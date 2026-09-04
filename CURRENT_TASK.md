@@ -21,6 +21,81 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-04 (LATEST-103) — doc 38: while-inner linking + topology arbitration LANDED
+
+The doc 15/16 continuation/link machinery, numeric-for-only until now, extended
+to `while` inner loops end-to-end — plus the recording discipline AND the
+topology arbitration the first A/B rounds proved necessary.
+`docs/design/38-while-inner-linking.md` is the full record; the "Topology
+arbitration" section there is the distilled model. Summary:
+
+- **Classification**: `whileLoopDonePostPc` / `isWhileLoopDoneGuardIndex` —
+  anchor-tied structural classifier for a while root's loop-done `guard_true`
+  (source `jmp_if_false`, branch target's predecessor a backward `jmp` to the
+  trace's own anchor). `ExitMaterialization.while_done`: NO flush owed (guard
+  at trace TOP; completed iterations committed at their `.loop` terminals),
+  walk/resume at the post-loop pc.
+- **Arming**: `maybeArmContinuation` arms while-done continuations at the
+  post-loop pc; `continuationReachesEnclosingBackEdge` recognizes backward
+  `.jmp` as an enclosing back-edge; `driveChain`/`driveBurstCore` chain
+  `.while_done` on both tiers; `recWhileLink` closes continuations with a
+  `.link` to the inner while root at the backward `jmp`.
+- **LLEAVE** (`AbortReason.loop_leave`): a ROOT at a while/repeat header that
+  observes its own loop's exit direction aborts unconditionally (LuaJIT
+  LJ_TRERR_LLEAVE) — the fast-retry budget (`lleave_fast_retries` = 8,
+  per-anchor `lleave_count`, warming-counter rewind) lands the retry on a
+  cond-true pass so the BODY root always forms first. An intermediate
+  "enclosure refinement" (enclosed whiles record through cond-false) leaked
+  glue-shaped roots onto high-trip anchors and was reverted.
+- **Topology arbitration** (the core finding): an enclosed while has three
+  topologies — the glue figure-eight (two `.loop` siblings at the condition
+  anchor, fused by sibling handoff; 78.5 cyc/it on a `j=i%64` nest),
+  the root+`.link` decomposition (137 cyc/it there, but 4× faster on
+  high-trip nsieve-bit-fp), and the outer unroll. Which wins is a pure
+  function of observed trips/entry, arbitrated by three deterministic
+  mechanisms: (1) `.low_trip_while` entry-yield gate — 64-entry probe of
+  while-done receipts, avg < 3 trips/entry ⇒ dispatch gate, probe-based
+  recovery ONLY (per-receipt un-gating oscillated via chain-driven entries),
+  exempt from all clear-on-productive paths; (2) trip-conditional glue
+  formation — while-done exits earn side-trace hotness only below avg 8
+  trips/entry (`whileDoneHotnessEligible`), so glue forms exclusively via
+  the side route (`.side` recordings skip LLEAVE by kind) on proven low-trip
+  anchors; (3) unroll-first root policy — roots unroll the inner while by
+  default, and flip to the LINNER decomposition after `unroll_fail_flip` = 2
+  failures (recording abort or `.legacy_thrash` gate of an
+  `unrolled_while`-flagged trace, per-anchor `unroll_fail`).
+- **Gate fixes**: `gateNativeUnsupported` no longer dispatch-gates an anchor
+  that still owns a COMPILED sibling; fused-M1 replay validation keyed on the
+  exact exit slot (`hasArmedSourceBranchLinkAt`) instead of first-slot-per-pair
+  (a latent bug unrolled parents with multiple armed source-branch guards hit).
+- **Hot-path cost lesson** (scimark-lu +10%, fixed; full recipe in doc 38):
+  the per-completion productive path runs 2M+/run — (a) map lookups as
+  ARGUMENTS to comptime-disabled `dbg()` still evaluate (hoist into locals);
+  (b) `clearDispatchGate` uses single-hash `getEntry`+`removeByPtr`;
+  (c) exit classification computed ONCE into
+  `numeric_for_done`/`while_done_exit` locals, not up to 4× per exit.
+
+Measured (ReleaseFast, A/B vs f663984 shadow baseline, nm-verified):
+- nest `j=i%64` (avg 5 trips): 0.07s = 0.07s parity (glue via side route).
+- nsieve-bit-fp scale 12 (~30+ trips): **70.7s → 17.4s (4×)** — decomposition.
+- bench board: nsieve-bit-fp 287.7→256.2ms, scimark-fft 387.8→307.7ms
+  (yield gate: fft_bitreverse:55 dispatch entries 4M→389 — the trace tier was
+  a net LOSS at ~1.5 trips/entry), scimark-lu 165.6ms parity, rest noise.
+- fft 20000-rep: 12.3–13.1s base vs 12.4–13.7s — noise-level parity.
+- fft_bitreverse:9 stays 0%: carried slots int/float-unstable (j/k — the
+  Fable finding). NEXT NAMED TECHNIQUE: numeric φ widening (LuaJIT CONV
+  int→num unification) — a while-body root recorded at trip 1-2 pins an int
+  entry that floats through the body (RV-3 analyze bail); the recorder/tropt
+  must unify the carried slot to float with an explicit conversion, keeping
+  deopt flushes byte-identical (pre-φ flushes reference the original int ref).
+- Queued behind that: doc-39 family-arbitration design (deterministic slot
+  competition between glue siblings and link chains), body-start while
+  anchoring, exit-branch patching (doc 16 correction).
+
+Gates: `zig build test` green (6 "doc 38:" e2e tests in
+interp_tier1a_test.zig, incl. the `.low_trip_while` yield-gate test),
+hashgate 84/84, full bench sweep cross=ok all rows.
+
 ## Status 2026-08-31 (LATEST-102) — **PROJECT RENAMED: lune -> mahina.** Not a
 campaign arc; a name collision. Gates green, one real bug caught by the rename.
 

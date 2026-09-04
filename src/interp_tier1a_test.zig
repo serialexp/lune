@@ -812,3 +812,270 @@ test "doc 30 c5: loopDoneSnapshotSupported — a sunk sgm_setpos below the loop-
     t = trace.Trace{ .anchor = undefined, .instrs = &plain, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
     try std.testing.expect(irinterp.loopDoneSnapshotSupported(&t, 1));
 }
+
+// ---------------------------------------------------------------------------
+// Doc 38: while-inner nested-loop linking. The doc 15/16 continuation/link
+// machinery extended to `while` inners: the while-body root's loop-done exit
+// (a `guard_true` mirroring the condition's `jmp_if_false`) arms a
+// continuation at the POST-loop pc; the continuation records the outer body,
+// re-enters the while (one recorded condition+body pass) and closes `.link`
+// at the backward `jmp` to the while root. Roots reaching that `jmp` abort
+// LINNER (LuaJIT `rec_loop_interp`), and a while/repeat-anchored root that
+// observes its own exit direction aborts `loop_leave` (LLEAVE) instead of
+// wandering into the enclosing loop.
+// ---------------------------------------------------------------------------
+
+test "doc 38: while-inner continuation links to the while-body root (.link terminal)" {
+    const gpa = testing.allocator;
+
+    const source =
+        \\local s = 0
+        \\for i = 1, 400 do
+        \\  local j = i % 32
+        \\  local k = 1
+        \\  while k <= j do k = k * 2 end
+        \\  s = s + k
+        \\end
+        \\print(s)
+    ;
+
+    var tier0_buf: [64]u8 = undefined;
+    var tier0 = io.Writer.fixed(&tier0_buf);
+    try runCaptured(gpa, source, &tier0, false, .off);
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var jit_buf: [64]u8 = undefined;
+    var jit = io.Writer.fixed(&jit_buf);
+    var chunk = try runExecForTrace(&vm, gpa, source, &jit);
+    defer chunk.deinit();
+    try testing.expectEqualStrings(tier0.buffered(), jit.buffered());
+
+    // The cache holds the while-body `.loop` root AND a `.link` continuation.
+    var loop_traces: usize = 0;
+    var link_traces: usize = 0;
+    for (vm.trace.cache.items) |t| {
+        try testing.expect(t.instrs.len >= 1);
+        switch (t.instrs[t.instrs.len - 1].op) {
+            .loop => loop_traces += 1,
+            .link => link_traces += 1,
+            else => {},
+        }
+    }
+    try testing.expect(loop_traces >= 1);
+    try testing.expect(link_traces >= 1);
+
+    // Every `.link` terminator targets the anchor of a cached `.loop` root.
+    for (vm.trace.cache.items) |t| {
+        const term = t.instrs[t.instrs.len - 1];
+        if (term.op != .link) continue;
+        const inner_pc: u32 = @intCast(term.aux);
+        var found_root = false;
+        for (vm.trace.cache.items) |r| {
+            if (r.anchor.proto == t.anchor.proto and r.anchor.pc == inner_pc and
+                r.instrs[r.instrs.len - 1].op == .loop) found_root = true;
+        }
+        try testing.expect(found_root);
+    }
+
+    // The link executed, not just committed.
+    try testing.expect(vm.trace.link_ir_exits > 0);
+    try testing.expect(vm.trace.link_follow_count > 0);
+}
+
+test "doc 38: no trace unrolls the variable-trip while (LINNER holds)" {
+    // An unrolled while pins one branch guard per unrolled condition pass, so
+    // >= 2 `jmp_if_false`-sourced branch guards in one trace is the unroll
+    // signature. Every legitimate doc 38 shape carries at most one: the
+    // while-body root pins its own condition once; a linked continuation pins
+    // the re-entry condition once before closing `.link`; a zero-trip sibling
+    // pins the done direction once.
+    //
+    // Unroll-first revision: unrolling is now the DEFAULT root policy, so this
+    // invariant only holds in decomposition mode. `unroll_fail_flip = 0` bars
+    // unrolling from the start, making this a deterministic unit test of the
+    // LINNER machinery (the organic unroll→flip→decompose path is covered by
+    // the `.link`-terminal test above, which runs with the default policy).
+    const gpa = testing.allocator;
+    const source =
+        \\local s = 0
+        \\for i = 1, 400 do
+        \\  local j = i % 32
+        \\  local k = 1
+        \\  while k <= j do k = k * 2 end
+        \\  s = s + k
+        \\end
+        \\print(s)
+    ;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.unroll_fail_flip = 0; // decomposition mode from the start
+    var jit_buf: [64]u8 = undefined;
+    var jit = io.Writer.fixed(&jit_buf);
+    var chunk = try runExecForTrace(&vm, gpa, source, &jit);
+    defer chunk.deinit();
+
+    for (vm.trace.cache.items) |t| {
+        var branch_guards: usize = 0;
+        for (t.instrs) |ins| {
+            if (ins.op != .guard_true and ins.op != .guard_false) continue;
+            const src_pc = trace.guardSourcePc(ins) orelse continue;
+            if (src_pc >= t.anchor.proto.code.len) continue;
+            const src_op = t.anchor.proto.code[src_pc].op;
+            if (src_op == .jmp_if_false or src_op == .jmp_if_true) branch_guards += 1;
+        }
+        try testing.expect(branch_guards <= 1);
+    }
+}
+
+test "doc 38: while-inner link goes native" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const source =
+        \\local s = 0
+        \\for i = 1, 2000 do
+        \\  local j = i % 64
+        \\  local k = 1
+        \\  while k <= j do k = k * 2 end
+        \\  s = s + k
+        \\end
+        \\print(s)
+    ;
+
+    var tier0_buf: [64]u8 = undefined;
+    var tier0 = io.Writer.fixed(&tier0_buf);
+    try runCaptured(gpa, source, &tier0, false, .off);
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var native_buf: [64]u8 = undefined;
+    var native = io.Writer.fixed(&native_buf);
+    var chunk = try runNativeForTrace(&vm, gpa, source, &native);
+    defer chunk.deinit();
+
+    try testing.expectEqualStrings(tier0.buffered(), native.buffered());
+    try testing.expect(vm.trace.native_link_exits > 0);
+    try testing.expect(vm.trace.native_link_follow_count > 0);
+}
+
+test "doc 38: always-zero-trip while stays sound (no while root, outer traces over it)" {
+    // The while back-edge never fires, so the while anchor never warms; the
+    // OUTER root records the condition and its `guard_false` (the observed
+    // done direction) and jumps straight over the body — no LLEAVE (the branch
+    // is not the OUTER anchor's own exit) and no LINNER (the backward `jmp` is
+    // never reached).
+    const gpa = testing.allocator;
+    const source =
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  local k = 100
+        \\  while k <= 10 do k = k + 1 end
+        \\  s = s + k
+        \\end
+        \\print(s)
+    ;
+    var tier0_buf: [64]u8 = undefined;
+    var tier0 = io.Writer.fixed(&tier0_buf);
+    try runCaptured(gpa, source, &tier0, false, .off);
+    try testing.expectEqualStrings("30000\n", tier0.buffered());
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var jit_buf: [64]u8 = undefined;
+    var jit = io.Writer.fixed(&jit_buf);
+    var chunk = try runExecForTrace(&vm, gpa, source, &jit);
+    defer chunk.deinit();
+    try testing.expectEqualStrings(tier0.buffered(), jit.buffered());
+
+    var loop_traces: usize = 0;
+    for (vm.trace.cache.items) |t| {
+        if (t.instrs[t.instrs.len - 1].op == .loop) loop_traces += 1;
+    }
+    try testing.expect(loop_traces >= 1);
+}
+
+test "doc 38: repeat-until is excluded from while linking (backward jmp_if_false)" {
+    // `repeat` closes its loop with a backward `jmp_if_false`, never a bare
+    // `jmp`, so `recWhileLink` and the while-done classifier both stay inert:
+    // no `.link` trace may commit for this program (no numeric-for inner
+    // either). Output parity still holds — the historical unroll owns it.
+    const gpa = testing.allocator;
+    const source =
+        \\local s = 0
+        \\for i = 1, 400 do
+        \\  local j = i % 32
+        \\  local k = 1
+        \\  repeat k = k * 2 until k > j
+        \\  s = s + k
+        \\end
+        \\print(s)
+    ;
+    var tier0_buf: [64]u8 = undefined;
+    var tier0 = io.Writer.fixed(&tier0_buf);
+    try runCaptured(gpa, source, &tier0, false, .off);
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var jit_buf: [64]u8 = undefined;
+    var jit = io.Writer.fixed(&jit_buf);
+    var chunk = try runExecForTrace(&vm, gpa, source, &jit);
+    defer chunk.deinit();
+    try testing.expectEqualStrings(tier0.buffered(), jit.buffered());
+
+    for (vm.trace.cache.items) |t| {
+        try testing.expect(t.instrs[t.instrs.len - 1].op != .link);
+    }
+}
+
+test "doc 38: low-trip while anchor earns a .low_trip_while yield gate" {
+    // Trips cycle 0/1/2 (avg 1.0 < while_yield_min_avg=3). Every dispatch
+    // entry at the while anchor is a COMPLETION — never a strike, often
+    // zero-trip — so neither the legacy penalty machine nor the region
+    // machine can see that the per-entry runtime turnstile outweighs 0–2
+    // interpreted iterations. Only the yield-gate probe can, and it must
+    // install a `.low_trip_while` dispatch gate that the clear-on-productive
+    // paths do not remove.
+    const gpa = testing.allocator;
+    const source =
+        \\local s = 0
+        \\for i = 1, 600 do
+        \\  local j = i % 3
+        \\  local k = 0
+        \\  while k < j do k = k + 1 end
+        \\  s = s + k
+        \\end
+        \\print(s)
+    ;
+    var tier0_buf: [64]u8 = undefined;
+    var tier0 = io.Writer.fixed(&tier0_buf);
+    try runCaptured(gpa, source, &tier0, false, .off);
+    try testing.expectEqualStrings("600\n", tier0.buffered());
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.while_yield_window = 8; // probe fast in a short test
+    vm.trace.config.unroll_fail_flip = 0; // decomposition mode: the yield gate
+    // only matters post-flip (with the default policy this bounded 0/1/2-trip
+    // while is simply unrolled into the outer root and never dispatches)
+    var jit_buf: [64]u8 = undefined;
+    var jit = io.Writer.fixed(&jit_buf);
+    var chunk = try runExecForTrace(&vm, gpa, source, &jit);
+    defer chunk.deinit();
+    try testing.expectEqualStrings(tier0.buffered(), jit.buffered());
+
+    // The while root committed (the gate must have gated a REAL dispatching
+    // anchor, not an anchor that never traced) …
+    var loop_traces: usize = 0;
+    for (vm.trace.cache.items) |t| {
+        if (t.instrs[t.instrs.len - 1].op == .loop) loop_traces += 1;
+    }
+    try testing.expect(loop_traces >= 1);
+
+    // … and the probe verdict gated it for low yield.
+    var yield_gates: usize = 0;
+    var it = vm.trace.gate.valueIterator();
+    while (it.next()) |g| {
+        if (g.reason == .low_trip_while) yield_gates += 1;
+    }
+    try testing.expect(yield_gates >= 1);
+}

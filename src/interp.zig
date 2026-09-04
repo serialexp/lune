@@ -2672,20 +2672,58 @@ pub const Vm = struct {
             // taken side exit — productive or not — charges
             // its own per-(trace, exit) counter; crossing
             // `hotexit` wants a side trace for the alternate
-            // path. Loop-done exits are excluded: they are
-            // productive completions owned by the
+            // path. NUMERIC-FOR loop-done exits are excluded:
+            // they are productive completions owned by the
             // continuation machinery, not side-trace
             // candidates (`linked_one_trip` exits are
             // loop-done by construction and fall out of the
-            // same check).
-            if (result.exit_instr != std.math.maxInt(u32) and
-                result.exit_instr < final.instrs.len and
-                !trace.isLoopDoneGuardIndex(final, result.exit_instr))
-            {
+            // same check). A WHILE loop-done exit counts iff
+            // the anchor's OBSERVED average trips/entry is
+            // low (doc 38, `whileDoneHotnessEligible`): the
+            // cond-false direction of an enclosed while is
+            // where the outer-glue sibling anchors
+            // (`guard_false → outer body → loop` back to the
+            // same anchor, the two-sibling figure-eight the
+            // handoff machinery fuses). For LOW-trip whiles
+            // that fusion amortizes the per-instance
+            // entry+seam turnstile (nest avg 5: 78 cyc/it vs
+            // 137 for root+link — excluding it was a 3.5×
+            // regression); for HIGH-trip whiles the body
+            // loop already amortizes the seam and the glue
+            // family is measured pure downside (nsieve-bit-fp
+            // avg ~30+: glue formation was 2.7× worse than
+            // the root+link chain it displaced).
+            // Classify the exit ONCE — this is the per-completion hot path
+            // (2M+ entries/run on scimark-lu), and each classifier walks trace
+            // instrs + proto code. `numeric_for_done`/`while_done_exit` are
+            // mutually exclusive by construction (guard_true on `for_loop` vs
+            // the while condition-branch shape), so together they decompose
+            // `isAnyLoopDoneGuardIndex` with at most one call to each.
+            //
+            // Doc 38: a while-loop-done exit is a COMPLETION at any count —
+            // including zero trips (the top-of-trace condition guard observed
+            // "done" before any body ran; regs are coherent at the post-loop pc
+            // untouched). Classifying it productive lets a zero-trip completion
+            // take the receipt + continuation-arm + `.while_done` chain path
+            // instead of the zero-iteration penalty path below, which misread
+            // HALF of fft_bitreverse's instances (~25.5M zero-trip entries per
+            // run) as failed entries: pure turnstile cost, penalty churn, and
+            // no chain attempt.
+            const exit_ok = result.exit_instr != std.math.maxInt(u32) and
+                result.exit_instr < final.instrs.len;
+            const numeric_for_done = exit_ok and
+                trace.isLoopDoneGuardIndex(final, result.exit_instr);
+            const while_done_exit = exit_ok and !numeric_for_done and
+                trace.isWhileLoopDoneGuardIndex(final, result.exit_instr);
+            const any_loop_done = numeric_for_done or while_done_exit;
+            const count_exit = exit_ok and
+                (!any_loop_done or
+                    (while_done_exit and self.trace.whileDoneHotnessEligible(final.anchor)));
+            if (count_exit) {
                 self.trace.noteTakenExit(final, result.exit_instr, local_done, proto);
             }
 
-            if (local_done > 0 or linked_one_trip) {
+            if (local_done > 0 or linked_one_trip or while_done_exit) {
                 // This trace did useful work — keep its result.
                 // (`linked_one_trip`: the committed loop-done IS one
                 // enclosing iteration, replayLedger's `max(local, 1)`.)
@@ -2693,7 +2731,7 @@ pub const Vm = struct {
                     final,
                     if (linked_one_trip) 1 else local_done,
                     result.exit_instr,
-                    if (linked_one_trip or trace.isLoopDoneGuardIndex(final, result.exit_instr)) 1 else local_done,
+                    if (linked_one_trip or any_loop_done) 1 else local_done,
                     .deferred,
                     .entered,
                 );
@@ -2774,13 +2812,37 @@ pub const Vm = struct {
                 // from `buf`, runs continuation ⇄ inner-root
                 // for a bounded burst, and tells us where
                 // tier-0 should resume when it yields.
+                // Doc 38: classify once — a while-loop-done exit chains through
+                // the `.while_done` materialization on BOTH tiers (no flush owed,
+                // walk at the condition branch's jump target). Numeric-for keeps
+                // its historical arms verbatim.
+                const while_done = while_done_exit;
                 if (ran_native and ran_native_link_mode) {
                     if (self.trace.driveChain(final, result, proto, trace_regs, .native_only, .native_numeric_for_done, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
                         if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                         for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
                         return .{ .resume_tier0 = pc };
                     }
-                } else if (!ran_native) {
+                } else if (ran_native) {
+                    // Doc 38: a while inner root always enters native in ORDINARY
+                    // mode (`hasNativeLoopDoneLink` is numeric-only), so its
+                    // loop-done surfaces here — an ordinary deopt with regs
+                    // coherent at the anchor, which for a top-of-trace condition
+                    // guard is also coherent at the post-loop pc.
+                    if (while_done) {
+                        if (self.trace.driveChain(final, result, proto, trace_regs, .native_only, .while_done, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
+                            if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                            for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                            return .{ .resume_tier0 = pc };
+                        }
+                    }
+                } else if (while_done) {
+                    if (self.trace.driveChain(final, result, proto, trace_regs, .ir, .while_done, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
+                        if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                        for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                        return .{ .resume_tier0 = pc };
+                    }
+                } else {
                     if (self.trace.driveChain(final, result, proto, trace_regs, .ir, .{ .ir_numeric_for_done = buf }, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
                         if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                         for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
@@ -2824,7 +2886,13 @@ pub const Vm = struct {
                 // anchor, so there is nothing to thread and
                 // the live regs remain exactly what each
                 // entered trace expects.
-                if (self.trace.isSourceBranchGuardExit(final, result.exit_instr, proto)) {
+                // Doc 38: a while-loop-done IS a source-branch guard (guard_true
+                // from `jmp_if_false`) but it is a COMPLETION — chaining to a
+                // same-anchor sibling could only re-check a finished loop (every
+                // sibling condition-fails at its top with zero committed). The
+                // while chain above already tried the continuation; fall through
+                // to tier-0.
+                if (!while_done and self.trace.isSourceBranchGuardExit(final, result.exit_instr, proto)) {
                     if (ran_native) {
                         if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl[0..nexcl], safe_to_arm, self.unicode_version_pinned)) |chain| {
                             if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);

@@ -858,6 +858,66 @@ pub fn isLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
     return true;
 }
 
+/// Doc 38 — the WHILE twin of `isLoopDoneGuardIndex`, returning the post-loop
+/// resume PC on a match (null otherwise). A while loop compiles to
+/// `<cond>; jmp_if_false <past_end>; <body>; jmp <back_to_cond>`, so its
+/// loop-done exit is the CONDITION guard: a `guard_true` (recBranch pinned the
+/// observed continue direction) whose source opcode is the `jmp_if_false`.
+/// Classified structurally, tied to the trace's own anchor: the branch's jump
+/// target must be exactly one past a backward `jmp` that returns to
+/// `t.anchor.pc` — that shape IS the while loop this trace is the root of, and
+/// it cannot match an inner while unrolled inside the trace (its back-edge
+/// targets the inner header, not our anchor).
+///
+/// Two structural differences from the numeric-for loop-done:
+///  * the guard sits at the trace TOP (before the body), so the failing pass
+///    ran only the condition prefix — completed iterations already committed
+///    at their `.loop` terminals and NO final-iteration flush is owed;
+///  * the post-loop PC is the branch's JUMP TARGET, not `guardExitPc` (which
+///    is the fall-through = the loop body start).
+/// Same doc-37 provenance rule as the numeric classifier: an inlined-callee
+/// guard's `guardSourcePc` is in the callee's proto — reject depth > 0.
+pub fn whileLoopDonePostPc(t: *const Trace, idx: usize) ?u32 {
+    if (idx >= t.instrs.len) return null;
+    const g = t.instrs[idx];
+    if (g.op != .guard_true) return null;
+    const src_pc = guardSourcePc(g) orelse return null;
+    const proto = t.anchor.proto;
+    if (src_pc >= proto.code.len) return null;
+    const br = proto.code[src_pc];
+    if (br.op != .jmp_if_false) return null;
+    // Post-loop pc = the branch's jump target (post-increment base, like
+    // `applyJump`): `(src_pc + 1) + aux`. Must be a forward, in-bounds exit.
+    const post_i: i64 = @as(i64, src_pc) + 1 + br.aux;
+    if (post_i <= @as(i64, src_pc) or post_i >= @as(i64, @intCast(proto.code.len))) return null;
+    const post: u32 = @intCast(post_i);
+    if (post == 0) return null;
+    // The instruction immediately before the post-loop pc must be this loop's
+    // backward `jmp`, returning exactly to the trace's anchor (the condition).
+    const back = proto.code[post - 1];
+    if (back.op != .jmp) return null;
+    if (@as(i64, post) + back.aux != @as(i64, t.anchor.pc)) return null;
+    if (t.provAt(@intCast(idx))) |prov| switch (prov) {
+        .guard => |gp| if (gp.inline_depth > 0) return null,
+        .link_terminal => return null,
+    };
+    return post;
+}
+
+/// Doc 38: boolean twin of `whileLoopDonePostPc` for classification-only sites.
+pub fn isWhileLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
+    return whileLoopDonePostPc(t, idx) != null;
+}
+
+/// Doc 38: either loop-done kind — numeric-for OR while. Use at accounting
+/// sites where "the loop ran to completion" matters regardless of loop shape
+/// (hot-exit exclusion, receipt region-work). Kind-specific machinery (the
+/// native linked materialization, `flushNumericForLoopDone`) keeps using the
+/// specific classifiers.
+pub fn isAnyLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
+    return isLoopDoneGuardIndex(t, idx) or isWhileLoopDoneGuardIndex(t, idx);
+}
+
 /// Caller-declared intent for `armNativeLink`, enforcing the P-C option (b) invariant
 /// (doc 17, 2.3c-0a): a numeric-for loop-done guard's `slot[ei]` is EXCLUSIVELY its
 /// linked-materialized exit. So only a `.loop_done_linked` arm may target a loop-done
@@ -972,6 +1032,13 @@ pub const ExitMaterialization = union(enum) {
     ordinary_header,
     ir_numeric_for_done: []Value,
     native_numeric_for_done,
+    /// Doc 38: a while-loop-done exit (either tier — the tier is `driveChain`'s
+    /// comptime param). The condition guard sits at the trace TOP, so the
+    /// failing pass ran only the condition prefix: completed iterations already
+    /// committed at their `.loop` terminals and NO flush is owed on any tier.
+    /// The chain walks at the post-loop pc (`whileLoopDonePostPc`), which is
+    /// the condition branch's jump target — NOT `guardExitPc`.
+    while_done,
 };
 
 /// Doc 20 (patched trace entry): one registry slot binding a `.jfor_loop` or
@@ -1047,6 +1114,13 @@ pub const Gate = struct {
     window: u32,
     /// How many times this anchor has been gated; `>= max_strikes` ⇒ permanent.
     strikes: u32,
+    /// Why the LAST escalation fired (doc 38 yield gate). A `.low_trip_while`
+    /// dispatch gate is exempt from the clear-on-productive paths: the very
+    /// receipts that would clear it (1–2-trip completions) are the evidence it
+    /// gates on. It expires only via the standard cooldown, after which a
+    /// probe window that clears the yield bar simply never re-gates
+    /// (`noteWhileYield`). All other reasons keep doc 31 D2 semantics.
+    reason: GateReason,
 };
 
 /// Doc 31 D3: why an anchor was gated — carried in the jit-debug receipt line
@@ -1057,8 +1131,25 @@ pub const GateReason = enum {
     legacy_thrash,
     region_decay,
     native_unsupported,
+    /// Doc 38 yield gate: a while anchor whose entries average below
+    /// `config.while_yield_min_avg` trips over a `while_yield_window`-entry
+    /// probe. Each entry is productive (a completion, often 1–2 trips, half
+    /// zero-trip on fft_bitreverse) but the per-entry runtime turnstile
+    /// (entry + seam re-entry; our exits are not patched branches) costs more
+    /// than tier-0 running the same 0–2 iterations. Dispatch-gate source;
+    /// exempt from clear-on-productive (see `Gate.reason`).
+    low_trip_while,
     record_abort,
     commit_failure,
+};
+
+/// Doc 38 yield-gate accumulator (`TraceState.while_yield`): entries and total
+/// completed iterations observed for one while anchor over the current probe
+/// window. Both saturate; the verdict compares `iters` against
+/// `entries * while_yield_min_avg` at `entries == while_yield_window`.
+pub const WhileYield = struct {
+    entries: u32,
+    iters: u32,
 };
 
 /// Identifies a guard-failure site: the trace anchor and the bytecode PC of the
@@ -1231,6 +1322,11 @@ pub const Trace = struct {
     /// Its tombstone (and only its) wakes this trace back to `.eligible`.
     entry_patch_incumbent: u16 = 0,
     anchor: AnchorKey,
+    /// Doc 38 unroll-first policy: this trace's recording unrolled at least one
+    /// inner-while back-edge inline. When such a trace's anchor is gated for
+    /// legacy thrash, that gate is evidence unrolling does not cover this
+    /// outer loop's trip variance (`unroll_fail`).
+    unrolled_while: bool = false,
     /// The straight-line IR, terminated by a `loop` instruction.
     instrs: []IrInstr,
     /// Constants referenced by `konst` instructions (may include heap values, so
@@ -1530,6 +1626,18 @@ pub const AbortReason = enum {
     /// would wrap its `u16`. The trace's actual usage is visible as
     /// `inputs=N/cap` in `--dump-traces`/`--dump-native`.
     input_cap,
+    /// Doc 38 / LuaJIT `LJ_TRERR_LLEAVE` ("leaving loop in root trace"): a ROOT
+    /// recording anchored at a `while`/`repeat` header observed its own loop's
+    /// exit direction on the condition branch. A root must loop back to form a
+    /// root trace — recording onward would wander into the enclosing loop and
+    /// commit a rotated outer trace at the inner anchor (frequently
+    /// type-unstable across the enclosing back-edge, e.g. `local k = 64` int
+    /// vs the loop body's float — the analyze RV-3 bail), clogging the anchor
+    /// the nested-loop continuation machinery needs for the loop-BODY root.
+    /// Repeated `loop_leave` strikes at an anchor mark a low-trip-count loop;
+    /// `recWhileLink` then lets an outer root unroll it (LuaJIT's
+    /// `innerloopleft` fallback).
+    loop_leave,
     /// An error unwound through the dispatch loop while this recording was
     /// active (doc 26 D1a). The raise itself is not part of the recorded IR, so
     /// letting the recording survive the unwind would stitch post-catch
@@ -1666,6 +1774,49 @@ pub const TraceConfig = struct {
     /// loop has proven hopeless — e.g. a host call in the body that aborts every
     /// recording, or strict alternation no straight-line trace can amortize).
     max_strikes: u32 = 6,
+    /// Doc 38 LLEAVE retry budget (LuaJIT `innerloopleft` analog, but reason-
+    /// specific where LuaJIT's penalty slot conflates less). A `loop_leave`
+    /// abort below this per-anchor count does NOT strike the record gate — the
+    /// anchor silently retries at its next hot event, because which pass a
+    /// recording lands on (cond-true → the loop-body root we want, cond-false
+    /// → LLEAVE) is a race against the loop's trip pattern, not evidence the
+    /// loop is untraceable. At/past the budget the loop has PROVEN a low/zero
+    /// remaining-trip pattern: `loop_leave` starts striking the gate normally
+    /// AND `recWhileLink` lets an enclosing root unroll the loop instead of
+    /// aborting LINNER. Deterministic — a pure per-anchor abort count.
+    lleave_fast_retries: u32 = 8,
+    /// Doc 38 unroll-first policy: proven unroll failures at one OUTER anchor
+    /// (recording aborts while unrolled + thrash gates on committed unrolled
+    /// roots) before `recWhileLink` stops unrolling there and decomposes into
+    /// inner-root + link (LINNER). 2 = LuaJIT `innerloopleft` penalty parity.
+    unroll_fail_flip: u32 = 2,
+    /// Doc 38 glue-sibling eligibility: maximum observed average trips/entry
+    /// (from the `while_yield` accumulator) at which a while anchor's
+    /// loop-done exit still accrues side-trace hotness — i.e. may grow the
+    /// cond-false GLUE sibling (`guard_false → outer body → loop`, the
+    /// figure-eight). Cost model: the glue fusion's benefit is amortizing the
+    /// per-instance entry+seam turnstile, which dominates only for low-trip
+    /// whiles (nest avg 5: glue = 78 cyc/it vs 137 decomposed; fft avg 1.5).
+    /// For high-trip whiles the body loop already amortizes the seam and the
+    /// glue family is measured pure downside (nsieve-bit-fp avg ~30+: glue
+    /// formation was a 2.7× bench regression vs the root+link chain). Below
+    /// the minimum sample (8 entries) hotness does not accrue (conservative:
+    /// glue formation defers until the trip pattern is observed).
+    while_glue_max_avg: u32 = 8,
+    /// Doc 38 yield gate probe window: how many while-loop-done ENTRY receipts
+    /// are accumulated per anchor before the average-trip verdict. Small enough
+    /// that a hopeless turnstile (fft_bitreverse: 25.5M entries/run at ~1.5
+    /// trips avg) gates within noise; large enough that a bursty-but-healthy
+    /// while (mixed zero-trip and long instances) shows its true average.
+    while_yield_window: u32 = 64,
+    /// Minimum average trips per entry (integer, compared as
+    /// `iters < entries * min_avg`) a while anchor must sustain over a probe
+    /// window to stay dispatched. Below it, entering the trace costs more in
+    /// runtime turnstile (entry + seam) than tier-0 running the same 0–2
+    /// iterations, so the anchor is dispatch-gated (`.low_trip_while`).
+    /// Recovery is probe-based: post-cooldown windows that clear the bar
+    /// never re-gate. Pure deterministic counters — no clocks, no RNG.
+    while_yield_min_avg: u32 = 3,
     /// Guard-failure count at which a side trace is recorded for this
     /// `(anchor, exit_pc)` pair.  When a guard at PC X in a trace anchored
     /// at A fails this many times, the next back-edge to A arms a new
@@ -2132,6 +2283,40 @@ pub const TraceState = struct {
     /// the anchor is permanently record-blacklisted (survives trace
     /// retirement — accepted `penalty_pc` blacklist semantics, doc 31 §3).
     record_gate: std.AutoHashMapUnmanaged(AnchorKey, Gate) = .empty,
+    /// Doc 38: per-anchor count of `loop_leave` aborts (a while/repeat root
+    /// recording that observed its own loop's exit direction). Below
+    /// `config.lleave_fast_retries` the abort is a silent retry (no record-gate
+    /// strike); at/past it, the anchor is treated as a proven low-trip loop —
+    /// gate strikes resume AND `recWhileLink`'s innerloopleft check lets an
+    /// enclosing root unroll it. Reset wholesale with the gates (epoch
+    /// boundary) so a freed proto's key never lingers.
+    lleave_count: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
+    /// Doc 38 unroll-first policy: per-OUTER-anchor count of proven unroll
+    /// failures — a root recording that unrolled an inner while and then
+    /// aborted, or a committed unrolled root whose anchor got gated for
+    /// legacy thrash. At `config.unroll_fail_flip` the outer anchor stops
+    /// unrolling and `recWhileLink` decomposes (LINNER) instead. Mirrors
+    /// LuaJIT's `innerloopleft` evidence counter with the roles REVERSED:
+    /// LuaJIT tries the inner root first because its side exits are patched
+    /// branches; mahina's exits re-enter the runtime per inner completion, so
+    /// unrolling is the profitable default (measured: unroll 17 cyc/it vs
+    /// decomposed ~95 cyc/it on a bounded-variance nest) and decomposition is
+    /// the escape for trip variance unrolling cannot cover (nsieve-bit-fp:
+    /// decomposition 4x faster than failed unrolling). Reset wholesale with
+    /// the gates (epoch boundary).
+    unroll_fail: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
+    /// Doc 38 unroll-first policy: memoized static classification per anchor —
+    /// the innermost enclosing loop's anchor pc when this anchor is a plain-jmp
+    /// while anchor enclosed by another loop in the same proto, else
+    /// `maxInt(u32)` (not a while / repeat-until / for anchor / top-level).
+    /// Pure bytecode geometry, computed once per anchor
+    /// (`whileEnclosingAnchorPc`). Reset wholesale with the gates.
+    while_static: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
+    /// Doc 38 yield gate accumulator: per-anchor (entries, iters) over the
+    /// current probe window, fed by every ENTERED receipt whose exit is a
+    /// while-loop-done guard (`noteWhileYield`). Reset per verdict and on the
+    /// epoch boundary with the gates.
+    while_yield: std.AutoHashMapUnmanaged(AnchorKey, WhileYield) = .empty,
     /// Re-entry penalty per anchor: a low-yield trace entry bumps it, a
     /// productive one clears it (doc 31 D2); at `config.max_penalty` the anchor
     /// is gated off with a doubling cooldown (`onSideExit` → `gateAnchor`).
@@ -2964,6 +3149,10 @@ pub const TraceState = struct {
         self.counters.deinit(self.gpa);
         self.gate.deinit(self.gpa);
         self.record_gate.deinit(self.gpa);
+        self.lleave_count.deinit(self.gpa);
+        self.unroll_fail.deinit(self.gpa);
+        self.while_static.deinit(self.gpa);
+        self.while_yield.deinit(self.gpa);
         self.penalty.deinit(self.gpa);
         self.guard_failures.deinit(self.gpa);
         for (self.values_chunks.items) |c| self.gpa.free(c);
@@ -3517,6 +3706,14 @@ pub const TraceState = struct {
             accountCandidateCharge(t, charge_kind);
             return;
         }
+        // Doc 38 yield gate: every ENTERED receipt that ended at a while-loop-
+        // done guard feeds the per-anchor trip accumulator — regardless of
+        // which profitability machine (region or legacy) consumes the receipt
+        // below, because the turnstile cost being measured (entry + seam
+        // re-entry per 0–2-trip completion) is real either way.
+        if (exit_instr < t.instrs.len and isWhileLoopDoneGuardIndex(t, exit_instr)) {
+            self.noteWhileYield(t.anchor, completed);
+        }
         const key: ?ExitKey = if (exit_instr < t.instrs.len)
             .{ .trace_id = t.id, .exit_instr = exit_instr }
         else
@@ -3529,6 +3726,74 @@ pub const TraceState = struct {
             self.accountLegacyThrash(t, completed, exit_instr, charge_kind);
         } else {
             accountCandidateCharge(t, charge_kind);
+        }
+    }
+
+    /// Doc 38 glue-sibling eligibility (see `Config.while_glue_max_avg`): may
+    /// this anchor's while-loop-done exit accrue side-trace hotness (and so
+    /// grow the cond-false glue sibling)? Deterministic — reads the
+    /// `while_yield` probe accumulator: requires a minimum sample of 8
+    /// entries in the current window AND an observed average strictly below
+    /// the glue ceiling. Consulted by the dispatch loop's hot-exit counting.
+    pub fn whileDoneHotnessEligible(self: *const TraceState, anchor: AnchorKey) bool {
+        const wy = self.while_yield.get(anchor) orelse return false;
+        if (wy.entries < 8) return false;
+        return wy.iters < wy.entries *| self.config.while_glue_max_avg;
+    }
+
+    /// Doc 38 yield gate: remove `anchor`'s dispatch gate UNLESS it is a
+    /// `.low_trip_while` yield gate — those are cleared only by
+    /// `noteWhileYield` on a genuinely high-trip completion, because the
+    /// receipts reaching the ordinary clear-on-productive paths (1–2-trip
+    /// while completions) are precisely the evidence the yield gate exists to
+    /// act on. Every other reason keeps its doc 31 D2 clear semantics.
+    fn clearDispatchGate(self: *TraceState, anchor: AnchorKey) void {
+        // Single-hash form (getEntry + removeByPtr, not getPtr + remove):
+        // this runs on every productive receipt, and the extra hash of the
+        // two-op form was a measured ~2% of a scimark-lu run.
+        const e = self.gate.getEntry(anchor) orelse return;
+        if (e.value_ptr.reason == .low_trip_while) return;
+        self.gate.removeByPtr(e.key_ptr);
+    }
+
+    /// Doc 38 yield gate: account one while-loop-done ENTRY receipt
+    /// (`completed` = trips this entry ran; 0 for a zero-trip completion —
+    /// the top-of-trace condition guard observed "done" before any body ran).
+    /// Rationale: a while completion at ANY trip count is productive-shaped,
+    /// so neither the legacy strike machine nor the region machine can see the
+    /// per-entry runtime turnstile (entry + seam re-entry; our exits are not
+    /// patched branches) that makes a 0–2-trip while NET SLOWER on the trace
+    /// tier than on tier-0 — fft_bitreverse pays it 25.5M times per run at
+    /// ~1.5 trips average, a measured +17% wall regression. This is the
+    /// LuaJIT-shape-free analog of the demoted `min_trip_entry` config: gate
+    /// on OBSERVED trips, not a predicted minimum. Pure deterministic
+    /// counters (mahina determinism): a `while_yield_window`-entry probe per
+    /// anchor; average below `while_yield_min_avg` ⇒ dispatch gate with the
+    /// standard doubling cooldown; `max_strikes` abandons the anchor to
+    /// tier-0 for good. Recovery is probe-based, not per-receipt: after the
+    /// cooldown the anchor free-runs one more window, and a probe whose
+    /// average clears the bar simply never re-gates. (A per-receipt "one
+    /// high-trip completion lifts the gate" rule was tried first and
+    /// oscillated: chain-driven entries — driveChain does not consult the
+    /// dispatch gate — kept delivering occasional 6-trip completions that
+    /// un-gated an anchor still averaging <1 trip/entry, measured live on
+    /// fft_bitreverse pc=55: `entries=64 iters=58 -> gate` then
+    /// `completed=6 -> ungate`, forever.)
+    fn noteWhileYield(self: *TraceState, anchor: AnchorKey, completed: usize) void {
+        const min_avg = self.config.while_yield_min_avg;
+        if (min_avg == 0) return; // knob disabled
+        const gop = self.while_yield.getOrPut(self.gpa, anchor) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .{ .entries = 0, .iters = 0 };
+        gop.value_ptr.entries +|= 1;
+        gop.value_ptr.iters +|= @as(u32, @intCast(@min(completed, std.math.maxInt(u32))));
+        if (gop.value_ptr.entries >= self.config.while_yield_window) {
+            const entries = gop.value_ptr.entries;
+            const iters = gop.value_ptr.iters;
+            gop.value_ptr.* = .{ .entries = 0, .iters = 0 };
+            if (iters < entries *| min_avg) {
+                self.dbg("while-yield: anchor pc={d} probe entries={d} iters={d} (< {d}) -> gate", .{ anchor.pc, entries, iters, entries *| min_avg });
+                self.gateAnchor(anchor, .low_trip_while);
+            }
         }
     }
 
@@ -3581,9 +3846,18 @@ pub const TraceState = struct {
         // machinery wins the race while capacity remains.
         if (completed > 0) {
             _ = self.penalty.remove(key);
-            _ = self.gate.remove(key);
+            self.clearDispatchGate(key);
             return;
         }
+        // Doc 38: a zero-COMPLETION loop-done receipt (a while whose top-of-
+        // trace condition guard observed "done" before any body ran) is a
+        // completed empty loop — evidence of NEITHER productivity NOR thrash.
+        // It must not strike (task #62's completions-are-not-thrash, extended
+        // to the legacy machine) and must not clear (it did no work to earn
+        // one). Without this, fft_bitreverse's ~50% zero-trip instances
+        // alternate strike/clear forever — penalty churn on a healthy anchor.
+        if (exit_instr != std.math.maxInt(u32) and exit_instr < t.instrs.len and
+            isAnyLoopDoneGuardIndex(t, exit_instr)) return;
         const gop = self.penalty.getOrPut(self.gpa, key) catch return;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;
@@ -3601,6 +3875,18 @@ pub const TraceState = struct {
             self.config.max_penalty;
         if (gop.value_ptr.* >= limit) {
             self.dbg("legacy-strike: anchor pc={d} completed={d} penalty={d} -> gate", .{ key.pc, completed, gop.value_ptr.* });
+            // Doc 38 unroll-first policy: thrash-gating an anchor whose trace
+            // unrolled an inner while is runtime proof that sibling coverage
+            // cannot absorb the trip variance — the second evidence source for
+            // the `recWhileLink` decomposition flip (the first is recording
+            // aborts of unrolling roots, in `abort`).
+            if (t.unrolled_while) {
+                if (self.unroll_fail.getOrPut(self.gpa, key)) |ugop| {
+                    if (!ugop.found_existing) ugop.value_ptr.* = 0;
+                    ugop.value_ptr.* +|= 1;
+                    self.dbg("unroll-fail (thrash gate): anchor pc={d} count={d}", .{ key.pc, ugop.value_ptr.* });
+                } else |_| {}
+            }
             self.gateAnchor(key, .legacy_thrash);
         } else {
             self.dbg("legacy-strike: anchor pc={d} completed={d} penalty={d}/{d}", .{ key.pc, completed, gop.value_ptr.*, limit });
@@ -3696,7 +3982,7 @@ pub const TraceState = struct {
         const owner = def.owner;
         if (work >= self.config.min_useful) {
             _ = self.penalty.remove(owner);
-            _ = self.gate.remove(owner);
+            self.clearDispatchGate(owner);
             return;
         }
         // Freeze-after-qualify (task #70): any low-yield verdict unfreezes the
@@ -4882,17 +5168,22 @@ pub const TraceState = struct {
                 if (self.regionMemberPoint(rid, k.proto.id, k.pc)) {
                     const victim = k.*;
                     _ = self.penalty.remove(victim);
-                    _ = self.gate.remove(victim);
+                    self.clearDispatchGate(victim);
                     continue :outer;
                 }
             }
             break;
         }
         gates: while (true) {
-            var git = self.gate.keyIterator();
-            while (git.next()) |k| {
-                if (self.regionMemberPoint(rid, k.proto.id, k.pc)) {
-                    _ = self.gate.remove(k.*);
+            var git = self.gate.iterator();
+            while (git.next()) |e| {
+                // Doc 38: `.low_trip_while` yield gates survive amnesty (see
+                // `clearDispatchGate`); skipping without removal keeps the
+                // restart-per-mutation loop finite.
+                if (e.value_ptr.reason != .low_trip_while and
+                    self.regionMemberPoint(rid, e.key_ptr.proto.id, e.key_ptr.pc))
+                {
+                    _ = self.gate.remove(e.key_ptr.*);
                     continue :gates;
                 }
             }
@@ -5168,6 +5459,21 @@ pub const TraceState = struct {
     /// back-edge `tick`. The `isGated` guard avoids re-escalating an active gate.
     pub fn gateNativeUnsupported(self: *TraceState, anchor: AnchorKey) void {
         if (self.isGated(anchor)) return;
+        // Doc 38: "unsupported" is a per-TRACE verdict, but this gate is
+        // per-ANCHOR — never fire it while a COMPILED sibling still serves the
+        // anchor. The dispatch walk's own "only if nothing productive ran"
+        // guard misses one shape: a compiled trace runs productively, exits at
+        // its loop-done with no chain target (directive `.next_candidate`),
+        // the walk then meets the unsupported sibling and ends — and the
+        // anchor gate starves the good trace (fft_bitreverse:55: the
+        // float-stable while-body root was gated off because a wandering
+        // sibling proveKinds-bailed; 176 native entries in 101M passes). A
+        // rare cold scan (this path runs only on unproductive walk ends), and
+        // an anchor whose traces are ALL unsupported still gates as before.
+        for (self.cache.items) |t| {
+            if (t.anchor.proto == anchor.proto and t.anchor.pc == anchor.pc and
+                t.native == .compiled) return;
+        }
         self.gateAnchor(anchor, .native_unsupported);
     }
 
@@ -5368,9 +5674,14 @@ pub const TraceState = struct {
             // `visited` set) keeps us from re-running the failed trace or any
             // sibling the cold walk already tried this back-edge.
             .ordinary_header => failed.anchor.pc,
-            // Loop-done materializations chain to a `.link` continuation living at
-            // the guard's *exit* PC (a real post-loop bytecode pc). Resolve it
-            // through the op-gated accessor so an array-guard lane ordinal is never
+            // Doc 38: a while-loop-done chains to the continuation at the condition
+            // branch's JUMP TARGET (the post-loop pc). Re-derived through the
+            // fail-closed classifier — a mis-tagged call (exit isn't actually a
+            // while-loop-done) returns null rather than walking a bogus pc.
+            .while_done => whileLoopDonePostPc(failed, exit_instr) orelse return null,
+            // Numeric-for loop-done materializations chain to a `.link` continuation
+            // living at the guard's *exit* PC (a real post-loop bytecode pc). Resolve
+            // it through the op-gated accessor so an array-guard lane ordinal is never
             // mistaken for a PC, and reject a 0/anchor exit PC (nothing to chain to).
             else => blk: {
                 const wp = guardExitPc(failed.instrs[exit_instr]) orelse return null;
@@ -5430,9 +5741,10 @@ pub const TraceState = struct {
             // Doc 26 D1 tripwire, chain half: see `enterSelectedTrace`.
             if (sct.requires_unicode_pin) std.debug.assert(unicode_pinned);
             const is_link = sct.instrs.len != 0 and sct.instrs[sct.instrs.len - 1].op == .link;
-            // Loop-done chains (ir and native) only follow `.link` continuations;
-            // an ordinary side trace at the post-loop PC is not a valid hand-off.
-            if (loop_done_values != null and !is_link) continue;
+            // Loop-done chains (ir and native, numeric-for and while) only follow
+            // `.link` continuations; an ordinary side trace at the post-loop PC is
+            // not a valid hand-off.
+            if ((loop_done_values != null or materialization == .while_done) and !is_link) continue;
             if (tier == .native_only and !is_link) continue;
             // A candidate with synthetic inputs needs per-entry seeding. B-iii
             // (doc 22 §B.3): the TIER-1A walk seeds it right here via the episode
@@ -5578,6 +5890,14 @@ pub const TraceState = struct {
                 const sbuf = self.valuesPush(sct.instrs.len) catch continue;
                 if (loop_done_values) |vals| {
                     if (!irinterp.flushNumericForLoopDone(failed, regs, vals, exit_instr)) return null;
+                    flushed_resume_pc = walk_pc;
+                } else if (materialization == .while_done) {
+                    // Doc 38: no flush owed — the while condition guard fails at
+                    // the trace TOP, before any of the final pass's body ran; the
+                    // completed iterations committed at their `.loop` terminals.
+                    // But the loop IS done (the condition was observed falsy), so
+                    // a zero-progress continuation run must still resume tier-0 at
+                    // the post-loop pc, never back at the loop header.
                     flushed_resume_pc = walk_pc;
                 }
                 sresult = irinterp.executeCtx(.{ .heap = self.exec_heap }, sct, regs, sbuf);
@@ -7053,9 +7373,14 @@ pub const TraceState = struct {
                             @panic("replayLedger: fused M1 .deopt exit is not a source-branch guard");
                         const succ = self.traceById(entries[k + 1].id) orelse
                             @panic("replayLedger: fused M1 successor id did not resolve");
-                        if ((self.fusedSourceBranchLinkSlot(owner, succ, proto) orelse
-                            @panic("replayLedger: fused M1 successor is not an armed source-branch ramp")) != e.exit)
-                            @panic("replayLedger: fused M1 armed slot does not match the exit guard");
+                        // Keyed on the EXACT exit, like `hasArmedSiblingHandoff`
+                        // above — an unrolled parent (doc 38 unroll-first) carries
+                        // several source-branch guards, each of which may hold its
+                        // own armed link to the same successor, so "the (first)
+                        // armed slot for the pair" is not unique and comparing it
+                        // to `e.exit` falsely rejected legitimate fused hops.
+                        if (!self.hasArmedSourceBranchLinkAt(owner, e.exit, succ, proto))
+                            @panic("replayLedger: fused M1 transition has no armed source-branch link at the exit guard");
                         std.debug.assert(self.countTracesAt(owner.anchor) >= 2);
                         // The ramp commits ZERO of its OWN iterations, so its `cum`
                         // equals the skip's (`entry_rbx == skip_local`). `local` here is
@@ -7730,8 +8055,14 @@ pub const TraceState = struct {
                 // at the outer header — which would misclassify a *completed*
                 // inner loop as a mid-loop side-exit and resume tier-0 back at the
                 // inner header, re-running the whole (idempotent) marking loop.
-                const loop_done = inner_exit_pc >= 1 and
+                const numeric_done = inner_exit_pc >= 1 and
                     proto.code[guardSourcePc(inner_guard).?].op == .for_loop;
+                // Doc 38: the while twin. The post-loop pc for a while-done is the
+                // condition branch's jump target — NOT `inner_exit_pc`, which is
+                // the loop-body start (inside the loop).
+                const while_post: ?u32 = if (numeric_done) null else whileLoopDonePostPc(inner, iresult.exit_instr);
+                const loop_done = numeric_done or while_post != null;
+                const post_pc: u32 = if (numeric_done) inner_exit_pc else while_post orelse 0;
                 if (!loop_done) {
                     if (inner_local > 0) {
                         self.onSideExitReceipt(inner, inner_local, iresult.exit_instr, 0, .deferred, .entered);
@@ -7744,8 +8075,10 @@ pub const TraceState = struct {
                     break;
                 }
                 // Native committed the loop-done inside `runLinkedLoopDone`; the
-                // tier-1a path still owes the final-iteration flush.
-                if (tier == .ir) {
+                // tier-1a path still owes the final-iteration flush. Doc 38: a
+                // while-done owes NO flush on either tier — its condition guard
+                // fails at the trace top, before the final pass ran any body.
+                if (tier == .ir and numeric_done) {
                     if (!irinterp.flushNumericForLoopDone(inner, regs, ibuf, iresult.exit_instr)) break;
                 }
                 // Hole B (doc 16, Phase 3): hand the ping-pong to the continuation
@@ -7757,15 +8090,15 @@ pub const TraceState = struct {
                 // continuation (doc-15 steady state) this is a no-op. If no
                 // continuation exists at the post-inner PC, resume tier-0 there —
                 // NOT at the inner header — so the inner loop is not re-run.
-                if (current_link.anchor.pc != inner_exit_pc) {
-                    const cont = self.findLinkTrace(proto, inner_exit_pc) orelse {
+                if (current_link.anchor.pc != post_pc) {
+                    const cont = self.findLinkTrace(proto, post_pc) orelse {
                         self.onSideExitReceipt(inner, if (inner_local > 0) inner_local else 1, iresult.exit_instr, 1, .deferred, .entered);
-                        return .{ .completed = linked_completed + 1, .resume_pc = inner_exit_pc };
+                        return .{ .completed = linked_completed + 1, .resume_pc = post_pc };
                     };
                     if (tier == .native_only) {
                         snt = self.nativeFor(cont) orelse {
                             self.onSideExitReceipt(inner, if (inner_local > 0) inner_local else 1, iresult.exit_instr, 1, .deferred, .entered);
-                            return .{ .completed = linked_completed + 1, .resume_pc = inner_exit_pc };
+                            return .{ .completed = linked_completed + 1, .resume_pc = post_pc };
                         };
                     }
                     current_link = cont;
@@ -8406,12 +8739,33 @@ pub const TraceState = struct {
         const exit_pc = guardExitPc(ins) orelse return;
         if (exit_pc == 0 or exit_pc == failed.anchor.pc) return;
         if (exit_pc >= proto.code.len) return;
-        if (proto.code[guardSourcePc(ins).?].op != .for_loop) return;
-        if (!continuationReachesEnclosingBackEdge(proto, exit_pc, failed.anchor.pc)) return;
-        const key = AnchorKey{ .proto = proto, .pc = exit_pc };
+        // Doc 38: two loop-done shapes seed a continuation. A numeric-for's
+        // continuation anchors at the guard's exit PC (the `for_loop`
+        // fall-through). A while loop's anchors at the condition branch's JUMP
+        // TARGET (the post-loop pc) — `guardExitPc` there is the loop-body
+        // start, inside the loop, never a valid continuation anchor.
+        const cont_pc: u32 = if (proto.code[guardSourcePc(ins).?].op == .for_loop)
+            exit_pc
+        else
+            whileLoopDonePostPc(failed, exit_instr) orelse return;
+        if (!continuationReachesEnclosingBackEdge(proto, cont_pc, failed.anchor.pc)) {
+            self.dbg("cont-arm refuse: no enclosing back-edge from pc={d} (inner anchor {d})", .{ cont_pc, failed.anchor.pc });
+            return;
+        }
+        const key = AnchorKey{ .proto = proto, .pc = cont_pc };
         // Don't fight the normal machinery: a trace already cached here, or a gated
         // anchor (a prior continuation aborted → back off), is left alone.
-        if (self.hasTrace(key) or self.recordingBarred(key)) return;
+        // NB: evaluate the map lookups ONCE into locals — `dbg` is comptime-off
+        // in normal builds but its ARGUMENTS are still evaluated, and a lookup
+        // inside the arg tuple re-hashes on every steady-state completion (a
+        // measured ~3.7% of a scimark-lu run before this was hoisted).
+        const has = self.hasTrace(key);
+        const barred = !has and self.recordingBarred(key);
+        if (has or barred) {
+            self.dbg("cont-arm refuse: pc={d} has_trace={} barred={}", .{ cont_pc, has, barred });
+            return;
+        }
+        self.dbg("cont-arm: pending at pc={d} (inner anchor {d})", .{ cont_pc, failed.anchor.pc });
         self.pending_exit_anchor = key;
     }
 
@@ -8422,6 +8776,14 @@ pub const TraceState = struct {
             const ins = proto.code[pc];
             switch (ins.op) {
                 .for_loop, .tfor_loop => {
+                    const target = @as(i64, @intCast(pc)) + 1 + ins.aux;
+                    if (target >= 0 and target <= @as(i64, @intCast(inner_anchor))) return true;
+                },
+                // Doc 38: an enclosing WHILE loop's back-edge is a plain backward
+                // `jmp`. The scan starts past the inner anchor, so a target at or
+                // before it is necessarily backward and enclosing (rule Z-6:
+                // while-in-while nests arm continuations like for-in-for ones).
+                .jmp => {
                     const target = @as(i64, @intCast(pc)) + 1 + ins.aux;
                     if (target >= 0 and target <= @as(i64, @intCast(inner_anchor))) return true;
                 },
@@ -8694,6 +9056,23 @@ pub const TraceState = struct {
             return l.slot_index;
         }
         return null;
+    }
+
+    /// Fused-M1 validation keyed on the EXACT exit (doc 38 unroll-first): is
+    /// there an armed link `parent[slot] → child` where `slot` is a
+    /// source-branch guard? An unrolled parent carries several source-branch
+    /// guards (one per unrolled while-condition pass), each of which may hold
+    /// its own armed link to the same sibling, so validating by "the first
+    /// armed slot for the pair" (`fusedSourceBranchLinkSlot`) is ambiguous —
+    /// the ledger's own exit index is the key.
+    pub fn hasArmedSourceBranchLinkAt(self: *const TraceState, parent: *Trace, slot: u32, child: *Trace, proto: *const Proto) bool {
+        if (parent == child) return false;
+        if (child.anchor.proto != parent.anchor.proto or child.anchor.pc != parent.anchor.pc) return false;
+        if (!self.isSourceBranchGuardExit(parent, slot, proto)) return false;
+        for (self.armed_links.items) |l| {
+            if (l.parent == parent and l.child == child and l.slot_index == slot) return true;
+        }
+        return false;
     }
 
     /// How many cached traces are at this anchor? `pub` so the dispatcher's M1 fused
@@ -11249,6 +11628,10 @@ pub const TraceState = struct {
         @memset(&self.hotcount, 0);
         self.gate.clearRetainingCapacity();
         self.record_gate.clearRetainingCapacity();
+        self.lleave_count.clearRetainingCapacity();
+        self.unroll_fail.clearRetainingCapacity();
+        self.while_static.clearRetainingCapacity();
+        self.while_yield.clearRetainingCapacity();
         self.penalty.clearRetainingCapacity();
         self.guard_failures.clearRetainingCapacity();
         self.wants_side_trace = null;
@@ -11447,12 +11830,13 @@ pub const TraceState = struct {
     /// (capped at `backoff_max`), and after `max_strikes` the anchor is
     /// abandoned for good. Deterministic — keyed only on the monotonic
     /// back-edge tick. Returns null on OOM (gate simply not escalated).
-    fn bumpGateEntry(self: *TraceState, map: *std.AutoHashMapUnmanaged(AnchorKey, Gate), anchor: AnchorKey) ?*Gate {
+    fn bumpGateEntry(self: *TraceState, map: *std.AutoHashMapUnmanaged(AnchorKey, Gate), anchor: AnchorKey, reason: GateReason) ?*Gate {
         const gop = map.getOrPut(self.gpa, anchor) catch return null;
         if (!gop.found_existing) {
-            gop.value_ptr.* = .{ .retry_at = 0, .window = self.config.backoff_base, .strikes = 0 };
+            gop.value_ptr.* = .{ .retry_at = 0, .window = self.config.backoff_base, .strikes = 0, .reason = reason };
         }
         const g = gop.value_ptr;
+        g.reason = reason;
         g.strikes +|= 1;
         g.retry_at = self.tick +| g.window;
         g.window = @min(g.window *| 2, self.config.backoff_max);
@@ -11464,7 +11848,7 @@ pub const TraceState = struct {
     /// legacy thrash, region decay, native-unsupported — never recording
     /// failures (those go to `gateRecordAnchor`).
     pub fn gateAnchor(self: *TraceState, anchor: AnchorKey, reason: GateReason) void {
-        const g = self.bumpGateEntry(&self.gate, anchor) orelse return;
+        const g = self.bumpGateEntry(&self.gate, anchor, reason) orelse return;
         // Doc 20 unpatch trigger: a dispatch-gated anchor must not keep a
         // patched entry — mark pending; the caller-owned safe-point drain
         // restores same-turn and warming re-decides after the cooldown. A
@@ -11478,7 +11862,7 @@ pub const TraceState = struct {
     /// keep dispatching and their entry patches stay live. Sources:
     /// recording aborts and commit failures (LuaJIT `penalty_pc` analog).
     pub fn gateRecordAnchor(self: *TraceState, anchor: AnchorKey, reason: GateReason) void {
-        const g = self.bumpGateEntry(&self.record_gate, anchor) orelse return;
+        const g = self.bumpGateEntry(&self.record_gate, anchor, reason) orelse return;
         self.dbg("gate[record:{s}]: anchor pc={d} strikes={d} window={d} retry_at={d} tick={d}", .{ @tagName(reason), anchor.pc, g.strikes, g.window, g.retry_at, self.tick });
     }
 
@@ -11609,6 +11993,66 @@ pub const TraceState = struct {
     ///  * **not recording** → count this back-edge; on *crossing* `hotloop` (and
     ///    if the anchor is neither already traced nor blacklisted), arm a fresh
     ///    recording that begins on the next loop iteration (at the anchor).
+    /// Doc 38 unroll-first policy: static bytecode geometry for one anchor,
+    /// memoized in `while_static`. Returns the innermost enclosing loop's
+    /// anchor pc when `pc` is a plain-jmp WHILE anchor enclosed by another
+    /// loop in the same proto — the anchor whose `unroll_fail` evidence gates
+    /// this while's rooting. Returns `maxInt(u32)` for everything else: for /
+    /// generic-for / repeat-until anchors (their rooting is untouched),
+    /// top-level whiles (no outer to unroll into), and the shared-anchor
+    /// corner where a `for_loop` back-edge also targets `pc` (the anchor IS
+    /// the outer loop; deferring would block the outer root itself).
+    fn whileEnclosingAnchorPc(self: *TraceState, proto: *const Proto, pc: u32) u32 {
+        const key = AnchorKey{ .proto = proto, .pc = pc };
+        if (self.while_static.get(key)) |v| return v;
+        const none = std.math.maxInt(u32);
+        var result: u32 = none;
+        // (1) `pc` must be a while anchor: some plain backward `jmp` targets it,
+        //     and no loop-op back-edge does.
+        var backedge: ?u32 = null;
+        var disqualified = false;
+        for (proto.code, 0..) |ins, j| {
+            const is_jump = switch (ins.op) {
+                .jmp, .jmp_if_false, .jmp_if_true, .for_loop, .tfor_loop, .jfor_loop => true,
+                else => false,
+            };
+            if (!is_jump) continue;
+            const t = @as(i64, @intCast(j)) + 1 + ins.aux;
+            if (t != pc or j <= pc) continue;
+            switch (ins.op) {
+                .jmp => backedge = @intCast(j),
+                // repeat-until back-edge or a loop-op back-edge sharing the pc:
+                // not a deferrable while anchor.
+                else => disqualified = true,
+            }
+        }
+        if (backedge != null and !disqualified) {
+            const be = backedge.?;
+            // (2) innermost enclosing loop: a backward jump from beyond the
+            //     while's back-edge to strictly before its condition.
+            var have = false;
+            var best_t: u32 = 0;
+            for (proto.code, 0..) |ins, j| {
+                const is_jump = switch (ins.op) {
+                    .jmp, .jmp_if_false, .jmp_if_true, .for_loop, .tfor_loop, .jfor_loop => true,
+                    else => false,
+                };
+                if (!is_jump) continue;
+                const t = @as(i64, @intCast(j)) + 1 + ins.aux;
+                if (t >= 0 and t < pc and j > be) {
+                    const tu: u32 = @intCast(t);
+                    if (!have or tu > best_t) {
+                        best_t = tu;
+                        have = true;
+                    }
+                }
+            }
+            if (have) result = best_t;
+        }
+        self.while_static.put(self.gpa, key, result) catch {};
+        return result;
+    }
+
     pub fn onBackEdge(self: *TraceState, proto: *const Proto, target_pc: u32, regs: RegWindow) void {
         if (self.rec.active) {
             if (self.rec.anchor.proto == proto and self.rec.anchor.pc == target_pc) {
@@ -11708,6 +12152,45 @@ pub const TraceState = struct {
         // `side_src` around to latch a parent exit DONE for a LATER, unrelated
         // commit (Pall retries the exit; `gateAnchor` below is our `penalty_pc`).
         self.rec.side_src = null;
+        // Doc 38 unroll-first policy: a ROOT recording that chose to unroll an
+        // inner while and then died — for ANY reason (too long, nyi op it only
+        // reached because it kept going, guard depth, …) — is one proven
+        // unroll failure at this outer anchor. At `unroll_fail_flip` failures
+        // `recWhileLink` stops unrolling here and decomposes (LINNER).
+        if (self.rec.kind == .root and self.rec.unrolled_while) {
+            if (self.unroll_fail.getOrPut(self.gpa, self.rec.anchor)) |gop| {
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* +|= 1;
+                self.dbg("unroll-fail (record abort): anchor pc={d} count={d}", .{ self.rec.anchor.pc, gop.value_ptr.* });
+            } else |_| {}
+        }
+        // Doc 38 LLEAVE fast retry: which pass a while/repeat-root recording
+        // lands on (cond-true → the body root we want, cond-false → LLEAVE) is
+        // a race against the loop's trip pattern, not evidence of
+        // untraceability. Count the abort but skip the gate strike while under
+        // budget, so the anchor retries at its next hot event; a loop that
+        // exhausts the budget has proven a low/zero remaining-trip pattern and
+        // strikes normally from then on (and unlocks `recWhileLink`'s
+        // innerloopleft unroll). On OOM fall through to the normal strike —
+        // fail-closed, never a hotter path.
+        if (reason == .loop_leave) {
+            if (self.lleave_count.getOrPut(self.gpa, self.rec.anchor)) |gop| {
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* +|= 1;
+                if (gop.value_ptr.* < self.config.lleave_fast_retries) {
+                    // No gate entry is created, so `onBackEdge`'s retry probe
+                    // (`gate.contains or record_gate.contains`) won't fire —
+                    // and the warming counter is already past its one-shot
+                    // `== hotloop` crossing (the review-B3 starvation shape).
+                    // Rewind the counter so the next back-edge re-crosses and
+                    // re-arms: the retry lands on the same instance's next
+                    // trip, which is exactly the cond-true pass we want.
+                    self.counters.put(self.gpa, self.rec.anchor, self.config.hotloop -| 1) catch {};
+                    self.dbg("lleave fast-retry: anchor pc={d} count={d}", .{ self.rec.anchor.pc, gop.value_ptr.* });
+                    return;
+                }
+            } else |_| {}
+        }
         self.gateRecordAnchor(self.rec.anchor, .record_abort);
     }
 
@@ -12039,6 +12522,7 @@ pub const TraceState = struct {
             .rec_path_complete = rec_path_complete,
             .alloc_bound = self.rec.alloc_count,
             .requires_unicode_pin = requires_unicode_pin,
+            .unrolled_while = self.rec.unrolled_while,
         };
         // §T.9: memoize the pure `isCompositeBridgeCandidate` oracle over this trace's
         // instruction indices. Must run AFTER `t.*` is populated — the oracle reads the
@@ -12308,8 +12792,12 @@ pub const TraceState = struct {
             .ge => try self.recCompare(.le, true, instr, regs),
 
             // control flow.
-            .jmp => {}, // straight-line trace: control flow is implicit.
-            .jmp_if_false, .jmp_if_true => try self.recBranch(instr, regs),
+            // Doc 38: while-inner nested-loop linking. A backward `jmp` whose
+            // target already has a `.loop` root trace links to it (continuation/
+            // side) or aborts LINNER (root), instead of unrolling the while body.
+            // Forward jumps and jumps to unknown targets stay no-ops.
+            .jmp => try self.recWhileLink(instr, regs, proto, pc),
+            .jmp_if_false, .jmp_if_true => try self.recBranch(instr, regs, proto, pc),
             .for_loop => try self.recForLoop(instr, regs, pc),
             // Doc 30 c4: the generic-for back-edge — mirrors the CONTINUE
             // direction (first loop var non-nil → publish it as ctrl).
@@ -13521,9 +14009,57 @@ pub const TraceState = struct {
     /// `jmp_if_false`/`jmp_if_true`: pin the *observed* truthiness of the tested
     /// register. Which path the trace records is whatever tier-0 took; the guard
     /// is what keeps the straight-line trace valid.
-    fn recBranch(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+    fn recBranch(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32) !void {
+        const truthy_early = regs.get(instr.a).isTruthy();
+        // Doc 38 LLEAVE (LuaJIT `rec_loop_interp`): a ROOT trace anchored at a
+        // loop header "must loop back to form a root trace". If this branch is
+        // the anchor loop's OWN exit edge and tier-0 took the exit direction,
+        // abort instead of recording the enclosing code — the retry (after the
+        // record-gate cooldown) lands on a pass that stays in the loop and
+        // records the loop-BODY root the continuation machinery links against.
+        // Anchor-tied structurally, so exits of OTHER loops (sequential
+        // whiles, an inlined callee's loops — excluded by depth 0) never
+        // match; side/continuation recordings legitimately cross loop exits.
+        if (self.rec.kind == .root and self.rec.inline_depth == 0 and
+            self.rec.anchor.proto == proto)
+        {
+            const jumped = (instr.op == .jmp_if_true) == truthy_early;
+            const target_i: i64 = @as(i64, pc) + instr.aux; // `pc` = post-increment cursor, as in applyJump
+            if (target_i >= 0 and target_i < @as(i64, @intCast(proto.code.len))) {
+                const target: u32 = @intCast(target_i);
+                if (target > pc) {
+                    // `while` shape: forward branch over the body whose last
+                    // instruction is the backward `jmp` to our anchor (the
+                    // condition start). Taking the branch leaves the loop.
+                    //
+                    // ROOT recordings abort unconditionally (LuaJIT LLEAVE):
+                    // the retry lands on a cond-true pass and records the
+                    // body root first. The cond-false GLUE sibling
+                    // (`guard_false → outer body → loop`, the figure-eight —
+                    // measured 78.5 cyc/it vs 137 for root+link on a
+                    // bounded-variance nest) is deliberately reachable only
+                    // through the SIDE-trace route: `.side` recordings skip
+                    // this check by kind, and the side want at a while-done
+                    // exit only accrues once the anchor's OBSERVED trips/entry
+                    // prove low (`whileDoneHotnessEligible`) — evidence a root
+                    // recording cannot have yet (no committed trace → no
+                    // receipts). That ordering keeps high-trip whiles
+                    // (nsieve-bit-fp) on the pure body-root + link family the
+                    // glue formation measurably degrades.
+                    if (jumped and target >= 1 and proto.code[target - 1].op == .jmp and
+                        @as(i64, target) + proto.code[target - 1].aux == @as(i64, self.rec.anchor.pc))
+                    {
+                        return self.abort(.loop_leave);
+                    }
+                } else if (instr.op == .jmp_if_false and target == self.rec.anchor.pc and !jumped) {
+                    // `repeat`/`until` shape: backward `jmp_if_false` to our
+                    // anchor (the body start). Falling through leaves the loop.
+                    return self.abort(.loop_leave);
+                }
+            }
+        }
         const ra = try self.refOf(instr.a);
-        const truthy = regs.get(instr.a).isTruthy();
+        const truthy = truthy_early;
         // Fold statically-decided branches (doc 30 c5): a konst's truthiness is
         // fixed forever, and a proven-string producer result (`scap_str`,
         // `tostr_*`, the snew class) is ALWAYS truthy — only nil/false are
@@ -13904,6 +14440,106 @@ pub const TraceState = struct {
         // inlined `for_prep`), so the path prefix is empty. Set together with
         // `link_target` so the commit-time ⇔ invariant holds by construction.
         self.rec.link_target = inner_anchor;
+        self.rec.pending_link_provenance = .{ .link_terminal = .{
+            .path = pathFromFrames(&self.rec.frames, self.rec.inline_depth),
+            .inline_depth = self.rec.inline_depth,
+            .source_proto_id = self.rec.cur_proto_id,
+            .source_pc = self.rec.cur_pc -| 1,
+        } };
+        self.closeTrace(regs);
+    }
+
+    /// Doc 38 — while-inner nested-loop linking. Extends the doc 15 linking
+    /// machinery to `while` loops, whose bytecode structure is
+    /// `<cmp>; jmp_if_false <past_end>; <body>; jmp <back_to_cmp>`.
+    ///
+    /// When a continuation/side recording encounters a backward `jmp` whose
+    /// target already has a `.loop` root trace (the inner while-loop root),
+    /// this function closes the recording with a `.link` terminal to that root
+    /// — exactly the numeric-for pattern from `recForPrepLink`, but simpler:
+    /// no pre-decrement arithmetic and no explicit bounds guard (the inner
+    /// root's own condition-prefix guard handles zero-trip).
+    ///
+    /// Root recordings abort LINNER (matching `recForPrepLink` and LuaJIT's
+    /// `rec_loop_jit` root gate): the inner loop must spawn its own root
+    /// first.
+    ///
+    /// Forward jumps, self-anchor jumps, OOB jumps, and jumps at inline
+    /// depth > 0 are silently ignored (the `.jmp` stays a no-op and the
+    /// recording unrolls the while body as before).
+    fn recWhileLink(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32) !void {
+        // Compute the jump target in signed arithmetic, matching `applyJump`.
+        // `pc` is the post-increment cursor (the instruction AFTER this `jmp`),
+        // so `pc + aux` gives the jump destination.
+        const target_i: i64 = @as(i64, pc) + instr.aux;
+        if (target_i < 0 or target_i >= @as(i64, @intCast(proto.code.len))) return; // OOB → no-op
+        const target: u32 = @intCast(target_i);
+
+        // Only backward jumps are while-loop re-entries. Forward jumps (break,
+        // goto, if-skip) are straight-line in the trace.
+        if (target >= pc) return;
+
+        // If this jump targets our own anchor, `maybeCloseAtAnchor` (called
+        // before the mirror) or `onBackEdge` already closed the trace. This is
+        // a safety net — in practice we shouldn't reach here for our own anchor.
+        // Compare the full (proto, pc) pair, not just pc, to be future-proof.
+        if (self.rec.anchor.proto == proto and target == self.rec.anchor.pc) return;
+
+        // Links at inline depth > 0 can't work: `driveChain` resolves
+        // `link_target` in the anchor proto, not the callee's. Same constraint
+        // as `recForPrepLink`.
+        if (self.rec.inline_depth > 0) return;
+
+        // Root recordings abort LINNER — REGARDLESS of whether the inner while
+        // has a root yet (LuaJIT `rec_loop_interp`: entering an inner loop in a
+        // root aborts so the inner loop traces FIRST; making it conditional on
+        // an existing inner root made the outcome a recording race). The
+        // continuation machinery then owns the nest: the inner root's loop-done
+        // exits arm a continuation at the post-loop pc (`maybeArmContinuation`,
+        // doc 38), which records the outer body and links back here. Unrolling
+        // instead would commit a trip-count-pinned trace that thrashes on trip
+        // variance AND clogs the anchor's trace population.
+        //
+        // Escape hatch (LuaJIT `innerloopleft`): an inner anchor that
+        // repeatedly failed to loop back (`loop_leave` aborts exhausting the
+        // fast-retry budget — reason-specific, exactly like LuaJIT keys its
+        // check on LLEAVE/LINNER penalties) has a low/zero remaining-trip
+        // pattern; a root may then unroll it, which is strictly better than
+        // both sides backing off forever. Deterministic — a pure abort count.
+        if (self.rec.kind == .root) {
+            // innerloopleft: an inner that PROVED it cannot root (LLEAVE budget
+            // exhausted) can only ever be unrolled — no evidence overrides this.
+            if (self.lleave_count.get(.{ .proto = proto, .pc = target })) |n| {
+                if (n >= self.config.lleave_fast_retries) {
+                    self.rec.unrolled_while = true;
+                    return; // unroll
+                }
+            }
+            // Unroll-first (doc 38 revision — LuaJIT's innerloopleft mirrored):
+            // mahina's decomposed inner-root+link pays a runtime re-entry per
+            // inner completion (exits are not patched branches), so unrolling
+            // into the outer root wins whenever sibling coverage can absorb the
+            // trip variance (measured: ~17 vs ~95 native cyc/it on a bounded-
+            // variance nest). Only an outer anchor with PROVEN unroll failure
+            // (`unroll_fail` >= flip: unrolling recordings aborted, or
+            // committed unrolled roots thrash-gated) decomposes via LINNER.
+            const fails = self.unroll_fail.get(self.rec.anchor) orelse 0;
+            if (fails < self.config.unroll_fail_flip) {
+                self.rec.unrolled_while = true;
+                return; // unroll
+            }
+            return self.abort(.nyi_opcode); // LINNER → inner root + link
+        }
+
+        // Side/continuation recordings: no inner root yet → no-op (the historical
+        // straight-line unroll). The inner while warms up via `onBackEdge` and
+        // spawns its own root; a later continuation then links here.
+        if (self.findLoopTrace(proto, target) == null) return;
+
+        // Close with a `.link` terminal to the inner while root. The φ writeback
+        // in `commit()` ensures all modified slots are flushed; unmodified slots
+        // remain coherent in the physical register file.
+        self.rec.link_target = target;
         self.rec.pending_link_provenance = .{ .link_terminal = .{
             .path = pathFromFrames(&self.rec.frames, self.rec.inline_depth),
             .inline_depth = self.rec.inline_depth,
@@ -15303,6 +15939,12 @@ pub const Recorder = struct {
     active: bool = false,
     anchor: AnchorKey = .{ .proto = undefined, .pc = 0 },
     abort_reason: ?AbortReason = null,
+    /// Doc 38 unroll-first policy: this ROOT recording followed at least one
+    /// inner-while back-edge inline (unrolled it) instead of aborting LINNER.
+    /// Read at abort (an unrolling root that dies bumps the outer anchor's
+    /// `unroll_fail` evidence) and carried onto the committed `Trace` so
+    /// runtime thrash of an unrolled root counts as the same evidence.
+    unrolled_while: bool = false,
     instrs: std.ArrayListUnmanaged(IrInstr) = .empty,
     consts: std.ArrayListUnmanaged(Value) = .empty,
     entry_slots: std.ArrayListUnmanaged(u16) = .empty,
@@ -15552,6 +16194,7 @@ pub const Recorder = struct {
         self.base_off = 0;
         self.inline_depth = 0;
         self.multret_top = null; // doc 27 §3a: never inherit a stale shadow
+        self.unrolled_while = false;
         self.next_input_slot = num_registers;
         self.active = true;
     }

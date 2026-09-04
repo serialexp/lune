@@ -1501,3 +1501,28 @@ Three things to remember when reading those boards:
     ratios. **Fix (Gothab side):** pin the bench pool's `instance_type_allowlist` to a
     single instance type or CPU generation. Until then, only jit/lj RATIOS are comparable
     across runs; absolute wall-clock A/B needs both runs on the same hardware.
+
+## Numeric φ widening (next arc after doc 38, 2026-09-04)
+
+A while-body root recorded at trip 1-2 pins an int entry load on a carried
+slot that the body floats (`j - k` with float k, `k / 2`) — lk=int/sk=float,
+the nativegen RV-3 analyze bail, so the root never compiles and the anchor
+starves (fft_bitreverse:9 at 0% residency). LuaJIT unifies with CONV int→num
+at record time. The mahina version must keep deopt flushes byte-identical:
+convert the ENTRY value explicitly (new ref), leave pre-φ snapshot refs on
+the original int ref, carry the φ as float. Watch the interaction with the
+deliberate `int_of_float` demotion in mixed compares (the nsieve float-limit
+win) — demote when the int side is the induction variable, widen when the
+int side is the slot that floats.
+
+## Type-guard side traces (deferred, 2026-09-04)
+
+The general mechanism (side traces for guard_int/guard_float failures on
+type-oscillating variables) is sound but needs:
+1. A scalar-path `consumeSideTraceWantAtResume` call (missing today)
+2. Restriction to tier-1a chaining (native type guards are hoisted to prologue)
+3. A commit-time duplicate-fingerprint check (DONE-latch poisoning risk)
+
+Deferred because fft_bitreverse's actual problem is branch-shape variance
+from while-inner unrolling, not type oscillation. Come back when a benchmark
+demonstrates genuine type oscillation on a carried slot.
