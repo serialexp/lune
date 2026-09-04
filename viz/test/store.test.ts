@@ -14,7 +14,7 @@ test("loadBytes populates the store and auto-selects the first trace", () => {
   loadBytes("counting-loop.mahinatrace", bytes);
   expect(state.error).toBeNull();
   expect(state.fileName).toBe("counting-loop.mahinatrace");
-  expect(state.version).toBe(2); // v2: loop-carry moved into the instr stream as φ nodes
+  expect(state.version).toBe(3); // v3: traces record whether numeric φ stabilization used a peel
   expect(state.traces.length).toBe(1);
   expect(state.selected).toBe(0);
 

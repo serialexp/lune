@@ -1327,7 +1327,13 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     // (the carry tier-0 resumes from); an internal φ refreshes its own
                     // carried scratch so the next iteration retains it.
                     flushPhiWriteback(t, regs, values);
-                    completed += 1;
+                    // Doc 39: a PEELED trace's run-once region is a real tier-0
+                    // iteration (the type-stabilizing first pass), so its first
+                    // back-edge completes TWO iterations. Sound against every
+                    // other use of `completed` in this fn: the run-once skip and
+                    // internal-φ init only distinguish 0 vs > 0, and `completed`
+                    // becomes nonzero at exactly the same event either way.
+                    completed += 1 + @as(usize, @intFromBool(t.peeled and completed == 0));
                     if (record) rec.commit();
                     continue :iter;
                 },

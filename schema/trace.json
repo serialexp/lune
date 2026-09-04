@@ -47,10 +47,11 @@
     },
 
     "Trace": {
-      "description": "A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized.",
+      "description": "A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized. `peeled` (doc 39, wire v3): 1 when the trace was committed from a type-stabilizing peel — its preheader run-once region is a REAL tier-0 iteration, so the first back-edge completes two iterations and a zero-completion deopt replays from the entry state. Semantic, not inferable from the marker (an LICM preheader completes zero iterations).",
       "sequence": [
         { "name": "anchor_proto_id", "type": "uint32" },
         { "name": "anchor_pc",       "type": "uint32" },
+        { "name": "peeled",          "type": "uint8" },
         { "name": "instrs",      "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "IrInstr" } },
         { "name": "consts",      "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "ConstValue" } },
         { "name": "entry_slots", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "uint16" } }

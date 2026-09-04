@@ -625,7 +625,7 @@ export class IrInstrDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized.
+ * A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized. `peeled` (doc 39, wire v3): 1 when the trace was committed from a type-stabilizing peel — its preheader run-once region is a REAL tier-0 iteration, so the first back-edge completes two iterations and a zero-completion deopt replays from the entry state. Semantic, not inferable from the marker (an LICM preheader completes zero iterations).
  */
 export interface TraceInput {
   /**
@@ -638,6 +638,11 @@ export interface TraceInput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   anchor_pc: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  peeled: number;
   /**
    * Array
    * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
@@ -671,7 +676,7 @@ export interface TraceInput {
 }
 
 /**
- * A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized.
+ * A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized. `peeled` (doc 39, wire v3): 1 when the trace was committed from a type-stabilizing peel — its preheader run-once region is a REAL tier-0 iteration, so the first back-edge completes two iterations and a zero-completion deopt replays from the entry state. Semantic, not inferable from the marker (an LICM preheader completes zero iterations).
  */
 export interface TraceOutput {
   /**
@@ -684,6 +689,11 @@ export interface TraceOutput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   anchor_pc: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  peeled: number;
   /**
    * Array
    * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
@@ -731,6 +741,7 @@ export class TraceEncoder extends BitStreamEncoder {
 
     this.writeUint32(value.anchor_proto_id, "little_endian");
     this.writeUint32(value.anchor_pc, "little_endian");
+    this.writeUint8(value.peeled);
     this.writeUint16(value.instrs.length, "little_endian");
     for (let value_instrs__iter_index = 0; value_instrs__iter_index < value.instrs.length; value_instrs__iter_index++) {
       const value_instrs__iter = value.instrs[value_instrs__iter_index];
@@ -763,7 +774,7 @@ export class TraceEncoder extends BitStreamEncoder {
    */
   calculateSize(value: Trace): number {
     let size = 0;
-    size += 8; // anchor_proto_id + anchor_pc
+    size += 9; // anchor_proto_id + anchor_pc + peeled
     // instrs: array (kind: length_prefixed)
     for (const item of value.instrs) {
       const instrs_itemEncoder = new IrInstrEncoder();
@@ -796,6 +807,7 @@ export class TraceDecoder extends SeekableBitStreamDecoder {
 
     value.anchor_proto_id = this.readUint32("little_endian");
     value.anchor_pc = this.readUint32("little_endian");
+    value.peeled = this.readUint8();
     value.instrs = [];
     const instrs_length = this.readUint16("little_endian");
     for (let i = 0; i < instrs_length; i++) {
@@ -962,6 +974,7 @@ export class TraceFileDecoder extends SeekableBitStreamDecoder {
       traces__iter = {};
       traces__iter.anchor_proto_id = this.readUint32("little_endian");
       traces__iter.anchor_pc = this.readUint32("little_endian");
+      traces__iter.peeled = this.readUint8();
       traces__iter.instrs = [];
       const traces__iter_instrs_length = this.readUint16("little_endian");
       for (let i = 0; i < traces__iter_instrs_length; i++) {
@@ -1515,7 +1528,7 @@ export class HeapStringDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A table object: the dense array part (keys 1..n, positionally) plus the hash part (every other key). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel.
+ * A table object: the dense array part (keys 0..asize-1, positionally — entry i IS logical key i, slot-0 hole included in-band; doc 18) plus the hash part (every other key; an array-covered integer key in the hash is invalid and rejected at restore). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel.
  */
 export interface HeapTableInput {
   /**
@@ -1546,7 +1559,7 @@ export interface HeapTableInput {
 }
 
 /**
- * A table object: the dense array part (keys 1..n, positionally) plus the hash part (every other key). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel.
+ * A table object: the dense array part (keys 0..asize-1, positionally — entry i IS logical key i, slot-0 hole included in-band; doc 18) plus the hash part (every other key; an array-covered integer key in the hash is invalid and rejected at restore). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel.
  */
 export interface HeapTableOutput {
   /**

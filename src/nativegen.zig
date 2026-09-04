@@ -305,6 +305,7 @@ pub const McodeArena = struct {
     /// writable (including already-compiled sibling traces) is safe — it is flipped
     /// back to RX before the compile returns.
     fn protectRegion(mem: []align(page_align) u8, exec: bool) MapError!void {
+        if (comptime !is_x64_linux) return error.UnsupportedTarget;
         const prot: std.posix.PROT = if (exec)
             .{ .READ = true, .EXEC = true }
         else
@@ -949,6 +950,12 @@ pub const CompiledTrace = struct {
     /// recorded at emission time (see `EntryStubs.seed_prologue`). Independent
     /// witness for the `seed_plan.nonEmpty() ⟺ prologue-present` invariant.
     seed_prologue: bool = false,
+    /// Doc 39: the compiled trace is a PEELED root (`Trace.peeled`). Its first
+    /// back-edge closes TWO tier-0 iterations (the run-once stabilizing pass +
+    /// the first steady-state pass), so the run wrapper adds 1 to the reported
+    /// `local_completed` whenever local progress is nonzero — mirroring
+    /// irinterp's `completed += 1 + (peeled and completed == 0)` at `.loop`.
+    peeled: bool = false,
 
     pub const EntryFn = fn ([*]u8, [*]u64, *NativeResult) callconv(.c) void;
     /// The shared frameless trampoline's C-ABI type: SoA lanes + result out-param,
@@ -1038,7 +1045,22 @@ pub const CompiledTrace = struct {
         // into a child under the shared frame, the fused child inherits the parent's
         // cumulative `rbx`, so `entry_rbx > 0` is the expected steady state and the old
         // `assert(entry_rbx == 0)` no longer holds.
-        const local: usize = result.completed -% result.entry_rbx;
+        const local: usize = blk: {
+            const raw = result.completed -% result.entry_rbx;
+            // Doc 39: a peeled trace's first back-edge closes TWO tier-0
+            // iterations (run-once pass + first steady pass) but increments rbx
+            // once, so nonzero local progress under-counts by exactly 1. Add it
+            // back HERE — the seam where tier-1a's contract (irinterp bakes the
+            // +1 into its returned `completed`) meets native's raw rbx delta —
+            // so every consumer sees the same iteration accounting on both
+            // tiers. `result.completed` itself stays the raw chain-cumulative
+            // rbx (the ledger asserts below compare raw values); peeled traces
+            // are excluded from fusion (armNativeLink refuses them), so the
+            // raw/adjusted split never crosses a chain boundary. Zero local
+            // progress stays zero: an exit before the first back-edge replays
+            // both partial iterations on tier-0.
+            break :blk if (self.peeled and raw > 0) raw + 1 else raw;
+        };
         // 2.3c-2a: the per-transition ledger's TERMINAL entry must reproduce the scalar
         // result fields. The ledger's whole reason to exist — recover the HIDDEN
         // intermediate hops a fused span drops — is only trustworthy if its last entry
@@ -1419,6 +1441,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena, see
         .metadata_cells = metadata_cells,
         .seed_plan = seed_plan,
         .seed_prologue = entry_stubs.seed_prologue,
+        .peeled = t.peeled,
     };
 }
 
@@ -2922,6 +2945,19 @@ const SlotInfo = struct {
     /// home in place and the back-edge shuffle move for this slot self-elides. Only set
     /// for `carried` slots passing the safety predicate (see `analyzeInner`).
     coalesced: bool,
+    /// Doc 39 (peeled trace): the ref of this slot's INTERNAL (steady-state) φ —
+    /// the slot-bound φ's `a` association stamped by the recorder — or -1. When
+    /// >= 0 the slot's post-run-once value lives in that φ's computed home, not in
+    /// `home`: `home` holds the ENTRY value (iteration 1's class, used only by the
+    /// run-once region), the back-edge shuffle skips the slot home entirely (the
+    /// internal-φ move carries the value; the home's register class may not even
+    /// match the steady kind), and every deopt flush re-boxes from the steady
+    /// home with `steady_kind`. Only ever set for `t.peeled` traces.
+    steady_phi: i32 = -1,
+    /// Kind of the steady-state value (`kinds[steady_phi]`); equals `kind` for a
+    /// type-stable carried slot, differs (int entry → float steady) for a widened
+    /// one. `.none` when `steady_phi < 0`.
+    steady_kind: Kind = .none,
     /// Phase 2 (invariant array-base hoisting): for a `.ptr` slot used as an
     /// `aref.a`, the loop-invariant array base pointers / length, materialized ONCE
     /// in the prologue into a dedicated register and reused across every iteration
@@ -3317,6 +3353,14 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
                     if (t.instrs[n - 1].op == .link and isNumKind(lk) and isNumKind(sk)) {
                         // Accept: the slot homes as the load class; the φ writeback
                         // converts at the back-edge.
+                    } else if (t.peeled and isNumKind(lk) and isNumKind(sk)) {
+                        // Doc 39: a peeled trace's widened carried slot (int entry,
+                        // float steady state). Accepted iff the peeled post-pass
+                        // below finds the slot-bound φ's steady-φ association —
+                        // the entry home keeps the load class (the prologue keeps
+                        // demanding TAG_INT, which is what fresh instances
+                        // present); the steady value lives in the internal φ's
+                        // computed home and every flush re-boxes from there.
                     } else {
                         return error.Bail;
                     }
@@ -3332,6 +3376,46 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
             s.kind = kinds[@intCast(s.store_ref)];
         }
     }
+    // Doc 39: peeled-trace steady-φ association. For every carried slot of a
+    // peeled trace, connect the slot to its internal (steady-state) φ via the
+    // slot-bound φ's `a` field (stamped by the recorder at commit;
+    // assertWellFormed pins that a nonzero `a` points at a PHI_INTERNAL φ).
+    // Post-run-once, the slot's live value rides that φ's computed home — the
+    // entry home is DEAD after iteration 1 (all slot_load uses are in the
+    // run-once region), so the back-edge shuffle skips it and the deopt flush
+    // reads the steady home instead. Fail-closed rules:
+    //   * widened slot (store kind ≠ load kind) with NO steady φ → Bail: the
+    //     back-edge move into the load-class home would be class-mismatched and
+    //     the flush tag wrong. (`a == 0` means the body pass never read the
+    //     slot before writing it — a shape v1 does not home.)
+    //   * steady φ present but its kind ≠ the store kind → Bail (malformed).
+    //   * scalar carried only: the carried-heap/carried-string classes keep
+    //     their own machinery (their per-iteration facts are body-anchored) —
+    //     v1 refuses them in a peeled trace rather than reasoning about their
+    //     run-once/steady split.
+    if (t.peeled) {
+        for (slots.items) |*s| {
+            if (s.class != .carried) continue;
+            if (s.kind == .heap or s.kind == .ptr) return error.Bail;
+            const sk = kinds[@intCast(s.store_ref)];
+            // Find this slot's slot-bound φ and read its steady association.
+            var steady: i32 = -1;
+            for (t.instrs) |p| {
+                if (p.op == .phi and p.aux >= 0 and @as(u16, @intCast(p.aux)) == s.slot) {
+                    if (p.a != 0) steady = @intCast(p.a);
+                    break;
+                }
+            }
+            if (steady >= 0) {
+                if (kinds[@intCast(steady)] != sk) return error.Bail;
+                s.steady_phi = steady;
+                s.steady_kind = sk;
+            } else if (sk != s.kind) {
+                return error.Bail; // widened but write-only-in-body: no steady home
+            }
+        }
+    }
+
     // [doc 22 §A.1, fail closed] Structural bails for carried-heap slots. The
     // `.ptr`-keyed lane/grid analyses below skip a carried-heap slot by kind
     // mismatch — which means an aref/garow rooted at one would otherwise compile
@@ -3614,6 +3698,14 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
                 // The init must be a run-once value (a < marker), so the prologue
                 // init-move reads a home already materialized before `loop_top`.
                 if (marker_idx == null or ins.a >= ms) return error.Bail;
+                // ... and one with a PERSISTENT location the seed move can read:
+                // a run-once transient (computed home, this same block) or a
+                // slot_load (slot home). LICM inits are always transients; a
+                // peeled trace's init is an arbitrary iteration-1 ref, so
+                // anything else (a scan-allocated non-transient producer whose
+                // register may be reused) fails closed.
+                const init_op = t.instrs[ins.a].op;
+                if (!isTransient(init_op) and init_op != .slot_load) return error.Bail;
             }
             switch (kinds[i]) {
                 .float => {
@@ -3789,6 +3881,11 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         }
         for (slots.items, 0..) |*s, sid| {
             if (s.class != .carried) continue;
+            // Doc 39: never coalesce in a peeled trace. A steady-φ slot's entry
+            // home is DEAD after the run-once region — pinning a body transient
+            // into it would resurrect it with (potentially) the wrong register
+            // class, and the back-edge shuffle deliberately skips these homes.
+            if (s.steady_phi >= 0) continue;
             // [Phase D] Float coalescing is disabled in the first cut: SSE has no
             // `op [mem],xmm` store form and a float op always materializes into a
             // scratch XMM before writing its home, so there is no in-place win to
@@ -4957,6 +5054,11 @@ fn isNumericForLoopDoneGuard(t: *const Trace, instr_idx: usize) bool {
 /// are excluded.
 pub fn isCompositeBridgeCandidate(t: *const Trace, instr_idx: usize) bool {
     if (instr_idx >= t.instrs.len) return false;
+    // Doc 39: no composite bridging out of a peeled trace (v1). The bridge
+    // snapshot commits slot-bound φ state without the run-once/steady split or
+    // the zero-completion skip — refuse the candidate so every exit stays an
+    // ordinary deopt through the peel-aware `deopt_exit`.
+    if (t.peeled) return false;
     const guard = t.instrs[instr_idx];
     if (guard.op != .guard_true and guard.op != .guard_false) return false;
     if (isNumericForLoopDoneGuard(t, instr_idx)) return false;
@@ -5770,6 +5872,9 @@ fn emitLinkedLoopDoneSnapshot(
     alloc: *const Alloc,
     exit_instr: usize,
 ) !void {
+    // Doc 39: unreachable for a peeled trace — the linked branch that creates
+    // this stub's label is gated on `!t.peeled` in `lower`.
+    std.debug.assert(!t.peeled);
     var si = exit_instr + 1;
     while (si < t.instrs.len) : (si += 1) {
         const p = t.instrs[si];
@@ -6953,7 +7058,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 // self-move), so it is dropped from the parallel move entirely.
                 var nmoves: usize = 0;
                 for (alloc.slots) |s| {
-                    if (s.class == .carried and !s.coalesced) nmoves += 1;
+                    // Doc 39: a steady-φ slot's entry home is dead post-run-once —
+                    // its carried value rides the internal φ's move below (the
+                    // entry home's register class may not even match the steady
+                    // kind), so the slot-home move is skipped entirely.
+                    if (s.class == .carried and !s.coalesced and s.steady_phi < 0) nmoves += 1;
                 }
                 // Internal φs (Phase E2): each updates its computed home from its
                 // back-edge value `b` in this same parallel shuffle — the move set
@@ -6967,7 +7076,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 defer gpa.free(done);
                 var mi: usize = 0;
                 for (alloc.slots) |s| {
-                    if (s.class != .carried or s.coalesced) continue;
+                    if (s.class != .carried or s.coalesced or s.steady_phi >= 0) continue;
                     moves[mi] = .{
                         .dst = slotHomePlace(s),
                         .src = placeOfRef(alloc, @intCast(s.store_ref)),
@@ -6989,6 +7098,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 try a.jmp(loop_top);
             },
             .link => {
+                // Doc 39: peel is gated on `link_target == null` at recording, so a
+                // peeled trace can never carry a `.link` terminal.
+                std.debug.assert(!t.peeled);
                 // A link-terminated continuation is a one-shot hand-off, not a loop
                 // back-edge. Flush every slot-bound φ snapshot directly into regs[]
                 // so the linked inner root sees exactly the same entry state as the
@@ -7067,7 +7179,12 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 // unemitted this guard is mode-0-always: ordinary deopt, tier-0
                 // replays the final iteration (replay-idempotent, sound). Tier-1a
                 // declines through the same predicate in flushNumericForLoopDone.
-                if (irinterp.loopDoneSnapshotSupported(t, ei)) {
+                // Doc 39: a peeled trace never takes the linked-materialized path —
+                // its snapshot walk has no notion of the run-once/steady split
+                // (the φ snapshot would commit entry-class state). Mode-0-always:
+                // ordinary deopt through `deopt_exit`, which carries the peeled
+                // flush semantics.
+                if (!t.peeled and irinterp.loopDoneSnapshotSupported(t, ei)) {
                     try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 0);
                     try a.jcc(.ne, try nativeLinkedLoopDoneLabel(a, linked_loop_done_labels, ei));
                 }
@@ -7160,13 +7277,37 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     // — invariant + write-only slots are already coherent. Then write `completed`
     // to the native result out-param and return.
     a.bind(deopt_exit);
+    // Doc 39: a peeled trace that has completed ZERO local iterations must leave
+    // regs[] untouched — the boxes still hold the int entry state, and tier-0
+    // replays iterations 1–2 from the header in full int semantics (the
+    // byte-identity core; mirrors irinterp's flush-only-at-`.loop` invariant).
+    // The predicate is `rbx == entry_rbx`, NOT `rbx == 0`: rbx is
+    // chain-cumulative, so a body entered through an armed link starts with
+    // rbx > 0 and local completions are `rbx − entry_rbx`. rax is free here —
+    // the mini-stubs staged `exit_target` in MEMORY precisely because this
+    // flush block clobbers rax.
+    var skip_flush: ?x64.Label = null;
+    if (t.peeled) {
+        const l = try a.label();
+        try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "entry_rbx"));
+        try a.cmpRegReg(.rbx, .rax);
+        try a.jcc(.e, l);
+        skip_flush = l;
+    }
     for (alloc.slots) |s| {
         if (s.class != .carried) continue;
         // Re-box the carried home with its kind's tag: int homes write TAG_INT from a
         // GP reg / spill cell; a float home writes TAG_FLOAT + `movsd` from its XMM
         // (a register-homed float can't go through `movMemReg`). flushSlot dispatches.
-        try flushSlot(a, @as(i32, s.slot), s.kind, slotHomePlace(s));
+        // Doc 39: a steady-φ slot re-boxes from the internal φ's computed home with
+        // the STEADY kind — the entry home is stale after the run-once region.
+        if (s.steady_phi >= 0) {
+            try flushSlot(a, @as(i32, s.slot), s.steady_kind, placeOfRef(alloc, @intCast(s.steady_phi)));
+        } else {
+            try flushSlot(a, @as(i32, s.slot), s.kind, slotHomePlace(s));
+        }
     }
+    if (skip_flush) |l| a.bind(l);
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
     // 2.3c-2a: record this ordinary / loop-done-ordinary transition. The mini-stub wrote
     // `exit_instr` = ei into memory and staged `exit_target` (its own `slot[ei]`, which
@@ -7264,10 +7405,26 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         for (patch_emissions, 0..) |maybe, ei| if (maybe) |em| {
             a.bind(em.epilogue);
             if (em.kind == .deopt) {
+                // Doc 39: same zero-local-completion skip + steady-home flush as
+                // the shared `deopt_exit` block above — this is its silent
+                // duplicate and must stay semantically identical.
+                var silent_skip: ?x64.Label = null;
+                if (t.peeled) {
+                    const l = try a.label();
+                    try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "entry_rbx"));
+                    try a.cmpRegReg(.rbx, .rax);
+                    try a.jcc(.e, l);
+                    silent_skip = l;
+                }
                 for (alloc.slots) |s| {
                     if (s.class != .carried) continue;
-                    try flushSlot(a, @as(i32, s.slot), s.kind, slotHomePlace(s));
+                    if (s.steady_phi >= 0) {
+                        try flushSlot(a, @as(i32, s.slot), s.steady_kind, placeOfRef(alloc, @intCast(s.steady_phi)));
+                    } else {
+                        try flushSlot(a, @as(i32, s.slot), s.kind, slotHomePlace(s));
+                    }
                 }
+                if (silent_skip) |l| a.bind(l);
                 try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
             }
             try emitSilentEpilogue(a, em.kind, &metadata_cells[ei], se, t.id);

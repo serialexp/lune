@@ -19,7 +19,7 @@ const bytes = new Uint8Array(readFileSync(fixturePath));
 
 test("decodes the fixture header + trace count", () => {
   const file = decodeTraceFile(bytes);
-  expect(file.version).toBe(2); // v2: loop-carry moved into the instr stream as φ nodes
+  expect(file.version).toBe(3); // v3: traces record whether numeric φ stabilization used a peel
   expect(file.traces.length).toBe(1);
 });
 

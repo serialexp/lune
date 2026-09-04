@@ -21,6 +21,44 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-04 (LATEST-105) — doc 39 IMPLEMENTED: the peel works end-to-end; premise gap found and documented
+
+All doc 39 phases (0–3) + the core of Phase 4 are landed and green: full
+suite (incl. five new 10-mode matrix tests in `interp_native_test.zig`
+with a peel-committed+compiled inspect), hashgate 84/84, CLI probes
+byte-identical across tier-0/tier-1a/native on every peel shape
+(recurring re-entry, zero-completion deopt, >2^53 run-once int
+exactness, F1-reverse no-peel, numeric-for-anchor no-peel). The peeled
+trace records (preheader mid-stream, internal φs, slot φ `steady=%N`
+associations — the disassembler now prints them), compiles native
+(RV-3 relaxed via `SlotInfo.steady_phi`/`steady_kind`), enters
+repeatedly, and deopts correctly at zero local completions (flush
+skipped on both `deopt_exit` and silent epilogues, `rbx == entry_rbx`).
+Fusion around peeled traces is refused (`armNativeLink`) and the run
+wrapper adds the +1 local completion at the unfused seam, mirroring
+irinterp's `completed += 2` first back-edge.
+
+**THE FINDING (doc 39 "What implementation revealed")**: the fft
+premise was wrong on the post-doc-38 tree. Warming can never start a
+root recording at instance trip 1 (recording begins at the arming
+BACK-EDGE arrival, trip ≥ 2), so the reset-to-int family (fft
+bitreverse `k = n`) always records FLOAT-entry — the :55 root compiles
+already; the remaining fft RV-3 bails (:68 + second :55) are the
+deferred **F1 reverse shape** (float entry, int store). The peel's
+organic trigger is **transition-trip alignment** (slot flips int→float
+at exactly the warming trip) — real (converts a dead-on-commit thrash
+trace into a compiled one that every later instance re-enters) but
+absent from the bench suite, so the bench sweep is expected ~neutral.
+The fft lever is a FOLLOW-UP DECISION for Bart: F1-reverse narrowing /
+continuation-scope peel vs. other campaign arcs.
+
+Repro scripts used (in /tmp, recreate from doc if needed): peel_align
+(transition-trip scan), peel_nested (reset-to-int nest — no peel, as
+now understood), peel_reenter (recurring value shape: 932/932 entries
+native), peel_bigint, peel_deopt0. Baseline shadow for the A/B:
+/tmp/mahina-base39 (HEAD aea79c2 sources for my files, verified
+trace #0 unsupported there).
+
 ## Status 2026-09-04 (LATEST-104) — doc 39 DESIGN landed: numeric φ widening via type-stabilizing peel
 
 The named-next-technique arc from LATEST-103, design phase complete through

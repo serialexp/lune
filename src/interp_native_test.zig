@@ -1328,3 +1328,149 @@ test "executor: doc 31 ratchet regression — fixed short gmatch instances never
     try testing.expectEqual(@as(usize, 0), vm.trace.penalty.count());
     try testing.expect(vm.trace.entries > 100);
 }
+
+// ---------------------------------------------------------------------------
+// Doc 39 — numeric φ widening via a type-stabilizing peel. A plain-while root
+// whose carried slot enters int at the recording trip but leaves it float
+// commits as a PEELED trace: iteration 1 is a verbatim run-once region behind
+// the preheader marker (int semantics preserved), iteration 2 records the
+// float steady state against internal φs, and nativegen homes the split
+// (entry load int/GP, steady value in the internal φ's XMM home, deopt flush
+// from the steady home — skipped entirely at zero local completions).
+
+/// The peel must actually have fired: some cached trace is `peeled`, carries
+/// the mid-stream preheader marker, at least one internal φ, and a slot-bound
+/// φ with a steady-φ association. On the native leg it must also have lowered
+/// to machine code (the RV-3 relaxation is the whole point of Phase 3).
+fn assertPeelCommitted(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (mode == .off) return; // no recorder, no cache — output oracle only
+    var peeled: ?*const trace.Trace = null;
+    for (vm.trace.cache.items) |tr| {
+        if (tr.peeled) peeled = tr;
+    }
+    try testing.expect(peeled != null);
+    const tr = peeled.?;
+    var saw_marker = false;
+    var saw_internal_phi = false;
+    var saw_steady_assoc = false;
+    for (tr.instrs) |ins| {
+        switch (ins.op) {
+            .preheader => saw_marker = true,
+            .phi => {
+                if (ins.aux == trace.PHI_INTERNAL) saw_internal_phi = true;
+                if (ins.aux >= 0 and ins.a != 0) saw_steady_assoc = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(saw_marker);
+    try testing.expect(saw_internal_phi);
+    try testing.expect(saw_steady_assoc);
+    if (mode == .record_execute_native) try testing.expect(tr.native == .compiled);
+}
+
+/// Doc 39 negative probes: whatever traces the program minted, NONE of them
+/// peeled (the shape is out of the peel's v1 scope) — the output oracle in the
+/// surrounding matrix run carries the correctness claim.
+fn assertNoPeel(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (mode == .off) return;
+    for (vm.trace.cache.items) |tr| {
+        try testing.expect(!tr.peeled);
+    }
+}
+
+test "doc 39: recurring int-entry/float-body while root peels, compiles, and stays byte-identical" {
+    // Each kernel() instance re-arrives at the while anchor with `x` int; the
+    // body forces it float at trip >= 5. With `hotloop = 4` the root records at
+    // trip 5 of instance 1 — the transition trip — so the recording sees the
+    // int entry AND the float body: the doc-39 peel shape. Every later
+    // instance re-enters the peeled trace at ITS trip-5 arrival and runs the
+    // float steady state to completion inside the trace.
+    try expectProgramTuned(
+        \\local function kernel()
+        \\  local x = 0
+        \\  local i = 1
+        \\  while i < 30 do
+        \\    if i >= 5 then x = x + 0.5 else x = x + 1 end
+        \\    i = i + 1
+        \\  end
+        \\  return x
+        \\end
+        \\local s = 0
+        \\for m = 1, 8 do s = s + kernel() end
+        \\print(s)
+    , "132\n", .{ .inspect = &assertPeelCommitted });
+}
+
+test "doc 39: zero-completion deopt leaves the boxes untouched (tier-0 replays iterations 1-2)" {
+    // Instance m == 4 diverges INSIDE the run-once region (the iteration-1
+    // branch guard fails before the first back-edge), so the peeled trace
+    // exits with zero local completions: the deopt flush must be skipped and
+    // tier-0 must replay both partial iterations from the int header state.
+    try expectProgramTuned(
+        \\local function kernel(skew)
+        \\  local x = 0
+        \\  local i = 1
+        \\  while i < 30 do
+        \\    if i >= 5 + skew then x = x + 0.5 else x = x + 1 end
+        \\    i = i + 1
+        \\  end
+        \\  return x
+        \\end
+        \\local s = 0
+        \\for m = 1, 8 do s = s + kernel(m == 4 and 3 or 0) end
+        \\print(s)
+    , "133.5\n", .{ .inspect = &assertPeelCommitted });
+}
+
+test "doc 39: run-once region keeps exact int semantics above 2^53" {
+    // The int adds ride above 2^53 where float arithmetic rounds: if anything
+    // widened iteration 1 early (the rejected eager-coercion design), the odd
+    // increments would round and the printed difference would drift. The
+    // outer loop re-runs the kernel so the peeled trace's run-once region
+    // executes natively on later instances.
+    try expectProgramTuned(
+        \\local function kernel()
+        \\  local y = 9007199254740993
+        \\  local i = 1
+        \\  while i < 30 do
+        \\    if i >= 5 then y = y + 0.5 else y = y + 3 end
+        \\    i = i + 1
+        \\  end
+        \\  return y - 9007199254740992
+        \\end
+        \\local r = 0
+        \\for m = 1, 8 do r = kernel() end
+        \\print(r)
+    , "12\n", .{ .inspect = &assertPeelCommitted });
+}
+
+test "doc 39: the F1 reverse shape (float entry, int store) does not peel" {
+    // At the recording trip (i == 5) the carried `x` enters FLOAT and the body
+    // stores an int konst — the narrowing direction doc 39 explicitly defers.
+    // The instability sweep requires an int entry, so the peel must decline;
+    // the trace commits unpeeled (RV-3 keeps it off native) and the matrix
+    // holds output parity.
+    try expectProgramTuned(
+        \\local x = 8
+        \\local i = 1
+        \\while i < 40 do
+        \\  if i % 5 == 0 then x = 8 else x = x / 2 end
+        \\  i = i + 1
+        \\end
+        \\print(x)
+    , "0.5\n", .{ .inspect = &assertNoPeel });
+}
+
+test "doc 39: a numeric-for anchor with the same transition does not peel" {
+    // Same int->float transition, but the anchor is a numeric `for` back-edge,
+    // not a plain while — `maybeEnterPeel`'s `isPlainWhileAnchor` gate
+    // declines and the close takes the ordinary path.
+    try expectProgramTuned(
+        \\local x = 0
+        \\for i = 1, 30 do
+        \\  if i >= 5 then x = x + 0.5 else x = x + 1 end
+        \\end
+        \\print(x)
+    , "17\n", .{ .inspect = &assertNoPeel });
+}

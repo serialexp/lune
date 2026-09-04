@@ -1327,6 +1327,15 @@ pub const Trace = struct {
     /// legacy thrash, that gate is evidence unrolling does not cover this
     /// outer loop's trip variance (`unroll_fail`).
     unrolled_while: bool = false,
+    /// Doc 39: this trace was committed from a type-stabilizing PEEL — its
+    /// `preheader` run-once region is a real tier-0 iteration (iteration 1,
+    /// original int semantics), not an LICM-hoisted invariant block. SEMANTIC
+    /// state, serialized (schema v bump): the first back-edge completes TWO
+    /// tier-0 iterations, and a deopt at zero local completions must leave the
+    /// carried-slot boxes untouched (tier-0 replays iteration 1 from the entry
+    /// state). Cannot be inferred from the marker — an LICM'd trace carries the
+    /// same marker but its preheader completes ZERO iterations.
+    peeled: bool = false,
     /// The straight-line IR, terminated by a `loop` instruction.
     instrs: []IrInstr,
     /// Constants referenced by `konst` instructions (may include heap values, so
@@ -1638,6 +1647,12 @@ pub const AbortReason = enum {
     /// `recWhileLink` then lets an outer root unroll it (LuaJIT's
     /// `innerloopleft` fallback).
     loop_leave,
+    /// Doc 39: a type-stabilizing peel (int-entry/float-body carried slots)
+    /// recorded its second pass and the carried kinds STILL mismatched — a
+    /// genuine per-iteration flip-flop, or a forbidden effect surfaced on the
+    /// body pass (a path iteration 1 didn't take). Ordinary strike semantics:
+    /// such a shape was uncompilable before the peel existed and stays so.
+    type_instability,
     /// An error unwound through the dispatch loop while this recording was
     /// active (doc 26 D1a). The raise itself is not part of the recorded IR, so
     /// letting the recording survive the unwind would stitch post-catch
@@ -1691,6 +1706,10 @@ pub const TraceConfig = struct {
     /// of `execute` (an unexecuted trace can still be optimized for inspection).
     /// Tests set it false to compare optimized vs raw IR and prove transparency.
     optimize: bool = true,
+    /// Doc 39: type-stabilizing peel for int-entry/float-body plain-while
+    /// roots (numeric φ widening). Off = every close is a first-return close
+    /// (pre-doc-39 behaviour); tests and A/B isolation flip it.
+    peel: bool = true,
     /// Back-edge count at which a loop header becomes a trace anchor.
     hotloop: u32 = 56,
     /// Maximum IR instructions in one trace before aborting (`too_long`).
@@ -10815,6 +10834,13 @@ pub const TraceState = struct {
             else => return false,
         };
         if (slot_index >= c.slots.len) return false;
+        // Doc 39 (v1): no fusion into or out of a PEELED trace. The run wrapper's
+        // +1 local-completion adjustment (a peeled first back-edge closes two
+        // tier-0 iterations) is applied at the unfused seam only — a fused span's
+        // per-hop counts come from the raw rbx ledger, which cannot express the
+        // split. Refusing the arm keeps every peeled run unfused and the
+        // accounting exact on both sides.
+        if (parent.peeled or child.peeled) return false;
         // P-C option (b) invariant (2.3c-0a): a numeric-for loop-done guard's slot is
         // exclusively its linked-materialized exit. Enforce that the arm's declared kind
         // matches the slot's guard shape — a mismatch is a wiring bug (assert in debug),
@@ -12220,10 +12246,185 @@ pub const TraceState = struct {
         }) catch {};
     }
 
+    /// Doc 39: ops admissible inside a type-stabilizing peel (the register-only
+    /// rule, enforced over BOTH passes). A WHITELIST, fail-closed: any op not
+    /// listed — stores (`astore`/`astore_append`/`hstore`/`gstore`), allocating
+    /// producers (the `.alloc` class), match-scratch writers
+    /// (`smatch`/`sfindp`/`sgmatch`/`scap_*`), the gmatch cursor
+    /// (`sgm_setpos`), grid ops, `guard_gc`, and anything added later —
+    /// declines the peel at pass 1 or aborts it at pass 2. Heap READS are
+    /// admitted: effect-free, guarded, and their run-once values persist under
+    /// the E1 executor contract.
+    fn peelAdmissibleOp(op: IrOp) bool {
+        return switch (op) {
+            .konst,
+            .slot_load,
+            .phi,
+            .preheader,
+            .add,
+            .sub,
+            .mul,
+            .div,
+            .idiv,
+            .mod,
+            .pow,
+            .band,
+            .bor,
+            .bxor,
+            .shl,
+            .shr,
+            .sar,
+            .eq,
+            .ne,
+            .lt,
+            .le,
+            .neg,
+            .not,
+            .bnot,
+            .int_of_float,
+            .guard_int,
+            .guard_float,
+            .guard_number,
+            .guard_true,
+            .guard_false,
+            .guard_func,
+            .guard_builtin,
+            .fsqrt,
+            .fsin,
+            .fcos,
+            .ffloor,
+            .fceil,
+            .aref,
+            .aload,
+            .href,
+            .hload,
+            .alen,
+            .guard_table,
+            .guard_lane,
+            .guard_bounds,
+            .guard_present,
+            .guard_hash,
+            .slen,
+            .guard_string,
+            .scp,
+            => true,
+            else => false,
+        };
+    }
+
+    /// Doc 39 Phase 0/1 entry decision, called at the FIRST anchor-return of a
+    /// recording (from `closeTrace`, before `commit` — never an error out of
+    /// commit, which would gate `.commit_failure`). Returns true when
+    /// `closeTrace` should return WITHOUT committing: either the peel was
+    /// entered (marker emitted, recording continues into iteration 2), or a
+    /// mid-entry OOM aborted the recording.
+    ///
+    /// Eligibility (codex round-2 minimum-sound-v1): initial plain-while
+    /// `.root` recordings only, anchor frame closed (no inlining / multret
+    /// shadow open), register-only iteration 1 (no pending stores, no
+    /// allocations, whitelist-pure IR). The instability sweep covers the
+    /// anchor window `[0, anchor_num_registers)` only: a `.def` slot whose
+    /// proven entry kind is int but whose carried ref is float is exactly the
+    /// RV-3-bailing int-entry/float-body shape (fft_bitreverse's `k`).
+    fn maybeEnterPeel(self: *TraceState) bool {
+        if (!self.config.peel) return false;
+        const rec = &self.rec;
+        if (rec.kind != .root) return false;
+        if (rec.link_target != null) return false;
+        if (rec.inline_depth != 0) return false;
+        if (rec.multret_top != null) return false;
+        if (rec.pending_stores.items.len != 0) return false;
+        if (rec.guard_gc_ref != null or rec.alloc_count != 0) return false;
+        if (!isPlainWhileAnchor(rec.anchor.proto, rec.anchor.pc)) return false;
+        // Instability sweep before the (linear) purity scan: the sweep is the
+        // rarer pass condition, so most closes stop here.
+        var unstable = false;
+        for (rec.reg_map[0..rec.anchor_num_registers]) |s| {
+            if (s.state != .def or s.entry_kind != .int) continue;
+            if (rec.instrs.items[@intCast(s.ref)].ty == .float) {
+                unstable = true;
+                break;
+            }
+        }
+        if (!unstable) return false;
+        for (rec.instrs.items) |ins| {
+            if (!peelAdmissibleOp(ins.op)) return false;
+        }
+        // Enter. Snapshot allocation first — a failure here declines cleanly
+        // with the stream untouched (ordinary close proceeds).
+        const slots = self.gpa.alloc(PeelSlot, rec.anchor_num_registers) catch return false;
+        for (slots, rec.reg_map[0..rec.anchor_num_registers]) |*ps, s| {
+            ps.* = .{ .ref = s.ref, .state = s.state };
+        }
+        _ = self.emit(.{ .op = .preheader }) catch {
+            // The stream may hold a half-appended marker (instrs vs exit_prov
+            // skew) — the recording cannot continue OR commit. Abort; `reset`
+            // restores the invariant, exactly as any mid-recording emit OOM.
+            self.gpa.free(slots);
+            self.abort(.alloc);
+            return true;
+        };
+        rec.peel = .{ .mark_len = rec.instrs.items.len, .slots = slots };
+        self.dbg("peel: enter anchor pc={d} marker ir={d}", .{ rec.anchor.pc, rec.instrs.items.len - 1 });
+        return true;
+    }
+
+    /// Doc 39 Phase 1 close, at the SECOND anchor-return of a peeled recording:
+    /// verify the body pass stayed register-only (a forbidden effect means
+    /// iteration 2 took a path iteration 1 didn't — abort, ordinary strikes)
+    /// and type-stable, then patch every internal φ's back-edge `b` from the
+    /// slot's body-final ref (or `a` — a constant carry — when the body only
+    /// read it). Returns false when the recording must abort
+    /// `.type_instability` instead of committing.
+    fn finishPeel(self: *TraceState, p: *PeelState) bool {
+        const rec = &self.rec;
+        if (rec.link_target != null) return false; // a peeled root never link-closes
+        if (rec.pending_stores.items.len != 0) return false;
+        if (rec.guard_gc_ref != null or rec.alloc_count != 0) return false;
+        for (rec.instrs.items[p.mark_len..]) |ins| {
+            if (!peelAdmissibleOp(ins.op)) return false;
+        }
+        for (p.slots, 0..) |*ps, slot| {
+            const pr = ps.phi_ref orelse continue;
+            const phi_ins = &rec.instrs.items[@intCast(pr)];
+            const cur = rec.reg_map[slot].ref;
+            // Body redefined the slot → carry the body-final def; body only
+            // read it → constant carry (`b = a`; the init is a run-once value
+            // whose executor slot persists, so re-carrying it is exact).
+            const b: Ref = if (cur != pr) cur else phi_ins.a;
+            // Stability recheck against the φ's carried type (stamped from the
+            // iteration-1 def at creation): a mismatch is a genuine
+            // per-iteration flip-flop — uncompilable before the peel, stays so.
+            if (rec.instrs.items[@intCast(b)].ty != phi_ins.ty) return false;
+            phi_ins.b = b;
+        }
+        self.dbg("peel: close anchor pc={d} body ir={d}..{d}", .{
+            rec.anchor.pc, p.mark_len, rec.instrs.items.len,
+        });
+        return true;
+    }
+
     /// Finalise a cleanly-closed recording into a cached `Trace`. A build failure
     /// is treated like an abort (discard + gate-with-backoff) so we never thrash.
+    ///
+    /// Doc 39: this is also the peel's decision point, shared by BOTH
+    /// anchor-arrival paths (`onBackEdge` + `maybeCloseAtAnchor`), which both
+    /// funnel here. The `mark_len` equality check makes the marker-emitting
+    /// return and its immediate re-arrival at the anchor ONE logical return
+    /// regardless of which path fires first (a back-edge arrival calls
+    /// `onBackEdge` then `maybeCloseAtAnchor` before anything records; a
+    /// forward-flow arrival calls only `maybeCloseAtAnchor`).
     fn closeTrace(self: *TraceState, regs: RegWindow) void {
         _ = regs; // reserved: a richer exit snapshot will read live values here.
+        if (self.rec.peel) |*p| {
+            if (self.rec.instrs.items.len == p.mark_len) return; // same arrival
+            if (!self.finishPeel(p)) {
+                self.abort(.type_instability);
+                return;
+            }
+        } else if (self.maybeEnterPeel()) {
+            return; // peel entered (keep recording iteration 2) or aborted
+        }
         self.commit() catch |err| {
             self.dbg("commit failed: anchor pc={d} error={s} ir_len={d}", .{
                 self.rec.anchor.pc,
@@ -12345,9 +12546,22 @@ pub const TraceState = struct {
             // loops cannot produce per-iteration heap temps).
             if (self.rec.alloc_count == 0 and
                 slot >= self.rec.locals_watermark and !self.readSlot(@intCast(slot))) continue;
+            // Doc 39: a peeled trace stamps each slot-bound φ's otherwise-
+            // unused `a` with the slot's steady-state INTERNAL φ ref — the
+            // durable slot↔φ association native analyze needs to connect the
+            // entry load (run-once, entry-kinded) with the carried home
+            // (internal-φ-kinded) without dataflow guessing (codex round-2
+            // finding 4). `a = 0` = no internal φ: a write-before-read or
+            // never-touched-in-body slot, the existing write-only class.
+            const steady_phi: Ref = if (self.rec.peel) |p| blk: {
+                if (slot < p.slots.len) {
+                    if (p.slots[slot].phi_ref) |pr| break :blk pr;
+                }
+                break :blk 0;
+            } else 0;
             try self.rec.instrs.append(self.gpa, .{
                 .op = .phi,
-                .a = 0,
+                .a = steady_phi,
                 .b = s.ref,
                 .aux = @intCast(slot),
                 .ty = self.rec.instrs.items[s.ref].ty,
@@ -12371,7 +12585,13 @@ pub const TraceState = struct {
         // terminal and its LICM/φ machinery is written for back-edge loops. Phase 3
         // executes link traces through `driveChain`, but the unoptimized straight-line
         // continuation is the intended hand-off shape. `dupe` preserves `.link`.
-        const fields: tropt.Optimized = if (self.config.optimize and self.rec.link_target == null)
+        // Doc 39 Phase 1b: peeled traces bypass `tropt` (the link-trace
+        // precedent) — the optimizer's liveness roots have no concept of a
+        // recorder-emitted `preheader` marker (it synthesizes its own during
+        // compaction from a global invariance analysis) and would drop the
+        // peel's run-once/steady split; CSE and guard dedup likewise span the
+        // whole stream marker-blind. A marker-aware tropt is future work.
+        const fields: tropt.Optimized = if (self.config.optimize and self.rec.link_target == null and self.rec.peel == null)
             tropt.optimize(self.gpa, instrs, consts) catch |e| switch (e) {
                 // Never fail a commit (or thrash the anchor) over an optimizer
                 // allocation failure: cache the unoptimized trace instead.
@@ -12523,6 +12743,7 @@ pub const TraceState = struct {
             .alloc_bound = self.rec.alloc_count,
             .requires_unicode_pin = requires_unicode_pin,
             .unrolled_while = self.rec.unrolled_while,
+            .peeled = self.rec.peel != null,
         };
         // §T.9: memoize the pure `isCompositeBridgeCandidate` oracle over this trace's
         // instruction indices. Must run AFTER `t.*` is populated — the oracle reads the
@@ -12698,6 +12919,15 @@ pub const TraceState = struct {
                     std.debug.assert(ins.b < last);
                     std.debug.assert(ins.aux == PHI_INTERNAL or
                         (ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < num_registers));
+                    // Doc 39: a slot-bound φ's `a` is either 0 (unused — no
+                    // steady-state internal φ; the historical value) or the
+                    // slot's INTERNAL φ (the durable slot↔φ association a
+                    // peeled trace commits). Unambiguous: instruction 0 can
+                    // never be a φ (its `a < i` requires i > 0).
+                    if (ins.aux != PHI_INTERNAL and ins.a != 0) {
+                        const assoc = instrs[@intCast(ins.a)];
+                        std.debug.assert(assoc.op == .phi and assoc.aux == PHI_INTERNAL);
+                    }
                 },
                 // Preheader region boundary (Phase E1): a pure marker, no operands.
                 // Structural invariants (at most one; before any φ) are asserted in
@@ -12992,19 +13222,98 @@ pub const TraceState = struct {
         // anchor_num_registers)`.
         const abs: usize = self.rec.base_off + slot;
         const s = &self.rec.reg_map[abs];
-        if (s.state != .undef) return s.ref;
+        if (s.state != .undef) {
+            // Doc 39: inside a peel's body pass, the first read of an
+            // anchor-window slot iteration 1 DEFINED lazily creates the
+            // internal φ carrying its steady state — `a` = the iteration-1
+            // ref (a run-once value), `b` patched at close — and rebinds the
+            // slot so every later consumer naturally uses the φ (φ-before-use
+            // falls out of laziness; no operand rewrite pass exists). Slots
+            // still `.input` at the marker (invariant reads) and slots the
+            // body already wrote (`rebound`, incl. write-before-read — no
+            // cross-iteration dataflow of their own) are referenced directly.
+            if (self.rec.peel) |*p| {
+                if (abs < self.rec.anchor_num_registers) {
+                    const ps = &p.slots[abs];
+                    if (!ps.rebound and ps.state == .def) {
+                        const phi_ref = try self.emit(.{
+                            .op = .phi,
+                            .a = ps.ref,
+                            .b = 0, // patched by finishPeel
+                            .aux = PHI_INTERNAL,
+                            .ty = self.rec.instrs.items[@intCast(ps.ref)].ty,
+                        });
+                        ps.rebound = true;
+                        ps.phi_ref = phi_ref;
+                        s.* = .{ .ref = phi_ref, .state = .def, .entry_kind = s.entry_kind };
+                        return phi_ref;
+                    }
+                }
+            }
+            return s.ref;
+        }
         const aux: i32 = @intCast(abs);
         const ref = try self.emit(.{ .op = .slot_load, .aux = aux, .ty = .unknown });
         try self.rec.entry_slots.append(self.gpa, @intCast(abs));
+        // A fresh `slot_load` resets `entry_kind` to `.none` by construction:
+        // the slot was `.undef`, so no proof can have covered it yet.
         s.* = .{ .ref = ref, .state = .input };
         return ref;
+    }
+
+    /// Doc 39 Phase 0 (central capture, codex round-2 finding 11): a numeric
+    /// type proof just covered `ref`. If `ref` is an anchor-window `slot_load`,
+    /// stamp the slot's `entry_kind` — keyed off the *instruction* (a
+    /// `slot_load` carries its absolute slot in `aux`), so the stamp works
+    /// regardless of which proof route got here first, after the slot has been
+    /// redefined, and even when `guarded_refs` dedup suppresses the guard's
+    /// emission (the proof exists either way). First proof wins: the entry
+    /// value has exactly one runtime kind per recording, so later proofs agree.
+    fn noteEntryKind(self: *TraceState, ref: Ref, kind: EntryKind) void {
+        const ins = self.rec.instrs.items[@intCast(ref)];
+        if (ins.op != .slot_load) return;
+        const abs: usize = @intCast(ins.aux);
+        // Synthetic input slots (upvalue/global/hash-cell snapshots) reuse the
+        // `slot_load` op with `aux >= anchor_num_registers`; that aux is an
+        // executor window index, NEVER a `reg_map` index — don't alias the
+        // inlined-callee scratch the `reg_map` tail reserves.
+        if (abs >= self.rec.anchor_num_registers) return;
+        const s = &self.rec.reg_map[abs];
+        if (s.entry_kind == .none) s.entry_kind = kind;
+    }
+
+    /// Doc 39: the lane-implied variant of `noteEntryKind` for the `guard_fits`
+    /// proof route (emitted directly, not via `guard`). Fit implies type for the
+    /// narrow lanes: the int store-shape lanes (`Lane.isInt`) prove the value
+    /// int, `.f64` proves float; `.boolean`/`.value`/`.grid` prove no numeric
+    /// kind and stamp nothing.
+    fn noteEntryKindFromLane(self: *TraceState, ref: Ref, lane: arr.Lane) void {
+        if (lane.isInt()) {
+            self.noteEntryKind(ref, .int);
+        } else if (lane == .f64) {
+            self.noteEntryKind(ref, .float);
+        }
     }
 
     /// Record that tier-0 register `slot` (in the current frame) now holds the
     /// value produced by `ref` (a loop-carried write — surfaces in the exit
     /// snapshot). Offset by `base_off` like `refOf`.
     fn setReg(self: *TraceState, slot: u16, ref: Ref) void {
-        self.rec.reg_map[self.rec.base_off + slot] = .{ .ref = ref, .state = .def };
+        self.defineSlotAbs(self.rec.base_off + slot, ref);
+    }
+
+    /// The single whole-`RegSlot` define: every write that replaces a slot's
+    /// binding (`setReg`, inlined-callee seeding, return mapping) funnels here
+    /// so that (a) `entry_kind` SURVIVES the write (doc 39 — `k = k/2` must not
+    /// erase the evidence that `k` entered int; codex round-2 finding 2), and
+    /// (b) an in-flight peel marks the slot `rebound` (a body write before any
+    /// read means "no internal φ" — the write-before-read class).
+    fn defineSlotAbs(self: *TraceState, abs: usize, ref: Ref) void {
+        if (self.rec.peel) |*p| {
+            if (abs < self.rec.anchor_num_registers) p.slots[abs].rebound = true;
+        }
+        const s = &self.rec.reg_map[abs];
+        s.* = .{ .ref = ref, .state = .def, .entry_kind = s.entry_kind };
     }
 
     /// Whether tier-0 register `slot` was *read* during this recording (i.e. it is
@@ -13044,6 +13353,13 @@ pub const TraceState = struct {
     /// guard (already covered) emits nothing, and the existing guard keeps its own
     /// stamp (the many-to-one static-slot → guard map, H-1c).
     fn guard(self: *TraceState, ref: Ref, op: IrOp, role: GuardRole, operand: OperandDesig) !void {
+        // Doc 39: stamp the slot's proven entry kind BEFORE the dedup return —
+        // the proof exists even when the guard emission is suppressed.
+        switch (op) {
+            .guard_int => self.noteEntryKind(ref, .int),
+            .guard_float => self.noteEntryKind(ref, .float),
+            else => {},
+        }
         if (self.rec.guarded_refs.contains(ref)) return;
         try self.rec.guarded_refs.put(self.gpa, ref, {});
         const gref = try self.emit(.{ .op = op, .a = ref });
@@ -13553,6 +13869,7 @@ pub const TraceState = struct {
             self.stampProv(try self.emit(.{ .op = .guard_append, .a = ref }), .append_precond, .none, .neutral);
             // guard_fits: the value still fits the narrow lane (the oracle re-checks a
             // free-variable store; native bool already proves `.bool`). Same as astore.
+            self.noteEntryKindFromLane(rval, lane); // doc 39: fit implies type
             self.stampProv(try self.emit(.{ .op = .guard_fits, .a = rval, .aux = lane_ord }), .value_fits, f.val_od, .neutral);
             _ = try self.emit(.{ .op = .astore_append, .a = ref, .b = rval, .aux = lane_ord });
             return;
@@ -13617,6 +13934,7 @@ pub const TraceState = struct {
         if (lane == .value) {
             try self.guardNum(rval, vval, .value_type, f.val_od);
         } else {
+            self.noteEntryKindFromLane(rval, lane); // doc 39: fit implies type
             self.stampProv(try self.emit(.{ .op = .guard_fits, .a = rval, .aux = lane_ord }), .value_fits, f.val_od, .neutral);
         }
         // No `guard_present`: on a narrow lane `astore` *creates* presence (the slot
@@ -14640,7 +14958,11 @@ pub const TraceState = struct {
                 try self.refOf(@intCast(@as(usize, instr.a) + 1 + i))
             else
                 try self.konst(Value.nil());
-            self.rec.reg_map[callee_base_off + i] = .{ .ref = seed, .state = .def };
+            // Whole-RegSlot write → `defineSlotAbs` (doc 39: preserves
+            // `entry_kind`; a callee index is >= anchor_num_registers so the
+            // peel-rebound branch never fires here, but the funnel keeps every
+            // define on one audited path).
+            self.defineSlotAbs(callee_base_off + i, seed);
         }
 
         // (3) push the recorder frame and descend into the callee window. Record the
@@ -15640,7 +15962,10 @@ pub const TraceState = struct {
                 try self.refOf(@intCast(@as(usize, instr.a) + k))
             else
                 try self.konst(Value.nil());
-            self.rec.reg_map[@as(usize, fr.base_off) + fr.ret_dest + k] = .{ .ref = ref, .state = .def };
+            // Whole-RegSlot write → `defineSlotAbs` (doc 39): return values can
+            // land back in the ANCHOR window (`fr.base_off == 0`), where the
+            // write must both preserve `entry_kind` and mark a peel rebound.
+            self.defineSlotAbs(@as(usize, fr.base_off) + fr.ret_dest + k, ref);
         }
         self.rec.base_off = fr.base_off;
         self.rec.inline_depth = d;
@@ -15778,6 +16103,32 @@ pub const TraceState = struct {
     }
 };
 
+/// Doc 39: `pc` anchors a *plain while* loop — at least one plain backward
+/// `jmp` targets it, and no conditional backward jump (a repeat-until
+/// back-edge) or loop-op back-edge (`for_loop`/`tfor_loop`/`jfor_loop`)
+/// does. The same structural test as step (1) of `whileEnclosingAnchorPc`
+/// (doc 38), as a standalone predicate. Unmemoized: it runs at most once
+/// per anchor-return of an otherwise-eligible root recording, never on the
+/// dispatch hot path.
+fn isPlainWhileAnchor(proto: *const Proto, pc: u32) bool {
+    var has_plain = false;
+    for (proto.code, 0..) |ins, j| {
+        const is_jump = switch (ins.op) {
+            .jmp, .jmp_if_false, .jmp_if_true, .for_loop, .tfor_loop, .jfor_loop => true,
+            else => false,
+        };
+        if (!is_jump) continue;
+        const t = @as(i64, @intCast(j)) + 1 + ins.aux;
+        if (t != pc or j <= pc) continue;
+        if (ins.op == .jmp) {
+            has_plain = true;
+        } else {
+            return false;
+        }
+    }
+    return has_plain;
+}
+
 /// Result type of a recorded arithmetic op given its observed operands. Mirrors
 /// `arith.zig`: `/` and `^` are always float; otherwise int iff both operands are
 /// int (matching tier-0's int/float promotion).
@@ -15806,8 +16157,54 @@ fn obsTypeOf(v: Value) ObsType {
 /// write that surfaces in the exit snapshot).
 const SlotState = enum { undef, input, def };
 
+/// Doc 39 Phase 0: the numeric kind a type proof established for a slot's
+/// ENTRY value (the `slot_load`), or `.none` when no int/float proof covered
+/// it. Stamped centrally by `noteEntryKind` on every proof route (`guardNum`,
+/// `guardInt`/`keyRefNarrowed`, bitop guards, lane-implied `guard_fits`) and
+/// preserved across every whole-`RegSlot` write (`defineSlotAbs`), so the
+/// peel-eligibility sweep can compare "entered int" against "carries float".
+const EntryKind = enum { none, int, float };
+
 /// The SSA ref currently held by a tier-0 register, with how it got there.
-const RegSlot = struct { ref: Ref = 0, state: SlotState = .undef };
+/// `entry_kind` records the proven numeric kind of the slot's entry value
+/// (doc 39) — a property of the recording's entry snapshot, so it survives
+/// redefinition (`.def`) of the slot.
+const RegSlot = struct { ref: Ref = 0, state: SlotState = .undef, entry_kind: EntryKind = .none };
+
+/// Doc 39: one anchor-window slot's snapshot at the peel marker (the first
+/// anchor-return of a type-unstable plain-while root).
+const PeelSlot = struct {
+    /// The slot's iteration-1 final ref at the marker.
+    ref: Ref = 0,
+    /// The slot's state at the marker: `.def` = iteration 1 defined it (a body
+    /// read lazily creates an internal φ); `.input`/`.undef` = invariant or
+    /// untouched (referenced directly, no φ).
+    state: SlotState = .undef,
+    /// The body pass wrote this slot, or its internal φ was already created —
+    /// either way, later body reads use `reg_map` directly (no new φ). A body
+    /// WRITE before any read deliberately leaves `phi_ref` null: the slot has
+    /// no cross-iteration dataflow of its own (redefined from other φ'd inputs
+    /// every iteration) and falls to the existing write-only slot class.
+    rebound: bool = false,
+    /// The internal φ (aux == PHI_INTERNAL) carrying this slot's steady state,
+    /// created lazily at the first body read. Its `b` is patched at close.
+    phi_ref: ?Ref = null,
+};
+
+/// Doc 39: in-flight type-stabilizing peel. Entered at the first anchor-return
+/// of an eligible unstable recording (`maybeEnterPeel`); cleared by `reset`.
+const PeelState = struct {
+    /// `instrs.len` immediately after the `preheader` marker was emitted. A
+    /// close-path call arriving with the stream still at this length is the
+    /// SAME logical anchor-return that entered the peel (`onBackEdge` and
+    /// `maybeCloseAtAnchor` both fire on one arrival — the shared-generation
+    /// rule, codex round-2 finding 1) and must not close; the next arrival
+    /// (stream grown by the body pass) is the real second return.
+    mark_len: usize,
+    /// Per-slot marker snapshot, length `anchor_num_registers` (gpa-owned;
+    /// freed by `Recorder.reset`/`deinit`).
+    slots: []PeelSlot,
+};
 
 /// Key for interning constants in the recorder's const pool. Built from the tag
 /// plus the meaningful payload bits — NOT the raw 16-byte `Value`, which has
@@ -15939,6 +16336,13 @@ pub const Recorder = struct {
     active: bool = false,
     anchor: AnchorKey = .{ .proto = undefined, .pc = 0 },
     abort_reason: ?AbortReason = null,
+    /// Doc 39: in-flight type-stabilizing peel, or null (the common case — no
+    /// peel entered). Set by `maybeEnterPeel` at the first anchor-return of an
+    /// int-entry/float-body plain-while root; consulted by the close paths
+    /// (same-arrival suppression + second-return close), `refOf` (lazy internal
+    /// φ) and `defineSlotAbs` (rebound tracking); consumed by `finishPeel` +
+    /// `commit`. Cleared (slice freed) by `reset`/`deinit`.
+    peel: ?PeelState = null,
     /// Doc 38 unroll-first policy: this ROOT recording followed at least one
     /// inner-while back-edge inline (unrolled it) instead of aborting LINNER.
     /// Read at abort (an unrolling root that dies bumps the outer anchor's
@@ -16141,6 +16545,7 @@ pub const Recorder = struct {
     next_input_slot: u16 = 0,
 
     pub fn deinit(self: *Recorder, gpa: std.mem.Allocator) void {
+        if (self.peel) |p| gpa.free(p.slots);
         self.pending_stores.deinit(gpa);
         self.input_seeds.deinit(gpa);
         self.input_dedup.deinit(gpa);
@@ -16194,6 +16599,8 @@ pub const Recorder = struct {
         self.base_off = 0;
         self.inline_depth = 0;
         self.multret_top = null; // doc 27 §3a: never inherit a stale shadow
+        if (self.peel) |p| gpa.free(p.slots);
+        self.peel = null;
         self.unrolled_while = false;
         self.next_input_slot = num_registers;
         self.active = true;
@@ -16262,9 +16669,14 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .link => try w.print("-> {d}", .{ins.aux}),
         // φ: a slot-bound φ prints `update=%b → r{slot}` (init is implicit
         // `regs[slot]`); an internal φ prints `init=%a update=%b → internal`.
+        // Doc 39: a peeled trace's slot-bound φ may carry `a` = the slot's
+        // internal (steady-state) φ ref; print it as `steady=%a` so peel
+        // associations are visible in dumps.
         .phi => {
             if (ins.aux == PHI_INTERNAL) {
                 try w.print("init=%{d} update=%{d} -> internal", .{ ins.a, ins.b });
+            } else if (ins.a != 0) {
+                try w.print("update=%{d} -> r{d} steady=%{d}", .{ ins.b, ins.aux, ins.a });
             } else {
                 try w.print("update=%{d} -> r{d}", .{ ins.b, ins.aux });
             }

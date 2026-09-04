@@ -33,7 +33,11 @@ pub const schema = @import("gen/trace_schema.zig");
 /// list into the instruction stream as slot-bound `phi` nodes; `exit_stores` and
 /// the `SlotStore` type were dropped from the schema. A v1 trace's trailing
 /// `exit_stores` bytes are wire-incompatible with the v2 layout.
-pub const format_version: u32 = 2;
+///
+/// v3 (doc 39): the `peeled` byte joins the Trace record — semantic state (the
+/// run-once region is a real tier-0 iteration; first back-edge counts two)
+/// that cannot be inferred from the `preheader` marker.
+pub const format_version: u32 = 3;
 
 /// Map one trace constant. A `heap_ref` const is always a string — the only
 /// heap value a trace constant can be (tables/closures are never compile-time
@@ -80,6 +84,7 @@ pub fn toSchemaTrace(a: std.mem.Allocator, t: *const trace.Trace) !schema.Trace 
     return .{
         .anchor_proto_id = t.anchor.proto.id,
         .anchor_pc = t.anchor.pc,
+        .peeled = @intFromBool(t.peeled),
         .instrs = instrs,
         .consts = consts,
         // `[]u16` coerces directly to the schema's `[]const u16` — no remap.
@@ -236,6 +241,7 @@ test "hand-built schema edge corpus round-trips byte-exact" {
             .{
                 .anchor_proto_id = 0xDEAD_BEEF,
                 .anchor_pc = 0,
+                .peeled = 1, // doc 39 wire v3: the semantic peel byte
                 .instrs = &.{
                     .{ .op = 0, .a = 0, .b = 0, .aux = std.math.minInt(i32), .ty = 0, .snap = 0 },
                     .{ .op = 1, .a = 65535, .b = 65535, .aux = std.math.maxInt(i32), .ty = 5, .snap = 4294967295 },
@@ -260,6 +266,7 @@ test "hand-built schema edge corpus round-trips byte-exact" {
             .{
                 .anchor_proto_id = 1,
                 .anchor_pc = 12345,
+                .peeled = 0,
                 .instrs = &.{.{ .op = 99, .a = 0, .b = 0, .aux = 0, .ty = 0, .snap = 0 }},
                 .consts = &.{},
                 .entry_slots = &.{},
@@ -275,6 +282,7 @@ test "hand-built schema edge corpus round-trips byte-exact" {
 
     const t0 = got.traces[0];
     try testing.expectEqual(@as(u32, 0xDEAD_BEEF), t0.anchor_proto_id);
+    try testing.expectEqual(@as(u8, 1), t0.peeled); // doc 39 wire v3
     try testing.expectEqual(std.math.minInt(i32), t0.instrs[0].aux);
     try testing.expectEqual(std.math.maxInt(i32), t0.instrs[1].aux);
     try testing.expectEqual(@as(u32, 4294967295), t0.instrs[1].snap);
@@ -293,6 +301,7 @@ test "hand-built schema edge corpus round-trips byte-exact" {
     try testing.expectEqual(@as(i32, 3), t0.instrs[3].aux);
 
     const t1 = got.traces[1];
+    try testing.expectEqual(@as(u8, 0), t1.peeled);
     try testing.expectEqual(@as(u32, 12345), t1.anchor_pc);
     try testing.expectEqual(@as(u8, 99), t1.instrs[0].op);
     try testing.expectEqual(@as(usize, 0), t1.consts.len);

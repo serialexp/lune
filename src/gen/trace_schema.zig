@@ -266,6 +266,7 @@ pub const IrInstr = struct {
 pub const Trace = struct {
     anchor_proto_id: u32,
     anchor_pc: u32,
+    peeled: u8,
     instrs: []const IrInstr,
     consts: []const ConstValue,
     entry_slots: []const u16,
@@ -282,6 +283,7 @@ pub const Trace = struct {
     pub fn encodeInto(self: Trace, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
         try enc.writeUint32(self.anchor_proto_id, .little_endian);
         try enc.writeUint32(self.anchor_pc, .little_endian);
+        try enc.writeUint8(self.peeled);
         try enc.writeUint16(@intCast(self.instrs.len), .little_endian);
         for (self.instrs) |_item_0| {
             try _item_0.encodeInto(enc, ctx);
@@ -305,6 +307,7 @@ pub const Trace = struct {
         var result: Trace = undefined;
         result.anchor_proto_id = try dec.readUint32(.little_endian);
         result.anchor_pc = try dec.readUint32(.little_endian);
+        result.peeled = try dec.readUint8();
         const _len_6 = try dec.readUint16(.little_endian);
         const _buf_7 = try allocator.alloc(IrInstr, @as(usize, _len_6));
         errdefer allocator.free(_buf_7);

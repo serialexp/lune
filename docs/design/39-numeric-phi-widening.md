@@ -1,8 +1,10 @@
 # Doc 39 — Numeric φ widening via a type-stabilizing peel
 
-Status: draft v3, not yet implemented — v1 (eager entry coercion) rejected by
-codex round 1; v2 (the peel) architecture confirmed by codex round 2, which
-supplied the minimum-sound-v1 constraints this revision incorporates.
+Status: implemented — phases 0–3 landed with tests + gates (suite green,
+hashgate 84/84, bench neutral vs shadow baseline); see "What
+implementation revealed" for the premise-gap finding (the fft bitreverse
+shape records float-entry on the current tree, so the peel's organic
+trigger is transition-trip alignment, not the reset-to-int family).
 Owner: Claude (fable), for Bart
 Last updated: 2026-09-04
 
@@ -14,68 +16,69 @@ inside them is checked.
 
 ### Done
 
-_(nothing yet)_
+- [x] **Phase 0 — instability detection.** Landed as designed:
+  `RegSlot.entry_kind` stamped in `guard()` before the `guarded_refs`
+  dedup return + `noteEntryKindFromLane` at the array `guard_fits`
+  sites; every whole-`RegSlot` write routed through `defineSlotAbs`
+  (preserves `entry_kind`); the sweep runs in `maybeEnterPeel` over
+  `[0, anchor_num_registers)` behind the full eligibility gate.
+- [x] **Phase 1 — peel recording.** Landed as designed: `PeelState`
+  with the `mark_len` same-arrival rule covering BOTH close paths;
+  marker emitted inline (snapshot allocated FIRST so OOM declines
+  cleanly); lazy internal φs in `refOf` (iteration-1-defined slots
+  only — invariants reference their `slot_load` directly); fail-closed
+  `peelAdmissibleOp` whitelist over both passes; `finishPeel` patches
+  φ back-edges with a type re-check; slot-bound φ `a` = steady-φ ref
+  (or 0); `AbortReason.type_instability`.
+- [x] **Phase 1b — peeled traces bypass tropt.** The bypass condition
+  in `commit` extends the link-trace precedent (`… and rec.peel ==
+  null`).
+- [x] **Phase 2 — completion accounting + serialization.**
+  `Trace.peeled` (semantic, serialized): wire format v3 with the
+  schema bump + regenerated Zig/TS codecs, traceser round-trip test,
+  irinterp first-back-edge `completed += 2`, viz Commit-readout
+  ("iterations 1–2 committed"), fixture regenerated to v3.
+- [x] **Phase 3 — nativegen peeled shape.** Landed as designed:
+  `SlotInfo.steady_phi`/`steady_kind` populated from the slot-bound
+  φ's `a` association (fail-closed post-pass; carried-heap/-string and
+  widened-without-φ shapes bail); RV-3 relaxed for peeled num↔num
+  slots; back-edge shuffle skips steady-φ slot homes (the internal-φ
+  move carries the value); deopt flush re-boxes from the steady home
+  with the steady kind and is SKIPPED at `rbx == entry_rbx` on BOTH
+  `deopt_exit` and the silent patched epilogues; internal-φ inits
+  pinned to persistently-homed refs; coalescing disabled for peeled
+  slots; composite bridge + linked-loop-done paths gated off;
+  `armNativeLink` refuses fusion into/out of peeled traces and the
+  run wrapper adds the +1 local completion at the unfused seam.
+- [x] **Phase 4 (core) — tests + gates.** Five 10-mode matrix tests in
+  `interp_native_test.zig` (recurring peel shape with a
+  peel-committed+compiled inspect; zero-completion deopt; >2^53
+  run-once int exactness; F1-reverse no-peel; numeric-for-anchor
+  no-peel); CLI probes byte-identical across tier-0/tier-1a/native on
+  the align/nested/re-enter/bigint/deopt0 shapes; full suite green;
+  hashgate 84/84; fft unchanged (checksum + same compile set).
+- [x] **Open question — resumed-instance float sibling.** VERIFIED
+  empirically: in every peeled repro the plain float-entry sibling
+  formed organically through the existing sibling machinery and
+  compiled native (it covers the post-transition arrivals the peeled
+  trace's int fingerprint refuses).
+- [x] **Phase 4 (bench) — fft A/B + full sweep vs shadow baseline.**
+  Neutral within noise, as the premise-gap finding predicts (no bench
+  organically triggers the peel — verified: zero preheaders from the
+  peel across the suite). fft jit-ms 314.0 → 321.1 at 9 reps, but the
+  emitted native code is BYTE-IDENTICAL between the binaries (dump
+  diff = imm64 slot-table addresses only; a same-binary control run
+  shows the identical diff class), so the delta is host-binary layout
+  / environment noise, not a semantic cost. Baseline: `just shadow`
+  of aea79c2 sources, verified peel-free behaviorally.
 
 ### Outstanding
 
-- [ ] **Phase 0 — instability detection.** `Recorder.RegSlot` gains an
-  `entry_kind` that (a) is captured CENTRALLY on every numeric-proof
-  route covering a `slot_load` — `guardNum`, `guardInt`/
-  `keyRefNarrowed`, bitop guards, `guard_fits` — not just when
-  `guardNum` itself emits (dedup via `guarded_refs` must not skip the
-  stamp), and (b) SURVIVES every whole-`RegSlot` assignment (`setReg`,
-  inlined-callee seeding, return mapping — audit all writes). At the
-  first anchor-return of a plain-while `.root` recording, sweep slots
-  `[0, anchor_num_registers)` only (assert `inline_depth == 0`, no
-  multret/call shadow open): int-entry/float-body ⇒ peel mode.
-- [ ] **Phase 1 — peel recording.** A `peel_state` generation shared by
-  BOTH anchor-close paths (`onBackEdge` + `maybeCloseAtAnchor`) so the
-  immediate re-arrival at the anchor after the marker is one logical
-  return, not a premature close. Emit the `preheader` marker inline,
-  snapshot `reg_map`; lazy internal-φ creation on first body read of a
-  slot iteration 1 DEFINED (invariant `.input` slots are referenced
-  directly — no φ, and no false uncompilability from non-numeric
-  invariants); eligibility rejects pending stores, `sgm_setpos`/cursor
-  state, and allocations (`guard_gc`) — enforced over BOTH passes
-  (iteration-1 effects prevent entering peel mode; a forbidden effect
-  during the body pass aborts) — register-only peel in v1. Close at
-  the second anchor-return (stability re-check, φ back-edge patch,
-  slot-bound φ `a` = its steady-state internal φ ref as the durable
-  slot↔φ association, or 0 for write-before-read slots which fall to
-  the existing write-only class, writebacks from body refs);
-  `AbortReason.type_instability` if still unstable (budget: one peel).
-- [ ] **Phase 1b — peeled traces bypass tropt.** v1 caches peeled traces
-  unoptimized (the link-trace precedent): tropt's liveness/LICM/CSE has
-  no concept of a semantic marker and would drop or re-derive it. A
-  marker-aware optimizer is future work.
-- [ ] **Phase 2 — completion accounting + serialization.** First
-  back-edge completes TWO tier-0 iterations (`Trace.peeled`); the flag
-  is SEMANTIC and must be serialized — schema/trace.json version bump,
-  generated Zig + TS codecs, traceser round-trip, viz exec-log
-  interpretation.
-- [ ] **Phase 3 — nativegen peeled shape.** `analyze` splits the
-  entry-load location/tag (int, run-once) from the steady-state
-  internal-φ home/kind (float, back-edge-updated) and the final
-  writeback — `SlotInfo`'s single kind/home assumption is the work
-  here, resolved via the slot-bound φ's `a` association; DEOPT flush
-  skips carried-slot writes when `rbx == entry_rbx` (LOCAL zero
-  completions — cumulative `rbx == 0` is wrong under chain entry) on
-  BOTH the shared `deopt_exit` and the silent patched epilogues;
-  prologue-fail ordering asserted.
-- [ ] **Phase 4 — tests + gates + bench.** e2e parity all tiers on the
-  fft shape; byte-identity probes (deopt before first back-edge sees
-  `math.type == "integer"` at tier-0, after sees `"float"`);
-  large-int (>2^53) first-iteration semantics; F1 reverse shape still
-  bails; peel-ineligible shapes (pending stores / gmatch / alloc)
-  decline cleanly; region/rec_path sanity on a two-traversal committed
-  path (no duplicate region edges, sibling formation from both
-  passes); hashgate 84/84; fft A/B + full bench sweep vs shadow
-  baseline.
-- [ ] **Open question — resumed-instance float sibling.** A deopt
-  mid-loop re-dispatches at the anchor with float slots; the peeled
-  trace's int fingerprint refuses it. The plain float-entry sibling
-  that covers resumed instances should form organically via the
-  existing sibling machinery — verify it does, or file the gap.
+- [ ] **Phase 4 (leftovers).** Explicit `math.type` deopt-boundary
+  probe; targeted decline tests for pending-store/gmatch/alloc
+  ineligibility (the gate is exercised only via the numeric-for
+  decline test today); region/rec_path sanity on a two-traversal
+  committed path.
 - [ ] **Defer — side/continuation recordings.** v1 scopes the peel to
   initial `.root` recordings; side traces and continuations keep
   today's behavior (their retry arming is hot-exit-driven, not
@@ -88,6 +91,45 @@ _(nothing yet)_
   several stabilization iterations; v1 allows exactly one (int→float
   stabilizes in one; genuine flip-flops abort `.type_instability` and
   were uncompilable before).
+
+## What implementation revealed (2026-09-04)
+
+The mechanism landed as designed and is verified end-to-end, but the
+premise about *where it fires* was wrong on the post-doc-38 tree. Two
+empirical facts, established while building Phase 4:
+
+1. **A warming-driven root recording can never start at instance trip 1
+   of a while loop.** Hot-counting ticks on back-edges, and recording
+   begins at the anchor arrival via the arming back-edge — i.e. at trip
+   ≥ 2 of whatever instance is running. Trip-1 arrivals come via
+   fallthrough, which never starts a root. So for the reset-to-int
+   family this doc was motivated by (`k = n` each outer iteration,
+   float by trip 2 — fft_bitreverse), the recorder always sees a
+   FLOAT entry and the instability sweep correctly declines: the :55
+   root records float-entry and compiles; the traces that still bail
+   RV-3 at fft today (:68 and the second :55) are the **F1 reverse
+   shape** (float entry, int store from `k = n`) that this doc
+   explicitly defers. A synthetic reset-to-int nest reproduces the
+   same outcome, with zero LLEAVE retries observed that could land a
+   trip-1 recording.
+2. **The organic trigger that DOES exist is transition-trip
+   alignment**: a loop whose carried slot flips int→float permanently
+   at some trip T, recorded exactly when warming lands on T. Then the
+   peel converts a trace that would otherwise be dead-on-commit (its
+   int entry state never recurs → per-entry guard thrash, RV-3 bail)
+   into a compiled native trace whose run-once region absorbs the
+   transition — and when the enclosing program re-runs the loop
+   (instances), every instance's trip-T arrival re-enters it natively
+   (the `interp_native_test.zig` doc-39 tests pin this shape).
+
+Consequence: this change is expected ~neutral on the current bench
+suite (nothing in it aligns a transition trip with the warming
+threshold), and the actual fft lever is the deferred F1-reverse /
+continuation-scope narrowing. The peel is general
+type-transition-robustness machinery — it removes a whole class of
+"recorded at the wrong moment" dead traces — not an fft win. Kept, per
+Rule Z-6, because it is the general mechanism; the fft-specific
+follow-up is a separate design decision.
 
 ## Why this exists
 

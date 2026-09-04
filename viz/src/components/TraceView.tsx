@@ -47,6 +47,21 @@ export default function TraceView() {
   };
   const isExit = () => curEvent()?.kind === ExecEventKind.Exit;
 
+  // Doc 39: a PEELED trace's run-once region is a real tier-0 iteration (the
+  // type-stabilizing first pass), so the FIRST commit of each entry closes
+  // iterations 1–2 at once; every later commit is one iteration as usual.
+  const isFirstCommitInEntry = (): boolean => {
+    const c = cur();
+    if (!c) return false;
+    const all = steps();
+    for (let i = pos() - 1; i >= 0; i--) {
+      const s = all[i];
+      if (!s || s.entryIndex !== c.entryIndex) break;
+      if (s.event.kind === ExecEventKind.Commit) return false;
+    }
+    return true;
+  };
+
   // Auto-advance while playing; stop at the final event. Reads the live store
   // position each tick so manual scrubbing mid-play stays coherent.
   createEffect(() => {
@@ -84,7 +99,9 @@ export default function TraceView() {
       case ExecEventKind.GuardPass:
         return `guard %${ev.ref} passed`;
       case ExecEventKind.Commit:
-        return "iteration committed — loop ↺";
+        return (trace()?.peeled ?? 0) !== 0 && isFirstCommitInEntry()
+          ? "iterations 1–2 committed (peeled stabilizing pass) — loop ↺"
+          : "iteration committed — loop ↺";
       case ExecEventKind.Exit: {
         const k = curEntry()?.exit_kind ?? 0;
         return `exit ramp @ %${ev.ref} — ${exitKindLabel(k)} side-exit → tier-0`;

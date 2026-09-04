@@ -34,6 +34,8 @@ export interface ConstRow {
 export interface TraceView {
   anchorProtoId: number;
   anchorPc: number;
+  /** Non-zero when the trace starts with a type-stabilizing peeled iteration. */
+  peeled: number;
   /** `entry=[r0 r4 …]` slot list. */
   entrySlots: number[];
   instrs: InstrRow[];
@@ -116,6 +118,7 @@ export function traceToView(t: TraceOutput): TraceView {
   return {
     anchorProtoId: t.anchor_proto_id,
     anchorPc: t.anchor_pc,
+    peeled: t.peeled,
     entrySlots: t.entry_slots,
     instrs,
     consts,
