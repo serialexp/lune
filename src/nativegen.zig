@@ -4933,7 +4933,15 @@ fn isNumericForLoopDoneGuard(t: *const Trace, instr_idx: usize) bool {
     if (guard.op != .guard_true) return false;
     const exit_pc = trace.guardExitPc(guard) orelse return false;
     if (exit_pc == 0 or exit_pc > t.anchor.proto.code.len) return false;
-    return t.anchor.proto.code[trace.guardSourcePc(guard).?].op == .for_loop;
+    if (t.anchor.proto.code[trace.guardSourcePc(guard).?].op != .for_loop) return false;
+    // Doc 37: reject inlined-callee `for_loop` guards — their `guardSourcePc` is
+    // in the callee's proto space, not the anchor's. A coincidental pc collision
+    // would falsely classify a callee guard as the anchor's loop-done guard.
+    if (t.provAt(@intCast(instr_idx))) |prov| switch (prov) {
+        .guard => |gp| if (gp.inline_depth > 0) return false,
+        .link_terminal => return false,
+    };
+    return true;
 }
 
 /// Part A-v (doc 17 §A2.1/§A2.3): true for a trace-local composite outer-loop

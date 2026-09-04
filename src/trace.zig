@@ -846,7 +846,16 @@ pub fn isLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
     if (g.op != .guard_true) return false;
     const exit_pc = guardExitPc(g) orelse return false;
     if (exit_pc == 0 or exit_pc > t.anchor.proto.code.len) return false;
-    return t.anchor.proto.code[guardSourcePc(g).?].op == .for_loop;
+    if (t.anchor.proto.code[guardSourcePc(g).?].op != .for_loop) return false;
+    // Doc 37: a callee-internal `for_loop` guard at `inline_depth > 0` has its
+    // `guardSourcePc` in the callee's proto, not the anchor's. If the callee's pc
+    // coincidentally maps to a `for_loop` in the anchor proto, this would falsely
+    // match. Reject inlined-callee guards via the exit provenance table.
+    if (t.provAt(@intCast(idx))) |prov| switch (prov) {
+        .guard => |gp| if (gp.inline_depth > 0) return false,
+        .link_terminal => return false, // a link terminal is never a loop-done guard
+    };
+    return true;
 }
 
 /// Caller-declared intent for `armNativeLink`, enforcing the P-C option (b) invariant
@@ -13626,13 +13635,6 @@ pub const TraceState = struct {
     }
 
     fn recForLoop(self: *TraceState, instr: Instr, regs: RegWindow, pc: u32) !void {
-        // Cross-frame tracing (Phase 0): never process a `for_loop` inside an
-        // inlined callee. The `target == anchor.pc` watermark test below compares
-        // raw pc integers across *different* protos, so a callee-internal loop
-        // whose body pc coincides with the outer anchor pc would corrupt the
-        // exit-snapshot watermark. Leaf callees in the target benchmark cluster are
-        // straight-line; a callee with its own numeric-`for` aborts and runs tier-0.
-        if (self.rec.inline_depth > 0) return self.abort(.cross_frame);
         const a = instr.a;
 
         // If *this* `for_loop` is the one whose back-edge defines the trace
@@ -13643,8 +13645,14 @@ pub const TraceState = struct {
         // start on every resume path and after the loop. Record the watermark so
         // `commit()` can drop those slots from the exit snapshot. A `for_loop` the
         // trace merely passes through (different target) is ignored.
+        //
+        // Guard with `inline_depth == 0`: at depth > 0 the `target` pc is in the
+        // callee's proto, so `target == anchor.pc` is a cross-proto coincidence —
+        // the watermark would corrupt the anchor frame's phi writeback. The callee's
+        // locals are already excluded by `slot >= anchor_num_registers` in commit.
         const target: u32 = @intCast(@as(i64, pc) + instr.aux);
-        if (target == self.rec.anchor.pc) self.rec.locals_watermark = @as(u32, a) + 4;
+        if (self.rec.inline_depth == 0 and target == self.rec.anchor.pc)
+            self.rec.locals_watermark = @as(u32, a) + 4;
         const vidx = regs.get(a);
         const vlimit = regs.get(a + 1);
         const vstep = regs.get(a + 2);
@@ -13758,9 +13766,6 @@ pub const TraceState = struct {
     /// inner root, which assumes ≥1 iteration. Phase 3 consumes this snapshot to follow
     /// the link through `driveChain`.
     fn recForPrepLink(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32) !void {
-        // A `for_prep` inside an inlined callee shares `recForLoop`'s cross-frame
-        // hazard (raw-pc anchor comparison across protos); keep the historical abort.
-        if (self.rec.inline_depth > 0) return self.abort(.nyi_opcode);
         const a = instr.a;
 
         // Read + type-check the numeric-for control values up front (both directions
@@ -13779,17 +13784,24 @@ pub const TraceState = struct {
         // The decision is a pure function of deterministic register values, so it is
         // identical in every record/exec mode.
         //
-        // If the loop runs, fall through to the historical `.link` hand-off below.
-        // If it ZERO-TRIPS, the link is meaningless (the inner root assumes ≥1
-        // iteration) and force-closing with `.link` recorded the WRONG shape — the
-        // duplicate-continuation bug that made the skip direction unrecordable.
-        // Instead, record the `for_prep` as the plain arithmetic it is (`R[a] =
-        // init − step`, operands type-guarded) and keep recording: tier-0 jumps to
-        // the `for_loop`, whose recorder mirror (`recForLoop`) now records the
-        // observed loop-EXIT direction (`guard_false` on the continue test) and
+        // If the loop runs AND we are at depth 0, fall through to the `.link`
+        // hand-off below. If it ZERO-TRIPS, the link is meaningless (the inner root
+        // assumes ≥1 iteration) and force-closing with `.link` recorded the WRONG
+        // shape — the duplicate-continuation bug that made the skip direction
+        // unrecordable. Instead, record the `for_prep` as the plain arithmetic it is
+        // (`R[a] = init − step`, operands type-guarded) and keep recording: tier-0
+        // jumps to the `for_loop`, whose recorder mirror (`recForLoop`) now records
+        // the observed loop-EXIT direction (`guard_false` on the continue test) and
         // continues straight-line past the loop. This is sound for every recording
         // kind — no link is taken, it is just straight-line code — so a `.root` may
         // record through a zero-tripping inner `for_prep` too.
+        //
+        // At `inline_depth > 0` the same record-through path handles BOTH zero-trip
+        // AND running loops: the link path cannot work at depth > 0 (`driveChain`
+        // resolves `link_target` in the anchor proto, not the callee's), so we record
+        // the `for_prep` arithmetic and let `recForLoop` unroll the inner loop. The
+        // trace specializes to the iteration count observed during recording; a
+        // mismatch on replay deopts via `guard_true`/`guard_false` failure.
         {
             const pre = arith.sub(vinit, vstep) catch return self.abort(.bad_type);
             const vnext = arith.add(pre, vstep) catch return self.abort(.bad_type);
@@ -13798,7 +13810,7 @@ pub const TraceState = struct {
                 arith.le(vnext, vlimit) catch return self.abort(.bad_type)
             else
                 arith.le(vlimit, vnext) catch return self.abort(.bad_type);
-            if (!within) {
+            if (!within or self.rec.inline_depth > 0) {
                 const rinit0 = try self.refOf(a);
                 const rlimit0 = try self.refOf(a + 1);
                 const rstep0 = try self.refOf(a + 2);

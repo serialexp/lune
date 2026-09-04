@@ -299,6 +299,13 @@ pub fn flushNumericForLoopDone(t: *const Trace, regs: RegWindow, values: []Value
     if (exit_pc == 0 or exit_pc > t.anchor.proto.code.len) return false;
     const for_ins = t.anchor.proto.code[trace.guardSourcePc(guard).?];
     if (for_ins.op != .for_loop) return false;
+    // Doc 37: reject inlined-callee `for_loop` guards — their `guardSourcePc` is
+    // in the callee's proto, not the anchor's. A coincidental pc match would flush
+    // the wrong stores.
+    if (t.provAt(exit_instr)) |prov| switch (prov) {
+        .guard => |gp| if (gp.inline_depth > 0) return false,
+        .link_terminal => return false,
+    };
     if (!loopDoneSnapshotSupported(t, exit_instr)) return false;
 
     var si: usize = @intCast(exit_instr + 1);
