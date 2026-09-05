@@ -1,26 +1,28 @@
-//! Trace recorder + trace IR — the heart of the JIT (Phase 5).
+//! Trace recorder, trace IR, and the trace lifecycle — the heart of the JIT.
 //!
 //! A tracing JIT works by watching tier-0 execute, noticing when a loop runs
 //! *hot*, and **recording** one iteration of that loop into a linear,
-//! single-assignment IR specialised to the types it actually observed. Later
-//! tiers (Phase 6: IR-interpreter; Phase 8: native codegen) *execute* that IR;
-//! this module only **records** it. Recording is deliberately *transparent* —
-//! tier-0 still performs every operation, so a program's observable behaviour is
-//! identical whether the recorder is on or off. That invariant is the recorder's
-//! decisive correctness test (`interp.zig`, the `expectProgram` matrix).
+//! single-assignment IR specialised to the types it actually observed. The
+//! execution tiers (`irinterp.zig`: tier-1a IR interpreter; `nativegen.zig`:
+//! tier-1b native codegen) *execute* that IR. Recording is deliberately
+//! *transparent* — tier-0 still performs every operation, so a program's
+//! observable behaviour is identical whether the recorder is on or off. That
+//! invariant is the recorder's decisive correctness test (`interp.zig`, the
+//! `expectProgram` matrix).
 //!
-//! Two pieces live here:
+//! What lives here:
 //!   * the **trace IR** — `IrOp`/`IrInstr`/`Trace`, plus a disassembler. This is
 //!     the cache-sensitive representation the architecture reserves for the JIT
 //!     (docs/design/00-architecture.md §Value representation), kept separate from
 //!     the tier-0 bytecode (`bytecode.zig`).
 //!   * the **recorder** — `TraceState` (hotness counters, the trace cache, and
 //!     the in-progress `Recorder`) and its state machine (`onBackEdge`).
+//!   * the **lifecycle machinery** that grew around them: side traces and hot-exit
+//!     wants, the peel (doc 39/40), chain/burst dispatch (`driveChain`,
+//!     `replayLedger`), native link arming and exit-branch patching (doc 17),
+//!     regions and provenance, gates/backoff, and cache invalidation.
 //!
-//! Policy is set by docs/design/01-trace-lifecycle.md. Phase 5a (this increment)
-//! lands hotness detection, recording with type guards, and the abort policy;
-//! executing traces, deopt/side-exit restore, blacklist backoff, side traces, and
-//! cache invalidation are later phases (named there, not built here).
+//! Policy is set by docs/design/01-trace-lifecycle.md and refined by docs 15-40.
 
 const std = @import("std");
 const bytecode = @import("bytecode.zig");
@@ -56,9 +58,11 @@ const pattern_mod = @import("stdlib/pattern.zig");
 /// instruction defines exactly one value, named by its position.
 pub const Ref = u16;
 
-/// Index into the (future) per-guard snapshot table. A placeholder in Phase 5a —
-/// the field exists from day one so the deopt machinery (Phase 6) is a body to
-/// fill in, not a schema change. See docs/design/01-trace-lifecycle.md.
+/// Index into the (future) per-guard snapshot table. Still a RESERVED
+/// placeholder (checked 2026-09: no producer writes a non-default value and no
+/// consumer reads it) — kept deliberately so per-guard snapshot deopt can land
+/// as a body to fill in, not a trace-schema change. Serialized as-is by
+/// traceser. See docs/design/01-trace-lifecycle.md.
 pub const SnapIdx = u32;
 
 /// The type the recorder *observed* for a value, and therefore the type a guard
@@ -634,7 +638,7 @@ pub const IrOp = enum(u8) {
     /// `isSideExitGuardOp` (aux is a konst id, not a PC). Wire ordinal 80.
     guard_sid,
 
-    // -- doc 35: rounding builtins (float→int).
+    // -- rounding builtins (float→int); extends doc 23's recorded-builtin set.
 
     /// `math.floor(x)`: `@floor` + convert to `i64`. Operand: a proven
     /// numeric ref (float or int — an int operand is promoted to float).
@@ -847,7 +851,7 @@ pub fn isLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
     const exit_pc = guardExitPc(g) orelse return false;
     if (exit_pc == 0 or exit_pc > t.anchor.proto.code.len) return false;
     if (t.anchor.proto.code[guardSourcePc(g).?].op != .for_loop) return false;
-    // Doc 37: a callee-internal `for_loop` guard at `inline_depth > 0` has its
+    // Inlined-callee corner: a callee-internal `for_loop` guard at `inline_depth > 0` has its
     // `guardSourcePc` in the callee's proto, not the anchor's. If the callee's pc
     // coincidentally maps to a `for_loop` in the anchor proto, this would falsely
     // match. Reject inlined-callee guards via the exit provenance table.
@@ -966,51 +970,48 @@ pub const ArmKind = enum {
     sibling_handoff,
 };
 
-/// A-v emitted bridge-capable stubs without publishing an edge into any of them.
-/// A-vii-d flipped this to true once the full chain landed: the replay grammar
-/// (A-vii-a), the arm-time S⊆E validator (A-vii-b), the consumption-keyed profit
-/// gate (A-vii-c/c.1/c.2), reachable armability (A-vii-d.0), and the
-/// `tryArmRegionBridge` arm site in `driveChain`. Flipping it back to false
-/// restores the pre-A-vii world: stubs still emit, but every `.region_bridge`
-/// arm attempt release-panics in `armNativeLink` (deliberate tripwire).
-const region_bridge_arming_enabled = true;
-
-/// Part S (§S) — the native sibling handoff master switch. ON.
-///
-/// The mechanism: patching a hot ordinary-guard exit to jump straight into a
-/// same-anchor sibling's ordinary entry, fusing skip⇄continuation ping-pong into
-/// one native call (on nsieve it fuses the majority of dispatcher bursts).
-///
-/// History of the soundness scare (2026-08-12/13), kept because the diagnosis
-/// path is instructive: an earlier revision of this comment declared the §S
-/// premise ("a zero-progress pre-effect deopt is coherent at the anchor")
-/// FALSIFIED, because the A-viii outer-cycle repro printed 108 where the unfused
-/// run prints 109 even after both premise halves (`exitIsPreEffect`, the
-/// `term_local == 0` charge filter) were in place. That verdict was wrong. The
-/// dropped iteration was never a register-coherence failure at the handoff at
-/// all — it was `replayLedger`'s TERMINAL arm resuming at the stale linked
-/// `link_pc` when a burst mixed `.link_terminal` rows with a later handoff row,
-/// so tier-0 resumed inside the previous prime's finished inner loop and the
-/// middle `for_loop` advanced past the in-flight iteration (the missing prime is
-/// 307, the first zero-trip). The fix is entry-PROVENANCE, not snapshots: a row
-/// whose owner was entered at its anchor (handoff successor, like a bridged
-/// successor) terminal-resumes at the anchor, never `link_pc` — see
-/// `next_entry = .via_handoff` in `replayLedger`. With that fix A-viii prints 109 with
-/// arming ON, the full suite is green, and all six output-identity controls
-/// hash byte-identical.
-///
-/// The premise therefore stands as designed, with eligibility enforced at
-/// `siblingHandoffEligible`: compiled native, in-bounds, not a loop-done or
-/// bridge slot, not already armed, no preceding heap effect on the trace
-/// (`exitIsPreEffect`), and the guard must be sourced at a real conditional
-/// branch opcode (`jmp_if_*`) — a non-branch guard (e.g. a zero-trip loop-entry
-/// check sourced at `for_prep`) would ping-pong parent⇄sibling to LEDGER_CAP
-/// instead of committing an iteration per transition (measured: +128% on
-/// nsieve before the branch-source rule).
-const sibling_handoff_arming_enabled = true;
-
-/// Part B-2b (doc 17 §B.5): hotexit-provenance relation and disposable arm ON.
-const provenance_arming_enabled = true;
+// Region-bridge arming (A-vii-d): always on since the full chain landed — the
+// replay grammar (A-vii-a), the arm-time S⊆E validator (A-vii-b), the
+// consumption-keyed profit gate (A-vii-c/c.1/c.2), reachable armability
+// (A-vii-d.0), and the `tryArmRegionBridge` arm site in `driveChain`. The
+// staged flip-switch (`region_bridge_arming_enabled`) was folded once the
+// increments were history.
+//
+// Part S (§S) — the native sibling handoff. Always on.
+//
+// The mechanism: patching a hot ordinary-guard exit to jump straight into a
+// same-anchor sibling's ordinary entry, fusing skip⇄continuation ping-pong into
+// one native call (on nsieve it fuses the majority of dispatcher bursts).
+//
+// History of the soundness scare (2026-08-12/13), kept because the diagnosis
+// path is instructive: an earlier revision of this comment declared the §S
+// premise ("a zero-progress pre-effect deopt is coherent at the anchor")
+// FALSIFIED, because the A-viii outer-cycle repro printed 108 where the unfused
+// run prints 109 even after both premise halves (`exitIsPreEffect`, the
+// `term_local == 0` charge filter) were in place. That verdict was wrong. The
+// dropped iteration was never a register-coherence failure at the handoff at
+// all — it was `replayLedger`'s TERMINAL arm resuming at the stale linked
+// `link_pc` when a burst mixed `.link_terminal` rows with a later handoff row,
+// so tier-0 resumed inside the previous prime's finished inner loop and the
+// middle `for_loop` advanced past the in-flight iteration (the missing prime is
+// 307, the first zero-trip). The fix is entry-PROVENANCE, not snapshots: a row
+// whose owner was entered at its anchor (handoff successor, like a bridged
+// successor) terminal-resumes at the anchor, never `link_pc` — see
+// `next_entry = .via_handoff` in `replayLedger`. With that fix A-viii prints 109 with
+// arming ON, the full suite is green, and all six output-identity controls
+// hash byte-identical.
+//
+// The premise therefore stands as designed, with eligibility enforced at
+// `siblingHandoffEligible`: compiled native, in-bounds, not a loop-done or
+// bridge slot, not already armed, no preceding heap effect on the trace
+// (`exitIsPreEffect`), and the guard must be sourced at a real conditional
+// branch opcode (`jmp_if_*`) — a non-branch guard (e.g. a zero-trip loop-entry
+// check sourced at `for_prep`) would ping-pong parent⇄sibling to LEDGER_CAP
+// instead of committing an iteration per transition (measured: +128% on
+// nsieve before the branch-source rule).
+//
+// Part B-2b (doc 17 §B.5): hotexit-provenance relation and disposable arm —
+// always on (the `provenance_arming_enabled` flip-switch was folded).
 
 /// A loop-carried writeback: at the back-edge, tier-0 register `slot` holds the
 /// value produced by IR `ref`. The set of these is the trace's exit snapshot —
@@ -1223,7 +1224,7 @@ pub const InputKind = enum(u8) { upvalue, global, hash_cell, callee_upvalue };
 /// (`closure.upvalues[source]`) or the global key's constant-pool index
 /// (`proto.constants[source]`); `slot` is the synthetic frame-relative slab slot
 /// (== the seeding `slot_load`'s `aux`), always `>= anchor_num_registers`. For
-/// `callee_upvalue` (doc 36): `source` is the upvalue index in the *inlined
+/// `callee_upvalue` (inlined-callee upvalues): `source` is the upvalue index in the *inlined
 /// callee's* closure, and `callee_slot` is the anchor-slab slot where that
 /// callee's closure lives at entry time — the seed resolves through
 /// `Closure.fromHeader(regGet(base + callee_slot)).upvalues[source]`. The
@@ -1243,7 +1244,7 @@ pub const InputSeed = struct {
     /// native analogue of the oracle's per-iteration `guard_hash` count check), else
     /// the entry declines native and runs tier-1a (which side-exits at `guard_hash`).
     expected_count: u32 = 0,
-    /// `callee_upvalue` only (doc 36): anchor-slab slot where the inlined callee's
+    /// `callee_upvalue` only (inlined-callee upvalues): anchor-slab slot where the inlined callee's
     /// closure lives at entry time. The callee was already seeded (as an `upvalue`
     /// or regular `slot_load` input) before this seed, so `regGet(base +
     /// callee_slot)` is valid by the time this seed runs.
@@ -1315,8 +1316,9 @@ pub const NativeSeedCtx = struct {
 };
 
 /// A completed, cached trace: the recorded IR plus the entry/exit snapshots that
-/// connect it back to tier-0 register slots. Immutable once committed (Phase 5a
-/// never invalidates a cached trace — see the lifecycle doc).
+/// connect it back to tier-0 register slots. The IR is immutable once
+/// committed; a trace leaves the cache only wholesale (`removeTrace` /
+/// `clearCache` — see the lifecycle doc).
 pub const Trace = struct {
     /// Stable, monotonically-assigned identity (P-B, doc 17). Unlike the cache
     /// index (`traceIndex`, which `swapRemove` shuffles), this is assigned once at
@@ -1432,7 +1434,8 @@ pub const Trace = struct {
     /// `false` iff the commit-time `buildExitProv` OOM'd and this trace was committed with
     /// an EMPTY exit table rather than aborting the commit (same fail-soft rationale as
     /// `rec_path_complete` — a `commit` error gates the anchor and perturbs tiering, and
-    /// `exit_prov` is inert region metadata read by nothing on the selection path). A
+    /// `exit_prov` is region metadata off the tier-selection path, though the Part-A
+    /// classifier and successor resolution do consume it). A
     /// truncated table means this trace contributes NO structural edges, so the whole edge
     /// graph is missing edges; region discovery then arms/mints NOTHING that pass (a
     /// dropped *boundary* edge could otherwise shrink an owner's competing-entry count and
@@ -2210,8 +2213,8 @@ pub const TraceState = struct {
     /// to `GATE_SKIP` when an anchor is found gated, so a dead loop's millions of
     /// back-edges cost an array decrement instead of three hashmap probes apiece.
     hotcount: [HOTCOUNT_SIZE]u16 = @splat(0),
-    /// Committed traces. A linear scan is fine — the cache is small in Phase 5a
-    /// and never invalidated.
+    /// Committed traces. A linear scan is fine — the cache stays small (dozens,
+    /// not thousands) and dispatch goes through per-anchor lookups.
     cache: std.ArrayListUnmanaged(*Trace) = .empty,
     /// Next stable `Trace.id` to hand out (P-B, doc 17). Monotonic; never decremented,
     /// so a retired trace's id is never reassigned and a baked `final_trace_id` can
@@ -2226,7 +2229,7 @@ pub const TraceState = struct {
     /// destroyed its slot array is freed, so its records must be dropped before any
     /// child-retire tries to write through them. `resetLinksTouching` handles both
     /// directions by trace *identity* (never a raw slot pointer), so it is correct
-    /// regardless of retire order. Empty until arming lands (2.3b) → inert in 2.3a.
+    /// regardless of retire order. Populated by `armNativeLink` (2.3b+).
     armed_links: std.ArrayListUnmanaged(NativeLink) = .empty,
     /// B-3b.2 silent-cycle registry. `promoted_exit_owners` is the exclusive
     /// physical-exit ownership index required by §B3.9(4); ids, rather than list
@@ -2345,13 +2348,6 @@ pub const TraceState = struct {
     /// decomposition 4x faster than failed unrolling). Reset wholesale with
     /// the gates (epoch boundary).
     unroll_fail: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
-    /// Doc 38 unroll-first policy: memoized static classification per anchor —
-    /// the innermost enclosing loop's anchor pc when this anchor is a plain-jmp
-    /// while anchor enclosed by another loop in the same proto, else
-    /// `maxInt(u32)` (not a while / repeat-until / for anchor / top-level).
-    /// Pure bytecode geometry, computed once per anchor
-    /// (`whileEnclosingAnchorPc`). Reset wholesale with the gates.
-    while_static: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
     /// Doc 38 yield gate accumulator: per-anchor (entries, iters) over the
     /// current probe window, fed by every ENTERED receipt whose exit is a
     /// while-loop-done guard (`noteWhileYield`). Reset per verdict and on the
@@ -2364,18 +2360,18 @@ pub const TraceState = struct {
     /// Pure ephemeral structural-edge cache (doc 17 §A3.3 / §A8-ii, A-ii.2):
     /// `{Trace.id, exit_instr} → StructuralEdgeId`. Rebuilt WHOLESALE from the current
     /// cache at every commit AND every retirement (never surgically mutated), dropped
-    /// in `clearCache`, freed in `deinit`. NOT a source of truth — the region
-    /// classifier (A-ii.4) will consume it. **Inert: read by nothing in A-ii ⇒
-    /// byte-identical.** A rebuild reserves capacity BEFORE clearing the prior snapshot,
-    /// so a commit-path OOM RETAINS it and a retirement-path OOM fail-closes to EMPTY
-    /// (both region-neutral while read-by-nothing).
+    /// in `clearCache`, freed in `deinit`. NOT a source of truth — consumed by the
+    /// region classifier and region-bridge validation (`validateRegionBridge`).
+    /// A rebuild reserves capacity BEFORE clearing the prior snapshot, so a
+    /// commit-path OOM RETAINS it and a retirement-path OOM fail-closes to EMPTY
+    /// (both region-neutral: an empty cache arms nothing).
     edge_cache: std.AutoHashMapUnmanaged(ExitKey, StructuralEdgeId) = .empty,
     /// Discovered region definitions keyed by interned `RegionId` (doc 17 §A3.1 /
     /// §A8-ii, A-ii.4). **Proto/VM-lifetime**: accumulated as traces commit, NEVER
     /// cleaned by `removeTrace` (a GC-physical retire must not diverge
     /// `gc_stress on/off`), cleared ONLY wholesale in `clearCache` (the epoch boundary
     /// where protos may be freed). Owns each `RegionDef`'s `members`/`member_points`.
-    /// **Inert: read by nothing in A-ii ⇒ byte-identical.**
+    /// Consumed by the arming path (`armable` flips, `edgeMemberOfRegion`).
     region_defs: std.AutoHashMapUnmanaged(RegionId, RegionDef) = .empty,
     /// Invalidation generation for `Trace.region_memo_*` (freeze-after-qualify,
     /// task #70). Bumped at EVERY `region_defs` mutation — new/updated defs and
@@ -2408,8 +2404,8 @@ pub const TraceState = struct {
     /// exits that LEAVE the region from a member anchor). **Physical + transient**:
     /// WHOLESALE-rebuilt per discovery pass AND per `removeTrace` from the surviving
     /// cache; excludes `armable == false` regions. Owns each `[]RegionId`. Queried by
-    /// `classifyExit` (unread by production in A-ii). A retirement-rebuild OOM publishes
-    /// EMPTY (fail-closed — the prior set references a dead trace).
+    /// `classifyExit`, whose result feeds `tryArmRegionBridge`. A retirement-rebuild
+    /// OOM publishes EMPTY (fail-closed — the prior set references a dead trace).
     source_exit_regions: std.AutoHashMapUnmanaged(ExitKey, []RegionId) = .empty,
     /// Physical classification index (doc 17 §A3.1): a concrete `Trace.id` → the
     /// regions entered by landing in it (destination of an internal edge; physical
@@ -2495,7 +2491,7 @@ pub const TraceState = struct {
     /// 2.3c-1 (M1 half-fusion, doc 17): count of fused skip→prime-side receipts DRAINED
     /// by the dispatcher's M1 fused-`.link` consumer (interp.zig) — i.e. the arm above
     /// actually took effect and a native `ct.run` fused straight into the prime-side ramp
-    /// (`final != ct`, provenance via `fusedSourceBranchLinkSlot`). Distinct from the arm
+    /// (`final != ct`, provenance via `hasArmedSourceBranchLinkAt`). Distinct from the arm
     /// counter: an arm can happen without ever firing (skip retired first); this counts
     /// the consumer path being taken. `> 0` proves the M1 consumer is exercised, not just
     /// wired, in the 2.3c-1 differential test.
@@ -2522,7 +2518,6 @@ pub const TraceState = struct {
     native_link_disarms: u64 = 0,
     silent_promotions: u64 = 0,
     silent_demotions: u64 = 0,
-    silent_promotion_rejects: u64 = 0,
     silent_promotion_candidates: u64 = 0,
     silent_rejects: PromotionRejects = .{},
     silent_demotion_reasons: PromotionDemotions = .{},
@@ -2661,7 +2656,7 @@ pub const TraceState = struct {
     /// `deinit`. `AnchorCoverage` fields mirror the aggregates above, partitioned by
     /// anchor.
     coverage: std.AutoHashMapUnmanaged(AnchorKey, AnchorCoverage) = .empty,
-    /// The in-progress recording (at most one at a time in Phase 5a).
+    /// The in-progress recording (at most one at a time).
     rec: Recorder = .{},
     /// Reusable SSA-value scratch for the tier-1a executor (`irinterp.execute`),
     /// indexed by `Ref`. Reused across every entry — never allocated
@@ -2933,7 +2928,6 @@ pub const TraceState = struct {
     /// Part S: charge one burst-terminal receipt to `(trace, exit)` and, on crossing
     /// `hotguard`, request an arm. Pure function of the receipt stream.
     fn noteSiblingTerminal(self: *TraceState, t: *Trace, exit_instr: u32) void {
-        if (!sibling_handoff_arming_enabled) return;
         // Steady state (a request already in flight): one optional load and out. See
         // `Trace.sibling_watch_exit` for why this path has to be free, not just cheap.
         if (self.pending_sibling_arm != null) return;
@@ -3191,7 +3185,6 @@ pub const TraceState = struct {
         self.record_gate.deinit(self.gpa);
         self.lleave_count.deinit(self.gpa);
         self.unroll_fail.deinit(self.gpa);
-        self.while_static.deinit(self.gpa);
         self.while_yield.deinit(self.gpa);
         self.penalty.deinit(self.gpa);
         self.guard_failures.deinit(self.gpa);
@@ -4619,7 +4612,7 @@ pub const TraceState = struct {
     /// provenance. Called only at dispatcher/runtime safe points. Observation
     /// windows retain the logical edges and retry when arming becomes safe again.
     pub fn drainProvenanceArms(self: *TraceState, safe_to_arm: bool) void {
-        if (!provenance_arming_enabled or self.provenance_edges.items.len == 0) return;
+        if (self.provenance_edges.items.len == 0) return;
         if (!safe_to_arm) return;
         // Event-driven gate: the drain runs at every dispatcher safe point, so
         // its edge×armed_links scan must be O(1) on the steady state (it was
@@ -4765,7 +4758,7 @@ pub const TraceState = struct {
         initial_cum: usize,
         out: []ProvenanceVerdict,
     ) usize {
-        if (!provenance_arming_enabled or self.provenance_edges.items.len == 0) return 0;
+        if (self.provenance_edges.items.len == 0) return 0;
         // O(1) necessary precondition. Every edge below must clear
         // `hasArmedSiblingHandoff` — an ARMED handoff — so with an empty arm
         // registry no edge can produce a verdict and the whole per-native-call
@@ -6126,7 +6119,7 @@ pub const TraceState = struct {
     /// returns), so callers do `return self.runLinkedBurst(...)`.
     ///
     /// `pub` because the dispatcher's M1 fused-`.link` consumer (interp.zig) enters it
-    /// directly with the already-run ramp receipt (see `fusedSourceBranchLinkSlot`).
+    /// directly with the already-run ramp receipt (see `hasArmedSourceBranchLinkAt`).
     ///
     /// 2.3c-2c: terminal disposition of draining ONE native call's per-transition
     /// ledger (`replayLedger`). The drain OWNS all per-transition accounting
@@ -7379,7 +7372,7 @@ pub const TraceState = struct {
                     //       loop-done guard) → regs coherent at the inner header.
                     // A NON-last `.deopt` is a fused ordinary-guard→successor hop (the M1
                     // `source-branch→ramp` shape). Its per-transition accounting is the
-                    // dispatcher's `fusedSourceBranchLinkSlot` steering, folded into this
+                    // dispatcher's fused source-branch steering, folded into this
                     // drain only when the dispatcher itself captures (2.3c-2d). Until
                     // then it is an unmodeled call-B grammar → loud release-panic (the
                     // same hard-stop the old ≤2 drain took on any >2 ledger), never a
@@ -9091,49 +9084,13 @@ pub const TraceState = struct {
         return true;
     }
 
-    /// 2.3c-1 (M1 half-fusion, doc 17): recognize a fused skip→prime-side receipt by
-    /// **armed-edge provenance**, returning `parent`'s source-branch guard slot index
-    /// if this receipt came through a slot the M1 arm (`driveChain`) established, else
-    /// null. The dispatcher calls this after a native run returned `final != ct` — some
-    /// child performed the final exit — to decide whether it was the skip→ramp fusion.
-    ///
-    /// Two distinct fusions can surface `final != ct` at the top level once 2.3c lands,
-    /// and they MUST be told apart by the armed slot's *guard shape*, not by
-    /// `final.instrs[exit_instr].op == .link` (which OOBs on a fused prologue-fail and
-    /// false-positives on the persistently-armed inner→continuation once 2.3c-2 lands):
-    ///   - **2.3b-1 continuation→inner** (`.link_terminal` slot: `C.link →
-    ///     I.linked_entry`): the armed slot is `C`'s `.link` terminal, NOT a source-
-    ///     branch guard → `isSourceBranchGuardExit` false → excluded (falls through to
-    ///     the existing `final`-routed handling).
-    ///   - **2.3c-1 skip→prime-side** (`.ordinary_guard` slot: `skip.guard →
-    ///     ramp.ordinary_entry`): the armed slot IS a source-branch guard of `ct` →
-    ///     recognized here.
-    ///
-    /// Corroborating shape checks (all cheap, all mode-invariant): the armed record must
-    /// name exactly `{parent = ct, child = final}`, `slot_index` must be an
-    /// `isSourceBranchGuardExit` of `ct`, and `final.anchor == ct.anchor` (skip and its
-    /// prime-side ramp are both anchored at the outer header). The CALLER still applies
-    /// the `exit_reason == .normal ∧ exit_instr < final.instrs.len` bounds gate before
-    /// indexing `final.instrs` — this helper only proves provenance, never touches the
-    /// receipt fields.
-    pub fn fusedSourceBranchLinkSlot(self: *const TraceState, parent: *Trace, child: *Trace, proto: *const Proto) ?u32 {
-        if (parent == child) return null;
-        if (child.anchor.proto != parent.anchor.proto or child.anchor.pc != parent.anchor.pc) return null;
-        for (self.armed_links.items) |l| {
-            if (l.parent != parent or l.child != child) continue;
-            if (!self.isSourceBranchGuardExit(parent, l.slot_index, proto)) continue;
-            return l.slot_index;
-        }
-        return null;
-    }
-
     /// Fused-M1 validation keyed on the EXACT exit (doc 38 unroll-first): is
     /// there an armed link `parent[slot] → child` where `slot` is a
     /// source-branch guard? An unrolled parent carries several source-branch
     /// guards (one per unrolled while-condition pass), each of which may hold
     /// its own armed link to the same sibling, so validating by "the first
-    /// armed slot for the pair" (`fusedSourceBranchLinkSlot`) is ambiguous —
-    /// the ledger's own exit index is the key.
+    /// armed slot for the pair" is ambiguous — the ledger's own exit index is
+    /// the key.
     pub fn hasArmedSourceBranchLinkAt(self: *const TraceState, parent: *Trace, slot: u32, child: *Trace, proto: *const Proto) bool {
         if (parent == child) return false;
         if (child.anchor.proto != parent.anchor.proto or child.anchor.pc != parent.anchor.pc) return false;
@@ -9370,8 +9327,8 @@ pub const TraceState = struct {
     /// Rebuild the ephemeral `edge_cache` WHOLESALE from the current cache (doc 17
     /// §A8-ii, A-ii.2): for every keyed exit of every cached trace with a compatibly-bound
     /// successor, record `{Trace.id, exit_instr} → StructuralEdgeId`. Called at every commit
-    /// and every retirement (never surgically mutated). **Inert: read by nothing in A-ii ⇒
-    /// byte-identical.**
+    /// and every retirement (never surgically mutated). Consumed by region discovery and
+    /// `validateRegionBridge`.
     ///
     /// **Transactional + fail-closed** (round-12 finding 2, round-14 finding 6): the rebuild
     /// reserves capacity BEFORE clearing (so the happy-path publish loop is infallible), but
@@ -9436,7 +9393,6 @@ pub const TraceState = struct {
     /// snapshot is unsafe — the commit that triggers this rebuild can add a boundary edge
     /// that invalidates a prior region's owner, so a retained snapshot could keep a stale
     /// region armed; empty is region-neutral and auto-recovers on the next successful pass).
-    /// **Inert in A-ii** (read by nothing on the selection path) ⇒ byte-identical.
     pub fn rebuildRegions(self: *TraceState) void {
         self.rebuildRegionsFallible() catch {
             self.clearPhysicalRegionIndices();
@@ -10155,8 +10111,9 @@ pub const TraceState = struct {
     }
 
     /// Classify a physical trace exit to the regions it belongs to (doc 17 §A3.3 /
-    /// §A8-ii, A-ii.4): a pure query over `source_exit_regions`. A-iv consumes it
-    /// only for inert accumulator updates; no tier-selection path reads the result.
+    /// §A8-ii, A-ii.4): a pure query over `source_exit_regions`. Consumed by the
+    /// accumulator updates AND by `tryArmRegionBridge`, which branches on the
+    /// result to decide arming.
     pub fn classifyExit(self: *const TraceState, key: ExitKey) []const RegionId {
         return self.source_exit_regions.get(key) orelse &.{};
     }
@@ -10377,7 +10334,6 @@ pub const TraceState = struct {
     };
 
     fn rejectPromotion(self: *TraceState, reason: PromotionRejectReason) ?[]PromotedEdge {
-        self.silent_promotion_rejects +|= 1;
         switch (reason) {
             .bridge_member => self.silent_rejects.bridge_member +|= 1,
             .region_mismatch => self.silent_rejects.region_mismatch +|= 1,
@@ -10751,7 +10707,6 @@ pub const TraceState = struct {
                 error.PromotionRegionOwned => self.silent_rejects.region_owned +|= 1,
                 else => self.silent_rejects.no_patch_point +|= 1,
             }
-            self.silent_promotion_rejects +|= 1;
             self.resetPromotionCandidate();
             return;
         };
@@ -10958,13 +10913,8 @@ pub const TraceState = struct {
             // A-vii is the first increment allowed to call this arm. Missing the
             // required re-guarding entry is therefore a wiring bug, not ordinary
             // ineligibility: fail loudly before publishing an unsafe bare jump.
-            .region_bridge => blk: {
-                const entry = child_c.ordinary_entry orelse
-                    @panic("armNativeLink(.region_bridge): child has no ordinary_entry");
-                if (!region_bridge_arming_enabled)
-                    @panic("armNativeLink(.region_bridge): A-v stub is intentionally unarmed");
-                break :blk entry;
-            },
+            .region_bridge => child_c.ordinary_entry orelse
+                @panic("armNativeLink(.region_bridge): child has no ordinary_entry"),
         };
         // A re-arm of this exact slot supersedes any prior child it pointed at.
         // Mutate the existing record IN PLACE (no allocation) — the earlier
@@ -11706,7 +11656,6 @@ pub const TraceState = struct {
         self.record_gate.clearRetainingCapacity();
         self.lleave_count.clearRetainingCapacity();
         self.unroll_fail.clearRetainingCapacity();
-        self.while_static.clearRetainingCapacity();
         self.while_yield.clearRetainingCapacity();
         self.penalty.clearRetainingCapacity();
         self.guard_failures.clearRetainingCapacity();
@@ -11767,7 +11716,9 @@ pub const TraceState = struct {
     }
 
     /// Part B-2a / §B.6: fresh-epoch teardown drops every logical provenance
-    /// relation along with the trace cache. Inert while B-2b has created none.
+    /// relation along with the trace cache. Edges are created by the B-2b
+    /// silent-provenance staging (`stageSilentSiblingProvenance` /
+    /// `stageSilentSuffixProvenance`) and by side-trace commits.
     pub fn clearProvenanceEdges(self: *TraceState) void {
         self.provenance_edges.clearRetainingCapacity();
     }
@@ -12069,66 +12020,6 @@ pub const TraceState = struct {
     ///  * **not recording** → count this back-edge; on *crossing* `hotloop` (and
     ///    if the anchor is neither already traced nor blacklisted), arm a fresh
     ///    recording that begins on the next loop iteration (at the anchor).
-    /// Doc 38 unroll-first policy: static bytecode geometry for one anchor,
-    /// memoized in `while_static`. Returns the innermost enclosing loop's
-    /// anchor pc when `pc` is a plain-jmp WHILE anchor enclosed by another
-    /// loop in the same proto — the anchor whose `unroll_fail` evidence gates
-    /// this while's rooting. Returns `maxInt(u32)` for everything else: for /
-    /// generic-for / repeat-until anchors (their rooting is untouched),
-    /// top-level whiles (no outer to unroll into), and the shared-anchor
-    /// corner where a `for_loop` back-edge also targets `pc` (the anchor IS
-    /// the outer loop; deferring would block the outer root itself).
-    fn whileEnclosingAnchorPc(self: *TraceState, proto: *const Proto, pc: u32) u32 {
-        const key = AnchorKey{ .proto = proto, .pc = pc };
-        if (self.while_static.get(key)) |v| return v;
-        const none = std.math.maxInt(u32);
-        var result: u32 = none;
-        // (1) `pc` must be a while anchor: some plain backward `jmp` targets it,
-        //     and no loop-op back-edge does.
-        var backedge: ?u32 = null;
-        var disqualified = false;
-        for (proto.code, 0..) |ins, j| {
-            const is_jump = switch (ins.op) {
-                .jmp, .jmp_if_false, .jmp_if_true, .for_loop, .tfor_loop, .jfor_loop => true,
-                else => false,
-            };
-            if (!is_jump) continue;
-            const t = @as(i64, @intCast(j)) + 1 + ins.aux;
-            if (t != pc or j <= pc) continue;
-            switch (ins.op) {
-                .jmp => backedge = @intCast(j),
-                // repeat-until back-edge or a loop-op back-edge sharing the pc:
-                // not a deferrable while anchor.
-                else => disqualified = true,
-            }
-        }
-        if (backedge != null and !disqualified) {
-            const be = backedge.?;
-            // (2) innermost enclosing loop: a backward jump from beyond the
-            //     while's back-edge to strictly before its condition.
-            var have = false;
-            var best_t: u32 = 0;
-            for (proto.code, 0..) |ins, j| {
-                const is_jump = switch (ins.op) {
-                    .jmp, .jmp_if_false, .jmp_if_true, .for_loop, .tfor_loop, .jfor_loop => true,
-                    else => false,
-                };
-                if (!is_jump) continue;
-                const t = @as(i64, @intCast(j)) + 1 + ins.aux;
-                if (t >= 0 and t < pc and j > be) {
-                    const tu: u32 = @intCast(t);
-                    if (!have or tu > best_t) {
-                        best_t = tu;
-                        have = true;
-                    }
-                }
-            }
-            if (have) result = best_t;
-        }
-        self.while_static.put(self.gpa, key, result) catch {};
-        return result;
-    }
-
     pub fn onBackEdge(self: *TraceState, proto: *const Proto, target_pc: u32, regs: RegWindow) void {
         if (self.rec.active) {
             if (self.rec.anchor.proto == proto and self.rec.anchor.pc == target_pc) {
@@ -12579,8 +12470,7 @@ pub const TraceState = struct {
         if (self.traceById(child.id) != child) return;
         const parent = self.traceById(src.trace_id) orelse return;
         var may_latch_done = true;
-        if (provenance_arming_enabled and
-            parent.anchor.proto == child.anchor.proto and parent.anchor.pc == child.anchor.pc and
+        if (parent.anchor.proto == child.anchor.proto and parent.anchor.pc == child.anchor.pc and
             src.exit_instr < parent.instrs.len)
         {
             self.provenance_edges.append(self.gpa, .{
@@ -12756,7 +12646,7 @@ pub const TraceState = struct {
             null;
         // **FAIL-SOFT (round-14 review, A-i exit_prov parity with `rec_path`):** an OOM in
         // `buildExitProv` must NOT abort the commit — `closeTrace` gates the anchor on a
-        // commit error, perturbing tiering, and `exit_prov` is inert region metadata (read
+        // commit error, perturbing tiering, and `exit_prov` is region metadata (read
         // only by `provAt` + the A-ii region classifier, nothing on the selection path). On
         // OOM commit an EMPTY exit table and mark `exit_prov_complete = false` so region
         // discovery treats the edge graph as incomplete and arms/mints nothing that pass.
@@ -12773,7 +12663,7 @@ pub const TraceState = struct {
         // A-ii.3/A-ii.4: dup the recorder's ordered program-point path into the
         // committed trace. **FAIL-SOFT (round-14 review finding 1):** an OOM here must
         // NOT abort the commit — `closeTrace` gates the anchor on a commit error, which
-        // would perturb tiering, and `rec_path` is inert region metadata. On ANY
+        // would perturb tiering, and `rec_path` is region metadata. On ANY
         // unavailability (recorder-path OOM flipped `rec_path_ok`, OR this dup OOMs)
         // commit an empty path and mark membership INCOMPLETE (finding 3), so region
         // discovery fails any region containing this trace CLOSED (`armable = false`)
@@ -12919,8 +12809,8 @@ pub const TraceState = struct {
         // finding 6 — this new trace can add a boundary edge that invalidates a prior
         // region's owner, so retaining the prior snapshot could keep a stale arm).
         self.rebuildEdgeCache();
-        // A-ii.4: rediscover regions over the refreshed graph. Fail-soft; inert (read by
-        // nothing in A-ii); any OOM fails CLOSED to empty physical indices (arm nothing).
+        // A-ii.4: rediscover regions over the refreshed graph. Fail-soft;
+        // any OOM fails CLOSED to empty physical indices (arm nothing).
         self.rebuildRegions();
     }
 
@@ -16022,7 +15912,7 @@ pub const TraceState = struct {
         self.setReg(instr.a, r);
     }
 
-    /// Record `math.floor(x)` / `math.ceil(x)` (doc 35). Unlike `recFloatUnary`
+    /// Record `math.floor(x)` / `math.ceil(x)`. Unlike `recFloatUnary`
     /// (sin/cos/sqrt → float result), these produce an INTEGER result (Lua 5.4
     /// semantics: `math.floor(2.7) == 2`, an int, not `2.0`).
     ///
@@ -16113,14 +16003,14 @@ pub const TraceState = struct {
     /// region is not in the record switch, so it aborts — the snapshot can never go
     /// stale mid-run.
     ///
-    /// Doc 36: upvalue reads inside inlined callees (inline_depth > 0) create a
+    /// Inlined-callee upvalues: reads inside inlined callees (inline_depth > 0) create a
     /// `callee_upvalue` seed that resolves through the callee's closure at entry.
     /// The callee's closure is in a slab slot that was itself seeded earlier (as an
     /// anchor-frame `upvalue`/`global` or regular `slot_load` input), so seed
     /// ordering is correct by construction. Global reads at inline_depth > 0 still
     /// abort — globals use proto-specific constant pool indices.
     fn recInputGet(self: *TraceState, comptime kind: InputKind, dest: u16, source: u16, resolved: Value) !void {
-        // Doc 36: upvalue reads inside inlined callees resolve through the callee's
+        // Inlined-callee upvalues resolve through the callee's
         // closure. Global reads at depth > 0 still abort: the seed uses the
         // anchor's proto.constants, but the global's constant-pool index refers to
         // the callee's proto — a different key set.
@@ -16171,7 +16061,7 @@ pub const TraceState = struct {
         self.setReg(dest, ref);
     }
 
-    /// Doc 36: record a `get_upval` inside an inlined callee. The callee's closure
+    /// Record a `get_upval` inside an inlined callee. The callee's closure
     /// must be reachable as a `slot_load` in the anchor slab (i.e. the callee was
     /// loaded from an upvalue/global/local of the anchor frame). If the callee was
     /// computed on-trace (not a `slot_load`), we abort — on-trace closure creation
@@ -16236,10 +16126,9 @@ pub const TraceState = struct {
 /// Doc 39: `pc` anchors a *plain while* loop — at least one plain backward
 /// `jmp` targets it, and no conditional backward jump (a repeat-until
 /// back-edge) or loop-op back-edge (`for_loop`/`tfor_loop`/`jfor_loop`)
-/// does. The same structural test as step (1) of `whileEnclosingAnchorPc`
-/// (doc 38), as a standalone predicate. Unmemoized: it runs at most once
-/// per anchor-return of an otherwise-eligible root recording, never on the
-/// dispatch hot path.
+/// does. Pure bytecode geometry as a standalone predicate. Unmemoized: it
+/// runs at most once per anchor-return of an otherwise-eligible root
+/// recording, never on the dispatch hot path.
 fn isPlainWhileAnchor(proto: *const Proto, pc: u32) bool {
     var has_plain = false;
     for (proto.code, 0..) |ins, j| {
