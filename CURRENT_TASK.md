@@ -21,6 +21,38 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-05 (LATEST-106) — cleanup pass: trace.zig dead-code sweep + 5-slice file split LANDED
+
+trace.zig 17,128 → 4,993 lines, pure code motion (Bart-approved plan:
+forwarding decls now, composition later). Commits: 0c8b20b (stage 0
+dead-code sweep: fusedSourceBranchLinkSlot, whileEnclosingAnchorPc +
+while_static, silent_promotion_rejects, 3 always-true doc-17 flags
+folded, ~20 comment-rot fixes), 249bfef (trace_ir.zig, 788, leaf),
+eace1b1 (trace_link.zig, 2,371), edf4d8c (trace_regionops.zig, 2,587),
+c62dfad (trace_chain.zig, 3,271), e47a45d (trace_recorder.zig, 3,712).
+Mechanism: methods become free fns taking *TraceState in sibling files,
+re-exported inside TraceState as forwarding decls — every self.foo(...)
+/ TraceState.Foo / trace.Recorder spelling unchanged; all 46 importers
+still @import("trace.zig"). ~13 annotated pub-promotions total
+("// pub for trace_X.zig (file-split pass)"). Every slice verified
+byte-identical modulo dedent+pub by script, gated green (1151/1151 +
+hashgate 84/84) and committed separately.
+
+Final bench A/B vs pre-cleanup shadow (/tmp/mahina-split-base, HEAD
+2900692, both ReleaseFast, reps 5): 23/28 rows within ±3%. Five
+outliers (binary-trees +4.2%, recursive-fib +3.1%, sieve_int −4.6%,
+lua54 −3.1%, str_format −5.9% — mixed directions) all have
+byte-identical perf-stat instruction+branch counts (<0.001% delta) →
+binary-layout artifact, not a behaviour change. TSVs:
+bench/results/20260905-102022-e47a45d.tsv vs shadow's
+20260905-102224-2900692.tsv.
+
+Still in trace.zig: TraceState fields/init/deinit/dbg, lifecycle
+(onBackEdge/abort/gates/closeTrace/commit/assertWellFormed, peel
+entry), sibling handoff, side-exit entry points, module types, writers,
+re-export/forwarding blocks. Composition (real ownership split instead
+of forwarding) is a possible future arc, per Bart's choice.
+
 ## Status 2026-09-04 (LATEST-105) — doc 39 IMPLEMENTED: the peel works end-to-end; premise gap found and documented
 
 All doc 39 phases (0–3) + the core of Phase 4 are landed and green: full
