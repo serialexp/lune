@@ -1,0 +1,292 @@
+# 42 — Tier-0 tail-call dispatch (per-op handlers, musttail)
+
+Status: DESIGN, codex-reviewed (gpt-5.6-sol, verdict sound-with-changes; all
+changes folded in below) — ready for implementation.
+Owner seam: `src/interp.zig` only (the trace modules are consumers, unchanged).
+Authorized by Bart 2026-09-07 ("absolutely number 1") after the doc-41 perf
+investigation. This is the interpreter phase `src/dispatch.zig` has been the
+standing capability gate for since Phase 0 ("the real interpreter replaces the
+code, NOT the capability").
+
+## 1. Problem: the interpreter's speed is hostage to block-placement luck
+
+Evidence chain (TODO "Doc-41 follow-ups" item 1b, all interleaved A/B against
+the 8a9ef56 shadow):
+
+- pi_leibniz **tier-0** +12.7% across the doc-41 split with `interp.zig`,
+  `arith.zig`, `value.zig`, `table.zig` byte-for-byte untouched.
+- `perf stat -e L1-icache-load-misses`: **19.7M misses (±0.4%) vs 14K**
+  pre-split — ~4 misses per interpreted loop iteration, sustained; IPC
+  4.57 → 4.13; +2% instructions.
+- The misses are spread across the whole `execImpl` body: LLVM's basic-block
+  placement of the ~48KB megafunction changed because the *shapes of trace
+  helpers inlined at its dispatch points* changed. Nothing semantic moved.
+
+The current loop is **already threaded** (labeled `sw: switch` +
+`continue :sw`, 61 thread sites): each arm has its own indirect dispatch jump,
+so branch prediction is fine. What threading does NOT give us is **layout
+control**: all 56 opcode arms, the `nextOp` prologue, and every inlined helper
+live in one function whose block order is a global LLVM optimization decision.
+Any edit anywhere in the inlined closure of `execImpl` can re-roll that dice.
+It came up bad this time; it will keep re-rolling every arc.
+
+## 2. The structure that removes the dice
+
+One handler **function** per opcode, dispatch by guaranteed tail call:
+
+- Each handler is its own symbol. LLVM lays out each function independently;
+  a hot handler is a compact straight-line block with its dispatch `jmp` at
+  the end. Editing trace-module helpers can no longer reshuffle unrelated
+  handlers against each other.
+- Per-handler register allocation, instead of one allocation fought over by
+  56 arms in a 48KB frame.
+- This is the compiler-era equivalent of what LuaJIT's hand-written
+  `lj_vm_*.dasc` per-op blocks achieve (each op a self-contained chunk ending
+  in a direct-threaded jump), and the exact pattern protobuf/upb and wasm3
+  use in C via `musttail`.
+- Architecture doc 00 names guaranteed tail calls a **portable architectural
+  pillar (#4)**; `build.zig` already enables the wasm `tail_call` CPU feature;
+  `src/dispatch.zig` is the permanent capability gate (do not weaken it —
+  extend it, §7 T-7).
+
+## 3. Toolchain facts (verified 2026-09-07 on 0.17.0-dev.813+2153f8143, Z-1)
+
+Experiments in /tmp/ztail (reproduce before implementation if the toolchain
+was bumped):
+
+1. **`@call(.always_tail)` through an error-union return DOES NOT COMPILE.**
+   `Err!i64` lowers to an sret out-param and LLVM's verifier rejects the
+   musttail ("musttail call must precede a ret with an optional bitcast").
+   ⇒ handlers cannot return `Error!ExecStep`.
+2. **Register-sized return + fn-pointer table works and is optimal**: with
+   `*const fn (st: *State, x: u64) i64` handlers and a shared `dispatch`
+   helper, ReleaseFast emits each handler as its own symbol ending in
+   `jmp *table(,%rax,8)` — the dispatch inlined into every handler tail,
+   i.e. true direct threading, zero call/ret pairs.
+3. **wasm32**: `@call(.always_tail)` errors without the `tail_call` feature
+   and compiles with it; `build.zig` already adds the feature.
+4. Native x86-64 via LLVM (`use_llvm = true`, already pinned): works.
+5. **CAVEAT (codex)**: the experiment's state struct is toy-sized and `Instr`
+   is 12 bytes (`bytecode.zig:186`), not 8 — it will likely take two argument
+   registers. The signature decision in §4.1 must therefore be made from
+   generated assembly of REAL representative handlers, not from this
+   experiment (§4.6).
+
+## 4. Design
+
+### 4.1 State: ownership and partition
+
+**Ownership (codex blocking change 1).** `execImpl` owns a local `ExecState`
+on its own frame and enters the handler chain with an **ordinary call** —
+never a musttail — so a pointer to its local state can never outlive the
+frame. Handlers and the dispatch wrapper musttail among themselves; any exit
+event returns through the whole chain in one `ret` to `execImpl`, which
+translates the result back to `Error!ExecStep` (re-raising a parked error as
+a real Zig error). `execWith` is untouched, so its two `errdefer`s
+(`clearPendingExitAnchor`, `abortRaised` — interp.zig:2033/2040) fire exactly
+as today, and mode switches / suspension keep their current shape: `execImpl`
+returns, its state dies, the next invocation reloads from `CallFrame`.
+
+```zig
+const ExecState = struct {
+    vm: *Vm,
+    frame: *CallFrame,
+    closure: *const Closure,
+    proto: *const Proto,
+    code: []const Instr,
+    code_gen: u64,
+    base: usize,          // matches CallFrame.base (interp.zig:368) — NOT u32
+    regs: RegWindow,
+    stop_depth: u32,
+    step: ExecStep,       // exit payload, set before returning non-continue
+    err: ?Error,          // parked error — initialized null on EVERY entry
+};
+
+const HandlerResult = enum(u8) { finished, suspended, switch_mode, err };
+```
+
+A handler that continues execution never returns — it tail-jumps. Only exit
+events return.
+
+**Partition.** Baseline signature `(st: *ExecState, pc: usize, instr: Instr)`:
+`pc` by value (hottest datum), `instr` by value (needed immediately; 12 bytes
+≈ 2 registers), everything else behind `st`. `cur_pc` and `a` stop being
+threaded state (`cur_pc = pc - 1` at handler entry; `a = instr.a`).
+
+Codex correctly notes the honest cost: the megafunction keeps `self`, the
+register lanes, and other hot state live in registers ACROSS arms; per-handler
+functions cannot retain anything across an indirect tail call that isn't in
+the ABI. The primary alternative to evaluate is `(vm: *Vm, st, pc, instr)` —
+`vm` is consumed by every prologue and most handlers, so a dedicated register
+argument removes the most universal `st.vm` load. If further widening looks
+useful, thread the two RegWindow *lane pointers* individually, never the
+three-word `RegWindow` (spill risk). Decision procedure in §4.6.
+
+### 4.2 The dispatch tail = the prologue + table jump
+
+`nextOp`'s body becomes the shared dispatch helper, called at every handler
+tail; LLVM inlines it into each handler (verified §3.2), reproducing today's
+per-arm threading plus per-function layout. Two comptime tables
+(`table(.fast)` / `table(.full)`) generated from one `handlerFor(op, mode)`
+so the `.full`-only hooks compile out of `.fast` handlers exactly as today.
+
+**The determinism contract is the complete prologue order** (interp.zig
+2103–2195), preserved verbatim — this list is normative:
+
+1. GC check/collect (suppressed while `reg_top_pending`)
+2. `safepoint_seq` increment
+3. replay-line append (`.full` + `record_safepoint_lines`)
+4. suspend test → park `frame.pc`, return `.suspended` (`.full`)
+5. region departure observer (count-gated, then `observeFast`, then slow call)
+6. `frame.pc = cur`
+7. fetch `i = code[cur]`, advance pc
+8. recording-close-at-anchor check (`.full` + recording)
+9. pending continuation activation (`.full`)
+10. pending replay-side activation (`.full`)
+11. recording mirror (`.full` + recording)
+
+Suspension stays before fetch and before all recording hooks. A prologue
+error (e.g. the replay-line `append` OOM) must park-and-return leaving
+exactly today's partial state — `safepoint_seq` already incremented, nothing
+after the failing step run.
+
+### 4.3 Errors: park-and-return replaces every error edge (not just `try`)
+
+Translation covers ALL error forms in arm bodies (codex blocking change 1):
+
+- `try X` → `X catch |e| { st.err = e; return .err; }`
+- direct raises (`return self.raise(...)`-shaped sites, e.g. interp.zig
+  ~3310/3670/3931) → park st.err, `return .err`
+- narrowed/native error edges (e.g. ~3763) and nested `catch` arms (concat)
+  → same parking at the point the error would today propagate out of the arm
+
+Helpers (`arith.*`, `binNum`, metamethods, `callValue`) keep their error
+unions unchanged. `execImpl` re-raises at the boundary (§4.1), so
+`execWith`'s errdefers and every enclosing pcall behave identically. Happy
+path pays zero (no error-union ABI on the tail chain at all); error path
+pays one store+branch and is already the slow path.
+
+### 4.4 Frame switches and resumes: TWO distinct operations (codex change 2)
+
+The old `continue :outer` sites are NOT uniform and must not share a helper:
+
+- **`reloadTopFrame(st)`** — only after a real push/pop (`.call` Lua entry
+  ~3711–3719, `.ret` ~3881–3894). Re-derives frame/closure/proto/code/
+  code_gen/base/regs from `frames[depth-1]`, calls `setRegionContext` — the
+  current explicit reload blocks move in as-is. The surrounding boundary
+  ORDER is owned by the call/ret handlers, not the helper: callee-window
+  init without safepoint → park caller `frame.pc` → push (raises
+  `stack_top`, sets region context) → reload → exactly one next-instruction
+  prologue; and for return: close upvalues → copy results while the callee
+  window is rooted → drop activation → pop → reload → shrink `stack_top` →
+  exactly one parent prologue (atomic rooting contract, interp.zig:1622).
+- **`dispatchCurrentAt(st, npc)`** — trace/deopt/patched-entry resumes
+  (~3438, ~3508, ~4117): replace pc and tail-dispatch, re-resolving NOTHING
+  (no `codeFor`, no `setRegionContext` — adding those would change observer
+  behavior and cost on productive resumes).
+
+**Back-edge epilogue** (the 14 `break :sw` sites → hotness seam, coverage,
+`onBackEdge`, tier entries, patched-entry plumbing, ~interp.zig 3940+):
+extracted as a **`noinline`** function (codex: "ordinary function" alone
+lets ReleaseFast re-inline it and recreate the coupling), comptime-
+parameterized by `mode`, returning a directive that maps onto: resume at pc
+(tail dispatch), reload-then-dispatch (after a productive entry that pushed/
+popped), suspend/switch-mode (return through the chain). Two invariants:
+
+- It must NOT write the jump target into `frame.pc` — today `frame.pc`
+  stays at the executed back-edge until the next prologue, except an explicit
+  mode-switch park.
+- It preserves every image-generation reload point inside itself
+  (~3423, ~4110, ~4160).
+
+### 4.5 What each handler looks like
+
+```zig
+fn opAdd(comptime mode: ExecMode) Handler {
+    return struct {
+        fn h(st: *ExecState, pc: usize, instr: Instr) HandlerResult {
+            st.vm.binNum(st.regs, instr.a, instr.b, instr.c, .add, st.vm.mm.add)
+                catch |e| { st.err = e; return .err; };
+            return dispatchTail(mode, st, pc);
+        }
+    }.h;
+}
+```
+
+Arm bodies move verbatim under five translation rules: `try`/raise/narrowed
+error → park (§4.3); `continue :sw (…)` → `return dispatchTail(…)`;
+push/pop reload → `reloadTopFrame` + dispatch; resume-only →
+`dispatchCurrentAt`; `break :sw` → `switch (backEdge(mode, st, pc, instr))`.
+
+### 4.6 ABI decision procedure (before the flip commit)
+
+Build the conversion with the baseline signature, then compare generated
+assembly (`objdump`) and interleaved wall time for `(st, pc, instr)` vs
+`(vm, st, pc, instr)` on four real handlers: `move` (trivial), `add`
+(arith), `jmp_if_false` (conditional), and `call` (helper-heavy). Look at
+loads-per-handler, spills, handler size, and that every handler tail is a
+`jmp` (T-6). Signature is one typedef; switching is mechanical. Further lane
+widening only with measurement (R1).
+
+Comptime safety: assert `OpCode` is dense and table index == enum value
+(`bytecode.zig:30` is dense today; direct indexing must fail loudly if that
+ever changes).
+
+## 5. What this does NOT change
+
+- `execWith`/`exec`/`runFastPath` drivers, `ExecOutcome`, `stop_depth`,
+  `final_cut` publication — untouched (codex change 1 makes this literal).
+- Tier-1a/1b entry seams, `driveChain`, recording, replay, all trace
+  modules — untouched callees.
+- Per-op semantic code: moved, not rewritten.
+- Determinism: §4.2's prologue order is the whole contract; hashgate + the
+  focused tests (§7) gate every commit.
+
+## 6. Landing plan (revised per codex; Z-7 slices)
+
+1. **Prep commit**: `ExecState`/`HandlerResult`/helper definitions
+   (`reloadTopFrame`, `dispatchCurrentAt`, error-parking), the comptime
+   dense-enum assert, and the §7 focused tests — WITHOUT routing the live
+   loop through any of it (codex: extracting the epilogue early would
+   re-roll the megafunction layout and contaminate every measurement).
+2. **The conversion, one commit**: handlers + tables + musttail dispatch +
+   `noinline` epilogue together; the labeled-switch loop deleted. Codex is
+   right that an "arms call handlers" intermediate is not a coherent
+   architecture (handlers have no non-tail continuation shape) — so the
+   conversion lands whole. It is mechanical per §4.5's five rules and
+   reviewed per-family within the one commit.
+3. **Measure against the PRE-ARC baseline** (the 8a9ef56 shadow AND current
+   HEAD): pi_leibniz t0, euler14/recursive-fib/array3d/lua54
+   (interpreter-bound set), fft + grid_matmul, full `just bench`,
+   `perf stat -e L1-icache-load-misses`, binary size, `zig build` wall.
+   Wasm smoke test green.
+4. **ABI tuning** (§4.6) as a follow-up commit only if assembly/measurement
+   justify it; then docs (board, CURRENT_TASK, this doc → LANDED, close
+   TODO 1b honestly).
+
+## 7. Focused tests (beyond hashgate — codex list, all in the prep commit)
+
+- T-1: error raised mid-recording → `abortRaised` + pending-anchor cleanup
+  still fire (the execWith errdefer path through the new boundary).
+- T-2: suspend cut landing immediately before the first callee instruction
+  (call boundary: prologue neither skipped nor doubled — R6).
+- T-3: parent resumption immediately after `.ret` (same property, pop side).
+- T-4: fast→full and full→fast handoff at a back-edge (`switch_mode`
+  through the new return chain).
+- T-5: reentrant `callValue` — outer exec's cached state survives the nested
+  `execWith` (interp.zig 1686–1695).
+- T-6: long-chain real-interpreter run (millions of dispatches) asserting
+  O(1) stack — extends `dispatch.zig`'s capability gate to the real
+  handlers; the toy gate stays.
+- T-7: wasm build + smoke test.
+
+## 8. Risks
+
+- R1 — cross-handler register retention is structurally lost (§4.1);
+  mitigations are ABI widening (§4.6). Accepted: layout stability + per-
+  handler allocation are expected to dominate, but §6.3 measures, not hopes.
+- R2 — 112 handler symbols + 2 tables: watch build wall + binary size.
+- R3 — epilogue `noinline` call cost, paid once per loop iteration on the
+  interpreted path — measured in §6.3 as part of the whole (prep commit
+  deliberately does NOT pre-extract it).
+- R4 — wasm `return_call` engine performance is not a gate; correctness is.
