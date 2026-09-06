@@ -1567,16 +1567,42 @@ Confirmed findings from the three-cluster review of the ownership extraction
 (commit 243c434); the cheap boundary items were fixed in the follow-up commit,
 these remain:
 
-1. **topologyView rebuild cost — REAL perf regression, diagnosed.** Same-machine
-   A/B (shadow baseline at 8a9ef56): grid_matmul +14% wall, scimark-fft +10%,
-   suite median +2.4% both tiers. Decisions byte-identical (`--jit-stats` event
-   counters equal; hashgate 84/84) — the cost is mechanical: `topologyView`
-   (trace_regionops.zig) eagerly materializes O(traces × exits × slots) facts
-   with per-exit scratch allocs on EVERY commit/retirement/closeTrace (8.1% of
-   grid_matmul runtime vs ~3.4% for the pre-split rebuild path, ~3×);
-   `replayLedgerFrom` also ~doubled (seam +7.5%/walk). Fix needs design care:
-   lazy or cached facts without breaking the topology ownership boundary
-   (hot-loop-allocations skill applies). Verify with full `just bench` A/B.
+1. **topologyView rebuild cost — FIXED 2026-09-07** (two mechanical halves,
+   both landed; interleaved A/B vs the 8a9ef56 shadow):
+   - Lazy bridge-emission queries: the eager O(traces×exits×slots×IR) fact
+     materialization in `topologyView` is gone — the emissions scan moved onto
+     `TraceCode` (`bridgeEmissions`/`bridgeEmitsSlot`, pure immutable-IR query
+     next to its sibling `classifyBridgeCandidate`) and the topology builder
+     queries it lazily at its three edge sites, exactly the pre-split pattern.
+     nativegen's `compositeBridgeEmitsSlot`/`compositeBridgeEmissions` deleted.
+     grid_matmul +14% → +5.4%.
+   - `RegionPolicy.receiptsInert()` early-out in `accountRegionProfit`: with
+     `region_profit` + `source_exit_regions` + `dest_entry_regions` all empty
+     the whole classify/choose/credit/destination pipeline is provably a no-op,
+     but scimark-fft ran it ~1M times per run (~95 cyc each — its one region is
+     armable=false, so the armable-only physical indices stay empty). Three
+     O(1) size loads now gate it. fft +8.8% → +3.7%, grid_matmul → +3.7%;
+     region/link tier now CHEAPER than pre-split (5.7ms vs 7.9ms on fft).
+   The `replayLedgerFrom` "doubling" from the original diagnosis did not
+   reproduce today (per-walk seam equal or better under `--jit-stats`: 315 vs
+   366 cyc/walk).
+
+1b. **NEW — interpreter i-cache regression from the split (block-placement
+   fragility), the REMAINING ~+3.7% jit / up to +12.7% t0.** Interleaved A/B
+   confirms it is real, not noise: pi_leibniz tier-0 +12.7% with `interp.zig`
+   (and arith/value/table) byte-for-byte UNTOUCHED across the split, and
+   `perf stat -e L1-icache-load-misses` shows 19.7M misses (±0.4%) vs 14K
+   pre-split — ~4 misses per interpreted loop iteration, spread across the
+   whole `execImpl` dispatch loop; IPC 4.57 → 4.13, +2% instructions. Cause:
+   LLVM basic-block placement of the ~48KB `execImpl` megafunction is hostage
+   to the shape of the trace helpers inlined at its dispatch points; the split
+   reshaped those and the layout flipped bad. All interpreter-bound benches
+   (res% 0) inherit it: euler14-bit +7.6%, recursive-fib +4.5%, array3d +4.3%.
+   Fixing by nudging source is whack-a-mole; the real lever is the one already
+   on file in CLAUDE.md's nsieve verdict as #3 — **threaded/computed-goto
+   tier-0 dispatch**, which breaks the megafunction into per-op blocks with
+   tail dispatch and removes the layout fragility structurally. Big arc; needs
+   Bart's go-ahead.
 2. **Forwarding facade on TraceState** — 176 pure-forward decls
    (trace.zig:2401+), three-layer aliasing trace.zig → trace_link →
    native_registry for ~9 demote/mutation ops, ~10 one-line policy forwards in

@@ -21,6 +21,53 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-07 — doc-41 perf regression: mechanical halves fixed, i-cache finding remains
+
+Follow-up to the 2026-09-06 review below; Bart authorized attacking TODO
+"Doc-41 follow-ups" item 1 (topologyView perf). Two mechanical fixes landed
+(both verified by interleaved A/B against the /tmp/mahina-baseline shadow at
+8a9ef56, all gates green: just test + boundary checker, hashgate 84/84 both
+legs, zig build wasm):
+
+- **Lazy bridge-emission queries.** The eager O(traces×exits×slots×IR)
+  materialization in `topologyView` is gone: `CompositeBridgeEmissionIterator`
+  moved from nativegen onto `TraceCode` as `bridgeEmissions`/`bridgeEmitsSlot`
+  (a pure immutable-IR query, same file as its sibling scan
+  `classifyBridgeCandidate`; trace_code already imports trace_ir so no
+  boundary change), `ExitFact.emitted_slots` + `TraceRecord.emitsSlot` deleted,
+  and the topology builder's three query sites call
+  `parent.code.bridgeEmitsSlot(...)` lazily — the exact pre-split pattern.
+  Equivalence argument: every queried slot comes from `live_in`/`required`,
+  seeded from member `entry_slots` ⊆ the union the eager set was computed
+  over, and the direct-IR answer is the pre-split truth. topologyView lost its
+  `with_slots` flag, slots hashmap, and per-exit scratch lists.
+  grid_matmul +14% → +5.4%.
+- **`RegionPolicy.receiptsInert()` early-out** in the coordinator's
+  `accountRegionProfit`: with `region_profit`/`source_exit_regions`/
+  `dest_entry_regions` all empty the pipeline is provably a no-op end to end
+  (no candidates, no activation, no dest entries — nothing to close, credit,
+  open, or invalidate), yet scimark-fft ran it ~1M times/run at ~95 cyc (its
+  single region is armable=false → the armable-only physical indices stay
+  empty forever). Three O(1) size loads now gate it; pure function of
+  deterministic policy state. fft +8.8% → +3.7%, grid_matmul +5.4% → +3.7%;
+  fft's region/link profile tier is now CHEAPER than pre-split (5.7 vs 7.9ms).
+
+**Remaining regression is the interpreter, not the JIT bookkeeping** — see
+TODO item 1b for the full evidence chain: pi_leibniz tier-0 +12.7%
+(interleaved, interp.zig untouched by the split), L1-icache-load-misses
+19.7M vs 14K (±0.4%), IPC 4.57→4.13. LLVM block placement of the 48KB
+`execImpl` flipped bad when the split reshaped the trace helpers inlined at
+dispatch points. Structural fix = threaded/computed-goto tier-0 dispatch
+(nsieve-verdict lever #3); awaiting Bart's direction.
+
+Methodology note that bit us AGAIN today: sequential suite runs (even
+same-machine, minutes apart) showed phantom +4.5% median on tier-0 columns
+whose code was untouched — thermal/frequency drift. Only interleaved
+per-program A/B (alternating binaries rep by rep) produced citable deltas.
+The bench TSVs from tonight: bench/results/20260907-002106-1945e27.tsv (tree)
+vs /tmp/mahina-baseline/bench/results/20260907-002307-8a9ef56.tsv — read the
+jit column with that caveat.
+
 ## Status 2026-09-06 — doc-41 split reviewed, committed, boundaries hardened
 
 The ownership extraction was reviewed on three axes (three parallel cluster
