@@ -302,7 +302,7 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
                 if (comp[e.from] != c or comp[e.to] != c) continue;
                 const parent = view.traceById(e.key.trace_id) orelse continue;
                 for (live_in[e.to].items) |slot| {
-                    if (parent.emitsSlot(e.key.exit_instr, slot)) continue;
+                    if (parent.code.bridgeEmitsSlot(e.key.exit_instr, slot)) continue;
                     if (try appendUniqueSlot(&live_in[e.from], gpa, slot)) changed = true;
                 }
             }
@@ -336,7 +336,7 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
                 var common: std.ArrayListUnmanaged(u16) = .empty;
                 defer common.deinit(gpa);
                 for (b.invariant_slots) |slot| {
-                    if (!parent.emitsSlot(e.key.exit_instr, slot))
+                    if (!parent.code.bridgeEmitsSlot(e.key.exit_instr, slot))
                         try common.append(gpa, slot);
                 }
                 const replacement = try gpa.dupe(u16, common.items);
@@ -350,7 +350,7 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
             var inv_list: std.ArrayListUnmanaged(u16) = .empty;
             defer inv_list.deinit(gpa);
             for (required) |slot| {
-                if (!parent.emitsSlot(e.key.exit_instr, slot))
+                if (!parent.code.bridgeEmitsSlot(e.key.exit_instr, slot))
                     try inv_list.append(gpa, slot);
             }
             const invariants = try gpa.dupe(u16, inv_list.items);

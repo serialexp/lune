@@ -637,7 +637,7 @@ pub fn compositeContinueProof(t: *const Trace, composite_ei: u32, flp: u32) bool
     // Fetch the dominance-scoped phi update refs for idx and var.
     var idx_ref: ?u16 = null;
     var var_ref: ?u16 = null;
-    var emitted = nativegen.compositeBridgeEmissions(&t.code, composite_ei);
+    var emitted = t.code.bridgeEmissions(composite_ei);
     while (emitted.next()) |p| {
         if (p.aux == @as(i32, @intCast(base))) idx_ref = p.b;
         if (p.aux == @as(i32, @intCast(base)) + 3) var_ref = p.b;

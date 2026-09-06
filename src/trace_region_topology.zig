@@ -19,20 +19,12 @@ pub const DefMap = std.AutoHashMapUnmanaged(RegionId, RegionDef);
 pub const ExitFact = struct {
     index: u32,
     successor: ?struct { proto_id: u32, pc: u32 } = null,
-    emitted_slots: []const u16 = &.{},
 };
 pub const TraceRecord = struct {
     id: u32,
     code: *const TraceCode,
     inner_root: bool,
     exits: []const ExitFact,
-    pub fn emitsSlot(self: TraceRecord, index: u32, slot: u16) bool {
-        for (self.exits) |e| if (e.index == index) {
-            for (e.emitted_slots) |s| if (s == slot) return true;
-            return false;
-        };
-        return false;
-    }
 };
 pub const View = struct {
     traces: []const TraceRecord,

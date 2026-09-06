@@ -5918,7 +5918,7 @@ fn emitCompositeBridgeSnapshot(
     alloc: *const Alloc,
     exit_instr: usize,
 ) !void {
-    var emitted = compositeBridgeEmissions(t, exit_instr);
+    var emitted = t.bridgeEmissions(exit_instr);
     while (emitted.next()) |p| {
         try flushSlot(
             a,
@@ -5927,36 +5927,6 @@ fn emitCompositeBridgeSnapshot(
             placeOfRef(alloc, @intCast(p.b)),
         );
     }
-}
-
-pub const CompositeBridgeEmissionIterator = struct {
-    instrs: []const trace.IrInstr,
-    exit_instr: usize,
-    index: usize = 0,
-
-    pub fn next(self: *CompositeBridgeEmissionIterator) ?trace.IrInstr {
-        while (self.index < self.instrs.len) {
-            const p = self.instrs[self.index];
-            self.index += 1;
-            if (p.op == .phi and p.aux != trace.PHI_INTERNAL and p.b < self.exit_instr)
-                return p;
-        }
-        return null;
-    }
-};
-
-/// The single source of truth for A-v's emitted bridge set E: slot-bound phis
-/// whose update dominates the composite exit. Both lowering and arm validation
-/// consume this allocation-free immutable-IR query.
-pub fn compositeBridgeEmissions(t: *const Trace, exit_instr: usize) CompositeBridgeEmissionIterator {
-    return .{ .instrs = t.instrs, .exit_instr = exit_instr };
-}
-
-pub fn compositeBridgeEmitsSlot(t: *const Trace, exit_instr: usize, slot: u16) bool {
-    var emitted = compositeBridgeEmissions(t, exit_instr);
-    while (emitted.next()) |p|
-        if (p.aux == @as(i32, @intCast(slot))) return true;
-    return false;
 }
 
 /// Byte offsets (from `page.code.ptr`) of the two frameless secondary entry stubs a

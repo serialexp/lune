@@ -474,7 +474,7 @@ pub fn validateRegionBridge(
     };
 
     for (b.required_slots) |slot| {
-        if (!nativegen.compositeBridgeEmitsSlot(&parent.code, exit_instr, slot) and
+        if (!parent.code.bridgeEmitsSlot(exit_instr, slot) and
             !slotInSortedSet(b.invariant_slots, slot))
         {
             self.invalidateRegion(id);
@@ -1090,6 +1090,7 @@ pub fn applyDestination(self: *TraceState, selected: ?RegionKey, dest: RegionDes
 pub fn accountRegionProfit(self: *TraceState, key: ?ExitKey, work: usize, dest: RegionDestination) bool {
     const exit_key = key orelse return false;
     const ctx = self.region_policy.region_context orelse return false;
+    if (self.region_policy.receiptsInert()) return false;
     const candidates = self.classifyExit(exit_key);
     const selected = self.chooseSource(candidates, ctx);
     var member: ?RegionKey = null;
@@ -1386,12 +1387,11 @@ pub fn rebuildEdgeCache(self: *TraceState) void {
 const topology = @import("trace_region_topology.zig");
 
 /// Cold structural-change adapter: native facts are resolved outside the builder.
-fn topologyView(self: *TraceState, scratch: std.mem.Allocator, with_slots: bool) !topology.View {
-    var slots: std.AutoHashMapUnmanaged(u16, void) = .empty;
-    defer slots.deinit(scratch);
-    if (with_slots) for (self.registry.cache.items) |t| {
-        for (t.code.entry_slots) |slot| try slots.put(scratch, slot, {});
-    };
+/// Slot-emission facts are NOT materialized here — the builder queries
+/// `TraceCode.bridgeEmitsSlot` lazily, only for edges inside candidate cycles
+/// (eager traces×exits×slots×IR materialization was a measured 3× rebuild-cost
+/// regression on grid_matmul; see TODO doc-41 follow-up 1).
+fn topologyView(self: *TraceState, scratch: std.mem.Allocator) !topology.View {
     const records = try scratch.alloc(topology.TraceRecord, self.registry.cache.items.len);
     for (self.registry.cache.items, records) |t, *record| {
         const exits = try scratch.alloc(topology.ExitFact, t.code.exit_prov.len);
@@ -1399,13 +1399,6 @@ fn topologyView(self: *TraceState, scratch: std.mem.Allocator, with_slots: bool)
             fact.* = .{ .index = e.index };
             if (self.resolveSuccessorAnchor(t, e)) |succ|
                 fact.successor = .{ .proto_id = succ.proto_id, .pc = succ.pc };
-            var emitted: std.ArrayListUnmanaged(u16) = .empty;
-            var it = slots.keyIterator();
-            while (it.next()) |slot| {
-                if (nativegen.compositeBridgeEmitsSlot(&t.code, e.index, slot.*))
-                    try emitted.append(scratch, slot.*);
-            }
-            fact.emitted_slots = emitted.items;
         }
         record.* = .{
             .id = t.id,
@@ -1421,7 +1414,7 @@ pub fn rebuildEdgeCacheFallible(self: *TraceState) !void {
     errdefer self.region_policy.clearEdges();
     var arena = std.heap.ArenaAllocator.init(self.gpa);
     defer arena.deinit();
-    const view = try topologyView(self, arena.allocator(), false);
+    const view = try topologyView(self, arena.allocator());
     const edges = try topology.buildEdges(self.gpa, view);
     self.region_policy.publishEdges(self.gpa, edges);
 }
@@ -1460,7 +1453,7 @@ pub fn rebuildRegionsFallible(self: *TraceState) !void {
     }
     var arena = std.heap.ArenaAllocator.init(self.gpa);
     defer arena.deinit();
-    const view = try topologyView(self, arena.allocator(), true);
+    const view = try topologyView(self, arena.allocator());
     var staged = topology.build(self.gpa, view, self.region_policy.previousTopology(), &self.region_policy.edge_cache) catch |err| {
         if (err == error.IncompleteRegionGraph) {
             self.clearPhysicalRegionIndices();

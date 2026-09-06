@@ -253,6 +253,22 @@ pub const RegionPolicy = struct {
     pub fn setContext(self: *RegionPolicy, depth: u32, seq: u64) void {
         self.region_context = .{ .depth = depth, .call_seq = seq };
     }
+    /// True iff a concrete receipt is provably a no-op end to end, so the
+    /// coordinator may skip the whole classify/choose/credit/destination
+    /// pipeline: with all three maps empty, `classifyExit` yields no candidates
+    /// (`source_exit_regions`), `activeRegionFor` yields no activation
+    /// (`region_profit` — so nothing to close, credit, or barren-consume), and
+    /// `applyDestination` finds no entry candidates (`dest_entry_regions` — so
+    /// nothing to open or invalidate). Pure function of deterministic policy
+    /// state; three O(1) size loads. This is the per-row cost floor for every
+    /// program that has no live armable region — the common case — measured at
+    /// ~1M no-op pipeline runs per scimark-fft execution without it.
+    pub fn receiptsInert(self: *const RegionPolicy) bool {
+        return self.region_profit.count() == 0 and
+            self.source_exit_regions.count() == 0 and
+            self.dest_entry_regions.count() == 0;
+    }
+
     /// Resolved logical membership, with no registry or physical trace reference.
     /// The single consumed bit is the exclusive legacy profitability boundary.
     pub const Receipt = struct { selected: ?RegionKey, unclassified_member: ?RegionKey, work: usize };

@@ -263,6 +263,37 @@ pub const TraceCode = struct {
         if (idx >= self.instrs.len) return false;
         return (self.bridge_cand[idx >> 3] >> @intCast(idx & 7)) & 1 != 0;
     }
+
+    /// The single source of truth for A-v's emitted bridge set E: slot-bound phis
+    /// whose update dominates the composite exit (doc 17 §A2.1). Lowering, arm
+    /// validation, and region-topology discovery all consume this allocation-free
+    /// immutable-IR query.
+    pub fn bridgeEmissions(self: *const TraceCode, exit_instr: usize) BridgeEmissionIterator {
+        return .{ .instrs = self.instrs, .exit_instr = exit_instr };
+    }
+
+    pub fn bridgeEmitsSlot(self: *const TraceCode, exit_instr: usize, slot: u16) bool {
+        var emitted = self.bridgeEmissions(exit_instr);
+        while (emitted.next()) |p|
+            if (p.aux == @as(i32, @intCast(slot))) return true;
+        return false;
+    }
+};
+
+pub const BridgeEmissionIterator = struct {
+    instrs: []const IrInstr,
+    exit_instr: usize,
+    index: usize = 0,
+
+    pub fn next(self: *BridgeEmissionIterator) ?IrInstr {
+        while (self.index < self.instrs.len) {
+            const p = self.instrs[self.index];
+            self.index += 1;
+            if (p.op == .phi and p.aux != trace_ir.PHI_INTERNAL and p.b < self.exit_instr)
+                return p;
+        }
+        return null;
+    }
 };
 
 test {
