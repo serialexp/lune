@@ -21,6 +21,26 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-06 — doc-41 split reviewed, committed, boundaries hardened
+
+The ownership extraction was reviewed on three axes (three parallel cluster
+reviews + independent gate reruns + a shadow-baseline bench A/B) and committed
+as 243c434; the confirmed cheap boundary findings were fixed and committed as
+ce4c6ec (replay-walk bracket API, entry_patch_dirty funnel, promotedSets const
+view + clearSilentSummaries, shared checkPromotable prologue, candidate
+take-before-publish in commit(), dead re-export/wrapper removal, reset() dedup).
+All gates green after both commits: just test + boundary checker, zig build
+wasm, 84-digest hashgate Debug+ReleaseFast.
+
+**Open, tracked in TODO.md ("Doc-41 follow-ups")**: (1) topologyView rebuild
+cost — a REAL diagnosed perf regression (grid_matmul +14%, fft +10%, suite
+median +2.4%; decisions byte-identical, cost is eager O(traces×exits×slots)
+fact materialization per rebuild) — fix before the next benchmark-sensitive
+arc; (2) the 176-forward TraceState facade (doc 41's outstanding coordinator
+phase); (3) RegionPolicy pub-field reach-ins; (4) finalize's `rec: anytype`.
+The four foreign-agent files (gc.zig, wasm_entry.zig, viz/*) remain
+uncommitted — not ours (Rule #14).
+
 ## Status 2026-09-05 — architectural ownership arc STARTED (doc 41)
 
 Bart approved starting with JIT ownership and eventually covering the full
