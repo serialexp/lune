@@ -89,9 +89,9 @@ test "nested-loop: a hot inner loop's continuation links to the inner root at th
     // The cache holds the inner `.loop` root AND the continuation `.link` trace.
     var loop_traces: usize = 0;
     var link_traces: usize = 0;
-    for (vm.trace.cache.items) |t| {
-        try testing.expect(t.instrs.len >= 1);
-        switch (t.instrs[t.instrs.len - 1].op) {
+    for (vm.trace.registry.cache.items) |t| {
+        try testing.expect(t.code.instrs.len >= 1);
+        switch (t.code.instrs[t.code.instrs.len - 1].op) {
             .loop => loop_traces += 1,
             .link => link_traces += 1,
             else => {},
@@ -102,14 +102,14 @@ test "nested-loop: a hot inner loop's continuation links to the inner root at th
 
     // The link trace's terminator carries the inner root's anchor pc, and that pc
     // really is the anchor of a cached root trace (the hand-off target — P2).
-    for (vm.trace.cache.items) |t| {
-        const term = t.instrs[t.instrs.len - 1];
+    for (vm.trace.registry.cache.items) |t| {
+        const term = t.code.instrs[t.code.instrs.len - 1];
         if (term.op != .link) continue;
         const inner_pc: u32 = @intCast(term.aux);
         var found_root = false;
-        for (vm.trace.cache.items) |r| {
-            if (r.anchor.proto == t.anchor.proto and r.anchor.pc == inner_pc and
-                r.instrs[r.instrs.len - 1].op == .loop) found_root = true;
+        for (vm.trace.registry.cache.items) |r| {
+            if (r.code.anchor.proto == t.code.anchor.proto and r.code.anchor.pc == inner_pc and
+                r.code.instrs[r.code.instrs.len - 1].op == .loop) found_root = true;
         }
         try testing.expect(found_root);
     }
@@ -418,7 +418,7 @@ test "2c-F (doc 17): a fresh top-level run disarms the prior epoch's LIVE armed 
     try testing.expect(vm.trace.native_loopdone_link_arms > 0);
     try testing.expect(vm.trace.native_loopdone_link_fused > 0);
     // … and nothing disarmed within the epoch (the negative control).
-    try testing.expectEqual(@as(u64, 0), vm.trace.native_link_disarms);
+    try testing.expectEqual(@as(u64, 0), vm.trace.registry.native_physical.native_link_disarms);
 
     // Phase B — a FRESH top-level run of the same proto on the same VM, with NO
     // observation window. `beginTopLevelEpoch` must reset the still-armed Phase-A
@@ -433,7 +433,7 @@ test "2c-F (doc 17): a fresh top-level run disarms the prior epoch's LIVE armed 
     try testing.expectEqualStrings(tier0.buffered(), phaseB.buffered());
     // (2) The fresh-run epoch boundary actually tore down the LIVE cycle armed in
     // Phase A — the load-bearing signal a byte-identical run alone can't provide.
-    try testing.expect(vm.trace.native_link_disarms > 0);
+    try testing.expect(vm.trace.registry.native_physical.native_link_disarms > 0);
 }
 
 test "2c-F (doc 17): a hot armed cycle inside a repeatedly-called function stays correct on re-entry" {
@@ -739,9 +739,9 @@ test "coherent-state chaining (doc 16, Phase 2): TraceKind link-permission (root
 
     var loop_traces: usize = 0;
     var link_traces: usize = 0;
-    for (vm.trace.cache.items) |t| {
-        if (t.instrs.len == 0) continue;
-        switch (t.instrs[t.instrs.len - 1].op) {
+    for (vm.trace.registry.cache.items) |t| {
+        if (t.code.instrs.len == 0) continue;
+        switch (t.code.instrs[t.code.instrs.len - 1].op) {
             .loop => loop_traces += 1,
             .link => link_traces += 1,
             else => {},
@@ -768,15 +768,15 @@ test "executor: a hot numeric-for sum runs via the IR-interpreter (back-edges co
     try testing.expectEqualStrings("5050\n", sink.buffered());
 
     // One clean trace, never blacklisted, penalty cleared by the big yield.
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
     try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
     try testing.expectEqual(@as(usize, 0), vm.trace.penalty.count());
 
     // The decisive "it actually executed" signal: tier-0 saw back-edges only
     // until the trace was cached (== hotloop). The remaining ~95 iterations ran
     // inside the IR-interpreter, so the anchor's counter never climbed toward 100.
-    const t = vm.trace.cache.items[0];
-    try testing.expectEqual(vm.trace.config.hotloop, vm.trace.backEdgeCount(t.anchor));
+    const t = vm.trace.registry.cache.items[0];
+    try testing.expectEqual(vm.trace.config.hotloop, vm.trace.backEdgeCount(t.code.anchor));
 }
 
 test "doc 30 c5: loopDoneSnapshotSupported — a sunk sgm_setpos below the loop-done guard declines the linked continuation" {
@@ -794,11 +794,11 @@ test "doc 30 c5: loopDoneSnapshotSupported — a sunk sgm_setpos below the loop-
         .{ .op = .phi, .b = 0, .aux = 0 }, // 4
         .{ .op = .loop }, // 5
     };
-    var t = trace.Trace{ .anchor = undefined, .instrs = &with_setpos, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
-    try std.testing.expect(!irinterp.loopDoneSnapshotSupported(&t, 1));
+    var t = trace.TraceCode{ .anchor = undefined, .instrs = &with_setpos, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try std.testing.expect(!t.loopDoneSnapshotSupported(1));
     // The scan stops at the φ block: a sgm_setpos BEFORE the guard (not in
     // the sunk range) does not decline — only the post-guard range counts.
-    try std.testing.expect(irinterp.loopDoneSnapshotSupported(&t, 3));
+    try std.testing.expect(t.loopDoneSnapshotSupported(3));
 
     // Control: the same shape with only closed-inventory stores is supported.
     var plain = [_]I{
@@ -809,8 +809,8 @@ test "doc 30 c5: loopDoneSnapshotSupported — a sunk sgm_setpos below the loop-
         .{ .op = .phi, .b = 0, .aux = 0 },
         .{ .op = .loop },
     };
-    t = trace.Trace{ .anchor = undefined, .instrs = &plain, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
-    try std.testing.expect(irinterp.loopDoneSnapshotSupported(&t, 1));
+    t = trace.TraceCode{ .anchor = undefined, .instrs = &plain, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try std.testing.expect(t.loopDoneSnapshotSupported(1));
 }
 
 // ---------------------------------------------------------------------------
@@ -854,9 +854,9 @@ test "doc 38: while-inner continuation links to the while-body root (.link termi
     // The cache holds the while-body `.loop` root AND a `.link` continuation.
     var loop_traces: usize = 0;
     var link_traces: usize = 0;
-    for (vm.trace.cache.items) |t| {
-        try testing.expect(t.instrs.len >= 1);
-        switch (t.instrs[t.instrs.len - 1].op) {
+    for (vm.trace.registry.cache.items) |t| {
+        try testing.expect(t.code.instrs.len >= 1);
+        switch (t.code.instrs[t.code.instrs.len - 1].op) {
             .loop => loop_traces += 1,
             .link => link_traces += 1,
             else => {},
@@ -866,14 +866,14 @@ test "doc 38: while-inner continuation links to the while-body root (.link termi
     try testing.expect(link_traces >= 1);
 
     // Every `.link` terminator targets the anchor of a cached `.loop` root.
-    for (vm.trace.cache.items) |t| {
-        const term = t.instrs[t.instrs.len - 1];
+    for (vm.trace.registry.cache.items) |t| {
+        const term = t.code.instrs[t.code.instrs.len - 1];
         if (term.op != .link) continue;
         const inner_pc: u32 = @intCast(term.aux);
         var found_root = false;
-        for (vm.trace.cache.items) |r| {
-            if (r.anchor.proto == t.anchor.proto and r.anchor.pc == inner_pc and
-                r.instrs[r.instrs.len - 1].op == .loop) found_root = true;
+        for (vm.trace.registry.cache.items) |r| {
+            if (r.code.anchor.proto == t.code.anchor.proto and r.code.anchor.pc == inner_pc and
+                r.code.instrs[r.code.instrs.len - 1].op == .loop) found_root = true;
         }
         try testing.expect(found_root);
     }
@@ -915,13 +915,13 @@ test "doc 38: no trace unrolls the variable-trip while (LINNER holds)" {
     var chunk = try runExecForTrace(&vm, gpa, source, &jit);
     defer chunk.deinit();
 
-    for (vm.trace.cache.items) |t| {
+    for (vm.trace.registry.cache.items) |t| {
         var branch_guards: usize = 0;
-        for (t.instrs) |ins| {
+        for (t.code.instrs) |ins| {
             if (ins.op != .guard_true and ins.op != .guard_false) continue;
             const src_pc = trace.guardSourcePc(ins) orelse continue;
-            if (src_pc >= t.anchor.proto.code.len) continue;
-            const src_op = t.anchor.proto.code[src_pc].op;
+            if (src_pc >= t.code.anchor.proto.code.len) continue;
+            const src_op = t.code.anchor.proto.code[src_pc].op;
             if (src_op == .jmp_if_false or src_op == .jmp_if_true) branch_guards += 1;
         }
         try testing.expect(branch_guards <= 1);
@@ -988,8 +988,8 @@ test "doc 38: always-zero-trip while stays sound (no while root, outer traces ov
     try testing.expectEqualStrings(tier0.buffered(), jit.buffered());
 
     var loop_traces: usize = 0;
-    for (vm.trace.cache.items) |t| {
-        if (t.instrs[t.instrs.len - 1].op == .loop) loop_traces += 1;
+    for (vm.trace.registry.cache.items) |t| {
+        if (t.code.instrs[t.code.instrs.len - 1].op == .loop) loop_traces += 1;
     }
     try testing.expect(loop_traces >= 1);
 }
@@ -1022,8 +1022,8 @@ test "doc 38: repeat-until is excluded from while linking (backward jmp_if_false
     defer chunk.deinit();
     try testing.expectEqualStrings(tier0.buffered(), jit.buffered());
 
-    for (vm.trace.cache.items) |t| {
-        try testing.expect(t.instrs[t.instrs.len - 1].op != .link);
+    for (vm.trace.registry.cache.items) |t| {
+        try testing.expect(t.code.instrs[t.code.instrs.len - 1].op != .link);
     }
 }
 
@@ -1066,8 +1066,8 @@ test "doc 38: low-trip while anchor earns a .low_trip_while yield gate" {
     // The while root committed (the gate must have gated a REAL dispatching
     // anchor, not an anchor that never traced) …
     var loop_traces: usize = 0;
-    for (vm.trace.cache.items) |t| {
-        if (t.instrs[t.instrs.len - 1].op == .loop) loop_traces += 1;
+    for (vm.trace.registry.cache.items) |t| {
+        if (t.code.instrs[t.code.instrs.len - 1].op == .loop) loop_traces += 1;
     }
     try testing.expect(loop_traces >= 1);
 

@@ -18,8 +18,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const x64 = @import("x64.zig");
-const trace = @import("trace.zig");
-const irinterp = @import("irinterp.zig");
+const trace_ir = @import("trace_ir.zig");
+const trace_code = @import("trace_code.zig");
+const trace = trace_ir;
+const trace_exec = @import("trace_exec.zig");
 const value = @import("value.zig");
 const table = @import("table.zig");
 const arr = @import("array.zig");
@@ -29,7 +31,8 @@ const stralloc = @import("stralloc.zig");
 const string_mod = @import("string.zig");
 const Value = value.Value;
 const RegWindow = @import("regwindow.zig").RegWindow;
-const Trace = trace.Trace;
+const Trace = trace_code.TraceCode;
+const NativeSeedCtx = trace_code.NativeSeedCtx;
 
 /// Frozen in-memory layout the lane-aware native array path (Phase B) encodes
 /// against. Every constant is imported from the table/array modules via
@@ -632,7 +635,7 @@ fn intLaneWidth(aux: i32) u8 {
 /// guard_fits tropt DCE'd. A *variant* (non-const) narrow-lane value keeps its
 /// guard_fits (tropt can't prove it always fits), so it takes the `fits_ok` path,
 /// not this one.
-fn konstFitsLane(t: *const Trace, r: trace.Ref, aux: i32) bool {
+fn konstFitsLane(t: *const Trace, r: trace_ir.Ref, aux: i32) bool {
     if (r >= t.instrs.len) return false;
     const ki = t.instrs[r];
     if (ki.op != .konst) return false;
@@ -700,7 +703,7 @@ pub const NativeResult = extern struct {
     /// (each body's entry overwrites it), so the returned value always describes the
     /// final trace. Not consumed by the host — pure scratch that rides in the result.
     entry_rbx: usize,
-    /// 2.3c-0b (doc 17): why the final body exited — `irinterp.ExitReason` as a raw
+    /// 2.3c-0b (doc 17): why the final body exited — `trace_exec.ExitReason` as a raw
     /// `u32`. The wrapper inits it to `.normal` (0); ONLY the `prologue_fail` stub
     /// overwrites it (to 1) via `movMemImm32`, so it splits a native prologue-fail from
     /// the tier-1a "ran to completion" meaning of `exit_instr == maxInt`. Written by
@@ -735,23 +738,23 @@ pub const NativeResult = extern struct {
     /// stay LAST: every scalar field's `@offsetOf` is baked into the exit stubs, so
     /// appending here keeps them byte-identical.
     ledger_len: usize,
-    ledger_cum: [irinterp.LEDGER_CAP]usize,
-    ledger_id: [irinterp.LEDGER_CAP]u32,
-    ledger_exit: [irinterp.LEDGER_CAP]u32,
-    ledger_reason: [irinterp.LEDGER_CAP]u32,
+    ledger_cum: [trace_exec.LEDGER_CAP]usize,
+    ledger_id: [trace_exec.LEDGER_CAP]u32,
+    ledger_exit: [trace_exec.LEDGER_CAP]u32,
+    ledger_reason: [trace_exec.LEDGER_CAP]u32,
     /// 2.3c-2c (doc 17): parallel `LedgerKind` lane — the exit-materialization SITE
     /// that appended each hop (one static constant per `emitLedgerAppend` caller).
     /// The generic `replayLedger` reads it to classify a hop's coherent-resume
     /// contract without re-deriving it from the trace IR. Like the other ledger
     /// lanes, appended AFTER the scalar fields so every baked scalar `@offsetOf` in
     /// the exit stubs stays byte-identical.
-    ledger_kind: [irinterp.LEDGER_CAP]u32,
+    ledger_kind: [trace_exec.LEDGER_CAP]u32,
     /// 2.3c-2c (doc 17): parallel `LedgerOutcome` lane — `.normal` for every entry by
     /// default (written by `emitLedgerAppend`), rewritten to `.yielded` by
     /// `emitForcedYieldCheck` when an armed chain source hits a full ledger. Lets
     /// `replayLedger` tell a forced yield apart from a natural terminal at the last
     /// entry. Appended last (after `ledger_kind`), same byte-identity rationale.
-    ledger_outcome: [irinterp.LEDGER_CAP]u32,
+    ledger_outcome: [trace_exec.LEDGER_CAP]u32,
     // Doc 17 B-3 frozen tail. These stay unreachable/zero in B-3a: only a future
     // validated exit patch can enter a silent epilogue.
     silent_active: u64,
@@ -791,12 +794,12 @@ pub const NativeResultLedgerLayout = extern struct {
     exit_reason: u32,
     exit_target: usize,
     ledger_len: usize,
-    ledger_cum: [irinterp.LEDGER_CAP]usize,
-    ledger_id: [irinterp.LEDGER_CAP]u32,
-    ledger_exit: [irinterp.LEDGER_CAP]u32,
-    ledger_reason: [irinterp.LEDGER_CAP]u32,
-    ledger_kind: [irinterp.LEDGER_CAP]u32,
-    ledger_outcome: [irinterp.LEDGER_CAP]u32,
+    ledger_cum: [trace_exec.LEDGER_CAP]usize,
+    ledger_id: [trace_exec.LEDGER_CAP]u32,
+    ledger_exit: [trace_exec.LEDGER_CAP]u32,
+    ledger_reason: [trace_exec.LEDGER_CAP]u32,
+    ledger_kind: [trace_exec.LEDGER_CAP]u32,
+    ledger_outcome: [trace_exec.LEDGER_CAP]u32,
 };
 
 comptime {
@@ -967,7 +970,7 @@ pub const CompiledTrace = struct {
     /// count plus the failing IR instruction when native can identify it. The two
     /// lanes are passed as the SysV first two args (rdi=tags, rsi=payloads); the
     /// result pointer is the third (rdx), reserved out of the allocator pools.
-    pub fn run(self: CompiledTrace, regs: RegWindow) irinterp.ExecResult {
+    pub fn run(self: CompiledTrace, regs: RegWindow) trace_exec.ExecResult {
         return self.runWithLinkedLoopDone(regs, false, null, .{});
     }
 
@@ -975,7 +978,7 @@ pub const CompiledTrace = struct {
     /// the final iteration's post-guard stores and phi snapshot before returning,
     /// so the native nested-loop chainer can jump to the `.link` continuation
     /// without tier-0 replay.
-    pub fn runLinkedLoopDone(self: CompiledTrace, regs: RegWindow) irinterp.ExecResult {
+    pub fn runLinkedLoopDone(self: CompiledTrace, regs: RegWindow) trace_exec.ExecResult {
         return self.runWithLinkedLoopDone(regs, true, null, .{});
     }
 
@@ -986,7 +989,7 @@ pub const CompiledTrace = struct {
     /// entries (the native append is bounds-guarded at that cap). The borrow is
     /// consumed immediately by the caller's replay — no native call / resize / nested
     /// replay may intervene between this capture and its consumption.
-    pub fn runCapturingLedger(self: CompiledTrace, regs: RegWindow, ledger_out: []irinterp.LedgerEntry, silent: SilentStaging) irinterp.ExecResult {
+    pub fn runCapturingLedger(self: CompiledTrace, regs: RegWindow, ledger_out: []trace_exec.LedgerEntry, silent: SilentStaging) trace_exec.ExecResult {
         return self.runWithLinkedLoopDone(regs, false, ledger_out, silent);
     }
 
@@ -999,18 +1002,18 @@ pub const CompiledTrace = struct {
     /// replay, corrupting the coherent resume — so capture MUST preserve the mode. Same
     /// borrow contract as `runCapturingLedger`: `ledger_out` holds `LEDGER_CAP` entries
     /// and is consumed immediately, with no intervening native call.
-    pub fn runLinkedLoopDoneCapturing(self: CompiledTrace, regs: RegWindow, ledger_out: []irinterp.LedgerEntry, silent: SilentStaging) irinterp.ExecResult {
+    pub fn runLinkedLoopDoneCapturing(self: CompiledTrace, regs: RegWindow, ledger_out: []trace_exec.LedgerEntry, silent: SilentStaging) trace_exec.ExecResult {
         return self.runWithLinkedLoopDone(regs, true, ledger_out, silent);
     }
 
-    fn runWithLinkedLoopDone(self: CompiledTrace, regs: RegWindow, linked_loop_done: bool, ledger_out: ?[]irinterp.LedgerEntry, silent: SilentStaging) irinterp.ExecResult {
+    fn runWithLinkedLoopDone(self: CompiledTrace, regs: RegWindow, linked_loop_done: bool, ledger_out: ?[]trace_exec.LedgerEntry, silent: SilentStaging) trace_exec.ExecResult {
         var result = NativeResult{
             .completed = 0,
             .exit_instr = std.math.maxInt(u32),
             .linked_loop_done = if (linked_loop_done) 1 else 0,
-            .final_trace_id = irinterp.NO_TRACE_ID,
+            .final_trace_id = trace_exec.NO_TRACE_ID,
             .entry_rbx = 0,
-            .exit_reason = @intFromEnum(irinterp.ExitReason.normal),
+            .exit_reason = @intFromEnum(trace_exec.ExitReason.normal),
             .exit_target = 0,
             // 2.3c-2a: fresh span → zero recorded transitions. Arrays stay `undefined`;
             // only `[0..ledger_len]` is ever read, and every appended slot is fully
@@ -1071,7 +1074,7 @@ pub const CompiledTrace = struct {
         // `rbx`. Native only (tier-1a never enters this wrapper).
         if (std.debug.runtime_safety) {
             const n = result.ledger_len;
-            std.debug.assert(n <= irinterp.LEDGER_CAP);
+            std.debug.assert(n <= trace_exec.LEDGER_CAP);
             std.debug.assert(result.silent_active != 0 or n >= 1);
             if (n != 0) {
                 std.debug.assert(result.ledger_cum[n - 1] == result.completed);
@@ -1085,12 +1088,12 @@ pub const CompiledTrace = struct {
                 // deopt all carry reason `.normal`, so the ledger `kind` is what tells them
                 // apart; nothing scalar cross-checks those three yet — the generic replay
                 // validates them structurally in 2.3c-2c.)
-                const term_kind: irinterp.LedgerKind = @enumFromInt(result.ledger_kind[n - 1]);
-                std.debug.assert((result.exit_reason == @intFromEnum(irinterp.ExitReason.prologue_fail)) ==
+                const term_kind: trace_exec.LedgerKind = @enumFromInt(result.ledger_kind[n - 1]);
+                std.debug.assert((result.exit_reason == @intFromEnum(trace_exec.ExitReason.prologue_fail)) ==
                     (term_kind == .prologue_fail));
-                std.debug.assert((result.exit_reason == @intFromEnum(irinterp.ExitReason.seed_hash_decline)) ==
+                std.debug.assert((result.exit_reason == @intFromEnum(trace_exec.ExitReason.seed_hash_decline)) ==
                     (term_kind == .seed_hash_decline));
-                std.debug.assert((result.exit_reason == @intFromEnum(irinterp.ExitReason.seed_capacity_decline)) ==
+                std.debug.assert((result.exit_reason == @intFromEnum(trace_exec.ExitReason.seed_capacity_decline)) ==
                     (term_kind == .seed_capacity_decline));
             }
         }
@@ -1172,23 +1175,23 @@ pub const NativeState = union(enum) {
 /// IR, or an assembly/mapping failure. A `null` is never fatal: the caller falls
 /// back to the tier-1a IR-interpreter. Success transfers ownership of an executable
 /// page to the returned `CompiledTrace` (free it with `deinit`).
-pub fn compile(gpa: std.mem.Allocator, t: *const Trace) ?CompiledTrace {
-    return compileImpl(gpa, t, null, null, null);
+pub fn compile(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32) ?CompiledTrace {
+    return compileImpl(gpa, t, trace_id, null, null, null);
 }
 
 /// Test entry point for ALLOCATING traces (doc 24): like `compile` but with the
 /// heap whose counters/`gc_stress` the `guard_gc` lowering and the `tostr_*`
 /// callouts bake as absolute addresses. Without one, an allocating trace bails
 /// (fail closed) — see `compileImpl`.
-pub fn compileWithHeap(gpa: std.mem.Allocator, t: *const Trace, heap: *gc.Heap) ?CompiledTrace {
-    return compileImpl(gpa, t, null, null, heap);
+pub fn compileWithHeap(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, heap: *gc.Heap) ?CompiledTrace {
+    return compileImpl(gpa, t, trace_id, null, null, heap);
 }
 
 /// Test entry point for SEEDED traces (doc 22 §B.2): like `compile` but with a
 /// seeding ctx to bake into the entry prologue. A trace whose seed plan is
 /// non-empty cannot compile without one (fail closed, §B.4).
-pub fn compileSeeded(gpa: std.mem.Allocator, t: *const Trace, seed_ctx: *const trace.NativeSeedCtx) ?CompiledTrace {
-    return compileImpl(gpa, t, null, seed_ctx, null);
+pub fn compileSeeded(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, seed_ctx: *const NativeSeedCtx) ?CompiledTrace {
+    return compileImpl(gpa, t, trace_id, null, seed_ctx, null);
 }
 
 /// Production entry point: compile `t` and co-locate its code in the shared `arena`
@@ -1196,13 +1199,13 @@ pub fn compileSeeded(gpa: std.mem.Allocator, t: *const Trace, seed_ctx: *const t
 /// lives (an arena slot vs a standalone `mmap`). `seed_ctx` is the per-VM seeding
 /// context (doc 22 §B.1) a seeded trace's entry prologue bakes; nullable because
 /// hand-built test TraceStates carry none — a seeded trace then bails to tier-1a.
-pub fn compileInto(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace, seed_ctx: ?*const trace.NativeSeedCtx, heap: ?*gc.Heap) ?CompiledTrace {
-    return compileImpl(gpa, t, arena, seed_ctx, heap);
+pub fn compileInto(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace, trace_id: u32, seed_ctx: ?*const NativeSeedCtx, heap: ?*gc.Heap) ?CompiledTrace {
+    return compileImpl(gpa, t, trace_id, arena, seed_ctx, heap);
 }
 
 /// Shared compile body. `arena == null` maps a standalone owned page (test path);
 /// non-null co-locates the code as an arena slot (production path).
-fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena, seed_ctx: ?*const trace.NativeSeedCtx, heap: ?*gc.Heap) ?CompiledTrace {
+fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*McodeArena, seed_ctx: ?*const NativeSeedCtx, heap: ?*gc.Heap) ?CompiledTrace {
     if (comptime !is_x64_linux) return null;
 
     const n = t.instrs.len;
@@ -1324,7 +1327,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena, see
 
     var asm_buf = x64.Assembler.init(gpa);
     defer asm_buf.deinit();
-    const entry_stubs = lower(gpa, t, kinds, &alloc, &asm_buf, shared_exit, slots, metadata_cells, patch_emissions, seed_ctx, seed_plan, heap) catch {
+    const entry_stubs = lower(gpa, t, trace_id, kinds, &alloc, &asm_buf, shared_exit, slots, metadata_cells, patch_emissions, seed_ctx, seed_plan, heap) catch {
         if (metadata_cells.len > 0) gpa.free(metadata_cells);
         if (slots.len > 0) gpa.free(slots);
         return null;
@@ -3097,7 +3100,7 @@ const AnalyzeError = std.mem.Allocator.Error || error{
 /// True iff `op` produces a register-resident value that gets its own location (i.e. a
 /// transient: konst / arithmetic / compare). slot_loads resolve to a slot home; guards
 /// and the loop marker produce no value.
-fn isTransient(op: trace.IrOp) bool {
+fn isTransient(op: trace_ir.IrOp) bool {
     return switch (op) {
         .konst, .add, .sub, .mul, .div, .band, .bor, .bxor, .shl, .shr, .sar, .neg, .bnot, .eq, .ne, .lt, .le => true,
         // aref materializes idx0 in a register; aload materializes the decoded bool.
@@ -3138,7 +3141,7 @@ fn isTransient(op: trace.IrOp) bool {
 /// True iff the op's two operands may be swapped without changing the result. Used
 /// both for operand coalescing (either operand's dying register may be reused) and to
 /// let the ALU emitter avoid a staging move when the in-register operand is `b`.
-fn isCommutative(op: trace.IrOp) bool {
+fn isCommutative(op: trace_ir.IrOp) bool {
     return switch (op) {
         .add, .mul, .band, .bor, .bxor, .eq, .ne => true,
         else => false, // sub, lt, le are order-sensitive
@@ -3146,7 +3149,7 @@ fn isCommutative(op: trace.IrOp) bool {
 }
 
 /// The operand refs an instruction reads (matching `proveKinds`/`lower` exactly).
-fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
+fn operandReads(ins: trace_ir.IrInstr) struct { a: bool, b: bool } {
     return switch (ins.op) {
         .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .sar, .eq, .ne, .lt, .le => .{ .a = true, .b = true },
         .neg, .bnot, .guard_int, .guard_true, .guard_false => .{ .a = true, .b = false },
@@ -3231,14 +3234,14 @@ fn locEql(x: Loc, y: Loc) bool {
 /// a compilable trace (fail closed); an op here that proveKinds does not
 /// treat as a string would be type confusion in the body's static string
 /// facts (`slen`, snew operands).
-fn isStringProducerOp(op: trace.IrOp) bool {
+fn isStringProducerOp(op: trace_ir.IrOp) bool {
     return switch (op) {
         .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower, .scap_str => true,
         else => false,
     };
 }
 
-fn isCoalescibleOp(op: trace.IrOp) bool {
+fn isCoalescibleOp(op: trace_ir.IrOp) bool {
     return switch (op) {
         .add, .sub, .mul, .band, .bor, .bxor, .neg, .bnot => true,
         else => false,
@@ -4842,11 +4845,11 @@ fn slotAddr(slots: []usize, idx: usize) ?usize {
 /// handful of hops, far below the cap — and 2.3c-2c replaces the drop at chain-SOURCE
 /// sites with a forced yield to `shared_exit` so a closed cycle can never silently lose
 /// a hop.
-fn emitLedgerAppend(a: *x64.Assembler, trace_id: u32, kind: irinterp.LedgerKind) !void {
+fn emitLedgerAppend(a: *x64.Assembler, trace_id: u32, kind: trace_exec.LedgerKind) !void {
     const full = try a.label();
     // rax = ledger_len; drop the entry if already at capacity (unreachable pre-cycle).
     try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "ledger_len"));
-    try a.cmpRegImm32(.rax, @intCast(irinterp.LEDGER_CAP));
+    try a.cmpRegImm32(.rax, @intCast(trace_exec.LEDGER_CAP));
     try a.jcc(.ae, full);
     // ledger_cum[rax] = rbx  (usize lane, SIB scale 8)
     try a.storeMemSibReg(.rdx, .rax, 8, @offsetOf(NativeResult, "ledger_cum"), .rbx);
@@ -4865,7 +4868,7 @@ fn emitLedgerAppend(a: *x64.Assembler, trace_id: u32, kind: irinterp.LedgerKind)
     // 2.3c-2c: ledger_outcome[rax] = .normal (0). A chain-source forced yield
     // (`emitForcedYieldCheck`) overwrites this entry to `.yielded` when the ledger is
     // full; otherwise it stays `.normal` (dispatched-or-terminal, positionally resolved).
-    try a.movRegImm64(.rcx, @intCast(@intFromEnum(irinterp.LedgerOutcome.normal)));
+    try a.movRegImm64(.rcx, @intCast(@intFromEnum(trace_exec.LedgerOutcome.normal)));
     try a.storeMemSibReg(.rdx, .rax, 4, @offsetOf(NativeResult, "ledger_outcome"), .rcx);
     // ledger_len = rax + 1
     try a.incReg(.rax);
@@ -4895,7 +4898,7 @@ fn emitForcedYieldCheck(a: *x64.Assembler, shared_exit: usize) !void {
     try a.cmpRegReg(.rax, .rcx);
     try a.jcc(.e, do_jmp);
     // Armed. Room left in the ledger (ledger_len < CAP) → dispatch into the child.
-    try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "ledger_len"), @intCast(irinterp.LEDGER_CAP));
+    try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "ledger_len"), @intCast(trace_exec.LEDGER_CAP));
     try a.jcc(.b, do_jmp);
     // Armed AND full → forced yield. Mark the just-appended terminal entry (index
     // ledger_len − 1) `.yielded`, then redirect the dispatch to `shared_exit`.
@@ -4903,7 +4906,7 @@ fn emitForcedYieldCheck(a: *x64.Assembler, shared_exit: usize) !void {
     try a.subRegImm32(.rcx, 1);
     // Stage the `.yielded` code in rax (free — reloaded with shared_exit right after),
     // store it into ledger_outcome[rcx] (u32 lane, scale 4).
-    try a.movRegImm64(.rax, @intCast(@intFromEnum(irinterp.LedgerOutcome.yielded)));
+    try a.movRegImm64(.rax, @intCast(@intFromEnum(trace_exec.LedgerOutcome.yielded)));
     try a.storeMemSibReg(.rdx, .rcx, 4, @offsetOf(NativeResult, "ledger_outcome"), .rax);
     try a.movRegImm64(.rax, @bitCast(@as(u64, shared_exit)));
     a.bind(do_jmp);
@@ -5070,20 +5073,7 @@ fn nativeLinkedLoopDoneLabel(a: *x64.Assembler, linked_loop_done_labels: []?x64.
 }
 
 fn isNumericForLoopDoneGuard(t: *const Trace, instr_idx: usize) bool {
-    if (instr_idx >= t.instrs.len) return false;
-    const guard = t.instrs[instr_idx];
-    if (guard.op != .guard_true) return false;
-    const exit_pc = trace.guardExitPc(guard) orelse return false;
-    if (exit_pc == 0 or exit_pc > t.anchor.proto.code.len) return false;
-    if (t.anchor.proto.code[trace.guardSourcePc(guard).?].op != .for_loop) return false;
-    // Doc 37: reject inlined-callee `for_loop` guards — their `guardSourcePc` is
-    // in the callee's proto space, not the anchor's. A coincidental pc collision
-    // would falsely classify a callee guard as the anchor's loop-done guard.
-    if (t.provAt(@intCast(instr_idx))) |prov| switch (prov) {
-        .guard => |gp| if (gp.inline_depth > 0) return false,
-        .link_terminal => return false,
-    };
-    return true;
+    return t.isNumericForLoopDoneGuard(instr_idx);
 }
 
 /// Part A-v (doc 17 §A2.1/§A2.3): true for a trace-local composite outer-loop
@@ -5098,38 +5088,7 @@ fn isNumericForLoopDoneGuard(t: *const Trace, instr_idx: usize) bool {
 /// live at the trace successor/back-edge. Internal phis do not name VM slots and
 /// are excluded.
 pub fn isCompositeBridgeCandidate(t: *const Trace, instr_idx: usize) bool {
-    if (instr_idx >= t.instrs.len) return false;
-    // Doc 39: no composite bridging out of a peeled trace (v1). The bridge
-    // snapshot commits slot-bound φ state without the run-once/steady split or
-    // the zero-completion skip — refuse the candidate so every exit stays an
-    // ordinary deopt through the peel-aware `deopt_exit`.
-    if (t.peeled) return false;
-    const guard = t.instrs[instr_idx];
-    if (guard.op != .guard_true and guard.op != .guard_false) return false;
-    if (isNumericForLoopDoneGuard(t, instr_idx)) return false;
-
-    const exit_pc = trace.guardExitPc(guard) orelse return false;
-    const source_pc = trace.guardSourcePc(guard) orelse return false;
-    if (exit_pc >= t.anchor.pc or source_pc >= t.anchor.proto.code.len) return false;
-    const prov = t.provAt(@intCast(instr_idx)) orelse return false;
-    const guard_prov = switch (prov) {
-        .guard => |g| g,
-        .link_terminal => return false,
-    };
-    if (guard_prov.role != .branch_cond or
-        guard_prov.source_proto_id != t.anchor.proto.id or
-        guard_prov.source_pc != source_pc)
-        return false;
-    switch (t.anchor.proto.code[source_pc].op) {
-        .jmp_if_true, .jmp_if_false => {},
-        else => return false,
-    }
-
-    for (t.instrs) |p| {
-        if (p.op == .phi and p.aux != trace.PHI_INTERNAL and p.b < instr_idx)
-            return true;
-    }
-    return false;
+    return t.classifyBridgeCandidate(instr_idx);
 }
 
 /// The caller-saved GPRs every body callout must preserve (rax/rcx are the
@@ -6025,7 +5984,7 @@ const PatchEmission = struct {
 /// committed counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers
 /// across iterations (loaded + type-guarded once in the prologue); `regs[]` is written
 /// only on a side-exit (the single snapshot) or for write-only slots at the back-edge.
-fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize, metadata_cells: []usize, patch_emissions: []?PatchEmission, seed_ctx: ?*const trace.NativeSeedCtx, seed_plan: SeedPlan, heap: ?*gc.Heap) !EntryStubs {
+fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize, metadata_cells: []usize, patch_emissions: []?PatchEmission, seed_ctx: ?*const NativeSeedCtx, seed_plan: SeedPlan, heap: ?*gc.Heap) !EntryStubs {
     const exit_labels = try gpa.alloc(?x64.Label, t.instrs.len);
     defer gpa.free(exit_labels);
     @memset(exit_labels, null);
@@ -6128,9 +6087,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         // takes the hash exit, and EVERYTHING else (SEED_CAPACITY_DECLINE or a
         // value outside the grammar) takes the capacity exit — whose consumer
         // moves to the next candidate, which is sound for any unexpected value.
-        try a.cmpRegImm32(.rax, @intCast(trace.NativeSeedCtx.SEED_OK));
+        try a.cmpRegImm32(.rax, @intCast(NativeSeedCtx.SEED_OK));
         try a.jcc(.e, seed_ok);
-        try a.cmpRegImm32(.rax, @intCast(trace.NativeSeedCtx.SEED_HASH_DECLINE));
+        try a.cmpRegImm32(.rax, @intCast(NativeSeedCtx.SEED_HASH_DECLINE));
         try a.jcc(.e, hash_l);
         try a.jmp(cap_l);
         a.bind(seed_ok);
@@ -7171,10 +7130,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 // 2.3c-2a: record this `.link` transition (chain source C→I) before the
                 // handoff. `exit_instr` = i is now in memory; `exit_reason` is the inherited
                 // `.normal`.
-                try emitLedgerAppend(a, t.id, .link_terminal);
+                try emitLedgerAppend(a, trace_id, .link_terminal);
                 // Chainable: the `.link` terminal is a single-contract hand-off, so
                 // its exit jumps through slot[i] (default `shared_exit`, armed → child).
-                try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, slotAddr(slots, i));
+                try emitReturn(a, frame, callee[0..callee_len], shared_exit, trace_id, slotAddr(slots, i));
             },
             // A φ emits no code in the body: a slot-bound φ's writeback is driven by
             // its slot's `.carried`/`.write_only` class above (the back-edge shuffle /
@@ -7229,7 +7188,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 // (the φ snapshot would commit entry-class state). Mode-0-always:
                 // ordinary deopt through `deopt_exit`, which carries the peeled
                 // flush semantics.
-                if (!t.peeled and irinterp.loopDoneSnapshotSupported(t, ei)) {
+                if (!t.peeled and t.loopDoneSnapshotSupported(ei)) {
                     try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 0);
                     try a.jcc(.ne, try nativeLinkedLoopDoneLabel(a, linked_loop_done_labels, ei));
                 }
@@ -7256,7 +7215,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     // the legacy exit_instr write above. Reserve two ledger cells:
                     // this bridge receipt and the successor's terminal receipt.
                     try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "ledger_len"));
-                    try a.cmpRegImm32(.rax, @intCast(irinterp.LEDGER_CAP - 2));
+                    try a.cmpRegImm32(.rax, @intCast(trace_exec.LEDGER_CAP - 2));
                     try a.jcc(.a, ordinary_mini);
 
                     try emitCompositeBridgeSnapshot(a, t, kinds, alloc, ei);
@@ -7264,7 +7223,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     const silent = try a.label();
                     patch_emissions[ei] = .{ .kind = .region_bridge, .patch_off = a.code.items.len, .epilogue = silent };
                     try a.nop5();
-                    try emitLedgerAppend(a, t.id, .region_bridge);
+                    try emitLedgerAppend(a, trace_id, .region_bridge);
 
                     // Re-resolve after the snapshot/append clobbered scratch regs,
                     // stage in the flush-immune result field, then hand off directly.
@@ -7311,10 +7270,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // 2.3c-2a: record this loop-done transition (chain source I→C once 2.3c-2c
             // arms slot[ei]) before the handoff. `exit_instr` = ei was written into memory
             // by the mini-stub (its `jne` reached here); `exit_reason` is `.normal`.
-            try emitLedgerAppend(a, t.id, .loop_done_linked);
+            try emitLedgerAppend(a, trace_id, .loop_done_linked);
             // Chainable: the linked-loop-done stub commits the post-guard state, then
             // hands off through slot[ei] (default `shared_exit`, armed → continuation).
-            try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, slotAddr(slots, ei));
+            try emitReturn(a, frame, callee[0..callee_len], shared_exit, trace_id, slotAddr(slots, ei));
         }
     }
 
@@ -7360,13 +7319,13 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     // `.normal`. The append clobbers rax/rcx but not the memory-staged `exit_target` the
     // dispatch below reads. Precedes the final_trace_id stamp — harmless, `t.id` is the
     // same value we pass as the ledger id.
-    try emitLedgerAppend(a, t.id, .deopt);
+    try emitLedgerAppend(a, trace_id, .deopt);
     // P-B: stamp the final trace id. `emitReturn` normally does this, but here the
     // dispatch target is the resolved value the mini-stub already staged into
     // `exit_target` (its own `slot[ei]`'s value, or `shared_exit` for a loop-done
     // ordinary exit), not a fixed address baked in this shared block — so inline the id
     // stamp + dispatch.
-    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "final_trace_id"), @bitCast(t.id));
+    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "final_trace_id"), @bitCast(trace_id));
     if (shared_exit) |se| {
         // 2.3c-0: frameless — dispatch through the memory-staged resolved target. The
         // mini-stub wrote `exit_target` BEFORE the flush ran, so the flush's rax clobber
@@ -7407,14 +7366,14 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     // 2.3c-0b: stamp the reason so a consumer distinguishes THIS (native prologue-fail,
     // no local progress) from a tier-1a clean completion — both otherwise show
     // `exit_instr == maxInt`. Only this stub writes a non-`.normal` reason.
-    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_reason"), @intFromEnum(irinterp.ExitReason.prologue_fail));
+    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_reason"), @intFromEnum(trace_exec.ExitReason.prologue_fail));
     // 2.3c-2a: record the prologue-fail as the terminal transition. `exit_instr` = -1 and
     // `exit_reason` = `.prologue_fail` are in memory; a chained child's entry-guard failure
     // after the parent committed thus shows up in the ledger with its own `trace_id` and
     // zero local progress. Terminal (jumps to `shared_exit`), so it is always the LAST
     // ledger entry — never a chain source, no cap needed.
-    try emitLedgerAppend(a, t.id, .prologue_fail);
-    try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, null);
+    try emitLedgerAppend(a, trace_id, .prologue_fail);
+    try emitReturn(a, frame, callee[0..callee_len], shared_exit, trace_id, null);
 
     // SEED DECLINE exits (doc 22 §B.2): the entry seed prologue's callout declined
     // before the body ran — cloned from `prologue_fail` above (same pre-commit
@@ -7430,16 +7389,16 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         a.bind(hash_l);
         try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
         try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), -1);
-        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_reason"), @intFromEnum(irinterp.ExitReason.seed_hash_decline));
-        try emitLedgerAppend(a, t.id, .seed_hash_decline);
-        try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, null);
+        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_reason"), @intFromEnum(trace_exec.ExitReason.seed_hash_decline));
+        try emitLedgerAppend(a, trace_id, .seed_hash_decline);
+        try emitReturn(a, frame, callee[0..callee_len], shared_exit, trace_id, null);
 
         a.bind(seed_capacity_exit.?);
         try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
         try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), -1);
-        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_reason"), @intFromEnum(irinterp.ExitReason.seed_capacity_decline));
-        try emitLedgerAppend(a, t.id, .seed_capacity_decline);
-        try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, null);
+        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_reason"), @intFromEnum(trace_exec.ExitReason.seed_capacity_decline));
+        try emitLedgerAppend(a, trace_id, .seed_capacity_decline);
+        try emitReturn(a, frame, callee[0..callee_len], shared_exit, trace_id, null);
     }
 
     // B-3a: all silent epilogues live out of line in this same allocation. Their
@@ -7472,7 +7431,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 if (silent_skip) |l| a.bind(l);
                 try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
             }
-            try emitSilentEpilogue(a, em.kind, &metadata_cells[ei], se, t.id);
+            try emitSilentEpilogue(a, em.kind, &metadata_cells[ei], se, trace_id);
         };
     }
 

@@ -47,8 +47,26 @@ test "A-vii-c split: regionless onSideExit keeps the legacy gate; bare accountTr
     // ONLY coverage + `hit_count` — never `penalty`/`gate`.
     var code = [_]Instr{ Instr.op0(.load_nil), Instr.op0(.load_nil) };
     const proto = Proto{ .code = &code, .name = "t", .num_registers = 1 };
-    var t_wrap: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
-    var t_bare: Trace = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 1 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var t_wrap: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 0 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 1,
+    };
+    var t_bare: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 1 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 2,
+    };
 
     // Feed exactly max_penalty low-yield events through both entry points.
     var i: u32 = 0;
@@ -58,10 +76,10 @@ test "A-vii-c split: regionless onSideExit keeps the legacy gate; bare accountTr
     }
     // The regionless wrapper gates exactly like the pre-flip machine; the bare
     // selection half no longer strikes at all.
-    try testing.expect(state.isGated(t_wrap.anchor));
-    try testing.expect(!state.isGated(t_bare.anchor));
-    try testing.expectEqual(@as(u32, state.config.max_penalty), state.penalty.get(t_wrap.anchor).?);
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(t_bare.anchor));
+    try testing.expect(state.isGated(t_wrap.code.anchor));
+    try testing.expect(!state.isGated(t_bare.code.anchor));
+    try testing.expectEqual(@as(u32, state.config.max_penalty), state.penalty.get(t_wrap.code.anchor).?);
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(t_bare.code.anchor));
     try testing.expectEqual(@as(u64, 0), t_wrap.hit_count);
     try testing.expectEqual(@as(u64, 0), t_bare.hit_count);
 
@@ -71,8 +89,8 @@ test "A-vii-c split: regionless onSideExit keeps the legacy gate; bare accountTr
     state.accountTraceRun(&t_bare, state.config.min_useful);
     try testing.expectEqual(@as(u64, 1), t_wrap.hit_count);
     try testing.expectEqual(@as(u64, 1), t_bare.hit_count);
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(t_wrap.anchor));
-    try testing.expect(!state.isGated(t_wrap.anchor));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(t_wrap.code.anchor));
+    try testing.expect(!state.isGated(t_wrap.code.anchor));
     try testing.expectEqual(@as(usize, 0), state.penalty.count());
     try testing.expectEqual(@as(usize, 0), state.gate.count());
 }
@@ -86,14 +104,14 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     var code = [_]Instr{ Instr.op0(.load_nil), Instr.op0(.load_nil) };
     const proto = Proto{ .id = 61, .code = &code, .name = "gate", .num_registers = 1 };
     const rid: RegionId = @enumFromInt(3);
-    try state.region_defs.put(gpa, rid, .{
+    try state.region_policy.region_defs.put(gpa, rid, .{
         .members = try gpa.dupe(StructuralEdgeId, &.{}),
         .member_points = try gpa.dupe(ProgramPoint, &.{.{ .proto_id = 61, .source_pc = 0 }}),
         .owner = .{ .proto = &proto, .pc = 0 },
         .classifier = .{ .kind = .self_loop, .member_count = 1 },
         .armable = true,
     });
-    try state.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
+    try state.region_policy.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
     const owner: AnchorKey = .{ .proto = &proto, .pc = 0 };
     const exit: ExitKey = .{ .trace_id = 9, .exit_instr = 0 };
     const key: RegionKey = .{ .region_id = rid, .activation = 5 };
@@ -103,8 +121,8 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     // (1) Seven traversals: no complete window — no flush, no qualification, no strike.
     state.setRegionContext(1, 5);
     _ = state.accountRegionProfit(exit, 7, .deferred);
-    try testing.expect(!state.region_profit.get(key).?.useful_window_seen);
-    try testing.expectEqual(@as(u64, 0), state.region_profit_flushes);
+    try testing.expect(!state.region_policy.region_profit.get(key).?.useful_window_seen);
+    try testing.expectEqual(@as(u64, 0), state.region_policy.region_profit_flushes);
     try testing.expectEqual(@as(?u32, null), state.penalty.get(owner));
 
     // Pre-seed a penalty AND an active gate on the owner: the full window must clear BOTH.
@@ -115,8 +133,8 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     // (2) The eighth traversal completes exactly one N window: one useful flush,
     // qualification latched, owner penalty and gate both removed.
     _ = state.accountRegionProfit(exit, 1, .deferred);
-    try testing.expect(state.region_profit.get(key).?.useful_window_seen);
-    try testing.expectEqual(@as(u64, 1), state.region_profit_flushes);
+    try testing.expect(state.region_policy.region_profit.get(key).?.useful_window_seen);
+    try testing.expectEqual(@as(u64, 1), state.region_policy.region_profit_flushes);
     try testing.expectEqual(@as(?u32, null), state.penalty.get(owner));
     try testing.expect(!state.isGated(owner));
 
@@ -124,7 +142,7 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     // NO zero-remainder flush (R2-1) and no spurious strike.
     state.observeRegionProgramPoint(61, 1, 1, 5);
     try testing.expectEqual(@as(usize, 0), state.regionProfitCount());
-    try testing.expectEqual(@as(u64, 1), state.region_profit_flushes);
+    try testing.expectEqual(@as(u64, 1), state.region_policy.region_profit_flushes);
     try testing.expectEqual(@as(?u32, null), state.penalty.get(owner));
 
     // (4) Arm a link, then repeated 1-traversal open/exit cycles each flush an
@@ -135,25 +153,29 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     defer gpa.free(parent_slots);
     @memset(parent_slots, SHARED_EXIT);
     var link_parent: Trace = .{
+        .code = .{
+            .anchor = undefined,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 71,
-        .anchor = undefined,
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
         .native = .{ .compiled = .{ .page = undefined, .slots = parent_slots, .gpa = gpa, .linked_entry = 0xAAAA } },
     };
     var link_child: Trace = .{
+        .code = .{
+            .anchor = undefined,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 72,
-        .anchor = undefined,
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
         .native = .{ .compiled = .{ .page = undefined, .slots = &.{}, .gpa = gpa, .linked_entry = 0xBBBB } },
     };
     try testing.expect(try state.armNativeLink(&link_parent, 0, &link_child, .link_terminal));
-    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.armed_links.items.len);
 
     var j: u32 = 0;
     while (j < state.config.max_penalty) : (j += 1) {
@@ -163,7 +185,7 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     }
     try testing.expectEqual(@as(u32, state.config.max_penalty), state.penalty.get(owner).?);
     try testing.expect(state.isGated(owner));
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
     try testing.expectEqual(SHARED_EXIT, parent_slots[0]);
 
     // (5) A-vii-c.1: the accounting boundary is CONSUMPTION, not membership. This
@@ -174,8 +196,17 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     // dispatcher's zero-iteration path at interp.zig, whose own comment reads
     // "apply the penalty"). Exactly one machine must account every receipt.
     var member_instrs = [_]IrInstr{ .{ .op = .slot_load, .aux = 0 }, .{ .op = .loop } };
-    var member: Trace = .{ .id = 9, .anchor = .{ .proto = &proto, .pc = 1 }, .instrs = &member_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
-    try state.dest_entry_regions.put(gpa, 9, try gpa.dupe(RegionId, &.{rid}));
+    var member: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 1 },
+            .instrs = &member_instrs,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 9,
+    };
+    try state.region_policy.dest_entry_regions.put(gpa, 9, try gpa.dupe(RegionId, &.{rid}));
     state.penalty.clearRetainingCapacity();
     state.gate.clearRetainingCapacity();
 
@@ -184,34 +215,34 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     // even though the segment itself was low-yield.
     state.setRegionContext(1, 5);
     state.onSideExitReceipt(&member, 0, 0, 1, .deferred, .entered);
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(member.anchor));
-    try testing.expectEqual(@as(u64, 1), state.region_profit.get(key).?.outer_traversals);
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(member.code.anchor));
+    try testing.expectEqual(@as(u64, 1), state.region_policy.region_profit.get(key).?.outer_traversals);
 
     // (5b) NOT consumed — same classified exit of the same live member, but zero
     // structural work. R2-1 keeps zero-work flushes silent, so if this did not fall
     // through to the legacy machine nothing would ever gate it: it must strike.
     state.onSideExitReceipt(&member, 0, 0, 0, .deferred, .entered);
-    try testing.expectEqual(@as(u32, 1), state.penalty.get(member.anchor).?);
+    try testing.expectEqual(@as(u32, 1), state.penalty.get(member.code.anchor).?);
 
     // (5c) NOT consumed — nonzero work, but exit 1 is absent from the edge cache,
     // so no accumulator receives it. Also a strike.
     state.onSideExitReceipt(&member, 0, 1, 4, .deferred, .entered);
-    try testing.expectEqual(@as(u32, 2), state.penalty.get(member.anchor).?);
+    try testing.expectEqual(@as(u32, 2), state.penalty.get(member.code.anchor).?);
 
     // (5d) An unconsumed USEFUL segment still recovers the anchor the legacy way,
     // and the selection half bumps hit_count on every useful receipt regardless of
     // which machine took the profitability verdict.
     state.onSideExitReceipt(&member, state.config.min_useful, 1, 0, .deferred, .entered);
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(member.anchor));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(member.code.anchor));
     try testing.expectEqual(@as(u64, 1), member.hit_count);
 
     // (5e) Tombstoning the region makes even a nonzero-work classified exit
     // unconsumable (`openRegion` refuses a non-armable def) — so the member reverts
     // to the legacy machine immediately, without waiting for a physical rebuild.
-    state.region_defs.getPtr(rid).?.armable = false;
+    state.region_policy.region_defs.getPtr(rid).?.armable = false;
     state.setRegionContext(1, 5);
     state.onSideExitReceipt(&member, 0, 0, 1, .deferred, .entered);
-    try testing.expectEqual(@as(u32, 1), state.penalty.get(member.anchor).?);
+    try testing.expectEqual(@as(u32, 1), state.penalty.get(member.code.anchor).?);
 }
 
 test "gate-fix consumption boundary: qualified activations own member barren receipts, unclassified member work credits, synthetic charges region-owned" {
@@ -223,7 +254,7 @@ test "gate-fix consumption boundary: qualified activations own member barren rec
     var code = [_]Instr{ Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil) };
     const proto = Proto{ .id = 62, .code = &code, .name = "boundary", .num_registers = 1 };
     const rid: RegionId = @enumFromInt(4);
-    try state.region_defs.put(gpa, rid, .{
+    try state.region_policy.region_defs.put(gpa, rid, .{
         .members = try gpa.dupe(StructuralEdgeId, &.{}),
         .member_points = try gpa.dupe(ProgramPoint, &.{
             .{ .proto_id = 62, .source_pc = 0 },
@@ -233,12 +264,30 @@ test "gate-fix consumption boundary: qualified activations own member barren rec
         .classifier = .{ .kind = .self_loop, .member_count = 1 },
         .armable = true,
     });
-    try state.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
+    try state.region_policy.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
     var member_instrs = [_]IrInstr{ .{ .op = .slot_load, .aux = 0 }, .{ .op = .loop } };
-    var member: Trace = .{ .id = 9, .anchor = .{ .proto = &proto, .pc = 1 }, .instrs = &member_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
-    try state.cache.append(gpa, &member); // traceById must resolve it (membership test)
-    defer state.cache.clearRetainingCapacity(); // stack-backed traces: never destroy()
-    var nonmember: Trace = .{ .id = 10, .anchor = .{ .proto = &proto, .pc = 5 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var member: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 1 },
+            .instrs = &member_instrs,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 9,
+    };
+    try state.registry.cache.append(gpa, &member); // traceById must resolve it (membership test)
+    defer state.registry.cache.clearRetainingCapacity(); // stack-backed traces: never destroy()
+    var nonmember: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 5 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 10,
+    };
     const key: RegionKey = .{ .region_id = rid, .activation = 7 };
 
     // (a) UNQUALIFIED: classified zero-work receipt of the live member still
@@ -246,19 +295,19 @@ test "gate-fix consumption boundary: qualified activations own member barren rec
     // full pre-flip gating on its barren receipts (the A-vii-c blocker shape).
     state.setRegionContext(1, 7);
     _ = state.accountRegionProfit(.{ .trace_id = 9, .exit_instr = 0 }, 1, .deferred); // open, 1 traversal
-    try testing.expect(!state.region_profit.get(key).?.useful_window_seen);
+    try testing.expect(!state.region_policy.region_profit.get(key).?.useful_window_seen);
     state.onSideExitReceipt(&member, 0, 0, 0, .deferred, .entered);
-    try testing.expectEqual(@as(u32, 1), state.penalty.get(member.anchor).?);
+    try testing.expectEqual(@as(u32, 1), state.penalty.get(member.code.anchor).?);
 
     // (a') UNQUALIFIED: a synthetic zero charge on the member anchor strikes too.
     state.onSideExit(&member, 0, .entered);
-    try testing.expectEqual(@as(u32, 2), state.penalty.get(member.anchor).?);
+    try testing.expectEqual(@as(u32, 2), state.penalty.get(member.code.anchor).?);
 
     // (b) Unclassified NONZERO-work member receipt (exit 1 absent from the edge
     // cache): credited to the LIVE accumulator instead of being dropped + struck.
     state.onSideExitReceipt(&member, 0, 1, 3, .deferred, .entered);
-    try testing.expectEqual(@as(u64, 4), state.region_profit.get(key).?.outer_traversals);
-    try testing.expectEqual(@as(u32, 2), state.penalty.get(member.anchor).?); // no new strike
+    try testing.expectEqual(@as(u64, 4), state.region_policy.region_profit.get(key).?.outer_traversals);
+    try testing.expectEqual(@as(u32, 2), state.penalty.get(member.code.anchor).?); // no new strike
 
     // (c) Qualify: enough credited work to flush a full window clears the owner's
     // penalty (owner == (proto,0)) and latches the bit — AND the qualification
@@ -266,47 +315,47 @@ test "gate-fix consumption boundary: qualified activations own member barren rec
     // EVERY member anchor, since the region machine owns those receipts from
     // here on and legacy clears can no longer reach them.
     _ = state.accountRegionProfit(.{ .trace_id = 9, .exit_instr = 0 }, state.config.min_useful, .deferred);
-    try testing.expect(state.region_profit.get(key).?.useful_window_seen);
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(member.anchor));
+    try testing.expect(state.region_policy.region_profit.get(key).?.useful_window_seen);
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(member.code.anchor));
 
     // (d) QUALIFIED: classified zero-work member receipt is now CONSUMED — an
     // intra-complex transition priced by the window/close verdicts, not legacy.
     state.onSideExitReceipt(&member, 0, 0, 0, .deferred, .entered);
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(member.anchor)); // no strike
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(member.code.anchor)); // no strike
 
     // (d') QUALIFIED: unclassified zero-work member receipt likewise consumed.
     state.onSideExitReceipt(&member, 0, 1, 0, .deferred, .entered);
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(member.anchor));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(member.code.anchor));
 
     // (e) QUALIFIED: the synthetic steering charge (`onSideExit(member, 0)`) is
     // region-owned — no legacy strike, no legacy clear.
     state.onSideExit(&member, 0, .entered);
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(member.anchor));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(member.code.anchor));
 
     // (e') Consumed barren receipts are COUNTED (codex BLOCKER 2): the streak so
     // far is 3 — (d), (d'), (e) — and a sustained barren-only run flushes one
     // synthetic low-yield strike at max_barren_run, restarting the streak.
-    try testing.expectEqual(@as(u32, 3), state.region_profit.get(key).?.barren_run);
+    try testing.expectEqual(@as(u32, 3), state.region_policy.region_profit.get(key).?.barren_run);
     const owner: AnchorKey = .{ .proto = &proto, .pc = 0 };
     var spins: u32 = 0;
     while (spins < state.config.max_barren_run - 3) : (spins += 1) state.onSideExit(&member, 0, .entered);
-    try testing.expectEqual(@as(u32, 0), state.region_profit.get(key).?.barren_run);
+    try testing.expectEqual(@as(u32, 0), state.region_policy.region_profit.get(key).?.barren_run);
     try testing.expectEqual(@as(u32, 1), state.penalty.get(owner).?); // one decay strike on the OWNER
     // ...and credited work resets the streak AND (via a full window) the penalty.
     state.onSideExitReceipt(&member, 0, 1, state.config.min_useful, .deferred, .entered);
-    try testing.expectEqual(@as(u32, 0), state.region_profit.get(key).?.barren_run);
+    try testing.expectEqual(@as(u32, 0), state.region_policy.region_profit.get(key).?.barren_run);
     try testing.expectEqual(@as(?u32, null), state.penalty.get(owner));
 
     // (f) A trace anchored OUTSIDE the footprint stays legacy-gated even while
     // the qualified activation is live.
     state.onSideExit(&nonmember, 0, .entered);
-    try testing.expectEqual(@as(u32, 1), state.penalty.get(nonmember.anchor).?);
+    try testing.expectEqual(@as(u32, 1), state.penalty.get(nonmember.code.anchor).?);
 
     // (g) Departure close still prices the remainder against the owner.
-    const flushes_before = state.region_profit_flushes;
+    const flushes_before = state.region_policy.region_profit_flushes;
     state.observeRegionProgramPoint(62, 5, 1, 7); // pc 5 ∉ footprint → close
     try testing.expectEqual(@as(usize, 0), state.regionProfitCount());
-    try testing.expect(state.region_profit_flushes > flushes_before);
+    try testing.expect(state.region_policy.region_profit_flushes > flushes_before);
 }
 
 test "A-vii-e.1 observer fast path: built on open, survive verdicts match the slow predicate, cleared on close" {
@@ -319,7 +368,7 @@ test "A-vii-e.1 observer fast path: built on open, survive verdicts match the sl
     var code = [_]Instr{ Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil) };
     const proto = Proto{ .id = 83, .code = &code, .name = "fastpath", .num_registers = 1 };
     const rid: RegionId = @enumFromInt(11);
-    try state.region_defs.put(gpa, rid, .{
+    try state.region_policy.region_defs.put(gpa, rid, .{
         .members = try gpa.dupe(StructuralEdgeId, &.{}),
         .member_points = try gpa.dupe(ProgramPoint, &.{
             .{ .proto_id = 83, .source_pc = 2 },
@@ -329,17 +378,17 @@ test "A-vii-e.1 observer fast path: built on open, survive verdicts match the sl
         .classifier = .{ .kind = .self_loop, .member_count = 1 },
         .armable = true,
     });
-    try state.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
+    try state.region_policy.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
     const exit: ExitKey = .{ .trace_id = 9, .exit_instr = 0 };
     const key: RegionKey = .{ .region_id = rid, .activation = 5 };
 
     state.setRegionContext(1, 5);
     _ = state.accountRegionProfit(exit, 3, .deferred);
-    try testing.expect(state.region_profit.contains(key));
+    try testing.expect(state.region_policy.region_profit.contains(key));
 
     // (1) The cache is live and mirrors the accumulator's root context, with the
     // membership bitset holding exactly {2, 5} of the [2, 6) span.
-    const f = state.observer_fast orelse return error.MissingObserverFast;
+    const f = state.region_policy.observer_fast orelse return error.MissingObserverFast;
     try testing.expectEqual(key, f.key);
     try testing.expectEqual(@as(u32, 1), f.root_frame_depth);
     try testing.expectEqual(@as(u64, 5), f.root_call_seq);
@@ -354,26 +403,26 @@ test "A-vii-e.1 observer fast path: built on open, survive verdicts match the sl
     state.observeRegionProgramPoint(83, 2, 1, 5);
     state.observeRegionProgramPoint(83, 5, 1, 5);
     state.observeRegionProgramPoint(99, 1234, 2, 77); // deeper frame: never a departure
-    try testing.expect(state.region_profit.contains(key));
-    try testing.expectEqual(@as(u64, 0), state.region_profit_flushes);
+    try testing.expect(state.region_policy.region_profit.contains(key));
+    try testing.expectEqual(@as(u64, 0), state.region_policy.region_profit_flushes);
 
     // (3) A non-member pc closes even INSIDE the span bounds: pc 3 is in [2, 6)
     // but its bit is clear — remainder flush, cache cleared.
     state.observeRegionProgramPoint(83, 3, 1, 5);
-    try testing.expect(!state.region_profit.contains(key));
-    try testing.expect(state.observer_fast == null);
-    try testing.expectEqual(@as(u64, 1), state.region_profit_flushes);
+    try testing.expect(!state.region_policy.region_profit.contains(key));
+    try testing.expect(state.region_policy.observer_fast == null);
+    try testing.expectEqual(@as(u64, 1), state.region_policy.region_profit_flushes);
 
     // (4) Re-open, then a sibling activation at the root depth (same depth,
     // different call_seq) closes even AT a member point — the activation-identity
     // half of the predicate.
     state.setRegionContext(1, 5);
     _ = state.accountRegionProfit(exit, 3, .deferred);
-    try testing.expect(state.observer_fast != null);
+    try testing.expect(state.region_policy.observer_fast != null);
     state.observeRegionProgramPoint(83, 2, 1, 6);
-    try testing.expect(!state.region_profit.contains(key));
-    try testing.expect(state.observer_fast == null);
-    try testing.expectEqual(@as(u64, 2), state.region_profit_flushes);
+    try testing.expect(!state.region_policy.region_profit.contains(key));
+    try testing.expect(state.region_policy.observer_fast == null);
+    try testing.expectEqual(@as(u64, 2), state.region_policy.region_profit_flushes);
 
     // (5) Shallower frames (codex e.1 review, MINOR): the accumulator opened at
     // depth 3 — a MEMBER point in a shallower frame survives (call_seq may
@@ -381,12 +430,12 @@ test "A-vii-e.1 observer fast path: built on open, survive verdicts match the sl
     // shallower NON-member point is a departure and closes.
     state.setRegionContext(3, 5);
     _ = state.accountRegionProfit(exit, 3, .deferred);
-    try testing.expect(state.observer_fast != null);
+    try testing.expect(state.region_policy.observer_fast != null);
     state.observeRegionProgramPoint(83, 5, 2, 999); // member, depth 2 < 3: survives
-    try testing.expect(state.region_profit.contains(.{ .region_id = rid, .activation = 5 }));
+    try testing.expect(state.region_policy.region_profit.contains(.{ .region_id = rid, .activation = 5 }));
     state.observeRegionProgramPoint(83, 4, 2, 999); // non-member, depth 2 < 3: closes
-    try testing.expect(!state.region_profit.contains(.{ .region_id = rid, .activation = 5 }));
-    try testing.expectEqual(@as(u64, 3), state.region_profit_flushes);
+    try testing.expect(!state.region_policy.region_profit.contains(.{ .region_id = rid, .activation = 5 }));
+    try testing.expectEqual(@as(u64, 3), state.region_policy.region_profit_flushes);
 
     // (6) Multi-accumulator disables the fast path AT the funnel: opening a
     // second activation through openRegion takes count 1→2 and the refresh
@@ -394,16 +443,16 @@ test "A-vii-e.1 observer fast path: built on open, survive verdicts match the sl
     // a funnel close back to one rebuilds it for the SURVIVOR.
     state.setRegionContext(1, 5);
     _ = state.accountRegionProfit(exit, 3, .deferred);
-    try testing.expect(state.observer_fast != null);
+    try testing.expect(state.region_policy.observer_fast != null);
     state.setRegionContext(1, 78);
     _ = state.accountRegionProfit(exit, 3, .deferred);
     try testing.expectEqual(@as(usize, 2), state.regionProfitCount());
-    try testing.expect(state.observer_fast == null);
+    try testing.expect(state.region_policy.observer_fast == null);
     state.closeRegion(.{ .region_id = rid, .activation = 5 }); // count 2→1: rebuilds for 78
-    const f2 = state.observer_fast orelse return error.MissingObserverFast;
+    const f2 = state.region_policy.observer_fast orelse return error.MissingObserverFast;
     try testing.expectEqual(@as(u64, 78), f2.key.activation);
     state.closeRegion(.{ .region_id = rid, .activation = 78 });
-    try testing.expect(state.observer_fast == null);
+    try testing.expect(state.region_policy.observer_fast == null);
 }
 
 test "A-vii-e.2 observer inline cache: only survive verdicts answer inline, and the key is the whole query" {
@@ -418,7 +467,7 @@ test "A-vii-e.2 observer inline cache: only survive verdicts answer inline, and 
     var code = [_]Instr{ Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil) };
     const proto = Proto{ .id = 83, .code = &code, .name = "inline-fastpath", .num_registers = 1 };
     const rid: RegionId = @enumFromInt(11);
-    try state.region_defs.put(gpa, rid, .{
+    try state.region_policy.region_defs.put(gpa, rid, .{
         .members = try gpa.dupe(StructuralEdgeId, &.{}),
         .member_points = try gpa.dupe(ProgramPoint, &.{
             .{ .proto_id = 83, .source_pc = 2 },
@@ -428,25 +477,25 @@ test "A-vii-e.2 observer inline cache: only survive verdicts answer inline, and 
         .classifier = .{ .kind = .self_loop, .member_count = 1 },
         .armable = true,
     });
-    try state.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
+    try state.region_policy.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
     const exit: ExitKey = .{ .trace_id = 9, .exit_instr = 0 };
     const key: RegionKey = .{ .region_id = rid, .activation = 5 };
 
     state.setRegionContext(1, 5);
     _ = state.accountRegionProfit(exit, 3, .deferred);
-    try testing.expect(state.region_profit.contains(key));
+    try testing.expect(state.region_policy.region_profit.contains(key));
 
     // (1) A freshly built `observer_fast` leaves the inline cache COLD — it is
     // warmed by a survive verdict, never by the rebuild, so the first instruction
     // after any refresh always goes through the real observer.
-    try testing.expect(state.observer_fast != null);
-    try testing.expect(state.observer_hot.words == null);
+    try testing.expect(state.region_policy.observer_fast != null);
+    try testing.expect(state.region_policy.observer_hot.words == null);
     try testing.expect(!state.observeFast(83, 2, 1, 5));
 
     // (2) One slow survive verdict warms it; the identical query then answers
     // inline, as does the region's OTHER member point (same span, same key).
     state.observeRegionProgramPoint(83, 2, 1, 5);
-    try testing.expect(state.observer_hot.words != null);
+    try testing.expect(state.region_policy.observer_hot.words != null);
     try testing.expect(state.observeFast(83, 2, 1, 5));
     try testing.expect(state.observeFast(83, 5, 1, 5));
 
@@ -462,23 +511,23 @@ test "A-vii-e.2 observer inline cache: only survive verdicts answer inline, and 
     try testing.expect(!state.observeFast(83, 2, 1, 6));
     try testing.expect(!state.observeFast(83, 2, 2, 5));
     // None of those declines touched the accumulator — declining is not closing.
-    try testing.expect(state.region_profit.contains(key));
-    try testing.expectEqual(@as(u64, 0), state.region_profit_flushes);
+    try testing.expect(state.region_policy.region_profit.contains(key));
+    try testing.expectEqual(@as(u64, 0), state.region_policy.region_profit_flushes);
 
     // (4) A survive verdict answered inline must still refresh the activation
     // context, exactly as the observer's own member-hit branch does.
-    state.region_context = null;
+    state.region_policy.region_context = null;
     try testing.expect(state.observeFast(83, 5, 1, 5));
-    try testing.expectEqual(@as(u32, 1), state.region_context.?.depth);
-    try testing.expectEqual(@as(u64, 5), state.region_context.?.call_seq);
+    try testing.expectEqual(@as(u32, 1), state.region_policy.region_context.?.depth);
+    try testing.expectEqual(@as(u64, 5), state.region_policy.region_context.?.call_seq);
 
     // (5) The hot entry borrows the owning span's bitset, so it must die with it.
     // Closing the region frees those words; a stale `words` pointer here would be
     // a use-after-free on the very next instruction.
     state.observeRegionProgramPoint(83, 3, 1, 5); // non-member → close
-    try testing.expect(!state.region_profit.contains(key));
-    try testing.expect(state.observer_fast == null);
-    try testing.expect(state.observer_hot.words == null);
+    try testing.expect(!state.region_policy.region_profit.contains(key));
+    try testing.expect(state.region_policy.observer_fast == null);
+    try testing.expect(state.region_policy.observer_hot.words == null);
     try testing.expect(!state.observeFast(83, 2, 1, 5));
 
     // (6) …and so must the multi-accumulator disable: with two live accumulators
@@ -490,7 +539,7 @@ test "A-vii-e.2 observer inline cache: only survive verdicts answer inline, and 
     state.setRegionContext(1, 78);
     _ = state.accountRegionProfit(exit, 3, .deferred);
     try testing.expectEqual(@as(usize, 2), state.regionProfitCount());
-    try testing.expect(state.observer_hot.words == null);
+    try testing.expect(state.region_policy.observer_hot.words == null);
     try testing.expect(!state.observeFast(83, 2, 1, 5));
     state.closeRegion(.{ .region_id = rid, .activation = 5 });
     state.closeRegion(.{ .region_id = rid, .activation = 78 });
@@ -537,7 +586,7 @@ test "A-vii-e.2 observer inline cache: differential — the accelerated call sit
     var states: [2]TraceState = .{ TraceState.init(gpa), TraceState.init(gpa) };
     defer for (&states) |*s| s.deinit();
     for (&states, 0..) |*state, which| {
-        try state.region_defs.put(gpa, rid, .{
+        try state.region_policy.region_defs.put(gpa, rid, .{
             .members = try gpa.dupe(StructuralEdgeId, &.{}),
             .member_points = try gpa.dupe(ProgramPoint, &.{
                 .{ .proto_id = 83, .source_pc = 2 },
@@ -547,7 +596,7 @@ test "A-vii-e.2 observer inline cache: differential — the accelerated call sit
             .classifier = .{ .kind = .self_loop, .member_count = 1 },
             .armable = true,
         });
-        try state.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
+        try state.region_policy.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
         state.setRegionContext(1, 5);
         _ = state.accountRegionProfit(exit, 3, .deferred);
 
@@ -569,13 +618,13 @@ test "A-vii-e.2 observer inline cache: differential — the accelerated call sit
     }
 
     try testing.expectEqual(states[1].regionProfitCount(), states[0].regionProfitCount());
-    try testing.expectEqual(states[1].region_profit_flushes, states[0].region_profit_flushes);
-    try testing.expectEqual(states[1].region_profit_flushed_work, states[0].region_profit_flushed_work);
-    try testing.expectEqual(states[1].region_context.?.depth, states[0].region_context.?.depth);
-    try testing.expectEqual(states[1].region_context.?.call_seq, states[0].region_context.?.call_seq);
+    try testing.expectEqual(states[1].region_policy.region_profit_flushes, states[0].region_policy.region_profit_flushes);
+    try testing.expectEqual(states[1].region_policy.region_profit_flushed_work, states[0].region_policy.region_profit_flushed_work);
+    try testing.expectEqual(states[1].region_policy.region_context.?.depth, states[0].region_policy.region_context.?.depth);
+    try testing.expectEqual(states[1].region_policy.region_context.?.call_seq, states[0].region_policy.region_context.?.call_seq);
     // The stream ends on a close, and it must be the same close on both sides.
     try testing.expectEqual(@as(usize, 0), states[0].regionProfitCount());
-    try testing.expect(states[1].region_profit_flushes > 0);
+    try testing.expect(states[1].region_policy.region_profit_flushes > 0);
 }
 
 test "A-vii-e.1 observer fast path: an over-cap pc range declines the cache; the slow path still closes" {
@@ -589,7 +638,7 @@ test "A-vii-e.1 observer fast path: an over-cap pc range declines the cache; the
     var code = [_]Instr{Instr.op0(.load_nil)};
     const proto = Proto{ .id = 84, .code = &code, .name = "sparse", .num_registers = 1 };
     const rid: RegionId = @enumFromInt(12);
-    try state.region_defs.put(gpa, rid, .{
+    try state.region_policy.region_defs.put(gpa, rid, .{
         .members = try gpa.dupe(StructuralEdgeId, &.{}),
         .member_points = try gpa.dupe(ProgramPoint, &.{
             .{ .proto_id = 84, .source_pc = 0 },
@@ -599,20 +648,20 @@ test "A-vii-e.1 observer fast path: an over-cap pc range declines the cache; the
         .classifier = .{ .kind = .self_loop, .member_count = 1 },
         .armable = true,
     });
-    try state.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
+    try state.region_policy.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
     const exit: ExitKey = .{ .trace_id = 9, .exit_instr = 0 };
     const key: RegionKey = .{ .region_id = rid, .activation = 5 };
 
     state.setRegionContext(1, 5);
     _ = state.accountRegionProfit(exit, 3, .deferred);
-    try testing.expect(state.region_profit.contains(key));
-    try testing.expect(state.observer_fast == null); // declined, not mis-built
+    try testing.expect(state.region_policy.region_profit.contains(key));
+    try testing.expect(state.region_policy.observer_fast == null); // declined, not mis-built
 
     state.observeRegionProgramPoint(84, (1 << 22) + 1, 1, 5); // member via slow path: survives
-    try testing.expect(state.region_profit.contains(key));
+    try testing.expect(state.region_policy.region_profit.contains(key));
     state.observeRegionProgramPoint(84, 1, 1, 5); // non-member via slow path: closes
-    try testing.expect(!state.region_profit.contains(key));
-    try testing.expectEqual(@as(u64, 1), state.region_profit_flushes);
+    try testing.expect(!state.region_policy.region_profit.contains(key));
+    try testing.expectEqual(@as(u64, 1), state.region_policy.region_profit_flushes);
 }
 
 test "A-iv region_profit: windows persist across physical re-entry and observer closes only on departure" {
@@ -625,7 +674,7 @@ test "A-iv region_profit: windows persist across physical re-entry and observer 
     const rid: RegionId = @enumFromInt(7);
     const points = try gpa.dupe(ProgramPoint, &.{.{ .proto_id = 41, .source_pc = 0 }});
     const members = try gpa.dupe(StructuralEdgeId, &.{});
-    try state.region_defs.put(gpa, rid, .{
+    try state.region_policy.region_defs.put(gpa, rid, .{
         .members = members,
         .member_points = points,
         .owner = .{ .proto = &proto, .pc = 0 },
@@ -633,25 +682,25 @@ test "A-iv region_profit: windows persist across physical re-entry and observer 
         .armable = true,
     });
     const source_set = try gpa.dupe(RegionId, &.{rid});
-    try state.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, source_set);
+    try state.region_policy.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, source_set);
 
     state.setRegionContext(1, 99);
     _ = state.accountRegionProfit(.{ .trace_id = 9, .exit_instr = 0 }, 3, .deferred);
     try testing.expectEqual(@as(usize, 1), state.regionProfitCount());
     const key: RegionKey = .{ .region_id = rid, .activation = 99 };
-    try testing.expectEqual(@as(u64, 3), state.region_profit.get(key).?.outer_traversals);
+    try testing.expectEqual(@as(u64, 3), state.region_policy.region_profit.get(key).?.outer_traversals);
 
     // Physical retirement/re-arm does not touch region_profit: another receipt for
     // the same logical id resumes the same window and crosses N=8 exactly once.
     _ = state.accountRegionProfit(.{ .trace_id = 9, .exit_instr = 0 }, 5, .deferred);
-    try testing.expectEqual(@as(u64, 8), state.region_profit.get(key).?.outer_traversals);
-    try testing.expectEqual(@as(u64, 8), state.region_profit.get(key).?.window_base);
-    try testing.expectEqual(@as(u64, 1), state.region_profit_flushes);
+    try testing.expectEqual(@as(u64, 8), state.region_policy.region_profit.get(key).?.outer_traversals);
+    try testing.expectEqual(@as(u64, 8), state.region_policy.region_profit.get(key).?.window_base);
+    try testing.expectEqual(@as(u64, 1), state.region_policy.region_profit_flushes);
     state.observeRegionProgramPoint(41, 0, 1, 99);
     try testing.expectEqual(@as(usize, 1), state.regionProfitCount());
     state.observeRegionProgramPoint(41, 1, 1, 99);
     try testing.expectEqual(@as(usize, 0), state.regionProfitCount());
-    try testing.expectEqual(@as(u64, 1), state.region_profit_flushes); // exact-N exit: no zero remainder
+    try testing.expectEqual(@as(u64, 1), state.region_policy.region_profit_flushes); // exact-N exit: no zero remainder
 }
 
 test "A-iv region_profit: activation cleanup drops only the dying activation" {
@@ -660,13 +709,13 @@ test "A-iv region_profit: activation cleanup drops only the dying activation" {
     defer state.deinit();
     const a: RegionKey = .{ .region_id = @enumFromInt(1), .activation = 10 };
     const b: RegionKey = .{ .region_id = @enumFromInt(1), .activation = 11 };
-    try state.region_profit.put(gpa, a, .{ .outer_traversals = 2, .root_frame_depth = 1, .root_call_seq = 10 });
-    try state.region_profit.put(gpa, b, .{ .outer_traversals = 4, .root_frame_depth = 2, .root_call_seq = 11 });
+    try state.region_policy.region_profit.put(gpa, a, .{ .outer_traversals = 2, .root_frame_depth = 1, .root_call_seq = 10 });
+    try state.region_policy.region_profit.put(gpa, b, .{ .outer_traversals = 4, .root_frame_depth = 2, .root_call_seq = 11 });
     state.dropRegionActivation(11);
     try testing.expectEqual(@as(usize, 1), state.regionProfitCount());
-    try testing.expect(state.region_profit.contains(a));
-    try testing.expectEqual(@as(u64, 1), state.region_profit_flushes);
-    try testing.expectEqual(@as(u64, 4), state.region_profit_flushed_work);
+    try testing.expect(state.region_policy.region_profit.contains(a));
+    try testing.expectEqual(@as(u64, 1), state.region_policy.region_profit_flushes);
+    try testing.expectEqual(@as(u64, 4), state.region_policy.region_profit_flushed_work);
 }
 
 test "A-iv region_profit: same-activation owner collision flushes old before replacement" {
@@ -678,7 +727,7 @@ test "A-iv region_profit: same-activation owner collision flushes old before rep
     const r1: RegionId = @enumFromInt(1);
     const r2: RegionId = @enumFromInt(2);
     inline for (.{ r1, r2 }) |rid| {
-        try state.region_defs.put(gpa, rid, .{
+        try state.region_policy.region_defs.put(gpa, rid, .{
             .members = try gpa.dupe(StructuralEdgeId, &.{}),
             .member_points = try gpa.dupe(ProgramPoint, &.{.{ .proto_id = 55, .source_pc = 0 }}),
             .owner = .{ .proto = &proto, .pc = 0 },
@@ -688,12 +737,12 @@ test "A-iv region_profit: same-activation owner collision flushes old before rep
     }
     const ctx: RegionContext = .{ .depth = 1, .call_seq = 77 };
     const old = state.openRegion(r1, ctx).?;
-    state.region_profit.getPtr(old).?.outer_traversals = 3;
+    state.region_policy.region_profit.getPtr(old).?.outer_traversals = 3;
     _ = state.openRegion(r2, ctx).?; // direct H-3 collision/replacement path
     try testing.expectEqual(@as(usize, 1), state.regionProfitCount());
-    try testing.expect(state.region_profit.contains(.{ .region_id = r2, .activation = 77 }));
-    try testing.expectEqual(@as(u64, 1), state.region_profit_flushes);
-    try testing.expectEqual(@as(u64, 3), state.region_profit_flushed_work);
+    try testing.expect(state.region_policy.region_profit.contains(.{ .region_id = r2, .activation = 77 }));
+    try testing.expectEqual(@as(u64, 1), state.region_policy.region_profit_flushes);
+    try testing.expectEqual(@as(u64, 3), state.region_policy.region_profit_flushed_work);
 }
 
 // ---------------------------------------------------------------------------
@@ -707,15 +756,24 @@ test "doc 33: entry refusals neither strike nor gate the anchor" {
 
     var code = [_]Instr{Instr.op0(.load_nil)};
     const proto = Proto{ .code = &code, .name = "refusal", .num_registers = 1 };
-    var t: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var t: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 0 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 1,
+    };
 
     var i: u32 = 0;
     while (i < state.config.max_entry_refusals) : (i += 1)
         state.onSideExit(&t, 0, .entry_refusal);
 
     try testing.expectEqual(state.config.max_entry_refusals, t.consec_refusals);
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(t.anchor));
-    try testing.expect(!state.isGated(t.anchor));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(t.code.anchor));
+    try testing.expect(!state.isGated(t.code.anchor));
 }
 
 test "doc 33: an entry refusal does not clear an existing strike" {
@@ -725,15 +783,24 @@ test "doc 33: an entry refusal does not clear an existing strike" {
 
     var code = [_]Instr{Instr.op0(.load_nil)};
     const proto = Proto{ .code = &code, .name = "no-clear", .num_registers = 1 };
-    var t: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var t: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 0 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 1,
+    };
 
     state.onSideExit(&t, 0, .entered);
     state.onSideExit(&t, 0, .entered);
-    const before = state.penalty.get(t.anchor).?;
+    const before = state.penalty.get(t.code.anchor).?;
     state.onSideExit(&t, 0, .entry_refusal);
 
     try testing.expectEqual(@as(u32, 2), before);
-    try testing.expectEqual(before, state.penalty.get(t.anchor).?);
+    try testing.expectEqual(before, state.penalty.get(t.code.anchor).?);
     try testing.expectEqual(@as(u32, 1), t.consec_refusals);
 }
 
@@ -744,7 +811,16 @@ test "doc 33: alternating deopts and refusals gate on deopts alone" {
 
     var code = [_]Instr{Instr.op0(.load_nil)};
     const proto = Proto{ .code = &code, .name = "alternate", .num_registers = 1 };
-    var t: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var t: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 0 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 1,
+    };
 
     var i: u32 = 0;
     while (i < state.config.max_penalty) : (i += 1) {
@@ -752,8 +828,8 @@ test "doc 33: alternating deopts and refusals gate on deopts alone" {
         state.onSideExit(&t, 0, .entry_refusal);
     }
 
-    try testing.expectEqual(state.config.max_penalty, state.penalty.get(t.anchor).?);
-    try testing.expect(state.isGated(t.anchor));
+    try testing.expectEqual(state.config.max_penalty, state.penalty.get(t.code.anchor).?);
+    try testing.expect(state.isGated(t.code.anchor));
 }
 
 test "doc 33: max consecutive refusals are tracked but do not suppress selection" {
@@ -763,9 +839,15 @@ test "doc 33: max consecutive refusals are tracked but do not suppress selection
 
     var code = [_]Instr{Instr.op0(.load_nil)};
     const proto = Proto{ .code = &code, .name = "suppress", .num_registers = 1 };
-    var refused: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .hit_count = 10 };
-    try state.cache.append(gpa, &refused);
-    defer state.cache.clearRetainingCapacity();
+    var refused: Trace = .{ .code = .{
+        .anchor = .{ .proto = &proto, .pc = 0 },
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    }, .id = 1, .hit_count = 10 };
+    try state.registry.cache.append(gpa, &refused);
+    defer state.registry.cache.clearRetainingCapacity();
 
     var i: u32 = 0;
     while (i < state.config.max_entry_refusals) : (i += 1)
@@ -775,7 +857,7 @@ test "doc 33: max consecutive refusals are tracked but do not suppress selection
     // would deadlock (a skipped trace can never reset its counter).
     try testing.expect(refused.consec_refusals >= state.config.max_entry_refusals);
     try testing.expectEqual(&refused, state.findTrace(&proto, 0).?);
-    try testing.expect(!state.isGated(refused.anchor));
+    try testing.expect(!state.isGated(refused.code.anchor));
 }
 
 test "doc 33: a body entry resets the refusal streak" {
@@ -785,7 +867,16 @@ test "doc 33: a body entry resets the refusal streak" {
 
     var code = [_]Instr{Instr.op0(.load_nil)};
     const proto = Proto{ .code = &code, .name = "reset", .num_registers = 1 };
-    var t: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var t: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 0 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 1,
+    };
 
     var i: u32 = 0;
     while (i < state.config.max_entry_refusals - 1) : (i += 1)
@@ -806,11 +897,23 @@ test "doc 33: a maxed refusal counter does not suppress the candidate from selec
     // A trace with a maxed refusal counter is still selectable — suppression
     // deadlocks (a skipped trace can never be entered, so the counter can
     // never reset). The counter is observational, not a gate.
-    var refused: Trace = .{ .id = 1, .anchor = anchor, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .hit_count = 100, .consec_refusals = state.config.max_entry_refusals };
-    var sibling: Trace = .{ .id = 2, .anchor = anchor, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .hit_count = 1 };
-    try state.cache.append(gpa, &refused);
-    try state.cache.append(gpa, &sibling);
-    defer state.cache.clearRetainingCapacity();
+    var refused: Trace = .{ .code = .{
+        .anchor = anchor,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    }, .id = 1, .hit_count = 100, .consec_refusals = state.config.max_entry_refusals };
+    var sibling: Trace = .{ .code = .{
+        .anchor = anchor,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    }, .id = 2, .hit_count = 1 };
+    try state.registry.cache.append(gpa, &refused);
+    try state.registry.cache.append(gpa, &sibling);
+    defer state.registry.cache.clearRetainingCapacity();
 
     // findTrace returns the highest-hit candidate; the maxed counter does not
     // exclude it. Both candidates remain eligible, and the anchor is not gated.
@@ -832,8 +935,17 @@ test "doc 31 D2: any productive receipt clears the strike; only consecutive zero
 
     var code = [_]Instr{ Instr.op0(.load_nil), Instr.op0(.load_nil) };
     const proto = Proto{ .code = &code, .name = "t", .num_registers = 1 };
-    var t: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
-    const key = t.anchor;
+    var t: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 0 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 1,
+    };
+    const key = t.code.anchor;
 
     // The str_gmatch ratchet shape: productive receipts BELOW min_useful
     // (7-token instances) with an isolated designed-exit zero (exhaustion,

@@ -121,8 +121,8 @@ fn traceInstrCount(gpa: std.mem.Allocator, source: [:0]const u8, optimize: bool)
     defer chunk.deinit();
     _ = try vm.run(chunk.proto);
 
-    if (vm.trace.cache.items.len == 0) return 0;
-    return vm.trace.cache.items[0].instrs.len;
+    if (vm.trace.registry.cache.items.len == 0) return 0;
+    return vm.trace.registry.cache.items[0].instrs.len;
 }
 
 fn ms(ns: u64) f64 {

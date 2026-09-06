@@ -16,6 +16,7 @@ const tropt = @import("tropt.zig");
 const execlog = @import("execlog.zig");
 const nativegen = @import("nativegen.zig");
 const irinterp = @import("irinterp.zig");
+const trace_exec = @import("trace_exec.zig");
 const jitdbg = @import("jitdbg.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
@@ -48,7 +49,7 @@ test "B-2a provenance edge storage retires endpoints, condemns parents, and clea
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity(); // stack-backed traces
+    defer state.registry.cache.clearRetainingCapacity(); // stack-backed traces
 
     try state.provenance_edges.append(gpa, .{ .parent_id = 1, .exit_instr = 10, .child_id = 2 });
     try state.provenance_edges.append(gpa, .{ .parent_id = 3, .exit_instr = 11, .child_id = 1, .strikes = 2 });
@@ -64,27 +65,31 @@ test "B-2a provenance edge storage retires endpoints, condemns parents, and clea
 
     const proto = Proto{ .code = &.{}, .name = "provenance-lifecycle", .num_registers = 0 };
     var condemned_parent: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 20 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 7,
-        .anchor = .{ .proto = &proto, .pc = 20 },
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
     };
     var surviving_parent: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 30 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 9,
-        .anchor = .{ .proto = &proto, .pc = 30 },
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
     };
-    try state.cache.append(gpa, &condemned_parent);
-    try state.cache.append(gpa, &surviving_parent);
+    try state.registry.cache.append(gpa, &condemned_parent);
+    try state.registry.cache.append(gpa, &surviving_parent);
     try state.provenance_edges.append(gpa, .{ .parent_id = 7, .exit_instr = 14, .child_id = 8 });
     try state.provenance_edges.append(gpa, .{ .parent_id = 9, .exit_instr = 15, .child_id = 10 });
 
-    state.condemnProvenanceEdgesAt(condemned_parent.anchor);
+    state.condemnProvenanceEdgesAt(condemned_parent.code.anchor);
     try testing.expectEqual(@as(usize, 1), state.provenance_edges.items.len);
     try testing.expectEqual(@as(u32, 9), state.provenance_edges.items[0].parent_id);
 
@@ -96,40 +101,45 @@ test "B-2b commit provenance creates same-anchor edge, skips null/cross-anchor, 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity();
+    defer state.registry.cache.clearRetainingCapacity();
 
     const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "commit-provenance", .num_registers = 1 };
     var parent_instrs = [_]IrInstr{ .{ .op = .guard_true, .aux = 1 }, .{ .op = .loop } };
     var counts = [_]u8{ 7, 0 };
     var parent: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 4 },
+            .instrs = &parent_instrs,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 51,
-        .anchor = .{ .proto = &proto, .pc = 4 },
-        .instrs = &parent_instrs,
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
         .exit_counts = &counts,
     };
     var child: Trace = .{
+        .code = .{
+            .anchor = parent.code.anchor,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 52,
-        .anchor = parent.anchor,
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
     };
     var cross: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 9 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 53,
-        .anchor = .{ .proto = &proto, .pc = 9 },
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
     };
-    for ([_]*Trace{ &parent, &child, &cross }) |t| try state.cache.append(gpa, t);
+    for ([_]*Trace{ &parent, &child, &cross }) |t| try state.registry.cache.append(gpa, t);
 
-    state.rec.side_src = .{ .trace_id = parent.id, .exit_instr = 0 };
-    state.finishSideTraceProvenance(&child);
+    state.finishSideTraceProvenance(&child, .{ .trace_id = parent.id, .exit_instr = 0 });
     try testing.expectEqual(@as(usize, 1), state.provenance_edges.items.len);
     try testing.expectEqual(parent.id, state.provenance_edges.items[0].parent_id);
     try testing.expectEqual(child.id, state.provenance_edges.items[0].child_id);
@@ -137,13 +147,12 @@ test "B-2b commit provenance creates same-anchor edge, skips null/cross-anchor, 
     try testing.expectEqual(@as(?ExitKey, null), state.rec.side_src);
 
     // No source is a strict no-op.
-    state.finishSideTraceProvenance(&child);
+    state.finishSideTraceProvenance(&child, null);
     try testing.expectEqual(@as(usize, 1), state.provenance_edges.items.len);
 
     // Cross-anchor side traces keep Pall's historical DONE latch but never arm.
     counts[0] = 8;
-    state.rec.side_src = .{ .trace_id = parent.id, .exit_instr = 0 };
-    state.finishSideTraceProvenance(&cross);
+    state.finishSideTraceProvenance(&cross, .{ .trace_id = parent.id, .exit_instr = 0 });
     try testing.expectEqual(@as(usize, 1), state.provenance_edges.items.len);
     try testing.expectEqual(Trace.EXIT_COUNT_DONE, counts[0]);
 }
@@ -155,22 +164,36 @@ test "B-2b commit provenance OOM does not latch DONE" {
     defer {
         fa.fail_index = std.math.maxInt(usize);
         fa.resize_fail_index = std.math.maxInt(usize);
-        state.cache.clearRetainingCapacity();
+        state.registry.cache.clearRetainingCapacity();
         state.deinit();
     }
 
     const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "commit-provenance-oom", .num_registers = 1 };
     var parent_instrs = [_]IrInstr{ .{ .op = .guard_true, .aux = 1 }, .{ .op = .loop } };
     var counts = [_]u8{ 9, 0 };
-    var parent: Trace = .{ .id = 61, .anchor = .{ .proto = &proto, .pc = 4 }, .instrs = &parent_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_counts = &counts };
-    var child: Trace = .{ .id = 62, .anchor = parent.anchor, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
-    try state.cache.append(gpa, &parent);
-    try state.cache.append(gpa, &child);
-    state.rec.side_src = .{ .trace_id = parent.id, .exit_instr = 0 };
+    var parent: Trace = .{ .code = .{
+        .anchor = .{ .proto = &proto, .pc = 4 },
+        .instrs = &parent_instrs,
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    }, .id = 61, .exit_counts = &counts };
+    var child: Trace = .{
+        .code = .{
+            .anchor = parent.code.anchor,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 62,
+    };
+    try state.registry.cache.append(gpa, &parent);
+    try state.registry.cache.append(gpa, &child);
     fa.fail_index = fa.alloc_index;
     fa.resize_fail_index = fa.resize_index;
 
-    state.finishSideTraceProvenance(&child);
+    state.finishSideTraceProvenance(&child, .{ .trace_id = parent.id, .exit_instr = 0 });
     try testing.expectEqual(@as(usize, 0), state.provenance_edges.items.len);
     try testing.expectEqual(@as(u8, 9), counts[0]);
     try testing.expectEqual(@as(?ExitKey, null), state.rec.side_src);
@@ -180,20 +203,23 @@ test "B-2b provenance drain arms compiled children, deletes unsupported edges, p
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity();
+    defer state.registry.cache.clearRetainingCapacity();
 
     const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "provenance-drain", .num_registers = 1 };
     var parent_instrs = [_]IrInstr{ .{ .op = .guard_true, .aux = 1 }, .{ .op = .loop } };
     const slots = try gpa.alloc(usize, parent_instrs.len);
     defer gpa.free(slots);
+    defer state.disarmAllLinks(); // registry borrows fixture slot storage
     @memset(slots, 0);
     var parent: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 4 },
+            .instrs = &parent_instrs,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 71,
-        .anchor = .{ .proto = &proto, .pc = 4 },
-        .instrs = &parent_instrs,
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
         .native = .{ .compiled = .{ .page = undefined, .slots = slots, .gpa = gpa } },
         .sibling_watch_exit = 0,
         .sibling_watch_count = 4,
@@ -203,18 +229,30 @@ test "B-2b provenance drain arms compiled children, deletes unsupported edges, p
     // compiled by the drain itself the first safe time it's seen; a child whose
     // compilation fails caches `.unsupported` and the edge is deleted per
     // §B.6(5) — covered below via `child_bad`).
-    var child: Trace = .{ .id = 72, .anchor = parent.anchor, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .ordinary_entry = 0xB2B2 } } };
-    var child_bad: Trace = .{ .id = 73, .anchor = parent.anchor, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .native = .unsupported };
-    try state.cache.append(gpa, &parent);
-    try state.cache.append(gpa, &child);
-    try state.cache.append(gpa, &child_bad);
+    var child: Trace = .{ .code = .{
+        .anchor = parent.code.anchor,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    }, .id = 72, .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .ordinary_entry = 0xB2B2 } } };
+    var child_bad: Trace = .{ .code = .{
+        .anchor = parent.code.anchor,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    }, .id = 73, .native = .unsupported };
+    try state.registry.cache.append(gpa, &parent);
+    try state.registry.cache.append(gpa, &child);
+    try state.registry.cache.append(gpa, &child_bad);
     try state.provenance_edges.append(gpa, .{ .parent_id = parent.id, .exit_instr = 0, .child_id = child.id });
     try state.provenance_edges.append(gpa, .{ .parent_id = parent.id, .exit_instr = 0, .child_id = child_bad.id });
     state.provenance_arms_pending = true; // finishSideTraceProvenance sets this on append
 
     state.drainProvenanceArms(false);
     try testing.expectEqual(@as(usize, 2), state.provenance_edges.items.len);
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
 
     // Safe drain: the compiled child arms; the unsupported child's edge is
     // deleted (never rescan a permanently-unsupported child) while the armed
@@ -222,8 +260,8 @@ test "B-2b provenance drain arms compiled children, deletes unsupported edges, p
     state.drainProvenanceArms(true);
     try testing.expectEqual(@as(usize, 1), state.provenance_edges.items.len);
     try testing.expectEqual(child.id, state.provenance_edges.items[0].child_id);
-    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
-    try testing.expectEqual(ArmKind.sibling_handoff, state.armed_links.items[0].kind);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.armed_links.items.len);
+    try testing.expectEqual(ArmKind.sibling_handoff, state.registry.native_physical.armed_links.items[0].kind);
     try testing.expectEqual(@as(usize, 0xB2B2), slots[0]);
     try testing.expectEqual(@as(u32, 1), parent.sibling_arms);
     try testing.expectEqual(std.math.maxInt(u32), parent.sibling_watch_exit);
@@ -240,20 +278,38 @@ test "B-2b region low-yield condemnation deletes only the owner provenance" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity();
+    defer state.registry.cache.clearRetainingCapacity();
     state.config.max_penalty = 1;
 
     const proto = Proto{ .code = &.{}, .name = "provenance-condemn", .num_registers = 0 };
     const owner = AnchorKey{ .proto = &proto, .pc = 10 };
-    var p1: Trace = .{ .id = 81, .anchor = owner, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
-    var p2: Trace = .{ .id = 82, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
-    try state.cache.append(gpa, &p1);
-    try state.cache.append(gpa, &p2);
+    var p1: Trace = .{
+        .code = .{
+            .anchor = owner,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 81,
+    };
+    var p2: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 20 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 82,
+    };
+    try state.registry.cache.append(gpa, &p1);
+    try state.registry.cache.append(gpa, &p2);
     try state.provenance_edges.append(gpa, .{ .parent_id = p1.id, .exit_instr = 0, .child_id = 91 });
     try state.provenance_edges.append(gpa, .{ .parent_id = p2.id, .exit_instr = 0, .child_id = 92 });
 
     const rid: RegionId = @enumFromInt(700);
-    try state.region_defs.put(gpa, rid, .{
+    try state.region_policy.region_defs.put(gpa, rid, .{
         .members = try gpa.alloc(StructuralEdgeId, 0),
         .member_points = try gpa.alloc(ProgramPoint, 0),
         .owner = owner,
@@ -270,37 +326,43 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity();
+    defer state.registry.cache.clearRetainingCapacity();
 
     const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "provenance-cycle", .num_registers = 1 };
     var p_instrs = [_]IrInstr{ .{ .op = .guard_true, .aux = 1 }, .{ .op = .loop } };
     var c_instrs = [_]IrInstr{ .{ .op = .guard_false, .aux = 1 }, .{ .op = .loop } };
     const p_slots = try gpa.alloc(usize, p_instrs.len);
     defer gpa.free(p_slots);
+    defer state.disarmAllLinks(); // registry borrows fixture slot storage
     @memset(p_slots, 0);
     const c_slots = try gpa.alloc(usize, c_instrs.len);
     defer gpa.free(c_slots);
+    defer state.disarmAllLinks(); // registry borrows fixture slot storage
     @memset(c_slots, 0);
     var parent: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 4 },
+            .instrs = &p_instrs,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 101,
-        .anchor = .{ .proto = &proto, .pc = 4 },
-        .instrs = &p_instrs,
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
         .native = .{ .compiled = .{ .page = undefined, .slots = p_slots, .gpa = gpa, .ordinary_entry = 0xA101 } },
     };
     var child: Trace = .{
+        .code = .{
+            .anchor = parent.code.anchor,
+            .instrs = &c_instrs,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 102,
-        .anchor = parent.anchor,
-        .instrs = &c_instrs,
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
         .native = .{ .compiled = .{ .page = undefined, .slots = c_slots, .gpa = gpa, .ordinary_entry = 0xA102 } },
     };
-    try state.cache.append(gpa, &parent);
-    try state.cache.append(gpa, &child);
+    try state.registry.cache.append(gpa, &parent);
+    try state.registry.cache.append(gpa, &child);
     try state.provenance_edges.append(gpa, .{ .parent_id = parent.id, .exit_instr = 0, .child_id = child.id, .strikes = 1 });
     try testing.expect(state.publishSiblingArm(&parent, 0, &child));
     try testing.expect(state.publishSiblingArm(&child, 0, &parent));
@@ -308,7 +370,7 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     var regs = TestRegs{ .regs = &regs_buf };
 
     // One-way prologue failure proves no completed alternation: no strike/reset.
-    const prologue = [_]irinterp.LedgerEntry{
+    const prologue = [_]trace_exec.LedgerEntry{
         .{ .cum = 0, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 0, .id = child.id, .exit = std.math.maxInt(u32), .reason = .prologue_fail, .kind = .prologue_fail, .outcome = .normal },
     };
@@ -316,7 +378,7 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     try testing.expectEqual(@as(u8, 1), state.provenance_edges.items[0].strikes);
 
     // The relation fired and later service advanced cum: reset strikes to zero.
-    const productive = [_]irinterp.LedgerEntry{
+    const productive = [_]trace_exec.LedgerEntry{
         .{ .cum = 0, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 1, .id = child.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 1, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
@@ -327,12 +389,12 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     // A reporting suffix begins after the suppressed prefix's cumulative count,
     // not at zero. With cum already at one this closed zero-progress alternation
     // is a strike; a zero baseline would misclassify row 0 as productive.
-    const suffix_zero_cycle = [_]irinterp.LedgerEntry{
+    const suffix_zero_cycle = [_]trace_exec.LedgerEntry{
         .{ .cum = 1, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 1, .id = child.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 1, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
     };
-    var suffix_verdicts: [irinterp.LEDGER_CAP]ProvenanceVerdict = undefined;
+    var suffix_verdicts: [trace_exec.LEDGER_CAP]ProvenanceVerdict = undefined;
     try testing.expectEqual(@as(usize, 1), state.captureProvenanceVerdicts(&suffix_zero_cycle, 1, &suffix_verdicts));
     try testing.expectEqual(.strike, suffix_verdicts[0].action);
     try testing.expectEqual(@as(usize, 1), state.captureProvenanceVerdicts(&suffix_zero_cycle, 0, &suffix_verdicts));
@@ -344,7 +406,7 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
         .kind = .deopt,
         .child = &child,
         .arm_kind = .sibling_handoff,
-        .resume_pc = child.anchor.pc,
+        .resume_pc = child.code.anchor.pc,
     };
 
     // Every internal native origin uses the same ordinary-vs-silent capture
@@ -356,12 +418,12 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
         .inner_call,
         .continuation_call,
     };
-    const origin_productive = [_]irinterp.LedgerEntry{
+    const origin_productive = [_]trace_exec.LedgerEntry{
         .{ .cum = 0, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 1, .id = child.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 1, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
     };
-    const origin_zero = [_]irinterp.LedgerEntry{
+    const origin_zero = [_]trace_exec.LedgerEntry{
         .{ .cum = 0, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 0, .id = child.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 0, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
@@ -414,12 +476,12 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
 
     // (i) Followed, then child exits without progress or return: both streams
     // produce no verdict and preserve the old strikes.
-    const incomplete = [_]irinterp.LedgerEntry{
+    const incomplete = [_]trace_exec.LedgerEntry{
         .{ .cum = 0, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 0, .id = child.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
     };
     state.provenance_edges.items[0].strikes = 2;
-    var reporting_verdicts: [irinterp.LEDGER_CAP]ProvenanceVerdict = undefined;
+    var reporting_verdicts: [trace_exec.LEDGER_CAP]ProvenanceVerdict = undefined;
     const reporting_incomplete_len = state.captureProvenanceVerdicts(&incomplete, 0, &reporting_verdicts);
     state.applyProvenanceVerdicts(reporting_verdicts[0..reporting_incomplete_len]);
     const reporting_incomplete_strikes = state.provenance_edges.items[0].strikes;
@@ -428,7 +490,7 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     state.ledger_scratch[0] = incomplete[1];
     var merged: [TraceState.PROVENANCE_VERDICT_CAP]ProvenanceVerdict = undefined;
     try testing.expectEqual(
-        TraceState.PROMOTED_SET_CAP + irinterp.LEDGER_CAP,
+        TraceState.PROMOTED_SET_CAP + trace_exec.LEDGER_CAP,
         state.silent_provenance.len,
     );
     var merged_len = state.captureSilentSuffixProvenance(.{
@@ -444,7 +506,7 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     // Productivity before the sibling firing is unrelated: reporting starts
     // this edge's progress interval at P→C and remains neutral when C exits
     // without progress or a return to P.
-    const earlier_productive = [_]irinterp.LedgerEntry{
+    const earlier_productive = [_]trace_exec.LedgerEntry{
         .{ .cum = 1, .id = child.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 1, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 1, .id = child.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
@@ -495,14 +557,16 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     // though the four-edge revolution has not completed. The frozen phase
     // distance must reproduce that weaker trace-id return condition.
     var x: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 8 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 103,
-        .anchor = .{ .proto = &proto, .pc = 8 },
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
     };
-    const repeated_parent_rows = [_]irinterp.LedgerEntry{
+    const repeated_parent_rows = [_]trace_exec.LedgerEntry{
         .{ .cum = 0, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 0, .id = child.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 0, .id = parent.id, .exit = 1, .reason = .normal, .kind = .deopt, .outcome = .normal },
@@ -526,14 +590,14 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     // the arrival evidence the ring's return distance used to reconstruct.
     var fab_edges = [_]PromotedEdge{
         silent_edge,
-        .{ .parent = &parent, .exit = 1, .kind = .deopt, .child = &x, .arm_kind = .ordinary_guard, .resume_pc = x.anchor.pc },
+        .{ .parent = &parent, .exit = 1, .kind = .deopt, .child = &x, .arm_kind = .ordinary_guard, .resume_pc = x.code.anchor.pc },
     };
     var fab_summary = [_]nativegen.SilentSummaryCell{
         .{ .region_work = 0, .selection_work = 0, .qualifying_rows = 0, .productive_firings = 0, .last_local = 0, .last_productive_ordinal = 0, .firings = 1, .last_ordinal = 1 },
         .{ .region_work = 0, .selection_work = 0, .qualifying_rows = 0, .productive_firings = 0, .last_local = 0, .last_productive_ordinal = 0, .firings = 1, .last_ordinal = 3 },
     };
     var fab_metadata: [2]nativegen.SilentExitMetadata = undefined;
-    try state.promoted_sets.append(gpa, .{
+    try state.registry.native_physical.promoted_sets.append(gpa, .{
         .edges = &fab_edges,
         .summary = &fab_summary,
         .metadata = &fab_metadata,
@@ -555,12 +619,12 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     // Suffix disjunct + R4 arrival ownership: a suffix row owned by P counts as
     // a return, and a `.prologue_fail` row's owner is `row.id` — the trace whose
     // prologue failed — exactly as `captureProvenanceVerdicts` scans it.
-    const suffix_arrival = [_]irinterp.LedgerEntry{
+    const suffix_arrival = [_]trace_exec.LedgerEntry{
         .{ .cum = 0, .id = parent.id, .exit = 0, .reason = .normal, .kind = .prologue_fail, .outcome = .normal },
     };
     const suffix_evidence = state.silentSiblingEvidence(fab_summary[1], 1, 0, parent.id, &suffix_arrival);
     try testing.expect(suffix_evidence.returned_to_parent);
-    _ = state.promoted_sets.pop();
+    _ = state.registry.native_physical.promoted_sets.pop();
     state.provenance_edges.items[0].strikes = 0;
     state.stageSilentSiblingProvenance(
         silent_edge,
@@ -583,7 +647,7 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     try testing.expectEqual(reporting_incomplete_strikes, state.provenance_edges.items[0].strikes);
 
     // (iii) A complete zero-progress revolution returns to P and strikes once.
-    const zero_revolution = [_]irinterp.LedgerEntry{
+    const zero_revolution = [_]trace_exec.LedgerEntry{
         .{ .cum = 0, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 0, .id = child.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 0, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
@@ -599,7 +663,7 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     try testing.expectEqual(reporting_zero_strikes, state.provenance_edges.items[0].strikes);
 
     // (iv) Productive prefix dominates a suffix-local strike for the same edge.
-    const productive_whole_call = [_]irinterp.LedgerEntry{
+    const productive_whole_call = [_]trace_exec.LedgerEntry{
         .{ .cum = 1, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 1, .id = child.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 1, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
@@ -626,7 +690,7 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     // P→C, an intervening child row, then P again at unchanged cum: one strike
     // per complete burst, applied only after replay. The third retires relation
     // and exact physical P→C arm; the reverse Part-S arm remains live.
-    const zero_cycle = [_]irinterp.LedgerEntry{
+    const zero_cycle = [_]trace_exec.LedgerEntry{
         .{ .cum = 0, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 0, .id = child.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 0, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
@@ -645,7 +709,7 @@ test "B-2b local-positive provenance handoff replays child-only cursor and charg
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity();
+    defer state.registry.cache.clearRetainingCapacity();
     state.config.min_useful = 5;
 
     const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "provenance-local", .num_registers = 1 };
@@ -653,32 +717,45 @@ test "B-2b local-positive provenance handoff replays child-only cursor and charg
     var c_instrs = [_]IrInstr{ .{ .op = .guard_false, .aux = 1 }, .{ .op = .loop } };
     const p_slots = try gpa.alloc(usize, p_instrs.len);
     defer gpa.free(p_slots);
+    defer state.disarmAllLinks(); // registry borrows fixture slot storage
     @memset(p_slots, 0);
-    var parent: Trace = .{ .id = 111, .anchor = .{ .proto = &proto, .pc = 4 }, .instrs = &p_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .native = .{ .compiled = .{ .page = undefined, .slots = p_slots, .gpa = gpa, .ordinary_entry = 0xB111 } } };
-    var child: Trace = .{ .id = 112, .anchor = parent.anchor, .instrs = &c_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .ordinary_entry = 0xB112 } } };
-    try state.cache.append(gpa, &parent);
-    try state.cache.append(gpa, &child);
+    var parent: Trace = .{ .code = .{
+        .anchor = .{ .proto = &proto, .pc = 4 },
+        .instrs = &p_instrs,
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    }, .id = 111, .native = .{ .compiled = .{ .page = undefined, .slots = p_slots, .gpa = gpa, .ordinary_entry = 0xB111 } } };
+    var child: Trace = .{ .code = .{
+        .anchor = parent.code.anchor,
+        .instrs = &c_instrs,
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    }, .id = 112, .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .ordinary_entry = 0xB112 } } };
+    try state.registry.cache.append(gpa, &parent);
+    try state.registry.cache.append(gpa, &child);
     try state.provenance_edges.append(gpa, .{ .parent_id = parent.id, .exit_instr = 0, .child_id = child.id });
     try testing.expect(state.publishSiblingArm(&parent, 0, &child));
     var regs_buf = [_]Value{Value.int(0)};
     var regs = TestRegs{ .regs = &regs_buf };
 
-    const prologue = [_]irinterp.LedgerEntry{
+    const prologue = [_]trace_exec.LedgerEntry{
         .{ .cum = 5, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 5, .id = child.id, .exit = std.math.maxInt(u32), .reason = .prologue_fail, .kind = .prologue_fail, .outcome = .normal },
     };
     const r1 = state.driveDispatcherLedger(&parent, &prologue, &proto, regs.view(), true);
     try testing.expectEqual(@as(usize, 0), r1.completed);
-    try testing.expectEqual(@as(?u32, parent.anchor.pc), r1.resume_pc);
+    try testing.expectEqual(@as(?u32, parent.code.anchor.pc), r1.resume_pc);
     try testing.expectEqual(@as(u64, 1), parent.hit_count); // parent's local=5 charged
 
-    const child_deopt = [_]irinterp.LedgerEntry{
+    const child_deopt = [_]trace_exec.LedgerEntry{
         .{ .cum = 5, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
         .{ .cum = 5, .id = child.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
     };
     const r2 = state.driveDispatcherLedger(&parent, &child_deopt, &proto, regs.view(), true);
     try testing.expectEqual(@as(usize, 0), r2.completed);
-    try testing.expectEqual(@as(?u32, parent.anchor.pc), r2.resume_pc);
+    try testing.expectEqual(@as(?u32, parent.code.anchor.pc), r2.resume_pc);
     try testing.expectEqual(@as(u64, 2), parent.hit_count);
 }
 
@@ -690,79 +767,89 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
     // No trampoline is built in this unit test, so the value a reset restores
     // (the "unarmed" slot) is `trampoline_exit orelse 0` == 0.
     const SHARED_EXIT: usize = 0;
-    try testing.expectEqual(@as(?usize, null), state.mcode_arena.trampoline_exit);
+    try testing.expectEqual(@as(?usize, null), state.registry.mcode_arena.trampoline_exit);
 
     // Two compiled-trace stubs. Only `.slots` is touched by the registry, so the
     // `.page` may stay undefined and we never call `destroy` on these.
     const parent_slots = try gpa.alloc(usize, 3);
     defer gpa.free(parent_slots);
+    defer state.disarmAllLinks(); // registry borrows fixture slot storage
     @memset(parent_slots, SHARED_EXIT);
     const child_slots = try gpa.alloc(usize, 1);
     defer gpa.free(child_slots);
+    defer state.disarmAllLinks(); // registry borrows fixture slot storage
     @memset(child_slots, SHARED_EXIT);
 
     var parent: Trace = .{
-        .anchor = undefined,
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
+        .code = .{
+            .anchor = undefined,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .native = .{ .compiled = .{ .page = undefined, .slots = parent_slots, .gpa = gpa } },
     };
     var child: Trace = .{
-        .anchor = undefined,
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
+        .code = .{
+            .anchor = undefined,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .native = .{ .compiled = .{ .page = undefined, .slots = child_slots, .gpa = gpa, .linked_entry = 0xDEAD_BEEF } },
     };
     const CHILD_BODY: usize = 0xDEAD_BEEF;
     const CHILD_BODY2: usize = 0xF00D;
     var child2: Trace = .{
-        .anchor = undefined,
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
+        .code = .{
+            .anchor = undefined,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .linked_entry = CHILD_BODY2 } },
     };
 
     // Arm: slot 1 of parent points at the child body; exactly one record tracked.
     try testing.expect(try state.armNativeLink(&parent, 1, &child, .link_terminal));
     try testing.expectEqual(CHILD_BODY, parent_slots[1]);
-    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.armed_links.items.len);
 
     // Re-arming the SAME slot supersedes the prior record IN PLACE (no duplicate,
     // no realloc — the record count stays 1 and the new target is written).
     try testing.expect(try state.armNativeLink(&parent, 1, &child2, .link_terminal));
     try testing.expectEqual(CHILD_BODY2, parent_slots[1]);
-    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.armed_links.items.len);
 
     // Retiring the superseded child does not touch the re-armed slot.
     state.resetLinksTouching(&child);
     try testing.expectEqual(CHILD_BODY2, parent_slots[1]);
-    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.armed_links.items.len);
     // Current child retires (target side): parent resets and the record is dropped.
     state.resetLinksTouching(&child2);
     try testing.expectEqual(SHARED_EXIT, parent_slots[1]);
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
 
     // Out-of-range slot index is a no-op → returns false, no OOB write, no record.
     try testing.expect(!try state.armNativeLink(&parent, 99, &child, .link_terminal));
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
 
     // A non-compiled parent is a no-op → returns false.
     var unsup: Trace = .{
-        .anchor = undefined,
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
+        .code = .{
+            .anchor = undefined,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .native = .unsupported,
     };
     try testing.expect(!try state.armNativeLink(&unsup, 0, &child, .link_terminal));
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
 
     // Parent-retire direction: re-arm, then reset touching the PARENT (source).
     // The record is dropped WITHOUT writing through the (about-to-be-freed) slot,
@@ -770,7 +857,7 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
     try testing.expect(try state.armNativeLink(&parent, 2, &child, .link_terminal));
     try testing.expectEqual(CHILD_BODY, parent_slots[2]);
     state.resetLinksTouching(&parent);
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
     // A parent-side reset leaves the slot value untouched (its array is freed anyway).
     try testing.expectEqual(CHILD_BODY, parent_slots[2]);
     // Later child-retire is a clean no-op now that the record is gone.
@@ -789,29 +876,35 @@ test "disarmAllLinks (2c-E / 2.3c-0e): resets EVERY armed slot on entering the o
     var state = TraceState.init(gpa);
     defer state.deinit();
     const SHARED_EXIT: usize = 0; // no trampoline in this unit test
-    try testing.expectEqual(@as(?usize, null), state.mcode_arena.trampoline_exit);
+    try testing.expectEqual(@as(?usize, null), state.registry.mcode_arena.trampoline_exit);
 
     const inner_slots = try gpa.alloc(usize, 1);
     defer gpa.free(inner_slots);
+    defer state.disarmAllLinks(); // registry borrows fixture slot storage
     @memset(inner_slots, SHARED_EXIT);
     const cont_slots = try gpa.alloc(usize, 1);
     defer gpa.free(cont_slots);
+    defer state.disarmAllLinks(); // registry borrows fixture slot storage
     @memset(cont_slots, SHARED_EXIT);
 
     var inner: Trace = .{
-        .anchor = undefined,
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
+        .code = .{
+            .anchor = undefined,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .native = .{ .compiled = .{ .page = undefined, .slots = inner_slots, .gpa = gpa, .linked_entry = 0xBBBB } },
     };
     var cont: Trace = .{
-        .anchor = undefined,
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
+        .code = .{
+            .anchor = undefined,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .native = .{ .compiled = .{ .page = undefined, .slots = cont_slots, .gpa = gpa, .linked_entry = 0xAAAA } },
     };
 
@@ -824,21 +917,21 @@ test "disarmAllLinks (2c-E / 2.3c-0e): resets EVERY armed slot on entering the o
     try testing.expect(try state.armNativeLink(&cont, 0, &inner, .link_terminal));
     try testing.expectEqual(I_TO_C, inner_slots[0]);
     try testing.expectEqual(C_TO_I, cont_slots[0]);
-    try testing.expectEqual(@as(usize, 2), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 2), state.registry.native_physical.armed_links.items.len);
 
     // One disarm resets BOTH slots and empties the registry, and the tear-down
     // counter reflects exactly the two slots reset.
     state.disarmAllLinks();
     try testing.expectEqual(SHARED_EXIT, inner_slots[0]);
     try testing.expectEqual(SHARED_EXIT, cont_slots[0]);
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
-    try testing.expectEqual(@as(u64, 2), state.native_link_disarms);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
+    try testing.expectEqual(@as(u64, 2), state.registry.native_physical.native_link_disarms);
 
     // Idempotent: a second call on the now-empty registry is a clean no-op — and
     // the counter does NOT advance (the early `len == 0` return fires first).
     state.disarmAllLinks();
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
-    try testing.expectEqual(@as(u64, 2), state.native_link_disarms);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
+    try testing.expectEqual(@as(u64, 2), state.registry.native_physical.native_link_disarms);
 }
 
 test "A-viii (doc 17 §A8 step 8): one disarm tears down the whole OUTER cycle — all four production edge kinds" {
@@ -874,7 +967,7 @@ test "A-viii (doc 17 §A8 step 8): one disarm tears down the whole OUTER cycle �
     var state = TraceState.init(gpa);
     defer state.deinit();
     const SHARED_EXIT: usize = 0;
-    try testing.expectEqual(@as(?usize, null), state.mcode_arena.trampoline_exit);
+    try testing.expectEqual(@as(?usize, null), state.registry.mcode_arena.trampoline_exit);
 
     // pc 5 = `jmp_if_true` (the composite branch's source), pc 6 = `for_loop`
     // (the numeric-for whose loop-done guard the P-C invariant governs); the
@@ -927,48 +1020,57 @@ test "A-viii (doc 17 §A8 step 8): one disarm tears down the whole OUTER cycle �
 
     const skip_slots = try gpa.alloc(usize, skip_instrs.len);
     defer gpa.free(skip_slots);
+    defer state.disarmAllLinks(); // registry borrows fixture slot storage
     @memset(skip_slots, SHARED_EXIT);
     const inner_slots = try gpa.alloc(usize, inner_instrs.len);
     defer gpa.free(inner_slots);
+    defer state.disarmAllLinks(); // registry borrows fixture slot storage
     @memset(inner_slots, SHARED_EXIT);
     const cont_slots = try gpa.alloc(usize, cont_instrs.len);
     defer gpa.free(cont_slots);
+    defer state.disarmAllLinks(); // registry borrows fixture slot storage
     @memset(cont_slots, SHARED_EXIT);
 
     var skip: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 9 },
+            .instrs = &skip_instrs,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 1,
-        .anchor = .{ .proto = &proto, .pc = 9 },
-        .instrs = &skip_instrs,
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
         .native = .{ .compiled = .{ .page = undefined, .slots = skip_slots, .gpa = gpa, .linked_entry = 0x5111, .ordinary_entry = 0x6111 } },
     };
     var inner: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 20 },
+            .instrs = &inner_instrs,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &prov,
+        },
         .id = 2,
-        .anchor = .{ .proto = &proto, .pc = 20 },
-        .instrs = &inner_instrs,
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
-        .exit_prov = &prov,
         .native = .{ .compiled = .{ .page = undefined, .slots = inner_slots, .gpa = gpa, .linked_entry = 0x5222, .ordinary_entry = 0x6222 } },
     };
     var cont: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 20 },
+            .instrs = &cont_instrs,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &prov,
+        },
         .id = 3,
-        .anchor = .{ .proto = &proto, .pc = 20 },
-        .instrs = &cont_instrs,
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
-        .exit_prov = &prov,
         .native = .{ .compiled = .{ .page = undefined, .slots = cont_slots, .gpa = gpa, .linked_entry = 0x5333, .ordinary_entry = 0x6333 } },
     };
     // The three distinct shapes, as the arm path's validators will classify them.
     try testing.expect(isLoopDoneGuardIndex(&inner, 4)); // loop-done slot
-    try testing.expect(nativegen.isCompositeBridgeCandidate(&cont, 7)); // bridge slot
+    try testing.expect(nativegen.isCompositeBridgeCandidate(&cont.code, 7)); // bridge slot
     try testing.expect(!isLoopDoneGuardIndex(&skip, 0)); // plain ordinary slot
-    try testing.expect(!nativegen.isCompositeBridgeCandidate(&skip, 0));
+    try testing.expect(!nativegen.isCompositeBridgeCandidate(&skip.code, 0));
 
     // Arm the cycle. `armNativeLink` derives every target from `child` + `kind`,
     // never from the caller: a loop-done / ordinary / bridge handoff enters the
@@ -980,7 +1082,7 @@ test "A-viii (doc 17 §A8 step 8): one disarm tears down the whole OUTER cycle �
     // The A-vii arm site re-stamps the proven region onto the record right after
     // arming (`armNativeLink` deliberately clears it); mirror that here so the
     // teardown walks a record shaped exactly like the production one.
-    for (state.armed_links.items) |*l| {
+    for (state.registry.native_physical.armed_links.items) |*l| {
         if (l.kind == .region_bridge) l.region_id = @enumFromInt(4);
     }
 
@@ -989,7 +1091,7 @@ test "A-viii (doc 17 §A8 step 8): one disarm tears down the whole OUTER cycle �
     try testing.expectEqual(@as(usize, 0x5222), cont_slots[8]); // terminal  → inner.linked
     try testing.expectEqual(@as(usize, 0x6111), cont_slots[7]); // bridge    → skip.ordinary
     try testing.expectEqual(@as(usize, 0x6222), skip_slots[0]); // ordinary  → inner.ordinary
-    try testing.expectEqual(@as(usize, 4), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 4), state.registry.native_physical.armed_links.items.len);
 
     // One blackout tears down the WHOLE cycle — every kind, every slot.
     state.disarmAllLinks();
@@ -1001,8 +1103,8 @@ test "A-viii (doc 17 §A8 step 8): one disarm tears down the whole OUTER cycle �
     for (skip_slots) |s| try testing.expectEqual(SHARED_EXIT, s);
     for (inner_slots) |s| try testing.expectEqual(SHARED_EXIT, s);
     for (cont_slots) |s| try testing.expectEqual(SHARED_EXIT, s);
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
-    try testing.expectEqual(@as(u64, 4), state.native_link_disarms);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
+    try testing.expectEqual(@as(u64, 4), state.registry.native_physical.native_link_disarms);
 }
 
 test "provenanceEdgeVerdict: the backward suffix-max walk agrees with the forward form" {
@@ -1015,49 +1117,49 @@ test "provenanceEdgeVerdict: the backward suffix-max walk agrees with the forwar
     const edge = trace.ProvenanceEdge{ .parent_id = P, .exit_instr = 0, .child_id = C };
 
     const row = struct {
-        fn at(id: u32, cum: usize) irinterp.LedgerEntry {
+        fn at(id: u32, cum: usize) trace_exec.LedgerEntry {
             return .{ .cum = cum, .id = id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal };
         }
     };
     const verdict = trace.TraceState.provenanceEdgeVerdict;
 
     // (1) Local progress on the matched row itself: cum advanced past prior_cum.
-    const local_progress = [_]irinterp.LedgerEntry{ row.at(P, 1), row.at(C, 1) };
+    const local_progress = [_]trace_exec.LedgerEntry{ row.at(P, 1), row.at(C, 1) };
     try testing.expectEqual(trace.ProvenanceAction.reset, verdict(&local_progress, 0, edge).?);
 
     // (2) Progress that only appears LATER in the ledger — the suffix maximum,
     // which is the whole reason the walk runs backward.
-    const later_progress = [_]irinterp.LedgerEntry{ row.at(P, 1), row.at(C, 1), row.at(P, 5) };
+    const later_progress = [_]trace_exec.LedgerEntry{ row.at(P, 1), row.at(C, 1), row.at(P, 5) };
     try testing.expectEqual(trace.ProvenanceAction.reset, verdict(&later_progress, 1, edge).?);
 
     // (3) A completed zero-progress revolution: child intervenes, then control
     // returns to the parent at the same cum. This is the strike.
-    const zero_cycle = [_]irinterp.LedgerEntry{ row.at(P, 1), row.at(C, 1), row.at(P, 1) };
+    const zero_cycle = [_]trace_exec.LedgerEntry{ row.at(P, 1), row.at(C, 1), row.at(P, 1) };
     try testing.expectEqual(trace.ProvenanceAction.strike, verdict(&zero_cycle, 1, edge).?);
 
     // (4) `.reset` outranks `.strike` regardless of order, so a productive row
     // decides the edge even when a zero-progress revolution precedes it. This is
     // what licenses returning at the first productive row instead of scanning on.
-    const strike_then_reset = [_]irinterp.LedgerEntry{
+    const strike_then_reset = [_]trace_exec.LedgerEntry{
         row.at(P, 1), row.at(C, 1), row.at(P, 1), row.at(C, 1), row.at(P, 4),
     };
     try testing.expectEqual(trace.ProvenanceAction.reset, verdict(&strike_then_reset, 1, edge).?);
 
     // (5) No evidence either way: zero progress, but control never returns to the
     // parent, so the revolution never completed.
-    const no_return = [_]irinterp.LedgerEntry{ row.at(P, 1), row.at(C, 1), row.at(C, 1) };
+    const no_return = [_]trace_exec.LedgerEntry{ row.at(P, 1), row.at(C, 1), row.at(C, 1) };
     try testing.expectEqual(@as(?trace.ProvenanceAction, null), verdict(&no_return, 1, edge));
 
     // (6) No row matches the edge at all, and the degenerate short ledgers.
-    const unrelated = [_]irinterp.LedgerEntry{ row.at(C, 1), row.at(P, 1) };
+    const unrelated = [_]trace_exec.LedgerEntry{ row.at(C, 1), row.at(P, 1) };
     try testing.expectEqual(@as(?trace.ProvenanceAction, null), verdict(&unrelated, 1, edge));
     try testing.expectEqual(@as(?trace.ProvenanceAction, null), verdict(&.{}, 0, edge));
-    try testing.expectEqual(@as(?trace.ProvenanceAction, null), verdict(&[_]irinterp.LedgerEntry{row.at(P, 1)}, 0, edge));
+    try testing.expectEqual(@as(?trace.ProvenanceAction, null), verdict(&[_]trace_exec.LedgerEntry{row.at(P, 1)}, 0, edge));
 }
 
 fn foreignEpisodeDummySeed(
     ctx: *const trace.NativeSeedCtx,
-    t: *const Trace,
+    t: *const trace.TraceCode,
     plan_bits: u64,
 ) callconv(.c) u64 {
     _ = ctx;
@@ -1087,7 +1189,7 @@ test "B-2b: a seeded child needing another episode defers WITHOUT latching the d
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity();
+    defer state.registry.cache.clearRetainingCapacity();
 
     // Two protos: the live episode runs `a`, the parent/child pair lives in `b`.
     const proto_a = Proto{ .code = &.{Instr.op0(.ret)}, .id = 1, .name = "episode-a", .num_registers = 1 };
@@ -1096,14 +1198,17 @@ test "B-2b: a seeded child needing another episode defers WITHOUT latching the d
     var parent_instrs = [_]IrInstr{ .{ .op = .guard_true, .aux = 1 }, .{ .op = .loop } };
     const slots = try gpa.alloc(usize, parent_instrs.len);
     defer gpa.free(slots);
+    defer state.disarmAllLinks(); // registry borrows fixture slot storage
     @memset(slots, 0);
     var parent: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto_b, .pc = 4 },
+            .instrs = &parent_instrs,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 81,
-        .anchor = .{ .proto = &proto_b, .pc = 4 },
-        .instrs = &parent_instrs,
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
         .native = .{ .compiled = .{ .page = undefined, .slots = slots, .gpa = gpa } },
         .sibling_watch_exit = 0,
         .sibling_watch_count = 4,
@@ -1111,12 +1216,14 @@ test "B-2b: a seeded child needing another episode defers WITHOUT latching the d
     // SEEDED child with a complete, otherwise-enterable page — the only thing
     // wrong with it is which episode is live.
     var child: Trace = .{
+        .code = .{
+            .anchor = parent.code.anchor,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 82,
-        .anchor = parent.anchor,
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
         .native = .{ .compiled = .{
             .page = undefined,
             .gpa = gpa,
@@ -1125,24 +1232,24 @@ test "B-2b: a seeded child needing another episode defers WITHOUT latching the d
             .seed_prologue = true,
         } },
     };
-    child.inputs = @constCast(&[_]trace.InputSeed{undefined});
-    try state.cache.append(gpa, &parent);
-    try state.cache.append(gpa, &child);
+    child.code.inputs = @constCast(&[_]trace.InputSeed{undefined});
+    try state.registry.cache.append(gpa, &parent);
+    try state.registry.cache.append(gpa, &child);
     try state.provenance_edges.append(gpa, .{ .parent_id = parent.id, .exit_instr = 0, .child_id = child.id });
 
     // Live episode = proto_a, so the child's proto_b page is not enterable.
     const seed_ctx = try gpa.create(trace.NativeSeedCtx);
     seed_ctx.* = .{ .seed_fn = foreignEpisodeDummySeed };
-    state.native_seed_ctx = seed_ctx; // state.deinit() destroys it
+    state.registry.native_seed_ctx = seed_ctx; // state.deinit() destroys it
     seed_ctx.proto = @ptrCast(&proto_a);
     seed_ctx.call_seq = 5;
-    state.region_context = .{ .depth = 0, .call_seq = 5 };
-    try testing.expect(state.stubEnterability(&child, .ordinary, child.anchor.proto) == .no_episode);
+    state.region_policy.region_context = .{ .depth = 0, .call_seq = 5 };
+    try testing.expect(state.stubEnterability(&child, .ordinary, child.code.anchor.proto) == .no_episode);
 
     state.provenance_arms_pending = true;
     state.drainProvenanceArms(true);
     // Nothing armed — that part is unchanged and correct.
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
     // The general flag SETTLES. Pre-fix it stayed true here, forever.
     try testing.expect(!state.provenance_arms_pending);
     // The deferral is recorded on the episode-scoped flag instead, stamped with
@@ -1152,15 +1259,15 @@ test "B-2b: a seeded child needing another episode defers WITHOUT latching the d
     // gate short-circuits on identity, not on "a pass happened".
     state.drainProvenanceArms(true);
     try testing.expect(state.provenance_arms_episode_pending);
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
 
     // The coverage half: when the episode really does change to the child's
     // proto, the deferred edge arms. Without the episode stamp this edge would
     // have been silently dropped rather than merely postponed.
     seed_ctx.proto = @ptrCast(&proto_b);
     state.drainProvenanceArms(true);
-    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
-    try testing.expectEqual(ArmKind.sibling_handoff, state.armed_links.items[0].kind);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.armed_links.items.len);
+    try testing.expectEqual(ArmKind.sibling_handoff, state.registry.native_physical.armed_links.items[0].kind);
     try testing.expectEqual(@as(u64, 1), state.sibling_handoff_arms);
     try testing.expectEqual(@as(usize, 0xB2B2), slots[0]);
     // Both flags settled: nothing is deferred any more.

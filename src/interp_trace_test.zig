@@ -223,7 +223,7 @@ test "H-2 part 3: clearCache retires every trace + resets all derived tiering/di
 
     // Sanity: the run actually populated the structures we care about (so the post-clear
     // assertions below aren't trivially satisfied by an already-empty state).
-    try testing.expect(vm.trace.cache.items.len >= 1);
+    try testing.expect(vm.trace.registry.cache.items.len >= 1);
     try testing.expect(vm.trace.exec_logs.items.len >= 1);
     try testing.expect(vm.trace.abort_log.items.len >= 1);
     try testing.expect(vm.trace.coverage.count() >= 1);
@@ -231,7 +231,7 @@ test "H-2 part 3: clearCache retires every trace + resets all derived tiering/di
     vm.trace.clearCache();
 
     // Everything in the reset set is empty/null after the clear.
-    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
     try testing.expectEqual(@as(usize, 0), vm.trace.counters.count());
     try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
     try testing.expectEqual(@as(usize, 0), vm.trace.penalty.count());
@@ -247,11 +247,11 @@ test "H-2 part 3: clearCache retires every trace + resets all derived tiering/di
     for (vm.trace.hotcount) |h| try testing.expectEqual(@as(u16, 0), h);
     // A-ii: the structural-edge cache + the whole region model (logical defs/intern
     // AND the physical classification indices) all empty after the flush.
-    try testing.expectEqual(@as(usize, 0), vm.trace.edge_cache.count());
-    try testing.expectEqual(@as(usize, 0), vm.trace.region_defs.count());
-    try testing.expectEqual(@as(usize, 0), vm.trace.region_intern.entries.items.len);
-    try testing.expectEqual(@as(usize, 0), vm.trace.source_exit_regions.count());
-    try testing.expectEqual(@as(usize, 0), vm.trace.dest_entry_regions.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.region_policy.edge_cache.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.region_policy.region_defs.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.region_policy.region_intern.entries.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.region_policy.source_exit_regions.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.region_policy.dest_entry_regions.count());
 }
 
 test "H-2 part 3: the JIT still records fresh traces in a second epoch after the cache clear" {
@@ -281,10 +281,10 @@ test "H-2 part 3: the JIT still records fresh traces in a second epoch after the
     try testing.expect(!diags.hasErrors());
 
     _ = try vm.run(chunk.proto); // epoch 1
-    try testing.expect(vm.trace.cache.items.len >= 1);
+    try testing.expect(vm.trace.registry.cache.items.len >= 1);
     _ = try vm.run(chunk.proto); // epoch 2 — beginTopLevelEpoch cleared the cache first
     // A fresh trace was recorded in epoch 2 (not left wedged by the reset).
-    try testing.expect(vm.trace.cache.items.len >= 1);
+    try testing.expect(vm.trace.registry.cache.items.len >= 1);
 }
 
 test "doc 24 c2: an allocating tostring loop records, commits guard_gc with the stamped bound, and runs end-to-end" {
@@ -325,12 +325,12 @@ test "doc 24 c2: an allocating tostring loop records, commits guard_gc with the 
     // The committed trace: exactly one `.alloc` op per iteration → bound 1,
     // stamped into the guard_gc's aux at commit.
     var found = false;
-    for (vm.trace.cache.items) |t| {
-        if (t.alloc_bound == 0) continue;
+    for (vm.trace.registry.cache.items) |t| {
+        if (t.code.alloc_bound == 0) continue;
         found = true;
-        try testing.expectEqual(@as(u32, 1), t.alloc_bound);
+        try testing.expectEqual(@as(u32, 1), t.code.alloc_bound);
         var n_guard_gc: usize = 0;
-        for (t.instrs) |ins| {
+        for (t.code.instrs) |ins| {
             if (ins.op == .guard_gc) {
                 n_guard_gc += 1;
                 try testing.expectEqual(@as(i32, 1), ins.aux);
@@ -419,13 +419,13 @@ test "doc 24 c3: a snew-class string loop records, commits, and runs end-to-end 
     try testing.expect(vm.trace.entries > 0);
 
     var found = false;
-    for (vm.trace.cache.items) |t| {
-        if (t.alloc_bound == 0) continue;
+    for (vm.trace.registry.cache.items) |t| {
+        if (t.code.alloc_bound == 0) continue;
         found = true;
-        try testing.expectEqual(@as(u32, 4), t.alloc_bound);
+        try testing.expectEqual(@as(u32, 4), t.code.alloc_bound);
         var has = [_]bool{ false, false, false, false };
         var n_guard_gc: usize = 0;
-        for (t.instrs) |ins| {
+        for (t.code.instrs) |ins| {
             switch (ins.op) {
                 .ssub => has[0] = true,
                 .srev => has[1] = true,
@@ -559,8 +559,8 @@ test "doc 24 c4: observation blackout — an armed safepoint recorder keeps allo
 
     // The allocating trace committed…
     var committed_alloc = false;
-    for (vm.trace.cache.items) |t| {
-        if (t.alloc_bound > 0) committed_alloc = true;
+    for (vm.trace.registry.cache.items) |t| {
+        if (t.code.alloc_bound > 0) committed_alloc = true;
     }
     try testing.expect(committed_alloc);
     // …but was never ENTERED (the blackout skip fires before the entry
@@ -774,10 +774,10 @@ test "doc 26 D1a: an error unwinding mid-recording aborts the recording (.raised
     // full-iteration recording from the clean leg (anchored at the loop
     // header, containing schar1 — never a partial/spliced body).
     try testing.expect(!vm.trace.isRecording());
-    try testing.expect(vm.trace.cache.items.len >= 1);
-    for (vm.trace.cache.items) |t| {
+    try testing.expect(vm.trace.registry.cache.items.len >= 1);
+    for (vm.trace.registry.cache.items) |t| {
         var has_schar1 = false;
-        for (t.instrs) |ins| {
+        for (t.code.instrs) |ins| {
             if (ins.op == .schar1) has_schar1 = true;
         }
         try testing.expect(has_schar1);
@@ -863,12 +863,12 @@ test "doc 26: upper/lower/codepoint loop runs NATIVELY end-to-end — pin invari
     // stamped (M3), and the guard_gc bound counts EXACTLY the two case
     // producers — scp must not inflate A (D3).
     var found = false;
-    for (vm.trace.cache.items) |t| {
+    for (vm.trace.registry.cache.items) |t| {
         var has_supper = false;
         var has_slower = false;
         var has_scp = false;
         var n_guard_gc: usize = 0;
-        for (t.instrs) |ins| {
+        for (t.code.instrs) |ins| {
             switch (ins.op) {
                 .supper => has_supper = true,
                 .slower => has_slower = true,
@@ -882,8 +882,8 @@ test "doc 26: upper/lower/codepoint loop runs NATIVELY end-to-end — pin invari
         }
         if (!(has_supper and has_slower and has_scp)) continue;
         found = true;
-        try testing.expect(t.requires_unicode_pin);
-        try testing.expectEqual(@as(u32, 2), t.alloc_bound);
+        try testing.expect(t.code.requires_unicode_pin);
+        try testing.expectEqual(@as(u32, 2), t.code.alloc_bound);
         try testing.expectEqual(@as(usize, 1), n_guard_gc);
     }
     try testing.expect(found);
@@ -965,18 +965,18 @@ test "doc 26: scp argument-shape matrix — 1/2/3-arg + negative wrap record wit
 
     // Find the committed loop trace and pin the four operand shapes.
     var found = false;
-    for (vm.trace.cache.items) |t| {
+    for (vm.trace.registry.cache.items) |t| {
         var n_scp: usize = 0;
         var shared_konst_one = false; // 1-arg: b == aux → konst 1
         var shared_runtime = false; // 2-arg runtime i: b == aux, NOT a konst
         var distinct = false; // 3-arg: b != aux
-        for (t.instrs) |ins| {
+        for (t.code.instrs) |ins| {
             if (ins.op != .scp) continue;
             n_scp += 1;
             if (ins.b == @as(u16, @intCast(ins.aux))) {
-                const opnd = t.instrs[ins.b];
+                const opnd = t.code.instrs[ins.b];
                 if (opnd.op == .konst) {
-                    if (t.consts[@intCast(opnd.aux)].payload.bits == Value.int(1).payload.bits)
+                    if (t.code.consts[@intCast(opnd.aux)].payload.bits == Value.int(1).payload.bits)
                         shared_konst_one = true;
                 } else {
                     shared_runtime = true;
@@ -992,8 +992,8 @@ test "doc 26: scp argument-shape matrix — 1/2/3-arg + negative wrap record wit
         try testing.expect(shared_runtime);
         try testing.expect(distinct);
         // A read-only op class: nothing here allocates, so no budget guard.
-        try testing.expectEqual(@as(u32, 0), t.alloc_bound);
-        try testing.expect(!t.requires_unicode_pin);
+        try testing.expectEqual(@as(u32, 0), t.code.alloc_bound);
+        try testing.expect(!t.code.requires_unicode_pin);
     }
     try testing.expect(found);
 }
@@ -1169,12 +1169,12 @@ test "doc 26: `.pure3` contract — dead scp DCE'd, identical scps never CSE'd, 
     // 14 x (1+..+50) + 50 x (98 + 98) = 17850 + 9800.
     try testing.expectEqualStrings("27650\n", sink.buffered());
 
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
-    const t = vm.trace.cache.items[0];
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
     var n_scp: usize = 0;
     var n_guard_gc: usize = 0;
     var muls: usize = 0;
-    for (t.instrs) |ins| {
+    for (t.code.instrs) |ins| {
         switch (ins.op) {
             .scp => {
                 n_scp += 1;
@@ -1183,9 +1183,9 @@ test "doc 26: `.pure3` contract — dead scp DCE'd, identical scps never CSE'd, 
                 // compacted ref space. The dead cp(base, 1, 1)'s konst-1 aux
                 // never appears — if the dead scp survived DCE, this
                 // expectation fails on its aux.
-                const jref = t.instrs[@intCast(ins.aux)];
+                const jref = t.code.instrs[@intCast(ins.aux)];
                 try testing.expectEqual(trace.IrOp.konst, jref.op);
-                try testing.expectEqual(Value.int(5).payload.bits, t.consts[@intCast(jref.aux)].payload.bits);
+                try testing.expectEqual(Value.int(5).payload.bits, t.code.consts[@intCast(jref.aux)].payload.bits);
             },
             .guard_gc => n_guard_gc += 1,
             .mul => muls += 1,
@@ -1198,9 +1198,9 @@ test "doc 26: `.pure3` contract — dead scp DCE'd, identical scps never CSE'd, 
     try testing.expectEqual(@as(usize, 1), muls);
     // scp never inflates the budget: a case-op-free scp trace has NO
     // allocation bound and NO guard_gc at all — and needs no pin.
-    try testing.expectEqual(@as(u32, 0), t.alloc_bound);
+    try testing.expectEqual(@as(u32, 0), t.code.alloc_bound);
     try testing.expectEqual(@as(usize, 0), n_guard_gc);
-    try testing.expect(!t.requires_unicode_pin);
+    try testing.expect(!t.code.requires_unicode_pin);
 }
 
 test "doc 26: recorder fail-closed matrix — float index, multi-result codepoint, non-string arg" {
@@ -1266,8 +1266,8 @@ test "doc 26: recorder fail-closed matrix — float index, multi-result codepoin
         _ = try vm.run(chunk.proto);
         try testing.expectEqualStrings(t0_out[0..t0_len], sink.buffered());
         // Fail closed: whatever committed (or nothing did), no scp anywhere.
-        for (vm.trace.cache.items) |t| {
-            for (t.instrs) |ins| try testing.expect(ins.op != .scp);
+        for (vm.trace.registry.cache.items) |t| {
+            for (t.code.instrs) |ins| try testing.expect(ins.op != .scp);
         }
         try testing.expect(!vm.trace.isRecording());
     }
@@ -1426,10 +1426,10 @@ test "doc 27: nested lower(upper(s)) records, runs NATIVELY, chains provenance, 
     // Committed-trace shape: `slower` consumes `supper`'s ref directly, and no
     // `guard_string` re-checks the proven producer result in between.
     var found = false;
-    for (vm.trace.cache.items) |t| {
+    for (vm.trace.registry.cache.items) |t| {
         var supper_ref: ?i64 = null;
         var chained = false;
-        for (t.instrs, 0..) |ins, idx| {
+        for (t.code.instrs, 0..) |ins, idx| {
             switch (ins.op) {
                 .supper => supper_ref = @intCast(idx),
                 .slower => if (supper_ref != null and ins.a == supper_ref.?) {
@@ -2070,7 +2070,7 @@ test "trace toggle gates back-edge counting" {
         try testing.expect(max >= vm.trace.config.hotloop);
         try testing.expect(max <= 100);
         // The simple counting loop is fully recordable → exactly one cached trace.
-        try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+        try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
     }
 }
 
@@ -2096,7 +2096,7 @@ test "doc 19: a hot loop inside a load-chunk traces exactly like the static chun
             \\print(s)
         , true);
         defer chunk.deinit();
-        try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+        try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
     }
     // LOADED: the same loop, compiled at runtime via `load` → records identically.
     {
@@ -2112,7 +2112,7 @@ test "doc 19: a hot loop inside a load-chunk traces exactly like the static chun
             \\print(f())
         , true);
         defer chunk.deinit();
-        try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+        try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
     }
 }
 
@@ -2191,7 +2191,7 @@ test "doc 19: a static trace inlines a loaded callee (flipped recCall gate)" {
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
     // The static anchor records and commits, inlining the loaded callee.
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
 }
 
 /// Run `source` with tier-1a execution **and** exec-log recording on (small
@@ -2237,7 +2237,7 @@ test "exec log captures a hot loop's iterations and its exit ramp" {
     defer chunk.deinit();
 
     // One cached trace → one exec log keyed by its cache index (0).
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
     try testing.expectEqual(@as(usize, 1), vm.trace.exec_logs.items.len);
     const log = vm.trace.exec_logs.items[0];
     try testing.expectEqual(@as(u32, 0), log.trace_id);
@@ -2264,7 +2264,7 @@ test "exec log captures a hot loop's iterations and its exit ramp" {
     // The last event is the exit ramp, and it names a real IR instruction.
     const last = entry.events[entry.events.len - 1];
     try testing.expectEqual(execlog.ExecEventKind.exit, last.kind);
-    try testing.expect(last.ref < vm.trace.cache.items[0].instrs.len);
+    try testing.expect(last.ref < vm.trace.registry.cache.items[0].code.instrs.len);
     try testing.expectEqual(execlog.ExitKind.guard, entry.exit_kind);
     try testing.expectEqual(@as(u32, last.ref), entry.exit_ref);
 }
@@ -2368,13 +2368,13 @@ test "per-guard PC: last_exit_instr is set on zero-iteration guard failure" {
 
     // The trace MUST have been executed and failed at a guard.
     try testing.expect(vm.trace.last_exit_instr != std.math.maxInt(u32));
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
-    const t = vm.trace.cache.items[0];
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
     const ei = vm.trace.last_exit_instr;
-    try testing.expect(ei < t.instrs.len);
+    try testing.expect(ei < t.code.instrs.len);
 
     // The failing instruction must be a guard.
-    const failed = t.instrs[ei];
+    const failed = t.code.instrs[ei];
     try testing.expect(switch (failed.op) {
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => true,
         else => false,
@@ -2423,7 +2423,7 @@ test "side traces: type-changing loop records a second trace at the same anchor"
 
     // Two traces should exist at the same anchor: the root trace (int path)
     // and the side trace (float path, recorded after guard failures).
-    try testing.expect(vm.trace.cache.items.len >= 2);
+    try testing.expect(vm.trace.registry.cache.items.len >= 2);
     // Guard failures are cleared when the side trace arms, and no new
     // failures are counted once 2+ traces exist (avoids unbounded growth).
     // Output must be correct despite the type change mid-loop.
@@ -2473,7 +2473,7 @@ test "side traces: without side traces the anchor blacklists; with them it stays
         _ = try vm.run(chunk.proto);
 
         // Only the root trace exists — no side trace was ever recorded.
-        try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+        try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
         // The anchor is NOT blacklisted: type fingerprinting skips the
         // trace when x becomes float instead of entering-and-failing,
         // so no penalty accumulates.
@@ -2508,7 +2508,7 @@ test "side traces: without side traces the anchor blacklists; with them it stays
         _ = try vm.run(chunk.proto);
 
         // Two traces: the root trace (int path) and the side trace (float path).
-        try testing.expect(vm.trace.cache.items.len >= 2);
+        try testing.expect(vm.trace.registry.cache.items.len >= 2);
         // The anchor is NOT blacklisted — the float side trace commits useful
         // iterations (> min_useful), clearing the penalty before it maxes out.
         try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
@@ -2521,9 +2521,9 @@ test "side traces: without side traces the anchor blacklists; with them it stays
 /// is sized comfortably above any test trace. The caller must keep the trace's
 /// `anchor.proto` alive (see `runForTrace`) — `writeTrace` prints `proto.name`.
 fn dumpTrace(buf: []u8, vm: *Vm) ![]const u8 {
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
     var w = io.Writer.fixed(buf);
-    try trace.writeTrace(&w, vm.trace.cache.items[0]);
+    try trace.writeTrace(&w, vm.trace.registry.cache.items[0]);
     return w.buffered();
 }
 
@@ -2549,14 +2549,14 @@ test "recorder: a numeric-for loop records guards + arithmetic + a loop close" {
     try testing.expect(std.mem.indexOf(u8, text, "guard_true") != null); // for-loop continuation
     try testing.expect(std.mem.indexOf(u8, text, "loop") != null);
 
-    const t = vm.trace.cache.items[0];
+    const t = vm.trace.registry.cache.items[0];
     // acc and the loop index are loop-carried, so they surface as slot-bound φs.
     var n_phi: usize = 0;
-    for (t.instrs) |ins| {
+    for (t.code.instrs) |ins| {
         if (ins.op == .phi and ins.aux >= 0) n_phi += 1;
     }
     try testing.expect(n_phi >= 1);
-    try testing.expect(t.entry_slots.len >= 1);
+    try testing.expect(t.code.entry_slots.len >= 1);
     // No host/cross-frame op was hit, so nothing was blacklisted.
     try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
 }
@@ -2598,8 +2598,8 @@ test "recorder: dead expression temporaries are dropped from the exit snapshot (
     , true);
     defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
 
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
-    const t = vm.trace.cache.items[0];
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
 
     // Recover the numeric-for base from the bytecode so the assertion does not
     // hard-code the compiler's register allocation. Control regs are base..base+3;
@@ -2616,21 +2616,21 @@ test "recorder: dead expression temporaries are dropped from the exit snapshot (
     // Every surviving slot-bound φ is either below the watermark (a real local /
     // loop control) or a slot the trace actually read — never a dead temporary.
     var saw_acc = false;
-    for (t.instrs) |ins| {
+    for (t.code.instrs) |ins| {
         if (ins.op != .phi or ins.aux < 0) continue;
         const slot: u16 = @intCast(ins.aux);
-        const was_read = std.mem.indexOfScalar(u16, t.entry_slots, slot) != null;
+        const was_read = std.mem.indexOfScalar(u16, t.code.entry_slots, slot) != null;
         try testing.expect(@as(usize, slot) < watermark or was_read);
         if (slot == 0) saw_acc = true; // `acc` is the first local → slot 0
     }
     // The loop-carried accumulator is still committed.
     try testing.expect(saw_acc);
     // And no high write-only temporary leaked through.
-    for (t.instrs) |ins| {
+    for (t.code.instrs) |ins| {
         if (ins.op != .phi or ins.aux < 0) continue;
         const slot: u16 = @intCast(ins.aux);
         if (@as(usize, slot) >= watermark)
-            try testing.expect(std.mem.indexOfScalar(u16, t.entry_slots, slot) != null);
+            try testing.expect(std.mem.indexOfScalar(u16, t.code.entry_slots, slot) != null);
     }
 }
 
@@ -2650,14 +2650,14 @@ test "recorder: a while loop keeps its write-only temporaries (no for_loop water
     , true);
     defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
 
-    const t = vm.trace.cache.items[0];
+    const t = vm.trace.registry.cache.items[0];
     // There must be at least one defined-but-never-read (write-only) slot still in
     // the snapshot — exactly what the for-loop filter would have removed.
     var saw_write_only = false;
-    for (t.instrs) |ins| {
+    for (t.code.instrs) |ins| {
         if (ins.op != .phi or ins.aux < 0) continue;
         const slot: u16 = @intCast(ins.aux);
-        if (std.mem.indexOfScalar(u16, t.entry_slots, slot) == null) saw_write_only = true;
+        if (std.mem.indexOfScalar(u16, t.code.entry_slots, slot) == null) saw_write_only = true;
     }
     try testing.expect(saw_write_only);
 }
@@ -2676,10 +2676,10 @@ test "recorder: a recurring literal is interned to one const-pool entry" {
     , true);
     defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
 
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
-    const t = vm.trace.cache.items[0];
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
     var sevens: usize = 0;
-    for (t.consts) |c| {
+    for (t.code.consts) |c| {
         if (c.isInt() and c.asInt() == 7) sevens += 1;
     }
     try testing.expectEqual(@as(usize, 1), sevens);
@@ -2717,13 +2717,13 @@ test "konst interning lets CSE collapse a repeated subexpression end-to-end" {
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
 
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
-    const t = vm.trace.cache.items[0];
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
     // The two `i * 7` subexpressions are now identical (same slot_load ref + same
     // interned konst ref), so CSE collapses them to a single `mul`. Before konst
     // interning, CSE could not fire here and both muls survived.
     var muls: usize = 0;
-    for (t.instrs) |ins| {
+    for (t.code.instrs) |ins| {
         if (ins.op == .mul) muls += 1;
     }
     try testing.expectEqual(@as(usize, 1), muls);
@@ -2773,27 +2773,27 @@ test "doc 24 c3: identical ssubs are NEVER CSE'd, and compaction remaps ssub.aux
     // 14 x (1+..+50) + 50 x (4 + 4) = 17850 + 400.
     try testing.expectEqualStrings("18250\n", sink.buffered());
 
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
-    const t = vm.trace.cache.items[0];
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
     // The `.alloc` class is codex #8: a repeat is a FALLIBLE op tier-0
     // performs (host scratch precedes the intern), so identical ssubs must
     // BOTH survive — CSE'ing one away would drop an allocation the id-stream
     // bound accounts for. And each aux must still resolve to the konst 5 end
     // bound after DCE shifted the ref space.
     var n_ssub: usize = 0;
-    for (t.instrs) |ins| {
+    for (t.code.instrs) |ins| {
         if (ins.op != .ssub) continue;
         n_ssub += 1;
-        const jref = t.instrs[@intCast(ins.aux)];
+        const jref = t.code.instrs[@intCast(ins.aux)];
         try testing.expectEqual(trace.IrOp.konst, jref.op);
-        try testing.expectEqual(Value.int(5).payload.bits, t.consts[@intCast(jref.aux)].payload.bits);
+        try testing.expectEqual(Value.int(5).payload.bits, t.code.consts[@intCast(jref.aux)].payload.bits);
     }
     try testing.expectEqual(@as(usize, 2), n_ssub);
-    try testing.expectEqual(@as(u32, 2), t.alloc_bound);
+    try testing.expectEqual(@as(u32, 2), t.code.alloc_bound);
     // The second `i * 7` was CSE'd — proof that compaction actually ran and
     // the aux checks above exercised a genuinely REMAPPED ref space.
     var muls: usize = 0;
-    for (t.instrs) |ins| {
+    for (t.code.instrs) |ins| {
         if (ins.op == .mul) muls += 1;
     }
     try testing.expectEqual(@as(usize, 1), muls);
@@ -2817,7 +2817,7 @@ test "recorder: a non-recursive fixed-arity leaf call is inlined into one trace"
     // one trace, the recording closes cleanly, and the anchor is *not*
     // blacklisted (an aborted anchor would have been record-gated — doc 31:
     // aborts land in `record_gate`, so both maps must stay empty here).
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
     try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
     try testing.expectEqual(@as(usize, 0), vm.trace.record_gate.count());
     try testing.expect(!vm.trace.isRecording());
@@ -2837,7 +2837,7 @@ test "recorder: a vararg call in the loop body still aborts cleanly" {
 
     // A vararg callee has no compile-time-fixed register window to seed, so the
     // recorder must still abort (cross_frame) — no trace cached, recording done.
-    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
     try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
@@ -2863,20 +2863,20 @@ test "recorder: a callee reached through an upvalue records a snapshot input + g
     , true);
     defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
 
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
-    const t = vm.trace.cache.items[0];
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
 
     // Exactly one synthetic input, resolved from an upvalue, slotted above the anchor.
-    try testing.expectEqual(@as(usize, 1), t.inputs.len);
-    try testing.expectEqual(trace.InputKind.upvalue, t.inputs[0].kind);
-    try testing.expect(t.inputs[0].slot >= vm.trace.rec.anchor_num_registers);
+    try testing.expectEqual(@as(usize, 1), t.code.inputs.len);
+    try testing.expectEqual(trace.InputKind.upvalue, t.code.inputs[0].kind);
+    try testing.expect(t.code.inputs[0].slot >= vm.trace.rec.anchor_num_registers);
 
     // The snapshot is read by a `slot_load` on exactly that synthetic slot, and a
     // `guard_func` pins the callee proto.
     var saw_input_load = false;
     var saw_guard_func = false;
-    for (t.instrs) |ins| {
-        if (ins.op == .slot_load and ins.aux == @as(i32, t.inputs[0].slot)) saw_input_load = true;
+    for (t.code.instrs) |ins| {
+        if (ins.op == .slot_load and ins.aux == @as(i32, t.code.inputs[0].slot)) saw_input_load = true;
         if (ins.op == .guard_func) saw_guard_func = true;
     }
     try testing.expect(saw_input_load);
@@ -2898,14 +2898,14 @@ test "recorder: a callee reached through a global records a snapshot input + gua
     , true);
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
-    const t = vm.trace.cache.items[0];
-    try testing.expectEqual(@as(usize, 1), t.inputs.len);
-    try testing.expectEqual(trace.InputKind.global, t.inputs[0].kind);
-    try testing.expect(t.inputs[0].slot >= vm.trace.rec.anchor_num_registers);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
+    try testing.expectEqual(@as(usize, 1), t.code.inputs.len);
+    try testing.expectEqual(trace.InputKind.global, t.code.inputs[0].kind);
+    try testing.expect(t.code.inputs[0].slot >= vm.trace.rec.anchor_num_registers);
 
     var saw_guard_func = false;
-    for (t.instrs) |ins| {
+    for (t.code.instrs) |ins| {
         if (ins.op == .guard_func) saw_guard_func = true;
     }
     try testing.expect(saw_guard_func);
@@ -2928,7 +2928,7 @@ test "recorder: a set_upval in the loop body aborts cleanly" {
     , true);
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
     try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
@@ -2947,7 +2947,7 @@ test "recorder: a set_global in the loop body aborts cleanly" {
     , true);
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
     try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
@@ -2970,13 +2970,13 @@ test "recorder S1: inlined callee slots are seeded — no callee-index slot_load
     , true);
     defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
 
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
-    const t = vm.trace.cache.items[0];
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
     const anchor_window: i32 = @intCast(chunk.proto.num_registers);
 
     // The inlining actually happened: a guard_func pins the runtime callee identity.
     var saw_guard_func = false;
-    for (t.instrs) |ins| {
+    for (t.code.instrs) |ins| {
         if (ins.op == .guard_func) saw_guard_func = true;
         // S1 invariant: no trace input (`slot_load`) reads a callee-window slot.
         if (ins.op == .slot_load) try testing.expect(ins.aux < anchor_window);
@@ -3001,10 +3001,10 @@ test "recorder S2: callee SSA slots are dropped from the loop-closing phi set" {
     , true);
     defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
 
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
-    const t = vm.trace.cache.items[0];
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
     const anchor_window: i32 = @intCast(chunk.proto.num_registers);
-    for (t.instrs) |ins| {
+    for (t.code.instrs) |ins| {
         if (ins.op != .phi or ins.aux < 0) continue; // skip the PHI_INTERNAL sentinel
         try testing.expect(ins.aux < anchor_window);
     }
@@ -3030,7 +3030,7 @@ test "recorder S3: the verifier window is the anchor frame, below the reserved s
     , true);
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
     // The recorder's window bound equals the anchor (top-level main) frame's regs.
     try testing.expectEqual(chunk.proto.num_registers, vm.trace.rec.anchor_num_registers);
     // …and the reserved scratch genuinely extends past it (callee windows live here).
@@ -3051,7 +3051,7 @@ test "recorder: maxrecord bounds trace length (overlong traces abort)" {
     , true);
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
     try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
@@ -3088,7 +3088,7 @@ test "recorder (hash field): a constant-key field read records href + guard_hash
     try testing.expect(std.mem.indexOf(u8, text, "guard_int") != null);
     // A pure field read sinks no store.
     try testing.expect(std.mem.indexOf(u8, text, "hstore") == null);
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
     try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
 }
 
@@ -3114,7 +3114,7 @@ test "recorder (hash field): an RMW field store (t.n = t.n + 1) sinks the hstore
     try testing.expect(i_load != null);
     try testing.expect(i_store != null);
     try testing.expect(i_load.? < i_store.?);
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
 }
 
 test "recorder (hash field): a float-valued field RMW records (nbody-shaped arithmetic)" {
@@ -3135,7 +3135,7 @@ test "recorder (hash field): a float-valued field RMW records (nbody-shaped arit
     try testing.expect(std.mem.indexOf(u8, text, "hload") != null);
     try testing.expect(std.mem.indexOf(u8, text, "guard_float") != null);
     try testing.expect(std.mem.indexOf(u8, text, "hstore") != null);
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
 }
 
 test "recorder (hash field): an absent constant-key access aborts (no trace)" {
@@ -3153,7 +3153,7 @@ test "recorder (hash field): an absent constant-key access aborts (no trace)" {
     , true);
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
     try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
@@ -3173,7 +3173,7 @@ test "recorder (hash field): a metatable-bearing table aborts (.has_metatable)" 
     , true);
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
     try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
@@ -3193,7 +3193,7 @@ test "recorder (hash field): a heap-valued (string) field aborts (scalar-only re
     , true);
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
     try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
@@ -3214,7 +3214,7 @@ test "recorder (hash field): a computed (non-konst) key aborts (const-key rule)"
     , true);
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
     try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
@@ -3249,7 +3249,7 @@ test "recorder (hash alias): different keys on one table classify NO — both RM
     // Two heap reads (nothing forwarded), two sunk stores.
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "hload"));
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "hstore"));
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
     try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
 }
 
@@ -3283,7 +3283,7 @@ test "recorder (hash alias): same cell forwards MUST with last-writer-wins and n
     const i_load = std.mem.indexOf(u8, text, "hload").?;
     const i_store = std.mem.indexOf(u8, text, "hstore").?;
     try testing.expect(i_load < i_store);
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
     try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
 }
 
@@ -3305,14 +3305,14 @@ test "recorder (hash alias): every sunk hstore's VALUE ref carries its own numer
     , true);
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
-    const t = vm.trace.cache.items[0];
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
     var n_hstore: usize = 0;
-    for (t.instrs, 0..) |ins, i| {
+    for (t.code.instrs, 0..) |ins, i| {
         if (ins.op != .hstore) continue;
         n_hstore += 1;
         var pinned = false;
-        for (t.instrs[0..i]) |prior| {
+        for (t.code.instrs[0..i]) |prior| {
             if ((prior.op == .guard_int or prior.op == .guard_float) and prior.a == ins.b) {
                 pinned = true;
                 break;
@@ -3343,7 +3343,7 @@ test "recorder (hash alias): same key through two table refs classifies MAY and 
     , true);
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
     try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
@@ -3371,7 +3371,7 @@ test "recorder (hash alias): a pending astore never aliases a hash load (NO) —
     const text = try dumpTrace(&buf, &vm);
     try testing.expect(std.mem.indexOf(u8, text, "astore") != null);
     try testing.expect(std.mem.indexOf(u8, text, "hload") != null);
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
     try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
 }
 
@@ -3566,14 +3566,14 @@ test "doc 30 c5: the pattern/str2num loop runs NATIVELY end-to-end — find/matc
     // gmatch composite: sgmatch + deferred sgm_setpos + scap_str.
     var found_body = false;
     var found_gm = false;
-    for (vm.trace.cache.items) |t| {
+    for (vm.trace.registry.cache.items) |t| {
         var n_smatch: usize = 0;
         var has_sfindp = false;
         var has_str2num = false;
         var has_scap_str = false;
         var has_sgmatch = false;
         var has_setpos = false;
-        for (t.instrs) |ins| switch (ins.op) {
+        for (t.code.instrs) |ins| switch (ins.op) {
             .smatch => n_smatch += 1,
             .sfindp => has_sfindp = true,
             .str2num_i => has_str2num = true,
@@ -3666,12 +3666,12 @@ test "doc 30 c5: guard_sid identity pin — a pattern rebound between loop runs 
     // The identity pin must be present in a committed trace, and its aux is
     // a konst-pool id whose const IS the pinned pattern string.
     var found_sid = false;
-    for (vm.trace.cache.items) |t| {
-        for (t.instrs) |ins| {
+    for (vm.trace.registry.cache.items) |t| {
+        for (t.code.instrs) |ins| {
             if (ins.op != .guard_sid) continue;
             found_sid = true;
-            try testing.expect(ins.aux >= 0 and ins.aux < t.consts.len);
-            const kv = t.consts[@intCast(ins.aux)];
+            try testing.expect(ins.aux >= 0 and ins.aux < t.code.consts.len);
+            const kv = t.code.consts[@intCast(ins.aux)];
             try testing.expect(kv.isHeap() and kv.heapType() == .string);
         }
     }

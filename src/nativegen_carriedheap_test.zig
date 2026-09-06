@@ -18,10 +18,11 @@ const table = @import("table.zig");
 const arr = @import("array.zig");
 const string = @import("string.zig");
 const Value = value.Value;
-const Trace = trace.Trace;
+const Trace = @import("trace_code.zig").TraceCode;
 const RegWindow = @import("regwindow.zig").RegWindow;
 const testing = std.testing;
 const irinterp = @import("irinterp.zig");
+const trace_exec = @import("trace_exec.zig");
 const I = trace.IrInstr;
 
 const VALUE_LANE = nativegen.VALUE_LANE;
@@ -31,7 +32,6 @@ const is_x64_linux = nativegen.is_x64_linux;
 const util = @import("nativegen_testutil.zig");
 const expectBail = util.expectBail;
 const expectMatch = util.expectMatch;
-const expectMatchFrameless = util.expectMatchFrameless;
 const runNative = util.runNative;
 
 /// Build the canonical carried-heap universe: a `.value`-lane container whose dense
@@ -162,8 +162,8 @@ test "nativegen(doc22 A): carried-heap read loop matches on the frameless produc
     var es = [_]u16{};
     const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
 
-    try expectMatchFrameless(&tr, &.{ Value.heap(&container.header), Value.int(1), Value.heap(&elems[N - 1].header), Value.int(0) });
-    try expectMatchFrameless(&tr, &.{ Value.heap(&container.header), Value.int(10), Value.heap(&elems[2].header), Value.int(5) });
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(1), Value.heap(&elems[N - 1].header), Value.int(0) });
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(10), Value.heap(&elems[2].header), Value.int(5) });
 }
 
 test "nativegen(doc22 A): hstore through a carried-heap root writes the CURRENT table" {
@@ -228,7 +228,7 @@ test "nativegen(doc22 A): hstore through a carried-heap root writes the CURRENT 
     const iresult = irinterp.executeValues(&tr, iregs, values);
 
     // Native on universe B (same logical entry state).
-    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     const nregs = try gpa.dupe(Value, &.{ Value.heap(&cont_b.header), Value.int(1), Value.heap(&elems_b[N - 1].header), Value.nil() });
     defer gpa.free(nregs);
@@ -409,7 +409,7 @@ test "nativegen(doc22 B-i): dynamic-rooted href DEACTIVATES its hash_cell seed; 
         .{ .kind = .hash_cell, .source = 0, .slot = 4, .table_reg = 2, .expected_count = 1 },
     };
     const tr_hash = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins_hash };
-    var ct_hash = compile(gpa, &tr_hash) orelse return error.NativeBailedUnexpectedly;
+    var ct_hash = compile(gpa, &tr_hash, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct_hash.deinit();
     try testing.expect(!ct_hash.seed_plan.isActive(0));
     try testing.expect(!ct_hash.seed_plan.nonEmpty());
@@ -420,7 +420,7 @@ test "nativegen(doc22 B-i): dynamic-rooted href DEACTIVATES its hash_cell seed; 
         .{ .kind = .upvalue, .source = 0, .slot = 30 },
     };
     const tr_mixed = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins_mixed };
-    var ct_mixed = nativegen.compileSeeded(gpa, &tr_mixed, &dummy_seed_ctx) orelse return error.NativeBailedUnexpectedly;
+    var ct_mixed = nativegen.compileSeeded(gpa, &tr_mixed, 0, &dummy_seed_ctx) orelse return error.NativeBailedUnexpectedly;
     defer ct_mixed.deinit();
     try testing.expect(!ct_mixed.seed_plan.isActive(0));
     try testing.expect(ct_mixed.seed_plan.isActive(1));
@@ -457,7 +457,7 @@ test "nativegen(doc22 B-i): static-rooted href keeps its hash_cell seed ACTIVE" 
         .{ .kind = .hash_cell, .source = 0, .slot = 3, .table_reg = 0, .expected_count = 0 },
     };
     const tr = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins };
-    var ct = nativegen.compileSeeded(gpa, &tr, &dummy_seed_ctx) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compileSeeded(gpa, &tr, 0, &dummy_seed_ctx) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     try testing.expect(ct.seed_plan.isActive(0));
     try testing.expect(ct.seed_plan.nonEmpty());
@@ -484,7 +484,7 @@ test "nativegen(doc22 B-i): more inputs than the plan can name bails the compile
     var ins: [65]trace.InputSeed = undefined;
     for (&ins) |*seed| seed.* = .{ .kind = .upvalue, .source = 0, .slot = 30 };
     const tr = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins };
-    try testing.expect(compile(gpa, &tr) == null);
+    try testing.expect(compile(gpa, &tr, 0) == null);
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +565,7 @@ test "nativegen(doc22 B-ii): SEED_OK — prologue calls seed_fn once with the pl
         .{ .kind = .hash_cell, .source = 0, .slot = 4, .table_reg = 0, .expected_count = 1 },
     };
     const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins };
-    var ct = nativegen.compileSeeded(gpa, &tr, &env_seed_ctx) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compileSeeded(gpa, &tr, 0, &env_seed_ctx) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     try testing.expect(ct.seed_plan.isActive(0));
 
@@ -620,7 +620,7 @@ test "nativegen(doc22 B-ii): SEED_HASH_DECLINE — terminal before the body, reg
         .{ .kind = .hash_cell, .source = 0, .slot = 4, .table_reg = 0, .expected_count = 1 },
     };
     const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins };
-    var ct = nativegen.compileSeeded(gpa, &tr, &env_seed_ctx) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compileSeeded(gpa, &tr, 0, &env_seed_ctx) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
 
     const regs_init = [_]Value{ Value.heap(&kt.header), Value.int(0), Value.int(4), Value.int(0), Value.int(0) };
@@ -633,15 +633,15 @@ test "nativegen(doc22 B-ii): SEED_HASH_DECLINE — terminal before the body, reg
         pays[i] = v.payload.bits;
     }
     seed_env = .{ .ret = trace.NativeSeedCtx.SEED_HASH_DECLINE };
-    var ledger: [irinterp.LEDGER_CAP]irinterp.LedgerEntry = undefined;
+    var ledger: [trace_exec.LEDGER_CAP]trace_exec.LedgerEntry = undefined;
     const r = ct.runCapturingLedger(RegWindow.of(tags, pays), &ledger, .{});
 
     try testing.expectEqual(@as(usize, 1), seed_env.calls);
     try testing.expectEqual(@as(usize, 0), r.completed); // zero local progress
-    try testing.expectEqual(irinterp.ExitReason.seed_hash_decline, r.exit_reason);
+    try testing.expectEqual(trace_exec.ExitReason.seed_hash_decline, r.exit_reason);
     try testing.expectEqual(std.math.maxInt(u32), r.exit_instr); // like prologue_fail
     try testing.expectEqual(@as(u32, 1), r.ledger_len); // one terminal row
-    try testing.expectEqual(irinterp.LedgerKind.seed_hash_decline, ledger[0].kind);
+    try testing.expectEqual(trace_exec.LedgerKind.seed_hash_decline, ledger[0].kind);
     try testing.expectEqual(@as(usize, 0), ledger[0].cum);
     // The body never ran: every lane bit is exactly the entry state.
     for (regs_init, 0..) |v, i| {
@@ -666,7 +666,7 @@ test "nativegen(doc22 B-ii): SEED_CAPACITY_DECLINE — and any out-of-grammar re
         .{ .kind = .hash_cell, .source = 0, .slot = 4, .table_reg = 0, .expected_count = 1 },
     };
     const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins };
-    var ct = nativegen.compileSeeded(gpa, &tr, &env_seed_ctx) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compileSeeded(gpa, &tr, 0, &env_seed_ctx) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
 
     const regs_init = [_]Value{ Value.heap(&kt.header), Value.int(0), Value.int(4), Value.int(0), Value.int(0) };
@@ -681,13 +681,13 @@ test "nativegen(doc22 B-ii): SEED_CAPACITY_DECLINE — and any out-of-grammar re
         pays[i] = v.payload.bits;
     }
     seed_env = .{ .ret = trace.NativeSeedCtx.SEED_CAPACITY_DECLINE };
-    var ledger: [irinterp.LEDGER_CAP]irinterp.LedgerEntry = undefined;
+    var ledger: [trace_exec.LEDGER_CAP]trace_exec.LedgerEntry = undefined;
     const r = ct.runCapturingLedger(RegWindow.of(tags, pays), &ledger, .{});
     try testing.expectEqual(@as(usize, 0), r.completed);
-    try testing.expectEqual(irinterp.ExitReason.seed_capacity_decline, r.exit_reason);
+    try testing.expectEqual(trace_exec.ExitReason.seed_capacity_decline, r.exit_reason);
     try testing.expectEqual(std.math.maxInt(u32), r.exit_instr);
     try testing.expectEqual(@as(u32, 1), r.ledger_len);
-    try testing.expectEqual(irinterp.LedgerKind.seed_capacity_decline, ledger[0].kind);
+    try testing.expectEqual(trace_exec.LedgerKind.seed_capacity_decline, ledger[0].kind);
     for (regs_init, 0..) |v, i| {
         try testing.expectEqual(@intFromEnum(v.tag), tags[i]);
         try testing.expectEqual(v.payload.bits, pays[i]);
@@ -697,7 +697,7 @@ test "nativegen(doc22 B-ii): SEED_CAPACITY_DECLINE — and any out-of-grammar re
     // capacity exit (whose consumer — next-candidate — is sound for garbage).
     seed_env = .{ .ret = 77 };
     const rg = ct.runCapturingLedger(RegWindow.of(tags, pays), &ledger, .{});
-    try testing.expectEqual(irinterp.ExitReason.seed_capacity_decline, rg.exit_reason);
+    try testing.expectEqual(trace_exec.ExitReason.seed_capacity_decline, rg.exit_reason);
     try testing.expectEqual(@as(usize, 0), rg.completed);
 }
 
@@ -737,7 +737,7 @@ test "nativegen(doc22 B-v §B.6): redundant-seed deactivation — a STALE hash s
         .{ .kind = .hash_cell, .source = 0, .slot = 4, .table_reg = 2, .expected_count = 99 },
     };
     const tr_a = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins_stale };
-    var ct_a = nativegen.compileSeeded(gpa, &tr_a, &env_seed_ctx) orelse return error.NativeBailedUnexpectedly;
+    var ct_a = nativegen.compileSeeded(gpa, &tr_a, 0, &env_seed_ctx) orelse return error.NativeBailedUnexpectedly;
     defer ct_a.deinit();
     try testing.expect(!ct_a.seed_plan.nonEmpty());
 
@@ -777,7 +777,7 @@ test "nativegen(doc22 B-v §B.6): redundant-seed deactivation — a STALE hash s
         .{ .kind = .upvalue, .source = 0, .slot = 5 },
     };
     const tr_b = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins_mixed };
-    var ct_b = nativegen.compileSeeded(gpa, &tr_b, &env_seed_ctx) orelse return error.NativeBailedUnexpectedly;
+    var ct_b = nativegen.compileSeeded(gpa, &tr_b, 0, &env_seed_ctx) orelse return error.NativeBailedUnexpectedly;
     defer ct_b.deinit();
     try testing.expect(!ct_b.seed_plan.isActive(0));
     try testing.expect(ct_b.seed_plan.isActive(1));

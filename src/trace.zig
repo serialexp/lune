@@ -25,6 +25,7 @@
 //! Policy is set by docs/design/01-trace-lifecycle.md and refined by docs 15-40.
 
 const std = @import("std");
+const native_physical = @import("trace_native_registry.zig");
 const bytecode = @import("bytecode.zig");
 const arith = @import("arith.zig");
 const value = @import("value.zig");
@@ -36,6 +37,7 @@ const tropt = @import("tropt.zig");
 const execlog = @import("execlog.zig");
 const nativegen = @import("nativegen.zig");
 const irinterp = @import("irinterp.zig");
+const trace_exec = @import("trace_exec.zig");
 const jitdbg = @import("jitdbg.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
@@ -62,6 +64,19 @@ pub const trace_link_mod = @import("trace_link.zig");
 pub const trace_regionops_mod = @import("trace_regionops.zig");
 pub const trace_chain_mod = @import("trace_chain.zig");
 pub const trace_recorder_mod = @import("trace_recorder.zig");
+pub const trace_code = @import("trace_code.zig");
+pub const trace_record = @import("trace_record.zig");
+pub const trace_entry_registry = @import("trace_entry_registry.zig");
+
+pub const TraceCode = trace_code.TraceCode;
+pub const TraceRecord = trace_record.TraceRecord;
+pub const Trace = TraceRecord;
+pub const EntryPatchState = trace_record.EntryPatchState;
+pub const EntryGuardType = trace_code.EntryGuardType;
+pub const EntryGuard = trace_code.EntryGuard;
+pub const InputKind = trace_code.InputKind;
+pub const InputSeed = trace_code.InputSeed;
+pub const NativeSeedCtx = trace_code.NativeSeedCtx;
 
 pub const Ref = trace_ir.Ref;
 pub const SnapIdx = trace_ir.SnapIdx;
@@ -135,7 +150,7 @@ pub const programPointLess = trace_region.programPointLess;
 ///
 /// Returns a static empty slice when there is nothing to carry (no alloc). Caller
 /// owns the result.
-/// Populate `t.bridge_cand` / `t.bridge_cand_built` by evaluating the pure
+/// Populate `t.code.bridge_cand` / `t.code.bridge_cand_built` by evaluating the pure
 /// `nativegen.isCompositeBridgeCandidate` oracle once per instruction index
 /// (doc 17 §T.9). Call once, at commit, after `t` is fully populated.
 ///
@@ -144,20 +159,7 @@ pub const programPointLess = trace_region.programPointLess;
 /// error return — a commit must never fail because an accelerator could not be
 /// allocated.
 pub fn buildBridgeCandMemo(gpa: std.mem.Allocator, t: *Trace) void {
-    if (t.instrs.len == 0) {
-        // Nothing to memoize, but mark it built: the oracle returns false for every
-        // index on an empty trace, which an empty bitset reproduces exactly.
-        t.bridge_cand_built = true;
-        return;
-    }
-    const bytes = gpa.alloc(u8, (t.instrs.len + 7) / 8) catch return;
-    @memset(bytes, 0);
-    for (0..t.instrs.len) |i| {
-        if (nativegen.isCompositeBridgeCandidate(t, i))
-            bytes[i >> 3] |= @as(u8, 1) << @intCast(i & 7);
-    }
-    t.bridge_cand = bytes;
-    t.bridge_cand_built = true;
+    @import("trace_finalize.zig").buildBridgeCandMemo(gpa, &t.code);
 }
 
 pub fn buildExitProv(
@@ -166,54 +168,27 @@ pub fn buildExitProv(
     old_to_new: ?[]const ?Ref,
     link_terminal: ?ExitProvEntry,
 ) ![]ExitProvEntry {
-    if (old_to_new) |m| std.debug.assert(m.len >= rec_exit_prov.len);
-    var count: usize = if (link_terminal != null) 1 else 0;
-    for (rec_exit_prov, 0..) |p, i| {
-        if (p == null) continue;
-        const survived = if (old_to_new) |m| m[i] != null else true;
-        if (survived) count += 1;
-    }
-    if (count == 0) return &.{};
-    const out = try gpa.alloc(ExitProvEntry, count);
-    errdefer gpa.free(out);
-    var k: usize = 0;
-    for (rec_exit_prov, 0..) |p, i| {
-        const prov = p orelse continue;
-        const committed: u32 = if (old_to_new) |m| (m[i] orelse continue) else @intCast(i);
-        out[k] = .{ .index = committed, .prov = prov };
-        k += 1;
-    }
-    if (link_terminal) |lt| {
-        out[k] = lt;
-        k += 1;
-    }
-    std.debug.assert(k == count);
-    // Committed indices are already ascending for guards/fused producers (neither is
-    // hoisted into the preheader, so compaction preserves their relative order), but
-    // sort defensively so `Trace.provAt`'s binary search is correct regardless of any
-    // future LICM change.
-    std.mem.sort(ExitProvEntry, out, {}, exitProvEntryLess);
-    return out;
+    return @import("trace_finalize.zig").buildExitProv(gpa, rec_exit_prov, old_to_new, link_terminal);
 }
 
 /// Whether IR instruction `idx` of `t` is a numeric-for loop-done guard: a
 /// `guard_true` whose deopt PC lands immediately after a `for_loop` bytecode op.
 /// Mirrors nativegen's `isNumericForLoopDoneGuard`, kept here so the arming side can
 /// enforce the P-C option (b) invariant (2.3c-0a) without reaching into codegen.
-/// Returns before touching `t.anchor` when `idx` is out of range, so it is safe on
+/// Returns before touching `t.code.anchor` when `idx` is out of range, so it is safe on
 /// synthetic traces with an undefined anchor and empty `instrs`.
 pub fn isLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
-    if (idx >= t.instrs.len) return false;
-    const g = t.instrs[idx];
+    if (idx >= t.code.instrs.len) return false;
+    const g = t.code.instrs[idx];
     if (g.op != .guard_true) return false;
     const exit_pc = guardExitPc(g) orelse return false;
-    if (exit_pc == 0 or exit_pc > t.anchor.proto.code.len) return false;
-    if (t.anchor.proto.code[guardSourcePc(g).?].op != .for_loop) return false;
+    if (exit_pc == 0 or exit_pc > t.code.anchor.proto.code.len) return false;
+    if (t.code.anchor.proto.code[guardSourcePc(g).?].op != .for_loop) return false;
     // Inlined-callee corner: a callee-internal `for_loop` guard at `inline_depth > 0` has its
     // `guardSourcePc` in the callee's proto, not the anchor's. If the callee's pc
     // coincidentally maps to a `for_loop` in the anchor proto, this would falsely
     // match. Reject inlined-callee guards via the exit provenance table.
-    if (t.provAt(@intCast(idx))) |prov| switch (prov) {
+    if (t.code.provAt(@intCast(idx))) |prov| switch (prov) {
         .guard => |gp| if (gp.inline_depth > 0) return false,
         .link_terminal => return false, // a link terminal is never a loop-done guard
     };
@@ -227,7 +202,7 @@ pub fn isLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
 /// observed continue direction) whose source opcode is the `jmp_if_false`.
 /// Classified structurally, tied to the trace's own anchor: the branch's jump
 /// target must be exactly one past a backward `jmp` that returns to
-/// `t.anchor.pc` — that shape IS the while loop this trace is the root of, and
+/// `t.code.anchor.pc` — that shape IS the while loop this trace is the root of, and
 /// it cannot match an inner while unrolled inside the trace (its back-edge
 /// targets the inner header, not our anchor).
 ///
@@ -240,11 +215,11 @@ pub fn isLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
 /// Same doc-37 provenance rule as the numeric classifier: an inlined-callee
 /// guard's `guardSourcePc` is in the callee's proto — reject depth > 0.
 pub fn whileLoopDonePostPc(t: *const Trace, idx: usize) ?u32 {
-    if (idx >= t.instrs.len) return null;
-    const g = t.instrs[idx];
+    if (idx >= t.code.instrs.len) return null;
+    const g = t.code.instrs[idx];
     if (g.op != .guard_true) return null;
     const src_pc = guardSourcePc(g) orelse return null;
-    const proto = t.anchor.proto;
+    const proto = t.code.anchor.proto;
     if (src_pc >= proto.code.len) return null;
     const br = proto.code[src_pc];
     if (br.op != .jmp_if_false) return null;
@@ -258,8 +233,8 @@ pub fn whileLoopDonePostPc(t: *const Trace, idx: usize) ?u32 {
     // backward `jmp`, returning exactly to the trace's anchor (the condition).
     const back = proto.code[post - 1];
     if (back.op != .jmp) return null;
-    if (@as(i64, post) + back.aux != @as(i64, t.anchor.pc)) return null;
-    if (t.provAt(@intCast(idx))) |prov| switch (prov) {
+    if (@as(i64, post) + back.aux != @as(i64, t.code.anchor.pc)) return null;
+    if (t.code.provAt(@intCast(idx))) |prov| switch (prov) {
         .guard => |gp| if (gp.inline_depth > 0) return null,
         .link_terminal => return null,
     };
@@ -285,8 +260,8 @@ pub fn isWhileLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
 /// run-once-region loop-done (idx before the marker) stays chain-safe: zero
 /// completions there really is zero iterations.
 pub fn whileDoneCoherentAtZero(t: *const Trace, idx: usize) bool {
-    if (!t.peeled) return true;
-    for (t.instrs[0..@min(idx, t.instrs.len)]) |ins| {
+    if (!t.code.peeled) return true;
+    for (t.code.instrs[0..@min(idx, t.code.instrs.len)]) |ins| {
         if (ins.op == .preheader) return false; // marker precedes the exit → steady region
     }
     return true;
@@ -307,26 +282,7 @@ pub fn isAnyLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
 /// guard slot, and conversely `.link_terminal` / `.ordinary_guard` arms must never
 /// land on one (a loop-done ordinary deopt reaches `shared_exit` through the memory-
 /// staged `NativeResult.exit_target`, never through `slot[ei]`).
-pub const ArmKind = enum {
-    /// `.link`-terminal handoff (2.3b-1). The terminal is a `.link` op, never a guard.
-    link_terminal,
-    /// Ordinary source-branch guard slot (2.3c-1). Must not be a loop-done guard.
-    ordinary_guard,
-    /// The loop-done linked-materialized exit (2.3c-2). Must be a loop-done guard.
-    loop_done_linked,
-    /// Part A edge-4 bridge: a composite ordinary guard whose stub commits the
-    /// dominance-scoped phi snapshot before entering the child's ordinary entry.
-    region_bridge,
-    /// Part S (doc 17): native SIBLING HANDOFF. An anchor-coherent ordinary deopt
-    /// exit whose child is a trace at the SAME anchor as the parent — the native
-    /// compilation of doc 16's coherent-anchor chain. The parent's carried-home
-    /// flush leaves regs coherent at the shared anchor, so the child's ordinary
-    /// entry (its own compiled prologue guards re-validating types) is exactly the
-    /// state an ordinary dispatcher re-entry would have produced. Reuses the
-    /// ordinary-guard slot and stub verbatim; only the arm kind and the replay
-    /// production are new.
-    sibling_handoff,
-};
+pub const ArmKind = native_physical.ArmKind;
 
 // Region-bridge arming (A-vii-d): always on since the full chain landed — the
 // replay grammar (A-vii-a), the arm-time S⊆E validator (A-vii-b), the
@@ -396,7 +352,7 @@ pub const ChainTier = enum { ir, native_only };
 /// where tier-0 must resume if the drive yields, and whether a loop-done commit is
 /// still owed before a continuation can run. (Design doc 16, "exit kinds".)
 ///   * `.ordinary_header`       — an ordinary guard exit; `regs` are coherent at
-///                                `failed.anchor.pc` and nothing is owed.
+///                                `failed.code.anchor.pc` and nothing is owed.
 ///   * `.ir_numeric_for_done`   — a tier-1a numeric-`for` loop-done exit; the final
 ///                                iteration's sunk stores + φ hand-off are still in
 ///                                the carried executor scratch (`[]Value`) and must
@@ -422,58 +378,9 @@ pub const ExitMaterialization = union(enum) {
 /// `.jloop`
 /// patched into a per-VM code image to its qualified root trace. Slots are
 /// **stable-address** (§R2-6): each is its own heap allocation, the index in
-/// `TraceState.entry_patches` is baked into the image instruction's `.b`, and
+/// `TraceState.registry.entry_registry.entry_patches` is baked into the image instruction's `.b`, and
 /// tombstoned slots are reused via `entry_patch_free` — never compacted.
-/// Doc 20 §R4-2: per-trace entry-patch lifecycle. Suppression is split by
-/// reason because the arms have different wake behaviour (§R5-2, §R6-2):
-/// `.suppressed_incumbent` is woken only by its recorded incumbent's
-/// tombstone; `.suppressed_capacity` by ANY tombstone; `.suppressed_permanent`
-/// (not-`.compiled`, ambiguous patch pc — properties that never change) is
-/// never woken, the trace simply keeps entering via the walk.
-pub const EntryPatchState = enum {
-    eligible,
-    pending,
-    bound,
-    suppressed_incumbent,
-    suppressed_capacity,
-    suppressed_permanent,
-};
-
-pub const EntryPatch = struct {
-    /// The bound root. Valid to dereference ONLY while `live` (§R7-2):
-    /// `removeTrace` clears `live` through `Trace.entry_slot` BEFORE
-    /// `t.destroy` frees the allocation; the drain resolves `trace_id`
-    /// through `traceById` and never follows this pointer.
-    trace: *Trace,
-    /// Non-reused id for drain-time identity; `traceById` returning null
-    /// means the trace is already destroyed (§R7-2).
-    trace_id: u32,
-    proto: *const Proto,
-    /// Instruction index of the patched loop-closing instruction in the image.
-    patch_pc: u32,
-    /// Canonical content, restored on unpatch (debug-asserted identical to
-    /// `proto.code[patch_pc]`, which is the ground truth anyway).
-    orig: Instr,
-    /// Cleared by any unpatch mark; the arm inspects it BEFORE the
-    /// post-return drain, never after (§R2-4, §R7-1).
-    live: bool = true,
-    /// Set with `live = false` by `markEntryPatchPending`; consumed by the
-    /// safe-point drain (§R5-1 same-turn).
-    pending_unpatch: bool = false,
-    /// Slot is dead and on (or headed for) the free-list.
-    tombstone: bool = false,
-    /// Non-productive patched entries since the last productive one; at
-    /// `patch_strikes` the arm marks pending unpatch (§R6-1).
-    strikes: u8 = 0,
-    /// EntryPlan (§R1-4/6), the structural half of seeding memoized at patch
-    /// time. The input-slot → seed-source map already lives on the trace
-    /// (`Trace.inputs`); the only piece `seedTraceInputs` re-derives per entry
-    /// is the scratch-size high-water mark (`max(num_registers, max input
-    /// slot + 1)`) — memoized here. Seed VALUES are still re-resolved every
-    /// entry and every fail-closed check stays in `enterSelectedTrace`; the
-    /// plan is never claimed total.
-    seed_count: u32,
-};
+pub const EntryPatch = trace_entry_registry.EntryPatch;
 
 /// Per-anchor cooldown record for the gate (`TraceState.gate`). An anchor that
 /// thrashed (low-yield penalty maxed) or could not be traced (abort / commit
@@ -541,430 +448,8 @@ pub const GuardKey = struct { anchor: AnchorKey, exit_pc: u32 };
 pub const DbgTerminalKey = struct {
     trace_id: u32,
     exit_instr: u32,
-    kind: irinterp.LedgerKind,
-    outcome: irinterp.LedgerOutcome,
-};
-
-/// The kind of type a trace's entry guard enforces on a register.
-pub const EntryGuardType = enum(u8) {
-    int,
-    float,
-    number, // accepts both int and float (guard_number)
-    table,
-};
-
-/// A register and the type it must have for this trace to be entered.
-/// Pairs are computed from the trace's IR at commit time and stored as a
-/// runtime-only fingerprint — not serialized.
-pub const EntryGuard = struct { slot: u16, ty: EntryGuardType };
-
-/// Where a synthetic trace input is resolved from at entry (cross-frame tracing,
-/// cluster sub-lever 1). A callee reached through an UPVALUE or GLOBAL is a
-/// loop-invariant register value the executor cannot read (it has no `*Vm`, no
-/// closure). The recorder snapshots it into a dead slab slot *above* the anchor
-/// frame window and reads it as an ordinary `slot_load`; the dispatch loop seeds
-/// the slot once per entry (`upvalGet`/`globals.get`) before running the trace.
-/// `hash_cell` (doc 11, H1): the loop-invariant **value-cell pointer** of a
-/// constant-key field access (`obj.field`). Unlike `upvalue`/`global` it seeds no
-/// `slot_load` — the existing `href` op consumes it (via `href.aux == slot`) — and
-/// it writes a raw `@intFromPtr(cell)` into the slab payload for the **native** path
-/// only; the tier-1a oracle ignores the slot and re-derives the cell from `href`'s
-/// `(table,key)` operands each iteration (so H0's IR and exec-log behaviour are
-/// frozen). Re-resolved every entry via `Table.fieldPtr`, so — like every seed — no
-/// pointer is ever serialized.
-pub const InputKind = enum(u8) { upvalue, global, hash_cell, callee_upvalue };
-
-/// One synthetic entry input the dispatch loop resolves and writes into the slab
-/// before trace entry. For `upvalue`/`global`: `source` is the upvalue index
-/// (`closure.upvalues[source]`) or the global key's constant-pool index
-/// (`proto.constants[source]`); `slot` is the synthetic frame-relative slab slot
-/// (== the seeding `slot_load`'s `aux`), always `>= anchor_num_registers`. For
-/// `callee_upvalue` (inlined-callee upvalues): `source` is the upvalue index in the *inlined
-/// callee's* closure, and `callee_slot` is the anchor-slab slot where that
-/// callee's closure lives at entry time — the seed resolves through
-/// `Closure.fromHeader(regGet(base + callee_slot)).upvalues[source]`. The
-/// callee's own seed (kind=`upvalue` or a regular `slot_load`) is always
-/// earlier in the seed array, so `callee_slot` is populated before this seed
-/// runs. For `hash_cell` (H1): `source` is the **key**'s constant-pool index,
-/// `table_reg` is the anchor slot holding the table value, and `expected_count`
-/// is the recorded `hash.count()` (the `guard_hash` aux) the seed re-checks for
-/// native eligibility. Runtime-only — not serialized (precedent: `entry_guards`).
-pub const InputSeed = struct {
-    kind: InputKind,
-    source: u32,
-    slot: u16,
-    /// `hash_cell` only: anchor slot the table value lives in at entry.
-    table_reg: u16 = 0,
-    /// `hash_cell` only: recorded `hash.count()` — the entry must match it (the
-    /// native analogue of the oracle's per-iteration `guard_hash` count check), else
-    /// the entry declines native and runs tier-1a (which side-exits at `guard_hash`).
-    expected_count: u32 = 0,
-    /// `callee_upvalue` only (inlined-callee upvalues): anchor-slab slot where the inlined callee's
-    /// closure lives at entry time. The callee was already seeded (as an `upvalue`
-    /// or regular `slot_load` input) before this seed, so `regGet(base +
-    /// callee_slot)` is valid by the time this seed runs.
-    callee_slot: u16 = 0,
-};
-
-/// Doc 22 §B.1: the per-VM native seeding context. A seeded trace's entry
-/// prologue (B-ii) and `driveChain`'s tier-1a seeding twin (B-iii) resolve
-/// entry inputs *from native/chain code*, where no `*Vm` argument exists — so
-/// the VM publishes everything the seeding helper needs into this struct once
-/// per episode (`Vm.prepareNativeEpisode`), and compiled pages bake `&ctx` as
-/// an imm64. Hence it MUST be heap-allocated with a stable address: `Vm` is a
-/// by-value struct that may move; this ctx may not. Owned by `TraceState`
-/// (created by `Vm.initBare`, freed in `TraceState.deinit`).
-///
-/// Freshness: a baked `&ctx` outlives episodes, so consumers must check that
-/// the ctx describes the CURRENT activation before trusting it — `proto` and
-/// `call_seq` are the stamp (`stubEnterable`, B-iv). `proto == null` means "no
-/// episode prepared yet" and can never read as fresh.
-///
-/// All pointers are `anyopaque` because trace.zig cannot name `Vm`/`Closure`/
-/// `Proto` (interp.zig imports trace.zig, not vice versa); `seed_fn` (installed
-/// once by `Vm.initBare`, pointing at interp.zig's C-ABI seeding twin) casts
-/// them back.
-pub const NativeSeedCtx = struct {
-    /// `seed_fn` result grammar (u64 for C-ABI simplicity; doc 22 §B.2).
-    pub const SEED_OK: u64 = 1;
-    /// A hash_cell seed failed validation (metatable appeared, key vanished,
-    /// `hash.count()` drifted): the entry must not run natively this episode.
-    pub const SEED_HASH_DECLINE: u64 = 2;
-    /// The seed slots don't fit the register slab (`base + count > capacity`):
-    /// nothing was written; the candidate itself is unusable at this depth.
-    pub const SEED_CAPACITY_DECLINE: u64 = 3;
-
-    /// `*Vm`, valid for the prepared episode only.
-    vm: *anyopaque = undefined,
-    /// `*const function.Closure` of the anchor frame (upvalue seeds).
-    closure: *const anyopaque = undefined,
-    /// Anchor frame base into the register slab.
-    base: usize = 0,
-    /// `Vm.regCapacity()` at episode start (capacity-decline check).
-    reg_capacity: usize = 0,
-    /// `*const Proto` of the anchor frame — half the freshness stamp, and the
-    /// constant pool for global/hash_cell key resolution. `null` ⇒ never fresh.
-    proto: ?*const anyopaque = null,
-    /// The anchor frame's activation token — the other half of the stamp.
-    call_seq: u64 = 0,
-    /// The C-ABI seeding twin (interp.zig `nativeSeedFn`): resolves the plan's
-    /// ACTIVE seeds into the slab, returns SEED_OK / SEED_HASH_DECLINE /
-    /// SEED_CAPACITY_DECLINE. Installed once at VM init; never reassigned.
-    ///
-    /// The plan travels BY VALUE (`plan_bits`, the `SeedPlan.bits` bitmap): the
-    /// caller is JIT-emitted prologue code that bakes its arguments as imm64s at
-    /// compile time, and `&CompiledTrace.seed_plan` has no stable address to bake
-    /// (`compileImpl` returns the struct by value). `&t` and `&ctx` bake fine —
-    /// committed traces are heap-allocated and immutable, the ctx is heap-allocated
-    /// by design. (Recorded deviation from doc 22 §B.1's `*const SeedPlan` sketch.)
-    seed_fn: *const fn (ctx: *const NativeSeedCtx, t: *const Trace, plan_bits: u64) callconv(.c) u64,
-    /// The tier-1a seeding twin (interp.zig `nativeSeedTier1aFn`; doc 22 §B.3),
-    /// called from `driveChain`'s chain seams (`seedForTier1a`) before each
-    /// `irinterp.execute` of a seeded successor. Unlike the C-ABI plan twin it
-    /// resolves the FULL input set — tier-1a's `slot_load`s read every synthetic
-    /// slot; seed plans are a native-page concept (carried-heap rewrites) that
-    /// never deactivates tier-1a's needs — and it is a plain Zig fn pointer (the
-    /// callers are chain seams, not JIT-emitted code, so nothing is baked).
-    /// Same tri-state result grammar. Optional so hand-built test ctxs that only
-    /// exercise the C-ABI prologue keep compiling; consumers fail closed.
-    seed_tier1a_fn: ?*const fn (ctx: *const NativeSeedCtx, t: *const Trace) u64 = null,
-};
-
-/// A completed, cached trace: the recorded IR plus the entry/exit snapshots that
-/// connect it back to tier-0 register slots. The IR is immutable once
-/// committed; a trace leaves the cache only wholesale (`removeTrace` /
-/// `clearCache` — see the lifecycle doc).
-pub const Trace = struct {
-    /// Stable, monotonically-assigned identity (P-B, doc 17). Unlike the cache
-    /// index (`traceIndex`, which `swapRemove` shuffles), this is assigned once at
-    /// finalize from `TraceState.next_trace_id` and NEVER reused — so it can be
-    /// baked into native exit code as `final_trace_id` and resolved back via
-    /// `traceById` even after unrelated traces retire. Default 0 for hand-built test
-    /// traces that never go through finalize (they don't chain, so id collisions are
-    /// harmless — the dispatcher's id path only runs for real recorded traces).
-    id: u32 = 0,
-    /// Doc 20 §R7-2: back-reference to this trace's entry-patch registry slot
-    /// while entry-patch-bound, else null. Lets `removeTrace` mark the slot
-    /// (clear `live`, set pending) in O(1) BEFORE destruction, and lets
-    /// qualification assert a trace never binds two slots.
-    entry_slot: ?u16 = null,
-    /// Doc 20 §R4-2: the per-trace entry-patch state machine. The receipt
-    /// funnel (`accountTraceRun`) may make exactly ONE transition —
-    /// `.eligible → .pending` — behind a single state compare, so a `.bound`
-    /// trace's productive receipts cost one never-taken branch. Every other
-    /// transition happens at the safe-point drain (`drainEntryPatchWork`) or
-    /// an unpatch (`unpatchSlot`), all deterministic events.
-    entry_patch: EntryPatchState = .eligible,
-    /// Valid ONLY while `entry_patch == .suppressed_incumbent`: the registry
-    /// slot index of the live incumbent that blocked this trace's install.
-    /// Its tombstone (and only its) wakes this trace back to `.eligible`.
-    entry_patch_incumbent: u16 = 0,
-    anchor: AnchorKey,
-    /// Doc 38 unroll-first policy: this trace's recording unrolled at least one
-    /// inner-while back-edge inline. When such a trace's anchor is gated for
-    /// legacy thrash, that gate is evidence unrolling does not cover this
-    /// outer loop's trip variance (`unroll_fail`).
-    unrolled_while: bool = false,
-    /// Doc 39: this trace was committed from a type-stabilizing PEEL — its
-    /// `preheader` run-once region is a real tier-0 iteration (iteration 1,
-    /// original int semantics), not an LICM-hoisted invariant block. SEMANTIC
-    /// state, serialized (schema v bump): the first back-edge completes TWO
-    /// tier-0 iterations, and a deopt at zero local completions must leave the
-    /// carried-slot boxes untouched (tier-0 replays iteration 1 from the entry
-    /// state). Cannot be inferred from the marker — an LICM'd trace carries the
-    /// same marker but its preheader completes ZERO iterations.
-    peeled: bool = false,
-    /// The straight-line IR, terminated by a `loop` instruction.
-    instrs: []IrInstr,
-    /// Constants referenced by `konst` instructions (may include heap values, so
-    /// the collector roots these — see `Vm.collect`).
-    consts: []Value,
-    /// Tier-0 registers read as inputs, in `slot_load` order (the entry snapshot).
-    entry_slots: []u16,
-    /// Synthetic entry inputs (cross-frame tracing cluster sub-lever 1): each
-    /// loop-invariant upvalue/global callee the dispatch loop must resolve and seed
-    /// into a dead slab slot above the anchor window before entry. Empty for the
-    /// common case (no upvalue/global-reached callee). Runtime-only — not
-    /// serialized; freed in `destroy`.
-    inputs: []InputSeed = &.{},
-    /// Entry type guards extracted from the IR at commit time: for each register
-    /// this trace guards on entry, the type it must have.  Used by
-    /// `matchesFingerprint` to skip non-matching traces without a trial entry.
-    /// Runtime-only — not serialized.
-    entry_guards: []EntryGuard,
-    /// Tier-1b native-codegen cache (Phase 8): lazily compiled machine code for
-    /// this trace, or a terminal `unsupported` verdict. `unattempted` until the
-    /// first native dispatch (`TraceState.nativeFor`). Runtime-only — not part of
-    /// the serialized trace; the page is freed in `destroy`.
-    native: nativegen.NativeState = .unattempted,
-    /// Runtime counter: how many times this trace has committed a useful
-    /// number of iterations (>= `min_useful`).  Used by `findTrace` to
-    /// return the most-successful trace first — a stable frequency-based
-    /// priority that does not thrash on alternating types.
-    hit_count: u64 = 0,
-    /// Consecutive native-prologue refusals for this candidate. Any body entry
-    /// resets the streak; a maxed streak suppresses only this trace.
-    consec_refusals: u32 = 0,
-    /// Doc 24 D3: the trace's static allocation bound `A` — the number of
-    /// `.alloc`-kind ops the recorded body contains (0 = non-allocating, the
-    /// arc-A status quo). Mirrors the entry `guard_gc`'s `aux` (stamped from the
-    /// same counter at commit, so it stays an upper bound even if the optimizer
-    /// CSEs an `.alloc` away). Read by the observation blackout: while
-    /// suspension/keyframe observation is armed, the dispatcher and the chain
-    /// walk decline to enter any trace with `alloc_bound > 0` (doc 24 D3,
-    /// codex #2). Runtime-only — not serialized (recomputable from the IR).
-    alloc_bound: u32 = 0,
-
-    /// Doc 26 D1: the IR contains `supper`/`slower`, whose heap-only kernels
-    /// are sound ONLY because the session's Unicode-version pin
-    /// (`Vm.unicode_version_pinned`) was committed before this trace could
-    /// commit and is monotone for the VM's lifetime. Debug asserts check the
-    /// pin at commit, at trace entry, and at link ARMING (a patched
-    /// native→native transfer has no vm in reach; by monotonicity a pin that
-    /// held at arm time holds forever after). Runtime-only, recomputable.
-    requires_unicode_pin: bool = false,
-
-    /// B-iv.3 backoff: the exit whose composite-bridge arm pipeline last ran in
-    /// full and declined because the child's page was not stub-enterable.
-    /// `maybeArmCompositeExit` short-circuits on a hit, so a durably
-    /// non-enterable child costs ONE full pipeline run per
-    /// (activation x `region_defs_gen`) instead of one per terminal composite
-    /// deopt. Purely an accelerator: it can only skip work that would have
-    /// declined identically, never change an arm decision that would otherwise
-    /// have been made. `maxInt` = no memo. Runtime-only — not serialized.
-    bridge_decline_exit: u32 = std.math.maxInt(u32),
-    /// `region_defs_gen` the memo was stamped under; 0 = never stamped.
-    bridge_decline_gen: u32 = 0,
-    /// `region_context.call_seq` the memo was stamped under.
-    bridge_decline_seq: u64 = 0,
-
-    /// Exit provenance (doc 17, A-i / 9-B): the guest-logical identity of each
-    /// side-exit / `.link` terminal, keyed by *committed* instruction index, sorted
-    /// by index (alloc-once at commit — guards are a minority of instrs). Empty for
-    /// hand-built test traces and until A-i.3 stamps sites. Runtime-only — transient
-    /// JIT-tiering metadata, never serialized, never a `.snapshot` root. Read by the
-    /// Part-A region classifier via `provAt`; freed in `destroy`.
-    exit_prov: []ExitProvEntry = &.{},
-    /// Whether `exit_prov` is the COMPLETE exit table (doc 17 §A8-ii, A-ii.4 fail-soft).
-    /// `false` iff the commit-time `buildExitProv` OOM'd and this trace was committed with
-    /// an EMPTY exit table rather than aborting the commit (same fail-soft rationale as
-    /// `rec_path_complete` — a `commit` error gates the anchor and perturbs tiering, and
-    /// `exit_prov` is region metadata off the tier-selection path, though the Part-A
-    /// classifier and successor resolution do consume it). A
-    /// truncated table means this trace contributes NO structural edges, so the whole edge
-    /// graph is missing edges; region discovery then arms/mints NOTHING that pass (a
-    /// dropped *boundary* edge could otherwise shrink an owner's competing-entry count and
-    /// spuriously flip a region armable). Default `true`. Runtime-only — not serialized.
-    exit_prov_complete: bool = true,
-    /// Ordered recorded guest program-points (doc 17 §A8-ii, A-ii.3), dup'd from the
-    /// recorder at commit; the membership-set basis A-ii.4 unions per region. Empty
-    /// when membership was *unavailable* (a recorder-path OOM flipped `rec_path_ok`)
-    /// or for hand-built test traces. Owned; freed in `destroy`. Not serialized.
-    rec_path: []ProgramPoint = &.{},
-    /// Whether `rec_path` is the COMPLETE recorded membership (doc 17 §A8-ii, A-ii.4
-    /// fail-soft — round-14 review finding 3). `false` iff a recorder-path OOM
-    /// (`rec_path_ok` flipped) OR the commit-time `rec_path` dup OOM'd truncated it, so
-    /// the two "empty" cases (unavailable vs legitimately empty) are distinguishable.
-    /// Region discovery fails any region containing an incomplete member CLOSED
-    /// (`armable = false`) rather than minting it on truncated membership. Default
-    /// `true` (a legitimately-empty path — incl. hand-built test traces — is complete).
-    /// Runtime-only — not serialized.
-    rec_path_complete: bool = true,
-
-    /// Memoized `nativegen.isCompositeBridgeCandidate` (doc 17 §T.9), one bit per
-    /// committed instruction index, LSB-first. That oracle is a PURE function of
-    /// immutable recorded data (`instrs`, `anchor.proto.code`, `provAt`) that ends in
-    /// an O(`instrs`) scan, and the seam calls it once per receipt from eight sites —
-    /// 4.68% of nsieve N=9 wall-clock spent recomputing a constant. Alloc-once at
-    /// commit; owned; freed in `destroy`; never serialized.
-    ///
-    /// `bridge_cand_built` distinguishes "not built" from "built and all-zero" — the
-    /// build is FAIL-SOFT (an OOM must not abort the commit, same rationale as
-    /// `exit_prov`), and hand-built test traces never go through commit at all. When
-    /// false, `isBridgeCandidate` falls back to calling the oracle, so the memo is a
-    /// pure accelerator: results are identical either way, by construction.
-    bridge_cand: []const u8 = &.{},
-    bridge_cand_built: bool = false,
-
-    /// Memo for `TraceState.anchorPopulation`: the `countTracesAt(anchor)` result as
-    /// of `TraceState.cache_gen == anchor_pop_gen`. Gen 0 = never computed (state
-    /// gens start at 1). Pure accelerator — recomputed on any cache mutation.
-    anchor_pop_gen: u32 = 0,
-    anchor_pop: u32 = 0,
-
-    /// Memo for `TraceState.hasNativeLoopDoneLink` — a pure function of this
-    /// trace's instrs (fixed after commit), its dispatch proto (fixed: the
-    /// anchor proto), and the trace cache contents (covered by
-    /// `TraceState.cache_gen`). Ran per NATIVE DISPATCH before; now one gen
-    /// compare in steady state. Gen 0 = never computed.
-    ldl_memo_gen: u32 = 0,
-    ldl_memo: bool = false,
-
-    /// Pall's per-snapshot exit hotcount (`snap->count`, lj_trace.c
-    /// `trace_hotside`): one taken-exit counter per committed instruction index,
-    /// bumped by `noteTakenExit` on EVERY taken exit through that instruction.
-    /// `EXIT_COUNT_DONE` (255, LuaJIT's `SNAPCOUNT_DONE`) latches once a side
-    /// trace triggered by this exit commits — the exit is never counted again.
-    /// Alloc-once at commit (FAIL-SOFT: an OOM leaves it empty and
-    /// `noteTakenExit` bounds-checks, costing hotness, never correctness — same
-    /// rationale as `bridge_cand`); empty for hand-built test traces; owned;
-    /// freed in `destroy`; never serialized. Per-receipt cost is one direct
-    /// byte RMW — no hashing (the Part S lesson below: a per-receipt hashmap
-    /// probe was a measured 15% regression).
-    exit_counts: []u8 = &.{},
-
-    /// Part S — the sibling-handoff watch, deliberately a THREE-SCALAR, one-slot,
-    /// allocation-free counter rather than a `(trace, exit) -> u32` side map.
-    ///
-    /// The first cut of Part S kept a `sibling_counts` hashmap keyed by `ExitKey` and
-    /// resolved its owner with a `traceById` linear scan, both executed on EVERY
-    /// dispatcher burst terminal (472k times on nsieve N=9). Measured: the bookkeeping
-    /// cost more than the handoff saved — a 26% burst reduction that came out 15%
-    /// SLOWER on the clock. The counter therefore has to be free, not merely cheap:
-    ///
-    ///   * one watched exit at a time (`sibling_watch_exit`), so a receipt is a `u32`
-    ///     compare and an increment — no hashing, no probe, no allocation;
-    ///   * eligibility is only consulted when the watch MOVES, not per receipt;
-    ///   * `sibling_arms` is a COUNT, and its only per-receipt job is the `== 0` fast
-    ///     reject in `hasArmedSiblingHandoff`.
-    ///
-    /// A count rather than a bool because a trace can have several hot exits and each
-    /// deserves its own handoff. The first cut latched a bool on the first arm, which
-    /// silently capped nsieve at ONE arm: exit 9 fused, and exit 16 — still terminating
-    /// 304k bursts, half the remaining seam — could never be watched again. After the
-    /// arm the watch resets so the next exit can qualify; an exit that is already armed
-    /// is rejected by `siblingHandoffEligible`, so it cannot re-arm.
-    ///
-    /// Determinism is unchanged: all three are pure functions of the receipt stream,
-    /// in receipt order. The one-slot watch is *less* eager than a full per-exit map
-    /// (two co-hot exits qualify one after the other, not simultaneously), which can
-    /// only ever DELAY an arm — never arm something a map wouldn't have.
-    sibling_watch_exit: u32 = std.math.maxInt(u32),
-    sibling_watch_count: u32 = 0,
-    sibling_arms: u32 = 0,
-    /// Single-slot INELIGIBLE-exit memo for `noteSiblingTerminal`: the last exit
-    /// whose `siblingHandoffEligible` came back false. Repeat receipts at that
-    /// exit are one `u32` compare instead of a full eligibility re-scan (measured:
-    /// nsieve terminated 84k bursts/run at one statically-ineligible exit, each
-    /// re-running the armed-links scan + bridge memo + branch-source test — ~5%
-    /// wall-clock). Sound because eligibility for a fixed `(trace, exit)` is
-    /// static EXCEPT for the armed-slot exclusion, so the memo is cleared wherever
-    /// the arm set touching this trace changes (`clearSiblingLatch`, a successful
-    /// sibling arm).
-    sibling_reject_exit: u32 = std.math.maxInt(u32),
-
-    /// Freeze-after-qualify membership memo (task #70, the runtime-seam kill): the
-    /// last `regionMemberPoint(rid, anchor)` answer for this trace, keyed by
-    /// `(region_defs_gen, rid)`. `replayLedger`'s frozen fast path asks "is this
-    /// row's owner anchored inside the live region's footprint" once per ROW; the
-    /// answer is a pure function of the trace anchor (immutable) and the region
-    /// def's `member_points`/`armable` (invalidated by bumping
-    /// `TraceState.region_defs_gen` at every `region_defs` mutation), so two
-    /// scalars + a bool replace a per-row footprint scan. Gen 0 never matches
-    /// (`region_defs_gen` starts at 1), so a fresh trace always recomputes.
-    region_memo_rid: u64 = std.math.maxInt(u64),
-    region_memo_gen: u32 = 0,
-    region_memo_member: bool = false,
-
-    /// Memoized `nativegen.isCompositeBridgeCandidate(self, idx)` — see `bridge_cand`.
-    /// Falls back to the oracle when the memo was not built.
-    pub fn isBridgeCandidate(self: *const Trace, idx: usize) bool {
-        if (!self.bridge_cand_built)
-            return nativegen.isCompositeBridgeCandidate(self, idx);
-        if (idx >= self.instrs.len) return false; // oracle's own bound
-        return (self.bridge_cand[idx >> 3] >> @intCast(idx & 7)) & 1 != 0;
-    }
-
-    /// The exit provenance at committed instruction index `idx`, or `null` if that
-    /// instruction is not a tracked exit. Binary search over the sorted table.
-    pub fn provAt(self: *const Trace, idx: u32) ?ExitProvenance {
-        var lo: usize = 0;
-        var hi: usize = self.exit_prov.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            const e = self.exit_prov[mid];
-            if (e.index == idx) return e.prov;
-            if (e.index < idx) lo = mid + 1 else hi = mid;
-        }
-        return null;
-    }
-
-    /// Free a heap-allocated trace and its arrays.
-    /// LuaJIT's `SNAPCOUNT_DONE` (lj_jit.h): a side trace for this exit has been
-    /// committed — stop counting it. Saturation caps at `DONE - 1` so an exit can
-    /// never drift into DONE by counting alone.
-    pub const EXIT_COUNT_DONE: u8 = 255;
-
-    pub fn destroy(self: *Trace, gpa: std.mem.Allocator) void {
-        self.native.deinit();
-        gpa.free(self.instrs);
-        gpa.free(self.consts);
-        gpa.free(self.entry_slots);
-        gpa.free(self.entry_guards);
-        if (self.inputs.len != 0) gpa.free(self.inputs);
-        if (self.exit_prov.len != 0) gpa.free(self.exit_prov);
-        if (self.rec_path.len != 0) gpa.free(self.rec_path); // A-ii.3
-        if (self.bridge_cand.len != 0) gpa.free(self.bridge_cand); // §T.9 memo
-        if (self.exit_counts.len != 0) gpa.free(self.exit_counts); // hotexit counters
-        gpa.destroy(self);
-    }
-
-    /// Check whether the current register types match this trace's entry
-    /// type guards (the fingerprint).  Returns true if all guarded slots
-    /// have the expected type, or if the trace has no entry guards at all
-    /// (hand-built test traces, traces without type guards).
-    pub fn matchesFingerprint(self: *const Trace, regs: RegWindow) bool {
-        for (self.entry_guards) |g| {
-            const v = regs.get(g.slot);
-            switch (g.ty) {
-                .int => if (!v.isInt()) return false,
-                .float => if (!v.isFloat()) return false,
-                .number => if (!v.isNumber()) return false,
-                .table => if (!v.isHeap() or v.heapType() != .table) return false,
-            }
-        }
-        return true;
-    }
+    kind: trace_exec.LedgerKind,
+    outcome: trace_exec.LedgerOutcome,
 };
 
 // ---------------------------------------------------------------------------
@@ -975,74 +460,7 @@ pub const Trace = struct {
 /// tier-0 entirely untouched; the anchor may be retried later (penalty/blacklist
 /// backoff is a later increment — see the lifecycle doc). `recordInstr` and the
 /// state machine fill these in (Increment B).
-pub const AbortReason = enum {
-    /// An opcode the recorder does not yet model (tables, globals, concat, …).
-    nyi_opcode,
-    /// A `call`/`ret`/`halt` — cross-frame tracing is deferred.
-    cross_frame,
-    /// A host (`native`) call — always a trace barrier (`02-determinism.md`).
-    host_barrier,
-    /// The trace exceeded `maxrecord` instructions.
-    too_long,
-    /// An operand had a type the recorder cannot guard/model here.
-    bad_type,
-    /// An indexed/appended table carries a metatable, so the access may dispatch
-    /// a `__index`/`__newindex` metamethod (chunk 2a). Recording aborts: the
-    /// metamethod call would be a trace barrier anyway, and a present-slot raw
-    /// read/store could silently skip a metamethod on a *later* iteration if the
-    /// table's shape changes. Conservative and exact — these tables run tier-0,
-    /// which does full metamethod dispatch. Lifting this needs a
-    /// `guard_no_metatable` IR op (deferred perf follow-up).
-    has_metatable,
-    /// Allocation failed while building the trace.
-    alloc,
-    /// Cross-frame inlining exceeded `MAX_INLINE_DEPTH`. (Deep/unbounded
-    /// recursion is Phase 3.) Exactly the call-nesting meaning the name says —
-    /// the reservation-overflow and input-budget conditions that used to share
-    /// this tag have their own reasons below (`frame_bounds`, `input_cap`), so
-    /// an abort table names WHICH limit fired (the LATEST-94 misdiagnosis came
-    /// from having to guess).
-    too_deep,
-    /// An inlined callee window (`recCall`) or a dynamic return write
-    /// (`recReturn`, multret shapes) would overflow the recorder's grown
-    /// `reg_map` reservation. Abort rather than panic on an OOB slab access;
-    /// tier-0 owns the loop.
-    frame_bounds,
-    /// The synthetic entry-input machinery refused: the trace already carries
-    /// `MAX_TRACE_INPUTS` upvalue/global/hash-cell snapshots (a pure-policy
-    /// backstop — see the constant's comment), or the synthetic slot index
-    /// would wrap its `u16`. The trace's actual usage is visible as
-    /// `inputs=N/cap` in `--dump-traces`/`--dump-native`.
-    input_cap,
-    /// Doc 38 / LuaJIT `LJ_TRERR_LLEAVE` ("leaving loop in root trace"): a ROOT
-    /// recording anchored at a `while`/`repeat` header observed its own loop's
-    /// exit direction on the condition branch. A root must loop back to form a
-    /// root trace — recording onward would wander into the enclosing loop and
-    /// commit a rotated outer trace at the inner anchor (frequently
-    /// type-unstable across the enclosing back-edge, e.g. `local k = 64` int
-    /// vs the loop body's float — the analyze RV-3 bail), clogging the anchor
-    /// the nested-loop continuation machinery needs for the loop-BODY root.
-    /// Repeated `loop_leave` strikes at an anchor mark a low-trip-count loop;
-    /// `recWhileLink` then lets an outer root unroll it (LuaJIT's
-    /// `innerloopleft` fallback).
-    loop_leave,
-    /// Doc 39: a type-stabilizing peel (int-entry/float-body carried slots)
-    /// recorded its second pass and the carried kinds STILL mismatched — a
-    /// genuine per-iteration flip-flop, or a forbidden effect surfaced on the
-    /// body pass (a path iteration 1 didn't take). Ordinary strike semantics:
-    /// such a shape was uncompilable before the peel existed and stays so.
-    type_instability,
-    /// An error unwound through the dispatch loop while this recording was
-    /// active (doc 26 D1a). The raise itself is not part of the recorded IR, so
-    /// letting the recording survive the unwind would stitch post-catch
-    /// instructions (an enclosing `pcall`'s continuation) onto the partial
-    /// iteration — a Franken-path that could commit if control re-reached the
-    /// anchor. Reachable today via `schar1` (records under `guard_int`, then
-    /// tier-0's `string.char` raises on an out-of-range value under an
-    /// enclosing pcall); `Vm.execWith`'s errdefer kills the recording at the
-    /// innermost unwind instead.
-    raised,
-};
+pub const AbortReason = trace_recorder_mod.AbortReason;
 
 /// One aggregated abort, accumulated in `TraceState.abort_log` when
 /// `config.record_aborts`. Rows are deduped by `(anchor.pc, reason, op)` so a
@@ -1316,45 +734,9 @@ inline fn hotIndex(proto: *const Proto, pc: u32) usize {
 /// at `slot_index` currently jumps straight into `child`'s body. Keyed by trace
 /// identity (not a raw slot address) so lifetime resets stay valid no matter which
 /// end retires first — the slot address is re-derived from the live `parent` at reset.
-pub const NativeLink = struct {
-    parent: *Trace,
-    slot_index: u32,
-    child: *Trace,
-    /// A-vii-d.1: the arm kind is part of the record so replay can validate a
-    /// `.region_bridge` row against the exact provenance that armed it (review
-    /// blocker 3: never a global historical `region_defs` scan).
-    kind: ArmKind,
-    /// Set only for `.region_bridge` arms: the exact live region the arm was
-    /// proven against. Every discovery rebuild disarms region-bridge links whose
-    /// region is no longer live-armable (fail-closed on topology transitions).
-    region_id: ?RegionId = null,
-    /// `region_defs_gen` at the moment the `.region_bridge` arm pipeline last
-    /// fully validated this link (`tryArmRegionBridge` stamps it with
-    /// `region_id`). The already-armed early-out in `maybeArmCompositeExit`
-    /// honors the arm only while this gen is current: a discovery rebuild
-    /// replaces `def.bridges`/membership under the same region id without
-    /// touching the link (the stale-link sweep checks region LIVENESS, not the
-    /// exact bridge proof — codex review of f613c98), so a gen mismatch forces
-    /// one full re-validation instead of trusting obsolete provenance forever.
-    armed_gen: u32 = 0,
-    /// Replay-walk memo for `.region_bridge` rows: the unique registered edge the
-    /// slow resolution (provAt → def lookup → members scan, all release-panicking)
-    /// produced, stamped with `region_defs_gen`. On a gen match the row grammar
-    /// validates the successor against this edge directly — the defs have not
-    /// changed since the full proof ran, so every slow-path verdict is unchanged
-    /// by construction. Gen 0 = never resolved (state gens start at 1).
-    bridge_edge: ?StructuralEdgeId = null,
-    bridge_edge_gen: u32 = 0,
-};
+pub const NativeLink = native_physical.NativeLink;
 
-pub const PromotedEdge = struct {
-    parent: *Trace,
-    exit: u32,
-    kind: nativegen.ExitPatchKind,
-    child: *Trace,
-    arm_kind: ArmKind,
-    resume_pc: u32,
-};
+pub const PromotedEdge = native_physical.PromotedEdge;
 
 /// B-3d (doc 17 §B3.16 D2): the promoted unit is the frozen region's armed-edge
 /// SET in canonical (parent id, exit) order — no ring order exists and none is
@@ -1363,13 +745,7 @@ pub const PromotedEdge = struct {
 /// (`firings`/`last_ordinal`/`last_productive_ordinal`), never reconstructed
 /// from position.
 // pub for trace_chain.zig (file-split pass)
-pub const PromotedSet = struct {
-    edges: []PromotedEdge,
-    summary: []nativegen.SilentSummaryCell,
-    metadata: []nativegen.SilentExitMetadata,
-    region_key: RegionKey,
-    id: u32,
-};
+pub const PromotedSet = native_physical.PromotedSet;
 
 const PromotionRejects = struct {
     bridge_member: u64 = 0,
@@ -1516,18 +892,7 @@ pub const TraceState = struct {
     /// where allocating traces fail closed (tier-1a side-exits the `.alloc`
     /// arm, `compileInto` declines the page).
     exec_heap: ?*gc.Heap = null,
-    /// Shared machine-code arena — all tier-1b native traces are co-located slices of
-    /// this (P-D of the exit-branch-patching port, doc 17). Replaces the old one-
-    /// `mmap`-per-trace model so a future increment can link trace→trace with a bare
-    /// `rel32` jump. Lifetime ≥ every trace (deinited *after* the cache is freed).
-    mcode_arena: nativegen.McodeArena,
-    /// Doc 22 §B.1: the per-VM native seeding context (see `NativeSeedCtx`).
-    /// Created by `Vm.initBare` (NOT `TraceState.init`, which stays infallible —
-    /// its ~120 call sites are hand-built test states that never run native
-    /// seeded entries and leave this null); freed here in `deinit`. Compiled
-    /// pages bake the pointer as an imm64, so it is assigned once and never
-    /// reallocated for the VM's lifetime.
-    native_seed_ctx: ?*NativeSeedCtx = null,
+    registry: @import("trace_registry.zig").TraceRegistry,
     /// Back-edge counters keyed by loop-header anchor. Only touched on the *slow*
     /// path (when the hot-count pre-filter trips), so for a non-gated anchor it
     /// still counts every back-edge (the pre-filter leaves un-gated slots at 0),
@@ -1535,28 +900,6 @@ pub const TraceState = struct {
     /// coarse (the pre-filter skips most of its back-edges), which is fine — the
     /// gate's own cooldown is driven by `tick`, not this.
     counters: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
-    /// Doc 20: per-VM copy-on-patch code images (§R1 fix). Canonical
-    /// `Proto.code` is NEVER mutated; the first patch into a proto clones its
-    /// code here and patches mutate only the clone. ONLY the dispatch fetch
-    /// reads images (`codeFor`); recorder/predicates/visualiser/keyframes
-    /// read canonical by construction. Lifetime is epoch-stable (§R2-2):
-    /// freed only in `dropEntryPatchState` (epoch clear / deinit), never on
-    /// last-unpatch. Empty forever on an unpatched run (§T7).
-    code_images: std.AutoHashMapUnmanaged(*const Proto, []Instr) = .empty,
-    /// Doc 20 §R2-1/§R3-4: monotone generation bumped on every image
-    /// create/publish; `execImpl` re-resolves its cached `code` local in the
-    /// back-edge epilogue when this differs from the generation it cached.
-    /// `u64` so wrap-aliasing is structurally unreachable.
-    image_gen: u64 = 0,
-    /// Doc 20 §R2-6: the entry-patch registry. Indexed by the `.b` operand of
-    /// patched `.jfor_loop` / `.jloop` instructions; each slot is its own allocation
-    /// (stable addresses), tombstoned + reused via `entry_patch_free`.
-    entry_patches: std.ArrayListUnmanaged(*EntryPatch) = .empty,
-    entry_patch_free: std.ArrayListUnmanaged(u16) = .empty,
-    /// Count of pending-unpatch marks awaiting the safe-point drain. A bare
-    /// counter (not a list) so `markEntryPatchPending` cannot OOM mid-grammar
-    /// (§R2-4); the drain early-outs at 0 and scans slots only when dirty.
-    entry_patch_dirty: u32 = 0,
     /// Monotonic global back-edge tick. Incremented on *every* back-edge in the
     /// dispatch loop — including ones the hot-count pre-filter skips — so it is the
     /// one clock that never freezes. The gate's `retry_at` cooldown is measured in
@@ -1569,13 +912,6 @@ pub const TraceState = struct {
     /// to `GATE_SKIP` when an anchor is found gated, so a dead loop's millions of
     /// back-edges cost an array decrement instead of three hashmap probes apiece.
     hotcount: [HOTCOUNT_SIZE]u16 = @splat(0),
-    /// Committed traces. A linear scan is fine — the cache stays small (dozens,
-    /// not thousands) and dispatch goes through per-anchor lookups.
-    cache: std.ArrayListUnmanaged(*Trace) = .empty,
-    /// Next stable `Trace.id` to hand out (P-B, doc 17). Monotonic; never decremented,
-    /// so a retired trace's id is never reassigned and a baked `final_trace_id` can
-    /// never alias a different live trace.
-    next_trace_id: u32 = 0,
     /// Armed native links (P-E, doc 17 Increment 2.3). Each record is a `parent`
     /// trace whose frameless exit slot `parent.native.compiled.slots[slot_index]` has
     /// been written to jump directly into `child`'s body. Kept so a retiring trace can
@@ -1586,19 +922,11 @@ pub const TraceState = struct {
     /// child-retire tries to write through them. `resetLinksTouching` handles both
     /// directions by trace *identity* (never a raw slot pointer), so it is correct
     /// regardless of retire order. Populated by `armNativeLink` (2.3b+).
-    armed_links: std.ArrayListUnmanaged(NativeLink) = .empty,
     /// B-3b.2 silent-cycle registry. `promoted_exit_owners` is the exclusive
     /// physical-exit ownership index required by §B3.9(4); ids, rather than list
     /// indices, remain stable across swap-removal.
-    promoted_sets: std.ArrayListUnmanaged(PromotedSet) = .empty,
-    promoted_exit_owners: std.AutoHashMapUnmanaged(ExitKey, u32) = .empty,
-    next_promoted_set_id: u32 = 1,
-    promotion_candidate: []PromotedEdge = &.{},
-    promotion_candidate_run: u32 = 0,
-    promotion_candidate_region: ?RegionKey = null,
     /// Cycle ids queued while replay is validating the armed-link registry.
     /// Capacity is reserved before promotion publication, so queuing is infallible.
-    pending_demote: std.ArrayListUnmanaged(PendingDemotion) = .empty,
     /// Part B-2b: persistent hotexit-provenance relations. Edges are expected to
     /// be few, so lifecycle operations deliberately use linear scans.
     provenance_edges: std.ArrayListUnmanaged(ProvenanceEdge) = .empty,
@@ -1622,20 +950,6 @@ pub const TraceState = struct {
     /// episode) is a distinct value from every proto pointer, so the pass-level
     /// staleness seam re-opens correctly too.
     provenance_drain_episode: ?*const anyopaque = null,
-    /// Trace-cache mutation generation: bumped on every `cache` append/remove/clear.
-    /// Keys the per-trace `anchor_pop_*` memo so hot-path anchor-population queries
-    /// (`anchorPopulation`) are one compare in steady state instead of an O(cache)
-    /// `countTracesAt` scan per receipt. Starts at 1 so a fresh trace's memo (gen 0)
-    /// always recomputes; wrap-around collision would need 2^32 mutations inside one
-    /// trace's lifetime — not reachable.
-    cache_gen: u32 = 1,
-    /// O(1) `traceById` index: slot `id` holds the live committed trace with that
-    /// id, or null (retired / gap / never registered). Ids are monotonic and never
-    /// reused (P-B), so the array only grows with commits. Maintained fail-soft: a
-    /// grow-OOM at commit simply leaves the id unindexed and `traceById` falls back
-    /// to the linear cache scan (hand-built test traces appended straight to
-    /// `cache` take that fallback too), so results are identical by construction.
-    trace_by_id: std.ArrayListUnmanaged(?*Trace) = .empty,
     /// A-vii-d.1: at most one bridge-arm request recorded by `replayLedger` when
     /// it walks a terminal composite `.deopt` row, drained by the ledger DRIVERS
     /// via `drainPendingBridgeArm` after the replay returns (never mid-walk —
@@ -1662,9 +976,7 @@ pub const TraceState = struct {
     /// DRIVERS apply the deferred disarm via `applyPendingDisarms` immediately
     /// after the walk returns, BEFORE acting on the directive — so no native
     /// code ever runs between the deferral and its application.
-    replay_walk_depth: u32 = 0,
     /// The deferred `disarmAllLinks` request (see `replay_walk_depth`).
-    pending_disarm_all: bool = false,
     /// Anchors currently held off tier-1 with a doubling cooldown (`Gate`). Set
     /// when a recording aborts, a commit fails, or the low-yield re-entry penalty
     /// maxes out. Unlike the old permanent blacklist, an anchor here is *retried*
@@ -1713,74 +1025,7 @@ pub const TraceState = struct {
     /// productive one clears it (doc 31 D2); at `config.max_penalty` the anchor
     /// is gated off with a doubling cooldown (`onSideExit` → `gateAnchor`).
     penalty: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
-    /// Pure ephemeral structural-edge cache (doc 17 §A3.3 / §A8-ii, A-ii.2):
-    /// `{Trace.id, exit_instr} → StructuralEdgeId`. Rebuilt WHOLESALE from the current
-    /// cache at every commit AND every retirement (never surgically mutated), dropped
-    /// in `clearCache`, freed in `deinit`. NOT a source of truth — consumed by the
-    /// region classifier and region-bridge validation (`validateRegionBridge`).
-    /// A rebuild reserves capacity BEFORE clearing the prior snapshot, so a
-    /// commit-path OOM RETAINS it and a retirement-path OOM fail-closes to EMPTY
-    /// (both region-neutral: an empty cache arms nothing).
-    edge_cache: std.AutoHashMapUnmanaged(ExitKey, StructuralEdgeId) = .empty,
-    /// Discovered region definitions keyed by interned `RegionId` (doc 17 §A3.1 /
-    /// §A8-ii, A-ii.4). **Proto/VM-lifetime**: accumulated as traces commit, NEVER
-    /// cleaned by `removeTrace` (a GC-physical retire must not diverge
-    /// `gc_stress on/off`), cleared ONLY wholesale in `clearCache` (the epoch boundary
-    /// where protos may be freed). Owns each `RegionDef`'s `members`/`member_points`.
-    /// Consumed by the arming path (`armable` flips, `edgeMemberOfRegion`).
-    region_defs: std.AutoHashMapUnmanaged(RegionId, RegionDef) = .empty,
-    /// Invalidation generation for `Trace.region_memo_*` (freeze-after-qualify,
-    /// task #70). Bumped at EVERY `region_defs` mutation — new/updated defs and
-    /// every `armable` flip — so per-trace footprint-membership memos never
-    /// outlive the def state they were computed against. Starts at 1 so a fresh
-    /// trace's memo gen 0 can never spuriously match.
-    region_defs_gen: u32 = 1,
-    /// Single-slot cache of the qualified-live-activation resolution inside
-    /// `qualifiedActiveMember` (task #70 seam work): the `activeRegionFor` map
-    /// iteration + `region_profit.getPtr` + qualification check for one
-    /// `call_seq`. `act_cache_gen == 0` means invalid; it is zeroed by
-    /// `refreshObserverFast` (the single hook every `region_profit` mutation
-    /// already runs through, so the cached `accum` pointer can never dangle) and
-    /// by the `useful_window_seen` flip (which changes the cached verdict without
-    /// mutating the map). The `region_defs_gen` half of the key covers footprint
-    /// changes.
-    act_cache_seq: u64 = 0,
-    act_cache_gen: u32 = 0,
-    act_cache: ?MemberAccum = null,
-    /// Interns a region's canonical sorted INTERNAL edge SET → its `RegionId` (same
-    /// Proto/VM lifetime as `region_defs`). Hash-bucketed; a hit confirmed by
-    /// element-wise set equality (collision mints a distinct id).
-    region_intern: RegionInternMap = .empty,
-    /// Next `RegionId` to mint (monotonic; mirrors `next_trace_id`). A discovery pass
-    /// that OOMs before publishing does NOT bump it — the tentative ids it staged are
-    /// simply never used (ids need only be unique, not contiguous).
-    next_region_id: u64 = 0,
-    /// Physical classification index (doc 17 §A3.1 / §A3.3): a concrete trace exit
-    /// `{Trace.id, exit_instr}` → the regions it belongs to (internal edges + boundary
-    /// exits that LEAVE the region from a member anchor). **Physical + transient**:
-    /// WHOLESALE-rebuilt per discovery pass AND per `removeTrace` from the surviving
-    /// cache; excludes `armable == false` regions. Owns each `[]RegionId`. Queried by
-    /// `classifyExit`, whose result feeds `tryArmRegionBridge`. A retirement-rebuild
-    /// OOM publishes EMPTY (fail-closed — the prior set references a dead trace).
-    source_exit_regions: std.AutoHashMapUnmanaged(ExitKey, []RegionId) = .empty,
-    /// Physical classification index (doc 17 §A3.1): a concrete `Trace.id` → the
-    /// regions entered by landing in it (destination of an internal edge; physical
-    /// members only). Same lifetime/rebuild/ownership rules as `source_exit_regions`.
-    dest_entry_regions: std.AutoHashMapUnmanaged(u32, []RegionId) = .empty,
-    /// A-iv: persistent across physical trace retirement/re-arm, bounded by live
-    /// activation lifetime and cleared on activation death / restore / epoch end.
-    /// Opening a logical region is the only operation that may grow this map;
-    /// the per-op observer only probes/removes existing entries.
-    region_profit: std.AutoHashMapUnmanaged(RegionKey, RegionAccum) = .empty,
-    region_context: ?RegionContext = null,
-    /// A-vii-e.1: single-accumulator observer fast path (see `ObserverFast`).
-    observer_fast: ?ObserverFast = null,
-    /// A-vii-e.2: inline hot-span cache over `observer_fast` (see `ObserverHot`).
-    observer_hot: ObserverHot = .{},
-    /// Inert diagnostics used by the A-iv guards to prove full-window and
-    /// remainder flushes occurred. No tiering path consumes either counter.
-    region_profit_flushes: u64 = 0,
-    region_profit_flushed_work: u64 = 0,
+    region_policy: @import("trace_region_policy.zig").RegionPolicy = .{},
     /// Total trace entries executed (incremented in the dispatch loop before each
     /// `irinterp.execute`/native run). Diagnostic only — used to confirm the gate
     /// entry-check actually halts re-entry on a thrashing anchor, and a cheap
@@ -1871,12 +1116,9 @@ pub const TraceState = struct {
     /// blackout actually tore down a live cycle" signal for the disarm integration
     /// test (a byte-identical run under an open window cannot, by itself, prove a
     /// non-empty registry was torn down — the counter can).
-    native_link_disarms: u64 = 0,
-    silent_promotions: u64 = 0,
-    silent_demotions: u64 = 0,
     silent_promotion_candidates: u64 = 0,
     silent_rejects: PromotionRejects = .{},
-    silent_demotion_reasons: PromotionDemotions = .{},
+
     silent_bursts_drained: u64 = 0,
     silent_transitions_total: u64 = 0,
     silent_budget_exhaustions: u64 = 0,
@@ -1895,7 +1137,6 @@ pub const TraceState = struct {
     /// in turn". This peak can: `>= 3` with a `.region_bridge` among the kinds is
     /// the outer cycle `skip→…→cont→skip` standing complete. Diagnostic only — no
     /// selection path reads it, so it cannot perturb the 10-mode equivalence.
-    native_link_peak: usize = 0,
     /// A-vii-d (doc 17 §A-vii.2): count of composite bridge slots actually armed by
     /// `tryArmRegionBridge` — a region member's composite ordinary guard slot pointed
     /// at the registered successor's `ordinary_entry`, so the next time that guard
@@ -1999,7 +1240,7 @@ pub const TraceState = struct {
     /// TSC of the last trace-hop boundary — the start of the current hop's execution
     /// span. Stamped at trace-region entry (dispatcher `|buf|` block) and re-stamped
     /// by every `onSideExit`, which charges `now - last_hop_tsc` of *this hop's*
-    /// execution to *this hop's own anchor* (`t.anchor`). This is what makes per-anchor
+    /// execution to *this hop's own anchor* (`t.code.anchor`). This is what makes per-anchor
     /// traced time mirror the per-anchor iteration count: a chain hop into an inner
     /// trace bills its cycles to the inner anchor, not the outer entry anchor. Scratch,
     /// not reported. (A fused native span that replays several hops in one mcode run is
@@ -2013,7 +1254,7 @@ pub const TraceState = struct {
     /// anchor.
     coverage: std.AutoHashMapUnmanaged(AnchorKey, AnchorCoverage) = .empty,
     /// The in-progress recording (at most one at a time).
-    rec: Recorder = .{},
+    rec: RecordingSession = .{},
     /// Reusable SSA-value scratch for the tier-1a executor (`irinterp.execute`),
     /// indexed by `Ref`. Reused across every entry — never allocated
     /// per-iteration or per-entry. Not a GC root (the executor runs no
@@ -2057,9 +1298,9 @@ pub const TraceState = struct {
     /// `CompiledTrace.runCapturingLedger` and immediately replays it in
     /// `replayContinuationLedger`; the borrow lives only for that capture→replay
     /// window (no native call / resize / nested replay in between). Sized to
-    /// `irinterp.LEDGER_CAP`, the native append's own bound, so a full span always
+    /// `trace_exec.LEDGER_CAP`, the native append's own bound, so a full span always
     /// fits. Not a GC root (holds decoded scalars, no `Value`s).
-    ledger_scratch: [irinterp.LEDGER_CAP]irinterp.LedgerEntry = undefined,
+    ledger_scratch: [trace_exec.LEDGER_CAP]trace_exec.LedgerEntry = undefined,
     /// Last guard-failure instruction index, written by the dispatch loop when a
     /// trace side-exits with zero iterations. Used for per-guard PC recording
     /// (exit-PC-aware chaining). `maxInt(u32)` means no guard failed (clean exit
@@ -2076,7 +1317,7 @@ pub const TraceState = struct {
     /// exits that hand control back to the runtime. This is the target list for
     /// exit-branch patching (doc 17 Part B): every entry here is a runtime
     /// round-trip that a patched transition or freeze could eliminate.
-    dbg_burst_len_hist: [irinterp.LEDGER_CAP + 1]u64 = @splat(0),
+    dbg_burst_len_hist: [trace_exec.LEDGER_CAP + 1]u64 = @splat(0),
     dbg_burst_terminals: std.AutoHashMapUnmanaged(DbgTerminalKey, u64) = .empty,
     /// B-3c telemetry: composition of silent-burst SUFFIX ledgers — every
     /// materialized row a burst still produced despite live promotion, keyed
@@ -2156,7 +1397,7 @@ pub const TraceState = struct {
     abort_log: std.ArrayListUnmanaged(AbortRecord) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) TraceState {
-        return .{ .gpa = gpa, .mcode_arena = nativegen.McodeArena.init(gpa) };
+        return .{ .gpa = gpa, .registry = @import("trace_registry.zig").TraceRegistry.init(gpa) };
     }
 
     // --- live debug logging (jitdbg) ------------------------------------------
@@ -2185,7 +1426,7 @@ pub const TraceState = struct {
         // condition for the scan below to find anything. This runs once per non-final
         // `.deopt` row in the hot replay walk; the registry scan must not.
         if (parent.sibling_arms == 0) return false;
-        for (self.armed_links.items) |l| {
+        for (self.registry.native_physical.armedLinks()) |l| {
             if (l.kind == .sibling_handoff and l.parent == parent and
                 l.slot_index == exit_instr and l.child == child) return true;
         }
@@ -2220,8 +1461,8 @@ pub const TraceState = struct {
     /// state, so re-running the iteration re-interns identically (D2 id-stream).
     // pub for trace_link.zig (file-split pass)
     pub fn exitIsPreEffect(t: *const Trace, exit_instr: u32) bool {
-        const n = @min(@as(usize, exit_instr), t.instrs.len);
-        for (t.instrs[0..n]) |ins| switch (ins.op) {
+        const n = @min(@as(usize, exit_instr), t.code.instrs.len);
+        for (t.code.instrs[0..n]) |ins| switch (ins.op) {
             .astore, .astore_append, .hstore, .gstore => return false,
             else => {},
         };
@@ -2237,12 +1478,12 @@ pub const TraceState = struct {
             .compiled => |*cc| cc,
             else => return false,
         };
-        if (exit_instr >= c.slots.len or exit_instr >= t.instrs.len) return false;
+        if (exit_instr >= c.slots.len or exit_instr >= t.code.instrs.len) return false;
         // Already armed here: the slot is taken, so counting it again could only
         // produce a redundant arm. Consulted on the watch-MOVE path only, never
         // per receipt, so the registry scan stays off the hot path.
         if (t.sibling_arms != 0) {
-            for (self.armed_links.items) |l| {
+            for (self.registry.native_physical.armedLinks()) |l| {
                 if (l.kind == .sibling_handoff and l.parent == t and l.slot_index == exit_instr)
                     return false;
             }
@@ -2251,7 +1492,7 @@ pub const TraceState = struct {
         // ordinary loop-done deopt bypasses `slot[ei]` entirely in emission.
         if (isLoopDoneGuardIndex(t, exit_instr)) return false;
         // Bridge candidates run the A-v bridge stub body, not the plain path.
-        if (t.isBridgeCandidate(exit_instr)) return false;
+        if (t.code.isBridgeCandidate(exit_instr)) return false;
         // The anchor-coherence proof. Without it the handoff is not
         // semantics-preserving — see `exitIsPreEffect`.
         if (!exitIsPreEffect(t, exit_instr)) return false;
@@ -2272,10 +1513,10 @@ pub const TraceState = struct {
         // the anchor branch. Require the POSITIVE property instead: the guard's source
         // opcode is a conditional branch — the one bytecode shape where "this guard
         // failed" and "the sibling's branch was taken" are the same statement.
-        if (!self.isSourceBranchGuardExit(t, exit_instr, t.anchor.proto)) return false;
-        const src_pc = guardSourcePc(t.instrs[exit_instr]) orelse return false;
-        if (src_pc >= t.anchor.proto.code.len) return false;
-        switch (t.anchor.proto.code[src_pc].op) {
+        if (!self.isSourceBranchGuardExit(t, exit_instr, t.code.anchor.proto)) return false;
+        const src_pc = guardSourcePc(t.code.instrs[exit_instr]) orelse return false;
+        if (src_pc >= t.code.anchor.proto.code.len) return false;
+        switch (t.code.anchor.proto.code[src_pc].op) {
             .jmp_if_false, .jmp_if_true, .jmp_if_not_nil => {},
             else => return false,
         }
@@ -2325,7 +1566,7 @@ pub const TraceState = struct {
             return;
         };
         if (parent == child) return; // not a sibling handoff; wait for a real sibling
-        if (child.anchor.proto != parent.anchor.proto or child.anchor.pc != parent.anchor.pc)
+        if (child.code.anchor.proto != parent.code.anchor.proto or child.code.anchor.pc != parent.code.anchor.pc)
             return; // different anchor: this entry is not the one the request meant
         self.pending_sibling_arm = null;
         _ = self.publishSiblingArm(parent, key.exit_instr, child);
@@ -2337,7 +1578,7 @@ pub const TraceState = struct {
         if (!(self.armNativeLink(parent, exit_instr, child, .sibling_handoff) catch false))
             return false;
         self.dbg("sibling-arm: t={d} ei={d} op={s} -> t={d}", .{
-            parent.id, exit_instr, @tagName(parent.instrs[exit_instr].op), child.id,
+            parent.id, exit_instr, @tagName(parent.code.instrs[exit_instr].op), child.id,
         });
         self.sibling_handoff_arms +|= 1;
         // Fast-reject key for `hasArmedSiblingHandoff`; decremented by every
@@ -2354,7 +1595,7 @@ pub const TraceState = struct {
     /// Record one dispatcher burst's ledger for the Part-B terminal telemetry
     /// (jitdbg builds only; comptime-false → zero cost in normal builds). Called
     /// from `driveDispatcherLedger` with the full burst ledger.
-    pub fn dbgNoteBurst(self: *TraceState, entries: []const irinterp.LedgerEntry) void {
+    pub fn dbgNoteBurst(self: *TraceState, entries: []const trace_exec.LedgerEntry) void {
         if (comptime jitdbg.enabled) {
             if (!self.config.debug_log) return;
             const len = @min(entries.len, self.dbg_burst_len_hist.len - 1);
@@ -2373,7 +1614,7 @@ pub const TraceState = struct {
     }
 
     /// B-3c: aggregate a silent burst's suffix-ledger rows (jitdbg builds only).
-    pub fn dbgNoteSuffixLedger(self: *TraceState, entries: []const irinterp.LedgerEntry) void {
+    pub fn dbgNoteSuffixLedger(self: *TraceState, entries: []const trace_exec.LedgerEntry) void {
         if (comptime jitdbg.enabled) {
             if (!self.config.debug_log) return;
             for (entries) |row| {
@@ -2391,7 +1632,7 @@ pub const TraceState = struct {
 
     fn armedEdgeInBridgeFreeCycle(self: *const TraceState, parent: *const Trace, exit_instr: u32) bool {
         var first_child: ?*Trace = null;
-        for (self.armed_links.items) |link| {
+        for (self.registry.native_physical.armedLinks()) |link| {
             if (link.parent == parent and link.slot_index == exit_instr and link.kind != .region_bridge) {
                 first_child = link.child;
                 break;
@@ -2418,7 +1659,7 @@ pub const TraceState = struct {
             if (seen_len == seen.len) return false;
             seen[seen_len] = cur;
             seen_len += 1;
-            for (self.armed_links.items) |link| {
+            for (self.registry.native_physical.armedLinks()) |link| {
                 if (link.parent != cur or link.kind == .region_bridge) continue;
                 if (pending_len == pending.len) return false;
                 pending[pending_len] = link.child;
@@ -2454,10 +1695,10 @@ pub const TraceState = struct {
                 self.dbg_patchable_cycle_rows, self.dbg_other_replay_rows, replay_total,
             });
             jitdbg.log("  silent: candidates={d} promotions={d} demotions={d} bursts={d} transitions={d} hops={d} budget={d} barren={d} suffix={d}", .{
-                self.silent_promotion_candidates, self.silent_promotions,
-                self.silent_demotions,            self.silent_bursts_drained,
-                self.silent_transitions_total,    self.silent_hops_total,
-                self.silent_budget_exhaustions,   self.silent_barren_exhaustions,
+                self.silent_promotion_candidates,               self.registry.native_physical.silent_promotions,
+                self.registry.native_physical.silent_demotions, self.silent_bursts_drained,
+                self.silent_transitions_total,                  self.silent_hops_total,
+                self.silent_budget_exhaustions,                 self.silent_barren_exhaustions,
                 self.silent_suffix_drains,
             });
             jitdbg.log("  silent rejects: bridge={d} region={d} open={d} child-mismatch={d} no-patch={d} cap={d} region-owned={d}", .{
@@ -2470,13 +1711,13 @@ pub const TraceState = struct {
                 self.silent_rejects.region_owned,
             });
             jitdbg.log("  silent demotions: activation={d} region-close={d} slot={d} trace={d} teardown={d} unfreeze={d} growth={d}", .{
-                self.silent_demotion_reasons.activation,
-                self.silent_demotion_reasons.region_close,
-                self.silent_demotion_reasons.slot_mutation,
-                self.silent_demotion_reasons.trace_invalidation,
-                self.silent_demotion_reasons.teardown,
-                self.silent_demotion_reasons.unfreeze,
-                self.silent_demotion_reasons.membership_growth,
+                self.registry.native_physical.silent_demotion_reasons.activation,
+                self.registry.native_physical.silent_demotion_reasons.region_close,
+                self.registry.native_physical.silent_demotion_reasons.slot_mutation,
+                self.registry.native_physical.silent_demotion_reasons.trace_invalidation,
+                self.registry.native_physical.silent_demotion_reasons.teardown,
+                self.registry.native_physical.silent_demotion_reasons.unfreeze,
+                self.registry.native_physical.silent_demotion_reasons.membership_growth,
             });
             for (self.dbg_burst_len_hist, 0..) |c, len| {
                 if (c != 0) jitdbg.log("  burst-len {d}: {d}", .{ len, c });
@@ -2519,24 +1760,26 @@ pub const TraceState = struct {
         if (comptime jitdbg.enabled) {
             if (!self.config.debug_log) return;
             jitdbg.log("trace cache ({d} traces, {d} armed links):", .{
-                self.cache.items.len, self.armed_links.items.len,
+                self.registry.cache.items.len, self.registry.native_physical.armedLinks().len,
             });
-            for (self.cache.items, 0..) |t, i| {
-                const term: IrOp = if (t.instrs.len != 0) t.instrs[t.instrs.len - 1].op else .loop;
+            for (self.registry.cache.items, 0..) |t, i| {
+                const term: IrOp = if (t.code.instrs.len != 0) t.code.instrs[t.code.instrs.len - 1].op else .loop;
                 jitdbg.log("  [{d}] id={d} anchor pc={d} instrs={d} inputs={d} term={s} native={s} hits={d}", .{
-                    i,                  t.id,         t.anchor.pc,
-                    t.instrs.len,       t.inputs.len, @tagName(term),
+                    i,                  t.id,              t.code.anchor.pc,
+                    t.code.instrs.len,  t.code.inputs.len, @tagName(term),
                     @tagName(t.native), t.hit_count,
                 });
             }
         }
     }
 
+    pub fn syncNativeInvalidation(self: *TraceState) void {
+        if (self.registry.native_physical.takeInvalidation()) self.provenance_arms_pending = true;
+    }
+
     pub fn deinit(self: *TraceState) void {
         self.dbgDumpBurstStats(); // jitdbg-only burst-terminal telemetry (Part B)
-        self.demoteAllSets();
-        if (self.pending_demote.items.len != 0)
-            @panic("TraceState.deinit: promotion demotion deferred during teardown");
+
         self.dbg_burst_terminals.deinit(self.gpa);
         self.dbg_silent_suffix_rows.deinit(self.gpa);
         self.counters.deinit(self.gpa);
@@ -2553,43 +1796,14 @@ pub const TraceState = struct {
         self.exec_logs.deinit(self.gpa);
         self.abort_log.deinit(self.gpa);
         if (self.exec_recorder) |*r| r.deinit();
-        self.armed_links.deinit(self.gpa);
-        self.pending_demote.deinit(self.gpa);
-        if (self.promotion_candidate.len != 0) self.gpa.free(self.promotion_candidate);
-        self.promoted_exit_owners.deinit(self.gpa);
-        self.promoted_sets.deinit(self.gpa);
         self.provenance_edges.deinit(self.gpa);
-        self.trace_by_id.deinit(self.gpa);
+
         self.coverage.deinit(self.gpa);
-        self.edge_cache.deinit(self.gpa); // A-ii.2 (values are plain structs; no per-entry free)
-        // A-ii.4: region model. `region_defs` values own members/member_points; the
-        // intern map owns its edge slices; the physical indices own their []RegionId.
-        var rd_it = self.region_defs.valueIterator();
-        while (rd_it.next()) |d| {
-            self.gpa.free(d.members);
-            self.gpa.free(d.member_points);
-            freeRegionBridges(self.gpa, d.bridges);
-        }
-        self.region_defs.deinit(self.gpa);
-        self.region_intern.deinit(self.gpa);
-        freeRegionSetMap(ExitKey, &self.source_exit_regions, self.gpa);
-        freeRegionSetMap(u32, &self.dest_entry_regions, self.gpa);
-        self.region_profit.deinit(self.gpa);
-        self.freeObserverFast(); // A-vii-e.1: owned bitset copies
+        self.region_policy.deinit(self.gpa);
         // Doc 20 §R2-2: VM teardown is the other legal image-free point.
-        self.dropEntryPatchState();
-        self.code_images.deinit(self.gpa);
-        self.entry_patches.deinit(self.gpa);
-        self.entry_patch_free.deinit(self.gpa);
-        // Free each trace (its `native.deinit()` returns mcode slots to the arena's
-        // free-list) *before* tearing down the arena those slots live in.
-        for (self.cache.items) |t| t.destroy(self.gpa);
-        self.cache.deinit(self.gpa);
-        self.mcode_arena.deinit();
-        // Doc 22 §B.1: the seeding ctx outlives every compiled page (pages bake
-        // `&ctx` as an imm64), so it is freed only after the cache + arena are
-        // gone. Null for hand-built test states (see the field doc).
-        if (self.native_seed_ctx) |ctx| self.gpa.destroy(ctx);
+
+        self.registry.native_physical.debug_log = self.config.debug_log;
+        self.registry.deinit();
         self.rec.deinit(self.gpa);
     }
 
@@ -2693,14 +1907,14 @@ pub const TraceState = struct {
     pub fn findTrace(self: *const TraceState, proto: *const Proto, pc: u32) ?*Trace {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
-        for (self.cache.items) |t| {
+        for (self.registry.cache.items) |t| {
             // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
             // selection. Suppression deadlocks: a skipped trace can never be
             // entered, so the counter can never reset. The refusal is already
             // free (no anchor penalty), so the cost of a futile prologue
             // attempt is one native call + ledger row per dispatch — bounded
             // by the caller's own iteration count, not by the counter.
-            if (t.anchor.proto == proto and t.anchor.pc == pc) {
+            if (t.code.anchor.proto == proto and t.code.anchor.pc == pc) {
                 if (best == null or t.hit_count > best_hits) {
                     best = t;
                     best_hits = t.hit_count;
@@ -2726,22 +1940,22 @@ pub const TraceState = struct {
     /// terminal only; enterability is `stubEnterable`'s job, not shape's.
     // pub for trace_link.zig (file-split pass)
     pub fn isInnerLoopRoot(t: *const Trace, proto: *const Proto, pc: u32) bool {
-        return t.anchor.proto == proto and t.anchor.pc == pc and
-            t.instrs.len != 0 and t.instrs[t.instrs.len - 1].op == .loop;
+        return t.code.anchor.proto == proto and t.code.anchor.pc == pc and
+            t.code.instrs.len != 0 and t.code.instrs[t.code.instrs.len - 1].op == .loop;
     }
 
     pub fn findLoopTrace(self: *const TraceState, proto: *const Proto, pc: u32) ?*Trace {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
-        for (self.cache.items) |t| {
+        for (self.registry.cache.items) |t| {
             // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
             // selection. Suppression deadlocks: a skipped trace can never be
             // entered, so the counter can never reset. The refusal is already
             // free (no anchor penalty), so the cost of a futile prologue
             // attempt is one native call + ledger row per dispatch — bounded
             // by the caller's own iteration count, not by the counter.
-            if (t.anchor.proto != proto or t.anchor.pc != pc) continue;
-            if (t.instrs.len == 0 or t.instrs[t.instrs.len - 1].op != .loop) continue;
+            if (t.code.anchor.proto != proto or t.code.anchor.pc != pc) continue;
+            if (t.code.instrs.len == 0 or t.code.instrs[t.code.instrs.len - 1].op != .loop) continue;
             if (best == null or t.hit_count > best_hits) {
                 best = t;
                 best_hits = t.hit_count;
@@ -2759,15 +1973,15 @@ pub const TraceState = struct {
     pub fn findLinkTrace(self: *const TraceState, proto: *const Proto, pc: u32) ?*Trace {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
-        for (self.cache.items) |t| {
+        for (self.registry.cache.items) |t| {
             // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
             // selection. Suppression deadlocks: a skipped trace can never be
             // entered, so the counter can never reset. The refusal is already
             // free (no anchor penalty), so the cost of a futile prologue
             // attempt is one native call + ledger row per dispatch — bounded
             // by the caller's own iteration count, not by the counter.
-            if (t.anchor.proto != proto or t.anchor.pc != pc) continue;
-            if (t.instrs.len == 0 or t.instrs[t.instrs.len - 1].op != .link) continue;
+            if (t.code.anchor.proto != proto or t.code.anchor.pc != pc) continue;
+            if (t.code.instrs.len == 0 or t.code.instrs[t.code.instrs.len - 1].op != .link) continue;
             // B-iv.3 (doc 22 §B.5): seeded continuations are selectable — the
             // tier-1a seams seed via §B.3 and a native page seeds itself at
             // entry (§B.4 prologue), declining cleanly through the B-iv.2
@@ -2800,15 +2014,15 @@ pub const TraceState = struct {
         // `max_traces_per_anchor` by 2× — unreachable today, bounded anyway).
         var buf: [8]*Trace = undefined;
         var n: usize = 0;
-        for (self.cache.items) |t| {
+        for (self.registry.cache.items) |t| {
             // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
             // selection. Suppression deadlocks: a skipped trace can never be
             // entered, so the counter can never reset. The refusal is already
             // free (no anchor penalty), so the cost of a futile prologue
             // attempt is one native call + ledger row per dispatch — bounded
             // by the caller's own iteration count, not by the counter.
-            if (t.anchor.proto != proto or t.anchor.pc != post_pc) continue;
-            if (t.instrs.len == 0 or t.instrs[t.instrs.len - 1].op != .link) continue;
+            if (t.code.anchor.proto != proto or t.code.anchor.pc != post_pc) continue;
+            if (t.code.instrs.len == 0 or t.code.instrs[t.code.instrs.len - 1].op != .link) continue;
             var pos: usize = n;
             for (buf[0..n], 0..) |p, idx| {
                 if (t.hit_count > p.hit_count or (t.hit_count == p.hit_count and t.id < p.id)) {
@@ -2845,7 +2059,7 @@ pub const TraceState = struct {
         if (regs) |r| {
             for (buf[0..n]) |t| {
                 if (self.nativeFor(t) == null) continue;
-                if (t.matchesFingerprint(r)) {
+                if (t.code.matchesFingerprint(r)) {
                     run = t;
                     break;
                 }
@@ -2864,14 +2078,14 @@ pub const TraceState = struct {
     pub fn nextTraceExcluding(self: *const TraceState, proto: *const Proto, pc: u32, visited: []const *Trace) ?*Trace {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
-        outer: for (self.cache.items) |t| {
+        outer: for (self.registry.cache.items) |t| {
             // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
             // selection. Suppression deadlocks: a skipped trace can never be
             // entered, so the counter can never reset. The refusal is already
             // free (no anchor penalty), so the cost of a futile prologue
             // attempt is one native call + ledger row per dispatch — bounded
             // by the caller's own iteration count, not by the counter.
-            if (t.anchor.proto != proto or t.anchor.pc != pc) continue;
+            if (t.code.anchor.proto != proto or t.code.anchor.pc != pc) continue;
             for (visited) |v| {
                 if (v == t) continue :outer;
             }
@@ -2892,7 +2106,7 @@ pub const TraceState = struct {
     /// id is the exec-log key and the viz's trace-selection key. Linear scan (the
     /// cache is small; only the instrumented path calls this).
     pub fn traceIndex(self: *const TraceState, t: *const Trace) ?u32 {
-        for (self.cache.items, 0..) |c, i| {
+        for (self.registry.cache.items, 0..) |c, i| {
             if (c == t) return @intCast(i);
         }
         return null;
@@ -2914,17 +2128,7 @@ pub const TraceState = struct {
     }
 
     pub fn traceById(self: *const TraceState, id: u32) ?*Trace {
-        // O(1) fast path via the id index; a hit is authoritative. A null slot or
-        // out-of-range id falls back to the linear scan — that covers hand-built
-        // test traces appended straight to `cache` (never indexed) and any
-        // fail-soft grow-OOM at commit. For real retired ids both paths miss.
-        if (id < self.trace_by_id.items.len) {
-            if (self.trace_by_id.items[id]) |t| return t;
-        }
-        for (self.cache.items) |c| {
-            if (c.id == id) return c;
-        }
-        return null;
+        return self.registry.traceById(id);
     }
 
     /// A frame of the executor value scratch: where `valuesRelease` must rewind
@@ -3074,7 +2278,7 @@ pub const TraceState = struct {
         // scan anchor, all from these sites, gating the anchor the region
         // machine had just qualified). Consumed-as-barren: a sustained streak
         // still strikes (`noteBarrenConsumed`, codex BLOCKER 2).
-        if (self.qualifiedActiveMember(t.anchor.proto, t.anchor.pc)) |m| {
+        if (self.qualifiedActiveMember(t.code.anchor.proto, t.code.anchor.pc)) |m| {
             accountCandidateCharge(t, charge_kind);
             self.noteBarrenConsumed(m.key, m.accum);
             return;
@@ -3105,16 +2309,16 @@ pub const TraceState = struct {
         // which profitability machine (region or legacy) consumes the receipt
         // below, because the turnstile cost being measured (entry + seam
         // re-entry per 0–2-trip completion) is real either way.
-        if (exit_instr < t.instrs.len and isWhileLoopDoneGuardIndex(t, exit_instr)) {
-            self.noteWhileYield(t.anchor, completed);
+        if (exit_instr < t.code.instrs.len and isWhileLoopDoneGuardIndex(t, exit_instr)) {
+            self.noteWhileYield(t.code.anchor, completed);
         }
-        const key: ?ExitKey = if (exit_instr < t.instrs.len)
+        const key: ?ExitKey = if (exit_instr < t.code.instrs.len)
             .{ .trace_id = t.id, .exit_instr = exit_instr }
         else
             null;
         // A-vii-c.1: region-first, then legacy iff unconsumed. The two verdicts can
         // only ever touch the same anchor when this receipt's own region closed and
-        // flushed against an owner that happens to be `t.anchor`; applying the
+        // flushed against an owner that happens to be `t.code.anchor`; applying the
         // receipt-local verdict last keeps the most recent evidence authoritative.
         if (!self.accountRegionProfit(key, region_work, dest)) {
             self.accountLegacyThrash(t, completed, exit_instr, charge_kind);
@@ -3338,13 +2542,13 @@ pub const TraceState = struct {
     /// can never change observable output.
     pub fn laneWidenedPast(self: *const TraceState, t: *const Trace, regs: RegWindow) bool {
         _ = self;
-        for (t.instrs) |ins| {
+        for (t.code.instrs) |ins| {
             if (ins.op != .guard_lane) continue;
             // `guard_lane.a` indexes the table-producing instr; that is a
             // `slot_load` whose `aux` is the tier-0 register the table lives in.
             const ld_idx: usize = @intCast(ins.a);
-            if (ld_idx >= t.instrs.len) continue;
-            const ld = t.instrs[ld_idx];
+            if (ld_idx >= t.code.instrs.len) continue;
+            const ld = t.code.instrs[ld_idx];
             if (ld.op != .slot_load) continue;
             const reg: usize = @intCast(ld.aux);
             if (reg >= regs.len()) continue;
@@ -3717,6 +2921,25 @@ pub const TraceState = struct {
     /// Begin recording at `target_pc`. Sizes the recorder's register map to the
     /// frame; recording proper begins at the next dispatch-loop iteration (which
     /// is the anchor instruction). On OOM we simply don't arm.
+    fn configureRecording(self: *TraceState) void {
+        self.rec.options = .{ .maxrecord = self.config.maxrecord, .peel = self.config.peel, .optimize = self.config.optimize };
+    }
+    pub fn recordInstr(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, resolved: Value) void {
+        self.configureRecording();
+        const target_i: i64 = @as(i64, pc) + instr.aux;
+        const target: ?u32 = if (instr.op == .for_prep) pc else if (instr.op == .jmp and target_i >= 0 and target_i < proto.code.len) @intCast(target_i) else null;
+        self.rec.context = .{ .heap = self.rec_heap };
+        if (target) |dest| {
+            self.rec.context.inner_root = self.findLoopTrace(proto, dest) != null;
+            const leaves = self.lleave_count.get(.{ .proto = proto, .pc = dest }) orelse 0;
+            const fails = self.unroll_fail.get(self.rec.anchor) orelse 0;
+            self.rec.context.unroll_while = leaves >= self.config.lleave_fast_retries or fails < self.config.unroll_fail_flip;
+        }
+        self.rec.recordInstr(instr, regs, proto, pc, resolved);
+        self.consumeRecordingAbort();
+        if (self.rec.close_requested) self.closeTrace(regs);
+    }
+
     fn arm(self: *TraceState, proto: *const Proto, target_pc: u32) void {
         self.rec.reset(self.gpa, .{ .proto = proto, .pc = target_pc }, proto.num_registers) catch return;
     }
@@ -3727,27 +2950,23 @@ pub const TraceState = struct {
     /// executed from the trace.
     // pub for trace_recorder.zig (file-split pass)
     pub fn abort(self: *TraceState, reason: AbortReason) void {
-        self.rec.abort_reason = reason;
-        if (self.config.record_aborts) self.logAbort(reason);
-        self.rec.active = false;
-        // Doc 27 §3a defense-in-depth: a dead recording must not leave a multret
-        // shadow behind (`reset` is the soundness boundary; this narrows the
-        // window further so no code path can observe a shadow past the abort).
-        self.rec.multret_top = null;
-        // Drop hot-exit provenance with the recording: an abort must never leave
-        // `side_src` around to latch a parent exit DONE for a LATER, unrelated
-        // commit (Pall retries the exit; `gateAnchor` below is our `penalty_pc`).
-        self.rec.side_src = null;
+        self.rec.abort(reason);
+        self.consumeRecordingAbort();
+    }
+    fn consumeRecordingAbort(self: *TraceState) void {
+        const notice = self.rec.takeAbortNotice() orelse return;
+        const reason = notice.reason;
+        if (self.config.record_aborts) self.logAbort(notice);
         // Doc 38 unroll-first policy: a ROOT recording that chose to unroll an
         // inner while and then died — for ANY reason (too long, nyi op it only
         // reached because it kept going, guard depth, …) — is one proven
         // unroll failure at this outer anchor. At `unroll_fail_flip` failures
         // `recWhileLink` stops unrolling here and decomposes (LINNER).
-        if (self.rec.kind == .root and self.rec.unrolled_while) {
-            if (self.unroll_fail.getOrPut(self.gpa, self.rec.anchor)) |gop| {
+        if (notice.kind == .root and notice.unrolled_while) {
+            if (self.unroll_fail.getOrPut(self.gpa, notice.anchor)) |gop| {
                 if (!gop.found_existing) gop.value_ptr.* = 0;
                 gop.value_ptr.* +|= 1;
-                self.dbg("unroll-fail (record abort): anchor pc={d} count={d}", .{ self.rec.anchor.pc, gop.value_ptr.* });
+                self.dbg("unroll-fail (record abort): anchor pc={d} count={d}", .{ notice.anchor.pc, gop.value_ptr.* });
             } else |_| {}
         }
         // Doc 38 LLEAVE fast retry: which pass a while/repeat-root recording
@@ -3760,7 +2979,7 @@ pub const TraceState = struct {
         // innerloopleft unroll). On OOM fall through to the normal strike —
         // fail-closed, never a hotter path.
         if (reason == .loop_leave) {
-            if (self.lleave_count.getOrPut(self.gpa, self.rec.anchor)) |gop| {
+            if (self.lleave_count.getOrPut(self.gpa, notice.anchor)) |gop| {
                 if (!gop.found_existing) gop.value_ptr.* = 0;
                 gop.value_ptr.* +|= 1;
                 if (gop.value_ptr.* < self.config.lleave_fast_retries) {
@@ -3771,13 +2990,13 @@ pub const TraceState = struct {
                     // Rewind the counter so the next back-edge re-crosses and
                     // re-arms: the retry lands on the same instance's next
                     // trip, which is exactly the cond-true pass we want.
-                    self.counters.put(self.gpa, self.rec.anchor, self.config.hotloop -| 1) catch {};
-                    self.dbg("lleave fast-retry: anchor pc={d} count={d}", .{ self.rec.anchor.pc, gop.value_ptr.* });
+                    self.counters.put(self.gpa, notice.anchor, self.config.hotloop -| 1) catch {};
+                    self.dbg("lleave fast-retry: anchor pc={d} count={d}", .{ notice.anchor.pc, gop.value_ptr.* });
                     return;
                 }
             } else |_| {}
         }
-        self.gateRecordAnchor(self.rec.anchor, .record_abort);
+        self.gateRecordAnchor(notice.anchor, .record_abort);
     }
 
     /// Append-or-bump the abort diagnostic log (`--dump-aborts`). Deduped by
@@ -3786,11 +3005,12 @@ pub const TraceState = struct {
     /// abort sites are few (a handful of loops × a handful of reasons), and this is
     /// off the hot path entirely (only runs when `config.record_aborts`). On OOM we
     /// simply drop the row: a diagnostic must never perturb execution.
-    fn logAbort(self: *TraceState, reason: AbortReason) void {
-        const anchor = self.rec.anchor;
+    fn logAbort(self: *TraceState, notice: @import("trace_recorder.zig").RecordingSession.AbortNotice) void {
+        const reason = notice.reason;
+        const anchor = notice.anchor;
         for (self.abort_log.items) |*r| {
             if (r.anchor_pc == anchor.pc and r.proto == anchor.proto and
-                r.reason == reason and r.op == self.rec.cur_op)
+                r.reason == reason and r.op == notice.op)
             {
                 r.count += 1;
                 return;
@@ -3799,237 +3019,11 @@ pub const TraceState = struct {
         self.abort_log.append(self.gpa, .{
             .proto = anchor.proto,
             .anchor_pc = anchor.pc,
-            .abort_pc = self.rec.cur_pc,
-            .op = self.rec.cur_op,
+            .abort_pc = notice.pc,
+            .op = notice.op,
             .reason = reason,
-            .ir_len = @intCast(self.rec.instrs.items.len),
+            .ir_len = notice.ir_len,
         }) catch {};
-    }
-
-    /// Doc 39: ops admissible inside a type-stabilizing peel (the register-only
-    /// rule, enforced over BOTH passes). A WHITELIST, fail-closed: any op not
-    /// listed — stores (`astore`/`astore_append`/`hstore`/`gstore`), allocating
-    /// producers (the `.alloc` class), match-scratch writers
-    /// (`smatch`/`sfindp`/`sgmatch`/`scap_*`), the gmatch cursor
-    /// (`sgm_setpos`), grid ops, `guard_gc`, and anything added later —
-    /// declines the peel at pass 1 or aborts it at pass 2. Heap READS are
-    /// admitted: effect-free, guarded, and their run-once values persist under
-    /// the E1 executor contract.
-    fn peelAdmissibleOp(op: IrOp) bool {
-        return switch (op) {
-            .konst,
-            .slot_load,
-            .phi,
-            .preheader,
-            .add,
-            .sub,
-            .mul,
-            .div,
-            .idiv,
-            .mod,
-            .pow,
-            .band,
-            .bor,
-            .bxor,
-            .shl,
-            .shr,
-            .sar,
-            .eq,
-            .ne,
-            .lt,
-            .le,
-            .neg,
-            .not,
-            .bnot,
-            .int_of_float,
-            .guard_int,
-            .guard_float,
-            .guard_number,
-            .guard_true,
-            .guard_false,
-            .guard_func,
-            .guard_builtin,
-            .fsqrt,
-            .fsin,
-            .fcos,
-            .ffloor,
-            .fceil,
-            .aref,
-            .aload,
-            .href,
-            .hload,
-            .alen,
-            .guard_table,
-            .guard_lane,
-            .guard_bounds,
-            .guard_present,
-            .guard_hash,
-            .slen,
-            .guard_string,
-            .scp,
-            => true,
-            else => false,
-        };
-    }
-
-    /// Doc 39 Phase 0/1 entry decision, called at the FIRST anchor-return of a
-    /// recording (from `closeTrace`, before `commit` — never an error out of
-    /// commit, which would gate `.commit_failure`). Returns true when
-    /// `closeTrace` should return WITHOUT committing: either the peel was
-    /// entered (marker emitted, recording continues into iteration 2), or a
-    /// mid-entry OOM aborted the recording.
-    ///
-    /// Eligibility (doc 40 Phase 2 lifts the doc-39 `.root`-only gate): any
-    /// recording kind closing as `.loop` at its own plain-while anchor — the
-    /// reset-to-int glue records exclusively through the side / continuation
-    /// channels (LLEAVE aborts a root on its anchor loop's own exit edge), so
-    /// a `.root`-only peel fires on neither fft DOA shape. Side recordings
-    /// that link elsewhere stay out (`link_target` below). The rest of the
-    /// gate is unchanged: anchor frame closed (no inlining / multret shadow
-    /// open), register-only iteration 1 (no pending stores, no allocations,
-    /// whitelist-pure IR).
-    ///
-    /// The instability sweep (doc 40 Phase 3, bidirectional) covers the
-    /// anchor window `[0, anchor_num_registers)` only, per-slot: a `.def`
-    /// slot whose proven entry kind contradicts the numeric kind its carried
-    /// value actually delivers at this anchor return. int-entry/float-carry
-    /// is doc 39's RV-3-bailing forward shape; float-entry/int-carry is the
-    /// F1-reverse reset-to-int shape (fft_bitreverse's `k = n`). The carried
-    /// side reads the LIVE anchor-return register, not the ref's IR `ty` —
-    /// an unguarded `slot_load` carries `.ty = .unknown` (exactly the `k = n`
-    /// store), while recording is concrete execution, so the live value IS
-    /// what the back-edge φ would deliver.
-    fn maybeEnterPeel(self: *TraceState, regs: RegWindow) bool {
-        if (!self.config.peel) return false;
-        const rec = &self.rec;
-        if (rec.link_target != null) return false;
-        if (rec.inline_depth != 0) return false;
-        if (rec.multret_top != null) return false;
-        if (rec.pending_stores.items.len != 0) return false;
-        if (rec.guard_gc_ref != null or rec.alloc_count != 0) return false;
-        if (!isPlainWhileAnchor(rec.anchor.proto, rec.anchor.pc)) return false;
-        // Instability sweep before the (linear) purity scan: the sweep is the
-        // rarer pass condition, so most closes stop here. Bidirectional
-        // (doc 40 Phase 3), per-slot — one recording may widen one slot and
-        // narrow another; any single mismatch makes the close unstable.
-        var unstable = false;
-        for (rec.reg_map[0..rec.anchor_num_registers], 0..) |s, slot| {
-            if (s.state != .def or s.entry_kind == .none) continue;
-            const v = regs.get(@intCast(slot));
-            unstable = switch (s.entry_kind) {
-                .int => v.isFloat(),
-                .float => v.isInt(),
-                .none => unreachable,
-            };
-            if (unstable) break;
-        }
-        if (!unstable) return false;
-        for (rec.instrs.items) |ins| {
-            if (!peelAdmissibleOp(ins.op)) return false;
-        }
-        // Enter. Snapshot allocation first — a failure here declines cleanly
-        // with the stream untouched (ordinary close proceeds).
-        const slots = self.gpa.alloc(PeelSlot, rec.anchor_num_registers) catch return false;
-        for (slots, rec.reg_map[0..rec.anchor_num_registers]) |*ps, s| {
-            ps.* = .{ .ref = s.ref, .state = s.state };
-        }
-        _ = self.emit(.{ .op = .preheader }) catch {
-            // The stream may hold a half-appended marker (instrs vs exit_prov
-            // skew) — the recording cannot continue OR commit. Abort; `reset`
-            // restores the invariant, exactly as any mid-recording emit OOM.
-            self.gpa.free(slots);
-            self.abort(.alloc);
-            return true;
-        };
-        rec.peel = .{ .mark_len = rec.instrs.items.len, .slots = slots };
-        self.dbg("peel: enter anchor pc={d} marker ir={d}", .{ rec.anchor.pc, rec.instrs.items.len - 1 });
-        return true;
-    }
-
-    /// Doc 39 Phase 1 close, at the SECOND anchor-return of a peeled recording:
-    /// verify the body pass stayed register-only (a forbidden effect means
-    /// iteration 2 took a path iteration 1 didn't — abort, ordinary strikes)
-    /// and type-stable, then patch every internal φ's back-edge `b` from the
-    /// slot's body-final ref (or `a` — a constant carry — when the body only
-    /// read it). Returns false when the recording must abort
-    /// `.type_instability` instead of committing.
-    fn finishPeel(self: *TraceState, p: *PeelState) bool {
-        const rec = &self.rec;
-        if (rec.link_target != null) return false; // a peeled root never link-closes
-        if (rec.pending_stores.items.len != 0) return false;
-        if (rec.guard_gc_ref != null or rec.alloc_count != 0) return false;
-        for (rec.instrs.items[p.mark_len..]) |ins| {
-            if (!peelAdmissibleOp(ins.op)) return false;
-        }
-        for (p.slots, 0..) |*ps, slot| {
-            const pr = ps.phi_ref orelse continue;
-            const phi_ins = &rec.instrs.items[@intCast(pr)];
-            const cur = rec.reg_map[slot].ref;
-            // Body redefined the slot → carry the body-final def; body only
-            // read it → constant carry (`b = a`; the init is a run-once value
-            // whose executor slot persists, so re-carrying it is exact).
-            const b: Ref = if (cur != pr) cur else phi_ins.a;
-            // Stability recheck against the φ's carried type (stamped from the
-            // iteration-1 def at creation): a mismatch is a genuine
-            // per-iteration flip-flop — uncompilable before the peel, stays so.
-            if (rec.instrs.items[@intCast(b)].ty != phi_ins.ty) return false;
-            phi_ins.b = b;
-        }
-        self.dbg("peel: close anchor pc={d} body ir={d}..{d}", .{
-            rec.anchor.pc, p.mark_len, rec.instrs.items.len,
-        });
-        return true;
-    }
-
-    /// Doc 40 Phase 1 — commit preflight: would this `.loop` close be
-    /// self-defeating? A trace whose entry fingerprint pins a carried slot to
-    /// one numeric kind while its back-edge φ would store the other can never
-    /// take its own back-edge: every entry runs exactly one iteration, exits
-    /// on the entry guard, and the accounting machinery mistakes it for
-    /// healthy forever (`completed > 0` clears the anchor penalty each entry;
-    /// no want channel fires — the doc 40 "failure loop"). Such a close is
-    /// refused BEFORE `commit` mutates anything (codex finding 4), keeping the
-    /// anchor's accounting live and the producing channel retrying under the
-    /// record gate.
-    ///
-    /// Scope (codex finding 6): proven int↔float contradictions only —
-    /// `guard_number` matches both numeric kinds and non-numeric carried slots
-    /// have legitimate specialized load/store relationships. The ENTRY side
-    /// mirrors the fingerprint-extraction criteria exactly (a guard over a
-    /// `slot_load` of an anchor-window slot — `matchesFingerprint` is what
-    /// makes the contradiction fatal at re-entry); the STORE side reads the
-    /// live anchor-return registers. Commit's φ-emission slot filter is
-    /// mirrored too: a slot that gets no φ is never written at the back-edge,
-    /// so its entry guard cannot be contradicted.
-    fn loopCloseSelfDefeating(self: *const TraceState, regs: RegWindow) bool {
-        // The live-value read below indexes the ANCHOR frame; at inline depth
-        // the window belongs to a callee. Depth-0 covers every channel the
-        // reset-to-int shape records through (glue side / continuation).
-        if (self.rec.inline_depth != 0) return false;
-        const instrs = self.rec.instrs.items;
-        for (instrs, 0..) |ins, i| {
-            const want_int = switch (ins.op) {
-                .guard_int => true,
-                .guard_float => false,
-                else => continue,
-            };
-            const ref: usize = @intCast(ins.a);
-            if (ref >= i or instrs[ref].op != .slot_load) continue;
-            const slot: usize = @intCast(instrs[ref].aux);
-            if (slot >= self.rec.anchor_num_registers) continue;
-            const s = self.rec.reg_map[slot];
-            if (s.state != .def) continue; // read-only slot: no φ, no back-edge write
-            if (self.rec.alloc_count == 0 and
-                slot >= self.rec.locals_watermark and !self.readSlot(@intCast(slot))) continue;
-            // STORE side: the LIVE value at this anchor return. Recording is
-            // concrete execution, so this is exactly what the φ delivers on
-            // the recorded path. (The IR `ty` is useless here: an unguarded
-            // `slot_load` store — the fft `k = n` reset — is `.unknown`.)
-            const v = regs.get(@intCast(slot));
-            if (want_int and v.isFloat()) return true;
-            if (!want_int and v.isInt()) return true;
-        }
-        return false;
     }
 
     /// Finalise a cleanly-closed recording into a cached `Trace`. A build failure
@@ -4044,26 +3038,14 @@ pub const TraceState = struct {
     /// forward-flow arrival calls only `maybeCloseAtAnchor`).
     // pub for trace_recorder.zig (file-split pass)
     pub fn closeTrace(self: *TraceState, regs: RegWindow) void {
-        if (self.rec.peel) |*p| {
-            if (self.rec.instrs.items.len == p.mark_len) return; // same arrival
-            if (!self.finishPeel(p)) {
-                self.abort(.type_instability);
-                return;
-            }
-        } else if (self.maybeEnterPeel(regs)) {
-            return; // peel entered (keep recording iteration 2) or aborted
-        }
-        // Doc 40 Phase 1: refuse a self-defeating `.loop` close (entry
-        // fingerprint contradicts a carried φ's numeric kind) for EVERY
-        // recording kind — root, side, continuation — the glue channels are
-        // precisely where the reset-to-int shape records (codex finding 1).
-        // Peeled closes are legitimately entry≠steady by design; `.link`
-        // closes carry no back-edge.
-        if (self.rec.peel == null and self.rec.link_target == null and
-            self.loopCloseSelfDefeating(regs))
-        {
-            self.dbg("commit refuse: anchor pc={d} self-defeating loop (entry kind vs phi store kind)", .{self.rec.anchor.pc});
-            self.abort(.type_instability);
+        self.configureRecording();
+        const ready = self.rec.close(regs);
+        if (self.rec.takePeelNotice()) |notice| switch (notice) {
+            .enter => |n| self.dbg("peel: enter anchor pc={d} marker ir={d}", .{ n.anchor_pc, n.marker }),
+            .close => |n| self.dbg("peel: close anchor pc={d} body ir={d}..{d}", .{ n.anchor_pc, n.begin, n.end }),
+        };
+        if (!ready) {
+            self.consumeRecordingAbort();
             return;
         }
         self.commit() catch |err| {
@@ -4084,14 +3066,13 @@ pub const TraceState = struct {
     /// after the child is registered. A same-anchor relation OOM deliberately
     /// leaves the parent counter live (no DONE-without-edge); cross-anchor side
     /// traces retain the historical DONE latch but never create an arm relation.
-    pub fn finishSideTraceProvenance(self: *TraceState, child: *Trace) void {
-        const src = self.rec.side_src orelse return;
-        defer self.rec.side_src = null;
+    pub fn finishSideTraceProvenance(self: *TraceState, child: *Trace, source: ?ExitKey) void {
+        const src = source orelse return;
         if (self.traceById(child.id) != child) return;
         const parent = self.traceById(src.trace_id) orelse return;
         var may_latch_done = true;
-        if (parent.anchor.proto == child.anchor.proto and parent.anchor.pc == child.anchor.pc and
-            src.exit_instr < parent.instrs.len)
+        if (parent.code.anchor.proto == child.code.anchor.proto and parent.code.anchor.pc == child.code.anchor.pc and
+            src.exit_instr < parent.code.instrs.len)
         {
             self.provenance_edges.append(self.gpa, .{
                 .parent_id = parent.id,
@@ -4115,314 +3096,22 @@ pub const TraceState = struct {
     /// first; an optimizer OOM falls back to caching the *unoptimized* trace
     /// (correct, just slower) rather than failing the commit.
     fn commit(self: *TraceState) !void {
-        // Doc 24 D3: stamp the allocation bound `A` into the entry `guard_gc`'s
-        // `aux` (emitted with a placeholder by `emitAlloc`). Stamped on the
-        // RECORDED stream, before `tropt.optimize` — the optimizer may CSE an
-        // `.alloc` op away (tostr repeats), which only makes the stamped bound a
-        // conservative upper bound: a stricter guard is always sound.
-        if (self.rec.guard_gc_ref) |gr| {
-            std.debug.assert(self.rec.alloc_count > 0);
-            self.rec.instrs.items[@intCast(gr)].aux = @intCast(self.rec.alloc_count);
-        }
-        // The loop-carried writebacks, as slot-bound φ nodes (one per register the
-        // trace defined, minus *dead temporaries*), spliced in just before the
-        // terminal `loop`. A slot at/above `locals_watermark` is a compiler
-        // expression temporary (set only by the anchoring numeric-`for`'s
-        // `for_loop`; see `recForLoop`/`Recorder.locals_watermark`): dead at the
-        // loop-header resume point on every path and after the loop, so tier-0
-        // recomputes it on deopt and post-loop code never reads it — writing it
-        // back is pure waste. The `entry_slots` (`readSlot`) guard is a safety net:
-        // a slot the trace actually read is never dropped (it is `< watermark`
-        // anyway). When the watermark is the `maxInt` sentinel (while / generic-
-        // `for` / passed-through `for`), nothing is filtered.
-        //
-        // A slot-bound φ's init is implicit (`regs[slot]`, read each entry like the
-        // matching `slot_load`), so `a` is 0; `b` is the body def (the update).
-        // Flush the deferred read-modify-write stores (store-sinking) at the end of
-        // the body, below every guard (the body guards + `recForLoop`'s continuation
-        // `guard_true`, all already in the stream) and before the φ writebacks +
-        // `.loop`. Sinking them below all side-exiting ops makes deopt-replay
-        // idempotent: any guard failure leaves *all* of them un-executed, so tier-0
-        // re-runs the whole iteration along the original source path and applies
-        // exactly that path's stores once each. Flushed FRONT-TO-BACK in the recorded
-        // (tier-0 bytecode) order — so two stores that alias the same slot land in the
-        // VM's order and last-writer-wins matches tier-0 (`08-multi-store-sinking.md`).
-        // This is exactly where inline (non-deferred) `astore`s sit — the body — so
-        // the φ block stays contiguous before `.loop`. Gap B (doc 07) was the single
-        // store; Gap C (doc 08) generalizes to an ordered set.
-        for (self.rec.pending_stores.items) |ps| {
-            // `ps.op` is `.astore` for a packed-array RMW or `.hstore` for a
-            // hash-field RMW (doc 11); both flush below every guard, in recorded
-            // order, just before `.loop`. `lane_ord` is the array `Lane` ordinal
-            // for `.astore` and unused (0) for `.hstore`.
-            try self.rec.instrs.append(self.gpa, .{
-                .op = ps.op,
-                .a = ps.aref,
-                .b = ps.value,
-                .aux = ps.lane_ord,
-            });
-        }
-        for (self.rec.reg_map, 0..) |s, slot| {
-            if (s.state != .def) continue;
-            // S2 (cross-frame tracing): callee slots are pure internal SSA
-            // temporaries — defined-before-use inside the inlined body, dead at the
-            // loop boundary, never loop-carried. Only anchor-frame slots may carry
-            // across iterations (including the return-mapped `ret_dest..` writes,
-            // which land back in the anchor window). Writing a callee slot back here
-            // would make the `.loop` flush `regs.set` past the executor's real
-            // `[0, anchor_num_registers)` window — a silent OOB slab write.
-            if (slot >= self.rec.anchor_num_registers) continue;
-            // Doc 24 D3 full-write-set flush rule (codex #6): an ALLOCATING
-            // trace flushes EVERY anchor-frame slot the body writes — including
-            // dead expression temporaries the watermark filter would drop. The
-            // collector roots every physical register below `stack_top`, not the
-            // live set; a dead temp holding a per-iteration heap ref (a `tostr_*`
-            // result) left at its *pre-burst* value would diverge the sweep's
-            // root set from tier-0-only's (which holds the LAST iteration's
-            // value there) → divergent de-intern sets → divergent ids. Flushing
-            // the full written span makes post-burst regs equal tier-0's after
-            // the same iterations exactly. Non-allocating traces keep the
-            // watermark filter (arc-A shapes byte-identical: their traceable
-            // loops cannot produce per-iteration heap temps).
-            if (self.rec.alloc_count == 0 and
-                slot >= self.rec.locals_watermark and !self.readSlot(@intCast(slot))) continue;
-            // Doc 39: a peeled trace stamps each slot-bound φ's otherwise-
-            // unused `a` with the slot's steady-state INTERNAL φ ref — the
-            // durable slot↔φ association native analyze needs to connect the
-            // entry load (run-once, entry-kinded) with the carried home
-            // (internal-φ-kinded) without dataflow guessing (codex round-2
-            // finding 4). `a = 0` = no internal φ: a write-before-read or
-            // never-touched-in-body slot, the existing write-only class.
-            const steady_phi: Ref = if (self.rec.peel) |p| blk: {
-                if (slot < p.slots.len) {
-                    if (p.slots[slot].phi_ref) |pr| break :blk pr;
-                }
-                break :blk 0;
-            } else 0;
-            try self.rec.instrs.append(self.gpa, .{
-                .op = .phi,
-                .a = steady_phi,
-                .b = s.ref,
-                .aux = @intCast(slot),
-                .ty = self.rec.instrs.items[s.ref].ty,
-            });
-        }
-        // Terminal: a continuation that re-reached an inner root closes with a
-        // `.link` hand-off (doc 15, Phase 2) carrying the inner anchor pc in `aux`;
-        // every other trace closes with the back-edge `.loop`. The φ block above is
-        // the register hand-off snapshot in either case.
-        if (self.rec.link_target) |lt| {
-            try self.rec.instrs.append(self.gpa, .{ .op = .link, .aux = @intCast(lt) });
-        } else {
-            try self.rec.instrs.append(self.gpa, .{ .op = .loop });
-        }
-
-        const instrs = self.rec.instrs.items;
-        const consts = self.rec.consts.items;
-        const entry = self.rec.entry_slots.items;
-
-        // Link traces are cached **unoptimized**: `tropt.optimize` asserts a `.loop`
-        // terminal and its LICM/φ machinery is written for back-edge loops. Phase 3
-        // executes link traces through `driveChain`, but the unoptimized straight-line
-        // continuation is the intended hand-off shape. `dupe` preserves `.link`.
-        // Doc 39 Phase 1b: peeled traces bypass `tropt` (the link-trace
-        // precedent) — the optimizer's liveness roots have no concept of a
-        // recorder-emitted `preheader` marker (it synthesizes its own during
-        // compaction from a global invariance analysis) and would drop the
-        // peel's run-once/steady split; CSE and guard dedup likewise span the
-        // whole stream marker-blind. A marker-aware tropt is future work.
-        const fields: tropt.Optimized = if (self.config.optimize and self.rec.link_target == null and self.rec.peel == null)
-            tropt.optimize(self.gpa, instrs, consts) catch |e| switch (e) {
-                // Never fail a commit (or thrash the anchor) over an optimizer
-                // allocation failure: cache the unoptimized trace instead.
-                error.OutOfMemory => try tropt.dupe(self.gpa, instrs, consts, entry),
-            }
-        else
-            try tropt.dupe(self.gpa, instrs, consts, entry);
-        errdefer {
-            self.gpa.free(fields.instrs);
-            self.gpa.free(fields.consts);
-            self.gpa.free(fields.entry_slots);
-        }
-        // The `tropt` compaction map is transient — used only to remap the exit
-        // provenance below, never stored in the `Trace`. Free it on every exit path.
-        defer fields.freeMap(self.gpa);
-
-        // Remap the recorder's emission-indexed exit provenance (A-i.1) into the
-        // committed, compact `Trace.exit_prov`, keyed by committed instr index. The
-        // `dupe` path (link + unoptimized traces) hands back a null map ⇒ identity.
-        //
-        // A-i.4: the `.link` terminal (edge 2) carries its own provenance on
-        // `pending_link_provenance`. It is the trace's last instr — appended directly
-        // above, never through `emit`, so it has no lockstep slot — and a link trace
-        // always takes the `dupe` (identity) path, so its committed index is
-        // `fields.instrs.len − 1`. Release invariant (both set together only in
-        // `recForPrepLink`): a `.link` terminal ⇔ a pending link provenance.
-        if ((self.rec.link_target != null) != (self.rec.pending_link_provenance != null))
-            @panic("commit: link_target / pending_link_provenance invariant violated");
-        const link_term: ?ExitProvEntry = if (self.rec.pending_link_provenance) |lp|
-            .{ .index = @intCast(fields.instrs.len - 1), .prov = lp }
-        else
-            null;
-        // **FAIL-SOFT (round-14 review, A-i exit_prov parity with `rec_path`):** an OOM in
-        // `buildExitProv` must NOT abort the commit — `closeTrace` gates the anchor on a
-        // commit error, perturbing tiering, and `exit_prov` is region metadata (read
-        // only by `provAt` + the A-ii region classifier, nothing on the selection path). On
-        // OOM commit an EMPTY exit table and mark `exit_prov_complete = false` so region
-        // discovery treats the edge graph as incomplete and arms/mints nothing that pass.
-        // `buildExitProv`'s single alloc is `errdefer`-guarded, so a failure leaks nothing.
-        var exit_prov_complete = true;
-        var exit_prov_owned: []ExitProvEntry = &.{};
-        if (buildExitProv(self.gpa, self.rec.exit_prov.items, fields.old_to_new, link_term)) |ok| {
-            exit_prov_owned = ok;
-        } else |_| {
-            exit_prov_complete = false;
-        }
-        errdefer if (exit_prov_owned.len != 0) self.gpa.free(exit_prov_owned);
-
-        // A-ii.3/A-ii.4: dup the recorder's ordered program-point path into the
-        // committed trace. **FAIL-SOFT (round-14 review finding 1):** an OOM here must
-        // NOT abort the commit — `closeTrace` gates the anchor on a commit error, which
-        // would perturb tiering, and `rec_path` is region metadata. On ANY
-        // unavailability (recorder-path OOM flipped `rec_path_ok`, OR this dup OOMs)
-        // commit an empty path and mark membership INCOMPLETE (finding 3), so region
-        // discovery fails any region containing this trace CLOSED (`armable = false`)
-        // rather than minting on truncated membership. Owned; freed in `destroy`.
-        var rec_path_complete = self.rec.rec_path_ok;
-        const rec_path_owned: []ProgramPoint = if (self.rec.rec_path_ok and self.rec.rec_path.items.len != 0)
-            (self.gpa.dupe(ProgramPoint, self.rec.rec_path.items) catch blk: {
-                rec_path_complete = false;
-                break :blk &.{};
-            })
-        else
-            &.{};
-        errdefer if (rec_path_owned.len != 0) self.gpa.free(rec_path_owned);
-
-        // S3 (cross-frame tracing): pin the verifier's register-window bound to the
-        // executor's *real* window (`anchor_num_registers`), not the grown
-        // `reg_map.len` (which includes the callee scratch tail). A `slot_load`/`phi`
-        // `aux` outside `[0, anchor_num_registers)` is exactly the OOB that S1/S2
-        // prevent — so the verifier must reject it, not have its bound widened to
-        // hide it.
-        assertWellFormed(fields.instrs, fields.consts.len, self.rec.anchor_num_registers, @as(usize, self.rec.anchor_num_registers) + self.rec.input_seeds.items.len);
-
-        // Compute the entry type fingerprint: for each guard_int/guard_float/
-        // guard_number/guard_table that guards a slot_load, record the
-        // (slot, type) pair.  This lets the dispatch loop skip non-matching
-        // traces without a trial entry.
-        var entry_guards: std.ArrayListUnmanaged(EntryGuard) = .empty;
-        // Covers OOM during the append loop (and a failing `toOwnedSlice`, which
-        // leaves the list intact). After `toOwnedSlice` succeeds the list owns
-        // nothing, so the freed slice gets its own errdefer below.
-        errdefer entry_guards.deinit(self.gpa);
-        for (fields.instrs, 0..) |ins, i| {
-            const egt: ?EntryGuardType = switch (ins.op) {
-                .guard_int => .int,
-                .guard_float => .float,
-                .guard_number => .number,
-                .guard_table => .table,
-                else => null,
-            };
-            if (egt) |ty| {
-                const ref: u32 = @intCast(ins.a);
-                if (ref < i and fields.instrs[ref].op == .slot_load) {
-                    const slot: u16 = @intCast(fields.instrs[ref].aux);
-                    // Fingerprint only anchor-frame slots: a synthetic input slot
-                    // (`>= anchor_num_registers`, cluster sub-lever 1) is not present
-                    // in the narrow `RegWindow` `matchesFingerprint` reads, so adding
-                    // it would be an out-of-window read. Its type is still pinned by
-                    // the guard in the IR — a mismatch side-exits on a trial entry
-                    // instead of being pre-filtered.
-                    if (slot < self.rec.anchor_num_registers)
-                        try entry_guards.append(self.gpa, .{ .slot = slot, .ty = ty });
-                }
-            }
-        }
-        const guards_owned = try entry_guards.toOwnedSlice(self.gpa);
-        // Covers OOM in `create(Trace)` and the trailing `cache.append` (the
-        // `fields` errdefer above frees the IR arrays; this frees the fingerprint).
-        errdefer self.gpa.free(guards_owned);
-
-        // Own the synthetic-input seeding recipe (cluster sub-lever 1). Empty for
-        // the common trace (no upvalue/global-reached callee) — a static empty slice
-        // needs no free (`destroy` guards on `len != 0`).
-        const inputs_owned: []InputSeed = if (self.rec.input_seeds.items.len == 0)
-            &.{}
-        else
-            try self.gpa.dupe(InputSeed, self.rec.input_seeds.items);
-        errdefer if (inputs_owned.len != 0) self.gpa.free(inputs_owned);
-
-        const t = try self.gpa.create(Trace);
-        errdefer self.gpa.destroy(t);
-        // Doc 26 D1: does the committed IR carry a case-mapping op? (`.alloc`
-        // ops are never DCE'd, so post-optimizer presence ≡ recorded.) The
-        // commit itself is the first checkpoint of the pin invariant: the
-        // recorder only reaches these ops by mirroring a successful tier-0
-        // upper/lower, which pinned the session's Unicode version.
-        var requires_unicode_pin = false;
-        for (fields.instrs) |ins| {
-            if (ins.op == .supper or ins.op == .slower) requires_unicode_pin = true;
-        }
-        // Stable id (P-B): assigned once, never reused. A bump before a failed
-        // `cache.append` leaves a harmless gap in the id space (ids need only be
-        // unique, not contiguous).
-        const new_id = self.next_trace_id;
-        self.next_trace_id += 1;
-        t.* = .{
-            .id = new_id,
-            .anchor = self.rec.anchor,
-            .instrs = fields.instrs,
-            .consts = fields.consts,
-            .entry_slots = fields.entry_slots,
-            .entry_guards = guards_owned,
-            .inputs = inputs_owned,
-            .exit_prov = exit_prov_owned,
-            .exit_prov_complete = exit_prov_complete,
-            .rec_path = rec_path_owned,
-            .rec_path_complete = rec_path_complete,
-            .alloc_bound = self.rec.alloc_count,
-            .requires_unicode_pin = requires_unicode_pin,
-            .unrolled_while = self.rec.unrolled_while,
-            .peeled = self.rec.peel != null,
-        };
-        // §T.9: memoize the pure `isCompositeBridgeCandidate` oracle over this trace's
-        // instruction indices. Must run AFTER `t.*` is populated — the oracle reads the
-        // finished trace (`instrs`, `anchor`, `provAt`). FAIL-SOFT: on OOM leave the memo
-        // unbuilt, and `isBridgeCandidate` transparently falls back to the oracle, so a
-        // failure costs speed and never correctness.
-        buildBridgeCandMemo(self.gpa, t);
-        errdefer if (t.bridge_cand.len != 0) self.gpa.free(t.bridge_cand);
-        // Hotexit substrate (Pall's `snap->count`): one taken-exit counter per
-        // committed instruction. FAIL-SOFT on OOM (empty ⇒ `noteTakenExit`
-        // no-ops for this trace — hotness lost, correctness untouched).
-        if (self.gpa.alloc(u8, fields.instrs.len)) |counts| {
+        var candidate = try self.rec.finalize();
+        defer candidate.deinit(self.gpa);
+        const t = try self.registry.allocate();
+        errdefer self.registry.discardAllocation(t);
+        t.code = candidate.getCode().?.*;
+        if (self.gpa.alloc(u8, t.code.instrs.len)) |counts| {
             @memset(counts, 0);
             t.exit_counts = counts;
         } else |_| {}
         errdefer if (t.exit_counts.len != 0) self.gpa.free(t.exit_counts);
-        try self.cache.append(self.gpa, t);
-        bumpGen(&self.cache_gen); // invalidate Trace.anchor_pop_* memos
-        // Register in the O(1) id index (fail-soft: on grow-OOM the id stays
-        // unindexed and `traceById` falls back to the cache scan).
-        if (t.id >= self.trace_by_id.items.len) {
-            const old_len = self.trace_by_id.items.len;
-            if (self.trace_by_id.resize(self.gpa, t.id + 1)) {
-                @memset(self.trace_by_id.items[old_len..], null);
-                self.trace_by_id.items[t.id] = t;
-            } else |_| {}
-        } else {
-            self.trace_by_id.items[t.id] = t;
-        }
-        // Pall's `snap->count = SNAPCOUNT_DONE` at side-trace link (lj_trace.c:535):
-        // this commit was triggered by a hot exit (`side_src` provenance followed
-        // the want through consume → pending → recorder), so latch the parent's
-        // exit — it now has its side trace and must never count again. The parent
-        // may have been evicted mid-recording (`traceById` miss) — then there is
-        // nothing to latch.
-        self.finishSideTraceProvenance(t);
+        try self.registry.publish(t);
+        _ = candidate.take();
+        self.finishSideTraceProvenance(t, candidate.side_src);
         // Coverage (gated): a trace now exists at this anchor, so subsequent
         // interpreted back-edges here are "fallback despite a trace."
-        if (self.config.coverage) self.markAnchorTraced(t.anchor);
+        if (self.config.coverage) self.markAnchorTraced(t.code.anchor);
         // A-ii.2: refresh the structural-edge cache — the new trace may add edges
         // FROM itself AND make pre-existing traces' exits newly resolvable. Fail-soft
         // (never fails the commit); any OOM fails CLOSED to an empty cache (round-14
@@ -4434,250 +3123,7 @@ pub const TraceState = struct {
         self.rebuildRegions();
     }
 
-    /// Debug-only structural verifier for the invariants the tier-1a executor
-    /// (`irinterp.zig`) relies on, so a recorder bug can never become a wild read
-    /// at execution time. Compiled out in release builds (`std.debug.assert`).
-    ///   * the trace is non-empty and terminates in exactly one `loop`;
-    ///   * every operand `Ref` is defined earlier (linear SSA: ref < its index);
-    ///   * `slot_load`/`konst` `aux` is in register / const-pool bounds;
-    ///   * every `phi` update `b` precedes the `loop` and its `aux` slot is a
-    ///     register (or the internal sentinel).
-    /// `num_registers` is the executor's real loop-carried window
-    /// (`anchor_num_registers`) — the bound a `phi` flush may write back to (S2/S3).
-    /// `input_limit` is that window *plus* the synthetic entry inputs (cluster
-    /// sub-lever 1): a `slot_load` may read an input slot in
-    /// `[num_registers, input_limit)`, but no `phi` ever names one (inputs are
-    /// read-only, never `.def`), so the phi bound stays tight.
-    fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: usize, input_limit: usize) void {
-        std.debug.assert(instrs.len >= 1);
-        const last = instrs.len - 1;
-        // The trace terminates in exactly one terminal: `.loop` (root/continuation
-        // back-edge) or `.link` (continuation hand-off to an inner root, doc 15).
-        std.debug.assert(instrs[last].op == .loop or instrs[last].op == .link);
-        for (instrs, 0..) |ins, i| {
-            switch (ins.op) {
-                .slot_load => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < input_limit),
-                .konst => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < consts_len),
-                .loop => std.debug.assert(i == last), // the only loop, and it is terminal
-                // `.link` (doc 15): terminal hand-off to an inner root. Like `.loop`
-                // it is the sole terminal; `aux` is the inner anchor pc, not an
-                // operand ref, so nothing to bound-check beyond terminality.
-                .link => std.debug.assert(i == last),
-                // binary ops read both `a` and `b`.
-                .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .sar, .eq, .ne, .lt, .le => {
-                    std.debug.assert(ins.a < i and ins.b < i);
-                },
-                // unary ops and guards read `a` only.
-                .neg, .not, .bnot, .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .guard_func => {
-                    std.debug.assert(ins.a < i);
-                },
-                // `int_of_float` reads its sole float operand `a` (a prior node).
-                .int_of_float => std.debug.assert(ins.a < i),
-                // `alen` reads its sole table operand `a` (a prior node).
-                .alen => std.debug.assert(ins.a < i),
-                // `fsin`/`fcos`/`ffloor`/`fceil` read their sole numeric operand `a` (a prior node).
-                .fsin, .fcos, .ffloor, .fceil => std.debug.assert(ins.a < i),
-                // Doc 24 D4: `tostr_*` read their guarded numeric operand,
-                // `slen`/`guard_string` their string operand — all prior nodes.
-                // Doc 26: `supper`/`slower` read their string operand like `srev`.
-                .tostr_int, .tostr_num, .slen, .guard_string, .srev, .schar1, .supper, .slower => std.debug.assert(ins.a < i),
-                .srep2 => {
-                    std.debug.assert(ins.a < i);
-                    std.debug.assert(ins.b < i);
-                },
-                // ssub's third operand rides `aux` as a Ref (doc 24 codex #4);
-                // `scp` shares the three-operand encoding (doc 26 D3), as do
-                // doc 30's `sfindp`/`smatch` (subject, init, pattern-in-aux).
-                .ssub, .scp, .sfindp, .smatch => {
-                    std.debug.assert(ins.a < i);
-                    std.debug.assert(ins.b < i);
-                    std.debug.assert(ins.aux >= 0 and ins.aux < i);
-                },
-                // Doc 30 `sgmatch`: `a` = state ref; `aux` = konst-pool id
-                // (an immediate, bounds-checked against the pool).
-                .sgmatch => {
-                    std.debug.assert(ins.a < i);
-                    std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < consts_len);
-                },
-                // Doc 30 projections: `a` = the match op ref; `b` = slot
-                // immediate within the scratch geometry (never a ref).
-                .scap_int, .scap_str => {
-                    std.debug.assert(ins.a < i);
-                    std.debug.assert(@as(usize, ins.b) < gc.MatchScratch.n_slots);
-                },
-                // Doc 30 str2num: unary on a proven-string ref.
-                .str2num_i, .str2num_f => std.debug.assert(ins.a < i),
-                // Doc 30 sgm_setpos: state ref + new-pos ref, both prior.
-                .sgm_setpos => {
-                    std.debug.assert(ins.a < i);
-                    std.debug.assert(ins.b < i);
-                },
-                // Doc 30 guard_sid: string ref + konst-pool id immediate.
-                .guard_sid => {
-                    std.debug.assert(ins.a < i);
-                    std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < consts_len);
-                },
-                // `guard_gc` (doc 24 D3): operand-free; `aux` is the allocation
-                // bound `A` — a positive count stamped by `commit()`.
-                .guard_gc => std.debug.assert(ins.aux > 0),
-                // `guard_builtin` reads the callee ref `a`; `fsqrt` reads its float
-                // operand `a` — both prior nodes.
-                .guard_builtin, .fsqrt => std.debug.assert(ins.a < i),
-                // `aref` pairs (table, index) into an address descriptor;
-                // `astore`/`astore_append` read the `aref` (`a`) and the value (`b`).
-                // `href` (table, key konst) and `hstore` (href, value) mirror them.
-                .aref, .astore, .astore_append, .href, .hstore => std.debug.assert(ins.a < i and ins.b < i),
-                // Grid cell access (doc 14, Phase 8): `garow` pairs (table,row),
-                // `gcell` pairs (garow,col), `gstore` reads (gcell, value) — all two
-                // prior operands. `gload` and the grid guards read one prior node.
-                .garow, .gcell, .gstore, .guard_gcol => std.debug.assert(ins.a < i and ins.b < i),
-                .gload, .guard_grid, .guard_stride, .guard_gpresent => std.debug.assert(ins.a < i),
-                // `aload` and the array-access guards read one prior node
-                // (the table value, or the `aref`). `guard_append` reads the `aref`.
-                // `hload`/`guard_hash` read the `href` (`a`).
-                .aload, .guard_table, .guard_lane, .guard_present, .guard_fits, .guard_append, .hload, .guard_hash => {
-                    std.debug.assert(ins.a < i);
-                },
-                // `guard_bounds` carries producer-dispatched semantics (doc 18 D3):
-                // tier-1a selects the bounds rule from the producer op, so the
-                // producer must be one of exactly two memory ops — `aref` (scalar
-                // array key) or `garow` (grid row). Both are canonical-to-self in
-                // `tropt` (never folded/CSE'd) and `a` is remapped through
-                // compaction, so this holds post-optimization too; pin it so
-                // malformed IR fails closed here rather than mis-dispatching.
-                .guard_bounds => {
-                    std.debug.assert(ins.a < i);
-                    const producer = instrs[ins.a].op;
-                    std.debug.assert(producer == .aref or producer == .garow);
-                },
-                // φ: the init `a` is an ordinary backward ref (a < i); the update
-                // `b` is the back-edge value and may reference a *later* node, like
-                // an `exit_store.ref` — only required to precede the `loop` marker.
-                // `aux` is the flush slot (a valid register) or the internal sentinel.
-                .phi => {
-                    std.debug.assert(ins.a < i);
-                    std.debug.assert(ins.b < last);
-                    std.debug.assert(ins.aux == PHI_INTERNAL or
-                        (ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < num_registers));
-                    // Doc 39: a slot-bound φ's `a` is either 0 (unused — no
-                    // steady-state internal φ; the historical value) or the
-                    // slot's INTERNAL φ (the durable slot↔φ association a
-                    // peeled trace commits). Unambiguous: instruction 0 can
-                    // never be a φ (its `a < i` requires i > 0).
-                    if (ins.aux != PHI_INTERNAL and ins.a != 0) {
-                        const assoc = instrs[@intCast(ins.a)];
-                        std.debug.assert(assoc.op == .phi and assoc.aux == PHI_INTERNAL);
-                    }
-                },
-                // Preheader region boundary (Phase E1): a pure marker, no operands.
-                // Structural invariants (at most one; before any φ) are asserted in
-                // the global pass below.
-                .preheader => {},
-            }
-        }
-        // Preheader structural rules (Phase E1 / LICM): at most one marker, and no
-        // `phi` may precede it (loop-carried values must run every iteration, but a
-        // φ before the marker would be skipped on iterations 2+).
-        var preheader_idx: ?usize = null;
-        for (instrs, 0..) |ins, i| {
-            if (ins.op == .preheader) {
-                std.debug.assert(preheader_idx == null); // at most one
-                preheader_idx = i;
-            }
-        }
-        if (preheader_idx) |ph| {
-            for (instrs[0..ph]) |ins| std.debug.assert(ins.op != .phi);
-        }
-    }
-
-    // Per-instruction recording — moved to trace_recorder.zig (file-split
-    // pass); forwarding decls keep every `self.recX(...)` spelling working.
-    pub const recordInstr = trace_recorder_mod.recordInstr;
-    pub const recordOne = trace_recorder_mod.recordOne;
-    pub const emit = trace_recorder_mod.emit;
-    pub const emitAlloc = trace_recorder_mod.emitAlloc;
-    pub const konst = trace_recorder_mod.konst;
-    pub const refOf = trace_recorder_mod.refOf;
-    pub const noteEntryKind = trace_recorder_mod.noteEntryKind;
-    pub const noteEntryKindFromLane = trace_recorder_mod.noteEntryKindFromLane;
-    pub const setReg = trace_recorder_mod.setReg;
-    pub const defineSlotAbs = trace_recorder_mod.defineSlotAbs;
-    pub const readSlot = trace_recorder_mod.readSlot;
-    pub const stampProv = trace_recorder_mod.stampProv;
-    pub const guard = trace_recorder_mod.guard;
-    pub const guardInt = trace_recorder_mod.guardInt;
-    pub const guardNum = trace_recorder_mod.guardNum;
-    pub const keyIndexOf = trace_recorder_mod.keyIndexOf;
-    pub const keyRefNarrowed = trace_recorder_mod.keyRefNarrowed;
-    pub const recArith = trace_recorder_mod.recArith;
-    pub const recBitwise = trace_recorder_mod.recBitwise;
-    pub const recNeg = trace_recorder_mod.recNeg;
-    pub const recNot = trace_recorder_mod.recNot;
-    pub const recBnot = trace_recorder_mod.recBnot;
-    pub const recCompare = trace_recorder_mod.recCompare;
-    pub const GetFrame = trace_recorder_mod.GetFrame;
-    pub const SetFrame = trace_recorder_mod.SetFrame;
-    pub const recArrayGet = trace_recorder_mod.recArrayGet;
-    pub const arrayGetShape = trace_recorder_mod.arrayGetShape;
-    pub const forwardPendingArrayLoad = trace_recorder_mod.forwardPendingArrayLoad;
-    pub const forwardPendingHashLoad = trace_recorder_mod.forwardPendingHashLoad;
-    pub const classifyArrayKeyAlias = trace_recorder_mod.classifyArrayKeyAlias;
-    pub const intKonstRef = trace_recorder_mod.intKonstRef;
-    pub const affineIntKey = trace_recorder_mod.affineIntKey;
-    pub const recArraySet = trace_recorder_mod.recArraySet;
-    pub const arraySetShape = trace_recorder_mod.arraySetShape;
-    pub const recGridGet = trace_recorder_mod.recGridGet;
-    pub const recGridSet = trace_recorder_mod.recGridSet;
-    pub const traceHasHeapLoad = trace_recorder_mod.traceHasHeapLoad;
-    pub const isStringKey = trace_recorder_mod.isStringKey;
-    pub const seedHashCell = trace_recorder_mod.seedHashCell;
-    pub const recHashGet = trace_recorder_mod.recHashGet;
-    pub const hashGetShape = trace_recorder_mod.hashGetShape;
-    pub const recHashSet = trace_recorder_mod.recHashSet;
-    pub const hashSetShape = trace_recorder_mod.hashSetShape;
-    pub const recEq = trace_recorder_mod.recEq;
-    pub const recBranch = trace_recorder_mod.recBranch;
-    pub const recTForLoop = trace_recorder_mod.recTForLoop;
-    pub const recForLoop = trace_recorder_mod.recForLoop;
-    pub const recForPrepLink = trace_recorder_mod.recForPrepLink;
-    pub const recWhileLink = trace_recorder_mod.recWhileLink;
-    pub const recCall = trace_recorder_mod.recCall;
-    pub const recBuiltin = trace_recorder_mod.recBuiltin;
-    pub const recBMType = trace_recorder_mod.recBMType;
-    pub const konstValueOf = trace_recorder_mod.konstValueOf;
-    pub const foldInternedStr = trace_recorder_mod.foldInternedStr;
-    pub const recBType = trace_recorder_mod.recBType;
-    pub const recBTostring = trace_recorder_mod.recBTostring;
-    pub const isProvenStringRef = trace_recorder_mod.isProvenStringRef;
-    pub const stringArgRef = trace_recorder_mod.stringArgRef;
-    pub const intArgRef = trace_recorder_mod.intArgRef;
-    pub const recBSLen = trace_recorder_mod.recBSLen;
-    pub const recBSSub = trace_recorder_mod.recBSSub;
-    pub const recBSRev = trace_recorder_mod.recBSRev;
-    pub const recBSChar1 = trace_recorder_mod.recBSChar1;
-    pub const recBSRep2 = trace_recorder_mod.recBSRep2;
-    pub const recBSCase = trace_recorder_mod.recBSCase;
-    pub const recBSCodepoint = trace_recorder_mod.recBSCodepoint;
-    pub const PatternPin = trace_recorder_mod.PatternPin;
-    pub const patternArgPin = trace_recorder_mod.patternArgPin;
-    pub const projectCaptures = trace_recorder_mod.projectCaptures;
-    pub const recBSFind = trace_recorder_mod.recBSFind;
-    pub const recBSMatch = trace_recorder_mod.recBSMatch;
-    pub const recBSGmatchIter = trace_recorder_mod.recBSGmatchIter;
-    pub const recBTonumber = trace_recorder_mod.recBTonumber;
-    pub const recBSelect = trace_recorder_mod.recBSelect;
-    pub const recBRawequal = trace_recorder_mod.recBRawequal;
-    pub const recBRawlen = trace_recorder_mod.recBRawlen;
-    pub const recBRawget = trace_recorder_mod.recBRawget;
-    pub const recBRawset = trace_recorder_mod.recBRawset;
-    pub const recAlenShape = trace_recorder_mod.recAlenShape;
-    pub const guardBuiltinCallee = trace_recorder_mod.guardBuiltinCallee;
-    pub const recPureSqrt = trace_recorder_mod.recPureSqrt;
-    pub const recFloatUnary = trace_recorder_mod.recFloatUnary;
-    pub const recFloorCeil = trace_recorder_mod.recFloorCeil;
-    pub const recReturn = trace_recorder_mod.recReturn;
-    pub const recInputGet = trace_recorder_mod.recInputGet;
-    pub const recCalleeUpval = trace_recorder_mod.recCalleeUpval;
+    // Emission and finalization are owned by RecordingSession.
 };
 
 // Recorder support decls + the Recorder struct itself — moved to
@@ -4701,7 +3147,7 @@ pub const MAX_TRACE_INPUTS = trace_recorder_mod.MAX_TRACE_INPUTS;
 pub const InlineFrame = trace_recorder_mod.InlineFrame;
 pub const pathFromFrames = trace_recorder_mod.pathFromFrames;
 pub const TraceKind = trace_recorder_mod.TraceKind;
-pub const Recorder = trace_recorder_mod.Recorder;
+pub const RecordingSession = trace_recorder_mod.RecordingSession;
 
 // ---------------------------------------------------------------------------
 // Disassembly — same spirit as `bytecode.writeProto`. Invaluable for `--dump-
@@ -4713,8 +3159,8 @@ pub const writeIrInstr = trace_ir.writeIrInstr;
 /// Disassemble a whole trace: header + entry slots + numbered IR (the slot-bound
 /// `phi` rows are the loop-carried writebacks that `exit_stores` used to list).
 pub fn writeTrace(w: *io.Writer, t: *const Trace) io.Writer.Error!void {
-    try w.print("trace {s}:{d}  entry=[", .{ t.anchor.proto.name, t.anchor.pc });
-    for (t.entry_slots, 0..) |s, i| {
+    try w.print("trace {s}:{d}  entry=[", .{ t.code.anchor.proto.name, t.code.anchor.pc });
+    for (t.code.entry_slots, 0..) |s, i| {
         if (i != 0) try w.writeAll(" ");
         try w.print("r{d}", .{s});
     }
@@ -4725,8 +3171,8 @@ pub fn writeTrace(w: *io.Writer, t: *const Trace) io.Writer.Error!void {
     // its main trace used 7 of 8, back when the then-`.too_deep` tag — now
     // split into `.input_cap`/`.frame_bounds`/`.too_deep` — hid which limit
     // fired; CURRENT_TASK LATEST-94).
-    try w.print("]  inputs={d}/{d}\n", .{ t.inputs.len, MAX_TRACE_INPUTS });
-    for (t.instrs, 0..) |ins, i| {
+    try w.print("]  inputs={d}/{d}\n", .{ t.code.inputs.len, MAX_TRACE_INPUTS });
+    for (t.code.instrs, 0..) |ins, i| {
         try w.print("  %{d:0>3}  ", .{i});
         try writeIrInstr(w, ins);
         try w.writeAll("\n");
@@ -4845,7 +3291,7 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
     try w.print("    link arms:            native={d} source={d} loopdone={d} bridge={d}\n", .{ ts.native_link_arms, ts.native_source_link_arms, ts.native_loopdone_link_arms, ts.native_region_bridge_arms });
     try w.print("    bridge arm attempts:  {d} (pipeline runs; vs {d} arms)\n", .{ ts.native_region_bridge_arm_attempts, ts.native_region_bridge_arms });
     try w.print("    link fused:           source={d} loopdone={d} bridge={d}\n", .{ ts.native_source_link_fused, ts.native_loopdone_link_fused, ts.native_region_bridge_fused });
-    try w.print("    link disarms:         {d} (peak simultaneous arms: {d})\n", .{ ts.native_link_disarms, ts.native_link_peak });
+    try w.print("    link disarms:         {d} (peak simultaneous arms: {d})\n", .{ ts.registry.native_physical.native_link_disarms, ts.registry.native_physical.native_link_peak });
     try w.print("    native link exits:    {d} (follows={d})\n", .{ ts.native_link_exits, ts.native_link_follow_count });
     try w.print("    ir link exits:        {d} (follows={d})\n", .{ ts.link_ir_exits, ts.link_follow_count });
     try w.print("    prime-side:           arms={d} chain-follows={d} tier0-body-entries={d}\n", .{ ts.prime_side_arms, ts.prime_side_chain_follows, ts.tier0_outer_body_entries });

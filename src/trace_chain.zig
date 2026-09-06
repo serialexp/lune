@@ -19,6 +19,7 @@ const value = @import("value.zig");
 const io = @import("io.zig");
 const nativegen = @import("nativegen.zig");
 const irinterp = @import("irinterp.zig");
+const trace_exec = @import("trace_exec.zig");
 const jitdbg = @import("jitdbg.zig");
 const function = @import("function.zig");
 const Value = value.Value;
@@ -83,12 +84,12 @@ const PROVENANCE_VERDICT_CAP = trace_mod.TraceState.PROVENANCE_VERDICT_CAP;
 /// — every chain seam runs inside an episode `prepareNativeEpisode` just
 /// stamped, so a mismatch is a wiring bug, not a runtime condition.
 pub fn seedForTier1a(self: *TraceState, t: *const Trace, proto: *const Proto) bool {
-    if (t.inputs.len == 0) return true;
-    const ctx = self.native_seed_ctx orelse return false;
+    if (t.code.inputs.len == 0) return true;
+    const ctx = self.registry.native_seed_ctx orelse return false;
     const f = ctx.seed_tier1a_fn orelse return false;
     std.debug.assert(ctx.proto == @as(*const anyopaque, @ptrCast(proto)));
-    const rc = f(ctx, t);
-    self.dbg("chain-seed: trace={d} inputs={d} rc={d}", .{ t.id, t.inputs.len, rc });
+    const rc = f(ctx, &t.code);
+    self.dbg("chain-seed: trace={d} inputs={d} rc={d}", .{ t.id, t.code.inputs.len, rc });
     return rc != NativeSeedCtx.SEED_CAPACITY_DECLINE;
 }
 
@@ -161,8 +162,8 @@ pub const StubEnterability = enum {
 /// fails for everything.
 // pub for trace_regionops.zig (file-split pass)
 pub fn liveEpisodeProto(self: *const TraceState) ?*const anyopaque {
-    const ctx = self.native_seed_ctx orelse return null;
-    const rctx = self.region_context orelse return null;
+    const ctx = self.registry.native_seed_ctx orelse return null;
+    const rctx = self.region_policy.region_context orelse return null;
     if (ctx.call_seq != rctx.call_seq) return null;
     return ctx.proto;
 }
@@ -187,7 +188,7 @@ pub fn stubEnterability(
     // episode context needed — hand-built test pages stay armable.
     if (!c.seed_plan.nonEmpty()) return .ok;
     // Seeded page: fail-closed freshness.
-    if (t.anchor.proto != proto) return .no_compilation;
+    if (t.code.anchor.proto != proto) return .no_compilation;
     const live = self.liveEpisodeProto() orelse return .no_episode;
     if (live != @as(*const anyopaque, @ptrCast(proto))) return .no_episode;
     return .ok;
@@ -211,7 +212,7 @@ pub fn stubEnterability(
 ///   * `.native_only` + `.native_numeric_for_done` ≡ old `tryChainProductiveLoopDoneNative`
 ///
 /// Returns the committed iteration count and the PC tier-0 should resume at
-/// (`resume_pc == null` ⇒ resume at `failed.anchor.pc`), or null if nothing
+/// (`resume_pc == null` ⇒ resume at `failed.code.anchor.pc`), or null if nothing
 /// ran (caller falls to tier-0 at the header, unchanged). `initially_excluded`
 /// seeds the candidate walk's visited set — the existing sites pass empty
 /// (their walk PC is the exit PC, disjoint from the dispatcher's anchor walk);
@@ -222,7 +223,7 @@ pub fn driveChain(
     // source-branch guard slot at the prime-side ramp's `ordinary_entry`
     // (`armNativeLink` takes `parent: *Trace`). Read-only on every other path.
     failed: *Trace,
-    result: irinterp.ExecResult,
+    result: trace_exec.ExecResult,
     proto: *const Proto,
     regs: RegWindow,
     comptime tier: ChainTier,
@@ -260,7 +261,7 @@ pub fn driveChain(
         // guard fired. `initially_excluded` (the dispatcher's same-anchor
         // `visited` set) keeps us from re-running the failed trace or any
         // sibling the cold walk already tried this back-edge.
-        .ordinary_header => failed.anchor.pc,
+        .ordinary_header => failed.code.anchor.pc,
         // Doc 38: a while-loop-done chains to the continuation at the condition
         // branch's JUMP TARGET (the post-loop pc). Re-derived through the
         // fail-closed classifier — a mis-tagged call (exit isn't actually a
@@ -280,8 +281,8 @@ pub fn driveChain(
         // it through the op-gated accessor so an array-guard lane ordinal is never
         // mistaken for a PC, and reject a 0/anchor exit PC (nothing to chain to).
         else => blk: {
-            const wp = guardExitPc(failed.instrs[exit_instr]) orelse return null;
-            if (wp == 0 or wp == failed.anchor.pc) return null;
+            const wp = guardExitPc(failed.code.instrs[exit_instr]) orelse return null;
+            if (wp == 0 or wp == failed.code.anchor.pc) return null;
             break :blk wp;
         },
     };
@@ -333,10 +334,10 @@ pub fn driveChain(
         // after the full burst — the keyframe byte-identity (§T-A.2)
         // demands allocation counts observed only at tier-0 boundaries.
         // Non-allocating candidates chain as before.
-        if (!safe_to_arm and sct.alloc_bound > 0) continue;
+        if (!safe_to_arm and sct.code.alloc_bound > 0) continue;
         // Doc 26 D1 tripwire, chain half: see `enterSelectedTrace`.
-        if (sct.requires_unicode_pin) std.debug.assert(unicode_pinned);
-        const is_link = sct.instrs.len != 0 and sct.instrs[sct.instrs.len - 1].op == .link;
+        if (sct.code.requires_unicode_pin) std.debug.assert(unicode_pinned);
+        const is_link = sct.code.instrs.len != 0 and sct.code.instrs[sct.code.instrs.len - 1].op == .link;
         // Loop-done chains (ir and native, numeric-for and while) only follow
         // `.link` continuations; an ordinary side trace at the post-loop PC is
         // not a valid hand-off.
@@ -352,7 +353,7 @@ pub fn driveChain(
         // stale seed declines through the B-iv.2 hop-0 directives (no
         // strike, no receipt). Ordered AFTER the shape filters so a
         // filtered-out candidate is never spuriously seeded.
-        if (sct.inputs.len != 0 and tier != .native_only) {
+        if (sct.code.inputs.len != 0 and tier != .native_only) {
             if (!self.seedForTier1a(sct, proto)) continue;
         }
 
@@ -363,7 +364,7 @@ pub fn driveChain(
         // native the commit already happened (`runLinkedLoopDone`); for tier-1a
         // loop-done we flush the failed trace's final iteration from scratch now.
         var flushed_resume_pc: ?u32 = null;
-        var sresult: irinterp.ExecResult = undefined;
+        var sresult: trace_exec.ExecResult = undefined;
         var snt: *const nativegen.CompiledTrace = undefined;
         if (tier == .native_only) {
             snt = self.nativeFor(sct) orelse return .{ .completed = 0, .resume_pc = walk_pc };
@@ -483,9 +484,9 @@ pub fn driveChain(
                 return .{ .completed = 0, .resume_pc = walk_pc };
             }
         } else {
-            const sbuf = self.valuesPush(sct.instrs.len) catch continue;
+            const sbuf = self.valuesPush(sct.code.instrs.len) catch continue;
             if (loop_done_values) |vals| {
-                if (!irinterp.flushNumericForLoopDone(failed, regs, vals, exit_instr)) return null;
+                if (!irinterp.flushNumericForLoopDone(&failed.code, regs, vals, exit_instr)) return null;
                 flushed_resume_pc = walk_pc;
             } else if (materialization == .while_done) {
                 // Doc 38: no flush owed — the while condition guard fails at
@@ -496,7 +497,7 @@ pub fn driveChain(
                 // the post-loop pc, never back at the loop header.
                 flushed_resume_pc = walk_pc;
             }
-            sresult = irinterp.executeCtx(.{ .heap = self.exec_heap }, sct, regs, sbuf);
+            sresult = irinterp.executeCtx(.{ .heap = self.exec_heap }, &sct.code, regs, sbuf);
         }
 
         // --- linked burst: the continuation ran to its `.link` terminator, so
@@ -510,9 +511,9 @@ pub fn driveChain(
         // enter the burst with the inner result pre-loaded (`fused_inner`) — exactly
         // as if the continuation had reached its `.link` and we had then run inner.
         const sresult_fused = tier == .native_only and
-            sresult.final_trace_id != irinterp.NO_TRACE_ID and
+            sresult.final_trace_id != trace_exec.NO_TRACE_ID and
             sresult.final_trace_id != sct.id;
-        if (is_link and (sresult.exit_instr == sct.instrs.len - 1 or sresult_fused)) {
+        if (is_link and (sresult.exit_instr == sct.code.instrs.len - 1 or sresult_fused)) {
             if (!sresult_fused) _ = self.accountRegionProfit(
                 .{ .trace_id = sct.id, .exit_instr = sresult.exit_instr },
                 0,
@@ -525,7 +526,7 @@ pub fn driveChain(
             // drained by the dispatcher's fused-`.link` consumer). Gated exactly like
             // 2.3b-1's continuation arm plus two M1-specific conditions:
             //  - `materialization == .ordinary_header`: only the coherent-anchor path,
-            //    where `sct` is a same-anchor ramp (walk_pc == failed.anchor.pc) -- never
+            //    where `sct` is a same-anchor ramp (walk_pc == failed.code.anchor.pc) -- never
             //    a post-inner continuation, so this can only ever arm skip->ramp.
             //  - `isSourceBranchGuardExit(failed, exit_instr)`: `exit_instr` must be a
             //    real source-branch guard (excludes the zero-exit path's arbitrary
@@ -577,17 +578,17 @@ pub fn driveChain(
 pub fn driveSeedSilentResult(
     self: *TraceState,
     seed: *Trace,
-    result: irinterp.ExecResult,
+    result: trace_exec.ExecResult,
     proto: *const Proto,
     regs: RegWindow,
     safe_to_arm: bool,
     materialization: ExitMaterialization,
 ) ?ChainResult {
     var linked_completed: usize = 0;
-    const seed_inner_pc: u32 = if (seed.instrs.len != 0 and seed.instrs[seed.instrs.len - 1].op == .link)
-        @intCast(seed.instrs[seed.instrs.len - 1].aux)
+    const seed_inner_pc: u32 = if (seed.code.instrs.len != 0 and seed.code.instrs[seed.code.instrs.len - 1].op == .link)
+        @intCast(seed.code.instrs[seed.code.instrs.len - 1].aux)
     else
-        seed.anchor.pc;
+        seed.code.anchor.pc;
     var resume_pc: u32 = seed_inner_pc;
     var hops: usize = 0;
     const directive = self.drainSilentResult(
@@ -811,7 +812,7 @@ pub const SilentCellOwner = struct { set: *PromotedSet, phase: usize };
 pub fn silentCellOwner(self: *TraceState, cell_addr: u64) ?SilentCellOwner {
     if (cell_addr == 0) return null;
     var found: ?SilentCellOwner = null;
-    for (self.promoted_sets.items) |*set| {
+    for (self.registry.native_physical.promoted_sets.items) |*set| {
         for (set.metadata, 0..) |*metadata, phase| {
             if (@intFromPtr(metadata) != cell_addr) continue;
             if (found != null)
@@ -860,12 +861,12 @@ pub fn silentSiblingEvidence(
     followed: u64,
     last_productive_ordinal: u64,
     parent_id: u32,
-    suffix_rows: []const irinterp.LedgerEntry,
+    suffix_rows: []const trace_exec.LedgerEntry,
 ) SilentSiblingEvidence {
     if (cell.last_ordinal == 0)
         @panic("driveSilentBurst: fired edge has no firing ordinal");
     var returned = false;
-    for (self.promoted_sets.items) |*c| {
+    for (self.registry.native_physical.promoted_sets.items) |*c| {
         for (c.edges, c.summary) |other_edge, other_cell| {
             if (other_edge.parent.id == parent_id and
                 other_cell.last_ordinal > cell.last_ordinal)
@@ -896,7 +897,7 @@ pub fn silentSiblingEvidence(
 /// resume contract of the edge where the silent budget stopped.
 pub fn driveSilentBurst(
     self: *TraceState,
-    result: irinterp.ExecResult,
+    result: trace_exec.ExecResult,
     proto: *const Proto,
     linked_completed: *usize,
     resume_pc: *u32,
@@ -923,13 +924,13 @@ pub fn driveSilentBurst(
     // `silent_last_cell` resolve against promotion storage as it was when
     // native published them. Any future safe point inserted between return
     // and drain would let those cell addresses go stale.
-    const seam_t0: u64 = if (self.config.coverage and self.replay_walk_depth == 0)
+    const seam_t0: u64 = if (self.config.coverage and self.registry.native_physical.replay_walk_depth == 0)
         readCycles()
     else
         0;
-    self.replay_walk_depth += 1;
+    self.registry.native_physical.replay_walk_depth += 1;
     defer {
-        self.replay_walk_depth -= 1;
+        self.registry.native_physical.replay_walk_depth -= 1;
         if (seam_t0 != 0) {
             self.cycles_seam +|= cycleDelta(readCycles(), seam_t0);
             self.seam_walks +|= 1;
@@ -949,12 +950,12 @@ pub fn driveSilentBurst(
         @panic("driveSilentBurst: silent terminal cell has no live promotion");
     const last_set = last_owner.set;
     const last_phase = last_owner.phase;
-    for (self.promoted_sets.items) |*c| {
+    for (self.registry.native_physical.promoted_sets.items) |*c| {
         if (c.edges.len == 0 or c.edges.len != c.summary.len or
             c.edges.len != c.metadata.len)
             @panic("driveSilentBurst: promoted set storage is inconsistent");
     }
-    if (result.ledger_len > irinterp.LEDGER_CAP)
+    if (result.ledger_len > trace_exec.LEDGER_CAP)
         @panic("driveSilentBurst: suffix ledger exceeds cap");
     const last_edge_local = last_set.summary[last_phase].last_local;
     if (last_edge_local > std.math.maxInt(usize))
@@ -965,7 +966,7 @@ pub fn driveSilentBurst(
     // "did anything make progress at or after this firing" stays one comparison.
     var last_productive_ordinal: u64 = 0;
     var total_firings: u64 = 0;
-    for (self.promoted_sets.items) |*c| {
+    for (self.registry.native_physical.promoted_sets.items) |*c| {
         for (c.summary) |cell| {
             last_productive_ordinal = @max(last_productive_ordinal, cell.last_productive_ordinal);
             total_firings +|= cell.firings;
@@ -979,7 +980,7 @@ pub fn driveSilentBurst(
             "driveSilentBurst: summary firings {d} disagree with transition count {d}",
             .{ total_firings, result.silent_transitions },
         );
-    const active = if (self.region_context) |ctx| self.activeRegionFor(ctx.call_seq) else null;
+    const active = if (self.region_policy.region_context) |ctx| self.activeRegionFor(ctx.call_seq) else null;
     if (active == null)
         @panic("driveSilentBurst: silent burst outside an activation");
 
@@ -991,7 +992,7 @@ pub fn driveSilentBurst(
     // sums) or measurement-carried (per-cell ordinals; one most-recent-firing
     // verdict per edge). Do not add order-sensitive derivation here — anything
     // that needs sequence must be measured into the cells by the epilogues.
-    for (self.promoted_sets.items) |*c| {
+    for (self.registry.native_physical.promoted_sets.items) |*c| {
         var region_work: u64 = 0;
         var fired = false;
         for (c.edges, 0..) |edge, phase| {
@@ -1056,7 +1057,7 @@ pub fn driveSilentBurst(
         // the live activation it credits.
         if (!std.meta.eql(active.?, c.region_key))
             @panic("driveSilentBurst: promoted set activation is not active");
-        const c_accum = self.region_profit.getPtr(c.region_key) orelse
+        const c_accum = self.region_policy.region_profit.getPtr(c.region_key) orelse
             @panic("driveSilentBurst: promoted set accumulator is missing");
         if (!c_accum.frozen)
             @panic("driveSilentBurst: promoted set accumulator is not frozen");
@@ -1066,7 +1067,7 @@ pub fn driveSilentBurst(
     }
     // Every fired edge proved `region_key == active`, so they all share one
     // accumulator; the entry set always fired, so its lookup names it.
-    const accum = self.region_profit.getPtr(entry_set.region_key) orelse
+    const accum = self.region_policy.region_profit.getPtr(entry_set.region_key) orelse
         @panic("driveSilentBurst: promoted set accumulator is missing");
     if (loop_done_count > std.math.maxInt(usize) - linked_completed.*)
         linked_completed.* = std.math.maxInt(usize)
@@ -1110,7 +1111,7 @@ pub fn driveSilentBurst(
     // clears after consuming the complete image. EVERY live set is cleared,
     // not just the entry one — a second live set that fused into this call
     // would otherwise re-apply its work on its own next drain.
-    for (self.promoted_sets.items) |*c|
+    for (self.registry.native_physical.promoted_sets.items) |*c|
         @memset(c.summary, std.mem.zeroes(nativegen.SilentSummaryCell));
     self.silent_bursts_drained +|= 1;
     self.silent_transitions_total +|= result.silent_transitions;
@@ -1172,7 +1173,7 @@ pub fn driveSilentBurst(
 /// Universal single-branch drain used immediately after every native call.
 pub fn drainSilentResult(
     self: *TraceState,
-    result: irinterp.ExecResult,
+    result: trace_exec.ExecResult,
     origin: ReplayOrigin,
     proto: *const Proto,
     linked_completed: *usize,
@@ -1198,11 +1199,11 @@ pub fn drainSilentResult(
 
 pub fn captureSilentSuffixProvenance(
     self: *TraceState,
-    result: irinterp.ExecResult,
+    result: trace_exec.ExecResult,
     out: []ProvenanceVerdict,
 ) usize {
     if (result.silent_active == 0) return 0;
-    if (result.ledger_len > irinterp.LEDGER_CAP)
+    if (result.ledger_len > trace_exec.LEDGER_CAP)
         @panic("silent suffix provenance: ledger exceeds cap");
     if (result.silent_cum > std.math.maxInt(usize))
         @panic("silent suffix provenance: cumulative count exceeds usize");
@@ -1256,8 +1257,8 @@ pub const NativeCallOrigin = enum {
 pub fn captureNativeCallProvenance(
     self: *TraceState,
     origin: NativeCallOrigin,
-    result: irinterp.ExecResult,
-    entries: []const irinterp.LedgerEntry,
+    result: trace_exec.ExecResult,
+    entries: []const trace_exec.LedgerEntry,
     captured: *NativeCallProvenance,
 ) void {
     _ = origin; // Required at each call site so origin coverage cannot hide.
@@ -1311,7 +1312,7 @@ pub fn settleNativeCallProvenance(
 ///   `[C.link, I.exit]`  armed slot fused into the inner root  → drain the inner
 pub fn replayLedger(
     self: *TraceState,
-    entries: []const irinterp.LedgerEntry,
+    entries: []const trace_exec.LedgerEntry,
     seed_owner: *Trace,
     inner_pc: u32,
     proto: *const Proto,
@@ -1324,9 +1325,9 @@ pub fn replayLedger(
     regs: ?RegWindow,
 ) LedgerReplay {
     var frozen_fast: ?FrozenFast = null;
-    if (self.region_context) |rctx| {
+    if (self.region_policy.region_context) |rctx| {
         if (self.activeRegionFor(rctx.call_seq)) |akey| {
-            if (self.region_profit.getPtr(akey)) |accum| {
+            if (self.region_policy.region_profit.getPtr(akey)) |accum| {
                 if (accum.frozen) frozen_fast = .{ .key = akey, .accum = accum };
             }
         }
@@ -1344,7 +1345,7 @@ pub fn replayLedger(
 
 pub fn replayLedgerSuffix(
     self: *TraceState,
-    entries: []const irinterp.LedgerEntry,
+    entries: []const trace_exec.LedgerEntry,
     suffix_init: SuffixInit,
     proto: *const Proto,
     linked_completed: *usize,
@@ -1358,9 +1359,9 @@ pub fn replayLedgerSuffix(
     const seed_owner = self.traceById(entries[0].id) orelse
         @panic("replayLedgerSuffix: first entry owner id did not resolve");
     var frozen_fast: ?FrozenFast = null;
-    if (self.region_context) |rctx| {
+    if (self.region_policy.region_context) |rctx| {
         if (self.activeRegionFor(rctx.call_seq)) |akey| {
-            if (self.region_profit.getPtr(akey)) |accum| {
+            if (self.region_policy.region_profit.getPtr(akey)) |accum| {
                 if (accum.frozen) frozen_fast = .{ .key = akey, .accum = accum };
             }
         }
@@ -1378,7 +1379,7 @@ pub fn replayLedgerSuffix(
 
 pub fn replayLedgerFrom(
     self: *TraceState,
-    entries: []const irinterp.LedgerEntry,
+    entries: []const trace_exec.LedgerEntry,
     cursor: *ReplayCursor,
     seed_owner: *Trace,
     proto: *const Proto,
@@ -1394,7 +1395,7 @@ pub fn replayLedgerFrom(
     // (the append is bounds-guarded; the forced-yield cap keeps a closed cycle
     // under CAP). Release-guard both so `entries[k]` is never OOB even if that
     // invariant were ever violated upstream.
-    if (entries.len == 0 or entries.len > irinterp.LEDGER_CAP)
+    if (entries.len == 0 or entries.len > trace_exec.LEDGER_CAP)
         @panic("replayLedger: ledger length outside [1, LEDGER_CAP]");
     // A-vii-d.1: never inherit a bridge-arm request from a previous ledger.
     self.pending_bridge_arm = null;
@@ -1402,15 +1403,15 @@ pub fn replayLedgerFrom(
     // so `cycles_seam` splits the traced bucket into native-vs-steering. A
     // `seam_t0` of 0 doubles as the "not bracketed" sentinel (coverage off,
     // nested walk, or no TSC on this target — all cases where we skip).
-    const seam_t0: u64 = if (self.config.coverage and self.replay_walk_depth == 0)
+    const seam_t0: u64 = if (self.config.coverage and self.registry.native_physical.replay_walk_depth == 0)
         readCycles()
     else
         0;
     // A-vii-d.1: defer any `disarmAllLinks` for the duration of the walk
     // (see `replay_walk_depth`); the driver applies it right after.
-    self.replay_walk_depth += 1;
+    self.registry.native_physical.replay_walk_depth += 1;
     defer {
-        self.replay_walk_depth -= 1;
+        self.registry.native_physical.replay_walk_depth -= 1;
         if (seam_t0 != 0) {
             self.cycles_seam +|= cycleDelta(readCycles(), seam_t0);
             self.seam_walks +|= 1;
@@ -1494,23 +1495,23 @@ pub fn replayLedgerFrom(
         // chain source that saw `ledger_len >= LEDGER_CAP` jumped to `shared_exit`
         // instead of its successor, so nothing follows it AND the ledger is exactly
         // at CAP (the append is bounds-guarded, so it never exceeds CAP).
-        if (e.outcome == .yielded and !(is_last and entries.len == irinterp.LEDGER_CAP))
+        if (e.outcome == .yielded and !(is_last and entries.len == trace_exec.LEDGER_CAP))
             @panic("replayLedger: forced-yield entry is not the last of a full ledger");
         const row_local = e.cum - cursor.prev_cum;
 
         // Static owner shape: a continuation ends in `.link`, an inner root in
         // `.loop`. Used per-kind to reject a kind on the wrong owner shape.
-        const ends_link = owner.instrs.len != 0 and
-            owner.instrs[owner.instrs.len - 1].op == .link;
-        const ends_loop = owner.instrs.len != 0 and
-            owner.instrs[owner.instrs.len - 1].op == .loop;
+        const ends_link = owner.code.instrs.len != 0 and
+            owner.code.instrs[owner.code.instrs.len - 1].op == .link;
+        const ends_loop = owner.code.instrs.len != 0 and
+            owner.code.instrs[owner.code.instrs.len - 1].op == .loop;
 
         // A-iv consumes the same per-transition ledger the steering machine
         // validates below. Work and structural transition are orthogonal:
         // loop-done is one outer traversal, deopt carries its segment-local
         // committed work, and link/prologue receipts carry none. A concrete
         // fused successor is known only when the next ledger row exists.
-        const region_key: ?ExitKey = if (e.kind != .prologue_fail and e.exit < owner.instrs.len)
+        const region_key: ?ExitKey = if (e.kind != .prologue_fail and e.exit < owner.code.instrs.len)
             .{ .trace_id = owner.id, .exit_instr = e.exit }
         else
             null;
@@ -1519,7 +1520,7 @@ pub fn replayLedgerFrom(
         // (below) — and because the `.deopt` arm must agree with it exactly.
         // Armed-edge provenance only, never position or opcode.
         const sibling_succ: ?*Trace = if (!is_last and e.kind == .deopt and
-            e.reason == .normal and e.outcome == .normal and e.exit < owner.instrs.len)
+            e.reason == .normal and e.outcome == .normal and e.exit < owner.code.instrs.len)
         blk: {
             const sib = self.traceById(entries[k + 1].id) orelse break :blk null;
             break :blk if (self.hasArmedSiblingHandoff(owner, e.exit, sib)) sib else null;
@@ -1537,10 +1538,10 @@ pub fn replayLedgerFrom(
                     if (!is_last)
                         @panic("replayLedger: silent M1 terminal ramp deopt is not last");
                     self.onSideExit(owner, 0, .entered);
-                    resume_pc.* = m1.parent.anchor.pc;
+                    resume_pc.* = m1.parent.code.anchor.pc;
                     return .{ .return_result = .{
                         .completed = linked_completed.*,
-                        .resume_pc = m1.parent.anchor.pc,
+                        .resume_pc = m1.parent.code.anchor.pc,
                     } };
                 }
             },
@@ -1549,10 +1550,10 @@ pub fn replayLedgerFrom(
                     e.exit == std.math.maxInt(u32) and e.outcome == .normal and row_local == 0))
                     @panic("replayLedger: silent M1 ramp prologue-fail violates terminal contract");
                 self.onSideExit(owner, 0, .entry_refusal);
-                resume_pc.* = m1.parent.anchor.pc;
+                resume_pc.* = m1.parent.code.anchor.pc;
                 return .{ .return_result = .{
                     .completed = linked_completed.*,
-                    .resume_pc = m1.parent.anchor.pc,
+                    .resume_pc = m1.parent.code.anchor.pc,
                 } };
             },
             // Doc 22 §B.2 (B-iv): the silent M1 ramp is a seeded page whose
@@ -1575,10 +1576,10 @@ pub fn replayLedgerFrom(
                     self.seed_hash_declines +|= 1
                 else
                     self.seed_capacity_declines +|= 1;
-                resume_pc.* = m1.parent.anchor.pc;
+                resume_pc.* = m1.parent.code.anchor.pc;
                 return .{ .return_result = .{
                     .completed = linked_completed.*,
-                    .resume_pc = m1.parent.anchor.pc,
+                    .resume_pc = m1.parent.code.anchor.pc,
                 } };
             },
             .link_terminal => {},
@@ -1713,7 +1714,7 @@ pub fn replayLedgerFrom(
                 // productive regions this arc exists to build. So this site stays
                 // selection-only. REACHABLE since A-vii-d/d.1 (arming live); the
                 // A-vii-a replay test pins the no-owner-penalty contract
-                // (`penalty.get(cont.anchor) == null` after a bridge row) and the
+                // (`penalty.get(cont.code.anchor) == null` after a bridge row) and the
                 // bridged-successor test pins the `.loop`-ending successor shape.
                 self.accountTraceRun(owner, @max(local, 1));
                 accountCandidateCharge(owner, .entered);
@@ -1722,7 +1723,7 @@ pub fn replayLedgerFrom(
             },
             .link_terminal => {
                 // A continuation reached its single-contract `.link` terminal.
-                if (!(e.reason == .normal and ends_link and e.exit == owner.instrs.len - 1))
+                if (!(e.reason == .normal and ends_link and e.exit == owner.code.instrs.len - 1))
                     @panic("replayLedger: link_terminal entry is not owner's .link");
                 if (ordinary_guard_entry != null) {
                     if (row_local != 0)
@@ -1732,7 +1733,7 @@ pub fn replayLedgerFrom(
                 // One `native_link_exits` bump per `.link` marker — this replaces
                 // BOTH the old per-fused-span bump and the standalone-`.link` bump.
                 self.native_link_exits +|= 1;
-                const owner_inner_pc: u32 = @intCast(owner.instrs[owner.instrs.len - 1].aux);
+                const owner_inner_pc: u32 = @intCast(owner.code.instrs[owner.code.instrs.len - 1].aux);
                 if (is_last) {
                     // Standalone `.link` (slot un-armed) OR a forced yield: the
                     // continuation advanced the enclosing loop but no inner fused
@@ -1775,7 +1776,7 @@ pub fn replayLedgerFrom(
                 // pre-B-iv shape-only contract (widened with the rule, never
                 // narrowed: real fused rows always have compiled successors,
                 // but the seed-freshness proof only exists for seeded pages).
-                if (succ.inputs.len != 0 and !self.stubEnterable(succ, .linked, proto))
+                if (succ.code.inputs.len != 0 and !self.stubEnterable(succ, .linked, proto))
                     @panic("replayLedger: fused seeded successor is not stub-enterable");
                 // 2c-E: a fused `C.link → I` edge IS a continuation→inner follow —
                 // the same event the physical call-A hop top charges via its
@@ -1799,9 +1800,9 @@ pub fn replayLedgerFrom(
                 // the final iteration committed LINKED. Compute BEFORE accounting so
                 // the resume is always the continuation anchor (P1a fix: an inner-seed
                 // `[I.loop_done_linked, …]` where `cont` still == the seed `I` would
-                // otherwise resume at `I.anchor.pc`, wrong; `post_pc` == the following
+                // otherwise resume at `I.code.anchor.pc`, wrong; `post_pc` == the following
                 // continuation's anchor in every modeled shape).
-                const post_pc = guardExitPc(owner.instrs[e.exit]) orelse
+                const post_pc = guardExitPc(owner.code.instrs[e.exit]) orelse
                     @panic("replayLedger: fused loop-done has no exit PC");
                 // One more enclosing iteration committed natively. Account BEFORE
                 // the re-run bound (Q1/Q2: never early-return mid-ledger).
@@ -1863,11 +1864,11 @@ pub fn replayLedgerFrom(
                         // Diagnostic sub-report: WHY each same-pc candidate was
                         // rejected (anchored-here traces that failed the P-G
                         // predicate or the runnability probe).
-                        for (self.cache.items) |t| {
-                            if (t.anchor.proto != proto or t.anchor.pc != post_pc) continue;
-                            const tail_link = t.instrs.len != 0 and t.instrs[t.instrs.len - 1].op == .link;
+                        for (self.registry.cache.items) |t| {
+                            if (t.code.anchor.proto != proto or t.code.anchor.pc != post_pc) continue;
+                            const tail_link = t.code.instrs.len != 0 and t.code.instrs[t.code.instrs.len - 1].op == .link;
                             self.dbg("  candidate id={d}: inputs={d} tail_link={} native={s}", .{
-                                t.id, t.inputs.len, tail_link, @tagName(t.native),
+                                t.id, t.code.inputs.len, tail_link, @tagName(t.native),
                             });
                         }
                     }
@@ -1878,9 +1879,9 @@ pub fn replayLedgerFrom(
                 // `.link` continuation anchored at this inner's post-loop PC.
                 const succ = self.traceById(entries[k + 1].id) orelse
                     @panic("replayLedger: fused continuation id did not resolve");
-                if (!(succ.instrs.len != 0 and
-                    succ.instrs[succ.instrs.len - 1].op == .link and
-                    succ.anchor.proto == proto and succ.anchor.pc == post_pc))
+                if (!(succ.code.instrs.len != 0 and
+                    succ.code.instrs[succ.code.instrs.len - 1].op == .link and
+                    succ.code.anchor.proto == proto and succ.code.anchor.pc == post_pc))
                     @panic("replayLedger: fused successor is not the expected continuation");
                 // B-iv.3 (doc 22 §B.5): seeded continuations are newly admitted
                 // (the `inputs.len == 0` shape clause is gone), but only under
@@ -1889,7 +1890,7 @@ pub fn replayLedgerFrom(
                 // stub-enterable right now (it just self-seeded this frame).
                 // Zero-input continuations keep the pre-B-iv shape-only
                 // contract (widened with the rule, never narrowed).
-                if (succ.inputs.len != 0 and !self.stubEnterable(succ, .ordinary, proto))
+                if (succ.code.inputs.len != 0 and !self.stubEnterable(succ, .ordinary, proto))
                     @panic("replayLedger: fused seeded continuation is not stub-enterable");
                 // 2c-E: the armed `I.loopdone → C.ordinary_entry` edge actually
                 // fired in native code — the consumer-side proof of the arm.
@@ -1958,12 +1959,12 @@ pub fn replayLedgerFrom(
                         // successor row anchor-entered, so a terminal deopt or
                         // prologue-fail on it resumes THERE — never at a `link_pc`
                         // left behind by earlier linked rows in the same burst.
-                        applyEdgeCursorTransition(cursor, .sibling_handoff, owner, sibling_succ.?, owner.anchor.pc, local, resume_pc);
+                        applyEdgeCursorTransition(cursor, .sibling_handoff, owner, sibling_succ.?, owner.code.anchor.pc, local, resume_pc);
                         continue;
                     }
                     if (e.outcome != .normal)
                         @panic("replayLedger: fused M1 .deopt is a forced yield");
-                    if (e.exit >= owner.instrs.len)
+                    if (e.exit >= owner.code.instrs.len)
                         @panic("replayLedger: fused M1 .deopt exit index out of range");
                     if (!self.isSourceBranchGuardExit(owner, e.exit, proto))
                         @panic("replayLedger: fused M1 .deopt exit is not a source-branch guard");
@@ -1977,7 +1978,7 @@ pub fn replayLedgerFrom(
                     // to `e.exit` falsely rejected legitimate fused hops.
                     if (!self.hasArmedSourceBranchLinkAt(owner, e.exit, succ, proto))
                         @panic("replayLedger: fused M1 transition has no armed source-branch link at the exit guard");
-                    std.debug.assert(self.countTracesAt(owner.anchor) >= 2);
+                    std.debug.assert(self.countTracesAt(owner.code.anchor) >= 2);
                     // The ramp commits ZERO of its OWN iterations, so its `cum`
                     // equals the skip's (`entry_rbx == skip_local`). `local` here is
                     // therefore the skip trace's own committed count, and
@@ -1989,12 +1990,12 @@ pub fn replayLedgerFrom(
                     self.accountLedgerRow(owner, local, e.exit, region_consumed, .entered);
                     // Sub-case (b): the ramp deopted at an internal guard BEFORE its
                     // `.link` — terminal. Replay the old dispatcher steering
-                    // `onSideExit(ramp, 0); resume owner.anchor.pc`. (`succ.cum ==
+                    // `onSideExit(ramp, 0); resume owner.code.anchor.pc`. (`succ.cum ==
                     // owner.cum`, so `succ`'s own `local` is 0 regardless.) Resume at
                     // `owner`'s OWN anchor — the source trace's coherent header — NOT
                     // `seed_owner`'s: for the flat 2-entry M1 they coincide (owner is
                     // the seed), but a future nested `[…, I.deopt(armed), R.deopt]`
-                    // would resume at `I.anchor.pc`, not the outer seed. `succ` (`R`)
+                    // would resume at `I.code.anchor.pc`, not the outer seed. `succ` (`R`)
                     // must be the LAST entry — a `.deopt` M1 edge whose ramp deopt is
                     // itself followed by more entries is an unmodeled grammar, so
                     // hard-stop rather than silently drop the tail.
@@ -2015,7 +2016,7 @@ pub fn replayLedgerFrom(
                         self.onSideExit(succ, 0, .entered);
                         return .{ .return_result = .{
                             .completed = linked_completed.*,
-                            .resume_pc = owner.anchor.pc,
+                            .resume_pc = owner.code.anchor.pc,
                         } };
                     }
                     // Sub-case (c) (2c-E): the ramp's HOISTED entry-type prologue
@@ -2026,7 +2027,7 @@ pub fn replayLedgerFrom(
                     // the ramp fresh, its prologue fails, and — because the native
                     // tier always owes a flush (`flushed_resume_pc = walk_pc`) —
                     // the "Not a completed link run" tail short-circuits with
-                    // `onSideExit(ramp, 0)` + resume at `walk_pc == owner.anchor.pc`
+                    // `onSideExit(ramp, 0)` + resume at `walk_pc == owner.code.anchor.pc`
                     // WITHOUT retrying further candidates (the retry tail is
                     // tier-1a-only). Terminal by contract; anything after it is an
                     // unmodeled grammar.
@@ -2037,12 +2038,12 @@ pub fn replayLedgerFrom(
                         if (!(se.reason == .prologue_fail and se.exit == std.math.maxInt(u32) and
                             se.outcome == .normal))
                             @panic("replayLedger: fused M1 sub-case (c) entry violates the prologue-fail contract");
-                        if (!(succ.instrs.len != 0 and succ.instrs[succ.instrs.len - 1].op == .link))
+                        if (!(succ.code.instrs.len != 0 and succ.code.instrs[succ.code.instrs.len - 1].op == .link))
                             @panic("replayLedger: fused M1 sub-case (c) ramp does not end in .link");
                         self.onSideExit(succ, 0, .entry_refusal);
                         return .{ .return_result = .{
                             .completed = linked_completed.*,
-                            .resume_pc = owner.anchor.pc,
+                            .resume_pc = owner.code.anchor.pc,
                         } };
                     }
                     // Sub-case (d) (doc 22 §B.2, B-iv): the ramp is a seeded
@@ -2067,11 +2068,11 @@ pub fn replayLedgerFrom(
                         if (!(reason_matches and se.exit == std.math.maxInt(u32) and
                             se.outcome == .normal))
                             @panic("replayLedger: fused M1 sub-case (d) entry violates the seed-decline contract");
-                        if (!(succ.instrs.len != 0 and succ.instrs[succ.instrs.len - 1].op == .link))
+                        if (!(succ.code.instrs.len != 0 and succ.code.instrs[succ.code.instrs.len - 1].op == .link))
                             @panic("replayLedger: fused M1 sub-case (d) ramp does not end in .link");
                         return .{ .return_result = .{
                             .completed = linked_completed.*,
-                            .resume_pc = owner.anchor.pc,
+                            .resume_pc = owner.code.anchor.pc,
                         } };
                     }
                     // Sub-case (a): the ramp reached its `.link` terminal. This is a
@@ -2098,16 +2099,16 @@ pub fn replayLedgerFrom(
                 // are the successful-completion path and never a deopt source. This
                 // rejects an out-of-range index and `exit == maxInt` (which belongs
                 // to `.prologue_fail`) without over-rejecting a legitimate guard.
-                if (e.exit >= owner.instrs.len)
+                if (e.exit >= owner.code.instrs.len)
                     @panic("replayLedger: .deopt exit index out of range");
-                const exit_op = owner.instrs[e.exit].op;
+                const exit_op = owner.code.instrs[e.exit].op;
                 if (exit_op == .link or exit_op == .loop)
                     @panic("replayLedger: .deopt exit names a terminator, not a guard");
                 // A-vii-d.1: a terminal composite-candidate deopt is the fused-span
                 // observation of the edge-4 exit. Record the at-most-one pending
                 // arm request; the ledger DRIVER drains it after this replay
                 // returns (never mid-walk — review blocker 5).
-                if (e.outcome == .normal and owner.isBridgeCandidate(e.exit))
+                if (e.outcome == .normal and owner.code.isBridgeCandidate(e.exit))
                     self.pending_bridge_arm = .{ .trace_id = owner.id, .exit_instr = e.exit };
                 // A-vii-d.1: (b') bridged successor — an ordinary-mode
                 // (`ordinary_entry`) body entered through the composite
@@ -2130,7 +2131,7 @@ pub fn replayLedgerFrom(
                 if (entered_via_bridge or entered_via_handoff) {
                     if (!(ends_link or ends_loop))
                         @panic("replayLedger: bridged successor deopt on a non-body owner shape");
-                    if (resume_pc.* != owner.anchor.pc)
+                    if (resume_pc.* != owner.code.anchor.pc)
                         @panic("replayLedger: bridged successor deopt resume mismatches its anchor");
                     self.accountLedgerRow(owner, local, e.exit, region_consumed, .entered);
                     return .{ .return_result = .{
@@ -2194,7 +2195,7 @@ pub fn replayLedgerFrom(
                 if (entered_via_bridge or entered_via_handoff) {
                     if (!(ends_link or ends_loop))
                         @panic("replayLedger: bridged successor prologue-fail on a non-body owner shape");
-                    if (resume_pc.* != owner.anchor.pc)
+                    if (resume_pc.* != owner.code.anchor.pc)
                         @panic("replayLedger: bridged successor prologue-fail resume mismatches its anchor");
                     self.accountLedgerRow(owner, 0, std.math.maxInt(u32), region_consumed, .entry_refusal);
                     return .{ .return_result = .{
@@ -2255,7 +2256,7 @@ pub fn replayLedgerFrom(
                 if (entered_via_bridge or entered_via_handoff) {
                     if (!(ends_link or ends_loop))
                         @panic("replayLedger: bridged successor seed-decline on a non-body owner shape");
-                    if (resume_pc.* != owner.anchor.pc)
+                    if (resume_pc.* != owner.code.anchor.pc)
                         @panic("replayLedger: bridged successor seed-decline resume mismatches its anchor");
                     return .{ .return_result = .{
                         .completed = linked_completed.*,
@@ -2289,11 +2290,11 @@ pub fn replayLedgerFrom(
                     // successor's anchor, so this is the same value it
                     // already held — the assert is a grammar-drift tripwire,
                     // not a behaviour change.
-                    if (resume_pc.* != owner.anchor.pc and cursor.link_pc == owner.anchor.pc)
+                    if (resume_pc.* != owner.code.anchor.pc and cursor.link_pc == owner.code.anchor.pc)
                         @panic("replayLedger: continuation seed-decline resume mismatches the decliner's anchor");
                     return .{ .return_result = .{
                         .completed = linked_completed.*,
-                        .resume_pc = owner.anchor.pc,
+                        .resume_pc = owner.code.anchor.pc,
                     } };
                 }
                 if (!ends_loop)
@@ -2302,11 +2303,11 @@ pub fn replayLedgerFrom(
                 // For the linked C⇄I grammar the most-recent `.link` names
                 // exactly that PC — release-assert the two agree so any
                 // future grammar drift fails loudly instead of misresuming.
-                if (cursor.link_pc != owner.anchor.pc)
+                if (cursor.link_pc != owner.code.anchor.pc)
                     @panic("replayLedger: linked inner seed-decline link_pc mismatches the decliner's anchor");
                 return .{ .return_result = .{
                     .completed = linked_completed.*,
-                    .resume_pc = owner.anchor.pc,
+                    .resume_pc = owner.code.anchor.pc,
                 } };
             },
         }
@@ -2329,7 +2330,7 @@ pub fn replayLedgerFrom(
 pub fn runLinkedBurst(
     self: *TraceState,
     sct: *Trace,
-    sresult: irinterp.ExecResult,
+    sresult: trace_exec.ExecResult,
     sresult_fused: bool,
     snt_in: *const nativegen.CompiledTrace,
     comptime tier: ChainTier,
@@ -2352,13 +2353,13 @@ pub fn runLinkedBurst(
         .linked_completed = 0,
         // The design's `coherent_pc` cursor: where tier-0 resumes when the
         // burst yields. Starts at the inner-root PC named by the `.link`.
-        .resume_pc = @intCast(sct.instrs[sct.instrs.len - 1].aux),
+        .resume_pc = @intCast(sct.code.instrs[sct.code.instrs.len - 1].aux),
         .hops = 0,
     };
     // 2.3b-1: a *fused* continuation run (armed `.link` slot jumped straight into
     // inner) hands the inner loop-done/mid result forward so the core consumes it
     // WITHOUT re-running inner. Only ever non-null on the native path.
-    const fused_inner: ?irinterp.ExecResult = if (sresult_fused) sresult else null;
+    const fused_inner: ?trace_exec.ExecResult = if (sresult_fused) sresult else null;
     return self.driveBurstCore(sct, cursor, fused_inner, snt_in, tier, proto, regs, safe_to_arm);
 }
 
@@ -2372,7 +2373,7 @@ pub fn driveBurstCore(
     self: *TraceState,
     seed: *Trace,
     cursor: BurstCursor,
-    fused_inner_in: ?irinterp.ExecResult,
+    fused_inner_in: ?trace_exec.ExecResult,
     snt_in: *const nativegen.CompiledTrace,
     comptime tier: ChainTier,
     proto: *const Proto,
@@ -2394,7 +2395,7 @@ pub fn driveBurstCore(
     // tier-0. Mutable for exactly that swap.
     var current_link = cursor.current_link;
     var resume_pc: u32 = cursor.resume_pc;
-    var fused_inner: ?irinterp.ExecResult = fused_inner_in;
+    var fused_inner: ?trace_exec.ExecResult = fused_inner_in;
     var hops: usize = cursor.hops;
     var tail_charge_kind: ChargeKind = .entered;
     // 2c-E: a `.run_continuation` handover enters at call B on its FIRST hop
@@ -2419,7 +2420,7 @@ pub fn driveBurstCore(
         // both push sites here are inside `tier == .ir` arms.
         const hop_mark = self.valuesMark();
         defer if (tier == .ir) self.valuesRelease(hop_mark);
-        const link_term = current_link.instrs[current_link.instrs.len - 1];
+        const link_term = current_link.code.instrs[current_link.code.instrs.len - 1];
         const inner_pc: u32 = @intCast(link_term.aux);
         // Call A — resolve and run this hop's inner root, classify its exit,
         // swap the driver, roll up the completed enclosing iteration, and arm
@@ -2467,7 +2468,7 @@ pub fn driveBurstCore(
             // stale seed declines through the B-iv.2 call-A directive. A
             // fused result never reaches the seeding call: fusion is
             // native-only.
-            if (inner.inputs.len != 0 and tier != .native_only) {
+            if (inner.code.inputs.len != 0 and tier != .native_only) {
                 // A seed decline ends the burst CHARGELESS. `break` here fell
                 // into the zero-progress tail's `onSideExit(seed, 0)`, which
                 // strikes the burst SEED for a decline by the INNER. Live on
@@ -2488,7 +2489,7 @@ pub fn driveBurstCore(
             if (tier == .native_only) self.native_link_follow_count +|= 1;
             self.link_follow_count +|= 1;
 
-            var iresult: irinterp.ExecResult = undefined;
+            var iresult: trace_exec.ExecResult = undefined;
             var ibuf: []Value = &.{};
             if (fused_inner) |fr| {
                 // A fused continuation run already executed `inner` under the
@@ -2595,8 +2596,8 @@ pub fn driveBurstCore(
                 // (normally empty) verdict before later steering can re-enter.
                 self.settleNativeCallProvenance(&provenance, safe_to_arm);
             } else {
-                ibuf = self.valuesPush(inner.instrs.len) catch break;
-                iresult = irinterp.executeCtx(.{ .heap = self.exec_heap }, inner, regs, ibuf);
+                ibuf = self.valuesPush(inner.code.instrs.len) catch break;
+                iresult = irinterp.executeCtx(.{ .heap = self.exec_heap }, &inner.code, regs, ibuf);
             }
             // B-iv.2 (doc 22 §B.2, codex Q2): a scalar seed decline at call A —
             // the inner's direct entry (or the carried fused hop's linked
@@ -2640,12 +2641,12 @@ pub fn driveBurstCore(
             else
                 iresult.completed;
 
-            const inner_guard = inner.instrs[iresult.exit_instr];
+            const inner_guard = inner.code.instrs[iresult.exit_instr];
             const inner_exit_pc = guardExitPc(inner_guard) orelse break;
             // The inner root reached its numeric loop-done ⟺ its exit PC
             // follows a `for_loop` (mode-invariant static bytecode; the same
             // discriminator `isSourceBranchGuardExit` uses inverted). This
-            // must NOT be `inner_exit_pc == current_link.anchor.pc`: that
+            // must NOT be `inner_exit_pc == current_link.code.anchor.pc`: that
             // only holds when the driver is already the post-inner
             // continuation, and is false for a prime-side entry ramp anchored
             // at the outer header — which would misclassify a *completed*
@@ -2675,7 +2676,7 @@ pub fn driveBurstCore(
             // while-done owes NO flush on either tier — its condition guard
             // fails at the trace top, before the final pass ran any body.
             if (tier == .ir and numeric_done) {
-                if (!irinterp.flushNumericForLoopDone(inner, regs, ibuf, iresult.exit_instr)) break;
+                if (!irinterp.flushNumericForLoopDone(&inner.code, regs, ibuf, iresult.exit_instr)) break;
             }
             // Hole B (doc 16, Phase 3): hand the ping-pong to the continuation
             // anchored at the inner's post-loop PC. When the burst was seeded
@@ -2686,7 +2687,7 @@ pub fn driveBurstCore(
             // continuation (doc-15 steady state) this is a no-op. If no
             // continuation exists at the post-inner PC, resume tier-0 there —
             // NOT at the inner header — so the inner loop is not re-run.
-            if (current_link.anchor.pc != post_pc) {
+            if (current_link.code.anchor.pc != post_pc) {
                 const cont = self.findLinkTrace(proto, post_pc) orelse {
                     self.onSideExitReceipt(inner, if (inner_local > 0) inner_local else 1, iresult.exit_instr, 1, .deferred, .entered);
                     return .{ .completed = linked_completed + 1, .resume_pc = post_pc };
@@ -2699,7 +2700,7 @@ pub fn driveBurstCore(
                 }
                 current_link = cont;
             }
-            resume_pc = current_link.anchor.pc;
+            resume_pc = current_link.code.anchor.pc;
 
             // Roll-up (doc 15 P3): the inner root running to its loop-done
             // exit completes exactly one enclosing-loop iteration — true even
@@ -2732,12 +2733,12 @@ pub fn driveBurstCore(
             // `instrs.len - 1` (slots are indexed by IR instr index). Persisted via
             // `armNativeLink` (registers the P-E backlink so a retiring `inner`
             // resets the slot before its mcode is reused).
-            const arm_term = current_link.instrs[current_link.instrs.len - 1];
+            const arm_term = current_link.code.instrs[current_link.code.instrs.len - 1];
             if (tier == .native_only and safe_to_arm and
                 self.stubEnterable(inner, .linked, proto) and
                 arm_term.op == .link and @as(u32, @intCast(arm_term.aux)) == inner_pc)
             {
-                const slot: u32 = @intCast(current_link.instrs.len - 1);
+                const slot: u32 = @intCast(current_link.code.instrs.len - 1);
                 if (self.armNativeLink(current_link, slot, inner, .link_terminal) catch false) {
                     self.native_link_arms +|= 1;
                 }
@@ -2848,11 +2849,11 @@ pub fn driveBurstCore(
             // directly makes the chargelessness a property of THIS site
             // instead of an invariant two hundred lines away that a future
             // `start_at_continuation` on the IR tier would silently break.
-            if (current_link.inputs.len != 0 and !self.seedForTier1a(current_link, proto))
+            if (current_link.code.inputs.len != 0 and !self.seedForTier1a(current_link, proto))
                 return .{ .completed = linked_completed, .resume_pc = resume_pc };
-            const cbuf = self.valuesPush(current_link.instrs.len) catch break;
-            const cresult = irinterp.executeCtx(.{ .heap = self.exec_heap }, current_link, regs, cbuf);
-            if (cresult.exit_instr == current_link.instrs.len - 1) {
+            const cbuf = self.valuesPush(current_link.code.instrs.len) catch break;
+            const cresult = irinterp.executeCtx(.{ .heap = self.exec_heap }, &current_link.code, regs, cbuf);
+            if (cresult.exit_instr == current_link.code.instrs.len - 1) {
                 _ = self.accountRegionProfit(
                     .{ .trace_id = current_link.id, .exit_instr = cresult.exit_instr },
                     0,
@@ -2869,7 +2870,7 @@ pub fn driveBurstCore(
                 return .{ .completed = linked_completed + cresult.completed, .resume_pc = resume_pc };
             }
             _ = self.accountRegionProfit(
-                if (cresult.exit_instr < current_link.instrs.len)
+                if (cresult.exit_instr < current_link.code.instrs.len)
                     .{ .trace_id = current_link.id, .exit_instr = cresult.exit_instr }
                 else
                     null,
@@ -2923,7 +2924,7 @@ pub fn driveBurstCore(
 /// already gated on `ran_native and ledger_len > 1 and exit_reason == .normal`.
 pub fn noteDispatcherLedgerTerminal(
     self: *TraceState,
-    entries: []const irinterp.LedgerEntry,
+    entries: []const trace_exec.LedgerEntry,
     first_prev_cum: usize,
     proto: *const Proto,
 ) void {
@@ -2935,14 +2936,14 @@ pub fn noteDispatcherLedgerTerminal(
     if (term.kind != .deopt or term.reason != .normal or term.outcome != .normal) return;
     const owner = self.traceById(term.id) orelse return;
     self.noteSiblingTerminal(owner, term.exit);
-    if (term.exit < owner.instrs.len and !isLoopDoneGuardIndex(owner, term.exit))
+    if (term.exit < owner.code.instrs.len and !isLoopDoneGuardIndex(owner, term.exit))
         self.noteTakenExit(owner, term.exit, term_local, proto);
 }
 
 pub fn driveDispatcherLedger(
     self: *TraceState,
     seed: *Trace,
-    entries: []const irinterp.LedgerEntry,
+    entries: []const trace_exec.LedgerEntry,
     proto: *const Proto,
     regs: RegWindow,
     safe_to_arm: bool,
@@ -2963,14 +2964,14 @@ pub fn driveDispatcherLedger(
     // three-scalar watch on the trace itself), not the resolve.
     const max_hops: usize = 8;
     var linked_completed: usize = 0;
-    var resume_pc: u32 = seed.anchor.pc;
+    var resume_pc: u32 = seed.code.anchor.pc;
     var hops: usize = 0;
     // The seed is a directly-dispatched trace (never a `.link`), so it has no
     // inner-root PC of its own; `inner_pc` only seeds `replayLedger`'s `link_pc`
     // fallback for an inner mid-loop-deopt before any `.link` marker — which the
     // modeled M1 grammar never reaches (its first `.link` sets the real cursor).
     // Pass the seed anchor as an inert placeholder.
-    const inner_pc: u32 = seed.anchor.pc;
+    const inner_pc: u32 = seed.code.anchor.pc;
     // B-2b: capture registry-recognized edge service over the COMPLETE ledger
     // before replay can request a deferred physical disarm. Apply only after
     // replay returns, per §B.6.
@@ -3071,17 +3072,17 @@ pub fn finishDispatcherDirective(
 pub fn driveDispatcherSilentResult(
     self: *TraceState,
     seed: *Trace,
-    result: irinterp.ExecResult,
+    result: trace_exec.ExecResult,
     proto: *const Proto,
     regs: RegWindow,
     safe_to_arm: bool,
 ) ?ChainResult {
     var linked_completed: usize = 0;
-    var resume_pc: u32 = seed.anchor.pc;
+    var resume_pc: u32 = seed.code.anchor.pc;
     var hops: usize = 0;
     const max_hops: usize = 8;
     if (result.silent_active != 0 and result.ledger_len != 0) {
-        if (result.ledger_len > irinterp.LEDGER_CAP)
+        if (result.ledger_len > trace_exec.LEDGER_CAP)
             @panic("driveDispatcherSilentResult: suffix ledger exceeds cap");
         if (result.silent_cum > std.math.maxInt(usize))
             @panic("driveDispatcherSilentResult: silent cumulative count exceeds usize");
@@ -3167,7 +3168,7 @@ pub fn driveDispatcherSilentResult(
 pub fn driveSeedLedger(
     self: *TraceState,
     seed: *Trace,
-    entries: []const irinterp.LedgerEntry,
+    entries: []const trace_exec.LedgerEntry,
     proto: *const Proto,
     regs: RegWindow,
     safe_to_arm: bool,
@@ -3189,15 +3190,15 @@ pub fn driveSeedLedger(
         .link_terminal => {
             if (entries.len < 3)
                 @panic("driveSeedLedger: expected a deep (>2-entry) hop-0 ledger");
-            if (!(seed.instrs.len != 0 and seed.instrs[seed.instrs.len - 1].op == .link))
+            if (!(seed.code.instrs.len != 0 and seed.code.instrs[seed.code.instrs.len - 1].op == .link))
                 @panic("driveSeedLedger: seed does not end in .link");
-            if (e0.exit != seed.instrs.len - 1)
+            if (e0.exit != seed.code.instrs.len - 1)
                 @panic("driveSeedLedger: first entry is not the seed's .link terminal");
         },
         .region_bridge => {
             if (entries.len < 2)
                 @panic("driveSeedLedger: bridge-headed ledger has no successor row");
-            if (!seed.isBridgeCandidate(e0.exit))
+            if (!seed.code.isBridgeCandidate(e0.exit))
                 @panic("driveSeedLedger: bridge-headed first entry is not a composite guard of the seed");
         },
         else => @panic("driveSeedLedger: first entry is neither the seed's .link terminal nor its composite bridge"),
@@ -3209,10 +3210,10 @@ pub fn driveSeedLedger(
     // For a bridge-headed span the seed's `.link` never fired, so there is no
     // inner-root cursor to seed — pass the seed anchor as an inert placeholder
     // (the bridged terminal contract resumes via `resume_pc`, never `link_pc`).
-    const seed_inner_pc: u32 = if (seed.instrs.len != 0 and seed.instrs[seed.instrs.len - 1].op == .link)
-        @intCast(seed.instrs[seed.instrs.len - 1].aux)
+    const seed_inner_pc: u32 = if (seed.code.instrs.len != 0 and seed.code.instrs[seed.code.instrs.len - 1].op == .link)
+        @intCast(seed.code.instrs[seed.code.instrs.len - 1].aux)
     else
-        seed.anchor.pc;
+        seed.code.anchor.pc;
     var resume_pc: u32 = seed_inner_pc;
     var hops: usize = 0;
     var provenance: NativeCallProvenance = .{};

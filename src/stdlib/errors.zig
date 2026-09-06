@@ -249,7 +249,7 @@ test "A-iv pcall unwind drops region_profit for the destroyed activation" {
     // under that exact activation id; the only path that can remove it is the
     // pcall catch's depth-restore cleanup hook.
     const activation = vm.next_call_seq;
-    try vm.trace.region_profit.put(testing.allocator, .{
+    try vm.trace.region_policy.region_profit.put(testing.allocator, .{
         .region_id = @as(trace.RegionId, @enumFromInt(123)),
         .activation = activation,
     }, .{

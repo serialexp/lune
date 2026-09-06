@@ -101,8 +101,8 @@ test "bit-reversal store/load regions record, compile, and execute natively" {
             var saw_compiled = false;
             var traced: u64 = 0;
             var interpreted: u64 = 0;
-            for (vm.trace.cache.items) |t| {
-                if (!std.mem.eql(u8, t.anchor.proto.name, "bitreverse")) continue;
+            for (vm.trace.registry.cache.items) |t| {
+                if (!std.mem.eql(u8, t.code.anchor.proto.name, "bitreverse")) continue;
                 switch (t.native) {
                     .compiled => {
                         saw_compiled = true;
@@ -264,8 +264,8 @@ fn runOuterCycle(gpa: std.mem.Allocator, window_open: bool) !OuterCycleRun {
         .bridge_arms = vm.trace.native_region_bridge_arms,
         .bridge_fused = vm.trace.native_region_bridge_fused,
         .loopdone_fused = vm.trace.native_loopdone_link_fused,
-        .disarms = vm.trace.native_link_disarms,
-        .peak = vm.trace.native_link_peak,
+        .disarms = vm.trace.registry.native_physical.native_link_disarms,
+        .peak = vm.trace.registry.native_physical.native_link_peak,
         .entries = vm.trace.entries,
     };
     @memcpy(result.out[0..result.out_len], sink.buffered());
@@ -353,7 +353,7 @@ fn aviiiProbe(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm: *Vm = @ptrCast(@alignCast(ctx));
     const m = &aviii_mid;
     if (!m.opened) {
-        const links = vm.trace.armed_links.items;
+        const links = vm.trace.registry.native_physical.armed_links.items;
         // Wait for a multi-edge cycle to stand: ≥3 links live at once.
         if (links.len < 3 or links.len > m.edges_at_open.len) return Value.nil();
         var kinds: u8 = 0;
@@ -362,7 +362,7 @@ fn aviiiProbe(ctx: *anyopaque, args: []const Value) anyerror!Value {
         m.armed_at_open = links.len;
         m.kinds_at_open = kinds;
         for (links, 0..) |l, i| m.edges_at_open[i] = .{ l.parent.id, l.child.id };
-        m.disarms_at_open = vm.trace.native_link_disarms;
+        m.disarms_at_open = vm.trace.registry.native_physical.native_link_disarms;
         m.native_entries_at_open = vm.trace.native_entries;
         m.opened = true;
         // THE EVENT: open the observation window over a live armed registry.
@@ -370,8 +370,8 @@ fn aviiiProbe(ctx: *anyopaque, args: []const Value) anyerror!Value {
         return Value.nil();
     }
     m.post_calls += 1;
-    m.armed_after = vm.trace.armed_links.items.len;
-    m.disarms_after = vm.trace.native_link_disarms;
+    m.armed_after = vm.trace.registry.native_physical.armed_links.items.len;
+    m.disarms_after = vm.trace.registry.native_physical.native_link_disarms;
     m.native_entries_after = vm.trace.native_entries;
     return Value.nil();
 }
@@ -594,9 +594,9 @@ test "doc 20 §T (Phase 1 e2e): a qualified hot loop actually installs and binds
         if (@import("nativegen.zig").is_x64_linux) {
             // The flip flipped: at least one slot was created and is still a
             // live binding whose trace reached `.bound`.
-            try testing.expect(vm.trace.entry_patches.items.len > 0);
+            try testing.expect(vm.trace.registry.entry_registry.entry_patches.items.len > 0);
             var bound: usize = 0;
-            for (vm.trace.entry_patches.items) |p| {
+            for (vm.trace.registry.entry_registry.entry_patches.items) |p| {
                 if (p.tombstone or !p.live) continue;
                 const t = vm.trace.traceById(p.trace_id) orelse continue;
                 if (t.entry_patch == .bound) bound += 1;
@@ -631,12 +631,12 @@ test "doc 20 Phase 3: while/repeat jloop patches bind and stay byte-identical ac
             if (mode != .record_execute_native or !@import("nativegen.zig").is_x64_linux) {
                 // Qualification is native-only; all other matrix legs keep the
                 // canonical code image and registry untouched.
-                try testing.expectEqual(@as(usize, 0), vm.trace.entry_patches.items.len);
+                try testing.expectEqual(@as(usize, 0), vm.trace.registry.entry_registry.entry_patches.items.len);
                 return;
             }
             var saw_while = false;
             var saw_repeat = false;
-            for (vm.trace.entry_patches.items) |p| {
+            for (vm.trace.registry.entry_registry.entry_patches.items) |p| {
                 if (p.tombstone or !p.live) continue;
                 try testing.expectEqual(bytecode.OpCode.jloop, vm.trace.codeFor(p.proto)[p.patch_pc].op);
                 switch (p.orig.op) {
@@ -729,7 +729,7 @@ test "doc 20 Phase 3: jloop prologue strike exhaustion unpatches same-turn" {
     // a one-strike budget the common patched-entry tail must restore `.jmp`
     // and tombstone the slot before the terminal condition exits the loop.
     var saw_exhausted_while = false;
-    for (vm.trace.entry_patches.items) |p| {
+    for (vm.trace.registry.entry_registry.entry_patches.items) |p| {
         if (p.orig.op != .jmp or !p.tombstone) continue;
         try testing.expect(std.meta.eql(p.orig, vm.trace.codeFor(p.proto)[p.patch_pc]));
         saw_exhausted_while = true;
@@ -856,10 +856,10 @@ test "doc 33: alternating value and f64 lanes refuse a candidate without gating 
     try testing.expectEqualStrings(expected, sink.buffered());
 
     var saw_lane_anchor = false;
-    for (vm.trace.cache.items) |t| {
-        if (!std.mem.eql(u8, t.anchor.proto.name, "lane_sum")) continue;
+    for (vm.trace.registry.cache.items) |t| {
+        if (!std.mem.eql(u8, t.code.anchor.proto.name, "lane_sum")) continue;
         saw_lane_anchor = true;
-        try testing.expect(!vm.trace.isGated(t.anchor));
+        try testing.expect(!vm.trace.isGated(t.code.anchor));
     }
     try testing.expect(saw_lane_anchor);
 }

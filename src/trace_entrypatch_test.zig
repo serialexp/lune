@@ -48,13 +48,15 @@ fn entryPatchTestCode() [8]Instr {
 fn entryPatchTestTrace(gpa: std.mem.Allocator, id: u32, proto: *const Proto, pc: u32) !*Trace {
     const t = try gpa.create(Trace);
     t.* = .{
+        .code = .{
+            .anchor = .{ .proto = proto, .pc = pc },
+            .instrs = try gpa.alloc(IrInstr, 0),
+            .consts = try gpa.alloc(Value, 0),
+            .entry_slots = try gpa.alloc(u16, 0),
+            .entry_guards = try gpa.alloc(EntryGuard, 0),
+            .exit_prov = try gpa.alloc(ExitProvEntry, 0),
+        },
         .id = id,
-        .anchor = .{ .proto = proto, .pc = pc },
-        .instrs = try gpa.alloc(IrInstr, 0),
-        .consts = try gpa.alloc(Value, 0),
-        .entry_slots = try gpa.alloc(u16, 0),
-        .entry_guards = try gpa.alloc(EntryGuard, 0),
-        .exit_prov = try gpa.alloc(ExitProvEntry, 0),
     };
     return t;
 }
@@ -90,14 +92,14 @@ test "doc 20 Phase 3: resolve and lifecycle cover compiler while/repeat closers 
     const while_proto = Proto{ .code = &while_code, .id = 8, .name = "while", .num_registers = 8 };
     try testing.expectEqual(@as(?u32, 5), TraceState.resolvePatchPc(&while_proto, 2));
     const wt = try entryPatchTestTrace(gpa, 10, &while_proto, 2);
-    try state.cache.append(gpa, wt);
+    try state.registry.cache.append(gpa, wt);
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(wt));
     try testing.expectEqual(OpCode.jloop, state.codeFor(&while_proto)[5].op);
     try testing.expectEqual(OpCode.jmp, while_proto.code[5].op); // canonical stays virgin
     state.markEntryPatchPending(wt.entry_slot.?);
     state.drainEntryPatchWork();
     try testing.expectEqual(OpCode.jmp, state.codeFor(&while_proto)[5].op);
-    try testing.expect(state.entry_patches.items[0].tombstone);
+    try testing.expect(state.registry.entry_registry.entry_patches.items[0].tombstone);
     while_code[7] = .{ .op = .jmp_if_false, .a = 1, .aux = -6 };
     try testing.expectEqual(@as(?u32, null), TraceState.resolvePatchPc(&while_proto, 2)); // mixed closer ambiguity
 
@@ -108,7 +110,7 @@ test "doc 20 Phase 3: resolve and lifecycle cover compiler while/repeat closers 
     const repeat_proto = Proto{ .code = &repeat_code, .id = 9, .name = "repeat", .num_registers = 8 };
     try testing.expectEqual(@as(?u32, 5), TraceState.resolvePatchPc(&repeat_proto, 2));
     const rt = try entryPatchTestTrace(gpa, 11, &repeat_proto, 2);
-    try state.cache.append(gpa, rt);
+    try state.registry.cache.append(gpa, rt);
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(rt));
     const patched = state.codeFor(&repeat_proto)[5];
     try testing.expectEqual(OpCode.jloop, patched.op);
@@ -138,18 +140,18 @@ test "doc 20 Phase 3: jloop strike exhaustion policy restores canonical and cool
     code[5] = .{ .op = .jmp, .aux = -4 };
     const proto = Proto{ .code = &code, .id = 11, .name = "strike", .num_registers = 8 };
     const t = try entryPatchTestTrace(gpa, 12, &proto, 2);
-    try state.cache.append(gpa, t);
+    try state.registry.cache.append(gpa, t);
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
     t.entry_patch = .bound;
 
     // The common patched-entry tail marks at `patch_strikes`; pin the policy's
     // resulting transaction independently of trace-entry shape.
     const slot = t.entry_slot.?;
-    state.entry_patches.items[slot].strikes = state.config.patch_strikes;
+    state.registry.entry_registry.entry_patches.items[slot].strikes = state.config.patch_strikes;
     state.markEntryPatchPending(slot);
     state.drainEntryPatchWork();
     try testing.expectEqual(OpCode.jmp, state.codeFor(&proto)[5].op);
-    try testing.expect(state.entry_patches.items[slot].tombstone);
+    try testing.expect(state.registry.entry_registry.entry_patches.items[slot].tombstone);
     try testing.expectEqual(trace.EntryPatchState.eligible, t.entry_patch);
     try testing.expectEqual(@as(?u16, null), t.entry_slot);
 }
@@ -162,13 +164,13 @@ test "doc 20 Phase 0b: install publishes a .jfor_loop image; canonical untouched
     var code = entryPatchTestCode();
     const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
     const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
-    try state.cache.append(gpa, t);
+    try state.registry.cache.append(gpa, t);
     const sibling = try entryPatchTestTrace(gpa, 2, &proto, 2);
-    try state.cache.append(gpa, sibling);
+    try state.registry.cache.append(gpa, sibling);
 
-    const gen0 = state.image_gen;
+    const gen0 = state.registry.entry_registry.image_gen;
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
-    try testing.expect(state.image_gen != gen0); // frames re-resolve at back-edge
+    try testing.expect(state.registry.entry_registry.image_gen != gen0); // frames re-resolve at back-edge
     try testing.expectEqual(@as(?u16, 0), t.entry_slot);
 
     // Image: `.jfor_loop` at the patch pc, operands preserved, `.b` = slot.
@@ -191,17 +193,17 @@ test "doc 20 Phase 0b: install publishes a .jfor_loop image; canonical untouched
 
     // Unpatch: mark (allocation-free) then drain restores in place + tombstones.
     state.markEntryPatchPending(0);
-    try testing.expect(!state.entry_patches.items[0].live);
+    try testing.expect(!state.registry.entry_registry.entry_patches.items[0].live);
     state.drainEntryPatchWork();
     try testing.expectEqual(OpCode.for_loop, state.codeFor(&proto)[5].op);
-    try testing.expect(state.entry_patches.items[0].tombstone);
+    try testing.expect(state.registry.entry_registry.entry_patches.items[0].tombstone);
     try testing.expectEqual(@as(?u16, null), t.entry_slot);
 
     // The freed slot index is reused by the next install (free-list pop).
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(sibling));
     try testing.expectEqual(@as(?u16, 0), sibling.entry_slot);
     try testing.expectEqual(@as(u16, 0), state.codeFor(&proto)[5].b);
-    try testing.expectEqual(@as(usize, 1), state.entry_patches.items.len);
+    try testing.expectEqual(@as(usize, 1), state.registry.entry_registry.entry_patches.items.len);
 }
 
 test "doc 20 §R7-2: removeTrace marks the slot pre-destroy; drain survives the dropped trace" {
@@ -212,12 +214,12 @@ test "doc 20 §R7-2: removeTrace marks the slot pre-destroy; drain survives the 
     var code = entryPatchTestCode();
     const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
     const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
-    try state.cache.append(gpa, t);
+    try state.registry.cache.append(gpa, t);
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
 
     // removeTrace destroys `t`; the hook must have marked slot 0 first.
     state.removeTrace(t);
-    const p = state.entry_patches.items[0];
+    const p = state.registry.entry_registry.entry_patches.items[0];
     try testing.expect(!p.live and p.pending_unpatch);
     // Drain after destroy: traceById(1) → null (dropped), restore + tombstone,
     // and `p.trace` is never dereferenced.
@@ -234,17 +236,17 @@ test "doc 20 §R2-2: clearCache drops images + registry wholesale (epoch boundar
     var code = entryPatchTestCode();
     const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
     const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
-    try state.cache.append(gpa, t);
+    try state.registry.cache.append(gpa, t);
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
-    try testing.expect(state.code_images.count() == 1);
+    try testing.expect(state.registry.entry_registry.code_images.count() == 1);
 
-    const gen0 = state.image_gen;
+    const gen0 = state.registry.entry_registry.image_gen;
     state.clearCache();
-    try testing.expectEqual(@as(usize, 0), state.code_images.count());
-    try testing.expectEqual(@as(usize, 0), state.entry_patches.items.len);
-    try testing.expectEqual(@as(usize, 0), state.entry_patch_free.items.len);
-    try testing.expectEqual(@as(u32, 0), state.entry_patch_dirty);
-    try testing.expect(state.image_gen != gen0); // live frames re-resolve to canonical
+    try testing.expectEqual(@as(usize, 0), state.registry.entry_registry.code_images.count());
+    try testing.expectEqual(@as(usize, 0), state.registry.entry_registry.entry_patches.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.entry_registry.entry_patch_free.items.len);
+    try testing.expectEqual(@as(u32, 0), state.registry.entry_registry.entry_patch_dirty);
+    try testing.expect(state.registry.entry_registry.image_gen != gen0); // live frames re-resolve to canonical
     try testing.expectEqual(@as([*]const Instr, proto.code.ptr), state.codeFor(&proto).ptr);
 }
 
@@ -257,14 +259,14 @@ test "doc 20 triggers: anchor gate and side-arm want both mark the patch pending
     const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
     const anchor = AnchorKey{ .proto = &proto, .pc = 2 };
     const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
-    try state.cache.append(gpa, t);
+    try state.registry.cache.append(gpa, t);
 
     // Gate trigger: gating the anchor marks its live slot pending.
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
     state.gateNativeUnsupported(anchor);
-    try testing.expect(state.entry_patches.items[0].pending_unpatch);
+    try testing.expect(state.registry.entry_registry.entry_patches.items[0].pending_unpatch);
     state.drainEntryPatchWork();
-    try testing.expect(state.entry_patches.items[0].tombstone);
+    try testing.expect(state.registry.entry_registry.entry_patches.items[0].tombstone);
     try testing.expectEqual(@as(?u16, null), t.entry_slot);
 
     // Doc 31 D1: while the anchor is still (dispatch-)gated from the trigger
@@ -281,7 +283,7 @@ test "doc 20 triggers: anchor gate and side-arm want both mark the patch pending
     _ = state.gate.remove(anchor);
     state.countGuardFailure(anchor, 4);
     try testing.expect(state.wants_side_trace != null);
-    const p = state.entry_patches.items[t.entry_slot.?];
+    const p = state.registry.entry_registry.entry_patches.items[t.entry_slot.?];
     try testing.expect(p.pending_unpatch);
     state.drainEntryPatchWork();
     try testing.expectEqual(OpCode.for_loop, state.codeFor(&proto)[5].op);
@@ -296,7 +298,7 @@ test "doc 31 D1: a record gate leaves the entry patch live and blocks want produ
     const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
     const anchor = AnchorKey{ .proto = &proto, .pc = 2 };
     const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
-    try state.cache.append(gpa, t);
+    try state.registry.cache.append(gpa, t);
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
 
     // Recording failures land in `record_gate`: dispatch stays open
@@ -306,7 +308,7 @@ test "doc 31 D1: a record gate leaves the entry patch live and blocks want produ
     try testing.expect(state.isRecordGated(anchor));
     try testing.expect(!state.isGated(anchor));
     try testing.expect(state.recordingBarred(anchor));
-    try testing.expect(!state.entry_patches.items[0].pending_unpatch);
+    try testing.expect(!state.registry.entry_registry.entry_patches.items[0].pending_unpatch);
 
     // Want PRODUCTION is barred while record-gated (review B3): crossing
     // hotguard neither creates a want nor unpatches the entry — without
@@ -315,7 +317,7 @@ test "doc 31 D1: a record gate leaves the entry patch live and blocks want produ
     var i: u32 = 0;
     while (i < state.config.hotguard) : (i += 1) state.countGuardFailure(anchor, 4);
     try testing.expect(state.wants_side_trace == null);
-    try testing.expect(!state.entry_patches.items[0].pending_unpatch);
+    try testing.expect(!state.registry.entry_registry.entry_patches.items[0].pending_unpatch);
 
     // After the record cooldown elapses, the saturated counter re-creates
     // the want on the next failure — hotness was never lost.
@@ -352,8 +354,8 @@ test "doc 31 D1 amendment: record-gated anchor arms GATE_SKIP only when no trace
     // slots cannot collide): the slow path is exactly what enters the trace —
     // must NOT skip (dispatch starvation, review B3).
     const t = try entryPatchTestTrace(gpa, 1, &proto2, 2);
-    try state.cache.append(gpa, t);
-    state.gateRecordAnchor(t.anchor, .record_abort);
+    try state.registry.cache.append(gpa, t);
+    state.gateRecordAnchor(t.code.anchor, .record_abort);
     state.afterBackEdge(&proto2, 2);
     try testing.expect(!state.skipBackEdge(&proto2, 2));
 }

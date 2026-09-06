@@ -2,6 +2,22 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Architecture roadmap (2026-09-05, Bart: eventually cover all boundaries)
+
+Start with docs/design/41-jit-ownership.md: shared contracts, registry, region
+policy, then recording-session ownership. Remaining review findings are tracked
+work, not implemented by that first arc:
+
+- [ ] Canonical IR operand roles/remapping and release-safe boundary validation.
+- [ ] Precise native compile declines and fallible assembler finalization; design retry policy separately.
+- [ ] Runtime-owned protected invocation/unwinding and loaded-program registration; narrow stdlib capabilities.
+- [ ] EffectSession ownership and atomic replay attachment.
+- [ ] Runtime snapshot capture/restore separate from codec; non-mutating canonical grid projection.
+- [ ] Program-image retention/lifetime API and common CLI/wasm runner.
+- [ ] Stable runtime scratch/context ownership distinct from collector mechanism.
+- [ ] Visualizer session/artifact ownership, injected execution clients, and stale async result tests (retain Solid stores).
+- [ ] Native registry uniqueness and restore identity validation, without assuming backwards compatibility.
+
 ## `require` returns 1 value, Lua 5.4 returns 2
 
 Found while smoke-testing the `.mah`/`.lua` split (2026-08-31). Running the same

@@ -226,7 +226,7 @@ fn captureNativeF2cCut(gpa: std.mem.Allocator, source: [:0]const u8, native: boo
     try testing.expect(vm.rng != null);
 
     var compiled_native_traces: usize = 0;
-    for (vm.trace.cache.items) |tr| if (tr.native == .compiled) {
+    for (vm.trace.registry.cache.items) |tr| if (tr.native == .compiled) {
         compiled_native_traces += 1;
     };
     return .{
@@ -318,7 +318,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
         resumed.deinit();
         gpa.destroy(resumed);
     }
-    try testing.expectEqual(@as(usize, 0), resumed.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), resumed.trace.registry.cache.items.len);
     const replay_log = try effectser.decodeFile(gpa, resumed.heap, cut_effects);
     defer gpa.free(replay_log);
     try resumed.effect_log.appendSlice(gpa, replay_log);

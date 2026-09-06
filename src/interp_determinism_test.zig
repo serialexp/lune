@@ -84,7 +84,10 @@ fn recordRun(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer) ![]
 
     _ = try vm.run(chunk.proto);
     // Self-contained wire bytes (copied out of the cache), safe past `vm.deinit`.
-    return traceser.encodeFile(gpa, vm.trace.cache.items);
+    const codes = try gpa.alloc(*const trace.TraceCode, vm.trace.registry.cache.items.len);
+    defer gpa.free(codes);
+    for (vm.trace.registry.cache.items, codes) |record, *code| code.* = &record.code;
+    return traceser.encodeFile(gpa, codes);
 }
 
 /// Run `source` (no tracing — a keyframe is a heap artifact, independent of the

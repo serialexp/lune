@@ -13,7 +13,7 @@ const table = @import("table.zig");
 const arr = @import("array.zig");
 const Value = value.Value;
 const RegWindow = @import("regwindow.zig").RegWindow;
-const Trace = trace.Trace;
+const Trace = @import("trace_code.zig").TraceCode;
 const Reg = x64.Reg;
 const object = @import("object.zig");
 const function = @import("function.zig");
@@ -478,7 +478,7 @@ test "nativegen: f64-lane t[k]=C write matches the interpreter" {
     const t_n = try buildFloatTable(gpa, K);
     defer t_n.destroy(gpa);
     var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
-    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     const ncomp = try runNative(ct, &nregs);
 
@@ -507,7 +507,7 @@ test "nativegen: f64-lane astore deopt-replay leaves a deterministic heap (idemp
     defer t_replay.destroy(gpa);
     try testing.expectEqual(arr.Lane.f64, t_replay.array.lane);
     var r_native = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
-    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     _ = try runNative(ct, &r_native);
     var r_replay = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
@@ -620,7 +620,7 @@ test "nativegen: f64-lane read-modify-write (sunk astore) matches the oracle" {
     const t_n = try buildFloatTable(gpa, K);
     defer t_n.destroy(gpa);
     var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
-    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     const ncomp = try runNative(ct, &nregs);
 
@@ -697,7 +697,7 @@ test "nativegen: f64-lane multi-store RMW (two sunk astores) matches the oracle"
     const t_n = try buildFloatTable(gpa, K);
     defer t_n.destroy(gpa);
     var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
-    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     const ncomp = try runNative(ct, &nregs);
 

@@ -8,6 +8,7 @@
 //! motion — behaviour identical by construction.
 
 const std = @import("std");
+const native_physical = @import("trace_native_registry.zig");
 const trace_mod = @import("trace.zig");
 const bytecode = @import("bytecode.zig");
 const value = @import("value.zig");
@@ -18,6 +19,7 @@ const tropt = @import("tropt.zig");
 const execlog = @import("execlog.zig");
 const nativegen = @import("nativegen.zig");
 const irinterp = @import("irinterp.zig");
+const trace_exec = @import("trace_exec.zig");
 const jitdbg = @import("jitdbg.zig");
 const table_mod = @import("table.zig");
 const arr = @import("array.zig");
@@ -80,18 +82,18 @@ pub fn hasNativeLoopDoneLink(self: *const TraceState, failed: *Trace, proto: *co
     // Memoized under `cache_gen` (see `Trace.ldl_memo_*`): the answer only
     // changes when the trace cache does (`nextTraceExcluding` reads it), and
     // this runs once per native dispatch.
-    if (failed.ldl_memo_gen == self.cache_gen) return failed.ldl_memo;
+    if (failed.ldl_memo_gen == self.registry.cache_gen) return failed.ldl_memo;
     const answer = self.computeNativeLoopDoneLink(failed, proto);
     failed.ldl_memo = answer;
-    failed.ldl_memo_gen = self.cache_gen;
+    failed.ldl_memo_gen = self.registry.cache_gen;
     return answer;
 }
 
 pub fn computeNativeLoopDoneLink(self: *const TraceState, failed: *const Trace, proto: *const Proto) bool {
-    for (failed.instrs) |ins| {
+    for (failed.code.instrs) |ins| {
         if (ins.op != .guard_true) continue;
         const exit_pc = guardExitPc(ins) orelse continue;
-        if (exit_pc == 0 or exit_pc == failed.anchor.pc or exit_pc > proto.code.len) continue;
+        if (exit_pc == 0 or exit_pc == failed.code.anchor.pc or exit_pc > proto.code.len) continue;
         if (proto.code[guardSourcePc(ins).?].op != .for_loop) continue;
 
         var visited: [8]*Trace = undefined;
@@ -106,7 +108,7 @@ pub fn computeNativeLoopDoneLink(self: *const TraceState, failed: *const Trace, 
                 visited[nvisited] = sct;
                 nvisited += 1;
             }
-            if (sct.instrs.len != 0 and sct.instrs[sct.instrs.len - 1].op == .link) return true;
+            if (sct.code.instrs.len != 0 and sct.code.instrs[sct.code.instrs.len - 1].op == .link) return true;
         }
     }
     return false;
@@ -134,13 +136,13 @@ pub fn computeNativeLoopDoneLink(self: *const TraceState, failed: *const Trace, 
 pub fn maybeArmContinuation(self: *TraceState, failed: *const Trace, exit_instr: u32, proto: *const Proto) void {
     if (exit_instr == std.math.maxInt(u32)) return; // no guard identity
     if (self.rec.active or self.pending_exit_anchor != null) return;
-    const ins = failed.instrs[exit_instr];
+    const ins = failed.code.instrs[exit_instr];
     // Only a loop-continuation `guard_true` failing marks "loop ran to
     // completion"; a body type-guard (`guard_int`/…) failing is a different,
     // mid-iteration exit and must not seed a continuation.
     if (ins.op != .guard_true) return;
     const exit_pc = guardExitPc(ins) orelse return;
-    if (exit_pc == 0 or exit_pc == failed.anchor.pc) return;
+    if (exit_pc == 0 or exit_pc == failed.code.anchor.pc) return;
     if (exit_pc >= proto.code.len) return;
     // Doc 38: two loop-done shapes seed a continuation. A numeric-for's
     // continuation anchors at the guard's exit PC (the `for_loop`
@@ -151,8 +153,8 @@ pub fn maybeArmContinuation(self: *TraceState, failed: *const Trace, exit_instr:
         exit_pc
     else
         whileLoopDonePostPc(failed, exit_instr) orelse return;
-    if (!continuationReachesEnclosingBackEdge(proto, cont_pc, failed.anchor.pc)) {
-        self.dbg("cont-arm refuse: no enclosing back-edge from pc={d} (inner anchor {d})", .{ cont_pc, failed.anchor.pc });
+    if (!continuationReachesEnclosingBackEdge(proto, cont_pc, failed.code.anchor.pc)) {
+        self.dbg("cont-arm refuse: no enclosing back-edge from pc={d} (inner anchor {d})", .{ cont_pc, failed.code.anchor.pc });
         return;
     }
     const key = AnchorKey{ .proto = proto, .pc = cont_pc };
@@ -168,7 +170,7 @@ pub fn maybeArmContinuation(self: *TraceState, failed: *const Trace, exit_instr:
         self.dbg("cont-arm refuse: pc={d} has_trace={} barred={}", .{ cont_pc, has, barred });
         return;
     }
-    self.dbg("cont-arm: pending at pc={d} (inner anchor {d})", .{ cont_pc, failed.anchor.pc });
+    self.dbg("cont-arm: pending at pc={d} (inner anchor {d})", .{ cont_pc, failed.code.anchor.pc });
     self.pending_exit_anchor = key;
 }
 
@@ -324,9 +326,9 @@ pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: u
     // qualifying hot exit would re-unpatch a healthy trace forever. The
     // exit counter above keeps saturating, so the first exit after the
     // cooldown re-creates the want without losing hotness.
-    if (self.recordingBarred(t.anchor)) return;
+    if (self.recordingBarred(t.code.anchor)) return;
     const branch = self.isSourceBranchGuardExit(t, exit_instr, proto) and blk: {
-        const src_pc = guardSourcePc(t.instrs[exit_instr]) orelse break :blk false;
+        const src_pc = guardSourcePc(t.code.instrs[exit_instr]) orelse break :blk false;
         if (src_pc >= proto.code.len) break :blk false;
         break :blk switch (proto.code[src_pc].op) {
             .jmp_if_false, .jmp_if_true, .jmp_if_not_nil => true,
@@ -336,21 +338,21 @@ pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: u
     if (branch) {
         if (self.wants_prime_side != null) return;
         if (self.anchorPopulation(t) >= 2) return;
-        self.dbg("hotexit: trace id={d} exit={d} count={d} -> want PRIME side at pc={d}", .{ t.id, exit_instr, c.*, t.anchor.pc });
-        self.wants_prime_side = t.anchor;
+        self.dbg("hotexit: trace id={d} exit={d} count={d} -> want PRIME side at pc={d}", .{ t.id, exit_instr, c.*, t.code.anchor.pc });
+        self.wants_prime_side = t.code.anchor;
         self.prime_want_src = .{ .trace_id = t.id, .exit_instr = exit_instr };
         // Doc 20 unpatch trigger (same rationale as `wants_side_trace`):
         // prime-side arming also runs through the virgin `onBackEdge` path.
-        self.markEntryPatchesAt(t.anchor);
+        self.markEntryPatchesAt(t.code.anchor);
     } else if (completed == 0) {
         if (self.wants_side_trace != null) return;
         if (self.anchorPopulation(t) >= self.config.max_traces_per_anchor) return;
-        self.dbg("hotexit: trace id={d} exit={d} count={d} -> want side at pc={d}", .{ t.id, exit_instr, c.*, t.anchor.pc });
-        self.wants_side_trace = t.anchor;
+        self.dbg("hotexit: trace id={d} exit={d} count={d} -> want side at pc={d}", .{ t.id, exit_instr, c.*, t.code.anchor.pc });
+        self.wants_side_trace = t.code.anchor;
         self.side_want_src = .{ .trace_id = t.id, .exit_instr = exit_instr };
         // Doc 20 unpatch trigger: side-arming needs the virgin `onBackEdge`
         // path at this anchor next execution — mark any patch pending.
-        self.markEntryPatchesAt(t.anchor);
+        self.markEntryPatchesAt(t.code.anchor);
     }
 }
 
@@ -400,7 +402,7 @@ pub fn countFingerprintMiss(self: *TraceState, anchor: AnchorKey) void {
 }
 
 /// **Coherent-state chaining (doc 16, Phase 2) discriminator.** True iff
-/// `failed.instrs[exit_instr]` is a *source-level branch guard* exit — a
+/// `failed.code.instrs[exit_instr]` is a *source-level branch guard* exit — a
 /// `guard_true`/`guard_false` whose exit PC is a real bytecode pc NOT immediately
 /// preceded by a `for_loop`. The `for_loop` predecessor marks a numeric-`for`
 /// *loop-done* guard (a continuation candidate, doc 15); everything else that is
@@ -417,10 +419,10 @@ pub fn countFingerprintMiss(self: *TraceState, anchor: AnchorKey) void {
 pub fn isSourceBranchGuardExit(self: *const TraceState, failed: *const Trace, exit_instr: u32, proto: *const Proto) bool {
     _ = self;
     if (exit_instr == std.math.maxInt(u32)) return false;
-    const ins = failed.instrs[exit_instr];
+    const ins = failed.code.instrs[exit_instr];
     if (ins.op != .guard_true and ins.op != .guard_false) return false;
     const exit_pc = guardExitPc(ins) orelse return false;
-    if (exit_pc == 0 or exit_pc == failed.anchor.pc) return false;
+    if (exit_pc == 0 or exit_pc == failed.code.anchor.pc) return false;
     if (exit_pc <= proto.code.len and proto.code[guardSourcePc(ins).?].op == .for_loop) return false;
     return true;
 }
@@ -434,9 +436,9 @@ pub fn isSourceBranchGuardExit(self: *const TraceState, failed: *const Trace, ex
 /// the key.
 pub fn hasArmedSourceBranchLinkAt(self: *const TraceState, parent: *Trace, slot: u32, child: *Trace, proto: *const Proto) bool {
     if (parent == child) return false;
-    if (child.anchor.proto != parent.anchor.proto or child.anchor.pc != parent.anchor.pc) return false;
+    if (child.code.anchor.proto != parent.code.anchor.proto or child.code.anchor.pc != parent.code.anchor.pc) return false;
     if (!self.isSourceBranchGuardExit(parent, slot, proto)) return false;
-    for (self.armed_links.items) |l| {
+    for (self.registry.native_physical.armedLinks()) |l| {
         if (l.parent == parent and l.child == child and l.slot_index == slot) return true;
     }
     return false;
@@ -446,20 +448,20 @@ pub fn hasArmedSourceBranchLinkAt(self: *const TraceState, parent: *Trace, slot:
 /// consumer (interp.zig) can assert the skip+prime-side pair coexist (≥ 2).
 pub fn countTracesAt(self: *const TraceState, anchor: AnchorKey) usize {
     var n: usize = 0;
-    for (self.cache.items) |t| {
-        if (t.anchor.proto == anchor.proto and t.anchor.pc == anchor.pc) n += 1;
+    for (self.registry.cache.items) |t| {
+        if (t.code.anchor.proto == anchor.proto and t.code.anchor.pc == anchor.pc) n += 1;
     }
     return n;
 }
 
-/// Memoized `countTracesAt(t.anchor)` for per-receipt hot paths
+/// Memoized `countTracesAt(t.code.anchor)` for per-receipt hot paths
 /// (`noteTakenExit`): one gen compare in steady state, full scan only after a
 /// cache mutation (`cache_gen` bump). Results are identical to the scan by
 /// construction.
 pub fn anchorPopulation(self: *const TraceState, t: *Trace) usize {
-    if (t.anchor_pop_gen != self.cache_gen) {
-        t.anchor_pop = @intCast(self.countTracesAt(t.anchor));
-        t.anchor_pop_gen = self.cache_gen;
+    if (t.anchor_pop_gen != self.registry.cache_gen) {
+        t.anchor_pop = @intCast(self.countTracesAt(t.code.anchor));
+        t.anchor_pop_gen = self.registry.cache_gen;
     }
     return t.anchor_pop;
 }
@@ -469,7 +471,7 @@ pub fn anchorPopulation(self: *const TraceState, t: *Trace) usize {
 /// is bound — the `isInnerLoopRoot` shape (`inputs.len == 0` + `.loop` terminal)
 /// that `findLoopTrace` omits.
 pub fn hasInnerRootAt(self: *const TraceState, proto: *const Proto, pc: u32) bool {
-    for (self.cache.items) |t| {
+    for (self.registry.cache.items) |t| {
         if (isInnerLoopRoot(t, proto, pc)) return true;
     }
     return false;
@@ -502,17 +504,17 @@ pub const SuccAnchor = struct { proto_id: u32, pc: u32 };
 ///     trace of inner-root shape is bound there.
 ///   • a guard exit → `(t.proto, wp)` where `wp = guardExitPc(...)` (non-null only
 ///     for the numeric/branch guards `driveChain` chains on), iff `wp != 0`,
-///     `wp != t.anchor.pc`, and a trace is bound at `(t.proto, wp)`.
-/// The successor proto is `t.anchor.proto` — the same-proto assumption
+///     `wp != t.code.anchor.pc`, and a trace is bound at `(t.proto, wp)`.
+/// The successor proto is `t.code.anchor.proto` — the same-proto assumption
 /// `driveChain` makes (it threads one `proto` into `nextTraceExcluding`); a
 /// cross-proto inlined-callee resume is a known deferred refinement (§A8-ii).
 /// Returns `null` (no structural edge) for any exit whose successor is not a
 /// compatibly-bound trace, or a non-PC-carrying guard.
 pub fn resolveSuccessorAnchor(self: *const TraceState, t: *const Trace, e: ExitProvEntry) ?SuccAnchor {
-    const proto = t.anchor.proto;
+    const proto = t.code.anchor.proto;
     switch (e.prov) {
         .link_terminal => {
-            const li = t.instrs[e.index];
+            const li = t.code.instrs[e.index];
             if (li.op != .link) return null; // defensive: a .link_terminal must sit on a .link
             if (li.aux < 0) return null;
             const succ_pc: u32 = @intCast(li.aux);
@@ -520,8 +522,8 @@ pub fn resolveSuccessorAnchor(self: *const TraceState, t: *const Trace, e: ExitP
             return .{ .proto_id = proto.id, .pc = succ_pc };
         },
         .guard => {
-            if (guardExitPc(t.instrs[e.index])) |wp| {
-                if (wp != 0 and wp != t.anchor.pc and
+            if (guardExitPc(t.code.instrs[e.index])) |wp| {
+                if (wp != 0 and wp != t.code.anchor.pc and
                     self.countTracesAt(.{ .proto = proto, .pc = wp }) != 0)
                     return .{ .proto_id = proto.id, .pc = wp };
             }
@@ -567,9 +569,9 @@ pub fn resolveCompositeBridgeSuccessor(self: *const TraceState, t: *const Trace,
     // proto's bytecode).
     if (g.inline_depth != 0) return null;
     if (g.role != .branch_cond or g.polarity == .neutral) return null;
-    const proto = t.anchor.proto;
+    const proto = t.code.anchor.proto;
     if (g.source_proto_id != proto.id) return null;
-    if (!t.isBridgeCandidate(e.index)) return null;
+    if (!t.code.isBridgeCandidate(e.index)) return null;
     if (g.source_pc >= proto.code.len) return null;
     const bop = proto.code[g.source_pc];
     switch (bop.op) {
@@ -591,7 +593,7 @@ pub fn resolveCompositeBridgeSuccessor(self: *const TraceState, t: *const Trace,
         const pc: u32 = @intCast(pc_i);
         // Landing back on the source's own anchor is a self-edge, not a
         // cross-anchor handoff — decline (same rule as the ordinary arm).
-        if (pc == t.anchor.pc) return null;
+        if (pc == t.code.anchor.pc) return null;
         if (self.countTracesAt(.{ .proto = proto, .pc = pc }) != 0) {
             if (crossed_for_loop) |flp| {
                 if (!compositeContinueProof(t, e.index, flp)) return null;
@@ -618,7 +620,7 @@ pub fn resolveCompositeBridgeSuccessor(self: *const TraceState, t: *const Trace,
 /// Requires, all with committed indices `< composite_ei`:
 ///   - the dominance-scoped emitted set E holds slot-bound phis for BOTH
 ///     slots the crossed `for_loop` writes — `a` (idx) and `a+3` (var) —
-///     with the SAME update ref `R`, and `t.instrs[R]` is the `add` that
+///     with the SAME update ref `R`, and `t.code.instrs[R]` is the `add` that
 ///     steps the index (`recForLoop` publishes the one `rnext` to both);
 ///   - a committed `.loop_done` guard (non-inlined, same proto, source pc
 ///     == `flp`) whose guarded `le` compare CONSUMES `R` — i.e. the loop
@@ -628,25 +630,25 @@ pub fn resolveCompositeBridgeSuccessor(self: *const TraceState, t: *const Trace,
 /// edge-invariant; this proof is what gives `invariant = S \ E` its
 /// soundness for the crossed-op slots (doc 17 A-vii-d.1 item 2).
 pub fn compositeContinueProof(t: *const Trace, composite_ei: u32, flp: u32) bool {
-    const proto = t.anchor.proto;
+    const proto = t.code.anchor.proto;
     if (flp >= proto.code.len or proto.code[flp].op != .for_loop) return false;
     const base: u16 = proto.code[flp].a;
 
     // Fetch the dominance-scoped phi update refs for idx and var.
     var idx_ref: ?u16 = null;
     var var_ref: ?u16 = null;
-    var emitted = nativegen.compositeBridgeEmissions(t, composite_ei);
+    var emitted = nativegen.compositeBridgeEmissions(&t.code, composite_ei);
     while (emitted.next()) |p| {
         if (p.aux == @as(i32, @intCast(base))) idx_ref = p.b;
         if (p.aux == @as(i32, @intCast(base)) + 3) var_ref = p.b;
     }
     const r = idx_ref orelse return false;
     if (var_ref != r) return false;
-    if (r >= t.instrs.len or t.instrs[r].op != .add) return false;
+    if (r >= t.code.instrs.len or t.code.instrs[r].op != .add) return false;
 
     // Find a dominating loop-continue guard for THIS for_loop whose compare
     // consumes exactly `r`.
-    for (t.exit_prov) |ep| {
+    for (t.code.exit_prov) |ep| {
         if (ep.index >= composite_ei) break; // sorted ascending
         const gp = switch (ep.prov) {
             .guard => |gg| gg,
@@ -654,11 +656,11 @@ pub fn compositeContinueProof(t: *const Trace, composite_ei: u32, flp: u32) bool
         };
         if (gp.role != .loop_done or gp.inline_depth != 0) continue;
         if (gp.source_proto_id != proto.id or gp.source_pc != flp) continue;
-        const gi = t.instrs[ep.index];
+        const gi = t.code.instrs[ep.index];
         if (gi.op != .guard_true) continue;
         const cmp_ref = gi.a;
-        if (cmp_ref >= t.instrs.len) continue;
-        const cmp = t.instrs[cmp_ref];
+        if (cmp_ref >= t.code.instrs.len) continue;
+        const cmp = t.code.instrs[cmp_ref];
         if (cmp.op != .le) continue;
         if (cmp.a == r or cmp.b == r) return true;
     }
@@ -670,12 +672,9 @@ pub const PROMOTED_SET_CAP: usize = 16;
 // reporting suffix can evidence at most 31 distinct parent→child relations
 // (each needs a following row), so the merged maximum is 47. Allocate 48 by
 // the natural component sum and keep every overflow path release-panicking.
-pub const PROVENANCE_VERDICT_CAP: usize = PROMOTED_SET_CAP + irinterp.LEDGER_CAP;
+pub const PROVENANCE_VERDICT_CAP: usize = PROMOTED_SET_CAP + trace_exec.LEDGER_CAP;
 
-pub fn exitPatchFor(compiled: *nativegen.CompiledTrace, exit: u32) ?*nativegen.ExitPatch {
-    for (compiled.exit_patches) |*patch| if (patch.exit_instr == exit) return patch;
-    return null;
-}
+pub const exitPatchFor = native_physical.exitPatchFor;
 
 pub fn patchKindForArm(kind: ArmKind) ?nativegen.ExitPatchKind {
     return switch (kind) {
@@ -702,9 +701,9 @@ pub const BridgeValidationError = error{
 /// One authoritative proof for both reporting replay and silent promotion.
 /// Its result is static until either the slot relation or region_defs changes.
 pub fn validateRegionBridgeReceipt(self: *TraceState, owner: *Trace, exit: u32, succ: *Trace) BridgeValidationError!StructuralEdgeId {
-    if (!owner.isBridgeCandidate(exit)) return error.NotComposite;
-    var armed_link: ?*NativeLink = null;
-    for (self.armed_links.items) |*link| {
+    if (!owner.code.isBridgeCandidate(exit)) return error.NotComposite;
+    var armed_link: ?*const NativeLink = null;
+    for (self.registry.native_physical.armedLinks()) |*link| {
         if (link.parent != owner or link.slot_index != exit or link.child != succ) continue;
         if (link.kind != .region_bridge) return error.WrongArmKind;
         if (armed_link != null) return error.NoArmedProvenance;
@@ -713,25 +712,27 @@ pub fn validateRegionBridgeReceipt(self: *TraceState, owner: *Trace, exit: u32, 
     const link = armed_link orelse return error.NoArmedProvenance;
     const edge = memo: {
         if (link.bridge_edge) |cached| {
-            if (link.bridge_edge_gen == self.region_defs_gen) break :memo cached;
+            if (link.bridge_edge_gen == self.region_policy.region_defs_gen) break :memo cached;
         }
         const region_id = link.region_id orelse return error.NoRegionProvenance;
-        const prov = owner.provAt(exit) orelse return error.NoExitProvenance;
-        const def = self.region_defs.getPtr(region_id) orelse return error.RegionMissing;
+        const prov = owner.code.provAt(exit) orelse return error.NoExitProvenance;
+        const def = self.region_policy.region_defs.getPtr(region_id) orelse return error.RegionMissing;
         if (!def.armable) return error.RegionTombstoned;
         var registered: ?StructuralEdgeId = null;
         for (def.members) |member| {
-            if (member.anchor_proto_id != owner.anchor.proto.id or
-                member.anchor_pc != owner.anchor.pc or exitOrder(member.exit, prov) != .eq) continue;
+            if (member.anchor_proto_id != owner.code.anchor.proto.id or
+                member.anchor_pc != owner.code.anchor.pc or exitOrder(member.exit, prov) != .eq) continue;
             if (registered != null) return error.DuplicateEdge;
             registered = member;
         }
         const resolved = registered orelse return error.EdgeMissing;
-        link.bridge_edge = resolved;
-        link.bridge_edge_gen = self.region_defs_gen;
+        if (!self.registry.native_physical.memoizeBridgeEdge(owner, exit, succ, .{
+            .id = region_id,
+            .generation = link.armed_gen,
+        }, resolved, self.region_policy.region_defs_gen)) return error.NoArmedProvenance;
         break :memo resolved;
     };
-    if (edge.succ_anchor_proto_id != succ.anchor.proto.id or edge.succ_anchor_pc != succ.anchor.pc)
+    if (edge.succ_anchor_proto_id != succ.code.anchor.proto.id or edge.succ_anchor_pc != succ.code.anchor.pc)
         return error.SuccessorMismatch;
     return edge;
 }
@@ -744,7 +745,7 @@ pub fn promotedEdgeFromLink(self: *TraceState, link: NativeLink) ?PromotedEdge {
         .compiled => |*c| c,
         else => return null,
     };
-    if (link.slot_index >= link.parent.instrs.len or link.slot_index >= compiled.slots.len)
+    if (link.slot_index >= link.parent.code.instrs.len or link.slot_index >= compiled.slots.len)
         return null;
     if (link.slot_index >= compiled.metadata_cells.len) return null;
     const patch = exitPatchFor(compiled, link.slot_index) orelse return null;
@@ -763,7 +764,7 @@ pub fn promotedEdgeFromLink(self: *TraceState, link: NativeLink) ?PromotedEdge {
     if (!self.stubEnterable(link.child, switch (link.kind) {
         .link_terminal => .linked,
         .ordinary_guard, .loop_done_linked, .sibling_handoff, .region_bridge => .ordinary,
-    }, link.child.anchor.proto)) return null;
+    }, link.child.code.anchor.proto)) return null;
     const target = switch (link.kind) {
         .link_terminal => child_compiled.linked_entry orelse return null,
         .ordinary_guard, .loop_done_linked, .sibling_handoff => child_compiled.ordinary_entry orelse return null,
@@ -773,31 +774,31 @@ pub fn promotedEdgeFromLink(self: *TraceState, link: NativeLink) ?PromotedEdge {
 
     const resume_pc: u32 = switch (link.kind) {
         .sibling_handoff => blk: {
-            if (link.parent.anchor.proto != link.child.anchor.proto or
-                link.parent.anchor.pc != link.child.anchor.pc or
+            if (link.parent.code.anchor.proto != link.child.code.anchor.proto or
+                link.parent.code.anchor.pc != link.child.code.anchor.pc or
                 !exitIsPreEffect(link.parent, link.slot_index)) return null;
-            break :blk link.child.anchor.pc;
+            break :blk link.child.code.anchor.pc;
         },
         .ordinary_guard => blk: {
-            if (link.parent.anchor.proto != link.child.anchor.proto or
+            if (link.parent.code.anchor.proto != link.child.code.anchor.proto or
                 isLoopDoneGuardIndex(link.parent, link.slot_index) or
-                link.parent.isBridgeCandidate(link.slot_index)) return null;
+                link.parent.code.isBridgeCandidate(link.slot_index)) return null;
             // M1's child is an ordinary-entry ramp, but any terminal child
             // deopt/prologue-fail is coherent at the SOURCE header.
-            break :blk link.parent.anchor.pc;
+            break :blk link.parent.code.anchor.pc;
         },
         .link_terminal => blk: {
-            const ins = link.parent.instrs[link.slot_index];
+            const ins = link.parent.code.instrs[link.slot_index];
             if (ins.op != .link or ins.aux < 0 or
-                link.parent.anchor.proto != link.child.anchor.proto or
-                @as(u32, @intCast(ins.aux)) != link.child.anchor.pc) return null;
-            break :blk link.child.anchor.pc;
+                link.parent.code.anchor.proto != link.child.code.anchor.proto or
+                @as(u32, @intCast(ins.aux)) != link.child.code.anchor.pc) return null;
+            break :blk link.child.code.anchor.pc;
         },
         .loop_done_linked => blk: {
-            if (link.parent.anchor.proto != link.child.anchor.proto or
+            if (link.parent.code.anchor.proto != link.child.code.anchor.proto or
                 !isLoopDoneGuardIndex(link.parent, link.slot_index)) return null;
-            const post_pc = guardExitPc(link.parent.instrs[link.slot_index]) orelse return null;
-            if (post_pc != link.child.anchor.pc) return null;
+            const post_pc = guardExitPc(link.parent.code.instrs[link.slot_index]) orelse return null;
+            if (post_pc != link.child.code.anchor.pc) return null;
             break :blk post_pc;
         },
         .region_bridge => (self.validateRegionBridgeReceipt(link.parent, link.slot_index, link.child) catch return null).succ_anchor_pc,
@@ -835,7 +836,7 @@ pub fn rejectPromotion(self: *TraceState, reason: PromotionRejectReason) ?[]Prom
     return null;
 }
 
-pub fn rowPatchKind(kind: irinterp.LedgerKind) ?nativegen.ExitPatchKind {
+pub fn rowPatchKind(kind: trace_exec.LedgerKind) ?nativegen.ExitPatchKind {
     return switch (kind) {
         .deopt => .deopt,
         .link_terminal => .link_terminal,
@@ -865,12 +866,12 @@ pub fn rowPatchKind(kind: irinterp.LedgerKind) ?nativegen.ExitPatchKind {
 /// direction: the worst case is one extra demote-and-regrow round, whereas
 /// requiring the stamp would make every fresh bridge arm invisible to growth.
 pub fn edgeMemberOfRegion(self: *TraceState, edge: PromotedEdge, region_id: RegionId, require_bridge_stamp: bool) bool {
-    if (!self.regionMemberPoint(region_id, edge.parent.anchor.proto.id, edge.parent.anchor.pc) or
-        !self.regionMemberPoint(region_id, edge.child.anchor.proto.id, edge.child.anchor.pc))
+    if (!self.regionMemberPoint(region_id, edge.parent.code.anchor.proto.id, edge.parent.code.anchor.pc) or
+        !self.regionMemberPoint(region_id, edge.child.code.anchor.proto.id, edge.child.code.anchor.pc))
         return false;
     if (edge.arm_kind == .region_bridge and require_bridge_stamp) {
         var matching: ?*const NativeLink = null;
-        for (self.armed_links.items) |*link| {
+        for (self.registry.native_physical.armedLinks()) |*link| {
             if (link.parent != edge.parent or link.slot_index != edge.exit or
                 link.child != edge.child or link.kind != .region_bridge) continue;
             if (matching != null) return false;
@@ -883,9 +884,9 @@ pub fn edgeMemberOfRegion(self: *TraceState, edge: PromotedEdge, region_id: Regi
 }
 
 pub fn promotionBelongsToRegion(self: *TraceState, edges: []const PromotedEdge, key: RegionKey) bool {
-    const def = self.region_defs.get(key.region_id) orelse return false;
+    const def = self.region_policy.region_defs.get(key.region_id) orelse return false;
     if (!def.armable) return false;
-    const accum = self.region_profit.get(key) orelse return false;
+    const accum = self.region_policy.region_profit.get(key) orelse return false;
     if (!accum.frozen) return false;
     for (edges) |edge| {
         if (!self.edgeMemberOfRegion(edge, key.region_id, true)) return false;
@@ -914,18 +915,18 @@ pub fn promotionBelongsToRegion(self: *TraceState, edges: []const PromotedEdge, 
 /// The candidate is a pure function of deterministic state (armed-link
 /// registry + region membership + ledger), so the promotion instant stays
 /// reproducible across the replay modes.
-pub fn detectPromotableSet(self: *TraceState, entries: []const irinterp.LedgerEntry, key: RegionKey) ?[]PromotedEdge {
-    const def = self.region_defs.get(key.region_id) orelse return self.rejectPromotion(.region_mismatch);
+pub fn detectPromotableSet(self: *TraceState, entries: []const trace_exec.LedgerEntry, key: RegionKey) ?[]PromotedEdge {
+    const def = self.region_policy.region_defs.get(key.region_id) orelse return self.rejectPromotion(.region_mismatch);
     if (!def.armable) return self.rejectPromotion(.region_mismatch);
     if (entries.len == 0) return self.rejectPromotion(.open_chain);
 
     // Region-total candidate from the armed-link registry.
     var scratch: [PROMOTED_SET_CAP]PromotedEdge = undefined;
     var n: usize = 0;
-    for (self.armed_links.items) |link| {
+    for (self.registry.native_physical.armedLinks()) |link| {
         const edge = self.promotedEdgeFromLink(link) orelse continue;
         if (!self.edgeMemberOfRegion(edge, key.region_id, true)) continue;
-        if (self.promoted_exit_owners.contains(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit }))
+        if (self.registry.native_physical.promoted_exit_owners.contains(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit }))
             continue;
         if (n == PROMOTED_SET_CAP) return self.rejectPromotion(.cap);
         scratch[n] = edge;
@@ -977,46 +978,16 @@ pub fn detectPromotableSet(self: *TraceState, entries: []const irinterp.LedgerEn
     return result;
 }
 
-pub fn originalRel32Target(compiled: *const nativegen.CompiledTrace, patch: *const nativegen.ExitPatch) usize {
-    const bits: u32 = @as(u32, patch.original[1]) |
-        (@as(u32, patch.original[2]) << 8) |
-        (@as(u32, patch.original[3]) << 16) |
-        (@as(u32, patch.original[4]) << 24);
-    const disp: i32 = @bitCast(bits);
-    const next = @intFromPtr(compiled.page.code.ptr) + patch.patch_off + 5;
-    return @intCast(@as(i128, @intCast(next)) + disp);
-}
+pub const originalRel32Target = native_physical.originalRel32Target;
 
 pub fn patchPromotedEdge(self: *TraceState, edge: PromotedEdge, promote: bool) nativegen.PatchError!void {
-    const compiled = switch (edge.parent.native) {
-        .compiled => |*c| c,
-        else => return error.StalePage,
-    };
-    const generation = compiled.pageGeneration() orelse return error.NotArenaOwned;
-    const patch = exitPatchFor(compiled, edge.exit) orelse return error.OffsetOutOfBounds;
-    if (patch.kind != edge.kind) return error.OpcodeMismatch;
-    const epilogue = @intFromPtr(compiled.page.code.ptr) + patch.epilogue_off;
-    switch (edge.kind) {
-        .deopt => try self.mcode_arena.patchRel32(
-            &compiled.page,
-            generation,
-            patch.patch_off,
-            if (promote) epilogue else originalRel32Target(compiled, patch),
-        ),
-        .link_terminal, .loop_done_linked, .region_bridge => try self.mcode_arena.patchWindow(
-            &compiled.page,
-            generation,
-            patch.patch_off,
-            patch.original,
-            epilogue,
-            promote,
-        ),
-    }
+    defer self.syncNativeInvalidation();
+    return self.registry.native_physical.patchPromotedEdge(&self.registry.mcode_arena, edge, promote);
 }
 
-pub fn promoteSet(self: *TraceState, edges: []PromotedEdge, region_key: RegionKey) !void {
+pub fn promoteSet(self: *TraceState, edges: []const PromotedEdge, region_key: RegionKey) !void {
     if (edges.len == 0 or edges.len > PROMOTED_SET_CAP) return error.InvalidPromotionSet;
-    if (self.next_promoted_set_id == std.math.maxInt(u32)) return error.PromotionIdExhausted;
+    if (self.registry.native_physical.next_promoted_set_id == std.math.maxInt(u32)) return error.PromotionIdExhausted;
     // B-3d (§B3.17 R1): ONE live set per region key, enforced — not assumed.
     // The reachable race this closes: a growth demote queued mid-walk has not
     // applied yet when a promotion-eligible candidate arrives; accepting the
@@ -1024,7 +995,7 @@ pub fn promoteSet(self: *TraceState, edges: []PromotedEdge, region_key: RegionKe
     // the PROVENANCE_VERDICT_CAP sizing argument. The reject resets the
     // candidate streak (caller), costing one extra 4-window round —
     // deterministic and accepted (§B3.18 R7 churn note).
-    for (self.promoted_sets.items) |s| {
+    for (self.registry.native_physical.promoted_sets.items) |s| {
         if (std.meta.eql(s.region_key, region_key)) return error.PromotionRegionOwned;
     }
     if (!self.promotionBelongsToRegion(edges, region_key)) return error.InvalidPromotionRegion;
@@ -1037,87 +1008,27 @@ pub fn promoteSet(self: *TraceState, edges: []PromotedEdge, region_key: RegionKe
         }) orelse return error.InvalidPromotionSet;
         if (validated.kind != edge.kind or validated.resume_pc != edge.resume_pc)
             return error.InvalidPromotionSet;
-        if (self.promoted_exit_owners.contains(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit }))
+        if (self.registry.native_physical.promoted_exit_owners.contains(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit }))
             return error.PromotionExitOwned;
     }
 
-    const owned_edges = try self.gpa.dupe(PromotedEdge, edges);
-    errdefer self.gpa.free(owned_edges);
-    const summary = try self.gpa.alloc(nativegen.SilentSummaryCell, edges.len);
-    errdefer self.gpa.free(summary);
-    @memset(summary, std.mem.zeroes(nativegen.SilentSummaryCell));
-    const metadata = try self.gpa.alloc(nativegen.SilentExitMetadata, edges.len);
-    errdefer self.gpa.free(metadata);
-
-    for (owned_edges, 0..) |edge, i| {
-        const compiled = &edge.parent.native.compiled;
-        metadata[i] = .{
-            .summary = &summary[i],
-            .slot = &compiled.slots[edge.exit],
-            .min_useful = self.config.min_useful,
-            .reporting_target = switch (edge.kind) {
-                .deopt => originalRel32Target(compiled, exitPatchFor(compiled, edge.exit).?),
-                .link_terminal, .loop_done_linked, .region_bridge => @intFromPtr(compiled.page.code.ptr) +
-                    exitPatchFor(compiled, edge.exit).?.patch_off + 5,
-            },
-        };
-    }
-
-    try self.promoted_sets.ensureUnusedCapacity(self.gpa, 1);
-    try self.promoted_exit_owners.ensureUnusedCapacity(self.gpa, @intCast(edges.len));
-    // At most one queued id per live set. Reserve against the registry
-    // size (not the pending list's current length, normally zero), so a
-    // global sweep during replay can queue every set without allocation.
-    try self.pending_demote.ensureTotalCapacity(self.gpa, self.promoted_sets.items.len + 1);
-
-    // Publication: initialized metadata first, then pointer cells, code last.
-    for (owned_edges, 0..) |edge, i| {
-        edge.parent.native.compiled.metadata_cells[edge.exit] = @intFromPtr(&metadata[i]);
-    }
-    var patched: usize = 0;
-    errdefer {
-        while (patched > 0) {
-            patched -= 1;
-            self.patchPromotedEdge(owned_edges[patched], false) catch
-                @panic("promoteSet: failed to restore reporting code during unwind");
-        }
-        for (owned_edges) |edge| edge.parent.native.compiled.metadata_cells[edge.exit] = 0;
-    }
-    for (owned_edges) |edge| {
-        try self.patchPromotedEdge(edge, true);
-        patched += 1;
-    }
-
-    const id = self.next_promoted_set_id;
-    self.next_promoted_set_id += 1;
-    self.promoted_sets.appendAssumeCapacity(.{
-        .edges = owned_edges,
-        .summary = summary,
-        .metadata = metadata,
-        .region_key = region_key,
-        .id = id,
-    });
-    for (owned_edges) |edge| self.promoted_exit_owners.putAssumeCapacityNoClobber(
-        .{ .trace_id = edge.parent.id, .exit_instr = edge.exit },
-        id,
-    );
-    self.silent_promotions +|= 1;
+    try self.registry.native_physical.promoteSet(&self.registry.mcode_arena, edges, region_key, self.config.min_useful);
     if (comptime jitdbg.enabled) {
         if (self.config.debug_log) {
             jitdbg.log("silent-promote: set={d} region={d} len={d}", .{
-                id, region_key.region_id, owned_edges.len,
+                self.registry.native_physical.next_promoted_set_id - 1, region_key.region_id, edges.len,
             });
-            for (owned_edges, 0..) |edge, i| {
+            for (edges, 0..) |edge, i| {
                 jitdbg.log("  edge[{d}]: {s}:{d} t={d} ei={d} kind={s} arm={s} -> {s}:{d} t={d} resume={d}", .{
                     i,
-                    edge.parent.anchor.proto.name,
-                    edge.parent.anchor.pc,
+                    edge.parent.code.anchor.proto.name,
+                    edge.parent.code.anchor.pc,
                     edge.parent.id,
                     edge.exit,
                     @tagName(edge.kind),
                     @tagName(edge.arm_kind),
-                    edge.child.anchor.proto.name,
-                    edge.child.anchor.pc,
+                    edge.child.code.anchor.proto.name,
+                    edge.child.code.anchor.pc,
                     edge.child.id,
                     edge.resume_pc,
                 });
@@ -1127,32 +1038,20 @@ pub fn promoteSet(self: *TraceState, edges: []PromotedEdge, region_key: RegionKe
 }
 
 pub fn resetPromotionCandidate(self: *TraceState) void {
-    if (self.promotion_candidate.len != 0) self.gpa.free(self.promotion_candidate);
-    self.promotion_candidate = &.{};
-    self.promotion_candidate_run = 0;
-    self.promotion_candidate_region = null;
-}
-
-pub fn samePromotionEdges(a: []const PromotedEdge, b: []const PromotedEdge) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (x.parent.id != y.parent.id or x.exit != y.exit or x.child.id != y.child.id or
-            x.kind != y.kind or x.arm_kind != y.arm_kind or x.resume_pc != y.resume_pc)
-            return false;
-    }
-    return true;
+    defer self.syncNativeInvalidation();
+    self.registry.native_physical.resetPromotionCandidate();
 }
 
 /// Production promotion gate: only a full forced-yield ledger from a frozen
 /// activation is evidence, and the same canonical physical edge sequence must
 /// be detected on consecutive observations.
-pub fn considerSilentPromotion(self: *TraceState, entries: []const irinterp.LedgerEntry) void {
+pub fn considerSilentPromotion(self: *TraceState, entries: []const trace_exec.LedgerEntry) void {
     if (!self.config.silent_promotion_enabled) return;
-    if (entries.len != irinterp.LEDGER_CAP or entries[entries.len - 1].outcome != .yielded) {
+    if (entries.len != trace_exec.LEDGER_CAP or entries[entries.len - 1].outcome != .yielded) {
         self.resetPromotionCandidate();
         return;
     }
-    const ctx = self.region_context orelse {
+    const ctx = self.region_policy.region_context orelse {
         self.resetPromotionCandidate();
         return;
     };
@@ -1160,7 +1059,7 @@ pub fn considerSilentPromotion(self: *TraceState, entries: []const irinterp.Ledg
         self.resetPromotionCandidate();
         return;
     };
-    const accum = self.region_profit.get(key) orelse {
+    const accum = self.region_policy.region_profit.get(key) orelse {
         self.resetPromotionCandidate();
         return;
     };
@@ -1173,21 +1072,10 @@ pub fn considerSilentPromotion(self: *TraceState, entries: []const irinterp.Ledg
         return;
     };
     self.silent_promotion_candidates +|= 1;
-    if (self.promotion_candidate_region != null and
-        std.meta.eql(self.promotion_candidate_region.?, key) and
-        samePromotionEdges(self.promotion_candidate, detected))
-    {
-        self.gpa.free(detected);
-        self.promotion_candidate_run +|= 1;
-    } else {
-        self.resetPromotionCandidate();
-        self.promotion_candidate = detected;
-        self.promotion_candidate_run = 1;
-        self.promotion_candidate_region = key;
-    }
+    const streak = self.registry.native_physical.observePromotionCandidate(detected, key);
     const threshold = @max(self.config.promote_after, 1);
-    if (self.promotion_candidate_run < threshold) return;
-    self.promoteSet(self.promotion_candidate, key) catch |err| {
+    if (streak < threshold) return;
+    self.promoteSet(self.registry.native_physical.promotionCandidate(), key) catch |err| {
         switch (err) {
             // §B3.17 R1: the region already owns a live set (e.g. a growth
             // demote is queued but not yet applied). Distinct counter so the
@@ -1202,122 +1090,58 @@ pub fn considerSilentPromotion(self: *TraceState, entries: []const irinterp.Ledg
     self.resetPromotionCandidate();
 }
 
-pub const DemotionReason = enum { activation, region_close, slot_mutation, trace_invalidation, teardown, unfreeze, membership_growth };
-pub const PendingDemotion = struct { id: u32, reason: DemotionReason };
+pub const DemotionReason = native_physical.DemotionReason;
+pub const PendingDemotion = native_physical.PendingDemotion;
 
 pub fn queueDemote(self: *TraceState, id: u32, reason: DemotionReason) void {
-    for (self.pending_demote.items) |pending| if (pending.id == id) return;
-    self.pending_demote.appendAssumeCapacity(.{ .id = id, .reason = reason });
+    defer self.syncNativeInvalidation();
+    self.registry.native_physical.queueDemote(id, reason);
 }
 
 pub fn demoteSet(self: *TraceState, idx: usize) void {
-    self.demoteSetReason(idx, .trace_invalidation);
+    defer self.syncNativeInvalidation();
+    self.registry.native_physical.demoteSet(&self.registry.mcode_arena, idx);
 }
 
 pub fn demoteSetReason(self: *TraceState, idx: usize, reason: DemotionReason) void {
-    const set = self.promoted_sets.items[idx];
-    if (self.replay_walk_depth > 0) {
-        self.queueDemote(set.id, reason);
-        return;
-    }
-    // Teardown order is the inverse publication order: code first, cells
-    // second, then ownership/storage. A failed restore intentionally leaves
-    // every cell and allocation live before terminating the process.
-    for (set.edges) |edge| self.patchPromotedEdge(edge, false) catch
-        @panic("demoteSet: failed to restore reporting code");
-    for (set.edges) |edge| edge.parent.native.compiled.metadata_cells[edge.exit] = 0;
-    for (set.edges) |edge| {
-        if (!self.promoted_exit_owners.remove(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit }))
-            @panic("demoteSet: missing physical-exit ownership");
-    }
-    self.gpa.free(set.edges);
-    self.gpa.free(set.summary);
-    self.gpa.free(set.metadata);
-    _ = self.promoted_sets.swapRemove(idx);
-    self.silent_demotions +|= 1;
-    switch (reason) {
-        .activation => self.silent_demotion_reasons.activation +|= 1,
-        .region_close => self.silent_demotion_reasons.region_close +|= 1,
-        .slot_mutation => self.silent_demotion_reasons.slot_mutation +|= 1,
-        .trace_invalidation => self.silent_demotion_reasons.trace_invalidation +|= 1,
-        .teardown => self.silent_demotion_reasons.teardown +|= 1,
-        .unfreeze => self.silent_demotion_reasons.unfreeze +|= 1,
-        .membership_growth => self.silent_demotion_reasons.membership_growth +|= 1,
-    }
-    self.resetPromotionCandidate();
+    defer self.syncNativeInvalidation();
+    self.registry.native_physical.demoteSetReason(&self.registry.mcode_arena, idx, reason);
 }
 
 pub fn demoteSetsTouching(self: *TraceState, parent: *Trace, exit: u32) void {
-    const id = self.promoted_exit_owners.get(.{ .trace_id = parent.id, .exit_instr = exit }) orelse return;
-    for (self.promoted_sets.items, 0..) |set, i| {
-        if (set.id == id) {
-            self.demoteSetReason(i, .slot_mutation);
-            return;
-        }
-    }
-    @panic("demoteSetsTouching: owner names no live set");
+    defer self.syncNativeInvalidation();
+    self.registry.native_physical.demoteSetsTouching(&self.registry.mcode_arena, parent, exit);
 }
 
 pub fn demoteSetsTouchingTrace(self: *TraceState, trace: *Trace) void {
-    self.resetPromotionCandidate();
-    var i = self.promoted_sets.items.len;
-    while (i > 0) {
-        i -= 1;
-        var touches = false;
-        for (self.promoted_sets.items[i].edges) |edge| {
-            if (edge.parent == trace or edge.child == trace) {
-                touches = true;
-                break;
-            }
-        }
-        if (touches) self.demoteSetReason(i, .trace_invalidation);
-    }
+    defer self.syncNativeInvalidation();
+    self.registry.native_physical.demoteSetsTouchingTrace(&self.registry.mcode_arena, trace);
 }
 
 pub fn demoteAllSets(self: *TraceState) void {
-    var i = self.promoted_sets.items.len;
-    while (i > 0) {
-        i -= 1;
-        self.demoteSetReason(i, .teardown);
-    }
+    defer self.syncNativeInvalidation();
+    self.registry.native_physical.demoteAllSets(&self.registry.mcode_arena);
 }
 
 pub fn demoteSetsForRegionDefsMutation(self: *TraceState) void {
-    self.resetPromotionCandidate();
-    var i = self.promoted_sets.items.len;
-    while (i > 0) {
-        i -= 1;
-        // Region membership is part of every promotion proof, and a bridge
-        // additionally freezes its exact structural edge. Any defs mutation
-        // invalidates both facts, so no promoted set may survive the gen bump.
-        self.demoteSetReason(i, .trace_invalidation);
-    }
+    defer self.syncNativeInvalidation();
+    self.registry.native_physical.demoteSetsForRegionDefsMutation(&self.registry.mcode_arena);
 }
 
-pub const SlotMutationReason = enum { arm, rearm, retire, disarm_all, disarm_one };
-pub const PreparedSlotMutation = struct { compiled: *nativegen.CompiledTrace, exit: u32 };
+pub const SlotMutationReason = native_physical.SlotMutationReason;
+pub const PreparedSlotMutation = native_physical.PreparedSlotMutation;
 
 /// Phase 1 of the sole physical slot-write funnel. B-3a validates ownership and
 /// bounds; B-3b will demote a promotion owning this physical exit here.
 pub fn prepareSlotMutation(self: *TraceState, parent: *Trace, exit: u32, reason: SlotMutationReason) !PreparedSlotMutation {
-    switch (reason) {
-        .retire, .disarm_all, .disarm_one => self.resetPromotionCandidate(),
-        .arm, .rearm => {}, // caller distinguishes identical convergence re-arms
-    }
-    const compiled = switch (parent.native) {
-        .compiled => |*c| c,
-        else => return error.NativeTraceUnavailable,
-    };
-    if (exit >= compiled.slots.len) return error.InvalidNativeSlot;
-    self.demoteSetsTouching(parent, exit);
-    if (self.promoted_exit_owners.contains(.{ .trace_id = parent.id, .exit_instr = exit }))
-        return error.DemotionDeferred;
-    return .{ .compiled = compiled, .exit = exit };
+    defer self.syncNativeInvalidation();
+    return self.registry.native_physical.prepareSlotMutation(&self.registry.mcode_arena, parent, exit, reason);
 }
 
 /// Phase 2 is infallible and occurs only after the caller's registry mutation.
-pub fn commitSlotMutation(_: *TraceState, prepared: PreparedSlotMutation, target: usize) void {
-    prepared.compiled.slots[prepared.exit] = target;
+pub fn commitSlotMutation(self: *TraceState, prepared: PreparedSlotMutation, target: usize) void {
+    defer self.syncNativeInvalidation();
+    self.registry.native_physical.commitSlotMutation(prepared, target);
 }
 
 /// Arm a native link (P-E, doc 17 Increment 2.3): point `parent`'s frameless exit
@@ -1338,7 +1162,22 @@ pub fn commitSlotMutation(_: *TraceState, prepared: PreparedSlotMutation, target
 /// makes the S2 provenance argument hold by construction.
 /// INVARIANT: every post-compilation `CompiledTrace.slots[i]` write goes through
 /// `prepareSlotMutation` + `commitSlotMutation`.
+pub const RegionArmProof = native_physical.RegionArmProof;
+
+pub const ArmRequest = native_physical.ArmRequest;
+
 pub fn armNativeLink(self: *TraceState, parent: *Trace, slot_index: u32, child: *Trace, kind: ArmKind) !bool {
+    return arm(self, .{ .parent = parent, .slot_index = slot_index, .child = child, .kind = kind });
+}
+
+/// Publish the complete relation before its executable slot. Region policy must
+/// supply its proof here, never amend an already-published registry row.
+pub fn arm(self: *TraceState, request: ArmRequest) !bool {
+    const parent = request.parent;
+    const slot_index = request.slot_index;
+    const child = request.child;
+    const kind = request.kind;
+    if (request.region != null and kind != .region_bridge) return false;
     const c = switch (parent.native) {
         .compiled => |*cc| cc,
         else => return false,
@@ -1350,7 +1189,7 @@ pub fn armNativeLink(self: *TraceState, parent: *Trace, slot_index: u32, child: 
     // per-hop counts come from the raw rbx ledger, which cannot express the
     // split. Refusing the arm keeps every peeled run unfused and the
     // accounting exact on both sides.
-    if (parent.peeled or child.peeled) return false;
+    if (parent.code.peeled or child.code.peeled) return false;
     // P-C option (b) invariant (2.3c-0a): a numeric-for loop-done guard's slot is
     // exclusively its linked-materialized exit. Enforce that the arm's declared kind
     // matches the slot's guard shape — a mismatch is a wiring bug (assert in debug),
@@ -1374,7 +1213,7 @@ pub fn armNativeLink(self: *TraceState, parent: *Trace, slot_index: u32, child: 
             // A-v bridge candidates must remain at shared_exit. In particular,
             // the older M1 ordinary-source arm must not accidentally publish a
             // composite back-edge into the new armed body.
-            if (parent.isBridgeCandidate(slot_index)) return false;
+            if (parent.code.isBridgeCandidate(slot_index)) return false;
         },
         .region_bridge => {
             std.debug.assert(!is_loopdone);
@@ -1387,115 +1226,26 @@ pub fn armNativeLink(self: *TraceState, parent: *Trace, slot_index: u32, child: 
         .sibling_handoff => {
             std.debug.assert(!is_loopdone);
             if (is_loopdone) return false;
-            if (parent.isBridgeCandidate(slot_index)) return false;
+            if (parent.code.isBridgeCandidate(slot_index)) return false;
             // Re-proved at arm time, not merely trusted from the watch: this is
             // the predicate that makes the handoff sound (`exitIsPreEffect`), and
             // the validator is the last gate before a physical slot is patched.
             if (!exitIsPreEffect(parent, slot_index)) return false;
             // The defining property: parent and child share an anchor.
-            if (child.anchor.proto != parent.anchor.proto or
-                child.anchor.pc != parent.anchor.pc) return false;
+            if (child.code.anchor.proto != parent.code.anchor.proto or
+                child.code.anchor.pc != parent.code.anchor.pc) return false;
             // B-iv.3 (doc 22 §B.5): the page prologue owns the seeding
             // (§B.4), so a seeded child IS stub-enterable when its episode
             // ctx is fresh — consult the shared predicate instead of the
             // pre-B-iv "ordinary_entry cannot seed" blanket rule.
-            if (!self.stubEnterable(child, .ordinary, child.anchor.proto)) return false;
+            if (!self.stubEnterable(child, .ordinary, child.code.anchor.proto)) return false;
         },
     }
-    // The child/target association is derived here, never trusted from a caller.
-    // A `.link` terminal must enter linked loop-done mode; both ordinary guard
-    // and linked loop-done handoffs must clear that mode at `ordinary_entry`.
-    // These are the only two valid cross-trace entry points. `compileImpl`
-    // release-validates that each stored address lies inside this child's live
-    // mcode page before publishing the CompiledTrace.
-    const child_c = switch (child.native) {
-        .compiled => |*cc| cc,
-        else => return false,
-    };
-    const target = switch (kind) {
-        .link_terminal => child_c.linked_entry orelse return false,
-        .ordinary_guard, .loop_done_linked, .sibling_handoff => child_c.ordinary_entry orelse return false,
-        // A-vii is the first increment allowed to call this arm. Missing the
-        // required re-guarding entry is therefore a wiring bug, not ordinary
-        // ineligibility: fail loudly before publishing an unsafe bare jump.
-        .region_bridge => child_c.ordinary_entry orelse
-            @panic("armNativeLink(.region_bridge): child has no ordinary_entry"),
-    };
-    // A re-arm of this exact slot supersedes any prior child it pointed at.
-    // Mutate the existing record IN PLACE (no allocation) — the earlier
-    // remove-then-append ordering could OOM after dropping the old record,
-    // stranding the slot armed-but-untracked (2.3a review BUG-1). Because at
-    // most one record exists per (parent, slot_index) — this loop guarantees
-    // it — the first match is the only match.
-    for (self.armed_links.items) |*l| {
-        if (l.parent == parent and l.slot_index == slot_index) {
-            // B-3d.1 R6 (doc 17 §B3.18, the convergent round-2 MAJOR): an
-            // IDENTICAL re-publication — same child, same kind, same slot
-            // target — is a no-op on the physical state and must not reach
-            // `prepareSlotMutation`, whose owned-exit demotion would tear a
-            // live promoted set down for a re-arm that changes nothing (the
-            // forced-yield `is_last` convergence arms re-publish exactly such
-            // relations). The target compare is load-bearing: a recompiled
-            // child has a NEW `ordinary_entry`, so its re-arm takes the full
-            // path below and correctly demotes. `.sibling_handoff` is
-            // EXCLUDED: `publishSiblingArm` increments the parent latch after
-            // every true return, balanced by `clearSiblingLatch` below —
-            // short-circuiting the clear would leak the latch +1 per
-            // identical republication (the codex post-landing blocker this
-            // branch's comment memorializes).
-            if (l.child == child and l.kind == kind and c.slots[slot_index] == target and
-                kind != .sibling_handoff)
-            {
-                self.dbg("arm (identical re-arm short-circuit): parent id={d} pc={d} slot={d} kind={s}", .{
-                    parent.id, parent.anchor.pc, slot_index, @tagName(kind),
-                });
-                return true;
-            }
-            // Convergence sites re-publish an identical relation on every
-            // terminal observation. Keep that from breaking the consecutive
-            // detection streak; a changed relation invalidates the candidate.
-            if (l.child != child or l.kind != kind or c.slots[slot_index] != target)
-                self.resetPromotionCandidate();
-            const prepared = self.prepareSlotMutation(parent, slot_index, .rearm) catch return false;
-            // A re-arm can displace a provenance-published sibling arm with
-            // a different kind/child — re-open publication so the drain can
-            // re-evaluate the surviving edges at the next safe point. And
-            // when the OLD record was a `.sibling_handoff`, its parent-side
-            // latch must be released here exactly as on removal (codex
-            // post-landing blocker: without this, sibling_arms leaks +1 on
-            // every displace→republish cycle and the watch fast-reject
-            // stops being exact). `publishSiblingArm` re-increments if the
-            // new kind is again a sibling handoff.
-            if (l.kind == .sibling_handoff or kind == .sibling_handoff)
-                self.provenance_arms_pending = true;
-            if (l.kind == .sibling_handoff)
-                clearSiblingLatch(l.*);
-            l.child = child;
-            l.kind = kind;
-            l.region_id = null; // a `.region_bridge` caller re-stamps after arming
-            l.armed_gen = 0;
-            l.bridge_edge = null; // drop the replay memo with the old child
-            l.bridge_edge_gen = 0;
-            self.commitSlotMutation(prepared, target);
-            self.dbg("arm (re-arm): parent id={d} pc={d} slot={d} -> child id={d} pc={d} kind={s}", .{
-                parent.id, parent.anchor.pc, slot_index, child.id, child.anchor.pc, @tagName(kind),
-            });
-            self.noteMembershipGrowth(parent, slot_index, child, kind);
-            return true;
-        }
-    }
-    // Fresh slot: append the record BEFORE writing the slot, so a failed append
-    // leaves the slot at its prior `shared_exit` value with no dangling record.
-    self.resetPromotionCandidate();
-    const prepared = self.prepareSlotMutation(parent, slot_index, .arm) catch return false;
-    try self.armed_links.append(self.gpa, .{ .parent = parent, .slot_index = slot_index, .child = child, .kind = kind });
-    if (self.armed_links.items.len > self.native_link_peak) self.native_link_peak = self.armed_links.items.len;
-    self.commitSlotMutation(prepared, target);
-    self.dbg("arm: parent id={d} pc={d} slot={d} -> child id={d} pc={d} kind={s}", .{
-        parent.id, parent.anchor.pc, slot_index, child.id, child.anchor.pc, @tagName(kind),
-    });
-    self.noteMembershipGrowth(parent, slot_index, child, kind);
-    return true;
+    defer self.syncNativeInvalidation();
+    self.registry.native_physical.debug_log = self.config.debug_log;
+    const outcome = try self.registry.native_physical.publishValidatedLink(&self.registry.mcode_arena, request);
+    if (outcome == .changed) self.noteMembershipGrowth(parent, slot_index, child, kind);
+    return outcome != .declined;
 }
 
 /// B-3d (doc 17 §B3.17 R1, §B3.18 R7): the membership-growth trigger. A
@@ -1515,8 +1265,8 @@ pub fn armNativeLink(self: *TraceState, parent: *Trace, slot_index: u32, child: 
 /// semantics — queued mid-walk, immediate at depth 0 — and the backwards
 /// iteration keeps the depth-0 `swapRemove` sound.
 pub fn noteMembershipGrowth(self: *TraceState, parent: *Trace, slot_index: u32, child: *Trace, kind: ArmKind) void {
-    if (self.promoted_sets.items.len == 0) return;
-    if (self.promoted_exit_owners.contains(.{ .trace_id = parent.id, .exit_instr = slot_index }))
+    if (self.registry.native_physical.promoted_sets.items.len == 0) return;
+    if (self.registry.native_physical.promoted_exit_owners.contains(.{ .trace_id = parent.id, .exit_instr = slot_index }))
         return;
     // Not patch-pointed (or otherwise failing arm-shape validation) means the
     // edge can never be a candidate member, so it cannot outgrow a set. Same
@@ -1529,10 +1279,10 @@ pub fn noteMembershipGrowth(self: *TraceState, parent: *Trace, slot_index: u32, 
         .child = child,
         .kind = kind,
     }) orelse return;
-    var i = self.promoted_sets.items.len;
+    var i = self.registry.native_physical.promoted_sets.items.len;
     while (i > 0) {
         i -= 1;
-        const s = self.promoted_sets.items[i];
+        const s = self.registry.native_physical.promoted_sets.items[i];
         if (!self.edgeMemberOfRegion(edge, s.region_key.region_id, false)) continue;
         self.dbg("membership growth: parent id={d} slot={d} kind={s} demotes set={d} region={d}", .{
             parent.id, slot_index, @tagName(kind), s.id, s.region_key.region_id,
@@ -1569,22 +1319,22 @@ pub fn armLinkTerminal(self: *TraceState, cont: *Trace, inner: *Trace, safe_to_a
     // replay-line recording is active.
     if (!safe_to_arm) return;
     // The parent must end in a `.link` terminal whose aux names the inner root.
-    if (cont.instrs.len == 0) return;
-    const term = cont.instrs[cont.instrs.len - 1];
+    if (cont.code.instrs.len == 0) return;
+    const term = cont.code.instrs[cont.code.instrs.len - 1];
     if (term.op != .link) return;
     // The child must be the shape `replayLedger`'s fused `.link_terminal`
     // successor validation release-panics on anything but: an inner loop
     // root in the same proto at exactly the `.link`-named PC (B-iv.3:
     // seeded roots included — enterability checked below).
-    if (!isInnerLoopRoot(inner, cont.anchor.proto, @intCast(term.aux))) return;
+    if (!isInnerLoopRoot(inner, cont.code.anchor.proto, @intCast(term.aux))) return;
     // Both ends need native code: the parent for its slot table, the child for
     // the `linked_entry` the arm derives (`armNativeLink` re-checks; missing
     // native on either side must no-op silently, not assert).
     if (self.nativeFor(cont) == null or self.nativeFor(inner) == null) return;
     // B-iv.3 (doc 22 §B.5): mirror the scalar call-A arm site's widened
     // gate — a seeded inner arms only while stub-enterable (fresh ctx).
-    if (!self.stubEnterable(inner, .linked, cont.anchor.proto)) return;
-    const slot: u32 = @intCast(cont.instrs.len - 1);
+    if (!self.stubEnterable(inner, .linked, cont.code.anchor.proto)) return;
+    const slot: u32 = @intCast(cont.code.instrs.len - 1);
     const armed = self.armNativeLink(cont, slot, inner, .link_terminal) catch false;
     if (armed) self.native_link_arms +|= 1;
 }
@@ -1598,9 +1348,9 @@ pub fn armLoopDoneLink(self: *TraceState, inner: *Trace, guard_idx: u32, safe_to
     // invariant's debug half is an assert (a wiring-bug tripwire), whereas a
     // mid-loop or prologue-fail exit index is a legitimately reachable input at
     // the call sites and must no-op silently.
-    if (guard_idx == std.math.maxInt(u32) or guard_idx >= inner.instrs.len) return;
+    if (guard_idx == std.math.maxInt(u32) or guard_idx >= inner.code.instrs.len) return;
     if (!isLoopDoneGuardIndex(inner, guard_idx)) return;
-    const post_pc = guardExitPc(inner.instrs[guard_idx]) orelse return;
+    const post_pc = guardExitPc(inner.code.instrs[guard_idx]) orelse return;
     // B-4 (§B4.3 D3'): the arm target is CANONICAL — resolved positionally
     // at `post_pc` through the shared selector, never taken from whatever
     // continuation the caller happened to be holding. A caller-supplied
@@ -1609,7 +1359,7 @@ pub fn armLoopDoneLink(self: *TraceState, inner: *Trace, guard_idx: u32, safe_to
     // candidacy (§B4.7 MAJOR-2); the selector is a pure function of the
     // cache, so the relation is stable and identical re-arms short-circuit
     // at the `armNativeLink` funnel (B-3d.1 R6).
-    const target = self.resolveLoopDoneCont(inner.anchor.proto, post_pc, null).arm orelse return;
+    const target = self.resolveLoopDoneCont(inner.code.anchor.proto, post_pc, null).arm orelse return;
     self.armLoopDoneLinkTo(inner, guard_idx, post_pc, target);
 }
 
@@ -1624,12 +1374,12 @@ pub fn armLoopDoneLinkTo(self: *TraceState, inner: *Trace, guard_idx: u32, post_
     // else must stay unarmed. B-iv.3 (doc 22 §B.5): seeded continuations
     // qualify when stub-enterable — checked AFTER `nativeFor` (the predicate
     // never compiles), mirroring the widened replay assert.
-    if (!(cont.instrs.len != 0 and cont.instrs[cont.instrs.len - 1].op == .link)) return;
-    if (!(cont.anchor.proto == inner.anchor.proto and cont.anchor.pc == post_pc)) return;
+    if (!(cont.code.instrs.len != 0 and cont.code.instrs[cont.code.instrs.len - 1].op == .link)) return;
+    if (!(cont.code.anchor.proto == inner.code.anchor.proto and cont.code.anchor.pc == post_pc)) return;
     // `ordinary_entry` is optional — a missing entry (e.g. a test stub or an
     // unsupported compile) leaves the slot unarmed, never `.?`-traps.
     _ = self.nativeFor(cont) orelse return;
-    if (!self.stubEnterable(cont, .ordinary, inner.anchor.proto)) return;
+    if (!self.stubEnterable(cont, .ordinary, inner.code.anchor.proto)) return;
     const armed = self.armNativeLink(inner, guard_idx, cont, .loop_done_linked) catch false;
     if (armed) self.native_loopdone_link_arms +|= 1;
 }
@@ -1646,32 +1396,9 @@ pub fn armLoopDoneLinkTo(self: *TraceState, inner: *Trace, guard_idx: u32, post_
 /// The slot address is re-derived from the live `parent` here, never cached, so it
 /// is always valid at the moment of the write.
 pub fn resetLinksTouching(self: *TraceState, t: *Trace) void {
-    self.demoteSetsTouchingTrace(t);
-    const shared_exit = self.mcode_arena.trampoline_exit orelse 0;
-    var i: usize = self.armed_links.items.len;
-    while (i > 0) {
-        i -= 1;
-        const link = self.armed_links.items[i];
-        if (link.child != t and link.parent != t) continue;
-        self.dbg("retire-reset: link parent id={d} slot={d} child id={d} (retiring id={d})", .{
-            link.parent.id, link.slot_index, link.child.id, t.id,
-        });
-        clearSiblingLatch(link);
-        if (link.child == t and link.parent != t) {
-            switch (link.parent.native) {
-                .compiled => |*c| if (link.slot_index < c.slots.len) {
-                    const prepared = self.prepareSlotMutation(link.parent, link.slot_index, .retire) catch
-                        @panic("resetLinksTouching: invalid native slot mutation");
-                    self.commitSlotMutation(prepared, shared_exit);
-                },
-                else => {},
-            }
-        }
-        _ = self.armed_links.swapRemove(i);
-        // A removed arm may be re-publishable from a surviving provenance
-        // edge — let the drain re-evaluate at the next safe point.
-        self.provenance_arms_pending = true;
-    }
+    defer self.syncNativeInvalidation();
+    self.registry.native_physical.debug_log = self.config.debug_log;
+    self.registry.native_physical.resetLinksTouching(&self.registry.mcode_arena, t);
 }
 
 /// Disarm-on-unsafe (2.3c-0e, doc 17; Bart's chosen cycle bound). Reset EVERY
@@ -1688,31 +1415,9 @@ pub fn resetLinksTouching(self: *TraceState, t: *Trace) void {
 /// then nothing until arming resumes). The slot address is re-derived from the
 /// live `parent`, never cached, exactly as `resetLinksTouching` does.
 pub fn disarmAllLinks(self: *TraceState) void {
-    // A-vii-d.1: never mutate the registry mid-`replayLedger` walk — later
-    // rows validate against it (see `replay_walk_depth`). Defer; the ledger
-    // driver applies it right after the walk, before any native re-entry.
-    if (self.replay_walk_depth > 0) {
-        self.pending_disarm_all = true;
-        return;
-    }
-    if (self.armed_links.items.len == 0) return;
-    self.dbg("disarmAllLinks: resetting {d} armed links", .{self.armed_links.items.len});
-    self.native_link_disarms +|= @intCast(self.armed_links.items.len);
-    const shared_exit = self.mcode_arena.trampoline_exit orelse 0;
-    for (self.armed_links.items) |link| {
-        clearSiblingLatch(link);
-        switch (link.parent.native) {
-            .compiled => |*c| if (link.slot_index < c.slots.len) {
-                const prepared = self.prepareSlotMutation(link.parent, link.slot_index, .disarm_all) catch
-                    @panic("disarmAllLinks: invalid native slot mutation");
-                self.commitSlotMutation(prepared, shared_exit);
-            },
-            else => {},
-        }
-    }
-    self.armed_links.clearRetainingCapacity();
-    // See resetLinksTouching: removed arms re-open provenance publication.
-    self.provenance_arms_pending = true;
+    defer self.syncNativeInvalidation();
+    self.registry.native_physical.debug_log = self.config.debug_log;
+    self.registry.native_physical.disarmAllLinks(&self.registry.mcode_arena);
 }
 
 /// Part S: drop a `.sibling_handoff` link's parent-side latch. EVERY path that
@@ -1720,41 +1425,15 @@ pub fn disarmAllLinks(self: *TraceState) void {
 /// stops being an exact necessary condition (it would keep saying "maybe" for a
 /// parent with no link, costing a registry scan) and the watch could never
 /// re-qualify. Cheap enough to call unconditionally on any link kind.
-pub fn clearSiblingLatch(link: NativeLink) void {
-    if (link.kind != .sibling_handoff) return;
-    link.parent.sibling_arms -|= 1;
-    link.parent.sibling_watch_exit = std.math.maxInt(u32);
-    link.parent.sibling_watch_count = 0;
-    // The arm set touching this trace changed — the ineligible memo may have
-    // been the armed-slot exclusion, so it must be re-derived.
-    link.parent.sibling_reject_exit = std.math.maxInt(u32);
-}
+pub const clearSiblingLatch = native_physical.clearSiblingLatch;
 
 /// A-vii-d.1 (review blocker 3): disarm ONE armed link by registry index —
 /// reset its parent's physical slot to the shared trampoline exit, count the
 /// disarm, and drop the record. Infallible (publish-phase safe). Uses
 /// `swapRemove`, so callers iterating the registry must walk BACKWARDS.
 pub fn disarmLinkAt(self: *TraceState, idx: usize) void {
-    const link = self.armed_links.items[idx];
-    self.native_link_disarms +|= 1;
-    clearSiblingLatch(link);
-    const shared_exit = self.mcode_arena.trampoline_exit orelse 0;
-    switch (link.parent.native) {
-        .compiled => |*c| if (link.slot_index < c.slots.len) {
-            const prepared = self.prepareSlotMutation(link.parent, link.slot_index, .disarm_one) catch
-                @panic("disarmLinkAt: invalid native slot mutation");
-            self.commitSlotMutation(prepared, shared_exit);
-        },
-        else => {},
-    }
-    _ = self.armed_links.swapRemove(idx);
-    // See resetLinksTouching: a removed arm re-opens provenance publication.
-    // Deliberately conservative: `.region_bridge` disarms (e.g. via
-    // disarmStaleRegionBridgeLinks) also pass through here and re-open
-    // publication even though no sibling arm changed — one wasted drain
-    // scan per stale-bridge teardown, accepted for a single invariant
-    // ("any physical disarm re-opens") instead of per-kind exceptions.
-    self.provenance_arms_pending = true;
+    defer self.syncNativeInvalidation();
+    self.registry.native_physical.disarmLinkAt(&self.registry.mcode_arena, idx);
 }
 
 /// A-vii-d.1 (review blocker 3) — the stale-region lifecycle rule: a
@@ -1767,10 +1446,10 @@ pub fn disarmLinkAt(self: *TraceState, idx: usize) void {
 /// region no longer validates, so the physical slot must be reset the
 /// moment the region dies. Infallible (publish-phase safe).
 pub fn disarmStaleRegionBridgeLinks(self: *TraceState, live_armable: []const RegionId) void {
-    var i = self.armed_links.items.len;
+    var i = self.registry.native_physical.armedLinks().len;
     while (i > 0) {
         i -= 1;
-        const link = self.armed_links.items[i];
+        const link = self.registry.native_physical.armedLinks()[i];
         if (link.kind != .region_bridge) continue;
         const keep = blk: {
             const rid = link.region_id orelse {
@@ -1797,24 +1476,15 @@ pub fn disarmStaleRegionBridgeLinks(self: *TraceState, live_armable: []const Reg
 /// mid-iteration over the cache through this trace (see the dispatch loop,
 /// which defers eviction until after its same-anchor walk completes).
 pub fn removeTrace(self: *TraceState, t: *Trace) void {
-    for (self.cache.items, 0..) |c, idx| {
+    for (self.registry.cache.items) |c| {
         if (c == t) {
-            const anchor = t.anchor;
+            const anchor = t.code.anchor;
             // B-2a / §B.6: logical relation deletion is immediate at the
             // retirement source; physical link teardown remains P-E's job.
             self.retireProvenanceEdgesTouching(t.id);
-            // P-E: reset/drop every armed native link touching `t` before its
-            // mcode slot can be freed and reused (see `resetLinksTouching`).
-            self.resetLinksTouching(t);
-            _ = self.cache.swapRemove(idx);
-            bumpGen(&self.cache_gen); // invalidate Trace.anchor_pop_* memos
-            // Doc 20 §R7-2: mark the entry patch BEFORE destroy — after it,
-            // `EntryPatch.trace` dangles and only `trace_id` (now resolving
-            // to null) remains valid. Allocation-free, drained at the next
-            // safe point.
-            if (t.entry_slot) |slot| self.markEntryPatchPending(slot);
-            if (t.id < self.trace_by_id.items.len) self.trace_by_id.items[t.id] = null;
-            t.destroy(self.gpa);
+            self.registry.native_physical.debug_log = self.config.debug_log;
+            _ = self.registry.retire(t);
+            self.syncNativeInvalidation();
             // Reopen the anchor for re-recording. `onBackEdge` only arms when
             // its hot-counter *crosses* `hotloop` (a one-shot `==`), so an
             // anchor whose counter is already past that point would never
@@ -1860,32 +1530,22 @@ pub fn removeTrace(self: *TraceState, t: *Trace) void {
 /// epoch boundary — otherwise a record mode carries a static literal alive into
 /// the next epoch while `.off` sweeps it, diverging the re-interned id.
 ///
-/// Precondition: `disarmAllLinks` has already reset every armed parent slot and
-/// emptied `armed_links`, so no inbound native link touches any cached trace and
-/// no per-trace `resetLinksTouching` is needed here.
+/// Physical epoch safety is owned by `TraceRegistry.clear`: it demotes and
+/// disarms before freeing records even when the caller has not pre-disarmed.
 // ---- doc 20: copy-on-patch code images + entry-patch registry ----------
 
 /// The code array the dispatch fetch must execute for `proto`: its
 /// VM-local patched image when one exists, else canonical. The empty-map
 /// early-out makes an unpatched program's cost one counter load per call.
 pub fn codeFor(self: *const TraceState, proto: *const Proto) []const Instr {
-    if (self.code_images.count() == 0) return proto.code;
-    return self.code_images.get(proto) orelse proto.code;
+    return self.registry.entry_registry.codeFor(proto);
 }
 
 /// Get-or-clone the VM-local image for `proto` (§R1 copy-on-patch). The
 /// clone bumps `image_gen` so live frames re-resolve at their next
 /// back-edge (§R2-1). Install path only — never called per entry.
 pub fn ensureImage(self: *TraceState, proto: *const Proto) ![]Instr {
-    const gop = try self.code_images.getOrPut(self.gpa, proto);
-    if (!gop.found_existing) {
-        gop.value_ptr.* = self.gpa.dupe(Instr, proto.code) catch |e| {
-            self.code_images.removeByPtr(gop.key_ptr);
-            return e;
-        };
-        self.image_gen +%= 1;
-    }
-    return gop.value_ptr.*;
+    return self.registry.entry_registry.ensureImage(proto);
 }
 
 /// The image opcode corresponding to a canonical loop-closing instruction.
@@ -1896,11 +1556,7 @@ pub fn ensureImage(self: *TraceState, proto: *const Proto) ![]Instr {
 /// `patch.orig` and enters only on a taken back-edge. Other jump variants
 /// are not loop closers emitted by the compiler.
 pub fn patchedEntryOp(op: OpCode) ?OpCode {
-    return switch (op) {
-        .for_loop => .jfor_loop,
-        .jmp, .jmp_if_false, .tfor_loop => .jloop,
-        else => null,
-    };
+    return trace_mod.trace_entry_registry.EntryRegistry.patchedEntryOp(op);
 }
 
 /// §R3-1 patch-pc resolution, fail closed: the unique supported loop-closing
@@ -1910,29 +1566,14 @@ pub fn patchedEntryOp(op: OpCode) ?OpCode {
 /// `repeat` (`.jmp_if_false`). Zero or multiple matches → null (ambiguity is a
 /// property of immutable bytecode; the caller routes `.suppressed_permanent`).
 pub fn resolvePatchPc(proto: *const Proto, anchor_pc: u32) ?u32 {
-    var found: ?u32 = null;
-    for (proto.code, 0..) |ins, i| {
-        if (patchedEntryOp(ins.op) == null) continue;
-        const target: i64 = @as(i64, @intCast(i + 1)) + ins.aux;
-        if (target == anchor_pc and target <= @as(i64, @intCast(i))) {
-            if (found != null) return null; // ambiguous → fail closed
-            found = @intCast(i);
-        }
-    }
-    return found;
+    return trace_mod.trace_entry_registry.EntryRegistry.resolvePatchPc(proto, anchor_pc);
 }
 
 /// Why `installEntryPatch` declined — routes the §R4-2 state machine at
 /// the drain (`.no_patch_pc` → `.suppressed_permanent`; `.incumbent` →
 /// `.suppressed_incumbent` recording the blocking slot; `.capacity` →
 /// `.suppressed_capacity`; `.oom` → `.eligible`, transient §R5-2).
-pub const InstallResult = union(enum) {
-    installed,
-    no_patch_pc,
-    incumbent: u16,
-    capacity,
-    oom,
-};
+pub const InstallResult = trace_mod.trace_entry_registry.InstallResult;
 
 /// Install a `.jfor_loop` / `.jloop` patch binding `t` at its anchor (§R2-6
 /// publication order: initialize the slot COMPLETELY, then write the
@@ -1943,51 +1584,13 @@ pub const InstallResult = union(enum) {
 /// optimization, never an error. Production caller: the Phase-1 install
 /// pass of `drainEntryPatchWork`, which owns the state routing.
 pub fn installEntryPatch(self: *TraceState, t: *Trace) InstallResult {
-    std.debug.assert(t.entry_slot == null);
-    const patch_pc = resolvePatchPc(t.anchor.proto, t.anchor.pc) orelse return .no_patch_pc;
-    const img = self.ensureImage(t.anchor.proto) catch return .oom;
-    const orig = t.anchor.proto.code[patch_pc];
-    const patched_op = patchedEntryOp(orig.op) orelse unreachable;
-    if (img[patch_pc].op == .jfor_loop or img[patch_pc].op == .jloop)
-        return .{ .incumbent = img[patch_pc].b }; // live incumbent wins
-    // Acquire a slot: reuse a tombstone, else append (fail closed at the
-    // u16 index ceiling — `.b` must hold the index).
-    const idx: u16 = if (self.entry_patch_free.pop()) |free_idx|
-        free_idx
-    else blk: {
-        // Fail closed when the WOULD-BE index (current len) no longer
-        // fits `.b`'s u16 — index 65535 itself is valid (codex MINOR on
-        // 7fa7e1a: `>=` wasted the last representable slot).
-        if (self.entry_patches.items.len > std.math.maxInt(u16)) return .capacity;
-        const p = self.gpa.create(EntryPatch) catch return .oom;
-        self.entry_patches.append(self.gpa, p) catch {
-            self.gpa.destroy(p);
-            return .oom;
-        };
-        break :blk @intCast(self.entry_patches.items.len - 1);
-    };
-    // EntryPlan structural half (§R1-4/6): the scratch high-water mark
-    // `seedTraceInputs` re-derives per entry, memoized at patch time.
-    var seed_count: u32 = t.anchor.proto.num_registers;
-    for (t.inputs) |seed| seed_count = @max(seed_count, @as(u32, seed.slot) + 1);
-    const p = self.entry_patches.items[idx];
-    p.* = .{
-        .trace = t,
-        .trace_id = t.id,
-        .proto = t.anchor.proto,
-        .patch_pc = patch_pc,
-        .orig = orig,
-        .seed_count = seed_count,
-    };
-    t.entry_slot = idx;
-    // Publication: the opcode write, AFTER the slot is fully initialized.
-    var patched = p.orig;
-    patched.op = patched_op;
-    patched.b = idx;
-    img[patch_pc] = patched;
-    self.image_gen +%= 1; // current frame reloads at its next back-edge
-    self.dbg("entry-patch install: pc={d} patch_pc={d} slot={d} trace={d}", .{ t.anchor.pc, patch_pc, idx, t.id });
-    return .installed;
+    const result = self.registry.entry_registry.installEntryPatch(t);
+    if (result == .installed) {
+        const idx = t.entry_slot.?;
+        const p = self.registry.entry_registry.entry_patches.items[idx];
+        self.dbg("entry-patch install: pc={d} patch_pc={d} slot={d} trace={d}", .{ t.code.anchor.pc, p.patch_pc, idx, t.id });
+    }
+    return result;
 }
 
 /// Mark a slot for unpatch (§R2-4): clears `live` so no arm dereferences
@@ -1995,11 +1598,7 @@ pub fn installEntryPatch(self: *TraceState, t: *Trace) InstallResult {
 /// the safe-point drain. Allocation-free — legal mid-grammar, including
 /// from `removeTrace` immediately before `t.destroy` (§R7-2).
 pub fn markEntryPatchPending(self: *TraceState, idx: u16) void {
-    const p = self.entry_patches.items[idx];
-    if (p.tombstone or p.pending_unpatch) return;
-    p.live = false;
-    p.pending_unpatch = true;
-    self.entry_patch_dirty += 1;
+    self.registry.entry_registry.markEntryPatchPending(idx);
 }
 
 /// Mark every live slot whose bound trace anchors at `anchor` (doc 20
@@ -2008,11 +1607,11 @@ pub fn markEntryPatchPending(self: *TraceState, idx: u16) void {
 /// already marked by the `removeTrace` hook. Linear over the registry,
 /// which stays tiny (one live slot per patched loop); allocation-free.
 pub fn markEntryPatchesAt(self: *TraceState, anchor: AnchorKey) void {
-    if (self.entry_patches.items.len == 0) return;
-    for (self.entry_patches.items, 0..) |p, i| {
+    if (self.registry.entry_registry.entry_patches.items.len == 0) return;
+    for (self.registry.entry_registry.entry_patches.items, 0..) |p, i| {
         if (p.tombstone or p.pending_unpatch) continue;
         const t = self.traceById(p.trace_id) orelse continue;
-        if (t.anchor.proto == anchor.proto and t.anchor.pc == anchor.pc)
+        if (t.code.anchor.proto == anchor.proto and t.code.anchor.pc == anchor.pc)
             self.markEntryPatchPending(@intCast(i));
     }
 }
@@ -2026,9 +1625,9 @@ pub fn markEntryPatchesAt(self: *TraceState, anchor: AnchorKey) void {
 /// ascending trace-id order (§R3-1 rule 3 deterministic sibling ties).
 /// Early-outs on the dirty counter, so a quiet turn costs one load.
 pub fn drainEntryPatchWork(self: *TraceState) void {
-    if (self.entry_patch_dirty == 0) return;
-    self.entry_patch_dirty = 0;
-    for (self.entry_patches.items, 0..) |p, i| {
+    if (self.registry.entry_registry.entry_patch_dirty == 0) return;
+    self.registry.entry_registry.entry_patch_dirty = 0;
+    for (self.registry.entry_registry.entry_patches.items, 0..) |p, i| {
         if (p.tombstone or !p.pending_unpatch) continue;
         self.unpatchSlot(@intCast(i));
     }
@@ -2037,7 +1636,7 @@ pub fn drainEntryPatchWork(self: *TraceState) void {
     // selection keeps sibling ties deterministic without allocating.
     while (true) {
         var best: ?*Trace = null;
-        for (self.cache.items) |t| {
+        for (self.registry.cache.items) |t| {
             if (t.entry_patch != .pending) continue;
             if (best == null or t.id < best.?.id) best = t;
         }
@@ -2062,11 +1661,11 @@ pub fn installPending(self: *TraceState, t: *Trace) void {
     // A `.link`-closed continuation is never trial-entered through the
     // anchor walk (interp.zig's walk skips them); a patched entry must
     // not become the back door. Permanent — the close op never changes.
-    if (t.instrs.len != 0 and t.instrs[t.instrs.len - 1].op == .link) {
+    if (t.code.instrs.len != 0 and t.code.instrs[t.code.instrs.len - 1].op == .link) {
         t.entry_patch = .suppressed_permanent;
         return;
     }
-    if (self.isGated(t.anchor)) {
+    if (self.isGated(t.code.anchor)) {
         // Transient (§R5-2): cooldown may lift; a condemned trace is
         // never repatched past `isGated` (§T14). Re-qualifies at the next
         // productive receipt after the gate clears.
@@ -2095,68 +1694,23 @@ pub fn installPending(self: *TraceState, t: *Trace) void {
 /// any receipt grammar and is the sole slot-pointer holder — synchronous
 /// unpatch is safe there.
 pub fn unpatchSlot(self: *TraceState, idx: u16) void {
-    const p = self.entry_patches.items[idx];
-    if (self.code_images.get(p.proto)) |img| {
-        std.debug.assert(img[p.patch_pc].op == patchedEntryOp(p.orig.op).? and img[p.patch_pc].b == idx);
-        std.debug.assert(std.meta.eql(p.orig, p.proto.code[p.patch_pc]));
-        img[p.patch_pc] = p.orig;
-    }
-    if (self.traceById(p.trace_id)) |t| {
-        t.entry_slot = null;
-        // §R4-2 `.bound → .eligible`: the trace survives its unpatch; a
-        // later productive receipt may re-qualify (the gate cooldown is
-        // the thrash brake against ping-pong).
-        if (t.entry_patch == .bound) t.entry_patch = .eligible;
-    }
-    p.live = false;
-    p.pending_unpatch = false;
-    p.tombstone = true;
-    // §R4-2 wakes, deterministic at this tombstone: `.suppressed_capacity`
-    // is a capacity wait — ANY tombstone restores capacity; a
-    // `.suppressed_incumbent` wakes only when ITS recorded incumbent slot
-    // dies (this one). Wake = back to `.eligible`; the next productive
-    // receipt re-qualifies (no install this turn — the wake is not a
-    // `.pending` mark).
-    for (self.cache.items) |wt| {
-        switch (wt.entry_patch) {
-            .suppressed_capacity => wt.entry_patch = .eligible,
-            .suppressed_incumbent => if (wt.entry_patch_incumbent == idx) {
-                wt.entry_patch = .eligible;
-            },
-            else => {},
-        }
-    }
+    self.registry.entry_registry.unpatchSlot(idx, self.registry.cache.items);
+    const p = self.registry.entry_registry.entry_patches.items[idx];
     self.dbg("entry-patch unpatch: patch_pc={d} slot={d} trace={d}", .{ p.patch_pc, idx, p.trace_id });
-    // OOM here loses the index for reuse (stays tombstoned forever) —
-    // safe: fail-closed capacity, reclaimed at the epoch drain anyway.
-    self.entry_patch_free.append(self.gpa, idx) catch {};
 }
 
 /// Epoch/deinit teardown (§R2-2: the ONLY points images are freed).
 /// Restores nothing — the images are dropped whole, and canonical
 /// `Proto.code` was never touched.
 pub fn dropEntryPatchState(self: *TraceState) void {
-    var it = self.code_images.valueIterator();
-    while (it.next()) |img| self.gpa.free(img.*);
-    self.code_images.clearRetainingCapacity();
-    for (self.entry_patches.items) |p| self.gpa.destroy(p);
-    self.entry_patches.clearRetainingCapacity();
-    self.entry_patch_free.clearRetainingCapacity();
-    self.entry_patch_dirty = 0;
-    self.image_gen +%= 1; // any live frame re-resolves to canonical
+    self.registry.entry_registry.dropEntryPatchState();
 }
 
 pub fn clearCache(self: *TraceState) void {
-    // Doc 20 §R2-2: drop images + registry BEFORE destroying traces so no
-    // slot outlives the epoch (traces are resolved by id, but the order
-    // keeps the invariant trivially visible).
-    self.dropEntryPatchState();
-    self.demoteAllSets();
     self.clearProvenanceEdges();
-    for (self.cache.items) |t| t.destroy(self.gpa);
-    self.cache.clearRetainingCapacity();
-    bumpGen(&self.cache_gen); // invalidate Trace.anchor_pop_* memos
-    @memset(self.trace_by_id.items, null); // every indexed trace was just destroyed
+    self.registry.native_physical.debug_log = self.config.debug_log;
+    self.registry.clear();
+    self.syncNativeInvalidation();
 
     // Anchor-keyed tiering state: reset so the next epoch re-warms cleanly and no
     // stale entry references a freed trace or blocks re-recording. (Mirrors the
@@ -2200,30 +1754,13 @@ pub fn clearCache(self: *TraceState) void {
 
     // A-ii.2: the structural-edge cache is keyed by `Trace.id` and references a
     // now-freed cache — drop it wholesale (rebuilt as fresh traces commit).
-    self.edge_cache.clearRetainingCapacity();
+    self.region_policy.clearEdges();
 
-    // A-ii.4: the region model. This is the ONE place the Proto/VM-lifetime logical
-    // maps (region_defs/region_intern) are cleared — the epoch boundary where protos
-    // (borrowed by RegionDef.owner) may be freed. The physical indices go with them.
-    var rd_it = self.region_defs.valueIterator();
-    while (rd_it.next()) |d| {
-        self.gpa.free(d.members);
-        self.gpa.free(d.member_points);
-        freeRegionBridges(self.gpa, d.bridges);
-    }
-    self.region_defs.clearRetainingCapacity();
-    // Uphold the "every region_defs mutation bumps the gen" contract at the
-    // epoch boundary too (codex review of f613c98). Not currently load-
-    // bearing — every gen-stamped memo lives on traces/links that were just
-    // destroyed/disarmed above — but a future consumer must not find the
-    // invariant silently false here.
+    // Physical demotion precedes the policy-owned epoch mutation.
     self.demoteSetsForRegionDefsMutation();
-    bumpGen(&self.region_defs_gen);
-    self.region_intern.clear(self.gpa);
-    self.clearPhysicalRegionIndices();
+    self.region_policy.clearEpochTopology(self.gpa);
     self.resetRegionProfit();
-    self.region_profit_flushes = 0;
-    self.region_profit_flushed_work = 0;
+    self.region_policy.resetDiagnostics();
 }
 
 /// Part B-2a / §B.6: fresh-epoch teardown drops every logical provenance
@@ -2255,7 +1792,7 @@ pub fn condemnProvenanceEdgesAt(self: *TraceState, anchor: AnchorKey) void {
         i -= 1;
         const edge = self.provenance_edges.items[i];
         const parent = self.traceById(edge.parent_id) orelse continue;
-        if (parent.anchor.proto == anchor.proto and parent.anchor.pc == anchor.pc)
+        if (parent.code.anchor.proto == anchor.proto and parent.code.anchor.pc == anchor.pc)
             _ = self.provenance_edges.swapRemove(i);
     }
 }
@@ -2286,27 +1823,27 @@ pub fn nativeFor(self: *TraceState, t: *Trace) ?*const nativegen.CompiledTrace {
         .compiled => return &t.native.compiled,
         .unsupported => return null,
         .unattempted => {
-            if (nativegen.compileInto(self.gpa, &self.mcode_arena, t, self.native_seed_ctx, self.exec_heap)) |ct| {
+            if (nativegen.compileInto(self.gpa, &self.registry.mcode_arena, &t.code, t.id, self.registry.native_seed_ctx, self.exec_heap)) |ct| {
                 t.native = .{ .compiled = ct };
                 return &t.native.compiled;
             }
             if (comptime jitdbg.enabled) if (self.config.debug_log) {
                 diag: {
-                    const kinds = self.gpa.alloc(nativegen.Kind, t.instrs.len) catch break :diag;
+                    const kinds = self.gpa.alloc(nativegen.Kind, t.code.instrs.len) catch break :diag;
                     defer self.gpa.free(kinds);
-                    const slots = self.gpa.alloc(i32, t.instrs.len) catch break :diag;
+                    const slots = self.gpa.alloc(i32, t.code.instrs.len) catch break :diag;
                     defer self.gpa.free(slots);
-                    const proved = nativegen.proveKinds(self.gpa, t, kinds, slots);
+                    const proved = nativegen.proveKinds(self.gpa, &t.code, kinds, slots);
                     if (proved) {
-                        if (nativegen.analyze(self.gpa, t, kinds, slots)) |alloc_value| {
+                        if (nativegen.analyze(self.gpa, &t.code, kinds, slots)) |alloc_value| {
                             var alloc = alloc_value;
                             defer alloc.deinit(self.gpa);
-                            self.dbg("native unsupported after analyze: trace={d} anchor={d} spill_count={d}", .{ t.id, t.anchor.pc, alloc.spill_count });
+                            self.dbg("native unsupported after analyze: trace={d} anchor={d} spill_count={d}", .{ t.id, t.code.anchor.pc, alloc.spill_count });
                         } else {
-                            self.dbg("native unsupported in analyze: trace={d} anchor={d}", .{ t.id, t.anchor.pc });
+                            self.dbg("native unsupported in analyze: trace={d} anchor={d}", .{ t.id, t.code.anchor.pc });
                         }
                     } else {
-                        self.dbg("native unsupported in proveKinds: trace={d} anchor={d}", .{ t.id, t.anchor.pc });
+                        self.dbg("native unsupported in proveKinds: trace={d} anchor={d}", .{ t.id, t.code.anchor.pc });
                     }
                 }
             };

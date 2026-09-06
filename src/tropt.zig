@@ -25,7 +25,7 @@
 //!   3. the executor has **no type-specialized semantics** — every op
 //!      re-dispatches on the actual type via `arith.zig`, so dropping a redundant
 //!      *type* guard cannot corrupt a fast path (there are none);
-//!   4. the shared evaluator (`irinterp.evalBinary`/`evalUnary`) is **total**
+//!   4. the shared evaluator (`ir_eval.evalBinary`/`evalUnary`) is **total**
 //!      (never traps: `arith.zig` wraps integer ops and masks shift counts) and
 //!      **reports every runtime error**, so a fold either matches runtime
 //!      bit-for-bit or is refused;
@@ -38,10 +38,10 @@
 //! so it side-exits and tier-0 raises the identical error — never deleted.
 
 const std = @import("std");
-const trace = @import("trace.zig");
+const trace = @import("trace_ir.zig");
 const value = @import("value.zig");
 const RegWindow = @import("regwindow.zig").RegWindow;
-const irinterp = @import("irinterp.zig");
+const ir_eval = @import("ir_eval.zig");
 const arr = @import("array.zig");
 
 const Value = value.Value;
@@ -357,7 +357,7 @@ pub fn optimize(
                 const a2 = canon[ins.a];
                 const b2 = canon[ins.b];
                 if (const_val[a2]) |va| if (const_val[b2]) |vb| {
-                    if (irinterp.evalBinary(ins.op, va, vb)) |res| {
+                    if (ir_eval.evalBinary(ins.op, va, vb)) |res| {
                         const aux: i32 = @intCast(out_consts.items.len);
                         try out_consts.append(gpa, res);
                         fold_aux[i] = aux;
@@ -378,7 +378,7 @@ pub fn optimize(
                 // `evalUnary` is `unreachable` for it — it never folds a constant.)
                 if (ins.op != .fsqrt and ins.op != .fsin and ins.op != .fcos and ins.op != .ffloor and ins.op != .fceil and ins.op != .slen) {
                     if (const_val[a2]) |va| {
-                        if (irinterp.evalUnary(ins.op, va)) |res| {
+                        if (ir_eval.evalUnary(ins.op, va)) |res| {
                             const aux: i32 = @intCast(out_consts.items.len);
                             try out_consts.append(gpa, res);
                             fold_aux[i] = aux;
@@ -1109,21 +1109,21 @@ test "tropt: folding poison constants matches the shared evaluator and never tra
     // Shift count |n| >= 64 masks to 0 in arith.zig — not UB, not a trap.
     {
         const got = try foldBinaryConst(gpa, .shl, Value.int(1), Value.int(100));
-        const want = try irinterp.evalBinary(.shl, Value.int(1), Value.int(100));
+        const want = try ir_eval.evalBinary(.shl, Value.int(1), Value.int(100));
         try testing.expect(got.eql(want));
     }
     // NaN == NaN: folds to whatever arith.eq decides, bit-identical to runtime.
     {
         const nan = Value.float(std.math.nan(f64));
         const got = try foldBinaryConst(gpa, .eq, nan, nan);
-        const want = try irinterp.evalBinary(.eq, nan, nan);
+        const want = try ir_eval.evalBinary(.eq, nan, nan);
         try testing.expect(got.eql(want));
     }
     // INT64_MIN // -1 wraps (no SIGFPE); the fold must match the evaluator.
     {
         const lo = Value.int(std.math.minInt(i64));
         const got = try foldBinaryConst(gpa, .idiv, lo, Value.int(-1));
-        const want = try irinterp.evalBinary(.idiv, lo, Value.int(-1));
+        const want = try ir_eval.evalBinary(.idiv, lo, Value.int(-1));
         try testing.expect(got.eql(want));
     }
 }
@@ -1187,6 +1187,8 @@ test "tropt E1: a loop-invariant subexpression is hoisted before a preheader mar
 }
 
 test "tropt E1: hoisting preserves behaviour (optimized ≡ unoptimized over a bounded loop)" {
+    const trace_runtime = @import("trace.zig");
+    const irinterp = @import("irinterp.zig");
     const gpa = testing.allocator;
     var t = licmInvariantMulTrace();
     var opt = try optimize(gpa, &t.instrs, &t.consts);
@@ -1196,15 +1198,31 @@ test "tropt E1: hoisting preserves behaviour (optimized ≡ unoptimized over a b
     // Each clean iteration: acc += 12, cnt -= 1; the 6th reads cnt==0 → DivByZero
     // side-exit. Expect 5 commits, acc=60, cnt=0 in BOTH the unoptimized and the
     // LICM-optimized run — a divergence would mean the hoist changed a value.
-    const unopt = trace.Trace{ .anchor = undefined, .instrs = &t.instrs, .consts = &t.consts, .entry_slots = &.{}, .entry_guards = &.{} };
-    const opted = trace.Trace{ .anchor = undefined, .instrs = opt.instrs, .consts = opt.consts, .entry_slots = opt.entry_slots, .entry_guards = &.{} };
+    const unopt = trace_runtime.Trace{
+        .code = .{
+            .anchor = undefined,
+            .instrs = &t.instrs,
+            .consts = &t.consts,
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+    };
+    const opted = trace_runtime.Trace{
+        .code = .{
+            .anchor = undefined,
+            .instrs = opt.instrs,
+            .consts = opt.consts,
+            .entry_slots = opt.entry_slots,
+            .entry_guards = &.{},
+        },
+    };
 
     var regs_u = [5]Value{ Value.int(3), Value.int(4), Value.int(0), Value.int(5), Value.int(0) };
     var regs_o = regs_u;
     var vals_u: [16]Value = undefined;
     var vals_o: [16]Value = undefined;
-    const done_u = irinterp.executeValues(&unopt, &regs_u, &vals_u).completed;
-    const done_o = irinterp.executeValues(&opted, &regs_o, &vals_o).completed;
+    const done_u = irinterp.executeValues(&unopt.code, &regs_u, &vals_u).completed;
+    const done_o = irinterp.executeValues(&opted.code, &regs_o, &vals_o).completed;
 
     try testing.expectEqual(@as(usize, 5), done_u);
     try testing.expectEqual(done_u, done_o);

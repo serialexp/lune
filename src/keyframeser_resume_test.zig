@@ -90,7 +90,7 @@ fn expectResume(gpa: std.mem.Allocator, source: [:0]const u8, ctl: SuspendCtl, r
     // A-iv: seed transient profit state immediately at the suspended cut. It must
     // not gain a wire field, affect schema v5 bytes, or survive restore.
     const live_activation = vm.frames[vm.depth - 1].call_seq;
-    try vm.trace.region_profit.put(gpa, .{
+    try vm.trace.region_policy.region_profit.put(gpa, .{
         .region_id = @as(trace.RegionId, @enumFromInt(901)),
         .activation = live_activation,
     }, .{
@@ -392,7 +392,7 @@ test "§R3: capture→restore→resume with tracing+opt+native — restored narr
     try testing.expectEqualStrings(ref.full_out, combined[0 .. out_before.len + sink_r.buffered().len]);
 
     // (c) traces recorded AND dispatched after restore.
-    try testing.expect(vm_r.trace.cache.items.len > 0);
+    try testing.expect(vm_r.trace.registry.cache.items.len > 0);
     try testing.expect(vm_r.trace.entries > 0);
     if (native) try testing.expect(vm_r.trace.native_entries > 0);
 

@@ -13,7 +13,7 @@ const table = @import("table.zig");
 const arr = @import("array.zig");
 const Value = value.Value;
 const RegWindow = @import("regwindow.zig").RegWindow;
-const Trace = trace.Trace;
+const Trace = @import("trace_code.zig").TraceCode;
 const Reg = x64.Reg;
 const object = @import("object.zig");
 const function = @import("function.zig");
@@ -89,7 +89,7 @@ test "nativegen: bool-lane t[k]=false write matches the interpreter (heap + regs
     const t_n = try buildBoolTable(gpa, K);
     defer t_n.destroy(gpa);
     var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
-    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     const ncomp = try runNative(ct, &nregs);
 
@@ -122,7 +122,7 @@ test "nativegen: astore deopt-replay leaves a deterministic heap (idempotent re-
     const t_replay = try buildBoolTable(gpa, K);
     defer t_replay.destroy(gpa);
     var r_native = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
-    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     _ = try runNative(ct, &r_native);
     var r_replay = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
@@ -219,7 +219,7 @@ test "nativegen: int-lane t[k]=C write matches the interpreter (i8/i16/i32/i64)"
         const t_n = try buildIntTable(gpa, K, cfg.bump);
         defer t_n.destroy(gpa);
         var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
-        var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+        var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
         defer ct.deinit();
         const ncomp = try runNative(ct, &nregs);
 
@@ -289,7 +289,7 @@ test "nativegen: const int-lane t[k]=C write compiles WITHOUT a guard_fits (trop
         defer t_n.destroy(gpa);
         var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
         // The whole point: compile() must NOT bail just because guard_fits is absent.
-        var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+        var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
         defer ct.deinit();
         const ncomp = try runNative(ct, &nregs);
 
@@ -358,7 +358,7 @@ test "nativegen: int-lane astore guard_fits side-exits when the value overflows 
     const t_n = try makeT(gpa, K);
     defer t_n.destroy(gpa);
     var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(start) };
-    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     const ncomp = try runNative(ct, &nregs);
 
@@ -440,7 +440,7 @@ test "nativegen: u8-lane t[k]=C write matches the interpreter (in-range byte)" {
     const t_n = try buildByteTable(gpa, K);
     defer t_n.destroy(gpa);
     var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
-    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     const ncomp = try runNative(ct, &nregs);
 
@@ -476,7 +476,7 @@ test "nativegen: u8-lane astore guard_fits side-exits at the [0,255] boundaries 
         const t_n = try buildByteTable(gpa, K);
         defer t_n.destroy(gpa);
         var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
-        var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+        var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
         defer ct.deinit();
         const ncomp = try runNative(ct, &nregs);
 
@@ -504,7 +504,7 @@ test "nativegen: int-lane astore deopt-replay leaves a deterministic heap (idemp
     defer t_replay.destroy(gpa);
     try testing.expectEqual(arr.Lane.i32, t_replay.array.lane);
     var r_native = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
-    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     _ = try runNative(ct, &r_native);
     var r_replay = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
@@ -587,7 +587,7 @@ test "nativegen(doc 32): .value-lane int astore fill matches the interpreter" {
     const t_native = try buildValueTable(gpa, anchor, K, seedInt);
     defer t_native.destroy(gpa);
     var r_native = [_]Value{ Value.heap(&t_native.header), Value.int(2) };
-    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     _ = try runNative(ct, &r_native);
 
@@ -642,7 +642,7 @@ test "nativegen(doc 32): .value-lane float astore fill matches the interpreter" 
     const t_native = try buildValueTable(gpa, anchor, K, seedInt);
     defer t_native.destroy(gpa);
     var r_native = [_]Value{ Value.heap(&t_native.header), Value.int(2) };
-    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     _ = try runNative(ct, &r_native);
 
@@ -691,7 +691,7 @@ test "nativegen(doc 32): .value-lane astore deopt-replay leaves a deterministic 
     const t_replay = try buildValueTable(gpa, anchor, K, seedFloat);
     defer t_replay.destroy(gpa);
     var r_native = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
-    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     _ = try runNative(ct, &r_native);
     var r_replay = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };

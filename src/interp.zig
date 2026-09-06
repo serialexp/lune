@@ -837,14 +837,6 @@ pub const Vm = struct {
         errdefer gpa.free(payloads);
         const boundary_scratch = try gpa.alloc(Value, stack_slots);
         errdefer gpa.free(boundary_scratch);
-        // Doc 22 §B.1: the native seeding ctx. Heap-allocated so compiled pages
-        // can bake its address as an imm64 (`Vm` is by-value and may move; this
-        // may not). Created here rather than in `TraceState.init` to keep that
-        // init infallible for its ~120 hand-built test call sites; ownership
-        // (the free) lives in `TraceState.deinit`.
-        const seed_ctx = try gpa.create(trace.NativeSeedCtx);
-        errdefer gpa.destroy(seed_ctx);
-        seed_ctx.* = .{ .seed_fn = &nativeSeedFn, .seed_tier1a_fn = &nativeSeedTier1aFn };
         // Stable-address heap (see the `heap` field doc): native pages bake
         // pointers to its collection counters, so it cannot live inside the
         // movable `Vm` by value.
@@ -860,7 +852,8 @@ pub const Vm = struct {
             .boundary_scratch = boundary_scratch,
             .trace = trace.TraceState.init(gpa),
         };
-        vm.trace.native_seed_ctx = seed_ctx;
+        // Registry allocates a stable context; no pointer into movable Vm storage.
+        try vm.trace.registry.createSeedContext(.{ .seed_fn = &nativeSeedFn, .seed_tier1a_fn = &nativeSeedTier1aFn });
         // Doc 24 D5: the stable mutable heap channel for allocating traces
         // (tier-1a `.alloc` arms + tier-1b baked callouts). Safe to store once
         // because `heap` is a stable gpa allocation, unlike `&vm.heap`-style
@@ -956,7 +949,7 @@ pub const Vm = struct {
     /// byte-identical (zero-iteration exit → tier-0 re-runs). `upvalue`/`global`
     /// seeds never touch it (their staleness is caught by an ordinary guard on the
     /// trace, not at seed time).
-    fn seedTraceInputs(self: *Vm, ct: *const trace.Trace, base: usize, closure: *const function.Closure, proto: *const Proto, narrow: RegWindow, native_eligible: *bool) ?RegWindow {
+    fn seedTraceInputs(self: *Vm, ct: *const trace.TraceCode, base: usize, closure: *const function.Closure, proto: *const Proto, narrow: RegWindow, native_eligible: *bool) ?RegWindow {
         if (ct.inputs.len == 0) return narrow;
         var count: usize = proto.num_registers;
         for (ct.inputs) |seed| count = @max(count, @as(usize, seed.slot) + 1);
@@ -1027,7 +1020,7 @@ pub const Vm = struct {
     ///   before any φ is live. See the `BodyCallout` header.
     fn nativeSeedFn(
         ctx: *const trace.NativeSeedCtx,
-        ct: *const trace.Trace,
+        ct: *const trace.TraceCode,
         plan_bits: u64,
     ) callconv(.c) u64 {
         // The plan arrives by value (see `NativeSeedCtx.seed_fn`): reconstruct the
@@ -1099,7 +1092,7 @@ pub const Vm = struct {
     /// caller's window, whose lane pointers view the same slab — the synthetic
     /// slots sit in dead scratch above the frame that the capacity check just
     /// bounded, and `RegWindow` accessors are unbounded pointer offsets.
-    fn nativeSeedTier1aFn(ctx: *const trace.NativeSeedCtx, ct: *const trace.Trace) u64 {
+    fn nativeSeedTier1aFn(ctx: *const trace.NativeSeedCtx, ct: *const trace.TraceCode) u64 {
         const self: *Vm = @ptrCast(@alignCast(ctx.vm));
         const closure: *const function.Closure = @ptrCast(@alignCast(ctx.closure));
         const proto: *const Proto = @ptrCast(@alignCast(ctx.proto.?));
@@ -1118,7 +1111,7 @@ pub const Vm = struct {
     /// `call_seq` are the freshness stamp consumers check (`stubEnterable`,
     /// B-iv). No-op when the ctx is absent (hand-built test TraceStates).
     fn prepareNativeEpisode(self: *Vm, closure: *const function.Closure, proto: *const Proto, base: usize) void {
-        const ctx = self.trace.native_seed_ctx orelse return;
+        const ctx = self.trace.registry.native_seed_ctx orelse return;
         ctx.vm = self;
         ctx.closure = closure;
         ctx.base = base;
@@ -1954,8 +1947,8 @@ pub const Vm = struct {
         // Trace consts are GC-liveness roots ONLY — never snapshot semantic roots
         // (doc 17 H-2/G-2). See the item-5 note above.
         if (kind == .gc) {
-            for (self.trace.cache.items) |t| {
-                for (t.consts) |v| if (v.isHeap()) cb(ctx, v.asHeap());
+            for (self.trace.registry.cache.items) |t| {
+                for (t.code.consts) |v| if (v.isHeap()) cb(ctx, v.asHeap());
             }
             if (self.trace.isRecording()) {
                 for (self.trace.rec.consts.items) |v| if (v.isHeap()) cb(ctx, v.asHeap());
@@ -2264,7 +2257,7 @@ pub const Vm = struct {
         // it MUST hold at every entry. (Patched native→native transfers have
         // no vm in reach; a pin that holds when their link is armed holds
         // forever after, so entry + arm coverage is complete.) Free in release.
-        if (ct.requires_unicode_pin) std.debug.assert(self.unicode_version_pinned);
+        if (ct.code.requires_unicode_pin) std.debug.assert(self.unicode_version_pinned);
         // Doc 22 §B.2: resolve the native page BEFORE any VM-side seeding, so the
         // two seeding paths never both run (the dedup half of B-ii). A page whose
         // seed plan is non-empty seeds ITSELF in its entry prologue (via the
@@ -2297,7 +2290,7 @@ pub const Vm = struct {
         var trace_regs = if (native_page != null)
             regs
         else
-            self.seedTraceInputs(ct, base, closure, proto, regs, &native_eligible) orelse return .next_candidate;
+            self.seedTraceInputs(&ct.code, base, closure, proto, regs, &native_eligible) orelse return .next_candidate;
         // The entering trace's executor frame — pushed ONLY when the tier-1a
         // executor can actually run, i.e. no native page resolved
         // (`native_page == null` also covers exec-log, which forces the page
@@ -2323,7 +2316,7 @@ pub const Vm = struct {
         var buf_live = false;
         if (native_page == null) {
             values_mark = self.trace.valuesMark();
-            buf = self.trace.valuesPush(ct.instrs.len) catch
+            buf = self.trace.valuesPush(ct.code.instrs.len) catch
                 return .next_candidate; // OOM: skip this trace, try next
             buf_live = true;
         }
@@ -2382,9 +2375,9 @@ pub const Vm = struct {
             // hit-count guess made at receipt time.
             self.trace.tryArmSiblingHandoff(ct, safe_to_arm);
             var result = if (self.trace.config.record_exec_log) blk: {
-                const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.executeCtx(.{ .heap = self.heap }, ct, trace_regs, buf);
-                const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.executeCtx(.{ .heap = self.heap }, ct, trace_regs, buf);
-                break :blk irinterp.executeTracedCtx(.{ .heap = self.heap }, rec, ct, trace_regs, buf);
+                const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.executeCtx(.{ .heap = self.heap }, &ct.code, trace_regs, buf);
+                const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.executeCtx(.{ .heap = self.heap }, &ct.code, trace_regs, buf);
+                break :blk irinterp.executeTracedCtx(.{ .heap = self.heap }, rec, &ct.code, trace_regs, buf);
             } else blk: {
                 // Doc 22 §B.2: `native_page` was resolved above (before VM-side
                 // seeding); non-null implies native_codegen && !record_exec_log.
@@ -2408,7 +2401,7 @@ pub const Vm = struct {
                     else
                         nt.runCapturingLedger(trace_regs, &self.trace.ledger_scratch, self.trace.silentStaging());
                 }
-                break :blk irinterp.executeCtx(.{ .heap = self.heap }, ct, trace_regs, buf);
+                break :blk irinterp.executeCtx(.{ .heap = self.heap }, &ct.code, trace_regs, buf);
             };
             if (ran_native) {
                 if (self.trace.driveDispatcherSilentResult(ct, result, proto, regs, safe_to_arm)) |chain| {
@@ -2440,7 +2433,7 @@ pub const Vm = struct {
                 // The native twin of `seedTraceInputs` returning null (the seed
                 // slots don't fit the register slab): the candidate itself is
                 // unusable at this depth — same directive as the VM-side wall.
-                self.trace.dbg("seed-capacity-decline: trace={d} anchor={d}", .{ ct.id, ct.anchor.pc });
+                self.trace.dbg("seed-capacity-decline: trace={d} anchor={d}", .{ ct.id, ct.code.anchor.pc });
                 self.trace.seed_capacity_declines +|= 1;
                 return .next_candidate;
             }
@@ -2456,9 +2449,9 @@ pub const Vm = struct {
                 // feeds the FULL ordinary consumer grammar below with
                 // `ran_native = false` — byte-identical to the old route (the
                 // oracle side-exits at the same `guard_table`/`guard_hash`).
-                self.trace.dbg("seed-hash-decline: trace={d} anchor={d} -> tier-1a rerun", .{ ct.id, ct.anchor.pc });
+                self.trace.dbg("seed-hash-decline: trace={d} anchor={d} -> tier-1a rerun", .{ ct.id, ct.code.anchor.pc });
                 self.trace.seed_hash_declines +|= 1;
-                trace_regs = self.seedTraceInputs(ct, base, closure, proto, regs, &native_eligible) orelse return .next_candidate;
+                trace_regs = self.seedTraceInputs(&ct.code, base, closure, proto, regs, &native_eligible) orelse return .next_candidate;
                 // The downgrade is the one native road back onto the tier-1a
                 // executor, and native entries skip the entry push above — so
                 // take the frame here. The mark is fresh, not the entry's:
@@ -2467,10 +2460,10 @@ pub const Vm = struct {
                 // machinery pushed above was released before we got here, so
                 // the stack is back at its entry state).
                 values_mark = self.trace.valuesMark();
-                buf = self.trace.valuesPush(ct.instrs.len) catch
+                buf = self.trace.valuesPush(ct.code.instrs.len) catch
                     return .next_candidate; // OOM: same skip as the entry push
                 buf_live = true;
-                result = irinterp.executeCtx(.{ .heap = self.heap }, ct, trace_regs, buf);
+                result = irinterp.executeCtx(.{ .heap = self.heap }, &ct.code, trace_regs, buf);
                 ran_native = false;
                 ran_native_link_mode = false;
             }
@@ -2583,12 +2576,12 @@ pub const Vm = struct {
             // `flushNumericForLoopDone`), so counting 1 there would
             // charge phantom progress. Bounds-check `exit_instr`
             // BEFORE the guard-shape probe (maxInt = prologue-fail).
-            if (ran_native) self.trace.dbg("receipt: pc={d} link_mode={} local={d} exit={d} ledger_len={d} completed={d}", .{ ct.anchor.pc, ran_native_link_mode, local_done, result.exit_instr, result.ledger_len, result.completed });
+            if (ran_native) self.trace.dbg("receipt: pc={d} link_mode={} local={d} exit={d} ledger_len={d} completed={d}", .{ ct.code.anchor.pc, ran_native_link_mode, local_done, result.exit_instr, result.ledger_len, result.completed });
             const linked_one_trip = ran_native and ran_native_link_mode and
                 local_done == 0 and
                 result.exit_reason == .normal and
                 result.exit_instr != std.math.maxInt(u32) and
-                result.exit_instr < final.instrs.len and
+                result.exit_instr < final.code.instrs.len and
                 trace.isLoopDoneGuardIndex(final, result.exit_instr);
 
             // 2.3c-1 (M1 half-fusion, doc 17): fused top-level
@@ -2605,7 +2598,7 @@ pub const Vm = struct {
             // ramp's INNER-loop PC — NOT the outer header. The plain
             // dispatcher below would misread `local_done == 0` as a
             // skip zero-exit, call `onSideExit(final, 0)`, and drive
-            // `.ordinary_header` off `final.anchor.pc` (the outer
+            // `.ordinary_header` off `final.code.anchor.pc` (the outer
             // header) — a semantic misresume from the wrong coherent
             // PC (doc 17 §Increment 2.3c). Through 2.3c-1 a bespoke
             // scalar recognizer (armed-edge provenance) handled it
@@ -2710,7 +2703,7 @@ pub const Vm = struct {
             // run) as failed entries: pure turnstile cost, penalty churn, and
             // no chain attempt.
             const exit_ok = result.exit_instr != std.math.maxInt(u32) and
-                result.exit_instr < final.instrs.len;
+                result.exit_instr < final.code.instrs.len;
             const numeric_for_done = exit_ok and
                 trace.isLoopDoneGuardIndex(final, result.exit_instr);
             // Doc 40 Phase 0: the zero-trip coherence claim above is peel-aware —
@@ -2724,7 +2717,7 @@ pub const Vm = struct {
             const any_loop_done = numeric_for_done or while_done_exit;
             const count_exit = exit_ok and
                 (!any_loop_done or
-                    (while_done_exit and self.trace.whileDoneHotnessEligible(final.anchor)));
+                    (while_done_exit and self.trace.whileDoneHotnessEligible(final.code.anchor)));
             if (count_exit) {
                 self.trace.noteTakenExit(final, result.exit_instr, local_done, proto);
             }
@@ -2786,18 +2779,18 @@ pub const Vm = struct {
                 // anchor with no deopt-replay and records
                 // `guard_true(p[i]) → inner for_prep → link`. Force
                 // `.full` so the replay-side prologue hook fires; do
-                // NOT advance pc (regs coherent at `ct.anchor`).
+                // NOT advance pc (regs coherent at `ct.code.anchor`).
                 // Self-limiting: `countTracesAt >= 2` (in
                 // `noteTakenExit`'s branch route) stops re-arming
                 // once the prime side-trace exists, and the commit
                 // DONE-latches the parent exit.
                 if (self.trace.wants_prime_side) |want| {
-                    if (want.proto == final.anchor.proto and want.pc == final.anchor.pc and
+                    if (want.proto == final.code.anchor.proto and want.pc == final.code.anchor.pc and
                         !self.trace.isRecording() and
                         self.trace.pending_replay_anchor == null and
-                        !self.trace.isGated(final.anchor))
+                        !self.trace.isGated(final.code.anchor))
                     {
-                        self.trace.pending_replay_anchor = final.anchor;
+                        self.trace.pending_replay_anchor = final.code.anchor;
                         // Hotexit provenance rides into the replay
                         // recording for the commit's DONE latch.
                         self.trace.pending_replay_src = self.trace.prime_want_src;
@@ -2881,7 +2874,7 @@ pub const Vm = struct {
                 // that is intentional. NOT because the entered
                 // traces are input-free — since B-iii/B-iv
                 // (doc 22 §B.3/§B.5) `findLinkTrace` admits
-                // SEEDED continuations, so `t.inputs.len` is
+                // SEEDED continuations, so `t.code.inputs.len` is
                 // routinely nonzero. The reason is that a
                 // trace's `inputs` are non-register state
                 // (upvalues, globals, hash cells) resolved
@@ -2963,7 +2956,7 @@ pub const Vm = struct {
 
             // --- coherent-anchor chaining (doc 16) ---
             // After this zero-exit the registers are coherent at
-            // `ct.anchor`, so chain to a same-anchor sibling the
+            // `ct.code.anchor`, so chain to a same-anchor sibling the
             // cold walk hasn't run (e.g. an outer-header prime
             // side-trace). Seed `initially_excluded` with the
             // walk's `visited` set so we neither re-run the trace
@@ -3064,7 +3057,7 @@ pub const Vm = struct {
         // makes that one counter load). `code_gen` memoizes the image
         // generation; the back-edge epilogue re-resolves when it moves (§R2-1).
         var code = self.trace.codeFor(proto);
-        var code_gen = self.trace.image_gen;
+        var code_gen = self.trace.registry.entry_registry.image_gen;
         var base = frame.base;
         var regs = self.frameWindow(base, proto.num_registers);
         var pc = frame.pc;
@@ -3351,7 +3344,7 @@ pub const Vm = struct {
                 // (`patch.orig`, §R2-5) — no shortcut, no rewind/refetch.
                 .jfor_loop => {
                     const slot: u16 = instr.b;
-                    const patch = self.trace.entry_patches.items[slot];
+                    const patch = self.trace.registry.entry_registry.entry_patches.items[slot];
                     const live = patch.live;
                     if (!live) {
                         // §R6-1 pre-step recovery — a LEGITIMATE deferred-
@@ -3427,9 +3420,9 @@ pub const Vm = struct {
                     // fingerprint at entry, per the B-4 discipline) and run
                     // the identical entry/receipt routine the walk uses.
                     const directive = self.enterPatchedTrace(mode, patch, slot, closure, proto, regs, base, pc);
-                    if (self.trace.image_gen != code_gen) {
+                    if (self.trace.registry.entry_registry.image_gen != code_gen) {
                         code = self.trace.codeFor(proto);
-                        code_gen = self.trace.image_gen;
+                        code_gen = self.trace.registry.entry_registry.image_gen;
                     }
                     switch (directive) {
                         .next_candidate => {
@@ -3460,7 +3453,7 @@ pub const Vm = struct {
                 // back-edge epilogue, exactly like `.jfor_loop`.
                 .jloop => {
                     const slot: u16 = instr.b;
-                    const patch = self.trace.entry_patches.items[slot];
+                    const patch = self.trace.registry.entry_registry.entry_patches.items[slot];
                     const live = patch.live;
                     if (!live) {
                         // Same load-bearing deferred-unpatch recovery as the
@@ -3500,9 +3493,9 @@ pub const Vm = struct {
                         break :sw;
                     }
                     const directive = self.enterPatchedTrace(mode, patch, slot, closure, proto, regs, base, pc);
-                    if (self.trace.image_gen != code_gen) {
+                    if (self.trace.registry.entry_registry.image_gen != code_gen) {
                         code = self.trace.codeFor(proto);
-                        code_gen = self.trace.image_gen;
+                        code_gen = self.trace.registry.entry_registry.image_gen;
                     }
                     switch (directive) {
                         .next_candidate => {
@@ -3719,7 +3712,7 @@ pub const Vm = struct {
                             closure = frame.closure;
                             proto = closure.proto;
                             code = self.trace.codeFor(proto); // doc 20 image
-                            code_gen = self.trace.image_gen;
+                            code_gen = self.trace.registry.entry_registry.image_gen;
                             base = frame.base;
                             regs = self.frameWindow(base, proto.num_registers);
                             pc = frame.pc;
@@ -3889,7 +3882,7 @@ pub const Vm = struct {
                     closure = frame.closure;
                     proto = closure.proto;
                     code = self.trace.codeFor(proto); // doc 20 image
-                    code_gen = self.trace.image_gen;
+                    code_gen = self.trace.registry.entry_registry.image_gen;
                     base = frame.base;
                     regs = self.frameWindow(base, proto.num_registers);
                     pc = frame.pc;
@@ -4061,14 +4054,14 @@ pub const Vm = struct {
                             // trial-enter one through the same-anchor walk, even if
                             // a malformed or future bytecode shape puts it at a
                             // back-edge pc.
-                            if (ct.instrs.len != 0 and ct.instrs[ct.instrs.len - 1].op == .link) continue;
+                            if (ct.code.instrs.len != 0 and ct.code.instrs[ct.code.instrs.len - 1].op == .link) continue;
                             // --- type fingerprint (step 5) ---
                             // Skip this trace if the current register types don't
                             // match its entry type guards.  Avoids trial entries
                             // that would immediately fail on a guard_int/guard_float
                             // mismatch.  Branch-direction guards (guard_true/false)
                             // aren't fingerprinted — they depend on computed values.
-                            if (!ct.matchesFingerprint(regs)) continue;
+                            if (!ct.code.matchesFingerprint(regs)) continue;
                             // Doc 24 D8 observation blackout: while a suspend
                             // cut or safepoint-line recording is armed, decline
                             // to enter any ALLOCATING trace (`alloc_bound > 0`)
@@ -4081,7 +4074,7 @@ pub const Vm = struct {
                             // blacked-out candidate still counts as matched
                             // (no spurious side-trace pressure).
                             any_fingerprint_matched = true;
-                            if (ct.alloc_bound > 0 and
+                            if (ct.code.alloc_bound > 0 and
                                 (self.suspend_ctl != null or self.record_safepoint_lines)) continue;
                             // Native safety net: under `--jit-native`, a trace that
                             // records but can't compile to native (unsupported op /
@@ -4115,9 +4108,9 @@ pub const Vm = struct {
                             // generation moved (a Phase-1 install, or the first
                             // clone of this proto's image).
                             self.trace.drainEntryPatchWork();
-                            if (self.trace.image_gen != code_gen) {
+                            if (self.trace.registry.entry_registry.image_gen != code_gen) {
                                 code = self.trace.codeFor(proto);
-                                code_gen = self.trace.image_gen;
+                                code_gen = self.trace.registry.entry_registry.image_gen;
                             }
                             switch (directive) {
                                 .next_candidate => {},
@@ -4165,9 +4158,9 @@ pub const Vm = struct {
                         // path), and re-resolve the fetch image if a drain
                         // moved the generation.
                         self.trace.drainEntryPatchWork();
-                        if (self.trace.image_gen != code_gen) {
+                        if (self.trace.registry.entry_registry.image_gen != code_gen) {
                             code = self.trace.codeFor(proto);
-                            code_gen = self.trace.image_gen;
+                            code_gen = self.trace.registry.entry_registry.image_gen;
                         }
                         // Coherent-state chaining (doc 16, Phase 2) diagnostic: tier-0
                         // is about to run this *traced* anchor's body because no trace

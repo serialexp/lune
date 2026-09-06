@@ -43,8 +43,10 @@
 //! use on the next entry).
 
 const std = @import("std");
-const trace = @import("trace.zig");
-const arith = @import("arith.zig");
+const trace_ir = @import("trace_ir.zig");
+const trace_code = @import("trace_code.zig");
+const Trace = trace_code.TraceCode;
+const ir_eval = @import("ir_eval.zig");
 const value = @import("value.zig");
 const regwindow = @import("regwindow.zig");
 const RegWindow = regwindow.RegWindow;
@@ -58,234 +60,16 @@ const stralloc = @import("stralloc.zig");
 const string_mod = @import("string.zig");
 const string_std = @import("stdlib/string.zig");
 const Value = value.Value;
-const Trace = trace.Trace;
 
-/// Sentinel `final_trace_id`: "no chain-final trace was identified" — a tier-1a
-/// result (which always belongs to the entered trace) or a native result whose
-/// exit stub somehow didn't write the id. The dispatcher resolves it to the entered
-/// trace `ct`. `maxInt(u32)` is unreachable as a real `Trace.id` (a session never
-/// records 4 billion traces).
-pub const NO_TRACE_ID: u32 = std.math.maxInt(u32);
+// Private aliases keep the executor implementation concise without re-exporting
+// the shared contract from this backend module. Callers import `trace_exec.zig`.
+const trace_exec = @import("trace_exec.zig");
+const ExecResult = trace_exec.ExecResult;
 
-/// Why a (possibly chained) native run left its final body. Distinct from
-/// `exit_instr` because `exit_instr == maxInt` is overloaded: on tier-1a it means
-/// "ran to natural completion" (a real, productive exit), while on native it is ALSO
-/// baked by `prologue_fail` (a hoisted entry-type guard failed BEFORE the body
-/// committed any of its own iterations — no guard identity, zero local progress).
-/// 2.3c-0b (doc 17) splits those apart so the dispatcher/`driveChain` can model a
-/// chained child that prologue-fails after the parent committed as three independent
-/// facts (final = child, `local_completed == 0`, chain `completed > 0`) instead of
-/// re-deriving intent from the `maxInt` artifact. Backed `u32` so it matches the
-/// JIT-emitted `movMemImm32` store into `NativeResult`.
-pub const ExitReason = enum(u32) {
-    /// A guard / terminal / loop-done exit with a valid `exit_instr`, OR a tier-1a
-    /// clean loop completion (`exit_instr == maxInt`, `completed > 0`). In every case
-    /// `exit_instr`/`completed` mean exactly what they say.
-    normal = 0,
-    /// Native only: a hoisted entry-type guard failed pre-commit. `exit_instr` carries
-    /// no guard identity (`maxInt`); `local_completed == 0` even when the enclosing
-    /// chain holds nonzero cumulative progress in `completed`.
-    prologue_fail = 1,
-    /// Doc 22 §B.2, native only: a seeded page's entry prologue called the seeding
-    /// twin (`nativeSeedFn`) and a `hash_cell` seed failed validation (metatable
-    /// appeared, key vanished, population drifted). The slab holds exactly the state
-    /// VM-side seeding leaves on the same failure (the 0-bits cell slot IS written),
-    /// so the dispatcher reruns THIS entry on tier-1a — same shape as the pre-B-ii
-    /// `native_eligible = false` route. Like `prologue_fail`: no guard identity
-    /// (`exit_instr == maxInt`), zero local progress. No strike is charged.
-    seed_hash_decline = 2,
-    /// Doc 22 §B.2, native only: the seeding twin declined before ANY slab write
-    /// because the seed slots don't fit the register slab (`base + count >
-    /// capacity`). The candidate itself is unusable at this depth — the dispatcher
-    /// moves to the next candidate (the native analogue of `seedTraceInputs`
-    /// returning null). No guard identity, zero local progress, no strike.
-    seed_capacity_decline = 3,
-};
-
-/// 2.3c-2a (doc 17): capacity of the per-transition native ledger carried in
-/// `NativeResult`. A fused native span (`C→I→C→…` chained under the shared frame)
-/// returns ONE result whose scalar fields describe only the TERMINAL body; every
-/// intermediate exit is otherwise unrecoverable. Each exit-materialization appends
-/// one entry so `runLinkedBurst` can replay the hops it never re-entered Zig to
-/// observe. Sized to cover the burst-hop bound (≤9 enclosing iterations × 2
-/// transitions/iteration = 18) in a single native span so the common closed-cycle
-/// case never forces an early yield; the native append is bounds-guarded, so an
-/// over-long span drops the overflow entry (2.3c-2a/b, no cycle → never reached) or,
-/// once 2.3c-2c closes the cycle, a chain-source forces a yield to `shared_exit`.
-pub const LEDGER_CAP: usize = 32;
-
-/// Result of executing a trace.
-pub const ExecResult = struct {
-    /// Number of loop iterations that committed cleanly.
-    completed: usize,
-    /// Index of the failing IR instruction when completed==0 (guard/arith
-    /// failure). `maxInt(u32)` means the trace ran to completion with no
-    /// failure (completed > 0).
-    exit_instr: u32,
-    /// P-B (doc 17): the stable `Trace.id` of the trace that performed the FINAL
-    /// exit of the (possibly chained) native run. Native bakes this per exit stub;
-    /// tier-1a leaves it at `NO_TRACE_ID` (a single `execute` call always belongs to
-    /// the entered trace). Defaulted so the ~40 tier-1a construction sites are
-    /// untouched. The dispatcher maps `(final_trace_id, exit_instr)` → the final
-    /// trace; with no linking yet this is always the entered trace.
-    final_trace_id: u32 = NO_TRACE_ID,
-    /// 2.3b-0 (doc 17): iterations committed by the FINAL trace's OWN loop, as
-    /// opposed to `completed` which is the chain-cumulative count (`rbx`). Native
-    /// derives it as `completed − entry_rbx`, where `entry_rbx` is the value the
-    /// counter held when the final trace's body was entered. Unchained the two are
-    /// equal (a fresh trampoline entry zeroes `rbx`), so today `local_completed ==
-    /// completed` always; once a parent `jmp`s into a child under the shared frame
-    /// (2.3b-1) the child inherits the parent's `rbx`, and the accounting that steers
-    /// recording (`onSideExit`) must use this local count, never the inflated
-    /// cumulative one. Defaulted to 0 so the ~40 tier-1a construction sites are
-    /// untouched; `local_completed` is only ever READ on the native chained path
-    /// (`driveChain`, `tier == .native_only`) — the tier-1a chain path reads
-    /// `completed` directly (a single `execute` is never fused, so its local count IS
-    /// its `completed`).
-    local_completed: usize = 0,
-    /// 2.3c-0b (doc 17): why the final body exited, disambiguating the overloaded
-    /// `exit_instr == maxInt`. Native marshals it from `NativeResult.exit_reason`;
-    /// tier-1a leaves it `.normal` (a single `execute` either takes a real guard exit
-    /// or completes cleanly — it has no hoisted-entry-guard prologue to fail).
-    /// Defaulted so the ~40 tier-1a construction sites are untouched; only ever READ on
-    /// the native chained path (`driveChain`, `tier == .native_only`).
-    exit_reason: ExitReason = .normal,
-    /// 2.3c-2a (doc 17): number of exit-materializations the (possibly fused) native
-    /// span recorded in `NativeResult`'s per-transition ledger. 1 for an un-fused run;
-    /// >1 when an armed slot chained bodies under the shared frame (a `C→I` `.link`
-    /// fusion records 2 — C's terminal exit then I's). In 2.3c-2a the ledger ENTRIES
-    /// are not carried here (the drain still reads scalar fields); `runLinkedBurst`
-    /// consumes them in 2.3c-2b. Native only — tier-1a leaves it 0 (defaulted, so the
-    /// ~40 tier-1a construction sites are untouched).
-    ledger_len: usize = 0,
-    /// Doc 17 B-3 frozen silent-burst ABI. Tier-1a and B-3a native runs leave these
-    /// zero; B-3b will consume them through the universal native-result drain.
-    silent_active: u64 = 0,
-    silent_transitions: u64 = 0,
-    silent_budget: u64 = 0,
-    barren_budget: u64 = 0,
-    silent_cell: u64 = 0,
-    cur_zero_run: u64 = 0,
-    silent_cum: u64 = 0,
-    /// Address of the `SilentExitMetadata` of the LAST promoted edge that fired.
-    /// Round-6 exactness: the terminal edge is measured, never reconstructed from
-    /// the transition count (see `TraceState.silentCellOwner`).
-    silent_last_cell: u64 = 0,
-};
-
-/// 2.3c-2c (doc 17): which exit-materialization SITE appended a ledger entry —
-/// the static discriminator the generic `replayLedger` needs to classify a hop's
-/// coherent-resume contract without re-deriving it from the trace IR. There is
-/// exactly one value per native exit-materialization site (see `emitLedgerAppend`
-/// callers in `nativegen.zig`); the append bakes the site's compile-time constant.
-/// Finer distinctions WITHIN `.deopt` (ordinary source-branch guard vs. ordinary
-/// numeric-for loop-done vs. plain mid-loop guard) stay derived from `exit` + the
-/// trace IR (`guardExitPc` + `for_loop`) exactly as the ≤2-entry drain does today —
-/// they all share one emit site and one resume contract (tier-0 at the exit PC), so
-/// they need no separate kind.
-pub const LedgerKind = enum(u32) {
-    /// `.link` terminal hand-off (single-contract). Chain source when its slot is
-    /// armed; the linked child is the inner root at `.link.aux`. Regs coherent at
-    /// that inner PC.
-    link_terminal = 0,
-    /// Numeric-`for` loop-done, LINKED materialization (mode 1): the final iteration's
-    /// post-guard stores + phi snapshot were committed, so regs are coherent at the
-    /// continuation anchor PC. Chain source when its `slot[ei]` is armed (2.3c-2c).
-    loop_done_linked = 1,
-    /// The shared `deopt_exit` flush: an ordinary per-guard side exit, an ordinary
-    /// (mode 0) numeric-`for` loop-done deopt, or a plain mid-loop guard. Regs coherent
-    /// at the guard's exit PC for tier-0 replay. Chain source when the mini-stub's
-    /// `slot[ei]` is armed (2.3c-1, source-branch guards).
-    deopt = 2,
-    /// A hoisted entry-type guard failed pre-commit (`exit_instr = -1`,
-    /// `reason = .prologue_fail`). Always terminal — never a chain source.
-    prologue_fail = 3,
-    /// Part A-v (doc 17): a composite-guard bridge committed the parent trace's
-    /// dominating phi updates before handing off to an outer-loop successor.
-    /// A-v emits this site but never arms it, so no runtime ledger can contain
-    /// this kind until A-vii lands the arm and replay contract.
-    region_bridge = 4,
-    /// Doc 22 §B.2: a seeded page's entry prologue declined on `hash_cell`
-    /// validation (`reason = .seed_hash_decline`, `exit_instr = -1`). Always
-    /// terminal — the decline happens before the body runs, never a chain source.
-    seed_hash_decline = 5,
-    /// Doc 22 §B.2: a seeded page's entry prologue declined on slab capacity
-    /// (`reason = .seed_capacity_decline`, `exit_instr = -1`, nothing written).
-    /// Always terminal.
-    seed_capacity_decline = 6,
-};
-
-/// 2.3c-2c (doc 17): what a chain-source exit DID with its (possibly armed) slot —
-/// the signal the generic `replayLedger` needs to tell a forced yield apart from a
-/// natural terminal, which position alone cannot (both are the LAST ledger entry).
-/// Only `.yielded` is stamped at runtime (in the static forced-yield branch of
-/// `emitForcedYieldCheck`); `.normal` is the default every append writes.
-/// `.normal` is deliberately two-in-one — a non-final `.normal` entry DISPATCHED
-/// (an armed slot carried control into the successor recorded next), a final
-/// `.normal` entry is a natural TERMINAL (unarmed → `shared_exit`, or a plain
-/// deopt/prologue-fail). Replay disambiguates those two by position; the successor-
-/// adjacency validation (2.3c-2c) is what makes the positional inference sound.
-pub const LedgerOutcome = enum(u32) {
-    /// Dispatched into a successor (non-final) OR a natural terminal (final).
-    normal = 0,
-    /// Forced yield: an ARMED chain source hit a full ledger (`ledger_len == CAP`)
-    /// and jumped to `shared_exit` instead of its child, bounding the closed cycle.
-    /// The cycle may not be finished — the driver re-enters at the coherent resume
-    /// PC to continue it.
-    yielded = 1,
-};
-
-/// 2.3c-2b (doc 17): one decoded entry from the native per-transition ledger. A
-/// fused native span returns ONE `NativeResult` whose scalar fields describe only
-/// the TERMINAL body; `runLinkedBurst` copies the parallel `ledger_*[0..ledger_len]`
-/// arrays into a `TraceState`-owned scratch of these (via `runCapturingLedger`) and
-/// replays each recorded hop instead of reading the terminal-only scalars. `cum` is
-/// the cumulative `rbx` at that exit; the per-segment local of entry `i` is
-/// `cum[i] − cum[i-1]` (`cum[-1] = 0`, the trampoline-zeroed call-start `rbx`).
-pub const LedgerEntry = struct {
-    /// Cumulative `rbx` (enclosing-iteration counter) at this exit.
-    cum: usize,
-    /// `Trace.id` whose body performed this exit.
-    id: u32,
-    /// That exit's `exit_instr` (`maxInt(u32)` for a prologue fail).
-    exit: u32,
-    /// Why the body exited (`.normal` / `.prologue_fail`).
-    reason: ExitReason,
-    /// 2.3c-2c: the exit-materialization site that appended this entry. Written by
-    /// `emitLedgerAppend` from a per-site compile-time constant; only READ by the
-    /// generic `replayLedger` (2.3c-2c) — inert until then.
-    kind: LedgerKind = .deopt,
-    /// 2.3c-2c: whether this exit force-yielded. Default `.normal`; the forced-yield
-    /// branch stamps `.yielded`. Only READ by the generic `replayLedger` — inert
-    /// until the cycle can fill the ledger (2.3c-2e).
-    outcome: LedgerOutcome = .normal,
-};
-
-/// [doc 30 §6 named coupling] Can the loop-done commit walks handle every sunk
-/// store below this guard? The two walks — the tier-1a flush below and
-/// nativegen's `emitLinkedLoopDoneSnapshot` — enumerate a CLOSED store
-/// inventory (`astore`/`hstore`/`gstore`); `sgm_setpos` (the gmatch cursor
-/// commit) rides the same pending-store sinking and so lands in exactly this
-/// range, but neither walk commits it. Skipping it silently would leave the
-/// gmatch cursor un-advanced while the continuation runs the POST-loop code —
-/// the last token would be re-yielded. So a range containing one must DECLINE
-/// the linked continuation: ordinary deopt replays the final iteration in
-/// tier-0 against the un-advanced cursor, which is replay-idempotent by
-/// construction (the doc 30 §6 sinking argument) and therefore always sound,
-/// merely slower. Shared by tier-1a (the flush pre-scan) and native (the
-/// linked-branch emission gate), so both tiers decline identically. Keep the
-/// inventory here in lockstep with BOTH walks' arms.
-pub fn loopDoneSnapshotSupported(t: *const Trace, exit_instr: usize) bool {
-    var si = exit_instr + 1;
-    while (si < t.instrs.len) : (si += 1) {
-        switch (t.instrs[si].op) {
-            .sgm_setpos => return false,
-            .phi, .loop, .link => return true,
-            else => {},
-        }
-    }
-    return true;
-}
+// [doc 30 §6 named coupling] The tier-1a flush below and nativegen's
+// `emitLinkedLoopDoneSnapshot` enumerate the same closed sunk-store inventory.
+// The shared eligibility gate is owned by
+// `TraceCode.loopDoneSnapshotSupported`; both tiers must consult it.
 
 /// Commit the final numeric-`for` iteration at a loop-done side exit so a linked
 /// continuation can start at the post-loop PC without tier-0 replaying that
@@ -295,9 +79,9 @@ pub fn flushNumericForLoopDone(t: *const Trace, regs: RegWindow, values: []Value
     if (exit_instr == std.math.maxInt(u32) or exit_instr >= t.instrs.len) return false;
     const guard = t.instrs[exit_instr];
     if (guard.op != .guard_true) return false;
-    const exit_pc = trace.guardExitPc(guard) orelse return false;
+    const exit_pc = trace_ir.guardExitPc(guard) orelse return false;
     if (exit_pc == 0 or exit_pc > t.anchor.proto.code.len) return false;
-    const for_ins = t.anchor.proto.code[trace.guardSourcePc(guard).?];
+    const for_ins = t.anchor.proto.code[trace_ir.guardSourcePc(guard).?];
     if (for_ins.op != .for_loop) return false;
     // Doc 37: reject inlined-callee `for_loop` guards — their `guardSourcePc` is
     // in the callee's proto, not the anchor's. A coincidental pc match would flush
@@ -306,7 +90,7 @@ pub fn flushNumericForLoopDone(t: *const Trace, regs: RegWindow, values: []Value
         .guard => |gp| if (gp.inline_depth > 0) return false,
         .link_terminal => return false,
     };
-    if (!loopDoneSnapshotSupported(t, exit_instr)) return false;
+    if (!t.loopDoneSnapshotSupported(exit_instr)) return false;
 
     var si: usize = @intCast(exit_instr + 1);
     while (si < t.instrs.len) : (si += 1) {
@@ -344,7 +128,7 @@ pub fn flushNumericForLoopDone(t: *const Trace, regs: RegWindow, values: []Value
     const visible_var_slot: i32 = @as(i32, @intCast(for_ins.a)) + 3;
     for (t.instrs, 0..) |p, pi| {
         if (p.op != .phi) continue;
-        if (p.aux == trace.PHI_INTERNAL) {
+        if (p.aux == trace_ir.PHI_INTERNAL) {
             values[pi] = values[@intCast(p.b)];
         } else if (p.aux != visible_var_slot) {
             regs.set(@intCast(p.aux), values[@intCast(p.b)]);
@@ -490,7 +274,7 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                 // the first iteration and keeps the value the back-edge carried into it
                 // on every subsequent one.
                 .phi => {
-                    if (ins.aux == trace.PHI_INTERNAL) {
+                    if (ins.aux == trace_ir.PHI_INTERNAL) {
                         if (completed == 0) values[i] = values[@intCast(ins.a)];
                         // else: retain the value the previous `.loop` carried in.
                         // An internal φ is a real computed scalar the body consumes
@@ -511,7 +295,7 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                 //      Any error (only integer //- or %-by-zero is reachable; see
                 //      arith.zig) side-exits to tier-0, which re-raises it. ----
                 .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .sar, .eq, .ne, .lt, .le => {
-                    values[i] = evalBinary(ins.op, values[ins.a], values[ins.b]) catch {
+                    values[i] = ir_eval.evalBinary(ins.op, values[ins.a], values[ins.b]) catch {
                         if (record) rec.exit(i, .arith, Value.nil());
                         break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                     };
@@ -520,7 +304,7 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
 
                 // ---- unary (shared evaluator too) ----
                 .neg, .not, .bnot => {
-                    values[i] = evalUnary(ins.op, values[ins.a]) catch {
+                    values[i] = ir_eval.evalUnary(ins.op, values[ins.a]) catch {
                         if (record) rec.exit(i, .arith, Value.nil());
                         break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                     };
@@ -1367,56 +1151,12 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
 fn flushPhiWriteback(t: *const Trace, regs: RegWindow, values: []Value) void {
     for (t.instrs, 0..) |p, pi| {
         if (p.op != .phi) continue;
-        if (p.aux == trace.PHI_INTERNAL) {
+        if (p.aux == trace_ir.PHI_INTERNAL) {
             values[pi] = values[@intCast(p.b)];
         } else {
             regs.set(@intCast(p.aux), values[@intCast(p.b)]);
         }
     }
-}
-
-/// Evaluate a binary IR op (arithmetic / bitwise / comparison) over two values,
-/// using the *exact* `arith.zig` functions tier-0 uses. This is the single
-/// evaluator shared by the executor (above) and the trace optimizer's constant
-/// folder (`tropt.zig`) — so a folded constant has byte-identical bits to what
-/// the executor would compute at runtime, by construction. It is **total**: it
-/// only ever returns `arith.Error` (`TypeError` / `DivisionByZero`), never traps
-/// (arith.zig wraps integer ops and masks shift counts), so the folder can call
-/// it on any constants and merely refuse to fold on error. `op` must be one of
-/// the binary ops in the `execute` switch above (else unreachable).
-pub fn evalBinary(op: trace.IrOp, a: Value, b: Value) arith.Error!Value {
-    return switch (op) {
-        .add => arith.add(a, b),
-        .sub => arith.sub(a, b),
-        .mul => arith.mul(a, b),
-        .div => arith.div(a, b),
-        .idiv => arith.floorDiv(a, b),
-        .mod => arith.mod(a, b),
-        .pow => arith.pow(a, b),
-        .band => arith.band(a, b),
-        .bor => arith.bor(a, b),
-        .bxor => arith.bxor(a, b),
-        .shl => arith.shl(a, b),
-        .shr => arith.shr(a, b),
-        .sar => arith.sar(a, b),
-        .eq => Value.boolean(arith.eq(a, b)),
-        .ne => Value.boolean(!arith.eq(a, b)),
-        .lt => Value.boolean(try arith.lt(a, b)),
-        .le => Value.boolean(try arith.le(a, b)),
-        else => unreachable,
-    };
-}
-
-/// Evaluate a unary IR op (`neg`/`not`/`bnot`). Shared by the executor and the
-/// folder, same contract as `evalBinary`. `not` is defined over Lua truthiness
-/// (no type guard, like tier-0). `op` must be a unary op (else unreachable).
-pub fn evalUnary(op: trace.IrOp, a: Value) arith.Error!Value {
-    return switch (op) {
-        .neg => arith.neg(a),
-        .not => Value.boolean(!a.isTruthy()),
-        .bnot => arith.bnot(a),
-        else => unreachable,
-    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1431,8 +1171,8 @@ pub fn evalUnary(op: trace.IrOp, a: Value) arith.Error!Value {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
-const IrInstr = trace.IrInstr;
-const IrOp = trace.IrOp;
+const IrInstr = trace_ir.IrInstr;
+const IrOp = trace_ir.IrOp;
 const Table = table.Table;
 
 /// Build a single-anchor trace that scans `t[r1], t[r1+1], …` accumulating into

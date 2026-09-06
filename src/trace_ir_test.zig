@@ -62,11 +62,13 @@ test "writeTrace renders a hand-built counting-loop trace" {
     }, &[_]SlotStore{ .{ .slot = 0, .ref = 4 }, .{ .slot = 1, .ref = 1 } });
     var entry = [_]u16{ 0, 1 };
     const t = Trace{
-        .anchor = .{ .proto = &proto, .pc = 5 },
-        .instrs = &instrs,
-        .consts = &.{},
-        .entry_slots = &entry,
-        .entry_guards = &.{},
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 5 },
+            .instrs = &instrs,
+            .consts = &.{},
+            .entry_slots = &entry,
+            .entry_guards = &.{},
+        },
     };
 
     var buf: [512]u8 = undefined;
@@ -101,7 +103,7 @@ test "onBackEdge counts back-edges per anchor" {
 
     try testing.expectEqual(@as(u32, 10), state.backEdgeCount(hot));
     try testing.expectEqual(@as(u32, 1), state.backEdgeCount(cold));
-    try testing.expectEqual(@as(usize, 0), state.cache.items.len); // never armed
+    try testing.expectEqual(@as(usize, 0), state.registry.cache.items.len); // never armed
 }
 
 test "crossing the hotness threshold arms a recording" {

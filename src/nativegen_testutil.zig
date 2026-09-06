@@ -12,13 +12,14 @@ const table = @import("table.zig");
 const arr = @import("array.zig");
 const Value = value.Value;
 const RegWindow = @import("regwindow.zig").RegWindow;
-const Trace = trace.Trace;
+const Trace = @import("trace_code.zig").TraceCode;
 const Reg = x64.Reg;
 const object = @import("object.zig");
 const function = @import("function.zig");
 const bytecode = @import("bytecode.zig");
 const testing = std.testing;
 const irinterp = @import("irinterp.zig");
+const trace_exec = @import("trace_exec.zig");
 const I = trace.IrInstr;
 const S = trace.SlotStore;
 
@@ -42,7 +43,7 @@ pub fn expectRegsEqual(expected: []const Value, actual: []const Value) !void {
 /// lanes the native ABI now consumes, run the trace, scatter the mutated lanes back
 /// into `regs`, and return the native result. Mirrors how `Vm.frameWindow` hands the
 /// two lanes to `CompiledTrace.run` in production (raw payload bits, no recanon).
-pub fn runNative(ct: CompiledTrace, regs: []Value) !irinterp.ExecResult {
+pub fn runNative(ct: CompiledTrace, regs: []Value) !trace_exec.ExecResult {
     const tags = try testing.allocator.alloc(u8, regs.len);
     defer testing.allocator.free(tags);
     const pays = try testing.allocator.alloc(u64, regs.len);
@@ -65,51 +66,39 @@ pub fn expectMatch(t: *const Trace, regs_init: []const Value) !void {
     defer testing.allocator.free(values);
     const iresult = irinterp.executeValues(t, iregs, values);
 
-    // Native: must compile (caller picks compilable traces) and match bit-for-bit.
-    var ct = compile(testing.allocator, t) orelse return error.NativeBailedUnexpectedly;
+    // Use the production shared trampoline; compiled code dies before its arena.
+    var arena = McodeArena.init(testing.allocator);
+    defer arena.deinit();
+    var ct = compileInto(testing.allocator, &arena, t, 0, null, null) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
+    try testing.expect(ct.trampoline_entry != null);
     const nregs = try testing.allocator.dupe(Value, regs_init);
     defer testing.allocator.free(nregs);
     const nresult = try runNative(ct, nregs);
 
-    try testing.expectEqual(iresult.completed, nresult.completed);
+    try testing.expectEqual(iresult.completed, nresult.local_completed);
+    switch (nresult.exit_reason) {
+        .normal => {
+            // Native fuses a value-lane load's tag guard into the load. The
+            // oracle reports the following explicit type guard instead.
+            if (iresult.exit_instr != nresult.exit_instr) {
+                const load = t.instrs[nresult.exit_instr];
+                const guard = t.instrs[iresult.exit_instr];
+                try testing.expectEqual(trace.IrOp.aload, load.op);
+                try testing.expectEqual(nativegen.VALUE_LANE, load.aux);
+                try testing.expectEqual(nresult.exit_instr, @as(u32, guard.a));
+                try testing.expect(guard.op == .guard_int or guard.op == .guard_float or guard.op == .guard_table);
+            }
+        },
+        .prologue_fail => try testing.expectEqual(@as(usize, 0), iresult.completed),
+        .seed_hash_decline, .seed_capacity_decline => return error.UnexpectedSeedDecline,
+    }
     try expectRegsEqual(iregs, nregs);
 }
 
-/// Like `expectMatch`, but drives the FRAMELESS production path (`compileInto` an
-/// `McodeArena` + the shared trampoline), not the self-framed standalone page. This is
-/// the ONLY path that dispatches an ordinary guard exit through the memory-staged
-/// `NativeResult.exit_target` (2.3c-0). A regression here — e.g. staging the dispatch
-/// target in rax, which `flushSlot` clobbers on a spilled carried home — would jump
-/// through a corrupt address and crash, so a clean match is the guard against blocker-1.
-pub fn expectMatchFrameless(t: *const Trace, regs_init: []const Value) !void {
-    const gpa = testing.allocator;
-    // Oracle: the tier-1a IR-interpreter.
-    const iregs = try gpa.dupe(Value, regs_init);
-    defer gpa.free(iregs);
-    const values = try gpa.alloc(Value, t.instrs.len);
-    defer gpa.free(values);
-    const iresult = irinterp.executeValues(t, iregs, values);
-
-    // Native, frameless: compile into a real arena so the shared trampoline + link-slot
-    // table + indirect exit dispatch are all live (arena.deinit must outlive ct, which
-    // holds an arena-slot page — defer LIFO runs ct.deinit first).
-    var arena = McodeArena.init(gpa);
-    defer arena.deinit();
-    var ct = compileInto(gpa, &arena, t, null, null) orelse return error.NativeBailedUnexpectedly;
-    defer ct.deinit();
-    try testing.expect(ct.trampoline_entry != null); // really the frameless path
-
-    const nregs = try gpa.dupe(Value, regs_init);
-    defer gpa.free(nregs);
-    const nresult = try runNative(ct, nregs);
-
-    try testing.expectEqual(iresult.completed, nresult.completed);
-    try expectRegsEqual(iregs, nregs);
-}
 /// Assert `compile` bails (returns null) for an unsupported trace.
 pub fn expectBail(t: *const Trace) !void {
-    if (compile(testing.allocator, t)) |ct| {
+    if (compile(testing.allocator, t, 0)) |ct| {
         var c = ct;
         c.deinit();
         return error.TestExpectedBail;

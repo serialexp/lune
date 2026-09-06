@@ -83,7 +83,7 @@ pub const TraceEntry = struct {
 };
 
 /// All recorded entries for one cached trace, keyed by `trace_id` (the trace's index
-/// in `TraceState.cache`, which is also the viz's selection key).
+/// in `TraceState.registry.cache`, which is also the viz's selection key).
 pub const TraceExecLog = struct {
     trace_id: u32,
     /// `max_entries` was reached; further entries for this trace were not recorded.

@@ -49,7 +49,7 @@ fn toSchemaCounters(ts: *const trace.TraceState) schema.JitCounters {
         .native_loopdone_link_arms = ts.native_loopdone_link_arms,
         .native_source_link_fused = ts.native_source_link_fused,
         .native_loopdone_link_fused = ts.native_loopdone_link_fused,
-        .native_link_disarms = ts.native_link_disarms,
+        .native_link_disarms = ts.registry.native_physical.native_link_disarms,
         .native_link_exits = ts.native_link_exits,
         .native_link_follow_count = ts.native_link_follow_count,
         .link_ir_exits = ts.link_ir_exits,

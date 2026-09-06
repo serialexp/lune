@@ -552,8 +552,8 @@ test "H-2/G-2: snapshot bytes are identical whether or not the JIT recorded (tra
             // in its const pool — otherwise this test proves nothing.
             if (jit) {
                 var found_k = false;
-                for (vm.trace.cache.items) |t| {
-                    for (t.consts) |v| {
+                for (vm.trace.registry.cache.items) |t| {
+                    for (t.code.consts) |v| {
                         if (v.isHeap() and v.heapType() == .string and
                             std.mem.eql(u8, string.String.fromHeader(v.asHeap()).bytes(), "k")) found_k = true;
                     }
@@ -796,8 +796,8 @@ test "doc 19 §T3: restored load-driven program resumes with the JIT and traces 
     // [0, chunk.proto_count); loaded protos sit above) that actually ran.
     try testing.expect(vm_r.trace.entries > 0);
     var saw_loaded_anchor = false;
-    for (vm_r.trace.cache.items) |t| {
-        if (t.anchor.proto.id >= chunk.proto_count) saw_loaded_anchor = true;
+    for (vm_r.trace.registry.cache.items) |t| {
+        if (t.code.anchor.proto.id >= chunk.proto_count) saw_loaded_anchor = true;
     }
     try testing.expect(saw_loaded_anchor);
 }

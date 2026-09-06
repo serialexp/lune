@@ -21,6 +21,106 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-05 — architectural ownership arc STARTED (doc 41)
+
+Bart approved starting with JIT ownership and eventually covering the full
+repository architecture review. Plan: shared trace/execution contracts → sole
+registry/link mutation owner → region policy → recording lifecycle. See
+`docs/design/41-jit-ownership.md`; follow-up runtime/replay/compiler/UI work is
+explicitly tracked in TODO.md.
+
+Latest increment: `trace_entry_registry.EntryRegistry` now owns entry images,
+stable patch slots and their physical publication/restore/teardown, with no
+coordinator reference. Qualification and deterministic unpatch-before-install
+drain remain coordinator policy. All source field consumers migrated. Two owner
+tests cover publication/dead-record retirement/reuse and OOM refusal. `just test`,
+wasm and both 84-digest hashgate legs pass; `just test` rerun after focused tests.
+Next increment also implemented: `NativePhysicalRegistry` owns native links,
+live promotions, candidate storage and deferred demotion/disarm/replay depth,
+with explicit arena borrowing and no coordinator/policy callbacks. Physical
+teardown disarms before record destruction. Review found no demonstrated
+production regression; same-generation region-proof changes now invalidate
+bridge replay memos (regression test added). Final `just test` (13 boundary
+tests), wasm and both 84-digest hashgate legs pass. This preserves existing
+last-row replay convergence, not a blanket prohibition on all mid-walk mutation.
+Registry extraction is now complete: `TraceRegistry` composes both physical
+owners and owns cache/ID publication and retirement, arena and seed context.
+Clear independently disarms and drops candidate references before freeing records.
+Const topology reads, proof-keyed memo updates and owner candidate observation
+close the policy-write gaps; targeted destructive operations enforce safe windows.
+Five physical debug messages restored with synchronized runtime logging gates.
+Four registry tests cover ownership/OOM, identity/order and candidate cleanup;
+final `just test` passes with 14 boundary tests; wasm and both 84-digest hashgate
+legs pass. Region policy and recorder lifecycle remain separate outstanding
+phases. No new benchmark run or commit.
+
+Region-policy and recording-lifecycle extractions are now implemented too:
+RegionPolicy owns normalized consumption/window/lifecycle/observer decisions and
+staged topology publication; the coordinator applies physical/gate effects in
+order. RecordingSession owns emission/reset/abort/peel/close/finalization, receives
+explicit instruction context and returns an independently owned candidate.
+Publication transfers code only on success; side provenance is explicit. Reset
+OOM and inactive-session boundaries are hardened and tested. Removed duplicate
+verifier; old public remap/memo helpers now exercise production finalization.
+Final combined tests, wasm and both 84-digest hashgate legs pass; 15 dependency
+tests pass and diff check is clean. Remaining doc41 items are arc-wide review/
+artifact/performance closure and the later architecture arcs, not these two
+ownership extractions. No benchmark rerun or commit.
+
+First implemented slice: pure arithmetic evaluation now lives in `ir_eval.zig`.
+Optimizer production imports use `trace_ir.zig` and `ir_eval.zig`, eliminating
+its dependency on interpreter/lifecycle code. The existing bounded-loop
+execution differential test imports runtime modules locally. No compatibility
+forwarders were retained. Baseline and post-change `just test` both passed.
+
+Shared execution contract is now implemented in `trace_exec.zig`: results,
+exit reasons, ledger vocabulary/capacity and sentinel are imported directly by
+both executors and lifecycle consumers. No irinterp compatibility reexports.
+Native transport remains backend-owned; focused defaults/ordinal tests and
+`just test` passed. Standalone `zig test src/ir_eval.zig` also passed 40 tests,
+including mixed-numeric, signed-zero and exact-integer comparison cases.
+
+TraceCode is now embedded by value in the existing stable heap Trace record.
+Compiler/executor/serializer consume code directly; native compile APIs receive
+an explicit trace ID, and seed callbacks receive the stable embedded code pointer.
+Record destruction releases native state before code arrays. Static bridge and
+loop-done classification now belong to code. All callers/tests migrated; no
+extra per-trace allocation. `just test`, `zig build wasm`, and `just hashgate`
+(84 digests each Debug/ReleaseFast) passed after migration. Further verification
+is in progress; phase 1 is NOT yet declared complete.
+
+Added tools/check-jit-boundaries.py and 9 scanner tests, wired into just test.
+Native differential expectMatch now uses the production arena/trampoline and
+compares guest local progress and exit identity, allowing explicit native
+prologue refusal and value-lane fused-load tag guard identity differences.
+The stricter exit check initially exposed that documented fused identity
+asymmetry (IR reports guard, native reports its load); normalization checks the
+actual load/guard relation, not an unconditional mismatch allowance.
+
+Continuation: added four TraceCode ownership/const-interface/fingerprint tests
+and a TraceRecord teardown test. Mutable TraceRecord now lives in
+trace_record.zig (no direct coordinator import); the obsolete duplicate was
+removed. Serializer integration tests moved to traceser_test.zig, eliminating
+a module-scope runtime import from the codec. Dependency checker now enforces
+executor/serializer direct boundaries and optimizer/code transitive boundaries
+with 10 scanner tests. Full executor transitive isolation still crosses the
+known stdlib→VM capability cycle, tracked in the later runtime arc.
+
+Started registry publication contract: trace_link.ArmRequest includes region
+identity/generation. Region policy no longer arms and then edits the registry
+row; fresh/changed/identical arms publish or refresh proof metadata inside the
+owner. Added tests for proof refresh, row count stability and invalid kind/proof
+rejection. This is a prerequisite, NOT the completed registry ownership move;
+arm still takes TraceState and old non-region callers use armNativeLink.
+Next: move physical links/promotion/barrier state into the registry with no
+coordinator back-reference, preserving demotion/settle ordering, then policy and
+recording ownership. Duplicated frameless helper removed;
+its callers use the strengthened production-path expectMatch. Final just test
+passed after consolidation. Existing gc/viz changes preserved; wasm serialization
+caller adapted in a separate region from its preexisting compile fix.
+Some delegated shell writes hit a Gothab internal path panic; parent completed
+migration using working shell/edit tools. No commits made.
+
 ## Status 2026-09-05 (LATEST-106) — cleanup pass: trace.zig dead-code sweep + 5-slice file split LANDED
 
 trace.zig 17,128 → 4,993 lines, pure code motion (Bart-approved plan:

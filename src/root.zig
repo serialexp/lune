@@ -138,6 +138,8 @@ test {
     _ = compiler;
     _ = interp;
     _ = trace;
+    _ = @import("trace_candidate.zig");
+    _ = @import("trace_finalize_test.zig");
     _ = jitdbg;
     _ = irinterp;
     _ = x64;

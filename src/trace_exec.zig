@@ -1,0 +1,239 @@
+//! Executor-independent semantic results for trace execution.
+//!
+//! Both tier-1a and tier-1b produce this contract. Native's layout-pinned extern
+//! transport and its explicit decoding remain in `nativegen.zig`.
+
+const std = @import("std");
+
+/// Sentinel `final_trace_id`: "no chain-final trace was identified" — a tier-1a
+/// result (which always belongs to the entered trace) or a native result whose
+/// exit stub somehow didn't write the id. The dispatcher resolves it to the entered
+/// trace `ct`. `maxInt(u32)` is unreachable as a real `Trace.id` (a session never
+/// records 4 billion traces).
+pub const NO_TRACE_ID: u32 = std.math.maxInt(u32);
+
+/// Why a (possibly chained) native run left its final body. Distinct from
+/// `exit_instr` because `exit_instr == maxInt` is overloaded: on tier-1a it means
+/// "ran to natural completion" (a real, productive exit), while on native it is ALSO
+/// baked by `prologue_fail` (a hoisted entry-type guard failed BEFORE the body
+/// committed any of its own iterations — no guard identity, zero local progress).
+/// 2.3c-0b (doc 17) splits those apart so the dispatcher/`driveChain` can model a
+/// chained child that prologue-fails after the parent committed as three independent
+/// facts (final = child, `local_completed == 0`, chain `completed > 0`) instead of
+/// re-deriving intent from the `maxInt` artifact. Backed `u32` so it matches the
+/// JIT-emitted `movMemImm32` store into `NativeResult`.
+pub const ExitReason = enum(u32) {
+    /// A guard / terminal / loop-done exit with a valid `exit_instr`, OR a tier-1a
+    /// clean loop completion (`exit_instr == maxInt`, `completed > 0`). In every case
+    /// `exit_instr`/`completed` mean exactly what they say.
+    normal = 0,
+    /// Native only: a hoisted entry-type guard failed pre-commit. `exit_instr` carries
+    /// no guard identity (`maxInt`); `local_completed == 0` even when the enclosing
+    /// chain holds nonzero cumulative progress in `completed`.
+    prologue_fail = 1,
+    /// Doc 22 §B.2, native only: a seeded page's entry prologue called the seeding
+    /// twin (`nativeSeedFn`) and a `hash_cell` seed failed validation (metatable
+    /// appeared, key vanished, population drifted). The slab holds exactly the state
+    /// VM-side seeding leaves on the same failure (the 0-bits cell slot IS written),
+    /// so the dispatcher reruns THIS entry on tier-1a — same shape as the pre-B-ii
+    /// `native_eligible = false` route. Like `prologue_fail`: no guard identity
+    /// (`exit_instr == maxInt`), zero local progress. No strike is charged.
+    seed_hash_decline = 2,
+    /// Doc 22 §B.2, native only: the seeding twin declined before ANY slab write
+    /// because the seed slots don't fit the register slab (`base + count >
+    /// capacity`). The candidate itself is unusable at this depth — the dispatcher
+    /// moves to the next candidate (the native analogue of `seedTraceInputs`
+    /// returning null). No guard identity, zero local progress, no strike.
+    seed_capacity_decline = 3,
+};
+
+/// 2.3c-2a (doc 17): capacity of the per-transition native ledger carried in
+/// `NativeResult`. A fused native span (`C→I→C→…` chained under the shared frame)
+/// returns ONE result whose scalar fields describe only the TERMINAL body; every
+/// intermediate exit is otherwise unrecoverable. Each exit-materialization appends
+/// one entry so `runLinkedBurst` can replay the hops it never re-entered Zig to
+/// observe. Sized to cover the burst-hop bound (≤9 enclosing iterations × 2
+/// transitions/iteration = 18) in a single native span so the common closed-cycle
+/// case never forces an early yield; the native append is bounds-guarded, so an
+/// over-long span drops the overflow entry (2.3c-2a/b, no cycle → never reached) or,
+/// once 2.3c-2c closes the cycle, a chain-source forces a yield to `shared_exit`.
+pub const LEDGER_CAP: usize = 32;
+
+/// Result of executing a trace.
+pub const ExecResult = struct {
+    /// Tier-1a: completed guest iterations. Native: raw chain-cumulative back-edge
+    /// count, also used by the ledger. For a peeled native trace, local_completed
+    /// includes the run-once iteration whereas this raw counter does not.
+    completed: usize,
+    /// Index of the failing IR instruction when completed==0 (guard/arith
+    /// failure). `maxInt(u32)` means the trace ran to completion with no
+    /// failure (completed > 0).
+    exit_instr: u32,
+    /// P-B (doc 17): the stable `Trace.id` of the trace that performed the FINAL
+    /// exit of the (possibly chained) native run. Native bakes this per exit stub;
+    /// tier-1a leaves it at `NO_TRACE_ID` (a single `execute` call always belongs to
+    /// the entered trace). Defaulted so the ~40 tier-1a construction sites are
+    /// untouched. The dispatcher maps `(final_trace_id, exit_instr)` → the final
+    /// trace; with no linking yet this is always the entered trace.
+    final_trace_id: u32 = NO_TRACE_ID,
+    /// 2.3b-0 (doc 17): iterations committed by the FINAL trace's OWN loop, as
+    /// opposed to `completed` which is the chain-cumulative count (`rbx`). Native
+    /// derives its raw count as `completed − entry_rbx`, where `entry_rbx` is the
+    /// value at final-body entry. For peeled code, nonzero raw progress gains one
+    /// guest iteration for the run-once region. Unchained, non-peeled executions
+    /// have equal local and cumulative counts. A child entered under the shared
+    /// frame inherits its parent's `rbx`, and the accounting that steers
+    /// recording (`onSideExit`) must use this local count, never the inflated
+    /// cumulative one. Defaulted to 0 so the ~40 tier-1a construction sites are
+    /// untouched; `local_completed` is only ever READ on the native chained path
+    /// (`driveChain`, `tier == .native_only`) — the tier-1a chain path reads
+    /// `completed` directly (a single `execute` is never fused, so its local count IS
+    /// its `completed`).
+    local_completed: usize = 0,
+    /// 2.3c-0b (doc 17): why the final body exited, disambiguating the overloaded
+    /// `exit_instr == maxInt`. Native marshals it from `NativeResult.exit_reason`;
+    /// tier-1a leaves it `.normal` (a single `execute` either takes a real guard exit
+    /// or completes cleanly — it has no hoisted-entry-guard prologue to fail).
+    /// Defaulted so the ~40 tier-1a construction sites are untouched; only ever READ on
+    /// the native chained path (`driveChain`, `tier == .native_only`).
+    exit_reason: ExitReason = .normal,
+    /// 2.3c-2a (doc 17): number of exit-materializations the (possibly fused) native
+    /// span recorded in `NativeResult`'s per-transition ledger. 1 for an un-fused run;
+    /// >1 when an armed slot chained bodies under the shared frame (a `C→I` `.link`
+    /// fusion records 2 — C's terminal exit then I's). In 2.3c-2a the ledger ENTRIES
+    /// are not carried here (the drain still reads scalar fields); `runLinkedBurst`
+    /// consumes them in 2.3c-2b. Native only — tier-1a leaves it 0 (defaulted, so the
+    /// ~40 tier-1a construction sites are untouched).
+    ledger_len: usize = 0,
+    /// Doc 17 B-3 frozen silent-burst ABI. Tier-1a and B-3a native runs leave these
+    /// zero; B-3b will consume them through the universal native-result drain.
+    silent_active: u64 = 0,
+    silent_transitions: u64 = 0,
+    silent_budget: u64 = 0,
+    barren_budget: u64 = 0,
+    silent_cell: u64 = 0,
+    cur_zero_run: u64 = 0,
+    silent_cum: u64 = 0,
+    /// Address of the `SilentExitMetadata` of the LAST promoted edge that fired.
+    /// Round-6 exactness: the terminal edge is measured, never reconstructed from
+    /// the transition count (see `TraceState.silentCellOwner`).
+    silent_last_cell: u64 = 0,
+};
+
+/// 2.3c-2c (doc 17): which exit-materialization SITE appended a ledger entry —
+/// the static discriminator the generic `replayLedger` needs to classify a hop's
+/// coherent-resume contract without re-deriving it from the trace IR. There is
+/// exactly one value per native exit-materialization site (see `emitLedgerAppend`
+/// callers in `nativegen.zig`); the append bakes the site's compile-time constant.
+/// Finer distinctions WITHIN `.deopt` (ordinary source-branch guard vs. ordinary
+/// numeric-for loop-done vs. plain mid-loop guard) stay derived from `exit` + the
+/// trace IR (`guardExitPc` + `for_loop`) exactly as the ≤2-entry drain does today —
+/// they all share one emit site and one resume contract (tier-0 at the exit PC), so
+/// they need no separate kind.
+pub const LedgerKind = enum(u32) {
+    /// `.link` terminal hand-off (single-contract). Chain source when its slot is
+    /// armed; the linked child is the inner root at `.link.aux`. Regs coherent at
+    /// that inner PC.
+    link_terminal = 0,
+    /// Numeric-`for` loop-done, LINKED materialization (mode 1): the final iteration's
+    /// post-guard stores + phi snapshot were committed, so regs are coherent at the
+    /// continuation anchor PC. Chain source when its `slot[ei]` is armed (2.3c-2c).
+    loop_done_linked = 1,
+    /// The shared `deopt_exit` flush: an ordinary per-guard side exit, an ordinary
+    /// (mode 0) numeric-`for` loop-done deopt, or a plain mid-loop guard. Regs coherent
+    /// at the guard's exit PC for tier-0 replay. Chain source when the mini-stub's
+    /// `slot[ei]` is armed (2.3c-1, source-branch guards).
+    deopt = 2,
+    /// A hoisted entry-type guard failed pre-commit (`exit_instr = -1`,
+    /// `reason = .prologue_fail`). Always terminal — never a chain source.
+    prologue_fail = 3,
+    /// Part A-v (doc 17): a composite-guard bridge committed the parent trace's
+    /// dominating phi updates before handing off to an outer-loop successor.
+    /// A-v emits this site but never arms it, so no runtime ledger can contain
+    /// this kind until A-vii lands the arm and replay contract.
+    region_bridge = 4,
+    /// Doc 22 §B.2: a seeded page's entry prologue declined on `hash_cell`
+    /// validation (`reason = .seed_hash_decline`, `exit_instr = -1`). Always
+    /// terminal — the decline happens before the body runs, never a chain source.
+    seed_hash_decline = 5,
+    /// Doc 22 §B.2: a seeded page's entry prologue declined on slab capacity
+    /// (`reason = .seed_capacity_decline`, `exit_instr = -1`, nothing written).
+    /// Always terminal.
+    seed_capacity_decline = 6,
+};
+
+/// 2.3c-2c (doc 17): what a chain-source exit DID with its (possibly armed) slot —
+/// the signal the generic `replayLedger` needs to tell a forced yield apart from a
+/// natural terminal, which position alone cannot (both are the LAST ledger entry).
+/// Only `.yielded` is stamped at runtime (in the static forced-yield branch of
+/// `emitForcedYieldCheck`); `.normal` is the default every append writes.
+/// `.normal` is deliberately two-in-one — a non-final `.normal` entry DISPATCHED
+/// (an armed slot carried control into the successor recorded next), a final
+/// `.normal` entry is a natural TERMINAL (unarmed → `shared_exit`, or a plain
+/// deopt/prologue-fail). Replay disambiguates those two by position; the successor-
+/// adjacency validation (2.3c-2c) is what makes the positional inference sound.
+pub const LedgerOutcome = enum(u32) {
+    /// Dispatched into a successor (non-final) OR a natural terminal (final).
+    normal = 0,
+    /// Forced yield: an ARMED chain source hit a full ledger (`ledger_len == CAP`)
+    /// and jumped to `shared_exit` instead of its child, bounding the closed cycle.
+    /// The cycle may not be finished — the driver re-enters at the coherent resume
+    /// PC to continue it.
+    yielded = 1,
+};
+
+/// 2.3c-2b (doc 17): one decoded entry from the native per-transition ledger. A
+/// fused native span returns ONE `NativeResult` whose scalar fields describe only
+/// the TERMINAL body; `runLinkedBurst` copies the parallel `ledger_*[0..ledger_len]`
+/// arrays into a `TraceState`-owned scratch of these (via `runCapturingLedger`) and
+/// replays each recorded hop instead of reading the terminal-only scalars. `cum` is
+/// the cumulative `rbx` at that exit; the per-segment local of entry `i` is
+/// `cum[i] − cum[i-1]` (`cum[-1] = 0`, the trampoline-zeroed call-start `rbx`).
+pub const LedgerEntry = struct {
+    /// Cumulative `rbx` (enclosing-iteration counter) at this exit.
+    cum: usize,
+    /// `Trace.id` whose body performed this exit.
+    id: u32,
+    /// That exit's `exit_instr` (`maxInt(u32)` for a prologue fail).
+    exit: u32,
+    /// Why the body exited (`.normal` / `.prologue_fail`).
+    reason: ExitReason,
+    /// 2.3c-2c: the exit-materialization site that appended this entry. Written by
+    /// `emitLedgerAppend` from a per-site compile-time constant; only READ by the
+    /// generic `replayLedger` (2.3c-2c) — inert until then.
+    kind: LedgerKind = .deopt,
+    /// 2.3c-2c: whether this exit force-yielded. Default `.normal`; the forced-yield
+    /// branch stamps `.yielded`. Only READ by the generic `replayLedger` — inert
+    /// until the cycle can fill the ledger (2.3c-2e).
+    outcome: LedgerOutcome = .normal,
+};
+
+test "execution contract defaults" {
+    const result = ExecResult{ .completed = 3, .exit_instr = 7 };
+    try std.testing.expectEqual(NO_TRACE_ID, result.final_trace_id);
+    try std.testing.expectEqual(@as(usize, 0), result.local_completed);
+    try std.testing.expectEqual(ExitReason.normal, result.exit_reason);
+    try std.testing.expectEqual(@as(usize, 0), result.ledger_len);
+    try std.testing.expectEqual(@as(u64, 0), result.silent_last_cell);
+
+    const entry = LedgerEntry{ .cum = 3, .id = 11, .exit = 7, .reason = .normal };
+    try std.testing.expectEqual(LedgerKind.deopt, entry.kind);
+    try std.testing.expectEqual(LedgerOutcome.normal, entry.outcome);
+}
+
+test "execution contract wire ordinals and capacity" {
+    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(ExitReason.normal));
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(ExitReason.prologue_fail));
+    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(ExitReason.seed_hash_decline));
+    try std.testing.expectEqual(@as(u32, 3), @intFromEnum(ExitReason.seed_capacity_decline));
+    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(LedgerKind.link_terminal));
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(LedgerKind.loop_done_linked));
+    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(LedgerKind.deopt));
+    try std.testing.expectEqual(@as(u32, 3), @intFromEnum(LedgerKind.prologue_fail));
+    try std.testing.expectEqual(@as(u32, 4), @intFromEnum(LedgerKind.region_bridge));
+    try std.testing.expectEqual(@as(u32, 5), @intFromEnum(LedgerKind.seed_hash_decline));
+    try std.testing.expectEqual(@as(u32, 6), @intFromEnum(LedgerKind.seed_capacity_decline));
+    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(LedgerOutcome.normal));
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(LedgerOutcome.yielded));
+    try std.testing.expectEqual(@as(usize, 32), LEDGER_CAP);
+}

@@ -45,9 +45,17 @@ const util = @import("trace_testutil.zig");
 const winRO = util.winRO;
 
 test "matchesFingerprint: empty fingerprint always matches" {
-    const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    const t = Trace{
+        .code = .{
+            .anchor = undefined,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+    };
     var regs = [_]Value{ Value.int(1), Value.float(3.14), Value.nil() };
-    try testing.expect(t.matchesFingerprint(winRO(&regs)));
+    try testing.expect(t.code.matchesFingerprint(winRO(&regs)));
 }
 
 test "nextTraceExcluding: visits each anchor trace once, highest-hit first, then null" {
@@ -74,18 +82,20 @@ test "nextTraceExcluding: visits each anchor trace once, highest-hit first, then
     for (&traces, specs) |*slot, spec| {
         const tr = try gpa.create(Trace);
         tr.* = .{
-            .anchor = .{ .proto = &proto, .pc = spec.pc },
-            .instrs = @constCast(&loop_only),
-            .consts = &.{},
-            .entry_slots = &.{},
-            .entry_guards = &.{},
+            .code = .{
+                .anchor = .{ .proto = &proto, .pc = spec.pc },
+                .instrs = @constCast(&loop_only),
+                .consts = &.{},
+                .entry_slots = &.{},
+                .entry_guards = &.{},
+            },
             .hit_count = spec.hits,
         };
         slot.* = tr;
-        try state.cache.append(gpa, tr);
+        try state.registry.cache.append(gpa, tr);
     }
     defer {
-        state.cache.clearRetainingCapacity();
+        state.registry.cache.clearRetainingCapacity();
         for (traces) |tr| gpa.destroy(tr);
     }
 
@@ -108,39 +118,71 @@ test "matchesFingerprint: matching types" {
         .{ .slot = 0, .ty = .int },
         .{ .slot = 1, .ty = .float },
     };
-    const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
+    const t = Trace{
+        .code = .{
+            .anchor = undefined,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = @constCast(&entry_guards),
+        },
+    };
     var regs = [_]Value{ Value.int(42), Value.float(3.14) };
-    try testing.expect(t.matchesFingerprint(winRO(&regs)));
+    try testing.expect(t.code.matchesFingerprint(winRO(&regs)));
 }
 
 test "matchesFingerprint: mismatched int/float" {
     const entry_guards = [_]EntryGuard{
         .{ .slot = 0, .ty = .int },
     };
-    const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
+    const t = Trace{
+        .code = .{
+            .anchor = undefined,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = @constCast(&entry_guards),
+        },
+    };
     // Register holds a float, but the trace expects int.
     var regs = [_]Value{Value.float(2.5)};
-    try testing.expect(!t.matchesFingerprint(winRO(&regs)));
+    try testing.expect(!t.code.matchesFingerprint(winRO(&regs)));
 }
 
 test "matchesFingerprint: guard_number accepts both int and float" {
     const entry_guards = [_]EntryGuard{
         .{ .slot = 0, .ty = .number },
     };
-    const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
-    try testing.expect(t.matchesFingerprint(winRO(@constCast(&[_]Value{Value.int(1)}))));
-    try testing.expect(t.matchesFingerprint(winRO(@constCast(&[_]Value{Value.float(1.5)}))));
-    try testing.expect(!t.matchesFingerprint(winRO(@constCast(&[_]Value{Value.nil()}))));
-    try testing.expect(!t.matchesFingerprint(winRO(@constCast(&[_]Value{Value.boolean(true)}))));
+    const t = Trace{
+        .code = .{
+            .anchor = undefined,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = @constCast(&entry_guards),
+        },
+    };
+    try testing.expect(t.code.matchesFingerprint(winRO(@constCast(&[_]Value{Value.int(1)}))));
+    try testing.expect(t.code.matchesFingerprint(winRO(@constCast(&[_]Value{Value.float(1.5)}))));
+    try testing.expect(!t.code.matchesFingerprint(winRO(@constCast(&[_]Value{Value.nil()}))));
+    try testing.expect(!t.code.matchesFingerprint(winRO(@constCast(&[_]Value{Value.boolean(true)}))));
 }
 
 test "matchesFingerprint: guard_table" {
     const entry_guards = [_]EntryGuard{
         .{ .slot = 0, .ty = .table },
     };
-    const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
-    try testing.expect(!t.matchesFingerprint(winRO(@constCast(&[_]Value{Value.int(1)}))));
-    try testing.expect(!t.matchesFingerprint(winRO(@constCast(&[_]Value{Value.float(1.0)}))));
+    const t = Trace{
+        .code = .{
+            .anchor = undefined,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = @constCast(&entry_guards),
+        },
+    };
+    try testing.expect(!t.code.matchesFingerprint(winRO(@constCast(&[_]Value{Value.int(1)}))));
+    try testing.expect(!t.code.matchesFingerprint(winRO(@constCast(&[_]Value{Value.float(1.0)}))));
 }
 
 fn testGuardProv(pc: u32, role: GuardRole, operand: OperandDesig) ExitProvenance {
@@ -172,12 +214,21 @@ test "buildExitProv: null map is the identity (dupe path), result stays sorted (
     try testing.expectEqual(@as(u32, 1), out[0].index);
     try testing.expectEqual(@as(u32, 3), out[1].index);
     // Sorted ascending → binary search via provAt works.
-    const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = @constCast(out) };
-    try testing.expect(t.provAt(0) == null);
-    try testing.expectEqual(@as(u32, 10), t.provAt(1).?.guard.source_pc);
-    try testing.expect(t.provAt(2) == null);
-    try testing.expectEqual(@as(u32, 20), t.provAt(3).?.guard.source_pc);
-    try testing.expect(t.provAt(4) == null);
+    const t = Trace{
+        .code = .{
+            .anchor = undefined,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = @constCast(out),
+        },
+    };
+    try testing.expect(t.code.provAt(0) == null);
+    try testing.expectEqual(@as(u32, 10), t.code.provAt(1).?.guard.source_pc);
+    try testing.expect(t.code.provAt(2) == null);
+    try testing.expectEqual(@as(u32, 20), t.code.provAt(3).?.guard.source_pc);
+    try testing.expect(t.code.provAt(4) == null);
 }
 
 test "§T.9 bridge-candidate memo: bit-identical to the oracle at every index, unbuilt falls back" {
@@ -206,40 +257,68 @@ test "§T.9 bridge-candidate memo: bit-identical to the oracle at every index, u
         .{ .op = .phi, .b = 2, .aux = 0 },
         .{ .op = .link, .aux = 7 },
     };
-    var cont: Trace = .{ .id = 900, .anchor = .{ .proto = &proto, .pc = 29 }, .instrs = &cont_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_prov };
+    var cont: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 29 },
+            .instrs = &cont_instrs,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &cont_prov,
+        },
+        .id = 900,
+    };
 
     // (a) Unbuilt — hand-built test traces never go through commit; the accessor
     // must BE the oracle.
-    try testing.expect(!cont.bridge_cand_built);
+    try testing.expect(!cont.code.bridge_cand_built);
     for (0..cont_instrs.len + 4) |i|
-        try testing.expectEqual(nativegen.isCompositeBridgeCandidate(&cont, i), cont.isBridgeCandidate(i));
-    try testing.expect(cont.isBridgeCandidate(3)); // known bridge slot
+        try testing.expectEqual(nativegen.isCompositeBridgeCandidate(&cont.code, i), cont.code.isBridgeCandidate(i));
+    try testing.expect(cont.code.isBridgeCandidate(3)); // known bridge slot
 
     // (b) Built — still bit-identical everywhere, in and out of bounds.
     buildBridgeCandMemo(gpa, &cont);
-    defer if (cont.bridge_cand.len != 0) gpa.free(cont.bridge_cand);
-    try testing.expect(cont.bridge_cand_built);
+    defer if (cont.code.bridge_cand.len != 0) gpa.free(cont.code.bridge_cand);
+    try testing.expect(cont.code.bridge_cand_built);
     for (0..cont_instrs.len + 4) |i|
-        try testing.expectEqual(nativegen.isCompositeBridgeCandidate(&cont, i), cont.isBridgeCandidate(i));
-    try testing.expect(cont.isBridgeCandidate(3));
+        try testing.expectEqual(nativegen.isCompositeBridgeCandidate(&cont.code, i), cont.code.isBridgeCandidate(i));
+    try testing.expect(cont.code.isBridgeCandidate(3));
 
     // (c) An all-false trace: a built memo must not invent a candidate.
     var skip_instrs = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
-    var skip: Trace = .{ .id = 901, .anchor = .{ .proto = &proto, .pc = 25 }, .instrs = &skip_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var skip: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 25 },
+            .instrs = &skip_instrs,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 901,
+    };
     buildBridgeCandMemo(gpa, &skip);
-    defer if (skip.bridge_cand.len != 0) gpa.free(skip.bridge_cand);
-    try testing.expect(skip.bridge_cand_built);
+    defer if (skip.code.bridge_cand.len != 0) gpa.free(skip.code.bridge_cand);
+    try testing.expect(skip.code.bridge_cand_built);
     for (0..skip_instrs.len + 2) |i| {
-        try testing.expect(!skip.isBridgeCandidate(i));
-        try testing.expectEqual(nativegen.isCompositeBridgeCandidate(&skip, i), skip.isBridgeCandidate(i));
+        try testing.expect(!skip.code.isBridgeCandidate(i));
+        try testing.expectEqual(nativegen.isCompositeBridgeCandidate(&skip.code, i), skip.code.isBridgeCandidate(i));
     }
 
     // (d) Empty trace: marked built, allocates nothing, every index false.
-    var empty: Trace = .{ .id = 902, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var empty: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 0 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 902,
+    };
     buildBridgeCandMemo(gpa, &empty);
-    try testing.expect(empty.bridge_cand_built);
-    try testing.expectEqual(@as(usize, 0), empty.bridge_cand.len);
-    try testing.expect(!empty.isBridgeCandidate(0));
+    try testing.expect(empty.code.bridge_cand_built);
+    try testing.expectEqual(@as(usize, 0), empty.code.bridge_cand.len);
+    try testing.expect(!empty.code.isBridgeCandidate(0));
 }
 
 test "pathFromFrames: f(a);f(b) at distinct call sites give distinct inline paths (A-i.2)" {
@@ -371,7 +450,7 @@ test "A-i.4 transport: recForPrepLink commits a .link trace carrying .link_termi
     defer state.deinit();
     defer {
         if (committed) |ct| ct.destroy(gpa);
-        state.cache.clearRetainingCapacity();
+        state.registry.cache.clearRetainingCapacity();
     }
 
     // Bytecode shape: `for_prep` recorded at post-increment pc 5 (its guest opcode is
@@ -385,14 +464,16 @@ test "A-i.4 transport: recForPrepLink commits a .link trace carrying .link_termi
     // A pre-existing inner `.loop` root at (proto, 5) — LINNER only links if one exists.
     const inner_instrs = [_]IrInstr{.{ .op = .loop }};
     var inner: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 5 },
+            .instrs = @constCast(&inner_instrs),
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 900,
-        .anchor = .{ .proto = &proto, .pc = 5 },
-        .instrs = @constCast(&inner_instrs),
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
     };
-    try state.cache.append(gpa, &inner);
+    try state.registry.cache.append(gpa, &inner);
 
     // Arm a *continuation* recording (a `.root` recording aborts LINNER at for_prep).
     try state.rec.reset(gpa, .{ .proto = &proto, .pc = 2 }, proto.num_registers);
@@ -404,15 +485,15 @@ test "A-i.4 transport: recForPrepLink commits a .link trace carrying .link_termi
 
     // Recording closed (committed a `.link` trace). The new trace is last in cache.
     try testing.expect(!state.isRecording());
-    const t = state.cache.items[state.cache.items.len - 1];
+    const t = state.registry.cache.items[state.registry.cache.items.len - 1];
     committed = t; // hand to the cleanup defer
     try testing.expect(t.id != 900); // not the pre-seeded inner root
-    const last = t.instrs.len - 1;
-    try testing.expectEqual(IrOp.link, t.instrs[last].op);
-    try testing.expectEqual(@as(i32, 5), t.instrs[last].aux); // links to inner anchor pc 5
+    const last = t.code.instrs.len - 1;
+    try testing.expectEqual(IrOp.link, t.code.instrs[last].op);
+    try testing.expectEqual(@as(i32, 5), t.code.instrs[last].aux); // links to inner anchor pc 5
 
     // The `.link` terminal's provenance is present at the terminal's committed index.
-    const prov = t.provAt(@intCast(last)) orelse return error.MissingLinkProvenance;
+    const prov = t.code.provAt(@intCast(last)) orelse return error.MissingLinkProvenance;
     try testing.expect(prov == .link_terminal);
     try testing.expectEqual(@as(u32, 4), prov.link_terminal.source_pc); // cur_pc 5 − 1
     try testing.expectEqual(@as(u8, 0), prov.link_terminal.inline_depth); // never inlined

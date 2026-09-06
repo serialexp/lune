@@ -52,11 +52,13 @@ test "driveChain ordinary_header: chains to a same-anchor sibling" {
     const consts_a = [_]Value{};
     var trace_a = try gpa.create(Trace);
     trace_a.* = .{
-        .anchor = .{ .proto = undefined, .pc = 10 },
-        .instrs = @constCast(&instrs_a),
-        .consts = @constCast(&consts_a),
-        .entry_slots = &entry_a,
-        .entry_guards = &.{},
+        .code = .{
+            .anchor = .{ .proto = undefined, .pc = 10 },
+            .instrs = @constCast(&instrs_a),
+            .consts = @constCast(&consts_a),
+            .entry_slots = &entry_a,
+            .entry_guards = &.{},
+        },
     };
 
     // Trace B: a sibling at the SAME anchor (pc 10) — a simple counting loop
@@ -77,21 +79,23 @@ test "driveChain ordinary_header: chains to a same-anchor sibling" {
     const consts_b = [_]Value{Value.int(1)};
     var trace_b = try gpa.create(Trace);
     trace_b.* = .{
-        .anchor = .{ .proto = undefined, .pc = 10 }, // same anchor as A
-        .instrs = @constCast(&instrs_b),
-        .consts = @constCast(&consts_b),
-        .entry_slots = &entry_b,
-        .entry_guards = &.{},
+        .code = .{
+            .anchor = .{ .proto = undefined, .pc = 10 }, // same anchor as A
+            .instrs = @constCast(&instrs_b),
+            .consts = @constCast(&consts_b),
+            .entry_slots = &entry_b,
+            .entry_guards = &.{},
+        },
     };
 
     // Put both traces in the cache.
-    try state.cache.append(gpa, trace_a);
-    try state.cache.append(gpa, trace_b);
+    try state.registry.cache.append(gpa, trace_a);
+    try state.registry.cache.append(gpa, trace_b);
 
     // Set proto on anchors (needed for findTrace lookup).
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 2 };
-    trace_a.anchor.proto = &proto;
-    trace_b.anchor.proto = &proto;
+    trace_a.code.anchor.proto = &proto;
+    trace_b.code.anchor.proto = &proto;
 
     // Regs: r0=0, r1=4 → Trace B should run 3 iterations (0,1,2;
     // iteration 3 computes 3<4 which is true, runs, then 4<4 fails).
@@ -109,7 +113,7 @@ test "driveChain ordinary_header: chains to a same-anchor sibling" {
 
     // Remove traces from cache before deinit — they have stack-allocated
     // arrays that must not be freed by destroy().
-    state.cache.clearRetainingCapacity();
+    state.registry.cache.clearRetainingCapacity();
     // Free the Trace heap allocations ourselves (instrs/consts/entry_slots
     // are stack memory, so skip those fields by not calling destroy).
     gpa.destroy(trace_a);
@@ -120,7 +124,7 @@ test "tryArmSiblingHandoff publishes complete Part-S bookkeeping" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity(); // stack-backed traces
+    defer state.registry.cache.clearRetainingCapacity(); // stack-backed traces
 
     const proto = Proto{
         .code = &.{Instr.op0(.ret)},
@@ -133,41 +137,46 @@ test "tryArmSiblingHandoff publishes complete Part-S bookkeeping" {
     };
     const parent_slots = try gpa.alloc(usize, parent_instrs.len);
     defer gpa.free(parent_slots);
+    defer state.disarmAllLinks(); // registry borrows fixture slot storage
     @memset(parent_slots, 0);
 
     var parent: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 7 },
+            .instrs = @constCast(&parent_instrs),
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 41,
-        .anchor = .{ .proto = &proto, .pc = 7 },
-        .instrs = @constCast(&parent_instrs),
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
         .native = .{ .compiled = .{ .page = undefined, .slots = parent_slots, .gpa = gpa } },
         .sibling_watch_exit = 0,
         .sibling_watch_count = 9,
     };
     var child: Trace = .{
+        .code = .{
+            .anchor = parent.code.anchor,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 42,
-        .anchor = parent.anchor,
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
         .native = .{ .compiled = .{
             .page = undefined,
             .gpa = gpa,
             .ordinary_entry = 0xCAFE,
         } },
     };
-    try state.cache.append(gpa, &parent);
-    try state.cache.append(gpa, &child);
+    try state.registry.cache.append(gpa, &parent);
+    try state.registry.cache.append(gpa, &child);
     state.pending_sibling_arm = .{ .trace_id = parent.id, .exit_instr = 0 };
 
     state.tryArmSiblingHandoff(&child, true);
 
     try testing.expectEqual(@as(?ExitKey, null), state.pending_sibling_arm);
-    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
-    const link = state.armed_links.items[0];
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.armed_links.items.len);
+    const link = state.registry.native_physical.armed_links.items[0];
     try testing.expectEqual(ArmKind.sibling_handoff, link.kind);
     try testing.expect(link.parent == &parent);
     try testing.expectEqual(@as(u32, 0), link.slot_index);
@@ -199,7 +208,7 @@ test "tryArmSiblingHandoff publishes complete Part-S bookkeeping" {
 const SeedStub = struct {
     var calls: usize = 0;
     var rc: u64 = trace.NativeSeedCtx.SEED_HASH_DECLINE;
-    fn seed(ctx: *const trace.NativeSeedCtx, t: *const Trace) u64 {
+    fn seed(ctx: *const trace.NativeSeedCtx, t: *const trace.TraceCode) u64 {
         _ = t;
         const tr: *TestRegs = @ptrCast(@alignCast(ctx.vm));
         const v = Value.int(2);
@@ -214,7 +223,7 @@ test "B-iii chained hash-drift (doc 22 §B.6): SEED_HASH_DECLINE still chains on
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity(); // stack/hand-owned traces
+    defer state.registry.cache.clearRetainingCapacity(); // stack/hand-owned traces
     SeedStub.calls = 0;
     SeedStub.rc = trace.NativeSeedCtx.SEED_HASH_DECLINE;
 
@@ -231,11 +240,13 @@ test "B-iii chained hash-drift (doc 22 §B.6): SEED_HASH_DECLINE still chains on
     const trace_a = try gpa.create(Trace);
     defer gpa.destroy(trace_a);
     trace_a.* = .{
-        .anchor = .{ .proto = &proto, .pc = 10 },
-        .instrs = @constCast(&instrs_a),
-        .consts = &.{},
-        .entry_slots = &entry_a,
-        .entry_guards = &.{},
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 10 },
+            .instrs = @constCast(&instrs_a),
+            .consts = &.{},
+            .entry_slots = &entry_a,
+            .entry_guards = &.{},
+        },
     };
 
     // Trace B: a SEEDED same-anchor sibling — the counting loop's increment is
@@ -261,16 +272,18 @@ test "B-iii chained hash-drift (doc 22 §B.6): SEED_HASH_DECLINE still chains on
     const trace_b = try gpa.create(Trace);
     defer gpa.destroy(trace_b);
     trace_b.* = .{
-        .anchor = .{ .proto = &proto, .pc = 10 }, // same anchor as A
-        .instrs = @constCast(&instrs_b),
-        .consts = &.{},
-        .entry_slots = &entry_b,
-        .entry_guards = &.{},
-        .inputs = &inputs_b,
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 10 }, // same anchor as A
+            .instrs = @constCast(&instrs_b),
+            .consts = &.{},
+            .entry_slots = &entry_b,
+            .entry_guards = &.{},
+            .inputs = &inputs_b,
+        },
     };
 
-    try state.cache.append(gpa, trace_a);
-    try state.cache.append(gpa, trace_b);
+    try state.registry.cache.append(gpa, trace_a);
+    try state.registry.cache.append(gpa, trace_b);
 
     // --- 1. Fail closed: no ctx installed (hand-built TraceState) → the walk
     // must skip the seeded candidate WITHOUT consulting any twin, exactly the
@@ -293,7 +306,7 @@ test "B-iii chained hash-drift (doc 22 §B.6): SEED_HASH_DECLINE still chains on
         .seed_fn = undefined, // C-ABI prologue twin — never called on the tier-1a walk
         .seed_tier1a_fn = &SeedStub.seed,
     };
-    state.native_seed_ctx = ctx;
+    state.registry.native_seed_ctx = ctx;
 
     // --- 2. THE hash-drift pin: the twin seeds slot 2 then reports
     // SEED_HASH_DECLINE — driveChain must STILL run the successor on tier-1a.
@@ -325,7 +338,7 @@ test "in-place re-arm releases the displaced sibling latch (sibling -> ordinary 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity(); // stack-backed traces
+    defer state.registry.cache.clearRetainingCapacity(); // stack-backed traces
 
     const proto = Proto{
         .code = &.{Instr.op0(.ret)},
@@ -338,27 +351,32 @@ test "in-place re-arm releases the displaced sibling latch (sibling -> ordinary 
     };
     const parent_slots = try gpa.alloc(usize, parent_instrs.len);
     defer gpa.free(parent_slots);
+    defer state.disarmAllLinks(); // registry borrows fixture slot storage
     @memset(parent_slots, 0);
     var parent: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 7 },
+            .instrs = @constCast(&parent_instrs),
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 45,
-        .anchor = .{ .proto = &proto, .pc = 7 },
-        .instrs = @constCast(&parent_instrs),
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
         .native = .{ .compiled = .{ .page = undefined, .slots = parent_slots, .gpa = gpa } },
     };
     var child: Trace = .{
+        .code = .{
+            .anchor = parent.code.anchor,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 46,
-        .anchor = parent.anchor,
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
         .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .ordinary_entry = 0xD00D } },
     };
-    try state.cache.append(gpa, &parent);
-    try state.cache.append(gpa, &child);
+    try state.registry.cache.append(gpa, &parent);
+    try state.registry.cache.append(gpa, &child);
 
     // sibling: latch counts 1.
     try testing.expect(state.publishSiblingArm(&parent, 0, &child));
@@ -368,7 +386,7 @@ test "in-place re-arm releases the displaced sibling latch (sibling -> ordinary 
     // leaks +1 per displace→republish cycle).
     try testing.expect(try state.armNativeLink(&parent, 0, &child, .ordinary_guard));
     try testing.expectEqual(@as(u32, 0), parent.sibling_arms);
-    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.armed_links.items.len);
     // sibling republish over the ordinary record: back to 1.
     try testing.expect(state.publishSiblingArm(&parent, 0, &child));
     try testing.expectEqual(@as(u32, 1), parent.sibling_arms);
@@ -382,7 +400,7 @@ test "in-place re-arm releases the displaced sibling latch (sibling -> ordinary 
     // physical disarm: back to 0, not underflowed.
     state.disarmLinkAt(0);
     try testing.expectEqual(@as(u32, 0), parent.sibling_arms);
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
 }
 
 // ---------------------------------------------------------------------------
@@ -396,7 +414,7 @@ test "in-place re-arm releases the displaced sibling latch (sibling -> ordinary 
 
 fn stubEnterableDummySeed(
     ctx: *const trace.NativeSeedCtx,
-    t: *const Trace,
+    t: *const trace.TraceCode,
     plan_bits: u64,
 ) callconv(.c) u64 {
     _ = ctx;
@@ -423,12 +441,14 @@ test "B-iv.1 stubEnterable (doc 22 §B.4): entry presence, unseeded pass, seeded
 
     // (1) Not compiled → false for both kinds (never compiles lazily).
     var uncompiled: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 1 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 60,
-        .anchor = .{ .proto = &proto, .pc = 1 },
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
     };
     try testing.expect(!state.stubEnterable(&uncompiled, .ordinary, &proto));
     try testing.expect(!state.stubEnterable(&uncompiled, .linked, &proto));
@@ -436,12 +456,14 @@ test "B-iv.1 stubEnterable (doc 22 §B.4): entry presence, unseeded pass, seeded
     // (2) Compiled, only the ordinary entry present: kind-selective. Unseeded
     // plan (default) → ordinary passes with NO episode ctx; linked has no stub.
     var ordinary_only: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 1 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 61,
-        .anchor = .{ .proto = &proto, .pc = 1 },
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
         .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .ordinary_entry = 0xCAFE } },
     };
     try testing.expect(state.stubEnterable(&ordinary_only, .ordinary, &proto));
@@ -450,12 +472,14 @@ test "B-iv.1 stubEnterable (doc 22 §B.4): entry presence, unseeded pass, seeded
     // (3) Seeded page (plan non-empty + prologue recorded, the §B.4 invariant
     // holding): fail-closed freshness ladder.
     var seeded: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 1 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 62,
-        .anchor = .{ .proto = &proto, .pc = 1 },
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
         .native = .{ .compiled = .{
             .page = undefined,
             .gpa = gpa,
@@ -470,7 +494,7 @@ test "B-iv.1 stubEnterable (doc 22 §B.4): entry presence, unseeded pass, seeded
 
     const ctx = try gpa.create(trace.NativeSeedCtx);
     ctx.* = .{ .seed_fn = stubEnterableDummySeed };
-    state.native_seed_ctx = ctx; // state.deinit() destroys it
+    state.registry.native_seed_ctx = ctx; // state.deinit() destroys it
 
     // (3b) Ctx present but never stamped (proto == null) → false.
     try testing.expect(!state.stubEnterable(&seeded, .ordinary, &proto));
@@ -478,7 +502,7 @@ test "B-iv.1 stubEnterable (doc 22 §B.4): entry presence, unseeded pass, seeded
     // (3c) Ctx stamped for a DIFFERENT frame proto → false.
     ctx.proto = @ptrCast(&other_proto);
     ctx.call_seq = 7;
-    state.region_context = .{ .depth = 0, .call_seq = 7 };
+    state.region_policy.region_context = .{ .depth = 0, .call_seq = 7 };
     try testing.expect(!state.stubEnterable(&seeded, .ordinary, &proto));
 
     // (3d) Ctx matches the live proto but the trace is anchored elsewhere → false.
@@ -491,11 +515,11 @@ test "B-iv.1 stubEnterable (doc 22 §B.4): entry presence, unseeded pass, seeded
     try testing.expect(state.stubEnterable(&seeded, .linked, &proto));
 
     // (3f) Frame token drift (new activation since the episode was stamped) → false.
-    state.region_context = .{ .depth = 0, .call_seq = 8 };
+    state.region_policy.region_context = .{ .depth = 0, .call_seq = 8 };
     try testing.expect(!state.stubEnterable(&seeded, .ordinary, &proto));
 
     // (3g) No region context at all (no frame transition observed yet) → false.
-    state.region_context = null;
+    state.region_policy.region_context = null;
     try testing.expect(!state.stubEnterable(&seeded, .ordinary, &proto));
 }
 
@@ -514,7 +538,7 @@ test "B-iv.3 (doc 22 §B.5): findLinkTrace + resolveLoopDoneCont admit a seeded 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity(); // stack-backed traces
+    defer state.registry.cache.clearRetainingCapacity(); // stack-backed traces
 
     const proto = Proto{
         .code = &.{Instr.op0(.ret)},
@@ -529,13 +553,15 @@ test "B-iv.3 (doc 22 §B.5): findLinkTrace + resolveLoopDoneCont admit a seeded 
         .{ .op = .link, .aux = 7 },
     };
     var cont: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 2 },
+            .instrs = @constCast(&cont_instrs),
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .inputs = &seed_inputs,
+        },
         .id = 71,
-        .anchor = .{ .proto = &proto, .pc = 2 },
-        .instrs = @constCast(&cont_instrs),
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
-        .inputs = &seed_inputs,
         .native = .{ .compiled = .{
             .page = undefined,
             .gpa = gpa,
@@ -544,7 +570,7 @@ test "B-iv.3 (doc 22 §B.5): findLinkTrace + resolveLoopDoneCont admit a seeded 
             .seed_prologue = true,
         } },
     };
-    try state.cache.append(gpa, &cont);
+    try state.registry.cache.append(gpa, &cont);
 
     // Pure selection: seeded is selectable, no episode ctx required.
     try testing.expect(state.findLinkTrace(&proto, 2) == &cont);
@@ -561,7 +587,7 @@ test "B-iv.3 (doc 22 §B.5): armNativeLink .sibling_handoff arms a seeded child 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity(); // stack-backed traces
+    defer state.registry.cache.clearRetainingCapacity(); // stack-backed traces
 
     const proto = Proto{
         .code = &.{Instr.op0(.ret)},
@@ -574,27 +600,32 @@ test "B-iv.3 (doc 22 §B.5): armNativeLink .sibling_handoff arms a seeded child 
     };
     const parent_slots = try gpa.alloc(usize, parent_instrs.len);
     defer gpa.free(parent_slots);
+    defer state.disarmAllLinks(); // registry borrows fixture slot storage
     @memset(parent_slots, 0);
     var parent: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 7 },
+            .instrs = @constCast(&parent_instrs),
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 81,
-        .anchor = .{ .proto = &proto, .pc = 7 },
-        .instrs = @constCast(&parent_instrs),
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
         .native = .{ .compiled = .{ .page = undefined, .slots = parent_slots, .gpa = gpa } },
     };
     // The SEEDED same-anchor sibling: pre-B-iv.3 the `.sibling_handoff` arm
     // refused it unconditionally on `inputs.len != 0`.
     var seed_inputs = [_]trace.InputSeed{undefined};
     var child: Trace = .{
+        .code = .{
+            .anchor = parent.code.anchor,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .inputs = &seed_inputs,
+        },
         .id = 82,
-        .anchor = parent.anchor,
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
-        .inputs = &seed_inputs,
         .native = .{ .compiled = .{
             .page = undefined,
             .gpa = gpa,
@@ -603,33 +634,33 @@ test "B-iv.3 (doc 22 §B.5): armNativeLink .sibling_handoff arms a seeded child 
             .seed_prologue = true,
         } },
     };
-    try state.cache.append(gpa, &parent);
-    try state.cache.append(gpa, &child);
+    try state.registry.cache.append(gpa, &parent);
+    try state.registry.cache.append(gpa, &child);
 
     // (1) No episode ctx at all → stubEnterable fail-closed → arm refused,
     // slot untouched (the pre-B-iv disposition).
     try testing.expect(!try state.armNativeLink(&parent, 0, &child, .sibling_handoff));
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
     try testing.expectEqual(@as(usize, 0), parent_slots[0]);
 
     // (2) Stale ctx (frame token drifted since the episode stamp) → refused.
     const ctx = try gpa.create(trace.NativeSeedCtx);
     ctx.* = .{ .seed_fn = stubEnterableDummySeed };
-    state.native_seed_ctx = ctx; // state.deinit() destroys it
+    state.registry.native_seed_ctx = ctx; // state.deinit() destroys it
     ctx.proto = @ptrCast(&proto);
     ctx.call_seq = 7;
-    state.region_context = .{ .depth = 0, .call_seq = 8 };
+    state.region_policy.region_context = .{ .depth = 0, .call_seq = 8 };
     try testing.expect(!try state.armNativeLink(&parent, 0, &child, .sibling_handoff));
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
     try testing.expectEqual(@as(usize, 0), parent_slots[0]);
 
     // (3) Fresh ctx (tokens agree) → the seeded child ARMS: the page prologue
     // owns the seeding at entry (§B.4), so the bare jump is safe.
-    state.region_context = .{ .depth = 0, .call_seq = 7 };
+    state.region_policy.region_context = .{ .depth = 0, .call_seq = 7 };
     try testing.expect(try state.armNativeLink(&parent, 0, &child, .sibling_handoff));
-    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
-    try testing.expectEqual(ArmKind.sibling_handoff, state.armed_links.items[0].kind);
-    try testing.expect(state.armed_links.items[0].child == &child);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.armed_links.items.len);
+    try testing.expectEqual(ArmKind.sibling_handoff, state.registry.native_physical.armed_links.items[0].kind);
+    try testing.expect(state.registry.native_physical.armed_links.items[0].child == &child);
     try testing.expectEqual(@as(usize, 0xCAFE), parent_slots[0]);
 }
 
@@ -768,11 +799,13 @@ test "driveChain ir_numeric_for_done: a longer candidate cannot invalidate the c
         .{ .op = .loop }, // %3
     };
     var failed = Trace{
-        .anchor = .{ .proto = &proto, .pc = 10 },
-        .instrs = @constCast(&instrs_f),
-        .consts = &.{},
-        .entry_slots = &entry_f,
-        .entry_guards = &.{},
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 10 },
+            .instrs = @constCast(&instrs_f),
+            .consts = &.{},
+            .entry_slots = &entry_f,
+            .entry_guards = &.{},
+        },
     };
 
     // The continuation at pc 1: `.link`-terminated (the only shape a loop-done
@@ -786,22 +819,24 @@ test "driveChain ir_numeric_for_done: a longer candidate cannot invalidate the c
     for (instrs_c[2 .. instrs_c.len - 1]) |*p| p.* = .{ .op = .loop }; // never reached
     instrs_c[instrs_c.len - 1] = .{ .op = .link, .aux = 1 };
     var cont = Trace{
-        .anchor = .{ .proto = &proto, .pc = 1 },
-        .instrs = &instrs_c,
-        .consts = &.{},
-        .entry_slots = &entry_c,
-        .entry_guards = &.{},
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 1 },
+            .instrs = &instrs_c,
+            .consts = &.{},
+            .entry_slots = &entry_c,
+            .entry_guards = &.{},
+        },
     };
-    try testing.expect(cont.instrs.len > failed.instrs.len);
+    try testing.expect(cont.code.instrs.len > failed.code.instrs.len);
 
-    try state.cache.append(gpa, &failed);
-    try state.cache.append(gpa, &cont);
+    try state.registry.cache.append(gpa, &failed);
+    try state.registry.cache.append(gpa, &cont);
 
     // The caller's frame, exactly as `enterSelectedTrace` takes it: sized for
     // the trace that ran, and still live while the chain drive runs beneath it.
     const mark = state.valuesMark();
     defer state.valuesRelease(mark);
-    const vals = try state.valuesPush(failed.instrs.len);
+    const vals = try state.valuesPush(failed.code.instrs.len);
     const sentinel: i64 = 0x5EED_5EED;
     for (vals) |*v| v.* = Value.int(sentinel);
 
@@ -831,5 +866,5 @@ test "driveChain ir_numeric_for_done: a longer candidate cannot invalidate the c
     // And the caller's frame is still its own memory afterwards.
     for (vals) |v| try testing.expectEqual(sentinel, v.asInt());
 
-    state.cache.clearRetainingCapacity();
+    state.registry.cache.clearRetainingCapacity();
 }

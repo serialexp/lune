@@ -16,8 +16,13 @@ release:
 # zig-out/bin/mahina (Debug) — otherwise a test-only run leaves the installed CLI
 # stale and you debug a binary that predates your changes (costs a few seconds,
 # saves a debugging detour).
-test: build
+test: build check-jit-boundaries
     zig build test
+
+# Enforce the implemented JIT dependency boundaries, including scanner tests.
+check-jit-boundaries:
+    python3 -m unittest discover -s tools -p test_jit_boundaries.py
+    python3 tools/check-jit-boundaries.py
 
 # Run the CLI (debug):  just run -- script.lua [args...]
 run *args:

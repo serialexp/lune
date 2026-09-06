@@ -46,7 +46,7 @@ test "A-ii.2 edge_cache: a 2-anchor cont↔inner cycle resolves both structural 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity(); // traces are stack-allocated; drop pointers pre-deinit
+    defer state.registry.cache.clearRetainingCapacity(); // traces are stack-allocated; drop pointers pre-deinit
 
     var code: [8]Instr = undefined;
     for (&code) |*c| c.* = Instr.op0(.ret);
@@ -55,24 +55,44 @@ test "A-ii.2 edge_cache: a 2-anchor cont↔inner cycle resolves both structural 
     // cont @pc2: a `.link` terminal (instrs[1], aux=7) to the inner root at pc7.
     var cont_instrs = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 9 }, .{ .op = .link, .aux = 7 } };
     var cont_prov = [_]ExitProvEntry{.{ .index = 1, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
-    var cont: Trace = .{ .id = 301, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_prov };
+    var cont: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 2 },
+            .instrs = &cont_instrs,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &cont_prov,
+        },
+        .id = 301,
+    };
 
     // inner root @pc7: loop-done guard_true (instrs[0], aux=2 == cont anchor), ends `.loop`.
     var inner_instrs = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
     var inner_prov = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .guard = .{ .source_proto_id = 0, .source_pc = 6, .role = .loop_done, .operand = .none } } }};
-    var inner: Trace = .{ .id = 302, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &inner_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &inner_prov };
+    var inner: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 7 },
+            .instrs = &inner_instrs,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &inner_prov,
+        },
+        .id = 302,
+    };
 
-    try state.cache.append(gpa, &cont);
-    try state.cache.append(gpa, &inner);
+    try state.registry.cache.append(gpa, &cont);
+    try state.registry.cache.append(gpa, &inner);
     state.rebuildEdgeCache();
 
     // Both structural edges present: cont --link--> inner(pc7), inner --loop_done--> cont(pc2).
-    try testing.expectEqual(@as(usize, 2), state.edge_cache.count());
-    const e_link = state.edge_cache.get(.{ .trace_id = 301, .exit_instr = 1 }) orelse return error.MissingLinkEdge;
+    try testing.expectEqual(@as(usize, 2), state.region_policy.edge_cache.count());
+    const e_link = state.region_policy.edge_cache.get(.{ .trace_id = 301, .exit_instr = 1 }) orelse return error.MissingLinkEdge;
     try testing.expect(e_link.exit == .link_terminal);
     try testing.expectEqual(@as(u32, 2), e_link.anchor_pc);
     try testing.expectEqual(@as(u32, 7), e_link.succ_anchor_pc);
-    const e_guard = state.edge_cache.get(.{ .trace_id = 302, .exit_instr = 0 }) orelse return error.MissingGuardEdge;
+    const e_guard = state.region_policy.edge_cache.get(.{ .trace_id = 302, .exit_instr = 0 }) orelse return error.MissingGuardEdge;
     try testing.expect(e_guard.exit == .guard);
     try testing.expectEqual(@as(u32, 7), e_guard.anchor_pc);
     try testing.expectEqual(@as(u32, 2), e_guard.succ_anchor_pc);
@@ -80,9 +100,9 @@ test "A-ii.2 edge_cache: a 2-anchor cont↔inner cycle resolves both structural 
     // Wholesale rebuild from the SURVIVING cache after inner leaves: cont's `.link` now
     // has no inner root bound, and inner's own edge is gone → empty. (Simulate the
     // retirement rebuild path without `destroy` on a stack trace.)
-    _ = state.cache.swapRemove(1); // drop &inner
+    _ = state.registry.cache.swapRemove(1); // drop &inner
     state.rebuildEdgeCache();
-    try testing.expectEqual(@as(usize, 0), state.edge_cache.count());
+    try testing.expectEqual(@as(usize, 0), state.region_policy.edge_cache.count());
 }
 
 test "A-ii.2 canonicalEql/order: field-wise, ignores the dead path tail and the inactive arm" {
@@ -140,7 +160,7 @@ test "A-ii.3 rec_path: a committed trace carries its recorded path (freed on des
     defer state.deinit();
     defer {
         if (committed) |ct| ct.destroy(gpa);
-        state.cache.clearRetainingCapacity();
+        state.registry.cache.clearRetainingCapacity();
     }
 
     // Same recForPrepLink→commit harness as the A-i.4 test: a continuation that
@@ -151,8 +171,17 @@ test "A-ii.3 rec_path: a committed trace carries its recorded path (freed on des
     code[7] = Instr.opJ(.for_loop, -3);
     const proto = Proto{ .code = &code, .id = 9, .name = "t", .num_registers = 4 };
     const inner_instrs = [_]IrInstr{.{ .op = .loop }};
-    var inner: Trace = .{ .id = 900, .anchor = .{ .proto = &proto, .pc = 5 }, .instrs = @constCast(&inner_instrs), .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
-    try state.cache.append(gpa, &inner);
+    var inner: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 5 },
+            .instrs = @constCast(&inner_instrs),
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 900,
+    };
+    try state.registry.cache.append(gpa, &inner);
 
     try state.rec.reset(gpa, .{ .proto = &proto, .pc = 2 }, proto.num_registers);
     state.rec.kind = .continuation;
@@ -160,18 +189,18 @@ test "A-ii.3 rec_path: a committed trace carries its recorded path (freed on des
     state.recordInstr(Instr.opAx(.for_prep, 0, 2), winRO(&regs), &proto, 5, Value.nil());
 
     try testing.expect(!state.isRecording());
-    const t = state.cache.items[state.cache.items.len - 1];
+    const t = state.registry.cache.items[state.registry.cache.items.len - 1];
     committed = t;
     try testing.expect(t.id != 900);
-    try testing.expectEqual(@as(usize, 1), t.rec_path.len);
-    try testing.expectEqual(ProgramPoint{ .proto_id = 9, .source_pc = 4 }, t.rec_path[0]);
+    try testing.expectEqual(@as(usize, 1), t.code.rec_path.len);
+    try testing.expectEqual(ProgramPoint{ .proto_id = 9, .source_pc = 4 }, t.code.rec_path[0]);
 }
 
 // ---- A-ii.4 region discovery / interning / classification (inert) ----------
 //
 // Helpers build a synthetic trace graph over one proto with stack-allocated `Trace`s,
 // then call `rebuildEdgeCache` + `rebuildRegions` directly (as the commit/retire path
-// does) and assert on the discovered regions. `defer state.cache.clearRetainingCapacity`
+// does) and assert on the discovered regions. `defer state.registry.cache.clearRetainingCapacity`
 // drops the (stack) cache pointers before `deinit`, exactly as the A-ii.2 test does; the
 // region maps own HEAP copies independent of the stack traces, so `deinit` frees them
 // cleanly.
@@ -184,7 +213,7 @@ test "A-ii.4 discovery: skip→ramp→inner→cont→skip cycle — owner==skip@
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity();
+    defer state.registry.cache.clearRetainingCapacity();
 
     const P_ID: u32 = 7;
     var code: [8]Instr = undefined;
@@ -196,35 +225,85 @@ test "A-ii.4 discovery: skip→ramp→inner→cont→skip cycle — owner==skip@
     // the UNIQUE external-entry ∧ loop-root anchor → owner.
     var skip_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
     var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
-    var skip: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 14 }, .instrs = &skip_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &skip_p };
+    var skip: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 14 },
+            .instrs = &skip_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &skip_p,
+        },
+        .id = 1,
+    };
 
     var ramp_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
     var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
-    var ramp: Trace = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &ramp_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ramp_p };
+    var ramp: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 2 },
+            .instrs = &ramp_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &ramp_p,
+        },
+        .id = 2,
+    };
 
     var inner_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
     var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
-    var inner: Trace = .{ .id = 3, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &inner_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &inner_p };
+    var inner: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 7 },
+            .instrs = &inner_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &inner_p,
+        },
+        .id = 3,
+    };
 
     var cont_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
     var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
-    var cont: Trace = .{ .id = 4, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p };
+    var cont: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 20 },
+            .instrs = &cont_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &cont_p,
+        },
+        .id = 4,
+    };
 
     var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
     var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
-    var ext: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p };
+    var ext: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 30 },
+            .instrs = &ext_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &ext_p,
+        },
+        .id = 5,
+    };
 
-    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.cache.append(gpa, t);
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.registry.cache.append(gpa, t);
     state.rebuildEdgeCache();
     state.rebuildRegions();
 
     // 5 structural edges (4 internal cycle + 1 incoming boundary), one discovered region.
-    try testing.expectEqual(@as(usize, 5), state.edge_cache.count());
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    try testing.expectEqual(@as(usize, 5), state.region_policy.edge_cache.count());
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
 
-    var kit = state.region_defs.keyIterator();
+    var kit = state.region_policy.region_defs.keyIterator();
     const rid = kit.next().?.*;
-    const def = state.region_defs.get(rid).?;
+    const def = state.region_policy.region_defs.get(rid).?;
     // Owner predicate (round-13 load-bearing): skip@14, armable.
     try testing.expectEqual(@as(*const Proto, &proto), def.owner.proto);
     try testing.expectEqual(@as(u32, 14), def.owner.pc);
@@ -240,8 +319,8 @@ test "A-ii.4 discovery: skip→ramp→inner→cont→skip cycle — owner==skip@
     try testing.expectEqual(rid, skip_regions[0]);
     try testing.expectEqual(@as(usize, 0), state.classifyExit(.{ .trace_id = 5, .exit_instr = 0 }).len);
     // dest_entry: the four cycle members are entries; the external trace is not.
-    try testing.expect(state.dest_entry_regions.get(1) != null);
-    try testing.expect(state.dest_entry_regions.get(5) == null);
+    try testing.expect(state.region_policy.dest_entry_regions.get(1) != null);
+    try testing.expect(state.region_policy.dest_entry_regions.get(5) == null);
 }
 
 test "A-vii-d.0 armability recovery: first-sight unarmable arms on the rebind that brings the entry edge; tombstone is sticky" {
@@ -254,7 +333,7 @@ test "A-vii-d.0 armability recovery: first-sight unarmable arms on the rebind th
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity();
+    defer state.registry.cache.clearRetainingCapacity();
 
     const P_ID: u32 = 8;
     var code: [8]Instr = undefined;
@@ -265,64 +344,114 @@ test "A-vii-d.0 armability recovery: first-sight unarmable arms on the rebind th
     // trace: skip@14 is a loop-root yet nothing outside the component enters it.
     var skip_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
     var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
-    var skip: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 14 }, .instrs = &skip_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &skip_p };
+    var skip: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 14 },
+            .instrs = &skip_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &skip_p,
+        },
+        .id = 1,
+    };
 
     var ramp_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
     var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
-    var ramp: Trace = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &ramp_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ramp_p };
+    var ramp: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 2 },
+            .instrs = &ramp_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &ramp_p,
+        },
+        .id = 2,
+    };
 
     var inner_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
     var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
-    var inner: Trace = .{ .id = 3, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &inner_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &inner_p };
+    var inner: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 7 },
+            .instrs = &inner_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &inner_p,
+        },
+        .id = 3,
+    };
 
     var cont_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
     var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
-    var cont: Trace = .{ .id = 4, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p };
+    var cont: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 20 },
+            .instrs = &cont_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &cont_p,
+        },
+        .id = 4,
+    };
 
-    for ([_]*Trace{ &skip, &ramp, &inner, &cont }) |t| try state.cache.append(gpa, t);
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont }) |t| try state.registry.cache.append(gpa, t);
     state.rebuildEdgeCache();
     state.rebuildRegions();
 
     // (1) First sight: cycle discovered, but no external entry yet ⇒ NOT armable,
     // NOT tombstoned, and excluded from the physical indices.
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
-    var kit = state.region_defs.keyIterator();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var kit = state.region_policy.region_defs.keyIterator();
     const rid = kit.next().?.*;
-    try testing.expect(!state.region_defs.get(rid).?.armable);
-    try testing.expect(!state.region_defs.get(rid).?.tombstoned);
-    try testing.expect(state.dest_entry_regions.get(1) == null);
+    try testing.expect(!state.region_policy.region_defs.get(rid).?.armable);
+    try testing.expect(!state.region_policy.region_defs.get(rid).?.tombstoned);
+    try testing.expect(state.region_policy.dest_entry_regions.get(1) == null);
 
     // (2) The external-entry side trace records (the guard-hot side trace that in
     // real programs always arrives AFTER the cycle): the rebind re-interns the
     // SAME RegionId and armability recovers.
     var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
     var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
-    var ext: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p };
-    try state.cache.append(gpa, &ext);
+    var ext: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 30 },
+            .instrs = &ext_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &ext_p,
+        },
+        .id = 5,
+    };
+    try state.registry.cache.append(gpa, &ext);
     state.rebuildEdgeCache();
     state.rebuildRegions();
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count()); // same logical region
-    try testing.expect(state.region_defs.get(rid).?.armable);
-    try testing.expect(!state.region_defs.get(rid).?.tombstoned);
-    try testing.expect(state.dest_entry_regions.get(1) != null); // members indexed again
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count()); // same logical region
+    try testing.expect(state.region_policy.region_defs.get(rid).?.armable);
+    try testing.expect(!state.region_policy.region_defs.get(rid).?.tombstoned);
+    try testing.expect(state.region_policy.dest_entry_regions.get(1) != null); // members indexed again
 
     // (3) A runtime tombstone is STICKY: the identical graph rebinding afterwards
     // must not re-arm (fail-closed for cause, per invalidateRegion).
     state.invalidateRegion(rid);
-    try testing.expect(!state.region_defs.get(rid).?.armable);
-    try testing.expect(state.region_defs.get(rid).?.tombstoned);
+    try testing.expect(!state.region_policy.region_defs.get(rid).?.armable);
+    try testing.expect(state.region_policy.region_defs.get(rid).?.tombstoned);
     state.rebuildEdgeCache();
     state.rebuildRegions();
-    try testing.expect(!state.region_defs.get(rid).?.armable);
-    try testing.expect(state.region_defs.get(rid).?.tombstoned);
-    try testing.expect(state.dest_entry_regions.get(1) == null);
+    try testing.expect(!state.region_policy.region_defs.get(rid).?.armable);
+    try testing.expect(state.region_policy.region_defs.get(rid).?.tombstoned);
+    try testing.expect(state.region_policy.dest_entry_regions.get(1) == null);
 }
 
 test "A-ii.4 finding-3: a member with an incomplete recorded path mints the region NON-armable" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity();
+    defer state.registry.cache.clearRetainingCapacity();
 
     // Same owner-bearing 5-trace graph as the armable test above, but one physical member
     // (`skip`) carries a TRUNCATED recorded path (rec_path_complete=false, as a recorder-
@@ -336,45 +465,96 @@ test "A-ii.4 finding-3: a member with an incomplete recorded path mints the regi
 
     var skip_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
     var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
-    var skip: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 14 }, .instrs = &skip_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &skip_p, .rec_path_complete = false };
+    var skip: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 14 },
+            .instrs = &skip_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &skip_p,
+            .rec_path_complete = false,
+        },
+        .id = 1,
+    };
 
     var ramp_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
     var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
-    var ramp: Trace = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &ramp_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ramp_p };
+    var ramp: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 2 },
+            .instrs = &ramp_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &ramp_p,
+        },
+        .id = 2,
+    };
 
     var inner_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
     var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
-    var inner: Trace = .{ .id = 3, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &inner_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &inner_p };
+    var inner: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 7 },
+            .instrs = &inner_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &inner_p,
+        },
+        .id = 3,
+    };
 
     var cont_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
     var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
-    var cont: Trace = .{ .id = 4, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p };
+    var cont: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 20 },
+            .instrs = &cont_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &cont_p,
+        },
+        .id = 4,
+    };
 
     var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
     var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
-    var ext: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p };
+    var ext: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 30 },
+            .instrs = &ext_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &ext_p,
+        },
+        .id = 5,
+    };
 
-    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.cache.append(gpa, t);
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.registry.cache.append(gpa, t);
     state.rebuildEdgeCache();
     state.rebuildRegions();
 
     // The region is still discovered (structural identity is unaffected by rec_path).
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
-    var kit = state.region_defs.keyIterator();
-    const def = state.region_defs.get(kit.next().?.*).?;
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var kit = state.region_policy.region_defs.keyIterator();
+    const def = state.region_policy.region_defs.get(kit.next().?.*).?;
     // …but incomplete membership forces it CLOSED, and no member exit is classified.
     try testing.expect(!def.armable);
     try testing.expectEqual(@as(usize, 0), state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len);
-    try testing.expect(state.dest_entry_regions.get(1) == null);
-    try testing.expectEqual(@as(u32, 0), state.source_exit_regions.count());
-    try testing.expectEqual(@as(u32, 0), state.dest_entry_regions.count());
+    try testing.expect(state.region_policy.dest_entry_regions.get(1) == null);
+    try testing.expectEqual(@as(u32, 0), state.region_policy.source_exit_regions.count());
+    try testing.expectEqual(@as(u32, 0), state.region_policy.dest_entry_regions.count());
 }
 
 test "A-ii.4 exit_prov fail-soft: an incomplete-exit_prov trace disarms the whole pass, logical defs retained, auto-recovers" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity();
+    defer state.registry.cache.clearRetainingCapacity();
 
     // The armable 5-trace graph again. Phase 1: fully complete → region armed. Phase 2:
     // taint the graph by marking one cached trace's `exit_prov` INCOMPLETE (as a
@@ -389,51 +569,101 @@ test "A-ii.4 exit_prov fail-soft: an incomplete-exit_prov trace disarms the whol
 
     var skip_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
     var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
-    var skip: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 14 }, .instrs = &skip_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &skip_p };
+    var skip: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 14 },
+            .instrs = &skip_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &skip_p,
+        },
+        .id = 1,
+    };
 
     var ramp_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
     var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
-    var ramp: Trace = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &ramp_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ramp_p };
+    var ramp: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 2 },
+            .instrs = &ramp_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &ramp_p,
+        },
+        .id = 2,
+    };
 
     var inner_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
     var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
-    var inner: Trace = .{ .id = 3, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &inner_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &inner_p };
+    var inner: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 7 },
+            .instrs = &inner_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &inner_p,
+        },
+        .id = 3,
+    };
 
     var cont_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
     var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
-    var cont: Trace = .{ .id = 4, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p };
+    var cont: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 20 },
+            .instrs = &cont_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &cont_p,
+        },
+        .id = 4,
+    };
 
     var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
     var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
-    var ext: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p };
+    var ext: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 30 },
+            .instrs = &ext_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &ext_p,
+        },
+        .id = 5,
+    };
 
-    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.cache.append(gpa, t);
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.registry.cache.append(gpa, t);
 
     // Phase 1 — complete graph: region armed.
     state.rebuildEdgeCache();
     state.rebuildRegions();
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
-    var kit = state.region_defs.keyIterator();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var kit = state.region_policy.region_defs.keyIterator();
     const rid = kit.next().?.*;
-    try testing.expect(state.region_defs.get(rid).?.armable);
+    try testing.expect(state.region_policy.region_defs.get(rid).?.armable);
     try testing.expectEqual(@as(usize, 1), state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len);
 
     // Phase 2 — taint one trace's exit_prov: the pass arms NOTHING, but keeps the def.
-    ext.exit_prov_complete = false;
+    ext.code.exit_prov_complete = false;
     state.rebuildEdgeCache();
     state.rebuildRegions();
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count()); // logical retained
-    try testing.expect(state.region_defs.get(rid).?.armable); // logical bit intrinsic, untouched
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count()); // logical retained
+    try testing.expect(state.region_policy.region_defs.get(rid).?.armable); // logical bit intrinsic, untouched
     try testing.expectEqual(@as(usize, 0), state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len);
-    try testing.expectEqual(@as(u32, 0), state.source_exit_regions.count());
-    try testing.expectEqual(@as(u32, 0), state.dest_entry_regions.count());
+    try testing.expectEqual(@as(u32, 0), state.region_policy.source_exit_regions.count());
+    try testing.expectEqual(@as(u32, 0), state.region_policy.dest_entry_regions.count());
 
     // Phase 3 — clear the taint: the region re-arms (same id), physical indices repopulate.
-    ext.exit_prov_complete = true;
+    ext.code.exit_prov_complete = true;
     state.rebuildEdgeCache();
     state.rebuildRegions();
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
-    var kit3 = state.region_defs.keyIterator();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var kit3 = state.region_policy.region_defs.keyIterator();
     try testing.expectEqual(rid, kit3.next().?.*);
     const regs = state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 });
     try testing.expectEqual(@as(usize, 1), regs.len);
@@ -444,7 +674,7 @@ test "A-ii.4 finding-5: a boundary edge added on rebind flips both_count 1→2, 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity();
+    defer state.registry.cache.clearRetainingCapacity();
 
     // Phase 1: the armable skip→ramp→inner→cont→skip cycle with ONE incoming boundary
     // (ext→skip@14) → skip is the unique external-entry ∧ loop-root → both_count==1, armed.
@@ -460,52 +690,112 @@ test "A-ii.4 finding-5: a boundary edge added on rebind flips both_count 1→2, 
 
     var skip_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
     var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
-    var skip: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 14 }, .instrs = &skip_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &skip_p };
+    var skip: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 14 },
+            .instrs = &skip_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &skip_p,
+        },
+        .id = 1,
+    };
 
     var ramp_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
     var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
-    var ramp: Trace = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &ramp_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ramp_p };
+    var ramp: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 2 },
+            .instrs = &ramp_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &ramp_p,
+        },
+        .id = 2,
+    };
 
     var inner_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
     var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
-    var inner: Trace = .{ .id = 3, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &inner_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &inner_p };
+    var inner: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 7 },
+            .instrs = &inner_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &inner_p,
+        },
+        .id = 3,
+    };
 
     var cont_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
     var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
-    var cont: Trace = .{ .id = 4, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p };
+    var cont: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 20 },
+            .instrs = &cont_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &cont_p,
+        },
+        .id = 4,
+    };
 
     var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
     var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
-    var ext: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p };
+    var ext: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 30 },
+            .instrs = &ext_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &ext_p,
+        },
+        .id = 5,
+    };
 
-    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.cache.append(gpa, t);
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.registry.cache.append(gpa, t);
     state.rebuildEdgeCache();
     state.rebuildRegions();
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
-    var kit = state.region_defs.keyIterator();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var kit = state.region_policy.region_defs.keyIterator();
     const rid = kit.next().?.*;
-    try testing.expect(state.region_defs.get(rid).?.armable);
-    try testing.expectEqual(@as(u32, 14), state.region_defs.get(rid).?.owner.pc); // owner=skip@14
+    try testing.expect(state.region_policy.region_defs.get(rid).?.armable);
+    try testing.expectEqual(@as(u32, 14), state.region_policy.region_defs.get(rid).?.owner.pc); // owner=skip@14
     try testing.expectEqual(@as(usize, 1), state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len);
 
     // Phase 2: add ext2 → inner@7 (a second external-entry into a loop-root). both_count→2.
     var ext2_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 7 }};
     var ext2_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(39, .branch_cond) }};
-    var ext2: Trace = .{ .id = 6, .anchor = .{ .proto = &proto, .pc = 40 }, .instrs = &ext2_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext2_p };
-    try state.cache.append(gpa, &ext2);
+    var ext2: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 40 },
+            .instrs = &ext2_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &ext2_p,
+        },
+        .id = 6,
+    };
+    try state.registry.cache.append(gpa, &ext2);
     state.rebuildEdgeCache();
     state.rebuildRegions();
 
     // SAME region id (internal edge set unchanged), but disarmed by the current owner
     // analysis, and no member exit is classified. The stored owner is refreshed away from
     // skip@14 to the deterministic placeholder (canonically-smallest anchor of the SCC).
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
-    var kit2 = state.region_defs.keyIterator();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var kit2 = state.region_policy.region_defs.keyIterator();
     try testing.expectEqual(rid, kit2.next().?.*);
     try testing.expectEqual(@as(usize, 0), state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len);
-    try testing.expectEqual(@as(u32, 0), state.source_exit_regions.count());
-    try testing.expectEqual(@as(u32, 0), state.dest_entry_regions.count());
-    try testing.expectEqual(@as(u32, 2), state.region_defs.get(rid).?.owner.pc); // placeholder = smallest anchor (ramp@2)
+    try testing.expectEqual(@as(u32, 0), state.region_policy.source_exit_regions.count());
+    try testing.expectEqual(@as(u32, 0), state.region_policy.dest_entry_regions.count());
+    try testing.expectEqual(@as(u32, 2), state.region_policy.region_defs.get(rid).?.owner.pc); // placeholder = smallest anchor (ramp@2)
 }
 
 test "A-ii.4 finding-6: a region-rebuild OOM fails CLOSED — physical indices emptied, logical defs retained" {
@@ -520,7 +810,7 @@ test "A-ii.4 finding-6: a region-rebuild OOM fails CLOSED — physical indices e
         fa.fail_index = std.math.maxInt(usize); // let teardown allocate freely
         state.deinit();
     }
-    defer state.cache.clearRetainingCapacity();
+    defer state.registry.cache.clearRetainingCapacity();
 
     const P_ID: u32 = 7;
     var code: [8]Instr = undefined;
@@ -529,28 +819,78 @@ test "A-ii.4 finding-6: a region-rebuild OOM fails CLOSED — physical indices e
 
     var skip_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
     var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
-    var skip: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 14 }, .instrs = &skip_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &skip_p };
+    var skip: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 14 },
+            .instrs = &skip_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &skip_p,
+        },
+        .id = 1,
+    };
     var ramp_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
     var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
-    var ramp: Trace = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &ramp_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ramp_p };
+    var ramp: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 2 },
+            .instrs = &ramp_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &ramp_p,
+        },
+        .id = 2,
+    };
     var inner_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
     var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
-    var inner: Trace = .{ .id = 3, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &inner_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &inner_p };
+    var inner: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 7 },
+            .instrs = &inner_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &inner_p,
+        },
+        .id = 3,
+    };
     var cont_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
     var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
-    var cont: Trace = .{ .id = 4, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p };
+    var cont: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 20 },
+            .instrs = &cont_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &cont_p,
+        },
+        .id = 4,
+    };
     var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
     var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
-    var ext: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p };
-    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.cache.append(gpa, t);
+    var ext: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 30 },
+            .instrs = &ext_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &ext_p,
+        },
+        .id = 5,
+    };
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.registry.cache.append(gpa, t);
 
     // Phase 1 — good pass: region armed, physical indices populated.
     state.rebuildEdgeCache();
     state.rebuildRegions();
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
-    var kit = state.region_defs.keyIterator();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var kit = state.region_policy.region_defs.keyIterator();
     const rid = kit.next().?.*;
-    try testing.expect(state.source_exit_regions.count() > 0);
+    try testing.expect(state.region_policy.source_exit_regions.count() > 0);
     try testing.expect(state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len == 1);
 
     // Phase 2 — arm the allocator to fail the NEXT allocation, then re-discover regions over
@@ -561,11 +901,11 @@ test "A-ii.4 finding-6: a region-rebuild OOM fails CLOSED — physical indices e
     state.rebuildRegions();
 
     // Physical indices emptied (fail-closed), logical defs retained (untouched).
-    try testing.expectEqual(@as(u32, 0), state.source_exit_regions.count());
-    try testing.expectEqual(@as(u32, 0), state.dest_entry_regions.count());
+    try testing.expectEqual(@as(u32, 0), state.region_policy.source_exit_regions.count());
+    try testing.expectEqual(@as(u32, 0), state.region_policy.dest_entry_regions.count());
     try testing.expectEqual(@as(usize, 0), state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len);
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
-    var kit2 = state.region_defs.keyIterator();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var kit2 = state.region_policy.region_defs.keyIterator();
     try testing.expectEqual(rid, kit2.next().?.*);
 }
 
@@ -587,33 +927,53 @@ test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) r
             const a_i = try g.dupe(IrInstr, &[_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 7 }});
             const a_p = try g.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(1, .branch_cond) }});
             const a = try g.create(Trace);
-            a.* = .{ .id = id_a, .anchor = .{ .proto = p, .pc = 2 }, .instrs = a_i, .consts = try g.alloc(Value, 0), .entry_slots = try g.alloc(u16, 0), .entry_guards = try g.alloc(EntryGuard, 0), .exit_prov = a_p };
+            a.* = .{
+                .code = .{
+                    .anchor = .{ .proto = p, .pc = 2 },
+                    .instrs = a_i,
+                    .consts = try g.alloc(Value, 0),
+                    .entry_slots = try g.alloc(u16, 0),
+                    .entry_guards = try g.alloc(EntryGuard, 0),
+                    .exit_prov = a_p,
+                },
+                .id = id_a,
+            };
             const b_i = try g.dupe(IrInstr, &[_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 2 }});
             const b_p = try g.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .branch_cond) }});
             const b = try g.create(Trace);
-            b.* = .{ .id = id_b, .anchor = .{ .proto = p, .pc = 7 }, .instrs = b_i, .consts = try g.alloc(Value, 0), .entry_slots = try g.alloc(u16, 0), .entry_guards = try g.alloc(EntryGuard, 0), .exit_prov = b_p };
-            try st.cache.append(g, a);
-            try st.cache.append(g, b);
+            b.* = .{
+                .code = .{
+                    .anchor = .{ .proto = p, .pc = 7 },
+                    .instrs = b_i,
+                    .consts = try g.alloc(Value, 0),
+                    .entry_slots = try g.alloc(u16, 0),
+                    .entry_guards = try g.alloc(EntryGuard, 0),
+                    .exit_prov = b_p,
+                },
+                .id = id_b,
+            };
+            try st.registry.cache.append(g, a);
+            try st.registry.cache.append(g, b);
         }
     }.go;
 
     try buildCycle(&state, gpa, &proto, 1, 2);
     state.rebuildEdgeCache();
     state.rebuildRegions();
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
-    var kit = state.region_defs.keyIterator();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var kit = state.region_policy.region_defs.keyIterator();
     const rid1 = kit.next().?.*;
 
     // Retire both (heap traces → real destroy), then re-record with fresh ids.
-    while (state.cache.items.len > 0) state.removeTrace(state.cache.items[0]);
+    while (state.registry.cache.items.len > 0) state.removeTrace(state.registry.cache.items[0]);
     try buildCycle(&state, gpa, &proto, 11, 12);
     state.rebuildEdgeCache();
     state.rebuildRegions();
     // Still ONE region, and the SAME id (not a second def).
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
-    try testing.expect(state.region_defs.get(rid1) != null);
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    try testing.expect(state.region_policy.region_defs.get(rid1) != null);
 
-    while (state.cache.items.len > 0) state.removeTrace(state.cache.items[0]);
+    while (state.registry.cache.items.len > 0) state.removeTrace(state.registry.cache.items[0]);
 }
 
 /// B-iv.3: inert seed twin for the seeded-child bridge fixture below —
@@ -621,7 +981,7 @@ test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) r
 /// but `NativeSeedCtx.seed_fn` has no default.
 fn regionBridgeDummySeed(
     ctx: *const trace.NativeSeedCtx,
-    t: *const Trace,
+    t: *const trace.TraceCode,
     plan_bits: u64,
 ) callconv(.c) u64 {
     _ = ctx;
@@ -634,7 +994,7 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity();
+    defer state.registry.cache.clearRetainingCapacity();
 
     var code: [41]Instr = undefined;
     for (&code) |*ins| ins.* = Instr.op0(.ret);
@@ -665,13 +1025,15 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     defer gpa.free(parent_slots);
     @memset(parent_slots, 0); // no trampoline in this unit test: shared_exit == 0
     var cont: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 29 },
+            .instrs = &cont_i,
+            .consts = &.{},
+            .entry_slots = @constCast(&[_]u16{2}),
+            .entry_guards = &.{},
+            .exit_prov = &cont_p,
+        },
         .id = 1,
-        .anchor = .{ .proto = &proto, .pc = 29 },
-        .instrs = &cont_i,
-        .consts = &.{},
-        .entry_slots = @constCast(&[_]u16{2}),
-        .entry_guards = &.{},
-        .exit_prov = &cont_p,
         .native = .{ .compiled = .{ .page = undefined, .slots = parent_slots, .gpa = gpa } },
     };
 
@@ -689,23 +1051,27 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
         .polarity = .taken,
     } } }};
     var skip: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 14 },
+            .instrs = &skip_i,
+            .consts = &.{},
+            .entry_slots = @constCast(&[_]u16{ 0, 1 }),
+            .entry_guards = &.{},
+            .exit_prov = &skip_p,
+        },
         .id = 2,
-        .anchor = .{ .proto = &proto, .pc = 14 },
-        .instrs = &skip_i,
-        .consts = &.{},
-        .entry_slots = @constCast(&[_]u16{ 0, 1 }),
-        .entry_guards = &.{},
-        .exit_prov = &skip_p,
         .hit_count = 9,
     };
     // Same-anchor decoy has a higher hit count but is not a physical region member.
     var sibling: Trace = .{
+        .code = .{
+            .anchor = skip.code.anchor,
+            .instrs = &skip_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
         .id = 3,
-        .anchor = skip.anchor,
-        .instrs = &skip_i,
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
         .hit_count = 100,
     };
     var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
@@ -717,22 +1083,24 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
         .polarity = .taken,
     } } }};
     var ext: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 40 },
+            .instrs = &ext_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &ext_p,
+        },
         .id = 4,
-        .anchor = .{ .proto = &proto, .pc = 40 },
-        .instrs = &ext_i,
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
-        .exit_prov = &ext_p,
     };
-    for ([_]*Trace{ &cont, &skip, &sibling, &ext }) |t| try state.cache.append(gpa, t);
+    for ([_]*Trace{ &cont, &skip, &sibling, &ext }) |t| try state.registry.cache.append(gpa, t);
     state.rebuildEdgeCache();
     state.rebuildRegions();
 
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
-    var ids = state.region_defs.keyIterator();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var ids = state.region_policy.region_defs.keyIterator();
     const rid = ids.next().?.*;
-    var def = state.region_defs.getPtr(rid).?;
+    var def = state.region_policy.region_defs.getPtr(rid).?;
     try testing.expect(def.armable);
     try testing.expectEqual(@as(usize, 1), def.bridges.len);
     try testing.expectEqualSlices(u16, &.{ 0, 1, 2 }, def.bridges[0].required_slots);
@@ -744,7 +1112,7 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     };
     try testing.expect(decision.child == &skip); // member filter defeats higher-hit sibling
     try testing.expect(def.armable);
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
     try testing.expectEqual(@as(usize, 0), parent_slots[3]);
 
     // Re-discovery with fresh physical ids must replace, not retain, descriptor
@@ -756,9 +1124,9 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     ext.id = 14;
     state.rebuildEdgeCache();
     state.rebuildRegions();
-    def = state.region_defs.getPtr(rid).?;
+    def = state.region_policy.region_defs.getPtr(rid).?;
     try testing.expectEqualSlices(u16, &.{ 1, 2 }, def.bridges[0].invariant_slots);
-    try testing.expect(state.dest_entry_regions.get(skip.id) != null);
+    try testing.expect(state.region_policy.dest_entry_regions.get(skip.id) != null);
 
     // Rejection A: S still contains live-through r2, but neither E nor the
     // (deliberately damaged) invariant proof contains it.
@@ -767,7 +1135,7 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     // decline exercised below (the verdict now says which happened).
     try testing.expect(state.validateRegionBridge(rid, &cont, 3) == .invalidated);
     try testing.expect(!def.armable);
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
     try testing.expectEqual(@as(usize, 0), parent_slots[3]);
 
     // B-iv.3 (doc 22 §B.5) replaces the old "Rejection B" (seeded child ⇒
@@ -778,10 +1146,10 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     // succeed, unlike the S/E disproof above which is a property of the proof).
     def.armable = true;
     def.bridges[0].invariant_slots[1] = 2;
-    skip.inputs = @constCast(&[_]InputSeed{undefined});
+    skip.code.inputs = @constCast(&[_]InputSeed{undefined});
     try testing.expect(state.validateRegionBridge(rid, &cont, 3) == .child_not_enterable);
     try testing.expect(def.armable); // transient decline — NOT invalidated
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
     try testing.expectEqual(@as(usize, 0), parent_slots[3]);
 
     // The decline is TRANSIENT but DURABLE-for-this-activation, and those are
@@ -798,19 +1166,19 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     // the memo is observed where it actually has to hold.
     state.config.min_useful = 3;
     const akey: trace.RegionKey = .{ .region_id = rid, .activation = 7 };
-    try state.region_profit.put(gpa, akey, .{
+    try state.region_policy.region_profit.put(gpa, akey, .{
         .root_frame_depth = 0,
         .root_call_seq = akey.activation,
         .useful_window_seen = true, // past the profitability gate
     });
-    state.region_context = .{ .depth = 0, .call_seq = akey.activation };
-    try testing.expect(cont.isBridgeCandidate(3));
+    state.region_policy.region_context = .{ .depth = 0, .call_seq = akey.activation };
+    try testing.expect(cont.code.isBridgeCandidate(3));
 
     state.pending_bridge_arm = .{ .trace_id = cont.id, .exit_instr = 3 };
     state.drainPendingBridgeArm(true);
     try testing.expectEqual(@as(u64, 1), state.native_region_bridge_arm_attempts);
     // Nothing armed, nothing tombstoned — the decline itself is unchanged.
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
     try testing.expect(def.armable);
 
     // Second identical deopt: the memo must absorb it. Pre-fix this was 2.
@@ -821,7 +1189,7 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     // ...but the memo must not WEDGE the arm. Each of the two facts it is keyed
     // on re-opens it independently. (a) a discovery rebuild — the bridges or
     // membership it was proven against may have changed:
-    state.region_defs_gen +%= 1;
+    state.region_policy.region_defs_gen +%= 1;
     state.pending_bridge_arm = .{ .trace_id = cont.id, .exit_instr = 3 };
     state.drainPendingBridgeArm(true);
     try testing.expectEqual(@as(u64, 2), state.native_region_bridge_arm_attempts);
@@ -830,13 +1198,13 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     // to become fresh, and also the natural bound on a child whose
     // `.unattempted → .compiled` transition bumps no generation at all.
     const akey2: trace.RegionKey = .{ .region_id = rid, .activation = 8 };
-    try state.region_profit.put(gpa, akey2, .{
+    try state.region_policy.region_profit.put(gpa, akey2, .{
         .root_frame_depth = 0,
         .root_call_seq = akey2.activation,
         .useful_window_seen = true,
     });
-    _ = state.region_profit.remove(akey);
-    state.region_context = .{ .depth = 0, .call_seq = akey2.activation };
+    _ = state.region_policy.region_profit.remove(akey);
+    state.region_policy.region_context = .{ .depth = 0, .call_seq = akey2.activation };
     state.pending_bridge_arm = .{ .trace_id = cont.id, .exit_instr = 3 };
     state.drainPendingBridgeArm(true);
     try testing.expectEqual(@as(u64, 3), state.native_region_bridge_arm_attempts);
@@ -854,10 +1222,10 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     } };
     const seed_ctx = try gpa.create(trace.NativeSeedCtx);
     seed_ctx.* = .{ .seed_fn = regionBridgeDummySeed };
-    state.native_seed_ctx = seed_ctx; // state.deinit() destroys it
+    state.registry.native_seed_ctx = seed_ctx; // state.deinit() destroys it
     seed_ctx.proto = @ptrCast(&proto);
     seed_ctx.call_seq = 7;
-    state.region_context = .{ .depth = 0, .call_seq = 7 };
+    state.region_policy.region_context = .{ .depth = 0, .call_seq = 7 };
     const seeded_decision = switch (state.validateRegionBridge(rid, &cont, 3)) {
         .ok => |d| d,
         else => return error.TestUnexpectedResult,
@@ -894,7 +1262,7 @@ test "A-ii.4 sibling boundary edge: only the physical MEMBER's exits are credite
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.cache.clearRetainingCapacity();
+    defer state.registry.cache.clearRetainingCapacity();
 
     const P_ID: u32 = 7;
     var code: [8]Instr = undefined;
@@ -906,32 +1274,82 @@ test "A-ii.4 sibling boundary edge: only the physical MEMBER's exits are credite
     // A's anchor but realizes NO internal edge, so it is NOT a physical member.
     var a_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 7 }, .{ .op = .loop } };
     var a_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(1, .loop_done) }};
-    var ta: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &a_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &a_p };
+    var ta: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 2 },
+            .instrs = &a_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &a_p,
+        },
+        .id = 1,
+    };
 
     var b_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 2 }};
     var b_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .branch_cond) }};
-    var tb: Trace = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &b_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &b_p };
+    var tb: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 7 },
+            .instrs = &b_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &b_p,
+        },
+        .id = 2,
+    };
 
     var as_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 30 }}; // sibling at @2 → C@30
     var as_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(1, .branch_cond) }};
-    var tas: Trace = .{ .id = 3, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &as_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &as_p };
+    var tas: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 2 },
+            .instrs = &as_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &as_p,
+        },
+        .id = 3,
+    };
 
     var c_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 99 }}; // C@30 resolves to nothing
     var c_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
-    var tc: Trace = .{ .id = 4, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &c_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &c_p };
+    var tc: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 30 },
+            .instrs = &c_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &c_p,
+        },
+        .id = 4,
+    };
 
     var x_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 2 }}; // X@40 → A@2 (incoming boundary)
     var x_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(39, .branch_cond) }};
-    var tx: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 40 }, .instrs = &x_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &x_p };
+    var tx: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 40 },
+            .instrs = &x_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &x_p,
+        },
+        .id = 5,
+    };
 
-    for ([_]*Trace{ &ta, &tb, &tas, &tc, &tx }) |t| try state.cache.append(gpa, t);
+    for ([_]*Trace{ &ta, &tb, &tas, &tc, &tx }) |t| try state.registry.cache.append(gpa, t);
     state.rebuildEdgeCache();
     state.rebuildRegions();
 
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
-    var kit = state.region_defs.keyIterator();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var kit = state.region_policy.region_defs.keyIterator();
     const rid = kit.next().?.*;
-    const def = state.region_defs.get(rid).?;
+    const def = state.region_policy.region_defs.get(rid).?;
     try testing.expectEqual(@as(u32, 2), def.owner.pc); // A@2 is external-entry ∧ loop-root
     try testing.expect(def.armable);
 
@@ -939,10 +1357,10 @@ test "A-ii.4 sibling boundary edge: only the physical MEMBER's exits are credite
     try testing.expectEqual(rid, state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 })[0]);
     try testing.expectEqual(@as(usize, 0), state.classifyExit(.{ .trace_id = 3, .exit_instr = 0 }).len);
     // dest_entry: members {A=1, B=2} only — never the sibling A'(3) or the outside X(5)/C(4).
-    try testing.expect(state.dest_entry_regions.get(1) != null);
-    try testing.expect(state.dest_entry_regions.get(2) != null);
-    try testing.expect(state.dest_entry_regions.get(3) == null);
-    try testing.expect(state.dest_entry_regions.get(5) == null);
+    try testing.expect(state.region_policy.dest_entry_regions.get(1) != null);
+    try testing.expect(state.region_policy.dest_entry_regions.get(2) != null);
+    try testing.expect(state.region_policy.dest_entry_regions.get(3) == null);
+    try testing.expect(state.region_policy.dest_entry_regions.get(5) == null);
 }
 
 test "A-ii.4 rebind tombstone: same edge set, incompatible member_points → armable flips false, purged from physical" {
@@ -964,39 +1382,70 @@ test "A-ii.4 rebind tombstone: same edge set, incompatible member_points → arm
             const a_p = try g.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(1, .loop_done) }});
             const a_path = try g.dupe(ProgramPoint, &[_]ProgramPoint{a_pt});
             const a = try g.create(Trace);
-            a.* = .{ .id = ids[0], .anchor = .{ .proto = p, .pc = 2 }, .instrs = a_i, .consts = try g.alloc(Value, 0), .entry_slots = try g.alloc(u16, 0), .entry_guards = try g.alloc(EntryGuard, 0), .exit_prov = a_p, .rec_path = a_path };
+            a.* = .{
+                .code = .{
+                    .anchor = .{ .proto = p, .pc = 2 },
+                    .instrs = a_i,
+                    .consts = try g.alloc(Value, 0),
+                    .entry_slots = try g.alloc(u16, 0),
+                    .entry_guards = try g.alloc(EntryGuard, 0),
+                    .exit_prov = a_p,
+                    .rec_path = a_path,
+                },
+                .id = ids[0],
+            };
             const b_i = try g.dupe(IrInstr, &[_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 2 }});
             const b_p = try g.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .branch_cond) }});
             const b = try g.create(Trace);
-            b.* = .{ .id = ids[1], .anchor = .{ .proto = p, .pc = 7 }, .instrs = b_i, .consts = try g.alloc(Value, 0), .entry_slots = try g.alloc(u16, 0), .entry_guards = try g.alloc(EntryGuard, 0), .exit_prov = b_p };
+            b.* = .{
+                .code = .{
+                    .anchor = .{ .proto = p, .pc = 7 },
+                    .instrs = b_i,
+                    .consts = try g.alloc(Value, 0),
+                    .entry_slots = try g.alloc(u16, 0),
+                    .entry_guards = try g.alloc(EntryGuard, 0),
+                    .exit_prov = b_p,
+                },
+                .id = ids[1],
+            };
             const x_i = try g.dupe(IrInstr, &[_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 2 }});
             const x_p = try g.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(39, .branch_cond) }});
             const x = try g.create(Trace);
-            x.* = .{ .id = ids[2], .anchor = .{ .proto = p, .pc = 40 }, .instrs = x_i, .consts = try g.alloc(Value, 0), .entry_slots = try g.alloc(u16, 0), .entry_guards = try g.alloc(EntryGuard, 0), .exit_prov = x_p };
-            for ([_]*Trace{ a, b, x }) |t| try st.cache.append(g, t);
+            x.* = .{
+                .code = .{
+                    .anchor = .{ .proto = p, .pc = 40 },
+                    .instrs = x_i,
+                    .consts = try g.alloc(Value, 0),
+                    .entry_slots = try g.alloc(u16, 0),
+                    .entry_guards = try g.alloc(EntryGuard, 0),
+                    .exit_prov = x_p,
+                },
+                .id = ids[2],
+            };
+            for ([_]*Trace{ a, b, x }) |t| try st.registry.cache.append(g, t);
         }
     }.go;
 
     try buildArmable(&state, gpa, &proto, .{ 1, 2, 3 }, .{ .proto_id = P_ID, .source_pc = 100 });
     state.rebuildEdgeCache();
     state.rebuildRegions();
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
-    var kit = state.region_defs.keyIterator();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var kit = state.region_policy.region_defs.keyIterator();
     const rid = kit.next().?.*;
-    try testing.expect(state.region_defs.get(rid).?.armable);
+    try testing.expect(state.region_policy.region_defs.get(rid).?.armable);
     try testing.expect(state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len == 1); // published
 
     // Re-record with a DIFFERENT A.rec_path (source_pc 200) → incompatible membership.
-    while (state.cache.items.len > 0) state.removeTrace(state.cache.items[0]);
+    while (state.registry.cache.items.len > 0) state.removeTrace(state.registry.cache.items[0]);
     try buildArmable(&state, gpa, &proto, .{ 11, 12, 13 }, .{ .proto_id = P_ID, .source_pc = 200 });
     state.rebuildEdgeCache();
     state.rebuildRegions();
     // Same id (edge set unchanged), but tombstoned + purged from the physical index.
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
-    try testing.expect(!state.region_defs.get(rid).?.armable);
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    try testing.expect(!state.region_policy.region_defs.get(rid).?.armable);
     try testing.expectEqual(@as(usize, 0), state.classifyExit(.{ .trace_id = 11, .exit_instr = 0 }).len);
 
-    while (state.cache.items.len > 0) state.removeTrace(state.cache.items[0]);
+    while (state.registry.cache.items.len > 0) state.removeTrace(state.registry.cache.items[0]);
 }
 
 test "A-ii.4 lifetime: removeTrace preserves region_defs (logical); clearCache empties it" {
@@ -1013,24 +1462,44 @@ test "A-ii.4 lifetime: removeTrace preserves region_defs (logical); clearCache e
     // `destroy` them. region_defs still gets one entry (first-sight always defines).
     const a_i = try gpa.dupe(IrInstr, &[_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 7 }});
     const a = try gpa.create(Trace);
-    a.* = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = a_i, .consts = try gpa.alloc(Value, 0), .entry_slots = try gpa.alloc(u16, 0), .entry_guards = try gpa.alloc(EntryGuard, 0), .exit_prov = try gpa.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(1, .branch_cond) }}) };
+    a.* = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 2 },
+            .instrs = a_i,
+            .consts = try gpa.alloc(Value, 0),
+            .entry_slots = try gpa.alloc(u16, 0),
+            .entry_guards = try gpa.alloc(EntryGuard, 0),
+            .exit_prov = try gpa.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(1, .branch_cond) }}),
+        },
+        .id = 1,
+    };
     const b_i = try gpa.dupe(IrInstr, &[_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 2 }});
     const b = try gpa.create(Trace);
-    b.* = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = b_i, .consts = try gpa.alloc(Value, 0), .entry_slots = try gpa.alloc(u16, 0), .entry_guards = try gpa.alloc(EntryGuard, 0), .exit_prov = try gpa.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .branch_cond) }}) };
-    try state.cache.append(gpa, a);
-    try state.cache.append(gpa, b);
+    b.* = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 7 },
+            .instrs = b_i,
+            .consts = try gpa.alloc(Value, 0),
+            .entry_slots = try gpa.alloc(u16, 0),
+            .entry_guards = try gpa.alloc(EntryGuard, 0),
+            .exit_prov = try gpa.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .branch_cond) }}),
+        },
+        .id = 2,
+    };
+    try state.registry.cache.append(gpa, a);
+    try state.registry.cache.append(gpa, b);
     state.rebuildEdgeCache();
     state.rebuildRegions();
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
 
     // removeTrace breaks the cycle but must NOT clean region_defs (logical persistence).
     state.removeTrace(b);
-    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
     // The physical index rebuilt from the surviving graph (cycle gone) → empty.
-    try testing.expectEqual(@as(usize, 0), state.source_exit_regions.count());
+    try testing.expectEqual(@as(usize, 0), state.region_policy.source_exit_regions.count());
 
     // clearCache is the ONE place the logical maps are cleared.
     state.clearCache();
-    try testing.expectEqual(@as(usize, 0), state.region_defs.count());
-    try testing.expectEqual(@as(usize, 0), state.region_intern.entries.items.len);
+    try testing.expectEqual(@as(usize, 0), state.region_policy.region_defs.count());
+    try testing.expectEqual(@as(usize, 0), state.region_policy.region_intern.entries.items.len);
 }

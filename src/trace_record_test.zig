@@ -213,7 +213,7 @@ test "guardSourcePc: source-opcode PC is exit PC − 1 (H-1b), pinned independen
     const M: u32 = 11;
     st2.rec.cur_pc = M + 1;
     inline for (.{ IrOp.guard_number, IrOp.int_of_float }) |op| {
-        const ref = try st2.emit(.{ .op = op, .a = 0 });
+        const ref = try st2.rec.emit(.{ .op = op, .a = 0 });
         const ins = st2.rec.instrs.items[ref];
         try testing.expectEqual(@as(u32, M + 1), guardExitPc(ins).?);
         try testing.expectEqual(@as(u32, M), guardSourcePc(ins).?);
@@ -893,7 +893,7 @@ test "recPureSqrt: sqrt(float) records guard_builtin, guard_float, fsqrt" {
     try testing.expectEqual(@as(Ref, 2), ops[4].a); // fsqrt reads the arg ref
     try testing.expectEqual(ObsType.float, ops[4].ty);
     // The call's destination register holds the fsqrt result (ref 4), not the callee.
-    try testing.expectEqual(@as(Ref, 4), try state.refOf(0));
+    try testing.expectEqual(@as(Ref, 4), try state.rec.refOf(0));
 }
 
 test "recPureSqrt aborts: bad arity, non-float arg, and a non-pure native" {
@@ -962,7 +962,7 @@ test "recFloatUnary: sin/cos(float) record guard_builtin, guard_float, fsin/fcos
         try testing.expectEqual(@as(Ref, 2), ops[4].a); // reads the arg ref
         try testing.expectEqual(ObsType.float, ops[4].ty);
         // The call's destination register holds the result (ref 4).
-        try testing.expectEqual(@as(Ref, 4), try state.refOf(0));
+        try testing.expectEqual(@as(Ref, 4), try state.rec.refOf(0));
     }
 }
 
@@ -1074,7 +1074,7 @@ test "recBType: type(int) folds to the interned 'number' konst under guard_int" 
     try testing.expectEqual(IrOp.guard_int, ops[3].op);
     try testing.expectEqual(IrOp.konst, ops[4].op);
     // The dest holds the interned "number" string konst — the exact object.
-    const dest = h.state.konstValueOf(try h.state.refOf(0)).?;
+    const dest = h.state.rec.konstValueOf(try h.state.rec.refOf(0)).?;
     try testing.expectEqual(@intFromPtr(&number_s.header), @intFromPtr(dest.asHeap()));
     // The arc-A invariant: recording created NO guest heap object.
     try testing.expectEqual(objs_before, h.heap.strtab_count);
@@ -1140,7 +1140,7 @@ test "recBSelect: konst '#' selector folds to the fixed arg count; non-konst abo
     h.state.recordInstr(.{ .op = .load_const, .a = 1, .b = 0 }, winRO(&regs), &h.proto, 0, Value.nil());
     h.state.recordInstr(Instr.opABC(.call, 0, 4, 1), winRO(&regs), &h.proto, 0, Value.nil());
     try testing.expect(h.state.isRecording());
-    const dest = h.state.konstValueOf(try h.state.refOf(0)).?;
+    const dest = h.state.rec.konstValueOf(try h.state.rec.refOf(0)).?;
     try testing.expectEqual(@as(i64, 3), dest.asInt());
 
     // Non-konst selector (a live register holding "#"): abort — the identity
@@ -1169,7 +1169,7 @@ test "recBTonumber: konst string folds via arith.toNumber; observed number passe
     h.state.recordInstr(.{ .op = .load_const, .a = 1, .b = 0 }, winRO(&regs), &h.proto, 0, Value.nil());
     h.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &h.proto, 0, Value.nil());
     try testing.expect(h.state.isRecording());
-    try testing.expectEqual(@as(i64, 31), h.state.konstValueOf(try h.state.refOf(0)).?.asInt());
+    try testing.expectEqual(@as(i64, 31), h.state.rec.konstValueOf(try h.state.rec.refOf(0)).?.asInt());
 
     // Pass-through: tonumber(x) on an observed int is the identity under guard_int.
     var h2 = try FoldHarness.init(gpa, .tonumber, &.{});
@@ -1180,8 +1180,8 @@ test "recBTonumber: konst string folds via arith.toNumber; observed number passe
     try testing.expect(h2.state.isRecording());
     const ops = h2.state.rec.instrs.items;
     try testing.expectEqual(IrOp.guard_int, ops[ops.len - 1].op); // arg pin; dest = arg ref
-    const arg_ref = try h2.state.refOf(1);
-    try testing.expectEqual(arg_ref, try h2.state.refOf(0));
+    const arg_ref = try h2.state.rec.refOf(1);
+    try testing.expectEqual(arg_ref, try h2.state.rec.refOf(0));
 }
 
 test "recBRawequal: NaN pin — float same-ref aborts; table same-ref folds true; konsts fold" {
@@ -1208,7 +1208,7 @@ test "recBRawequal: NaN pin — float same-ref aborts; table same-ref folds true
     h2.state.recordInstr(.{ .op = .move, .a = 2, .b = 1 }, winRO(&regs2), &h2.proto, 0, Value.nil());
     h2.state.recordInstr(Instr.opABC(.call, 0, 2, 1), winRO(&regs2), &h2.proto, 0, Value.nil());
     try testing.expect(h2.state.isRecording());
-    try testing.expect(h2.state.konstValueOf(try h2.state.refOf(0)).?.asBool());
+    try testing.expect(h2.state.rec.konstValueOf(try h2.state.rec.refOf(0)).?.asBool());
 
     // Konst×konst folds exactly (ints via load_int).
     var h3 = try FoldHarness.init(gpa, .rawequal, &.{});
@@ -1219,7 +1219,7 @@ test "recBRawequal: NaN pin — float same-ref aborts; table same-ref folds true
     h3.state.recordInstr(.{ .op = .load_int, .a = 2, .aux = 6 }, winRO(&regs3), &h3.proto, 0, Value.nil());
     h3.state.recordInstr(Instr.opABC(.call, 0, 2, 1), winRO(&regs3), &h3.proto, 0, Value.nil());
     try testing.expect(h3.state.isRecording());
-    try testing.expect(!h3.state.konstValueOf(try h3.state.refOf(0)).?.asBool());
+    try testing.expect(!h3.state.rec.konstValueOf(try h3.state.rec.refOf(0)).?.asBool());
 }
 
 test "recBRawlen: konst string folds to BYTE length (vs #s cp_len — UTF-8 differential)" {
@@ -1238,7 +1238,7 @@ test "recBRawlen: konst string folds to BYTE length (vs #s cp_len — UTF-8 diff
     try testing.expect(h.state.isRecording());
     // rawlen = String.len = 6 BYTES. (#s is cp_len = 5 — a different quantity;
     // the two must never share an emission. Codex catch #7.)
-    try testing.expectEqual(@as(i64, 6), h.state.konstValueOf(try h.state.refOf(0)).?.asInt());
+    try testing.expectEqual(@as(i64, 6), h.state.rec.konstValueOf(try h.state.rec.refOf(0)).?.asInt());
 }
 
 test "recBTostring: konst int folds via the shared renderer; konst string aborts (mutable string metatable)" {
@@ -1252,7 +1252,7 @@ test "recBTostring: konst int folds via the shared renderer; konst string aborts
     h.state.recordInstr(.{ .op = .load_int, .a = 1, .aux = 42 }, winRO(&regs), &h.proto, 0, Value.nil());
     h.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &h.proto, 0, Value.nil());
     try testing.expect(h.state.isRecording());
-    const dest = h.state.konstValueOf(try h.state.refOf(0)).?;
+    const dest = h.state.rec.konstValueOf(try h.state.rec.refOf(0)).?;
     try testing.expectEqual(@intFromPtr(&s42.header), @intFromPtr(dest.asHeap()));
     try testing.expectEqual(objs_before, h.heap.strtab_count); // no allocation
 
@@ -1300,7 +1300,7 @@ test "recBTostring: scalar non-konst records guard_gc + tostr_int/tostr_num (doc
     // for the RECORDER even in arc B; allocation happens at EXECUTION).
     try testing.expectEqual(objs_before, h.heap.strtab_count);
     // The dest reg now maps to the tostr result.
-    try testing.expectEqual(@as(trace.Ref, 5), try h.state.refOf(0));
+    try testing.expectEqual(@as(trace.Ref, 5), try h.state.rec.refOf(0));
 
     // A SECOND allocating call in the same recording (fresh callee/arg slots so
     // the first call's dest remap does not shadow the callee): guard_gc is
@@ -1407,7 +1407,7 @@ test "recBSSub: sub(s, lo, hi) records guard_string + guard_ints + guard_gc + ss
     try testing.expectEqual(@as(u32, 1), h.state.rec.alloc_count);
     // Recording emitted IR only — no guest allocation.
     try testing.expectEqual(objs_before, h.heap.strtab_count);
-    try testing.expectEqual(@as(Ref, 9), try h.state.refOf(0));
+    try testing.expectEqual(@as(Ref, 9), try h.state.rec.refOf(0));
 
     // 2-arg shape sub(s, 2): the default end records as a konst(-1) — the same
     // value tier-0 defaults to — so both shapes share one op.
@@ -1571,7 +1571,7 @@ test "recBRawget: int key reuses the array-get shape under guard_builtin" {
     };
     for (found) |g| try testing.expect(g);
     // The dest register holds the aload result.
-    try testing.expectEqual(IrOp.aload, ops[@intCast(try h.state.refOf(0))].op);
+    try testing.expectEqual(IrOp.aload, ops[@intCast(try h.state.rec.refOf(0))].op);
 }
 
 test "recBRawset: int key reuses the array-set shape; dest is the table ref" {
@@ -1597,8 +1597,8 @@ test "recBRawset: int key reuses the array-set shape; dest is the table ref" {
     }
     try testing.expect(saw_store);
     // rawset returns the table: the dest ref is the table's slot_load.
-    const dest_ref = try h.state.refOf(0);
-    try testing.expectEqual(dest_ref, try h.state.refOf(1));
+    const dest_ref = try h.state.rec.refOf(0);
+    try testing.expectEqual(dest_ref, try h.state.rec.refOf(1));
 }
 
 test "recBRawset: statement form (c == 0, the common case) records the store, defines no dest" {
@@ -1620,7 +1620,7 @@ test "recBRawset: statement form (c == 0, the common case) records the store, de
     }
     try testing.expect(saw_store);
     // No result: slot 0 keeps its callee ref (the slot_load at 0), not the table.
-    try testing.expectEqual(@as(Ref, 0), try h.state.refOf(0));
+    try testing.expectEqual(@as(Ref, 0), try h.state.rec.refOf(0));
 }
 
 test "recBRawget: wrong arity and non-table abort without recording garbage" {
@@ -1662,7 +1662,7 @@ test "len opcode: #t on a bitmap-lane table records guard_table + alen" {
     try testing.expectEqual(IrOp.guard_table, ops[1].op);
     try testing.expectEqual(IrOp.alen, ops[2].op);
     try testing.expectEqual(ObsType.int, ops[2].ty);
-    try testing.expectEqual(@as(Ref, 2), try state.refOf(0));
+    try testing.expectEqual(@as(Ref, 2), try state.rec.refOf(0));
 }
 
 test "len opcode: alen abort matrix — in-band lane, hash border, metatable" {
@@ -1781,7 +1781,7 @@ test "recBMType: int folds 'integer', float folds 'float', table folds nil" {
         st.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(st.isRecording());
         try testing.expectEqual(before, h.heap.strtab_count); // no allocation
-        const dest = st.konstValueOf(try st.refOf(0)).?;
+        const dest = st.rec.konstValueOf(try st.rec.refOf(0)).?;
         if (c.want_nil) {
             try testing.expect(dest.isNil());
         } else {
@@ -1809,7 +1809,7 @@ test "recBRawlen: observed table records guard_builtin + guard_table + alen" {
     try testing.expectEqual(@as(usize, 5), ops.len);
     try testing.expectEqual(IrOp.guard_builtin, ops[1].op);
     try testing.expectEqual(IrOp.alen, ops[4].op);
-    try testing.expectEqual(@as(Ref, 4), try h.state.refOf(0));
+    try testing.expectEqual(@as(Ref, 4), try h.state.rec.refOf(0));
 }
 
 test "alen fast case is exactly Table.length() under its premises (differential)" {
@@ -1851,7 +1851,7 @@ test "recEq: konst×konst folds to a bool konst (the type(x)=='number' collapse)
     state.recordInstr(Instr.opABC(.eq, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(state.isRecording());
     // No guards, no eq op — just the two konst loads and the folded bool.
-    try testing.expect(state.konstValueOf(try state.refOf(0)).?.asBool());
+    try testing.expect(state.rec.konstValueOf(try state.rec.refOf(0)).?.asBool());
     for (state.rec.instrs.items) |ins| try testing.expect(ins.op == .konst);
 }
 

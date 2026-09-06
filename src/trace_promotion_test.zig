@@ -16,6 +16,7 @@ const tropt = @import("tropt.zig");
 const execlog = @import("execlog.zig");
 const nativegen = @import("nativegen.zig");
 const irinterp = @import("irinterp.zig");
+const trace_exec = @import("trace_exec.zig");
 const jitdbg = @import("jitdbg.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
@@ -58,17 +59,19 @@ fn makeB3LinkTrace(
     const entry_guards = try gpa.alloc(EntryGuard, 0);
     errdefer gpa.free(entry_guards);
     t.* = .{
+        .code = .{
+            .anchor = .{ .proto = proto, .pc = pc },
+            .instrs = instrs,
+            .consts = consts,
+            .entry_slots = entry_slots,
+            .entry_guards = entry_guards,
+        },
         .id = id,
-        .anchor = .{ .proto = proto, .pc = pc },
-        .instrs = instrs,
-        .consts = consts,
-        .entry_slots = entry_slots,
-        .entry_guards = entry_guards,
     };
-    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null, null) orelse
+    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.registry.mcode_arena, &(t).code, (t).id, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
-    try state.cache.append(gpa, t);
+    try state.registry.cache.append(gpa, t);
     return t;
 }
 
@@ -97,17 +100,19 @@ fn makeB3GuardTrace(
     const entry_guards = try gpa.alloc(EntryGuard, 0);
     errdefer gpa.free(entry_guards);
     t.* = .{
+        .code = .{
+            .anchor = .{ .proto = proto, .pc = pc },
+            .instrs = instrs,
+            .consts = consts,
+            .entry_slots = entry_slots,
+            .entry_guards = entry_guards,
+        },
         .id = id,
-        .anchor = .{ .proto = proto, .pc = pc },
-        .instrs = instrs,
-        .consts = consts,
-        .entry_slots = entry_slots,
-        .entry_guards = entry_guards,
     };
-    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null, null) orelse
+    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.registry.mcode_arena, &(t).code, (t).id, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
-    try state.cache.append(gpa, t);
+    try state.registry.cache.append(gpa, t);
     return t;
 }
 
@@ -136,17 +141,19 @@ fn makeB3LoopDoneTrace(
     const entry_guards = try gpa.alloc(EntryGuard, 0);
     errdefer gpa.free(entry_guards);
     t.* = .{
+        .code = .{
+            .anchor = .{ .proto = proto, .pc = pc },
+            .instrs = instrs,
+            .consts = consts,
+            .entry_slots = entry_slots,
+            .entry_guards = entry_guards,
+        },
         .id = id,
-        .anchor = .{ .proto = proto, .pc = pc },
-        .instrs = instrs,
-        .consts = consts,
-        .entry_slots = entry_slots,
-        .entry_guards = entry_guards,
     };
-    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null, null) orelse
+    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.registry.mcode_arena, &(t).code, (t).id, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
-    try state.cache.append(gpa, t);
+    try state.registry.cache.append(gpa, t);
     return t;
 }
 
@@ -188,18 +195,20 @@ fn makeB3BridgeTrace(
     });
     errdefer gpa.free(exit_prov);
     t.* = .{
+        .code = .{
+            .anchor = .{ .proto = proto, .pc = pc },
+            .instrs = instrs,
+            .consts = consts,
+            .entry_slots = entry_slots,
+            .entry_guards = entry_guards,
+            .exit_prov = exit_prov,
+        },
         .id = id,
-        .anchor = .{ .proto = proto, .pc = pc },
-        .instrs = instrs,
-        .consts = consts,
-        .entry_slots = entry_slots,
-        .entry_guards = entry_guards,
-        .exit_prov = exit_prov,
     };
-    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null, null) orelse
+    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.registry.mcode_arena, &(t).code, (t).id, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
-    try state.cache.append(gpa, t);
+    try state.registry.cache.append(gpa, t);
     return t;
 }
 
@@ -232,17 +241,19 @@ fn makeB3BridgeSuccessorTrace(
     const entry_guards = try gpa.dupe(EntryGuard, &.{.{ .slot = 2, .ty = .int }});
     errdefer gpa.free(entry_guards);
     t.* = .{
+        .code = .{
+            .anchor = .{ .proto = proto, .pc = pc },
+            .instrs = instrs,
+            .consts = consts,
+            .entry_slots = entry_slots,
+            .entry_guards = entry_guards,
+        },
         .id = id,
-        .anchor = .{ .proto = proto, .pc = pc },
-        .instrs = instrs,
-        .consts = consts,
-        .entry_slots = entry_slots,
-        .entry_guards = entry_guards,
     };
-    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null, null) orelse
+    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.registry.mcode_arena, &(t).code, (t).id, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
-    try state.cache.append(gpa, t);
+    try state.registry.cache.append(gpa, t);
     return t;
 }
 
@@ -272,17 +283,19 @@ fn makeB3M1RampTrace(
     const entry_guards = try gpa.dupe(EntryGuard, &.{.{ .slot = 2, .ty = .int }});
     errdefer gpa.free(entry_guards);
     t.* = .{
+        .code = .{
+            .anchor = .{ .proto = proto, .pc = pc },
+            .instrs = instrs,
+            .consts = consts,
+            .entry_slots = entry_slots,
+            .entry_guards = entry_guards,
+        },
         .id = id,
-        .anchor = .{ .proto = proto, .pc = pc },
-        .instrs = instrs,
-        .consts = consts,
-        .entry_slots = entry_slots,
-        .entry_guards = entry_guards,
     };
-    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null, null) orelse
+    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.registry.mcode_arena, &(t).code, (t).id, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
-    try state.cache.append(gpa, t);
+    try state.registry.cache.append(gpa, t);
     return t;
 }
 
@@ -307,7 +320,7 @@ fn expectB3Patched(edge: PromotedEdge, promoted: bool) !void {
     try testing.expectEqual(&compiled.slots[edge.exit], metadata.slot);
 }
 
-fn b3ObservedRow(t: *Trace, exit: u32, kind: irinterp.LedgerKind) irinterp.LedgerEntry {
+fn b3ObservedRow(t: *Trace, exit: u32, kind: trace_exec.LedgerKind) trace_exec.LedgerEntry {
     return .{ .cum = 0, .id = t.id, .exit = exit, .reason = .normal, .kind = kind, .outcome = .normal };
 }
 
@@ -320,7 +333,7 @@ fn installB3PromotionRegion(state: *TraceState, key: RegionKey, traces: []const 
     var scratch: [TraceState.PROMOTED_SET_CAP * 2]ProgramPoint = undefined;
     var n: usize = 0;
     for (traces) |t| {
-        const point = ProgramPoint{ .proto_id = t.anchor.proto.id, .source_pc = t.anchor.pc };
+        const point = ProgramPoint{ .proto_id = t.code.anchor.proto.id, .source_pc = t.code.anchor.pc };
         var exists = false;
         for (scratch[0..n]) |prior| {
             if (prior.proto_id == point.proto_id and prior.source_pc == point.source_pc) {
@@ -333,15 +346,15 @@ fn installB3PromotionRegion(state: *TraceState, key: RegionKey, traces: []const 
             n += 1;
         }
     }
-    try state.region_defs.put(gpa, key.region_id, .{
+    try state.region_policy.region_defs.put(gpa, key.region_id, .{
         .members = try gpa.alloc(StructuralEdgeId, 0),
         .member_points = try gpa.dupe(ProgramPoint, scratch[0..n]),
-        .owner = traces[0].anchor,
+        .owner = traces[0].code.anchor,
         .classifier = .{ .kind = .cross_trace_cycle, .member_count = @intCast(traces.len) },
         .armable = true,
         .bridges = try gpa.alloc(RegionBridgeDef, 0),
     });
-    try state.region_profit.put(gpa, key, .{
+    try state.region_policy.region_profit.put(gpa, key, .{
         .root_frame_depth = 1,
         .root_call_seq = key.activation,
         .useful_window_seen = true,
@@ -375,12 +388,12 @@ test "B-3d.2 set candidacy accepts 2/3-edge automata in canonical order from any
     try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
     const two_key: RegionKey = .{ .region_id = @enumFromInt(1700), .activation = 32 };
     try installB3PromotionRegion(&state, two_key, &.{ a, b });
-    const observed_a = [_]irinterp.LedgerEntry{
+    const observed_a = [_]trace_exec.LedgerEntry{
         b3ObservedRow(a, 0, .link_terminal),
         b3ObservedRow(b, 0, .link_terminal),
         b3ObservedRow(a, 0, .link_terminal),
     };
-    const observed_b = [_]irinterp.LedgerEntry{
+    const observed_b = [_]trace_exec.LedgerEntry{
         b3ObservedRow(b, 0, .link_terminal),
         b3ObservedRow(a, 0, .link_terminal),
         b3ObservedRow(b, 0, .link_terminal),
@@ -401,20 +414,20 @@ test "B-3d.2 set candidacy accepts 2/3-edge automata in canonical order from any
 
     state.disarmAllLinks();
     const c = try makeB3LinkTrace(gpa, &state, &proto, 20, 3, 1);
-    a.instrs[0].aux = 2;
-    b.instrs[0].aux = 3;
+    a.code.instrs[0].aux = 2;
+    b.code.instrs[0].aux = 3;
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
     try testing.expect(try state.armNativeLink(b, 0, c, .link_terminal));
     try testing.expect(try state.armNativeLink(c, 0, a, .link_terminal));
     const region_key: RegionKey = .{ .region_id = @enumFromInt(1701), .activation = 33 };
     try installB3PromotionRegion(&state, region_key, &.{ a, b, c });
-    const observed_three_a = [_]irinterp.LedgerEntry{
+    const observed_three_a = [_]trace_exec.LedgerEntry{
         b3ObservedRow(a, 0, .link_terminal),
         b3ObservedRow(b, 0, .link_terminal),
         b3ObservedRow(c, 0, .link_terminal),
         b3ObservedRow(a, 0, .link_terminal),
     };
-    const observed_three_c = [_]irinterp.LedgerEntry{
+    const observed_three_c = [_]trace_exec.LedgerEntry{
         b3ObservedRow(c, 0, .link_terminal),
         b3ObservedRow(a, 0, .link_terminal),
         b3ObservedRow(b, 0, .link_terminal),
@@ -431,7 +444,7 @@ test "B-3d.2 set candidacy accepts 2/3-edge automata in canonical order from any
     // A second armed outgoing exit that is NOT patch-pointed (out-of-range
     // slot on a one-instruction link trace) is excluded from the candidate —
     // the set grammar admits only edges `promotedEdgeFromLink` validates.
-    try state.armed_links.append(gpa, .{
+    try state.registry.native_physical.armed_links.append(gpa, .{
         .parent = a,
         .slot_index = 1,
         .child = c,
@@ -440,13 +453,13 @@ test "B-3d.2 set candidacy accepts 2/3-edge automata in canonical order from any
     const multi_armed = state.detectPromotableSet(&observed_three_a, region_key).?;
     try testing.expectEqual(@as(usize, 3), multi_armed.len);
     gpa.free(multi_armed);
-    _ = state.armed_links.pop();
+    _ = state.registry.native_physical.armed_links.pop();
 
     // Promotion belongs to one exact live frozen region. Shrinking the
     // region's footprint excludes a member edge from the candidate, so its
     // observed rows no longer match (open_chain); a missing/foreign region is
     // its own reject; an unfrozen accumulator still refuses publication.
-    const def = state.region_defs.getPtr(region_key.region_id).?;
+    const def = state.region_policy.region_defs.getPtr(region_key.region_id).?;
     const complete_points = def.member_points;
     def.member_points = complete_points[0 .. complete_points.len - 1];
     try testing.expect(state.detectPromotableSet(&observed_three_a, region_key) == null);
@@ -457,9 +470,9 @@ test "B-3d.2 set candidacy accepts 2/3-edge automata in canonical order from any
         .{ .region_id = @enumFromInt(4242), .activation = 33 },
     ) == null);
     try testing.expectEqual(@as(u64, 1), state.silent_rejects.region_mismatch);
-    state.region_profit.getPtr(region_key).?.frozen = false;
+    state.region_policy.region_profit.getPtr(region_key).?.frozen = false;
     try testing.expectError(error.InvalidPromotionRegion, state.promoteSet(three_a, region_key));
-    state.region_profit.getPtr(region_key).?.frozen = true;
+    state.region_policy.region_profit.getPtr(region_key).?.frozen = true;
 }
 
 test "B-3d.2 set candidacy rejects non-member rows, kind mismatch, adjacent-pair break, over-cap; one set per region enforced" {
@@ -478,7 +491,7 @@ test "B-3d.2 set candidacy rejects non-member rows, kind mismatch, adjacent-pair
 
     // The set grammar has no repetition requirement: a forward-only ledger
     // whose every adjacent pair follows an armed edge is valid evidence.
-    const forward = [_]irinterp.LedgerEntry{
+    const forward = [_]trace_exec.LedgerEntry{
         b3ObservedRow(a, 0, .link_terminal),
         b3ObservedRow(b, 0, .link_terminal),
     };
@@ -486,17 +499,17 @@ test "B-3d.2 set candidacy rejects non-member rows, kind mismatch, adjacent-pair
     try testing.expectEqual(@as(usize, 2), forward_edges.len);
     gpa.free(forward_edges);
 
-    const closed = [_]irinterp.LedgerEntry{
+    const closed = [_]trace_exec.LedgerEntry{
         b3ObservedRow(a, 0, .link_terminal),
         b3ObservedRow(b, 0, .link_terminal),
         b3ObservedRow(a, 0, .link_terminal),
     };
     // An invalidated bridge kind fails `promotedEdgeFromLink`, dropping the
     // edge from the candidate — its observed rows no longer match any member.
-    state.armed_links.items[0].kind = .region_bridge;
+    state.registry.native_physical.armed_links.items[0].kind = .region_bridge;
     try testing.expect(state.detectPromotableSet(&closed, key) == null);
     try testing.expectEqual(@as(u64, 1), state.silent_rejects.open_chain);
-    state.armed_links.items[0].kind = .link_terminal;
+    state.registry.native_physical.armed_links.items[0].kind = .link_terminal;
     // Same exclusion when the parent has no patch table.
     const saved_patches = a.native.compiled.exit_patches;
     a.native.compiled.exit_patches = &.{};
@@ -504,14 +517,14 @@ test "B-3d.2 set candidacy rejects non-member rows, kind mismatch, adjacent-pair
     try testing.expectEqual(@as(u64, 2), state.silent_rejects.open_chain);
     a.native.compiled.exit_patches = saved_patches;
     // A row whose observed patch kind disagrees with the armed edge's kind.
-    const kind_mismatch = [_]irinterp.LedgerEntry{
+    const kind_mismatch = [_]trace_exec.LedgerEntry{
         b3ObservedRow(a, 0, .deopt),
         b3ObservedRow(b, 0, .link_terminal),
     };
     try testing.expect(state.detectPromotableSet(&kind_mismatch, key) == null);
     try testing.expectEqual(@as(u64, 1), state.silent_rejects.no_patch_point);
     // Per-adjacent-pair child-match: row i's armed child must own row i+1.
-    const pair_break = [_]irinterp.LedgerEntry{
+    const pair_break = [_]trace_exec.LedgerEntry{
         b3ObservedRow(a, 0, .link_terminal),
         b3ObservedRow(a, 0, .link_terminal),
         b3ObservedRow(b, 0, .link_terminal),
@@ -549,7 +562,7 @@ test "B-3d.2 set candidacy rejects non-member rows, kind mismatch, adjacent-pair
     ));
     const key_cap: RegionKey = .{ .region_id = @enumFromInt(2), .activation = 10 };
     try installB3PromotionRegion(&state, key_cap, &long);
-    const one_row = [_]irinterp.LedgerEntry{b3ObservedRow(long[0], 0, .link_terminal)};
+    const one_row = [_]trace_exec.LedgerEntry{b3ObservedRow(long[0], 0, .link_terminal)};
     try testing.expect(state.detectPromotableSet(&one_row, key_cap) == null);
     try testing.expectEqual(@as(u64, 1), state.silent_rejects.cap);
     try testing.expectEqual(@as(u64, 0), state.silent_rejects.bridge_member);
@@ -570,7 +583,7 @@ test "B-3b.2 promotion publishes metadata and patches mixed deopt/NOP exits; dem
     try testing.expect(try state.armNativeLink(guard, 5, done, .ordinary_guard));
     try testing.expect(try state.armNativeLink(done, 5, link, .loop_done_linked));
     try testing.expect(try state.armNativeLink(link, 0, guard, .link_terminal));
-    const observed = [_]irinterp.LedgerEntry{
+    const observed = [_]trace_exec.LedgerEntry{
         b3ObservedRow(guard, 5, .deopt),
         b3ObservedRow(done, 5, .loop_done_linked),
         b3ObservedRow(link, 0, .link_terminal),
@@ -581,12 +594,12 @@ test "B-3b.2 promotion publishes metadata and patches mixed deopt/NOP exits; dem
     const edges = state.detectPromotableSet(&observed, key).?;
     defer gpa.free(edges);
     try state.promoteSet(edges, key);
-    try testing.expectEqual(@as(usize, 1), state.promoted_sets.items.len);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
     for (edges) |edge| try expectB3Patched(edge, true);
-    try testing.expectEqual(@as(u64, 1), state.silent_promotions);
+    try testing.expectEqual(@as(u64, 1), state.registry.native_physical.silent_promotions);
     state.demoteAllSets();
     for (edges) |edge| try expectB3Patched(edge, false);
-    try testing.expectEqual(@as(u64, 1), state.silent_demotions);
+    try testing.expectEqual(@as(u64, 1), state.registry.native_physical.silent_demotions);
 }
 
 test "B-3b.4 region bridge promotes with frozen structural resume and rebuild demotes" {
@@ -600,36 +613,36 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
     const proto = Proto{ .id = 1714, .code = &code, .name = "b3-bridge", .num_registers = 4 };
     const bridge = try makeB3BridgeTrace(gpa, &state, &proto, 41, 20, 9);
     const succ = try makeB3LinkTrace(gpa, &state, &proto, 42, 9, 20);
-    try testing.expect(nativegen.isCompositeBridgeCandidate(bridge, 11));
+    try testing.expect(nativegen.isCompositeBridgeCandidate(&bridge.code, 11));
     const patch = TraceState.exitPatchFor(&bridge.native.compiled, 11).?;
     try testing.expectEqual(nativegen.ExitPatchKind.region_bridge, patch.kind);
     try testing.expectEqualSlices(u8, &nativegen.EXIT_NOP5, &patch.original);
 
     const rid: RegionId = @enumFromInt(1714);
-    try state.region_defs.put(gpa, rid, .{
+    try state.region_policy.region_defs.put(gpa, rid, .{
         .members = try gpa.dupe(StructuralEdgeId, &.{.{
             .anchor_proto_id = proto.id,
-            .anchor_pc = bridge.anchor.pc,
-            .exit = bridge.exit_prov[1].prov,
+            .anchor_pc = bridge.code.anchor.pc,
+            .exit = bridge.code.exit_prov[1].prov,
             .succ_anchor_proto_id = proto.id,
-            .succ_anchor_pc = succ.anchor.pc,
+            .succ_anchor_pc = succ.code.anchor.pc,
         }}),
         .member_points = try gpa.dupe(ProgramPoint, &.{
-            .{ .proto_id = proto.id, .source_pc = bridge.anchor.pc },
-            .{ .proto_id = proto.id, .source_pc = succ.anchor.pc },
+            .{ .proto_id = proto.id, .source_pc = bridge.code.anchor.pc },
+            .{ .proto_id = proto.id, .source_pc = succ.code.anchor.pc },
         }),
-        .owner = bridge.anchor,
+        .owner = bridge.code.anchor,
         .classifier = .{ .kind = .cross_trace_cycle, .member_count = 2 },
         .armable = true,
         .bridges = try gpa.alloc(RegionBridgeDef, 0),
     });
     try testing.expect(try state.armNativeLink(bridge, 11, succ, .region_bridge));
     try testing.expect(try state.armNativeLink(succ, 0, bridge, .link_terminal));
-    for (state.armed_links.items) |*link| if (link.kind == .region_bridge) {
+    for (state.registry.native_physical.armed_links.items) |*link| if (link.kind == .region_bridge) {
         link.region_id = rid;
-        link.armed_gen = state.region_defs_gen;
+        link.armed_gen = state.region_policy.region_defs_gen;
     };
-    const observed = [_]irinterp.LedgerEntry{
+    const observed = [_]trace_exec.LedgerEntry{
         b3ObservedRow(bridge, 11, .region_bridge),
         b3ObservedRow(succ, 0, .link_terminal),
         b3ObservedRow(bridge, 11, .region_bridge),
@@ -640,7 +653,7 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
     for (edges) |edge| {
         if (edge.arm_kind == .region_bridge) bridge_edge = edge;
     }
-    try testing.expectEqual(succ.anchor.pc, bridge_edge.?.resume_pc);
+    try testing.expectEqual(succ.code.anchor.pc, bridge_edge.?.resume_pc);
     const key: RegionKey = .{ .region_id = rid, .activation = 99 };
     state.config.min_useful = 3;
     state.config.max_barren_run = 64;
@@ -651,12 +664,12 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
         .useful_streak = state.config.freeze_windows,
         .frozen = true,
     };
-    try state.region_profit.put(gpa, key, initial);
-    for (state.armed_links.items) |*link| if (link.kind == .region_bridge) {
+    try state.region_policy.region_profit.put(gpa, key, initial);
+    for (state.registry.native_physical.armed_links.items) |*link| if (link.kind == .region_bridge) {
         link.region_id = @enumFromInt(9999);
     };
     try testing.expect(!state.promotionBelongsToRegion(edges, key));
-    for (state.armed_links.items) |*link| if (link.kind == .region_bridge) {
+    for (state.registry.native_physical.armed_links.items) |*link| if (link.kind == .region_bridge) {
         link.region_id = rid;
     };
     try state.promoteSet(edges, key);
@@ -664,25 +677,25 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
 
     // Reporting-mode oracle for one bridge firing followed by the structural
     // link back into the ring.
-    state.region_context = .{ .depth = 1, .call_seq = key.activation };
-    const reporting = [_]irinterp.LedgerEntry{
+    state.region_policy.region_context = .{ .depth = 1, .call_seq = key.activation };
+    const reporting = [_]trace_exec.LedgerEntry{
         .{ .cum = 3, .id = bridge.id, .exit = 11, .reason = .normal, .kind = .region_bridge, .outcome = .normal },
         .{ .cum = 3, .id = succ.id, .exit = 0, .reason = .normal, .kind = .link_terminal, .outcome = .normal },
     };
     var reporting_completed: usize = 0;
-    var reporting_resume: u32 = bridge.anchor.pc;
+    var reporting_resume: u32 = bridge.code.anchor.pc;
     var reporting_hops: usize = 0;
-    _ = state.replayLedger(&reporting, bridge, succ.anchor.pc, &proto, &reporting_completed, &reporting_resume, &reporting_hops, 8, .continuation_call, true, null);
-    const oracle_accum = state.region_profit.get(key).?;
+    _ = state.replayLedger(&reporting, bridge, succ.code.anchor.pc, &proto, &reporting_completed, &reporting_resume, &reporting_hops, 8, .continuation_call, true, null);
+    const oracle_accum = state.region_policy.region_profit.get(key).?;
     const oracle_bridge_hits = bridge.hit_count;
     const oracle_bridge_fused = state.native_region_bridge_fused;
     const oracle_link_exits = state.native_link_exits;
 
-    state.region_profit.getPtr(key).?.* = initial;
+    state.region_policy.region_profit.getPtr(key).?.* = initial;
     bridge.hit_count = 0;
     state.native_region_bridge_fused = 0;
     state.native_link_exits = 0;
-    const set = &state.promoted_sets.items[0];
+    const set = &state.registry.native_physical.promoted_sets.items[0];
     var bridge_phase: usize = 0;
     for (set.edges, 0..) |edge, phase| {
         if (edge.arm_kind == .region_bridge) bridge_phase = phase;
@@ -729,7 +742,7 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
         .silent_cum = 3,
         .silent_last_cell = @intFromPtr(&set.metadata[link_phase]),
     }, &proto, &silent_completed, &silent_resume, &silent_hops, 8, .continuation_call, true, null);
-    const silent_accum = state.region_profit.get(key).?;
+    const silent_accum = state.region_policy.region_profit.get(key).?;
     try testing.expectEqual(oracle_bridge_hits, bridge.hit_count);
     try testing.expectEqual(oracle_bridge_fused, state.native_region_bridge_fused);
     try testing.expectEqual(oracle_link_exits, state.native_link_exits);
@@ -737,7 +750,7 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
     try testing.expectEqual(oracle_accum.outer_traversals, silent_accum.outer_traversals);
 
     state.rebuildRegions();
-    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
     try expectB3Patched(bridge_edge.?, false);
 }
 
@@ -757,28 +770,28 @@ test "B-3b suffix preserves bridge materialization for child deopt and prologue 
     const child = try makeB3BridgeSuccessorTrace(gpa, &state, &proto, 52, 9, 20);
 
     const rid: RegionId = @enumFromInt(1715);
-    try state.region_defs.put(gpa, rid, .{
+    try state.region_policy.region_defs.put(gpa, rid, .{
         .members = try gpa.dupe(StructuralEdgeId, &.{.{
             .anchor_proto_id = proto.id,
-            .anchor_pc = bridge.anchor.pc,
-            .exit = bridge.exit_prov[1].prov,
+            .anchor_pc = bridge.code.anchor.pc,
+            .exit = bridge.code.exit_prov[1].prov,
             .succ_anchor_proto_id = proto.id,
-            .succ_anchor_pc = child.anchor.pc,
+            .succ_anchor_pc = child.code.anchor.pc,
         }}),
         .member_points = try gpa.dupe(ProgramPoint, &.{
-            .{ .proto_id = proto.id, .source_pc = bridge.anchor.pc },
-            .{ .proto_id = proto.id, .source_pc = child.anchor.pc },
+            .{ .proto_id = proto.id, .source_pc = bridge.code.anchor.pc },
+            .{ .proto_id = proto.id, .source_pc = child.code.anchor.pc },
         }),
-        .owner = bridge.anchor,
+        .owner = bridge.code.anchor,
         .classifier = .{ .kind = .cross_trace_cycle, .member_count = 2 },
         .armable = true,
         .bridges = try gpa.alloc(RegionBridgeDef, 0),
     });
     try testing.expect(try state.armNativeLink(bridge, 11, child, .region_bridge));
     try testing.expect(try state.armNativeLink(child, 7, bridge, .ordinary_guard));
-    for (state.armed_links.items) |*link| if (link.kind == .region_bridge) {
+    for (state.registry.native_physical.armed_links.items) |*link| if (link.kind == .region_bridge) {
         link.region_id = rid;
-        link.armed_gen = state.region_defs_gen;
+        link.armed_gen = state.region_policy.region_defs_gen;
     };
 
     const key: RegionKey = .{ .region_id = rid, .activation = 101 };
@@ -789,9 +802,9 @@ test "B-3b suffix preserves bridge materialization for child deopt and prologue 
         .useful_streak = state.config.freeze_windows,
         .frozen = true,
     };
-    try state.region_profit.put(gpa, key, initial);
-    state.region_context = .{ .depth = 1, .call_seq = key.activation };
-    const observed = [_]irinterp.LedgerEntry{
+    try state.region_policy.region_profit.put(gpa, key, initial);
+    state.region_policy.region_context = .{ .depth = 1, .call_seq = key.activation };
+    const observed = [_]trace_exec.LedgerEntry{
         b3ObservedRow(bridge, 11, .region_bridge),
         b3ObservedRow(child, 7, .deopt),
         b3ObservedRow(bridge, 11, .region_bridge),
@@ -820,7 +833,7 @@ test "B-3b suffix preserves bridge materialization for child deopt and prologue 
     try testing.expectEqual(@as(u64, 1), deopt.silent_transitions);
     try testing.expectEqual(@as(usize, 1), deopt.ledger_len);
     try testing.expectEqual(child.id, state.ledger_scratch[0].id);
-    try testing.expectEqual(irinterp.LedgerKind.deopt, state.ledger_scratch[0].kind);
+    try testing.expectEqual(trace_exec.LedgerKind.deopt, state.ledger_scratch[0].kind);
     try testing.expectEqual(@as(u32, 5), state.ledger_scratch[0].exit);
     var completed: usize = 0;
     var resume_pc_value: u32 = 0;
@@ -831,12 +844,12 @@ test "B-3b suffix preserves bridge materialization for child deopt and prologue 
         .return_result => |r| r,
         else => return error.TestUnexpectedResult,
     };
-    try testing.expectEqual(child.anchor.pc, deopt_result.resume_pc);
-    try testing.expectEqual(child.anchor.pc, resume_pc_value);
-    try testing.expectEqual(@as(u32, 2), state.region_profit.get(key).?.barren_run);
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(child.anchor));
+    try testing.expectEqual(child.code.anchor.pc, deopt_result.resume_pc);
+    try testing.expectEqual(child.code.anchor.pc, resume_pc_value);
+    try testing.expectEqual(@as(u32, 2), state.region_policy.region_profit.get(key).?.barren_run);
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(child.code.anchor));
 
-    state.region_profit.getPtr(key).?.* = initial;
+    state.region_policy.region_profit.getPtr(key).?.* = initial;
     payloads = .{
         @bitCast(@as(i64, 0)),
         @bitCast(@as(i64, 2)),
@@ -850,7 +863,7 @@ test "B-3b suffix preserves bridge materialization for child deopt and prologue 
     try testing.expectEqual(@as(u64, 1), prologue.silent_transitions);
     try testing.expectEqual(@as(usize, 1), prologue.ledger_len);
     try testing.expectEqual(child.id, state.ledger_scratch[0].id);
-    try testing.expectEqual(irinterp.LedgerKind.prologue_fail, state.ledger_scratch[0].kind);
+    try testing.expectEqual(trace_exec.LedgerKind.prologue_fail, state.ledger_scratch[0].kind);
     completed = 0;
     resume_pc_value = 0;
     hops = 0;
@@ -860,10 +873,10 @@ test "B-3b suffix preserves bridge materialization for child deopt and prologue 
         .return_result => |r| r,
         else => return error.TestUnexpectedResult,
     };
-    try testing.expectEqual(child.anchor.pc, prologue_result.resume_pc);
-    try testing.expectEqual(child.anchor.pc, resume_pc_value);
-    try testing.expectEqual(@as(u32, 1), state.region_profit.get(key).?.barren_run);
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(child.anchor));
+    try testing.expectEqual(child.code.anchor.pc, prologue_result.resume_pc);
+    try testing.expectEqual(child.code.anchor.pc, resume_pc_value);
+    try testing.expectEqual(@as(u32, 1), state.region_policy.region_profit.get(key).?.barren_run);
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(child.code.anchor));
     try testing.expectEqual(@as(u32, 1), child.consec_refusals);
     try testing.expectEqual(@as(u64, 2), state.silent_suffix_drains);
 }
@@ -883,7 +896,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
     try testing.expect(try state.armNativeLink(source, 5, ramp, .ordinary_guard));
     try testing.expect(try state.armNativeLink(ramp, 6, source, .link_terminal));
 
-    const observed = [_]irinterp.LedgerEntry{
+    const observed = [_]trace_exec.LedgerEntry{
         b3ObservedRow(source, 5, .deopt),
         b3ObservedRow(ramp, 6, .link_terminal),
         b3ObservedRow(source, 5, .deopt),
@@ -892,8 +905,8 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
     try installB3PromotionRegion(&state, key, &.{ source, ramp });
     const physical = state.detectPromotableSet(&observed, key).?;
     defer gpa.free(physical);
-    state.region_context = .{ .depth = 1, .call_seq = key.activation };
-    const initial_accum = state.region_profit.get(key).?;
+    state.region_policy.region_context = .{ .depth = 1, .call_seq = key.activation };
+    const initial_accum = state.region_policy.region_profit.get(key).?;
 
     var tags = [_]u8{
         @intFromEnum(value.Tag.int),
@@ -916,7 +929,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
     const oracle_deopt = state.replayLedger(
         state.ledger_scratch[0..ordinary_deopt.ledger_len],
         source,
-        source.anchor.pc,
+        source.code.anchor.pc,
         &proto,
         &oracle_completed,
         &oracle_resume,
@@ -930,14 +943,14 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
         .return_result => |r| r,
         else => return error.TestUnexpectedResult,
     };
-    const oracle_deopt_penalty = state.penalty.get(ramp.anchor);
+    const oracle_deopt_penalty = state.penalty.get(ramp.code.anchor);
     const oracle_source_hits = source.hit_count;
-    const oracle_deopt_accum = state.region_profit.get(key).?;
+    const oracle_deopt_accum = state.region_policy.region_profit.get(key).?;
 
     state.penalty.clearRetainingCapacity();
     source.hit_count = 0;
     ramp.hit_count = 0;
-    state.region_profit.getPtr(key).?.* = initial_accum;
+    state.region_policy.region_profit.getPtr(key).?.* = initial_accum;
     try state.promoteSet(physical, key);
     state.prepareNativeEntry();
     const silent_deopt = source.native.compiled.runCapturingLedger(regs, &state.ledger_scratch, state.silentStaging());
@@ -962,17 +975,17 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
         else => return error.TestUnexpectedResult,
     };
     try testing.expectEqual(oracle_deopt_result.resume_pc, silent_deopt_result.resume_pc);
-    try testing.expectEqual(source.anchor.pc, silent_deopt_result.resume_pc);
-    try testing.expectEqual(oracle_deopt_penalty, state.penalty.get(ramp.anchor));
+    try testing.expectEqual(source.code.anchor.pc, silent_deopt_result.resume_pc);
+    try testing.expectEqual(oracle_deopt_penalty, state.penalty.get(ramp.code.anchor));
     try testing.expectEqual(oracle_source_hits, source.hit_count);
-    try expectRegionAccumEqual(oracle_deopt_accum, state.region_profit.get(key).?);
+    try expectRegionAccumEqual(oracle_deopt_accum, state.region_policy.region_profit.get(key).?);
 
     // Repeat with a hoisted ramp entry failure. The source's silent M1 state
     // must still drive the zero-progress charge and source-anchor resume.
     state.penalty.clearRetainingCapacity();
     source.hit_count = 0;
     ramp.hit_count = 0;
-    state.region_profit.getPtr(key).?.* = initial_accum;
+    state.region_policy.region_profit.getPtr(key).?.* = initial_accum;
     tags[2] = @intFromEnum(value.Tag.float);
     payloads[2] = @bitCast(@as(f64, 0.5));
     state.demoteAllSets();
@@ -984,7 +997,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
     const oracle_prologue = state.replayLedger(
         state.ledger_scratch[0..ordinary_prologue.ledger_len],
         source,
-        source.anchor.pc,
+        source.code.anchor.pc,
         &proto,
         &oracle_completed,
         &oracle_resume,
@@ -998,14 +1011,14 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
         .return_result => |r| r,
         else => return error.TestUnexpectedResult,
     };
-    const oracle_prologue_penalty = state.penalty.get(ramp.anchor);
+    const oracle_prologue_penalty = state.penalty.get(ramp.code.anchor);
     const oracle_prologue_hits = source.hit_count;
-    const oracle_prologue_accum = state.region_profit.get(key).?;
+    const oracle_prologue_accum = state.region_policy.region_profit.get(key).?;
 
     state.penalty.clearRetainingCapacity();
     source.hit_count = 0;
     ramp.hit_count = 0;
-    state.region_profit.getPtr(key).?.* = initial_accum;
+    state.region_policy.region_profit.getPtr(key).?.* = initial_accum;
     try state.promoteSet(physical, key);
     state.prepareNativeEntry();
     const silent_prologue = source.native.compiled.runCapturingLedger(regs, &state.ledger_scratch, state.silentStaging());
@@ -1030,10 +1043,10 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
         else => return error.TestUnexpectedResult,
     };
     try testing.expectEqual(oracle_prologue_result.resume_pc, silent_prologue_result.resume_pc);
-    try testing.expectEqual(source.anchor.pc, silent_prologue_result.resume_pc);
-    try testing.expectEqual(oracle_prologue_penalty, state.penalty.get(ramp.anchor));
+    try testing.expectEqual(source.code.anchor.pc, silent_prologue_result.resume_pc);
+    try testing.expectEqual(oracle_prologue_penalty, state.penalty.get(ramp.code.anchor));
     try testing.expectEqual(oracle_prologue_hits, source.hit_count);
-    try expectRegionAccumEqual(oracle_prologue_accum, state.region_profit.get(key).?);
+    try expectRegionAccumEqual(oracle_prologue_accum, state.region_policy.region_profit.get(key).?);
 
     // Row-0 ramp deopt may itself be an armed Part-S handoff source. Rebuild
     // the suppressed source row with local=9: the ramp sibling production must
@@ -1049,10 +1062,10 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
     // set; this leg instead re-promotes the original pair directly so the
     // sibling edge stays UN-owned and its suffix row still exercises the
     // Part-S handoff production below.
-    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
-    try testing.expectEqual(@as(u64, 1), state.silent_demotion_reasons.membership_growth);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
+    try testing.expectEqual(@as(u64, 1), state.registry.native_physical.silent_demotion_reasons.membership_growth);
     try state.promoteSet(physical, key);
-    const set = &state.promoted_sets.items[0];
+    const set = &state.registry.native_physical.promoted_sets.items[0];
     var source_phase: usize = 0;
     for (set.edges, 0..) |edge, phase| if (edge.parent == source) {
         source_phase = phase;
@@ -1084,7 +1097,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
         .kind = .link_terminal,
         .outcome = .normal,
     };
-    const ramp_handoff_suffix = irinterp.ExecResult{
+    const ramp_handoff_suffix = trace_exec.ExecResult{
         .completed = 9,
         .exit_instr = 0,
         .ledger_len = 2,
@@ -1139,7 +1152,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
         .kind = .link_terminal,
         .outcome = .normal,
     };
-    const ramp_link_suffix = irinterp.ExecResult{
+    const ramp_link_suffix = trace_exec.ExecResult{
         .completed = 9,
         .exit_instr = 6,
         .ledger_len = 1,
@@ -1186,7 +1199,7 @@ test "B-3b.2 slot mutation and closeRegion demote before invalidation" {
     const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
     try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
-    const observed = [_]irinterp.LedgerEntry{
+    const observed = [_]trace_exec.LedgerEntry{
         b3ObservedRow(a, 0, .link_terminal),
         b3ObservedRow(b, 0, .link_terminal),
         b3ObservedRow(a, 0, .link_terminal),
@@ -1200,20 +1213,20 @@ test "B-3b.2 slot mutation and closeRegion demote before invalidation" {
     // target, exactly what the forced-yield convergence sites re-publish —
     // short-circuits at the funnel and demotes NOTHING.
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
-    try testing.expectEqual(@as(usize, 1), state.promoted_sets.items.len);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
     for (edges) |edge| try expectB3Patched(edge, true);
     // A CHANGED relation (different child) still demotes via prepareSlotMutation.
     const c2 = try makeB3LinkTrace(gpa, &state, &proto, 3, 2, 1);
     try testing.expect(try state.armNativeLink(a, 0, c2, .link_terminal));
-    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
     for (edges) |edge| try expectB3Patched(edge, false);
 
     // Restore the ring relation (changed again: c2 -> b) for the closeRegion leg.
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
     try state.promoteSet(edges, key);
-    try state.region_profit.put(gpa, key, .{ .root_frame_depth = 1, .root_call_seq = key.activation });
+    try state.region_policy.region_profit.put(gpa, key, .{ .root_frame_depth = 1, .root_call_seq = key.activation });
     state.closeRegion(key);
-    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
 }
 
 test "B-3b.2 prepareNativeEntry retains same activation and demotes a different activation" {
@@ -1227,7 +1240,7 @@ test "B-3b.2 prepareNativeEntry retains same activation and demotes a different 
     const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
     try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
-    const observed = [_]irinterp.LedgerEntry{
+    const observed = [_]trace_exec.LedgerEntry{
         b3ObservedRow(a, 0, .link_terminal),
         b3ObservedRow(b, 0, .link_terminal),
         b3ObservedRow(a, 0, .link_terminal),
@@ -1237,15 +1250,15 @@ test "B-3b.2 prepareNativeEntry retains same activation and demotes a different 
     try installB3PromotionRegion(&state, same, &.{ a, b });
     const edges = state.detectPromotableSet(&observed, same).?;
     defer gpa.free(edges);
-    state.region_context = .{ .depth = 1, .call_seq = same.activation };
+    state.region_policy.region_context = .{ .depth = 1, .call_seq = same.activation };
     try state.promoteSet(edges, same);
     state.prepareNativeEntry();
-    try testing.expectEqual(@as(usize, 1), state.promoted_sets.items.len);
-    _ = state.region_profit.remove(same);
-    try state.region_profit.put(gpa, other, .{ .root_frame_depth = 1, .root_call_seq = other.activation });
-    state.region_context = .{ .depth = 1, .call_seq = other.activation };
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
+    _ = state.region_policy.region_profit.remove(same);
+    try state.region_policy.region_profit.put(gpa, other, .{ .root_frame_depth = 1, .root_call_seq = other.activation });
+    state.region_policy.region_context = .{ .depth = 1, .call_seq = other.activation };
     state.prepareNativeEntry();
-    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
 }
 
 test "B-3b.2 replay walk queues demotion and applies it before pending disarms" {
@@ -1259,7 +1272,7 @@ test "B-3b.2 replay walk queues demotion and applies it before pending disarms" 
     const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
     try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
-    const observed = [_]irinterp.LedgerEntry{
+    const observed = [_]trace_exec.LedgerEntry{
         b3ObservedRow(a, 0, .link_terminal),
         b3ObservedRow(b, 0, .link_terminal),
         b3ObservedRow(a, 0, .link_terminal),
@@ -1269,16 +1282,16 @@ test "B-3b.2 replay walk queues demotion and applies it before pending disarms" 
     const edges = state.detectPromotableSet(&observed, key).?;
     defer gpa.free(edges);
     try state.promoteSet(edges, key);
-    state.replay_walk_depth = 1;
+    state.registry.native_physical.replay_walk_depth = 1;
     state.demoteSetsTouching(a, 0);
     state.disarmAllLinks();
-    try testing.expectEqual(@as(usize, 1), state.promoted_sets.items.len);
-    try testing.expectEqual(@as(usize, 1), state.pending_demote.items.len);
-    try testing.expect(state.pending_disarm_all);
-    state.replay_walk_depth = 0;
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.pending_demote.items.len);
+    try testing.expect(state.registry.native_physical.pending_disarm_all);
+    state.registry.native_physical.replay_walk_depth = 0;
     state.applyPendingDisarms();
-    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
-    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
     for (edges) |edge| try expectB3Patched(edge, false);
 }
 
@@ -1293,7 +1306,7 @@ test "B-3d.1 low-yield unfreeze demotes the region's promotion in the same act" 
     const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
     try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
-    const observed = [_]irinterp.LedgerEntry{
+    const observed = [_]trace_exec.LedgerEntry{
         b3ObservedRow(a, 0, .link_terminal),
         b3ObservedRow(b, 0, .link_terminal),
         b3ObservedRow(a, 0, .link_terminal),
@@ -1310,27 +1323,27 @@ test "B-3d.1 low-yield unfreeze demotes the region's promotion in the same act" 
     // pre-existing hole: the barren-exhaustion path could unfreeze with the
     // patches live and panic the next drain on the frozen check).
     state.flushRegionWindow(key, 1);
-    try testing.expect(!state.region_profit.get(key).?.frozen);
-    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
-    try testing.expectEqual(@as(u64, 1), state.silent_demotion_reasons.unfreeze);
+    try testing.expect(!state.region_policy.region_profit.get(key).?.frozen);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
+    try testing.expectEqual(@as(u64, 1), state.registry.native_physical.silent_demotion_reasons.unfreeze);
     for (edges) |edge| try expectB3Patched(edge, false);
 
     // Mid-walk: the same verdict QUEUES the demotion; the walk applies it at
     // its exit, exactly like every other deferred demotion source.
     {
-        const accum = state.region_profit.getPtr(key).?;
+        const accum = state.region_policy.region_profit.getPtr(key).?;
         accum.frozen = true;
         accum.useful_streak = state.config.freeze_windows;
     }
     try state.promoteSet(edges, key);
-    state.replay_walk_depth = 1;
+    state.registry.native_physical.replay_walk_depth = 1;
     state.flushRegionWindow(key, 1);
-    try testing.expectEqual(@as(usize, 1), state.promoted_sets.items.len);
-    try testing.expectEqual(@as(usize, 1), state.pending_demote.items.len);
-    state.replay_walk_depth = 0;
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.pending_demote.items.len);
+    state.registry.native_physical.replay_walk_depth = 0;
     state.applyPendingDisarms();
-    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
-    try testing.expectEqual(@as(u64, 2), state.silent_demotion_reasons.unfreeze);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
+    try testing.expectEqual(@as(u64, 2), state.registry.native_physical.silent_demotion_reasons.unfreeze);
     for (edges) |edge| try expectB3Patched(edge, false);
 }
 
@@ -1350,10 +1363,10 @@ test "B-3d round-6: a repeated-parent SET firing out of order resolves its termi
     const c = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
     const d = try makeB3LinkTrace(gpa, &state, &proto, 3, 3, 1);
     const set = [_]PromotedEdge{
-        .{ .parent = p, .exit = 0, .kind = .deopt, .child = c, .arm_kind = .loop_done_linked, .resume_pc = c.anchor.pc },
-        .{ .parent = p, .exit = 1, .kind = .deopt, .child = d, .arm_kind = .loop_done_linked, .resume_pc = d.anchor.pc },
-        .{ .parent = c, .exit = 0, .kind = .deopt, .child = p, .arm_kind = .loop_done_linked, .resume_pc = p.anchor.pc },
-        .{ .parent = d, .exit = 0, .kind = .deopt, .child = p, .arm_kind = .loop_done_linked, .resume_pc = p.anchor.pc },
+        .{ .parent = p, .exit = 0, .kind = .deopt, .child = c, .arm_kind = .loop_done_linked, .resume_pc = c.code.anchor.pc },
+        .{ .parent = p, .exit = 1, .kind = .deopt, .child = d, .arm_kind = .loop_done_linked, .resume_pc = d.code.anchor.pc },
+        .{ .parent = c, .exit = 0, .kind = .deopt, .child = p, .arm_kind = .loop_done_linked, .resume_pc = p.code.anchor.pc },
+        .{ .parent = d, .exit = 0, .kind = .deopt, .child = p, .arm_kind = .loop_done_linked, .resume_pc = p.code.anchor.pc },
     };
 
     // Three transitions, all on edges 0 and 2: P.e0, C.e0, P.e0. Round-robin
@@ -1402,7 +1415,7 @@ test "B-3d round-6: a repeated-parent SET firing out of order resolves its termi
     }
     try testing.expectEqual(@as(?usize, 0), terminal);
     try testing.expectEqual(c, set[terminal.?].child);
-    try testing.expectEqual(c.anchor.pc, set[terminal.?].resume_pc);
+    try testing.expectEqual(c.code.anchor.pc, set[terminal.?].resume_pc);
 }
 
 test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix" {
@@ -1411,7 +1424,7 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
     var state = TraceState.init(gpa);
     defer state.deinit();
     state.config.min_useful = 1;
-    state.config.silent_budget = irinterp.LEDGER_CAP;
+    state.config.silent_budget = trace_exec.LEDGER_CAP;
     state.config.max_barren_run = 64;
     state.config.promote_after = 2;
 
@@ -1425,13 +1438,13 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
 
     const rid: RegionId = @enumFromInt(1710);
     const key: RegionKey = .{ .region_id = rid, .activation = 77 };
-    try state.region_defs.put(gpa, rid, .{
+    try state.region_policy.region_defs.put(gpa, rid, .{
         .members = try gpa.alloc(StructuralEdgeId, 0),
         .member_points = try gpa.dupe(ProgramPoint, &.{
-            .{ .proto_id = proto.id, .source_pc = inner.anchor.pc },
-            .{ .proto_id = proto.id, .source_pc = cont.anchor.pc },
+            .{ .proto_id = proto.id, .source_pc = inner.code.anchor.pc },
+            .{ .proto_id = proto.id, .source_pc = cont.code.anchor.pc },
         }),
-        .owner = cont.anchor,
+        .owner = cont.code.anchor,
         .classifier = .{ .kind = .cross_trace_cycle, .member_count = 2 },
         .armable = true,
         .bridges = try gpa.alloc(RegionBridgeDef, 0),
@@ -1443,8 +1456,8 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
         .useful_streak = state.config.freeze_windows,
         .frozen = true,
     };
-    try state.region_profit.put(gpa, key, initial_accum);
-    state.region_context = .{ .depth = 1, .call_seq = key.activation };
+    try state.region_policy.region_profit.put(gpa, key, initial_accum);
+    state.region_policy.region_context = .{ .depth = 1, .call_seq = key.activation };
 
     // The unpromoted oracle executes the same armed C↔I workload until the
     // reporting ledger cap forces a yield, then replays every row normally.
@@ -1456,11 +1469,11 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
         &state.ledger_scratch,
         state.silentStaging(),
     );
-    try testing.expectEqual(@as(usize, irinterp.LEDGER_CAP), ordinary.ledger_len);
-    try testing.expectEqual(irinterp.LedgerOutcome.yielded, state.ledger_scratch[ordinary.ledger_len - 1].outcome);
+    try testing.expectEqual(@as(usize, trace_exec.LEDGER_CAP), ordinary.ledger_len);
+    try testing.expectEqual(trace_exec.LedgerOutcome.yielded, state.ledger_scratch[ordinary.ledger_len - 1].outcome);
     const evidence = state.ledger_scratch;
     var ordinary_completed: usize = 0;
-    var ordinary_resume: u32 = cont.anchor.pc;
+    var ordinary_resume: u32 = cont.code.anchor.pc;
     var ordinary_hops: usize = 0;
     _ = state.replayLedger(
         state.ledger_scratch[0..ordinary.ledger_len],
@@ -1478,45 +1491,45 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
     state.applyPendingDisarms();
     state.drainPendingBridgeArm(true);
     state.drainProvenanceArms(true);
-    const ordinary_accum = state.region_profit.get(key).?;
+    const ordinary_accum = state.region_policy.region_profit.get(key).?;
     const ordinary_cont_hits = cont.hit_count;
     const ordinary_inner_hits = inner.hit_count;
     const ordinary_link_exits = state.native_link_exits;
     const ordinary_link_follows = state.native_link_follow_count;
     const ordinary_all_follows = state.link_follow_count;
     const ordinary_loopdone_fused = state.native_loopdone_link_fused;
-    const ordinary_flushes = state.region_profit_flushes;
-    const ordinary_flushed_work = state.region_profit_flushed_work;
+    const ordinary_flushes = state.region_policy.region_profit_flushes;
+    const ordinary_flushed_work = state.region_policy.region_profit_flushed_work;
 
     // Reset only fields the oracle replay moved, then require two identical
     // successful detections before the production promotion gate publishes.
-    state.region_profit.getPtr(key).?.* = initial_accum;
+    state.region_policy.region_profit.getPtr(key).?.* = initial_accum;
     cont.hit_count = 0;
     inner.hit_count = 0;
     state.native_link_exits = 0;
     state.native_link_follow_count = 0;
     state.link_follow_count = 0;
     state.native_loopdone_link_fused = 0;
-    state.region_profit_flushes = 0;
-    state.region_profit_flushed_work = 0;
+    state.region_policy.region_profit_flushes = 0;
+    state.region_policy.region_profit_flushed_work = 0;
     state.config.silent_promotion_enabled = true;
     _ = state.driveDispatcherLedger(cont, &evidence, &proto, regs, true);
-    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
     _ = state.driveDispatcherLedger(cont, &evidence, &proto, regs, true);
-    try testing.expectEqual(@as(usize, 1), state.promoted_sets.items.len);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
     try testing.expectEqual(@as(u64, 2), state.silent_promotion_candidates);
 
     // Detection replays are evidence, not part of the differential workload.
     // Reset the fields they moved before executing the promoted comparison span.
-    state.region_profit.getPtr(key).?.* = initial_accum;
+    state.region_policy.region_profit.getPtr(key).?.* = initial_accum;
     cont.hit_count = 0;
     inner.hit_count = 0;
     state.native_link_exits = 0;
     state.native_link_follow_count = 0;
     state.link_follow_count = 0;
     state.native_loopdone_link_fused = 0;
-    state.region_profit_flushes = 0;
-    state.region_profit_flushed_work = 0;
+    state.region_policy.region_profit_flushes = 0;
+    state.region_policy.region_profit_flushed_work = 0;
 
     state.prepareNativeEntry();
     const silent = cont.native.compiled.runCapturingLedger(
@@ -1528,7 +1541,7 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
     try testing.expect(silent.silent_transitions > 1);
     try testing.expectEqual(@as(usize, 0), silent.ledger_len);
     var silent_completed: usize = 0;
-    var silent_resume: u32 = cont.anchor.pc;
+    var silent_resume: u32 = cont.code.anchor.pc;
     var silent_hops: usize = 0;
     const silent_dir = state.drainSilentResult(
         silent,
@@ -1546,7 +1559,7 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
     // Differential equivalence over every deterministic field replayLedger's
     // row accounting moved. Coverage/TSC is deliberately disabled here: one
     // native span cannot be attributed per member in the promoted mode.
-    const silent_accum = state.region_profit.get(key).?;
+    const silent_accum = state.region_policy.region_profit.get(key).?;
     try testing.expectEqual(ordinary_accum.outer_traversals, silent_accum.outer_traversals);
     try testing.expectEqual(ordinary_accum.window_base, silent_accum.window_base);
     try testing.expectEqual(ordinary_accum.useful_window_seen, silent_accum.useful_window_seen);
@@ -1559,13 +1572,13 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
     try testing.expectEqual(ordinary_link_follows, state.native_link_follow_count);
     try testing.expectEqual(ordinary_all_follows, state.link_follow_count);
     try testing.expectEqual(ordinary_loopdone_fused, state.native_loopdone_link_fused);
-    try testing.expectEqual(ordinary_flushes, state.region_profit_flushes);
-    try testing.expectEqual(ordinary_flushed_work, state.region_profit_flushed_work);
+    try testing.expectEqual(ordinary_flushes, state.region_policy.region_profit_flushes);
+    try testing.expectEqual(ordinary_flushed_work, state.region_policy.region_profit_flushed_work);
 
     // Synthetic off-cycle reporting suffix: one silent C.link transition enters
     // inner, then inner reports an ordinary guard with cumulative rbx advanced by
     // two. The suffix must subtract silent_cum=7 and account exactly local=2.
-    const set = &state.promoted_sets.items[0];
+    const set = &state.registry.native_physical.promoted_sets.items[0];
     const suffix_drains_before = state.silent_suffix_drains;
     var cont_phase: usize = 0;
     for (set.edges, 0..) |edge, phase| if (edge.parent == cont) {
@@ -1585,7 +1598,7 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
         .kind = .deopt,
         .outcome = .normal,
     };
-    const suffix_result = irinterp.ExecResult{
+    const suffix_result = trace_exec.ExecResult{
         .completed = 9,
         .exit_instr = 2,
         .final_trace_id = inner.id,
@@ -1637,7 +1650,7 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
         .kind = .loop_done_linked,
         .outcome = .normal,
     };
-    const loop_done_suffix = irinterp.ExecResult{
+    const loop_done_suffix = trace_exec.ExecResult{
         .completed = 7,
         .exit_instr = 5,
         .final_trace_id = inner.id,
@@ -1647,7 +1660,7 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
         .silent_budget = state.config.silent_budget,
         .barren_budget = state.config.max_barren_run,
         .silent_cell = @intFromPtr(&set.metadata[cont_phase]),
-        .cur_zero_run = state.region_profit.get(key).?.barren_run,
+        .cur_zero_run = state.region_policy.region_profit.get(key).?.barren_run,
         .silent_cum = 7,
         .silent_last_cell = @intFromPtr(&set.metadata[cont_phase]),
     };
@@ -1671,7 +1684,7 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
     };
     try testing.expectEqual(cont, loop_done_cont);
     try testing.expectEqual(@as(usize, 1), suffix_completed);
-    try testing.expectEqual(cont.anchor.pc, suffix_resume);
+    try testing.expectEqual(cont.code.anchor.pc, suffix_resume);
     try testing.expectEqual(@as(usize, 1), suffix_hops);
     try testing.expectEqual(suffix_drains_before + 2, state.silent_suffix_drains);
     state.applyPendingDisarms();
@@ -1697,12 +1710,12 @@ test "B-3d.2 repeated-parent set promotes, zero-evidence edges included, and an 
     try testing.expect(try state.armNativeLink(d, 0, p, .link_terminal));
     const key: RegionKey = .{ .region_id = @enumFromInt(1720), .activation = 55 };
     try installB3PromotionRegion(&state, key, &.{ p, c, d });
-    state.region_context = .{ .depth = 1, .call_seq = key.activation };
+    state.region_policy.region_context = .{ .depth = 1, .call_seq = key.activation };
 
     // Evidence touches only the P.e5/C edges; the P.e7 and D edges promote on
     // registry proof alone (§B3.18 R5(c): zero-evidence candidate edges are an
     // accepted trade — firing evidence arrives later via summary cells).
-    const observed = [_]irinterp.LedgerEntry{
+    const observed = [_]trace_exec.LedgerEntry{
         b3ObservedRow(p, 5, .deopt),
         b3ObservedRow(c, 0, .link_terminal),
         b3ObservedRow(p, 5, .deopt),
@@ -1711,7 +1724,7 @@ test "B-3d.2 repeated-parent set promotes, zero-evidence edges included, and an 
     defer gpa.free(edges);
     try testing.expectEqual(@as(usize, 4), edges.len);
     try state.promoteSet(edges, key);
-    const set = &state.promoted_sets.items[0];
+    const set = &state.registry.native_physical.promoted_sets.items[0];
     var p5_phase: usize = 0;
     var c0_phase: usize = 0;
     for (set.edges, 0..) |edge, phase| {
@@ -1767,7 +1780,7 @@ test "B-3d.2 repeated-parent set promotes, zero-evidence edges included, and an 
     // The resume contract belongs to the measured terminal edge: an ordinary
     // guard resumes at its SOURCE header (P's anchor), not at any successor a
     // ring order would have predicted.
-    try testing.expectEqual(p.anchor.pc, result.resume_pc);
+    try testing.expectEqual(p.code.anchor.pc, result.resume_pc);
     try testing.expectEqual(@as(usize, 6), result.completed);
     try testing.expectEqual(@as(u64, 1), state.silent_budget_exhaustions);
     state.demoteAllSets();

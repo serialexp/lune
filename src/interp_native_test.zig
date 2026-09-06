@@ -76,8 +76,8 @@ test "native: a hot integer for-loop is lowered to machine code and matches tier
 
     // Same result tier-0 produces — and the decisive signal that it ran natively.
     try testing.expectEqualStrings("5050\n", sink.buffered());
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
-    try testing.expect(vm.trace.cache.items[0].native == .compiled);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.registry.cache.items[0].native == .compiled);
 }
 
 test "native: a multi-op for-loop with dropped temporaries lowers and matches tier-0 (task A)" {
@@ -100,8 +100,8 @@ test "native: a multi-op for-loop with dropped temporaries lowers and matches ti
     defer chunk.deinit();
 
     try testing.expectEqualStrings("413950\n", sink.buffered());
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
-    try testing.expect(vm.trace.cache.items[0].native == .compiled);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.registry.cache.items[0].native == .compiled);
 }
 
 test "native: a float-accumulate loop compiles to the XMM path (Phase D / F1)" {
@@ -122,8 +122,8 @@ test "native: a float-accumulate loop compiles to the XMM path (Phase D / F1)" {
     // Phase D: the float add (carried float accumulator + int-controlled for loop)
     // is now inside the native subset — the compiler lowers it to the SSE2/XMM path
     // (cvtsi2sd-free here: both add operands are float) and memoizes `.compiled`.
-    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
-    try testing.expect(vm.trace.cache.items[0].native == .compiled);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.registry.cache.items[0].native == .compiled);
 
     // Decisive soundness check: native output is byte-identical to a plain tier-0 run
     // (strict-FP addsd matches the oracle bit-for-bit — 150.0).
@@ -157,7 +157,7 @@ test "native: a compiled int loop that flips to float mid-run deopts and matches
     defer chunk.deinit();
 
     // The pre-flip trace did compile to machine code...
-    try testing.expect(vm.trace.cache.items[0].native == .compiled);
+    try testing.expect(vm.trace.registry.cache.items[0].native == .compiled);
     // ...and the native run's output equals a plain tier-0 run, deopt and all.
     var obuf: [64]u8 = undefined;
     var osink = io.Writer.fixed(&obuf);
@@ -197,7 +197,7 @@ test "native: int_of_float — a float-limit loop compiles native, then deopts o
     defer chunk.deinit();
 
     // The float-limit loop did lower to machine code (int_of_float made it native-able)...
-    try testing.expect(vm.trace.cache.items[0].native == .compiled);
+    try testing.expect(vm.trace.registry.cache.items[0].native == .compiled);
     // ...and the native run (deopt on 100.5 included) is byte-identical to tier-0.
     var obuf: [64]u8 = undefined;
     var osink = io.Writer.fixed(&obuf);
@@ -252,8 +252,8 @@ test "native: a bool-lane growth loop compiles native (astore_append) and matche
     // trace lowered to machine code (proveKinds admitted the bool-lane grow store).
     var saw_append = false;
     var compiled_append = false;
-    for (vm.trace.cache.items) |tr| {
-        for (tr.instrs) |ins| {
+    for (vm.trace.registry.cache.items) |tr| {
+        for (tr.code.instrs) |ins| {
             if (ins.op == .astore_append) {
                 saw_append = true;
                 if (tr.native == .compiled) compiled_append = true;
@@ -311,8 +311,8 @@ test "eager commit: a dense-from-1 bool fill traces + compiles native (no hole, 
 
     var saw_append = false;
     var compiled_append = false;
-    for (vm.trace.cache.items) |tr| {
-        for (tr.instrs) |ins| {
+    for (vm.trace.registry.cache.items) |tr| {
+        for (tr.code.instrs) |ins| {
             if (ins.op == .astore_append) {
                 saw_append = true;
                 if (tr.native == .compiled) compiled_append = true;
@@ -372,8 +372,8 @@ test "astore_append (int lane): a dense-from-1 fill (t[i]=i) compiles native and
 
     var saw_append = false;
     var compiled_append = false;
-    for (vm.trace.cache.items) |tr| {
-        for (tr.instrs) |ins| {
+    for (vm.trace.registry.cache.items) |tr| {
+        for (tr.code.instrs) |ins| {
             if (ins.op == .astore_append) {
                 saw_append = true;
                 if (tr.native == .compiled) compiled_append = true;
@@ -417,8 +417,8 @@ test "widen-eviction: a lane-crossing fill retires the narrow trace and stabilis
 
     var saw_i16_append = false;
     var saw_u8_append = false;
-    for (vm.trace.cache.items) |tr| {
-        for (tr.instrs) |ins| {
+    for (vm.trace.registry.cache.items) |tr| {
+        for (tr.code.instrs) |ins| {
             if (ins.op != .astore_append) continue;
             // The append's lane lives in its own `aux`; the leading guard_lane
             // carries the same ordinal. Read the op directly.
@@ -742,18 +742,18 @@ fn assertRegionGateExercised(vm: *Vm, mode: TraceMode) anyerror!void {
     // legs still carry the output oracle.
     if (mode == .off or mode == .record_only) return;
 
-    try testing.expect(vm.trace.region_defs.count() >= 1);
+    try testing.expect(vm.trace.region_policy.region_defs.count() >= 1);
 
     var armable: usize = 0;
-    var defs = vm.trace.region_defs.valueIterator();
+    var defs = vm.trace.region_policy.region_defs.valueIterator();
     while (defs.next()) |def| {
         if (def.armable) armable += 1;
     }
     var live_members: usize = 0;
-    var members = vm.trace.dest_entry_regions.iterator();
+    var members = vm.trace.region_policy.dest_entry_regions.iterator();
     while (members.next()) |entry| {
         for (entry.value_ptr.*) |id| {
-            const def = vm.trace.region_defs.get(id) orelse continue;
+            const def = vm.trace.region_policy.region_defs.get(id) orelse continue;
             if (def.armable) {
                 live_members += 1;
                 break;
@@ -762,7 +762,7 @@ fn assertRegionGateExercised(vm: *Vm, mode: TraceMode) anyerror!void {
     }
     try testing.expect(armable >= 1);
     try testing.expect(live_members >= 1);
-    try testing.expect(vm.trace.region_profit_flushes >= 1);
+    try testing.expect(vm.trace.region_policy.region_profit_flushes >= 1);
 }
 
 test "A-vii-c: a region-forming sieve shape stays byte-identical across all 10 modes" {
@@ -1196,14 +1196,14 @@ fn assertSeededChainExercised(vm: *Vm, mode: TraceMode) anyerror!void {
     // `get_upval`) and must have compiled as a SEEDED page — the §B.4
     // "seeds_at_entry" invariant: plan non-empty ⇔ prologue present.
     var seeded_compiled: usize = 0;
-    for (vm.trace.cache.items) |t| {
-        if (t.inputs.len == 0) continue;
+    for (vm.trace.registry.cache.items) |t| {
+        if (t.code.inputs.len == 0) continue;
         if (t.native != .compiled) continue;
         const c = &t.native.compiled;
         try testing.expectEqual(c.seed_plan.nonEmpty(), c.seed_prologue);
         if (!c.seed_plan.nonEmpty()) continue;
         var has_upvalue = false;
-        for (t.inputs) |seed| {
+        for (t.code.inputs) |seed| {
             if (seed.kind == .upvalue) has_upvalue = true;
         }
         try testing.expect(has_upvalue);
@@ -1345,15 +1345,15 @@ test "executor: doc 31 ratchet regression — fixed short gmatch instances never
 fn assertPeelCommitted(vm: *Vm, mode: TraceMode) anyerror!void {
     if (mode == .off) return; // no recorder, no cache — output oracle only
     var peeled: ?*const trace.Trace = null;
-    for (vm.trace.cache.items) |tr| {
-        if (tr.peeled) peeled = tr;
+    for (vm.trace.registry.cache.items) |tr| {
+        if (tr.code.peeled) peeled = tr;
     }
     try testing.expect(peeled != null);
     const tr = peeled.?;
     var saw_marker = false;
     var saw_internal_phi = false;
     var saw_steady_assoc = false;
-    for (tr.instrs) |ins| {
+    for (tr.code.instrs) |ins| {
         switch (ins.op) {
             .preheader => saw_marker = true,
             .phi => {
@@ -1374,8 +1374,8 @@ fn assertPeelCommitted(vm: *Vm, mode: TraceMode) anyerror!void {
 /// surrounding matrix run carries the correctness claim.
 fn assertNoPeel(vm: *Vm, mode: TraceMode) anyerror!void {
     if (mode == .off) return;
-    for (vm.trace.cache.items) |tr| {
-        try testing.expect(!tr.peeled);
+    for (vm.trace.registry.cache.items) |tr| {
+        try testing.expect(!tr.code.peeled);
     }
 }
 
@@ -1517,8 +1517,8 @@ test "doc 40 phase 0: zero-completion while-done on a peeled trace must not chai
 /// natively. Also demands the cache is non-empty (vacuity guard).
 fn assertNoUnsupportedTraces(vm: *Vm, mode: TraceMode) anyerror!void {
     if (mode == .off) return;
-    try testing.expect(vm.trace.cache.items.len > 0);
-    for (vm.trace.cache.items) |tr| {
+    try testing.expect(vm.trace.registry.cache.items.len > 0);
+    for (vm.trace.registry.cache.items) |tr| {
         try testing.expect(tr.native != .unsupported);
     }
 }

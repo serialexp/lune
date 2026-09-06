@@ -305,7 +305,7 @@ test "top-level re-entry on a suspended (dirty) VM fails closed (doc 17 H-3 / 9-
         .region_id = @enumFromInt(0xA603),
         .activation = 999_999,
     };
-    try vm.trace.region_profit.put(gpa, sentinel, .{
+    try vm.trace.region_policy.region_profit.put(gpa, sentinel, .{
         .outer_traversals = 3,
         .root_frame_depth = vm.depth,
         .root_call_seq = sentinel.activation,
@@ -316,7 +316,7 @@ test "top-level re-entry on a suspended (dirty) VM fails closed (doc 17 H-3 / 9-
     // bare assert would vanish under ReleaseFast, so this is a returned error.
     try testing.expectError(error.DirtyTopLevelEntry, vm.start(chunk.proto));
     try testing.expectError(error.DirtyTopLevelEntry, vm.run(chunk.proto));
-    try testing.expect(vm.trace.region_profit.contains(sentinel));
+    try testing.expect(vm.trace.region_policy.region_profit.contains(sentinel));
 
     // The suspended epoch is still intact and resumes normally to completion
     // (clear the trigger first, else it re-suspends at the same depth).
@@ -345,7 +345,7 @@ test "H-3: a clean fresh top-level epoch clears region_profit wholesale" {
 
     _ = try vm.run(chunk.proto);
     try testing.expectEqual(@as(u32, 0), vm.depth);
-    try vm.trace.region_profit.put(gpa, .{
+    try vm.trace.region_policy.region_profit.put(gpa, .{
         .region_id = @enumFromInt(0xA604),
         .activation = 42,
     }, .{

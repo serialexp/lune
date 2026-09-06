@@ -660,10 +660,13 @@ fn emitCoverage(gpa: std.mem.Allocator, io: mahina.io.Io, path: []const u8, vm: 
 
 /// Serialize the recorded trace cache to `path` (binschema wire format).
 fn emitTraces(gpa: std.mem.Allocator, io: mahina.io.Io, path: []const u8, vm: *mahina.interp.Vm) !void {
-    const bytes = try mahina.traceser.encodeFile(gpa, vm.trace.cache.items);
+    const codes = try gpa.alloc(*const mahina.trace.TraceCode, vm.trace.registry.cache.items.len);
+    defer gpa.free(codes);
+    for (vm.trace.registry.cache.items, codes) |record, *code| code.* = &record.code;
+    const bytes = try mahina.traceser.encodeFile(gpa, codes);
     defer gpa.free(bytes);
     try mahina.io.writeFile(io, path, bytes);
-    mahina.io.eprint("mahina: wrote {d} trace(s), {d} bytes → {s}\n", .{ vm.trace.cache.items.len, bytes.len, path });
+    mahina.io.eprint("mahina: wrote {d} trace(s), {d} bytes → {s}\n", .{ vm.trace.registry.cache.items.len, bytes.len, path });
 }
 
 /// Disassemble every cached trace to stderr (for `--dump-traces`).
@@ -684,11 +687,11 @@ fn dumpAborts(vm: *mahina.interp.Vm) void {
 
 fn dumpTraces(vm: *mahina.interp.Vm) void {
     const w = mahina.io.stderrWriter();
-    if (vm.trace.cache.items.len == 0) {
+    if (vm.trace.registry.cache.items.len == 0) {
         w.print("mahina: no traces recorded\n", .{}) catch {};
     } else {
-        w.print("mahina: {d} trace(s) recorded\n", .{vm.trace.cache.items.len}) catch {};
-        for (vm.trace.cache.items) |t| {
+        w.print("mahina: {d} trace(s) recorded\n", .{vm.trace.registry.cache.items.len}) catch {};
+        for (vm.trace.registry.cache.items) |t| {
             mahina.trace.writeTrace(w, t) catch {};
         }
     }
@@ -700,26 +703,26 @@ fn dumpTraces(vm: *mahina.interp.Vm) void {
 fn dumpOpportunities(vm: *mahina.interp.Vm) void {
     const gpa = vm.gpa;
     const w = mahina.io.stderrWriter();
-    if (vm.trace.cache.items.len == 0) {
+    if (vm.trace.registry.cache.items.len == 0) {
         w.print("mahina: (no traces — cannot run opportunity detector)\n", .{}) catch {};
         w.flush() catch {};
         return;
     }
 
     var total: usize = 0;
-    for (vm.trace.cache.items) |t| {
-        const findings = mahina.troptdiag.analyze(gpa, t) catch {
+    for (vm.trace.registry.cache.items) |t| {
+        const findings = mahina.troptdiag.analyze(gpa, &t.code) catch {
             w.print("mahina: error: opportunity analysis OOM\n", .{}) catch {};
             w.flush() catch {};
             return;
         };
         defer mahina.troptdiag.deinitFindings(gpa, findings);
 
-        w.print("trace {s}:{d}  waste opportunities:\n", .{ t.anchor.proto.name, t.anchor.pc }) catch {};
-        mahina.troptdiag.writeFindings(w, t, findings) catch {};
+        w.print("trace {s}:{d}  waste opportunities:\n", .{ t.code.anchor.proto.name, t.code.anchor.pc }) catch {};
+        mahina.troptdiag.writeFindings(w, &t.code, findings) catch {};
         total += findings.len;
     }
-    w.print("mahina: {d} waste signature(s) across {d} trace(s)\n", .{ total, vm.trace.cache.items.len }) catch {};
+    w.print("mahina: {d} waste signature(s) across {d} trace(s)\n", .{ total, vm.trace.registry.cache.items.len }) catch {};
     w.flush() catch {};
 }
 
@@ -729,7 +732,7 @@ fn dumpOpportunities(vm: *mahina.interp.Vm) void {
 /// fell outside the proven int/bool subset and runs on tier-1a.
 fn dumpNative(vm: *mahina.interp.Vm) void {
     const w = mahina.io.stderrWriter();
-    const items = vm.trace.cache.items;
+    const items = vm.trace.registry.cache.items;
     if (items.len == 0) {
         w.print("mahina: no traces recorded\n", .{}) catch {};
         w.flush() catch {};
@@ -740,7 +743,7 @@ fn dumpNative(vm: *mahina.interp.Vm) void {
         if (vm.trace.nativeFor(t)) |ct| {
             const code = ct.page.code;
             w.print("trace #{d}: compiled, {d} bytes of x86-64, inputs={d}/{d}\n", .{
-                i, code.len, t.inputs.len, mahina.trace.MAX_TRACE_INPUTS,
+                i, code.len, t.code.inputs.len, mahina.trace.MAX_TRACE_INPUTS,
             }) catch {};
             var off: usize = 0;
             while (off < code.len) : (off += 16) {
@@ -751,7 +754,7 @@ fn dumpNative(vm: *mahina.interp.Vm) void {
             }
         } else {
             w.print("trace #{d}: unsupported — runs on the tier-1a interpreter, inputs={d}/{d}\n", .{
-                i, t.inputs.len, mahina.trace.MAX_TRACE_INPUTS,
+                i, t.code.inputs.len, mahina.trace.MAX_TRACE_INPUTS,
             }) catch {};
         }
     }

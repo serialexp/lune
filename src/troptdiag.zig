@@ -13,7 +13,8 @@
 //! proof. Surface behind `--trace-opportunities` (stderr, like `--dump-traces`).
 
 const std = @import("std");
-const trace = @import("trace.zig");
+const trace = @import("trace_ir.zig");
+const TraceCode = @import("trace_code.zig").TraceCode;
 const io = @import("io.zig");
 const bytecode = @import("bytecode.zig");
 const value = @import("value.zig");
@@ -58,7 +59,7 @@ pub const Finding = struct {
 /// Run all waste-signature detectors over an optimized trace. Returns a slice of
 /// Findings; each Finding's `instrs` and `label` are owned by the caller (allocated
 /// with `gpa`). The returned slice itself is also caller-owned.
-pub fn analyze(gpa: std.mem.Allocator, t: *const trace.Trace) ![]Finding {
+pub fn analyze(gpa: std.mem.Allocator, t: *const TraceCode) ![]Finding {
     var list: std.ArrayListUnmanaged(Finding) = .empty;
     errdefer {
         for (list.items) |f| {
@@ -88,7 +89,7 @@ pub fn deinitFindings(gpa: std.mem.Allocator, findings: []Finding) void {
 /// Print findings to `w` in a columnar, human-readable form. Each finding lists
 /// the waste signature, a description, and the affected instruction indices as
 /// compact ranges (consecutive indices like `%030-%033`, singletons like `%029`).
-pub fn writeFindings(w: *io.Writer, _: *const trace.Trace, findings: []const Finding) !void {
+pub fn writeFindings(w: *io.Writer, _: *const TraceCode, findings: []const Finding) !void {
     if (findings.len == 0) {
         try w.print("  (no waste detected)\n", .{});
         return;
@@ -111,7 +112,7 @@ pub fn writeFindings(w: *io.Writer, _: *const trace.Trace, findings: []const Fin
 /// chain (instructions that feed only that phi or other dead-chain instructions).
 fn detectDeadCarries(
     gpa: std.mem.Allocator,
-    t: *const trace.Trace,
+    t: *const TraceCode,
     list: *std.ArrayListUnmanaged(Finding),
 ) !void {
     const n = t.instrs.len;
@@ -322,7 +323,7 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
 /// different registers. Only one is needed; the rest are redundant.
 fn detectDuplicateCarries(
     gpa: std.mem.Allocator,
-    t: *const trace.Trace,
+    t: *const TraceCode,
     list: *std.ArrayListUnmanaged(Finding),
 ) !void {
     // Map update ref → list of (phi_index, flush_slot).
@@ -370,7 +371,7 @@ fn detectDuplicateCarries(
 /// signals either a genuine hoisting gap or a deliberately pinned op (idiv/mod).
 fn detectUnhoistedInvariants(
     gpa: std.mem.Allocator,
-    t: *const trace.Trace,
+    t: *const TraceCode,
     list: *std.ArrayListUnmanaged(Finding),
 ) !void {
     const n = t.instrs.len;
@@ -455,7 +456,7 @@ fn detectUnhoistedInvariants(
 /// finding one is a strong signal that something escaped dedup.
 fn detectRedundantGuards(
     gpa: std.mem.Allocator,
-    t: *const trace.Trace,
+    t: *const TraceCode,
     list: *std.ArrayListUnmanaged(Finding),
 ) !void {
     const n = t.instrs.len;
@@ -534,7 +535,7 @@ test "troptdiag: dead carry — a phi with no slot_load and not in entry_slots i
         .{ .slot = 4, .ref = 2 }, // r4 ← %2 (DEAD — no slot_load r4, not in entry_slots)
     });
     var entry = [_]u16{0}; // only r0 is live-in
-    const t = trace.Trace{
+    const t = TraceCode{
         .anchor = .{ .proto = &proto, .pc = 5 },
         .instrs = &instrs,
         .consts = &.{},
@@ -586,7 +587,7 @@ test "troptdiag: dead carry — exclusive dependency chain is included" {
     });
     var entry = [_]u16{0};
     var consts = [_]value.Value{value.Value.int(1)};
-    const t = trace.Trace{
+    const t = TraceCode{
         .anchor = .{ .proto = &proto, .pc = 5 },
         .instrs = &instrs,
         .consts = &consts,
@@ -638,7 +639,7 @@ test "troptdiag: live carry — a phi whose slot is read is NOT flagged" {
         .{ .slot = 1, .ref = 1 }, // r1 ← %1 (slot_load r1 exists, so this is live)
     });
     var entry = [_]u16{0};
-    const t = trace.Trace{
+    const t = TraceCode{
         .anchor = .{ .proto = &proto, .pc = 5 },
         .instrs = &instrs,
         .consts = &.{},
@@ -669,7 +670,7 @@ test "troptdiag: live carry — a phi whose slot is in entry_slots is NOT flagge
     });
     var entry = [_]u16{ 0, 4 }; // r4 is live-in at the anchor → NOT dead
     var consts = [_]value.Value{value.Value.int(1)};
-    const t = trace.Trace{
+    const t = TraceCode{
         .anchor = .{ .proto = &proto, .pc = 5 },
         .instrs = &instrs,
         .consts = &consts,
@@ -698,7 +699,7 @@ test "troptdiag: duplicate carry — two phis sharing an update are flagged" {
         .{ .slot = 8, .ref = 2 }, // r8 ← %2 — duplicate! same update as r0's phi
     });
     var entry = [_]u16{0};
-    const t = trace.Trace{
+    const t = TraceCode{
         .anchor = .{ .proto = &proto, .pc = 5 },
         .instrs = &instrs,
         .consts = &.{},
@@ -738,7 +739,7 @@ test "troptdiag: no waste on a clean trace" {
         .{ .slot = 0, .ref = 2 }, // r0 ← %2
     });
     var entry = [_]u16{0};
-    const t = trace.Trace{
+    const t = TraceCode{
         .anchor = .{ .proto = &proto, .pc = 5 },
         .instrs = &instrs,
         .consts = &.{},
@@ -771,7 +772,7 @@ test "troptdiag: unhoisted invariant — a pure op over invariants in the body i
     });
     var entry = [_]u16{0};
     var consts = [_]value.Value{ value.Value.int(2), value.Value.int(3) };
-    const t = trace.Trace{
+    const t = TraceCode{
         .anchor = .{ .proto = &proto, .pc = 5 },
         .instrs = &instrs,
         .consts = &consts,
@@ -814,7 +815,7 @@ test "troptdiag: unhoisted invariant — idiv/mod over invariants is flagged as 
     });
     var entry = [_]u16{0};
     var consts = [_]value.Value{ value.Value.int(10), value.Value.int(2) };
-    const t = trace.Trace{
+    const t = TraceCode{
         .anchor = .{ .proto = &proto, .pc = 5 },
         .instrs = &instrs,
         .consts = &consts,
@@ -855,7 +856,7 @@ test "troptdiag: unhoisted invariant — a preheader-marker trace has no unhoist
     };
     var entry = [_]u16{0};
     var consts = [_]value.Value{value.Value.int(2)};
-    const t = trace.Trace{
+    const t = TraceCode{
         .anchor = .{ .proto = &bytecode.Proto{ .code = &.{}, .name = "t" }, .pc = 5 },
         .instrs = &instrs,
         .consts = &consts,
@@ -885,7 +886,7 @@ test "troptdiag: redundant guard — a duplicate type guard on the same operand 
         .{ .slot = 0, .ref = 2 }, // r0 ← %2
     });
     var entry = [_]u16{0};
-    const t = trace.Trace{
+    const t = TraceCode{
         .anchor = .{ .proto = &proto, .pc = 5 },
         .instrs = &instrs,
         .consts = &.{},
@@ -924,7 +925,7 @@ test "troptdiag: redundant guard — different opcodes on the same operand are N
         .{ .slot = 0, .ref = 0 }, // r0 ← %0
     });
     var entry = [_]u16{0};
-    const t = trace.Trace{
+    const t = TraceCode{
         .anchor = .{ .proto = &proto, .pc = 5 },
         .instrs = &instrs,
         .consts = &.{},
@@ -964,7 +965,7 @@ test "troptdiag: writeFindings renders waste to a writer" {
     // writeFindings needs a Trace for context; only the proto name matters for the
     // header (we're not printing the header here — just the findings body).
     const proto = bytecode.Proto{ .code = &.{}, .name = "t" };
-    const dummy_trace = trace.Trace{
+    const dummy_trace = TraceCode{
         .anchor = .{ .proto = &proto, .pc = 5 },
         .instrs = &.{},
         .consts = &.{},

@@ -13,13 +13,14 @@ const table = @import("table.zig");
 const arr = @import("array.zig");
 const Value = value.Value;
 const RegWindow = @import("regwindow.zig").RegWindow;
-const Trace = trace.Trace;
+const Trace = @import("trace_code.zig").TraceCode;
 const Reg = x64.Reg;
 const object = @import("object.zig");
 const function = @import("function.zig");
 const bytecode = @import("bytecode.zig");
 const testing = std.testing;
 const irinterp = @import("irinterp.zig");
+const trace_exec = @import("trace_exec.zig");
 const I = trace.IrInstr;
 const S = trace.SlotStore;
 
@@ -37,7 +38,6 @@ const regBit = nativegen.regBit;
 const util = @import("nativegen_testutil.zig");
 const expectBail = util.expectBail;
 const expectMatch = util.expectMatch;
-const expectMatchFrameless = util.expectMatchFrameless;
 
 // --- Phase D / F3: div (always float; divsd, cvtsi2sd int operands) ----------
 
@@ -792,11 +792,11 @@ test "nativegen: frameless spilled carried homes dispatch the ordinary guard exi
     // back-edge. The oracle covers the exact flushed values.
     var regs4: [CARRIED_SPILL_N + 2]Value = undefined;
     carriedSpillRegs(&regs4, 4);
-    try expectMatchFrameless(&t, &regs4);
+    try expectMatch(&t, &regs4);
 
     var regs0: [CARRIED_SPILL_N + 2]Value = undefined;
     carriedSpillRegs(&regs0, 0);
-    try expectMatchFrameless(&t, &regs0);
+    try expectMatch(&t, &regs0);
 }
 
 test "nativegen A-v: composite bridge prefix emits but unarmed exit takes ordinary_mini" {
@@ -836,7 +836,6 @@ test "nativegen A-v: composite bridge prefix emits but unarmed exit takes ordina
     }};
     var es = [_]u16{};
     const t = Trace{
-        .id = 73,
         .anchor = .{ .proto = &proto, .pc = 29 },
         .instrs = &instrs,
         .consts = &consts,
@@ -848,7 +847,7 @@ test "nativegen A-v: composite bridge prefix emits but unarmed exit takes ordina
 
     var arena = McodeArena.init(gpa);
     defer arena.deinit();
-    var ct = compileInto(gpa, &arena, &t, null, null) orelse return error.NativeBailedUnexpectedly;
+    var ct = compileInto(gpa, &arena, &t, 73, null, null) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     const shared_exit = arena.trampoline_exit.?;
     try testing.expectEqual(shared_exit, ct.slots[7]); // A-v publishes no bridge arm.
@@ -885,7 +884,7 @@ test "nativegen A-v: composite bridge prefix emits but unarmed exit takes ordina
         Value.int(5).payload.bits,
         Value.int(3).payload.bits,
     };
-    var ledger: [irinterp.LEDGER_CAP]irinterp.LedgerEntry = undefined;
+    var ledger: [trace_exec.LEDGER_CAP]trace_exec.LedgerEntry = undefined;
     const result = ct.runCapturingLedger(
         RegWindow.of(tags[0..], payloads[0..]),
         ledger[0..],
@@ -894,8 +893,8 @@ test "nativegen A-v: composite bridge prefix emits but unarmed exit takes ordina
     try testing.expectEqual(@as(usize, 0), result.completed);
     try testing.expectEqual(@as(u32, 7), result.exit_instr);
     try testing.expectEqual(@as(usize, 1), result.ledger_len);
-    try testing.expectEqual(irinterp.LedgerKind.deopt, ledger[0].kind);
-    try testing.expectEqual(irinterp.LedgerOutcome.normal, ledger[0].outcome);
+    try testing.expectEqual(trace_exec.LedgerKind.deopt, ledger[0].kind);
+    try testing.expectEqual(trace_exec.LedgerOutcome.normal, ledger[0].outcome);
     try testing.expectEqual(@intFromEnum(Value.int(5).tag), tags[0]);
     try testing.expectEqual(Value.int(5).payload.bits, payloads[0]);
     try testing.expectEqual(@intFromEnum(Value.int(3).tag), tags[1]);
@@ -1105,7 +1104,7 @@ test "doc 24 c2: tostr_int + slen + guard_gc — tier-1a and native match, same 
     var nheap = gc.Heap.init(gpa);
     defer nheap.deinit();
     const nobjs_before = nheap.object_count;
-    var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compileWithHeap(gpa, &t, 0, &nheap) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     var nregs_arr = regs_init;
     const nregs: []Value = &nregs_arr;
@@ -1151,7 +1150,7 @@ test "doc 24 c2: guard_gc declines at the header — budget exceeded, gc_stress,
         try testing.expectEqual(strs_before, heap.strtab_count);
         try util.expectRegsEqual(&regs_init, &iregs);
 
-        var ct = nativegen.compileWithHeap(gpa, &t, &heap) orelse return error.NativeBailedUnexpectedly;
+        var ct = nativegen.compileWithHeap(gpa, &t, 0, &heap) orelse return error.NativeBailedUnexpectedly;
         defer ct.deinit();
         var nregs = regs_init;
         const nresult = try util.runNative(ct, &nregs);
@@ -1178,7 +1177,7 @@ test "doc 24 c2: guard_gc declines at the header — budget exceeded, gc_stress,
         try testing.expectEqual(@as(u32, 6), iresult.exit_instr);
         try testing.expectEqual(objs_before, heap.object_count);
 
-        var ct = nativegen.compileWithHeap(gpa, &t, &heap) orelse return error.NativeBailedUnexpectedly;
+        var ct = nativegen.compileWithHeap(gpa, &t, 0, &heap) orelse return error.NativeBailedUnexpectedly;
         defer ct.deinit();
         var nregs = regs_init;
         const nresult = try util.runNative(ct, &nregs);
@@ -1199,7 +1198,7 @@ test "doc 24 c2: guard_gc declines at the header — budget exceeded, gc_stress,
 
         var arena = McodeArena.init(gpa);
         defer arena.deinit();
-        try testing.expect(compileInto(gpa, &arena, &t, null, null) == null);
+        try testing.expect(compileInto(gpa, &arena, &t, 0, null, null) == null);
     }
 }
 
@@ -1247,7 +1246,7 @@ test "doc 24 c2: tostr_num renders floats through the one shared renderer (tier 
 
     var nheap = gc.Heap.init(gpa);
     defer nheap.deinit();
-    var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compileWithHeap(gpa, &t, 0, &nheap) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     var nregs = regs_init;
     const nresult = try util.runNative(ct, &nregs);
@@ -1332,7 +1331,7 @@ test "doc 24 c3: ssub + srev chain on a guard_string-pinned slot — tier parity
     const nsubj = try nheap.intern("héllo");
     const regs_init_n = [_]Value{ Value.int(1), Value.int(7), Value.int(0), Value.heap(&nsubj.header) };
     const nobjs_before = nheap.object_count;
-    var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compileWithHeap(gpa, &t, 0, &nheap) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     var nregs = regs_init_n;
     const nresult = try util.runNative(ct, &nregs);
@@ -1364,7 +1363,7 @@ test "doc 24 c3: guard_string prologue pin — a non-string entry fails the prol
 
     var heap = gc.Heap.init(gpa);
     defer heap.deinit();
-    var ct = nativegen.compileWithHeap(gpa, &t, &heap) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compileWithHeap(gpa, &t, 0, &heap) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
 
     // (a) A TABLE in the string slot: TAG_HEAP passes the tag lane, the new
@@ -1378,7 +1377,7 @@ test "doc 24 c3: guard_string prologue pin — a non-string entry fails the prol
         var nregs = regs_init;
         const nresult = try util.runNative(ct, &nregs);
         try testing.expectEqual(@as(usize, 0), nresult.completed);
-        try testing.expectEqual(irinterp.ExitReason.prologue_fail, nresult.exit_reason);
+        try testing.expectEqual(trace_exec.ExitReason.prologue_fail, nresult.exit_reason);
         try testing.expectEqual(objs_before, heap.object_count);
         try util.expectRegsEqual(&regs_init, &nregs);
         // The tier-1a oracle side-exits at the guard_string body instr instead
@@ -1401,7 +1400,7 @@ test "doc 24 c3: guard_string prologue pin — a non-string entry fails the prol
         var nregs = regs_init;
         const nresult = try util.runNative(ct, &nregs);
         try testing.expectEqual(@as(usize, 0), nresult.completed);
-        try testing.expectEqual(irinterp.ExitReason.prologue_fail, nresult.exit_reason);
+        try testing.expectEqual(trace_exec.ExitReason.prologue_fail, nresult.exit_reason);
         try util.expectRegsEqual(&regs_init, &nregs);
     }
 
@@ -1409,7 +1408,7 @@ test "doc 24 c3: guard_string prologue pin — a non-string entry fails the prol
     {
         var arena = McodeArena.init(gpa);
         defer arena.deinit();
-        try testing.expect(compileInto(gpa, &arena, &t, null, null) == null);
+        try testing.expect(compileInto(gpa, &arena, &t, 0, null, null) == null);
     }
 }
 
@@ -1465,7 +1464,7 @@ test "doc 24 c3: schar1 + srep2 — tier parity incl. the n<=0 empty repeat and 
         var nheap = gc.Heap.init(gpa);
         defer nheap.deinit();
         const nobjs_before = nheap.object_count;
-        var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+        var ct = nativegen.compileWithHeap(gpa, &t, 0, &nheap) orelse return error.NativeBailedUnexpectedly;
         defer ct.deinit();
         var nregs = regs_init;
         const nresult = try util.runNative(ct, &nregs);
@@ -1498,7 +1497,7 @@ test "doc 24 c3: schar1 + srep2 — tier parity incl. the n<=0 empty repeat and 
         var nheap = gc.Heap.init(gpa);
         defer nheap.deinit();
         const nobjs_before = nheap.object_count;
-        var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+        var ct = nativegen.compileWithHeap(gpa, &t, 0, &nheap) orelse return error.NativeBailedUnexpectedly;
         defer ct.deinit();
         var nregs = regs_init;
         const nresult = try util.runNative(ct, &nregs);
@@ -1576,7 +1575,7 @@ test "doc 24 c4: two allocs per iteration — the bound declines entry even when
         defer nheap.deinit();
         nheap.next_gc = nheap.object_count + 2;
         const nobjs = nheap.object_count;
-        var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+        var ct = nativegen.compileWithHeap(gpa, &t, 0, &nheap) orelse return error.NativeBailedUnexpectedly;
         defer ct.deinit();
         var nregs = regs_init;
         const nresult = try util.runNative(ct, &nregs);
@@ -1609,7 +1608,7 @@ test "doc 24 c4: two allocs per iteration — the bound declines entry even when
         defer nheap.deinit();
         nheap.next_gc = nheap.object_count + 9;
         const nobjs = nheap.object_count;
-        var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+        var ct = nativegen.compileWithHeap(gpa, &t, 0, &nheap) orelse return error.NativeBailedUnexpectedly;
         defer ct.deinit();
         var nregs = regs_init;
         const nresult = try util.runNative(ct, &nregs);
@@ -1629,7 +1628,7 @@ test "doc 24 c4: an intern-hit loop parked just below next_gc completes natively
 
     var heap = gc.Heap.init(gpa);
     defer heap.deinit();
-    var ct = nativegen.compileWithHeap(gpa, &t, &heap) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compileWithHeap(gpa, &t, 0, &heap) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
 
     // Warm run: intern every string the loop produces (ample budget).
@@ -1679,7 +1678,7 @@ test "doc 24 c4: OOM injection — the same fail point produces identical comple
         var nheap = gc.Heap.init(nfail.allocator());
         defer nheap.deinit();
         const nobjs = nheap.object_count;
-        var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+        var ct = nativegen.compileWithHeap(gpa, &t, 0, &nheap) orelse return error.NativeBailedUnexpectedly;
         defer ct.deinit();
         var nregs = regs_init;
         const nresult = try util.runNative(ct, &nregs);
@@ -1782,7 +1781,7 @@ test "doc 25: (minInt, -1) is computed INLINE — native continues, no exit (cod
     try testing.expectEqual(Value.int(min), iregs[4]); // minInt // -1 (wraps)
 
     // Native: identical — completed, exit instr, and both special results.
-    var ct = nativegen.compile(gpa, &t) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compile(gpa, &t, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     var nregs = regs_init;
     const nresult = try util.runNative(ct, &nregs);
@@ -1837,7 +1836,7 @@ test "doc 25: divisor reaches 0 mid-run — % and // side-exit at their own inst
         try testing.expectEqual(@as(usize, 3), iresult.completed);
         try testing.expectEqual(@as(u32, 10), iresult.exit_instr);
 
-        var ct = nativegen.compile(gpa, &t) orelse return error.NativeBailedUnexpectedly;
+        var ct = nativegen.compile(gpa, &t, 0) orelse return error.NativeBailedUnexpectedly;
         defer ct.deinit();
         var nregs = regs_init;
         const nresult = try util.runNative(ct, &nregs);
@@ -2120,7 +2119,7 @@ test "doc 26: supper + slower on a guard_string-pinned slot — tier parity, ful
     const nsubj = try nheap.intern(subject);
     const regs_init_n = [_]Value{ Value.int(1), Value.int(5), Value.int(0), Value.heap(&nsubj.header) };
     const nobjs_before = nheap.object_count;
-    var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compileWithHeap(gpa, &t, 0, &nheap) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     var nregs = regs_init_n;
     const nresult = try util.runNative(ct, &nregs);
@@ -2147,7 +2146,7 @@ test "doc 26: supper + slower on a guard_string-pinned slot — tier parity, ful
     {
         var arena = McodeArena.init(gpa);
         defer arena.deinit();
-        try testing.expect(compileInto(gpa, &arena, &t, null, null) == null);
+        try testing.expect(compileInto(gpa, &arena, &t, 0, null, null) == null);
     }
 }
 
@@ -2215,7 +2214,7 @@ test "doc 26: scp — tier parity, U+0000 as a REAL result, empty-range side-exi
 
     // Native — WITHOUT a heap: scp is non-allocating, so unlike every other
     // stralloc op the trace must compile with heap == null (nothing to bake).
-    var ct = nativegen.compile(gpa, &t) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compile(gpa, &t, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     // The native subject must be the SAME interned string as the oracle's —
     // scp reads through the pointer, no heap identity involved.
@@ -2240,7 +2239,7 @@ test "doc 26 (review M5): malformed result-ty stamps fail closed — new ops AND
         const saved = t.instrs[9].ty;
         t.instrs[9].ty = .int;
         defer t.instrs[9].ty = saved;
-        try testing.expect(nativegen.compileWithHeap(gpa, &t, &heap) == null);
+        try testing.expect(nativegen.compileWithHeap(gpa, &t, 0, &heap) == null);
     }
     // (b) scp stamped .heap instead of .int: refuse to compile.
     {
@@ -2249,7 +2248,7 @@ test "doc 26 (review M5): malformed result-ty stamps fail closed — new ops AND
         const saved = t.instrs[9].ty;
         t.instrs[9].ty = .heap;
         defer t.instrs[9].ty = saved;
-        try testing.expect(nativegen.compileWithHeap(gpa, &t, &heap) == null);
+        try testing.expect(nativegen.compileWithHeap(gpa, &t, 0, &heap) == null);
     }
     // (c) The RETROFIT is live on the pre-existing arms too: an ssub stamped
     // .int (instr 11 of the c3 flagship trace) now also refuses — before doc
@@ -2260,21 +2259,21 @@ test "doc 26 (review M5): malformed result-ty stamps fail closed — new ops AND
         const saved = t.instrs[11].ty;
         t.instrs[11].ty = .int;
         defer t.instrs[11].ty = saved;
-        try testing.expect(nativegen.compileWithHeap(gpa, &t, &heap) == null);
+        try testing.expect(nativegen.compileWithHeap(gpa, &t, 0, &heap) == null);
     }
     // (d) Control: the same three traces with honest stamps all compile (the
     // checks above failed for the STAMP, not for some unrelated reason).
     {
         var consts_c = [_]Value{Value.int(1)};
         const tc = caseUpperLowerTrace(&consts_c);
-        var c1 = nativegen.compileWithHeap(gpa, &tc, &heap) orelse return error.NativeBailedUnexpectedly;
+        var c1 = nativegen.compileWithHeap(gpa, &tc, 0, &heap) orelse return error.NativeBailedUnexpectedly;
         c1.deinit();
         const ts = scpSlideTrace(&consts_c);
-        var c2 = nativegen.compileWithHeap(gpa, &ts, &heap) orelse return error.NativeBailedUnexpectedly;
+        var c2 = nativegen.compileWithHeap(gpa, &ts, 0, &heap) orelse return error.NativeBailedUnexpectedly;
         c2.deinit();
         var consts_s = [_]Value{ Value.int(2), Value.int(1) };
         const tv = snewSubRevTrace(&consts_s);
-        var c3 = nativegen.compileWithHeap(gpa, &tv, &heap) orelse return error.NativeBailedUnexpectedly;
+        var c3 = nativegen.compileWithHeap(gpa, &tv, 0, &heap) orelse return error.NativeBailedUnexpectedly;
         c3.deinit();
     }
 }
@@ -2352,7 +2351,7 @@ test "doc 30 c3: smatch + scap_int — tier parity, char-index projections, no_m
     var nconsts = [_]Value{ Value.int(1), Value.heap(&npat.header) };
     const tn = smatchSlideTrace(&nconsts);
     const nobjs_before = nheap.object_count;
-    var ct = nativegen.compileWithHeap(gpa, &tn, &nheap) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compileWithHeap(gpa, &tn, 0, &nheap) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     var nregs = [_]Value{ Value.int(1), Value.int(0), Value.heap(&nsubj.header) };
     const nresult = try util.runNative(ct, &nregs);
@@ -2367,7 +2366,7 @@ test "doc 30 c3: smatch + scap_int — tier parity, char-index projections, no_m
     {
         var arena = McodeArena.init(gpa);
         defer arena.deinit();
-        try testing.expect(compileInto(gpa, &arena, &tn, null, null) == null);
+        try testing.expect(compileInto(gpa, &arena, &tn, 0, null, null) == null);
     }
 }
 
@@ -2425,7 +2424,7 @@ test "doc 30 c3: sfindp — tier parity, heap-FREE compile, no_match exit" {
     // Native WITHOUT a heap: sfindp is the heap-free member of the class (the
     // scp precedent) — the trace must compile with heap == null; the string
     // konst is a baked pointer, no heap involved.
-    var ct = nativegen.compile(gpa, &t) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compile(gpa, &t, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     var nregs = regs_init;
     const nresult = try util.runNative(ct, &nregs);
@@ -2513,7 +2512,7 @@ test "doc 30 c3: sgmatch + scap_str + sgm_setpos — tier parity, cursor commit,
     var nconsts = [_]Value{ Value.int(1), Value.heap(&npat.header) };
     const tn = gmatchStepTrace(&nconsts);
     const nobjs_before = nheap.object_count;
-    var ct = nativegen.compileWithHeap(gpa, &tn, &nheap) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compileWithHeap(gpa, &tn, 0, &nheap) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     var nregs = [_]Value{ Value.heap(&nstate.header), Value.int(0) };
     const nresult = try util.runNative(ct, &nregs);
@@ -2566,7 +2565,7 @@ test "doc 30 c3: guard_sid — identity pass loops, identity mismatch exits at t
     defer gpa.free(values);
 
     // Heap-free like sfindp: the pin is a baked pointer compare.
-    var ct = nativegen.compile(gpa, &t) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compile(gpa, &t, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
 
     // (a) Identity HOLDS: the loop runs to its counter exit (guard_true).
@@ -2665,9 +2664,9 @@ test "doc 30 c3: str2num_i/_f — tier parity, heap-free, and the kind-mismatch 
     defer gpa.free(values);
 
     // Heap-free: the ONE arith.toNumber core allocates nothing.
-    var ct_i = nativegen.compile(gpa, &t_i) orelse return error.NativeBailedUnexpectedly;
+    var ct_i = nativegen.compile(gpa, &t_i, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct_i.deinit();
-    var ct_f = nativegen.compile(gpa, &t_f) orelse return error.NativeBailedUnexpectedly;
+    var ct_f = nativegen.compile(gpa, &t_f, 0) orelse return error.NativeBailedUnexpectedly;
     defer ct_f.deinit();
 
     const Case = struct { s: Value, int_kind: bool, completed: usize, exit: u32, acc: Value };
@@ -2720,7 +2719,7 @@ test "doc 30 c3: malformed stamps and layouts fail closed — the never-trust-th
         const saved = t.instrs[7].ty;
         t.instrs[7].ty = .heap;
         defer t.instrs[7].ty = saved;
-        try testing.expect(nativegen.compileWithHeap(gpa, &t, &heap) == null);
+        try testing.expect(nativegen.compileWithHeap(gpa, &t, 0, &heap) == null);
     }
     // (b) scap_int slot out of bounds: refuse.
     {
@@ -2729,19 +2728,19 @@ test "doc 30 c3: malformed stamps and layouts fail closed — the never-trust-th
         const saved = t.instrs[8].b;
         t.instrs[8].b = @intCast(gc.MatchScratch.n_slots);
         defer t.instrs[8].b = saved;
-        try testing.expect(nativegen.compileWithHeap(gpa, &t, &heap) == null);
+        try testing.expect(nativegen.compileWithHeap(gpa, &t, 0, &heap) == null);
     }
     // (c) sgmatch whose aux names an INT konst (not a string): refuse.
     {
         var consts = [_]Value{ Value.int(1), Value.int(7) };
         const t = gmatchStepTrace(&consts);
-        try testing.expect(nativegen.compileWithHeap(gpa, &t, &heap) == null);
+        try testing.expect(nativegen.compileWithHeap(gpa, &t, 0, &heap) == null);
     }
     // (d) guard_sid whose aux names an INT konst: refuse.
     {
         var consts = [_]Value{ Value.int(1), Value.int(7) };
         const t = guardSidTrace(&consts);
-        try testing.expect(nativegen.compile(gpa, &t) == null);
+        try testing.expect(nativegen.compile(gpa, &t, 0) == null);
     }
     // (e) smatch whose pattern ref is a dominating INT (no string proof —
     // the is_string gate, not the bounds gate): refuse.
@@ -2751,17 +2750,17 @@ test "doc 30 c3: malformed stamps and layouts fail closed — the never-trust-th
         const saved = t.instrs[7].aux;
         t.instrs[7].aux = 0; // the pos slot_load — kind .int, never a string
         defer t.instrs[7].aux = saved;
-        try testing.expect(nativegen.compileWithHeap(gpa, &t, &heap) == null);
+        try testing.expect(nativegen.compileWithHeap(gpa, &t, 0, &heap) == null);
     }
     // (f) Control: the honest traces all compile (the refusals above were for
     // the STAMP, not some unrelated reason).
     {
         var consts = [_]Value{ Value.int(1), Value.heap(&pat.header) };
         const t1 = smatchSlideTrace(&consts);
-        var c1 = nativegen.compileWithHeap(gpa, &t1, &heap) orelse return error.NativeBailedUnexpectedly;
+        var c1 = nativegen.compileWithHeap(gpa, &t1, 0, &heap) orelse return error.NativeBailedUnexpectedly;
         c1.deinit();
         const t2 = guardSidTrace(&consts);
-        var c2 = nativegen.compile(gpa, &t2) orelse return error.NativeBailedUnexpectedly;
+        var c2 = nativegen.compile(gpa, &t2, 0) orelse return error.NativeBailedUnexpectedly;
         c2.deinit();
     }
 }
@@ -2873,7 +2872,7 @@ test "doc 30 c4b: carried-string slot — native compiles, runs, flushes TAG_HEA
     var nconsts = [_]Value{ Value.int(1), Value.heap(&npat.header) };
     const tn = carriedStringTrace(&nconsts);
     const nobjs_before = nheap.object_count;
-    var ct = nativegen.compileWithHeap(gpa, &tn, &nheap) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compileWithHeap(gpa, &tn, 0, &nheap) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     var nregs = [_]Value{ Value.heap(&nstate.header), Value.heap(&nw0.header), Value.int(0) };
     const nresult = try util.runNative(ct, &nregs);
@@ -2893,7 +2892,7 @@ test "doc 30 c4b: carried-string slot — native compiles, runs, flushes TAG_HEA
         var xregs = regs_init;
         const xresult = try util.runNative(ct, &xregs);
         try testing.expectEqual(@as(usize, 0), xresult.completed);
-        try testing.expectEqual(irinterp.ExitReason.prologue_fail, xresult.exit_reason);
+        try testing.expectEqual(trace_exec.ExitReason.prologue_fail, xresult.exit_reason);
         try util.expectRegsEqual(&regs_init, &xregs);
     }
     {
@@ -2903,7 +2902,7 @@ test "doc 30 c4b: carried-string slot — native compiles, runs, flushes TAG_HEA
         var xregs = regs_init;
         const xresult = try util.runNative(ct, &xregs);
         try testing.expectEqual(@as(usize, 0), xresult.completed);
-        try testing.expectEqual(irinterp.ExitReason.prologue_fail, xresult.exit_reason);
+        try testing.expectEqual(trace_exec.ExitReason.prologue_fail, xresult.exit_reason);
         try util.expectRegsEqual(&regs_init, &xregs);
     }
 
@@ -2914,7 +2913,7 @@ test "doc 30 c4b: carried-string slot — native compiles, runs, flushes TAG_HEA
         const tb = carriedStringBadWritebackTrace(&bconsts);
         var arena = McodeArena.init(gpa);
         defer arena.deinit();
-        try testing.expect(compileInto(gpa, &arena, &tb, null, &nheap) == null);
+        try testing.expect(compileInto(gpa, &arena, &tb, 0, null, &nheap) == null);
     }
 }
 
@@ -2987,7 +2986,7 @@ test "doc 30 c5 (m02): post-sgmatch projection OOM — the deferred sgm_setpos l
         const nstate = gmatchStateTable(&nheap, &nsubj.header, &npat.header, 0) catch continue;
         var nconsts = [_]Value{ Value.int(1), Value.heap(&npat.header) };
         const tn = gmatchStepTrace(&nconsts);
-        var ct = nativegen.compileWithHeap(gpa, &tn, &nheap) orelse return error.NativeBailedUnexpectedly;
+        var ct = nativegen.compileWithHeap(gpa, &tn, 0, &nheap) orelse return error.NativeBailedUnexpectedly;
         defer ct.deinit();
         var nregs = [_]Value{ Value.heap(&nstate.header), Value.int(0) };
         const nresult = try util.runNative(ct, &nregs);
