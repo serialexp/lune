@@ -21,6 +21,39 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-07b — doc 42 arc OPEN: tail-call dispatch, prep landed, conversion next
+
+Bart authorized the structural fix for the interpreter i-cache fragility
+("absolutely number 1"). State of the arc:
+
+- **docs/design/42-tier0-tail-call-dispatch.md** (commit 233d0c0) — the full
+  design, codex-reviewed (gpt-5.6-sol, sound-with-changes, all folded in).
+  READ IT FIRST; it contains the verified toolchain facts (musttail rejects
+  error-union/sret returns; bare-word + fn-table tails compile to per-handler
+  `jmp *table`; wasm tail_call feature already on in build.zig), the
+  normative 11-step prologue order (the determinism contract), the
+  reloadTopFrame/dispatchCurrentAt split, and the five mechanical
+  translation rules for arm bodies.
+- **Prep commit c38ffb9** — interp_dispatch_test.zig (T-1..T-5 behavior pins
+  at safepoint granularity: call/ret suspend boundaries, fast/full handoff
+  safepoint-count equality, error-mid-recording cleanup, reentrant
+  callValue) + the OpCode density comptime assert in bytecode.zig. All green.
+- **NEXT: the conversion, ONE commit** (doc 42 §6.2): ExecState +
+  HandlerResult + per-op handler fns (56 ops × fast/full comptime tables) +
+  musttail dispatch tail + noinline back-edge epilogue; the labeled-switch
+  loop deleted. Then §6.3's measurement battery vs BOTH the 8a9ef56 shadow
+  (/tmp/mahina-baseline, still on disk) and current HEAD: pi_leibniz t0,
+  euler14/recursive-fib/array3d/lua54, fft, grid_matmul, full just bench
+  (INTERLEAVED per-program A/B only — sequential suites showed +4.5% phantom
+  medians from thermal drift, see 2026-09-07 status), L1-icache-load-misses
+  perf stat, binary size, wasm smoke. Then T-6 (real-handler O(1)-stack
+  chain test) + T-7 as part of the conversion commit, ABI tuning per §4.6
+  only if assembly justifies it.
+- Zig gotchas already hit: `@typeInfo(E).@"enum"` now has
+  field_names/field_values parallel arrays (no .fields); doc comments can't
+  attach to comptime blocks. The pinned toolchain's Type lives in
+  std/lang.zig.
+
 ## Status 2026-09-07 — doc-41 perf regression: mechanical halves fixed, i-cache finding remains
 
 Follow-up to the 2026-09-06 review below; Bart authorized attacking TODO
