@@ -134,43 +134,6 @@ pub const programPointsEqual = trace_region.programPointsEqual;
 pub const appendUniqueSlot = trace_region.appendUniqueSlot;
 pub const programPointLess = trace_region.programPointLess;
 
-/// Remap the recorder's dense, emission-indexed exit-provenance table (A-i.1) into
-/// the committed trace's compact, sorted `[]ExitProvEntry`, keyed by committed
-/// instruction index. `old_to_new` is `tropt`'s compaction map (emission index →
-/// committed index, `null` for a dropped instr); pass `null` for the identity map
-/// (the `dupe` path — link + unoptimized traces preserve indices 1:1). Only
-/// non-`null` provenance whose instruction survived compaction is carried over
-/// (the many-to-one dedup already happened at stamp time).
-///
-/// `link_terminal` (A-i.4) carries the `.link` terminal's provenance and its
-/// committed index. The `.link`/`.loop` terminal is appended directly to `instrs`
-/// at commit — it never went through `emit`, so it has NO lockstep `rec_exit_prov`
-/// slot; it is injected here as one extra entry. `null` for every non-link trace
-/// (a `.loop` terminal is a back-edge, not an exit).
-///
-/// Returns a static empty slice when there is nothing to carry (no alloc). Caller
-/// owns the result.
-/// Populate `t.code.bridge_cand` / `t.code.bridge_cand_built` by evaluating the pure
-/// `nativegen.isCompositeBridgeCandidate` oracle once per instruction index
-/// (doc 17 §T.9). Call once, at commit, after `t` is fully populated.
-///
-/// FAIL-SOFT by design: on OOM the memo is simply left unbuilt and
-/// `Trace.isBridgeCandidate` falls back to the oracle. There is deliberately no
-/// error return — a commit must never fail because an accelerator could not be
-/// allocated.
-pub fn buildBridgeCandMemo(gpa: std.mem.Allocator, t: *Trace) void {
-    @import("trace_finalize.zig").buildBridgeCandMemo(gpa, &t.code);
-}
-
-pub fn buildExitProv(
-    gpa: std.mem.Allocator,
-    rec_exit_prov: []const ?ExitProvenance,
-    old_to_new: ?[]const ?Ref,
-    link_terminal: ?ExitProvEntry,
-) ![]ExitProvEntry {
-    return @import("trace_finalize.zig").buildExitProv(gpa, rec_exit_prov, old_to_new, link_terminal);
-}
-
 /// Whether IR instruction `idx` of `t` is a numeric-for loop-done guard: a
 /// `guard_true` whose deopt PC lands immediately after a `for_loop` bytecode op.
 /// Mirrors nativegen's `isNumericForLoopDoneGuard`, kept here so the arming side can
@@ -912,21 +875,6 @@ pub const TraceState = struct {
     /// to `GATE_SKIP` when an anchor is found gated, so a dead loop's millions of
     /// back-edges cost an array decrement instead of three hashmap probes apiece.
     hotcount: [HOTCOUNT_SIZE]u16 = @splat(0),
-    /// Armed native links (P-E, doc 17 Increment 2.3). Each record is a `parent`
-    /// trace whose frameless exit slot `parent.native.compiled.slots[slot_index]` has
-    /// been written to jump directly into `child`'s body. Kept so a retiring trace can
-    /// be made lifetime-safe: when `child` is destroyed its arena slot returns to the
-    /// reuse free-list and could be overwritten by unrelated code, so every parent
-    /// slot pointing at it must first be reset to `shared_exit`; and when `parent` is
-    /// destroyed its slot array is freed, so its records must be dropped before any
-    /// child-retire tries to write through them. `resetLinksTouching` handles both
-    /// directions by trace *identity* (never a raw slot pointer), so it is correct
-    /// regardless of retire order. Populated by `armNativeLink` (2.3b+).
-    /// B-3b.2 silent-cycle registry. `promoted_exit_owners` is the exclusive
-    /// physical-exit ownership index required by §B3.9(4); ids, rather than list
-    /// indices, remain stable across swap-removal.
-    /// Cycle ids queued while replay is validating the armed-link registry.
-    /// Capacity is reserved before promotion publication, so queuing is infallible.
     /// Part B-2b: persistent hotexit-provenance relations. Edges are expected to
     /// be few, so lifecycle operations deliberately use linear scans.
     provenance_edges: std.ArrayListUnmanaged(ProvenanceEdge) = .empty,
@@ -3056,10 +3004,9 @@ pub const TraceState = struct {
             });
             self.gateRecordAnchor(self.rec.anchor, .commit_failure);
         };
-        self.rec.active = false;
-        // A successful `commit` consumed `side_src` (DONE latch); a failed one
-        // must drop it too, so a stale key can never latch a later commit.
-        self.rec.side_src = null;
+        // No terminal-state writes here: `finalize`'s defer clears `active` and
+        // `side_src` on success AND failure, so a stale key can never latch a
+        // later commit.
     }
 
     /// B-2b commit publication: preserve the logical hotexit provenance only
@@ -3100,14 +3047,20 @@ pub const TraceState = struct {
         defer candidate.deinit(self.gpa);
         const t = try self.registry.allocate();
         errdefer self.registry.discardAllocation(t);
-        t.code = candidate.getCode().?.*;
+        // Ownership transfer per RecordingCandidate's contract: take() BEFORE
+        // the code is reached through the record — never a shallow copy of a
+        // live candidate. From here `t.code` is the sole owner; on a failed
+        // publish the errdefer below returns the arrays (`discardAllocation`
+        // destroys only the record, never code), and the candidate's deferred
+        // deinit is a no-op after take(). `side_src` stays readable by design.
+        t.code = candidate.take().?;
+        errdefer t.code.deinit(self.gpa);
         if (self.gpa.alloc(u8, t.code.instrs.len)) |counts| {
             @memset(counts, 0);
             t.exit_counts = counts;
         } else |_| {}
         errdefer if (t.exit_counts.len != 0) self.gpa.free(t.exit_counts);
         try self.registry.publish(t);
-        _ = candidate.take();
         self.finishSideTraceProvenance(t, candidate.side_src);
         // Coverage (gated): a trace now exists at this anchor, so subsequent
         // interpreted back-edges here are "fallback despite a trace."
@@ -3126,27 +3079,10 @@ pub const TraceState = struct {
     // Emission and finalization are owned by RecordingSession.
 };
 
-// Recorder support decls + the Recorder struct itself — moved to
-// trace_recorder.zig (file-split pass); aliases keep `trace.Recorder`,
-// the `rec: Recorder` field, and every internal spelling working.
-pub const isPlainWhileAnchor = trace_recorder_mod.isPlainWhileAnchor;
-pub const arithResultType = trace_recorder_mod.arithResultType;
-pub const obsTypeOf = trace_recorder_mod.obsTypeOf;
-pub const SlotState = trace_recorder_mod.SlotState;
-pub const EntryKind = trace_recorder_mod.EntryKind;
-pub const RegSlot = trace_recorder_mod.RegSlot;
-pub const PeelSlot = trace_recorder_mod.PeelSlot;
-pub const PeelState = trace_recorder_mod.PeelState;
-pub const KonstKey = trace_recorder_mod.KonstKey;
-pub const konstKey = trace_recorder_mod.konstKey;
-pub const PendingStore = trace_recorder_mod.PendingStore;
-pub const AliasClass = trace_recorder_mod.AliasClass;
-pub const AffineIntKey = trace_recorder_mod.AffineIntKey;
-pub const MAX_CALLEE_REGS = trace_recorder_mod.MAX_CALLEE_REGS;
+// The recorder lives in trace_recorder.zig. Only the names this module and its
+// direct consumers genuinely use are re-exported; everything else is imported
+// from trace_recorder.zig at the point of use.
 pub const MAX_TRACE_INPUTS = trace_recorder_mod.MAX_TRACE_INPUTS;
-pub const InlineFrame = trace_recorder_mod.InlineFrame;
-pub const pathFromFrames = trace_recorder_mod.pathFromFrames;
-pub const TraceKind = trace_recorder_mod.TraceKind;
 pub const RecordingSession = trace_recorder_mod.RecordingSession;
 
 // ---------------------------------------------------------------------------

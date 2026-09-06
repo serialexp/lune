@@ -1560,3 +1560,35 @@ steering seam (or skips the native TSC bracket) only in Debug. Harmless for
 benchmarking (we only trust ReleaseFast numbers) but confusing during
 diagnosis — worth a look at the TSC bracketing in the fused-loopdone dispatch
 path.
+
+## Doc-41 follow-ups from the split review (2026-09-06)
+
+Confirmed findings from the three-cluster review of the ownership extraction
+(commit 243c434); the cheap boundary items were fixed in the follow-up commit,
+these remain:
+
+1. **topologyView rebuild cost — REAL perf regression, diagnosed.** Same-machine
+   A/B (shadow baseline at 8a9ef56): grid_matmul +14% wall, scimark-fft +10%,
+   suite median +2.4% both tiers. Decisions byte-identical (`--jit-stats` event
+   counters equal; hashgate 84/84) — the cost is mechanical: `topologyView`
+   (trace_regionops.zig) eagerly materializes O(traces × exits × slots) facts
+   with per-exit scratch allocs on EVERY commit/retirement/closeTrace (8.1% of
+   grid_matmul runtime vs ~3.4% for the pre-split rebuild path, ~3×);
+   `replayLedgerFrom` also ~doubled (seam +7.5%/walk). Fix needs design care:
+   lazy or cached facts without breaking the topology ownership boundary
+   (hot-loop-allocations skill applies). Verify with full `just bench` A/B.
+2. **Forwarding facade on TraceState** — 176 pure-forward decls
+   (trace.zig:2401+), three-layer aliasing trace.zig → trace_link →
+   native_registry for ~9 demote/mutation ops, ~10 one-line policy forwards in
+   trace_regionops. Doc 41's own invariant ("no permanent forwarding-only
+   endpoint") forbids this as an end-state; it is the doc's outstanding
+   coordinator phase, not a quick fix.
+3. **RegionPolicy pub-field reach-ins** — coordinator slices read/write
+   `region_profit.getPtr` / `region_defs` / `edge_cache` directly (trace_chain,
+   trace_link, trace_regionops); bridge-arm decision logic lives in regionops
+   while its data moved to policy. Related: `EntryPatchState` transitions are
+   written from three modules; `debug_log` sync is manual boilerplate at ~7
+   sites; promoted-set `summary`/`metadata` inner pointers still reachable
+   through the const view.
+4. **trace_finalize's `rec: anytype`** — a ~20-field implicit structural
+   contract over the recorder; consider a named view struct.

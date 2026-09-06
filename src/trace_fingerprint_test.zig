@@ -4,6 +4,8 @@
 //! Shared harness lives in `trace_testutil.zig`.
 
 const trace = @import("trace.zig");
+const trace_recorder = @import("trace_recorder.zig");
+const trace_finalize = @import("trace_finalize.zig");
 const std = @import("std");
 const bytecode = @import("bytecode.zig");
 const arith = @import("arith.zig");
@@ -29,7 +31,7 @@ const EntryGuard = trace.EntryGuard;
 const ExitProvEntry = trace.ExitProvEntry;
 const ExitProvenance = trace.ExitProvenance;
 const GuardRole = trace.GuardRole;
-const InlineFrame = trace.InlineFrame;
+const InlineFrame = trace_recorder.InlineFrame;
 const IrInstr = trace.IrInstr;
 const IrOp = trace.IrOp;
 const OperandDesig = trace.OperandDesig;
@@ -37,9 +39,9 @@ const Polarity = trace.Polarity;
 const Ref = trace.Ref;
 const Trace = trace.Trace;
 const TraceState = trace.TraceState;
-const buildBridgeCandMemo = trace.buildBridgeCandMemo;
-const buildExitProv = trace.buildExitProv;
-const pathFromFrames = trace.pathFromFrames;
+const buildBridgeCandMemo = trace_finalize.buildBridgeCandMemo;
+const buildExitProv = trace_finalize.buildExitProv;
+const pathFromFrames = trace_recorder.pathFromFrames;
 
 const util = @import("trace_testutil.zig");
 const winRO = util.winRO;
@@ -277,7 +279,7 @@ test "§T.9 bridge-candidate memo: bit-identical to the oracle at every index, u
     try testing.expect(cont.code.isBridgeCandidate(3)); // known bridge slot
 
     // (b) Built — still bit-identical everywhere, in and out of bounds.
-    buildBridgeCandMemo(gpa, &cont);
+    buildBridgeCandMemo(gpa, &cont.code);
     defer if (cont.code.bridge_cand.len != 0) gpa.free(cont.code.bridge_cand);
     try testing.expect(cont.code.bridge_cand_built);
     for (0..cont_instrs.len + 4) |i|
@@ -296,7 +298,7 @@ test "§T.9 bridge-candidate memo: bit-identical to the oracle at every index, u
         },
         .id = 901,
     };
-    buildBridgeCandMemo(gpa, &skip);
+    buildBridgeCandMemo(gpa, &skip.code);
     defer if (skip.code.bridge_cand.len != 0) gpa.free(skip.code.bridge_cand);
     try testing.expect(skip.code.bridge_cand_built);
     for (0..skip_instrs.len + 2) |i| {
@@ -315,7 +317,7 @@ test "§T.9 bridge-candidate memo: bit-identical to the oracle at every index, u
         },
         .id = 902,
     };
-    buildBridgeCandMemo(gpa, &empty);
+    buildBridgeCandMemo(gpa, &empty.code);
     try testing.expect(empty.code.bridge_cand_built);
     try testing.expectEqual(@as(usize, 0), empty.code.bridge_cand.len);
     try testing.expect(!empty.code.isBridgeCandidate(0));

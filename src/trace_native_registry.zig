@@ -143,13 +143,29 @@ pub const NativePhysicalRegistry = struct {
     provenance_invalidated: bool = false,
     /// Synchronized by the coordinator before physical transactions; no owner back-pointer.
     debug_log: bool = false,
+    /// Armed native links (P-E, doc 17 Increment 2.3). Each record is a `parent`
+    /// trace whose frameless exit slot `parent.native.compiled.slots[slot_index]`
+    /// has been written to jump directly into `child`'s body. Kept so a retiring
+    /// trace can be made lifetime-safe: when `child` is destroyed its arena slot
+    /// returns to the reuse free-list and could be overwritten by unrelated code,
+    /// so every parent slot pointing at it must first be reset to `shared_exit`;
+    /// and when `parent` is destroyed its slot array is freed, so its records
+    /// must be dropped before any child-retire tries to write through them.
+    /// `resetLinksTouching` handles both directions by trace *identity* (never a
+    /// raw slot pointer), so it is correct regardless of retire order.
     armed_links: std.ArrayListUnmanaged(NativeLink) = .empty,
+    /// B-3b.2 silent-cycle registry; `promotedSets()` is the readers' view.
     promoted_sets: std.ArrayListUnmanaged(PromotedSet) = .empty,
+    /// The exclusive physical-exit ownership index required by §B3.9(4); ids,
+    /// rather than list indices, remain stable across swap-removal.
     promoted_exit_owners: std.AutoHashMapUnmanaged(ExitKey, u32) = .empty,
     next_promoted_set_id: u32 = 1,
     promotion_candidate: []PromotedEdge = &.{},
     promotion_candidate_run: u32 = 0,
     promotion_candidate_region: ?RegionKey = null,
+    /// Cycle ids queued while replay is validating the armed-link registry.
+    /// Capacity is reserved before promotion publication, so queuing is
+    /// infallible.
     pending_demote: std.ArrayListUnmanaged(PendingDemotion) = .empty,
     replay_walk_depth: u32 = 0,
     pending_disarm_all: bool = false,
@@ -170,6 +186,21 @@ pub const NativePhysicalRegistry = struct {
     pub fn armedLinks(self: *const NativePhysicalRegistry) []const NativeLink {
         return self.armed_links.items;
     }
+    /// Replay-barrier bracket (A-vii-d.1): while a ledger walk is in flight,
+    /// destructive link mutation is deferred or panics (every guard in this
+    /// owner validates against the depth). Drivers bracket the walk with
+    /// enter/exit; `replay_walk_depth` is owner state — never written directly
+    /// by callers.
+    pub fn enterReplayWalk(self: *NativePhysicalRegistry) void {
+        self.replay_walk_depth += 1;
+    }
+    pub fn exitReplayWalk(self: *NativePhysicalRegistry) void {
+        std.debug.assert(self.replay_walk_depth > 0);
+        self.replay_walk_depth -= 1;
+    }
+    pub fn inReplayWalk(self: *const NativePhysicalRegistry) bool {
+        return self.replay_walk_depth != 0;
+    }
     /// Update only the memo of the exact relation/proof the reader validated.
     pub fn memoizeBridgeEdge(self: *NativePhysicalRegistry, parent: *Trace, slot: u32, child: *Trace, expected: RegionArmProof, edge: StructuralEdgeId, generation: u32) bool {
         for (self.armed_links.items) |*link| {
@@ -180,6 +211,24 @@ pub const NativePhysicalRegistry = struct {
             return true;
         }
         return false;
+    }
+    /// Const view of the live promoted sets, mirroring `armedLinks`: readers
+    /// iterate this; mutation goes through promote/demote/mailbox owner
+    /// operations.
+    pub fn promotedSets(self: *const NativePhysicalRegistry) []const PromotedSet {
+        return self.promoted_sets.items;
+    }
+    /// Whether a live promoted set already owns this (trace, exit) relation.
+    pub fn exitIsPromoted(self: *const NativePhysicalRegistry, trace_id: u32, exit_instr: u32) bool {
+        return self.promoted_exit_owners.contains(.{ .trace_id = trace_id, .exit_instr = exit_instr });
+    }
+    /// Clear every live set's per-call summary mailbox. Native epilogues only
+    /// add; the burst driver calls this once after consuming the complete
+    /// image — every live set, not just the entry one, or a second live set
+    /// that fused into the call would re-apply its work on its own next drain.
+    pub fn clearSilentSummaries(self: *NativePhysicalRegistry) void {
+        for (self.promoted_sets.items) |*c|
+            @memset(c.summary, std.mem.zeroes(nativegen.SilentSummaryCell));
     }
     pub fn promotionCandidate(self: *const NativePhysicalRegistry) []const PromotedEdge {
         return self.promotion_candidate;
@@ -417,22 +466,31 @@ pub const NativePhysicalRegistry = struct {
         // ("any physical disarm re-opens") instead of per-kind exceptions.
         self.provenance_invalidated = true;
     }
-    pub fn promoteSet(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena, edges: []const PromotedEdge, region_key: RegionKey, min_useful: usize) !void {
+    /// The physical promotability prologue, shared with the coordinator's
+    /// policy wrapper so error precedence lives in exactly one place: bounds
+    /// and id space, then one-live-set-per-region, then exit ownership.
+    /// `promoteSet` re-runs it before mutating (fail-closed even on a direct
+    /// owner call).
+    ///
+    /// B-3d (§B3.17 R1): ONE live set per region key, enforced — not assumed.
+    /// The reachable race this closes: a growth demote queued mid-walk has not
+    /// applied yet when a promotion-eligible candidate arrives; accepting the
+    /// second set would put two overlapping promotions on one region and break
+    /// the PROVENANCE_VERDICT_CAP sizing argument. The reject resets the
+    /// candidate streak (caller), costing one extra 4-window round —
+    /// deterministic and accepted (§B3.18 R7 churn note).
+    pub fn checkPromotable(self: *const NativePhysicalRegistry, edges: []const PromotedEdge, region_key: RegionKey) !void {
         if (edges.len == 0 or edges.len > PROMOTED_SET_CAP) return error.InvalidPromotionSet;
         if (self.next_promoted_set_id == std.math.maxInt(u32)) return error.PromotionIdExhausted;
-        // B-3d (§B3.17 R1): ONE live set per region key, enforced — not assumed.
-        // The reachable race this closes: a growth demote queued mid-walk has not
-        // applied yet when a promotion-eligible candidate arrives; accepting the
-        // second set would put two overlapping promotions on one region and break
-        // the PROVENANCE_VERDICT_CAP sizing argument. The reject resets the
-        // candidate streak (caller), costing one extra 4-window round —
-        // deterministic and accepted (§B3.18 R7 churn note).
         for (self.promoted_sets.items) |s| {
             if (std.meta.eql(s.region_key, region_key)) return error.PromotionRegionOwned;
         }
         for (edges) |edge| {
             if (self.promoted_exit_owners.contains(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit })) return error.PromotionExitOwned;
         }
+    }
+    pub fn promoteSet(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena, edges: []const PromotedEdge, region_key: RegionKey, min_useful: usize) !void {
+        try self.checkPromotable(edges, region_key);
         const owned_edges = try self.gpa.dupe(PromotedEdge, edges);
         errdefer self.gpa.free(owned_edges);
         const summary = try self.gpa.alloc(nativegen.SilentSummaryCell, edges.len);

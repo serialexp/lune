@@ -163,8 +163,15 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
     return RecordingCandidate.init(code, rec.side_src);
 }
 
-/// Same pure classifier as native lowering. OOM leaves the memo unbuilt so
-/// readers use the oracle, never an incomplete bitset.
+/// Populate `code.bridge_cand` / `code.bridge_cand_built` by evaluating the
+/// pure `isCompositeBridgeCandidate` classifier once per instruction index
+/// (doc 17 §T.9) — the same classifier native lowering uses. Call once, at
+/// commit, after the code is fully populated.
+///
+/// FAIL-SOFT by design: on OOM the memo is simply left unbuilt and
+/// `isBridgeCandidate` falls back to the oracle, never an incomplete bitset.
+/// There is deliberately no error return — a commit must never fail because
+/// an accelerator could not be allocated.
 pub fn buildBridgeCandMemo(gpa: std.mem.Allocator, code: *TraceCode) void {
     if (code.instrs.len == 0) {
         code.bridge_cand_built = true;
@@ -180,6 +187,23 @@ pub fn buildBridgeCandMemo(gpa: std.mem.Allocator, code: *TraceCode) void {
     code.bridge_cand_built = true;
 }
 
+/// Remap the recorder's dense, emission-indexed exit-provenance table (A-i.1)
+/// into the committed trace's compact, sorted `[]ExitProvEntry`, keyed by
+/// committed instruction index. `old_to_new` is `tropt`'s compaction map
+/// (emission index → committed index, `null` for a dropped instr); pass `null`
+/// for the identity map (the `dupe` path — link + unoptimized traces preserve
+/// indices 1:1). Only non-`null` provenance whose instruction survived
+/// compaction is carried over (the many-to-one dedup already happened at stamp
+/// time).
+///
+/// `link_terminal` (A-i.4) carries the `.link` terminal's provenance and its
+/// committed index. The `.link`/`.loop` terminal is appended directly to
+/// `instrs` at commit — it never went through `emit`, so it has NO lockstep
+/// `rec_exit_prov` slot; it is injected here as one extra entry. `null` for
+/// every non-link trace (a `.loop` terminal is a back-edge, not an exit).
+///
+/// Returns a static empty slice when there is nothing to carry (no alloc).
+/// Caller owns the result.
 pub fn buildExitProv(
     gpa: std.mem.Allocator,
     rec_exit_prov: []const ?ExitProvenance,

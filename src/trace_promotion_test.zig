@@ -1282,13 +1282,13 @@ test "B-3b.2 replay walk queues demotion and applies it before pending disarms" 
     const edges = state.detectPromotableSet(&observed, key).?;
     defer gpa.free(edges);
     try state.promoteSet(edges, key);
-    state.registry.native_physical.replay_walk_depth = 1;
+    state.registry.native_physical.enterReplayWalk();
     state.demoteSetsTouching(a, 0);
     state.disarmAllLinks();
     try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
     try testing.expectEqual(@as(usize, 1), state.registry.native_physical.pending_demote.items.len);
     try testing.expect(state.registry.native_physical.pending_disarm_all);
-    state.registry.native_physical.replay_walk_depth = 0;
+    state.registry.native_physical.exitReplayWalk();
     state.applyPendingDisarms();
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
@@ -1336,11 +1336,11 @@ test "B-3d.1 low-yield unfreeze demotes the region's promotion in the same act" 
         accum.useful_streak = state.config.freeze_windows;
     }
     try state.promoteSet(edges, key);
-    state.registry.native_physical.replay_walk_depth = 1;
+    state.registry.native_physical.enterReplayWalk();
     state.flushRegionWindow(key, 1);
     try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
     try testing.expectEqual(@as(usize, 1), state.registry.native_physical.pending_demote.items.len);
-    state.registry.native_physical.replay_walk_depth = 0;
+    state.registry.native_physical.exitReplayWalk();
     state.applyPendingDisarms();
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
     try testing.expectEqual(@as(u64, 2), state.registry.native_physical.silent_demotion_reasons.unfreeze);

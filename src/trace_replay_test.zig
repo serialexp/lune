@@ -1645,7 +1645,7 @@ test "A-vii-d.1 disarm deferral: disarmAllLinks defers mid-replay-walk; applyPen
 
     // Mid-walk: the registry must stay intact (later rows of the ledger being
     // walked validate against it) and the request must be recorded.
-    state.registry.native_physical.replay_walk_depth = 1;
+    state.registry.native_physical.enterReplayWalk();
     state.disarmAllLinks();
     try testing.expectEqual(@as(usize, 1), state.registry.native_physical.armed_links.items.len);
     try testing.expect(state.registry.native_physical.pending_disarm_all);
@@ -1654,7 +1654,7 @@ test "A-vii-d.1 disarm deferral: disarmAllLinks defers mid-replay-walk; applyPen
     // Driver-side application: registry cleared, counter charged, and any
     // pending bridge-arm request from the same walk dropped (fail-closed —
     // never disarm-then-re-arm into a complex the gate just condemned).
-    state.registry.native_physical.replay_walk_depth = 0;
+    state.registry.native_physical.exitReplayWalk();
     state.pending_bridge_arm = .{ .trace_id = 801, .exit_instr = 0 };
     state.applyPendingDisarms();
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);

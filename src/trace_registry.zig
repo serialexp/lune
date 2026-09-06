@@ -53,7 +53,7 @@ pub const TraceRegistry = struct {
     }
     /// Retirement is forbidden during replay: deferred disarm cannot protect freed pages.
     pub fn retire(self: *TraceRegistry, t: *Trace) bool {
-        if (self.native_physical.replay_walk_depth != 0) @panic("trace retirement during replay");
+        if (self.native_physical.inReplayWalk()) @panic("trace retirement during replay");
         for (self.cache.items, 0..) |live, idx| {
             if (live != t) continue;
             self.native_physical.resetLinksTouching(&self.mcode_arena, t);
@@ -70,7 +70,7 @@ pub const TraceRegistry = struct {
     }
     /// Self-contained epoch safety; never relies on coordinator pre-disarm.
     pub fn clear(self: *TraceRegistry) void {
-        if (self.native_physical.replay_walk_depth != 0) @panic("trace clear during replay");
+        if (self.native_physical.inReplayWalk()) @panic("trace clear during replay");
         self.native_physical.demoteAllSets(&self.mcode_arena);
         self.native_physical.disarmAllLinks(&self.mcode_arena);
         self.native_physical.resetPromotionCandidate();

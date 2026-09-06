@@ -926,7 +926,7 @@ pub fn detectPromotableSet(self: *TraceState, entries: []const trace_exec.Ledger
     for (self.registry.native_physical.armedLinks()) |link| {
         const edge = self.promotedEdgeFromLink(link) orelse continue;
         if (!self.edgeMemberOfRegion(edge, key.region_id, true)) continue;
-        if (self.registry.native_physical.promoted_exit_owners.contains(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit }))
+        if (self.registry.native_physical.exitIsPromoted(edge.parent.id, edge.exit))
             continue;
         if (n == PROMOTED_SET_CAP) return self.rejectPromotion(.cap);
         scratch[n] = edge;
@@ -986,18 +986,10 @@ pub fn patchPromotedEdge(self: *TraceState, edge: PromotedEdge, promote: bool) n
 }
 
 pub fn promoteSet(self: *TraceState, edges: []const PromotedEdge, region_key: RegionKey) !void {
-    if (edges.len == 0 or edges.len > PROMOTED_SET_CAP) return error.InvalidPromotionSet;
-    if (self.registry.native_physical.next_promoted_set_id == std.math.maxInt(u32)) return error.PromotionIdExhausted;
-    // B-3d (§B3.17 R1): ONE live set per region key, enforced — not assumed.
-    // The reachable race this closes: a growth demote queued mid-walk has not
-    // applied yet when a promotion-eligible candidate arrives; accepting the
-    // second set would put two overlapping promotions on one region and break
-    // the PROVENANCE_VERDICT_CAP sizing argument. The reject resets the
-    // candidate streak (caller), costing one extra 4-window round —
-    // deterministic and accepted (§B3.18 R7 churn note).
-    for (self.registry.native_physical.promoted_sets.items) |s| {
-        if (std.meta.eql(s.region_key, region_key)) return error.PromotionRegionOwned;
-    }
+    // Physical precedence (bounds, id space, region/exit ownership) is the
+    // owner's `checkPromotable` — run it first so its errors keep priority
+    // over policy validation, exactly as before the checks were shared.
+    try self.registry.native_physical.checkPromotable(edges, region_key);
     if (!self.promotionBelongsToRegion(edges, region_key)) return error.InvalidPromotionRegion;
     for (edges) |edge| {
         const validated = self.promotedEdgeFromLink(.{
@@ -1008,8 +1000,6 @@ pub fn promoteSet(self: *TraceState, edges: []const PromotedEdge, region_key: Re
         }) orelse return error.InvalidPromotionSet;
         if (validated.kind != edge.kind or validated.resume_pc != edge.resume_pc)
             return error.InvalidPromotionSet;
-        if (self.registry.native_physical.promoted_exit_owners.contains(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit }))
-            return error.PromotionExitOwned;
     }
 
     try self.registry.native_physical.promoteSet(&self.registry.mcode_arena, edges, region_key, self.config.min_useful);
@@ -1265,8 +1255,8 @@ pub fn arm(self: *TraceState, request: ArmRequest) !bool {
 /// semantics — queued mid-walk, immediate at depth 0 — and the backwards
 /// iteration keeps the depth-0 `swapRemove` sound.
 pub fn noteMembershipGrowth(self: *TraceState, parent: *Trace, slot_index: u32, child: *Trace, kind: ArmKind) void {
-    if (self.registry.native_physical.promoted_sets.items.len == 0) return;
-    if (self.registry.native_physical.promoted_exit_owners.contains(.{ .trace_id = parent.id, .exit_instr = slot_index }))
+    if (self.registry.native_physical.promotedSets().len == 0) return;
+    if (self.registry.native_physical.exitIsPromoted(parent.id, slot_index))
         return;
     // Not patch-pointed (or otherwise failing arm-shape validation) means the
     // edge can never be a candidate member, so it cannot outgrow a set. Same
@@ -1279,10 +1269,10 @@ pub fn noteMembershipGrowth(self: *TraceState, parent: *Trace, slot_index: u32, 
         .child = child,
         .kind = kind,
     }) orelse return;
-    var i = self.registry.native_physical.promoted_sets.items.len;
+    var i = self.registry.native_physical.promotedSets().len;
     while (i > 0) {
         i -= 1;
-        const s = self.registry.native_physical.promoted_sets.items[i];
+        const s = self.registry.native_physical.promotedSets()[i];
         if (!self.edgeMemberOfRegion(edge, s.region_key.region_id, false)) continue;
         self.dbg("membership growth: parent id={d} slot={d} kind={s} demotes set={d} region={d}", .{
             parent.id, slot_index, @tagName(kind), s.id, s.region_key.region_id,
@@ -1625,8 +1615,7 @@ pub fn markEntryPatchesAt(self: *TraceState, anchor: AnchorKey) void {
 /// ascending trace-id order (§R3-1 rule 3 deterministic sibling ties).
 /// Early-outs on the dirty counter, so a quiet turn costs one load.
 pub fn drainEntryPatchWork(self: *TraceState) void {
-    if (self.registry.entry_registry.entry_patch_dirty == 0) return;
-    self.registry.entry_registry.entry_patch_dirty = 0;
+    if (!self.registry.entry_registry.takeDirty()) return;
     for (self.registry.entry_registry.entry_patches.items, 0..) |p, i| {
         if (p.tombstone or !p.pending_unpatch) continue;
         self.unpatchSlot(@intCast(i));

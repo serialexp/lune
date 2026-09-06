@@ -293,10 +293,10 @@ pub fn demotePromotionsForRegion(self: *TraceState, key: RegionKey) void {
 /// Backwards over `promoted_sets` because `demoteSetReason` swapRemoves at
 /// depth 0 (mid-walk it queues instead) — forward iteration would skip entries.
 pub fn demotePromotionsForRegionReason(self: *TraceState, key: RegionKey, reason: DemotionReason) void {
-    var i = self.registry.native_physical.promoted_sets.items.len;
+    var i = self.registry.native_physical.promotedSets().len;
     while (i > 0) {
         i -= 1;
-        if (std.meta.eql(self.registry.native_physical.promoted_sets.items[i].region_key, key))
+        if (std.meta.eql(self.registry.native_physical.promotedSets()[i].region_key, key))
             self.demoteSetReason(i, reason);
     }
 }
@@ -307,12 +307,12 @@ pub fn demotePromotionsForRegionReason(self: *TraceState, key: RegionKey, reason
 pub fn prepareNativeEntry(self: *TraceState) void {
     // This is on every native entry; preserve the empty-registry common case
     // as one length branch before resolving activation state.
-    if (self.registry.native_physical.promoted_sets.items.len == 0) return;
+    if (self.registry.native_physical.promotedSets().len == 0) return;
     const active = if (self.region_policy.region_context) |ctx| self.activeRegionFor(ctx.call_seq) else null;
-    var i = self.registry.native_physical.promoted_sets.items.len;
+    var i = self.registry.native_physical.promotedSets().len;
     while (i > 0) {
         i -= 1;
-        if (active == null or !std.meta.eql(self.registry.native_physical.promoted_sets.items[i].region_key, active.?))
+        if (active == null or !std.meta.eql(self.registry.native_physical.promotedSets()[i].region_key, active.?))
             self.demoteSetReason(i, .activation);
     }
 }
@@ -329,7 +329,7 @@ pub fn silentStaging(self: *TraceState) nativegen.SilentStaging {
     // the A-vii-e.1 observer scan. Stage zeros behind one predictable branch;
     // the real staging cost is paid only while patched code exists, where it is
     // amortized across thousands of silent transitions.
-    if (self.registry.native_physical.promoted_sets.items.len == 0) return .{};
+    if (self.registry.native_physical.promotedSets().len == 0) return .{};
     var zero_run: u64 = 0;
     if (self.region_policy.region_context) |ctx| {
         if (self.activeRegionFor(ctx.call_seq)) |key| {
@@ -1326,8 +1326,7 @@ pub inline fn accountTraceRun(self: *TraceState, t: *Trace, completed: usize) vo
         if (t.entry_patch == .eligible and !self.config.coverage and
             self.config.native_codegen and t.native == .compiled)
         {
-            t.entry_patch = .pending;
-            self.registry.entry_registry.entry_patch_dirty += 1;
+            self.registry.entry_registry.markInstallPending(t);
         }
     }
 }

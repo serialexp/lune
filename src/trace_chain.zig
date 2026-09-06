@@ -791,7 +791,7 @@ pub fn applyEdgeCursorTransition(
     resume_pc.* = edge_resume_pc;
 }
 
-pub const SilentCellOwner = struct { set: *PromotedSet, phase: usize };
+pub const SilentCellOwner = struct { set: *const PromotedSet, phase: usize };
 
 /// Resolve a `*SilentExitMetadata` address published by a silent epilogue back to
 /// the promoted edge that owns it.
@@ -812,7 +812,7 @@ pub const SilentCellOwner = struct { set: *PromotedSet, phase: usize };
 pub fn silentCellOwner(self: *TraceState, cell_addr: u64) ?SilentCellOwner {
     if (cell_addr == 0) return null;
     var found: ?SilentCellOwner = null;
-    for (self.registry.native_physical.promoted_sets.items) |*set| {
+    for (self.registry.native_physical.promotedSets()) |*set| {
         for (set.metadata, 0..) |*metadata, phase| {
             if (@intFromPtr(metadata) != cell_addr) continue;
             if (found != null)
@@ -866,7 +866,7 @@ pub fn silentSiblingEvidence(
     if (cell.last_ordinal == 0)
         @panic("driveSilentBurst: fired edge has no firing ordinal");
     var returned = false;
-    for (self.registry.native_physical.promoted_sets.items) |*c| {
+    for (self.registry.native_physical.promotedSets()) |*c| {
         for (c.edges, c.summary) |other_edge, other_cell| {
             if (other_edge.parent.id == parent_id and
                 other_cell.last_ordinal > cell.last_ordinal)
@@ -924,13 +924,13 @@ pub fn driveSilentBurst(
     // `silent_last_cell` resolve against promotion storage as it was when
     // native published them. Any future safe point inserted between return
     // and drain would let those cell addresses go stale.
-    const seam_t0: u64 = if (self.config.coverage and self.registry.native_physical.replay_walk_depth == 0)
+    const seam_t0: u64 = if (self.config.coverage and !self.registry.native_physical.inReplayWalk())
         readCycles()
     else
         0;
-    self.registry.native_physical.replay_walk_depth += 1;
+    self.registry.native_physical.enterReplayWalk();
     defer {
-        self.registry.native_physical.replay_walk_depth -= 1;
+        self.registry.native_physical.exitReplayWalk();
         if (seam_t0 != 0) {
             self.cycles_seam +|= cycleDelta(readCycles(), seam_t0);
             self.seam_walks +|= 1;
@@ -950,7 +950,7 @@ pub fn driveSilentBurst(
         @panic("driveSilentBurst: silent terminal cell has no live promotion");
     const last_set = last_owner.set;
     const last_phase = last_owner.phase;
-    for (self.registry.native_physical.promoted_sets.items) |*c| {
+    for (self.registry.native_physical.promotedSets()) |*c| {
         if (c.edges.len == 0 or c.edges.len != c.summary.len or
             c.edges.len != c.metadata.len)
             @panic("driveSilentBurst: promoted set storage is inconsistent");
@@ -966,7 +966,7 @@ pub fn driveSilentBurst(
     // "did anything make progress at or after this firing" stays one comparison.
     var last_productive_ordinal: u64 = 0;
     var total_firings: u64 = 0;
-    for (self.registry.native_physical.promoted_sets.items) |*c| {
+    for (self.registry.native_physical.promotedSets()) |*c| {
         for (c.summary) |cell| {
             last_productive_ordinal = @max(last_productive_ordinal, cell.last_productive_ordinal);
             total_firings +|= cell.firings;
@@ -992,7 +992,7 @@ pub fn driveSilentBurst(
     // sums) or measurement-carried (per-cell ordinals; one most-recent-firing
     // verdict per edge). Do not add order-sensitive derivation here — anything
     // that needs sequence must be measured into the cells by the epilogues.
-    for (self.registry.native_physical.promoted_sets.items) |*c| {
+    for (self.registry.native_physical.promotedSets()) |*c| {
         var region_work: u64 = 0;
         var fired = false;
         for (c.edges, 0..) |edge, phase| {
@@ -1111,8 +1111,7 @@ pub fn driveSilentBurst(
     // clears after consuming the complete image. EVERY live set is cleared,
     // not just the entry one — a second live set that fused into this call
     // would otherwise re-apply its work on its own next drain.
-    for (self.registry.native_physical.promoted_sets.items) |*c|
-        @memset(c.summary, std.mem.zeroes(nativegen.SilentSummaryCell));
+    self.registry.native_physical.clearSilentSummaries();
     self.silent_bursts_drained +|= 1;
     self.silent_transitions_total +|= result.silent_transitions;
     self.silent_hops_total +|= result.silent_transitions;
@@ -1403,15 +1402,15 @@ pub fn replayLedgerFrom(
     // so `cycles_seam` splits the traced bucket into native-vs-steering. A
     // `seam_t0` of 0 doubles as the "not bracketed" sentinel (coverage off,
     // nested walk, or no TSC on this target — all cases where we skip).
-    const seam_t0: u64 = if (self.config.coverage and self.registry.native_physical.replay_walk_depth == 0)
+    const seam_t0: u64 = if (self.config.coverage and !self.registry.native_physical.inReplayWalk())
         readCycles()
     else
         0;
     // A-vii-d.1: defer any `disarmAllLinks` for the duration of the walk
     // (see `replay_walk_depth`); the driver applies it right after.
-    self.registry.native_physical.replay_walk_depth += 1;
+    self.registry.native_physical.enterReplayWalk();
     defer {
-        self.registry.native_physical.replay_walk_depth -= 1;
+        self.registry.native_physical.exitReplayWalk();
         if (seam_t0 != 0) {
             self.cycles_seam +|= cycleDelta(readCycles(), seam_t0);
             self.seam_walks +|= 1;

@@ -40,6 +40,8 @@ pub const EntryRegistry = struct {
     image_gen: u64 = 0,
     entry_patches: std.ArrayListUnmanaged(*EntryPatch) = .empty,
     entry_patch_free: std.ArrayListUnmanaged(u16) = .empty,
+    /// Owner-internal work counter; advance via `markEntryPatchPending` /
+    /// `markInstallPending`, consume via `takeDirty` — never write directly.
     entry_patch_dirty: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator) EntryRegistry {
@@ -138,6 +140,22 @@ pub const EntryRegistry = struct {
         p.live = false;
         p.pending_unpatch = true;
         self.entry_patch_dirty += 1;
+    }
+
+    /// Mark a qualified trace for install at the next safe-point drain: the
+    /// record transition and the dirty bump are one owner operation, so no
+    /// caller ever advances `entry_patch_dirty` by hand.
+    pub fn markInstallPending(self: *EntryRegistry, t: *Trace) void {
+        t.entry_patch = .pending;
+        self.entry_patch_dirty += 1;
+    }
+
+    /// Consume the drain request: returns false on a quiet turn (one load),
+    /// true after zeroing the counter — the caller then owns this drain.
+    pub fn takeDirty(self: *EntryRegistry) bool {
+        if (self.entry_patch_dirty == 0) return false;
+        self.entry_patch_dirty = 0;
+        return true;
     }
 
     /// Physical restore and retirement. `live_records` is explicit so this owner
