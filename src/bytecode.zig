@@ -188,6 +188,19 @@ pub const OpCode = enum(u8) {
     halt,
 };
 
+// Doc 42 §4.6: the tail-call dispatch tables index `[@intFromEnum(op)]`
+// directly, which is only sound while the enum stays dense from 0. Explicit
+// or sparse discriminants must fail HERE, loudly, not as silent
+// wrong-handler dispatch.
+comptime {
+    const info = @typeInfo(OpCode).@"enum";
+    for (info.field_names, info.field_values, 0..) |name, val, i| {
+        if (val != i) @compileError("OpCode must stay dense from 0: '" ++
+            name ++ "' has value " ++ std.fmt.comptimePrint("{d}", .{val}) ++
+            " at index " ++ std.fmt.comptimePrint("{d}", .{i}));
+    }
+}
+
 /// Sentinel for `call`'s `c` operand meaning "want every result the callee
 /// produces" (multi-value tail position). A real result count is `< this`.
 pub const all_results: u16 = std.math.maxInt(u16);

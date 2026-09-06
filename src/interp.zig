@@ -5436,6 +5436,7 @@ test {
     _ = @import("interp_effects_test.zig");
     _ = @import("interp_modules_test.zig");
     _ = @import("interp_replay_test.zig");
+    _ = @import("interp_dispatch_test.zig");
     _ = @import("interp_gc_test.zig");
     _ = @import("interp_trace_test.zig");
     _ = @import("interp_tier1a_test.zig");
