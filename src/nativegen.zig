@@ -1646,11 +1646,13 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             .guard_func => {
                 const r = ins.a;
                 if (r >= i) return false; // not linear SSA → malformed
-                // A func guard only ever covers the callee-snapshot slot_load (the
-                // recorder emits it on a fresh synthetic input); the native path
-                // hoists it to a prologue closure/proto-id check.
-                if (t.instrs[r].op != .slot_load) return false;
-                func_guarded[r] = true;
+                // On the callee-snapshot slot_load (a fresh synthetic input) the
+                // native path hoists it to a prologue closure/proto-id check. On
+                // anything else — doc 43 P2's `hload ty=.heap` function field —
+                // Pass B validates the operand is `.heap`-kinded and the body
+                // lowers a per-iteration type + proto-id check (the dynamic
+                // guard_table precedent).
+                if (t.instrs[r].op == .slot_load) func_guarded[r] = true;
             },
             .guard_builtin => {
                 const r = ins.a;
@@ -1840,11 +1842,14 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 kinds[i] = .none;
             },
             // guard_func (U1, cross-frame): covers the callee-snapshot slot_load
-            // (proven `.func`). Pinned to a prologue identity check (closure type +
-            // recorded `Proto.id`); lowers to nothing in the body, like guard_table.
+            // (proven `.func`) — pinned to a prologue identity check (closure type
+            // + recorded `Proto.id`), lowering to nothing in the body, like
+            // guard_table. OR (doc 43 P2) a `.heap`-kinded hload result (a
+            // function field) — lowered as a per-iteration in-body type +
+            // proto-id check, the dynamic-guard_table precedent.
             .guard_func => {
                 if (ins.a >= i) return false;
-                if (kinds[ins.a] != .func) return false;
+                if (kinds[ins.a] != .func and kinds[ins.a] != .heap) return false;
                 kinds[i] = .none;
             },
             // guard_builtin (the pure-builtin identity guard): covers the callee-snapshot
@@ -2136,7 +2141,12 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                     .int => .int,
                     .float => .float,
                     .boolean => .bool, // payload is canonical 0/1 (Value.boolean) → Kind.bool convention
-                    else => return false, // heap field value → tier-1a
+                    // doc 43 P2: a heap-valued field (function; table in P3). The
+                    // payload is the raw *GcHeader — same `.heap` class as a
+                    // VALUE_LANE heap aload result (transient, GC-safe while no
+                    // body callout may collect — HelperCaps discipline).
+                    .heap => .heap,
+                    else => return false, // string/unknown field value → tier-1a
                 };
             },
             // hstore: overwrite the present cell in place (no grow — the present-key
@@ -2704,6 +2714,12 @@ fn opMayExitInBody(
         // The dynamic (per-iteration) table checks side-exit; the `.ptr` forms
         // are prologue-hoisted / seed-validated and emit nothing in the body.
         .guard_table => isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a),
+        // doc 43 P2: a guard_func on a `.heap`-kinded hload (function field)
+        // side-exits in the body; the `.func` callee-snapshot form is
+        // prologue-hoisted and exit-free. Without this row, carried-home
+        // coalescing could commit a resumable home before the identity check
+        // and a failed method guard would deopt a partial iteration.
+        .guard_func => kinds[ins.a] == .heap,
         // A dynamically-resolved href side-exits on callout miss (cell == 0).
         .href => isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a),
         .guard_hash => isDynTableRoot(kinds, slots, slot_id_of_ref, t.instrs[ins.a].a),
@@ -6270,7 +6286,26 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // slot_load it is the prologue `header.type == string` pin; on a
             // proven-string producer it is statically discharged — both emit
             // nothing here.
-            .slot_load, .guard_int, .guard_float, .guard_lane, .guard_func, .guard_builtin, .guard_grid, .guard_stride, .guard_string => {},
+            .slot_load, .guard_int, .guard_float, .guard_lane, .guard_builtin, .guard_grid, .guard_stride, .guard_string => {},
+            // guard_func: hoisted no-op for the invariant `.func` callee snapshot
+            // (prologue closure/proto-id check). For a `.heap`-kinded operand —
+            // doc 43 P2's function-field hload — emit the per-iteration identity
+            // check inline: GcHeader.type == function, then proto.id == aux (the
+            // recorded stable id; ids survive keyframe restore, pointers do not).
+            // Mirrors the prologue check (`stubEnterable`'s func arm) and the
+            // dynamic guard_table below. Base resolves through scratch rcx so rax
+            // stays free for the proto pointer.
+            .guard_func => {
+                if (kinds[ins.a] == .heap) {
+                    const freg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    try a.cmpByteMemImm(freg, HEADER_TYPE_OFF, FUNCTION_TYPE);
+                    try jccNativeExit(a, exit_labels, i, .ne); // not a closure → side-exit
+                    try a.movRegMem(.rax, freg, CLOSURE_PROTO_OFF);
+                    try a.cmpDwordMemImm(.rax, PROTO_ID_OFF, @bitCast(ins.aux));
+                    try jccNativeExit(a, exit_labels, i, .ne); // different proto → side-exit
+                }
+                // else: `.func` → prologue-hoisted, no-op
+            },
             // guard_table: hoisted no-op for invariant `.ptr` operands (prologue
             // checks). For per-iteration roots — a `.heap`-kind VALUE_LANE aload
             // result, or a carried-heap slot whose home the back-edge φ shuffle
@@ -6528,6 +6563,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 const want_tag: u8 = switch (kinds[i]) {
                     .float => TAG_FLOAT,
                     .bool => TAG_BOOL,
+                    .heap => TAG_HEAP, // doc 43 P2: function/table field — payload is the *GcHeader
                     else => TAG_INT,
                 };
                 try a.cmpByteMemImm(creg, VALUE_TAG_OFF, want_tag);
@@ -6542,9 +6578,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         .reg => unreachable, // a float never homes in a GP register
                     }
                 } else {
-                    // int OR bool: raw 8-byte payload load. A bool cell's payload is
-                    // the canonical full-width 0/1 (`Value.boolean` defines all 8
-                    // bytes), so this lands exactly the Kind.bool 0/1 GP convention.
+                    // int, bool, OR heap: raw 8-byte payload load. A bool cell's
+                    // payload is the canonical full-width 0/1 (`Value.boolean`
+                    // defines all 8 bytes); a heap cell's is the raw *GcHeader —
+                    // both land their Kind's GP convention exactly.
                     try a.movRegMem(.rax, creg, VALUE_PAYLOAD_OFF);
                     try regToPlace(a, placeOfRef(alloc, i), .rax);
                 }

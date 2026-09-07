@@ -515,7 +515,12 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                         // recorder emits no consumer guard for it, so this fused
                         // tag exit is what keeps a bool→heap drift off-trace.
                         .boolean => fv.isBool(),
-                        else => false, // only int/float/bool fields are recorded
+                        // doc 43 P2: a heap-valued field (function today, table in
+                        // P3). "Some heap value" only — the identity/type pin is
+                        // the guard the recorder emits right after the load
+                        // (`guard_func` proto-id / P3 `guard_table`).
+                        .heap => fv.isHeap(),
+                        else => false, // int/float/bool/heap fields are recorded
                     };
                     if (!type_ok) {
                         if (record) rec.exit(i, .guard, values[hr.a]);

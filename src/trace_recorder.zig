@@ -1896,19 +1896,29 @@ pub const RecordingSession = struct {
         const cell = tbl.fieldPtr(vkey) orelse return self.abort(.bad_type); // absent
         // Field-type restriction (the hash analogue of the narrow-array-lane rule).
         // A present cell holds a non-`nil` tagged `Value` of any type. We trace
-        // **int/float/bool** fields. The historic objection to bool — "there is no
-        // strict bool guard; `guard_true` waves a truthy heap value through" — is
-        // answered LuaJIT-style (doc 43 P1): the **load's own tag check** is the
-        // strict guard. `hload ty=.boolean` tag-checks the cell in BOTH tiers
-        // (tier-1a `type_ok`, native `cmp byte [cell], TAG_BOOL`) and side-exits
-        // at the load, before any consumer, so a field drifting bool→heap never
-        // flows on-trace. (The old "the scalar exec-log encoder can't take it"
-        // half of the objection was already dead — doc 32: the log silently drops
-        // unencodables, is viz-only, mutually exclusive with native, and
-        // `effectser.toEffectResult` encodes bools anyway.) Heap-valued fields
-        // (function/table/string) remain the P2/P3 arc; they abort to tier-0.
+        // **int/float/bool/function** fields. The historic objection to bool —
+        // "there is no strict bool guard; `guard_true` waves a truthy heap value
+        // through" — is answered LuaJIT-style (doc 43 P1): the **load's own tag
+        // check** is the strict guard. `hload ty=.boolean` tag-checks the cell in
+        // BOTH tiers (tier-1a `type_ok`, native `cmp byte [cell], TAG_BOOL`) and
+        // side-exits at the load, before any consumer, so a field drifting
+        // bool→heap never flows on-trace. (The old "the scalar exec-log encoder
+        // can't take it" half of the objection was already dead — doc 32: the log
+        // silently drops unencodables, is viz-only, mutually exclusive with
+        // native, and `effectser.toEffectResult` encodes bools anyway.)
+        // A FUNCTION field (doc 43 P2 — `local m = self.method` / `obj:method()`
+        // dispatch) records as `hload ty=.heap` + an immediate `guard_func`
+        // pinning the closure's `Proto.id` (doc 02: a stable id, never a pointer
+        // — survives keyframe restore). Proto-id identity — not closure identity
+        // — is sound because an inlined callee's upvalue read requires a
+        // `slot_load` callee ref (`recCalleeUpval`) and an `hload` ref is not
+        // one: it aborts `.cross_frame` fail-closed. HARD INVARIANT (doc 43 §5):
+        // any future path letting an hload-loaded callee reach upvalue access
+        // must first tighten `guard_func` to closure `GcHeader.id`.
+        // Table fields are P3; string/native-builtin fields still abort.
         const fv = cell.*;
-        if (!(fv.isInt() or fv.isFloat() or fv.isBool())) return self.abort(.nyi_opcode);
+        const is_fn_field = fv.isHeap() and fv.heapType() == .function;
+        if (!(fv.isInt() or fv.isFloat() or fv.isBool() or is_fn_field)) return self.abort(.nyi_opcode);
         // The key must be a recorded `konst` (the bytecode literal interned via
         // `load_const`), so its ref is provably the constant — no runtime key-
         // identity guard is needed and the cell is pinnable. A computed key reaches
@@ -1950,7 +1960,17 @@ pub const RecordingSession = struct {
         // both tiers side-exit at the load itself on a tag flip, so the ref is
         // bool-proven for every consumer (`guard_true`/`guard_false`, or a P1
         // bool `hstore` requiring a `.ty == .boolean` producer).
-        if (!fv.isBool()) try self.guardNum(rload, fv, .field_type, .loaded);
+        // A FUNCTION field (P2) instead pins IDENTITY: `guard_func(rload,
+        // aux=Proto.id)` right at the load. The `hload ty=.heap` tag exit proves
+        // "some heap value"; guard_func proves "a closure of exactly this proto".
+        // `recCall` re-emits the same guard on this ref at the call site and
+        // tropt's aux-keyed guard CSE (`guardKeyAux`) folds the duplicate.
+        if (is_fn_field) {
+            const cl = function.Closure.fromHeader(fv.asHeap());
+            self.stampProv(try self.emit(.{ .op = .guard_func, .a = rload, .aux = @bitCast(cl.proto.id) }), .callee_identity, .loaded, .neutral);
+        } else if (!fv.isBool()) {
+            try self.guardNum(rload, fv, .field_type, .loaded);
+        }
     }
 
     /// Record `t.field = v` (`set_index`, `a=table b=key c=value`, key an interned

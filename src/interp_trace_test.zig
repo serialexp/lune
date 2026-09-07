@@ -3261,6 +3261,130 @@ test "recorder (hash field, P1): a comparison-result store (t.b = i < k) records
     try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
 }
 
+test "recorder (hash field, P2): a function field records hload ty=.heap + guard_func on the load" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local function getx(p) return p.x end
+        \\local obj = { x = 3, getx = getx }
+        \\local s = 0
+        \\for i = 1, 50 do s = s + obj.getx(obj) end
+        \\print(s)
+    , true);
+    defer chunk.deinit();
+
+    // Doc 43 P2: the function field loads as `hload ty=.heap` and is pinned by
+    // `guard_func(rload, aux=Proto.id)` right at the load; `recCall` re-emits
+    // the same guard at the call site. This harness records UNOPTIMIZED IR, so
+    // both appear here (identical (op, a, aux) — tropt's aux-keyed CSE folds
+    // them to one on the optimized/native path, verified by the e2e legs). The
+    // callee body then inlines (its `p.x` hload appears in the same trace).
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
+    var heap_hload_ref: ?usize = null;
+    var n_hload: usize = 0;
+    for (t.code.instrs, 0..) |ins, i| {
+        if (ins.op == .hload) {
+            n_hload += 1;
+            if (ins.ty == .heap) heap_hload_ref = i;
+        }
+    }
+    try testing.expect(heap_hload_ref != null);
+    try testing.expect(n_hload >= 2); // the function field AND the inlined body's p.x
+    var n_guard_func_on_load: usize = 0;
+    for (t.code.instrs) |ins| {
+        if (ins.op == .guard_func and ins.a == @as(trace.Ref, @intCast(heap_hload_ref.?)))
+            n_guard_func_on_load += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), n_guard_func_on_load);
+}
+
+test "recorder (hash field, P2): an hload-loaded callee reading its OWN UPVALUE aborts (hard invariant)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // Doc 43 §5 HARD INVARIANT: guard_func pins the PROTO id, not closure
+    // identity — sound ONLY because an inlined callee's upvalue read requires a
+    // `slot_load` callee ref (`recCalleeUpval`) and an `hload` ref is not one.
+    // Two closures over one proto with different cells would otherwise alias
+    // under the instance-blind guard (a P0-class miscompile). This test pins
+    // the abort; if it ever starts tracing, guard_func must FIRST tighten to
+    // closure `GcHeader.id`.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local function mk(n)
+        \\  return function() return n end
+        \\end
+        \\local obj = { g = mk(10) }
+        \\local s = 0
+        \\for i = 1, 50 do s = s + obj.g() end
+        \\print(s)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.record_gate.count() >= 1);
+    try testing.expect(!vm.trace.isRecording());
+}
+
+test "hash field P2 end-to-end: function-field call inlines; all ten legs" {
+    try expectProgram(
+        \\local function getx(p) return p.x end
+        \\local obj = { x = 3, getx = getx }
+        \\local s = 0
+        \\for i = 1, 200 do s = s + obj.getx(obj) end
+        \\print(s)
+    , "600\n");
+}
+
+test "hash field P2 end-to-end: colon method with float self-field RMW; all ten legs" {
+    // The real OOP shape (nbody-like): `o:advance(dt)` loads the method field,
+    // inlines the body, and the body does a float hash-field RMW through self.
+    // Float accumulation must stay byte-identical on every leg.
+    try expectProgram(
+        \\local obj = { x = 0.0, vx = 1.5 }
+        \\function obj.advance(self, dt) self.x = self.x + dt * self.vx end
+        \\local o = obj
+        \\for i = 1, 200 do o:advance(0.01) end
+        \\print(o.x)
+    , "3.0000000000000027\n");
+}
+
+test "hash field P2 end-to-end: mid-loop method swap (different proto) side-exits exactly" {
+    try expectProgram(
+        \\local function m1(p) return 1 end
+        \\local function m2(p) return 1000 end
+        \\local obj = { m = m1 }
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  if i == 100 then obj.m = m2 end
+        \\  s = s + obj.m(obj)
+        \\end
+        \\print(s)
+    , "101099\n");
+}
+
+test "hash field P2 end-to-end: closure swap SAME proto different cells stays exact (invariant shape)" {
+    // The alias shape the hard invariant defends: obj.g flips between two
+    // closures of ONE proto with different upvalue cells. Recording aborts
+    // (`.cross_frame` at the callee's get_upval), so every tier runs tier-0
+    // semantics — and must agree.
+    try expectProgram(
+        \\local function mk(n)
+        \\  return function() return n end
+        \\end
+        \\local f10 = mk(10)
+        \\local f99 = mk(99)
+        \\local obj = { g = f10 }
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  if i == 100 then obj.g = f99 end
+        \\  s = s + obj.g()
+        \\end
+        \\print(s)
+    , "10989\n");
+}
+
 test "hash field P1 end-to-end: bool field branch + konst store + proven copy, all ten legs" {
     // The full P1 shape from one loop: hload ty=.boolean feeding guard_true,
     // a comparison-result store, and a bool-proven cross-table copy. Byte-

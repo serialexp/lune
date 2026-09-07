@@ -1,9 +1,10 @@
 # 43 — heap-valued fields, assert, and upvalue stores (tracing the OOP + closure-iterator idioms)
 
-Status: **PARTIAL — P0 (all four: P0a/P0b/P0c/P0d) and P1 (bool hash fields)
-landed 2026-09-07; P2–P5 outstanding. Two review rounds folded in (codex +
-technical-architect; ledger at bottom). The adversarial sweep (a01–a20) is
-permanent in `trace_p0_alias_test.zig`, green on all ten legs.**
+Status: **PARTIAL — P0 (all four), P1 (bool hash fields), and P2 (function
+hash fields → method inlining) landed 2026-09-07; P3–P5 outstanding. Two
+review rounds folded in (codex + technical-architect; ledger at bottom). The
+adversarial sweep (a01–a20) is permanent in `trace_p0_alias_test.zig`, green
+on all ten legs.**
 Owner: Bart
 Last updated: 2026-09-07
 
@@ -65,11 +66,26 @@ to Done once everything inside a phase is checked.
       no bench movement expected until P2–P4 join (array3d's bool reads sit
       inside `array_set`, blocked on assert/method inlining).
 
+- [x] **Phase 2 — function-valued hash fields → method-call inlining.** Landed
+      2026-09-07 per §5: `hashGetShape` admits function fields → `hload
+      ty=.heap` + immediate `guard_func(rload, aux=Proto.id)`; `recCall`'s
+      duplicate folds under tropt's aux-keyed CSE. Tier-1a `type_ok` gains
+      `.heap => fv.isHeap()`. Native, all four named pieces: Pass A accepts a
+      non-slot_load guard_func operand; Pass B admits `.heap`-kinded operands;
+      body lowering emits the per-iteration `GcHeader.type == function` +
+      `proto.id == aux` check (dynamic-guard_table precedent, base via scratch
+      rcx); `opMayExitInBody` gains `guard_func => kinds[a] == .heap`. Plus
+      `hload .heap` (TAG_HEAP arm, raw *GcHeader payload) in proveKinds +
+      lowering — which is also P3's plumbing. HARD INVARIANT verified live and
+      pinned by test: an hload-loaded callee's upvalue read aborts
+      `.cross_frame` (`recCalleeUpval` slot_load gate), so same-proto/
+      different-cell closure swaps stay exact (adversarial e2e test). Two
+      recorder tests + four ten-leg e2e tests (function-field call, colon
+      float-RMW method, proto-swap exit, same-proto cell-swap). Gates green;
+      nbody/lua54/array3d cross=ok.
+
 ### Outstanding
 
-- [ ] **Phase 2 — function-valued hash fields → method-call inlining.**
-      `hload ty=.heap` + body `guard_func`; native checklist: proveKinds
-      Pass A + Pass B, body lowering, **and `opMayExitInBody`**.
 - [ ] **Phase 3 — table-valued hash fields.** `hload ty=.heap` + `guard_table`
       → dynamic-root `href`/`aref` chain (mirror of the `.value`-lane heap
       `aload`).
