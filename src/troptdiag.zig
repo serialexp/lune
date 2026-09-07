@@ -193,7 +193,9 @@ fn detectDeadCarries(
             // so like `.loop`/`.preheader` it contributes no uses. `guard_gc`
             // (doc 24) is likewise operand-free (`aux` = the bound A).
             // Doc 43 P5: `uref` reads no operands (its seed slot rides `aux`).
-            .slot_load, .konst, .loop, .preheader, .link, .guard_gc, .uref => {},
+            // `.terminal` (doc 44) likewise: `a` is a kind tag, `aux` a resume
+            // pc — no operand refs.
+            .slot_load, .konst, .loop, .preheader, .link, .guard_gc, .uref, .terminal => {},
         }
     }
 
@@ -317,7 +319,7 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
             // `.link` (doc 15) consumes no refs (`aux` is the inner anchor pc).
             // `guard_gc` (doc 24) is operand-free: `a` unused, `aux` = bound A.
             // `uref` (doc 43 P5) likewise reads nothing (`aux` = seed slot).
-            .slot_load, .konst, .loop, .preheader, .link, .guard_gc, .uref => false,
+            .slot_load, .konst, .loop, .preheader, .link, .guard_gc, .uref, .terminal => false,
         };
         if (consumes) {
             found_consumer = true;

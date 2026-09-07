@@ -164,6 +164,11 @@ fn kindOf(op: IrOp) OpKind {
         // the `.loop` terminal kind: structurally identical (sole terminal, last op,
         // no value), so any terminal-leave-alone logic does the right thing.
         .link => .loop,
+        // `.terminal` (doc 44): the one-shot head-trace close. Same terminal
+        // class as `.link` — sole terminal, last op, no value, `a`/`aux` are
+        // a kind tag + resume pc (not refs) — so terminal-leave-alone logic
+        // is inherited.
+        .terminal => .loop,
         // Loop-carried value: a root (the carry); canonical to itself (never
         // folded/CSE'd). Keeps both operands live; `b` is a forward (back-edge)
         // ref, remapped by a fixup after compaction.

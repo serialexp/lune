@@ -5,7 +5,14 @@
 // cross-language decode test can assert on it directly.
 
 import type { TraceFileOutput, TraceOutput, ConstValueOutput } from "./gen/generated";
-import { irOpName, obsTypeName, NO_OPERAND_OPS, UNARY_OR_GUARD_OPS, TERNARY_AUX_OPS } from "./enums";
+import {
+  irOpName,
+  obsTypeName,
+  NO_OPERAND_OPS,
+  UNARY_OR_GUARD_OPS,
+  TERNARY_AUX_OPS,
+  TERMINAL_KIND_NAMES,
+} from "./enums";
 
 /** The decoded `ConstValue.body` `{ type, value }` envelope, straight from the
  * generated decoder — a discriminated union keyed on `type`. */
@@ -50,6 +57,8 @@ function operandsOf(opName: string, a: number, b: number, aux: number): string {
   if (opName === "slot_load") return `r${aux}`;
   // Doc 43 P5: uref prints its seed slot like slot_load (`writeIrInstr` parity).
   if (opName === "uref") return `r${aux}`;
+  // Doc 44: terminal prints its kind tag + resume pc (`writeIrInstr` parity).
+  if (opName === "terminal") return `${TERMINAL_KIND_NAMES[a] ?? `kind:${a}`} @ ${aux}`;
   if (opName === "konst") return `k${aux}`;
   // φ: slot-bound prints `update=%b -> r{slot}`; internal prints
   // `init=%a update=%b -> internal` (the loop-carried writeback rides the stream).

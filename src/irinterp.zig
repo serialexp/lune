@@ -1205,6 +1205,19 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     flushPhiWriteback(t, regs, values);
                     break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
+
+                // ---- terminal: one-shot close of a HEAD trace (doc 44 P0) ----
+                // A head trace's register writebacks ride slot-bound φ rows
+                // (internal φs are forbidden by finalize for kind-.head), so
+                // the shared flush materializes the full terminal register
+                // state; the caller sees `instrs[exit_instr].op == .terminal`
+                // and resumes tier-0 at `terminal.aux` (the unexecuted ret /
+                // self-call) — NOT at the anchor, and with no strike
+                // accounting (this is a successful completion, not a deopt).
+                .terminal => {
+                    flushPhiWriteback(t, regs, values);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
             }
         }
         // A well-formed trace always terminates in `loop` (checked by the

@@ -244,8 +244,9 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
     std.debug.assert(instrs.len >= 1);
     const last = instrs.len - 1;
     // The trace terminates in exactly one terminal: `.loop` (root/continuation
-    // back-edge) or `.link` (continuation hand-off to an inner root, doc 15).
-    std.debug.assert(instrs[last].op == .loop or instrs[last].op == .link);
+    // back-edge), `.link` (continuation hand-off to an inner root, doc 15), or
+    // `.terminal` (one-shot close of a head-anchored trace, doc 44).
+    std.debug.assert(instrs[last].op == .loop or instrs[last].op == .link or instrs[last].op == .terminal);
     for (instrs, 0..) |ins, i| {
         switch (ins.op) {
             .slot_load => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < input_limit),
@@ -262,6 +263,10 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
             // it is the sole terminal; `aux` is the inner anchor pc, not an
             // operand ref, so nothing to bound-check beyond terminality.
             .link => std.debug.assert(i == last),
+            // `.terminal` (doc 44): the one-shot head-trace close. Sole
+            // terminal; `a` is a TerminalKind tag and `aux` the resume pc —
+            // neither is an operand ref.
+            .terminal => std.debug.assert(i == last),
             // binary ops read both `a` and `b`.
             .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .sar, .eq, .ne, .lt, .le => {
                 std.debug.assert(ins.a < i and ins.b < i);

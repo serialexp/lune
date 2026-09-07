@@ -105,9 +105,17 @@ export const IR_OP_NAMES = [
   "uref", // 83  closed-upvalue-cell pointer from entry-seeded slab slot aux (doc 43 P5)
   "uload", // 84  typed load through a uref cell — a=uref, fused tag exit per ty
   "ustore", // 85  in-place scalar store through a uref cell — a=uref, b=value
+  "terminal", // 86  one-shot head-trace close (doc 44) — a=TerminalKind, aux=resume pc
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
+
+/** TerminalKind (doc 44), indexed by wire ordinal — rides `terminal.a`
+ * (mirrors trace_ir.TerminalKind). */
+export const TERMINAL_KIND_NAMES = [
+  "return_interp", // 0  trace ends at a depth-0 ret; tier-0 performs it
+  "self_call_interp", // 1  trace ends at a depth-0 self-call; tier-0 performs it
+] as const;
 
 /** Observed/result types, indexed by wire ordinal (mirrors trace.ObsType, 0..5). */
 export const OBS_TYPE_NAMES = [

@@ -644,6 +644,39 @@ pub const IrOp = enum(u8) {
     /// below every guard when the trace has a prior heap load). Effectful;
     /// never DCE'd. Classified `.astore`. Wire ordinal 85.
     ustore,
+
+    // ---- one-shot trace terminator (doc 44 P0) --------------------------------
+
+    /// Terminator of a HEAD-anchored (function-entry) trace — the one-shot
+    /// shape: the trace covers the body up to (never including) a depth-0
+    /// `ret` or a depth-0 direct self-`call`, then hands back to tier-0,
+    /// which resumes AT that instruction and executes it exactly once.
+    /// `a` = `TerminalKind` ordinal (`trace_code.TerminalKind`:
+    /// return_interp / self_call_interp); `aux` = the real resume bytecode
+    /// pc. No operands; like `.loop`/`.link` it must be the last
+    /// instruction, and only kind-`.head` traces may carry it
+    /// (`assertWellFormed`). A SUCCESSFUL terminal exit is NOT a side
+    /// exit: it publishes end-of-trace state (sunk stores flushed exactly
+    /// once — the terminator never ran in-trace, so C1 idempotence holds)
+    /// and bypasses guard-hotness/side-trace/chaining accounting entirely
+    /// (doc 44 D5). Guard FAILURES in a head trace deopt to the
+    /// function-entry snapshot at pc 0, never to the terminal. Wire
+    /// ordinal 86.
+    terminal,
+};
+
+/// Doc 44: what a `.terminal` hands back to tier-0 (rides `terminal.a`).
+/// The `_interp` suffix is deliberate — P0's staged model has tier-0 execute
+/// the terminating instruction; Phase 4's native frame push will add
+/// native-resuming kinds alongside, not replace these.
+pub const TerminalKind = enum(u16) {
+    /// The trace ends at a depth-0 `ret`: tier-0 resumes at the ret pc
+    /// (terminal.aux) and performs the actual return.
+    return_interp = 0,
+    /// The trace ends at a depth-0 direct self-`call` (the up-recursion
+    /// analogue, staged): tier-0 performs the call; the callee's patched
+    /// head re-enters the trace.
+    self_call_interp = 1,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
@@ -777,6 +810,8 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .loop, .preheader => {},
         // `.link` (doc 15): terminal hand-off; `aux` is the inner root's anchor pc.
         .link => try w.print("-> {d}", .{ins.aux}),
+        // `.terminal` (doc 44): one-shot close; kind tag + resume pc.
+        .terminal => try w.print("{s} @ {d}", .{ @tagName(@as(TerminalKind, @enumFromInt(ins.a))), ins.aux }),
         // φ: a slot-bound φ prints `update=%b → r{slot}` (init is implicit
         // `regs[slot]`); an internal φ prints `init=%a update=%b → internal`.
         // Doc 39: a peeled trace's slot-bound φ may carry `a` = the slot's
