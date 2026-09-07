@@ -13,6 +13,7 @@ const string_stdlib = @import("stdlib/string.zig");
 const table_mod = @import("table.zig");
 const arith = @import("arith.zig");
 const gc = @import("gc.zig");
+const object = @import("object.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
@@ -92,6 +93,19 @@ pub const AbortReason = enum {
     /// body pass (a path iteration 1 didn't take). Ordinary strike semantics:
     /// such a shape was uncompilable before the peel existed and stays so.
     type_instability,
+    /// Doc 43 §3.1 (P0a): an inlined callee (or anchor-frame) `get_upval` read
+    /// an upvalue whose cell is **open over a register the trace can write** —
+    /// the cell's `loc.open` slab index falls at or above the anchor frame's
+    /// absolute base, i.e. inside the anchor window or an inlined-callee window,
+    /// every one of which the trace's φ writeback / body writes mutate. The
+    /// per-entry input snapshot (`InputKind.upvalue` / `.callee_upvalue`) is a
+    /// COPY, so an on-trace write to that slot leaves the snapshot stale for the
+    /// rest of the episode and tier-1a reads the entry value forever (confirmed
+    /// miscompile, repro `a01_callee_upval_open.lua`). Fail closed: a closed
+    /// cell (or one open over a frame *below* the anchor base — an outer scope
+    /// the trace never writes, the common `local cfg` idiom) is unaffected and
+    /// keeps recording.
+    aliased_input,
     /// An error unwound through the dispatch loop while this recording was
     /// active (doc 26 D1a). The raise itself is not part of the recorded IR, so
     /// letting the recording survive the unwind would stitch post-catch
@@ -333,7 +347,15 @@ pub const TraceKind = enum { root, side, continuation };
 
 pub const RecordingSession = struct {
     pub const Options = struct { maxrecord: usize = 4096, peel: bool = true, optimize: bool = true };
-    pub const InstructionContext = struct { heap: ?*const gc.Heap = null, inner_root: bool = false, unroll_while: bool = false };
+    /// `upval_open`: for a `get_upval` whose resolved cell is OPEN, its `loc.open`
+    /// absolute slab index; null for `get_global`, a closed cell, or any other
+    /// op. Supplied per-instruction by the dispatch loop (doc 43 §3.1, P0a) so
+    /// `recInputGet` can reject a snapshot that aliases the trace-writable window.
+    /// `globals_header`: the VM globals table's `GcHeader` address (doc 43 §3.2,
+    /// P0b), so `hashSetShape`/`arraySetShape` can recognise a recorded store into
+    /// `_G` and fail closed when the trace also snapshots a `get_global`. Stable
+    /// per VM; supplied per-instruction alongside `heap`.
+    pub const InstructionContext = struct { heap: ?*const gc.Heap = null, inner_root: bool = false, unroll_while: bool = false, upval_open: ?usize = null, globals_header: ?*const object.GcHeader = null };
     pub const AbortNotice = struct { reason: AbortReason, anchor: AnchorKey, kind: TraceKind, unrolled_while: bool, pc: u32, op: OpCode, ir_len: u32 };
     pub const PeelNotice = union(enum) { enter: struct { anchor_pc: u32, marker: usize }, close: struct { anchor_pc: u32, begin: usize, end: usize } };
     pub fn takePeelNotice(self: *RecordingSession) ?PeelNotice {
@@ -509,6 +531,28 @@ pub const RecordingSession = struct {
     /// writeback to it (S2): callee slots are pure internal SSA temporaries, dead
     /// at the loop boundary, never loop-carried.
     anchor_num_registers: u16 = 0,
+    /// Doc 43 §3.1 (P0a): the anchor frame's ABSOLUTE slab base index at record
+    /// time, captured when the recording is armed (`arm` ← the back-edge's
+    /// `st.base`). The trace's writable region is `[anchor_abs_base, …)` — the
+    /// anchor window plus every inlined-callee window above it. An open upvalue
+    /// cell whose `loc.open` falls in that region aliases a register the trace
+    /// writes, so its per-entry snapshot would go stale (`aliased_input` abort).
+    /// The absolute base differs per episode (a loop entered at varying call
+    /// depth), but the aliasing *relationship* it decides is lexically invariant,
+    /// so a record-time verdict generalises. Record-time only; never serialised.
+    anchor_abs_base: usize = 0,
+    /// Doc 43 §3.2 (P0b): the `_G` snapshot-vs-store coherence flags. A
+    /// `get_global` snapshots the globals cell once per entry; a recorded
+    /// `hstore`/`astore` into the globals table (reached via a `_G` handle)
+    /// mutates that same cell every iteration, staling the snapshot (confirmed
+    /// tier-1a AND native miscompile, repro `a02_global_hstore.lua`). Recording
+    /// is linear, so either order is caught by remembering both: a global seed
+    /// aborts if a globals store was already recorded, and vice-versa. Coarse by
+    /// design (any store to the globals table vs any global seed) — a key-level
+    /// refinement (only abort on a colliding name) is a documented follow-up
+    /// (doc 43 open Q4). Reset per recording.
+    recorded_global_seed: bool = false,
+    recorded_global_store: bool = false,
     /// Absolute slot offset of the frame currently being recorded, relative to the
     /// anchor frame's base. 0 for the anchor frame; `caller_base_off +
     /// caller_proto.num_registers` for an inlined callee. `refOf`/`setReg` add it
@@ -1470,6 +1514,7 @@ pub const RecordingSession = struct {
         const vkey = regs.get(f.key);
         const vval = regs.get(f.val);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
+        if (self.globalsStoreBars(vtab)) return self.abort(.aliased_input); // doc 43 P0b
         const idx = keyIndexOf(vkey) orelse return self.abort(.bad_type);
         if (vval.isNil()) return self.abort(.bad_type); // hole-punch — out of scope
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
@@ -1517,6 +1562,9 @@ pub const RecordingSession = struct {
             const rval = try self.refOf(f.val);
             const lane_ord: i32 = @intFromEnum(lane);
             const rtab = try self.refOf(f.tab);
+            // P0d: `t[#t+1] = v` (length-dependent append) is non-idempotent under
+            // coarse deopt-replay — bar it fail-closed. See `traceHasAlenOf`.
+            if (self.traceHasAlenOf(rtab)) return self.abort(.aliased_input);
             self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
             self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, f.tab_od, .neutral);
             const rkey = try self.keyRefNarrowed(f.key, f.key_od, vkey);
@@ -1738,6 +1786,23 @@ pub const RecordingSession = struct {
         return false;
     }
 
+    /// Has this trace already read `#t` (an `.alen`) of the SAME table `rtab`?
+    /// The push idiom `t[#t+1] = v` reads the table's own length to form the
+    /// append index, then appends — growing that very length. Under coarse C1
+    /// deopt-replay a loop-done side-exit re-runs the final body iteration, and
+    /// the re-run observes the now-longer `#t`, so the append double-applies at
+    /// `asize+1` (doc 43 P0d: a16/a20 diverged, t0=N vs trace=N+1). A loop-var-
+    /// indexed append (`t[i]=v`, nsieve) never reads `#t` and is idempotent, so
+    /// it stays traced. Fail-closed: any `alen(rtab)` in the trace bars the
+    /// append. Correct native tracing of the push idiom is a perf follow-up
+    /// (needs a loop-done snapshot that pins the pre-append length).
+    fn traceHasAlenOf(self: *const RecordingSession, rtab: Ref) bool {
+        for (self.instrs.items) |ins| {
+            if (ins.op == .alen and ins.a == rtab) return true;
+        }
+        return false;
+    }
+
     /// Is `v` a heap **string** — i.e. an `obj.field`-shaped (hash-part) table key?
     /// The compiler lowers every `obj.field` to `get_index`/`set_index` with an
     /// interned-string key, so this is the gate that routes such accesses to the
@@ -1896,11 +1961,25 @@ pub const RecordingSession = struct {
         return self.hashSetShape(regs, .{ .tab = instr.a, .key = instr.b, .val = instr.c, .tab_od = .a, .key_od = .b, .val_od = .c });
     }
 
+    /// Doc 43 §3.2 (P0b): record that a store targets `vtab`; if that is the
+    /// globals table, enforce the `_G` snapshot-vs-store coherence. Returns true
+    /// when the caller must abort `.aliased_input` (a `get_global` snapshot is
+    /// already live). On a non-conflicting globals store it latches the flag so a
+    /// *later* `get_global` seed aborts. Non-globals stores are ignored.
+    fn globalsStoreBars(self: *RecordingSession, vtab: Value) bool {
+        const gh = self.context.globals_header orelse return false;
+        if (!vtab.isHeap() or vtab.asHeap() != gh) return false;
+        if (self.recorded_global_seed) return true;
+        self.recorded_global_store = true;
+        return false;
+    }
+
     pub fn hashSetShape(self: *RecordingSession, regs: RegWindow, f: SetFrame) !void {
         const vtab = regs.get(f.tab);
         const vkey = regs.get(f.key);
         const vval = regs.get(f.val);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
+        if (self.globalsStoreBars(vtab)) return self.abort(.aliased_input);
         if (vval.isNil()) return self.abort(.bad_type); // delete — out of scope
         // Scalar-value restriction, the store mirror of `recHashGet`'s read rule: the
         // exec-log encoder is scalar-only, so the stored value (logged by its
@@ -3659,6 +3738,29 @@ pub const RecordingSession = struct {
     /// ordering is correct by construction. Global reads at inline_depth > 0 still
     /// abort — globals use proto-specific constant pool indices.
     pub fn recInputGet(self: *RecordingSession, comptime kind: InputKind, dest: u16, source: u16, resolved: Value) !void {
+        // Doc 43 §3.1 (P0a): fail closed on an OPEN upvalue cell that aliases the
+        // trace-writable window. The per-entry snapshot is a copy; an on-trace
+        // write to the backing register leaves it stale (confirmed tier-1a
+        // miscompile). `context.upval_open` carries the cell's `loc.open` slab
+        // index (null for globals / closed cells); the trace writes every slot
+        // at or above the anchor base, so an index there is an alias. A cell open
+        // over a frame BELOW the anchor (an outer scope the trace never writes —
+        // the `local cfg; hot loop reads cfg` idiom) is index < base → safe, and
+        // keeps recording. Covers both the anchor-frame and inlined-callee reads
+        // (both route through here before the depth split below).
+        if (kind == .upvalue) {
+            if (self.context.upval_open) |open_idx| {
+                if (open_idx >= self.anchor_abs_base) return self.abort(.aliased_input);
+            }
+        }
+        // Doc 43 §3.2 (P0b): a global snapshot cannot coexist with a recorded
+        // store into the globals table (the store stales the snapshot). If such
+        // a store already landed this recording, fail closed; otherwise remember
+        // the seed so a later globals store aborts symmetrically.
+        if (kind == .global) {
+            if (self.recorded_global_store) return self.abort(.aliased_input);
+            self.recorded_global_seed = true;
+        }
         // Inlined-callee upvalues resolve through the callee's
         // closure. Global reads at depth > 0 still abort: the seed uses the
         // anchor's proto.constants, but the global's constant-pool index refers to
@@ -4048,6 +4150,10 @@ pub const RecordingSession = struct {
         self.pending_stores.clearRetainingCapacity();
         self.alloc_count = 0;
         self.guard_gc_ref = null;
+        self.anchor_abs_base = 0; // doc 43 P0a: arm() seeds the real base after reset
+        self.recorded_global_seed = false; // doc 43 P0b
+        self.recorded_global_store = false;
+
         // Size the register map for the anchor frame **plus** reserved windows for
         // inlined callee frames (cross-frame tracing). The executor only ever
         // touches `[0, anchor_num_registers)`; the tail is scratch the recorder

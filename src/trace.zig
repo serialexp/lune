@@ -47,6 +47,7 @@ const table_mod = @import("table.zig");
 const arr = @import("array.zig");
 const string_mod = @import("string.zig");
 const gc = @import("gc.zig");
+const object = @import("object.zig");
 // Doc 30 c4: the recorder's P2/P3 surface — the SAME pure cores tier-0 and
 // the shims run (census, locate, init resolution), never a re-derivation.
 const string_stdlib = @import("stdlib/string.zig");
@@ -846,6 +847,21 @@ pub const TraceState = struct {
     /// harnesses that build a `TraceState` without a VM; fold arms then abort
     /// `.bad_type` and every other recorder path is unaffected.
     rec_heap: ?*const gc.Heap = null,
+    /// Doc 43 §3.1 (P0a): the dispatch loop's `st.base` at the current back-edge,
+    /// stashed just before `onBackEdge` so `arm` can seed the recorder's
+    /// `anchor_abs_base` (the arm sites live inside `onBackEdge` and don't carry
+    /// the absolute slab index otherwise). Read once at arm; stale between
+    /// back-edges is harmless (only consumed at the arming instant).
+    pending_anchor_base: usize = 0,
+    /// Doc 43 §3.1 (P0a): per-instruction supply of an OPEN `get_upval` cell's
+    /// `loc.open` slab index (null otherwise), the mirror of `rec_heap`'s
+    /// supply-per-call discipline. Copied into the recorder's `InstructionContext`
+    /// by `recordInstr`; consumed by `recInputGet` to reject aliasing snapshots.
+    rec_upval_open: ?usize = null,
+    /// Doc 43 §3.2 (P0b): the VM globals table's `GcHeader` address, so the
+    /// recorder can recognise a store into `_G`. Stable per VM; set by `Vm.initBare`
+    /// (null in bare test harnesses — the globals coherence check then no-ops).
+    rec_globals_header: ?*const object.GcHeader = null,
     /// MUTABLE execution-heap channel (doc 24 D5): the heap the tier-1a
     /// executor's `.alloc` arms and tier-1b's baked callouts/`guard_gc`
     /// allocate against. Unlike `rec_heap` (refreshed defensively per
@@ -2876,7 +2892,7 @@ pub const TraceState = struct {
         self.configureRecording();
         const target_i: i64 = @as(i64, pc) + instr.aux;
         const target: ?u32 = if (instr.op == .for_prep) pc else if (instr.op == .jmp and target_i >= 0 and target_i < proto.code.len) @intCast(target_i) else null;
-        self.rec.context = .{ .heap = self.rec_heap };
+        self.rec.context = .{ .heap = self.rec_heap, .upval_open = self.rec_upval_open, .globals_header = self.rec_globals_header };
         if (target) |dest| {
             self.rec.context.inner_root = self.findLoopTrace(proto, dest) != null;
             const leaves = self.lleave_count.get(.{ .proto = proto, .pc = dest }) orelse 0;
@@ -2890,6 +2906,10 @@ pub const TraceState = struct {
 
     fn arm(self: *TraceState, proto: *const Proto, target_pc: u32) void {
         self.rec.reset(self.gpa, .{ .proto = proto, .pc = target_pc }, proto.num_registers) catch return;
+        // Doc 43 §3.1 (P0a): seed the anchor's absolute slab base for the open-cell
+        // aliasing check. `reset` zeroes it; the dispatch loop stashed `st.base`
+        // in `pending_anchor_base` just before this `onBackEdge` call.
+        self.rec.anchor_abs_base = self.pending_anchor_base;
     }
 
     /// Abandon the in-flight recording: deactivate, remember why, and gate the
@@ -3372,4 +3392,5 @@ test {
     _ = @import("trace_gate_test.zig");
     _ = @import("trace_region_test.zig");
     _ = @import("trace_entrypatch_test.zig");
+    _ = @import("trace_p0_alias_test.zig");
 }

@@ -21,6 +21,46 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-07d — doc 43 P0 (all four) LANDED + gated; arc P1–P5 not started
+
+The array3d-coverage arc (doc 43) began with a correctness pass. An adversarial
+alias sweep (20 shapes, `/tmp/doc43_sweep/`) + two reviews found **four** entry-
+snapshot / store-sinking miscompiles; all now fixed FAIL-CLOSED (abort the unsafe
+recording; correctness > coverage). NONE committed yet — awaiting Bart.
+
+- **P0a — callee-upvalue open aliasing.** `recInputGet` aborts `.aliased_input`
+  when an inlined callee's upvalue is open over a slot at/above the anchor window
+  base. Plumbed `anchor_abs_base`/`upval_open` through trace.zig + interp.zig.
+- **P0b — global-seed staleness.** An `hstore`/`astore`/`rawset` into the globals
+  table after a `.global` seed aborts (`globalsStoreBars`); `rec_globals_header`
+  refreshed at Vm.init AND keyframe restore.
+- **P0d — length-dependent append double-apply.** `t[#t+1]=v` aborts via
+  `traceHasAlenOf(rtab)` in `arraySetShape`'s append branch. nsieve's loop-var
+  append still records `astore_append` (unaffected). Correct push-idiom tracing
+  is a perf follow-up.
+- **P0c — composite bridge vs sunk stores (LATENT, now pinned).** Verified in
+  codegen: an ARMED composite bridge flushes only slot φs then `jmpMem`s to the
+  successor — NO tier-0 replay — so a sunk `astore`/`hstore`/`gstore`/`sgm_setpos`
+  would be LOST. Empirically arms 0 bridges today (store-bearing traces and
+  branch-candidate traces are disjoint), so latent not live. Made explicit:
+  `classifyBridgeCandidate` (trace_code.zig) refuses candidacy when any store op
+  sits below the branch guard. Coverage-neutral (sieve still `bridge=2`).
+
+Permanent corpus: the 20 sweep shapes are now `expectProgram` tests in
+`src/trace_p0_alias_test.zig` (full ten-leg tier matrix, stronger than the shell
+sweep and stronger than the bench-corpus hashgate — which is why they went here,
+not into `bench/`). P0c pinned by §T.9b in `trace_fingerprint_test.zig`.
+
+Gates all green: `just test`, `just hashgate` 84/84 both legs, `zig build wasm`.
+Bench abort sweep: only binary-trees hits `aliased_input` (P0a guard firing
+correctly; binary-trees is 0%-traced by nature — recursion, not loops — so no
+coverage lost; hashgate proves its output byte-identical). array3d coverage
+unchanged (50%, 2.1% native — the P1–P3 target).
+
+Doc 43 checklist: P0a/P0b/P0c/P0d all `[x]`. Outstanding = P1 (bool hash fields),
+P2 (fn hash fields + method inlining), P3 (table hash fields), P4 (assert), P5
+(closed-cell upvalue stores). NOT authorized to implement beyond P0 yet.
+
 ## Status 2026-09-07c — doc 42 arc LANDED: tail-call dispatch conversion complete
 
 The conversion commit is in (one commit: interp.zig conversion + T-6 test +

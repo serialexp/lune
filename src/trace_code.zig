@@ -254,6 +254,27 @@ pub const TraceCode = struct {
             .jmp_if_true, .jmp_if_false => {},
             else => return false,
         }
+        // Doc 43 P0c (fail-closed): an ARMED composite bridge hands off directly to
+        // the successor (`nativegen` edge-4 stub: snapshot φ slots, then `jmpMem`
+        // to `exit_target` — NO tier-0 replay) and its snapshot
+        // (`emitCompositeBridgeSnapshot`) flushes ONLY slot-bound φs. A SUNK heap
+        // store (RMW `astore`/`hstore`/`gstore`, or the deferred gmatch
+        // `sgm_setpos`) is deopt-deferred to the trace tail — below every body
+        // guard — on the promise that any side-exit re-runs the iteration in tier-0
+        // and re-does the store. A bridge exit breaks that promise: it neither
+        // flushes the sunk store nor replays, so the store is LOST. Such stores are
+        // always appended AFTER the body guards (`trace_finalize`), i.e. at an IR
+        // index below this branch guard, so refuse candidacy whenever any store op
+        // sits below `instr_idx`. Today branch-candidate traces and store-bearing
+        // traces are disjoint (the sieve's bridge trace has zero store ops), so
+        // this is coverage-neutral now and pins the invariant as the arc adds new
+        // sunk-store shapes (P1–P3 `hstore`). Ordinary deopt (tier-0 replay) stays
+        // correct for these guards.
+        var si = instr_idx + 1;
+        while (si < self.instrs.len) : (si += 1) switch (self.instrs[si].op) {
+            .astore, .astore_append, .hstore, .gstore, .sgm_setpos => return false,
+            else => {},
+        };
         for (self.instrs) |ins| if (ins.op == .phi and ins.aux != trace_ir.PHI_INTERNAL and ins.b < instr_idx) return true;
         return false;
     }

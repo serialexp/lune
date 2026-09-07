@@ -786,6 +786,9 @@ pub const Vm = struct {
         // The globals table lives on the heap like any other table (id 0), then
         // the base library installs (the `print` native + its interned name).
         vm.globals = try vm.heap.newTable();
+        // Doc 43 §3.2 (P0b): hand the recorder the globals table's header so it can
+        // recognise a store into `_G` and keep it from staling a global snapshot.
+        vm.trace.rec_globals_header = &vm.globals.header;
         try vm.installBaseLib();
         try vm.initMetatableSupport();
         return vm;
@@ -2406,6 +2409,16 @@ pub const Vm = struct {
                 .get_upval => self.upvalGet(st.closure.upvalues[mi.b]),
                 .get_global => self.globals.get(st.proto.constants[mi.b]),
                 else => Value.nil(),
+            };
+            // Doc 43 §3.1 (P0a): supply an OPEN get_upval cell's backing slab
+            // index so the recorder can reject a snapshot that aliases the
+            // trace-writable window. Closed cells and non-upvalue ops → null.
+            self.trace.rec_upval_open = switch (mi.op) {
+                .get_upval => switch (st.closure.upvalues[mi.b].loc) {
+                    .open => |idx| idx,
+                    .closed => null,
+                },
+                else => null,
             };
             // Refresh the recorder's read-only heap channel (doc 23
             // D2) — the same supply-per-call pattern as `resolved`, so
@@ -4519,6 +4532,11 @@ pub const Vm = struct {
         // keep a 0 slot and always take the slow path below, so their
         // behaviour is unchanged.
         if (!self.trace.skipBackEdge(proto, anchor_pc)) {
+            // Doc 43 §3.1 (P0a): hand the recorder this frame's absolute slab base
+            // so a fresh arming can decide open-upvalue aliasing. Any arm inside
+            // `onBackEdge` reads it immediately; a stale value between arms is
+            // never consumed.
+            self.trace.pending_anchor_base = st.base;
             self.trace.onBackEdge(proto, anchor_pc, regs);
 
             // Phase 6 tier-1a entry: if a trace is cached for this loop header

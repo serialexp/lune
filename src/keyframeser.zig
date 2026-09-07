@@ -790,6 +790,10 @@ pub fn restoreSnapshot(
     const gh = idmap.get(kf.globals_id) orelse return error.UnresolvedHeapRef;
     if (gh.type != .table) return error.GlobalsNotATable;
     vm.globals = table.Table.fromHeader(gh);
+    // Doc 43 §3.2 (P0b): restore reseats the globals table at a new address, so
+    // refresh the recorder's globals-header channel to match (a trace recorded
+    // after a restore must compare stores against the live table).
+    vm.trace.rec_globals_header = &vm.globals.header;
 
     if (kf.stack.len > vm.regCapacity()) return error.StackTooLarge;
     for (kf.stack, 0..) |sv, i| vm.regSet(i, try fromSchemaValue(sv, &idmap));

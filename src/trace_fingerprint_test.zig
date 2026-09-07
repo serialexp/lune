@@ -323,6 +323,59 @@ test "§T.9 bridge-candidate memo: bit-identical to the oracle at every index, u
     try testing.expect(!empty.code.isBridgeCandidate(0));
 }
 
+test "§T.9b P0c: a sunk store below a branch guard refuses bridge candidacy" {
+    // doc 43 P0c fail-closed: an armed composite bridge flushes only slot phis
+    // and hands off WITHOUT tier-0 replay, so a deopt-sunk heap store appended
+    // below the branch guard would be lost. `classifyBridgeCandidate` must
+    // refuse candidacy whenever any store op sits below the guard. Reuse the
+    // §T.9 shape (branch guard at index 3, phi update dominating it) and splice
+    // an `astore` between the guard and the phi — the ONLY change from the
+    // known-candidate trace — and assert candidacy flips true → false.
+    const gpa = testing.allocator;
+    var code: [30]Instr = undefined;
+    @memset(code[0..], Instr.op0(.halt));
+    code[13] = Instr.opAx(.jmp_if_true, 0, 0);
+    code[19] = Instr.opAx(.for_loop, 0, 2);
+    const proto = Proto{ .id = 42, .code = &code, .name = "p0c", .num_registers = 1 };
+    const guard_prov: ExitProvenance = .{ .guard = .{
+        .source_proto_id = proto.id,
+        .source_pc = 13,
+        .role = .branch_cond,
+        .operand = .a,
+        .polarity = .taken,
+    } };
+    var cont_prov = [_]ExitProvEntry{.{ .index = 3, .prov = guard_prov }};
+    // Same as §T.9 (candidate at 3) + an `astore` at index 4, below the guard.
+    var cont_instrs = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .add, .a = 0, .b = 1, .ty = .int },
+        .{ .op = .guard_true, .a = 0, .aux = 14 },
+        .{ .op = .astore, .a = 2, .b = 1 }, // sunk store below the branch guard
+        .{ .op = .phi, .b = 2, .aux = 0 },
+        .{ .op = .link, .aux = 7 },
+    };
+    var cont: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 29 },
+            .instrs = &cont_instrs,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &cont_prov,
+        },
+        .id = 903,
+    };
+    // Without the store this index IS a candidate (§T.9 asserts it); the store
+    // below the guard must now refuse it, and the memo must agree.
+    try testing.expect(!cont.code.isBridgeCandidate(3));
+    buildBridgeCandMemo(gpa, &cont.code);
+    defer if (cont.code.bridge_cand.len != 0) gpa.free(cont.code.bridge_cand);
+    try testing.expect(!cont.code.isBridgeCandidate(3));
+    for (0..cont_instrs.len + 2) |i|
+        try testing.expectEqual(nativegen.isCompositeBridgeCandidate(&cont.code, i), cont.code.isBridgeCandidate(i));
+}
+
 test "pathFromFrames: f(a);f(b) at distinct call sites give distinct inline paths (A-i.2)" {
     // Same callee proto inlined at two different `.call` PCs must yield distinct
     // provenance — the collision H-1a fixes. `pathFromFrames` distinguishes them by

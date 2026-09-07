@@ -1,10 +1,9 @@
 # 43 — heap-valued fields, assert, and upvalue stores (tracing the OOP + closure-iterator idioms)
 
-Status: **DRAFT v2 — two review rounds folded in (codex + technical-architect;
-ledger at bottom). v1's P0 was materially incomplete: review found a SECOND
-confirmed live miscompile (global-seed aliasing, tier-1a AND native) and a
-suspected third (bridge-exit sunk-store skip, verification item). Pending
-Bart's go-ahead.**
+Status: **PARTIAL — P0a/P0b/P0d correctness fixes landed (2026-09-07); P0c
+(bridge-exit vs sunk-store) verification outstanding; arc phases P1–P5 not yet
+authorized. Two review rounds folded in (codex + technical-architect; ledger at
+bottom). The adversarial sweep (a01–a20) is green on all three tiers.**
 Owner: Bart
 Last updated: 2026-09-07
 
@@ -21,31 +20,39 @@ to Done once everything inside a phase is checked.
 
 ### Done
 
-_(nothing yet — the sibling eq-vs-nil fold, 49604e1, predates this doc and is
-not one of its phases)_
+- [x] **Phase 0a — fix the `recCalleeUpval` open-cell aliasing miscompile.**
+      Fail-closed abort (`.aliased_input`) when an inlined callee's upvalue is
+      open over a slot at/above the anchor window base (precise anchor-base
+      check, not conservative any-open). `anchor_abs_base`/`upval_open` plumbed
+      through trace.zig + interp.zig; a01 sweep + regression pass.
+- [x] **Phase 0b — fix the global-seed aliasing miscompile.** A recorded
+      `hstore`/`astore` into the globals table (via `_G`/`rawset`) after a
+      `.global` seed now aborts (`globalsStoreBars`); `rec_globals_header`
+      refreshed at Vm.init AND keyframe restore. a02/a03 sweep pass. (Key-level
+      refinement deferred — open Q4.)
+- [x] **Phase 0d — fix the append double-apply under loop-done replay.**
+      `t[#t+1] = v` (length-dependent append) now aborts fail-closed via
+      `traceHasAlenOf(rtab)` in `arraySetShape`'s append branch: any `alen` of
+      the same table in the trace bars the append. a16/a20 sweep pass; nsieve's
+      loop-var-indexed append still records `astore_append` (unaffected).
+      Correct native tracing of the push idiom is a perf follow-up.
+
+- [x] **Phase 0c — RESOLVED: composite bridge exits vs sunk stores (pinned).**
+      Verified structurally (nativegen.zig:7171–7216 + `emitCompositeBridgeSnapshot`):
+      an ARMED composite bridge flushes ONLY slot φs then `jmpMem`s straight to
+      the successor — NO tier-0 replay — so a deopt-sunk `astore`/`hstore`/
+      `gstore`/`sgm_setpos` (appended below every body guard by `trace_finalize`)
+      WOULD be lost on a bridge exit. Empirically the combination arms 0 bridges
+      today (a sunk store and a branch-candidate guard never coexist in one
+      trace — the sieve's bridge trace has zero store ops), so it is a LATENT,
+      not currently-live, miscompile. Made fail-closed and explicit:
+      `classifyBridgeCandidate` now refuses candidacy when any store op sits
+      below the branch guard (trace_code.zig). Coverage-neutral now (sieve still
+      arms bridge=2); pins the invariant against the arc's new `hstore` shapes
+      (P1–P3). Regression test §T.9b in `trace_fingerprint_test.zig`.
 
 ### Outstanding
 
-- [ ] **Phase 0a — fix the `recCalleeUpval` open-cell aliasing miscompile.**
-      Fail-closed abort when an inlined callee's upvalue is open over a slot
-      the trace window can write; regression test + hashgate program.
-- [ ] **Phase 0b — fix the global-seed aliasing miscompile.** A recorded
-      `hstore` into the globals table (via `_G`) stales every `.global` input
-      seed; tier-1a AND native diverge today (repro §3.2). Fail-closed:
-      reject/side-exit the combination.
-- [ ] **Phase 0c — VERIFY: composite bridge exits vs sunk stores.** Bridge
-      exits don't replay the iteration and their materializer flushes only
-      slot φs (`nativegen.zig:5914`); eligibility doesn't reject traces with
-      sunk heap stores (`trace_code.zig:240`). Determine whether an EXISTING
-      sunk `hstore`/`astore` can be skipped on a bridge taken at a guard it
-      was sunk below — if yes, that's a live bug and a P0 fix; if no,
-      document why and pin it with a test.
-- [ ] **Phase 0d — fix the append double-apply under loop-done replay.**
-      `a[#a+1] = v` in the final iteration is applied on-trace AND re-applied
-      by the coarse replay; tier-1a and native both end with a phantom
-      element (repro §3.4, found by the 2026-09-07 adversarial sweep). The
-      inline-append exemption from C1 sinking is only replay-safe when the
-      re-run is idempotent; a length-dependent index is not.
 - [ ] **Phase 1 — bool-valued hash fields (load + store).** `hload ty=.boolean`
       with fused tag exit; bool `hstore`; native arms.
 - [ ] **Phase 2 — function-valued hash fields → method-call inlining.**
