@@ -1855,6 +1855,68 @@ test "recEq: konst×konst folds to a bool konst (the type(x)=='number' collapse)
     for (state.rec.instrs.items) |ins| try testing.expect(ins.op == .konst);
 }
 
+test "recEq: observed number vs konst nil pins the number and folds false (the `x == nil` idiom)" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    // r1 = observed int (a loaded slot), r2 = nil via load_nil (a konst).
+    var regs = [_]Value{ Value.nil(), Value.int(7), Value.nil(), Value.nil() };
+    state.recordInstr(.{ .op = .load_nil, .a = 2 }, winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.eq, 0, 1, 2), winRO(&regs), &proto, 1, Value.nil());
+    try testing.expect(state.isRecording());
+    // Expected IR: konst(nil), slot_load(r1), guard_int(r1), konst(false).
+    // Cross-type Lua equality is false, and the guard is what keeps the fold
+    // honest — an iteration where r1 stops being an int side-exits.
+    const ops = state.rec.instrs.items;
+    try testing.expectEqual(@as(usize, 4), ops.len);
+    try testing.expectEqual(IrOp.konst, ops[0].op);
+    try testing.expectEqual(IrOp.slot_load, ops[1].op);
+    try testing.expectEqual(IrOp.guard_int, ops[2].op);
+    try testing.expectEqual(IrOp.konst, ops[3].op);
+    const rres = state.rec.konstValueOf(try state.rec.refOf(0)).?;
+    try testing.expect(!rres.asBool());
+}
+
+test "recEq: observed float vs konst nil folds under guard_float; ne folds true; swapped sides fold" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 6 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    var regs = [_]Value{ Value.nil(), Value.float(2.5), Value.nil(), Value.int(9), Value.nil(), Value.nil() };
+    state.recordInstr(.{ .op = .load_nil, .a = 2 }, winRO(&regs), &proto, 0, Value.nil());
+    // r0 = (float r1 ~= nil r2) → guard_float(r1), konst true.
+    state.recordInstr(Instr.opABC(.ne, 0, 1, 2), winRO(&regs), &proto, 1, Value.nil());
+    try testing.expect(state.isRecording());
+    try testing.expect(state.rec.konstValueOf(try state.rec.refOf(0)).?.asBool());
+    var saw_guard_float = false;
+    for (state.rec.instrs.items) |ins| {
+        if (ins.op == .guard_float) saw_guard_float = true;
+    }
+    try testing.expect(saw_guard_float);
+    // r4 = (nil r2 == int r3) — konst on the LEFT, observed number on the
+    // right: same fold, guarding the c side.
+    state.recordInstr(Instr.opABC(.eq, 4, 2, 3), winRO(&regs), &proto, 2, Value.nil());
+    try testing.expect(state.isRecording());
+    try testing.expect(!state.rec.konstValueOf(try state.rec.refOf(4)).?.asBool());
+}
+
+test "recEq: observed non-number vs konst nil still aborts bad_type (no strict guard to pin it)" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    // r1 = observed bool. guard_true/guard_false pin TRUTHINESS, not type —
+    // a truthy heap value would wave through — so this stays out of scope.
+    var regs = [_]Value{ Value.nil(), Value.boolean(true), Value.nil(), Value.nil() };
+    state.recordInstr(.{ .op = .load_nil, .a = 2 }, winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.eq, 0, 1, 2), winRO(&regs), &proto, 1, Value.nil());
+    try testing.expect(!state.isRecording());
+}
+
 test "per-guard PC recording: guard_int aux carries the bytecode PC" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);

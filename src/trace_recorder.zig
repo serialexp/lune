@@ -1975,7 +1975,34 @@ pub const RecordingSession = struct {
         };
         const vb = regs.get(instr.b);
         const vc = regs.get(instr.c);
-        if (!vb.isNumber() or !vc.isNumber()) return self.abort(.bad_type);
+        if (!vb.isNumber() or !vc.isNumber()) {
+            // Cross-type fold — the `x == nil` idiom. Lua equality across
+            // distinct type classes is unconditionally false (`__eq` only fires
+            // table×table / userdata×userdata, never number×anything-else), and
+            // int↔float — the one cross-type pair that CAN compare equal — is
+            // excluded here because both sides would satisfy `isNumber`. So an
+            // observed NUMBER compared against a konst NON-number can never be
+            // true: pin the number side's type (guardNum — an iteration where
+            // the operand drifts off-number side-exits before the fold lies)
+            // and fold to a bool konst. The konst side is the bytecode literal
+            // and needs no guard. An observed (non-konst) non-number operand
+            // still aborts: bool/nil/heap have no strict type guard to pin them
+            // (`guard_true`/`guard_false` pin truthiness, not type).
+            if (vb.isNumber()) {
+                if (self.konstValueOf(rc)) |kc| if (!kc.isNumber()) {
+                    try self.guardNum(rb, vb, .operand_type, .b);
+                    self.setReg(instr.a, try self.konst(Value.boolean(op == .ne)));
+                    return;
+                };
+            } else if (vc.isNumber()) {
+                if (self.konstValueOf(rb)) |kb| if (!kb.isNumber()) {
+                    try self.guardNum(rc, vc, .operand_type, .c);
+                    self.setReg(instr.a, try self.konst(Value.boolean(op == .ne)));
+                    return;
+                };
+            }
+            return self.abort(.bad_type);
+        }
         try self.guardNum(rb, vb, .operand_type, .b);
         try self.guardNum(rc, vc, .operand_type, .c);
         const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
