@@ -595,6 +595,10 @@ pub const RecordingSession = struct {
     /// the `MAX_TRACE_INPUTS` budget. Separate from `input_dedup` because the value
     /// is a raw slot (no `slot_load` ref — `href` is the consumer via its `aux`).
     hash_cell_dedup: std.AutoHashMapUnmanaged(u64, u16) = .empty,
+    /// Dedup for `callee_global` seeds (doc 43 P4): interned name address →
+    /// the seeding `slot_load` ref. Interned strings are VM-deduped, so two
+    /// callee protos naming one global share the address (and the seed).
+    callee_global_dedup: std.AutoHashMapUnmanaged(u64, Ref) = .empty,
     /// Next synthetic input slab slot to hand out. Initialised to
     /// `anchor_num_registers` in `reset` (inputs live *above* the anchor window);
     /// bumped once per unique input. The slot is only ever a `slot_load` `aux` and
@@ -834,8 +838,8 @@ pub const RecordingSession = struct {
             // function — pin its identity with `guard_func`. `set_upval`/`set_global`
             // stay aborts (not in this switch): a write in the traced region would
             // make the snapshot stale, so such loops keep running on tier-0.
-            .get_upval => try self.recInputGet(.upvalue, instr.a, instr.b, resolved),
-            .get_global => try self.recInputGet(.global, instr.a, instr.b, resolved),
+            .get_upval => try self.recInputGet(.upvalue, instr.a, instr.b, resolved, proto),
+            .get_global => try self.recInputGet(.global, instr.a, instr.b, resolved, proto),
 
             // tables, closures, concat, for_prep, len, …: each pulls in heap-effect
             // / cross-frame / invalidation machinery that is later work. Abort
@@ -1552,13 +1556,25 @@ pub const RecordingSession = struct {
             tbl.hash.count() == 0 and
             tbl.array.fits(vval))
         {
-            // Same C1 deopt-replay rule as `astore`: a prior packed-array read could
-            // have steered this store's value or occurrence, and re-running the
-            // iteration on a side-exit (against the now-longer array) would diverge.
-            // (A non-empty `pending_stores` implies a prior `aload`, so this also
-            // covers "append after a sunk store" — an append changes `len` and is
-            // never deferred; `docs/design/08-multi-store-sinking.md` §soundness.)
-            if (self.traceHasHeapLoad()) return self.abort(.bad_type);
+            // Same C1 deopt-replay rule as `astore`, but scoped to the reads an
+            // append can actually invalidate (doc 43 P4): a prior ARRAY read
+            // (`aload`/`gload`/`alen`) could have steered this store's value or
+            // occurrence, and re-running the iteration on a side-exit (against
+            // the now-longer array) would diverge — barred. A pure HASH read
+            // (`hload`) cannot witness an append — `guard_append` re-proves
+            // this table's hash EMPTY while `guard_hash` requires the hload's
+            // cell POPULATED, so aliasing side-exits before the append runs —
+            // and is admitted (the method-fill idiom: `self.image` hloads
+            // feeding `image[pos] = p`). Pending SUNK stores may therefore now
+            // coexist with an inline append (hload→hstore traces have no
+            // aload): sound because the flush stays below every guard — a
+            // failed guard leaves them unapplied and tier-0's re-run applies
+            // each exactly once, while the re-run's append lands as an
+            // idempotent in-bounds overwrite (its key/value derive only from
+            // state the append didn't touch); hash and array parts are
+            // disjoint, and same-table hstore+append contradict at the guards
+            // (`docs/design/08-multi-store-sinking.md` §soundness).
+            if (self.traceHasArrayRead()) return self.abort(.bad_type);
             const rval = try self.refOf(f.val);
             const lane_ord: i32 = @intFromEnum(lane);
             const rtab = try self.refOf(f.tab);
@@ -1782,6 +1798,25 @@ pub const RecordingSession = struct {
     pub fn traceHasHeapLoad(self: *const RecordingSession) bool {
         for (self.instrs.items) |ins| {
             if (ins.op == .aload or ins.op == .hload or ins.op == .gload) return true;
+        }
+        return false;
+    }
+
+    /// Has this trace already read any ARRAY-part state (`aload`/`gload`) or a
+    /// table length (`alen`)? The narrower cousin of `traceHasHeapLoad` for the
+    /// APPEND branch's C1 idempotence bar (doc 43 P4): an append mutates only
+    /// array-part state (a slot + `asize`), and `guard_append` re-proves the
+    /// table's hash EMPTY every iteration — while an `hload`'s dominating
+    /// `guard_hash` requires a POPULATED cell in its table. If the two tables
+    /// were ever the same, the guards contradict at runtime and the iteration
+    /// side-exits BEFORE the append executes, so a pure hash-field read can
+    /// never witness an append and is safe to precede one (the method-call
+    /// idiom: `self.nx`/`self.image` hloads feeding an `image[pos] = p` fill).
+    /// Array reads and `alen`s of ANY ref stay barred — a different SSA root
+    /// may alias the appended table (fail-closed, no alias analysis).
+    pub fn traceHasArrayRead(self: *const RecordingSession) bool {
+        for (self.instrs.items) |ins| {
+            if (ins.op == .aload or ins.op == .gload or ins.op == .alen) return true;
         }
         return false;
     }
@@ -2831,7 +2866,9 @@ pub const RecordingSession = struct {
             switch (rb) {
                 // Doc 30 §5: find/match/gmatch_iter join the D1 EXCLUDED list
                 // in v1 — the producer shadow would need the census count.
-                .codepoint, .select, .find, .match, .gmatch_iter => return self.abort(.cross_frame),
+                // Doc 43 P4: assert returns ALL its arguments (variable-result
+                // like select), so a dynamic result window is excluded too.
+                .codepoint, .select, .find, .match, .gmatch_iter, .assert => return self.abort(.cross_frame),
                 else => {},
             }
             eff.c = 1;
@@ -2862,6 +2899,7 @@ pub const RecordingSession = struct {
             .gmatch_iter => try self.recBSGmatchIter(eff, regs),
             .floor => try self.recFloorCeil(eff, regs, .floor, .ffloor),
             .ceil => try self.recFloorCeil(eff, regs, .ceil, .fceil),
+            .assert => try self.recBAssert(eff, regs),
         }
         // D1 publish — only a LIVE recording may leave a shadow (an aborting arm
         // set `rec.active = false`; §3a truthfulness: set only by a successfully
@@ -3490,6 +3528,56 @@ pub const RecordingSession = struct {
         self.setReg(instr.a, try self.konst(Value.int(@as(i64, instr.b) - 1)));
     }
 
+    /// `assert(v[, message, ...])` — doc 43 P4. mahina cannot do LuaJIT's
+    /// zero-IR version (our refs don't carry nil/false-excluding types), but
+    /// one deduped truthiness pin is close. The observed `v` was truthy — a
+    /// falsy one raises, and the raise is a trace barrier, so that observation
+    /// aborts fail-closed here. The pin per observed shape mirrors the branch
+    /// recorder's folds: a truthy konst and a proven-string ref are tautologies
+    /// (emit nothing); an observed NUMBER pins its type via `guardNum` — every
+    /// int/float is truthy (0 and 0.0 included), so the tag pin IS the
+    /// truthiness pin, and native models it where a `guard_true` on a float
+    /// kind would bail; an observed bool emits `guard_true` (both tiers lower
+    /// it). Other heap shapes abort in v1 (a type pin there is not a
+    /// worthwhile tautology yet). Results: assert returns ALL its arguments —
+    /// a fixed `c` copies `min(nargs, c)` argument REFS to the destination
+    /// window and nil-pads the remainder; the statement form (`c == 0`, the
+    /// array3d shape) copies nothing; `c == all_results` was excluded upstream
+    /// (the `select` list). The message argument is evaluated but never
+    /// guarded — it is observed only on the error path, a side-exit by
+    /// construction.
+    pub fn recBAssert(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
+        if (instr.b < 1) return self.abort(.cross_frame); // `assert()` raises — barrier
+        const arg_slot: u16 = @intCast(@as(usize, instr.a) + 1);
+        const ra = try self.refOf(arg_slot);
+        const argv = regs.get(arg_slot);
+        if (!argv.isTruthy()) return self.abort(.cross_frame); // THIS call raises — barrier
+        try self.guardBuiltinCallee(instr.a, .assert);
+        if (self.konstValueOf(ra)) |_| {
+            // konst: truthiness fixed forever; observed truthy → tautology.
+        } else if (self.isProvenStringRef(ra)) {
+            // a reachable string ref is never nil/false → tautology.
+        } else if (argv.isInt() or argv.isFloat()) {
+            try self.guardNum(ra, argv, .operand_type, .a1);
+        } else if (argv.isBool()) {
+            self.stampProv(try self.emit(.{ .op = .guard_true, .a = ra }), .operand_type, .a1, .neutral);
+        } else {
+            return self.abort(.bad_type);
+        }
+        // Copy argument refs forward (dest slot a+k reads arg slot a+1+k,
+        // strictly above every slot already written — no clobber), then pad.
+        const nres: u32 = instr.c;
+        const ncopy: u32 = @min(@as(u32, instr.b), nres);
+        var k: u32 = 0;
+        while (k < ncopy) : (k += 1) {
+            const rsrc = try self.refOf(@intCast(@as(usize, instr.a) + 1 + k));
+            self.setReg(@intCast(@as(usize, instr.a) + k), rsrc);
+        }
+        while (k < nres) : (k += 1) {
+            self.setReg(@intCast(@as(usize, instr.a) + k), try self.konst(Value.nil()));
+        }
+    }
+
     /// `rawequal(a, b)` — the NaN-safe fold subset (doc 23 D2, codex catch #6:
     /// `Value.eql` is false for NaN==NaN, so same-ref must NOT blindly fold
     /// true). Konst×konst folds exactly; a same-ref pair folds true only once
@@ -3799,7 +3887,7 @@ pub const RecordingSession = struct {
     /// anchor-frame `upvalue`/`global` or regular `slot_load` input), so seed
     /// ordering is correct by construction. Global reads at inline_depth > 0 still
     /// abort — globals use proto-specific constant pool indices.
-    pub fn recInputGet(self: *RecordingSession, comptime kind: InputKind, dest: u16, source: u16, resolved: Value) !void {
+    pub fn recInputGet(self: *RecordingSession, comptime kind: InputKind, dest: u16, source: u16, resolved: Value, proto: *const Proto) !void {
         // Doc 43 §3.1 (P0a): fail closed on an OPEN upvalue cell that aliases the
         // trace-writable window. The per-entry snapshot is a copy; an on-trace
         // write to the backing register leaves it stale (confirmed tier-1a
@@ -3823,12 +3911,16 @@ pub const RecordingSession = struct {
             if (self.recorded_global_store) return self.abort(.aliased_input);
             self.recorded_global_seed = true;
         }
-        // Inlined-callee upvalues resolve through the callee's
-        // closure. Global reads at depth > 0 still abort: the seed uses the
-        // anchor's proto.constants, but the global's constant-pool index refers to
-        // the callee's proto — a different key set.
+        // Inlined-callee reads resolve through the callee's closure: an upvalue
+        // via `closure.upvalues[source]` (callee_upvalue), a global via the
+        // CALLEE proto's constant pool — `globals.get(callee.proto.constants
+        // [source])` (callee_global, doc 43 P4; the anchor proto's pool is a
+        // different key set, which is why the plain `global` recipe can't be
+        // reused at depth).
         if (self.inline_depth != 0) {
-            if (kind == .global) return self.abort(.cross_frame);
+            // The reading frame's proto is the CALLEE's here (tier-0 executes
+            // the callee), so its constant pool holds the global's key value.
+            if (kind == .global) return self.recCalleeGlobal(dest, proto.constants[source], resolved);
             // kind == .upvalue at inline_depth > 0 → callee_upvalue seed.
             return self.recCalleeUpval(dest, source, resolved);
         }
@@ -3862,14 +3954,21 @@ pub const RecordingSession = struct {
         try self.input_seeds.append(self.gpa, .{ .kind = kind, .source = source, .slot = slot });
         try self.input_dedup.put(self.gpa, key, ref);
         // Pin a *function* callee's identity so a different proto — or a value that
-        // is no longer a function — side-exits. A non-function loop-invariant (e.g.
+        // is no longer a function — side-exits. A non-function heap invariant (e.g.
         // an upvalue table) needs no identity guard: its *type* is pinned by the
-        // ordinary operand guard wherever the trace consumes it.
+        // ordinary operand guard wherever the trace consumes it. An observed
+        // SCALAR (int/float) is type-pinned right here (doc 43 P4 — LuaJIT's
+        // typed-SLOAD discipline): a pure pass-through read (a value copied to a
+        // φ without any computation) has no consuming guard, and native cannot
+        // re-box a kind-unproven value at the φ commit. `guard()` dedups, so a
+        // consumer's later guardNum on the same ref emits nothing.
         if (resolved.isHeap() and resolved.heapType() == .function) {
             const cl = function.Closure.fromHeader(resolved.asHeap());
             // Operand is the destination register `dest` (H-1c: `(callee_identity, dest)`),
             // which `recInputGet` receives as `instr.a` of the get_upval/get_global.
             self.stampProv(try self.emit(.{ .op = .guard_func, .a = ref, .aux = @bitCast(cl.proto.id) }), .callee_identity, .a, .neutral);
+        } else if (resolved.isInt() or resolved.isFloat()) {
+            try self.guardNum(ref, resolved, .operand_type, .a);
         }
         self.setReg(dest, ref);
     }
@@ -3927,10 +4026,67 @@ pub const RecordingSession = struct {
         });
         try self.input_dedup.put(self.gpa, key, ref);
 
-        // Pin a function callee's identity (same as the anchor-frame path).
+        // Pin a function callee's identity, or an observed scalar's type (the
+        // typed-SLOAD discipline — see recInputGet; pass-through reads feeding
+        // φs have no consuming guard, and the array3d iterator's y/z are
+        // exactly this shape).
         if (resolved.isHeap() and resolved.heapType() == .function) {
             const cl = function.Closure.fromHeader(resolved.asHeap());
             self.stampProv(try self.emit(.{ .op = .guard_func, .a = ref, .aux = @bitCast(cl.proto.id) }), .callee_identity, .a, .neutral);
+        } else if (resolved.isInt() or resolved.isFloat()) {
+            try self.guardNum(ref, resolved, .operand_type, .a);
+        }
+        self.setReg(dest, ref);
+    }
+
+    /// Record a `get_global` inside an inlined callee (doc 43 P4 — unblocks
+    /// `assert(...)` and every other global read in an inlined body). The
+    /// bytecode's constant-pool index refers to the CALLEE's proto — a key set
+    /// the entry seeder cannot reach — so the seed carries the key VALUE
+    /// itself: the interned name string is copied into the TRACE's const pool
+    /// (`ct.consts`, the `hash_cell` precedent) and `source` is its index;
+    /// entry resolution is proto-free (`globals.get(ct.consts[source])`).
+    /// Works for computed callees (an hload'd method) as well as slab-slot
+    /// ones — the name is fixed at record time, and callee identity is pinned
+    /// independently (`recCall`'s guard_func / the arm's guard_builtin). The
+    /// P0b store-bar discipline already ran in `recInputGet` (kind was
+    /// `.global` there). Dedup keys on the interned name's address (interned
+    /// strings are VM-deduped, so two protos naming one global share it).
+    pub fn recCalleeGlobal(self: *RecordingSession, dest: u16, key: Value, resolved: Value) !void {
+        if (!key.isHeap() or key.heapType() != .string) return self.abort(.bad_type);
+        const dkey = @intFromPtr(key.asHeap());
+        if (self.callee_global_dedup.get(dkey)) |ref| {
+            self.setReg(dest, ref);
+            return;
+        }
+
+        if (self.input_seeds.items.len >= MAX_TRACE_INPUTS) return self.abort(.input_cap);
+        if (self.next_input_slot == std.math.maxInt(u16)) return self.abort(.input_cap);
+
+        // Intern the key into the trace const pool WITHOUT emitting a `konst`
+        // IR instruction (nothing on the trace reads the name; a dangling heap
+        // konst would only complicate native proving).
+        const const_idx: u32 = @intCast(self.consts.items.len);
+        try self.consts.append(self.gpa, key);
+
+        const slot = self.next_input_slot;
+        self.next_input_slot += 1;
+        const ref = try self.emit(.{ .op = .slot_load, .aux = @intCast(slot), .ty = .unknown });
+        try self.entry_slots.append(self.gpa, slot);
+        try self.input_seeds.append(self.gpa, .{
+            .kind = .callee_global,
+            .source = const_idx,
+            .slot = slot,
+        });
+        try self.callee_global_dedup.put(self.gpa, dkey, ref);
+
+        // Pin a function value's identity, or an observed scalar's type (the
+        // typed-SLOAD discipline — see recInputGet).
+        if (resolved.isHeap() and resolved.heapType() == .function) {
+            const cl = function.Closure.fromHeader(resolved.asHeap());
+            self.stampProv(try self.emit(.{ .op = .guard_func, .a = ref, .aux = @bitCast(cl.proto.id) }), .callee_identity, .a, .neutral);
+        } else if (resolved.isInt() or resolved.isFloat()) {
+            try self.guardNum(ref, resolved, .operand_type, .a);
         }
         self.setReg(dest, ref);
     }
@@ -4171,6 +4327,7 @@ pub const RecordingSession = struct {
         self.input_seeds.deinit(gpa);
         self.input_dedup.deinit(gpa);
         self.hash_cell_dedup.deinit(gpa);
+        self.callee_global_dedup.deinit(gpa);
         self.instrs.deinit(gpa);
         self.consts.deinit(gpa);
         self.entry_slots.deinit(gpa);
@@ -4209,6 +4366,7 @@ pub const RecordingSession = struct {
         self.input_seeds.clearRetainingCapacity();
         self.input_dedup.clearRetainingCapacity();
         self.hash_cell_dedup.clearRetainingCapacity();
+        self.callee_global_dedup.clearRetainingCapacity();
         self.pending_stores.clearRetainingCapacity();
         self.alloc_count = 0;
         self.guard_gc_ref = null;

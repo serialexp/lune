@@ -21,6 +21,51 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-08a — doc 43 P4 LANDED + gated; array3d 0% → 97.4% native; P5 optional
+
+P4 turned into FOUR general levers (each one array3d merely *revealed*, per Z-6):
+
+- **`assert` as RecordedBuiltin (ordinal 25).** Truthiness pin per observed
+  shape: truthy konst / proven-string → nothing; int/float → `guardNum` (every
+  number is truthy); bool → `guard_true`; other heap → abort `.bad_type`. Falsy
+  observed arg aborts `.cross_frame` (the raise is a barrier). Joins select in
+  the variable-result `all_results` EXCLUSION switch; fixed `c` copies
+  min(nargs, c) refs + nil-pads; statement form copies nothing; message arg
+  evaluated but unguarded. Native `guard_true`: int kind → no-op, bool →
+  cmp/exit, else proveKinds bails.
+- **`callee_global` InputKind.** get_global inside an INLINED callee seeds by
+  copying the interned name string into the trace's const pool (`ct.consts`,
+  the hash_cell precedent); entry resolution is proto-free
+  (`globals.get(ct.consts[seed.source])`), so it works for computed
+  (hload-loaded-method) callees too. Dedup on interned-name address.
+- **Append C1 bar narrowed.** `traceHasHeapLoad` → `traceHasArrayRead`
+  (aload/gload/alen only) in arraySetShape's append branch. Sound because
+  guard_append re-proves the hash part EMPTY while an hload's guard_hash needs
+  a POPULATED cell — same-table aliasing contradicts at runtime and side-exits
+  before the append. Array reads/alens of ANY ref stay barred (no alias
+  analysis, fail-closed).
+- **Typed-SLOAD pins.** Observed int/float ENTRY seeds get `guardNum` at the
+  seed site (all three seed recorders); `guard()` dedups via `guarded_refs` so
+  consumer guards fold away. Without this, pure pass-through reads (value → φ
+  with no computation, e.g. the iterator's y/z) reach native with no kind
+  proof and proveKinds bails after commit.
+
+**array3d records as ONE trace covering the whole cascade** (asserts,
+bool/table fields, dynamic-root append fill, sunk bool hstores, iterator
+callee-upvalue reads); compiles native (9493 bytes); `--jit-stats` 97.4% of
+iterations on trace, ~192 vs ~22261 Debug cycles/iter. **P5 (upvalue stores)
+is NOT needed for array3d's steady state** — the hot iterator path only READS
+y/z; writes are rare row/plane transitions that side-exit.
+
+Tests: 2 recorder (statement-form assert shape; callee_global seed on an
+inlined-callee assert) + 4 ten-leg e2e incl. a 12×12 mini-array3d cascade; P3
+recorder test fixed to search all committed traces (init fill loop records
+post-P4). Gates green: `just test` 1241/1241, `just hashgate` 84/84 both legs,
+`zig build wasm`. Doc 43 checklist updated (P0–P4 done; P5 outstanding, no
+longer required for array3d).
+
+NEXT (Bart's call): P5, or close the arc and run the full bench board.
+
 ## Status 2026-09-07e — doc 43 P1+P2+P3 LANDED + gated; P4 (assert) next
 
 Continuing the arc under Bart's "commit and move to P1" + standing keep-going

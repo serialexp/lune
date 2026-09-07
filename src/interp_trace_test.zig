@@ -3406,23 +3406,27 @@ test "recorder (hash field, P3): a table field records hload ty=.heap + guard_ta
     // `guard_table(rload)` (type + metatable-free, per-iteration in native) —
     // the `.value`-lane element-table precedent — plus the `guard_lane` the
     // array access adds. The subsequent array ops root their aref AT THE HLOAD
-    // REF (a dynamic root), not at a slot_load.
-    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
-    const t = vm.trace.registry.cache.items[0];
-    var heap_hload_ref: ?usize = null;
-    for (t.code.instrs, 0..) |ins, i| {
-        if (ins.op == .hload and ins.ty == .heap) heap_hload_ref = i;
+    // REF (a dynamic root), not at a slot_load. (Since P4 narrowed the append
+    // C1 bar to array reads, the INIT fill loop also records — search every
+    // committed trace for the shape rather than pinning a count of one.)
+    try testing.expect(vm.trace.registry.cache.items.len >= 1);
+    var saw_shape = false;
+    for (vm.trace.registry.cache.items) |t| {
+        var heap_hload_ref: ?usize = null;
+        for (t.code.instrs, 0..) |ins, i| {
+            if (ins.op == .hload and ins.ty == .heap) heap_hload_ref = i;
+        }
+        if (heap_hload_ref == null) continue;
+        const hr: trace.Ref = @intCast(heap_hload_ref.?);
+        var saw_guard_table = false;
+        var saw_dyn_aref = false;
+        for (t.code.instrs) |ins| {
+            if (ins.op == .guard_table and ins.a == hr) saw_guard_table = true;
+            if (ins.op == .aref and ins.a == hr) saw_dyn_aref = true;
+        }
+        if (saw_guard_table and saw_dyn_aref) saw_shape = true;
     }
-    try testing.expect(heap_hload_ref != null);
-    const hr: trace.Ref = @intCast(heap_hload_ref.?);
-    var saw_guard_table = false;
-    var saw_dyn_aref = false;
-    for (t.code.instrs) |ins| {
-        if (ins.op == .guard_table and ins.a == hr) saw_guard_table = true;
-        if (ins.op == .aref and ins.a == hr) saw_dyn_aref = true;
-    }
-    try testing.expect(saw_guard_table);
-    try testing.expect(saw_dyn_aref);
+    try testing.expect(saw_shape);
 }
 
 test "recorder (hash field, P3): a table field WITH a metatable aborts fail-closed" {
@@ -3544,6 +3548,174 @@ test "hash field P3 end-to-end: cross-root aliasing — dynamic-root store visib
         \\end
         \\print(total, t[1], t[8])
     , "10200\t50\t50\n");
+}
+
+test "recorder (assert, P4): statement-form assert records guard_builtin + guard_true, copies nothing" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local s = 0
+        \\for i = 1, 50 do
+        \\  assert(i < 100, "range")
+        \\  s = s + 1
+        \\end
+        \\print(s)
+    , true);
+    defer chunk.deinit();
+
+    // Doc 43 P4: assert dispatches through recBuiltin — the callee pins with
+    // guard_builtin[assert]; the truthiness pin for the observed-bool argument
+    // (a comparison result, ty=.boolean) is one guard_true on its ref. The
+    // statement form (c == 0) copies no results. The message konst is
+    // evaluated but never guarded.
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
+    var saw_builtin = false;
+    var lt_ref: ?usize = null;
+    for (t.code.instrs, 0..) |ins, i| {
+        if (ins.op == .guard_builtin and ins.aux == @intFromEnum(function.RecordedBuiltin.assert)) saw_builtin = true;
+        if (ins.op == .lt) lt_ref = i;
+    }
+    try testing.expect(saw_builtin);
+    try testing.expect(lt_ref != null);
+    var saw_guard_true = false;
+    for (t.code.instrs) |ins| {
+        if (ins.op == .guard_true and ins.a == @as(trace.Ref, @intCast(lt_ref.?))) saw_guard_true = true;
+    }
+    try testing.expect(saw_guard_true);
+}
+
+test "recorder (assert, P4): assert inside an INLINED callee records via the callee_global seed" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local function chk(self, i)
+        \\  assert(i >= 1, "low")
+        \\  return i + self.k
+        \\end
+        \\local obj = { k = 2, chk = chk }
+        \\local s = 0
+        \\for i = 1, 50 do s = s + obj.chk(obj, i) end
+        \\print(s)
+    , true);
+    defer chunk.deinit();
+
+    // The global `assert` is read INSIDE the inlined callee — its bytecode
+    // const-pool index refers to the callee's proto, so the seed carries the
+    // key VALUE in the trace's own const pool: kind `.callee_global` with
+    // `ct.consts[source]` == the interned "assert" string (proto-free entry
+    // resolution, the hash_cell precedent).
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
+    var saw_cg = false;
+    for (t.code.inputs) |seed| {
+        if (seed.kind != .callee_global) continue;
+        const key = t.code.consts[seed.source];
+        try testing.expect(key.isHeap() and key.heapType() == .string);
+        saw_cg = true;
+    }
+    try testing.expect(saw_cg);
+}
+
+test "assert P4 end-to-end: statement + result + number-pin forms; all ten legs" {
+    try expectProgram(
+        \\local s = 0
+        \\for i = 1, 60 do
+        \\  assert(i >= 1 and i <= 60, "range")
+        \\  s = s + i
+        \\end
+        \\local a, b = assert(41, "msg")
+        \\local t = { v = 3 }
+        \\local u = { w = 0.5 }
+        \\local n = 0
+        \\for i = 1, 60 do
+        \\  n = n + assert(t.v)
+        \\  n = n + assert(u.w)
+        \\end
+        \\print(s, a, b, n)
+    , "1830\t41\tmsg\t210\n");
+}
+
+test "assert P4 end-to-end: assert inside an inlined method (the array3d shape); all ten legs" {
+    try expectProgram(
+        \\local function set(self, i, p)
+        \\  assert(i >= 1 and i <= 8, "out of range")
+        \\  local image = self.image
+        \\  image[i] = p
+        \\  self.changed = true
+        \\end
+        \\local obj = { image = {}, changed = false, set = set }
+        \\for i = 1, 8 do obj.image[i] = 0 end
+        \\for round = 1, 60 do
+        \\  for i = 1, 8 do
+        \\    obj.set(obj, i, i + round)
+        \\  end
+        \\end
+        \\print(obj.image[1], obj.image[8], obj.changed)
+    , "61\t68\ttrue\n");
+}
+
+test "assert P4 end-to-end: mid-loop falsy drift side-exits and raises identically (pcall)" {
+    // The bool-field argument flips false mid-loop: the guard_true (or the
+    // hload's fused tag path) must side-exit, and tier-0 must raise the
+    // recorded-but-unguarded message on every leg.
+    try expectProgram(
+        \\local flag = { ok = true }
+        \\local s = 0
+        \\local function body()
+        \\  for i = 1, 60 do
+        \\    if i == 50 then flag.ok = false end
+        \\    assert(flag.ok, "flipped")
+        \\    s = s + 1
+        \\  end
+        \\end
+        \\local ok, err = pcall(body)
+        \\print(ok, err, s)
+    , "false\tflipped\t49\n");
+}
+
+test "doc 43 end-to-end: mini-array3d — iterator closure + method with assert + fields + append fill; all ten legs" {
+    // The full cascade in one loop: generic-for over a closure iterator
+    // (callee-upvalue reads incl. the pure PASS-THROUGH `y` the typed-SLOAD
+    // pin exists for), an hload'd method callee, asserts via callee_global
+    // seeds, a bool field branch, a table-field dynamic-root APPEND fill
+    // (hloads preceding an append — the narrowed C1 bar), and sunk bool
+    // hstores. The real array3d tiers up through exactly this shape.
+    try expectProgram(
+        \\local function aset(self, x, y, p)
+        \\  assert(x >= 0 and x < self.nx, "x out")
+        \\  assert(y >= 0 and y < self.ny, "y out")
+        \\  local pos = y * self.nx + x
+        \\  local image = self.image
+        \\  if self.packed then
+        \\    image[pos] = p * 2
+        \\  else
+        \\    image[pos] = p
+        \\  end
+        \\  self.changed = true
+        \\end
+        \\local function points(self)
+        \\  local y = 0
+        \\  return function(s2, x)
+        \\    x = x + 1
+        \\    if x >= s2.nx then
+        \\      x = 0
+        \\      y = y + 1
+        \\      if y >= s2.ny then return nil, nil end
+        \\    end
+        \\    return x, y
+        \\  end, self, -1
+        \\end
+        \\local arr = { nx = 12, ny = 12, packed = false, changed = false, image = {}, set = aset, points = points }
+        \\for x, y in arr:points() do
+        \\  arr:set(x, y, x * x)
+        \\end
+        \\local sum = 0
+        \\for i = 0, arr.nx * arr.ny - 1 do sum = sum + arr.image[i] end
+        \\print(sum, arr.changed)
+    , "6072\ttrue\n");
 }
 
 test "hash field P1 end-to-end: bool field branch + konst store + proven copy, all ten legs" {

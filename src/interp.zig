@@ -995,6 +995,10 @@ pub const Vm = struct {
                     if (seed.source >= callee_cl.upvalues.len) break :blk Value.nil();
                     break :blk self.upvalGet(callee_cl.upvalues[seed.source]);
                 },
+                // Doc 43 P4: a global read inside an inlined callee — the name
+                // was copied into the TRACE's const pool at record time (the
+                // hash_cell precedent), so resolution is proto-free.
+                .callee_global => self.globals.get(ct.consts[seed.source]),
             };
             self.regSet(base + seed.slot, v);
         }
@@ -1070,6 +1074,9 @@ pub const Vm = struct {
                     if (seed.source >= callee_cl.upvalues.len) break :blk Value.nil();
                     break :blk self.upvalGet(callee_cl.upvalues[seed.source]);
                 },
+                // Doc 43 P4: same as seedTraceInputs's callee_global arm — the
+                // name lives in the trace const pool, resolution is proto-free.
+                .callee_global => self.globals.get(ct.consts[seed.source]),
             };
             self.regSet(ctx.base + seed.slot, v);
         }

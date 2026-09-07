@@ -44,7 +44,7 @@ pub const EntryGuard = struct { slot: u16, ty: EntryGuardType };
 /// `(table,key)` operands each iteration (so H0's IR and exec-log behaviour are
 /// frozen). Re-resolved every entry via `Table.fieldPtr`, so — like every seed — no
 /// pointer is ever serialized.
-pub const InputKind = enum(u8) { upvalue, global, hash_cell, callee_upvalue };
+pub const InputKind = enum(u8) { upvalue, global, hash_cell, callee_upvalue, callee_global };
 
 /// One synthetic entry input the dispatch loop resolves and writes into the slab
 /// before trace entry. For `upvalue`/`global`: `source` is the upvalue index
@@ -74,7 +74,13 @@ pub const InputSeed = struct {
     /// `callee_upvalue` only (inlined-callee upvalues): anchor-slab slot where the inlined callee's
     /// closure lives at entry time. The callee was already seeded (as an `upvalue`
     /// or regular `slot_load` input) before this seed, so `regGet(base +
-    /// callee_slot)` is valid by the time this seed runs.
+    /// callee_slot)` is valid by the time this seed runs. (`callee_global` — doc 43
+    /// P4, a global read inside an inlined callee — needs no callee at all: its
+    /// `source` indexes the TRACE's own const pool (`ct.consts`, the `hash_cell`
+    /// precedent), where the recorder copied the interned name string, so entry
+    /// resolution is simply `globals.get(ct.consts[source])` — proto-free, which is
+    /// what makes a depth>0 global seedable when the anchor proto's constant pool
+    /// doesn't contain the key.)
     callee_slot: u16 = 0,
 };
 

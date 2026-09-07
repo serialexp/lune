@@ -223,7 +223,7 @@ pub const natives = [_]function.BaseNative{
     .{ .name = "pcall", .func = &nPcall1, .multi = &nPcallN },
     .{ .name = "xpcall", .func = &nXpcall1, .multi = &nXpcallN },
     .{ .name = "error", .func = &nError },
-    .{ .name = "assert", .func = &nAssert1, .multi = &nAssertN },
+    .{ .name = "assert", .func = &nAssert1, .multi = &nAssertN, .recorded = .assert },
 };
 
 test "A-iv pcall unwind drops region_profit for the destroyed activation" {

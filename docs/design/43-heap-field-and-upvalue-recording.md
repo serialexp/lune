@@ -1,10 +1,12 @@
 # 43 — heap-valued fields, assert, and upvalue stores (tracing the OOP + closure-iterator idioms)
 
 Status: **PARTIAL — P0 (all four), P1 (bool hash fields), P2 (function hash
-fields → method inlining), and P3 (table hash fields + dynamic aref) landed
-2026-09-07; P4–P5 outstanding. Two review rounds folded in (codex +
-technical-architect; ledger at bottom). The adversarial sweep (a01–a20) is
-permanent in `trace_p0_alias_test.zig`, green on all ten legs.**
+fields → method inlining), P3 (table hash fields + dynamic aref), and P4
+(assert + callee_global seeds + append-bar narrowing + typed-SLOAD pins)
+landed 2026-09-07; P5 outstanding — and no longer required for array3d's
+steady state, which now runs 97.4% native. Two review rounds folded in
+(codex + technical-architect; ledger at bottom). The adversarial sweep
+(a01–a20) is permanent in `trace_p0_alias_test.zig`, green on all ten legs.**
 Owner: Bart
 Last updated: 2026-09-07
 
@@ -107,11 +109,49 @@ to Done once everything inside a phase is checked.
       exit, cross-root same-iteration aliasing). Gates green; the array3d-
       shaped microbench runs 98% native at ~52 cycles/iter (tier-0 ~29.8k).
 
-### Outstanding
+- [x] **Phase 4 — `assert` as a RecordedBuiltin + the three general levers it
+      exposed.** Landed 2026-09-07. The arm itself is §7 as designed
+      (`RecordedBuiltin.assert = 25`; truthiness pin per observed shape —
+      truthy-konst/proven-string tautologies emit nothing, numbers pin via
+      `guardNum` (every int/float is truthy, so the tag pin IS the pin, and
+      native models it), bools emit `guard_true`, other heap shapes abort;
+      joins the `all_results` exclusion list; fixed `c` copies `min(nargs,c)`
+      arg refs + nil-pads; statement form copies nothing; no Z-5 CSV change).
+      Landing it on array3d then surfaced three GENERAL gaps, each fixed at
+      its root (Z-6):
+      1. **`callee_global` input seeds** — a `get_global` inside an inlined
+         callee (the `assert` read itself!) used to abort `.cross_frame`
+         because the const-pool index is callee-proto-specific. New InputKind
+         `.callee_global`: the recorder copies the interned name into the
+         TRACE's const pool (the `hash_cell` precedent) and entry resolution
+         is proto-free (`globals.get(ct.consts[source])`) — works for
+         computed (hload'd-method) callees too. Both seeding twins + the
+         SeedPlan arm; P0b's store-bar discipline unchanged.
+      2. **The append C1 bar narrowed to ARRAY reads.** `traceHasHeapLoad`
+         barred any heap load before an `astore_append`; hloads are provably
+         safe (guard_append re-proves the hash EMPTY while guard_hash needs a
+         POPULATED cell — same-table aliasing contradicts at runtime and
+         side-exits before the append), so the bar is now
+         `traceHasArrayRead` (aload/gload/alen — any ref, fail-closed on
+         aliasing). Unblocks the method-fill idiom (`self.image` hloads
+         feeding `image[pos] = p`); sunk hstores may now coexist with an
+         inline append (soundness argument at the call site).
+      3. **Typed-SLOAD pins on scalar entry seeds.** An input seed observed
+         int/float now gets `guardNum` at the seed site (all three seed
+         recorders; `guard()` dedups so consumer guards fold away). Without
+         it a pure PASS-THROUGH read (a value copied straight to a φ — the
+         array3d iterator's `y`/`z`) had no consuming guard, and native
+         cannot re-box a kind-unproven value at the φ commit (the whole
+         trace bailed in proveKinds' unguarded-slot_load arm).
+      Result: **array3d records as ONE trace covering the full cascade** —
+      asserts, bool/table fields, the dynamic-root append fill, sunk bool
+      hstores, iterator callee-upvalue reads (the hot path never writes
+      y/z — those are rare row/plane side-exits, so P5 is not needed for
+      steady state) — compiles native (~9.5 KB) and runs **97.4% of
+      iterations as trace (~192 vs ~22 261 Debug cycles/iter)**, from 0%.
+      Tests: 2 recorder + 4 ten-leg e2e incl. a mini-array3d cascade pin.
 
-- [ ] **Phase 4 — `assert` as a RecordedBuiltin.** `guard_true(arg1)` +
-      pass-through; joins the variable-result `all_results` EXCLUSION list;
-      fixed-`c` = copy `min(nargs, c)` + nil-pad.
+### Outstanding
 - [ ] **Phase 5 — closed-cell upvalue stores (`uref`/`uload`/`ustore`),
       SCALAR stored values only in v1.** Physical-cell alias classes,
       entry-decline (not downgrade) seed grammar, three-site loop-done flush +

@@ -253,6 +253,16 @@ pub const RecordedBuiltin = enum(u8) {
     floor = 23,
     /// `math.ceil(x)` — `fceil`: same contract as `floor`, opposite direction.
     ceil = 24,
+    // -- doc 43 P4.
+    /// `assert(v[, message, ...])` — one deduped truthiness pin on `v` (konst /
+    /// proven-number / bool → `guard_true`), arguments passed through as
+    /// results. Structurally variable-result (returns ALL its arguments), so it
+    /// joins `select` on the `all_results` exclusion list; a fixed `c` copies
+    /// `min(nargs, c)` argument refs and nil-pads. The message argument is
+    /// evaluated but unguarded (observed only on the error path, which is a
+    /// side-exit by construction — a falsy `v` raises in tier-0 and aborts
+    /// recording).
+    assert = 25,
 };
 
 /// Which **nondeterministic input** a native represents, if any. A native with a
