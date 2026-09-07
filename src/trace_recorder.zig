@@ -1894,17 +1894,21 @@ pub const RecordingSession = struct {
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
         if (tbl.metatable != null) return self.abort(.has_metatable);
         const cell = tbl.fieldPtr(vkey) orelse return self.abort(.bad_type); // absent
-        // Scalar-field restriction (the hash analogue of the narrow-array-lane rule).
-        // A present cell holds a non-`nil` tagged `Value` of any type. We trace only
-        // **int/float** fields, for two joined reasons: (1) the scalar exec-log
-        // encoder (the cross-mode determinism oracle) cannot encode a heap value, so
-        // `hload`'s logged value must be scalar; (2) only int/float have a *strict*
-        // type guard (`guard_int`/`guard_float`) that pins the field's type so a later
-        // iteration changing it side-exits — a `bool` field could silently become a
-        // truthy heap value that `guard_true` would wave through. A bool/heap/string
-        // field therefore aborts to tier-0, exactly as a `.value` array lane does.
+        // Field-type restriction (the hash analogue of the narrow-array-lane rule).
+        // A present cell holds a non-`nil` tagged `Value` of any type. We trace
+        // **int/float/bool** fields. The historic objection to bool — "there is no
+        // strict bool guard; `guard_true` waves a truthy heap value through" — is
+        // answered LuaJIT-style (doc 43 P1): the **load's own tag check** is the
+        // strict guard. `hload ty=.boolean` tag-checks the cell in BOTH tiers
+        // (tier-1a `type_ok`, native `cmp byte [cell], TAG_BOOL`) and side-exits
+        // at the load, before any consumer, so a field drifting bool→heap never
+        // flows on-trace. (The old "the scalar exec-log encoder can't take it"
+        // half of the objection was already dead — doc 32: the log silently drops
+        // unencodables, is viz-only, mutually exclusive with native, and
+        // `effectser.toEffectResult` encodes bools anyway.) Heap-valued fields
+        // (function/table/string) remain the P2/P3 arc; they abort to tier-0.
         const fv = cell.*;
-        if (!(fv.isInt() or fv.isFloat())) return self.abort(.nyi_opcode);
+        if (!(fv.isInt() or fv.isFloat() or fv.isBool())) return self.abort(.nyi_opcode);
         // The key must be a recorded `konst` (the bytecode literal interned via
         // `load_const`), so its ref is provably the constant — no runtime key-
         // identity guard is needed and the cell is pinnable. A computed key reaches
@@ -1941,7 +1945,12 @@ pub const RecordingSession = struct {
         // tag-check + payload load of the guarded kind. The oracle returns the whole
         // `Value`, so this guard is what makes the two agree on the side-exit
         // iteration (and pins the field type — int→float etc. side-exits).
-        try self.guardNum(rload, fv, .field_type, .loaded);
+        // A BOOL field takes no `guardNum` (there is no numeric guard to give it):
+        // its strict type pin IS the `hload ty=.boolean` fused tag exit above —
+        // both tiers side-exit at the load itself on a tag flip, so the ref is
+        // bool-proven for every consumer (`guard_true`/`guard_false`, or a P1
+        // bool `hstore` requiring a `.ty == .boolean` producer).
+        if (!fv.isBool()) try self.guardNum(rload, fv, .field_type, .loaded);
     }
 
     /// Record `t.field = v` (`set_index`, `a=table b=key c=value`, key an interned
@@ -1981,12 +1990,13 @@ pub const RecordingSession = struct {
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         if (self.globalsStoreBars(vtab)) return self.abort(.aliased_input);
         if (vval.isNil()) return self.abort(.bad_type); // delete — out of scope
-        // Scalar-value restriction, the store mirror of `recHashGet`'s read rule: the
-        // exec-log encoder is scalar-only, so the stored value (logged by its
-        // producing `slot_load`/arith ref) must be int/float; a heap/bool field store
-        // aborts to tier-0. Covers the int/float field arithmetic OOP code does
-        // (`obj.x = obj.x + dt*vx`); reference fields (`obj.next = node`) stay tier-0.
-        if (!(vval.isInt() or vval.isFloat())) return self.abort(.nyi_opcode);
+        // Value restriction, the store mirror of `hashGetShape`'s read rule:
+        // int/float (runtime-pinned by the `guardNum` below) and bool (statically
+        // pinned — see the rval check after `refOf`). Covers the int/float field
+        // arithmetic OOP code does (`obj.x = obj.x + dt*vx`) and flag writes
+        // (`obj.done = true`, `p.alive = q.alive`); reference fields
+        // (`obj.next = node`) stay tier-0 pending P2/P3.
+        if (!(vval.isInt() or vval.isFloat() or vval.isBool())) return self.abort(.nyi_opcode);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
         if (tbl.metatable != null) return self.abort(.has_metatable);
         _ = tbl.fieldPtr(vkey) orelse return self.abort(.bad_type); // absent = insert
@@ -1998,18 +2008,32 @@ pub const RecordingSession = struct {
         // side-exit leaves it un-executed and deopt-replay applies it exactly once.
         const defer_store = self.traceHasHeapLoad();
         const rval = try self.refOf(f.val);
-        // Pin the **store value's** type (int/float). A hash cell holds a full tagged
-        // `Value` with no lane to constrain it, so this guard is the analogue of the
-        // array path's `guard_fits`: it is the sole guarantee the field stays scalar
-        // on-trace. Without it, a value whose runtime type drifts (int→heap) would be
-        // written into the cell, and a later `hload` would read a non-scalar into the
-        // scalar-only exec log. Emitting it inline (it stays in the body even when the
-        // store sinks) makes a drifted store value side-exit *before* the write lands.
-        // Sound via the standard deduped `guardNum`: `guarded_refs` holds only numeric
-        // guards (truthiness `guard_true`/`guard_false` are emitted raw, never
-        // registered), so a prior guard on this ref is necessarily a matching
-        // `guard_int`/`guard_float`.
-        try self.guardNum(rval, vval, .value_type, f.val_od);
+        // Pin the **store value's** type. A hash cell holds a full tagged `Value`
+        // with no lane to constrain it, so this pin is the analogue of the array
+        // path's `guard_fits`: it is the sole guarantee the field stays this type
+        // on-trace. Without it, a value whose runtime type drifts (int→heap) would
+        // be written into the cell, and a later `hload` would read the wrong type.
+        //  * int/float: the standard deduped `guardNum`, emitted inline (it stays
+        //    in the body even when the store sinks) so a drifted store value
+        //    side-exits *before* the write lands. Sound via `guarded_refs`
+        //    (holds only numeric guards, so a prior guard on this ref is
+        //    necessarily a matching `guard_int`/`guard_float`).
+        //  * bool (doc 43 P1): there is no runtime bool guard — instead the value
+        //    ref must be STATICALLY bool-proven: a konst bool, or a producer whose
+        //    `.ty == .boolean` (an `hload` bool field, whose fused tag exit
+        //    already side-exits upstream on drift). An unproven ref (e.g. a
+        //    `slot_load` of a plain register that merely happened to hold a bool)
+        //    aborts — that is exactly the drifting-store-value hole `guardNum`
+        //    plugs for scalars, and fail-closed is the P0 discipline.
+        if (vval.isBool()) {
+            const bool_proven = if (self.konstValueOf(rval)) |kv|
+                kv.isBool()
+            else
+                self.instrs.items[@intCast(rval)].ty == .boolean;
+            if (!bool_proven) return self.abort(.nyi_opcode);
+        } else {
+            try self.guardNum(rval, vval, .value_type, f.val_od);
+        }
         const rtab = try self.refOf(f.tab);
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
         // Seed the cell pointer for native (H1) — see `recHashGet`. An RMW's read and

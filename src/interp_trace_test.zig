@@ -3138,6 +3138,178 @@ test "recorder (hash field): a float-valued field RMW records (nbody-shaped arit
     try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
 }
 
+test "recorder (hash field, P1): a bool field read records hload ty=.boolean with NO consumer guard" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local t = {b = true}
+        \\local n = 0
+        \\for i = 1, 50 do if t.b then n = n + 1 end end
+        \\print(n)
+    , true);
+    defer chunk.deinit();
+
+    // Doc 43 P1: the bool field's strict type pin IS the `hload ty=.boolean`
+    // fused tag exit — both tiers side-exit at the load on a tag flip — so the
+    // recorder must emit NO guard_int/guard_float on the hload ref (there is no
+    // numeric guard to give a bool), and the branch's guard_true consumes the
+    // bool-proven ref directly.
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
+    var hload_ref: ?usize = null;
+    for (t.code.instrs, 0..) |ins, i| {
+        if (ins.op == .hload) {
+            try testing.expectEqual(trace.ObsType.boolean, ins.ty);
+            hload_ref = i;
+        }
+    }
+    try testing.expect(hload_ref != null);
+    var saw_guard_true = false;
+    for (t.code.instrs) |ins| {
+        if ((ins.op == .guard_int or ins.op == .guard_float or ins.op == .guard_number) and
+            ins.a == @as(trace.Ref, @intCast(hload_ref.?))) return error.TestUnexpectedResult;
+        if (ins.op == .guard_true and ins.a == @as(trace.Ref, @intCast(hload_ref.?))) saw_guard_true = true;
+    }
+    try testing.expect(saw_guard_true);
+}
+
+test "recorder (hash field, P1): a konst-bool field store records an hstore (no value guard)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local t = {b = false}
+        \\for i = 1, 50 do t.b = true end
+        \\print(t.b)
+    , true);
+    defer chunk.deinit();
+
+    // A konst bool is statically bool-proven, so the store is admitted with no
+    // runtime value guard (`guardNum` has no bool arm; the pin is the konst).
+    // A pure write (no prior heap load) emits the hstore inline, as for scalars.
+    var buf: [8192]u8 = undefined;
+    const text = try dumpTrace(&buf, &vm);
+    try testing.expect(std.mem.indexOf(u8, text, "hstore") != null);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+}
+
+test "recorder (hash field, P1): a bool-proven copy (dst.f = src.g) records; hload feeds hstore" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local src = {g = true}
+        \\local dst = {f = false}
+        \\for i = 1, 50 do dst.f = src.g end
+        \\print(dst.f)
+    , true);
+    defer chunk.deinit();
+
+    // The store value ref is the `hload ty=.boolean` of `src.g` — statically
+    // bool-proven (a tag flip on src.g side-exits at ITS load, upstream of the
+    // store), so the store is admitted. The store follows a heap load, so C1
+    // sinks it: hload strictly before hstore in the stream.
+    var buf: [8192]u8 = undefined;
+    const text = try dumpTrace(&buf, &vm);
+    const i_load = std.mem.indexOf(u8, text, "hload");
+    const i_store = std.mem.indexOf(u8, text, "hstore");
+    try testing.expect(i_load != null);
+    try testing.expect(i_store != null);
+    try testing.expect(i_load.? < i_store.?);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+}
+
+test "recorder (hash field, P1): an UNPROVEN bool store (plain local) aborts fail-closed" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `x` reaches the store as a `slot_load` ref that merely HAPPENED to hold a
+    // bool at record time — nothing pins it (no bool guard exists), so a later
+    // iteration could deliver a heap value straight into the cell. That is
+    // exactly the drifting-store-value hole `guardNum` plugs for scalars;
+    // fail-closed, the recorder aborts and the loop stays tier-0.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local t = {b = false}
+        \\local x = true
+        \\for i = 1, 50 do t.b = x end
+        \\print(t.b)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
+    try testing.expect(!vm.trace.isRecording());
+}
+
+test "recorder (hash field, P1): a comparison-result store (t.b = i < k) records (ty=.boolean producer)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local t = {b = false}
+        \\for i = 1, 50 do t.b = i < 25 end
+        \\print(t.b)
+    , true);
+    defer chunk.deinit();
+
+    // A comparison always produces a bool (`lt` carries `.ty = .boolean`), so the
+    // ref is statically bool-proven and the store is admitted.
+    var buf: [8192]u8 = undefined;
+    const text = try dumpTrace(&buf, &vm);
+    try testing.expect(std.mem.indexOf(u8, text, "hstore") != null);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+}
+
+test "hash field P1 end-to-end: bool field branch + konst store + proven copy, all ten legs" {
+    // The full P1 shape from one loop: hload ty=.boolean feeding guard_true,
+    // a comparison-result store, and a bool-proven cross-table copy. Byte-
+    // identical across the ten-leg matrix (incl. native, where the hload tag
+    // check and TAG_BOOL hstore arms carry the type discipline).
+    try expectProgram(
+        \\local obj = { packed = true, on = false }
+        \\local src = { flag = true }
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  if obj.packed then s = s + 2 else s = s + 1 end
+        \\  obj.on = src.flag
+        \\  obj.packed = (i < 150)
+        \\end
+        \\print(s, obj.packed, obj.on)
+    , "350\tfalse\ttrue\n");
+}
+
+test "hash field P1 end-to-end: bool field type drift (bool->int->bool) side-exits and stays exact" {
+    // Mid-loop the field turns int (the hload's fused tag exit must fire — it is
+    // the bool field's ONLY pin) and later back to bool. Every tier must agree.
+    try expectProgram(
+        \\local obj = { flag = true }
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  if obj.flag then s = s + 1 else s = s + 100 end
+        \\  if i == 100 then obj.flag = 7 end
+        \\  if i == 110 then obj.flag = false end
+        \\end
+        \\print(s, obj.flag)
+    , "9110\tfalse\n");
+}
+
+test "hash field P1 end-to-end: C1 forwards a pending bool hstore to a same-iteration load" {
+    // `o.f = v` sinks (a heap load precedes it); the immediately following
+    // `if o.f` must forward the pending BOOL value ref (`forwardPendingHashLoad`
+    // is type-agnostic — doc 43 P1 pins that with this test).
+    try expectProgram(
+        \\local o = { f = true, g = true }
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  local v = o.g
+        \\  o.f = v
+        \\  if o.f then s = s + 1 end
+        \\end
+        \\print(s)
+    , "200\n");
+}
+
 test "recorder (hash field): an absent constant-key access aborts (no trace)" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
@@ -3178,13 +3350,13 @@ test "recorder (hash field): a metatable-bearing table aborts (.has_metatable)" 
     try testing.expect(!vm.trace.isRecording());
 }
 
-test "recorder (hash field): a heap-valued (string) field aborts (scalar-only restriction)" {
+test "recorder (hash field): a heap-valued (string) field aborts (heap fields are P2/P3)" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    // The field value is a string (heap). Only int/float fields trace: the scalar
-    // exec-log encoder can't serialize a heap value, and a non-scalar field has no
-    // strict type guard to pin it across iterations. Aborts as a `.value` lane does.
+    // The field value is a string (heap). int/float/bool fields trace (doc 43 P1
+    // added bool via the hload fused tag exit); heap-valued fields await the
+    // P2/P3 arc (guard_func / guard_table pins). Until then they abort to tier-0.
     var chunk = try runForTrace(&vm, gpa,
         \\local t = {x = "hi"}
         \\local n = 0

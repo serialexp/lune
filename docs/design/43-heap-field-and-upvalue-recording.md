@@ -1,9 +1,9 @@
 # 43 — heap-valued fields, assert, and upvalue stores (tracing the OOP + closure-iterator idioms)
 
-Status: **PARTIAL — P0a/P0b/P0d correctness fixes landed (2026-09-07); P0c
-(bridge-exit vs sunk-store) verification outstanding; arc phases P1–P5 not yet
-authorized. Two review rounds folded in (codex + technical-architect; ledger at
-bottom). The adversarial sweep (a01–a20) is green on all three tiers.**
+Status: **PARTIAL — P0 (all four: P0a/P0b/P0c/P0d) and P1 (bool hash fields)
+landed 2026-09-07; P2–P5 outstanding. Two review rounds folded in (codex +
+technical-architect; ledger at bottom). The adversarial sweep (a01–a20) is
+permanent in `trace_p0_alias_test.zig`, green on all ten legs.**
 Owner: Bart
 Last updated: 2026-09-07
 
@@ -50,11 +50,23 @@ to Done once everything inside a phase is checked.
       below the branch guard (trace_code.zig). Coverage-neutral now (sieve still
       arms bridge=2); pins the invariant against the arc's new `hstore` shapes
       (P1–P3). Regression test §T.9b in `trace_fingerprint_test.zig`.
+- [x] **Phase 1 — bool-valued hash fields (load + store).** Landed 2026-09-07
+      exactly as designed (§4): `hashGetShape` admits bool → `hload ty=.boolean`
+      with NO consumer guard (the load's tag check is the strict pin, both
+      tiers); `hashSetShape` admits a STATICALLY bool-proven store value (konst
+      bool or `.ty == .boolean` producer — comparisons qualify, `lt` stamps
+      `.boolean`), unproven refs abort fail-closed; tier-1a `type_ok` gains
+      `.boolean => fv.isBool()`; native proveKinds maps `.boolean => .bool`
+      (payload is canonical full-width 0/1 = the Kind.bool GP convention),
+      hload gets the TAG_BOOL tag-check arm, `emitHStore` the TAG_BOOL store
+      arm. Five recorder tests + three ten-leg end-to-end tests (incl. the
+      C1 bool-forwarding pin and the bool→int→bool drift exit) in
+      `interp_trace_test.zig`. Gates green; field_hash/array3d cross=ok,
+      no bench movement expected until P2–P4 join (array3d's bool reads sit
+      inside `array_set`, blocked on assert/method inlining).
 
 ### Outstanding
 
-- [ ] **Phase 1 — bool-valued hash fields (load + store).** `hload ty=.boolean`
-      with fused tag exit; bool `hstore`; native arms.
 - [ ] **Phase 2 — function-valued hash fields → method-call inlining.**
       `hload ty=.heap` + body `guard_func`; native checklist: proveKinds
       Pass A + Pass B, body lowering, **and `opMayExitInBody`**.

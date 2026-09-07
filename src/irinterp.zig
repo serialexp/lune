@@ -492,8 +492,8 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                 // metatable-free, so this hits the hash-part and returns the present
                 // value. (The hash analogue of `aload`.)
                 //
-                // `hload` is a **typed** load: `ins.ty` is the recorded scalar type
-                // (int/float — the recorder restricts the field to those). Unlike a
+                // `hload` is a **typed** load: `ins.ty` is the recorded field type
+                // (int/float/bool — the recorder restricts the field to those). Unlike a
                 // packed array lane, a hash cell holds a full tagged `Value`, so its
                 // runtime type is NOT structurally constrained — a sibling mutation
                 // between entries (same `hash.count()`, so `guard_hash` still passes) or
@@ -511,7 +511,11 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     const type_ok = switch (ins.ty) {
                         .int => fv.isInt(),
                         .float => fv.isFloat(),
-                        else => false, // only int/float fields are recorded
+                        // doc 43 P1: the bool field's ONLY strict type pin — the
+                        // recorder emits no consumer guard for it, so this fused
+                        // tag exit is what keeps a bool→heap drift off-trace.
+                        .boolean => fv.isBool(),
+                        else => false, // only int/float/bool fields are recorded
                     };
                     if (!type_ok) {
                         if (record) rec.exit(i, .guard, values[hr.a]);

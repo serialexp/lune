@@ -2124,27 +2124,31 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 kinds[i] = .none;
             },
             // hload: a typed load from the cell. `a` is the href; the recorder stamps
-            // the observed scalar type in `ins.ty` and emits the existing type-guard on
-            // this ref. Native restricts to int/float field values (a heap-valued field
-            // declines native, like the `.value` array lane); the load tag-checks
-            // `[cell+0]` (side-exit on mismatch) then loads `[cell+8]`.
+            // the observed field type in `ins.ty` (int/float carry a consumer
+            // type-guard; bool's pin IS the hload tag check — doc 43 P1). Native
+            // handles int/float/bool field values (a heap-valued field declines,
+            // like the `.value` array lane); the load tag-checks `[cell+0]`
+            // (side-exit on mismatch) then loads `[cell+8]`.
             .hload => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .href) return false;
                 kinds[i] = switch (ins.ty) {
                     .int => .int,
                     .float => .float,
-                    else => return false, // heap/bool field value → tier-1a
+                    .boolean => .bool, // payload is canonical 0/1 (Value.boolean) → Kind.bool convention
+                    else => return false, // heap field value → tier-1a
                 };
             },
             // hstore: overwrite the present cell in place (no grow — the present-key
-            // rule holds). `a` is the href, `b` the value; native lowers int/float
-            // values to a tag+payload store and declines a heap value. Produces nothing.
+            // rule holds). `a` is the href, `b` the value; native lowers int/float/
+            // bool values to a tag+payload store and declines a heap value. A `.bool`
+            // value is a clean 0/1 GP by convention, so the 8-byte payload store
+            // reproduces `Value.boolean`'s layout bit-for-bit. Produces nothing.
             .hstore => {
                 if (ins.a >= i or ins.b >= i) return false;
                 if (kinds[ins.a] != .href) return false;
                 const vk = kinds[ins.b];
-                if (vk != .int and vk != .float) return false; // heap value → tier-1a
+                if (vk != .int and vk != .float and vk != .bool) return false; // heap value → tier-1a
                 kinds[i] = .none;
             },
             .guard_lane => {
@@ -5769,11 +5773,15 @@ fn emitHStore(a: *x64.Assembler, kinds: []const Kind, alloc: *const Alloc, ins: 
         try a.movByteMemImm(creg, VALUE_TAG_OFF, TAG_FLOAT);
         try a.movsdMemReg(creg, VALUE_PAYLOAD_OFF, XMM_SCRATCH0);
     } else {
-        // Load the value before resolving the cell pointer: a spilled href resolves
-        // through rcx (never rax), and value homes are outside rax/rcx.
+        // int OR bool (doc 43 P1). Load the value before resolving the cell
+        // pointer: a spilled href resolves through rcx (never rax), and value
+        // homes are outside rax/rcx. A `.bool` value is a clean 0/1 GP by
+        // convention, so the raw 8-byte payload store reproduces
+        // `Value.boolean`'s full-width layout bit-for-bit (as the int arm does
+        // `Value.int`'s).
         try placeToReg(a, .rax, placeOfRef(alloc, ins.b));
         const creg = try refBaseReg(a, alloc, ins.a, .rcx);
-        try a.movByteMemImm(creg, VALUE_TAG_OFF, TAG_INT);
+        try a.movByteMemImm(creg, VALUE_TAG_OFF, if (kinds[ins.b] == .bool) TAG_BOOL else TAG_INT);
         try a.storeMemReg(creg, 8, VALUE_PAYLOAD_OFF, .rax);
     }
 }
@@ -6511,11 +6519,17 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             },
             // hload: a typed load from the cell. The dominating guard_hash + per-entry
             // seed validation pinned the cell's identity; here we tag-check `[cell+0]`
-            // against the recorded scalar type (side-exit on a type change — the field
-            // turned from int↔float or to a heap value mid-loop) and load `[cell+8]`.
+            // against the recorded field type (side-exit on a type change — the field
+            // turned int↔float, bool→heap, etc. mid-loop) and load `[cell+8]`. For a
+            // BOOL field this tag check is the field's ONLY strict type pin (the
+            // recorder emits no consumer guard — doc 43 P1), same in tier-1a.
             .hload => {
                 const creg = try refBaseReg(a, alloc, ins.a, .rcx);
-                const want_tag: u8 = if (kinds[i] == .float) TAG_FLOAT else TAG_INT;
+                const want_tag: u8 = switch (kinds[i]) {
+                    .float => TAG_FLOAT,
+                    .bool => TAG_BOOL,
+                    else => TAG_INT,
+                };
                 try a.cmpByteMemImm(creg, VALUE_TAG_OFF, want_tag);
                 try jccNativeExit(a, exit_labels, i, .ne); // field type changed → drop to tier-1a/tier-0
                 if (kinds[i] == .float) {
@@ -6528,6 +6542,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         .reg => unreachable, // a float never homes in a GP register
                     }
                 } else {
+                    // int OR bool: raw 8-byte payload load. A bool cell's payload is
+                    // the canonical full-width 0/1 (`Value.boolean` defines all 8
+                    // bytes), so this lands exactly the Kind.bool 0/1 GP convention.
                     try a.movRegMem(.rax, creg, VALUE_PAYLOAD_OFF);
                     try regToPlace(a, placeOfRef(alloc, i), .rax);
                 }
