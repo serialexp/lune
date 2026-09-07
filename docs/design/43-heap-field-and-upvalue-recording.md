@@ -38,8 +38,14 @@ not one of its phases)_
       slot φs (`nativegen.zig:5914`); eligibility doesn't reject traces with
       sunk heap stores (`trace_code.zig:240`). Determine whether an EXISTING
       sunk `hstore`/`astore` can be skipped on a bridge taken at a guard it
-      was sunk below — if yes, that's a third live bug and a P0 fix; if no,
+      was sunk below — if yes, that's a live bug and a P0 fix; if no,
       document why and pin it with a test.
+- [ ] **Phase 0d — fix the append double-apply under loop-done replay.**
+      `a[#a+1] = v` in the final iteration is applied on-trace AND re-applied
+      by the coarse replay; tier-1a and native both end with a phantom
+      element (repro §3.4, found by the 2026-09-07 adversarial sweep). The
+      inline-append exemption from C1 sinking is only replay-safe when the
+      re-run is idempotent; a length-dependent index is not.
 - [ ] **Phase 1 — bool-valued hash fields (load + store).** `hload ty=.boolean`
       with fused tag exit; bool `hstore`; native arms.
 - [ ] **Phase 2 — function-valued hash fields → method-call inlining.**
@@ -222,9 +228,43 @@ must be established by reading + a targeted repro before P5 adds a third store
 kind to the same discipline. If it is live, it is a P0 fix; if not, document
 the excluding invariant and pin it with a test.
 
-**Common to all of P0:** regression tests pin cross-mode equality on both
-repros; both shapes join the hashgate corpus (`--generate`, rationale in the
-commit).
+### 3.4 Append double-apply under loop-done replay (tier-1a AND native)
+
+Found by the 2026-09-07 adversarial sweep (20 shapes, `/tmp/doc43_sweep/`):
+
+```lua
+local a = {}
+for i = 1, 100 do a[#a + 1] = i end
+print(#a, a[101])   -- tier-0: 100, nil    --trace and --jit-native: 101, 100
+```
+
+The final iteration's `astore_append` executes on-trace; the loop-done exit
+then replays the iteration coarsely and tier-0 appends **again** — the array
+ends one element long, with `a[101] == a[100]`. Appends are exempt from C1
+sinking ("they change len"); that exemption is replay-safe only when the
+re-run is idempotent — nsieve's `p[i] = v` shape is (the replayed store lands
+in-bounds on the same slot), which is why the suite never caught it — but a
+**length-dependent index** (`#a + 1`) recomputes against the mutated length
+and appends a phantom element. Both tiers diverge; every round of a
+loop-in-loop shape adds one (sweep a20: +1 per round). Fix direction is
+root-caused during implementation: make the final-iteration append replay-
+idempotent (sink it into the loop-done flush like other stores, abort the
+shape, or make the exit not replay a completed body) — chosen against doc
+07's discipline, not ad hoc.
+
+**Sweep boundary pins (safe, to become regression tests):** sunk RMW stores
+at loop-done apply exactly once (a17 hash, a18 array); idempotent counting
+appends replay harmlessly (a19); two-ref same-table forwarding is correct or
+fail-closed (a05/a06/a10); cold-branch mutations re-seed correctly on the
+side-exit re-entry (a14/a15 — the mutation must be ON-trace to trigger the
+snapshot class); `set_upval`/`set_global` aborts still protect their direct
+paths (a04/a08); disjoint array-part stores don't alias string-keyed globals
+(a11); cross-entry hash growth is caught by the count guard (a13).
+
+**Common to all of P0:** regression tests pin cross-mode equality on every
+divergent repro; all sweep shapes (divergent AND boundary pins) join the test
+corpus, the divergent ones additionally the hashgate corpus (`--generate`,
+rationale in the commit).
 
 ## 4. Phase 1 — bool-valued hash fields
 
