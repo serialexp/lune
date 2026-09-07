@@ -102,6 +102,9 @@ export const IR_OP_NAMES = [
   "guard_sid", // 80  interned-identity pin — a=string ref, aux=expected konst id (imm)
   "ffloor", // 81  math.floor — float→int via shared fmath kernel (doc 35)
   "fceil", // 82  math.ceil — float→int via shared fmath kernel (doc 35)
+  "uref", // 83  closed-upvalue-cell pointer from entry-seeded slab slot aux (doc 43 P5)
+  "uload", // 84  typed load through a uref cell — a=uref, fused tag exit per ty
+  "ustore", // 85  in-place scalar store through a uref cell — a=uref, b=value
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
@@ -164,6 +167,10 @@ export const UNARY_OR_GUARD_OPS: ReadonlySet<IrOpName> = new Set([
   "guard_append",
   "hload",
   "guard_hash",
+  // Doc 43 P5: the typed closed-cell load renders `%a` like hload. `uref` is
+  // operand-free but renders its seed slot `r{aux}` (the slot_load form —
+  // special-cased in disasm.ts, not here); `ustore` uses the default `%a  %b`.
+  "uload",
   "guard_builtin",
   "fsqrt",
   "fsin",

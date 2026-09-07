@@ -44,7 +44,24 @@ pub const EntryGuard = struct { slot: u16, ty: EntryGuardType };
 /// `(table,key)` operands each iteration (so H0's IR and exec-log behaviour are
 /// frozen). Re-resolved every entry via `Table.fieldPtr`, so — like every seed — no
 /// pointer is ever serialized.
-pub const InputKind = enum(u8) { upvalue, global, hash_cell, callee_upvalue, callee_global };
+/// `upvalue_cell` (doc 43 P5): one ACCESS PATH of a closed-upvalue alias class.
+/// The seed resolves the cell `closure.upvalues[source]` through either the
+/// anchor closure (`callee_slot == UPVALUE_CELL_ANCHOR`) or the closure in slab
+/// slot `callee_slot`, requires it CLOSED, and produces `&cell.loc.closed` (a
+/// `*Value`) into slab slot `slot` tagged `.int` (the `hash_cell` raw-pointer
+/// discipline). The FIRST path of a class writes the slot; every further path
+/// (`verify == true`) re-resolves and DECLINES the entry unless it agrees —
+/// that is how the record-time MUST-alias relation (same observed `*Upvalue`)
+/// is re-proven at entry. ANY failure (missing/open cell, non-function callee,
+/// verifier mismatch) declines the whole candidate to tier-0 — `uref` has no
+/// operands to re-derive from, so no tier-1a downgrade exists.
+pub const InputKind = enum(u8) { upvalue, global, hash_cell, callee_upvalue, callee_global, upvalue_cell };
+
+/// `upvalue_cell` sentinel for `callee_slot`: resolve through the ANCHOR
+/// closure (a depth-0 `get_upval`/`set_upval` path). Never a real slab slot —
+/// the recorder aborts before `next_input_slot` reaches `maxInt(u16)` and real
+/// callee slots are bounded by the slab capacity check at entry.
+pub const UPVALUE_CELL_ANCHOR: u16 = std.math.maxInt(u16);
 
 /// One synthetic entry input the dispatch loop resolves and writes into the slab
 /// before trace entry. For `upvalue`/`global`: `source` is the upvalue index
@@ -82,6 +99,10 @@ pub const InputSeed = struct {
     /// what makes a depth>0 global seedable when the anchor proto's constant pool
     /// doesn't contain the key.)
     callee_slot: u16 = 0,
+    /// `upvalue_cell` only: this seed is a VERIFIER path of an alias class —
+    /// re-resolve the cell and decline the entry unless it equals the pointer
+    /// the class's writer seed (same `slot`, earlier in the array) produced.
+    verify: bool = false,
 };
 
 /// Doc 22 §B.1: the per-VM native seeding context. A seeded trace's entry
@@ -219,12 +240,22 @@ pub const TraceCode = struct {
         return true;
     }
 
+    /// Doc 43 P5 (the sgm_setpos precedent, generalized): the eligibility gate
+    /// for the loop-done linked-exit flush is a CLOSED WHITELIST, not a
+    /// denylist. The region between the loop-done guard and the φ block holds
+    /// exactly the sunk stores `finalize` appended; both materializers
+    /// (`irinterp.flushNumericForLoopDone`, nativegen's
+    /// `emitLinkedLoopDoneSnapshot`) enumerate the same store inventory, so any
+    /// op neither of them models — `sgm_setpos` today, or a future store kind
+    /// added without its two flush arms — declines the flush here and the
+    /// linked exit falls back to tier-0 replaying the final iteration
+    /// (correct, merely slower). A denylist would silently LOSE the new store.
     pub fn loopDoneSnapshotSupported(self: *const TraceCode, exit_instr: usize) bool {
         var i = exit_instr + 1;
         while (i < self.instrs.len) : (i += 1) switch (self.instrs[i].op) {
-            .sgm_setpos => return false,
+            .astore, .hstore, .gstore, .ustore => {},
             .phi, .loop, .link => return true,
-            else => {},
+            else => return false,
         };
         return true;
     }
@@ -278,7 +309,7 @@ pub const TraceCode = struct {
         // correct for these guards.
         var si = instr_idx + 1;
         while (si < self.instrs.len) : (si += 1) switch (self.instrs[si].op) {
-            .astore, .astore_append, .hstore, .gstore, .sgm_setpos => return false,
+            .astore, .astore_append, .hstore, .gstore, .sgm_setpos, .ustore => return false,
             else => {},
         };
         for (self.instrs) |ins| if (ins.op == .phi and ins.aux != trace_ir.PHI_INTERNAL and ins.b < instr_idx) return true;

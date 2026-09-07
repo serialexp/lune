@@ -122,13 +122,22 @@ fn kindOf(op: IrOp) OpKind {
         // themselves (never folded, never CSE'd) so a later store can't be
         // reordered past them. DCE'd if not reachable from a live root.
         // `href`/`hload` are the hash-field analogues — same memory-op treatment.
-        .aref, .href => .aref,
+        // `uref` (doc 43 P5) is the closed-upvalue-cell token: no operands (the
+        // seeded slab slot rides `aux`), but the same canonical-to-self
+        // memory-op treatment so `uload`/`ustore` can never be reordered
+        // around it and repeated emission is impossible (the recorder's class
+        // map already guarantees one per alias class).
+        .aref, .href, .uref => .aref,
         // Grid-cell address chain (doc 14, Phase 8): `garow` (table+row → row base)
         // and `gcell` (row base+col → cell) are memory-address producers, same
         // canonical-to-self memory-op treatment as `aref` so a later `gstore` can't
         // be reordered past them. DCE'd if not reachable from a live root.
         .garow, .gcell => .aref,
-        .aload, .hload => .aload,
+        // `uload` (doc 43 P5) joins the load class: never folded/CSE'd/hoisted
+        // across the store class (`ustore` mutates what it reads), DCE'd only
+        // when dead (its fused tag exit protects nothing then — deopt replay
+        // re-reads the cell in tier-0).
+        .aload, .hload, .uload => .aload,
         // Grid-cell load (doc 14, Phase 8): the hash/array-load analogue. Reads the
         // `gcell` address (`a`).
         .gload => .aload,
@@ -142,7 +151,9 @@ fn kindOf(op: IrOp) OpKind {
         // `astore_append` is the grow analogue of `astore`: an effectful, never-DCE'd
         // alias/CSE barrier. Same `.astore` kind (reads `a`=aref + `b`=value).
         // `hstore` is the hash-field store — same effectful never-DCE'd treatment.
-        .astore, .astore_append, .hstore => .astore,
+        // `ustore` (doc 43 P5) is the closed-cell store — same effectful
+        // never-DCE'd alias/CSE-barrier treatment (reads `a`=uref + `b`=value).
+        .astore, .astore_append, .hstore, .ustore => .astore,
         // Grid-cell store (doc 14, Phase 8): effectful, never-DCE'd alias/CSE barrier.
         // Reads `a`=gcell address + `b`=value, same as `astore`.
         .gstore => .astore,

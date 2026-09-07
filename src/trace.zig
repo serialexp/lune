@@ -77,6 +77,7 @@ pub const EntryGuardType = trace_code.EntryGuardType;
 pub const EntryGuard = trace_code.EntryGuard;
 pub const InputKind = trace_code.InputKind;
 pub const InputSeed = trace_code.InputSeed;
+pub const UPVALUE_CELL_ANCHOR = trace_code.UPVALUE_CELL_ANCHOR;
 pub const NativeSeedCtx = trace_code.NativeSeedCtx;
 
 pub const Ref = trace_ir.Ref;
@@ -858,6 +859,11 @@ pub const TraceState = struct {
     /// supply-per-call discipline. Copied into the recorder's `InstructionContext`
     /// by `recordInstr`; consumed by `recInputGet` to reject aliasing snapshots.
     rec_upval_open: ?usize = null,
+    /// Doc 43 P5: per-instruction supply of a `get_upval`/`set_upval`'s
+    /// resolved `*Upvalue` cell (null for other ops) — the recorder keys
+    /// closed-cell alias classes and the snapshot-read set on its address.
+    /// Same supply-per-call discipline as `rec_upval_open`.
+    rec_upval_cell: ?*function.Upvalue = null,
     /// Doc 43 §3.2 (P0b): the VM globals table's `GcHeader` address, so the
     /// recorder can recognise a store into `_G`. Stable per VM; set by `Vm.initBare`
     /// (null in bare test harnesses — the globals coherence check then no-ops).
@@ -985,6 +991,16 @@ pub const TraceState = struct {
     /// while-loop-done guard (`noteWhileYield`). Reset per verdict and on the
     /// epoch boundary with the gates.
     while_yield: std.AutoHashMapUnmanaged(AnchorKey, WhileYield) = .empty,
+    /// Doc 43 P5 (the read-routing memo): anchors where a recording aborted
+    /// `.upvalue_mutable` — a `set_upval` hit a cell whose value the same
+    /// recording had already baked into the per-entry snapshot. The gated
+    /// retry arms with `route_upvalue_reads`, so scalar closed-cell reads go
+    /// through per-iteration `uload`s from the start and the store records.
+    /// Read-only loops never land here and keep their free snapshot hoist —
+    /// the LuaJIT-flavoured penalty/retry answer to doc 43 §8's open question.
+    /// Grows monotonically (an anchor set is never cleared: the loop's shape
+    /// is lexical); bounded by the number of distinct upvalue-mutating loops.
+    upvalue_mutable_memo: std.AutoHashMapUnmanaged(AnchorKey, void) = .empty,
     /// Re-entry penalty per anchor: a low-yield trace entry bumps it, a
     /// productive one clears it (doc 31 D2); at `config.max_penalty` the anchor
     /// is gated off with a doubling cooldown (`onSideExit` → `gateAnchor`).
@@ -1751,6 +1767,7 @@ pub const TraceState = struct {
         self.record_gate.deinit(self.gpa);
         self.lleave_count.deinit(self.gpa);
         self.unroll_fail.deinit(self.gpa);
+        self.upvalue_mutable_memo.deinit(self.gpa);
         self.while_yield.deinit(self.gpa);
         self.penalty.deinit(self.gpa);
         self.guard_failures.deinit(self.gpa);
@@ -2892,7 +2909,7 @@ pub const TraceState = struct {
         self.configureRecording();
         const target_i: i64 = @as(i64, pc) + instr.aux;
         const target: ?u32 = if (instr.op == .for_prep) pc else if (instr.op == .jmp and target_i >= 0 and target_i < proto.code.len) @intCast(target_i) else null;
-        self.rec.context = .{ .heap = self.rec_heap, .upval_open = self.rec_upval_open, .globals_header = self.rec_globals_header };
+        self.rec.context = .{ .heap = self.rec_heap, .upval_open = self.rec_upval_open, .globals_header = self.rec_globals_header, .upval_cell = self.rec_upval_cell };
         if (target) |dest| {
             self.rec.context.inner_root = self.findLoopTrace(proto, dest) != null;
             const leaves = self.lleave_count.get(.{ .proto = proto, .pc = dest }) orelse 0;
@@ -2910,6 +2927,10 @@ pub const TraceState = struct {
         // aliasing check. `reset` zeroes it; the dispatch loop stashed `st.base`
         // in `pending_anchor_base` just before this `onBackEdge` call.
         self.rec.anchor_abs_base = self.pending_anchor_base;
+        // Doc 43 P5: arm with the anchor's mutable-upvalue memo, so a retry
+        // after an `.upvalue_mutable` abort routes scalar closed-cell reads
+        // through `uload` from the first instruction.
+        self.rec.route_upvalue_reads = self.upvalue_mutable_memo.contains(.{ .proto = proto, .pc = target_pc });
     }
 
     /// Abandon the in-flight recording: deactivate, remember why, and gate the
@@ -2946,6 +2967,13 @@ pub const TraceState = struct {
         // strikes normally from then on (and unlocks `recWhileLink`'s
         // innerloopleft unroll). On OOM fall through to the normal strike —
         // fail-closed, never a hotter path.
+        // Doc 43 P5: memoize the anchor before the ordinary gate strike — the
+        // gated retry re-records with `route_upvalue_reads` (see `arm`) and the
+        // store that aborted here then records. OOM drops the memo: the retry
+        // simply re-aborts and re-tries the memo, never a hotter path.
+        if (reason == .upvalue_mutable) {
+            self.upvalue_mutable_memo.put(self.gpa, notice.anchor, {}) catch {};
+        }
         if (reason == .loop_leave) {
             if (self.lleave_count.getOrPut(self.gpa, notice.anchor)) |gop| {
                 if (!gop.found_existing) gop.value_ptr.* = 0;

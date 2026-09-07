@@ -1,14 +1,17 @@
 # 43 — heap-valued fields, assert, and upvalue stores (tracing the OOP + closure-iterator idioms)
 
-Status: **PARTIAL — P0 (all four), P1 (bool hash fields), P2 (function hash
-fields → method inlining), P3 (table hash fields + dynamic aref), and P4
-(assert + callee_global seeds + append-bar narrowing + typed-SLOAD pins)
-landed 2026-09-07; P5 outstanding — and no longer required for array3d's
-steady state, which now runs 97.4% native. Two review rounds folded in
-(codex + technical-architect; ledger at bottom). The adversarial sweep
-(a01–a20) is permanent in `trace_p0_alias_test.zig`, green on all ten legs.**
+Status: **COMPLETE (v1 scope) — P0 (all four), P1 (bool hash fields), P2
+(function hash fields → method inlining), P3 (table hash fields + dynamic
+aref), and P4 (assert + callee_global seeds + append-bar narrowing +
+typed-SLOAD pins) landed 2026-09-07; P5 (closed-cell upvalue stores,
+scalar v1) landed 2026-09-08. array3d's steady state runs 97.4% native.
+Only the knowingly-deferred bullets remain (heap-valued ustore,
+close_upvalues/.closure, open-cell stores, method-load hoisting). Two
+review rounds folded in (codex + technical-architect; ledger at bottom).
+The adversarial sweep (a01–a20) is permanent in `trace_p0_alias_test.zig`,
+green on all ten legs.**
 Owner: Bart
-Last updated: 2026-09-07
+Last updated: 2026-09-08
 
 Prerequisite reading: doc 10 (cross-frame tracing, input seeds, `guard_func`),
 doc 11 (hash-field tracing), doc 32 (value-lane scalar access — the exec-log
@@ -151,19 +154,48 @@ to Done once everything inside a phase is checked.
       iterations as trace (~192 vs ~22 261 Debug cycles/iter)**, from 0%.
       Tests: 2 recorder + 4 ten-leg e2e incl. a mini-array3d cascade pin.
 
+- [x] **Phase 5 — closed-cell upvalue stores (`uref`/`uload`/`ustore`),
+      SCALAR stored values only in v1.** Landed 2026-09-08 per §8, with one
+      refinement over the sketch: the seed resolves **`&cell.loc.closed`
+      (a `*Value`)** rather than the `*Upvalue`, so the u-family is exactly
+      href/hload/hstore-shaped and native reuses the hash-cell machinery
+      verbatim (`uref` = href's invariant slab load, `uload` = hload minus
+      the `.heap` arm, `ustore` = `emitHStore`; `proveKinds` gives `uref`
+      the `.href` kind). Physical-cell alias classes keyed on the observed
+      `*Upvalue` address, one `uref` per class; multi-path re-proof via
+      `verify=true` seeds (compare-don't-write, same slot). Entry failure
+      DECLINES the whole candidate (seedTraceInputs → null / native twin →
+      `SEED_CAPACITY_DECLINE`) — no tier-1a downgrade, no per-iteration
+      structural guard (a closed cell never re-opens). Three-site loop-done
+      flush in lockstep: `loopDoneSnapshotSupported` converted to a closed
+      whitelist ({astore, hstore, gstore, ustore}), irinterp's flush and the
+      native linked-snapshot twin both grew `ustore` arms + fail-fast elses;
+      `classifyBridgeCandidate`'s store bar includes `ustore` (P0c).
+      C1: `ustore` sinks like hstore, `traceHasHeapLoad` counts `uload`,
+      `forwardPendingUload` is an exact MUST/NO lattice on uref-token
+      identity. Exec-log discipline: `uref` logs `Value.nil()` (raw pointers
+      never enter the log — the href precedent); `uload` tag-checks before
+      logging. Wire ordinals 83/84/85 pinned (traceser_test + viz mirror).
+      Tests: 6 recorder-shape + 4 ten-leg e2e (RMW memo retry, same-proto
+      rebinding, verify-mismatch decline, mixed ustore+hstore loop-done).
+- [x] **Invariant (P2×P5): `recCalleeUpval`'s slot_load gate must hold the
+      weight.** Inherited unchanged: `upvalAccessPathSlot` requires a
+      slot_load-backed callee for every depth>0 path (anchor paths use the
+      `UPVALUE_CELL_ANCHOR` sentinel) and aborts `.cross_frame` otherwise —
+      the hload-backed-callee recorder test pins it.
+- [x] **Open question — P5 read routing.** RESOLVED as the anchor-keyed
+      mutable-upvalue memo (abort-once-and-retry): a `set_upval` hitting a
+      cell already read via snapshot aborts `.upvalue_mutable` and memos the
+      anchor; the gated retry routes SCALAR closed-cell reads through
+      `uload` from the start (reads also route whenever the cell already
+      has a class, so read-after-store sees pending values). Read-only
+      loops keep the free snapshot hoist; function/table reads always stay
+      snapshots. The scalar bar precedes the mutable-read bar in
+      `recSetUpval` so unfixable shapes never memo a pointless retry.
+
 ### Outstanding
-- [ ] **Phase 5 — closed-cell upvalue stores (`uref`/`uload`/`ustore`),
-      SCALAR stored values only in v1.** Physical-cell alias classes,
-      entry-decline (not downgrade) seed grammar, three-site loop-done flush +
-      eligibility whitelist conversion, existing-classifier arms, anchor+callee
-      cell sources, wire-format work. Unlocks generic-for iterator closures.
-- [ ] **Invariant (P2×P5): `recCalleeUpval`'s slot_load gate is load-bearing.**
-      Any P5 cell-resolution path must inherit it unchanged, or `guard_func`
-      identity must tighten to closure `GcHeader.id` first (§5).
 - [ ] **Open question — P0a scope.** Precise anchor-base aliasing check vs
       conservative any-open abort (measure abort-table fallout on the suite).
-- [ ] **Open question — P5 read routing.** Anchor-keyed mutable-upvalue memo
-      (abort-once-and-retry) vs always-`uload` for callee upvalue reads.
 - [ ] **Open question — P0/arc sequencing.** Land P0a+P0b (+0c if real) as an
       immediate bugfix commit ahead of the arc, or as the arc's first phase.
 - [ ] **Defer — heap-valued `ustore`.** Needs a native write-barrier callout

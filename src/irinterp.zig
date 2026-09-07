@@ -120,8 +120,22 @@ pub fn flushNumericForLoopDone(t: *const Trace, regs: RegWindow, values: []Value
                 const col: usize = @intCast(values[gcell.b].asInt() - 1);
                 tbl.array.gridSet(row, col, values[p.b]);
             },
+            // Doc 43 P5: flush the sunk closed-cell store — the uref token's
+            // value IS the `*Value` cell pointer (tagged int, seeded at entry).
+            .ustore => {
+                const cell: *Value = @ptrFromInt(@as(usize, @intCast(values[p.a].payload.bits)));
+                cell.* = values[p.b];
+            },
             .phi, .loop, .link => break,
-            else => {},
+            // `loopDoneSnapshotSupported` (consulted above) whitelists exactly
+            // the four store arms + the φ block, so any other op here means the
+            // gate and this walk drifted apart — refuse the flush BEFORE any
+            // partial application could double-apply an RMW on the tier-0
+            // replay path. (The sgm_setpos fail-fast precedent, generalized.)
+            else => {
+                std.debug.assert(false);
+                return false;
+            },
         }
     }
 
@@ -539,6 +553,51 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     const hr = t.instrs[ins.a];
                     const tbl = table.Table.fromHeader(values[hr.a].asHeap());
                     tbl.fieldPtr(values[hr.b]).?.* = values[ins.b];
+                    values[i] = Value.nil();
+                    if (record) rec.value(i, values[i]);
+                },
+                // ---- closed-cell upvalue access (doc 43 P5) ----
+                // `uref`: the seeded `*Value` cell pointer, read from its slab
+                // slot exactly like a `slot_load` (the entry seeder proved the
+                // cell closed and every access path agreeing; a failed seed
+                // DECLINED this entry before we ran). The raw pointer must
+                // never enter the exec log (record vs replay runs would
+                // diverge on addresses), so log nil — the `href` precedent.
+                .uref => {
+                    values[i] = regs.get(@intCast(ins.aux));
+                    if (record) rec.value(i, Value.nil());
+                },
+                // `uload`: typed load of the cell's owned Value. The fused tag
+                // exit per the recorded scalar `ty` is the field's strict type
+                // pin (the hload discipline): tag-check BEFORE logging, so a
+                // drifted cell (int→heap between entries, or a same-episode
+                // store of a drifted type — impossible on-trace, ustore is
+                // scalar-pinned) side-exits instead of feeding consumers.
+                .uload => {
+                    const cell: *const Value = @ptrFromInt(@as(usize, @intCast(values[ins.a].payload.bits)));
+                    const fv = cell.*;
+                    const type_ok = switch (ins.ty) {
+                        .int => fv.isInt(),
+                        .float => fv.isFloat(),
+                        .boolean => fv.isBool(),
+                        else => false, // v1 routes only scalar-observed reads
+                    };
+                    if (!type_ok) {
+                        if (record) rec.exit(i, .guard, Value.nil());
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                    values[i] = fv;
+                    if (record) rec.value(i, values[i]);
+                },
+                // `ustore`: overwrite the closed cell's Value in place. The
+                // value ref is scalar-pinned by the recorder (guardNum /
+                // static bool proof), so no write barrier is needed (it is a
+                // no-op for scalars under every current and planned GC — the
+                // heap-valued store is deferred until a native barrier ABI
+                // exists, doc 43 §8).
+                .ustore => {
+                    const cell: *Value = @ptrFromInt(@as(usize, @intCast(values[ins.a].payload.bits)));
+                    cell.* = values[ins.b];
                     values[i] = Value.nil();
                     if (record) rec.value(i, values[i]);
                 },

@@ -4306,3 +4306,287 @@ test "doc 30 c5: guard_sid identity pin — a pattern rebound between loop runs 
     }
     try testing.expect(found_sid);
 }
+
+// ---------------------------------------------------------------------------
+// Doc 43 P5: closed-cell upvalue stores (uref / uload / ustore, scalar v1).
+// ---------------------------------------------------------------------------
+
+test "recorder (upvalue cell, P5): a write-only closed-cell store records uref+ustore on the FIRST attempt" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `last = i` never READS the cell inside the loop, so no snapshot seed
+    // exists for it and the store is admitted on the very first recording —
+    // no `.upvalue_mutable` memo round-trip. The factory shape matters: the
+    // cell must be CLOSED (make() returned) or recSetUpval declines.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local function make()
+        \\  local last = 0
+        \\  return function(n)
+        \\    for i = 1, n do last = i end
+        \\    return last
+        \\  end
+        \\end
+        \\local f = make()
+        \\print(f(50))
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expectEqual(@as(u32, 0), vm.trace.record_gate.count());
+    const t = vm.trace.registry.cache.items[0];
+    var n_uref: usize = 0;
+    var saw_ustore = false;
+    for (t.code.instrs) |ins| {
+        if (ins.op == .uref) n_uref += 1;
+        if (ins.op == .ustore) saw_ustore = true;
+        try testing.expect(ins.op != .uload); // pure write: no routed read
+    }
+    try testing.expectEqual(@as(usize, 1), n_uref); // one alias class → one uref
+    try testing.expect(saw_ustore);
+    // Exactly one upvalue_cell seed, and it is the WRITER (not a verifier).
+    var n_cell_seeds: usize = 0;
+    for (t.code.inputs) |seed| {
+        if (seed.kind == .upvalue_cell) {
+            n_cell_seeds += 1;
+            try testing.expect(!seed.verify);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), n_cell_seeds);
+}
+
+test "recorder (upvalue cell, P5): an RMW (c = c + 1) aborts once with the memo, then the retry records uref+uload+ustore" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // First attempt: the read routes to a snapshot seed (registering the cell in
+    // `snapshot_read_cells`), so the store aborts `.upvalue_mutable` and memos the
+    // anchor. The record gate's first window is backoff_base (128 ticks), so 400
+    // iterations guarantee a retry — which routes the read through uload from the
+    // start and commits.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local function make()
+        \\  local count = 0
+        \\  return function(n)
+        \\    for i = 1, n do count = count + 1 end
+        \\    return count
+        \\  end
+        \\end
+        \\local f = make()
+        \\print(f(400))
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.record_gate.count() >= 1); // the memoized first abort struck the gate
+    const t = vm.trace.registry.cache.items[0];
+    var n_uref: usize = 0;
+    var saw_uload = false;
+    var saw_ustore = false;
+    for (t.code.instrs) |ins| {
+        if (ins.op == .uref) n_uref += 1;
+        if (ins.op == .uload) saw_uload = true;
+        if (ins.op == .ustore) saw_ustore = true;
+    }
+    try testing.expectEqual(@as(usize, 1), n_uref);
+    try testing.expect(saw_uload);
+    try testing.expect(saw_ustore);
+}
+
+test "recorder (upvalue cell, P5): two access paths to ONE cell share the uref and add a VERIFIER seed" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `setter` (inlined callee) and the anchor closure both close over the same
+    // `x`. The retry records the first path as the class WRITER; the second path
+    // resolves the same cell → same uref, plus a verify=true seed that re-proves
+    // the record-time aliasing at every future entry (the s1-into-f2 trap).
+    var chunk = try runForTrace(&vm, gpa,
+        \\local function make()
+        \\  local x = 0
+        \\  local setter = function(d) x = x + d end
+        \\  local f = function(n)
+        \\    for i = 1, n do setter(2); x = x + 1 end
+        \\    return x
+        \\  end
+        \\  return f
+        \\end
+        \\local f = make()
+        \\print(f(400))
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
+    var n_uref: usize = 0;
+    var saw_ustore = false;
+    for (t.code.instrs) |ins| {
+        if (ins.op == .uref) n_uref += 1;
+        if (ins.op == .ustore) saw_ustore = true;
+    }
+    try testing.expectEqual(@as(usize, 1), n_uref); // ONE cell → ONE class → ONE uref
+    try testing.expect(saw_ustore);
+    var n_writer: usize = 0;
+    var n_verifier: usize = 0;
+    for (t.code.inputs) |seed| {
+        if (seed.kind != .upvalue_cell) continue;
+        if (seed.verify) n_verifier += 1 else n_writer += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n_writer);
+    try testing.expectEqual(@as(usize, 1), n_verifier);
+}
+
+test "recorder (upvalue cell, P5): a store to an OPEN cell aborts (no trace)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `n` still lives on outer's active frame, so the cell is OPEN: the pointer
+    // `&cell.loc.closed` doesn't exist yet and open-cell stores write through the
+    // stack — v1 declines the shape entirely (fail closed, doc 43 §8).
+    var chunk = try runForTrace(&vm, gpa,
+        \\local function outer()
+        \\  local n = 0
+        \\  local function bump() n = n + 1 end
+        \\  for i = 1, 50 do bump() end
+        \\  return n
+        \\end
+        \\print(outer())
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.record_gate.count() >= 1);
+    try testing.expect(!vm.trace.isRecording());
+}
+
+test "recorder (upvalue cell, P5): a HEAP-valued store aborts fail-closed (scalar v1)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // The stored value is a string konst — not int/float/bool. The scalar bar
+    // sits BEFORE the mutable-read bar in recSetUpval, so this unfixable shape
+    // aborts .bad_type without memoizing a pointless retry.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local function make()
+        \\  local s = "a"
+        \\  return function(n)
+        \\    for i = 1, n do s = "b" end
+        \\    return s
+        \\  end
+        \\end
+        \\local f = make()
+        \\print(f(50))
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.record_gate.count() >= 1);
+    try testing.expect(!vm.trace.isRecording());
+}
+
+test "recorder (upvalue cell, P5): an hload-backed (computed) callee's upvalue access aborts — the P2×P5 invariant" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `t.inc` is an hload'd function field (P2 inlines it fine), but its body
+    // touches an upvalue: the access path needs a slot_load-backed callee to be
+    // re-resolvable at entry, and an hload result is not one — abort, no trace.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local function make()
+        \\  local c = 0
+        \\  return { inc = function() c = c + 1 end }
+        \\end
+        \\local t = make()
+        \\for i = 1, 400 do t.inc() end
+        \\print("done")
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.record_gate.count() >= 1);
+    try testing.expect(!vm.trace.isRecording());
+}
+
+test "upvalue cell P5 end-to-end: steady-state counter closure (RMW via memo retry), all ten legs" {
+    // The doc 43 §8 headline shape: a closed-over accumulator mutated every
+    // iteration. First attempt memos, the retry commits uref/uload/ustore, and
+    // the remaining iterations run on the trace; the second call re-seeds the
+    // same cell and continues. Byte-identical across the ten-leg matrix.
+    try expectProgram(
+        \\local function make()
+        \\  local count = 0
+        \\  return function(n)
+        \\    for i = 1, n do count = count + i end
+        \\    return count
+        \\  end
+        \\end
+        \\local f = make()
+        \\print(f(500), f(3))
+    , "125250\t125256\n");
+}
+
+test "upvalue cell P5 end-to-end: same-proto closure swap REBINDS the cell seed (g must not mutate f's cell)" {
+    // The trace is recorded against f's cell; g enters the same anchor with its
+    // OWN cell. The seed re-resolves per entry (the .upvalue snapshot-seed
+    // discipline), so native writes must land in g's cell — a baked record-time
+    // pointer would corrupt f. f(1) then proves f's cell was untouched by g.
+    try expectProgram(
+        \\local function make()
+        \\  local c = 0
+        \\  return function(n)
+        \\    for i = 1, n do c = c + 1 end
+        \\    return c
+        \\  end
+        \\end
+        \\local f, g = make(), make()
+        \\print(f(400), g(400), f(1))
+    , "400\t400\t401\n");
+}
+
+test "upvalue cell P5 end-to-end: a verify-seed mismatch DECLINES the entry (record-time aliasing broken), stays exact" {
+    // Recorded from f1, where `inc` IS f1's own setter: the verifier seed proves
+    // inc's cell == the anchor's x cell. f2 borrows f1's setter (same proto — the
+    // guard_func pin passes!), so only the verifier stands between the trace and
+    // silently collapsing f2's two distinct cells into one. Every leg must agree:
+    //   f1(400): 400·(2+1)            → 1200
+    //   f2(400): f2.x gets +1/iter    → 400   (inc adds +2/iter to f1.x → 2000)
+    //   f1(2):   2000 + 2·(2+1)       → 2006
+    try expectProgram(
+        \\local function make(inc)
+        \\  local x = 0
+        \\  local setter = function(d) x = x + d end
+        \\  if inc == nil then inc = setter end
+        \\  local f = function(n)
+        \\    for i = 1, n do inc(2); x = x + 1 end
+        \\    return x
+        \\  end
+        \\  return f, setter
+        \\end
+        \\local f1, s1 = make(nil)
+        \\local f2, s2 = make(s1)
+        \\print(f1(400), f2(400), f1(2))
+    , "1200\t400\t2006\n");
+}
+
+test "upvalue cell P5 end-to-end: mixed ustore + hstore in one loop (C1 sinking + loop-done flush), all ten legs" {
+    // `total` is a closed-cell RMW (uload → ustore) and `t.sum` a hash-field
+    // store; the uload makes the trace heap-loading, so BOTH stores defer
+    // through pending_stores and flush in order — including at the numeric
+    // loop-done boundary (tier-1a flushNumericForLoopDone + the native linked
+    // snapshot twin, whose whitelist now admits ustore).
+    try expectProgram(
+        \\local function make()
+        \\  local total = 0
+        \\  return function(t, n)
+        \\    for i = 1, n do
+        \\      total = total + i
+        \\      t.sum = total
+        \\    end
+        \\    return total
+        \\  end
+        \\end
+        \\local f = make()
+        \\local acc = { sum = 0 }
+        \\print(f(acc, 500), acc.sum)
+    , "125250\t125250\n");
+}

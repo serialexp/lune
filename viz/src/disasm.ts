@@ -48,6 +48,8 @@ const PHI_INTERNAL = -1;
 /** Render one instruction's operand column, exactly as `writeIrInstr` does. */
 function operandsOf(opName: string, a: number, b: number, aux: number): string {
   if (opName === "slot_load") return `r${aux}`;
+  // Doc 43 P5: uref prints its seed slot like slot_load (`writeIrInstr` parity).
+  if (opName === "uref") return `r${aux}`;
   if (opName === "konst") return `k${aux}`;
   // φ: slot-bound prints `update=%b -> r{slot}`; internal prints
   // `init=%a update=%b -> internal` (the loop-carried writeback rides the stream).

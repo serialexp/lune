@@ -249,6 +249,13 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
     for (instrs, 0..) |ins, i| {
         switch (ins.op) {
             .slot_load => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < input_limit),
+            // Doc 43 P5: `uref`'s aux is a synthetic seed slot — same bound as
+            // a slot_load (and always >= num_registers, but the tighter check
+            // needs the recorder's watermark, which finalize doesn't carry).
+            .uref => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < input_limit),
+            // `uload` reads its uref; `ustore` reads uref + value.
+            .uload => std.debug.assert(ins.a < i),
+            .ustore => std.debug.assert(ins.a < i and ins.b < i),
             .konst => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < consts_len),
             .loop => std.debug.assert(i == last), // the only loop, and it is terminal
             // `.link` (doc 15): terminal hand-off to an inner root. Like `.loop`

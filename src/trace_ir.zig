@@ -608,6 +608,42 @@ pub const IrOp = enum(u8) {
     /// `math.ceil(x)`: `@ceil` + convert to `i64`. Same contract as `ffloor`.
     /// Wire ordinal 82.
     fceil,
+
+    // ---- closed-cell upvalue access (doc 43 P5) -------------------------------
+    //
+    // The mirror of `href`/`hload`/`hstore` for a CLOSED upvalue cell's owned
+    // `Value` slot. The entry seeder resolves `&cell.loc.closed` (a `*Value`,
+    // never serialized) into the synthetic slab slot `uref.aux`, after proving
+    // the cell CLOSED and every access path of the alias class agreeing on one
+    // cell (`InputSeed.kind == .upvalue_cell`); a failed resolution DECLINES the
+    // whole entry to tier-0 (`.next_candidate`) — there are no operands to
+    // re-derive the cell from, so no tier-1a downgrade exists (unlike
+    // `hash_cell`). A closed cell can never re-open and the GC is non-moving,
+    // so the pointer is stable for the episode with NO per-iteration
+    // structural guard (the `guard_hash` analogue is unnecessary).
+    //
+    /// `aux` = the synthetic slab slot holding the seeded `*Value` cell pointer
+    /// (tagged `.int` so a GC scan of the dead scratch never mistakes it for a
+    /// header). One `uref` per alias class — the recorder keys classes on the
+    /// OBSERVED `*Upvalue` at record time. Carries no usable guest `Value`
+    /// (tier-1a logs nil, like `href` — a raw pointer must never enter the exec
+    /// log). Classified `.aref` (memory token, canonical-to-self); native kind
+    /// is the seeded cell pointer (`Kind.href`). Wire ordinal 83.
+    uref,
+    /// `a` = `uref` ref → load the cell's tagged `Value`, fused tag exit per the
+    /// recorded `ty` (int/float/bool — v1 routes only scalar-observed reads
+    /// through cells). The `hload` twin: tier-1a tag-checks before logging;
+    /// native `cmp byte [cell], TAG_*` + payload load. Classified `.aload`
+    /// (never folded/CSE'd across the store class). Wire ordinal 84.
+    uload,
+    /// `a` = `uref` ref, `b` = value ref → overwrite the closed cell's `Value`
+    /// in place (tag + payload). SCALAR values only in v1 (int/float/bool —
+    /// recorder-enforced), which sidesteps the native write-barrier ABI (the
+    /// barrier is only meaningful for heap values; today it is a no-op
+    /// everywhere). Follows the C1 store-sink discipline of `hstore` (deferred
+    /// below every guard when the trace has a prior heap load). Effectful;
+    /// never DCE'd. Classified `.astore`. Wire ordinal 85.
+    ustore,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
@@ -729,6 +765,11 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .scap_int, .scap_str => try w.print("%{d}  [{d}]", .{ ins.a, ins.b }),
         .str2num_i, .str2num_f => try w.print("%{d}", .{ins.a}),
         .sgm_setpos => try w.print("%{d}  pos=%{d}", .{ ins.a, ins.b }),
+        // Closed-cell upvalue access (doc 43 P5): uref renders its seed slot,
+        // uload its cell token, ustore cell + value.
+        .uref => try w.print("r{d}", .{ins.aux}),
+        .uload => try w.print("%{d}", .{ins.a}),
+        .ustore => try w.print("%{d}  %{d}", .{ ins.a, ins.b }),
         // guard_sid: operand + the expected string's konst id.
         .guard_sid => try w.print("%{d}  sid=k{d}", .{ ins.a, ins.aux }),
         // `guard_builtin` reads the callee `%a` and tags the builtin in `aux`.

@@ -21,6 +21,52 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-08b — doc 43 P5 LANDED + gated; arc COMPLETE (v1 scope)
+
+P5 (closed-cell upvalue stores, scalar v1) landed per doc 43 §8, closing the
+arc. The design's one refinement over the sketch: seeds resolve
+**`&cell.loc.closed` (a `*Value`)**, not the `*Upvalue` — so `uref`/`uload`/
+`ustore` (wire 83/84/85) are exactly href/hload/hstore-shaped and native
+reuses the hash-cell emitters verbatim (uref = href's invariant slab load,
+uload = hload minus `.heap`, ustore = `emitHStore`; `proveKinds` kind =
+`.href`). The moving parts:
+
+- **Alias classes + verifier seeds.** Classes keyed on the observed `*Upvalue`
+  address; one uref per class; each additional access path appends a
+  `verify=true` seed (same slot, compare-don't-write) re-proving record-time
+  MUST-aliasing at every entry — pinned by the s1-into-f2 e2e (same proto ⇒
+  guard_func passes; ONLY the verifier separates two distinct cells).
+- **Entry-failure grammar = DECLINE.** seedTraceInputs → null / native twin →
+  SEED_CAPACITY_DECLINE routes the entry to tier-0. No tier-1a downgrade
+  (uref has no operands to re-derive), no per-iteration structural guard
+  (closed cells never re-open). Per-entry re-resolution REBINDS correctly
+  (same-proto closure swap e2e).
+- **Read routing = anchor-keyed memo + retry.** set_upval on a snapshot-read
+  cell aborts `.upvalue_mutable` + memos (`upvalue_mutable_memo`, AnchorKey);
+  the gated retry routes scalar closed-cell reads through uload from the
+  start. Reads also route when the cell already has a class (read-after-store
+  forwards pending values via `forwardPendingUload`, exact uref-token MUST/NO
+  lattice). Scalar bar precedes the mutable bar in recSetUpval → unfixable
+  shapes never memo. Function/table reads stay snapshots.
+- **Loop-done flush lockstep ×3.** `loopDoneSnapshotSupported` is now a closed
+  WHITELIST ({astore,hstore,gstore,ustore}); irinterp's flush + the native
+  linked-snapshot twin grew ustore arms and fail-fast elses;
+  classifyBridgeCandidate's store bar includes ustore (P0c discipline).
+- **Depth>0 paths inherit recCalleeUpval's slot_load gate**
+  (`upvalAccessPathSlot`, anchor sentinel `UPVALUE_CELL_ANCHOR`); hload-backed
+  callee upvalue access aborts `.cross_frame` (recorder test pins it).
+- **Exec-log:** uref logs `Value.nil()` — raw pointers never enter the log.
+
+Tests: 6 recorder-shape + 4 ten-leg e2e in interp_trace_test.zig. Gates all
+green 2026-09-08: `just test`, hashgate 84 digests ×2 legs, `zig build wasm`,
+viz `bun test` 69 pass. Sanity: the counter-closure RMW runs 100% of loop
+iterations native at ~5.4 cycles/iter (`--jit-stats`). Remaining doc-43
+bullets are the knowing deferrals (heap ustore, close_upvalues/.closure,
+open-cell stores, method-load hoisting) + two P0 open questions.
+
+Next: full bench board re-run for the campaign map, then pick the next arc
+from it (nbody backend seams / return tracing per the map above).
+
 ## Status 2026-09-08a — doc 43 P4 LANDED + gated; array3d 0% → 97.4% native; P5 optional
 
 P4 turned into FOUR general levers (each one array3d merely *revealed*, per Z-6):

@@ -2160,6 +2160,41 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (vk != .int and vk != .float and vk != .bool) return false; // heap value → tier-1a
                 kinds[i] = .none;
             },
+            // Doc 43 P5: the closed-upvalue-cell family mirrors href/hload/
+            // hstore. `uref` loads the entry-seeded `*Value` cell pointer from
+            // its slab slot — same `.href` kind, so the load/store twins share
+            // the hash-cell emission verbatim. No per-iteration structural
+            // guard exists (a closed cell can never re-open; the entry seeder
+            // validated + verified the alias class, declining to tier-0 on any
+            // failure), so unlike href there is no dynamic-root variant.
+            .uref => {
+                if (ins.aux < 0 or ins.aux > 0xFFFF) return false; // seed slot must be valid
+                kinds[i] = .href;
+            },
+            // `uload`: typed load from the cell; the fused tag check IS the
+            // strict pin (a bool's only one — the hload P1 discipline).
+            // Heap-valued cells are never routed by the recorder (v1), so the
+            // `.heap` arm is deliberately absent: fail closed.
+            .uload => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .href) return false;
+                kinds[i] = switch (ins.ty) {
+                    .int => .int,
+                    .float => .float,
+                    .boolean => .bool,
+                    else => return false, // non-scalar ty: the recorder never emits it — fail closed
+                };
+            },
+            // `ustore`: overwrite the cell in place — scalar values only (the
+            // recorder pins them; heap values would need the write-barrier
+            // ABI, doc 43 §8 deferred bullet).
+            .ustore => {
+                if (ins.a >= i or ins.b >= i) return false;
+                if (kinds[ins.a] != .href) return false;
+                const vk = kinds[ins.b];
+                if (vk != .int and vk != .float and vk != .bool) return false;
+                kinds[i] = .none;
+            },
             .guard_lane => {
                 if (ins.a >= i) return false;
                 // `.ptr` = invariant root, lane checked once in the prologue.
@@ -2682,6 +2717,11 @@ fn opMayExitInBody(
         .ffloor,
         .fceil,
         .hload,
+        // Doc 43 P5: uload tag-checks the cell per iteration and side-exits on
+        // a type drift between entries — a body exit, exactly like hload.
+        // (`uref` and `ustore` are exit-free: the cell is entry-proven and a
+        // scalar overwrite cannot fail.)
+        .uload,
         .guard_gcol,
         .guard_gpresent,
         .alen,
@@ -2940,7 +2980,13 @@ fn computeSeedPlan(
     var plan = SeedPlan{};
     for (t.inputs, 0..) |seed, i| {
         switch (seed.kind) {
-            .upvalue, .global, .callee_upvalue, .callee_global => plan.activate(i),
+            // Doc 43 P5: every `upvalue_cell` seed stays active — WRITER paths
+            // feed `uref`'s slab load, and VERIFIER paths re-prove the alias
+            // class at entry (deactivating one would skip that proof). A class
+            // whose uref was DCE'd still validates (conservative: a failed
+            // resolve declines an entry nothing would have read — matching
+            // tier-1a's full-set resolution, and fail-closed).
+            .upvalue, .global, .callee_upvalue, .callee_global, .upvalue_cell => plan.activate(i),
             .hash_cell => {
                 for (t.instrs) |ins| {
                     if (ins.op != .href) continue;
@@ -3163,7 +3209,9 @@ fn isTransient(op: trace_ir.IrOp) bool {
         .sfindp, .smatch, .sgmatch, .scap_int, .scap_str, .str2num_i, .str2num_f => true,
         // href materializes the seeded cell pointer in a register (like aref); hload
         // materializes the decoded scalar field value. hstore/guard_hash are effects.
-        .href, .hload => true,
+        // Doc 43 P5: uref/uload are their closed-upvalue-cell twins (uref the
+        // seeded cell pointer, uload the decoded scalar); ustore is an effect.
+        .href, .hload, .uref, .uload => true,
         // grid (doc 14): garow materializes the row base (row0, like aref), gcell the
         // flat cell index, gload the decoded int cell. gstore/the grid guards are
         // effects/value-less.
@@ -3239,6 +3287,12 @@ fn operandReads(ins: trace_ir.IrInstr) struct { a: bool, b: bool } {
         .href => .{ .a = false, .b = false },
         .hload, .guard_hash => .{ .a = true, .b = false },
         .hstore => .{ .a = true, .b = true },
+        // Doc 43 P5: uref reads nothing (the cell pointer comes from the
+        // seeded slab slot, `ins.aux` — the href discipline); uload reaches
+        // the cell through the uref token (a); ustore reads token + value.
+        .uref => .{ .a = false, .b = false },
+        .uload => .{ .a = true, .b = false },
+        .ustore => .{ .a = true, .b = true },
         // grid (doc 14): garow reads table (a) + row (b); gcell reads the garow token
         // (a) + col (b); gstore reads the gcell token (a) + value (b); guard_gcol reads
         // the gcell token (a) + the column ref (b) it range-checks. gload reaches the
@@ -5940,15 +5994,18 @@ fn emitLinkedLoopDoneSnapshot(
         switch (p.op) {
             .astore => try emitAStore(a, t, kinds, alloc, p),
             .hstore => try emitHStore(a, kinds, alloc, p),
+            // Doc 43 P5: a loop-done-sunk closed-cell store — same Value-cell
+            // shape as hstore, same emitter.
+            .ustore => try emitHStore(a, kinds, alloc, p),
             .gstore => try emitGStore(a, t, alloc, p),
             .phi, .loop, .link => break,
             // Defensive belt: the linked branch is only emitted when
-            // `irinterp.loopDoneSnapshotSupported` accepted the range, so a
-            // `sgm_setpos` here means the gate and this walk drifted apart —
-            // fail the compile rather than emit a snapshot that silently
-            // skips a store (the un-advanced gmatch cursor would re-yield).
-            .sgm_setpos => return error.UnsupportedLoopDoneStore,
-            else => {},
+            // `loopDoneSnapshotSupported` accepted the range — now a closed
+            // whitelist of exactly the store arms above — so ANY other op here
+            // means the gate and this walk drifted apart. Fail the compile
+            // rather than emit a snapshot that silently skips a store (the
+            // sgm_setpos un-advanced-cursor bug class, generalized).
+            else => return error.UnsupportedLoopDoneStore,
         }
     }
 
@@ -6638,6 +6695,58 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // oracle's struct-assign which also leaves them undefined). int → TAG_INT +
             // 8-byte payload; float → TAG_FLOAT + `movsd`. Heap values declined (proveKinds).
             .hstore => {
+                try emitHStore(a, kinds, alloc, ins);
+            },
+            // --- closed-upvalue-cell path (doc 43 P5) ---------------------------
+            // The u-family shares the hash-cell machinery: the seeded slab slot
+            // holds a `*Value` (here `&cell.loc.closed`, resolved + alias-verified
+            // once per entry by `seedTraceInputs`; any failure DECLINES the whole
+            // entry to tier-0 — SEED_CAPACITY_DECLINE — so unlike href there is no
+            // per-iteration callout twin, and no dynamic-root variant can exist).
+            // uref: href's loop-invariant branch verbatim — load the cell pointer
+            // from `[rsi + aux*8]` into the token's home.
+            .uref => {
+                const off: i32 = @as(i32, @intCast(ins.aux)) * 8;
+                switch (placeOfRef(alloc, i)) {
+                    .reg => |r| try a.movRegMem(r, .rsi, off),
+                    .mem => |d| {
+                        try a.movRegMem(.rax, .rsi, off);
+                        try a.movMemReg(.rsp, d, .rax);
+                    },
+                    .xmm => unreachable, // a cell pointer is an int kind, never an XMM home
+                }
+            },
+            // uload: hload minus the `.heap` arm (the recorder never routes a
+            // heap-valued cell in v1; proveKinds fails closed). The fused tag
+            // check IS the strict pin — for a bool cell it is the only one.
+            .uload => {
+                const creg = try refBaseReg(a, alloc, ins.a, .rcx);
+                const want_tag: u8 = switch (kinds[i]) {
+                    .float => TAG_FLOAT,
+                    .bool => TAG_BOOL,
+                    else => TAG_INT, // proveKinds admits only int/float/bool
+                };
+                try a.cmpByteMemImm(creg, VALUE_TAG_OFF, want_tag);
+                try jccNativeExit(a, exit_labels, i, .ne); // cell type changed → drop to tier-1a/tier-0
+                if (kinds[i] == .float) {
+                    switch (placeOfRef(alloc, i)) {
+                        .xmm => |x| try a.movsdRegMem(x, creg, VALUE_PAYLOAD_OFF),
+                        .mem => |d| {
+                            try a.movsdRegMem(XMM_SCRATCH0, creg, VALUE_PAYLOAD_OFF);
+                            try a.movsdMemReg(.rsp, d, XMM_SCRATCH0);
+                        },
+                        .reg => unreachable, // a float never homes in a GP register
+                    }
+                } else {
+                    // int or bool: raw 8-byte payload load (bool payload is the
+                    // canonical full-width 0/1 — `Value.boolean` defines all 8 bytes).
+                    try a.movRegMem(.rax, creg, VALUE_PAYLOAD_OFF);
+                    try regToPlace(a, placeOfRef(alloc, i), .rax);
+                }
+            },
+            // ustore: hstore's in-place tag+payload overwrite, verbatim — a closed
+            // cell is a bare `Value`, exactly the shape emitHStore writes.
+            .ustore => {
                 try emitHStore(a, kinds, alloc, ins);
             },
             // --- lane-aware array read path (B2, bool lane) ----------------------

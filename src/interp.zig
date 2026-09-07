@@ -958,7 +958,27 @@ pub const Vm = struct {
         for (ct.inputs) |seed| count = @max(count, @as(usize, seed.slot) + 1);
         if (base + count > self.regCapacity()) return null;
         for (ct.inputs) |seed| {
+            // Doc 43 P5: an `upvalue_cell` seed resolves `&cell.loc.closed` (a
+            // `*Value`) — writer paths stash it raw (tagged `.int`, the
+            // hash_cell discipline), verifier paths re-resolve and must AGREE
+            // with the writer's slot, re-proving the record-time alias class.
+            // ANY failure (open/missing cell, non-function callee, verifier
+            // mismatch) declines the whole candidate to tier-0 (`return null`
+            // → `.next_candidate`): `uref` has no operands to re-derive the
+            // cell from, so — unlike `hash_cell` — no tier-1a downgrade
+            // exists. Earlier seeds may already have written their (dead
+            // scratch) slots; that is harmless, nothing runs this trace.
+            if (seed.kind == .upvalue_cell) {
+                const bits = self.resolveUpvalueCellBits(base, closure, seed) orelse return null;
+                if (seed.verify) {
+                    if (self.regGet(base + seed.slot).payload.bits != bits) return null;
+                } else {
+                    self.regSet(base + seed.slot, Value{ .tag = .int, .payload = .{ .bits = bits } });
+                }
+                continue;
+            }
             const v = switch (seed.kind) {
+                .upvalue_cell => unreachable, // handled above
                 .upvalue => self.upvalGet(closure.upvalues[seed.source]),
                 .global => self.globals.get(proto.constants[seed.source]),
                 .hash_cell => blk: {
@@ -1005,6 +1025,28 @@ pub const Vm = struct {
         return self.frameWindow(base, count);
     }
 
+    /// Doc 43 P5: resolve one `upvalue_cell` access path to the raw address of
+    /// the closed cell's owned `Value` (`&cell.loc.closed`), or null when the
+    /// path no longer resolves (callee slot not a function, upvalue index out
+    /// of range, or the cell is OPEN — v1 records closed cells only; a cell
+    /// can never re-open, so a successful resolution is stable for the whole
+    /// episode and needs no per-iteration guard). Shared by all three seeding
+    /// twins so their validation is byte-identical.
+    fn resolveUpvalueCellBits(self: *const Vm, base: usize, closure: *const function.Closure, seed: trace.InputSeed) ?u64 {
+        const cl: *const function.Closure = blk: {
+            if (seed.callee_slot == trace.UPVALUE_CELL_ANCHOR) break :blk closure;
+            const cv = self.regGet(base + seed.callee_slot);
+            if (!cv.isHeap() or cv.heapType() != .function) return null;
+            break :blk function.Closure.fromHeader(cv.asHeap());
+        };
+        if (seed.source >= cl.upvalues.len) return null;
+        const cell = cl.upvalues[seed.source];
+        return switch (cell.loc) {
+            .open => null,
+            .closed => |*v| @intFromPtr(v),
+        };
+    }
+
     /// Doc 22 §B.2: the C-ABI seeding twin of `seedTraceInputs`, installed once
     /// into `NativeSeedCtx.seed_fn` at VM init. Called from a seeded page's
     /// entry prologue (B-ii) and from `driveChain`'s tier-1a seeding (B-iii),
@@ -1016,10 +1058,13 @@ pub const Vm = struct {
     ///   rewrite made redundant is skipped entirely — its slab slot stays
     ///   unwritten and its validation cannot spuriously decline the entry.
     /// - Returns the tri-state decline grammar instead of (null, *bool):
-    ///   `SEED_CAPACITY_DECLINE` before ANY slab write if the seed slots don't
-    ///   fit, `SEED_HASH_DECLINE` if a hash_cell seed failed validation (the
-    ///   0-bits slot is still written, exactly like the original, so tier-1a
-    ///   sees the same slab state), else `SEED_OK`.
+    ///   `SEED_CAPACITY_DECLINE` if the seed slots don't fit (before ANY slab
+    ///   write) or — doc 43 P5 — an `upvalue_cell` seed failed to resolve /
+    ///   verify (mid-loop; earlier seeds' dead-scratch slots may already be
+    ///   written, which is harmless since the decline means nothing runs this
+    ///   candidate), `SEED_HASH_DECLINE` if a hash_cell seed failed validation
+    ///   (the 0-bits slot is still written, exactly like the original, so
+    ///   tier-1a sees the same slab state), else `SEED_OK`.
     /// - Allocation-free and GC-safe: resolution + validation only (upvalue
     ///   reads, global lookups, hash-chain walks). Deliberately NOT a
     ///   `nativegen.BodyCallout` row — that enum answers "can a heap φ die
@@ -1047,7 +1092,23 @@ pub const Vm = struct {
         var ok = true;
         for (ct.inputs, 0..) |seed, i| {
             if (!plan.isActive(i)) continue;
+            // Doc 43 P5: upvalue_cell resolution/verification failure declines
+            // the whole candidate (the capacity grammar — the emitted prologue
+            // routes it to the capacity exit → `.next_candidate`); tier-1a
+            // must not run either (`uref` has nothing to re-derive from).
+            if (seed.kind == .upvalue_cell) {
+                const bits = self.resolveUpvalueCellBits(ctx.base, closure, seed) orelse
+                    return trace.NativeSeedCtx.SEED_CAPACITY_DECLINE;
+                if (seed.verify) {
+                    if (self.regGet(ctx.base + seed.slot).payload.bits != bits)
+                        return trace.NativeSeedCtx.SEED_CAPACITY_DECLINE;
+                } else {
+                    self.regSet(ctx.base + seed.slot, Value{ .tag = .int, .payload = .{ .bits = bits } });
+                }
+                continue;
+            }
             const v = switch (seed.kind) {
+                .upvalue_cell => unreachable, // handled above
                 .upvalue => self.upvalGet(closure.upvalues[seed.source]),
                 .global => self.globals.get(proto.constants[seed.source]),
                 .hash_cell => blk: {
@@ -2425,6 +2486,14 @@ pub const Vm = struct {
                     .open => |idx| idx,
                     .closed => null,
                 },
+                else => null,
+            };
+            // Doc 43 P5: supply the resolved `*Upvalue` cell for both upvalue
+            // ops — `st.closure` is the EXECUTING frame's closure, so this is
+            // correct at any inline depth the recorder mirrors. The recorder
+            // keys closed-cell alias classes on the cell's address.
+            self.trace.rec_upval_cell = switch (mi.op) {
+                .get_upval, .set_upval => st.closure.upvalues[mi.b],
                 else => null,
             };
             // Refresh the recorder's read-only heap channel (doc 23

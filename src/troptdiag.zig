@@ -175,9 +175,15 @@ fn detectDeadCarries(
             // Grid-cell address producers + store + the column guard read both operands
             // (table+row, garow+col, gcell+value, gcell+col).
             .aref, .astore, .astore_append, .href, .hstore,
-            .garow, .gcell, .gstore, .guard_gcol => {
+            .garow, .gcell, .gstore, .guard_gcol,
+            // Doc 43 P5: the closed-cell store reads its uref + value.
+            .ustore => {
                 uses[ins.a] += 1;
                 uses[ins.b] += 1;
+            },
+            // Doc 43 P5: uload reads its uref token only.
+            .uload => {
+                uses[ins.a] += 1;
             },
             .phi => {
                 uses[ins.b] += 1; // the update is always a use
@@ -186,7 +192,8 @@ fn detectDeadCarries(
             // `.link` (doc 15) carries no operand refs (`aux` is the inner anchor pc),
             // so like `.loop`/`.preheader` it contributes no uses. `guard_gc`
             // (doc 24) is likewise operand-free (`aux` = the bound A).
-            .slot_load, .konst, .loop, .preheader, .link, .guard_gc => {},
+            // Doc 43 P5: `uref` reads no operands (its seed slot rides `aux`).
+            .slot_load, .konst, .loop, .preheader, .link, .guard_gc, .uref => {},
         }
     }
 
@@ -302,10 +309,15 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
             .sgm_setpos => ins.a == idx or ins.b == idx,
             .aref, .astore, .astore_append, .href, .hstore,
             .garow, .gcell, .gstore, .guard_gcol => ins.a == idx or ins.b == idx,
+            // Doc 43 P5: the closed-cell pair — ustore reads uref + value,
+            // uload reads its uref token.
+            .ustore => ins.a == idx or ins.b == idx,
+            .uload => ins.a == idx,
             .phi => (ins.aux == trace.PHI_INTERNAL and ins.a == idx) or ins.b == idx,
             // `.link` (doc 15) consumes no refs (`aux` is the inner anchor pc).
             // `guard_gc` (doc 24) is operand-free: `a` unused, `aux` = bound A.
-            .slot_load, .konst, .loop, .preheader, .link, .guard_gc => false,
+            // `uref` (doc 43 P5) likewise reads nothing (`aux` = seed slot).
+            .slot_load, .konst, .loop, .preheader, .link, .guard_gc, .uref => false,
         };
         if (consumes) {
             found_consumer = true;

@@ -33,6 +33,7 @@ const GuardRole = @import("trace_types.zig").GuardRole;
 const OperandDesig = @import("trace_types.zig").OperandDesig;
 const Polarity = @import("trace_types.zig").Polarity;
 const InputKind = @import("trace_code.zig").InputKind;
+const UPVALUE_CELL_ANCHOR = @import("trace_code.zig").UPVALUE_CELL_ANCHOR;
 const MAX_INLINE_DEPTH = @import("trace_types.zig").MAX_INLINE_DEPTH;
 const CallEdge = @import("trace_types.zig").CallEdge;
 const SlotStore = @import("trace_ir.zig").SlotStore;
@@ -116,6 +117,16 @@ pub const AbortReason = enum {
     /// enclosing pcall); `Vm.execWith`'s errdefer kills the recording at the
     /// innermost unwind instead.
     raised,
+    /// Doc 43 P5: a `set_upval` targeted a closed cell whose value this same
+    /// recording already baked into the per-entry SNAPSHOT (a
+    /// `.upvalue`/`.callee_upvalue` seed) — recording is linear, so the read
+    /// is already frozen and would go stale the moment the store lands. The
+    /// abort MEMOIZES the anchor (`TraceState.upvalue_mutable_memo`): the
+    /// gated retry arms with `route_upvalue_reads`, routing scalar closed-cell
+    /// reads through per-iteration `uload`s from the start, and the store then
+    /// records (the LuaJIT-flavoured penalty/retry answer to doc 43 §8's read-
+    /// routing question — read-only loops keep their free snapshot hoist).
+    upvalue_mutable,
 };
 const ExitProvenance = @import("trace_types.zig").ExitProvenance;
 const ProgramPoint = @import("trace_types.zig").ProgramPoint;
@@ -355,7 +366,12 @@ pub const RecordingSession = struct {
     /// P0b), so `hashSetShape`/`arraySetShape` can recognise a recorded store into
     /// `_G` and fail closed when the trace also snapshots a `get_global`. Stable
     /// per VM; supplied per-instruction alongside `heap`.
-    pub const InstructionContext = struct { heap: ?*const gc.Heap = null, inner_root: bool = false, unroll_while: bool = false, upval_open: ?usize = null, globals_header: ?*const object.GcHeader = null };
+    /// `upval_cell` (doc 43 P5): for a `get_upval`/`set_upval`, the resolved
+    /// `*Upvalue` cell (`st.closure.upvalues[instr.b]` — correct at any inline
+    /// depth, since tier-0 is really executing the callee); null for other ops.
+    /// The recorder keys alias classes and the snapshot-read set on its address
+    /// and inspects `loc` for the open/closed split.
+    pub const InstructionContext = struct { heap: ?*const gc.Heap = null, inner_root: bool = false, unroll_while: bool = false, upval_open: ?usize = null, globals_header: ?*const object.GcHeader = null, upval_cell: ?*function.Upvalue = null };
     pub const AbortNotice = struct { reason: AbortReason, anchor: AnchorKey, kind: TraceKind, unrolled_while: bool, pc: u32, op: OpCode, ir_len: u32 };
     pub const PeelNotice = union(enum) { enter: struct { anchor_pc: u32, marker: usize }, close: struct { anchor_pc: u32, begin: usize, end: usize } };
     pub fn takePeelNotice(self: *RecordingSession) ?PeelNotice {
@@ -606,6 +622,34 @@ pub const RecordingSession = struct {
     /// collide with the inlined-callee scratch the `reg_map` tail reserves.
     next_input_slot: u16 = 0,
 
+    // --- closed-cell upvalue stores (doc 43 P5) -----------------------------
+    /// Alias classes keyed on the OBSERVED `*Upvalue` address at record time
+    /// (`@intFromPtr(cell)`): aliasing is a property of the physical cell, not
+    /// of the `(callee_slot, upvalue_index)` access path — different slots,
+    /// closures and indices can reach one shared cell. Value = the class's
+    /// `uref` token; two paths resolving to the same cell share it
+    /// (MUST-alias), distinct observed cells are distinct classes (NO-alias),
+    /// and the entry seeder re-proves the whole relation (verifier seeds).
+    upvalue_cell_classes: std.AutoHashMapUnmanaged(u64, Ref) = .empty,
+    /// Per-class access-path dedup: `(callee_slot_or_anchor_sentinel << 16 |
+    /// upvalue_index)` → seen. A path already seeded (as writer or verifier)
+    /// appends no further seed.
+    upvalue_path_dedup: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Cells whose value was baked into the per-entry SNAPSHOT (a
+    /// `.upvalue`/`.callee_upvalue` seed) this recording. A later `set_upval`
+    /// to such a cell would leave the baked read stale for the rest of the
+    /// episode — abort `.upvalue_mutable`, which memoizes the anchor so the
+    /// retry routes its scalar reads through `uload` from the start.
+    snapshot_read_cells: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Doc 43 P5 read routing (the abort-once-and-memo retry): set at arm time
+    /// from the anchor's `upvalue_mutable_memo`. When true, SCALAR-observed
+    /// closed-cell upvalue reads route through per-iteration `uload`s instead
+    /// of the per-entry snapshot, so a later `set_upval` in the same recording
+    /// can join the class. Function/table-valued reads always stay snapshots
+    /// (they cannot be stored — v1 is scalar-only — and the callee-loading
+    /// machinery depends on their `slot_load` shape).
+    route_upvalue_reads: bool = false,
+
     pub fn abort(self: *RecordingSession, reason: AbortReason) void {
         if (!self.active) return;
         self.abort_notice = .{ .reason = reason, .anchor = self.anchor, .kind = self.kind, .unrolled_while = self.unrolled_while, .pc = self.cur_pc, .op = self.cur_op, .ir_len = @intCast(self.instrs.items.len) };
@@ -835,11 +879,20 @@ pub const RecordingSession = struct {
             // `*Vm`, no closure), so we snapshot the loop-invariant value into a
             // dead slab slot above the anchor window (`slot_load` from a synthetic
             // input slot the dispatch loop re-seeds each entry) and — when it is a
-            // function — pin its identity with `guard_func`. `set_upval`/`set_global`
-            // stay aborts (not in this switch): a write in the traced region would
-            // make the snapshot stale, so such loops keep running on tier-0.
+            // function — pin its identity with `guard_func`. `set_global` stays an
+            // abort (not in this switch): a write in the traced region would make
+            // the snapshot stale, so such loops keep running on tier-0.
+            // `set_upval` records since doc 43 P5 (closed cells, scalar values)
+            // — see `recSetUpval`; the snapshot-staleness concern is enforced by
+            // `snapshot_read_cells` + the `.upvalue_mutable` memo/retry.
             .get_upval => try self.recInputGet(.upvalue, instr.a, instr.b, resolved, proto),
             .get_global => try self.recInputGet(.global, instr.a, instr.b, resolved, proto),
+            // Doc 43 P5: a write through a CLOSED upvalue cell records as
+            // `uref`/`ustore` (scalar values only in v1); everything else —
+            // open cells, heap values, snapshot-staled reads — aborts, and the
+            // `.upvalue_mutable` abort memoizes the anchor so the retry routes
+            // its reads through `uload` and the store can record.
+            .set_upval => try self.recSetUpval(instr, regs),
 
             // tables, closures, concat, for_prep, len, …: each pulls in heap-effect
             // / cross-frame / invalidation machinery that is later work. Abort
@@ -1348,8 +1401,10 @@ pub const RecordingSession = struct {
             const ps = self.pending_stores.items[n];
             switch (ps.op) {
                 .astore => {},
-                // A present hash overwrite cannot change an array slot.
-                .hstore => continue,
+                // A present hash overwrite cannot change an array slot; a
+                // closed-cell upvalue store (doc 43 P5) writes an `Upvalue`'s
+                // owned `Value`, which is never a table slot.
+                .hstore, .ustore => continue,
                 // Doc 30: a pending `sgm_setpos` DOES write an array cell
                 // (the gmatch state's slot 3) — fail closed on any store op
                 // this classifier wasn't written for.
@@ -1396,8 +1451,9 @@ pub const RecordingSession = struct {
                 // An in-bounds array store (the only array op ever buffered —
                 // `astore_append` is emitted inline) can neither grow the array nor
                 // migrate a hash cell, and every recordable hash key is a string:
-                // NO alias, keep scanning.
-                .astore => continue,
+                // NO alias, keep scanning. A closed-cell upvalue store (doc 43
+                // P5) likewise can never alias a table's hash cell.
+                .astore, .ustore => continue,
                 .hstore => {},
                 // Fail closed on any store op this classifier wasn't written for.
                 else => {
@@ -1797,7 +1853,10 @@ pub const RecordingSession = struct {
     /// just as deopt-unsound as same-kind RMW.
     pub fn traceHasHeapLoad(self: *const RecordingSession) bool {
         for (self.instrs.items) |ins| {
-            if (ins.op == .aload or ins.op == .hload or ins.op == .gload) return true;
+            // `uload` (doc 43 P5) is a heap read for the C1 store-sink
+            // decision: a store following it is a read-modify-write whose
+            // write must defer below every guard.
+            if (ins.op == .aload or ins.op == .hload or ins.op == .gload or ins.op == .uload) return true;
         }
         return false;
     }
@@ -3898,6 +3957,20 @@ pub const RecordingSession = struct {
         // the `local cfg; hot loop reads cfg` idiom) is index < base → safe, and
         // keeps recording. Covers both the anchor-frame and inlined-callee reads
         // (both route through here before the depth split below).
+        // Doc 43 P5 read routing (any depth — recUpvalLoad splits the access
+        // path itself): a read of a cell that already has an alias class (a
+        // store was recorded — the read MUST see the pending value) or of a
+        // scalar closed cell under the anchor's `upvalue_mutable` memo goes
+        // through the per-iteration `uload` path instead of the per-entry
+        // snapshot. Function/table-valued reads always stay snapshots.
+        if (kind == .upvalue) {
+            if (self.context.upval_cell) |cell| {
+                const scalar = resolved.isInt() or resolved.isFloat() or resolved.isBool();
+                if (self.upvalue_cell_classes.contains(@intFromPtr(cell)) or
+                    (self.route_upvalue_reads and scalar and !cell.isOpen()))
+                    return self.recUpvalLoad(dest, source, cell, resolved);
+            }
+        }
         if (kind == .upvalue) {
             if (self.context.upval_open) |open_idx| {
                 if (open_idx >= self.anchor_abs_base) return self.abort(.aliased_input);
@@ -3953,6 +4026,13 @@ pub const RecordingSession = struct {
         try self.entry_slots.append(self.gpa, slot);
         try self.input_seeds.append(self.gpa, .{ .kind = kind, .source = source, .slot = slot });
         try self.input_dedup.put(self.gpa, key, ref);
+        // Doc 43 P5: remember which CELL this snapshot baked, so a later
+        // `set_upval` to it aborts `.upvalue_mutable` (and memoizes the anchor)
+        // instead of silently staling the read.
+        if (kind == .upvalue) {
+            if (self.context.upval_cell) |cell|
+                try self.snapshot_read_cells.put(self.gpa, @intFromPtr(cell), {});
+        }
         // Pin a *function* callee's identity so a different proto — or a value that
         // is no longer a function — side-exits. A non-function heap invariant (e.g.
         // an upvalue table) needs no identity guard: its *type* is pinned by the
@@ -4025,6 +4105,11 @@ pub const RecordingSession = struct {
             .callee_slot = callee_slot,
         });
         try self.input_dedup.put(self.gpa, key, ref);
+        // Doc 43 P5: the snapshot-vs-store staleness bar, exactly as in
+        // `recInputGet`'s depth-0 arm — the context cell is the CALLEE's here
+        // (tier-0 executes the callee, so `st.closure` is its closure).
+        if (self.context.upval_cell) |cell|
+            try self.snapshot_read_cells.put(self.gpa, @intFromPtr(cell), {});
 
         // Pin a function callee's identity, or an observed scalar's type (the
         // typed-SLOAD discipline — see recInputGet; pass-through reads feeding
@@ -4089,6 +4174,176 @@ pub const RecordingSession = struct {
             try self.guardNum(ref, resolved, .operand_type, .a);
         }
         self.setReg(dest, ref);
+    }
+
+    // --- closed-cell upvalue access (doc 43 P5) -----------------------------
+
+    /// Resolve the CURRENT frame's closure access path for an upvalue op:
+    /// depth 0 → the anchor closure (`UPVALUE_CELL_ANCHOR` sentinel); depth > 0
+    /// → the inlined callee's slab slot, requiring the callee ref to be a
+    /// `slot_load` — the P2×P5 invariant inherited verbatim from
+    /// `recCalleeUpval`: `guard_func` pins only `Proto.id`, so a COMPUTED
+    /// (hload'd) callee's cells cannot be re-resolved at entry and two
+    /// same-proto closures would silently swap cells. Null → caller aborts
+    /// `.cross_frame`.
+    fn upvalAccessPathSlot(self: *const RecordingSession) ?u16 {
+        if (self.inline_depth == 0) return UPVALUE_CELL_ANCHOR;
+        const d = self.inline_depth - 1;
+        const callee_anchor_reg: usize = @as(usize, self.frames[d].base_off) + self.frames[d].ret_dest;
+        if (callee_anchor_reg >= self.reg_map.len) return null;
+        const callee_entry = self.reg_map[callee_anchor_reg];
+        if (callee_entry.state == .undef) return null;
+        const callee_ir = self.instrs.items[callee_entry.ref];
+        if (callee_ir.op != .slot_load) return null;
+        return @intCast(callee_ir.aux);
+    }
+
+    /// Get-or-create the alias class for an observed closed cell, seen through
+    /// access path `(path_slot, source)`. One `uref` (and one synthetic slab
+    /// slot) per distinct `*Upvalue`; a NEW path onto an EXISTING class appends
+    /// a VERIFIER seed (entry re-proves the record-time MUST-alias relation),
+    /// and an already-seen path appends nothing. Returns null after aborting
+    /// (budget exhaustion, or the defensive same-path/different-cell case).
+    fn ensureUpvalClass(self: *RecordingSession, cell: *function.Upvalue, path_slot: u16, source: u16) !?Ref {
+        const addr: u64 = @intFromPtr(cell);
+        const existing = self.upvalue_cell_classes.get(addr);
+        const pkey = (@as(u64, path_slot) << 16) | source;
+        if (self.upvalue_path_dedup.contains(pkey)) {
+            // A path is (slab slot, upvalue index); the closure in that slot is
+            // fixed for the whole recording (slot_load = the entry value, and a
+            // body overwrite re-maps the register to a non-slot_load ref that
+            // fails the gate above), so a seen path re-resolving to a DIFFERENT
+            // cell is a recorder invariant break — fail closed.
+            if (existing) |uref| return uref;
+            self.abort(.bad_type);
+            return null;
+        }
+        if (self.input_seeds.items.len >= MAX_TRACE_INPUTS) {
+            self.abort(.input_cap);
+            return null;
+        }
+        if (existing) |uref| {
+            // New verifier path for an existing class: same slab slot, no write.
+            const slot: u16 = @intCast(self.instrs.items[@intCast(uref)].aux);
+            try self.input_seeds.append(self.gpa, .{
+                .kind = .upvalue_cell,
+                .source = source,
+                .slot = slot,
+                .callee_slot = path_slot,
+                .verify = true,
+            });
+            try self.upvalue_path_dedup.put(self.gpa, pkey, {});
+            return uref;
+        }
+        if (self.next_input_slot == std.math.maxInt(u16)) {
+            self.abort(.input_cap);
+            return null;
+        }
+        const slot = self.next_input_slot;
+        self.next_input_slot += 1;
+        const uref = try self.emit(.{ .op = .uref, .aux = @intCast(slot), .ty = .unknown });
+        try self.entry_slots.append(self.gpa, slot);
+        try self.input_seeds.append(self.gpa, .{
+            .kind = .upvalue_cell,
+            .source = source,
+            .slot = slot,
+            .callee_slot = path_slot,
+            .verify = false,
+        });
+        try self.upvalue_cell_classes.put(self.gpa, addr, uref);
+        try self.upvalue_path_dedup.put(self.gpa, pkey, {});
+        return uref;
+    }
+
+    /// Resolve a closed-cell read against the deferred-store buffer. Class
+    /// identity IS cell identity (one `uref` per observed `*Upvalue`), so the
+    /// alias lattice is exact: same token → MUST (forward the newest pending
+    /// value), different token → NO (distinct observed cells), and there is no
+    /// MAY case. Table-part stores can never alias a cell's owned `Value`.
+    /// Walks newest→oldest (last-writer-wins); fail-closed on unknown store ops.
+    fn forwardPendingUload(self: *RecordingSession, dst: u16, uref: Ref) bool {
+        var n = self.pending_stores.items.len;
+        while (n > 0) {
+            n -= 1;
+            const ps = self.pending_stores.items[n];
+            switch (ps.op) {
+                .astore, .hstore => continue,
+                .ustore => {},
+                else => {
+                    self.abort(.bad_type);
+                    return true;
+                },
+            }
+            if (ps.aref != uref) continue;
+            self.setReg(dst, ps.value);
+            return true;
+        }
+        return false;
+    }
+
+    /// Record a closed-cell upvalue READ through the per-iteration `uload`
+    /// path (instead of the per-entry snapshot). Reached when the cell's alias
+    /// class already exists (a read after a recorded store MUST see the
+    /// pending value), or when the anchor's `upvalue_mutable` memo routed all
+    /// scalar reads here so a later `set_upval` can record. Mirrors
+    /// `hashGetShape`'s load discipline: `uload ty=obs` is the fused tag pin
+    /// (a bool's ONLY pin); int/float additionally get the consumer `guardNum`.
+    fn recUpvalLoad(self: *RecordingSession, dest: u16, source: u16, cell: *function.Upvalue, resolved: Value) !void {
+        if (cell.isOpen()) return self.abort(.nyi_opcode); // v1: closed cells only
+        if (!(resolved.isInt() or resolved.isFloat() or resolved.isBool())) return self.abort(.bad_type);
+        const path_slot = self.upvalAccessPathSlot() orelse return self.abort(.cross_frame);
+        const uref = (try self.ensureUpvalClass(cell, path_slot, source)) orelse return;
+        if (self.forwardPendingUload(dest, uref)) return;
+        const rload = try self.emit(.{ .op = .uload, .a = uref, .ty = obsTypeOf(resolved) });
+        self.stampProv(rload, .field_type, .loaded, .neutral);
+        self.setReg(dest, rload);
+        // The consumer type pin, exactly the hload discipline: int/float get a
+        // deduped guardNum; a bool's strict pin IS the uload tag exit.
+        if (!resolved.isBool()) try self.guardNum(rload, resolved, .field_type, .loaded);
+    }
+
+    /// Record `set_upval` — a write through a CLOSED upvalue cell (doc 43 P5,
+    /// scalar values only in v1). The store follows the C1 sink discipline of
+    /// `hashSetShape` (deferred below every guard when the trace has a prior
+    /// heap load, so any side-exit leaves it un-executed and deopt-replay
+    /// applies it exactly once), and the value-type pin is `hashSetShape`'s
+    /// verbatim (guardNum for scalars, static proof for bools). Aborts:
+    ///   * no resolved cell (defensive) / OPEN cell (the LuaJIT SSA-redirect
+    ///     case, deferred) → `.nyi_opcode`;
+    ///   * non-scalar or nil value → `.bad_type` (heap-valued stores need the
+    ///     native write-barrier ABI, deferred with its own doc 43 bullet);
+    ///   * the cell was already SNAPSHOT-read this recording →
+    ///     `.upvalue_mutable`, memoizing the anchor so the retry routes reads
+    ///     through `uload` (see the AbortReason doc);
+    ///   * computed callee at depth > 0 → `.cross_frame` (the P2×P5 gate).
+    pub fn recSetUpval(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
+        const cell = self.context.upval_cell orelse return self.abort(.nyi_opcode);
+        const vval = regs.get(instr.a);
+        if (!(vval.isInt() or vval.isFloat() or vval.isBool())) return self.abort(.bad_type);
+        if (cell.isOpen()) return self.abort(.nyi_opcode);
+        if (self.snapshot_read_cells.contains(@intFromPtr(cell))) return self.abort(.upvalue_mutable);
+        const path_slot = self.upvalAccessPathSlot() orelse return self.abort(.cross_frame);
+        const rval = try self.refOf(instr.a);
+        if (vval.isBool()) {
+            const bool_proven = if (self.konstValueOf(rval)) |kv|
+                kv.isBool()
+            else
+                self.instrs.items[@intCast(rval)].ty == .boolean;
+            if (!bool_proven) return self.abort(.nyi_opcode);
+        } else {
+            try self.guardNum(rval, vval, .value_type, .a);
+        }
+        const uref = (try self.ensureUpvalClass(cell, path_slot, instr.b)) orelse return;
+        if (self.traceHasHeapLoad()) {
+            try self.pending_stores.append(self.gpa, .{
+                .aref = uref,
+                .value = rval,
+                .lane_ord = 0,
+                .op = .ustore,
+            });
+        } else {
+            _ = try self.emit(.{ .op = .ustore, .a = uref, .b = rval });
+        }
     }
 
     /// Doc 39: `pc` anchors a *plain while* loop — at least one plain backward
@@ -4328,6 +4583,9 @@ pub const RecordingSession = struct {
         self.input_dedup.deinit(gpa);
         self.hash_cell_dedup.deinit(gpa);
         self.callee_global_dedup.deinit(gpa);
+        self.upvalue_cell_classes.deinit(gpa);
+        self.upvalue_path_dedup.deinit(gpa);
+        self.snapshot_read_cells.deinit(gpa);
         self.instrs.deinit(gpa);
         self.consts.deinit(gpa);
         self.entry_slots.deinit(gpa);
@@ -4367,6 +4625,10 @@ pub const RecordingSession = struct {
         self.input_dedup.clearRetainingCapacity();
         self.hash_cell_dedup.clearRetainingCapacity();
         self.callee_global_dedup.clearRetainingCapacity();
+        self.upvalue_cell_classes.clearRetainingCapacity();
+        self.upvalue_path_dedup.clearRetainingCapacity();
+        self.snapshot_read_cells.clearRetainingCapacity();
+        self.route_upvalue_reads = false; // doc 43 P5: arm() seeds the anchor memo after reset
         self.pending_stores.clearRetainingCapacity();
         self.alloc_count = 0;
         self.guard_gc_ref = null;

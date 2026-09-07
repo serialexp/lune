@@ -325,9 +325,13 @@ test "wire enum ordinals are a pinned contract (mirrored by viz/src/enums.ts)" {
     // Doc 35: rounding builtins (float→int).
     try testing.expectEqual(@as(u8, 81), @intFromEnum(IrOp.ffloor));
     try testing.expectEqual(@as(u8, 82), @intFromEnum(IrOp.fceil));
+    // Doc 43 P5: closed-upvalue-cell family, appended after `fceil`.
+    try testing.expectEqual(@as(u8, 83), @intFromEnum(IrOp.uref));
+    try testing.expectEqual(@as(u8, 84), @intFromEnum(IrOp.uload));
+    try testing.expectEqual(@as(u8, 85), @intFromEnum(IrOp.ustore));
     // Exhaustiveness: if a member is added/removed, this count changes and forces
     // both this test and enums.ts to be revisited.
-    try testing.expectEqual(@as(usize, 83), @typeInfo(IrOp).@"enum".field_names.len);
+    try testing.expectEqual(@as(usize, 86), @typeInfo(IrOp).@"enum".field_names.len);
 
     const ObsType = trace_ir.ObsType;
     try testing.expectEqual(@as(u8, 0), @intFromEnum(ObsType.unknown));
