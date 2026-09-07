@@ -21,6 +21,44 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-07e — doc 43 P1+P2+P3 LANDED + gated; P4 (assert) next
+
+Continuing the arc under Bart's "commit and move to P1" + standing keep-going
+autonomy. Three phases landed as three commits (a6fde0f P1, 811d0df P2, P3 this
+commit); doc 43's checklist has the full as-landed detail per phase. Short form:
+
+- **P1 (bool hash fields).** `hload ty=.boolean` fused tag exit IS the pin (no
+  consumer guard); stores only for STATICALLY bool-proven values (konst /
+  `.ty == .boolean` producer), else fail-closed abort. Native TAG_BOOL arms.
+- **P2 (function hash fields → method inlining).** `hload ty=.heap` +
+  `guard_func(rload, aux=Proto.id)`; recCall's duplicate folds under tropt's
+  aux-keyed CSE. Proto-id identity is sound ONLY because `recCalleeUpval`'s
+  slot_load gate makes hload-loaded-callee upvalue reads abort `.cross_frame`
+  — that invariant is pinned by an adversarial same-proto/cell-swap e2e test.
+- **P3 (table hash fields + dynamic aref).** `hload ty=.heap` + `guard_table`
+  (metatable-free checked at record time); aref/guard_lane accept a `.heap`
+  root; guard_lane gets a per-iteration body arm + opMayExitInBody row. **Real
+  bug fixed:** aref consumers reach the table through `aref.a` but liveness
+  counted only the aref token — fine for `.ptr` roots (pinned slot home),
+  use-after-death for SSA `.heap` roots (segfault via recycled register).
+  `analyzeInner` now extends the dynamic root's `last_use` to every
+  reach-through consumer (`guard_bounds/present/append`, `aload`, `astore`,
+  `astore_append`) — the dyn-href precedent.
+
+Tests: 2 recorder + 5 ten-leg e2e for P3 (in-loop field load + array RMW,
+mid-run table swap, mid-run setmetatable exit, lane-drift exit, cross-root
+same-iteration aliasing) in `interp_trace_test.zig`; P1/P2 tests per doc 43.
+Gates green: `just test`, `just hashgate` 84/84 both legs, `zig build wasm`.
+The array3d-shaped microbench (field load inside the loop) now runs 98% native
+at ~52 cycles/iter vs ~29.8k tier-0. array3d itself still 0% — its remaining
+abort is `.cross_frame` at a callee get_global: exactly P4 (assert) + P5
+(upvalue stores), as doc 43 §9 predicted (all of P1–P5 needed).
+
+NEXT: P4 — `assert` as a RecordedBuiltin (doc 43 §7): `guard_true(arg1)` +
+pass-through; joins the variable-result `all_results` EXCLUSION switch; fixed
+`c` copies min(nargs, c) + nil-pads; zero-result statement form copies nothing.
+Then P5 (closed-cell upvalue stores, scalar v1). Then the full bench board.
+
 ## Status 2026-09-07d — doc 43 P0 (all four) LANDED + gated; arc P1–P5 not started
 
 The array3d-coverage arc (doc 43) began with a correctness pass. An adversarial

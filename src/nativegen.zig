@@ -1624,14 +1624,13 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (r >= i) return false; // not linear SSA → malformed
                 // A table guard on a slot_load covers the table-bearing snapshot
                 // slot; the native path hoists it to a prologue heap/type check.
-                // A guard on an aload (Phase 2, .value-lane) is a per-iteration
-                // body guard — accept it but don't mark table_guarded (no slot
-                // to pin for the prologue).
-                if (t.instrs[r].op == .slot_load) {
-                    table_guarded[r] = true;
-                } else if (t.instrs[r].op != .aload) {
-                    return false;
-                }
+                // A guard on anything else — an aload (Phase 2, .value-lane
+                // element) or an hload (doc 43 P3, table-valued hash field) —
+                // is a per-iteration body guard: accept it here but don't mark
+                // table_guarded (no slot to pin for the prologue). Pass B
+                // validates the operand is `.ptr`/`.heap`-kinded, so a guard on
+                // a non-table producer still fails closed there.
+                if (t.instrs[r].op == .slot_load) table_guarded[r] = true;
             },
             // guard_grid (doc 14): the grid analogue of guard_table+guard_lane. It
             // covers the grid table's slot_load (proven `.ptr`); the prologue
@@ -2163,7 +2162,10 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             },
             .guard_lane => {
                 if (ins.a >= i) return false;
-                if (kinds[ins.a] != .ptr) return false;
+                // `.ptr` = invariant root, lane checked once in the prologue.
+                // `.heap` (doc 43 P3) = per-iteration root; the body emits the
+                // lane-byte compare inline (see the lowering arm).
+                if (kinds[ins.a] != .ptr and kinds[ins.a] != .heap) return false;
                 // `.value` lane: accepted for Phase 2 (array-of-structs). The
                 // prologue checks `array.lane == .value` the same way it checks
                 // any other lane byte. No scalar lane-kind produced — the aload
@@ -2174,9 +2176,17 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             },
             // aref pairs (table, index); its register carries idx0 = index-1. A
             // distinct `.aref` kind so it can neither feed arithmetic nor be flushed.
+            // The root is an invariant `.ptr` (prologue-hoisted homes) OR — doc 43
+            // P3 — a per-iteration `.heap` table (an hload'd table field / a
+            // VALUE_LANE aload element): every consumer (guard_bounds,
+            // guard_present, aload, astore) already resolves data/present/asize
+            // through `arrayFieldReg`'s per-iteration fallback when the root has
+            // no hoisted slot homes, so the dynamic root costs loads, not new
+            // machinery. The lane pin for a dynamic root is guard_lane's in-body
+            // form (below), never the prologue.
             .aref => {
                 if (ins.a >= i or ins.b >= i) return false;
-                if (kinds[ins.a] != .ptr or kinds[ins.b] != .int) return false;
+                if ((kinds[ins.a] != .ptr and kinds[ins.a] != .heap) or kinds[ins.b] != .int) return false;
                 if (ins.aux != VALUE_LANE and laneKind(ins.aux) == null) return false;
                 if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 kinds[i] = .aref;
@@ -2714,6 +2724,10 @@ fn opMayExitInBody(
         // The dynamic (per-iteration) table checks side-exit; the `.ptr` forms
         // are prologue-hoisted / seed-validated and emit nothing in the body.
         .guard_table => isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a),
+        // doc 43 P3: a guard_lane on a `.heap`-kinded root (hload'd table
+        // field) compares the lane byte per-iteration and side-exits on
+        // mismatch; the `.ptr` form is prologue-hoisted and exit-free.
+        .guard_lane => isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a),
         // doc 43 P2: a guard_func on a `.heap`-kinded hload (function field)
         // side-exits in the body; the `.func` callee-snapshot form is
         // prologue-hoisted and exit-free. Without this row, carried-home
@@ -3686,6 +3700,23 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
             if (isDynTableRoot(kinds, slots.items, slot_id_of_ref, href_ins.a)) {
                 if (last_use[href_ins.a] < i) last_use[href_ins.a] = @intCast(i);
             }
+        }
+        // doc 43 P3: aref consumers reach the TABLE lazily through `aref.a`
+        // (arrayFieldReg / the guard_bounds asize fallback), but operandReads
+        // counts only the aref token — sound for a `.ptr` root (the table
+        // lives in a pinned slot home for the whole trace), unsound for a
+        // dynamic root (an hload'd table field / VALUE_LANE element), whose
+        // SSA range would otherwise end at its last DIRECT use and hand the
+        // consumers a recycled register as the "table". Extend the root's
+        // liveness to every reach-through consumer, the dyn-href precedent.
+        switch (ins.op) {
+            .guard_bounds, .guard_present, .guard_append, .aload, .astore, .astore_append => {
+                const aref_ins = t.instrs[ins.a];
+                if (aref_ins.op == .aref and isDynTableRoot(kinds, slots.items, slot_id_of_ref, aref_ins.a)) {
+                    if (last_use[aref_ins.a] < i) last_use[aref_ins.a] = @intCast(i);
+                }
+            },
+            else => {},
         }
         // ssub (doc 24 c3) and scp (doc 26) read a THIRD operand — the
         // end-index ref in `aux` — which `operandReads`' two-field shape
@@ -6286,7 +6317,21 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // slot_load it is the prologue `header.type == string` pin; on a
             // proven-string producer it is statically discharged — both emit
             // nothing here.
-            .slot_load, .guard_int, .guard_float, .guard_lane, .guard_builtin, .guard_grid, .guard_stride, .guard_string => {},
+            .slot_load, .guard_int, .guard_float, .guard_builtin, .guard_grid, .guard_stride, .guard_string => {},
+            // guard_lane: hoisted no-op for an invariant `.ptr` root (the prologue
+            // compares the lane byte once). For a per-iteration `.heap` root —
+            // doc 43 P3's hload'd table field — compare `array.lane` inline
+            // against the recorded lane ordinal, side-exiting on mismatch (the
+            // loaded table may be a different table each iteration, or the same
+            // table rehashed to a different lane).
+            .guard_lane => {
+                if (isDynTableRoot(kinds, alloc.slots, alloc.slot_id_of_ref, ins.a)) {
+                    const tbreg = try refBaseReg(a, alloc, ins.a, .rax);
+                    try a.cmpByteMemImm(tbreg, ArrLayout.array_base + ArrLayout.lane, @intCast(ins.aux));
+                    try jccNativeExit(a, exit_labels, i, .ne); // lane changed → side-exit
+                }
+                // else: `.ptr` → prologue-hoisted, no-op
+            },
             // guard_func: hoisted no-op for the invariant `.func` callee snapshot
             // (prologue closure/proto-id check). For a `.heap`-kinded operand —
             // doc 43 P2's function-field hload — emit the per-iteration identity

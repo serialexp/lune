@@ -1915,10 +1915,24 @@ pub const RecordingSession = struct {
         // one: it aborts `.cross_frame` fail-closed. HARD INVARIANT (doc 43 §5):
         // any future path letting an hload-loaded callee reach upvalue access
         // must first tighten `guard_func` to closure `GcHeader.id`.
-        // Table fields are P3; string/native-builtin fields still abort.
+        // A TABLE field (doc 43 P3 — `local image = self.image` inside a loop
+        // body, the array3d shape) records as `hload ty=.heap` + an immediate
+        // `guard_table` — the exact mirror of the `.value`-lane array-of-structs
+        // element pin (`arrayGetShape`). The loaded ref then roots downstream
+        // array/hash accesses as a DYNAMIC (per-iteration) table: native lowers
+        // its guard_table/guard_lane/guard_hash in-body and resolves href via
+        // the `resolveHashCell` callout (no entry seed — `seedHashCell` already
+        // declines a non-slot_load root). Metatable-free is checked at record
+        // time here AND at run time by guard_table, like the element precedent.
+        // String/native-builtin fields still abort.
         const fv = cell.*;
         const is_fn_field = fv.isHeap() and fv.heapType() == .function;
-        if (!(fv.isInt() or fv.isFloat() or fv.isBool() or is_fn_field)) return self.abort(.nyi_opcode);
+        const is_tbl_field = fv.isHeap() and fv.heapType() == .table;
+        if (!(fv.isInt() or fv.isFloat() or fv.isBool() or is_fn_field or is_tbl_field)) return self.abort(.nyi_opcode);
+        if (is_tbl_field) {
+            const ftbl = table_mod.Table.fromHeader(fv.asHeap());
+            if (ftbl.metatable != null) return self.abort(.has_metatable);
+        }
         // The key must be a recorded `konst` (the bytecode literal interned via
         // `load_const`), so its ref is provably the constant — no runtime key-
         // identity guard is needed and the cell is pinnable. A computed key reaches
@@ -1968,6 +1982,10 @@ pub const RecordingSession = struct {
         if (is_fn_field) {
             const cl = function.Closure.fromHeader(fv.asHeap());
             self.stampProv(try self.emit(.{ .op = .guard_func, .a = rload, .aux = @bitCast(cl.proto.id) }), .callee_identity, .loaded, .neutral);
+        } else if (is_tbl_field) {
+            // P3: pin "table, metatable-free" at run time — the mirror of the
+            // `.value`-lane element pin. Downstream accesses chain off `rload`.
+            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rload }), .field_type, .loaded, .neutral);
         } else if (!fv.isBool()) {
             try self.guardNum(rload, fv, .field_type, .loaded);
         }

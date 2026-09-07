@@ -3385,6 +3385,167 @@ test "hash field P2 end-to-end: closure swap SAME proto different cells stays ex
     , "10989\n");
 }
 
+test "recorder (hash field, P3): a table field records hload ty=.heap + guard_table on the load; aref roots at it" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local obj = { image = {} }
+        \\for i = 1, 8 do obj.image[i] = 0 end
+        \\local s = 0
+        \\for i = 1, 50 do
+        \\  local image = obj.image
+        \\  image[3] = image[3] + 1
+        \\  s = s + image[3]
+        \\end
+        \\print(s)
+    , true);
+    defer chunk.deinit();
+
+    // Doc 43 P3: the table field loads as `hload ty=.heap`; its pin is
+    // `guard_table(rload)` (type + metatable-free, per-iteration in native) —
+    // the `.value`-lane element-table precedent — plus the `guard_lane` the
+    // array access adds. The subsequent array ops root their aref AT THE HLOAD
+    // REF (a dynamic root), not at a slot_load.
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
+    var heap_hload_ref: ?usize = null;
+    for (t.code.instrs, 0..) |ins, i| {
+        if (ins.op == .hload and ins.ty == .heap) heap_hload_ref = i;
+    }
+    try testing.expect(heap_hload_ref != null);
+    const hr: trace.Ref = @intCast(heap_hload_ref.?);
+    var saw_guard_table = false;
+    var saw_dyn_aref = false;
+    for (t.code.instrs) |ins| {
+        if (ins.op == .guard_table and ins.a == hr) saw_guard_table = true;
+        if (ins.op == .aref and ins.a == hr) saw_dyn_aref = true;
+    }
+    try testing.expect(saw_guard_table);
+    try testing.expect(saw_dyn_aref);
+}
+
+test "recorder (hash field, P3): a table field WITH a metatable aborts fail-closed" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // The record-time gate mirrors arrayGetShape's element-table rule: a
+    // metatable on the field table means index misses dispatch to __index,
+    // which the traced fast path cannot replay — refuse at the load.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local obj = { image = setmetatable({}, {}) }
+        \\for i = 1, 8 do obj.image[i] = 0 end
+        \\local s = 0
+        \\for i = 1, 50 do
+        \\  local image = obj.image
+        \\  s = s + image[3]
+        \\end
+        \\print(s)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
+    try testing.expect(!vm.trace.isRecording());
+}
+
+test "hash field P3 end-to-end: table field loaded INSIDE the loop, array RMW through it; all ten legs" {
+    // The array3d shape: `local image = obj.image` inside the loop body makes
+    // every array op root at the hload (a dynamic `.heap` root). Native lowers
+    // per-iteration guard_table/guard_lane checks and reaches data/present/asize
+    // through the root each iteration (arrayFieldReg's fallback) — and the
+    // liveness extension keeps the root register alive through the LAST
+    // reach-through consumer (the segfault this arc fixed).
+    try expectProgram(
+        \\local obj = { image = {} }
+        \\local img = obj.image
+        \\for i = 1, 8 do img[i] = 0 end
+        \\local total = 0
+        \\for round = 1, 50 do
+        \\  for i = 1, 8 do
+        \\    local image = obj.image
+        \\    image[i] = image[i] + 1
+        \\  end
+        \\  total = total + obj.image[4]
+        \\end
+        \\print(total, obj.image[1], obj.image[8])
+    , "1275\t50\t50\n");
+}
+
+test "hash field P3 end-to-end: mid-loop field table SWAP redirects writes exactly" {
+    // guard_hash/hload re-resolve the CURRENT field value each iteration, so
+    // swapping obj.image mid-run must redirect every subsequent write to the
+    // new table with no leakage into the old one — on every leg.
+    try expectProgram(
+        \\local a, b = {}, {}
+        \\for i = 1, 8 do a[i] = 0; b[i] = 100 end
+        \\local obj = { image = a }
+        \\for round = 1, 60 do
+        \\  if round == 31 then obj.image = b end
+        \\  for i = 1, 8 do
+        \\    local image = obj.image
+        \\    image[i] = image[i] + 1
+        \\  end
+        \\end
+        \\print(a[1], b[1], a[8], b[8])
+    , "30\t130\t30\t130\n");
+}
+
+test "hash field P3 end-to-end: metatable ADDED to the field table mid-run side-exits (dynamic guard_table)" {
+    // The per-iteration guard_table checks type AND metatable == null against
+    // the CURRENT table; setmetatable mid-run must side-exit, and the __index
+    // miss after the loop must dispatch through the metatable on every leg.
+    try expectProgram(
+        \\local obj = { image = {} }
+        \\for i = 1, 8 do obj.image[i] = 0 end
+        \\for round = 1, 60 do
+        \\  if round == 41 then setmetatable(obj.image, { __index = function() return -1 end }) end
+        \\  for i = 1, 8 do
+        \\    local image = obj.image
+        \\    image[i] = image[i] + 1
+        \\  end
+        \\end
+        \\print(obj.image[1], obj.image[8], obj.image[99])
+    , "60\t60\t-1\n");
+}
+
+test "hash field P3 end-to-end: lane drift on the field table side-exits (dynamic guard_lane)" {
+    // A float landing in the int-lane array rewrites the lane; the dynamic
+    // guard_lane compares the lane byte per iteration and must catch it.
+    try expectProgram(
+        \\local obj = { image = {} }
+        \\for i = 1, 8 do obj.image[i] = 0 end
+        \\for round = 1, 60 do
+        \\  if round == 31 then obj.image[1] = 0.5 end
+        \\  for i = 2, 8 do
+        \\    local image = obj.image
+        \\    image[i] = image[i] + 1
+        \\  end
+        \\end
+        \\print(obj.image[1], obj.image[2], obj.image[8])
+    , "0.5\t60\t60\n");
+}
+
+test "hash field P3 end-to-end: cross-root aliasing — dynamic-root store visible to .ptr-root load, same iteration" {
+    // The SAME table reached through an invariant `.ptr` slot root (t) AND the
+    // dynamic hload root (obj.image) in one body: a store through one must be
+    // visible to a load through the other with no stale hoisted state.
+    try expectProgram(
+        \\local t = {}
+        \\for i = 1, 8 do t[i] = 0 end
+        \\local obj = { image = t }
+        \\local total = 0
+        \\for round = 1, 50 do
+        \\  for i = 1, 8 do
+        \\    local image = obj.image
+        \\    image[i] = image[i] + 1
+        \\    total = total + t[i]
+        \\  end
+        \\end
+        \\print(total, t[1], t[8])
+    , "10200\t50\t50\n");
+}
+
 test "hash field P1 end-to-end: bool field branch + konst store + proven copy, all ten legs" {
     // The full P1 shape from one loop: hload ty=.boolean feeding guard_true,
     // a comparison-result store, and a bool-proven cross-table copy. Byte-
@@ -3474,13 +3635,13 @@ test "recorder (hash field): a metatable-bearing table aborts (.has_metatable)" 
     try testing.expect(!vm.trace.isRecording());
 }
 
-test "recorder (hash field): a heap-valued (string) field aborts (heap fields are P2/P3)" {
+test "recorder (hash field): a heap-valued (string) field aborts (no string-field pin yet)" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    // The field value is a string (heap). int/float/bool fields trace (doc 43 P1
-    // added bool via the hload fused tag exit); heap-valued fields await the
-    // P2/P3 arc (guard_func / guard_table pins). Until then they abort to tier-0.
+    // The field value is a string (heap). int/float/bool fields trace (doc 43
+    // P1), function fields pin via guard_func (P2), table fields via
+    // guard_table (P3) — STRING fields have no pin yet and abort to tier-0.
     var chunk = try runForTrace(&vm, gpa,
         \\local t = {x = "hi"}
         \\local n = 0

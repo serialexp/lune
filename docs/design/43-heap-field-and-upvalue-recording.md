@@ -1,10 +1,10 @@
 # 43 — heap-valued fields, assert, and upvalue stores (tracing the OOP + closure-iterator idioms)
 
-Status: **PARTIAL — P0 (all four), P1 (bool hash fields), and P2 (function
-hash fields → method inlining) landed 2026-09-07; P3–P5 outstanding. Two
-review rounds folded in (codex + technical-architect; ledger at bottom). The
-adversarial sweep (a01–a20) is permanent in `trace_p0_alias_test.zig`, green
-on all ten legs.**
+Status: **PARTIAL — P0 (all four), P1 (bool hash fields), P2 (function hash
+fields → method inlining), and P3 (table hash fields + dynamic aref) landed
+2026-09-07; P4–P5 outstanding. Two review rounds folded in (codex +
+technical-architect; ledger at bottom). The adversarial sweep (a01–a20) is
+permanent in `trace_p0_alias_test.zig`, green on all ten legs.**
 Owner: Bart
 Last updated: 2026-09-07
 
@@ -84,11 +84,31 @@ to Done once everything inside a phase is checked.
       float-RMW method, proto-swap exit, same-proto cell-swap). Gates green;
       nbody/lua54/array3d cross=ok.
 
+- [x] **Phase 3 — table-valued hash fields + dynamic aref.** Landed 2026-09-07
+      per §6: `hashGetShape` admits table fields (record-time metatable-free
+      check, the `arrayGetShape` element-table rule) → `hload ty=.heap` +
+      `guard_table(rload)` stamped `.field_type/.loaded`. Native: aref and
+      guard_lane proveKinds accept a `.heap` root alongside `.ptr`; Pass A's
+      guard_table arm accepts a non-slot_load operand (Pass B fail-closes
+      non-`.ptr`/`.heap` kinds — the P2 guard_func relaxation); guard_lane
+      gets a per-iteration body arm (lane-byte compare against the CURRENT
+      table, `jccNativeExit` on mismatch) + its `opMayExitInBody` row;
+      consumers reach data/present/asize through `arrayFieldReg`'s existing
+      per-iteration fallback. One real bug found and fixed on the way: aref
+      consumers (`guard_bounds`/`guard_present`/`guard_append`/`aload`/
+      `astore`/`astore_append`) reach the table lazily through `aref.a`, but
+      liveness counted only the aref token — sound for a `.ptr` root (pinned
+      slot home), a use-after-death for an SSA `.heap` root (segfaulting
+      guard_bounds read through a recycled index register). Fixed with an
+      explicit liveness extension in `analyzeInner` (the dyn-href precedent):
+      every reach-through consumer extends the dynamic root's `last_use`.
+      Two recorder tests + five ten-leg e2e tests (in-loop field load with
+      array RMW, mid-run table swap, mid-run setmetatable exit, lane-drift
+      exit, cross-root same-iteration aliasing). Gates green; the array3d-
+      shaped microbench runs 98% native at ~52 cycles/iter (tier-0 ~29.8k).
+
 ### Outstanding
 
-- [ ] **Phase 3 — table-valued hash fields.** `hload ty=.heap` + `guard_table`
-      → dynamic-root `href`/`aref` chain (mirror of the `.value`-lane heap
-      `aload`).
 - [ ] **Phase 4 — `assert` as a RecordedBuiltin.** `guard_true(arg1)` +
       pass-through; joins the variable-result `all_results` EXCLUSION list;
       fixed-`c` = copy `min(nargs, c)` + nil-pad.
