@@ -7,8 +7,10 @@
 //! `callValue` — at safepoint granularity, where a skipped or doubled
 //! prologue shifts every subsequent index. If any of these breaks during the
 //! doc-42 flip, the conversion changed observable interpreter timing, even
-//! if final outputs still match. T-6 (real-handler O(1)-stack chain) and T-7
-//! (wasm smoke) land WITH the conversion; T-1..T-5 live here.
+//! if final outputs still match. T-6 (real-handler O(1)-stack chain, below)
+//! landed WITH the conversion; T-7 is the wasm build (`zig build wasm`
+//! compiles the same musttail handlers for wasm32+tail_call — a green build
+//! IS the capability proof, see build.zig's gate comment).
 
 const std = @import("std");
 const testing = std.testing;
@@ -212,6 +214,28 @@ test "T-1: error mid-recording aborts the recording and clears pending anchors" 
     var sink = io.Writer.fixed(&sink_buf);
     try testutil.runCapturedTuned(gpa, src, &sink, false, .record_only, .{ .inspect = Hook.check });
     try testing.expectEqualStrings("false\t435\n", sink.buffered());
+}
+
+// T-6 (doc 42 §7): the real-handler O(1)-stack gate. `dispatch.zig` proves
+// the toy mechanism; this proves the REAL interpreter — every instruction of
+// a fully-interpreted run is one musttail hop (handler → dispatch → handler).
+// ~3M+ dispatches at ~100B/frame would need ~300MB of stack if frames were
+// NOT being reused, overflowing the 8 MiB default long before completion;
+// finishing with the right answer is the proof the chain runs in O(1) stack.
+test "T-6: multi-million-dispatch chain runs in O(1) stack (real handlers)" {
+    const gpa = testing.allocator;
+    const src: [:0]const u8 =
+        \\local acc = 0
+        \\for i = 1, 1000000 do
+        \\  acc = acc + 1
+        \\end
+        \\print(acc)
+        \\
+    ;
+    var sink_buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    try testutil.runCapturedTuned(gpa, src, &sink, false, .off, .{});
+    try testing.expectEqualStrings("1000000\n", sink.buffered());
 }
 
 // T-5: reentrant `callValue` (a metamethod re-entering the interpreter from

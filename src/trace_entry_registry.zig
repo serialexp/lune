@@ -55,7 +55,7 @@ pub const EntryRegistry = struct {
         self.entry_patch_free.deinit(self.gpa);
     }
 
-    pub fn codeFor(self: *const EntryRegistry, proto: *const Proto) []const Instr {
+    pub inline fn codeFor(self: *const EntryRegistry, proto: *const Proto) []const Instr {
         if (self.code_images.count() == 0) return proto.code;
         return self.code_images.get(proto) orelse proto.code;
     }

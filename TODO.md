@@ -1587,22 +1587,20 @@ these remain:
    reproduce today (per-walk seam equal or better under `--jit-stats`: 315 vs
    366 cyc/walk).
 
-1b. **NEW — interpreter i-cache regression from the split (block-placement
-   fragility), the REMAINING ~+3.7% jit / up to +12.7% t0.** Interleaved A/B
-   confirms it is real, not noise: pi_leibniz tier-0 +12.7% with `interp.zig`
-   (and arith/value/table) byte-for-byte UNTOUCHED across the split, and
-   `perf stat -e L1-icache-load-misses` shows 19.7M misses (±0.4%) vs 14K
-   pre-split — ~4 misses per interpreted loop iteration, spread across the
-   whole `execImpl` dispatch loop; IPC 4.57 → 4.13, +2% instructions. Cause:
-   LLVM basic-block placement of the ~48KB `execImpl` megafunction is hostage
-   to the shape of the trace helpers inlined at its dispatch points; the split
-   reshaped those and the layout flipped bad. All interpreter-bound benches
-   (res% 0) inherit it: euler14-bit +7.6%, recursive-fib +4.5%, array3d +4.3%.
-   Fixing by nudging source is whack-a-mole; the real lever is the one already
-   on file in CLAUDE.md's nsieve verdict as #3 — **threaded/computed-goto
-   tier-0 dispatch**, which breaks the megafunction into per-op blocks with
-   tail dispatch and removes the layout fragility structurally. Big arc; needs
-   Bart's go-ahead.
+1b. **interpreter i-cache regression from the split — CLOSED 2026-09-07 by
+   the doc-42 tail-call dispatch conversion** (per-op musttail handlers; see
+   docs/design/42 §9 for the full receipts). The megafunction block-placement
+   lottery is structurally gone: pi_leibniz t0 icache misses 9.1K on the
+   final shape (the 19.7M-miss layout roll can no longer happen — handlers
+   are independently-placed functions), and t0 beats pre-conversion HEAD on
+   5/7 battery benches (pi_leibniz -10.8%, fft -8.9%, euler14 -5.9%,
+   grid_matmul -4.6%, array3d -4.2%). Honest residuals, recorded in doc 42
+   §9.3: recursive-fib/lua54 t0 ≈ +2% vs HEAD (call-boundary reload work the
+   megafunction kept in registers), scimark-fft jit +6.9% (profiled to the
+   trace-chain seam / R3 back-edge epilogue call, NOT the dispatch hot
+   path). Follow-up lever awaiting Bart's call: `omit_frame_pointer = true`
+   on the mahina module = a further measured ~1.5–3.5% t0 (doc 42 §9.4;
+   costs fp-based `perf -g` call graphs).
 2. **Forwarding facade on TraceState** — 176 pure-forward decls
    (trace.zig:2401+), three-layer aliasing trace.zig → trace_link →
    native_registry for ~9 demote/mutation ops, ~10 one-line policy forwards in

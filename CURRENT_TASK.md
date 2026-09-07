@@ -21,7 +21,41 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
-## Status 2026-09-07b — doc 42 arc OPEN: tail-call dispatch, prep landed, conversion next
+## Status 2026-09-07c — doc 42 arc LANDED: tail-call dispatch conversion complete
+
+The conversion commit is in (one commit: interp.zig conversion + T-6 test +
+two inline-fn fixes in trace_link/trace_entry_registry). Read
+**docs/design/42 §9** for the as-landed amendments + full measured receipts;
+short form:
+
+- Uniform six-arg musttail signature (`st, pc, instr: *const Instr, vm,
+  tags, payloads` — exact SysV int-register fit). The §4.6 widening was
+  REQUIRED: baseline signature was +4.3% t0 from load-port saturation.
+- Hot prologue is CALL-FREE via handler-shaped trampolines (gc, region
+  probe) — callable sites force per-hop callee-saved spills otherwise.
+  `@branchHint(.cold)` is the anti-inline device (noinline breaks the
+  musttail type match).
+- Straight-line handlers fetch via `instr + 1` (`instrNext`), putting the
+  opcode-load address in hand at handler entry.
+- Final battery: t0 beats pre-conversion HEAD on 5/7 (pi -10.8%,
+  fft -8.9%, euler14 -5.9%, grid -4.6%, array3d -4.2%; fib/lua54 ≈ +2%);
+  jit within noise except fft +6.9% (trace-chain seam per profile, R3).
+  icache lottery structurally dead (9.1K misses). Binary +2.2%; cold
+  ReleaseFast build FASTER (40.8s vs 46.3s). All gates green (just test,
+  hashgate 84/84 both legs, wasm).
+- OPEN for Bart: `omit_frame_pointer` module flag = further ~1.5–3.5% t0
+  (doc 42 §9.4). NOT landed (degrades fp-based perf -g call graphs).
+- **Methodology warning, sharper than before:** a `just bench` board run
+  launched right after two back-to-back 40s all-core cold builds produced
+  PHANTOM +30%/+54% rows (recursive-fib, scimark-fft) — the machine was
+  still thermally throttled, proven by LuaJIT's OWN column inflating 50%
+  in the same run (24.4 vs 16.2 lj_ms on fft) and by hand-interleaved
+  re-timing of the identical binary/command showing parity-or-better.
+  The earlier "+4.5% phantom medians" note understated it. NEVER cite a
+  sequential board taken near heavy builds; interleaved A/B or an idle-
+  machine re-run only. (The garbage TSVs were deleted.)
+
+## Status 2026-09-07b — doc 42 arc (design/prep phase, superseded by 07c above)
 
 Bart authorized the structural fix for the interpreter i-cache fragility
 ("absolutely number 1"). State of the arc:

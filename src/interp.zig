@@ -2075,51 +2075,226 @@ pub const Vm = struct {
             self.trace.pending_replay_anchor != null);
     }
 
-    /// Per-instruction prologue + fetch for the threaded dispatch loop, factored
-    /// out of `execImpl` so every opcode arm can re-dispatch with `continue :sw
-    /// (try self.nextOp(...) orelse return .suspended)`. Runs **between every pair
-    /// of instructions in both modes**, so GC timing, `safepoint_seq` counting,
-    /// suspend points, replay-line recording, and the trace recording mirror stay
-    /// byte-identical to the old centralized `while`-loop prologue.
-    ///
-    /// Returns the next opcode to dispatch, or `null` when a `.full`-mode suspend
-    /// fires (the caller turns that into `return .suspended`). `frame.pc`,
-    /// `cur_pc`, `instr`, and `a` are written through the out-pointers; `pc` is
-    /// advanced past the fetched instruction. `inline` so the loop locals stay in
-    /// registers and the `.fast` instantiation compiles the full-only hooks out.
-    inline fn nextOp(
-        self: *Vm,
-        comptime mode: ExecMode,
+    // ------------------------------------------------------------------------
+    // Doc 42: tail-call threaded dispatch — one handler FUNCTION per opcode,
+    // dispatched with `@call(.always_tail)` through a per-mode fn-pointer
+    // table. Rationale (doc 42 §1–2): each handler is its own symbol, so LLVM
+    // lays it out (and allocates registers for it) independently — the
+    // interpreter's speed is no longer hostage to basic-block placement of a
+    // single ~48KB megafunction re-rolled by every trace-helper edit. This is
+    // the real interpreter behind the `dispatch.zig` capability gate ("the toy
+    // loop is temporary; the capability is the pillar" — architecture doc 00,
+    // principle #4).
+    // ------------------------------------------------------------------------
+
+    /// Doc 42 §4.1: everything one `execImpl` invocation threads through its
+    /// handler chain, EXCEPT the two hottest data (`pc`, `instr`), which ride
+    /// as by-value musttail arguments. Owned by `execImpl`'s frame — the chain
+    /// is entered by an ORDINARY call (never a musttail from `execImpl`), so a
+    /// pointer to this state can never outlive the frame it lives on. Handlers
+    /// and the dispatch helper musttail among themselves; any exit event
+    /// returns through the whole chain in one `ret`.
+    const ExecState = struct {
+        vm: *Vm,
+        /// Hot top-frame state, re-derived by `reloadTopFrame` after every
+        /// real push/pop (`.call` Lua entry, `.ret`).
         frame: *CallFrame,
         closure: *const Closure,
         proto: *const Proto,
+        /// Doc 20: dispatch fetches from the VM-local copy-on-patch image when
+        /// one exists (canonical `proto.code` otherwise — the empty-map
+        /// early-out makes that one counter load). `code_gen` memoizes the
+        /// image generation; the patched-entry and back-edge sites re-resolve
+        /// when it moves (§R2-1).
         code: []const Instr,
+        code_gen: u64,
+        base: usize,
         regs: RegWindow,
-        pc: *usize,
-        cur_pc: *usize,
-        instr: *Instr,
-        a: *usize,
-    ) Error!?bytecode.OpCode {
-        // GC safepoint — see the long note at the call-equivalent site in the old
-        // loop: every live value is rooted here, the collection is non-moving, and
-        // it is suppressed while a multret result set is pending.
-        if (!self.reg_top_pending and self.heap.shouldCollect()) self.collect();
+        stop_depth: u32,
+        /// Exit payload: written by the `.ret`/`.halt` handler before it
+        /// returns `.finished` (the only `HandlerResult` carrying a payload).
+        step: ExecStep,
+        /// Doc 42 §4.3: the parked error. A musttail chain cannot thread an
+        /// error-union return (§3.1: sret breaks musttail — verified compile
+        /// error), so every error edge in a handler parks here and returns
+        /// `.err`; `execImpl` re-raises it at the chain boundary, which keeps
+        /// `execWith`'s errdefers and every enclosing pcall byte-identical.
+        /// Initialized `null` on EVERY entry.
+        err: ?Error,
+    };
 
-        // Free-running safepoint counter — must advance every instruction in both
-        // modes so replay cuts land identically (keyframeser reads it as the total).
+    /// Doc 42 §4.1: register-sized handler return. A handler that continues
+    /// execution never returns — it tail-jumps to the next dispatch; only exit
+    /// events return, and they return through the whole musttail chain in one
+    /// `ret` to `execImpl`.
+    const HandlerResult = enum(u8) { finished, suspended, switch_mode, err };
+
+    /// The uniform musttail signature. Every handler, the dispatch helper, and
+    /// the back-edge trampoline share it EXACTLY, so every hop in the chain is
+    /// a guaranteed tail call (`dispatch.zig` is the permanent capability gate
+    /// for the mechanism; `interp_dispatch_test.zig` T-6 gates the real
+    /// handlers).
+    const HandlerFn = fn (st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult;
+
+    const op_count = @typeInfo(bytecode.OpCode).@"enum".field_names.len;
+
+    /// Doc 42 §4.3: park-and-return — the mechanical translation of every
+    /// error edge that used to `try`/`return err` out of an opcode arm. The
+    /// happy path pays nothing (no error-union ABI on the tail chain at all);
+    /// the error path pays one store+branch and is already the slow path.
+    inline fn parkErr(st: *ExecState, e: Error) HandlerResult {
+        st.err = e;
+        return .err;
+    }
+
+    /// Doc 42 §4.4: re-derive the hot top-frame state after a REAL push/pop
+    /// (`.call` Lua entry, `.ret`) — the old explicit reload blocks, verbatim,
+    /// including `setRegionContext`. The surrounding boundary ORDER
+    /// (callee-window init without safepoint → park caller pc → push → reload;
+    /// close upvalues → copy results while the callee window is rooted → pop →
+    /// reload → shrink `stack_top`) is owned by the call/ret handlers, not by
+    /// this helper. Trace/deopt resumes must NOT use this — they re-resolve
+    /// nothing (no `codeFor`, no `setRegionContext`; adding those would change
+    /// observer behavior and cost on productive resumes) and just
+    /// tail-dispatch at the new pc.
+    inline fn reloadTopFrame(st: *ExecState) void {
+        const vm = st.vm;
+        st.frame = &vm.frames[vm.depth - 1];
+        st.closure = st.frame.closure;
+        st.proto = st.closure.proto;
+        st.code = vm.trace.codeFor(st.proto); // doc 20 image
+        st.code_gen = vm.trace.registry.entry_registry.image_gen;
+        st.base = st.frame.base;
+        st.regs = vm.frameWindow(st.base, st.proto.num_registers);
+        vm.trace.setRegionContext(vm.depth, st.frame.call_seq);
+    }
+
+    /// The per-mode handler tables, comptime-built from `handlerFor`. Two
+    /// instantiations so the `.full`-only prologue hooks compile out of the
+    /// `.fast` handlers exactly as the old `nextOp` instantiations did.
+    /// `bytecode.zig`'s comptime density assert is what makes the bare
+    /// `[@intFromEnum(op)]` indexing total and correct.
+    const handler_table_fast = buildHandlerTable(.fast);
+    const handler_table_full = buildHandlerTable(.full);
+
+    fn buildHandlerTable(comptime mode: ExecMode) [op_count]*const HandlerFn {
+        @setEvalBranchQuota(10_000);
+        var t: [op_count]*const HandlerFn = undefined;
+        inline for (@typeInfo(bytecode.OpCode).@"enum".field_names, 0..) |name, i| {
+            t[i] = handlerFor(mode, @field(bytecode.OpCode, name));
+        }
+        return t;
+    }
+
+    inline fn handlerTable(comptime mode: ExecMode) *const [op_count]*const HandlerFn {
+        return if (mode == .fast) &handler_table_fast else &handler_table_full;
+    }
+
+    /// Doc 42 §4.2: the dispatch tail — the complete per-instruction prologue
+    /// followed by the table jump, `inline` so it expands INTO every handler
+    /// tail and the `@call(.always_tail)` at its end jumps handler→handler
+    /// directly (true direct threading: each handler carries its own copy of
+    /// the prologue and its own indirect-jump site, exactly as the old 61
+    /// `nextOp` thread sites did — a first cut through a shared non-inline
+    /// dispatch function measured +37.7% on pi_leibniz tier-0 from the
+    /// per-instruction call frame it added). Runs **between every pair of
+    /// instructions in both modes**, so GC timing, `safepoint_seq` counting,
+    /// suspend points, replay-line recording, and the trace recording mirror
+    /// stay byte-identical to the old `nextOp` prologue. The numbered step
+    /// order below is the determinism contract (doc 42 §4.2 — normative; do
+    /// not reorder).
+    /// `&instr[1]` — the next-instruction pointer for a straight-line fall
+    /// through. Zig single-item pointers have no arithmetic, so bounce
+    /// through a many-item pointer.
+    inline fn instrNext(instr: *const Instr) *const Instr {
+        const many: [*]const Instr = @ptrCast(instr);
+        return &many[1];
+    }
+
+    /// General dispatch: `pc` is an arbitrary target (jump, frame reload,
+    /// chain entry), so derive the fetch pointer from the cached image.
+    inline fn dispatchTail(comptime mode: ExecMode, st: *ExecState, pc: usize, vm: *Vm) HandlerResult {
+        // Lanes re-derived from `st.regs` — the authoritative window for an
+        // arbitrary target (post-reload, post-epilogue); identical reads to
+        // the pre-widening general path.
+        return dispatchTailFrom(mode, st, pc, &st.code[pc], vm, st.regs.tags, st.regs.payloads);
+    }
+
+    /// Dispatch with a caller-supplied fetch pointer (`iptr == &st.code[pc]`).
+    /// Straight-line handlers pass `instrNext(instr)` — the identity
+    /// `instr == &st.code[pc - 1]` holds at every handler entry, so
+    /// `instr + 1 == &st.code[pc]` against the SAME cached image (identical
+    /// staleness semantics to the general path; no new hazard). What it buys:
+    /// the opcode-load address is ready at handler ENTRY instead of behind an
+    /// `st.code` load, shortening the dependency chain into the indirect
+    /// table jump — the chain the megafunction never paid because it kept
+    /// `code` in a register.
+    inline fn dispatchTailFrom(comptime mode: ExecMode, st: *ExecState, pc: usize, iptr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+        const self = vm;
+        // (1) GC safepoint — every live value is rooted here, the
+        // collection is non-moving, and it is suppressed while a
+        // multret result set is pending.
+        //
+        // Hot-path shape (doc 42 §4.2 amendment): the `.fast` prologue must
+        // stay CALL-FREE — a callable site anywhere in a handler forces
+        // callee-saved spills (push/pop ×5, measured) on EVERY hop, even when
+        // the call never runs, because LLVM's shrink-wrapping cannot sink
+        // them past the tail jump. The two calls this prologue can make —
+        // `collect` here and the region observer's slow path in step (5) —
+        // are outlined as handler-shaped trampolines the dispatch musttails
+        // INTO; each does its call and re-enters the remaining prologue, so
+        // the §4.2 step order is preserved exactly and the hot handlers stay
+        // frameless.
+        if (!self.reg_top_pending and self.heap.shouldCollect())
+            return @call(.always_tail, gcTrampoline(mode), .{ st, pc, iptr, vm, tags, payloads });
+        return dispatchPostGc(mode, st, pc, iptr, vm, tags, payloads);
+    }
+
+    /// Cold half of prologue step (1): run the collection, then re-enter the
+    /// prologue at step (2). Handler-shaped so the hot path can musttail here
+    /// instead of calling — see the shape note in `dispatchTail`.
+    fn gcTrampoline(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                // `.cold` (not `noinline` — that would change the fn TYPE and
+                // break the musttail type match) is what actually keeps this
+                // outlined: without it LLVM inlines the trampoline back into
+                // every handler and the spills return.
+                @branchHint(.cold);
+                // `instr` carries the fetch pointer (`&st.code[pc]`) through
+                // the trampoline. It survives `collect()`: the collector is
+                // non-moving and never swaps the cached code image.
+                vm.collect();
+                return dispatchPostGc(mode, st, pc, instr, vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// Prologue steps (2)–(5 hot half); step (5)'s slow observer call exits
+    /// via `regionTrampoline`.
+    inline fn dispatchPostGc(comptime mode: ExecMode, st: *ExecState, pc: usize, iptr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+        const self = vm;
+        // (2) Free-running safepoint counter — must advance every
+        // instruction in both modes so replay cuts land identically
+        // (keyframeser reads it as the total).
         self.safepoint_seq += 1;
 
-        // Replay line-index recorder — `.full` only (compiled out in `.fast`).
+        // (3) Replay line-index recorder — `.full` only (compiled out
+        // in `.fast`). A failed append parks-and-returns leaving
+        // exactly the old partial state: `safepoint_seq` already
+        // incremented, nothing after this step run (§4.2).
         if (mode == .full and self.record_safepoint_lines) {
+            const proto = st.proto;
             const sp_src = if (proto.source.len > 0) proto.source else self.source;
-            const sp_line: u32 = if (pc.* < proto.spans.len)
-                compiler.lineFromOffset(sp_src, proto.spans[pc.*].start)
+            const sp_line: u32 = if (pc < proto.spans.len)
+                compiler.lineFromOffset(sp_src, proto.spans[pc].start)
             else
                 0;
-            try self.safepoint_lines.append(self.gpa, sp_line);
+            self.safepoint_lines.append(self.gpa, sp_line) catch |e| return parkErr(st, e);
         }
 
-        // Mid-execution suspend point — an instruction boundary. `.full` only.
+        // (4) Mid-execution suspend point — an instruction boundary,
+        // BEFORE the fetch and all recording hooks. `.full` only.
         if (mode == .full) {
             if (self.suspend_ctl) |sc| {
                 const effect_cut_reached = if (sc.after_committed_effects) |n|
@@ -2130,81 +2305,181 @@ pub const Vm = struct {
                     self.safepoint_seq >= sc.after_safepoints and self.depth >= sc.min_depth)
                 {
                     std.debug.assert(self.pending_error == null);
-                    frame.pc = pc.*;
-                    return null;
+                    st.frame.pc = pc;
+                    return .suspended;
                 }
             }
         }
 
-        const cur = pc.*;
-        cur_pc.* = cur;
-        // A-iv logical-region departure observer. The empty-map common path does
-        // not call into the observer and cannot allocate; activation context is
-        // refreshed only on frame reload (execImpl/push/pop), not per instruction.
-        // A-vii-e.2: with a region live, `observeFast` answers the overwhelmingly
-        // common survive verdict inline (bit test against the cached hot span) so
-        // the loop never pays the observer's call frame; anything it cannot answer
-        // falls through to the pre-e.2 call, unchanged. The empty-map test stays
-        // FIRST and stays the only unconditional work: probing the hot cache ahead
-        // of it would touch a second `TraceState` line on every instruction of
-        // every region-free program, which measured +11% on scimark-sor tier-0.
-        if (self.trace.regionProfitCount() != 0 and
-            !self.trace.observeFast(proto.id, @intCast(cur), self.depth, frame.call_seq))
-            self.trace.observeRegionProgramPoint(proto.id, @intCast(cur), self.depth, frame.call_seq);
-        // Keep the faulting location recoverable (see the old loop's note).
-        frame.pc = cur;
-        const i = code[cur];
-        pc.* = cur + 1;
-        instr.* = i;
-        a.* = i.a;
+        // (5) A-iv logical-region departure observer. The empty-map
+        // common path does not call into the observer and cannot
+        // allocate; activation context is refreshed only on frame
+        // reload (`execImpl`/push/pop), not per instruction. The
+        // empty-map test stays FIRST and stays the only unconditional
+        // work: probing the hot cache ahead of it would touch a second
+        // `TraceState` line on every instruction of every region-free
+        // program, which measured +11% on scimark-sor tier-0.
+        //
+        // The WHOLE probe — `observeFast` inline verdict included —
+        // lives behind the trampoline: inlined here, its bit-test
+        // machinery needs enough temporaries that LLVM allocates
+        // callee-saved registers (push/pop ×3, measured on the
+        // widened ABI) in EVERY fast handler, taxing every hop of
+        // every region-free program for state only region profiling
+        // touches. Behind the musttail the hot prologue keeps only
+        // this one counter test, and a regions-live program pays one
+        // extra tail jump per instruction — still call-frame-free
+        // (A-vii-e.2's point), just one hop farther out of line.
+        if (self.trace.regionProfitCount() != 0)
+            return @call(.always_tail, regionTrampoline(mode), .{ st, pc, iptr, vm, tags, payloads });
+        return dispatchPostObserve(mode, st, pc, iptr, vm, tags, payloads);
+    }
 
-        // A recording is one CFG cycle, not necessarily one syntactic back-edge.
-        // Close before mirroring when forward flow re-enters its anchor (nested
-        // loops can do this after an enclosing back-edge). The ordinary matching
-        // back-edge already closed in `onBackEdge`, making this a cheap no-op.
+    /// Out-of-line prologue step (5) for regions-live programs: the
+    /// A-vii-e.2 inline verdict, falling through to the real observer only
+    /// when the hot cache cannot answer, then re-enter the prologue at
+    /// step (6).
+    fn regionTrampoline(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                @branchHint(.cold); // keep outlined — see gcTrampoline's note
+                // `instr` carries the fetch pointer, as in `gcTrampoline`.
+                if (!vm.trace.observeFast(st.proto.id, @intCast(pc), vm.depth, st.frame.call_seq))
+                    vm.trace.observeRegionProgramPoint(st.proto.id, @intCast(pc), vm.depth, st.frame.call_seq);
+                return dispatchPostObserve(mode, st, pc, instr, vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// Prologue steps (6)–(11) + the table jump into the next handler.
+    inline fn dispatchPostObserve(comptime mode: ExecMode, st: *ExecState, pc: usize, iptr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+        const self = vm;
+        const cur = pc;
+        // (6) Keep the faulting location recoverable (see the old
+        // loop's note): `frame.pc` points at the instruction about to
+        // execute.
+        st.frame.pc = cur;
+        // (7) Fetch. The handler receives `cur + 1` as its `pc` (one
+        // past itself — `cur_pc` is derivable as `pc - 1`).
+        const i = iptr.*;
+
+        // (8) A recording is one CFG cycle, not necessarily one
+        // syntactic back-edge. Close before mirroring when forward
+        // flow re-enters its anchor (nested loops can do this after an
+        // enclosing back-edge). The ordinary matching back-edge
+        // already closed in `onBackEdge`, making this a cheap no-op.
         if (mode == .full and self.trace.isRecording())
-            self.trace.maybeCloseAtAnchor(proto, @intCast(cur), regs);
-        // Nested-loop continuation (Phase 1): a continuation recording armed by a
-        // hot inner loop-done exit begins at its (non-header) anchor pc, which
-        // tier-0 reaches here — *before* the mirror below, so the anchor
-        // instruction is recorded as the trace's first op (exactly as a root
-        // trace's anchor is). A cheap optional-null read when nothing is pending.
+            self.trace.maybeCloseAtAnchor(st.proto, @intCast(cur), st.regs);
+        // (9) Nested-loop continuation (Phase 1): a continuation
+        // recording armed by a hot inner loop-done exit begins at its
+        // (non-header) anchor pc, which tier-0 reaches here — *before*
+        // the mirror below, so the anchor instruction is recorded as
+        // the trace's first op (exactly as a root trace's anchor is).
+        // A cheap optional-null read when nothing is pending.
         if (mode == .full and self.trace.pending_exit_anchor != null) {
-            self.trace.maybeStartContinuation(proto, @intCast(cur));
+            self.trace.maybeStartContinuation(st.proto, @intCast(cur));
         }
-
-        // Coherent-state chaining (doc 16, Phase 2): a prime side-trace armed on a
-        // productive branch-guard exit begins at the failed trace's own coherent
-        // anchor (the outer header), which tier-0 reaches here with registers already
-        // coherent — no deopt-replay needed. Same `.full`-only, before-the-mirror
-        // placement so the anchor instruction is the recording's first op.
+        // (10) Coherent-state chaining (doc 16, Phase 2): a prime
+        // side-trace armed on a productive branch-guard exit begins at
+        // the failed trace's own coherent anchor (the outer header),
+        // which tier-0 reaches here with registers already coherent —
+        // no deopt-replay needed. Same `.full`-only, before-the-mirror
+        // placement so the anchor instruction is the recording's
+        // first op.
         if (mode == .full and self.trace.pending_replay_anchor != null) {
-            self.trace.maybeStartReplaySide(proto, @intCast(cur));
+            self.trace.maybeStartReplaySide(st.proto, @intCast(cur));
         }
-
-        // Recording mirror — `.full` only. Mirrors this instruction (and its
-        // observed operand types) into the trace IR *before* tier-0 executes it.
+        // (11) Recording mirror — `.full` only. Mirrors this
+        // instruction (and its observed operand types) into the trace
+        // IR *before* tier-0 executes it.
         if (mode == .full and self.trace.isRecording()) {
             // Doc 20 §R1-3: the mirror always records the CANONICAL
-            // instruction. `i` came from the fetch `code` slice, which may be
-            // a patched image — a recording crossing a patched pc (a sibling
-            // loop of the one being recorded) must see the virgin loop closer
-            // (`.for_loop`, `.jmp`, or `.jmp_if_false`) and virgin shape checks,
-            // byte-identical with or without the patch. `proto.code` is
-            // canonical by construction (§R1).
-            const mi = recordingMirrorInstr(proto, cur, i);
+            // instruction. `i` came from the fetch `code` slice, which
+            // may be a patched image — a recording crossing a patched
+            // pc (a sibling loop of the one being recorded) must see
+            // the virgin loop closer (`.for_loop`, `.jmp`, or
+            // `.jmp_if_false`) and virgin shape checks, byte-identical
+            // with or without the patch. `proto.code` is canonical by
+            // construction (§R1).
+            const mi = recordingMirrorInstr(st.proto, cur, i);
             const resolved: Value = switch (mi.op) {
-                .get_upval => self.upvalGet(closure.upvalues[mi.b]),
-                .get_global => self.globals.get(proto.constants[mi.b]),
+                .get_upval => self.upvalGet(st.closure.upvalues[mi.b]),
+                .get_global => self.globals.get(st.proto.constants[mi.b]),
                 else => Value.nil(),
             };
-            // Refresh the recorder's read-only heap channel (doc 23 D2) — the
-            // same supply-per-call pattern as `resolved`, so the recorder never
-            // holds a `*Heap` it wasn't just handed by its driver.
+            // Refresh the recorder's read-only heap channel (doc 23
+            // D2) — the same supply-per-call pattern as `resolved`, so
+            // the recorder never holds a `*Heap` it wasn't just handed
+            // by its driver.
             self.trace.rec_heap = self.heap;
-            self.trace.recordInstr(mi, regs, proto, @intCast(pc.*), resolved);
+            self.trace.recordInstr(mi, st.regs, st.proto, @intCast(cur + 1), resolved);
         }
-        return i.op;
+        // The instruction rides as a POINTER into the fetch image (or
+        // `patch.orig`), not by value: a by-value 12-byte `Instr`
+        // lowers to a byval STACK argument on wasm32, and wasm tail
+        // calls reject stack arguments outright ("does not support
+        // tail calling with stack arguments") — found by the T-7 wasm
+        // build, doc 42 §4.1 amendment. `*const Instr` is
+        // register-sized on every target; the pointee is the code
+        // image element just fetched (same hot cache line).
+        return @call(.always_tail, handlerTable(mode)[@intFromEnum(i.op)], .{ st, cur + 1, iptr, vm, tags, payloads });
+    }
+
+    /// Doc 42 §4.1: the ORDINARY (non-musttail) entry into the handler chain.
+    /// A real `noinline` function with the uniform handler signature: its own
+    /// frame is the disposable one the first musttail hop replaces, while
+    /// `execImpl`'s frame — which owns the `ExecState` — sits safely beneath,
+    /// reached only by the chain's single final `ret`.
+    fn chainEntry(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            // Plain fn, NOT `noinline`: in this toolchain `noinline` is part
+            // of the function TYPE, and a musttail caller's type must match
+            // its callee's exactly — a noinline entry cannot tail-call the
+            // plain handlers. The no-inline property lives at `execImpl`'s
+            // call site (`@call(.never_inline, …)`) instead.
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                _ = instr; // uniform signature; nothing has executed yet
+                _ = tags; // general dispatch re-derives lanes from st.regs
+                _ = payloads;
+                return dispatchTail(mode, st, pc, vm);
+            }
+        }.h;
+    }
+
+    /// What the extracted back-edge epilogue tells its trampoline to do.
+    /// `dispatch_at` = the old `continue :outer` (pc possibly advanced by a
+    /// chain resume): tail-dispatch at that pc with a full prologue,
+    /// re-resolving NOTHING. `switch_mode_at` = park pc and flip the dispatch
+    /// mode (the old `frame.pc = npc; return .switch_mode`).
+    const BackEdgeDirective = union(enum) {
+        dispatch_at: usize,
+        switch_mode_at: usize,
+    };
+
+    /// Doc 42 §4.4: the back-edge trampoline. Jump handlers musttail here on a
+    /// real loop back-edge (target `pc <= cur_pc` while tracing is enabled),
+    /// presenting the CANONICAL instruction (`patch.orig` from the patched
+    /// arms); it runs the `noinline` epilogue and acts on the directive. The
+    /// `frame.pc` write for a mode switch lives HERE, not in the epilogue —
+    /// the epilogue must never write the jump target into `frame.pc` (§4.4
+    /// invariant: `frame.pc` stays at the executed back-edge until the next
+    /// prologue, except an explicit mode-switch park).
+    fn backEdgeHandler(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                // The epilogue may run traces/drains that move the lanes;
+                // dispatchTail re-derives them from `st.regs`.
+                _ = tags;
+                _ = payloads;
+                switch (backEdgeEpilogue(mode, st, pc, instr)) {
+                    .dispatch_at => |npc| return dispatchTail(mode, st, npc, vm),
+                    .switch_mode_at => |npc| {
+                        st.frame.pc = npc;
+                        return .switch_mode;
+                    },
+                }
+            }
+        }.h;
     }
 
     /// Phase 0a (doc 20): what the factored entry routine tells its caller's
@@ -3047,1178 +3322,1442 @@ pub const Vm = struct {
         return directive;
     }
 
+    /// Doc 42: one `execImpl` invocation = build the chain state on THIS
+    /// frame, enter the handler chain with an ordinary call, and translate its
+    /// register-sized result back into `Error!ExecStep` (re-raising a parked
+    /// error as a real Zig error, so `execWith`'s errdefers and every
+    /// enclosing pcall behave exactly as before). The old labeled-switch loop
+    /// is gone: control flow lives in the per-op handlers below, threaded by
+    /// `@call(.always_tail)` through `dispatchTail`. Mode switches and
+    /// suspension keep their old shape — the chain returns, this state dies,
+    /// and the next invocation reloads from `CallFrame`.
     fn execImpl(self: *Vm, comptime mode: ExecMode, stop_depth: u32) Error!ExecStep {
-        // Hot top-frame state, reloaded from `frames[depth-1]` after every push/pop.
-        var frame: *CallFrame = &self.frames[self.depth - 1];
-        var closure = frame.closure;
-        var proto = closure.proto;
-        // Doc 20: dispatch fetches from the VM-local copy-on-patch image when
-        // one exists (canonical `proto.code` otherwise — the empty-map early-out
-        // makes that one counter load). `code_gen` memoizes the image
-        // generation; the back-edge epilogue re-resolves when it moves (§R2-1).
-        var code = self.trace.codeFor(proto);
-        var code_gen = self.trace.registry.entry_registry.image_gen;
-        var base = frame.base;
-        var regs = self.frameWindow(base, proto.num_registers);
-        var pc = frame.pc;
+        const frame = &self.frames[self.depth - 1];
+        const proto = frame.closure.proto;
+        var st: ExecState = .{
+            .vm = self,
+            .frame = frame,
+            .closure = frame.closure,
+            .proto = proto,
+            .code = self.trace.codeFor(proto), // doc 20 image
+            .code_gen = self.trace.registry.entry_registry.image_gen,
+            .base = frame.base,
+            .regs = self.frameWindow(frame.base, proto.num_registers),
+            .stop_depth = stop_depth,
+            .step = undefined,
+            .err = null,
+        };
         self.trace.setRegionContext(self.depth, frame.call_seq);
-        // Threaded-dispatch loop locals. `step` writes `cur_pc`/`instr`/`a` and
-        // advances `pc` on every fetch; declared here so each opcode arm can
-        // re-dispatch with `continue :sw`. Always set by `step` before any use.
-        var cur_pc: usize = undefined;
-        var instr: Instr = undefined;
-        var a: usize = undefined;
+        switch (@call(.never_inline, chainEntry(mode), .{ &st, frame.pc, undefined, self, st.regs.tags, st.regs.payloads })) {
+            .finished => return st.step,
+            .suspended => return .suspended,
+            .switch_mode => return .switch_mode,
+            .err => return st.err.?,
+        }
+    }
 
-        // `outer:` is retained for the back-edge epilogue's two `continue :outer`
-        // deopt re-entries and the post-epilogue header re-fetch. The central
-        // dispatch is now a labeled `sw: switch`: straight-line arms thread
-        // directly to the next instruction via `continue :sw (try self.nextOp(...)
-        // orelse return .suspended)`, and the epilogue below is reached *only* via
-        // `break :sw` from a jump arm on a real loop back-edge. Everything else
-        // threads or `continue :outer`s: `.call`'s Lua-function and `.ret` arms
-        // reload frame locals and `continue :outer`; `.call`'s native/`__call`
-        // arms thread with an explicit `continue :sw` tail (they advance `pc` past
-        // the call like any straight-line op). The whole per-instruction prologue
-        // (GC safepoint, `safepoint_seq`, suspend, replay, recording mirror) lives
-        // in `nextOp`, so it still runs between every pair of instructions in both
-        // modes — byte-identical to the old inlined prologue.
-        outer: while (true) {
-            sw: switch (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended) {
-                // ---- loads & moves ---- (direct lane writes; no `Value` built)
-                .load_nil => {
-                    regs.setNil(a);
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .load_bool => {
-                    regs.setBool(a, instr.b != 0);
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .load_int => {
-                    regs.setInt(a, instr.aux);
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .load_const => {
-                    regs.set(a, proto.constants[instr.b]);
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .move => {
-                    regs.copy(a, instr.b);
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
+    /// Doc 42 §4.5: the op → handler map, one entry per opcode; the comptime
+    /// density assert in `bytecode.zig` keeps this and the table index in
+    /// lockstep. The handler bodies are the old `execImpl` arms moved verbatim
+    /// under the five mechanical translation rules (§4.5): error edge → park;
+    /// `continue :sw` → tail-dispatch; push/pop reload → `reloadTopFrame` +
+    /// dispatch; resume-only → tail-dispatch at the resume pc (no re-resolve);
+    /// `break :sw` → musttail into `backEdgeHandler`.
+    fn handlerFor(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        return switch (op) {
+            .load_nil, .load_bool, .load_int, .load_const, .move => opLoad(mode, op),
+            .add, .sub, .mul => opBinNum(mode, op),
+            .div => opDiv(mode),
+            .idiv, .mod, .pow, .shl, .shr, .sar => opArithMeta(mode, op),
+            .band, .bor, .bxor => opBinBit(mode, op),
+            .neg => opNeg(mode),
+            .not => opNot(mode),
+            .bnot => opBnot(mode),
+            .len => opLen(mode),
+            .concat => opConcat(mode),
+            .eq, .ne => opEqNe(mode, op),
+            .lt, .le, .gt, .ge => opCompare(mode, op),
+            .jmp, .jmp_if_false, .jmp_if_true, .jmp_if_not_nil => opJump(mode, op),
+            .for_prep => opForPrep(mode),
+            .for_loop => opForLoop(mode),
+            .jfor_loop => opJForLoop(mode),
+            .jloop => opJLoop(mode),
+            .tfor_loop => opTForLoop(mode),
+            .new_table => opNewTable(mode),
+            .get_index => opGetIndex(mode),
+            .set_index => opSetIndex(mode),
+            .get_index2 => opGetIndex2(mode),
+            .set_index2 => opSetIndex2(mode),
+            .get_global => opGetGlobal(mode),
+            .set_global => opSetGlobal(mode),
+            .closure => opClosure(mode),
+            .get_upval => opGetUpval(mode),
+            .set_upval => opSetUpval(mode),
+            .close_upvalues => opCloseUpvalues(mode),
+            .call => opCall(mode),
+            .ret, .halt => opRet(mode),
+            .vararg_first => opVarargFirst(mode),
+            .vararg_len => opVarargLen(mode),
+            .vararg_get => opVarargGet(mode),
+            .vararg_spread => opVarargSpread(mode),
+        };
+    }
 
-                // ---- arithmetic (semantics live in arith.zig) ----
-                // The hot both-int / both-float cases compute on the raw payload
-                // lanes directly (no 16-byte `Value` materialized — the SoA win);
-                // every other operand mix falls back to the exact `arith.*` +
-                // `arithMeta` path (mixed promotion, `__add`/… metamethod, or a
-                // propagated error like `DivisionByZero`). Numbers carry no
-                // metatable, so the common path never touches dispatch.
-                .add => {
-                    try self.binNum(regs, a, instr.b, instr.c, .add, self.mm.add);
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .sub => {
-                    try self.binNum(regs, a, instr.b, instr.c, .sub, self.mm.sub);
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .mul => {
-                    try self.binNum(regs, a, instr.b, instr.c, .mul, self.mm.mul);
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .div => {
-                    const tb = regs.tagAt(instr.b);
-                    const tc = regs.tagAt(instr.c);
-                    if (tb == .float and tc == .float) {
+    // ---- loads & moves ---- (direct lane writes; no `Value` built)
+    fn opLoad(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const a: usize = instr.a;
+                switch (op) {
+                    .load_nil => regs.setNil(a),
+                    .load_bool => regs.setBool(a, instr.b != 0),
+                    .load_int => regs.setInt(a, instr.aux),
+                    .load_const => regs.set(a, st.proto.constants[instr.b]),
+                    .move => regs.copy(a, instr.b),
+                    else => unreachable,
+                }
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    // ---- arithmetic (semantics live in arith.zig) ----
+    // The hot both-int / both-float cases compute on the raw payload lanes
+    // directly (no 16-byte `Value` materialized — the SoA win); every other
+    // operand mix falls back to the exact `arith.*` + `arithMeta` path (mixed
+    // promotion, `__add`/… metamethod, or a propagated error like
+    // `DivisionByZero`). Numbers carry no metatable, so the common path never
+    // touches dispatch.
+    fn opBinNum(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const self = vm;
+                self.binNum(regs, instr.a, instr.b, instr.c, comptime switch (op) {
+                    .add => .add,
+                    .sub => .sub,
+                    .mul => .mul,
+                    else => unreachable,
+                }, switch (op) {
+                    .add => self.mm.add,
+                    .sub => self.mm.sub,
+                    .mul => self.mm.mul,
+                    else => unreachable,
+                }) catch |e| return parkErr(st, e);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    fn opDiv(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const self = vm;
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const tb = regs.tagAt(instr.b);
+                const tc = regs.tagAt(instr.c);
+                if (tb == .float and tc == .float) {
+                    @setFloatMode(.strict);
+                    regs.setFloat(instr.a, @as(f64, @bitCast(regs.bitsAt(instr.b))) / @as(f64, @bitCast(regs.bitsAt(instr.c))));
+                } else {
+                    const lhs = regs.get(instr.b);
+                    const rhs = regs.get(instr.c);
+                    regs.set(instr.a, self.arithMeta(arith.div(lhs, rhs), self.mm.div, lhs, rhs) catch |e| return parkErr(st, e));
+                }
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// The `arith.* → arithMeta` fallback family (no raw-lane fast path).
+    fn opArithMeta(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const self = vm;
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const lhs = regs.get(instr.b);
+                const rhs = regs.get(instr.c);
+                const raw = switch (op) {
+                    .idiv => arith.floorDiv(lhs, rhs),
+                    .mod => arith.mod(lhs, rhs),
+                    .pow => arith.pow(lhs, rhs),
+                    .shl => arith.shl(lhs, rhs),
+                    .shr => arith.shr(lhs, rhs),
+                    .sar => arith.sar(lhs, rhs),
+                    else => unreachable,
+                };
+                const name = switch (op) {
+                    .idiv => self.mm.idiv,
+                    .mod => self.mm.mod,
+                    .pow => self.mm.pow,
+                    .shl => self.mm.shl,
+                    .shr => self.mm.shr,
+                    .sar => self.mm.sar,
+                    else => unreachable,
+                };
+                regs.set(instr.a, self.arithMeta(raw, name, lhs, rhs) catch |e| return parkErr(st, e));
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    // ---- bitwise ---- (both-int fast lane; else `arith.*` + meta)
+    fn opBinBit(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const self = vm;
+                self.binBit(regs, instr.a, instr.b, instr.c, comptime switch (op) {
+                    .band => .band,
+                    .bor => .bor,
+                    .bxor => .bxor,
+                    else => unreachable,
+                }, switch (op) {
+                    .band => self.mm.band,
+                    .bor => self.mm.bor,
+                    .bxor => self.mm.bxor,
+                    else => unreachable,
+                }) catch |e| return parkErr(st, e);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    // ---- unary ----
+    fn opNeg(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const self = vm;
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const a: usize = instr.a;
+                switch (regs.tagAt(instr.b)) {
+                    .int => regs.setInt(a, 0 -% @as(i64, @bitCast(regs.bitsAt(instr.b)))),
+                    .float => {
                         @setFloatMode(.strict);
-                        regs.setFloat(a, @as(f64, @bitCast(regs.bitsAt(instr.b))) / @as(f64, @bitCast(regs.bitsAt(instr.c))));
-                    } else {
-                        const lhs = regs.get(instr.b);
-                        const rhs = regs.get(instr.c);
-                        regs.set(a, try self.arithMeta(arith.div(lhs, rhs), self.mm.div, lhs, rhs));
-                    }
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .idiv => {
-                    const lhs = regs.get(instr.b);
-                    const rhs = regs.get(instr.c);
-                    regs.set(a, try self.arithMeta(arith.floorDiv(lhs, rhs), self.mm.idiv, lhs, rhs));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .mod => {
-                    const lhs = regs.get(instr.b);
-                    const rhs = regs.get(instr.c);
-                    regs.set(a, try self.arithMeta(arith.mod(lhs, rhs), self.mm.mod, lhs, rhs));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .pow => {
-                    const lhs = regs.get(instr.b);
-                    const rhs = regs.get(instr.c);
-                    regs.set(a, try self.arithMeta(arith.pow(lhs, rhs), self.mm.pow, lhs, rhs));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
+                        regs.setFloat(a, -@as(f64, @bitCast(regs.bitsAt(instr.b))));
+                    },
+                    else => {
+                        const v = regs.get(instr.b);
+                        regs.set(a, self.unArithMeta(arith.neg(v), self.mm.unm, v) catch |e| return parkErr(st, e));
+                    },
+                }
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
 
-                // ---- bitwise ---- (both-int fast lane; else `arith.*` + meta)
-                .band => {
-                    try self.binBit(regs, a, instr.b, instr.c, .band, self.mm.band);
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .bor => {
-                    try self.binBit(regs, a, instr.b, instr.c, .bor, self.mm.bor);
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .bxor => {
-                    try self.binBit(regs, a, instr.b, instr.c, .bxor, self.mm.bxor);
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .shl => {
-                    const lhs = regs.get(instr.b);
-                    const rhs = regs.get(instr.c);
-                    regs.set(a, try self.arithMeta(arith.shl(lhs, rhs), self.mm.shl, lhs, rhs));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .shr => {
-                    const lhs = regs.get(instr.b);
-                    const rhs = regs.get(instr.c);
-                    regs.set(a, try self.arithMeta(arith.shr(lhs, rhs), self.mm.shr, lhs, rhs));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .sar => {
-                    const lhs = regs.get(instr.b);
-                    const rhs = regs.get(instr.c);
-                    regs.set(a, try self.arithMeta(arith.sar(lhs, rhs), self.mm.sar, lhs, rhs));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
+    fn opNot(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                regs.setBool(instr.a, !regs.get(instr.b).isTruthy());
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
 
-                // ---- unary ----
-                .neg => {
-                    switch (regs.tagAt(instr.b)) {
-                        .int => regs.setInt(a, 0 -% @as(i64, @bitCast(regs.bitsAt(instr.b)))),
-                        .float => {
-                            @setFloatMode(.strict);
-                            regs.setFloat(a, -@as(f64, @bitCast(regs.bitsAt(instr.b))));
-                        },
-                        else => {
-                            const v = regs.get(instr.b);
-                            regs.set(a, try self.unArithMeta(arith.neg(v), self.mm.unm, v));
-                        },
-                    }
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .not => {
-                    regs.setBool(a, !regs.get(instr.b).isTruthy());
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .bnot => {
-                    const v = regs.get(instr.b);
-                    regs.set(a, try self.unArithMeta(arith.bnot(v), self.mm.bnot, v));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                // `#t` honours `__len` for tables; strings/raw-length fall through.
-                .len => {
-                    // Inline string fast path: `#s` is a cached-field read
-                    // (`cp_len`, S-B) and strings can't carry `__len`, so the
-                    // outlined `lenValue` call — whose error-union struct
-                    // return alone measured ~86 cycles/op via a store-forward
-                    // stall (str_gmatch profile, 2026-08-29: 20% of the bench)
-                    // — is pure overhead here. Tables (metamethod dispatch),
-                    // row views, and error cases keep the slow path.
-                    const v = regs.get(instr.b);
-                    if (v.isHeap() and v.heapType() == .string) {
-                        regs.setInt(a, @intCast(string.String.fromHeader(v.asHeap()).cpLen()));
-                    } else {
-                        regs.set(a, try self.lenValue(v));
-                    }
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
+    fn opBnot(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const self = vm;
+                const v = regs.get(instr.b);
+                regs.set(instr.a, self.unArithMeta(arith.bnot(v), self.mm.bnot, v) catch |e| return parkErr(st, e));
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
 
-                // ---- concat ---- `__concat` on `TypeError` (a non-concatable
-                // operand); the located fault is preserved when neither has one.
-                .concat => {
-                    const lhs = regs.get(instr.b);
-                    const rhs = regs.get(instr.c);
-                    regs.set(a, self.concat(lhs, rhs) catch |e| switch (e) {
-                        Error.TypeError => try self.binMeta(self.mm.concat, lhs, rhs, Error.TypeError),
-                        else => return e,
-                    });
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
+    /// `#t` honours `__len` for tables; strings/raw-length fall through.
+    fn opLen(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                // Inline string fast path: `#s` is a cached-field read
+                // (`cp_len`, S-B) and strings can't carry `__len`, so the
+                // outlined `lenValue` call — whose error-union struct return
+                // alone measured ~86 cycles/op via a store-forward stall
+                // (str_gmatch profile, 2026-08-29: 20% of the bench) — is pure
+                // overhead here. Tables (metamethod dispatch), row views, and
+                // error cases keep the slow path.
+                const v = regs.get(instr.b);
+                if (v.isHeap() and v.heapType() == .string) {
+                    regs.setInt(instr.a, @intCast(string.String.fromHeader(v.asHeap()).cpLen()));
+                } else {
+                    regs.set(instr.a, vm.lenValue(v) catch |e| return parkErr(st, e));
+                }
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
 
-                // ---- comparisons → boolean register ----
-                // `gt`/`ge` reuse `lt`/`le` with operands swapped (a>b ≡ b<a).
-                // `eq`/`ne` consult `__eq` only for two raw-unequal tables;
-                // `lt`/`le` consult `__lt`/`__le` when not raw-comparable.
-                .eq => {
-                    regs.setBool(a, try self.valuesEqual(regs.get(instr.b), regs.get(instr.c)));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .ne => {
-                    regs.setBool(a, !try self.valuesEqual(regs.get(instr.b), regs.get(instr.c)));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .lt => {
-                    regs.setBool(a, try self.compareMeta(.lt, regs.get(instr.b), regs.get(instr.c)));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .le => {
-                    regs.setBool(a, try self.compareMeta(.le, regs.get(instr.b), regs.get(instr.c)));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .gt => {
-                    regs.setBool(a, try self.compareMeta(.lt, regs.get(instr.c), regs.get(instr.b)));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .ge => {
-                    regs.setBool(a, try self.compareMeta(.le, regs.get(instr.c), regs.get(instr.b)));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
+    // ---- concat ---- `__concat` on `TypeError` (a non-concatable operand);
+    // the located fault is preserved when neither has one.
+    fn opConcat(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const self = vm;
+                const lhs = regs.get(instr.b);
+                const rhs = regs.get(instr.c);
+                regs.set(instr.a, self.concat(lhs, rhs) catch |e| switch (e) {
+                    Error.TypeError => self.binMeta(self.mm.concat, lhs, rhs, Error.TypeError) catch |e2| return parkErr(st, e2),
+                    else => return parkErr(st, e),
+                });
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
 
-                // ---- control flow ----
-                // Jumps stay threaded for the *forward* (and not-taken) case —
-                // `continue :sw` re-dispatches the next instruction directly. Only
-                // a real loop back-edge (`pc <= cur_pc` while tracing is enabled —
-                // exactly the epilogue's guard) breaks out to run the back-edge
-                // epilogue below; when tracing is off the epilogue is inert, so a
-                // back-edge threads too. `cur_pc` is this jump's own pc (set by
-                // `step`), so the test sees the post-jump target.
-                .jmp => {
-                    pc = applyJump(pc, instr.aux);
-                    if (self.trace.config.enabled and pc <= cur_pc) break :sw;
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .jmp_if_false => {
-                    if (!regs.get(a).isTruthy()) pc = applyJump(pc, instr.aux);
-                    if (self.trace.config.enabled and pc <= cur_pc) break :sw;
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .jmp_if_true => {
-                    if (regs.get(a).isTruthy()) pc = applyJump(pc, instr.aux);
-                    if (self.trace.config.enabled and pc <= cur_pc) break :sw;
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .jmp_if_not_nil => {
-                    if (!regs.get(a).isNil()) pc = applyJump(pc, instr.aux);
-                    if (self.trace.config.enabled and pc <= cur_pc) break :sw;
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
+    // ---- comparisons → boolean register ----
+    // `eq`/`ne` consult `__eq` only for two raw-unequal tables.
+    fn opEqNe(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const eqv = vm.valuesEqual(regs.get(instr.b), regs.get(instr.c)) catch |e| return parkErr(st, e);
+                regs.setBool(instr.a, if (op == .eq) eqv else !eqv);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
 
-                // ---- numeric for ----
-                // R[a..a+3) = (idx, limit, step). Validate numbers, pre-subtract
-                // step from idx (so the first for_loop re-adds it), then jump to
-                // the matching for_loop test.
-                .for_prep => {
-                    if (!regs.get(a).isNumber() or !regs.get(a + 1).isNumber() or !regs.get(a + 2).isNumber()) {
-                        return Error.TypeError;
-                    }
-                    regs.set(a, try arith.sub(regs.get(a), regs.get(a + 2)));
-                    pc = applyJump(pc, instr.aux);
-                    // `for_prep` always jumps forward to the matching `for_loop`, so
-                    // this never back-edges; kept uniform with the other jumps.
-                    if (self.trace.config.enabled and pc <= cur_pc) break :sw;
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                // idx += step; if still within limit (direction by step sign),
-                // publish idx to the loop var R[a+3] and take the back-edge.
-                .for_loop => {
-                    regs.set(a, try arith.add(regs.get(a), regs.get(a + 2)));
-                    const idx = regs.get(a);
-                    const limit = regs.get(a + 1);
-                    const step = regs.get(a + 2);
-                    const ascending = !(try arith.lt(step, Value.int(0)));
-                    const within = if (ascending)
-                        try arith.le(idx, limit)
-                    else
-                        try arith.le(limit, idx);
-                    if (within) {
-                        regs.set(a + 3, idx);
-                        pc = applyJump(pc, instr.aux);
-                    }
-                    if (self.trace.config.enabled and pc <= cur_pc) break :sw;
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                // Doc 20 Phase 1 (patched trace entry, the BC_JFORL analogue):
-                // only ever fetched from a per-VM copy-on-patch code image
-                // over a qualified `.for_loop`; canonical `Proto.code` never
-                // contains it. §R2-3 discipline: the shared `for_loop` step
-                // runs EXACTLY once, and every non-entered back-edge reaches
-                // the ordinary epilogue presenting the canonical instruction
-                // (`patch.orig`, §R2-5) — no shortcut, no rewind/refetch.
-                .jfor_loop => {
-                    const slot: u16 = instr.b;
-                    const patch = self.trace.registry.entry_registry.entry_patches.items[slot];
-                    const live = patch.live;
-                    if (!live) {
-                        // §R6-1 pre-step recovery — a LEGITIMATE deferred-
-                        // unpatch state, not a defensive-unreachable one
-                        // (codex post-landing review of 7fa7e1a): marks can
-                        // originate outside any drained grammar — recorder
-                        // aborts (`gateAnchor(rec.anchor)`) fire mid-dispatch
-                        // where draining would install under a frame that
-                        // cannot re-resolve its image pointer, and the walk's
-                        // post-epilogue retire/miss/gate sites mark after
-                        // their turn's drain. This arm is the sole
-                        // slot-pointer holder and sits outside any receipt
-                        // grammar, so the complete synchronous unpatch
-                        // transaction is safe here; then continue as the
-                        // virgin `.for_loop` arm below (`break :sw` after the
-                        // step). `patch.orig` stays readable through the
-                        // tombstone: reuse only happens in a drain's install
-                        // pass, and none runs between here and the step.
-                        self.trace.unpatchSlot(slot);
-                    }
-                    // §R2-5: everything downstream — the epilogue's
-                    // `instr.op == .for_loop` reads, the recorder mirror —
-                    // sees the canonical instruction. Same `a`/`aux`
-                    // operands by construction (install preserves them).
-                    instr = patch.orig;
-                    // The shared numeric-`for` step, exactly once — INCLUDING
-                    // the internal-index increment, the `.for_loop` arm's
-                    // first line (omitting it re-takes the back-edge with a
-                    // stale index: the §R2-3 hazard, caught as +strikes×n
-                    // guest corruption in the T3 e2e test).
-                    regs.set(a, try arith.add(regs.get(a), regs.get(a + 2)));
-                    const idx = regs.get(a);
-                    const limit = regs.get(a + 1);
-                    const step = regs.get(a + 2);
-                    const ascending = !(try arith.lt(step, Value.int(0)));
-                    const within = if (ascending)
-                        try arith.le(idx, limit)
-                    else
-                        try arith.le(limit, idx);
-                    if (within) {
-                        regs.set(a + 3, idx);
-                        pc = applyJump(pc, instr.aux);
-                    }
-                    // Loop exit → fall through exactly as `.for_loop` (the
-                    // back-edge block is never revisited — `pc <= cur_pc`).
-                    // A patch exists ⇒ tracing is enabled, so the plain
-                    // comparison is the same predicate `.for_loop` uses.
-                    if (!(pc <= cur_pc)) {
-                        continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                    }
-                    // Defensive-unpatched: virgin cascade (cold path IS the
-                    // existing cascade, reached by unpatching BEFORE the step
-                    // ran above — §R2-3's double-increment hazard avoided).
-                    if (!live) break :sw;
-                    // §R1-5 bypass set — live authoritative fields, no
-                    // maintained flag: the `runFastPath` `.full` set plus
-                    // exec-log and coverage. Take the back-edge through the
-                    // ordinary epilogue with `patch.orig` presented, so
-                    // recording, coverage attribution, `onBackEdge`, and
-                    // trace closure all see virgin `.for_loop` behaviour.
-                    if (self.trace.isRecording() or self.suspend_ctl != null or
-                        self.record_safepoint_lines or self.trace.config.record_exec_log or
-                        self.trace.pending_exit_anchor != null or
-                        self.trace.pending_replay_anchor != null or
-                        self.trace.config.coverage)
-                    {
-                        break :sw;
-                    }
-                    // Patched entry: skip exactly the discovery/selection
-                    // prefix (hot-count probe, counters hashmap, trip
-                    // computation, isGated, walk, fingerprint — the native
-                    // prologue's fail-closed type check subsumes the
-                    // fingerprint at entry, per the B-4 discipline) and run
-                    // the identical entry/receipt routine the walk uses.
-                    const directive = self.enterPatchedTrace(mode, patch, slot, closure, proto, regs, base, pc);
-                    if (self.trace.registry.entry_registry.image_gen != code_gen) {
-                        code = self.trace.codeFor(proto);
-                        code_gen = self.trace.registry.entry_registry.image_gen;
-                    }
-                    switch (directive) {
-                        .next_candidate => {
-                            // Fall through to the tier-0 body. Mirror the
-                            // walk's T3 invariant: a recording must never run
-                            // under `.fast` (its prologue elides the mirror).
-                            if (mode == .fast and self.trace.isRecording()) {
-                                frame.pc = pc;
-                                return .switch_mode;
-                            }
-                            continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                        },
-                        .resume_tier0 => |npc| {
-                            pc = npc;
-                            continue :outer;
-                        },
-                        .switch_mode_at => |npc| {
-                            frame.pc = npc;
+    // `gt`/`ge` reuse `lt`/`le` with operands swapped (a>b ≡ b<a); `lt`/`le`
+    // consult `__lt`/`__le` when not raw-comparable.
+    fn opCompare(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const self = vm;
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const raw = switch (op) {
+                    .lt => self.compareMeta(.lt, regs.get(instr.b), regs.get(instr.c)),
+                    .le => self.compareMeta(.le, regs.get(instr.b), regs.get(instr.c)),
+                    .gt => self.compareMeta(.lt, regs.get(instr.c), regs.get(instr.b)),
+                    .ge => self.compareMeta(.le, regs.get(instr.c), regs.get(instr.b)),
+                    else => unreachable,
+                };
+                regs.setBool(instr.a, raw catch |e| return parkErr(st, e));
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    // ---- control flow ----
+    // Jumps stay threaded for the *forward* (and not-taken) case — the tail
+    // dispatch re-enters the next instruction directly. Only a real loop
+    // back-edge (`npc <= cur_pc` while tracing is enabled — exactly the
+    // epilogue's guard) musttails into `backEdgeHandler`; when tracing is off
+    // the epilogue is inert, so a back-edge threads too. `cur_pc` is this
+    // jump's own pc (`pc - 1`), so the test sees the post-jump target.
+    fn opJump(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const cur_pc = pc - 1;
+                var npc = pc;
+                switch (op) {
+                    .jmp => npc = applyJump(pc, instr.aux),
+                    .jmp_if_false => {
+                        if (!regs.get(instr.a).isTruthy()) npc = applyJump(pc, instr.aux);
+                    },
+                    .jmp_if_true => {
+                        if (regs.get(instr.a).isTruthy()) npc = applyJump(pc, instr.aux);
+                    },
+                    .jmp_if_not_nil => {
+                        if (!regs.get(instr.a).isNil()) npc = applyJump(pc, instr.aux);
+                    },
+                    else => unreachable,
+                }
+                if (vm.trace.config.enabled and npc <= cur_pc)
+                    return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
+                return dispatchTail(mode, st, npc, vm);
+            }
+        }.h;
+    }
+
+    // ---- numeric for ----
+    // R[a..a+3) = (idx, limit, step). Validate numbers, pre-subtract step from
+    // idx (so the first for_loop re-adds it), then jump to the matching
+    // for_loop test.
+    fn opForPrep(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const a: usize = instr.a;
+                if (!regs.get(a).isNumber() or !regs.get(a + 1).isNumber() or !regs.get(a + 2).isNumber()) {
+                    return parkErr(st, Error.TypeError);
+                }
+                regs.set(a, arith.sub(regs.get(a), regs.get(a + 2)) catch |e| return parkErr(st, e));
+                const cur_pc = pc - 1;
+                const npc = applyJump(pc, instr.aux);
+                // `for_prep` always jumps forward to the matching `for_loop`,
+                // so this never back-edges; kept uniform with the other jumps.
+                if (vm.trace.config.enabled and npc <= cur_pc)
+                    return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
+                return dispatchTail(mode, st, npc, vm);
+            }
+        }.h;
+    }
+
+    // idx += step; if still within limit (direction by step sign), publish idx
+    // to the loop var R[a+3] and take the back-edge.
+    fn opForLoop(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const a: usize = instr.a;
+                regs.set(a, arith.add(regs.get(a), regs.get(a + 2)) catch |e| return parkErr(st, e));
+                const idx = regs.get(a);
+                const limit = regs.get(a + 1);
+                const step = regs.get(a + 2);
+                const ascending = !(arith.lt(step, Value.int(0)) catch |e| return parkErr(st, e));
+                const within = if (ascending)
+                    arith.le(idx, limit) catch |e| return parkErr(st, e)
+                else
+                    arith.le(limit, idx) catch |e| return parkErr(st, e);
+                const cur_pc = pc - 1;
+                var npc = pc;
+                if (within) {
+                    regs.set(a + 3, idx);
+                    npc = applyJump(pc, instr.aux);
+                }
+                if (vm.trace.config.enabled and npc <= cur_pc)
+                    return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
+                return dispatchTail(mode, st, npc, vm);
+            }
+        }.h;
+    }
+
+    // Doc 20 Phase 1 (patched trace entry, the BC_JFORL analogue): only ever
+    // fetched from a per-VM copy-on-patch code image over a qualified
+    // `.for_loop`; canonical `Proto.code` never contains it. §R2-3 discipline:
+    // the shared `for_loop` step runs EXACTLY once, and every non-entered
+    // back-edge reaches the ordinary epilogue presenting the canonical
+    // instruction (`patch.orig`, §R2-5) — no shortcut, no rewind/refetch.
+    fn opJForLoop(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr_in: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const self = vm;
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const cur_pc = pc - 1;
+                const slot: u16 = instr_in.b;
+                const patch = self.trace.registry.entry_registry.entry_patches.items[slot];
+                const live = patch.live;
+                if (!live) {
+                    // §R6-1 pre-step recovery — a LEGITIMATE deferred-unpatch
+                    // state, not a defensive-unreachable one (codex
+                    // post-landing review of 7fa7e1a): marks can originate
+                    // outside any drained grammar — recorder aborts
+                    // (`gateAnchor(rec.anchor)`) fire mid-dispatch where
+                    // draining would install under a frame that cannot
+                    // re-resolve its image pointer, and the walk's
+                    // post-epilogue retire/miss/gate sites mark after their
+                    // turn's drain. This arm is the sole slot-pointer holder
+                    // and sits outside any receipt grammar, so the complete
+                    // synchronous unpatch transaction is safe here; then
+                    // continue as the virgin `.for_loop` arm (musttail into
+                    // the epilogue after the step). `patch.orig` stays
+                    // readable through the tombstone: reuse only happens in a
+                    // drain's install pass, and none runs between here and the
+                    // step.
+                    self.trace.unpatchSlot(slot);
+                }
+                // §R2-5: everything downstream — the epilogue's
+                // `instr.op == .for_loop` reads, the recorder mirror — sees
+                // the canonical instruction. Same `a`/`aux` operands by
+                // construction (install preserves them).
+                // Pointer, not a local copy: the musttail chain outlives this
+                // handler's frame, so anything passed onward must be
+                // frame-independent — `patch.orig` is slot-stable (reuse only
+                // happens in a drain's install pass; the epilogue copies what
+                // it needs before its drains run).
+                const instr = &patch.orig;
+                const a: usize = instr.a;
+                // The shared numeric-`for` step, exactly once — INCLUDING the
+                // internal-index increment, the `.for_loop` arm's first line
+                // (omitting it re-takes the back-edge with a stale index: the
+                // §R2-3 hazard, caught as +strikes×n guest corruption in the
+                // T3 e2e test).
+                regs.set(a, arith.add(regs.get(a), regs.get(a + 2)) catch |e| return parkErr(st, e));
+                const idx = regs.get(a);
+                const limit = regs.get(a + 1);
+                const step = regs.get(a + 2);
+                const ascending = !(arith.lt(step, Value.int(0)) catch |e| return parkErr(st, e));
+                const within = if (ascending)
+                    arith.le(idx, limit) catch |e| return parkErr(st, e)
+                else
+                    arith.le(limit, idx) catch |e| return parkErr(st, e);
+                var npc = pc;
+                if (within) {
+                    regs.set(a + 3, idx);
+                    npc = applyJump(pc, instr.aux);
+                }
+                // Loop exit → thread exactly as `.for_loop` (the back-edge
+                // machinery is never visited — `npc <= cur_pc` is false). A
+                // patch exists ⇒ tracing is enabled, so the plain comparison
+                // is the same predicate `.for_loop` uses.
+                if (!(npc <= cur_pc)) {
+                    return dispatchTail(mode, st, npc, vm);
+                }
+                // Defensive-unpatched: virgin cascade (cold path IS the
+                // existing cascade, reached by unpatching BEFORE the step ran
+                // above — §R2-3's double-increment hazard avoided).
+                if (!live) return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
+                // §R1-5 bypass set — live authoritative fields, no maintained
+                // flag: the `runFastPath` `.full` set plus exec-log and
+                // coverage. Take the back-edge through the ordinary epilogue
+                // with `patch.orig` presented, so recording, coverage
+                // attribution, `onBackEdge`, and trace closure all see virgin
+                // `.for_loop` behaviour.
+                if (self.trace.isRecording() or self.suspend_ctl != null or
+                    self.record_safepoint_lines or self.trace.config.record_exec_log or
+                    self.trace.pending_exit_anchor != null or
+                    self.trace.pending_replay_anchor != null or
+                    self.trace.config.coverage)
+                {
+                    return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
+                }
+                // Patched entry: skip exactly the discovery/selection prefix
+                // (hot-count probe, counters hashmap, trip computation,
+                // isGated, walk, fingerprint — the native prologue's
+                // fail-closed type check subsumes the fingerprint at entry,
+                // per the B-4 discipline) and run the identical entry/receipt
+                // routine the walk uses.
+                const directive = self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, npc);
+                if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
+                    st.code = self.trace.codeFor(st.proto);
+                    st.code_gen = self.trace.registry.entry_registry.image_gen;
+                }
+                switch (directive) {
+                    .next_candidate => {
+                        // Fall through to the tier-0 body. Mirror the walk's
+                        // T3 invariant: a recording must never run under
+                        // `.fast` (its prologue elides the mirror).
+                        if (mode == .fast and self.trace.isRecording()) {
+                            st.frame.pc = npc;
                             return .switch_mode;
-                        },
-                    }
-                },
-                // Doc 20 Phase 3: patched entry for the loop-closing jumps the
-                // compiler actually emits — `.jmp` for `while`, and
-                // `.jmp_if_false` for `repeat`. The slot's canonical `orig`
-                // selects the exact jump semantics; only a taken back-edge may
-                // enter native. All bypasses present `orig` to the ordinary
-                // back-edge epilogue, exactly like `.jfor_loop`.
-                .jloop => {
-                    const slot: u16 = instr.b;
-                    const patch = self.trace.registry.entry_registry.entry_patches.items[slot];
-                    const live = patch.live;
-                    if (!live) {
-                        // Same load-bearing deferred-unpatch recovery as the
-                        // numeric-for arm: complete the transaction before
-                        // executing the canonical jump once.
-                        self.trace.unpatchSlot(slot);
-                    }
-                    instr = patch.orig;
-                    a = instr.a;
-                    switch (instr.op) {
-                        .jmp => pc = applyJump(pc, instr.aux),
-                        .jmp_if_false => if (!regs.get(a).isTruthy()) {
-                            pc = applyJump(pc, instr.aux);
-                        },
-                        // Generic-for test+continue (doc 30 c5): first loop var
-                        // non-nil → publish it as ctrl and take the back-edge;
-                        // nil → fall through (loop done). Byte-identical to the
-                        // canonical `.tfor_loop` arm.
-                        .tfor_loop => if (!regs.get(a + 3).isNil()) {
-                            regs.set(a + 2, regs.get(a + 3));
-                            pc = applyJump(pc, instr.aux);
-                        },
-                        else => unreachable, // install accepts only compiler loop closers
-                    }
-                    // A repeat condition that is true exits the loop. `while`'s
-                    // unconditional closer always takes its back-edge.
-                    if (!(pc <= cur_pc)) {
-                        continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                    }
-                    if (!live) break :sw; // restored virgin cascade
-                    if (self.trace.isRecording() or self.suspend_ctl != null or
-                        self.record_safepoint_lines or self.trace.config.record_exec_log or
-                        self.trace.pending_exit_anchor != null or
-                        self.trace.pending_replay_anchor != null or
-                        self.trace.config.coverage)
-                    {
-                        break :sw;
-                    }
-                    const directive = self.enterPatchedTrace(mode, patch, slot, closure, proto, regs, base, pc);
-                    if (self.trace.registry.entry_registry.image_gen != code_gen) {
-                        code = self.trace.codeFor(proto);
-                        code_gen = self.trace.registry.entry_registry.image_gen;
-                    }
-                    switch (directive) {
-                        .next_candidate => {
-                            if (mode == .fast and self.trace.isRecording()) {
-                                frame.pc = pc;
-                                return .switch_mode;
-                            }
-                            continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                        },
-                        .resume_tier0 => |npc| {
-                            pc = npc;
-                            continue :outer;
-                        },
-                        .switch_mode_at => |npc| {
-                            frame.pc = npc;
-                            return .switch_mode;
-                        },
-                    }
-                },
-                // generic-for test: the preceding `call` filled R[a+3..] with the
-                // iterator's results. Continue iff the first var is non-nil (Lua
-                // stops only on nil; `false` continues), publishing it as the next
-                // control R[a+2] and taking the back-edge. Else fall through (exit).
-                .tfor_loop => {
-                    if (!regs.get(a + 3).isNil()) {
+                        }
+                        return dispatchTail(mode, st, npc, vm);
+                    },
+                    .resume_tier0 => |rpc| return dispatchTail(mode, st, rpc, vm),
+                    .switch_mode_at => |rpc| {
+                        st.frame.pc = rpc;
+                        return .switch_mode;
+                    },
+                }
+            }
+        }.h;
+    }
+
+    // Doc 20 Phase 3: patched entry for the loop-closing jumps the compiler
+    // actually emits — `.jmp` for `while`, and `.jmp_if_false` for `repeat`.
+    // The slot's canonical `orig` selects the exact jump semantics; only a
+    // taken back-edge may enter native. All bypasses present `orig` to the
+    // ordinary back-edge epilogue, exactly like `.jfor_loop`.
+    fn opJLoop(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr_in: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const self = vm;
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const cur_pc = pc - 1;
+                const slot: u16 = instr_in.b;
+                const patch = self.trace.registry.entry_registry.entry_patches.items[slot];
+                const live = patch.live;
+                if (!live) {
+                    // Same load-bearing deferred-unpatch recovery as the
+                    // numeric-for arm: complete the transaction before
+                    // executing the canonical jump once.
+                    self.trace.unpatchSlot(slot);
+                }
+                // Pointer, not a local copy: the musttail chain outlives this
+                // handler's frame, so anything passed onward must be
+                // frame-independent — `patch.orig` is slot-stable (reuse only
+                // happens in a drain's install pass; the epilogue copies what
+                // it needs before its drains run).
+                const instr = &patch.orig;
+                const a: usize = instr.a;
+                var npc = pc;
+                switch (instr.op) {
+                    .jmp => npc = applyJump(pc, instr.aux),
+                    .jmp_if_false => if (!regs.get(a).isTruthy()) {
+                        npc = applyJump(pc, instr.aux);
+                    },
+                    // Generic-for test+continue (doc 30 c5): first loop var
+                    // non-nil → publish it as ctrl and take the back-edge;
+                    // nil → fall through (loop done). Byte-identical to the
+                    // canonical `.tfor_loop` arm.
+                    .tfor_loop => if (!regs.get(a + 3).isNil()) {
                         regs.set(a + 2, regs.get(a + 3));
-                        pc = applyJump(pc, instr.aux);
-                    }
-                    if (self.trace.config.enabled and pc <= cur_pc) break :sw;
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
+                        npc = applyJump(pc, instr.aux);
+                    },
+                    else => unreachable, // install accepts only compiler loop closers
+                }
+                // A repeat condition that is true exits the loop. `while`'s
+                // unconditional closer always takes its back-edge.
+                if (!(npc <= cur_pc)) {
+                    return dispatchTail(mode, st, npc, vm);
+                }
+                if (!live) return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads }); // restored virgin cascade
+                if (self.trace.isRecording() or self.suspend_ctl != null or
+                    self.record_safepoint_lines or self.trace.config.record_exec_log or
+                    self.trace.pending_exit_anchor != null or
+                    self.trace.pending_replay_anchor != null or
+                    self.trace.config.coverage)
+                {
+                    return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
+                }
+                const directive = self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, npc);
+                if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
+                    st.code = self.trace.codeFor(st.proto);
+                    st.code_gen = self.trace.registry.entry_registry.image_gen;
+                }
+                switch (directive) {
+                    .next_candidate => {
+                        if (mode == .fast and self.trace.isRecording()) {
+                            st.frame.pc = npc;
+                            return .switch_mode;
+                        }
+                        return dispatchTail(mode, st, npc, vm);
+                    },
+                    .resume_tier0 => |rpc| return dispatchTail(mode, st, rpc, vm),
+                    .switch_mode_at => |rpc| {
+                        st.frame.pc = rpc;
+                        return .switch_mode;
+                    },
+                }
+            }
+        }.h;
+    }
 
-                // ---- tables ----
-                .new_table => {
-                    const t = try self.heap.newTable();
-                    regs.set(a, Value.heap(&t.header));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .get_index => {
-                    // Array fast-path: a table indexed by an in-range integer key
-                    // reads straight from the typed array part, skipping the
-                    // `indexGet → Table.get → normalizeKey → getInt` call layering
-                    // (the ~22% `Table.get` in the nsieve profile). This is a pure
-                    // shortcut to the exact value `getInt` would return for an
-                    // in-bounds int key (table.zig:105); every other shape — float
-                    // key, out-of-range, hash-resident, non-table — falls through
-                    // to the unchanged helper, so semantics and determinism are
-                    // identical (no allocation on either branch).
-                    const container = regs.get(instr.b);
-                    const key = regs.get(instr.c);
-                    regs.set(a, blk: {
-                        if (container.isHeap() and container.heapType() == .table and key.isInt()) {
-                            const tbl = table.Table.fromHeader(container.asHeap());
-                            const i = key.asInt();
-                            // A grid table's `t[i]` is a transient `row_view`, not a
-                            // raw slot — skip the fast path and let `indexGet →
-                            // Table.getInt` mint the handle. (Phase 3, doc 14.)
-                            if (!tbl.array.isGrid() and array.ArrayPart.inArray(i, tbl.array.asize)) {
-                                // A *present* (non-nil) in-bounds slot is a raw read
-                                // regardless of any metatable — Lua only consults
-                                // `__index` for an absent key. A hole (nil) falls
-                                // through to `indexGet`, which checks `__index`.
-                                const v = tbl.array.get(@intCast(i));
-                                if (!v.isNil()) break :blk v;
+    // generic-for test: the preceding `call` filled R[a+3..] with the
+    // iterator's results. Continue iff the first var is non-nil (Lua stops
+    // only on nil; `false` continues), publishing it as the next control
+    // R[a+2] and taking the back-edge. Else fall through (exit).
+    fn opTForLoop(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const a: usize = instr.a;
+                const cur_pc = pc - 1;
+                var npc = pc;
+                if (!regs.get(a + 3).isNil()) {
+                    regs.set(a + 2, regs.get(a + 3));
+                    npc = applyJump(pc, instr.aux);
+                }
+                if (vm.trace.config.enabled and npc <= cur_pc)
+                    return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
+                return dispatchTail(mode, st, npc, vm);
+            }
+        }.h;
+    }
+
+    // ---- tables ----
+    fn opNewTable(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const t = vm.heap.newTable() catch |e| return parkErr(st, e);
+                regs.set(instr.a, Value.heap(&t.header));
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    fn opGetIndex(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                // Array fast-path: a table indexed by an in-range integer key
+                // reads straight from the typed array part, skipping the
+                // `indexGet → Table.get → normalizeKey → getInt` call layering
+                // (the ~22% `Table.get` in the nsieve profile). This is a pure
+                // shortcut to the exact value `getInt` would return for an
+                // in-bounds int key (table.zig:105); every other shape — float
+                // key, out-of-range, hash-resident, non-table — falls through
+                // to the unchanged helper, so semantics and determinism are
+                // identical (no allocation on either branch).
+                const self = vm;
+                const container = regs.get(instr.b);
+                const key = regs.get(instr.c);
+                regs.set(instr.a, blk: {
+                    if (container.isHeap() and container.heapType() == .table and key.isInt()) {
+                        const tbl = table.Table.fromHeader(container.asHeap());
+                        const i = key.asInt();
+                        // A grid table's `t[i]` is a transient `row_view`, not
+                        // a raw slot — skip the fast path and let `indexGet →
+                        // Table.getInt` mint the handle. (Phase 3, doc 14.)
+                        if (!tbl.array.isGrid() and array.ArrayPart.inArray(i, tbl.array.asize)) {
+                            // A *present* (non-nil) in-bounds slot is a raw
+                            // read regardless of any metatable — Lua only
+                            // consults `__index` for an absent key. A hole
+                            // (nil) falls through to `indexGet`, which checks
+                            // `__index`.
+                            const v = tbl.array.get(@intCast(i));
+                            if (!v.isNil()) break :blk v;
+                        }
+                    }
+                    break :blk self.indexGet(container, key) catch |e| return parkErr(st, e);
+                });
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    fn opSetIndex(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                // Array fast-path mirror of `.get_index`: an in-bounds integer
+                // store whose value already fits the current lane is the exact
+                // work `Table.set`'s in-bounds branch does (table.zig:121 →
+                // `setInPlace`, which with a fitting value is just `encode` —
+                // no widen, no `migrateFromHash`, no allocation). `setInLane`
+                // (array.zig:209) is that allocation-free `encode`. A
+                // lane-missing value, append (`i == len+1`), out-of-range,
+                // float/nil/NaN key, or non-table all fall through to the
+                // unchanged `indexSet`, which owns widen/append/hash/delete.
+                const self = vm;
+                const container = regs.get(instr.a);
+                const key = regs.get(instr.b);
+                const val = regs.get(instr.c);
+                fast: {
+                    if (container.isHeap() and container.heapType() == .table and key.isInt()) {
+                        const tbl = table.Table.fromHeader(container.asHeap());
+                        const i = key.asInt();
+                        // A grid store is an outer row (re)assignment — a
+                        // Phase 5 deflation trigger owned by `indexSet`; never
+                        // raw-stored here (and `fits(nil)` is `true`, so
+                        // without this guard a `nil` store would reach
+                        // `array.get` on a grid).
+                        if (!tbl.array.isGrid() and array.ArrayPart.inArray(i, tbl.array.asize) and tbl.array.fits(val)) {
+                            // `__newindex` fires only for an *absent* key on a
+                            // metatable-bearing table. A metatable-free table
+                            // (the overwhelming common case — one predictable
+                            // load) takes the raw store directly; with a
+                            // metatable, only a present (non-nil) slot may be
+                            // stored raw — a hole routes through `indexSet`.
+                            if (tbl.metatable == null or !tbl.array.get(@intCast(i)).isNil()) {
+                                tbl.array.setInLane(@intCast(i), val);
+                                self.heap.writeBarrier(&tbl.header, val); // no-op until Phase 4
+                                break :fast;
                             }
                         }
-                        break :blk try self.indexGet(container, key);
-                    });
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .set_index => {
-                    // Array fast-path mirror of `.get_index`: an in-bounds integer
-                    // store whose value already fits the current lane is the exact
-                    // work `Table.set`'s in-bounds branch does (table.zig:121 →
-                    // `setInPlace`, which with a fitting value is just `encode` —
-                    // no widen, no `migrateFromHash`, no allocation). `setInLane`
-                    // (array.zig:209) is that allocation-free `encode`. A
-                    // lane-missing value, append (`i == len+1`), out-of-range,
-                    // float/nil/NaN key, or non-table all fall through to the
-                    // unchanged `indexSet`, which owns widen/append/hash/delete.
-                    const container = regs.get(a);
-                    const key = regs.get(instr.b);
-                    const val = regs.get(instr.c);
-                    fast: {
-                        if (container.isHeap() and container.heapType() == .table and key.isInt()) {
-                            const tbl = table.Table.fromHeader(container.asHeap());
-                            const i = key.asInt();
-                            // A grid store is an outer row (re)assignment — a Phase 5
-                            // deflation trigger owned by `indexSet`; never raw-stored
-                            // here (and `fits(nil)` is `true`, so without this guard a
-                            // `nil` store would reach `array.get` on a grid).
-                            if (!tbl.array.isGrid() and array.ArrayPart.inArray(i, tbl.array.asize) and tbl.array.fits(val)) {
-                                // `__newindex` fires only for an *absent* key on a
-                                // metatable-bearing table. A metatable-free table
-                                // (the overwhelming common case — one predictable
-                                // load) takes the raw store directly; with a
-                                // metatable, only a present (non-nil) slot may be
-                                // stored raw — a hole routes through `indexSet`.
-                                if (tbl.metatable == null or !tbl.array.get(@intCast(i)).isNil()) {
-                                    tbl.array.setInLane(@intCast(i), val);
-                                    self.heap.writeBarrier(&tbl.header, val); // no-op until Phase 4
-                                    break :fast;
-                                }
-                            }
-                        }
-                        try self.indexSet(container, key, val);
                     }
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .get_index2 => {
-                    // Fused two-level read `R[a] = R[b][R[c]][R[aux]]`. On a grid
-                    // (doc 14) this reads the flat cell directly — the *only* grid
-                    // reader, so it never mints a `row_view`. On a nested table it is
-                    // exactly two `indexGet`s, semantically identical to the unfused
-                    // form (metatables on either level still dispatch).
-                    const container = regs.get(instr.b);
-                    const key1 = regs.get(instr.c);
-                    const key2 = regs.get(@as(u16, @intCast(instr.aux)));
-                    regs.set(a, try self.fusedGet(container, key1, key2));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .set_index2 => {
-                    // Fused two-level store `R[a][R[b]][R[c]] = R[aux]`. The grid
-                    // inflation trigger and the in-grid cell store (with
-                    // reshape-on-overflow) live in `fusedStore` (doc 14, Phase 4b).
-                    const container = regs.get(a);
-                    const key1 = regs.get(instr.b);
-                    const key2 = regs.get(instr.c);
-                    const val = regs.get(@as(u16, @intCast(instr.aux)));
-                    try self.fusedStore(container, key1, key2, val);
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
+                    self.indexSet(container, key, val) catch |e| return parkErr(st, e);
+                }
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
 
-                // ---- globals ----
-                .get_global => {
-                    regs.set(a, self.globals.get(proto.constants[instr.b]));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .set_global => {
-                    const v = regs.get(a);
-                    try self.globals.set(self.gpa, proto.constants[instr.b], v);
-                    self.heap.writeBarrier(&self.globals.header, v); // no-op until Phase 4
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
+    fn opGetIndex2(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                // Fused two-level read `R[a] = R[b][R[c]][R[aux]]`. On a grid
+                // (doc 14) this reads the flat cell directly — the *only* grid
+                // reader, so it never mints a `row_view`. On a nested table it
+                // is exactly two `indexGet`s, semantically identical to the
+                // unfused form (metatables on either level still dispatch).
+                const container = regs.get(instr.b);
+                const key1 = regs.get(instr.c);
+                const key2 = regs.get(@as(u16, @intCast(instr.aux)));
+                regs.set(instr.a, vm.fusedGet(container, key1, key2) catch |e| return parkErr(st, e));
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
 
-                // ---- functions ----
-                .closure => {
-                    const child = proto.protos[instr.b];
-                    const cl = try self.makeClosure(closure, child, base);
-                    regs.set(a, Value.heap(&cl.header));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .get_upval => {
-                    regs.set(a, self.upvalGet(closure.upvalues[instr.b]));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .set_upval => {
-                    const v = regs.get(a);
-                    self.upvalSet(closure.upvalues[instr.b], v);
-                    self.heap.writeBarrier(&closure.upvalues[instr.b].header, v); // no-op until generational
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .close_upvalues => {
-                    self.closeUpvaluesFrom(base + a);
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
+    fn opSetIndex2(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                // Fused two-level store `R[a][R[b]][R[c]] = R[aux]`. The grid
+                // inflation trigger and the in-grid cell store (with
+                // reshape-on-overflow) live in `fusedStore` (doc 14, Phase 4b).
+                const container = regs.get(instr.a);
+                const key1 = regs.get(instr.b);
+                const key2 = regs.get(instr.c);
+                const val = regs.get(@as(u16, @intCast(instr.aux)));
+                vm.fusedStore(container, key1, key2, val) catch |e| return parkErr(st, e);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
 
-                // ---- calls ---- a Lua call pushes a frame and reloads onto it; a
-                // native runs inline (no frame) as the current frame's top activity.
-                .call => {
-                    const callee = regs.get(a);
-                    if (!callee.isHeap()) return Error.TypeError;
-                    // Resolve the argument count. `all_results` (the consumer half
-                    // of dynamic multret, e.g. the outer `print` in
-                    // `print(unpack(t))`) takes every value the immediately-preceding
-                    // producer left, from the first argument slot up to `reg_top`.
-                    const nargs: usize = if (instr.b == bytecode.all_results) blk: {
-                        self.reg_top_pending = false;
-                        break :blk self.reg_top - (base + a + 1);
-                    } else instr.b;
-                    switch (callee.heapType()) {
-                        .function => {
-                            const cl = Closure.fromHeader(callee.asHeap());
-                            const cp = cl.proto;
-                            const callee_base = base + proto.num_registers;
-                            if (self.depth >= max_call_depth) return Error.StackOverflow;
-                            if (callee_base + cp.num_registers > self.regCapacity()) return Error.StackOverflow;
-                            // Lay out the callee window: bind fixed params (nil-fill
-                            // any not supplied), nil the rest. Straight-line and
-                            // allocation-free — these slots sit above the current
-                            // `stack_top` until `pushFrame` raises it, so no safepoint
-                            // may intervene here (none does).
-                            var i: usize = 0;
-                            while (i < cp.num_registers) : (i += 1) {
-                                self.regSet(callee_base + i, if (i < cp.num_params and i < nargs)
-                                    self.regGet(base + a + 1 + i)
-                                else
-                                    Value.nil());
-                            }
-                            // Varargs cursor: a vararg callee handed more args than
-                            // it has fixed params keeps the surplus where they already
-                            // sit — in the caller's window, below `callee_base`. They
-                            // stay valid (the stack slab never moves) and GC-rooted
-                            // (`forEachRootHeader` scans the whole live prefix) for the
-                            // callee's lifetime. Recorded per-callee so a non-vararg or
-                            // no-surplus callee gets a zero cursor (never inherits one).
-                            const va_count: usize = if (cp.is_vararg and nargs > cp.num_params) nargs - cp.num_params else 0;
-                            const va_base: usize = if (va_count > 0) base + a + 1 + cp.num_params else 0;
-                            // Freeze the caller's resume cursor (already one past this
-                            // call), push the callee, and reload locals onto it.
-                            frame.pc = pc;
-                            try self.pushFrameVararg(cl, callee_base, instr.a, instr.c, va_base, va_count);
-                            frame = &self.frames[self.depth - 1];
-                            closure = frame.closure;
-                            proto = closure.proto;
-                            code = self.trace.codeFor(proto); // doc 20 image
-                            code_gen = self.trace.registry.entry_registry.image_gen;
-                            base = frame.base;
-                            regs = self.frameWindow(base, proto.num_registers);
-                            pc = frame.pc;
-                            self.trace.setRegionContext(self.depth, frame.call_seq);
-                            // Reloaded onto the callee frame; re-enter the outer
-                            // loop so `step` fetches the callee's first instruction
-                            // with a full prologue (GC/seq/suspend/recording).
-                            continue :outer;
-                        },
-                        .native => {
-                            const nat = function.Native.fromHeader(callee.asHeap());
-                            const nwanted: usize = instr.c;
-                            // Materialize the args into the absolute-indexed boundary
-                            // scratch so the native ABI keeps speaking `[]Value` after
-                            // the register file split (SoA). The scratch is laid out at
-                            // the same absolute slot indices as the registers, so the
-                            // `out`-aliases-`args` overlap multi natives rely on is
-                            // preserved exactly; nesting is safe because a deeper call
-                            // parks its own args at higher absolute indices.
-                            const args = self.gatherScratch(base + a + 1, base + a + 1 + nargs);
-                            // `all` = the caller wants *every* result (dynamic count,
-                            // the producer half of `print(unpack(t))` / `return f()`):
-                            // results land starting at `regs[a]` and `reg_top` records
-                            // their end for the adjacent consumer. Otherwise a concrete
-                            // `nwanted` is written and the tail nil-padded.
-                            //
-                            // Three native shapes, in priority order:
-                            //  1. effect native (clock/getenv/…): one result through the
-                            //     record/replay boundary — effects are inherently single.
-                            //  2. multi-result native: write straight into the destination
-                            //     slots. `out` aliases `args` (see NativeMultiFn), which is
-                            //     why the native reads its args first. For `all`, `out`
-                            //     spans to the end of the register stack (bounded → no OOB;
-                            //     the native caps at `out.len`).
-                            //  3. otherwise (pure single, or a multi native with 0/1 wanted):
-                            //     call `func` (the primary-value projection) and write one.
-                            // A native call is a trace barrier (recording aborts at it), so
-                            // none of this touches the JIT.
-                            const all = nwanted == bytecode.all_results;
-                            if (nat.effect) |kind| {
-                                const result = try performEffect(self, kind, nat, args);
-                                if (all) self.stampSingleResult(base, a, result) else writeSingleResult(regs, a, nwanted, result);
-                            } else if (nat.multi != null and (all or nwanted >= 2)) {
-                                // `out` aliases `args` in scratch (same overlap as the
-                                // old stack slices); the native writes results into
-                                // scratch, then we scatter them back into the registers.
-                                const out = if (all) self.scratchOut(base + a, self.regCapacity()) else self.scratchOut(base + a, base + a + nwanted);
-                                const produced = nat.multi.?(@ptrCast(self), args, out) catch |e| return narrowError(e);
-                                if (all) {
-                                    std.debug.assert(!self.reg_top_pending);
-                                    self.scatterScratch(base + a, base + a + produced);
-                                    self.reg_top = base + a + produced;
-                                    self.reg_top_pending = true;
-                                } else {
-                                    var k: usize = produced;
-                                    while (k < nwanted) : (k += 1) out[k] = Value.nil();
-                                    self.scatterScratch(base + a, base + a + nwanted);
-                                }
-                            } else {
-                                const result = nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
-                                if (all) self.stampSingleResult(base, a, result) else writeSingleResult(regs, a, nwanted, result);
-                            }
-                        },
-                        // `__call`: a non-callable heap value (typically a table)
-                        // with a `__call` metamethod is invoked as
-                        // `handler(value, args...)`. The arguments already sit
-                        // contiguously as `[callee, args...]` at `stack[base+a..]`
-                        // — exactly the handler's argument list, so no copy is
-                        // needed; `callValue` reads it before writing results.
-                        // Results honour `nwanted`/`all_results` like the native
-                        // arm. A nil/non-heap callee, or a callee whose `__call`
-                        // chain bottoms out in a non-callable, stays the located
-                        // "attempt to call a <type> value" fault. A `__call` whose
-                        // handler is itself a `__call` table chains through
-                        // `callValue` (bounded by `native_reentry_depth`; a cycle
-                        // surfaces as a catchable StackOverflow, never a hang).
-                        else => {
-                            const handler = self.metamethod(callee, self.mm.call);
-                            if (handler.isNil()) return Error.TypeError;
-                            const nwanted: usize = instr.c;
-                            // `[callee, args...]` is exactly the handler's argument
-                            // list — gather it into the absolute-indexed scratch (the
-                            // result `out` aliases it, same overlap as the old stack
-                            // slices; `callValue` reads its args before writing out).
-                            const call_args = self.gatherScratch(base + a, base + a + 1 + nargs);
-                            if (nwanted == bytecode.all_results) {
-                                const n = try self.callValue(handler, call_args, self.scratchOut(base + a, self.regCapacity()));
+    // ---- globals ----
+    fn opGetGlobal(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                regs.set(instr.a, vm.globals.get(st.proto.constants[instr.b]));
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    fn opSetGlobal(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const self = vm;
+                const v = regs.get(instr.a);
+                self.globals.set(self.gpa, st.proto.constants[instr.b], v) catch |e| return parkErr(st, e);
+                self.heap.writeBarrier(&self.globals.header, v); // no-op until Phase 4
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    // ---- functions ----
+    fn opClosure(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const child = st.proto.protos[instr.b];
+                const cl = vm.makeClosure(st.closure, child, st.base) catch |e| return parkErr(st, e);
+                regs.set(instr.a, Value.heap(&cl.header));
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    fn opGetUpval(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                regs.set(instr.a, vm.upvalGet(st.closure.upvalues[instr.b]));
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    fn opSetUpval(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const self = vm;
+                const v = regs.get(instr.a);
+                self.upvalSet(st.closure.upvalues[instr.b], v);
+                self.heap.writeBarrier(&st.closure.upvalues[instr.b].header, v); // no-op until generational
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    fn opCloseUpvalues(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                vm.closeUpvaluesFrom(st.base + instr.a);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    // ---- calls ---- a Lua call pushes a frame and reloads onto it; a native
+    // runs inline (no frame) as the current frame's top activity.
+    fn opCall(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const self = vm;
+                const a: usize = instr.a;
+                const base = st.base;
+                const callee = st.regs.get(a);
+                if (!callee.isHeap()) return parkErr(st, Error.TypeError);
+                // Resolve the argument count. `all_results` (the consumer half
+                // of dynamic multret, e.g. the outer `print` in
+                // `print(unpack(t))`) takes every value the
+                // immediately-preceding producer left, from the first argument
+                // slot up to `reg_top`.
+                const nargs: usize = if (instr.b == bytecode.all_results) blk: {
+                    self.reg_top_pending = false;
+                    break :blk self.reg_top - (base + a + 1);
+                } else instr.b;
+                switch (callee.heapType()) {
+                    .function => {
+                        const cl = Closure.fromHeader(callee.asHeap());
+                        const cp = cl.proto;
+                        const callee_base = base + st.proto.num_registers;
+                        if (self.depth >= max_call_depth) return parkErr(st, Error.StackOverflow);
+                        if (callee_base + cp.num_registers > self.regCapacity()) return parkErr(st, Error.StackOverflow);
+                        // Lay out the callee window: bind fixed params
+                        // (nil-fill any not supplied), nil the rest.
+                        // Straight-line and allocation-free — these slots sit
+                        // above the current `stack_top` until `pushFrame`
+                        // raises it, so no safepoint may intervene here (none
+                        // does).
+                        var i: usize = 0;
+                        while (i < cp.num_registers) : (i += 1) {
+                            self.regSet(callee_base + i, if (i < cp.num_params and i < nargs)
+                                self.regGet(base + a + 1 + i)
+                            else
+                                Value.nil());
+                        }
+                        // Varargs cursor: a vararg callee handed more args
+                        // than it has fixed params keeps the surplus where
+                        // they already sit — in the caller's window, below
+                        // `callee_base`. They stay valid (the stack slab never
+                        // moves) and GC-rooted (`forEachRootHeader` scans the
+                        // whole live prefix) for the callee's lifetime.
+                        // Recorded per-callee so a non-vararg or no-surplus
+                        // callee gets a zero cursor (never inherits one).
+                        const va_count: usize = if (cp.is_vararg and nargs > cp.num_params) nargs - cp.num_params else 0;
+                        const va_base: usize = if (va_count > 0) base + a + 1 + cp.num_params else 0;
+                        // Freeze the caller's resume cursor (already one past
+                        // this call), push the callee, and reload onto it.
+                        st.frame.pc = pc;
+                        self.pushFrameVararg(cl, callee_base, instr.a, instr.c, va_base, va_count) catch |e| return parkErr(st, e);
+                        reloadTopFrame(st);
+                        // Reloaded onto the callee frame; tail-dispatch its
+                        // first instruction with a full prologue
+                        // (GC/seq/suspend/recording) — exactly one prologue at
+                        // the call boundary (T-2).
+                        return dispatchTail(mode, st, st.frame.pc, vm);
+                    },
+                    .native => {
+                        const nat = function.Native.fromHeader(callee.asHeap());
+                        const nwanted: usize = instr.c;
+                        // Materialize the args into the absolute-indexed
+                        // boundary scratch so the native ABI keeps speaking
+                        // `[]Value` after the register file split (SoA). The
+                        // scratch is laid out at the same absolute slot
+                        // indices as the registers, so the `out`-aliases-`args`
+                        // overlap multi natives rely on is preserved exactly;
+                        // nesting is safe because a deeper call parks its own
+                        // args at higher absolute indices.
+                        const args = self.gatherScratch(base + a + 1, base + a + 1 + nargs);
+                        // `all` = the caller wants *every* result (dynamic
+                        // count, the producer half of `print(unpack(t))` /
+                        // `return f()`): results land starting at `regs[a]`
+                        // and `reg_top` records their end for the adjacent
+                        // consumer. Otherwise a concrete `nwanted` is written
+                        // and the tail nil-padded.
+                        //
+                        // Three native shapes, in priority order:
+                        //  1. effect native (clock/getenv/…): one result
+                        //     through the record/replay boundary — effects are
+                        //     inherently single.
+                        //  2. multi-result native: write straight into the
+                        //     destination slots. `out` aliases `args` (see
+                        //     NativeMultiFn), which is why the native reads
+                        //     its args first. For `all`, `out` spans to the
+                        //     end of the register stack (bounded → no OOB; the
+                        //     native caps at `out.len`).
+                        //  3. otherwise (pure single, or a multi native with
+                        //     0/1 wanted): call `func` (the primary-value
+                        //     projection) and write one.
+                        // A native call is a trace barrier (recording aborts
+                        // at it), so none of this touches the JIT.
+                        const all = nwanted == bytecode.all_results;
+                        if (nat.effect) |kind| {
+                            const result = performEffect(self, kind, nat, args) catch |e| return parkErr(st, e);
+                            if (all) self.stampSingleResult(base, a, result) else writeSingleResult(st.regs, a, nwanted, result);
+                        } else if (nat.multi != null and (all or nwanted >= 2)) {
+                            // `out` aliases `args` in scratch (same overlap as
+                            // the old stack slices); the native writes results
+                            // into scratch, then we scatter them back into the
+                            // registers.
+                            const out = if (all) self.scratchOut(base + a, self.regCapacity()) else self.scratchOut(base + a, base + a + nwanted);
+                            const produced = nat.multi.?(@ptrCast(self), args, out) catch |e| return parkErr(st, narrowError(e));
+                            if (all) {
                                 std.debug.assert(!self.reg_top_pending);
-                                self.scatterScratch(base + a, base + a + n);
-                                self.reg_top = base + a + n;
+                                self.scatterScratch(base + a, base + a + produced);
+                                self.reg_top = base + a + produced;
                                 self.reg_top_pending = true;
                             } else {
-                                const out = self.scratchOut(base + a, base + a + nwanted);
-                                const n = try self.callValue(handler, call_args, out);
-                                var k: usize = n;
+                                var k: usize = produced;
                                 while (k < nwanted) : (k += 1) out[k] = Value.nil();
                                 self.scatterScratch(base + a, base + a + nwanted);
                             }
-                        },
-                    }
-                    // The native and `__call` arms run inline (no frame push) and
-                    // leave `pc` one past the call, exactly like a straight-line op,
-                    // so they thread to the next instruction. (The `.function` arm
-                    // never reaches here — it `continue :outer`s after reloading
-                    // onto the callee frame.) Threading here keeps the back-edge
-                    // epilogue reachable *only* via `break :sw`.
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
+                        } else {
+                            const result = nat.func(@ptrCast(self), args) catch |e| return parkErr(st, narrowError(e));
+                            if (all) self.stampSingleResult(base, a, result) else writeSingleResult(st.regs, a, nwanted, result);
+                        }
+                    },
+                    // `__call`: a non-callable heap value (typically a table)
+                    // with a `__call` metamethod is invoked as
+                    // `handler(value, args...)`. The arguments already sit
+                    // contiguously as `[callee, args...]` at `stack[base+a..]`
+                    // — exactly the handler's argument list, so no copy is
+                    // needed; `callValue` reads it before writing results.
+                    // Results honour `nwanted`/`all_results` like the native
+                    // arm. A nil/non-heap callee, or a callee whose `__call`
+                    // chain bottoms out in a non-callable, stays the located
+                    // "attempt to call a <type> value" fault. A `__call` whose
+                    // handler is itself a `__call` table chains through
+                    // `callValue` (bounded by `native_reentry_depth`; a cycle
+                    // surfaces as a catchable StackOverflow, never a hang).
+                    else => {
+                        const handler = self.metamethod(callee, self.mm.call);
+                        if (handler.isNil()) return parkErr(st, Error.TypeError);
+                        const nwanted: usize = instr.c;
+                        // `[callee, args...]` is exactly the handler's
+                        // argument list — gather it into the absolute-indexed
+                        // scratch (the result `out` aliases it, same overlap
+                        // as the old stack slices; `callValue` reads its args
+                        // before writing out).
+                        const call_args = self.gatherScratch(base + a, base + a + 1 + nargs);
+                        if (nwanted == bytecode.all_results) {
+                            const n = self.callValue(handler, call_args, self.scratchOut(base + a, self.regCapacity())) catch |e| return parkErr(st, e);
+                            std.debug.assert(!self.reg_top_pending);
+                            self.scatterScratch(base + a, base + a + n);
+                            self.reg_top = base + a + n;
+                            self.reg_top_pending = true;
+                        } else {
+                            const out = self.scratchOut(base + a, base + a + nwanted);
+                            const n = self.callValue(handler, call_args, out) catch |e| return parkErr(st, e);
+                            var k: usize = n;
+                            while (k < nwanted) : (k += 1) out[k] = Value.nil();
+                            self.scatterScratch(base + a, base + a + nwanted);
+                        }
+                    },
+                }
+                // The native and `__call` arms run inline (no frame push) and
+                // leave `pc` one past the call, exactly like a straight-line
+                // op, so they thread to the next instruction. (The `.function`
+                // arm never reaches here — it tail-dispatches after reloading
+                // onto the callee frame.)
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
 
-                // ---- returns ---- pop this frame; copy results into the parent's
-                // window (or, for the bottom frame, hand the `FrameResult` to
-                // `run`/`exec`'s caller). Close any upvalues over this frame first.
-                .ret, .halt => {
-                    self.closeUpvaluesFrom(base);
-                    // Resolve how many values this frame returns. `ret a all_results`
-                    // (the producer half of `return f()` / `return unpack(t)`) returns
-                    // everything the immediately-preceding multret call left, from
-                    // `a` up to `reg_top`.
-                    const ret_count: u16 = if (instr.op == .ret and instr.b == bytecode.all_results) blk: {
-                        self.reg_top_pending = false;
-                        break :blk @intCast(self.reg_top - (base + @as(usize, a)));
-                    } else if (instr.op == .ret) instr.b else 0;
-                    const result: FrameResult = .{ .reg = @intCast(a), .count = ret_count };
-                    if (self.depth == stop_depth) {
-                        // Pop the boundary frame. For the top level (stop_depth == 1)
-                        // this nets `depth == 0` exactly as before; for a reentrant
-                        // `callValue` (stop_depth == entry_depth + 1) it leaves the
-                        // outer frames intact at `depth == entry_depth`. Results stay
-                        // in this frame's window (at `base + result.reg`) until the
-                        // caller copies them out — `stack_top` is not shrunk here, so
-                        // the live-register scan still roots them.
-                        self.trace.dropRegionActivation(frame.call_seq);
-                        self.depth -= 1;
-                        return .{ .finished = result };
-                    }
-                    // Copy results into the parent *while* `stack_top` still covers
-                    // this (callee) window — no allocation or safepoint between here
-                    // and the `stack_top` shrink below, so a result can't be
-                    // collected before it lands in the parent's (scanned) registers.
-                    // `want` uses the stored return-wiring, never a re-decode of the
-                    // caller's call instruction. When the caller wanted *all* results
-                    // (`call … c=all_results`, e.g. `print(g())`), take everything the
-                    // callee produced and stamp `reg_top` so the parent's adjacent
-                    // consumer instruction can expand them.
-                    const parent = &self.frames[self.depth - 2];
-                    const wants_all = frame.ret_count == bytecode.all_results;
-                    const want: usize = if (wants_all) result.count else frame.ret_count;
-                    const dst = parent.base + frame.ret_dest;
-                    const src = base + result.reg;
-                    var k: usize = 0;
-                    while (k < want) : (k += 1) {
-                        self.regSet(dst + k, if (k < result.count)
-                            self.regGet(src + k)
-                        else
-                            Value.nil());
-                    }
-                    if (wants_all) {
-                        std.debug.assert(!self.reg_top_pending);
-                        self.reg_top = dst + want;
-                        self.reg_top_pending = true;
-                    }
-                    // Pop and reload locals onto the parent (its `pc` is already past
-                    // the call), shrinking `stack_top` to the parent's window.
-                    self.trace.dropRegionActivation(frame.call_seq);
+    // ---- returns ---- pop this frame; copy results into the parent's window
+    // (or, for the bottom frame, hand the `FrameResult` to `run`/`exec`'s
+    // caller). Close any upvalues over this frame first. Shared by `.ret` and
+    // `.halt` (the old combined arm).
+    fn opRet(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                _ = pc;
+                // Frame pop ahead: lanes change under this handler, so it
+                // works through `st` and dispatches on the general path.
+                _ = tags;
+                _ = payloads;
+                const self = vm;
+                const a: usize = instr.a;
+                const base = st.base;
+                self.closeUpvaluesFrom(base);
+                // Resolve how many values this frame returns. `ret a
+                // all_results` (the producer half of `return f()` /
+                // `return unpack(t)`) returns everything the
+                // immediately-preceding multret call left, from `a` up to
+                // `reg_top`.
+                const ret_count: u16 = if (instr.op == .ret and instr.b == bytecode.all_results) blk: {
+                    self.reg_top_pending = false;
+                    break :blk @intCast(self.reg_top - (base + a));
+                } else if (instr.op == .ret) instr.b else 0;
+                const result: FrameResult = .{ .reg = @intCast(a), .count = ret_count };
+                if (self.depth == st.stop_depth) {
+                    // Pop the boundary frame. For the top level
+                    // (stop_depth == 1) this nets `depth == 0` exactly as
+                    // before; for a reentrant `callValue`
+                    // (stop_depth == entry_depth + 1) it leaves the outer
+                    // frames intact at `depth == entry_depth`. Results stay in
+                    // this frame's window (at `base + result.reg`) until the
+                    // caller copies them out — `stack_top` is not shrunk here,
+                    // so the live-register scan still roots them.
+                    self.trace.dropRegionActivation(st.frame.call_seq);
                     self.depth -= 1;
-                    frame = &self.frames[self.depth - 1];
-                    closure = frame.closure;
-                    proto = closure.proto;
-                    code = self.trace.codeFor(proto); // doc 20 image
-                    code_gen = self.trace.registry.entry_registry.image_gen;
-                    base = frame.base;
-                    regs = self.frameWindow(base, proto.num_registers);
-                    pc = frame.pc;
-                    self.trace.setRegionContext(self.depth, frame.call_seq);
-                    self.stack_top = base + proto.num_registers;
-                    // Reloaded onto the parent frame; re-enter the outer loop so
-                    // `step` fetches the parent's next instruction with a full
-                    // prologue. (The parent `pc` is already past the call.)
-                    continue :outer;
-                },
-
-                // ---- varargs ---- read the current frame's `...` cursor. The
-                // surplus-arg region lives below `base` (in the caller's window),
-                // stable and GC-rooted; these never relocate it.
-                .vararg_first => {
-                    regs.set(a, if (frame.varargs_count >= 1) self.regGet(frame.varargs_base) else Value.nil());
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .vararg_len => {
-                    regs.set(a, Value.int(@intCast(frame.varargs_count)));
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .vararg_get => {
-                    // 1-based, bounds-checked; out of range or non-int index → nil.
-                    const idx_v = regs.get(instr.b);
-                    var out = Value.nil();
-                    if (idx_v.isInt()) {
-                        const idx = idx_v.asInt();
-                        if (idx >= 1 and idx <= @as(i64, @intCast(frame.varargs_count))) {
-                            out = self.regGet(frame.varargs_base + @as(usize, @intCast(idx - 1)));
-                        }
-                    }
-                    regs.set(a, out);
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-                .vararg_spread => {
-                    // The dynamic-multret producer half: copy every vararg into
-                    // R[a..a+count) and stamp `reg_top` for the adjacent consumer
-                    // (a `call`/`ret` with `all_results`). Bound against the whole
-                    // stack, not the static window — like the native multret, the
-                    // values may land above `stack_top`, covered by the
-                    // `reg_top_pending` safepoint suppression until consumed.
-                    std.debug.assert(!self.reg_top_pending);
-                    const count = frame.varargs_count;
-                    const dest = base + a;
-                    if (dest + count > self.regCapacity()) return Error.StackOverflow;
-                    var k: usize = 0;
-                    while (k < count) : (k += 1) self.regSet(dest + k, self.regGet(frame.varargs_base + k));
-                    self.reg_top = dest + count;
-                    self.reg_top_pending = true;
-                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
-                },
-            }
-
-            // Phase 5 hotness seam: a backward (or self) jump just took us to
-            // `pc <= cur_pc` — a loop back-edge whose target `pc` is the loop
-            // header (anchor). Count it, and arm/close a recording. Gated on
-            // `enabled`, so it is inert until `--trace`.
-            if (self.trace.config.enabled and pc <= cur_pc) {
-                const anchor_pc: u32 = @intCast(pc);
-                // JIT coverage (gated): arriving at a back-edge means tier-0 just
-                // interpreted one loop-body iteration. Classify it covered (a trace
-                // exists at this anchor — the fallback-despite-a-trace smell) vs
-                // uncovered, and charge the cycles that body iteration took (the span
-                // since the last coverage event — another back-edge or a trace-region
-                // exit) to this anchor. Trace-run iterations/cycles are counted
-                // separately (`onSideExit` + the trace-exec bracket below); the two
-                // are disjoint (a trace's committed count excludes the deopt iteration
-                // tier-0 redoes on side-exit), so there is no double count.
-                if (self.trace.config.coverage) {
-                    const now = trace.readCycles();
-                    self.trace.noteInterpIter(proto, anchor_pc, trace.cycleDelta(now, self.trace.last_event_tsc));
-                    self.trace.last_event_tsc = now;
+                    st.step = .{ .finished = result };
+                    return .finished;
                 }
-                // Cheap direct-mapped hot-count pre-filter. A gated/dead loop (the
-                // canonical case: nsieve's array-growing init loop, which can't be
-                // traced) skips the per-back-edge hashmap bookkeeping in
-                // `onBackEdge` + the trace-entry lookup entirely — it just
-                // decrements a `u16` slot and falls back to tier-0. The global
-                // `tick` still advances (inside `skipBackEdge`), so a transiently
-                // gated loop's backoff cooldown keeps elapsing across the skip.
-                // Hot traced loops and warming loops keep a 0 slot and always take
-                // the slow path below, so their behaviour is unchanged.
-                if (!self.trace.skipBackEdge(proto, anchor_pc)) {
-                    self.trace.onBackEdge(proto, anchor_pc, regs);
-
-                    // Phase 6 tier-1a entry: if a trace is cached for this loop header
-                    // and we're not mid-recording, execute it. `irinterp.execute`
-                    // returns with `regs` coherent for the header — it side-exits
-                    // *before* committing a partial iteration — so we `continue`
-                    // **without** advancing `pc`: tier-0 then re-runs the loop header
-                    // to redo the (pure, side-effect-free) deopt iteration. A trace is
-                    // only ever entered at exactly its anchor pc, so re-entry is sound.
-                    // Per-entry trip-count gating: for a numeric-`for`, decline to
-                    // enter the trace when the remaining iteration count is below
-                    // `min_trip_entry` — tier-0 runs the short loop and we skip the
-                    // `onSideExit` penalty, so the inner loop's trivial large-stride
-                    // runs never gate its profitable long runs. `null` for any
-                    // non-`for_loop` back-edge (while/repeat) ⇒ always eligible.
-                    const for_trips: ?u64 = if (instr.op == .for_loop)
-                        forRemainingTrips(regs.get(a), regs.get(a + 1), regs.get(a + 2))
+                // Copy results into the parent *while* `stack_top` still
+                // covers this (callee) window — no allocation or safepoint
+                // between here and the `stack_top` shrink below, so a result
+                // can't be collected before it lands in the parent's (scanned)
+                // registers. `want` uses the stored return-wiring, never a
+                // re-decode of the caller's call instruction. When the caller
+                // wanted *all* results (`call … c=all_results`, e.g.
+                // `print(g())`), take everything the callee produced and stamp
+                // `reg_top` so the parent's adjacent consumer instruction can
+                // expand them.
+                const parent = &self.frames[self.depth - 2];
+                const wants_all = st.frame.ret_count == bytecode.all_results;
+                const want: usize = if (wants_all) result.count else st.frame.ret_count;
+                const dst = parent.base + st.frame.ret_dest;
+                const src = base + result.reg;
+                var k: usize = 0;
+                while (k < want) : (k += 1) {
+                    self.regSet(dst + k, if (k < result.count)
+                        self.regGet(src + k)
                     else
-                        null;
-                    const eligible = self.trace.config.execute and !self.trace.isRecording() and
-                        !self.trace.isGated(.{ .proto = proto, .pc = anchor_pc });
-                    const trip_ok = for_trips == null or for_trips.? >= self.trace.config.min_trip_entry;
-                    if (eligible and trip_ok) {
-                        // A gated anchor has proven it thrashes: every entry
-                        // committed fewer than `min_useful` iterations until the
-                        // re-entry penalty maxed out. The canonical case is a
-                        // strictly-alternating branch (stable types, so fingerprinting
-                        // can't tell the arms apart) where no single straight-line
-                        // trace can amortize entry/exit over more than one iteration —
-                        // running the trace was *slower* than tier-0. Gating entry
-                        // (not just re-arming, as before) lets tier-0
-                        // own the loop and removes the slowdown. The gate retries the
-                        // anchor on an exponential backoff and clears the moment an
-                        // entry finally proves useful, so a loop that only thrashes
-                        // transiently still recovers. Works on the native
-                        // path too: the penalty keys only on `completed`, which native
-                        // execution reports.
-                        //
-                        // Same-anchor chaining: if multiple traces exist for this
-                        // loop header (e.g. different type specializations), try
-                        // each in turn until one commits at least one iteration.
-                        // All traces share the same loop-header re-entry deopt
-                        // discipline, so `regs` is valid for every attempt.
-                        // Same-anchor trial walk. We iterate by an explicit
-                        // *visited* set (`nextTraceExcluding`) rather than the
-                        // single-`skip` `findNextTrace`, so each candidate is tried
-                        // exactly once and the walk always terminates — two
-                        // equal-priority traces that both zero-exit would otherwise
-                        // cycle `A→B→A→…` forever (e.g. two stale narrow-lane traces
-                        // once the live array has widened past both).
-                        var visited: [trial_visited_cap]*trace.Trace = undefined;
-                        var nvisited: usize = 0;
-                        var any_fingerprint_matched = false;
-                        // Native safety net (see the skip below): set when a
-                        // fingerprint-matching trace at this anchor compiled to
-                        // native-*unsupported*. If the walk then ends with no
-                        // productive entry, we gate the anchor so tier-0 owns the
-                        // loop rather than re-walking (or falling to tier-1a) every
-                        // back-edge.
-                        var saw_native_unsupported = false;
-                        // Widen-eviction: traces whose `guard_lane` pins a lane the
-                        // live array has monotonically widened past can never match
-                        // again. Collect them during the trial walk and retire them
-                        // when we leave it — removing a trace frees the `*Trace`, so
-                        // we must not do it while the walk could still revisit the
-                        // cache. `dead` is a subset of `visited`, so it never
-                        // overflows past the visited cap.
-                        var dead: [trial_visited_cap]*trace.Trace = undefined;
-                        var ndead: usize = 0;
-                        var t: ?*trace.Trace = self.trace.nextTraceExcluding(proto, @intCast(pc), visited[0..0]);
-                        while (t) |ct| : (t = if (nvisited < visited.len)
-                            self.trace.nextTraceExcluding(proto, @intCast(pc), visited[0..nvisited])
-                        else
-                            null)
-                        {
-                            // Mark visited *before* the body so the loop continuation
-                            // excludes `ct` (and everything tried so far) — this is
-                            // what makes the walk finite.
-                            if (nvisited < visited.len) {
-                                visited[nvisited] = ct;
-                                nvisited += 1;
-                            }
-                            // `.link` traces are continuations entered only by
-                            // exit-PC chaining after an inner loop-done exit. Never
-                            // trial-enter one through the same-anchor walk, even if
-                            // a malformed or future bytecode shape puts it at a
-                            // back-edge pc.
-                            if (ct.code.instrs.len != 0 and ct.code.instrs[ct.code.instrs.len - 1].op == .link) continue;
-                            // --- type fingerprint (step 5) ---
-                            // Skip this trace if the current register types don't
-                            // match its entry type guards.  Avoids trial entries
-                            // that would immediately fail on a guard_int/guard_float
-                            // mismatch.  Branch-direction guards (guard_true/false)
-                            // aren't fingerprinted — they depend on computed values.
-                            if (!ct.code.matchesFingerprint(regs)) continue;
-                            // Doc 24 D8 observation blackout: while a suspend
-                            // cut or safepoint-line recording is armed, decline
-                            // to enter any ALLOCATING trace (`alloc_bound > 0`)
-                            // — a mid-burst observation would see a heap
-                            // `next_obj_id` tier-0 only reaches after the whole
-                            // burst, breaking §T-A.2 keyframe byte-identity.
-                            // Identical condition to `safe_to_arm` below;
-                            // tier-0 owns allocating loops for the window's
-                            // duration. Ordered after the fingerprint so a
-                            // blacked-out candidate still counts as matched
-                            // (no spurious side-trace pressure).
-                            any_fingerprint_matched = true;
-                            if (ct.code.alloc_bound > 0 and
-                                (self.suspend_ctl != null or self.record_safepoint_lines)) continue;
-                            // Native safety net: under `--jit-native`, a trace that
-                            // records but can't compile to native (unsupported op /
-                            // type) would otherwise run on the tier-1a IR-interpreter,
-                            // which is ~equal-to-slower than tier-0 on these bodies —
-                            // so enabling native codegen *regresses* the loop vs plain
-                            // tier-0. Decline to enter it (skip, never tier-1a) and note
-                            // it; the post-walk fall-through gates the anchor *only* if
-                            // nothing productive ran — so a native-supported sibling at
-                            // the same anchor still runs and never thrashes the gate.
-                            // `nativeFor` compiles lazily and memoizes the verdict, so
-                            // this is one compile attempt then an O(1) `union` tag read
-                            // forever (the supported path below re-reads the page).
-                            if (self.trace.config.native_codegen and self.trace.nativeFor(ct) == null) {
-                                saw_native_unsupported = true;
-                                continue;
-                            }
-                            // Phase 0a (doc 20): the whole per-candidate entry + receipt
-                            // grammar lives in `enterSelectedTrace`; this switch is the
-                            // caller-owned epilogue the safe-point drain will hook (§R3-3).
-                            var wctx: TrialWalkCtx = .{
-                                .visited = visited[0..nvisited],
-                                .dead = &dead,
-                                .ndead = &ndead,
-                            };
-                            const directive = self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx);
-                            // Doc 20 safe-point drain: runs BEFORE acting on any
-                            // directive (§R3-1) — every unpatch-producing event
-                            // inside the entry routine is flushed here, same
-                            // turn. Then re-resolve the fetch image if its
-                            // generation moved (a Phase-1 install, or the first
-                            // clone of this proto's image).
-                            self.trace.drainEntryPatchWork();
-                            if (self.trace.registry.entry_registry.image_gen != code_gen) {
-                                code = self.trace.codeFor(proto);
-                                code_gen = self.trace.registry.entry_registry.image_gen;
-                            }
-                            switch (directive) {
-                                .next_candidate => {},
-                                .resume_tier0 => |npc| {
-                                    pc = npc;
-                                    continue :outer;
-                                },
-                                .switch_mode_at => |npc| {
-                                    frame.pc = npc;
-                                    return .switch_mode;
-                                },
-                            }
-                        }
-                        // Retire traces the walk found permanently dead (lane widened
-                        // past their guard). Safe now that the same-anchor walk is
-                        // complete — removing frees the `*Trace` and would otherwise
-                        // dangle the iterator cursor.
-                        for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
-                        // All traces at this anchor failed, OOM'd, or didn't match
-                        // the fingerprint.  If at least one trace exists but none
-                        // matched, count it for side-trace recording.
-                        if (!any_fingerprint_matched and self.trace.hasTrace(.{ .proto = proto, .pc = anchor_pc })) {
-                            self.trace.countFingerprintMiss(.{ .proto = proto, .pc = anchor_pc });
-                        }
-                        // Native safety net (part 2): we reach here only when no trace
-                        // ran productively (a productive entry does `continue :outer`).
-                        // If the walk skipped a native-unsupported trace, gate the
-                        // anchor so its next back-edges hit the hot-count skip and
-                        // tier-0 owns the loop — rather than re-walking + re-compiling
-                        // every iteration. Guarded on "nothing productive ran", so a
-                        // native-supported sibling that *did* run never gets gated
-                        // (it `continue :outer`s and bypasses this). Self-heals via the
-                        // gate's backoff + `onSideExit` clear.
-                        if (saw_native_unsupported) {
-                            self.trace.gateNativeUnsupported(.{ .proto = proto, .pc = anchor_pc });
-                        }
-                        // Doc 20 §R5-1 (codex post-landing blocker on
-                        // 7fa7e1a): the three sites above — dead-trace
-                        // retirement, fingerprint-miss, native-unsupported
-                        // gating — all run AFTER this turn's epilogue drain
-                        // and can mark bound patches pending. Drain again so
-                        // the image and registry re-agree same-turn (the
-                        // `.jfor_loop` arm's §R6-1 recovery would self-heal a
-                        // missed one, but same-turn is the cheap, prompt
-                        // path), and re-resolve the fetch image if a drain
-                        // moved the generation.
-                        self.trace.drainEntryPatchWork();
-                        if (self.trace.registry.entry_registry.image_gen != code_gen) {
-                            code = self.trace.codeFor(proto);
-                            code_gen = self.trace.registry.entry_registry.image_gen;
-                        }
-                        // Coherent-state chaining (doc 16, Phase 2) diagnostic: tier-0
-                        // is about to run this *traced* anchor's body because no trace
-                        // or chain took over this back-edge — the design's REQUIRED
-                        // tier-0-outer-body signal. (The back-edge counter is the wrong
-                        // one: `onBackEdge` returns before incrementing once any trace
-                        // exists here, so it flattens even under full tier-0 fallback.)
-                        // Guarded on a trace existing so untraced hot loops don't
-                        // inflate it; a productive trace/chain entry `continue :outer`s
-                        // above and never reaches here. Under Phase 2 the prime path
-                        // chains instead of dropping here, so this trends to ~0.
-                        if (self.trace.hasTrace(.{ .proto = proto, .pc = anchor_pc })) {
-                            self.trace.tier0_outer_body_entries +|= 1;
-                        }
-                        // Fall through to tier-0.
-                    } else if (eligible and !trip_ok) {
-                        // Declined a numeric-`for` purely on trip count: cheap-skip
-                        // the rest of this short invocation so its remaining
-                        // back-edges don't each re-pay full `onBackEdge`
-                        // bookkeeping. `trip - 1` exactly covers the remainder (the
-                        // final `for_loop` exits without a back-edge), so the window
-                        // never bleeds into the next invocation's (possibly
-                        // profitable) entry at this same anchor.
-                        if (for_trips.? >= 2) {
-                            self.trace.armShortLoopSkip(proto, anchor_pc, for_trips.? - 1);
-                        }
-                    }
-                    // Reached only when no trace ran this back-edge — a successful
-                    // trace entry above does `continue :outer` and never gets here.
-                    // If the anchor is gated, install a hot-count skip window so its
-                    // next back-edges bypass all of the above.
-                    self.trace.afterBackEdge(proto, anchor_pc);
+                        Value.nil());
                 }
-                // T3 fast/slow handoff — back-edges are the *only* point a
-                // recording can arm (`onBackEdge`), so the check lives here, not
-                // per-instruction. `.fast`: if a recording just armed, the loop
-                // header (the next instruction) must be mirrored, which `.fast`
-                // elides — re-enter `.full`. `.full`: once recording has finished
-                // or aborted and no other hook is live, drop back to `.fast`. The
-                // back-edge instruction itself is never part of the recorded body
-                // (its prologue mirror ran before `onBackEdge` armed), so handing
-                // off here is byte-identical to an always-`.full` recording run.
-                // Park `pc` before handing off, exactly as the `.suspended` path
-                // does: re-entry reloads `pc = frame.pc`, so without this the other
-                // mode would resume at `cur_pc` and re-run this back-edge.
-                if (mode == .fast) {
-                    if (self.trace.isRecording()) {
-                        frame.pc = pc;
-                        return .switch_mode;
+                if (wants_all) {
+                    std.debug.assert(!self.reg_top_pending);
+                    self.reg_top = dst + want;
+                    self.reg_top_pending = true;
+                }
+                // Pop and reload locals onto the parent (its `pc` is already
+                // past the call), shrinking `stack_top` to the parent's
+                // window. Then tail-dispatch the parent's next instruction
+                // with exactly one full prologue (T-3).
+                self.trace.dropRegionActivation(st.frame.call_seq);
+                self.depth -= 1;
+                reloadTopFrame(st);
+                self.stack_top = st.base + st.proto.num_registers;
+                return dispatchTail(mode, st, st.frame.pc, vm);
+            }
+        }.h;
+    }
+
+    // ---- varargs ---- read the current frame's `...` cursor. The
+    // surplus-arg region lives below `base` (in the caller's window), stable
+    // and GC-rooted; these never relocate it.
+    fn opVarargFirst(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                regs.set(instr.a, if (st.frame.varargs_count >= 1) vm.regGet(st.frame.varargs_base) else Value.nil());
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    fn opVarargLen(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                regs.set(instr.a, Value.int(@intCast(st.frame.varargs_count)));
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    fn opVarargGet(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                // 1-based, bounds-checked; out of range or non-int index → nil.
+                const idx_v = regs.get(instr.b);
+                var out = Value.nil();
+                if (idx_v.isInt()) {
+                    const idx = idx_v.asInt();
+                    if (idx >= 1 and idx <= @as(i64, @intCast(st.frame.varargs_count))) {
+                        out = vm.regGet(st.frame.varargs_base + @as(usize, @intCast(idx - 1)));
                     }
-                } else {
-                    if (self.runFastPath()) {
-                        frame.pc = pc;
-                        return .switch_mode;
+                }
+                regs.set(instr.a, out);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    fn opVarargSpread(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                // The dynamic-multret producer half: copy every vararg into
+                // R[a..a+count) and stamp `reg_top` for the adjacent consumer
+                // (a `call`/`ret` with `all_results`). Bound against the whole
+                // stack, not the static window — like the native multret, the
+                // values may land above `stack_top`, covered by the
+                // `reg_top_pending` safepoint suppression until consumed.
+                const self = vm;
+                std.debug.assert(!self.reg_top_pending);
+                const count = st.frame.varargs_count;
+                const dest = st.base + instr.a;
+                if (dest + count > self.regCapacity()) return parkErr(st, Error.StackOverflow);
+                var k: usize = 0;
+                while (k < count) : (k += 1) self.regSet(dest + k, self.regGet(st.frame.varargs_base + k));
+                self.reg_top = dest + count;
+                self.reg_top_pending = true;
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// Doc 42 §4.4: the back-edge epilogue — the Phase 5 hotness seam,
+    /// coverage attribution, `onBackEdge`, the same-anchor trial walk /
+    /// tier-entry machinery, and the T3 fast/slow handoff, moved verbatim from
+    /// the bottom of the old dispatch loop. Reached only via `backEdgeHandler`
+    /// when a backward (or self) jump took `pc` to `<= cur_pc` — a loop
+    /// back-edge whose target is the loop header (anchor) — while
+    /// `trace.config.enabled`; inert otherwise (the jump handlers thread
+    /// straight past it).
+    ///
+    /// `noinline` is mandatory (doc 42 §4.4): an ordinary function would be
+    /// re-inlined by ReleaseFast into every jump handler, re-creating exactly
+    /// the layout coupling this arc removes. Two invariants: it never writes
+    /// the jump target into `frame.pc` (the trampoline owns the mode-switch
+    /// park; `frame.pc` stays at the executed back-edge until the next
+    /// prologue), and every image-generation reload point stays inside it.
+    noinline fn backEdgeEpilogue(comptime mode: ExecMode, st: *ExecState, pc: usize, instr: *const Instr) BackEdgeDirective {
+        const self = st.vm;
+        const proto = st.proto;
+        const regs = st.regs;
+        // Copy the presented (canonical) instruction up front: `instr` may
+        // point at `patch.orig`, which is only guaranteed stable until the
+        // next entry-patch drain — and this epilogue runs drains. The copy
+        // makes every later read (`for_trips` below, future edits) safe by
+        // construction instead of by ordering argument.
+        const inst: Instr = instr.*;
+        const anchor_pc: u32 = @intCast(pc);
+        // JIT coverage (gated): arriving at a back-edge means tier-0 just
+        // interpreted one loop-body iteration. Classify it covered (a trace
+        // exists at this anchor — the fallback-despite-a-trace smell) vs
+        // uncovered, and charge the cycles that body iteration took (the span
+        // since the last coverage event — another back-edge or a trace-region
+        // exit) to this anchor. Trace-run iterations/cycles are counted
+        // separately (`onSideExit` + the trace-exec bracket in
+        // `enterSelectedTrace`); the two are disjoint (a trace's committed
+        // count excludes the deopt iteration tier-0 redoes on side-exit), so
+        // there is no double count.
+        if (self.trace.config.coverage) {
+            const now = trace.readCycles();
+            self.trace.noteInterpIter(proto, anchor_pc, trace.cycleDelta(now, self.trace.last_event_tsc));
+            self.trace.last_event_tsc = now;
+        }
+        // Cheap direct-mapped hot-count pre-filter. A gated/dead loop (the
+        // canonical case: nsieve's array-growing init loop, which can't be
+        // traced) skips the per-back-edge hashmap bookkeeping in `onBackEdge`
+        // + the trace-entry lookup entirely — it just decrements a `u16` slot
+        // and falls back to tier-0. The global `tick` still advances (inside
+        // `skipBackEdge`), so a transiently gated loop's backoff cooldown
+        // keeps elapsing across the skip. Hot traced loops and warming loops
+        // keep a 0 slot and always take the slow path below, so their
+        // behaviour is unchanged.
+        if (!self.trace.skipBackEdge(proto, anchor_pc)) {
+            self.trace.onBackEdge(proto, anchor_pc, regs);
+
+            // Phase 6 tier-1a entry: if a trace is cached for this loop header
+            // and we're not mid-recording, execute it. `irinterp.execute`
+            // returns with `regs` coherent for the header — it side-exits
+            // *before* committing a partial iteration — so we resume
+            // **without** advancing `pc`: tier-0 then re-runs the loop header
+            // to redo the (pure, side-effect-free) deopt iteration. A trace is
+            // only ever entered at exactly its anchor pc, so re-entry is
+            // sound. Per-entry trip-count gating: for a numeric-`for`, decline
+            // to enter the trace when the remaining iteration count is below
+            // `min_trip_entry` — tier-0 runs the short loop and we skip the
+            // `onSideExit` penalty, so the inner loop's trivial large-stride
+            // runs never gate its profitable long runs. `null` for any
+            // non-`for_loop` back-edge (while/repeat) ⇒ always eligible.
+            const a: usize = inst.a;
+            const for_trips: ?u64 = if (inst.op == .for_loop)
+                forRemainingTrips(regs.get(a), regs.get(a + 1), regs.get(a + 2))
+            else
+                null;
+            const eligible = self.trace.config.execute and !self.trace.isRecording() and
+                !self.trace.isGated(.{ .proto = proto, .pc = anchor_pc });
+            const trip_ok = for_trips == null or for_trips.? >= self.trace.config.min_trip_entry;
+            if (eligible and trip_ok) {
+                // A gated anchor has proven it thrashes: every entry committed
+                // fewer than `min_useful` iterations until the re-entry
+                // penalty maxed out. The canonical case is a
+                // strictly-alternating branch (stable types, so fingerprinting
+                // can't tell the arms apart) where no single straight-line
+                // trace can amortize entry/exit over more than one iteration —
+                // running the trace was *slower* than tier-0. Gating entry
+                // (not just re-arming, as before) lets tier-0 own the loop and
+                // removes the slowdown. The gate retries the anchor on an
+                // exponential backoff and clears the moment an entry finally
+                // proves useful, so a loop that only thrashes transiently
+                // still recovers. Works on the native path too: the penalty
+                // keys only on `completed`, which native execution reports.
+                //
+                // Same-anchor chaining: if multiple traces exist for this loop
+                // header (e.g. different type specializations), try each in
+                // turn until one commits at least one iteration. All traces
+                // share the same loop-header re-entry deopt discipline, so
+                // `regs` is valid for every attempt.
+                // Same-anchor trial walk. We iterate by an explicit *visited*
+                // set (`nextTraceExcluding`) rather than the single-`skip`
+                // `findNextTrace`, so each candidate is tried exactly once and
+                // the walk always terminates — two equal-priority traces that
+                // both zero-exit would otherwise cycle `A→B→A→…` forever
+                // (e.g. two stale narrow-lane traces once the live array has
+                // widened past both).
+                var visited: [trial_visited_cap]*trace.Trace = undefined;
+                var nvisited: usize = 0;
+                var any_fingerprint_matched = false;
+                // Native safety net (see the skip below): set when a
+                // fingerprint-matching trace at this anchor compiled to
+                // native-*unsupported*. If the walk then ends with no
+                // productive entry, we gate the anchor so tier-0 owns the loop
+                // rather than re-walking (or falling to tier-1a) every
+                // back-edge.
+                var saw_native_unsupported = false;
+                // Widen-eviction: traces whose `guard_lane` pins a lane the
+                // live array has monotonically widened past can never match
+                // again. Collect them during the trial walk and retire them
+                // when we leave it — removing a trace frees the `*Trace`, so
+                // we must not do it while the walk could still revisit the
+                // cache. `dead` is a subset of `visited`, so it never
+                // overflows past the visited cap.
+                var dead: [trial_visited_cap]*trace.Trace = undefined;
+                var ndead: usize = 0;
+                var t: ?*trace.Trace = self.trace.nextTraceExcluding(proto, @intCast(pc), visited[0..0]);
+                while (t) |ct| : (t = if (nvisited < visited.len)
+                    self.trace.nextTraceExcluding(proto, @intCast(pc), visited[0..nvisited])
+                else
+                    null)
+                {
+                    // Mark visited *before* the body so the loop continuation
+                    // excludes `ct` (and everything tried so far) — this is
+                    // what makes the walk finite.
+                    if (nvisited < visited.len) {
+                        visited[nvisited] = ct;
+                        nvisited += 1;
                     }
+                    // `.link` traces are continuations entered only by exit-PC
+                    // chaining after an inner loop-done exit. Never
+                    // trial-enter one through the same-anchor walk, even if a
+                    // malformed or future bytecode shape puts it at a
+                    // back-edge pc.
+                    if (ct.code.instrs.len != 0 and ct.code.instrs[ct.code.instrs.len - 1].op == .link) continue;
+                    // --- type fingerprint (step 5) ---
+                    // Skip this trace if the current register types don't
+                    // match its entry type guards.  Avoids trial entries that
+                    // would immediately fail on a guard_int/guard_float
+                    // mismatch.  Branch-direction guards (guard_true/false)
+                    // aren't fingerprinted — they depend on computed values.
+                    if (!ct.code.matchesFingerprint(regs)) continue;
+                    // Doc 24 D8 observation blackout: while a suspend cut or
+                    // safepoint-line recording is armed, decline to enter any
+                    // ALLOCATING trace (`alloc_bound > 0`) — a mid-burst
+                    // observation would see a heap `next_obj_id` tier-0 only
+                    // reaches after the whole burst, breaking §T-A.2 keyframe
+                    // byte-identity. Identical condition to `safe_to_arm`
+                    // downstream; tier-0 owns allocating loops for the
+                    // window's duration. Ordered after the fingerprint so a
+                    // blacked-out candidate still counts as matched (no
+                    // spurious side-trace pressure).
+                    any_fingerprint_matched = true;
+                    if (ct.code.alloc_bound > 0 and
+                        (self.suspend_ctl != null or self.record_safepoint_lines)) continue;
+                    // Native safety net: under `--jit-native`, a trace that
+                    // records but can't compile to native (unsupported op /
+                    // type) would otherwise run on the tier-1a
+                    // IR-interpreter, which is ~equal-to-slower than tier-0 on
+                    // these bodies — so enabling native codegen *regresses*
+                    // the loop vs plain tier-0. Decline to enter it (skip,
+                    // never tier-1a) and note it; the post-walk fall-through
+                    // gates the anchor *only* if nothing productive ran — so a
+                    // native-supported sibling at the same anchor still runs
+                    // and never thrashes the gate. `nativeFor` compiles lazily
+                    // and memoizes the verdict, so this is one compile attempt
+                    // then an O(1) `union` tag read forever (the supported
+                    // path below re-reads the page).
+                    if (self.trace.config.native_codegen and self.trace.nativeFor(ct) == null) {
+                        saw_native_unsupported = true;
+                        continue;
+                    }
+                    // Phase 0a (doc 20): the whole per-candidate entry +
+                    // receipt grammar lives in `enterSelectedTrace`; this
+                    // switch is the caller-owned epilogue the safe-point drain
+                    // hooks (§R3-3).
+                    var wctx: TrialWalkCtx = .{
+                        .visited = visited[0..nvisited],
+                        .dead = &dead,
+                        .ndead = &ndead,
+                    };
+                    const directive = self.enterSelectedTrace(mode, ct, st.closure, proto, regs, st.base, pc, &wctx);
+                    // Doc 20 safe-point drain: runs BEFORE acting on any
+                    // directive (§R3-1) — every unpatch-producing event inside
+                    // the entry routine is flushed here, same turn. Then
+                    // re-resolve the fetch image if its generation moved (a
+                    // Phase-1 install, or the first clone of this proto's
+                    // image).
+                    self.trace.drainEntryPatchWork();
+                    if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
+                        st.code = self.trace.codeFor(proto);
+                        st.code_gen = self.trace.registry.entry_registry.image_gen;
+                    }
+                    switch (directive) {
+                        .next_candidate => {},
+                        .resume_tier0 => |npc| return .{ .dispatch_at = npc },
+                        .switch_mode_at => |npc| return .{ .switch_mode_at = npc },
+                    }
+                }
+                // Retire traces the walk found permanently dead (lane widened
+                // past their guard). Safe now that the same-anchor walk is
+                // complete — removing frees the `*Trace` and would otherwise
+                // dangle the iterator cursor.
+                for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+                // All traces at this anchor failed, OOM'd, or didn't match the
+                // fingerprint.  If at least one trace exists but none matched,
+                // count it for side-trace recording.
+                if (!any_fingerprint_matched and self.trace.hasTrace(.{ .proto = proto, .pc = anchor_pc })) {
+                    self.trace.countFingerprintMiss(.{ .proto = proto, .pc = anchor_pc });
+                }
+                // Native safety net (part 2): we reach here only when no trace
+                // ran productively (a productive entry returns a directive).
+                // If the walk skipped a native-unsupported trace, gate the
+                // anchor so its next back-edges hit the hot-count skip and
+                // tier-0 owns the loop — rather than re-walking + re-compiling
+                // every iteration. Guarded on "nothing productive ran", so a
+                // native-supported sibling that *did* run never gets gated (it
+                // returns `.dispatch_at` and bypasses this). Self-heals via
+                // the gate's backoff + `onSideExit` clear.
+                if (saw_native_unsupported) {
+                    self.trace.gateNativeUnsupported(.{ .proto = proto, .pc = anchor_pc });
+                }
+                // Doc 20 §R5-1 (codex post-landing blocker on 7fa7e1a): the
+                // three sites above — dead-trace retirement, fingerprint-miss,
+                // native-unsupported gating — all run AFTER this turn's
+                // epilogue drain and can mark bound patches pending. Drain
+                // again so the image and registry re-agree same-turn (the
+                // `.jfor_loop` arm's §R6-1 recovery would self-heal a missed
+                // one, but same-turn is the cheap, prompt path), and
+                // re-resolve the fetch image if a drain moved the generation.
+                self.trace.drainEntryPatchWork();
+                if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
+                    st.code = self.trace.codeFor(proto);
+                    st.code_gen = self.trace.registry.entry_registry.image_gen;
+                }
+                // Coherent-state chaining (doc 16, Phase 2) diagnostic: tier-0
+                // is about to run this *traced* anchor's body because no trace
+                // or chain took over this back-edge — the design's REQUIRED
+                // tier-0-outer-body signal. (The back-edge counter is the
+                // wrong one: `onBackEdge` returns before incrementing once any
+                // trace exists here, so it flattens even under full tier-0
+                // fallback.) Guarded on a trace existing so untraced hot loops
+                // don't inflate it; a productive trace/chain entry returns a
+                // directive above and never reaches here. Under Phase 2 the
+                // prime path chains instead of dropping here, so this trends
+                // to ~0.
+                if (self.trace.hasTrace(.{ .proto = proto, .pc = anchor_pc })) {
+                    self.trace.tier0_outer_body_entries +|= 1;
+                }
+                // Fall through to tier-0.
+            } else if (eligible and !trip_ok) {
+                // Declined a numeric-`for` purely on trip count: cheap-skip
+                // the rest of this short invocation so its remaining
+                // back-edges don't each re-pay full `onBackEdge` bookkeeping.
+                // `trip - 1` exactly covers the remainder (the final
+                // `for_loop` exits without a back-edge), so the window never
+                // bleeds into the next invocation's (possibly profitable)
+                // entry at this same anchor.
+                if (for_trips.? >= 2) {
+                    self.trace.armShortLoopSkip(proto, anchor_pc, for_trips.? - 1);
                 }
             }
+            // Reached only when no trace ran this back-edge — a successful
+            // trace entry above returns a directive and never gets here. If
+            // the anchor is gated, install a hot-count skip window so its next
+            // back-edges bypass all of the above.
+            self.trace.afterBackEdge(proto, anchor_pc);
         }
+        // T3 fast/slow handoff — back-edges are the *only* point a recording
+        // can arm (`onBackEdge`), so the check lives here, not
+        // per-instruction. `.fast`: if a recording just armed, the loop header
+        // (the next instruction) must be mirrored, which `.fast` elides —
+        // re-enter `.full`. `.full`: once recording has finished or aborted
+        // and no other hook is live, drop back to `.fast`. The back-edge
+        // instruction itself is never part of the recorded body (its prologue
+        // mirror ran before `onBackEdge` armed), so handing off here is
+        // byte-identical to an always-`.full` recording run. The trampoline
+        // parks `pc` before handing off, exactly as the `.suspended` path
+        // does: re-entry reloads `pc = frame.pc`, so without this the other
+        // mode would resume at `cur_pc` and re-run this back-edge.
+        if (mode == .fast) {
+            if (self.trace.isRecording()) return .{ .switch_mode_at = pc };
+        } else {
+            if (self.runFastPath()) return .{ .switch_mode_at = pc };
+        }
+        return .{ .dispatch_at = pc };
     }
 
     /// `R[b] .. R[c]` — string concatenation. Strings concatenate directly;

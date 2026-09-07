@@ -1527,7 +1527,7 @@ pub fn removeTrace(self: *TraceState, t: *Trace) void {
 /// The code array the dispatch fetch must execute for `proto`: its
 /// VM-local patched image when one exists, else canonical. The empty-map
 /// early-out makes an unpatched program's cost one counter load per call.
-pub fn codeFor(self: *const TraceState, proto: *const Proto) []const Instr {
+pub inline fn codeFor(self: *const TraceState, proto: *const Proto) []const Instr {
     return self.registry.entry_registry.codeFor(proto);
 }
 

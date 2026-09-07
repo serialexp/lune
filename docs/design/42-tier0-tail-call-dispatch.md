@@ -1,7 +1,8 @@
 # 42 — Tier-0 tail-call dispatch (per-op handlers, musttail)
 
-Status: DESIGN, codex-reviewed (gpt-5.6-sol, verdict sound-with-changes; all
-changes folded in below) — ready for implementation.
+Status: LANDED 2026-09-07 (conversion + §4.6 ABI widening + prologue
+trampolines in one arc; measured receipts in §9 below). Codex-reviewed
+design (gpt-5.6-sol, verdict sound-with-changes; all changes folded in).
 Owner seam: `src/interp.zig` only (the trace modules are consumers, unchanged).
 Authorized by Bart 2026-09-07 ("absolutely number 1") after the doc-41 perf
 investigation. This is the interpreter phase `src/dispatch.zig` has been the
@@ -290,3 +291,119 @@ ever changes).
   interpreted path — measured in §6.3 as part of the whole (prep commit
   deliberately does NOT pre-extract it).
 - R4 — wasm `return_call` engine performance is not a gate; correctness is.
+
+## 9. As landed (2026-09-07) — amendments and measured receipts
+
+The conversion landed as designed, plus three iterations the §6.3 battery
+forced. Everything below was measured with interleaved A/B/C (NEW vs
+pre-conversion HEAD a446bea vs pre-split shadow 8a9ef56), 9 reps + discarded
+warmup round, medians.
+
+### 9.1 Signature amendments (supersede §4.1's baseline)
+
+1. **`instr` rides as `*const Instr`, never by value.** A by-value 12-byte
+   `Instr` lowers to a byval STACK argument on wasm32, and wasm tail calls
+   reject stack arguments outright ("does not support tail calling with
+   stack arguments") — found by the T-7 build. `*const Instr` is
+   register-sized on every target; the pointee is the fetched code-image
+   element (same hot cache line).
+2. **§4.6 widening WAS justified, and by lanes, not just `vm`.** The
+   baseline signature measured +4.3% on pi_leibniz t0 with instruction
+   count at parity — the delta was L1-dcache LOAD PORT saturation (HEAD
+   already ran 3.0 loads/cycle; per-hop re-derivation of vm/frame/lanes
+   from `st` added ~4 loads/hop). Final uniform signature — exactly six
+   register-sized args, a full SysV x86-64 integer-register fit:
+   `fn (st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult`.
+   Handlers rebuild their window as
+   `.{ .tags = tags, .payloads = payloads, .n = st.regs.n }` (the `n` load
+   is dead-code-eliminated in hot handlers; kept correct for anything that
+   forwards the window to `regs.len()` consumers, e.g. trace.zig:2502).
+   `opCall`/`opRet` keep working through `st.regs` — their lanes
+   legitimately change mid-handler (frame push/pop) — and the general
+   `dispatchTail` re-derives lanes from `st.regs`, so every reload site
+   inherits the pre-widening staleness discipline unchanged.
+3. **Straight-line fetch = `instr + 1`.** At handler entry
+   `instr == &st.code[pc - 1]` invariantly, so fall-through handlers pass
+   `instrNext(instr)` to `dispatchTailFrom` and the opcode-load address is
+   ready at handler ENTRY instead of behind an `st.code` load — the fetch
+   chain the megafunction never paid (it kept `code` in a register). Pure
+   algebraic identity against the same cached image: identical staleness
+   semantics, no new hazard. Only handlers whose dispatch target is the
+   incoming `pc` qualify (28 sites); jumps, reloads, `&patch.orig`
+   presenters, and `chainEntry` (instr undefined) stay general.
+
+### 9.2 The call-free hot prologue (supersedes the §4.2 shape, order intact)
+
+The single biggest regression source (+37.7% → +23.2% → measured down to
+parity) was CALLABLE SITES in the inlined prologue: any `call` anywhere in a
+handler forces callee-saved push/pop pairs on EVERY hop, even when the call
+never executes (LLVM cannot shrink-wrap past the tail jump). Three
+extractions fixed it, each a handler-shaped musttail trampoline that does
+its cold work and re-enters the remaining prologue, preserving the §4.2
+step order exactly:
+
+- `gcTrampoline` — step (1)'s `collect()`.
+- `regionTrampoline` — ALL of step (5) behind the empty-map counter test:
+  even the A-vii-e.2 inline `observeFast` probe costs 3 callee-saved
+  registers of pressure in every fast handler when inlined; behind the
+  musttail, a regions-live program pays one extra tail jump per
+  instruction (still call-frame-free) and region-free programs pay one
+  `cmpl`.
+- The trampolines carry the fetch pointer through their (otherwise unused)
+  `instr` argument — valid across `collect()` because the collector is
+  non-moving and never swaps the cached image.
+
+Two toolchain facts (Z-1, add to §3's list):
+
+- `noinline` is part of the fn TYPE in 0.17.0-dev.813 and musttail requires
+  exact caller/callee type match — a noinline trampoline cannot be
+  musttail'd from plain handlers. `@branchHint(.cold)` as the first body
+  statement (std/lang.zig BranchHint) is the working anti-inline device,
+  and without it LLVM DOES re-inline small trampolines, dragging the
+  spills back in (measured on regionSlowTrampoline).
+- The shared dispatch must be Zig `inline fn` expanded into every handler
+  tail; LLVM declines to inline it as a plain shared function (263-byte
+  dispatch + `jmp dispatch` per handler = +37.7% pi_leibniz t0).
+
+Two same-arc de-inlining fixes on the reload path (visible only once the
+megafunction stopped hiding them): `reloadTopFrame` and
+`TraceState.codeFor`/`EntryRegistry.codeFor` are now `inline fn` — perf
+showed them as standalone symbols at 7.5% + 5.3% of recursive-fib after the
+conversion (in the megafunction both inlined into `execImpl`'s arms).
+
+### 9.3 Receipts (final shape, interleaved medians vs HEAD a446bea / shadow 8a9ef56)
+
+    bench          t0 vs HEAD  t0 vs SHADOW   jit vs HEAD  jit vs SHADOW
+    pi_leibniz       -10.8%       -7.3%          -0.9%        +1.4%
+    euler14-bit       -5.9%       -2.2%          -1.2%        +4.0%
+    recursive-fib     +1.9%       +6.5%          +0.4%        +3.4%
+    array3d           -4.2%       +1.1%          -3.9%        +1.1%
+    lua54             +1.7%       +3.1%          +1.7%        +5.1%
+    scimark-fft       -8.9%       -4.1%          +6.9%        +7.2%
+    grid_matmul       -4.6%       -2.4%          +1.1%        +4.9%
+
+- The structural goal is met: pi_leibniz t0 L1-icache misses 9.1K (HEAD
+  12–19.7K depending on that commit's layout luck; shadow 14–17K) — the
+  megafunction's block-placement lottery is gone, and t0 beats HEAD on 5
+  of 7 benches.
+- Honest residuals: recursive-fib/lua54 t0 ≈ +2% vs HEAD (call-boundary
+  hops still pay reload work the megafunction kept in registers);
+  scimark-fft jit +6.9% — profiled to the trace-chain seam
+  (`replayLedgerFrom` 13.7%, `driveDispatcherLedger` 5.7%,
+  `backEdgeEpilogue` 2.2%), i.e. R3's accepted per-back-edge call cost,
+  NOT the region trampoline (absent from the profile entirely).
+- R2 receipts: binary 14.45MB vs 14.14MB HEAD (+2.2%); cold ReleaseFast
+  build 40.8s vs HEAD's 46.3s — the conversion is FASTER to compile (the
+  ~48KB megafunction was the expensive thing).
+- Gates: `just test` green, hashgate 84/84 on BOTH legs (ReleaseFast +
+  Debug), `zig build wasm` green (T-7: musttail with the six-arg
+  signature compiles on wasm32+tail_call), T-1..T-6 in
+  `interp_dispatch_test.zig`.
+
+### 9.4 Follow-up lever on file (NOT landed — Bart's call)
+
+`omit_frame_pointer = true` on the mahina module removes the remaining
+`push rbp`/`pop rbp` per hop: measured ~1.5–3.5% additional t0 win
+(pi_leibniz 195.9ms vs 202.9ms same-shape A/B). Cost: fp-based `perf
+record -g` call graphs degrade (flat profiles and `--call-graph dwarf`
+unaffected). Left out of the conversion commit deliberately.
