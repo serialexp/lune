@@ -23,6 +23,7 @@ const AnchorKey = @import("trace_types.zig").AnchorKey;
 const ChargeKind = @import("trace_ir.zig").ChargeKind;
 const IrOp = @import("trace_ir.zig").IrOp;
 const IrInstr = @import("trace_ir.zig").IrInstr;
+const trace_ir = @import("trace_ir.zig");
 const Ref = @import("trace_ir.zig").Ref;
 const ObsType = @import("trace_ir.zig").ObsType;
 const PHI_INTERNAL = @import("trace_ir.zig").PHI_INTERNAL;
@@ -354,7 +355,14 @@ pub fn pathFromFrames(frames: []const InlineFrame, depth: u8) [MAX_INLINE_DEPTH]
 /// - `.continuation` — a nested-loop continuation (doc 15), armed by
 ///                  `maybeStartContinuation` at a non-header exit pc after an
 ///                  inner loop's loop-done exit. May close with a `.link`.
-pub const TraceKind = enum { root, side, continuation };
+/// - `.head`      — a FUNCTION-HEAD root (doc 44): armed by `maybeStartHead`
+///                  at a hot callee's pc 0 (anchor pc = `FUNC_HEAD_PC`
+///                  sentinel). Root-like in every root-only policy (LINNER,
+///                  peel refusal, no `.link` close); closes ONLY via the
+///                  one-shot `.terminal` — at a depth-0 `ret`
+///                  (return_interp) or a depth-0 direct self-call
+///                  (self_call_interp) — never via `.loop`.
+pub const TraceKind = enum { root, side, continuation, head };
 
 pub const RecordingSession = struct {
     pub const Options = struct { maxrecord: usize = 4096, peel: bool = true, optimize: bool = true };
@@ -461,6 +469,17 @@ pub const RecordingSession = struct {
     /// `.link`. Release invariant: `link_target != null ⇔ pending_link_provenance !=
     /// null`. Reset to `null` by `reset` (every abort/re-arm) alongside `link_target`.
     pending_link_provenance: ?ExitProvenance = null,
+    /// Doc 44 P0: a `.head` recording's one-shot close. Set by the depth-0
+    /// `ret` arm (`.return_interp`) or `recCall`'s depth-0 self-call arm
+    /// (`.self_call_interp`) — always BEFORE tier-0 executes that
+    /// instruction, so `resume_pc` (the instruction's own pc) is where
+    /// tier-0 resumes after a successful terminal exit and executes it
+    /// exactly once. `finalize` appends `.terminal{a=kind, aux=resume_pc}`
+    /// instead of `.loop`/`.link`, keeps EVERY defined depth-0 register in
+    /// the writeback φ rows (a ret/call may read temps above the locals
+    /// watermark), and caches the trace unoptimized (the link-trace
+    /// precedent). Reset to `null` by `reset`.
+    terminal_close: ?struct { kind: trace_ir.TerminalKind, resume_pc: u32 } = null,
     /// Nested-loop trace linking (doc 15, Phase 2): true iff this recording is a
     /// *continuation* — armed at a non-header exit pc by `maybeStartContinuation`,
     /// recording the outer body after an inner loop's loop-done exit. Only a
@@ -667,6 +686,10 @@ pub const RecordingSession = struct {
     pub fn close(self: *RecordingSession, regs: RegWindow) bool {
         if (!self.active) return false;
         self.close_requested = false;
+        // Doc 44: a terminal (one-shot head) close has no back-edge — no peel
+        // machinery, no loop-close fingerprint check. `finalize` appends the
+        // `.terminal` and the full writeback rows.
+        if (self.terminal_close != null) return true;
         if (self.peel) |*p| {
             if (self.instrs.items.len == p.mark_len) return false; // same arrival
             if (!self.finishPeel(p)) {
@@ -800,11 +823,19 @@ pub const RecordingSession = struct {
             // (doc 27) instead of aborting.
             .call => try self.recCall(instr, regs, proto, multret),
             .ret => if (self.inline_depth == 0)
-                // A `.ret` in the anchor frame closes the traced function itself —
-                // the loop's back-edge always closes the trace first, so this is
-                // only reached on an odd shape; abort rather than map results into a
-                // caller we never inlined.
-                self.abort(.cross_frame)
+                // Depth-0 return. A `.head` recording (doc 44) CLOSES here —
+                // the one-shot terminal, set before tier-0 executes the ret —
+                // unless the ret window is dynamic (`b == all_results` reads
+                // `multret_top`, which trace execution never sets: refused,
+                // codex round-1 change 4). A loop root still aborts (LLEAVE):
+                // it must not leave the loop.
+                (if (self.kind == .head)
+                    (if (instr.b == bytecode.all_results)
+                        self.abort(.nyi_opcode)
+                    else
+                        self.closeHeadTerminal(.return_interp))
+                else
+                    self.abort(.cross_frame))
             else
                 try self.recReturn(instr, multret),
             // `.halt` ends the top-level chunk; never a return from an inlined
@@ -2600,8 +2631,9 @@ pub const RecordingSession = struct {
         // Only a *side* or *continuation* links (LuaJIT's model). A `.root` recording
         // that reaches an inner `for_prep` aborts LINNER — byte-identical to the
         // pre-Phase-2 behaviour — so it never anchors a link trace at a real
-        // back-edge target.
-        if (self.kind == .root) return self.abort(.nyi_opcode);
+        // back-edge target. A `.head` root (doc 44) is root-like here: its body's
+        // loops record their own root traces.
+        if (self.kind == .root or self.kind == .head) return self.abort(.nyi_opcode);
 
         // Locate the matching `for_loop` (the forward jump target) and verify the
         // shape. `pc` is the post-increment pc, so `pc + instr.aux` is the `for_loop`
@@ -2743,9 +2775,10 @@ pub const RecordingSession = struct {
         // check on LLEAVE/LINNER penalties) has a low/zero remaining-trip
         // pattern; a root may then unroll it, which is strictly better than
         // both sides backing off forever. Deterministic — a pure abort count.
-        if (self.kind == .root) {
+        if (self.kind == .root or self.kind == .head) {
             // innerloopleft: an inner that PROVED it cannot root (LLEAVE budget
             // exhausted) can only ever be unrolled — no evidence overrides this.
+            // (doc 44: `.head` is root-like — same policy, same escape hatch.)
             if (self.context.unroll_while) {
                 self.unrolled_while = true;
                 return;
@@ -2832,6 +2865,18 @@ pub const RecordingSession = struct {
         // proto constants are rooted VM-lifetime via `loaded_chunks` in both root
         // walks, so a trace konst over them is always redundant — the H-2
         // sole-root hazard that used to force an abort here is unreachable.
+        // Doc 44 P0: a depth-0 DIRECT self-call in a `.head` recording closes
+        // the trace — the staged up-recursion analogue. Closed BEFORE any
+        // guard is emitted: on the terminal exit tier-0 re-executes the call
+        // generically, so no callee pin is needed (a different callee at this
+        // pc at run time simply gets called normally — correct either way).
+        // A dynamic argument window is refused: the re-executed call would
+        // read `reg_top` state that trace execution never maintains (the
+        // multret shadow is a RECORD-time resolution only).
+        if (self.kind == .head and self.inline_depth == 0 and cp == self.anchor.proto) {
+            if (instr.b == bytecode.all_results) return self.abort(.nyi_opcode);
+            return self.closeHeadTerminal(.self_call_interp);
+        }
         // A vararg callee's extra-args frame cursor isn't modelled on the trace.
         if (cp.is_vararg) return self.abort(.cross_frame);
         if (self.inline_depth >= MAX_INLINE_DEPTH) return self.abort(.too_deep);
@@ -3885,6 +3930,16 @@ pub const RecordingSession = struct {
     /// restores `base_off`. The result writes use *absolute* `reg_map` indices (the
     /// caller region is disjoint from and below the callee source region, so a
     /// single forward pass can read source then write dest without a buffer).
+    /// Doc 44 P0: request the one-shot close of a `.head` recording.
+    /// `cur_pc` is post-increment, so the terminating instruction's own pc —
+    /// where tier-0 resumes on a successful terminal exit and executes it
+    /// exactly once — is `cur_pc - 1`.
+    fn closeHeadTerminal(self: *RecordingSession, kind: trace_ir.TerminalKind) void {
+        std.debug.assert(self.kind == .head and self.inline_depth == 0);
+        self.terminal_close = .{ .kind = kind, .resume_pc = self.cur_pc - 1 };
+        self.close_requested = true;
+    }
+
     pub fn recReturn(self: *RecordingSession, instr: Instr, multret: ?u32) !void {
         const d = self.inline_depth - 1;
         const fr = self.frames[d];
@@ -4609,6 +4664,7 @@ pub const RecordingSession = struct {
         self.side_src = null;
         self.multret_top = null; // doc 27 §3a: never inherit a stale shadow
         self.link_target = null;
+        self.terminal_close = null;
         self.pending_link_provenance = null;
         self.inline_depth = 0;
         if (self.peel) |p| gpa.free(p.slots);

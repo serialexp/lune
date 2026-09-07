@@ -63,6 +63,27 @@ pub const InputKind = enum(u8) { upvalue, global, hash_cell, callee_upvalue, cal
 /// callee slots are bounded by the slab capacity check at entry.
 pub const UPVALUE_CELL_ANCHOR: u16 = std.math.maxInt(u16);
 
+/// Doc 44: the `AnchorKey.pc` of a FUNCTION-HEAD anchor (a hot-call trace,
+/// LuaJIT's `BC_FUNCF` analogue). A sentinel, deliberately NOT pc 0: a
+/// `while` at the top of a function body can anchor a loop at pc 0, and the
+/// two anchors must never share counters/gates/cache rows. The sentinel is
+/// anchor IDENTITY only — recording and every bytecode consumer use the real
+/// entry pc via `headEntryPc` — so any site that reads/executes bytecode at
+/// `anchor.pc` must check `isHeadAnchorPc` first (bridging, loop
+/// classification, and chain resume-pc derivation exclude head anchors
+/// outright, fail-closed; doc 44 D1).
+pub const FUNC_HEAD_PC: u32 = std.math.maxInt(u32);
+
+/// True iff `pc` is the function-head sentinel (not an executable pc).
+pub inline fn isHeadAnchorPc(pc: u32) bool {
+    return pc == FUNC_HEAD_PC;
+}
+
+/// The real bytecode pc a head anchor's recording/entry starts at.
+pub inline fn headEntryPc(pc: u32) u32 {
+    return if (pc == FUNC_HEAD_PC) 0 else pc;
+}
+
 /// One synthetic entry input the dispatch loop resolves and writes into the slab
 /// before trace entry. For `upvalue`/`global`: `source` is the upvalue index
 /// (`closure.upvalues[source]`) or the global key's constant-pool index

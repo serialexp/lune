@@ -45,7 +45,11 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
     for (rec.reg_map, 0..) |s, slot| {
         if (s.state != .def) continue;
         if (slot >= rec.anchor_num_registers) continue;
-        if (rec.alloc_count == 0 and
+        // Doc 44: a `.head` trace's φ rows are its TERMINAL writeback set —
+        // tier-0 resumes at the ret/self-call, which may read temps above the
+        // locals watermark (e.g. the summed result a `ret` returns) — so the
+        // watermark filter below must not drop any defined slot.
+        if (rec.terminal_close == null and rec.alloc_count == 0 and
             slot >= rec.locals_watermark and std.mem.indexOfScalar(u16, rec.entry_slots.items, @intCast(slot)) == null) continue;
         const steady_phi: Ref = if (rec.peel) |p| blk: {
             if (slot < p.slots.len) {
@@ -61,7 +65,11 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
             .ty = rec.instrs.items[s.ref].ty,
         });
     }
-    if (rec.link_target) |lt| {
+    if (rec.terminal_close) |tc| {
+        // Doc 44: the one-shot head-trace close — kind tag in `a`, the real
+        // resume pc in `aux`.
+        try rec.instrs.append(gpa, .{ .op = .terminal, .a = @intFromEnum(tc.kind), .aux = @intCast(tc.resume_pc) });
+    } else if (rec.link_target) |lt| {
         try rec.instrs.append(gpa, .{ .op = .link, .aux = @intCast(lt) });
     } else {
         try rec.instrs.append(gpa, .{ .op = .loop });
@@ -71,7 +79,10 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
     const consts = rec.consts.items;
     const entry = rec.entry_slots.items;
 
-    const fields: tropt.Optimized = if (options.optimize and rec.link_target == null and rec.peel == null)
+    // Doc 44: head (terminal-closed) traces cache UNOPTIMIZED in P0, the
+    // link-trace precedent — tropt's φ handling is loop-carried-shaped and
+    // has not been audited for the one-shot writeback rows.
+    const fields: tropt.Optimized = if (options.optimize and rec.link_target == null and rec.peel == null and rec.terminal_close == null)
         tropt.optimize(gpa, instrs, consts) catch |e| switch (e) {
             error.OutOfMemory => try tropt.dupe(gpa, instrs, consts, entry),
         }

@@ -1,6 +1,7 @@
 # 44 — call anchors and return tracing (making recursion trace at all)
 
-Status: draft, not yet implemented — codex-reviewed (gpt-5.6-sol, verdict
+Status: partial — P0 recording layers landed (head anchors record + close);
+head *entry*/execution outstanding. Codex-reviewed (gpt-5.6-sol, verdict
 sound-with-changes; all 8 required changes folded in, ledger at bottom)
 Owner: Bart
 Last updated: 2026-09-08
@@ -18,10 +19,29 @@ to Done once everything inside a phase is checked.
 
 ### Done
 
-_(nothing yet)_
+- [x] **P0 layers 1–3 — record a head trace at all.** The parameterized
+      `.terminal` IR op (`TerminalKind{return_interp, self_call_interp}`,
+      wire 86); `FUNC_HEAD_PC` sentinel identity + fail-closed classifier
+      audit; `hotcall` counting in `opCall` (tick-advancing, vararg refused,
+      counts successful entries only) with the `.fast`-mode park-and-flip so
+      the `.full` prologue's step (10b) consumer arms at callee pc 0;
+      recorder kind `.head` closing at BOTH depth-0 terminators (`ret` and
+      direct self-call; `all_results` refused at both); finalize keeps every
+      defined depth-0 slot as φ writeback rows and terminates with
+      `.terminal` (cached unoptimized). Recorder-shape tests (return_interp,
+      fib self_call_interp, vararg never counts, multret forwarding aborts);
+      all gates green (test, hashgate ×2, wasm, viz, boundaries).
 
 ### Outstanding
 
+- [ ] **Phase 0 — remaining: execute + enter.** Terminal-exit directive
+      (resume at `aux`, NO strike/side-trace/chain accounting), tier-1a
+      dispatch of head traces, `jfunc_head` bytecode op + entry-patch kind
+      (function-entry deopt snapshot), native `.terminal` lowering,
+      `traceser.format_version` bump + anchor-kind serialization, ten-leg
+      e2e (fib steady state), fib/binary-trees receipts. Exit target:
+      recursive-fib records a non-base trace and re-enters through the
+      patched head (res% > 0 from 0).
 - [ ] **Phase 0 — the minimum viable function-entry tracing milestone.**
       Hot-call counting (advancing the gate tick), typed head anchors,
       `pending_call_anchor` arming (carrying `call_seq`, cleared on every

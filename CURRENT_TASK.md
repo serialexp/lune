@@ -21,6 +21,59 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-08d — doc 44 P0 recording layers LANDED (steps 1–5 partial)
+
+Steps 1–4 of the list below plus the opCall/prologue halves of step 5 are in
+and gated (test 1261 green, hashgate 84×2, wasm, viz 69, boundaries). Key
+find of the session: `runFastPath` — the pending call anchor MUST hold the
+exec loop in `.full` (and opCall parks-and-flips with `.switch_mode` when it
+goes hot under `.fast`), or the step-(10b) consumer never runs and nothing
+arms. Recorder-shape tests prove: hot non-recursive call → head trace ending
+`.terminal return_interp` (+φ rows); fib → `.terminal self_call_interp`;
+vararg never counts; `return g()` multret forwarding aborts. Three old tests
+pinning loop-anchor cache shapes with 300–400 calls now park
+`hotcall = maxInt(u32)` (head traces of hot callee bodies are correct new
+behavior, but those tests pin the LOOP anchor).
+
+NEXT (rest of P0, in order): terminal-exit directive (resume at `aux`, NO
+strike/side/chain accounting — interp.zig:3361 must not see terminal exits),
+tier-1a head dispatch, `jfunc_head` op + entry-patch kind (steps 5c/6),
+native `.terminal` lowering (step 7), exclusion-site kind tests (step 8),
+traceser bump (step 9), ten-leg fib e2e + receipts (step 10).
+
+## Status 2026-09-08c — doc 44 arc STARTED (call anchors + return tracing); P0 in flight
+
+Bart picked next arc: "return tracing / up-recursion — it'd be nice if all
+the things start tracing at least." Diagnosis done (recursive-fib records
+NOTHING — zero back-edge anchors; binary-trees recursion + one aliased_input
+site; euler14/sparse are OTHER arcs' levers). Doc 44 written + codex round 1
+folded (sound-with-changes, 8 changes) + committed (6920926). Read
+`docs/design/44-call-anchors-and-return-tracing.md` FIRST — it has the full
+P0 scope, the terminal-exit contract, and the review ledger.
+
+P0 implementation order (work down this list):
+1. trace_ir: `.terminal` op (wire 86, a=TerminalKind, aux=resume pc);
+   pins in traceser_test (count 87) + viz mirror.
+2. trace_types/trace_code: FUNC_HEAD_PC sentinel, anchorKind/entryPc
+   helpers, TerminalKind enum, `hotcall` config (2*hotloop).
+3. trace.zig: onCallEntry (counters + tick advance + gates),
+   pending_call_anchor {key, base, call_seq}, arm-for-head.
+4. trace_recorder: TraceKind.head (root-like audit: LINNER 2730, peel),
+   depth-0 ret → terminal(.return_interp), depth-0 self-call →
+   terminal(.self_call_interp), all_results refusal, stack-depth guard.
+5. interp: opCall .function hook (after reloadTopFrame, vararg refused),
+   prologue arming (before mirror; bypass set; cleared on unwind/abort),
+   terminal-exit directive (NOT a side exit — no strike accounting),
+   opJFuncHead + mirror arm.
+6. entry registry/link: patch KIND on EntryPatch; resolvePatchPc head arm.
+7. irinterp/nativegen/finalize: .terminal exec (flush + terminal result),
+   native terminal stub, head finalization (no loop φs), assertWellFormed.
+8. Exclusions: classifyBridgeCandidate (trace_code:284), loop classifier
+   (trace:163), chaining resume-pc (trace_chain:264) — kind checks.
+9. traceser format_version bump + anchor kind.
+10. Tests (recorder shape + ten-leg fib e2e) + gates + fib/binary-trees
+    receipts.
+
 ## Status 2026-09-08b — doc 43 P5 LANDED + gated; arc COMPLETE (v1 scope)
 
 P5 (closed-cell upvalue stores, scalar v1) landed per doc 43 §8, closing the

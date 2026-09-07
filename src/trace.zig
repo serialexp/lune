@@ -78,6 +78,21 @@ pub const EntryGuard = trace_code.EntryGuard;
 pub const InputKind = trace_code.InputKind;
 pub const InputSeed = trace_code.InputSeed;
 pub const UPVALUE_CELL_ANCHOR = trace_code.UPVALUE_CELL_ANCHOR;
+pub const FUNC_HEAD_PC = trace_code.FUNC_HEAD_PC;
+
+/// Doc 44: a hot function head waiting for the dispatch prologue to arm a
+/// `.head` recording at the callee's pc 0. See `TraceState.onCallEntry` /
+/// `maybeStartHead`.
+pub const PendingCallAnchor = struct {
+    proto: *const Proto,
+    /// The callee frame's absolute slab base (the head trace's anchor base).
+    base: usize,
+    /// The activation stamp from `pushFrame` — pins the pending to exactly
+    /// the frame that went hot.
+    call_seq: u64,
+};
+pub const isHeadAnchorPc = trace_code.isHeadAnchorPc;
+pub const headEntryPc = trace_code.headEntryPc;
 pub const NativeSeedCtx = trace_code.NativeSeedCtx;
 
 pub const Ref = trace_ir.Ref;
@@ -474,6 +489,14 @@ pub const TraceConfig = struct {
     peel: bool = true,
     /// Back-edge count at which a loop header becomes a trace anchor.
     hotloop: u32 = 56,
+    /// Doc 44: call count at which a Lua function head becomes a trace anchor.
+    /// Default `2 * hotloop` — LuaJIT's ½-weight for calls (`HOTCOUNT_CALL=1`
+    /// vs `HOTCOUNT_LOOP=2`) expressed as a separate threshold so the loop
+    /// hot-count pre-filter stays untouched. Counted in `onCallEntry` on
+    /// SUCCESSFUL Lua-callee entries only (tier-0's own depth/capacity checks
+    /// already passed), a pure function of executed calls — no addresses, no
+    /// time (the determinism rule, doc 44 D7).
+    hotcall: u32 = 112,
     /// Maximum IR instructions in one trace before aborting (`too_long`).
     maxrecord: u32 = 2000,
     /// A trace entry that commits at least this many iterations is "doing real
@@ -1364,6 +1387,15 @@ pub const TraceState = struct {
     /// reaches it, capturing the prime branch of that same iteration. Cleared by
     /// `maybeStartReplaySide` (consumed) or `clearPendingExitAnchor` (frame unwind).
     pending_replay_anchor: ?AnchorKey = null,
+    /// **Doc 44 P0.** When non-null, a Lua function head went hot in `opCall`
+    /// (`onCallEntry`) and a `.head` recording should arm the moment the
+    /// dispatch prologue reaches the callee's pc 0 — the `.full`-pinned
+    /// prologue-activation discipline of the two pendings above. `call_seq`
+    /// pins the exact activation (stamped by `pushFrame`), so a pending left
+    /// behind by an error/unwind can never attach to a later frame: the
+    /// consumer clears the pending on the FIRST prologue it sees, match or
+    /// mismatch (self-cleaning; no unwind hook needed).
+    pending_call_anchor: ?PendingCallAnchor = null,
     /// Per-trace execution logs for the visualizer (`execlog.zig`), populated only
     /// when `config.record_exec_log`. Keyed by `trace_id` (cache index). Empty and
     /// untouched on the normal JIT path.
@@ -2919,6 +2951,46 @@ pub const TraceState = struct {
         self.rec.recordInstr(instr, regs, proto, pc, resolved);
         self.consumeRecordingAbort();
         if (self.rec.close_requested) self.closeTrace(regs);
+    }
+
+    /// Doc 44: count a successful Lua-callee entry toward the callee's
+    /// function-head anchor. Called from `opCall`'s `.function` arm AFTER the
+    /// frame push + `reloadTopFrame` (failed calls never count). Advances the
+    /// gate-cooldown `tick` (review round 1: a call-only recursive workload
+    /// whose recording aborts must still see cooldowns elapse). Vararg protos
+    /// are refused here — head arming bypasses `recCall`'s vararg rejection,
+    /// so the bar must sit at the counting site (doc 44 D2).
+    pub fn onCallEntry(self: *TraceState, proto: *const Proto, base: usize, call_seq: u64) void {
+        self.tick +%= 1;
+        if (!self.config.enabled) return;
+        if (self.rec.active) return; // a recording owns the stream; don't compete
+        if (proto.is_vararg) return;
+        const key = AnchorKey{ .proto = proto, .pc = FUNC_HEAD_PC };
+        if (self.hasTrace(key)) return; // entry is the patch's job (doc 44 D6)
+        if (self.recordingBarred(key)) return;
+        const gop = self.counters.getOrPut(self.gpa, key) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* +|= 1;
+        if (gop.value_ptr.* < self.config.hotcall) return;
+        gop.value_ptr.* = 0; // reset so a declined/aborted arm re-warms, the loop discipline
+        self.pending_call_anchor = .{ .proto = proto, .base = base, .call_seq = call_seq };
+    }
+
+    /// Doc 44: dispatch-prologue consumer of `pending_call_anchor` (the
+    /// `maybeStartContinuation` twin). Returns true iff a `.head` recording
+    /// armed at this prologue step. ALWAYS clears the pending — a mismatch
+    /// means the pending activation is gone (error/unwind between set and
+    /// consume), and `call_seq` makes reuse impossible by construction.
+    pub fn maybeStartHead(self: *TraceState, proto: *const Proto, pc: u32, base: usize, call_seq: u64) bool {
+        const pending = self.pending_call_anchor orelse return false;
+        self.pending_call_anchor = null; // consume-or-discard, never linger
+        if (pc != 0 or pending.proto != proto or pending.call_seq != call_seq or pending.base != base) return false;
+        if (self.rec.active) return false;
+        self.arm(proto, FUNC_HEAD_PC);
+        if (!self.rec.active) return false; // reset OOM-declined
+        self.rec.kind = .head;
+        self.rec.anchor_abs_base = pending.base;
+        return true;
     }
 
     fn arm(self: *TraceState, proto: *const Proto, target_pc: u32) void {

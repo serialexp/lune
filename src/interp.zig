@@ -2143,7 +2143,8 @@ pub const Vm = struct {
     inline fn runFastPath(self: *const Vm) bool {
         return !(self.suspend_ctl != null or self.record_safepoint_lines or
             self.trace.isRecording() or self.trace.pending_exit_anchor != null or
-            self.trace.pending_replay_anchor != null);
+            self.trace.pending_replay_anchor != null or
+            self.trace.pending_call_anchor != null);
     }
 
     // ------------------------------------------------------------------------
@@ -2459,6 +2460,15 @@ pub const Vm = struct {
         // first op.
         if (mode == .full and self.trace.pending_replay_anchor != null) {
             self.trace.maybeStartReplaySide(st.proto, @intCast(cur));
+        }
+        // (10b) Function-head anchor (doc 44 P0): a hot call flagged in
+        // `opCall` arms a `.head` recording the moment the prologue reaches
+        // the callee's pc 0. Same `.full`-only, before-the-mirror placement
+        // as (9)/(10) so pc 0's instruction is the recording's first op.
+        // `maybeStartHead` consumes-or-discards the pending unconditionally
+        // (`call_seq`-pinned), so a stale pending self-cleans right here.
+        if (mode == .full and self.trace.pending_call_anchor != null) {
+            _ = self.trace.maybeStartHead(st.proto, @intCast(cur), st.base, st.frame.call_seq);
         }
         // (11) Recording mirror — `.full` only. Mirrors this
         // instruction (and its observed operand types) into the trace
@@ -4298,6 +4308,22 @@ pub const Vm = struct {
                         st.frame.pc = pc;
                         self.pushFrameVararg(cl, callee_base, instr.a, instr.c, va_base, va_count) catch |e| return parkErr(st, e);
                         reloadTopFrame(st);
+                        // Doc 44: count this SUCCESSFUL Lua-callee entry
+                        // toward the callee's function-head anchor (after the
+                        // push — failed calls never count). A hot verdict
+                        // sets `pending_call_anchor`; the very next prologue
+                        // (the dispatchTail below lands on callee pc 0) arms
+                        // it under `.full` — never here (T-2/T-3 discipline).
+                        self.trace.onCallEntry(cp, st.base, st.frame.call_seq);
+                        // A hot verdict under `.fast` needs the `.full`
+                        // prologue's consumer (step 10b) at callee pc 0 —
+                        // park and flip, exactly the back-edge arming
+                        // discipline (`runFastPath` holds `.full` while the
+                        // pending exists; it is consumed on the very next
+                        // prologue, so the stint is one instruction on a
+                        // mismatch).
+                        if (mode == .fast and self.trace.pending_call_anchor != null)
+                            return .switch_mode;
                         // Reloaded onto the callee frame; tail-dispatch its
                         // first instruction with a full prologue
                         // (GC/seq/suspend/recording) — exactly one prologue at

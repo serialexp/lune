@@ -20,6 +20,7 @@ const Scratch = struct {
     anchor_num_registers: u16 = 1,
     locals_watermark: u16 = 1,
     link_target: ?u32 = null,
+    terminal_close: ?struct { kind: ir.TerminalKind, resume_pc: u32 } = null,
     pending_link_provenance: ?types.ExitProvenance = null,
     rec_path_ok: bool = true,
     anchor: types.AnchorKey = undefined,

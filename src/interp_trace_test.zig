@@ -2182,6 +2182,10 @@ test "doc 19: a static trace inlines a loaded callee (flipped recCall gate)" {
     vm.trace.config.execute = false;
     vm.trace.config.optimize = false;
     vm.trace.config.hotloop = 4;
+    // 300 calls would also trip the doc-44 function-head anchor (hotcall=112)
+    // and add a head trace of `g`'s body — this test pins the LOOP anchor's
+    // cache shape, so park hot-call counting out of reach.
+    vm.trace.config.hotcall = std.math.maxInt(u32);
     vm.trace.config.record_aborts = true; // populate abort_log so we can read the reason
     var buf: [256]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
@@ -4401,6 +4405,9 @@ test "recorder (upvalue cell, P5): two access paths to ONE cell share the uref a
     // `x`. The retry records the first path as the class WRITER; the second path
     // resolves the same cell → same uref, plus a verify=true seed that re-proves
     // the record-time aliasing at every future entry (the s1-into-f2 trap).
+    // 400 `setter` calls would also head-trace its body (doc 44); park hot-call
+    // counting — this test pins the LOOP anchor's cache shape.
+    vm.trace.config.hotcall = std.math.maxInt(u32);
     var chunk = try runForTrace(&vm, gpa,
         \\local function make()
         \\  local x = 0
@@ -4491,6 +4498,10 @@ test "recorder (upvalue cell, P5): an hload-backed (computed) callee's upvalue a
     // `t.inc` is an hload'd function field (P2 inlines it fine), but its body
     // touches an upvalue: the access path needs a slot_load-backed callee to be
     // re-resolvable at entry, and an hload result is not one — abort, no trace.
+    // 400 `t.inc()` calls would also head-trace its body (doc 44, a closed-cell
+    // RMW that records fine as a head); park hot-call counting — this test pins
+    // the LOOP anchor's abort.
+    vm.trace.config.hotcall = std.math.maxInt(u32);
     var chunk = try runForTrace(&vm, gpa,
         \\local function make()
         \\  local c = 0
@@ -4589,4 +4600,126 @@ test "upvalue cell P5 end-to-end: mixed ustore + hstore in one loop (C1 sinking 
         \\local acc = { sum = 0 }
         \\print(f(acc, 500), acc.sum)
     , "125250\t125250\n");
+}
+
+// ---------------------------------------------------------------------------
+// Doc 44 P0: function-head anchors — hot-call counting → `.head` recording →
+// `.terminal` close. Recording shape only: head *entry* (the `jfunc_head`
+// patch) is P0 layer 4 and gets its own end-to-end tests when it lands.
+// ---------------------------------------------------------------------------
+
+/// `runForTrace` with a small `hotcall`, so a handful of straight-line calls
+/// arms a function-head anchor. The default (112) would need an outer loop,
+/// and that loop's own back-edge anchor would go hot first and muddy the
+/// cache-shape assertions below.
+fn runForHeadTrace(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8) !compiler.Chunk {
+    vm.trace.config.hotcall = 4;
+    return runForTrace(vm, gpa, source, true);
+}
+
+test "recorder (head, doc 44 P0): a hot non-recursive call records a head trace closed by terminal/return_interp" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // Straight-line calls only — no loops, so the ONLY possible anchor is the
+    // function head. Entry #4 trips `hotcall`, the pending anchor is consumed
+    // at `add`'s pc 0, and the depth-0 `ret` closes the trace with a terminal.
+    var chunk = try runForHeadTrace(&vm, gpa,
+        \\local function add(a, b) return a + b end
+        \\local r = 0
+        \\r = add(r, 1)
+        \\r = add(r, 2)
+        \\r = add(r, 3)
+        \\r = add(r, 4)
+        \\r = add(r, 5)
+        \\print(r)
+    );
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expectEqual(@as(u32, 0), vm.trace.record_gate.count());
+    const t = vm.trace.registry.cache.items[0];
+    // Head identity: the sentinel pc, never bytecode pc 0.
+    try testing.expectEqual(trace.FUNC_HEAD_PC, t.code.anchor.pc);
+    // The terminator is the terminal, not a back-edge `loop`.
+    const last = t.code.instrs[t.code.instrs.len - 1];
+    try testing.expectEqual(trace.trace_ir.IrOp.terminal, last.op);
+    try testing.expectEqual(
+        @intFromEnum(trace.trace_ir.TerminalKind.return_interp),
+        last.a,
+    );
+    // The end state publishes through φ writeback rows: `a + b` defines at
+    // least one depth-0 slot the resumed `ret` will read.
+    var saw_phi = false;
+    for (t.code.instrs) |ins| {
+        if (ins.op == .phi) saw_phi = true;
+    }
+    try testing.expect(saw_phi);
+}
+
+test "recorder (head, doc 44 P0): fib-shaped recursion records a head trace closed by terminal/self_call_interp" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // fib(12) → fib(11) → fib(10) → fib(9): the 4th entry (n = 9) arms the
+    // head, takes the recursive branch, and the depth-0 self-call closes the
+    // trace with `self_call_interp` — tier-0 re-executes the call generically.
+    var chunk = try runForHeadTrace(&vm, gpa,
+        \\local function fib(n)
+        \\  if n < 2 then return n end
+        \\  return fib(n - 1) + fib(n - 2)
+        \\end
+        \\print(fib(12))
+    );
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expectEqual(@as(u32, 0), vm.trace.record_gate.count());
+    const t = vm.trace.registry.cache.items[0];
+    try testing.expectEqual(trace.FUNC_HEAD_PC, t.code.anchor.pc);
+    const last = t.code.instrs[t.code.instrs.len - 1];
+    try testing.expectEqual(trace.trace_ir.IrOp.terminal, last.op);
+    try testing.expectEqual(
+        @intFromEnum(trace.trace_ir.TerminalKind.self_call_interp),
+        last.a,
+    );
+}
+
+test "recorder (head, doc 44 P0): a vararg callee never counts and never arms" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `onCallEntry` refuses vararg protos outright (doc 44 D2): no counter,
+    // no pending anchor, no gate strike — six entries leave the cache empty.
+    var chunk = try runForHeadTrace(&vm, gpa,
+        \\local function f(...) return 1 end
+        \\f() f() f() f() f() f()
+        \\print("done")
+    );
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
+    try testing.expectEqual(@as(u32, 0), vm.trace.record_gate.count());
+    try testing.expect(!vm.trace.isRecording());
+}
+
+test "recorder (head, doc 44 P0): a depth-0 multret-forwarding return aborts — no head trace" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `return g()` forwards ALL results: `multret_top` is dynamic VM state the
+    // trace never maintains, so the head close refuses it (abort, gate strike).
+    // Only four `f` entries, so `g`'s own counter (3 counted entries — the one
+    // during recording is skipped) never goes hot and can't pollute the cache.
+    var chunk = try runForHeadTrace(&vm, gpa,
+        \\local function g() return 1, 2 end
+        \\local function f() return g() end
+        \\f() f() f() f()
+        \\print("done")
+    );
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.record_gate.count() >= 1);
+    try testing.expect(!vm.trace.isRecording());
 }
