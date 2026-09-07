@@ -64,8 +64,19 @@ iterations native at ~5.4 cycles/iter (`--jit-stats`). Remaining doc-43
 bullets are the knowing deferrals (heap ustore, close_upvalues/.closure,
 open-cell stores, method-load hoisting) + two P0 open questions.
 
-Next: full bench board re-run for the campaign map, then pick the next arc
-from it (nbody backend seams / return tracing per the map above).
+Board re-run (2026-09-08, rev e0c3b3e, reps=5 — `bench/results/
+20260908-075259-e0c3b3e.tsv`, vs last full board bf164e8): **array3d
+31.1× → 1.7× (res 0% → 72.3%)** — the arc's headline. Every other row flat
+within noise (±0.3×; spectral-norm 14.7→13.5 and repack 9.6→9.1 slightly
+better, likely run variance). Worst remaining, with res%:
+  nbody 22.2× (67.1%) · recursive-fib 21.3× (0%) · scimark-sparse 21.2×
+  (0%) · euler14-bit 20.5× (0%) · scimark-fft 19.7× (26.0%) · nsieve-bit-fp
+  17.3× (13.7%) · spectral-norm 13.5× (71.9%) · scimark-lu 11.5× (41.1%) ·
+  repack 9.1× (8.5%)
+Next arc: pick from the campaign map — (2) nbody backend seams (heap-φ
+writeback etc., 67% res but 22× ⇒ the traced part is slow or the 33%
+dominates), (3) return tracing / up-recursion (recursive-fib, binary-trees,
+euler14-bit at 0% res), or diagnose the 0%-res scimark-sparse abort.
 
 ## Status 2026-09-08a — doc 43 P4 LANDED + gated; array3d 0% → 97.4% native; P5 optional
 
