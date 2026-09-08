@@ -118,6 +118,15 @@ pub const ExecResult = struct {
     /// Round-6 exactness: the terminal edge is measured, never reconstructed from
     /// the transition count (see `TraceState.silentCellOwner`).
     silent_last_cell: u64 = 0,
+    /// Doc 44 D11: how many REAL VM frames the native run pushed via the
+    /// self-call push helper (`nativeSelfCallPush`). Nonzero breaks the old
+    /// episode invariant "a native run never changes the VM frame stack":
+    /// BOTH dispatcher consumers must branch on it FIRST — before the silent
+    /// drain, the seed-decline handlers, the D10 burst consumer, and every
+    /// scalar head consumer — because those all reason against the ENTRY
+    /// activation while the top frame is now the descent's leaf. Native only;
+    /// tier-1a leaves it 0 (defaulted, construction sites untouched).
+    pushed_frames: u64 = 0,
 };
 
 /// 2.3c-2c (doc 17): which exit-materialization SITE appended a ledger entry —

@@ -772,6 +772,13 @@ pub const NativeResult = extern struct {
     /// round-robin that neither a repeated-parent ring nor two concurrently live
     /// promoted cycles obey.
     silent_last_cell: u64,
+    /// Doc 44 D11: count of successful native self-call frame pushes this run
+    /// (the `.terminal(self_call_interp)` push epilogue increments it after
+    /// `nativeSelfCallPush` returns PUSH_OK). At the ABI TAIL by the frozen-
+    /// offset rule: every scalar field's `@offsetOf` is baked into exit stubs,
+    /// so this may only ever be appended, never inserted. The wrapper inits it
+    /// to 0 and marshals it into `ExecResult.pushed_frames`.
+    pushed_frames: u64,
 };
 
 /// Host-staged bounds/state for a native call that may enter a promoted silent
@@ -808,6 +815,9 @@ comptime {
     std.debug.assert(@offsetOf(NativeResult, "silent_active") == @sizeOf(NativeResultLedgerLayout));
     std.debug.assert(@offsetOf(NativeResult, "silent_cum") == @offsetOf(NativeResult, "silent_active") + 6 * @sizeOf(u64));
     std.debug.assert(@offsetOf(NativeResult, "silent_last_cell") == @offsetOf(NativeResult, "silent_active") + 7 * @sizeOf(u64));
+    // Doc 44 D11: `pushed_frames` is appended at the very tail — nothing that
+    // was baked before it may have moved.
+    std.debug.assert(@offsetOf(NativeResult, "pushed_frames") == @offsetOf(NativeResult, "silent_last_cell") + @sizeOf(u64));
 }
 
 pub const SilentSummaryCell = extern struct {
@@ -1041,6 +1051,7 @@ pub const CompiledTrace = struct {
             .cur_zero_run = silent.cur_zero_run,
             .silent_cum = 0,
             .silent_last_cell = 0,
+            .pushed_frames = 0,
         };
         if (self.trampoline_entry) |tramp| {
             const f: *const TrampolineFn = @ptrFromInt(tramp);
@@ -1136,6 +1147,7 @@ pub const CompiledTrace = struct {
             .cur_zero_run = result.cur_zero_run,
             .silent_cum = result.silent_cum,
             .silent_last_cell = result.silent_last_cell,
+            .pushed_frames = result.pushed_frames,
         };
     }
 
@@ -7376,6 +7388,71 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     const flush_kind = kinds[@intCast(s.store_ref)];
                     try flushSlot(a, @as(i32, s.slot), flush_kind, placeOfRef(alloc, @intCast(s.store_ref)));
                 }
+                // Doc 44 D11: native frame push at the self-call terminal — a
+                // LOWERING decision only (recording and tier-1a keep the interp
+                // terminal; the ten-leg matrix keeps its D10 shape). The flush
+                // above already materialized the caller window, including the
+                // argument registers the callee layout reads. Call the runtime
+                // push helper; on PUSH_OK it has pushed a REAL VM frame (real
+                // `pushFrameVararg`: depth, stack_top, call_seq stream, region
+                // context) and refreshed the episode ctx, so this page shifts
+                // its lane pointers onto the pushed window (self-call ⇒ same
+                // proto ⇒ compile-time `num_registers`) and re-enters its own
+                // body: `entry_rbx` re-snapshots the unchanged rbx (harmless),
+                // then the seed prologue + hoisted entry-type guards re-run
+                // against the NEW activation — the ordinary_entry replica
+                // (`linked_loop_done = 0`) keeps the materialization mode
+                // clean. Any refusal falls through to the plain terminal exit
+                // below, byte-identical to pre-D11 (tier-0 re-executes the
+                // call generically, raising any overflow error itself).
+                var no_push: ?x64.Label = null;
+                const term = t.instrs[i];
+                if (@as(trace.TerminalKind, @enumFromInt(@as(u16, @intCast(term.a)))) == .self_call_interp) {
+                    if (seed_ctx) |ctx| if (ctx.self_call_push_fn) |push_fn| {
+                        const decline = try a.label();
+                        // C-ABI bracket: verbatim the seed-prologue protocol.
+                        // rdi/rsi/rdx are the only live caller-saved regs here
+                        // (every home was just flushed to memory), rbx is
+                        // callee-saved, and three pushes take rsp from ≡8
+                        // (mod 16, the body invariant) to ≡0 — aligned call.
+                        try a.push(.rdi);
+                        try a.push(.rsi);
+                        try a.push(.rdx);
+                        // SysV args: rdi = &ctx (per-VM, heap-stable), rsi =
+                        // &t (committed traces are heap-allocated + immutable),
+                        // rdx = the terminal's resume pc (the `.call` index)
+                        // BY VALUE. `push_fn` is installed once at VM init and
+                        // never reassigned — safe to bake.
+                        try a.movRegImm64(.rdi, @bitCast(@as(u64, @intFromPtr(ctx))));
+                        try a.movRegImm64(.rsi, @bitCast(@as(u64, @intFromPtr(t))));
+                        try a.movRegImm64(.rdx, @bitCast(@as(u64, @intCast(term.aux))));
+                        try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(push_fn))));
+                        try a.callReg(.rax);
+                        try a.pop(.rdx);
+                        try a.pop(.rsi);
+                        try a.pop(.rdi);
+                        // Two-state result, fail closed: PUSH_OK descends,
+                        // EVERYTHING else (PUSH_DECLINE or a value outside the
+                        // grammar) runs the plain terminal exit.
+                        try a.cmpRegImm32(.rax, @intCast(NativeSeedCtx.PUSH_OK));
+                        try a.jcc(.ne, decline);
+                        // Count the push for the dispatcher's pushed-frame
+                        // consumer (a successful push appends NO ledger row —
+                        // only the eventual real exit publishes a terminal).
+                        try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "pushed_frames"));
+                        try a.addRegImm32(.rax, 1);
+                        try a.movMemReg(.rdx, @offsetOf(NativeResult, "pushed_frames"), .rax);
+                        // Shift the SoA lanes onto the pushed callee window:
+                        // tags scale 1, payloads scale 8.
+                        const nreg: i32 = t.anchor.proto.num_registers;
+                        try a.addRegImm32(.rdi, nreg);
+                        try a.addRegImm32(.rsi, nreg * 8);
+                        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 0);
+                        try a.jmp(body_entry);
+                        no_push = decline;
+                    };
+                }
+                if (no_push) |l| a.bind(l);
                 try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
                 try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
                 try emitLedgerAppend(a, trace_id, .head_terminal);

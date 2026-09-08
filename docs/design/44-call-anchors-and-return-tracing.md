@@ -1,10 +1,12 @@
 # 44 — call anchors and return tracing (making recursion trace at all)
 
 Status: partial — P0 complete, P1a (D8 head siblings), P1b (D9 quiet head
-episode + S1/S2/S4), and P4 slice 1 (D10 head-sibling exit-branch patching)
-landed; fib jit 317 ms / binary-trees ~368 ms with 100% head coverage. The
-remaining fib gap is the per-call episode turnstile itself — P4's native
-frame push (true up-recursion) owns it.
+episode + S1/S2/S4), P4 slice 1 (D10 head-sibling exit-branch patching), and
+P4 slice 2 (D11 native frame push — true up-recursion on the descent side)
+landed; fib jit 263.5 ms / binary-trees 287.7 ms with 100% head coverage.
+The remaining fib gap (35× vs LuaJIT) is the return side: every `ret` is
+tier-0 and each post-leaf parent resumption re-opens an episode — P3
+down-recursion (+ P2 RETF) owns it.
 Codex-reviewed ×5 (gpt-5.6-sol, all sound-with-changes, every required change
 folded; ledger at bottom)
 Owner: Bart
@@ -157,17 +159,44 @@ to Done once everything inside a phase is checked.
       D10 changes tiering/receipt streams on native legs — wasm, viz,
       boundaries).
 
+- [x] **P4 slice 2 — native frame push at the self-call terminal
+      (D11).** Landed per the round-5-amended design: nativegen-only
+      lowering of `.terminal(self_call_interp)` (flush → save/restore
+      rdi/rsi/rdx around the baked `nativeSelfCallPush` callout →
+      `pushed_frames` bump → lane shift by `num_registers` →
+      `linked_loop_done = 0` → `jmp body_entry`; refusal falls through
+      to the byte-identical plain terminal). Helper = `opCall`-verbatim
+      (round-5 distant-invariant re-verification, actual-callee proto
+      match with no closure-identity pin, depth/capacity walls,
+      `receiptsInert` descent gate, window layout, one-past-call cursor
+      freeze, real `pushFrameVararg`, episode-ctx refresh, factored
+      `tickCallEntry` after success only). `NativeResult.pushed_frames`
+      at the ABI tail (frozen offsets pinned by a new comptime assert)
+      → `ExecResult.pushed_frames`; BOTH dispatcher paths branch on
+      `pushed > 0` FIRST into `consumePushedDescent` — a sibling of
+      `consumeHeadBurst` sharing the factored row core
+      (`resolveHeadRowOwner`/`accountHeadIntermediateRow`) with none of
+      the walk-local state, six-way terminal grammar, every disposition
+      → `.resume_pushed_frame` (reload + dispatch the LEAF; the leaf's
+      own jfunc_head walk owns non-terminal failure accounting —
+      charging the final deopt row here too would double-count).
+      Recording + tier-1a legs byte-identical (no recorded change).
+      `self_call_pushes` witness counter (+ `--jit-stats` line). Tests:
+      ten-leg pins (deep linear descent, StackOverflow through the
+      wall + pcall parity, type change at depth, mid-run callee rebind
+      — an in-trace rebind is unreachable in v1 since function-valued
+      `ustore` aborts recording), native formation proof on the
+      witness, helper refusal matrix through the installed fn pointer
+      (bounds/non-call/all_results/vararg/multret-pending/non-function/
+      foreign-proto/capacity + positive control asserting the real
+      frame, cursor, tick, ctx stamp). Receipts: fib jit 317→263.5 ms
+      (arc: 550 D8 → 435 D9 → 317 D10 → 263.5 D11; LuaJIT 7.5, 35×),
+      binary-trees 368→287.7 ms (−22%); board otherwise noise-flat.
+      Known Piece-6 artifact carried openly: `--jit-stats` res%/
+      iterations-per-entry undercount descents (binary-trees res%
+      reads 9% while getting 22% faster). All gates green.
+
 ### Outstanding
-- [ ] **P4 slice 2 — native frame push at the self-call terminal
-      (D11).** Nativegen-only lowering of `.terminal(self_call_interp)`:
-      flush, `nativeSelfCallPush` callout (runtime eligibility — actual
-      callee proto match, depth/capacity walls — then `opCall`-verbatim
-      layout + `pushFrameVararg` + episode-ctx refresh), lane-pointer
-      shift by `num_registers`, jump to own `ordinary_entry`.
-      `NativeResult.pushed_frames`; consumers branch on `pushed > 0`
-      FIRST and resume the RELOADED top frame
-      (`.resume_pushed_frame`); recording and tier-1a legs unchanged.
-      See §D11.
 - [ ] **Phase 1a follow-ups.** Remaining review-round-2 matrix tests
       (want-during-recording, sibling abort/cooldown retry,
       `max_traces_per_anchor == trial_visited_cap` truncation, unpatch

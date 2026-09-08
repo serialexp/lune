@@ -4955,6 +4955,211 @@ test "head arm formation (doc 44 D10): the walk evidence channel arms a .sibling
     try testing.expect(head_arms >= 1);
 }
 
+test "head e2e (doc 44 D11): deep linear self-recursion stays byte-identical, all ten legs" {
+    // Output pin for the native frame-push descent: on the native legs a
+    // committed `.terminal(self_call_interp)` page pushes real VM frames down
+    // to the base case (which deopts at the branch guard and hands the leaf
+    // to tier-0); the tier-1a legs keep the P0 interp terminal. Byte-identical
+    // output across the matrix is the transparency claim.
+    try util.expectProgram(
+        \\local function sum(n)
+        \\  if n == 0 then return 0 end
+        \\  return n + sum(n - 1)
+        \\end
+        \\local s = 0
+        \\for i = 1, 5 do s = s + sum(150) end
+        \\print(s)
+    , "56625\n");
+}
+
+test "head e2e (doc 44 D11): StackOverflow through a native descent — message and pcall catch identical, all ten legs" {
+    // The depth wall: the second `pcall` descends natively (the head patched
+    // after the first run's warmup) until `nativeSelfCallPush` refuses at
+    // `max_call_depth`; the plain terminal resumes the leaf AT its self-call
+    // and tier-0 re-executes it generically, raising `StackOverflow` with
+    // intact frames — so the located message (`describeFault`) and the pcall
+    // catch must be byte-identical to the pure tier-0 legs.
+    try util.expectProgram(
+        \\local function down(n)
+        \\  if n > 300 then return n end
+        \\  return 1 + down(n + 1)
+        \\end
+        \\local ok1, err1 = pcall(down, 1)
+        \\local ok2, err2 = pcall(down, 1)
+        \\print(ok1, err1)
+        \\print(ok2, err2)
+    , "false\tdown:3: stack overflow\nfalse\tdown:3: stack overflow\n");
+}
+
+test "head e2e (doc 44 D11): argument type change at depth deopts mid-descent, all ten legs" {
+    // At d == 60 the step read flips int → float: the guard fails at that
+    // depth, the deopt flushes into the CURRENT (descended) window, and the
+    // pushed leaf frame resumes at pc 0 on tier-0 — the Piece-3 coherence
+    // claim. The float then propagates through the remaining recursion on
+    // tier-0/leaf-walk paths; output must not depend on where the descent cut.
+    try util.expectProgram(
+        \\local steps = {}
+        \\for i = 1, 100 do steps[i] = 1 end
+        \\steps[60] = 1.5
+        \\local function g(n, d)
+        \\  if n < 2 then return 1 end
+        \\  return 1 + g(n - steps[d], d + 1)
+        \\end
+        \\local s = 0
+        \\for i = 1, 8 do s = s + g(90, 1) end
+        \\print(s)
+    , "712\n");
+}
+
+test "head e2e (doc 44 D11): mid-run callee rebind through the recursion upvalue, all ten legs" {
+    // The recursion upvalue is rebound to a DIFFERENT proto while old-proto
+    // activations are still live. A function-valued `ustore` aborts recording
+    // (doc 43 P5 scalar-only), so no committed trace can contain the rebind
+    // itself — the helper's proto check is the fail-closed wall (unit matrix
+    // below); this pin proves the surrounding machinery (deopt at the trigger
+    // guard, generic tier-0 calls of the new callee from old bodies) stays
+    // transparent.
+    try util.expectProgram(
+        \\local f
+        \\local trigger = false
+        \\f = function(n)
+        \\  if trigger and n == 10 then f = function(m) return 1000 + m end end
+        \\  if n < 2 then return n end
+        \\  return f(n - 2) + f(n - 1)
+        \\end
+        \\local a = f(18)
+        \\trigger = true
+        \\local b = f(18)
+        \\print(a, b)
+    , "2584\t6073\n");
+}
+
+test "head descent formation (doc 44 D11): the self-call terminal actually pushes native frames" {
+    // The formation proof: output equality alone cannot distinguish a live
+    // descent from the (slower, output-equivalent) per-call episode
+    // turnstile. Run a recursion under explicit low warmup and assert the
+    // `self_call_pushes` witness advanced. Native-only: the push epilogue is
+    // a nativegen lowering.
+    if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    const source =
+        \\local function sum(n)
+        \\  if n == 0 then return 0 end
+        \\  return n + sum(n - 1)
+        \\end
+        \\local s = 0
+        \\for i = 1, 5 do s = s + sum(150) end
+        \\print(s)
+    ;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = true;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.hotcall = 4;
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings("56625\n", sink.buffered());
+    // Committed descents: each sum(150) after commit pushes ~149 frames.
+    try testing.expect(vm.trace.self_call_pushes >= 100);
+}
+
+test "push helper refusal matrix (doc 44 D11): every wall declines with nothing mutated" {
+    // Drive `nativeSelfCallPush` directly through the installed ctx fn
+    // pointer (the same route the baked callout takes) against a hand-built
+    // caller activation, and check each refusal: distant-invariant
+    // re-verification (aux bounds, non-call, all_results, vararg,
+    // reg_top_pending), the actual-callee walls (non-function, foreign
+    // proto), and the capacity wall — plus the positive control, which must
+    // push a REAL frame (depth, base, caller cursor, tick, witness).
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var proto = Proto{
+        .code = &.{
+            Instr{ .op = .call, .a = 1, .b = 1, .c = 1 },
+            Instr{ .op = .ret },
+            Instr{ .op = .call, .a = 1, .b = bytecode.all_results, .c = 1 },
+        },
+        .num_registers = 4,
+        .num_params = 1,
+        .name = "d11self",
+    };
+    const foreign = Proto{ .code = &.{Instr{ .op = .ret }}, .num_registers = 2, .name = "d11foreign" };
+    const cl = try vm.heap.newClosure(&proto, 0);
+    const foreign_cl = try vm.heap.newClosure(&foreign, 0);
+    var code = trace.TraceCode{
+        .anchor = .{ .proto = &proto, .pc = trace.FUNC_HEAD_PC },
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    // Hand-built caller activation of the anchor proto at base 0, callee
+    // value (itself) in the call's slot `base + a = 1`, argument in slot 2
+    // (a fresh slab holds undefined tags — the layout loop reads real args).
+    try vm.pushFrame(cl, 0, 0, 0);
+    vm.regSet(0, Value.nil());
+    vm.regSet(1, Value.heap(&cl.header));
+    vm.regSet(2, Value.int(41));
+    vm.regSet(3, Value.nil());
+    const ctx = vm.trace.registry.native_seed_ctx.?;
+    ctx.vm = &vm;
+    ctx.base = 0;
+    const push = ctx.self_call_push_fn.?;
+    const tick0 = vm.trace.tick;
+
+    // Refusals, each with nothing mutated (depth/tick/witness unchanged).
+    try testing.expectEqual(trace.NativeSeedCtx.PUSH_DECLINE, push(ctx, &code, 99)); // aux out of bounds
+    try testing.expectEqual(trace.NativeSeedCtx.PUSH_DECLINE, push(ctx, &code, 1)); // not a .call
+    try testing.expectEqual(trace.NativeSeedCtx.PUSH_DECLINE, push(ctx, &code, 2)); // all_results args
+    proto.is_vararg = true;
+    try testing.expectEqual(trace.NativeSeedCtx.PUSH_DECLINE, push(ctx, &code, 0)); // vararg anchor
+    proto.is_vararg = false;
+    vm.reg_top_pending = true;
+    try testing.expectEqual(trace.NativeSeedCtx.PUSH_DECLINE, push(ctx, &code, 0)); // pending multret
+    vm.reg_top_pending = false;
+    vm.regSet(1, Value.int(7));
+    try testing.expectEqual(trace.NativeSeedCtx.PUSH_DECLINE, push(ctx, &code, 0)); // non-function callee
+    vm.regSet(1, Value.heap(&foreign_cl.header));
+    try testing.expectEqual(trace.NativeSeedCtx.PUSH_DECLINE, push(ctx, &code, 0)); // foreign proto
+    vm.regSet(1, Value.heap(&cl.header));
+    const saved_nreg = proto.num_registers;
+    proto.num_registers = @intCast(vm.regCapacity() - 2);
+    try testing.expectEqual(trace.NativeSeedCtx.PUSH_DECLINE, push(ctx, &code, 0)); // capacity wall
+    proto.num_registers = saved_nreg;
+    try testing.expectEqual(@as(u32, 1), vm.depth);
+    try testing.expectEqual(tick0, vm.trace.tick);
+    try testing.expectEqual(@as(u64, 0), vm.trace.self_call_pushes);
+
+    // Positive control: a real frame push with the opCall-verbatim shape.
+    try testing.expectEqual(trace.NativeSeedCtx.PUSH_OK, push(ctx, &code, 0));
+    try testing.expectEqual(@as(u32, 2), vm.depth);
+    try testing.expect(vm.frames[1].closure == cl);
+    try testing.expectEqual(@as(usize, 4), vm.frames[1].base);
+    try testing.expectEqual(@as(usize, 0), vm.frames[1].pc);
+    try testing.expectEqual(@as(usize, 1), vm.frames[0].pc); // one-past-call cursor
+    try testing.expectEqual(@as(usize, 8), vm.stack_top);
+    try testing.expectEqual(tick0 +% 1, vm.trace.tick);
+    try testing.expectEqual(@as(u64, 1), vm.trace.self_call_pushes);
+    // The ctx now describes the pushed activation (freshness stamp).
+    try testing.expectEqual(@as(usize, 4), ctx.base);
+    try testing.expectEqual(vm.frames[1].call_seq, ctx.call_seq);
+}
+
 test "recorder (head, doc 44 P0): a depth-0 multret-forwarding return aborts — no head trace" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);

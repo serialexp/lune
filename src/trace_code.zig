@@ -154,6 +154,19 @@ pub const NativeSeedCtx = struct {
     /// nothing was written; the candidate itself is unusable at this depth.
     pub const SEED_CAPACITY_DECLINE: u64 = 3;
 
+    /// `self_call_push_fn` result grammar (doc 44 D11) — deliberately disjoint
+    /// from the seed values above so a wiring mistake (wrong fn baked) can
+    /// never read as the other grammar's success.
+    /// The helper pushed a real VM frame for the self-call and refreshed this
+    /// ctx for the new activation: the page shifts its lane pointers and
+    /// re-enters its own body.
+    pub const PUSH_OK: u64 = 16;
+    /// Any refusal (rebound callee, depth/capacity wall, live region
+    /// receipts, invariant re-verification failure): NOTHING was mutated;
+    /// the page runs its plain terminal exit and tier-0 re-executes the
+    /// call generically, raising any error itself.
+    pub const PUSH_DECLINE: u64 = 17;
+
     /// `*Vm`, valid for the prepared episode only.
     vm: *anyopaque = undefined,
     /// `*const function.Closure` of the anchor frame (upvalue seeds).
@@ -188,6 +201,16 @@ pub const NativeSeedCtx = struct {
     /// Same tri-state result grammar. Optional so hand-built test ctxs that only
     /// exercise the C-ABI prologue keep compiling; consumers fail closed.
     seed_tier1a_fn: ?*const fn (ctx: *const NativeSeedCtx, t: *const TraceCode) u64 = null,
+    /// Doc 44 D11: the C-ABI self-call frame-push helper (interp.zig
+    /// `nativeSelfCallPush`), called from a head page's
+    /// `.terminal(self_call_interp)` push epilogue with the terminal's resume
+    /// pc (the `.call` bytecode index) baked as an imm64. Replicates `opCall`'s
+    /// Lua-closure arm verbatim (window layout + caller cursor freeze +
+    /// `pushFrameVararg`), refreshes THIS ctx for the pushed activation, and
+    /// returns PUSH_OK / PUSH_DECLINE. Installed once at VM init next to
+    /// `seed_fn`; optional so hand-built test ctxs keep compiling and
+    /// compilation falls back to the plain terminal when absent (fail closed).
+    self_call_push_fn: ?*const fn (ctx: *const NativeSeedCtx, t: *const TraceCode, terminal_aux: u64) callconv(.c) u64 = null,
 };
 
 pub const TraceCode = struct {

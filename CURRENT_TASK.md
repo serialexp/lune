@@ -21,6 +21,68 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-08j — doc 44 D11 (P4 slice 2: native frame push / up-recursion descent) LANDED
+
+Design committed 3d6dc81 (§D11, codex round-5 reviewed, 7 changes folded);
+implementation this change set. The self-call terminal no longer exits native:
+`.terminal(self_call_interp)` gets a NATIVE-LOWERING-ONLY push epilogue (flush →
+`nativeSelfCallPush` C-ABI callout → `pushed_frames` bump → lane shift by
+`num_registers` → ordinary_entry replica → `jmp body_entry`), so the recursion
+descent is a native loop over REAL VM frames. Nothing recorded changed —
+recording + tier-1a legs byte-identical; refusal falls through to the plain
+terminal (pre-D11 bytes).
+
+Landed:
+- **Helper** (interp.zig `nativeSelfCallPush`, installed on `NativeSeedCtx` as
+  `self_call_push_fn`, PUSH_OK=16/PUSH_DECLINE=17 disjoint from the seed
+  grammar): round-5 distant-invariant re-verification (aux bounds + `.call`,
+  `b != all_results`, non-vararg anchor, `!reg_top_pending`), `receiptsInert`
+  descent gate (v1 answer to cross-activation region receipts), ACTUAL-callee
+  proto match (no closure-identity pin), depth/capacity walls, then
+  opCall-verbatim layout + one-past-call cursor freeze + real `pushFrameVararg`
+  (call_seq stream identical across legs by construction) + episode-ctx
+  refresh + factored `tickCallEntry` (success only) + `self_call_pushes`
+  witness.
+- **Emission** (nativegen `.terminal` arm): seed-prologue callout protocol
+  verbatim (3 pushes rsp ≡8→≡0, imm64-baked ctx/&t/term.aux, call via rax);
+  `NativeResult.pushed_frames` at the ABI tail (comptime-assert pinned);
+  wrapper zero-init + `ExecResult.pushed_frames` propagation.
+- **Consumers**: BOTH dispatcher paths branch `pushed > 0` FIRST (before
+  silent/seed-decline/D10-burst/scalar-head consumers — a descent ledger can
+  be len==1). `consumePushedDescent` = sibling of `consumeHeadBurst` sharing
+  factored `resolveHeadRowOwner`/`accountHeadIntermediateRow`, none of the
+  walk-local state; six-way terminal grammar, every disposition →
+  `.resume_pushed_frame` (jfunc_head site: reloadTopFrame + dispatch;
+  head_terminal → leaf's term.aux, everything else → leaf pc 0 where the
+  LEAF's own walk charges failure accounting — descent consumer charges only
+  the genuine terminal, avoiding double-count). Loop-arm switch sites panic
+  on the variant (only head pages emit the push). Non-`.next_candidate`
+  directive already zeroes patch strikes (descent counts productive).
+- **Tests**: ten-leg pins (deep linear descent 56625; StackOverflow through
+  the depth wall with pcall + located-message parity; type-change-at-depth
+  mid-descent deopt; mid-run callee rebind — in-trace rebind unreachable in
+  v1, function-valued ustore aborts recording); native formation proof on the
+  witness (≥100 pushes); helper refusal matrix driven through the installed
+  fn pointer + positive control (real frame, cursor, stack_top, tick, ctx
+  stamp).
+
+Board (20260908-171229-3d6dc81.tsv vs D10 board): **fib jit 317→263.5 ms**
+(arc: 550 D8 → 435 D9 → 317 D10 → 263.5 D11; LuaJIT 7.5 ms, 35×),
+**binary-trees 368→287.7 ms (−22%)**; rest noise-flat (repack/nsieve wobble
+tracks t0, which D11 does not touch). Piece-6 artifact carried openly:
+res%/iters-per-entry undercount descents (btrees res% reads 9.0 while 22%
+faster) — fib descents bottom out in the base-case deopt (196k pushes on
+fib(27)), each leaf re-entry double-executes one cheap native attempt by
+design (leaf walk owns the accounting).
+
+All gates green: `zig build test` ×2 (plain + jit-debug), hashgate 84×2,
+wasm, viz 69, boundaries.
+
+NEXT (remaining fib gap is the RETURN side now): every `ret` is tier-0 and
+each post-leaf parent resumption re-opens an episode — P3 down-recursion /
+P2 RETF decision own it. Also queued: P1 recunroll, P1a follow-up matrix
+tests, cheap side-lever per-proto codeFor cache (5.5% hash).
+
 ## Status 2026-09-08i — doc 44 D10 (P4 slice 1: head-sibling exit-branch patching) implemented
 
 The D9 residual: every fib LEAF call still paid incumbent-A quiet entry →

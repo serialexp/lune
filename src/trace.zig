@@ -1101,6 +1101,12 @@ pub const TraceState = struct {
     /// the witness), and no tiering path reads them.
     seed_hash_declines: u64 = 0,
     seed_capacity_declines: u64 = 0,
+    /// Doc 44 D11 diagnostic: successful native self-call frame pushes
+    /// (`nativeSelfCallPush` → PUSH_OK). Output equality alone cannot prove a
+    /// descent actually pushed (the plain-terminal turnstile is
+    /// output-equivalent, just slower) — the formation test asserts on this
+    /// witness. No tiering path reads it.
+    self_call_pushes: u64 = 0,
     /// 2.3b-1 (doc 17): count of `.link`-terminal slots actually armed in
     /// `driveChain` — a continuation `C`'s `.link` slot pointed straight at its inner
     /// root `I`'s `linked_entry`, so the next `C.run` fuses into `I` under the shared
@@ -3023,6 +3029,17 @@ pub const TraceState = struct {
         if (self.rec.close_requested) self.closeTrace(regs);
     }
 
+    /// Doc 44 D11: the unconditional "successful Lua entry" tick, shared by
+    /// `onCallEntry` (every tier-0 Lua-callee entry) and the native frame-push
+    /// helper (`nativeSelfCallPush`, one per successful push). Factored so the
+    /// gate-cooldown `tick` stream stays a pure function of the CALL stream on
+    /// every leg — a native descent that pushed k frames advances the tick by
+    /// exactly the k the tier-0 legs would (round 5 change 1). Tick only after
+    /// a SUCCESSFUL entry; failed calls never tick in tier-0 either.
+    pub inline fn tickCallEntry(self: *TraceState) void {
+        self.tick +%= 1;
+    }
+
     /// Doc 44: count a successful Lua-callee entry toward the callee's
     /// function-head anchor. Called from `opCall`'s `.function` arm AFTER the
     /// frame push + `reloadTopFrame` (failed calls never count). Advances the
@@ -3031,7 +3048,7 @@ pub const TraceState = struct {
     /// are refused here — head arming bypasses `recCall`'s vararg rejection,
     /// so the bar must sit at the counting site (doc 44 D2).
     pub fn onCallEntry(self: *TraceState, proto: *const Proto, base: usize, call_seq: u64, img: []const Instr) void {
-        self.tick +%= 1;
+        self.tickCallEntry();
         if (!self.config.enabled) return;
         if (self.rec.active) return; // a recording owns the stream; don't compete
         if (proto.is_vararg) return;
@@ -3462,6 +3479,7 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
     try w.writeAll("mahina: JIT stats\n");
     try w.writeAll("  event counters:\n");
     try w.print("    trace entries:        {d} (native bodies: {d})\n", .{ ts.entries, ts.native_entries });
+    try w.print("    self-call pushes:     {d} (doc 44 D11 native descents)\n", .{ts.self_call_pushes});
     try w.print("    link arms:            native={d} source={d} loopdone={d} bridge={d}\n", .{ ts.native_link_arms, ts.native_source_link_arms, ts.native_loopdone_link_arms, ts.native_region_bridge_arms });
     try w.print("    bridge arm attempts:  {d} (pipeline runs; vs {d} arms)\n", .{ ts.native_region_bridge_arm_attempts, ts.native_region_bridge_arms });
     try w.print("    link fused:           source={d} loopdone={d} bridge={d}\n", .{ ts.native_source_link_fused, ts.native_loopdone_link_fused, ts.native_region_bridge_fused });

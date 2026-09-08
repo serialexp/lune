@@ -868,7 +868,11 @@ pub const Vm = struct {
             .trace = trace.TraceState.init(gpa),
         };
         // Registry allocates a stable context; no pointer into movable Vm storage.
-        try vm.trace.registry.createSeedContext(.{ .seed_fn = &nativeSeedFn, .seed_tier1a_fn = &nativeSeedTier1aFn });
+        try vm.trace.registry.createSeedContext(.{
+            .seed_fn = &nativeSeedFn,
+            .seed_tier1a_fn = &nativeSeedTier1aFn,
+            .self_call_push_fn = &nativeSelfCallPush,
+        });
         // Doc 24 D5: the stable mutable heap channel for allocating traces
         // (tier-1a `.alloc` arms + tier-1b baked callouts). Safe to store once
         // because `heap` is a stable gpa allocation, unlike `&vm.heap`-style
@@ -1186,6 +1190,97 @@ pub const Vm = struct {
             trace.NativeSeedCtx.SEED_OK
         else
             trace.NativeSeedCtx.SEED_HASH_DECLINE;
+    }
+
+    /// Doc 44 D11: the C-ABI self-call frame-push twin of `opCall`'s
+    /// Lua-closure arm, installed once into `NativeSeedCtx.self_call_push_fn`
+    /// at VM init and called from a head page's `.terminal(self_call_interp)`
+    /// push epilogue (the caller window is already fully flushed, argument
+    /// registers included). P0 records NO callee pin at the self-call, so ALL
+    /// legality is re-derived here per push, fail-closed to PUSH_DECLINE with
+    /// nothing mutated — the page then runs its plain terminal exit and tier-0
+    /// re-executes the call generically (raising any error with intact frames).
+    ///
+    /// On PUSH_OK the helper has replicated the `.function` arm verbatim:
+    /// callee-window layout, the caller's one-past-call resume-cursor freeze
+    /// (what keeps `backtraceFrames`/`opRet`/mid-descent faults identical),
+    /// the REAL `pushFrameVararg` (frame struct, depth, stack_top, call_seq
+    /// stream, `setRegionContext` — byte-identical activation bookkeeping to
+    /// the tier-0 legs by construction), the episode-ctx refresh (so
+    /// per-activation seeds and `stubEnterable`'s freshness stamp describe the
+    /// pushed activation), and the shared call-entry tick (round 5 change 1 —
+    /// after success only, like tier-0). `onCallEntry`'s hasTrace/repatch body
+    /// is deliberately NOT re-run: the callee's head is the very trace we are
+    /// inside, and its patched image early-outs at the S1 opcode check anyway.
+    fn nativeSelfCallPush(
+        ctx: *const trace.NativeSeedCtx,
+        ct: *const trace.TraceCode,
+        terminal_aux: u64,
+    ) callconv(.c) u64 {
+        const self: *Vm = @ptrCast(@alignCast(ctx.vm));
+        const proto = ct.anchor.proto;
+        // Round 5 change 6: the record-time exclusions (recorder refusals) are
+        // DISTANT invariants; this is the fail-closed boundary, so re-verify
+        // them before any mutation.
+        if (terminal_aux >= proto.code.len) return trace.NativeSeedCtx.PUSH_DECLINE;
+        const instr = proto.code[@intCast(terminal_aux)];
+        if (instr.op != .call) return trace.NativeSeedCtx.PUSH_DECLINE;
+        if (instr.b == bytecode.all_results) return trace.NativeSeedCtx.PUSH_DECLINE;
+        if (proto.is_vararg) return trace.NativeSeedCtx.PUSH_DECLINE;
+        if (self.reg_top_pending) return trace.NativeSeedCtx.PUSH_DECLINE;
+        // Round 5 change 2: no descents while region receipts are live —
+        // `pushed_frames` is a total that cannot re-pair D10 handoff rows
+        // with their originating activation's region context. (Immutable for
+        // the whole native episode — nothing mutates region policy between
+        // pushes — so checking per push IS the per-episode check.)
+        if (!self.trace.region_policy.receiptsInert()) return trace.NativeSeedCtx.PUSH_DECLINE;
+        // The CURRENT top frame is the caller: `frames[]` is authoritative
+        // (the ctx was refreshed by the previous push, so `ctx.base` agrees —
+        // asserted, not trusted).
+        const caller = &self.frames[self.depth - 1];
+        const base = caller.base;
+        std.debug.assert(base == ctx.base);
+        // The ACTUAL callee value from the just-flushed caller window. A
+        // rebound name simply declines; closure IDENTITY is deliberately not
+        // required — a same-proto different-upvalue closure is safe because
+        // the pushed closure and refreshed ctx are the actual entering ones.
+        const a: usize = instr.a;
+        const callee = self.regGet(base + a);
+        if (!callee.isHeap() or callee.heapType() != .function) return trace.NativeSeedCtx.PUSH_DECLINE;
+        const cl = function.Closure.fromHeader(callee.asHeap());
+        if (cl.proto != proto) return trace.NativeSeedCtx.PUSH_DECLINE;
+        // The two `opCall` overflow walls — on refusal tier-0 re-runs the
+        // call and raises `StackOverflow` with intact frames.
+        if (self.depth >= max_call_depth) return trace.NativeSeedCtx.PUSH_DECLINE;
+        const nreg: usize = proto.num_registers;
+        const callee_base = base + nreg;
+        if (callee_base + nreg > self.regCapacity()) return trace.NativeSeedCtx.PUSH_DECLINE;
+        // opCall-verbatim window layout: bind fixed params (nil-fill any not
+        // supplied), nil the rest. Straight-line and allocation-free; the
+        // slots sit above `stack_top` until `pushFrameVararg` raises it.
+        // Surplus args on the (non-vararg, checked above) callee nil-fill
+        // exactly as `opCall` does — va cursor stays zero.
+        const nargs: usize = instr.b;
+        var j: usize = 0;
+        while (j < nreg) : (j += 1) {
+            self.regSet(callee_base + j, if (j < proto.num_params and j < nargs)
+                self.regGet(base + a + 1 + j)
+            else
+                Value.nil());
+        }
+        // Freeze the caller's one-past-call resume cursor, then the real push.
+        // The walls above make the push infallible; a hypothetical failure
+        // still declines cleanly (the cursor equals what tier-0's re-executed
+        // call would write, and the window writes are dead scratch).
+        caller.pc = @intCast(terminal_aux + 1);
+        self.pushFrameVararg(cl, callee_base, instr.a, instr.c, 0, 0) catch
+            return trace.NativeSeedCtx.PUSH_DECLINE;
+        // Refresh the episode ctx for the pushed activation and advance the
+        // shared call-entry tick — success only, like tier-0.
+        self.prepareNativeEpisode(cl, proto, callee_base);
+        self.trace.tickCallEntry();
+        self.trace.self_call_pushes +%= 1;
+        return trace.NativeSeedCtx.PUSH_OK;
     }
 
     /// Doc 22 §B.1: publish the current activation into the per-VM seeding ctx
@@ -2615,6 +2710,14 @@ pub const Vm = struct {
         next_candidate,
         resume_tier0: usize,
         switch_mode_at: usize,
+        /// Doc 44 D11: the native run pushed real VM frames (a self-call
+        /// descent). The dispatch site must `reloadTopFrame` and dispatch the
+        /// NEW top frame at this pc — `head_terminal` completions resume at
+        /// the leaf's `term.aux`; every other disposition (deopt, yielded cut,
+        /// prologue-fail, either seed decline) resumes the leaf at pc 0, where
+        /// the jfunc_head arm runs the LEAF's own walk. Only the head patch
+        /// site can receive it (loop pages never emit the push epilogue).
+        resume_pushed_frame: usize,
     };
 
     /// Same-anchor trial-walk cap (visited/dead arrays; `dead ⊆ visited`).
@@ -2735,6 +2838,45 @@ pub const Vm = struct {
     /// Ledger-shape violations panic in release too: a malformed burst means
     /// native code jumped somewhere the registry never armed — continuing
     /// would account (and resume) against fiction.
+    /// Doc 44 D10/D11: resolve a fused-head-ledger row's owner and validate
+    /// that it is a head trace of this anchor. Shared by `consumeHeadBurst`
+    /// and the D11 pushed-descent consumer; violations panic in release too —
+    /// a malformed ledger means native code jumped somewhere the registry
+    /// never armed, and continuing would account (and resume) against fiction.
+    fn resolveHeadRowOwner(self: *Vm, row_id: u32, proto: *const Proto) *trace.Trace {
+        const ts = &self.trace;
+        const owner = ts.traceById(row_id) orelse @panic("head burst: row owner did not resolve");
+        if (owner.code.anchor.proto != proto or !trace.isHeadAnchorPc(owner.code.anchor.pc))
+            @panic("head burst: row owner is not a head trace of this anchor");
+        return owner;
+    }
+
+    /// Doc 44 D10/D11: validate + account one INTERMEDIATE fused-head row —
+    /// an armed pre-effect branch-guard deopt that dispatched into
+    /// `next_owner`, checked against the LIVE registry (adjacency per row).
+    /// Entered-and-handed-off accounting: NO zero receipt (a sibling went on
+    /// to finish the call) and NO hot-exit charge (the exit is already
+    /// armed); the candidate charge resets the refusal streak, which
+    /// `accountTraceRun` alone does not (round 4). Shared by
+    /// `consumeHeadBurst` and the D11 pushed-descent consumer.
+    fn accountHeadIntermediateRow(
+        self: *Vm,
+        owner: *trace.Trace,
+        row: trace_exec.LedgerEntry,
+        next_id: u32,
+        seg_local: usize,
+    ) void {
+        const ts = &self.trace;
+        if (row.kind != .deopt or row.outcome != .normal)
+            @panic("head burst: intermediate row is not a dispatched deopt");
+        const next_owner = ts.traceById(next_id) orelse
+            @panic("head burst: successor owner did not resolve");
+        if (!ts.hasArmedSiblingHandoff(owner, row.exit, next_owner))
+            @panic("head burst: transition has no armed sibling handoff");
+        ts.accountTraceRun(owner, seg_local);
+        trace.TraceState.accountCandidateCharge(owner, .entered);
+    }
+
     fn consumeHeadBurst(
         self: *Vm,
         ct: *trace.Trace,
@@ -2750,9 +2892,7 @@ pub const Vm = struct {
         var i: usize = 0;
         while (i < ledger.len) : (i += 1) {
             const row = ledger[i];
-            const owner = ts.traceById(row.id) orelse @panic("head burst: row owner did not resolve");
-            if (owner.code.anchor.proto != proto or !trace.isHeadAnchorPc(owner.code.anchor.pc))
-                @panic("head burst: row owner is not a head trace of this anchor");
+            const owner = self.resolveHeadRowOwner(row.id, proto);
             if (dedup: {
                 for (ts.head_burst_visited[0..ts.head_burst_visited_len]) |vid| {
                     if (vid == owner.id) break :dedup false;
@@ -2768,21 +2908,8 @@ pub const Vm = struct {
             const seg_local: usize = row.cum - (if (i == 0) 0 else ledger[i - 1].cum);
             if (i != ledger.len - 1) {
                 // INTERMEDIATE row: an armed dispatch, validated against the
-                // live registry (adjacency per row — round 4).
-                if (row.kind != .deopt or row.outcome != .normal)
-                    @panic("head burst: intermediate row is not a dispatched deopt");
-                const next_owner = ts.traceById(ledger[i + 1].id) orelse
-                    @panic("head burst: successor owner did not resolve");
-                if (!ts.hasArmedSiblingHandoff(owner, row.exit, next_owner))
-                    @panic("head burst: transition has no armed sibling handoff");
-                // Entered-and-handed-off accounting: NO zero receipt (the
-                // deopt at an armed slot is not a failure — a sibling went on
-                // to finish the call) and NO hot-exit charge (the exit is
-                // already armed; wants on it would only churn). The candidate
-                // charge resets the refusal streak, which `accountTraceRun`
-                // alone does not (round 4).
-                ts.accountTraceRun(owner, seg_local);
-                trace.TraceState.accountCandidateCharge(owner, .entered);
+                // live registry (adjacency per row — round 4; shared core).
+                self.accountHeadIntermediateRow(owner, row, ledger[i + 1].id, seg_local);
                 continue;
             }
             // TERMINAL row.
@@ -2848,6 +2975,98 @@ pub const Vm = struct {
         unreachable;
     }
 
+    /// Doc 44 D11: the pushed-descent consumer — a SIBLING of
+    /// `consumeHeadBurst` sharing the factored row-validation/accounting core
+    /// but NONE of the walk-local state: no `head_burst_visited` publication,
+    /// no `head_walk_fail` pairing (rows cross activations), and no
+    /// `.next_candidate` — every disposition converts directly to
+    /// `.resume_pushed_frame` (the top frame is now the descent's leaf; the
+    /// entry activation's walk cannot continue against it). The terminal
+    /// grammar is SIX-way — the post-push `ordinary_entry` re-runs both the
+    /// seed and hoisted-type prologues, so both seed declines can surface
+    /// mid-descent; `seed_hash_decline` must NOT take the scalar tier-1a
+    /// rerun (it would execute against the ENTRY activation's base/closure) —
+    /// the reloaded leaf's own jfunc_head walk makes the rerun/downgrade
+    /// decision (round 5 change 3). Non-terminal leaf dispositions charge
+    /// NOTHING here: the leaf resumes at pc 0 where its own walk re-runs the
+    /// entry and charges penalty / D8 wants / D10 evidence per-activation
+    /// exactly as scalar entries do.
+    fn consumePushedDescent(
+        self: *Vm,
+        ct: *trace.Trace,
+        result: trace_exec.ExecResult,
+        proto: *const Proto,
+    ) EntryDirective {
+        const ts = &self.trace;
+        std.debug.assert(result.pushed_frames > 0);
+        // The push helper refuses while region receipts are live, and heads
+        // never enter promoted silent cycles — a silent descent result means
+        // native ran a shape the registry never armed.
+        if (result.silent_active != 0) @panic("pushed descent: silent result");
+        if (result.ledger_len == 0) @panic("pushed descent: empty ledger");
+        const ledger = ts.ledger_scratch[0..result.ledger_len];
+        if (ledger[0].id != ct.id) @panic("pushed descent: row 0 owner is not the entered trace");
+        var i: usize = 0;
+        while (i < ledger.len) : (i += 1) {
+            const row = ledger[i];
+            const owner = self.resolveHeadRowOwner(row.id, proto);
+            const seg_local: usize = row.cum - (if (i == 0) 0 else ledger[i - 1].cum);
+            if (i != ledger.len - 1) {
+                // INTERMEDIATE row: a D10 armed handoff mid-descent —
+                // transfers within one activation, validated + accounted by
+                // the shared core.
+                self.accountHeadIntermediateRow(owner, row, ledger[i + 1].id, seg_local);
+                continue;
+            }
+            // TERMINAL row.
+            switch (row.kind) {
+                .head_terminal => {
+                    // The descent's LAST activation refused a further push
+                    // (depth/capacity wall, rebound callee, …) and ran the
+                    // plain terminal: a genuine completion of that
+                    // activation's body. Verbatim the scalar terminal
+                    // receipt; the reloaded leaf resumes AT the unexecuted
+                    // self-call, which tier-0 re-executes generically
+                    // (raising any overflow error with intact frames).
+                    if (row.outcome != .normal) @panic("pushed descent: yielded head_terminal");
+                    if (row.exit >= owner.code.instrs.len or owner.code.instrs[row.exit].op != .terminal)
+                        @panic("pushed descent: head_terminal row does not name a terminal instr");
+                    const term = owner.code.instrs[row.exit];
+                    ts.dbg("pushed-descent terminal: pushed={d} rows={d} final t={d} resume={d}", .{ result.pushed_frames, ledger.len, owner.id, term.aux });
+                    ts.onSideExitReceipt(owner, 1, row.exit, 1, .deferred, .entered);
+                    ts.noteHeadSiblingCompletion(.{ .proto = owner.code.anchor.proto, .pc = owner.code.anchor.pc }, owner.id);
+                    return .{ .resume_pushed_frame = @intCast(term.aux) };
+                },
+                .deopt => {
+                    // Guard deopt at some depth (normal), or a full-cap
+                    // `.yielded` cut: either way the deopt flush left the
+                    // LEAF window coherent at pc 0 and the leaf's own walk
+                    // owns the event's accounting on re-entry — charging it
+                    // here too would double-count one semantic failure.
+                    if (row.outcome == .yielded and ledger.len != trace_exec.LEDGER_CAP)
+                        @panic("pushed descent: yielded row below full cap");
+                    ts.dbg("pushed-descent deopt: pushed={d} rows={d} last t={d} exit={d} yielded={}", .{ result.pushed_frames, ledger.len, owner.id, row.exit, row.outcome == .yielded });
+                    return .{ .resume_pushed_frame = 0 };
+                },
+                .prologue_fail => {
+                    // Arg types changed at some depth: the post-push re-entry
+                    // refused before touching regs. Leaf walk owns it.
+                    ts.dbg("pushed-descent prologue-fail: pushed={d} rows={d} last t={d}", .{ result.pushed_frames, ledger.len, owner.id });
+                    return .{ .resume_pushed_frame = 0 };
+                },
+                .seed_capacity_decline, .seed_hash_decline => {
+                    // The post-push seed prologue declined. Both resume the
+                    // leaf at pc 0 — the hash decline explicitly must not
+                    // take the entry activation's scalar tier-1a rerun.
+                    ts.dbg("pushed-descent seed-decline: pushed={d} rows={d} last t={d} kind={s}", .{ result.pushed_frames, ledger.len, owner.id, @tagName(row.kind) });
+                    return .{ .resume_pushed_frame = 0 };
+                },
+                else => @panic("pushed descent: terminal row kind outside the head grammar"),
+            }
+        }
+        unreachable;
+    }
+
     /// Doc 44 D9: the quiet head episode — the full dispatcher episode
     /// reduced to what a head entry can actually reach when the quiet
     /// predicate holds. Every skipped call is proven no-op by a predicate
@@ -2881,6 +3100,15 @@ pub const Vm = struct {
         const result = nt.runCapturingLedger(regs, &ts.ledger_scratch, .{});
         // What the predicate bought (no promoted sets ⇒ no silent state):
         std.debug.assert(result.silent_active == 0);
+        // Doc 44 D11: a pushed descent — the native run changed the VM frame
+        // stack, so it MUST branch before every other consumer (they all
+        // reason against the ENTRY activation; the top frame is now the
+        // descent's leaf). Pushes mutate no receipt state, so the quiet
+        // predicate needed no new line.
+        if (result.pushed_frames > 0) {
+            ts.last_exit_instr = result.exit_instr;
+            return self.consumePushedDescent(ct, result, proto);
+        }
         // Doc 44 D10 (quiet v2): an armed `.sibling_handoff` slot fired —
         // the whole chain is described by the multi-row ledger; the shared
         // burst consumer owns validation, accounting, and resumption. May
@@ -3109,6 +3337,17 @@ pub const Vm = struct {
                 }
                 break :blk irinterp.executeCtx(.{ .heap = self.heap }, &ct.code, trace_regs, buf);
             };
+            // Doc 44 D11: a pushed descent — the native run changed the VM
+            // frame stack, so it MUST branch before EVERY other consumer
+            // below (silent drain, seed-decline handlers, D10 burst, scalar
+            // heads): they all reason against the ENTRY activation, and a
+            // pushed-descent ledger can be `len == 1` (round 5 change 3).
+            if (ran_native and result.pushed_frames > 0) {
+                self.trace.last_exit_instr = result.exit_instr;
+                const d = self.consumePushedDescent(ct, result, proto);
+                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                return d;
+            }
             if (ran_native) {
                 if (self.trace.driveDispatcherSilentResult(ct, result, proto, regs, safe_to_arm)) |chain| {
                     if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
@@ -4456,6 +4695,8 @@ pub const Vm = struct {
                         st.frame.pc = rpc;
                         return .switch_mode;
                     },
+                    // Doc 44 D11: only head pages emit the push epilogue.
+                    .resume_pushed_frame => @panic("pushed frames from a loop-anchor entry"),
                 }
             }
         }.h;
@@ -4536,6 +4777,8 @@ pub const Vm = struct {
                         st.frame.pc = rpc;
                         return .switch_mode;
                     },
+                    // Doc 44 D11: only head pages emit the push epilogue.
+                    .resume_pushed_frame => @panic("pushed frames from a loop-anchor entry"),
                 }
             }
         }.h;
@@ -4619,6 +4862,15 @@ pub const Vm = struct {
                     .switch_mode_at => |rpc| {
                         st.frame.pc = rpc;
                         return .switch_mode;
+                    },
+                    // Doc 44 D11: the native run pushed real frames — the top
+                    // frame is now the descent's leaf. Reload onto it and
+                    // dispatch: `term.aux` re-executes the leaf's refused
+                    // self-call generically; pc 0 runs the leaf's own
+                    // jfunc_head walk (which owns the failure accounting).
+                    .resume_pushed_frame => |rpc| {
+                        reloadTopFrame(st);
+                        return dispatchTail(mode, st, rpc, vm);
                     },
                 }
             }
@@ -5388,6 +5640,8 @@ pub const Vm = struct {
                         .next_candidate => {},
                         .resume_tier0 => |npc| return .{ .dispatch_at = npc },
                         .switch_mode_at => |npc| return .{ .switch_mode_at = npc },
+                        // Doc 44 D11: only head pages emit the push epilogue.
+                        .resume_pushed_frame => @panic("pushed frames from a loop-anchor entry"),
                     }
                 }
                 // Retire traces the walk found permanently dead (lane widened
