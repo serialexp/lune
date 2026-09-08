@@ -1,10 +1,11 @@
 # 44 — call anchors and return tracing (making recursion trace at all)
 
-Status: partial — P0 complete (recording, tier-1a AND native `.terminal`
-execution; fib runs 100% of entries native, board jit 521→477 ms, binary-trees
-468→370 ms); the per-call dispatcher seam still makes traced fib ~3× tier-0 —
-P1/P4 own that. Codex-reviewed (gpt-5.6-sol, verdict sound-with-changes; all 8
-required changes folded in, ledger at bottom)
+Status: partial — P0 complete, P1a (D8 head siblings) and P1b (D9 quiet head
+episode + S1/S2/S4) landed; fib jit 435 ms / binary-trees ~365-373 ms with 100%
+head coverage. The remaining fib gap is the per-leaf zero-exit + sibling
+episode structure — P4 (exit-branch patching + native frame push) owns it.
+Codex-reviewed ×3 (gpt-5.6-sol, all sound-with-changes, every required change
+folded; ledger at bottom)
 Owner: Bart
 Last updated: 2026-09-08
 
@@ -96,7 +97,6 @@ to Done once everything inside a phase is checked.
       and a synthetic head-anchored driveChain test with a reachable
       same-anchor sibling.
 
-### Outstanding
 - [x] **Phase 1a — head path siblings (D8).** All four pieces landed:
       head route in `noteTakenExit` (want + src provenance, no unpatch),
       sibling walk in `enterPatchedTrace` (`nextTraceExcluding` hit-count
@@ -118,15 +118,19 @@ to Done once everything inside a phase is checked.
       where tier-0 ran the 3-op base case in ~30 ns. This is the same
       per-entry seam P4 exists to remove, not a D8 defect; revisit the
       pair after P4's native frame push / lean head entry.
-- [ ] **Phase 1b — quiet head episode (D9, lean entry).** Profile-driven
-      (fib 31: native 6.4% of cycles, episode machinery ~60%): an O(1)
-      quiet predicate (nothing armed/promoted/penalized/regioned/pending)
-      guards a dedicated small-frame head entry handling the full head
-      result grammar; non-quiet takes today's path unchanged. Plus the
-      general S1 (`onCallEntry` image-first — removes the per-call
-      `hasTrace` + D8 `maybeRepatchHead` hashes) and S4 (frame-cached
-      code image — removes the per-pop `codeFor` hash) slices.
-      Byte-identical by construction; hashgate must not move.
+- [x] **Phase 1b — quiet head episode (D9, lean entry).** Landed
+      (d0e9d8e): `headEpisodeQuiet` predicate + `enterHeadNativeQuiet`
+      at both `enterPatchedTrace` entry sites; the round-3
+      `hasNativeLoopDoneLink` head refusal; S1 (`onCallEntry`
+      image-first), S2 (inline receipt early-outs), S4 (frame-cached
+      code image, `?u64` gen); `CompiledTrace.has_hash_seed` from active
+      plan bits. Hashgate byte-identical. Board: fib jit 550→435 ms,
+      btrees 397→~365-373, rest flat — recovers the D8 cost and more.
+      Remaining fib gap is structural (leaf calls pay incumbent
+      zero-exit + sibling full episode; penalty churn keeps the sibling
+      non-quiet) — P4's exit-branch patching owns it.
+
+### Outstanding
 - [ ] **Phase 1a follow-ups.** Remaining review-round-2 matrix tests
       (want-during-recording, sibling abort/cooldown retry,
       `max_traces_per_anchor == trial_visited_cap` truncation, unpatch
