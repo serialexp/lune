@@ -62,6 +62,33 @@ formation witness tests (`self_ret_pops`; fib(20) pops 6.7k natively). All
 gates green; fib 413.5→404.3 / btrees 450.4→441.8 (one opRet saved per
 leaf — the episode toll needs the links). Stages 2/3 next: `.ret_cont` K=4
 resume-pc link slots on the pop epilogue, `.call_head` cont-page push links.
+
+Stage-2 implementation notes for the next session (surfaces already read):
+- The arm funnel (`trace_link.zig arm()`, ~1225) already carries the D12c
+  placeholder comment at the one-shot `head_parent` switch — `.ret_cont`/
+  `.call_head` go in as first-class `ArmKind` branches there; physical
+  publication runs through `registry.native_physical.publishValidatedLink`
+  (slot cells patched with the child entry address; disarm/invalidation
+  blast radius already generic).
+- Slot-key problem: `.ret_cont` slots key on a RESUME PC, not an IR exit
+  index — the pop's resume pc is DYNAMIC (the popped-into caller's frozen
+  cursor). The emitted compare-chain needs that pc in a register: either
+  have `nativeSelfRetPop` return `(1<<63)|resume_pc` on success (bit-63
+  flag keeps the 16-19 grammar disjoint; POP_DECLINE stays 19), or stash
+  it in a NativeSeedCtx field the epilogue reloads via a baked imm64.
+- On a link HIT the lanes must shift DOWN by compile-time `nreg` (same
+  proto) before `jmp` to the cont page's `ordinary_entry`; rdx
+  (*NativeResult) is live throughout; `.ret_pop` row becomes the
+  TRANSITION row (validated per-kind against the live registry — an armed
+  `.ret_cont` from owner to target must exist; charges `accountTraceRun`
+  + `accountCandidateCharge(.entered)`).
+- Arming: hotguard-style deterministic counter on (returning page, resume
+  pc); pending arm consumed when the dispatcher actually enters the cont
+  page (the `tryArmSiblingHandoff` consume-at-entry shape, interp.zig
+  ~3468). First K=4 distinct resume pcs win; fifth stays unlinked and is
+  logged (no-silent-caps). Blackout bound: max_call_depth + LEDGER_CAP
+  (round-6 change 9) — document at the force-yield branch when links land.
+
 Queued behind: P1 recunroll, P1a matrix tests, per-proto codeFor cache,
 quiet-predicate anchor-locality fragility.
 
