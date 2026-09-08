@@ -119,8 +119,11 @@ pub inline fn accountLegacyThrash(self: *TraceState, t: *Trace, completed: usize
     // gate — with Option-A headroom for shape-guard exits so the side-trace
     // machinery wins the race while capacity remains.
     if (completed > 0) {
-        _ = self.penalty.remove(key);
-        self.clearDispatchGate(key);
+        // Doc 44 D9 (S2): skip the two hash probes when the maps are empty —
+        // the steady state of every healthy workload (removing a missing key
+        // is a no-op, so this is behavior-identical, just without the wyhash).
+        if (self.penalty.count() != 0) _ = self.penalty.remove(key);
+        if (self.gate.count() != 0) self.clearDispatchGate(key);
         return;
     }
     // Doc 38: a zero-COMPLETION loop-done receipt (a while whose top-of-
@@ -304,7 +307,7 @@ pub fn demotePromotionsForRegionReason(self: *TraceState, key: RegionKey, reason
 /// B-3a hook at every native-call origin. B-3b performs the conservative global
 /// activation sweep here, demoting every live promotion whose RegionKey differs
 /// from the current active key before any patched code can run.
-pub fn prepareNativeEntry(self: *TraceState) void {
+pub inline fn prepareNativeEntry(self: *TraceState) void {
     // This is on every native entry; preserve the empty-registry common case
     // as one length branch before resolving activation state.
     if (self.registry.native_physical.promotedSets().len == 0) return;
@@ -320,7 +323,7 @@ pub fn prepareNativeEntry(self: *TraceState) void {
 /// One authoritative staging image for every native-call origin. The barren
 /// bound is absolute: `cur_zero_run` begins at the active activation's current
 /// streak and native compares it directly with `max_barren_run`.
-pub fn silentStaging(self: *TraceState) nativegen.SilentStaging {
+pub inline fn silentStaging(self: *TraceState) nativegen.SilentStaging {
     // Nothing is promoted ⇒ no patch targets a silent epilogue ⇒ no native code
     // can read any of these fields. Resolving the activation here would put an
     // `activeRegionFor` walk + a `region_profit` hashmap lookup on EVERY native

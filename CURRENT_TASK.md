@@ -21,6 +21,58 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-08h — doc 44 D9 (P1b quiet head episode + S1/S4) implemented
+
+Profile receipt (fib 31, house recipe): native [JIT] 6.4% of cycles, episode
+machinery ~60% — death by a thousand call frames (15 outlined calls that all
+early-out in O(1); accountRegionProfit builds a 344-byte frame 4M×/run to
+return false) + 3-4 hashes per episode + opCall/opRet ~14%. Design: doc 44 §D9,
+codex round-3 reviewed (sound-with-changes, 5 changes folded — see review
+ledger). All slices byte-identical by construction; hashgate did not move.
+
+Landed in this change set:
+- **D1-style head check in `hasNativeLoopDoneLink`** (trace_link.zig, before
+  the memo) — round-3 finding: it scans logical continuations independent of
+  armedLinks and did NOT reject heads; a head with a coincident exit-pc link
+  terminal could select linked entry mode. Latent bug, now fixed for both
+  paths.
+- **S1** — `onCallEntry` takes the callee image (`st.code`, already reloaded
+  at the opCall site): patched steady state = one bounds-checked opcode
+  compare, no `hasTrace` hash, no `maybeRepatchHead` `codeFor` hash (that
+  pair was D8's per-call regression contribution). tick/enabled/rec/vararg
+  order preserved; unpatched path keeps `hasTrace` for D8 repatch recovery.
+- **S4** — `CallFrame.code_cache: []const Instr` + `code_cache_gen: ?u64`
+  (image_gen IS u64; null = invalid — gen 0 real, empty image cacheable);
+  push-time struct-literal defaults are the invalidation (covers slot reuse
+  + keyframe restore); one `cachedCodeFor` helper serves reloadTopFrame,
+  execImpl construction, and all 5 gen-refresh sites. Kills the per-pop
+  `codeFor` hash in opRet.
+- **`has_hash_seed` on CompiledTrace** (nativegen) — computed from ACTIVE
+  seed-plan bits; the hash decline can only be raised from an active
+  `.hash_cell` (all other seed failures are capacity declines).
+- **D9 proper** — `headEpisodeQuiet` (per-entry O(1) predicate: native_codegen,
+  .compiled + !has_hash_seed, armedLinks empty, no pending demote/disarm/
+  invalidation, debug_log synced, promotedSets empty, provenance_edges empty,
+  no pending sibling/bridge arm, receiptsInert, penalty+gate empty,
+  !coverage) + `enterHeadNativeQuiet` (asserted guarantees: scalar ledger,
+  final==ct, no silent, no hash decline; grammar: terminal → accountTraceRun +
+  accountCandidateCharge + noteHeadSiblingCompletion + resume(term.aux) |
+  capacity decline → next_candidate | zero exit/prologue-fail → REAL
+  noteTakenExit + onSideExitReceipt then next_candidate into the D8 walk).
+  Wired quiet-first at both enterPatchedTrace entry sites (incumbent +
+  sibling walk); a post-zero-exit sibling correctly goes non-quiet via the
+  penalty insert.
+
+Gates: zig build test (plain + -Djit-debug), hashgate 84×2 byte-identical,
+wasm, viz 69, boundaries — all green. Board: pending (this session's run).
+
+NEXT after board: remeasure fib profile (expect enterSelectedTrace/
+accountRegionProfit/provenance gone from the head path; residual = opCall/
+opRet + onCallEntry + nativeSeedFn + quiet episode itself) → then recunroll
+(P1) → P4 native frame push + exit patching (the episode-COUNT structure;
+quiet episode survives as the entry path P4 keeps). Loop-anchor quiet episode
+is a recorded follow-up in doc 44 D9 non-goals.
+
 ## Status 2026-09-08g — doc 44 D8 (P1a head path siblings) LANDED
 
 Designed (doc 44 D8) + codex round-2 reviewed (sound-with-changes, 7 changes

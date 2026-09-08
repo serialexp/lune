@@ -384,6 +384,17 @@ pub const CallFrame = struct {
     /// Number of `...` values for this frame (`nargs - num_params`, clamped at 0).
     /// Zero for non-vararg callees and vararg callees called with no extra args.
     varargs_count: usize = 0,
+    /// Doc 44 D9 (S4): the frame's cached doc-20 fetch image — one `codeFor`
+    /// hash per (frame, image generation) instead of one per push/pop boundary
+    /// crossing (`opRet`'s per-pop hash was 1.4% of recursive-fib inside
+    /// `getIndex` alone). `null` gen = invalid; gen 0 is a REAL generation and
+    /// an empty image is a cacheable value, so neither doubles as the validity
+    /// bit. Push-time defaults are the invalidation (a full struct-literal
+    /// reassignment covers frame-slot reuse and keyframe restore, which
+    /// recreates frames through `pushFrameVararg`). Transient — keyframes omit
+    /// it, exactly like `call_seq`.
+    code_cache: []const Instr = &.{},
+    code_cache_gen: ?u64 = null,
 };
 
 /// The outcome of an `exec` run: either the bottom frame returned (carrying the
@@ -2229,12 +2240,26 @@ pub const Vm = struct {
     /// nothing (no `codeFor`, no `setRegionContext`; adding those would change
     /// observer behavior and cost on productive resumes) and just
     /// tail-dispatch at the new pc.
+    /// Doc 44 D9 (S4): resolve `proto`'s current doc-20 fetch image through
+    /// the frame's cache — the `codeFor` hash is paid once per (frame, image
+    /// generation), not on every push/pop boundary crossing. The cache is
+    /// implicitly keyed by the frame's closure (immutable for a live frame);
+    /// push-time defaults invalidate on slot reuse.
+    inline fn cachedCodeFor(self: *Vm, frame: *CallFrame, proto: *const Proto) []const Instr {
+        const gen = self.trace.registry.entry_registry.image_gen;
+        if (frame.code_cache_gen) |g| if (g == gen) return frame.code_cache;
+        const img = self.trace.codeFor(proto);
+        frame.code_cache = img;
+        frame.code_cache_gen = gen;
+        return img;
+    }
+
     inline fn reloadTopFrame(st: *ExecState) void {
         const vm = st.vm;
         st.frame = &vm.frames[vm.depth - 1];
         st.closure = st.frame.closure;
         st.proto = st.closure.proto;
-        st.code = vm.trace.codeFor(st.proto); // doc 20 image
+        st.code = vm.cachedCodeFor(st.frame, st.proto); // doc 20 image
         st.code_gen = vm.trace.registry.entry_registry.image_gen;
         st.base = st.frame.base;
         st.regs = vm.frameWindow(st.base, st.proto.num_registers);
@@ -2613,6 +2638,126 @@ pub const Vm = struct {
     /// from the same-anchor trial walk; both the walk and (Phase 1) the
     /// `.jfor_loop` arm call it and act on the returned directive in their own
     /// caller-owned epilogue — the future safe-point drain site (doc 20).
+    /// Doc 44 D9: the quiet predicate. Returns the compiled page iff NOTHING
+    /// that could observe, steer, or account this head episode beyond the
+    /// minimal receipt is live — every check is an O(1) load, computed fresh
+    /// per entry (no cached flag to drift; the `captureProvenanceVerdicts`
+    /// emptiness-over-counter rule). Each line names the machinery it proves
+    /// inert; a false anywhere routes to the full `enterSelectedTrace`, so
+    /// non-quiet states are byte-identical to before by construction.
+    fn headEpisodeQuiet(self: *Vm, ct: *trace.Trace) ?*const nativegen.CompiledTrace {
+        const ts = &self.trace;
+        // `.compiled` alone ≠ "the config would run it native" (round 3).
+        if (!ts.config.native_codegen) return null;
+        if (ct.native != .compiled) return null;
+        const nt = &ct.native.compiled;
+        // The one decline needing the tier-1a rerun machinery.
+        if (nt.has_hash_seed) return null;
+        const phys = &ts.registry.native_physical;
+        // No fusion possible ⇒ scalar result, final == ct, no silent state;
+        // `disarmAllLinks` is a no-op.
+        if (phys.armedLinks().len != 0) return null;
+        // `applyPendingDisarms`/`drainBarrier`/`syncNativeInvalidation` no-op.
+        if (phys.pending_demote.items.len != 0 or phys.pending_disarm_all) return null;
+        if (phys.provenance_invalidated) return null;
+        // `applyPendingDisarms` also syncs this field unconditionally; a
+        // mismatch takes one full entry to synchronize (round 3).
+        if (phys.debug_log != ts.config.debug_log) return null;
+        // `prepareNativeEntry` no-op; `silentStaging() == .{}`.
+        if (phys.promotedSets().len != 0) return null;
+        // Provenance capture/settle/drain and sibling arming no-op.
+        if (ts.provenance_edges.items.len != 0) return null;
+        if (ts.pending_sibling_arm != null or ts.pending_bridge_arm != null) return null;
+        // `accountRegionProfit` returns false ⇒ legacy receipt.
+        if (!ts.region_policy.receiptsInert()) return null;
+        // The legacy productive removals no-op on empty maps; head gate READS
+        // (want transfer, repatch) stay correct because non-empty forces full.
+        if (ts.penalty.count() != 0 or ts.gate.count() != 0) return null;
+        // Coverage runs want the tsc stamps (`--jit-stats` attribution).
+        if (ts.config.coverage) return null;
+        return nt;
+    }
+
+    /// Doc 44 D9: the quiet head episode — the full dispatcher episode
+    /// reduced to what a head entry can actually reach when the quiet
+    /// predicate holds. Every skipped call is proven no-op by a predicate
+    /// line; every taken action is verbatim the full path's (byte-identical
+    /// by construction, hashgate-pinned). The head result grammar is closed
+    /// (D5/D8): terminal completion, seed capacity decline, or a zero
+    /// exit / prologue-fail into the D8 sibling walk. `seed_hash_decline`
+    /// is excluded at compile time (`has_hash_seed`), fusion/silent/ledger
+    /// shapes by the empty arm registry.
+    fn enterHeadNativeQuiet(
+        self: *Vm,
+        ct: *trace.Trace,
+        nt: *const nativegen.CompiledTrace,
+        closure: *const function.Closure,
+        proto: *const Proto,
+        regs: RegWindow,
+        base: usize,
+    ) EntryDirective {
+        const ts = &self.trace;
+        // The `jfunc_head` §R1-5 bypass set already excluded every
+        // observation/recording entry mode; assert rather than re-check.
+        std.debug.assert(!ts.config.record_exec_log);
+        std.debug.assert(!ts.isRecording());
+        std.debug.assert(self.suspend_ctl == null and !self.record_safepoint_lines);
+        // Doc 26 D1 tripwire, same as the full path.
+        if (ct.code.requires_unicode_pin) std.debug.assert(self.unicode_version_pinned);
+        ts.entries +%= 1;
+        // Doc 22 §B.1: the native page seeds itself from this ctx.
+        self.prepareNativeEpisode(closure, proto, base);
+        ts.native_entries +%= 1;
+        const result = nt.runCapturingLedger(regs, &ts.ledger_scratch, .{});
+        // What the predicate bought (empty arm registry ⇒ no fusion):
+        std.debug.assert(result.silent_active == 0);
+        std.debug.assert(result.ledger_len <= 1);
+        std.debug.assert(result.final_trace_id == ct.id);
+        std.debug.assert(result.exit_reason != .seed_hash_decline);
+        if (result.exit_reason == .seed_capacity_decline) {
+            // Verbatim the full path's handler: an entry-condition mismatch,
+            // not a guard failure — no receipt, no `last_exit_instr`.
+            ts.dbg("seed-capacity-decline: trace={d} anchor={d}", .{ ct.id, ct.code.anchor.pc });
+            ts.seed_capacity_declines +|= 1;
+            return .next_candidate;
+        }
+        ts.last_exit_instr = result.exit_instr;
+        if (result.exit_instr != std.math.maxInt(u32) and
+            result.exit_instr < ct.code.instrs.len and
+            ct.code.instrs[result.exit_instr].op == .terminal)
+        {
+            const term = ct.code.instrs[result.exit_instr];
+            ts.dbg("terminal: trace={d} kind={d} resume={d}", .{ ct.id, term.a, term.aux });
+            // `onSideExitReceipt(ct, 1, exit, 1, .deferred, .entered)` reduced
+            // under the predicate: the while-probe rejects on op (terminal is
+            // not `guard_true`), the region machine returns false
+            // (`receiptsInert`), and the legacy productive path's two map
+            // removals no-op on empty maps — leaving exactly these two calls.
+            ts.accountTraceRun(ct, 1);
+            trace.TraceState.accountCandidateCharge(ct, .entered);
+            // Doc 44 D8: a completion by a NON-source sibling retires a
+            // standing head-sibling want.
+            ts.noteHeadSiblingCompletion(.{ .proto = ct.code.anchor.proto, .pc = ct.code.anchor.pc }, ct.id);
+            return .{ .resume_tier0 = @intCast(term.aux) };
+        }
+        // Head guard-fail zero exit / prologue-fail — deopt to function entry.
+        // The receipt calls are the REAL funnels, verbatim semantics: they
+        // mutate penalty/want state, correctly ending quietness for
+        // subsequent entries. `.next_candidate` feeds the D8 sibling walk.
+        const local_done: usize = result.local_completed;
+        ts.dbg("head zero-exit: trace={d} native={} reason={s} exit={d} completed={d}", .{ ct.id, true, @tagName(result.exit_reason), result.exit_instr, result.completed });
+        ts.noteTakenExit(ct, result.exit_instr, local_done, proto);
+        ts.onSideExitReceipt(
+            ct,
+            local_done,
+            result.exit_instr,
+            local_done,
+            .deferred,
+            if (result.exit_reason == .prologue_fail) .entry_refusal else .entered,
+        );
+        return .next_candidate;
+    }
+
     fn enterSelectedTrace(
         self: *Vm,
         comptime mode: ExecMode,
@@ -3456,7 +3601,15 @@ pub const Vm = struct {
             .dead = &dead,
             .ndead = &ndead,
         };
-        var directive = self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx);
+        // Doc 44 D9: quiet-first for heads — the lean episode when nothing
+        // that could observe or steer it is live; the full path otherwise.
+        var directive = if (is_head)
+            (if (self.headEpisodeQuiet(ct)) |nt|
+                self.enterHeadNativeQuiet(ct, nt, closure, proto, regs, base)
+            else
+                self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx))
+        else
+            self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx);
         // Doc 44 D8 (P1a): the head sibling walk. On a zero exit from the
         // incumbent, try the anchor's OTHER head traces — `nextTraceExcluding`
         // is the same deterministic selection the loop walk uses (highest
@@ -3478,7 +3631,12 @@ pub const Vm = struct {
                 visited[nvisited] = sib;
                 nvisited += 1;
                 wctx.visited = visited[0..nvisited];
-                directive = self.enterSelectedTrace(mode, sib, closure, proto, regs, base, pc, &wctx);
+                // D9: each sibling retries the quiet path — a prior zero
+                // exit's penalty insert correctly forces the full path.
+                directive = if (self.headEpisodeQuiet(sib)) |nt|
+                    self.enterHeadNativeQuiet(sib, nt, closure, proto, regs, base)
+                else
+                    self.enterSelectedTrace(mode, sib, closure, proto, regs, base, pc, &wctx);
             }
             // Doc 44 D8: every candidate declined this activation — consume a
             // standing head-sibling want on the CURRENT activation (review
@@ -3562,7 +3720,7 @@ pub const Vm = struct {
             .frame = frame,
             .closure = frame.closure,
             .proto = proto,
-            .code = self.trace.codeFor(proto), // doc 20 image
+            .code = self.cachedCodeFor(frame, proto), // doc 20 image
             .code_gen = self.trace.registry.entry_registry.image_gen,
             .base = frame.base,
             .regs = self.frameWindow(frame.base, proto.num_registers),
@@ -4050,7 +4208,7 @@ pub const Vm = struct {
                 // routine the walk uses.
                 const directive = self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, npc);
                 if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
-                    st.code = self.trace.codeFor(st.proto);
+                    st.code = self.cachedCodeFor(st.frame, st.proto);
                     st.code_gen = self.trace.registry.entry_registry.image_gen;
                 }
                 switch (directive) {
@@ -4133,7 +4291,7 @@ pub const Vm = struct {
                 }
                 const directive = self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, npc);
                 if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
-                    st.code = self.trace.codeFor(st.proto);
+                    st.code = self.cachedCodeFor(st.frame, st.proto);
                     st.code_gen = self.trace.registry.entry_registry.image_gen;
                 }
                 switch (directive) {
@@ -4208,7 +4366,7 @@ pub const Vm = struct {
                 // the function-entry deopt snapshot IS pc 0's register state.
                 const directive = self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, cur_pc);
                 if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
-                    st.code = self.trace.codeFor(st.proto);
+                    st.code = self.cachedCodeFor(st.frame, st.proto);
                     st.code_gen = self.trace.registry.entry_registry.image_gen;
                 }
                 switch (directive) {
@@ -4523,7 +4681,10 @@ pub const Vm = struct {
                         // sets `pending_call_anchor`; the very next prologue
                         // (the dispatchTail below lands on callee pc 0) arms
                         // it under `.full` — never here (T-2/T-3 discipline).
-                        self.trace.onCallEntry(cp, st.base, st.frame.call_seq);
+                        // `st.code` is the callee's image, just reloaded above
+                        // — passing it makes the patched steady state hash-free
+                        // (doc 44 D9 S1).
+                        self.trace.onCallEntry(cp, st.base, st.frame.call_seq, st.code);
                         // A hot verdict under `.fast` needs the `.full`
                         // prologue's consumer (step 10b) at callee pc 0 —
                         // park and flip, exactly the back-edge arming
@@ -4991,7 +5152,7 @@ pub const Vm = struct {
                     // image).
                     self.trace.drainEntryPatchWork();
                     if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
-                        st.code = self.trace.codeFor(proto);
+                        st.code = self.cachedCodeFor(st.frame, proto);
                         st.code_gen = self.trace.registry.entry_registry.image_gen;
                     }
                     switch (directive) {
@@ -5033,7 +5194,7 @@ pub const Vm = struct {
                 // re-resolve the fetch image if a drain moved the generation.
                 self.trace.drainEntryPatchWork();
                 if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
-                    st.code = self.trace.codeFor(proto);
+                    st.code = self.cachedCodeFor(st.frame, proto);
                     st.code_gen = self.trace.registry.entry_registry.image_gen;
                 }
                 // Coherent-state chaining (doc 16, Phase 2) diagnostic: tier-0

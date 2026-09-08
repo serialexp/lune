@@ -2352,7 +2352,17 @@ pub const TraceState = struct {
         // only ever touch the same anchor when this receipt's own region closed and
         // flushed against an owner that happens to be `t.code.anchor`; applying the
         // receipt-local verdict last keeps the most recent evidence authoritative.
-        if (!self.accountRegionProfit(key, region_work, dest)) {
+        //
+        // Doc 44 D9 (S2): replicate `accountRegionProfit`'s first three
+        // side-effect-free early-outs inline before paying its (large,
+        // outlined) call frame — on region-free workloads this receipt runs
+        // per completion (4M+/run on recursive-fib) and the call was 8-12% of
+        // wall doing nothing. Behavior-identical: the callee returns false on
+        // exactly these conditions with nothing mutated before them.
+        const region_live = key != null and
+            self.region_policy.region_context != null and
+            !self.region_policy.receiptsInert();
+        if (!(region_live and self.accountRegionProfit(key, region_work, dest))) {
             self.accountLegacyThrash(t, completed, exit_instr, charge_kind);
         } else {
             accountCandidateCharge(t, charge_kind);
@@ -2980,11 +2990,18 @@ pub const TraceState = struct {
     /// whose recording aborts must still see cooldowns elapse). Vararg protos
     /// are refused here — head arming bypasses `recCall`'s vararg rejection,
     /// so the bar must sit at the counting site (doc 44 D2).
-    pub fn onCallEntry(self: *TraceState, proto: *const Proto, base: usize, call_seq: u64) void {
+    pub fn onCallEntry(self: *TraceState, proto: *const Proto, base: usize, call_seq: u64, img: []const Instr) void {
         self.tick +%= 1;
         if (!self.config.enabled) return;
         if (self.rec.active) return; // a recording owns the stream; don't compete
         if (proto.is_vararg) return;
+        // Doc 44 D9 (S1): the caller passes the callee's freshly-reloaded
+        // image, so the patched steady state is one bounds-checked opcode
+        // compare — entry is the patch's job (`maybeRepatchHead` returned on
+        // this exact check via its own `codeFor` hash; the D8-era per-call
+        // `hasTrace` + `codeFor` hashes both fall away here). The unpatched
+        // path below keeps `hasTrace` so D8 repatch recovery stays live.
+        if (img.len != 0 and img[0].op == .jfunc_head) return;
         const key = AnchorKey{ .proto = proto, .pc = FUNC_HEAD_PC };
         if (self.hasTrace(key)) {
             // Doc 44 D8 (review round 2 blocker 4): entry is the patch's job —
@@ -2997,7 +3014,7 @@ pub const TraceState = struct {
             // surviving trace. Idempotent — a live patch short-circuits on the
             // image check, and `installEntryPatch` returns `.incumbent` on a
             // raced re-install.
-            self.maybeRepatchHead(proto, key);
+            self.maybeRepatchHead(proto, key, img);
             return;
         }
         if (self.recordingBarred(key)) return;
@@ -3012,9 +3029,8 @@ pub const TraceState = struct {
     /// Doc 44 D8: deterministic head entry-patch recovery (see the call site
     /// in `onCallEntry`). Cheap-gated: an already-patched pc 0 returns on one
     /// hashmap probe + opcode compare.
-    fn maybeRepatchHead(self: *TraceState, proto: *const Proto, key: AnchorKey) void {
+    fn maybeRepatchHead(self: *TraceState, proto: *const Proto, key: AnchorKey, img: []const Instr) void {
         if (!self.config.execute) return; // same gate as install-at-commit
-        const img = self.registry.entry_registry.codeFor(proto);
         if (img.len == 0 or img[0].op == .jfunc_head) return; // live patch (or empty proto)
         if (self.recordingBarred(key)) return;
         const best = self.nextTraceExcluding(proto, FUNC_HEAD_PC, &.{}) orelse return;

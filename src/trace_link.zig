@@ -79,6 +79,14 @@ const freeRegionBridges = trace_mod.freeRegionBridges;
 /// after a normal native deopt the pre-run snapshot needed for that commit is
 /// already gone.
 pub fn hasNativeLoopDoneLink(self: *const TraceState, failed: *Trace, proto: *const Proto) bool {
+    // Doc 44 D9 (review round 3): a head trace has no loop-done exits by
+    // construction — its guards deopt to function entry, never to a
+    // post-loop pc. The body scan below matches `guard_true` exit pcs
+    // against `proto.code` shapes and could collide with a coincident
+    // link-terminated trace; refuse the kind explicitly (the D1
+    // discipline), BEFORE the memo, so both entry paths structurally
+    // select ordinary mode for heads.
+    if (trace_mod.isHeadAnchorPc(failed.code.anchor.pc)) return false;
     // Memoized under `cache_gen` (see `Trace.ldl_memo_*`): the answer only
     // changes when the trace cache does (`nextTraceExcluding` reads it), and
     // this runs once per native dispatch.

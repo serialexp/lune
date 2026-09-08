@@ -953,6 +953,14 @@ pub const CompiledTrace = struct {
     /// recorded at emission time (see `EntryStubs.seed_prologue`). Independent
     /// witness for the `seed_plan.nonEmpty() ⟺ prologue-present` invariant.
     seed_prologue: bool = false,
+    /// Doc 44 D9: whether the ACTIVE seed plan contains a `.hash_cell` input —
+    /// the only seed whose prologue can raise `seed_hash_decline` (the one
+    /// decline needing the dispatcher's tier-1a rerun machinery;
+    /// `nativeSeedFn` raises it solely while resolving an active hash cell,
+    /// every other failure is a capacity decline). The quiet head episode
+    /// refuses pages with this set. Computed from active PLAN bits, not raw
+    /// `inputs` (an inactive hash cell never seeds).
+    has_hash_seed: bool = false,
     /// Doc 39: the compiled trace is a PEELED root (`Trace.peeled`). Its first
     /// back-edge closes TWO tier-0 iterations (the run-once stabilizing pass +
     /// the first steady-state pass), so the run wrapper adds 1 to the reported
@@ -1444,6 +1452,12 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
         .metadata_cells = metadata_cells,
         .seed_plan = seed_plan,
         .seed_prologue = entry_stubs.seed_prologue,
+        .has_hash_seed = hhs: {
+            for (t.inputs, 0..) |seed, i| {
+                if (seed_plan.isActive(i) and seed.kind == .hash_cell) break :hhs true;
+            }
+            break :hhs false;
+        },
         .peeled = t.peeled,
     };
 }

@@ -118,6 +118,15 @@ to Done once everything inside a phase is checked.
       where tier-0 ran the 3-op base case in ~30 ns. This is the same
       per-entry seam P4 exists to remove, not a D8 defect; revisit the
       pair after P4's native frame push / lean head entry.
+- [ ] **Phase 1b — quiet head episode (D9, lean entry).** Profile-driven
+      (fib 31: native 6.4% of cycles, episode machinery ~60%): an O(1)
+      quiet predicate (nothing armed/promoted/penalized/regioned/pending)
+      guards a dedicated small-frame head entry handling the full head
+      result grammar; non-quiet takes today's path unchanged. Plus the
+      general S1 (`onCallEntry` image-first — removes the per-call
+      `hasTrace` + D8 `maybeRepatchHead` hashes) and S4 (frame-cached
+      code image — removes the per-pop `codeFor` hash) slices.
+      Byte-identical by construction; hashgate must not move.
 - [ ] **Phase 1a follow-ups.** Remaining review-round-2 matrix tests
       (want-during-recording, sibling abort/cooldown retry,
       `max_traces_per_anchor == trial_visited_cap` truncation, unpatch
@@ -508,6 +517,140 @@ split at a function head, with "base vs non-base recursion" merely the
 motivating instance. No predicate inspects recursion or numeric base
 cases; the test set includes a non-recursive two-path head.
 
+### D9 — P1b: the quiet head episode (lean entry)
+
+**Profile receipt (2026-09-08, fib 31, ReleaseFast, `perf record`).** Per
+the house recipe: native `[JIT]` code is **6.4%** of cycles; the
+dispatcher episode around it is ~60% (`enterSelectedTrace` self 22.9%,
+`accountRegionProfit` 8.6%, `nativeSeedFn` 4.0%, `opJFuncHead` 4.1%,
+wyhash+hashmap ~7%, provenance capture/settle ~3.6%, silent/staging/arms
+~4%); tier-0 `opCall`/`opRet` ~14%. Annotating the hot receipt functions
+shows the bodies all early-out in O(1) — the cost is **the call frames
+themselves**: ~15 outlined calls per episode, each 5–30 cycles of
+prologue + cold-field loads (`accountRegionProfit` alone builds a
+344-byte frame 4M+ times to immediately return false), plus 3–4 hash
+lookups and `enterSelectedTrace`'s own 344-byte worst-case frame.
+Total ≈ 640 cycles wrapping a ~20-cycle native body.
+
+**Shape of the fix — one predicate, not fifteen pre-checks.** Scattering
+`if (empty) skip` guards at each call site is seam polish. The general
+mechanism: compute once, per entry, an O(1) **quiet predicate** — "no
+machinery that could observe or steer this episode is live" — and run a
+dedicated small-frame episode function when it holds. Non-quiet states
+(anything armed, promoted, penalized, regioned, pending) take today's
+full path unchanged. This survives P4 (fewer episodes, same entry code)
+and the predicate + structure extend to loop-anchor entries as a
+follow-up — heads first because their result grammar is tiny (D5/D8:
+terminal, zero exit, prologue-fail, two seed declines; no links, no
+chains, no ledgers > 1).
+
+**The quiet predicate** (all O(1) loads, computed fresh per entry — no
+cached flag to drift; the `captureProvenanceVerdicts` comment's
+emptiness-over-counter rule):
+
+- `config.native_codegen` (review round 3: `.compiled` alone does not
+  imply the config would RUN it native — the full path gates page
+  resolution on this)
+- `ct.native == .compiled` and `!compiled.has_hash_seed` (new bool set at
+  compile time iff the seed plan has an ACTIVE `hash_cell` bit — active
+  plan bits, not raw inputs; `nativeSeedFn` raises the hash decline only
+  from an active `.hash_cell`, every other seed failure is a capacity
+  decline — the one decline that needs the tier-1a rerun machinery; such
+  traces always take the full path)
+- `registry.native_physical.armedLinks().len == 0` (⇒ no fusion: scalar
+  result, `final == ct`, `silent_active == 0`, `ledger_len <= 1`;
+  `disarmAllLinks` is a no-op). `hasNativeLoopDoneLink` is NOT covered by
+  this (review round 3: it scans logical continuation traces + memoizes,
+  independent of physical arms, and its scanner did not reject head
+  anchors — a latent misclassification for a head with a coincident
+  exit-pc link terminal). Fix: the D1-style
+  `isHeadAnchorPc → return false` check lands in `hasNativeLoopDoneLink`
+  itself, before its memo, so BOTH paths structurally select ordinary
+  entry mode for heads and the quiet path omits the call.
+- `pending_demote.items.len == 0 and !pending_disarm_all` and no pending
+  native invalidation (⇒ `applyPendingDisarms`/`drainBarrier`/
+  `syncNativeInvalidation` are no-ops), and
+  `native_physical.debug_log == config.debug_log` (review round 3:
+  `applyPendingDisarms` unconditionally syncs that field — a mismatch
+  takes one full entry to synchronize rather than an unconditional store
+  on every quiet entry)
+- `promotedSets().len == 0` (⇒ `prepareNativeEntry` no-op,
+  `silentStaging() == .{}`, no silent epilogue reachable)
+- `provenance_edges.items.len == 0` and `pending_sibling_arm == null` and
+  `pending_bridge_arm == null` (⇒ capture/settle/drain provenance and
+  `tryArmSiblingHandoff` are no-ops)
+- `region_policy.receiptsInert()` (⇒ `accountRegionProfit` returns false)
+- `penalty.count() == 0 and gate.count() == 0` (⇒ the productive-clear
+  hashes are no-ops; heads' gate reads stay correct because a non-empty
+  map forces the full path)
+- `!config.coverage` (coverage runs want the tsc stamps; `--jit-stats`
+  keeps full-path attribution)
+
+Recording/suspend/exec-log/pending-anchor states need no predicate bits:
+the `jfunc_head` §R1-5 bypass set already routes those to the canonical
+instruction before any entry runs (debug-asserted in the quiet path).
+
+**The quiet episode** (`enterHeadNativeQuiet`), per entry: unicode-pin
+debug assert; `entries`/`native_entries` counters; `prepareNativeEpisode`
+(7 stores — the native page still seeds itself); `runCapturingLedger(regs,
+&ledger_scratch, .{})`; `last_exit_instr`; then the head grammar:
+
+- **`.terminal`** → `accountTraceRun(ct, 1)` (kept in full — it mutates
+  `hit_count` and can mark entry-patch installation pending) +
+  `accountCandidateCharge(ct, .entered)` (= exactly what
+  `onSideExitReceipt` reduces to under the predicate: region false,
+  legacy productive path's two map removals no-op on empty maps) +
+  `noteHeadSiblingCompletion` (null-check fast) →
+  `.resume_tier0(term.aux)`. The jit-debug terminal receipt (`dbg`) is
+  kept so debug stderr stays behavior-identical (comptime-free
+  otherwise).
+- **`seed_capacity_decline`** → dbg + counter → `.next_candidate`
+  (verbatim the full path's handler; nothing committed).
+- **zero exit / prologue-fail** → the real `noteTakenExit` +
+  `onSideExitReceipt` calls, verbatim semantics (these MUTATE penalty
+  state, correctly ending quietness for subsequent entries) →
+  `.next_candidate` into the D8 sibling walk, where each sibling entry
+  retries the quiet path itself.
+
+Debug asserts on the guarantees the predicate buys:
+`result.final_trace_id == ct.id`, `silent_active == 0`,
+`ledger_len <= 1`, `exit_reason != .seed_hash_decline`.
+
+**Byte-identical by construction.** Every skipped call is proven no-op
+under the predicate; every taken action is the same calls the full path
+makes. The gate battery (hashgate 84×2) must stay byte-identical — this
+slice has no behavioral latitude at all.
+
+**Companion general slices (same arc, separately landable):**
+
+- **S1 — `onCallEntry` image-first.** The call site (opCall, post
+  `reloadTopFrame`) already holds the callee image in `st.code`; pass it
+  in. Review round 3 ordering: `tick +%= 1` and the
+  enabled/rec.active/vararg bars keep their exact current order; the new
+  bounds-checked `img[0].op == .jfunc_head → return` sits after them
+  (entry is the patch's job — `maybeRepatchHead` already returns on this
+  same opcode check). Removes the per-call `hasTrace` hash and the
+  per-call `codeFor` hash D8's `maybeRepatchHead` introduced (part of
+  the 477→550 regression) from the PATCHED steady state only — the
+  unpatched path keeps `hasTrace` so D8 repatch recovery stays live.
+- **S4 — frame-cached code image.** `CallFrame` gains
+  `code_cache: []const Instr` + `code_cache_gen: ?u64` (review round 3:
+  `image_gen` is u64; `null` is the validity bit — gen 0 is real and
+  `len == 0` must not double as invalid, empty images are cacheable).
+  Push invalidates (covers frame-slot reuse and keyframe restore, which
+  recreates frames through push); one shared helper validates/refills
+  and serves `reloadTopFrame`, `execImpl` construction, and the
+  patched-entry post-drain refreshes. Kills the per-pop `codeFor` hash
+  in `opRet` (1.36% of fib inside `getIndex` alone) for every program
+  with calls, head-traced or not. The snapshot schema keeps omitting
+  transient fields.
+
+**Non-goals.** No change to what receipts/gates/wants DO — only to when
+the no-op paths are physically executed. The loop-anchor quiet episode is
+a follow-up once the head shape proves out. P4 still owns removing the
+episode-per-call structure for recursion; this makes the episodes that
+remain (and every episode P4 keeps: outermost entries, side exits) cheap.
+
 ## 5. Phasing
 
 P0 is the coverage milestone and is deliberately self-contained (both
@@ -548,6 +691,23 @@ never strikes. (6) selection order is `nextTraceExcluding`'s hit-count
 order, not registry order. (7) caller-owned dead removal across the whole
 walk. Z-6 reinforcement: framed as path-polymorphic head specialization
 with a non-recursive two-path test.
+
+**Round 3 (codex gpt-5.6-sol, 2026-09-08, D9 only): sound-with-changes; 5
+required changes, all folded into D9.** (1) predicate gains
+`config.native_codegen` (`.compiled` ≠ "config would run it"). (2)
+`hasNativeLoopDoneLink` gets the D1 head check itself (it scans logical
+continuations + memoizes, independent of `armedLinks`; a head with a
+coincident exit-pc link terminal could select linked entry mode — latent
+bug, fixed for both paths). (3) `applyPendingDisarms`'s unconditional
+`debug_log` sync → predicate bit (`native_physical.debug_log ==
+config.debug_log`); jit-debug receipts kept in the quiet path. (4) S1
+keeps tick/enabled/rec/vararg order, bounds-checks `img`, and only the
+patched steady state loses the hashes. (5) S4: `?u64` gen (image_gen is
+u64, gen 0 valid, empty images cacheable), push-time invalidation, one
+shared validate/refill helper. Confirmed sound: the skip-claim audit for
+every other call, grammar completeness, active-plan-bits `has_hash_seed`
+airtightness, D8 walk symmetry (a post-zero-exit sibling correctly goes
+non-quiet — the penalty insert ends quietness by design).
 
 ## References
 
