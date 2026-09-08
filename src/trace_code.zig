@@ -283,6 +283,11 @@ pub const TraceCode = struct {
 
     pub fn isNumericForLoopDoneGuard(self: *const TraceCode, instr_idx: usize) bool {
         if (instr_idx >= self.instrs.len) return false;
+        // Doc 44 D1: a head trace has no loop-done exits — a zero-iteration
+        // `for` recorded through the body would otherwise classify here (its
+        // guard_true really does source from a `for_loop` op) and route into
+        // the loop-done slot/snapshot machinery. Kind check, fail-closed.
+        if (isHeadAnchorPc(self.anchor.pc)) return false;
         const guard = self.instrs[instr_idx];
         if (guard.op != .guard_true) return false;
         const exit_pc = trace_ir.guardExitPc(guard) orelse return false;
@@ -297,6 +302,12 @@ pub const TraceCode = struct {
 
     pub fn classifyBridgeCandidate(self: *const TraceCode, instr_idx: usize) bool {
         if (instr_idx >= self.instrs.len or self.peeled) return false;
+        // Doc 44 D1: a HEAD trace is never a bridge member — its branch guards
+        // (e.g. fib's base-case `jmp_if` guard) carry `.branch_cond` provenance
+        // and slot-bound φs below them, so the structural checks alone would
+        // admit it (`exit_pc >= anchor.pc` is vacuous against the sentinel).
+        // Explicit kind check, fail-closed.
+        if (isHeadAnchorPc(self.anchor.pc)) return false;
         const guard = self.instrs[instr_idx];
         if (guard.op != .guard_true and guard.op != .guard_false) return false;
         if (self.isNumericForLoopDoneGuard(instr_idx)) return false;

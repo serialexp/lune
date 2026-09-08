@@ -120,6 +120,60 @@ test "driveChain ordinary_header: chains to a same-anchor sibling" {
     gpa.destroy(trace_b);
 }
 
+test "driveChain (doc 44 D1): a head-anchored trace never chains — kind check fires before the sentinel becomes a walk pc" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    // A head-anchored trace with a same-anchor sibling in the cache. Without
+    // the D1 kind check `.ordinary_header` would hand FUNC_HEAD_PC out as the
+    // walk pc and chain to the sibling; with it, driveChain returns null
+    // before touching the window or the proto.
+    var entry_a = [_]u16{0};
+    const instrs_a = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_int, .a = 0, .aux = 20 },
+        .{ .op = .terminal, .aux = 5 },
+    };
+    const consts_a = [_]Value{};
+    var trace_a = try gpa.create(Trace);
+    trace_a.* = .{
+        .code = .{
+            .anchor = .{ .proto = undefined, .pc = trace.FUNC_HEAD_PC },
+            .instrs = @constCast(&instrs_a),
+            .consts = @constCast(&consts_a),
+            .entry_slots = &entry_a,
+            .entry_guards = &.{},
+        },
+    };
+    var trace_b = try gpa.create(Trace);
+    trace_b.* = .{
+        .code = .{
+            .anchor = .{ .proto = undefined, .pc = trace.FUNC_HEAD_PC },
+            .instrs = @constCast(&instrs_a),
+            .consts = @constCast(&consts_a),
+            .entry_slots = &entry_a,
+            .entry_guards = &.{},
+        },
+    };
+    try state.registry.cache.append(gpa, trace_a);
+    try state.registry.cache.append(gpa, trace_b);
+    const proto = Proto{ .code = &.{}, .name = "head", .num_registers = 1 };
+    trace_a.code.anchor.proto = &proto;
+    trace_b.code.anchor.proto = &proto;
+
+    var regs = [_]Value{Value.int(0)};
+    var tr_regs = TestRegs{ .regs = &regs };
+    // Exclude only A (the failed trace itself) — B stays a reachable sibling,
+    // proving it's the kind check (not the exclusion set) that refuses.
+    const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a}, false, false);
+    try testing.expect(chained == null);
+
+    state.registry.cache.clearRetainingCapacity();
+    gpa.destroy(trace_a);
+    gpa.destroy(trace_b);
+}
+
 test "tryArmSiblingHandoff publishes complete Part-S bookkeeping" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);

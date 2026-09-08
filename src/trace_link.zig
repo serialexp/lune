@@ -511,6 +511,11 @@ pub const SuccAnchor = struct { proto_id: u32, pc: u32 };
 /// Returns `null` (no structural edge) for any exit whose successor is not a
 /// compatibly-bound trace, or a non-PC-carrying guard.
 pub fn resolveSuccessorAnchor(self: *const TraceState, t: *const Trace, e: ExitProvEntry) ?SuccAnchor {
+    // Doc 44 D1: a head trace contributes no edges to the structural successor
+    // graph — it is never armed, promoted, or region-owned, and the guard arm
+    // below would otherwise compare real exit pcs against the sentinel
+    // (`wp != anchor.pc` is vacuously true). Explicit kind check, fail-closed.
+    if (trace_mod.isHeadAnchorPc(t.code.anchor.pc)) return null;
     const proto = t.code.anchor.proto;
     switch (e.prov) {
         .link_terminal => {

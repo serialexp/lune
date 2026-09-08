@@ -159,6 +159,10 @@ pub const programPointLess = trace_region.programPointLess;
 /// synthetic traces with an undefined anchor and empty `instrs`.
 pub fn isLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
     if (idx >= t.code.instrs.len) return false;
+    // Doc 44 D1: a head trace has no loop back-edge — none of its guards can be
+    // a loop-done guard. Explicit kind check, fail-closed (its guard_true pcs
+    // must never be interpreted against the anchor proto's loop CFG).
+    if (isHeadAnchorPc(t.code.anchor.pc)) return false;
     const g = t.code.instrs[idx];
     if (g.op != .guard_true) return false;
     const exit_pc = guardExitPc(g) orelse return false;

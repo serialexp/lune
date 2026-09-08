@@ -62,7 +62,18 @@ entirely the per-call dispatcher episode (~400 cyc around a ~20-cyc body) —
 enterPatchedTrace → enterSelectedTrace's full prep/receipt machinery per
 recursion level. Rule Z-7: don't polish that seam; P1 (recunroll) and P4
 (native frame push for the self-call terminal + exit patching) own it.
-NEXT: exclusion-site kind tests (doc 44 step 8), then P1.
+
+Layer 6 (same day): D1 exclusion-site kind checks + tests. The
+"fail-closed by construction" audit claim was FALSE for
+classifyBridgeCandidate (fib's branch guard has .branch_cond provenance,
+φs below, and `exit_pc >= anchor.pc` is vacuous vs maxInt) — explicit
+isHeadAnchorPc checks now at classifyBridgeCandidate +
+isNumericForLoopDoneGuard (trace_code), isLoopDoneGuardIndex (trace),
+driveChain (trace_chain), resolveSuccessorAnchor (trace_link); recorded-fib
+classifier sweep test (fails when the check is neutralized — verified) +
+synthetic head driveChain test. NEXT: P1 (base-vs-non-base side traces
+first — the fib(15/25) base-case-seed coverage collapse is the motivator —
+then recunroll, lifecycle matrix).
 
 ## Status 2026-09-08e — doc 44 P0 tier-1a ENTRY + EXECUTION LANDED; fib res% 0 → 30.6%
 

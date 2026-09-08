@@ -80,6 +80,22 @@ to Done once everything inside a phase is checked.
       40→30 ms (truthiness widening); all gates green (test, hashgate ×2,
       wasm, viz, boundaries).
 
+- [x] **P0 layer 6 — D1 exclusion-site kind checks + tests.** The audit's
+      "fail-closed by construction" claim did NOT hold for
+      `classifyBridgeCandidate`: fib's base-case branch guard carries
+      `.branch_cond` provenance with slot-bound φs below it, and
+      `exit_pc >= anchor.pc` is vacuous against the sentinel — the head
+      trace's guard classified as a bridge candidate (harmless today only
+      because the dispatcher's head consumers return before every
+      consumer). Explicit `isHeadAnchorPc` kind checks added at all five
+      sites — `classifyBridgeCandidate`, `isNumericForLoopDoneGuard`
+      (trace_code.zig), `isLoopDoneGuardIndex` (trace.zig), `driveChain`
+      (trace_chain.zig — the sentinel must never become a walk pc),
+      `resolveSuccessorAnchor` (trace_link.zig) — plus a recorded-fib
+      classifier sweep test (verified to FAIL with the check neutralized)
+      and a synthetic head-anchored driveChain test with a reachable
+      same-anchor sibling.
+
 ### Outstanding
 - [ ] **Phase 1 — recursion ergonomics.** Bounded recursive unrolling
       (`recunroll` budget for depth>0 self-calls), base-vs-non-base side

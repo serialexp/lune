@@ -4685,6 +4685,47 @@ test "recorder (head, doc 44 P0): fib-shaped recursion records a head trace clos
     );
 }
 
+test "head exclusion (doc 44 D1): a head trace's guards never classify as bridge or loop-done, and contribute no successor edges" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // The real recorded fib head trace: its base-case branch guard carries
+    // `.branch_cond` provenance with slot-bound φs below it — exactly the
+    // shape `classifyBridgeCandidate`'s structural checks alone would admit
+    // (the `exit_pc >= anchor.pc` cut is vacuous against the sentinel). The
+    // D1 kind checks must refuse every classifier at every index.
+    var chunk = try runForHeadTrace(&vm, gpa,
+        \\local function fib(n)
+        \\  if n < 2 then return n end
+        \\  return fib(n - 1) + fib(n - 2)
+        \\end
+        \\print(fib(12))
+    );
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
+    try testing.expectEqual(trace.FUNC_HEAD_PC, t.code.anchor.pc);
+
+    for (0..t.code.instrs.len) |i| {
+        // Site 1 (trace_code.zig): loop-region bridging.
+        try testing.expect(!t.code.classifyBridgeCandidate(i));
+        try testing.expect(!t.code.isBridgeCandidate(i));
+        // Site 2 (trace_code.zig): the loop-done guard classifier twin.
+        try testing.expect(!t.code.isNumericForLoopDoneGuard(i));
+        // Site 3 (trace.zig): the arming-side loop-done classifier.
+        try testing.expect(!trace.isLoopDoneGuardIndex(t, i));
+    }
+    // Site 4 (trace_link.zig): the structural successor graph — no edge from
+    // any of the head trace's keyed exits.
+    for (t.code.exit_prov) |ep| {
+        try testing.expectEqual(
+            @as(?trace.TraceState.SuccAnchor, null),
+            vm.trace.resolveSuccessorAnchor(t, ep),
+        );
+    }
+}
+
 test "recorder (head, doc 44 P0): a vararg callee never counts and never arms" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
