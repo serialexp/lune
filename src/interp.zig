@@ -2950,6 +2950,53 @@ pub const Vm = struct {
             // `flushNumericForLoopDone`), so counting 1 there would
             // charge phantom progress. Bounds-check `exit_instr`
             // BEFORE the guard-shape probe (maxInt = prologue-fail).
+            // Doc 44 P0: a `.terminal` exit is a COMPLETION of a head trace,
+            // NOT a side exit — the φ writeback already published the end
+            // state, and tier-0 resumes AT the still-unexecuted ret/self-call
+            // (`terminal.aux`). It bypasses the entire exit-consumer grammar
+            // below by design (review round 1: no strike, no hot-exit charge,
+            // no side-trace want, no chain — those all reason about loop
+            // anchors and would misread a straight-line completion with
+            // `completed == 0` as a failed entry).
+            if (result.exit_instr != std.math.maxInt(u32) and
+                result.exit_instr < final.code.instrs.len and
+                final.code.instrs[result.exit_instr].op == .terminal)
+            {
+                const term = final.code.instrs[result.exit_instr];
+                self.trace.dbg("terminal: trace={d} kind={d} resume={d}", .{ final.id, term.a, term.aux });
+                // A PRODUCTIVE receipt — the run completed the whole recorded
+                // body, so it must both attribute coverage AND clear the
+                // penalty/gate state (doc 31 D2 clear-on-productive; without
+                // this, base-case zero exits would ratchet a gate the head's
+                // successes could never un-earn — exactly the str_gmatch
+                // starvation shape). One completed head run = one iteration.
+                self.trace.onSideExitReceipt(final, 1, result.exit_instr, 1, .deferred, .entered);
+                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                return .{ .resume_tier0 = @intCast(term.aux) };
+            }
+            // Doc 44 P0: a head trace's guard-fail exit — deopt to function
+            // entry (regs untouched since pc 0). The loop-anchor grammar
+            // below (hot-exit wants, continuations, prime sides, chains)
+            // reasons about back-edge anchors; none of it applies to the
+            // sentinel, and `noteTakenExit`'s side-trace want would only
+            // UNPATCH the head's sole entry (P1 owns base-path side traces).
+            // Charge the ordinary zero receipt — the thrash gate stays live,
+            // so a head that keeps failing its guards still retires — and
+            // fall to `.next_candidate`: the jfunc_head arm then runs the
+            // canonical pc-0 instruction (returning `.resume_tier0(0)` here
+            // would re-dispatch the patch and spin).
+            if (trace.isHeadAnchorPc(final.code.anchor.pc)) {
+                self.trace.onSideExitReceipt(
+                    final,
+                    local_done,
+                    result.exit_instr,
+                    local_done,
+                    .deferred,
+                    if (result.exit_reason == .prologue_fail) .entry_refusal else .entered,
+                );
+                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                return .next_candidate;
+            }
             if (ran_native) self.trace.dbg("receipt: pc={d} link_mode={} local={d} exit={d} ledger_len={d} completed={d}", .{ ct.code.anchor.pc, ran_native_link_mode, local_done, result.exit_instr, result.ledger_len, result.completed });
             const linked_one_trip = ran_native and ran_native_link_mode and
                 local_done == 0 and
@@ -3481,6 +3528,7 @@ pub const Vm = struct {
             .for_loop => opForLoop(mode),
             .jfor_loop => opJForLoop(mode),
             .jloop => opJLoop(mode),
+            .jfunc_head => opJFuncHead(mode),
             .tfor_loop => opTForLoop(mode),
             .new_table => opNewTable(mode),
             .get_index => opGetIndex(mode),
@@ -4019,6 +4067,90 @@ pub const Vm = struct {
                         }
                         return dispatchTail(mode, st, npc, vm);
                     },
+                    .resume_tier0 => |rpc| return dispatchTail(mode, st, rpc, vm),
+                    .switch_mode_at => |rpc| {
+                        st.frame.pc = rpc;
+                        return .switch_mode;
+                    },
+                }
+            }
+        }.h;
+    }
+
+    // Doc 44 P0: patched FUNCTION-HEAD trace entry (LuaJIT JFUNCF analogue).
+    // Written only into a per-VM image over a head-qualified proto's pc 0.
+    // Unlike `.jfor_loop`/`.jloop` the patched-over instruction is ARBITRARY,
+    // so this handler owns no canonical step of its own: every decline/bypass
+    // tail-dispatches `patch.orig` through the ordinary handler table (the
+    // recorder mirror already presents the canonical instruction, §R1-3).
+    fn opJFuncHead(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr_in: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const self = vm;
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const cur_pc = pc - 1; // == patch_pc == 0 by construction
+                const slot: u16 = instr_in.b;
+                const patch = self.trace.registry.entry_registry.entry_patches.items[slot];
+                // Every decline/bypass below dispatches `&st.proto.code[cur_pc]`
+                // (canonical-identical to `patch.orig` by the install
+                // invariant) — NEVER `&patch.orig`: straight-line handlers
+                // walk `instrNext(instr)` and a detached struct pointer has
+                // no successor instruction behind it. Walking on into
+                // `proto.code` is sound (virgin ops, canonical semantics);
+                // the next jump/call re-derives from `st.code` and re-sees
+                // any patched pcs.
+                if (!patch.live) {
+                    // §R6-1 deferred-unpatch recovery, exactly the loop arms'
+                    // discipline: complete the transaction, then run the
+                    // canonical instruction.
+                    self.trace.unpatchSlot(slot);
+                    return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
+                }
+                // §R1-5 bypass set (the loop arms' set + the pending call
+                // anchor): under any live observation/recording hook, present
+                // the canonical instruction to the ordinary handler so
+                // recording and replay see virgin behaviour. Coverage is NOT
+                // in this set (unlike the loop arms): a loop anchor still
+                // enters its trace through the back-edge walk under coverage,
+                // but the pc-0 patch is a head's ONLY entry — bypassing here
+                // would make `--jit-stats` report 0%% head residency by
+                // construction. The terminal consumer attributes the hop.
+                if (self.trace.isRecording() or self.suspend_ctl != null or
+                    self.record_safepoint_lines or self.trace.config.record_exec_log or
+                    self.trace.pending_exit_anchor != null or
+                    self.trace.pending_replay_anchor != null or
+                    self.trace.pending_call_anchor != null)
+                {
+                    return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
+                }
+                // Patched entry: the identical entry/receipt routine the loop
+                // arms use. Guard failures leave regs untouched since entry
+                // (tier-1a/native evaluate into scratch; only φ-writeback and
+                // committed flushes touch the file), so the zero-exit resume
+                // at `cur_pc` re-runs the body on tier-0 from the same state —
+                // the function-entry deopt snapshot IS pc 0's register state.
+                const directive = self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, cur_pc);
+                if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
+                    st.code = self.trace.codeFor(st.proto);
+                    st.code_gen = self.trace.registry.entry_registry.image_gen;
+                }
+                switch (directive) {
+                    .next_candidate => {
+                        // Tier-0 owns the body. T3 invariant: a recording must
+                        // never run under `.fast` (its prologue elides the
+                        // mirror) — park at pc 0; the `.full` re-entry's
+                        // bypass above then routes to the canonical handler.
+                        if (mode == .fast and self.trace.isRecording()) {
+                            st.frame.pc = cur_pc;
+                            return .switch_mode;
+                        }
+                        return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
+                    },
+                    // A `.terminal` completion resumes AT the unexecuted
+                    // ret/self-call; a guard-fail zero exit resumes at pc 0 —
+                    // both are ordinary tier-0 dispatches. pc 0 re-dispatch
+                    // cannot loop: a failed entry returns `.next_candidate`
+                    // (handled above), never `.resume_tier0(0)`.
                     .resume_tier0 => |rpc| return dispatchTail(mode, st, rpc, vm),
                     .switch_mode_at => |rpc| {
                         st.frame.pc = rpc;
@@ -6076,7 +6208,7 @@ inline fn applyJump(pc: usize, offset: i32) usize {
 /// recorder input. A recording that crosses a patched pc mirrors the immutable
 /// canonical instruction, so trace IR is byte-identical to an unpatched run.
 pub inline fn recordingMirrorInstr(proto: *const Proto, pc: usize, fetched: Instr) Instr {
-    return if (fetched.op == .jfor_loop or fetched.op == .jloop) proto.code[pc] else fetched;
+    return if (fetched.op == .jfor_loop or fetched.op == .jloop or fetched.op == .jfunc_head) proto.code[pc] else fetched;
 }
 
 // ---------------------------------------------------------------------------

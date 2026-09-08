@@ -1643,7 +1643,12 @@ pub fn drainEntryPatchWork(self: *TraceState) void {
 /// fail-closed checks. Failure routes per the §R4-2 state machine.
 pub fn installPending(self: *TraceState, t: *Trace) void {
     std.debug.assert(t.entry_patch == .pending);
-    if (t.native != .compiled) {
+    // Doc 44 P0: head traces install without a native page — the pc-0 patch
+    // is their ONLY entry (there is no back-edge walk to fall back on), so
+    // gating installs on `.compiled` would make heads unreachable on every
+    // tier-1a leg. The loop-patch rationale (a patch merely SHORTCUTS the
+    // walk, so only pay for it when native is ready) does not transfer.
+    if (t.native != .compiled and !trace_mod.isHeadAnchorPc(t.code.anchor.pc)) {
         t.entry_patch = .suppressed_permanent;
         return;
     }

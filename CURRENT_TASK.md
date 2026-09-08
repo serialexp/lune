@@ -21,6 +21,35 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-08e — doc 44 P0 tier-1a ENTRY + EXECUTION LANDED; fib res% 0 → 30.6%
+
+Layer 4 in: `jfunc_head` op (appended, dense rule), `EntryPatch.patched_op`
+field, resolvePatchPc head arm → pc 0, install-at-commit (config.execute
+gate) + immediate drain, installPending native-gate bypass for heads,
+terminal consumer in enterSelectedTrace (PRODUCTIVE receipt — one run = one
+iter, clears penalty/gate per doc 31 D2 — then resume at terminal.aux),
+head zero-exit consumer (zero receipt + .next_candidate; NO noteTakenExit —
+side wants would unpatch the sole entry), coverage NOT in jfunc_head's
+bypass set (no walk fallback → --jit-stats would read 0% by construction),
+traceser v4.
+
+Hard-won gotchas for the next slice:
+- NEVER pass `&patch.orig` as a handler's instr pointer — straight-line
+  handlers walk `instrNext(instr)` off the end of the struct into 0xAA
+  undefined memory (crashed 4 tests). Dispatch `&st.proto.code[cur_pc]`.
+- Terminal receipts MUST be productive or base-case zeros ratchet the
+  penalty gate monotonically (heads died after 9 runs — the str_gmatch
+  clear-on-productive shape all over again).
+- A retired/gated head is permanent: hasTrace keeps onCallEntry from ever
+  re-arming and installs only happen at commit. Fine for P0, noted.
+
+Receipts: fib(30) 1,346,206 head completions, 100% of fib entries traced,
+res% 30.6% of run cycles — BUT --trace is 3.3× SLOWER than tier-0 (0.33s vs
+0.10s): tier-1a entry turnstile ~420 cyc/hop on a 9-op body. NEXT: native
+`.terminal` lowering (nativegen.zig:1235 lifts the loop/link terminal gate;
+proveKinds arm; φ one-shot flush + terminal exit stub — the loop-done
+snapshot twin). Then exclusion-site kind tests, bench board, P1.
+
 ## Status 2026-09-08d — doc 44 P0 recording layers LANDED (steps 1–5 partial)
 
 Steps 1–4 of the list below plus the opCall/prologue halves of step 5 are in

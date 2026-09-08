@@ -39,7 +39,12 @@ pub const schema = @import("gen/trace_schema.zig");
 /// v3 (doc 39): the `peeled` byte joins the Trace record — semantic state (the
 /// run-once region is a real tier-0 iteration; first back-edge counts two)
 /// that cannot be inferred from the `preheader` marker.
-pub const format_version: u32 = 3;
+///
+/// v4 (doc 44 P0): the `.terminal` IR op (wire 86) joins the instruction
+/// stream, and a head trace's `anchor.pc` is the `FUNC_HEAD_PC` sentinel
+/// (`maxInt(u32)`) — a v3 reader would misdecode op 86 and misread the
+/// sentinel as a bytecode pc. No layout change; the bump is semantic.
+pub const format_version: u32 = 4;
 
 /// Map one trace constant. A `heap_ref` const is always a string — the only
 /// heap value a trace constant can be (tables/closures are never compile-time

@@ -3194,6 +3194,21 @@ pub const TraceState = struct {
         // A-ii.4: rediscover regions over the refreshed graph. Fail-soft;
         // any OOM fails CLOSED to empty physical indices (arm nothing).
         self.rebuildRegions();
+        // Doc 44 P0: a head trace's ONLY entry is the pc-0 `jfunc_head` patch —
+        // no back-edge walk ever reaches the sentinel anchor, so it can never
+        // qualify through the receipt funnel (`accountTraceRun`). Qualify at
+        // commit and drain immediately: without a loop-trace entry this turn
+        // there may be no other drain site, and marks are legal anywhere
+        // (§R6-1) while this drain runs post-publish, outside any receipt
+        // grammar.
+        // Gated on `config.execute`: with execution off (the recording-shape
+        // test harness) loop patches are unreachable too — they qualify via
+        // receipts, which need traces to run — and a head patch must not
+        // become the one path that runs a trace anyway.
+        if (self.config.execute and isHeadAnchorPc(t.code.anchor.pc)) {
+            self.registry.entry_registry.markInstallPending(t);
+            self.drainEntryPatchWork();
+        }
     }
 
     // Emission and finalization are owned by RecordingSession.

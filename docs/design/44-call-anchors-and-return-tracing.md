@@ -1,8 +1,9 @@
 # 44 — call anchors and return tracing (making recursion trace at all)
 
-Status: partial — P0 recording layers landed (head anchors record + close);
-head *entry*/execution outstanding. Codex-reviewed (gpt-5.6-sol, verdict
-sound-with-changes; all 8 required changes folded in, ledger at bottom)
+Status: partial — P0 recording + tier-1a entry/execution landed (fib re-enters
+through the patched head, res% 30.6%); native `.terminal` lowering and P1+
+outstanding. Codex-reviewed (gpt-5.6-sol, verdict sound-with-changes; all 8
+required changes folded in, ledger at bottom)
 Owner: Bart
 Last updated: 2026-09-08
 
@@ -32,16 +33,38 @@ to Done once everything inside a phase is checked.
       fib self_call_interp, vararg never counts, multret forwarding aborts);
       all gates green (test, hashgate ×2, wasm, viz, boundaries).
 
+- [x] **P0 layer 4 — head entry + terminal execution (tier-1a).** The
+      `jfunc_head` bytecode op (appended, dense-enum rule; handler
+      tail-dispatches `&proto.code[0]` on decline — NEVER `&patch.orig`,
+      straight-line handlers walk `instrNext`); `EntryPatch.patched_op` as a
+      first-class field (head patches overwrite an arbitrary pc-0 op);
+      `resolvePatchPc` head arm → pc 0; install-at-commit (gated on
+      `config.execute`; the receipt funnel can't qualify what it never
+      sees) with an immediate drain; `installPending` head bypass of the
+      native-only gate (the patch is the sole entry, tier-1a legs included);
+      terminal-exit consumer in `enterSelectedTrace` — a PRODUCTIVE receipt
+      (one run = one iteration; clears penalty/gate per doc 31 D2, else
+      base-case zeros ratchet a gate successes could never un-earn) then
+      resume at `terminal.aux`; head zero-exit consumer — ordinary zero
+      receipt, `.next_candidate` (thrash gate stays live; no hot-exit
+      wants — they'd only unpatch the sole entry), skipping the whole
+      loop-anchor grammar; coverage NOT in the jfunc_head bypass set
+      (unlike loop arms — no walk fallback exists, `--jit-stats` would
+      read 0%% by construction); `traceser` v4. Receipts: recursive-fib
+      1,346,206 head completions, res%% 0 → 30.6%% of run cycles, ten-leg
+      e2e (fib steady state, hot non-recursive call, upvalue-seed closure
+      swap) all green. **Exit target met: fib records a non-base trace and
+      re-enters through the patched head.**
+
 ### Outstanding
 
-- [ ] **Phase 0 — remaining: execute + enter.** Terminal-exit directive
-      (resume at `aux`, NO strike/side-trace/chain accounting), tier-1a
-      dispatch of head traces, `jfunc_head` bytecode op + entry-patch kind
-      (function-entry deopt snapshot), native `.terminal` lowering,
-      `traceser.format_version` bump + anchor-kind serialization, ten-leg
-      e2e (fib steady state), fib/binary-trees receipts. Exit target:
-      recursive-fib records a non-base trace and re-enters through the
-      patched head (res% > 0 from 0).
+- [ ] **Phase 0 — remaining: native `.terminal` lowering.** Tier-1a head
+      entry costs ~420 cycles/hop on a 9-op fib body, so `--trace` is
+      currently 3.3× SLOWER than tier-0 on recursive-fib (residency without
+      speed). Lower `.terminal` as the loop-done-snapshot twin: φ one-shot
+      writeback flush + a terminal exit stub reporting the terminal's
+      instruction index; lift the `nativeFor` loop/link-only terminal gate
+      and add the proveKinds arm.
 - [ ] **Phase 0 — the minimum viable function-entry tracing milestone.**
       Hot-call counting (advancing the gate tick), typed head anchors,
       `pending_call_anchor` arming (carrying `call_seq`, cleared on every

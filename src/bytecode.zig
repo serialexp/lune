@@ -186,6 +186,19 @@ pub const OpCode = enum(u8) {
     // ---- misc ----
     /// Stop top-level execution (implicit final instruction of the main chunk).
     halt,
+
+    /// `b` (+ orig operands preserved) patched FUNCTION-HEAD trace entry
+    ///             (doc 44 P0, the LuaJIT `BC_JFUNCF` analogue). Written ONLY
+    ///             into a per-VM copy-on-patch image over a head-qualified
+    ///             proto's pc 0 — canonical `Proto.code` NEVER contains it.
+    ///             Unlike `.jfor_loop`/`.jloop` the patched-over instruction
+    ///             is ARBITRARY (whatever the function body starts with), so
+    ///             the handler owns no canonical step semantics of its own:
+    ///             it tries the bound head trace and, on decline/bypass,
+    ///             tail-dispatches `patch.orig` through the ordinary handler
+    ///             table. `.b` carries the entry-patch slot index; appended
+    ///             LAST to keep the enum dense (doc 42 §4.6).
+    jfunc_head,
 };
 
 // Doc 42 §4.6: the tail-call dispatch tables index `[@intFromEnum(op)]`

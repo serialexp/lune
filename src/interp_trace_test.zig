@@ -4703,6 +4703,57 @@ test "recorder (head, doc 44 P0): a vararg callee never counts and never arms" {
     try testing.expect(!vm.trace.isRecording());
 }
 
+test "head e2e (doc 44 P0): recursive fib steady state — head trace enters via jfunc_head, all ten legs" {
+    // The arc's headline shape: fib records a `.head` trace closed by
+    // `terminal/self_call_interp` (committed mid-run at the default
+    // hotcall=112), the commit installs the pc-0 `jfunc_head` patch, and
+    // every later fib entry runs the traced prefix on tier-1a, resuming
+    // tier-0 at the unexecuted self-call. Base-case entries (n < 2) fail
+    // the branch guard and deopt to pc 0 with regs untouched. Byte-identical
+    // across the ten-leg matrix.
+    try expectProgram(
+        \\local function fib(n)
+        \\  if n < 2 then return n end
+        \\  return fib(n - 1) + fib(n - 2)
+        \\end
+        \\print(fib(18))
+    , "2584\n");
+}
+
+test "head e2e (doc 44 P0): hot non-recursive call — terminal/return_interp resumes at the ret, all ten legs" {
+    // A straight-line callee crossing hotcall inside a hot LOOP: the loop
+    // trace goes hot first (inlining the call), the head anchor arms off the
+    // still-interpreted warmup calls, and both coexist — the head's terminal
+    // publishes the summed temp the resumed `ret` returns.
+    try expectProgram(
+        \\local function mix(a, b)
+        \\  local s = a + b
+        \\  return s * 2 - a
+        \\end
+        \\local acc = 0
+        \\for i = 1, 300 do acc = acc + mix(acc % 7, i) end
+        \\print(acc)
+    , "91191\n");
+}
+
+test "head e2e (doc 44 P0): head trace with an upvalue read seed — same-proto closure swap re-resolves, all ten legs" {
+    // The callee reads a closed-over scalar: the head trace carries an
+    // `.upvalue` snapshot seed that must re-resolve per entry through the
+    // ENTERING closure (g's cell, not record-time f's). f then proves its
+    // own cell was never touched by g's entries.
+    try expectProgram(
+        \\local function make(k)
+        \\  return function(x) return x + k end
+        \\end
+        \\local f, g = make(10), make(1000)
+        \\local a = 0
+        \\for i = 1, 200 do a = a + f(i) end
+        \\local b = 0
+        \\for i = 1, 200 do b = b + g(i) end
+        \\print(a, b)
+    , "22100\t220100\n");
+}
+
 test "recorder (head, doc 44 P0): a depth-0 multret-forwarding return aborts — no head trace" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);

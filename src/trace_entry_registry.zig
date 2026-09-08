@@ -7,6 +7,7 @@
 const std = @import("std");
 const bytecode = @import("bytecode.zig");
 const trace_record = @import("trace_record.zig");
+const trace_code = @import("trace_code.zig");
 
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
@@ -19,6 +20,11 @@ pub const EntryPatch = struct {
     proto: *const Proto,
     patch_pc: u32,
     orig: Instr,
+    /// The op written into the image (doc 44 codex round 1: a first-class
+    /// field, never re-derived from `orig` — a head patch overwrites an
+    /// ARBITRARY pc-0 instruction, so `patchedEntryOp(orig.op)` is null
+    /// for it and only the loop kinds can re-derive).
+    patched_op: OpCode,
     live: bool = true,
     pending_unpatch: bool = false,
     tombstone: bool = false,
@@ -81,6 +87,9 @@ pub const EntryRegistry = struct {
     }
 
     pub fn resolvePatchPc(proto: *const Proto, anchor_pc: u32) ?u32 {
+        // Doc 44: a function-head anchor patches the callee's pc 0 (the
+        // LuaJIT FUNCF→JFUNCF analogue) — no back-edge scan applies.
+        if (trace_code.isHeadAnchorPc(anchor_pc)) return 0;
         var found: ?u32 = null;
         for (proto.code, 0..) |ins, i| {
             if (patchedEntryOp(ins.op) == null) continue;
@@ -99,8 +108,12 @@ pub const EntryRegistry = struct {
         const patch_pc = resolvePatchPc(t.code.anchor.proto, t.code.anchor.pc) orelse return .no_patch_pc;
         const img = self.ensureImage(t.code.anchor.proto) catch return .oom;
         const orig = t.code.anchor.proto.code[patch_pc];
-        const patched_op = patchedEntryOp(orig.op) orelse unreachable;
-        if (img[patch_pc].op == .jfor_loop or img[patch_pc].op == .jloop)
+        const patched_op: OpCode = if (trace_code.isHeadAnchorPc(t.code.anchor.pc))
+            .jfunc_head
+        else
+            patchedEntryOp(orig.op) orelse unreachable;
+        if (img[patch_pc].op == .jfor_loop or img[patch_pc].op == .jloop or
+            img[patch_pc].op == .jfunc_head)
             return .{ .incumbent = img[patch_pc].b };
 
         const idx: u16 = if (self.entry_patch_free.pop()) |free_idx|
@@ -123,6 +136,7 @@ pub const EntryRegistry = struct {
             .proto = t.code.anchor.proto,
             .patch_pc = patch_pc,
             .orig = orig,
+            .patched_op = patched_op,
             .seed_count = seed_count,
         };
         t.entry_slot = idx;
@@ -163,7 +177,7 @@ pub const EntryRegistry = struct {
     pub fn unpatchSlot(self: *EntryRegistry, idx: u16, live_records: []const *Trace) void {
         const p = self.entry_patches.items[idx];
         if (self.code_images.get(p.proto)) |img| {
-            std.debug.assert(img[p.patch_pc].op == patchedEntryOp(p.orig.op).? and img[p.patch_pc].b == idx);
+            std.debug.assert(img[p.patch_pc].op == p.patched_op and img[p.patch_pc].b == idx);
             std.debug.assert(std.meta.eql(p.orig, p.proto.code[p.patch_pc]));
             img[p.patch_pc] = p.orig;
         }
