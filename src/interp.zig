@@ -2251,7 +2251,8 @@ pub const Vm = struct {
         return !(self.suspend_ctl != null or self.record_safepoint_lines or
             self.trace.isRecording() or self.trace.pending_exit_anchor != null or
             self.trace.pending_replay_anchor != null or
-            self.trace.pending_call_anchor != null);
+            self.trace.pending_call_anchor != null or
+            self.trace.pending_ret_anchor != null);
     }
 
     // ------------------------------------------------------------------------
@@ -2591,6 +2592,14 @@ pub const Vm = struct {
         if (mode == .full and self.trace.pending_call_anchor != null) {
             _ = self.trace.maybeStartHead(st.proto, @intCast(cur), st.base, st.frame.call_seq);
         }
+        // (10c) Continuation anchor (doc 44 D12b): a hot post-call resume pc
+        // flagged in `opRet` arms a `.cont` recording the moment the prologue
+        // reaches the caller's frozen cursor. Same `.full`-only,
+        // before-the-mirror placement and consume-or-discard self-cleaning
+        // as (10b).
+        if (mode == .full and self.trace.pending_ret_anchor != null) {
+            _ = self.trace.maybeStartCont(st.proto, @intCast(cur), st.base, st.frame.call_seq);
+        }
         // (11) Recording mirror — `.full` only. Mirrors this
         // instruction (and its observed operand types) into the trace
         // IR *before* tier-0 executes it.
@@ -2843,11 +2852,14 @@ pub const Vm = struct {
     /// and the D11 pushed-descent consumer; violations panic in release too —
     /// a malformed ledger means native code jumped somewhere the registry
     /// never armed, and continuing would account (and resume) against fiction.
-    fn resolveHeadRowOwner(self: *Vm, row_id: u32, proto: *const Proto) *trace.Trace {
+    /// (D12b round 6 change 4: validation is EXACT-anchor — a proto can now
+    /// carry several one-shot anchors, and a row fused under anchor A must
+    /// never validate against an entry at anchor B.)
+    fn resolveHeadRowOwner(self: *Vm, row_id: u32, proto: *const Proto, anchor_pc: u32) *trace.Trace {
         const ts = &self.trace;
         const owner = ts.traceById(row_id) orelse @panic("head burst: row owner did not resolve");
-        if (owner.code.anchor.proto != proto or !trace.isHeadAnchorPc(owner.code.anchor.pc))
-            @panic("head burst: row owner is not a head trace of this anchor");
+        if (owner.code.anchor.proto != proto or owner.code.anchor.pc != anchor_pc)
+            @panic("head burst: row owner is not a one-shot trace of this exact anchor");
         return owner;
     }
 
@@ -2892,7 +2904,7 @@ pub const Vm = struct {
         var i: usize = 0;
         while (i < ledger.len) : (i += 1) {
             const row = ledger[i];
-            const owner = self.resolveHeadRowOwner(row.id, proto);
+            const owner = self.resolveHeadRowOwner(row.id, proto, ct.code.anchor.pc);
             if (dedup: {
                 for (ts.head_burst_visited[0..ts.head_burst_visited_len]) |vid| {
                     if (vid == owner.id) break :dedup false;
@@ -3027,7 +3039,7 @@ pub const Vm = struct {
         var i: usize = 0;
         while (i < ledger.len) : (i += 1) {
             const row = ledger[i];
-            const owner = self.resolveHeadRowOwner(row.id, proto);
+            const owner = self.resolveHeadRowOwner(row.id, proto, ct.code.anchor.pc);
             const seg_local: usize = row.cum - (if (i == 0) 0 else ledger[i - 1].cum);
             if (i != ledger.len - 1) {
                 // INTERMEDIATE row: a D10 armed handoff mid-descent —
@@ -3521,7 +3533,7 @@ pub const Vm = struct {
             // (round 4's factual correction). Loop-anchor multi-row ledgers
             // still flow to `driveDispatcherLedger` further down.
             if (ran_native and result.ledger_len > 1 and
-                trace.isHeadAnchorPc(ct.code.anchor.pc))
+                trace.anchorKind(ct.code.anchor.pc) != .loop)
             {
                 const d = self.consumeHeadBurst(ct, self.trace.ledger_scratch[0..result.ledger_len], proto);
                 for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
@@ -3600,18 +3612,18 @@ pub const Vm = struct {
                 for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
                 return .{ .resume_tier0 = @intCast(term.aux) };
             }
-            // Doc 44 P0: a head trace's guard-fail exit — deopt to function
-            // entry (regs untouched since pc 0). The loop-anchor grammar
-            // below (hot-exit wants, continuations, prime sides, chains)
-            // reasons about back-edge anchors; none of it applies to the
-            // sentinel, and `noteTakenExit`'s side-trace want would only
-            // UNPATCH the head's sole entry (P1 owns base-path side traces).
-            // Charge the ordinary zero receipt — the thrash gate stays live,
-            // so a head that keeps failing its guards still retires — and
-            // fall to `.next_candidate`: the jfunc_head arm then runs the
-            // canonical pc-0 instruction (returning `.resume_tier0(0)` here
+            // Doc 44 P0/D12b: a one-shot trace's (head or cont) guard-fail
+            // exit — deopt to its entry pc (regs untouched since entry). The
+            // loop-anchor grammar below (hot-exit wants, continuations,
+            // prime sides, chains) reasons about back-edge anchors; none of
+            // it applies to a sentinel/tagged anchor, and `noteTakenExit`'s
+            // side-trace want would only UNPATCH the sole entry. Charge the
+            // ordinary zero receipt — the thrash gate stays live, so a
+            // one-shot page that keeps failing its guards still retires —
+            // and fall to `.next_candidate`: the patch arm then runs the
+            // canonical instruction (returning `.resume_tier0(entry)` here
             // would re-dispatch the patch and spin).
-            if (trace.isHeadAnchorPc(final.code.anchor.pc)) {
+            if (trace.anchorKind(final.code.anchor.pc) != .loop) {
                 self.trace.dbg("head zero-exit: trace={d} native={} reason={s} exit={d} completed={d}", .{ final.id, ran_native, @tagName(result.exit_reason), result.exit_instr, result.completed });
                 // Doc 44 D10: a REAL native guard deopt records the walk-local
                 // handoff evidence (native-only, matching Part S — evidence
@@ -4070,7 +4082,14 @@ pub const Vm = struct {
         pc: usize,
     ) EntryDirective {
         const ct = patch.trace; // live pre-drain ⇒ valid (§R7-2)
-        const is_head = trace.isHeadAnchorPc(ct.code.anchor.pc);
+        // Doc 44 D12b (round 6 change 4): one-shot is a BEHAVIOR class (head
+        // + cont share the walk/retention/want/evidence machinery), but every
+        // per-anchor operation below is keyed on the EXACT anchor pc — a
+        // proto now has many one-shot anchors, and a cont-anchor-A row must
+        // never validate (or select siblings) against cont-anchor-B.
+        const anchor_pc = ct.code.anchor.pc;
+        const is_head = trace.anchorKind(anchor_pc) == .head;
+        const one_shot = trace.anchorKind(anchor_pc) != .loop;
         var dead: [trial_visited_cap]*trace.Trace = undefined;
         var ndead: usize = 0;
         // The walk marks each candidate visited before entering. Seed the
@@ -4089,9 +4108,11 @@ pub const Vm = struct {
         // only holds within one walk). Same freshness rule for the burst
         // visited scratch: stale ids from a prior activation's burst must
         // not shrink THIS walk's candidate set.
-        if (is_head) {
+        if (one_shot) {
             self.trace.head_walk_fail = null;
             self.trace.head_burst_visited_len = 0;
+        }
+        if (is_head) {
             // Doc 44 D12a (A2): consume the descent-bottom failer carry. The
             // `call_seq` pin proves this walk belongs to the very activation
             // the descent deopted in (globally monotone — a stale carry can
@@ -4107,9 +4128,12 @@ pub const Vm = struct {
                     self.trace.head_walk_fail = pdf.exit;
             }
         }
-        // Doc 44 D9: quiet-first for heads — the lean episode when nothing
-        // that could observe or steer it is live; the full path otherwise.
-        var directive = if (is_head)
+        // Doc 44 D9: quiet-first for one-shot anchors (head + cont, D12b) —
+        // the lean episode when nothing that could observe or steer it is
+        // live; the full path otherwise. (`enterHeadNativeQuiet` is
+        // anchor-exact throughout: every receipt/evidence call keys on
+        // `ct.code.anchor`, and cont pages never emit the push epilogue.)
+        var directive = if (one_shot)
             (if (self.headEpisodeQuiet(ct)) |nt|
                 self.enterHeadNativeQuiet(ct, nt, closure, proto, regs, base)
             else
@@ -4118,28 +4142,29 @@ pub const Vm = struct {
             self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx);
         // Doc 44 D10: a fused burst entered several owners — exclude them
         // from re-selection this walk.
-        if (is_head) {
+        if (one_shot) {
             self.mergeHeadBurstVisited(visited[0..], &nvisited);
             wctx.visited = visited[0..nvisited];
         }
-        // Doc 44 D8 (P1a): the head sibling walk. On a zero exit from the
-        // incumbent, try the anchor's OTHER head traces — `nextTraceExcluding`
-        // is the same deterministic selection the loop walk uses (highest
-        // hit_count, registry insertion order as tiebreak). Each candidate's
-        // entry is coherent (a head guard fail leaves regs untouched at pc 0).
-        // Removal stays safe mid-walk: `removeTrace` is cache-scan-guarded
-        // (idempotent), and every candidate is selected from the LIVE cache
-        // immediately before entry.
+        // Doc 44 D8 (P1a): the one-shot sibling walk. On a zero exit from the
+        // incumbent, try the EXACT anchor's other traces —
+        // `nextTraceExcluding` is the same deterministic selection the loop
+        // walk uses (highest hit_count, registry insertion order as
+        // tiebreak). Each candidate's entry is coherent (a one-shot guard
+        // fail leaves regs untouched at the entry pc). Removal stays safe
+        // mid-walk: `removeTrace` is cache-scan-guarded (idempotent), and
+        // every candidate is selected from the LIVE cache immediately before
+        // entry.
         var walk_truncated = false;
-        if (is_head) {
+        if (one_shot) {
             while (directive == .next_candidate) {
                 if (nvisited >= trial_visited_cap) {
                     // Capacity: unvisited siblings may remain — all-declined
                     // strike semantics require all-visited (review round 2).
-                    walk_truncated = self.trace.nextTraceExcluding(proto, trace.FUNC_HEAD_PC, visited[0..nvisited]) != null;
+                    walk_truncated = self.trace.nextTraceExcluding(proto, anchor_pc, visited[0..nvisited]) != null;
                     break;
                 }
-                const sib = self.trace.nextTraceExcluding(proto, trace.FUNC_HEAD_PC, visited[0..nvisited]) orelse break;
+                const sib = self.trace.nextTraceExcluding(proto, anchor_pc, visited[0..nvisited]) orelse break;
                 visited[nvisited] = sib;
                 nvisited += 1;
                 wctx.visited = visited[0..nvisited];
@@ -4154,27 +4179,40 @@ pub const Vm = struct {
                 wctx.visited = visited[0..nvisited];
             }
             // Doc 44 D8: every candidate declined this activation — consume a
-            // standing head-sibling want on the CURRENT activation (review
-            // round 2's reframe): transfer it into `pending_call_anchor` pinned
-            // to this frame's `call_seq` and park through the `.full` prologue,
-            // so `maybeStartHead` arms at pc 0 of the very activation whose
-            // path just failed every candidate. Transfer rules: never while a
-            // recording is active or another pending exists; re-check the gate.
+            // standing sibling want on the CURRENT activation (review round
+            // 2's reframe): transfer it into the kind-matching pending
+            // (`pending_call_anchor` for a head, `pending_ret_anchor` for a
+            // cont — D12b) pinned to this frame's `call_seq` and park through
+            // the `.full` prologue, so the matching consumer arms at the
+            // entry pc of the very activation whose path just failed every
+            // candidate. EXACT-key match (round 6 change 4). Transfer rules:
+            // never while a recording is active or another pending exists;
+            // re-check the gate.
             if (directive == .next_candidate) {
                 if (self.trace.wants_head_sibling) |wanted| {
-                    if (wanted.proto == proto and trace.isHeadAnchorPc(wanted.pc) and
+                    if (wanted.proto == proto and wanted.pc == anchor_pc and
                         !self.trace.isRecording() and self.trace.pending_call_anchor == null and
+                        self.trace.pending_ret_anchor == null and
                         !self.trace.recordingBarred(wanted))
                     {
                         self.trace.wants_head_sibling = null;
                         const src = self.trace.head_want_src;
                         self.trace.head_want_src = null;
                         self.trace.dbg("head-want transfer: arming sibling recording on current activation (src t={?})", .{if (src) |s| s.trace_id else null});
-                        self.trace.pending_call_anchor = .{
-                            .proto = proto,
-                            .base = base,
-                            .call_seq = self.frames[self.depth - 1].call_seq,
-                        };
+                        if (is_head) {
+                            self.trace.pending_call_anchor = .{
+                                .proto = proto,
+                                .base = base,
+                                .call_seq = self.frames[self.depth - 1].call_seq,
+                            };
+                        } else {
+                            self.trace.pending_ret_anchor = .{
+                                .proto = proto,
+                                .resume_pc = trace.entryPc(anchor_pc),
+                                .base = base,
+                                .call_seq = self.frames[self.depth - 1].call_seq,
+                            };
+                        }
                         directive = .{ .switch_mode_at = pc };
                     }
                 }
@@ -4183,9 +4221,9 @@ pub const Vm = struct {
         // A patched entry has no back-edge sibling walk. If a zero-progress
         // exit made a LOOP side want hot, consume it at the coherent header
         // now; otherwise the back-edge arm is one iteration late and records
-        // the old shape again. (Loop anchors only — head wants are consumed
-        // above.)
-        if (!is_head and directive == .next_candidate and self.trace.consumeSideTraceWantAtResume(proto, @intCast(pc))) {
+        // the old shape again. (Loop anchors only — one-shot wants are
+        // consumed above.)
+        if (!one_shot and directive == .next_candidate and self.trace.consumeSideTraceWantAtResume(proto, @intCast(pc))) {
             directive = if (mode == .fast)
                 .{ .switch_mode_at = pc }
             else
@@ -4196,14 +4234,15 @@ pub const Vm = struct {
         // set, then never touch `patch` again (the slot may have been reused).
         if (patch.live) {
             if (directive == .next_candidate) {
-                // Doc 44 D8 (review round 2 blocker 1): a head patch accrues NO
-                // retirement strikes while the anchor is below sibling capacity
-                // or the walk truncated — `patch_strikes (4) < hotexit (10)`
-                // would retire the SOLE entry before any exit could ever get
-                // hot, reproducing the P0 coverage collapse. At capacity, with
-                // every sibling visited, ordinary strikes resume.
-                const head_retention = is_head and (walk_truncated or
-                    self.trace.countTracesAt(.{ .proto = proto, .pc = trace.FUNC_HEAD_PC }) < self.trace.config.max_traces_per_anchor);
+                // Doc 44 D8 (review round 2 blocker 1): a one-shot patch
+                // accrues NO retirement strikes while the EXACT anchor is
+                // below sibling capacity or the walk truncated —
+                // `patch_strikes (4) < hotexit (10)` would retire the SOLE
+                // entry before any exit could ever get hot, reproducing the
+                // P0 coverage collapse. At capacity, with every sibling
+                // visited, ordinary strikes resume.
+                const head_retention = one_shot and (walk_truncated or
+                    self.trace.countTracesAt(.{ .proto = proto, .pc = anchor_pc }) < self.trace.config.max_traces_per_anchor);
                 if (!head_retention) {
                     patch.strikes +|= 1;
                     if (patch.strikes >= self.trace.config.patch_strikes)
@@ -4279,6 +4318,7 @@ pub const Vm = struct {
             .jfor_loop => opJForLoop(mode),
             .jloop => opJLoop(mode),
             .jfunc_head => opJFuncHead(mode),
+            .jcont => opJCont(mode),
             .tfor_loop => opTForLoop(mode),
             .new_table => opNewTable(mode),
             .get_index => opGetIndex(mode),
@@ -4924,6 +4964,75 @@ pub const Vm = struct {
         }.h;
     }
 
+    // Doc 44 D12b: patched CONTINUATION trace entry (the return-side
+    // `jfunc_head` twin). Written only into a per-VM image over a hot
+    // post-call resume pc. Like `.jfunc_head` the patched-over instruction is
+    // ARBITRARY, so every decline/bypass tail-dispatches the canonical
+    // instruction through the ordinary handler table. Entered from `opRet`'s
+    // dispatchTail — and from straight-line flow into the same pc, which is
+    // free extra coverage (the trace guards its own entry types).
+    fn opJCont(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr_in: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const self = vm;
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const cur_pc = pc - 1; // == patch_pc == the resume pc
+                const slot: u16 = instr_in.b;
+                const patch = self.trace.registry.entry_registry.entry_patches.items[slot];
+                // Every decline/bypass below dispatches `&st.proto.code[cur_pc]`
+                // (canonical-identical to `patch.orig` by the install
+                // invariant) — never `&patch.orig` (no successor instruction
+                // behind a detached struct pointer; the jfunc_head note).
+                if (!patch.live) {
+                    // §R6-1 deferred-unpatch recovery.
+                    self.trace.unpatchSlot(slot);
+                    return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
+                }
+                // §R1-5 bypass set: jfunc_head's set + the pending RET anchor
+                // (a `.cont` recording arming at this very pc must see the
+                // virgin instruction). Coverage is NOT in the set for the same
+                // reason as jfunc_head: this patch is the anchor's ONLY entry.
+                if (self.trace.isRecording() or self.suspend_ctl != null or
+                    self.record_safepoint_lines or self.trace.config.record_exec_log or
+                    self.trace.pending_exit_anchor != null or
+                    self.trace.pending_replay_anchor != null or
+                    self.trace.pending_call_anchor != null or
+                    self.trace.pending_ret_anchor != null)
+                {
+                    return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
+                }
+                // Patched entry: the identical entry/receipt routine. Guard
+                // failures leave regs untouched since entry, so the zero-exit
+                // resume at `cur_pc` re-runs the continuation on tier-0 from
+                // the same state — the entry deopt snapshot IS this pc's
+                // register state.
+                const directive = self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, cur_pc);
+                if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
+                    st.code = self.cachedCodeFor(st.frame, st.proto);
+                    st.code_gen = self.trace.registry.entry_registry.image_gen;
+                }
+                switch (directive) {
+                    .next_candidate => {
+                        // T3: a recording must never run under `.fast`.
+                        if (mode == .fast and self.trace.isRecording()) {
+                            st.frame.pc = cur_pc;
+                            return .switch_mode;
+                        }
+                        return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
+                    },
+                    .resume_tier0 => |rpc| return dispatchTail(mode, st, rpc, vm),
+                    .switch_mode_at => |rpc| {
+                        st.frame.pc = rpc;
+                        return .switch_mode;
+                    },
+                    // Doc 44 D12b v1: cont pages never lower the push epilogue
+                    // (their self-call terminal exits plain until D12c links).
+                    .resume_pushed_frame => @panic("pushed frames from a cont-anchor entry"),
+                }
+            }
+        }.h;
+    }
+
     // generic-for test: the preceding `call` filled R[a+3..] with the
     // iterator's results. Continue iff the first var is non-nil (Lua stops
     // only on nil; `false` continues), publishing it as the next control
@@ -5411,6 +5520,17 @@ pub const Vm = struct {
                 self.depth -= 1;
                 reloadTopFrame(st);
                 self.stack_top = st.base + st.proto.num_registers;
+                // Doc 44 D12b: count this return toward the CALLER's
+                // continuation anchor at the frozen cursor (`st` is the
+                // caller now; `st.code` its freshly-reloaded image). The
+                // boundary return above never reaches here, so `stop_depth`
+                // returns are structurally excluded. A hot verdict sets
+                // `pending_ret_anchor`; the very next prologue (the
+                // dispatchTail below lands on the resume pc) arms it under
+                // `.full` — park and flip in `.fast`, the opCall discipline.
+                self.trace.onRetResume(st.proto, @intCast(st.frame.pc), st.base, st.frame.call_seq, st.code);
+                if (mode == .fast and self.trace.pending_ret_anchor != null)
+                    return .switch_mode;
                 return dispatchTail(mode, st, st.frame.pc, vm);
             }
         }.h;
@@ -6976,7 +7096,7 @@ inline fn applyJump(pc: usize, offset: i32) usize {
 /// recorder input. A recording that crosses a patched pc mirrors the immutable
 /// canonical instruction, so trace IR is byte-identical to an unpatched run.
 pub inline fn recordingMirrorInstr(proto: *const Proto, pc: usize, fetched: Instr) Instr {
-    return if (fetched.op == .jfor_loop or fetched.op == .jloop or fetched.op == .jfunc_head) proto.code[pc] else fetched;
+    return if (fetched.op == .jfor_loop or fetched.op == .jloop or fetched.op == .jfunc_head or fetched.op == .jcont) proto.code[pc] else fetched;
 }
 
 // ---------------------------------------------------------------------------

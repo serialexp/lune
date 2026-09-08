@@ -289,6 +289,14 @@ const Compiler = struct {
     // ---- emission ----
 
     fn emit(self: *Compiler, instr: Instr) Error!usize {
+        // Doc 44 D12b identity CONTRACT: every executable pc must stay below
+        // `trace_code.CONT_PC_BIT` (1 << 31) so a continuation anchor's
+        // tagged pc (`CONT_PC_BIT | resume_pc`) can never collide with an
+        // executable pc — and so no resume pc can reach `0x7fffffff`, whose
+        // encoding would alias `FUNC_HEAD_PC`. Hard-fail, not clamp: a
+        // 2-billion-instruction proto is corrupt input, not a program.
+        if (self.code.items.len >= 1 << 31)
+            return self.fail(self.cur_span, "function too large (2^31 instruction limit)");
         try self.code.append(self.arena, instr);
         try self.spans.append(self.arena, .{ .start = self.cur_span.start, .end = self.cur_span.end });
         return self.code.items.len - 1;

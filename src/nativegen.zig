@@ -7407,7 +7407,15 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 // call generically, raising any overflow error itself).
                 var no_push: ?x64.Label = null;
                 const term = t.instrs[i];
-                if (@as(trace.TerminalKind, @enumFromInt(@as(u16, @intCast(term.a)))) == .self_call_interp) {
+                // Doc 44 D12b v1: HEAD pages only. A cont page's self-call
+                // terminal must exit plain — the push's `jmp body_entry`
+                // targets its OWN page, which is wrong for a cont page (the
+                // callee's next activation belongs to the HEAD anchor; the
+                // D12c `.call_head` cross-page link is the lever that makes
+                // cont-page pushes correct).
+                if (trace_code.anchorKind(t.anchor.pc) == .head and
+                    @as(trace.TerminalKind, @enumFromInt(@as(u16, @intCast(term.a)))) == .self_call_interp)
+                {
                     if (seed_ctx) |ctx| if (ctx.self_call_push_fn) |push_fn| {
                         const decline = try a.label();
                         // C-ABI bracket: verbatim the seed-prologue protocol.

@@ -21,6 +21,41 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-08l — doc 44 D12b (continuation anchors) LANDED — regression carried openly
+
+D12b implemented per the committed round-6 design (73af1d3): post-call
+resume pcs as one-shot roots. Identity `CONT_PC_BIT` (bit 31) + `anchorKind`
+/`entryPc`/`contAnchorPc` (head sentinel first; compiler caps protos at 2^31
+instrs); `onRetResume` counting in opRet only (no tick, vararg + physical-pc
+collision refusal fail-closed by OP via `patchedEntryOp`); `pending_ret_anchor`
+→ `maybeStartCont` (`.full` prologue, `.fast` parks via switch_mode);
+TraceKind `.cont` = head's one-shot close grammar + ANY back-edge aborts
+`.cont_backedge` (3 sites); first-class `jcont` patch kind (opJCont mirrors
+opJFuncHead, `.resume_pushed_frame` panics — push epilogue is head-only);
+`enterPatchedTrace` one-shot walk parameterized on EXACT anchor pc + kind;
+fail-closed kind audit across 10 files; `maybeRepatchCont` D8 flavour.
+
+**Receipts (`--jit-stats`) and the honest verdict:** formation is perfect —
+100% residency, zero fallback on every cont anchor (fib 2 cont anchors ×
+2.18M entries at ~250–390 c/entry; btrees 3 × 657k). But the design's
+"board ≈flat" prediction was WRONG: each cont entry is a full native
+episode that terminals out after ~1 pass, so the unlinked toll costs
+fib 262.4→413.5 ms and btrees 287.9→450.4 ms (board
+20260908-193902-3631cb8.tsv). ~150 extra cycles × 4.36M entries on fib.
+This is exactly the seam D12c's `.ret_cont`/`.call_head` links + native
+frame pop remove — the regression is carried openly, not an open question.
+Tests: fib kind-counted (1 head + 2 cont, one self_call_interp + one
+return_interp); non-recursive cont formation; `.cont_backedge` gating;
+collision refusal pinned on a resume pc that IS a `for_loop` back-edge.
+All gates green: `zig build test` ×2 (plain + jit-debug), hashgate 84×2,
+wasm, viz 69, boundaries.
+
+NEXT: **D12c** (native frame pop `nativeSelfRetPop` + K=4 `.ret_cont` link
+slots + `.call_head` cont-page links + `.ret_pop`/`.call_push` LedgerKinds,
+blackout bound max_call_depth + LEDGER_CAP) — the payoff slice that consumes
+the toll above. Queued behind: P1 recunroll, P1a matrix tests, per-proto
+codeFor cache, quiet-predicate anchor-locality fragility.
+
 ## Status 2026-09-08k — doc 44 §D12 designed (codex round 6) + D12a LANDED
 
 §D12 (return side) committed 73af1d3, codex round-6 reviewed (sound-with-

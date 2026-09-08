@@ -4673,16 +4673,40 @@ test "recorder (head, doc 44 P0): fib-shaped recursion records a head trace clos
     );
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    // Doc 44 D12b: the same warmup now also forms CONTINUATION traces at
+    // fib's two post-call resume pcs (returns count at `hotcall` too) — one
+    // closing self_call_interp (after fib(n-1), the `+ fib(n-2)` call), one
+    // return_interp (after fib(n-2), the add + ret). Count by kind.
     try testing.expectEqual(@as(u32, 0), vm.trace.record_gate.count());
-    const t = vm.trace.registry.cache.items[0];
-    try testing.expectEqual(trace.FUNC_HEAD_PC, t.code.anchor.pc);
-    const last = t.code.instrs[t.code.instrs.len - 1];
-    try testing.expectEqual(trace.trace_ir.IrOp.terminal, last.op);
-    try testing.expectEqual(
-        @intFromEnum(trace.trace_ir.TerminalKind.self_call_interp),
-        last.a,
-    );
+    var heads: usize = 0;
+    var conts: usize = 0;
+    var saw_cont_self_call = false;
+    var saw_cont_return = false;
+    for (vm.trace.registry.cache.items) |t| {
+        const last = t.code.instrs[t.code.instrs.len - 1];
+        switch (trace.anchorKind(t.code.anchor.pc)) {
+            .head => {
+                heads += 1;
+                try testing.expectEqual(trace.trace_ir.IrOp.terminal, last.op);
+                try testing.expectEqual(
+                    @intFromEnum(trace.trace_ir.TerminalKind.self_call_interp),
+                    last.a,
+                );
+            },
+            .cont => {
+                conts += 1;
+                try testing.expectEqual(trace.trace_ir.IrOp.terminal, last.op);
+                switch (@as(trace.trace_ir.TerminalKind, @enumFromInt(@as(u16, @intCast(last.a))))) {
+                    .self_call_interp => saw_cont_self_call = true,
+                    .return_interp => saw_cont_return = true,
+                }
+            },
+            .loop => return error.TestUnexpectedResult, // no loops in this program
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), heads);
+    try testing.expectEqual(@as(usize, 2), conts);
+    try testing.expect(saw_cont_self_call and saw_cont_return);
 }
 
 test "head exclusion (doc 44 D1): a head trace's guards never classify as bridge or loop-done, and contribute no successor edges" {
@@ -4703,27 +4727,149 @@ test "head exclusion (doc 44 D1): a head trace's guards never classify as bridge
     );
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
-    const t = vm.trace.registry.cache.items[0];
-    try testing.expectEqual(trace.FUNC_HEAD_PC, t.code.anchor.pc);
+    // Doc 44 D12b: the warmup now commits ONE head trace plus fib's two cont
+    // traces — and the D1 exclusions must hold for EVERY one-shot trace
+    // (head and cont alike), so run the classifier sweep over all of them.
+    try testing.expectEqual(@as(usize, 3), vm.trace.registry.cache.items.len);
+    var heads: usize = 0;
+    for (vm.trace.registry.cache.items) |t| {
+        try testing.expect(trace.anchorKind(t.code.anchor.pc) != .loop);
+        if (trace.anchorKind(t.code.anchor.pc) == .head) heads += 1;
 
-    for (0..t.code.instrs.len) |i| {
-        // Site 1 (trace_code.zig): loop-region bridging.
-        try testing.expect(!t.code.classifyBridgeCandidate(i));
-        try testing.expect(!t.code.isBridgeCandidate(i));
-        // Site 2 (trace_code.zig): the loop-done guard classifier twin.
-        try testing.expect(!t.code.isNumericForLoopDoneGuard(i));
-        // Site 3 (trace.zig): the arming-side loop-done classifier.
-        try testing.expect(!trace.isLoopDoneGuardIndex(t, i));
+        for (0..t.code.instrs.len) |i| {
+            // Site 1 (trace_code.zig): loop-region bridging.
+            try testing.expect(!t.code.classifyBridgeCandidate(i));
+            try testing.expect(!t.code.isBridgeCandidate(i));
+            // Site 2 (trace_code.zig): the loop-done guard classifier twin.
+            try testing.expect(!t.code.isNumericForLoopDoneGuard(i));
+            // Site 3 (trace.zig): the arming-side loop-done classifier.
+            try testing.expect(!trace.isLoopDoneGuardIndex(t, i));
+        }
+        // Site 4 (trace_link.zig): the structural successor graph — no edge
+        // from any one-shot trace's keyed exits.
+        for (t.code.exit_prov) |ep| {
+            try testing.expectEqual(
+                @as(?trace.TraceState.SuccAnchor, null),
+                vm.trace.resolveSuccessorAnchor(t, ep),
+            );
+        }
     }
-    // Site 4 (trace_link.zig): the structural successor graph — no edge from
-    // any of the head trace's keyed exits.
-    for (t.code.exit_prov) |ep| {
-        try testing.expectEqual(
-            @as(?trace.TraceState.SuccAnchor, null),
-            vm.trace.resolveSuccessorAnchor(t, ep),
-        );
+    try testing.expectEqual(@as(usize, 1), heads);
+}
+
+test "recorder (cont, doc 44 D12b): a hot NON-recursive call site forms a continuation trace closed by return_interp" {
+    // The generality pin: cont anchors are any hot call site's continuation,
+    // not a recursion feature. `f` returns into `g` 40 times; at hotcall=4
+    // the resume pc in `g` arms a `.cont` recording whose straight-line
+    // continuation (`+ 1`, depth-0 ret) closes return_interp. The driver
+    // loop is kept cold (hotloop huge) so the only committed traces are the
+    // one-shot family's; the resume pc AFTER `g(i)` sits inside the loop
+    // body, so its cont recording aborts `.cont_backedge` into the record
+    // gate (asserted cont-kind, the designed loop-yielding refusal).
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local function f(x) return x * 2 end
+        \\local function g(x) return f(x) + 1 end
+        \\local total = 0
+        \\for i = 1, 40 do total = total + g(i) end
+        \\print(total)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = false;
+    vm.trace.config.optimize = false;
+    vm.trace.config.hotloop = 1 << 24; // driver loop never arms
+    vm.trace.config.hotcall = 4;
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings("1680\n", sink.buffered());
+
+    var cont_return = false;
+    for (vm.trace.registry.cache.items) |t| {
+        try testing.expect(trace.anchorKind(t.code.anchor.pc) != .loop);
+        if (trace.anchorKind(t.code.anchor.pc) != .cont) continue;
+        const last = t.code.instrs[t.code.instrs.len - 1];
+        try testing.expectEqual(trace.trace_ir.IrOp.terminal, last.op);
+        if (last.a == @intFromEnum(trace.trace_ir.TerminalKind.return_interp))
+            cont_return = true;
     }
+    try testing.expect(cont_return);
+    // The in-loop resume pc's recording died on the back-edge, cont-gated.
+    var saw_cont_gate = false;
+    var it = vm.trace.record_gate.iterator();
+    while (it.next()) |e| {
+        if (trace.anchorKind(e.key_ptr.pc) == .cont) saw_cont_gate = true;
+    }
+    try testing.expect(saw_cont_gate);
+}
+
+test "cont collision refusal (doc 44 D12b): a resume pc holding a patchable-op site forms no cont anchor" {
+    // `for i = 1, 8 do f(i) end` with the call as the body's last statement:
+    // f's resume pc holds the loop's own `for_loop` back-edge — the exact pc
+    // a `jfor_loop` patch would claim if the loop got hot. The physical-pc
+    // collision rule (round 6 change 3) refuses cont formation at any such
+    // site outright — no counter entry, no recording, no patch —
+    // conservatively by OP via `patchedEntryOp` (fail-closed is the v1
+    // contract; a multiplexed entry opcode is the recorded durable
+    // follow-up).
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local function f(i) return i < 40 end
+        \\for i = 1, 8 do f(i) end
+        \\print("done")
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = false;
+    vm.trace.config.optimize = false;
+    vm.trace.config.hotloop = 1 << 24; // isolate: the repeat loop never arms
+    vm.trace.config.hotcall = 4;
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings("done\n", sink.buffered());
+
+    // The shape premise, pinned so a compiler change can't silently turn
+    // this into a plain formation test: f's resume pc holds a patchable op
+    // (the numeric for's own back-edge).
+    var call_pc: ?usize = null;
+    for (chunk.proto.code, 0..) |ins, ii| {
+        if (ins.op == .call and call_pc == null) call_pc = ii;
+    }
+    try testing.expect(chunk.proto.code[call_pc.? + 1].op == .for_loop);
+    // Stronger than "no cont trace": the collision rule bars COUNTING, so no
+    // cont-kind key may exist in the warming counters or gates at all.
+    var cit = vm.trace.counters.iterator();
+    while (cit.next()) |e|
+        try testing.expect(trace.anchorKind(e.key_ptr.pc) != .cont);
+    var git = vm.trace.record_gate.iterator();
+    while (git.next()) |e|
+        try testing.expect(trace.anchorKind(e.key_ptr.pc) != .cont);
+    for (vm.trace.registry.cache.items) |t|
+        try testing.expect(trace.anchorKind(t.code.anchor.pc) != .cont);
 }
 
 test "recorder (head, doc 44 P0): a vararg callee never counts and never arms" {
@@ -4868,7 +5014,14 @@ test "recorder (head, doc 44 D8): the sibling lifecycle — want, transfer, seco
         try testing.expectEqual(trace.trace_ir.IrOp.terminal, last.op);
     }
     try testing.expectEqual(@as(usize, 2), heads);
-    try testing.expectEqual(@as(u32, 0), vm.trace.record_gate.count());
+    // Doc 44 D12b: the post-call resume pcs sit INSIDE the outer `for` body,
+    // so their cont recordings meet the loop back-edge and abort
+    // `.cont_backedge` into the record gate — the designed v1 loop-yielding
+    // refusal. The HEAD lifecycle pin stands: no gate entry at a head anchor.
+    var it = vm.trace.record_gate.iterator();
+    while (it.next()) |e| {
+        try testing.expectEqual(trace.AnchorPcKind.cont, trace.anchorKind(e.key_ptr.pc));
+    }
     // The want must not linger once the sibling covers the failing path
     // (review round 2 blocker 3 — a stuck want would re-record duplicates).
     try testing.expect(vm.trace.wants_head_sibling == null);

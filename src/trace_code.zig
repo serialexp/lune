@@ -74,12 +74,56 @@ pub const UPVALUE_CELL_ANCHOR: u16 = std.math.maxInt(u16);
 /// outright, fail-closed; doc 44 D1).
 pub const FUNC_HEAD_PC: u32 = std.math.maxInt(u32);
 
+/// Doc 44 D12b: the `AnchorKey.pc` tag bit of a CONTINUATION anchor (a hot
+/// post-call resume pc; the return-side one-shot root). Anchor pc =
+/// `CONT_PC_BIT | resume_pc`. Sound ONLY under the compiler contract that
+/// every proto's code length stays `< 1 << 31` (`compiler.zig` hard-fails
+/// past it), which both keeps bit 31 free on executable pcs and excludes
+/// `resume_pc == 0x7fffffff` (whose encoding would alias `FUNC_HEAD_PC`).
+/// All encode/decode goes through `contAnchorPc` / `anchorKind` / `entryPc`
+/// — never raw bit tests at use sites.
+pub const CONT_PC_BIT: u32 = 1 << 31;
+
+/// Doc 44 D12b: the three anchor identity classes an `AnchorKey.pc` can
+/// carry. `head` and `cont` are the ONE-SHOT family (terminal-closing roots
+/// with a patched entry and no back-edge walk); `loop` is everything
+/// classic. One-shot is a behavior class, never an identity equivalence —
+/// per-anchor state (counters, gates, walks, wants, row validation) is
+/// always keyed on the EXACT `AnchorKey`.
+pub const AnchorPcKind = enum { loop, head, cont };
+
+/// Decode an `AnchorKey.pc`'s identity class. Head first: the sentinel
+/// (`maxInt`) has bit 31 set, so the cont test must never see it.
+pub inline fn anchorKind(pc: u32) AnchorPcKind {
+    if (pc == FUNC_HEAD_PC) return .head;
+    if (pc & CONT_PC_BIT != 0) return .cont;
+    return .loop;
+}
+
+/// The real bytecode pc an anchor's recording/entry starts at: pc 0 for a
+/// head, the masked resume pc for a cont, the pc itself for a loop.
+pub inline fn entryPc(pc: u32) u32 {
+    return switch (anchorKind(pc)) {
+        .head => 0,
+        .cont => pc & ~CONT_PC_BIT,
+        .loop => pc,
+    };
+}
+
+/// Encode a continuation anchor's `AnchorKey.pc` from its resume pc.
+pub inline fn contAnchorPc(resume_pc: u32) u32 {
+    std.debug.assert(resume_pc & CONT_PC_BIT == 0); // compiler length contract
+    return CONT_PC_BIT | resume_pc;
+}
+
 /// True iff `pc` is the function-head sentinel (not an executable pc).
 pub inline fn isHeadAnchorPc(pc: u32) bool {
     return pc == FUNC_HEAD_PC;
 }
 
 /// The real bytecode pc a head anchor's recording/entry starts at.
+/// (Superseded by `entryPc` for kind-generic sites; retained where the
+/// caller has already proven `.head`.)
 pub inline fn headEntryPc(pc: u32) u32 {
     return if (pc == FUNC_HEAD_PC) 0 else pc;
 }
@@ -306,11 +350,12 @@ pub const TraceCode = struct {
 
     pub fn isNumericForLoopDoneGuard(self: *const TraceCode, instr_idx: usize) bool {
         if (instr_idx >= self.instrs.len) return false;
-        // Doc 44 D1: a head trace has no loop-done exits — a zero-iteration
-        // `for` recorded through the body would otherwise classify here (its
-        // guard_true really does source from a `for_loop` op) and route into
-        // the loop-done slot/snapshot machinery. Kind check, fail-closed.
-        if (isHeadAnchorPc(self.anchor.pc)) return false;
+        // Doc 44 D1/D12b: a one-shot trace (head or cont) has no loop-done
+        // exits — a zero-iteration `for` recorded through the body would
+        // otherwise classify here (its guard_true really does source from a
+        // `for_loop` op) and route into the loop-done slot/snapshot
+        // machinery. Kind check, fail-closed.
+        if (anchorKind(self.anchor.pc) != .loop) return false;
         const guard = self.instrs[instr_idx];
         if (guard.op != .guard_true) return false;
         const exit_pc = trace_ir.guardExitPc(guard) orelse return false;
@@ -325,12 +370,13 @@ pub const TraceCode = struct {
 
     pub fn classifyBridgeCandidate(self: *const TraceCode, instr_idx: usize) bool {
         if (instr_idx >= self.instrs.len or self.peeled) return false;
-        // Doc 44 D1: a HEAD trace is never a bridge member — its branch guards
-        // (e.g. fib's base-case `jmp_if` guard) carry `.branch_cond` provenance
-        // and slot-bound φs below them, so the structural checks alone would
-        // admit it (`exit_pc >= anchor.pc` is vacuous against the sentinel).
-        // Explicit kind check, fail-closed.
-        if (isHeadAnchorPc(self.anchor.pc)) return false;
+        // Doc 44 D1/D12b: a ONE-SHOT trace (head or cont) is never a bridge
+        // member — its branch guards (e.g. fib's base-case `jmp_if` guard)
+        // carry `.branch_cond` provenance and slot-bound φs below them, so
+        // the structural checks alone would admit it (`exit_pc >= anchor.pc`
+        // is vacuous against the sentinel / tagged pc). Explicit kind check,
+        // fail-closed.
+        if (anchorKind(self.anchor.pc) != .loop) return false;
         const guard = self.instrs[instr_idx];
         if (guard.op != .guard_true and guard.op != .guard_false) return false;
         if (self.isNumericForLoopDoneGuard(instr_idx)) return false;

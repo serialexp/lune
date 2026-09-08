@@ -782,7 +782,7 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
 
     var parent: Trace = .{
         .code = .{
-            .anchor = undefined,
+            .anchor = .{ .proto = undefined, .pc = 7 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -792,7 +792,7 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
     };
     var child: Trace = .{
         .code = .{
-            .anchor = undefined,
+            .anchor = .{ .proto = undefined, .pc = 7 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -804,7 +804,7 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
     const CHILD_BODY2: usize = 0xF00D;
     var child2: Trace = .{
         .code = .{
-            .anchor = undefined,
+            .anchor = .{ .proto = undefined, .pc = 7 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -840,7 +840,7 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
     // A non-compiled parent is a no-op → returns false.
     var unsup: Trace = .{
         .code = .{
-            .anchor = undefined,
+            .anchor = .{ .proto = undefined, .pc = 7 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -889,7 +889,7 @@ test "disarmAllLinks (2c-E / 2.3c-0e): resets EVERY armed slot on entering the o
 
     var inner: Trace = .{
         .code = .{
-            .anchor = undefined,
+            .anchor = .{ .proto = undefined, .pc = 7 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -899,7 +899,7 @@ test "disarmAllLinks (2c-E / 2.3c-0e): resets EVERY armed slot on entering the o
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = undefined,
+            .anchor = .{ .proto = undefined, .pc = 7 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},

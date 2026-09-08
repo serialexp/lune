@@ -128,6 +128,13 @@ pub const AbortReason = enum {
     /// records (the LuaJIT-flavoured penalty/retry answer to doc 43 §8's read-
     /// routing question — read-only loops keep their free snapshot hoist).
     upvalue_mutable,
+    /// Doc 44 D12b: a `.cont` (continuation-anchor) recording met a loop
+    /// back-edge — at the tier-0 back-edge funnel (`onBackEdge`), or at the
+    /// recorder's own link sites (`recForPrepLink` running-loop path,
+    /// `recWhileLink` backward jmp). v1 keeps cont shapes
+    /// straight-line-to-terminal: loops have their own anchor machinery, so
+    /// a continuation that runs into one yields the loop to it, fail-closed.
+    cont_backedge,
 };
 const ExitProvenance = @import("trace_types.zig").ExitProvenance;
 const ProgramPoint = @import("trace_types.zig").ProgramPoint;
@@ -362,7 +369,24 @@ pub fn pathFromFrames(frames: []const InlineFrame, depth: u8) [MAX_INLINE_DEPTH]
 ///                  one-shot `.terminal` — at a depth-0 `ret`
 ///                  (return_interp) or a depth-0 direct self-call
 ///                  (self_call_interp) — never via `.loop`.
-pub const TraceKind = enum { root, side, continuation, head };
+/// - `.cont`      — a CONTINUATION-ANCHOR root (doc 44 D12b): armed by
+///                  `maybeStartCont` at a hot post-call resume pc (anchor
+///                  pc = `CONT_PC_BIT | resume_pc`). Inherits `.head`'s
+///                  one-shot close grammar verbatim (depth-0 `ret` →
+///                  return_interp; depth-0 direct self-call of the anchor
+///                  proto → self_call_interp) and every root-only policy —
+///                  stricter on loops: ANY back-edge met while recording
+///                  aborts `.cont_backedge` (straight-line-to-terminal v1;
+///                  distinct from the legacy `.continuation` loop-exit kind,
+///                  which may `.link`).
+pub const TraceKind = enum { root, side, continuation, head, cont };
+
+/// Doc 44 D12b: the ONE-SHOT recording family — head + cont share the
+/// terminal close grammar and every root-only policy. A behavior class,
+/// never an identity equivalence (per-anchor state stays exact-key).
+pub inline fn isOneShotKind(kind: TraceKind) bool {
+    return kind == .head or kind == .cont;
+}
 
 pub const RecordingSession = struct {
     pub const Options = struct { maxrecord: usize = 4096, peel: bool = true, optimize: bool = true };
@@ -823,13 +847,13 @@ pub const RecordingSession = struct {
             // (doc 27) instead of aborting.
             .call => try self.recCall(instr, regs, proto, multret),
             .ret => if (self.inline_depth == 0)
-                // Depth-0 return. A `.head` recording (doc 44) CLOSES here —
-                // the one-shot terminal, set before tier-0 executes the ret —
-                // unless the ret window is dynamic (`b == all_results` reads
-                // `multret_top`, which trace execution never sets: refused,
-                // codex round-1 change 4). A loop root still aborts (LLEAVE):
-                // it must not leave the loop.
-                (if (self.kind == .head)
+                // Depth-0 return. A one-shot recording (`.head`/`.cont`,
+                // doc 44) CLOSES here — the one-shot terminal, set before
+                // tier-0 executes the ret — unless the ret window is dynamic
+                // (`b == all_results` reads `multret_top`, which trace
+                // execution never sets: refused, codex round-1 change 4). A
+                // loop root still aborts (LLEAVE): it must not leave the loop.
+                (if (isOneShotKind(self.kind))
                     (if (instr.b == bytecode.all_results)
                         self.abort(.nyi_opcode)
                     else
@@ -2634,6 +2658,9 @@ pub const RecordingSession = struct {
         // back-edge target. A `.head` root (doc 44) is root-like here: its body's
         // loops record their own root traces.
         if (self.kind == .root or self.kind == .head) return self.abort(.nyi_opcode);
+        // Doc 44 D12b: a `.cont` recording never links and never enters a
+        // running loop — straight-line-to-terminal v1, fail-closed.
+        if (self.kind == .cont) return self.abort(.cont_backedge);
 
         // Locate the matching `for_loop` (the forward jump target) and verify the
         // shape. `pc` is the post-increment pc, so `pc + instr.aux` is the `for_loop`
@@ -2785,6 +2812,9 @@ pub const RecordingSession = struct {
             }
             return self.abort(.nyi_opcode); // LINNER → inner root + link
         }
+        // Doc 44 D12b: a `.cont` recording never links and never unrolls a
+        // while — any backward jmp aborts (straight-line-to-terminal v1).
+        if (self.kind == .cont) return self.abort(.cont_backedge);
 
         // Side/continuation recordings: no inner root yet → no-op (the historical
         // straight-line unroll). The inner while warms up via `onBackEdge` and
@@ -2873,7 +2903,10 @@ pub const RecordingSession = struct {
         // A dynamic argument window is refused: the re-executed call would
         // read `reg_top` state that trace execution never maintains (the
         // multret shadow is a RECORD-time resolution only).
-        if (self.kind == .head and self.inline_depth == 0 and cp == self.anchor.proto) {
+        // (Doc 44 D12b: `.cont` inherits the same close — a depth-0 direct
+        // call of the anchor proto, i.e. the caller recursing, terminates
+        // the continuation one-shot exactly like the head's.)
+        if (isOneShotKind(self.kind) and self.inline_depth == 0 and cp == self.anchor.proto) {
             if (instr.b == bytecode.all_results) return self.abort(.nyi_opcode);
             return self.closeHeadTerminal(.self_call_interp);
         }
@@ -3930,12 +3963,13 @@ pub const RecordingSession = struct {
     /// restores `base_off`. The result writes use *absolute* `reg_map` indices (the
     /// caller region is disjoint from and below the callee source region, so a
     /// single forward pass can read source then write dest without a buffer).
-    /// Doc 44 P0: request the one-shot close of a `.head` recording.
+    /// Doc 44 P0: request the one-shot close of a `.head` (or, D12b, `.cont`)
+    /// recording.
     /// `cur_pc` is post-increment, so the terminating instruction's own pc —
     /// where tier-0 resumes on a successful terminal exit and executes it
     /// exactly once — is `cur_pc - 1`.
     fn closeHeadTerminal(self: *RecordingSession, kind: trace_ir.TerminalKind) void {
-        std.debug.assert(self.kind == .head and self.inline_depth == 0);
+        std.debug.assert(isOneShotKind(self.kind) and self.inline_depth == 0);
         self.terminal_close = .{ .kind = kind, .resume_pc = self.cur_pc - 1 };
         self.close_requested = true;
     }

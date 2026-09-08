@@ -1,15 +1,15 @@
 # 44 — call anchors and return tracing (making recursion trace at all)
 
 Status: partial — P0 complete, P1a (D8 head siblings), P1b (D9 quiet head
-episode + S1/S2/S4), P4 slice 1 (D10 head-sibling exit-branch patching), and
-P4 slice 2 (D11 native frame push — true up-recursion on the descent side)
-landed; fib jit 263.5 ms / binary-trees 287.7 ms with 100% head coverage.
-The remaining fib gap (35× vs LuaJIT) is the return side: every `ret` is
-tier-0 and each post-leaf parent resumption re-opens an episode — §D12 owns
-it in three slices: D12a handoff-evidence symmetry under descents (LANDED —
-formation-order robustness, the fib(27)-shape fix), D12b continuation
-anchors (post-call resume traces), D12c native frame pop + return links
-(down-recursion; subsumes P3 and supersedes P2-for-recursion).
+episode + S1/S2/S4), P4 slice 1 (D10 head-sibling exit-branch patching), P4
+slice 2 (D11 native frame push — true up-recursion on the descent side), and
+§D12 slices a+b landed. D12b (continuation anchors) forms and enters cont
+traces at 100% residency on every resume anchor (fib 3/3, btrees 5 anchors)
+— but each entry is a full native episode that terminals out immediately
+(iters/entry ~1), so the UNLINKED toll regresses fib 262→414 ms and btrees
+288→450 ms. That toll is exactly what D12c (native frame pop +
+`.ret_cont`/`.call_head` links; subsumes P3, supersedes P2-for-recursion)
+removes — it is the next slice, not an open question.
 Codex-reviewed ×6 (gpt-5.6-sol, all sound-with-changes, every required change
 folded; ledger at bottom)
 Owner: Bart
@@ -223,6 +223,48 @@ to Done once everything inside a phase is checked.
       lucky-shape board, as designed. All gates green (both test
       builds, hashgate 84×2, wasm, viz 69, boundaries).
 
+- [x] **D12b — continuation anchors.** Landed per the round-6-amended
+      design. Identity: `CONT_PC_BIT` (bit 31) tagged resume pcs,
+      `anchorKind`/`entryPc`/`contAnchorPc` in trace_code (head sentinel
+      classified before the cont bit; compiler hard-fails protos at the
+      2^31 instruction limit so no legal pc aliases). Counting:
+      `onRetResume` in opRet's resume path only (stop-depth boundary
+      naturally excluded), shared `counters` map at the cont key,
+      `hotcall` threshold, NO tick; vararg callers and physical-pc
+      collisions (any already-patched op or `patchedEntryOp`-accepted
+      op at the resume pc — fail-closed by OP) refused at counting.
+      Recording: `pending_ret_anchor` consumed by `maybeStartCont` in
+      the `.full` prologue; `.fast` parks via `.switch_mode`; TraceKind
+      `.cont` inherits the head one-shot close grammar plus a stricter
+      rule — ANY loop back-edge aborts `.cont_backedge` (generic
+      funnel + both link-time sites). Entry: first-class `jcont` patch
+      kind (opcode appended last; registry `resolvePatchPc` bounds-
+      checked switch; cross-kind incumbents mutually exclude), opJCont
+      mirrors opJFuncHead with `pending_ret_anchor` in the §R1-5
+      bypass set and `.resume_pushed_frame` → panic (push epilogue is
+      head-only). One-shot walk: `enterPatchedTrace` parameterized on
+      EXACT anchor pc + kind (freshness, quiet path, burst merge,
+      sibling walk, retention, want transfer split head/cont);
+      fail-closed kind audit across trace_code/trace/trace_link/
+      trace_chain/nativegen/interp (every `isHeadAnchorPc` reviewed →
+      `anchorKind != .loop` or exact-kind). D8 recovery: `maybeRepatchCont`.
+      Tests: identity round-trips; fib forms 1 head + 2 cont traces
+      (kind-counted, one self_call_interp + one return_interp cont);
+      non-recursive call site forms a return_interp cont trace;
+      loop-body resume pcs gate `.cont_backedge`; collision refusal
+      pinned on a call whose resume pc IS the `for_loop` back-edge
+      (shape premise asserted); registry patch/incumbent/unpatch/OOB.
+      Receipts (`--jit-stats`): 100% residency, zero fallback on every
+      cont anchor — fib 2×2.18M entries (~250–390 c/entry), btrees
+      3×657k. Board: fib 262→413.5 ms, btrees 288→450.4 ms — the
+      predicted-flat verdict was WRONG: each cont entry pays the full
+      unlinked episode toll (iters/entry ~1), ~150 extra cycles ×
+      4.36M entries on fib. Formation infrastructure is correct and
+      consumed by D12c, whose links remove exactly this toll; the
+      regression is carried openly until D12c lands (next slice, same
+      arc). All gates green (both test builds, hashgate 84×2, wasm,
+      viz 69, boundaries).
+
 ### Outstanding
 - [ ] **Phase 1a follow-ups.** Remaining review-round-2 matrix tests
       (want-during-recording, sibling abort/cooldown retry,
@@ -238,11 +280,6 @@ to Done once everything inside a phase is checked.
       patch out in 4 consecutive `.next_candidate`s (`patch_strikes`), and
       since a retired head never re-arms (hasTrace blocks `onCallEntry`,
       installs only at commit) coverage collapses to 0 for those inputs.
-- [ ] **D12b — continuation anchors.** Post-call resume pcs as a new
-      one-shot root source: hot-counted at the `opRet` resume, recorded
-      with the existing D4/D5 grammar, entered via a first-class `jcont`
-      patch kind. Coverage infrastructure for D12c — board expected ≈flat
-      on its own (verdict requires `--jit-stats`, doc 31 D3 rule).
 - [ ] **D12c — native frame pop + return links (down-recursion).** The
       `.terminal(return_interp)` native lowering pops the episode's own
       pushed frames (opCall-symmetric helper, entry-frame floor) and

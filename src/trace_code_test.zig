@@ -132,3 +132,27 @@ test "fingerprint boundaries use initialized RegWindow lanes" {
     regs.setNil(1);
     try testing.expect(!wants_mixed_numbers.matchesFingerprint(regs));
 }
+
+test "anchor identity (doc 44 D12b): anchorKind/entryPc/contAnchorPc decode every class, head sentinel first" {
+    const tc = @import("trace_code.zig");
+    // Loop pcs: bit 31 clear, not the sentinel.
+    try testing.expectEqual(tc.AnchorPcKind.loop, tc.anchorKind(0));
+    try testing.expectEqual(tc.AnchorPcKind.loop, tc.anchorKind(7));
+    try testing.expectEqual(tc.AnchorPcKind.loop, tc.anchorKind((1 << 31) - 1));
+    try testing.expectEqual(@as(u32, 7), tc.entryPc(7));
+    // Head: the maxInt sentinel — it HAS bit 31 set, so the decoder must
+    // classify it head BEFORE the cont bit test.
+    try testing.expectEqual(tc.AnchorPcKind.head, tc.anchorKind(tc.FUNC_HEAD_PC));
+    try testing.expectEqual(@as(u32, 0), tc.entryPc(tc.FUNC_HEAD_PC));
+    // Cont: tagged resume pcs round-trip.
+    const tagged = tc.contAnchorPc(42);
+    try testing.expectEqual(tc.AnchorPcKind.cont, tc.anchorKind(tagged));
+    try testing.expectEqual(@as(u32, 42), tc.entryPc(tagged));
+    try testing.expectEqual(tc.AnchorPcKind.cont, tc.anchorKind(tc.contAnchorPc(1)));
+    // The largest resume pc the compiler contract permits ((1<<31)-2; -1 would
+    // alias FUNC_HEAD_PC and is excluded by the code-length hard-fail).
+    const top = tc.contAnchorPc((1 << 31) - 2);
+    try testing.expectEqual(tc.AnchorPcKind.cont, tc.anchorKind(top));
+    try testing.expectEqual(@as(u32, (1 << 31) - 2), tc.entryPc(top));
+    try testing.expect(top != tc.FUNC_HEAD_PC);
+}

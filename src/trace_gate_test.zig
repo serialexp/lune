@@ -154,7 +154,7 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     @memset(parent_slots, SHARED_EXIT);
     var link_parent: Trace = .{
         .code = .{
-            .anchor = undefined,
+            .anchor = .{ .proto = undefined, .pc = 7 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -165,7 +165,7 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     };
     var link_child: Trace = .{
         .code = .{
-            .anchor = undefined,
+            .anchor = .{ .proto = undefined, .pc = 7 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},

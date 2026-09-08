@@ -245,12 +245,13 @@ pub fn driveChain(
 ) ?ChainResult {
     const exit_instr = result.exit_instr;
     if (exit_instr == std.math.maxInt(u32)) return null;
-    // Doc 44 D1: head traces never chain. Their exits are consumed by the
-    // dispatcher's terminal/zero-exit consumers before this is ever reached,
-    // but the resume-pc derivation below (`.ordinary_header => anchor.pc`)
-    // would hand the SENTINEL out as a walk pc — explicit kind check,
-    // fail-closed, so a future caller can't reintroduce that by accident.
-    if (trace_mod.isHeadAnchorPc(failed.code.anchor.pc)) return null;
+    // Doc 44 D1/D12b: one-shot traces (head + cont) never chain. Their exits
+    // are consumed by the dispatcher's terminal/zero-exit consumers before
+    // this is ever reached, but the resume-pc derivation below
+    // (`.ordinary_header => anchor.pc`) would hand the SENTINEL / tagged pc
+    // out as a walk pc — explicit kind check, fail-closed, so a future
+    // caller can't reintroduce that by accident.
+    if (trace_mod.anchorKind(failed.code.anchor.pc) != .loop) return null;
     // A-vii-d (doc 17 §A-vii.2): region-bridge arm site — beside the M1
     // `.ordinary_guard` arms below, never inside them. Native path only,
     // observation-blackout gated (`safe_to_arm`, same rule as every other

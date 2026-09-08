@@ -88,8 +88,16 @@ pub const EntryRegistry = struct {
 
     pub fn resolvePatchPc(proto: *const Proto, anchor_pc: u32) ?u32 {
         // Doc 44: a function-head anchor patches the callee's pc 0 (the
-        // LuaJIT FUNCF→JFUNCF analogue) — no back-edge scan applies.
-        if (trace_code.isHeadAnchorPc(anchor_pc)) return 0;
+        // LuaJIT FUNCF→JFUNCF analogue) — no back-edge scan applies. A
+        // continuation anchor (D12b) patches its resume pc directly.
+        switch (trace_code.anchorKind(anchor_pc)) {
+            .head => return 0,
+            .cont => {
+                const pc = trace_code.entryPc(anchor_pc);
+                return if (pc < proto.code.len) pc else null;
+            },
+            .loop => {},
+        }
         var found: ?u32 = null;
         for (proto.code, 0..) |ins, i| {
             if (patchedEntryOp(ins.op) == null) continue;
@@ -108,12 +116,13 @@ pub const EntryRegistry = struct {
         const patch_pc = resolvePatchPc(t.code.anchor.proto, t.code.anchor.pc) orelse return .no_patch_pc;
         const img = self.ensureImage(t.code.anchor.proto) catch return .oom;
         const orig = t.code.anchor.proto.code[patch_pc];
-        const patched_op: OpCode = if (trace_code.isHeadAnchorPc(t.code.anchor.pc))
-            .jfunc_head
-        else
-            patchedEntryOp(orig.op) orelse unreachable;
+        const patched_op: OpCode = switch (trace_code.anchorKind(t.code.anchor.pc)) {
+            .head => .jfunc_head,
+            .cont => .jcont,
+            .loop => patchedEntryOp(orig.op) orelse unreachable,
+        };
         if (img[patch_pc].op == .jfor_loop or img[patch_pc].op == .jloop or
-            img[patch_pc].op == .jfunc_head)
+            img[patch_pc].op == .jfunc_head or img[patch_pc].op == .jcont)
             return .{ .incumbent = img[patch_pc].b };
 
         const idx: u16 = if (self.entry_patch_free.pop()) |free_idx|
@@ -259,4 +268,39 @@ test "entry owner allocation refusal leaves canonical dispatch and no binding" {
     try testing.expectEqual(@as(?u16, null), record.entry_slot);
     try testing.expectEqual(@as(usize, 0), registry.entry_patches.items.len);
     try testing.expectEqual(proto.code.ptr, registry.codeFor(&proto).ptr);
+}
+
+test "cont entry patch (doc 44 D12b): install writes .jcont at the resume pc, unpatch restores, cross-kind incumbents exclude" {
+    const testing = std.testing;
+    var registry = EntryRegistry.init(testing.allocator);
+    defer registry.deinit();
+    var code = [_]Instr{ Instr.op0(.ret), .{ .op = .add, .a = 1 }, Instr.op0(.ret) };
+    const proto = Proto{ .code = &code, .id = 1, .name = "cont", .num_registers = 4 };
+    var record = Trace{ .id = 21, .code = undefined };
+    record.code.anchor = .{ .proto = &proto, .pc = trace_code.contAnchorPc(1) };
+    record.code.inputs = &.{};
+    try testing.expectEqual(InstallResult.installed, registry.installEntryPatch(&record));
+    const slot = record.entry_slot.?;
+    const patch = registry.entry_patches.items[slot];
+    try testing.expectEqual(@as(u32, 1), patch.patch_pc);
+    try testing.expectEqual(OpCode.jcont, patch.patched_op);
+    try testing.expectEqual(OpCode.jcont, registry.codeFor(&proto)[1].op);
+    try testing.expectEqual(slot, registry.codeFor(&proto)[1].b);
+    // Canonical code untouched (copy-on-patch image only).
+    try testing.expectEqual(OpCode.add, code[1].op);
+    // One patch per physical pc: a second cont trace at the SAME resume pc is
+    // an incumbent, not a second install.
+    var record2 = Trace{ .id = 22, .code = undefined };
+    record2.code.anchor = .{ .proto = &proto, .pc = trace_code.contAnchorPc(1) };
+    record2.code.inputs = &.{};
+    try testing.expectEqual(InstallResult{ .incumbent = slot }, registry.installEntryPatch(&record2));
+    // Unpatch restores the canonical instruction in the image.
+    registry.markEntryPatchPending(slot);
+    registry.unpatchSlot(slot, &.{});
+    try testing.expectEqual(OpCode.add, registry.codeFor(&proto)[1].op);
+    // An out-of-bounds cont resume pc refuses cleanly.
+    var record3 = Trace{ .id = 23, .code = undefined };
+    record3.code.anchor = .{ .proto = &proto, .pc = trace_code.contAnchorPc(99) };
+    record3.code.inputs = &.{};
+    try testing.expectEqual(InstallResult.no_patch_pc, registry.installEntryPatch(&record3));
 }

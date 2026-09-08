@@ -79,14 +79,14 @@ const freeRegionBridges = trace_mod.freeRegionBridges;
 /// after a normal native deopt the pre-run snapshot needed for that commit is
 /// already gone.
 pub fn hasNativeLoopDoneLink(self: *const TraceState, failed: *Trace, proto: *const Proto) bool {
-    // Doc 44 D9 (review round 3): a head trace has no loop-done exits by
-    // construction — its guards deopt to function entry, never to a
-    // post-loop pc. The body scan below matches `guard_true` exit pcs
-    // against `proto.code` shapes and could collide with a coincident
+    // Doc 44 D9 (review round 3) / D12b: a one-shot trace (head or cont) has
+    // no loop-done exits by construction — its guards deopt to its entry pc,
+    // never to a post-loop pc. The body scan below matches `guard_true` exit
+    // pcs against `proto.code` shapes and could collide with a coincident
     // link-terminated trace; refuse the kind explicitly (the D1
     // discipline), BEFORE the memo, so both entry paths structurally
-    // select ordinary mode for heads.
-    if (trace_mod.isHeadAnchorPc(failed.code.anchor.pc)) return false;
+    // select ordinary mode for one-shot anchors.
+    if (trace_mod.anchorKind(failed.code.anchor.pc) != .loop) return false;
     // Memoized under `cache_gen` (see `Trace.ldl_memo_*`): the answer only
     // changes when the trace cache does (`nextTraceExcluding` reads it), and
     // this runs once per native dispatch.
@@ -335,14 +335,15 @@ pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: u
     // exit counter above keeps saturating, so the first exit after the
     // cooldown re-creates the want without losing hotness.
     if (self.recordingBarred(t.code.anchor)) return;
-    // Doc 44 D8 (P1a): HEAD route, before the branch/generic routes. A head
-    // guard fail is coherent at function entry — the alternate path is a
-    // same-anchor SIBLING, so raise the head-sibling want and, decisively,
-    // do NOT `markEntryPatchesAt`: the pc-0 patch is the SOLE entry for
-    // every sibling (a head has no virgin back-edge walk to re-arm through).
-    // Consumed on the CURRENT activation by `enterPatchedTrace` after the
-    // whole sibling walk declines.
-    if (trace_mod.isHeadAnchorPc(t.code.anchor.pc)) {
+    // Doc 44 D8 (P1a) / D12b: ONE-SHOT route (head + cont), before the
+    // branch/generic routes. A one-shot guard fail is coherent at the entry
+    // pc — the alternate path is a same-anchor SIBLING, so raise the
+    // sibling want (an EXACT AnchorKey; the consumer matches it exactly)
+    // and, decisively, do NOT `markEntryPatchesAt`: the patched pc is the
+    // SOLE entry for every sibling (no virgin back-edge walk to re-arm
+    // through). Consumed on the CURRENT activation by `enterPatchedTrace`
+    // after the whole sibling walk declines.
+    if (trace_mod.anchorKind(t.code.anchor.pc) != .loop) {
         if (self.wants_head_sibling != null) return;
         if (self.anchorPopulation(t) >= self.config.max_traces_per_anchor) return;
         self.dbg("hotexit: trace id={d} exit={d} count={d} -> want HEAD sibling", .{ t.id, exit_instr, c.* });
@@ -558,11 +559,12 @@ pub const SuccAnchor = struct { proto_id: u32, pc: u32 };
 /// Returns `null` (no structural edge) for any exit whose successor is not a
 /// compatibly-bound trace, or a non-PC-carrying guard.
 pub fn resolveSuccessorAnchor(self: *const TraceState, t: *const Trace, e: ExitProvEntry) ?SuccAnchor {
-    // Doc 44 D1: a head trace contributes no edges to the structural successor
-    // graph — it is never armed, promoted, or region-owned, and the guard arm
-    // below would otherwise compare real exit pcs against the sentinel
-    // (`wp != anchor.pc` is vacuously true). Explicit kind check, fail-closed.
-    if (trace_mod.isHeadAnchorPc(t.code.anchor.pc)) return null;
+    // Doc 44 D1/D12b: a one-shot trace (head or cont) contributes no edges to
+    // the structural successor graph — it is never armed, promoted, or
+    // region-owned, and the guard arm below would otherwise compare real exit
+    // pcs against the sentinel/tagged pc (`wp != anchor.pc` is vacuously
+    // true). Explicit kind check, fail-closed.
+    if (trace_mod.anchorKind(t.code.anchor.pc) != .loop) return null;
     const proto = t.code.anchor.proto;
     switch (e.prov) {
         .link_terminal => {
@@ -1243,10 +1245,12 @@ pub fn arm(self: *TraceState, request: ArmRequest) !bool {
     // arming half so no ordinary/link arm can ever write a loop-done slot (and no
     // loop-done arm can land on a non-loop-done slot).
     const is_loopdone = isLoopDoneGuardIndex(parent, slot_index);
-    // Doc 44 D10 (round 4, durable invariant): head-anchored slots carry ONLY
-    // `.sibling_handoff` arms. Enforced here at the single arm funnel — not
-    // just at the request sites — so the guarantee survives future arm paths.
-    const head_parent = trace_mod.isHeadAnchorPc(parent.code.anchor.pc);
+    // Doc 44 D10 (round 4, durable invariant) / D12b: one-shot-anchored slots
+    // (head + cont) carry ONLY `.sibling_handoff` arms. Enforced here at the
+    // single arm funnel — not just at the request sites — so the guarantee
+    // survives future arm paths. (D12c's `.ret_cont`/`.call_head` kinds will
+    // widen this switch as first-class branches.)
+    const head_parent = trace_mod.anchorKind(parent.code.anchor.pc) != .loop;
     switch (kind) {
         .loop_done_linked => {
             std.debug.assert(is_loopdone);
@@ -1717,12 +1721,13 @@ pub fn drainEntryPatchWork(self: *TraceState) void {
 /// fail-closed checks. Failure routes per the §R4-2 state machine.
 pub fn installPending(self: *TraceState, t: *Trace) void {
     std.debug.assert(t.entry_patch == .pending);
-    // Doc 44 P0: head traces install without a native page — the pc-0 patch
-    // is their ONLY entry (there is no back-edge walk to fall back on), so
-    // gating installs on `.compiled` would make heads unreachable on every
-    // tier-1a leg. The loop-patch rationale (a patch merely SHORTCUTS the
-    // walk, so only pay for it when native is ready) does not transfer.
-    if (t.native != .compiled and !trace_mod.isHeadAnchorPc(t.code.anchor.pc)) {
+    // Doc 44 P0/D12b: one-shot traces (head + cont) install without a native
+    // page — the patched pc is their ONLY entry (there is no back-edge walk
+    // to fall back on), so gating installs on `.compiled` would make them
+    // unreachable on every tier-1a leg. The loop-patch rationale (a patch
+    // merely SHORTCUTS the walk, so only pay for it when native is ready)
+    // does not transfer.
+    if (t.native != .compiled and trace_mod.anchorKind(t.code.anchor.pc) == .loop) {
         t.entry_patch = .suppressed_permanent;
         return;
     }

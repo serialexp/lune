@@ -199,6 +199,18 @@ pub const OpCode = enum(u8) {
     ///             table. `.b` carries the entry-patch slot index; appended
     ///             LAST to keep the enum dense (doc 42 §4.6).
     jfunc_head,
+
+    /// `b` (+ orig operands preserved) patched CONTINUATION trace entry
+    ///             (doc 44 D12b — the return-side `jfunc_head` twin). Written
+    ///             ONLY into a per-VM copy-on-patch image over a hot post-call
+    ///             resume pc — canonical `Proto.code` NEVER contains it. The
+    ///             patched-over instruction is ARBITRARY (whatever follows the
+    ///             call), so the handler owns no canonical step semantics: it
+    ///             tries the bound cont trace and, on decline/bypass,
+    ///             tail-dispatches the canonical instruction through the
+    ///             ordinary handler table. `.b` carries the entry-patch slot
+    ///             index; appended LAST to keep the enum dense (doc 42 §4.6).
+    jcont,
 };
 
 // Doc 42 §4.6: the tail-call dispatch tables index `[@intFromEnum(op)]`

@@ -91,8 +91,26 @@ pub const PendingCallAnchor = struct {
     /// the frame that went hot.
     call_seq: u64,
 };
+/// Doc 44 D12b: a hot post-call resume pc waiting for the dispatch prologue
+/// to arm a `.cont` recording at the CALLER's frozen cursor. Set by
+/// `onRetResume` (the `opRet` funnel), consumed by `maybeStartCont`.
+pub const PendingRetAnchor = struct {
+    proto: *const Proto,
+    /// The caller's frozen one-past-call cursor — the cont anchor's entry pc.
+    resume_pc: u32,
+    /// The caller frame's absolute slab base (the cont trace's anchor base).
+    base: usize,
+    /// The activation stamp from `pushFrame` — pins the pending to exactly
+    /// the caller activation the hot return resumed.
+    call_seq: u64,
+};
 pub const isHeadAnchorPc = trace_code.isHeadAnchorPc;
 pub const headEntryPc = trace_code.headEntryPc;
+pub const CONT_PC_BIT = trace_code.CONT_PC_BIT;
+pub const AnchorPcKind = trace_code.AnchorPcKind;
+pub const anchorKind = trace_code.anchorKind;
+pub const entryPc = trace_code.entryPc;
+pub const contAnchorPc = trace_code.contAnchorPc;
 pub const NativeSeedCtx = trace_code.NativeSeedCtx;
 
 pub const Ref = trace_ir.Ref;
@@ -160,10 +178,11 @@ pub const programPointLess = trace_region.programPointLess;
 /// synthetic traces with an undefined anchor and empty `instrs`.
 pub fn isLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
     if (idx >= t.code.instrs.len) return false;
-    // Doc 44 D1: a head trace has no loop back-edge — none of its guards can be
-    // a loop-done guard. Explicit kind check, fail-closed (its guard_true pcs
-    // must never be interpreted against the anchor proto's loop CFG).
-    if (isHeadAnchorPc(t.code.anchor.pc)) return false;
+    // Doc 44 D1/D12b: a one-shot trace (head or cont) has no loop back-edge —
+    // none of its guards can be a loop-done guard. Explicit kind check,
+    // fail-closed (its guard_true pcs must never be interpreted against the
+    // anchor proto's loop CFG).
+    if (anchorKind(t.code.anchor.pc) != .loop) return false;
     const g = t.code.instrs[idx];
     if (g.op != .guard_true) return false;
     const exit_pc = guardExitPc(g) orelse return false;
@@ -1460,6 +1479,13 @@ pub const TraceState = struct {
     /// consumer clears the pending on the FIRST prologue it sees, match or
     /// mismatch (self-cleaning; no unwind hook needed).
     pending_call_anchor: ?PendingCallAnchor = null,
+    /// **Doc 44 D12b.** When non-null, a post-call resume pc went hot in
+    /// `opRet` (`onRetResume`) and a `.cont` recording should arm the moment
+    /// the dispatch prologue reaches the caller's frozen cursor — the same
+    /// `.full`-pinned prologue-activation discipline and `call_seq` pinning
+    /// as `pending_call_anchor` above, with the same self-cleaning consumer
+    /// (`maybeStartCont` clears on the FIRST prologue, match or mismatch).
+    pending_ret_anchor: ?PendingRetAnchor = null,
     /// Per-trace execution logs for the visualizer (`execlog.zig`), populated only
     /// when `config.record_exec_log`. Keyed by `trace_id` (cache index). Empty and
     /// untouched on the normal JIT path.
@@ -1596,13 +1622,14 @@ pub const TraceState = struct {
             .jmp_if_false, .jmp_if_true, .jmp_if_not_nil => {},
             else => return false,
         }
-        // Doc 44 D10 (round 4): head parents demand the POSITIVE provenance
-        // proof, not just the source-opcode shape above. A head trace inlines
-        // callees freely, and an inlined guard's `guardSourcePc` lives in the
-        // CALLEE's proto — a coincidental branch opcode at that pc in the
-        // anchor proto would misclassify it. Require the exit-provenance table
-        // to say: a real guard, role `.branch_cond`, at inline depth 0.
-        if (isHeadAnchorPc(t.code.anchor.pc)) {
+        // Doc 44 D10 (round 4) / D12b: one-shot parents (head + cont) demand
+        // the POSITIVE provenance proof, not just the source-opcode shape
+        // above. A one-shot trace inlines callees freely, and an inlined
+        // guard's `guardSourcePc` lives in the CALLEE's proto — a
+        // coincidental branch opcode at that pc in the anchor proto would
+        // misclassify it. Require the exit-provenance table to say: a real
+        // guard, role `.branch_cond`, at inline depth 0.
+        if (anchorKind(t.code.anchor.pc) != .loop) {
             const prov = t.code.provAt(exit_instr) orelse return false;
             switch (prov) {
                 .guard => |gp| {
@@ -2948,6 +2975,15 @@ pub const TraceState = struct {
     ///    recording that begins on the next loop iteration (at the anchor).
     pub fn onBackEdge(self: *TraceState, proto: *const Proto, target_pc: u32, regs: RegWindow) void {
         if (self.rec.active) {
+            // Doc 44 D12b: a `.cont` recording is straight-line-to-terminal —
+            // ANY executed loop back-edge (while jmp, repeat closer, numeric/
+            // generic for, at any inline depth) aborts, one funnel for every
+            // closer shape. (A cont anchor's own pc is tagged, so the
+            // close-at-anchor compare below can never match it.)
+            if (self.rec.kind == .cont) {
+                self.abort(.cont_backedge);
+                return;
+            }
             if (self.rec.anchor.proto == proto and self.rec.anchor.pc == target_pc) {
                 self.closeTrace(regs);
             }
@@ -3109,6 +3145,79 @@ pub const TraceState = struct {
         self.dbg("head repatch: re-requesting install for trace={d}", .{best.id});
         self.registry.entry_registry.markInstallPending(best);
         self.drainEntryPatchWork();
+    }
+
+    /// Doc 44 D12b: count a return through a post-call resume pc toward its
+    /// CONTINUATION anchor (`onCallEntry`'s return-side twin — returns into a
+    /// site are calls of its continuation, so the threshold is `hotcall`).
+    /// Called from `opRet` after the pop + reload, with the CALLER's frozen
+    /// cursor and freshly-reloaded image. No tick: the gate-cooldown tick
+    /// stream stays a pure function of the CALL stream on every leg (D12c
+    /// rule, applied from the start). Refusals, in order:
+    /// - the physical-pc collision rule (round 6 change 3): ONE patch per
+    ///   physical pc — a resume pc that is already patched (any kind) or is
+    ///   a patchable loop-closer site forms NO cont anchor (no counting, no
+    ///   recording, no patch). A live `.jcont` at the pc short-circuits to
+    ///   "entry is the patch's job" exactly like the head's D9 S1 check.
+    /// - vararg callers (the head counter's D2 discipline: cont arming
+    ///   bypasses `recCall`'s vararg rejection, so the bar sits here).
+    /// - the boundary return never reaches this funnel (`opRet`'s
+    ///   `stop_depth` path exits `execImpl` before it).
+    pub fn onRetResume(self: *TraceState, proto: *const Proto, resume_pc: u32, base: usize, call_seq: u64, img: []const Instr) void {
+        if (!self.config.enabled) return;
+        if (self.rec.active) return; // a recording owns the stream; don't compete
+        if (proto.is_vararg) return;
+        if (resume_pc >= img.len) return; // resume at end-of-code (no instruction to anchor)
+        // Patched steady state: one bounds-checked opcode compare (D9 S1).
+        const resumed_op = img[resume_pc].op;
+        if (resumed_op == .jcont) return;
+        // Collision rule: the pc hosts (or could host) a different patch kind.
+        if (resumed_op == .jfor_loop or resumed_op == .jloop or resumed_op == .jfunc_head) return;
+        if (trace_entry_registry.EntryRegistry.patchedEntryOp(proto.code[resume_pc].op) != null) return;
+        const key = AnchorKey{ .proto = proto, .pc = contAnchorPc(resume_pc) };
+        if (self.hasTrace(key)) {
+            // D8 recovery, cont flavour: traces exist but the pc is unpatched
+            // (gate blast, strike exhaustion) — re-request install for the
+            // best survivor once the gate clears. Idempotent.
+            self.maybeRepatchCont(proto, key, img);
+            return;
+        }
+        if (self.recordingBarred(key)) return;
+        const gop = self.counters.getOrPut(self.gpa, key) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* +|= 1;
+        if (gop.value_ptr.* < self.config.hotcall) return;
+        gop.value_ptr.* = 0; // reset so a declined/aborted arm re-warms
+        self.pending_ret_anchor = .{ .proto = proto, .resume_pc = resume_pc, .base = base, .call_seq = call_seq };
+    }
+
+    /// Doc 44 D12b: deterministic cont entry-patch recovery (`maybeRepatchHead`
+    /// twin). Cheap-gated: an already-patched resume pc returns on one compare.
+    fn maybeRepatchCont(self: *TraceState, proto: *const Proto, key: AnchorKey, img: []const Instr) void {
+        if (!self.config.execute) return; // same gate as install-at-commit
+        const resume_pc = trace_code.entryPc(key.pc);
+        if (resume_pc >= img.len or img[resume_pc].op == .jcont) return; // live patch
+        if (self.recordingBarred(key)) return;
+        const best = self.nextTraceExcluding(proto, key.pc, &.{}) orelse return;
+        self.dbg("cont repatch: re-requesting install for trace={d}", .{best.id});
+        self.registry.entry_registry.markInstallPending(best);
+        self.drainEntryPatchWork();
+    }
+
+    /// Doc 44 D12b: dispatch-prologue consumer of `pending_ret_anchor` (the
+    /// `maybeStartHead` twin). Returns true iff a `.cont` recording armed at
+    /// this prologue step. ALWAYS clears the pending — same consume-or-discard
+    /// self-cleaning as the head consumer.
+    pub fn maybeStartCont(self: *TraceState, proto: *const Proto, pc: u32, base: usize, call_seq: u64) bool {
+        const pending = self.pending_ret_anchor orelse return false;
+        self.pending_ret_anchor = null; // consume-or-discard, never linger
+        if (pending.proto != proto or pending.resume_pc != pc or pending.call_seq != call_seq or pending.base != base) return false;
+        if (self.rec.active) return false;
+        self.arm(proto, contAnchorPc(pc));
+        if (!self.rec.active) return false; // reset OOM-declined
+        self.rec.kind = .cont;
+        self.rec.anchor_abs_base = pending.base;
+        return true;
     }
 
     /// Doc 44: dispatch-prologue consumer of `pending_call_anchor` (the
@@ -3329,18 +3438,19 @@ pub const TraceState = struct {
         // A-ii.4: rediscover regions over the refreshed graph. Fail-soft;
         // any OOM fails CLOSED to empty physical indices (arm nothing).
         self.rebuildRegions();
-        // Doc 44 P0: a head trace's ONLY entry is the pc-0 `jfunc_head` patch —
-        // no back-edge walk ever reaches the sentinel anchor, so it can never
-        // qualify through the receipt funnel (`accountTraceRun`). Qualify at
-        // commit and drain immediately: without a loop-trace entry this turn
-        // there may be no other drain site, and marks are legal anywhere
-        // (§R6-1) while this drain runs post-publish, outside any receipt
-        // grammar.
+        // Doc 44 P0/D12b: a ONE-SHOT trace's (head or cont) ONLY entry is its
+        // patched pc (`jfunc_head` at pc 0 / `jcont` at the resume pc) — no
+        // back-edge walk ever reaches a sentinel/tagged anchor, so it can
+        // never qualify through the receipt funnel (`accountTraceRun`).
+        // Qualify at commit and drain immediately: without a loop-trace entry
+        // this turn there may be no other drain site, and marks are legal
+        // anywhere (§R6-1) while this drain runs post-publish, outside any
+        // receipt grammar.
         // Gated on `config.execute`: with execution off (the recording-shape
         // test harness) loop patches are unreachable too — they qualify via
-        // receipts, which need traces to run — and a head patch must not
+        // receipts, which need traces to run — and a one-shot patch must not
         // become the one path that runs a trace anyway.
-        if (self.config.execute and isHeadAnchorPc(t.code.anchor.pc)) {
+        if (self.config.execute and anchorKind(t.code.anchor.pc) != .loop) {
             self.registry.entry_registry.markInstallPending(t);
             self.drainEntryPatchWork();
         }
