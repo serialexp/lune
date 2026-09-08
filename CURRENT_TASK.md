@@ -78,10 +78,30 @@ Board (20260908-141114-710cb25 vs D9's 20260908-131454): **fib jit 442→317 ms*
 noise (spectral 30.2→33.4 and sor 79→83 look like ordinary run-to-run wobble —
 neither has head anchors in play; recheck next board).
 
-NEXT: re-profile fib (what's left of the episode share now that A→B fuses?) →
-then the remaining arc ladder: P4 native frame push (true up-recursion, the
-per-call turnstile itself), P1 recunroll, P1a follow-up matrix tests, P2 RETF
-decision, P3 down-recursion.
+Post-D10 fib(31) profile receipt (house recipe, f31fab4): the D9 accounting
+monsters are GONE (accountRegionProfit/onSideExitReceipt off the board). What
+remains, flat view:
+- tier-0 call/return scaffolding ≈ 45%: opCall 14.7, opRet 9.5, opLoad
+  7.2+2.1, opJFuncHead 6.9, opGetUpval 4.4, opBinNum 6.5 — the per-call
+  resume→setup→push→dispatch round trip between episodes;
+- episode entry ≈ 17%: runCapturingLedger wrapper 21.1 (incl. native body;
+  bare [JIT] rows only ~2.5%), enterHeadNativeQuiet 10.5, consumeHeadBurst
+  5.6, headEpisodeQuiet 0.85;
+- per-call codeFor hash ≈ 5.5% (hash_map.get 3.2 + wyhash 2.3): frames are
+  PUSHED fresh per call so S4's per-frame code cache misses on every first
+  reload — a per-proto (not per-frame) cache keyed on image_gen would kill
+  this;
+- whileLoopDonePostPc 1.1% (the while-probe inside the burst final-row /
+  zero-exit receipts).
+`--jit-stats`: 100% head iteration residency, traced 45.5% of cycles
+(~248 c/iter), "other (non-loop)" 54.5% — the scaffolding above.
+
+NEXT: P4 slice 2 — native frame push for the self-call terminal (true
+up-recursion; new design section §D11 + codex round, per the doc's P4 bullet:
+must poll safepoint/hook/replay natively or self-disable when active). Cheap
+side-lever spotted en route: per-proto codeFor cache (the 5.5% hash above).
+Then P1 recunroll, P1a follow-up matrix tests, P2 RETF decision, P3
+down-recursion.
 
 ## Status 2026-09-08h — doc 44 D9 (P1b quiet head episode + S1/S4) implemented
 
