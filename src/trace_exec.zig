@@ -160,6 +160,11 @@ pub const LedgerKind = enum(u32) {
     /// (`reason = .seed_capacity_decline`, `exit_instr = -1`, nothing written).
     /// Always terminal.
     seed_capacity_decline = 6,
+    /// Doc 44 P0: a head trace's `.terminal` completion — the one-shot φ
+    /// writeback committed and tier-0 resumes at the terminal's resume pc.
+    /// Always a natural terminal, never a chain source (the dispatcher's
+    /// terminal consumer owns resumption; no slot indirection is emitted).
+    head_terminal = 7,
 };
 
 /// 2.3c-2c (doc 17): what a chain-source exit DID with its (possibly armed) slot —

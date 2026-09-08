@@ -846,6 +846,9 @@ pub fn rowPatchKind(kind: trace_exec.LedgerKind) ?nativegen.ExitPatchKind {
         // Doc 22 §B.2: seed declines are entry-condition mismatches, not
         // guard failures — there is no exit branch to patch.
         .seed_hash_decline, .seed_capacity_decline => null,
+        // Doc 44 P0: a head trace's terminal is a completion through
+        // shared_exit (slot_addr = null) — there is no exit branch to patch.
+        .head_terminal => null,
     };
 }
 

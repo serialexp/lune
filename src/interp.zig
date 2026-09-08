@@ -2986,6 +2986,7 @@ pub const Vm = struct {
             // canonical pc-0 instruction (returning `.resume_tier0(0)` here
             // would re-dispatch the patch and spin).
             if (trace.isHeadAnchorPc(final.code.anchor.pc)) {
+                self.trace.dbg("head zero-exit: trace={d} native={} reason={s} exit={d} completed={d}", .{ final.id, ran_native, @tagName(result.exit_reason), result.exit_instr, result.completed });
                 self.trace.onSideExitReceipt(
                     final,
                     local_done,

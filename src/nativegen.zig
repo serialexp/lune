@@ -1227,12 +1227,12 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
             }
         }
     }
-    // A well-formed native-able trace is non-empty and ends in a terminal `loop`
-    // or `link`. Re-checked here because `assertWellFormed` is gone in release
-    // builds (never trust the IR).
+    // A well-formed native-able trace is non-empty and ends in a terminal `loop`,
+    // `link`, or `terminal` (doc 44 head close). Re-checked here because
+    // `assertWellFormed` is gone in release builds (never trust the IR).
     if (n == 0 or n > 0xFFFF) return null;
     const terminal = t.instrs[n - 1].op;
-    if (terminal != .loop and terminal != .link) return null;
+    if (terminal != .loop and terminal != .link and terminal != .terminal) return null;
 
     const kinds = gpa.alloc(Kind, n) catch return null;
     defer gpa.free(kinds);
@@ -1824,8 +1824,15 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 kinds[i] = .none;
             },
             .guard_true, .guard_false => {
+                // Lua truthiness: ONLY nil/false are falsy. Every proven value
+                // kind except `.bool` is therefore statically truthy — a
+                // guard_true on it lowers to nothing and a guard_false to an
+                // unconditional side-exit (the recorder saw a falsy value the
+                // proof says can't recur; mirror the existing `.int` arms).
+                // `.none`/`.aref`/`.href` are not values and stay a bail.
                 const k = kinds[ins.a];
-                if (k != .int and k != .bool) return false;
+                if (k != .int and k != .bool and k != .float and
+                    k != .ptr and k != .heap and k != .func and k != .native) return false;
                 kinds[i] = .none;
             },
             // --- lane-aware array read path (B2) ---------------------------------
@@ -2536,6 +2543,12 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (i != n - 1) return false; // link must be terminal
                 kinds[i] = .none;
             },
+            // Doc 44: the one-shot head-trace close. `a` is a TerminalKind tag
+            // and `aux` the resume pc — neither is an operand ref. Value-less.
+            .terminal => {
+                if (i != n - 1) return false; // must be terminal
+                kinds[i] = .none;
+            },
             // Phase E1/E2: the preheader region boundary. A pure marker (no value);
             // everything before it is the run-once region the lowering emits ahead
             // of `loop_top`. `analyze` gives each run-once value a computed home.
@@ -2642,7 +2655,12 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
         if (p.op != .phi) continue;
         if (p.b >= n) return false;
         const k = kinds[p.b];
-        if (k != .int and k != .bool and k != .float and k != .ptr and k != .heap) return false;
+        // `.func` is admissible (doc 44): a guard_func-covered closure is a raw
+        // `*GcHeader` boxed TAG_HEAP exactly like `.ptr` — a head trace's φ rows
+        // write the callee closure into the child call frame's slots. A carried
+        // `.func` load still bails in `analyze` (lk must be numeric), so this
+        // only ever feeds write-only flushes.
+        if (k != .int and k != .bool and k != .float and k != .ptr and k != .heap and k != .func) return false;
         // Doc 40: an internal φ's back-edge update must deliver the φ's own
         // kind — the other half of the φ-guard discharge (Pass B proved the
         // init; this proves iterations 2+). `b` is a forward ref, so the check
@@ -3486,9 +3504,12 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
                 // the LOAD type (the prologue pin). The `.link` terminal flush
                 // (below) tags the store value with its own kind, not the slot's.
                 if (sk != lk) {
-                    if (t.instrs[n - 1].op == .link and isNumKind(lk) and isNumKind(sk)) {
+                    if ((t.instrs[n - 1].op == .link or t.instrs[n - 1].op == .terminal) and isNumKind(lk) and isNumKind(sk)) {
                         // Accept: the slot homes as the load class; the φ writeback
-                        // converts at the back-edge.
+                        // converts at the one-shot flush. Doc 44: a `.terminal`
+                        // head close shares `.link`'s exemption verbatim — it
+                        // never loops back into its own body either, and tier-0
+                        // re-checks types at the resume pc.
                     } else if (t.peeled and isNumKind(lk) and isNumKind(sk)) {
                         // Doc 39: a peeled trace's widened carried slot (int entry,
                         // float steady state). Accepted iff the peeled post-pass
@@ -3649,6 +3670,11 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
     // within a native run). Locate the guard_func and stash its id on the slot.
     for (slots.items) |*s| {
         if (s.kind != .func) continue;
+        // Doc 44: a WRITE-ONLY `.func` slot (a head trace's φ writeback of the
+        // callee closure into the child frame) is never prologue-checked — the
+        // guard_func covers the LOADED snapshot slot, and the flush re-boxes
+        // the already-verified pointer. No id to stash.
+        if (s.load_ref < 0) continue;
         const lr: u16 = @intCast(s.load_ref);
         var found = false;
         for (t.instrs) |g| {
@@ -3675,6 +3701,9 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
     // cannot change within a native run). Locate the guard_builtin and stash its tag.
     for (slots.items) |*s| {
         if (s.kind != .native) continue;
+        // Same write-only guard as the `.func` loop above: no load → no
+        // prologue identity check → nothing to stash.
+        if (s.load_ref < 0) continue;
         const lr: u16 = @intCast(s.load_ref);
         var found = false;
         for (t.instrs) |g| {
@@ -4748,10 +4777,12 @@ fn flushSlot(a: *x64.Assembler, slot: i32, kind: Kind, payload: Place) !void {
     const tag: u8 = switch (kind) {
         .bool => TAG_BOOL,
         .float => TAG_FLOAT,
-        // `.ptr` (invariant table) and `.heap` (per-iteration table — a carried-heap
-        // slot's current value or a write-only VALUE_LANE aload result) both hold a
-        // raw *GcHeader payload and re-box as a heap ref.
-        .ptr, .heap => TAG_HEAP,
+        // `.ptr` (invariant table), `.heap` (per-iteration table — a carried-heap
+        // slot's current value or a write-only VALUE_LANE aload result), and
+        // `.func` (a guard_func-covered closure, flushed by a head trace's φ
+        // writeback — doc 44) all hold a raw *GcHeader payload and re-box as a
+        // heap ref.
+        .ptr, .heap, .func => TAG_HEAP,
         else => TAG_INT,
     };
     const poff: i32 = slot * 8;
@@ -7203,7 +7234,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 try emitGStore(a, t, alloc, ins);
             },
             .guard_true => switch (kinds[ins.a]) {
-                .int => {}, // every int is truthy → guard always passes (no-op)
+                // Every non-bool proven value is statically truthy (only
+                // nil/false are falsy in Lua) → guard always passes (no-op).
+                .int, .float, .ptr, .func, .native, .heap => {},
                 .bool => {
                     switch (placeOfRef(alloc, ins.a)) {
                         .reg => |r| try a.cmpRegImm32(r, 0),
@@ -7212,10 +7245,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     }
                     try jccNativeExit(a, exit_labels, i, .e); // false (0) → side-exit
                 },
-                .none, .ptr, .aref, .float, .func, .href, .native, .heap => unreachable, // proveKinds restricts to int/bool
+                .none, .aref, .href => unreachable, // proveKinds restricts to value kinds
             },
             .guard_false => switch (kinds[ins.a]) {
-                .int => try jmpNativeExit(a, exit_labels, i), // an int is never falsy → always side-exit
+                // A non-bool proven value is never falsy → always side-exit.
+                .int, .float, .ptr, .func, .native, .heap => try jmpNativeExit(a, exit_labels, i),
                 .bool => {
                     switch (placeOfRef(alloc, ins.a)) {
                         .reg => |r| try a.cmpRegImm32(r, 0),
@@ -7224,7 +7258,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     }
                     try jccNativeExit(a, exit_labels, i, .ne); // true (≠0) → side-exit
                 },
-                .none, .ptr, .aref, .float, .func, .href, .native, .heap => unreachable, // proveKinds restricts to int/bool
+                .none, .aref, .href => unreachable, // proveKinds restricts to value kinds
             },
             .loop => {
                 // [RV-2] write-only slots commit to regs[] BEFORE the shuffle, so the
@@ -7312,6 +7346,26 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 // Chainable: the `.link` terminal is a single-contract hand-off, so
                 // its exit jumps through slot[i] (default `shared_exit`, armed → child).
                 try emitReturn(a, frame, callee[0..callee_len], shared_exit, trace_id, slotAddr(slots, i));
+            },
+            // Doc 44 P0: the one-shot head-trace close — `.link`'s flush
+            // discipline with a plain (never chainable) exit. Flush every
+            // slot-bound φ snapshot into regs[] with the STORE value's kind
+            // (the `.link` doc-34 rule: tier-0 re-checks types at the resume
+            // pc, so load/store instability is safe), publish the terminal's
+            // instruction index, and return through `shared_exit` — no slot
+            // indirection, no arm patch site: the dispatcher's terminal
+            // consumer (doc 44) owns resumption at `terminal.aux`.
+            .terminal => {
+                std.debug.assert(!t.peeled); // head closes bypass peel
+                for (alloc.slots) |s| {
+                    if (s.store_ref < 0) continue;
+                    const flush_kind = kinds[@intCast(s.store_ref)];
+                    try flushSlot(a, @as(i32, s.slot), flush_kind, placeOfRef(alloc, @intCast(s.store_ref)));
+                }
+                try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+                try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
+                try emitLedgerAppend(a, trace_id, .head_terminal);
+                try emitReturn(a, frame, callee[0..callee_len], shared_exit, trace_id, null);
             },
             // A φ emits no code in the body: a slot-bound φ's writeback is driven by
             // its slot's `.carried`/`.write_only` class above (the back-edge shuffle /

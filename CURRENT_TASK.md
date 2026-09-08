@@ -21,6 +21,49 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-08f — doc 44 P0 COMPLETE: native `.terminal` lowering landed
+
+fib runs 100% of entries as native bodies (2,692,425/2,692,425), correct
+output, all gates green (test, hashgate 84×2, wasm, viz 69, boundaries).
+Board: recursive-fib jit 521→477 ms (res 34.3), binary-trees 468→370 ms
+(res 28.6, BOTH head traces compile), spectral-norm 40→30 ms, rest flat.
+
+What the lowering took (all in nativegen.zig unless noted):
+- nativeFor gate admits `.terminal`; proveKinds arm (last-position check,
+  kind `.none`); analyze type-instability exemption shared with `.link`.
+- `.terminal` lower arm: one-shot flushSlot per store_ref (STORE value's
+  kind), completed←rbx, exit_instr←i, `head_terminal` ledger row
+  (LedgerKind 7, trace_exec.zig), emitReturn(slot_addr=null) — a head
+  terminal is a COMPLETION via shared_exit, never a chain source.
+  Fail-closed arms: replayLedger ×2 @panic (trace_chain.zig — heads never
+  enter silent chains), rowPatchKind null (trace_link.zig).
+- `.func` flushability (GENERAL, Z-6): guard_func-covered closure is a raw
+  *GcHeader boxed TAG_HEAP like `.ptr` → φ-boxability accepts `.func`,
+  flushSlot TAG_HEAP arm. Write-only `.func`/`.native` slots (head φ
+  writebacks) must SKIP the prologue id-stash loops — `load_ref < 0` was
+  an @intCast(-1) panic in analyzeInner.
+- Truthiness widening (GENERAL, Z-6): only nil/false are falsy → guard_true
+  on proven int/float/ptr/heap/func/native lowers to NOTHING, guard_false
+  to an unconditional side-exit. This is what let binary-trees' ItemCheck
+  head compile (guard_true on an aload'd table) and moved spectral-norm.
+- New jitdbg probe: "head zero-exit" (trace/native/reason/exit/completed)
+  in the head zero-exit consumer — first thing to read when a head
+  underperforms.
+
+Fresh P1 evidence: WHICH call is hot-call #112 decides the recorded shape.
+fib(15)/fib(25) seed a BASE-CASE head trace (guard_true n<2); the majority
+non-base entries then strike the patch out in 4 (`patch_strikes`) and a
+retired head never re-arms → coverage 0 for those inputs. fib(18/30) luck
+into the recursive shape (max base-case run = 3 consecutive < 4). Base-vs-
+non-base side traces (P1) is the fix, not tuning strike counts.
+
+Traced fib is STILL ~3× tier-0 wall (477 vs 161 board): the cost is now
+entirely the per-call dispatcher episode (~400 cyc around a ~20-cyc body) —
+enterPatchedTrace → enterSelectedTrace's full prep/receipt machinery per
+recursion level. Rule Z-7: don't polish that seam; P1 (recunroll) and P4
+(native frame push for the self-call terminal + exit patching) own it.
+NEXT: exclusion-site kind tests (doc 44 step 8), then P1.
+
 ## Status 2026-09-08e — doc 44 P0 tier-1a ENTRY + EXECUTION LANDED; fib res% 0 → 30.6%
 
 Layer 4 in: `jfunc_head` op (appended, dense rule), `EntryPatch.patched_op`

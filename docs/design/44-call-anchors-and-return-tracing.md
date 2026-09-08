@@ -1,8 +1,9 @@
 # 44 — call anchors and return tracing (making recursion trace at all)
 
-Status: partial — P0 recording + tier-1a entry/execution landed (fib re-enters
-through the patched head, res% 30.6%); native `.terminal` lowering and P1+
-outstanding. Codex-reviewed (gpt-5.6-sol, verdict sound-with-changes; all 8
+Status: partial — P0 complete (recording, tier-1a AND native `.terminal`
+execution; fib runs 100% of entries native, board jit 521→477 ms, binary-trees
+468→370 ms); the per-call dispatcher seam still makes traced fib ~3× tier-0 —
+P1/P4 own that. Codex-reviewed (gpt-5.6-sol, verdict sound-with-changes; all 8
 required changes folded in, ledger at bottom)
 Owner: Bart
 Last updated: 2026-09-08
@@ -56,31 +57,40 @@ to Done once everything inside a phase is checked.
       swap) all green. **Exit target met: fib records a non-base trace and
       re-enters through the patched head.**
 
-### Outstanding
+- [x] **P0 layer 5 — native `.terminal` lowering.** `nativeFor` gate admits
+      `.terminal`; proveKinds arm (terminal position only, kind `.none`);
+      the analyze type-instability exemption shared verbatim with `.link`
+      (one-shot flush, never loops back); the `.terminal` lower arm — φ
+      one-shot `flushSlot` per store_ref with the STORE value's kind,
+      `completed ← rbx`, `exit_instr ← i`, a `head_terminal` ledger row
+      (LedgerKind 7; every native exit appends ≥1 row), then
+      `emitReturn(slot_addr=null)` — a head terminal is a COMPLETION through
+      shared_exit and never a chain source (fail-closed `@panic` arms in
+      `replayLedger`, `null` in `rowPatchKind`). Unlocked along the way,
+      both as GENERAL rules (Z-6): (a) `.func` values are flushable — a
+      guard_func-covered closure is a raw `*GcHeader` boxed TAG_HEAP like
+      `.ptr` (φ-boxability + flushSlot); write-only `.func`/`.native` slots
+      skip the prologue id-stash loops (`load_ref < 0` — was an @intCast
+      panic); (b) truthiness widening — a proven non-bool value kind is
+      statically truthy, so `guard_true` on int/float/ptr/heap/func/native
+      lowers to nothing and `guard_false` to an unconditional side-exit.
+      Receipts: fib(30) 2,692,425 entries, 100% native bodies, correct
+      output; board recursive-fib jit 521→477 ms (res 34.3), binary-trees
+      468→370 ms (res 28.6, both head traces compile), spectral-norm
+      40→30 ms (truthiness widening); all gates green (test, hashgate ×2,
+      wasm, viz, boundaries).
 
-- [ ] **Phase 0 — remaining: native `.terminal` lowering.** Tier-1a head
-      entry costs ~420 cycles/hop on a 9-op fib body, so `--trace` is
-      currently 3.3× SLOWER than tier-0 on recursive-fib (residency without
-      speed). Lower `.terminal` as the loop-done-snapshot twin: φ one-shot
-      writeback flush + a terminal exit stub reporting the terminal's
-      instruction index; lift the `nativeFor` loop/link-only terminal gate
-      and add the proveKinds arm.
-- [ ] **Phase 0 — the minimum viable function-entry tracing milestone.**
-      Hot-call counting (advancing the gate tick), typed head anchors,
-      `pending_call_anchor` arming (carrying `call_seq`, cleared on every
-      unwind/abort path), recorder kind `.head` (root-like in every
-      root-only policy) closing at BOTH depth-0 terminators — `ret` AND
-      direct self-call — via the parameterized `.terminal` IR op; the
-      terminal-exit contract (distinct from side exits); function-entry
-      deopt snapshot; vararg protos refused; recorder stack-depth guard for
-      inlined calls; tier-1a + native execution; entry via the `jfunc_head`
-      patch kind; `traceser.format_version` bump. Exit target:
-      recursive-fib records a non-base trace and re-enters through the
-      patched head (res% > 0 from 0).
+### Outstanding
 - [ ] **Phase 1 — recursion ergonomics.** Bounded recursive unrolling
       (`recunroll` budget for depth>0 self-calls), base-vs-non-base side
       traces off the branch guard, lifecycle hardening under the abort/GC/
-      error matrix, binary-trees receipts.
+      error matrix, binary-trees receipts. P0 field note strengthening the
+      case for base-vs-non-base sides: WHICH call is hot-call #112 decides
+      the recorded shape — fib(15)/fib(25) seed a BASE-CASE head trace
+      (guard_true n<2), the majority non-base entries then strike the
+      patch out in 4 consecutive `.next_candidate`s (`patch_strikes`), and
+      since a retired head never re-arms (hasTrace blocks `onCallEntry`,
+      installs only at commit) coverage collapses to 0 for those inputs.
 - [ ] **Phase 2 — RETF return tracing (expanded scope — likely its own
       doc).** Record *through* a depth-0 `ret` into the caller: needs a
       two-frame execution ABI (slab+base addressing, not one RegWindow),

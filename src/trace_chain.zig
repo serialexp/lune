@@ -1594,6 +1594,10 @@ pub fn replayLedgerFrom(
             .link_terminal, .prologue_fail, .region_bridge => 0,
             // Doc 22 §B.2: declines happen before the body runs — zero work.
             .seed_hash_decline, .seed_capacity_decline => 0,
+            // Doc 44 P0: head traces exit via shared_exit with a null slot
+            // address — they are never armed, never fused, never chain members,
+            // so a `.head_terminal` row can never reach the silent replay.
+            .head_terminal => @panic("replayLedger: head_terminal row in a chain ledger"),
         };
 
         // Destination `.deferred` for a handoff, NEVER `.known_trace`: this edge is
@@ -1662,6 +1666,9 @@ pub fn replayLedgerFrom(
         // static contract; any mismatch is a release-`@panic` rather than a silent
         // mis-walk that could double-count an already-committed loop.
         switch (e.kind) {
+            // Doc 44 P0: head traces are never armed/fused (null slot address at
+            // their terminal), so this row kind cannot reach the silent replay.
+            .head_terminal => @panic("replayLedger: head_terminal row in a chain ledger"),
             .region_bridge => {
                 // A bridge commits its distinct cross-anchor snapshot before
                 // entering the successor. It is therefore never terminal or a
