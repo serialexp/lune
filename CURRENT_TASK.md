@@ -78,10 +78,24 @@ design (leaf walk owns the accounting).
 All gates green: `zig build test` ×2 (plain + jit-debug), hashgate 84×2,
 wasm, viz 69, boundaries.
 
+Post-D11 profile receipt (fib(32), house recipe, ReleaseFast):
+runWithLinkedLoopDone 17.5% (wrapper + native body), enterSelectedTrace
+11.5% vs enterHeadNativeQuiet 3.0% — the FULL path dominates because each
+descent's leaf re-entry deopts and its scalar zero-exit consumer inserts
+penalty/gate state (Gate.get 4.7%, penalty remove 1.7%, wyhash 2.6%),
+ending quietness for subsequent entries — the D9/D10 starvation shape
+recurring one level down. opCall 11.3% + opRet 8.0% (tier-0 return side),
+driveDispatcherSilentResult 5.3% (full-path per-entry), consumePushedDescent
+3.4%, nativeSelfCallPush 2.4%, nativeSeedFn 2.0% (seed prologue re-runs per
+push — fib's upvalue-callee seed).
+
 NEXT (remaining fib gap is the RETURN side now): every `ret` is tier-0 and
 each post-leaf parent resumption re-opens an episode — P3 down-recursion /
-P2 RETF decision own it. Also queued: P1 recunroll, P1a follow-up matrix
-tests, cheap side-lever per-proto codeFor cache (5.5% hash).
+P2 RETF decision own it (new design section + codex round). The profile
+also flags the leaf-deopt penalty churn forcing the full path (a quiet-path
+starvation shape to fold into the same design round, Z-6: fix the general
+leaf-exit contract, not fib). Also queued: P1 recunroll, P1a follow-up
+matrix tests, cheap side-lever per-proto codeFor cache.
 
 ## Status 2026-09-08i — doc 44 D10 (P4 slice 1: head-sibling exit-branch patching) implemented
 
