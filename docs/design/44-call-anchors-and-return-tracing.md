@@ -5,7 +5,7 @@ episode + S1/S2/S4), and P4 slice 1 (D10 head-sibling exit-branch patching)
 landed; fib jit 317 ms / binary-trees ~368 ms with 100% head coverage. The
 remaining fib gap is the per-call episode turnstile itself — P4's native
 frame push (true up-recursion) owns it.
-Codex-reviewed ×4 (gpt-5.6-sol, all sound-with-changes, every required change
+Codex-reviewed ×5 (gpt-5.6-sol, all sound-with-changes, every required change
 folded; ledger at bottom)
 Owner: Bart
 Last updated: 2026-09-08
@@ -158,6 +158,16 @@ to Done once everything inside a phase is checked.
       boundaries).
 
 ### Outstanding
+- [ ] **P4 slice 2 — native frame push at the self-call terminal
+      (D11).** Nativegen-only lowering of `.terminal(self_call_interp)`:
+      flush, `nativeSelfCallPush` callout (runtime eligibility — actual
+      callee proto match, depth/capacity walls — then `opCall`-verbatim
+      layout + `pushFrameVararg` + episode-ctx refresh), lane-pointer
+      shift by `num_registers`, jump to own `ordinary_entry`.
+      `NativeResult.pushed_frames`; consumers branch on `pushed > 0`
+      FIRST and resume the RELOADED top frame
+      (`.resume_pushed_frame`); recording and tier-1a legs unchanged.
+      See §D11.
 - [ ] **Phase 1a follow-ups.** Remaining review-round-2 matrix tests
       (want-during-recording, sibling abort/cooldown retry,
       `max_traces_per_anchor == trial_visited_cap` truncation, unpatch
@@ -814,6 +824,234 @@ P-E teardown (`removeTrace` → link disarm paths); `EXIT_COUNT_DONE` and
 the D8 want machinery are unaffected (the want records NEW siblings
 below capacity; the arm fuses EXISTING ones — they compose).
 
+### D11 — P4 slice 2: native frame push at the self-call terminal
+
+**Profile receipt (post-D10, fib(31), f31fab4).** The accounting
+machinery is off the board; what remains is the per-call turnstile
+itself: tier-0 call/return scaffolding ≈45% (opCall 14.7%, opRet 9.5%,
+opLoad 9.3%, opJFuncHead 6.9%, opGetUpval 4.4%, opBinNum 6.5%), episode
+entry ≈17% (`runCapturingLedger` wrapper 21.1% incl. the native body —
+bare `[JIT]` rows only ~2.5% — `enterHeadNativeQuiet` 10.5%,
+`consumeHeadBurst` 5.6%), per-call `codeFor` hash ≈5.5%. `--jit-stats`:
+100% head residency, traced 45.5% of cycles at ~248 c/iter, "other
+(non-loop)" 54.5%. Every self-call today exits native, re-enters tier-0,
+runs `opCall` + the jfunc_head dispatch, and opens a fresh episode —
+hundreds of cycles for what LuaJIT does with an in-trace frame push
+(`lj_record.c` up-recursion). This slice replicates that descent-side
+mechanism; returns (down-recursion) stay tier-0 and belong to P3.
+
+**The shape.** A head trace ending in `.terminal(self_call_interp)`
+gets, on the NATIVE lowering only, a frame-push epilogue instead of the
+plain exit: flush the terminal snapshot into the caller window (exactly
+today's flush — it is what makes tier-0's re-executed call correct, so
+by construction it materializes the argument registers), call a runtime
+helper that replicates `opCall`'s Lua-closure arm verbatim (callee
+window layout + `pushFrameVararg` + caller resume-cursor freeze), shift
+the window lane pointers by the anchor proto's `num_registers`
+(compile-time constant — self-call ⇒ same proto), and jump to the
+page's own `ordinary_entry` so the hoisted entry-type guards and seed
+prologue re-run against the new activation. The recursion descent
+becomes a native loop over real VM frames.
+
+**Nothing is recorded differently.** The `TerminalKind` stays
+`self_call_interp`; the push is a LOWERING decision inside nativegen
+(the doc's own P0 note anticipated "native-resuming kinds alongside" —
+we go one better: no new recorded kind at all, so recording and the
+tier-1a legs are byte-identical to today, and the ten-leg matrix keeps
+its D10 shape: native legs descend natively, tier-1a legs keep the
+interp terminal).
+
+**Piece 1 — runtime eligibility lives in the helper, not the trace.**
+P0 deliberately emits NO callee pin at the self-call ("tier-0
+re-executes the call generically", recCall) — so the native push must
+re-derive legality per push, fail-closed to the plain terminal exit
+(publish `exit_instr` + `head_terminal` row + `shared_exit`; tier-0
+re-executes the call generically, including raising the proper errors):
+- the callee value in the caller window is a heap `.function` whose
+  `proto == anchor.proto` (the actual value, read from the just-flushed
+  window — a rebound name at run time simply declines; closure IDENTITY
+  is deliberately not required — same-proto different-upvalue closures
+  are safe because the pushed closure and refreshed ctx are the ACTUAL
+  entering ones, round 5 confirmation);
+- `depth < max_call_depth` and `callee_base + nreg <= regCapacity()`
+  (the two `opCall` overflow walls — on refusal tier-0 re-runs the call
+  and raises `StackOverflow` with intact frames for `describeFault`);
+- round 5 change 6 — the record-time exclusions are DISTANT invariants
+  and the helper is the fail-closed boundary, so it re-verifies them
+  before any mutation: `terminal.aux` in bounds and naming a `.call`;
+  `instr.b != all_results` (the recorder refuses these, recCall, but
+  verify anyway); the anchor proto non-vararg; `!vm.reg_top_pending`.
+  Surplus args on a non-vararg callee nil-fill exactly as `opCall` does
+  (`va_count = 0`); `instr.c == all_results` is safe return wiring the
+  real frame stores and `opRet` already resolves;
+- round 5 change 2 — `region_policy.receiptsInert()` must hold, checked
+  once per EPISODE at the descent-capable entry (not per push): a
+  descent's ledger rows are consumed after the episode against the LEAF
+  activation's region context, but D10 handoff rows can originate in
+  ancestor activations — `pushed_frames` is a total and cannot re-pair
+  rows with their originating `call_seq`, so replaying rows into live
+  region accounting would attach receipts to the wrong activation.
+  V1 disables descents while region receipts are live (mirroring the
+  quiet predicate's own line); the larger per-row-activation-identity
+  alternative is recorded as a non-goal.
+
+**Piece 2 — the helper is `opCall` verbatim, plus the episode ctx.**
+`nativeSelfCallPush` (C-ABI callout, absolute `mov rax,imm64; call` like
+the hash-cell callout; context pointer baked at compile time) performs,
+in order: read the call instr fields (`a`/`b`/`c`) from
+`anchor.proto.code[terminal.aux]`; the checks above; the callee-window
+layout loop (bind params, nil-fill the rest — straight-line,
+allocation-free, above `stack_top` until the push raises it, same as
+tier-0); freeze the CALLER frame's resume cursor to `terminal.aux + 1`
+(the one-past-call cursor `opCall` freezes — this is what keeps
+`backtraceFrames`, `opRet`, and any mid-descent fault byte-identical);
+`pushFrameVararg(cl, callee_base, instr.a, instr.c, 0, 0)` — the real
+funnel: frame struct, `depth`, `stack_top`, `next_call_seq` bump,
+`setRegionContext` — so the call_seq STREAM is identical to the tier-0
+legs by construction; refresh the native episode ctx
+(`prepareNativeEpisode` equivalent: entering closure, proto, new base)
+so per-activation seeds (upvalues — the D9 closure-swap pin) re-resolve
+against the pushed activation and `stubEnterable`'s freshness clause
+keeps matching `region_context.call_seq`; increment a new
+`NativeResult.pushed_frames` counter; return a status word. On any
+refusal: nothing mutated, status → the plain-exit path.
+`onCallEntry`'s hasTrace/repatch body is NOT re-run (the callee's head
+is the very trace we are inside; its patched image early-outs at the S1
+opcode check anyway) — but its UNCONDITIONAL `tick +%= 1`, which runs
+before that early-out on every successful tier-0 Lua entry and drives
+cooldown expiry, MUST be replicated per successful push (round 5 change
+1): factor a shared "successful Lua entry tick" primitive so the tick
+stream stays a pure function of the call stream on every leg. Ordering:
+tick only AFTER the push succeeds (failed calls never tick in tier-0
+either).
+
+**Piece 3 — real frames make every downstream event coherent.** This is
+the structural payoff that justifies the callout cost. Because each
+push creates a REAL activation
+(frame/depth/stack_top/call_seq all live), every later event needs no
+new machinery:
+- a guard deopt at depth k flushes carried homes into the CURRENT
+  window (the lane pointers shifted with the descent) and tier-0
+  resumes at pc 0 of a real frame — the ordinary head-deopt contract;
+- a D10 armed handoff mid-descent transfers within the CURRENT
+  activation — untouched;
+- a prologue-fail on the post-push re-entry (arg types changed at some
+  depth) exits with its ordinary row; tier-0 resumes the pushed frame
+  at pc 0 and the jfunc_head dispatch runs the leaf's own walk;
+- errors raise only in tier-0 (native raises nothing), and the frames
+  the descent pushed are exactly what `describeFault`/pcall unwind
+  expects.
+
+**Piece 4 — the dispatcher contract change (the one real ABI break).**
+Today's episode invariant is "a native run never changes the VM frame
+stack"; the descent breaks it, and BOTH consumers must branch on
+`result.pushed_frames > 0` IMMEDIATELY after the native return — before
+`driveDispatcherSilentResult`, before the scalar seed-decline handlers,
+before the D10 `ledger_len > 1` consumer, and before every scalar head
+consumer (round 5 change 3; a pushed-descent ledger can be `len == 1`
+and every one of those would mis-act against the ENTRY activation):
+- new `EntryDirective` variant `.resume_pushed_frame: usize` — both
+  dispatch sites reload the top frame (`reloadTopFrame`) and dispatch
+  at the given pc of the NEW frame;
+- the pushed-descent terminal grammar is SIX-way (the post-push
+  `ordinary_entry` re-runs both the seed and hoisted-type prologues):
+  `head_terminal` → resume at `term.aux`; final `.deopt` (normal or
+  full-cap `.yielded`) → resume at pc 0; `prologue_fail` → pc 0;
+  `seed_capacity_decline` → pc 0; **`seed_hash_decline` → pc 0 as
+  well** — it must NOT take the existing scalar tier-1a rerun, which
+  would execute against the ENTRY activation's base/closure; the
+  reloaded leaf's own jfunc_head walk makes the rerun/downgrade
+  decision (round 5 change 3). In every case the jfunc_head arm then
+  runs the LEAF's own walk — penalty, D8 want, D10 evidence all charge
+  per-activation exactly as scalar entries do;
+- round 5 change 4 — the pushed consumer is a SIBLING of
+  `consumeHeadBurst`, sharing a factored row-validation/accounting
+  core (owner resolution, head-anchor check, adjacency for armed
+  transitions, per-row run + candidate charges,
+  `noteHeadSiblingCompletion` on a genuine terminal), but NONE of the
+  walk-local state: no `head_burst_visited` publication, no
+  `head_walk_fail` pairing (rows cross activations), no
+  `.next_candidate` (every disposition converts directly to
+  `.resume_pushed_frame`), and the entry patch counts the episode
+  productive (`strikes = 0` — the descent entered native and did real
+  work regardless of how the leaf exited);
+- the quiet predicate is UNCHANGED: pushes mutate no receipt state,
+  and the quiet path routes `pushed_frames > 0` to the same consumer.
+
+**Piece 5 — determinism, GC, and the polling question.** The P4 bullet
+demands the push "poll safepoint/hook/replay natively or self-disable";
+D11 satisfies it via the ALREADY-EXISTING observation-mode bypass, and
+that phrasing supersedes the older Phase 4 bullet's wording (round 5
+reconciliation note):
+- replay/suspend/exec-log/safepoint-lines legs never reach a patched
+  native entry (the §R1-5 bypass set) — the self-disable is already
+  structural. `safepoint_seq` is INTENTIONALLY native-leg-specific: a
+  per-instruction tier-0 counter that native execution already skips
+  today for covered instructions; within-leg consistency is what
+  replay cuts need (and those legs never go native), and cross-leg the
+  gate pins output only — no cross-tier state identity is claimed
+  (round 5 wording fix);
+- the call_seq stream is identical across legs because the helper runs
+  the real `pushFrameVararg` (Piece 2);
+- GC: the descent runs up to `max_call_depth` (200) activations without
+  a `shouldCollect` poll. This is strictly WITHIN existing precedent —
+  a native loop trace already runs unbounded iterations (including
+  doc-24 interning producers) with no mid-loop poll; collection happens
+  at the next tier-0 boundary. Depth-bounded blackout, no new
+  mechanism. If the loop precedent ever gains a native poll, the push
+  joins it.
+
+**Piece 6 — accounting v1.** `rbx` is deliberately untouched by pushes
+(a `cum` bump would corrupt the D10 seg-local column and the head
+zero-exit receipts); the episode still charges one receipt at its
+terminal row. Consequence to carry openly: `--jit-stats`
+iterations/entry undercounts descents (calls ≫ episodes), and
+`hit_count` accrues per-episode, not per-call — both noted, neither
+carries correctness weight; revisit only if trace selection misbehaves
+on recursion-heavy anchors.
+
+**Piece 7 — lowering mechanics (round 5 changes 5 and 7).**
+- C-ABI protocol: at body entry `rdi/rsi/rdx` hold tags/payloads/
+  `*NativeResult` and all three are caller-saved under SysV — the push
+  epilogue must save and restore them around the callout before
+  shifting `rdi/rsi` (the seed prologue's three-push preservation and
+  the hash-cell callout's `rsp % 16 == 8` alignment correction are the
+  in-tree precedents to copy verbatim).
+- `NativeResult.pushed_frames` goes at the ABI TAIL, zero-initialized
+  by the run wrappers; the frozen ledger field offsets must not move.
+- Ledger publication: a SUCCESSFUL push appends NO row and publishes NO
+  terminal result — only the eventual real exit produces the final row.
+  A REFUSAL executes today's complete plain-terminal sequence unchanged
+  (flush already done; `completed = rbx`, `exit_instr = terminal index`,
+  `head_terminal` append, `final_trace_id` stamp, `shared_exit` jump) —
+  which is exactly right in both worlds: with zero prior pushes the
+  existing scalar terminal consumer sees today's bytes; with prior
+  pushes the pushed consumer sees a `head_terminal` final row and
+  resumes the reloaded frame at its `term.aux` (the refusing
+  activation IS the top frame — tier-0 re-executes its call
+  generically, raising any overflow error with intact frames).
+  `emitLedgerAppend` capacity stays safe: an armed source at a full
+  ledger force-yields before dispatching (the existing LEDGER_CAP
+  branch), so descents cannot overflow the row arrays.
+
+**v1 non-goals.** Inline-store lowering of the push (the callout is
+~tens of cycles against the ~500-cycle turnstile it replaces; inlining
+is later codegen tightening inside the same boundary — Z-7 compliant),
+general non-self call pushes, down-recursion/returns (P3), RETF (P2),
+`rbx`-per-push accounting, any GC poll inside the descent, per-row
+activation identity in the ledger (the receiptsInert episode gate is
+the v1 answer to cross-activation region accounting — see Piece 1).
+
+**Tests.** Deep-recursion e2e: fib ten-leg (existing) must stay green
+with descents active; `StackOverflow` at `max_call_depth` through a
+native descent (error message + backtrace identical across legs — the
+helper's refusal hands tier-0 the raise); pcall catching that overflow
+with intact frames; a self-call whose argument type changes at depth
+(prologue-fail mid-descent → leaf walk); a rebound-callee program (the
+name `fib` reassigned mid-run → helper declines, generic call still
+correct); GC-stress legs via the existing matrix. Unit: helper refusal
+matrix (depth wall, capacity wall, non-function callee, foreign proto).
+
 ## 5. Phasing
 
 P0 is the coverage milestone and is deliberately self-contained (both
@@ -893,6 +1131,38 @@ entry-identical for heads; no loop-pc assumption; cap yields cleanly),
 quiet-v2 safety inventory, accounting rationale (suppressed intermediate
 zero receipts; last-failed sibling still raises wants), P-E lifecycle
 composition.
+
+**Round 5 (codex gpt-5.6-sol, 2026-09-08, D11 only): sound-with-changes;
+7 required changes, all folded into D11.** (1) `onCallEntry`'s
+unconditional `tick +%= 1` (pre-early-out, drives cooldown expiry) must
+be replicated per successful push — factor a shared successful-entry
+tick primitive, tick only after the push. (2) descents require
+`receiptsInert()` (episode-level): rows are consumed against the LEAF's
+region context but can originate in ancestor activations —
+`pushed_frames` cannot re-pair them; per-row activation identity is the
+recorded non-goal alternative. (3) the pushed branch runs IMMEDIATELY
+after the native return (before silent-result, scalar seed-decline, D10
+burst, scalar head consumers) and the terminal grammar is six-way —
+both seed declines resume the reloaded leaf at pc 0; `seed_hash_decline`
+must NOT take the entry-activation tier-1a rerun. (4) the pushed
+consumer shares a factored validation/accounting core with
+`consumeHeadBurst` but none of its walk-local state (no burst-visited,
+no `head_walk_fail`, no `.next_candidate`). (5) ABI: save/restore
+`rdi/rsi/rdx` around the callout (SysV caller-saved), hash-callout
+alignment protocol, `pushed_frames` at the ABI tail with frozen ledger
+offsets untouched. (6) the helper re-verifies the distant record-time
+invariants pre-mutation (`terminal.aux` bounds + `.call`, `b !=
+all_results`, non-vararg anchor, `!reg_top_pending`). (7) successful
+push appends no row; refusal runs today's full plain-terminal sequence
+(correct for both the zero-push scalar consumer and the pushed
+consumer). Confirmed sound: same-proto/different-upvalue closures (push
+the actual closure, no identity pin), rebound/`__call` decline paths,
+terminal-flush sufficiency for fixed-arg calls, real-frame
+unwind/backtrace/pcall coherence, the no-GC-poll argument (within the
+native-loop precedent), `instr.c == all_results` return wiring.
+Wording fixes: `safepoint_seq` is intentionally native-leg-specific;
+the D11 bypass-based self-disable supersedes the older P4 bullet's
+polling phrasing.
 
 ## References
 
