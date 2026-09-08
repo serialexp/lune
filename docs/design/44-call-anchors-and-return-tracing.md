@@ -5,9 +5,9 @@ episode + S1/S2/S4), P4 slice 1 (D10 head-sibling exit-branch patching), and
 P4 slice 2 (D11 native frame push — true up-recursion on the descent side)
 landed; fib jit 263.5 ms / binary-trees 287.7 ms with 100% head coverage.
 The remaining fib gap (35× vs LuaJIT) is the return side: every `ret` is
-tier-0 and each post-leaf parent resumption re-opens an episode — §D12
-(designed, not yet implemented) owns it in three slices: D12a handoff-evidence
-symmetry under descents (formation-order robustness), D12b continuation
+tier-0 and each post-leaf parent resumption re-opens an episode — §D12 owns
+it in three slices: D12a handoff-evidence symmetry under descents (LANDED —
+formation-order robustness, the fib(27)-shape fix), D12b continuation
 anchors (post-call resume traces), D12c native frame pop + return links
 (down-recursion; subsumes P3 and supersedes P2-for-recursion).
 Codex-reviewed ×6 (gpt-5.6-sol, all sound-with-changes, every required change
@@ -199,6 +199,30 @@ to Done once everything inside a phase is checked.
       iterations-per-entry undercount descents (binary-trees res%
       reads 9% while getting 22% faster). All gates green.
 
+- [x] **D12a — descent-symmetric handoff evidence.** Landed per the
+      round-6-amended design. A1: one evidence funnel at the top of
+      `consumePushedDescent`, keyed on the ENTERED trace's id
+      (`consumeHeadWalkFail(ct.id)` + `noteHeadSiblingCompletion(…,
+      ct.id)`, exactly once per consumed descent, disposition-
+      independent; the `head_terminal` branch's duplicate completion
+      call removed — round-6 change 5). A2: `pending_descent_fail`
+      carry (`DescentFailCarry` in trace_types) set only for the final
+      `.deopt`+`.normal` real-guard row, pinned to the leaf frame's
+      `call_seq`; consumed-or-discarded at the head walk start AFTER
+      the freshness reset (globally-monotone `call_seq` makes stale
+      false-matches impossible — the `maybeStartHead` argument).
+      Receipts: fib(27)-shape (base-case incumbent) goes from ZERO arms
+      + 196,391 per-leaf penalty strikes + 2–3 episodes/call to BOTH
+      directions armed by warmup end, 61 strikes total, and 196,330
+      fused `pushed-descent terminal` episodes — the lucky shape's
+      ideal steady state, now formation-order-independent. Test: the
+      bad shape pinned deterministically (`hotcall=4`, `fib(4)` warmup
+      makes call #4 the base case) asserting `sibling_handoff_arms >=
+      2` (lucky shape produces exactly 1) + live descents + exact
+      output. Board: fib 262.4 / btrees 287.9 (7-rep) — neutral on the
+      lucky-shape board, as designed. All gates green (both test
+      builds, hashgate 84×2, wasm, viz 69, boundaries).
+
 ### Outstanding
 - [ ] **Phase 1a follow-ups.** Remaining review-round-2 matrix tests
       (want-during-recording, sibling abort/cooldown retry,
@@ -214,11 +238,6 @@ to Done once everything inside a phase is checked.
       patch out in 4 consecutive `.next_candidate`s (`patch_strikes`), and
       since a retired head never re-arms (hasTrace blocks `onCallEntry`,
       installs only at commit) coverage collapses to 0 for those inputs.
-- [ ] **D12a — descent-symmetric handoff evidence.** Both head-handoff
-      arming pathways are structurally starved when the base-case sibling
-      is the incumbent (fib(27) shape: per-call penalty churn forever,
-      neither direction can ever arm — §D12 receipts). Productive-descent
-      completion evidence + descent-bottom failer carry.
 - [ ] **D12b — continuation anchors.** Post-call resume pcs as a new
       one-shot root source: hot-counted at the `opRet` resume, recorded
       with the existing D4/D5 grammar, entered via a first-class `jcont`

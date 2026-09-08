@@ -21,6 +21,51 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-08k — doc 44 §D12 designed (codex round 6) + D12a LANDED
+
+§D12 (return side) committed 73af1d3, codex round-6 reviewed (sound-with-
+changes, 9 changes folded — see doc 44 review ledger). Three slices: D12a
+evidence symmetry (landed, this change set), D12b continuation anchors,
+D12c native frame pop + `.ret_cont`/`.call_head` links. P2 RETF superseded
+for the recursion shape; P3 owned by D12b+c.
+
+**The D12a receipts (jit-debug, the defining datum for the slice):** which
+sibling records first is a deterministic per-input coin flip (hot-call #112),
+and the BAD shape — base-case sibling as incumbent, e.g. fib(27) — could arm
+NEITHER handoff direction: the entry walk's completion is a productive
+descent (no terminal → no `noteSiblingTerminal`), and the descent-bottom
+deopt died with the walk-start `head_walk_fail` reset. Steady state: 196,391
+per-leaf penalty strikes, 2–3 episodes per call, forever. fib(22)/fib(31)
+just got lucky (descender incumbent → natural pairing → armed → fused
+`pushed-descent terminal: rows=2` steady state).
+
+Landed (round-6-amended design):
+- **A1** — one evidence funnel at the top of `consumePushedDescent`, keyed
+  on the ENTERED trace (`consumeHeadWalkFail(ct.id)` +
+  `noteHeadSiblingCompletion(…, ct.id)`), exactly once per descent;
+  duplicate completion call removed from the `head_terminal` branch.
+- **A2** — `pending_descent_fail: ?DescentFailCarry` (trace_types): the
+  final `.deopt`+`.normal` real-guard row carried into the leaf's own walk,
+  `call_seq`-pinned, consume-or-discard at walk start after the freshness
+  reset.
+- **Test**: bad shape pinned deterministically (hotcall=4 + `fib(4)` warmup
+  → call #4 = `fib(1)` = base case records first), asserts
+  `sibling_handoff_arms >= 2` (lucky shape = exactly 1), live descents,
+  exact output.
+
+Receipts after fix: fib(27) run — both arms by warmup end, strikes
+196,391 → 61, descents 196,330× fused-terminal. Board
+(20260908-181252-73af1d3.tsv): fib 262.4 ms, btrees 298→287.9 at 7 reps
+(the 298 was rep noise) — neutral on the lucky-shape board, as designed.
+All gates green: `zig build test` ×2 (plain + jit-debug), hashgate 84×2,
+wasm, viz 69, boundaries.
+
+NEXT: D12b (continuation anchors — jcont patch kind, opRet-resume counting,
+`.fast` parking, physical-pc collision refusal, `OneShotWalkCtx` exact-
+anchor parameterization), then D12c (native pop + links — the payoff).
+Queued behind: P1 recunroll, P1a matrix tests, per-proto codeFor cache,
+quiet-predicate anchor-locality fragility (global penalty/gate emptiness).
+
 ## Status 2026-09-08j — doc 44 D11 (P4 slice 2: native frame push / up-recursion descent) LANDED
 
 Design committed 3d6dc81 (§D11, codex round-5 reviewed, 7 changes folded);

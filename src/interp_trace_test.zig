@@ -5077,6 +5077,62 @@ test "head descent formation (doc 44 D11): the self-call terminal actually pushe
     try testing.expect(vm.trace.self_call_pushes >= 100);
 }
 
+test "head handoff evidence symmetry (doc 44 D12a): the base-case-incumbent shape arms BOTH directions" {
+    // Which sibling records FIRST is a deterministic function of hot-call
+    // timing, and pre-D12a the base-case-incumbent shape (fib(27) in the
+    // field) could arm NEITHER handoff direction: the entry walk's
+    // "completion" is a productive descent (no terminal → no
+    // `noteSiblingTerminal` pairing), and the descent-bottom deopt died with
+    // the walk-start `head_walk_fail` reset. Steady state was one penalty
+    // strike + two extra episodes per call, forever. This test pins the bad
+    // shape ON PURPOSE — with `hotcall = 4`, warming with `fib(4)` makes the
+    // 4th fib call `fib(1)` (a base case: calls go 4, 2, 0, 1 under the
+    // n-2-first body), so the FIRST recorded trace is the base-case sibling
+    // and it takes the entry patch — then asserts the two D12a evidence
+    // flows arm BOTH directions (the lucky shape arms exactly one; ≥ 2 is
+    // unreachable without the fix) while descents stay live and the output
+    // stays exact. Native-only: descents are a nativegen lowering.
+    if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    const source =
+        \\local function fib(n)
+        \\  if n < 2 then return 1 end
+        \\  return fib(n-2) + fib(n-1)
+        \\end
+        \\local warm = fib(4)
+        \\local big = fib(20)
+        \\print(warm, big)
+    ;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = true;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.hotcall = 4;
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings("5\t10946\n", sink.buffered());
+    // Both evidence flows fired: A1 (walk failer + productive descent) arms
+    // base@guard → descender; A2 (descent-bottom carry + leaf completion)
+    // arms descender@guard → base. The lucky shape produces exactly one arm.
+    try testing.expect(vm.trace.sibling_handoff_arms >= 2);
+    // And the descents themselves are live (not a scalar-turnstile pass).
+    try testing.expect(vm.trace.self_call_pushes >= 100);
+}
+
 test "push helper refusal matrix (doc 44 D11): every wall declines with nothing mutated" {
     // Drive `nativeSelfCallPush` directly through the installed ctx fn
     // pointer (the same route the baked callout takes) against a hand-built

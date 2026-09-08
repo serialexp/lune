@@ -2977,11 +2977,16 @@ pub const Vm = struct {
 
     /// Doc 44 D11: the pushed-descent consumer — a SIBLING of
     /// `consumeHeadBurst` sharing the factored row-validation/accounting core
-    /// but NONE of the walk-local state: no `head_burst_visited` publication,
-    /// no `head_walk_fail` pairing (rows cross activations), and no
-    /// `.next_candidate` — every disposition converts directly to
+    /// but NONE of the walk-local state: no `head_burst_visited` publication
+    /// and no `.next_candidate` — every disposition converts directly to
     /// `.resume_pushed_frame` (the top frame is now the descent's leaf; the
-    /// entry activation's walk cannot continue against it). The terminal
+    /// entry activation's walk cannot continue against it). D12a amended the
+    /// original "no `head_walk_fail` pairing" rule with the two ACTIVATION-
+    /// CORRECT evidence flows: the A1 funnel pairs a standing walk failer
+    /// with the ENTERED trace (the descent handled the entry activation's
+    /// call), and the A2 carry hands the final deopt — which happened in the
+    /// LEAF activation — to the leaf's own walk, `call_seq`-pinned. Rows in
+    /// between still cross activations and still pair nothing. The terminal
     /// grammar is SIX-way — the post-push `ordinary_entry` re-runs both the
     /// seed and hoisted-type prologues, so both seed declines can surface
     /// mid-descent; `seed_hash_decline` must NOT take the scalar tier-1a
@@ -3006,6 +3011,19 @@ pub const Vm = struct {
         if (result.ledger_len == 0) @panic("pushed descent: empty ledger");
         const ledger = ts.ledger_scratch[0..result.ledger_len];
         if (ledger[0].id != ct.id) @panic("pushed descent: row 0 owner is not the entered trace");
+        // Doc 44 D12a (A1): ONE evidence funnel per consumed descent, keyed on
+        // the ENTERED trace — never the final row's owner (an armed handoff
+        // diverges them, and `noteHeadSiblingCompletion` deliberately keeps a
+        // want alive when the completer equals its source). A descent that
+        // pushed real frames handled the entry activation's call productively:
+        // pair a standing walk failer with it (`noteSiblingTerminal(failer)`
+        // — arming failer@exit → this trace at `hotguard`), and retire a
+        // standing head want exactly as a terminal completion does (without
+        // this, the want lingers under descents and re-records duplicate
+        // shapes to the population cap). Runs exactly once, disposition-
+        // independent; the genuine `head_terminal` receipt stays separate.
+        self.consumeHeadWalkFail(ct.id);
+        ts.noteHeadSiblingCompletion(.{ .proto = ct.code.anchor.proto, .pc = ct.code.anchor.pc }, ct.id);
         var i: usize = 0;
         while (i < ledger.len) : (i += 1) {
             const row = ledger[i];
@@ -3034,7 +3052,9 @@ pub const Vm = struct {
                     const term = owner.code.instrs[row.exit];
                     ts.dbg("pushed-descent terminal: pushed={d} rows={d} final t={d} resume={d}", .{ result.pushed_frames, ledger.len, owner.id, term.aux });
                     ts.onSideExitReceipt(owner, 1, row.exit, 1, .deferred, .entered);
-                    ts.noteHeadSiblingCompletion(.{ .proto = owner.code.anchor.proto, .pc = owner.code.anchor.pc }, owner.id);
+                    // D12a: want retirement moved to the single funnel above
+                    // (keyed on the ENTERED trace, round-6 change 5 — a second
+                    // call here would double-fire with a different id).
                     return .{ .resume_pushed_frame = @intCast(term.aux) };
                 },
                 .deopt => {
@@ -3045,6 +3065,19 @@ pub const Vm = struct {
                     // here too would double-count one semantic failure.
                     if (row.outcome == .yielded and ledger.len != trace_exec.LEDGER_CAP)
                         @panic("pushed descent: yielded row below full cap");
+                    // Doc 44 D12a (A2): the final real-guard deopt happened IN
+                    // the leaf activation — carry it as walk-local failer
+                    // evidence for the leaf's own upcoming walk, pinned to the
+                    // leaf frame's `call_seq` (consume-or-discard at the walk
+                    // start). Never for `.yielded` (a CUT, not a failure —
+                    // the last exit is armed and live, the D10 rationale) and
+                    // only for a real guard exit (the scalar provenance bar).
+                    if (row.outcome == .normal and row.exit != std.math.maxInt(u32)) {
+                        ts.pending_descent_fail = .{
+                            .exit = .{ .trace_id = owner.id, .exit_instr = row.exit },
+                            .call_seq = self.frames[self.depth - 1].call_seq,
+                        };
+                    }
                     ts.dbg("pushed-descent deopt: pushed={d} rows={d} last t={d} exit={d} yielded={}", .{ result.pushed_frames, ledger.len, owner.id, row.exit, row.outcome == .yielded });
                     return .{ .resume_pushed_frame = 0 };
                 },
@@ -4059,6 +4092,20 @@ pub const Vm = struct {
         if (is_head) {
             self.trace.head_walk_fail = null;
             self.trace.head_burst_visited_len = 0;
+            // Doc 44 D12a (A2): consume the descent-bottom failer carry. The
+            // `call_seq` pin proves this walk belongs to the very activation
+            // the descent deopted in (globally monotone — a stale carry can
+            // never false-match); a mismatch means that activation died, so
+            // discard. On match the carry seeds `head_walk_fail` AFTER the
+            // freshness reset above — this walk's completion then pairs with
+            // the descender's bottom exit (`noteSiblingTerminal`), which is
+            // what arms descender@exit → base-case sibling and lets the
+            // descent finish natively next time (the fib(27)-shape fix).
+            if (self.trace.pending_descent_fail) |pdf| {
+                self.trace.pending_descent_fail = null;
+                if (pdf.call_seq == self.frames[self.depth - 1].call_seq)
+                    self.trace.head_walk_fail = pdf.exit;
+            }
         }
         // Doc 44 D9: quiet-first for heads — the lean episode when nothing
         // that could observe or steer it is live; the full path otherwise.

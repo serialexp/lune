@@ -124,6 +124,7 @@ pub const LinkTerminalProvenance = trace_types.LinkTerminalProvenance;
 pub const ExitProvenance = trace_types.ExitProvenance;
 pub const ExitProvEntry = trace_types.ExitProvEntry;
 pub const ExitKey = trace_types.ExitKey;
+pub const DescentFailCarry = trace_types.DescentFailCarry;
 pub const ProgramPoint = trace_types.ProgramPoint;
 pub const StructuralEdgeId = trace_types.StructuralEdgeId;
 pub const AnchorKey = trace_types.AnchorKey;
@@ -974,6 +975,20 @@ pub const TraceState = struct {
     /// recorded failer. NOT a per-receipt counter — the counting lives in the
     /// existing Part-S watch (`noteSiblingTerminal`).
     head_walk_fail: ?ExitKey = null,
+    /// Doc 44 D12a (A2): descent-bottom failer carry. A pushed descent's final
+    /// real-guard deopt happens IN the leaf activation (the D11 deopt contract
+    /// flushes into the CURRENT window), so it is legitimate walk-local
+    /// evidence FOR the leaf's own upcoming walk — the walk-start reset rule
+    /// guards against *stale cross-activation* evidence, which this is not.
+    /// `consumePushedDescent` records the final `.deopt`+`.normal` row here
+    /// (never `.yielded`, prologue-fail, or seed declines — those carry no
+    /// branch-alternative meaning), pinned to the leaf frame's `call_seq`;
+    /// the next head walk start consumes it into `head_walk_fail` iff the
+    /// entering frame's `call_seq` matches, else discards (the activation
+    /// died — and `call_seq` is globally monotone, so a stale carry can never
+    /// false-match, the `maybeStartHead` argument). One slot, overwritten by
+    /// later descents, consume-or-discard at every head walk start.
+    pending_descent_fail: ?DescentFailCarry = null,
     /// Doc 44 D10: owner ids the last fused head burst ENTERED (deduped),
     /// published by the dispatcher's `consumeHeadBurst` for the
     /// `enterPatchedTrace` walk to merge into its visited set — a burst owner

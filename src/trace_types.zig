@@ -134,6 +134,10 @@ pub fn exitProvEntryLess(_: void, a: ExitProvEntry, b: ExitProvEntry) bool {
 /// until A-iv threads it per-site — §A8-ii).
 pub const ExitKey = struct { trace_id: u32, exit_instr: u32 };
 
+/// Doc 44 D12a (A2): a descent-bottom failer `ExitKey` pinned to the leaf
+/// activation it deopted in. See `TraceState.pending_descent_fail`.
+pub const DescentFailCarry = struct { exit: ExitKey, call_seq: u64 };
+
 /// A recorded guest program-point `{proto_id, source_pc}` (doc 17 §A3.5 / §A8-ii,
 /// A-ii.3). `Trace.rec_path` is the ordered sequence captured one-per-`recordInstr`;
 /// A-ii.4 unions member traces' paths into each `RegionDef`'s membership set. Keyed
