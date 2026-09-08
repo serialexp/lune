@@ -327,6 +327,21 @@ pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: u
     // exit counter above keeps saturating, so the first exit after the
     // cooldown re-creates the want without losing hotness.
     if (self.recordingBarred(t.code.anchor)) return;
+    // Doc 44 D8 (P1a): HEAD route, before the branch/generic routes. A head
+    // guard fail is coherent at function entry — the alternate path is a
+    // same-anchor SIBLING, so raise the head-sibling want and, decisively,
+    // do NOT `markEntryPatchesAt`: the pc-0 patch is the SOLE entry for
+    // every sibling (a head has no virgin back-edge walk to re-arm through).
+    // Consumed on the CURRENT activation by `enterPatchedTrace` after the
+    // whole sibling walk declines.
+    if (trace_mod.isHeadAnchorPc(t.code.anchor.pc)) {
+        if (self.wants_head_sibling != null) return;
+        if (self.anchorPopulation(t) >= self.config.max_traces_per_anchor) return;
+        self.dbg("hotexit: trace id={d} exit={d} count={d} -> want HEAD sibling", .{ t.id, exit_instr, c.* });
+        self.wants_head_sibling = t.code.anchor;
+        self.head_want_src = .{ .trace_id = t.id, .exit_instr = exit_instr };
+        return;
+    }
     const branch = self.isSourceBranchGuardExit(t, exit_instr, proto) and blk: {
         const src_pc = guardSourcePc(t.code.instrs[exit_instr]) orelse break :blk false;
         if (src_pc >= proto.code.len) break :blk false;
@@ -354,6 +369,30 @@ pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: u
         // path at this anchor next execution — mark any patch pending.
         self.markEntryPatchesAt(t.code.anchor);
     }
+}
+
+/// Doc 44 D8 (P1a): a head trace at `anchor` completed terminally. If a
+/// head-sibling want is standing for this anchor, retire it: clear the want
+/// and DONE-latch the raising `(trace, exit)` counter — without the latch a
+/// saturated incumbent exit re-raises the want on its next zero exit and the
+/// anchor records duplicate shapes until the population cap (review round 2
+/// blocker 3). Deterministic: pure function of the want state.
+pub fn noteHeadSiblingCompletion(self: *TraceState, anchor: AnchorKey, completed_id: u32) void {
+    const wanted = self.wants_head_sibling orelse return;
+    if (wanted.proto != anchor.proto or wanted.pc != anchor.pc) return;
+    if (self.head_want_src) |src| {
+        // The want's SOURCE completing proves only its own path still runs —
+        // the failing path stays uncovered, so the want stands. Any OTHER
+        // sibling completing on this anchor was reached because the walk fell
+        // past the source's zero exit: that path is now covered.
+        if (src.trace_id == completed_id) return;
+        if (self.traceById(src.trace_id)) |parent| {
+            if (src.exit_instr < parent.exit_counts.len)
+                parent.exit_counts[src.exit_instr] = trace_mod.Trace.EXIT_COUNT_DONE;
+        }
+    }
+    self.wants_head_sibling = null;
+    self.head_want_src = null;
 }
 
 /// Count a guard failure at `exit_pc` within a trace anchored at `anchor`.
@@ -1728,6 +1767,8 @@ pub fn clearCache(self: *TraceState) void {
     self.guard_failures.clearRetainingCapacity();
     self.wants_side_trace = null;
     self.side_want_src = null;
+    self.wants_head_sibling = null;
+    self.head_want_src = null;
     self.wants_prime_side = null;
     self.prime_want_src = null;
     self.pending_exit_anchor = null;

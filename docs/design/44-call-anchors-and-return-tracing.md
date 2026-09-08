@@ -97,15 +97,32 @@ to Done once everything inside a phase is checked.
       same-anchor sibling.
 
 ### Outstanding
-- [ ] **Phase 1a — head path siblings (D8, designed + reviewed).** The
-      four D8 pieces: head route in `noteTakenExit` (want, no unpatch),
-      sibling walk in `enterPatchedTrace` (hit-count order, truncation
-      never strikes, caller-owned dead removal), current-activation want
-      transfer into `pending_call_anchor`, patch retention below sibling
-      capacity + DONE-latch on sibling completion + idempotent re-install
-      recovery. Matrix tests incl. base→non-base, non-base→base, a
-      NON-recursive two-path head (Z-6), want-during-recording, sibling
-      abort/cooldown, `max_traces_per_anchor == trial_visited_cap`.
+- [x] **Phase 1a — head path siblings (D8).** All four pieces landed:
+      head route in `noteTakenExit` (want + src provenance, no unpatch),
+      sibling walk in `enterPatchedTrace` (`nextTraceExcluding` hit-count
+      order, truncation never strikes, `removeTrace` idempotence keeps
+      mid-walk removal safe), current-activation want transfer into
+      `pending_call_anchor` (parked through the `.full` prologue so
+      `maybeStartHead` arms pc 0 of the failing activation), patch
+      retention below sibling capacity, DONE-latch on NON-source sibling
+      completion (a source completing proves nothing about the failing
+      path), idempotent `maybeRepatchHead` recovery in `onCallEntry`.
+      Receipts: fib(15)/fib(25) — the P0 coverage-collapse inputs — now
+      grow the recursive sibling and keep 100% coverage; fib(30) grows the
+      base sibling (2.69M completions, 100% of calls, cycles/iter
+      405→301); the non-recursive two-path e2e pins Z-6 generality; want
+      self-retires via the DONE-latch. All gates green.
+      **Board cost note:** absorbing a trivial alternate path natively
+      currently LOSES wall clock (fib jit 477→550 ms, btrees 370→397) —
+      each absorbed call pays the ~300-cycle dispatcher episode twice
+      where tier-0 ran the 3-op base case in ~30 ns. This is the same
+      per-entry seam P4 exists to remove, not a D8 defect; revisit the
+      pair after P4's native frame push / lean head entry.
+- [ ] **Phase 1a follow-ups.** Remaining review-round-2 matrix tests
+      (want-during-recording, sibling abort/cooldown retry,
+      `max_traces_per_anchor == trial_visited_cap` truncation, unpatch
+      recovery e2e); commit-time provenance latch (today's latch fires at
+      the walk's completion site only).
 - [ ] **Phase 1 — remaining recursion ergonomics.** Bounded recursive
       unrolling (`recunroll` budget for depth>0 self-calls), lifecycle
       hardening under the abort/GC/error matrix, binary-trees receipts. P0 field note strengthening the

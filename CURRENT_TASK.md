@@ -21,6 +21,33 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-08g — doc 44 D8 (P1a head path siblings) LANDED
+
+Designed (doc 44 D8) + codex round-2 reviewed (sound-with-changes, 7 changes
+folded) + implemented + tested, all gates green. The pieces: noteTakenExit
+head route (want + src, NO unpatch), enterPatchedTrace sibling walk
+(nextTraceExcluding order; truncation never strikes; head patch retention
+below max_traces_per_anchor), current-activation want transfer →
+pending_call_anchor → `.switch_mode_at(0)` park → maybeStartHead arms the
+FAILING activation, DONE-latch on non-source sibling completion,
+maybeRepatchHead recovery in onCallEntry. New tests: non-recursive two-path
+ten-leg e2e (Z-6) + executing sibling-lifecycle recorder test (NB:
+runForTrace is recording-only — execute=false — a lifecycle test must
+inline an executing harness).
+
+Receipts: fib(15)/(25) (P0's coverage-collapse inputs) now grow the
+recursive sibling, 100% coverage, no unpatch; fib(30) grows a base sibling
+(100% of calls complete, cycles/iter 405→301). BUT board wall: fib jit
+477→550 ms, btrees 370→397 — absorbing a trivial alternate path pays the
+~300-cyc dispatcher episode TWICE vs a ~30ns tier-0 base case. Not a D8
+defect; the per-entry seam is the single remaining cost everywhere
+(Rule Z-7: the fix is P4's native frame push + a LEAN head entry path —
+most of enterSelectedTrace's prep is loop-anchor machinery heads never
+use: tryArmSiblingHandoff, loop-done link modes, silent-burst staging).
+NEXT: lean head entry (slice of the P4 end-state, not seam polish), then
+recunroll, then P4 proper. Follow-ups parked in doc 44 P1a-follow-ups
+bullet (remaining matrix tests, commit-time provenance latch).
+
 ## Status 2026-09-08f — doc 44 P0 COMPLETE: native `.terminal` lowering landed
 
 fib runs 100% of entries as native bodies (2,692,425/2,692,425), correct

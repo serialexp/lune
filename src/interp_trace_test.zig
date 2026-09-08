@@ -4795,6 +4795,86 @@ test "head e2e (doc 44 P0): head trace with an upvalue read seed — same-proto 
     , "22100\t220100\n");
 }
 
+test "head e2e (doc 44 D8): non-recursive two-path head — alternating calls grow a path sibling, all ten legs" {
+    // Z-6 pin: head path siblings are general path-polymorphic
+    // specialization, not a recursion feature. `pick` splits at its head on
+    // the sign of `n`; strictly alternating calls guarantee whichever path
+    // the incumbent records, every other call zero-exits it — the hot-exit
+    // want, current-activation transfer, and sibling walk must all fire with
+    // zero recursion anywhere. Byte-identical across the ten-leg matrix.
+    try expectProgram(
+        \\local function pick(n)
+        \\  if n < 0 then return -n end
+        \\  return n + 1
+        \\end
+        \\local acc = 0
+        \\for i = 1, 300 do
+        \\  if i % 2 == 0 then acc = acc + pick(-i) else acc = acc + pick(i) end
+        \\end
+        \\print(acc)
+    , "45300\n");
+}
+
+test "recorder (head, doc 44 D8): the sibling lifecycle — want, transfer, second head trace, want retired" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // The sibling lifecycle needs EXECUTION (zero exits only happen when the
+    // incumbent actually runs), so `runForTrace`'s recording-only harness
+    // (execute=false) can't drive it — inline the executing variant.
+    const source =
+        \\local function pick(n)
+        \\  if n < 0 then return -n end
+        \\  return n + 1
+        \\end
+        \\local acc = 0
+        \\for i = 1, 60 do
+        \\  if i % 2 == 0 then acc = acc + pick(-i) else acc = acc + pick(i) end
+        \\end
+        \\print(acc)
+    ;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.hotcall = 4;
+    vm.trace.config.hotexit = 3; // few zero exits → want (default 10)
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    // Alternating two-path calls: the incumbent records one path, the other
+    // path's calls zero-exit it hot, the want transfers on the current
+    // activation, and the sibling records the other path. Both then complete
+    // their own calls — the anchor ends with TWO head traces, the want
+    // retired (cleared + DONE-latched by the sibling completion), and no
+    // record gate.
+
+    // The outer `for` records its own loop trace (hotloop=56 < 60 iters); the
+    // head-anchored population is what this test pins.
+    var heads: usize = 0;
+    for (vm.trace.registry.cache.items) |t| {
+        if (!trace.isHeadAnchorPc(t.code.anchor.pc)) continue;
+        heads += 1;
+        const last = t.code.instrs[t.code.instrs.len - 1];
+        try testing.expectEqual(trace.trace_ir.IrOp.terminal, last.op);
+    }
+    try testing.expectEqual(@as(usize, 2), heads);
+    try testing.expectEqual(@as(u32, 0), vm.trace.record_gate.count());
+    // The want must not linger once the sibling covers the failing path
+    // (review round 2 blocker 3 — a stuck want would re-record duplicates).
+    try testing.expect(vm.trace.wants_head_sibling == null);
+    try testing.expect(vm.trace.head_want_src == null);
+}
+
 test "recorder (head, doc 44 P0): a depth-0 multret-forwarding return aborts — no head trace" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);

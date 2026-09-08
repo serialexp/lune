@@ -2971,6 +2971,11 @@ pub const Vm = struct {
                 // successes could never un-earn — exactly the str_gmatch
                 // starvation shape). One completed head run = one iteration.
                 self.trace.onSideExitReceipt(final, 1, result.exit_instr, 1, .deferred, .entered);
+                // Doc 44 D8: a completion by a NON-source sibling retires a
+                // standing head-sibling want (clear + DONE-latch the raising
+                // exit) — the walk only reached this trace past the source's
+                // zero exit, so the failing path is covered now.
+                self.trace.noteHeadSiblingCompletion(.{ .proto = final.code.anchor.proto, .pc = final.code.anchor.pc }, final.id);
                 for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
                 return .{ .resume_tier0 = @intCast(term.aux) };
             }
@@ -2987,6 +2992,12 @@ pub const Vm = struct {
             // would re-dispatch the patch and spin).
             if (trace.isHeadAnchorPc(final.code.anchor.pc)) {
                 self.trace.dbg("head zero-exit: trace={d} native={} reason={s} exit={d} completed={d}", .{ final.id, ran_native, @tagName(result.exit_reason), result.exit_instr, result.completed });
+                // Doc 44 D8: head guard fails DO accrue hot-exit hotness now —
+                // `noteTakenExit`'s head route raises the sibling want without
+                // ever unpatching (the pc-0 patch is the sole entry). A
+                // prologue-fail exit (`exit_instr == maxInt`) is bounds-refused
+                // inside, exactly like the loop arms.
+                self.trace.noteTakenExit(final, result.exit_instr, local_done, proto);
                 self.trace.onSideExitReceipt(
                     final,
                     local_done,
@@ -3432,21 +3443,76 @@ pub const Vm = struct {
         pc: usize,
     ) EntryDirective {
         const ct = patch.trace; // live pre-drain ⇒ valid (§R7-2)
+        const is_head = trace.isHeadAnchorPc(ct.code.anchor.pc);
         var dead: [trial_visited_cap]*trace.Trace = undefined;
         var ndead: usize = 0;
-        // The walk marks each candidate visited before entering. A patched
-        // entry has no walk, so seed the exclusion set with exactly `ct`.
-        var visited_ct = [1]*trace.Trace{ct};
+        // The walk marks each candidate visited before entering. Seed the
+        // exclusion set with the incumbent; the head sibling walk below grows it.
+        var visited: [trial_visited_cap]*trace.Trace = undefined;
+        visited[0] = ct;
+        var nvisited: usize = 1;
         var wctx: TrialWalkCtx = .{
-            .visited = visited_ct[0..1],
+            .visited = visited[0..1],
             .dead = &dead,
             .ndead = &ndead,
         };
         var directive = self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx);
-        // A patched entry has no sibling walk. If its zero-progress exit made a
-        // side want hot, consume it at the coherent header now; otherwise the
-        // back-edge arm is one iteration late and records the old shape again.
-        if (directive == .next_candidate and self.trace.consumeSideTraceWantAtResume(proto, @intCast(pc))) {
+        // Doc 44 D8 (P1a): the head sibling walk. On a zero exit from the
+        // incumbent, try the anchor's OTHER head traces — `nextTraceExcluding`
+        // is the same deterministic selection the loop walk uses (highest
+        // hit_count, registry insertion order as tiebreak). Each candidate's
+        // entry is coherent (a head guard fail leaves regs untouched at pc 0).
+        // Removal stays safe mid-walk: `removeTrace` is cache-scan-guarded
+        // (idempotent), and every candidate is selected from the LIVE cache
+        // immediately before entry.
+        var walk_truncated = false;
+        if (is_head) {
+            while (directive == .next_candidate) {
+                if (nvisited >= trial_visited_cap) {
+                    // Capacity: unvisited siblings may remain — all-declined
+                    // strike semantics require all-visited (review round 2).
+                    walk_truncated = self.trace.nextTraceExcluding(proto, trace.FUNC_HEAD_PC, visited[0..nvisited]) != null;
+                    break;
+                }
+                const sib = self.trace.nextTraceExcluding(proto, trace.FUNC_HEAD_PC, visited[0..nvisited]) orelse break;
+                visited[nvisited] = sib;
+                nvisited += 1;
+                wctx.visited = visited[0..nvisited];
+                directive = self.enterSelectedTrace(mode, sib, closure, proto, regs, base, pc, &wctx);
+            }
+            // Doc 44 D8: every candidate declined this activation — consume a
+            // standing head-sibling want on the CURRENT activation (review
+            // round 2's reframe): transfer it into `pending_call_anchor` pinned
+            // to this frame's `call_seq` and park through the `.full` prologue,
+            // so `maybeStartHead` arms at pc 0 of the very activation whose
+            // path just failed every candidate. Transfer rules: never while a
+            // recording is active or another pending exists; re-check the gate.
+            if (directive == .next_candidate) {
+                if (self.trace.wants_head_sibling) |wanted| {
+                    if (wanted.proto == proto and trace.isHeadAnchorPc(wanted.pc) and
+                        !self.trace.isRecording() and self.trace.pending_call_anchor == null and
+                        !self.trace.recordingBarred(wanted))
+                    {
+                        self.trace.wants_head_sibling = null;
+                        const src = self.trace.head_want_src;
+                        self.trace.head_want_src = null;
+                        self.trace.dbg("head-want transfer: arming sibling recording on current activation (src t={?})", .{if (src) |s| s.trace_id else null});
+                        self.trace.pending_call_anchor = .{
+                            .proto = proto,
+                            .base = base,
+                            .call_seq = self.frames[self.depth - 1].call_seq,
+                        };
+                        directive = .{ .switch_mode_at = pc };
+                    }
+                }
+            }
+        }
+        // A patched entry has no back-edge sibling walk. If a zero-progress
+        // exit made a LOOP side want hot, consume it at the coherent header
+        // now; otherwise the back-edge arm is one iteration late and records
+        // the old shape again. (Loop anchors only — head wants are consumed
+        // above.)
+        if (!is_head and directive == .next_candidate and self.trace.consumeSideTraceWantAtResume(proto, @intCast(pc))) {
             directive = if (mode == .fast)
                 .{ .switch_mode_at = pc }
             else
@@ -3457,9 +3523,19 @@ pub const Vm = struct {
         // set, then never touch `patch` again (the slot may have been reused).
         if (patch.live) {
             if (directive == .next_candidate) {
-                patch.strikes +|= 1;
-                if (patch.strikes >= self.trace.config.patch_strikes)
-                    self.trace.markEntryPatchPending(slot);
+                // Doc 44 D8 (review round 2 blocker 1): a head patch accrues NO
+                // retirement strikes while the anchor is below sibling capacity
+                // or the walk truncated — `patch_strikes (4) < hotexit (10)`
+                // would retire the SOLE entry before any exit could ever get
+                // hot, reproducing the P0 coverage collapse. At capacity, with
+                // every sibling visited, ordinary strikes resume.
+                const head_retention = is_head and (walk_truncated or
+                    self.trace.countTracesAt(.{ .proto = proto, .pc = trace.FUNC_HEAD_PC }) < self.trace.config.max_traces_per_anchor);
+                if (!head_retention) {
+                    patch.strikes +|= 1;
+                    if (patch.strikes >= self.trace.config.patch_strikes)
+                        self.trace.markEntryPatchPending(slot);
+                }
             } else {
                 patch.strikes = 0;
             }

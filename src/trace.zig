@@ -1340,6 +1340,21 @@ pub const TraceState = struct {
     /// recording (even if a trace already exists there).  Set by
     /// `countGuardFailure` when a guard-failure crosses `hotguard`; cleared
     /// by `onBackEdge` when the side trace is armed.
+    /// **Doc 44 D8 (P1a).** When non-null, a HEAD trace's guard exit went hot
+    /// (`noteTakenExit`'s head route): the anchor wants a path SIBLING — a new
+    /// `.head` recording at the same function-entry anchor capturing the path
+    /// the existing traces keep failing on. Unlike `wants_side_trace` this
+    /// never unpatches (a head has no virgin back-edge walk; the pc-0 patch is
+    /// the sole entry for every sibling); it is consumed on the CURRENT
+    /// activation by `enterPatchedTrace` after the whole sibling walk declines
+    /// (transfer into `pending_call_anchor`, review round 2's reframe).
+    wants_head_sibling: ?AnchorKey = null,
+    /// Provenance of `wants_head_sibling` (mirrors `side_want_src`): the
+    /// `(trace, exit)` whose hot counter raised it — DONE-latched when a
+    /// sibling completes terminally, else a saturated exit re-raises the want
+    /// forever and records duplicate shapes. Cleared wherever the want drops,
+    /// so `head_want_src != null ⇒ wants_head_sibling != null`.
+    head_want_src: ?ExitKey = null,
     wants_side_trace: ?AnchorKey = null,
     /// Provenance of the pending `wants_side_trace` when it came from a hot exit
     /// (`noteTakenExit`): the parent `(trace id, exit index)` to DONE-latch once
@@ -2520,6 +2535,7 @@ pub const TraceState = struct {
     pub const maybeStartReplaySide = trace_link_mod.maybeStartReplaySide;
     pub const clearPendingExitAnchor = trace_link_mod.clearPendingExitAnchor;
     pub const noteTakenExit = trace_link_mod.noteTakenExit;
+    pub const noteHeadSiblingCompletion = trace_link_mod.noteHeadSiblingCompletion;
     pub const countGuardFailure = trace_link_mod.countGuardFailure;
     pub const countFingerprintMiss = trace_link_mod.countFingerprintMiss;
     pub const isSourceBranchGuardExit = trace_link_mod.isSourceBranchGuardExit;
@@ -2970,7 +2986,20 @@ pub const TraceState = struct {
         if (self.rec.active) return; // a recording owns the stream; don't compete
         if (proto.is_vararg) return;
         const key = AnchorKey{ .proto = proto, .pc = FUNC_HEAD_PC };
-        if (self.hasTrace(key)) return; // entry is the patch's job (doc 44 D6)
+        if (self.hasTrace(key)) {
+            // Doc 44 D8 (review round 2 blocker 4): entry is the patch's job —
+            // but every unpatch source outside the head lifecycle (gateAnchor's
+            // markEntryPatchesAt, strike exhaustion at sibling capacity,
+            // incumbent retirement) would otherwise strand the surviving
+            // traces forever (a head has no virgin back-edge walk). Recovery:
+            // when the anchor has traces but pc 0 is NOT patched and the gate
+            // has cleared, deterministically re-request install for the best
+            // surviving trace. Idempotent — a live patch short-circuits on the
+            // image check, and `installEntryPatch` returns `.incumbent` on a
+            // raced re-install.
+            self.maybeRepatchHead(proto, key);
+            return;
+        }
         if (self.recordingBarred(key)) return;
         const gop = self.counters.getOrPut(self.gpa, key) catch return;
         if (!gop.found_existing) gop.value_ptr.* = 0;
@@ -2978,6 +3007,20 @@ pub const TraceState = struct {
         if (gop.value_ptr.* < self.config.hotcall) return;
         gop.value_ptr.* = 0; // reset so a declined/aborted arm re-warms, the loop discipline
         self.pending_call_anchor = .{ .proto = proto, .base = base, .call_seq = call_seq };
+    }
+
+    /// Doc 44 D8: deterministic head entry-patch recovery (see the call site
+    /// in `onCallEntry`). Cheap-gated: an already-patched pc 0 returns on one
+    /// hashmap probe + opcode compare.
+    fn maybeRepatchHead(self: *TraceState, proto: *const Proto, key: AnchorKey) void {
+        if (!self.config.execute) return; // same gate as install-at-commit
+        const img = self.registry.entry_registry.codeFor(proto);
+        if (img.len == 0 or img[0].op == .jfunc_head) return; // live patch (or empty proto)
+        if (self.recordingBarred(key)) return;
+        const best = self.nextTraceExcluding(proto, FUNC_HEAD_PC, &.{}) orelse return;
+        self.dbg("head repatch: re-requesting install for trace={d}", .{best.id});
+        self.registry.entry_registry.markInstallPending(best);
+        self.drainEntryPatchWork();
     }
 
     /// Doc 44: dispatch-prologue consumer of `pending_call_anchor` (the
