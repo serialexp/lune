@@ -97,10 +97,18 @@ to Done once everything inside a phase is checked.
       same-anchor sibling.
 
 ### Outstanding
-- [ ] **Phase 1 — recursion ergonomics.** Bounded recursive unrolling
-      (`recunroll` budget for depth>0 self-calls), base-vs-non-base side
-      traces off the branch guard, lifecycle hardening under the abort/GC/
-      error matrix, binary-trees receipts. P0 field note strengthening the
+- [ ] **Phase 1a — head path siblings (D8, designed + reviewed).** The
+      four D8 pieces: head route in `noteTakenExit` (want, no unpatch),
+      sibling walk in `enterPatchedTrace` (hit-count order, truncation
+      never strikes, caller-owned dead removal), current-activation want
+      transfer into `pending_call_anchor`, patch retention below sibling
+      capacity + DONE-latch on sibling completion + idempotent re-install
+      recovery. Matrix tests incl. base→non-base, non-base→base, a
+      NON-recursive two-path head (Z-6), want-during-recording, sibling
+      abort/cooldown, `max_traces_per_anchor == trial_visited_cap`.
+- [ ] **Phase 1 — remaining recursion ergonomics.** Bounded recursive
+      unrolling (`recunroll` budget for depth>0 self-calls), lifecycle
+      hardening under the abort/GC/error matrix, binary-trees receipts. P0 field note strengthening the
       case for base-vs-non-base sides: WHICH call is hot-call #112 decides
       the recorded shape — fib(15)/fib(25) seed a BASE-CASE head trace
       (guard_true n<2), the majority non-base entries then strike the
@@ -390,6 +398,99 @@ correction, now the contract:
   equivalents only, the hotcount precedent).
 - Anchors serialize as `(Proto.id, kind, pc)`; format_version bumped.
 
+### D8 — P1a: base-vs-non-base head SIBLINGS (same-anchor walk + head re-arm)
+
+**The problem (P0 field data).** The recorded head shape is decided by
+whichever call trips `hotcall` — fib(15)/fib(25) seed a BASE-CASE trace
+(`guard_true n<2`), the majority non-base entries then zero-exit it, four
+consecutive `.next_candidate`s exhaust `patch_strikes`, and a retired head
+never re-arms (`onCallEntry` refuses on `hasTrace`): coverage collapses to
+0 for those inputs. Symmetrically, a non-base incumbent (fib 18/30) eats a
+zero exit on every base-case call — survival is a shape accident (max
+base-case run 3 < 4 strikes).
+
+**The shape is the loop-anchor sibling discipline, not the side-trace
+discipline.** A head guard fail at `completed == 0` leaves the registers
+coherent at function entry — the exact state every OTHER head trace at the
+same anchor wants. So the alternate path is a same-anchor SIBLING (the
+prime-side/branch analogue), selected by trial entry, NOT an exit-pc
+side trace (there is no coherent mid-function resume state to anchor one
+on). LuaJIT's equivalent is recording a new trace from `BC_JFUNCF` when
+the existing one keeps exiting (`lj_dispatch` hot-call path re-fires).
+
+Four pieces, all reusing standing machinery (as revised by review round 2
+— the walk consumes the want on the CURRENT activation, and the head patch
+gets its own retention/recovery lifecycle):
+
+1. **Hot-exit accounting for heads** — the head zero-exit consumer calls
+   `noteTakenExit` (P0 skipped it entirely). A new HEAD route inside
+   `noteTakenExit`, before the branch/generic routes: on `isHeadAnchorPc`,
+   set a dedicated `wants_head_sibling: ?{anchor, src trace id, src exit}`
+   (occupancy-gated like the other wants, capped by
+   `anchorPopulation >= max_traces_per_anchor`, `recordingBarred`-gated)
+   and — decisively — do NOT `markEntryPatchesAt`. Unpatching is the
+   loop-anchor trigger for re-arming via the virgin back-edge walk; a head
+   has no back-edge walk, and unpatching would sever the SOLE entry to
+   every sibling. The exit counter (`t.exit_counts` + `hotexit`) is shared
+   and stays deterministic.
+2. **Sibling walk at the patched entry** — `enterPatchedTrace`, on a
+   `.next_candidate` directive from the incumbent, walks the OTHER head
+   traces at the anchor through `enterSelectedTrace`, extending the
+   `visited` set as it goes. Selection order is `nextTraceExcluding`'s
+   real deterministic order: highest `hit_count` first, registry insertion
+   order as tiebreak (NOT bare registry order). Any terminal completion
+   resolves the entry (strikes reset by the existing
+   `directive != .next_candidate` rule). If the walk TRUNCATES at
+   `trial_visited_cap` with unvisited siblings remaining, the decline does
+   NOT strike (all-declined semantics require all-visited). The second
+   trace's `installEntryPatch` returns `.incumbent` and stays slotless —
+   sibling dispatch rides the walk, never a second patch. No candidate's
+   `wctx.dead` removal happens until the walk ends (caller-owned removal
+   for the whole walk).
+3. **Want consumption on the CURRENT activation** (review round 2's
+   reframe — no delayed `onCallEntry` arming): when the incumbent AND
+   every sibling decline and `wants_head_sibling` matches this anchor,
+   transfer the want into `pending_call_anchor` pinned to the CURRENT
+   activation (`proto`, `base`, this frame's `call_seq`) and route back
+   through the `.full` prologue so `maybeStartHead` arms at pc 0 of the
+   VERY activation whose path just failed every candidate — recording the
+   observed failing path exactly. This kills the delayed-consumption
+   hazards wholesale: no "calls stopped" stuck want, no duplicate-shape
+   recording, no cross-proto want blocking. Transfer rules: leave the want
+   intact while `rec.active` or another `pending_call_anchor` exists;
+   re-check `recordingBarred` at transfer; clear want state on cache
+   reset. Recording under a live patch already works (`opJFuncHead`
+   declines to canonical while `isRecording`; the mirror canonicalizes).
+4. **Head patch retention + recovery** (review round 2 blockers): (a) a
+   head entry patch accrues NO ordinary retirement strikes while
+   `anchorPopulation < max_traces_per_anchor` — otherwise
+   `patch_strikes=4 < hotexit=10` retires the sole entry before any exit
+   can get hot, reproducing the P0 collapse; at capacity, ordinary strikes
+   resume. (b) On a sibling's terminal completion, clear a matching want
+   AND latch the want's source `(trace, exit)` counter to
+   `EXIT_COUNT_DONE` — else a saturated incumbent exit re-raises the want
+   forever and records duplicates. (c) Every OTHER unpatch source
+   (`gateAnchor`'s `markEntryPatchesAt`, strike exhaustion at capacity,
+   incumbent retirement) gets a deterministic recovery route: `onCallEntry`,
+   on `hasTrace` with no live entry patch and `recordingBarred` clear,
+   re-requests install for the anchor's best surviving trace (idempotent —
+   an `.incumbent` result is a no-op).
+
+**Receipts contract.** Sibling completions route through the SAME terminal
+consumer (productive receipt, clear-on-productive); sibling zero exits
+charge their own trace's ordinary zero receipt, so the gate can still
+retire an individually useless sibling while the anchor stays healthy.
+
+**Determinism.** Every trigger is a pure function of deterministic
+counters (exit counts, want occupancy, hit counts, registry order); no
+addresses, no time. The ten-leg matrix pins equivalence as always.
+
+**Z-6 note (review round 2).** The mechanism is path-polymorphic
+function-head specialization — general over any stable branch/type/callee
+split at a function head, with "base vs non-base recursion" merely the
+motivating instance. No predicate inspects recursion or numeric base
+cases; the test set includes a non-recursive two-path head.
+
 ## 5. Phasing
 
 P0 is the coverage milestone and is deliberately self-contained (both
@@ -415,6 +516,21 @@ D2, D3, D7. (8) P2 scope expanded (two-frame ABI, upvalue close,
 protected frames) and flagged for its own doc → P2. Noted risks adopted:
 function-entry snapshot (D3), stack-overflow guard (D4), vararg refusal
 (D2), Phase-4 hook/safepoint polling (P4 bullet), open-upvalue bar on P2.
+
+**Round 2 (codex gpt-5.6-sol, 2026-09-08, D8 only): sound-with-changes; 7
+required changes, all folded into D8.** (1) head patch retention below
+sibling capacity (`patch_strikes=4 < hotexit=10` would retire the sole
+entry before hotness). (2) want consumption on the CURRENT activation
+(the `consumeSideTraceWantAtResume` analogue) instead of delayed
+`onCallEntry` arming — kills stale-want/duplicate-shape/cross-proto
+blocking wholesale. (3) DONE-latch the want's source exit on sibling
+completion. (4) recovery routes for every other unpatch source
+(gateAnchor, strikes-at-capacity, incumbent retirement) via idempotent
+re-install from `onCallEntry`. (5) walk truncation at `trial_visited_cap`
+never strikes. (6) selection order is `nextTraceExcluding`'s hit-count
+order, not registry order. (7) caller-owned dead removal across the whole
+walk. Z-6 reinforcement: framed as path-polymorphic head specialization
+with a non-recursive two-path test.
 
 ## References
 
