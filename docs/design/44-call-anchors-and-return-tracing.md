@@ -5,9 +5,12 @@ episode + S1/S2/S4), P4 slice 1 (D10 head-sibling exit-branch patching), and
 P4 slice 2 (D11 native frame push — true up-recursion on the descent side)
 landed; fib jit 263.5 ms / binary-trees 287.7 ms with 100% head coverage.
 The remaining fib gap (35× vs LuaJIT) is the return side: every `ret` is
-tier-0 and each post-leaf parent resumption re-opens an episode — P3
-down-recursion (+ P2 RETF) owns it.
-Codex-reviewed ×5 (gpt-5.6-sol, all sound-with-changes, every required change
+tier-0 and each post-leaf parent resumption re-opens an episode — §D12
+(designed, not yet implemented) owns it in three slices: D12a handoff-evidence
+symmetry under descents (formation-order robustness), D12b continuation
+anchors (post-call resume traces), D12c native frame pop + return links
+(down-recursion; subsumes P3 and supersedes P2-for-recursion).
+Codex-reviewed ×6 (gpt-5.6-sol, all sound-with-changes, every required change
 folded; ledger at bottom)
 Owner: Bart
 Last updated: 2026-09-08
@@ -211,15 +214,36 @@ to Done once everything inside a phase is checked.
       patch out in 4 consecutive `.next_candidate`s (`patch_strikes`), and
       since a retired head never re-arms (hasTrace blocks `onCallEntry`,
       installs only at commit) coverage collapses to 0 for those inputs.
-- [ ] **Phase 2 — RETF return tracing (expanded scope — likely its own
-      doc).** Record *through* a depth-0 `ret` into the caller: needs a
-      two-frame execution ABI (slab+base addressing, not one RegWindow),
-      guards on frame kind/return pc/caller proto/activation identity,
-      multi-result top state, modeled upvalue close before the pop, and an
-      explicit bar on protected/host/stop-depth frames. Decide at P1 close
-      whether it stays in this arc.
+- [ ] **D12a — descent-symmetric handoff evidence.** Both head-handoff
+      arming pathways are structurally starved when the base-case sibling
+      is the incumbent (fib(27) shape: per-call penalty churn forever,
+      neither direction can ever arm — §D12 receipts). Productive-descent
+      completion evidence + descent-bottom failer carry.
+- [ ] **D12b — continuation anchors.** Post-call resume pcs as a new
+      one-shot root source: hot-counted at the `opRet` resume, recorded
+      with the existing D4/D5 grammar, entered via a first-class `jcont`
+      patch kind. Coverage infrastructure for D12c — board expected ≈flat
+      on its own (verdict requires `--jit-stats`, doc 31 D3 rule).
+- [ ] **D12c — native frame pop + return links (down-recursion).** The
+      `.terminal(return_interp)` native lowering pops the episode's own
+      pushed frames (opCall-symmetric helper, entry-frame floor) and
+      armed cross-page links chain pop→continuation and cont-self-call→
+      head-descent, LEDGER_CAP-bounded. Subsumes Phase 3; the payoff
+      slice.
+- [ ] **Phase 2 — RETF return tracing. SUPERSEDED for the recursion/return
+      shape by §D12** (real-frame pop over single-frame traces needs no
+      two-frame recording ABI, no modeled upvalue close, no multi-result
+      top state). What remains of P2 — recording *through* a depth-0 `ret`
+      for cross-frame inlining — stays deferred to its own doc if a
+      profile ever demands it. (Original scope, for the record: two-frame
+      execution ABI, guards on frame kind/return pc/caller proto/
+      activation identity, multi-result top state, modeled upvalue close,
+      bar on protected/host/stop-depth frames.)
 - [ ] **Phase 3 — down-recursion.** Return-anchored traces (LuaJIT patches
-      `JLOOP` over a hot `RET`) so the unwind phase runs traced.
+      `JLOOP` over a hot `RET`) so the unwind phase runs traced. **Owned
+      by §D12 (D12b+D12c are its mahina-shaped form: anchor at the resume
+      pc after the tier-0/native pop, not at the `ret` itself — no
+      cross-frame recording needed).**
 - [ ] **Phase 4 — de-seam the recursion links.** Native frame push for the
       self-call terminal (true up-recursion), then exit-branch patching.
       MUST either include safepoint/hook/replay polling in the native
@@ -1081,6 +1105,304 @@ name `fib` reassigned mid-run → helper declines, generic call still
 correct); GC-stress legs via the existing matrix. Unit: helper refusal
 matrix (depth wall, capacity wall, non-function callee, foreign proto).
 
+### D12 — the return side: evidence symmetry, continuation anchors, native pop
+
+**Profile receipt (post-D11, fib(32), 19855df).** With the descent native,
+what remains is (a) the per-node tier-0 return turnstile — opRet 8.0% +
+opCall 11.3% + resume glue: after every subtree completes, the parent runs
+`ret`-result-move / arith / the second `call` / its own `ret` entirely in
+tier-0 — and (b) the per-subtree episode entry block ≈25% (enterSelectedTrace
+11.5% + quiet 3.0% + driveDispatcherSilentResult 5.3% + consumePushedDescent
+3.4% + nativeSeedFn 2.0%): every second call re-opens an episode, every
+episode re-runs the seed prologue.
+
+**Formation receipts (jit-debug, 2026-09-08, this section's defining
+datum).** Which sibling records FIRST is a deterministic coin flip per input
+(the D8 field note: whichever call is hot-call #112). The two outcomes are
+NOT symmetric:
+
+- *Lucky shape* (fib(22), fib(31); descender = t0 = incumbent): the leaf
+  walk pairs evidence naturally (t0 zero-exit → t1 terminal in ONE walk),
+  `noteSiblingTerminal` arms t0@exit5 → t1 at `hotguard`, and the steady
+  state is ideal on the descent side — `pushed-descent terminal: rows=2
+  final t=1 resume=5`: descend, bottom, armed handoff fires MID-DESCENT
+  (the D11 Piece-3 claim, now observed), base case completes natively, one
+  fused episode ending at the leaf's ret pc. Zero strikes.
+- *Bad shape* (fib(27); base case = t0 = incumbent): **neither arming
+  pathway can ever fire.** The entry walk's completion is a productive
+  DESCENT (`pushed_frames > 0`, final row a deopt) — `consumePushedDescent`
+  deliberately runs none of the walk-local evidence machinery, so the
+  t0-zero-exit evidence dangles and t0→t1 never arms. And the descent's
+  bottom deopt (t1@5, in the LEAF activation) is never carried into the
+  leaf's walk — `enterPatchedTrace` resets `head_walk_fail` at walk start —
+  so t1→t0 never arms either. Steady state: 196,391 legacy strikes on
+  196,381 descents (one penalty insert + productive remove per LEAF,
+  forever), t0 zero-exit + full-path episode + t1 descent episode + leaf
+  walk episode per call. `--dump-aborts` clean; both traces healthy; purely
+  an evidence starvation.
+
+The board's fib(31) got the lucky shape, so 263.5 ms already includes the
+fused descent. The 35× residue is therefore: the return turnstile, the
+episode-entry block, and the formation coin flip as a robustness landmine.
+Three slices.
+
+**D12a — descent-symmetric handoff evidence (the leaf-exit contract).**
+Two additions, both pure functions of the walk/descent event stream
+(D7-narrow determinism):
+
+- *A1, productive-descent completion — ONE exact evidence funnel (round 6
+  change 5).* The arm's semantic claim is "when X zero-fails at exit E,
+  this sibling handles the call productively" — a descent that pushed real
+  frames IS productive handling; requiring a terminal conflates
+  "productive" with "completed without deopt". But the completing IDENTITY
+  must be the trace the walk actually selected after the failure — `ct`,
+  the entered trace — NOT the final ledger row's owner (an armed handoff
+  can make the final owner a different sibling, and
+  `noteHeadSiblingCompletion` deliberately keeps a want alive when the
+  completer equals its source). And the existing `head_terminal` branch
+  already fires completion — a naive second call would double-fire with a
+  potentially different id. Design: capture
+  `productive_handler_id = ct.id` at the top of `consumePushedDescent`
+  and run one post-disposition funnel exactly once per consumed descent —
+  consume `head_walk_fail` against it, retire a standing head want
+  against it — with the genuine `head_terminal` receipt/accounting kept
+  separate and unchanged.
+- *A2, descent-bottom failer carry.* The descent's final deopt happened IN
+  the leaf activation (the D11 deopt contract flushes into the CURRENT
+  window), so it is legitimate walk-local evidence FOR the leaf's own
+  walk — the reset-at-walk-start rule was about *stale cross-activation*
+  evidence, which this is not. Carry: `consumePushedDescent` records
+  `pending_descent_fail = {trace_id, exit_instr, call_seq}` ONLY for the
+  final `.deopt`+`.normal` disposition with a valid real-guard exit
+  (round 6 change 5: never for `.yielded`, prologue-fail, or seed
+  declines — those carry no branch-alternative meaning); the jfunc_head
+  walk start consumes it into `head_walk_fail` iff the top frame's
+  `call_seq` matches (else discards — the activation died). One carry
+  slot, overwritten by later descents, cleared on consume-or-mismatch AND
+  on unwind/reset/cache-reset paths (the same lifecycle set that clears
+  `head_walk_fail`); never crosses an activation by construction.
+
+Result: both directions arm regardless of formation order, and the bad
+shape converges to the SAME fused steady state as the lucky one (roles
+swapped): entry → armed handoff → descend → bottom → armed handoff → base
+case → one episode. The per-leaf penalty churn disappears with the scalar
+zero-exits (fused rows charge via `accountHeadIntermediateRow`, which never
+touches the legacy thrash half). Expected board: fib(31)/btrees unchanged
+or slightly better; the win is eliminating the coin flip — pin the bad
+shape in a test, not the board.
+
+**D12b — continuation anchors (post-call resume traces).** The return-side
+coverage gap in mahina terms: after `opRet` copies results and pops, it
+tail-dispatches the caller at the frozen one-past-call cursor **through the
+caller's doc-20 image with a full prologue** (interp.zig `opRet` → 
+`reloadTopFrame` → `dispatchTail`, T-3). That pc is a legitimate one-shot
+root anchor, and everything a root needs already exists there:
+
+- *Identity (D1 discipline, hardened — round 6 change 2).*
+  `CONT_PC_BIT = 1 << 31`; anchor pc `CONT_PC_BIT | resume_pc`;
+  `FUNC_HEAD_PC = maxInt` stays distinct. The encoding is only sound with
+  its boundary made a CONTRACT, not an assumption: (a) the compiler
+  hard-fails any proto whose code length reaches `1 << 31` (today nothing
+  bounds it — compiler.zig appends unbounded), which also excludes
+  `resume_pc == 0x7fffffff` (would alias `FUNC_HEAD_PC`); (b) ALL
+  encode/decode goes through two helpers, `anchorKind(pc)` /
+  `entryPc(pc)` — no raw bit tests at use sites; (c) the D1 audit is a
+  grep-driven sweep of EVERY direct `anchor.pc` comparison against
+  executable pcs, not just the five D1 sites — round 6 named five more
+  (recording closure trace.zig:2919, back-edge closure :2934, while
+  recognition trace_recorder.zig:2318, numeric-for :2458, while-link
+  :2751) and the implementation gate is the full grep, each site either
+  proven kind-safe or routed through the helpers. (A typed
+  `AnchorKey.kind` field is the recorded alternative; the encoding is
+  chosen for map-layout stability with the boundary contract above.)
+- *Counting.* In the `opRet` resume path only (the `stop_depth` boundary
+  return exits `execImpl` and naturally never counts): bump the same
+  `counters` map at the cont key, threshold `hotcall` (shared — returns
+  into a site are calls of its continuation). Not the back-edge hotcount
+  array; same discipline as `onCallEntry`. Gated by `recordingBarred` and
+  `hasTrace` exactly as the head counter is.
+- *Recording — with the `.fast` parking rule (round 6 change 1).* At
+  threshold, `pending_ret_anchor` (a `pending_call_anchor` twin pinned to
+  the CALLER's `call_seq`/base), consumed by a `maybeStartCont` in the
+  `.full` prologue. Pending consumers exist ONLY in `.full`; `opRet`
+  tail-dispatches in the current mode — so the counting funnel reports
+  "armed" and `opRet`, in `.fast`, parks `frame.pc` at the resume pc and
+  returns `.switch_mode` (the exact opCall precedent at interp.zig:5168);
+  the pending also joins every bypass/reset/unwind cleanup set
+  `pending_call_anchor` is in, and is processed before the recording
+  mirror. Recording kind `.cont` inherits D4 wholesale (root snapshot at
+  the resume pc, seeded SSA, same abort policies) and the D5 terminal
+  grammar verbatim: depth-0 `ret` → `.terminal(return_interp)`, direct
+  self-call of the caller's own proto → `.terminal(self_call_interp)`. A
+  loop back-edge met while recording a `.cont` root aborts (new reason
+  `.cont_backedge`) — loops have their own anchor machinery; v1 keeps
+  cont shapes straight-line-to-terminal.
+- *Entry.* First-class patch kind `jcont` at the resume pc (D6 shape:
+  entry-registry slot in the operand, mirror canonicalization, pending
+  processed before mirroring, unpatch recovery). Entered from `opRet`'s
+  dispatchTail like any patched op — and from straight-line flow into the
+  same pc, which is free extra coverage (the trace guards its own entry
+  types). **Physical-pc collision rule (round 6 change 3): the entry
+  registry holds ONE patch per physical pc, and a resume pc can itself be
+  a patchable loop site — v1 REFUSES cont formation (no counting, no
+  recording, no patch) at any physical pc that is already patched or is a
+  patchable loop-anchor site, documented and tested; a multiplexed entry
+  opcode dispatching several logical anchors at one physical pc is the
+  recorded durable follow-up.** Episode consumers: cont anchors join the
+  head family as "one-shot roots" — but round 6 change 4: one-shot is a
+  BEHAVIOR class, never an identity equivalence. A proto now has many
+  one-shot anchors, so the walk, patch retention, want state, row-owner
+  resolution, and adjacency validation are parameterized by the EXACT
+  `AnchorKey` (a factored `OneShotWalkCtx` carrying it), replacing today's
+  hard-coded `FUNC_HEAD_PC` in sibling selection (interp.zig:4092),
+  retention counting (:4158), and proto+is-head row validation (:2846) —
+  a fused row from cont-anchor A must never validate against an entry at
+  cont-anchor B.
+- *v1 non-goals.* No D11 push from cont pages (their self-call terminal
+  exits plain until D12c links land — the push's `jmp body_entry` targets
+  its OWN page, which is wrong for a cont page); no `all_results` /
+  vararg-caller shapes (recorder refuses, P0 grammar); no pcall-boundary
+  counting (structurally excluded above).
+
+Expected board: ≈flat alone (the glue it covers is small and each cont
+entry pays the episode toll D12c removes). This slice is judged on
+formation receipts (`--jit-stats` residency + cont-trace counts), not
+wall-clock — doc 31 D3 rule, stated here so a flat board doesn't read as
+failure.
+
+**D12c — native frame pop + return links (down-recursion, the payoff).**
+Symmetric twin of D11, closing the cycle so the whole recursion tree runs
+as ONE native episode chain (LuaJIT's FUNCF root + DOWNREC + patched side
+exits, expressed as one-shot roots + armed cross-page links over real
+frames):
+
+- *The pop.* `.terminal(return_interp)` gets a NATIVE-LOWERING-ONLY pop
+  epilogue (recording and tier-1a legs byte-identical, the D11 rule):
+  flush → C-ABI callout `nativeSelfRetPop` → on POP_OK bump
+  `NativeResult.popped_frames`, shift lanes DOWN by `nreg` (compile-time —
+  see the invariant below), refresh episode ctx to the caller activation,
+  then the link dispatch. Refusal falls through to today's plain terminal
+  bytes.
+- *The invariant that keeps v1 closed.* An episode may only pop frames IT
+  pushed: the helper refuses at net `pushed - popped == 0` (the episode
+  entry frame's own return stays tier-0). Round 6 change 7: the current
+  push-helper ABI carries no frame-motion counters, so the floor must be
+  made explicit in the ABI — the helper takes the `*NativeResult` (or the
+  episode's immutable entry depth stashed in the seed ctx at
+  `prepareNativeEpisode`) and derives net from it; "refuse at net 0" is
+  otherwise unimplementable. Every episode-pushed frame is a same-proto
+  self-call frame (D11), so the popped-into frame is same-proto and the
+  lane shift is the compile-time `nreg` — exactly the push's mirror. Net
+  ≥ 0 always; the dispatcher's frame-motion branch (`pushed_frames > 0`
+  generalizes to `pushed != 0 or popped != 0`; the directive renamed
+  `.resume_frame_motion`) reloads the top frame generically, so
+  intermediate net states need no new directive shape.
+- *The helper is `opRet` verbatim minus what it refuses — full preflight
+  BEFORE any mutation (round 6 changes 6+7).* Fail-closed; the complete
+  contract, checked in order with nothing written until all pass:
+  `depth > 1` and net > 0; top frame matches `ctx.base`/`ctx.call_seq`
+  and its proto is `ct.anchor.proto`; parent frame exists with the same
+  proto; exact window adjacency `callee.base == parent.base +
+  proto.num_registers` (the push laid it out; verify anyway — distant
+  invariant); `terminal.aux` in bounds naming a `.ret` with
+  `b != all_results`; the popped frame's STORED return-wiring
+  (`ret_count`/`ret_dest` from the frame struct, never a re-decode) not
+  `all_results`, source range within the callee window, `ret_dest + want`
+  within the parent window; no pending dynamic multret state
+  (`!reg_top_pending`); **no open upvalue anywhere in the open-upvalue
+  list with `index >= popped base` — a FULL read-only scan; the list is
+  append-discovery-ordered and `swapRemove`-compacted (interp.zig:6222,
+  :6256), so no single-compare shortcut exists** (decline hands tier-0
+  the `closeUpvaluesFrom`; the P2 "modeled upvalue close" stays out, and
+  the v1 helper never mutates cells); `receiptsInert` shared with the
+  push (same episode gate). Only then: result copy WHILE the callee
+  window is still under `stack_top` (opRet's rooting order,
+  interp.zig:5332), `dropRegionActivation`, `depth -= 1`, `stack_top`
+  shrink, ctx refresh. No tick (tier-0 `opRet` does not tick — the tick
+  stream stays a pure function of the CALL stream on every leg).
+- *Return links.* After a pop, the resume pc is the caller's frozen cursor
+  — dynamic per pop (fib returns into after-call-1 OR after-call-2). The
+  epilogue gets K = 4 patchable link slots (new kind `.ret_cont`): each
+  armed slot bakes (resume-pc const → cont page `ordinary_entry`);
+  compare-chain, miss → plain exit with the frame-motion directive
+  (tier-0 dispatches the resume pc, hits `jcont`, ordinary episode —
+  still one `opRet` cheaper than today). Round 6 (Z-7 note + change 8):
+  the K slots are NOT a side table — they extend the physical-link
+  registry (`armNativeLink`/disarm/invalidation blast radius, ledger
+  ownership) with a kind whose slot key is a RESUME PC rather than an IR
+  exit index; the `arm()` funnel's head-parent validation (today
+  `.sibling_handoff`-only, trace_link.zig:1245) gets the two new kinds as
+  first-class branches. Slot allocation is deterministic (first K
+  distinct resume pcs to reach the arm threshold; no eviction in v1 — a
+  fifth pc stays unlinked and exits plain, logged by the no-silent-caps
+  rule). Arming: deterministic hotguard-style counter on (returning page,
+  resume pc) → pending arm consumed when the dispatcher actually enters
+  the cont page (the `tryArmSiblingHandoff` shape); disarm rides the
+  existing physical-registry lifecycle.
+- *Cont-page self-call links.* The same armed-link mechanism gives cont
+  pages their push: `.terminal(self_call_interp)` on a cont page runs the
+  D11 push helper, then jumps through an armed `.call_head` link to the
+  anchor proto's HEAD page `ordinary_entry` (cross-page descent). Unarmed:
+  push, then exit with the pushed-frame directive (leaf's jfunc_head walk
+  enters the head page as its own episode — correct, one seam, arms away).
+- *Ledger grammar (round 6 change 8 — defined here, not inherited).* The
+  D10 validator accepts only `.deopt`-with-armed-`sibling_handoff`
+  intermediates; frame motion needs its own rows. Two new `LedgerKind`s:
+  `.ret_pop` (a committed native pop that then took a `.ret_cont` link)
+  and `.call_push` (a committed cont-page push that took a `.call_head`
+  link) — each row carries the owner page and the transition target, is
+  validated per-kind against the LIVE registry (an armed `.ret_cont` /
+  `.call_head` must exist from that owner to that target, the adjacency
+  rule D10 established), and charges `accountTraceRun` +
+  `accountCandidateCharge(.entered)` like other intermediates. A pop or
+  push whose link MISSES appends no transition row — it terminates the
+  episode with the ordinary final row (`head_terminal` for the terminal
+  grammar, `.deopt` shapes otherwise) plus the frame-motion counters, and
+  the dispatcher derives the resume target from the FINAL top frame +
+  final row exactly as `consumePushedDescent` does today (generalized to
+  net motion; `.yielded` cut mid-chain resumes the current top frame at
+  the final row's pc).
+- *Blackout bound (round 6 change 9 — stated honestly).* Same-page D11
+  pushes deliberately append NO row, so LEDGER_CAP alone does not bound
+  the blackout: the bound is `max_call_depth + LEDGER_CAP` segments (a
+  descent can push up to depth-wall frames row-free before the first
+  transition row; every cross-page transition then consumes ledger
+  capacity, and the existing full-cap branch force-yields). Both terms
+  are deterministic constants; GC stays at tier-0 boundaries within that
+  bound — the native-loop precedent, now with an explicit two-term bound.
+  Per-push rows (or a native poll budget) are the recorded follow-up if
+  GC latency ever demands a tighter bound.
+- *What the chain buys.* Steady-state fib: head page descends (pushes),
+  base case via armed sibling handoff, pop via `.ret_cont` into cont-1,
+  cont-1 pushes via `.call_head` back into the head page, …, pops chain
+  through cont-2 up the tree — tier-0 touched once per LEDGER_CAP rows.
+  The episode-entry block (~25%) amortizes across the cap; opRet/opCall
+  and the per-call seed prologue leave the profile for covered shapes.
+
+**Determinism, GC, replay (whole section).** The §R1-5 bypass set is
+untouched — replay/suspend/exec-log/safepoint legs never reach a patched
+native entry, so every new native seam self-disables there structurally.
+`call_seq` streams stay identical across legs because push and pop both run
+the real frame funnel (`pushFrameVararg` / the opRet-verbatim pop). All
+arming counters are pure functions of deterministic event streams; links
+move WHERE code runs, never what it computes — hashgate (84 × 2) is the
+gate, per phase, as always.
+
+**Tests (per slice).** D12a: bad-shape formation e2e (fib(27)-shape pinned
+via a hotcall-tuned harness or the witness counters: assert BOTH handoff
+directions arm and legacy strikes stay O(warmup), not O(leaves)); ten-leg
+matrix stays green. D12b: cont-trace formation on fib + on a non-recursive
+hot call site (generality pin); jcont patch/unpatch/mirror recovery;
+`.fast`-mode arming (the parking rule); the physical-pc collision refusal
+(a resume pc that is a patched/patchable loop site must form NO cont
+anchor); abort matrix (`.cont_backedge`, vararg caller, `all_results`).
+D12c: pop-refusal matrix (net-zero floor, open upvalue at depth — the
+full-scan case with an older frame's cell first in the list, `all_results`
+wiring, aux bounds, window-adjacency violation); deep-unwind ten-leg pins;
+StackOverflow + pcall through fused chains; type-change at depth
+(prologue-fail on a linked cont entry); GC-stress legs; LEDGER_CAP
+force-yield mid-chain (round 6: mandatory gates, all of these).
+
 ## 5. Phasing
 
 P0 is the coverage milestone and is deliberately self-contained (both
@@ -1192,6 +1514,51 @@ native-loop precedent), `instr.c == all_results` return wiring.
 Wording fixes: `safepoint_seq` is intentionally native-leg-specific;
 the D11 bypass-based self-disable supersedes the older P4 bullet's
 polling phrasing.
+
+**Round 6 (codex gpt-5.6-sol, 2026-09-08, D12 only): sound-with-changes;
+9 required changes, all folded into D12.** (1) `pending_ret_anchor`
+raised under `.fast` must park and `.switch_mode` (pending consumers are
+`.full`-only; the opCall precedent at interp.zig:5168), plus join every
+bypass/reset/unwind cleanup set. (2) `CONT_PC_BIT` is only sound as a
+CONTRACT: compiler hard-limit on proto code length (`< 1 << 31`, which
+also excludes the `FUNC_HEAD_PC` alias at `resume_pc == 0x7fffffff`),
+centralized `anchorKind`/`entryPc` decoding, and a grep-driven audit of
+ALL direct `anchor.pc` comparisons (round 6 named five beyond the D1
+five: trace.zig:2919/:2934, trace_recorder.zig:2318/:2458/:2751); typed
+`AnchorKey.kind` recorded as the alternative. (3) one patch per physical
+pc — a resume pc can be a patchable loop site; v1 refuses cont formation
+there (documented + tested); multiplexed entry opcode is the durable
+follow-up. (4) "one-shot" is a behavior class, never an identity
+equivalence: walk/retention/want/row-owner/adjacency must be
+parameterized by the exact `AnchorKey` (`OneShotWalkCtx`), replacing
+hard-coded `FUNC_HEAD_PC` at interp.zig:4092/:4158/:2846. (5) D12a needs
+ONE evidence funnel keyed on `productive_handler_id = ct.id` (the
+ENTERED trace, not the final row owner — armed handoffs diverge them;
+the `head_terminal` branch already fires completion, a second call
+double-fires); A2 carry only for `.deopt`+`.normal` real-guard bottoms,
+cleared on the full `head_walk_fail` lifecycle set. (6) the open-upvalue
+check must be a FULL read-only list scan (append-ordered +
+`swapRemove`-compacted, interp.zig:6222/:6256 — no head-compare
+shortcut; a stale first element hides a capturing later one → popped
+cell would point above `stack_top`, unrooted). (7) the pop helper's
+preflight contract enumerated in full (frame/ctx/proto identity, window
+adjacency, wiring bounds, `reg_top_pending`, floor made explicit in the
+ABI — the push ABI carries no frame-motion counters today), all checks
+before any mutation, result copy under `stack_top` (opRet rooting
+order, interp.zig:5332). (8) the D12c ledger grammar defined, not
+inherited: new `.ret_pop`/`.call_push` row kinds with per-kind
+live-registry adjacency, link slots extend the physical-link registry
+(never a side table — the Z-7 risk codex flagged), deterministic K-slot
+allocation with the no-silent-caps log, `.resume_pushed_frame` →
+`.resume_frame_motion` with reload whenever either counter is nonzero.
+(9) the blackout bound stated honestly as `max_call_depth + LEDGER_CAP`
+(same-page D11 pushes append no row); per-push rows / native poll budget
+recorded as the follow-up if GC latency demands tighter. Confirmed
+sound: D12b is not scaffolding (counter, identity, kind, patch all
+consumed by D12c); staged push-disable on cont pages; Z-6 generality
+(cont anchors cover arbitrary hot call resumptions; the non-recursive
+witness test is important); error/pcall coherence via the entry-frame
+floor + non-throwing helper.
 
 ## References
 
