@@ -903,6 +903,9 @@ pub fn rowPatchKind(kind: trace_exec.LedgerKind) ?nativegen.ExitPatchKind {
         // Doc 44 P0: a head trace's terminal is a completion through
         // shared_exit (slot_addr = null) — there is no exit branch to patch.
         .head_terminal => null,
+        // Doc 44 D12c: same — the pop exits through shared_exit; the future
+        // `.ret_cont` links are entry-registry-keyed, not exit-slot patches.
+        .ret_pop => null,
     };
 }
 

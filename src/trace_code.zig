@@ -211,6 +211,18 @@ pub const NativeSeedCtx = struct {
     /// call generically, raising any error itself.
     pub const PUSH_DECLINE: u64 = 17;
 
+    /// `self_ret_pop_fn` result grammar (doc 44 D12c) — disjoint from both
+    /// grammars above for the same wiring-mistake reason.
+    /// The helper popped the episode's own top frame (opRet-verbatim result
+    /// copy + real frame pop) and refreshed this ctx for the popped-into
+    /// caller activation; the page appends a `.ret_pop` row and exits.
+    pub const POP_OK: u64 = 18;
+    /// Any refusal (net-zero floor, open upvalue over the popped window,
+    /// `all_results` wiring, boundary frame, invariant re-verification
+    /// failure): NOTHING was mutated; the page runs its plain terminal exit
+    /// and tier-0 re-executes the `ret` generically.
+    pub const POP_DECLINE: u64 = 19;
+
     /// `*Vm`, valid for the prepared episode only.
     vm: *anyopaque = undefined,
     /// `*const function.Closure` of the anchor frame (upvalue seeds).
@@ -255,6 +267,20 @@ pub const NativeSeedCtx = struct {
     /// `seed_fn`; optional so hand-built test ctxs keep compiling and
     /// compilation falls back to the plain terminal when absent (fail closed).
     self_call_push_fn: ?*const fn (ctx: *const NativeSeedCtx, t: *const TraceCode, terminal_aux: u64) callconv(.c) u64 = null,
+    /// Doc 44 D12c: the C-ABI return-side frame-pop helper (interp.zig
+    /// `nativeSelfRetPop`), called from a `.terminal(return_interp)` pop
+    /// epilogue with the terminal's `.ret` bytecode index AND the episode's
+    /// net pushed-frame count (`pushed_frames - popped_frames`, computed by
+    /// the emitted code from the `NativeResult` counters) — the round-6
+    /// change-7 explicit floor: the helper refuses at net 0, so an episode
+    /// only ever pops frames IT pushed and the entry frame's own return
+    /// stays tier-0. Replicates `opRet`'s non-boundary arm verbatim (result
+    /// copy under the live `stack_top`, region-activation drop, frame pop,
+    /// `stack_top` shrink), refreshes THIS ctx for the caller activation,
+    /// and returns POP_OK / POP_DECLINE. Installed once at VM init;
+    /// optional so hand-built test ctxs keep compiling and compilation
+    /// falls back to the plain terminal when absent (fail closed).
+    self_ret_pop_fn: ?*const fn (ctx: *const NativeSeedCtx, t: *const TraceCode, terminal_aux: u64, net_pushed: u64) callconv(.c) u64 = null,
 };
 
 pub const TraceCode = struct {

@@ -1141,6 +1141,10 @@ pub const TraceState = struct {
     /// output-equivalent, just slower) — the formation test asserts on this
     /// witness. No tiering path reads it.
     self_call_pushes: u64 = 0,
+    /// Doc 44 D12c: count of successful native frame pops (`nativeSelfRetPop`
+    /// POP_OK) — the pop's formation witness, symmetric to `self_call_pushes`.
+    /// No tiering path reads it.
+    self_ret_pops: u64 = 0,
     /// 2.3b-1 (doc 17): count of `.link`-terminal slots actually armed in
     /// `driveChain` — a continuation `C`'s `.link` slot pointed straight at its inner
     /// root `I`'s `linked_entry`, so the next `C.run` fuses into `I` under the shared
@@ -3605,6 +3609,7 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
     try w.writeAll("  event counters:\n");
     try w.print("    trace entries:        {d} (native bodies: {d})\n", .{ ts.entries, ts.native_entries });
     try w.print("    self-call pushes:     {d} (doc 44 D11 native descents)\n", .{ts.self_call_pushes});
+    try w.print("    self-ret pops:        {d} (doc 44 D12c native unwinds)\n", .{ts.self_ret_pops});
     try w.print("    link arms:            native={d} source={d} loopdone={d} bridge={d}\n", .{ ts.native_link_arms, ts.native_source_link_arms, ts.native_loopdone_link_arms, ts.native_region_bridge_arms });
     try w.print("    bridge arm attempts:  {d} (pipeline runs; vs {d} arms)\n", .{ ts.native_region_bridge_arm_attempts, ts.native_region_bridge_arms });
     try w.print("    link fused:           source={d} loopdone={d} bridge={d}\n", .{ ts.native_source_link_fused, ts.native_loopdone_link_fused, ts.native_region_bridge_fused });

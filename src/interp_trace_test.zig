@@ -5369,6 +5369,172 @@ test "push helper refusal matrix (doc 44 D11): every wall declines with nothing 
     try testing.expectEqual(vm.frames[1].call_seq, ctx.call_seq);
 }
 
+test "ret pop formation (doc 44 D12c): fused descents unwind through the native pop" {
+    // The pop's formation proof, symmetric to the D11 push witness: output
+    // equality cannot distinguish a native pop from the (slower) plain
+    // terminal + tier-0 opRet, so assert the `self_ret_pops` witness
+    // advanced. fib's fused descents (push chain + armed sibling handoff
+    // into the base-case page, whose terminal is `return_interp`) are what
+    // reach a POP_OK: net > 0 with a same-proto episode-pushed top frame.
+    // Native-only: the pop epilogue is a nativegen lowering.
+    if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    const source =
+        \\local function fib(n)
+        \\  if n < 2 then return 1 end
+        \\  return fib(n-2) + fib(n-1)
+        \\end
+        \\print(fib(20))
+    ;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = true;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.hotcall = 4;
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings("10946\n", sink.buffered());
+    // Descents live AND their unwinds pop natively.
+    try testing.expect(vm.trace.self_call_pushes >= 100);
+    try testing.expect(vm.trace.self_ret_pops >= 100);
+}
+
+test "pop helper refusal matrix (doc 44 D12c): every wall declines with nothing mutated" {
+    // Drive `nativeSelfRetPop` directly through the installed ctx fn pointer
+    // against a hand-built two-frame activation: the net-zero floor, the
+    // distant-invariant re-verifications (aux bounds, non-ret, `all_results`
+    // producer, vararg, pending multret), the activation-identity walls
+    // (base/call_seq stamp, boundary depth), the window-adjacency and
+    // return-wiring bounds (stored `all_results` want, dest overflow, source
+    // overflow), and the full open-upvalue scan — plus the positive control,
+    // which must pop the REAL frame (result copy, depth, stack_top, ctx
+    // refresh, witness) WITHOUT ticking (the tick stream is a pure function
+    // of the CALL stream).
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var proto = Proto{
+        .code = &.{
+            Instr{ .op = .call, .a = 1, .b = 1, .c = 1 },
+            Instr{ .op = .ret, .a = 1, .b = 1 },
+            Instr{ .op = .ret, .a = 0, .b = bytecode.all_results },
+            Instr{ .op = .ret, .a = 3, .b = 2 }, // source range past the window
+        },
+        .num_registers = 4,
+        .num_params = 1,
+        .name = "d12cself",
+    };
+    const cl = try vm.heap.newClosure(&proto, 0);
+    var code = trace.TraceCode{
+        .anchor = .{ .proto = &proto, .pc = trace.FUNC_HEAD_PC },
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    // Parent at base 0, "episode-pushed" callee at base 4 (exact adjacency)
+    // returning one value from its slot 1 into the parent's slot 0.
+    try vm.pushFrame(cl, 0, 0, 0);
+    try vm.pushFrame(cl, 4, 0, 1);
+    vm.regSet(5, Value.int(42));
+    const ctx = vm.trace.registry.native_seed_ctx.?;
+    ctx.vm = &vm;
+    ctx.base = 4;
+    ctx.call_seq = vm.frames[1].call_seq;
+    const pop = ctx.self_ret_pop_fn.?;
+    const tick0 = vm.trace.tick;
+
+    // Refusals, each with nothing mutated.
+    try testing.expectEqual(trace.NativeSeedCtx.POP_DECLINE, pop(ctx, &code, 1, 0)); // net-zero floor
+    try testing.expectEqual(trace.NativeSeedCtx.POP_DECLINE, pop(ctx, &code, 99, 1)); // aux out of bounds
+    try testing.expectEqual(trace.NativeSeedCtx.POP_DECLINE, pop(ctx, &code, 0, 1)); // not a .ret
+    try testing.expectEqual(trace.NativeSeedCtx.POP_DECLINE, pop(ctx, &code, 2, 1)); // all_results producer
+    try testing.expectEqual(trace.NativeSeedCtx.POP_DECLINE, pop(ctx, &code, 3, 1)); // source past the window
+    proto.is_vararg = true;
+    try testing.expectEqual(trace.NativeSeedCtx.POP_DECLINE, pop(ctx, &code, 1, 1)); // vararg anchor
+    proto.is_vararg = false;
+    vm.reg_top_pending = true;
+    try testing.expectEqual(trace.NativeSeedCtx.POP_DECLINE, pop(ctx, &code, 1, 1)); // pending multret
+    vm.reg_top_pending = false;
+    ctx.base = 5;
+    try testing.expectEqual(trace.NativeSeedCtx.POP_DECLINE, pop(ctx, &code, 1, 1)); // stale base stamp
+    ctx.base = 4;
+    ctx.call_seq +%= 1;
+    try testing.expectEqual(trace.NativeSeedCtx.POP_DECLINE, pop(ctx, &code, 1, 1)); // stale call_seq stamp
+    ctx.call_seq = vm.frames[1].call_seq;
+    {
+        const d = vm.depth;
+        vm.depth = 1;
+        // net says 1 but the frames array has no parent — the physical
+        // re-verification refuses (frames[0] IS the boundary frame).
+        // Restore ctx to describe frames[0] so only depth is at issue.
+        ctx.base = 0;
+        ctx.call_seq = vm.frames[0].call_seq;
+        try testing.expectEqual(trace.NativeSeedCtx.POP_DECLINE, pop(ctx, &code, 1, 1)); // boundary depth
+        vm.depth = d;
+        ctx.base = 4;
+        ctx.call_seq = vm.frames[1].call_seq;
+    }
+    {
+        const saved = proto.num_registers;
+        proto.num_registers = 3; // 0 + 3 != 4: adjacency violation
+        try testing.expectEqual(trace.NativeSeedCtx.POP_DECLINE, pop(ctx, &code, 1, 1));
+        proto.num_registers = saved;
+    }
+    {
+        const saved = vm.frames[1].ret_count;
+        vm.frames[1].ret_count = bytecode.all_results; // stored multret want
+        try testing.expectEqual(trace.NativeSeedCtx.POP_DECLINE, pop(ctx, &code, 1, 1));
+        vm.frames[1].ret_count = saved;
+    }
+    {
+        const saved = vm.frames[1].ret_dest;
+        vm.frames[1].ret_dest = 4; // dest + want past the parent window
+        try testing.expectEqual(trace.NativeSeedCtx.POP_DECLINE, pop(ctx, &code, 1, 1));
+        vm.frames[1].ret_dest = saved;
+    }
+    {
+        // Open upvalue OVER the popped window: v1 never mutates cells, so
+        // the full scan refuses even when an OLDER frame's cell sits first
+        // in the (append-ordered, swapRemove-compacted) list.
+        const old_cell = try vm.heap.newUpvalue(1); // below the popped base
+        try vm.open_upvalues.append(gpa, .{ .index = 1, .cell = old_cell });
+        const hot_cell = try vm.heap.newUpvalue(5); // inside the popped window
+        try vm.open_upvalues.append(gpa, .{ .index = 5, .cell = hot_cell });
+        try testing.expectEqual(trace.NativeSeedCtx.POP_DECLINE, pop(ctx, &code, 1, 1));
+        vm.open_upvalues.clearRetainingCapacity();
+    }
+    try testing.expectEqual(@as(u32, 2), vm.depth);
+    try testing.expectEqual(tick0, vm.trace.tick);
+    try testing.expectEqual(@as(u64, 0), vm.trace.self_ret_pops);
+
+    // Positive control: the opRet-verbatim pop.
+    vm.frames[0].pc = 1; // the frozen one-past-call cursor a push would leave
+    try testing.expectEqual(trace.NativeSeedCtx.POP_OK, pop(ctx, &code, 1, 1));
+    try testing.expectEqual(@as(u32, 1), vm.depth);
+    try testing.expectEqual(@as(i64, 42), vm.regGet(0).asInt()); // result landed at parent slot 0
+    try testing.expectEqual(@as(usize, 4), vm.stack_top);
+    try testing.expectEqual(tick0, vm.trace.tick); // pops never tick
+    try testing.expectEqual(@as(u64, 1), vm.trace.self_ret_pops);
+    // The ctx now describes the popped-into caller activation.
+    try testing.expectEqual(@as(usize, 0), ctx.base);
+    try testing.expectEqual(vm.frames[0].call_seq, ctx.call_seq);
+}
+
 test "recorder (head, doc 44 P0): a depth-0 multret-forwarding return aborts — no head trace" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);

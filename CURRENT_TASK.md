@@ -53,8 +53,17 @@ wasm, viz 69, boundaries.
 NEXT: **D12c** (native frame pop `nativeSelfRetPop` + K=4 `.ret_cont` link
 slots + `.call_head` cont-page links + `.ret_pop`/`.call_push` LedgerKinds,
 blackout bound max_call_depth + LEDGER_CAP) — the payoff slice that consumes
-the toll above. Queued behind: P1 recunroll, P1a matrix tests, per-proto
-codeFor cache, quiet-predicate anchor-locality fragility.
+the toll above. **Stage 1 (the pop, no links) LANDED**: `nativeSelfRetPop`
+(opRet-verbatim, full preflight, net floor passed BY VALUE from the emitted
+preflight over the two NativeResult motion counters), `popped_frames` ABI
+tail field, `.ret_pop` LedgerKind (final-row flavour: resume = popped-into
+caller's frozen cursor), `.resume_frame_motion` rename, pop-refusal matrix +
+formation witness tests (`self_ret_pops`; fib(20) pops 6.7k natively). All
+gates green; fib 413.5→404.3 / btrees 450.4→441.8 (one opRet saved per
+leaf — the episode toll needs the links). Stages 2/3 next: `.ret_cont` K=4
+resume-pc link slots on the pop epilogue, `.call_head` cont-page push links.
+Queued behind: P1 recunroll, P1a matrix tests, per-proto codeFor cache,
+quiet-predicate anchor-locality fragility.
 
 ## Status 2026-09-08k — doc 44 §D12 designed (codex round 6) + D12a LANDED
 

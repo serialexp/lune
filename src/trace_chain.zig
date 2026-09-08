@@ -1605,6 +1605,9 @@ pub fn replayLedgerFrom(
             // address — they are never armed, never fused, never chain members,
             // so a `.head_terminal` row can never reach the silent replay.
             .head_terminal => @panic("replayLedger: head_terminal row in a chain ledger"),
+            // Doc 44 D12c: same one-shot exclusion — pops happen only on
+            // head-descent episodes, which never enter loop chains.
+            .ret_pop => @panic("replayLedger: ret_pop row in a chain ledger"),
         };
 
         // Destination `.deferred` for a handoff, NEVER `.known_trace`: this edge is
@@ -1676,6 +1679,8 @@ pub fn replayLedgerFrom(
             // Doc 44 P0: head traces are never armed/fused (null slot address at
             // their terminal), so this row kind cannot reach the silent replay.
             .head_terminal => @panic("replayLedger: head_terminal row in a chain ledger"),
+            // Doc 44 D12c: same one-shot exclusion for the pop's row kind.
+            .ret_pop => @panic("replayLedger: ret_pop row in a chain ledger"),
             .region_bridge => {
                 // A bridge commits its distinct cross-anchor snapshot before
                 // entering the successor. It is therefore never terminal or a

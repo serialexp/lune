@@ -872,6 +872,7 @@ pub const Vm = struct {
             .seed_fn = &nativeSeedFn,
             .seed_tier1a_fn = &nativeSeedTier1aFn,
             .self_call_push_fn = &nativeSelfCallPush,
+            .self_ret_pop_fn = &nativeSelfRetPop,
         });
         // Doc 24 D5: the stable mutable heap channel for allocating traces
         // (tier-1a `.alloc` arms + tier-1b baked callouts). Safe to store once
@@ -1281,6 +1282,93 @@ pub const Vm = struct {
         self.trace.tickCallEntry();
         self.trace.self_call_pushes +%= 1;
         return trace.NativeSeedCtx.PUSH_OK;
+    }
+
+    /// Doc 44 D12c: the C-ABI return-side frame-pop twin of `opRet`'s
+    /// non-boundary arm, installed once into `NativeSeedCtx.self_ret_pop_fn`
+    /// at VM init and called from a `.terminal(return_interp)` pop epilogue
+    /// (the callee window is already fully flushed, return-value registers
+    /// included). ALL legality is re-derived here per pop, fail-closed to
+    /// POP_DECLINE with nothing mutated — the page then runs its plain
+    /// terminal exit and tier-0 re-executes the `ret` generically.
+    ///
+    /// The round-6 change-7 floor comes in BY VALUE: `net_pushed` is the
+    /// episode's `pushed_frames - popped_frames`, computed by the emitted
+    /// preflight from the `NativeResult` motion counters. Refusing at net 0
+    /// means an episode only ever pops frames IT pushed (every one a
+    /// same-proto self-call frame — D11), so the popped-into parent is
+    /// same-proto and the window adjacency is the push's mirror; the episode
+    /// ENTRY frame's own return always stays tier-0.
+    ///
+    /// On POP_OK the helper has replicated `opRet`'s non-boundary arm
+    /// verbatim: the result copy runs WHILE the callee window is still under
+    /// `stack_top` (the rooting order — no allocation or safepoint between
+    /// copy and shrink), using the frame's STORED return-wiring (never a
+    /// re-decode of the caller's call instruction); then the region-
+    /// activation drop, the frame pop, the `stack_top` shrink, and the
+    /// episode-ctx refresh onto the caller activation. No tick — tier-0's
+    /// `opRet` does not tick either, so the tick stream stays a pure
+    /// function of the CALL stream on every leg. The v1 helper never
+    /// mutates upvalue cells: ANY open upvalue at or above the popped base
+    /// declines (a FULL read-only scan — the open list is append-discovery-
+    /// ordered and swapRemove-compacted, so no single-compare shortcut is
+    /// sound), handing tier-0 the `closeUpvaluesFrom`.
+    fn nativeSelfRetPop(
+        ctx: *const trace.NativeSeedCtx,
+        ct: *const trace.TraceCode,
+        terminal_aux: u64,
+        net_pushed: u64,
+    ) callconv(.c) u64 {
+        const self: *Vm = @ptrCast(@alignCast(ctx.vm));
+        const proto = ct.anchor.proto;
+        // The net floor FIRST — everything below assumes an episode-pushed
+        // top frame.
+        if (net_pushed == 0) return trace.NativeSeedCtx.POP_DECLINE;
+        // Record-time exclusions are DISTANT invariants; re-verify at this
+        // fail-closed boundary before any mutation.
+        if (terminal_aux >= proto.code.len) return trace.NativeSeedCtx.POP_DECLINE;
+        const instr = proto.code[@intCast(terminal_aux)];
+        if (instr.op != .ret) return trace.NativeSeedCtx.POP_DECLINE;
+        if (instr.b == bytecode.all_results) return trace.NativeSeedCtx.POP_DECLINE;
+        if (proto.is_vararg) return trace.NativeSeedCtx.POP_DECLINE;
+        if (self.reg_top_pending) return trace.NativeSeedCtx.POP_DECLINE;
+        if (!self.trace.region_policy.receiptsInert()) return trace.NativeSeedCtx.POP_DECLINE;
+        // Physical shape: a parent must exist (net > 0 implies it, but the
+        // floor is derived state — verify the frames array itself).
+        if (self.depth < 2) return trace.NativeSeedCtx.POP_DECLINE;
+        const frame = &self.frames[self.depth - 1];
+        const parent = &self.frames[self.depth - 2];
+        if (frame.base != ctx.base) return trace.NativeSeedCtx.POP_DECLINE;
+        if (frame.call_seq != ctx.call_seq) return trace.NativeSeedCtx.POP_DECLINE;
+        if (frame.closure.proto != proto) return trace.NativeSeedCtx.POP_DECLINE;
+        if (parent.closure.proto != proto) return trace.NativeSeedCtx.POP_DECLINE;
+        // Exact window adjacency — the push laid it out; verify anyway.
+        const nreg: usize = proto.num_registers;
+        if (frame.base != parent.base + nreg) return trace.NativeSeedCtx.POP_DECLINE;
+        // Stored return-wiring, bounds-checked against both windows.
+        if (frame.ret_count == bytecode.all_results) return trace.NativeSeedCtx.POP_DECLINE;
+        const want: usize = frame.ret_count;
+        const count: usize = instr.b;
+        const a_reg: usize = instr.a;
+        if (a_reg + count > nreg) return trace.NativeSeedCtx.POP_DECLINE;
+        if (@as(usize, frame.ret_dest) + want > nreg) return trace.NativeSeedCtx.POP_DECLINE;
+        // The full open-upvalue scan (see the doc comment).
+        for (self.open_upvalues.items) |ou| {
+            if (ou.index >= frame.base) return trace.NativeSeedCtx.POP_DECLINE;
+        }
+        // All checks passed — `opRet`-verbatim mutation from here down.
+        const dst = parent.base + frame.ret_dest;
+        const src = frame.base + a_reg;
+        var k: usize = 0;
+        while (k < want) : (k += 1) {
+            self.regSet(dst + k, if (k < count) self.regGet(src + k) else Value.nil());
+        }
+        self.trace.dropRegionActivation(frame.call_seq);
+        self.depth -= 1;
+        self.stack_top = parent.base + nreg;
+        self.prepareNativeEpisode(parent.closure, proto, parent.base);
+        self.trace.self_ret_pops +%= 1;
+        return trace.NativeSeedCtx.POP_OK;
     }
 
     /// Doc 22 §B.1: publish the current activation into the per-VM seeding ctx
@@ -2719,14 +2807,17 @@ pub const Vm = struct {
         next_candidate,
         resume_tier0: usize,
         switch_mode_at: usize,
-        /// Doc 44 D11: the native run pushed real VM frames (a self-call
-        /// descent). The dispatch site must `reloadTopFrame` and dispatch the
-        /// NEW top frame at this pc — `head_terminal` completions resume at
-        /// the leaf's `term.aux`; every other disposition (deopt, yielded cut,
-        /// prologue-fail, either seed decline) resumes the leaf at pc 0, where
-        /// the jfunc_head arm runs the LEAF's own walk. Only the head patch
-        /// site can receive it (loop pages never emit the push epilogue).
-        resume_pushed_frame: usize,
+        /// Doc 44 D11/D12c: the native run moved real VM frames (self-call
+        /// pushes, and now return-side pops). The dispatch site must
+        /// `reloadTopFrame` and dispatch the NEW top frame at this pc —
+        /// `head_terminal` completions resume at the leaf's `term.aux`;
+        /// `.ret_pop` completions resume the popped-into CALLER at its frozen
+        /// one-past-call cursor; every other disposition (deopt, yielded cut,
+        /// prologue-fail, either seed decline) resumes the leaf at pc 0,
+        /// where the jfunc_head arm runs the LEAF's own walk. Only the head
+        /// patch site can receive it (loop pages never emit either epilogue;
+        /// cont pages enter with net 0, so their pops decline in v1).
+        resume_frame_motion: usize,
     };
 
     /// Same-anchor trial-walk cap (visited/dead arrays; `dead ⊆ visited`).
@@ -2991,7 +3082,7 @@ pub const Vm = struct {
     /// `consumeHeadBurst` sharing the factored row-validation/accounting core
     /// but NONE of the walk-local state: no `head_burst_visited` publication
     /// and no `.next_candidate` — every disposition converts directly to
-    /// `.resume_pushed_frame` (the top frame is now the descent's leaf; the
+    /// `.resume_frame_motion` (the top frame is now the descent's leaf; the
     /// entry activation's walk cannot continue against it). D12a amended the
     /// original "no `head_walk_fail` pairing" rule with the two ACTIVATION-
     /// CORRECT evidence flows: the A1 funnel pairs a standing walk failer
@@ -3016,6 +3107,10 @@ pub const Vm = struct {
     ) EntryDirective {
         const ts = &self.trace;
         std.debug.assert(result.pushed_frames > 0);
+        // D12c: the pop helper's net floor makes popped-without-pushed
+        // structurally impossible; a violation means the emitted preflight
+        // computed net from the wrong counters.
+        std.debug.assert(result.popped_frames <= result.pushed_frames);
         // The push helper refuses while region receipts are live, and heads
         // never enter promoted silent cycles — a silent descent result means
         // native ran a shape the registry never armed.
@@ -3067,7 +3162,25 @@ pub const Vm = struct {
                     // D12a: want retirement moved to the single funnel above
                     // (keyed on the ENTERED trace, round-6 change 5 — a second
                     // call here would double-fire with a different id).
-                    return .{ .resume_pushed_frame = @intCast(term.aux) };
+                    return .{ .resume_frame_motion = @intCast(term.aux) };
+                },
+                .ret_pop => {
+                    // Doc 44 D12c: the final activation COMMITTED a native
+                    // frame pop (`return_interp` terminal + POP_OK) — the top
+                    // frame is the popped-into CALLER and its `pc` is the
+                    // frozen one-past-call cursor the push wrote. Resume
+                    // there: that pc may hold a `jcont` patch, making the
+                    // continuation the very next episode (`.ret_cont` links
+                    // will later take this hop without leaving native). A
+                    // DECLINED final pop appends `head_terminal` instead and
+                    // takes the arm above (leaf re-executes its `ret`).
+                    if (row.outcome != .normal) @panic("pushed descent: yielded ret_pop");
+                    if (result.popped_frames == 0) @panic("pushed descent: ret_pop row without pops");
+                    if (row.exit >= owner.code.instrs.len or owner.code.instrs[row.exit].op != .terminal)
+                        @panic("pushed descent: ret_pop row does not name a terminal instr");
+                    ts.dbg("pushed-descent ret-pop: pushed={d} popped={d} rows={d} final t={d} resume={d}", .{ result.pushed_frames, result.popped_frames, ledger.len, owner.id, self.frames[self.depth - 1].pc });
+                    ts.onSideExitReceipt(owner, 1, row.exit, 1, .deferred, .entered);
+                    return .{ .resume_frame_motion = self.frames[self.depth - 1].pc };
                 },
                 .deopt => {
                     // Guard deopt at some depth (normal), or a full-cap
@@ -3091,20 +3204,20 @@ pub const Vm = struct {
                         };
                     }
                     ts.dbg("pushed-descent deopt: pushed={d} rows={d} last t={d} exit={d} yielded={}", .{ result.pushed_frames, ledger.len, owner.id, row.exit, row.outcome == .yielded });
-                    return .{ .resume_pushed_frame = 0 };
+                    return .{ .resume_frame_motion = 0 };
                 },
                 .prologue_fail => {
                     // Arg types changed at some depth: the post-push re-entry
                     // refused before touching regs. Leaf walk owns it.
                     ts.dbg("pushed-descent prologue-fail: pushed={d} rows={d} last t={d}", .{ result.pushed_frames, ledger.len, owner.id });
-                    return .{ .resume_pushed_frame = 0 };
+                    return .{ .resume_frame_motion = 0 };
                 },
                 .seed_capacity_decline, .seed_hash_decline => {
                     // The post-push seed prologue declined. Both resume the
                     // leaf at pc 0 — the hash decline explicitly must not
                     // take the entry activation's scalar tier-1a rerun.
                     ts.dbg("pushed-descent seed-decline: pushed={d} rows={d} last t={d} kind={s}", .{ result.pushed_frames, ledger.len, owner.id, @tagName(row.kind) });
-                    return .{ .resume_pushed_frame = 0 };
+                    return .{ .resume_frame_motion = 0 };
                 },
                 else => @panic("pushed descent: terminal row kind outside the head grammar"),
             }
@@ -4783,7 +4896,7 @@ pub const Vm = struct {
                         return .switch_mode;
                     },
                     // Doc 44 D11: only head pages emit the push epilogue.
-                    .resume_pushed_frame => @panic("pushed frames from a loop-anchor entry"),
+                    .resume_frame_motion => @panic("native frame motion from a loop-anchor entry"),
                 }
             }
         }.h;
@@ -4865,7 +4978,7 @@ pub const Vm = struct {
                         return .switch_mode;
                     },
                     // Doc 44 D11: only head pages emit the push epilogue.
-                    .resume_pushed_frame => @panic("pushed frames from a loop-anchor entry"),
+                    .resume_frame_motion => @panic("native frame motion from a loop-anchor entry"),
                 }
             }
         }.h;
@@ -4955,7 +5068,7 @@ pub const Vm = struct {
                     // dispatch: `term.aux` re-executes the leaf's refused
                     // self-call generically; pc 0 runs the leaf's own
                     // jfunc_head walk (which owns the failure accounting).
-                    .resume_pushed_frame => |rpc| {
+                    .resume_frame_motion => |rpc| {
                         reloadTopFrame(st);
                         return dispatchTail(mode, st, rpc, vm);
                     },
@@ -5027,7 +5140,7 @@ pub const Vm = struct {
                     },
                     // Doc 44 D12b v1: cont pages never lower the push epilogue
                     // (their self-call terminal exits plain until D12c links).
-                    .resume_pushed_frame => @panic("pushed frames from a cont-anchor entry"),
+                    .resume_frame_motion => @panic("native frame motion from a cont-anchor entry"),
                 }
             }
         }.h;
@@ -5808,7 +5921,7 @@ pub const Vm = struct {
                         .resume_tier0 => |npc| return .{ .dispatch_at = npc },
                         .switch_mode_at => |npc| return .{ .switch_mode_at = npc },
                         // Doc 44 D11: only head pages emit the push epilogue.
-                        .resume_pushed_frame => @panic("pushed frames from a loop-anchor entry"),
+                        .resume_frame_motion => @panic("native frame motion from a loop-anchor entry"),
                     }
                 }
                 // Retire traces the walk found permanently dead (lane widened

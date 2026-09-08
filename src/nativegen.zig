@@ -779,6 +779,13 @@ pub const NativeResult = extern struct {
     /// so this may only ever be appended, never inserted. The wrapper inits it
     /// to 0 and marshals it into `ExecResult.pushed_frames`.
     pushed_frames: u64,
+    /// Doc 44 D12c: count of successful native frame pops this run (the
+    /// `.terminal(return_interp)` pop epilogue increments it after
+    /// `nativeSelfRetPop` returns POP_OK). Appended at the ABI tail like its
+    /// push twin; the wrapper inits it to 0 and marshals it into
+    /// `ExecResult.popped_frames`. The emitted pop preflight also READS both
+    /// motion counters to compute the net floor it passes the helper.
+    popped_frames: u64,
 };
 
 /// Host-staged bounds/state for a native call that may enter a promoted silent
@@ -818,6 +825,8 @@ comptime {
     // Doc 44 D11: `pushed_frames` is appended at the very tail — nothing that
     // was baked before it may have moved.
     std.debug.assert(@offsetOf(NativeResult, "pushed_frames") == @offsetOf(NativeResult, "silent_last_cell") + @sizeOf(u64));
+    // Doc 44 D12c: `popped_frames` appended after its push twin, same rule.
+    std.debug.assert(@offsetOf(NativeResult, "popped_frames") == @offsetOf(NativeResult, "pushed_frames") + @sizeOf(u64));
 }
 
 pub const SilentSummaryCell = extern struct {
@@ -1052,6 +1061,7 @@ pub const CompiledTrace = struct {
             .silent_cum = 0,
             .silent_last_cell = 0,
             .pushed_frames = 0,
+            .popped_frames = 0,
         };
         if (self.trampoline_entry) |tramp| {
             const f: *const TrampolineFn = @ptrFromInt(tramp);
@@ -1148,6 +1158,7 @@ pub const CompiledTrace = struct {
             .silent_cum = result.silent_cum,
             .silent_last_cell = result.silent_last_cell,
             .pushed_frames = result.pushed_frames,
+            .popped_frames = result.popped_frames,
         };
     }
 
@@ -7458,6 +7469,60 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         try a.movMemImm32(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 0);
                         try a.jmp(body_entry);
                         no_push = decline;
+                    };
+                }
+                // Doc 44 D12c: native frame pop at the return terminal — the
+                // symmetric twin of the push above, and like it a LOWERING
+                // decision only (recording and tier-1a keep the interp
+                // terminal). The flush above materialized the callee window,
+                // return-value registers included, so the runtime pop helper
+                // can copy results into the parent slab window verbatim
+                // opRet. The emitted preflight computes the episode's NET
+                // pushed-frame count from the two motion counters and passes
+                // it by value — the round-6 explicit floor (`net == 0`
+                // declines inside the helper: an episode only pops frames IT
+                // pushed; the entry frame's own return stays tier-0). POP_OK
+                // exits through a DISTINCT `.ret_pop` ledger row (top frame =
+                // the popped-into caller at its frozen cursor — the motion
+                // consumer's resume contract); any decline falls through to
+                // the plain `head_terminal` exit, byte-identical to pre-D12c
+                // (tier-0 re-executes the `ret` generically).
+                if (@as(trace.TerminalKind, @enumFromInt(@as(u16, @intCast(term.a)))) == .return_interp) {
+                    if (seed_ctx) |ctx| if (ctx.self_ret_pop_fn) |pop_fn| {
+                        const no_pop = try a.label();
+                        // Same C-ABI bracket as the push: three pushes take
+                        // rsp ≡8 → ≡0 (aligned call); rdi/rsi/rdx are the
+                        // only live caller-saved regs (homes just flushed).
+                        try a.push(.rdi);
+                        try a.push(.rsi);
+                        try a.push(.rdx);
+                        // net = pushed - popped, read while rdx still holds
+                        // the *NativeResult (before the arg loads clobber it).
+                        try a.movRegMem(.rcx, .rdx, @offsetOf(NativeResult, "pushed_frames"));
+                        try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "popped_frames"));
+                        try a.subRegReg(.rcx, .rax);
+                        // SysV args: rdi = &ctx, rsi = &t, rdx = the
+                        // terminal's `.ret` pc BY VALUE, rcx = net (above).
+                        try a.movRegImm64(.rdi, @bitCast(@as(u64, @intFromPtr(ctx))));
+                        try a.movRegImm64(.rsi, @bitCast(@as(u64, @intFromPtr(t))));
+                        try a.movRegImm64(.rdx, @bitCast(@as(u64, @intCast(term.aux))));
+                        try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(pop_fn))));
+                        try a.callReg(.rax);
+                        try a.pop(.rdx);
+                        try a.pop(.rsi);
+                        try a.pop(.rdi);
+                        // Two-state result, fail closed: POP_OK takes the
+                        // `.ret_pop` exit, EVERYTHING else the plain terminal.
+                        try a.cmpRegImm32(.rax, @intCast(NativeSeedCtx.POP_OK));
+                        try a.jcc(.ne, no_pop);
+                        try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "popped_frames"));
+                        try a.addRegImm32(.rax, 1);
+                        try a.movMemReg(.rdx, @offsetOf(NativeResult, "popped_frames"), .rax);
+                        try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+                        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
+                        try emitLedgerAppend(a, trace_id, .ret_pop);
+                        try emitReturn(a, frame, callee[0..callee_len], shared_exit, trace_id, null);
+                        a.bind(no_pop);
                     };
                 }
                 if (no_push) |l| a.bind(l);

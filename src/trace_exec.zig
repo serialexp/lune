@@ -127,6 +127,13 @@ pub const ExecResult = struct {
     /// activation while the top frame is now the descent's leaf. Native only;
     /// tier-1a leaves it 0 (defaulted, construction sites untouched).
     pushed_frames: u64 = 0,
+    /// Doc 44 D12c: how many episode-pushed frames the native run popped back
+    /// via the return-side helper (`nativeSelfRetPop`). The net floor
+    /// (`popped < pushed` at every pop, enforced in the helper) makes
+    /// `popped_frames > 0` imply `pushed_frames > 0`, so the dispatchers'
+    /// existing pushed-frame branch already routes every frame-motion result.
+    /// Native only; tier-1a leaves it 0.
+    popped_frames: u64 = 0,
 };
 
 /// 2.3c-2c (doc 17): which exit-materialization SITE appended a ledger entry —
@@ -174,6 +181,17 @@ pub const LedgerKind = enum(u32) {
     /// Always a natural terminal, never a chain source (the dispatcher's
     /// terminal consumer owns resumption; no slot indirection is emitted).
     head_terminal = 7,
+    /// Doc 44 D12c: a `.terminal(return_interp)` whose native pop epilogue
+    /// COMMITTED (`nativeSelfRetPop` returned POP_OK): the episode popped one
+    /// of its own pushed frames, so the top frame is the popped-into CALLER
+    /// and regs are coherent at its frozen one-past-call cursor. With no
+    /// `.ret_cont` links armed yet this row is always FINAL (the pop exits
+    /// plain); once links land it doubles as the transition row for a pop
+    /// that dispatched into a cont page. A DECLINED pop appends the ordinary
+    /// `head_terminal` row instead — the two kinds are what let the
+    /// dispatcher's motion consumer tell "resume the caller at its cursor"
+    /// from "re-execute the leaf's ret at `term.aux`".
+    ret_pop = 8,
 };
 
 /// 2.3c-2c (doc 17): what a chain-source exit DID with its (possibly armed) slot —
@@ -247,6 +265,8 @@ test "execution contract wire ordinals and capacity" {
     try std.testing.expectEqual(@as(u32, 4), @intFromEnum(LedgerKind.region_bridge));
     try std.testing.expectEqual(@as(u32, 5), @intFromEnum(LedgerKind.seed_hash_decline));
     try std.testing.expectEqual(@as(u32, 6), @intFromEnum(LedgerKind.seed_capacity_decline));
+    try std.testing.expectEqual(@as(u32, 7), @intFromEnum(LedgerKind.head_terminal));
+    try std.testing.expectEqual(@as(u32, 8), @intFromEnum(LedgerKind.ret_pop));
     try std.testing.expectEqual(@as(u32, 0), @intFromEnum(LedgerOutcome.normal));
     try std.testing.expectEqual(@as(u32, 1), @intFromEnum(LedgerOutcome.yielded));
     try std.testing.expectEqual(@as(usize, 32), LEDGER_CAP);
