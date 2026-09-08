@@ -960,6 +960,30 @@ pub const TraceState = struct {
     /// successful same-anchor trace entry — so the armed child is the trace the
     /// deterministic dispatch actually ran, never a hit-count guess made here.
     pending_sibling_arm: ?ExitKey = null,
+    /// Doc 44 D10: WALK-LOCAL evidence channel for head sibling-handoff arming.
+    /// A head episode's zero-exit (real guard deopt, `completed == 0`) records
+    /// the failing `(trace, exit)` here; when a LATER trace in the SAME
+    /// `enterPatchedTrace` sibling walk completes terminally, the terminal
+    /// consumer charges `noteSiblingTerminal(failer, exit)` — "trace A's branch
+    /// guard failed and sibling B then finished the call" is exactly the
+    /// handoff-profitable pattern. Reset at every walk start; set ONLY by real
+    /// head guard deopts (never declines — a `prologue_fail` or
+    /// `seed_capacity_decline` says nothing about the branch); survives
+    /// intermediate declines within the walk; consumed (and cleared) at the
+    /// terminal-completion consumers when the completing trace differs from the
+    /// recorded failer. NOT a per-receipt counter — the counting lives in the
+    /// existing Part-S watch (`noteSiblingTerminal`).
+    head_walk_fail: ?ExitKey = null,
+    /// Doc 44 D10: owner ids the last fused head burst ENTERED (deduped),
+    /// published by the dispatcher's `consumeHeadBurst` for the
+    /// `enterPatchedTrace` walk to merge into its visited set — a burst owner
+    /// already ran this activation and must not be re-selected by the walk.
+    /// Reset at each burst; capacity matches the walk's `trial_visited_cap`
+    /// (8). On overflow recording simply stops — the walk's own cap branch
+    /// then reports truncation, which is exactly the all-visited-strike
+    /// semantics the D8 retention rule wants.
+    head_burst_visited: [8]u32 = @splat(0),
+    head_burst_visited_len: usize = 0,
     /// A-vii-d.1: nonzero while a `replayLedger` walk is in progress. While set,
     /// `disarmAllLinks` DEFERS (records `pending_disarm_all`) instead of
     /// mutating the armed-link registry: later rows of the very ledger being
@@ -1550,6 +1574,22 @@ pub const TraceState = struct {
         switch (t.code.anchor.proto.code[src_pc].op) {
             .jmp_if_false, .jmp_if_true, .jmp_if_not_nil => {},
             else => return false,
+        }
+        // Doc 44 D10 (round 4): head parents demand the POSITIVE provenance
+        // proof, not just the source-opcode shape above. A head trace inlines
+        // callees freely, and an inlined guard's `guardSourcePc` lives in the
+        // CALLEE's proto — a coincidental branch opcode at that pc in the
+        // anchor proto would misclassify it. Require the exit-provenance table
+        // to say: a real guard, role `.branch_cond`, at inline depth 0.
+        if (isHeadAnchorPc(t.code.anchor.pc)) {
+            const prov = t.code.provAt(exit_instr) orelse return false;
+            switch (prov) {
+                .guard => |gp| {
+                    if (gp.inline_depth != 0) return false;
+                    if (gp.role != .branch_cond) return false;
+                },
+                .link_terminal => return false,
+            }
         }
         return true;
     }

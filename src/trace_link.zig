@@ -1243,18 +1243,25 @@ pub fn arm(self: *TraceState, request: ArmRequest) !bool {
     // arming half so no ordinary/link arm can ever write a loop-done slot (and no
     // loop-done arm can land on a non-loop-done slot).
     const is_loopdone = isLoopDoneGuardIndex(parent, slot_index);
+    // Doc 44 D10 (round 4, durable invariant): head-anchored slots carry ONLY
+    // `.sibling_handoff` arms. Enforced here at the single arm funnel — not
+    // just at the request sites — so the guarantee survives future arm paths.
+    const head_parent = trace_mod.isHeadAnchorPc(parent.code.anchor.pc);
     switch (kind) {
         .loop_done_linked => {
             std.debug.assert(is_loopdone);
             if (!is_loopdone) return false;
+            if (head_parent) return false;
         },
         .link_terminal => {
             std.debug.assert(!is_loopdone);
             if (is_loopdone) return false;
+            if (head_parent) return false;
         },
         .ordinary_guard => {
             std.debug.assert(!is_loopdone);
             if (is_loopdone) return false;
+            if (head_parent) return false;
             // A-v bridge candidates must remain at shared_exit. In particular,
             // the older M1 ordinary-source arm must not accidentally publish a
             // composite back-edge into the new armed body.
@@ -1263,6 +1270,7 @@ pub fn arm(self: *TraceState, request: ArmRequest) !bool {
         .region_bridge => {
             std.debug.assert(!is_loopdone);
             if (is_loopdone) return false;
+            if (head_parent) return false;
         },
         // Part S: same slot shape as `.ordinary_guard` (the stub is literally
         // the same code path) — never a loop-done slot (that one is reserved
@@ -1272,6 +1280,17 @@ pub fn arm(self: *TraceState, request: ArmRequest) !bool {
             std.debug.assert(!is_loopdone);
             if (is_loopdone) return false;
             if (parent.code.isBridgeCandidate(slot_index)) return false;
+            // Doc 44 D10: a head arm's fused ledger grammar has no
+            // `seed_hash_decline` terminal — the burst consumer cannot replay
+            // a hash-seeded child's tier-1a rerun mid-episode. Exclude the
+            // case at ARM time instead of teaching the consumer about it.
+            if (head_parent) {
+                const child_cc = switch (child.native) {
+                    .compiled => |*cc| cc,
+                    else => return false,
+                };
+                if (child_cc.has_hash_seed) return false;
+            }
             // Re-proved at arm time, not merely trusted from the watch: this is
             // the predicate that makes the handoff sound (`exitIsPreEffect`), and
             // the validator is the last gate before a physical slot is patched.

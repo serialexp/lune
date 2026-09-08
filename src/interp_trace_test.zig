@@ -4875,6 +4875,86 @@ test "recorder (head, doc 44 D8): the sibling lifecycle — want, transfer, seco
     try testing.expect(vm.trace.head_want_src == null);
 }
 
+test "head e2e (doc 44 D10): alternating two-path head under a low hotguard stays byte-identical, all ten legs" {
+    // Output pin for the D10 machinery across the ten-leg matrix: with
+    // `hotguard = 5`, the native legs can arm `.sibling_handoff` on the head
+    // incumbent's branch-guard exit and fuse A→B bursts, while the tier-1a
+    // legs keep walking unfused — the outputs must still agree byte-for-byte
+    // (arms are native-physical only; guard re-verification preserves
+    // committed state).
+    try util.expectProgramTuned(
+        \\local function pick(n)
+        \\  if n < 0 then return -n end
+        \\  return n + 1
+        \\end
+        \\local acc = 0
+        \\for i = 1, 600 do
+        \\  if i % 2 == 0 then acc = acc + pick(-i) else acc = acc + pick(i) end
+        \\end
+        \\print(acc)
+    , "180600\n", .{ .hotguard = 5 });
+}
+
+test "head arm formation (doc 44 D10): the walk evidence channel arms a .sibling_handoff exit patch with a head parent" {
+    // The D10 formation proof: the incumbent's branch-guard deopt plus the
+    // sibling's terminal completion within ONE `enterPatchedTrace` walk
+    // charge the Part-S watch (`head_walk_fail` → `noteSiblingTerminal`);
+    // at `hotguard` the exit arms `.sibling_handoff` at the dispatcher's
+    // next same-anchor selection. Without this assertion the ten-leg pin
+    // above would silently pass on a regression that never arms (the scalar
+    // walk is output-equivalent, just slower). Native-only: evidence and
+    // arms are both native-physical.
+    if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    const source =
+        \\local function pick(n)
+        \\  if n < 0 then return -n end
+        \\  return n + 1
+        \\end
+        \\local acc = 0
+        \\for i = 1, 600 do
+        \\  if i % 2 == 0 then acc = acc + pick(-i) else acc = acc + pick(i) end
+        \\end
+        \\print(acc)
+    ;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = true;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.hotcall = 4;
+    vm.trace.config.hotexit = 3;
+    vm.trace.config.hotguard = 5;
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings("180600\n", sink.buffered());
+    // At least one armed handoff whose PARENT is a head trace; every head
+    // arm's child must share the head anchor (the validator's same-anchor
+    // rule — a cross-anchor head arm would be a validator regression).
+    var head_arms: usize = 0;
+    for (vm.trace.registry.native_physical.armedLinks()) |l| {
+        if (l.kind != .sibling_handoff) continue;
+        if (!trace.isHeadAnchorPc(l.parent.code.anchor.pc)) continue;
+        try testing.expect(trace.isHeadAnchorPc(l.child.code.anchor.pc));
+        try testing.expect(l.parent.code.anchor.proto == l.child.code.anchor.proto);
+        head_arms += 1;
+    }
+    try testing.expect(head_arms >= 1);
+}
+
 test "recorder (head, doc 44 P0): a depth-0 multret-forwarding return aborts — no head trace" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);

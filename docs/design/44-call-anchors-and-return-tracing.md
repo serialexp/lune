@@ -1,10 +1,11 @@
 # 44 — call anchors and return tracing (making recursion trace at all)
 
-Status: partial — P0 complete, P1a (D8 head siblings) and P1b (D9 quiet head
-episode + S1/S2/S4) landed; fib jit 435 ms / binary-trees ~365-373 ms with 100%
-head coverage. The remaining fib gap is the per-leaf zero-exit + sibling
-episode structure — P4 (exit-branch patching + native frame push) owns it.
-Codex-reviewed ×3 (gpt-5.6-sol, all sound-with-changes, every required change
+Status: partial — P0 complete, P1a (D8 head siblings), P1b (D9 quiet head
+episode + S1/S2/S4), and P4 slice 1 (D10 head-sibling exit-branch patching)
+landed; fib jit 317 ms / binary-trees ~368 ms with 100% head coverage. The
+remaining fib gap is the per-call episode turnstile itself — P4's native
+frame push (true up-recursion) owns it.
+Codex-reviewed ×4 (gpt-5.6-sol, all sound-with-changes, every required change
 folded; ledger at bottom)
 Owner: Bart
 Last updated: 2026-09-08
@@ -129,6 +130,32 @@ to Done once everything inside a phase is checked.
       Remaining fib gap is structural (leaf calls pay incumbent
       zero-exit + sibling full episode; penalty churn keeps the sibling
       non-quiet) — P4's exit-branch patching owns it.
+- [x] **P4 slice 1 — head-sibling exit-branch patching (D10).** Landed
+      per the round-4-amended design: the central arm validator rejects
+      head parents for every non-`.sibling_handoff` kind and refuses
+      hash-seeded children for head handoff arms (the durable "head
+      slots carry only handoff arms" invariant); `siblingHandoffEligible`
+      demands non-inlined `.branch_cond` provenance for head parents;
+      the walk-local `head_walk_fail` evidence channel (reset per walk,
+      set only by real native head guard deopts, consumed at terminal
+      completions via `noteSiblingTerminal`); `consumeHeadBurst` at both
+      dispatch sites, keyed on `ledger_len > 1` BEFORE the scalar head
+      consumers, with release-mode per-row validation (owner/anchor/
+      kind/outcome, `hasArmedSiblingHandoff` adjacency, `.yielded` only
+      at full cap) and per-row accounting (intermediates: run + candidate
+      charge, no zero receipt, no hot-exit charge; final row: verbatim
+      scalar terminal / zero-exit / prologue-fail / capacity-decline
+      semantics); burst owners merge into the walk's `visited` via the
+      `head_burst_visited` scratch; quiet predicate v2 drops the global
+      `armedLinks` line (un-starves the quiet path in mixed loop+call
+      programs, Z-6). The `replayLedger` `head_terminal` panics stay as
+      backstop; heads still never enter `replayLedger`. Receipts: fib
+      jit 442→317 ms (res 43.5→46.3), binary-trees ~flat (362→368),
+      rest of the board within noise; validator + arm-formation + ten-leg
+      output-equality tests; all gates green (both test builds, hashgate
+      84×2 — output-equality claim, not byte-identical-by-construction:
+      D10 changes tiering/receipt streams on native legs — wasm, viz,
+      boundaries).
 
 ### Outstanding
 - [ ] **Phase 1a follow-ups.** Remaining review-round-2 matrix tests
@@ -655,6 +682,138 @@ a follow-up once the head shape proves out. P4 still owns removing the
 episode-per-call structure for recursion; this makes the episodes that
 remain (and every episode P4 keeps: outermost entries, side exits) cheap.
 
+### D10 — P4 slice 1: head-sibling exit-branch patching
+
+**The measured residual (D9 re-profile).** With the quiet episode landed,
+every LEAF call of fib still pays: incumbent A entry → base-guard zero
+exit (noteTakenExit + zero receipt, penalty insert) → D8 walk → sibling
+B full episode (the penalty insert forces B non-quiet) → terminal
+(penalty remove). Two episodes plus map churn per leaf, ~half of all
+calls. LuaJIT's answer is exit-branch patching: the failing guard jumps
+straight into the side trace's native code. **We already built the
+machine for loop anchors** — Part S sibling handoffs (`noteSiblingTerminal`
+watch → `pending_sibling_arm` → `tryArmSiblingHandoff` at the selection
+site → `armNativeLink(.sibling_handoff)`); D10 is that machine admitted
+to head anchors, not a new mechanism (Z-6: path-polymorphic sibling
+fusion at any shared anchor; heads are one instance).
+
+**Why `.sibling_handoff` fits verbatim.** Its arm validator already
+demands everything a head handoff needs: same-anchor parent/child,
+`exitIsPreEffect` (head guards precede any store — regs and heap
+untouched since pc 0, so re-entering the sibling at entry state is
+coherent), NOT loop-done / NOT bridge candidate (both structurally false
+for heads since D1), `stubEnterable(.ordinary)` (a seeded child
+self-seeds from the episode ctx, which is fresh — same closure/base/
+proto, it's the same activation). The ping-pong hazard is already
+solved: `siblingHandoffEligible` arms **source-branch guards only** — a
+branch guard failing means the program took the other branch, exactly
+the base/non-base split; head entry TYPE guards stay unarmed. A
+no-sibling-matches value walks the armed chain once and yields at the
+native ledger cap — bounded, and the final row is a real zero exit.
+
+**Piece 1 — evidence + arming (all existing machinery).** Evidence is
+a walk-local channel (round 4 — not `last_exit_instr`, which episodes
+overwrite on paths that are not guard evidence): `head_walk_fail:
+?ExitKey`, reset at walk start; SET by every real head guard-deopt
+consumer (scalar zero exit, fused final deopt — the LAST failed trace,
+not the entered one); UNCHANGED by declines/prologue-fails (evidence
+survives an intervening decline); CONSUMED at every terminal-completion
+consumer: if the completing trace differs from the recorded failer,
+call `noteSiblingTerminal(failer, exit)` and clear. The existing watch
+accrues per (trace, exit), crosses `hotguard`, and raises
+`pending_sibling_arm`. Consumption needs ZERO new code: a standing
+pending forces the quiet predicate false, and the full path's
+entry-sited `tryArmSiblingHandoff(entered)` fires on a LATER walk when
+the dispatcher again selects a real sibling after the parent's failure
+(round-4 timing note: not on the threshold-crossing entry itself — B
+was already entered when the watch crossed) — `publishSiblingArm` then
+patches A's exit stub to B's `ordinary_entry`.
+
+Head eligibility is strengthened in `siblingHandoffEligible` (round 4):
+for a head parent the guard must carry exact non-inlined
+`.branch_cond` provenance — `isSourceBranchGuardExit`'s shape-only
+check can misclassify an inlined guard through a coincidental
+source-pc opcode. And the central arm validator makes "a head slot
+carries only `.sibling_handoff` arms" a DURABLE invariant: every other
+arm kind explicitly rejects a head parent (today that exclusion is a
+distributed fact about triggers; quiet-v2 correctness must not rest on
+it).
+
+**Piece 2 — the fused-result consumer (dispatcher-level, NOT
+replayLedger).** A fused head run returns a multi-row ledger. Round-4
+correction: without a new consumer the fused ledger would NOT panic —
+it would be **silently mis-consumed** by the scalar terminal / head
+zero-exit consumers (which read only the terminal body's fields and
+drop the intermediate rows); `driveDispatcherLedger` → the
+`head_terminal` `@panic` sits after them and is only the backstop. So
+the head-burst consumer is keyed on `ledger_len > 1` BEFORE the scalar
+head consumers, at both dispatch sites; the chain machine's fail-closed
+arms stay (heads still never enter `replayLedger`).
+
+The full grammar (round 4 — the child's `ordinary_entry` runs its seed
++ hoisted-type prologues, so decline terminals are reachable):
+`[A.deopt…, B.head_terminal | B.deopt | B.deopt(.yielded, full-cap
+only) | B.prologue_fail | B.seed_capacity_decline]`.
+`seed_hash_decline` is excluded at ARM time instead: a head
+`.sibling_handoff` arm refuses a hash-seeded child (`has_hash_seed`,
+the D9 flag) — the tier-1a rerun contract cannot be met mid-fusion.
+
+Release-mode validation (round 4 — matching the generic replay's
+registry-adjacency discipline, not a debug assert): every non-final row
+must resolve, anchor at the entered head's `{proto, FUNC_HEAD_PC}`, be
+`kind == .deopt` with normal reason/outcome, and carry an exact armed
+`.sibling_handoff` edge to the next row's owner
+(`hasArmedSiblingHandoff`); `.yielded` is valid only as the last row of
+a full-cap ledger. Per row:
+- **Intermediate rows**: `accountTraceRun(row, 0)` AND
+  `accountCandidateCharge(row, .entered)` (round 4: an intermediate
+  handoff is a successfully entered candidate — the refusal streak must
+  reset exactly as ordinary ledger accounting preserves it). NO zero
+  receipt, NO `noteTakenExit` — a patched branch is a designed edge,
+  not thrash (doc 38 precedent); this deletes the per-leaf penalty
+  churn. The exit counter is already saturated/armed.
+- **Final `head_terminal`**: the existing terminal consumer — REAL
+  `onSideExitReceipt` productive receipt on the final trace (shared
+  between quiet and full paths, so it must be the real funnel — S2
+  makes it cheap when maps are empty), `noteHeadSiblingCompletion`,
+  resume at its `term.aux`.
+- **Final deopt (normal)**: the existing head zero-exit consumer on the
+  final trace (`noteTakenExit` + zero receipt) → `.next_candidate`.
+- **Final deopt (.yielded)**: cap artifact, not hotness evidence — zero
+  receipt without `noteTakenExit` → `.next_candidate` (entry image
+  still coherent, the walk continues).
+- **Final prologue-fail / capacity-decline**: the existing scalar
+  handlers' semantics → `.next_candidate`.
+The consumer records the fused-FAILED owners (deduped — a full-cap
+cyclic chain has 32 rows but few unique siblings; the walk buffer holds
+8) into a walk-visible scratch; the D8 walk merges them into `visited`,
+setting `walk_truncated` on overflow so strike semantics stay honest.
+
+**Piece 3 — quiet predicate v2.** Drop the global
+`armedLinks().len == 0` line — it was doing two jobs. The job it keeps
+via OTHER predicate lines: no silent state (`promotedSets` empty), no
+provenance scans (`provenance_edges` empty), no pending consumption
+(`pending_sibling_arm == null`). The job it loses on purpose: "no
+fusion ⇒ scalar ledger" — the quiet consumer now walks the (small)
+ledger instead of asserting `ledger_len <= 1`, with a debug assert that
+every row resolves to a head-anchored trace. This also fixes a real
+D9 generality gap: the old line turned the quiet path off in ANY
+program with armed loop links (scimark et al.), starving exactly the
+mixed loop+call workloads (Z-6).
+
+**Accounting/determinism.** Everything is a pure function of the
+deterministic ledger. Native legs fuse; tier-1a legs walk unfused and
+so see a different receipt stream — that is already true of every
+native-vs-tier-1a tiering difference; the ten-leg gate pins OUTPUT
+equality, which guard re-verification preserves (a fused entry commits
+exactly what the unfused walk would have committed). Arms are
+native-physical only; exec-log legs bypass patched entries entirely.
+
+**Lifecycle.** Retirement/disarm of either sibling rides the existing
+P-E teardown (`removeTrace` → link disarm paths); `EXIT_COUNT_DONE` and
+the D8 want machinery are unaffected (the want records NEW siblings
+below capacity; the arm fuses EXISTING ones — they compose).
+
 ## 5. Phasing
 
 P0 is the coverage milestone and is deliberately self-contained (both
@@ -712,6 +871,28 @@ shared validate/refill helper. Confirmed sound: the skip-claim audit for
 every other call, grammar completeness, active-plan-bits `has_hash_seed`
 airtightness, D8 walk symmetry (a post-zero-exit sibling correctly goes
 non-quiet — the penalty insert ends quietness by design).
+
+**Round 4 (codex gpt-5.6-sol, 2026-09-08, D10 only): sound-with-changes;
+5 required changes, all folded into D10.** (1) fused grammar expanded to
+the decline terminals (`prologue_fail`, `seed_capacity_decline`) with
+`seed_hash_decline` excluded at ARM time (refuse hash-seeded head
+children). (2) factual correction: an unhandled fused head ledger is
+silently mis-consumed by the scalar consumers, not a panic — the burst
+consumer keys on `ledger_len > 1` BEFORE them; the replayLedger `@panic`
+arms stay as backstop. (3) release-mode ledger validation (owner
+resolution, head-anchor match, kind/reason/outcome, registry adjacency
+via `hasArmedSiblingHandoff`, `.yielded` only at full cap) + deduped
+`visited` merging. (4) intermediate rows also charge
+`accountCandidateCharge(.entered)` (refusal-streak reset —
+`accountTraceRun` alone does not). (5) walk-local `head_walk_fail`
+evidence channel with explicit set/survive/consume rules + head
+eligibility requires non-inlined `.branch_cond` provenance + the central
+arm validator rejects head parents for every non-`sibling_handoff` kind.
+Confirmed sound: physical stub fit (pre-effect carried-home flush is
+entry-identical for heads; no loop-pc assumption; cap yields cleanly),
+quiet-v2 safety inventory, accounting rationale (suppressed intermediate
+zero receipts; last-failed sibling still raises wants), P-E lifecycle
+composition.
 
 ## References
 

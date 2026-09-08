@@ -28,6 +28,7 @@ const table = @import("table.zig");
 const array = @import("array.zig");
 const function = @import("function.zig");
 const trace = @import("trace.zig");
+const trace_exec = @import("trace_exec.zig");
 const nativegen = @import("nativegen.zig");
 const irinterp = @import("irinterp.zig");
 const execlog = @import("execlog.zig");
@@ -2654,9 +2655,11 @@ pub const Vm = struct {
         // The one decline needing the tier-1a rerun machinery.
         if (nt.has_hash_seed) return null;
         const phys = &ts.registry.native_physical;
-        // No fusion possible ⇒ scalar result, final == ct, no silent state;
-        // `disarmAllLinks` is a no-op.
-        if (phys.armedLinks().len != 0) return null;
+        // Doc 44 D10 (quiet v2): armed links no longer force the full path —
+        // a fused multi-row result routes through `consumeHeadBurst`, which
+        // validates every transition against the live registry. This also
+        // closes a Z-6 generality gap: v1's global `armedLinks` check made
+        // the quiet path dead in any program with armed LOOP links.
         // `applyPendingDisarms`/`drainBarrier`/`syncNativeInvalidation` no-op.
         if (phys.pending_demote.items.len != 0 or phys.pending_disarm_all) return null;
         if (phys.provenance_invalidated) return null;
@@ -2676,6 +2679,173 @@ pub const Vm = struct {
         // Coverage runs want the tsc stamps (`--jit-stats` attribution).
         if (ts.config.coverage) return null;
         return nt;
+    }
+
+    /// Doc 44 D10: consume the walk-local head-handoff evidence at a terminal
+    /// completion. If an EARLIER trace in this same `enterPatchedTrace` walk
+    /// zero-exited on a real guard deopt and a DIFFERENT trace has now
+    /// completed the call, that is one observation of the handoff-profitable
+    /// pattern — charge the existing Part-S watch on the failer's exit
+    /// (`noteSiblingTerminal`), which arms `.sibling_handoff` at `hotguard`.
+    /// Shared by the quiet and full terminal consumers; clears the channel
+    /// unconditionally (one observation per walk, by design).
+    fn consumeHeadWalkFail(self: *Vm, completed_id: u32) void {
+        const ts = &self.trace;
+        const fk = ts.head_walk_fail orelse return;
+        ts.head_walk_fail = null;
+        if (fk.trace_id == completed_id) return;
+        const failer = ts.traceById(fk.trace_id) orelse return;
+        ts.noteSiblingTerminal(failer, fk.exit_instr);
+    }
+
+    /// Doc 44 D10: merge the last burst's entered-owner ids into the head
+    /// walk's visited set — a burst owner already ran this activation and must
+    /// not be re-selected by `nextTraceExcluding`. Deduped against the ids
+    /// already visited; when the buffer fills, remaining ids are dropped and
+    /// the walk's own cap branch reports truncation. Clears the scratch so a
+    /// non-burst entry later in the walk merges nothing.
+    fn mergeHeadBurstVisited(self: *Vm, visited: []*trace.Trace, nvisited: *usize) void {
+        const ts = &self.trace;
+        outer: for (ts.head_burst_visited[0..ts.head_burst_visited_len]) |vid| {
+            if (nvisited.* >= visited.len) break;
+            const t = ts.traceById(vid) orelse continue;
+            for (visited[0..nvisited.*]) |v| {
+                if (v == t) continue :outer;
+            }
+            visited[nvisited.*] = t;
+            nvisited.* += 1;
+        }
+        ts.head_burst_visited_len = 0;
+    }
+
+    /// Doc 44 D10: the fused head-burst consumer. A head entry whose armed
+    /// `.sibling_handoff` slot fired returns a multi-row ledger describing the
+    /// whole native chain: `[A.deopt…, terminal]` where every intermediate row
+    /// is an armed pre-effect branch-guard deopt that dispatched into the next
+    /// row's owner, and the terminal row is one of the closed head grammar's
+    /// five shapes (`head_terminal` completion, final `.deopt` zero exit,
+    /// full-cap `.yielded` cut, `prologue_fail`, `seed_capacity_decline` —
+    /// `seed_hash_decline` is excluded at ARM time). MUST run BEFORE the
+    /// scalar terminal / head-zero consumers: those read only the terminal
+    /// body's scalars and would silently drop the intermediate rows'
+    /// accounting (round 4's factual correction — no panic saves us here; the
+    /// `replayLedger` `head_terminal` panics are a backstop for ledgers that
+    /// leak PAST this consumer, not a substitute for it).
+    ///
+    /// Ledger-shape violations panic in release too: a malformed burst means
+    /// native code jumped somewhere the registry never armed — continuing
+    /// would account (and resume) against fiction.
+    fn consumeHeadBurst(
+        self: *Vm,
+        ct: *trace.Trace,
+        ledger: []const trace_exec.LedgerEntry,
+        proto: *const Proto,
+    ) EntryDirective {
+        const ts = &self.trace;
+        std.debug.assert(ledger.len > 1);
+        if (ledger[0].id != ct.id) @panic("head burst: row 0 owner is not the entered trace");
+        // Publish every entered owner for the walk's visited merge (deduped;
+        // overflow stops recording — the walk's cap branch owns truncation).
+        ts.head_burst_visited_len = 0;
+        var i: usize = 0;
+        while (i < ledger.len) : (i += 1) {
+            const row = ledger[i];
+            const owner = ts.traceById(row.id) orelse @panic("head burst: row owner did not resolve");
+            if (owner.code.anchor.proto != proto or !trace.isHeadAnchorPc(owner.code.anchor.pc))
+                @panic("head burst: row owner is not a head trace of this anchor");
+            if (dedup: {
+                for (ts.head_burst_visited[0..ts.head_burst_visited_len]) |vid| {
+                    if (vid == owner.id) break :dedup false;
+                }
+                break :dedup ts.head_burst_visited_len < ts.head_burst_visited.len;
+            }) {
+                ts.head_burst_visited[ts.head_burst_visited_len] = owner.id;
+                ts.head_burst_visited_len += 1;
+            }
+            // Heads never increment `rbx` (no `.loop` terminal), but read the
+            // segment local off the cumulative column anyway — the accounting
+            // stays correct if a future head shape ever commits iterations.
+            const seg_local: usize = row.cum - (if (i == 0) 0 else ledger[i - 1].cum);
+            if (i != ledger.len - 1) {
+                // INTERMEDIATE row: an armed dispatch, validated against the
+                // live registry (adjacency per row — round 4).
+                if (row.kind != .deopt or row.outcome != .normal)
+                    @panic("head burst: intermediate row is not a dispatched deopt");
+                const next_owner = ts.traceById(ledger[i + 1].id) orelse
+                    @panic("head burst: successor owner did not resolve");
+                if (!ts.hasArmedSiblingHandoff(owner, row.exit, next_owner))
+                    @panic("head burst: transition has no armed sibling handoff");
+                // Entered-and-handed-off accounting: NO zero receipt (the
+                // deopt at an armed slot is not a failure — a sibling went on
+                // to finish the call) and NO hot-exit charge (the exit is
+                // already armed; wants on it would only churn). The candidate
+                // charge resets the refusal streak, which `accountTraceRun`
+                // alone does not (round 4).
+                ts.accountTraceRun(owner, seg_local);
+                trace.TraceState.accountCandidateCharge(owner, .entered);
+                continue;
+            }
+            // TERMINAL row.
+            switch (row.kind) {
+                .head_terminal => {
+                    if (row.outcome != .normal) @panic("head burst: yielded head_terminal");
+                    if (row.exit >= owner.code.instrs.len or owner.code.instrs[row.exit].op != .terminal)
+                        @panic("head burst: head_terminal row does not name a terminal instr");
+                    const term = owner.code.instrs[row.exit];
+                    ts.dbg("head-burst terminal: rows={d} final t={d} resume={d}", .{ ledger.len, owner.id, term.aux });
+                    // Verbatim the scalar terminal consumer's receipt: one
+                    // completed head run, productive (clears penalty/gate).
+                    ts.onSideExitReceipt(owner, 1, row.exit, 1, .deferred, .entered);
+                    ts.noteHeadSiblingCompletion(.{ .proto = owner.code.anchor.proto, .pc = owner.code.anchor.pc }, owner.id);
+                    self.consumeHeadWalkFail(owner.id);
+                    return .{ .resume_tier0 = @intCast(term.aux) };
+                },
+                .deopt => {
+                    if (row.outcome == .yielded) {
+                        // Full-cap forced yield: the chain was CUT, not
+                        // failed — regs are entry-coherent (pre-effect
+                        // guards only), so fall back to the walk. No
+                        // hot-exit charge and no handoff evidence (the
+                        // last exit is armed and live); the zero receipt
+                        // keeps the thrash gate able to retire a
+                        // pathological ping-pong pair.
+                        if (ledger.len != trace_exec.LEDGER_CAP)
+                            @panic("head burst: yielded row below full cap");
+                        ts.dbg("head-burst yield: rows={d} last t={d} exit={d}", .{ ledger.len, owner.id, row.exit });
+                        ts.onSideExitReceipt(owner, seg_local, row.exit, seg_local, .deferred, .entered);
+                        return .next_candidate;
+                    }
+                    // Real zero exit of the LAST owner — verbatim the scalar
+                    // head zero-exit consumer, including the walk-local
+                    // handoff evidence (a later completer may extend the
+                    // chain by arming THIS exit).
+                    ts.dbg("head zero-exit: trace={d} native={} reason={s} exit={d} completed={d}", .{ owner.id, true, @tagName(row.reason), row.exit, row.cum });
+                    if (row.exit != std.math.maxInt(u32))
+                        ts.head_walk_fail = .{ .trace_id = owner.id, .exit_instr = row.exit };
+                    ts.noteTakenExit(owner, row.exit, seg_local, proto);
+                    ts.onSideExitReceipt(owner, seg_local, row.exit, seg_local, .deferred, .entered);
+                    return .next_candidate;
+                },
+                .prologue_fail => {
+                    // A fused successor's hoisted entry-type guard failed:
+                    // scalar semantics (`exit == maxInt` bounds-refuses the
+                    // hot-exit charge inside), `.entry_refusal` charge kind.
+                    ts.dbg("head zero-exit: trace={d} native={} reason={s} exit={d} completed={d}", .{ owner.id, true, @tagName(row.reason), row.exit, row.cum });
+                    ts.noteTakenExit(owner, row.exit, seg_local, proto);
+                    ts.onSideExitReceipt(owner, seg_local, row.exit, seg_local, .deferred, .entry_refusal);
+                    return .next_candidate;
+                },
+                .seed_capacity_decline => {
+                    // Verbatim scalar decline semantics: no receipt, no
+                    // strike — an entry-condition mismatch, not a failure.
+                    ts.dbg("seed-capacity-decline: trace={d} anchor={d}", .{ owner.id, owner.code.anchor.pc });
+                    ts.seed_capacity_declines +|= 1;
+                    return .next_candidate;
+                },
+                else => @panic("head burst: terminal row kind outside the head grammar"),
+            }
+        }
+        unreachable;
     }
 
     /// Doc 44 D9: the quiet head episode — the full dispatcher episode
@@ -2709,9 +2879,17 @@ pub const Vm = struct {
         self.prepareNativeEpisode(closure, proto, base);
         ts.native_entries +%= 1;
         const result = nt.runCapturingLedger(regs, &ts.ledger_scratch, .{});
-        // What the predicate bought (empty arm registry ⇒ no fusion):
+        // What the predicate bought (no promoted sets ⇒ no silent state):
         std.debug.assert(result.silent_active == 0);
-        std.debug.assert(result.ledger_len <= 1);
+        // Doc 44 D10 (quiet v2): an armed `.sibling_handoff` slot fired —
+        // the whole chain is described by the multi-row ledger; the shared
+        // burst consumer owns validation, accounting, and resumption. May
+        // set `pending_sibling_arm` / penalty state, which correctly ends
+        // quietness for the NEXT entry.
+        if (result.ledger_len > 1) {
+            ts.last_exit_instr = result.exit_instr; // full-path diagnostic parity
+            return self.consumeHeadBurst(ct, ts.ledger_scratch[0..result.ledger_len], proto);
+        }
         std.debug.assert(result.final_trace_id == ct.id);
         std.debug.assert(result.exit_reason != .seed_hash_decline);
         if (result.exit_reason == .seed_capacity_decline) {
@@ -2738,6 +2916,11 @@ pub const Vm = struct {
             // Doc 44 D8: a completion by a NON-source sibling retires a
             // standing head-sibling want.
             ts.noteHeadSiblingCompletion(.{ .proto = ct.code.anchor.proto, .pc = ct.code.anchor.pc }, ct.id);
+            // Doc 44 D10: an earlier walk failer + this completion = one
+            // handoff observation. May set `pending_sibling_arm`, which
+            // correctly ends quietness for the NEXT entry (the arm needs
+            // the full path's selection-sited `tryArmSiblingHandoff`).
+            self.consumeHeadWalkFail(ct.id);
             return .{ .resume_tier0 = @intCast(term.aux) };
         }
         // Head guard-fail zero exit / prologue-fail — deopt to function entry.
@@ -2746,6 +2929,10 @@ pub const Vm = struct {
         // subsequent entries. `.next_candidate` feeds the D8 sibling walk.
         const local_done: usize = result.local_completed;
         ts.dbg("head zero-exit: trace={d} native={} reason={s} exit={d} completed={d}", .{ ct.id, true, @tagName(result.exit_reason), result.exit_instr, result.completed });
+        // Doc 44 D10: a REAL guard deopt (never a prologue-fail — that says
+        // nothing about the branch) records the walk-local handoff evidence.
+        if (result.exit_instr != std.math.maxInt(u32))
+            ts.head_walk_fail = .{ .trace_id = ct.id, .exit_instr = result.exit_instr };
         ts.noteTakenExit(ct, result.exit_instr, local_done, proto);
         ts.onSideExitReceipt(
             ct,
@@ -3055,6 +3242,20 @@ pub const Vm = struct {
                 nexcl += 1;
             }
 
+            // Doc 44 D10: fused head burst. MUST precede the scalar terminal /
+            // head-zero consumers below — they read only the TERMINAL body's
+            // scalars and would silently mis-consume a multi-row head ledger,
+            // dropping the intermediate rows' accounting and validation
+            // (round 4's factual correction). Loop-anchor multi-row ledgers
+            // still flow to `driveDispatcherLedger` further down.
+            if (ran_native and result.ledger_len > 1 and
+                trace.isHeadAnchorPc(ct.code.anchor.pc))
+            {
+                const d = self.consumeHeadBurst(ct, self.trace.ledger_scratch[0..result.ledger_len], proto);
+                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                return d;
+            }
+
             // 2.3b-1 (doc 17): every EXIT consumer below routes
             // through `final` (the trace that performed the final
             // native exit), not `ct` (the trace we entered). With no
@@ -3121,6 +3322,9 @@ pub const Vm = struct {
                 // exit) — the walk only reached this trace past the source's
                 // zero exit, so the failing path is covered now.
                 self.trace.noteHeadSiblingCompletion(.{ .proto = final.code.anchor.proto, .pc = final.code.anchor.pc }, final.id);
+                // Doc 44 D10: earlier walk failer + this completion = one
+                // handoff observation on the failer's exit.
+                self.consumeHeadWalkFail(final.id);
                 for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
                 return .{ .resume_tier0 = @intCast(term.aux) };
             }
@@ -3137,6 +3341,12 @@ pub const Vm = struct {
             // would re-dispatch the patch and spin).
             if (trace.isHeadAnchorPc(final.code.anchor.pc)) {
                 self.trace.dbg("head zero-exit: trace={d} native={} reason={s} exit={d} completed={d}", .{ final.id, ran_native, @tagName(result.exit_reason), result.exit_instr, result.completed });
+                // Doc 44 D10: a REAL native guard deopt records the walk-local
+                // handoff evidence (native-only, matching Part S — evidence
+                // from a tier-1a run would memo-reject on the uncompiled
+                // parent; prologue-fail carries no branch information).
+                if (ran_native and result.exit_instr != std.math.maxInt(u32))
+                    self.trace.head_walk_fail = .{ .trace_id = final.id, .exit_instr = result.exit_instr };
                 // Doc 44 D8: head guard fails DO accrue hot-exit hotness now —
                 // `noteTakenExit`'s head route raises the sibling want without
                 // ever unpatching (the pc-0 patch is the sole entry). A
@@ -3601,6 +3811,16 @@ pub const Vm = struct {
             .dead = &dead,
             .ndead = &ndead,
         };
+        // Doc 44 D10: fresh evidence channel per walk — a failer recorded by
+        // a PREVIOUS activation's walk must never pair with this walk's
+        // completion (the "different trace completed the SAME call" claim
+        // only holds within one walk). Same freshness rule for the burst
+        // visited scratch: stale ids from a prior activation's burst must
+        // not shrink THIS walk's candidate set.
+        if (is_head) {
+            self.trace.head_walk_fail = null;
+            self.trace.head_burst_visited_len = 0;
+        }
         // Doc 44 D9: quiet-first for heads — the lean episode when nothing
         // that could observe or steer it is live; the full path otherwise.
         var directive = if (is_head)
@@ -3610,6 +3830,12 @@ pub const Vm = struct {
                 self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx))
         else
             self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx);
+        // Doc 44 D10: a fused burst entered several owners — exclude them
+        // from re-selection this walk.
+        if (is_head) {
+            self.mergeHeadBurstVisited(visited[0..], &nvisited);
+            wctx.visited = visited[0..nvisited];
+        }
         // Doc 44 D8 (P1a): the head sibling walk. On a zero exit from the
         // incumbent, try the anchor's OTHER head traces — `nextTraceExcluding`
         // is the same deterministic selection the loop walk uses (highest
@@ -3637,6 +3863,9 @@ pub const Vm = struct {
                     self.enterHeadNativeQuiet(sib, nt, closure, proto, regs, base)
                 else
                     self.enterSelectedTrace(mode, sib, closure, proto, regs, base, pc, &wctx);
+                // Doc 44 D10: merge this entry's fused-burst owners too.
+                self.mergeHeadBurstVisited(visited[0..], &nvisited);
+                wctx.visited = visited[0..nvisited];
             }
             // Doc 44 D8: every candidate declined this activation — consume a
             // standing head-sibling want on the CURRENT activation (review

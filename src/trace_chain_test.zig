@@ -242,6 +242,88 @@ test "tryArmSiblingHandoff publishes complete Part-S bookkeeping" {
     try testing.expectEqual(@as(u64, 1), state.sibling_handoff_arms);
 }
 
+test "arm validator (doc 44 D10): head-anchored parents carry ONLY .sibling_handoff arms, and head arms refuse hash-seeded children" {
+    // The durable invariant, enforced at the single arm funnel: a head slot's
+    // fused ledger grammar is the closed sibling-handoff burst — any other
+    // arm kind on a head parent would smuggle a row shape `consumeHeadBurst`
+    // cannot replay. The `.sibling_handoff` positive case proves the head
+    // rejections are the kind checks, not some other validator line; the
+    // hash-seeded child refusal keeps `seed_hash_decline` (whose consumer
+    // needs the tier-1a rerun machinery) out of the burst grammar at ARM time.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.registry.cache.clearRetainingCapacity(); // stack-backed traces
+
+    const proto = Proto{
+        .code = &.{Instr.op0(.ret)},
+        .name = "head-arm-validator",
+        .num_registers = 1,
+    };
+    const parent_instrs = [_]IrInstr{
+        .{ .op = .guard_true, .aux = 1 },
+        .{ .op = .terminal },
+    };
+    const parent_slots = try gpa.alloc(usize, parent_instrs.len);
+    defer gpa.free(parent_slots);
+    defer state.disarmAllLinks(); // registry borrows fixture slot storage
+    @memset(parent_slots, 0);
+
+    var parent: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = trace.FUNC_HEAD_PC },
+            .instrs = @constCast(&parent_instrs),
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 51,
+        .native = .{ .compiled = .{ .page = undefined, .slots = parent_slots, .gpa = gpa } },
+    };
+    var child: Trace = .{
+        .code = .{
+            .anchor = parent.code.anchor,
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 52,
+        .native = .{ .compiled = .{
+            .page = undefined,
+            .gpa = gpa,
+            .ordinary_entry = 0xBEEF,
+        } },
+    };
+    try state.registry.cache.append(gpa, &parent);
+    try state.registry.cache.append(gpa, &child);
+
+    // Every non-handoff kind is refused on a head parent. (`.loop_done_linked`
+    // is untestable here: its shape assert fires first in debug — a head
+    // guard is never loop-done by D1 — and the release path fails closed on
+    // the same check.)
+    try testing.expect(!(try state.armNativeLink(&parent, 0, &child, .ordinary_guard)));
+    try testing.expect(!(try state.armNativeLink(&parent, 0, &child, .link_terminal)));
+    try testing.expect(!(try state.armNativeLink(&parent, 0, &child, .region_bridge)));
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
+
+    // A hash-seeded child is refused for a HEAD handoff arm specifically.
+    child.native.compiled.has_hash_seed = true;
+    try testing.expect(!(try state.armNativeLink(&parent, 0, &child, .sibling_handoff)));
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
+
+    // With the hash seed gone the same head arm publishes — proving the
+    // rejections above were the D10 checks, not an unrelated validator line.
+    child.native.compiled.has_hash_seed = false;
+    try testing.expect(try state.armNativeLink(&parent, 0, &child, .sibling_handoff));
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.armed_links.items.len);
+    const link = state.registry.native_physical.armed_links.items[0];
+    try testing.expectEqual(ArmKind.sibling_handoff, link.kind);
+    try testing.expect(link.parent == &parent);
+    try testing.expect(link.child == &child);
+    try testing.expectEqual(@as(usize, 0xBEEF), parent_slots[0]);
+}
+
 // ---------------------------------------------------------------------------
 // Doc 22 §B.3 / §B.6 (Phase B-iii): driveChain's TIER-1A walk seeds a seeded
 // successor through the episode ctx's seeding twin before `irinterp.execute`.

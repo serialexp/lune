@@ -21,6 +21,68 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-08i — doc 44 D10 (P4 slice 1: head-sibling exit-branch patching) implemented
+
+The D9 residual: every fib LEAF call still paid incumbent-A quiet entry →
+base-guard zero exit → penalty insert → sibling-B FULL episode → terminal →
+penalty remove (accountRegionProfit still 12%, enterSelectedTrace 7%). D10
+removes the round-trip by admitting head anchors to the existing Part-S
+`.sibling_handoff` machine: A's armed branch-guard exit now jumps STRAIGHT
+into B's native page (flush carried homes → ledger row → jmp ordinary_entry),
+one episode for the whole call. Design: doc 44 §D10, codex round-4 reviewed
+(sound-with-changes, 5 changes folded — see review ledger round 4).
+
+Landed (all per the round-4-amended design):
+- **Arm validator (trace_link.zig `arm()`)**: head parents rejected in every
+  non-`.sibling_handoff` branch (durable invariant at the single funnel);
+  head handoff arms refuse hash-seeded children (`has_hash_seed`) so
+  `seed_hash_decline` never enters the fused head grammar.
+- **`siblingHandoffEligible`**: head parents additionally require exit
+  provenance = real guard, role `.branch_cond`, inline depth 0 (shape-only
+  `isSourceBranchGuardExit` can misclassify inlined guards on heads).
+- **Evidence channel**: `TraceState.head_walk_fail: ?ExitKey`, reset at each
+  `enterPatchedTrace` head walk, set only by real NATIVE head guard deopts
+  (both scalar consumers + fused final deopt row), consumed at terminal
+  completions (`consumeHeadWalkFail` → `noteSiblingTerminal(failer, exit)`);
+  arm publishes via the existing entry-sited `tryArmSiblingHandoff`.
+- **`consumeHeadBurst`** (interp.zig): shared by quiet + full paths, keyed on
+  `ran_native and ledger_len > 1 and isHeadAnchorPc(ct)` BEFORE the scalar
+  head consumers (round 4's factual correction — the scalars would silently
+  mis-consume a fused ledger). Release-mode per-row validation (owner
+  resolves, head anchor, intermediate rows `.deopt/.normal` with
+  `hasArmedSiblingHandoff` adjacency, `.yielded` only as full-cap last row;
+  violations `@panic`). Accounting: intermediates get `accountTraceRun` +
+  `accountCandidateCharge(.entered)` (refusal-streak reset), NO zero receipt,
+  NO hot-exit charge; final row runs verbatim scalar semantics per kind
+  (head_terminal / zero-exit / yielded / prologue_fail / capacity-decline).
+  Burst owners merge into the walk's visited via `head_burst_visited` scratch
+  (dedup; overflow → walk cap branch owns truncation).
+- **Quiet predicate v2**: global `armedLinks().len == 0` line dropped (also
+  un-starves the quiet path in any program with armed loop links — Z-6);
+  burst results route to `consumeHeadBurst`; scalar asserts retained.
+- Verified: no disarm window exists between the native run and the burst
+  consumer on either path (drainSilentResult early-outs on silent_active==0,
+  provenance drains only arm `.region_bridge` which head slots now refuse),
+  so the adjacency panic cannot fire spuriously.
+
+Tests: validator head-rejection + hash-seed-refusal unit test
+(trace_chain_test.zig), arm-formation e2e asserting an armed head-parent
+`.sibling_handoff` after warmup (interp_trace_test.zig, native-gated), ten-leg
+output-equality pin at hotguard=5. Gates: `zig build test` plain +
+`-Djit-debug=true`, hashgate 84×2 ok (NB: output-equality claim — D10 is NOT
+byte-identical-by-construction; it changes tiering/receipt streams on native
+legs), wasm, viz 69, boundaries.
+
+Board (20260908-141114-710cb25 vs D9's 20260908-131454): **fib jit 442→317 ms**
+(45.2× LJ, res 43.5→46.3), binary-trees ~flat 362→368, everything else within
+noise (spectral 30.2→33.4 and sor 79→83 look like ordinary run-to-run wobble —
+neither has head anchors in play; recheck next board).
+
+NEXT: re-profile fib (what's left of the episode share now that A→B fuses?) →
+then the remaining arc ladder: P4 native frame push (true up-recursion, the
+per-call turnstile itself), P1 recunroll, P1a follow-up matrix tests, P2 RETF
+decision, P3 down-recursion.
+
 ## Status 2026-09-08h — doc 44 D9 (P1b quiet head episode + S1/S4) implemented
 
 Profile receipt (fib 31, house recipe): native [JIT] 6.4% of cycles, episode
