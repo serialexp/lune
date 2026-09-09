@@ -21,6 +21,86 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## D12c final verification — ready to land
+
+Native return/continuation/call-head links and general one-shot value snapshots
+are implemented. Final28-program seven-rep board:
+`bench/results/20260909-155852-06bab1b.tsv` — every cross-tier check passes;
+fib185.739ms vs402.8baseline, binary-trees394.681ms vs425.7baseline.
+Plain tests, jit-debug tests, hashgate84×2 and wasm/viz69 pass. Added witnessed
+mixed-chain cap cuts and ten-leg changed-return-type/pcall-overflow/recovery
+coverage; the overflow fixture uses1000 so its first n-2 descent exceeds the
+200-frame wall BEFORE exponential work. K4 retention/rearm/child-teardown tests
+pass. Audit fixed arm retries after failed publication/disarm and call-head
+hotguard threshold; capacity diagnostics use jitdbg, no temporary debug prints.
+Doc44 records final-row motion grammar and first-observation bounded watch
+selection explicitly. Binary-trees still needs general new_table and nil-child
+get_index recording breadth; those are next-arc work, not native link failures.
+Unrelated gc/wasm/viz working-tree edits are excluded from this commit.
+
+## D12c continuation — historical implementation handoff
+
+D12c stages 2/3 are being implemented; **not validated or complete**.
+Registry physical-slot/key separation, retained K=4 key storage, native return
+compare-chain/downshift, cont push/call-head emission, pending arms, frame-motion
+ledger consumers and statistics witnesses are now present. General boxed
+pass-through was added with source-tag snapshots in bounded spill space,
+parallel swap/fanout/write-only tests, guard-failure preservation, typed-use
+rejection, and x64 low-byte REX tests.
+
+**Direct implementation resumed after Bart stopped delegation. Gates now pass:**
+`just test` (1289 tests plus boundaries), jit-debug tests, hashgate84×2,
+wasm build, viz69. Fixed actual pending-arm starvation in `headEpisodeQuiet`
+(the worker changed a different quiet predicate); fixed 64-bit native reads
+of u32 resume PCs/keys via `movRegMem32`; accepted full-cap yielded ret/pop
+and call/push finals; resumed cont deopt/prologue/seed failure at the owner's
+actual entry PC rather than head-only pc0. Stopped cap cuts from requesting
+redundant call-head arms. Replaced temporary test debug prints with `trace.dbg`.
+Focused fib formation now proves all4 native traces and both link kinds firing
+(observed17420 return hits/10580 call hits at test size before redundant-arm fix).
+
+7-rep post-change measurements: fib189.3ms vs402.8baseline; btrees441.0ms vs
+425.7baseline. Result files20260909-110116-06bab1b.tsv and
+20260909-110126-06bab1b.tsv. **Btrees not resolved:** required jit-stats run
+shows0 native pops/0 return links,1 call-head arm/655902hits and656622 tier1a
+entries. Receipt `/tmp/mahina-d12c-receipts/after-btrees-stats.txt`. Investigate
+why its return path remains unsupported/refused before claiming D12c payoff
+there. **Follow-up direct pass:** terminal-terminated roots now keep immutable
+entry homes independent of outgoing snapshot kinds (no loop-carried type
+restriction). This admits ItemCheck's int→table register reuse; all2647623
+trace entries are now native. Btrees421.3ms (7reps,
+20260909-114902-06bab1b.tsv),2 call-head arms/1311804hits, still0pops.
+Return coverage is blocked before lowering: dump-aborts shows BottomUpTree
+base head and return continuation abort `new_table nyi_opcode`; ItemCheck
+base head aborts `get_index bad_type` (nil child). Receipts `/tmp/btrees-aborts.txt`
+and `/tmp/btrees-d12-after.txt`. These are recorder breadth gaps, not failed
+return-link publication. Added tests for one-shot incoming/outgoing type
+separation and physical K4 retained keys/fifth refusal/rearm/child teardown;
+fixed patch_emissions allocation-failure leak. `just test`, jit-debug tests,
+and hashgate84×2 pass after this pass. Explicit cap-yield/linked-prologue and
+fused safety tests plus full implementation/design audit still outstanding.
+Independent reviews are recorded under `/tmp/mahina-d12c-receipts/`.
+No completion claim applies to these uncommitted changes.
+
+Fresh baseline at 06bab1b: `just bench --filter recursive-fib --reps 7`
+402.8 ms; binary-trees 425.7 ms. Results are
+`bench/results/20260909-074402-06bab1b.tsv` and
+`bench/results/20260909-074412-06bab1b.tsv`. Profile/stats receipts live in
+`/tmp/mahina-d12c-receipts/`. Baseline viz tests: 69 passed.
+
+**Discovered prerequisite, must not omit:** fib's first continuation
+(`fib:2147483660`, trace #2) is native-unsupported because an unguarded
+`slot_load r3` is copied through a slot-bound phi to r2 before the second
+self-call terminal. `nativegen.proveKinds` rejects the untyped load. The value
+is arbitrary boxed data, merely passed through here. Add general, use-gated
+opaque tag+payload pass-through lowering (or equivalent terminal snapshot
+copy), not a guessed int/heap specialization. Test tag/payload preservation,
+rejection of unguarded typed uses, and native compilation of all four fib
+traces. This blocks the central ret_cont→cont-1→call_head cycle otherwise.
+The baseline's 100% traced residency includes 2,178,196 tier-1a entries;
+`perf` attributes 18.27% to `irinterp.executeCtx`. Diagnostics attribution is
+noted separately in TODO.md.
+
 ## Status 2026-09-08l — doc 44 D12b (continuation anchors) LANDED — regression carried openly
 
 D12b implemented per the committed round-6 design (73af1d3): post-call

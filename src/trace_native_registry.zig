@@ -27,10 +27,18 @@ pub const ArmKind = enum {
     /// ordinary-guard slot and stub verbatim; only the arm kind and the replay
     /// production are new.
     sibling_handoff,
+    /// Return-page dynamic resume-PC slot (four per compiled page).
+    ret_cont,
+    /// Continuation-page self-call slot into the proto head page.
+    call_head,
 };
 pub const NativeLink = struct {
     parent: *Trace,
+    /// Logical key: IR exit for ordinary links; resume PC for `.ret_cont`;
+    /// terminal IR index for `.call_head`.
     slot_index: u32,
+    /// Actual cell in `CompiledTrace.slots`, kept separate from the logical key.
+    physical_slot: u32 = std.math.maxInt(u32),
     child: *Trace,
     /// A-vii-d.1: the arm kind is part of the record so replay can validate a
     /// `.region_bridge` row against the exact provenance that armed it (review
@@ -101,6 +109,13 @@ pub fn originalRel32Target(compiled: *const nativegen.CompiledTrace, patch: *con
     const next = @intFromPtr(compiled.page.code.ptr) + patch.patch_off + 5;
     return @intCast(@as(i128, @intCast(next)) + disp);
 }
+fn physicalSlot(link: NativeLink) u32 {
+    return if (link.physical_slot == std.math.maxInt(u32)) link.slot_index else link.physical_slot;
+}
+
+// Transition keys are page-lifetime allocation metadata, not arm state. A
+// disarm resets only the executable target; retaining the first four distinct
+// resume PCs makes allocation deterministic and prevents eviction-by-disarm.
 pub fn clearSiblingLatch(link: NativeLink) void {
     if (link.kind != .sibling_handoff) return;
     link.parent.sibling_arms -|= 1;
@@ -401,9 +416,10 @@ pub const NativePhysicalRegistry = struct {
             });
             clearSiblingLatch(link);
             if (link.child == t and link.parent != t) {
+                const p = physicalSlot(link);
                 switch (link.parent.native) {
-                    .compiled => |*c| if (link.slot_index < c.slots.len) {
-                        const prepared = self.prepareSlotMutation(arena, link.parent, link.slot_index, .retire) catch
+                    .compiled => |*c| if (p < c.slots.len) {
+                        const prepared = self.prepareSlotMutation(arena, link.parent, p, .retire) catch
                             @panic("resetLinksTouching: invalid native slot mutation");
                         self.commitSlotMutation(prepared, shared_exit);
                     },
@@ -430,9 +446,10 @@ pub const NativePhysicalRegistry = struct {
         const shared_exit = arena.*.trampoline_exit orelse 0;
         for (self.armed_links.items) |link| {
             clearSiblingLatch(link);
+            const p = physicalSlot(link);
             switch (link.parent.native) {
-                .compiled => |*c| if (link.slot_index < c.slots.len) {
-                    const prepared = self.prepareSlotMutation(arena, link.parent, link.slot_index, .disarm_all) catch
+                .compiled => |*c| if (p < c.slots.len) {
+                    const prepared = self.prepareSlotMutation(arena, link.parent, p, .disarm_all) catch
                         @panic("disarmAllLinks: invalid native slot mutation");
                     self.commitSlotMutation(prepared, shared_exit);
                 },
@@ -449,9 +466,10 @@ pub const NativePhysicalRegistry = struct {
         self.native_link_disarms +|= 1;
         clearSiblingLatch(link);
         const shared_exit = arena.*.trampoline_exit orelse 0;
+        const p = physicalSlot(link);
         switch (link.parent.native) {
-            .compiled => |*c| if (link.slot_index < c.slots.len) {
-                const prepared = self.prepareSlotMutation(arena, link.parent, link.slot_index, .disarm_one) catch
+            .compiled => |*c| if (p < c.slots.len) {
+                const prepared = self.prepareSlotMutation(arena, link.parent, p, .disarm_one) catch
                     @panic("disarmLinkAt: invalid native slot mutation");
                 self.commitSlotMutation(prepared, shared_exit);
             },
@@ -565,7 +583,27 @@ pub const NativePhysicalRegistry = struct {
             .compiled => |*cc| cc,
             else => return .declined,
         };
-        if (slot_index >= c.slots.len) return .declined;
+        const ir_slots: u32 = @intCast(parent.code.instrs.len);
+        var physical_slot: u32 = slot_index;
+        switch (kind) {
+            .ret_cont => {
+                if (c.ret_cont_keys.len != nativegen.RET_CONT_SLOTS) return .declined;
+                var free: ?u32 = null;
+                for (c.ret_cont_keys, 0..) |key, i| {
+                    if (key == slot_index) {
+                        physical_slot = ir_slots + @as(u32, @intCast(i));
+                        free = null;
+                        break;
+                    }
+                    if (key == std.math.maxInt(u32) and free == null) free = @intCast(i);
+                } else if (free) |i| {
+                    physical_slot = ir_slots + i;
+                } else return .declined;
+            },
+            .call_head => physical_slot = ir_slots + @as(u32, nativegen.RET_CONT_SLOTS),
+            else => {},
+        }
+        if (physical_slot >= c.slots.len) return .declined;
         const child_c = switch (child.native) {
             .compiled => |*cc| cc,
             else => return .declined,
@@ -582,7 +620,8 @@ pub const NativePhysicalRegistry = struct {
         // most one record exists per (parent, slot_index) — this loop guarantees
         // it — the first match is the only match.
         for (self.armed_links.items) |*l| {
-            if (l.parent == parent and l.slot_index == slot_index) {
+            const existing_physical = if (l.physical_slot == std.math.maxInt(u32)) l.slot_index else l.physical_slot;
+            if (l.parent == parent and existing_physical == physical_slot) {
                 // B-3d.1 R6 (doc 17 §B3.18, the convergent round-2 MAJOR): an
                 // IDENTICAL re-publication — same child, same kind, same slot
                 // target — is a no-op on the physical state and must not reach
@@ -597,7 +636,7 @@ pub const NativePhysicalRegistry = struct {
                 // short-circuiting the clear would leak the latch +1 per
                 // identical republication (the codex post-landing blocker this
                 // branch's comment memorializes).
-                if (l.child == child and l.kind == kind and c.slots[slot_index] == target and
+                if (l.child == child and l.kind == kind and c.slots[physical_slot] == target and
                     kind != .sibling_handoff)
                 {
                     // Refresh proof metadata within the publication owner, including
@@ -618,9 +657,9 @@ pub const NativePhysicalRegistry = struct {
                 // Convergence sites re-publish an identical relation on every
                 // terminal observation. Keep that from breaking the consecutive
                 // detection streak; a changed relation invalidates the candidate.
-                if (l.child != child or l.kind != kind or c.slots[slot_index] != target)
+                if (l.child != child or l.kind != kind or c.slots[physical_slot] != target)
                     self.resetPromotionCandidate();
-                const prepared = self.prepareSlotMutation(arena, parent, slot_index, .rearm) catch return .declined;
+                const prepared = self.prepareSlotMutation(arena, parent, physical_slot, .rearm) catch return .declined;
                 // A re-arm can displace a provenance-published sibling arm with
                 // a different kind/child — re-open publication so the drain can
                 // re-evaluate the surviving edges at the next safe point. And
@@ -636,6 +675,7 @@ pub const NativePhysicalRegistry = struct {
                     clearSiblingLatch(l.*);
                 l.child = child;
                 l.kind = kind;
+                l.physical_slot = physical_slot;
                 l.region_id = region_id;
                 l.armed_gen = armed_gen;
                 l.bridge_edge = null; // drop the replay memo with the old child
@@ -651,8 +691,9 @@ pub const NativePhysicalRegistry = struct {
         // Fresh slot: append the record BEFORE writing the slot, so a failed append
         // leaves the slot at its prior `shared_exit` value with no dangling record.
         self.resetPromotionCandidate();
-        const prepared = self.prepareSlotMutation(arena, parent, slot_index, .arm) catch return .declined;
-        try self.armed_links.append(self.gpa, .{ .parent = parent, .slot_index = slot_index, .child = child, .kind = kind, .region_id = region_id, .armed_gen = armed_gen });
+        const prepared = self.prepareSlotMutation(arena, parent, physical_slot, .arm) catch return .declined;
+        try self.armed_links.append(self.gpa, .{ .parent = parent, .slot_index = slot_index, .physical_slot = physical_slot, .child = child, .kind = kind, .region_id = region_id, .armed_gen = armed_gen });
+        if (kind == .ret_cont) c.ret_cont_keys[physical_slot - ir_slots] = slot_index;
         if (self.armed_links.items.len > self.native_link_peak) self.native_link_peak = self.armed_links.items.len;
         self.commitSlotMutation(prepared, target);
         self.dbg("arm: parent id={d} pc={d} slot={d} -> child id={d} pc={d} kind={s}", .{
@@ -688,6 +729,47 @@ pub const NativePhysicalRegistry = struct {
         self.promoted_sets.deinit(self.gpa);
     }
 };
+
+test "frame link physical cells disarm without recycling the first four return keys" {
+    var arena = nativegen.McodeArena.init(std.testing.allocator);
+    defer arena.deinit();
+    var registry = NativePhysicalRegistry.init(std.testing.allocator);
+    defer registry.deinit(&arena);
+    var proto: @import("bytecode.zig").Proto = .{ .code = &.{} };
+    var instrs = [_]@import("trace_ir.zig").IrInstr{.{ .op = .terminal }};
+    var slots = [_]usize{ 0, 0, 0, 0, 0, 0 };
+    const unset = std.math.maxInt(u32);
+    var keys = [_]u32{ unset, unset, unset, unset };
+    var parent: Trace = .{
+        .id = 100,
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} },
+        .native = .{ .compiled = .{ .page = undefined, .gpa = std.testing.allocator, .slots = &slots, .ret_cont_keys = &keys } },
+    };
+    var child: Trace = .{
+        .id = 101,
+        .code = .{ .anchor = parent.code.anchor, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} },
+        .native = .{ .compiled = .{ .page = undefined, .gpa = std.testing.allocator, .ordinary_entry = 0xCAFE } },
+    };
+    // No executable code is needed: the physical owner mutates data cells only.
+    for (0..4) |i| {
+        const pc: u32 = @intCast(1000 + i);
+        try std.testing.expect(try registry.publishValidatedLink(&arena, .{ .parent = &parent, .child = &child, .slot_index = pc, .kind = .ret_cont }) == .changed);
+        try std.testing.expect(keys[i] == pc and slots[i + 1] == 0xCAFE);
+    }
+    try std.testing.expect(slots[0] == 0);
+    registry.disarmAllLinks(&arena);
+    for (slots) |target| try std.testing.expect(target == 0);
+    for (keys, 0..) |pc, i| try std.testing.expect(pc == 1000 + i);
+    try std.testing.expect(try registry.publishValidatedLink(&arena, .{ .parent = &parent, .child = &child, .slot_index = 2000, .kind = .ret_cont }) == .declined);
+    try std.testing.expect(try registry.publishValidatedLink(&arena, .{ .parent = &parent, .child = &child, .slot_index = 1002, .kind = .ret_cont }) == .changed);
+    try std.testing.expect(slots[3] == 0xCAFE);
+    try std.testing.expect(try registry.publishValidatedLink(&arena, .{ .parent = &parent, .child = &child, .slot_index = 0, .kind = .call_head }) == .changed);
+    try std.testing.expect(slots[5] == 0xCAFE);
+    registry.resetLinksTouching(&arena, &child);
+    for (slots) |target| try std.testing.expect(target == 0);
+    for (keys, 0..) |pc, i| try std.testing.expect(pc == 1000 + i);
+    try std.testing.expect(registry.armedLinks().len == 0);
+}
 
 test "native owner barrier cancels policy arm even with no live links" {
     var arena = nativegen.McodeArena.init(std.testing.allocator);

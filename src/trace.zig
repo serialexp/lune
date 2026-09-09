@@ -980,6 +980,11 @@ pub const TraceState = struct {
     /// successful same-anchor trace entry — so the armed child is the trace the
     /// deterministic dispatch actually ran, never a hit-count guess made here.
     pending_sibling_arm: ?ExitKey = null,
+    /// Returning owner + dynamic caller resume PC; consumed only when that
+    /// continuation page is actually selected by the dispatcher.
+    pending_ret_cont_arm: ?ExitKey = null,
+    /// A continuation self-call terminal awaiting entry of the proto head page.
+    pending_call_head_arm: ?ExitKey = null,
     /// Doc 44 D10: WALK-LOCAL evidence channel for head sibling-handoff arming.
     /// A head episode's zero-exit (real guard deopt, `completed == 0`) records
     /// the failing `(trace, exit)` here; when a LATER trace in the SAME
@@ -1145,6 +1150,12 @@ pub const TraceState = struct {
     /// POP_OK) — the pop's formation witness, symmetric to `self_call_pushes`.
     /// No tiering path reads it.
     self_ret_pops: u64 = 0,
+    ret_cont_link_arms: u64 = 0,
+    ret_cont_link_hits: u64 = 0,
+    call_head_link_arms: u64 = 0,
+    call_head_link_hits: u64 = 0,
+    /// Observation-only witness: full ledgers returning from frame-motion chains.
+    frame_link_cap_yields: u64 = 0,
     /// 2.3b-1 (doc 17): count of `.link`-terminal slots actually armed in
     /// `driveChain` — a continuation `C`'s `.link` slot pointed straight at its inner
     /// root `I`'s `linked_entry`, so the next `C.run` fuses into `I` under the shared
@@ -1526,6 +1537,13 @@ pub const TraceState = struct {
     /// paste into tests. Same double gate as `dbg`.
     /// Part S: does an armed `.sibling_handoff` link exist for exactly this
     /// (parent, exit) → child triple? The replay-side proof of the arm.
+    pub fn hasArmedFrameLink(self: *const TraceState, parent: *const Trace, key: u32, child: *const Trace, kind: ArmKind) bool {
+        for (self.registry.native_physical.armedLinks()) |l| {
+            if (l.kind == kind and l.parent == parent and l.slot_index == key and l.child == child) return true;
+        }
+        return false;
+    }
+
     pub fn hasArmedSiblingHandoff(self: *const TraceState, parent: *const Trace, exit_instr: u32, child: *const Trace) bool {
         // Fast reject: `sibling_arms` counts this parent's armed handoffs and is
         // maintained by every arm/disarm path, so `== 0` is an exact necessary
@@ -1681,6 +1699,56 @@ pub const TraceState = struct {
     /// Part S: consume a pending arm request now that the dispatcher has actually
     /// selected and entered `child`. The armed target is therefore the trace the
     /// deterministic dispatch ran — `hit_count` never enters the contract.
+    pub fn noteRetContTransition(self: *TraceState, owner: *Trace, resume_pc: u32) void {
+        if (self.pending_ret_cont_arm != null) return;
+        var free: ?usize = null;
+        for (&owner.ret_cont_watch_pcs, 0..) |*pc, i| {
+            if (pc.* == resume_pc) {
+                owner.ret_cont_watch_counts[i] +|= 1;
+                if (owner.ret_cont_watch_counts[i] >= self.config.hotguard) {
+                    owner.ret_cont_watch_counts[i] = 0;
+                    self.pending_ret_cont_arm = .{ .trace_id = owner.id, .exit_instr = resume_pc };
+                }
+                return;
+            }
+            if (free == null and pc.* == std.math.maxInt(u32)) free = i;
+        }
+        // K distinct PCs are retained for the page lifetime. A fifth is a
+        // deterministic plain miss: no eviction and no displaced evidence.
+        const i = free orelse {
+            self.dbg("ret-cont watch capacity: owner={d} resume={d} cap={d}", .{ owner.id, resume_pc, nativegen.RET_CONT_SLOTS });
+            return;
+        };
+        owner.ret_cont_watch_pcs[i] = resume_pc;
+        owner.ret_cont_watch_counts[i] = 1;
+        if (self.config.hotguard == 1)
+            self.pending_ret_cont_arm = .{ .trace_id = owner.id, .exit_instr = resume_pc };
+    }
+
+    pub fn tryArmFrameLinks(self: *TraceState, child: *Trace, safe_to_arm: bool) void {
+        if (!safe_to_arm) return;
+        if (self.pending_ret_cont_arm) |key| {
+            if (self.traceById(key.trace_id)) |parent| {
+                if (child.code.anchor.proto == parent.code.anchor.proto and
+                    child.code.anchor.pc == contAnchorPc(key.exit_instr))
+                {
+                    self.pending_ret_cont_arm = null;
+                    if (self.armNativeLink(parent, key.exit_instr, child, .ret_cont) catch false)
+                        self.ret_cont_link_arms +|= 1;
+                }
+            } else self.pending_ret_cont_arm = null;
+        }
+        if (self.pending_call_head_arm) |key| {
+            if (self.traceById(key.trace_id)) |parent| {
+                if (child.code.anchor.proto == parent.code.anchor.proto and anchorKind(child.code.anchor.pc) == .head) {
+                    self.pending_call_head_arm = null;
+                    if (self.armNativeLink(parent, key.exit_instr, child, .call_head) catch false)
+                        self.call_head_link_arms +|= 1;
+                }
+            } else self.pending_call_head_arm = null;
+        }
+    }
+
     pub fn tryArmSiblingHandoff(self: *TraceState, child: *Trace, safe_to_arm: bool) void {
         const key = self.pending_sibling_arm orelse return;
         if (!safe_to_arm) return; // keep pending; observation window owns the slot
@@ -3610,6 +3678,7 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
     try w.print("    trace entries:        {d} (native bodies: {d})\n", .{ ts.entries, ts.native_entries });
     try w.print("    self-call pushes:     {d} (doc 44 D11 native descents)\n", .{ts.self_call_pushes});
     try w.print("    self-ret pops:        {d} (doc 44 D12c native unwinds)\n", .{ts.self_ret_pops});
+    try w.print("    frame links:          ret-cont arms={d} hits={d}; call-head arms={d} hits={d}\n", .{ ts.ret_cont_link_arms, ts.ret_cont_link_hits, ts.call_head_link_arms, ts.call_head_link_hits });
     try w.print("    link arms:            native={d} source={d} loopdone={d} bridge={d}\n", .{ ts.native_link_arms, ts.native_source_link_arms, ts.native_loopdone_link_arms, ts.native_region_bridge_arms });
     try w.print("    bridge arm attempts:  {d} (pipeline runs; vs {d} arms)\n", .{ ts.native_region_bridge_arm_attempts, ts.native_region_bridge_arms });
     try w.print("    link fused:           source={d} loopdone={d} bridge={d}\n", .{ ts.native_source_link_fused, ts.native_loopdone_link_fused, ts.native_region_bridge_fused });

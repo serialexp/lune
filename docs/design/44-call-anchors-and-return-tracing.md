@@ -3,13 +3,12 @@
 Status: partial — P0 complete, P1a (D8 head siblings), P1b (D9 quiet head
 episode + S1/S2/S4), P4 slice 1 (D10 head-sibling exit-branch patching), P4
 slice 2 (D11 native frame push — true up-recursion on the descent side), and
-§D12 slices a+b landed. D12b (continuation anchors) forms and enters cont
-traces at 100% residency on every resume anchor (fib 3/3, btrees 5 anchors)
-— but each entry is a full native episode that terminals out immediately
-(iters/entry ~1), so the UNLINKED toll regresses fib 262→414 ms and btrees
-288→450 ms. That toll is exactly what D12c (native frame pop +
-`.ret_cont`/`.call_head` links; subsumes P3, supersedes P2-for-recursion)
-removes — it is the next slice, not an open question.
+§D12 slices a+b+c implemented. D12c closes the native push/pop cycle through
+continuation and call-head links. The final seven-rep board measures fib
+185.7 ms (pre-D12c 402.8 ms) and binary-trees 394.7 ms (425.7 ms).
+Binary-trees still has no native pops: its table-construction and nil-child
+base-case recorder gaps prevent the required return traces from forming.
+Remaining P1/P2/P4 work below is not claimed complete.
 Codex-reviewed ×6 (gpt-5.6-sol, all sound-with-changes, every required change
 folded; ledger at bottom)
 Owner: Bart
@@ -265,6 +264,18 @@ to Done once everything inside a phase is checked.
       arc). All gates green (both test builds, hashgate 84×2, wasm,
       viz 69, boundaries).
 
+- [x] **D12c — native return and call-head links.** Four retained physical
+      return-key slots and one call-head cell, registry-owned disarm/retirement,
+      deterministic hotguard evidence/retries, ordinary-entry reseeding and
+      live-registry ledger adjacency. Frame-motion consumers reload the current
+      activation and use the final owner's exact entry PC on failure. Capacity
+      cuts, native link formation, key retention/fifth refusal, changed return
+      types, protected overflow/recovery and ten-leg GC equivalence are tested.
+      General prerequisites: boxed tag/payload pass-through with parallel tag
+      snapshots, and immutable entry homes for terminal one-shot roots independent
+      of outgoing register kinds. Plain/jit-debug tests, hashgate84×2, wasm/viz69
+      and full28-program board pass. Board:20260909-155852-06bab1b.tsv.
+
 ### Outstanding
 - [ ] **Phase 1a follow-ups.** Remaining review-round-2 matrix tests
       (want-during-recording, sibling abort/cooldown retry,
@@ -280,12 +291,9 @@ to Done once everything inside a phase is checked.
       patch out in 4 consecutive `.next_candidate`s (`patch_strikes`), and
       since a retired head never re-arms (hasTrace blocks `onCallEntry`,
       installs only at commit) coverage collapses to 0 for those inputs.
-- [ ] **D12c — native frame pop + return links (down-recursion).** The
-      `.terminal(return_interp)` native lowering pops the episode's own
-      pushed frames (opCall-symmetric helper, entry-frame floor) and
-      armed cross-page links chain pop→continuation and cont-self-call→
-      head-descent, LEDGER_CAP-bounded. Subsumes Phase 3; the payoff
-      slice.
+- [ ] **Return recording breadth.** Binary-trees base-case/return paths abort
+      on `new_table` (BottomUpTree) and nil-child `get_index` (ItemCheck).
+      Native link infrastructure does not substitute for these missing traces.
 - [ ] **Phase 2 — RETF return tracing. SUPERSEDED for the recursion/return
       shape by §D12** (real-frame pop over single-frame traces needs no
       two-frame recording ABI, no modeled upvalue close, no multi-result
@@ -1434,6 +1442,18 @@ frames):
   through cont-2 up the tree — tier-0 touched once per LEDGER_CAP rows.
   The episode-entry block (~25%) amortizes across the cap; opRet/opCall
   and the per-call seed prologue leave the profile for covered shapes.
+
+**Implementation clarification (D12c).** A committed push/pop miss uses a
+final `.call_push`/`.ret_pop` row rather than pretending the unexecuted terminal
+still belongs to the new top frame. Intermediate rows of those kinds require
+a live matching link; final rows resume the actual top frame (pc0 after push,
+frozen caller cursor after pop), including full-cap cuts. Return keys and
+bounded hot watches retain the first four observed PCs for the page lifetime;
+disarm clears targets, not keys. This differs from the proposed first-four-to-
+threshold ordering above, keeping hot-path evidence allocation-free. Saturated
+miss observations retry arming deterministically, and capacity refusal logs
+through jitdbg. The observer-only cap-yield counter pins that tests exercise
+mixed-chain cuts, not merely output-equivalent unlinked episodes.
 
 **Determinism, GC, replay (whole section).** The §R1-5 bypass set is
 untouched — replay/suspend/exec-log/safepoint legs never reach a patched

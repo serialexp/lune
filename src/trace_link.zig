@@ -736,6 +736,7 @@ pub fn patchKindForArm(kind: ArmKind) ?nativegen.ExitPatchKind {
         .link_terminal => .link_terminal,
         .loop_done_linked => .loop_done_linked,
         .region_bridge => .region_bridge,
+        .ret_cont, .call_head => null,
     };
 }
 
@@ -817,16 +818,17 @@ pub fn promotedEdgeFromLink(self: *TraceState, link: NativeLink) ?PromotedEdge {
     // `prepareNativeEpisode`). Entry kind mirrors the target switch below.
     if (!self.stubEnterable(link.child, switch (link.kind) {
         .link_terminal => .linked,
-        .ordinary_guard, .loop_done_linked, .sibling_handoff, .region_bridge => .ordinary,
+        .ordinary_guard, .loop_done_linked, .sibling_handoff, .region_bridge, .ret_cont, .call_head => .ordinary,
     }, link.child.code.anchor.proto)) return null;
     const target = switch (link.kind) {
         .link_terminal => child_compiled.linked_entry orelse return null,
-        .ordinary_guard, .loop_done_linked, .sibling_handoff => child_compiled.ordinary_entry orelse return null,
+        .ordinary_guard, .loop_done_linked, .sibling_handoff, .ret_cont, .call_head => child_compiled.ordinary_entry orelse return null,
         .region_bridge => child_compiled.ordinary_entry orelse return null,
     };
     if (compiled.slots[link.slot_index] != target) return null;
 
     const resume_pc: u32 = switch (link.kind) {
+        .ret_cont, .call_head => return null, // frame-motion links never promote
         .sibling_handoff => blk: {
             if (link.parent.code.anchor.proto != link.child.code.anchor.proto or
                 link.parent.code.anchor.pc != link.child.code.anchor.pc or
@@ -903,9 +905,8 @@ pub fn rowPatchKind(kind: trace_exec.LedgerKind) ?nativegen.ExitPatchKind {
         // Doc 44 P0: a head trace's terminal is a completion through
         // shared_exit (slot_addr = null) — there is no exit branch to patch.
         .head_terminal => null,
-        // Doc 44 D12c: same — the pop exits through shared_exit; the future
-        // `.ret_cont` links are entry-registry-keyed, not exit-slot patches.
-        .ret_pop => null,
+        // Frame-motion transitions use dedicated trailing slot cells.
+        .ret_pop, .call_push => null,
     };
 }
 
@@ -1232,7 +1233,17 @@ pub fn arm(self: *TraceState, request: ArmRequest) !bool {
         .compiled => |*cc| cc,
         else => return false,
     };
-    if (slot_index >= c.slots.len) return false;
+    // Logical keys and physical cells differ for frame links. Ordinary kinds
+    // name an IR instruction; ret_cont names a bytecode resume PC; call_head
+    // names the continuation's terminal IR instruction. Physical translation
+    // and bounds are registry-owned.
+    switch (kind) {
+        .ret_cont => if (slot_index >= parent.code.anchor.proto.code.len) return false,
+        .call_head => if (slot_index >= parent.code.instrs.len or parent.code.instrs[slot_index].op != .terminal) return false,
+        // Legacy fixtures may omit synthetic IR while still providing physical
+        // slots. Production traces have one physical slot per IR instruction.
+        else => if (slot_index >= parent.code.instrs.len and slot_index >= c.slots.len) return false,
+    }
     // Doc 39 (v1): no fusion into or out of a PEELED trace. The run wrapper's
     // +1 local-completion adjustment (a peeled first back-edge closes two
     // tier-0 iterations) is applied at the unfused seam only — a fused span's
@@ -1283,6 +1294,18 @@ pub fn arm(self: *TraceState, request: ArmRequest) !bool {
         // the same code path) — never a loop-done slot (that one is reserved
         // for `.loop_done_linked`), never a bridge candidate (whose stub takes
         // the A-v bridge body instead of the plain resolve-through-slot path).
+        .ret_cont => {
+            if (!head_parent or trace_mod.anchorKind(child.code.anchor.pc) != .cont) return false;
+            if (parent.code.anchor.proto != child.code.anchor.proto) return false;
+            if (trace_mod.contAnchorPc(slot_index) != child.code.anchor.pc) return false;
+            if (!self.stubEnterable(child, .ordinary, child.code.anchor.proto)) return false;
+        },
+        .call_head => {
+            if (trace_mod.anchorKind(parent.code.anchor.pc) != .cont or
+                trace_mod.anchorKind(child.code.anchor.pc) != .head) return false;
+            if (parent.code.anchor.proto != child.code.anchor.proto) return false;
+            if (!self.stubEnterable(child, .ordinary, child.code.anchor.proto)) return false;
+        },
         .sibling_handoff => {
             std.debug.assert(!is_loopdone);
             if (is_loopdone) return false;

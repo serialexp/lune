@@ -680,7 +680,7 @@ fn laneConsistent(trace_lane: *?i32, aux: i32) bool {
 ///               `[rsi + aux*8]`, not computed from the operands. Like `.aref` it is a
 ///               distinct addressing kind — it can neither feed arithmetic nor be
 ///               flushed to a slot (C2). Consumed only by `hload`/`hstore`/`guard_hash`.
-pub const Kind = enum { none, int, bool, ptr, aref, float, func, href, native, heap };
+pub const Kind = enum { none, int, bool, ptr, aref, float, func, href, native, heap, boxed };
 
 pub const NativeResult = extern struct {
     completed: usize,
@@ -868,6 +868,9 @@ pub const SilentExitMetadata = extern struct {
 };
 
 pub const ExitPatchKind = enum(u8) { deopt, link_terminal, loop_done_linked, region_bridge };
+/// Four dynamic return-continuation slots plus one continuation-to-head slot.
+pub const RET_CONT_SLOTS: usize = 4;
+pub const NATIVE_TRANSITION_SLOTS: usize = RET_CONT_SLOTS + 1;
 pub const EXIT_NOP5 = [5]u8{ 0x0F, 0x1F, 0x44, 0x00, 0x00 };
 
 pub const ExitPatch = struct {
@@ -934,6 +937,9 @@ pub const CompiledTrace = struct {
     /// the exit loads the slot address as a full imm64). Empty for self-framed test
     /// pages (`trampoline_entry == null`). Owned; freed in `deinit` via `gpa`.
     slots: []usize = &.{},
+    /// Resume-PC keys parallel to the four trailing `.ret_cont` cells. A zero
+    /// target means unarmed; keys are metadata, never executable addresses.
+    ret_cont_keys: []u32 = &.{},
     /// The allocator that owns `slots` (needed at `deinit`, which has no other handle
     /// to a gpa — the page frees itself through its own owner).
     gpa: std.mem.Allocator = undefined,
@@ -1172,6 +1178,7 @@ pub const CompiledTrace = struct {
     pub fn deinit(self: *CompiledTrace) void {
         self.page.deinit();
         if (self.slots.len > 0) self.gpa.free(self.slots);
+        if (self.ret_cont_keys.len > 0) self.gpa.free(self.ret_cont_keys);
         if (self.exit_patches.len > 0) self.gpa.free(self.exit_patches);
         if (self.metadata_cells.len > 0) self.gpa.free(self.metadata_cells);
         self.* = undefined;
@@ -1331,34 +1338,51 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     // so `slots.len == n` and every index is a real IR exit slot that `armNativeLink`
     // may legitimately arm.
     var slots: []usize = &.{};
+    var ret_cont_keys: []u32 = &.{};
     var metadata_cells: []usize = &.{};
     var patch_emissions: []?PatchEmission = &.{};
     if (arena) |ar| {
-        // A frameless body may only address SPILL_MAX spill slots (the trampoline
-        // reserves exactly that many). Beyond it → bail to tier-1a.
-        if (alloc.spill_count > SPILL_MAX) return null;
+        // Boxed phi tags use one lowering-only spill each so every source tag is
+        // snapshotted before parallel destination writes. Include those cells in
+        // the fixed trampoline spill ceiling.
+        var boxed_tag_spills: u32 = 0;
+        for (t.instrs) |ins| if (ins.op == .phi and ins.aux >= 0 and kinds[ins.b] == .boxed) {
+            boxed_tag_spills += 1;
+        };
+        if (alloc.spill_count + boxed_tag_spills > SPILL_MAX) return null;
         const tr = ar.ensureTrampoline() catch return null;
         shared_exit = tr.shared_exit;
         tramp_entry = tr.entry;
-        slots = gpa.alloc(usize, n) catch return null;
+        // Five trailing cells are first-class physical links: four keyed
+        // return-continuation targets and one continuation-to-head target.
+        slots = gpa.alloc(usize, n + NATIVE_TRANSITION_SLOTS) catch return null;
         @memset(slots, tr.shared_exit);
+        ret_cont_keys = gpa.alloc(u32, RET_CONT_SLOTS) catch {
+            gpa.free(slots);
+            return null;
+        };
+        @memset(ret_cont_keys, std.math.maxInt(u32));
         metadata_cells = gpa.alloc(usize, n) catch {
+            gpa.free(ret_cont_keys);
             gpa.free(slots);
             return null;
         };
         @memset(metadata_cells, 0);
         patch_emissions = gpa.alloc(?PatchEmission, n) catch {
             gpa.free(metadata_cells);
+            gpa.free(ret_cont_keys);
             gpa.free(slots);
             return null;
         };
         @memset(patch_emissions, null);
     }
     defer if (patch_emissions.len > 0) gpa.free(patch_emissions);
+    var keep_ret_cont_keys = false;
+    defer if (ret_cont_keys.len > 0 and !keep_ret_cont_keys) gpa.free(ret_cont_keys);
 
     var asm_buf = x64.Assembler.init(gpa);
     defer asm_buf.deinit();
-    const entry_stubs = lower(gpa, t, trace_id, kinds, &alloc, &asm_buf, shared_exit, slots, metadata_cells, patch_emissions, seed_ctx, seed_plan, heap) catch {
+    const entry_stubs = lower(gpa, t, trace_id, kinds, &alloc, &asm_buf, shared_exit, slots, ret_cont_keys, metadata_cells, patch_emissions, seed_ctx, seed_plan, heap) catch {
         if (metadata_cells.len > 0) gpa.free(metadata_cells);
         if (slots.len > 0) gpa.free(slots);
         return null;
@@ -1464,10 +1488,12 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     // which is where a future conditional-emission path in `lower` would
     // actually break it.
     std.debug.assert(seed_plan.nonEmpty() == entry_stubs.seed_prologue);
+    keep_ret_cont_keys = true;
     return .{
         .page = page,
         .trampoline_entry = tramp_entry,
         .slots = slots,
+        .ret_cont_keys = ret_cont_keys,
         .gpa = gpa,
         .linked_entry = linked_entry,
         .ordinary_entry = ordinary_entry,
@@ -1485,9 +1511,34 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     };
 }
 
+/// An untyped slot value may enter native code only as an boxed-value
+/// copy: every semantic use must be the update of a slot-bound phi. No guard,
+/// arithmetic, truthiness, heap operation, or internal phi may inspect it.
+fn boxedPassThroughOnly(t: *const Trace, ref: usize) bool {
+    if (t.instrs.len == 0) return false;
+    const terminal = t.instrs[t.instrs.len - 1].op;
+    if (terminal != .terminal and terminal != .link) return false;
+    var copied = false;
+    for (t.instrs, 0..) |ins, i| {
+        if (i == ref) continue;
+        if (ins.op == .phi and ins.aux >= 0 and ins.b == ref) {
+            copied = true;
+            continue;
+        }
+        const reads = operandReads(ins);
+        if ((reads.a and ins.a == ref) or (reads.b and ins.b == ref)) return false;
+        // phi.b is intentionally absent from operandReads because it is consumed
+        // by the terminal shuffle. For a slot-bound phi, `a` is metadata (usually
+        // zero; a peeled steady-phi association otherwise), not a value use. Only
+        // internal phi init/update operands inspect a value.
+        if (ins.op == .phi and (ins.b == ref or (ins.aux == trace.PHI_INTERNAL and ins.a == ref))) return false;
+    }
+    return copied;
+}
+
 /// Forward type-proof over the linear SSA. Fills `kinds` (and `slot_of`, the
 /// register slot of each `slot_load`) and returns `true` iff every value is a
-/// proven `int`/`bool` produced by a supported op — otherwise `false` (bail).
+/// proven supported value or a use-gated boxed pass-through.
 pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: []i32) bool {
     const n = t.instrs.len;
     @memset(kinds, .none);
@@ -1736,8 +1787,13 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                     // prologue pins TAG_HEAP + `header.type == string` once.
                     kinds[i] = .heap;
                     is_string[i] = true;
+                } else if (boxedPassThroughOnly(t, i)) {
+                    // Preserve both lanes without inventing a type. Allocation
+                    // keeps payload and tag in their source slots; terminal
+                    // writeback copies the complete boxed Value.
+                    kinds[i] = .boxed;
                 } else {
-                    return false; // unguarded → cannot prove a kind
+                    return false; // unguarded typed/inspected use → bail
                 }
             },
             .konst => {
@@ -2697,7 +2753,7 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
         // write the callee closure into the child call frame's slots. A carried
         // `.func` load still bails in `analyze` (lk must be numeric), so this
         // only ever feeds write-only flushes.
-        if (k != .int and k != .bool and k != .float and k != .ptr and k != .heap and k != .func) return false;
+        if (k != .int and k != .bool and k != .float and k != .ptr and k != .heap and k != .func and k != .boxed) return false;
         // Doc 40: an internal φ's back-edge update must deliver the φ's own
         // kind — the other half of the φ-guard discharge (Pass B proved the
         // init; this proves iterations 2+). `b` is a forward ref, so the check
@@ -3461,7 +3517,14 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
     for (slots.items) |*s| {
         const loaded = s.load_ref >= 0;
         const stored = s.store_ref >= 0;
-        if (loaded and stored) {
+        if (loaded and stored and t.instrs[n - 1].op == .terminal) {
+            // A one-shot root never feeds its snapshot back into its own
+            // prologue. Keep the entry home immutable, independently of the
+            // outgoing value's kind. Terminal lowering reads store_ref and
+            // boxes that value separately; failed guards leave entry regs intact.
+            s.class = .invariant;
+            s.kind = kinds[@intCast(s.load_ref)];
+        } else if (loaded and stored) {
             s.class = .carried;
             // A carried slot is treated as ONE boxable scalar kind end-to-end: the
             // prologue tag-checks it, the body keeps it in a same-class home, and the
@@ -3518,6 +3581,11 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
                 if (!isStringProducerOp(t.instrs[@intCast(s.store_ref)].op)) return error.Bail;
                 s.kind = .heap;
                 s.is_string = true;
+            } else if (lk == .boxed and sk == .boxed) {
+                // One-shot boxed pass-through: the payload home is raw bits and
+                // terminal writeback copies the tag lane separately. It is never
+                // inspected or loop-carried (proveKinds gates both properties).
+                s.kind = .boxed;
             } else {
                 // [RV-4 / review P0] The *load* class fixes the prologue tag-check and the
                 // home's register class. Outside the carried-heap and carried-string
@@ -4810,7 +4878,46 @@ fn emitFloatBinOp(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, ka: 
 /// The payload source is a `Place`: a GP reg / spill cell raw-copies the 8 bytes
 /// (int/bool); an XMM home stores the double with `movsd` (float). rax is the
 /// scratch for a spilled payload.
+fn boxedTagSpill(t: *const Trace, kinds: []const Kind, alloc: *const Alloc, ref: usize) !u32 {
+    if (ref >= t.instrs.len or kinds[ref] != .boxed or t.instrs[ref].op != .slot_load) return error.Unsupported;
+    var ordinal: u32 = 0;
+    for (kinds[0..ref]) |kind| if (kind == .boxed) {
+        ordinal += 1;
+    };
+    return alloc.spill_count + ordinal;
+}
+
+fn snapshotBoxedTags(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc: *const Alloc) !void {
+    // Snapshot every admitted boxed source before *any* destination tag store:
+    // phi writes are parallel, and reading tags during a swap/cycle would pair a
+    // preserved payload with an already-overwritten tag.
+    for (kinds, 0..) |kind, ref| {
+        if (kind != .boxed) continue;
+        const spill = try boxedTagSpill(t, kinds, alloc, ref);
+        try a.movzxRegMem8(.rax, .rdi, t.instrs[ref].aux);
+        try a.movMemReg(.rsp, @as(i32, @intCast(spill)) * 8, .rax);
+    }
+}
+
+fn flushBoxedSlot(a: *x64.Assembler, dst_slot: i32, tag_spill: u32, payload: Place) !void {
+    // Payload was loaded into its ordinary GP/spill home. The independent tag
+    // came from the actual phi source and was snapshotted before destination
+    // mutation, so write-only destinations and arbitrary parallel copies work.
+    try a.movzxRegMem8(.rax, .rsp, @as(i32, @intCast(tag_spill)) * 8);
+    try a.movByteMemReg(.rdi, dst_slot, .rax);
+    const poff: i32 = dst_slot * 8;
+    switch (payload) {
+        .reg => |r| try a.movMemReg(.rsi, poff, r),
+        .mem => |d| {
+            try a.movRegMem(.rax, .rsp, d);
+            try a.movMemReg(.rsi, poff, .rax);
+        },
+        .xmm => unreachable,
+    }
+}
+
 fn flushSlot(a: *x64.Assembler, slot: i32, kind: Kind, payload: Place) !void {
+    std.debug.assert(kind != .boxed);
     const tag: u8 = switch (kind) {
         .bool => TAG_BOOL,
         .float => TAG_FLOAT,
@@ -6046,6 +6153,16 @@ fn emitGStore(a: *x64.Assembler, t: *const Trace, alloc: *const Alloc, ins: trac
     try a.btsMemReg(preg, 0, pflat);
 }
 
+fn emitPhiValueFlush(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, p: trace.IrInstr) !void {
+    const ref: usize = @intCast(p.b);
+    const kind = kinds[ref];
+    if (kind == .boxed) {
+        try flushBoxedSlot(a, @as(i32, @intCast(p.aux)), try boxedTagSpill(t, kinds, alloc, ref), placeOfRef(alloc, ref));
+    } else {
+        try flushSlot(a, @as(i32, @intCast(p.aux)), kind, placeOfRef(alloc, ref));
+    }
+}
+
 fn emitLinkedLoopDoneSnapshot(
     a: *x64.Assembler,
     t: *const Trace,
@@ -6083,7 +6200,7 @@ fn emitLinkedLoopDoneSnapshot(
     for (t.instrs) |p| {
         if (p.op != .phi or p.aux == trace.PHI_INTERNAL) continue;
         if (p.aux == visible_var_slot) continue;
-        try flushSlot(a, @as(i32, @intCast(p.aux)), kinds[@intCast(p.b)], placeOfRef(alloc, @intCast(p.b)));
+        try emitPhiValueFlush(a, t, kinds, alloc, p);
     }
 }
 
@@ -6100,12 +6217,7 @@ fn emitCompositeBridgeSnapshot(
 ) !void {
     var emitted = t.bridgeEmissions(exit_instr);
     while (emitted.next()) |p| {
-        try flushSlot(
-            a,
-            @as(i32, @intCast(p.aux)),
-            kinds[@intCast(p.b)],
-            placeOfRef(alloc, @intCast(p.b)),
-        );
+        try emitPhiValueFlush(a, t, kinds, alloc, p);
     }
 }
 
@@ -6134,7 +6246,7 @@ const PatchEmission = struct {
 /// committed counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers
 /// across iterations (loaded + type-guarded once in the prologue); `regs[]` is written
 /// only on a side-exit (the single snapshot) or for write-only slots at the back-edge.
-fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize, metadata_cells: []usize, patch_emissions: []?PatchEmission, seed_ctx: ?*const NativeSeedCtx, seed_plan: SeedPlan, heap: ?*gc.Heap) !EntryStubs {
+fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize, ret_cont_keys: []u32, metadata_cells: []usize, patch_emissions: []?PatchEmission, seed_ctx: ?*const NativeSeedCtx, seed_plan: SeedPlan, heap: ?*gc.Heap) !EntryStubs {
     const exit_labels = try gpa.alloc(?x64.Label, t.instrs.len);
     defer gpa.free(exit_labels);
     @memset(exit_labels, null);
@@ -6156,10 +6268,14 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
         }
     }
 
-    // Frame = compacted spill area (homes + transients that missed a register), padded so
-    // the total below-entry delta (rbx + callee pushes + frame) stays 16-byte aligned [RV-6].
+    // Frame = compacted spill area plus one cell per boxed source tag. These tags
+    // must survive arbitrary body stores until a one-shot terminal snapshot.
+    var boxed_tag_count: u32 = 0;
+    for (kinds) |kind| if (kind == .boxed) {
+        boxed_tag_count += 1;
+    };
     const pushes = 1 + callee_len; // rbx + callee-saved homes
-    const frame: i32 = @intCast(std.mem.alignForward(usize, pushes * 8 + alloc.spill_count * 8, 16) - pushes * 8);
+    const frame: i32 = @intCast(std.mem.alignForward(usize, pushes * 8 + (alloc.spill_count + boxed_tag_count) * 8, 16) - pushes * 8);
 
     // Prologue: save rbx + callee-saved homes, completed = 0, reserve the frame.
     // Frameless (production): the shared trampoline already saved ALL callee-saved,
@@ -6253,6 +6369,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     // table-type + lane are verified below, after the pointer is loaded).
     for (alloc.slots) |s| {
         if (s.class == .write_only) continue;
+        if (s.kind == .boxed) continue; // arbitrary tag is copied at terminal
         const tag: u8 = switch (s.kind) {
             .ptr, .func, .native => TAG_HEAP, // all invariant heap pointers
             // A carried-heap slot enters holding a table (TAG_HEAP). Its table-type/
@@ -6266,6 +6383,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
         try a.cmpByteMemImm(.rdi, @as(i32, s.slot), tag);
         try a.jcc(.ne, prologue_fail);
     }
+    // Boxed tags are immutable source state for the whole one-shot body. Taking
+    // this snapshot only after every hoisted guard passed preserves the strict
+    // prologue-failure contract: failed entry leaves regs[] byte-identical.
+    try snapshotBoxedTags(a, t, kinds, alloc);
     for (alloc.slots) |s| {
         if (s.class == .write_only) continue;
         // payload lane: `payloads[slot]` at rsi+slot*8 (scale-8, free).
@@ -7282,7 +7403,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     }
                     try jccNativeExit(a, exit_labels, i, .e); // false (0) → side-exit
                 },
-                .none, .aref, .href => unreachable, // proveKinds restricts to value kinds
+                .none, .aref, .href, .boxed => unreachable, // proveKinds restricts to inspected value kinds
             },
             .guard_false => switch (kinds[ins.a]) {
                 // A non-bool proven value is never falsy → always side-exit.
@@ -7295,7 +7416,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     }
                     try jccNativeExit(a, exit_labels, i, .ne); // true (≠0) → side-exit
                 },
-                .none, .aref, .href => unreachable, // proveKinds restricts to value kinds
+                .none, .aref, .href, .boxed => unreachable, // proveKinds restricts to inspected value kinds
             },
             .loop => {
                 // [RV-2] write-only slots commit to regs[] BEFORE the shuffle, so the
@@ -7366,8 +7487,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 // so flushing with the true store type is correct.
                 for (alloc.slots) |s| {
                     if (s.store_ref < 0) continue;
-                    const flush_kind = kinds[@intCast(s.store_ref)];
-                    try flushSlot(a, @as(i32, s.slot), flush_kind, placeOfRef(alloc, @intCast(s.store_ref)));
+                    const ref: usize = @intCast(s.store_ref);
+                    const flush_kind = kinds[ref];
+                    if (flush_kind == .boxed) {
+                        try flushBoxedSlot(a, @as(i32, s.slot), try boxedTagSpill(t, kinds, alloc, ref), placeOfRef(alloc, ref));
+                    } else try flushSlot(a, @as(i32, s.slot), flush_kind, placeOfRef(alloc, ref));
                 }
                 try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
                 try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
@@ -7396,8 +7520,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 std.debug.assert(!t.peeled); // head closes bypass peel
                 for (alloc.slots) |s| {
                     if (s.store_ref < 0) continue;
-                    const flush_kind = kinds[@intCast(s.store_ref)];
-                    try flushSlot(a, @as(i32, s.slot), flush_kind, placeOfRef(alloc, @intCast(s.store_ref)));
+                    const ref: usize = @intCast(s.store_ref);
+                    const flush_kind = kinds[ref];
+                    if (flush_kind == .boxed) {
+                        try flushBoxedSlot(a, @as(i32, s.slot), try boxedTagSpill(t, kinds, alloc, ref), placeOfRef(alloc, ref));
+                    } else try flushSlot(a, @as(i32, s.slot), flush_kind, placeOfRef(alloc, ref));
                 }
                 // Doc 44 D11: native frame push at the self-call terminal — a
                 // LOWERING decision only (recording and tier-1a keep the interp
@@ -7418,17 +7545,24 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 // call generically, raising any overflow error itself).
                 var no_push: ?x64.Label = null;
                 const term = t.instrs[i];
-                // Doc 44 D12b v1: HEAD pages only. A cont page's self-call
-                // terminal must exit plain — the push's `jmp body_entry`
-                // targets its OWN page, which is wrong for a cont page (the
-                // callee's next activation belongs to the HEAD anchor; the
-                // D12c `.call_head` cross-page link is the lever that makes
-                // cont-page pushes correct).
-                if (trace_code.anchorKind(t.anchor.pc) == .head and
+                // Head pages descend into themselves. Continuation pages use
+                // their dedicated `.call_head` trailing slot; if it is not
+                // armed they leave the call to tier-0 unchanged.
+                if (trace_code.anchorKind(t.anchor.pc) != .loop and
                     @as(trace.TerminalKind, @enumFromInt(@as(u16, @intCast(term.a)))) == .self_call_interp)
                 {
                     if (seed_ctx) |ctx| if (ctx.self_call_push_fn) |push_fn| {
                         const decline = try a.label();
+                        // A continuation performs the real push even while its
+                        // call-head slot is unarmed.  On that first miss the
+                        // committed `.call_push` final row returns to the
+                        // dispatcher, which reloads the pushed frame at pc 0;
+                        // consume-at-entry then learns the *actual* selected
+                        // head page and arms this owner after hotguard evidence.
+                        // Pre-gating the helper on an already-armed slot makes
+                        // formation circular: no push => no final row => no
+                        // pending arm.  This is the return-link twin's normal
+                        // deterministic miss path, not an undo requirement.
                         // C-ABI bracket: verbatim the seed-prologue protocol.
                         // rdi/rsi/rdx are the only live caller-saved regs here
                         // (every home was just flushed to memory), rbx is
@@ -7461,13 +7595,30 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "pushed_frames"));
                         try a.addRegImm32(.rax, 1);
                         try a.movMemReg(.rdx, @offsetOf(NativeResult, "pushed_frames"), .rax);
-                        // Shift the SoA lanes onto the pushed callee window:
-                        // tags scale 1, payloads scale 8.
                         const nreg: i32 = t.anchor.proto.num_registers;
-                        try a.addRegImm32(.rdi, nreg);
-                        try a.addRegImm32(.rsi, nreg * 8);
-                        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 0);
-                        try a.jmp(body_entry);
+                        if (trace_code.anchorKind(t.anchor.pc) == .head) {
+                            // Shift onto the pushed callee and re-enter this head.
+                            try a.addRegImm32(.rdi, nreg);
+                            try a.addRegImm32(.rsi, nreg * 8);
+                            try a.movMemImm32(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 0);
+                            try a.jmp(body_entry);
+                        } else if (shared_exit) |se| {
+                            // A continuation push is committed only when its
+                            // cross-page head link is live. Otherwise undo is
+                            // impossible, so the helper must not have been called.
+                            // (The pre-call target gate is emitted below.)
+                            try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+                            try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
+                            try emitLedgerAppend(a, trace_id, .call_push);
+                            // A cap cut can return before the child stamps itself.
+                            try a.movMemImm32(.rdx, @offsetOf(NativeResult, "final_trace_id"), @bitCast(trace_id));
+                            try a.addRegImm32(.rdi, nreg);
+                            try a.addRegImm32(.rsi, nreg * 8);
+                            try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&slots[t.instrs.len + RET_CONT_SLOTS]))));
+                            try a.movRegMem(.rax, .rax, 0);
+                            try emitForcedYieldCheck(a, se);
+                            try a.jmpReg(.rax);
+                        }
                         no_push = decline;
                     };
                 }
@@ -7521,6 +7672,36 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
                         try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
                         try emitLedgerAppend(a, trace_id, .ret_pop);
+                        // A miss/cap cut returns before a child stamps itself.
+                        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "final_trace_id"), @bitCast(trace_id));
+                        // Dynamic resume-PC dispatch. Keys and target cells are
+                        // stable page-owned storage; publication writes the key
+                        // before the target. A miss exits with the committed pop.
+                        if (shared_exit) |se| {
+                            const nreg: i32 = t.anchor.proto.num_registers;
+                            for (ret_cont_keys, 0..) |*key, ki| {
+                                const next = try a.label();
+                                try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(ctx))));
+                                try a.movRegMem32(.rax, .rax, @offsetOf(NativeSeedCtx, "ret_resume_pc"));
+                                try a.movRegImm64(.rcx, @bitCast(@as(u64, @intFromPtr(key))));
+                                // Keys are u32: a qword comparison also reads the
+                                // next key (and reads past the final key).
+                                try a.movRegMem32(.rcx, .rcx, 0);
+                                try a.cmpRegReg(.rax, .rcx);
+                                try a.jcc(.ne, next);
+                                try a.movRegImm64(.rcx, @bitCast(@as(u64, @intFromPtr(&slots[t.instrs.len + ki]))));
+                                try a.movRegMem(.rax, .rcx, 0);
+                                try a.movRegImm64(.rcx, @bitCast(@as(u64, se)));
+                                try a.cmpRegReg(.rax, .rcx);
+                                try a.jcc(.e, next);
+                                // Only a real armed hit changes lane ownership.
+                                try a.subRegImm32(.rdi, nreg);
+                                try a.subRegImm32(.rsi, nreg * 8);
+                                try emitForcedYieldCheck(a, se);
+                                try a.jmpReg(.rax);
+                                a.bind(next);
+                            }
+                        }
                         try emitReturn(a, frame, callee[0..callee_len], shared_exit, trace_id, null);
                         a.bind(no_pop);
                     };
@@ -7696,6 +7877,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     }
     for (alloc.slots) |s| {
         if (s.class != .carried) continue;
+        // Boxed pass-through traces are one-shot. Before their terminal commit the
+        // VM slot is still the entry Value byte-for-byte, so a guard exit must not
+        // flush a typed approximation (or write anything at all).
+        if (s.kind == .boxed) continue;
         // Re-box the carried home with its kind's tag: int homes write TAG_INT from a
         // GP reg / spill cell; a float home writes TAG_FLOAT + `movsd` from its XMM
         // (a register-homed float can't go through `movMemReg`). flushSlot dispatches.
@@ -7818,6 +8003,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 }
                 for (alloc.slots) |s| {
                     if (s.class != .carried) continue;
+                    if (s.kind == .boxed) continue;
                     if (s.steady_phi >= 0) {
                         try flushSlot(a, @as(i32, s.slot), s.steady_kind, placeOfRef(alloc, @intCast(s.steady_phi)));
                     } else {

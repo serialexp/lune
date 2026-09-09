@@ -236,6 +236,9 @@ pub const NativeSeedCtx = struct {
     proto: ?*const anyopaque = null,
     /// The anchor frame's activation token — the other half of the stamp.
     call_seq: u64 = 0,
+    /// Dynamic resume cursor published by a successful native return pop. The
+    /// emitted epilogue reloads it after the C call to select a `.ret_cont` slot.
+    ret_resume_pc: u32 = 0,
     /// The C-ABI seeding twin (interp.zig `nativeSeedFn`): resolves the plan's
     /// ACTIVE seeds into the slab, returns SEED_OK / SEED_HASH_DECLINE /
     /// SEED_CAPACITY_DECLINE. Installed once at VM init; never reassigned.

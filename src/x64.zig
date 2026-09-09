@@ -265,6 +265,13 @@ pub const Assembler = struct {
         try self.modrmMem(dst.lo(), base, disp);
     }
 
+    /// Load a u32, zero-extending it to the full destination register.
+    pub fn movRegMem32(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
+        try self.rex(false, dst.hi(), false, base.hi());
+        try self.b(0x8B);
+        try self.modrmMem(dst.lo(), base, disp);
+    }
+
     /// `mov [base + disp], src` — 89 /r (MOV r/m64, r64): reg = src, rm = mem.
     pub fn movMemReg(self: *Assembler, base: Reg, disp: i32, src: Reg) !void {
         try self.rex(true, src.hi(), false, base.hi());
@@ -289,6 +296,23 @@ pub const Assembler = struct {
         try self.b(0xC6);
         try self.modrmMem(0, base, disp);
         try self.b(v);
+    }
+
+    /// `movzx dst, byte [base + disp]` — REX.W 0F B6 /r.
+    pub fn movzxRegMem8(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
+        try self.rex(true, dst.hi(), false, base.hi());
+        try self.b(0x0F);
+        try self.b(0xB6);
+        try self.modrmMem(dst.lo(), base, disp);
+    }
+
+    /// `mov byte [base + disp], src8` — 88 /r. A REX prefix is mandatory not
+    /// only for extended registers, but also for spl/bpl/sil/dil: without it,
+    /// encodings 4..7 name ah/ch/dh/bh instead.
+    pub fn movByteMemReg(self: *Assembler, base: Reg, disp: i32, src: Reg) !void {
+        try self.rexF(false, src.hi(), false, base.hi(), src.lo() >= 4);
+        try self.b(0x88);
+        try self.modrmMem(src.lo(), base, disp);
     }
 
     /// `movzx dst, src8` — REX.W 0F B6 /r: zero-extend the low byte of `src` into

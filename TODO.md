@@ -2,6 +2,16 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## JIT coverage labels conflate traced and native execution (D12c baseline)
+
+- [ ] Audit `--jit-stats` native-cycle attribution for tier-1a fallbacks. The
+      D12c baseline (06bab1b, recursive-fib 31) reports 6,534,740 trace entries
+      but only 4,356,544 native bodies, while labeling all traced cycles as
+      native execution. `perf` independently puts 18.27% in `irinterp.executeCtx`
+      through `opJCont`. Thus 100% trace residency does not prove native
+      continuation residency. Keep formation witnesses separate from coverage
+      percentages; correct attribution in a focused diagnostics change.
+
 ## Architecture roadmap (2026-09-05, Bart: eventually cover all boundaries)
 
 Start with docs/design/41-jit-ownership.md: shared contracts, registry, region

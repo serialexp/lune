@@ -1367,6 +1367,8 @@ pub const Vm = struct {
         self.depth -= 1;
         self.stack_top = parent.base + nreg;
         self.prepareNativeEpisode(parent.closure, proto, parent.base);
+        // Published only after the pop commits; declined calls leave it irrelevant.
+        @constCast(ctx).ret_resume_pc = @intCast(parent.pc);
         self.trace.self_ret_pops +%= 1;
         return trace.NativeSeedCtx.POP_OK;
     }
@@ -2340,7 +2342,9 @@ pub const Vm = struct {
             self.trace.isRecording() or self.trace.pending_exit_anchor != null or
             self.trace.pending_replay_anchor != null or
             self.trace.pending_call_anchor != null or
-            self.trace.pending_ret_anchor != null);
+            self.trace.pending_ret_anchor != null or
+            self.trace.pending_ret_cont_arm != null or
+            self.trace.pending_call_head_arm != null);
     }
 
     // ------------------------------------------------------------------------
@@ -2874,6 +2878,8 @@ pub const Vm = struct {
         // Provenance capture/settle/drain and sibling arming no-op.
         if (ts.provenance_edges.items.len != 0) return null;
         if (ts.pending_sibling_arm != null or ts.pending_bridge_arm != null) return null;
+        // Frame-link requests are consumed only by the full entry path.
+        if (ts.pending_ret_cont_arm != null or ts.pending_call_head_arm != null) return null;
         // `accountRegionProfit` returns false ⇒ legacy receipt.
         if (!ts.region_policy.receiptsInert()) return null;
         // The legacy productive removals no-op on empty maps; head gate READS
@@ -3134,13 +3140,35 @@ pub const Vm = struct {
         var i: usize = 0;
         while (i < ledger.len) : (i += 1) {
             const row = ledger[i];
-            const owner = self.resolveHeadRowOwner(row.id, proto, ct.code.anchor.pc);
+            const owner = ts.traceById(row.id) orelse @panic("pushed descent: row owner did not resolve");
+            if (owner.code.anchor.proto != proto) @panic("pushed descent: row owner proto mismatch");
+            if (trace.anchorKind(owner.code.anchor.pc) == .loop)
+                @panic("pushed descent: loop owner in one-shot ledger");
+            if (row.outcome == .yielded) {
+                if (i != ledger.len - 1 or ledger.len != trace_exec.LEDGER_CAP)
+                    @panic("pushed descent: yield must end a full ledger");
+                ts.frame_link_cap_yields +|= 1;
+            }
             const seg_local: usize = row.cum - (if (i == 0) 0 else ledger[i - 1].cum);
             if (i != ledger.len - 1) {
-                // INTERMEDIATE row: a D10 armed handoff mid-descent —
-                // transfers within one activation, validated + accounted by
-                // the shared core.
-                self.accountHeadIntermediateRow(owner, row, ledger[i + 1].id, seg_local);
+                const next_owner = ts.traceById(ledger[i + 1].id) orelse @panic("pushed descent: successor did not resolve");
+                switch (row.kind) {
+                    .ret_pop => {
+                        if (!ts.hasArmedFrameLink(owner, trace.entryPc(next_owner.code.anchor.pc), next_owner, .ret_cont))
+                            @panic("pushed descent: ret_pop without live ret_cont");
+                        ts.ret_cont_link_hits +|= 1;
+                        ts.accountTraceRun(owner, seg_local);
+                        trace.TraceState.accountCandidateCharge(owner, .entered);
+                    },
+                    .call_push => {
+                        if (!ts.hasArmedFrameLink(owner, row.exit, next_owner, .call_head))
+                            @panic("pushed descent: call_push without live call_head");
+                        ts.call_head_link_hits +|= 1;
+                        ts.accountTraceRun(owner, seg_local);
+                        trace.TraceState.accountCandidateCharge(owner, .entered);
+                    },
+                    else => self.accountHeadIntermediateRow(owner, row, ledger[i + 1].id, seg_local),
+                }
                 continue;
             }
             // TERMINAL row.
@@ -3164,6 +3192,29 @@ pub const Vm = struct {
                     // call here would double-fire with a different id).
                     return .{ .resume_frame_motion = @intCast(term.aux) };
                 },
+                .call_push => {
+                    // A cont page committed a real push but its call-head slot
+                    // missed (or the cap forced a cut before the jump). The new
+                    // top frame is the callee at pc 0. Record the deterministic
+                    // arm request only here, after observing the actual push;
+                    // the next selected head page supplies the child.
+                    if (row.outcome == .yielded and ledger.len != trace_exec.LEDGER_CAP)
+                        @panic("pushed descent: yielded call_push below full cap");
+                    if (row.exit >= owner.code.instrs.len or owner.code.instrs[row.exit].op != .terminal)
+                        @panic("pushed descent: final call_push does not name a terminal instr");
+                    if (trace.anchorKind(owner.code.anchor.pc) != .cont)
+                        @panic("pushed descent: final call_push owner is not cont");
+                    ts.onSideExitReceipt(owner, 1, row.exit, 1, .deferred, .entered);
+                    // A cap cut followed an already armed slot, not a miss.
+                    if (row.outcome == .normal and ts.pending_call_head_arm == null) {
+                        owner.call_head_watch_count +|= 1;
+                        if (owner.call_head_watch_count >= ts.config.hotguard) {
+                            owner.call_head_watch_count = 0;
+                            ts.pending_call_head_arm = .{ .trace_id = owner.id, .exit_instr = row.exit };
+                        }
+                    }
+                    return .{ .resume_frame_motion = 0 };
+                },
                 .ret_pop => {
                     // Doc 44 D12c: the final activation COMMITTED a native
                     // frame pop (`return_interp` terminal + POP_OK) — the top
@@ -3174,13 +3225,16 @@ pub const Vm = struct {
                     // will later take this hop without leaving native). A
                     // DECLINED final pop appends `head_terminal` instead and
                     // takes the arm above (leaf re-executes its `ret`).
-                    if (row.outcome != .normal) @panic("pushed descent: yielded ret_pop");
+                    if (row.outcome == .yielded and ledger.len != trace_exec.LEDGER_CAP)
+                        @panic("pushed descent: yielded ret_pop below full cap");
                     if (result.popped_frames == 0) @panic("pushed descent: ret_pop row without pops");
                     if (row.exit >= owner.code.instrs.len or owner.code.instrs[row.exit].op != .terminal)
                         @panic("pushed descent: ret_pop row does not name a terminal instr");
                     ts.dbg("pushed-descent ret-pop: pushed={d} popped={d} rows={d} final t={d} resume={d}", .{ result.pushed_frames, result.popped_frames, ledger.len, owner.id, self.frames[self.depth - 1].pc });
                     ts.onSideExitReceipt(owner, 1, row.exit, 1, .deferred, .entered);
-                    return .{ .resume_frame_motion = self.frames[self.depth - 1].pc };
+                    const resume_pc: u32 = @intCast(self.frames[self.depth - 1].pc);
+                    ts.noteRetContTransition(owner, resume_pc);
+                    return .{ .resume_frame_motion = resume_pc };
                 },
                 .deopt => {
                     // Guard deopt at some depth (normal), or a full-cap
@@ -3204,20 +3258,20 @@ pub const Vm = struct {
                         };
                     }
                     ts.dbg("pushed-descent deopt: pushed={d} rows={d} last t={d} exit={d} yielded={}", .{ result.pushed_frames, ledger.len, owner.id, row.exit, row.outcome == .yielded });
-                    return .{ .resume_frame_motion = 0 };
+                    return .{ .resume_frame_motion = trace.entryPc(owner.code.anchor.pc) };
                 },
                 .prologue_fail => {
                     // Arg types changed at some depth: the post-push re-entry
                     // refused before touching regs. Leaf walk owns it.
                     ts.dbg("pushed-descent prologue-fail: pushed={d} rows={d} last t={d}", .{ result.pushed_frames, ledger.len, owner.id });
-                    return .{ .resume_frame_motion = 0 };
+                    return .{ .resume_frame_motion = trace.entryPc(owner.code.anchor.pc) };
                 },
                 .seed_capacity_decline, .seed_hash_decline => {
                     // The post-push seed prologue declined. Both resume the
                     // leaf at pc 0 — the hash decline explicitly must not
                     // take the entry activation's scalar tier-1a rerun.
                     ts.dbg("pushed-descent seed-decline: pushed={d} rows={d} last t={d} kind={s}", .{ result.pushed_frames, ledger.len, owner.id, @tagName(row.kind) });
-                    return .{ .resume_frame_motion = 0 };
+                    return .{ .resume_frame_motion = trace.entryPc(owner.code.anchor.pc) };
                 },
                 else => @panic("pushed descent: terminal row kind outside the head grammar"),
             }
@@ -3466,6 +3520,7 @@ pub const Vm = struct {
             // the deterministic dispatch actually runs, never a
             // hit-count guess made at receipt time.
             self.trace.tryArmSiblingHandoff(ct, safe_to_arm);
+            self.trace.tryArmFrameLinks(ct, safe_to_arm);
             var result = if (self.trace.config.record_exec_log) blk: {
                 const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.executeCtx(.{ .heap = self.heap }, &ct.code, trace_regs, buf);
                 const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.executeCtx(.{ .heap = self.heap }, &ct.code, trace_regs, buf);
@@ -5138,9 +5193,15 @@ pub const Vm = struct {
                         st.frame.pc = rpc;
                         return .switch_mode;
                     },
-                    // Doc 44 D12b v1: cont pages never lower the push epilogue
-                    // (their self-call terminal exits plain until D12c links).
-                    .resume_frame_motion => @panic("native frame motion from a cont-anchor entry"),
+                    // Doc 44 D12c: a continuation can now commit either a
+                    // self-call push (unarmed call-head miss) or return pops
+                    // before its frame link misses/cap-yields. Reload the
+                    // actual top frame and dispatch the explicit final resume
+                    // pc exactly as the head-entry motion path does.
+                    .resume_frame_motion => |rpc| {
+                        reloadTopFrame(st);
+                        return dispatchTail(mode, st, rpc, vm);
+                    },
                 }
             }
         }.h;

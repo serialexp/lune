@@ -192,6 +192,9 @@ pub const LedgerKind = enum(u32) {
     /// dispatcher's motion consumer tell "resume the caller at its cursor"
     /// from "re-execute the leaf's ret at `term.aux`".
     ret_pop = 8,
+    /// A continuation page committed a native self-call push and dispatched
+    /// through its `.call_head` link into the proto's head page.
+    call_push = 9,
 };
 
 /// 2.3c-2c (doc 17): what a chain-source exit DID with its (possibly armed) slot —
@@ -267,6 +270,7 @@ test "execution contract wire ordinals and capacity" {
     try std.testing.expectEqual(@as(u32, 6), @intFromEnum(LedgerKind.seed_capacity_decline));
     try std.testing.expectEqual(@as(u32, 7), @intFromEnum(LedgerKind.head_terminal));
     try std.testing.expectEqual(@as(u32, 8), @intFromEnum(LedgerKind.ret_pop));
+    try std.testing.expectEqual(@as(u32, 9), @intFromEnum(LedgerKind.call_push));
     try std.testing.expectEqual(@as(u32, 0), @intFromEnum(LedgerOutcome.normal));
     try std.testing.expectEqual(@as(u32, 1), @intFromEnum(LedgerOutcome.yielded));
     try std.testing.expectEqual(@as(usize, 32), LEDGER_CAP);

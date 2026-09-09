@@ -153,6 +153,14 @@ pub const TraceRecord = struct {
     /// the arm set touching this trace changes (`clearSiblingLatch`, a successful
     /// sibling arm).
     sibling_reject_exit: u32 = std.math.maxInt(u32),
+    /// D12c allocation-free hotguard evidence for the K dynamic return resume
+    /// PCs. Fib alternates two PCs on the same returning page, so a single
+    /// last-key watch can never reach the threshold. First-observation order
+    /// claims these fixed cells deterministically; there is no eviction.
+    ret_cont_watch_pcs: [nativegen.RET_CONT_SLOTS]u32 = @splat(std.math.maxInt(u32)),
+    ret_cont_watch_counts: [nativegen.RET_CONT_SLOTS]u32 = @splat(0),
+    /// One terminal self-call per continuation page; retries remain event-counted.
+    call_head_watch_count: u32 = 0,
 
     /// Freeze-after-qualify membership memo (task #70, the runtime-seam kill): the
     /// last `regionMemberPoint(rid, anchor)` answer for this trace, keyed by

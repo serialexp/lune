@@ -39,6 +39,132 @@ const util = @import("nativegen_testutil.zig");
 const expectBail = util.expectBail;
 const expectMatch = util.expectMatch;
 
+// --- doc 44 D12c prerequisite: arbitrary boxed pass-through -----------------
+
+test "one-shot terminal separates incoming and outgoing register kinds" {
+    var code = [_]bytecode.Instr{.{ .op = .ret }};
+    var proto = bytecode.Proto{ .code = &code, .num_registers = 2 };
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_int, .a = 0 },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .guard_float, .a = 2 },
+        .{ .op = .phi, .b = 2, .aux = 0 },
+        .{ .op = .phi, .b = 0, .aux = 1 },
+        .{ .op = .terminal, .a = 0, .aux = 0 },
+    };
+    var t = Trace{ .anchor = .{ .proto = &proto, .pc = trace.FUNC_HEAD_PC }, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var regs = [_]Value{ Value.int(17), Value.float(2.5) };
+    try expectMatch(&t, &regs);
+    // Prologue refusal must not publish either outgoing snapshot value.
+    regs[0] = Value.boolean(true);
+    try expectMatch(&t, &regs);
+}
+
+test "unguarded slot load may pass through a slot-bound phi with tag and payload intact" {
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 3 },
+        .{ .op = .phi, .b = 0, .aux = 2 },
+        .{ .op = .link },
+    };
+    var t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+
+    // A heap-looking payload is intentional: native must copy the arbitrary tag
+    // byte and payload independently, not guess an integer or heap kind.
+    var regs = [_]Value{ Value.nil(), Value.int(9), Value.nil(), Value.boolean(true) };
+    regs[3].payload.bits = 0xFEDC_BA98_7654_3210;
+    try expectMatch(&t, &regs);
+}
+
+test "unguarded boxed pass-through rejects typed inspection" {
+    const typed_ops = [_]trace.IrOp{ .guard_true, .guard_false };
+    for (typed_ops) |op| {
+        var instrs = [_]I{
+            .{ .op = .slot_load, .aux = 3 },
+            .{ .op = op, .a = 0 },
+            .{ .op = .phi, .b = 0, .aux = 2 },
+            .{ .op = .link },
+        };
+        var t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+        try expectBail(&t);
+    }
+    var arithmetic = [_]I{
+        .{ .op = .slot_load, .aux = 3 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .add, .a = 0, .b = 1, .ty = .int },
+        .{ .op = .phi, .b = 0, .aux = 2 },
+        .{ .op = .link },
+    };
+    var consts = [_]Value{Value.int(1)};
+    var at = Trace{ .anchor = undefined, .instrs = &arithmetic, .consts = &consts, .entry_slots = &.{}, .entry_guards = &.{} };
+    try expectBail(&at);
+}
+
+fn expectBoxedParallel(terminal: trace.IrOp) !void {
+    var code = [_]bytecode.Instr{.{ .op = if (terminal == .terminal) .ret else .jmp }};
+    var proto = bytecode.Proto{ .code = &code, .num_registers = 4, .name = "boxed-parallel" };
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .slot_load, .aux = 2 },
+        .{ .op = .phi, .b = 1, .aux = 0 }, // swap 0 <- 1
+        .{ .op = .phi, .b = 0, .aux = 1 }, // swap 1 <- 0
+        .{ .op = .phi, .b = 0, .aux = 2 }, // fanout old 0
+        .{ .op = .phi, .b = 2, .aux = 3 }, // write-only destination
+        .{ .op = terminal, .a = 0, .aux = 0 },
+    };
+    var t = Trace{ .anchor = .{ .proto = &proto, .pc = trace.FUNC_HEAD_PC }, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var regs = [_]Value{ Value.int(11), Value.boolean(true), Value.float(3.25), Value.nil() };
+    // Distinct payload bits make tag-only and payload-only copy bugs visible.
+    regs[0].payload.bits = 0x1111_2222_3333_4444;
+    regs[1].payload.bits = 0x5555_6666_7777_8888;
+    regs[2].payload.bits = 0x9999_AAAA_BBBB_CCCC;
+    const kinds = try testing.allocator.alloc(Kind, instrs.len);
+    defer testing.allocator.free(kinds);
+    const slot_of = try testing.allocator.alloc(i32, instrs.len);
+    defer testing.allocator.free(slot_of);
+    try testing.expect(proveKinds(testing.allocator, &t, kinds, slot_of));
+    var allocation = analyze(testing.allocator, &t, kinds, slot_of) orelse return error.AnalyzeBailedUnexpectedly;
+    allocation.deinit(testing.allocator);
+    try expectMatch(&t, &regs);
+}
+
+test "boxed phi terminal snapshots preserve swaps fanout and write-only destinations" {
+    try expectBoxedParallel(.link);
+    try expectBoxedParallel(.terminal);
+}
+
+test "boxed carried state remains byte-identical on an unrelated preterminal guard failure" {
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_int, .a = 0 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .lt, .a = 0, .b = 2 },
+        .{ .op = .guard_true, .a = 3 }, // 7 < 0 fails
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .phi, .b = 5, .aux = 2 },
+        .{ .op = .link },
+    };
+    var consts = [_]Value{Value.int(0)};
+    var t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &.{}, .entry_guards = &.{} };
+    var regs = [_]Value{ Value.int(7), Value.boolean(false), Value.float(-9.5) };
+    regs[1].payload.bits = 0x0123_4567_89AB_CDEF;
+    try expectMatch(&t, &regs);
+}
+
+test "x64 byte register store emits mandatory REX for sil and extended registers" {
+    var a = x64.Assembler.init(testing.allocator);
+    defer a.deinit();
+    try a.movByteMemReg(.rdi, 0, .rax);
+    try testing.expectEqualSlices(u8, &.{ 0x88, 0x07 }, a.code.items);
+    a.code.clearRetainingCapacity();
+    try a.movByteMemReg(.rdi, 0, .rsi);
+    try testing.expectEqualSlices(u8, &.{ 0x40, 0x88, 0x37 }, a.code.items);
+    a.code.clearRetainingCapacity();
+    try a.movByteMemReg(.rdi, 0, .r8);
+    try testing.expectEqualSlices(u8, &.{ 0x44, 0x88, 0x07 }, a.code.items);
+}
+
 // --- Phase D / F3: div (always float; divsd, cvtsi2sd int operands) ----------
 
 /// Run a single float division `x / y` through both tiers and assert the result

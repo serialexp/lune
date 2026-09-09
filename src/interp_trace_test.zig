@@ -5408,9 +5408,64 @@ test "ret pop formation (doc 44 D12c): fused descents unwind through the native 
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
     try testing.expectEqualStrings("10946\n", sink.buffered());
-    // Descents live AND their unwinds pop natively.
+    // Descents live AND their unwinds pop natively. More importantly, pin the
+    // whole four-page fib cycle: head + base sibling + both continuation pages
+    // must all compile, both dynamic return PCs must arm and hit, and the first
+    // continuation's second recursive call must form and use its call-head
+    // link. This catches the circular bug where push was gated on an already
+    // armed call-head slot (so no committed miss could ever request the arm).
     try testing.expect(vm.trace.self_call_pushes >= 100);
     try testing.expect(vm.trace.self_ret_pops >= 100);
+    var native_traces: usize = 0;
+    var native_conts: usize = 0;
+    for (vm.trace.registry.cache.items) |t| switch (t.native) {
+        .compiled => {
+            native_traces += 1;
+            if (trace.anchorKind(t.code.anchor.pc) == .cont) native_conts += 1;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 4), vm.trace.registry.cache.items.len);
+    try testing.expectEqual(@as(usize, 4), native_traces);
+    try testing.expectEqual(@as(usize, 2), native_conts);
+    vm.trace.dbg("D12c formation: native={d} cont={d} ret arms/hits={d}/{d} call arms/hits={d}/{d}", .{ native_traces, native_conts, vm.trace.ret_cont_link_arms, vm.trace.ret_cont_link_hits, vm.trace.call_head_link_arms, vm.trace.call_head_link_hits });
+    try testing.expect(vm.trace.ret_cont_link_arms >= 2);
+    try testing.expect(vm.trace.ret_cont_link_hits >= 2);
+    try testing.expect(vm.trace.call_head_link_arms >= 1);
+    try testing.expect(vm.trace.call_head_link_hits >= 1);
+    // This workload must exercise the mixed-chain capacity cut, not merely
+    // individual unlinked pushes/pops with output-equivalent resumption.
+    try testing.expect(vm.trace.frame_link_cap_yields > 0);
+}
+
+test "D12c fused calls survive changed return types and protected overflow across ten legs" {
+    try util.expectProgramTuned(
+        \\local leaf = 1
+        \\local function fib(n)
+        \\  if n < 2 then return leaf end
+        \\  return fib(n-2) + fib(n-1)
+        \\end
+        \\print(fib(16))
+        \\leaf = 1.5
+        \\print(fib(10))
+        \\leaf = 1
+        \\-- The FIRST n-2 descent must exceed the 200-frame wall before a leaf.
+        \\-- 300 reaches a leaf first and starts exponential work, not a quick overflow.
+        \\local ok, err = pcall(fib, 1000)
+        \\print(ok, type(err))
+        \\print(fib(10))
+    , "1597\n133.5\nfalse\tstring\n89\n", .{
+        .hotguard = 2,
+        .inspect = &struct {
+            fn inspect(vm: *Vm, mode: util.TraceMode) !void {
+                if (mode != .record_execute_native or vm.heap.gc_stress or
+                    !@import("nativegen.zig").is_x64_linux) return;
+                try testing.expect(vm.trace.ret_cont_link_hits > 0);
+                try testing.expect(vm.trace.call_head_link_hits > 0);
+                try testing.expect(vm.trace.frame_link_cap_yields > 0);
+            }
+        }.inspect,
+    });
 }
 
 test "pop helper refusal matrix (doc 44 D12c): every wall declines with nothing mutated" {

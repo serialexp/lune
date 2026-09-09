@@ -789,6 +789,7 @@ pub fn applyEdgeCursorTransition(
             cursor.next_entry = .ordinary;
         },
         .region_bridge => cursor.next_entry = .via_bridge,
+        .ret_cont, .call_head => @panic("loop replay saw frame-motion edge"),
         .sibling_handoff => cursor.next_entry = .via_handoff,
         .ordinary_guard => cursor.next_entry = .{ .via_ordinary_guard = .{
             .parent = parent,
@@ -1039,6 +1040,7 @@ pub fn driveSilentBurst(
                     loop_done_count +|= fires;
                     suppressed_hops +|= fires;
                 },
+                .ret_cont, .call_head => @panic("driveSilentBurst: frame-motion edge promoted"),
                 .sibling_handoff => {
                     self.sibling_handoff_fused +|= followed;
                     const evidence = self.silentSiblingEvidence(
@@ -1605,9 +1607,8 @@ pub fn replayLedgerFrom(
             // address — they are never armed, never fused, never chain members,
             // so a `.head_terminal` row can never reach the silent replay.
             .head_terminal => @panic("replayLedger: head_terminal row in a chain ledger"),
-            // Doc 44 D12c: same one-shot exclusion — pops happen only on
-            // head-descent episodes, which never enter loop chains.
-            .ret_pop => @panic("replayLedger: ret_pop row in a chain ledger"),
+            // Frame-motion rows belong only to one-shot descent episodes.
+            .ret_pop, .call_push => @panic("replayLedger: frame-motion row in a chain ledger"),
         };
 
         // Destination `.deferred` for a handoff, NEVER `.known_trace`: this edge is
@@ -1679,8 +1680,8 @@ pub fn replayLedgerFrom(
             // Doc 44 P0: head traces are never armed/fused (null slot address at
             // their terminal), so this row kind cannot reach the silent replay.
             .head_terminal => @panic("replayLedger: head_terminal row in a chain ledger"),
-            // Doc 44 D12c: same one-shot exclusion for the pop's row kind.
-            .ret_pop => @panic("replayLedger: ret_pop row in a chain ledger"),
+            // Frame-motion rows belong only to one-shot descent episodes.
+            .ret_pop, .call_push => @panic("replayLedger: frame-motion row in a chain ledger"),
             .region_bridge => {
                 // A bridge commits its distinct cross-anchor snapshot before
                 // entering the successor. It is therefore never terminal or a
