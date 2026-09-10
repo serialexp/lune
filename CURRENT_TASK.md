@@ -21,6 +21,44 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-10 (latest) — doc 45 D2 increment 2 LANDED (TraceCode ownership + needs_precise policy)
+
+Follows increment 1 (013379c, `src/trace_snapshot.zig` types/budgets/validation).
+This increment, all per the doc 45 D2 contract (doc lines 88–180):
+
+- **TraceCode ownership**: `snapshots: []Snapshot`, `snapshot_slots:
+  []SnapshotSlot`, `deopt_mode: DeoptMode = .entry_replay` on `TraceCode`
+  (trace_code.zig), freed in `deinit` — which every candidate error path
+  already funnels through, so no new error-path plumbing.
+- **Two new AbortReasons** (trace_recorder.zig, after `cont_backedge`):
+  `needs_precise` (non-penalizing cancel) and `snapshot_limit` (deterministic
+  budget refusal, ordinary strike — wired up when capture lands).
+- **Deterministic re-recording policy**: `rec.precise` flag (cleared in
+  `reset`, seeded in `arm()` from the new `TraceState.precise_anchor_memo` —
+  same lexical-monotone pattern as `upvalue_mutable_memo`). `.new_table` in a
+  non-precise recording aborts `.needs_precise`; `consumeRecordingAbort`
+  memoizes the anchor, rewinds the hotness counter to threshold−1 by anchor
+  kind (`anchorKind`: loop→`hotloop`, head/cont→`hotcall` — the LLEAVE
+  fast-retry mechanics) and returns before the gate. Memo-put OOM falls
+  through to the normal strike (fail-closed, no ungated infinite retry).
+- **Interim behaviour** (until capture/construction increments): the precise
+  retry hits `new_table` again and aborts `.nyi_opcode` → normal strikes. Net:
+  exactly one extra non-penalized retry per constructing anchor, fully
+  deterministic (hashgate green ×2 legs).
+- **Named transition test** (interp_trace_test.zig, doc-mandated): cancel-once
+  (dedup count == 1) → precise retry at the SAME anchor/abort pc with equal
+  `ir_len` (re-recorded from the real anchor, not blacklisted) → memo
+  contains the anchor → record_gate struck by the nyi retry.
+- Gates: `zig build test`, `zig build wasm`, `just hashgate` (84 ×2) all green.
+- **Known seam carried** (TODO.md round-2 item 1, Bart's call pending): the
+  trace_link.zig starters bypass `arm()`, so cont/side recordings never see
+  `rec.precise` — same fail-closed shape as `route_upvalue_reads`.
+
+**Next D2 increments**: recorder per-bytecode snapshot capture via `Builder`
+scratch on precise candidates → `IrInstr.snap` wiring → finalization
+validation; then D3 effect ordering, D4 construction, D5 errors, D6 exit ABI,
+D8 serialization (traceser format bump + viz), D9 acceptance.
+
 ## Status 2026-09-10 (later) — split review round 2 + nativegen 6-slice file split LANDED
 
 Bart's task: "review the file/logic split, then the big piece."

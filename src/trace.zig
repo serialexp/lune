@@ -1081,6 +1081,16 @@ pub const TraceState = struct {
     /// Grows monotonically (an anchor set is never cleared: the loop's shape
     /// is lexical); bounded by the number of distinct upvalue-mutating loops.
     upvalue_mutable_memo: std.AutoHashMapUnmanaged(AnchorKey, void) = .empty,
+    /// Doc 45 D2 (deterministic re-recording): anchors whose recording met a
+    /// bytecode that needs per-instruction precise deopt (`new_table` today).
+    /// The `.needs_precise` cancel memoizes here without a gate strike and
+    /// re-arms the hotness counter; `arm` seeds `rec.precise` from this memo
+    /// so the retry records the whole episode in precise mode from the first
+    /// instruction. Per-anchor POLICY that survives the cancelled candidate —
+    /// never keyed by addresses, so it replays byte-identically. Grows
+    /// monotonically like `upvalue_mutable_memo` (lexical loop shape),
+    /// bounded by the number of distinct constructing anchors.
+    precise_anchor_memo: std.AutoHashMapUnmanaged(AnchorKey, void) = .empty,
     /// Re-entry penalty per anchor: a low-yield trace entry bumps it, a
     /// productive one clears it (doc 31 D2); at `config.max_penalty` the anchor
     /// is gated off with a doubling cooldown (`onSideExit` → `gateAnchor`).
@@ -1969,6 +1979,7 @@ pub const TraceState = struct {
         self.lleave_count.deinit(self.gpa);
         self.unroll_fail.deinit(self.gpa);
         self.upvalue_mutable_memo.deinit(self.gpa);
+        self.precise_anchor_memo.deinit(self.gpa);
         self.while_yield.deinit(self.gpa);
         self.penalty.deinit(self.gpa);
         self.guard_failures.deinit(self.gpa);
@@ -3285,6 +3296,11 @@ pub const TraceState = struct {
         // after an `.upvalue_mutable` abort routes scalar closed-cell reads
         // through `uload` from the first instruction.
         self.rec.route_upvalue_reads = self.upvalue_mutable_memo.contains(.{ .proto = proto, .pc = target_pc });
+        // Doc 45 D2: arm with the anchor's precise-mode memo, so a retry after
+        // a `.needs_precise` cancel records per-bytecode snapshots from the
+        // first instruction (deterministic re-recording, never a retroactive
+        // mid-candidate promotion).
+        self.rec.precise = self.precise_anchor_memo.contains(.{ .proto = proto, .pc = target_pc });
     }
 
     /// Abandon the in-flight recording: deactivate, remember why, and gate the
@@ -3327,6 +3343,27 @@ pub const TraceState = struct {
         // simply re-aborts and re-tries the memo, never a hotter path.
         if (reason == .upvalue_mutable) {
             self.upvalue_mutable_memo.put(self.gpa, notice.anchor, {}) catch {};
+        }
+        // Doc 45 D2: `.needs_precise` is a non-penalizing cancellation, not a
+        // strike — the shape isn't untraceable, it just needs the anchor
+        // re-recorded in precise mode. Memoize the anchor, then rewind its
+        // hotness counter to threshold-minus-one (the LLEAVE fast-retry
+        // mechanics: the warming counter is past its one-shot crossing, so
+        // without the rewind the retry starves) and return before the gate.
+        // The counter family follows the anchor kind: back-edge counters warm
+        // to `hotloop`, head/cont counters to `hotcall`. On memo OOM fall
+        // through to the ordinary gate strike — fail-closed, never an
+        // ungated infinite retry.
+        if (reason == .needs_precise) {
+            if (self.precise_anchor_memo.put(self.gpa, notice.anchor, {})) |_| {
+                const threshold = switch (anchorKind(notice.anchor.pc)) {
+                    .loop => self.config.hotloop,
+                    .head, .cont => self.config.hotcall,
+                };
+                self.counters.put(self.gpa, notice.anchor, threshold -| 1) catch {};
+                self.dbg("needs-precise retry: anchor pc={d}", .{notice.anchor.pc});
+                return;
+            } else |_| {}
         }
         if (reason == .loop_leave) {
             if (self.lleave_count.getOrPut(self.gpa, notice.anchor)) |gop| {

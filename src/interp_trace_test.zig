@@ -5634,3 +5634,69 @@ test "recorder (head, doc 44 P0): a depth-0 multret-forwarding return aborts —
     try testing.expect(vm.trace.record_gate.count() >= 1);
     try testing.expect(!vm.trace.isRecording());
 }
+
+// ---------------------------------------------------------------------------
+// Doc 45 D2: deterministic re-recording — the `.needs_precise` cancel/retry.
+// ---------------------------------------------------------------------------
+
+test "recorder (precise deopt, doc 45 D2): new_table cancels needs_precise ONCE, then the precise retry re-arms at the SAME loop anchor (not blacklisted)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.record_aborts = true; // read the cancel/retry sequence below
+    // A hot loop whose body constructs a table. First recording is non-precise
+    // → `new_table` cancels `.needs_precise` (no gate strike, anchor memoized,
+    // counter rewound to hotloop-1 so the retry arms on the very next
+    // back-edge). The retry arms with `rec.precise` and — construction
+    // recording (doc 45 D4) not being built yet — aborts `.nyi_opcode` at the
+    // same instruction, striking the gate normally. Net: exactly one
+    // non-penalized retry, then today's behaviour.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local s = 0
+        \\for i = 1, 400 do
+        \\  local t = {}
+        \\  t.x = i
+        \\  s = s + t.x
+        \\end
+        \\print(s)
+    , true);
+    defer chunk.deinit();
+
+    // Nothing commits (construction recording doesn't exist yet).
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
+
+    // The abort log carries the transition: one `.needs_precise` row and at
+    // least one `.nyi_opcode` row, both on `new_table` at the SAME anchor —
+    // the retry re-recorded from the real loop anchor, it wasn't blacklisted.
+    var cancel_row: ?trace.AbortRecord = null;
+    var nyi_row: ?trace.AbortRecord = null;
+    for (vm.trace.abort_log.items) |r| {
+        if (r.op != .new_table) continue;
+        switch (r.reason) {
+            .needs_precise => {
+                try testing.expect(cancel_row == null); // deduped: one row
+                cancel_row = r;
+            },
+            .nyi_opcode => nyi_row = r,
+            else => {},
+        }
+    }
+    try testing.expect(cancel_row != null);
+    try testing.expect(nyi_row != null);
+    try testing.expectEqual(@as(u64, 1), cancel_row.?.count); // memo held: cancelled exactly once
+    try testing.expectEqual(cancel_row.?.anchor_pc, nyi_row.?.anchor_pc);
+    try testing.expectEqual(cancel_row.?.abort_pc, nyi_row.?.abort_pc);
+    // Both attempts recorded the anchor's leading instructions before dying at
+    // `new_table` — the retry really re-recorded from the anchor's first
+    // instruction with the original register values (a corrupt re-arm would
+    // change how far it gets or where it dies).
+    try testing.expectEqual(cancel_row.?.ir_len, nyi_row.?.ir_len);
+
+    // Policy state: the anchor is memoized for precise mode, and the nyi
+    // retry struck the record gate normally (ordinary strikes resumed — the
+    // cancel is non-penalizing, not ungated-forever).
+    const anchor = trace.AnchorKey{ .proto = cancel_row.?.proto, .pc = cancel_row.?.anchor_pc };
+    try testing.expect(vm.trace.precise_anchor_memo.contains(anchor));
+    try testing.expect(vm.trace.record_gate.count() >= 1);
+    try testing.expect(!vm.trace.isRecording());
+}

@@ -7,6 +7,7 @@
 const std = @import("std");
 const value = @import("value.zig");
 const trace_ir = @import("trace_ir.zig");
+const trace_snapshot = @import("trace_snapshot.zig");
 const trace_types = @import("trace_types.zig");
 const RegWindow = @import("regwindow.zig").RegWindow;
 
@@ -319,6 +320,17 @@ pub const TraceCode = struct {
     /// OOM leaves it unbuilt and isBridgeCandidate uses the identical oracle.
     bridge_cand: []const u8 = &.{},
     bridge_cand_built: bool = false,
+    /// Doc 45 D2: owned precise-deopt snapshot records + their flat slot-vector
+    /// store (see `trace_snapshot.zig`). Empty on every `entry_replay` trace;
+    /// a `precise` trace's finalization populates both or fails the candidate
+    /// (correctness metadata, never fail-soft). Freed in `deinit`, which every
+    /// candidate error path already funnels through.
+    snapshots: []trace_snapshot.Snapshot = &.{},
+    snapshot_slots: []trace_snapshot.SnapshotSlot = &.{},
+    /// Doc 45 D2: how a guard failure restores guest state — whole-episode
+    /// entry replay (the historical contract) or per-bytecode precise deopt
+    /// via `snapshots`. Arm/dispatch validation must check this, not infer it.
+    deopt_mode: trace_snapshot.DeoptMode = .entry_replay,
 
     pub fn deinit(self: *TraceCode, gpa: std.mem.Allocator) void {
         gpa.free(self.instrs);
@@ -329,6 +341,8 @@ pub const TraceCode = struct {
         if (self.exit_prov.len != 0) gpa.free(self.exit_prov);
         if (self.rec_path.len != 0) gpa.free(self.rec_path);
         if (self.bridge_cand.len != 0) gpa.free(self.bridge_cand);
+        if (self.snapshots.len != 0) gpa.free(self.snapshots);
+        if (self.snapshot_slots.len != 0) gpa.free(self.snapshot_slots);
         self.* = undefined;
     }
 

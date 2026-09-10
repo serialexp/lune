@@ -135,6 +135,25 @@ pub const AbortReason = enum {
     /// straight-line-to-terminal: loops have their own anchor machinery, so
     /// a continuation that runs into one yields the loop to it, fail-closed.
     cont_backedge,
+    /// Doc 45 D2: a NON-precise recording met `new_table` (later: any general
+    /// store requiring per-bytecode precision). The candidate is discarded
+    /// without a gate strike; the hub memoizes the anchor
+    /// (`TraceState.precise_anchor_memo`) and re-arms its deterministic
+    /// hotness counter to threshold-saturating-minus-one (the `loop_leave`
+    /// fast-retry precedent), so the retry arms at the next back-edge /
+    /// call / return event in PRECISE mode (`RecordingSession.precise`) with
+    /// the full entry slot_load map from the first instruction. Deterministic
+    /// re-recording, never retroactive promotion: no loads or snapshots are
+    /// inserted into an already-running candidate.
+    needs_precise,
+    /// Doc 45 D2: the recording's precise-deopt snapshot demand exceeded a
+    /// deterministic admission budget (`trace_snapshot.Budget`: 256 interned
+    /// slot vectors / 2000 records / 65536 slots per candidate, checked
+    /// BEFORE allocation). Deliberate admission refusal — a full-map body
+    /// that churns one slot per bytecode can exhaust vectors long before
+    /// `maxrecord`. Ordinary strike semantics: the shape is honestly
+    /// uncompilable under the budget, no partial candidate publishes.
+    snapshot_limit,
 };
 const ExitProvenance = @import("trace_types.zig").ExitProvenance;
 const ProgramPoint = @import("trace_types.zig").ProgramPoint;
@@ -692,6 +711,14 @@ pub const RecordingSession = struct {
     /// (they cannot be stored — v1 is scalar-only — and the callee-loading
     /// machinery depends on their `slot_load` shape).
     route_upvalue_reads: bool = false,
+    /// Doc 45 D2 deterministic re-recording: set at arm time from the
+    /// anchor's `precise_anchor_memo`. When false, the first bytecode that
+    /// needs per-instruction deopt precision (`new_table` today) cancels the
+    /// candidate with `.needs_precise` — non-penalizing, memoizes the anchor,
+    /// re-arms the hotness counter — so the retry records this whole episode
+    /// in precise mode from the first instruction. Per-anchor policy, never
+    /// a retroactive mid-candidate promotion.
+    precise: bool = false,
 
     pub fn abort(self: *RecordingSession, reason: AbortReason) void {
         if (!self.active) return;
@@ -949,7 +976,18 @@ pub const RecordingSession = struct {
             // its reads through `uload` and the store can record.
             .set_upval => try self.recSetUpval(instr, regs),
 
-            // tables, closures, concat, for_prep, len, …: each pulls in heap-effect
+            // Doc 45 D2: table construction needs per-bytecode precise deopt
+            // to record (the constructed table is visible mid-episode, so
+            // entry replay would double-construct). A non-precise candidate
+            // cancels with `.needs_precise` — memoized + counter re-armed, so
+            // the retry arms in precise mode from the first instruction. The
+            // precise retry still aborts `.nyi_opcode` until construction
+            // recording (doc 45 D4) lands: same observable tiering as today
+            // plus exactly one non-penalized retry per anchor, and the memo is
+            // the flag the later increments read.
+            .new_table => self.abort(if (self.precise) .nyi_opcode else .needs_precise),
+
+            // closures, concat, for_prep, len, …: each pulls in heap-effect
             // / cross-frame / invalidation machinery that is later work. Abort
             // cleanly.
             else => self.abort(.nyi_opcode),
@@ -4739,6 +4777,7 @@ pub const RecordingSession = struct {
         self.upvalue_path_dedup.clearRetainingCapacity();
         self.snapshot_read_cells.clearRetainingCapacity();
         self.route_upvalue_reads = false; // doc 43 P5: arm() seeds the anchor memo after reset
+        self.precise = false; // doc 45 D2: arm() seeds the anchor memo after reset
         self.pending_stores.clearRetainingCapacity();
         self.alloc_count = 0;
         self.guard_gc_ref = null;
