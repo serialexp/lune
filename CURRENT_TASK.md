@@ -81,6 +81,71 @@ won't move until the NATIVE precise executor lands. That (D6 native half:
 exit-stub snapshot flush, runtime_error/activation ABI, ledger row) is the
 next slice, then tset/constructor stores.
 
+### NEXT SLICE — D6 native precise executor (task #26), plan CODEX-REVIEWED 2026-09-11
+
+Codex (gpt-5.6-sol default) reviewed the design; verdict "sound direction,
+not sound as written" with these REQUIRED corrections (thread
+01a08bf1-782e-7831-bd5e-6e8bfa8d6351):
+
+1. **compileImpl acceptance**: loop anchor only; final op exactly `.loop`;
+   `.precise` + `body_start == 0` + `!peeled` + no frame motion; valid
+   snapshots for every op that requires one; NO link machinery emitted; heap
+   mandatory (add `.tnew` to the heapless refusal, nativegen.zig ~173).
+   Lowering breadth beyond "add tnew": `proveKinds` accepts `.tnew` as
+   `.heap`; `isTransient` includes it; `bodyCalloutOf`/`BodyCallout`/
+   `calloutMayCollect` include it; exit classification treats it fallible;
+   untyped entry loads used ONLY by snapshots admitted as boxed values;
+   **snapshot refs extend allocator liveness through every exit that reads
+   them** (else restores read recycled homes).
+2. **Skip-flush predicate as I proposed is WRONG** (the big catch): after a
+   native back-edge, carried values live in machine homes while the slab is
+   STALE (deopt_exit publishes only at exit) — an own-entry-slot_load ref can
+   be current while the slab isn't (numeric-for control reg is the
+   counterexample). Valid skip is only: ref is the destination's OWN entry
+   slot_load AND the allocator class is INVARIANT AND nothing can have
+   mutated that slab slot pre-exit. Never skip `.carried` on ref identity.
+   Compare ref identity, never value equality. Extend snapshot refs'
+   last_use to the failing instr BEFORE regalloc; preserve payload+tag for
+   boxed snapshot-only refs; sources must hold stable homes until the
+   materializer finishes (no slab-sourced reads unless parallel-copy staged).
+3. **ABI**: append `snapshot_id`/`runtime_error`/`activation_base`/
+   `activation_depth` (u32 ×4) after `popped_frames`; zero-init per
+   invocation; offset asserts; precise exits also stamp final_trace_id/
+   exit_instr/exit_reason.
+4. **tnew callout**: established save/restore bracket; DEDICATED frame word
+   for scratch_out (no padding reuse); preserve `eax`→`ecx` IMMEDIATELY
+   after the call (emitCalloutRestore preserves rax/rcx, nativegen_emit
+   ~976); store runtime_error from ecx BEFORE any flush/ledger (flush +
+   spilled-payload loads + ledger clobber rax).
+5. **Ledger**: NEW kinds `precise_deopt = 10`, `precise_error = 11` (doc 45
+   specifies them; `.deopt` implies an entry-replay/chain-source contract a
+   precise row must not carry). Wrapper/dispatcher require: ledger_len == 1,
+   outcome .normal, row id/exit agree with scalars, kind agrees with
+   exit_reason, snapshot_id selects the failing instr's snap.
+6. **No patch windows / no patch_emissions / no indirect exit-slot dispatch
+   for precise exits — direct to shared_exit**; assert silent_active == 0,
+   pushed/popped_frames == 0.
+7. **Loop-done**: bypass isNumericForLoopDoneGuard's linked-materialization
+   branch (nativegen.zig ~2077) — ordinary snapshot-bearing precise guard.
+8. **Dispatcher**: lift `!ran_native` asserts in BOTH precise consumers; the
+   precise `.normal` prologue path (interp.zig ~3930) must stay available
+   for native guard_gc (snap==0) fails after completed iterations; validate
+   precise results BEFORE generic silent/burst/multi-row ledger handlers.
+9. **Materialization shape (codex recommendation)**: inline native, SHARED
+   per (snapshot_id, exit class) — per-instruction stub stamps scalars then
+   jumps a per-snapshot materializer which flushes slots and jumps the
+   precise terminal tail. NOT a Zig-wrapper data-driven restore (would need
+   frozen location maps + GP/XMM dump + spill export — far more machinery).
+   Size control: skip only proven invariant-own-entry slots; measure
+   materializer bytes; add a deterministic per-trace precise-materialization
+   byte/store budget with bail-to-tier-1a (the 65k slot budget is too big to
+   translate blindly to mcode). NB bail-to-tier-1a needs the walk to STOP
+   skipping native-unsupported precise candidates — otherwise a budget bail
+   = the trace never runs again; that selection change is part of this slice.
+10. **GC**: safe under current collector (tnew doesn't collect, non-moving
+    heap, guard_gc exits pre-alloc when due); the one condition is snapshot
+    liveness of the boxed table ref (see 1).
+
 ## Status 2026-09-10 (latest+2) — doc 45 increment 4 LANDED (tier-1a precise snapshot-restore executor)
 
 Precise traces now RUN on tier-1a and deopt precisely:
