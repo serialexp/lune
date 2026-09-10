@@ -113,6 +113,13 @@ pub fn encodeFile(gpa: std.mem.Allocator, traces: []const *const TraceCode) ![]u
     defer arena.deinit();
     const a = arena.allocator();
 
+    // Doc 45 D8 interim: no filtering here — `TraceExecLog.trace_id` is a
+    // cache INDEX, so omitting a trace would silently desynchronize every
+    // later trace from its exec log. Instead, an exec-log session never
+    // PRODUCES a precise trace at all: `consumeRecordingAbort` treats
+    // `needs_precise` as an ordinary strike under `record_exec_log` (no memo,
+    // no precise retry), so this hard error stays what it is — an invariant
+    // trip, not a filter case — until the format bump serializes snapshots.
     const sch = try a.alloc(schema.Trace, traces.len);
     for (traces, 0..) |t, i| sch[i] = try toSchemaTrace(a, t);
 

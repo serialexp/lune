@@ -45,6 +45,21 @@ pub const ExitReason = enum(u32) {
     /// moves to the next candidate (the native analogue of `seedTraceInputs`
     /// returning null). No guard identity, zero local progress, no strike.
     seed_capacity_decline = 3,
+    /// Doc 45 D6: a guard/arith failure in a PRECISE trace (`deopt_mode ==
+    /// .precise`) whose failing IR op carries a nonzero per-bytecode snapshot.
+    /// The executor has ALREADY materialized the snapshot into the guest
+    /// registers before returning; `snapshot_id` names the one-based record
+    /// whose `resume_pc` tier-0 must resume at. Never chainable, never a
+    /// side-trace want, never an entry-replay fallback — the dispatcher
+    /// validates and resumes, nothing else. (A precise trace's PROLOGUE
+    /// failure — `IrInstr.snap == 0`, iteration-entry coherent — stays
+    /// `.normal`: the ordinary entry contract applies.)
+    precise_resume = 4,
+    /// Doc 45 D5/D6 (reserved until the effect executors land): a runtime
+    /// error (OOM/type) raised by a precise trace's effect helper AFTER a
+    /// guest-visible mutation. Handed to the located-error/pcall path,
+    /// preserving the partial heap — never retried, never ordinary deopt.
+    precise_error = 5,
 };
 
 /// 2.3c-2a (doc 17): capacity of the per-transition native ledger carried in
@@ -97,6 +112,14 @@ pub const ExecResult = struct {
     /// Defaulted so the ~40 tier-1a construction sites are untouched; only ever READ on
     /// the native chained path (`driveChain`, `tier == .native_only`).
     exit_reason: ExitReason = .normal,
+    /// Doc 45 D6: one-based index into `TraceCode.snapshots` selecting the
+    /// snapshot the executor materialized for a `.precise_resume` exit; the
+    /// dispatcher resumes tier-0 at that record's `resume_pc`. 0 (defaulted,
+    /// construction sites untouched) everywhere else — legacy exits, precise
+    /// prologue failures, terminals. Tier-1a fills it at its shared exit
+    /// point; the native exit stubs will bake it when the native precise
+    /// executor lands (doc 45 D6, outstanding).
+    snapshot_id: u32 = 0,
     /// 2.3c-2a (doc 17): number of exit-materializations the (possibly fused) native
     /// span recorded in `NativeResult`'s per-transition ledger. 1 for an un-fused run;
     /// >1 when an armed slot chained bodies under the shared frame (a `C→I` `.link`
@@ -261,6 +284,8 @@ test "execution contract wire ordinals and capacity" {
     try std.testing.expectEqual(@as(u32, 1), @intFromEnum(ExitReason.prologue_fail));
     try std.testing.expectEqual(@as(u32, 2), @intFromEnum(ExitReason.seed_hash_decline));
     try std.testing.expectEqual(@as(u32, 3), @intFromEnum(ExitReason.seed_capacity_decline));
+    try std.testing.expectEqual(@as(u32, 4), @intFromEnum(ExitReason.precise_resume));
+    try std.testing.expectEqual(@as(u32, 5), @intFromEnum(ExitReason.precise_error));
     try std.testing.expectEqual(@as(u32, 0), @intFromEnum(LedgerKind.link_terminal));
     try std.testing.expectEqual(@as(u32, 1), @intFromEnum(LedgerKind.loop_done_linked));
     try std.testing.expectEqual(@as(u32, 2), @intFromEnum(LedgerKind.deopt));

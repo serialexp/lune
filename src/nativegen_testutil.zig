@@ -92,6 +92,9 @@ pub fn expectMatch(t: *const Trace, regs_init: []const Value) !void {
         },
         .prologue_fail => try testing.expectEqual(@as(usize, 0), iresult.completed),
         .seed_hash_decline, .seed_capacity_decline => return error.UnexpectedSeedDecline,
+        // Doc 45 D6: native never runs a precise trace until its own
+        // executor lands (`compileImpl` bails), so these cannot surface here.
+        .precise_resume, .precise_error => return error.UnexpectedPreciseExit,
     }
     try expectRegsEqual(iregs, nregs);
 }

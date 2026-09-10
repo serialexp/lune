@@ -1251,6 +1251,14 @@ pub fn arm(self: *TraceState, request: ArmRequest) !bool {
     // split. Refusing the arm keeps every peeled run unfused and the
     // accounting exact on both sides.
     if (parent.code.peeled or child.code.peeled) return false;
+    // Doc 45 D6 (P2): no native link INTO or OUT OF a PRECISE page — a
+    // precise guard exit must reach the dispatcher's `.precise_resume`
+    // consumer, never jump to another trace, and nothing may fuse into a
+    // page whose exits carry snapshot contracts the burst machinery cannot
+    // honor. Structurally unreachable today (precise never compiles to
+    // native, and `.compiled` is required above), but the doc mandates the
+    // predicate at the arm boundary explicitly.
+    if (parent.code.deopt_mode == .precise or child.code.deopt_mode == .precise) return false;
     // P-C option (b) invariant (2.3c-0a): a numeric-for loop-done guard's slot is
     // exclusively its linked-materialized exit. Enforce that the arm's declared kind
     // matches the slot's guard shape — a mismatch is a wiring bug (assert in debug),

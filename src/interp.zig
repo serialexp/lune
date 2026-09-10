@@ -3397,6 +3397,16 @@ pub const Vm = struct {
         wctx: *TrialWalkCtx,
     ) EntryDirective {
         var pc = pc_in;
+        // Doc 45 D8 interim: a PRECISE trace cannot serialize yet
+        // (`traceser` has no snapshot schema until the format bump), so under
+        // an exec-log recording session it must not RUN either — its exec-log
+        // rows would reference a trace absent from the session's trace file,
+        // breaking the visualiser's record. Decline here (not only in the
+        // back-edge walk) so patched head/cont entries are covered too;
+        // tier-0 owns precise anchors for the session. Deterministic: a pure
+        // function of config + the trace's committed mode.
+        if (ct.code.deopt_mode == .precise and self.trace.config.record_exec_log)
+            return .next_candidate;
         // Doc 26 D1 tripwire: a trace carrying `supper`/`slower` can only have
         // committed after a successful tier-0 upper/lower pinned the session's
         // Unicode version, and the pin is monotone for this VM's lifetime — so
@@ -3780,6 +3790,39 @@ pub const Vm = struct {
                 for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
                 return .{ .resume_tier0 = @intCast(term.aux) };
             }
+            // Doc 45 D6: tier-1a PRECISE deopt. The executor already
+            // materialized the failing op's per-bytecode snapshot into the
+            // guest registers, so the ONLY sound continuation is tier-0 at
+            // the snapshot's `resume_pc` — for every anchor kind (a precise
+            // head/cont deopt bypasses the entry pc; a loop deopt bypasses
+            // the anchor). Registers are MID-ITERATION state now: no sibling
+            // trial (`.next_candidate` would enter a sibling on non-entry
+            // regs), no chain, no continuation arm, no side-trace want
+            // (`noteTakenExit` skipped — a want here would bucket an
+            // entry-replay successor on a mid-body resume pc, D6's
+            // mis-bucketed-fallthrough hazard). The ordinary receipt still
+            // charges productivity/penalty so a thrashing precise anchor
+            // gates and tier-0 takes it back. Native never produces this
+            // reason yet (compileImpl declines precise), so `final == ct`.
+            if (result.exit_reason == .precise_resume) {
+                std.debug.assert(!ran_native and final == ct);
+                std.debug.assert(ct.code.deopt_mode == .precise);
+                // D6 dispatcher validation — internal invariant failures,
+                // never a replay fallback.
+                std.debug.assert(result.snapshot_id >= 1 and result.snapshot_id <= ct.code.snapshots.len);
+                const snap = ct.code.snapshots[result.snapshot_id - 1];
+                std.debug.assert(snap.register_count == proto.num_registers);
+                std.debug.assert(snap.resume_pc < proto.code.len);
+                const done: usize = result.completed;
+                self.trace.dbg("precise-resume: trace={d} exit={d} snap={d} resume_pc={d} completed={d}", .{ ct.id, result.exit_instr, result.snapshot_id, snap.resume_pc, done });
+                self.trace.precise_resumes +|= 1;
+                self.trace.onSideExitReceipt(ct, done, result.exit_instr, done, .deferred, .entered);
+                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                if (mode == .full and self.runFastPath()) {
+                    return .{ .switch_mode_at = @intCast(snap.resume_pc) };
+                }
+                return .{ .resume_tier0 = @intCast(snap.resume_pc) };
+            }
             // Doc 44 P0/D12b: a one-shot trace's (head or cont) guard-fail
             // exit — deopt to its entry pc (regs untouched since entry). The
             // loop-anchor grammar below (hot-exit wants, continuations,
@@ -3814,6 +3857,32 @@ pub const Vm = struct {
                     if (result.exit_reason == .prologue_fail) .entry_refusal else .entered,
                 );
                 for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                return .next_candidate;
+            }
+            // Doc 45 D6: a PRECISE loop trace's remaining `.normal` exits are
+            // PROLOGUE failures (`IrInstr.snap == 0` — the per-iteration
+            // `slot_load`s and eager `guard_gc` re-execute each pass on the
+            // dupe path, so a fail here is iteration-entry coherent: regs
+            // untouched since the last φ flush). The ordinary ENTRY contract
+            // applies, minus everything D6 suppresses for precise pages — no
+            // side-trace wants (`noteTakenExit` below is skipped), no
+            // continuation arms, no prime sides, no chains, no
+            // widen-eviction probe. Productive → receipt + tier-0 at the
+            // anchor (`pc` is unadvanced here); zero → penalty receipt +
+            // next candidate (regs entry-coherent, so the sibling trial walk
+            // stays sound). One-shot precise prologue exits took the head
+            // zero-exit arm above — same entry contract, same soundness.
+            if (!ran_native and ct.code.deopt_mode == .precise) {
+                std.debug.assert(final == ct);
+                self.trace.dbg("precise prologue-exit: trace={d} exit={d} completed={d}", .{ ct.id, result.exit_instr, local_done });
+                self.trace.onSideExitReceipt(ct, local_done, result.exit_instr, local_done, .deferred, .entered);
+                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                if (local_done > 0) {
+                    if (mode == .full and self.runFastPath()) {
+                        return .{ .switch_mode_at = pc };
+                    }
+                    return .{ .resume_tier0 = pc };
+                }
                 return .next_candidate;
             }
             if (ran_native) self.trace.dbg("receipt: pc={d} link_mode={} local={d} exit={d} ledger_len={d} completed={d}", .{ ct.code.anchor.pc, ran_native_link_mode, local_done, result.exit_instr, result.ledger_len, result.completed });
@@ -5919,13 +5988,15 @@ pub const Vm = struct {
                     // malformed or future bytecode shape puts it at a
                     // back-edge pc.
                     if (ct.code.instrs.len != 0 and ct.code.instrs[ct.code.instrs.len - 1].op == .link) continue;
-                    // Doc 45 D2 (P1 substrate): a PRECISE trace carries
-                    // per-bytecode snapshots but neither executor implements
-                    // precise deopt yet — running it via entry replay would be
-                    // unsound (and, for a constructing body whose effects are
-                    // NOT replay-idempotent, non-terminating). Decline to
-                    // enter until the precise executor lands; tier-0 owns it.
-                    if (ct.code.deopt_mode == .precise) continue;
+                    // Doc 45 D6: PRECISE traces now execute on tier-1a (the
+                    // snapshot-restore executor consumes their exits in
+                    // `enterSelectedTrace`). Two standing declines remain:
+                    // exec-log sessions (handled inside `enterSelectedTrace`
+                    // — no serialization schema until D8's format bump) and
+                    // native mode (`compileImpl` bails on precise, so the
+                    // native safety net below skips them like any other
+                    // native-unsupported trace until the native precise
+                    // executor lands).
                     // --- type fingerprint (step 5) ---
                     // Skip this trace if the current register types don't
                     // match its entry type guards.  Avoids trial entries that

@@ -342,6 +342,14 @@ pub fn driveChain(
         // demands allocation counts observed only at tier-0 boundaries.
         // Non-allocating candidates chain as before.
         if (!safe_to_arm and sct.code.alloc_bound > 0) continue;
+        // Doc 45 D6 (P2): never chain INTO a precise page. The chain
+        // machinery enters candidates directly (irinterp/native, below the
+        // dispatcher) and consumes their exits with entry-replay grammar —
+        // it has no `.precise_resume` consumer, and a precise page's
+        // restore-then-resume contract cannot ride a burst. Precise traces
+        // are only ever entered through `enterSelectedTrace`, whose
+        // dedicated arms own their exits.
+        if (sct.code.deopt_mode == .precise) continue;
         // Doc 26 D1 tripwire, chain half: see `enterSelectedTrace`.
         if (sct.code.requires_unicode_pin) std.debug.assert(unicode_pinned);
         const is_link = sct.code.instrs.len != 0 and sct.code.instrs[sct.code.instrs.len - 1].op == .link;

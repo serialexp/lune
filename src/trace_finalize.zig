@@ -176,6 +176,12 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
     var snap_owned: ?trace_snapshot.Builder.Owned = null;
     errdefer if (snap_owned) |o| o.deinit(gpa);
     if (rec.precise) {
+        // Doc 45 D6 (P2): a precise page never closes `.link` (the recorder
+        // refuses both link-close paths) and never peels (`maybeEnterPeel`
+        // declines precise) — backstop the structural prohibitions here so a
+        // future recording path can't silently violate them.
+        std.debug.assert(rec.link_target == null);
+        std.debug.assert(rec.peel == null);
         const owned = try rec.snap_builder.finalize(gpa);
         snap_owned = owned;
         if (!trace_snapshot.validate(owned.snapshots, owned.snapshot_slots, @intCast(rec.anchor.proto.code.len)))

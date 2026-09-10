@@ -1145,6 +1145,14 @@ pub const TraceState = struct {
     /// the witness), and no tiering path reads them.
     seed_hash_declines: u64 = 0,
     seed_capacity_declines: u64 = 0,
+    /// Doc 45 D6 diagnostic: tier-1a `.precise_resume` exits consumed — a
+    /// PRECISE trace's body guard failed, the executor materialized its
+    /// per-bytecode snapshot into the guest registers, and the dispatcher
+    /// resumed tier-0 at the snapshot's `resume_pc`. Output equality alone
+    /// cannot prove the precise path fired (for the pure bodies P1 admits,
+    /// entry replay is observationally equivalent) — the executor tests
+    /// assert on this witness. No tiering path reads it.
+    precise_resumes: u64 = 0,
     /// Doc 44 D11 diagnostic: successful native self-call frame pushes
     /// (`nativeSelfCallPush` → PUSH_OK). Output equality alone cannot prove a
     /// descent actually pushed (the plain-terminal turnstile is
@@ -2180,6 +2188,11 @@ pub const TraceState = struct {
             // by the caller's own iteration count, not by the counter.
             if (t.code.anchor.proto != proto or t.code.anchor.pc != pc) continue;
             if (t.code.instrs.len == 0 or t.code.instrs[t.code.instrs.len - 1].op != .link) continue;
+            // Doc 45 D6 (P2): no links INTO a precise page. Structurally
+            // unreachable — the recorder refuses link closes on precise
+            // candidates, so no precise trace is `.link`-tailed — but the
+            // doc requires the predicate at BOTH arm and dispatch.
+            if (t.code.deopt_mode == .precise) continue;
             // B-iv.3 (doc 22 §B.5): seeded continuations are selectable — the
             // tier-1a seams seed via §B.3 and a native page seeds itself at
             // entry (§B.4 prologue), declining cleanly through the B-iv.2
@@ -2221,6 +2234,8 @@ pub const TraceState = struct {
             // by the caller's own iteration count, not by the counter.
             if (t.code.anchor.proto != proto or t.code.anchor.pc != post_pc) continue;
             if (t.code.instrs.len == 0 or t.code.instrs[t.code.instrs.len - 1].op != .link) continue;
+            // Doc 45 D6 (P2): no links INTO a precise page (see findLinkTrace).
+            if (t.code.deopt_mode == .precise) continue;
             var pos: usize = n;
             for (buf[0..n], 0..) |p, idx| {
                 if (t.hit_count > p.hit_count or (t.hit_count == p.hit_count and t.id < p.id)) {
@@ -3364,7 +3379,16 @@ pub const TraceState = struct {
         // through to the ordinary gate strike — fail-closed, never an
         // ungated infinite retry.
         if (reason == .needs_precise) {
-            if (self.precise_anchor_memo.getOrPut(self.gpa, notice.anchor)) |gop| {
+            // Doc 45 D8 interim: an exec-log session must never PRODUCE a
+            // precise trace — the wire format has no snapshot schema until
+            // the D8 bump, and `traceser.encodeFile` (correctly) hard-errors
+            // on one. Skip the memo + retry entirely: the abort falls through
+            // to the ordinary gate strike and the anchor stays tier-0 for the
+            // session. `record_exec_log` is set once at session setup, so
+            // this is a deterministic pure function of config.
+            if (self.config.record_exec_log) {
+                // fall through to the ordinary strike below
+            } else if (self.precise_anchor_memo.getOrPut(self.gpa, notice.anchor)) |gop| {
                 // FIRST memoization only: an anchor already in the memo means
                 // this recording SHOULD have armed precise but didn't (the
                 // trace_link starters bypass `arm()` — the round-2 seam). A

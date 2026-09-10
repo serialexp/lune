@@ -30,6 +30,8 @@ const stddebug = @import("stdlib/debug.zig");
 const stdload = @import("stdlib/load.zig");
 const trace_snapshot = @import("trace_snapshot.zig");
 const trace_ir = @import("trace_ir.zig");
+const trace_exec = @import("trace_exec.zig");
+const traceser = @import("traceser.zig");
 const stdpackage = @import("stdlib/package.zig");
 const unicode_case = @import("gen/unicode_case.zig");
 const Value = value.Value;
@@ -5784,4 +5786,236 @@ test "recorder (precise deopt, doc 45 D2): a pre-seeded precise loop commits a f
         }
     }
     try testing.expect(body_guard_snaps > 0);
+}
+
+test "executor (precise deopt, doc 45 D6): a mid-body guard failure precise-resumes on tier-1a and matches pure tier-0 output" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    // A value-lane array read whose element guard fails MID-LOOP (a[200] is a
+    // float in an otherwise-int array): the recorded precise trace runs its
+    // steady state on tier-1a, then the element guard fails mid-iteration and
+    // the dispatcher must resume tier-0 at the snapshot's resume_pc — regs
+    // restored to mid-iteration state — never at the anchor and never via a
+    // sibling trial. The first loop (astore) never traces precise (stores are
+    // refused this phase); only the read loop is under test.
+    const source: [:0]const u8 =
+        \\local a = {}
+        \\for i = 1, 300 do a[i] = i end
+        \\a[200] = 1.5
+        \\local s = 0
+        \\for i = 1, 300 do s = s + a[i] end
+        \\print(s)
+    ;
+
+    // Tier-0 truth first.
+    var truth: [64]u8 = undefined;
+    var truth_len: usize = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        truth_len = sink.buffered().len;
+        @memcpy(truth[0..truth_len], sink.buffered());
+    }
+
+    // Precise-executing run: pre-seed every pc into the memo so the read
+    // loop's first recording arms precise, and let tier-1a ENTER it.
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = false;
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    var pc: u32 = 0;
+    while (pc < chunk.proto.code.len) : (pc += 1)
+        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pc }, {});
+
+    _ = try vm.run(chunk.proto);
+
+    // Output identity is necessary but not sufficient (for a pure body,
+    // entry replay is observationally equivalent) — the witness counter
+    // proves the precise restore path actually fired.
+    try testing.expectEqualStrings(truth[0..truth_len], sink.buffered());
+    try testing.expect(vm.trace.precise_resumes >= 1);
+    // And the entered trace really was precise.
+    var saw_precise = false;
+    for (vm.trace.registry.cache.items) |ct| {
+        if (ct.code.deopt_mode == .precise) saw_precise = true;
+    }
+    try testing.expect(saw_precise);
+}
+
+test "executor (precise deopt, doc 45 D6): the snapshot restore writes mid-iteration values into the guest registers" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+
+    // `x = i + 10` writes a register BEFORE `x // d` can fail — the arith
+    // failure's snapshot must restore x's MID-ITERATION value (the doc 45 D2
+    // boundary contract: completed instruction results only, resumed at the
+    // failing bytecode). Recording runs with d == 1 (no failure); the direct
+    // executor call below re-enters with a crafted d == 0.
+    const source: [:0]const u8 =
+        \\local d = 1
+        \\local s = 0
+        \\for i = 1, 400 do
+        \\  local x = i + 10
+        \\  s = s + x // d
+        \\end
+        \\print(s)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = false; // keep the committed trace un-entered
+    vm.trace.config.optimize = false;
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    var pc: u32 = 0;
+    while (pc < chunk.proto.code.len) : (pc += 1)
+        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pc }, {});
+    _ = try vm.run(chunk.proto);
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = &vm.trace.registry.cache.items[0].code;
+    try testing.expectEqual(trace_snapshot.DeoptMode.precise, t.deopt_mode);
+
+    // Structural slot discovery — no hardcoded compiler layout. The `//`
+    // lowers to `.idiv`; its divisor ref is d's entry `slot_load` (d never
+    // changes in the loop, dupe-path indices are identity).
+    var idiv_idx: ?usize = null;
+    for (t.instrs, 0..) |ins, i| {
+        if (ins.op == .idiv) idiv_idx = i;
+    }
+    try testing.expect(idiv_idx != null);
+    const div_b = t.instrs[idiv_idx.?].b;
+    try testing.expectEqual(trace_ir.IrOp.slot_load, t.instrs[div_b].op);
+    const d_slot: usize = @intCast(t.instrs[div_b].aux);
+    // The numeric-for control base from the bytecode.
+    var for_base: ?usize = null;
+    for (chunk.proto.code) |ins| {
+        if (ins.op == .for_prep) for_base = ins.a;
+    }
+    try testing.expect(for_base != null);
+    const base = for_base.?;
+
+    // Craft a coherent anchor-entry state. The loop anchor's entry contract
+    // is POST-for_loop: `i` already holds the current iteration's value (the
+    // recorded body uses it directly; the increment + done guard sit at the
+    // body's END, LuaJIT-style). With i == 7 this iteration computes
+    // x == 17, then divides by the crafted d == 0 and fails mid-body.
+    const nregs: usize = chunk.proto.num_registers;
+    const regs = try gpa.alloc(Value, nregs);
+    defer gpa.free(regs);
+    for (regs) |*r| r.* = Value.int(1);
+    regs[base] = Value.int(7); // control index (current iteration)
+    regs[base + 1] = Value.int(400); // limit
+    regs[base + 2] = Value.int(1); // step
+    regs[base + 3] = Value.int(7); // visible i
+    regs[d_slot] = Value.int(0); // divide-by-zero mid-body
+    const entry = try gpa.dupe(Value, regs);
+    defer gpa.free(entry);
+
+    const values = try gpa.alloc(Value, t.instrs.len);
+    defer gpa.free(values);
+    const result = irinterp.executeValuesCtx(.{ .heap = vm.heap }, t, regs, values);
+
+    // The failing op is the idiv, at iteration 0, and the exit is a precise
+    // resume carrying that op's one-based snapshot.
+    try testing.expectEqual(@as(usize, 0), result.completed);
+    try testing.expectEqual(trace_exec.ExitReason.precise_resume, result.exit_reason);
+    try testing.expectEqual(@as(usize, idiv_idx.?), @as(usize, result.exit_instr));
+    try testing.expect(result.snapshot_id != 0);
+    try testing.expectEqual(t.instrs[idiv_idx.?].snap, result.snapshot_id);
+    const snap = t.snapshots[result.snapshot_id - 1];
+    try testing.expect(snap.resume_pc < chunk.proto.code.len);
+
+    // Restored registers: x holds 17 — a value computed THIS iteration,
+    // before the failure — the proof the restore wrote mid-iteration state
+    // rather than leaving entry state or applying a φ flush. The other
+    // changed slots are the compiler's operand-alias temps (bytecode moves
+    // alias the recorder's reg_map, so their captured refs are the same
+    // this-iteration values): a copy of i (7), of d (0), of x (17). Nothing
+    // outside that envelope may change; in particular the loop controls are
+    // untouched (the increment lives at the body's END and never ran) and s
+    // keeps its entry value (the add after the div never executed).
+    var saw_x = false;
+    var diffs: usize = 0;
+    for (regs, entry) |after, before| {
+        if (after.eql(before)) continue;
+        diffs += 1;
+        try testing.expect(after.eql(Value.int(17)) or after.eql(Value.int(7)) or after.eql(Value.int(0)));
+        if (after.eql(Value.int(17))) saw_x = true;
+    }
+    try testing.expect(diffs >= 1);
+    try testing.expect(saw_x);
+    try testing.expect(regs[base].eql(Value.int(7)));
+    try testing.expect(regs[base + 1].eql(Value.int(400)));
+    try testing.expect(regs[base + 2].eql(Value.int(1)));
+    try testing.expect(regs[base + 3].eql(Value.int(7)));
+}
+
+test "recorder (precise deopt, doc 45 D8 interim): an exec-log session never produces a precise trace and serializes cleanly" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.record_exec_log = true;
+    // The increment-2 constructing loop: under an exec-log session the
+    // `needs_precise` cancel must fall through to an ORDINARY strike — no
+    // memo, no precise retry, no precise commit — because the wire format
+    // cannot carry a precise trace until the D8 bump, and filtering one out
+    // of `encodeFile` would desynchronize `TraceExecLog.trace_id` (a cache
+    // index) for every later trace.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local s = 0
+        \\for i = 1, 400 do
+        \\  local t = {}
+        \\  t.x = i
+        \\  s = s + t.x
+        \\end
+        \\print(s)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 0), vm.trace.precise_anchor_memo.count());
+    for (vm.trace.registry.cache.items) |ct| {
+        try testing.expect(ct.code.deopt_mode != .precise);
+    }
+    // The whole cache serializes (would hard-error on any precise trace).
+    const codes = try gpa.alloc(*const trace.TraceCode, vm.trace.registry.cache.items.len);
+    defer gpa.free(codes);
+    for (vm.trace.registry.cache.items, codes) |record, *code| code.* = &record.code;
+    const bytes = try traceser.encodeFile(gpa, codes);
+    gpa.free(bytes);
 }

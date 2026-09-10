@@ -1234,8 +1234,45 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
         // than spin — `regs` is whatever the last commit left, which is coherent.
         break :iter ExecResult{ .completed = completed, .exit_instr = std.math.maxInt(u32) };
     };
-    if (record) rec.end(completed_out.completed);
-    return completed_out;
+    var out = completed_out;
+    // Doc 45 D6, tier-1a precise materialization. A PRECISE trace's body
+    // guard/arith failure carries a one-based per-bytecode snapshot
+    // (`IrInstr.snap`); write every captured register back into the guest
+    // window HERE — the tier-1a analogue of the native exit stub
+    // "materialize into the current slab" — and mark the exit
+    // `.precise_resume` so the dispatcher resumes tier-0 at the snapshot's
+    // `resume_pc` (never the anchor, never a chain). Soundness of
+    // `values[ref]`: a precise trace is finalized on the DUPE path (no
+    // LICM/CSE, `body_start == 0`), so EVERY instruction — including the
+    // prologue `slot_load`s — re-executes each iteration, and finalize's
+    // `refsDefinedAt` proved each captured ref sits before its snapshot's
+    // use site; at the failing index `i` every captured ref `< i` therefore
+    // holds the CURRENT iteration's value. Exits excluded from restore:
+    // `.terminal`/`.link`/`.loop` are completions/handoffs (φs flushed, not
+    // failures — and P2 precise traces never close `.link`), and a
+    // prologue failure (`snap == 0`, e.g. the eager `guard_gc`) is
+    // iteration-entry coherent, so the ordinary entry contract stands and
+    // the exit stays `.normal`.
+    if (t.deopt_mode == .precise and out.exit_instr != std.math.maxInt(u32)) {
+        const ins = t.instrs[out.exit_instr];
+        switch (ins.op) {
+            .terminal, .link, .loop => {},
+            else => if (ins.snap > 0) {
+                std.debug.assert(ins.snap <= t.snapshots.len); // finalize-validated
+                const s = t.snapshots[ins.snap - 1];
+                for (t.snapshot_slots[s.slots_begin..][0 .. s.slots_len]) |ss| {
+                    // Every captured ref precedes the failing op (validated at
+                    // finalize), so `values[ref]` is this iteration's value.
+                    std.debug.assert(@as(u32, ss.ref) < out.exit_instr);
+                    regs.set(ss.slot, values[ss.ref]);
+                }
+                out.exit_reason = .precise_resume;
+                out.snapshot_id = ins.snap;
+            },
+        }
+    }
+    if (record) rec.end(out.completed);
+    return out;
 }
 
 fn flushPhiWriteback(t: *const Trace, regs: RegWindow, values: []Value) void {

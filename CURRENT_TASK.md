@@ -21,6 +21,65 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-10 (latest+2) — doc 45 increment 4 LANDED (tier-1a precise snapshot-restore executor)
+
+Precise traces now RUN on tier-1a and deopt precisely:
+
+- **Exit ABI** (trace_exec): `ExitReason.precise_resume = 4` / `.precise_error
+  = 5` (error variant reserved for D5) + `ExecResult.snapshot_id` (one-based,
+  0 everywhere else — construction sites untouched). Ordinal pin test extended.
+- **Executor materialization** (irinterp, ONE shared exit point after the iter
+  block): precise + failing op with `snap > 0` → write every captured
+  `SnapshotSlot` into the guest window (`regs.set(slot, values[ref])`), stamp
+  `.precise_resume` + `snapshot_id`. Sound because precise finalizes on the
+  DUPE path (no LICM/CSE, `body_start == 0`): every instr — including prologue
+  slot_loads — re-executes per iteration, so refs `< exit_instr` hold the
+  CURRENT iteration's values (finalize's `refsDefinedAt` proved order).
+  `.terminal`/`.link`/`.loop` and `snap == 0` prologue exits excluded.
+- **Dispatcher** (enterSelectedTrace): a `.precise_resume` arm (after the
+  terminal consumer, before the head zero-exit arm — covers ALL anchor kinds)
+  validates snapshot range/register_count and returns
+  `.resume_tier0(snapshot.resume_pc)` — regs are MID-ITERATION so no sibling
+  trial/chain/continuation-arm/side-want (D6's mis-bucketing hazard);
+  ordinary receipt keeps the thrash gate live. Witness: `precise_resumes`
+  counter. A second loop-anchor arm handles `snap == 0` prologue exits
+  (iteration-entry coherent → ordinary entry contract minus suppressed
+  machinery). One-shot prologue exits ride the existing head zero-exit arm.
+- **Selection flipped**: the back-edge walk's blanket precise decline is gone —
+  tier-1a enters precise traces. Native mode still declines (compileImpl bail
+  → the existing native-unsupported safety net). Exec-log sessions never
+  PRODUCE a precise trace: `consumeRecordingAbort` treats `.needs_precise` as
+  an ordinary strike under `record_exec_log` — critical because
+  `TraceExecLog.trace_id` is a cache INDEX, so filtering a precise trace out
+  of `traceser.encodeFile` would silently desynchronize every later trace
+  from its exec log (found while wiring the D8-interim guard; encodeFile
+  stays strict). Belt: enterSelectedTrace also declines precise under
+  record_exec_log.
+- **P2 link prohibitions, arm AND dispatch**: recorder refuses `.link` closes
+  on precise candidates (recForPrepLink + recWhileLink; finalize backstop
+  asserts link_target/peel null); `findLinkTrace` / `resolveLoopDoneCont` /
+  driveChain's sibling walk skip precise pages; `armNativeLink` refuses
+  precise on either end.
+- **Anchor-entry contract pinned by test** (matters for the native half): loop
+  entry state is POST-for_loop — the body consumes `i` directly and the
+  increment + done guard close the body — so a loop-done deopt's snapshot
+  resumes AT the for_loop bytecode and tier-0 re-runs the increment.
+- **Tests**: (1) mid-loop element-guard failure (float in int array at i=200)
+  precise-resumes on tier-1a, output byte-identical to tier-0, witness ≥ 1;
+  (2) direct-executor divide-by-zero proves MID-ITERATION restore (x + its
+  operand-alias temps = this-iteration values; controls + s untouched);
+  (3) exec-log session commits no precise trace and serializes cleanly.
+- Gates: `zig build test` (1308), `zig build wasm`, `just hashgate` (84 ×2)
+  all green. Hashgate MUST stay green here: P1 precise bodies are pure, so
+  precise resume vs entry replay is observationally equivalent — which is
+  exactly why the witness counter, not output, proves the path fired.
+
+**Next**: the NATIVE precise executor (D6 exit stubs: snapshot flush +
+`activation_base`/`depth`/`runtime_error` + final non-yielded precise ledger
+row + layout assertions), optimizer integration (snapshot refs as tropt
+liveness roots + `canon`/`new_index` remap so precise leaves the dupe path),
+then D4 tnew/tset construction — the actual btrees lever.
+
 ## Status 2026-09-10 (latest+1) — doc 45 D2 increment 3 LANDED (recorder per-bytecode snapshot capture)
 
 Precise candidates now CAPTURE their snapshots end-to-end:

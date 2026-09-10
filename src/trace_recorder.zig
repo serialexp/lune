@@ -2891,6 +2891,13 @@ pub const RecordingSession = struct {
         self.setReg(a, rfirst);
         self.setReg(a + 3, rfirst);
 
+        // Doc 45 D6 (P2): a PRECISE candidate never closes `.link` — no link
+        // OUT of a precise page (the chain machinery has no precise-exit
+        // consumer, and a `.link` tail would make this page selectable by
+        // `findLinkTrace`'s structural predicate). Ordinary admission
+        // refusal; constructing outers with inner loops stay tier-0 until
+        // their own phase (P3+) lands a precise link contract.
+        if (self.precise) return self.abort(.nyi_opcode);
         // Close with the `.link` terminator (commit reads `link_target`). closeTrace
         // commits + clears `active`; a build failure gates the anchor, like any abort.
         // A-i.4: stamp the `.link` terminal's provenance (edge 2). `for_prep` is the
@@ -2984,6 +2991,9 @@ pub const RecordingSession = struct {
         // spawns its own root; a later continuation then links here.
         if (!self.context.inner_root) return;
 
+        // Doc 45 D6 (P2): no `.link` close on a PRECISE candidate (see
+        // `recForPrepLink` — same refusal, same rationale).
+        if (self.precise) return self.abort(.nyi_opcode);
         // Close with a `.link` terminal to the inner while root. The φ writeback
         // in `commit()` ensures all modified slots are flushed; unmodified slots
         // remain coherent in the physical register file.
