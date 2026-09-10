@@ -453,7 +453,7 @@ pub const Heap = struct {
     /// A hit costs one hash + on average ≤1 chain hop (grow keeps load ≤ ~100%).
     fn strtabLookup(self: *const Heap, content: []const u8, hash: u64) ?*String {
         if (self.strtab.len == 0) return null;
-        var s = self.strtab[hash & (self.strtab.len - 1)];
+        var s = self.strtab[@as(usize, @truncate(hash)) & (self.strtab.len - 1)];
         while (s) |cur| : (s = cur.next_intern) {
             if (cur.hash == hash and cur.len == content.len and std.mem.eql(u8, cur.bytes(), content))
                 return cur;
@@ -464,7 +464,7 @@ pub const Heap = struct {
     /// Push `s` at its bucket's head. Infallible; the caller has ensured capacity.
     fn strtabInsert(self: *Heap, s: *String) void {
         std.debug.assert(self.strtab.len != 0);
-        const idx = s.hash & (self.strtab.len - 1);
+        const idx = @as(usize, @truncate(s.hash)) & (self.strtab.len - 1);
         s.next_intern = self.strtab[idx];
         self.strtab[idx] = s;
         self.strtab_count += 1;
@@ -500,7 +500,7 @@ pub const Heap = struct {
             var s = head;
             while (s) |cur| {
                 const next = cur.next_intern; // save before overwriting the link
-                const idx = cur.hash & mask;
+                const idx = @as(usize, @truncate(cur.hash)) & mask;
                 cur.next_intern = nt[idx];
                 nt[idx] = cur;
                 s = next;
