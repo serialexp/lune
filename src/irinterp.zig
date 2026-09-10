@@ -58,6 +58,7 @@ const fmath = @import("fmath.zig");
 const gc = @import("gc.zig");
 const stralloc = @import("stralloc.zig");
 const string_mod = @import("string.zig");
+const table_runtime = @import("table_runtime.zig");
 const string_std = @import("stdlib/string.zig");
 const Value = value.Value;
 
@@ -172,6 +173,13 @@ pub fn execute(t: *const Trace, regs: RegWindow, values: []Value) ExecResult {
 /// trace without a heap can never allocate.
 pub const ExecCtx = struct {
     heap: ?*gc.Heap = null,
+    /// Doc 45 D6 activation contract for precise exits (echoed verbatim into
+    /// `ExecResult.activation_base`/`.activation_depth`): the frame-window
+    /// base and inlined-frame depth the trace's snapshots are relative to.
+    /// P2 precise recording refuses frame inlining, so production always
+    /// passes the anchor activation (0, 0) and the dispatcher asserts it.
+    activation_base: u32 = 0,
+    activation_depth: u32 = 0,
 };
 
 /// `execute` with a VM context attached (doc 24): required for traces that
@@ -252,6 +260,12 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
     std.debug.assert(values.len >= t.instrs.len);
     if (record) rec.begin();
     var completed: usize = 0;
+    // Doc 45 D5: nonzero iff a PRECISE effect shim (`tnew` today) raised a
+    // runtime error — the `table_runtime.Status` ordinal, set immediately
+    // before the failing op's `break :iter`. The shared exit tail folds it
+    // into the result: same snapshot restore as a guard miss, but the exit
+    // becomes `.precise_error` (the dispatcher raises, never resumes).
+    var runtime_error: u32 = 0;
     // Phase E1 (LICM): instructions before the `preheader` marker run **once**
     // (on the first pass); their `values[]` persist and are reused every later
     // iteration. `body_start` is the first per-iteration instruction (0 when there
@@ -1182,6 +1196,44 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     }
                 },
 
+                // ---- doc 45 D3: identity-bearing table allocation ----
+                // Runs EXACTLY once per iteration via the D5 shim (one
+                // `Heap.newTable`, one GC id, no collect — `guard_gc` already
+                // proved the budget at the loop head). On OOM: nothing was
+                // linked, no id advanced; record the shim status and break —
+                // the exit tail restores this op's snapshot and reports
+                // `.precise_error`, which tier-0 turns into the identical
+                // parked error at the identical pc WITHOUT re-executing the
+                // bytecode (execute-once, never a retry). No-heap (bare
+                // harness) fails closed as a plain break: the tail makes it a
+                // `.precise_resume`, so tier-0 re-executes the still-
+                // unperformed `new_table` itself — allocation still happens
+                // exactly once.
+                .tnew => {
+                    if (ctx.heap) |heap| {
+                        var out_tbl: *table.Table = undefined;
+                        switch (table_runtime.tnew(heap, &out_tbl)) {
+                            .ok => {
+                                values[i] = Value.heap(&out_tbl.header);
+                                if (record) rec.value(i, values[i]);
+                                continue;
+                            },
+                            else => |status| {
+                                runtime_error = @intFromEnum(status);
+                            },
+                        }
+                    }
+                    if (record) rec.exit(i, .guard, Value.nil());
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                // Doc 45 D3: `tset` is reserved — nothing emits it yet;
+                // finalize's well-formedness pass traps on it, so reaching
+                // this arm means a malformed hand-built trace. Fail closed.
+                .tset => {
+                    if (record) rec.exit(i, .guard, Value.nil());
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+
                 // ---- close: commit the loop-carried writes, then iterate ----
                 .loop => {
                     // φ writeback: a slot-bound φ flushes its update to the register
@@ -1256,7 +1308,7 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
     if (t.deopt_mode == .precise and out.exit_instr != std.math.maxInt(u32)) {
         const ins = t.instrs[out.exit_instr];
         switch (ins.op) {
-            .terminal, .link, .loop => {},
+            .terminal, .link, .loop => std.debug.assert(runtime_error == 0),
             else => if (ins.snap > 0) {
                 std.debug.assert(ins.snap <= t.snapshots.len); // finalize-validated
                 const s = t.snapshots[ins.snap - 1];
@@ -1266,11 +1318,27 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     std.debug.assert(@as(u32, ss.ref) < out.exit_instr);
                     regs.set(ss.slot, values[ss.ref]);
                 }
-                out.exit_reason = .precise_resume;
+                // Doc 45 D5: a shim failure (`runtime_error != 0`) shares
+                // the restore verbatim — the guest registers ARE the
+                // pre-instruction state — but exits `.precise_error`: the
+                // dispatcher parks the actual error at `resume_pc` instead
+                // of resuming (the effect never happened; nothing to redo).
+                out.exit_reason = if (runtime_error != 0) .precise_error else .precise_resume;
+                out.runtime_error = runtime_error;
                 out.snapshot_id = ins.snap;
+                out.activation_base = ctx.activation_base;
+                out.activation_depth = ctx.activation_depth;
+            } else {
+                // A precise runtime ERROR without a snapshot has nowhere to
+                // park — finalize's `requiresPreciseSnapshot` pass makes it
+                // unrepresentable; never degrade one to `.normal`.
+                std.debug.assert(runtime_error == 0);
             },
         }
     }
+    // `tnew` only exists in precise traces (finalize-asserted), so a shim
+    // failure is always folded above — it can never leak out as `.normal`.
+    std.debug.assert(runtime_error == 0 or out.exit_reason == .precise_error);
     if (record) rec.end(out.completed);
     return out;
 }

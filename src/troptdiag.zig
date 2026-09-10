@@ -196,7 +196,17 @@ fn detectDeadCarries(
             // Doc 43 P5: `uref` reads no operands (its seed slot rides `aux`).
             // `.terminal` (doc 44) likewise: `a` is a kind tag, `aux` a resume
             // pc — no operand refs.
-            .slot_load, .konst, .loop, .preheader, .link, .guard_gc, .uref, .terminal => {},
+            // Doc 45 D3: `tnew` is likewise operand-free (a fresh-table
+            // producer; its `guard_gc` budget coupling is structural, not an
+            // operand).
+            .slot_load, .konst, .loop, .preheader, .link, .guard_gc, .uref, .terminal, .tnew => {},
+            // Doc 45 D3: `tset` is reserved (nothing emits it yet); its
+            // declared encoding reads table (`a`), key (`b`), value (`aux`).
+            .tset => {
+                uses[ins.a] += 1;
+                uses[ins.b] += 1;
+                uses[@intCast(ins.aux)] += 1;
+            },
         }
     }
 
@@ -317,10 +327,13 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
             .ustore => ins.a == idx or ins.b == idx,
             .uload => ins.a == idx,
             .phi => (ins.aux == trace.PHI_INTERNAL and ins.a == idx) or ins.b == idx,
+            // Doc 45 D3: `tset` (reserved) declares table/key/value refs.
+            .tset => ins.a == idx or ins.b == idx or @as(trace.Ref, @intCast(ins.aux)) == idx,
             // `.link` (doc 15) consumes no refs (`aux` is the inner anchor pc).
             // `guard_gc` (doc 24) is operand-free: `a` unused, `aux` = bound A.
             // `uref` (doc 43 P5) likewise reads nothing (`aux` = seed slot).
-            .slot_load, .konst, .loop, .preheader, .link, .guard_gc, .uref, .terminal => false,
+            // `tnew` (doc 45 D3) is operand-free too.
+            .slot_load, .konst, .loop, .preheader, .link, .guard_gc, .uref, .terminal, .tnew => false,
         };
         if (consumes) {
             found_consumer = true;

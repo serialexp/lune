@@ -193,10 +193,13 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
                     return error.InvalidSnapshotMetadata;
                 if (!trace_snapshot.refsDefinedAt(ins.snap, i, owned.snapshots, owned.snapshot_slots))
                     return error.InvalidSnapshotMetadata;
-            } else if (ir.isSideExitGuardOp(ins.op) and i > @as(usize, @intCast(gr))) {
+            } else if (ir.requiresPreciseSnapshot(ins.op) and i > @as(usize, @intCast(gr))) {
                 // A potentially failing BODY op without a snapshot: only the
                 // prologue (entry loads + the eager `guard_gc`) may fail
-                // pre-body with entry-replay semantics.
+                // pre-body with entry-replay semantics. Covers side-exit
+                // guards AND the fallible effect ops (`tnew`/`tset`, doc 45
+                // D3) — an OOM at a snap-less `tnew` would have nowhere to
+                // resume.
                 return error.InvalidSnapshotMetadata;
             }
         }
@@ -442,6 +445,15 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
                     std.debug.assert(assoc.op == .phi and assoc.aux == PHI_INTERNAL);
                 }
             },
+            // Doc 45 D3 `tnew`: operand-free identity-bearing allocation —
+            // only legal in a PRECISE trace (its OOM leg needs the
+            // per-bytecode snapshot + `.precise_error` contract; the snap
+            // requirement itself is enforced by the finalize loop via
+            // `requiresPreciseSnapshot`).
+            .tnew => std.debug.assert(precise),
+            // Doc 45 D3 `tset`: reserved — nothing may emit it until the
+            // effect-ordering increment lands.
+            .tset => unreachable,
             // Preheader region boundary (Phase E1): a pure marker, no operands.
             // Structural invariants (at most one; before any φ) are asserted in
             // the global pass below.

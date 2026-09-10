@@ -1153,6 +1153,14 @@ pub const TraceState = struct {
     /// entry replay is observationally equivalent) — the executor tests
     /// assert on this witness. No tiering path reads it.
     precise_resumes: u64 = 0,
+    /// Doc 45 D5 diagnostic: tier-1a `.precise_error` exits consumed — a
+    /// PRECISE trace's effect shim (`tnew`) raised a runtime error, the
+    /// executor restored the failing op's snapshot, and the dispatcher
+    /// parked the mapped error at the snapshot's pc (no receipt, no strike,
+    /// no retry). The OOM identity test asserts on this witness — output/
+    /// heap equality alone cannot prove the raise took the precise path.
+    /// No tiering path reads it.
+    precise_errors: u64 = 0,
     /// Doc 44 D11 diagnostic: successful native self-call frame pushes
     /// (`nativeSelfCallPush` → PUSH_OK). Output equality alone cannot prove a
     /// descent actually pushed (the plain-terminal turnstile is

@@ -180,6 +180,13 @@ fn kindOf(op: IrOp) OpKind {
         // freshly-recorded trace (the recorder emits none); the LICM pass below
         // *synthesizes* it during compaction. Mapped for switch-exhaustiveness.
         .preheader => .preheader,
+        // Doc 45 D3: `tnew`/`tset` live only in PRECISE traces, which are
+        // cached unoptimized via `dupe` — `finalize` routes `rec.precise`
+        // around `optimize`, so this pass can never see them. Fail closed
+        // rather than invent an optimization class for ops whose entire
+        // contract (ordered effect roots, no CSE/DCE/hoist/sink) is "the
+        // optimizer must not touch me".
+        .tnew, .tset => unreachable,
         // Doc 24 D4: allocating interned-string producers. `.alloc` is a
         // side-effecting VALUE-PRODUCING root class: allocation events are
         // effects on the serialized id stream (`next_obj_id` is byte-compared),

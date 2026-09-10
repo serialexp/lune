@@ -21,6 +21,66 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-11 (latest+3) — doc 45 P2 slice 1 LANDED (tnew recording + tier-1a precise execution of allocating bodies)
+
+Construction now RECORDS and RUNS on tier-1a — the first real btrees lever
+slice (codex-reviewed plan, all required corrections implemented):
+
+- **IR**: `tnew` (wire 88, operand-free heap producer via `emitAlloc`, ordered
+  effect root, PRECISE-only — `assertWellFormed` pins it) and `tset` (wire 89
+  RESERVED: finalize traps, executor fails closed, nothing emits). Ordinal pin
+  test + viz `enums.ts` updated; tropt `kindOf` is `unreachable` for both
+  (precise = dupe path, the optimizer can never see them).
+- **Recorder**: precise `.new_table` → `setReg(a, emitAlloc(tnew))`. The
+  transition test now proves the retry gets PAST the construction (dies at
+  the absent-key insert `.bad_type` one bytecode later, ir_len strictly
+  longer). Sunk stores stay refused; IMMEDIATE stores still emit → mixed
+  bodies (tnew + inline astore) commit, covered by test.
+- **Finalize**: `requiresPreciseSnapshot(op)` = side-exit guards + tnew/tset;
+  a snap-less fallible effect past guard_gc → `error.InvalidSnapshotMetadata`.
+- **Shim** (table_runtime): `tnew(heap, out) callconv(.c) Status`
+  (ok/out_of_memory/type_error, ABI ordinals pinned by test) — exactly one
+  `Heap.newTable`, no collect, no rollback, no retry.
+- **Executor** (irinterp): `.tnew` arm runs the shim once per iteration; OOM
+  sets local `runtime_error` + breaks; the SHARED exit tail restores the op's
+  snapshot for BOTH `.precise_resume` and `.precise_error`, asserts a precise
+  runtime error never reaches a snap-less op (no degrade to `.normal`), and
+  echoes the activation contract — `ExecResult.runtime_error` /
+  `activation_base` / `activation_depth` (tier-1a always 0/0 — P2 precise
+  refuses inlining — dispatcher asserts it). No-heap harness fails closed as
+  a plain `.precise_resume` (tier-0 performs the still-unexecuted alloc).
+- **Dispatcher** (interp): `.precise_error` consumer — validated like
+  `.precise_resume` but NO receipt/strike/want/chain/mode-switch (the error
+  unwinds); maps `Status.out_of_memory → Error.OutOfMemory` (uncatchable,
+  D5); returns new `EntryDirective.raise_at{pc, err}`. All FIVE consumption
+  sites (jfor_loop, jloop, jfunc_head, jcont patched entries + back-edge walk
+  via `BackEdgeDirective.raise_at`) do `st.frame.pc = pc; parkErr(err)` —
+  identical parked location to tier-0's own OOM at that bytecode, with NO
+  re-execution (execute-once; a tier-0 re-run would be a forbidden retry).
+  Witness counter: `precise_errors`.
+- **Tests** (4 new): money identity (pure `local t = {}` loop → precise
+  commit with ONE tnew + `guard_gc aux == 1`, tier-1a runs it, output +
+  `next_obj_id` + `object_count` byte-match tier-0 incl. across the final
+  loop-done precise resume); direct-executor one-shot OOM (custom fail-Nth
+  wrapper over `heap.gpa`: `.precise_error`, status=1, right snapshot,
+  regs == entry exactly, ZERO heap effect; then real heap: 14 iterations =
+  exactly 14 new IDs); full-pipeline OOM identity (fail the K-th GUEST heap
+  allocation in tier-0 truth AND traced runs — same error, same
+  next_obj_id/object_count/parked frame pc, `precise_errors == 1` proves the
+  raise took the tier-1a path; sound because the trace machinery holds its
+  own allocator copy, so `heap.gpa` swap counts guest allocations only);
+  mixed body (tnew + inline astore commit in ONE precise trace; mid-loop
+  element-guard resume at i==200 AFTER both effects ran — neither repeats).
+- Gates: `zig build test` (1312), `zig build wasm`, `just hashgate` (84 ×2)
+  all green.
+
+**Note for the bench board**: under `--jit-native` precise traces still DON'T
+run — the back-edge walk skips native-unsupported candidates entirely
+(`nativeFor == null` → continue), and compileImpl declines precise. So btrees
+won't move until the NATIVE precise executor lands. That (D6 native half:
+exit-stub snapshot flush, runtime_error/activation ABI, ledger row) is the
+next slice, then tset/constructor stores.
+
 ## Status 2026-09-10 (latest+2) — doc 45 increment 4 LANDED (tier-1a precise snapshot-restore executor)
 
 Precise traces now RUN on tier-1a and deopt precisely:

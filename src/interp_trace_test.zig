@@ -5651,10 +5651,11 @@ test "recorder (precise deopt, doc 45 D2): new_table cancels needs_precise ONCE,
     // A hot loop whose body constructs a table. First recording is non-precise
     // → `new_table` cancels `.needs_precise` (no gate strike, anchor memoized,
     // counter rewound to hotloop-1 so the retry arms on the very next
-    // back-edge). The retry arms with `rec.precise` and — construction
-    // recording (doc 45 D4) not being built yet — aborts `.nyi_opcode` at the
-    // same instruction, striking the gate normally. Net: exactly one
-    // non-penalized retry, then today's behaviour.
+    // back-edge). The retry arms with `rec.precise` and — since increment 5 —
+    // records the construction itself as `tnew`, then dies one bytecode LATER
+    // at `t.x = i` (an absent-key hash insert, `.bad_type` — inserts stay out
+    // of scope), striking the gate normally. Net: exactly one non-penalized
+    // retry that provably got PAST the construction, then today's behaviour.
     var chunk = try runForTrace(&vm, gpa,
         \\local s = 0
         \\for i = 1, 400 do
@@ -5666,36 +5667,36 @@ test "recorder (precise deopt, doc 45 D2): new_table cancels needs_precise ONCE,
     , true);
     defer chunk.deinit();
 
-    // Nothing commits (construction recording doesn't exist yet).
+    // Nothing commits (the insert aborts every precise retry).
     try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
 
-    // The abort log carries the transition: one `.needs_precise` row and at
-    // least one `.nyi_opcode` row, both on `new_table` at the SAME anchor —
-    // the retry re-recorded from the real loop anchor, it wasn't blacklisted.
+    // The abort log carries the transition: one `.needs_precise` row on
+    // `new_table`, and at least one retry row at the SAME anchor that aborted
+    // PAST the construction (`set_index`, `.bad_type`) — the retry
+    // re-recorded from the real loop anchor (not blacklisted) and `tnew`
+    // recording carried it through the `new_table` bytecode.
     var cancel_row: ?trace.AbortRecord = null;
-    var nyi_row: ?trace.AbortRecord = null;
+    var retry_row: ?trace.AbortRecord = null;
     for (vm.trace.abort_log.items) |r| {
-        if (r.op != .new_table) continue;
-        switch (r.reason) {
-            .needs_precise => {
-                try testing.expect(cancel_row == null); // deduped: one row
-                cancel_row = r;
-            },
-            .nyi_opcode => nyi_row = r,
-            else => {},
+        if (r.op == .new_table and r.reason == .needs_precise) {
+            try testing.expect(cancel_row == null); // deduped: one row
+            cancel_row = r;
         }
+        if (r.op == .set_index and r.reason == .bad_type) retry_row = r;
+        // The old pre-increment-5 outcome must be gone: no precise retry
+        // ever aborts ON the construction bytecode again.
+        try testing.expect(!(r.op == .new_table and r.reason == .nyi_opcode));
     }
     try testing.expect(cancel_row != null);
-    try testing.expect(nyi_row != null);
+    try testing.expect(retry_row != null);
     try testing.expectEqual(@as(u64, 1), cancel_row.?.count); // memo held: cancelled exactly once
-    try testing.expectEqual(cancel_row.?.anchor_pc, nyi_row.?.anchor_pc);
-    try testing.expectEqual(cancel_row.?.abort_pc, nyi_row.?.abort_pc);
-    // The retry re-recorded from the same anchor and died at the same
-    // `new_table` bytecode — but in PRECISE mode, so it first emitted the
-    // full entry-load + eager-guard_gc prologue. Its partial trace is
-    // therefore STRICTLY LONGER than the non-precise attempt's (the prologue),
-    // which is exactly the observable signature of the precise re-arm.
-    try testing.expect(nyi_row.?.ir_len > cancel_row.?.ir_len);
+    try testing.expectEqual(cancel_row.?.anchor_pc, retry_row.?.anchor_pc);
+    // The retry died STRICTLY PAST the construction bytecode...
+    try testing.expect(retry_row.?.abort_pc > cancel_row.?.abort_pc);
+    // ...and its partial trace is strictly longer: the precise entry-load +
+    // eager-`guard_gc` prologue plus the recorded `tnew` itself — the
+    // observable signature of the precise re-arm reaching further.
+    try testing.expect(retry_row.?.ir_len > cancel_row.?.ir_len);
 
     // Policy state: the anchor is memoized for precise mode, and the nyi
     // retry struck the record gate normally (ordinary strikes resumed — the
@@ -5984,6 +5985,430 @@ test "executor (precise deopt, doc 45 D6): the snapshot restore writes mid-itera
     try testing.expect(regs[base + 1].eql(Value.int(400)));
     try testing.expect(regs[base + 2].eql(Value.int(1)));
     try testing.expect(regs[base + 3].eql(Value.int(7)));
+}
+
+test "executor (tnew, doc 45 D3): a pure construction loop commits precise, executes on tier-1a, and allocates exactly once per iteration" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    // The money shape for the whole increment: `local t = {}` per iteration.
+    // The FIRST recording cancels `.needs_precise`; the natural retry arms
+    // precise (no memo pre-seeding here — the full cancel/re-arm/commit/
+    // execute pipeline is under test), records `tnew`, commits, and tier-1a
+    // runs the loop. Identity bar: output, `next_obj_id` (a monotonic count
+    // of every allocation ever — the exactly-once witness: a re-run of any
+    // iteration's `tnew`, e.g. across the final loop-done deopt, would
+    // advance it extra) and `object_count` must all match pure tier-0.
+    const source: [:0]const u8 =
+        \\local n = 0
+        \\for i = 1, 400 do
+        \\  local t = {}
+        \\  n = n + 1
+        \\end
+        \\print(n)
+    ;
+
+    // Tier-0 truth.
+    var truth: [64]u8 = undefined;
+    var truth_len: usize = 0;
+    var truth_next_id: u32 = 0;
+    var truth_obj_count: usize = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        truth_len = sink.buffered().len;
+        @memcpy(truth[0..truth_len], sink.buffered());
+        truth_next_id = vm.heap.next_obj_id;
+        truth_obj_count = vm.heap.object_count;
+    }
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = false;
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    try testing.expectEqualStrings(truth[0..truth_len], sink.buffered());
+    try testing.expectEqual(truth_next_id, vm.heap.next_obj_id);
+    try testing.expectEqual(truth_obj_count, vm.heap.object_count);
+
+    // A precise trace committed carrying the construction: exactly one
+    // `tnew`, routed through `emitAlloc` — the eager `guard_gc`'s stamped
+    // bound is exactly 1 — and every fallible body op snapshot-stamped.
+    var money: ?*const trace.Trace = null;
+    for (vm.trace.registry.cache.items) |ct| {
+        for (ct.code.instrs) |ins| {
+            if (ins.op == .tnew) money = ct;
+        }
+    }
+    try testing.expect(money != null);
+    const t = &money.?.code;
+    try testing.expectEqual(trace_snapshot.DeoptMode.precise, t.deopt_mode);
+    var tnew_count: usize = 0;
+    var gc_aux: ?i32 = null;
+    for (t.instrs) |ins| {
+        if (ins.op == .tnew) {
+            tnew_count += 1;
+            try testing.expect(ins.snap > 0); // requiresPreciseSnapshot held
+        }
+        if (ins.op == .guard_gc) gc_aux = ins.aux;
+    }
+    try testing.expectEqual(@as(usize, 1), tnew_count);
+    try testing.expectEqual(@as(i32, 1), gc_aux.?);
+    // The loop-done exit of a precise dupe-path trace is a body guard with a
+    // snapshot — the run's clean completions surface as precise resumes.
+    try testing.expect(vm.trace.precise_resumes >= 1);
+}
+
+test "executor (tnew OOM, doc 45 D5): a one-shot allocation failure exits precise_error with restored registers and zero heap effect" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const table_runtime = @import("table_runtime.zig");
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+
+    const source: [:0]const u8 =
+        \\local n = 0
+        \\for i = 1, 400 do
+        \\  local t = {}
+        \\  n = n + 1
+        \\end
+        \\print(n)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = false; // keep the committed trace un-entered
+    vm.trace.config.optimize = false;
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    var pcs: u32 = 0;
+    while (pcs < chunk.proto.code.len) : (pcs += 1)
+        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pcs }, {});
+    _ = try vm.run(chunk.proto);
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = &vm.trace.registry.cache.items[0].code;
+    try testing.expectEqual(trace_snapshot.DeoptMode.precise, t.deopt_mode);
+    var tnew_idx: ?usize = null;
+    for (t.instrs, 0..) |ins, i| {
+        if (ins.op == .tnew) tnew_idx = i;
+    }
+    try testing.expect(tnew_idx != null);
+
+    // Coherent anchor-entry state (POST-for_loop contract), limit 20 so the
+    // success run below stays far under the GC trigger.
+    var for_base: ?usize = null;
+    for (chunk.proto.code) |ins| {
+        if (ins.op == .for_prep) for_base = ins.a;
+    }
+    try testing.expect(for_base != null);
+    const base = for_base.?;
+    const nregs: usize = chunk.proto.num_registers;
+    const regs = try gpa.alloc(Value, nregs);
+    defer gpa.free(regs);
+    for (regs) |*r| r.* = Value.int(1);
+    regs[base] = Value.int(7); // control index (current iteration)
+    regs[base + 1] = Value.int(20); // limit
+    regs[base + 2] = Value.int(1); // step
+    regs[base + 3] = Value.int(7); // visible i
+    const entry = try gpa.dupe(Value, regs);
+    defer gpa.free(entry);
+    const values = try gpa.alloc(Value, t.instrs.len);
+    defer gpa.free(values);
+    vm.heap.next_gc = 1_000_000; // keep guard_gc out of the way
+
+    // One-shot failing allocator over the heap's real gpa: the FIRST heap
+    // allocation attempt (this iteration's `tnew`) fails.
+    const FailNth = struct {
+        inner: std.mem.Allocator,
+        fail_at: usize, // 1-based allocation call that fails; others forward
+        count: usize = 0,
+        const VT = std.mem.Allocator.VTable{ .alloc = allocFn, .resize = resizeFn, .remap = remapFn, .free = freeFn };
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &VT };
+        }
+        fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            if (self.count == self.fail_at) return null;
+            return self.inner.vtable.alloc(self.inner.ptr, len, alignment, ret_addr);
+        }
+        fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.inner.vtable.resize(self.inner.ptr, memory, alignment, new_len, ret_addr);
+        }
+        fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.inner.vtable.remap(self.inner.ptr, memory, alignment, new_len, ret_addr);
+        }
+        fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.inner.vtable.free(self.inner.ptr, memory, alignment, ret_addr);
+        }
+    };
+    var failing = FailNth{ .inner = vm.heap.gpa, .fail_at = 1 };
+    const real_gpa = vm.heap.gpa;
+    vm.heap.gpa = failing.allocator();
+    const id_before = vm.heap.next_obj_id;
+    const count_before = vm.heap.object_count;
+    const oom = irinterp.executeValuesCtx(.{ .heap = vm.heap }, t, regs, values);
+    vm.heap.gpa = real_gpa;
+
+    // D5: the failing `tnew` performed NOTHING — no object linked, no id
+    // consumed — and the exit carries the op's snapshot with the shim's
+    // status; the registers are the exact pre-instruction (== entry, nothing
+    // was written yet this iteration) state.
+    try testing.expectEqual(@as(usize, 0), oom.completed);
+    try testing.expectEqual(trace_exec.ExitReason.precise_error, oom.exit_reason);
+    try testing.expectEqual(@as(u32, @intFromEnum(table_runtime.Status.out_of_memory)), oom.runtime_error);
+    try testing.expectEqual(@as(usize, tnew_idx.?), @as(usize, oom.exit_instr));
+    try testing.expectEqual(t.instrs[tnew_idx.?].snap, oom.snapshot_id);
+    try testing.expectEqual(@as(u32, 0), oom.activation_base);
+    try testing.expectEqual(@as(u32, 0), oom.activation_depth);
+    try testing.expectEqual(id_before, vm.heap.next_obj_id);
+    try testing.expectEqual(count_before, vm.heap.object_count);
+    for (regs, entry) |after, before| try testing.expect(after.eql(before));
+
+    // Same entry against the REAL heap: i = 7..20 is 14 iterations, each
+    // allocating exactly one table — the executor-level exactly-once count.
+    @memcpy(regs, entry);
+    const ok = irinterp.executeValuesCtx(.{ .heap = vm.heap }, t, regs, values);
+    try testing.expectEqual(trace_exec.ExitReason.precise_resume, ok.exit_reason);
+    try testing.expectEqual(@as(u32, 14), vm.heap.next_obj_id - id_before);
+    try testing.expectEqual(@as(usize, 14), vm.heap.object_count - count_before);
+}
+
+test "pipeline (tnew OOM, doc 45 D5): a mid-execution heap OOM raises identically to tier-0 through the precise_error path" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    const source: [:0]const u8 =
+        \\local n = 0
+        \\for i = 1, 400 do
+        \\  local t = {}
+        \\  n = n + 1
+        \\end
+        \\print(n)
+    ;
+
+    // The K-th allocation THROUGH THE HEAP fails (guest allocations only —
+    // the trace machinery holds its own copy of the VM allocator, so the
+    // swap below never sees it). K = 150 lands mid-loop, well after the
+    // precise trace commits (~iteration 10 at hotloop 4), so tier-1a is
+    // executing when the OOM hits — the guest-visible outcome must be
+    // byte-identical to tier-0 dying at the same allocation.
+    const FailNth = struct {
+        inner: std.mem.Allocator,
+        fail_at: usize,
+        count: usize = 0,
+        const VT = std.mem.Allocator.VTable{ .alloc = allocFn, .resize = resizeFn, .remap = remapFn, .free = freeFn };
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &VT };
+        }
+        fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            if (self.count == self.fail_at) return null;
+            return self.inner.vtable.alloc(self.inner.ptr, len, alignment, ret_addr);
+        }
+        fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.inner.vtable.resize(self.inner.ptr, memory, alignment, new_len, ret_addr);
+        }
+        fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.inner.vtable.remap(self.inner.ptr, memory, alignment, new_len, ret_addr);
+        }
+        fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.inner.vtable.free(self.inner.ptr, memory, alignment, ret_addr);
+        }
+    };
+    const K: usize = 150;
+
+    // Tier-0 truth under the same failure schedule.
+    var truth_next_id: u32 = 0;
+    var truth_obj_count: usize = 0;
+    var truth_parked_pc: usize = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        var failing = FailNth{ .inner = vm.heap.gpa, .fail_at = K };
+        vm.heap.gpa = failing.allocator();
+        try testing.expectError(interp.Error.OutOfMemory, vm.run(chunk.proto));
+        vm.heap.gpa = failing.inner;
+        try testing.expectEqual(@as(usize, 0), sink.buffered().len); // died pre-print
+        truth_next_id = vm.heap.next_obj_id;
+        truth_obj_count = vm.heap.object_count;
+        truth_parked_pc = vm.frames[0].pc;
+    }
+
+    // Traced run, same schedule: the OOM must surface as the SAME error with
+    // the SAME partial heap (execute-once through `.precise_error` — a
+    // double-run or a skip of any iteration's `tnew` shifts the failing
+    // iteration and breaks the counts) and park at the SAME bytecode.
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = false;
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    var failing = FailNth{ .inner = vm.heap.gpa, .fail_at = K };
+    vm.heap.gpa = failing.allocator();
+    try testing.expectError(interp.Error.OutOfMemory, vm.run(chunk.proto));
+    vm.heap.gpa = failing.inner;
+
+    try testing.expectEqual(@as(usize, 0), sink.buffered().len);
+    try testing.expectEqual(truth_next_id, vm.heap.next_obj_id);
+    try testing.expectEqual(truth_obj_count, vm.heap.object_count);
+    try testing.expectEqual(truth_parked_pc, vm.frames[0].pc);
+    // The witness: the OOM was raised THROUGH the tier-1a precise_error
+    // consumer (state identity alone can't distinguish "the trace never
+    // entered and tier-0 OOM'd on its own").
+    try testing.expectEqual(@as(u64, 1), vm.trace.precise_errors);
+}
+
+test "executor (tnew mixed body, doc 45 D3): an immediate store rides a precise construction trace and neither effect repeats across a mid-loop resume" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    // Codex-flagged coverage: `tnew` unlocks MIXED effect bodies (immediate
+    // astores still emit in precise mode; only sunk stores are refused). At
+    // i == 200 the element guard fails MID-ITERATION — after this
+    // iteration's `tnew` AND `a[1] = i` already ran in-trace — and tier-0
+    // resumes at the load bytecode. Exactly-once bar: `next_obj_id` (no
+    // re-run of the tnew across the resume), `a[1]` (no doubled store), and
+    // the printed sums all byte-match pure tier-0.
+    const source: [:0]const u8 =
+        \\local a = {}
+        \\for i = 1, 300 do a[i] = i end
+        \\a[200] = 1.5
+        \\local s = 0
+        \\local n = 0
+        \\for i = 1, 300 do
+        \\  local t = {}
+        \\  a[1] = i
+        \\  s = s + a[i]
+        \\  n = n + 1
+        \\end
+        \\print(s)
+        \\print(n)
+        \\print(a[1])
+    ;
+
+    var truth: [64]u8 = undefined;
+    var truth_len: usize = 0;
+    var truth_next_id: u32 = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        truth_len = sink.buffered().len;
+        @memcpy(truth[0..truth_len], sink.buffered());
+        truth_next_id = vm.heap.next_obj_id;
+    }
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = false;
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    try testing.expectEqualStrings(truth[0..truth_len], sink.buffered());
+    try testing.expectEqual(truth_next_id, vm.heap.next_obj_id);
+    try testing.expect(vm.trace.precise_resumes >= 1);
+    // The mixed body really recorded: one precise trace carries BOTH the
+    // `tnew` and an inline `astore` (were the store refused, this documents
+    // the regression; were tnew refused, the trace never commits).
+    var saw_mixed = false;
+    for (vm.trace.registry.cache.items) |ct| {
+        if (ct.code.deopt_mode != .precise) continue;
+        var has_tnew = false;
+        var has_store = false;
+        for (ct.code.instrs) |ins| {
+            if (ins.op == .tnew) has_tnew = true;
+            if (ins.op == .astore) has_store = true;
+        }
+        if (has_tnew and has_store) saw_mixed = true;
+    }
+    try testing.expect(saw_mixed);
 }
 
 test "recorder (precise deopt, doc 45 D8 interim): an exec-log session never produces a precise trace and serializes cleanly" {

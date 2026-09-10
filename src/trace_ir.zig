@@ -668,6 +668,24 @@ pub const IrOp = enum(u8) {
     /// string key. Memory-dependent, non-CSE guard; checks metatable absence
     /// too. Covers packed holes and hash-resident keys, not just array bounds.
     guard_absent,
+
+    /// Doc 45 D3: identity-bearing table allocation — `local t = {}` in a
+    /// PRECISE recording. No operands; produces heap/table; routes through
+    /// `emitAlloc` (one GC ID against the eager `guard_gc` budget). An
+    /// ordered effect root: never CSE'd, DCE'd, hoisted or sunk, and only
+    /// legal in a `deopt_mode == .precise` trace (its OOM outcome needs the
+    /// per-bytecode snapshot + `.precise_error` contract — entry replay
+    /// would re-consume an object ID). Executes `Heap.newTable` EXACTLY once
+    /// via the `table_runtime.tnew` shim (D5); on OOM the executor restores
+    /// the op's snapshot and exits `.precise_error` — never an ordinary
+    /// deopt, never a retry. Wire ordinal 88.
+    tnew,
+    /// Doc 45 D3: general constructor store (`t[k] = v` on non-grid,
+    /// metatable-free tables) — RESERVED at wire ordinal 89 per the doc's
+    /// numbering; semantics land with the effect-ordering increment. Until
+    /// then nothing emits it and every executor/prover rejects it. `a` =
+    /// table, `b` = key, `aux` = value ref; produces no value.
+    tset,
 };
 
 /// Doc 44: what a `.terminal` hands back to tier-0 (rides `terminal.a`).
@@ -727,6 +745,21 @@ pub fn isSideExitGuardOp(op: IrOp) bool {
     return switch (op) {
         .guard_absent => true,
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent, .alen => true,
+        else => false,
+    };
+}
+
+/// Doc 45 D3: every op a PRECISE trace must carry a snapshot for, because its
+/// runtime failure exits mid-iteration. The side-exit guards (shape/type
+/// misses → `.precise_resume`) PLUS the fallible effect ops (`tnew`/`tset`
+/// OOM/type errors → `.precise_error` — never an ordinary deopt, D5).
+/// Finalize enforces this fail-closed (`error.InvalidSnapshotMetadata` on a
+/// snap-less match past `guard_gc`), and the tier-1a exit tail asserts it:
+/// a precise runtime error with `snap == 0` is a bug, never degraded to
+/// `.normal`.
+pub fn requiresPreciseSnapshot(op: IrOp) bool {
+    return isSideExitGuardOp(op) or switch (op) {
+        .tnew, .tset => true,
         else => false,
     };
 }

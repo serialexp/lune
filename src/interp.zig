@@ -29,6 +29,7 @@ const array = @import("array.zig");
 const function = @import("function.zig");
 const trace = @import("trace.zig");
 const trace_exec = @import("trace_exec.zig");
+const table_runtime = @import("table_runtime.zig");
 const nativegen = @import("nativegen.zig");
 const irinterp = @import("irinterp.zig");
 const execlog = @import("execlog.zig");
@@ -2772,9 +2773,16 @@ pub const Vm = struct {
     /// chain resume): tail-dispatch at that pc with a full prologue,
     /// re-resolving NOTHING. `switch_mode_at` = park pc and flip the dispatch
     /// mode (the old `frame.pc = npc; return .switch_mode`).
+    /// Doc 45 D5: the raise payload both directive unions share — a precise
+    /// trace's effect error and the bytecode pc to park it at.
+    const RaiseAt = struct { pc: usize, err: Error };
+
     const BackEdgeDirective = union(enum) {
         dispatch_at: usize,
         switch_mode_at: usize,
+        /// Doc 45 D5: relay of `EntryDirective.raise_at` — a precise
+        /// trace's effect error to park at its bytecode (see that variant).
+        raise_at: RaiseAt,
     };
 
     /// Doc 42 §4.4: the back-edge trampoline. Jump handlers musttail here on a
@@ -2797,6 +2805,12 @@ pub const Vm = struct {
                     .switch_mode_at => |npc| {
                         st.frame.pc = npc;
                         return .switch_mode;
+                    },
+                    // Doc 45 D5: park the precise effect error at its
+                    // bytecode — registers already snapshot-restored.
+                    .raise_at => |r| {
+                        st.frame.pc = r.pc;
+                        return parkErr(st, r.err);
                     },
                 }
             }
@@ -2822,6 +2836,15 @@ pub const Vm = struct {
         /// patch site can receive it (loop pages never emit either epilogue;
         /// cont pages enter with net 0, so their pops decline in v1).
         resume_frame_motion: usize,
+        /// Doc 45 D5: a PRECISE trace's effect shim raised a runtime error
+        /// (`.precise_error`). The executor already restored the failing
+        /// op's snapshot (pre-instruction registers; the iteration's earlier
+        /// heap effects stand). The consumer parks `err` with `frame.pc =
+        /// pc` — the bytecode the error belongs to — WITHOUT re-executing
+        /// anything (execute-once: for OOM there is no effect to redo and a
+        /// tier-0 re-run would be a forbidden retry). Never `pending_error`,
+        /// never a mode switch, never a sibling/chain continuation.
+        raise_at: RaiseAt,
     };
 
     /// Same-anchor trial-walk cap (visited/dead arrays; `dead ⊆ visited`).
@@ -3804,9 +3827,41 @@ pub const Vm = struct {
             // charges productivity/penalty so a thrashing precise anchor
             // gates and tier-0 takes it back. Native never produces this
             // reason yet (compileImpl declines precise), so `final == ct`.
+            // Doc 45 D5: a precise effect shim raised a runtime error — the
+            // executor restored the failing op's snapshot (pre-instruction
+            // registers; the iteration's earlier committed effects stand,
+            // partial heap preserved) and the error is about to unwind, so
+            // NO tiering accounting runs: no receipt, no strike, no
+            // side-trace want, no chain/sibling continuation, no mode
+            // switch. Validate exactly like `.precise_resume`, map the shim
+            // status to the guest error, and hand the raise directive up —
+            // the consumer parks the error at the snapshot's pc without
+            // re-executing the bytecode (execute-once, never an OOM retry).
+            if (result.exit_reason == .precise_error) {
+                std.debug.assert(!ran_native and final == ct);
+                std.debug.assert(ct.code.deopt_mode == .precise);
+                std.debug.assert(result.snapshot_id >= 1 and result.snapshot_id <= ct.code.snapshots.len);
+                std.debug.assert(result.activation_base == 0 and result.activation_depth == 0);
+                const snap = ct.code.snapshots[result.snapshot_id - 1];
+                std.debug.assert(snap.register_count == proto.num_registers);
+                std.debug.assert(snap.resume_pc < proto.code.len);
+                const err: Error = switch (@as(table_runtime.Status, @enumFromInt(result.runtime_error))) {
+                    .out_of_memory => Error.OutOfMemory,
+                    // `.ok` cannot reach here (the executor only sets
+                    // `runtime_error` on failure); `.type_error` is
+                    // unrepresentable this slice (`tnew` never returns it —
+                    // it arrives with `tset`).
+                    .ok, .type_error => unreachable,
+                };
+                self.trace.dbg("precise-error: trace={d} exit={d} snap={d} raise_pc={d} status={d}", .{ ct.id, result.exit_instr, result.snapshot_id, snap.resume_pc, result.runtime_error });
+                self.trace.precise_errors +|= 1;
+                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                return .{ .raise_at = .{ .pc = @intCast(snap.resume_pc), .err = err } };
+            }
             if (result.exit_reason == .precise_resume) {
                 std.debug.assert(!ran_native and final == ct);
                 std.debug.assert(ct.code.deopt_mode == .precise);
+                std.debug.assert(result.activation_base == 0 and result.activation_depth == 0);
                 // D6 dispatcher validation — internal invariant failures,
                 // never a replay fallback.
                 std.debug.assert(result.snapshot_id >= 1 and result.snapshot_id <= ct.code.snapshots.len);
@@ -5021,6 +5076,12 @@ pub const Vm = struct {
                     },
                     // Doc 44 D11: only head pages emit the push epilogue.
                     .resume_frame_motion => @panic("native frame motion from a loop-anchor entry"),
+                    // Doc 45 D5: park the precise effect error at its
+                    // bytecode — registers already snapshot-restored.
+                    .raise_at => |r| {
+                        st.frame.pc = r.pc;
+                        return parkErr(st, r.err);
+                    },
                 }
             }
         }.h;
@@ -5103,6 +5164,12 @@ pub const Vm = struct {
                     },
                     // Doc 44 D11: only head pages emit the push epilogue.
                     .resume_frame_motion => @panic("native frame motion from a loop-anchor entry"),
+                    // Doc 45 D5: park the precise effect error at its
+                    // bytecode — registers already snapshot-restored.
+                    .raise_at => |r| {
+                        st.frame.pc = r.pc;
+                        return parkErr(st, r.err);
+                    },
                 }
             }
         }.h;
@@ -5196,6 +5263,12 @@ pub const Vm = struct {
                         reloadTopFrame(st);
                         return dispatchTail(mode, st, rpc, vm);
                     },
+                    // Doc 45 D5: park the precise effect error at its
+                    // bytecode — registers already snapshot-restored.
+                    .raise_at => |r| {
+                        st.frame.pc = r.pc;
+                        return parkErr(st, r.err);
+                    },
                 }
             }
         }.h;
@@ -5270,6 +5343,12 @@ pub const Vm = struct {
                     .resume_frame_motion => |rpc| {
                         reloadTopFrame(st);
                         return dispatchTail(mode, st, rpc, vm);
+                    },
+                    // Doc 45 D5: park the precise effect error at its
+                    // bytecode — registers already snapshot-restored.
+                    .raise_at => |r| {
+                        st.frame.pc = r.pc;
+                        return parkErr(st, r.err);
                     },
                 }
             }
@@ -6061,6 +6140,9 @@ pub const Vm = struct {
                         .switch_mode_at => |npc| return .{ .switch_mode_at = npc },
                         // Doc 44 D11: only head pages emit the push epilogue.
                         .resume_frame_motion => @panic("native frame motion from a loop-anchor entry"),
+                        // Doc 45 D5: relay the precise effect error to the
+                        // trampoline (which parks it — never a retry).
+                        .raise_at => |r| return .{ .raise_at = r },
                     }
                 }
                 // Retire traces the walk found permanently dead (lane widened

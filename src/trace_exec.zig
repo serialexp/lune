@@ -55,10 +55,15 @@ pub const ExitReason = enum(u32) {
     /// failure — `IrInstr.snap == 0`, iteration-entry coherent — stays
     /// `.normal`: the ordinary entry contract applies.)
     precise_resume = 4,
-    /// Doc 45 D5/D6 (reserved until the effect executors land): a runtime
-    /// error (OOM/type) raised by a precise trace's effect helper AFTER a
-    /// guest-visible mutation. Handed to the located-error/pcall path,
-    /// preserving the partial heap — never retried, never ordinary deopt.
+    /// Doc 45 D5/D6: a runtime error (OOM/type) raised by a precise trace's
+    /// effect helper (`table_runtime.tnew` today). The executor has ALREADY
+    /// materialized the failing op's snapshot into the guest registers
+    /// (pre-instruction state); `snapshot_id` names it and `runtime_error`
+    /// carries the shim's `table_runtime.Status` ordinal. The dispatcher
+    /// parks the ACTUAL error at the snapshot's `resume_pc` — the partial
+    /// heap of the iteration's earlier effects is preserved (D5), the
+    /// operation is never retried (execute-once), and no strike/receipt/
+    /// chain/side-trace accounting runs (the error is about to unwind).
     precise_error = 5,
 };
 
@@ -120,6 +125,21 @@ pub const ExecResult = struct {
     /// point; the native exit stubs will bake it when the native precise
     /// executor lands (doc 45 D6, outstanding).
     snapshot_id: u32 = 0,
+    /// Doc 45 D5: the `table_runtime.Status` ordinal of the effect-shim
+    /// failure behind a `.precise_error` exit (nonzero there, 0 everywhere
+    /// else). Kept as the raw C-ABI status — the dispatcher owns the
+    /// status→`Error` mapping — so the future native exit stub can bake the
+    /// shim's return register verbatim.
+    runtime_error: u32 = 0,
+    /// Doc 45 D6 activation contract for precise exits: the frame-window
+    /// base and inlined-frame depth the snapshot's slots are relative to.
+    /// P2 precise recording refuses frame inlining outright, so tier-1a
+    /// always reports the anchor activation (base 0, depth 0) and the
+    /// dispatcher asserts exactly that before consuming a precise exit —
+    /// the fields exist so the assert (and the wire shape the native
+    /// executor will fill) is explicit rather than implied.
+    activation_base: u32 = 0,
+    activation_depth: u32 = 0,
     /// 2.3c-2a (doc 17): number of exit-materializations the (possibly fused) native
     /// span recorded in `NativeResult`'s per-transition ledger. 1 for an un-fused run;
     /// >1 when an armed slot chained bodies under the shared frame (a `C→I` `.link`

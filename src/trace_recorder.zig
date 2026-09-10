@@ -1072,12 +1072,18 @@ pub const RecordingSession = struct {
             // to record (the constructed table is visible mid-episode, so
             // entry replay would double-construct). A non-precise candidate
             // cancels with `.needs_precise` — memoized + counter re-armed, so
-            // the retry arms in precise mode from the first instruction. The
-            // precise retry still aborts `.nyi_opcode` until construction
-            // recording (doc 45 D4) lands: same observable tiering as today
-            // plus exactly one non-penalized retry per anchor, and the memo is
-            // the flag the later increments read.
-            .new_table => self.abort(if (self.precise) .nyi_opcode else .needs_precise),
+            // the retry arms in precise mode from the first instruction.
+            // Doc 45 D3 (increment 5): the precise retry records `tnew` —
+            // routed through `emitAlloc` so the body's `guard_gc` bound
+            // covers its object ID, and snapshot-stamped like every precise
+            // body op so an OOM exits `.precise_error` at exactly this
+            // bytecode (finalize rejects a snap-less `tnew`,
+            // `requiresPreciseSnapshot`). The produced ref IS the fresh
+            // table of the current iteration; no operands, never reused.
+            .new_table => {
+                if (!self.precise) return self.abort(.needs_precise);
+                self.setReg(instr.a, try self.emitAlloc(.{ .op = .tnew, .ty = .heap }));
+            },
 
             // closures, concat, for_prep, len, …: each pulls in heap-effect
             // / cross-frame / invalidation machinery that is later work. Abort

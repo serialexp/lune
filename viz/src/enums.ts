@@ -107,6 +107,8 @@ export const IR_OP_NAMES = [
   "ustore", // 85  in-place scalar store through a uref cell — a=uref, b=value
   "terminal", // 86  one-shot head-trace close (doc 44) — a=TerminalKind, aux=resume pc
   "guard_absent", // 87 raw table lookup is nil — a=table, b=key
+  "tnew", // 88  identity-bearing table allocation (doc 45, precise traces only)
+  "tset", // 89  reserved: general constructor store (doc 45) — a=table, b=key, aux=value
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
