@@ -59,6 +59,23 @@ NEXT (doc 45): precise-state contract (D2) + table construction (D4/D5) — the
 payoff that unfuses btrees' remaining `new_table` aborts. Then effect ordering,
 GC/errors, link integration per the checklist.
 
+**Post-land cadence receipts (2026-09-10):** codex reviewed b2b5bd3 against D7
+— zero findings at all levels (`docs/reviews/doc45/codex-absence-slice.md`).
+D2 increment 1 landed: `src/trace_snapshot.zig` — executor-independent
+Snapshot/SnapshotSlot/DeoptMode types, the Builder (allocator-injected
+reusable scratch, vector interning, deterministic 256/2000/65536 admission
+budgets checked BEFORE allocation, configurable for exact-boundary tests),
+`validate` (bounds, full ascending v1 window, resume-pc range),
+`refsDefinedAt` (forward-ref rejection at the use site) and `remapRefs`
+(pure canon+new_index rewrite for tropt). Unit-tested (interning identity,
+one-over refusal per budget, reset/reuse, finalize ownership, validation
+matrix); wired into root.zig test imports. NOT yet consumed anywhere —
+TraceCode fields (`snapshots`/`snapshot_slots`/`deopt_mode`), the
+needs_precise re-record policy, recorder per-bytecode capture, tier-1a/native
+precise exits, D8 serialization all remain. Next increment: TraceCode
+ownership + `snapshot_limit` abort reason + the needs_precise anchor policy
+with its counter re-arm (trace.zig:3365 fast-retry precedent).
+
 ## Doc45 historical — astra in-flight notes (superseded by the section above)
 
 Implementation resumed: fixed P0 shared href/absence-key pointer admission.

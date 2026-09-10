@@ -140,6 +140,7 @@ test {
     _ = trace;
     _ = @import("trace_candidate.zig");
     _ = @import("trace_finalize_test.zig");
+    _ = @import("trace_snapshot.zig");
     _ = jitdbg;
     _ = irinterp;
     _ = x64;
