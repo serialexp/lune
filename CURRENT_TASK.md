@@ -21,6 +21,66 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-10 (later) — split review round 2 + nativegen 6-slice file split LANDED
+
+Bart's task: "review the file/logic split, then the big piece."
+
+**Review round 2 of the trace.zig 5-slice split** (two read-only agents + hand
+verification): structurally sound — leaves really are leaves, zero duplicated
+code, zero leftover fn forwarders. One real seam defect + smaller items
+recorded in TODO.md "File-split review round 2 findings (2026-09-10)"; the key
+one: `maybeStartContinuation`/`maybeStartReplaySide` (trace_link.zig:216,240)
+re-implement the hub's private `arm()` minus its `anchor_abs_base` /
+`route_upvalue_reads` seeds — verified fail-closed (cont/side recordings abort
+every open-upvalue read via trace_recorder.zig:4085 and never consult the
+doc-43-P5 memo), so it's a coverage gap + drift hazard, NOT unsound. Fix shape
+is Bart's call (pure motion vs also-seed = behaviour change). Dead facade swept
+same-day: d29c805 (34 alias deletions + 9 pub demotions, compiler-adjudicated).
+
+**The big piece: nativegen.zig 8,219 → 2,390 lines, 6 slices, all committed
+separately and gated** (zig build test + hashgate 84/84 + zig build wasm per
+slice; full `just bench` board after the last slice for layout-noise sanity):
+
+- 8f62b38 slice 1 `nativegen_mcode.zig` (416) — ExecPage, mapExecutable,
+  McodeArena + W^X patch machinery + trampoline, SPILL_MAX. True leaf
+  (std/builtin/x64).
+- f93c1f9 slice 2 `nativegen_artifact.zig` (571) — Kind, NativeResult +
+  ledger layouts, silent metadata, ExitPatch, SeedPlan, CompiledTrace (run
+  wrappers), NativeState. Pub-promotion: SeedPlan.activate.
+- f856716 slice 3 `nativegen_layout.zig` (228) — ArrLayout, tag/offset/lane
+  constants (@offsetOf-derived, Z-1/Z-2), resolveHashCell, lane helpers.
+  Also reunited the Kind doc comment slice 2 orphaned.
+- bebf009 slice 4 `nativegen_prove.zig` (1,382) — boxedPassThroughOnly,
+  proveKinds, isNumKind, operandReads (its doc: "matching proveKinds/lower
+  exactly").
+- b0da275 slice 5 `nativegen_alloc.zig` (1,703) — Loc/SlotClass/SlotInfo/
+  Alloc, order tables, analyze/analyzeInner, pure Place mapping, and the
+  exit/callout classification block analyzeInner needs (opMayExitInBody,
+  BodyCallout, bodyCalloutOf, computeSeedPlan, …). Pub-promotion: Place.eql.
+- f7717f0 slice 6 `nativegen_emit.zig` (1,897) — all 53 emitter helpers
+  (Place movers, ALU/float/compare, flushes, parallel move, exits/ledger/
+  silent epilogue, the 13 runtime-callout emitters incl. emitGuardAbsent).
+
+Hub keeps: compile drivers + compileImpl, lower(), EntryStubs/PatchEmission,
+facade (all 34 importers still spell `nativegen.X`). Module import order is
+acyclic: mcode/layout/artifact ← prove ← alloc ← emit ← hub (no module
+imports nativegen.zig back — unlike the trace split there is NO hub
+back-import).
+
+Verification note (honesty per Rule #3): slices were verified by compiler +
+full suite + hashgate per slice (behavioural byte-identity), NOT by a
+source-byte-diff script like the trace split used. Perf A/B via `just shadow`
+/tmp/mahina-split-base2 restored to d29c805 sources (nm-verified: 0 new-module
+symbols): 19/28 jit rows within ±3%, worst outliers scalar +7.2% /
+grid_matmul −5.7% BOTH have perf-stat instruction+branch counts identical to
+<0.003% → binary-layout artifact, the same verdict shape as the trace split's
+five outliers. TSVs: bench/results/20260910-163049-f7717f0.tsv (split) vs
+shadow 20260910-163444-f7717f0.tsv (stamped f7717f0 but pre-split sources).
+
+Next candidates after this: doc 45 D2 increment 2 (TraceCode snapshot
+ownership + snapshot_limit abort + needs_precise re-arm policy — handoff
+recorded below), and the TODO.md round-2 seam items if Bart picks a fix shape.
+
 ## Status 2026-09-10 — doc 45 guarded-absence slice finished per D7 (this session)
 
 Finished astra's absence slice against the D7 contract. What this pass added on
