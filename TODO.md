@@ -1626,3 +1626,48 @@ these remain:
    through the const view.
 4. **trace_finalize's `rec: anytype`** — a ~20-field implicit structural
    contract over the recorder; consider a named view struct.
+
+## File-split review round 2 findings (2026-09-10, eager-tiger)
+
+Fresh audit of the 5-slice trace.zig split (two read-only agents + hand
+verification). Dead facade swept same-day (34 alias deletions + 9 pub
+demotions in trace.zig, compiler-adjudicated). Deferred items:
+
+1. **Recording-start family cut in half + raw `rec` writes** — the split's
+   one real seam defect. `maybeStartContinuation` (trace_link.zig:216) and
+   `maybeStartReplaySide` (:240) live in trace_link while their siblings
+   `maybeStartCont`/`maybeStartHead` stayed in trace.zig; the trace_link
+   pair calls `rec.reset` + writes `rec.kind`/`rec.side_src` directly
+   (8 reach-ins, 5 writes — the ONLY `.rec.` sites outside the hub),
+   re-implementing the hub's private `arm()` minus its two seeds. Verified
+   consequence (not unsound, fail-closed): cont/side recordings never seed
+   `anchor_abs_base` (stays 0 → trace_recorder.zig:4085 aborts EVERY open-
+   upvalue read `.aliased_input`) nor `route_upvalue_reads` (→ eternal
+   `.upvalue_mutable` re-aborts, doc 43 P5 memo never consulted). Fix shape
+   is Bart's call: (a) pure motion — reunite all four starters hub-side next
+   to `arm()`, behaviour unchanged; (b) also route them through `arm()` so
+   cont/side get the seeds = behaviour change, needs its own gate+bench run
+   (cont anchors DO carry a base via PendingRetAnchor, so seeding is
+   possible).
+2. **Link-arming stragglers in the hub** — `hasArmedFrameLink`,
+   `hasArmedSiblingHandoff`, `siblingHandoffEligible`, `tryArmFrameLinks`,
+   `tryArmSiblingHandoff`, `publishSiblingArm`, `armedEdgeInBridgeFreeCycle`,
+   `resolveLoopDoneCont` (trace.zig:1540-2261) are trace_link's declared
+   concern; `publishSiblingArm` sets the Part-S sibling latch that
+   trace_link's `clearSiblingLatch` clears — one latch maintained from two
+   files.
+3. **Chain-only material stranded in the hub** — `dbgNoteBurst`/
+   `dbgNoteSuffixLedger`/`dbgNoteReplayRow`/`dbgDumpBurstStats` (called only
+   from trace_chain) and `ChainResult`/`ChainTier`/`ExitMaterialization`
+   (21 chain uses vs 3 hub uses).
+4. **Pure `*const Trace` classifiers in the hub** — the
+   `isLoopDoneGuardIndex`/`whileLoopDonePostPc` family (trace.zig:179-290)
+   touches no TraceState, consumed by 8+ modules; leaf material
+   (trace_record.zig or trace_ir.zig).
+5. **No registry query API** — 17 hand-rolled `armedLinks()` filter loops
+   across trace.zig(6)/trace_link(6)/trace_regionops(5).
+6. **Cosmetic**: 4 test files (trace_code_test, trace_finalize_test,
+   traceser_test, trace_region_topology_test) import leaf modules directly
+   where sibling tests use the trace.X facade; `trace_link_mod.arm` (native
+   link) vs `TraceState.arm` (recording) name collision is a readability
+   trap.

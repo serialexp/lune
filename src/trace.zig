@@ -61,19 +61,18 @@ const pattern_mod = @import("stdlib/pattern.zig");
 // the move stays behaviour-free.
 
 pub const trace_ir = @import("trace_ir.zig");
-pub const trace_link_mod = @import("trace_link.zig");
-pub const trace_regionops_mod = @import("trace_regionops.zig");
-pub const trace_chain_mod = @import("trace_chain.zig");
-pub const trace_recorder_mod = @import("trace_recorder.zig");
-pub const trace_code = @import("trace_code.zig");
-pub const trace_record = @import("trace_record.zig");
+const trace_link_mod = @import("trace_link.zig");
+const trace_regionops_mod = @import("trace_regionops.zig");
+const trace_chain_mod = @import("trace_chain.zig");
+const trace_recorder_mod = @import("trace_recorder.zig");
+const trace_code = @import("trace_code.zig");
+const trace_record = @import("trace_record.zig");
 pub const trace_entry_registry = @import("trace_entry_registry.zig");
 
 pub const TraceCode = trace_code.TraceCode;
 pub const TraceRecord = trace_record.TraceRecord;
 pub const Trace = TraceRecord;
 pub const EntryPatchState = trace_record.EntryPatchState;
-pub const EntryGuardType = trace_code.EntryGuardType;
 pub const EntryGuard = trace_code.EntryGuard;
 pub const InputKind = trace_code.InputKind;
 pub const InputSeed = trace_code.InputSeed;
@@ -105,8 +104,6 @@ pub const PendingRetAnchor = struct {
     call_seq: u64,
 };
 pub const isHeadAnchorPc = trace_code.isHeadAnchorPc;
-pub const headEntryPc = trace_code.headEntryPc;
-pub const CONT_PC_BIT = trace_code.CONT_PC_BIT;
 pub const AnchorPcKind = trace_code.AnchorPcKind;
 pub const anchorKind = trace_code.anchorKind;
 pub const entryPc = trace_code.entryPc;
@@ -114,7 +111,6 @@ pub const contAnchorPc = trace_code.contAnchorPc;
 pub const NativeSeedCtx = trace_code.NativeSeedCtx;
 
 pub const Ref = trace_ir.Ref;
-pub const SnapIdx = trace_ir.SnapIdx;
 pub const ObsType = trace_ir.ObsType;
 pub const IrOp = trace_ir.IrOp;
 pub const PHI_INTERNAL = trace_ir.PHI_INTERNAL;
@@ -130,25 +126,21 @@ pub const guardSourcePc = trace_ir.guardSourcePc;
 // `trace.X` spelling keeps resolving and the move stays behaviour-free.
 // -------------------------------------------------------------------------
 
-pub const trace_types = @import("trace_types.zig");
-pub const trace_region = @import("trace_region.zig");
+const trace_types = @import("trace_types.zig");
+const trace_region = @import("trace_region.zig");
 
-pub const CallEdge = trace_types.CallEdge;
 pub const Polarity = trace_types.Polarity;
 pub const GuardRole = trace_types.GuardRole;
 pub const OperandDesig = trace_types.OperandDesig;
 pub const GuardProvenance = trace_types.GuardProvenance;
-pub const LinkTerminalProvenance = trace_types.LinkTerminalProvenance;
 pub const ExitProvenance = trace_types.ExitProvenance;
 pub const ExitProvEntry = trace_types.ExitProvEntry;
 pub const ExitKey = trace_types.ExitKey;
-pub const DescentFailCarry = trace_types.DescentFailCarry;
+const DescentFailCarry = trace_types.DescentFailCarry;
 pub const ProgramPoint = trace_types.ProgramPoint;
 pub const StructuralEdgeId = trace_types.StructuralEdgeId;
 pub const AnchorKey = trace_types.AnchorKey;
-pub const MAX_INLINE_DEPTH = trace_types.MAX_INLINE_DEPTH;
 pub const exitOrder = trace_types.exitOrder;
-pub const exitProvEntryLess = trace_types.exitProvEntryLess;
 
 pub const RegionId = trace_region.RegionId;
 pub const RegionKey = trace_region.RegionKey;
@@ -160,8 +152,6 @@ pub const RegionBridgeDef = trace_region.RegionBridgeDef;
 pub const RegionDef = trace_region.RegionDef;
 pub const RegionInternMap = trace_region.RegionInternMap;
 pub const ObserverSpan = trace_region.ObserverSpan;
-pub const ObserverFast = trace_region.ObserverFast;
-pub const ObserverHot = trace_region.ObserverHot;
 pub const freeRegionBridges = trace_region.freeRegionBridges;
 pub const cloneRegionBridges = trace_region.cloneRegionBridges;
 pub const freeRegionSetMap = trace_region.freeRegionSetMap;
@@ -2604,7 +2594,6 @@ pub const TraceState = struct {
     pub const accountLedgerRow = trace_regionops_mod.accountLedgerRow;
     pub const accountCandidateCharge = trace_regionops_mod.accountCandidateCharge;
     pub const accountLedgerRowsBulk = trace_regionops_mod.accountLedgerRowsBulk;
-    pub const sameAnchor = trace_regionops_mod.sameAnchor;
     pub const flushRegionWindow = trace_regionops_mod.flushRegionWindow;
     pub const closeRegion = trace_regionops_mod.closeRegion;
     pub const demotePromotionsForRegion = trace_regionops_mod.demotePromotionsForRegion;
@@ -2616,11 +2605,8 @@ pub const TraceState = struct {
     pub const activeRegionFor = trace_regionops_mod.activeRegionFor;
     pub const openRegion = trace_regionops_mod.openRegion;
     pub const invalidateRegion = trace_regionops_mod.invalidateRegion;
-    pub const RegionBridgeDecision = trace_regionops_mod.RegionBridgeDecision;
-    pub const RegionBridgeVerdict = trace_regionops_mod.RegionBridgeVerdict;
     pub const traceInRegion = trace_regionops_mod.traceInRegion;
     pub const resolveRegionBridgeChild = trace_regionops_mod.resolveRegionBridgeChild;
-    pub const slotInSortedSet = trace_regionops_mod.slotInSortedSet;
     pub const validateRegionBridge = trace_regionops_mod.validateRegionBridge;
     pub const tryArmRegionBridge = trace_regionops_mod.tryArmRegionBridge;
     pub const maybeArmCompositeExit = trace_regionops_mod.maybeArmCompositeExit;
@@ -2657,25 +2643,12 @@ pub const TraceState = struct {
     // pass); forwarding decls keep every `self.foo(...)` / `TraceState.Foo`
     // spelling working (incl. TraceState.NativeCallProvenance in tests).
     pub const seedForTier1a = trace_chain_mod.seedForTier1a;
-    pub const StubEntryKind = trace_chain_mod.StubEntryKind;
     pub const stubEnterable = trace_chain_mod.stubEnterable;
-    pub const StubEnterability = trace_chain_mod.StubEnterability;
     pub const liveEpisodeProto = trace_chain_mod.liveEpisodeProto;
     pub const stubEnterability = trace_chain_mod.stubEnterability;
     pub const driveChain = trace_chain_mod.driveChain;
     pub const driveSeedSilentResult = trace_chain_mod.driveSeedSilentResult;
-    pub const LedgerReplay = trace_chain_mod.LedgerReplay;
-    pub const ReplayOrigin = trace_chain_mod.ReplayOrigin;
-    pub const BurstCursor = trace_chain_mod.BurstCursor;
-    pub const FrozenFast = trace_chain_mod.FrozenFast;
-    pub const OrdinaryGuardEntry = trace_chain_mod.OrdinaryGuardEntry;
-    pub const EntryMaterialization = trace_chain_mod.EntryMaterialization;
-    pub const ReplayCursor = trace_chain_mod.ReplayCursor;
-    pub const SuffixInit = trace_chain_mod.SuffixInit;
-    pub const applyEdgeCursorTransition = trace_chain_mod.applyEdgeCursorTransition;
-    pub const SilentCellOwner = trace_chain_mod.SilentCellOwner;
     pub const silentCellOwner = trace_chain_mod.silentCellOwner;
-    pub const SilentSiblingEvidence = trace_chain_mod.SilentSiblingEvidence;
     pub const silentSiblingEvidence = trace_chain_mod.silentSiblingEvidence;
     pub const driveSilentBurst = trace_chain_mod.driveSilentBurst;
     pub const drainSilentResult = trace_chain_mod.drainSilentResult;
@@ -2700,7 +2673,6 @@ pub const TraceState = struct {
     pub const hasNativeLoopDoneLink = trace_link_mod.hasNativeLoopDoneLink;
     pub const computeNativeLoopDoneLink = trace_link_mod.computeNativeLoopDoneLink;
     pub const maybeArmContinuation = trace_link_mod.maybeArmContinuation;
-    pub const continuationReachesEnclosingBackEdge = trace_link_mod.continuationReachesEnclosingBackEdge;
     pub const maybeStartContinuation = trace_link_mod.maybeStartContinuation;
     pub const maybeStartReplaySide = trace_link_mod.maybeStartReplaySide;
     pub const clearPendingExitAnchor = trace_link_mod.clearPendingExitAnchor;
@@ -2717,7 +2689,6 @@ pub const TraceState = struct {
     pub const SuccAnchor = trace_link_mod.SuccAnchor;
     pub const resolveSuccessorAnchor = trace_link_mod.resolveSuccessorAnchor;
     pub const resolveCompositeBridgeSuccessor = trace_link_mod.resolveCompositeBridgeSuccessor;
-    pub const compositeContinueProof = trace_link_mod.compositeContinueProof;
 
     // Edge-cache / region rebuilds — moved to trace_regionops.zig (file-split pass);
     // forwarding decls keep every `self.foo(...)` / `TraceState.Foo` spelling working.
@@ -2771,13 +2742,9 @@ pub const TraceState = struct {
     pub const PROMOTED_SET_CAP = trace_link_mod.PROMOTED_SET_CAP;
     pub const PROVENANCE_VERDICT_CAP = trace_link_mod.PROVENANCE_VERDICT_CAP;
     pub const exitPatchFor = trace_link_mod.exitPatchFor;
-    pub const patchKindForArm = trace_link_mod.patchKindForArm;
-    pub const BridgeValidationError = trace_link_mod.BridgeValidationError;
     pub const validateRegionBridgeReceipt = trace_link_mod.validateRegionBridgeReceipt;
     pub const promotedEdgeFromLink = trace_link_mod.promotedEdgeFromLink;
-    pub const PromotionRejectReason = trace_link_mod.PromotionRejectReason;
     pub const rejectPromotion = trace_link_mod.rejectPromotion;
-    pub const rowPatchKind = trace_link_mod.rowPatchKind;
     pub const edgeMemberOfRegion = trace_link_mod.edgeMemberOfRegion;
     pub const promotionBelongsToRegion = trace_link_mod.promotionBelongsToRegion;
     pub const detectPromotableSet = trace_link_mod.detectPromotableSet;
@@ -2785,7 +2752,6 @@ pub const TraceState = struct {
     pub const patchPromotedEdge = trace_link_mod.patchPromotedEdge;
     pub const promoteSet = trace_link_mod.promoteSet;
     pub const resetPromotionCandidate = trace_link_mod.resetPromotionCandidate;
-    pub const samePromotionEdges = trace_link_mod.samePromotionEdges;
     pub const considerSilentPromotion = trace_link_mod.considerSilentPromotion;
     pub const DemotionReason = trace_link_mod.DemotionReason;
     pub const PendingDemotion = trace_link_mod.PendingDemotion;
