@@ -14,6 +14,33 @@ const NativeSeedCtx = trace_code.NativeSeedCtx;
 const ExecPage = mcode.ExecPage;
 const mapExecutable = mcode.mapExecutable;
 
+/// The proven kind of each SSA ref.
+///   - `none`  — produces no usable value (a guard / the `loop` marker);
+///               referencing it as an operand is a bail.
+///   - `int` / `bool` — a boxed scalar (GP register) that may be carried, flushed,
+///               or stored.
+///   - `float` — a boxed f64 (Phase D). Lives in an XMM register / a shared 8-byte
+///               spill cell; carried & flushed (TAG_FLOAT + `movsd`) like an int but
+///               in the disjoint XMM pool. `div`/`pow` results and any arithmetic
+///               with a float operand are `.float`.
+///   - `ptr`   — a raw `*GcHeader` (a `guard_table`-covered table `slot_load`).
+///               Classified `invariant`, loaded once; **must never** reach
+///               `exit_stores` (the deopt flush boxes as TAG_INT — C2).
+///   - `func`  — a raw `*GcHeader` for a Lua closure (a `guard_func`-covered
+///               `slot_load`: the cross-frame callee snapshot, U1). Like `.ptr` it
+///               is an invariant heap pointer loaded once and tag-checked TAG_HEAP,
+///               but the prologue verifies it is a closure of the recorded
+///               `Proto.id` (not a table+lane). Consumed ONLY by `guard_func` (an
+///               entry guard) — never feeds arithmetic, an `aref`, or a flush.
+///   - `aref`  — the paired `(table, index)` addressing token produced by `aref`
+///               (its register holds `idx0 = index-1`). A distinct kind so it can
+///               neither feed arithmetic nor be flushed to a slot.
+///   - `href` — the hash-part value-cell pointer produced by `href` (H1). A
+///               loop-invariant `*Value` into a table's hash part, **seeded** into a
+///               slab slot per entry (`seedTraceInputs`) and loaded from
+///               `[rsi + aux*8]`, not computed from the operands. Like `.aref` it is a
+///               distinct addressing kind — it can neither feed arithmetic nor be
+///               flushed to a slot (C2). Consumed only by `hload`/`hstore`/`guard_hash`.
 pub const Kind = enum { none, int, bool, ptr, aref, float, func, href, native, heap, boxed, nil };
 
 pub const NativeResult = extern struct {
