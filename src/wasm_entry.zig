@@ -655,7 +655,10 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8) !void {
     res.stdout = bufFromSlice(try gpa.dupe(u8, sink.buffered()));
     res.keyframe = bufFromSlice(try mahina.keyframeser.encodeSnapshot(gpa, &vm));
     res.effects = bufFromSlice(try mahina.effectser.encodeFile(gpa, vm.effect_log.items));
-    res.trace = bufFromSlice(try mahina.traceser.encodeFile(gpa, vm.trace.cache.items));
+    const codes = try gpa.alloc(*const mahina.trace.TraceCode, vm.trace.registry.cache.items.len);
+    defer gpa.free(codes);
+    for (vm.trace.registry.cache.items, codes) |record, *code| code.* = &record.code;
+    res.trace = bufFromSlice(try mahina.traceser.encodeFile(gpa, codes));
     res.exec_log = bufFromSlice(try mahina.execlogser.encodeFile(gpa, vm.trace.exec_logs.items));
     res.coverage = bufFromSlice(try mahina.coverageser.encodeState(gpa, &vm.trace));
     res.status = 0;
@@ -819,7 +822,7 @@ fn check(res: *CheckResult, source: []const u8) !void {
     if (tree_opt) |tree| {
         if (!diags.hasErrors()) {
             vm_opt = try mahina.interp.Vm.init(gpa);
-            chunk_opt = mahina.compiler.compileWithOptions(gpa, &vm_opt.?.heap, src0, tree.root, &diags, .{
+            chunk_opt = mahina.compiler.compileWithOptions(gpa, vm_opt.?.heap, src0, tree.root, &diags, .{
                 .known_globals = &mahina.interp.builtin_global_names,
             }) catch null;
         }
