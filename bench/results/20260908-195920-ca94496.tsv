@@ -1,0 +1,3 @@
+# mahina bench suite  rev=ca94496  stamp=20260908-195920  reps=5  scale=1.0
+program	args	luajit_mode	cross	luajit_match	mahina_t0_ms	mahina_jit_ms	luajit_ms	mahina_t0_execns	mahina_jit_execns	mahina_t0_maxrss_kb	mahina_jit_maxrss_kb	luajit_maxrss_kb	mahina_jit_res_pct
+binary-trees	12	-	ok	ok	215.522	441.812	39.345	212765141	431014895	10456	10652	8628	27.3

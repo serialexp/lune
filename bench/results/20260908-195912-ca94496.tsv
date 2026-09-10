@@ -1,0 +1,3 @@
+# mahina bench suite  rev=ca94496  stamp=20260908-195912  reps=5  scale=1.0
+program	args	luajit_mode	cross	luajit_match	mahina_t0_ms	mahina_jit_ms	luajit_ms	mahina_t0_execns	mahina_jit_execns	mahina_t0_maxrss_kb	mahina_jit_maxrss_kb	luajit_maxrss_kb	mahina_jit_res_pct
+recursive-fib	31	-	ok	ok	170.109	404.274	7.010	168163080	411521728	2460	3164	2416	61.0

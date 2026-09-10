@@ -1,0 +1,3 @@
+# mahina bench suite  rev=aea79c2  stamp=20260905-000223  reps=9  scale=1.0
+program	args	luajit_mode	cross	luajit_match	mahina_t0_ms	mahina_jit_ms	luajit_ms	mahina_t0_execns	mahina_jit_execns	mahina_t0_maxrss_kb	mahina_jit_maxrss_kb	luajit_maxrss_kb	mahina_jit_res_pct
+scimark-fft	500	-	ok	ok	705.589	321.072	15.630	717336056	345300404	2596	3424	2404	28.2
