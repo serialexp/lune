@@ -83,12 +83,13 @@ export function keyframeSansArg(bytes: Uint8Array): string {
 
   // Neutralize the single host-injected slot globals["arg"][0]. The native CLI
   // sets arg[0] = the script path (a nondeterministic temp path); the wasm
-  // embedding has no argv and leaves it unset. We drop integer key 0 from `arg` on
-  // BOTH sides — symmetric, so a user-set arg[0] cancels too — and leave every
-  // other slot (arg[1..], arg.foo, the array part) intact, so a genuine divergence
-  // there still surfaces. Key 0 is never in the array part (that holds keys 1..n),
-  // so it always lives in the hash `entries`. The now-orphaned path string simply
-  // isn't reached by the traversal below and drops out on its own.
+  // embedding may leave it unset. We drop integer key 0 from `arg` on BOTH sides —
+  // symmetric, so a user-set arg[0] cancels too — and leave every other slot
+  // (arg[1..], arg.foo) intact, so a genuine divergence there still surfaces.
+  // Tables now keep a contiguous key run starting at 0 in the array part, but an
+  // older/sparse shape may keep key 0 in the hash part; normalize both forms. The
+  // now-orphaned path string simply isn't reached by the traversal below and drops
+  // out on its own.
   const globals = byId.get(Number(kf.globals_id));
   if (globals && globals.obj_type === 1) {
     for (const e of globals.body.value.entries) {
@@ -99,7 +100,9 @@ export function keyframeSansArg(bytes: Uint8Array): string {
         const argId = svId(e.val);
         const argTable = argId !== null ? byId.get(argId) : null;
         if (argTable && argTable.obj_type === 1) {
-          argTable.body.value.entries = argTable.body.value.entries.filter(
+          const body = argTable.body.value;
+          if (body.array.length > 0) body.array = body.array.slice(1);
+          body.entries = body.entries.filter(
             (ae: any) => !(ae.key.tag === 2 && ae.key.body.value.v === 0n),
           );
         }

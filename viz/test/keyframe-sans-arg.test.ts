@@ -107,6 +107,23 @@ test("arg[0] (script path) is cancelled — two paths compare equal", () => {
   expect(keyframeSansArg(withArg("/tmp/aaa/p.mahina"))).toBe(keyframeSansArg(withArg("/tmp/zzz/other.mahina")));
 });
 
+/** Current table layout stores contiguous integer keys 0..n in the array part. */
+function withArrayArg(path: string, args: string[] = []): Uint8Array {
+  const kf = new Kf();
+  const pathId = kf.str(path);
+  const argValueIds = args.map((arg) => kf.str(arg));
+  const argId = kf.tbl([sRef(pathId), ...argValueIds.map(sRef)], []);
+  const argKeyId = kf.str("arg");
+  const gid = kf.tbl([], [{ key: sRef(argKeyId), val: sRef(argId) }]);
+  return kf.encode(gid);
+}
+
+test("array-resident arg[0] is cancelled without hiding arg[1..]", () => {
+  expect(keyframeSansArg(withArrayArg("/tmp/aaa/p.mahina"))).toBe(keyframeSansArg(withArrayArg("/tmp/zzz/other.mahina")));
+  expect(keyframeSansArg(withArrayArg("/tmp/a", ["same"]))).toBe(keyframeSansArg(withArrayArg("/tmp/b", ["same"])));
+  expect(keyframeSansArg(withArrayArg("/tmp/a", ["realA"]))).not.toBe(keyframeSansArg(withArrayArg("/tmp/b", ["realB"])));
+});
+
 test("arg[1..] is preserved — a real divergence there still surfaces", () => {
   // Path strings differ (arg[0], cancelled) AND arg[1] differs; only arg[1] counts.
   expect(keyframeSansArg(withArgWith("realA"))).not.toBe(keyframeSansArg(withArgWith("realB")));
