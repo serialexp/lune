@@ -634,6 +634,15 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     if (record) rec.exit(i, .guard, values[ins.a]);
                     break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
+                .guard_absent => {
+                    const tab = values[ins.a];
+                    if (tab.isHeap() and @import("table_runtime.zig").isAbsent(tab.asHeap(), values[ins.b])) {
+                        if (record) rec.guardPass(i, Value.nil());
+                    } else {
+                        if (record) rec.exit(i, .guard, tab);
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                },
                 // Cross-frame tracing: the inlined callee value must still be a Lua
                 // closure of the recorded `Proto.id`. `aux` is the id (a stable `u32`,
                 // not a pointer — survives keyframe restore). Fails *closed*: any

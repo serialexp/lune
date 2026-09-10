@@ -267,7 +267,7 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
             .uref => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < input_limit),
             // `uload` reads its uref; `ustore` reads uref + value.
             .uload => std.debug.assert(ins.a < i),
-            .ustore => std.debug.assert(ins.a < i and ins.b < i),
+            .ustore, .guard_absent => std.debug.assert(ins.a < i and ins.b < i),
             .konst => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < consts_len),
             .loop => std.debug.assert(i == last), // the only loop, and it is terminal
             // `.link` (doc 15): terminal hand-off to an inner root. Like `.loop`

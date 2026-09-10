@@ -39,6 +39,125 @@ const util = @import("nativegen_testutil.zig");
 const expectBail = util.expectBail;
 const expectMatch = util.expectMatch;
 
+test "shared href and absence string key is materialized in native code" {
+    var heap = @import("gc.zig").Heap.init(testing.allocator);
+    defer heap.deinit();
+    const present = try heap.newTable();
+    const absent = try heap.newTable();
+    const key = Value.heap(&(try heap.intern("field")).header);
+    try present.set(testing.allocator, key, Value.int(7));
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_table, .a = 0 },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .guard_table, .a = 2 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .href, .a = 0, .b = 4, .aux = 3 },
+        .{ .op = .guard_hash, .a = 5, .aux = 1 },
+        .{ .op = .hload, .a = 5, .ty = .int },
+        .{ .op = .guard_absent, .a = 2, .b = 4 },
+        .{ .op = .phi, .b = 7, .aux = 2 },
+        .{ .op = .link },
+    };
+    var consts = [_]Value{key};
+    var t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &.{}, .entry_guards = &.{} };
+    var regs = [_]Value{ Value.heap(&present.header), Value.heap(&absent.header), Value.int(0), Value.int(@bitCast(@as(u64, @intFromPtr(present.fieldPtr(key).?)))) };
+    try expectMatch(&t, &regs);
+    try absent.set(testing.allocator, key, Value.boolean(false));
+    try expectMatch(&t, &regs);
+}
+
+test "guarded absence matches native for holes, hash overflow, insertion and metatables" {
+    const tab = try table.Table.create(testing.allocator);
+    defer tab.destroy(testing.allocator);
+    const meta = try table.Table.create(testing.allocator);
+    defer meta.destroy(testing.allocator);
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_table, .a = 0 },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .guard_int, .a = 2 },
+        .{ .op = .guard_absent, .a = 0, .b = 2 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .phi, .b = 5, .aux = 2 },
+        .{ .op = .link },
+    };
+    var consts = [_]Value{Value.nil()};
+    var t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &.{}, .entry_guards = &.{} };
+    var regs = [_]Value{ Value.heap(&tab.header), Value.int(9999), Value.int(42) };
+    try expectMatch(&t, &regs);
+    try tab.set(testing.allocator, Value.int(9999), Value.boolean(false));
+    try expectMatch(&t, &regs); // false is present, not nil
+    try tab.set(testing.allocator, Value.int(9999), Value.nil());
+    try expectMatch(&t, &regs);
+    for (1..20) |i| try tab.set(testing.allocator, Value.int(@intCast(i)), Value.int(1));
+    try tab.set(testing.allocator, Value.int(5), Value.nil());
+    regs[1] = Value.int(5);
+    try expectMatch(&t, &regs); // packed presence-bitmap hole
+    tab.metatable = meta;
+    try expectMatch(&t, &regs);
+}
+
+test "guarded absence matches native across bool/value lanes and negative keys" {
+    // Same trace shape as above; only the table layouts differ. Each pair of
+    // expectMatch calls exercises the inline path's per-lane nil encoding
+    // (doc 45 D7): bool lane in-band byte, `.value` lane nil tag, and the
+    // negative-key / hash-resident shapes that must reach the callout.
+    const gpa = testing.allocator;
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_table, .a = 0 },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .guard_int, .a = 2 },
+        .{ .op = .guard_absent, .a = 0, .b = 2 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .phi, .b = 5, .aux = 2 },
+        .{ .op = .link },
+    };
+    var consts = [_]Value{Value.nil()};
+    var t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &.{}, .entry_guards = &.{} };
+
+    // Bool lane: contiguous booleans, then punch an in-band hole (byte 0).
+    const btab = try table.Table.create(gpa);
+    defer btab.destroy(gpa);
+    for (0..4) |k| try btab.set(gpa, Value.int(@intCast(k)), Value.boolean(k % 2 == 0));
+    try btab.set(gpa, Value.int(2), Value.nil());
+    try testing.expectEqual(arr.Lane.boolean, btab.array.lane); // premise: bool lane
+    var regs = [_]Value{ Value.heap(&btab.header), Value.int(2), Value.int(42) };
+    try expectMatch(&t, &regs); // hole → absent → guard passes
+    regs[1] = Value.int(3);
+    try expectMatch(&t, &regs); // `false` present → guard fails (native == oracle)
+
+    // Value lane: mixed int/table values force the type-erased lane; nil is
+    // in-band (a nil-tagged 16-byte Value), probed by tag, no bitmap.
+    const vtab = try table.Table.create(gpa);
+    defer vtab.destroy(gpa);
+    const child = try table.Table.create(gpa);
+    defer child.destroy(gpa);
+    try vtab.set(gpa, Value.int(0), Value.int(7));
+    try vtab.set(gpa, Value.int(1), Value.heap(&child.header));
+    try vtab.set(gpa, Value.int(2), Value.int(9));
+    try vtab.set(gpa, Value.int(1), Value.nil());
+    try testing.expectEqual(arr.Lane.value, vtab.array.lane); // premise: value lane
+    regs[0] = Value.heap(&vtab.header);
+    regs[1] = Value.int(1);
+    try expectMatch(&t, &regs); // in-band nil → absent
+    regs[1] = Value.int(2);
+    try expectMatch(&t, &regs); // present int → guard fails
+
+    // Negative keys are never in the array part (unsigned-wrap bounds): a
+    // hash-resident one must fail the guard THROUGH the callout, an absent
+    // one must pass through it (hash non-empty → no inline shortcut).
+    const ntab = try table.Table.create(gpa);
+    defer ntab.destroy(gpa);
+    try ntab.set(gpa, Value.int(-7), Value.int(1));
+    regs[0] = Value.heap(&ntab.header);
+    regs[1] = Value.int(-7);
+    try expectMatch(&t, &regs); // hash-resident → guard fails
+    regs[1] = Value.int(-8);
+    try expectMatch(&t, &regs); // absent, hash non-empty → callout proves nil
+}
+
 // --- doc 44 D12c prerequisite: arbitrary boxed pass-through -----------------
 
 test "one-shot terminal separates incoming and outgoing register kinds" {

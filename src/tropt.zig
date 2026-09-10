@@ -128,6 +128,9 @@ fn kindOf(op: IrOp) OpKind {
         // around it and repeated emission is impossible (the recorder's class
         // map already guarantees one per alias class).
         .aref, .href, .uref => .aref,
+        // Two-operand memory guard: effect root, never CSE/hoisted. Reuse
+        // the ordered two-operand effect class, not unary guard dedup.
+        .guard_absent => .astore,
         // Grid-cell address chain (doc 14, Phase 8): `garow` (table+row → row base)
         // and `gcell` (row base+col → cell) are memory-address producers, same
         // canonical-to-self memory-op treatment as `aref` so a later `gstore` can't

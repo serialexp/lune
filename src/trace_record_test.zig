@@ -241,8 +241,6 @@ test "recArrayGet aborts: non-table container, non-int key, hole, and out-of-bou
         .{ .tab = Value.int(7), .key = Value.int(3), .why = .bad_type }, // not a table
         .{ .tab = Value.heap(&t.header), .key = Value.boolean(true), .why = .bad_type }, // non-int key
         .{ .tab = Value.heap(&t.header), .key = Value.float(1.5), .why = .bad_type }, // FRACTIONAL float — hash territory, no narrow
-        .{ .tab = Value.heap(&t.header), .key = Value.int(1), .why = .bad_type }, // hole at 1
-        .{ .tab = Value.heap(&t.header), .key = Value.int(9999), .why = .bad_type }, // out of bounds
     };
     for (cases) |c| {
         var state = TraceState.init(gpa);

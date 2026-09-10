@@ -21,6 +21,116 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-10 — doc 45 guarded-absence slice finished per D7 (this session)
+
+Finished astra's absence slice against the D7 contract. What this pass added on
+top of the section below:
+
+- **D7 inline numeric fast path** (`emitGuardAbsent`, nativegen): every check
+  reads the LIVE table layout via the header (type, metatable, lane, asize,
+  data/present, hash size) — bool lane in-band byte, `.value` lane nil tag,
+  numeric-lane presence `bt`, and the empty-hash OOB shortcut (the btrees leaf
+  `t[2]` on `{item}`). Grid lanes, string keys and non-empty-hash OOB fall back
+  to the shared `isAbsent` callout (THE tier-1a predicate; save area still
+  reserved via `bodyCalloutOf`). Receipts: ItemCheck absence anchors
+  1541.8→1341.4 and 229.6→201.4 c/it (`--jit-stats`, vs
+  `/tmp/mahina-table-recording/absence.txt`).
+- **Regression investigation (doc 31 D3) closed with receipts.** The 399-vs-370
+  board delta decomposes as: (a) run noise — t0 and LuaJIT moved ±5–7% between
+  astra's two runs; (b) a real structural cost — absence recording turned
+  ~160k ItemCheck leaf continuations/iters into native episodes at ~1341 c/it
+  that previously ran tier-0 at ~357 c/it (episode-entry seams; iters/entry ~1),
+  NOT the guard itself. That seam is exactly what doc 45 table construction
+  (BottomUpTree `new_table`, the whole-cycle fuse) removes — same disease D12b
+  carried until D12c linked it. Board is 65% non-loop (alloc+GC), so guard-level
+  wins move cycles receipts, not wall-clock. fib unaffected (183–187 ms).
+- **Coverage added**: bool-lane in-band hole, `.value`-lane in-band nil,
+  negative/hash-resident keys (native-vs-tier-1a differential); VM-level
+  same-iteration store-after-absent-read deferral (C1) test. Restored the
+  guard_func comment D7 says to keep; `troptdiag.zig` fmt churn reduced to the
+  two substantive `.guard_absent` prongs (repo is not fmt-enforced).
+- **Audits done**: nil kind (zero payload from `Value.nil()`, falsy truth
+  guards, flush tag, rejected by numeric + eq/ne arms — fail closed);
+  `guardExitPc` null for guard_absent; tropt `.astore` classing gives
+  no-fold/no-CSE/no-hoist/liveness-root/live+remapped operands; no other
+  optimizer pass touches memory classes.
+
+NEXT (doc 45): precise-state contract (D2) + table construction (D4/D5) — the
+payoff that unfuses btrees' remaining `new_table` aborts. Then effect ordering,
+GC/errors, link integration per the checklist.
+
+## Doc45 historical — astra in-flight notes (superseded by the section above)
+
+Implementation resumed: fixed P0 shared href/absence-key pointer admission.
+Keys with actual value uses (including aux operands/phi writeback) now leave
+the metadata-only href_key set and materialize as heap strings; absence proof
+requires actual int or proven-string heap kind. Added native differential
+regression with one key shared across present href and absent lookup, then
+inserted false to exercise refusal. Added guard_absent to side-exit guard
+inventory and repaired misplaced comments. `timeout300s just test` passes.
+Remaining P0: inline numeric path, nil/alias/VM-level coverage, full gates and
+regression investigation. P1-P3 not implemented. No commit.
+
+Bart requested general table construction + nil-child loads. Plan approved;
+implementation is direct (no delegated workers). Design:
+`docs/design/45-table-effects-and-precise-deopt.md`.
+
+**Review loop completed at Bart's request:** normative Revision5 independently
+APPROVED for implementation by Claude **Opus** (explicit model, not Fable) and
+Antigravity. R2/R3 required revisions; R4 had mandatory clarifications; R5 has
+no design blockers. Final receipts in `docs/reviews/doc45/`; intermediate rounds
+in `/tmp/mahina-doc45-review/`. Antigravity had supplied-source context only
+(headless tool permissions denied); Opus read the repo. This turn changed docs
+only, ran git diff --check, not builds/tests. No commit.
+
+Key final decisions: deterministic needs_precise cancellation + counter rearm,
+next-anchor precise recording, full entry capture ONLY for precise candidates,
+ordered effects from start (no retroactive ref/store merge), bounded maps/records,
+precise final-row ABI, execute-once OOM error propagation (UNCATCHABLE; TypeError
+pcall-recoverable), eager guard_gc even for zero-allocation precise mutation,
+explicit inline/peel/state-change/link admission boundaries. Follow D1-D9.
+
+**P0 hard blocker confirmed by Opus:** shared string konst used as href key and
+guard_absent gets native kind .none yet absence admits it as pointer. Fix kind
+admission/materialization and add witnessed native two-table regression before
+landing. D7 also requires inline numeric absence, isSideExitGuardOp inventory,
+full native nil audit and full-board regression investigation. Opus nonblocking
+implementation notes: snapshot vector length must be u32 (65536 bound); explicit
+body-entry snapshot for guard_gc; boxedPassThroughOnly currently excludes loop
+terminators and must admit precise-loop snapshot uses. Design approval does NOT
+approve the uncommitted absence implementation or complete table construction.
+
+Fresh baseline4893cbc: binary-trees370.0ms, t0221.3ms, LuaJIT39.3ms,
+`20260909-161243-4893cbc.tsv`. Profile/stats receipts under
+`/tmp/mahina-table-recording/`. Main findings: collection15.57%, native runner
+10.23%, trace entry8.40%, tier0 new-table4.64%, tier0 return4.32% at depth14.
+**Table allocation requires precise deopt**: doc24 explicitly excludes it;
+IrInstr.snap remains unused. Do NOT add a replaying new_table callout, roll
+back IDs, or cache speculative allocations. Constructors also need growing,
+heap-valued stores, not just allocation. Precise snapshots/effect ordering,
+optimizer liveness, native exits/ledger and serialization remain unimplemented.
+
+Initial absent-load slice implemented: appended guard_absent (wire87), shared
+nonallocating table_runtime lookup covering holes/hash overflow/metatables,
+recorder paths for numeric and constant-string absence, C1 read classification,
+tier1a/native helper, optimizer effect-root classification, nil constant native
+kind/flush/truth guards, viz enum and initial tests. `timeout300s just test`
+passes after fixing old abort expectations and native nil writeback admission.
+**Still needs audit and stronger tests**: nil kind admission/home/tag inventory,
+constant key simultaneously used by href and absence (href-key .none issue),
+optimizer passes beyond tropt (LICM etc.), source/provenance and link inventories,
+string/array changing-value tests, explicit native formation, OOM not relevant
+to absence but mandatory for forthcoming table effects. zig fmt reformatted
+unrelated sections of troptdiag.zig; reduce own formatting-only diff before land.
+
+Post-slice bench399.1ms vs370.0ms fresh baseline (t0236.7 vs221.3;
+LuaJIT41.3 vs39.3, noisy denominator). No speedup claim. Required jit-stats
+run shows **159869 native pops,159819 return-link hits**, all2974476 entries
+native; ItemCheck bad_type abort gone. BottomUpTree new_table remains. Receipt
+`/tmp/mahina-table-recording/absence.txt`, board
+`20260909-163840-4893cbc.tsv`. Full debug/hash/wasm/viz gates NOT rerun yet.
+No commit. Preserve unrelated gc/wasm/viz pre-existing edits.
+
 ## D12c final verification — ready to land
 
 Native return/continuation/call-head links and general one-shot value snapshots

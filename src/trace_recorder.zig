@@ -1372,9 +1372,9 @@ pub const RecordingSession = struct {
         // sound conservative choice is to bail the whole trace to tier-0.
         if (tbl.metatable != null) return self.abort(.has_metatable);
         const lane = tbl.array.lane;
-        if (!arr.ArrayPart.inArray(idx, tbl.array.asize)) return self.abort(.bad_type);
         const loaded = tbl.getInt(idx);
-        if (loaded.isNil()) return self.abort(.bad_type); // hole — not a profitable trace
+        if (loaded.isNil()) return self.recordAbsentGet(regs, f);
+        if (!arr.ArrayPart.inArray(idx, tbl.array.asize)) return self.abort(.bad_type);
 
         if (lane == .value) {
             // The `.value` lane stores full 16-byte Values (tag+payload, nil in-band).
@@ -1911,7 +1911,7 @@ pub const RecordingSession = struct {
             // `uload` (doc 43 P5) is a heap read for the C1 store-sink
             // decision: a store following it is a read-modify-write whose
             // write must defer below every guard.
-            if (ins.op == .aload or ins.op == .hload or ins.op == .gload or ins.op == .uload) return true;
+            if (ins.op == .aload or ins.op == .hload or ins.op == .gload or ins.op == .uload or ins.op == .guard_absent) return true;
         }
         return false;
     }
@@ -1930,7 +1930,7 @@ pub const RecordingSession = struct {
     /// may alias the appended table (fail-closed, no alias analysis).
     pub fn traceHasArrayRead(self: *const RecordingSession) bool {
         for (self.instrs.items) |ins| {
-            if (ins.op == .aload or ins.op == .gload or ins.op == .alen) return true;
+            if (ins.op == .aload or ins.op == .gload or ins.op == .alen or ins.op == .guard_absent) return true;
         }
         return false;
     }
@@ -2032,6 +2032,26 @@ pub const RecordingSession = struct {
     ///     `forwardPendingHashLoad` — a MUST-alias forwards the pending value, a
     ///     proven NO falls through to the heap read, and only the ambiguous
     ///     same-key/different-table-ref case aborts fail-closed.
+    /// General absent lookup. Keep the nil constant behind a runtime proof;
+    /// never specialize an observed absence into an unconditional result.
+    fn recordAbsentGet(self: *RecordingSession, regs: RegWindow, f: GetFrame) !void {
+        const key = regs.get(f.key);
+        const rtab = try self.refOf(f.tab);
+        const rkey = if (key.isNumber())
+            try self.keyRefNarrowed(f.key, f.key_od, key)
+        else
+            try self.refOf(f.key);
+        if (!key.isNumber() and self.konstValueOf(rkey) == null) return self.abort(.bad_type);
+        // Pending mutations are not yet in the executor heap. The existing
+        // forwarding paths either resolve them or refuse ambiguous aliases.
+        if (key.isNumber()) {
+            if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, keyIndexOf(key).?)) return;
+        } else if (self.forwardPendingHashLoad(f.dst, rtab, rkey)) return;
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_absent, .a = rtab, .b = rkey }), .present, .loaded, .neutral);
+        self.setReg(f.dst, try self.konst(Value.nil()));
+    }
+
     pub fn recHashGet(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
         return self.hashGetShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = instr.c, .tab_od = .b, .key_od = .c });
     }
@@ -2042,7 +2062,7 @@ pub const RecordingSession = struct {
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
         if (tbl.metatable != null) return self.abort(.has_metatable);
-        const cell = tbl.fieldPtr(vkey) orelse return self.abort(.bad_type); // absent
+        const cell = tbl.fieldPtr(vkey) orelse return self.recordAbsentGet(regs, f);
         // Field-type restriction (the hash analogue of the narrow-array-lane rule).
         // A present cell holds a non-`nil` tagged `Value` of any type. We trace
         // **int/float/bool/function** fields. The historic objection to bool —

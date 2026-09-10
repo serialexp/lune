@@ -663,6 +663,11 @@ pub const IrOp = enum(u8) {
     /// function-entry snapshot at pc 0, never to the terminal. Wire
     /// ordinal 86.
     terminal,
+
+    /// Runtime raw lookup must be nil. `a` = table, `b` = integer or constant
+    /// string key. Memory-dependent, non-CSE guard; checks metatable absence
+    /// too. Covers packed holes and hash-resident keys, not just array bounds.
+    guard_absent,
 };
 
 /// Doc 44: what a `.terminal` hands back to tier-0 (rides `terminal.a`).
@@ -720,6 +725,7 @@ pub fn guardExitPc(ins: IrInstr) ?u32 {
 /// is side-trace evidence, not thrash.
 pub fn isSideExitGuardOp(op: IrOp) bool {
     return switch (op) {
+        .guard_absent => true,
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent, .alen => true,
         else => false,
     };

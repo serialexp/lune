@@ -3771,13 +3771,11 @@ test "hash field P1 end-to-end: C1 forwards a pending bool hstore to a same-iter
     , "200\n");
 }
 
-test "recorder (hash field): an absent constant-key access aborts (no trace)" {
+test "recorder (hash field): an absent constant-key access records a guarded nil" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    // `t.y` is absent at record time. The present-key rule forbids it: an absent-key
-    // read is `__index`/migrate territory, and an absent-key store could grow/rehash
-    // and dangle every hoisted cell. The recorder aborts → no trace, anchor gated.
+    // Metatable-free absence is a guarded load, not an unconditional nil.
     var chunk = try runForTrace(&vm, gpa,
         \\local t = {x = 1}
         \\local c = 0
@@ -3786,9 +3784,35 @@ test "recorder (hash field): an absent constant-key access aborts (no trace)" {
     , true);
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
-    try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
+    try testing.expect(vm.trace.registry.cache.items.len > 0);
+    var witnessed = false;
+    for (vm.trace.registry.cache.items) |ct| {
+        for (ct.code.instrs) |ins| if (ins.op == .guard_absent) {
+            witnessed = true;
+        };
+    }
+    try testing.expect(witnessed);
     try testing.expect(!vm.trace.isRecording());
+}
+
+test "hash field (doc 45): a store after an absent read defers below the guard" {
+    // C1 discipline for the absence slice: `guard_absent` counts as a heap
+    // read, so the same-iteration present-cell store `t.x = i` must sink
+    // BELOW it — an entry replay after a guard failure must re-run the read
+    // against the unmutated heap and take the same branch (doc 45 D7: "a
+    // following write cannot change which branch entry replay would take").
+    // (A store to the absent key itself is unrecordable today — hash
+    // insertion aborts — so the different-key deferral is the recordable
+    // interplay; general tset ordering arrives with table construction.)
+    try expectProgram(
+        \\local t = { x = 1 }
+        \\local c = 0
+        \\for i = 1, 200 do
+        \\  if t.y == nil then c = c + 1 end
+        \\  t.x = i
+        \\end
+        \\print(c .. " " .. t.x)
+    , "200 200\n");
 }
 
 test "recorder (hash field): a metatable-bearing table aborts (.has_metatable)" {

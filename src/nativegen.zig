@@ -486,6 +486,7 @@ const Reg = x64.Reg;
 const object = @import("object.zig");
 const function = @import("function.zig");
 const bytecode = @import("bytecode.zig");
+const TAG_NIL: u8 = @intFromEnum(value.Tag.nil);
 const TAG_INT: u8 = @intFromEnum(value.Tag.int);
 const TAG_BOOL: u8 = @intFromEnum(value.Tag.boolean);
 const TAG_FLOAT: u8 = @intFromEnum(value.Tag.float);
@@ -680,7 +681,7 @@ fn laneConsistent(trace_lane: *?i32, aux: i32) bool {
 ///               `[rsi + aux*8]`, not computed from the operands. Like `.aref` it is a
 ///               distinct addressing kind — it can neither feed arithmetic nor be
 ///               flushed to a slot (C2). Consumed only by `hload`/`hstore`/`guard_hash`.
-pub const Kind = enum { none, int, bool, ptr, aref, float, func, href, native, heap, boxed };
+pub const Kind = enum { none, int, bool, ptr, aref, float, func, href, native, heap, boxed, nil };
 
 pub const NativeResult = extern struct {
     completed: usize,
@@ -1763,6 +1764,23 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
         }
     }
 
+    // Only exclusively-addressing keys may omit materialization. A shared
+    // string constant consumed as a value must have a real heap location.
+    for (t.instrs) |ins| {
+        const reads = operandReads(ins);
+        if (reads.a and ins.a < n) href_key[ins.a] = false;
+        if (reads.b and ins.op != .href and ins.b < n) href_key[ins.b] = false;
+        switch (ins.op) {
+            .ssub, .scp, .sfindp, .smatch => {
+                if (ins.aux >= 0 and ins.aux < n) href_key[@intCast(ins.aux)] = false;
+            },
+            .phi => if (ins.b < n) {
+                href_key[ins.b] = false;
+            },
+            else => {},
+        }
+    }
+
     // The single packed lane this trace's array ops touch (set by the first
     // lane-bearing op; every later one must match — see `laneConsistent`).
     var trace_lane: ?i32 = null;
@@ -1810,14 +1828,15 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                     // sfindp/smatch) — `payload.bits` IS the stable `*GcHeader`
                     // pointer (non-moving GC, consts rooted by the trace), so the
                     // existing raw-bits materialization emits it verbatim. A konst
-                    // that is BOTH an href key and a value operand stays `.none`
-                    // and the value use bails — fail closed. Non-string heap
-                    // konsts stay unmarked → bail.
+                    // used BOTH as an href key and a value operand is excluded
+                    // from href_key's metadata-only set and materializes normally.
+                    // Non-string heap konsts stay unmarked → bail.
                     .heap_ref => if (href_key[i]) .none else if (t.consts[@intCast(ins.aux)].heapType() == .string) blk: {
                         is_string[i] = true;
                         break :blk .heap;
                     } else return false,
-                    else => return false, // nil → bail
+                    .nil => .nil,
+                    else => return false,
                 };
             },
             // Arithmetic: the recorder stamps the *result* type in `ins.ty`
@@ -1924,7 +1943,7 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 // proof says can't recur; mirror the existing `.int` arms).
                 // `.none`/`.aref`/`.href` are not values and stay a bail.
                 const k = kinds[ins.a];
-                if (k != .int and k != .bool and k != .float and
+                if (k != .int and k != .bool and k != .float and k != .nil and
                     k != .ptr and k != .heap and k != .func and k != .native) return false;
                 kinds[i] = .none;
             },
@@ -1938,6 +1957,14 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 // `.heap` = per-iteration element table from .value-lane aload
                 // (Phase 2) — body guard, NOT hoisted.
                 if (kinds[ins.a] != .ptr and kinds[ins.a] != .heap) return false;
+                kinds[i] = .none;
+            },
+            // Absence consumes real runtime values, including materialized
+            // string keys shared with href; a metadata-only .none is not a pointer.
+            .guard_absent => {
+                if (ins.a >= i or ins.b >= i) return false;
+                if (kinds[ins.a] != .ptr and kinds[ins.a] != .heap) return false;
+                if (kinds[ins.b] != .int and !(kinds[ins.b] == .heap and is_string[ins.b])) return false;
                 kinds[i] = .none;
             },
             // guard_func (U1, cross-frame): covers the callee-snapshot slot_load
@@ -2753,7 +2780,7 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
         // write the callee closure into the child call frame's slots. A carried
         // `.func` load still bails in `analyze` (lk must be numeric), so this
         // only ever feeds write-only flushes.
-        if (k != .int and k != .bool and k != .float and k != .ptr and k != .heap and k != .func and k != .boxed) return false;
+        if (k != .int and k != .bool and k != .float and k != .ptr and k != .heap and k != .func and k != .boxed and k != .nil) return false;
         // Doc 40: an internal φ's back-edge update must deliver the φ's own
         // kind — the other half of the φ-guard discharge (Pass B proved the
         // init; this proves iterations 2+). `b` is a forward ref, so the check
@@ -2822,6 +2849,7 @@ fn opMayExitInBody(
         .guard_false,
         .guard_bounds,
         .guard_present,
+        .guard_absent,
         .guard_fits,
         .guard_append,
         .int_of_float,
@@ -2922,6 +2950,8 @@ const BodyCallout = enum {
     /// `resolveHashCell`: pure hash-chain walk over an existing table — reads
     /// the key, hashes, follows cells; allocates nothing.
     resolve_hash_cell,
+    /// Full raw lookup, no mutation/allocation/collection.
+    table_absent,
     /// `fmath.sinRuntime`: the shared noinline `math.sin` kernel (doc 23 D4) —
     /// a pure f64 → f64 function; allocates nothing.
     fsin,
@@ -3014,7 +3044,7 @@ const BodyCallout = enum {
 /// per-row above and accounted by the `guard_gc` budget instead.
 fn calloutMayCollect(c: BodyCallout) bool {
     return switch (c) {
-        .resolve_hash_cell => false,
+        .resolve_hash_cell, .table_absent => false,
         .fsin, .fcos, .ffloor, .fceil, .fpow, .fmod, .ffloordiv => false,
         .tostr_int, .tostr_num => false,
         .ssub, .srev, .schar1, .srep2 => false,
@@ -3037,6 +3067,7 @@ fn bodyCalloutOf(
     const ins = t.instrs[idx];
     return switch (ins.op) {
         .href => if (isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a)) .resolve_hash_cell else null,
+        .guard_absent => .table_absent,
         .fsin => .fsin,
         .fcos => .fcos,
         .ffloor => .ffloor,
@@ -3353,7 +3384,7 @@ fn operandReads(ins: trace_ir.IrInstr) struct { a: bool, b: bool } {
         // table through aref.a, so they read only the aref token (a). astore reads
         // the aref token (a) plus the value to write (b). astore_append is the grow
         // analogue (aref token + value).
-        .aref, .astore, .astore_append => .{ .a = true, .b = true },
+        .aref, .astore, .astore_append, .guard_absent => .{ .a = true, .b = true },
         .aload, .guard_bounds, .guard_present, .guard_table, .guard_lane => .{ .a = true, .b = false },
         // guard_func reads the callee-snapshot value it identity-checks (a).
         .guard_func => .{ .a = true, .b = false },
@@ -4919,6 +4950,7 @@ fn flushBoxedSlot(a: *x64.Assembler, dst_slot: i32, tag_spill: u32, payload: Pla
 fn flushSlot(a: *x64.Assembler, slot: i32, kind: Kind, payload: Place) !void {
     std.debug.assert(kind != .boxed);
     const tag: u8 = switch (kind) {
+        .nil => @intFromEnum(value.Tag.nil),
         .bool => TAG_BOOL,
         .float => TAG_FLOAT,
         // `.ptr` (invariant table), `.heap` (per-iteration table — a carried-heap
@@ -6040,6 +6072,116 @@ fn emitHrefCallout(
     try regToPlace(a, placeOfRef(alloc, i), .rcx);
 }
 
+/// `guard_absent` (doc 45 D7): prove the runtime raw lookup `t[k]` is still nil,
+/// side-exiting when a value (or a metatable, or a non-table) has appeared.
+///
+/// The common numeric shape is INLINED — every check reads the table's LIVE
+/// layout through the header pointer (lane, asize, data/present, hash size);
+/// nothing is pinned to the recording's addresses, so lane widening, growth and
+/// rehash between iterations are all observed truthfully:
+///
+///   1. `header.type == .table` and `metatable == null` — else the guard fails
+///      (a metatable would dispatch `__index`; absence may not suppress it).
+///   2. grid lane → full-lookup callout (virtual rows are never nil).
+///   3. `key <u asize` (LuaJIT-style unsigned compare — rejects negative keys
+///      via wrap, same as `ArrayPart.inArray`): in-array absence is the lane's
+///      own nil encoding — bool lane in-band byte 0, `.value` lane nil tag,
+///      numeric lanes a CLEAR presence-bitmap bit. All reads are behind the
+///      bounds check; the bitmap is only dereferenced for bitmap lanes.
+///   4. out of array: an EMPTY hash (live-entry count 0) proves absence with
+///      no lookup at all — the binary-trees leaf shape `t[2]` on `{item}`.
+///      A non-empty hash falls back to the callout (the key may be resident).
+///
+/// String keys always take the full-lookup callout (interning gives them no
+/// cheap inline test). The callout is `table_runtime.isAbsent` — the SAME
+/// predicate tier-1a runs, so every tier agrees by construction. The callout
+/// preserves live homes via the shared save/restore ABI (`bodyCalloutOf` maps
+/// this op, so the save area is reserved whenever the trace contains one —
+/// even though the inline path usually skips the call).
+fn emitGuardAbsent(
+    a: *x64.Assembler,
+    alloc: *const Alloc,
+    kinds: []const Kind,
+    ins: trace.IrInstr,
+    i: usize,
+    exit_labels: []?x64.Label,
+) !void {
+    const is_int_key = kinds[ins.b] == .int;
+    const pass = try a.label();
+    const callout = try a.label();
+
+    if (is_int_key) {
+        const lane_off: i32 = ArrLayout.array_base + ArrLayout.lane;
+        // rax = table header. rax/rcx are the body scratch pair (never homes).
+        try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
+        // 1. type + metatable (no qword cmp-mem-imm encoder → load and test).
+        try a.cmpByteMemImm(.rax, HEADER_TYPE_OFF, TABLE_TYPE);
+        try jccNativeExit(a, exit_labels, i, .ne); // not a table → guard fails
+        try a.movRegMem(.rcx, .rax, METATABLE_OFF);
+        try a.cmpRegImm32(.rcx, 0);
+        try jccNativeExit(a, exit_labels, i, .ne); // metatable appeared → guard fails
+        // 2. grid meta-lane → full lookup.
+        try a.cmpByteMemImm(.rax, lane_off, @intCast(GRID_LANE));
+        try a.jcc(.e, callout);
+        // 3. bounds: key <u asize?
+        try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
+        try a.cmpRegMem(.rcx, .rax, ArrLayout.array_base + ArrLayout.asize);
+        const in_array = try a.label();
+        try a.jcc(.b, in_array);
+        // 4. out of array: empty hash proves absence; else the callout decides.
+        try a.cmpDwordMemImm(.rax, HASH_SIZE_FROM_HEADER, 0);
+        try a.jcc(.ne, callout);
+        try a.jmp(pass);
+
+        a.bind(in_array);
+        const bool_lane = try a.label();
+        const value_lane = try a.label();
+        try a.cmpByteMemImm(.rax, lane_off, @intCast(BOOL_LANE));
+        try a.jcc(.e, bool_lane);
+        try a.cmpByteMemImm(.rax, lane_off, @intCast(VALUE_LANE));
+        try a.jcc(.e, value_lane);
+        // Numeric lanes (i8…i64/u8/f64): presence bitmap — a SET bit means the
+        // slot holds a value, so the absence guard fails.
+        try a.movRegMem(.rax, .rax, ArrLayout.array_base + ArrLayout.present);
+        try a.btMemReg(.rax, 0, .rcx);
+        try jccNativeExit(a, exit_labels, i, .b); // CF=1 → present → guard fails
+        try a.jmp(pass);
+
+        a.bind(bool_lane); // in-band encoding: 0 = absent, 1 = false, 2 = true
+        try a.movRegMem(.rax, .rax, ArrLayout.array_base + ArrLayout.data);
+        try a.loadRegMemSib(.rax, .rax, .rcx, 1, false, 0); // movzx byte
+        try a.cmpRegImm32(.rax, 0);
+        try jccNativeExit(a, exit_labels, i, .ne); // non-zero byte → present
+        try a.jmp(pass);
+
+        a.bind(value_lane); // 16-byte tagged Values, nil in-band → tag probe
+        try a.movRegMem(.rax, .rax, ArrLayout.array_base + ArrLayout.data);
+        try a.shlRegImm8(.rcx, 4); // idx*16 (SIB can't scale by 16)
+        try a.addRegReg(.rcx, .rax); // rcx = &data[idx]
+        try a.cmpByteMemImm(.rcx, VALUE_TAG_OFF, TAG_NIL);
+        try jccNativeExit(a, exit_labels, i, .ne); // non-nil tag → present
+        try a.jmp(pass);
+    }
+
+    // Slow path (string keys unconditionally; int keys on grid / non-empty-hash
+    // fallback): the shared full semantic lookup, THE predicate tier-1a runs.
+    a.bind(callout);
+    try emitCalloutSave(a, alloc);
+    try placeToReg(a, .rdi, placeOfRef(alloc, ins.a));
+    try placeToReg(a, .rsi, placeOfRef(alloc, ins.b));
+    const runtime = @import("table_runtime.zig");
+    const helper = if (is_int_key) @intFromPtr(&runtime.absentInt) else @intFromPtr(&runtime.absentString);
+    try a.subRegImm32(.rsp, 8);
+    try a.movRegImm64(.rax, @bitCast(@as(u64, helper)));
+    try a.callReg(.rax);
+    try a.addRegImm32(.rsp, 8);
+    try a.movRegReg(.rcx, .rax);
+    try emitCalloutRestore(a, alloc);
+    try a.cmpRegImm32(.rcx, 0);
+    try jccNativeExit(a, exit_labels, i, .e); // helper says "not absent" → guard fails
+    a.bind(pass);
+}
+
 fn emitHStore(a: *x64.Assembler, kinds: []const Kind, alloc: *const Alloc, ins: trace.IrInstr) !void {
     if (kinds[ins.b] == .float) {
         // Stage the value into XMM_SCRATCH0 first (independent of rax/rcx), then
@@ -6754,6 +6896,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // reader. No heap arg; −1 sentinel → side-exit (tier-0 replays
             // the call to its nil result).
             .scp => try emitScpCallout(a, alloc, ins, i, exit_labels),
+            .guard_absent => try emitGuardAbsent(a, alloc, kinds, ins, i, exit_labels),
             // --- doc 30: the pattern/str2num callout class -------------------
             // (compileImpl bailed heapless traces containing the heap-needing
             // members, so `heap.?` cannot trip for smatch/sgmatch/scap_*.)
@@ -7392,6 +7535,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 try emitGStore(a, t, alloc, ins);
             },
             .guard_true => switch (kinds[ins.a]) {
+                .nil => try jmpNativeExit(a, exit_labels, i),
                 // Every non-bool proven value is statically truthy (only
                 // nil/false are falsy in Lua) → guard always passes (no-op).
                 .int, .float, .ptr, .func, .native, .heap => {},
@@ -7406,6 +7550,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 .none, .aref, .href, .boxed => unreachable, // proveKinds restricts to inspected value kinds
             },
             .guard_false => switch (kinds[ins.a]) {
+                .nil => {},
                 // A non-bool proven value is never falsy → always side-exit.
                 .int, .float, .ptr, .func, .native, .heap => try jmpNativeExit(a, exit_labels, i),
                 .bool => {

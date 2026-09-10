@@ -106,6 +106,7 @@ export const IR_OP_NAMES = [
   "uload", // 84  typed load through a uref cell — a=uref, fused tag exit per ty
   "ustore", // 85  in-place scalar store through a uref cell — a=uref, b=value
   "terminal", // 86  one-shot head-trace close (doc 44) — a=TerminalKind, aux=resume pc
+  "guard_absent", // 87 raw table lookup is nil — a=table, b=key
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
