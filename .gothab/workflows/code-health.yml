@@ -1,0 +1,12 @@
+name: Code health
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gothab/analyze@v1
