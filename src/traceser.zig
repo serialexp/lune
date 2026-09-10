@@ -75,6 +75,12 @@ pub fn toSchemaConst(v: Value) error{UnsupportedConst}!schema.ConstValue {
 /// trace's live string consts). The anchor is the proto's *id*, never its
 /// pointer.
 pub fn toSchemaTrace(a: std.mem.Allocator, t: *const TraceCode) !schema.Trace {
+    // Doc 45 D8 (fail-closed until it lands): the schema has no
+    // snapshots/deopt_mode fields yet, so serializing a PRECISE trace would
+    // silently strip its correctness metadata — the decoded trace would carry
+    // dangling one-based `snap` indexes and claim entry-replay semantics.
+    // Refuse rather than round-trip a lie.
+    if (t.deopt_mode == .precise) return error.UnsupportedPreciseTrace;
     const instrs = try a.alloc(schema.IrInstr, t.instrs.len);
     for (t.instrs, 0..) |ins, i| instrs[i] = .{
         .op = @intFromEnum(ins.op),

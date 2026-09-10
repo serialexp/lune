@@ -28,6 +28,8 @@ const stdstring = @import("stdlib/string.zig");
 const stderrors = @import("stdlib/errors.zig");
 const stddebug = @import("stdlib/debug.zig");
 const stdload = @import("stdlib/load.zig");
+const trace_snapshot = @import("trace_snapshot.zig");
+const trace_ir = @import("trace_ir.zig");
 const stdpackage = @import("stdlib/package.zig");
 const unicode_case = @import("gen/unicode_case.zig");
 const Value = value.Value;
@@ -5686,11 +5688,12 @@ test "recorder (precise deopt, doc 45 D2): new_table cancels needs_precise ONCE,
     try testing.expectEqual(@as(u64, 1), cancel_row.?.count); // memo held: cancelled exactly once
     try testing.expectEqual(cancel_row.?.anchor_pc, nyi_row.?.anchor_pc);
     try testing.expectEqual(cancel_row.?.abort_pc, nyi_row.?.abort_pc);
-    // Both attempts recorded the anchor's leading instructions before dying at
-    // `new_table` — the retry really re-recorded from the anchor's first
-    // instruction with the original register values (a corrupt re-arm would
-    // change how far it gets or where it dies).
-    try testing.expectEqual(cancel_row.?.ir_len, nyi_row.?.ir_len);
+    // The retry re-recorded from the same anchor and died at the same
+    // `new_table` bytecode — but in PRECISE mode, so it first emitted the
+    // full entry-load + eager-guard_gc prologue. Its partial trace is
+    // therefore STRICTLY LONGER than the non-precise attempt's (the prologue),
+    // which is exactly the observable signature of the precise re-arm.
+    try testing.expect(nyi_row.?.ir_len > cancel_row.?.ir_len);
 
     // Policy state: the anchor is memoized for precise mode, and the nyi
     // retry struck the record gate normally (ordinary strikes resumed — the
@@ -5699,4 +5702,86 @@ test "recorder (precise deopt, doc 45 D2): new_table cancels needs_precise ONCE,
     try testing.expect(vm.trace.precise_anchor_memo.contains(anchor));
     try testing.expect(vm.trace.record_gate.count() >= 1);
     try testing.expect(!vm.trace.isRecording());
+}
+
+test "recorder (precise deopt, doc 45 D2): a pre-seeded precise loop commits a full-window snapshot per body bytecode" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+
+    // Pure int arithmetic — records cleanly, no new_table/store to abort in
+    // precise mode — so pre-seeding its anchor into `precise_anchor_memo`
+    // makes the FIRST recording arm precise and COMMIT a precise trace we can
+    // dissect. (Execution is declined for precise traces this increment; the
+    // commit + snapshot metadata is the substrate under test.)
+    const source: [:0]const u8 =
+        \\local s = 0
+        \\for i = 1, 400 do s = s + i * 2 end
+        \\print(s)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = false; // inspect recording in isolation
+    vm.trace.config.optimize = false;
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    // Seed every pc into the precise memo: only the real loop anchor's
+    // counter ever crosses, so `arm()` consults exactly one and records this
+    // loop precise. (Robust against the exact back-edge-target pc encoding.)
+    var pc: u32 = 0;
+    while (pc < chunk.proto.code.len) : (pc += 1)
+        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pc }, {});
+
+    _ = try vm.run(chunk.proto);
+
+    // A precise trace committed at the anchor.
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
+    try testing.expectEqual(trace_snapshot.DeoptMode.precise, t.code.deopt_mode);
+    try testing.expect(t.code.snapshots.len > 0);
+
+    // Structural validity + full-window shape (register_count == num_registers,
+    // every slot present ascending, resume_pc in range) — the same predicate
+    // finalization enforced.
+    try testing.expect(trace_snapshot.validate(t.code.snapshots, t.code.snapshot_slots, @intCast(chunk.proto.code.len)));
+    const nregs = chunk.proto.num_registers;
+    for (t.code.snapshots) |snap| {
+        try testing.expectEqual(nregs, snap.register_count);
+        try testing.expectEqual(@as(u32, nregs), snap.slots_len);
+        try testing.expect(snap.resume_pc < chunk.proto.code.len);
+    }
+
+    // Every potentially-failing BODY op carries a nonzero snap; the entry
+    // prologue (slot_loads + the eager guard_gc) carries snap == 0. Locate the
+    // guard_gc: everything at/before it is prologue, everything after is body.
+    var gc_idx: ?usize = null;
+    for (t.code.instrs, 0..) |ins, i| {
+        if (ins.op == .guard_gc) gc_idx = i;
+    }
+    try testing.expect(gc_idx != null);
+    try testing.expectEqual(@as(i32, 0), t.code.instrs[gc_idx.?].aux); // nonallocating body: aux==0 legal
+    for (t.code.instrs[0 .. gc_idx.? + 1]) |ins| {
+        try testing.expectEqual(@as(trace_ir.SnapIdx, 0), ins.snap); // prologue = entry replay
+    }
+    var body_guard_snaps: usize = 0;
+    for (t.code.instrs[gc_idx.? + 1 ..], gc_idx.? + 1..) |ins, i| {
+        if (trace_ir.isSideExitGuardOp(ins.op)) {
+            try testing.expect(ins.snap != 0);
+            // The captured refs are all defined before this use site.
+            try testing.expect(trace_snapshot.refsDefinedAt(ins.snap, i, t.code.snapshots, t.code.snapshot_slots));
+            body_guard_snaps += 1;
+        }
+    }
+    try testing.expect(body_guard_snaps > 0);
 }

@@ -38,6 +38,7 @@ const UPVALUE_CELL_ANCHOR = @import("trace_code.zig").UPVALUE_CELL_ANCHOR;
 const MAX_INLINE_DEPTH = @import("trace_types.zig").MAX_INLINE_DEPTH;
 const CallEdge = @import("trace_types.zig").CallEdge;
 const SlotStore = @import("trace_ir.zig").SlotStore;
+const trace_snapshot = @import("trace_snapshot.zig");
 pub const AbortReason = enum {
     /// An opcode the recorder does not yet model (tables, globals, concat, …).
     nyi_opcode,
@@ -408,7 +409,15 @@ pub inline fn isOneShotKind(kind: TraceKind) bool {
 }
 
 pub const RecordingSession = struct {
-    pub const Options = struct { maxrecord: usize = 4096, peel: bool = true, optimize: bool = true };
+    pub const Options = struct {
+        maxrecord: usize = 4096,
+        peel: bool = true,
+        optimize: bool = true,
+        /// Doc 45 D2: deterministic snapshot admission budgets for PRECISE
+        /// recordings. Defaults are the contract values; tests inject smaller
+        /// ones to exercise exact-boundary and one-over refusal.
+        snapshot_budget: trace_snapshot.Budget = .{},
+    };
     /// `upval_open`: for a `get_upval` whose resolved cell is OPEN, its `loc.open`
     /// absolute slab index; null for `get_global`, a closed cell, or any other
     /// op. Supplied per-instruction by the dispatch loop (doc 43 §3.1, P0a) so
@@ -719,6 +728,21 @@ pub const RecordingSession = struct {
     /// in precise mode from the first instruction. Per-anchor policy, never
     /// a retroactive mid-candidate promotion.
     precise: bool = false,
+    /// Doc 45 D2 capture state (precise recordings only). `snap_builder` is
+    /// the allocator-injected reusable accumulator (reset between recordings,
+    /// no per-iteration allocation); `snap_scratch` is the bounded full-window
+    /// vector buffer `recordInstr` rebuilds at each guest-bytecode boundary;
+    /// `cur_snap` is the one-based index of the CURRENT bytecode's snapshot,
+    /// stamped by `emit` onto every body op (0 during the entry prologue =
+    /// entry-replay semantics for pre-body failures).
+    snap_builder: trace_snapshot.Builder = undefined,
+    snap_builder_init: bool = false,
+    snap_scratch: []trace_snapshot.SnapshotSlot = &.{},
+    cur_snap: trace_ir.SnapIdx = 0,
+    /// Doc 45 D2: whether the precise entry prologue (full slot_load map +
+    /// eager guard_gc) has been emitted yet this recording. Deferred to the
+    /// first body `recordInstr`; cleared in `reset`.
+    precise_prologue_done: bool = false,
 
     pub fn abort(self: *RecordingSession, reason: AbortReason) void {
         if (!self.active) return;
@@ -800,7 +824,75 @@ pub const RecordingSession = struct {
                 self.rec_path_ok = false;
             };
         }
+        // Doc 45 D2: a PRECISE recording emits its full entry slot_load map +
+        // eager `guard_gc` prologue at its FIRST body instruction (deferred
+        // from `arm`, whose eager emit would defeat `maybeCloseAtAnchor`'s
+        // empty-body guard), then opens every guest bytecode with a full-window
+        // snapshot built BEFORE the bytecode's IR — it holds the state after
+        // the last COMPLETED instruction, so a failing body op resumes at this
+        // pc with those values. Budget overflow is deterministic admission
+        // refusal (`.snapshot_limit`), never a partial candidate.
+        if (self.precise) {
+            if (!self.precise_prologue_done) {
+                self.beginPreciseInner() catch return self.abort(.alloc);
+                self.precise_prologue_done = true;
+            }
+            self.snapBoundary(pc) catch |e| switch (e) {
+                error.SnapshotLimit => return self.abort(.snapshot_limit),
+                error.OutOfMemory => return self.abort(.alloc),
+            };
+        }
         self.recordOne(instr, regs, proto, pc, resolved) catch self.abort(.alloc);
+    }
+
+    /// Doc 45 D2: emit a PRECISE recording's entry prologue — force the full
+    /// entry `slot_load` map (every anchor-window register, ascending) so
+    /// unwritten slots keep a ref to their ORIGINAL entry values in every later
+    /// snapshot; then emit the eager `guard_gc` (doc 45 D4: after the entry-load
+    /// block, before ALL effects — `aux` stays 0 for a nonallocating body;
+    /// finalize stamps the real bound). Run lazily at the FIRST body
+    /// `recordInstr` (not at `arm` — an eager emit would make
+    /// `maybeCloseAtAnchor` close an empty-body trace). Everything emitted here
+    /// carries `snap == 0`: prologue/seed failures remain pre-body ENTRY
+    /// failures, not mid-body deopts.
+    fn beginPreciseInner(self: *RecordingSession) !void {
+        // Builder + scratch are reusable across recordings (Z-4), sized to
+        // the anchor window. The budget is re-read per recording so tests can
+        // inject a smaller one.
+        if (!self.snap_builder_init) {
+            self.snap_builder = trace_snapshot.Builder.init(self.gpa, self.options.snapshot_budget);
+            self.snap_builder_init = true;
+        } else {
+            self.snap_builder.budget = self.options.snapshot_budget;
+            self.snap_builder.reset();
+        }
+        const n: usize = self.anchor_num_registers;
+        if (self.snap_scratch.len != n) {
+            const replacement = try self.gpa.alloc(trace_snapshot.SnapshotSlot, n);
+            if (self.snap_scratch.len != 0) self.gpa.free(self.snap_scratch);
+            self.snap_scratch = replacement;
+        }
+        var slot: u16 = 0;
+        while (slot < self.anchor_num_registers) : (slot += 1) _ = try self.refOf(slot);
+        self.guard_gc_ref = try self.emit(.{ .op = .guard_gc });
+    }
+
+    /// Build the current guest bytecode's full-window snapshot (doc 45 D2):
+    /// every anchor-window register exactly once, ascending; unwritten slots
+    /// reference their entry `slot_load` (forced by `beginPrecise`). `pc` is
+    /// the post-increment dispatch pc — the snapshot resumes at the CURRENT
+    /// instruction (`pc - 1`), never at a branch target.
+    fn snapBoundary(self: *RecordingSession, pc: u32) trace_snapshot.Error!void {
+        // Precise mode refuses inlining, so recording is always in the anchor
+        // frame and `reg_map[0..anchor_num_registers]` IS the activation.
+        std.debug.assert(self.base_off == 0);
+        const n: u16 = @intCast(self.anchor_num_registers);
+        for (self.snap_scratch[0..n], 0..) |*out, slot| {
+            const s = self.reg_map[slot];
+            std.debug.assert(s.state != .undef); // beginPrecise loaded every slot
+            out.* = .{ .slot = @intCast(slot), .ref = s.ref };
+        }
+        self.cur_snap = try self.snap_builder.add(pc - 1, n, self.snap_scratch[0..n]);
     }
 
     pub fn recordOne(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, resolved: Value) error{OutOfMemory}!void {
@@ -1015,6 +1107,12 @@ pub const RecordingSession = struct {
             },
             else => {},
         }
+        // Doc 45 D2: on a precise recording every BODY op carries the current
+        // bytecode-boundary snapshot (a superset of "all potentially failing
+        // ops" — dead metadata on ops that cannot exit). The entry prologue
+        // runs before any boundary exists (`cur_snap == 0`), which is exactly
+        // the entry-replay marker those pre-body failures need.
+        if (self.precise) ins_mut.snap = self.cur_snap;
         const ref: Ref = @intCast(self.instrs.items.len);
         try self.instrs.append(self.gpa, ins_mut);
         // Grow the exit-provenance table in lockstep (A-i.1): one `null` per append,
@@ -1814,6 +1912,11 @@ pub const RecordingSession = struct {
         // and the store writes a non-nil value by the `isNil` abort above. The store
         // is effectful and not register-defining, so nothing is `setReg`'d.
         if (defer_store) {
+            // Doc 45 D3: precise candidates keep `pending_stores` EMPTY — a
+            // sunk store would float past the per-bytecode snapshot ordering.
+            // Store-at-position for these shapes lands with the effect-order
+            // increment; until then refuse, fail-closed.
+            if (self.precise) return self.abort(.nyi_opcode);
             // Read-modify-write: stash the store; `commit()` flushes it (and any
             // siblings) below every guard, just before `.loop`, in this recorded
             // order. The guards above (table/lane/int/bounds/fits) stay inline and
@@ -2294,6 +2397,8 @@ pub const RecordingSession = struct {
         // (population) stays sufficient. The store value's type is pinned by the
         // `guardNum` above (native declines a heap value at H1).
         if (defer_store) {
+            // Doc 45 D3: no sunk stores on a precise candidate (see astore).
+            if (self.precise) return self.abort(.nyi_opcode);
             try self.pending_stores.append(self.gpa, .{
                 .aref = ref,
                 .value = rval,
@@ -2968,6 +3073,12 @@ pub const RecordingSession = struct {
             if (instr.b == bytecode.all_results) return self.abort(.nyi_opcode);
             return self.closeHeadTerminal(.self_call_interp);
         }
+        // Doc 45 D1/D3: precise mode records NO inlined frames — snapshots
+        // describe the anchor activation only, and no call may be inlined once
+        // precision is required (a checked admission boundary, not a fallback).
+        // The depth-zero terminal self-call above is real frame motion, not an
+        // inline, and stays supported.
+        if (self.precise) return self.abort(.nyi_opcode);
         // A vararg callee's extra-args frame cursor isn't modelled on the trace.
         if (cp.is_vararg) return self.abort(.cross_frame);
         if (self.inline_depth >= MAX_INLINE_DEPTH) return self.abort(.too_deep);
@@ -3096,6 +3207,10 @@ pub const RecordingSession = struct {
             .ceil => try self.recFloorCeil(eff, regs, .ceil, .fceil),
             .assert => try self.recBAssert(eff, regs),
         }
+        // Doc 45 D2: a snapshot boundary cannot carry dynamic multret state —
+        // precise mode refuses the shadow's producer outright, fail-closed.
+        if (was_dynamic_c and self.active and self.precise)
+            return self.abort(.nyi_opcode);
         // D1 publish — only a LIVE recording may leave a shadow (an aborting arm
         // set `rec.active = false`; §3a truthfulness: set only by a successfully
         // recorded producer).
@@ -3648,6 +3763,8 @@ pub const RecordingSession = struct {
             try self.projectCaptures(m, base, 0, census, instr.c);
         }
         const np = try self.emit(.{ .op = .scap_int, .a = m, .b = @intCast(gc.MatchScratch.slot_next_pos), .ty = .int });
+        // Doc 45 D3: no sunk stores on a precise candidate (see astore).
+        if (self.precise) return self.abort(.nyi_opcode);
         try self.pending_stores.append(self.gpa, .{ .op = .sgm_setpos, .aref = state_ref, .value = np, .lane_ord = 0 });
     }
 
@@ -4482,6 +4599,8 @@ pub const RecordingSession = struct {
         }
         const uref = (try self.ensureUpvalClass(cell, path_slot, instr.b)) orelse return;
         if (self.traceHasHeapLoad()) {
+            // Doc 45 D3: no sunk stores on a precise candidate (see astore).
+            if (self.precise) return self.abort(.nyi_opcode);
             try self.pending_stores.append(self.gpa, .{
                 .aref = uref,
                 .value = rval,
@@ -4594,6 +4713,11 @@ pub const RecordingSession = struct {
     /// what the back-edge φ would deliver.
     fn maybeEnterPeel(self: *RecordingSession, regs: RegWindow) bool {
         if (!self.options.peel) return false;
+        // Doc 45 D3: no peeling on a precise candidate (snapshots assume one
+        // guest-ordered stream; allocations-in-peels are an explicit deferral).
+        // The eager `guard_gc_ref` below would decline it anyway — this makes
+        // the policy visible rather than incidental.
+        if (self.precise) return false;
         const rec = self;
         if (rec.link_target != null) return false;
         if (rec.inline_depth != 0) return false;
@@ -4741,6 +4865,8 @@ pub const RecordingSession = struct {
         self.guarded_refs.deinit(gpa);
         self.konst_map.deinit(gpa);
         if (self.reg_map.len != 0) gpa.free(self.reg_map);
+        if (self.snap_scratch.len != 0) gpa.free(self.snap_scratch);
+        if (self.snap_builder_init) self.snap_builder.deinit();
     }
 
     /// Clear the buffer and arm a fresh recording for `anchor` over a frame with
@@ -4778,6 +4904,8 @@ pub const RecordingSession = struct {
         self.snapshot_read_cells.clearRetainingCapacity();
         self.route_upvalue_reads = false; // doc 43 P5: arm() seeds the anchor memo after reset
         self.precise = false; // doc 45 D2: arm() seeds the anchor memo after reset
+        self.cur_snap = 0; // doc 45 D2: no boundary exists until the first precise bytecode
+        self.precise_prologue_done = false; // doc 45 D2: prologue emitted at first body instr
         self.pending_stores.clearRetainingCapacity();
         self.alloc_count = 0;
         self.guard_gc_ref = null;

@@ -26,6 +26,10 @@ const Scratch = struct {
     anchor: types.AnchorKey = undefined,
     unrolled_while: bool = false,
     side_src: ?types.ExitKey = .{ .trace_id = 12, .exit_instr = 2 },
+    // Doc 45 D2: finalize reads the precise flag and, when set, hands the
+    // builder's snapshot arrays to the code. The fixture stays entry-replay.
+    precise: bool = false,
+    snap_builder: @import("trace_snapshot.zig").Builder = .{ .gpa = undefined, .budget = .{} },
 
     fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
         inline for (.{ "instrs", "consts", "entry_slots", "input_seeds", "exit_prov", "rec_path", "pending_stores" }) |field|

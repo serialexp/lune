@@ -17,6 +17,7 @@ const exitProvEntryLess = types.exitProvEntryLess;
 const EntryGuard = code_mod.EntryGuard;
 const EntryGuardType = code_mod.EntryGuardType;
 const InputSeed = code_mod.InputSeed;
+const trace_snapshot = @import("trace_snapshot.zig");
 pub const RecordingCandidate = @import("trace_candidate.zig").RecordingCandidate;
 
 pub const Options = struct {
@@ -31,9 +32,16 @@ pub const Options = struct {
 /// allocation failures are fail-soft. Program/constant lifetimes follow TraceCode.
 pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !RecordingCandidate {
     if (rec.guard_gc_ref) |gr| {
-        std.debug.assert(rec.alloc_count > 0);
+        // Doc 45 D4: a PRECISE recording emits `guard_gc` eagerly after its
+        // entry-load prologue, so `aux == 0` is legal for a nonallocating
+        // body (it still enforces `!gc_stress` and the due-GC check). Every
+        // other recording only creates the guard lazily at its first `.alloc`.
+        if (!rec.precise) std.debug.assert(rec.alloc_count > 0);
         rec.instrs.items[@intCast(gr)].aux = @intCast(rec.alloc_count);
     }
+    // Doc 45 D3: precise candidates keep a single guest-ordered stream — the
+    // recorder refuses every deferral, so nothing may be waiting here.
+    if (rec.precise) std.debug.assert(rec.pending_stores.items.len == 0);
     for (rec.pending_stores.items) |ps| {
         try rec.instrs.append(gpa, .{
             .op = ps.op,
@@ -82,7 +90,12 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
     // Doc 44: head (terminal-closed) traces cache UNOPTIMIZED in P0, the
     // link-trace precedent — tropt's φ handling is loop-carried-shaped and
     // has not been audited for the one-shot writeback rows.
-    const fields: tropt.Optimized = if (options.optimize and rec.link_target == null and rec.peel == null and rec.terminal_close == null)
+    // Doc 45 D3: PRECISE candidates take the dupe path too (explicitly
+    // identity for snapshots) — snapshot refs are not tropt liveness roots
+    // yet and `old_to_new` cannot remap through CSE merges; the optimizer
+    // integration (canonical-map remap + liveness extension) is its own
+    // increment.
+    const fields: tropt.Optimized = if (options.optimize and !rec.precise and rec.link_target == null and rec.peel == null and rec.terminal_close == null)
         tropt.optimize(gpa, instrs, consts) catch |e| switch (e) {
             error.OutOfMemory => try tropt.dupe(gpa, instrs, consts, entry),
         }
@@ -120,7 +133,7 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
         &.{};
     errdefer if (rec_path_owned.len != 0) gpa.free(rec_path_owned);
 
-    assertWellFormed(fields.instrs, fields.consts.len, rec.anchor_num_registers, @as(usize, rec.anchor_num_registers) + rec.input_seeds.items.len);
+    assertWellFormed(fields.instrs, fields.consts.len, rec.anchor_num_registers, @as(usize, rec.anchor_num_registers) + rec.input_seeds.items.len, rec.precise);
 
     var entry_guards: std.ArrayListUnmanaged(EntryGuard) = .empty;
     errdefer entry_guards.deinit(gpa);
@@ -154,6 +167,35 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
     for (fields.instrs) |ins| {
         if (ins.op == .supper or ins.op == .slower) requires_unicode_pin = true;
     }
+
+    // Doc 45 D2: a PRECISE candidate takes ownership of its snapshot arrays
+    // and must carry VALID correctness metadata — finalization rejects
+    // missing/invalid snapshots outright (this is not fail-soft diagnostics).
+    // The dupe path above kept instruction indices identity, so the recorded
+    // one-based `snap` values and captured refs are final as-is.
+    var snap_owned: ?trace_snapshot.Builder.Owned = null;
+    errdefer if (snap_owned) |o| o.deinit(gpa);
+    if (rec.precise) {
+        const owned = try rec.snap_builder.finalize(gpa);
+        snap_owned = owned;
+        if (!trace_snapshot.validate(owned.snapshots, owned.snapshot_slots, @intCast(rec.anchor.proto.code.len)))
+            return error.InvalidSnapshotMetadata;
+        const gr = rec.guard_gc_ref orelse return error.InvalidSnapshotMetadata;
+        for (fields.instrs, 0..) |ins, i| {
+            if (ins.snap != 0) {
+                if (owned.snapshots[ins.snap - 1].register_count != rec.anchor_num_registers)
+                    return error.InvalidSnapshotMetadata;
+                if (!trace_snapshot.refsDefinedAt(ins.snap, i, owned.snapshots, owned.snapshot_slots))
+                    return error.InvalidSnapshotMetadata;
+            } else if (ir.isSideExitGuardOp(ins.op) and i > @as(usize, @intCast(gr))) {
+                // A potentially failing BODY op without a snapshot: only the
+                // prologue (entry loads + the eager `guard_gc`) may fail
+                // pre-body with entry-replay semantics.
+                return error.InvalidSnapshotMetadata;
+            }
+        }
+    }
+
     var code: TraceCode = .{
         .anchor = rec.anchor,
         .instrs = fields.instrs,
@@ -169,6 +211,13 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
         .requires_unicode_pin = requires_unicode_pin,
         .unrolled_while = rec.unrolled_while,
         .peeled = rec.peel != null,
+        // Doc 45 D2: snapshot ownership moves to the code (freed by its
+        // deinit, which every candidate error path funnels through). No error
+        // return exists past this literal, so the errdefer above cannot
+        // double-free.
+        .snapshots = if (snap_owned) |o| o.snapshots else &.{},
+        .snapshot_slots = if (snap_owned) |o| o.snapshot_slots else &.{},
+        .deopt_mode = if (rec.precise) .precise else .entry_replay,
     };
     buildBridgeCandMemo(gpa, &code);
     return RecordingCandidate.init(code, rec.side_src);
@@ -251,7 +300,7 @@ pub fn buildExitProv(
     return out;
 }
 
-fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: usize, input_limit: usize) void {
+fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: usize, input_limit: usize, precise: bool) void {
     std.debug.assert(instrs.len >= 1);
     const last = instrs.len - 1;
     // The trace terminates in exactly one terminal: `.loop` (root/continuation
@@ -333,8 +382,11 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
                 std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < consts_len);
             },
             // `guard_gc` (doc 24 D3): operand-free; `aux` is the allocation
-            // bound `A` — a positive count stamped by `commit()`.
-            .guard_gc => std.debug.assert(ins.aux > 0),
+            // bound `A` — a positive count stamped by `commit()`. Doc 45 D4:
+            // a PRECISE body emits the guard eagerly, so `aux == 0` is legal
+            // there (nonallocating body — the guard still enforces
+            // `!gc_stress` and the due-GC check).
+            .guard_gc => std.debug.assert(if (precise) ins.aux >= 0 else ins.aux > 0),
             // `guard_builtin` reads the callee ref `a`; `fsqrt` reads its float
             // operand `a` — both prior nodes.
             .guard_builtin, .fsqrt => std.debug.assert(ins.a < i),

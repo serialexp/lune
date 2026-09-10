@@ -5919,6 +5919,13 @@ pub const Vm = struct {
                     // malformed or future bytecode shape puts it at a
                     // back-edge pc.
                     if (ct.code.instrs.len != 0 and ct.code.instrs[ct.code.instrs.len - 1].op == .link) continue;
+                    // Doc 45 D2 (P1 substrate): a PRECISE trace carries
+                    // per-bytecode snapshots but neither executor implements
+                    // precise deopt yet — running it via entry replay would be
+                    // unsound (and, for a constructing body whose effects are
+                    // NOT replay-idempotent, non-terminating). Decline to
+                    // enter until the precise executor lands; tier-0 owns it.
+                    if (ct.code.deopt_mode == .precise) continue;
                     // --- type fingerprint (step 5) ---
                     // Skip this trace if the current register types don't
                     // match its entry type guards.  Avoids trial entries that

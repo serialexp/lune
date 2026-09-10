@@ -513,6 +513,11 @@ pub const TraceConfig = struct {
     hotcall: u32 = 112,
     /// Maximum IR instructions in one trace before aborting (`too_long`).
     maxrecord: u32 = 2000,
+    /// Doc 45 D2: deterministic snapshot admission budgets for PRECISE
+    /// recordings — a pure function of the recorded maps, never available
+    /// memory. Tests inject smaller values to exercise exact-boundary and
+    /// one-over refusal.
+    snapshot_budget: @import("trace_snapshot.zig").Budget = .{},
     /// A trace entry that commits at least this many iterations is "doing real
     /// work" and clears the anchor's re-entry penalty. Loops shorter than this per
     /// entry are exactly where a tracing JIT wins nothing, so retiring them to
@@ -3111,7 +3116,7 @@ pub const TraceState = struct {
     /// frame; recording proper begins at the next dispatch-loop iteration (which
     /// is the anchor instruction). On OOM we simply don't arm.
     fn configureRecording(self: *TraceState) void {
-        self.rec.options = .{ .maxrecord = self.config.maxrecord, .peel = self.config.peel, .optimize = self.config.optimize };
+        self.rec.options = .{ .maxrecord = self.config.maxrecord, .peel = self.config.peel, .optimize = self.config.optimize, .snapshot_budget = self.config.snapshot_budget };
     }
     pub fn recordInstr(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, resolved: Value) void {
         self.configureRecording();
@@ -3299,7 +3304,11 @@ pub const TraceState = struct {
         // Doc 45 D2: arm with the anchor's precise-mode memo, so a retry after
         // a `.needs_precise` cancel records per-bytecode snapshots from the
         // first instruction (deterministic re-recording, never a retroactive
-        // mid-candidate promotion).
+        // mid-candidate promotion). The full-entry prologue is NOT emitted here
+        // — `maybeCloseAtAnchor` uses `instrs.len == 0` to skip the arming
+        // iteration's spurious close, so emitting anything now would close an
+        // empty-body trace. The recorder emits the prologue lazily at its first
+        // body `recordInstr` instead (`beginPrecise` / `precise_prologue_done`).
         self.rec.precise = self.precise_anchor_memo.contains(.{ .proto = proto, .pc = target_pc });
     }
 
@@ -3355,14 +3364,22 @@ pub const TraceState = struct {
         // through to the ordinary gate strike — fail-closed, never an
         // ungated infinite retry.
         if (reason == .needs_precise) {
-            if (self.precise_anchor_memo.put(self.gpa, notice.anchor, {})) |_| {
-                const threshold = switch (anchorKind(notice.anchor.pc)) {
-                    .loop => self.config.hotloop,
-                    .head, .cont => self.config.hotcall,
-                };
-                self.counters.put(self.gpa, notice.anchor, threshold -| 1) catch {};
-                self.dbg("needs-precise retry: anchor pc={d}", .{notice.anchor.pc});
-                return;
+            if (self.precise_anchor_memo.getOrPut(self.gpa, notice.anchor)) |gop| {
+                // FIRST memoization only: an anchor already in the memo means
+                // this recording SHOULD have armed precise but didn't (the
+                // trace_link starters bypass `arm()` — the round-2 seam). A
+                // second non-penalized retry would repeat identically: fall
+                // through to the ordinary gate strike instead (fail-closed,
+                // never a livelock).
+                if (!gop.found_existing) {
+                    const threshold = switch (anchorKind(notice.anchor.pc)) {
+                        .loop => self.config.hotloop,
+                        .head, .cont => self.config.hotcall,
+                    };
+                    self.counters.put(self.gpa, notice.anchor, threshold -| 1) catch {};
+                    self.dbg("needs-precise retry: anchor pc={d}", .{notice.anchor.pc});
+                    return;
+                }
             } else |_| {}
         }
         if (reason == .loop_leave) {

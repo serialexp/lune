@@ -158,6 +158,12 @@ pub fn compileInto(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace, 
 fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*McodeArena, seed_ctx: ?*const NativeSeedCtx, heap: ?*gc.Heap) ?CompiledTrace {
     if (comptime !is_x64_linux) return null;
 
+    // Doc 45 D2/D6: native lowering of PRECISE traces (per-guard snapshot
+    // flush + resume-pc exit ABI) is its own increment — until it lands, a
+    // precise trace bails to tier-1a rather than compile exits that would
+    // silently entry-replay past its snapshots.
+    if (t.deopt_mode == .precise) return null;
+
     const n = t.instrs.len;
     // Doc 24 D5 fail-closed: an allocating body (`guard_gc` / `tostr_*`) bakes
     // the heap's counter and `gc_stress` addresses (and hands the heap to the

@@ -21,6 +21,46 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-10 (latest+1) — doc 45 D2 increment 3 LANDED (recorder per-bytecode snapshot capture)
+
+Precise candidates now CAPTURE their snapshots end-to-end:
+
+- **Prologue at first body instr** (NOT `arm`): `beginPreciseInner` force-loads
+  the full anchor window (`slot_load` per register, ascending) + emits the
+  eager `guard_gc`. Deferring it past `arm` is required — `maybeCloseAtAnchor`
+  keys its arming-iteration skip on `rec.instrs.len == 0`, and an eager
+  prologue made it commit an empty-body precise loop (found + fixed this arc;
+  a20 hung on entry-replay execution of that empty precise trace).
+- **Per-bytecode snapshot**: `snapBoundary(pc)` builds a full-window snapshot in
+  the reusable `Builder`+scratch (Z-4, no per-iteration alloc) before each guest
+  bytecode; `emit` stamps one-based `IrInstr.snap` on body ops (prologue =
+  `snap 0` = entry replay). Budget overflow → `snapshot_limit` abort.
+- **D3/D4 admission during capture**: precise refuses inlined calls, ALL sunk
+  stores (`pending_stores` asserted empty at finalize), dynamic multret, and
+  peeling; `guard_gc aux == 0` legalized for a nonallocating precise body.
+- **Finalization** (trace_finalize): dupe path (identity indices) for precise,
+  moves `Builder` output into `TraceCode`, sets `deopt_mode = .precise`, and
+  REJECTS bad metadata (`validate` + `refsDefinedAt` + register_count + every
+  fallible body op carries a snap → `error.InvalidSnapshotMetadata`).
+- **Declined pending their own increments**: native codegen (`compileImpl`
+  bails on `.precise`), traceser (`toSchemaTrace` → `error.UnsupportedPreciseTrace`),
+  and EXECUTION SELECTION (enterSelectedTrace's same-anchor walk skips precise
+  traces) — no precise executor exists yet, so tier-0 owns the loop and a
+  constructing body cannot non-terminate via entry replay.
+- **Config**: `TraceConfig.snapshot_budget` (→ recorder `Options`) so tests
+  inject small budgets; defaults are the doc contract values.
+- **Test**: pre-seeded precise loop commits a full-window snapshot per body
+  bytecode, prologue at `snap 0`, every body guard's captured refs defined at
+  its use site. Increment-2 transition test updated (precise retry's `ir_len`
+  is now STRICTLY LONGER than the non-precise attempt — the prologue).
+- Gates: `zig build test`, `zig build wasm`, `just hashgate` (84 ×2) all green.
+
+**Next (rest of D2 + D6)**: the two precise EXECUTORS — tier-1a + native
+per-guard snapshot restore (write captured refs into guest regs, resume tier-0
+at `resume_pc`; native flush + exit ABI), then flip selection to ENTER precise
+traces. Plus optimizer integration (snapshot refs as tropt liveness roots +
+`remapRefs` through `canon`/`new_index`). Then D4 tnew/tset construction.
+
 ## Status 2026-09-10 (latest) — doc 45 D2 increment 2 LANDED (TraceCode ownership + needs_precise policy)
 
 Follows increment 1 (013379c, `src/trace_snapshot.zig` types/budgets/validation).
