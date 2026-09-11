@@ -217,12 +217,3 @@ pub fn konstFitsLane(t: *const Trace, r: trace_ir.Ref, aux: i32) bool {
     return arr.ArrayPart.laneFits(@enumFromInt(aux), t.consts[@intCast(ki.aux)]);
 }
 
-/// Enforce that every lane-bearing op in a trace (`guard_lane`/`aref`/`aload`/
-/// `astore`) names the SAME lane. The prologue checks the runtime array lane
-/// once against the `guard_lane` ordinal; tying the per-op `aux` to that single
-/// lane guarantees each aload/astore uses the width the prologue verified.
-pub fn laneConsistent(trace_lane: *?i32, aux: i32) bool {
-    if (trace_lane.*) |l| return l == aux;
-    trace_lane.* = aux;
-    return true;
-}

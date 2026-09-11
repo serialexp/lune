@@ -21,7 +21,6 @@ const isNumKind = prove.isNumKind;
 const operandReads = prove.operandReads;
 const laneKind = layout.laneKind;
 const konstFitsLane = layout.konstFitsLane;
-const laneConsistent = layout.laneConsistent;
 const VALUE_LANE = layout.VALUE_LANE;
 const GRID_LANE = layout.GRID_LANE;
 const BOOL_LANE = layout.BOOL_LANE;

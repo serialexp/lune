@@ -97,7 +97,6 @@ const resolveHashCell = layout.resolveHashCell;
 const laneKind = layout.laneKind;
 const intLaneWidth = layout.intLaneWidth;
 const konstFitsLane = layout.konstFitsLane;
-const laneConsistent = layout.laneConsistent;
 
 // ---------------------------------------------------------------------------
 // Compiled-artifact types live in `nativegen_artifact.zig` (file-split

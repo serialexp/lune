@@ -927,3 +927,234 @@ test "nativegen(doc 32): .value-lane int element read as a FLOAT tag-exits every
     // Oracle and native must agree that nothing completes and nothing is written.
     try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(2), Value.float(0.0) });
 }
+
+// ---------------------------------------------------------------------------
+// Task #29 (codex thread 01a09008): per-chain lane binding. Array lanes are
+// proven per ROOT (guard_lane / guard_grid+guard_stride bind each root's
+// shape) and per ADDRESS CHAIN (each aref/aload/astore must agree with its
+// own root/address op) — never per trace. A trace may mix element widths
+// across DIFFERENT arrays (the sparse `vx[col[i]] * val[i]` shape); every
+// mismatch WITHIN one chain, missing dominating structural guard, root
+// shape conflict, or duplicate slot_load fails closed.
+// ---------------------------------------------------------------------------
+
+test "nativegen: mixed-lane roots (int index array into f64 array) admit and match" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    // idx: i8 lane holding in-bounds indices into data; data: f64 lane.
+    const idx = try table.Table.create(gpa);
+    defer idx.destroy(gpa);
+    const data = try table.Table.create(gpa);
+    defer data.destroy(gpa);
+    const K: i64 = 32;
+    var i: i64 = 1;
+    while (i <= K) : (i += 1) {
+        try idx.set(gpa, Value.int(i), Value.int(@rem(i * 7, K) + 1));
+        try data.set(gpa, Value.int(i), Value.float(@as(f64, @floatFromInt(i)) * 0.5));
+    }
+    try testing.expectEqual(arr.Lane.u8, idx.array.lane);
+    try testing.expectEqual(arr.Lane.f64, data.array.lane);
+
+    const li: i32 = @intFromEnum(arr.Lane.u8);
+    const lf: i32 = @intFromEnum(arr.Lane.f64);
+    var consts = [_]Value{Value.int(1)};
+    // r0=idx table, r1=data table, r2=i, r3=v: v = data[idx[i]]; i += 1.
+    var full = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: idx
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = li }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: data
+        .{ .op = .guard_table, .a = 3 }, // 4
+        .{ .op = .guard_lane, .a = 3, .aux = lf }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: i
+        .{ .op = .guard_int, .a = 6 }, // 7
+        .{ .op = .aref, .a = 0, .b = 6, .aux = li }, // 8: idx[i]
+        .{ .op = .guard_bounds, .a = 8 }, // 9
+        .{ .op = .guard_present, .a = 8 }, // 10
+        .{ .op = .aload, .a = 8, .aux = li }, // 11: k (int)
+        .{ .op = .aref, .a = 3, .b = 11, .aux = lf }, // 12: data[k]
+        .{ .op = .guard_bounds, .a = 12 }, // 13
+        .{ .op = .guard_present, .a = 12 }, // 14
+        .{ .op = .aload, .a = 12, .aux = lf }, // 15: v (float)
+        .{ .op = .konst, .aux = 0 }, // 16
+        .{ .op = .add, .a = 6, .b = 16 }, // 17: i + 1
+        .{ .op = .phi, .b = 17, .aux = 2 },
+        .{ .op = .phi, .b = 15, .aux = 3 },
+        .{ .op = .loop },
+    };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+    // Full scan (bounds-exit past K), immediate bounds-exit, and mid-run start.
+    try expectMatch(&tr, &.{ Value.heap(&idx.header), Value.heap(&data.header), Value.int(1), Value.nil() });
+    try expectMatch(&tr, &.{ Value.heap(&idx.header), Value.heap(&data.header), Value.int(K + 3), Value.nil() });
+    try expectMatch(&tr, &.{ Value.heap(&idx.header), Value.heap(&data.header), Value.int(20), Value.nil() });
+}
+
+test "nativegen: per-chain lane binding refuses every mismatched or unguarded shape" {
+    const gpa = testing.allocator;
+    const bl: i32 = @intFromEnum(arr.Lane.boolean);
+    const l8: i32 = @intFromEnum(arr.Lane.i8);
+    const l16: i32 = @intFromEnum(arr.Lane.i16);
+    _ = gpa;
+
+    // (a) aload lane != its aref's lane.
+    var a = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_table, .a = 0 },
+        .{ .op = .guard_lane, .a = 0, .aux = bl },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .guard_int, .a = 3 },
+        .{ .op = .aref, .a = 0, .b = 3, .aux = bl },
+        .{ .op = .guard_bounds, .a = 5 },
+        .{ .op = .guard_present, .a = 5 },
+        .{ .op = .aload, .a = 5, .aux = l8 }, // MISMATCH vs aref's bool lane
+        .{ .op = .phi, .b = 8, .aux = 2 },
+        .{ .op = .loop },
+    };
+    var ta = Trace{ .anchor = undefined, .instrs = &a, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try expectBail(&ta);
+
+    // (b) aref lane != its root's guard_lane.
+    a[5] = .{ .op = .aref, .a = 0, .b = 3, .aux = l8 }; // root guarded bool
+    a[8] = .{ .op = .aload, .a = 5, .aux = l8 }; // chain-consistent with the aref
+    var tb = Trace{ .anchor = undefined, .instrs = &a, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try expectBail(&tb);
+
+    // (c) aref with NO dominating guard_lane on its root.
+    var c = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_table, .a = 0 },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .guard_int, .a = 2 },
+        .{ .op = .aref, .a = 0, .b = 2, .aux = bl }, // no guard_lane anywhere
+        .{ .op = .guard_bounds, .a = 4 },
+        .{ .op = .guard_present, .a = 4 },
+        .{ .op = .aload, .a = 4, .aux = bl },
+        .{ .op = .phi, .b = 7, .aux = 2 },
+        .{ .op = .loop },
+    };
+    var tc = Trace{ .anchor = undefined, .instrs = &c, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try expectBail(&tc);
+
+    // (d) conflicting guard_lane re-guard of one root.
+    var d = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_table, .a = 0 },
+        .{ .op = .guard_lane, .a = 0, .aux = bl },
+        .{ .op = .guard_lane, .a = 0, .aux = l8 }, // CONFLICT
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .guard_int, .a = 4 },
+        .{ .op = .aref, .a = 0, .b = 4, .aux = bl },
+        .{ .op = .guard_bounds, .a = 6 },
+        .{ .op = .guard_present, .a = 6 },
+        .{ .op = .aload, .a = 6, .aux = bl },
+        .{ .op = .phi, .b = 9, .aux = 2 },
+        .{ .op = .loop },
+    };
+    var td = Trace{ .anchor = undefined, .instrs = &d, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try expectBail(&td);
+
+    // (e) duplicate slot_load of one VM slot.
+    var e = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_int, .a = 0 },
+        .{ .op = .slot_load, .aux = 0 }, // DUP
+        .{ .op = .guard_int, .a = 2 },
+        .{ .op = .add, .a = 0, .b = 2 },
+        .{ .op = .phi, .b = 4, .aux = 1 },
+        .{ .op = .loop },
+    };
+    var te = Trace{ .anchor = undefined, .instrs = &e, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try expectBail(&te);
+
+    // (f) guard_fits proves ONE width; a different-width int store refuses,
+    // and the exact-width pairing is what admits (bitset, not last-wins).
+    // Value is a non-const int input so konstFitsLane cannot rescue it.
+    var f = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // table (i8 lane)
+        .{ .op = .guard_table, .a = 0 },
+        .{ .op = .guard_lane, .a = 0, .aux = l8 },
+        .{ .op = .slot_load, .aux = 1 }, // index
+        .{ .op = .guard_int, .a = 3 },
+        .{ .op = .slot_load, .aux = 2 }, // value
+        .{ .op = .guard_int, .a = 5 },
+        .{ .op = .guard_fits, .a = 5, .aux = l16 }, // proof for i16, store is i8
+        .{ .op = .aref, .a = 0, .b = 3, .aux = l8 },
+        .{ .op = .guard_bounds, .a = 8 },
+        .{ .op = .astore, .a = 8, .b = 5, .aux = l8 }, // needs the i8 bit
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .add, .a = 3, .b = 11 },
+        .{ .op = .phi, .b = 12, .aux = 1 },
+        .{ .op = .loop },
+    };
+    var fconsts = [_]Value{Value.int(1)};
+    var tf = Trace{ .anchor = undefined, .instrs = &f, .consts = &fconsts, .entry_slots = &.{}, .entry_guards = &.{} };
+    try expectBail(&tf);
+    // Exact-width proof admits: prove-level check (kinds/slot_of direct).
+    f[7] = .{ .op = .guard_fits, .a = 5, .aux = l8 };
+    const tg = Trace{ .anchor = undefined, .instrs = &f, .consts = &fconsts, .entry_slots = &.{}, .entry_guards = &.{} };
+    const kinds = try testing.allocator.alloc(nativegen.Kind, f.len);
+    defer testing.allocator.free(kinds);
+    const slot_of = try testing.allocator.alloc(i32, f.len);
+    defer testing.allocator.free(slot_of);
+    try testing.expect(nativegen.proveKinds(testing.allocator, &tg, kinds, slot_of));
+}
+
+test "nativegen: grid/scalar root shape conflicts and grid chain mismatches refuse" {
+    const l8: i32 = @intFromEnum(arr.Lane.i8);
+    const gi: i32 = @intFromEnum(arr.Lane.i64);
+    const gf: i32 = @intFromEnum(arr.Lane.f64);
+
+    // Common prefix: r0=grid table (.ptr via guard_table), r1=row, r2=col.
+    // Build the variants by editing one op in a canonical valid-shaped chain.
+    const proto_len = 14;
+    var g: [proto_len]I = .{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_grid, .a = 0, .aux = gi }, // 2
+        .{ .op = .guard_stride, .a = 0, .aux = 8 }, // 3
+        .{ .op = .slot_load, .aux = 1 }, // 4: row
+        .{ .op = .guard_int, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: col
+        .{ .op = .guard_int, .a = 6 }, // 7
+        .{ .op = .garow, .a = 0, .b = 4, .aux = gi }, // 8
+        .{ .op = .guard_bounds, .a = 8 }, // 9
+        .{ .op = .gcell, .a = 8, .b = 6, .aux = gi }, // 10
+        .{ .op = .guard_gcol, .a = 10, .b = 6 }, // 11
+        .{ .op = .gload, .a = 10, .aux = gi }, // 12
+        .{ .op = .loop }, // 13
+    };
+    const base = g;
+
+    const Variant = struct { at: usize, ins: I };
+    const variants = [_]Variant{
+        // scalar-bound root re-guarded as grid (guard_lane first).
+        .{ .at = 2, .ins = .{ .op = .guard_lane, .a = 0, .aux = l8 } }, // then guard_stride on a scalar root refuses
+        // conflicting guard_grid elem re-guard.
+        .{ .at = 3, .ins = .{ .op = .guard_grid, .a = 0, .aux = gf } },
+        // garow without guard_grid (replaced by a second stride guard - same value, harmless).
+        .{ .at = 2, .ins = .{ .op = .guard_stride, .a = 0, .aux = 8 } },
+        // garow without guard_stride.
+        .{ .at = 3, .ins = .{ .op = .guard_grid, .a = 0, .aux = gi } }, // duplicate same-elem guard is fine; now remove stride
+        // gcell elem != its garow's elem.
+        .{ .at = 10, .ins = .{ .op = .gcell, .a = 8, .b = 6, .aux = gf } },
+        // gload elem != its gcell's elem.
+        .{ .at = 12, .ins = .{ .op = .gload, .a = 10, .aux = gf } },
+        // garow elem != the root's guard_grid elem.
+        .{ .at = 8, .ins = .{ .op = .garow, .a = 0, .b = 4, .aux = gf } },
+    };
+    for (variants, 0..) |v, vi| {
+        g = base;
+        g[v.at] = v.ins;
+        if (vi == 3) g[3] = v.ins; // "without stride": both slots become guard_grid
+        var tv = Trace{ .anchor = undefined, .instrs = &g, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+        try expectBail(&tv);
+    }
+
+    // Grid root re-guarded as scalar refuses (grid_elem set, then guard_lane).
+    g = base;
+    g[3] = .{ .op = .guard_lane, .a = 0, .aux = l8 };
+    var ts = Trace{ .anchor = undefined, .instrs = &g, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try expectBail(&ts);
+}

@@ -18,9 +18,16 @@ const Value = value.Value;
 const Trace = trace_code.TraceCode;
 const Kind = @import("nativegen_artifact.zig").Kind;
 const laneKind = layout.laneKind;
-const laneConsistent = layout.laneConsistent;
 const konstFitsLane = layout.konstFitsLane;
 const VALUE_LANE = layout.VALUE_LANE;
+
+/// Task #29: one bit per lane ordinal for the per-value `fits_mask`. Lane
+/// ordinals are tiny (`arr.Lane` has < 16 members); anything outside [0, 15]
+/// is malformed and yields null (fail closed).
+fn laneBit(aux: i32) ?u16 {
+    if (aux < 0 or aux > 15) return null;
+    return @as(u16, 1) << @intCast(aux);
+}
 
 /// An untyped slot value may enter native code only as an boxed-value
 /// copy: every semantic use must be the update of a slot-bound phi. No guard,
@@ -144,15 +151,20 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
     const bounds_ok = gpa.alloc(bool, n) catch return false;
     defer gpa.free(bounds_ok);
     @memset(bounds_ok, false);
-    // Per-value: has a `guard_fits` proven this value fits the narrow int lane's
-    // signed range? [B4b] An int-lane astore requires it — native cannot widen
-    // the lane mid-run (it has no allocate-and-repack path), so the recorder
-    // emits a `guard_fits` ahead of every int-lane store and the tier-1a oracle
-    // side-exits identically when the value would overflow the lane. Without a
-    // covering guard_fits an int-lane astore bails the whole trace to tier-1a.
-    const fits_ok = gpa.alloc(bool, n) catch return false;
-    defer gpa.free(fits_ok);
-    @memset(fits_ok, false);
+    // Per-value: which narrow int lanes has a `guard_fits` proven this value
+    // fits? [B4b] An int-lane astore requires the EXACT lane's bit — native
+    // cannot widen the lane mid-run (it has no allocate-and-repack path), so
+    // the recorder emits a `guard_fits` ahead of every int-lane store and the
+    // tier-1a oracle side-exits identically when the value would overflow the
+    // lane. Without a covering same-lane guard_fits an int-lane astore bails
+    // the whole trace to tier-1a. A BITSET (task #29, codex) rather than a
+    // bool: with per-chain lanes one value may feed stores into arrays of
+    // different widths, each store paired with its own width proof — a single
+    // "last guard wins" cell would reject a legitimate order-dependent subset,
+    // and a lane-blind bool would let an i64 proof cover an i8 store.
+    const fits_mask = gpa.alloc(u16, n) catch return false;
+    defer gpa.free(fits_mask);
+    @memset(fits_mask, 0);
     // Per-gcell (doc 14): has a `guard_gcol` proven this cell's column in
     // `[1, stride]`? A grid `gload`/`gstore`/`guard_gpresent` touches `data`/
     // `present` at the flat index `gcell` computed (`row0*stride + col-1`), which
@@ -173,10 +185,19 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
     defer gpa.free(href_key);
     @memset(href_key, false);
 
+    // Task #29 (codex): reject duplicate `slot_load`s of one VM slot. The
+    // recorder deduplicates real inputs, so a dup only appears in a malformed
+    // or handcrafted trace — and allocation keeps ONE `SlotInfo` per VM slot
+    // (one prologue lane/type check), so two refs carrying independent
+    // per-ref root bindings could disagree while only one is runtime-checked.
+    var slot_seen: std.StaticBitSet(0x10000) = .empty;
+
     for (t.instrs, 0..) |ins, i| {
         switch (ins.op) {
             .slot_load => {
                 if (ins.aux < 0 or ins.aux > 0xFFFF) return false;
+                if (slot_seen.isSet(@intCast(ins.aux))) return false;
+                slot_seen.set(@intCast(ins.aux));
                 slot_of[i] = ins.aux;
             },
             // H1: mark this href's key operand so the `.konst` arm accepts the
@@ -318,9 +339,27 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
         }
     }
 
-    // The single packed lane this trace's array ops touch (set by the first
-    // lane-bearing op; every later one must match — see `laneConsistent`).
-    var trace_lane: ?i32 = null;
+    // Task #29 (per-chain lane binding, codex thread 01a09008): array lanes are
+    // proven per ROOT and per ADDRESS CHAIN, not per trace. Each root ref (a
+    // `.ptr`/`.heap` table) is bound by its own structural guards — `guard_lane`
+    // binds a scalar lane; `guard_grid` + `guard_stride` jointly bind a grid
+    // shape — and every address op must agree with ITS OWN root's binding
+    // (`aref.aux == scalar lane`; `garow.aux == grid elem`), while every memory
+    // op must agree with its own address op (`aload.aux == aref.aux`, etc.).
+    // That is exactly the invariant the prologue/body checks verify at runtime
+    // (each guard names its root; each load/store lowers at its own `aux`
+    // width), so a trace may freely mix element widths across DIFFERENT arrays
+    // — the old trace-global single-lane cell rejected e.g. sparse's
+    // `vx[col[i]] * val[i]` (int-lane col + f64-lane vx/val) outright. A
+    // scalar-bound root used as a grid (or vice versa), a conflicting
+    // re-guard, or an address op with no dominating structural guard all fail
+    // closed. Two DIFFERENT roots aliasing one runtime array are safe: the
+    // array has one live lane, so one of the two runtime lane checks fails at
+    // entry and the trace exits before any mismatched-width access.
+    const RootBind = struct { scalar: ?i32 = null, grid_elem: ?i32 = null, grid_stride: ?i32 = null };
+    const root_bind = gpa.alloc(RootBind, n) catch return false;
+    defer gpa.free(root_bind);
+    @memset(root_bind, .{});
 
     // Pass B: assign kinds, validating operands and constants as we go.
     for (t.instrs, 0..) |ins, i| {
@@ -894,7 +933,14 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 // any other lane byte. No scalar lane-kind produced — the aload
                 // arm handles the `.value` case separately.
                 if (ins.aux != VALUE_LANE and laneKind(ins.aux) == null) return false;
-                if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                // Task #29: bind THIS root's scalar lane. A grid-bound root
+                // re-guarded as scalar, or a conflicting scalar re-guard,
+                // fails closed.
+                const rb = &root_bind[ins.a];
+                if (rb.grid_elem != null or rb.grid_stride != null) return false;
+                if (rb.scalar) |l| {
+                    if (l != ins.aux) return false;
+                } else rb.scalar = ins.aux;
                 kinds[i] = .none;
             },
             // aref pairs (table, index); its register carries idx0 = index-1. A
@@ -911,7 +957,13 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (ins.a >= i or ins.b >= i) return false;
                 if ((kinds[ins.a] != .ptr and kinds[ins.a] != .heap) or kinds[ins.b] != .int) return false;
                 if (ins.aux != VALUE_LANE and laneKind(ins.aux) == null) return false;
-                if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                // Task #29: the aref's lane must be the one a DOMINATING
+                // guard_lane on ITS root proved at runtime. An aref may never
+                // establish the binding itself — that would prove internal
+                // metadata consistency, not the live array's layout. A root
+                // never guard_lane'd (or bound as a grid) fails closed.
+                const rl = root_bind[ins.a].scalar orelse return false;
+                if (rl != ins.aux) return false;
                 kinds[i] = .aref;
             },
             // guard_bounds (idx0 <u len): the bounds proof for this aref. Marks the
@@ -939,6 +991,10 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
                 if (!bounds_ok[ins.a]) return false; // [I4] bounds must dominate
+                // Task #29: direct chain equality — the load's width is the
+                // one its own aref (and transitively that aref's guard_lane)
+                // verified. Replaces the old transitive-via-global argument.
+                if (ins.aux != t.instrs[ins.a].aux) return false;
                 if (ins.aux == VALUE_LANE) {
                     // The .value lane holds full 16-byte tagged Values, so the
                     // element's kind comes from the recorded `ty`, not from the lane.
@@ -958,7 +1014,6 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                     };
                 } else {
                     const lk = laneKind(ins.aux) orelse return false;
-                    if (!laneConsistent(&trace_lane, ins.aux)) return false;
                     kinds[i] = lk; // bool → .bool; i8…i64/u8 → .int; f64 → .float
                 }
             },
@@ -973,11 +1028,13 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             .guard_fits => {
                 if (ins.a >= i) return false;
                 const lk = laneKind(ins.aux) orelse return false; // .value → tier-1a
-                if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 switch (lk) {
                     .int => {
                         if (kinds[ins.a] != .int) return false; // only int values are range-guarded
-                        fits_ok[ins.a] = true;
+                        // Task #29: record the EXACT lane this proof covers;
+                        // the consuming store requires its own lane's bit.
+                        const bit = laneBit(ins.aux) orelse return false;
+                        fits_mask[ins.a] |= bit;
                     },
                     // The bool lane's guard_fits exists only for the tier-1a oracle
                     // (it side-exits a free-variable non-bool store). Native already
@@ -1017,14 +1074,15 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                     // what proves the kind below. Only int/float are lowered; a heap
                     // value is the one shape that would need a real write barrier under
                     // a future generational/incremental collector.
-                    if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                    // Task #29: chain equality with this store's own aref.
+                    if (ins.aux != t.instrs[ins.a].aux) return false;
                     if (!bounds_ok[ins.a]) return false; // [I1/P1] bounds must dominate
                     if (kinds[ins.b] != .int and kinds[ins.b] != .float) return false;
                     kinds[i] = .none;
                     continue;
                 }
                 const lk = laneKind(ins.aux) orelse return false;
-                if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                if (ins.aux != t.instrs[ins.a].aux) return false; // task #29: chain equality
                 if (!bounds_ok[ins.a]) return false; // [I1/P1] bounds must dominate
                 switch (lk) {
                     .bool => {
@@ -1040,7 +1098,8 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                         // static fit here (a const fill/init store) — mirrors the f64
                         // arm below.
                         if (kinds[ins.b] != .int) return false;
-                        if (!fits_ok[ins.b] and !konstFitsLane(t, ins.b, ins.aux)) return false;
+                        const bit = laneBit(ins.aux) orelse return false;
+                        if (fits_mask[ins.b] & bit == 0 and !konstFitsLane(t, ins.b, ins.aux)) return false;
                     },
                     .float => {
                         // f64 lane: the value need only be a proven float. The store is
@@ -1067,7 +1126,8 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (kinds[ins.a] != .aref) return false;
                 const aref_ins = t.instrs[ins.a];
                 if (laneKind(aref_ins.aux) == null) return false; // .value → tier-1a
-                if (!laneConsistent(&trace_lane, aref_ins.aux)) return false;
+                // Task #29: the aref's lane/root agreement was proven at its
+                // own admission; nothing trace-global left to check here.
                 bounds_ok[ins.a] = true;
                 kinds[i] = .none;
             },
@@ -1080,13 +1140,11 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (ins.a >= i or ins.b >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
                 // Validate the lane `lower()` actually switches on (`ins.aux`), exactly
-                // like the in-bounds `astore` — not the aref's aux. The aref arm already
-                // pinned its own aux to `trace_lane`, so checking `ins.aux` against
-                // `trace_lane` here forces ins.aux == aref.aux transitively; a trace
-                // whose astore_append.aux disagreed with its aref would be rejected
-                // rather than lowered with a mismatched width/lane.
+                // like the in-bounds `astore` — and require it to EQUAL the aref's aux
+                // directly (task #29): a trace whose astore_append.aux disagreed with
+                // its aref is rejected rather than lowered with a mismatched width.
                 const lk = laneKind(ins.aux) orelse return false; // .value → tier-1a
-                if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                if (ins.aux != t.instrs[ins.a].aux) return false; // task #29: chain equality, now direct
                 if (!bounds_ok[ins.a]) return false; // guard_append must dominate
                 switch (lk) {
                     .bool => if (kinds[ins.b] != .bool) return false,
@@ -1094,7 +1152,8 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                         if (kinds[ins.b] != .int) return false;
                         // guard_fits ⇒ width store is exact; or a constant whose fit
                         // tropt proved and folded away (const fill append, `p[i]=0`).
-                        if (!fits_ok[ins.b] and !konstFitsLane(t, ins.b, ins.aux)) return false;
+                        const bit = laneBit(ins.aux) orelse return false;
+                        if (fits_mask[ins.b] & bit == 0 and !konstFitsLane(t, ins.b, ins.aux)) return false;
                     },
                     // f64 append is intentionally not lowered in this cut: the recorder's
                     // append gate (`recArraySet`) excludes the f64 lane, so no f64
@@ -1117,7 +1176,14 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (kinds[ins.a] != .ptr) return false;
                 const lk = laneKind(ins.aux) orelse return false; // grid_elem lane
                 if (lk != .int and lk != .float) return false; // int + f64 grid lanes
-                if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                // Task #29: bind THIS root's grid element lane. A scalar-bound
+                // root re-guarded as a grid, or a conflicting elem re-guard,
+                // fails closed.
+                const rb = &root_bind[ins.a];
+                if (rb.scalar != null) return false;
+                if (rb.grid_elem) |e| {
+                    if (e != ins.aux) return false;
+                } else rb.grid_elem = ins.aux;
                 kinds[i] = .none;
             },
             .guard_stride => {
@@ -1126,6 +1192,14 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 // `array.stride` against it; an enlarged grid side-exits there.
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .ptr) return false;
+                // Task #29: bind THIS root's stride; conflicting stride guards
+                // on one root fail closed (allocation would otherwise take the
+                // last matching metadata it scans).
+                const rb = &root_bind[ins.a];
+                if (rb.scalar != null) return false;
+                if (rb.grid_stride) |s| {
+                    if (s != ins.aux) return false;
+                } else rb.grid_stride = ins.aux;
                 kinds[i] = .none;
             },
             // garow pairs (grid table, row); its register carries the row base —
@@ -1138,7 +1212,14 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (kinds[ins.a] != .ptr or kinds[ins.b] != .int) return false;
                 const lk = laneKind(ins.aux) orelse return false;
                 if (lk != .int and lk != .float) return false; // int + f64 grid lanes (bool never a grid)
-                if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                // Task #29: BOTH structural guards must dominate — guard_grid
+                // (the elem lane this garow's aux must match) and guard_stride
+                // (the imm32 the covering gcell folds). A garow may never
+                // establish the binding itself.
+                const rb = root_bind[ins.a];
+                const ge = rb.grid_elem orelse return false;
+                if (ge != ins.aux) return false;
+                if (rb.grid_stride == null) return false;
                 kinds[i] = .aref;
             },
             // gcell pairs (garow, col); its register carries the FLAT cell index
@@ -1153,7 +1234,7 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (kinds[ins.a] != .aref or kinds[ins.b] != .int) return false;
                 const lk = laneKind(ins.aux) orelse return false;
                 if (lk != .int and lk != .float) return false;
-                if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                if (ins.aux != t.instrs[ins.a].aux) return false; // task #29: chain equality with the garow
                 if (!bounds_ok[ins.a]) return false; // row bound must dominate the gcell
                 kinds[i] = .aref;
             },
@@ -1187,7 +1268,7 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (!gcol_ok[ins.a]) return false; // column bound must dominate
                 const lk = laneKind(ins.aux) orelse return false;
                 if (lk != .int and lk != .float) return false;
-                if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                if (ins.aux != t.instrs[ins.a].aux) return false; // task #29: chain equality with the gcell
                 kinds[i] = lk; // int grid → .int (GP); f64 grid → .float (XMM)
             },
             // gstore: encode the value (`b`) into the grid cell addressed by the
@@ -1203,11 +1284,12 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (kinds[ins.a] != .aref) return false;
                 if (!gcol_ok[ins.a]) return false; // column bound must dominate
                 const lk = laneKind(ins.aux) orelse return false;
-                if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                if (ins.aux != t.instrs[ins.a].aux) return false; // task #29: chain equality with the gcell
                 switch (lk) {
                     .int => {
                         if (kinds[ins.b] != .int) return false;
-                        if (!fits_ok[ins.b]) return false; // guard_fits ⇒ width store is exact
+                        const bit = laneBit(ins.aux) orelse return false;
+                        if (fits_mask[ins.b] & bit == 0) return false; // guard_fits ⇒ width store is exact
                     },
                     .float => {
                         if (kinds[ins.b] != .float) return false; // full-width movsd, no range check
