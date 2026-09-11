@@ -21,6 +21,86 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-11 (latest+5) — doc 45 D6.2 LANDED (task #27: one-shot population repair, B1′ + A1′)
+
+btrees 462→418.6ms; the inc-2 population regression is FIXED with the full
+baseline JIT machinery restored. Codex-reviewed design (thread
+01a08f8d-f6dc-7ba3-bab7-d214dd45c3fa, verdict "approve B1′ + A1′").
+
+- **Root cause (established from jit-debug forensics, shadow A/B vs
+  f77c30e):** two coupled defects. (1) inc-2's needs_precise retry let the
+  FIRST-observed path (the `{ }` leaf) commit a PRECISE trace that
+  permanently claimed BottomUpTree's HEAD anchor — sibling recording only
+  triggers on hot exits of ENTERED traces, a native-declined precise
+  incumbent never enters, and the D6.1 memo bypasses even the walk; the
+  pre-inc-2 world instead plain-aborted leaf recordings (strike) until a
+  DESCENT-path recording committed the ordinary, native, linkable head
+  trace. (2) that anchor's cont page filed a `call_head` arm request
+  wanting a same-proto head child that could never arrive —
+  `pending_call_head_arm` is a SINGLE global slot and the old code gated
+  all watch accrual on it being empty, so the stale request froze frame
+  links for EVERY proto: construction-free ItemCheck lost its links too
+  (`arms=0 hits=0 pops=0`; per-anchor: ItemCheck cont@12 50→656k entries,
+  head 159k→319k, BottomUpTree cont@17 720→656k).
+- **B1′ (arm-request liveness):** per-owner watches accumulate
+  independently of the slot; an owner that independently re-crosses
+  `hotguard` DISPLACES a stale request under a different key (full ExitKey
+  compare; same-key re-crossing = no-op, so no self-ping-pong); applied to
+  both `.call_head` (interp walk) and `.ret_cont`
+  (`noteRetContTransition` → `fileRetContArm`); `clearCache` nulls both
+  pendings (ids are epoch-monotonic so stale keys already resolve null —
+  policy hygiene). B1′ alone restored ItemCheck's machinery exactly
+  (ret-cont hits 159,819 = baseline).
+- **A1′ (ordinary-probe population policy, mode-independent):**
+  `precise_anchor_memo` value gained `ordinary_probe`; a precise ONE-SHOT
+  commit sets it (unless an ordinary sibling exists / anchor full); the
+  patched-entry walk consumes it BEFORE the D6.1 decline and before the
+  incumbent — same deterministic point in native AND tier-1a modes, so the
+  trace population never depends on backend capability (codex's decisive
+  argument for A1 over the native-mode-only A2). The transfer arms a
+  `force_ordinary` recording via the existing pending machinery
+  (`PendingCallAnchor`/`PendingRetAnchor.force_ordinary` →
+  `armWithPolicy` suppresses the memo seed; `AbortNotice.force_ordinary`
+  makes `.needs_precise` a plain gate strike — memo untouched, no precise
+  re-record). Probe survives aborts, rides gate cooldowns, resolves on
+  ordinary commit / `recordingAbandoned` (permanent, strikes ≥
+  max_strikes) / population cap; the D6.1 memo cannot arm while a probe is
+  outstanding (`ordinary_probe_count` steady-state one-branch check).
+  Precise incumbent stays installed — no repatch (codex point 4).
+- **Result (--jit-stats, plain ReleaseFast):** entries 2.97M ALL native
+  (= baseline), call-head arms=2 hits=1,313,044, ret-cont arms=1
+  hits=159,819, pops 159,869, BottomUpTree cont@17 656k→150 deep-descent
+  entries. Probe lifecycle in the log: set → transfer → ordinary commit →
+  cleared → arm to the ordinary child.
+- **Tests:** B1′ displacement + same-key no-op + epoch-clear (unit,
+  trace_chain_test); A1′ population twins — native and tier-1a runs commit
+  the SAME ordinary sibling next to the precise trace, probe resolved
+  (interp_trace_test, mini-btrees source); probe stop-at-the-gate (D6.1 mk
+  test now sets `max_strikes = 1`: in a straight-line program the
+  back-edge tick freezes, so cooldowns never elapse — one strike must be
+  permanent abandonment for the memo to arm; also asserts
+  `ordinary_probe_count == 0`); starvation end-to-end (poisoned allocating
+  recursion + clean fib; fib's `call_head_link_arms >= 1`; VERIFIED
+  non-vacuous — fails under the temporarily-restored pre-B1′ gate). Gates:
+  unit 1322, wasm, hashgate 84×2, full board.
+- **Board (20260911-175744):** everything within noise vs both reference
+  boards EXCEPT binary-trees 418.6 vs 383 pre-45 (+9.3%, down from +20.8%)
+  and spectral-norm 39.5 vs 36.5 (+8.2%, drifting since D6.1 — watch).
+- **OPEN → task #28 (the +9% btrees residual is SEAM, not population):**
+  same-conditions plain-ReleaseFast A/B (shadow f77c30e vs HEAD,
+  back-to-back): 0.39 vs 0.43s with IDENTICAL structural counters. perf
+  attributes it to the native run wrapper — `runWithLinkedLoopDone`/
+  `runCapturingLedger` self-time 6.34%→17.16% (+~49ms) — and
+  `drainProvenanceArms` 0.19%→2.88% (+~11ms; it early-returns on 0 edges,
+  so that's a lost-inlining/codegen shift, not work). Likely driver: the
+  D6 ABI quad growing `NativeResult`/`ExecResult` + the wider decode
+  switch changed inlining in the per-transition hot loop (1.9M descent
+  transitions; recursive-fib is flat so generic pages are fine). NOTE the
+  jit-debug A/B showed parity (0.38 vs 0.38) — jit-debug slows the
+  baseline wrapper enough to mask the delta; always A/B in the board's
+  build flavor. Also still pre-existing: 1.0M prologue_fail head entries
+  (task #18 domain).
+
 ## Status 2026-09-11 (latest+4) — doc 45 D6 NATIVE HALF LANDED (native precise executor)
 
 Precise traces now compile AND run natively (task #26; all 10 codex points
