@@ -21,6 +21,42 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-11 (latest+7) — doc 46 LANDED (task #29: per-chain array lane binding)
+
+scimark-lu 182.4→142.7ms (−22%, res 40.6→56.8%); sparse fallback population
+83.3%→25.0% of iterations (res 0→53.3%); long-body mixed-lane repro ~9×.
+Codex-reviewed design (thread 01a09008-f492-7bb1-b679-7d7f9b06c6f6).
+
+- **Root cause (isolated + bisected per the standing recipe):** proveKinds
+  enforced ONE packed lane per TRACE (`trace_lane` cell + `laneConsistent`).
+  sparse's `vx[col[i]] * val[i]` mixes a u8-lane index array with f64 data
+  arrays → the inner dot trace was native-refused → tier-1a → dispatch gate
+  starved it → 83.3% "fallback despite a trace" (the doc-31 str_gmatch
+  signature at 15M iterations/79% of cycles). Codegen was ALREADY per-op
+  (emit picks widths from each op's aux; prologue checks per guard_lane) —
+  the global cell was prove-only.
+- **Fix (doc 46):** per-root `RootBind` (guard_lane binds scalar;
+  guard_grid+guard_stride jointly bind grid; cross-use/conflicts fail
+  closed), required dominance (aref needs its root's guard_lane, garow needs
+  BOTH grid guards — an address op never establishes a binding), direct
+  chain aux equality on every memory op, `fits_mask` lane bitset (an i64
+  fits proof can no longer cover an i8 store), duplicate slot_load
+  rejection (one SlotInfo/prologue check per VM slot). `laneConsistent`
+  deleted.
+- **Board:** lu −22%, euler14 64.0→59.1, spectral 34.9→32.1, sparse
+  586→573; no regressions beyond noise (fib back to 190.9, confirming
+  latest+6's noise lesson). Gates: unit, wasm, hashgate 84×2. Board tsv:
+  bench/results/20260911-195243-318382b.tsv.
+- **OPEN → the sparse residual is NEST COVERAGE, not admission (task #30):**
+  post-fix sparse runs native at ~82 c/iter but only ~3 iters/native-entry
+  (each row has ~5 elements) with 3.0M replayLedger walks at ~380 cyc — the
+  entry seam eats the win. LuaJIT traces the OUTER row loop; ours aborts at
+  the inner `for_prep` with nyi_opcode (`--dump-aborts`: sparse_mult anc@4
+  abrt@8 and anc@8 abrt@21, both nyi_opcode for_prep). That is the
+  Pall-shape nest arc (docs 22/44, campaign item 2). Also recorded from the
+  same forensics: bad_type set_index (random_vector/SPARSE setup) and
+  upvalue_mutable set_upval (rand) aborts — separate admission arcs.
+
 ## Status 2026-09-11 (latest+6) — doc 45 D6.3 LANDED (task #28: seam-overhead repair)
 
 btrees 418.6→394.8ms (+3.1% residual vs the 383 pre-doc-45 reference; interleaved
