@@ -21,6 +21,122 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-11 (latest+9) — doc 47 increment D LANDED (widen-eviction churn fix, 0fb8eb2); f64 append still held
+
+**Tree state: f64-append diff still UNCOMMITTED** (src/trace_recorder.zig,
+src/nativegen_prove.zig, src/nativegen.zig, src/array.zig,
+src/interp_native_test.zig) on top of 0fb8eb2. Codex split-land ruling (same
+thread, rounds 4–6): land D independently, hold f64 append until increments
+A/C clear its sparse/spectral seams. Do not revert the held diff; do not land
+it until A/C.
+
+- **Increment D root cause (corrects latest+8's "warmup bookkeeping scaling"
+  guess): widen-eviction mint-retire churn.** `laneWidenedPast` treated a
+  fresh unfrozen `.value` array as "monotonically widened past" any narrow
+  `guard_lane` pin (`.value` is the lattice top; `canWidenTo` always false) —
+  but monotonicity only begins at the one-shot lane commitment
+  (`ArrayPart.frozen`, set by `commitFreshLane` on the first real store). So
+  every fill-a-fresh-table-per-outer-iteration loop entered its fill trace
+  once with the next iteration's `{}` → widen-evict → `removeTrace` resets
+  the warm counter → full re-record+optimize+compile+`rebuildEdgeCache`/
+  `rebuildRegions`+entry-patch churn, EVERY outer iteration. jit-debug on
+  grid_matmul_f64: 2448 rec-arms / ~600 commits / ~600 retires per run →
+  12 / 7 / 0 after the fix. The topology_build/session-reset/Gate-lookup/
+  allocator symptoms perf fingered were all downstream of this one loop.
+  The churn PREDATES doc 47 (int fills had it too — that's why the fix wins
+  big on the int board).
+- **Fix + tests (committed 0fb8eb2):** skip unfrozen arrays in
+  `laneWidenedPast`; predicate-level regression pair + reachability cases in
+  NEW `src/trace_evict_test.zig` (kept out of the held interp_native_test.zig
+  so the commit needed no partial-file staging); 3 permanent jitdbg probes
+  (rec-arm, commit, trace-retire). Gates: unit, hashgate 84×2.
+- **D-only board (baseline + D files only, interleaved A/B vs
+  /tmp/lune-base-47):** grid_matmul **−36%** (41.0→25.7ms), repack
+  **−55%** (57→25.8ms eq., res 8→30%), spectral **−5%**;
+  gm_f64/btrees/nbody/fib/sor neutral. **sparse asterisk:** +5% wall but
+  byte-identical trace dumps, identical per-anchor iteration and
+  replayLedger walk counts, `perf stat` −0.9% instructions / +9.4% cycles /
+  **+18% L1-icache misses** → code-layout artifact (the phantom-fft class),
+  codex-ruled non-blocking.
+- **Full-tree board (D + held f64):** bench/results/20260911-221920-877fbf4.tsv —
+  grid_matmul 25.0, gm_f64 25.8, repack 36.7; sparse 705/spectral 37.8 remain
+  the held-f64 residuals (scimark t0 columns in that run drifted +16-23% =
+  machine noise; the interleaved A/Bs above are the citable numbers).
+- **Spectral +9.6% (held f64 only) DIAGNOSED — same append-cont seam class as
+  sparse, increment C territory:** with f64 append recordable, the loop-done
+  continuation at Av/Atv pc=22 (`y[i] = a`) records during the FIRST call
+  (append phase, `v` empty); every later call stores in-bounds → the cont's
+  entries refuse at prologue/fingerprint (NOT guard terminals, so the doc-47
+  sibling-handoff convergence never produces a want) → 3334
+  `gate[dispatch:legacy_thrash]` cooldown cycles at pc=22 (baseline: 4), the
+  inner Av:9 loses its linked bursts (364k tier-0 fallback iters vs 13.7k),
+  each calling the A head trace un-inlined (366k entries ~244cyc). Committed
+  trace shapes identical to baseline — purely entry/gating. Increment C needs
+  entry-refusal evidence to feed the same side-specialization path guard
+  terminals feed (or arm repoint/disarm off the dead cont), per codex's
+  proven-relation constraint.
+- **Next:** increment A (continuation-scoped peeling — design agreed round 3,
+  see below) for sparse's int-0 `sum` prologue-fail seam; increment C
+  (entry-refusal → side want / arm repoint) for spectral's cont thrash; then
+  land the held f64 diff when its two rows are neutral-or-better. B (closed-
+  SCC owner election) after.
+
+## Status 2026-09-11 (latest+8) — doc 47 IMPLEMENTED, HELD (task #30: f64 append + the nest-seam diagnosis)
+
+**Tree state: UNCOMMITTED working-tree diff on top of 877fbf4** (src/trace_recorder.zig,
+src/nativegen_prove.zig, src/nativegen.zig, src/array.zig, src/interp_native_test.zig,
+docs/design/47-f64-array-append.md). All gates green (unit incl. 4 new tests, wasm,
+hashgate 84×2) but the BOARD regressed → held per the campaign bar + codex's landing
+condition. **Doc 47 has the complete record** (increments A–D, board outcome). Do
+not revert this diff — it is correct coverage held on perf; do not land it either
+until increments A/D make the board net-positive.
+
+- **What landed in-tree:** f64 `astore_append` (recorder gate + prove `.float`
+  arm + native movsd/bts/len-bump branch; oracle was lane-generic). Float array
+  fills now record everywhere. Codex thread 01a09045-973c-79d1-9070-d94fbb7955ac
+  (2 rounds).
+- **Task #30 diagnosis chain (all verified):** sparse's loop-done continuation
+  anchor was permanently record-blacklisted during scimark's cycles=1 calibration
+  call — every `vy[r]=sum` in that call is an APPEND to a growing f64 array, the
+  recorder's append gate excluded f64, 6 aborts = max_strikes. With f64 append:
+  the full arm chain forms (jit-debug: loop_done_linked 3→4, sibling_handoff 4→5
+  via provenance drain, link_terminal 4→3/5→3), loopdone fused 0→150M on the real
+  bench, res 58%. BUT wall 573→701ms because **every row's burst dies at
+  `inner.linked_entry PROLOGUE_FAIL`** (codex round 2): the continuation resets
+  `sum` with INT 0; the steady inner root wants FLOAT (`guard_float` entry
+  prologue — it recorded after tier-0 ran the first iteration). One ~576cyc
+  replayLedger boundary per 5-iteration row. Link eligibility is pc-only; the
+  machinery closed a cycle that isn't dynamically enterable.
+- **Second regression mechanism (grid_matmul_f64 +33%, btrees +3.9%, short
+  benches +2-9%):** NOT the seam — `other (non-loop)` 3.3M→37.3M cyc; perf
+  fingers topology_build (3.2%), RecordingSession.reset memset via armWithPolicy
+  (3.8%), Gate-map lookups (2.5+1.5%), allocator churn. Warmup bookkeeping
+  scaling with the newly recordable fill anchors (doc 47 increment D).
+- **A/B instrument:** HEAD shadow at /tmp/lune-base-47 (sources restored from
+  git, ReleaseFast built, verified baseline by diffing the append gate line).
+  Interleaved 7-9-rep medians: grid_matmul_f64 +33.4%, spectral +9.7%, sparse
+  +5.8%, btrees +3.9%, euler14/nbody/fib neutral.
+- **Repros:** /tmp/sp_calib2.lua (grow-then-reuse, parameters — NB: does NOT
+  reproduce the blacklist on baseline, its hotness lands past the growth phase;
+  the REAL bench's abort table is the pre-change evidence). The e2e convergence
+  test in interp_native_test.zig is the committed-form repro.
+- **Next (the actual nest arc, codex-named):** doc 47 increment A —
+  **continuation-scoped PEELING** (round 3: the eager int→float link-boundary
+  conversion was codex-REJECTED with counterexamples — `math.type(sum)` on
+  iteration 1, `0//2` int vs `0.0//2`, post-`.link` nonnumeric prologue
+  failures resuming tier-0 with a coerced slot; doc 39's rejected shape.
+  Full reasoning + the two extra holes (link-target identity persistence;
+  prologue derives from proveKinds→analyzeInner→Alloc.slots, never scan the
+  IR prefix) are in doc 47 increment A). Peel iteration 1 inside the
+  continuation with original int semantics; close `.link` at the first
+  back-edge (recForLoop continue direction) where recorded state matches the
+  steady root's PERSISTED entry contract (doc 39 entry-kind/steady-kind
+  model), arm-time compatibility re-checked; bounded peel (1–2, deterministic
+  counter) else LINNER. Then B (closed-SCC owner election → region
+  promotion), C (arm repoint cleanup), D (warmup scaling — likely the bigger
+  half of the board hold: grid_matmul_f64 +33% is bookkeeping, not the seam).
+  Land doc 47 + whichever of A/D restores the board.
+
 ## Status 2026-09-11 (latest+7) — doc 46 LANDED (task #29: per-chain array lane binding)
 
 scimark-lu 182.4→142.7ms (−22%, res 40.6→56.8%); sparse fallback population
