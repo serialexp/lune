@@ -4463,18 +4463,39 @@ pub const Vm = struct {
                     self.trace.head_walk_fail = pdf.exit;
             }
         }
+        // Doc 45 D6.1 (native safety net, one-shot flavor — codex-reviewed):
+        // under `--jit-native`, a one-shot candidate that cannot run natively
+        // (`nativeFor == null`, e.g. a precise trace — the native acceptance
+        // checklist is loop-anchor-only) is NEVER entered on tier-1a: per-call
+        // one-shot entries have no iteration amortization, so tier-1a entry +
+        // receipt + (for precise) snapshot materialization is a strict loss vs
+        // the tier-0 body (binary-trees: 1.32M such entries cost +40% wall).
+        // A declined candidate is indistinguishable from an unselected one —
+        // no receipts, no accounting. Loop-anchor patched entries are
+        // untouched (a budget-bailed precise LOOP trace amortizes tier-1a
+        // over its iterations and has nowhere else to run — codex point 9).
+        const native_mode = self.trace.config.native_codegen;
+        // Memo eligibility: stays true only while EVERY visited candidate was
+        // a native-unsupported decline (any real entry or steering kills it).
+        var all_nonnative_declines = one_shot and native_mode;
         // Doc 44 D9: quiet-first for one-shot anchors (head + cont, D12b) —
         // the lean episode when nothing that could observe or steer it is
         // live; the full path otherwise. (`enterHeadNativeQuiet` is
         // anchor-exact throughout: every receipt/evidence call keys on
         // `ct.code.anchor`, and cont pages never emit the push epilogue.)
-        var directive = if (one_shot)
-            (if (self.headEpisodeQuiet(ct)) |nt|
+        var directive: EntryDirective = undefined;
+        if (one_shot and native_mode and self.trace.nativeFor(ct) == null) {
+            self.trace.dbg("one-shot native-unsupported decline: trace={d}", .{ct.id});
+            directive = .next_candidate;
+        } else if (one_shot) {
+            all_nonnative_declines = false;
+            directive = if (self.headEpisodeQuiet(ct)) |nt|
                 self.enterHeadNativeQuiet(ct, nt, closure, proto, regs, base)
             else
-                self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx))
-        else
-            self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx);
+                self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx);
+        } else {
+            directive = self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx);
+        }
         // Doc 44 D10: a fused burst entered several owners — exclude them
         // from re-selection this walk.
         if (one_shot) {
@@ -4503,6 +4524,15 @@ pub const Vm = struct {
                 visited[nvisited] = sib;
                 nvisited += 1;
                 wctx.visited = visited[0..nvisited];
+                // D6.1: same native safety net per sibling — a compiled
+                // sibling after an unsupported incumbent still gets tried
+                // (the decline leaves `.next_candidate`, so the walk moves
+                // on rather than refusing the whole anchor).
+                if (native_mode and self.trace.nativeFor(sib) == null) {
+                    self.trace.dbg("one-shot native-unsupported decline: trace={d}", .{sib.id});
+                    continue;
+                }
+                all_nonnative_declines = false;
                 // D9: each sibling retries the quiet path — a prior zero
                 // exit's penalty insert correctly forces the full path.
                 directive = if (self.headEpisodeQuiet(sib)) |nt|
@@ -4567,6 +4597,20 @@ pub const Vm = struct {
         // §R6-1/§R7-1 strict order: inspect the stable slot before the drain,
         // mark strike exhaustion, retire dead traces, drain the entire pending
         // set, then never touch `patch` again (the slot may have been reused).
+        // D6.1 memo: a FULL walk that declined every candidate as
+        // native-unsupported (nothing entered, nothing steered, not
+        // truncated) short-circuits future `opJFuncHead`/`opJCont` entries to
+        // the canonical tier-0 instruction until the next cache mutation
+        // (`cache_gen` bump — a later native-capable sibling reopens the
+        // walk). The patch itself stays installed: unpatching would churn
+        // through `maybeRepatchHead`/`maybeRepatchCont`, which reinstall
+        // without a native-support check.
+        if (patch.live and all_nonnative_declines and !walk_truncated and
+            directive == .next_candidate)
+        {
+            patch.native_decline_gen = self.trace.registry.cache_gen;
+            self.trace.dbg("one-shot native-decline memo: anchor pc={d} gen={d}", .{ anchor_pc, patch.native_decline_gen });
+        }
         if (patch.live) {
             if (directive == .next_candidate) {
                 // Doc 44 D8 (review round 2 blocker 1): a one-shot patch
@@ -5264,6 +5308,18 @@ pub const Vm = struct {
                 {
                     return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
                 }
+                // Doc 45 D6.1 fast decline: a prior full walk proved every
+                // candidate at this anchor is native-unsupported (memo keyed
+                // to `cache_gen`; any commit/retirement invalidates it). Run
+                // the canonical tier-0 instruction — one compare instead of a
+                // decline-walk per call. A standing sibling want forces the
+                // full walk (its transfer must be consumed there).
+                if (self.trace.config.native_codegen and
+                    patch.native_decline_gen == self.trace.registry.cache_gen and
+                    self.trace.wants_head_sibling == null)
+                {
+                    return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
+                }
                 // Patched entry: the identical entry/receipt routine the loop
                 // arms use. Guard failures leave regs untouched since entry
                 // (tier-1a/native evaluate into scratch; only φ-writeback and
@@ -5351,6 +5407,15 @@ pub const Vm = struct {
                     self.trace.pending_replay_anchor != null or
                     self.trace.pending_call_anchor != null or
                     self.trace.pending_ret_anchor != null)
+                {
+                    return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
+                }
+                // Doc 45 D6.1 fast decline (jfunc_head twin): every candidate
+                // proved native-unsupported by a prior full walk — canonical
+                // tier-0 dispatch until the next `cache_gen` bump.
+                if (self.trace.config.native_codegen and
+                    patch.native_decline_gen == self.trace.registry.cache_gen and
+                    self.trace.wants_head_sibling == null)
                 {
                     return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
                 }

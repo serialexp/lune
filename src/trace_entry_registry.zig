@@ -30,6 +30,18 @@ pub const EntryPatch = struct {
     tombstone: bool = false,
     strikes: u8 = 0,
     seed_count: u32,
+    /// Doc 45 D6.1 (native safety net, one-shot flavor): the `cache_gen` at
+    /// which a FULL, non-truncated `enterPatchedTrace` walk declined EVERY
+    /// candidate at this anchor as native-unsupported (under
+    /// `native_codegen`), with no steering fired. While it matches the live
+    /// `cache_gen`, `opJFuncHead`/`opJCont` tail-dispatch the canonical
+    /// tier-0 instruction without walking — the patch stays installed (an
+    /// unpatch would churn: `maybeRepatchHead`/`maybeRepatchCont` reinstall
+    /// without a native-support check), but per-call cost drops to one
+    /// compare. Any commit/retirement bumps `cache_gen` and naturally
+    /// invalidates the memo, so a later native-capable sibling re-enables
+    /// the walk. 0 = no memo (`cache_gen` is never 0).
+    native_decline_gen: u32 = 0,
 };
 
 pub const InstallResult = union(enum) {

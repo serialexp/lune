@@ -6721,3 +6721,158 @@ test "executor (tnew mixed body native, doc 45 D6): a mid-loop element-guard exi
     if (@import("nativegen.zig").is_x64_linux)
         try testing.expect(vm.trace.native_entries >= 1);
 }
+
+// Doc 45 D6.1 (codex-reviewed): the native safety net, one-shot flavor. A
+// precise trace at a HEAD/CONT anchor can never compile natively (the D6
+// acceptance checklist is loop-anchor-only), and running it on tier-1a per
+// call — no iteration amortization — is a strict loss vs the tier-0 body
+// (binary-trees paid +40% wall for exactly this). Under `native_codegen`,
+// `enterPatchedTrace` must DECLINE such candidates without entering, and a
+// full all-declined walk memoizes a fast tier-0 dispatch on the patch
+// (`native_decline_gen`, invalidated by any `cache_gen` bump).
+const D61_MK_SOURCE: [:0]const u8 =
+    \\local function mk(a, b)
+    \\  local t = {}
+    \\  return a + b
+    \\end
+    \\local r = 0
+    \\r = mk(r, 1)
+    \\r = mk(r, 2)
+    \\r = mk(r, 3)
+    \\r = mk(r, 4)
+    \\r = mk(r, 5)
+    \\r = mk(r, 6)
+    \\r = mk(r, 7)
+    \\r = mk(r, 8)
+    \\r = mk(r, 9)
+    \\r = mk(r, 10)
+    \\r = mk(r, 11)
+    \\r = mk(r, 12)
+    \\r = mk(r, 13)
+    \\r = mk(r, 14)
+    \\r = mk(r, 15)
+    \\r = mk(r, 16)
+    \\print(r)
+;
+
+fn d61Truth(gpa: std.mem.Allocator, out: *[64]u8) !usize {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, D61_MK_SOURCE, &diags);
+    defer tree.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, D61_MK_SOURCE, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    const len = sink.buffered().len;
+    @memcpy(out[0..len], sink.buffered());
+    return len;
+}
+
+test "selection (one-shot precise, doc 45 D6.1): under native mode an unsupported precise head trace is declined, memoized, and never runs tier-1a" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    var truth: [64]u8 = undefined;
+    const truth_len = try d61Truth(gpa, &truth);
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, D61_MK_SOURCE, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = false;
+    vm.trace.config.native_codegen = @import("nativegen.zig").is_x64_linux;
+    // Straight-line calls only: the shared `mk` HEAD anchor heats (hotcall
+    // 4), while every call site's cont resume pc is distinct and stays cold.
+    vm.trace.config.hotcall = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, D61_MK_SOURCE, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    try testing.expectEqualStrings(truth[0..truth_len], sink.buffered());
+    // Vacuity guard: the precise HEAD trace really committed.
+    var precise_head: ?*const trace.Trace = null;
+    for (vm.trace.registry.cache.items) |ct| {
+        if (ct.code.deopt_mode == .precise and trace.anchorKind(ct.code.anchor.pc) != .loop)
+            precise_head = ct;
+    }
+    try testing.expect(precise_head != null);
+    if (@import("nativegen.zig").is_x64_linux) {
+        // The decline: NOTHING ever entered — no native page exists for a
+        // non-loop precise trace, and tier-1a must not be substituted.
+        try testing.expectEqual(@as(u64, 0), vm.trace.entries);
+        try testing.expectEqual(@as(u64, 0), vm.trace.native_entries);
+        try testing.expectEqual(@as(u64, 0), vm.trace.precise_resumes);
+        try testing.expectEqual(@as(u64, 0), vm.trace.precise_errors);
+        // The memo: a full all-declined walk armed the fast tier-0 dispatch
+        // (keyed to the LIVE cache_gen — nothing committed after it).
+        var memoized = false;
+        for (vm.trace.registry.entry_registry.entry_patches.items) |p| {
+            if (p.live and p.native_decline_gen == vm.trace.registry.cache_gen)
+                memoized = true;
+        }
+        try testing.expect(memoized);
+    } else {
+        // Non-x64: native_codegen stayed false, so tier-1a owns the trace.
+        try testing.expect(vm.trace.entries > 0);
+    }
+}
+
+test "selection (one-shot precise, doc 45 D6.1): tier-1a mode still enters the same precise head trace" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    var truth: [64]u8 = undefined;
+    const truth_len = try d61Truth(gpa, &truth);
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, D61_MK_SOURCE, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = false;
+    // native_codegen OFF: tier-1a is the precise executor and MUST keep
+    // running one-shot precise traces (the decline is native-mode-only).
+    vm.trace.config.hotcall = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, D61_MK_SOURCE, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    try testing.expectEqualStrings(truth[0..truth_len], sink.buffered());
+    var precise_head: ?*const trace.Trace = null;
+    for (vm.trace.registry.cache.items) |ct| {
+        if (ct.code.deopt_mode == .precise and trace.anchorKind(ct.code.anchor.pc) != .loop)
+            precise_head = ct;
+    }
+    try testing.expect(precise_head != null);
+    try testing.expect(vm.trace.entries > 0);
+    try testing.expectEqual(@as(u64, 0), vm.trace.native_entries);
+    // No memo in tier-1a mode: the decline path never ran.
+    for (vm.trace.registry.entry_registry.entry_patches.items) |p| {
+        try testing.expectEqual(@as(u32, 0), p.native_decline_gen);
+    }
+}
