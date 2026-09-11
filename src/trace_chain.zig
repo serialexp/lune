@@ -1617,6 +1617,9 @@ pub fn replayLedgerFrom(
             .head_terminal => @panic("replayLedger: head_terminal row in a chain ledger"),
             // Frame-motion rows belong only to one-shot descent episodes.
             .ret_pop, .call_push => @panic("replayLedger: frame-motion row in a chain ledger"),
+            // Doc 45 D6: precise exits are always terminal — never armed,
+            // never fused, never chain members.
+            .precise_deopt, .precise_error => @panic("replayLedger: precise row in a chain ledger"),
         };
 
         // Destination `.deferred` for a handoff, NEVER `.known_trace`: this edge is
@@ -1690,6 +1693,9 @@ pub fn replayLedgerFrom(
             .head_terminal => @panic("replayLedger: head_terminal row in a chain ledger"),
             // Frame-motion rows belong only to one-shot descent episodes.
             .ret_pop, .call_push => @panic("replayLedger: frame-motion row in a chain ledger"),
+            // Doc 45 D6: precise exits are always terminal and never armed —
+            // this row kind cannot reach a chain ledger.
+            .precise_deopt, .precise_error => @panic("replayLedger: precise row in a chain ledger"),
             .region_bridge => {
                 // A bridge commits its distinct cross-anchor snapshot before
                 // entering the successor. It is therefore never terminal or a

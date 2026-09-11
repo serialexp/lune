@@ -238,6 +238,17 @@ pub const LedgerKind = enum(u32) {
     /// A continuation page committed a native self-call push and dispatched
     /// through its `.call_head` link into the proto's head page.
     call_push = 9,
+    /// Doc 45 D6: a precise trace's guard failed — the per-snapshot
+    /// materializer restored the anchor window from the guard's captured
+    /// snapshot refs and the body exits `.precise_resume` with the one-based
+    /// `snapshot_id` stamped. Always terminal — a precise exit is never a
+    /// chain source (no slot indirection, no patch window).
+    precise_deopt = 10,
+    /// Doc 45 D6: a precise trace's allocating callout FAILED (nonzero
+    /// `table_runtime.Status`) — snapshot restored, `runtime_error` stamped,
+    /// body exits `.precise_error`. Always terminal; the dispatcher parks the
+    /// mapped error at the snapshot's `resume_pc` without re-execution.
+    precise_error = 11,
 };
 
 /// 2.3c-2c (doc 17): what a chain-source exit DID with its (possibly armed) slot —
@@ -316,6 +327,8 @@ test "execution contract wire ordinals and capacity" {
     try std.testing.expectEqual(@as(u32, 7), @intFromEnum(LedgerKind.head_terminal));
     try std.testing.expectEqual(@as(u32, 8), @intFromEnum(LedgerKind.ret_pop));
     try std.testing.expectEqual(@as(u32, 9), @intFromEnum(LedgerKind.call_push));
+    try std.testing.expectEqual(@as(u32, 10), @intFromEnum(LedgerKind.precise_deopt));
+    try std.testing.expectEqual(@as(u32, 11), @intFromEnum(LedgerKind.precise_error));
     try std.testing.expectEqual(@as(u32, 0), @intFromEnum(LedgerOutcome.normal));
     try std.testing.expectEqual(@as(u32, 1), @intFromEnum(LedgerOutcome.yielded));
     try std.testing.expectEqual(@as(usize, 32), LEDGER_CAP);

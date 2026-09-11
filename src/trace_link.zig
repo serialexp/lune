@@ -907,6 +907,9 @@ pub fn rowPatchKind(kind: trace_exec.LedgerKind) ?nativegen.ExitPatchKind {
         .head_terminal => null,
         // Frame-motion transitions use dedicated trailing slot cells.
         .ret_pop, .call_push => null,
+        // Doc 45 D6: precise exits carry no patch window — a precise trace
+        // is never a chain source, so there is no exit branch to patch.
+        .precise_deopt, .precise_error => null,
     };
 }
 

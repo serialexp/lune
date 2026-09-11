@@ -147,6 +147,22 @@ pub const NativeResult = extern struct {
     /// `ExecResult.popped_frames`. The emitted pop preflight also READS both
     /// motion counters to compute the net floor it passes the helper.
     popped_frames: u64,
+    /// Doc 45 D6: one-based `TraceCode.snapshots` index stamped by a precise
+    /// exit (`.precise_resume` / `.precise_error`); 0 otherwise. Appended at
+    /// the ABI tail by the frozen-offset rule (every scalar `@offsetOf` is
+    /// baked into exit stubs — append only, never insert). The wrapper inits
+    /// it to 0 and marshals it into `ExecResult.snapshot_id`.
+    snapshot_id: u32,
+    /// Doc 45 D6: raw `table_runtime.Status` ordinal from a failed allocating
+    /// callout (nonzero ⟺ `exit_reason == .precise_error`). Stamped by the
+    /// exit stub BEFORE any flush/ledger code (those clobber rax). Zero-init;
+    /// marshaled into `ExecResult.runtime_error`.
+    runtime_error: u32,
+    /// Doc 45 D6: activation window of a precise exit. Always 0/0 while the
+    /// precise recorder refuses frame inlining; the dispatcher asserts that.
+    /// Zero-init; marshaled into `ExecResult.activation_base`/`_depth`.
+    activation_base: u32,
+    activation_depth: u32,
 };
 
 /// Host-staged bounds/state for a native call that may enter a promoted silent
@@ -188,6 +204,12 @@ comptime {
     std.debug.assert(@offsetOf(NativeResult, "pushed_frames") == @offsetOf(NativeResult, "silent_last_cell") + @sizeOf(u64));
     // Doc 44 D12c: `popped_frames` appended after its push twin, same rule.
     std.debug.assert(@offsetOf(NativeResult, "popped_frames") == @offsetOf(NativeResult, "pushed_frames") + @sizeOf(u64));
+    // Doc 45 D6: the precise-exit quad is appended after the frame-motion
+    // counters, same append-only rule — nothing baked before it may move.
+    std.debug.assert(@offsetOf(NativeResult, "snapshot_id") == @offsetOf(NativeResult, "popped_frames") + @sizeOf(u64));
+    std.debug.assert(@offsetOf(NativeResult, "runtime_error") == @offsetOf(NativeResult, "snapshot_id") + @sizeOf(u32));
+    std.debug.assert(@offsetOf(NativeResult, "activation_base") == @offsetOf(NativeResult, "runtime_error") + @sizeOf(u32));
+    std.debug.assert(@offsetOf(NativeResult, "activation_depth") == @offsetOf(NativeResult, "activation_base") + @sizeOf(u32));
 }
 
 pub const SilentSummaryCell = extern struct {
@@ -430,6 +452,10 @@ pub const CompiledTrace = struct {
             .silent_last_cell = 0,
             .pushed_frames = 0,
             .popped_frames = 0,
+            .snapshot_id = 0,
+            .runtime_error = 0,
+            .activation_base = 0,
+            .activation_depth = 0,
         };
         if (self.trampoline_entry) |tramp| {
             const f: *const TrampolineFn = @ptrFromInt(tramp);
@@ -527,6 +553,10 @@ pub const CompiledTrace = struct {
             .silent_last_cell = result.silent_last_cell,
             .pushed_frames = result.pushed_frames,
             .popped_frames = result.popped_frames,
+            .snapshot_id = result.snapshot_id,
+            .runtime_error = result.runtime_error,
+            .activation_base = result.activation_base,
+            .activation_depth = result.activation_depth,
         };
     }
 
