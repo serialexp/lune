@@ -3825,8 +3825,9 @@ pub const Vm = struct {
             // entry-replay successor on a mid-body resume pc, D6's
             // mis-bucketed-fallthrough hazard). The ordinary receipt still
             // charges productivity/penalty so a thrashing precise anchor
-            // gates and tier-0 takes it back. Native never produces this
-            // reason yet (compileImpl declines precise), so `final == ct`.
+            // gates and tier-0 takes it back. `final == ct` holds for BOTH
+            // executors: a precise page never links/fuses, so a native
+            // exit's baked final id is always the entered trace's own.
             // Doc 45 D5: a precise effect shim raised a runtime error — the
             // executor restored the failing op's snapshot (pre-instruction
             // registers; the iteration's earlier committed effects stand,
@@ -3837,14 +3838,32 @@ pub const Vm = struct {
             // status to the guest error, and hand the raise directive up —
             // the consumer parks the error at the snapshot's pc without
             // re-executing the bytecode (execute-once, never an OOM retry).
+            // Doc 45 D6: the native executor produces both precise reasons
+            // now (per-snapshot materializers restored the window before the
+            // exit), so these arms validate rather than assume tier-1a.
             if (result.exit_reason == .precise_error) {
-                std.debug.assert(!ran_native and final == ct);
+                // Doc 45 D6: BOTH executors produce this reason now. A precise
+                // page never links/fuses (arm-side prohibitions), so the
+                // native final id must resolve to the entered trace itself,
+                // with a single terminal non-yielded ledger row whose kind
+                // agrees with the reason, and no silent/frame-motion state.
+                std.debug.assert(final == ct);
+                if (ran_native) {
+                    std.debug.assert(result.ledger_len == 1);
+                    std.debug.assert(result.silent_active == 0);
+                    std.debug.assert(result.pushed_frames == 0 and result.popped_frames == 0);
+                    std.debug.assert(self.trace.ledger_scratch[0].kind == .precise_error);
+                    std.debug.assert(self.trace.ledger_scratch[0].outcome == .normal);
+                    std.debug.assert(self.trace.ledger_scratch[0].id == result.final_trace_id);
+                    std.debug.assert(self.trace.ledger_scratch[0].exit == result.exit_instr);
+                }
                 std.debug.assert(ct.code.deopt_mode == .precise);
                 std.debug.assert(result.snapshot_id >= 1 and result.snapshot_id <= ct.code.snapshots.len);
                 std.debug.assert(result.activation_base == 0 and result.activation_depth == 0);
                 const snap = ct.code.snapshots[result.snapshot_id - 1];
                 std.debug.assert(snap.register_count == proto.num_registers);
                 std.debug.assert(snap.resume_pc < proto.code.len);
+                self.trace.dbg("precise-error raw: trace={d} native={} exit={d} snap={d} status={d}", .{ ct.id, ran_native, result.exit_instr, result.snapshot_id, result.runtime_error });
                 const err: Error = switch (@as(table_runtime.Status, @enumFromInt(result.runtime_error))) {
                     .out_of_memory => Error.OutOfMemory,
                     // `.ok` cannot reach here (the executor only sets
@@ -3859,7 +3878,18 @@ pub const Vm = struct {
                 return .{ .raise_at = .{ .pc = @intCast(snap.resume_pc), .err = err } };
             }
             if (result.exit_reason == .precise_resume) {
-                std.debug.assert(!ran_native and final == ct);
+                // Doc 45 D6: both executors — same validation grammar as the
+                // `.precise_error` arm above.
+                std.debug.assert(final == ct);
+                if (ran_native) {
+                    std.debug.assert(result.ledger_len == 1);
+                    std.debug.assert(result.silent_active == 0);
+                    std.debug.assert(result.pushed_frames == 0 and result.popped_frames == 0);
+                    std.debug.assert(self.trace.ledger_scratch[0].kind == .precise_deopt);
+                    std.debug.assert(self.trace.ledger_scratch[0].outcome == .normal);
+                    std.debug.assert(self.trace.ledger_scratch[0].id == result.final_trace_id);
+                    std.debug.assert(self.trace.ledger_scratch[0].exit == result.exit_instr);
+                }
                 std.debug.assert(ct.code.deopt_mode == .precise);
                 std.debug.assert(result.activation_base == 0 and result.activation_depth == 0);
                 // D6 dispatcher validation — internal invariant failures,
@@ -3927,8 +3957,21 @@ pub const Vm = struct {
             // next candidate (regs entry-coherent, so the sibling trial walk
             // stays sound). One-shot precise prologue exits took the head
             // zero-exit arm above — same entry contract, same soundness.
-            if (!ran_native and ct.code.deopt_mode == .precise) {
+            if (ct.code.deopt_mode == .precise) {
                 std.debug.assert(final == ct);
+                if (ran_native) {
+                    // Doc 45 D6: a NATIVE precise page's remaining exits are
+                    // the eager guard_gc's snap==0 exit (`.normal` through
+                    // the ordinary carried-home flush — iteration-entry
+                    // coherent, exactly this arm's contract, even after
+                    // completed iterations) and the hoisted-guard
+                    // `.prologue_fail` (pre-entry, regs untouched). Single
+                    // terminal non-yielded row, no silent/frame motion.
+                    std.debug.assert(result.exit_reason == .normal or result.exit_reason == .prologue_fail);
+                    std.debug.assert(result.ledger_len == 1);
+                    std.debug.assert(result.silent_active == 0);
+                    std.debug.assert(result.pushed_frames == 0 and result.popped_frames == 0);
+                }
                 self.trace.dbg("precise prologue-exit: trace={d} exit={d} completed={d}", .{ ct.id, result.exit_instr, local_done });
                 self.trace.onSideExitReceipt(ct, local_done, result.exit_instr, local_done, .deferred, .entered);
                 for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
@@ -6067,15 +6110,15 @@ pub const Vm = struct {
                     // malformed or future bytecode shape puts it at a
                     // back-edge pc.
                     if (ct.code.instrs.len != 0 and ct.code.instrs[ct.code.instrs.len - 1].op == .link) continue;
-                    // Doc 45 D6: PRECISE traces now execute on tier-1a (the
-                    // snapshot-restore executor consumes their exits in
-                    // `enterSelectedTrace`). Two standing declines remain:
-                    // exec-log sessions (handled inside `enterSelectedTrace`
-                    // — no serialization schema until D8's format bump) and
-                    // native mode (`compileImpl` bails on precise, so the
-                    // native safety net below skips them like any other
-                    // native-unsupported trace until the native precise
-                    // executor lands).
+                    // Doc 45 D6: PRECISE traces execute on tier-1a (the
+                    // snapshot-restore executor) and, since the native
+                    // precise executor landed, on tier-1b when `compileImpl`
+                    // accepts them. One standing decline remains: exec-log
+                    // sessions (handled inside `enterSelectedTrace` — no
+                    // serialization schema until D8's format bump). A
+                    // precise candidate whose native compile BAILED falls
+                    // through to tier-1a below instead of the
+                    // native-unsupported skip — see that arm.
                     // --- type fingerprint (step 5) ---
                     // Skip this trace if the current register types don't
                     // match its entry type guards.  Avoids trial entries that
@@ -6110,8 +6153,21 @@ pub const Vm = struct {
                     // then an O(1) `union` tag read forever (the supported
                     // path below re-reads the page).
                     if (self.trace.config.native_codegen and self.trace.nativeFor(ct) == null) {
-                        saw_native_unsupported = true;
-                        continue;
+                        // Doc 45 D6: a PRECISE candidate that failed native
+                        // compilation (unsupported ref shape, materializer
+                        // store budget, …) still ENTERS on tier-1a — the
+                        // precise executor there is the only one that can run
+                        // it, and skipping would orphan the trace forever
+                        // (its recording already consumed the anchor's
+                        // hot-count; nothing would ever re-record it). The
+                        // tier-1a-slower-than-tier-0 rationale behind the
+                        // skip is about entry-replay bodies tier-0 can
+                        // replay for free; a precise body records effects
+                        // tier-0 would re-execute from the anchor anyway.
+                        if (ct.code.deopt_mode != .precise) {
+                            saw_native_unsupported = true;
+                            continue;
+                        }
                     }
                     // Phase 0a (doc 20): the whole per-candidate entry +
                     // receipt grammar lives in `enterSelectedTrace`; this

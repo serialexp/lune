@@ -47,6 +47,33 @@ fn boxedPassThroughOnly(t: *const Trace, ref: usize) bool {
     return copied;
 }
 
+/// Doc 45 D6: true iff `ref` (a slot_load in a PRECISE trace) has no semantic
+/// use at all — no instruction operand reads it, no φ names it, no hidden
+/// reader (dyn-href root, ternary `aux` ref) touches it. Such a load exists
+/// only so full-window snapshots can reference a dead anchor slot; it is
+/// admitted as kind `.none` and every exit materializer skips it. The hidden-
+/// reader list mirrors `analyzeInner`'s liveness extensions — an op Pass B
+/// accepts while reading a ref invisible to BOTH `operandReads` and this list
+/// would be a soundness hole, so keep the two in lockstep.
+fn snapshotOnlyLoad(t: *const Trace, ref: usize) bool {
+    for (t.instrs, 0..) |ins, i| {
+        if (i == ref) continue;
+        const reads = operandReads(ins);
+        if ((reads.a and ins.a == ref) or (reads.b and ins.b == ref)) return false;
+        // A φ mentioning the ref anywhere (writeback `b`, internal init /
+        // steady association `a`) is a use.
+        if (ins.op == .phi and (ins.a == ref or ins.b == ref)) return false;
+        // href's operandReads is {false,false} (seeded-slab discipline), but a
+        // dynamically-rooted href DOES read its table root (`a`); count the
+        // key (`b`) too, conservatively.
+        if (ins.op == .href and (ins.a == ref or ins.b == ref)) return false;
+        // Ternary ops whose third ref rides `aux` (the analyzeInner list).
+        if ((ins.op == .ssub or ins.op == .scp or ins.op == .sfindp or ins.op == .smatch) and
+            ins.aux >= 0 and @as(usize, @intCast(ins.aux)) == ref) return false;
+    }
+    return true;
+}
+
 /// Forward type-proof over the linear SSA. Fills `kinds` (and `slot_of`, the
 /// register slot of each `slot_load`) and returns `true` iff every value is a
 /// proven supported value or a use-gated boxed pass-through.
@@ -320,6 +347,16 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                     // keeps payload and tag in their source slots; terminal
                     // writeback copies the complete boxed Value.
                     kinds[i] = .boxed;
+                } else if (t.deopt_mode == .precise and snapshotOnlyLoad(t, i)) {
+                    // Doc 45 D6: a PRECISE recording force-loads EVERY anchor-
+                    // window register so full-window snapshots have a ref —
+                    // including dead temporaries of arbitrary type. A load with
+                    // no semantic use at all is admitted as `.none`: no home,
+                    // no prologue check, nothing emitted; the exit
+                    // materializers skip it because its slab slot is untouched
+                    // by the native run (nothing writes it — that is exactly
+                    // what `snapshotOnlyLoad` proved), hence already current.
+                    kinds[i] = .none;
                 } else {
                     return false; // unguarded typed/inspected use → bail
                 }
@@ -727,8 +764,22 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             // to two loads of the baked heap counters + the gc_stress byte test.
             // `compileImpl` guaranteed `heap != null` for any trace containing it.
             .guard_gc => {
-                if (ins.aux <= 0) return false; // bound A is stamped positive
+                // Bound A is stamped positive by finalize — except a PRECISE
+                // body's eager guard_gc, which keeps aux == 0 when the body
+                // allocates nothing (doc 45 D4). Lower it with A = 0 rather
+                // than bail: the gc_stress arm must still exit identically to
+                // tier-1a, so it cannot be elided.
+                if (ins.aux < 0) return false;
+                if (ins.aux == 0 and t.deopt_mode != .precise) return false;
                 kinds[i] = .none;
+            },
+            // Doc 45 D6: precise-only table allocation — materializes the
+            // fresh `*Table`'s `*GcHeader` in a GP home (`.heap`, the snew
+            // producer discipline). Operand-free; fail closed outside a
+            // precise trace (never trust the IR — finalize traps tnew there).
+            .tnew => {
+                if (t.deopt_mode != .precise) return false;
+                kinds[i] = .heap;
             },
             // --- hash-part field path (H1) --------------------------------------
             // href: a value-cell pointer (`*Value`) for a constant string key into

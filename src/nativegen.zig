@@ -27,6 +27,7 @@ const table = @import("table.zig");
 const arr = @import("array.zig");
 const fmath = @import("fmath.zig");
 const gc = @import("gc.zig");
+const table_runtime = @import("table_runtime.zig");
 const stralloc = @import("stralloc.zig");
 const string_mod = @import("string.zig");
 const Value = value.Value;
@@ -158,12 +159,6 @@ pub fn compileInto(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace, 
 fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*McodeArena, seed_ctx: ?*const NativeSeedCtx, heap: ?*gc.Heap) ?CompiledTrace {
     if (comptime !is_x64_linux) return null;
 
-    // Doc 45 D2/D6: native lowering of PRECISE traces (per-guard snapshot
-    // flush + resume-pc exit ABI) is its own increment — until it lands, a
-    // precise trace bails to tier-1a rather than compile exits that would
-    // silently entry-replay past its snapshots.
-    if (t.deopt_mode == .precise) return null;
-
     const n = t.instrs.len;
     // Doc 24 D5 fail-closed: an allocating body (`guard_gc` / `tostr_*`) bakes
     // the heap's counter and `gc_stress` addresses (and hands the heap to the
@@ -174,6 +169,10 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
         for (t.instrs) |ins| {
             switch (ins.op) {
                 .guard_gc, .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower => return null,
+                // Doc 45 D6: tnew calls `Heap.newTable` — heap mandatory. (A
+                // precise body always carries the eager guard_gc too, so this
+                // row is belt on top of that suspender.)
+                .tnew => return null,
                 // Doc 30: the match/scratch class bakes `heap.match_scratch`
                 // addresses (scap_int) or passes the heap to the shims
                 // (smatch/sgmatch/scap_str). sfindp, str2num_* and sgm_setpos
@@ -189,6 +188,35 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     if (n == 0 or n > 0xFFFF) return null;
     const terminal = t.instrs[n - 1].op;
     if (terminal != .loop and terminal != .link and terminal != .terminal) return null;
+
+    // Doc 45 D6 acceptance checklist for PRECISE traces (codex point 1), all
+    // fail-closed — never trust the IR (`assertWellFormed` is compiled out in
+    // release): loop-anchor bodies only (final op exactly `.loop` — head/link
+    // closes are recorder-refused on precise and carry frame motion / patch
+    // machinery a precise exit must not), un-peeled (the materializers have no
+    // notion of the run-once/steady split), and a valid in-range one-based
+    // snapshot on every op that can take a precise exit. `tset` is reserved
+    // (finalize traps it); proveKinds rejects it below via its `else` arm.
+    if (t.deopt_mode == .precise) {
+        if (terminal != .loop) return null;
+        if (t.peeled) return null;
+        for (t.instrs, 0..) |ins, idx| {
+            if (ins.snap != 0) {
+                if (ins.snap > t.snapshots.len) return null;
+                const rec = t.snapshots[ins.snap - 1];
+                if (rec.slots_len != rec.register_count) return null; // v1: full window
+                if (@as(usize, rec.slots_begin) + rec.slots_len > t.snapshot_slots.len) return null;
+                for (t.snapshot_slots[rec.slots_begin..][0..rec.slots_len]) |ss| {
+                    if (ss.ref >= idx) return null; // refs strictly precede the exit
+                }
+            } else if (trace_ir.requiresPreciseSnapshot(ins.op)) {
+                // Every side-exit guard / fallible effect in a precise body
+                // carries a snapshot (finalize's rule; the entry prologue —
+                // slot_loads + the eager guard_gc — contains none of them).
+                return null;
+            }
+        }
+    }
 
     const kinds = gpa.alloc(Kind, n) catch return null;
     defer gpa.free(kinds);
@@ -560,6 +588,82 @@ const PatchEmission = struct {
     epilogue: x64.Label,
 };
 
+/// Doc 45 D6: deterministic per-trace budget on the TOTAL number of
+/// materializer stores (tag+payload pairs) across every precise exit
+/// materializer. Depends only on the trace's snapshots and slot classes —
+/// never on addresses or available memory — so the compile/bail decision is
+/// replay-stable. Each store is ≤ ~20 bytes of mcode, bounding the whole
+/// materializer region at ~20 KiB; a body that needs more bails to tier-1a
+/// (whose precise executor has no such limit).
+const PRECISE_FLUSH_STORE_MAX: u32 = 1024;
+
+/// Doc 45 D6: flush one snapshot's captured full window into the SoA
+/// register file (rdi = tags, rsi = payloads). Called only from a PRECISE
+/// exit materializer, where rax/rcx are dead scratch and every captured ref
+/// still holds its home (analyze extended snapshot-ref liveness through the
+/// exits). Skips, because the slab is already current there:
+///   * `.none` refs — snapshot-only dead-window loads (no home at all);
+///     sound ONLY restoring their own slab slot, anything else bails;
+///   * invariant own-entry refs — the destination's OWN entry `slot_load`
+///     when the slot class is `.invariant` (codex point 2: NEVER skip a
+///     `.carried` slot on ref identity — after the first back-edge its
+///     current value lives in the machine home while the slab is stale).
+/// Returns the number of stores emitted (the budget input). Fails closed on
+/// any ref shape it cannot materialize.
+fn emitPreciseSnapshotFlush(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, snap: u32) !u32 {
+    var stores: u32 = 0;
+    const rec = t.snapshots[snap - 1];
+    for (t.snapshot_slots[rec.slots_begin..][0..rec.slots_len]) |ss| {
+        const ref: usize = ss.ref;
+        const rins = t.instrs[ref];
+        const k = kinds[ref];
+        if (rins.op == .konst) {
+            // Compile-time Value: immediate tag byte + imm64 payload via rax
+            // (consts are trace-rooted; heap consts are stable *GcHeader
+            // bits under the non-moving GC — the sfindp pattern precedent).
+            const v = t.consts[@intCast(rins.aux)];
+            try a.movByteMemImm(.rdi, @as(i32, ss.slot), @intFromEnum(v.tag));
+            try a.movRegImm64(.rax, @bitCast(v.payload.bits));
+            try a.movMemReg(.rsi, @as(i32, ss.slot) * 8, .rax);
+            stores += 1;
+            continue;
+        }
+        if (rins.op == .slot_load) {
+            const sid = alloc.slot_id_of_ref[ref];
+            if (sid < 0) return error.Unsupported;
+            const s = alloc.slots[@intCast(sid)];
+            if (k == .none) {
+                // A `.none` load is only ever captured for its OWN slot.
+                if (s.slot != ss.slot) return error.Unsupported;
+                // Dead invariant slot: nothing writes it → slab current → skip.
+                if (s.class == .invariant) continue;
+                // WRITE-DOMINATED carried slot (analyze reclassified it to the
+                // store class): the pre-first-write snapshot value is the
+                // previous iteration's φ'd value, which lives in the HOME —
+                // the slab is stale after the first back-edge. Flush the home
+                // under the slot's pinned class.
+                std.debug.assert(s.class == .carried and s.kind != .none);
+                try flushSlot(a, @as(i32, ss.slot), s.kind, slotHomePlace(s));
+                stores += 1;
+                continue;
+            }
+            if (s.slot == ss.slot and s.class == .invariant) continue;
+        }
+        switch (k) {
+            .int, .bool, .float, .ptr, .heap, .func => try flushSlot(a, @as(i32, ss.slot), k, placeOfRef(alloc, ref)),
+            // `.native` is a raw *GcHeader exactly like `.func`; flushSlot's
+            // scalar else-arm would mis-tag it TAG_INT, so re-box it through
+            // the `.heap` (TAG_HEAP) path.
+            .native => try flushSlot(a, @as(i32, ss.slot), .heap, placeOfRef(alloc, ref)),
+            // Tokens (`.aref`/`.href`/...), `.boxed` (impossible in a `.loop`
+            // precise body) and non-load `.none` refs cannot be materialized.
+            else => return error.Unsupported,
+        }
+        stores += 1;
+    }
+    return stores;
+}
+
 /// Lower a proven trace to machine code (cut-2). ABI: rdi = tags base, rsi = payloads
 /// base (the SoA register file's two lanes), rdx = native result out-param, rbx =
 /// committed counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers
@@ -572,6 +676,28 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     const linked_loop_done_labels = try gpa.alloc(?x64.Label, t.instrs.len);
     defer gpa.free(linked_loop_done_labels);
     @memset(linked_loop_done_labels, null);
+
+    // Doc 45 D6: PRECISE exit machinery — one SHARED materializer per
+    // (snapshot, exit class) pair, created lazily by the per-instruction
+    // stubs (codex point 9). The resume family serves every guard exit whose
+    // snap names the record; the error family serves tnew failures (same
+    // flush, different terminal tail — the ledger kind is a per-site baked
+    // constant, so the tails cannot be merged behind a runtime branch).
+    const precise = t.deopt_mode == .precise;
+    var mat_resume: []?x64.Label = &.{};
+    var mat_err: []?x64.Label = &.{};
+    defer if (mat_resume.len > 0) gpa.free(mat_resume);
+    defer if (mat_err.len > 0) gpa.free(mat_err);
+    var precise_tail_resume: ?x64.Label = null;
+    var precise_tail_err: ?x64.Label = null;
+    if (precise) {
+        mat_resume = try gpa.alloc(?x64.Label, t.snapshots.len);
+        @memset(mat_resume, null);
+        mat_err = try gpa.alloc(?x64.Label, t.snapshots.len);
+        @memset(mat_err, null);
+        precise_tail_resume = try a.label();
+        precise_tail_err = try a.label();
+    }
 
     // Callee-saved registers we clobber — as a home OR as a transient — must be
     // preserved across the call. `used_callee_saved` already ORs both; iterate a fixed
@@ -689,6 +815,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     for (alloc.slots) |s| {
         if (s.class == .write_only) continue;
         if (s.kind == .boxed) continue; // arbitrary tag is copied at terminal
+        // Doc 45 D6: a snapshot-only dead-window load (`.none`) has no home,
+        // no type and no prologue check — the body never reads it and the
+        // exit materializers skip it (its slab slot stays current).
+        if (s.kind == .none) continue;
         const tag: u8 = switch (s.kind) {
             .ptr, .func, .native => TAG_HEAP, // all invariant heap pointers
             // A carried-heap slot enters holding a table (TAG_HEAP). Its table-type/
@@ -708,6 +838,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     try snapshotBoxedTags(a, t, kinds, alloc);
     for (alloc.slots) |s| {
         if (s.class == .write_only) continue;
+        if (s.kind == .none) continue; // doc 45 D6: no home to load into
         // payload lane: `payloads[slot]` at rsi+slot*8 (scale-8, free).
         const off: i32 = @as(i32, s.slot) * 8;
         switch (slotHomePlace(s)) {
@@ -1134,6 +1265,55 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&h.next_gc))));
                 try a.cmpRegMem(.rcx, .rax, 0);
                 try jccNativeExit(a, exit_labels, i, .ae);
+            },
+            // Doc 45 D6: precise-only table allocation. Calls the SAME
+            // noinline `table_runtime.tnew` shim tier-1a executes (one
+            // compiled body per process → cross-tier identity by
+            // construction). Save/restore bracket around the C call; the
+            // `**Table` out-param goes through the allocator-owned dedicated
+            // frame word (`alloc.tnew_out`, never the callout padding slot).
+            // A non-`.ok` Status routes through this instruction's exit
+            // label, whose PRECISE stub stores the status (still stashed in
+            // rcx — nothing between the `jcc` and the stub touches it) into
+            // `runtime_error` and enters the error materializer: snapshot
+            // restore + `.precise_error`, execute-once, never retried (D5).
+            .tnew => {
+                const h = heap.?; // compileImpl bailed heapless tnew bodies
+                std.debug.assert(alloc.callout_save_count != 0); // bodyCalloutOf reserved it
+                const out_disp: i32 = @as(i32, @intCast(alloc.tnew_out.?)) * 8;
+                try emitCalloutSave(a, alloc);
+                // SysV args: rdi = *Heap (stable for the VM's lifetime),
+                // rsi = &frame[tnew_out] — computed BEFORE the alignment
+                // bump so the displacement is frame-relative.
+                try a.movRegImm64(.rdi, @bitCast(@as(u64, @intFromPtr(h))));
+                try a.movRegReg(.rsi, .rsp);
+                try a.addRegImm32(.rsi, out_disp);
+                try a.subRegImm32(.rsp, 8);
+                try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&table_runtime.tnew))));
+                try a.callReg(.rax);
+                try a.addRegImm32(.rsp, 8);
+                // Stash the u32 Status (eax) in rcx BEFORE the restore
+                // (emitCalloutRestore deliberately never touches rax/rcx).
+                // `movzx` from al: the SysV upper 32 bits of rax are
+                // unspecified for a u32 return, and Status ordinals are
+                // pinned tiny (see the comptime assert below), so the byte
+                // zero-extend is exact where a 64-bit copy would not be.
+                comptime std.debug.assert(@intFromEnum(table_runtime.Status.ok) == 0 and
+                    @intFromEnum(table_runtime.Status.type_error) < 256);
+                try a.movzxRegReg8(.rcx, .rax);
+                try emitCalloutRestore(a, alloc);
+                try a.cmpRegImm32(.rcx, 0);
+                try jccNativeExit(a, exit_labels, i, .ne); // non-.ok → precise error stub
+                // Success: the fresh `*Table`'s `*GcHeader` from the frame
+                // word into the tnew's `.heap` home.
+                switch (placeOfRef(alloc, i)) {
+                    .reg => |r| try a.movRegMem(r, .rsp, out_disp),
+                    .mem => |d| {
+                        try a.movRegMem(.rax, .rsp, out_disp);
+                        try a.movMemReg(.rsp, d, .rax);
+                    },
+                    .xmm => unreachable, // .heap never homes in an XMM
+                }
             },
             // --- hash-part field path (H1) --------------------------------------
             // href: load the loop-invariant value-cell pointer (`*Value`) from its
@@ -2074,6 +2254,56 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
         if (maybe_l) |l| {
             a.bind(l);
             try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(ei));
+            // Doc 45 D6: PRECISE exits never stage slot dispatch, never open
+            // a patch window, never take the linked loop-done branch (codex
+            // points 6/7) — a precise exit is always terminal. Three shapes:
+            //   snap == 0  → the eager guard_gc's iteration-entry exit: the
+            //                ordinary carried-home flush (`deopt_exit`) with
+            //                reason `.normal` is exactly its contract — the
+            //                dispatcher's precise `.normal` prologue path
+            //                consumes it. Stage `shared_exit` DIRECTLY
+            //                (bypass slot[ei]; precise is never armed).
+            //   tnew       → stamp the snapshot id, then store the Status
+            //                (still stashed in rcx — the stub is entered
+            //                straight from the body's `jcc`) into
+            //                `runtime_error` (32-bit store: the adjacent
+            //                `activation_base` stays 0), enter the ERROR
+            //                materializer.
+            //   guard      → stamp the snapshot id, enter the RESUME
+            //                materializer.
+            if (precise) {
+                const pins = t.instrs[ei];
+                if (pins.snap == 0) {
+                    std.debug.assert(pins.op == .guard_gc);
+                    if (shared_exit) |se| {
+                        try a.movRegImm64(.rax, @bitCast(@as(u64, se)));
+                        try a.movMemReg(.rdx, @offsetOf(NativeResult, "exit_target"), .rax);
+                    }
+                    try a.jmp(deopt_exit);
+                } else if (pins.op == .tnew) {
+                    // ORDER MATTERS: `movMemImm32` is a QWORD store (C7 REX.W,
+                    // sign-extended) — its upper 4 bytes land on the adjacent
+                    // `runtime_error` dword. Stamp the snapshot id FIRST, then
+                    // overwrite the zeroed `runtime_error` with the Status.
+                    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "snapshot_id"), @intCast(pins.snap));
+                    try a.movMemReg32(.rdx, @offsetOf(NativeResult, "runtime_error"), .rcx);
+                    const ml = mat_err[pins.snap - 1] orelse blk: {
+                        const nl = try a.label();
+                        mat_err[pins.snap - 1] = nl;
+                        break :blk nl;
+                    };
+                    try a.jmp(ml);
+                } else {
+                    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "snapshot_id"), @intCast(pins.snap));
+                    const ml = mat_resume[pins.snap - 1] orelse blk: {
+                        const nl = try a.label();
+                        mat_resume[pins.snap - 1] = nl;
+                        break :blk nl;
+                    };
+                    try a.jmp(ml);
+                }
+                continue;
+            }
             if (isNumericForLoopDoneGuard(t, ei)) {
                 // [doc 30 §6 named coupling] Only emit the linked branch when the
                 // snapshot walk can commit EVERY sunk store below the guard — a
@@ -2174,6 +2404,42 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // hands off through slot[ei] (default `shared_exit`, armed → continuation).
             try emitReturn(a, frame, callee[0..callee_len], shared_exit, trace_id, slotAddr(slots, ei));
         }
+    }
+
+    // Doc 45 D6: PRECISE per-snapshot materializers + the two terminal tails.
+    // Each materializer flushes its snapshot's captured window into the SoA
+    // register file (skipping proven invariant-own-entry and dead `.none`
+    // slots — the slab is already current for those) and falls into its
+    // family's tail: completed = rbx, the reason stamp, the terminal ledger
+    // row, and a DIRECT return to shared_exit (no slot indirection — a
+    // precise exit is never a chain source). The store budget is checked
+    // against the emitted total: over budget → compile bail → tier-1a (the
+    // selection walk runs precise pages there since increment 4).
+    if (precise) {
+        var flush_stores: u32 = 0;
+        for (0..t.snapshots.len) |si| {
+            if (mat_resume[si]) |ml| {
+                a.bind(ml);
+                flush_stores += try emitPreciseSnapshotFlush(a, t, kinds, alloc, @intCast(si + 1));
+                try a.jmp(precise_tail_resume.?);
+            }
+            if (mat_err[si]) |ml| {
+                a.bind(ml);
+                flush_stores += try emitPreciseSnapshotFlush(a, t, kinds, alloc, @intCast(si + 1));
+                try a.jmp(precise_tail_err.?);
+            }
+        }
+        if (flush_stores > PRECISE_FLUSH_STORE_MAX) return error.PreciseFlushBudget;
+        a.bind(precise_tail_resume.?);
+        try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_reason"), @intFromEnum(trace_exec.ExitReason.precise_resume));
+        try emitLedgerAppend(a, trace_id, .precise_deopt);
+        try emitReturn(a, frame, callee[0..callee_len], shared_exit, trace_id, null);
+        a.bind(precise_tail_err.?);
+        try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_reason"), @intFromEnum(trace_exec.ExitReason.precise_error));
+        try emitLedgerAppend(a, trace_id, .precise_error);
+        try emitReturn(a, frame, callee[0..callee_len], shared_exit, trace_id, null);
     }
 
     // DEOPT_EXIT: the single snapshot flush. Write each carried home back to regs[]

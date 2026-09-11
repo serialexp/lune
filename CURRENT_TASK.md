@@ -21,6 +21,67 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-11 (latest+4) — doc 45 D6 NATIVE HALF LANDED (native precise executor)
+
+Precise traces now compile AND run natively (task #26; all 10 codex points
+implemented — see the plan record below for the point list):
+
+- **ABI** (nativegen_artifact, committed early as increment A, f527bff):
+  `NativeResult`/`ExecResult` tail quad `snapshot_id`/`runtime_error`/
+  `activation_base`/`activation_depth` (u32×4 after `popped_frames`,
+  comptime offset asserts — stubs bake the offsets as imm32). LedgerKinds
+  `precise_deopt = 10` / `precise_error = 11` (terminal, never chain source:
+  chain replay panics on them, `rowPatchKind → null`).
+- **compileImpl** (nativegen): precise decline → acceptance checklist (loop
+  anchor, terminal `.loop`, `!peeled`, `body_start == 0`, no frame motion,
+  valid full-window snapshot on every `requiresPreciseSnapshot` op, heap
+  mandatory — `.tnew` in the heapless refusal). proveKinds: `.tnew → .heap`,
+  `guard_gc aux == 0` allowed (precise), snapshot-only entry loads → kind
+  `.none` (no home/prologue check; write-dominated carried `.none` slots
+  reclassify to the STORE kind so `local t = {}` compiles). Regalloc
+  (nativegen_alloc): snapshot refs of exit-capable ops extend `last_use`
+  through their exits; `tnew` gets a dedicated out-param frame word +
+  membership in isTransient/bodyCalloutOf/calloutMayCollect(false)/
+  opMayExitInBody (blocks carried-home coalescing before the last body
+  exit → homes stable for materializer reads).
+- **Codegen**: `tnew` body callout (save/restore bracket; status stashed
+  rcx via `movzx` from al — SysV upper rax unspecified on u32 return,
+  Status < 256 comptime-pinned; new dword store `x64.movMemReg32`). Exit
+  stubs (precise branch, always `continue` — no slot dispatch, no patch
+  windows, no linked loop-done): snap==0 (eager guard_gc) → ordinary
+  carried-home flush, reason `.normal` (dispatcher precise prologue path);
+  tnew → stamp snapshot_id THEN store rcx into runtime_error (**order
+  matters: `movMemImm32` is a QWORD store — its upper 4 bytes zero the
+  adjacent dword; found via the OOM pipeline test panicking on status==0**);
+  guards → stamp snapshot_id. SHARED per-(snapshot, exit-class) inline
+  materializers flush the full window (konst → imm tag+payload; invariant
+  own-entry refs SKIP — the only legal skip, codex point 2; carried `.none`
+  loads flush the HOME, slab stale after first back-edge) into two tails:
+  completed=rbx → exit_reason → ledger row (kind matches reason) →
+  emitReturn. Store budget 1024 → `error.PreciseFlushBudget` bail.
+- **Selection + dispatch** (interp): the back-edge walk no longer skips
+  native-unsupported PRECISE candidates (budget/unsupported bail still runs
+  tier-1a — codex point 9's mandatory pairing). Both precise consumers
+  lift `!ran_native` and validate native rows: ledger_len==1, silent_active
+  ==0, pushed/popped==0, row kind agrees with reason, id/exit agree with
+  scalars; `.precise_error` decodes Status via exhaustive switch (.ok/
+  .type_error unreachable this slice). Precise `.normal` prologue arm now
+  accepts native (reason .normal/.prologue_fail, single row).
+- **Tests** (3 new, tier-1a twins with `native_codegen = is_x64_linux`):
+  native money identity (page compiles + ENTERS — `native_entries ≥ 1`
+  gated on x64 — output/next_obj_id/object_count byte-match tier-0,
+  loop-done rides the resume materializer, `precise_resumes ≥ 1`); native
+  mixed-body mid-loop element-guard resume at i==200 (exactly-once across
+  the native materializer); native pipeline OOM (K=150th guest allocation
+  fails inside the native callout: same error/heap/parked pc as tier-0,
+  `precise_errors == 1`).
+- Gates: `zig build test` (1316), `zig build wasm`, `just hashgate` (84 ×2)
+  all green. NOT yet run: `just bench` (btrees is the target — precise
+  pages previously never ran under `--jit-native`).
+- Not done (recorded): optional direct compileWithHeap self-framed unit
+  test; a budget-bail-runs-tier-1a witness test (the selection change is
+  exercised implicitly on non-x64 hosts / any compile bail).
+
 ## Status 2026-09-11 (latest+3) — doc 45 P2 slice 1 LANDED (tnew recording + tier-1a precise execution of allocating bodies)
 
 Construction now RECORDS and RUNS on tier-1a — the first real btrees lever

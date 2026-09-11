@@ -152,6 +152,15 @@ pub const Alloc = struct {
     // spilled operand or the callout's own saved rdx. Addressed `div_save*8`.
     div_save: ?u32 = null,
 
+    // --- tnew out-param word (doc 45 D6) ---
+    // The `table_runtime.tnew` callout writes its `**Table` result through a
+    // pointer. A DEDICATED allocator-owned frame word (codex: never the
+    // callout region's alignment-padding slot — that would alias the
+    // callout's own `sub rsp, 8` bracket). One word serves every tnew in the
+    // body: the out-param is strictly instruction-local. Addressed
+    // `tnew_out*8`; null when the trace allocates no tables.
+    tnew_out: ?u32 = null,
+
     pub fn deinit(self: *Alloc, gpa: std.mem.Allocator) void {
         gpa.free(self.loc);
         gpa.free(self.last_use);
@@ -240,6 +249,9 @@ pub fn isTransient(op: trace_ir.IrOp) bool {
         // flat cell index, gload the decoded int cell. gstore/the grid guards are
         // effects/value-less.
         .garow, .gcell, .gload => true,
+        // doc 45 D6: tnew materializes the fresh `*Table`'s `*GcHeader` in a
+        // GP home (kind `.heap`), like the snew producer class.
+        .tnew => true,
         else => false,
     };
 }
@@ -427,6 +439,28 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                 // terminal writeback copies the tag lane separately. It is never
                 // inspected or loop-carried (proveKinds gates both properties).
                 s.kind = .boxed;
+            } else if (lk == .none) {
+                // Doc 45 D6: WRITE-DOMINATED carried slot — the entry load is
+                // snapshot-only (`.none`: the body never reads it; it exists
+                // because a precise recording force-loads the whole window)
+                // while the φ writeback re-defines the slot every iteration
+                // (`local t = {}`). The home carries the STORE class, and the
+                // prologue tag-check pins the ENTRY value to that same class,
+                // which is what makes the pre-first-write snapshot flush
+                // byte-exact: re-boxing payload bits under the checked tag
+                // reproduces the entry Value verbatim (TAG_HEAP boxing is
+                // type-agnostic, so any heap object — table, string —
+                // round-trips; int/float likewise under their checked tag).
+                // An entry value of a different class refuses in the prologue
+                // → tier-1a, fail closed. `.bool` stays refused: the [RV-1]
+                // tag switch has no TAG_BOOL row for slot pins.
+                if (sk == .int or sk == .float or sk == .heap) {
+                    s.kind = sk;
+                } else if (sk == .ptr) {
+                    s.kind = .heap; // raw *GcHeader → TAG_HEAP boxing
+                } else {
+                    return error.Bail;
+                }
             } else {
                 // [RV-4 / review P0] The *load* class fixes the prologue tag-check and the
                 // home's register class. Outside the carried-heap and carried-string
@@ -759,6 +793,24 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             if (last_use[ar] < i) last_use[ar] = @intCast(i);
         }
     }
+    // Doc 45 D6 (codex point 1): PRECISE snapshot refs are read by the
+    // per-snapshot exit materializers, which `operandReads` cannot see.
+    // Extend every captured ref's liveness to each exit that can materialize
+    // it — BEFORE any allocation decision — or the flush would read a
+    // recycled register/spill. Only ops that can actually take a precise exit
+    // (`requiresPreciseSnapshot`: side-exit guards + tnew) extend; the snap a
+    // pure arithmetic op carries can never be materialized, so extending for
+    // it would only waste registers. Runs only on precise traces (no snap
+    // anywhere otherwise); refs were range-validated by compileImpl.
+    if (t.deopt_mode == .precise) {
+        for (t.instrs, 0..) |ins, i| {
+            if (ins.snap == 0 or !trace_ir.requiresPreciseSnapshot(ins.op)) continue;
+            const rec = t.snapshots[ins.snap - 1];
+            for (t.snapshot_slots[rec.slots_begin..][0..rec.slots_len]) |ss| {
+                if (last_use[ss.ref] < i) last_use[ss.ref] = @intCast(i);
+            }
+        }
+    }
 
     // --- allocation: pin slot homes, then linear-scan the transients ---
     const loc = try gpa.alloc(Loc, n);
@@ -784,6 +836,12 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
 
     for (slots.items) |*s| {
         if (s.class == .write_only) continue;
+        // Doc 45 D6: a snapshot-only load (kind `.none` — a dead anchor-window
+        // slot the precise recorder force-loaded so full-window snapshots have
+        // a ref) gets NO home: the body never reads it, the exit materializers
+        // SKIP it (its slab slot is untouched, so the slab is already
+        // current), and pinning a home would burn a register per dead slot.
+        if (s.kind == .none) continue;
         if (s.kind == .float) {
             // Float home: draw from the XMM pool, else a shared 8-byte spill cell.
             if (pickRegFrom(&free_xmm, &XMM_ALLOC_ORDER)) |r| {
@@ -802,10 +860,15 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             spill_count += 1;
         }
     }
-    // Resolve slot_load refs to their slot home.
+    // Resolve slot_load refs to their slot home. A `.none` (snapshot-only)
+    // slot has no home — its loc stays the value-less placeholder, and every
+    // consumer (there are none in the body; exit materializers skip it) must
+    // never read it.
     for (t.instrs, 0..) |ins, i| {
         if (ins.op != .slot_load) continue;
-        loc[i] = slots.items[@intCast(slot_id_of_ref[i])].home;
+        const s = slots.items[@intCast(slot_id_of_ref[i])];
+        if (s.kind == .none) continue;
+        loc[i] = s.home;
     }
 
     // --- computed homes (Phase E1/E2) ---
@@ -1278,6 +1341,18 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         }
     }
 
+    // --- tnew out-param word (doc 45 D6) ---
+    // Same discipline as div_save: reserved after the callout region, one
+    // dedicated word, never the padding slot (see the field doc on `Alloc`).
+    var tnew_out: ?u32 = null;
+    for (t.instrs) |ins| {
+        if (ins.op == .tnew) {
+            tnew_out = spill_count;
+            spill_count += 1;
+            break;
+        }
+    }
+
     return .{
         .loc = loc,
         .last_use = last_use,
@@ -1288,6 +1363,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         .callout_save_base = callout_save_base,
         .callout_save_count = callout_save_count,
         .div_save = div_save,
+        .tnew_out = tnew_out,
     };
 }
 
@@ -1449,6 +1525,8 @@ pub fn opMayExitInBody(
         .str2num_f,
         .sgm_setpos,
         .guard_sid,
+        // Doc 45 D6: tnew exits on a non-.ok Status (OOM → `.precise_error`).
+        .tnew,
         => true,
         // Doc 25: only the INT lane exits (a zero divisor side-exits so
         // tier-0 raises DivisionByZero; the (minInt, -1) pair is computed
@@ -1590,6 +1668,14 @@ pub const BodyCallout = enum {
     /// commit — one in-lane int-over-int cell write (no GC barrier needed);
     /// allocates nothing.
     sgm_setpos,
+    /// `table_runtime.tnew` (doc 45 D6): the precise-only table allocation.
+    /// **may_allocate = true** (exactly ONE `Heap.newTable` link per call —
+    /// budgeted by the eager `guard_gc`), **may_collect = false** (allocation
+    /// never collects in place; the single collect site stays tier-0's
+    /// dispatch prologue, and the heap is non-moving). Failure is NOT a
+    /// side-exit deopt: the emitter routes a non-`.ok` Status through the
+    /// precise-error stub (`.precise_error`, execute-once — never retried).
+    tnew,
 };
 
 /// The doc-22 capability, renamed for the doc-24 may_allocate/may_collect
@@ -1610,6 +1696,9 @@ pub fn calloutMayCollect(c: BodyCallout) bool {
         // `Vm.collect` — scapStr's intern merely ALLOCATES (≤1 link, budgeted
         // by guard_gc); the rest touch only host scratch / one table cell.
         .sfindp, .smatch, .sgmatch, .scap_str, .str2num, .sgm_setpos => false,
+        // Doc 45 D6: tnew allocates (≤1 link, guard_gc-budgeted) but never
+        // collects — see the enum row.
+        .tnew => false,
     };
 }
 
@@ -1651,6 +1740,8 @@ pub fn bodyCalloutOf(
         .scap_str => .scap_str,
         .str2num_i, .str2num_f => .str2num,
         .sgm_setpos => .sgm_setpos,
+        // Doc 45 D6: precise-only table allocation callout.
+        .tnew => .tnew,
         else => null,
     };
 }

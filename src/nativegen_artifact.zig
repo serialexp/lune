@@ -518,6 +518,15 @@ pub const CompiledTrace = struct {
                     (term_kind == .seed_hash_decline));
                 std.debug.assert((result.exit_reason == @intFromEnum(trace_exec.ExitReason.seed_capacity_decline)) ==
                     (term_kind == .seed_capacity_decline));
+                // Doc 45 D6: the precise reasons are likewise site-paired —
+                // each terminal tail stamps its reason then appends its own
+                // kind — and always carry a one-based snapshot id.
+                std.debug.assert((result.exit_reason == @intFromEnum(trace_exec.ExitReason.precise_resume)) ==
+                    (term_kind == .precise_deopt));
+                std.debug.assert((result.exit_reason == @intFromEnum(trace_exec.ExitReason.precise_error)) ==
+                    (term_kind == .precise_error));
+                if (term_kind == .precise_deopt or term_kind == .precise_error)
+                    std.debug.assert(result.snapshot_id >= 1);
             }
         }
         // 2.3c-2b: decode the per-transition ledger for the caller's replay. Only

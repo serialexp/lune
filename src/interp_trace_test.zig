@@ -6444,3 +6444,280 @@ test "recorder (precise deopt, doc 45 D8 interim): an exec-log session never pro
     const bytes = try traceser.encodeFile(gpa, codes);
     gpa.free(bytes);
 }
+
+test "executor (tnew native, doc 45 D6): the construction loop runs on the NATIVE page and loop-done rides the precise materializer" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    // The D3 money shape with `native_codegen` ON: the precise trace must
+    // compile to a native page (heap-armed `tnew` callout + inline snapshot
+    // materializers), enter it, allocate exactly once per iteration through
+    // the callout, and surface every clean completion as a `precise_resume`
+    // via the loop-done materializer — never the linked/ordinary machinery.
+    // Identity bar is the same as tier-1a: output, `next_obj_id`,
+    // `object_count` byte-match pure tier-0. On non-x64 hosts the selection
+    // change routes the same trace to tier-1a and the identity half still
+    // runs; the native-entry asserts are gated.
+    const source: [:0]const u8 =
+        \\local n = 0
+        \\for i = 1, 400 do
+        \\  local t = {}
+        \\  n = n + 1
+        \\end
+        \\print(n)
+    ;
+
+    // Tier-0 truth.
+    var truth: [64]u8 = undefined;
+    var truth_len: usize = 0;
+    var truth_next_id: u32 = 0;
+    var truth_obj_count: usize = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        truth_len = sink.buffered().len;
+        @memcpy(truth[0..truth_len], sink.buffered());
+        truth_next_id = vm.heap.next_obj_id;
+        truth_obj_count = vm.heap.object_count;
+    }
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = false;
+    vm.trace.config.native_codegen = @import("nativegen.zig").is_x64_linux;
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    try testing.expectEqualStrings(truth[0..truth_len], sink.buffered());
+    try testing.expectEqual(truth_next_id, vm.heap.next_obj_id);
+    try testing.expectEqual(truth_obj_count, vm.heap.object_count);
+
+    // The precise construction trace committed (same shape as the D3 test).
+    var money: ?*const trace.Trace = null;
+    for (vm.trace.registry.cache.items) |ct| {
+        for (ct.code.instrs) |ins| {
+            if (ins.op == .tnew) money = ct;
+        }
+    }
+    try testing.expect(money != null);
+    try testing.expectEqual(trace_snapshot.DeoptMode.precise, money.?.code.deopt_mode);
+    try testing.expect(vm.trace.precise_resumes >= 1);
+    // The payoff assertion: on x64 the page really COMPILED and ENTERED —
+    // a compileImpl bail here would silently demote to tier-1a and turn
+    // this into a duplicate of the D3 test.
+    if (@import("nativegen.zig").is_x64_linux)
+        try testing.expect(vm.trace.native_entries >= 1);
+}
+
+test "pipeline (tnew OOM native, doc 45 D6): a mid-execution heap OOM inside the native page raises identically to tier-0" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    const source: [:0]const u8 =
+        \\local n = 0
+        \\for i = 1, 400 do
+        \\  local t = {}
+        \\  n = n + 1
+        \\end
+        \\print(n)
+    ;
+
+    // Same failure schedule as the tier-1a pipeline twin: the K-th guest
+    // heap allocation fails. K = 150 lands mid-loop, long after the native
+    // page is compiled and entered (~iteration 10 at hotloop 4), so the
+    // `tnew` CALLOUT is what observes the null — the stub must preserve the
+    // shim's status across the register restore, run the error materializer,
+    // and hand tier-0 a byte-identical death (same error, same partial heap,
+    // same parked pc). JIT-side allocations never see the swap: the trace
+    // machinery holds its own copy of the VM allocator.
+    const FailNth = struct {
+        inner: std.mem.Allocator,
+        fail_at: usize,
+        count: usize = 0,
+        const VT = std.mem.Allocator.VTable{ .alloc = allocFn, .resize = resizeFn, .remap = remapFn, .free = freeFn };
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &VT };
+        }
+        fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            if (self.count == self.fail_at) return null;
+            return self.inner.vtable.alloc(self.inner.ptr, len, alignment, ret_addr);
+        }
+        fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.inner.vtable.resize(self.inner.ptr, memory, alignment, new_len, ret_addr);
+        }
+        fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.inner.vtable.remap(self.inner.ptr, memory, alignment, new_len, ret_addr);
+        }
+        fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.inner.vtable.free(self.inner.ptr, memory, alignment, ret_addr);
+        }
+    };
+    const K: usize = 150;
+
+    // Tier-0 truth under the same failure schedule.
+    var truth_next_id: u32 = 0;
+    var truth_obj_count: usize = 0;
+    var truth_parked_pc: usize = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        var failing = FailNth{ .inner = vm.heap.gpa, .fail_at = K };
+        vm.heap.gpa = failing.allocator();
+        try testing.expectError(interp.Error.OutOfMemory, vm.run(chunk.proto));
+        vm.heap.gpa = failing.inner;
+        try testing.expectEqual(@as(usize, 0), sink.buffered().len); // died pre-print
+        truth_next_id = vm.heap.next_obj_id;
+        truth_obj_count = vm.heap.object_count;
+        truth_parked_pc = vm.frames[0].pc;
+    }
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = false;
+    vm.trace.config.native_codegen = @import("nativegen.zig").is_x64_linux;
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    var failing = FailNth{ .inner = vm.heap.gpa, .fail_at = K };
+    vm.heap.gpa = failing.allocator();
+    try testing.expectError(interp.Error.OutOfMemory, vm.run(chunk.proto));
+    vm.heap.gpa = failing.inner;
+
+    try testing.expectEqual(@as(usize, 0), sink.buffered().len);
+    try testing.expectEqual(truth_next_id, vm.heap.next_obj_id);
+    try testing.expectEqual(truth_obj_count, vm.heap.object_count);
+    try testing.expectEqual(truth_parked_pc, vm.frames[0].pc);
+    // The OOM surfaced through the precise_error consumer exactly once, and
+    // on x64 the trace was executing NATIVELY when it did.
+    try testing.expectEqual(@as(u64, 1), vm.trace.precise_errors);
+    if (@import("nativegen.zig").is_x64_linux)
+        try testing.expect(vm.trace.native_entries >= 1);
+}
+
+test "executor (tnew mixed body native, doc 45 D6): a mid-loop element-guard exit restores through the native materializer exactly once" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    // The tier-1a mixed-body twin with `native_codegen` ON. At i == 200 the
+    // `a[i]` element guard fails MID-ITERATION on the native page — after
+    // this iteration's `tnew` callout AND the inline `a[1] = i` store
+    // already ran — and the guard's materializer must flush the FULL
+    // snapshot window (including the carried scalars and the freshly
+    // allocated table's slot) so tier-0 resumes at the load bytecode with
+    // nothing re-run and nothing lost. Exactly-once bar: `next_obj_id`,
+    // `a[1]`, and both printed sums byte-match pure tier-0.
+    const source: [:0]const u8 =
+        \\local a = {}
+        \\for i = 1, 300 do a[i] = i end
+        \\a[200] = 1.5
+        \\local s = 0
+        \\local n = 0
+        \\for i = 1, 300 do
+        \\  local t = {}
+        \\  a[1] = i
+        \\  s = s + a[i]
+        \\  n = n + 1
+        \\end
+        \\print(s)
+        \\print(n)
+        \\print(a[1])
+    ;
+
+    var truth: [64]u8 = undefined;
+    var truth_len: usize = 0;
+    var truth_next_id: u32 = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        truth_len = sink.buffered().len;
+        @memcpy(truth[0..truth_len], sink.buffered());
+        truth_next_id = vm.heap.next_obj_id;
+    }
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = false;
+    vm.trace.config.native_codegen = @import("nativegen.zig").is_x64_linux;
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    try testing.expectEqualStrings(truth[0..truth_len], sink.buffered());
+    try testing.expectEqual(truth_next_id, vm.heap.next_obj_id);
+    try testing.expect(vm.trace.precise_resumes >= 1);
+    if (@import("nativegen.zig").is_x64_linux)
+        try testing.expect(vm.trace.native_entries >= 1);
+}

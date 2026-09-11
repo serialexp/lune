@@ -272,6 +272,16 @@ pub const Assembler = struct {
         try self.modrmMem(dst.lo(), base, disp);
     }
 
+    /// `mov dword [base + disp], src32` — 89 /r without REX.W: store the low 32
+    /// bits of `src`. Doc 45 D6: the precise tnew-error stub stores the callout's
+    /// u32 `Status` into `NativeResult.runtime_error` without touching the
+    /// adjacent `activation_base` dword a 64-bit store would clobber.
+    pub fn movMemReg32(self: *Assembler, base: Reg, disp: i32, src: Reg) !void {
+        try self.rex(false, src.hi(), false, base.hi());
+        try self.b(0x89);
+        try self.modrmMem(src.lo(), base, disp);
+    }
+
     /// `mov [base + disp], src` — 89 /r (MOV r/m64, r64): reg = src, rm = mem.
     pub fn movMemReg(self: *Assembler, base: Reg, disp: i32, src: Reg) !void {
         try self.rex(true, src.hi(), false, base.hi());
