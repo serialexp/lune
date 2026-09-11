@@ -82,6 +82,57 @@ implemented — see the plan record below for the point list):
   test; a budget-bail-runs-tier-1a witness test (the selection change is
   exercised implicitly on non-x64 hosts / any compile bail).
 
+### D6.1 follow-up (f41d080) — btrees bench regression triaged + fixed (native safety net, one-shot flavor)
+
+`just bench --filter binary` after D6: **520ms jit vs 226 t0** (was 383/218
+on the 2026-09-10 board). Shadow-bisect (`just shadow`, `git archive <rev>
+src | tar -x` per point, `--jit-stats` at depth 12):
+
+- f77c30e (pre-doc-45): 449–455ms, 2.97M entries ALL native.
+- 4391ee0 (inc 2, needs_precise policy): 499ms, same 2.97M all-native.
+- 672280c (inc 3): 633ms, 4.30M entries — **1.32M NON-native** (tier-1a).
+  Unchanged through inc 4/slice 1/D6 (my D6 commit itself is neutral).
+- Mechanism: the needs_precise retry commits PRECISE traces at BottomUpTree
+  head/cont anchors where recording formerly aborted (`.new_table`); native
+  refuses non-loop precise (D6 checklist); the ONE-SHOT patched-entry path
+  (enterPatchedTrace) had NO native safety net (the loop back-edge walk has
+  had one for ages) → tier-1a per call, no amortization; HALF the entries
+  precise-resumed with completed=0 (full snapshot materialization for
+  nothing). Retirement never fired: zero-completion strikes interleave with
+  terminal completions, and one-shot patches accrue no strikes below
+  sibling capacity.
+- Fix (codex-reviewed, thread 01a08ed6-6901-7b53-b28d-49bee7231e10 —
+  verdict "A′": selection is the right layer; UNPATCHING rejected as a
+  blocker because maybeRepatchHead/Cont reinstall without a native check =
+  churn): under native_codegen, one-shot candidates with `nativeFor ==
+  null` are declined without entering (sibling walk still tries compiled
+  siblings); a full non-truncated all-declined unsteered walk memoizes
+  `EntryPatch.native_decline_gen = cache_gen` and opJFuncHead/opJCont then
+  fast-dispatch canonical tier-0 on one compare (any commit/retire bumps
+  cache_gen → re-walk). Patch stays installed. Loop anchors untouched
+  (budget-bail pairing, codex point 9 stands).
+- Result: 462ms, all entries native, traced c/it 344 vs tier-0 450.
+- **OPEN (next investigation candidate): 462 vs 383 pre-doc-45** — bisects
+  to inc 2's needs_precise policy reshaping the one-shot ORDINARY trace
+  population: post-fix per-anchor diff vs f77c30e shows
+  ItemCheck:4294967295 cont entries 159k→319k (2×), BottomUpTree:2147483665
+  head 720→656k entries, "other (non-loop)" +413M cycles (+94ms). Also
+  PRE-EXISTING (before doc 45, task #18 domain): 1.0M "head zero-exit
+  trace=2 native=true prologue_fail" per depth-12 run — a native head page
+  failing its prologue on 60%+ of entries is why jit (383) trailed t0 (218)
+  even before doc 45.
+- Codex-required tests not yet written (recorded): unsupported incumbent +
+  compiled sibling runs the sibling; cache-mutation invalidates the fast
+  decline; truncated walk sets no memo. The walk structurally guarantees
+  the first two (decline = `.next_candidate` continue; memo compares live
+  cache_gen); landed tests cover decline-end-to-end + memo arming +
+  tier-1a-mode preservation.
+- **Full board after D6.1** (20260911-141534-f41d080.tsv vs the 2026-09-10
+  f7717f0 board): every bench within noise (±6%) EXCEPT binary-trees
+  462 vs 383 (+20.8%, the open inc-2 population item above; was +36%
+  before D6.1). No collateral from the native precise executor or the
+  one-shot safety net anywhere on the board.
+
 ## Status 2026-09-11 (latest+3) — doc 45 P2 slice 1 LANDED (tnew recording + tier-1a precise execution of allocating bodies)
 
 Construction now RECORDS and RUNS on tier-1a — the first real btrees lever
