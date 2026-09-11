@@ -21,6 +21,62 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-11 (latest+6) — doc 45 D6.3 LANDED (task #28: seam-overhead repair)
+
+btrees 418.6→394.8ms (+3.1% residual vs the 383 pre-doc-45 reference; interleaved
+cycle A/Bs: 2.309G→~2.07G median vs base ~2.03G). Codex-reviewed design (thread
+01a08fbd-465c-7932-8b2f-ed719242e35c, verdict "A+ with amendments").
+
+- **Root cause (perf on the same-flavor plain-ReleaseFast A/B, /tmp/lune-base-27):**
+  NOT feature cost — an LLVM inlining flip. The doc-45 D6 code growth pushed
+  `runWithLinkedLoopDone` out of the inline budget at `enterSelectedTrace`
+  (base: inlined, no wrapper frame in the stacks; head: out-of-line call).
+  The wrapper symbol barely grew (0x393→0x3b5) — only the inline DECISION
+  changed, and out of line the ~1.3KB `NativeResult` stack init (hot: a single
+  zmm zero store at 38% of wrapper self) + `ExecResult` marshal can't be
+  scalarized/DSE'd per call site. Combined seam 20.9%→31.9% of wall (+~250M
+  cycles at ~3M native entries). Second symbol: `drainProvenanceArms` fell out
+  of budget too — jit-debug shows ZERO scan activity (gate settles), so its
+  1.99%/46M cycles were pure out-of-line call overhead on an immediately-
+  returning gate at every dispatcher safe point.
+- **Fix (doc 45 D6.3):** (1) FORCED inline on both levels — the four public
+  run wrappers AND the inner `runWithLinkedLoopDone` (inner-only would move
+  the call boundary to the ~1KB public wrappers — codex amendment); (2) both
+  drains split into `inline` gates + `noinline` slow bodies
+  (`drainProvenanceArmsScan` / `drainPendingBridgeArmSlow`) so no future
+  cost-model change can rebuild either regression; (3) latent hazard fixed
+  now (codex: "fix in this arc"): a precise provenance endpoint tripped
+  "parent not compiled → deferred" — a PERMANENT condition (D6.1 precise
+  traces never compile; `armNativeLink` refuses precise links) charged to the
+  transient flag, i.e. a full edge-list rescan at every safe point forever
+  once A1′'s precise-parent/ordinary-sibling same-anchor pairs acquire edges.
+  Precise-endpoint edges now DELETE (both orientations, before `parent.native`,
+  no compile-on-demand) — same family as the peeled/unsupported exclusions.
+- **Artifact-level verification:** wrapper standalone symbol GONE from the
+  binary; `drainProvenanceArmsScan` call inside `enterSelectedTrace` is
+  branch-guarded (settled path never calls out); `.text` +67KB vs pre-doc-45
+  (spans the whole doc-45 arc, not this change alone).
+- **A/B discipline:** the fresh board showed fib +7.6%/euler14 +5.3% —
+  interleaved per-bench cycle A/Bs against a same-tree shadow restored to the
+  committed state (`/tmp/lune-t28-prev`, nm-verified no new symbol) proved
+  both were BOARD NOISE: fib neutral-to-better (prev 970.7M / new 965.7M
+  median), euler14 −7.8%, btrees −7.1%. Never judge this change off one
+  board row; the interleaved shadow A/B is the instrument.
+- **`--jit-stats` counters byte-identical to D6.2** (entries 2,974,482
+  all-native, pushes 1,918,915, pops 159,869, ret-cont arms=1 hits=159,819,
+  call-head arms=2 hits=1,313,044).
+- **Tests/gates:** precise-endpoint edge-deletion test (both orientations;
+  one drain → edges gone, flags settled, nothing armed, all four traces
+  still `.unattempted`); unit gate, jit-debug test build, hashgate 84×2 all
+  green. Board: bench/results/20260911-182803-2ceac02.tsv.
+- **OPEN (remaining btrees residual ~+3%):** likely genuine doc-45 seam cost
+  (4 extra ABI fields staged/marshaled per native call + wider dispatcher
+  decode) and/or the pre-existing 1.0M per-run "head zero-exit prologue_fail"
+  entries (task #18 domain). No longer an inlining artifact. Next campaign
+  arc should re-profile from the top (btrees 10.3× vs LuaJIT is still the
+  worst gap after nbody 22.9×/fft 20.8×/sparse 21.7×/spectral 19.6× — all
+  doc-44/nest-coverage domain).
+
 ## Status 2026-09-11 (latest+5) — doc 45 D6.2 LANDED (task #27: one-shot population repair, B1′ + A1′)
 
 btrees 462→418.6ms; the inc-2 population regression is FIXED with the full
