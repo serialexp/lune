@@ -387,7 +387,7 @@ pub const CompiledTrace = struct {
     /// count plus the failing IR instruction when native can identify it. The two
     /// lanes are passed as the SysV first two args (rdi=tags, rsi=payloads); the
     /// result pointer is the third (rdx), reserved out of the allocator pools.
-    pub fn run(self: CompiledTrace, regs: RegWindow) trace_exec.ExecResult {
+    pub inline fn run(self: CompiledTrace, regs: RegWindow) trace_exec.ExecResult {
         return self.runWithLinkedLoopDone(regs, false, null, .{});
     }
 
@@ -395,7 +395,7 @@ pub const CompiledTrace = struct {
     /// the final iteration's post-guard stores and phi snapshot before returning,
     /// so the native nested-loop chainer can jump to the `.link` continuation
     /// without tier-0 replay.
-    pub fn runLinkedLoopDone(self: CompiledTrace, regs: RegWindow) trace_exec.ExecResult {
+    pub inline fn runLinkedLoopDone(self: CompiledTrace, regs: RegWindow) trace_exec.ExecResult {
         return self.runWithLinkedLoopDone(regs, true, null, .{});
     }
 
@@ -406,7 +406,7 @@ pub const CompiledTrace = struct {
     /// entries (the native append is bounds-guarded at that cap). The borrow is
     /// consumed immediately by the caller's replay — no native call / resize / nested
     /// replay may intervene between this capture and its consumption.
-    pub fn runCapturingLedger(self: CompiledTrace, regs: RegWindow, ledger_out: []trace_exec.LedgerEntry, silent: SilentStaging) trace_exec.ExecResult {
+    pub inline fn runCapturingLedger(self: CompiledTrace, regs: RegWindow, ledger_out: []trace_exec.LedgerEntry, silent: SilentStaging) trace_exec.ExecResult {
         return self.runWithLinkedLoopDone(regs, false, ledger_out, silent);
     }
 
@@ -419,11 +419,21 @@ pub const CompiledTrace = struct {
     /// replay, corrupting the coherent resume — so capture MUST preserve the mode. Same
     /// borrow contract as `runCapturingLedger`: `ledger_out` holds `LEDGER_CAP` entries
     /// and is consumed immediately, with no intervening native call.
-    pub fn runLinkedLoopDoneCapturing(self: CompiledTrace, regs: RegWindow, ledger_out: []trace_exec.LedgerEntry, silent: SilentStaging) trace_exec.ExecResult {
+    pub inline fn runLinkedLoopDoneCapturing(self: CompiledTrace, regs: RegWindow, ledger_out: []trace_exec.LedgerEntry, silent: SilentStaging) trace_exec.ExecResult {
         return self.runWithLinkedLoopDone(regs, true, ledger_out, silent);
     }
 
-    fn runWithLinkedLoopDone(self: CompiledTrace, regs: RegWindow, linked_loop_done: bool, ledger_out: ?[]trace_exec.LedgerEntry, silent: SilentStaging) trace_exec.ExecResult {
+    /// Task #28 (doc 45 seam overhead): this wrapper and the four public
+    /// entries above are FORCED inline. The ~1.3KB `NativeResult` stack init
+    /// and the `ExecResult` marshal are only cheap when LLVM can scalarize
+    /// and dead-store-eliminate them per call site (constant `linked_loop_done`
+    /// / `ledger_out` / `silent` at every caller); when the doc-45 D6 code
+    /// growth pushed this out of the cost model's inline budget at the
+    /// dispatcher's hottest call site, the out-of-line copy alone cost ~250M
+    /// cycles per binary-trees run (~+9% wall). Both levels must stay inline:
+    /// forcing only the inner fn would just move the call boundary to the
+    /// ~1KB public wrappers.
+    inline fn runWithLinkedLoopDone(self: CompiledTrace, regs: RegWindow, linked_loop_done: bool, ledger_out: ?[]trace_exec.LedgerEntry, silent: SilentStaging) trace_exec.ExecResult {
         var result = NativeResult{
             .completed = 0,
             .exit_instr = std.math.maxInt(u32),

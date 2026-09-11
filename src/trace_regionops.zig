@@ -665,7 +665,15 @@ pub fn maybeArmCompositeExit(self: *TraceState, t: *Trace, exit_instr: u32, safe
 /// never run MID-ledger — it could erase the armed provenance later
 /// `.region_bridge` rows validate against — so the ledger drivers call this
 /// immediately after `replayLedger` returns, before acting on its directive.
-pub fn drainPendingBridgeArm(self: *TraceState, safe_to_arm: bool) void {
+pub inline fn drainPendingBridgeArm(self: *TraceState, safe_to_arm: bool) void {
+    // Task #28: the gate is inline (a single null check at every ledger-driver
+    // safe point); the consumer stays out of line so a cost-model change can
+    // never drag the arm pipeline into the hot dispatcher path.
+    if (self.pending_bridge_arm == null) return;
+    drainPendingBridgeArmSlow(self, safe_to_arm);
+}
+
+noinline fn drainPendingBridgeArmSlow(self: *TraceState, safe_to_arm: bool) void {
     const key = self.pending_bridge_arm orelse return;
     self.pending_bridge_arm = null;
     const t = self.traceById(key.trace_id) orelse return;
@@ -675,7 +683,7 @@ pub fn drainPendingBridgeArm(self: *TraceState, safe_to_arm: bool) void {
 /// B-2b: republish disposable physical sibling arms from persistent hotexit
 /// provenance. Called only at dispatcher/runtime safe points. Observation
 /// windows retain the logical edges and retry when arming becomes safe again.
-pub fn drainProvenanceArms(self: *TraceState, safe_to_arm: bool) void {
+pub inline fn drainProvenanceArms(self: *TraceState, safe_to_arm: bool) void {
     if (self.provenance_edges.items.len == 0) return;
     if (!safe_to_arm) return;
     // Event-driven gate: the drain runs at every dispatcher safe point, so
@@ -691,6 +699,16 @@ pub fn drainProvenanceArms(self: *TraceState, safe_to_arm: bool) void {
         if (!self.provenance_arms_episode_pending) return;
         if (self.liveEpisodeProto() == self.provenance_drain_episode) return;
     }
+    // Task #28: the gate above is FORCED inline (at ~3M dispatcher safe
+    // points per binary-trees run, even an out-of-line call to an
+    // immediately-returning gate cost ~46M cycles once code growth pushed
+    // this function out of LLVM's inline budget); the scan below is FORCED
+    // out of line so the same cost model can never inline the cold
+    // edge-walk machinery back into the dispatcher hot path.
+    drainProvenanceArmsScan(self);
+}
+
+noinline fn drainProvenanceArmsScan(self: *TraceState) void {
     var deferred = false;
     var episode_deferred = false;
     var i = self.provenance_edges.items.len;
@@ -705,6 +723,22 @@ pub fn drainProvenanceArms(self: *TraceState, safe_to_arm: bool) void {
             _ = self.provenance_edges.swapRemove(i);
             continue;
         };
+        // Doc 45 / task #28: a precise endpoint is PERMANENT for the edge —
+        // `deopt_mode` is immutable on a committed trace and `armNativeLink`
+        // categorically refuses links into or out of precise traces, so the
+        // publish below could never succeed. Charging that to the transient
+        // `deferred` flag (a precise parent is native-declined, so it trips
+        // the "parent not compiled" arm forever) would re-scan the full edge
+        // list at every dispatcher safe point — the same failure family as
+        // the peeled exclusion below. Delete the edge. BEFORE the
+        // `parent.native` inspection, and with no compile-on-demand: precise
+        // traces are excluded from the chain selectors and burst grammar, so
+        // nothing needs the child page this edge would have compiled.
+        if (parent.code.deopt_mode == .precise or child.code.deopt_mode == .precise) {
+            self.dbg("provenance-drain: t={d} ei={d} decline: precise endpoint (edge deleted)", .{ edge.parent_id, edge.exit_instr });
+            _ = self.provenance_edges.swapRemove(i);
+            continue;
+        }
         const compiled = switch (parent.native) {
             .compiled => |*c| c,
             else => {

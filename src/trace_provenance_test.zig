@@ -274,6 +274,82 @@ test "B-2b provenance drain arms compiled children, deletes unsupported edges, p
     try testing.expectEqual(child.id, state.provenance_edges.items[0].child_id);
 }
 
+test "provenance drain (task #28): a precise endpoint deletes the edge permanently, in both orientations" {
+    // Doc 45 D6.1 makes precise traces permanently native-declined, and the
+    // task-27 A1' probe creates precise-parent + ordinary-sibling pairs at
+    // the SAME anchor — exactly the edge shape the drain requires. Before
+    // this fix, a precise parent tripped the "parent not compiled" arm and
+    // charged a PERMANENT condition to the transient `deferred` flag: the
+    // full edge list re-scanned at every dispatcher safe point, forever
+    // (the same failure family as the peeled/unsupported exclusions).
+    // `armNativeLink` categorically refuses links touching a precise trace,
+    // so the only correct disposition is deletion — with no compile-on-
+    // demand attempt (nothing in the chain machinery can enter the page).
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.registry.cache.clearRetainingCapacity();
+
+    const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "provenance-precise", .num_registers = 1 };
+    var precise_parent: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 4 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .deopt_mode = .precise,
+        },
+        .id = 101,
+    };
+    var ordinary_child: Trace = .{ .code = .{
+        .anchor = precise_parent.code.anchor,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    }, .id = 102 };
+    var ordinary_parent: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 8 },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 103,
+    };
+    var precise_child: Trace = .{ .code = .{
+        .anchor = ordinary_parent.code.anchor,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .deopt_mode = .precise,
+    }, .id = 104 };
+    try state.registry.cache.append(gpa, &precise_parent);
+    try state.registry.cache.append(gpa, &ordinary_child);
+    try state.registry.cache.append(gpa, &ordinary_parent);
+    try state.registry.cache.append(gpa, &precise_child);
+    try state.provenance_edges.append(gpa, .{ .parent_id = precise_parent.id, .exit_instr = 0, .child_id = ordinary_child.id });
+    try state.provenance_edges.append(gpa, .{ .parent_id = ordinary_parent.id, .exit_instr = 0, .child_id = precise_child.id });
+    state.provenance_arms_pending = true; // finishSideTraceProvenance sets this on append
+
+    // ONE safe drain: both edges deleted (not deferred), both pending flags
+    // settle, nothing armed, and no compilation attempt was induced on any
+    // endpoint (all four traces stay `.unattempted` — the precise check
+    // sits BEFORE both the `parent.native` inspection and the `nativeFor`
+    // compile-on-demand probe).
+    state.drainProvenanceArms(true);
+    try testing.expectEqual(@as(usize, 0), state.provenance_edges.items.len);
+    try testing.expect(!state.provenance_arms_pending);
+    try testing.expect(!state.provenance_arms_episode_pending);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
+    for ([_]*Trace{ &precise_parent, &ordinary_child, &ordinary_parent, &precise_child }) |t| {
+        try testing.expect(t.native == .unattempted);
+    }
+}
+
 test "B-2b region low-yield condemnation deletes only the owner provenance" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
