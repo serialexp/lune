@@ -89,7 +89,18 @@ pub const PendingCallAnchor = struct {
     /// The activation stamp from `pushFrame` — pins the pending to exactly
     /// the frame that went hot.
     call_seq: u64,
+    /// A1' (doc 45 / task 27): this pending is an ordinary-probe request at a
+    /// precise-occupied anchor — `arm()` suppresses the precise memo seed and
+    /// the recording's `.needs_precise` aborts strike normally.
+    force_ordinary: bool = false,
 };
+/// A1' (doc 45 / task 27): per-anchor value of `precise_anchor_memo`. The
+/// entry's EXISTENCE is the doc 45 D2 "record precise here" policy;
+/// `ordinary_probe` additionally requests one ordinary-probe recording so a
+/// precise-occupied ONE-SHOT anchor can grow a native-runnable ordinary
+/// sibling (set at precise one-shot commit, consumed/kept by the patched
+/// entry walk, cleared on ordinary commit / gate-barred / population cap).
+pub const PreciseAnchorMemo = struct { ordinary_probe: bool = false };
 /// Doc 44 D12b: a hot post-call resume pc waiting for the dispatch prologue
 /// to arm a `.cont` recording at the CALLER's frozen cursor. Set by
 /// `onRetResume` (the `opRet` funnel), consumed by `maybeStartCont`.
@@ -102,6 +113,8 @@ pub const PendingRetAnchor = struct {
     /// The activation stamp from `pushFrame` — pins the pending to exactly
     /// the caller activation the hot return resumed.
     call_seq: u64,
+    /// A1' (doc 45 / task 27): ordinary-probe request — see PendingCallAnchor.
+    force_ordinary: bool = false,
 };
 pub const isHeadAnchorPc = trace_code.isHeadAnchorPc;
 pub const AnchorPcKind = trace_code.AnchorPcKind;
@@ -1095,7 +1108,13 @@ pub const TraceState = struct {
     /// never keyed by addresses, so it replays byte-identically. Grows
     /// monotonically like `upvalue_mutable_memo` (lexical loop shape),
     /// bounded by the number of distinct constructing anchors.
-    precise_anchor_memo: std.AutoHashMapUnmanaged(AnchorKey, void) = .empty,
+    precise_anchor_memo: std.AutoHashMapUnmanaged(AnchorKey, PreciseAnchorMemo) = .empty,
+    /// A1' (task 27): number of anchors whose memo currently has
+    /// `ordinary_probe` set. Steady-state fast reject for the patched-entry
+    /// probe check (`ordinaryProbeNeeded`): one branch on this counter
+    /// instead of a hashmap probe per one-shot entry. Maintained ONLY by
+    /// `setOrdinaryProbe`/`clearOrdinaryProbe`.
+    ordinary_probe_count: u32 = 0,
     /// Re-entry penalty per anchor: a low-yield trace entry bumps it, a
     /// productive one clears it (doc 31 D2); at `config.max_penalty` the anchor
     /// is gated off with a doubling cooldown (`onSideExit` → `gateAnchor`).
@@ -1721,14 +1740,13 @@ pub const TraceState = struct {
     /// selected and entered `child`. The armed target is therefore the trace the
     /// deterministic dispatch ran — `hit_count` never enters the contract.
     pub fn noteRetContTransition(self: *TraceState, owner: *Trace, resume_pc: u32) void {
-        if (self.pending_ret_cont_arm != null) return;
         var free: ?usize = null;
         for (&owner.ret_cont_watch_pcs, 0..) |*pc, i| {
             if (pc.* == resume_pc) {
                 owner.ret_cont_watch_counts[i] +|= 1;
                 if (owner.ret_cont_watch_counts[i] >= self.config.hotguard) {
                     owner.ret_cont_watch_counts[i] = 0;
-                    self.pending_ret_cont_arm = .{ .trace_id = owner.id, .exit_instr = resume_pc };
+                    self.fileRetContArm(owner, resume_pc);
                 }
                 return;
             }
@@ -1743,7 +1761,26 @@ pub const TraceState = struct {
         owner.ret_cont_watch_pcs[i] = resume_pc;
         owner.ret_cont_watch_counts[i] = 1;
         if (self.config.hotguard == 1)
-            self.pending_ret_cont_arm = .{ .trace_id = owner.id, .exit_instr = resume_pc };
+            self.fileRetContArm(owner, resume_pc);
+    }
+
+    /// B1' (task 27): install-or-displace the single pending ret-cont arm
+    /// request. Per-owner-per-pc watches accumulate INDEPENDENTLY of the slot
+    /// (no early return above), so an owner that re-crosses `hotguard` while
+    /// a stale request under a DIFFERENT key occupies the slot displaces it —
+    /// one unsatisfiable request can no longer starve the system. Same-key
+    /// re-crossings are no-ops (the request is already filed).
+    fn fileRetContArm(self: *TraceState, owner: *Trace, resume_pc: u32) void {
+        const req: ExitKey = .{ .trace_id = owner.id, .exit_instr = resume_pc };
+        if (self.pending_ret_cont_arm) |cur| {
+            if (cur.trace_id != req.trace_id or cur.exit_instr != req.exit_instr) {
+                self.pending_ret_cont_arm = req;
+                self.dbg("ret-cont arm request DISPLACED: old t={d} ei={d} -> parent t={d} resume={d}", .{ cur.trace_id, cur.exit_instr, owner.id, resume_pc });
+            }
+        } else {
+            self.pending_ret_cont_arm = req;
+            self.dbg("ret-cont arm request: parent t={d} resume={d}", .{ owner.id, resume_pc });
+        }
     }
 
     pub fn tryArmFrameLinks(self: *TraceState, child: *Trace, safe_to_arm: bool) void {
@@ -1763,8 +1800,9 @@ pub const TraceState = struct {
             if (self.traceById(key.trace_id)) |parent| {
                 if (child.code.anchor.proto == parent.code.anchor.proto and anchorKind(child.code.anchor.pc) == .head) {
                     self.pending_call_head_arm = null;
-                    if (self.armNativeLink(parent, key.exit_instr, child, .call_head) catch false)
+                    if (self.armNativeLink(parent, key.exit_instr, child, .call_head) catch false) {
                         self.call_head_link_arms +|= 1;
+                    } else self.dbg("call-head arm FAILED: parent t={d} exit={d} child t={d}", .{ parent.id, key.exit_instr, child.id });
                 }
             } else self.pending_call_head_arm = null;
         }
@@ -2881,6 +2919,21 @@ pub const TraceState = struct {
         return self.isGated(anchor) or self.isRecordGated(anchor);
     }
 
+    /// A1' (task 27): PERMANENT-only variant of `recordingBarred` — true only
+    /// once either gate has abandoned the anchor for good (`strikes >=
+    /// max_strikes`), never during a transient cooldown window. The
+    /// ordinary-probe policy rides cooldowns (retries resume when the window
+    /// elapses) and resolves as hopeless only on abandonment.
+    pub fn recordingAbandoned(self: *const TraceState, anchor: AnchorKey) bool {
+        if (self.gate.get(anchor)) |g| {
+            if (g.strikes >= self.config.max_strikes) return true;
+        }
+        if (self.record_gate.get(anchor)) |g| {
+            if (g.strikes >= self.config.max_strikes) return true;
+        }
+        return false;
+    }
+
     /// Shared escalation arithmetic for both gate maps: start (or double) the
     /// cooldown window and bump the strike count. The next eligibility is
     /// `retry_at` = current global `tick` + window; the window then doubles
@@ -3290,7 +3343,7 @@ pub const TraceState = struct {
         self.pending_ret_anchor = null; // consume-or-discard, never linger
         if (pending.proto != proto or pending.resume_pc != pc or pending.call_seq != call_seq or pending.base != base) return false;
         if (self.rec.active) return false;
-        self.arm(proto, contAnchorPc(pc));
+        self.armWithPolicy(proto, contAnchorPc(pc), pending.force_ordinary);
         if (!self.rec.active) return false; // reset OOM-declined
         self.rec.kind = .cont;
         self.rec.anchor_abs_base = pending.base;
@@ -3307,7 +3360,7 @@ pub const TraceState = struct {
         self.pending_call_anchor = null; // consume-or-discard, never linger
         if (pc != 0 or pending.proto != proto or pending.call_seq != call_seq or pending.base != base) return false;
         if (self.rec.active) return false;
-        self.arm(proto, FUNC_HEAD_PC);
+        self.armWithPolicy(proto, FUNC_HEAD_PC, pending.force_ordinary);
         if (!self.rec.active) return false; // reset OOM-declined
         self.rec.kind = .head;
         self.rec.anchor_abs_base = pending.base;
@@ -3315,6 +3368,10 @@ pub const TraceState = struct {
     }
 
     fn arm(self: *TraceState, proto: *const Proto, target_pc: u32) void {
+        self.armWithPolicy(proto, target_pc, false);
+    }
+
+    fn armWithPolicy(self: *TraceState, proto: *const Proto, target_pc: u32, force_ordinary: bool) void {
         self.rec.reset(self.gpa, .{ .proto = proto, .pc = target_pc }, proto.num_registers) catch return;
         // Doc 43 §3.1 (P0a): seed the anchor's absolute slab base for the open-cell
         // aliasing check. `reset` zeroes it; the dispatch loop stashed `st.base`
@@ -3332,7 +3389,13 @@ pub const TraceState = struct {
         // iteration's spurious close, so emitting anything now would close an
         // empty-body trace. The recorder emits the prologue lazily at its first
         // body `recordInstr` instead (`beginPrecise` / `precise_prologue_done`).
-        self.rec.precise = self.precise_anchor_memo.contains(.{ .proto = proto, .pc = target_pc });
+        // A1' (task 27): an ordinary-probe recording SUPPRESSES the memo seed
+        // (that is its whole point — record the construction-free path as an
+        // ordinary sibling next to the precise incumbent); the memo itself is
+        // never mutated here.
+        self.rec.force_ordinary = force_ordinary;
+        self.rec.precise = !force_ordinary and
+            self.precise_anchor_memo.contains(.{ .proto = proto, .pc = target_pc });
     }
 
     /// Abandon the in-flight recording: deactivate, remember why, and gate the
@@ -3394,7 +3457,14 @@ pub const TraceState = struct {
             // to the ordinary gate strike and the anchor stays tier-0 for the
             // session. `record_exec_log` is set once at session setup, so
             // this is a deterministic pure function of config.
-            if (self.config.record_exec_log) {
+            //
+            // A1' (task 27): an ordinary-PROBE session hitting construction is
+            // the probe's expected failure mode, not new evidence — it takes
+            // the ordinary gate strike below (bounded retries via the record
+            // gate; strikes eventually bar the anchor and the walk clears the
+            // probe flag). The memo is NOT touched and NO precise re-record is
+            // armed: the anchor already has its precise trace.
+            if (self.config.record_exec_log or notice.force_ordinary) {
                 // fall through to the ordinary strike below
             } else if (self.precise_anchor_memo.getOrPut(self.gpa, notice.anchor)) |gop| {
                 // FIRST memoization only: an anchor already in the memo means
@@ -3404,6 +3474,7 @@ pub const TraceState = struct {
                 // through to the ordinary gate strike instead (fail-closed,
                 // never a livelock).
                 if (!gop.found_existing) {
+                    gop.value_ptr.* = .{}; // A1': fresh memo, no probe requested yet
                     const threshold = switch (anchorKind(notice.anchor.pc)) {
                         .loop => self.config.hotloop,
                         .head, .cont => self.config.hotcall,
@@ -3530,6 +3601,44 @@ pub const TraceState = struct {
     /// When `config.optimize`, the trace optimizer (`tropt.zig`) rewrites the IR
     /// first; an optimizer OOM falls back to caching the *unoptimized* trace
     /// (correct, just slower) rather than failing the commit.
+    // ------------------------------------------------------------------
+    // A1' (doc 45 / task 27): ordinary-probe policy at precise-occupied
+    // one-shot anchors. The flag lives in `precise_anchor_memo`'s value;
+    // `ordinary_probe_count` keeps the steady-state check one branch.
+    // ------------------------------------------------------------------
+
+    pub fn ordinaryProbeNeeded(self: *const TraceState, anchor: AnchorKey) bool {
+        if (self.ordinary_probe_count == 0) return false;
+        const memo = self.precise_anchor_memo.get(anchor) orelse return false;
+        return memo.ordinary_probe;
+    }
+
+    fn setOrdinaryProbe(self: *TraceState, anchor: AnchorKey) void {
+        const memo = self.precise_anchor_memo.getPtr(anchor) orelse return;
+        if (memo.ordinary_probe) return;
+        memo.ordinary_probe = true;
+        self.ordinary_probe_count += 1;
+        self.dbg("ordinary-probe set: anchor pc={d}", .{anchor.pc});
+    }
+
+    pub fn clearOrdinaryProbe(self: *TraceState, anchor: AnchorKey) void {
+        const memo = self.precise_anchor_memo.getPtr(anchor) orelse return;
+        if (!memo.ordinary_probe) return;
+        memo.ordinary_probe = false;
+        self.ordinary_probe_count -= 1;
+        self.dbg("ordinary-probe cleared: anchor pc={d}", .{anchor.pc});
+    }
+
+    /// Does the anchor already hold a non-precise (ordinary) trace? Same scan
+    /// as `countTracesAt`, filtered on deopt mode.
+    fn hasOrdinaryTraceAt(self: *const TraceState, anchor: AnchorKey) bool {
+        for (self.registry.cache.items) |t| {
+            if (t.code.anchor.proto == anchor.proto and t.code.anchor.pc == anchor.pc and
+                t.code.deopt_mode != .precise) return true;
+        }
+        return false;
+    }
+
     fn commit(self: *TraceState) !void {
         var candidate = try self.rec.finalize();
         defer candidate.deinit(self.gpa);
@@ -3577,6 +3686,27 @@ pub const TraceState = struct {
         if (self.config.execute and anchorKind(t.code.anchor.pc) != .loop) {
             self.registry.entry_registry.markInstallPending(t);
             self.drainEntryPatchWork();
+        }
+        // A1' (doc 45 / task 27): one-shot anchor population policy.
+        // A PRECISE commit requests exactly one ordinary-probe recording
+        // (unless an ordinary sibling already exists or the anchor is full) so
+        // the anchor can also grow a native-runnable ordinary trace — without
+        // this, a precise incumbent permanently claims the anchor: sibling
+        // recording only triggers on hot exits of ENTERED traces, and under
+        // native mode a declined precise trace never enters (binary-trees lost
+        // its whole BottomUpTree descent this way). An ORDINARY one-shot
+        // commit resolves any outstanding probe. Mode-independent by design
+        // (codex 01a08f8d): the probe fires in tier-1a-only runs too, so the
+        // trace population never depends on backend capability.
+        if (anchorKind(t.code.anchor.pc) != .loop) {
+            const anchor = t.code.anchor;
+            if (t.code.deopt_mode == .precise) {
+                if (!self.hasOrdinaryTraceAt(anchor) and
+                    self.countTracesAt(anchor) < self.config.max_traces_per_anchor)
+                    self.setOrdinaryProbe(anchor);
+            } else {
+                self.clearOrdinaryProbe(anchor);
+            }
         }
     }
 

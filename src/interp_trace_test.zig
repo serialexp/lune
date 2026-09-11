@@ -5744,7 +5744,7 @@ test "recorder (precise deopt, doc 45 D2): a pre-seeded precise loop commits a f
     // loop precise. (Robust against the exact back-edge-target pc encoding.)
     var pc: u32 = 0;
     while (pc < chunk.proto.code.len) : (pc += 1)
-        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pc }, {});
+        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pc }, .{});
 
     _ = try vm.run(chunk.proto);
 
@@ -5851,7 +5851,7 @@ test "executor (precise deopt, doc 45 D6): a mid-body guard failure precise-resu
     try testing.expect(!diags.hasErrors());
     var pc: u32 = 0;
     while (pc < chunk.proto.code.len) : (pc += 1)
-        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pc }, {});
+        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pc }, .{});
 
     _ = try vm.run(chunk.proto);
 
@@ -5905,7 +5905,7 @@ test "executor (precise deopt, doc 45 D6): the snapshot restore writes mid-itera
     try testing.expect(!diags.hasErrors());
     var pc: u32 = 0;
     while (pc < chunk.proto.code.len) : (pc += 1)
-        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pc }, {});
+        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pc }, .{});
     _ = try vm.run(chunk.proto);
 
     try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
@@ -6116,7 +6116,7 @@ test "executor (tnew OOM, doc 45 D5): a one-shot allocation failure exits precis
     try testing.expect(!diags.hasErrors());
     var pcs: u32 = 0;
     while (pcs < chunk.proto.code.len) : (pcs += 1)
-        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pcs }, {});
+        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pcs }, .{});
     _ = try vm.run(chunk.proto);
 
     try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
@@ -6797,6 +6797,13 @@ test "selection (one-shot precise, doc 45 D6.1): under native mode an unsupporte
     // Straight-line calls only: the shared `mk` HEAD anchor heats (hotcall
     // 4), while every call site's cont resume pc is distinct and stays cold.
     vm.trace.config.hotcall = 4;
+    // A1' (task 27): the precise commit requests an ordinary probe; `mk`
+    // constructs on EVERY path, so the forced attempt aborts with a strike.
+    // In a straight-line program the back-edge tick never advances, so gate
+    // cooldowns cannot elapse — one strike must be PERMANENT abandonment for
+    // the probe to resolve (clearing it re-opens the D6.1 decline memo this
+    // test asserts). This also exercises the probe's stop-at-the-gate path.
+    vm.trace.config.max_strikes = 1;
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
@@ -6813,6 +6820,9 @@ test "selection (one-shot precise, doc 45 D6.1): under native mode an unsupporte
             precise_head = ct;
     }
     try testing.expect(precise_head != null);
+    // A1': the probe resolved (aborted attempt -> permanent gate -> cleared),
+    // so no anchor still requests an ordinary probe.
+    try testing.expectEqual(@as(u32, 0), vm.trace.ordinary_probe_count);
     if (@import("nativegen.zig").is_x64_linux) {
         // The decline: NOTHING ever entered — no native page exists for a
         // non-loop precise trace, and tier-1a must not be substituted.
@@ -6874,5 +6884,186 @@ test "selection (one-shot precise, doc 45 D6.1): tier-1a mode still enters the s
     // No memo in tier-1a mode: the decline path never ran.
     for (vm.trace.registry.entry_registry.entry_patches.items) |p| {
         try testing.expectEqual(@as(u32, 0), p.native_decline_gen);
+    }
+}
+
+// A1' (doc 45 / task 27): mini binary-trees — leaf path constructs, descent
+// path is clean. The first hot recording lands on a construction path and
+// goes precise; the probe then grows an ORDINARY sibling from a clean path.
+const A1_BTREE_SOURCE: [:0]const u8 =
+    \\local function build(d)
+    \\  if d > 0 then
+    \\    local l = build(d - 1)
+    \\    local r = build(d - 1)
+    \\    return l + r
+    \\  else
+    \\    local t = {}
+    \\    return 1
+    \\  end
+    \\end
+    \\local total = 0
+    \\for i = 1, 6 do
+    \\  total = total + build(4)
+    \\end
+    \\print(total)
+;
+
+fn a1Truth(gpa: std.mem.Allocator, out: *[64]u8) !usize {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, A1_BTREE_SOURCE, &diags);
+    defer tree.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, A1_BTREE_SOURCE, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    const len = sink.buffered().len;
+    @memcpy(out[0..len], sink.buffered());
+    return len;
+}
+
+fn a1RunAndAssertPopulation(gpa: std.mem.Allocator, native: bool) !void {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    var truth: [64]u8 = undefined;
+    const truth_len = try a1Truth(gpa, &truth);
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, A1_BTREE_SOURCE, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = false;
+    vm.trace.config.native_codegen = native;
+    vm.trace.config.hotcall = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, A1_BTREE_SOURCE, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    try testing.expectEqualStrings(truth[0..truth_len], sink.buffered());
+    // Vacuity: a precise ONE-SHOT trace committed somewhere (the leaf-path
+    // construction forced needs_precise at a head/cont anchor)...
+    var precise_anchor: ?trace.AnchorKey = null;
+    for (vm.trace.registry.cache.items) |ct| {
+        if (ct.code.deopt_mode == .precise and trace.anchorKind(ct.code.anchor.pc) != .loop)
+            precise_anchor = ct.code.anchor;
+    }
+    try testing.expect(precise_anchor != null);
+    // ...and the probe grew an ORDINARY sibling at that SAME anchor: without
+    // A1' a precise incumbent permanently claims the anchor (sibling
+    // recording only triggers on hot exits of entered traces).
+    var ordinary_sibling = false;
+    for (vm.trace.registry.cache.items) |ct| {
+        if (ct.code.anchor.proto == precise_anchor.?.proto and
+            ct.code.anchor.pc == precise_anchor.?.pc and
+            ct.code.deopt_mode != .precise) ordinary_sibling = true;
+    }
+    try testing.expect(ordinary_sibling);
+    // The probe resolved on the ordinary commit — no outstanding requests.
+    try testing.expectEqual(@as(u32, 0), vm.trace.ordinary_probe_count);
+}
+
+test "population (ordinary probe, A1' task 27): a precise one-shot anchor grows an ordinary sibling — native mode" {
+    // On non-x64 hosts native_codegen stays inert, making this the tier-1a
+    // twin below — still a valid population assertion, just not distinct.
+    try a1RunAndAssertPopulation(testing.allocator, @import("nativegen.zig").is_x64_linux);
+}
+
+test "population (ordinary probe, A1' task 27): tier-1a mode produces the SAME ordinary sibling (mode-independent population)" {
+    try a1RunAndAssertPopulation(testing.allocator, false);
+}
+
+// B1' (task 27): X constructs on EVERY path — its head anchor goes
+// precise-only and (under native) is declined, never entered. X's cont pages
+// are clean, commit natively, and file call-head arm requests wanting an X
+// head child that can never arrive: a permanently unsatisfiable request.
+// Pre-B1' that request froze the single global pending slot and starved
+// EVERY proto's frame links (binary-trees lost ItemCheck's links to
+// BottomUpTree's poisoned anchor). Y (clean fib) must still arm.
+const B1_STARVE_SOURCE: [:0]const u8 =
+    \\local function xr(d)
+    \\  local t = { d }
+    \\  if d > 0 then
+    \\    return xr(d - 1) + xr(d - 2) + t[1]
+    \\  end
+    \\  return 0
+    \\end
+    \\local function fib(n)
+    \\  if n < 2 then return n end
+    \\  return fib(n - 1) + fib(n - 2)
+    \\end
+    \\local acc = 0
+    \\for i = 1, 30 do
+    \\  acc = acc + xr(6) + fib(12)
+    \\end
+    \\print(acc)
+;
+
+test "frame-link liveness (B1' task 27): an unsatisfiable call-head request cannot starve another proto's arms" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    // Tier-0 truth.
+    var truth: [64]u8 = undefined;
+    var truth_len: usize = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, B1_STARVE_SOURCE, &diags);
+        defer tree.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, B1_STARVE_SOURCE, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        truth_len = sink.buffered().len;
+        @memcpy(truth[0..truth_len], sink.buffered());
+    }
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, B1_STARVE_SOURCE, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = false;
+    vm.trace.config.native_codegen = @import("nativegen.zig").is_x64_linux;
+    vm.trace.config.hotcall = 4;
+    vm.trace.config.hotguard = 2;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, B1_STARVE_SOURCE, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    try testing.expectEqualStrings(truth[0..truth_len], sink.buffered());
+    if (@import("nativegen.zig").is_x64_linux) {
+        // The clean recursion's frame links armed despite the poisoned
+        // anchor's stale request (displacement, B1'). Pre-B1' this is 0.
+        try testing.expect(vm.trace.call_head_link_arms >= 1);
     }
 }

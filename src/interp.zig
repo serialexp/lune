@@ -3229,11 +3229,28 @@ pub const Vm = struct {
                         @panic("pushed descent: final call_push owner is not cont");
                     ts.onSideExitReceipt(owner, 1, row.exit, 1, .deferred, .entered);
                     // A cap cut followed an already armed slot, not a miss.
-                    if (row.outcome == .normal and ts.pending_call_head_arm == null) {
+                    // B1' (task 27 / codex 01a08f8d): the per-owner watch keeps
+                    // accumulating even while the single pending slot is
+                    // occupied — an owner that independently re-crosses
+                    // `hotguard` DISPLACES a stale request under a different
+                    // key. Without this, one unsatisfiable request (e.g. a
+                    // precise-declined head anchor that can never supply the
+                    // child) starves every other proto's frame links forever.
+                    if (row.outcome == .normal) {
                         owner.call_head_watch_count +|= 1;
                         if (owner.call_head_watch_count >= ts.config.hotguard) {
                             owner.call_head_watch_count = 0;
-                            ts.pending_call_head_arm = .{ .trace_id = owner.id, .exit_instr = row.exit };
+                            const req: trace.ExitKey = .{ .trace_id = owner.id, .exit_instr = row.exit };
+                            if (ts.pending_call_head_arm) |cur| {
+                                if (cur.trace_id != req.trace_id or cur.exit_instr != req.exit_instr) {
+                                    ts.pending_call_head_arm = req;
+                                    ts.dbg("call-head arm request DISPLACED: old t={d} ei={d} -> parent t={d} anchor={d} exit={d}", .{ cur.trace_id, cur.exit_instr, owner.id, owner.code.anchor.pc, row.exit });
+                                }
+                                // Same key re-crossing: request already filed.
+                            } else {
+                                ts.pending_call_head_arm = req;
+                                ts.dbg("call-head arm request: parent t={d} anchor={d} exit={d}", .{ owner.id, owner.code.anchor.pc, row.exit });
+                            }
                         }
                     }
                     return .{ .resume_frame_motion = 0 };
@@ -4463,6 +4480,53 @@ pub const Vm = struct {
                     self.trace.head_walk_fail = pdf.exit;
             }
         }
+        // A1' (doc 45 / task 27, codex 01a08f8d): ordinary-probe consumer.
+        // BEFORE the native-decline check and before attempting the (possibly
+        // precise) incumbent — so the probe fires at the same deterministic
+        // entry in native AND tier-1a modes and the population stays
+        // mode-independent. The steady-state cost is one branch
+        // (`ordinary_probe_count == 0`). Transfer rules mirror the head-want
+        // transfer below: never while a recording or another pending is in
+        // flight; a gate-barred or population-full anchor resolves the probe
+        // as hopeless instead (which re-opens the D6.1 decline memo).
+        if (one_shot and self.trace.ordinaryProbeNeeded(.{ .proto = proto, .pc = anchor_pc })) {
+            const akey = trace.AnchorKey{ .proto = proto, .pc = anchor_pc };
+            if (self.trace.recordingAbandoned(akey) or
+                self.trace.countTracesAt(akey) >= self.trace.config.max_traces_per_anchor)
+            {
+                // PERMANENT resolution only — a transient strike cooldown
+                // skips the transfer below (recordingBarred) but keeps the
+                // probe alive for a retry once the window elapses.
+                self.trace.clearOrdinaryProbe(akey);
+            } else if (!self.trace.isRecording() and !self.trace.recordingBarred(akey) and
+                self.trace.pending_call_anchor == null and
+                self.trace.pending_ret_anchor == null)
+            {
+                // The flag is NOT cleared here: it survives an aborted probe
+                // (retries bounded by the record gate) and resolves only on
+                // ordinary commit / barred / full. Nothing below ran yet — no
+                // dead traces, no patch mutation — so returning directly is
+                // safe (§R6-1 order untouched).
+                self.trace.dbg("ordinary-probe transfer: arming forced-ordinary recording at anchor pc={d}", .{anchor_pc});
+                if (is_head) {
+                    self.trace.pending_call_anchor = .{
+                        .proto = proto,
+                        .base = base,
+                        .call_seq = self.frames[self.depth - 1].call_seq,
+                        .force_ordinary = true,
+                    };
+                } else {
+                    self.trace.pending_ret_anchor = .{
+                        .proto = proto,
+                        .resume_pc = trace.entryPc(anchor_pc),
+                        .base = base,
+                        .call_seq = self.frames[self.depth - 1].call_seq,
+                        .force_ordinary = true,
+                    };
+                }
+                return .{ .switch_mode_at = pc };
+            }
+        }
         // Doc 45 D6.1 (native safety net, one-shot flavor — codex-reviewed):
         // under `--jit-native`, a one-shot candidate that cannot run natively
         // (`nativeFor == null`, e.g. a precise trace — the native acceptance
@@ -4605,8 +4669,14 @@ pub const Vm = struct {
         // walk). The patch itself stays installed: unpatching would churn
         // through `maybeRepatchHead`/`maybeRepatchCont`, which reinstall
         // without a native-support check.
+        // A1' guard: while an ordinary probe is outstanding at this anchor
+        // (transfer conditions above didn't hold this entry — e.g. a recording
+        // was in flight), the memo must NOT arm: the fast path would bypass
+        // this walk and the probe could never fire again. The probe resolves
+        // (commit / barred / full) in bounded time, re-opening the memo.
         if (patch.live and all_nonnative_declines and !walk_truncated and
-            directive == .next_candidate)
+            directive == .next_candidate and
+            !self.trace.ordinaryProbeNeeded(.{ .proto = proto, .pc = anchor_pc }))
         {
             patch.native_decline_gen = self.trace.registry.cache_gen;
             self.trace.dbg("one-shot native-decline memo: anchor pc={d} gen={d}", .{ anchor_pc, patch.native_decline_gen });

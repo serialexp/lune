@@ -1843,6 +1843,11 @@ pub fn clearCache(self: *TraceState) void {
     self.pending_exit_anchor = null;
     self.pending_replay_anchor = null;
     self.pending_replay_src = null;
+    // B1' (task 27): frame-link arm requests are trace-id-keyed; ids are
+    // monotonic across epochs (so a stale key can only resolve to null), but
+    // a cleared cache must not carry cross-epoch arm policy either way.
+    self.pending_ret_cont_arm = null;
+    self.pending_call_head_arm = null;
 
     // Trace-index-keyed and `*Proto`-borrowing diagnostic state — unsafe to retain
     // across the boundary (docs/design/17 H-2 part 3):

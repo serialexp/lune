@@ -432,7 +432,7 @@ pub const RecordingSession = struct {
     /// The recorder keys alias classes and the snapshot-read set on its address
     /// and inspects `loc` for the open/closed split.
     pub const InstructionContext = struct { heap: ?*const gc.Heap = null, inner_root: bool = false, unroll_while: bool = false, upval_open: ?usize = null, globals_header: ?*const object.GcHeader = null, upval_cell: ?*function.Upvalue = null };
-    pub const AbortNotice = struct { reason: AbortReason, anchor: AnchorKey, kind: TraceKind, unrolled_while: bool, pc: u32, op: OpCode, ir_len: u32 };
+    pub const AbortNotice = struct { reason: AbortReason, anchor: AnchorKey, kind: TraceKind, unrolled_while: bool, pc: u32, op: OpCode, ir_len: u32, force_ordinary: bool };
     pub const PeelNotice = union(enum) { enter: struct { anchor_pc: u32, marker: usize }, close: struct { anchor_pc: u32, begin: usize, end: usize } };
     pub fn takePeelNotice(self: *RecordingSession) ?PeelNotice {
         const notice = self.peel_notice;
@@ -728,6 +728,16 @@ pub const RecordingSession = struct {
     /// in precise mode from the first instruction. Per-anchor policy, never
     /// a retroactive mid-candidate promotion.
     precise: bool = false,
+    /// A1' (doc 45 / task 27): this recording is an ORDINARY PROBE at a
+    /// precise-occupied one-shot anchor — the `precise_anchor_memo` seed is
+    /// suppressed (arm() leaves `precise` false) and `.needs_precise` aborts
+    /// take a normal gate strike instead of the cancel-and-retry path (the
+    /// abort consumer reads this off the AbortNotice). The probe commits
+    /// only when recording lands on a construction-free path (e.g. the
+    /// recursive-descent side of a body whose leaf side allocates), giving
+    /// the anchor a native-runnable ordinary sibling next to its precise
+    /// incumbent.
+    force_ordinary: bool = false,
     /// Doc 45 D2 capture state (precise recordings only). `snap_builder` is
     /// the allocator-injected reusable accumulator (reset between recordings,
     /// no per-iteration allocation); `snap_scratch` is the bounded full-window
@@ -746,7 +756,7 @@ pub const RecordingSession = struct {
 
     pub fn abort(self: *RecordingSession, reason: AbortReason) void {
         if (!self.active) return;
-        self.abort_notice = .{ .reason = reason, .anchor = self.anchor, .kind = self.kind, .unrolled_while = self.unrolled_while, .pc = self.cur_pc, .op = self.cur_op, .ir_len = @intCast(self.instrs.items.len) };
+        self.abort_notice = .{ .reason = reason, .anchor = self.anchor, .kind = self.kind, .unrolled_while = self.unrolled_while, .pc = self.cur_pc, .op = self.cur_op, .ir_len = @intCast(self.instrs.items.len), .force_ordinary = self.force_ordinary };
         self.abort_reason = reason;
         self.active = false;
         self.multret_top = null;
@@ -4920,6 +4930,7 @@ pub const RecordingSession = struct {
         self.snapshot_read_cells.clearRetainingCapacity();
         self.route_upvalue_reads = false; // doc 43 P5: arm() seeds the anchor memo after reset
         self.precise = false; // doc 45 D2: arm() seeds the anchor memo after reset
+        self.force_ordinary = false; // A1' (task 27): arm() sets it from the pending's policy
         self.cur_snap = 0; // doc 45 D2: no boundary exists until the first precise bytecode
         self.precise_prologue_done = false; // doc 45 D2: prologue emitted at first body instr
         self.pending_stores.clearRetainingCapacity();

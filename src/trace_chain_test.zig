@@ -1004,3 +1004,55 @@ test "driveChain ir_numeric_for_done: a longer candidate cannot invalidate the c
 
     state.registry.cache.clearRetainingCapacity();
 }
+
+test "noteRetContTransition (B1', task 27): a hot owner displaces a stale request under a different key" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    state.config.hotguard = 2;
+
+    const proto = Proto{
+        .code = &.{Instr.op0(.ret)},
+        .name = "b1-displace",
+        .num_registers = 1,
+    };
+    var owner: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = trace.contAnchorPc(0) },
+            .instrs = &.{},
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        },
+        .id = 7,
+    };
+    // A stale request from another (retired/unsatisfiable) parent occupies
+    // the single slot. Pre-B1' the early `!= null` return froze it forever.
+    state.pending_ret_cont_arm = .{ .trace_id = 99, .exit_instr = 3 };
+
+    // The owner's per-pc watch accumulates INDEPENDENTLY of the slot...
+    state.noteRetContTransition(&owner, 5);
+    try testing.expectEqual(@as(u32, 99), state.pending_ret_cont_arm.?.trace_id);
+    // ...and its own hotguard crossing displaces the stale key.
+    state.noteRetContTransition(&owner, 5);
+    try testing.expectEqual(@as(u32, 7), state.pending_ret_cont_arm.?.trace_id);
+    try testing.expectEqual(@as(u32, 5), state.pending_ret_cont_arm.?.exit_instr);
+
+    // A same-key re-crossing is a no-op (the request is already filed) —
+    // no ping-pong against itself, deterministic bounded churn.
+    state.noteRetContTransition(&owner, 5);
+    state.noteRetContTransition(&owner, 5);
+    try testing.expectEqual(@as(u32, 7), state.pending_ret_cont_arm.?.trace_id);
+    try testing.expectEqual(@as(u32, 5), state.pending_ret_cont_arm.?.exit_instr);
+}
+
+test "clearCache (B1', task 27): pending frame-link arm requests do not survive the epoch" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    state.pending_ret_cont_arm = .{ .trace_id = 1, .exit_instr = 2 };
+    state.pending_call_head_arm = .{ .trace_id = 3, .exit_instr = 4 };
+    state.clearCache();
+    try testing.expectEqual(@as(?ExitKey, null), state.pending_ret_cont_arm);
+    try testing.expectEqual(@as(?ExitKey, null), state.pending_call_head_arm);
+}
