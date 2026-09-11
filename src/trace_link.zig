@@ -1584,6 +1584,7 @@ pub fn removeTrace(self: *TraceState, t: *Trace) void {
     for (self.registry.cache.items) |c| {
         if (c == t) {
             const anchor = t.code.anchor;
+            self.dbg("trace-retire: t={d} anchor pc={d}", .{ t.id, anchor.pc });
             // B-2a / §B.6: logical relation deletion is immediate at the
             // retirement source; physical link teardown remains P-E's job.
             self.retireProvenanceEdgesTouching(t.id);

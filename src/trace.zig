@@ -2791,6 +2791,18 @@ pub const TraceState = struct {
     /// through the same anchor is a benign false positive: eviction only drops a
     /// cache entry (tier-0 stays the oracle and the trace simply re-records), it
     /// can never change observable output.
+    ///
+    /// The monotonicity argument holds only for a **frozen** array part: `frozen`
+    /// is the one-shot lane commitment (`commitFreshLane`), and only after it does
+    /// "lanes never re-narrow" apply. A fresh, unfrozen `.value` array is
+    /// lane-UNDECIDED — its first real store will commit it to a narrow lane, so a
+    /// narrow `guard_lane` absolutely can pass on a later entry. Without this
+    /// exclusion, any loop that fills a fresh table per outer iteration
+    /// (`local r = {}; for j=1,n do r[j] = v end`) enters its fill trace once with
+    /// the next iteration's still-unfrozen `{}`, gets widen-evicted, and re-records
+    /// an identical trace EVERY outer iteration — a permanent mint-retire-recompile
+    /// churn (~600 rounds on grid_matmul_f64's row fills, doc 47 increment D) that
+    /// costs far more than the traces save.
     pub fn laneWidenedPast(self: *const TraceState, t: *const Trace, regs: RegWindow) bool {
         _ = self;
         for (t.code.instrs) |ins| {
@@ -2805,7 +2817,9 @@ pub const TraceState = struct {
             if (reg >= regs.len()) continue;
             const v = regs.get(reg);
             if (!v.isHeap() or v.heapType() != .table) continue;
-            const live_lane = table_mod.Table.fromHeader(v.asHeap()).array.lane;
+            const live_arr = &table_mod.Table.fromHeader(v.asHeap()).array;
+            if (!live_arr.frozen) continue; // pre-commitment: no monotonicity, guard may pass later
+            const live_lane = live_arr.lane;
             const trace_lane: arr.Lane = @enumFromInt(ins.aux);
             if (live_lane != trace_lane and !live_lane.canWidenTo(trace_lane)) return true;
         }
@@ -3373,6 +3387,7 @@ pub const TraceState = struct {
 
     fn armWithPolicy(self: *TraceState, proto: *const Proto, target_pc: u32, force_ordinary: bool) void {
         self.rec.reset(self.gpa, .{ .proto = proto, .pc = target_pc }, proto.num_registers) catch return;
+        self.dbg("rec-arm: pc={d} force_ordinary={}", .{ target_pc, force_ordinary });
         // Doc 43 §3.1 (P0a): seed the anchor's absolute slab base for the open-cell
         // aliasing check. `reset` zeroes it; the dispatch loop stashed `st.base`
         // in `pending_anchor_base` just before this `onBackEdge` call.
@@ -3658,6 +3673,7 @@ pub const TraceState = struct {
         } else |_| {}
         errdefer if (t.exit_counts.len != 0) self.gpa.free(t.exit_counts);
         try self.registry.publish(t);
+        self.dbg("commit: trace={d} anchor pc={d} ir_len={d}", .{ t.id, t.code.anchor.pc, t.code.instrs.len });
         self.finishSideTraceProvenance(t, candidate.side_src);
         // Coverage (gated): a trace now exists at this anchor, so subsequent
         // interpreted back-edges here are "fallback despite a trace."
@@ -4010,4 +4026,5 @@ test {
     _ = @import("trace_region_test.zig");
     _ = @import("trace_entrypatch_test.zig");
     _ = @import("trace_p0_alias_test.zig");
+    _ = @import("trace_evict_test.zig");
 }
