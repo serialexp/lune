@@ -304,6 +304,22 @@ pub const PendingLinkClose = struct {
     contract: []const trace_code.EntryGuard,
     phase: Phase,
 
+    // --- Rewind state: saved at peel entry so that a mid-body abort can
+    //     truncate back and emit the immediate `.link` close instead. ---
+    ir_rewind_len: u32,
+    entry_slots_rewind_len: u32,
+    for_prep_slot: u16,
+    vinit: value.Value,
+    vlimit: value.Value,
+    vstep: value.Value,
+    for_prep_pc: u32,
+    saved_proto_id: u32,
+    saved_global_seed: bool,
+    saved_global_store: bool,
+    /// Snapshot of `reg_map[0..anchor_num_registers]` at peel entry.
+    /// Allocated with gpa at peel start; freed on rewind or normal close.
+    saved_reg_map: []RegSlot,
+
     pub const Phase = enum {
         await_initial_entry,
         peeling,
@@ -849,14 +865,151 @@ pub const RecordingSession = struct {
 
     pub fn abort(self: *RecordingSession, reason: AbortReason) void {
         if (!self.active) return;
+        // Doc 47 increment A fallback: if a peel is in flight and the body
+        // recording aborts (aliased_input, nyi_opcode, etc.), don't kill the
+        // recording — rewind the IR to the pre-peel state and close `.link`
+        // immediately (the path that would have run without the peel attempt).
+        if (self.pending_link_close != null) {
+            self.rewindPeelAndCloseLink();
+            return;
+        }
         self.abort_notice = .{ .reason = reason, .anchor = self.anchor, .kind = self.kind, .unrolled_while = self.unrolled_while, .pc = self.cur_pc, .op = self.cur_op, .ir_len = @intCast(self.instrs.items.len), .force_ordinary = self.force_ordinary };
         self.abort_reason = reason;
         self.active = false;
         self.multret_top = null;
         self.side_src = null;
         self.close_requested = false;
-        self.pending_link_close = null;
     }
+    /// Doc 47 increment A fallback: the link peel attempted to record through
+    /// the inner body but hit an abort (aliased_input on get_upval, nyi_opcode
+    /// on a call, etc.). Instead of killing the whole continuation recording,
+    /// rewind the IR to the pre-peel state and emit the immediate `.link`
+    /// close that would have fired without the peel attempt. This preserves
+    /// loopdone link fusion for patterns like spectral-norm where the peel
+    /// can't complete (body contains upvalue loads / calls that abort).
+    fn rewindPeelAndCloseLink(self: *RecordingSession) void {
+        const plc = self.pending_link_close orelse return;
+        const a = plc.for_prep_slot;
+
+        // --- Rewind IR and register state to the pre-peel snapshot ---
+        self.instrs.items.len = plc.ir_rewind_len;
+        self.exit_prov.items.len = plc.ir_rewind_len;
+        self.entry_slots.items.len = plc.entry_slots_rewind_len;
+        // Restore the full reg_map to its pre-peel state. Body recording
+        // may have modified arbitrary slots (slot_load, setReg from arith,
+        // etc.); those refs now point into the truncated range and would
+        // produce garbage in the exit snapshot if left.
+        @memcpy(self.reg_map[0..plc.saved_reg_map.len], plc.saved_reg_map);
+        self.gpa.free(plc.saved_reg_map);
+        // Restore side-effect flags that body recording may have set.
+        self.recorded_global_seed = plc.saved_global_seed;
+        self.recorded_global_store = plc.saved_global_store;
+        // Purge any guarded_refs pointing at truncated IR.
+        var to_remove: [64]Ref = undefined;
+        var n_remove: usize = 0;
+        var it = self.guarded_refs.iterator();
+        while (it.next()) |entry| {
+            if (@as(u32, entry.key_ptr.*) >= plc.ir_rewind_len) {
+                if (n_remove < to_remove.len) {
+                    to_remove[n_remove] = entry.key_ptr.*;
+                    n_remove += 1;
+                }
+            }
+        }
+        for (to_remove[0..n_remove]) |ref| {
+            _ = self.guarded_refs.remove(ref);
+        }
+        self.pending_link_close = null;
+
+        // --- Re-emit the immediate `.link` close (same logic as the
+        //     non-peel path in recForPrepLink lines 3062-3124). ---
+        const vinit = plc.vinit;
+        const vlimit = plc.vlimit;
+        const vstep = plc.vstep;
+        const rinit = self.refOf(a) catch {
+            self.realAbort(.nyi_opcode);
+            return;
+        };
+        const rlimit = self.refOf(a + 1) catch {
+            self.realAbort(.nyi_opcode);
+            return;
+        };
+        const rstep = self.refOf(a + 2) catch {
+            self.realAbort(.nyi_opcode);
+            return;
+        };
+        self.guardNum(rinit, vinit, .operand_type, .a) catch {
+            self.realAbort(.nyi_opcode);
+            return;
+        };
+        self.guardNum(rlimit, vlimit, .operand_type, .a1) catch {
+            self.realAbort(.nyi_opcode);
+            return;
+        };
+        self.guardNum(rstep, vstep, .operand_type, .a2) catch {
+            self.realAbort(.nyi_opcode);
+            return;
+        };
+        const all_int = vinit.isInt() and vstep.isInt();
+        const vpre = arith.sub(vinit, vstep) catch {
+            self.realAbort(.bad_type);
+            return;
+        };
+        const rpre = self.emit(.{ .op = .sub, .a = rinit, .b = rstep, .ty = arithResultType(.sub, vinit, vstep) }) catch {
+            self.realAbort(.nyi_opcode);
+            return;
+        };
+        const rfirst = self.emit(.{ .op = .add, .a = rpre, .b = rstep, .ty = arithResultType(.add, vpre, vstep) }) catch {
+            self.realAbort(.nyi_opcode);
+            return;
+        };
+        const rlimit_cmp = if (all_int and vlimit.isFloat() and value.floatAsExactInt(vlimit.asFloat()) != null) blk: {
+            const iof = self.emit(.{ .op = .int_of_float, .a = rlimit, .ty = .int }) catch {
+                self.realAbort(.nyi_opcode);
+                return;
+            };
+            self.stampProv(iof, .limit_int, .a1, .neutral);
+            break :blk iof;
+        } else rlimit;
+        const ascending = vstep.toFloat() >= 0;
+        const cmp = if (ascending)
+            self.emit(.{ .op = .le, .a = rfirst, .b = rlimit_cmp, .ty = .boolean }) catch {
+                self.realAbort(.nyi_opcode);
+                return;
+            }
+        else
+            self.emit(.{ .op = .le, .a = rlimit_cmp, .b = rfirst, .ty = .boolean }) catch {
+                self.realAbort(.nyi_opcode);
+                return;
+            };
+        const guard_ref = self.emit(.{ .op = .guard_true, .a = cmp }) catch {
+            self.realAbort(.nyi_opcode);
+            return;
+        };
+        self.stampProv(guard_ref, .loop_done, .none, .neutral);
+        self.setReg(a, rfirst);
+        self.setReg(a + 3, rfirst);
+        self.link_target = plc.inner_anchor_pc;
+        self.pending_link_provenance = .{ .link_terminal = .{
+            .path = pathFromFrames(&self.frames, self.inline_depth),
+            .inline_depth = self.inline_depth,
+            .source_proto_id = plc.saved_proto_id,
+            .source_pc = plc.for_prep_pc -| 1,
+        } };
+        self.close_requested = true;
+    }
+
+    /// The real abort — unconditionally kills the recording. Called when
+    /// `rewindPeelAndCloseLink` itself fails (OOM on emit, etc.).
+    fn realAbort(self: *RecordingSession, reason: AbortReason) void {
+        self.abort_notice = .{ .reason = reason, .anchor = self.anchor, .kind = self.kind, .unrolled_while = self.unrolled_while, .pc = self.cur_pc, .op = self.cur_op, .ir_len = @intCast(self.instrs.items.len), .force_ordinary = self.force_ordinary };
+        self.abort_reason = reason;
+        self.active = false;
+        self.multret_top = null;
+        self.side_src = null;
+        self.close_requested = false;
+    }
+
     pub fn takeAbortNotice(self: *RecordingSession) ?AbortNotice {
         const notice = self.abort_notice;
         self.abort_notice = null;
@@ -2859,6 +3012,7 @@ pub const RecordingSession = struct {
                         if (within) {
                             plc.phase = .peeling;
                         } else {
+                            self.gpa.free(plc.saved_reg_map);
                             self.pending_link_close = null;
                             // Continue recording — the guard_false exit direction
                             // was already recorded above.
@@ -2883,11 +3037,16 @@ pub const RecordingSession = struct {
                                     .source_pc = self.cur_pc -| 1, // the for_loop opcode
                                 } };
                                 self.close_requested = true;
+                                self.gpa.free(plc.saved_reg_map);
                                 self.pending_link_close = null;
                             } else {
                                 // Still mismatched after one iteration — abort.
                                 // The peel can't help; fall back to today's
-                                // behavior (no link, eventual gate).
+                                // behavior (no link, eventual gate). Free the
+                                // rewind state and clear BEFORE abort so the
+                                // abort-rewind catch doesn't fire (the peel
+                                // completed; rewind would be wrong).
+                                self.gpa.free(plc.saved_reg_map);
                                 self.pending_link_close = null;
                                 return self.abort(.type_instability);
                             }
@@ -2896,6 +3055,7 @@ pub const RecordingSession = struct {
                             // iteration 2 exists. Clear the peel and continue
                             // recording past the loop — may produce a useful
                             // one-trip-specialized continuation trace.
+                            self.gpa.free(plc.saved_reg_map);
                             self.pending_link_close = null;
                         }
                     },
@@ -2918,7 +3078,7 @@ pub const RecordingSession = struct {
     /// The decision is a pure function of the cache + bytecode (no clock/RNG/address),
     /// so it is identical across every record/exec mode — P1 carries to P2.
     ///
-    /// **P2 (the load-bearing hand-off invariant, doc 15).** The link hand-off must
+    /// **P2 (the critical hand-off invariant, doc 15).** The link hand-off must
     /// reproduce the inner root's *entry state* — the tier-0 registers it reads at its
     /// anchor (`entry_slots`). The inner root anchors at the loop **body start** (the
     /// `for_loop` back-edge target), which tier-0 first reaches only AFTER `for_prep`
@@ -3037,6 +3197,13 @@ pub const RecordingSession = struct {
             if (!compatible and entryGuardsMismatchPromotable(inner_guards, regs)) {
                 // Promotable int→float mismatch: record `for_prep` as arithmetic
                 // (like zero-trip / inline_depth>0) and peel one inner iteration.
+                // Save rewind state BEFORE emitting any IR so that a mid-body
+                // abort can truncate back and close `.link` immediately.
+                const n_regs = self.anchor_num_registers;
+                const saved_regs = self.gpa.dupe(RegSlot, self.reg_map[0..n_regs]) catch
+                    return; // OOM → fall through to the normal `.link` close below
+                const rewind_ir = @as(u32, @intCast(self.instrs.items.len));
+                const rewind_es = @as(u32, @intCast(self.entry_slots.items.len));
                 const rinit0 = try self.refOf(a);
                 const rlimit0 = try self.refOf(a + 1);
                 const rstep0 = try self.refOf(a + 2);
@@ -3050,6 +3217,17 @@ pub const RecordingSession = struct {
                     .for_loop_pc = fl_pc,
                     .contract = inner_guards,
                     .phase = .await_initial_entry,
+                    .ir_rewind_len = rewind_ir,
+                    .entry_slots_rewind_len = rewind_es,
+                    .for_prep_slot = a,
+                    .vinit = vinit,
+                    .vlimit = vlimit,
+                    .vstep = vstep,
+                    .for_prep_pc = pc,
+                    .saved_proto_id = self.cur_proto_id,
+                    .saved_global_seed = self.recorded_global_seed,
+                    .saved_global_store = self.recorded_global_store,
+                    .saved_reg_map = saved_regs,
                 };
                 return;
             }
@@ -5071,6 +5249,7 @@ pub const RecordingSession = struct {
     }
 
     pub fn deinit(self: *RecordingSession, gpa: std.mem.Allocator) void {
+        if (self.pending_link_close) |plc| gpa.free(plc.saved_reg_map);
         if (self.peel) |p| gpa.free(p.slots);
         self.pending_stores.deinit(gpa);
         self.input_seeds.deinit(gpa);
@@ -5107,6 +5286,7 @@ pub const RecordingSession = struct {
         self.link_target = null;
         self.terminal_close = null;
         self.pending_link_provenance = null;
+        if (self.pending_link_close) |plc| self.gpa.free(plc.saved_reg_map);
         self.pending_link_close = null;
         self.inline_depth = 0;
         if (self.peel) |p| gpa.free(p.slots);

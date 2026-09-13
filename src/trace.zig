@@ -3130,11 +3130,13 @@ pub const TraceState = struct {
             }
             // Doc 47 increment A: a pending link peel only tolerates the target
             // inner `for_loop` back-edge. Any OTHER back-edge (a while-loop or
-            // repeat-loop inside the peeled inner body) aborts — the peel can't
-            // model nested loop structures.
+            // repeat-loop inside the peeled inner body) can't be modeled by the
+            // peel. Abort (which triggers the rewind-to-link fallback) and then
+            // check `close_requested` in case the rewind set it.
             if (self.rec.pending_link_close) |plc| {
                 if (target_pc != plc.inner_anchor_pc) {
                     self.abort(.nyi_opcode);
+                    if (self.rec.close_requested) self.closeTrace(regs);
                     return;
                 }
             }
