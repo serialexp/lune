@@ -21,6 +21,49 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-13 (latest+10) — doc 47 increment A IMPLEMENTED (continuation-scoped link peel); f64 append ready to land?
+
+**Tree state: increment A + f64-append diff UNCOMMITTED** (src/trace_recorder.zig,
+src/trace.zig, src/nativegen_prove.zig, src/nativegen.zig, src/array.zig,
+src/interp_native_test.zig, NEW src/trace_link_peel_test.zig). All gates green
+(unit 1342, JIT boundaries, hashgate 84×2).
+
+- **Increment A implemented:** continuation-scoped link peeling. When a
+  `.continuation` recording reaches an inner `for_prep` and the inner root's
+  `entry_guards` show a float-on-int mismatch, the recorder takes the
+  record-through path (like zero-trip) and records one inner body iteration
+  to promote accumulator types. Two-phase state machine
+  (`await_initial_entry` → `peeling`) tracks the `for_loop` visits; post-peel
+  compatibility recheck before closing `.link`. Codex-reviewed (thread
+  01a093be, 3 rounds). Changes: `PendingLinkClose` descriptor +
+  `pending_link_close` field on `RecordingSession`; modified `recForPrepLink`
+  (peel entry), `recForLoop` (peel consumption), `onBackEdge` (nested-loop
+  refusal during peel), `recCall` (call refusal during peel); `entryGuardsMatch`
+  + `entryGuardsMismatchPromotable` helpers; `inner_root_guards` on
+  `InstructionContext` threaded from `findLoopTrace` in `trace.zig recordInstr`.
+  Reset in `reset()`/`abort()`; asserted null in `finalize()`.
+- **Board (D + held f64 + inc A vs D + held f64):** scimark-sparse **−56.2%**
+  (705→309ms), spectral-norm **−33.3%** (37.8→25.2ms), repack **−29.2%**
+  (36.7→26.0ms). grid_matmul/nbody/fib/euler14 neutral. Short benches
+  (str_manip, tbl_ops) show noise but are JIT-unaffected (res 0%).
+- **Board vs PRE-f64 baseline (rough, needs proper A/B):** sparse 573→309ms
+  (−46%), spectral 35.8→25.2ms (−30%). The held f64 diff + increment A is
+  net-positive on every row.
+- **Tests:** 8 new tests in `src/trace_link_peel_test.zig`: convergence
+  positive (short inner loop → link fusion > 0), math.type before promotion
+  preserves "integer", int division before promotion preserves int semantics,
+  byte-identical tier-0 equivalence, 4 predicate-level unit tests for
+  `entryGuardsMatch` and `entryGuardsMismatchPromotable`.
+- **Remaining:** the `type_instability` abort at sparse_mult:34 fired once
+  (during the calibration call's first outer iteration — the peel's inner body
+  didn't promote `sum` because the row had few elements); harmless, the normal
+  immediate-close path took over. Increment C (spectral entry-refusal thrash)
+  may no longer be needed since spectral is now −33%. Increment B (closed-SCC
+  owner election) remains outstanding.
+- **Next:** evaluate whether the held f64 diff + increment A can land together.
+  The board is net-positive on all regressed rows. Pending: interleaved A/B
+  against a clean baseline shadow to get citable numbers.
+
 ## Status 2026-09-11 (latest+9) — doc 47 increment D LANDED (widen-eviction churn fix, 0fb8eb2); f64 append still held
 
 **Tree state: f64-append diff still UNCOMMITTED** (src/trace_recorder.zig,
@@ -75,11 +118,26 @@ it until A/C.
   entry-refusal evidence to feed the same side-specialization path guard
   terminals feed (or arm repoint/disarm off the dead cont), per codex's
   proven-relation constraint.
-- **Next:** increment A (continuation-scoped peeling — design agreed round 3,
-  see below) for sparse's int-0 `sum` prologue-fail seam; increment C
-  (entry-refusal → side want / arm repoint) for spectral's cont thrash; then
-  land the held f64 diff when its two rows are neutral-or-better. B (closed-
-  SCC owner election) after.
+- **Next: increment A IN PROGRESS (2026-09-12).** Read doc 39 (entry-kind/
+  steady-kind peel model) and researched the `.cont` recording lifecycle.
+  Key finding: the codex-accepted "continuation-scoped peeling" is NOT a
+  doc-39-style peel (which needs two anchor returns; `.cont` is straight-
+  line-to-terminal and hard-refuses back-edges). Instead, it's simpler: the
+  `.cont` records the outer tail, then at `recForPrepLink` instead of
+  aborting `.cont_backedge`, it records THROUGH `for_prep` into the inner
+  body (like the zero-trip or inline_depth>0 path at line 2825), lets
+  `recForLoop` unroll one inner iteration (which promotes `sum` int→float
+  via the inner arithmetic), and closes `.link` at the `for_loop` back-edge
+  — matching the inner root's float entry contract. This is the same path
+  `.side` recordings already take through `recForPrepLink`. The gate at
+  line 2846 (`if (self.kind == .cont) return self.abort(.cont_backedge)`)
+  is the single change needed — replace it with the `.side`-equivalent
+  path. The inner body's `for_loop` back-edge in `onBackEdge` needs the
+  same exemption (currently `.cont` aborts `.cont_backedge` at line 3113).
+  Design to be codex-reviewed before implementation.
+- Increment C (entry-refusal → side want / arm repoint) for spectral's
+  cont thrash; then land the held f64 diff when its two rows are
+  neutral-or-better. B (closed-SCC owner election) after.
 
 ## Status 2026-09-11 (latest+8) — doc 47 IMPLEMENTED, HELD (task #30: f64 append + the nest-seam diagnosis)
 

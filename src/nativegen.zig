@@ -1726,9 +1726,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 a.bind(done);
                 try regToPlace(a, placeOfRef(alloc, i), .rcx);
             },
-            // astore_append (B5-grow): commit one boolean to `data[asize]` and bump asize.
+            // astore_append (B5-grow): commit one value to `data[asize]` and bump asize.
             // guard_append proved `idx0 == asize < cap` and an empty hash, so this is the
-            // bool-lane byte store (`1=false, 2=true`, value+1 — presence is in-band)
+            // lane store — bool: in-band byte (`1=false, 2=true`, value+1); int i8…i64/u8:
+            // width-truncating store + presence bit; f64 (doc 47): movsd + presence bit —
             // followed by an in-place `inc qword [tbl+len]`. len has NO register home
             // for an append trace (the home-reservation switch skips astore_append), so
             // the table struct stays the single source of truth: the bump is immediately
@@ -1751,7 +1752,23 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // as-is; a spilled home is reloaded fresh into rax) for the len bump.
             .astore_append => {
                 const aref_ins = t.instrs[ins.a];
-                if (ins.aux == BOOL_LANE) {
+                if (ins.aux == F64_LANE) {
+                    // f64 lane (doc 47): identical to the in-bounds F64_LANE astore —
+                    // stage the value into XMM_SCRATCH0 FIRST (`arrayFieldReg`/
+                    // `refBaseReg` may hand back rax/rcx, so the float must leave its
+                    // possibly-scratch-backed home before either address helper runs),
+                    // then movsd the data slot and set the presence bit. Like the int
+                    // lanes, f64 keeps a per-slot presence bitmap, so this is two
+                    // stores; both land before the len bump below publishes the slot.
+                    try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
+                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    try a.leaRegMemSib(.rax, datareg, ireg, 8, 0); // rax = &data[idx0]
+                    try a.movsdMemReg(.rax, 0, XMM_SCRATCH0);
+                    const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
+                    const pireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    try a.btsMemReg(preg, 0, pireg);
+                } else if (ins.aux == BOOL_LANE) {
                     // bool-lane byte store, identical to the in-bounds astore bool path.
                     const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
                     const ireg = try refBaseReg(a, alloc, ins.a, .rcx);

@@ -134,8 +134,11 @@ pub const Lane = enum(u8) {
     /// grow/in-bounds store paths branch on this to pick the int lowering vs the
     /// boolean in-band byte. The only signedness difference is on the *read*
     /// (`u8` zero-extends, the signed lanes sign-extend), handled in `decode` and
-    /// the native `aload`. `.f64` is excluded: it needs XMM stores the native array
-    /// path does not yet emit.
+    /// the native `aload`. `.f64` is excluded from THIS predicate only because its
+    /// store shape differs (XMM movsd, not a width-truncating GPR write) — the
+    /// native array path lowers f64 in-bounds stores (F64_LANE `astore`) and, since
+    /// doc 47, f64 appends too; JIT sites gate on `isInt() or lane == .f64` where
+    /// both shapes are handled.
     pub fn isInt(self: Lane) bool {
         return switch (self) {
             .i8, .i16, .i32, .i64, .u8 => true,

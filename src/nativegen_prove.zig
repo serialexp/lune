@@ -1118,9 +1118,8 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             // aref addresses a writable slot — here `data[len]`, the in-cap append
             // successor (idx==len+1, len<cap) into a migrate-free (empty-hash) table.
             // Marks the aref bounds-checked so the following astore_append may store.
-            // bool + i8…i64 (the lanes the append path lowers); `.value` → tier-1a.
-            // (`.f64` passes laneKind but the recorder never emits an f64 append —
-            // the astore_append below bails it; see there.)
+            // bool + i8…i64 + f64 (doc 47) — the lanes the append path lowers;
+            // `.value` → tier-1a.
             .guard_append => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
@@ -1155,10 +1154,12 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                         const bit = laneBit(ins.aux) orelse return false;
                         if (fits_mask[ins.b] & bit == 0 and !konstFitsLane(t, ins.b, ins.aux)) return false;
                     },
-                    // f64 append is intentionally not lowered in this cut: the recorder's
-                    // append gate (`recArraySet`) excludes the f64 lane, so no f64
-                    // astore_append is ever emitted. Should one appear, bail to tier-1a.
-                    else => return false,
+                    // f64 append (doc 47): a proven float always fits the f64 lane, so
+                    // no fits_mask bit is needed — the f64 `guard_fits` is purely the
+                    // type pin (native lowers it to nothing), mirroring the in-bounds
+                    // astore's float arm above.
+                    .float => if (kinds[ins.b] != .float) return false,
+                    else => return false, // laneKind never yields these here
                 }
                 kinds[i] = .none;
             },

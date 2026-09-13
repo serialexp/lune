@@ -3128,6 +3128,16 @@ pub const TraceState = struct {
                 self.abort(.cont_backedge);
                 return;
             }
+            // Doc 47 increment A: a pending link peel only tolerates the target
+            // inner `for_loop` back-edge. Any OTHER back-edge (a while-loop or
+            // repeat-loop inside the peeled inner body) aborts — the peel can't
+            // model nested loop structures.
+            if (self.rec.pending_link_close) |plc| {
+                if (target_pc != plc.inner_anchor_pc) {
+                    self.abort(.nyi_opcode);
+                    return;
+                }
+            }
             if (self.rec.anchor.proto == proto and self.rec.anchor.pc == target_pc) {
                 self.closeTrace(regs);
             }
@@ -3214,7 +3224,9 @@ pub const TraceState = struct {
         const target: ?u32 = if (instr.op == .for_prep) pc else if (instr.op == .jmp and target_i >= 0 and target_i < proto.code.len) @intCast(target_i) else null;
         self.rec.context = .{ .heap = self.rec_heap, .upval_open = self.rec_upval_open, .globals_header = self.rec_globals_header, .upval_cell = self.rec_upval_cell };
         if (target) |dest| {
-            self.rec.context.inner_root = self.findLoopTrace(proto, dest) != null;
+            const inner = self.findLoopTrace(proto, dest);
+            self.rec.context.inner_root = inner != null;
+            self.rec.context.inner_root_guards = if (inner) |t| t.code.entry_guards else &.{};
             const leaves = self.lleave_count.get(.{ .proto = proto, .pc = dest }) orelse 0;
             const fails = self.unroll_fail.get(self.rec.anchor) orelse 0;
             self.rec.context.unroll_while = leaves >= self.config.lleave_fast_retries or fails < self.config.unroll_fail_flip;
@@ -4027,4 +4039,5 @@ test {
     _ = @import("trace_entrypatch_test.zig");
     _ = @import("trace_p0_alias_test.zig");
     _ = @import("trace_evict_test.zig");
+    _ = @import("trace_link_peel_test.zig");
 }

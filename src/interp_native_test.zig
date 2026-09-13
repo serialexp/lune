@@ -445,6 +445,180 @@ test "astore_append (int lane): a widening int fill is byte-identical across all
     , "12502500\n");
 }
 
+test "astore_append (f64 lane, doc 47): a float fill compiles native, preserves -0.0, matches tier-0" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // `for i=1,5000 do t[i]=(i-2500)*-0.5 end` — the float analogue of the int
+    // fill. Eager commit narrows to `.f64` on the first append; the recorder now
+    // admits the f64 lane in the append branch, so it records guard_append +
+    // guard_fits(f64 — the float type pin) + astore_append, and native lowers it
+    // to movsd + `bts [present]` + `inc [len]`. 5000 slots cross many presence-
+    // bitmap word boundaries (incl. bits 63/64). At i=2500 the store is
+    // `0 * -0.5 == -0.0`: `1/t[2500]` prints `-inf` only if the movsd preserved
+    // the sign bit — a reboxing through an int register would lose it. The read
+    // loop sums through the f64 aload.
+    const source =
+        \\local t = {}
+        \\for i = 1, 5000 do t[i] = (i - 2500) * -0.5 end
+        \\print(1/t[2500])
+        \\local c = 0
+        \\for i = 1, 5000 do c = c + t[i] end
+        \\print(c)
+    ;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var nbuf: [64]u8 = undefined;
+    var nsink = io.Writer.fixed(&nbuf);
+    var chunk = try runNativeForTrace(&vm, gpa, source, &nsink);
+    defer chunk.deinit();
+
+    const f64_ord = @intFromEnum(array.Lane.f64);
+    var compiled_f64_append = false;
+    for (vm.trace.registry.cache.items) |tr| {
+        for (tr.code.instrs) |ins| {
+            if (ins.op == .astore_append and ins.aux == f64_ord and tr.native == .compiled)
+                compiled_f64_append = true;
+        }
+    }
+    try testing.expect(compiled_f64_append);
+    var obuf: [64]u8 = undefined;
+    var osink = io.Writer.fixed(&obuf);
+    try runCaptured(gpa, source, &osink, false, .off);
+    try testing.expectEqualStrings(osink.buffered(), nsink.buffered());
+}
+
+test "astore_append (f64 lane): float and NaN fills are byte-identical across all 8 modes" {
+    // The full matrix for the f64 grow store: the movsd data write, the separate
+    // presence bit, and the len bump must land identically in tier-0, tier-1a, and
+    // native. The NaN fill (`z/z` with `z=0.0`) additionally pins bit-pattern
+    // transparency: a NaN survives the append and still fails `t[i] == t[i]`.
+    try expectProgram(
+        \\local t = {}
+        \\for i = 1, 5000 do t[i] = (i - 2500) * -0.5 end
+        \\print(1/t[2500])
+        \\local c = 0
+        \\for i = 1, 5000 do c = c + t[i] end
+        \\print(c)
+        \\local u = {}
+        \\local z = 0.0
+        \\for i = 1, 5000 do u[i] = z/z end
+        \\local n = 0
+        \\for i = 1, 5000 do if u[i] ~= u[i] then n = n + 1 end end
+        \\print(n)
+    ,
+        \\-inf
+        \\-1250
+        \\5000
+        \\
+    );
+}
+
+test "astore_append: a `.value`-lane append still refuses (no astore_append recorded)" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // A mixed table (int at 1, string at 2) widens to the `.value` lane; the
+    // numeric fill that follows appends on `.value`, which the append branch
+    // still excludes (doc 32 write-barrier reasoning) — it falls through to the
+    // in-bounds check and aborts. The loop must stay correct on tier-0 and no
+    // `astore_append` may appear in any recorded trace.
+    const source =
+        \\local t = {}
+        \\t[1] = 1
+        \\t[2] = "x"
+        \\for i = 3, 5000 do t[i] = i * 1.0 end
+        \\print(t[5000])
+    ;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var nbuf: [64]u8 = undefined;
+    var nsink = io.Writer.fixed(&nbuf);
+    var chunk = try runNativeForTrace(&vm, gpa, source, &nsink);
+    defer chunk.deinit();
+
+    for (vm.trace.registry.cache.items) |tr| {
+        for (tr.code.instrs) |ins| {
+            try testing.expect(ins.op != .astore_append);
+        }
+    }
+    try testing.expectEqualStrings("5000\n", nsink.buffered());
+}
+
+test "doc 47 convergence: grow-then-reuse commits an append continuation, then the in-bounds sibling takes over" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // The codex-required end-to-end regression for the doc 47 convergence story
+    // (thread 01a09045): scimark-sparse's shape. A calibration call grows an f64
+    // `vy` from empty, so the loop-done continuation for the short inner loop
+    // records `vy[r]=sum` as an APPEND and commits + links. The steady-state
+    // calls store in-bounds; the append trace's `guard_append` then fails on
+    // every entry, goes hot (`wants_side_trace` via the ledger-terminal count),
+    // and an IN-BOUNDS sibling continuation records at the same anchor and links.
+    // Assertions pin the whole transition:
+    //   * both continuations exist at the SAME anchor, both `.link`-terminated —
+    //     one carrying `astore_append` (f64), one carrying `astore` (f64);
+    //   * loop-done fusion is live (`native_loopdone_link_fused > 0`) — the nest
+    //     runs fused, not through the dispatcher seam per row;
+    //   * the continuation anchor never took a record_gate strike (the pre-doc-47
+    //     failure mode was 6 append aborts → permanent record blacklist);
+    //   * no retirement was needed: the append trace is still cached.
+    const source =
+        \\local n, nr = 1000, 5
+        \\local vx, val, vy, col, row = {}, {}, {}, {}, {}
+        \\for i = 1, n do vx[i] = i * 0.5 end
+        \\for i = 1, n * nr do val[i] = i * 0.25 end
+        \\row[1] = 1
+        \\for r = 1, n do
+        \\  local rr = row[r]
+        \\  row[r+1] = rr + nr
+        \\  for i = 0, nr - 1 do col[rr+i] = 1 + i end
+        \\end
+        \\local function sparse_mult(nn, cycles, vy_, val_, row_, col_, vx_)
+        \\  for p = 1, cycles do
+        \\    for r = 1, nn do
+        \\      local sum = 0
+        \\      for i = row_[r], row_[r+1] - 1 do sum = sum + vx_[col_[i]] * val_[i] end
+        \\      vy_[r] = sum
+        \\    end
+        \\  end
+        \\end
+        \\sparse_mult(n, 1, vy, val, row, col, vx)
+        \\sparse_mult(n, 40, vy, val, row, col, vx)
+        \\print(vy[n])
+    ;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var nbuf: [64]u8 = undefined;
+    var nsink = io.Writer.fixed(&nbuf);
+    var chunk = try runNativeForTrace(&vm, gpa, source, &nsink);
+    defer chunk.deinit();
+
+    const f64_ord = @intFromEnum(array.Lane.f64);
+    var append_cont: ?*trace.Trace = null; // the calibration-call continuation
+    var inbounds_cont: ?*trace.Trace = null; // the steady-state sibling
+    for (vm.trace.registry.cache.items) |tr| {
+        if (tr.code.instrs.len == 0) continue;
+        if (tr.code.instrs[tr.code.instrs.len - 1].op != .link) continue;
+        for (tr.code.instrs) |ins| {
+            if (ins.op == .astore_append and ins.aux == f64_ord) append_cont = tr;
+            if (ins.op == .astore and ins.aux == f64_ord) inbounds_cont = tr;
+        }
+    }
+    const ap = append_cont orelse return testing.expect(false);
+    const ib = inbounds_cont orelse return testing.expect(false);
+    // Same anchor: the sibling specialized the SAME continuation site.
+    try testing.expect(ap.code.anchor.proto == ib.code.anchor.proto);
+    try testing.expectEqual(ap.code.anchor.pc, ib.code.anchor.pc);
+    // The nest runs fused through the loop-done link, not per-row dispatch.
+    try testing.expect(vm.trace.native_loopdone_link_fused > 0);
+    // The pre-doc-47 failure mode (append aborts → record blacklist) is gone:
+    // the continuation anchor never took a record_gate strike…
+    const key = trace.AnchorKey{ .proto = ap.code.anchor.proto, .pc = ap.code.anchor.pc };
+    try testing.expect(vm.trace.record_gate.get(key) == null);
+    // …and convergence needed no retirement: the stale append trace is still
+    // cached (found above), the sibling simply took over.
+    try testing.expectEqualStrings("9372.5\n", nsink.buffered());
+}
+
 // ---- doc 18 §T: slot-0 array part, cross-tier ----
 
 test "slot-0: a 0-indexed fill + read loop is byte-identical across all 8 modes" {

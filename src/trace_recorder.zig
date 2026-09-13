@@ -33,8 +33,9 @@ const isSideExitGuardOp = @import("trace_ir.zig").isSideExitGuardOp;
 const GuardRole = @import("trace_types.zig").GuardRole;
 const OperandDesig = @import("trace_types.zig").OperandDesig;
 const Polarity = @import("trace_types.zig").Polarity;
-const InputKind = @import("trace_code.zig").InputKind;
-const UPVALUE_CELL_ANCHOR = @import("trace_code.zig").UPVALUE_CELL_ANCHOR;
+const trace_code = @import("trace_code.zig");
+const InputKind = trace_code.InputKind;
+const UPVALUE_CELL_ANCHOR = trace_code.UPVALUE_CELL_ANCHOR;
 const MAX_INLINE_DEPTH = @import("trace_types.zig").MAX_INLINE_DEPTH;
 const CallEdge = @import("trace_types.zig").CallEdge;
 const SlotStore = @import("trace_ir.zig").SlotStore;
@@ -203,6 +204,47 @@ pub fn obsTypeOf(v: Value) ObsType {
     };
 }
 
+/// Doc 47 increment A: check whether all entry guards match the current regs.
+/// This mirrors `TraceCode.matchesFingerprint` but operates on the borrowed
+/// `entry_guards` slice without needing a full `TraceCode`.
+pub fn entryGuardsMatch(guards: []const trace_code.EntryGuard, regs: RegWindow) bool {
+    for (guards) |g| {
+        if (g.slot >= regs.len()) return false;
+        const v = regs.get(g.slot);
+        const ok = switch (g.ty) {
+            .int => v.isInt(),
+            .float => v.isFloat(),
+            .number => v.isNumber(),
+            .table => v.isHeap() and v.heapType() == .table,
+        };
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// Doc 47 increment A: check whether every mismatching entry guard is a `.float`
+/// guard on a slot currently holding int. Only such mismatches can be resolved
+/// by peeling one inner iteration (arithmetic promotes int→float). Any other
+/// kind of mismatch (float→int, table mismatch, etc.) is not fixable by peeling.
+pub fn entryGuardsMismatchPromotable(guards: []const trace_code.EntryGuard, regs: RegWindow) bool {
+    var has_mismatch = false;
+    for (guards) |g| {
+        if (g.slot >= regs.len()) return false;
+        const v = regs.get(g.slot);
+        const ok = switch (g.ty) {
+            .int => v.isInt(),
+            .float => v.isFloat(),
+            .number => v.isNumber(),
+            .table => v.isHeap() and v.heapType() == .table,
+        };
+        if (!ok) {
+            if (g.ty != .float or !v.isInt()) return false;
+            has_mismatch = true;
+        }
+    }
+    return has_mismatch;
+}
+
 /// State of a tier-0 register within the recording: `undef` (never touched →
 /// next read emits a `slot_load`), `input` (holds a `slot_load` ref — read but
 /// not written, loop-invariant), or `def` (holds a computed ref — a loop-carried
@@ -241,6 +283,31 @@ pub const PeelSlot = struct {
     /// The internal φ (aux == PHI_INTERNAL) carrying this slot's steady state,
     /// created lazily at the first body read. Its `b` is patched at close.
     phi_ref: ?Ref = null,
+};
+
+/// Doc 47 increment A: deferred link close state for continuation-scoped peeling.
+/// When a `.continuation`/`.side` recording reaches an inner `for_prep` and the
+/// inner root's entry guards mismatch the current register types, the recording
+/// continues through the inner body to promote accumulator types before closing
+/// `.link`. The two-phase state machine tracks progress:
+/// - `.await_initial_entry`: waiting for the first `for_loop` visit (tier-0
+///    jumped from `for_prep` to `for_loop`; this is the initial bounds check,
+///    not a post-body back-edge). Transition to `.peeling` on continue.
+/// - `.peeling`: one body iteration is being recorded. The next `for_loop`
+///    continue-direction visit closes `.link` if compatible, else aborts.
+pub const PendingLinkClose = struct {
+    inner_anchor_pc: u32,
+    for_loop_pc: u32,
+    /// Snapshot of the inner root's numeric entry guards. Borrowed from the
+    /// live `Trace.code.entry_guards` — stable while the trace is cached (no
+    /// eviction runs during recording).
+    contract: []const trace_code.EntryGuard,
+    phase: Phase,
+
+    pub const Phase = enum {
+        await_initial_entry,
+        peeling,
+    };
 };
 
 /// Doc 39: in-flight type-stabilizing peel. Entered at the first anchor-return
@@ -431,7 +498,21 @@ pub const RecordingSession = struct {
     /// depth, since tier-0 is really executing the callee); null for other ops.
     /// The recorder keys alias classes and the snapshot-read set on its address
     /// and inspects `loc` for the open/closed split.
-    pub const InstructionContext = struct { heap: ?*const gc.Heap = null, inner_root: bool = false, unroll_while: bool = false, upval_open: ?usize = null, globals_header: ?*const object.GcHeader = null, upval_cell: ?*function.Upvalue = null };
+    pub const InstructionContext = struct {
+        heap: ?*const gc.Heap = null,
+        inner_root: bool = false,
+        /// Doc 47 increment A: the inner root's entry_guards, resolved once per
+        /// `for_prep` instruction by `TraceState.recordInstr`. The slice is
+        /// borrowed from the live `Trace.code.entry_guards` (stable while the
+        /// trace is cached — no eviction runs during recording). Used by
+        /// `recForPrepLink` to decide whether a peel is needed and by
+        /// `recForLoop` to verify post-peel compatibility.
+        inner_root_guards: []const trace_code.EntryGuard = &.{},
+        unroll_while: bool = false,
+        upval_open: ?usize = null,
+        globals_header: ?*const object.GcHeader = null,
+        upval_cell: ?*function.Upvalue = null,
+    };
     pub const AbortNotice = struct { reason: AbortReason, anchor: AnchorKey, kind: TraceKind, unrolled_while: bool, pc: u32, op: OpCode, ir_len: u32, force_ordinary: bool };
     pub const PeelNotice = union(enum) { enter: struct { anchor_pc: u32, marker: usize }, close: struct { anchor_pc: u32, begin: usize, end: usize } };
     pub fn takePeelNotice(self: *RecordingSession) ?PeelNotice {
@@ -521,6 +602,18 @@ pub const RecordingSession = struct {
     /// `.link`. Release invariant: `link_target != null ⇔ pending_link_provenance !=
     /// null`. Reset to `null` by `reset` (every abort/re-arm) alongside `link_target`.
     pending_link_provenance: ?ExitProvenance = null,
+    /// Doc 47 increment A: deferred link close for continuation-scoped peeling.
+    /// When a `.continuation`/`.side` recording reaches an inner `for_prep` whose
+    /// inner root's entry guards don't match the current register types (e.g. the
+    /// inner root wants float on `sum` but the continuation has int), the
+    /// recording takes the record-through path instead of immediately closing
+    /// `.link`. The recording continues through `for_prep`, the initial `for_loop`
+    /// entry, and one inner body iteration — which naturally promotes `sum` from
+    /// int to float. At the post-body `for_loop` (phase `.peeling`), compatibility
+    /// is rechecked; if the entry guards now match, `.link` is closed with the
+    /// promoted state. Set by `recForPrepLink`; consumed by `recForLoop`.
+    /// Cleared in `reset()` and `abort()`; asserted null in `finalize()`.
+    pending_link_close: ?PendingLinkClose = null,
     /// Doc 44 P0: a `.head` recording's one-shot close. Set by the depth-0
     /// `ret` arm (`.return_interp`) or `recCall`'s depth-0 self-call arm
     /// (`.self_call_interp`) — always BEFORE tier-0 executes that
@@ -762,6 +855,7 @@ pub const RecordingSession = struct {
         self.multret_top = null;
         self.side_src = null;
         self.close_requested = false;
+        self.pending_link_close = null;
     }
     pub fn takeAbortNotice(self: *RecordingSession) ?AbortNotice {
         const notice = self.abort_notice;
@@ -800,6 +894,11 @@ pub const RecordingSession = struct {
     }
     pub fn finalize(self: *RecordingSession) !@import("trace_candidate.zig").RecordingCandidate {
         if (!self.active) return error.InactiveRecording;
+        // Doc 47 increment A: a pending link peel must be consumed (closed into
+        // link_target) or cancelled (abort/reset) before finalization. Reaching
+        // finalize with the peel still live means the recording was committed
+        // without completing the peel — a state machine error.
+        std.debug.assert(self.pending_link_close == null);
         defer {
             self.active = false;
             self.side_src = null;
@@ -1806,15 +1905,19 @@ pub const RecordingSession = struct {
         // its first rehash narrows to the boolean lane and drains the hash). Rather
         // than abort the whole trace (the historic behaviour — the fill then ran fully
         // tier-0), record an `astore_append` guarded so the realloc/migrate cases fall
-        // back to tier-0 while the in-capacity common case runs native. Phase A: the
-        // boolean lane (one in-band byte/slot) and the fixed-width int lanes
-        // (i8…i64: width store + presence bit) — exactly the lanes the native
-        // in-bounds `astore` lowers (`nativegen.laneKind`). `.f64` needs XMM stores
-        // the array path does not yet emit, so it (and `.value`) still abort below.
-        // The emitted IR sequence is lane-generic; `guard_fits` (below) supplies the
-        // int lane's runtime range check, and the value's static `.int` kind comes
-        // from its producing ref (the loop slot) — same as the in-bounds int store.
-        if ((lane == .boolean or lane.isInt()) and
+        // back to tier-0 while the in-capacity common case runs native. Phase A
+        // covered the boolean lane (one in-band byte/slot) and the fixed-width int
+        // lanes (i8…i64: width store + presence bit); doc 47 extends it to `.f64`
+        // (movsd store + presence bit — the XMM path the in-bounds F64_LANE
+        // `astore` already emits), unblocking float array-fill loops
+        // (`x[i]=rand()`-style setup, and sparse's grow-then-reuse `vy` whose
+        // append aborts permanently record-blacklisted the loop-done continuation
+        // anchor during scimark's calibration call). Only `.value` still aborts
+        // below (write-barrier territory, doc 32). The emitted IR sequence is
+        // lane-generic; `guard_fits` (below) supplies the int lane's runtime range
+        // check (for f64 it degenerates to the float type pin), and the value's
+        // static kind comes from its producing ref — same as the in-bounds store.
+        if ((lane == .boolean or lane.isInt() or lane == .f64) and
             idx == @as(i64, @intCast(tbl.array.asize)) and
             tbl.hash.count() == 0 and
             tbl.array.fits(vval))
@@ -2740,6 +2843,65 @@ pub const RecordingSession = struct {
             self.stampProv(skip_g, .loop_done, .none, .neutral); // loop-exit test
             self.setReg(a, rnext);
         }
+
+        // Doc 47 increment A: consume a pending link close from a continuation
+        // that recorded through an inner `for_prep` to promote accumulator types.
+        if (self.pending_link_close) |*plc| {
+            if (self.inline_depth == 0 and target == plc.inner_anchor_pc) {
+                switch (plc.phase) {
+                    .await_initial_entry => {
+                        // First `for_loop` visit: tier-0 jumped here from
+                        // `for_prep`. The bounds check just ran above. If the
+                        // loop continues (`within`), transition to `.peeling` —
+                        // the body will run next, promoting types. If the loop
+                        // exits, this is a one-trip-loop: clear the peel and
+                        // continue recording past the loop normally.
+                        if (within) {
+                            plc.phase = .peeling;
+                        } else {
+                            self.pending_link_close = null;
+                            // Continue recording — the guard_false exit direction
+                            // was already recorded above.
+                        }
+                    },
+                    .peeling => {
+                        // Post-body `for_loop`: one inner iteration completed.
+                        if (within) {
+                            // Check compatibility against the inner root's entry
+                            // guards using the CURRENT register state (types have
+                            // been promoted by the inner body).
+                            if (entryGuardsMatch(plc.contract, regs)) {
+                                // Types now match. Close `.link` with the
+                                // promoted state. The for_loop's `guard_true`
+                                // (continue test) was already emitted above, and
+                                // the stepped index/loop-var are published.
+                                self.link_target = plc.inner_anchor_pc;
+                                self.pending_link_provenance = .{ .link_terminal = .{
+                                    .path = pathFromFrames(&self.frames, self.inline_depth),
+                                    .inline_depth = self.inline_depth,
+                                    .source_proto_id = self.cur_proto_id,
+                                    .source_pc = self.cur_pc -| 1, // the for_loop opcode
+                                } };
+                                self.close_requested = true;
+                                self.pending_link_close = null;
+                            } else {
+                                // Still mismatched after one iteration — abort.
+                                // The peel can't help; fall back to today's
+                                // behavior (no link, eventual gate).
+                                self.pending_link_close = null;
+                                return self.abort(.type_instability);
+                            }
+                        } else {
+                            // One-trip inner loop: the body ran once but no
+                            // iteration 2 exists. Clear the peel and continue
+                            // recording past the loop — may produce a useful
+                            // one-trip-specialized continuation trace.
+                            self.pending_link_close = null;
+                        }
+                    },
+                }
+            }
+        }
     }
 
     /// `for_prep` (numeric-for entry): the nested-loop **trace-link** site (doc 15,
@@ -2774,6 +2936,9 @@ pub const RecordingSession = struct {
     /// inner root, which assumes ≥1 iteration. Phase 3 consumes this snapshot to follow
     /// the link through `driveChain`.
     pub fn recForPrepLink(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32) !void {
+        // Doc 47 increment A: a pending link peel forbids nested inner for-loops
+        // (a nested for_prep inside the peeled body is too complex for v1).
+        if (self.pending_link_close != null) return self.abort(.nyi_opcode);
         const a = instr.a;
 
         // Read + type-check the numeric-for control values up front (both directions
@@ -2861,6 +3026,34 @@ pub const RecordingSession = struct {
         // has a `.loop` root trace. Otherwise abort — the inner loop must trace as a
         // root first; once it does, a later continuation links here.
         if (!self.context.inner_root) return self.abort(.nyi_opcode);
+
+        // Doc 47 increment A: check whether the current register state matches the
+        // inner root's entry guards. If it does, use the existing immediate `.link`
+        // close. If not — and the mismatch is int→float promotable — take the
+        // record-through path and peel one inner iteration to promote types.
+        const inner_guards = self.context.inner_root_guards;
+        if (!self.precise and self.pending_link_close == null and inner_guards.len > 0) {
+            const compatible = entryGuardsMatch(inner_guards, regs);
+            if (!compatible and entryGuardsMismatchPromotable(inner_guards, regs)) {
+                // Promotable int→float mismatch: record `for_prep` as arithmetic
+                // (like zero-trip / inline_depth>0) and peel one inner iteration.
+                const rinit0 = try self.refOf(a);
+                const rlimit0 = try self.refOf(a + 1);
+                const rstep0 = try self.refOf(a + 2);
+                try self.guardNum(rinit0, vinit, .operand_type, .a);
+                try self.guardNum(rlimit0, vlimit, .operand_type, .a1);
+                try self.guardNum(rstep0, vstep, .operand_type, .a2);
+                const rsub = try self.emit(.{ .op = .sub, .a = rinit0, .b = rstep0, .ty = arithResultType(.sub, vinit, vstep) });
+                self.setReg(a, rsub);
+                self.pending_link_close = .{
+                    .inner_anchor_pc = inner_anchor,
+                    .for_loop_pc = fl_pc,
+                    .contract = inner_guards,
+                    .phase = .await_initial_entry,
+                };
+                return;
+            }
+        }
 
         // Reconstruct the inner root's entry state (discharges P2 — see the doc
         // comment). Guard init/limit/step are numbers (all three — tier-0 `for_prep`
@@ -3044,6 +3237,10 @@ pub const RecordingSession = struct {
     /// `all_results` RESULT window stores the sentinel in `ret_count` verbatim,
     /// resolved by `recReturn` once the callee's `ret` fixes `produced`.
     pub fn recCall(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto, multret: ?u32) !void {
+        // Doc 47 increment A: a pending link peel forbids inlined calls (v1
+        // conservative — sparse's inner body has no calls; a future version
+        // may allow balanced loop-free inlined calls).
+        if (self.pending_link_close != null) return self.abort(.nyi_opcode);
         const callee = regs.get(instr.a);
         if (!callee.isHeap()) return self.abort(.cross_frame);
         switch (callee.heapType()) {
@@ -4910,6 +5107,7 @@ pub const RecordingSession = struct {
         self.link_target = null;
         self.terminal_close = null;
         self.pending_link_provenance = null;
+        self.pending_link_close = null;
         self.inline_depth = 0;
         if (self.peel) |p| gpa.free(p.slots);
         self.peel = null;
