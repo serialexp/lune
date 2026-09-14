@@ -247,3 +247,53 @@ test "entryGuardsMismatchPromotable: no mismatch returns false" {
     regs.set(0, Value.float(1.0)); // already float → no mismatch
     try testing.expect(!rec_mod.entryGuardsMismatchPromotable(&guards, regs));
 }
+
+// ---------------------------------------------------------------------------
+// Regression: open-upvalue aliased_input must NOT fire for outer-frame upvals
+// in continuation/side recordings (anchor_abs_base bug).
+// ---------------------------------------------------------------------------
+
+test "continuation recording with open upvalue from caller frame does not abort aliased_input" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    // Pattern: module-level `local f = math.floor` captured as an open upvalue
+    // by a called function. A continuation trace (loop-done exit from the inner
+    // loop) records the outer body which contains `get_upval` of `floor`. Before
+    // the anchor_abs_base fix, maybeStartContinuation left anchor_abs_base=0,
+    // making the open-upvalue aliasing guard fire on ALL open upvalues.
+    //
+    // The nsieve-bit-fp shape: outer for + inner for with a get_upval in between.
+    // The inner loop traces as root. The outer loop's loop-done exit fires a
+    // continuation that tries to record the outer body (including `get_upval`).
+    // With the bug, the continuation aborts aliased_input.
+    const source =
+        \\local floor = math.floor
+        \\local function work(n)
+        \\  local count = 0
+        \\  for i = 1, n do
+        \\    local x = floor(i * 0.5)
+        \\    local s = 0
+        \\    for j = 1, 50 do s = s + x + j end
+        \\    count = count + s
+        \\  end
+        \\  return count
+        \\end
+        \\print(work(500))
+    ;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.record_aborts = true;
+    var nbuf: [64]u8 = undefined;
+    var nsink = io.Writer.fixed(&nbuf);
+    var chunk = try runNativeForTrace(&vm, gpa, source, &nsink);
+    defer chunk.deinit();
+
+    // The abort log must contain NO aliased_input entries. Before the fix,
+    // the continuation at the outer loop would abort aliased_input on every
+    // get_upval of `floor` because anchor_abs_base was 0.
+    for (vm.trace.abort_log.items) |rec| {
+        try testing.expect(rec.reason != .aliased_input);
+    }
+    // Also verify deterministic output.
+    try expectTier0Equiv(source);
+}

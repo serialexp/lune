@@ -222,6 +222,13 @@ pub fn maybeStartContinuation(self: *TraceState, proto: *const Proto, cur_pc: u3
     // the request may have been gated between creation and activation.
     if (self.recordingBarred(key)) return;
     self.rec.reset(self.gpa, key, proto.num_registers) catch return;
+    // Doc 43 P0a: seed the anchor's absolute slab base (same as armWithPolicy).
+    // Missing this left `anchor_abs_base = 0`, making the open-upvalue aliasing
+    // guard fire on ALL open upvalues regardless of frame depth.
+    // Doc 43 P0a: seed the anchor's absolute slab base (same as armWithPolicy).
+    // Missing this left `anchor_abs_base = 0`, making the open-upvalue aliasing
+    // guard fire on ALL open upvalues regardless of frame depth.
+    self.rec.anchor_abs_base = self.pending_anchor_base;
     // Mark this recording a continuation so `recForPrepLink` may close it with a
     // `.link` at the inner `for_prep` (a root recording, armed via `arm`, leaves
     // this `.root` and instead LINNER-aborts there — LuaJIT's model).
@@ -248,6 +255,8 @@ pub fn maybeStartReplaySide(self: *TraceState, proto: *const Proto, cur_pc: u32)
     // the request may have been gated between creation and activation.
     if (self.recordingBarred(key)) return;
     self.rec.reset(self.gpa, key, proto.num_registers) catch return;
+    // Doc 43 P0a: seed the anchor's absolute slab base (same as armWithPolicy).
+    self.rec.anchor_abs_base = self.pending_anchor_base;
     self.rec.kind = .side;
     self.rec.side_src = src;
 }
