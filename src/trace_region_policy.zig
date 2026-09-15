@@ -342,7 +342,21 @@ pub const RegionPolicy = struct {
             if (self.region_defs.getPtr(u.id)) |d| d.owner = u.owner;
         }
         for (staged.staged_armable_updates.items) |u| {
-            if (self.region_defs.getPtr(u.id)) |d| d.armable = u.armable;
+            if (self.region_defs.getPtr(u.id)) |d| {
+                d.armable = u.armable;
+                d.fallback_owner = u.fallback_owner;
+                d.dormant = u.dormant;
+                if (u.reset_learning) {
+                    // Election tier flipped primary↔fallback: stale fallback
+                    // evidence must not survive into (or return from) a
+                    // primary-owned phase.
+                    d.instability = 0;
+                    d.no_candidate_runs = 0;
+                    d.admission_failures = 0;
+                    d.receipts_debit = 0;
+                    d.transitions_credit = 0;
+                }
+            }
         }
         for (staged.staged_bridge_updates.items) |u| {
             const d = self.region_defs.getPtr(u.id).?;

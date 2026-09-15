@@ -594,6 +594,33 @@ pub const TraceConfig = struct {
     /// Number of identical, consecutive full-ledger cycle detections required
     /// before publishing a promotion.
     promote_after: u32 = 4,
+    /// Doc 47 Increment B follow-up: fallback-region instability tombstone.
+    /// A fallback-elected region whose promotions are destroyed by `.unfreeze`
+    /// demotions (window strike killing a live promotion) this many times —
+    /// net of clean `.region_close` survivals, which decrement — is
+    /// invalidated: the promote/patch + demote/unpatch churn costs more than
+    /// the ledger drains it saves (measured: scimark-lu, 175k cycles/run).
+    region_instability_tombstone: u8 = 8,
+    /// Fallback-region failed-opportunity tombstone: full-cap `.yielded`
+    /// ledgers for an ACTIVE frozen fallback region that produce no promotable
+    /// candidate. Reset by a successful promotion. 2× `promote_after`.
+    region_no_candidate_tombstone: u8 = 8,
+    /// Dormant-admission probe cap: after this many failed admission probes a
+    /// dormant fallback region is never probed again (terminal dormancy),
+    /// bounding the probe cost on shapes that never qualify.
+    region_admission_probe_cap: u8 = 64,
+    /// Net-profitability minimum sample: priced receipts a fallback region
+    /// may accumulate before the credit/debit balance is enforced. Below
+    /// this, no verdict — admission evidence plus the other triggers
+    /// (instability, no-candidate) govern the warmup.
+    region_payoff_receipts: u32 = 4096,
+    /// Net-profitability weight: one suppressed silent transition repays
+    /// this many priced receipts. Grounded in measured micro-costs, not a
+    /// benchmark: a suppressed ledger row saves its share of the ~4889-cycle
+    /// LEDGER_CAP drain (~150 cycles/row), while a priced receipt costs the
+    /// classify/choose walk (tens of cycles) — the ratio sits in the low
+    /// single digits; 4 keeps a margin toward keeping regions alive.
+    region_profit_weight: u32 = 4,
     /// Gate backoff (replaces the old permanent blacklist). When an anchor is
     /// gated (low-yield penalty maxed, a recording abort, or a commit failure) it
     /// is held off tier-1 for a *cooldown window* measured in back-edges, after
@@ -983,6 +1010,12 @@ pub const TraceState = struct {
     /// Cleared at every `replayLedger` entry so a stale request can never leak
     /// across ledgers.
     pending_bridge_arm: ?ExitKey = null,
+    /// Doc 47 Increment B follow-up: set by `invalidateRegion`; drained at the
+    /// dispatcher drain tail (post-replay-walk safe point) by
+    /// `drainPendingRegionRebuild` — rebuilds the region topology so the
+    /// invalidated region leaves the source/dest receipt maps and
+    /// `receiptsInert()` can short-circuit receipts again.
+    pending_region_rebuild: bool = false,
     /// Part S: one-shot arm request. Set when a `Trace.sibling_watch_count` crosses
     /// `hotguard`; consumed by `tryArmSiblingHandoff` at the dispatcher's NEXT
     /// successful same-anchor trace entry — so the armed child is the trace the
@@ -1243,6 +1276,10 @@ pub const TraceState = struct {
     /// test (a byte-identical run under an open window cannot, by itself, prove a
     /// non-empty registry was torn down — the counter can).
     silent_promotion_candidates: u64 = 0,
+    /// Promotions that reused a parked proof (codex C′) instead of re-earning
+    /// the `promote_after` observation streak — the "activation churn skipped"
+    /// counter for repeated activations of the same fallback region.
+    silent_parked_reuses: u64 = 0,
     silent_rejects: PromotionRejects = .{},
 
     silent_bursts_drained: u64 = 0,
@@ -1944,12 +1981,20 @@ pub const TraceState = struct {
             jitdbg.log("  B-3 seam rows: bridge-free-closed={d} rest={d} total={d}", .{
                 self.dbg_patchable_cycle_rows, self.dbg_other_replay_rows, replay_total,
             });
-            jitdbg.log("  silent: candidates={d} promotions={d} demotions={d} bursts={d} transitions={d} hops={d} budget={d} barren={d} suffix={d}", .{
+            jitdbg.log("  silent: candidates={d} promotions={d} parked-reuses={d} demotions={d} bursts={d} transitions={d} hops={d} budget={d} barren={d} suffix={d}", .{
                 self.silent_promotion_candidates,               self.registry.native_physical.silent_promotions,
+                self.silent_parked_reuses,
                 self.registry.native_physical.silent_demotions, self.silent_bursts_drained,
                 self.silent_transitions_total,                  self.silent_hops_total,
                 self.silent_budget_exhaustions,                 self.silent_barren_exhaustions,
                 self.silent_suffix_drains,
+            });
+            jitdbg.log("  region maps: profit count={d} cap={d} source={d} dest={d} defs={d}", .{
+                self.region_policy.region_profit.count(),
+                self.region_policy.region_profit.capacity(),
+                self.region_policy.source_exit_regions.count(),
+                self.region_policy.dest_entry_regions.count(),
+                self.region_policy.region_defs.count(),
             });
             jitdbg.log("  silent rejects: bridge={d} region={d} open={d} child-mismatch={d} no-patch={d} cap={d} region-owned={d}", .{
                 self.silent_rejects.bridge_member,
@@ -2772,6 +2817,9 @@ pub const TraceState = struct {
     pub const rebuildEdgeCache = trace_regionops_mod.rebuildEdgeCache;
     pub const rebuildEdgeCacheFallible = trace_regionops_mod.rebuildEdgeCacheFallible;
     pub const clearPhysicalRegionIndices = trace_regionops_mod.clearPhysicalRegionIndices;
+    pub const drainPendingRegionRebuild = trace_regionops_mod.drainPendingRegionRebuild;
+    pub const minOpenRegion = trace_regionops_mod.minOpenRegion;
+    pub const chargePayoffReceipt = trace_regionops_mod.chargePayoffReceipt;
     pub const rebuildRegions = trace_regionops_mod.rebuildRegions;
     pub const rebuildRegionsFallible = trace_regionops_mod.rebuildRegionsFallible;
     pub const closeNonArmableAccumulators = trace_regionops_mod.closeNonArmableAccumulators;

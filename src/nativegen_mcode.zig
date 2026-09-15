@@ -256,6 +256,25 @@ pub const McodeArena = struct {
         }
     }
 
+    /// Flip only the page-aligned window of `mem` covering `[off, off+len)`.
+    /// An mprotect's direct cost scales with the range (PTE rewrite + per-page
+    /// TLB invalidation), and flipping unrelated pages RX→RW→RX additionally
+    /// forces instruction refetch for every other trace co-located in the
+    /// 1 MiB region. The patch path is not compile-time-only: promote/demote
+    /// cycles patch per region activation (grid_matmul measured 1,640
+    /// region-wide flips — 2 per patched edge — before this narrowing), so
+    /// the window must stay proportional to the bytes actually written.
+    fn protectWindow(mem: []align(page_align) u8, off: usize, len: usize, exec: bool) MapError!void {
+        if (comptime !is_x64_linux) return error.UnsupportedTarget;
+        const page = std.heap.pageSize();
+        const start = std.mem.alignBackward(usize, off, page);
+        // Region lengths are page-rounded at map time, so the clamp only
+        // guards the theoretical last-page overshoot of alignForward.
+        const end = @min(std.mem.alignForward(usize, off + len, page), mem.len);
+        const window: []align(page_align) u8 = @alignCast(mem[start..end]);
+        return protectRegion(window, exec);
+    }
+
     fn mapRegion(self: *McodeArena, min_bytes: usize) (MapError || std.mem.Allocator.Error)!*Region {
         const page = std.heap.pageSize();
         const len = std.mem.alignForward(usize, @max(min_bytes, REGION_SIZE), page);
@@ -284,9 +303,9 @@ pub const McodeArena = struct {
         for (self.free_list.items, 0..) |fb, i| {
             if (fb.cap >= cap) {
                 const region_mem = self.regions.items[fb.region].mem;
-                try protectRegion(region_mem, false);
+                try protectWindow(region_mem, fb.offset, code.len, false);
                 @memcpy(region_mem[fb.offset..][0..code.len], code);
-                try protectRegion(region_mem, true);
+                try protectWindow(region_mem, fb.offset, code.len, true);
                 const generation = self.takePageGeneration();
                 try self.live_pages.append(self.gpa, .{ .region = fb.region, .offset = fb.offset, .generation = generation });
                 _ = self.free_list.swapRemove(i);
@@ -312,9 +331,9 @@ pub const McodeArena = struct {
         }
         const region = &self.regions.items[region_idx];
         const off = region.used;
-        try protectRegion(region.mem, false);
+        try protectWindow(region.mem, off, code.len, false);
         @memcpy(region.mem[off..][0..code.len], code);
-        try protectRegion(region.mem, true);
+        try protectWindow(region.mem, off, code.len, true);
         const generation = self.takePageGeneration();
         try self.live_pages.append(self.gpa, .{ .region = region_idx, .offset = off, .generation = generation });
         region.used += cap;
@@ -364,11 +383,12 @@ pub const McodeArena = struct {
     }
 
     fn applyPatch(self: *McodeArena, region: *Region, dst: []u8, replacement: []const u8) PatchError!void {
-        try protectRegion(region.mem, false);
+        const off = @intFromPtr(dst.ptr) - @intFromPtr(region.mem.ptr);
+        try protectWindow(region.mem, off, dst.len, false);
         // Once RW is established there is no fallible apply step. RX restoration is
         // a soundness boundary, not a recoverable compile miss.
         @memcpy(dst, replacement);
-        protectRegion(region.mem, true) catch @panic("McodeArena: failed to restore RX after patch");
+        protectWindow(region.mem, off, dst.len, true) catch @panic("McodeArena: failed to restore RX after patch");
         _ = self;
     }
 

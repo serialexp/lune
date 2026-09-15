@@ -70,7 +70,18 @@ pub const StagedIntern = struct { edges: []StructuralEdgeId, id: RegionId };
 pub const StagedDef = struct { id: RegionId, def: RegionDef };
 pub const StagedBridgeUpdate = struct { id: RegionId, bridges: []RegionBridgeDef };
 pub const StagedOwnerUpdate = struct { id: RegionId, owner: AnchorKey };
-pub const StagedArmableUpdate = struct { id: RegionId, armable: bool };
+pub const StagedArmableUpdate = struct {
+    id: RegionId,
+    armable: bool,
+    fallback_owner: bool = false,
+    /// Effective dormancy after this rebind (kept from the stored def when the
+    /// election tier is unchanged; reset to `fallback_owner` when it flips).
+    dormant: bool = false,
+    /// True when the election tier flipped primary↔fallback: publish must zero
+    /// the region's fallback learning counters (instability, no_candidate_runs,
+    /// admission_failures) so stale evidence never crosses a tier change.
+    reset_learning: bool = false,
+};
 pub const Rebuild = struct {
     staged_interns: std.ArrayListUnmanaged(StagedIntern) = .empty,
     staged_defs: std.ArrayListUnmanaged(StagedDef) = .empty,

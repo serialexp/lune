@@ -204,6 +204,65 @@ pub const RegionDef = struct {
     /// incomplete when we looked" (recoverable) from "this region misbehaved"
     /// (permanent).
     tombstoned: bool = false,
+    /// Doc 47 Increment B: true when the owner was elected by the CLOSED-SCC
+    /// fallback tier (the unique loop-root destination of a continuation
+    /// `.link_terminal` back-edge) rather than the primary external-entry /
+    /// enclosing predicate. Refreshed per rebind alongside `armable`. Consumed
+    /// by `applyWindowDecision`: a fallback-elected region that strikes out at
+    /// `max_penalty` is TOMBSTONED (one-shot, back to the pre-inc-B status quo
+    /// for that region) instead of repeatedly gating its owner anchor and
+    /// tearing down every armed link — a dispatcher-entered closed cycle has no
+    /// future entry edge that could ever change its yield, so low yield means
+    /// the election itself was unprofitable (measured: fft's dual=1 butterfly
+    /// phases, +96% wall from repeated gate+disarmAllLinks cycles).
+    fallback_owner: bool = false,
+    /// Doc 47 Increment B follow-up (demand-driven admission): a fallback-elected
+    /// region mints DORMANT — excluded from the source/dest receipt maps so
+    /// `receiptsInert()` keeps short-circuiting and receipts pay nothing for it.
+    /// `tryDormantAdmission` clears the bit (once, per region lifetime, modulo an
+    /// election-tier flip which resets all fallback learning) when a full-cap
+    /// `.yielded` ledger proves a promotable set for the region — the exact
+    /// evidence that the arming can amortize its per-receipt accounting tax.
+    /// Measured: spectral-norm minted 2 armable-but-never-promoting regions and
+    /// paid +16% wall in per-receipt classify/credit with zero payoff.
+    dormant: bool = false,
+    /// Saturating count of promotions destroyed by an `.unfreeze` demotion (a
+    /// window strike killing a live promotion — "we paid to patch, then
+    /// immediately unpatched"). Decremented when a promotion instead survives to
+    /// a clean `.region_close` lifecycle demotion. At
+    /// `config.region_instability_tombstone` a fallback region is invalidated:
+    /// promote/demote oscillation (scimark-lu: 175k cycles/run at ~35
+    /// transitions per burst, +28% wall) costs more than the drains it saves.
+    instability: u8 = 0,
+    /// Saturating count of full-cap `.yielded` ledgers observed for this ACTIVE,
+    /// frozen fallback region that produced no promotable candidate — the
+    /// region was admitted on good evidence but its physical topology stopped
+    /// being promotable. At `config.region_no_candidate_tombstone`, invalidate.
+    no_candidate_runs: u8 = 0,
+    /// Deterministic net-work ledger, DEBIT side: lifetime count of priced
+    /// receipts — the unit the region accounting tax is actually paid in
+    /// (classify/choose/open per receipt). Charged in `chargePayoffReceipt`
+    /// whenever this region is the effective activation for a receipt (or
+    /// the min-id open activation for an unresolved one). NEVER reset by a
+    /// promotion — "promotion occurred" and "promotion repaid the
+    /// accumulated cost" are different facts (grid_matmul: 203 steady
+    /// promotions, net-negative anyway). Windows and activations were both
+    /// tried and rejected as the unit: scimark-lu's surviving region runs
+    /// tiny activations whose windows never complete, keeping both proxies
+    /// at zero while paying 12% wall in the per-receipt pipeline.
+    receipts_debit: u64 = 0,
+    /// Deterministic net-work ledger, CREDIT side: lifetime silent
+    /// transitions suppressed by this region's promoted sets, rolled up at
+    /// the burst drain (`driveSilentBurst`). Once `receipts_debit` passes
+    /// the `region_payoff_receipts` minimum sample, the region survives only
+    /// while `transitions_credit × region_profit_weight ≥ receipts_debit` —
+    /// cumulative deterministic benefit must keep repaying cumulative
+    /// accounting cost, or the region is invalidated.
+    transitions_credit: u64 = 0,
+    /// Saturating count of failed dormant-admission probes. At
+    /// `config.region_admission_probe_cap` the region stops being probed —
+    /// terminal dormancy, bounding probe cost on shapes that never qualify.
+    admission_failures: u8 = 0,
 };
 
 pub fn freeRegionBridges(gpa: std.mem.Allocator, bridges: []RegionBridgeDef) void {

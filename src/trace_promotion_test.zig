@@ -1785,3 +1785,433 @@ test "B-3d.2 repeated-parent set promotes, zero-evidence edges included, and an 
     try testing.expectEqual(@as(u64, 1), state.silent_budget_exhaustions);
     state.demoteAllSets();
 }
+
+// ── C′ parked promotion proofs (doc 47 Increment B follow-up) ────────────────
+
+/// Full-cap forced-yield ledger over the a/b ring — the evidence class
+/// `considerSilentPromotion` requires before it will consult a parked proof.
+fn b3FullYieldedLedger(a: *Trace, b: *Trace, buf: *[trace_exec.LEDGER_CAP]trace_exec.LedgerEntry) []const trace_exec.LedgerEntry {
+    for (buf, 0..) |*row, i| {
+        row.* = b3ObservedRow(if (i % 2 == 0) a else b, 0, .link_terminal);
+    }
+    buf[buf.len - 1].outcome = .yielded;
+    return buf;
+}
+
+test "C' parked proof: clean region_close parks; next activation re-promotes without detection or streak" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [4]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1720, .code = &code, .name = "b3-parked", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    const observed = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+    };
+    const key1: RegionKey = .{ .region_id = @enumFromInt(7), .activation = 40 };
+    try installB3PromotionRegion(&state, key1, &.{ a, b });
+    state.region_policy.region_defs.getPtr(key1.region_id).?.fallback_owner = true;
+    const edges = state.detectPromotableSet(&observed, key1).?;
+    defer gpa.free(edges);
+    try state.promoteSet(edges, key1);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
+
+    // Clean close: promotion demotes with `.region_close`, and the proof parks.
+    state.closeRegion(key1);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.parked_proofs.items.len);
+    try testing.expectEqual(key1.region_id, state.registry.native_physical.parked_proofs.items[0].region_id);
+    for (edges) |edge| try expectB3Patched(edge, false);
+
+    // A NEW activation of the same region: one full-cap yielded ledger with a
+    // frozen accumulator re-promotes from the parked proof — no
+    // `detectPromotableSet` candidacy (candidates counter stays 0), no
+    // `promote_after` streak.
+    const key2: RegionKey = .{ .region_id = key1.region_id, .activation = 41 };
+    try state.region_policy.region_profit.put(gpa, key2, .{
+        .root_frame_depth = 1,
+        .root_call_seq = key2.activation,
+        .useful_window_seen = true,
+        .useful_streak = state.config.freeze_windows,
+        .frozen = true,
+    });
+    state.region_policy.region_context = .{ .depth = 1, .call_seq = key2.activation };
+    var buf: [trace_exec.LEDGER_CAP]trace_exec.LedgerEntry = undefined;
+    state.considerSilentPromotion(b3FullYieldedLedger(a, b, &buf));
+    try testing.expectEqual(@as(u64, 1), state.silent_parked_reuses);
+    try testing.expectEqual(@as(u64, 0), state.silent_promotion_candidates);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
+    try testing.expect(std.meta.eql(key2, state.registry.native_physical.promoted_sets.items[0].region_key));
+    // Take semantics: the proof was consumed by the reuse.
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.parked_proofs.items.len);
+    for (edges) |edge| try expectB3Patched(edge, true);
+    state.demoteAllSets();
+}
+
+test "C' parked proof: .unfreeze never parks; a non-fallback (primary) region_close never parks" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [4]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1721, .code = &code, .name = "b3-nopark", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    const observed = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+    };
+    const key: RegionKey = .{ .region_id = @enumFromInt(8), .activation = 50 };
+    try installB3PromotionRegion(&state, key, &.{ a, b });
+    state.region_policy.region_defs.getPtr(key.region_id).?.fallback_owner = true;
+    const edges = state.detectPromotableSet(&observed, key).?;
+    defer gpa.free(edges);
+
+    // `.unfreeze` is negative evidence — no park.
+    try state.promoteSet(edges, key);
+    _ = state.demotePromotionsForRegionReason(key, .unfreeze);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.parked_proofs.items.len);
+
+    // A primary-elected owner (fallback_owner=false) parks nothing either:
+    // its promotion lifecycle predates Increment B and stays untouched.
+    state.region_policy.region_defs.getPtr(key.region_id).?.fallback_owner = false;
+    try state.promoteSet(edges, key);
+    _ = state.demotePromotionsForRegionReason(key, .region_close);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.parked_proofs.items.len);
+}
+
+test "C' parked proof: trace retire and defs mutation drop proofs; a stale proof fails closed into detection" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [4]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1722, .code = &code, .name = "b3-drop", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    const observed = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+    };
+    const key: RegionKey = .{ .region_id = @enumFromInt(9), .activation = 60 };
+    try installB3PromotionRegion(&state, key, &.{ a, b });
+    state.region_policy.region_defs.getPtr(key.region_id).?.fallback_owner = true;
+
+    // Leg 1: a retiring member trace drops the proof (its pointers dangle).
+    {
+        const edges = state.detectPromotableSet(&observed, key).?;
+        defer gpa.free(edges);
+        try state.promoteSet(edges, key);
+        _ = state.demotePromotionsForRegionReason(key, .region_close);
+        try testing.expectEqual(@as(usize, 1), state.registry.native_physical.parked_proofs.items.len);
+        state.registry.native_physical.resetLinksTouching(&state.registry.mcode_arena, b);
+        try testing.expectEqual(@as(usize, 0), state.registry.native_physical.parked_proofs.items.len);
+    }
+
+    // Leg 2: a region-defs mutation drops the proof (membership is part of it).
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    {
+        const edges = state.detectPromotableSet(&observed, key).?;
+        defer gpa.free(edges);
+        try state.promoteSet(edges, key);
+        _ = state.demotePromotionsForRegionReason(key, .region_close);
+        try testing.expectEqual(@as(usize, 1), state.registry.native_physical.parked_proofs.items.len);
+        state.registry.native_physical.demoteSetsForRegionDefsMutation(&state.registry.mcode_arena);
+        try testing.expectEqual(@as(usize, 0), state.registry.native_physical.parked_proofs.items.len);
+    }
+
+    // Leg 3: a proof made stale by a RELATION change (same slot re-armed to a
+    // different child — a funnel that does not drop proofs) fails the
+    // `promoteSet` re-validation, is discarded (take semantics), and the call
+    // falls through to ordinary detection of the CURRENT armed population.
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    {
+        const edges = state.detectPromotableSet(&observed, key).?;
+        defer gpa.free(edges);
+        try state.promoteSet(edges, key);
+        _ = state.demotePromotionsForRegionReason(key, .region_close);
+        try testing.expectEqual(@as(usize, 1), state.registry.native_physical.parked_proofs.items.len);
+    }
+    const c2 = try makeB3LinkTrace(gpa, &state, &proto, 3, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, c2, .link_terminal));
+    state.region_policy.region_context = .{ .depth = 1, .call_seq = key.activation };
+    var buf: [trace_exec.LEDGER_CAP]trace_exec.LedgerEntry = undefined;
+    state.considerSilentPromotion(b3FullYieldedLedger(a, b, &buf));
+    try testing.expectEqual(@as(u64, 0), state.silent_parked_reuses);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.parked_proofs.items.len);
+    // Detection DID run against the live registry — and correctly rejected
+    // the a→b evidence rows against the re-armed a→c2 relation, promoting
+    // nothing (the stale proof could not smuggle the old relation through).
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.child_mismatch);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
+    state.demoteAllSets();
+}
+
+// ── inc-B follow-up: dormant admission, no-candidate settlement, instability ─
+
+test "inc-B dormant admission: min-RegionId of the matching dormant regions admits; non-matching eligibles are charged; saturated failures are terminal" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [4]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1730, .code = &code, .name = "b3-admit", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+
+    // Two MATCHING dormant fallback regions (same membership) + one that can
+    // never match (empty membership). Admission must pick the minimum
+    // matching RegionId, leave the other matcher dormant and uncharged, and
+    // charge the non-matcher one failure.
+    const k20: RegionKey = .{ .region_id = @enumFromInt(20), .activation = 70 };
+    const k21: RegionKey = .{ .region_id = @enumFromInt(21), .activation = 71 };
+    try installB3PromotionRegion(&state, k20, &.{ a, b });
+    try installB3PromotionRegion(&state, k21, &.{ a, b });
+    const rid22: RegionId = @enumFromInt(22);
+    try state.region_policy.region_defs.put(gpa, rid22, .{
+        .members = try gpa.alloc(StructuralEdgeId, 0),
+        .member_points = try gpa.alloc(ProgramPoint, 0),
+        .owner = .{ .proto = &proto, .pc = 3 },
+        .classifier = .{ .kind = .cross_trace_cycle, .member_count = 0 },
+        .armable = true,
+        .bridges = try gpa.alloc(RegionBridgeDef, 0),
+    });
+    for ([_]RegionId{ k20.region_id, k21.region_id, rid22 }) |rid| {
+        const d = state.region_policy.region_defs.getPtr(rid).?;
+        d.fallback_owner = true;
+        d.dormant = true;
+    }
+
+    var buf: [trace_exec.LEDGER_CAP]trace_exec.LedgerEntry = undefined;
+    state.considerSilentPromotion(b3FullYieldedLedger(a, b, &buf));
+    // NOTE: admission triggers `rebuildRegions`, which tombstones these
+    // hand-installed defs (their edges aren't in the topology view) — but the
+    // defs and their learning fields persist, so the admission outcome stays
+    // assertable.
+    try testing.expect(!state.region_policy.region_defs.get(k20.region_id).?.dormant);
+    try testing.expectEqual(@as(u8, 0), state.region_policy.region_defs.get(k20.region_id).?.admission_failures);
+    try testing.expect(state.region_policy.region_defs.get(k21.region_id).?.dormant);
+    try testing.expectEqual(@as(u8, 0), state.region_policy.region_defs.get(k21.region_id).?.admission_failures);
+    try testing.expect(state.region_policy.region_defs.get(rid22).?.dormant);
+    try testing.expectEqual(@as(u8, 1), state.region_policy.region_defs.get(rid22).?.admission_failures);
+}
+
+test "inc-B dormant admission: saturated admission_failures is terminal even for a ledger the region would match" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [4]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1731, .code = &code, .name = "b3-terminal", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    const key: RegionKey = .{ .region_id = @enumFromInt(23), .activation = 72 };
+    try installB3PromotionRegion(&state, key, &.{ a, b });
+    {
+        const d = state.region_policy.region_defs.getPtr(key.region_id).?;
+        d.fallback_owner = true;
+        d.dormant = true;
+        d.admission_failures = state.config.region_admission_probe_cap;
+    }
+    var buf: [trace_exec.LEDGER_CAP]trace_exec.LedgerEntry = undefined;
+    state.considerSilentPromotion(b3FullYieldedLedger(a, b, &buf));
+    const d = state.region_policy.region_defs.get(key.region_id).?;
+    try testing.expect(d.dormant);
+    try testing.expectEqual(state.config.region_admission_probe_cap, d.admission_failures);
+}
+
+test "inc-B no-candidate settlement: consecutive dry full-cap ledgers saturate and invalidate; a successful (parked) promotion resets the count" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [4]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1732, .code = &code, .name = "b3-dry", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
+    // NO armed links: the region is active + frozen but detection can never
+    // produce a candidate — the failed-opportunity shape.
+    const key: RegionKey = .{ .region_id = @enumFromInt(24), .activation = 80 };
+    try installB3PromotionRegion(&state, key, &.{ a, b });
+    state.region_policy.region_defs.getPtr(key.region_id).?.fallback_owner = true;
+    state.region_policy.region_context = .{ .depth = 1, .call_seq = key.activation };
+    var buf: [trace_exec.LEDGER_CAP]trace_exec.LedgerEntry = undefined;
+    const threshold = state.config.region_no_candidate_tombstone;
+    var i: u8 = 0;
+    while (i < threshold - 1) : (i += 1) state.considerSilentPromotion(b3FullYieldedLedger(a, b, &buf));
+    {
+        const d = state.region_policy.region_defs.get(key.region_id).?;
+        try testing.expectEqual(threshold - 1, d.no_candidate_runs);
+        try testing.expect(!d.tombstoned);
+    }
+    // A successful promotion resets the CONSECUTIVE count: reuse a parked
+    // proof (park it directly from a real detection with the links armed).
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    state.considerSilentPromotion(b3FullYieldedLedger(a, b, &buf));
+    // (streak 1 of promote_after — no promotion yet, but detection succeeded,
+    //  so the dry-run count must NOT have advanced.)
+    var j: u32 = 1;
+    while (j < state.config.promote_after) : (j += 1) state.considerSilentPromotion(b3FullYieldedLedger(a, b, &buf));
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
+    {
+        const d = state.region_policy.region_defs.get(key.region_id).?;
+        try testing.expectEqual(@as(u8, 0), d.no_candidate_runs);
+        try testing.expect(!d.tombstoned);
+    }
+    state.demoteAllSets();
+
+    // Saturation: from a clean count, dry ledgers to the threshold invalidate
+    // one-shot and request the deferred maps rebuild.
+    state.disarmAllLinks();
+    state.region_policy.region_defs.getPtr(key.region_id).?.no_candidate_runs = 0;
+    i = 0;
+    while (i < threshold) : (i += 1) state.considerSilentPromotion(b3FullYieldedLedger(a, b, &buf));
+    {
+        const d = state.region_policy.region_defs.get(key.region_id).?;
+        try testing.expect(d.tombstoned);
+        try testing.expect(!d.armable);
+    }
+    try testing.expect(state.pending_region_rebuild);
+}
+
+test "inc-B instability: an .unfreeze strike on a LIVE promotion charges; a strike without one does not; clean region_close survival recovers; saturation tombstones" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [4]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1733, .code = &code, .name = "b3-instab", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    const observed = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+    };
+    const key: RegionKey = .{ .region_id = @enumFromInt(25), .activation = 90 };
+    try installB3PromotionRegion(&state, key, &.{ a, b });
+    state.region_policy.region_defs.getPtr(key.region_id).?.fallback_owner = true;
+
+    // Strike with NO live promotion: no instability charge.
+    state.flushRegionWindow(key, 1);
+    try testing.expectEqual(@as(u8, 0), state.region_policy.region_defs.get(key.region_id).?.instability);
+
+    // Strike with a LIVE promotion: `.unfreeze` demotion + instability 1.
+    // (The promotion-free strike above unfroze the accumulator; re-freeze.)
+    try state.region_policy.region_profit.put(gpa, key, .{ .root_frame_depth = 1, .root_call_seq = key.activation, .useful_window_seen = true, .frozen = true });
+    const edges = state.detectPromotableSet(&observed, key).?;
+    defer gpa.free(edges);
+    try state.promoteSet(edges, key);
+    state.flushRegionWindow(key, 1);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
+    try testing.expectEqual(@as(u64, 1), state.registry.native_physical.silent_demotion_reasons.unfreeze);
+    try testing.expectEqual(@as(u8, 1), state.region_policy.region_defs.get(key.region_id).?.instability);
+    // An `.unfreeze` demotion parks nothing.
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.parked_proofs.items.len);
+
+    // Clean region_close survival decrements. (Re-freeze the accumulator
+    // first — the strike above unfroze it, and promotion requires frozen.)
+    try state.region_policy.region_profit.put(gpa, key, .{ .root_frame_depth = 1, .root_call_seq = key.activation, .useful_window_seen = true, .frozen = true });
+    try state.promoteSet(edges, key);
+    state.closeRegion(key);
+    try testing.expectEqual(@as(u8, 0), state.region_policy.region_defs.get(key.region_id).?.instability);
+    // ... and DID park (clean close of a fallback-owned live set).
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.parked_proofs.items.len);
+    state.registry.native_physical.dropAllParkedProofs();
+
+    // Saturation: with the counter one below the threshold, one more
+    // unfreeze-of-a-live-promotion tombstones one-shot.
+    state.region_policy.region_defs.getPtr(key.region_id).?.instability = state.config.region_instability_tombstone - 1;
+    try state.region_policy.region_profit.put(gpa, key, .{ .root_frame_depth = 1, .root_call_seq = key.activation, .useful_window_seen = true, .frozen = true });
+    try state.promoteSet(edges, key);
+    state.flushRegionWindow(key, 1);
+    {
+        const d = state.region_policy.region_defs.get(key.region_id).?;
+        try testing.expect(d.tombstoned);
+        try testing.expect(!d.armable);
+    }
+    try testing.expect(state.pending_region_rebuild);
+}
+
+test "C' parked proof invalidation (codex round 4): membership growth, exit mutation, and empty-links global disarm all drop proofs" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [4]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1734, .code = &code, .name = "b3-inval", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    const observed = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+    };
+    const key: RegionKey = .{ .region_id = @enumFromInt(26), .activation = 100 };
+    try installB3PromotionRegion(&state, key, &.{ a, b });
+    state.region_policy.region_defs.getPtr(key.region_id).?.fallback_owner = true;
+
+    const park = struct {
+        fn park(s: *TraceState, k: RegionKey, obs: []const trace_exec.LedgerEntry) !void {
+            const edges = s.detectPromotableSet(obs, k).?;
+            defer s.gpa.free(edges);
+            try s.promoteSet(edges, k);
+            _ = s.demotePromotionsForRegionReason(k, .region_close);
+            try testing.expectEqual(@as(usize, 1), s.registry.native_physical.parked_proofs.items.len);
+        }
+    }.park;
+
+    // Leg 1 — membership growth: a NEW armed region-member edge (fresh
+    // parent `c` at a member anchor, never part of the parked set) falsifies
+    // the parked proof's region-total claim and drops it, even with ZERO
+    // live promoted sets.
+    try park(&state, key, &observed);
+    const c = try makeB3LinkTrace(gpa, &state, &proto, 3, 2, 1);
+    try testing.expect(try state.armNativeLink(c, 0, a, .link_terminal));
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.parked_proofs.items.len);
+    // Drop c's arm again so later legs re-detect the two-edge set.
+    state.registry.native_physical.resetLinksTouching(&state.registry.mcode_arena, c);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+
+    // Leg 2 — exit mutation: re-arming a RELATION named by the proof (a,0 →
+    // different child) drops it at the physical funnel, so a later identical
+    // re-arm cannot resurrect the invalidated evidence.
+    try park(&state, key, &observed);
+    const c2 = try makeB3LinkTrace(gpa, &state, &proto, 4, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, c2, .link_terminal));
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.parked_proofs.items.len);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+
+    // Leg 3 — global disarm with ZERO armed links (the TraceRegistry.clear
+    // shape: links already gone, traces about to be destroyed) still drops
+    // every proof — the drop happens before the empty-links early return.
+    try park(&state, key, &observed);
+    state.registry.native_physical.armed_links.clearRetainingCapacity();
+    state.disarmAllLinks();
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.parked_proofs.items.len);
+}

@@ -616,6 +616,42 @@ test "doc 47 convergence: grow-then-reuse commits an append continuation, then t
     try testing.expect(vm.trace.record_gate.get(key) == null);
     // …and convergence needed no retirement: the stale append trace is still
     // cached (found above), the sibling simply took over.
+
+    // Doc 47 Increment B: the fully-closed {inner root, continuation} SCC now
+    // elects the inner root through the closed-SCC fallback (the unique
+    // loop-root destination of the continuation's `.link` back-edge), so the
+    // cycle's region is ARMABLE and silent promotion actually engages —
+    // pre-inc-B this minted `armable=false` forever and every burst drained at
+    // LEDGER_CAP through the runtime seam.
+    {
+        var armable_cycle = false;
+        var it = vm.trace.region_policy.region_defs.valueIterator();
+        while (it.next()) |def| {
+            if (def.classifier.kind == .cross_trace_cycle and def.armable) armable_cycle = true;
+        }
+        try testing.expect(armable_cycle);
+    }
+    try testing.expect(vm.trace.registry.native_physical.silent_promotions > 0);
+    try testing.expect(vm.trace.silent_transitions_total > 0);
+    // The steady-state cycle carries all three expected arm kinds: the
+    // loop-done link into the continuation, the guard_append sibling handoff,
+    // and the `.link` terminal back into the inner root.
+    {
+        var saw_loopdone = false;
+        var saw_sibling = false;
+        var saw_link = false;
+        for (vm.trace.registry.native_physical.armedLinks()) |l| switch (l.kind) {
+            .loop_done_linked => saw_loopdone = true,
+            .sibling_handoff => saw_sibling = true,
+            .link_terminal => saw_link = true,
+            else => {},
+        };
+        try testing.expect(saw_loopdone and saw_sibling and saw_link);
+    }
+    // Promoted steady state stays structurally clean (codex): no open-chain /
+    // child-mismatch candidacy rejects accumulate while the set is live.
+    try testing.expectEqual(@as(u64, 0), vm.trace.silent_rejects.open_chain);
+    try testing.expectEqual(@as(u64, 0), vm.trace.silent_rejects.child_mismatch);
     try testing.expectEqualStrings("9372.5\n", nsink.buffered());
 }
 

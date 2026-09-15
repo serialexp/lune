@@ -1114,6 +1114,11 @@ pub fn considerSilentPromotion(self: *TraceState, entries: []const trace_exec.Le
         self.resetPromotionCandidate();
         return;
     }
+    // Demand-driven admission runs on the same evidence class as candidacy (a
+    // full forced-yield ledger) but BEFORE the activation-context resolution:
+    // a dormant region is out of the receipt maps, so no activation can be
+    // open for it yet — the ledger itself is its only voice.
+    tryDormantAdmission(self, entries);
     const ctx = self.region_policy.region_context orelse {
         self.resetPromotionCandidate();
         return;
@@ -1130,7 +1135,44 @@ pub fn considerSilentPromotion(self: *TraceState, entries: []const trace_exec.Le
         self.resetPromotionCandidate();
         return;
     }
+    // Parked-proof reuse (codex C′): a clean `.region_close` parked this
+    // region's last proven physical set. Re-promotion still goes through the
+    // FULL fail-closed `promoteSet` validation (physical exit ownership, link
+    // identity, membership, enterability) against this activation's frozen
+    // accumulator — only the observational re-detection and the
+    // `promote_after` streak are skipped: the set already proved it chains in
+    // a prior activation of this same region, and the full-cap yielded
+    // ledger above re-establishes present drain pressure. A proof that fails
+    // validation is discarded (take semantics) and the normal detection path
+    // resumes below.
+    if (self.registry.native_physical.takeParkedProof(key.region_id)) |parked| {
+        defer self.gpa.free(parked);
+        if (self.promoteSet(parked, key)) |_| {
+            self.silent_parked_reuses +|= 1;
+            self.dbg("silent-promote: parked reuse rid={d} len={d}", .{ @intFromEnum(key.region_id), parked.len });
+            if (self.region_policy.region_defs.getPtr(key.region_id)) |d| d.no_candidate_runs = 0;
+            self.resetPromotionCandidate();
+            return;
+        } else |_| {
+            self.dbg("silent-promote: parked proof stale rid={d}", .{@intFromEnum(key.region_id)});
+        }
+    }
     const detected = self.detectPromotableSet(entries, key) orelse {
+        // Failed-opportunity settlement (doc 47 Increment B follow-up): a
+        // full-cap yielded ledger for an ACTIVE frozen fallback region that
+        // yields no promotable candidate means the region was admitted on
+        // evidence its physical topology no longer supports. Bounded count,
+        // reset by a successful promotion; at the threshold, invalidate — the
+        // per-receipt accounting tax has no remaining payoff path.
+        if (self.region_policy.region_defs.getPtr(key.region_id)) |d| {
+            if (d.fallback_owner and !d.dormant and !d.tombstoned) {
+                d.no_candidate_runs +|= 1;
+                if (d.no_candidate_runs >= self.config.region_no_candidate_tombstone) {
+                    self.dbg("region: no-candidate tombstone rid={d}", .{@intFromEnum(key.region_id)});
+                    self.invalidateRegion(key.region_id);
+                }
+            }
+        }
         self.resetPromotionCandidate();
         return;
     };
@@ -1150,7 +1192,68 @@ pub fn considerSilentPromotion(self: *TraceState, entries: []const trace_exec.Le
         self.resetPromotionCandidate();
         return;
     };
+    // A successful promotion clears the region's failed-opportunity debt
+    // (settlement counts only CONSECUTIVE dry runs). It does NOT touch the
+    // net-work ledger: "a promotion occurred" is not "the promotion repaid
+    // the receipt tax" — repayment is measured in suppressed transitions
+    // credited at burst drain (grid_matmul promotes 200+ times while staying
+    // net-negative).
+    if (self.region_policy.region_defs.getPtr(key.region_id)) |d| {
+        d.no_candidate_runs = 0;
+    }
     self.resetPromotionCandidate();
+}
+
+/// Demand-driven admission of dormant fallback regions (doc 47 Increment B
+/// follow-up). A fallback-elected region mints DORMANT: excluded from the
+/// source/dest receipt maps, so `receiptsInert()` keeps short-circuiting and
+/// the per-receipt classify/credit tax is never paid for it. This probe runs
+/// once per full-cap forced-yield ledger — the exact evidence that LEDGER_CAP
+/// drain pressure exists AND (via the same set proof as candidacy) that the
+/// region owns a promotable armed set which could absorb it. One qualifying
+/// ledger admits (the existing `promote_after` streak then supplies
+/// confirmation before anything is patched); repeated failures saturate
+/// `admission_failures` and end probing — terminal dormancy, bounding the
+/// probe cost on shapes that never qualify (spectral-norm: 2 minted regions,
+/// zero promotable ledgers, +16% wall pre-admission-gating).
+fn tryDormantAdmission(self: *TraceState, entries: []const trace_exec.LedgerEntry) void {
+    if (self.region_policy.region_defs.count() == 0) return;
+    // Order-independence (codex): probe EVERY eligible dormant region before
+    // publishing anything — hashmap iteration order must never decide which
+    // region admits or which regions get charged a failure. Every
+    // non-matching eligible region gains a failure; the winner is the
+    // MINIMUM matching RegionId (deterministic; two disjoint regions cannot
+    // both cover every row of one ledger unless memberships overlap).
+    var winner: ?RegionId = null;
+    var it = self.region_policy.region_defs.iterator();
+    while (it.next()) |e| {
+        const d = e.value_ptr;
+        if (!d.fallback_owner or !d.dormant or !d.armable or d.tombstoned) continue;
+        if (d.admission_failures >= self.config.region_admission_probe_cap) continue;
+        // Probe with the candidacy proof. Reject diagnostics are production
+        // candidacy telemetry — probes must not pollute them (success or
+        // failure), so save/restore around every probe.
+        const saved_rejects = self.silent_rejects;
+        const probe_key: RegionKey = .{ .region_id = e.key_ptr.*, .activation = 0 };
+        if (self.detectPromotableSet(entries, probe_key)) |edges| {
+            self.gpa.free(edges);
+            self.silent_rejects = saved_rejects;
+            if (winner == null or @intFromEnum(e.key_ptr.*) < @intFromEnum(winner.?))
+                winner = e.key_ptr.*;
+        } else {
+            self.silent_rejects = saved_rejects;
+            d.admission_failures +|= 1;
+        }
+    }
+    const rid = winner orelse return;
+    const d = self.region_policy.region_defs.getPtr(rid).?;
+    d.dormant = false;
+    self.dbg("region: dormant admission rid={d} failures={d}", .{ @intFromEnum(rid), d.admission_failures });
+    // The receipt maps are wholesale-built; rebuild so the admitted region
+    // enters them. Safe here: the replay walk has returned (this runs from
+    // the post-walk drain tail) and admission only ADDS armability — the
+    // stale-bridge sweep sees an unchanged live-armable set.
+    self.rebuildRegions();
 }
 
 pub const DemotionReason = native_physical.DemotionReason;
@@ -1379,7 +1482,8 @@ pub fn arm(self: *TraceState, request: ArmRequest) !bool {
 /// semantics — queued mid-walk, immediate at depth 0 — and the backwards
 /// iteration keeps the depth-0 `swapRemove` sound.
 pub fn noteMembershipGrowth(self: *TraceState, parent: *Trace, slot_index: u32, child: *Trace, kind: ArmKind) void {
-    if (self.registry.native_physical.promotedSets().len == 0) return;
+    if (self.registry.native_physical.promotedSets().len == 0 and
+        self.registry.native_physical.parked_proofs.items.len == 0) return;
     if (self.registry.native_physical.exitIsPromoted(parent.id, slot_index))
         return;
     // Not patch-pointed (or otherwise failing arm-shape validation) means the
@@ -1402,6 +1506,33 @@ pub fn noteMembershipGrowth(self: *TraceState, parent: *Trace, slot_index: u32, 
             parent.id, slot_index, @tagName(kind), s.id, s.region_key.region_id,
         });
         self.demoteSetReason(i, .membership_growth);
+    }
+    // Parked proofs hold to the SAME region-total invariant (§B3.17 R1,
+    // codex round-4 blocker): a proof is a claim that its set covered the
+    // region's whole armed-edge population, and a new armable member edge of
+    // that region falsifies the claim — reuse would promote a set whose
+    // uncovered rows surface only in suffix ledgers, permanently. An edge
+    // already IN the proof changes nothing physically and may stay (identical
+    // convergence re-arms short-circuit before this trigger anyway; the
+    // covered check is belt-and-braces).
+    var j = self.registry.native_physical.parked_proofs.items.len;
+    while (j > 0) {
+        j -= 1;
+        const p = self.registry.native_physical.parked_proofs.items[j];
+        if (!self.edgeMemberOfRegion(edge, p.region_id, false)) continue;
+        var covered = false;
+        for (p.edges) |pe| {
+            if (pe.parent.id == edge.parent.id and pe.exit == edge.exit and
+                pe.child.id == edge.child.id and pe.kind == edge.kind and
+                pe.arm_kind == edge.arm_kind and pe.resume_pc == edge.resume_pc)
+            {
+                covered = true;
+                break;
+            }
+        }
+        if (covered) continue;
+        self.dbg("membership growth: drops parked proof region={d}", .{@intFromEnum(p.region_id)});
+        self.registry.native_physical.dropParkedProof(p.region_id);
     }
 }
 

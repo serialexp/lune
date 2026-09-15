@@ -21,7 +21,162 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
-## Status 2026-09-15 (latest+11) — abort renames + store_fwd_ambiguity FIXED (ne alias-disambiguation guards); UNCOMMITTED
+## Status 2026-09-15 (latest+13) — task #30: Increment B regression-elimination arc COMPLETE — parked proofs + windowed mprotect landed, board clean, awaiting final codex confirm + commit
+
+**Tree state: UNCOMMITTED, `zig build test` GREEN (1359 tests), board run
+saved (bench/results/20260915-200333-09bb515.tsv).** Every latest+12 board
+regression is eliminated: sparse 294→**150** (−49% vs 09bb515, 5.4× LJ, was
+11.4×), lu/sor/spectral/nbody/fft at par, grid_matmul/f64 residual ~+2-3% ≈
+the measured layout-noise band (fft ±1.5% / btrees ±3%, both with ZERO region
+activity — fft: 0 promotions, 0 parks, verified). Codex thread (rounds 2–3):
+01a0a48c-6935-7960-873e-e9409784c036. Full mechanism narrative now in doc 47
+("Increment B follow-up" + "Parked promotion proofs" Done bullets).
+
+**What landed since the round-3 HOLD (all verified with probes):**
+- **Parked promotion proofs (codex C′)**: clean `.region_close` of a
+  fallback-owned set parks its edges by RegionId
+  (`NativePhysicalRegistry.parked_proofs`); next activation re-promotes
+  through the full fail-closed `promoteSet` validation, skipping re-detection
+  + the promote_after streak. Take semantics; drops in `resetLinksTouching` /
+  `disarmAllLinks` / `demoteSetsForRegionDefsMutation` / deinit (proofs hold
+  *Trace pointers — `promotedEdgeFromLink` dereferences). grid: 199/203
+  promotions from parked proofs, 0 stale, transitions 54,873→73,977; sparse:
+  96/101, ~205→~150 ms.
+- **Page-windowed patch mprotect** (`protectWindow` in nativegen_mcode.zig):
+  applyPatch/alloc flipped the whole 1 MiB region RW↔RX per 5-byte patch
+  (1,640 region-wide flips/run on grid, PTE+TLB+icache fallout); now only the
+  page(s) spanning the write flip. main:37 churn 20,939→14,219 c/it.
+- **Tests for the codex round-2 list**: 3 "C' parked proof" tests
+  (trace_promotion_test.zig), "inc-B dormancy" (map exclusion + tier-flip
+  reset of ALL counters incl. debit/credit), "inc-B net-work balance"
+  (min-sample / repaid-survives / net-loss tombstone + deferred rebuild /
+  tombstoned-inert), "inc-B null-effective attribution" (minOpenRegion),
+  "inc-B dormant admission" ×2 (min-RegionId winner, non-matcher charging,
+  terminal saturation), "inc-B no-candidate settlement" (dry-run saturation +
+  reset on promotion), "inc-B instability" (no-charge without live promotion,
+  charge+no-park on .unfreeze, region_close survival decrement + park,
+  saturation tombstone). chargePayoffReceipt/minOpenRegion made pub +
+  re-exported for these. NOT covered (documented): rebuild-OOM harness
+  (flag consumed at rebuildRegions top regardless — by construction),
+  per-ledger-driver invalidation integration (funnel argument:
+  settleNativeCallProvenance is the common drain).
+
+**Remaining before commit:** final codex confirmation, then conventional
+commit (whole files, Rule #13). After commit: doc 47 Increment C (spectral
+dead-append-cont) and the codex D cheapenings are the outstanding bullets.
+
+**Mechanisms landed in the tree this arc (all uncommitted):**
+- Fallback strike-out tombstone (fft fix): fallback-elected owner at max_penalty
+  → one-shot `invalidateRegion`, never the repeating gate+`disarmAllLinks`.
+- Instability eviction (lu/sor fix, half 1): `.unfreeze` demotion of a live
+  promotion increments `RegionDef.instability`; clean `.region_close` survival
+  decrements; tombstone at 8.
+- `pending_region_rebuild` (lu/sor fix, half 2 — THE decisive one):
+  `invalidateRegion` left stale map entries forever, keeping `receiptsInert()`
+  false so every receipt program-wide paid the pipeline for a dead region. Flag
+  drained at `settleNativeCallProvenance` end (common funnel, per codex);
+  `rebuildRegions` consumes it.
+- Dormant admission (spectral fix): fallback regions mint dormant (out of the
+  receipt maps); `tryDormantAdmission` probes once per full-cap yielded ledger,
+  order-independent (probe all eligible, min-RegionId winner, publish after
+  loop), `admission_failures` cap 64 = terminal dormancy.
+- Failed-opportunity settlement: `no_candidate_runs` tombstone at 8, reset on
+  promotion.
+- Net-work balance (codex round-2 item (a), IMPLEMENTED): `receipts_debit`
+  (chargePayoffReceipt; min sample `region_payoff_receipts`=4096) vs
+  `transitions_credit` (driveSilentBurst, entry set's region, fallback only);
+  survive while credit×`region_profit_weight`(4) ≥ debit; NEVER reset on
+  promotion; tier-flip `reset_learning` zeroes both. Milestone dbg every 4096.
+
+**Empirical status (interleaved A/B, quiet machine):** sparse 295→180 retained;
+lu/sor/spectral/nbody at par; fft +1.5% ≈ layout noise floor (binary-trees
+bounds it at +3% with zero region activity). grid_matmul 24.1→26.0,
+grid_matmul_f64 24.7→26.5 (+8%, every interleaved pair agrees). The balance is
+SAFE (sparse debit 4096/credit 180k at milestone) but CANNOT evict grid
+(debit 4096/credit 34k — credit≫debit): the dominant cost is NOT receipts.
+Measured: 203 promote→one-burst→region_close-demote→repromote cycles at ~20.5k
+cycles each (main:37 t0-c/it 246→20,939 × 200 iters = +4.2M cycles), receipt
+pipeline ~600 cyc/receipt × 5150 (`accountRegionProfit` 0.87%→2.59%),
+`prepareNativeEntry`/`enterSelectedTrace` per-entry tax while promotions live;
+offset by real seam savings (replayLedger walks 2651→1029, 9.2M→4.0M cyc).
+Discriminator grid-vs-sparse: transitions per promotion cycle 270 vs ~2800;
+measured break-even ≈300–400.
+
+**Codex round 3 verdict: HOLD. Implement C′ "parked promotion proofs" + D
+cheapenings; do NOT add promotion-cost constants to the balance (A/B options
+rejected as dimensionally weak / Z-6-shaped).** C′ = separate persistent
+physical-set evidence from activation-scoped authorization: on clean
+`.region_close` demote of a fallback-owned set, park the edge set keyed by
+RegionId; on the next activation (full-cap yielded ledger + live FROZEN
+accumulator for the new RegionKey), revalidate via the existing `promoteSet`
+fail-closed pipeline and re-patch, skipping `detectPromotableSet` and the
+`promote_after`(=4) streak ramp (~128 dispatcher transitions/activation).
+Unpatch-at-close stays (no resident patches v1). Only clean `.region_close`
+parks; `.unfreeze`/growth/slot/trace demotions destroy. Proofs hold *Trace
+POINTERS and `promotedEdgeFromLink` dereferences immediately → MUST eagerly
+drop proofs in `resetLinksTouching` (trace retire), plus `rebuildRegions` /
+`invalidateRegion` / deinit (conservative; steady state has no rebuilds so
+grid still wins). D (independent follow-up, measure after C′): O(1)
+activeRegionFor, indexed prepareNativeEntry check, cheaper accountRegionProfit.
+Balance stays as receipt-tax backstop (documented as such, not a profitability
+oracle).
+
+**Still owed before landing (besides C′):** codex round-2 test list (dormancy
+exclusion/admission/saturation/order-independence, tier-flip reset, unfreeze
+vs region_close instability, no-candidate settlement, net-balance eviction,
+null-effective attribution, invalidation from each ledger driver + deferred
+rebuild, rebuild-OOM fail-closed), full gates, interleaved A/B on
+grid/f64/sparse/lu/sor/spectral/fft + full board, doc 47 checklist update,
+conventional commit (whole files, Rule #13). Baseline shadow:
+/tmp/mahina-incB-base (plain ReleaseFast, verified non-jit-debug).
+
+## Status 2026-09-15 (latest+12) — task #30: doc 47 Increment B landed (closed-SCC owner election); sparse ~322–378 → ~205 ms
+
+**Tree state: UNCOMMITTED diff on top of 09bb515** — src/trace_region_topology_build.zig
+(the fix), src/trace_region_test.zig (5 "inc-B" unit tests),
+src/interp_native_test.zig (convergence test extended with promotion asserts),
+docs/design/47-f64-array-append.md (checklist: A/B/hold ticked, C outstanding),
+CLAUDE.md (Rule Z-8: the exit-patching diagnosis ladder — added at Bart's
+request after this arc's mis-framing), CURRENT_TASK.md. Full board A/B pending
+at write time (tree board running; baseline sweep next).
+
+**The arc, compressed (full detail in doc 47 Done/Increment B + codex thread
+01a0a3df-2eb7-79f3-8cae-d4dfa776a007):**
+
+- Task #30's premise ("nyi_opcode for_prep starves inner loops") was stale, and
+  my first two re-framings were ALSO wrong (selector tie-break; then "widen
+  sibling-handoff eligibility"). Codex + doc 47 corrected both: the
+  guard_append→overwrite sibling handoff is ALREADY ARMED (provenance drain;
+  `outcome=yielded` in the ledger PROVES the slot is armed —
+  nativegen_emit.zig ~724 contract). Rule Z-8 now encodes the whole diagnosis
+  ladder so the next agent checks armed → promoted → eligibility in order.
+- Real blocker (verified jit-debug): `region: mint kind=cross_trace_cycle
+  members=2 armable=false` — the fully-closed {inner root pc21, continuation
+  pc34} SCC failed owner election (no structural entry edge; `enclosing` can't
+  span a post-loop cont), so NO silent promotion, so every burst wrote 3
+  ledger rows/matrix-row and drained at LEDGER_CAP=32 (~4889 cyc × 13.65M/run
+  = 55% of sparse wall-clock).
+- Fix = doc 47 Increment B, codex-tightened: fallback owner-election tier in
+  trace_region_topology_build.zig step 3e-b. Runs only at primary
+  both_count==0; requires closed SCC (NO incoming boundary edge), all members
+  one proto, exactly one loop root fed by an internal top-level same-proto
+  `.link_terminal` edge from a non-root member (nodes counted, not edges).
+- After: `armable=true`, promotions engage (repro: 301 promotions, 310k silent
+  transitions), sparse interleaved A/B (reps 5, ReleaseFast shadow at
+  09bb515): 377.6/321.8 → 206.6/203.7 ms (~−40%). res% 79.4→59.6 under
+  coverage — coverage measures the unpatched machine, promotion changes what
+  the covered run looks like; wall time is the truth here.
+- NOTE for next agent: existing region-test fixtures carry
+  `link_terminal.source_proto_id=0` against nonzero proto ids — they miss the
+  fallback only via the same-proto scope check. Pinned deliberately in the
+  "inc-B negatives" test; don't "fix" those fixtures without re-checking
+  election expectations.
+- Follow-ups on the board: doc 47 Increment C (spectral dead-append-cont
+  entry-refusal thrash) still outstanding; the 300 region-close
+  demote/re-promote cycles per repro run (1/outer pass) may be worth a look if
+  sparse still trails LuaJIT ≥1.2× after this.
+
+## Status 2026-09-15 (latest+11) — abort renames + store_fwd_ambiguity FIXED (ne alias-disambiguation guards); COMMITTED as 09bb515
 
 **Tree state: UNCOMMITTED diff** (src/trace_types.zig, src/trace_recorder.zig,
 src/nativegen_prove.zig, src/trace_record_test.zig, src/interp_trace_test.zig).

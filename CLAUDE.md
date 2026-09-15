@@ -116,6 +116,60 @@ The threshold is knowledge, not discomfort: do not invoke “architecture” to 
 ordinary focused work, but do not demand another round of proof after the structural
 cause and required direction are already established.
 
+### Rule Z-8: Exit patching already exists — diagnose a hot native seam layer by layer before building ANYTHING.
+
+Native→native exit-branch patching (LuaJIT's `lj_asm_patchexit`, adapted for
+mahina's coarse-deopt model) is BUILT and always on. Do not re-diagnose a hot
+runtime seam as "we need exit patching" and do not build new mediation layers
+(ledger row kinds, burst tweaks, selection heuristics) around one. The moving
+parts, so you don't have to rediscover them:
+
+- **Slot machinery**: every compiled trace has a per-exit jump-slot array
+  (`CompiledTrace.slots`); `commitSlotMutation` (`trace_native_registry.zig`)
+  writes a target address into a slot — either `shared_exit` (back to the
+  runtime) or a child trace's native entry. Arming/disarming lives in
+  `trace_link.zig` (`armNativeLink` / `arm`, the single funnel).
+- **Arm kinds** (`ArmKind`, `trace_native_registry.zig`): `link_terminal`,
+  `ordinary_guard`, `loop_done_linked`, `region_bridge`, **`sibling_handoff`**
+  (Part S, doc 17 — a failing ordinary deopt exit patched to jump into a
+  SAME-anchor sibling's entry, re-running the iteration natively; this is the
+  coarse-deopt equivalent of a LuaJIT side trace), `ret_cont`, `call_head`.
+  Arms come from TWO paths: the receipt watch (`noteSiblingTerminal` →
+  `siblingHandoffEligible`, branch-guards-only) AND the provenance drain
+  (`trace_regionops.zig` ~line 711, which admits e.g. `guard_append` exits).
+- **Silent promotion** (doc 17 B-3/B-4): armed cycles only stop paying
+  per-row ledger costs once promoted to a silent set, which requires their
+  region to be `armable` — i.e. owner election in
+  `trace_region_topology_build.zig` (~line 377) succeeded. A fully-closed
+  SCC (dispatcher-entered cycle, e.g. inner loop + its post-loop
+  continuation) can fail election and mint `armable=false` forever — that
+  is doc 47 Increment B.
+
+**The diagnosis ladder** — when profiling shows per-row seam costs between
+traces (deopt/handoff rows, bursts ending at `LEDGER_CAP`, "silent:
+candidates=0"), check in this order with `-Djit-debug` probes; each layer can
+look like the one below it:
+1. **Is the exit armed at all?** `sibling-arm:`/`bridge-arm:` probe lines; a
+   ledger deopt row with `outcome=yielded` PROVES the slot is armed (yielded
+   is only stamped when an armed jump was suppressed by the ledger cap —
+   `nativegen_emit.zig` ~line 724). Armed ⇒ the seam is NOT a missing arm.
+2. **Armed but rows still written every burst?** Then the blocker is silent
+   promotion: check `region: mint ... armable=...` and the `silent
+   rejects:`/`silent:` summary. `armable=false` on a closed SCC = owner
+   election (Increment B territory), not arming, not eligibility.
+3. **Not armed?** Only now look at eligibility (`siblingHandoffEligible`,
+   `exitIsPreEffect`, per-kind checks in `arm`) and the evidence path
+   (`noteDispatcherLedgerTerminal` charges only terminal deopts with
+   outcome `.normal`). Widen a gate only with an explicit soundness +
+   progress argument (the branch-only gate is a scar from a measured nsieve
+   ping-pong, +128%).
+
+Only if no arm kind can ever express the transition is new machinery on the
+table — and then it goes through a design doc first. Read doc 47
+(`docs/design/47-f64-array-append.md`) before touching any of this: it holds
+the fill-then-reuse staleness story, the convergence path, and the
+outstanding increments.
+
 ## Build
 
 Use the `just` recipes (`justfile`) as the canonical entry points — they wrap

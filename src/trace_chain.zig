@@ -1132,6 +1132,13 @@ pub fn driveSilentBurst(
     self.silent_bursts_drained +|= 1;
     self.silent_transitions_total +|= result.silent_transitions;
     self.silent_hops_total +|= result.silent_transitions;
+    // Net-work ledger credit: every suppressed silent transition is work the
+    // region machinery actually delivered (a runtime round-trip avoided).
+    // Rolled up per burst against the entry set's region; weighed against
+    // `receipts_debit` in chargePayoffReceipt.
+    if (self.region_policy.region_defs.getPtr(entry_set.region_key.region_id)) |rd| {
+        if (rd.fallback_owner) rd.transitions_credit +|= result.silent_transitions;
+    }
 
     const last_edge = last_set.edges[last_phase];
     if (result.silent_cum > std.math.maxInt(usize))
@@ -1293,6 +1300,13 @@ pub fn settleNativeCallProvenance(
     self.applyProvenanceVerdicts(captured.verdicts[0..captured.len]);
     self.drainPendingBridgeArm(safe_to_arm);
     self.drainProvenanceArms(safe_to_arm);
+    // Doc 47 Increment B follow-up: apply any deferred region-maps rebuild
+    // (requested by invalidateRegion, possibly mid-walk) here in the COMMON
+    // settlement funnel — every ledger driver (dispatcher root, inner-call,
+    // continuation, seed) funnels through this point post-walk, so a
+    // tombstoned region's stale map entries are bounded by one native call,
+    // not by "whenever the dispatcher-root drain next happens to run".
+    self.drainPendingRegionRebuild();
 }
 
 /// 2.3c-2c: the single authoritative drain of ONE native call's per-transition

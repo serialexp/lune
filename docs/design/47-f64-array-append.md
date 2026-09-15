@@ -1,10 +1,16 @@
 # f64 array append recording — Design
 
-Status: increment D landed separately (0fb8eb2); f64 append implemented
-in-tree, NOT LANDED — held until increments A + C clear the sparse/spectral
-seams (codex split-land ruling; see "Board outcome" below)
-Owner: Claude (campaign loop), codex review thread 01a09045-973c-79d1-9070-d94fbb7955ac
-Last updated: 2026-09-11
+Status: partial — increments D (0fb8eb2), f64 append + A (7a6ca81, peel
+fallback 3ab724a), and B (closed-SCC owner election + the full
+regression-elimination arc: strike-out tombstone, instability eviction,
+deferred maps rebuild, dormant admission, net-work backstop, parked
+promotion proofs, page-windowed patch mprotect — this change) landed;
+increment C (dead-append-cont entry-refusal thrash, spectral) and the codex
+round-3 D cheapenings outstanding
+Owner: Claude (campaign loop), codex review threads
+01a09045-973c-79d1-9070-d94fbb7955ac (f64 append / A / C),
+01a0a3df-2eb7-79f3-8cae-d4dfa776a007 (increment B)
+Last updated: 2026-09-15
 
 ## Implementation status
 
@@ -48,6 +54,117 @@ everything inside them is checked.
 - [x] **Gates.** unit (all green incl. the four new tests), wasm build,
   8-mode hashgate 84×2 green.
 
+- [x] **The doc-47 hold RELEASED — f64 append + Increment A landed together
+  (7a6ca81, `perf(jit): doc 47 — f64 array append + continuation link
+  peeling`).** Increment A shipped as continuation-scoped link peeling: a
+  `.continuation` recording that reaches an inner `for_prep` whose root's
+  entry guards have a float-on-int mismatch peels one inner body iteration to
+  promote types before closing `.link` (two-phase `await_initial_entry →
+  peeling` state machine in `RecordingSession`). Killed the prologue-fail
+  thrash (3M replayLedger walks × ~531 cyc = 42% of sparse's runtime). A/B at
+  landing: sparse 605→310 ms (−49%), spectral −19%, grid_matmul_f64 −9%.
+  Follow-up 3ab724a: peel-to-link FALLBACK — an abort inside the peeled body
+  (spectral's `get_upval aliased_input`) falls back to the plain `.link`
+  close instead of killing the whole continuation recording (prevented an
+  8× spectral regression).
+
+- [x] **Increment B — closed-SCC owner election (this change).** The
+  `{inner, post-inner continuation}` cycle minted `armable=false` forever, so
+  silent promotion never engaged and every burst drained at LEDGER_CAP=32
+  through the runtime seam (~4889 cyc × 13.65M/run = 55% of sparse
+  wall-clock, measured 2026-09-15). Landed as a FALLBACK TIER in the owner
+  predicate (`trace_region_topology_build.zig` step 3e-b), per codex review
+  01a0a3df: runs only when the primary `(is_ext or enclosing) and has_root`
+  pass yields `both_count == 0`, and requires the full closed-SCC proof —
+  no incoming boundary edge, all members one proto, and exactly ONE member
+  that is a loop root fed by an internal top-level same-proto
+  `.link_terminal` edge from a non-root member (destination NODES counted,
+  not edges; several qualifying roots stay unarmable). Unit tests
+  (`trace_region_test.zig` "inc-B …": election + rebind stability, guard-fed/
+  foreign-proto/inlined negatives, two-root ambiguity, node-counting, open-SCC
+  refusal) plus promotion assertions in the doc 47 convergence test
+  (armable cycle region, `silent_promotions > 0`, all three arm kinds,
+  clean rejects). A/B (5-rep interleaved ReleaseFast, vs 09bb515 shadow):
+  scimark-sparse 322–378 → 204–207 ms (~−40%).
+
+- [x] **Increment B follow-up — the regression-elimination arc (codex thread
+  01a0a48c-6935-7960-873e-e9409784c036, rounds 1–3).** Increment B as first
+  landed regressed fft/lu/sor/spectral/nbody on the board; Rule #2 held the
+  commit until every one was eliminated. Five policy mechanisms + one
+  structural change, each diagnosed from profiles/probes rather than tuned:
+  - **Fallback strike-out tombstone (fft):** a fallback-elected owner at
+    `max_penalty` invalidates one-shot instead of the primary tier's
+    repeating gate + registry-wide `disarmAllLinks` (which re-fired on EVERY
+    strike at saturation — ~2× fft wall on its phase-variant butterfly).
+  - **Instability eviction (lu/sor, half 1):** `.unfreeze` demotion of a
+    LIVE promotion charges `RegionDef.instability`; clean `.region_close`
+    survival decrements; tombstone at 8. Catches the 435k-strike/175k-cycle
+    oscillation that per-anchor penalties (remove-on-recover) never saturate
+    on.
+  - **`pending_region_rebuild` (lu/sor, half 2 — decisive):**
+    `invalidateRegion` left the dead region's receipt-map entries live
+    forever, so `receiptsInert()` stayed false and EVERY receipt
+    program-wide paid the pipeline for a tombstone. The flag defers a maps
+    rebuild to the end of `settleNativeCallProvenance` (the common
+    settlement funnel every ledger driver passes through — codex round-2
+    blocker (b) moved it off the dispatcher-only drain); `rebuildRegions`
+    consumes it.
+  - **Dormant admission (spectral):** fallback regions mint `dormant` —
+    excluded from the source/dest receipt maps, so the pipeline stays
+    short-circuited until a full-cap forced-yield ledger proves via the
+    candidacy detector that the region owns a promotable set
+    (`tryDormantAdmission`, order-independent per codex round-2 blocker
+    (c): probe every eligible region, min-RegionId winner, failures charged
+    to non-matchers, publish after the loop; `admission_failures` cap 64 =
+    terminal dormancy). Spectral (2 minted regions, zero promotable
+    ledgers, +16% pre-gating) never admits and pays nothing.
+  - **Deterministic net-work balance (codex round-2 blocker (a)):**
+    `receipts_debit` (per priced receipt) vs `transitions_credit`
+    (suppressed silent transitions at burst drain); after a 4096-receipt
+    minimum sample, survive only while `credit × region_profit_weight(4) ≥
+    debit`. NEVER reset by promotion — grid_matmul promotes 203× while
+    remaining net-negative, so "a promotion occurred" is not repayment.
+    Empirically a RECEIPT-TAX BACKSTOP, not a profitability oracle (codex
+    round 3): sparse debit 4096/credit 180k and grid debit 4096/credit 34k
+    both survive — grid's real cost was never receipts.
+  - **No-candidate settlement:** consecutive dry full-cap ledgers for an
+    active frozen fallback region saturate `no_candidate_runs` (8) →
+    invalidate; any successful promotion resets the consecutive count.
+  - Unit tests: `trace_region_test.zig` ("inc-B fallback_owner flag",
+    "inc-B strike-out policy", "inc-B dormancy", "inc-B net-work balance",
+    "inc-B null-effective receipt attribution") and
+    `trace_promotion_test.zig` ("inc-B dormant admission" ×2, "inc-B
+    no-candidate settlement", "inc-B instability").
+
+- [x] **Parked promotion proofs (codex round-3 C′) + page-windowed patch
+  mprotect — the grid_matmul residual.** After the mechanisms above, grid
+  remained +8%: 203 promote→one-burst→`.region_close`→re-promote cycles at
+  ~20.5k cycles each (per-anchor TSC: main:37 246→20,939 c/it × 200
+  activations), each re-earning the `promote_after`(=4) full-ledger streak +
+  `detectPromotableSet`. Codex rejected pricing promotions into the balance
+  (dimensionally weak, Z-6 risk) and prescribed the lifetime split:
+  **persistent physical-set evidence, activation-scoped authorization.** A
+  clean `.region_close` demote of a fallback-owned set parks its edge array
+  keyed by RegionId (`NativePhysicalRegistry.parked_proofs`); the region's
+  next activation (full-cap yielded ledger + live FROZEN accumulator)
+  re-promotes through the FULL fail-closed `promoteSet` validation, skipping
+  only re-detection and the streak. Take semantics (a failed validation
+  discards the proof); `.unfreeze`/growth/slot/trace demotions park nothing;
+  proofs hold *Trace pointers so they drop eagerly in `resetLinksTouching`,
+  `disarmAllLinks`, `demoteSetsForRegionDefsMutation` (covers
+  `invalidateRegion` + every rebuild), and deinit. Second cost cut:
+  `applyPatch`/`alloc` flipped the whole 1 MiB mcode region RW↔RX around
+  every 5-byte patch (1,640 region-wide mprotects/run on grid — PTE rewrite
+  + TLB + icache refetch for every co-located trace); `protectWindow` now
+  flips only the page(s) spanning the write. Results: grid 199/203
+  promotions via parked proofs, 0 stale, suppressed transitions 54,873 →
+  73,977 (+35%); sparse reuses 96/101 and drops ~205 → ~150 ms (−49% total
+  vs 09bb515, 5.4× LJ); grid residual +8% → ~+2-3% ≈ the measured
+  code-layout noise band (fft ±1.5%, btrees ±3%, both with zero region
+  activity). Tests: `trace_promotion_test.zig` "C' parked proof" ×3
+  (park/reuse-without-detection, never-park reasons, drop funnels +
+  stale-proof fail-closed into detection).
+
 - [x] **Increment D — RESOLVED and LANDED separately (0fb8eb2,
   `fix(jit): retain lane traces for unfrozen arrays`).** The "warmup/
   bookkeeping scaling" framing was a symptom-list; the single root cause was
@@ -69,16 +186,10 @@ everything inside them is checked.
   non-blocking). Codex split-land ruling (rounds 4–6): D lands alone; the
   f64 append stays held until A + C clear sparse/spectral.
 
-### Outstanding
-
-- [ ] **LAND BLOCKED — board regression (the doc-47 hold).** Full board +
-  interleaved A/B vs a HEAD shadow (`/tmp/lune-base-47`) measured:
-  grid_matmul_f64 **+33.4%**, spectral-norm **+9.7%**, scimark-sparse
-  **+5.8%** (board row +17.6%), binary-trees **+3.9%**; euler14/nbody/fib
-  neutral. Two distinct mechanisms, neither caused by the append lowering
-  itself (codex concurs): see "Board outcome". Land together with (or after)
-  the increments below.
-- [ ] **Increment A — compatible loop-entry stitching (the sparse seam).**
+- [x] **Increment A — compatible loop-entry stitching (the sparse seam);
+  landed as the continuation-scoped link peeling in 7a6ca81 (see the
+  hold-release entry above for what shipped). The design narrative below is
+  kept verbatim — the round-3 rejection reasoning is a standing constraint.**
   Codex round-2 diagnosis: the steady-state burst is
   `inner.loop_done → append.guard fail → sibling.link → inner.linked_entry
   PROLOGUE_FAIL → replayLedger` (~576 cyc) once per 5-iteration row. The
@@ -133,14 +244,22 @@ everything inside them is checked.
   arithmetic before promotion; a nonnumeric child-prologue failure after
   handoff; the record-time root superseded by an incompatible sibling at
   arm time.
-- [ ] **Increment B — closed-SCC owner election.** The `{inner, post-inner
-  continuation}` cycle region minted `armable=false` forever: no structural
-  external entry edge exists (dispatcher entry is not structural) and the
-  `enclosing` fallback can't let pc21 enclose pc34. Accept the unique
-  loop-root destination of the SCC's continuation back-edge as owner
-  (multiple qualifying roots stay unarmable). Then region silent promotion
-  amortizes ledger reporting across the cycle (LEDGER_CAP=32 bounds plain
-  fusion at ~16 rows/yield — not enough alone for the mandate).
+
+### Outstanding
+
+- [ ] **Codex D cheapenings (round 3, independent follow-up):** O(1) current-
+  activation resolution instead of the `activeRegionFor` linear map walk (it
+  runs per receipt AND per native entry via `prepareNativeEntry`); an indexed
+  owner/active-set check instead of sweeping all promoted sets per entry;
+  cheaper `accountRegionProfit` classification (measured ~600 cyc/receipt on
+  grid). Lowers the promotion break-even everywhere; not required for the
+  current board (grid residual is at the layout-noise band) so deferred.
+- [ ] **Resident-but-disabled patches (codex round-3 escalation):** only if a
+  future workload shows the remaining patch/unpatch cost (2 page-windowed
+  mprotects per edge per promote/demote) is material — the parked-proof +
+  windowed-mprotect combination made it immaterial on the current board.
+  Requires an activation enable/disable token in the silent epilogue; codex
+  flagged the permanent exit-path tax as the risk to measure first.
 - [ ] **Increment C — kill the dead-append-cont thrash (spectral is the
   concrete case).** Original framing was "repoint the loop-done arm off the
   dead append cont as cleanup after A"; the spectral-norm diagnosis

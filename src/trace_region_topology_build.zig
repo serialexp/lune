@@ -192,6 +192,11 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
         owner: AnchorKey,
         classifier: RegionClassifier,
         armable_owner: bool,
+        /// Doc 47 Increment B: the owner above was elected by the closed-SCC
+        /// FALLBACK tier, not the primary external-entry/enclosing predicate.
+        /// Threaded into `RegionDef.fallback_owner` (mint + rebind) so the
+        /// window-strike policy can tombstone instead of gate+disarm.
+        fallback_owner: bool,
         /// Finding 3 (recorder-path completeness): true iff every physical member
         /// trace was found by id AND carries a complete recorded path
         /// (`rec_path_complete`). A truncated/absent membership must never mint or keep
@@ -420,6 +425,66 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
                 owner_node = @intCast(n);
             }
         }
+        // 3e-b (doc 47 Increment B): fully-CLOSED SCC fallback. A cycle whose
+        // every entry comes from the dispatcher (no incoming boundary edge at
+        // all) has no member the primary predicate can elect: `is_ext` is
+        // structurally false everywhere, and `enclosing` fails whenever a
+        // continuation anchor lies OUTSIDE the loop root's body span (sparse:
+        // post-inner cont pc34 vs inner root pc21 — the exact doc 47 shape).
+        // Elect the unique loop-root DESTINATION of a continuation back-edge:
+        // an internal `.link_terminal`-provenance edge from a non-root member
+        // into a root. Identified by the edge's structural provenance, never
+        // by anchor shape alone (review tightening: "source has no root" also
+        // matches ordinary side anchors). v1 scope is deliberately same-proto
+        // and top-level (`inline_depth == 0`, local source proto), matching
+        // `enclosing`'s conservative posture — cross-proto cycles stay
+        // unarmable. Zero or several qualifying roots keep today's
+        // deterministic placeholder + armable=false ("multiple qualifying
+        // roots stay unarmable"), and qualification counts destination NODES,
+        // not edges, so several physical `.link` continuations targeting one
+        // root still elect exactly that root. Runs strictly as a fallback
+        // tier (`both_count == 0`), so every region that elects an owner
+        // under the primary predicate is untouched by construction.
+        const primary_count = both_count;
+        if (both_count == 0) closed: {
+            for (edges.items) |e| {
+                if (comp[e.to] == c and comp[e.from] != c) break :closed; // open SCC: incoming boundary edge
+            }
+            var scc_proto_id: ?u32 = null;
+            for (0..nnodes) |n| {
+                if (comp[n] != c) continue;
+                const pid = nodes.items[n].proto_id;
+                if (scc_proto_id) |p| {
+                    if (p != pid) break :closed; // cross-proto: out of v1 scope
+                } else scc_proto_id = pid;
+            }
+            const pid = scc_proto_id orelse break :closed;
+            const proto = proto_by_id.get(pid) orelse return error.RegionGraphInconsistent;
+            for (0..nnodes) |n| {
+                if (comp[n] != c) continue;
+                if (!view.hasInnerRootAt(proto, nodes.items[n].pc)) continue;
+                const qualifies = blk: {
+                    for (edges.items) |e| {
+                        if (e.to != @as(u32, @intCast(n)) or e.from == e.to) continue;
+                        if (comp[e.from] != c) continue;
+                        if (view.hasInnerRootAt(proto, nodes.items[e.from].pc)) continue;
+                        switch (e.eid.exit) {
+                            .link_terminal => |lt| {
+                                if (lt.inline_depth != 0) continue;
+                                if (lt.source_proto_id != pid) continue;
+                                break :blk true;
+                            },
+                            .guard => continue,
+                        }
+                    }
+                    break :blk false;
+                };
+                if (qualifies) {
+                    both_count += 1;
+                    owner_node = @intCast(n);
+                }
+            }
+        }
         const owner_anchor: AnchorId = if (both_count == 1) nodes.items[owner_node] else (smallest orelse return error.RegionGraphInconsistent);
         const owner_proto = proto_by_id.get(owner_anchor.proto_id) orelse return error.RegionGraphInconsistent;
         const owner: AnchorKey = .{ .proto = owner_proto, .pc = owner_anchor.pc };
@@ -436,6 +501,7 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
                 .member_count = comp_size[c],
             },
             .armable_owner = both_count == 1,
+            .fallback_owner = primary_count == 0 and both_count == 1,
             .membership_complete = membership_complete,
         });
     }
@@ -460,7 +526,7 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
     // 4. Intern + stage (all scratch, fallible). Reserve staged capacity up front so
     // the per-candidate appends are infallible AFTER the ownership-transferring dupes
     // (no half-transferred double-free window).
-    const ActiveRegion = struct { id: RegionId, comp: u32, armable: bool, member_trace_ids: []u32 };
+    const ActiveRegion = struct { id: RegionId, comp: u32, armable: bool, dormant: bool, member_trace_ids: []u32 };
     var staged_interns: std.ArrayListUnmanaged(StagedIntern) = .empty;
     errdefer {
         for (staged_interns.items) |s| gpa.free(s.edges);
@@ -528,7 +594,20 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
             // permanently pins the region off regardless of what the graph says.
             const eff_armable = compatible and cand.membership_complete and
                 cand.armable_owner and !stored.tombstoned;
-            staged_armable_updates.appendAssumeCapacity(.{ .id = existing_id, .armable = eff_armable });
+            // Doc 47 Increment B follow-up: dormancy is admission state, not
+            // graph state — a rebind keeps the stored bit (an admitted region
+            // stays admitted) UNLESS the election tier flipped, which resets
+            // ALL fallback learning: dormancy re-arms (a re-fallback region
+            // needs fresh admission evidence) and publish zeroes the counters.
+            const tier_changed = stored.fallback_owner != cand.fallback_owner;
+            const eff_dormant = cand.fallback_owner and (tier_changed or stored.dormant);
+            staged_armable_updates.appendAssumeCapacity(.{
+                .id = existing_id,
+                .armable = eff_armable,
+                .fallback_owner = cand.fallback_owner,
+                .dormant = eff_dormant,
+                .reset_learning = tier_changed,
+            });
             // Keep the stored owner fresh: the unique external-entry loop-root can MOVE
             // to a different anchor with the internal edge set (hence the id) unchanged,
             // so the arm site must track the current owner, not the first-sight one.
@@ -536,7 +615,7 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
             const bridge_copy = try cloneRegionBridges(gpa, cand.bridges);
             staged_bridge_updates.appendAssumeCapacity(.{ .id = existing_id, .bridges = bridge_copy });
             const mt_copy = try gpa.dupe(u32, cand.member_trace_ids);
-            active_regions.appendAssumeCapacity(.{ .id = existing_id, .comp = cand.comp, .armable = eff_armable, .member_trace_ids = mt_copy });
+            active_regions.appendAssumeCapacity(.{ .id = existing_id, .comp = cand.comp, .armable = eff_armable, .dormant = eff_dormant, .member_trace_ids = mt_copy });
         } else {
             // First sight: mint an id and stage the intern + def (armable per owner).
             const new_id: RegionId = @enumFromInt(new_id_counter);
@@ -560,8 +639,13 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
                 .classifier = cand.classifier,
                 .bridges = bridge_copy,
                 .armable = first_armable,
+                .fallback_owner = cand.fallback_owner,
+                // Demand-driven admission: fallback regions mint dormant and
+                // stay out of the receipt maps until a full-cap yielded ledger
+                // proves a promotable set (`tryDormantAdmission`).
+                .dormant = cand.fallback_owner,
             } });
-            active_regions.appendAssumeCapacity(.{ .id = new_id, .comp = cand.comp, .armable = first_armable, .member_trace_ids = mt_copy });
+            active_regions.appendAssumeCapacity(.{ .id = new_id, .comp = cand.comp, .armable = first_armable, .dormant = cand.fallback_owner, .member_trace_ids = mt_copy });
             new_id_counter += 1;
         }
     }
@@ -584,7 +668,11 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
             }
         }
         const R = ar orelse continue;
-        if (!R.armable) continue;
+        // Dormant fallback regions stay OUT of the receipt maps — the whole
+        // point of demand admission is that `receiptsInert()` keeps
+        // short-circuiting until a ledger proves the region can pay for the
+        // per-receipt accounting this map entry would enable.
+        if (!R.armable or R.dormant) continue;
         var is_member = false;
         for (R.member_trace_ids) |tid| {
             if (tid == e.key.trace_id) {
@@ -598,7 +686,7 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
     // dest_entry: every physical member of an armable region (in a strongly-connected
     // component every member anchor is the destination of an internal edge).
     for (active_regions.items) |a| {
-        if (!a.armable) continue;
+        if (!a.armable or a.dormant) continue;
         for (a.member_trace_ids) |tid| try dst_builder.add(gpa, tid, a.id);
     }
 

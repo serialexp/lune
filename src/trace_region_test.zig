@@ -1503,3 +1503,662 @@ test "A-ii.4 lifetime: removeTrace preserves region_defs (logical); clearCache e
     try testing.expectEqual(@as(usize, 0), state.region_policy.region_defs.count());
     try testing.expectEqual(@as(usize, 0), state.region_policy.region_intern.entries.items.len);
 }
+
+// ---- doc 47 Increment B: closed-SCC owner election (fallback tier) ----------
+//
+// A fully-closed cycle (dispatcher-entered — no incoming boundary edge) elects
+// the unique loop-root DESTINATION of an internal top-level same-proto
+// `.link_terminal` edge from a non-root member. Zero or several qualifying
+// roots keep the deterministic placeholder + armable=false. These fixtures use
+// CORRECT link provenance (`source_proto_id == proto.id`); the older fixtures
+// above carry `source_proto_id = 0` against a nonzero proto id, which the
+// same-proto scope check rejects — pinned explicitly in the negative test.
+
+test "inc-B closed SCC: link-fed root elected + armable; boundary edge hands election to the primary tier; removal returns to the fallback (same RegionId)" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.registry.cache.clearRetainingCapacity();
+
+    const P_ID: u32 = 21;
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
+
+    // root@7 (loop shape) --loop_done--> cont@2 --link--> root@7. Closed 2-node SCC.
+    var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
+    var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
+    var root: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 7 },
+            .instrs = &root_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &root_p,
+        },
+        .id = 1,
+    };
+    var cont_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
+    var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 1, .inline_depth = 0 } } }};
+    var cont: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 2 },
+            .instrs = &cont_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &cont_p,
+        },
+        .id = 2,
+    };
+    for ([_]*Trace{ &root, &cont }) |t| try state.registry.cache.append(gpa, t);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+
+    // (1) First sight: the fallback elects the link-fed root — armable at once
+    // (the sparse shape: primary tier yields both_count==0, `enclosing` cannot
+    // span the post-loop continuation).
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var kit = state.region_policy.region_defs.keyIterator();
+    const rid = kit.next().?.*;
+    {
+        const def = state.region_policy.region_defs.get(rid).?;
+        try testing.expect(def.armable);
+        try testing.expect(def.classifier.kind == .cross_trace_cycle);
+        try testing.expectEqual(@as(u32, 2), def.classifier.member_count);
+        try testing.expectEqual(@as(*const Proto, &proto), def.owner.proto);
+        try testing.expectEqual(@as(u32, 7), def.owner.pc);
+    }
+
+    // (2) An external-entry side trace arrives (boundary edge INTO the root):
+    // the primary tier now elects — same RegionId (internal edge set is the
+    // identity; the boundary edge is not internal), same owner, still armable.
+    var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 7 }};
+    var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
+    var ext: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 30 },
+            .instrs = &ext_i,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &ext_p,
+        },
+        .id = 3,
+    };
+    try state.registry.cache.append(gpa, &ext);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    {
+        const def = state.region_policy.region_defs.get(rid).?;
+        try testing.expect(def.armable);
+        try testing.expectEqual(@as(u32, 7), def.owner.pc);
+    }
+
+    // (3) The boundary edge retires again (codex rebind nuance): the region
+    // stays armable through the fallback — owner/armability are recomputed per
+    // rebuild and the closed-SCC proof still holds. Same RegionId throughout.
+    _ = state.registry.cache.swapRemove(2); // drop &ext
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    {
+        const def = state.region_policy.region_defs.get(rid).?;
+        try testing.expect(def.armable);
+        try testing.expectEqual(@as(u32, 7), def.owner.pc);
+        try testing.expect(!def.tombstoned);
+    }
+}
+
+test "inc-B negatives: guard-fed root, foreign-proto link, and inlined link all stay unarmable" {
+    const gpa = testing.allocator;
+
+    const P_ID: u32 = 22;
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
+
+    // (a) The cont enters the root through a BRANCH GUARD, not `.link` — the
+    // qualification demands `.link_terminal` structural provenance (codex
+    // tightening: "source has no root" alone also matches ordinary side
+    // anchors), so nothing qualifies.
+    {
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        defer state.registry.cache.clearRetainingCapacity();
+        var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
+        var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
+        var root: Trace = .{
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
+            .id = 1,
+        };
+        var cont_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 7 }};
+        var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(1, .branch_cond) }};
+        var cont: Trace = .{
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
+            .id = 2,
+        };
+        for ([_]*Trace{ &root, &cont }) |t| try state.registry.cache.append(gpa, t);
+        state.rebuildEdgeCache();
+        state.rebuildRegions();
+        try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+        var kit = state.region_policy.region_defs.keyIterator();
+        try testing.expect(!state.region_policy.region_defs.get(kit.next().?.*).?.armable);
+    }
+
+    // (b) Foreign-proto link provenance (`source_proto_id != proto.id`) — an
+    // inlined/cross-proto `.link` may not nominate under the v1 same-proto
+    // scope. This is also the shape the pre-inc-B fixtures above carry
+    // (source_proto_id=0 vs a nonzero proto id), pinned here deliberately.
+    {
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        defer state.registry.cache.clearRetainingCapacity();
+        var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
+        var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
+        var root: Trace = .{
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
+            .id = 1,
+        };
+        var cont_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
+        var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID + 1, .source_pc = 1, .inline_depth = 0 } } }};
+        var cont: Trace = .{
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
+            .id = 2,
+        };
+        for ([_]*Trace{ &root, &cont }) |t| try state.registry.cache.append(gpa, t);
+        state.rebuildEdgeCache();
+        state.rebuildRegions();
+        try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+        var kit = state.region_policy.region_defs.keyIterator();
+        try testing.expect(!state.region_policy.region_defs.get(kit.next().?.*).?.armable);
+    }
+
+    // (c) Inlined link provenance (`inline_depth != 0`) may not nominate.
+    {
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        defer state.registry.cache.clearRetainingCapacity();
+        var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
+        var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
+        var root: Trace = .{
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
+            .id = 1,
+        };
+        var cont_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
+        var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 1, .inline_depth = 1 } } }};
+        var cont: Trace = .{
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
+            .id = 2,
+        };
+        for ([_]*Trace{ &root, &cont }) |t| try state.registry.cache.append(gpa, t);
+        state.rebuildEdgeCache();
+        state.rebuildRegions();
+        try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+        var kit = state.region_policy.region_defs.keyIterator();
+        try testing.expect(!state.region_policy.region_defs.get(kit.next().?.*).?.armable);
+    }
+}
+
+test "inc-B ambiguity + node-counting: two link-fed roots stay unarmable; two links into ONE root elect exactly once" {
+    const gpa = testing.allocator;
+
+    const P_ID: u32 = 23;
+    var code: [40]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
+
+    // (a) rootA@7 --loop_done--> contA@10 --link--> rootB@20 --loop_done-->
+    //     contB@30 --link--> rootA@7: BOTH roots are link-fed — two qualifiers,
+    //     "multiple qualifying roots stay unarmable".
+    {
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        defer state.registry.cache.clearRetainingCapacity();
+        var ra_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 10 }, .{ .op = .loop } };
+        var ra_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
+        var ra: Trace = .{
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &ra_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ra_p },
+            .id = 1,
+        };
+        var ca_i = [_]IrInstr{.{ .op = .link, .aux = 20 }};
+        var ca_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 9, .inline_depth = 0 } } }};
+        var ca: Trace = .{
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 10 }, .instrs = &ca_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ca_p },
+            .id = 2,
+        };
+        var rb_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 30 }, .{ .op = .loop } };
+        var rb_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .loop_done) }};
+        var rb: Trace = .{
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &rb_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &rb_p },
+            .id = 3,
+        };
+        var cb_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
+        var cb_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 29, .inline_depth = 0 } } }};
+        var cb: Trace = .{
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &cb_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cb_p },
+            .id = 4,
+        };
+        for ([_]*Trace{ &ra, &ca, &rb, &cb }) |t| try state.registry.cache.append(gpa, t);
+        state.rebuildEdgeCache();
+        state.rebuildRegions();
+        try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+        var kit = state.region_policy.region_defs.keyIterator();
+        try testing.expect(!state.region_policy.region_defs.get(kit.next().?.*).?.armable);
+    }
+
+    // (b) One root fed by TWO physical `.link` continuations: qualification
+    // counts destination NODES, not edges — exactly one qualifier, elected.
+    {
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        defer state.registry.cache.clearRetainingCapacity();
+        var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .guard_true, .a = 0, .aux = 10 }, .{ .op = .loop } };
+        var root_p = [_]ExitProvEntry{
+            .{ .index = 0, .prov = guardProv(6, .loop_done) },
+            .{ .index = 1, .prov = guardProv(5, .branch_cond) },
+        };
+        var root: Trace = .{
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
+            .id = 1,
+        };
+        var ca_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
+        var ca_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 1, .inline_depth = 0 } } }};
+        var ca: Trace = .{
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &ca_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ca_p },
+            .id = 2,
+        };
+        var cbb_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
+        var cbb_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 9, .inline_depth = 0 } } }};
+        var cbb: Trace = .{
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 10 }, .instrs = &cbb_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cbb_p },
+            .id = 3,
+        };
+        for ([_]*Trace{ &root, &ca, &cbb }) |t| try state.registry.cache.append(gpa, t);
+        state.rebuildEdgeCache();
+        state.rebuildRegions();
+        try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+        var kit = state.region_policy.region_defs.keyIterator();
+        const def = state.region_policy.region_defs.get(kit.next().?.*).?;
+        try testing.expect(def.armable);
+        try testing.expectEqual(@as(u32, 7), def.owner.pc);
+    }
+}
+
+test "inc-B open SCC: an incoming boundary edge into a NON-root member disables the fallback (codex closed-proof pin)" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.registry.cache.clearRetainingCapacity();
+
+    const P_ID: u32 = 24;
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
+
+    // The armable T1 shape (root@7 ↔ cont@2, correct link provenance) PLUS a
+    // boundary edge into the CONT. The primary tier still elects nobody (the
+    // external edge's destination is not a root), and the fallback must refuse:
+    // the closed-SCC proof fails, so the region keeps today's unarmable
+    // treatment rather than newly arming an open shape.
+    var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
+    var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
+    var root: Trace = .{
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
+        .id = 1,
+    };
+    var cont_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
+    var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 1, .inline_depth = 0 } } }};
+    var cont: Trace = .{
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
+        .id = 2,
+    };
+    var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 2 }};
+    var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
+    var ext: Trace = .{
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p },
+        .id = 3,
+    };
+    for ([_]*Trace{ &root, &cont, &ext }) |t| try state.registry.cache.append(gpa, t);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var kit = state.region_policy.region_defs.keyIterator();
+    try testing.expect(!state.region_policy.region_defs.get(kit.next().?.*).?.armable);
+}
+
+test "inc-B fallback_owner flag: set on fallback mint, cleared when the primary tier takes over (rebind)" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.registry.cache.clearRetainingCapacity();
+
+    const P_ID: u32 = 25;
+    var code: [40]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
+
+    // T1 shape: link-fed root@7 ↔ cont@2, fully closed → fallback tier elects.
+    var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
+    var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
+    var root: Trace = .{
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
+        .id = 1,
+    };
+    var cont_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
+    var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 1, .inline_depth = 0 } } }};
+    var cont: Trace = .{
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
+        .id = 2,
+    };
+    try state.registry.cache.append(gpa, &root);
+    try state.registry.cache.append(gpa, &cont);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var kit = state.region_policy.region_defs.keyIterator();
+    const rid = kit.next().?.*;
+    {
+        const def = state.region_policy.region_defs.get(rid).?;
+        try testing.expect(def.armable);
+        try testing.expect(def.fallback_owner);
+    }
+
+    // Add an external guard-fed entry INTO THE ROOT: the primary tier now
+    // elects (is_ext root), so the rebind must clear `fallback_owner` — the
+    // strike-out policy for a primary-elected owner is the gate, not the
+    // tombstone.
+    var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 7 }};
+    var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
+    var ext: Trace = .{
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p },
+        .id = 3,
+    };
+    try state.registry.cache.append(gpa, &ext);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+    {
+        const def = state.region_policy.region_defs.get(rid).?;
+        try testing.expect(def.armable);
+        try testing.expect(!def.fallback_owner);
+    }
+
+    // Remove the external entry again: the fallback re-elects and the flag
+    // comes back — strike-out policy tracks the CURRENT election tier.
+    for (state.registry.cache.items, 0..) |t, i| {
+        if (t.id == 3) {
+            _ = state.registry.cache.swapRemove(i);
+            break;
+        }
+    }
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+    {
+        const def = state.region_policy.region_defs.get(rid).?;
+        try testing.expect(def.armable);
+        try testing.expect(def.fallback_owner);
+    }
+}
+
+test "inc-B strike-out policy: fallback-elected owner tombstones (one-shot); primary-elected owner keeps the gate" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = 26, .name = "t", .num_registers = 1 };
+    const owner: trace.AnchorKey = .{ .proto = &proto, .pc = 7 };
+
+    // Fallback-elected region: strike-out must tombstone the region and eat
+    // the penalty — NOT gate the anchor (the gate branch re-fires on every
+    // subsequent strike and tears down every armed link registry-wide, which
+    // is the fft regression this policy exists to prevent).
+    const rid: RegionId = @enumFromInt(900);
+    const key: trace.RegionKey = .{ .region_id = rid, .activation = 1 };
+    try state.region_policy.region_defs.put(gpa, rid, .{
+        .members = try gpa.alloc(StructuralEdgeId, 0),
+        .member_points = try gpa.alloc(ProgramPoint, 0),
+        .owner = owner,
+        .classifier = .{ .kind = .cross_trace_cycle, .member_count = 2 },
+        .armable = true,
+        .bridges = try gpa.alloc(trace.RegionBridgeDef, 0),
+        .fallback_owner = true,
+    });
+    try state.region_policy.region_profit.put(gpa, key, .{
+        .root_frame_depth = 0,
+        .root_call_seq = key.activation,
+        .useful_window_seen = true,
+    });
+    try state.penalty.put(gpa, owner, state.config.max_penalty - 1);
+
+    // work=1 < min_useful → strike; penalty saturates → the fallback path.
+    state.flushRegionWindow(key, 1);
+    {
+        const def = state.region_policy.region_defs.get(rid).?;
+        try testing.expect(def.tombstoned);
+        try testing.expect(!def.armable);
+    }
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(owner));
+    try testing.expectEqual(@as(usize, 0), state.gate.count());
+
+    // Re-saturating the penalty later re-takes the same path without
+    // re-invalidating (tombstone is sticky) and still never gates.
+    try state.penalty.put(gpa, owner, state.config.max_penalty - 1);
+    try state.region_policy.region_profit.put(gpa, key, .{
+        .root_frame_depth = 0,
+        .root_call_seq = key.activation,
+        .useful_window_seen = true,
+    });
+    state.flushRegionWindow(key, 1);
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(owner));
+    try testing.expectEqual(@as(usize, 0), state.gate.count());
+
+    // Primary-elected region (fallback_owner=false): the same saturation must
+    // keep today's behaviour — gate the owner anchor, def NOT tombstoned.
+    const rid2: RegionId = @enumFromInt(901);
+    const key2: trace.RegionKey = .{ .region_id = rid2, .activation = 2 };
+    const owner2: trace.AnchorKey = .{ .proto = &proto, .pc = 3 };
+    try state.region_policy.region_defs.put(gpa, rid2, .{
+        .members = try gpa.alloc(StructuralEdgeId, 0),
+        .member_points = try gpa.alloc(ProgramPoint, 0),
+        .owner = owner2,
+        .classifier = .{ .kind = .cross_trace_cycle, .member_count = 2 },
+        .armable = true,
+        .bridges = try gpa.alloc(trace.RegionBridgeDef, 0),
+    });
+    try state.region_policy.region_profit.put(gpa, key2, .{
+        .root_frame_depth = 0,
+        .root_call_seq = key2.activation,
+        .useful_window_seen = true,
+    });
+    try state.penalty.put(gpa, owner2, state.config.max_penalty - 1);
+    state.flushRegionWindow(key2, 1);
+    {
+        const def = state.region_policy.region_defs.get(rid2).?;
+        try testing.expect(!def.tombstoned);
+    }
+    try testing.expect(state.gate.get(owner2) != null);
+}
+
+// ── inc-B follow-up: dormancy, net-work balance, receipt attribution ─────────
+
+test "inc-B dormancy: fallback mint is dormant + excluded from receipt maps; tier flips re-arm dormancy and reset ALL learning counters" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.registry.cache.clearRetainingCapacity();
+
+    const P_ID: u32 = 27;
+    var code: [40]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
+
+    // T1 shape: link-fed root@7 ↔ cont@2, fully closed → fallback tier elects.
+    var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
+    var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
+    var root: Trace = .{
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
+        .id = 1,
+    };
+    var cont_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
+    var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 1, .inline_depth = 0 } } }};
+    var cont: Trace = .{
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
+        .id = 2,
+    };
+    try state.registry.cache.append(gpa, &root);
+    try state.registry.cache.append(gpa, &cont);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var kit = state.region_policy.region_defs.keyIterator();
+    const rid = kit.next().?.*;
+    {
+        const def = state.region_policy.region_defs.get(rid).?;
+        try testing.expect(def.armable);
+        try testing.expect(def.fallback_owner);
+        // Fallback mints DORMANT: no receipt-map entries, so the whole
+        // receipt pipeline stays short-circuited until admission.
+        try testing.expect(def.dormant);
+    }
+    try testing.expectEqual(@as(usize, 0), state.region_policy.source_exit_regions.count());
+    try testing.expectEqual(@as(usize, 0), state.region_policy.dest_entry_regions.count());
+    try testing.expect(state.region_policy.receiptsInert());
+
+    // Seed every learning counter as if the region had lived a while.
+    {
+        const d = state.region_policy.region_defs.getPtr(rid).?;
+        d.dormant = false; // as if admitted
+        d.instability = 3;
+        d.no_candidate_runs = 2;
+        d.admission_failures = 5;
+        d.receipts_debit = 1000;
+        d.transitions_credit = 500;
+    }
+
+    // Tier flip to PRIMARY (external guard-fed entry into the root): the
+    // rebind must clear fallback_owner AND zero all fallback learning state.
+    var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 7 }};
+    var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
+    var ext: Trace = .{
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p },
+        .id = 3,
+    };
+    try state.registry.cache.append(gpa, &ext);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+    {
+        const def = state.region_policy.region_defs.get(rid).?;
+        try testing.expect(!def.fallback_owner);
+        try testing.expect(!def.dormant);
+        try testing.expectEqual(@as(u8, 0), def.instability);
+        try testing.expectEqual(@as(u8, 0), def.no_candidate_runs);
+        try testing.expectEqual(@as(u8, 0), def.admission_failures);
+        try testing.expectEqual(@as(u64, 0), def.receipts_debit);
+        try testing.expectEqual(@as(u64, 0), def.transitions_credit);
+    }
+    // Primary tier is NOT dormant → it participates in the receipt maps.
+    try testing.expect(!state.region_policy.receiptsInert());
+
+    // Seed again, then flip BACK to fallback: dormancy re-arms (the region
+    // must re-qualify through admission) and the counters zero again.
+    {
+        const d = state.region_policy.region_defs.getPtr(rid).?;
+        d.instability = 7;
+        d.receipts_debit = 9999;
+    }
+    for (state.registry.cache.items, 0..) |t, i| {
+        if (t.id == 3) {
+            _ = state.registry.cache.swapRemove(i);
+            break;
+        }
+    }
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+    {
+        const def = state.region_policy.region_defs.get(rid).?;
+        try testing.expect(def.fallback_owner);
+        try testing.expect(def.dormant);
+        try testing.expectEqual(@as(u8, 0), def.instability);
+        try testing.expectEqual(@as(u64, 0), def.receipts_debit);
+    }
+    try testing.expect(state.region_policy.receiptsInert());
+}
+
+test "inc-B net-work balance: below min sample never evicts; repaid balance survives; net-loss tombstones and requests the deferred rebuild" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = 28, .name = "t", .num_registers = 1 };
+    const rid: RegionId = @enumFromInt(910);
+    try state.region_policy.region_defs.put(gpa, rid, .{
+        .members = try gpa.alloc(StructuralEdgeId, 0),
+        .member_points = try gpa.alloc(ProgramPoint, 0),
+        .owner = .{ .proto = &proto, .pc = 7 },
+        .classifier = .{ .kind = .cross_trace_cycle, .member_count = 2 },
+        .armable = true,
+        .bridges = try gpa.alloc(trace.RegionBridgeDef, 0),
+        .fallback_owner = true,
+    });
+
+    // Below the minimum sample: no credit at all, still no eviction.
+    {
+        const d = state.region_policy.region_defs.getPtr(rid).?;
+        d.receipts_debit = state.config.region_payoff_receipts - 2;
+    }
+    state.chargePayoffReceipt(rid);
+    try testing.expect(!state.region_policy.region_defs.get(rid).?.tombstoned);
+
+    // At the sample boundary with a repaying credit: survives, debit keeps
+    // accumulating (promotions never reset it).
+    {
+        const d = state.region_policy.region_defs.getPtr(rid).?;
+        d.transitions_credit = (d.receipts_debit + 1 + state.config.region_profit_weight - 1) / state.config.region_profit_weight;
+    }
+    state.chargePayoffReceipt(rid);
+    {
+        const d = state.region_policy.region_defs.get(rid).?;
+        try testing.expect(!d.tombstoned);
+        try testing.expectEqual(@as(u64, state.config.region_payoff_receipts), d.receipts_debit);
+    }
+
+    // Starve the credit below the survival line: the next charge tombstones
+    // one-shot and requests the deferred maps rebuild.
+    {
+        const d = state.region_policy.region_defs.getPtr(rid).?;
+        d.transitions_credit = 0;
+    }
+    try testing.expect(!state.pending_region_rebuild);
+    state.chargePayoffReceipt(rid);
+    {
+        const d = state.region_policy.region_defs.get(rid).?;
+        try testing.expect(d.tombstoned);
+        try testing.expect(!d.armable);
+    }
+    try testing.expect(state.pending_region_rebuild);
+    // The deferred drain consumes the flag through the common settlement path.
+    state.drainPendingRegionRebuild();
+    try testing.expect(!state.pending_region_rebuild);
+
+    // Charges against a tombstoned (or dormant, or primary) def are inert.
+    state.chargePayoffReceipt(rid);
+    try testing.expect(!state.pending_region_rebuild);
+}
+
+test "inc-B null-effective receipt attribution: minOpenRegion picks the smallest open region id deterministically" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    try testing.expectEqual(@as(?RegionId, null), state.minOpenRegion());
+    try state.region_policy.region_profit.put(gpa, .{ .region_id = @enumFromInt(9), .activation = 1 }, .{ .root_frame_depth = 0, .root_call_seq = 1 });
+    try state.region_policy.region_profit.put(gpa, .{ .region_id = @enumFromInt(4), .activation = 2 }, .{ .root_frame_depth = 0, .root_call_seq = 2 });
+    try state.region_policy.region_profit.put(gpa, .{ .region_id = @enumFromInt(6), .activation = 3 }, .{ .root_frame_depth = 0, .root_call_seq = 3 });
+    try testing.expectEqual(@as(RegionId, @enumFromInt(4)), state.minOpenRegion().?);
+}

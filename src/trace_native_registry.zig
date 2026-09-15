@@ -81,6 +81,22 @@ pub const PromotedSet = struct {
     region_key: RegionKey,
     id: u32,
 };
+/// Parked physical-set evidence (doc 47 Increment B follow-up, codex C′
+/// "parked promotion proofs"): the edge set of a promotion demoted by a clean
+/// `.region_close`, retained keyed by RegionId so the region's next
+/// activation can re-promote through the full fail-closed `promoteSet`
+/// validation without re-earning the `promote_after` observation streak.
+/// Activation-scoped AUTHORIZATION is untouched — a parked proof never
+/// executes; it only lets a new frozen activation of the SAME region skip the
+/// observational re-detection its physical set already passed. The edges hold
+/// *Trace pointers and validation dereferences them, so proofs are eagerly
+/// dropped whenever a referenced trace retires (`resetLinksTouching`) and
+/// conservatively on link/defs-wide invalidation and teardown; the policy
+/// owner additionally drops on region invalidation and topology rebuild.
+pub const ParkedProof = struct {
+    region_id: RegionId,
+    edges: []PromotedEdge,
+};
 pub const DemotionReason = enum { activation, region_close, slot_mutation, trace_invalidation, teardown, unfreeze, membership_growth };
 pub const PendingDemotion = struct { id: u32, reason: DemotionReason };
 pub const SlotMutationReason = enum { arm, rearm, retire, disarm_all, disarm_one };
@@ -184,6 +200,9 @@ pub const NativePhysicalRegistry = struct {
     pending_demote: std.ArrayListUnmanaged(PendingDemotion) = .empty,
     replay_walk_depth: u32 = 0,
     pending_disarm_all: bool = false,
+    /// Parked promotion proofs, one at most per RegionId (few regions live at
+    /// once — a linear scan; see `ParkedProof`).
+    parked_proofs: std.ArrayListUnmanaged(ParkedProof) = .empty,
     silent_promotions: u64 = 0,
     silent_demotions: u64 = 0,
     silent_demotion_reasons: PromotionDemotions = .{},
@@ -306,6 +325,75 @@ pub const NativePhysicalRegistry = struct {
         for (self.pending_demote.items) |pending| if (pending.id == id) return;
         self.pending_demote.appendAssumeCapacity(.{ .id = id, .reason = reason });
     }
+    /// Park a copy of `edges` as this region's proof, replacing any earlier
+    /// one. OOM skips the park — a proof is an optimization, never load
+    /// correctness state, so failing to retain it merely re-earns the streak.
+    pub fn parkPromotionProof(self: *NativePhysicalRegistry, region_id: RegionId, edges: []const PromotedEdge) void {
+        const copy = self.gpa.dupe(PromotedEdge, edges) catch return;
+        self.dropParkedProof(region_id);
+        self.parked_proofs.append(self.gpa, .{ .region_id = region_id, .edges = copy }) catch {
+            self.gpa.free(copy);
+            return;
+        };
+        self.dbg("silent-park: rid={d} len={d}", .{ @intFromEnum(region_id), edges.len });
+    }
+    /// Remove and return the region's parked proof (caller owns/frees), or
+    /// null. Removal on take is deliberate: a proof that fails re-validation
+    /// must not be retried forever.
+    pub fn takeParkedProof(self: *NativePhysicalRegistry, region_id: RegionId) ?[]PromotedEdge {
+        for (self.parked_proofs.items, 0..) |p, i| {
+            if (p.region_id == region_id) {
+                const edges = p.edges;
+                _ = self.parked_proofs.swapRemove(i);
+                return edges;
+            }
+        }
+        return null;
+    }
+    pub fn dropParkedProof(self: *NativePhysicalRegistry, region_id: RegionId) void {
+        for (self.parked_proofs.items, 0..) |p, i| {
+            if (p.region_id == region_id) {
+                self.gpa.free(p.edges);
+                _ = self.parked_proofs.swapRemove(i);
+                return;
+            }
+        }
+    }
+    pub fn dropAllParkedProofs(self: *NativePhysicalRegistry) void {
+        for (self.parked_proofs.items) |p| self.gpa.free(p.edges);
+        self.parked_proofs.clearRetainingCapacity();
+    }
+    /// A physical (parent, exit) relation is being mutated; every parked
+    /// proof naming that exit is falsified and dropped.
+    pub fn dropParkedProofsTouchingExit(self: *NativePhysicalRegistry, parent: *Trace, exit: u32) void {
+        var i = self.parked_proofs.items.len;
+        while (i > 0) {
+            i -= 1;
+            for (self.parked_proofs.items[i].edges) |edge| {
+                if (edge.parent == parent and edge.exit == exit) {
+                    self.gpa.free(self.parked_proofs.items[i].edges);
+                    _ = self.parked_proofs.swapRemove(i);
+                    break;
+                }
+            }
+        }
+    }
+    /// A retiring trace's memory is about to be reused; every parked proof
+    /// whose edges point at it becomes a dangling-pointer hazard (validation
+    /// dereferences `edge.parent`/`edge.child`) and is dropped eagerly.
+    pub fn dropParkedProofsTouching(self: *NativePhysicalRegistry, t: *Trace) void {
+        var i = self.parked_proofs.items.len;
+        while (i > 0) {
+            i -= 1;
+            for (self.parked_proofs.items[i].edges) |edge| {
+                if (edge.parent == t or edge.child == t) {
+                    self.gpa.free(self.parked_proofs.items[i].edges);
+                    _ = self.parked_proofs.swapRemove(i);
+                    break;
+                }
+            }
+        }
+    }
     pub fn demoteSet(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena, idx: usize) void {
         self.demoteSetReason(arena, idx, .trace_invalidation);
     }
@@ -374,6 +462,8 @@ pub const NativePhysicalRegistry = struct {
         }
     }
     pub fn demoteSetsForRegionDefsMutation(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena) void {
+        // Region membership is part of every parked proof too.
+        self.dropAllParkedProofs();
         self.resetPromotionCandidate();
         var i = self.promoted_sets.items.len;
         while (i > 0) {
@@ -385,6 +475,12 @@ pub const NativePhysicalRegistry = struct {
         }
     }
     pub fn prepareSlotMutation(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena, parent: *Trace, exit: u32, reason: SlotMutationReason) !PreparedSlotMutation {
+        // Sole physical slot-write funnel; identical convergence re-arms
+        // short-circuit before reaching it, so every call is a REAL relation
+        // mutation. A parked proof naming this exit is falsified by it —
+        // dropped here so a later equivalent re-arm cannot resurrect evidence
+        // that negative provenance invalidated (codex round-4 blocker).
+        self.dropParkedProofsTouchingExit(parent, exit);
         switch (reason) {
             .retire, .disarm_all, .disarm_one => self.resetPromotionCandidate(),
             .arm, .rearm => {}, // caller distinguishes identical convergence re-arms
@@ -404,6 +500,7 @@ pub const NativePhysicalRegistry = struct {
     }
     pub fn resetLinksTouching(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena, t: *Trace) void {
         if (self.replay_walk_depth != 0) @panic("resetLinksTouching during replay");
+        self.dropParkedProofsTouching(t);
         self.demoteSetsTouchingTrace(arena, t);
         const shared_exit = arena.*.trampoline_exit orelse 0;
         var i: usize = self.armed_links.items.len;
@@ -433,6 +530,14 @@ pub const NativePhysicalRegistry = struct {
         }
     }
     pub fn disarmAllLinks(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena) void {
+        // Parked proofs drop FIRST, unconditionally — before the deferred
+        // branch and before the empty-links early return (codex round-4
+        // blocker: `TraceRegistry.clear` reaches this with zero armed links
+        // and then DESTROYS every trace, so a surviving proof would dangle;
+        // and a blackout must never let pre-blackout evidence be resurrected
+        // by an equivalent later re-arm). Dropping is pointer-safe mid-walk —
+        // no code patching is involved.
+        self.dropAllParkedProofs();
         // A-vii-d.1: never mutate the registry mid-`replayLedger` walk — later
         // rows validate against it (see `replay_walk_depth`). Defer; the ledger
         // driver applies it right after the walk, before any native re-entry.
@@ -725,6 +830,8 @@ pub const NativePhysicalRegistry = struct {
         self.armed_links.deinit(self.gpa);
         self.pending_demote.deinit(self.gpa);
         self.resetPromotionCandidate();
+        self.dropAllParkedProofs();
+        self.parked_proofs.deinit(self.gpa);
         self.promoted_exit_owners.deinit(self.gpa);
         self.promoted_sets.deinit(self.gpa);
     }

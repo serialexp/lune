@@ -265,11 +265,50 @@ fn applyWindowDecision(self: *TraceState, key: RegionKey, work: u64, decision: @
         },
         .strike => |owner| owner,
     };
-    self.demotePromotionsForRegionReason(key, .unfreeze);
+    const unfroze = self.demotePromotionsForRegionReason(key, .unfreeze);
+    // Instability eviction (doc 47 Increment B follow-up): a strike that
+    // destroys a LIVE promotion is the churn event — "we paid to patch, then
+    // immediately unpatched". Charged per event on the fallback region's def
+    // (never the shared per-anchor penalty map, whose remove-on-recover
+    // semantics an oscillating region defeats: scimark-lu recovered often
+    // enough that 435k strikes never saturated max_penalty while cycling 175k
+    // promote/demote pairs). Clean `.region_close` survivals decrement in
+    // `closeRegion`. At the threshold the region is invalidated one-shot.
+    if (unfroze > 0) {
+        if (self.region_policy.region_defs.getPtr(key.region_id)) |d| {
+            if (d.fallback_owner and !d.tombstoned) {
+                d.instability +|= 1;
+                if (d.instability >= self.config.region_instability_tombstone) {
+                    self.dbg("region: instability tombstone rid={d} owner pc={d} work={d}", .{ @intFromEnum(key.region_id), owner.pc, work });
+                    _ = self.penalty.remove(owner);
+                    self.invalidateRegion(key.region_id);
+                    return;
+                }
+            }
+        }
+    }
     const gop = self.penalty.getOrPut(self.gpa, owner) catch return;
     if (!gop.found_existing) gop.value_ptr.* = 0;
     gop.value_ptr.* +|= 1;
     if (gop.value_ptr.* >= self.config.max_penalty) {
+        // Doc 47 Increment B: a FALLBACK-elected owner (closed-SCC tier) that
+        // strikes out is tombstoned — one-shot `invalidateRegion`, returning
+        // that region to its pre-Increment-B unarmable status quo — instead of
+        // the primary-tier gate below. The gate branch re-fires on EVERY strike
+        // once penalty saturates, and each firing tears down every armed link
+        // registry-wide (`disarmAllLinks`); on a phase-variant closed cycle
+        // (fft's butterfly: work=1 early stages, work=512 late) that repeated
+        // global teardown cost ~2× wall-clock. Re-entry via invalidateRegion →
+        // closeRegion → applyWindowDecision is bounded: the def is tombstoned
+        // by then, so the lookup below takes the remove-and-return path.
+        if (self.region_policy.region_defs.get(key.region_id)) |def| {
+            if (def.fallback_owner) {
+                self.dbg("region: fallback owner strike-out — tombstone rid={d} owner pc={d} work={d}", .{ @intFromEnum(key.region_id), owner.pc, work });
+                _ = self.penalty.remove(owner);
+                if (!def.tombstoned) self.invalidateRegion(key.region_id);
+                return;
+            }
+        }
         self.dbg("disarm-reason: window gate-strike owner pc={d} work={d}", .{ owner.pc, work });
         self.gateAnchor(owner, .region_decay);
         // B-2b / §B.6: only this explicit region-owner condemnation event
@@ -284,24 +323,54 @@ fn applyWindowDecision(self: *TraceState, key: RegionKey, work: u64, decision: @
 pub fn closeRegion(self: *TraceState, key: RegionKey) void {
     const close = self.region_policy.beginClose(key, self.config.min_useful) orelse return;
     applyWindowDecision(self, key, close.work, close.window);
-    self.demotePromotionsForRegion(key);
+    const survived = self.demotePromotionsForRegion(key);
+    // Instability recovery: a promotion that lived until the activation's own
+    // lifecycle close (rather than being struck down by `.unfreeze`) is
+    // positive evidence — decrement, never full-reset, so sustained churn
+    // still saturates through occasional clean closes. This is scimark-sparse's
+    // healthy signature: 150k region-close demotions, ~2800 transitions per
+    // burst, 1 strike per run.
+    if (survived > 0) {
+        if (self.region_policy.region_defs.getPtr(key.region_id)) |d| {
+            if (d.fallback_owner) d.instability -|= 1;
+        }
+    }
     self.resetPromotionCandidate();
     self.region_policy.finishClose(self.gpa, key);
 }
 
-pub fn demotePromotionsForRegion(self: *TraceState, key: RegionKey) void {
-    self.demotePromotionsForRegionReason(key, .region_close);
+pub fn demotePromotionsForRegion(self: *TraceState, key: RegionKey) usize {
+    return self.demotePromotionsForRegionReason(key, .region_close);
 }
 
 /// Backwards over `promoted_sets` because `demoteSetReason` swapRemoves at
 /// depth 0 (mid-walk it queues instead) — forward iteration would skip entries.
-pub fn demotePromotionsForRegionReason(self: *TraceState, key: RegionKey, reason: DemotionReason) void {
+/// Returns the number of sets demoted (or queued mid-walk — they WILL demote).
+///
+/// Parked proofs (codex C′): ONLY the clean `.region_close` demotion of a
+/// fallback-owned, live-armable region parks the set's edges for reuse by the
+/// region's next activation. Every other reason (`.unfreeze`, growth, slot,
+/// trace, teardown) is negative evidence and parks nothing. The copy is taken
+/// BEFORE `demoteSetReason` so a mid-walk queued demotion still parks the
+/// exact set that was live.
+pub fn demotePromotionsForRegionReason(self: *TraceState, key: RegionKey, reason: DemotionReason) usize {
+    var demoted: usize = 0;
     var i = self.registry.native_physical.promotedSets().len;
     while (i > 0) {
         i -= 1;
-        if (std.meta.eql(self.registry.native_physical.promotedSets()[i].region_key, key))
+        const set = self.registry.native_physical.promotedSets()[i];
+        if (std.meta.eql(set.region_key, key)) {
+            if (reason == .region_close) {
+                if (self.region_policy.region_defs.get(key.region_id)) |d| {
+                    if (d.fallback_owner and d.armable and !d.tombstoned and !d.dormant)
+                        self.registry.native_physical.parkPromotionProof(key.region_id, set.edges);
+                }
+            }
             self.demoteSetReason(i, reason);
+            demoted += 1;
+        }
     }
+    return demoted;
 }
 
 /// B-3a hook at every native-call origin. B-3b performs the conservative global
@@ -366,6 +435,13 @@ pub fn invalidateRegion(self: *TraceState, id: RegionId) void {
     if (self.region_policy.invalidateRegion(id)) self.demoteSetsForRegionDefsMutation();
     while (self.region_policy.nextInvalidated(id)) |key| self.closeRegion(key);
     self.disarmAllLinks();
+    // Doc 47 Increment B follow-up: the tombstone alone leaves the region's
+    // stale entries in the source/dest receipt maps, so `receiptsInert()`
+    // stays false and every receipt program-wide keeps paying the region
+    // pipeline for a region that can never pay off again. Request a maps
+    // rebuild at the next post-walk drain tail (deferred — this can run
+    // mid-replay, where a wholesale map swap is not safe).
+    self.pending_region_rebuild = true;
 }
 
 pub const RegionBridgeDecision = struct {
@@ -1078,10 +1154,64 @@ pub fn applyDestination(self: *TraceState, selected: ?RegionKey, dest: RegionDes
     var source = selected;
     var cursor: @import("trace_region_policy.zig").RegionPolicy.SelectionCursor = .{};
     while (true) switch (self.region_policy.applyDestination(self.gpa, &source, candidates, dest == .deferred, ctx, &cursor)) {
-        .done => return,
+        .done => |maybe_key| {
+            // Payoff-receipt eviction (doc 47 Increment B follow-up): charge
+            // a receipt that OPENED a destination region here (a kept source
+            // was already charged at the `decision.effective` site in
+            // `accountRegionProfit` — don't double-charge it).
+            if (maybe_key) |key| {
+                if (selected == null or !std.meta.eql(selected.?, key))
+                    chargePayoffReceipt(self, key.region_id);
+            }
+            return;
+        },
         .close => |key| self.closeRegion(key),
         .invalidate => |id| self.invalidateRegion(id),
     };
+}
+
+/// Drain the deferred maps rebuild requested by `invalidateRegion`. Runs at
+/// the dispatcher drain tail — the same post-replay-walk safe point as
+/// dormant admission — never mid-walk.
+pub fn drainPendingRegionRebuild(self: *TraceState) void {
+    if (!self.pending_region_rebuild) return;
+    self.pending_region_rebuild = false;
+    self.rebuildRegions();
+}
+
+/// Deterministic pick of the open activation with the smallest region id —
+/// the region charged for a receipt the pipeline processed without resolving
+/// any effective activation (the open activation that keeps `receiptsInert()`
+/// false may belong to an OUTER frame's call_seq, invisible to this receipt's
+/// context, yet its existence is exactly why the receipt paid the walk).
+pub fn minOpenRegion(self: *TraceState) ?RegionId {
+    var best: ?RegionId = null;
+    var it = self.region_policy.region_profit.keyIterator();
+    while (it.next()) |key| {
+        if (best == null or @intFromEnum(key.region_id) < @intFromEnum(best.?))
+            best = key.region_id;
+    }
+    return best;
+}
+
+/// Charge one receipt of region-accounting tax against a fallback region's
+/// deterministic net-work ledger, and invalidate the region once its
+/// cumulative debit passes the minimum sample without the credit side
+/// (suppressed silent transitions, rolled up in `driveSilentBurst`) repaying
+/// it at `region_profit_weight`. Promotions never reset the ledger —
+/// "promotion occurred" is not "promotion repaid the cost". After eviction
+/// the maps rebuild without the region and `receiptsInert()` short-circuits
+/// the whole receipt path again.
+pub fn chargePayoffReceipt(self: *TraceState, rid: RegionId) void {
+    const d = self.region_policy.region_defs.getPtr(rid) orelse return;
+    if (!d.fallback_owner or d.dormant or d.tombstoned) return;
+    d.receipts_debit +|= 1;
+    if (d.receipts_debit % 4096 == 0)
+        self.dbg("region: net ledger rid={d} debit={d} credit={d}", .{ @intFromEnum(rid), d.receipts_debit, d.transitions_credit });
+    if (d.receipts_debit < self.config.region_payoff_receipts) return;
+    if (d.transitions_credit *| self.config.region_profit_weight >= d.receipts_debit) return;
+    self.dbg("region: net-loss tombstone rid={d} debit={d} credit={d}", .{ @intFromEnum(rid), d.receipts_debit, d.transitions_credit });
+    self.invalidateRegion(rid);
 }
 
 /// Region-profit receipt processor (doc 17 §A3.5). Null-keyed synthetic
@@ -1146,6 +1276,19 @@ pub fn accountRegionProfit(self: *TraceState, key: ?ExitKey, work: usize, dest: 
             if (decision.credit) self.creditRegionWork(effective, accum, work);
             if (decision.barren) self.noteBarrenConsumed(effective, accum);
         }
+        // Payoff-receipt eviction: the receipt paid the region pipeline for
+        // this activation (classify + choose + credit) — charge it, whether
+        // or not the destination side is deferred.
+        chargePayoffReceipt(self, effective.region_id);
+    } else {
+        // The receipt resolved to NOTHING, yet it still paid the pipeline
+        // (classifyExit + the activeRegionFor walks) purely because some
+        // region holds an open activation — possibly in an outer frame,
+        // under a call_seq this receipt's context can't see (scimark-lu:
+        // every inner-loop receipt program-wide paid ~15% wall this way for
+        // a region that promoted once per run). Charge that region: if it
+        // never pays off, eviction ends the tax for the whole program.
+        if (minOpenRegion(self)) |rid| chargePayoffReceipt(self, rid);
     }
     self.applyDestination(decision.effective, dest, ctx);
     return decision.consumed;
@@ -1165,7 +1308,23 @@ pub inline fn creditRegionWork(self: *TraceState, key: RegionKey, accum: *Region
     while (self.region_policy.nextCreditWindow(key, accum, self.config.min_useful, self.config.freeze_windows, self.penalty.count() == 0 and self.gate.count() == 0)) |decision| {
         applyWindowDecision(self, key, self.config.min_useful, decision.window);
         if (decision.clear_members) self.clearMemberAnchorState(key.region_id);
+        // Invalidation backstop: `applyWindowDecision` above may have
+        // tombstoned the region (instability / strike-out), which ran
+        // `closeRegion` and removed this activation's accum — `accum` must
+        // not be dereferenced again, so stop the loop.
+        if (self.region_policy.region_defs.get(key.region_id)) |d| {
+            if (d.tombstoned) return;
+        }
     }
+}
+
+/// True when any promoted set currently belongs to `rid` (list is tiny: one
+/// live set per region at most, and usually zero or one total).
+pub fn regionHasLivePromotion(self: *TraceState, rid: RegionId) bool {
+    for (self.registry.native_physical.promotedSets()) |set| {
+        if (set.region_key.region_id == rid) return true;
+    }
+    return false;
 }
 
 /// Consume one zero-work (barren) receipt of a QUALIFIED activation, and
@@ -1474,6 +1633,10 @@ pub fn clearPhysicalRegionIndices(self: *TraceState) void {
 /// that invalidates a prior region's owner, so a retained snapshot could keep a stale
 /// region armed; empty is region-neutral and auto-recovers on the next successful pass).
 pub fn rebuildRegions(self: *TraceState) void {
+    // Any full rebuild satisfies the deferred-rebuild request — consume the
+    // flag so a normal (commit/removal-driven) rebuild isn't followed by a
+    // redundant deferred one.
+    self.pending_region_rebuild = false;
     self.rebuildRegionsFallible() catch {
         self.clearPhysicalRegionIndices();
         // A-vii-d.1 (review blocker 3): the physical indices failed closed
