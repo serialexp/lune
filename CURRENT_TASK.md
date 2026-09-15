@@ -21,9 +21,26 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
-## Status 2026-09-15 (latest+13) — task #30: Increment B regression-elimination arc COMPLETE — parked proofs + windowed mprotect landed, board clean, awaiting final codex confirm + commit
+## Status 2026-09-15 (latest+13) — task #30 DONE: Increment B + regression-elimination arc COMMITTED as 4dddad2
 
-**Tree state: UNCOMMITTED, `zig build test` GREEN (1359 tests), board run
+**COMMITTED (4dddad2 on master, whole-file staging, codex round-5 landing
+confirmation in thread 01a0a48c).** Post-round-4 additions folded in before
+the commit: codex found two parked-proof invalidation holes — (1)
+`disarmAllLinks` early-returned on zero armed links BEFORE the proof drop
+(the `TraceRegistry.clear` dangling shape), fixed by dropping first,
+unconditionally; (2) membership growth demoted live sets but left parked
+proofs' region-total claim unfalsified, fixed via `noteMembershipGrowth`
+parked participation + a `dropParkedProofsTouchingExit` hook at the
+`prepareSlotMutation` funnel (every real relation mutation). Three-leg
+regression test isolates each path. Re-probed: reuse counts unchanged
+(grid 199/203, sparse 96/101) — no spurious drops. 1364 tests green.
+Next campaign arcs: doc 47 Increment C (spectral dead-append-cont
+entry-refusal thrash), codex D cheapenings (doc 47 Outstanding), task #18
+(doc 44 return tracing). The mid-arc board
+bench/results/20260915-163605-09bb515.tsv stays untracked (unclaimed-board
+pile, per the per-file rule at the bottom of this file).
+
+**Pre-commit state (kept for context): `zig build test` GREEN, board run
 saved (bench/results/20260915-200333-09bb515.tsv).** Every latest+12 board
 regression is eliminated: sparse 294→**150** (−49% vs 09bb515, 5.4× LJ, was
 11.4×), lu/sor/spectral/nbody/fft at par, grid_matmul/f64 residual ~+2-3% ≈
