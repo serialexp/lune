@@ -726,7 +726,7 @@ test "post-store array load proves constant non-aliasing without a runtime relat
     try testing.expect(saw_aload);
 }
 
-test "post-store array load aborts on ambiguous loop-varying key alias" {
+test "post-store array load with ambiguous key emits runtime ne disambiguation guard" {
     const gpa = testing.allocator;
     const t = try table_mod.Table.create(gpa);
     defer t.destroy(gpa);
@@ -739,14 +739,21 @@ test "post-store array load aborts on ambiguous loop-varying key alias" {
     try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
 
     // r2 and r3 are unrelated loop inputs. Their observed 3 != 4 relation is not
-    // a proof that survives another iteration, so no runtime `ne` guard may pin it.
+    // a static proof, so the recorder emits a runtime `ne` guard to disambiguate
+    // the sunk store's key from the load's key (store_fwd_ambiguity → ne guard).
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.int(4), Value.boolean(true) };
     state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
     state.recordInstr(Instr.opABC(.set_index, 1, 2, 4), winRO(&regs), &proto, 0, Value.nil());
     state.recordInstr(Instr.opABC(.get_index, 0, 1, 3), winRO(&regs), &proto, 0, Value.nil());
-    try testing.expect(!state.isRecording());
-    try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
-    for (state.rec.instrs.items) |ins| try testing.expect(ins.op != .eq and ins.op != .ne);
+    // Recording continues (no abort) — the ne guard allows it.
+    try testing.expect(state.isRecording());
+    try testing.expectEqual(@as(?AbortReason, null), state.rec.abort_reason);
+    // The IR must contain at least one `.ne` instruction (the disambiguation guard).
+    var saw_ne = false;
+    for (state.rec.instrs.items) |ins| {
+        if (ins.op == .ne) saw_ne = true;
+    }
+    try testing.expect(saw_ne);
 }
 
 test "recArraySet sinks a read-steered const store (control channel) instead of aborting" {

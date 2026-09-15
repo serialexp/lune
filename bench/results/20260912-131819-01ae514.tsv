@@ -1,0 +1,4 @@
+# mahina bench suite  rev=01ae514  stamp=20260912-131819  reps=5  scale=1.0
+program	args	luajit_mode	cross	luajit_match	mahina_t0_ms	mahina_jit_ms	luajit_ms	mahina_t0_execns	mahina_jit_execns	mahina_t0_maxrss_kb	mahina_jit_maxrss_kb	luajit_maxrss_kb	mahina_jit_res_pct
+grid_matmul	200	-	ok	ok	269.900	27.573	8.643	289411980	26008883	3204	3704	3488	90.7
+grid_matmul_f64	200	-	ok	ok	270.098	26.207	7.354	269500582	25536093	5892	6200	3456	91.0

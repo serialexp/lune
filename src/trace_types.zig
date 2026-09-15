@@ -73,6 +73,7 @@ pub const GuardRole = enum(u8) {
     callee_identity, // closure identity (call / get_upval / get_global — guard_func)
     callee_pure, // pure-builtin identity (guard_builtin)
     border, // `#t` fast-case border computable (alen's own producer-exit)
+    alias_disambig, // store-forwarding key/table alias disambiguation (ne guard)
 };
 
 /// Static register designator for the guarded operand (H-1c). Covers `a`/`b`/`c`,

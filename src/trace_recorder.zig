@@ -51,6 +51,21 @@ pub const AbortReason = enum {
     too_long,
     /// An operand had a type the recorder cannot guard/model here.
     bad_type,
+    /// Store-forwarding ambiguity: a pending-store load-forwarding pass
+    /// (`forwardPendingArrayLoad` / `forwardPendingHashLoad`) could not
+    /// prove non-aliasing between a pending store and a load — either the
+    /// pending store's op is unclassified, the table SSA refs are distinct
+    /// (same key, different table — `may`-alias), or the key alias class
+    /// was `.may`. Fail-closed: tier-0 owns the iteration.
+    store_fwd_ambiguity,
+    /// Deopt-replay unsoundness: a store (array, grid, or hash) follows a
+    /// prior heap read in the same trace, making the iteration
+    /// non-idempotent under coarse side-exit replay — a side-exit after
+    /// the store re-runs the whole iteration against the mutated heap and
+    /// double-applies (C1 rule, doc 08 §store-sinking). For arrays the
+    /// sinking machinery handles this; for appends and grids the recorder
+    /// aborts instead.
+    store_after_load,
     /// An indexed/appended table carries a metatable, so the access may dispatch
     /// a `__index`/`__newindex` metamethod (chunk 2a). Recording aborts: the
     /// metamethod call would be a trace barrier anyway, and a present-slot raw
@@ -865,6 +880,9 @@ pub const RecordingSession = struct {
 
     pub fn abort(self: *RecordingSession, reason: AbortReason) void {
         if (!self.active) return;
+        if (comptime @import("jitdbg.zig").enabled) {
+            if (reason == .bad_type or reason == .store_fwd_ambiguity or reason == .store_after_load) @import("jitdbg.zig").log("ABORT {s}: pc={d} op={d} ir_len={d} ret={x}", .{ @tagName(reason), self.cur_pc, @intFromEnum(self.cur_op), self.instrs.items.len, @returnAddress() });
+        }
         // Doc 47 increment A fallback: if a peel is in flight and the body
         // recording aborts (aliased_input, nyi_opcode, etc.), don't kill the
         // recording — rewind the IR to the pre-peel state and close `.link`
@@ -1288,8 +1306,10 @@ pub const RecordingSession = struct {
                 try self.recArrayGet(instr, regs)
             else if (isStringKey(regs.get(instr.c)))
                 try self.recHashGet(instr, regs)
-            else
-                self.abort(.bad_type),
+            else blk: {
+                if (comptime @import("jitdbg.zig").enabled) @import("jitdbg.zig").log("bad_type get_index dispatch: isInt={} isFloat={} isNil={} isHeap={} pc={d}", .{ regs.get(instr.c).isInt(), regs.get(instr.c).isFloat(), regs.get(instr.c).isNil(), regs.get(instr.c).isHeap(), self.cur_pc });
+                break :blk self.abort(.bad_type);
+            },
 
             // Table write `t[k]=v`: INTEGER key → packed-array write (Phase B,
             // in-bounds in-lane, C1 deopt-replay rule); constant STRING key →
@@ -1769,7 +1789,10 @@ pub const RecordingSession = struct {
         const vtab = regs.get(f.tab);
         const vkey = regs.get(f.key);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
-        const idx = keyIndexOf(vkey) orelse return self.abort(.bad_type);
+        const idx = keyIndexOf(vkey) orelse {
+            if (comptime @import("jitdbg.zig").enabled) @import("jitdbg.zig").log("bad_type arrayGet key: isInt={} isFloat={} pc={d}", .{ vkey.isInt(), vkey.isFloat(), self.cur_pc });
+            return self.abort(.bad_type);
+        };
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
         // A metatable means an absent slot could fire `__index` (chunk 2a). Even a
         // present slot today could become a hole on a later iteration, so the only
@@ -1778,7 +1801,10 @@ pub const RecordingSession = struct {
         const lane = tbl.array.lane;
         const loaded = tbl.getInt(idx);
         if (loaded.isNil()) return self.recordAbsentGet(regs, f);
-        if (!arr.ArrayPart.inArray(idx, tbl.array.asize)) return self.abort(.bad_type);
+        if (!arr.ArrayPart.inArray(idx, tbl.array.asize)) {
+            if (comptime @import("jitdbg.zig").enabled) @import("jitdbg.zig").log("bad_type arrayGet: idx={d} asize={d} lane={d} pc={d}", .{ idx, tbl.array.asize, @intFromEnum(lane), self.cur_pc });
+            return self.abort(.bad_type);
+        }
 
         if (lane == .value) {
             // The `.value` lane stores full 16-byte Values (tag+payload, nil in-band).
@@ -1868,15 +1894,19 @@ pub const RecordingSession = struct {
                 // (the gmatch state's slot 3) — fail closed on any store op
                 // this classifier wasn't written for.
                 else => {
-                    self.abort(.bad_type);
+                    self.abort(.store_fwd_ambiguity);
                     return true;
                 },
             }
             const addr = self.instrs.items[ps.aref];
             std.debug.assert(addr.op == .aref);
             if (addr.a != rtab) {
-                self.abort(.bad_type);
-                return true;
+                // Different table SSA refs — runtime pointer identity
+                // disambiguation. If the refs hold the same table at runtime,
+                // side-exit; otherwise the stores can't touch our cell.
+                const cmp = try self.emit(.{ .op = .ne, .a = rtab, .b = addr.a, .ty = .boolean });
+                self.stampProv(try self.emit(.{ .op = .guard_true, .a = cmp }), .alias_disambig, .none, .neutral);
+                continue;
             }
             switch (self.classifyArrayKeyAlias(rkey, addr.b)) {
                 .must => {
@@ -1885,8 +1915,14 @@ pub const RecordingSession = struct {
                 },
                 .no => continue,
                 .may => {
-                    self.abort(.bad_type);
-                    return true;
+                    // Runtime key disambiguation: the load key must differ
+                    // from the sunk store's key. If they collide at runtime,
+                    // side-exit to tier-0. Otherwise the aload reads the
+                    // pre-store heap safely (the sunk store is below all
+                    // guards and hasn't executed yet).
+                    const cmp = try self.emit(.{ .op = .ne, .a = rkey, .b = addr.b, .ty = .boolean });
+                    self.stampProv(try self.emit(.{ .op = .guard_true, .a = cmp }), .alias_disambig, .none, .neutral);
+                    continue;
                 },
             }
         }
@@ -1901,7 +1937,7 @@ pub const RecordingSession = struct {
     /// (last-writer-wins; `commit()` flushes oldest→newest — the pair keeps
     /// repeated same-cell stores exact). Returns `true` when the load was resolved
     /// (value forwarded or recording aborted); `false` → caller emits the heap read.
-    pub fn forwardPendingHashLoad(self: *RecordingSession, dst: u16, rtab: Ref, rkey: Ref) bool {
+    pub fn forwardPendingHashLoad(self: *RecordingSession, dst: u16, rtab: Ref, rkey: Ref) !bool {
         var n = self.pending_stores.items.len;
         while (n > 0) {
             n -= 1;
@@ -1916,7 +1952,7 @@ pub const RecordingSession = struct {
                 .hstore => {},
                 // Fail closed on any store op this classifier wasn't written for.
                 else => {
-                    self.abort(.bad_type);
+                    self.abort(.store_fwd_ambiguity);
                     return true;
                 },
             }
@@ -1933,11 +1969,12 @@ pub const RecordingSession = struct {
                 self.setReg(dst, ps.value);
                 return true;
             }
-            // Same key, unproven table identity (two SSA refs may hold the same
-            // table at runtime) → MAY: abort fail-closed. Never guard a runtime
-            // identity relation between loop-varying refs.
-            self.abort(.bad_type);
-            return true;
+            // Same key, unproven table identity — runtime pointer identity
+            // disambiguation. If the refs hold the same table at runtime,
+            // side-exit; otherwise the stores can't touch our cell.
+            const cmp = try self.emit(.{ .op = .ne, .a = rtab, .b = addr.a, .ty = .boolean });
+            self.stampProv(try self.emit(.{ .op = .guard_true, .a = cmp }), .alias_disambig, .none, .neutral);
+            continue;
         }
         return false;
     }
@@ -2093,7 +2130,7 @@ pub const RecordingSession = struct {
             // state the append didn't touch); hash and array parts are
             // disjoint, and same-table hstore+append contradict at the guards
             // (`docs/design/08-multi-store-sinking.md` §soundness).
-            if (self.traceHasArrayRead()) return self.abort(.bad_type);
+            if (self.traceHasArrayRead()) return self.abort(.store_after_load);
             const rval = try self.refOf(f.val);
             const lane_ord: i32 = @intFromEnum(lane);
             const rtab = try self.refOf(f.tab);
@@ -2213,7 +2250,7 @@ pub const RecordingSession = struct {
     /// tier-0.
     pub fn recGridGet(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
         // Like recArrayGet: a grid load after a sunk store would read stale on-trace.
-        if (self.pending_stores.items.len > 0) return self.abort(.bad_type);
+        if (self.pending_stores.items.len > 0) return self.abort(.store_after_load);
         const col_reg: u16 = @intCast(instr.aux);
         const vtab = regs.get(instr.b);
         const vrow = regs.get(instr.c);
@@ -2286,7 +2323,7 @@ pub const RecordingSession = struct {
         // double-apply when a side-exit re-runs the iteration against the already-
         // mutated grid. Phase 8a aborts rather than sinking (see recArraySet for the
         // sinking machinery a later phase can extend to grids).
-        if (self.traceHasHeapLoad()) return self.abort(.bad_type);
+        if (self.traceHasHeapLoad()) return self.abort(.store_after_load);
 
         const ge: i32 = @intFromEnum(ap.grid_elem);
         const stride_aux: i32 = @intCast(ap.stride);
@@ -2459,7 +2496,7 @@ pub const RecordingSession = struct {
         // forwarding paths either resolve them or refuse ambiguous aliases.
         if (key.isNumber()) {
             if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, keyIndexOf(key).?)) return;
-        } else if (self.forwardPendingHashLoad(f.dst, rtab, rkey)) return;
+        } else if (try self.forwardPendingHashLoad(f.dst, rtab, rkey)) return;
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
         self.stampProv(try self.emit(.{ .op = .guard_absent, .a = rtab, .b = rkey }), .present, .loaded, .neutral);
         self.setReg(f.dst, try self.konst(Value.nil()));
@@ -2528,7 +2565,7 @@ pub const RecordingSession = struct {
         // side already emitted `guard_table`/`href`/`guard_hash`/`guardNum` on this
         // same table ref + key konst, so no chain is re-emitted here), NO keeps
         // scanning / falls through to the heap read, MAY aborts fail-closed.
-        if (self.forwardPendingHashLoad(f.dst, rtab, rkey)) return;
+        if (try self.forwardPendingHashLoad(f.dst, rtab, rkey)) return;
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
         // Seed the loop-invariant cell pointer for native (H1); `href.aux` carries
         // the synthetic slab slot, or `-1` to mark "not seeded → native declines".

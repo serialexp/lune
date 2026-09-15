@@ -21,6 +21,59 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-15 (latest+11) — abort renames + store_fwd_ambiguity FIXED (ne alias-disambiguation guards); UNCOMMITTED
+
+**Tree state: UNCOMMITTED diff** (src/trace_types.zig, src/trace_recorder.zig,
+src/nativegen_prove.zig, src/trace_record_test.zig, src/interp_trace_test.zig).
+All gates green (unit 1342+, JIT boundaries). A/B-verified performance-neutral
+(shadow-built HEAD binary vs current, best-of-7: fft 338.6→343.2, field_hash
+13.9→13.7, nsieve-bit-fp 287.4→285.0, sor 86.2→85.3 — all noise).
+
+Two slices in this diff:
+
+1. **Abort-reason renames.** `bad_type` was reused at 8 sites that are NOT type
+   mismatches. New `AbortReason` variants: `store_fwd_ambiguity` (5 sites in
+   `forwardPendingArrayLoad`/`forwardPendingHashLoad` — alias analysis can't
+   prove non-aliasing) and `store_after_load` (3 sites — C1 deopt-replay:
+   append-after-array-read in arraySetShape, grid-get with pending stores,
+   grid-set after heap load). Genuine type-mismatch `bad_type` sites untouched.
+
+2. **store_fwd_ambiguity FIXED — runtime `ne` alias-disambiguation guards**
+   (LuaJIT-inspired; aa_ahref does static index arithmetic, we add the runtime
+   fallback our sinking model needs). Instead of aborting when the forwarding
+   pass hits `.may` (key alias) or different-table SSA refs, emit
+   `ne(load_key, store_key)` / `ne(load_tab, store_tab)` + `guard_true`
+   (`GuardRole.alias_disambig`): keys/tables equal at runtime → side-exit to
+   tier-0 (correct: coarse replay re-runs the iteration); different → the aload
+   safely reads pre-store heap (sunk stores flush below all guards).
+   `proveKinds` extended: `eq`/`ne` on `ptr`×`ptr` → `.bool` (pointer identity;
+   x86-64 `cmp` identical to int path, no emitter change needed).
+   `forwardPendingHashLoad` signature `bool` → `!bool` (now emits).
+   - Reproducer (/tmp/store_fwd_test.lua, read-write-read with `j = i + n`):
+     was 6/6 aborts + no trace; now ZERO aborts.
+   - fft: all 3 `store_fwd_ambiguity` sites gone (recordings now proceed; the
+     unrolled anchors hit `too_long` instead — they record past the ambiguity).
+     lu's site gone too. fft wall-clock unchanged (its bottleneck is nest
+     coverage, below).
+   - Tests updated: trace_record_test "ambiguous key" now expects recording +
+     `.ne` in IR; interp_trace_test hash-alias MAY test now expects commit +
+     correct output (t==u case side-exits every iteration, verified via
+     expectProgram 10-leg parity).
+
+**fft diagnosis parked for the next arc:** --jit-stats shows 50% of fft's
+runtime is tier-0 fallback-despite-a-trace; top aborts are `nyi_opcode` at
+`for_prep` (nested-loop recording, task #30) ×2 + `cont_backedge` ×3. That —
+not codegen — is fft's 20× gap. Same signature on sparse/nsieve-bit-fp (res
+13–16%). Board (2026-09-11 full baseline): recursive-fib 27.3× (doc 44,
+task #18), nbody 22.9×, sparse 21.0×, fft 20.2×, nsieve-bit-fp 18.0×,
+spectral 17.5×, euler14-bit 10.8× at res 0% (trace never dispatches —
+undiagnosed, possibly cheap win).
+
+**`store_after_load` (the other renamed reason) still aborts** — sinking
+doesn't cover `astore_append` (shape change) or `gstore` (grid). Hits setup
+loops (random_vector/random_matrix in fft/lu/sor/sparse) and SPARSE's
+`vy[r] = sum`. Candidate follow-up arc.
+
 ## Status 2026-09-13 (latest+10) — doc 47 increment A IMPLEMENTED (continuation-scoped link peel); f64 append ready to land?
 
 **Tree state: increment A + f64-append diff UNCOMMITTED** (src/trace_recorder.zig,
@@ -7821,6 +7874,35 @@ Verdict: **no correctness blocker**; two doc nits (bail-comment wording, mirror 
 
 NEXT: Increment 2.3c — arm ordinary source-branch guards + loop-done (S1 dual
 materialization, S3 prologue-fail split, slot-identity collision decision).
+
+## Status 2026-09-14 (latest+11): doc 47 peel fallback + next-arc survey
+
+Landed:
+- `7a6ca81` perf(jit): doc 47 — f64 array append + continuation link peeling
+- `3ab724a` fix(jit): peel-to-link fallback prevents spectral-norm 8× regression
+
+Board (3-rep, vs LuaJIT): sparse 316/27.7=11.4×, spectral 28.8/2.1=13.8×,
+grid_matmul_f64 27.1/7.5=3.6×, repack 23.4/5.0=4.6×. No regressions.
+
+**Next-arc survey (gaps sorted by jit/lj):**
+
+| Bench | jit/lj | Bottleneck class |
+|---|---|---|
+| recursive-fib | 27.9× | recursion can't trace (doc 44) |
+| nbody | 22.0× | codegen quality (native 7536 cyc/iter) + outer-loop LINNER |
+| scimark-fft | 21.6× | dispatch starving: 11 traces compile native, 0% native exec; 15 abort types (bad_type get_index, for_prep LINNER, type_instability, aliased_input get_upval) |
+| nsieve-bit-fp | 17.7× | aliased_input on get_upval kills continuations at nsieve:45 (56.6% of run, 81% tier-0) |
+| spectral-norm | 13.8× | now viable after peel fallback |
+| scimark-sparse | 11.4× | tier-0 outer scan remainder |
+| euler14-bit | 10.5× | native slower than tier-0 (12114 vs 4551 cyc/iter!); close_upvalues abort blocks inner loop |
+| scimark-lu | 10.1× | not yet profiled |
+| binary-trees | 9.9× | recursion can't trace (doc 44) |
+
+**Recurring general blockers (cross-bench):**
+1. `aliased_input` on `get_upval` — kills continuations in spectral (fixed via peel fallback), nsieve-bit-fp, fft. The open-upvalue aliasing guard (trace_recorder.zig:4463) fires when a closed-cell upvalue load has an open_idx >= anchor_abs_base.
+2. `bad_type` on `get_index`/`set_index` — array access type mismatches block fft entirely.
+3. `nyi_opcode` at `for_prep` (LINNER) — inner loop linking still aborts when no inner root exists; hits nbody, euler14-bit, fft, nsieve-bit-fp.
+4. Dispatch prologue-fail: fft has 11 native-compiled traces but 0% native execution — entry-guard fingerprint mismatches starve dispatch on every entry attempt.
 
 ## Unpushed local commits (Rule #15 — don't push unless asked)
 master is well ahead of origin/master; do NOT push without Bart's say-so.
