@@ -598,7 +598,21 @@ pub const RecordingSession = struct {
     rec_path: std.ArrayListUnmanaged(ProgramPoint) = .empty,
     rec_path_ok: bool = true,
     /// Refs already covered by a type guard, so we emit each at most once.
-    guarded_refs: std.AutoHashMapUnmanaged(Ref, void) = .empty,
+    /// The value is the guard INSTRUCTION's index: a peel rewind
+    /// (`rewindPeelAndCloseLink`) truncates IR by length, and the guard always
+    /// sits at a higher index than the ref it covers — purging on the ref's own
+    /// index left refs below the rewind point marked "guarded" with their guard
+    /// truncated away, so the re-close silently skipped a required guard and
+    /// the committed trace carried an unguarded slot_load (proveKinds then
+    /// rejected the whole trace; spectral-norm's loop-done cont was the case).
+    guarded_refs: std.AutoHashMapUnmanaged(Ref, u32) = .empty,
+    /// Doc 48: record-time table identity per emitted `guard_lane`
+    /// (recorder-index keyed; finalization remaps through tropt's compaction
+    /// map). Eviction metadata only — an OOM here silently skips the pin,
+    /// which can only ever SUPPRESS a widen-eviction, never corrupt output.
+    /// Truncated on peel rewind exactly like `guarded_refs` (`guard_ref >=
+    /// ir_rewind_len` ⇒ the guard instruction itself was truncated).
+    lane_pins: std.ArrayListUnmanaged(trace_code.LanePin) = .empty,
     /// Interns constants: a recurring literal reuses its `konst` instruction's
     /// ref (and pool slot) instead of emitting a fresh one, so identical
     /// subexpressions get identical operand refs and the optimizer's CSE can
@@ -922,21 +936,35 @@ pub const RecordingSession = struct {
         // Restore side-effect flags that body recording may have set.
         self.recorded_global_seed = plc.saved_global_seed;
         self.recorded_global_store = plc.saved_global_store;
-        // Purge any guarded_refs pointing at truncated IR.
-        var to_remove: [64]Ref = undefined;
-        var n_remove: usize = 0;
-        var it = self.guarded_refs.iterator();
-        while (it.next()) |entry| {
-            if (@as(u32, entry.key_ptr.*) >= plc.ir_rewind_len) {
-                if (n_remove < to_remove.len) {
-                    to_remove[n_remove] = entry.key_ptr.*;
-                    n_remove += 1;
+        // Purge any guarded_refs whose GUARD instruction was truncated. The
+        // map value is the guard's own index — never the guarded ref's, which
+        // is always lower: a ref below the rewind point whose guard sat above
+        // it must lose its "guarded" mark, or the re-close below would
+        // silently skip a required guard (an unguarded slot_load then made
+        // proveKinds reject the committed trace — spectral's loop-done cont).
+        // Restart the scan after each removal (iterator invalidation); the
+        // set is small and rewinds are rare, so O(n·removals) is fine — and
+        // unlike the old fixed 64-slot scratch, nothing stale can survive.
+        outer: while (true) {
+            var it = self.guarded_refs.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* >= plc.ir_rewind_len) {
+                    _ = self.guarded_refs.remove(entry.key_ptr.*);
+                    continue :outer;
                 }
             }
+            break;
         }
-        for (to_remove[0..n_remove]) |ref| {
-            _ = self.guarded_refs.remove(ref);
+        // Doc 48: drop lane pins whose guard_lane was truncated (same
+        // staleness class; the pin indexes the guard instruction itself).
+        var np: usize = 0;
+        for (self.lane_pins.items) |pin| {
+            if (pin.guard_ref < plc.ir_rewind_len) {
+                self.lane_pins.items[np] = pin;
+                np += 1;
+            }
         }
+        self.lane_pins.items.len = np;
         self.pending_link_close = null;
 
         // --- Re-emit the immediate `.link` close (same logic as the
@@ -1598,14 +1626,32 @@ pub const RecordingSession = struct {
             .guard_float => self.noteEntryKind(ref, .float),
             else => {},
         }
-        if (self.guarded_refs.contains(ref)) return;
-        try self.guarded_refs.put(self.gpa, ref, {});
+        if (self.guarded_refs.contains(ref)) {
+            @import("jitdbg.zig").log("guard-dedup: ref={d} op={s} ir_len={d}", .{ ref, @tagName(op), self.instrs.items.len });
+            return;
+        }
         const gref = try self.emit(.{ .op = op, .a = ref });
+        try self.guarded_refs.put(self.gpa, ref, @intCast(gref));
         self.stampProv(gref, role, operand, .neutral);
     }
 
     pub fn guardInt(self: *RecordingSession, ref: Ref, role: GuardRole, operand: OperandDesig) !void {
         try self.guard(ref, .guard_int, role, operand);
+    }
+
+    /// Doc 48: emit the `container_lane` `guard_lane` AND pin the observed
+    /// table's deterministic identity (`GcHeader.id`) for widen-eviction.
+    /// The pin is eviction metadata only — append failure (OOM) skips it,
+    /// which at worst suppresses a future eviction of this trace.
+    pub fn emitLaneGuardPinned(self: *RecordingSession, rtab: Ref, lane_ord: i32, od: OperandDesig, header: *const object.GcHeader) !void {
+        const gref = try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord });
+        self.stampProv(gref, .container_lane, od, .neutral);
+        // Only slot_load-rooted guards get pins: `laneWidenedPast` resolves
+        // the live table via guard_lane.a → slot_load.aux, so a pin on any
+        // other root (e.g. an hloaded per-iteration table, doc 43 P3) could
+        // never be consulted — don't capture it (codex round-2).
+        if (self.instrs.items[rtab].op != .slot_load) return;
+        self.lane_pins.append(self.gpa, .{ .guard_ref = @intCast(gref), .table_id = header.id }) catch {};
     }
 
     pub fn guardNum(self: *RecordingSession, ref: Ref, v: Value, role: GuardRole, operand: OperandDesig) !void {
@@ -1833,7 +1879,7 @@ pub const RecordingSession = struct {
             const lane_ord: i32 = @intFromEnum(lane); // 0 for .value
             const rtab = try self.refOf(f.tab);
             self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
-            self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, f.tab_od, .neutral);
+            try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
             const rkey = try self.keyRefNarrowed(f.key, f.key_od, vkey);
             if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, idx)) return;
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
@@ -1862,7 +1908,7 @@ pub const RecordingSession = struct {
         const lane_ord: i32 = @intFromEnum(lane);
         const rtab = try self.refOf(f.tab);
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
-        self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, f.tab_od, .neutral);
+        try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
         const rkey = try self.keyRefNarrowed(f.key, f.key_od, vkey);
         if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, idx)) return;
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
@@ -2138,7 +2184,7 @@ pub const RecordingSession = struct {
             // coarse deopt-replay — bar it fail-closed. See `traceHasAlenOf`.
             if (self.traceHasAlenOf(rtab)) return self.abort(.aliased_input);
             self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
-            self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, f.tab_od, .neutral);
+            try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
             const rkey = try self.keyRefNarrowed(f.key, f.key_od, vkey);
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
             // guard_append: hash-empty + `idx==asize` + `asize<cap`. The grow analogue
@@ -2178,7 +2224,7 @@ pub const RecordingSession = struct {
         const lane_ord: i32 = @intFromEnum(lane);
         const rtab = try self.refOf(f.tab);
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
-        self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, f.tab_od, .neutral);
+        try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
         const rkey = try self.keyRefNarrowed(f.key, f.key_od, vkey);
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
         self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
@@ -3686,8 +3732,9 @@ pub const RecordingSession = struct {
                 .function => {
                     const cl = function.Closure.fromHeader(argv.asHeap());
                     if (!self.guarded_refs.contains(arg_ref)) {
-                        try self.guarded_refs.put(self.gpa, arg_ref, {});
-                        self.stampProv(try self.emit(.{ .op = .guard_func, .a = arg_ref, .aux = @bitCast(cl.proto.id) }), .callee_identity, .a1, .neutral);
+                        const gref = try self.emit(.{ .op = .guard_func, .a = arg_ref, .aux = @bitCast(cl.proto.id) });
+                        try self.guarded_refs.put(self.gpa, arg_ref, @intCast(gref));
+                        self.stampProv(gref, .callee_identity, .a1, .neutral);
                     }
                 },
                 else => return self.abort(.bad_type),
@@ -3768,8 +3815,9 @@ pub const RecordingSession = struct {
                 .function => {
                     const cl = function.Closure.fromHeader(argv.asHeap());
                     if (!self.guarded_refs.contains(arg_ref)) {
-                        try self.guarded_refs.put(self.gpa, arg_ref, {});
-                        self.stampProv(try self.emit(.{ .op = .guard_func, .a = arg_ref, .aux = @bitCast(cl.proto.id) }), .callee_identity, .a1, .neutral);
+                        const gref = try self.emit(.{ .op = .guard_func, .a = arg_ref, .aux = @bitCast(cl.proto.id) });
+                        try self.guarded_refs.put(self.gpa, arg_ref, @intCast(gref));
+                        self.stampProv(gref, .callee_identity, .a1, .neutral);
                     }
                 },
                 else => return self.abort(.bad_type),
@@ -4496,8 +4544,9 @@ pub const RecordingSession = struct {
     pub fn guardBuiltinCallee(self: *RecordingSession, callee_slot: u16, rb: function.RecordedBuiltin) !void {
         const callee_ref = try self.refOf(callee_slot);
         if (!self.guarded_refs.contains(callee_ref)) {
-            try self.guarded_refs.put(self.gpa, callee_ref, {});
-            self.stampProv(try self.emit(.{ .op = .guard_builtin, .a = callee_ref, .aux = @intFromEnum(rb) }), .callee_pure, .a, .neutral);
+            const gref = try self.emit(.{ .op = .guard_builtin, .a = callee_ref, .aux = @intFromEnum(rb) });
+            try self.guarded_refs.put(self.gpa, callee_ref, @intCast(gref));
+            self.stampProv(gref, .callee_pure, .a, .neutral);
         }
     }
 
@@ -5302,6 +5351,7 @@ pub const RecordingSession = struct {
         self.exit_prov.deinit(gpa);
         self.rec_path.deinit(gpa);
         self.guarded_refs.deinit(gpa);
+        self.lane_pins.deinit(gpa);
         self.konst_map.deinit(gpa);
         if (self.reg_map.len != 0) gpa.free(self.reg_map);
         if (self.snap_scratch.len != 0) gpa.free(self.snap_scratch);
@@ -5335,6 +5385,7 @@ pub const RecordingSession = struct {
         self.rec_path.clearRetainingCapacity();
         self.rec_path_ok = true;
         self.guarded_refs.clearRetainingCapacity();
+        self.lane_pins.clearRetainingCapacity();
         self.konst_map.clearRetainingCapacity();
         self.input_seeds.clearRetainingCapacity();
         self.input_dedup.clearRetainingCapacity();

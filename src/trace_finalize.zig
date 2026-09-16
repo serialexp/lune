@@ -163,6 +163,35 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
         try gpa.dupe(InputSeed, rec.input_seeds.items);
     errdefer if (inputs_owned.len != 0) gpa.free(inputs_owned);
 
+    // Doc 48: commit the recorder's lane pins against the COMMITTED index
+    // space. tropt compaction is an index-lifetime transition exactly like the
+    // peel rewind (codex round-1 blocker): a recorder `guard_ref` must be
+    // remapped through `old_to_new`, and a pin whose guard was eliminated is
+    // dropped. The dupe path has a null map (identity). Eviction metadata is
+    // fail-soft: an OOM leaves the trace pinless, which only suppresses
+    // eviction — but a surviving pin must point at a `guard_lane`, asserted.
+    var pins_owned: []code_mod.LanePin = &.{};
+    if (rec.lane_pins.items.len != 0) {
+        var pins: std.ArrayListUnmanaged(code_mod.LanePin) = .empty;
+        // A successful toOwnedSlice empties the list, so this deinit is a
+        // no-op there; on the append/toOwnedSlice OOM paths it frees the
+        // partial buffer (codex round-2 blocker: a failed toOwnedSlice
+        // leaves ownership with the list).
+        defer pins.deinit(gpa);
+        blk: {
+            for (rec.lane_pins.items) |pin| {
+                const committed: u32 = if (fields.old_to_new) |m|
+                    (m[pin.guard_ref] orelse continue)
+                else
+                    pin.guard_ref;
+                std.debug.assert(fields.instrs[committed].op == .guard_lane);
+                pins.append(gpa, .{ .guard_ref = committed, .table_id = pin.table_id }) catch break :blk;
+            }
+            pins_owned = pins.toOwnedSlice(gpa) catch &.{};
+        }
+    }
+    errdefer if (pins_owned.len != 0) gpa.free(pins_owned);
+
     var requires_unicode_pin = false;
     for (fields.instrs) |ins| {
         if (ins.op == .supper or ins.op == .slower) requires_unicode_pin = true;
@@ -227,6 +256,7 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
         .snapshots = if (snap_owned) |o| o.snapshots else &.{},
         .snapshot_slots = if (snap_owned) |o| o.snapshot_slots else &.{},
         .deopt_mode = if (rec.precise) .precise else .entry_replay,
+        .lane_pins = pins_owned,
     };
     buildBridgeCandMemo(gpa, &code);
     return RecordingCandidate.init(code, rec.side_src);

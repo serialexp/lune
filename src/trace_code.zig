@@ -31,6 +31,14 @@ pub const EntryGuardType = enum(u8) {
 /// runtime-only fingerprint — not serialized.
 pub const EntryGuard = struct { slot: u16, ty: EntryGuardType };
 
+/// Doc 48: record-time table identity behind one `guard_lane` (see
+/// `TraceCode.lane_pins`). `guard_ref` indexes the COMMITTED instruction
+/// array (finalization remaps recorder indices through tropt's `old_to_new`
+/// and drops pins whose guard was eliminated); `table_id` is the observed
+/// table's deterministic `GcHeader.id` — never an address, so replay-stable
+/// and immune to allocator reuse.
+pub const LanePin = struct { guard_ref: u32, table_id: u32 };
+
 /// Where a synthetic trace input is resolved from at entry (cross-frame tracing,
 /// cluster sub-lever 1). A callee reached through an UPVALUE or GLOBAL is a
 /// loop-invariant register value the executor cannot read (it has no `*Vm`, no
@@ -331,6 +339,17 @@ pub const TraceCode = struct {
     /// entry replay (the historical contract) or per-bytecode precise deopt
     /// via `snapshots`. Arm/dispatch validation must check this, not infer it.
     deopt_mode: trace_snapshot.DeoptMode = .entry_replay,
+    /// Doc 48: eviction metadata ONLY — the record-time table identity behind
+    /// each `guard_lane` on a slot_load-covered root, so widen-eviction
+    /// (`laneWidenedPast`) fires only against the very table whose monotonic
+    /// lane history the recorder observed, never against a different table
+    /// that happens to occupy the register at a polymorphic anchor. Identity
+    /// is the deterministic `GcHeader.id` serial (never an address). A pin is
+    /// a HEURISTIC: the guarded trace is lane- not identity-specialized, so
+    /// evicting when the pinned table widens can still discard a trace some
+    /// other same-lane table would pass — accepted re-record risk. Missing
+    /// pins (OOM, non-slot_load roots) only ever suppress eviction.
+    lane_pins: []LanePin = &.{},
 
     pub fn deinit(self: *TraceCode, gpa: std.mem.Allocator) void {
         gpa.free(self.instrs);
@@ -343,6 +362,7 @@ pub const TraceCode = struct {
         if (self.bridge_cand.len != 0) gpa.free(self.bridge_cand);
         if (self.snapshots.len != 0) gpa.free(self.snapshots);
         if (self.snapshot_slots.len != 0) gpa.free(self.snapshot_slots);
+        if (self.lane_pins.len != 0) gpa.free(self.lane_pins);
         self.* = undefined;
     }
 

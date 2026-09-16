@@ -245,23 +245,21 @@ everything inside them is checked.
   handoff; the record-time root superseded by an incompatible sibling at
   arm time.
 
-### Outstanding
-
-- [ ] **Codex D cheapenings (round 3, independent follow-up):** O(1) current-
-  activation resolution instead of the `activeRegionFor` linear map walk (it
-  runs per receipt AND per native entry via `prepareNativeEntry`); an indexed
-  owner/active-set check instead of sweeping all promoted sets per entry;
-  cheaper `accountRegionProfit` classification (measured ~600 cyc/receipt on
-  grid). Lowers the promotion break-even everywhere; not required for the
-  current board (grid residual is at the layout-noise band) so deferred.
-- [ ] **Resident-but-disabled patches (codex round-3 escalation):** only if a
-  future workload shows the remaining patch/unpatch cost (2 page-windowed
-  mprotects per edge per promote/demote) is material — the parked-proof +
-  windowed-mprotect combination made it immaterial on the current board.
-  Requires an activation enable/disable token in the silent epilogue; codex
-  flagged the permanent exit-path tax as the risk to measure first.
-- [ ] **Increment C — kill the dead-append-cont thrash (spectral is the
-  concrete case).** Original framing was "repoint the loop-done arm off the
+- [x] **Increment C — kill the dead-append-cont thrash (spectral is the
+  concrete case). CLOSED by doc 48 (2026-09-16), without new convergence
+  machinery.** The 2026-09-11 diagnosis was stale by the time the increment
+  was picked up: the 3334 `legacy_thrash` cooldowns were gone, and the real
+  blockers were (1) a `guarded_refs` peel-rewind staleness bug that left the
+  cont's inner-limit `slot_load` silently unguarded → `proveKinds` rejected
+  the cont → tier-1a forever, and (2) widen-eviction retiring the live f64
+  Av sibling once per u-burst at the polymorphic anchor. Both fixed in
+  `docs/design/48-polymorphic-anchor-lane-eviction.md`; with the conts
+  native, the append→in-bounds-astore convergence this bullet wanted already
+  works through the existing hot-guard sibling path (Atv 4000 bursts → ~200
+  receipts). spectral 30.175 → 17.4 ms (13.3× → 9.4× LJ). The codex round-3
+  design constraint (no "failed last N entries" heuristic) was honored — no
+  entry-refusal machinery was built at all. Original framing kept below for
+  history: "repoint the loop-done arm off the
   dead append cont as cleanup after A"; the spectral-norm diagnosis
   (2026-09-11, increment D session) upgraded it to a required increment for
   landing this doc. Mechanism: with f64 append recordable, the loop-done
@@ -277,6 +275,22 @@ everything inside them is checked.
   same side-specialization path guard terminals feed, or disarm/repoint off
   the cont via parent-guard-failed → sibling-entered → sibling-terminal —
   never a "failed last N entries" heuristic (phase-dependent arm churn).
+
+### Outstanding
+
+- [ ] **Codex D cheapenings (round 3, independent follow-up):** O(1) current-
+  activation resolution instead of the `activeRegionFor` linear map walk (it
+  runs per receipt AND per native entry via `prepareNativeEntry`); an indexed
+  owner/active-set check instead of sweeping all promoted sets per entry;
+  cheaper `accountRegionProfit` classification (measured ~600 cyc/receipt on
+  grid). Lowers the promotion break-even everywhere; not required for the
+  current board (grid residual is at the layout-noise band) so deferred.
+- [ ] **Resident-but-disabled patches (codex round-3 escalation):** only if a
+  future workload shows the remaining patch/unpatch cost (2 page-windowed
+  mprotects per edge per promote/demote) is material — the parked-proof +
+  windowed-mprotect combination made it immaterial on the current board.
+  Requires an activation enable/disable token in the silent epilogue; codex
+  flagged the permanent exit-path tax as the risk to measure first.
 
 ## Board outcome (2026-09-11, the hold decision)
 

@@ -4000,7 +4000,7 @@ pub const Vm = struct {
                 }
                 return .next_candidate;
             }
-            if (ran_native) self.trace.dbg("receipt: pc={d} link_mode={} local={d} exit={d} ledger_len={d} completed={d}", .{ ct.code.anchor.pc, ran_native_link_mode, local_done, result.exit_instr, result.ledger_len, result.completed });
+            if (ran_native) self.trace.dbg("receipt: pc={d} t={d} link_mode={} local={d} exit={d} ledger_len={d} completed={d}", .{ ct.code.anchor.pc, ct.id, ran_native_link_mode, local_done, result.exit_instr, result.ledger_len, result.completed });
             const linked_one_trip = ran_native and ran_native_link_mode and
                 local_done == 0 and
                 result.exit_reason == .normal and

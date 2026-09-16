@@ -805,7 +805,6 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .guard_false,
         .aload,
         .guard_table,
-        .guard_lane,
         .guard_bounds,
         .guard_present,
         .guard_fits,
@@ -826,6 +825,10 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .supper,
         .slower,
         => try w.print("%{d}", .{ins.a}),
+        // guard_lane pins the array lane in aux — print it, so a dump answers
+        // "which lane does this sibling specialize on?" directly (the
+        // alternating-lane eviction diagnosis needed exactly this).
+        .guard_lane => try w.print("%{d}  lane={d}", .{ ins.a, ins.aux }),
         // guard_gc's aux is the allocation bound, not an operand.
         .guard_gc => try w.print("A={d}", .{ins.aux}),
         // ssub's third operand rides aux as a ref (codex #4); scp shares the

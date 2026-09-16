@@ -74,6 +74,7 @@ pub const TraceRecord = trace_record.TraceRecord;
 pub const Trace = TraceRecord;
 pub const EntryPatchState = trace_record.EntryPatchState;
 pub const EntryGuard = trace_code.EntryGuard;
+pub const LanePin = trace_code.LanePin;
 pub const InputKind = trace_code.InputKind;
 pub const InputSeed = trace_code.InputSeed;
 pub const UPVALUE_CELL_ANCHOR = trace_code.UPVALUE_CELL_ANCHOR;
@@ -2851,10 +2852,23 @@ pub const TraceState = struct {
     /// an identical trace EVERY outer iteration — a permanent mint-retire-recompile
     /// churn (~600 rounds on grid_matmul_f64's row fills, doc 47 increment D) that
     /// costs far more than the traces save.
+    /// Doc 48: identity-pinned widen-eviction predicate. Lane monotonicity
+    /// (a frozen array only widens) is a per-TABLE invariant, so eviction may
+    /// only fire against the very table the recorder observed — matched by
+    /// deterministic `GcHeader.id`, never an address. A DIFFERENT table at
+    /// the guarded register (a polymorphic anchor, doc 33) proves nothing:
+    /// evicting there churned spectral-norm's f64 sibling once per u-burst
+    /// (8 commit→retire cycles, 364k tier-0 iterations). This stays a
+    /// HEURISTIC, not a proof of permanent death — the trace is lane- not
+    /// identity-specialized, so a same-lane sibling table could still have
+    /// used it after the pinned table widened; the cost of that miss is one
+    /// re-record, accepted (codex round-1). A trace with no pins is never
+    /// evicted here (fail-safe: pins are best-effort metadata).
     pub fn laneWidenedPast(self: *const TraceState, t: *const Trace, regs: RegWindow) bool {
         _ = self;
-        for (t.code.instrs) |ins| {
-            if (ins.op != .guard_lane) continue;
+        for (t.code.lane_pins) |pin| {
+            const ins = t.code.instrs[pin.guard_ref];
+            std.debug.assert(ins.op == .guard_lane);
             // `guard_lane.a` indexes the table-producing instr; that is a
             // `slot_load` whose `aux` is the tier-0 register the table lives in.
             const ld_idx: usize = @intCast(ins.a);
@@ -2865,7 +2879,9 @@ pub const TraceState = struct {
             if (reg >= regs.len()) continue;
             const v = regs.get(reg);
             if (!v.isHeap() or v.heapType() != .table) continue;
-            const live_arr = &table_mod.Table.fromHeader(v.asHeap()).array;
+            const header = v.asHeap();
+            if (header.id != pin.table_id) continue; // different table: no evidence
+            const live_arr = &table_mod.Table.fromHeader(header).array;
             if (!live_arr.frozen) continue; // pre-commitment: no monotonicity, guard may pass later
             const live_lane = live_arr.lane;
             const trace_lane: arr.Lane = @enumFromInt(ins.aux);
@@ -3735,7 +3751,20 @@ pub const TraceState = struct {
         } else |_| {}
         errdefer if (t.exit_counts.len != 0) self.gpa.free(t.exit_counts);
         try self.registry.publish(t);
-        self.dbg("commit: trace={d} anchor pc={d} ir_len={d}", .{ t.id, t.code.anchor.pc, t.code.instrs.len });
+        if (comptime jitdbg.enabled) if (self.config.debug_log) {
+            // Lane pins (guard_lane aux per table guard) identify which array
+            // shape a sibling specializes on — the alternating-lane churn
+            // diagnosis needed exactly this at commit time.
+            var lanes: [4]i32 = .{ -1, -1, -1, -1 };
+            var nl: usize = 0;
+            for (t.code.instrs) |ins| {
+                if (ins.op == .guard_lane and nl < lanes.len) {
+                    lanes[nl] = ins.aux;
+                    nl += 1;
+                }
+            }
+            self.dbg("commit: trace={d} anchor pc={d} ir_len={d} proto={s} lanes={any}", .{ t.id, t.code.anchor.pc, t.code.instrs.len, t.code.anchor.proto.name, lanes[0..nl] });
+        };
         self.finishSideTraceProvenance(t, candidate.side_src);
         // Coverage (gated): a trace now exists at this anchor, so subsequent
         // interpreted back-edges here are "fallback despite a trace."

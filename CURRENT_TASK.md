@@ -21,6 +21,76 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-16 (latest+14) — task #31 (doc 47 Increment C → doc 48): spectral 13.3× → 9.4×, awaiting full board + codex round-2
+
+**Implementation + P3 test suite COMPLETE, uncommitted.** Doc 48
+(`docs/design/48-polymorphic-anchor-lane-eviction.md`) holds the full story;
+doc 47's Increment C bullet is closed by it (moved to Done). Summary:
+
+- **Increment C's original diagnosis was stale** — the 3334 legacy_thrash
+  cooldowns no longer reproduce. The real spectral blockers found this arc:
+  1. **`guarded_refs` peel-rewind staleness** (trace_recorder.zig): the dedup
+     map was purged on the guarded REF's index, not the GUARD's (always
+     higher). A failed peel + link-close left the cont's inner for_prep limit
+     slot_load silently unguarded → proveKinds rejected → both loop-done conts
+     (Av:22/Atv:22) permanently tier-1a. Fix: map ref → guard index, purge on
+     the guard. With the conts native, the append→in-bounds-astore sibling
+     convergence Increment C wanted ALREADY WORKS (no new machinery; Atv 4000
+     bursts → ~200 receipts).
+  2. **Widen-eviction misfire at the polymorphic anchor** (doc 33 shape):
+     `laneWidenedPast` treated one entry's live table as *the* table; Av's
+     alternating u (.value) / v (.f64) killed every f64 sibling once per
+     u-burst (8 commit→retire cycles, 364k tier-0 iterations). Fix: identity
+     pins — recorder captures the observed table's deterministic
+     `GcHeader.id` per container_lane guard_lane (`TraceCode.lane_pins`,
+     remapped through tropt's old_to_new at finalize, truncated on peel
+     rewind); eviction fires only on id match + frozen + widened-past.
+     Heuristic, not proof (codex round-1 wording); no pins → never evicts.
+- **Measured (just bench --filter spectral, TSV 20260916-085252-6a2b334):
+  30.175 → 17.4 ms, 13.3× → 9.4× LJ, cross ok, luajit ok.** Better than the
+  eviction-neuter experiment (25.9) because the narrow-int zombie now dies precisely.
+  Receipts: 772k/800k Av iterations native. Board res% (61.9) UNDER-REPORTS —
+  see the --jit-stats coverage-path divergence Defer bullet in doc 48 (its own
+  future arc; coverage runs force the discovery epilogue and select
+  differently at polymorphic anchors).
+- **Tests** (trace_evict_test.zig, all passing): pins-based rewrite of the
+  eviction predicate tests; polymorphic-anchor no-evidence + control;
+  no-pins fail-safe; A-widens/B-remains adversarial (codex-required);
+  optimized-root pin remap (guard shifts both ways, asserted non-vacuous vs
+  the unoptimized run; codex-required); cont-peel guarded_refs regression
+  (verified to FAIL under the simulated old keying); tier-0 equivalence for
+  both reproducers under the native pipeline. Also added `lane_pins` to
+  trace_finalize_test's Scratch fixture.
+- **Board (TSV 20260916-091642-6a2b334, full 28 benches)**: spectral −41.8%,
+  everything else within noise. The +4-6% flags (sparse/repack/sor/grid_f64)
+  were re-run best-of-7 and came back at baseline (152.8/23.3/83.6/26.4 vs
+  150.2/24.1/83.1/25.5) — ambient noise was wide this session (LuaJIT's own
+  wall ±5-15% between runs, tier-0 +2-6% on flagged rows). nsieve/array3d
+  flat.
+- **Codex round-2 (NEEDS CHANGES → all 7 items landed)**: toOwnedSlice OOM
+  leak in pin finalization (defer deinit + failing-allocator sweep now
+  carries a pin); id==0 is VALID (globals table) — zero-rejection removed
+  from tests, review-ledger entry; doc 48 body rewritten pointer→id with
+  follow-up note; dispatch-level policy tests (polymorphic coexistence +
+  zombie retirement — fails under both neutered and simulated-old
+  predicates; monotonic retirement scoped to the shared `fill` anchor —
+  fails under neutered); remap test asserts BOTH shift directions matching
+  by pc+lane+table_id; trace-retire probe prints lanes; pin capture
+  conditional on slot_load root.
+- **Codex round-3: approved** after two mechanical fixes (polymorphic
+  dispatch test matches proto+pc and requires a distinct sibling trace;
+  "i64 zombie" wording → "narrow-int zombie" — small ints commit to `.u8`).
+  Final full `just test` green on the exact landing tree. Committed on
+  master (NO push — master is ahead of origin, Bart decides when).
+- Untracked TSVs: 20260916-084304-6a2b334.tsv is the eviction-DISABLED
+  experiment — never a valid board; 20260916-091812-6a2b334.tsv is a
+  broken-pipe fragment (sparse row only). Both stay untracked. Committed:
+  085252 (spectral-only) + 091642 (full board).
+  20260915-163605-09bb515.tsv unclaimed (other agent).
+- Observed but out of scope (candidates for later): Av's f64 cycle exits
+  every ~28 its vs Atv's ~131 (the Av:22 in-bounds cont sibling didn't commit
+  in that run); the A() head trace stays un-inlined for interp remnants.
+
 ## Status 2026-09-15 (latest+13) — task #30 DONE: Increment B + regression-elimination arc COMMITTED as 4dddad2
 
 **COMMITTED (4dddad2 on master, whole-file staging, codex round-5 landing

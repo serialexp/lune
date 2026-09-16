@@ -12,6 +12,7 @@ const Scratch = struct {
     input_seeds: std.ArrayListUnmanaged(code.InputSeed) = .empty,
     exit_prov: std.ArrayListUnmanaged(?types.ExitProvenance) = .empty,
     rec_path: std.ArrayListUnmanaged(types.ProgramPoint) = .empty,
+    lane_pins: std.ArrayListUnmanaged(code.LanePin) = .empty,
     pending_stores: std.ArrayListUnmanaged(struct { op: ir.IrOp, aref: ir.Ref, value: ir.Ref, lane_ord: i32 }) = .empty,
     reg_map: []const struct { state: enum { undef, input, def }, ref: ir.Ref } = &.{},
     peel: ?struct { slots: []const struct { phi_ref: ?ir.Ref } } = null,
@@ -32,7 +33,7 @@ const Scratch = struct {
     snap_builder: @import("trace_snapshot.zig").Builder = .{ .gpa = undefined, .budget = .{} },
 
     fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
-        inline for (.{ "instrs", "consts", "entry_slots", "input_seeds", "exit_prov", "rec_path", "pending_stores" }) |field|
+        inline for (.{ "instrs", "consts", "entry_slots", "input_seeds", "exit_prov", "rec_path", "pending_stores", "lane_pins" }) |field|
             @field(self, field).deinit(gpa);
     }
 };
@@ -87,9 +88,14 @@ test "finalizer allocation failures clean nonempty candidate arrays" {
         scratch.instrs.appendSlice(gpa, &.{
             .{ .op = .slot_load, .aux = 0 },
             .{ .op = .guard_int, .a = 0 },
+            .{ .op = .guard_lane, .a = 0, .aux = 0 },
         }) catch continue;
         scratch.entry_slots.append(gpa, 0) catch continue;
         scratch.input_seeds.append(gpa, .{ .kind = .global, .source = 0, .slot = 1 }) catch continue;
+        // Doc 48: exercise the fail-soft lane-pin finalization path under
+        // allocator failure (codex round-2 — the pin list's append AND
+        // toOwnedSlice failure legs must not leak).
+        scratch.lane_pins.append(gpa, .{ .guard_ref = 2, .table_id = 7 }) catch continue;
         var candidate = finalizer.finalize(gpa, &scratch, .{ .optimize = false }) catch |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
             continue;

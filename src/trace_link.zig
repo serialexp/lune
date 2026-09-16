@@ -1724,7 +1724,20 @@ pub fn removeTrace(self: *TraceState, t: *Trace) void {
     for (self.registry.cache.items) |c| {
         if (c == t) {
             const anchor = t.code.anchor;
-            self.dbg("trace-retire: t={d} anchor pc={d}", .{ t.id, anchor.pc });
+            if (comptime jitdbg.enabled) if (self.config.debug_log) {
+                // Same lane summary as the commit probe: correlating WHICH
+                // sibling was removed is the point of this line (doc 48
+                // alternating-lane churn diagnosis; codex round-2).
+                var lanes: [4]i32 = .{ -1, -1, -1, -1 };
+                var nl: usize = 0;
+                for (t.code.instrs) |ins| {
+                    if (ins.op == .guard_lane and nl < lanes.len) {
+                        lanes[nl] = ins.aux;
+                        nl += 1;
+                    }
+                }
+                self.dbg("trace-retire: t={d} anchor pc={d} proto={s} lanes={any}", .{ t.id, anchor.pc, anchor.proto.name, lanes[0..nl] });
+            };
             // B-2a / §B.6: logical relation deletion is immediate at the
             // retirement source; physical link teardown remains P-E's job.
             self.retireProvenanceEdgesTouching(t.id);
@@ -2102,6 +2115,14 @@ pub fn nativeFor(self: *TraceState, t: *Trace) ?*const nativegen.CompiledTrace {
                         }
                     } else {
                         self.dbg("native unsupported in proveKinds: trace={d} anchor={d}", .{ t.id, t.code.anchor.pc });
+                        // `dbg_last_idx` is the instruction the failing pass was
+                        // examining when it bailed — written per iteration by the
+                        // synchronous call above, so it is this trace's offender.
+                        const fi = @import("nativegen_prove.zig").dbg_last_idx;
+                        if (fi < t.code.instrs.len) {
+                            const ins = t.code.instrs[fi];
+                            self.dbg("proveKinds fail-at: trace={d} %{d} op={s} aux={d} ty={s}", .{ t.id, fi, @tagName(ins.op), ins.aux, @tagName(ins.ty) });
+                        }
                     }
                 }
             };

@@ -20,6 +20,18 @@ const Kind = @import("nativegen_artifact.zig").Kind;
 const laneKind = layout.laneKind;
 const konstFitsLane = layout.konstFitsLane;
 const VALUE_LANE = layout.VALUE_LANE;
+const jitdbg = @import("jitdbg.zig");
+
+/// Diagnostic only (`-Djit-debug` builds; `void` otherwise): the instruction
+/// index a `proveKinds` pass was examining when it last returned false. Read
+/// immediately after a failed call on the same thread (the trace_link
+/// unsupported-diag block does exactly that). `threadlocal` so concurrent
+/// VMs in a debug test binary cannot data-race the slot (codex round-1).
+pub threadlocal var dbg_last_idx: if (jitdbg.enabled) usize else void = if (jitdbg.enabled) 0 else {};
+
+inline fn dbgNoteIdx(i: usize) void {
+    if (comptime jitdbg.enabled) dbg_last_idx = i;
+}
 
 /// Task #29: one bit per lane ordinal for the per-value `fits_mask`. Lane
 /// ordinals are tiny (`arr.Lane` has < 16 members); anything outside [0, 15]
@@ -193,6 +205,7 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
     var slot_seen: std.StaticBitSet(0x10000) = .empty;
 
     for (t.instrs, 0..) |ins, i| {
+        dbgNoteIdx(i);
         switch (ins.op) {
             .slot_load => {
                 if (ins.aux < 0 or ins.aux > 0xFFFF) return false;
@@ -363,6 +376,7 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
 
     // Pass B: assign kinds, validating operands and constants as we go.
     for (t.instrs, 0..) |ins, i| {
+        dbgNoteIdx(i);
         switch (ins.op) {
             .slot_load => {
                 if (guarded[i]) {
@@ -1422,6 +1436,7 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
     // an addressing token and must never escape into the VM register file. This
     // runs after Pass B so a φ's forward-referencing `b` has its kind assigned.
     for (t.instrs, 0..) |p, i| {
+        dbgNoteIdx(i);
         if (p.op != .phi) continue;
         if (p.b >= n) return false;
         const k = kinds[p.b];
