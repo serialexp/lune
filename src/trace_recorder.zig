@@ -2506,6 +2506,22 @@ pub const RecordingSession = struct {
         return slot;
     }
 
+    /// The `href.aux` for a hash-field access (doc 49): seed slab slot when the
+    /// root is invariant, else the hrefk `(slot, mask)` encoding for a HEAP
+    /// (string) constant key present LIVE in the observed table, else `-1`
+    /// (the per-iteration `resolveHashCell` callout). Scalar-key hrefk is
+    /// deferred (doc 49) — the native key guard compares the node key's
+    /// `GcHeader.id`, which only heap keys have.
+    fn hrefAuxFor(seed_slot: ?u16, tbl: *const table_mod.Table, vkey: Value) i32 {
+        if (seed_slot) |s| return @as(i32, s);
+        if (vkey.isHeap()) {
+            if (tbl.hashSlotOf(vkey)) |sm| {
+                if (trace_ir.HrefAux.encode(sm.slot, sm.mask)) |aux| return aux;
+            }
+        }
+        return -1;
+    }
+
     /// Record `t.field` (`get_index`, `dst=a b=table c=key`, key an interned
     /// string) as a hash-part field read. The string analogue of `recArrayGet`.
     /// Emits, in order: `guard_table`(table) → `href`(table, keyconst) →
@@ -2614,11 +2630,12 @@ pub const RecordingSession = struct {
         if (try self.forwardPendingHashLoad(f.dst, rtab, rkey)) return;
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
         // Seed the loop-invariant cell pointer for native (H1); `href.aux` carries
-        // the synthetic slab slot, or `-1` to mark "not seeded → native declines".
-        // The tier-1a oracle ignores `aux`, so a `null` seed leaves H0 untouched.
+        // the synthetic slab slot, the hrefk `(slot, mask)` encoding for a
+        // dynamic root (doc 49), or `-1` (per-iteration callout).
+        // The tier-1a oracle ignores `aux`, so H0 is untouched either way.
         const count: u32 = @intCast(tbl.hash.count());
         const seed_slot = try self.seedHashCell(rtab, rkey, count);
-        const ref = try self.emit(.{ .op = .href, .a = rtab, .b = rkey, .aux = if (seed_slot) |s| @as(i32, s) else -1 });
+        const ref = try self.emit(.{ .op = .href, .a = rtab, .b = rkey, .aux = hrefAuxFor(seed_slot, tbl, vkey) });
         // Fused native producer-exit (A-i.3): native `href` side-exits at the address
         // node on cell-resolution failure (`nativegen.zig`), no `guard_*` — same guest
         // hash access as `guard_hash`, so it shares `(hash_struct, b)`.
@@ -2740,10 +2757,11 @@ pub const RecordingSession = struct {
         const rtab = try self.refOf(f.tab);
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
         // Seed the cell pointer for native (H1) — see `recHashGet`. An RMW's read and
-        // write `href`s dedup onto the same slot via `seedHashCell`.
+        // write `href`s dedup onto the same slot via `seedHashCell`. A dynamic
+        // root gets the hrefk `(slot, mask)` aux instead (doc 49).
         const count: u32 = @intCast(tbl.hash.count());
         const seed_slot = try self.seedHashCell(rtab, rkey, count);
-        const ref = try self.emit(.{ .op = .href, .a = rtab, .b = rkey, .aux = if (seed_slot) |s| @as(i32, s) else -1 });
+        const ref = try self.emit(.{ .op = .href, .a = rtab, .b = rkey, .aux = hrefAuxFor(seed_slot, tbl, vkey) });
         // Fused native producer-exit (A-i.3): native `href` cell-resolution failure.
         self.stampProv(ref, .hash_struct, f.tab_od, .neutral);
         self.stampProv(try self.emit(.{ .op = .guard_hash, .a = ref, .aux = @intCast(count) }), .hash_struct, f.tab_od, .neutral);

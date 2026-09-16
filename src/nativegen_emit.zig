@@ -1605,6 +1605,69 @@ pub fn emitHrefCallout(
     try regToPlace(a, placeOfRef(alloc, i), .rcx);
 }
 
+/// doc 49 — the hrefk inline hash-cell resolution for a dynamic-root href
+/// carrying an `HrefAux`-encoded `(slot, mask)`. Replaces the
+/// `resolveHashCell` callout for that shape: ~7 instructions, 4 loads, NO
+/// call, NO caller-saved save/restore (and `bodyCalloutOf` reserves no save
+/// frame for it).
+///
+/// Guard order is contractual (doc 49 codex rounds 1–3):
+///   1. `hash.mask == K` — establishes capacity, bounds `S <= K` (encode
+///      guarantees it), and non-null `nodes` (empty map has mask 0, K >= 3).
+///      Reloading `nodes` from the LIVE table each iteration makes same-mask
+///      reallocation safe.
+///   2. LIVE-CELL guard: `node[S].value.tag != nil`. Without it a store-only
+///      chain could write through a DEAD node (delete + unrelated insert
+///      restores the aggregate count) without bumping `live` — diverging from
+///      the tier-1a `fieldPtr` oracle, which rejects dead nodes. Ordered
+///      BEFORE any key deref: a dead heap key holds id bits, not a pointer.
+///   3. Key tag == the konst's tag (heap_ref for the v1 string keys).
+///   4. Key IDENTITY by stable `GcHeader.id` — NEVER payload bits: keyframe
+///      restore gives interned strings new addresses; ids survive (the same
+///      reason `guard_func` pins `proto.id`).
+/// Any failure side-exits at this instruction — the same exit the callout's
+/// miss path uses, so provenance/ledger semantics are unchanged.
+pub fn emitHrefK(
+    a: *x64.Assembler,
+    t: *const Trace,
+    alloc: *const Alloc,
+    ins: trace.IrInstr,
+    i: usize,
+    exit_labels: []?x64.Label,
+) !void {
+    const dec = trace.HrefAux.decode(ins.aux).?; // caller dispatched on decode
+    const konst_ins = t.instrs[ins.b];
+    const key = t.consts[@intCast(konst_ins.aux)];
+    // v1 records hrefk for heap (interned string) keys only (`hrefAuxFor`).
+    std.debug.assert(key.isHeap());
+    const key_id: u32 = key.asHeap().id;
+    const node_off: i32 = @as(i32, @intCast(dec.slot)) * layout.NODE_SIZE;
+
+    // rax/rcx are the body scratch pair (never homes) — same discipline as
+    // the dynamic guard_table/guard_func emitters.
+    // 1. rax = *GcHeader (== *Table; header is the first field).
+    try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
+    //    mask guard: capacity changed (rehash/grow/fresh table shape) → exit.
+    try a.cmpDwordMemImm(.rax, layout.HASH_MASK_FROM_HEADER, dec.mask);
+    try jccNativeExit(a, exit_labels, i, .ne);
+    //    rax = nodes base (non-null: mask == K >= 3 proves a live array).
+    try a.movRegMem(.rax, .rax, layout.HASH_NODES_FROM_HEADER);
+    // 2. live-cell guard: value tag at the slot must not be nil (dead/absent).
+    try a.cmpByteMemImm(.rax, node_off + layout.NODE_VALUE_OFF + layout.VALUE_TAG_OFF, layout.TAG_NIL);
+    try jccNativeExit(a, exit_labels, i, .e);
+    // 3. key tag guard.
+    try a.cmpByteMemImm(.rax, node_off + layout.NODE_KEY_TAG_OFF, @intFromEnum(key.tag));
+    try jccNativeExit(a, exit_labels, i, .ne);
+    // 4. key identity guard by stable id: rcx = node key's *GcHeader (a LIVE
+    //    node's key holds a valid pointer — guard 2 established liveness).
+    try a.movRegMem(.rcx, .rax, node_off + layout.NODE_KEY_PAYLOAD_OFF);
+    try a.cmpDwordMemImm(.rcx, layout.GCHEADER_ID_OFF, key_id);
+    try jccNativeExit(a, exit_labels, i, .ne);
+    // Cell pointer: &node.value.
+    try a.addRegImm32(.rax, node_off + layout.NODE_VALUE_OFF);
+    try regToPlace(a, placeOfRef(alloc, i), .rax);
+}
+
 /// `guard_absent` (doc 45 D7): prove the runtime raw lookup `t[k]` is still nil,
 /// side-exiting when a value (or a metatable, or a non-table) has appeared.
 ///

@@ -222,6 +222,101 @@ test "keyframe: a live grid deflates at capture and round-trips byte-identically
     );
 }
 
+test "doc 49 P2b: hash-part physical layout diverges across restore; snapshot artifacts are layout-independent" {
+    // The restore-boundary contract for the owned hash part (doc 49, codex
+    // round-2): the map's PHYSICAL geometry — dead nodes, probe displacement,
+    // `used` vs `live` — is deliberately NOT serialized. Capture walks live
+    // entries in canonical order; restore rebuilds by fresh insertion. So a
+    // history with deletions produces a pre-capture map with `used > live`,
+    // while the restored twin is dead-node-free (`used == live`) — a REAL
+    // layout divergence — yet the re-snapshot must be byte-identical, and a
+    // second restore of the same bytes must reproduce the restored layout
+    // slot-for-slot (artifacts and layout are pure functions of the logical
+    // state, never of addresses or the mutation history).
+    const gpa = testing.allocator;
+    const source =
+        \\t = { a1 = 1, a2 = 2, a3 = 3, a4 = 4, a5 = 5, a6 = 6 }
+        \\t.a2 = nil
+        \\t.a5 = nil
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try mahina_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    _ = try vm.run(chunk.proto);
+
+    // Pre-capture: the deletions left dead nodes behind (Lua-style removal
+    // never compacts), so the physical map is strictly bigger than the
+    // logical one.
+    const t1_val = vm.globals.get(try vm.heap.internValue("t"));
+    try testing.expect(t1_val.isHeap() and t1_val.heapType() == .table);
+    const t1 = table.Table.fromHeader(t1_val.asHeap());
+    try testing.expectEqual(@as(u32, 4), t1.hash.live);
+    try testing.expect(t1.hash.used > t1.hash.live);
+
+    const b0 = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(b0);
+
+    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    defer {
+        vm2.deinit();
+        gpa.destroy(vm2);
+    }
+
+    // The serialized artifact must be UNCHANGED by the layout divergence:
+    // capture reads the logical map (live entries, canonical order), never
+    // the geometry. (Captured FIRST — probing keys below may intern strings
+    // into vm2, which would legitimately change a later snapshot.)
+    const b1 = try encodeSnapshot(gpa, vm2);
+    defer gpa.free(b1);
+    try testing.expectEqualSlices(u8, b0, b1);
+
+    // Restored twin: fresh insertion of the live entries only — no dead
+    // nodes. The physical layouts have genuinely diverged...
+    const t2_val = vm2.globals.get(try vm2.heap.internValue("t"));
+    try testing.expect(t2_val.isHeap() and t2_val.heapType() == .table);
+    const t2 = table.Table.fromHeader(t2_val.asHeap());
+    try testing.expectEqual(@as(u32, 4), t2.hash.live);
+    try testing.expectEqual(t2.hash.live, t2.hash.used);
+    try testing.expect(t2.hash.used != t1.hash.used);
+
+    // ...while the logical content is identical.
+    for ([_]struct { k: []const u8, v: i64 }{
+        .{ .k = "a1", .v = 1 }, .{ .k = "a3", .v = 3 },
+        .{ .k = "a4", .v = 4 }, .{ .k = "a6", .v = 6 },
+    }) |kv| {
+        try testing.expectEqual(kv.v, t2.get(try vm2.heap.internValue(kv.k)).asInt());
+    }
+    try testing.expect(t2.get(try vm2.heap.internValue("a2")).isNil());
+    try testing.expect(t2.get(try vm2.heap.internValue("a5")).isNil());
+
+    // Determinism from the restored state: a second restore of the same bytes
+    // lands every key at the same (slot, mask) as the first — layout is a
+    // pure function of the restored insertion history.
+    const vm3 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    defer {
+        vm3.deinit();
+        gpa.destroy(vm3);
+    }
+    const t3_val = vm3.globals.get(try vm3.heap.internValue("t"));
+    const t3 = table.Table.fromHeader(t3_val.asHeap());
+    for ([_][]const u8{ "a1", "a3", "a4", "a6" }) |k| {
+        const s2 = t2.hashSlotOf(try vm2.heap.internValue(k)).?;
+        const s3 = t3.hashSlotOf(try vm3.heap.internValue(k)).?;
+        try testing.expectEqual(s2.slot, s3.slot);
+        try testing.expectEqual(s2.mask, s3.mask);
+    }
+}
+
 test "restore reanimates a live load closure that runs with the same result (L-2)" {
     const gpa = testing.allocator;
     const source =

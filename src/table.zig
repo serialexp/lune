@@ -24,6 +24,7 @@ const std = @import("std");
 const object = @import("object.zig");
 const value = @import("value.zig");
 const arr = @import("array.zig");
+const hash_part = @import("hash_part.zig");
 const GcHeader = object.GcHeader;
 const Value = value.Value;
 const ArrayPart = arr.ArrayPart;
@@ -49,13 +50,13 @@ pub const Table = struct {
     /// (`gc.blacken` marks it) and a keyframe edge (`keyframeser` persists its
     /// id). `Table.get`/`set` ignore it entirely — they are the raw accessors.
     metatable: ?*Table = null,
-    /// Amortised rehash trigger. mahina's hash part (`std.HashMapUnmanaged`)
-    /// self-grows, so we can't use Lua's "hash full" hook to drive a rehash —
-    /// instead we recompute the array/hash split when the hash-part population
-    /// crosses this threshold, doubling it each time (`rehash`). This keeps the
-    /// O(n) rehash work amortised O(1) per insert. Default-initialised, so
-    /// `create`/`initBare`/restore need no extra wiring; it only gates an
-    /// optimisation, never correctness.
+    /// Amortised rehash trigger. mahina's hash part (`hash_part.HashPart`,
+    /// doc 49) self-grows, so we can't use Lua's "hash full" hook to drive a
+    /// rehash — instead we recompute the array/hash split when the hash-part
+    /// population crosses this threshold, doubling it each time (`rehash`).
+    /// This keeps the O(n) rehash work amortised O(1) per insert.
+    /// Default-initialised, so `create`/`initBare`/restore need no extra
+    /// wiring; it only gates an optimisation, never correctness.
     rehash_threshold: usize = 4,
     /// Grid hysteresis (doc 14, Phase 4b). `true` once this table has been ruled
     /// out as a flattened grid — either a `Heap.inflateToGrid` scan found it
@@ -69,12 +70,13 @@ pub const Table = struct {
     /// (doc 14 §Determinism gate). Default `false`; `create`/restore need no wiring.
     no_grid: bool = false,
 
-    pub const Map = std.HashMapUnmanaged(
-        Value,
-        Value,
-        ValueContext,
-        std.hash_map.default_max_load_percentage,
-    );
+    /// The hash part's concrete type — mahina's OWN extern-layout map
+    /// (doc 49), not the std map: the JIT's HREFK lowering reads its
+    /// nodes/mask/live fields inline via comptime `@offsetOf`, which the std
+    /// map's private `Header` made impossible. Same logical contract
+    /// (`get`/`getPtr`/`put`/`remove`/`contains`/`count`/`iterator`), plus
+    /// Lua-style dead-node deletion for hrefk slot stability.
+    pub const Map = hash_part.HashPart;
 
     /// Byte offset of the embedded `array` (`ArrayPart`) from a `*Table`. The
     /// tier-1b native compiler (`nativegen.zig`) reaches the packed array
@@ -260,6 +262,19 @@ pub const Table = struct {
     /// matching `get`/`set`. Never migrates or reshapes the table.
     pub fn fieldPtr(self: *Table, key: Value) ?*Value {
         return self.hash.getPtr(normalizeKey(key));
+    }
+
+    /// The hash part's LIVE node slot + mask for `key`, or `null` when the key
+    /// is absent or dead (doc 49). The recorder's hrefk capture: a dynamic-root
+    /// constant-key `href` records `(slot, mask)` so native can guard
+    /// mask/live/key inline and use the cell with no callout. Live slots only —
+    /// hrefk must never pin a dead node (its guards would pass the key check on
+    /// a resurrected-later cell whose `live` accounting the store path would
+    /// then corrupt; see doc 49 codex round-1 item 1). The key is normalised,
+    /// matching `fieldPtr`.
+    pub fn hashSlotOf(self: *const Table, key: Value) ?struct { slot: u32, mask: u32 } {
+        const idx = self.hash.liveSlotOf(normalizeKey(key)) orelse return null;
+        return .{ .slot = idx, .mask = self.hash.mask };
     }
 
     /// `t[key] = val`. A `nil`/`NaN` key errors; storing `nil` deletes.
@@ -629,44 +644,19 @@ pub inline fn normalizeKey(key: Value) Value {
     return key;
 }
 
-/// Hash/equality for `Value` keys. Stateless (zero-sized), so the unmanaged map's
-/// inferred-context convenience methods apply. Keys are always normalised before
-/// they reach here, so equal keys (per `Value.eql`) share tag+payload bits and
+/// Hash/equality for `Value` keys. The canonical hash body now lives in
+/// `hash_part.keyHash` (doc 49 — the owned map calls it directly, without a
+/// context); this stateless context remains for any std-map-shaped use of
+/// `Value` keys and for the historical record: the splitmix64 avalanche
+/// replaced a per-lookup `std.hash.Wyhash` that was ~45–57% of the runtime of
+/// the table-heavy benchmarks. Determinism notes (id-based heap hashing,
+/// canonical iteration order imposed by `key_order`, not by probe order) are
+/// documented at `hash_part.keyHash`. Keys are always normalised before they
+/// reach here, so equal keys (per `Value.eql`) share tag+payload bits and
 /// therefore hash identically.
 pub const ValueContext = struct {
     pub fn hash(_: ValueContext, v: Value) u64 {
-        // The key is always a tag (1 byte) plus an 8-byte payload, so there is
-        // nothing to *stream*: a fixed-width integer avalanche hashes it in a
-        // handful of instructions, where `std.hash.Wyhash` paid init+update+final
-        // overhead on every single lookup. That per-lookup `Wyhash.final` was
-        // ~45–57% of the runtime of the table-heavy benchmarks (nbody, array3d)
-        // and dominated `field_hash`; replacing it cut nbody by ~13% of cycles
-        // and field_hash by ~16% of instructions.
-        //
-        // Determinism: this is a pure function of `(tag, payload)`, identical in
-        // all 8 modes and on replay. It does NOT affect observable iteration
-        // order — that is imposed by `key_order.keyLessThan`'s canonical sort in
-        // both `keyframeser.sortedHashEntries` and `pairs`/`next`, which erases
-        // the hash-map's internal probe order (see docs/design/02-determinism.md
-        // §"Table iteration order"). So the function is free to change without
-        // touching any snapshot golden. (`eql` below still does the full
-        // `Value.eql`, so distribution quality is a performance concern only,
-        // never correctness.)
-        const payload: u64 = if (v.isHeap())
-            // Hash a heap key by its stable, deterministic object `id`, NOT
-            // `payload.bits` (the object's ASLR-dependent address). Consistent
-            // with `eql`: equal heap keys are the same interned object, same id.
-            v.asHeap().id
-        else
-            v.payload.bits;
-
-        // Fold the tag into the payload (spread across the word first so a small
-        // ordinal still perturbs the high bits), then run a splitmix64-style
-        // finalizer — a well-distributed 64-bit avalanche.
-        var x = payload ^ (@as(u64, @intFromEnum(v.tag)) *% 0x9E3779B97F4A7C15);
-        x = (x ^ (x >> 30)) *% 0xBF58476D1CE4E5B9;
-        x = (x ^ (x >> 27)) *% 0x94D049BB133111EB;
-        return x ^ (x >> 31);
+        return hash_part.keyHash(v);
     }
     pub fn eql(_: ValueContext, a: Value, b: Value) bool {
         return a.eql(b);

@@ -1711,7 +1711,11 @@ pub fn bodyCalloutOf(
 ) ?BodyCallout {
     const ins = t.instrs[idx];
     return switch (ins.op) {
-        .href => if (isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a)) .resolve_hash_cell else null,
+        // A dynamic-root href calls resolveHashCell — UNLESS it carries an
+        // hrefk aux (doc 49): that lowers to inline guards + a `lea`, no call,
+        // so it must NOT reserve the (large) callout save frame.
+        .href => if (isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a) and
+            trace_ir.HrefAux.decode(ins.aux) == null) .resolve_hash_cell else null,
         .guard_absent => .table_absent,
         .fsin => .fsin,
         .fcos => .fcos,

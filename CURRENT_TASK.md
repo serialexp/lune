@@ -21,6 +21,57 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-16 (latest+15) — task #32 (doc 49): owned hash part + hrefk — nbody 23.3× → 13.4× LJ
+
+**COMPLETE, ready to commit.** Doc 49
+(`docs/design/49-owned-hash-part-hrefk.md`, codex-approved rounds 1–3, thread
+`01a0a86c-f747-7db3-95c5-d4b1e3b7c664`) holds the full design + measurements.
+Bart chose "Own hash part (B)" over the std-map layout-discovery hack. Summary:
+
+- **P1 `src/hash_part.zig`**: mahina-owned extern-layout open-addressing map
+  (interleaved 32 B `Node{key,value}`, `{nodes, mask, live, used}` header).
+  Lua-style deletion: free ⇔ nil KEY tag; dead ⇔ live key + nil VALUE, dead
+  heap-key payload rewritten to `GcHeader.id` bits (pointer-free dead nodes).
+  `keyHash` = splitmix64 over (tag, id-or-bits). 8 inline tests.
+- **P1b battery**: owned map BEATS std map at tier-0 (nbody −4.7%, array3d
+  −5.8%, churn −6.3%, field-hash −6.8%; miss micro +2.2% = predicted
+  no-fingerprint cost). binary-trees "+13.9%" disproven as noise ×3.
+- **P2 swap**: `table.Map = hash_part.HashPart`, call sites migrated,
+  `hash_size` → `live`. Table 112→120 B, same 128 B SmpAllocator class.
+- **P2b restore contract**: geometry (slot/mask/dead nodes/used) deliberately
+  NOT serialized; divergence across restore PERMISSIBLE (doc 02 Done-bullet
+  added). Pinned by `doc 49 P2b` test in keyframeser_restore_test.zig:
+  used>live history restores dead-node-free, `encodeSnapshot ∘ restore ==
+  identity`, second restore layout-identical slot-for-slot.
+- **P3 hrefk**: recorder pins live `(slot, mask)` via `Table.hashSlotOf` into
+  `href.aux` (`trace_ir.HrefAux`, 3-domain contract: aux≥0 seed slab / −1
+  callout / ≤−2 hrefk); `emitHrefK` (~7 instr, 4 loads, NO callout/save
+  frame) with CONTRACTUAL guard order mask → live-cell → key tag → key id
+  (ids, never payload bits — restore moves strings). Prover admits hrefk only
+  at `.heap` roots; static-root-with-hrefk-aux fails closed.
+  Tests `src/nativegen_hrefk_test.zig` (7): same-shape distinct-table read
+  vs oracle; guard_table agreement; two-universe RMW store; swapped-slot
+  sibling (native exits at pinned iteration K with hand-computed regs, oracle
+  completes N — the documented conservative divergence); delete+unrelated-
+  insert dead-node STORE TRAP (live-cell guard exits before key deref —
+  neutering it segfaults on the id-bits deref, proving the guard order);
+  rehash + empty-map mask exits; static-root bail. All guards
+  neuter-verified to bite. GOTCHA for future tests: raw-created heap objects
+  default `GcHeader.id = 0` and heap `Value.eql`/`keyHash` go BY ID — a test
+  with >1 heap key must assign distinct ids itself (see `assignIdWithSlot`).
+- **P4 board** (TSV 20260916-141459-858834f, cross+luajit ok everywhere):
+  **nbody 106.4 → 61.7 ms, 23.3× → 13.4×**; repack −14.1%, btrees −7.4%,
+  grid_matmul_f64 −7.4%, nsieve −6.5%; tier-0 broadly down. str_gsub/
+  str_manip/array3d apparent jit regressions disproven ×3 interleaved.
+  Full `just test` green on the final tree.
+- **Next rocks (out of scope, recorded in doc 49)**: nbody remaining gap is
+  tier-0 COVERAGE, not the traced loop — `--jit-stats` 50000: advance:4
+  nested for_prep (13.6% run, `nyi_opcode for_prep`), main:211
+  `aliased_input get_upval` (18.5%), tier-0 no-trace 32.3% of cycles;
+  liveSlotOf 31.9% of profile is those tier-0 probes. Seam:
+  replayLedgerFrom 7.5%, ~1028 cyc/walk. Defers: guard_hash subsumption on
+  hrefk chains, on-trace insertion (asm_newref analogue), scalar-key hrefk.
+
 ## Status 2026-09-16 (latest+14) — task #31 (doc 47 Increment C → doc 48): spectral 13.3× → 9.4×, awaiting full board + codex round-2
 
 **Implementation + P3 test suite COMPLETE, uncommitted.** Doc 48

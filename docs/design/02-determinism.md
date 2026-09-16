@@ -164,6 +164,25 @@ that for a time-travel debugger it *is* the architecture.
       canonical order. This is the one signed-off observable change of the
       slot-0 flip (a program keying on `pairs` order across it sees key 0 move
       from the hash tail to the array front).
+- [x] **Restore-boundary contract for the hash part's physical layout
+      (doc 49).** With the owned map (`src/hash_part.zig`) the geometry —
+      `(slot, mask)`, dead nodes, `used` vs `live`, probe displacement — is a
+      pure function of the *mutation history*, and the keyframe deliberately
+      does **not** serialize it: capture emits live entries in canonical key
+      order; restore rebuilds by fresh insertion. A pre-capture map with
+      deletions (`used > live`) therefore restores to a physically different,
+      dead-node-free twin, and JIT artifacts derived from geometry (hrefk
+      `(slot, mask)` pins in `href.aux`) may side-exit-and-rerecord across the
+      boundary. That divergence is PERMISSIBLE, same as the recomputed array
+      lanes and the reset grid layout: the determinism contract is
+      byte-identical *artifacts* for identical full executions, not identical
+      *physical layouts* across a restore seam. Native never trusts a recorded
+      geometry — the hrefk mask/live-cell/key-id guards re-validate against
+      the live table every iteration, and heap-key identity is compared by
+      `GcHeader.id`, never payload bits (restore gives objects new
+      addresses). Pinned by the `doc 49 P2b` keyframeser restore test
+      (layout diverges, `encodeSnapshot ∘ restore == identity`, second
+      restore reproduces the first's layout slot-for-slot).
 - [~] **Floating-point determinism.** FP **mode is pinned**: every float-producing
       function in `src/arith.zig` sets `@setFloatMode(.strict)`, forbidding
       contraction/reassociation regardless of build mode (Zig's default is already

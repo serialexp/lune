@@ -36,6 +36,9 @@ pub const parser = @import("parser.zig");
 /// Phase 3 — runtime heap objects + bytecode ISA + tier-0 interpreter.
 pub const string = @import("string.zig");
 pub const array = @import("array.zig");
+/// The owned hash part backing `Table.hash` (doc 49) — extern layout for the
+/// JIT's inline HREFK access.
+pub const hash_part = @import("hash_part.zig");
 pub const table = @import("table.zig");
 pub const function = @import("function.zig");
 pub const gc = @import("gc.zig");

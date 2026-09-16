@@ -856,8 +856,11 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                     // Loop-invariant: seed slot must be valid.
                     if (ins.aux < 0 or ins.aux > 0xFFFF) return false;
                 } else if (kinds[ins.a] == .heap) {
-                    // Per-iteration: recorder sets aux = -1 (no seed).
-                    if (ins.aux != -1) return false;
+                    // Per-iteration: aux is `-1` (resolveHashCell callout) or a
+                    // valid hrefk `(slot, mask)` encoding (doc 49 — inline
+                    // mask/live/key guards, no callout). Anything else is
+                    // malformed and declines native.
+                    if (ins.aux != -1 and trace_ir.HrefAux.decode(ins.aux) == null) return false;
                 } else {
                     return false;
                 }

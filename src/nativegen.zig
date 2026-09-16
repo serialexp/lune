@@ -1322,14 +1322,26 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // recomputing the hash lookup, exactly as `aref` reads an invariant base.
             .href => {
                 if (isDynTableRoot(kinds, alloc.slots, alloc.slot_id_of_ref, ins.a)) {
-                    // Per-iteration hash-cell resolution via call-out (the root is a
-                    // `.heap`-kind aload result, or a carried-heap slot whose current
-                    // table the seed cannot describe — its recorded seed, if any, is
-                    // ignored). Save rdi/rsi (SoA bases) and all live caller-saved
-                    // homes, call resolveHashCell, restore, check result.
-                    std.debug.assert(alloc.callout_save_count != 0); // save area must be reserved
-                    try emitHrefCallout(a, t, alloc, kinds, ins, i, exit_labels);
+                    if (trace.HrefAux.decode(ins.aux) != null) {
+                        // doc 49 hrefk: the recorder pinned the observed live
+                        // node `(slot, mask)` — inline mask/live/key-id guards
+                        // + the cell address. No callout, no save frame
+                        // (`bodyCalloutOf` skips hrefk hrefs by decode).
+                        try emit.emitHrefK(a, t, alloc, ins, i, exit_labels);
+                    } else {
+                        // Per-iteration hash-cell resolution via call-out (the root is a
+                        // `.heap`-kind aload result, or a carried-heap slot whose current
+                        // table the seed cannot describe — its recorded seed, if any, is
+                        // ignored). Save rdi/rsi (SoA bases) and all live caller-saved
+                        // homes, call resolveHashCell, restore, check result.
+                        std.debug.assert(alloc.callout_save_count != 0); // save area must be reserved
+                        try emitHrefCallout(a, t, alloc, kinds, ins, i, exit_labels);
+                    }
                 } else {
+                    // Invariant root: the aux is a seed slab slot by
+                    // construction (the recorder only encodes hrefk for
+                    // non-`slot_load` roots, which are `.heap`-kinded here).
+                    std.debug.assert(ins.aux >= 0);
                     // Loop-invariant: load seeded cell pointer from slab.
                     const off: i32 = @as(i32, @intCast(ins.aux)) * 8;
                     switch (placeOfRef(alloc, i)) {
@@ -2675,4 +2687,5 @@ test {
     _ = @import("nativegen_arrayread_test.zig");
     _ = @import("nativegen_arraywrite_test.zig");
     _ = @import("nativegen_carriedheap_test.zig");
+    _ = @import("nativegen_hrefk_test.zig");
 }

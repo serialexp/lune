@@ -240,6 +240,17 @@ pub const IrOp = enum(u8) {
     /// carries no usable `Value` (its operands are what `hload`/`hstore` read);
     /// native kind is a raw pointer (`Kind.href`, the re-resolved `getPtr` cell).
     /// Classified `.aref` in `tropt.kindOf` (same (a=table, b=key) operand shape).
+    ///
+    /// `aux` (doc 49) is one of three disjoint encodings, shared through
+    /// `HrefAux` (never open-coded):
+    ///   * `aux >= 0`  — entry-seed slab slot (invariant `slot_load` root).
+    ///   * `aux == -1` — no seed, no slot: native resolves per iteration via
+    ///     the `resolveHashCell` callout.
+    ///   * `aux <= -2` — **hrefk** (`HrefAux.encode(slot, mask)`): the
+    ///     observed live node slot + hash mask for a dynamic root; native
+    ///     guards mask/live/key inline and uses the cell with NO callout.
+    /// The tier-1a oracle ignores `aux` entirely (it re-resolves via
+    /// `fieldPtr`), so all three run identically at tier-1a.
     href,
     /// `a` = `href` ref → load the full tagged `Value` from the cell. The hash
     /// analogue of `aload`: the oracle returns `Table.get(key)`; native loads the
@@ -902,4 +913,81 @@ pub fn withPhis(
     }
     out[last + ncarry] = .{ .op = .loop };
     return out;
+}
+
+/// doc 49 — the packed `href.aux` hrefk encoding, the ONE encode/decode point
+/// (codex round-1 item 6: never open-code the negation/shift logic).
+///
+/// Layout of the encoded payload `p` (before negation): bits 0..19 = the live
+/// node slot, bits 20..24 = log2(capacity) of the hash part (capacity = mask+1,
+/// power of 2). Stored as `aux = -(2 + p)`, keeping the three `href.aux`
+/// domains disjoint: `>= 0` seed slab slot, `-1` callout, `<= -2` hrefk.
+///
+/// Determinism: `(slot, mask)` is a pure function of the deterministic
+/// id-based key hash and the guest's insertion/deletion history (doc 49
+/// §Determinism), so the encoded aux is byte-identical across modes and
+/// independent runs. Nothing address-shaped is encoded.
+pub const HrefAux = struct {
+    pub const Decoded = struct { slot: u32, mask: u32 };
+
+    const slot_bits: u5 = 20;
+    const max_slot: u32 = (1 << slot_bits) - 1;
+    /// Capacity above 2^20 (or a slot index past it) falls back to the
+    /// callout — LuaJIT caps hslot at 65535 for the same "huge table" reason.
+    const max_log2_cap: u32 = slot_bits;
+
+    /// Encode a live slot + mask, or null when out of the encodable range
+    /// (caller falls back to `aux = -1`, the callout).
+    pub fn encode(slot: u32, mask: u32) ?i32 {
+        const cap = @as(u64, mask) + 1;
+        if (mask == 0 or !std.math.isPowerOfTwo(cap)) return null;
+        const log2_cap: u32 = @intCast(std.math.log2_int(u64, cap));
+        if (log2_cap < 2 or log2_cap > max_log2_cap) return null; // min capacity 4
+        if (slot > mask) return null; // slot <= mask by construction upstream
+        const p: u32 = (log2_cap << slot_bits) | slot;
+        return -(2 + @as(i32, @intCast(p)));
+    }
+
+    /// Decode an `href.aux`, or null when it is not an hrefk encoding
+    /// (seed slot / callout) OR fails validation (malformed log2, slot past
+    /// mask) — a failed decode routes native to the callout, never a bogus
+    /// inline access.
+    pub fn decode(aux: i32) ?Decoded {
+        if (aux > -2) return null;
+        const p: u32 = @intCast(-(@as(i64, aux)) - 2);
+        const slot: u32 = p & max_slot;
+        const log2_cap: u32 = p >> slot_bits;
+        if (log2_cap < 2 or log2_cap > max_log2_cap) return null;
+        const mask: u32 = (@as(u32, 1) << @intCast(log2_cap)) - 1;
+        if (slot > mask) return null;
+        return .{ .slot = slot, .mask = mask };
+    }
+};
+
+test "HrefAux round-trips, keeps domains disjoint, rejects malformed" {
+    // Round-trip across the range.
+    const cases = [_]HrefAux.Decoded{
+        .{ .slot = 0, .mask = 3 },
+        .{ .slot = 3, .mask = 3 },
+        .{ .slot = 17, .mask = 31 },
+        .{ .slot = (1 << 20) - 1, .mask = (1 << 20) - 1 },
+    };
+    for (cases) |c| {
+        const aux = HrefAux.encode(c.slot, c.mask).?;
+        try std.testing.expect(aux <= -2); // hrefk domain
+        const d = HrefAux.decode(aux).?;
+        try std.testing.expectEqual(c.slot, d.slot);
+        try std.testing.expectEqual(c.mask, d.mask);
+    }
+    // Seed-slot and callout auxes never decode.
+    try std.testing.expect(HrefAux.decode(-1) == null);
+    try std.testing.expect(HrefAux.decode(0) == null);
+    try std.testing.expect(HrefAux.decode(1234) == null);
+    // Out-of-range encodes decline.
+    try std.testing.expect(HrefAux.encode(0, 0) == null); // empty map
+    try std.testing.expect(HrefAux.encode(0, 1) == null); // capacity 2 < min 4
+    try std.testing.expect(HrefAux.encode(5, 3) == null); // slot > mask
+    try std.testing.expect(HrefAux.encode(0, (1 << 21) - 1) == null); // too big
+    // Malformed decode payloads (hand-built) decline.
+    try std.testing.expect(HrefAux.decode(-2) == null); // p=0 → log2 0
 }

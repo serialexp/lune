@@ -9,6 +9,7 @@
 const std = @import("std");
 const value = @import("value.zig");
 const table = @import("table.zig");
+const hash_part = @import("hash_part.zig");
 const arr = @import("array.zig");
 const object = @import("object.zig");
 const function = @import("function.zig");
@@ -44,7 +45,7 @@ pub const ArrLayout = struct {
     /// store's `guard_append` reads this to prove the hash is empty (so tier-0's
     /// `migrateFromHash` would be a no-op). `@offsetOf` on the std map field makes a
     /// layout churn a compile error, never a silent miscompile (Z-1/Z-2).
-    pub const hash_size = table.Table.hash_off + @offsetOf(table.Table.Map, "size");
+    pub const hash_size = table.Table.hash_off + @offsetOf(table.Table.Map, "live");
 };
 
 comptime {
@@ -91,6 +92,27 @@ pub const CLOSURE_PROTO_OFF: i32 = @offsetOf(function.Closure, "proto");
 /// it survives keyframe restore/replay) from a `*const Proto`. `guard_func` compares
 /// the recorded id against `[closure.proto + PROTO_ID_OFF]`.
 pub const PROTO_ID_OFF: i32 = @offsetOf(bytecode.Proto, "id");
+/// doc 49 — the hrefk inline hash access encodes against the OWNED hash part
+/// (`hash_part.HashPart`, extern layout by design). All from-`*GcHeader`
+/// offsets, like `HASH_SIZE_FROM_HEADER` (header is `Table`'s first field).
+pub const HASH_MASK_FROM_HEADER: i32 = table.Table.hash_off + @offsetOf(table.Table.Map, "mask") - @as(i32, @intCast(@offsetOf(table.Table, "header")));
+pub const HASH_NODES_FROM_HEADER: i32 = table.Table.hash_off + @offsetOf(table.Table.Map, "nodes") - @as(i32, @intCast(@offsetOf(table.Table, "header")));
+/// Node geometry: `hash_part.Node` is `extern { key: Value, value: Value }`,
+/// 32 bytes. Comptime-pinned so a Node change recomputes the JIT's address
+/// math or fails the build, never miscompiles.
+pub const NODE_SIZE: i32 = @sizeOf(hash_part.Node);
+pub const NODE_KEY_TAG_OFF: i32 = @offsetOf(hash_part.Node, "key") + @offsetOf(value.Value, "tag");
+pub const NODE_KEY_PAYLOAD_OFF: i32 = @offsetOf(hash_part.Node, "key") + @offsetOf(value.Value, "payload");
+pub const NODE_VALUE_OFF: i32 = @offsetOf(hash_part.Node, "value");
+/// Offset of `GcHeader.id` (the stable `u32` object identity — NOT an address,
+/// survives keyframe restore) from a `*GcHeader`. The hrefk key guard compares
+/// the recorded interned-key id against `[node.key.payload + GCHEADER_ID_OFF]`.
+pub const GCHEADER_ID_OFF: i32 = @offsetOf(object.GcHeader, "id");
+comptime {
+    std.debug.assert(NODE_SIZE == 32);
+    std.debug.assert(HASH_MASK_FROM_HEADER >= 0 and HASH_NODES_FROM_HEADER >= 0);
+}
+
 /// `ObjectType.native` ordinal — the byte at `GcHeader.type` for a host native.
 /// The pure-builtin `guard_builtin` checks a snapshot callee value is a native of this
 /// type before reading its `pure` tag.
