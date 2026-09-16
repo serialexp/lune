@@ -1681,3 +1681,12 @@ demotions in trace.zig, compiler-adjudicated). Deferred items:
    where sibling tests use the trace.X facade; `trace_link_mod.arm` (native
    link) vs `TraceState.arm` (recording) name collision is a readability
    trap.
+
+## Stable-ID heap-eq coverage leftovers (Astra review of doc 50)
+
+- [ ] A spill-pressure variant of the heap `eq`/`ne` identity tests (enough
+      live values that the compared refs live in memory homes, pinning the
+      mem-operand id-compare path).
+- [ ] A differential identity test through a REAL keyframe capture/restore
+      (run the eq trace pre-capture and post-restore and compare), rather
+      than the simulated same-id/different-address twin.

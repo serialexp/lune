@@ -1260,6 +1260,10 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             .gcell => {
                 if (ins.a >= i or ins.b >= i) return false;
                 if (kinds[ins.a] != .aref or kinds[ins.b] != .int) return false;
+                // Astra review (doc 50): `.aref` is shared by aref/garow/gcell, but
+                // the native emitters WALK `t.instrs[...]` chains assuming exact
+                // ops — never trust the IR; pin the op identity here.
+                if (t.instrs[ins.a].op != .garow) return false;
                 const lk = laneKind(ins.aux) orelse return false;
                 if (lk != .int and lk != .float) return false;
                 if (ins.aux != t.instrs[ins.a].aux) return false; // task #29: chain equality with the garow
@@ -1273,6 +1277,14 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             .guard_gcol => {
                 if (ins.a >= i or ins.b >= i) return false;
                 if (kinds[ins.a] != .aref or kinds[ins.b] != .int) return false;
+                // Astra review (doc 50): the token must really be a gcell (native
+                // walks gcell.a → garow → table slot for the folded stride), and the
+                // range-checked column ref must be THE column baked into the gcell's
+                // flat index — the oracle derives the column from `gcell.b`, so a
+                // divergent `ins.b` would let native prove the wrong value in-range
+                // and dereference an unproven flat index.
+                if (t.instrs[ins.a].op != .gcell) return false;
+                if (ins.b != t.instrs[ins.a].b) return false;
                 gcol_ok[ins.a] = true;
                 kinds[i] = .none;
             },
@@ -1283,6 +1295,7 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             .guard_gpresent => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
+                if (t.instrs[ins.a].op != .gcell) return false; // exact-op chain (Astra)
                 if (!gcol_ok[ins.a]) return false; // column bound must dominate
                 kinds[i] = .none;
             },
@@ -1293,6 +1306,7 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             .gload => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
+                if (t.instrs[ins.a].op != .gcell) return false; // exact-op chain (Astra)
                 if (!gcol_ok[ins.a]) return false; // column bound must dominate
                 const lk = laneKind(ins.aux) orelse return false;
                 if (lk != .int and lk != .float) return false;
@@ -1310,6 +1324,7 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             .gstore => {
                 if (ins.a >= i or ins.b >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
+                if (t.instrs[ins.a].op != .gcell) return false; // exact-op chain (Astra)
                 if (!gcol_ok[ins.a]) return false; // column bound must dominate
                 const lk = laneKind(ins.aux) orelse return false;
                 if (ins.aux != t.instrs[ins.a].aux) return false; // task #29: chain equality with the gcell

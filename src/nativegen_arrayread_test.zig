@@ -1237,3 +1237,144 @@ test "nativegen: grid/scalar root shape conflicts and grid chain mismatches refu
     var ts = Trace{ .anchor = undefined, .instrs = &g, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
     try expectBail(&ts);
 }
+
+test "nativegen(Astra/doc50): grid chain op-identity and guard_gcol column-ref equality refuse" {
+    // Astra review of doc 50: `.aref` kind is shared by aref/garow/gcell while
+    // the native emitters WALK `t.instrs[...]` chains assuming exact ops, and
+    // the oracle derives guard_gcol's column from `gcell.b` while native
+    // range-checks `guard_gcol.b`. The prover now pins both. Each variant
+    // below passed the OLD kind-only checks (fail-open: native would compile
+    // and misinterpret the chain or range-check the wrong value) and must now
+    // bail.
+    const gi: i32 = @intFromEnum(arr.Lane.i64);
+
+    // Same canonical valid chain as the refuse test above.
+    const proto_len = 14;
+    var g: [proto_len]I = .{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_grid, .a = 0, .aux = gi }, // 2
+        .{ .op = .guard_stride, .a = 0, .aux = 8 }, // 3
+        .{ .op = .slot_load, .aux = 1 }, // 4: row
+        .{ .op = .guard_int, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: col
+        .{ .op = .guard_int, .a = 6 }, // 7
+        .{ .op = .garow, .a = 0, .b = 4, .aux = gi }, // 8
+        .{ .op = .guard_bounds, .a = 8 }, // 9
+        .{ .op = .gcell, .a = 8, .b = 6, .aux = gi }, // 10
+        .{ .op = .guard_gcol, .a = 10, .b = 6 }, // 11
+        .{ .op = .gload, .a = 10, .aux = gi }, // 12
+        .{ .op = .loop }, // 13
+    };
+    const base = g;
+
+    // Positive control: the unmutated chain compiles (so the bails below are
+    // attributable to the mutations, not the fixture).
+    {
+        var tv = Trace{ .anchor = undefined, .instrs = &g, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+        var ct = nativegen.compile(testing.allocator, &tv, 0) orelse return error.NativeBailedUnexpectedly;
+        ct.deinit();
+    }
+
+    // (a) guard_gcol.b diverges from gcell.b: b=4 is the ROW ref — an int, so
+    // the old kind check passed and native range-checked the row while the
+    // flat index was built from the (unproven) column.
+    g = base;
+    g[11] = .{ .op = .guard_gcol, .a = 10, .b = 4 };
+    {
+        var tv = Trace{ .anchor = undefined, .instrs = &g, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+        try expectBail(&tv);
+    }
+
+    // (b) guard_gcol + gload rooted at the GAROW (an `.aref` too): the old
+    // prover accepted both (garow.aux == gi satisfies the chain-aux check)
+    // and native would have walked garow.a's slot_load as if it were a garow.
+    g = base;
+    g[11] = .{ .op = .guard_gcol, .a = 8, .b = 6 };
+    g[12] = .{ .op = .gload, .a = 8, .aux = gi };
+    {
+        var tv = Trace{ .anchor = undefined, .instrs = &g, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+        try expectBail(&tv);
+    }
+
+    // (c) gcell chained on a GCELL: guard_bounds accepts any `.aref`, so a
+    // malformed row-bound on the inner gcell satisfied `bounds_ok` and the
+    // whole chain compiled pre-fix; native would then read the inner gcell's
+    // `.a` (a garow) as if it were the table slot of a garow.
+    var g2 = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_grid, .a = 0, .aux = gi }, // 2
+        .{ .op = .guard_stride, .a = 0, .aux = 8 }, // 3
+        .{ .op = .slot_load, .aux = 1 }, // 4: row
+        .{ .op = .guard_int, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: col
+        .{ .op = .guard_int, .a = 6 }, // 7
+        .{ .op = .garow, .a = 0, .b = 4, .aux = gi }, // 8
+        .{ .op = .guard_bounds, .a = 8 }, // 9
+        .{ .op = .gcell, .a = 8, .b = 6, .aux = gi }, // 10
+        .{ .op = .guard_bounds, .a = 10 }, // 11: malformed row-bound on a gcell
+        .{ .op = .gcell, .a = 10, .b = 6, .aux = gi }, // 12: gcell-of-gcell
+        .{ .op = .guard_gcol, .a = 12, .b = 6 }, // 13
+        .{ .op = .gload, .a = 12, .aux = gi }, // 14
+        .{ .op = .loop }, // 15
+    };
+    {
+        var tv = Trace{ .anchor = undefined, .instrs = &g2, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+        try expectBail(&tv);
+    }
+}
+
+test "nativegen(Astra/doc50): heap eq — mixed invariant/value-lane operands and high-bit stable IDs" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var heap = @import("gc.zig").Heap.init(gpa);
+    defer heap.deinit();
+
+    // Astra coverage additions to the stable-ID identity tests above: the EQ
+    // op (only `ne` was exercised), a MIXED operand pair (invariant `.ptr`
+    // root vs per-iteration `.heap` aload), and ids with the top bit set — a
+    // sign-extension bug in the id compare would break exactly these.
+    const inv = try heap.newTable();
+    const other = try heap.newTable();
+    const container = try heap.newTable();
+    try container.set(gpa, Value.int(1), Value.heap(&inv.header));
+    try testing.expectEqual(arr.Lane.value, container.array.lane);
+
+    const lane: i32 = VALUE_LANE;
+    var consts = [_]Value{Value.int(1)};
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: container
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: invariant table (.ptr)
+        .{ .op = .guard_table, .a = 3 }, // 4
+        .{ .op = .konst, .aux = 0 }, // 5: 1
+        .{ .op = .aref, .a = 0, .b = 5, .aux = lane }, // 6
+        .{ .op = .guard_bounds, .a = 6 }, // 7
+        .{ .op = .aload, .a = 6, .aux = lane, .ty = .heap }, // 8: element (.heap)
+        .{ .op = .guard_table, .a = 8 }, // 9
+        .{ .op = .eq, .a = 3, .b = 8, .ty = .boolean }, // 10: MIXED .ptr vs .heap
+        .{ .op = .guard_true, .a = 10 }, // 11
+        .{ .op = .link }, // 12
+    };
+    const tr = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &.{}, .entry_guards = &.{} };
+    const regs = [_]Value{ Value.heap(&container.header), Value.heap(&inv.header) };
+
+    // Same object through both routes → eq true, trace completes.
+    try expectMatch(&tr, &regs);
+    // Different object in the container → eq false, guard_true exits.
+    try container.set(gpa, Value.int(1), Value.heap(&other.header));
+    try expectMatch(&tr, &regs);
+
+    // High-bit ids. Restored-twin equality first: distinct objects, same
+    // top-bit id — oracle says equal; native must agree via the 32-bit id
+    // compare regardless of sign interpretation.
+    inv.header.id = 0x8000_0001;
+    other.header.id = 0x8000_0001;
+    try testing.expect(@intFromPtr(&inv.header) != @intFromPtr(&other.header));
+    try expectMatch(&tr, &regs);
+    // And top-bit ids that DIFFER only in the low bit → not equal.
+    other.header.id = 0x8000_0002;
+    try expectMatch(&tr, &regs);
+}

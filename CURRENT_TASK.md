@@ -75,6 +75,39 @@ the ones that bite):
   before declaring it hard; "replay/determinism forbids it" only ever means
   *adapt* the mechanism (ids not addresses, deterministic counters).
 
+## Status 2026-09-16 (latest+17) — doc 50 Astra-review follow-ups landed; next arc = nest-decomposition diagnosis
+
+Codex Astra (gpt-6-astra) reviewed the doc 50 arc read-only. Verdicts and what
+landed from them (this session, on top of `d35ca63`):
+
+- **`guard_gcol` fail-open gap FIXED** (pre-existing, Rule #0.5): native
+  range-checks `guard_gcol.b` while the oracle derives the column from
+  `gcell.b`; the prover never tied them, and the shared `.aref` kind let
+  aref/garow/gcell impersonate each other while native emitters walk exact-op
+  `t.instrs[...]` chains (`guard_bounds` on a gcell even satisfied
+  `bounds_ok`, so a gcell-of-gcell chain COMPILED). Prover now enforces
+  `guard_gcol.b == gcell.b` + exact op identity along the whole grid chain.
+  Three previously-compiling malformed variants pinned in
+  nativegen_arrayread_test.zig ("Astra/doc50" tests) — bite verified by
+  temporary neutering (they compiled pre-fix), positive control compiles.
+- **Heap identity eq coverage extended**: `eq` op (only `ne` was covered),
+  mixed invariant-`.ptr`/value-lane-`.heap` operands, top-bit ids
+  (sign-extension trap), equal-twin + differing cases. Leftovers in TODO.md:
+  spill-pressure variant, real capture/restore differential.
+- **Doc 50 amended per review**: rejection scoped to whole-inner-loop cloning
+  of variable-trip nests (bounded unrolling of genuinely short loops stays
+  legitimate); "no production multi-loop trace" softened to a working
+  assumption; "External review" section records verdicts + follow-ups.
+- **Next arc (Astra-recommended, recorded in doc 50 "Outstanding
+  direction")**: NOT a new mechanism — diagnose why the EXISTING
+  `inner root → outer continuation → inner root` decomposition fails to
+  cover outer work on a reduced advance:4-shaped variable-trip nest, layer
+  by layer (the Z-8 ladder generalized): 1 topology/aborts, 2 entry-guard
+  mismatches, 3 exit arming, 4 silent-region promotion / SCC owner
+  election, 5 residency + seam cost. End state: inner trace REUSED, outer
+  state through continuation φ/writeback, code size independent of inner
+  trip count.
+
 ## Status 2026-09-16 (latest+16) — task #33 (doc 50): nested `for_prep` investigation — unrolling rejected
 
 **NO FEATURE LANDING.** Doc 50 (`docs/design/50-nested-for-prep-investigation.md`)
