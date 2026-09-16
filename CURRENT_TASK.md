@@ -75,6 +75,43 @@ the ones that bite):
   before declaring it hard; "replay/determinism forbids it" only ever means
   *adapt* the mechanism (ids not addresses, deterministic counters).
 
+## Status 2026-09-16 (latest+16) — task #33 (doc 50): nested `for_prep` investigation — unrolling rejected
+
+**NO FEATURE LANDING.** Doc 50 (`docs/design/50-nested-for-prep-investigation.md`)
+records the experiment and measurements. Starting HEAD for this run was
+`33d4ced`; do not push without Bart's say-so.
+
+- Profile + `--jit-stats` confirmed the documented nbody gap: `advance:4`
+  contributes about 13.5–13.9% of the run with zero traced iterations;
+  `advance:34` remains about 87.5% trace-resident. The outer abort is
+  `nyi_opcode for_prep`.
+- A general bounded numeric-inner-loop recorder prototype (15-trip cap) built
+  an approximately 500-IR native outer trace. Variable/shrinking trip counts
+  made it match only about one third of nbody outer iterations at ~2,417
+  cycles/iteration versus ~485 in tier 0, regressing wall time to ~108 ms.
+  Mismatch retirement merely restored the old shape with no durable new
+  coverage. A fixed-four-trip control was already covered by the existing
+  inner-root/link machinery. Per Z-6, the prototype was removed in full.
+- Two independent correctness bugs exposed by the experiment remain fixed:
+  `guard_gcol.b` is now marked/remapped through tropt's two-operand effect
+  class; and native heap `eq`/`ne` now admits both invariant `.ptr` and
+  value-lane `.heap` operands while comparing stable `GcHeader.id`, never
+  process address. Differential tests cover distinct IDs, the same object,
+  and restored twins with equal IDs at different addresses.
+- An owner-aware numeric loop-done classifier was prototyped but removed: its
+  only demonstrated need was the rejected multi-loop root, while landing it
+  would require a deliberate revision of the replay fixture contract. Doc 50
+  records this requirement for any future multi-loop-root design.
+- Gates: focused regressions green; full `just test` green; full
+  `zig build test -Djit-debug=true` green. Post-removal nbody 50,000 is correct,
+  71.8 ms in the sampled stats run, with `advance:4` back to zero trace
+  iterations and 50.8% traced time. Full five-repetition `just bench` is
+  cross-tier clean and LuaJIT-parity clean on every compatible row; nbody is
+  62.4 ms versus 61.7 ms on the post-doc-49 board (noise-scale).
+- Next choice returns to the candidate list above. Bounded whole-inner-loop
+  cloning is ruled out; a future nested-loop design must preserve the reusable
+  inner trace and represent the enclosing state transition instead.
+
 ## Status 2026-09-16 (latest+15) — task #32 (doc 49): owned hash part + hrefk — nbody 23.3× → 13.4× LJ
 
 **COMPLETE — committed as `76198e5` on master (not pushed).** Doc 49
@@ -125,4 +162,3 @@ Bart chose "Own hash part (B)" over the std-map layout-discovery hack. Summary:
   liveSlotOf 31.9% of profile is those tier-0 probes. Seam:
   replayLedgerFrom 7.5%, ~1028 cyc/walk. Defers: guard_hash subsumption on
   hrefk chains, on-trace insertion (asm_newref analogue), scalar-key hrefk.
-

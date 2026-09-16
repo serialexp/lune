@@ -523,6 +523,7 @@ const emitAluRegPlace = emit.emitAluRegPlace;
 const emitBinAlu = emit.emitBinAlu;
 const emitShift = emit.emitShift;
 const emitCompare = emit.emitCompare;
+const emitHeapCompare = emit.emitHeapCompare;
 const emitFloatCompare = emit.emitFloatCompare;
 const floatOperandToXmm = emit.floatOperandToXmm;
 const emitFloatBinOp = emit.emitFloatBinOp;
@@ -1138,10 +1139,13 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 }
             },
             .eq, .ne, .lt, .le => {
-                // proveKinds pins the operand pair to both-int or both-float; check one
-                // operand to pick the path (float compare via ucomisd, int via cmp).
+                // proveKinds pins the pair to both-numeric or, for eq/ne, two
+                // heap-reference kinds. Heap identity is stable GcHeader.id, not
+                // process address (keyframe restore preserves the former only).
                 if (kinds[ins.a] == .float) {
                     try emitFloatCompare(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
+                } else if (kinds[ins.a] == .ptr or kinds[ins.a] == .heap) {
+                    try emitHeapCompare(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
                 } else {
                     try emitCompare(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
                 }

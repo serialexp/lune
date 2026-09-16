@@ -101,9 +101,13 @@ fn kindOf(op: IrOp) OpKind {
         .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append => .guard,
         // Grid-cell guards (doc 14, Phase 8): the flattened-grid analogues of the
         // array guards. All side-effecting roots, never hoisted past the `gstore`
-        // they protect. `guard_grid`/`guard_stride` read the table (`a`);
-        // `guard_gcol`/`guard_gpresent` read the `gcell` address (`a`).
-        .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent => .guard,
+        // they protect. `guard_grid`/`guard_stride` read the table (`a`) and
+        // `guard_gpresent` reads the `gcell` address (`a`). `guard_gcol` ALSO
+        // carries the live column ref in `b` for native lowering, so it must use
+        // the ordered two-operand effect class below; treating it as unary left
+        // `b` unremapped after compaction (a repeated grid body exposed the
+        // resulting forward/wrong reference).
+        .guard_grid, .guard_stride, .guard_gpresent => .guard,
         // Hash-field structural guard (doc 11): the grow/rehash analogue of the array
         // guards. A side-effecting root, deduped by (op, href ref, count-aux); reads
         // the `href` (`a`). Never hoisted above the `hstore` it protects.
@@ -130,7 +134,7 @@ fn kindOf(op: IrOp) OpKind {
         .aref, .href, .uref => .aref,
         // Two-operand memory guard: effect root, never CSE/hoisted. Reuse
         // the ordered two-operand effect class, not unary guard dedup.
-        .guard_absent => .astore,
+        .guard_absent, .guard_gcol => .astore,
         // Grid-cell address chain (doc 14, Phase 8): `garow` (table+row → row base)
         // and `gcell` (row base+col → cell) are memory-address producers, same
         // canonical-to-self memory-op treatment as `aref` so a later `gstore` can't
@@ -958,6 +962,42 @@ test "tropt: an exact-duplicate guard is dropped (the earlier copy dominates)" {
     // Survivors: slot_load r0, guard_int, add, φ(r0), loop.
     try testing.expectEqual(@as(usize, 5), opt.instrs.len);
     try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .guard_int));
+}
+
+test "tropt: guard_gcol keeps and remaps its explicit column operand" {
+    // A repeated grid body exposed this latent optimizer bug by making it appear
+    // several times in one outer trace. `guard_gcol.b` is a real ref consumed
+    // by native lowering, not spare metadata. A dead op before the column makes
+    // compaction renumber it; classifying the guard as unary left the old index
+    // behind, producing a wrong/occasionally-forward ref at commit.
+    const gpa = testing.allocator;
+    const instrs = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0 table
+        .{ .op = .konst, .aux = 0 }, // %1 dead — forces ref compaction
+        .{ .op = .slot_load, .aux = 1 }, // %2 row
+        .{ .op = .slot_load, .aux = 2 }, // %3 col
+        .{ .op = .garow, .a = 0, .b = 2 }, // %4
+        .{ .op = .gcell, .a = 4, .b = 3 }, // %5
+        .{ .op = .guard_gcol, .a = 5, .b = 3 }, // %6
+        .{ .op = .loop }, // %7
+    };
+    const consts = [_]Value{Value.int(99)};
+    var opt = try optimize(gpa, &instrs, &consts);
+    defer freeOpt(gpa, &opt);
+
+    try testing.expectEqual(@as(usize, 0), countOp(opt.instrs, .konst));
+    var checked = false;
+    for (opt.instrs) |ins| {
+        if (ins.op != .guard_gcol) continue;
+        try testing.expect(ins.a < opt.instrs.len);
+        try testing.expect(ins.b < opt.instrs.len);
+        try testing.expectEqual(IrOp.gcell, opt.instrs[ins.a].op);
+        try testing.expectEqual(IrOp.slot_load, opt.instrs[ins.b].op);
+        try testing.expectEqual(@as(i32, 2), opt.instrs[ins.b].aux);
+        try testing.expectEqual(ins.b, opt.instrs[ins.a].b);
+        checked = true;
+    }
+    try testing.expect(checked);
 }
 
 test "tropt: a guard_fits on a constant value uses laneFits (never the type-guard table)" {

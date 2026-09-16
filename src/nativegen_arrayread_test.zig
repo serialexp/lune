@@ -213,6 +213,85 @@ test "nativegen(Phase F): .value-lane array-of-structs int-field read matches th
     try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(@intCast(N + 5)), Value.int(0) });
 }
 
+test "nativegen: invariant heap identity compares stable IDs, not addresses" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var heap = @import("gc.zig").Heap.init(gpa);
+    defer heap.deinit();
+
+    const first = try heap.newTable();
+    const second = try heap.newTable();
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_table, .a = 0 },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .guard_table, .a = 2 },
+        .{ .op = .ne, .a = 0, .b = 2, .ty = .boolean },
+        .{ .op = .guard_true, .a = 4 },
+        .{ .op = .link },
+    };
+    const tr = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+
+    try expectMatch(&tr, &.{ Value.heap(&first.header), Value.heap(&second.header) });
+    try expectMatch(&tr, &.{ Value.heap(&first.header), Value.heap(&first.header) });
+
+    // Keyframe restore preserves IDs while rebuilding objects at new addresses.
+    // The invariant-pointer path must therefore use the same identity rule as
+    // Value.eql and the IR interpreter.
+    second.header.id = first.header.id;
+    try testing.expect(@intFromPtr(&first.header) != @intFromPtr(&second.header));
+    try expectMatch(&tr, &.{ Value.heap(&first.header), Value.heap(&second.header) });
+}
+
+test "nativegen: value-lane heap identity compares stable IDs, not addresses" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var heap = @import("gc.zig").Heap.init(gpa);
+    defer heap.deinit();
+
+    const first = try heap.newTable();
+    const second = try heap.newTable();
+    const container = try heap.newTable();
+    try container.set(gpa, Value.int(1), Value.heap(&first.header));
+    try container.set(gpa, Value.int(2), Value.heap(&second.header));
+    try testing.expectEqual(arr.Lane.value, container.array.lane);
+
+    const lane: i32 = VALUE_LANE;
+    var consts = [_]Value{ Value.int(1), Value.int(2) };
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_table, .a = 0 },
+        .{ .op = .guard_lane, .a = 0, .aux = lane },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane },
+        .{ .op = .guard_bounds, .a = 4 },
+        .{ .op = .aload, .a = 4, .aux = lane, .ty = .heap },
+        .{ .op = .guard_table, .a = 6 },
+        .{ .op = .konst, .aux = 1 },
+        .{ .op = .aref, .a = 0, .b = 8, .aux = lane },
+        .{ .op = .guard_bounds, .a = 9 },
+        .{ .op = .aload, .a = 9, .aux = lane, .ty = .heap },
+        .{ .op = .guard_table, .a = 11 },
+        .{ .op = .ne, .a = 6, .b = 11, .ty = .boolean },
+        .{ .op = .guard_true, .a = 13 },
+        .{ .op = .link },
+    };
+    const tr = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &.{}, .entry_guards = &.{} };
+    const regs = [_]Value{Value.heap(&container.header)};
+
+    // Distinct IDs pass `ne`; the same object in both cells fails it.
+    try expectMatch(&tr, &regs);
+    try container.set(gpa, Value.int(2), Value.heap(&first.header));
+    try expectMatch(&tr, &regs);
+
+    // A restored twin may occupy a different address but preserve the original
+    // stable ID. The oracle considers the pair equal, and native must agree.
+    try container.set(gpa, Value.int(2), Value.heap(&second.header));
+    second.header.id = first.header.id;
+    try testing.expect(@intFromPtr(&first.header) != @intFromPtr(&second.header));
+    try expectMatch(&tr, &regs);
+}
+
 test "nativegen(Phase F): .value-lane array-of-structs float-field read matches the interpreter" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;

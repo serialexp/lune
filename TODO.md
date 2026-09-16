@@ -2,6 +2,16 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Multi-loop trace roots need loop-done ownership
+
+- [ ] Before enabling any recorder path that can put guards from more than one
+      numeric loop in a single root trace, replace the current source-opcode-only
+      loop-done classifier with an owner-aware contract. The rejected doc 50
+      unrolling prototype showed that treating an inner `for_loop` exit as the
+      root's linked completion materializes the wrong live locals. Specify the
+      ownership representation first and update the synthetic replay fixtures,
+      which currently model loop-done by exit source alone.
+
 ## JIT coverage labels conflate traced and native execution (D12c baseline)
 
 - [ ] Audit `--jit-stats` native-cycle attribution for tier-1a fallbacks. The

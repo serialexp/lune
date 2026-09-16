@@ -514,14 +514,18 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 // EXACTLY (compareIntFloat, no rounding), so a cvtsi2sd-then-ucomisd
                 // lowering would diverge for ints not representable as f64. (Unlike F1
                 // arith, where the oracle promotes via toFloat — there cvtsi2sd matches.)
-                // Two ptr operands on eq/ne → pointer identity comparison (store-
-                // forwarding alias disambiguation). x86-64 lowers identically to int
-                // cmp — both are 64-bit register compares.
+                // Two heap-reference operands on eq/ne → stable object-identity
+                // comparison. `.ptr` is an invariant table and `.heap` is a
+                // per-iteration heap value (including value-lane table loads). The
+                // lowerer compares GcHeader.id, NOT addresses: restored twins may
+                // have different addresses while preserving language identity.
                 const ka = kinds[ins.a];
                 const kb = kinds[ins.b];
                 if ((ka == .int and kb == .int) or (ka == .float and kb == .float)) {
                     kinds[i] = .bool;
-                } else if ((ins.op == .eq or ins.op == .ne) and ka == .ptr and kb == .ptr) {
+                } else if ((ins.op == .eq or ins.op == .ne) and
+                    (ka == .ptr or ka == .heap) and (kb == .ptr or kb == .heap))
+                {
                     kinds[i] = .bool;
                 } else return false;
             },

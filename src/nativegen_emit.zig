@@ -338,6 +338,32 @@ pub fn emitCompare(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb:
     }
 }
 
+/// Lower heap-reference equality by stable `GcHeader.id`. Process-address
+/// equality is not mahina identity: keyframe restore deliberately rebuilds the
+/// graph at new addresses while preserving IDs. Both operand kinds (`.ptr` and
+/// `.heap`) hold a non-null raw `*GcHeader` in a GP home.
+pub fn emitHeapCompare(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Place) !void {
+    std.debug.assert(op == .eq or op == .ne);
+    try placeToReg(a, .rax, pa);
+    try a.movRegMem32(.rax, .rax, layout.GCHEADER_ID_OFF);
+    try placeToReg(a, .rcx, pb);
+    try a.movRegMem32(.rcx, .rcx, layout.GCHEADER_ID_OFF);
+    try a.cmpRegReg(.rax, .rcx);
+    const cc: x64.Cond = if (op == .eq) .e else .ne;
+    switch (dst) {
+        .reg => |R| {
+            try a.setcc(cc, R);
+            try a.movzxRegReg8(R, R);
+        },
+        .mem => |D| {
+            try a.setcc(cc, .rax);
+            try a.movzxRegReg8(.rax, .rax);
+            try a.movMemReg(.rsp, D, .rax);
+        },
+        .xmm => unreachable,
+    }
+}
+
 /// Lower a float comparison `dst = pa <cc> pb` (both operands proven `.float`; mixed
 /// int/float compares bail in proveKinds). Stages operands into xmm0/xmm1, runs
 /// `ucomisd`, and combines the NaN-aware flags into a clean 0/1 bool in rax, then to
