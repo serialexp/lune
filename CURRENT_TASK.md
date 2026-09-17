@@ -75,6 +75,69 @@ the ones that bite):
   before declaring it hard; "replay/determinism forbids it" only ever means
   *adapt* the mechanism (ids not addresses, deterministic counters).
 
+## Status 2026-09-17 (latest+18) — doc 51: nest diagnosis complete + Fix A (DOA alias guards) LANDED
+
+Ran the Astra-recommended layered diagnosis (doc 50 → **doc 51,
+`docs/design/51-nest-decomposition-diagnosis.md`** — full receipts there).
+Instruments committed: `bench/nest_probe.lua` (reduced advance:4-shaped
+variable-trip nest, faithfully reproduces nbody's jit-stats shape) and
+`bench/alias_doa.lua` (flat-loop minimal repro). Headlines:
+
+- **Layer 1/3 healthy**: inner root (`advance:19`) + continuation
+  (`advance:44 → link 19`) both commit, both directions armed
+  (`loop_done_linked` / `link_terminal`), 7,967 fused native transitions,
+  region minted `armable=true` (doc 47 Inc-B works on this shape). PLUS the
+  driver loop records a whole-call unrolled 616-instr trace via
+  `recForPrepLink`'s depth>0 record-through.
+- **F1 (the headline, general recorder defect, Rule #0.5)**: that driver
+  trace is DEAD ON ARRIVAL — `forwardPendingHashLoad`/`forwardPendingArrayLoad`
+  emit table-identity `ne`+`guard_true` alias-disambiguation WITHOUT
+  consulting record-time identity. In the nest, `bodies[j]` of outer i=1 IS
+  `bodies[i]` of outer i=2 (konst-pool dump proves k9=k14=2), so the guard
+  was false during its own recording → completed=0 every dispatch → 18
+  legacy strikes → `legacy_thrash` gate; the side trace has the same defect.
+  Reproduces in a FLAT loop (`t = {a, a}`; `bench/alias_doa.lua`) — any two
+  SSA paths to one table. Output stays correct; the cost is a hot loop
+  pinned to tier-0 + record/side/gate churn.
+- **F2 (structural gate)**: silent promotion requires a FULL 32-row
+  forced-yield ledger (`considerSilentPromotion`); a nest with outer trip 5
+  produces 8-row bursts ending in a natural deopt → candidates=0 forever →
+  the armed cycle pays ~1,064 cyc/replayLedger walk = 15.8% of the
+  instrument's run. Every short-outer nest (nbody included) is in this class.
+- **F3 (optimizer, general)**: `tropt` constant folds append pool slots with
+  NO value dedup and konsts have no value canonicalization (unopt pool 5
+  entries → opt pool 37, ~13 unique) — equal constants defeat CSE downstream
+  everywhere.
+- **Fix A LANDED** (same session, after codex review of doc 51 — thread
+  `01a0ac91-853c-7b03-b097-a6b7a5abba76`; two material corrections adopted:
+  the array arm combines table relation × key class since table identity ≠
+  cell identity, and the claimed F3→F1 CSE connection was false because
+  aref/aload are never CSE'd). `PendingStore` captures record-time table
+  OBJECT identity (header pointer, NOT GcHeader.id — raw test tables share
+  id 0; pointer never enters the IR, decision deterministic) + observed
+  astore index; observed-equal → forward + `guard_false` pin,
+  observed-distinct → today's honest `ne`+`guard_true`, `.may` keys
+  observed-equal → abort. Results: instrument driver loop 0 → 97.2% traced,
+  seam 15.8% → 1.5%, wall ~3.3×; flat repro 99.9% traced (was 0%, gated).
+  Board: no attributable movers (all >5% single-run diffs re-checked ×3
+  interleaved vs a `just shadow` pre-fix baseline — identical; sparse's +7%
+  vs yesterday exists pre-fix too and its traces have zero grid ops, so
+  cb47d95 is excluded as well: board drift). nbody unchanged (63.1 ms,
+  13.1×) — its driver loop aborts on `aliased_input get_upval` first (next
+  candidate #2 in the handoff list). Tests: 4 unit (bite-verified by
+  neutering) + expectProgram flat repro + expectTier0Equiv mini-nest.
+- **Fix B (konst canonicalization) and Fix C (short-burst promotion
+  evidence) remain outstanding in doc 51** — B is a general optimizer win,
+  C needs its own doc 47-grade design.
+- Dump improvement landed: `writeTrace` prints the konst pool.
+- Gates: full `just test` green; `zig build test -Djit-debug=true` green
+  (one unreproducible failure on its very first post-edit run — 5 seed
+  re-runs all green; noting for the record).
+- NB (Rule #1 confession): two bare `python3 bench/run.py` invocations
+  happened during noise-checking before switching to `just bench` — the
+  binary was verifiably the fresh ReleaseFast from the immediately-prior
+  `just bench`, and the numbers were re-taken via `just bench` anyway.
+
 ## Status 2026-09-16 (latest+17) — doc 50 Astra-review follow-ups landed; next arc = nest-decomposition diagnosis
 
 Codex Astra (gpt-6-astra) reviewed the doc 50 arc read-only. Verdicts and what

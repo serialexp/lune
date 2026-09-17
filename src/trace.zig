@@ -3849,6 +3849,17 @@ pub fn writeTrace(w: *io.Writer, t: *const Trace) io.Writer.Error!void {
     // split into `.input_cap`/`.frame_bounds`/`.too_deep` — hid which limit
     // fired; CURRENT_TASK LATEST-94).
     try w.print("]  inputs={d}/{d}\n", .{ t.code.inputs.len, MAX_TRACE_INPUTS });
+    // Konst pool values, so a dump can answer alias/identity questions about
+    // `konst kN` operands (e.g. "are these two aref indices the same value?")
+    // without a debugger. One line, only when the pool is non-empty.
+    if (t.code.consts.len != 0) {
+        try w.writeAll("  konsts:");
+        for (t.code.consts, 0..) |kv, ki| {
+            try w.print(" k{d}=", .{ki});
+            try io.writeValue(w, kv);
+        }
+        try w.writeAll("\n");
+    }
     for (t.code.instrs, 0..) |ins, i| {
         try w.print("  %{d:0>3}  ", .{i});
         try writeIrInstr(w, ins);

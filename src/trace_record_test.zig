@@ -756,6 +756,146 @@ test "post-store array load with ambiguous key emits runtime ne disambiguation g
     try testing.expect(saw_ne);
 }
 
+test "doc 51 F1: array load via a second SSA ref to the OBSERVED-SAME table forwards behind guard_false" {
+    // Two register slots hold the SAME table (`t[1]`/`t[2]` both = a, the flat
+    // alias_doa shape): the load's table ref differs from the sunk store's, but
+    // record-time object identity proves they alias. Pre-fix the recorder
+    // emitted `ne` + `guard_true` — false during its own recording, a trace
+    // that completed 0 iterations forever (the F1 turnstile). Now: konst keys
+    // classify `.must`, the identity is pinned with `ne` + `guard_false`, and
+    // the pending value forwards.
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 1;
+    while (i <= 16) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "same_tab_two_refs", .num_registers = 6 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    // r1 AND r2 hold the same table; r3 = konst key; r4 = value.
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.heap(&t.header), Value.int(3), Value.boolean(true), Value.nil() };
+    state.recordInstr(.{ .op = .load_int, .a = 3, .aux = 3 }, winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 3), winRO(&regs), &proto, 0, Value.nil()); // read via r1 (RMW trigger)
+    state.recordInstr(Instr.opABC(.set_index, 1, 3, 4), winRO(&regs), &proto, 0, Value.nil()); // sinks
+    try testing.expectEqual(@as(usize, 1), state.rec.pending_stores.items.len);
+    const pending_val = state.rec.pending_stores.items[0].value;
+
+    state.recordInstr(Instr.opABC(.get_index, 0, 2, 3), winRO(&regs), &proto, 0, Value.nil()); // read via r2
+    try testing.expect(state.isRecording());
+    // Forwarded, not re-loaded: r0 now holds the pending store's value ref.
+    try testing.expectEqual(pending_val, state.rec.reg_map[0].ref);
+    var n_ne: usize = 0;
+    var n_gf: usize = 0;
+    var n_aload: usize = 0;
+    for (state.rec.instrs.items) |ins| {
+        if (ins.op == .ne) n_ne += 1;
+        if (ins.op == .guard_false) n_gf += 1;
+        if (ins.op == .aload) n_aload += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n_ne); // the identity pin
+    try testing.expectEqual(@as(usize, 1), n_gf); // guarded in the OBSERVED direction
+    try testing.expectEqual(@as(usize, 1), n_aload); // only the first read touched the heap
+}
+
+test "doc 51 F1: array load via a second ref to an OBSERVED-DIFFERENT table guards ne true and reads the heap" {
+    // The honest arm: two genuinely different tables — `ne` observed TRUE, so
+    // `guard_true` (as before the fix, but now proven honest at record time)
+    // and the load emits its own heap read.
+    const gpa = testing.allocator;
+    const t1 = try table_mod.Table.create(gpa);
+    defer t1.destroy(gpa);
+    const t2 = try table_mod.Table.create(gpa);
+    defer t2.destroy(gpa);
+    var i: i64 = 1;
+    while (i <= 16) : (i += 1) {
+        try t1.set(gpa, Value.int(i), Value.boolean(true));
+        try t2.set(gpa, Value.int(i), Value.boolean(true));
+    }
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "two_tabs", .num_registers = 6 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    var regs = [_]Value{ Value.nil(), Value.heap(&t1.header), Value.heap(&t2.header), Value.int(3), Value.boolean(true), Value.nil() };
+    state.recordInstr(.{ .op = .load_int, .a = 3, .aux = 3 }, winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 3), winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.set_index, 1, 3, 4), winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.get_index, 0, 2, 3), winRO(&regs), &proto, 0, Value.nil());
+    try testing.expect(state.isRecording());
+    var n_ne: usize = 0;
+    var n_gf: usize = 0;
+    var n_aload: usize = 0;
+    for (state.rec.instrs.items) |ins| {
+        if (ins.op == .ne) n_ne += 1;
+        if (ins.op == .guard_false) n_gf += 1;
+        if (ins.op == .aload) n_aload += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n_ne);
+    try testing.expectEqual(@as(usize, 0), n_gf); // no false-direction guard
+    try testing.expectEqual(@as(usize, 2), n_aload); // the second read hits the heap
+}
+
+test "doc 51 F1: loop-varying keys OBSERVED EQUAL on the observed-same table abort store_fwd_ambiguity" {
+    // Different table SSA refs to the same table, keys from two loop-input
+    // slots that happen to hold the SAME value at record time: `.may` with an
+    // observed collision. Forwarding would pin an unproven per-iteration
+    // relation (turnstile); guarding `ne` would be false at record time (DOA).
+    // The only sound move is the abort.
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 1;
+    while (i <= 16) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "collided_keys", .num_registers = 6 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    // r3 and r4 are unrelated loop inputs BOTH holding 3 right now.
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.heap(&t.header), Value.int(3), Value.int(3), Value.boolean(true) };
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 3), winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.set_index, 1, 3, 5), winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.get_index, 0, 2, 4), winRO(&regs), &proto, 0, Value.nil());
+    try testing.expect(!state.isRecording());
+    try testing.expectEqual(@as(?AbortReason, .store_fwd_ambiguity), state.rec.abort_reason);
+}
+
+test "doc 51 F1: loop-varying keys observed different on the observed-same table pin ONLY the key inequality" {
+    // Same table through two refs, `.may` keys observed 3 != 4: the key
+    // inequality guard alone suffices (a table-equality guard would
+    // over-specialize — if the tables differ at runtime the store can't touch
+    // the cell regardless, and a spurious key-collision exit is C1-sound).
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 1;
+    while (i <= 16) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "varying_keys", .num_registers = 6 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.heap(&t.header), Value.int(3), Value.int(4), Value.boolean(true) };
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 3), winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.set_index, 1, 3, 5), winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.get_index, 0, 2, 4), winRO(&regs), &proto, 0, Value.nil());
+    try testing.expect(state.isRecording());
+    var n_ne: usize = 0;
+    var n_gf: usize = 0;
+    for (state.rec.instrs.items) |ins| {
+        if (ins.op == .ne) n_ne += 1;
+        if (ins.op == .guard_false) n_gf += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n_ne); // the key guard, nothing else
+    try testing.expectEqual(@as(usize, 0), n_gf);
+}
+
 test "recArraySet sinks a read-steered const store (control channel) instead of aborting" {
     // `if t[i] then t[i]=false else t[i]=true end`: a guard on a read picks the
     // branch, so even a *constant* store could replay differently after a deopt.

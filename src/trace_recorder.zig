@@ -395,6 +395,21 @@ pub const PendingStore = struct {
     value: Ref,
     lane_ord: i32,
     op: IrOp = .astore,
+    /// Record-time identity of the stored-to table (doc 51 Fix A): the
+    /// observed truth that decides which DIRECTION the alias-disambiguation
+    /// guard specializes to. Object identity (the header pointer), NOT
+    /// `GcHeader.id` — raw test-created tables share id 0, which would make
+    /// distinct tables falsely compare equal and forward wrongly. The
+    /// pointer never enters the trace IR; it only picks between two guard
+    /// emissions, and that choice is deterministic because object identity
+    /// is replay-stable (same precedent as `konstKey`'s heap lookup). Null
+    /// for non-table stores (`ustore`/`sgm_setpos`), which never reach the
+    /// identity arms.
+    tab_obj: ?*const object.GcHeader = null,
+    /// Record-time integer index of an `astore` (doc 51 Fix A) — the
+    /// observed truth for the loop-varying (`.may`) key arm. Unused for
+    /// other store ops.
+    key_idx: i64 = 0,
 };
 
 pub const AliasClass = enum { must, no, may };
@@ -1881,7 +1896,7 @@ pub const RecordingSession = struct {
             self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
             try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
             const rkey = try self.keyRefNarrowed(f.key, f.key_od, vkey);
-            if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, idx)) return;
+            if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, idx, vtab.asHeap())) return;
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
             self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
             // No guard_present: the `.value` lane has no presence bitmap — nil is
@@ -1910,7 +1925,7 @@ pub const RecordingSession = struct {
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
         try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
         const rkey = try self.keyRefNarrowed(f.key, f.key_od, vkey);
-        if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, idx)) return;
+        if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, idx, vtab.asHeap())) return;
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
         self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
         self.stampProv(try self.emit(.{ .op = .guard_present, .a = ref }), .present, .none, .neutral);
@@ -1919,13 +1934,21 @@ pub const RecordingSession = struct {
     }
 
     /// Resolve an array load against the recorder's deferred-store buffer using
-    /// LuaJIT's `aa_ahref` rule: forward only on a statically must-alias key, skip
-    /// only on a statically no-alias key, and abort on ambiguity. In particular we
-    /// never guard the record-time equality of two loop-varying keys — that pins an
-    /// incidental per-iteration relation and makes a valid trace a turnstile.
+    /// LuaJIT's `aa_ahref` rule extended with RECORD-TIME TRUTH (doc 51 Fix A):
+    /// forward on a must-alias, skip on a proven no-alias, and — where static
+    /// analysis is ambiguous — specialize to the direction actually OBSERVED
+    /// during recording, guarded. A guard contrary to the observed state is a
+    /// dead-on-arrival trace (it fails on the very iteration that recorded it —
+    /// the F1 turnstile of doc 51), so the observed values decide the guard's
+    /// direction, never its necessity. Table identity alone is NOT cell
+    /// identity: the decision combines the observed table relation with the
+    /// static key class (the doc 51 matrix). The one deliberate abort:
+    /// loop-varying (`.may`) keys observed EQUAL — forwarding behind a key-
+    /// equality guard would pin an unproven per-iteration collision (the
+    /// turnstile the pre-existing policy warns against); proving such a
+    /// relation is `classifyArrayKeyAlias`'s job, not a record sample's.
     /// Walking newest-to-oldest preserves last-writer-wins.
-    pub fn forwardPendingArrayLoad(self: *RecordingSession, dst: u16, rtab: Ref, rkey: Ref, idx: i64) !bool {
-        _ = idx; // observed values never decide aliasing
+    pub fn forwardPendingArrayLoad(self: *RecordingSession, dst: u16, rtab: Ref, rkey: Ref, idx: i64, load_tab: *const object.GcHeader) !bool {
         var n = self.pending_stores.items.len;
         while (n > 0) {
             n -= 1;
@@ -1946,29 +1969,47 @@ pub const RecordingSession = struct {
             }
             const addr = self.instrs.items[ps.aref];
             std.debug.assert(addr.op == .aref);
-            if (addr.a != rtab) {
-                // Different table SSA refs — runtime pointer identity
-                // disambiguation. If the refs hold the same table at runtime,
-                // side-exit; otherwise the stores can't touch our cell.
+            const same_ref = addr.a == rtab;
+            const tables_observed_equal = same_ref or load_tab == ps.tab_obj;
+            if (!tables_observed_equal) {
+                // Observed-distinct tables: the honest specialization is
+                // "they differ" — guard it and ignore the keys entirely. If
+                // the refs collide on a later iteration, side-exit (sound in
+                // C1: no pending store has executed).
                 const cmp = try self.emit(.{ .op = .ne, .a = rtab, .b = addr.a, .ty = .boolean });
                 self.stampProv(try self.emit(.{ .op = .guard_true, .a = cmp }), .alias_disambig, .none, .neutral);
                 continue;
             }
             switch (self.classifyArrayKeyAlias(rkey, addr.b)) {
                 .must => {
+                    // Statically the same cell. Same SSA ref needs no guard;
+                    // different refs to the observed-same table pin the
+                    // identity (`ne` observed FALSE → guard_false).
+                    if (!same_ref) {
+                        const cmp = try self.emit(.{ .op = .ne, .a = rtab, .b = addr.a, .ty = .boolean });
+                        self.stampProv(try self.emit(.{ .op = .guard_false, .a = cmp }), .alias_disambig, .none, .neutral);
+                    }
                     self.setReg(dst, ps.value);
                     return true;
                 },
+                // Statically-distinct keys can't share a cell regardless of
+                // which table each ref holds — no guard needed.
                 .no => continue,
                 .may => {
-                    // Runtime key disambiguation: the load key must differ
-                    // from the sunk store's key. If they collide at runtime,
-                    // side-exit to tier-0. Otherwise the aload reads the
-                    // pre-store heap safely (the sunk store is below all
-                    // guards and hasn't executed yet).
-                    const cmp = try self.emit(.{ .op = .ne, .a = rkey, .b = addr.b, .ty = .boolean });
-                    self.stampProv(try self.emit(.{ .op = .guard_true, .a = cmp }), .alias_disambig, .none, .neutral);
-                    continue;
+                    if (idx != ps.key_idx) {
+                        // Loop-varying keys observed DIFFERENT: guard the key
+                        // inequality ONLY — adding a table-equality guard
+                        // would over-specialize (if the tables differ at
+                        // runtime the store can't touch our cell anyway, and
+                        // a spurious key-collision exit is C1-sound).
+                        const cmp = try self.emit(.{ .op = .ne, .a = rkey, .b = addr.b, .ty = .boolean });
+                        self.stampProv(try self.emit(.{ .op = .guard_true, .a = cmp }), .alias_disambig, .none, .neutral);
+                        continue;
+                    }
+                    // Loop-varying keys observed EQUAL: an unproven
+                    // collision — abort rather than pin it (see doc comment).
+                    self.abort(.store_fwd_ambiguity);
+                    return true;
                 },
             }
         }
@@ -1981,9 +2022,13 @@ pub const RecordingSession = struct {
     /// so key identity is exactly konst-ref equality — interning + `konst()`'s
     /// `(tag, bits)` dedup make equal content ⇔ the same ref. Walks newest→oldest
     /// (last-writer-wins; `commit()` flushes oldest→newest — the pair keeps
-    /// repeated same-cell stores exact). Returns `true` when the load was resolved
-    /// (value forwarded or recording aborted); `false` → caller emits the heap read.
-    pub fn forwardPendingHashLoad(self: *RecordingSession, dst: u16, rtab: Ref, rkey: Ref) !bool {
+    /// repeated same-cell stores exact). Same-key/different-table-ref cases
+    /// specialize to the RECORD-TIME table object identity (doc 51 Fix A): observed
+    /// equal → the store aliases this cell, forward its value behind an
+    /// identity guard; observed distinct → guard the inequality (honest) and
+    /// keep scanning. Returns `true` when the load was resolved (value
+    /// forwarded or recording aborted); `false` → caller emits the heap read.
+    pub fn forwardPendingHashLoad(self: *RecordingSession, dst: u16, rtab: Ref, rkey: Ref, load_tab: *const object.GcHeader) !bool {
         var n = self.pending_stores.items.len;
         while (n > 0) {
             n -= 1;
@@ -2015,9 +2060,23 @@ pub const RecordingSession = struct {
                 self.setReg(dst, ps.value);
                 return true;
             }
-            // Same key, unproven table identity — runtime pointer identity
-            // disambiguation. If the refs hold the same table at runtime,
-            // side-exit; otherwise the stores can't touch our cell.
+            // Same key, different table SSA refs — the record-time identity
+            // decides the specialization direction (doc 51 Fix A; guarding
+            // contrary to the observed state minted DOA turnstile traces).
+            if (load_tab == ps.tab_obj) {
+                // Observed the SAME table: the sunk store aliases this cell.
+                // Pin the identity (`ne` observed FALSE → guard_false) and
+                // forward the newest pending value — at record time tier-0
+                // has executed the store, so the observed loaded value IS
+                // the stored value; at native time the flush below all
+                // guards makes the same value visible.
+                const cmp = try self.emit(.{ .op = .ne, .a = rtab, .b = addr.a, .ty = .boolean });
+                self.stampProv(try self.emit(.{ .op = .guard_false, .a = cmp }), .alias_disambig, .none, .neutral);
+                self.setReg(dst, ps.value);
+                return true;
+            }
+            // Observed DISTINCT tables: guard the inequality (honest) and
+            // keep scanning — the store can't touch our cell.
             const cmp = try self.emit(.{ .op = .ne, .a = rtab, .b = addr.a, .ty = .boolean });
             self.stampProv(try self.emit(.{ .op = .guard_true, .a = cmp }), .alias_disambig, .none, .neutral);
             continue;
@@ -2280,6 +2339,8 @@ pub const RecordingSession = struct {
                 .aref = ref,
                 .value = rval,
                 .lane_ord = lane_ord,
+                .tab_obj = vtab.asHeap(),
+                .key_idx = idx,
             });
         } else {
             _ = try self.emit(.{ .op = .astore, .a = ref, .b = rval, .aux = lane_ord });
@@ -2557,8 +2618,8 @@ pub const RecordingSession = struct {
         // Pending mutations are not yet in the executor heap. The existing
         // forwarding paths either resolve them or refuse ambiguous aliases.
         if (key.isNumber()) {
-            if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, keyIndexOf(key).?)) return;
-        } else if (try self.forwardPendingHashLoad(f.dst, rtab, rkey)) return;
+            if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, keyIndexOf(key).?, regs.get(f.tab).asHeap())) return;
+        } else if (try self.forwardPendingHashLoad(f.dst, rtab, rkey, regs.get(f.tab).asHeap())) return;
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
         self.stampProv(try self.emit(.{ .op = .guard_absent, .a = rtab, .b = rkey }), .present, .loaded, .neutral);
         self.setReg(f.dst, try self.konst(Value.nil()));
@@ -2627,7 +2688,7 @@ pub const RecordingSession = struct {
         // side already emitted `guard_table`/`href`/`guard_hash`/`guardNum` on this
         // same table ref + key konst, so no chain is re-emitted here), NO keeps
         // scanning / falls through to the heap read, MAY aborts fail-closed.
-        if (try self.forwardPendingHashLoad(f.dst, rtab, rkey)) return;
+        if (try self.forwardPendingHashLoad(f.dst, rtab, rkey, vtab.asHeap())) return;
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
         // Seed the loop-invariant cell pointer for native (H1); `href.aux` carries
         // the synthetic slab slot, the hrefk `(slot, mask)` encoding for a
@@ -2777,6 +2838,7 @@ pub const RecordingSession = struct {
                 .value = rval,
                 .lane_ord = 0,
                 .op = .hstore,
+                .tab_obj = vtab.asHeap(),
             });
         } else {
             _ = try self.emit(.{ .op = .hstore, .a = ref, .b = rval });

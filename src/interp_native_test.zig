@@ -1809,3 +1809,54 @@ test "doc 39: a numeric-for anchor with the same transition does not peel" {
         \\print(x)
     , "17\n", .{ .inspect = &assertNoPeel });
 }
+
+test "doc 51 F1: aliased-table RMW loop (two SSA paths to one table) runs correctly across all tiers" {
+    // The flat alias_doa repro: `t[1]` and `t[2]` hold the SAME table, so the
+    // store via one path and the load via the other genuinely alias. Pre-fix
+    // the recorder emitted an alias-disambiguation guard contrary to the
+    // record-time state — a trace that completed 0 iterations forever (doc 51
+    // F1). The full matrix (incl. .record_execute_native) pins that the
+    // observed-equal forwarding path produces byte-identical output.
+    // acc = sum_{i=1..40} i = 820 (the load sees the just-stored value).
+    try expectProgram(
+        \\local a = { v = 0 }
+        \\local t = { a, a }
+        \\local acc = 0
+        \\for i = 1, 40 do
+        \\  t[1].v = t[1].v + 1
+        \\  acc = acc + t[2].v
+        \\end
+        \\print(acc)
+    , "820\n");
+}
+
+test "doc 51 F1: variable-trip numeric nest with cross-iteration table aliasing stays tier-equivalent" {
+    // A reduced bench/nest_probe.lua: outer `i`, inner `j = i+1..n`, where
+    // `bodies[j]` of one outer iteration IS `bodies[i]` of a later one — the
+    // cross-outer-iteration alias the unrolled driver trace must forward
+    // (observed-equal) or honestly guard (observed-distinct). Float output is
+    // tedious to spell; tier-0 equivalence is the oracle.
+    try expectTier0Equiv(
+        \\local n = 4
+        \\local bodies = {}
+        \\for i = 1, n do bodies[i] = { x = i * 1.0, v = 0.0 } end
+        \\local function advance(dt)
+        \\  for i = 1, n do
+        \\    local bi = bodies[i]
+        \\    local bx, bv = bi.x, bi.v
+        \\    for j = i + 1, n do
+        \\      local bj = bodies[j]
+        \\      local d = bx - bj.x
+        \\      bv = bv - d * dt
+        \\      bj.v = bj.v + d * dt
+        \\    end
+        \\    bi.v = bv
+        \\    bi.x = bx + dt * bv
+        \\  end
+        \\end
+        \\for k = 1, 30 do advance(0.001) end
+        \\local s = 0
+        \\for i = 1, n do s = s + i * bodies[i].x + (i * i) * bodies[i].v end
+        \\print(string.format("%0.9f", s))
+    );
+}
