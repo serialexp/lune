@@ -400,3 +400,50 @@ P0+P1 now on master; P2 (measurement) is the remaining doc 52 phase.
   benches (never-qualifying probe cost, unrelated-phase entry tax vs
   ≤-noise budget, alternating A/B cap saturation), sensitive boards
   (scimark-sparse, grid_matmul, scimark-lu), full board, tick doc 51 Fix C.
+
+## Status 2026-09-18 (latest+18) — task #36 (doc 52) CLOSED: P2 measurement — memset regression found+fixed, verdict ~break-even
+
+- **The P1 board regressions (+7% nbody, +26% scimark-fft) were NOT the
+  resident mechanism.** fft promotes nothing (silent counters all zero on
+  both binaries) and regressed anyway — that was the tell. `perf` showed
+  `compiler_rt.memset` at 19.9% of the fft run, called from
+  `driveDispatcherLedger`: the P1 `PROVENANCE_VERDICT_CAP` bump (48→64)
+  pushed `@sizeOf(NativeCallProvenance)` to 1032 bytes (0x408 — exactly
+  the memset size in the disassembly), which flipped the aggregate
+  `= .{}` init past the compiler's undef-elision threshold. Every one of
+  the 8 `var provenance: NativeCallProvenance = .{};` sites began
+  zeroing the whole 1 KiB struct; the hottest is once per dispatcher
+  walk (~1M/run fft, ~500k nbody). Base binary at CAP=48 (776 B): no
+  memset, just `len=0`.
+- **Fix (985110b)**: `var p: NativeCallProvenance = undefined; p.len = 0;`
+  at all 12 sites (8 hot + 4 test), via a Rule-#6 dry-run script;
+  struct field defaults REMOVED so `= .{}` is now a compile error, with
+  a comment naming the failure mode (same family as the by-value-return
+  memcpy already documented on captureNativeCallProvenance). Verified by
+  disassembly: zero 0x408 memsets remain in the binary. Gate green
+  (`just test` + boundaries check), zig fmt clean.
+- **Post-fix interleaved A/B (vs P0 df246a0 shadow, nm-verified)**:
+  fft 0.33–0.35 s vs base 0.34–0.36 (restored, even slightly better);
+  nbody residual +1–2% (median 0.63 vs 0.62). `--jit-stats` nbody split:
+  seam 1081→1050 cyc/walk (resident set saves −30: drain rollup + 1-row
+  suffix vs the 8-row frozen walk), native +24 cyc/walk (silent-epilogue
+  exact accounting replacing the cheap row write). **Verdict:
+  ~break-even** — my earlier "epilogue is ~57 cyc/firing fatter" claim
+  was mostly the memset in disguise.
+- **Full board (20260918-150154-985110b.tsv)**: everything in band —
+  fft 329.2 (band 322–340), nbody 62.8 (prior 62.1–62.4), lu 141.6,
+  sor 81.0, sparse 153.8, grid_matmul 25.1/25.0, pi_leibniz 36.8,
+  field_hash 13.0 (no probe tax on never-qualifying benches).
+- **Docs**: doc 52 status → complete, P2 bullet moved to Done as a
+  negative-result-on-payoff entry, payoff model gets a dated P2
+  correction (the pre-arc "~11.9k cyc/walk = 20.5% of run" figure was
+  wrong — the dormant region's walk was already frozen-cheap ~1.1k);
+  new deferred bullet: lean resident epilogue (shed part of the
+  measurement contract for barren-exempt edges — design question first).
+  Doc 51 Fix C ticked with the same verdict.
+- **Commits (local, NOT pushed)**: a247e84, df246a0 (P0), 5d9b5cf (P1),
+  985110b (memset fix), + this docs commit.
+- **Open question for Bart**: is the +1–2% nbody residual worth a
+  lean-epilogue design round, or do we accept break-even (the mechanism
+  is correct, tested, and self-contained) and move to the next campaign
+  gap?

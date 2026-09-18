@@ -1,6 +1,6 @@
 # Recurrence-resident silent promotion for short natural-terminal bursts — Design
 
-Status: partial — P0 (evidence detection) and P1 (resident promotion, mixed support) landed; P2 (measurement) outstanding
+Status: complete (P0–P2 landed; P2 verdict: mechanism sound, payoff ~break-even — see the P2 correction under the payoff model). Deferred: lean resident epilogue, multi-resident, signature relaxation, per-entry seed re-resolution
 Owner: Bart + agents
 Last updated: 2026-09-18
 
@@ -50,12 +50,24 @@ inside them is checked.
   (`trace_promotion_test.zig` "doc 52 P1: …"). Full gate battery green
   (`just test`, jit-debug battery, ReleaseFast build).
 
+- [x] **P2 — measurement (negative result on the payoff; mechanism
+  verified).** nbody `--jit-stats` before/after: promotion fires once,
+  stays resident, zero churn; seam −30 cyc/walk vs native +24 cyc/walk →
+  **~break-even, nbody +1–2% (edge of noise)** — the pre-arc "20.5% of
+  run in the walk" figure was wrong (actual ~1.1k cyc/walk, already
+  frozen-cheap). En route, found and fixed a compiler artifact of the P1
+  CAP bump — a 1 KiB memset per dispatcher walk from the
+  `NativeCallProvenance = .{}` init (+26% fft, most of the +7% nbody) —
+  in 985110b. Post-fix full board in band everywhere (fft 329.2,
+  nbody 62.8, lu 141.6, sor 81.0, sparse 153.8, grid_matmul 25.1);
+  never-qualifying benches show no probe tax. See the P2 correction under
+  the payoff model.
+
 ### Outstanding
-- [ ] **P2 — measurement.** nbody `--jit-stats` seam share before/after,
-  `perf` walk-share confirmation; adversarial benches: never-qualifying
-  short-drain probe cost, post-promotion unrelated-native-phase entry tax;
-  sensitive boards (scimark-sparse, grid_matmul, scimark-lu) unregressed;
-  full board; doc updates.
+- [ ] **Lean resident epilogue.** If the nbody residual (+1–2%) is worth
+  chasing: shed part of the measurement contract (firings/zero-run exact
+  accounting) for barren-exempt edges, keeping only what the drain's
+  credit split needs. Design question first — not built.
 - [ ] **Defer — multiple concurrent resident sets.** v1 caps at one; the
   price of lifting it is a further provenance-capacity re-argument
   (beyond the 2-set sizing v1 already carries) and the demotion notice
@@ -689,6 +701,53 @@ the set's cells. Expected recovery: most of the 20.5% walk share plus the
 row-write share, minus the rollup. The armed jumps themselves are already
 native and unchanged — and still pay the seed prologue per hop (out of
 scope, above).
+
+**P2 correction (2026-09-18): the model above was built on a wrong input,
+and the measured outcome is ~break-even, not a 20.5% recovery.** Kept per
+house rules so the stale reasoning stays visible; what P2 actually
+measured (nbody 500000, interleaved ReleaseFast A/B vs P0 HEAD~1, both
+`--jit-stats`):
+
+- **The pre-arc "~11.9k cyc/walk = 20.5% of run" figure was wrong.** The
+  dormant region's 8-row ledgers were already receipts-inert/frozen-cheap:
+  the real walk cost at the P0 baseline is **~1,081 cyc/walk** (540.6M cyc
+  = 17.3% of run for the whole steering seam, of which the walk is one
+  part). The 20.5% prize this doc was sized against does not exist; the
+  recoverable share was always the row-write + short-walk delta, a few
+  percent of the seam at best.
+- **The mechanism works exactly as designed**: rid=0 qualifies at 4/4,
+  promotes one 2-edge RESIDENT set, stays resident for the whole run, zero
+  churn (`--jit-debug` confirms one owner-resolve, one promotion, no
+  demotions).
+- **Measured economics, memset artifact removed (see below)**: seam
+  1,081 → 1,050 cyc/walk (−30 cyc/walk — the 8-row frozen walk becomes a
+  drain rollup + 1-row suffix); native +24 cyc/walk (silent-epilogue
+  exact accounting — cell/zero-run bookkeeping plus the 2-instruction
+  `barren_exempt` branch — replacing the cheap ledger-row write). Net:
+  **~break-even**; interleaved wall shows nbody at +1–2% of the P0
+  baseline, at the edge of the noise band (board best-of-5: 62.8 ms vs
+  62.1–62.4 prior).
+- **The +7% nbody / +26% scimark-fft wall regressions initially blamed on
+  this design were a compiler artifact, not the mechanism.** Raising
+  `PROVENANCE_VERDICT_CAP` 48 → 64 pushed `@sizeOf(NativeCallProvenance)`
+  to 1032 bytes, which flipped the aggregate `= .{}` init past the
+  undef-elision threshold: every dispatcher walk began paying a full
+  1 KiB zero memset (19.9% of the fft profile; fft promotes nothing and
+  regressed anyway, which is what exposed it). Fixed in 985110b
+  (`undefined` init + explicit `len = 0`; field defaults removed so
+  `.{}` is a compile error). Post-fix boards: fft 329.2 (band 322–340),
+  lu 141.6, sor 81.0, sparse 153.8, grid_matmul 25.1 — all in band.
+- **Adversarial cost is unmeasurable** on the full board: never-qualifying
+  benches (pi_leibniz 36.8, field_hash 13.0) show no probe/streak tax.
+
+The honest verdict for doc 51 Fix C: the seam this fix targeted was
+already an order of magnitude cheaper than diagnosed, and what the
+resident set saves on the walk it pays back in exact epilogue accounting.
+A future lever, if the residual matters: a **lean resident epilogue**
+(skip the firings/zero-run measurement contract for barren-exempt edges,
+keeping only what the drain's credit split needs) — a design question on
+how much of the measurement contract residency may shed, deliberately not
+built in this arc.
 
 ### Determinism
 

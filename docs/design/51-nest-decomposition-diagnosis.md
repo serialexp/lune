@@ -1,8 +1,9 @@
 # 51 — Variable-trip nest decomposition: layered diagnosis + DOA alias guards
 
-**Status:** diagnosis complete; Fix A (record-time truth) and Fix B (konst
-canonicalization) LANDED and green; Fix C + the optional statically-false
-guard backstop outstanding. Design reviewed by codex (gpt-5.6-sol, thread
+**Status:** diagnosis complete; Fix A (record-time truth), Fix B (konst
+canonicalization) and Fix C (doc 52 recurrence-resident promotion —
+mechanism landed, payoff ~break-even) done; only the optional
+statically-false guard backstop outstanding. Design reviewed by codex (gpt-5.6-sol, thread
 `01a0ac91-853c-7b03-b097-a6b7a5abba76`) — see "External review" for the two
 material corrections, both folded into the implemented matrix
 **Owner:** claude
@@ -73,10 +74,15 @@ material corrections, both folded into the implemented matrix
   candidate whose guard provably always fails on constants; would NOT have
   caught F1 (see review note). Not built with Fix B — needs its own
   justification.
-- [ ] **Fix C — silent-promotion evidence for short bursts (doc 47
-  follow-on).** Only if Bart wants it; the gate's cap-saturation requirement
-  is deliberate drain-pressure proof, and the review's lifecycle-ordering
-  questions must be answered first.
+- [x] **Fix C — silent-promotion evidence for short bursts (doc 47
+  follow-on).** Built as doc 52 (recurrence-resident promotion, P0–P2
+  landed through 985110b). Verdict: mechanism sound (nbody's 8-row cycle
+  promotes once and stays resident, zero churn), **payoff ~break-even** —
+  the "20.5% of run in the walk" figure this fix was sized against was
+  wrong (the dormant region's walk was already frozen-cheap, ~1.1k
+  cyc/walk); the −30 cyc/walk the resident set saves on the seam is paid
+  back as +24 cyc/walk of silent-epilogue exact accounting. See doc 52's
+  P2 correction for the numbers and the deferred lean-epilogue lever.
 
 ## Why this exists
 
