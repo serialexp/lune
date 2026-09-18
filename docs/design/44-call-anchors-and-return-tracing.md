@@ -313,7 +313,12 @@ to Done once everything inside a phase is checked.
       MUST either include safepoint/hook/replay polling in the native
       frame-push path or self-disable whenever those facilities are active
       (the tier-0 prologue services they'd otherwise skip). Done when the
-      seam is off the fib/binary-trees profile.
+      seam is off the fib/binary-trees profile. **Completion now OWNED BY
+      DOC 54** (inline native frame motion, codex-approved 2026-09-18):
+      the D11/D12c callout-based form measured ~1415 cycles/call
+      (fib 27.0× at 86% residency, `iters/native-entry ~0`); doc 54
+      replaces the callouts with inline sequences, removes rows from
+      row-free frame-motion episodes, and adds warm entries.
 - [ ] **Open question — trace stitching at un-inlinable calls.** LuaJIT's
       `trace_stop` `BC_CALL` case links the previous trace to a new one
       instead of aborting. Kills a whole abort class (`.too_deep`, vararg

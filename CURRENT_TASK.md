@@ -75,6 +75,44 @@ the ones that bite):
   before declaring it hard; "replay/determinism forbids it" only ever means
   *adapt* the mechanism (ids not addresses, deterministic counters).
 
+## Status 2026-09-18 (latest+21) — doc 54 DESIGN APPROVED (codex ×7): inline native frame motion — recursive-fib arc (task #43)
+
+Bart picked "whichever bench is currently weakest" → recursive-fib 27.0×
+(186.9 vs 6.9 ms, res 86.2%!), then "straight to C, no intermediates"
+(C = the full LuaJIT-parity mechanism; A = silent-promotion extension and
+B = helper slimming were the rejected intermediates).
+
+- **Diagnosis (Z-8 ladder, receipts in doc 54 "Why this exists")**:
+  100% traced, 0 seam, yet ~1415 cyc/iter vs LuaJIT ~9. (1) Frame-motion
+  links are barred from silent promotion (trace_link.zig:843, explicit
+  v1 exclusion) → every armed `.ret_cont`/`.call_head` hit writes a
+  ledger row → LEDGER_CAP(32) guillotines the episode every ~6 calls →
+  925k episode entries / 879k iterations, re-entry glue ≈32% of run.
+  (2) Push/pop are C-ABI callouts re-deriving compile-time/episode-
+  invariant preflight per call (+ full open-upvalue scan per pop) ≈28%.
+  (3) Seed callout + entry guards re-run per push via body_entry ≈8%.
+  Actual [JIT] code ≈18%.
+- **Doc 54 written and codex-APPROVED after 7 rounds** (thread
+  01a0b428…; ledger in-doc records every blocker: seed-image window
+  overlap, across-activation seed equality, positional
+  consumePushedDescent grammar, budget-cut row grammar, keyframe-restore
+  watermark, rows-first LEDGER_CAP retention, same-page-push row
+  semantics — my deviation from codex's prescription CONFIRMED in round
+  4 — bounded touched-slot drain, cross-page seed_epoch, epoch
+  saturation poison). Phases: P0 inline same-page push (+ static
+  eligibility, descent_ok gate), P1 inline pop + open_upvalue_ceiling
+  watermark, P2 row-free pure frame-motion episodes + descent budget +
+  bounded drain, P3 warm entries (page-owned stamped seed images).
+  Expectation: 186.9 → 70-90 ms; remainder = body codegen (later arc).
+- **Doc 44 Phase 4 bullet updated** — completion owned by doc 54.
+- **NEXT: implement P0** (nativegen terminal lowering: emit the inline
+  push; delete the head-page callout; sabotage-verified tests per the
+  doc's protocol; gates + fib/btrees bench per phase).
+- Session also: codex MCP outage root-caused (codex 0.154.0 removed
+  `mcp-server`; pinned 0.153.4 via bun, Bart restarted ccui; wrapper
+  TODO tracked by Bart) and docs 53 + 49 P5 codex reviews landed
+  (9a2ced2, both APPROVED).
+
 ## Status 2026-09-18 (latest+20) — doc 53: open-upvalue slot canonicalization — nbody 54.5 → 19.8 ms (4.5× LJ)
 
 Bart: "Is that 30% of time for nbody in tier-0? Lets try to work on that."
