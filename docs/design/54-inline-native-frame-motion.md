@@ -1,7 +1,7 @@
 # 54 — Inline native frame motion (recursion without callouts)
 
-**Status:** design approved (codex ×7 rounds, final verdict APPROVED) —
-not yet implemented; P0 next
+**Status:** partial — P0 landed (commits `3891fd1` + `3df7d53`); P1–P3
+outstanding. Design codex-approved ×7 rounds.
 **Owner:** claude (campaign: every benchmark ≤1.2× LuaJIT; weakest-bench arc)
 **Last updated:** 2026-09-18
 
@@ -9,16 +9,44 @@ not yet implemented; P0 next
 
 ### Done
 
-_(nothing yet)_
-
-### Outstanding
-
-- [ ] **P0 — static push eligibility + inline same-page push.** Commit-time
+- [x] **P0 — static push eligibility + inline same-page push.** Commit-time
   terminal-shape checks decide whether a push epilogue exists at all; the
   eligible head-page fast path is emitted inline (callee guard, walls,
   window init, frame write, tick, ctx refresh) with decline → plain
   terminal exit. The `nativeSelfCallPush` callout is deleted from the
-  head-page path.
+  head-page path. Implementation notes (discovered, per Mode-B duty):
+  - **Enablers the design missed** (commit `3891fd1`): (1) the step-6
+    field list omitted that `pushFrameVararg`'s struct literal ALSO
+    invalidates the doc-20 fetch-image cache — skipping it inline is a
+    real stale-image miscompile on frame-slot reuse, and `?u64` has no
+    machine-encodable layout, so `code_cache_gen` became a plain u64
+    with a `CODE_CACHE_GEN_INVALID = maxInt` sentinel (`cachedCodeFor`
+    refuses to hit or fill at the sentinel gen — fail closed, no wrap
+    panic); (2) `setRegionContext`'s "two field stores" were really an
+    optional-struct store — `RegionPolicy.region_context` split into
+    plain payload + `region_context_valid` byte behind
+    `regionContext()`/`setContext()`/`clearContext()` accessors;
+    (3) nativegen deliberately cannot import interp, so the `Vm`/
+    `CallFrame` offsets travel via `FrameMotionAbi`, comptime-derived in
+    `interp.zig` with pinned-width asserts and published through the
+    seed ctx next to the new `descent_ok` byte.
+  - **descent-gate sabotage is a unit matrix, not an integration run**:
+    a healthy single run can never observe `descent_ok = 0` — the
+    top-level epoch resets region receipts before any episode (verified:
+    a receipt planted before `run()` was epoch-wiped and 743 pushes
+    happened anyway). That unreachability IS the episode-invariance;
+    the publication matrix over `prepareNativeEpisode` breaks each
+    conjunct directly, and the emitted `cmp byte` consumer is pinned by
+    the helper-removed formation test.
+  - **P0 measurement** (interleaved A/B vs `a0e66ae` shadow, quiet
+    machine): recursive-fib ≈−5% wall, 27.2× → 25.2× LJ; binary-trees
+    flat at 9.8×. Small by design: `--jit-stats`/perf show ~60% of
+    fib's run cycles on the two CONT anchors, whose pushes stay on the
+    retained helper until P2 — `nativeSelfCallPush` remains in the
+    profile via that path only, exactly the protocol's P0 receipt.
+    Pushes = every call (7.05M at N=32 ≈ C(32)), pops ~88% of them.
+
+### Outstanding
 - [ ] **P1 — inline pop + open-upvalue ceiling.** The pop fast path emitted
   inline against the episode-structural invariants (each named, argued,
   and asserted); new VM-general `open_upvalue_ceiling` watermark replaces

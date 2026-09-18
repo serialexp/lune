@@ -75,6 +75,41 @@ the ones that bite):
   before declaring it hard; "replay/determinism forbids it" only ever means
   *adapt* the mechanism (ids not addresses, deterministic counters).
 
+## Status 2026-09-18 (latest+22) — doc 54 P0 LANDED: inline same-page push (recursive-fib arc, task #43)
+
+Commits `a0e66ae` (doc), `3891fd1` (enablers), `3df7d53` (emission + battery).
+Full `just test` + `-Djit-debug=true` gates green (one jit-debug flake,
+occurrence 7 — TODO.md — same seed passed 1411/1411 on direct rerun + 4 more
+clean gates; extra-scrutinized because fresh codegen was in the tree).
+
+**What landed (doc 54 "Implementation status → Done" has the full notes):**
+- Enablers: `code_cache_gen` `?u64`→u64 + `CODE_CACHE_GEN_INVALID` sentinel
+  (the inline frame write must replicate the struct-literal cache
+  invalidation — a design gap found at implementation);
+  `region_context` optional→payload+valid-byte split behind accessors;
+  `FrameMotionAbi` (comptime Vm/CallFrame offsets published via seed ctx —
+  nativegen can't import interp); `NativeSeedCtx.descent_ok` published per
+  episode by `prepareNativeEpisode`.
+- Emission: commit-time static push eligibility (ineligible pages emit NO
+  push epilogue); `emitInlineSelfPush` = the doc's 9-step sequence; head-page
+  `nativeSelfCallPush` callout DELETED (helper stays on cont pages until P2,
+  now also statically gated).
+- Battery: helper-removed inline formation test; frame_abi-null fail-closed
+  test; descent-gate publication matrix (unit-level — integration 0 is
+  unreachable by episode-invariance, verified: planted receipt epoch-wiped,
+  743 pushes anyway).
+
+**Measurement (interleaved A/B vs a0e66ae shadow, quiet machine):** fib
+≈−5% wall, 27.2×→25.2×; btrees flat 9.8×. Small as designed: ~60% of fib's
+cycles run on the two CONT anchors whose pushes keep the helper until P2.
+CAUTION for future benching: a parallel agent's Playwright run had the
+machine at load 20 for a while — early "302 vs 187 regression!" was pure
+cross-condition noise (LuaJIT itself drifted 6.9→10.1 ms). Always interleave
+A/B on this box.
+
+**NEXT: P1 (inline pop + open_upvalue_ceiling + check-jit-boundaries rule),
+then P2 (row-free armed frame motion + descent budget), P3 (warm entries).**
+
 ## Status 2026-09-18 (latest+21) — doc 54 DESIGN APPROVED (codex ×7): inline native frame motion — recursive-fib arc (task #43)
 
 Bart picked "whichever bench is currently weakest" → recursive-fib 27.0×
