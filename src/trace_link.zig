@@ -1580,9 +1580,13 @@ pub fn prepareSlotMutation(self: *TraceState, parent: *Trace, exit: u32, reason:
 }
 
 /// Phase 2 is infallible and occurs only after the caller's registry mutation.
-pub fn commitSlotMutation(self: *TraceState, prepared: PreparedSlotMutation, target: usize) void {
+/// `rowless_ok` is the P2-amendment per-slot gate value for this publication
+/// (one-shot→one-shot `.sibling_handoff` only); every disarm/retire passes
+/// `false`. See `NativePhysicalRegistry.commitSlotMutation` for the paired
+/// ordering contract.
+pub fn commitSlotMutation(self: *TraceState, prepared: PreparedSlotMutation, target: usize, rowless_ok: bool) void {
     defer self.syncNativeInvalidation();
-    self.registry.native_physical.commitSlotMutation(prepared, target);
+    self.registry.native_physical.commitSlotMutation(prepared, target, rowless_ok);
 }
 
 /// Arm a native link (P-E, doc 17 Increment 2.3): point `parent`'s frameless exit

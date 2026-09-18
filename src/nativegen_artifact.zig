@@ -133,9 +133,9 @@ pub const NativeResult = extern struct {
     /// round-robin that neither a repeated-parent ring nor two concurrently live
     /// promoted cycles obey.
     silent_last_cell: u64,
-    /// Doc 44 D11: count of successful native self-call frame pushes this run
-    /// (the `.terminal(self_call_interp)` push epilogue increments it after
-    /// `nativeSelfCallPush` returns PUSH_OK). At the ABI TAIL by the frozen-
+    /// Doc 44 D11 / doc 54: count of successful native self-call frame pushes
+    /// this run (the inline push sequence's step-9 witness increment — the
+    /// runtime helper is gone since doc 54 P2). At the ABI TAIL by the frozen-
     /// offset rule: every scalar field's `@offsetOf` is baked into exit stubs,
     /// so this may only ever be appended, never inserted. The wrapper inits it
     /// to 0 and marshals it into `ExecResult.pushed_frames`.
@@ -163,6 +163,49 @@ pub const NativeResult = extern struct {
     /// Zero-init; marshaled into `ExecResult.activation_base`/`_depth`.
     activation_base: u32,
     activation_depth: u32,
+    /// Doc 54 P2: the per-episode frame-motion transition budget — the
+    /// blackout bound for row-free frame-motion cycles (see
+    /// `trace_exec.DESCENT_BUDGET`). Appended at the ABI tail by the
+    /// frozen-offset rule; the wrapper inits it to the compile-time
+    /// constant. Every inline frame-motion sequence (push — same-page or
+    /// cont — and pop) runs `load; sub 1; js decline; store` at its TOP,
+    /// pre-mutation: at zero the sequence takes its ordinary decline path
+    /// (plain terminal exit, nothing mutated), which ends the episode, so
+    /// the value is never read again after a decline. Rows-mode armed
+    /// frame-motion jumps additionally keep `emitForcedYieldCheck`'s
+    /// `LEDGER_CAP` bound — the budget only SUBSTITUTES for the cap on the
+    /// row-free path. Not marshaled (scratch).
+    descent_budget: u32,
+    /// Doc 54 P2: 1 once the episode has taken a ROW-FREE cross-page
+    /// frame-motion transition. Set by the row-free `.ret_cont`/
+    /// `.call_head` hit paths only (same-page D11 pushes set nothing in
+    /// either mode); read by `emitForcedYieldCheck` at EVERY armed
+    /// non-frame dispatch site on every page — set ⇒ the arm is refused
+    /// (target rewritten to `shared_exit`, outcome stays `.normal`), so a
+    /// row-free episode's ledger is always empty-plus-final and the
+    /// positional grammar is never poisoned. Zero-init; marshaled into
+    /// `ExecResult.frame_motion_taken`.
+    ///
+    /// AMENDMENT (doc 54 P2 amendment, codex-approved): the refusal is no
+    /// longer blanket — an armed ORDINARY exit whose slot carries the
+    /// `slot_rowless_ok` gate (a `.sibling_handoff` arm between one-shot
+    /// pages) FOLLOWS rowlessly post-motion (budget-consumed,
+    /// counter-published, at most one hop between frame motions via
+    /// `sibling_hop_taken`). `emitForcedYieldCheck`'s motion branch
+    /// remains the refusal for everything else.
+    frame_motion_taken: u8,
+    /// Doc 54 P2 amendment: the sibling-hop progress bound — at most ONE
+    /// rowless sibling hop between committed frame motions. SET by every
+    /// rowless sibling follow (ordinary deopt tail fast path); CLEARED by
+    /// every COMMITTED frame-motion sequence (push, pop, row-free
+    /// `.ret_cont`/`.call_head` hop) at the committed-motion point, AFTER
+    /// the sequence's last declining check — a declined push/pop must not
+    /// clear it. A rowless follow is admitted only while this byte is
+    /// clear, so a zero-progress sibling cycle (A→B→A…) emits a normal
+    /// final deopt row after at most one hidden hop — the constant-work
+    /// bound that makes a 65,536-hop silent burn impossible. Zero-init
+    /// per episode; scratch (not marshaled).
+    sibling_hop_taken: u8,
 };
 
 /// Host-staged bounds/state for a native call that may enter a promoted silent
@@ -210,6 +253,54 @@ comptime {
     std.debug.assert(@offsetOf(NativeResult, "runtime_error") == @offsetOf(NativeResult, "snapshot_id") + @sizeOf(u32));
     std.debug.assert(@offsetOf(NativeResult, "activation_base") == @offsetOf(NativeResult, "runtime_error") + @sizeOf(u32));
     std.debug.assert(@offsetOf(NativeResult, "activation_depth") == @offsetOf(NativeResult, "activation_base") + @sizeOf(u32));
+    // Doc 54 P2: the budget dword + motion byte are appended after the
+    // precise-exit quad, same append-only rule.
+    std.debug.assert(@offsetOf(NativeResult, "descent_budget") == @offsetOf(NativeResult, "activation_depth") + @sizeOf(u32));
+    std.debug.assert(@offsetOf(NativeResult, "frame_motion_taken") == @offsetOf(NativeResult, "descent_budget") + @sizeOf(u32));
+    // Doc 54 P2 amendment: the sibling-hop byte is appended after the
+    // motion byte, same append-only rule.
+    std.debug.assert(@offsetOf(NativeResult, "sibling_hop_taken") == @offsetOf(NativeResult, "frame_motion_taken") + @sizeOf(u8));
+}
+
+/// Doc 54 P2: one per-slot hit-counter record — page-owned storage
+/// (allocated beside `ret_cont_keys`, one record per PHYSICAL SLOT in
+/// the same layout as `slots`: `instrs.len` ordinary exit cells
+/// (`.sibling_handoff`, doc 54 P2 amendment), then four `.ret_cont`
+/// cells, then the `.call_head` cell).
+/// A ROW-FREE armed hit bumps `count` inline instead of appending a
+/// ledger row; the dispatcher's episode-end drain reads the records
+/// back through the seed ctx's touched list. `gen` is the episode
+/// stamp: counts are meaningful only while `gen` equals the ctx's
+/// `episode_gen` — the first hit of an episode (gen mismatch) zeroes
+/// `count`, publishes the record to the touched list, and restamps, so
+/// a drain can never read lifetime-cumulative counts as episode
+/// counts. (`episode_gen` saturates at `maxInt(u64)` and saturation
+/// kills `descent_ok`, so a stale stamp can never falsely match a
+/// reused generation — the rollover discipline.) Extern layout:
+/// emitted code addresses the fields by byte offset (gen 0, count 8,
+/// owner_id 16, kind 20).
+pub const LinkHitCounter = extern struct {
+    gen: u64 = 0,
+    count: u64 = 0,
+    /// The owning trace's stable id (baked at compile) — the drain's
+    /// accounting key.
+    owner_id: u32 = 0,
+    /// `LinkHitKind` ordinal — which diagnostic counter the drained
+    /// count feeds.
+    kind: u32 = 0,
+};
+
+/// Doc 54 P2: which slot family a `LinkHitCounter` describes.
+/// `.sibling_handoff` (amendment) covers the ordinary exit slots — the
+/// only arm kind eligible for a rowless post-motion follow.
+pub const LinkHitKind = enum(u32) { ret_cont = 0, call_head = 1, sibling_handoff = 2 };
+
+comptime {
+    std.debug.assert(@offsetOf(LinkHitCounter, "gen") == 0);
+    std.debug.assert(@offsetOf(LinkHitCounter, "count") == 8);
+    std.debug.assert(@offsetOf(LinkHitCounter, "owner_id") == 16);
+    std.debug.assert(@offsetOf(LinkHitCounter, "kind") == 20);
+    std.debug.assert(@sizeOf(LinkHitCounter) == 24);
 }
 
 pub const SilentSummaryCell = extern struct {
@@ -333,6 +424,26 @@ pub const CompiledTrace = struct {
     /// Resume-PC keys parallel to the four trailing `.ret_cont` cells. A zero
     /// target means unarmed; keys are metadata, never executable addresses.
     ret_cont_keys: []u32 = &.{},
+    /// Doc 54 P2 (+amendment): per-slot row-free hit counters, parallel to
+    /// the FULL `slots` layout — `instrs.len` ordinary cells
+    /// (`.sibling_handoff`) then the five trailing physical link cells
+    /// (four `.ret_cont` records then the `.call_head` record). Allocated
+    /// beside `ret_cont_keys` on the frameless production path (empty
+    /// otherwise); the emitted row-free hit paths bake record addresses
+    /// (frame slots) or compute them from `exit_instr` (ordinary slots),
+    /// so the array address must be stable before `lower` runs. Owned;
+    /// freed in `deinit`.
+    link_hit_counters: []LinkHitCounter = &.{},
+    /// Doc 54 P2 amendment: the per-slot rowless-follow gate, parallel to
+    /// `slots` (full length, index parity; only ordinary cells are ever
+    /// set). 1 ⟺ the slot's arm is a `.sibling_handoff` between one-shot
+    /// pages — the only relation eligible for a rowless post-motion
+    /// follow. Published ONLY by `commitSlotMutation`'s paired commit
+    /// (arm: gate before target; disarm/refusing kind: target before gate
+    /// clear) under the single-runner model (slot mutation never runs
+    /// while a native episode executes in this VM). Owned; freed in
+    /// `deinit`.
+    slot_rowless_ok: []u8 = &.{},
     /// The allocator that owns `slots` (needed at `deinit`, which has no other handle
     /// to a gpa — the page frees itself through its own owner).
     gpa: std.mem.Allocator = undefined,
@@ -475,6 +586,14 @@ pub const CompiledTrace = struct {
             .runtime_error = 0,
             .activation_base = 0,
             .activation_depth = 0,
+            // Doc 54 P2: fresh transition budget + motion flag per episode.
+            // The wrapper is the replay-stable init point — every episode
+            // re-entry after a yield/bounce gets a full budget by
+            // construction.
+            .descent_budget = trace_exec.DESCENT_BUDGET,
+            .frame_motion_taken = 0,
+            // Doc 54 P2 amendment: fresh sibling-hop allowance per episode.
+            .sibling_hop_taken = 0,
         };
         if (self.trampoline_entry) |tramp| {
             const f: *const TrampolineFn = @ptrFromInt(tramp);
@@ -518,6 +637,13 @@ pub const CompiledTrace = struct {
             const n = result.ledger_len;
             std.debug.assert(n <= trace_exec.LEDGER_CAP);
             std.debug.assert(result.silent_active != 0 or n >= 1);
+            // Doc 54 P2: a row-free frame-motion episode implies real frame
+            // motion (the flag is set only on an armed cross-page hit, which
+            // a push/pop must precede) and an empty-plus-final ledger.
+            if (result.frame_motion_taken != 0) {
+                std.debug.assert(result.pushed_frames > 0);
+                std.debug.assert(n == 1);
+            }
             if (n != 0) {
                 std.debug.assert(result.ledger_cum[n - 1] == result.completed);
                 std.debug.assert(result.ledger_id[n - 1] == result.final_trace_id);
@@ -585,6 +711,7 @@ pub const CompiledTrace = struct {
             .runtime_error = result.runtime_error,
             .activation_base = result.activation_base,
             .activation_depth = result.activation_depth,
+            .frame_motion_taken = result.frame_motion_taken != 0,
         };
     }
 
@@ -599,6 +726,8 @@ pub const CompiledTrace = struct {
         self.page.deinit();
         if (self.slots.len > 0) self.gpa.free(self.slots);
         if (self.ret_cont_keys.len > 0) self.gpa.free(self.ret_cont_keys);
+        if (self.link_hit_counters.len > 0) self.gpa.free(self.link_hit_counters);
+        if (self.slot_rowless_ok.len > 0) self.gpa.free(self.slot_rowless_ok);
         if (self.exit_patches.len > 0) self.gpa.free(self.exit_patches);
         if (self.metadata_cells.len > 0) self.gpa.free(self.metadata_cells);
         self.* = undefined;

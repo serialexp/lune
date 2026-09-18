@@ -75,6 +75,119 @@ the ones that bite):
   before declaring it hard; "replay/determinism forbids it" only ever means
   *adapt* the mechanism (ids not addresses, deterministic counters).
 
+## Status 2026-09-19 (latest+25) — doc 54 P2 + AMENDMENT LANDED: fib 171.6→~81-87 ms, 24.7×→~10× LJ; episodes 925k→2.3k (task #43)
+
+**The latest+24 block below is resolved.** Bart chose "amend doc 54 + codex
+review"; the amendment (rowless armed non-frame transitions with one-shot
+targets post-motion) went through 3 codex rounds on the arc thread
+(`01a0b527-c784-7983-9fc6-16730a34f5d6`), verdict **APPROVED**, and is now
+implemented, gated, benched, and committed together with the held P2 tree.
+
+**What the amendment is** (full spec: doc 54 "### P2 amendment"): post-motion,
+an armed `.sibling_handoff` exit whose parent AND child are one-shot pages
+FOLLOWS its arm rowlessly instead of bouncing. Mechanisms as landed:
+- **Deopt-tail fast path** (`nativegen.zig`, before the `.deopt` row append):
+  single memory-staged target load → armed? → motion? → hop window free?
+  (`NativeResult.sibling_hop_taken`) → per-slot gate byte? → budget
+  dec-and-test → runtime record address (`counters_base + exit_instr*24`) →
+  `emitRowFreeHitPublishReg` (new register-record core) → mark hop → `jmp rax`.
+  EVERY decline falls into the unchanged rows tail (row + forced-yield bounce).
+- **One-hop window**: `sibling_hop_taken` set on a rowless follow, cleared
+  ONLY past the last declining check of the inline push/pop and at the two
+  row-free frame-hop sites — declined motion never clears, so a zero-progress
+  A→B→A cycle degenerates to the old refusal price (constant work, no hidden
+  budget burn).
+- **Per-slot gate** `CompiledTrace.slot_rowless_ok`, published only by
+  `commitSlotMutation`'s paired commit (arm: gate-before-target; disarm:
+  target-before-gate-clear; `rowlessOkFor` = sibling kind + both endpoints
+  non-loop; identical-rearm short-circuit asserts gate agreement).
+- **Counters** extended to `instrs.len + NATIVE_TRANSITION_SLOTS` (ordinary
+  cells first, kind `.sibling_handoff`); the totals drain validates sibling
+  records strongly (owner one-shot + compiled, address maps to a real
+  ordinary cell) and feeds the new `sibling_link_hits` witness (jit-stats
+  line "rowless sibling hits").
+- **Gen saturation**: `episode_gen` saturates at maxInt(u64) in
+  `prepareNativeEpisode` (advance-first), folded into `descent_ok` —
+  permanent fail-closed disable instead of the rejected skip-0 wrap.
+
+**Receipts** (fib 31 `--jit-stats`, ReleaseFast, load ~9): pushes 4.36M,
+pops 4.35M (vs 32 blocked / 3.63M at P1), ret-cont hits 4.35M, call-head
+2.18M, sibling hits 2.18M, trace entries **2,272** (925k at P1 — O(warmup)),
+native 99.3% of cycles, 0 fallback. Bench `just bench --filter recursive`:
+**87.3 ms, 10.3×** LJ (full-board run: 80.7 ms / 9.8×), res 99.5%.
+Interleaved A/B vs `/tmp/lune_pre_arc` shadow: fib 0.08s vs 0.22s wall
+(−2.6×), btrees neutral (~0.45s both). Full board: no regressions.
+
+**Gates**: `just test` green; `zig build test -Djit-debug=true` green
+(captured to /tmp/p2a_jitdebug_test.log). New battery: two-sibling
+adversarial cycle + three-sibling divergence (ten-leg, `hotguard=2`),
+gen-saturation unit pin (advance-first, saturate, dead gate, cleared
+touched), and the D12c tests' capacity-cut witness (structurally dead now —
+row-free chains never fill a positional ledger) replaced by
+`sibling_link_hits > 0` + `frame_link_cap_yields == 0`.
+
+**Next**: doc 54 P3 (warm entry for pushed frames — P3 wording already
+updated for the saturating gen: warm-image validation rejects
+`episode_gen == maxInt`). Then the post-arc measurement bullet (board +
+profile + btrees re-profile).
+
+## Status 2026-09-18 (latest+24) — doc 54 P2 IMPLEMENTED BUT BLOCKED: the two-mode grammar degenerates fib — design decision needed (task #43) [RESOLVED — see latest+25]
+
+**State: all P2 source work is in the tree, uncommitted; 1 test red
+(`ret pop formation`), and that red is a TRUE POSITIVE.** Do not land
+without resolving the design question below.
+
+**What's implemented** (compiles; boundary tool 21/21; the rest of
+`just test` green): descent budget (65,536) + `frame_motion_taken` ABI
+tail + runtime asserts; `LinkHitCounter` per transition slot
+(page-owned, gen-stamped, bounded touched-drain ≤64 in `NativeSeedCtx`
+— recorded deviation: ctx-owned, not NativeResult-tail, because
+runWithLinkedLoopDone has no ctx handle; init in `prepareNativeEpisode`,
+the per-episode funnel); `emitRowFreeHitPublish`; two-mode pop chain +
+cont-page push rebuilt on `emitInlineSelfPush` fall-through mode;
+`nativeSelfCallPush` DELETED (grammar constants retired, boundary
+allowlist shrunk, refusal-matrix test retired with a walls-map note);
+non-frame-arm refusal in `emitForcedYieldCheck`; `consumeMotionTotals`
+consumer (zero-work invariant asserted, A1 funnel on entered ct,
+per-owner accounting, shared `consumeDescentTerminalRow` extraction).
+
+**The finding (jit-debug stream + `--jit-stats`, fib 31 ReleaseFast):**
+the doc's P2 grammar self-destructs on branchy recursion. Chain:
+cont-push takes the row-free `.call_head` hop (empty ledger → motion
+byte set) → head page descends via same-page pushes → base case is an
+ARMED SIBLING HANDOFF = non-frame arm → refused (per round-4
+should-fix 4's blanket rule) → episode bounces → the unwind starts a
+NEW episode at the base/cont page where net=0 → the pop's net floor
+(soundness-critical, can't relax) declines EVERY pop → and with zero
+committed pops there are zero `.ret_pop` miss rows, so
+`noteRetContTransition` gets no evidence and ret-cont links NEVER ARM.
+Numbers: pushes 4.36M (fine), **pops 32 (P1: 3.63M)**, **ret-cont
+arms 0** (P1: armed+hit 5.65M), episodes **6.53M (P1: 925k — 7×
+worse)**; bench recursive-fib jit 391 ms vs t0 177 ms (P1: 171.6 ms).
+The doc's "one dispatcher bounce per non-frame transition — today's
+price" was wrong twice: pre-P2 the sibling hop was INTRA-episode (no
+bounce), and the bounce strands every downstream pop at net=0. fib —
+the arc's target — hits this on every leaf.
+
+**Why the end state needs rowless siblings**: the intended episode
+(cont push → head → pushes → base → pop → cont → …, one episode per
+budget window) only exists if the descent-bottom sibling hop stays
+in-episode. Post-motion it must not write a row (grammar) — so it must
+either be refused (implemented, degenerate) or go ROWLESS (design
+amendment: extend row-freedom to armed non-frame transitions when
+`frame_motion_taken` is set; sibling hop = same frame, no motion, no
+row; grammar stays empty-plus-final; consumers lose only per-handoff
+accounting/watch rows, post-formation). Formation stays sound under
+the amendment: early pops DO commit (sibling hop keeps net>0), their
+unarmed-chain misses write the final `.ret_pop` evidence rows, links
+arm, then steady state goes rowless. Options presented to Bart
+(awaiting direction): (1) amend doc 54 (rowless non-frame arms under
+motion, + drain/accounting story) + codex review round, then finish
+P2; (2) different fix he prefers; (3) park P2 (tree carries it
+uncommitted or reverted) and reconsider. jit-debug probe added to the
+formation test (permanent, comptime-free). Logs: /tmp/p2_dbg2.log,
+stats runs /tmp/p2_fib{20,27,31}.lua.
+
 ## Status 2026-09-18 (latest+23) — doc 54 P1 LANDED: inline pop + open-upvalue ceiling (recursive-fib arc, task #43)
 
 Commits `4084142` (enablers) + `aeddcac` (emission + battery + CI rule).

@@ -220,9 +220,19 @@ class BoundaryTests(TemporarySourceTest):
         # The allowlisted NAME in the wrong FILE still flags.
         self.write(
             "other.zig",
-            "fn nativeSelfCallPush(ctx: *const trace.NativeSeedCtx) callconv(.c) u64 {\n"
+            "fn nativeSeedFn(ctx: *const trace.NativeSeedCtx) callconv(.c) u64 {\n"
             "    return 0;\n"
             "}\n",
+        )
+        self.assertEqual(1, len(checker.check_boundaries(self.src)))
+
+    def test_deleted_push_helper_is_no_longer_allowlisted(self) -> None:
+        # Doc 54 P2 deleted `nativeSelfCallPush`; reintroducing an
+        # authority-bearing callout under that name must FLAG again even in
+        # interp.zig.
+        self.write(
+            "interp.zig",
+            "fn nativeSelfCallPush(ctx: *const trace.NativeSeedCtx) callconv(.c) u64 { return 0; }\n",
         )
         self.assertEqual(1, len(checker.check_boundaries(self.src)))
 
@@ -230,7 +240,6 @@ class BoundaryTests(TemporarySourceTest):
         self.write(
             "interp.zig",
             "fn nativeSeedFn(ctx: *const trace.NativeSeedCtx) callconv(.c) u64 { return 0; }\n"
-            "fn nativeSelfCallPush(ctx: *const trace.NativeSeedCtx) callconv(.c) u64 { return 0; }\n"
             "fn nativeFrameMotionAssert(ctx: *const trace.NativeSeedCtx, nreg: u64) callconv(.c) void {}\n",
         )
         self.assertEqual([], checker.check_boundaries(self.src))

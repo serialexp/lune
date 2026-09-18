@@ -956,7 +956,6 @@ pub const Vm = struct {
         try vm.trace.registry.createSeedContext(.{
             .seed_fn = &nativeSeedFn,
             .seed_tier1a_fn = &nativeSeedTier1aFn,
-            .self_call_push_fn = &nativeSelfCallPush,
             // Doc 54 P1: the structural-invariant assert callout exists only
             // in -Djit-debug builds; normal builds emit no callout at all.
             .frame_motion_assert_fn = if (@import("jitdbg.zig").enabled) &nativeFrameMotionAssert else null,
@@ -1323,96 +1322,14 @@ pub const Vm = struct {
             trace.NativeSeedCtx.SEED_HASH_DECLINE;
     }
 
-    /// Doc 44 D11: the C-ABI self-call frame-push twin of `opCall`'s
-    /// Lua-closure arm, installed once into `NativeSeedCtx.self_call_push_fn`
-    /// at VM init and called from a head page's `.terminal(self_call_interp)`
-    /// push epilogue (the caller window is already fully flushed, argument
-    /// registers included). P0 records NO callee pin at the self-call, so ALL
-    /// legality is re-derived here per push, fail-closed to PUSH_DECLINE with
-    /// nothing mutated — the page then runs its plain terminal exit and tier-0
-    /// re-executes the call generically (raising any error with intact frames).
-    ///
-    /// On PUSH_OK the helper has replicated the `.function` arm verbatim:
-    /// callee-window layout, the caller's one-past-call resume-cursor freeze
-    /// (what keeps `backtraceFrames`/`opRet`/mid-descent faults identical),
-    /// the REAL `pushFrameVararg` (frame struct, depth, stack_top, call_seq
-    /// stream, `setRegionContext` — byte-identical activation bookkeeping to
-    /// the tier-0 legs by construction), the episode-ctx refresh (so
-    /// per-activation seeds and `stubEnterable`'s freshness stamp describe the
-    /// pushed activation), and the shared call-entry tick (round 5 change 1 —
-    /// after success only, like tier-0). `onCallEntry`'s hasTrace/repatch body
-    /// is deliberately NOT re-run: the callee's head is the very trace we are
-    /// inside, and its patched image early-outs at the S1 opcode check anyway.
-    fn nativeSelfCallPush(
-        ctx: *const trace.NativeSeedCtx,
-        ct: *const trace.TraceCode,
-        terminal_aux: u64,
-    ) callconv(.c) u64 {
-        const self: *Vm = @ptrCast(@alignCast(ctx.vm));
-        const proto = ct.anchor.proto;
-        // Round 5 change 6: the record-time exclusions (recorder refusals) are
-        // DISTANT invariants; this is the fail-closed boundary, so re-verify
-        // them before any mutation.
-        if (terminal_aux >= proto.code.len) return trace.NativeSeedCtx.PUSH_DECLINE;
-        const instr = proto.code[@intCast(terminal_aux)];
-        if (instr.op != .call) return trace.NativeSeedCtx.PUSH_DECLINE;
-        if (instr.b == bytecode.all_results) return trace.NativeSeedCtx.PUSH_DECLINE;
-        if (proto.is_vararg) return trace.NativeSeedCtx.PUSH_DECLINE;
-        if (self.reg_top_pending) return trace.NativeSeedCtx.PUSH_DECLINE;
-        // Round 5 change 2: no descents while region receipts are live —
-        // `pushed_frames` is a total that cannot re-pair D10 handoff rows
-        // with their originating activation's region context. (Immutable for
-        // the whole native episode — nothing mutates region policy between
-        // pushes — so checking per push IS the per-episode check.)
-        if (!self.trace.region_policy.receiptsInert()) return trace.NativeSeedCtx.PUSH_DECLINE;
-        // The CURRENT top frame is the caller: `frames[]` is authoritative
-        // (the ctx was refreshed by the previous push, so `ctx.base` agrees —
-        // asserted, not trusted).
-        const caller = &self.frames[self.depth - 1];
-        const base = caller.base;
-        std.debug.assert(base == ctx.base);
-        // The ACTUAL callee value from the just-flushed caller window. A
-        // rebound name simply declines; closure IDENTITY is deliberately not
-        // required — a same-proto different-upvalue closure is safe because
-        // the pushed closure and refreshed ctx are the actual entering ones.
-        const a: usize = instr.a;
-        const callee = self.regGet(base + a);
-        if (!callee.isHeap() or callee.heapType() != .function) return trace.NativeSeedCtx.PUSH_DECLINE;
-        const cl = function.Closure.fromHeader(callee.asHeap());
-        if (cl.proto != proto) return trace.NativeSeedCtx.PUSH_DECLINE;
-        // The two `opCall` overflow walls — on refusal tier-0 re-runs the
-        // call and raises `StackOverflow` with intact frames.
-        if (self.depth >= max_call_depth) return trace.NativeSeedCtx.PUSH_DECLINE;
-        const nreg: usize = proto.num_registers;
-        const callee_base = base + nreg;
-        if (callee_base + nreg > self.regCapacity()) return trace.NativeSeedCtx.PUSH_DECLINE;
-        // opCall-verbatim window layout: bind fixed params (nil-fill any not
-        // supplied), nil the rest. Straight-line and allocation-free; the
-        // slots sit above `stack_top` until `pushFrameVararg` raises it.
-        // Surplus args on the (non-vararg, checked above) callee nil-fill
-        // exactly as `opCall` does — va cursor stays zero.
-        const nargs: usize = instr.b;
-        var j: usize = 0;
-        while (j < nreg) : (j += 1) {
-            self.regSet(callee_base + j, if (j < proto.num_params and j < nargs)
-                self.regGet(base + a + 1 + j)
-            else
-                Value.nil());
-        }
-        // Freeze the caller's one-past-call resume cursor, then the real push.
-        // The walls above make the push infallible; a hypothetical failure
-        // still declines cleanly (the cursor equals what tier-0's re-executed
-        // call would write, and the window writes are dead scratch).
-        caller.pc = @intCast(terminal_aux + 1);
-        self.pushFrameVararg(cl, callee_base, instr.a, instr.c, 0, 0) catch
-            return trace.NativeSeedCtx.PUSH_DECLINE;
-        // Refresh the episode ctx for the pushed activation and advance the
-        // shared call-entry tick — success only, like tier-0.
-        self.prepareNativeEpisode(cl, proto, callee_base);
-        self.trace.tickCallEntry();
-        self.trace.self_call_pushes +%= 1;
-        return trace.NativeSeedCtx.PUSH_OK;
-    }
+    // (Doc 44 D11's `nativeSelfCallPush` C-ABI push helper lived here until
+    // doc 54 P2 rebuilt its last caller — the continuation-page push
+    // epilogue — on the inline emitted sequence (`emitInlineSelfPush`) and
+    // deleted it. Every check it re-derived per push is now an emit-time
+    // static, the per-episode `descent_ok` byte, or an inline wall; its
+    // VM-state effect survives byte-for-byte in the emitted sequence, and
+    // its structural premises keep jit-debug asserts in
+    // `nativeFrameMotionAssert` below.)
 
     /// Doc 54 P1: the jit-debug-only structural-invariant assert for inline
     /// native frame motion, installed into
@@ -1462,14 +1379,38 @@ pub const Vm = struct {
         ctx.reg_capacity = self.regCapacity();
         ctx.proto = proto;
         ctx.call_seq = self.frames[self.depth - 1].call_seq;
-        // Doc 54 P0: the episode descent gate — all three conjuncts are
-        // episode-invariant (see `NativeSeedCtx.descent_ok`), so the byte
-        // published here holds for every inline push in the episode. Also
-        // recomputed on the helper-driven mid-episode refreshes (pop helper),
-        // where it cannot have changed — harmless and simpler than special-
-        // casing the call sites.
+        // Doc 54 P2: new episode → all row-free hit-counter records go cold
+        // (their `gen` no longer matches) and the touched drain list starts
+        // empty. This funnel is the episode-entry init point: every
+        // frame-motion-capable entry passes through here (the quiet and full
+        // head paths both prepare before running), and unprepared episodes
+        // (pure loop chains) have no frame-motion slots to publish with.
+        // Since doc 54 P2 deleted the push helper, nothing calls this
+        // mid-episode — the inline push refreshes closure/base/call_seq
+        // directly in emitted code and deliberately leaves gen/touched alone.
+        //
+        // Rollover discipline (amendment, codex round-2 blocker): the gen
+        // SATURATES at maxInt — skipping 0 would be insufficient because
+        // every nonzero generation is eventually reused, and an ancient
+        // record stamped `gen = k` would falsely match a reused
+        // `episode_gen = k`, silently skipping the counter reset/touched
+        // publication. Advance FIRST, then compute `descent_ok` from the
+        // resulting generation (codex round-3 pin), so the saturated state
+        // is self-consistent: at maxInt the descent gate is dead, no
+        // frame-motion sequence commits, `frame_motion_taken` never sets,
+        // and therefore no rowless follow or counter publication can occur
+        // ever again — permanent fail-closed disable at zero emitted-code
+        // cost. Gen 0 stays the permanent cold sentinel (records start
+        // there; the first prepared episode is gen 1).
+        if (ctx.episode_gen != std.math.maxInt(u64)) ctx.episode_gen += 1;
+        ctx.touched_len = 0;
+        // Doc 54 P0 (+P2 amendment conjunct): the episode descent gate —
+        // all conjuncts are episode-invariant (see
+        // `NativeSeedCtx.descent_ok`), so the byte published here holds for
+        // every inline push in the episode.
         ctx.descent_ok = @intFromBool(self.trace.region_policy.receiptsInert() and
-            !self.reg_top_pending and self.final_cut == null);
+            !self.reg_top_pending and self.final_cut == null and
+            ctx.episode_gen != std.math.maxInt(u64));
     }
 
     // ---- native / callValue boundary scratch --------------------------------
@@ -3227,15 +3168,21 @@ pub const Vm = struct {
     ) EntryDirective {
         const ts = &self.trace;
         std.debug.assert(result.pushed_frames > 0);
-        // D12c: the pop helper's net floor makes popped-without-pushed
+        // D12c: the pop sequence's net floor makes popped-without-pushed
         // structurally impossible; a violation means the emitted preflight
         // computed net from the wrong counters.
         std.debug.assert(result.popped_frames <= result.pushed_frames);
-        // The push helper refuses while region receipts are live, and heads
-        // never enter promoted silent cycles — a silent descent result means
-        // native ran a shape the registry never armed.
+        // The push sequence declines while region receipts are live (the
+        // `descent_ok` gate), and heads never enter promoted silent cycles —
+        // a silent descent result means native ran a shape the registry
+        // never armed.
         if (result.silent_active != 0) @panic("pushed descent: silent result");
         if (result.ledger_len == 0) @panic("pushed descent: empty ledger");
+        // Doc 54 P2: a row-free episode has NO positional grammar — zero
+        // intermediate rows, and a final row owned by the exiting page
+        // rather than the entered trace. Its accounting comes from the
+        // touched-slot drain instead.
+        if (result.frame_motion_taken) return self.consumeMotionTotals(ct, result, proto);
         const ledger = ts.ledger_scratch[0..result.ledger_len];
         if (ledger[0].id != ct.id) @panic("pushed descent: row 0 owner is not the entered trace");
         // Doc 44 D12a (A1): ONE evidence funnel per consumed descent, keyed on
@@ -3286,7 +3233,27 @@ pub const Vm = struct {
                 continue;
             }
             // TERMINAL row.
-            switch (row.kind) {
+            return self.consumeDescentTerminalRow(owner, row, result, ledger.len);
+        }
+        unreachable;
+    }
+
+    /// Doc 44 D11 / doc 54 P2: the shared TERMINAL-row disposition of a
+    /// pushed-descent episode — factored out of `consumePushedDescent`'s
+    /// positional walk so the row-free totals path (`consumeMotionTotals`)
+    /// dispatches the identical six-way grammar on its single final row.
+    /// `ledger_len` is the consumed ledger's length (always 1 on the totals
+    /// path, where the full-cap `.yielded` shapes are structurally
+    /// impossible and the caller has already rejected them).
+    fn consumeDescentTerminalRow(
+        self: *Vm,
+        owner: *trace.Trace,
+        row: trace_exec.LedgerEntry,
+        result: trace_exec.ExecResult,
+        ledger_len: usize,
+    ) EntryDirective {
+        const ts = &self.trace;
+        switch (row.kind) {
                 .head_terminal => {
                     // The descent's LAST activation refused a further push
                     // (depth/capacity wall, rebound callee, …) and ran the
@@ -3299,7 +3266,7 @@ pub const Vm = struct {
                     if (row.exit >= owner.code.instrs.len or owner.code.instrs[row.exit].op != .terminal)
                         @panic("pushed descent: head_terminal row does not name a terminal instr");
                     const term = owner.code.instrs[row.exit];
-                    ts.dbg("pushed-descent terminal: pushed={d} rows={d} final t={d} resume={d}", .{ result.pushed_frames, ledger.len, owner.id, term.aux });
+                    ts.dbg("pushed-descent terminal: pushed={d} rows={d} final t={d} resume={d}", .{ result.pushed_frames, ledger_len, owner.id, term.aux });
                     ts.onSideExitReceipt(owner, 1, row.exit, 1, .deferred, .entered);
                     // D12a: want retirement moved to the single funnel above
                     // (keyed on the ENTERED trace, round-6 change 5 — a second
@@ -3312,7 +3279,7 @@ pub const Vm = struct {
                     // top frame is the callee at pc 0. Record the deterministic
                     // arm request only here, after observing the actual push;
                     // the next selected head page supplies the child.
-                    if (row.outcome == .yielded and ledger.len != trace_exec.LEDGER_CAP)
+                    if (row.outcome == .yielded and ledger_len != trace_exec.LEDGER_CAP)
                         @panic("pushed descent: yielded call_push below full cap");
                     if (row.exit >= owner.code.instrs.len or owner.code.instrs[row.exit].op != .terminal)
                         @panic("pushed descent: final call_push does not name a terminal instr");
@@ -3356,12 +3323,12 @@ pub const Vm = struct {
                     // will later take this hop without leaving native). A
                     // DECLINED final pop appends `head_terminal` instead and
                     // takes the arm above (leaf re-executes its `ret`).
-                    if (row.outcome == .yielded and ledger.len != trace_exec.LEDGER_CAP)
+                    if (row.outcome == .yielded and ledger_len != trace_exec.LEDGER_CAP)
                         @panic("pushed descent: yielded ret_pop below full cap");
                     if (result.popped_frames == 0) @panic("pushed descent: ret_pop row without pops");
                     if (row.exit >= owner.code.instrs.len or owner.code.instrs[row.exit].op != .terminal)
                         @panic("pushed descent: ret_pop row does not name a terminal instr");
-                    ts.dbg("pushed-descent ret-pop: pushed={d} popped={d} rows={d} final t={d} resume={d}", .{ result.pushed_frames, result.popped_frames, ledger.len, owner.id, self.frames[self.depth - 1].pc });
+                    ts.dbg("pushed-descent ret-pop: pushed={d} popped={d} rows={d} final t={d} resume={d}", .{ result.pushed_frames, result.popped_frames, ledger_len, owner.id, self.frames[self.depth - 1].pc });
                     ts.onSideExitReceipt(owner, 1, row.exit, 1, .deferred, .entered);
                     const resume_pc: u32 = @intCast(self.frames[self.depth - 1].pc);
                     ts.noteRetContTransition(owner, resume_pc);
@@ -3373,7 +3340,7 @@ pub const Vm = struct {
                     // LEAF window coherent at pc 0 and the leaf's own walk
                     // owns the event's accounting on re-entry — charging it
                     // here too would double-count one semantic failure.
-                    if (row.outcome == .yielded and ledger.len != trace_exec.LEDGER_CAP)
+                    if (row.outcome == .yielded and ledger_len != trace_exec.LEDGER_CAP)
                         @panic("pushed descent: yielded row below full cap");
                     // Doc 44 D12a (A2): the final real-guard deopt happened IN
                     // the leaf activation — carry it as walk-local failer
@@ -3388,26 +3355,123 @@ pub const Vm = struct {
                             .call_seq = self.frames[self.depth - 1].call_seq,
                         };
                     }
-                    ts.dbg("pushed-descent deopt: pushed={d} rows={d} last t={d} exit={d} yielded={}", .{ result.pushed_frames, ledger.len, owner.id, row.exit, row.outcome == .yielded });
+                    ts.dbg("pushed-descent deopt: pushed={d} rows={d} last t={d} exit={d} yielded={}", .{ result.pushed_frames, ledger_len, owner.id, row.exit, row.outcome == .yielded });
                     return .{ .resume_frame_motion = trace.entryPc(owner.code.anchor.pc) };
                 },
                 .prologue_fail => {
                     // Arg types changed at some depth: the post-push re-entry
                     // refused before touching regs. Leaf walk owns it.
-                    ts.dbg("pushed-descent prologue-fail: pushed={d} rows={d} last t={d}", .{ result.pushed_frames, ledger.len, owner.id });
+                    ts.dbg("pushed-descent prologue-fail: pushed={d} rows={d} last t={d}", .{ result.pushed_frames, ledger_len, owner.id });
                     return .{ .resume_frame_motion = trace.entryPc(owner.code.anchor.pc) };
                 },
                 .seed_capacity_decline, .seed_hash_decline => {
                     // The post-push seed prologue declined. Both resume the
                     // leaf at pc 0 — the hash decline explicitly must not
                     // take the entry activation's scalar tier-1a rerun.
-                    ts.dbg("pushed-descent seed-decline: pushed={d} rows={d} last t={d} kind={s}", .{ result.pushed_frames, ledger.len, owner.id, @tagName(row.kind) });
+                    ts.dbg("pushed-descent seed-decline: pushed={d} rows={d} last t={d} kind={s}", .{ result.pushed_frames, ledger_len, owner.id, @tagName(row.kind) });
                     return .{ .resume_frame_motion = trace.entryPc(owner.code.anchor.pc) };
                 },
                 else => @panic("pushed descent: terminal row kind outside the head grammar"),
             }
+    }
+
+    /// Doc 54 P2: the row-free frame-motion consumer — the totals path of
+    /// `consumePushedDescent`. A row-free episode's ledger is always
+    /// empty-plus-final: zero intermediate rows (armed cross-page frame
+    /// hops were taken row-free while the ledger was empty; P2-amendment
+    /// rowless SIBLING hops — gate-approved one-shot→one-shot
+    /// `.sibling_handoff` follows, at most one per committed motion —
+    /// likewise; every other armed non-frame arm refused), and one final
+    /// row whose owner is the page performing the final exit — NOT the
+    /// entered trace. Entry
+    /// identity for the A1 funnel is therefore the dispatcher's own `ct`
+    /// (round-2 should-fix 6), and per-transition accounting comes from the
+    /// bounded touched-slot drain instead of positional rows.
+    fn consumeMotionTotals(
+        self: *Vm,
+        ct: *trace.Trace,
+        result: trace_exec.ExecResult,
+        proto: *const Proto,
+    ) EntryDirective {
+        const ts = &self.trace;
+        if (result.ledger_len != 1) @panic("motion totals: ledger must be empty-plus-final");
+        // Zero-work invariant (normative): one-shot frame pages never
+        // advance the rbx iteration counter, and a row-free episode can
+        // only ever run head/cont pages, so it commits zero back-edges.
+        // Drained transition counts are transition counts — never
+        // reinterpreted as completed iterations (`completed >= min_useful`
+        // feeds steering, so conflating them would corrupt qualification).
+        if (result.completed != 0) @panic("motion totals: nonzero iteration work in a frame-motion episode");
+        const row = ts.ledger_scratch[0];
+        const owner = ts.traceById(row.id) orelse @panic("motion totals: final row owner did not resolve");
+        if (owner.code.anchor.proto != proto) @panic("motion totals: final row owner proto mismatch");
+        if (trace.anchorKind(owner.code.anchor.pc) == .loop)
+            @panic("motion totals: loop owner in a frame-motion episode");
+        // A row-free episode's ledger holds at most this one row, so the
+        // forced-yield cap can never have fired; the motion-refusal
+        // redirect deliberately leaves outcome `.normal`.
+        if (row.outcome != .normal) @panic("motion totals: yielded final row in a row-free episode");
+        // Doc 44 D12a (A1) — verbatim the rows path's single evidence
+        // funnel, keyed on the ENTERED trace.
+        self.consumeHeadWalkFail(ct.id);
+        ts.noteHeadSiblingCompletion(.{ .proto = ct.code.anchor.proto, .pc = ct.code.anchor.pc }, ct.id);
+        // Bounded drain: walk the records this episode's row-free hits
+        // published — O(distinct slots touched), ≤ `TOUCHED_CAP`, never a
+        // registry scan (Rule #20). Per record, the drained count feeds the
+        // link-hit diagnostics; per distinct OWNER (deduped below),
+        // `accountTraceRun(owner, 0)` — zero work, the invariant asserted
+        // above — and `accountCandidateCharge(.entered)` once, preserving
+        // the rows path's one-shot intermediate semantics.
+        const ctx = ts.registry.native_seed_ctx orelse @panic("motion totals: no seed ctx");
+        std.debug.assert(ctx.touched_len >= 1 and ctx.touched_len <= trace.TOUCHED_CAP);
+        const touched = ctx.touched[0..ctx.touched_len];
+        for (touched, 0..) |addr, ti| {
+            const rec: *const nativegen.LinkHitCounter = @ptrFromInt(addr);
+            std.debug.assert(rec.gen == ctx.episode_gen);
+            std.debug.assert(rec.count > 0);
+            switch (@as(nativegen.LinkHitKind, @enumFromInt(rec.kind))) {
+                .ret_cont => ts.ret_cont_link_hits +|= rec.count,
+                .call_head => ts.call_head_link_hits +|= rec.count,
+                .sibling_handoff => {
+                    // P2 amendment: rowless sibling records validate STRONGLY
+                    // against the registry (immutable between episode start
+                    // and this drain — no arm/disarm can run while native
+                    // code executes). The record must be an ORDINARY cell of
+                    // a compiled ONE-SHOT owner's counter array; anything
+                    // else means a stray publication and is a bug.
+                    const rec_owner = ts.traceById(rec.owner_id) orelse
+                        @panic("motion totals: sibling record owner did not resolve");
+                    if (trace.anchorKind(rec_owner.code.anchor.pc) == .loop)
+                        @panic("motion totals: sibling record on a loop-page owner");
+                    const oc = switch (rec_owner.native) {
+                        .compiled => |*cc| cc,
+                        else => @panic("motion totals: sibling record owner not compiled"),
+                    };
+                    const base = @intFromPtr(oc.link_hit_counters.ptr);
+                    if (addr < base) @panic("motion totals: sibling record below owner counters");
+                    const off = addr - base;
+                    if (off % @sizeOf(nativegen.LinkHitCounter) != 0)
+                        @panic("motion totals: sibling record misaligned in owner counters");
+                    if (off / @sizeOf(nativegen.LinkHitCounter) >= rec_owner.code.instrs.len)
+                        @panic("motion totals: sibling record outside the ordinary cells");
+                    ts.sibling_link_hits +|= rec.count;
+                },
+            }
+            var seen = false;
+            for (touched[0..ti]) |prev_addr| {
+                const prev: *const nativegen.LinkHitCounter = @ptrFromInt(prev_addr);
+                if (prev.owner_id == rec.owner_id) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            const rec_owner = ts.traceById(rec.owner_id) orelse @panic("motion totals: drained owner did not resolve");
+            ts.accountTraceRun(rec_owner, 0);
+            trace.TraceState.accountCandidateCharge(rec_owner, .entered);
         }
-        unreachable;
+        ts.dbg("motion totals: pushed={d} popped={d} slots={d} final t={d} kind={s}", .{ result.pushed_frames, result.popped_frames, ctx.touched_len, owner.id, @tagName(row.kind) });
+        return self.consumeDescentTerminalRow(owner, row, result, 1);
     }
 
     /// Doc 44 D9: the quiet head episode — the full dispatcher episode

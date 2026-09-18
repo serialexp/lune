@@ -308,7 +308,9 @@ CALLOUT_AUTHORITY_TYPES = frozenset({"Vm", "NativeSeedCtx"})
 EPISODE_BOUNDARY_ALLOWLIST = frozenset(
     {
         ("interp.zig", "nativeSeedFn"),
-        ("interp.zig", "nativeSelfCallPush"),
+        # (doc 54 P2 deleted `nativeSelfCallPush` — frame motion is fully
+        # inline-emitted; the seed fn and the jit-debug assert callout are
+        # the only remaining authority-bearing boundary helpers.)
         ("interp.zig", "nativeFrameMotionAssert"),
     }
 )

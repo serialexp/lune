@@ -123,6 +123,7 @@ pub const anchorKind = trace_code.anchorKind;
 pub const entryPc = trace_code.entryPc;
 pub const contAnchorPc = trace_code.contAnchorPc;
 pub const NativeSeedCtx = trace_code.NativeSeedCtx;
+pub const TOUCHED_CAP = trace_code.TOUCHED_CAP;
 pub const FrameMotionAbi = trace_code.FrameMotionAbi;
 
 pub const Ref = trace_ir.Ref;
@@ -1241,8 +1242,8 @@ pub const TraceState = struct {
     /// heap equality alone cannot prove the raise took the precise path.
     /// No tiering path reads it.
     precise_errors: u64 = 0,
-    /// Doc 44 D11 diagnostic: successful native self-call frame pushes
-    /// (`nativeSelfCallPush` → PUSH_OK). Output equality alone cannot prove a
+    /// Doc 44 D11 diagnostic: successful native self-call frame pushes (the
+    /// inline push sequence). Output equality alone cannot prove a
     /// descent actually pushed (the plain-terminal turnstile is
     /// output-equivalent, just slower) — the formation test asserts on this
     /// witness. No tiering path reads it.
@@ -1255,6 +1256,10 @@ pub const TraceState = struct {
     ret_cont_link_hits: u64 = 0,
     call_head_link_arms: u64 = 0,
     call_head_link_hits: u64 = 0,
+    /// Doc 54 P2 amendment: rowless armed sibling-handoff follows drained
+    /// from the touched-slot records (one-shot→one-shot non-frame hops
+    /// taken without a ledger row). Diagnostic witness only.
+    sibling_link_hits: u64 = 0,
     /// Observation-only witness: full ledgers returning from frame-motion chains.
     frame_link_cap_yields: u64 = 0,
     /// 2.3b-1 (doc 17): count of `.link`-terminal slots actually armed in
@@ -3347,8 +3352,8 @@ pub const TraceState = struct {
     }
 
     /// Doc 44 D11: the unconditional "successful Lua entry" tick, shared by
-    /// `onCallEntry` (every tier-0 Lua-callee entry) and the native frame-push
-    /// helper (`nativeSelfCallPush`, one per successful push). Factored so the
+    /// `onCallEntry` (every tier-0 Lua-callee entry) and the native inline
+    /// push sequence (step 7's `incMemQword` twin, one per push). Factored so the
     /// gate-cooldown `tick` stream stays a pure function of the CALL stream on
     /// every leg — a native descent that pushed k frames advances the tick by
     /// exactly the k the tier-0 legs would (round 5 change 1). Tick only after
@@ -4023,6 +4028,7 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
     try w.print("    self-call pushes:     {d} (doc 44 D11 native descents)\n", .{ts.self_call_pushes});
     try w.print("    self-ret pops:        {d} (doc 44 D12c native unwinds)\n", .{ts.self_ret_pops});
     try w.print("    frame links:          ret-cont arms={d} hits={d}; call-head arms={d} hits={d}\n", .{ ts.ret_cont_link_arms, ts.ret_cont_link_hits, ts.call_head_link_arms, ts.call_head_link_hits });
+    try w.print("    rowless sibling hits: {d} (doc 54 P2 amendment hops)\n", .{ts.sibling_link_hits});
     try w.print("    link arms:            native={d} source={d} loopdone={d} bridge={d}\n", .{ ts.native_link_arms, ts.native_source_link_arms, ts.native_loopdone_link_arms, ts.native_region_bridge_arms });
     try w.print("    bridge arm attempts:  {d} (pipeline runs; vs {d} arms)\n", .{ ts.native_region_bridge_arm_attempts, ts.native_region_bridge_arms });
     try w.print("    link fused:           source={d} loopdone={d} bridge={d}\n", .{ ts.native_source_link_fused, ts.native_loopdone_link_fused, ts.native_region_bridge_fused });

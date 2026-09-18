@@ -216,6 +216,14 @@ pub const InputSeed = struct {
 /// `Proto` (interp.zig imports trace.zig, not vice versa); `seed_fn` (installed
 /// once by `Vm.initBare`, pointing at interp.zig's C-ABI seeding twin) casts
 /// them back.
+/// Doc 54 P2: capacity of the per-episode touched-slot drain list
+/// (`NativeSeedCtx.touched`). Bounded so the episode-end drain is
+/// O(distinct slots touched), never a global armed-link registry scan
+/// (Rule #20). A row-free hit whose first-of-episode publish would
+/// overflow the list DECLINES into its site's miss path instead — an
+/// ordinary final row + dispatcher bounce; the next episode drains fresh.
+pub const TOUCHED_CAP: usize = 64;
+
 pub const NativeSeedCtx = struct {
     /// `seed_fn` result grammar (u64 for C-ABI simplicity; doc 22 §B.2).
     pub const SEED_OK: u64 = 1;
@@ -226,23 +234,12 @@ pub const NativeSeedCtx = struct {
     /// nothing was written; the candidate itself is unusable at this depth.
     pub const SEED_CAPACITY_DECLINE: u64 = 3;
 
-    /// `self_call_push_fn` result grammar (doc 44 D11) — deliberately disjoint
-    /// from the seed values above so a wiring mistake (wrong fn baked) can
-    /// never read as the other grammar's success.
-    /// The helper pushed a real VM frame for the self-call and refreshed this
-    /// ctx for the new activation: the page shifts its lane pointers and
-    /// re-enters its own body.
-    pub const PUSH_OK: u64 = 16;
-    /// Any refusal (rebound callee, depth/capacity wall, live region
-    /// receipts, invariant re-verification failure): NOTHING was mutated;
-    /// the page runs its plain terminal exit and tier-0 re-executes the
-    /// call generically, raising any error itself.
-    pub const PUSH_DECLINE: u64 = 17;
-
-    // (Values 18/19 were the doc 44 D12c `self_ret_pop_fn` POP_OK/POP_DECLINE
-    // grammar; doc 54 P1 replaced the pop helper with the inline emitted
-    // sequence, so the C-ABI pop grammar is gone. The values stay reserved —
-    // never reuse them for a new grammar.)
+    // (Values 16/17 were the doc 44 D11 `self_call_push_fn` PUSH_OK/
+    // PUSH_DECLINE grammar — doc 54 P2 replaced the last helper-driven push
+    // path (cont pages) with the inline emitted sequence — and values 18/19
+    // were the doc 44 D12c `self_ret_pop_fn` POP_OK/POP_DECLINE grammar,
+    // replaced at doc 54 P1. All four stay reserved — never reuse them for
+    // a new grammar.)
 
     /// `*Vm`, valid for the prepared episode only.
     vm: *anyopaque = undefined,
@@ -281,16 +278,9 @@ pub const NativeSeedCtx = struct {
     /// Same tri-state result grammar. Optional so hand-built test ctxs that only
     /// exercise the C-ABI prologue keep compiling; consumers fail closed.
     seed_tier1a_fn: ?*const fn (ctx: *const NativeSeedCtx, t: *const TraceCode) u64 = null,
-    /// Doc 44 D11: the C-ABI self-call frame-push helper (interp.zig
-    /// `nativeSelfCallPush`), called from a head page's
-    /// `.terminal(self_call_interp)` push epilogue with the terminal's resume
-    /// pc (the `.call` bytecode index) baked as an imm64. Replicates `opCall`'s
-    /// Lua-closure arm verbatim (window layout + caller cursor freeze +
-    /// `pushFrameVararg`), refreshes THIS ctx for the pushed activation, and
-    /// returns PUSH_OK / PUSH_DECLINE. Installed once at VM init next to
-    /// `seed_fn`; optional so hand-built test ctxs keep compiling and
-    /// compilation falls back to the plain terminal when absent (fail closed).
-    self_call_push_fn: ?*const fn (ctx: *const NativeSeedCtx, t: *const TraceCode, terminal_aux: u64) callconv(.c) u64 = null,
+    // (Doc 44 D11's `self_call_push_fn` C-ABI push helper lived here until
+    // doc 54 P2 rebuilt the last helper-driven path — continuation-page
+    // pushes — on the inline emitted sequence and deleted the helper.)
     /// Doc 54 P1: the jit-debug-only structural-invariant assert callout
     /// (interp.zig `nativeFrameMotionAssert`). The inline pop drops the old
     /// helper's frame-identity re-verification because its premises are
@@ -317,6 +307,28 @@ pub const NativeSeedCtx = struct {
     /// hand-built test ctx) means compilation emits no inline push — the
     /// same fail-closed fallback as an absent helper fn.
     frame_abi: ?FrameMotionAbi = null,
+    /// Doc 54 P2: the episode generation stamp the row-free hit counters
+    /// compare against (`LinkHitCounter.gen`). Incremented by
+    /// `Vm.prepareNativeEpisode` — the per-episode funnel every
+    /// frame-motion entry passes through — so every episode makes all
+    /// counter records cold by construction and a drain can never read a
+    /// previous episode's counts. (Recorded deviation from doc 54 P2's
+    /// `runWithLinkedLoopDone` init sketch: the run wrapper has no ctx
+    /// handle — `CompiledTrace` deliberately does not carry the ctx — and
+    /// unprepared episodes (pure loop chains) cannot reach a frame-motion
+    /// slot, so the prepare funnel is the equivalent init point.)
+    episode_gen: u64 = 0,
+    /// Doc 54 P2: the bounded touched-slot drain list — raw addresses of
+    /// the `LinkHitCounter` records this episode's row-free hits published
+    /// (first hit per slot per episode publishes; `TOUCHED_CAP` bounds the
+    /// walk). `touched_len` is reset by `prepareNativeEpisode`; the array
+    /// contents above the length are dead. Same recorded deviation as
+    /// `episode_gen` (the doc sketched a `NativeResult`-tail array, which
+    /// would cost a per-episode marshal of the full array or signature
+    /// churn on every run wrapper; the ctx is per-VM, heap-stable, and
+    /// already the episode-scoped mutable surface the emitted code bakes).
+    touched_len: usize = 0,
+    touched: [TOUCHED_CAP]usize = @splat(0),
 };
 
 /// Doc 54 P0: every `Vm`/`CallFrame`-layout byte offset the inline native

@@ -2,6 +2,7 @@
 //! Arena is borrowed per transaction; records and published metadata stay stable.
 const std = @import("std");
 const nativegen = @import("nativegen.zig");
+const trace_code = @import("trace_code.zig");
 const Trace = @import("trace_record.zig").TraceRecord;
 const ExitKey = @import("trace_types.zig").ExitKey;
 const StructuralEdgeId = @import("trace_types.zig").StructuralEdgeId;
@@ -563,8 +564,38 @@ pub const NativePhysicalRegistry = struct {
             return error.DemotionDeferred;
         return .{ .compiled = compiled, .exit = exit };
     }
-    pub fn commitSlotMutation(_: *NativePhysicalRegistry, prepared: PreparedSlotMutation, target: usize) void {
-        prepared.compiled.slots[prepared.exit] = target;
+    /// Doc 54 P2 amendment: the paired slot+gate commit, order-pinned under
+    /// the single-runner model (slot mutation never runs while a native
+    /// episode executes in this VM — arm/disarm/retire are all runtime
+    /// code). `rowless_ok` is the per-slot rowless-follow gate: true only
+    /// for a `.sibling_handoff` arm between one-shot pages (the caller
+    /// classifies via `rowlessOkFor`). Ordering: an ARMING commit publishes
+    /// the gate BEFORE the target (an emitted reader that sees the new
+    /// target sees the right gate); a disarm/refusing commit publishes the
+    /// target BEFORE clearing the gate (a reader that sees gate=1 still
+    /// sees either the old eligible target or `shared_exit`, both sound —
+    /// `shared_exit` reads as unarmed and never follows).
+    pub fn commitSlotMutation(_: *NativePhysicalRegistry, prepared: PreparedSlotMutation, target: usize, rowless_ok: bool) void {
+        const c = prepared.compiled;
+        if (rowless_ok) {
+            if (prepared.exit < c.slot_rowless_ok.len) c.slot_rowless_ok[prepared.exit] = 1;
+            c.slots[prepared.exit] = target;
+        } else {
+            c.slots[prepared.exit] = target;
+            if (prepared.exit < c.slot_rowless_ok.len) c.slot_rowless_ok[prepared.exit] = 0;
+        }
+    }
+
+    /// Doc 54 P2 amendment: classify an arm relation for the rowless-follow
+    /// gate — eligible iff it is a `.sibling_handoff` between one-shot
+    /// (non-loop) pages. `.ret_cont`/`.call_head` keep their dedicated
+    /// frame-motion paths; every other kind is loop-page machinery and
+    /// stays gate-clear even when its child happens to be one-shot (the
+    /// zero-work proof rests on this publication boundary).
+    fn rowlessOkFor(kind: ArmKind, parent: *Trace, child: *Trace) bool {
+        return kind == .sibling_handoff and
+            trace_code.anchorKind(parent.code.anchor.pc) != .loop and
+            trace_code.anchorKind(child.code.anchor.pc) != .loop;
     }
     pub fn resetLinksTouching(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena, t: *Trace) void {
         if (self.replay_walk_depth != 0) @panic("resetLinksTouching during replay");
@@ -586,7 +617,7 @@ pub const NativePhysicalRegistry = struct {
                     .compiled => |*c| if (p < c.slots.len) {
                         const prepared = self.prepareSlotMutation(arena, link.parent, p, .retire) catch
                             @panic("resetLinksTouching: invalid native slot mutation");
-                        self.commitSlotMutation(prepared, shared_exit);
+                        self.commitSlotMutation(prepared, shared_exit, false);
                     },
                     else => {},
                 }
@@ -624,7 +655,7 @@ pub const NativePhysicalRegistry = struct {
                 .compiled => |*c| if (p < c.slots.len) {
                     const prepared = self.prepareSlotMutation(arena, link.parent, p, .disarm_all) catch
                         @panic("disarmAllLinks: invalid native slot mutation");
-                    self.commitSlotMutation(prepared, shared_exit);
+                    self.commitSlotMutation(prepared, shared_exit, false);
                 },
                 else => {},
             }
@@ -644,7 +675,7 @@ pub const NativePhysicalRegistry = struct {
             .compiled => |*c| if (p < c.slots.len) {
                 const prepared = self.prepareSlotMutation(arena, link.parent, p, .disarm_one) catch
                     @panic("disarmLinkAt: invalid native slot mutation");
-                self.commitSlotMutation(prepared, shared_exit);
+                self.commitSlotMutation(prepared, shared_exit, false);
             },
             else => {},
         }
@@ -844,6 +875,14 @@ pub const NativePhysicalRegistry = struct {
                         l.region_id = region_id;
                         l.armed_gen = armed_gen;
                     }
+                    // P2 amendment: the short-circuit skips `commitSlotMutation`,
+                    // so the published rowless gate byte must already agree with
+                    // the recomputed relation (this branch excludes
+                    // `.sibling_handoff`, so the relation is always false and
+                    // the gate must read 0). Assert instead of trusting it.
+                    if (physical_slot < c.slot_rowless_ok.len)
+                        std.debug.assert((c.slot_rowless_ok[physical_slot] != 0) ==
+                            rowlessOkFor(kind, parent, child));
                     self.dbg("arm (identical re-arm short-circuit): parent id={d} pc={d} slot={d} kind={s}", .{
                         parent.id, parent.code.anchor.pc, slot_index, @tagName(kind),
                     });
@@ -875,7 +914,7 @@ pub const NativePhysicalRegistry = struct {
                 l.armed_gen = armed_gen;
                 l.bridge_edge = null; // drop the replay memo with the old child
                 l.bridge_edge_gen = 0;
-                self.commitSlotMutation(prepared, target);
+                self.commitSlotMutation(prepared, target, rowlessOkFor(kind, parent, child));
                 self.dbg("arm (re-arm): parent id={d} pc={d} slot={d} -> child id={d} pc={d} kind={s}", .{
                     parent.id, parent.code.anchor.pc, slot_index, child.id, child.code.anchor.pc, @tagName(kind),
                 });
@@ -890,7 +929,7 @@ pub const NativePhysicalRegistry = struct {
         try self.armed_links.append(self.gpa, .{ .parent = parent, .slot_index = slot_index, .physical_slot = physical_slot, .child = child, .kind = kind, .region_id = region_id, .armed_gen = armed_gen });
         if (kind == .ret_cont) c.ret_cont_keys[physical_slot - ir_slots] = slot_index;
         if (self.armed_links.items.len > self.native_link_peak) self.native_link_peak = self.armed_links.items.len;
-        self.commitSlotMutation(prepared, target);
+        self.commitSlotMutation(prepared, target, rowlessOkFor(kind, parent, child));
         self.dbg("arm: parent id={d} pc={d} slot={d} -> child id={d} pc={d} kind={s}", .{
             parent.id, parent.code.anchor.pc, slot_index, child.id, child.code.anchor.pc, @tagName(kind),
         });

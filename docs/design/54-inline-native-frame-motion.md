@@ -1,10 +1,11 @@
 # 54 — Inline native frame motion (recursion without callouts)
 
 **Status:** partial — P0 landed (commits `3891fd1` + `3df7d53`), P1 landed
-(commits `4084142` + `aeddcac`); P2–P3 outstanding. Design codex-approved
-×7 rounds.
+(commits `4084142` + `aeddcac`), P2 + its amendment landed (fib 171.6 →
+~81-87 ms, 24.7× → ~10× LJ; episodes 925k → 2.3k); P3 outstanding. Base
+design codex-approved ×7 rounds; amendment codex-approved ×3 rounds.
 **Owner:** claude (campaign: every benchmark ≤1.2× LuaJIT; weakest-bench arc)
-**Last updated:** 2026-09-18
+**Last updated:** 2026-09-19
 
 ## Implementation status
 
@@ -102,13 +103,50 @@
     3.63M (83% unwind natively), 925k episode entries (~4.7
     pushes/entry — P2 wants O(warmup)), native 84.4% of cycles, seam ~0.
 
-### Outstanding
-- [ ] **P2 — row-free armed frame-motion transitions + descent poll
+- [x] **P2 — row-free armed frame-motion transitions + descent poll
   budget.** Armed `.ret_cont`/`.call_head` hits go row-free while the
   ledger is empty (rows-first episodes keep today's rows + cap;
   per-slot hit counters drain at episode end into the same accounting
   funnel); a deterministic per-episode transition budget
   replaces `LEDGER_CAP` as the blackout bound for frame-motion cycles.
+  Implemented as specced 2026-09-19, then HELD: the specced blanket
+  non-frame-arm refusal degenerated fib (pops 32 vs 3.63M; the failure
+  chain is recorded in the amendment section). Landed together with the
+  amendment below.
+- [x] **P2 amendment — rowless armed non-frame transitions (one-shot
+  targets) after frame motion.** Codex-approved ×3 rounds, implemented
+  2026-09-19. As landed: (1) the ordinary deopt shared tail loads the
+  memory-staged target ONCE and runs motion + hop-window + per-slot
+  gate + budget tests BEFORE the row append; every decline falls into
+  the unchanged rows tail (row appends as the final row, the forced-
+  yield motion branch bounces); (2) `NativeResult.sibling_hop_taken` —
+  at most one rowless sibling hop between committed frame motions,
+  cleared only past the LAST declining check of push/pop and at the two
+  row-free frame-hop sites (declined motion never clears — the
+  constant-work bound on zero-progress cycles); (3) per-slot
+  `CompiledTrace.slot_rowless_ok` gate published only by
+  `commitSlotMutation`'s paired commit (`rowlessOkFor`: `.sibling_
+  handoff` with non-loop parent AND child; the identical-rearm short-
+  circuit asserts gate agreement); (4) `link_hit_counters` extended to
+  `instrs.len + NATIVE_TRANSITION_SLOTS` (ordinary cells first, kind
+  `.sibling_handoff`; the deopt tail computes the record address at
+  runtime via a register-record `emitRowFreeHitPublishReg` core);
+  (5) `episode_gen` saturates at maxInt(u64), folded into `descent_ok`
+  (advance-first; unit-pinned); (6) the totals drain validates sibling
+  records strongly (owner one-shot + compiled, address maps to a real
+  ordinary cell) and feeds a `sibling_link_hits` witness. Battery: the
+  two-sibling adversarial cycle + three-sibling divergence ten-leg
+  tests, the gen-saturation unit pin, and the D12c witnesses moved from
+  the (now structurally dead) capacity-cut to the rowless sibling hop.
+  **Measurement** (fib 31 `--jit-stats`, load ~9): pushes 4.36M, pops
+  4.35M (99.9% unwind natively, vs 3.63M at P1 and 32 when blocked),
+  ret-cont hits 4.35M, call-head hits 2.18M, rowless sibling hits
+  2.18M, trace entries **2,272** (vs 925k at P1 — the O(warmup)
+  collapse), native 99.3% of cycles, 0 fallback. Bench: fib 80.7-87.3
+  ms ≈ **10× LJ** (171.6 ms / 24.7× at P1; interleaved A/B vs the
+  pre-arc shadow: fib −2.6× wall, btrees neutral), res 99.5%.
+
+### Outstanding
 - [ ] **P3 — warm entry for pushed frames.** Seed-stable pages skip the
   per-entry seed callout on push/pop re-entries (inline seed-slot
   materialization from the page-owned, generation+closure-stamped seed
@@ -456,6 +494,206 @@ dispatcher-service blackout for allocation-free recursion like fib.
 frame-motion rows in rows-first mode (round-3 blocker 1); only the
 row-free path substitutes the budget check for the cap check.
 
+### P2 amendment (2026-09-19, found at implementation): rowless armed non-frame transitions
+
+**The failure, measured.** P2 was implemented exactly as specced above
+(two-mode grammar, budget, counters, cont-push on the inline sequence,
+totals consumer, helper deletion — all in the tree, compiling, boundary
+tool green) and the specced grammar self-destructs on branchy recursion —
+fib, the arc's own target. The chain, verified from the jit-debug event
+stream (`ret pop formation` test, hotcall=4) and `--jit-stats` (fib 31,
+ReleaseFast):
+
+1. A cont push takes the row-free `.call_head` hop (empty ledger →
+   `frame_motion_taken` set).
+2. The head page descends via same-page pushes; the descent bottom (the
+   base case) is an ARMED SIBLING HANDOFF — a non-frame arm — which
+   round-4 should-fix 4's blanket rule REFUSES → final row, bounce.
+3. The unwind therefore starts a NEW episode at the base/cont page with
+   `net = 0`, so the pop's net floor — soundness-critical, the pop's
+   frame-identity proof derives from it, NOT relaxable — declines EVERY
+   pop.
+4. With zero committed pops there are zero `.ret_pop` miss rows, so
+   `noteRetContTransition` never gets evidence and ret-cont links NEVER
+   ARM. The degeneration is self-sustaining.
+
+fib 31: pushes 4.36M (healthy), **pops 32** (P1: 3.63M), **ret-cont
+arms 0** (P1: 5.65M hits), episodes **6.53M** (P1: 925k — 7× worse, the
+opposite of the O(warmup) goal); bench recursive-fib jit 391 ms vs
+tier-0 177 ms (P1: 171.6 ms). The round-4 claim "one dispatcher bounce
+per non-frame transition — today's price" was wrong on both halves:
+pre-P2 the sibling hop was INTRA-episode (rows mode, no bounce), and the
+bounce additionally strands every downstream pop at net=0. Silent
+promotion cannot rescue it: frame-motion links carry the v1 silent
+exclusion, and the failing run mints no region at all (zero
+region/silent events in the whole stream).
+
+**The amendment.** An armed non-frame transition whose target is a
+ONE-SHOT (non-loop) page FOLLOWS rowlessly after frame motion instead of
+refusing. The intended steady-state episode (cont push → head → pushes →
+base → pop → cont → …, one episode per budget window) exists exactly
+when the descent-bottom sibling hop stays in-episode; post-motion it
+must not write a row (the positional grammar), so it goes rowless under
+the same discipline as the frame hops:
+
+- **Emission restructure at ONE site: the ordinary deopt common tail**
+  (`nativegen.zig` ~2608; codex round-1 should-fix 3 — enumerate, don't
+  hand-wave "every armed-capable site"). The slot target is loaded ONCE
+  (the existing `exit_target` staging — round-1 should-fix 4: the
+  decision and the eventual `jmp` use the SAME loaded value, no reload
+  after the gate test, so the target/gate relation cannot tear) and the
+  motion + gate tests run BEFORE the deopt-row append (today the row is
+  appended first and `emitForcedYieldCheck` runs after). Cases:
+  unarmed → append the row (the episode's final row), bounce —
+  unchanged; armed + no motion → append the row, cap check, follow —
+  byte-identical to today; armed + motion + gate byte set + hop byte
+  clear → budget decrement-and-test (exhausted → the refusal shape:
+  append the row as final, then bounce — round-1 nit 1 wording), then
+  `emitRowFreeHitPublish` on the slot's counter record, set the hop
+  byte, `jmp`; armed + motion + (gate clear OR hop byte set) → refuse:
+  append the row as final, then bounce. The `.link` terminal
+  (`nativegen.zig` ~2064), linked loop-done (~2523), region bridge
+  (~2453 — dispatches directly, does NOT call `emitForcedYieldCheck`),
+  and silent epilogues (`nativegen_emit.zig` ~1239/~1377 — own direct
+  slot dispatch) are NOT restructured. Their post-motion safety is
+  STRUCTURAL UNREACHABILITY, not a refusal branch (round-2 should-fix
+  1 — the actual proof): frame motion begins on, and only ever
+  transfers among, one-shot pages (frame arms target head/cont entries;
+  rowless ordinary transitions are restricted to exact-anchor one-shot
+  sibling handoffs); one-shot traces contribute no region edges, so
+  their sibling exits cannot be silently promoted; and bridge/link/
+  loop-done/silent sources are loop-page machinery, which the one-shot
+  closure never reaches. The `.link`/loop-done sites DO run
+  `emitForcedYieldCheck`, whose motion branch refuses as
+  defense-in-depth, but the claim rests on the closure argument.
+  Exhaustive site list: ordinary deopt tail (restructured),
+  frame-motion sites (own P2 paths), link/loop-done (refusal
+  defense-in-depth, unreachable post-motion), bridge/silent (direct
+  dispatch, unreachable post-motion).
+- **Progress bound — at most ONE sibling hop between frame motions
+  (round-1 BLOCKER).** New `NativeResult` tail byte
+  `sibling_hop_taken`: init 0 per episode, SET by every rowless sibling
+  follow, CLEARED by every COMMITTED frame-motion sequence (push, pop,
+  row-free `.ret_cont`/`.call_head` hop) — the clear sits after the
+  sequence's last declining check, at the committed-motion point; a
+  DECLINED push/pop must not clear it (round-2 placement rule). A
+  rowless follow is admitted only while the byte is clear; a second
+  consecutive sibling hop without intervening frame motion refuses
+  (final row + bounce).
+  Consequences, in order of importance: (1) a zero-progress sibling
+  cycle (A→B→A…) cannot exist rowlessly — the second hop emits a
+  normal final deopt row and returns control to the existing
+  dispatcher walk after AT MOST ONE hidden hop. The guarantee is the
+  constant-work bound, no more (round-2 should-fix 2): the final row
+  does not encode "refused by the hop byte" and the drain does not
+  reconstruct the omitted adjacency, so no claim is made that
+  retirement is immediate — only that a 65,536-hop silent burn is
+  impossible and ordinary dispatcher selection/provenance logic
+  resumes at the bounce, every episode; (2) episodes with frame motion
+  between hops make real program progress by construction (each
+  push/pop advances the deterministic recursion tree — a "cycle"
+  through frame motion is the program genuinely recursing, terminated
+  by its own semantics or the depth/budget walls); (3) fib's
+  steady-state motion episodes need exactly one hop per descent
+  bottom (guard fail → base sibling → pop clears the byte) — admitted.
+  (A sibling hop BEFORE any frame motion — e.g. a base-entered episode
+  hopping to the descender before its first push — rides the existing
+  rows-first path untouched; the hop byte only gates POST-motion
+  follows — round-2 nit.) A legitimate three-sibling divergence chain
+  A→B→C pays a dispatcher boundary at the refused B→C hop; whether C
+  is entered next is the ordinary exact-anchor walk's decision in a
+  fresh episode — an accepted performance trade-off of the
+  conservative v1 bound, not a semantic cost. Battery: the adversarial
+  two-sibling zero-effect cycle test at the full boundary AND a
+  legitimate three-sibling divergence test (semantic equivalence + the
+  bounce stays bounded).
+- **Per-slot gate, published by arm kind AND both endpoints (round-1
+  should-fix 1).** The arm funnel (`trace_link.arm` →
+  `commitSlotMutation`) publishes a parallel per-slot byte
+  `slot_rowless_ok = (kind == .sibling_handoff and
+  parent.anchorKind != .loop and child.anchorKind != .loop)`.
+  `.ret_cont`/`.call_head` keep their dedicated frame-motion paths;
+  `.ordinary_guard`, `.link_terminal`, `.loop_done_linked`,
+  `.region_bridge` are gate-clear even when their child happens to be
+  one-shot — their materialization/accounting contracts are loop-page
+  machinery and the zero-work proof should rest on the publication
+  boundary, not an unstated reachability induction. Loop targets keep
+  refusing because completed iterations (rbx advance) need positional
+  row attribution for steering/qualification — this keeps the totals
+  consumer's zero-work invariant (`completed == 0`) assertable for
+  every rowless episode.
+- **Two-cell publication contract (round-1 should-fix 2).** Slot and
+  gate mutations happen only in runtime code (arm/disarm/retire), never
+  while a native episode executes in this VM — the single-runner model;
+  stated normatively, not assumed. The paired commit is order-pinned
+  anyway: arm publishes the gate byte BEFORE the target (rowless-ok:
+  gate 1 then target; refusing kind: gate 0 then target); disarm
+  publishes `shared_exit` BEFORE clearing the gate; re-arm re-classifies
+  the gate before the new target becomes executable. All disarm/global-
+  disarm/retire/re-arm paths go through the same paired funnel, and the
+  identical-rearm short-circuit (`trace_native_registry.zig` ~834)
+  asserts the existing gate agrees with the recomputed relation.
+- **Counters.** `link_hit_counters` extends from
+  `NATIVE_TRANSITION_SLOTS` to `instrs.len + NATIVE_TRANSITION_SLOTS`
+  (one record per ordinary exit slot; new kind named
+  `LinkHitKind.sibling_handoff` — round-1 nit 2, matching the only
+  eligible arm kind). Same gen-stamp + order-pinned publish + touched
+  drain; TOUCHED_CAP unchanged (overflow → decline into the refusal
+  shape). ~24 B/instr per compiled page — noise next to the code
+  itself. `episode_gen` gets an explicit fail-closed rollover
+  discipline (round-1 should-fix 6, corrected per round-2 blocker —
+  skipping 0 is insufficient because every NONZERO generation would
+  eventually be reused and an ancient `gen = k` record would falsely
+  match a reused `episode_gen = k`, silently skipping the counter
+  reset/touched publication): `episode_gen` SATURATES at
+  `maxInt(u64)` (`prepareNativeEpisode` stops incrementing there), and
+  the saturated value is folded into the descent gate —
+  `descent_ok = … and episode_gen != maxInt`. With `descent_ok = 0` no
+  frame-motion sequence commits, `frame_motion_taken` is never set, and
+  therefore no rowless follow and no counter publication can occur —
+  rowless machinery is permanently disabled for that VM after 2^64−1
+  episodes, at zero emitted-code cost (the emitted paths already
+  consult the descent byte). Gen 0 stays the permanent cold sentinel
+  (records start there; the first prepared episode is gen 1).
+- **Budget covers every rowless transition**, frame or not (one
+  decrement-and-test per follow — "pre-mutation" meaning before counter
+  publication, before marking/following the transition, and before the
+  jump, NOT before the exit's required VM-state materialization
+  (round-1 should-fix 5: carried-state flushes in the shared deopt
+  block happen whether the path follows or bounces)), so the
+  dispatcher-service blackout bound holds unconditionally without rows;
+  the budget stays a pure function of the deterministic transition
+  stream (arming, the motion byte, the hop byte, and the gate are all
+  deterministic), replay-stable, 8-mode-invisible.
+- **Consumer.** `consumeMotionTotals` is unchanged in shape; the drain
+  now also sees sibling-hop owners (same per-owner
+  `accountTraceRun(owner, 0)` + `.entered` charge; per-kind
+  diagnostics gain a sibling counter). Drained `sibling_handoff`
+  records are validated strongly (round-1 should-fix 7): owner is
+  one-shot, the record index maps to a real ordinary exit slot, kind
+  matches — and no live child lookup is needed because registry
+  mutation cannot happen between episode end and drain (dispatcher
+  consumes before any arm/disarm runs; documented at the drain). This
+  makes the `completed == 0` assert derived, not incidental. A rowless
+  sibling hop whose child ENTRY GUARDS fail deopts in the child → the
+  child owns the final row — same-anchor ⇒ same proto, so the totals
+  validation holds. Stale "frame pages only" comments at the totals
+  consumer and the `frame_motion_taken` ABI doc are updated (round-1
+  nit 3).
+- **Formation stays sound.** Warmup (nothing armed) and re-formation
+  (after a disarm/retire) episodes still run rows-first or take miss
+  paths, producing the `.call_push`/`.ret_pop`/deopt evidence rows that
+  arm links; once armed, steady state is fully rowless and
+  budget-bounded. Disarm reopens the evidence stream by construction
+  (unarmed slots take miss paths), and the progress bound guarantees
+  the degenerate shapes that WANT retiring keep emitting their bounce
+  evidence (point 1 of the progress bound) — the "disarm reopens
+  evidence" claim is no longer circular.
+
+Z-8 conformance: this extends the EXISTING slot/arm machinery under the
+grammar this doc already owns — no new ledger row kinds, no new
+mediation layer, no selection heuristics.
+
 ### P3 — warm entry for pushed frames
 
 Post-P0/P1/P2 the remaining per-transition toll is `body_entry` itself:
@@ -475,14 +713,17 @@ rewrote this).** Seed values are staged in PAGE-owned storage (like
 `ret_cont_keys`: allocated at commit, sized to the page's plan count) —
 one shared ctx image cannot serve an episode alternating over several
 head/cont pages. Each image carries a validity stamp: `(generation,
-closure)`. `NativeSeedCtx.episode_gen: u64` is incremented by the
-dispatcher's episode-entry funnel (`runWithLinkedLoopDone`, beside the
-fresh `NativeResult`) — every dispatcher re-entry makes ALL images cold
-by construction, closing the tier-0-mutated-globals-between-episodes
-hole. A COLD entry (`nativeSeedFn` path) fills the page's image as a
-byproduct of the seeding it already does and stamps it with the current
-`episode_gen` and the closure it seeded for. A WARM entry requires
-`image.gen == ctx.episode_gen` AND `image.closure == <the entering
+closure)`. `NativeSeedCtx.episode_gen: u64` is advanced-until-saturation
+by the dispatcher's episode-entry funnel (as landed at P2:
+`prepareNativeEpisode`, saturating at maxInt per the P2 amendment) —
+every dispatcher re-entry makes ALL images cold by construction, closing
+the tier-0-mutated-globals-between-episodes hole. A COLD entry
+(`nativeSeedFn` path) fills the page's image as a byproduct of the
+seeding it already does and stamps it with the current `episode_gen` and
+the closure it seeded for. A WARM entry requires
+`image.gen == ctx.episode_gen` AND `ctx.episode_gen != maxInt(u64)`
+(the saturated sentinel must never validate a warm image — same
+fail-closed discipline as the descent gate) AND `image.closure == <the entering
 closure>` (for a push: the just-guarded callee payload register; for a
 ret-cont re-entry: the popped-into frame's closure) — any mismatch
 takes the cold `body_entry`, which refills and re-stamps the image for

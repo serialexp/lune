@@ -752,6 +752,9 @@ pub fn emitLedgerAppend(a: *x64.Assembler, trace_id: u32, kind: trace_exec.Ledge
 /// resolved dispatch target — an armed child body entry, or `shared_exit` when the
 /// slot is unarmed. Contract:
 ///   * unarmed (`rax == shared_exit`)         → leave `rax`, fall through (natural terminal / plain deopt);
+///   * armed + frame motion taken (doc 54 P2) → rewrite `rax = shared_exit`, outcome
+///       stays `.normal`: a row-free episode refuses every non-frame arm so its ledger
+///       remains empty-plus-final (the row just appended IS the final row);
 ///   * armed + ledger has room (`len < CAP`)  → leave `rax`, fall through (dispatch into the child);
 ///   * armed + ledger FULL (`len == CAP`)     → mark the just-appended terminal entry
 ///       `.yielded` and rewrite `rax = shared_exit`, so a closed native cycle returns to
@@ -764,10 +767,34 @@ pub fn emitLedgerAppend(a: *x64.Assembler, trace_id: u32, kind: trace_exec.Ledge
 /// (32), so the ledger never fills and the yield branch never executes — byte-identical.
 pub fn emitForcedYieldCheck(a: *x64.Assembler, shared_exit: usize) !void {
     const do_jmp = try a.label();
+    const cap_check = try a.label();
     // rcx = shared_exit. Unarmed target (rax == shared_exit) → nothing to cap.
     try a.movRegImm64(.rcx, @bitCast(@as(u64, shared_exit)));
     try a.cmpRegReg(.rax, .rcx);
     try a.jcc(.e, do_jmp);
+    // Doc 54 P2: armed NON-frame dispatch after a row-free frame-motion
+    // transition → REFUSE the arm (rewrite the target to `shared_exit`; the
+    // just-appended row becomes the episode's natural FINAL row, outcome
+    // deliberately left `.normal` — this is a bounce, not a cap yield).
+    // Following the arm instead would append further rows behind frame
+    // motion and poison the positional grammar. This check runs at every
+    // armed dispatch site on every page; on pages that can never see frame
+    // motion the byte is always 0 and the branch never fires. The two
+    // frame-motion sites' ROWS-mode tails also run this check, where
+    // mutual exclusivity (the flag is only ever set while the ledger is
+    // empty, and after it is set only the final row can ever be appended)
+    // makes the byte provably 0.
+    // P2 AMENDMENT: gate-approved one-shot→one-shot `.sibling_handoff`
+    // exits no longer reach this refusal on their fast path — the ordinary
+    // deopt tail follows them ROWLESSLY before the row append (bounded by
+    // `sibling_hop_taken` + the descent budget). This branch remains the
+    // decline destination for every fast-path miss and the defense-in-depth
+    // refusal for link/loop-done/frame rows-tail dispatches post-motion.
+    try a.cmpByteMemImm(.rdx, @offsetOf(NativeResult, "frame_motion_taken"), 0);
+    try a.jcc(.e, cap_check);
+    try a.movRegImm64(.rax, @bitCast(@as(u64, shared_exit)));
+    try a.jmp(do_jmp);
+    a.bind(cap_check);
     // Armed. Room left in the ledger (ledger_len < CAP) → dispatch into the child.
     try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "ledger_len"), @intCast(trace_exec.LEDGER_CAP));
     try a.jcc(.b, do_jmp);
@@ -781,6 +808,63 @@ pub fn emitForcedYieldCheck(a: *x64.Assembler, shared_exit: usize) !void {
     try a.storeMemSibReg(.rdx, .rcx, 4, @offsetOf(NativeResult, "ledger_outcome"), .rax);
     try a.movRegImm64(.rax, @bitCast(@as(u64, shared_exit)));
     a.bind(do_jmp);
+}
+
+/// Doc 54 P2: the row-free armed-hit counter publish — bump the transition
+/// slot's page-owned `LinkHitCounter` and, on the FIRST hit of the episode
+/// (stale `gen`), run the order-pinned publish protocol: (1) touched-list
+/// capacity check (full → `jmp full_decline`, the site's miss path — an
+/// ordinary final row + dispatcher bounce; NEVER falls into rows mode,
+/// which would put a non-entered-trace owner in row 0), (2) `count = 0`
+/// (without the reset a drain would read lifetime-cumulative counts as
+/// episode counts), (3) `touched[touched_len++] = &record`, (4) `gen =
+/// episode_gen`. Then — first hit or not — `count += 1`.
+///
+/// Register contract: preserves rax (the live armed jump target), rdi/rsi
+/// (lanes), rdx (`*NativeResult`), rbx; clobbers rcx/r9/r10/r11. The
+/// record and ctx addresses are baked imm64s (page-owned array and per-VM
+/// ctx are both heap-stable).
+pub fn emitRowFreeHitPublish(
+    a: *x64.Assembler,
+    ctx: *const trace_code.NativeSeedCtx,
+    record: *const artifact.LinkHitCounter,
+    full_decline: x64.Label,
+) !void {
+    try a.movRegImm64(.r10, @bitCast(@as(u64, @intFromPtr(record))));
+    try emitRowFreeHitPublishReg(a, ctx, full_decline);
+}
+
+/// The register-record core of `emitRowFreeHitPublish` (P2 amendment): the
+/// caller has already computed the record's address into `r10` — the deopt
+/// tail derives it at RUNTIME from the staged `exit_instr` (`counters_base +
+/// exit_instr * @sizeOf(LinkHitCounter)`), which no baked imm64 can express.
+/// Same contract as the wrapper: preserves rax/rdi/rsi/rdx/rbx, clobbers
+/// rcx/r9/r10/r11, `full_decline` on touched-list overflow.
+pub fn emitRowFreeHitPublishReg(
+    a: *x64.Assembler,
+    ctx: *const trace_code.NativeSeedCtx,
+    full_decline: x64.Label,
+) !void {
+    const Ctx = trace_code.NativeSeedCtx;
+    const gen_off = 0; // asserted by the LinkHitCounter comptime block
+    const count_off = 8;
+    try a.movRegImm64(.r9, @bitCast(@as(u64, @intFromPtr(ctx))));
+    const bump = try a.label();
+    try a.movRegMem(.rcx, .r10, gen_off);
+    try a.cmpRegMem(.rcx, .r9, @offsetOf(Ctx, "episode_gen"));
+    try a.jcc(.e, bump);
+    // First hit this episode — the four-step publish.
+    try a.cmpQwordMemImm8(.r9, @offsetOf(Ctx, "touched_len"), @intCast(trace_code.TOUCHED_CAP));
+    try a.jcc(.ae, full_decline);
+    try a.movMemImm32(.r10, count_off, 0); // qword store: count = 0
+    try a.movRegMem(.rcx, .r9, @offsetOf(Ctx, "touched_len"));
+    try a.storeMemSibReg(.r9, .rcx, 8, @offsetOf(Ctx, "touched"), .r10);
+    try a.incReg(.rcx);
+    try a.movMemReg(.r9, @offsetOf(Ctx, "touched_len"), .rcx);
+    try a.movRegMem(.rcx, .r9, @offsetOf(Ctx, "episode_gen"));
+    try a.movMemReg(.r10, gen_off, .rcx);
+    a.bind(bump);
+    try a.incMemQword(.r10, count_off);
 }
 
 /// Doc 54 P0: everything the inline self-call push needs that is knowable at
@@ -802,8 +886,10 @@ pub const InlineSelfPush = struct {
     proto_addr: u64,
 };
 
-/// Doc 54 P0: the inline same-page self-call frame push — the emitted twin of
-/// `interp.nativeSelfCallPush` for HEAD pages, replacing the C-ABI callout.
+/// Doc 54 P0/P2: the inline self-call frame push — the emitted twin of the
+/// deleted `nativeSelfCallPush` C-ABI callout, used by HEAD pages (P0,
+/// `body_entry` set: re-enter own body) and CONT pages (P2, `body_entry`
+/// null: fall through to the cross-page armed dispatch).
 /// Emitted between the terminal's slot flush and the plain terminal exit;
 /// every check the helper re-derived per push is now either an emit-time
 /// constant (static eligibility, the caller's job), the per-episode
@@ -835,10 +921,18 @@ pub fn emitInlineSelfPush(
     ctx: *const trace_code.NativeSeedCtx,
     abi: trace_code.FrameMotionAbi,
     p: InlineSelfPush,
-    body_entry: x64.Label,
+    body_entry: ?x64.Label,
     decline: x64.Label,
 ) !void {
     const Ctx = trace_code.NativeSeedCtx;
+    // -- step 0 (doc 54 P2): the descent poll budget — pre-mutation
+    // decrement-and-test at the TOP of every frame-motion sequence (see
+    // the pop twin's step-0 comment; same-page pushes consume budget too,
+    // both modes, and set nothing else).
+    try a.movRegMem32(.rax, .rdx, @offsetOf(NativeResult, "descent_budget"));
+    try a.subRegImm32(.rax, 1);
+    try a.jcc(.s, decline);
+    try a.movMemReg32(.rdx, @offsetOf(NativeResult, "descent_budget"), .rax);
     // -- step 1: episode descent gate ------------------------------------
     try a.movRegImm64(.r9, @bitCast(@as(u64, @intFromPtr(ctx))));
     try a.cmpByteMemImm(.r9, @offsetOf(Ctx, "descent_ok"), 1);
@@ -867,6 +961,12 @@ pub fn emitInlineSelfPush(
     // next_call_seq == maxInt(u64) → decline (tier-0 re-runs and panics).
     try a.cmpQwordMemImm8(.r8, abi.vm_next_call_seq_off, -1);
     try a.jcc(.e, decline);
+    // -- committed-motion point (P2 amendment): every declining check is
+    // behind us, so this push WILL commit — re-open the one-rowless-
+    // sibling-hop window. Placement is the amendment's clear rule: a
+    // DECLINED push must not clear the byte (a zero-progress hop cycle
+    // would then never bounce), a committed one must.
+    try a.movByteMemImm(.rdx, @offsetOf(NativeResult, "sibling_hop_taken"), 0);
     // -- step 4: caller one-past-call resume-cursor freeze ---------------
     // rax = &frames[depth-1] (byte address; frame_size is not a power of
     // two, so multiply through a scratch immediate).
@@ -944,10 +1044,22 @@ pub fn emitInlineSelfPush(
     try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "pushed_frames"));
     try a.addRegImm32(.rax, 1);
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "pushed_frames"), .rax);
-    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 0);
     try a.addRegImm32(.rdi, p.nreg);
     try a.addRegImm32(.rsi, p.nreg * 8);
-    try a.jmp(body_entry);
+    if (body_entry) |be| {
+        // Same-page (head) push: re-enter this page's own body directly,
+        // bypassing `ordinary_entry` — so the materialization-mode reset it
+        // would have done is replicated here (the ordinary-entry replica).
+        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 0);
+        try a.jmp(be);
+    }
+    // Doc 54 P2: cont-page mode (`body_entry == null`) — the frame is
+    // pushed and the lanes sit on the pushed window; FALL THROUGH to the
+    // caller's cross-page `.call_head` dispatch. No `linked_loop_done`
+    // reset: an armed hit enters the child head through its
+    // `ordinary_entry`, which presets the mode itself, and a miss exits
+    // the episode (byte-identical to the deleted helper path, which never
+    // reset it either).
 }
 
 pub const InlineSelfRetPop = struct {
@@ -1011,6 +1123,18 @@ pub fn emitInlineSelfRetPop(
 ) !void {
     const Ctx = trace_code.NativeSeedCtx;
     const all_results: i32 = @import("bytecode.zig").all_results;
+    // -- step 0 (doc 54 P2): the descent poll budget — pre-mutation
+    // decrement-and-test at the TOP of every frame-motion sequence.
+    // `load; sub 1; js decline; store`: a zero budget declines WITHOUT
+    // storing; the decline is the ordinary plain terminal exit (outcome
+    // `.normal`, nothing mutated), which ends the episode, so the value is
+    // never re-read after a decline. Bounds the dispatcher-service
+    // blackout for allocation-free frame-motion cycles now that row-free
+    // transitions no longer hit `LEDGER_CAP`.
+    try a.movRegMem32(.rax, .rdx, @offsetOf(NativeResult, "descent_budget"));
+    try a.subRegImm32(.rax, 1);
+    try a.jcc(.s, no_pop);
+    try a.movMemReg32(.rdx, @offsetOf(NativeResult, "descent_budget"), .rax);
     // -- step 1: episode descent gate ------------------------------------
     try a.movRegImm64(.r9, @bitCast(@as(u64, @intFromPtr(ctx))));
     try a.cmpByteMemImm(.r9, @offsetOf(Ctx, "descent_ok"), 1);
@@ -1060,6 +1184,11 @@ pub fn emitInlineSelfRetPop(
     try a.addRegReg(.rcx, .r11);
     try a.cmpRegImm32(.rcx, p.nreg);
     try a.jcc(.a, no_pop);
+    // -- committed-motion point (P2 amendment): the wiring check above is
+    // the pop's LAST declining check — this pop commits, so re-open the
+    // one-rowless-sibling-hop window (declined pops must not clear; see
+    // the push twin's comment for the progress-bound rule).
+    try a.movByteMemImm(.rdx, @offsetOf(NativeResult, "sibling_hop_taken"), 0);
     // -- step 6: result copy (opRet order: while the callee window is
     // still under stack_top; nil-fill the tail past `count`). Src slot
     // a_reg+k of the CALLEE window (lanes); dst slot ret_dest+k of the

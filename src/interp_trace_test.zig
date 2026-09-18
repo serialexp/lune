@@ -5254,8 +5254,8 @@ test "head e2e (doc 44 D11): deep linear self-recursion stays byte-identical, al
 
 test "head e2e (doc 44 D11): StackOverflow through a native descent — message and pcall catch identical, all ten legs" {
     // The depth wall: the second `pcall` descends natively (the head patched
-    // after the first run's warmup) until `nativeSelfCallPush` refuses at
-    // `max_call_depth`; the plain terminal resumes the leaf AT its self-call
+    // after the first run's warmup) until the inline push sequence declines
+    // at `max_call_depth`; the plain terminal resumes the leaf AT its self-call
     // and tier-0 re-executes it generically, raising `StackOverflow` with
     // intact frames — so the located message (`describeFault`) and the pcall
     // catch must be byte-identical to the pure tier-0 legs.
@@ -5413,149 +5413,40 @@ test "head handoff evidence symmetry (doc 44 D12a): the base-case-incumbent shap
     try testing.expect(vm.trace.self_call_pushes >= 100);
 }
 
-test "push helper refusal matrix (doc 44 D11): every wall declines with nothing mutated" {
-    // Drive `nativeSelfCallPush` directly through the installed ctx fn
-    // pointer (the same route the baked callout takes) against a hand-built
-    // caller activation, and check each refusal: distant-invariant
-    // re-verification (aux bounds, non-call, all_results, vararg,
-    // reg_top_pending), the actual-callee walls (non-function, foreign
-    // proto), and the capacity wall — plus the positive control, which must
-    // push a REAL frame (depth, base, caller cursor, tick, witness).
-    const gpa = testing.allocator;
-    var vm = try Vm.init(gpa);
-    defer vm.deinit();
-    var proto = Proto{
-        .code = &.{
-            Instr{ .op = .call, .a = 1, .b = 1, .c = 1 },
-            Instr{ .op = .ret },
-            Instr{ .op = .call, .a = 1, .b = bytecode.all_results, .c = 1 },
-        },
-        .num_registers = 4,
-        .num_params = 1,
-        .name = "d11self",
-    };
-    const foreign = Proto{ .code = &.{Instr{ .op = .ret }}, .num_registers = 2, .name = "d11foreign" };
-    const cl = try vm.heap.newClosure(&proto, 0);
-    const foreign_cl = try vm.heap.newClosure(&foreign, 0);
-    var code = trace.TraceCode{
-        .anchor = .{ .proto = &proto, .pc = trace.FUNC_HEAD_PC },
-        .instrs = &.{},
-        .consts = &.{},
-        .entry_slots = &.{},
-        .entry_guards = &.{},
-    };
-    // Hand-built caller activation of the anchor proto at base 0, callee
-    // value (itself) in the call's slot `base + a = 1`, argument in slot 2
-    // (a fresh slab holds undefined tags — the layout loop reads real args).
-    try vm.pushFrame(cl, 0, 0, 0);
-    vm.regSet(0, Value.nil());
-    vm.regSet(1, Value.heap(&cl.header));
-    vm.regSet(2, Value.int(41));
-    vm.regSet(3, Value.nil());
-    const ctx = vm.trace.registry.native_seed_ctx.?;
-    ctx.vm = &vm;
-    ctx.base = 0;
-    const push = ctx.self_call_push_fn.?;
-    const tick0 = vm.trace.tick;
+// (The doc 44 D11 "push helper refusal matrix" test lived here. Doc 54 P2
+// deleted `nativeSelfCallPush` — cont pages now run the same inline push
+// sequence as head pages — so the matrix's walls now live as: emit-time
+// statics (aux bounds / non-call / all_results / vararg anchor are the
+// commit-time `push_static` eligibility — an ineligible page emits no push
+// epilogue at all, pinned by the fail-closed test below), the per-episode
+// descent byte (`descent_ok` folds `reg_top_pending` — its own unit matrix
+// below), the inline step-2 callee guard (tag / object type / proto pin
+// covers the non-function and foreign-proto rows), the inline step-3 walls
+// (depth, register capacity, call_seq space), and the doc 54 P2 step-0
+// descent poll budget. The positive control's frame shape (depth, base,
+// one-past-call cursor, tick, witness) is pinned by the formation witness
+// above plus byte-identical ten-legs output on every recursion e2e.)
 
-    // Refusals, each with nothing mutated (depth/tick/witness unchanged).
-    try testing.expectEqual(trace.NativeSeedCtx.PUSH_DECLINE, push(ctx, &code, 99)); // aux out of bounds
-    try testing.expectEqual(trace.NativeSeedCtx.PUSH_DECLINE, push(ctx, &code, 1)); // not a .call
-    try testing.expectEqual(trace.NativeSeedCtx.PUSH_DECLINE, push(ctx, &code, 2)); // all_results args
-    proto.is_vararg = true;
-    try testing.expectEqual(trace.NativeSeedCtx.PUSH_DECLINE, push(ctx, &code, 0)); // vararg anchor
-    proto.is_vararg = false;
-    vm.reg_top_pending = true;
-    try testing.expectEqual(trace.NativeSeedCtx.PUSH_DECLINE, push(ctx, &code, 0)); // pending multret
-    vm.reg_top_pending = false;
-    vm.regSet(1, Value.int(7));
-    try testing.expectEqual(trace.NativeSeedCtx.PUSH_DECLINE, push(ctx, &code, 0)); // non-function callee
-    vm.regSet(1, Value.heap(&foreign_cl.header));
-    try testing.expectEqual(trace.NativeSeedCtx.PUSH_DECLINE, push(ctx, &code, 0)); // foreign proto
-    vm.regSet(1, Value.heap(&cl.header));
-    const saved_nreg = proto.num_registers;
-    proto.num_registers = @intCast(vm.regCapacity() - 2);
-    try testing.expectEqual(trace.NativeSeedCtx.PUSH_DECLINE, push(ctx, &code, 0)); // capacity wall
-    proto.num_registers = saved_nreg;
-    try testing.expectEqual(@as(u32, 1), vm.depth);
-    try testing.expectEqual(tick0, vm.trace.tick);
-    try testing.expectEqual(@as(u64, 0), vm.trace.self_call_pushes);
-
-    // Positive control: a real frame push with the opCall-verbatim shape.
-    try testing.expectEqual(trace.NativeSeedCtx.PUSH_OK, push(ctx, &code, 0));
-    try testing.expectEqual(@as(u32, 2), vm.depth);
-    try testing.expect(vm.frames[1].closure == cl);
-    try testing.expectEqual(@as(usize, 4), vm.frames[1].base);
-    try testing.expectEqual(@as(usize, 0), vm.frames[1].pc);
-    try testing.expectEqual(@as(usize, 1), vm.frames[0].pc); // one-past-call cursor
-    try testing.expectEqual(@as(usize, 8), vm.stack_top);
-    try testing.expectEqual(tick0 +% 1, vm.trace.tick);
-    try testing.expectEqual(@as(u64, 1), vm.trace.self_call_pushes);
-    // The ctx now describes the pushed activation (freshness stamp).
-    try testing.expectEqual(@as(usize, 4), ctx.base);
-    try testing.expectEqual(vm.frames[1].call_seq, ctx.call_seq);
-}
-
-test "inline push formation (doc 54 P0): head-page descents survive with the cont helper removed" {
-    // The P0 formation proof. `self_call_pushes` is bumped by BOTH the
-    // inline head-page sequence and the cont-page runtime helper, so the
-    // plain witness cannot distinguish them. Removing the helper fn from
-    // the ctx BEFORE any trace commits makes cont pages emit no push
-    // epilogue at all (their `self_call_push_fn` gate) — every remaining
-    // push must have come from the emitted inline sequence. sum(150)'s
-    // linear recursion descends ~149 frames per call from the HEAD page's
-    // own terminal (after the first push, execution re-enters the same
-    // head body), so the witness stays well above 100 on the inline path
-    // alone. Native-only: the push epilogue is a nativegen lowering.
-    if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
-    const gpa = testing.allocator;
-    var vm = try Vm.init(gpa);
-    defer vm.deinit();
-    vm.trace.registry.native_seed_ctx.?.self_call_push_fn = null;
-    const source =
-        \\local function sum(n)
-        \\  if n == 0 then return 0 end
-        \\  return n + sum(n - 1)
-        \\end
-        \\local s = 0
-        \\for i = 1, 5 do s = s + sum(150) end
-        \\print(s)
-    ;
-    const parser = @import("parser.zig");
-    const diag = @import("diag.zig");
-    var diags = diag.Diagnostics.init(gpa);
-    defer diags.deinit();
-    var tree = try parser.parse(gpa, source, &diags);
-    defer tree.deinit();
-    vm.trace.config.enabled = true;
-    vm.trace.config.execute = true;
-    vm.trace.config.optimize = true;
-    vm.trace.config.native_codegen = true;
-    vm.trace.config.hotloop = 4;
-    vm.trace.config.hotcall = 4;
-    var buf: [256]u8 = undefined;
-    var sink = io.Writer.fixed(&buf);
-    vm.out = &sink;
-    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
-    defer chunk.deinit();
-    try testing.expect(!diags.hasErrors());
-    _ = try vm.run(chunk.proto);
-    try testing.expectEqualStrings("56625\n", sink.buffered());
-    try testing.expect(vm.trace.self_call_pushes >= 100);
-}
+// (The doc 54 P0 "inline push formation with the cont helper removed" test
+// lived here. Its discriminator — nulling `self_call_push_fn` so only the
+// inline head-page sequence could push — became vacuous when doc 54 P2
+// deleted the helper field outright: EVERY push is the inline sequence by
+// construction now, and the formation-witness test above pins exactly the
+// same claim on the same program.)
 
 test "fail-closed compilation (doc 54 P0): absent frame_abi emits no push epilogue" {
     // Sabotage the emission gate: with `frame_abi` null (a hand-built-ctx
-    // world) AND the cont helper removed, NO page may carry a push
-    // epilogue — the compiled traces run their plain terminal exits and
-    // tier-0 executes every call generically. Output stays exact and the
-    // witness stays at zero. This is the fail-closed half of the P0
-    // contract (an absent descriptor can never miscompile, only decline).
+    // world), NO page may carry a push epilogue — the inline sequence is
+    // the only push path since doc 54 P2 deleted the cont helper, and its
+    // emission gates on the descriptor. The compiled traces run their
+    // plain terminal exits and tier-0 executes every call generically.
+    // Output stays exact and the witness stays at zero. This is the
+    // fail-closed half of the P0 contract (an absent descriptor can never
+    // miscompile, only decline).
     if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    vm.trace.registry.native_seed_ctx.?.self_call_push_fn = null;
     vm.trace.registry.native_seed_ctx.?.frame_abi = null;
     const source =
         \\local function sum(n)
@@ -5731,6 +5622,7 @@ test "ret pop formation (doc 44 D12c): fused descents unwind through the native 
     // continuation's second recursive call must form and use its call-head
     // link. This catches the circular bug where push was gated on an already
     // armed call-head slot (so no committed miss could ever request the arm).
+    vm.trace.dbg("D12c witnesses: pushes={d} pops={d} ret hits={d} call hits={d}", .{ vm.trace.self_call_pushes, vm.trace.self_ret_pops, vm.trace.ret_cont_link_hits, vm.trace.call_head_link_hits });
     try testing.expect(vm.trace.self_call_pushes >= 100);
     try testing.expect(vm.trace.self_ret_pops >= 100);
     var native_traces: usize = 0;
@@ -5750,9 +5642,15 @@ test "ret pop formation (doc 44 D12c): fused descents unwind through the native 
     try testing.expect(vm.trace.ret_cont_link_hits >= 2);
     try testing.expect(vm.trace.call_head_link_arms >= 1);
     try testing.expect(vm.trace.call_head_link_hits >= 1);
-    // This workload must exercise the mixed-chain capacity cut, not merely
-    // individual unlinked pushes/pops with output-equivalent resumption.
-    try testing.expect(vm.trace.frame_link_cap_yields > 0);
+    // Doc 54 P2 (as amended): frame-motion chains run ROW-FREE, so the old
+    // mixed-chain capacity-cut witness (`frame_link_cap_yields > 0`) is
+    // structurally unreachable on this workload — a positional frame ledger
+    // never forms. Pin its absence, and pin the amendment's replacement
+    // witness instead: the base-case sibling handoff must FOLLOW its arm
+    // rowlessly post-motion (`sibling_link_hits`), the exact seam whose
+    // refusal degenerated fib before the amendment (pops 32 vs 3.6M).
+    try testing.expectEqual(@as(u64, 0), vm.trace.frame_link_cap_yields);
+    try testing.expect(vm.trace.sibling_link_hits > 0);
 }
 
 test "D12c fused calls survive changed return types and protected overflow across ten legs" {
@@ -5779,7 +5677,10 @@ test "D12c fused calls survive changed return types and protected overflow acros
                     !@import("nativegen.zig").is_x64_linux) return;
                 try testing.expect(vm.trace.ret_cont_link_hits > 0);
                 try testing.expect(vm.trace.call_head_link_hits > 0);
-                try testing.expect(vm.trace.frame_link_cap_yields > 0);
+                // Doc 54 P2 (as amended): row-free chains never build the
+                // positional frame ledger, so the capacity-cut witness is
+                // structurally dead; the rowless sibling hop replaces it.
+                try testing.expect(vm.trace.sibling_link_hits > 0);
             }
         }.inspect,
     });
@@ -5794,6 +5695,103 @@ test "D12c fused calls survive changed return types and protected overflow acros
 // frame-identity walls, which became jit-debug assert-callout invariants
 // (`nativeFrameMotionAssert`, exercised on every pop of every jit-debug
 // gate run).)
+
+test "P2 amendment: two-sibling post-motion hop cycle stays bounded and byte-identical" {
+    // The amendment's adversarial shape: a recursive body with a 2-way value
+    // branch grows sibling pages whose armed handoffs point at each other
+    // (D12a arms both directions). Post-motion, a deopt at either branch
+    // guard now FOLLOWS its sibling arm rowlessly — and when the hopped-to
+    // sibling immediately deopts back, `sibling_hop_taken` (already 1, no
+    // committed motion between) forces the second hop into the refusal
+    // bounce: at most ONE hidden hop between committed frame motions, so a
+    // zero-progress ping-pong degenerates to the pre-amendment refusal
+    // price instead of burning the 65,536 descent budget invisibly. The
+    // pinned property is the semantic one — byte-identical output across
+    // the whole mode matrix with alternating-parity inputs keeping both
+    // siblings hot (a budget-burn bug shows up as the jit legs disagreeing
+    // or the runtime-safety panics firing).
+    try util.expectProgramTuned(
+        \\local function f(n)
+        \\  if n < 1 then return 0 end
+        \\  if n % 2 == 0 then return f(n-1) + 1 end
+        \\  return f(n-2) + 2
+        \\end
+        \\local acc = 0
+        \\for i = 1, 40 do acc = acc + f(i) end
+        \\print(acc)
+    , "860\n", .{ .hotguard = 2 });
+}
+
+test "P2 amendment: three-sibling divergence chain pays one boundary and stays byte-identical" {
+    // The legitimate divergence shape from the amendment: three recursion
+    // paths (n%3) grow up to three sibling pages at the same anchor. A
+    // post-motion chain A→B→C pays a dispatcher boundary at the refused
+    // B→C hop (the one-hop window is consumed by A→B); whether C is
+    // entered next is the ordinary exact-anchor walk's decision in a fresh
+    // episode — an accepted trade-off of the conservative v1 bound, never
+    // a semantic cost. Cycling i through all three residues keeps every
+    // sibling live; the mode matrix pins byte-identical output.
+    try util.expectProgramTuned(
+        \\local function f(n)
+        \\  if n < 1 then return 0 end
+        \\  local m = n % 3
+        \\  if m == 0 then return f(n-1) + 1 end
+        \\  if m == 1 then return f(n-2) + 2 end
+        \\  return f(n-3) + 3
+        \\end
+        \\local acc = 0
+        \\for i = 1, 60 do acc = acc + f(i) end
+        \\print(acc)
+    , "1890\n", .{ .hotguard = 2 });
+}
+
+test "P2 amendment: episode gen saturation fails closed (descent dead, no publication)" {
+    // Codex round-2 blocker pin: `episode_gen` SATURATES at maxInt(u64) —
+    // skip-0-on-wrap was rejected because every nonzero generation is
+    // eventually reused, and an ancient record stamped `gen = k` would
+    // falsely match a reused `episode_gen = k`, silently skipping the
+    // counter reset/touched publication. At saturation the descent gate
+    // must be permanently dead: `descent_ok == 0` means no frame-motion
+    // sequence commits, `frame_motion_taken` never sets, and therefore no
+    // rowless follow and no counter publication can ever occur again for
+    // this VM. The emitted paths already consult the descent byte, so the
+    // Zig-level contract under test here (advance-first, saturate, fold
+    // into `descent_ok`, reset `touched_len`) is the whole mechanism.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // Vm.init installed the real per-VM ctx; drive IT (registry owns it).
+    const ctx = vm.trace.registry.native_seed_ctx.?;
+    // prepareNativeEpisode reads frames[depth-1].call_seq; give it a live
+    // anchor frame. The closure/proto pointers are stored, never followed.
+    vm.depth = 1;
+    vm.frames[0].call_seq = 1;
+    var dummy_closure: function.Closure = undefined;
+    var dummy_proto: bytecode.Proto = undefined;
+    const max = std.math.maxInt(u64);
+    // Two steps below saturation: a normal episode — gen advances, the
+    // gate opens (fresh VM: receipts inert, no pending reg-top, no final
+    // cut), touched list empty.
+    ctx.episode_gen = max - 2;
+    ctx.touched_len = 7; // stale garbage the prepare must clear
+    vm.prepareNativeEpisode(&dummy_closure, &dummy_proto, 0);
+    try testing.expectEqual(max - 1, ctx.episode_gen);
+    try testing.expectEqual(@as(u8, 1), ctx.descent_ok);
+    try testing.expectEqual(@as(usize, 0), ctx.touched_len);
+    // The step INTO saturation: advance-first (round-3 pin), so this very
+    // episode already sees the dead gate — never a one-episode window
+    // where gen == maxInt with an open gate.
+    vm.prepareNativeEpisode(&dummy_closure, &dummy_proto, 0);
+    try testing.expectEqual(max, ctx.episode_gen);
+    try testing.expectEqual(@as(u8, 0), ctx.descent_ok);
+    try testing.expectEqual(@as(usize, 0), ctx.touched_len);
+    // Saturated forever: the gen stops moving (no wrap to the cold
+    // sentinel 0, no reuse of live generations) and the gate stays dead.
+    vm.prepareNativeEpisode(&dummy_closure, &dummy_proto, 0);
+    try testing.expectEqual(max, ctx.episode_gen);
+    try testing.expectEqual(@as(u8, 0), ctx.descent_ok);
+    try testing.expectEqual(@as(usize, 0), ctx.touched_len);
+}
 
 test "inline pop ceiling (doc 54 P1): escaping closures over recursion frames stay correct across legs" {
     // A leaf that mints a closure over its own `n` leaves an OPEN upvalue

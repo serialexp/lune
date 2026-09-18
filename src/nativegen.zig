@@ -118,6 +118,8 @@ pub const ExitPatch = artifact.ExitPatch;
 pub const SeedPlan = artifact.SeedPlan;
 pub const CompiledTrace = artifact.CompiledTrace;
 pub const NativeState = artifact.NativeState;
+pub const LinkHitCounter = artifact.LinkHitCounter;
+pub const LinkHitKind = artifact.LinkHitKind;
 
 /// Try to compile `t` to native code. Returns `null` to **bail** — for any reason:
 /// an off-target build, a value/op outside the proven-int/bool subset, malformed
@@ -283,6 +285,8 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     // may legitimately arm.
     var slots: []usize = &.{};
     var ret_cont_keys: []u32 = &.{};
+    var link_hit_counters: []artifact.LinkHitCounter = &.{};
+    var slot_rowless_ok: []u8 = &.{};
     var metadata_cells: []usize = &.{};
     var patch_emissions: []?PatchEmission = &.{};
     if (arena) |ar| {
@@ -306,7 +310,42 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
             return null;
         };
         @memset(ret_cont_keys, std.math.maxInt(u32));
+        // Doc 54 P2 (+amendment): one row-free hit-counter record per
+        // PHYSICAL SLOT, same layout as `slots` — `n` ordinary exit cells
+        // (`.sibling_handoff`) then the five transition cells (four
+        // `.ret_cont` + the `.call_head`). The emitted hit paths bake
+        // record addresses (frame slots) or compute `base + exit_instr*24`
+        // (ordinary slots), so the array must be stable before `lower`
+        // runs. `gen = 0` never matches a live `episode_gen` (prepare
+        // increments before first use, and the gen saturates below maxInt),
+        // so every record starts cold.
+        link_hit_counters = gpa.alloc(artifact.LinkHitCounter, n + NATIVE_TRANSITION_SLOTS) catch {
+            gpa.free(ret_cont_keys);
+            gpa.free(slots);
+            return null;
+        };
+        for (link_hit_counters, 0..) |*rec, ri| rec.* = .{
+            .owner_id = trace_id,
+            .kind = @intFromEnum(@as(artifact.LinkHitKind, if (ri < n)
+                .sibling_handoff
+            else if (ri < n + RET_CONT_SLOTS)
+                .ret_cont
+            else
+                .call_head)),
+        };
+        // Doc 54 P2 amendment: the per-slot rowless-follow gate, parallel
+        // to `slots` (full length, zero-init = no slot eligible). Written
+        // only by `commitSlotMutation`'s paired commit.
+        slot_rowless_ok = gpa.alloc(u8, n + NATIVE_TRANSITION_SLOTS) catch {
+            gpa.free(link_hit_counters);
+            gpa.free(ret_cont_keys);
+            gpa.free(slots);
+            return null;
+        };
+        @memset(slot_rowless_ok, 0);
         metadata_cells = gpa.alloc(usize, n) catch {
+            gpa.free(slot_rowless_ok);
+            gpa.free(link_hit_counters);
             gpa.free(ret_cont_keys);
             gpa.free(slots);
             return null;
@@ -314,6 +353,8 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
         @memset(metadata_cells, 0);
         patch_emissions = gpa.alloc(?PatchEmission, n) catch {
             gpa.free(metadata_cells);
+            gpa.free(slot_rowless_ok);
+            gpa.free(link_hit_counters);
             gpa.free(ret_cont_keys);
             gpa.free(slots);
             return null;
@@ -323,10 +364,14 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     defer if (patch_emissions.len > 0) gpa.free(patch_emissions);
     var keep_ret_cont_keys = false;
     defer if (ret_cont_keys.len > 0 and !keep_ret_cont_keys) gpa.free(ret_cont_keys);
+    var keep_link_hit_counters = false;
+    defer if (link_hit_counters.len > 0 and !keep_link_hit_counters) gpa.free(link_hit_counters);
+    var keep_slot_rowless_ok = false;
+    defer if (slot_rowless_ok.len > 0 and !keep_slot_rowless_ok) gpa.free(slot_rowless_ok);
 
     var asm_buf = x64.Assembler.init(gpa);
     defer asm_buf.deinit();
-    const entry_stubs = lower(gpa, t, trace_id, kinds, &alloc, &asm_buf, shared_exit, slots, ret_cont_keys, metadata_cells, patch_emissions, seed_ctx, seed_plan, heap) catch {
+    const entry_stubs = lower(gpa, t, trace_id, kinds, &alloc, &asm_buf, shared_exit, slots, ret_cont_keys, link_hit_counters, slot_rowless_ok, metadata_cells, patch_emissions, seed_ctx, seed_plan, heap) catch {
         if (metadata_cells.len > 0) gpa.free(metadata_cells);
         if (slots.len > 0) gpa.free(slots);
         return null;
@@ -433,11 +478,15 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     // actually break it.
     std.debug.assert(seed_plan.nonEmpty() == entry_stubs.seed_prologue);
     keep_ret_cont_keys = true;
+    keep_link_hit_counters = true;
+    keep_slot_rowless_ok = true;
     return .{
         .page = page,
         .trampoline_entry = tramp_entry,
         .slots = slots,
         .ret_cont_keys = ret_cont_keys,
+        .link_hit_counters = link_hit_counters,
+        .slot_rowless_ok = slot_rowless_ok,
         .gpa = gpa,
         .linked_entry = linked_entry,
         .ordinary_entry = ordinary_entry,
@@ -666,7 +715,7 @@ fn emitPreciseSnapshotFlush(a: *x64.Assembler, t: *const Trace, kinds: []const K
 /// committed counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers
 /// across iterations (loaded + type-guarded once in the prologue); `regs[]` is written
 /// only on a side-exit (the single snapshot) or for write-only slots at the back-edge.
-fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize, ret_cont_keys: []u32, metadata_cells: []usize, patch_emissions: []?PatchEmission, seed_ctx: ?*const NativeSeedCtx, seed_plan: SeedPlan, heap: ?*gc.Heap) !EntryStubs {
+fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize, ret_cont_keys: []u32, link_hit_counters: []artifact.LinkHitCounter, slot_rowless_ok: []u8, metadata_cells: []usize, patch_emissions: []?PatchEmission, seed_ctx: ?*const NativeSeedCtx, seed_plan: SeedPlan, heap: ?*gc.Heap) !EntryStubs {
     const exit_labels = try gpa.alloc(?x64.Label, t.instrs.len);
     defer gpa.free(exit_labels);
     @memset(exit_labels, null);
@@ -2064,14 +2113,14 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         try flushBoxedSlot(a, @as(i32, s.slot), try boxedTagSpill(t, kinds, alloc, ref), placeOfRef(alloc, ref));
                     } else try flushSlot(a, @as(i32, s.slot), flush_kind, placeOfRef(alloc, ref));
                 }
-                // Doc 44 D11: native frame push at the self-call terminal — a
-                // LOWERING decision only (recording and tier-1a keep the interp
-                // terminal; the ten-leg matrix keeps its D10 shape). The flush
-                // above already materialized the caller window, including the
-                // argument registers the callee layout reads. Call the runtime
-                // push helper; on PUSH_OK it has pushed a REAL VM frame (real
-                // `pushFrameVararg`: depth, stack_top, call_seq stream, region
-                // context) and refreshed the episode ctx, so this page shifts
+                // Doc 44 D11 / doc 54: native frame push at the self-call
+                // terminal — a LOWERING decision only (recording and tier-1a
+                // keep the interp terminal; the ten-leg matrix keeps its D10
+                // shape). The flush above already materialized the caller
+                // window, including the argument registers the callee layout
+                // reads. The inline push sequence pushes a REAL VM frame
+                // (opCall-verbatim: depth, stack_top, call_seq stream, region
+                // context) and refreshes the episode ctx, so this page shifts
                 // its lane pointers onto the pushed window (self-call ⇒ same
                 // proto ⇒ compile-time `num_registers`) and re-enters its own
                 // body: `entry_rbx` re-snapshots the unchanged rbx (harmless),
@@ -2102,9 +2151,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 };
                 // Head pages descend into themselves — doc 54 P0: via the
                 // INLINE push sequence (no C-ABI callout; decline = the
-                // plain terminal exit below). Continuation pages keep the
-                // runtime helper and their dedicated `.call_head` trailing
-                // slot until P2 rebuilds that path on the inline sequence.
+                // plain terminal exit below). Continuation pages ride the
+                // SAME inline sequence in fall-through mode (doc 54 P2) and
+                // continue into their dedicated `.call_head` trailing slot.
                 if (trace_code.anchorKind(t.anchor.pc) == .head and
                     @as(trace.TerminalKind, @enumFromInt(@as(u16, @intCast(term.a)))) == .self_call_interp)
                 {
@@ -2122,71 +2171,79 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         no_push = decline;
                     };
                 } else if (trace_code.anchorKind(t.anchor.pc) == .cont and
-                    push_static != null and
                     @as(trace.TerminalKind, @enumFromInt(@as(u16, @intCast(term.a)))) == .self_call_interp)
                 {
-                    if (seed_ctx) |ctx| if (ctx.self_call_push_fn) |push_fn| {
+                    // Doc 54 P2: the cont push rides the same inline sequence
+                    // as the head push (the C-ABI helper is deleted), in
+                    // fall-through mode — after the committed push the lanes
+                    // sit on the pushed window and control falls through to
+                    // the cross-page `.call_head` dispatch below. A
+                    // continuation still performs the real push even while
+                    // its call-head slot is unarmed: the committed
+                    // `.call_push` final row is the formation evidence path
+                    // (consume-at-entry learns the *actual* selected head
+                    // page and arms this owner after hotguard evidence);
+                    // pre-gating on an armed slot would make formation
+                    // circular — no push => no final row => no pending arm.
+                    if (push_static) |ci| if (seed_ctx) |ctx| if (ctx.frame_abi) |abi| if (shared_exit) |se| {
                         const decline = try a.label();
-                        // A continuation performs the real push even while its
-                        // call-head slot is unarmed.  On that first miss the
-                        // committed `.call_push` final row returns to the
-                        // dispatcher, which reloads the pushed frame at pc 0;
-                        // consume-at-entry then learns the *actual* selected
-                        // head page and arms this owner after hotguard evidence.
-                        // Pre-gating the helper on an already-armed slot makes
-                        // formation circular: no push => no final row => no
-                        // pending arm.  This is the return-link twin's normal
-                        // deterministic miss path, not an undo requirement.
-                        // C-ABI bracket: verbatim the seed-prologue protocol.
-                        // rdi/rsi/rdx are the only live caller-saved regs here
-                        // (every home was just flushed to memory), rbx is
-                        // callee-saved, and three pushes take rsp from ≡8
-                        // (mod 16, the body invariant) to ≡0 — aligned call.
-                        try a.push(.rdi);
-                        try a.push(.rsi);
-                        try a.push(.rdx);
-                        // SysV args: rdi = &ctx (per-VM, heap-stable), rsi =
-                        // &t (committed traces are heap-allocated + immutable),
-                        // rdx = the terminal's resume pc (the `.call` index)
-                        // BY VALUE. `push_fn` is installed once at VM init and
-                        // never reassigned — safe to bake.
-                        try a.movRegImm64(.rdi, @bitCast(@as(u64, @intFromPtr(ctx))));
-                        try a.movRegImm64(.rsi, @bitCast(@as(u64, @intFromPtr(t))));
-                        try a.movRegImm64(.rdx, @bitCast(@as(u64, @intCast(term.aux))));
-                        try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(push_fn))));
-                        try a.callReg(.rax);
-                        try a.pop(.rdx);
-                        try a.pop(.rsi);
-                        try a.pop(.rdi);
-                        // Two-state result, fail closed: PUSH_OK descends,
-                        // EVERYTHING else (PUSH_DECLINE or a value outside the
-                        // grammar) runs the plain terminal exit.
-                        try a.cmpRegImm32(.rax, @intCast(NativeSeedCtx.PUSH_OK));
-                        try a.jcc(.ne, decline);
-                        // Count the push for the dispatcher's pushed-frame
-                        // consumer (a successful push appends NO ledger row —
-                        // only the eventual real exit publishes a terminal).
-                        try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "pushed_frames"));
-                        try a.addRegImm32(.rax, 1);
-                        try a.movMemReg(.rdx, @offsetOf(NativeResult, "pushed_frames"), .rax);
-                        const nreg: i32 = t.anchor.proto.num_registers;
-                        if (shared_exit) |se| {
-                            // A continuation push is committed only when its
-                            // cross-page head link is live. Otherwise undo is
-                            // impossible, so the helper must not have been called.
-                            // (The pre-call target gate is emitted below.)
-                            try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
-                            try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
-                            try emitLedgerAppend(a, trace_id, .call_push);
-                            // A cap cut can return before the child stamps itself.
-                            try a.movMemImm32(.rdx, @offsetOf(NativeResult, "final_trace_id"), @bitCast(trace_id));
-                            try a.addRegImm32(.rdi, nreg);
-                            try a.addRegImm32(.rsi, nreg * 8);
-                            try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&slots[t.instrs.len + RET_CONT_SLOTS]))));
-                            try a.movRegMem(.rax, .rax, 0);
-                            try emitForcedYieldCheck(a, se);
-                            try a.jmpReg(.rax);
-                        }
+                        try emit.emitInlineSelfPush(a, ctx, abi, .{
+                            .callee_slot = ci.a,
+                            .nargs = ci.b,
+                            .ret_count = ci.c,
+                            .term_aux = term.aux,
+                            .num_params = t.anchor.proto.num_params,
+                            .nreg = t.anchor.proto.num_registers,
+                            .proto_addr = @intFromPtr(t.anchor.proto),
+                        }, null, decline);
+                        // Cross-page dispatch through the trailing
+                        // `.call_head` slot — two-mode (doc 54 P2).
+                        try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&slots[t.instrs.len + RET_CONT_SLOTS]))));
+                        try a.movRegMem(.rax, .rax, 0);
+                        const rows_tail = try a.label();
+                        const cap_decline = try a.label();
+                        // Miss (unarmed): the committed push's final
+                        // `.call_push` row + return to the dispatcher, which
+                        // reloads the pushed frame at pc 0.
+                        try a.movRegImm64(.rcx, @bitCast(@as(u64, se)));
+                        try a.cmpRegReg(.rax, .rcx);
+                        try a.jcc(.e, rows_tail);
+                        // Armed. Row-free only while the ledger is EMPTY — a
+                        // rows-first episode keeps today's positional row and
+                        // the forced-yield cap at the jump.
+                        try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "ledger_len"), 0);
+                        try a.jcc(.ne, rows_tail);
+                        // Row-free: publish the slot's hit counter, mark the
+                        // episode, jump straight into the child head's
+                        // `ordinary_entry`. No row, no completed/exit_instr/
+                        // final_trace_id stores (the eventual real exit
+                        // stamps its own), no forced-yield check — the
+                        // descent budget consumed at the sequence top is the
+                        // blackout bound.
+                        try emit.emitRowFreeHitPublish(a, ctx, &link_hit_counters[t.instrs.len + RET_CONT_SLOTS], cap_decline);
+                        try a.movByteMemImm(.rdx, @offsetOf(NativeResult, "frame_motion_taken"), 1);
+                        // P2 amendment: a committed cross-page frame hop
+                        // re-opens the one-rowless-sibling-hop window.
+                        try a.movByteMemImm(.rdx, @offsetOf(NativeResult, "sibling_hop_taken"), 0);
+                        try a.jmpReg(.rax);
+                        // Touched-list overflow: end the episode through the
+                        // ordinary miss shape (final row + dispatcher
+                        // bounce); the next episode drains fresh.
+                        a.bind(cap_decline);
+                        try a.movRegImm64(.rax, @bitCast(@as(u64, se)));
+                        a.bind(rows_tail);
+                        // Stash the dispatch target across the row append
+                        // (`emitLedgerAppend` clobbers rax/rcx; r10 is dead
+                        // scratch here and nothing below writes it).
+                        try a.movRegReg(.r10, .rax);
+                        try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+                        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
+                        try emitLedgerAppend(a, trace_id, .call_push);
+                        // A cap cut can return before the child stamps itself.
+                        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "final_trace_id"), @bitCast(trace_id));
+                        try a.movRegReg(.rax, .r10);
+                        try emitForcedYieldCheck(a, se);
+                        try a.jmpReg(.rax);
                         no_push = decline;
                     };
                 }
@@ -2229,14 +2286,18 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "popped_frames"));
                         try a.addRegImm32(.rax, 1);
                         try a.movMemReg(.rdx, @offsetOf(NativeResult, "popped_frames"), .rax);
-                        try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
-                        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
-                        try emitLedgerAppend(a, trace_id, .ret_pop);
-                        // A miss/cap cut returns before a child stamps itself.
-                        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "final_trace_id"), @bitCast(trace_id));
-                        // Dynamic resume-PC dispatch. Keys and target cells are
-                        // stable page-owned storage; publication writes the key
-                        // before the target. A miss exits with the committed pop.
+                        // Doc 54 P2: the armed `.ret_cont` chain runs BEFORE
+                        // the committed-pop row so a row-free hit appends
+                        // nothing. Dynamic resume-PC dispatch: keys and
+                        // target cells are stable page-owned storage;
+                        // publication writes the key before the target. Each
+                        // armed hit splits two-mode on `ledger_len`; a miss
+                        // (no key / unarmed slot / touched-list overflow)
+                        // exits with the committed pop's final `.ret_pop` row
+                        // — the formation evidence path.
+                        const miss = try a.label();
+                        var rows_hit: ?x64.Label = null;
+                        if (shared_exit != null) rows_hit = try a.label();
                         if (shared_exit) |se| {
                             const nreg: i32 = t.anchor.proto.num_registers;
                             for (ret_cont_keys, 0..) |*key, ki| {
@@ -2254,15 +2315,52 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                                 try a.movRegImm64(.rcx, @bitCast(@as(u64, se)));
                                 try a.cmpRegReg(.rax, .rcx);
                                 try a.jcc(.e, next);
-                                // Only a real armed hit changes lane ownership.
+                                // Armed hit. Row-free only on an EMPTY ledger
+                                // (rows-first episodes stay positional).
+                                try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "ledger_len"), 0);
+                                try a.jcc(.ne, rows_hit.?);
+                                // Row-free: counter publish, episode mark,
+                                // lane shift onto the popped-into caller
+                                // window, dispatch. No row, no scalar-exit
+                                // stores, no forced-yield (the budget is the
+                                // bound).
+                                try emit.emitRowFreeHitPublish(a, ctx, &link_hit_counters[t.instrs.len + ki], miss);
+                                try a.movByteMemImm(.rdx, @offsetOf(NativeResult, "frame_motion_taken"), 1);
+                                // P2 amendment: committed frame hop —
+                                // re-open the one-rowless-sibling-hop window.
+                                try a.movByteMemImm(.rdx, @offsetOf(NativeResult, "sibling_hop_taken"), 0);
                                 try a.subRegImm32(.rdi, nreg);
                                 try a.subRegImm32(.rsi, nreg * 8);
-                                try emitForcedYieldCheck(a, se);
                                 try a.jmpReg(.rax);
                                 a.bind(next);
                             }
                         }
+                        a.bind(miss);
+                        try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+                        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
+                        try emitLedgerAppend(a, trace_id, .ret_pop);
                         try emitReturn(a, frame, callee[0..callee_len], shared_exit, trace_id, null);
+                        if (shared_exit) |se| {
+                            // Rows-first episode's armed hit: today's
+                            // positional `.ret_pop` row + the cap-bounded
+                            // dispatch, byte-equivalent to the pre-P2 path.
+                            const nreg: i32 = t.anchor.proto.num_registers;
+                            a.bind(rows_hit.?);
+                            // Stash the dispatch target across the row append
+                            // (`emitLedgerAppend` clobbers rax/rcx; r10 is
+                            // dead scratch here).
+                            try a.movRegReg(.r10, .rax);
+                            try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+                            try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
+                            try emitLedgerAppend(a, trace_id, .ret_pop);
+                            // A cap cut returns before a child stamps itself.
+                            try a.movMemImm32(.rdx, @offsetOf(NativeResult, "final_trace_id"), @bitCast(trace_id));
+                            try a.movRegReg(.rax, .r10);
+                            try a.subRegImm32(.rdi, nreg);
+                            try a.subRegImm32(.rsi, nreg * 8);
+                            try emitForcedYieldCheck(a, se);
+                            try a.jmpReg(.rax);
+                        }
                         a.bind(no_pop);
                     };
                 }
@@ -2546,6 +2644,62 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     // `.normal`. The append clobbers rax/rcx but not the memory-staged `exit_target` the
     // dispatch below reads. Precedes the final_trace_id stamp — harmless, `t.id` is the
     // same value we pass as the ledger id.
+    // P2 AMENDMENT (doc 54): the rowless armed sibling fast path, tested
+    // BEFORE the row append. Post-motion, an armed one-shot→one-shot
+    // `.sibling_handoff` exit (gate byte set by `commitSlotMutation`'s
+    // paired publish) FOLLOWS its arm without a ledger row — the carried-
+    // home flush above already left the shared anchor coherent, exactly the
+    // state the sibling's own prologue guards re-validate. Bounds: at most
+    // ONE rowless hop between committed frame motions (`sibling_hop_taken`,
+    // cleared only at committed push/pop/frame-hop points) and the descent
+    // budget's pre-publication decrement-and-test. EVERY decline falls into
+    // the unchanged rows tail below: the `.deopt` row appends as the
+    // episode's final row and `emitForcedYieldCheck`'s motion branch
+    // refuses the arm (dispatcher bounce, outcome `.normal`) — the pre-
+    // amendment behaviour, now the degenerate case instead of the only one.
+    var deopt_rows_tail: ?x64.Label = null;
+    if (shared_exit) |se| if (seed_ctx) |ctx| {
+        const old_tail = try a.label();
+        // Single target load — the memory-staged resolved `slot[ei]` value
+        // the mini-stub wrote (never a slot re-read: no tear). rax stays
+        // the live jump target through the publish (contract-preserved).
+        try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "exit_target"));
+        try a.movRegImm64(.rcx, @bitCast(@as(u64, se)));
+        try a.cmpRegReg(.rax, .rcx);
+        try a.jcc(.e, old_tail); // unarmed
+        try a.cmpByteMemImm(.rdx, @offsetOf(NativeResult, "frame_motion_taken"), 0);
+        try a.jcc(.e, old_tail); // rows mode (no motion yet)
+        try a.cmpByteMemImm(.rdx, @offsetOf(NativeResult, "sibling_hop_taken"), 0);
+        try a.jcc(.ne, old_tail); // already hopped since the last motion
+        // Per-slot gate byte: slot_rowless_ok[exit_instr] (layout parallel
+        // to `slots`; only one-shot→one-shot sibling arms publish 1).
+        try a.movRegMem32(.rcx, .rdx, @offsetOf(NativeResult, "exit_instr"));
+        try a.movRegImm64(.r9, @bitCast(@as(u64, @intFromPtr(slot_rowless_ok.ptr))));
+        try a.addRegReg(.r9, .rcx);
+        try a.cmpByteMemImm(.r9, 0, 0);
+        try a.jcc(.e, old_tail); // arm kind/endpoints not rowless-eligible
+        // Descent budget: pre-publication decrement-and-test (every rowless
+        // transition pays; a zero budget declines without storing).
+        try a.movRegMem32(.r9, .rdx, @offsetOf(NativeResult, "descent_budget"));
+        try a.subRegImm32(.r9, 1);
+        try a.jcc(.s, old_tail);
+        try a.movMemReg32(.rdx, @offsetOf(NativeResult, "descent_budget"), .r9);
+        // Record address at runtime: counters_base + exit_instr * 24 — the
+        // ordinary cells of the extended `link_hit_counters` array (rcx
+        // still holds the index). Touched-list overflow → rows tail.
+        try a.movRegImm64(.r10, @sizeOf(artifact.LinkHitCounter));
+        try a.imulRegReg(.r10, .rcx);
+        try a.movRegImm64(.r11, @bitCast(@as(u64, @intFromPtr(link_hit_counters.ptr))));
+        try a.addRegReg(.r10, .r11);
+        try emit.emitRowFreeHitPublishReg(a, ctx, old_tail);
+        // Mark the hop window consumed, then jump straight into the
+        // sibling's ordinary entry. No row, no completed/final stamps (the
+        // eventual real exit stamps its own), no forced-yield check.
+        try a.movByteMemImm(.rdx, @offsetOf(NativeResult, "sibling_hop_taken"), 1);
+        try a.jmpReg(.rax);
+        deopt_rows_tail = old_tail;
+    };
+    if (deopt_rows_tail) |l| a.bind(l);
     try emitLedgerAppend(a, trace_id, .deopt);
     // P-B: stamp the final trace id. `emitReturn` normally does this, but here the
     // dispatch target is the resolved value the mini-stub already staged into
@@ -2560,7 +2714,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
         // `shared_exit` (byte-identical to 2.1's direct jump); 2.3c-1 arms it to a child
         // body entry. 2.3c-2c: load the resolved target into rax and apply the forced-yield
         // cap (redirects an armed source-branch dispatch to `shared_exit` when the ledger is
-        // full) before jumping.
+        // full) before jumping. (P2 amendment: the reload is REQUIRED — the fast path
+        // above and `emitLedgerAppend` both leave rax clobbered on this path; reloading
+        // the memory-staged value is legal, it is not a slot re-read.)
         try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "exit_target"));
         try emitForcedYieldCheck(a, se);
         try a.jmpReg(.rax);

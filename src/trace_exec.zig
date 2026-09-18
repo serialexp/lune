@@ -79,6 +79,18 @@ pub const ExitReason = enum(u32) {
 /// once 2.3c-2c closes the cycle, a chain-source forces a yield to `shared_exit`.
 pub const LEDGER_CAP: usize = 32;
 
+/// Doc 54 P2: per-episode frame-motion transition budget — the blackout
+/// bound that replaces `LEDGER_CAP` for ROW-FREE frame-motion cycles (rows
+/// mode keeps the cap). Initialized into `NativeResult.descent_budget` by
+/// the run wrapper for every native episode; every frame-motion sequence
+/// (inline push — same-page or cont — and inline pop) decrements-and-tests
+/// it PRE-mutation, and at zero takes its ordinary decline path (plain
+/// terminal exit, outcome `.normal`, no frame mutated — already legal
+/// grammar at every site). A pure function of the deterministic transition
+/// stream: replay-stable, 8-mode-invisible (it moves WHERE code runs,
+/// never what it computes).
+pub const DESCENT_BUDGET: u32 = 65_536;
+
 /// Result of executing a trace.
 pub const ExecResult = struct {
     /// Tier-1a: completed guest iterations. Native: raw chain-cumulative back-edge
@@ -161,8 +173,8 @@ pub const ExecResult = struct {
     /// Round-6 exactness: the terminal edge is measured, never reconstructed from
     /// the transition count (see `TraceState.silentCellOwner`).
     silent_last_cell: u64 = 0,
-    /// Doc 44 D11: how many REAL VM frames the native run pushed via the
-    /// self-call push helper (`nativeSelfCallPush`). Nonzero breaks the old
+    /// Doc 44 D11 / doc 54: how many REAL VM frames the native run pushed via
+    /// the inline self-call push sequence. Nonzero breaks the old
     /// episode invariant "a native run never changes the VM frame stack":
     /// BOTH dispatcher consumers must branch on it FIRST — before the silent
     /// drain, the seed-decline handlers, the D10 burst consumer, and every
@@ -177,6 +189,15 @@ pub const ExecResult = struct {
     /// existing pushed-frame branch already routes every frame-motion result.
     /// Native only; tier-1a leaves it 0.
     popped_frames: u64 = 0,
+    /// Doc 54 P2: the episode took at least one ROW-FREE cross-page
+    /// frame-motion transition (`.ret_cont`/`.call_head` armed hit with an
+    /// empty ledger). Selects the totals path in `consumePushedDescent`:
+    /// the ledger is then always empty-plus-final (zero intermediate rows;
+    /// the final row's owner is the exiting page, NOT the entered trace),
+    /// and the per-slot hit counters published to the seed ctx's touched
+    /// list carry the transition counts. Implies `pushed_frames > 0`
+    /// (asserted at the marshal). Native only; tier-1a leaves it false.
+    frame_motion_taken: bool = false,
 };
 
 /// 2.3c-2c (doc 17): which exit-materialization SITE appended a ledger entry —
