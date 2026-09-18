@@ -1690,3 +1690,14 @@ demotions in trace.zig, compiler-adjudicated). Deferred items:
 - [ ] A differential identity test through a REAL keyframe capture/restore
       (run the eq trace pre-capture and post-restore and compare), rather
       than the simulated same-id/different-address twin.
+
+## Recurring jit-debug test-gate flake (2 occurrences, 2 days)
+
+- [ ] Hunt the nondeterministic `zig build test -Djit-debug=true` failure:
+      2026-09-17 seed 0x3ace15b0, 2026-09-18 seed 0x34eef2f0 — each failed
+      once, then PASSED with the very same seed on rerun, so it is not
+      seed-deterministic. Suspect test parallelism / shared state / timing
+      rather than the seeded shuffle. Neither occurrence surfaced the failing
+      test's name before the runner exited. Next occurrence: capture full
+      output (`> log 2>&1`) and extract the test name; a nondeterministic
+      failure in this project is a real bug (Rule #2), not noise.

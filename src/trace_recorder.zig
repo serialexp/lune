@@ -357,28 +357,12 @@ pub const PeelState = struct {
 };
 
 /// Key for interning constants in the recorder's const pool. Built from the tag
-/// plus the meaningful payload bits — NOT the raw 16-byte `Value`, which has
-/// uninitialised padding between `tag` and `payload`. Immediates compare by
-/// value; a `heap_ref` const (always a string literal) compares by object
-/// identity, which is conservative and sufficient: the same pooled literal is the
-/// same heap object, and consts are GC roots for the recording's lifetime, so no
-/// address is reused mid-recording.
-pub const KonstKey = struct { tag: u8, bits: u64 };
-
-pub fn konstKey(v: Value) KonstKey {
-    return .{
-        .tag = @intFromEnum(v.tag),
-        .bits = switch (v.tag) {
-            .nil => 0,
-            .boolean => @as(u64, @intFromBool(v.asBool())),
-            .int => @bitCast(v.asInt()),
-            .float => @bitCast(v.asFloat()),
-            .heap_ref => @intFromPtr(v.asHeap()),
-            // Never a trace constant (runtime transient).
-            .row_view => unreachable,
-        },
-    };
-}
+/// plus the meaningful payload bits. Moved to `trace_ir.zig` (doc 51 Fix B —
+/// the optimizer keys its konst canonicalization on the same identity, and
+/// tropt must not depend on this module); re-exported so recorder-side call
+/// sites and tests keep their spelling.
+pub const KonstKey = trace_ir.KonstKey;
+pub const konstKey = trace_ir.konstKey;
 
 /// The in-progress recording buffer. `TraceState` owns it and drives every
 /// mutation through its own methods (`emit`/`refOf`/`recordInstr`/…); this struct

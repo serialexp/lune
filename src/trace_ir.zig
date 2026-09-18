@@ -13,10 +13,37 @@
 const std = @import("std");
 const io = @import("io.zig");
 const function = @import("function.zig");
+const value_mod = @import("value.zig");
 
 /// An SSA value reference: an index into a trace's `instrs` array. Every IR
 /// instruction defines exactly one value, named by its position.
 pub const Ref = u16;
+
+/// The dedup key for a trace-constant `Value`: the tag plus the meaningful
+/// payload bits — NOT the raw 16-byte `Value`, which has uninitialised padding
+/// between `tag` and `payload`. Immediates compare by value; a `heap_ref`
+/// const compares by object identity, which is conservative and sufficient:
+/// the same pooled literal is the same heap object, and consts are GC roots
+/// for the recording's lifetime, so no address is reused mid-recording. Owned
+/// here (not by the recorder) because the pool it describes is trace IR's:
+/// both the recorder's `konst()` dedup and the optimizer's konst
+/// canonicalization (doc 51 Fix B) key on it.
+pub const KonstKey = struct { tag: u8, bits: u64 };
+
+pub fn konstKey(v: value_mod.Value) KonstKey {
+    return .{
+        .tag = @intFromEnum(v.tag),
+        .bits = switch (v.tag) {
+            .nil => 0,
+            .boolean => @as(u64, @intFromBool(v.asBool())),
+            .int => @bitCast(v.asInt()),
+            .float => @bitCast(v.asFloat()),
+            .heap_ref => @intFromPtr(v.asHeap()),
+            // Never a trace constant (runtime transient).
+            .row_view => unreachable,
+        },
+    };
+}
 
 /// Index into the (future) per-guard snapshot table. Still a RESERVED
 /// placeholder (checked 2026-09: no producer writes a non-default value and no

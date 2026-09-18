@@ -285,11 +285,58 @@ fn guardConstPasses(ins: IrInstr, v: Value) bool {
     };
 }
 
-/// CSE key for a pure value-producing op (konst is excluded — not CSE'd here).
+/// CSE key for a pure value-producing op (konst is excluded — not CSE'd here;
+/// konsts canonicalize by VALUE via `KonstCanonKey` below, doc 51 Fix B).
 /// Operand-order sensitive (no commutative canonicalization) and includes `ty`
 /// so a future type-sensitive executor can't be tricked by a merge.
 const CseKey = struct { op: IrOp, a: Ref, b: Ref, aux: i32, ty: ObsType };
 const GuardKey = struct { op: IrOp, a: Ref, aux: i32 };
+
+/// Doc 51 Fix B (F3): the by-value canonicalization key for konst-valued refs
+/// (recorded konst instrs and fold results alike). Scalars key on exact
+/// `(tag, bits)` — deterministic including `-0` and NaN payloads; heap
+/// constants key on object identity via `konstKey`'s `@intFromPtr`, the same
+/// precedent the recorder uses: consts are GC roots for the trace's lifetime,
+/// so no address is reused, and pointer identity never falsely conflates two
+/// distinct objects (keying by `GcHeader.id` would — raw test-created tables
+/// share id 0). The pointer never enters the emitted trace; it only picks a
+/// canonical SSA ref, and that choice is deterministic because object
+/// identity is replay-stable. `ty` is included for the same reason as
+/// `CseKey`'s: two equal-valued konsts under different IR types must not merge.
+const KonstCanonKey = struct { k: trace.KonstKey, ty: ObsType };
+
+/// Doc 51 Fix B: resolve a fold result `res` at instruction `i` to a canonical
+/// konst. If an earlier canonical konst-valued ref carries the same
+/// `(value, ty)`, instruction `i` canonicalizes to it — no new instruction, no
+/// pool growth. Otherwise the value is interned into the pool (reusing an
+/// existing equal-valued entry when present — existing entries are NEVER
+/// renumbered or pruned: `sgmatch.aux`, `guard_sid.aux`, and
+/// `InputSeed.source` are pool indices that ride verbatim through compaction)
+/// and `i` becomes the canonical konst for that value.
+fn resolveFold(
+    gpa: std.mem.Allocator,
+    out_consts: *std.ArrayListUnmanaged(Value),
+    pool_map: *std.AutoHashMapUnmanaged(trace.KonstKey, i32),
+    kcanon: *std.AutoHashMapUnmanaged(KonstCanonKey, Ref),
+    canon: []Ref,
+    fold_aux: []?i32,
+    i: usize,
+    res: Value,
+    ty: ObsType,
+) !void {
+    const kk = trace.konstKey(res);
+    if (kcanon.get(.{ .k = kk, .ty = ty })) |c| {
+        canon[i] = c; // an equal konst already exists → this fold is dead
+        return;
+    }
+    const gop = try pool_map.getOrPut(gpa, kk);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = @intCast(out_consts.items.len);
+        try out_consts.append(gpa, res);
+    }
+    fold_aux[i] = gop.value_ptr.*;
+    try kcanon.put(gpa, .{ .k = kk, .ty = ty }, @intCast(i));
+}
 
 /// The part of a guard's `aux` that is *semantic identity* — what distinguishes
 /// two otherwise-identical guards on the same operand — as opposed to the
@@ -378,21 +425,44 @@ pub fn optimize(
     var guards: std.AutoHashMapUnmanaged(GuardKey, void) = .empty;
     defer guards.deinit(gpa);
 
+    // Doc 51 Fix B (F3): value-keyed konst canonicalization state. `pool_map`
+    // interns fold results against the pool (first occurrence of each value
+    // wins; existing entries are never renumbered); `kcanon` holds the
+    // canonical SSA ref per distinct `(value, ty)`.
+    var pool_map: std.AutoHashMapUnmanaged(trace.KonstKey, i32) = .empty;
+    defer pool_map.deinit(gpa);
+    for (consts, 0..) |cv, ci| {
+        const gop = try pool_map.getOrPut(gpa, trace.konstKey(cv));
+        if (!gop.found_existing) gop.value_ptr.* = @intCast(ci);
+    }
+    var kcanon: std.AutoHashMapUnmanaged(KonstCanonKey, Ref) = .empty;
+    defer kcanon.deinit(gpa);
+
     // --- forward: fold + CSE-tagging + guard elimination ---
     for (instrs, 0..) |ins, i| {
         switch (kindOf(ins.op)) {
-            .konst => const_val[i] = consts[@intCast(ins.aux)],
+            .konst => {
+                const v = consts[@intCast(ins.aux)];
+                const_val[i] = v;
+                // Doc 51 Fix B: canonicalize equal-valued konsts to one SSA
+                // ref so downstream CSE keys (which hash canonical operand
+                // refs) see them as the same operand. The later duplicate
+                // becomes non-canonical → dead → not emitted; its pool entry
+                // stays (never renumbered).
+                const ckey = KonstCanonKey{ .k = trace.konstKey(v), .ty = ins.ty };
+                if (kcanon.get(ckey)) |c| {
+                    canon[i] = c;
+                } else try kcanon.put(gpa, ckey, @intCast(i));
+            },
             .slot_load => {}, // a loop-variant input: not constant, canonical to itself
             .binary => {
                 const a2 = canon[ins.a];
                 const b2 = canon[ins.b];
                 if (const_val[a2]) |va| if (const_val[b2]) |vb| {
                     if (ir_eval.evalBinary(ins.op, va, vb)) |res| {
-                        const aux: i32 = @intCast(out_consts.items.len);
-                        try out_consts.append(gpa, res);
-                        fold_aux[i] = aux;
                         const_val[i] = res;
-                        continue; // becomes a konst; do not CSE as a binary op
+                        try resolveFold(gpa, &out_consts, &pool_map, &kcanon, canon, fold_aux, i, res, ins.ty);
+                        continue; // becomes a konst (or an earlier one); never CSE'd as a binary op
                     } else |_| {} // fold would error → leave as a runtime op
                 };
                 const key = CseKey{ .op = ins.op, .a = a2, .b = b2, .aux = ins.aux, .ty = ins.ty };
@@ -409,10 +479,8 @@ pub fn optimize(
                 if (ins.op != .fsqrt and ins.op != .fsin and ins.op != .fcos and ins.op != .ffloor and ins.op != .fceil and ins.op != .slen) {
                     if (const_val[a2]) |va| {
                         if (ir_eval.evalUnary(ins.op, va)) |res| {
-                            const aux: i32 = @intCast(out_consts.items.len);
-                            try out_consts.append(gpa, res);
-                            fold_aux[i] = aux;
                             const_val[i] = res;
+                            try resolveFold(gpa, &out_consts, &pool_map, &kcanon, canon, fold_aux, i, res, ins.ty);
                             continue;
                         } else |_| {}
                     }
@@ -1112,6 +1180,110 @@ test "tropt: a repeated subexpression is CSE'd to a single instruction" {
     const last_add = opt.instrs[3];
     try testing.expectEqual(IrOp.add, last_add.op);
     try testing.expectEqual(last_add.a, last_add.b);
+}
+
+test "tropt doc 51 F3: equal-valued konsts canonicalize to one ref and unlock CSE" {
+    const gpa = testing.allocator;
+    // Two konst instrs read DISTINCT pool slots holding the same value 7; the
+    // two `r0 + 7` adds differ only in which duplicate they reference. Without
+    // value canonicalization their CSE keys differ (distinct operand refs) and
+    // both survive.
+    const instrs = trace.withPhis(&[_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0 = r0
+        .{ .op = .konst, .aux = 0 }, // %1 = 7
+        .{ .op = .konst, .aux = 1 }, // %2 = 7 (duplicate pool slot)
+        .{ .op = .add, .a = 0, .b = 1 }, // %3 = r0 + 7
+        .{ .op = .add, .a = 0, .b = 2 }, // %4 = r0 + 7 → CSE with %3 post-canon
+        .{ .op = .add, .a = 3, .b = 4 }, // %5 = %3 + %4
+        .{ .op = .loop }, // %6
+    }, &[_]SlotStore{.{ .slot = 0, .ref = 5 }});
+    const consts = [_]Value{ Value.int(7), Value.int(7) };
+    var opt = try optimize(gpa, &instrs, &consts);
+    defer freeOpt(gpa, &opt);
+
+    // One konst survives (the duplicate is non-canonical → dead) and the two
+    // r0+7 adds merge; the final add reads the merged ref twice.
+    try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .konst));
+    try testing.expectEqual(@as(usize, 2), countOp(opt.instrs, .add));
+    // The pool itself is never renumbered or pruned — both entries remain.
+    try testing.expectEqual(consts.len, opt.consts.len);
+}
+
+test "tropt doc 51 F3: a fold result reuses an equal-valued pool entry and an equal konst ref" {
+    const gpa = testing.allocator;
+    // %3 folds 2+3 → 5, which already exists BOTH as pool slot 2 and as konst
+    // instr %0. The fold must add no pool entry and no konst instr — it
+    // canonicalizes to %0, letting the two `r0 + 5` adds CSE.
+    const instrs = trace.withPhis(&[_]IrInstr{
+        .{ .op = .konst, .aux = 2 }, // %0 = 5
+        .{ .op = .konst, .aux = 0 }, // %1 = 2
+        .{ .op = .konst, .aux = 1 }, // %2 = 3
+        .{ .op = .add, .a = 1, .b = 2 }, // %3 = 2 + 3 → folds to 5 ≡ %0
+        .{ .op = .slot_load, .aux = 0 }, // %4 = r0
+        .{ .op = .add, .a = 4, .b = 0 }, // %5 = r0 + %0
+        .{ .op = .add, .a = 4, .b = 3 }, // %6 = r0 + %3 → CSE with %5 post-canon
+        .{ .op = .add, .a = 5, .b = 6 }, // %7 = %5 + %6
+        .{ .op = .loop }, // %8
+    }, &[_]SlotStore{.{ .slot = 0, .ref = 7 }});
+    const consts = [_]Value{ Value.int(2), Value.int(3), Value.int(5) };
+    var opt = try optimize(gpa, &instrs, &consts);
+    defer freeOpt(gpa, &opt);
+
+    try testing.expectEqual(consts.len, opt.consts.len); // no pool growth
+    try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .konst)); // one 5
+    try testing.expectEqual(@as(usize, 2), countOp(opt.instrs, .add)); // %5≡%6, plus %7
+}
+
+test "tropt doc 51 F3: two folds producing the same value share one konst and one pool entry" {
+    const gpa = testing.allocator;
+    // 2+3 and 1+4 both fold to 5: exactly one new pool entry and one konst
+    // instr, and the downstream `r0 + 5` adds CSE. (This is the unrolled
+    // for_prep/for_loop arithmetic shape that bloated t3's pool 5 → 37.)
+    const instrs = trace.withPhis(&[_]IrInstr{
+        .{ .op = .konst, .aux = 0 }, // %0 = 2
+        .{ .op = .konst, .aux = 1 }, // %1 = 3
+        .{ .op = .konst, .aux = 2 }, // %2 = 1
+        .{ .op = .konst, .aux = 3 }, // %3 = 4
+        .{ .op = .add, .a = 0, .b = 1 }, // %4 → 5 (new konst)
+        .{ .op = .add, .a = 2, .b = 3 }, // %5 → 5 ≡ %4
+        .{ .op = .slot_load, .aux = 0 }, // %6 = r0
+        .{ .op = .add, .a = 6, .b = 4 }, // %7 = r0 + 5
+        .{ .op = .add, .a = 6, .b = 5 }, // %8 = r0 + 5 → CSE with %7
+        .{ .op = .add, .a = 7, .b = 8 }, // %9
+        .{ .op = .loop }, // %10
+    }, &[_]SlotStore{.{ .slot = 0, .ref = 9 }});
+    const consts = [_]Value{ Value.int(2), Value.int(3), Value.int(1), Value.int(4) };
+    var opt = try optimize(gpa, &instrs, &consts);
+    defer freeOpt(gpa, &opt);
+
+    try testing.expectEqual(consts.len + 1, opt.consts.len); // exactly one new entry (5)
+    try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .konst));
+    try testing.expectEqual(@as(usize, 2), countOp(opt.instrs, .add));
+}
+
+test "tropt doc 51 F3: distinct heap konsts with identical ids never canonicalize (pointer identity)" {
+    const gpa = testing.allocator;
+    const object = @import("object.zig");
+    // Two RAW headers, both id 0 — the exact trap keying by `GcHeader.id`
+    // would fall into (Fix A's recorded gotcha). Pointer identity keeps them
+    // distinct: the two `eq` compares against them must NOT CSE.
+    var h1 = object.GcHeader.init(.table);
+    var h2 = object.GcHeader.init(.table);
+    const instrs = trace.withPhis(&[_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0 = r0
+        .{ .op = .konst, .aux = 0 }, // %1 = table A
+        .{ .op = .konst, .aux = 1 }, // %2 = table B (same id, different object)
+        .{ .op = .eq, .a = 0, .b = 1, .ty = .boolean }, // %3 = r0 == A
+        .{ .op = .eq, .a = 0, .b = 2, .ty = .boolean }, // %4 = r0 == B — must survive
+        .{ .op = .band, .a = 3, .b = 4 }, // %5 keeps both alive
+        .{ .op = .loop }, // %6
+    }, &[_]SlotStore{.{ .slot = 0, .ref = 5 }});
+    const consts = [_]Value{ Value.heap(&h1), Value.heap(&h2) };
+    var opt = try optimize(gpa, &instrs, &consts);
+    defer freeOpt(gpa, &opt);
+
+    try testing.expectEqual(@as(usize, 2), countOp(opt.instrs, .konst));
+    try testing.expectEqual(@as(usize, 2), countOp(opt.instrs, .eq));
 }
 
 test "tropt: a dead computation (and its now-unused input) is eliminated" {

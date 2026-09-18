@@ -75,6 +75,57 @@ the ones that bite):
   before declaring it hard; "replay/determinism forbids it" only ever means
   *adapt* the mechanism (ids not addresses, deterministic counters).
 
+## Status 2026-09-18 (latest+19) — doc 51 Fix B: konst value canonicalization LANDED
+
+Bart picked Fix B as the most general lever. What landed (task #35, all in
+`src/tropt.zig` + one move):
+
+- **The change.** Konst instrs and fold results now canonicalize by
+  `(value, ty)` to one SSA ref (`KonstCanonKey` + `resolveFold`); fold
+  results intern against the pool via a value-keyed `pool_map` seeded from
+  the input consts (reuse an equal-valued entry, else append — existing pool
+  entries are NEVER renumbered/pruned: `sgmatch.aux`/`guard_sid.aux`/
+  `InputSeed.source` are pool indices riding verbatim through compaction).
+  Downstream CSE keys hash canonical operand refs, so equal-konst-fed
+  expressions now merge; the duplicate konst instr goes non-canonical → dead.
+- **Deviation from the codex review, recorded in doc 51:** heap constants
+  key by object identity (`konstKey` pointer), NOT `GcHeader.id` — same id-0
+  raw-test-object hazard Fix A documented; a test pins two id-0 headers
+  apart. Deterministic: consts are GC roots for the trace's lifetime, the
+  pointer never enters the emitted trace.
+- **Boundary move.** `KonstKey`/`konstKey` moved `trace_recorder.zig` →
+  `trace_ir.zig` (re-exported from the recorder): the `just test` JIT
+  boundary check correctly rejects `tropt → trace_recorder` (found the hard
+  way — first gate run failed on it).
+- **Tests.** Four new `tropt doc 51 F3:` unit tests (equal konsts
+  canonicalize + unlock CSE; fold reuses an equal pool entry AND an equal
+  konst ref; two same-value folds share one konst + one pool entry; distinct
+  id-0 heap konsts never merge). Bite-verified: neutering both
+  canonicalization points fails the first three; the heap test is a
+  deliberate negative (guards against WRONG keying, passes either way).
+- **Measurements.** Instrument (`nest_probe`): driver trace pool 37 → 11
+  entries (all unique), body 486 → 441 instrs (−9.3%); outputs byte-identical
+  across tier-0/`--trace`/`--jit-native`; 82.3% native by cycles. Board
+  (`bench/results/20260918-123134-20d7b27.tsv`): all cross=ok/luajit=ok, NO
+  regressions; the eight "−5–9% movers" were checked ×3 interleaved against a
+  `just shadow` pre-B baseline (nm-verified: shadow lacks `resolveFold`) —
+  OLD ≈ NEW on every one, i.e. board drift, and Fix B is **board-neutral**;
+  its win is trace quality (size/CSE), general per Z-6.
+- **jit-debug gate flake, 2nd occurrence.** `zig build test -Djit-debug=true`
+  failed once (seed 0x34eef2f0), then PASSED with the SAME seed + 3 more
+  random-seed runs — so not seed-deterministic; parallelism/shared-state
+  suspect. Now recorded in TODO.md with capture instructions for the next hit.
+- **Rule #6 note (confessed):** the 6-site `recorder.konstKey` →
+  `trace.konstKey` rename in tropt was applied via a Python one-liner without
+  a dry-run pass first (counts printed and matched, full gate green after,
+  but the letter of the rule says dry-run first).
+
+**Outstanding from doc 51:** Fix C (short-burst silent-promotion evidence —
+needs a doc-47-grade design first) and the optional statically-false-guard
+commit rejection (tri-state evaluator). **Next-arc candidates:** nbody's
+driver-loop `aliased_input get_upval` abort (18.5% of its run), Fix C /
+replayLedger seam, task #18 doc 44 return tracing.
+
 ## Status 2026-09-17 (latest+18) — doc 51: nest diagnosis complete + Fix A (DOA alias guards) LANDED
 
 Ran the Astra-recommended layered diagnosis (doc 50 → **doc 51,

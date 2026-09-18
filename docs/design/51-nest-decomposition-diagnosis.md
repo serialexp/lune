@@ -1,11 +1,12 @@
 # 51 — Variable-trip nest decomposition: layered diagnosis + DOA alias guards
 
-**Status:** diagnosis complete; Fix A (record-time truth) LANDED and green;
-Fix B/C outstanding. Design reviewed by codex (gpt-5.6-sol, thread
+**Status:** diagnosis complete; Fix A (record-time truth) and Fix B (konst
+canonicalization) LANDED and green; Fix C + the optional statically-false
+guard backstop outstanding. Design reviewed by codex (gpt-5.6-sol, thread
 `01a0ac91-853c-7b03-b097-a6b7a5abba76`) — see "External review" for the two
 material corrections, both folded into the implemented matrix
 **Owner:** claude
-**Last updated:** 2026-09-17
+**Last updated:** 2026-09-18
 
 ## Implementation status
 
@@ -46,11 +47,32 @@ material corrections, both folded into the implemented matrix
   loop aborts earlier on `aliased_input get_upval`, the separately-recorded
   next candidate.
 
+- [x] **Fix B — konst value canonicalization in the optimizer (F3).** Landed
+  2026-09-18. Konst instrs and fold results canonicalize by `(value, ty)` to
+  one SSA ref; fold results intern against the pool (reusing equal-valued
+  entries; existing entries never renumbered or pruned — `sgmatch.aux`/
+  `guard_sid.aux`/`InputSeed.source` ride verbatim). One deliberate deviation
+  from the review: heap constants key by object identity via `konstKey`'s
+  pointer, NOT `GcHeader.id` — raw test-created objects share id 0, so
+  id-keying would falsely conflate distinct objects (the same hazard Fix A
+  hit); a dedicated test pins two id-0 headers apart. `KonstKey`/`konstKey`
+  moved from `trace_recorder.zig` to `trace_ir.zig` (re-exported) — tropt
+  must not depend on the recorder per the JIT boundary check, and the pool
+  the key describes is trace IR's. Four unit tests, three bite-verified (the
+  heap test is a negative — it guards against wrong keying, not absence).
+  Measured on the instrument: driver trace pool 37 → 11 entries (all
+  unique), body 486 → 441 instrs (−9.3%, unlocked CSE); board NEUTRAL — the
+  full-board "-5–9% movers" were re-checked ×3 interleaved against a
+  `just shadow` pre-B baseline (`nm`-verified: shadow lacks `resolveFold`)
+  and are baseline drift, OLD ≈ NEW on every one.
+
 ### Outstanding
 
-- [ ] **Fix B — konst value canonicalization in the optimizer.** Fold-dedup +
-  canonical refs for equal-valued constants (F3); optional statically-false
-  guard backstop at commit. Independent of F1 (see correction).
+- [ ] **Statically-false-guard commit rejection (optional Fix B backstop).**
+  Loud tri-state evaluator (proven-pass / proven-fail / unknown) rejecting a
+  candidate whose guard provably always fails on constants; would NOT have
+  caught F1 (see review note). Not built with Fix B — needs its own
+  justification.
 - [ ] **Fix C — silent-promotion evidence for short bursts (doc 47
   follow-on).** Only if Bart wants it; the gate's cap-saturation requirement
   is deliberate drain-pressure proof, and the review's lifecycle-ordering
@@ -258,6 +280,16 @@ pool gains one slot per distinct new value. Review-driven constraints:
   against existing entries and canonicalize SSA refs only.
 - This does NOT collapse aref/aload chains (memory ops are never CSE'd)
   and is independent of F1.
+
+**Follow-up (2026-09-18, as landed):** heap constants key by object identity
+(`konstKey`'s pointer), not `GcHeader.id` as the review suggested — the same
+id-0 raw-test-object hazard Fix A documented applies here (distinct unlinked
+objects share id 0 and would falsely conflate), and within one `optimize()`
+call the pointer is exactly as replay-stable as the id (consts are GC roots
+for the trace's lifetime; the pointer never enters the emitted trace). A
+dedicated test pins two id-0 headers apart. `KonstKey`/`konstKey` moved to
+`trace_ir.zig` (re-exported from the recorder) because the JIT boundary check
+correctly rejects `tropt → trace_recorder`.
 
 Optional backstop: a guard proven to always FAIL on constants shows the
 trace can never complete — reject the candidate at commit (loud: its own
