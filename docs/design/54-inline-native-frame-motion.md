@@ -1,7 +1,8 @@
 # 54 — Inline native frame motion (recursion without callouts)
 
-**Status:** partial — P0 landed (commits `3891fd1` + `3df7d53`); P1–P3
-outstanding. Design codex-approved ×7 rounds.
+**Status:** partial — P0 landed (commits `3891fd1` + `3df7d53`), P1 landed
+(commits `4084142` + `aeddcac`); P2–P3 outstanding. Design codex-approved
+×7 rounds.
 **Owner:** claude (campaign: every benchmark ≤1.2× LuaJIT; weakest-bench arc)
 **Last updated:** 2026-09-18
 
@@ -46,13 +47,62 @@ outstanding. Design codex-approved ×7 rounds.
     profile via that path only, exactly the protocol's P0 receipt.
     Pushes = every call (7.05M at N=32 ≈ C(32)), pops ~88% of them.
 
-### Outstanding
-- [ ] **P1 — inline pop + open-upvalue ceiling.** The pop fast path emitted
+- [x] **P1 — inline pop + open-upvalue ceiling.** The pop fast path emitted
   inline against the episode-structural invariants (each named, argued,
   and asserted); new VM-general `open_upvalue_ceiling` watermark replaces
   the per-pop full list scan; region-activation drop resolved to a
   fast-path skip under the descent gate (assert-verified) or a
-  flag-guarded callout.
+  flag-guarded callout. Implementation notes (Mode-B):
+  - **Enablers** (commit `4084142`): `open_upvalue_ceiling` on `Vm`, all
+    `open_upvalues` mutations centralized (`appendOpenUpvalue` @max
+    raise via `captureUpvalue`/keyframe restore/tests,
+    `closeUpvaluesFrom` exact recompute on the walk it already does,
+    `clearOpenUpvalues`); `FrameMotionAbi` gained
+    `vm_self_ret_pops_off` + `vm_open_upvalue_ceiling_off`.
+  - **Emission** (commit `aeddcac`): `emitInlineSelfRetPop` + static pop
+    eligibility (ineligible pages emit NO pop epilogue);
+    `nativeSelfRetPop`/`self_ret_pop_fn`/POP grammar deleted (values
+    18/19 stay reserved). New `x64.movzxRegMem16` for the u16 ret-wiring
+    loads; the copy loop uses the SIB forms with a runtime `want` and
+    emit-time `count`/`a_reg`.
+  - **The step-4 "skip" is NOT a pure no-op — design correction.** Under
+    the gate `dropRegionActivation` closes nothing, but `nextActivation`
+    has a side effect the doc missed: it CLEARS `region_context_valid`
+    when the context seq matches the popped frame's (which the push set
+    it to — i.e. on every pop). The inline sequence replicates exactly
+    that residue (cmp seq + one byte store); the zero-activations
+    premise is assert-pinned. No flag-guarded callout was needed.
+  - **The invariant asserts live in `nativeFrameMotionAssert`**, a
+    jit-debug-only C-ABI callout installed in the ctx and emitted after
+    the net floor — zero release cost, and the jit-debug gate runs it on
+    every pop. Sabotage-verified: a broken adjacency premise (nreg+1)
+    panics the gate; a forced ceiling wall trips formation + ten-legs.
+  - **The ceiling wall is defense-in-depth today**: native bodies cannot
+    mint closures, so no open cell can appear over an episode-pushed
+    frame mid-episode (a side-exit mint ends the episode; a later
+    re-entry sees net=0 for that frame). Stale-LOW sabotage therefore
+    bites in the maintenance unit matrix + restore test, not at
+    integration; the wall becomes essential the day
+    closure minting is traced (doc 43 P2+ direction). New
+    escaping-closure ten-legs test pins the semantics either way.
+  - **`check-jit-boundaries.py` body-callout authority rule**: C-ABI fns
+    taking `*Vm`/`NativeSeedCtx` fail the check outside the episode-
+    boundary allowlist (`nativeSeedFn`, `nativeSelfCallPush`,
+    `nativeFrameMotionAssert`); 5 new scanner unit tests; the audited
+    "no body callout carries frame authority" claim is now CI, and the
+    real tree passes non-vacuously (scanner sees all 3 helpers).
+  - **P1 measurement** (interleaved A/B vs the `a0e66ae` pre-arc shadow,
+    load ~3.4): fib 199.6 → 171.6 ms ≈ **−14% cumulative P0+P1** (P1
+    alone ≈ −9%); board row 172.4 ms / 24.7× / res 87.2%; btrees flat
+    10.0×. Below the doc's −25-30% P0+P1 budget for a known reason the
+    P0 receipt already named: cont-page pushes (~60% of fib's motion)
+    still ride the C-ABI helper AND every armed transition still writes
+    its ledger row + forced-yield cut — both are P2's levers.
+    `--jit-stats` receipts: pushes 4.36M (= every call at N=31), pops
+    3.63M (83% unwind natively), 925k episode entries (~4.7
+    pushes/entry — P2 wants O(warmup)), native 84.4% of cycles, seam ~0.
+
+### Outstanding
 - [ ] **P2 — row-free armed frame-motion transitions + descent poll
   budget.** Armed `.ret_cont`/`.call_head` hits go row-free while the
   ledger is empty (rows-first episodes keep today's rows + cap;

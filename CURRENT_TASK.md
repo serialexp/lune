@@ -75,6 +75,51 @@ the ones that bite):
   before declaring it hard; "replay/determinism forbids it" only ever means
   *adapt* the mechanism (ids not addresses, deterministic counters).
 
+## Status 2026-09-18 (latest+23) — doc 54 P1 LANDED: inline pop + open-upvalue ceiling (recursive-fib arc, task #43)
+
+Commits `4084142` (enablers) + `aeddcac` (emission + battery + CI rule).
+`just test` (incl. the new body-callout scanner rule) + `-Djit-debug=true`
+gates green, no flake this round.
+
+**What landed (doc 54 P1 Done notes have the detail):**
+- Enablers: `Vm.open_upvalue_ceiling` watermark, all `open_upvalues`
+  mutations centralized (append @max raise / closeUpvaluesFrom exact
+  recompute / clear reset; keyframe restore republication), ABI offsets
+  for ceiling + self_ret_pops.
+- Emission: `emitInlineSelfRetPop` (descent byte → net floor → ceiling
+  wall → dynamic ret wiring → SIB copy loop → region-context-clear
+  replica → pop/ctx refresh/witness); static pop eligibility (ineligible
+  pages emit NO epilogue); `nativeSelfRetPop` + POP grammar DELETED;
+  `x64.movzxRegMem16` added with golden tests.
+- **Design correction found at implementation**: the doc's "skip the
+  region drop entirely" was wrong — under the gate `nextActivation` still
+  clears `region_context_valid` on seq match (i.e. on every pop). The
+  inline sequence replicates that residue; zero-activations premise is
+  assert-pinned.
+- Invariant asserts = `nativeFrameMotionAssert`, jit-debug-only C-ABI
+  callout (zero release cost). Sabotage-verified: adjacency break panics
+  the jit-debug gate; forced ceiling wall trips formation+ten-legs;
+  stale-LOW maintenance bites in the unit matrix + restore test (the
+  emitted wall is defense-in-depth until native closure minting exists).
+- `check-jit-boundaries.py`: body-callout authority rule (C-ABI fns must
+  not take *Vm/NativeSeedCtx outside the 3-helper allowlist) + 5 scanner
+  tests; runs in `just test`.
+- New tests: ceiling maintenance matrix, restore republication,
+  escaping-closure ten-legs, fail-closed pop extension; helper refusal
+  matrix retired (walls relocated — see the doc note in the test file).
+
+**Measurement** (interleaved A/B vs `a0e66ae` shadow, load ~3.4): fib
+199.6 → 171.6 ms ≈ −14% cumulative P0+P1 (P1 ≈ −9%); board 172.4 ms /
+24.7× / res 87.2%; btrees flat 10.0×. Below the doc's P0+P1 budget for
+the reason the P0 receipt named: cont-page pushes (~60% of motion) still
+ride the C helper and every armed transition still writes a ledger row +
+forced-yield cut — both P2 levers. `--jit-stats`: pushes 4.36M, pops
+3.63M (83%), 925k episode entries (~4.7 pushes/entry; P2 wants
+O(warmup)), native 84.4% of cycles.
+
+**NEXT: P2 — row-free armed frame-motion transitions + descent poll
+budget (the big lever), then P3 warm entries.**
+
 ## Status 2026-09-18 (latest+22) — doc 54 P0 LANDED: inline same-page push (recursive-fib arc, task #43)
 
 Commits `a0e66ae` (doc), `3891fd1` (enablers), `3df7d53` (emission + battery).
