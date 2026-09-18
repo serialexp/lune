@@ -1485,7 +1485,14 @@ pub const RecordingSession = struct {
         // inlining `.call`, so a callee index is never `.undef` here — the
         // executor's `slot_load aux` therefore always lands in `[0,
         // anchor_num_registers)`.
-        const abs: usize = self.base_off + slot;
+        return self.refOfAbs(self.base_off + slot);
+    }
+
+    /// The anchor-absolute-index body of `refOf` (doc 53): the open-upvalue
+    /// slot canonicalization reads an ANCHOR-window slot from a depth>0
+    /// context, which `refOf`'s frame-relative signature (it adds `base_off`)
+    /// cannot express. Same lazy `slot_load` + peel-φ machinery either way.
+    pub fn refOfAbs(self: *RecordingSession, abs: usize) !Ref {
         const s = &self.reg_map[abs];
         if (s.state != .undef) {
             // Doc 39: inside a peel's body pass, the first read of an
@@ -4802,7 +4809,12 @@ pub const RecordingSession = struct {
         }
         if (kind == .upvalue) {
             if (self.context.upval_open) |open_idx| {
-                if (open_idx >= self.anchor_abs_base) return self.abort(.aliased_input);
+                // Doc 53: an open cell over the trace-writable window cannot be
+                // a snapshot (the P0a staleness argument stands) — but when it
+                // aliases the ANCHOR frame's own window, the cell IS a tracked
+                // slot and the read canonicalizes to that slot's SSA value.
+                if (open_idx >= self.anchor_abs_base)
+                    return self.recUpvalSlotAlias(dest, source, open_idx);
             }
         }
         // Doc 43 §3.2 (P0b): a global snapshot cannot coexist with a recorded
@@ -4879,6 +4891,58 @@ pub const RecordingSession = struct {
         } else if (resolved.isInt() or resolved.isFloat()) {
             try self.guardNum(ref, resolved, .operand_type, .a);
         }
+        self.setReg(dest, ref);
+    }
+
+    /// Doc 53: canonicalize a `get_upval` whose OPEN cell aliases the ANCHOR
+    /// frame's own window to the aliased slot's SSA value (the mahina flavor of
+    /// LuaJIT `rec_upvalue`'s SSA redirect). Within one recording the cell and
+    /// the slot are the same storage, so the lazy `refOfAbs` machinery is exact
+    /// by construction — reads see prior anchor-frame stores in order, no
+    /// snapshot, no IR guard. Cross-entry soundness comes from a
+    /// VALIDATION-ONLY `.upvalue_slot_alias` seed: `guard_func` pins only proto
+    /// id, so a same-proto closure from another live activation (whose cell
+    /// aliases a DIFFERENT frame) must be caught at entry — the seed re-proves
+    /// `closure_in(callee_slot).upvalues[source].loc.open == base + rel` and
+    /// declines the candidate otherwise. Mid-episode the relation cannot
+    /// change: the anchor never returns mid-trace, and a scope-exit close of
+    /// an anchor-window cell would need an on-trace closure creation, which
+    /// aborts.
+    ///
+    /// Fail-closed aborts (all keep the pre-doc-53 `.aliased_input` verdict):
+    /// a cell over an INLINED frame's window (`rel >= anchor_num_registers` —
+    /// unreachable today without on-trace closures, doc 24), and depth 0
+    /// (lexically impossible: a function cannot capture its own locals as
+    /// upvalues). An unresolvable callee path (computed callee) keeps
+    /// `recCalleeUpval`'s `.cross_frame`.
+    fn recUpvalSlotAlias(self: *RecordingSession, dest: u16, source: u16, open_idx: usize) !void {
+        const rel_usize = open_idx - self.anchor_abs_base;
+        if (rel_usize >= self.anchor_num_registers) return self.abort(.aliased_input);
+        if (self.inline_depth == 0) return self.abort(.aliased_input);
+        const rel: u16 = @intCast(rel_usize);
+        const path_slot = self.upvalAccessPathSlot() orelse return self.abort(.cross_frame);
+        // path_slot is a real slab slot here — the depth-0 sentinel case was
+        // excluded above.
+        std.debug.assert(path_slot != UPVALUE_CELL_ANCHOR);
+
+        // Dedup the SEED only — the read itself must always re-resolve through
+        // `refOfAbs` so a repeat read after an anchor-frame store to the slot
+        // sees the current def (the cell IS the slot), never a cached first ref.
+        const key = (@as(u64, @intFromEnum(InputKind.upvalue_slot_alias)) << 32) |
+            (@as(u64, path_slot) << 16) | source;
+        if (!self.input_dedup.contains(key)) {
+            if (self.input_seeds.items.len >= MAX_TRACE_INPUTS) return self.abort(.input_cap);
+            try self.input_seeds.append(self.gpa, .{
+                .kind = .upvalue_slot_alias,
+                .source = source,
+                .slot = rel,
+                .callee_slot = path_slot,
+            });
+            // The stored ref is never read back (see above); the map is used as
+            // a set keyed on (kind, path, source).
+            try self.input_dedup.put(self.gpa, key, 0);
+        }
+        const ref = try self.refOfAbs(rel);
         self.setReg(dest, ref);
     }
 

@@ -64,7 +64,7 @@ pub const LanePin = struct { guard_ref: u32, table_id: u32 };
 /// is re-proven at entry. ANY failure (missing/open cell, non-function callee,
 /// verifier mismatch) declines the whole candidate to tier-0 — `uref` has no
 /// operands to re-derive from, so no tier-1a downgrade exists.
-pub const InputKind = enum(u8) { upvalue, global, hash_cell, callee_upvalue, callee_global, upvalue_cell };
+pub const InputKind = enum(u8) { upvalue, global, hash_cell, callee_upvalue, callee_global, upvalue_cell, upvalue_slot_alias };
 
 /// `upvalue_cell` sentinel for `callee_slot`: resolve through the ANCHOR
 /// closure (a depth-0 `get_upval`/`set_upval` path). Never a real slab slot —
@@ -151,7 +151,18 @@ pub inline fn headEntryPc(pc: u32) u32 {
 /// runs. For `hash_cell` (H1): `source` is the **key**'s constant-pool index,
 /// `table_reg` is the anchor slot holding the table value, and `expected_count`
 /// is the recorded `hash.count()` (the `guard_hash` aux) the seed re-checks for
-/// native eligibility. Runtime-only — not serialized (precedent: `entry_guards`).
+/// native eligibility. For `upvalue_slot_alias` (doc 53): VALIDATION-ONLY — no
+/// slab write. The recorder canonicalized an inlined callee's OPEN-upvalue read
+/// to the aliased anchor slot's SSA value; the seed re-proves at entry that the
+/// callee closure in `callee_slot` still has `upvalues[source]` open over
+/// exactly `base + slot` (`slot` is the aliased ANCHOR-window slot here, not a
+/// synthetic one — `guard_func` pins only proto id, so a same-proto closure
+/// from another live activation would alias a different frame; this seed is
+/// mahina's per-entry flavor of LuaJIT `rec_upvalue`'s `REF_BASE` relation
+/// guard). ANY failure declines the whole candidate to tier-0 (the
+/// `upvalue_cell` grammar — the canonicalized slot read has nothing to
+/// re-derive from, so no tier-1a downgrade exists).
+/// Runtime-only — not serialized (precedent: `entry_guards`).
 pub const InputSeed = struct {
     kind: InputKind,
     source: u32,

@@ -1715,3 +1715,10 @@ demotions in trace.zig, compiler-adjudicated). Deferred items:
       stray line. So the flake can also manifest as a test-binary
       crash/restart that the build runner ultimately reports as success —
       look at zig's --listen respawn behavior when hunting this.
+- [ ] Occurrence 5 (2026-09-18, doc 53 P0 gate, seed 0xe84b76c2, binary
+      5d7c4dcc…): failed once (`failed command: …/5d7c4dcc…/test
+      --seed=0xe84b76c2 --listen=-`; the failing test's name was lost to a
+      `tail -3` pipe again — only `guard-dedup: ref=5 op=guard_int
+      ir_len=1617` spam survived, ir_len 1617 suggests one of the big
+      driver-trace recordings). Three immediate re-runs: 0 failures each.
+      Same lesson as occurrence 3: capture with `> log 2>&1` FIRST.

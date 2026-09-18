@@ -2891,6 +2891,92 @@ test "recorder: a callee reached through an upvalue records a snapshot input + g
     try testing.expect(saw_guard_func);
 }
 
+test "recorder(doc53): an open upvalue over the anchor window canonicalizes to the slot — validation seed, no snapshot" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `m` is a local of the ANCHOR frame (the chunk), captured by `f` as an
+    // OPEN upvalue. Recording the chunk's loop inlines `f`; the `get_upval m`
+    // resolves to a cell aliasing the trace-writable window — pre-doc-53 this
+    // was a hard `.aliased_input` abort (no trace at all). Now the read
+    // canonicalizes to the aliased slot's SSA value: NO `.upvalue` snapshot
+    // seed, ONE validation-only `.upvalue_slot_alias` seed, and the read is a
+    // plain anchor-window `slot_load`.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local m = 7
+        \\local function f(j) return m + j end
+        \\local s = 0
+        \\for j = 1, 80 do s = s + f(j) end
+        \\print(s)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
+
+    try testing.expectEqual(@as(usize, 1), t.code.inputs.len);
+    const seed = t.code.inputs[0];
+    try testing.expectEqual(trace.InputKind.upvalue_slot_alias, seed.kind);
+    // `slot` is the ALIASED anchor-window slot (`m`), not a synthetic one —
+    // the inversion of the snapshot tests' `>= anchor_num_registers`.
+    try testing.expect(seed.slot < vm.trace.rec.anchor_num_registers);
+    // The callee (`f`) is re-resolved from a real anchor slab slot at entry.
+    try testing.expect(seed.callee_slot < vm.trace.rec.anchor_num_registers);
+    // `source` is f's upvalue index for `m` (its only upvalue).
+    try testing.expectEqual(@as(u32, 0), seed.source);
+
+    // The canonicalized read appears as a slot_load of the aliased slot.
+    var saw_alias_load = false;
+    for (t.code.instrs) |ins| {
+        if (ins.op == .slot_load and ins.aux == @as(i32, seed.slot)) saw_alias_load = true;
+    }
+    try testing.expect(saw_alias_load);
+}
+
+test "doc53: canonicalized upvalue read sees the anchor's per-iteration store, not a per-entry snapshot" {
+    // The anchor rebinds the captured local EVERY iteration; the inlined
+    // callee reads it through the open cell. The cell IS the slot, so the
+    // read must see the current iteration's value — a per-entry snapshot
+    // (the pre-doc-53 mechanism, had it not aborted) would replay the
+    // entry value and diverge. sum(j=1..80 of j) = 3240.
+    try expectProgram(
+        \\local m = 0
+        \\local function f() return m end
+        \\local s = 0
+        \\for j = 1, 80 do
+        \\  m = j
+        \\  s = s + f()
+        \\end
+        \\print(s)
+    , "3240\n");
+}
+
+test "doc53: a same-proto closure from another live activation declines entry (slot-alias validation)" {
+    // Activation 1 of `outer` records the loop trace with `h = inner1`
+    // canonicalized against ITS OWN frame (`s` slot). Activation 2 (still
+    // holding activation 1 live below it) runs the same loop with h = inner1
+    // — a closure that passes `guard_func` (same proto) but whose cell
+    // aliases activation 1's frame, NOT the executing anchor frame. The
+    // `.upvalue_slot_alias` entry validation must refuse the trace so h()
+    // keeps reading activation 1's s (=107): correct total is
+    // 80*107 + 80*107 = 17120. An unsound entry instead reads activation 2's
+    // own s (=207) in the second loop: 80*107 + 80*207 = 25120.
+    try expectProgram(
+        \\local function outer(g, depth)
+        \\  local s = depth * 100 + 7
+        \\  local function inner() return s end
+        \\  local h = g or inner
+        \\  local acc = 0
+        \\  for j = 1, 80 do acc = acc + h() end
+        \\  if depth == 1 then
+        \\    return acc + outer(inner, 2)
+        \\  end
+        \\  return acc
+        \\end
+        \\print(outer(nil, 1))
+    , "17120\n");
+}
+
 test "recorder: a callee reached through a global records a snapshot input + guard_func" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);

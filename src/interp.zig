@@ -995,8 +995,16 @@ pub const Vm = struct {
                 }
                 continue;
             }
+            // Doc 53: validation-only — re-prove the open-cell↔anchor-slot
+            // relation for the canonicalized upvalue read; any failure declines
+            // the whole candidate (same grammar as `upvalue_cell`, same reason:
+            // nothing to re-derive from).
+            if (seed.kind == .upvalue_slot_alias) {
+                if (!self.upvalueSlotAliasOk(base, seed)) return null;
+                continue;
+            }
             const v = switch (seed.kind) {
-                .upvalue_cell => unreachable, // handled above
+                .upvalue_cell, .upvalue_slot_alias => unreachable, // handled above
                 .upvalue => self.upvalGet(closure.upvalues[seed.source]),
                 .global => self.globals.get(proto.constants[seed.source]),
                 .hash_cell => blk: {
@@ -1050,6 +1058,33 @@ pub const Vm = struct {
     /// can never re-open, so a successful resolution is stable for the whole
     /// episode and needs no per-iteration guard). Shared by all three seeding
     /// twins so their validation is byte-identical.
+    /// Doc 53: validate one `upvalue_slot_alias` seed — the recorder
+    /// canonicalized an inlined callee's OPEN-upvalue read to the aliased
+    /// anchor slot's SSA value, and this re-proves the relation for the
+    /// closure the trace will actually call: the value in `callee_slot` is a
+    /// function closure whose `upvalues[source]` is OPEN over exactly
+    /// `base + seed.slot`. `guard_func` pins only proto id, so a same-proto
+    /// closure from another live activation (aliasing a different frame's
+    /// slot) must be refused here — this is mahina's per-entry flavor of
+    /// LuaJIT `rec_upvalue`'s `REF_BASE` relation guard. Validation-only (no
+    /// slab write); shared by all three seeding twins so the check is
+    /// byte-identical. False → decline the WHOLE candidate to tier-0 (the
+    /// `upvalue_cell` grammar — the canonicalized slot read has nothing to
+    /// re-derive from, so no tier-1a downgrade exists). Single-slab
+    /// assumption: coroutines are excluded by design, so `loc.open` indices
+    /// are all coordinates of one slab; if multiple stacks ever appear this
+    /// comparison must gain slab identity.
+    fn upvalueSlotAliasOk(self: *const Vm, base: usize, seed: trace.InputSeed) bool {
+        const cv = self.regGet(base + seed.callee_slot);
+        if (!cv.isHeap() or cv.heapType() != .function) return false;
+        const cl = function.Closure.fromHeader(cv.asHeap());
+        if (seed.source >= cl.upvalues.len) return false;
+        return switch (cl.upvalues[seed.source].loc) {
+            .open => |idx| idx == base + seed.slot,
+            .closed => false,
+        };
+    }
+
     fn resolveUpvalueCellBits(self: *const Vm, base: usize, closure: *const function.Closure, seed: trace.InputSeed) ?u64 {
         const cl: *const function.Closure = blk: {
             if (seed.callee_slot == trace.UPVALUE_CELL_ANCHOR) break :blk closure;
@@ -1125,8 +1160,15 @@ pub const Vm = struct {
                 }
                 continue;
             }
+            // Doc 53: same validation + decline grammar as `seedTraceInputs`'s
+            // arm — whole-candidate decline, nothing to re-derive from.
+            if (seed.kind == .upvalue_slot_alias) {
+                if (!self.upvalueSlotAliasOk(ctx.base, seed))
+                    return trace.NativeSeedCtx.SEED_CAPACITY_DECLINE;
+                continue;
+            }
             const v = switch (seed.kind) {
-                .upvalue_cell => unreachable, // handled above
+                .upvalue_cell, .upvalue_slot_alias => unreachable, // handled above
                 .upvalue => self.upvalGet(closure.upvalues[seed.source]),
                 .global => self.globals.get(proto.constants[seed.source]),
                 .hash_cell => blk: {

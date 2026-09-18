@@ -46,7 +46,10 @@ material corrections, both folded into the implemented matrix
   sparse's traces contain zero grid ops so the cb47d95 prover tightening is
   excluded too). nbody itself is unchanged (63.1 ms, 13.1×) — its driver
   loop aborts earlier on `aliased_input get_upval`, the separately-recorded
-  next candidate.
+  next candidate. **(Follow-up 2026-09-18: that candidate landed as doc 53 —
+  open-upvalue slot canonicalization; nbody's driver then records the whole
+  `advance` call exactly as this doc's instrument predicted, 54.5 → 19.8 ms,
+  4.5× LJ.)**
 
 - [x] **Fix B — konst value canonicalization in the optimizer (F3).** Landed
   2026-09-18. Konst instrs and fold results canonicalize by `(value, ty)` to

@@ -1812,7 +1812,14 @@ pub fn computeSeedPlan(
             // whose uref was DCE'd still validates (conservative: a failed
             // resolve declines an entry nothing would have read — matching
             // tier-1a's full-set resolution, and fail-closed).
-            .upvalue, .global, .callee_upvalue, .callee_global, .upvalue_cell => plan.activate(i),
+            // Doc 53: `upvalue_slot_alias` likewise always active — it IS the
+            // cross-entry soundness proof for a canonicalized slot read
+            // (deactivating it would let a same-proto alien-activation closure
+            // run the trace against the wrong frame), and keeping the whole
+            // non-hash_cell family active preserves seed-order dependencies
+            // (this seed reads `slots[callee_slot]`, which an earlier
+            // upvalue/global seed may populate).
+            .upvalue, .global, .callee_upvalue, .callee_global, .upvalue_cell, .upvalue_slot_alias => plan.activate(i),
             .hash_cell => {
                 for (t.instrs) |ins| {
                     if (ins.op != .href) continue;

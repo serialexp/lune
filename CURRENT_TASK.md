@@ -75,6 +75,70 @@ the ones that bite):
   before declaring it hard; "replay/determinism forbids it" only ever means
   *adapt* the mechanism (ids not addresses, deterministic counters).
 
+## Status 2026-09-18 (latest+20) — doc 53: open-upvalue slot canonicalization — nbody 54.5 → 19.8 ms (4.5× LJ)
+
+Bart: "Is that 30% of time for nbody in tier-0? Lets try to work on that."
+Fresh `--jit-stats` confirmed 35.3% tier-0-no-trace: `main:211` (19.8%,
+`aliased_input get_upval`) + `advance:4` (15.5%, LINNER by design per doc 51
+F4). Doc 51 had already anointed the get_upval abort as the next candidate —
+its instrument proved the driver loop inlines the whole `advance` call once
+recording survives.
+
+- **Root cause.** Doc 43 P0a aborts any `get_upval` whose OPEN cell aliases
+  the trace-writable window (a snapshot would go stale). But when the cell
+  aliases the ANCHOR frame's own window, the cell IS a tracked slot — nbody's
+  `advance` captures main's `local sqrt`, and tracing `main:211` died at the
+  first sqrt read. The `local sqrt = math.sqrt` idiom killed every driver
+  trace that inlines a callee capturing an anchor local.
+- **The fix (doc 53 P0)** — mahina flavor of LuaJIT `rec_upvalue`'s SSA
+  redirect (`lj_record.c`): `recUpvalSlotAlias` canonicalizes the read to
+  the aliased slot's SSA value via new `refOfAbs` (refOf minus the base_off
+  add — exact within a recording, the cell IS the slot, store-then-read
+  ordering falls out of SSA). Cross-entry soundness: `guard_func` pins only
+  PROTO id, so a same-proto closure from another live activation (cell over
+  a different frame) is caught by a new VALIDATION-ONLY `.upvalue_slot_alias`
+  InputSeed — all three seeding twins re-prove
+  `closure_in(callee_slot).upvalues[source].loc.open == base + rel` via
+  shared `upvalueSlotAliasOk`, declining the candidate otherwise (the
+  `upvalue_cell` grammar; mahina's per-entry equivalent of LuaJIT's
+  per-iteration `REF_BASE` guard — cheaper, valid because the relation
+  can't change mid-episode: anchor never rets mid-trace, scope-exit close
+  needs on-trace closure creation which aborts). Fail-closed keeps the old
+  abort for inlined-frame-window cells (unreachable without doc 24) and
+  depth 0 (lexically impossible). `computeSeedPlan`: new kind always
+  active. Single-slab assumption noted (coroutines excluded by design).
+- **Files**: trace_code.zig (InputKind + seed docs), trace_recorder.zig
+  (refOfAbs factor, recInputGet arm, recUpvalSlotAlias), interp.zig
+  (upvalueSlotAliasOk + arms in seedTraceInputs/nativeSeedFn; tier-1a via
+  delegate), nativegen_alloc.zig (computeSeedPlan), interp_trace_test.zig
+  (3 tests), docs 53/51, TODO.md (jit-debug flake occurrence 5, seed
+  0xe84b76c2, name lost to tail pipe AGAIN — use `> log 2>&1` first).
+- **Tests bite-verified** by three targeted sabotages: neutered validation
+  → alien-activation test fails (25120≠17120); snapshot-semantics read →
+  per-iteration-store test diverges; restored abort → shape test fails.
+  Gates: `just test` + `-Djit-debug=true` (one flake occurrence, 3 clean
+  re-runs) + boundaries + fmt green.
+- **Measured.** nbody `--jit-stats` 500k: tier-0 45.2% → 0.3% of cycles,
+  traced 44.9% → 99.2% (native 99.1%), seam 20.5% → ~0% (499,995 → 51
+  walks), wall 603 → 199 ms; main:211 traces 100.0% of iterations; aborts
+  4 sites → 1 (by-design LINNER root). Board: **nbody 54.5 → 19.8 ms,
+  13.9×→11.6× (P5) → 4.5× LJ, res 92.9%**; cross=ok/luajit=ok everywhere.
+  Movers vetted ×3 interleaved vs behavior-verified `just shadow` baseline
+  (`/tmp/lune-base-doc53`, shows the old abort): tbl_ops/repack noise,
+  str_format drift (res 0%); **fft +3.5% is a code-layout artifact**: ALL
+  JIT counters bit-identical (1,016,150 entries, 1,012,995 fused, same
+  splits, same aborts) and the sign FLIPS under --jit-stats (NEW 456.6 vs
+  OLD 467.2 ms). Doc 51's unroll-vs-decomposition isolation sweep not
+  needed: the driver trace absorbed the nest outright (advance:34 → 352
+  warmup iterations).
+- **Deferred (doc 53 Outstanding)**: set_upval write side (open-cell
+  stores still abort .nyi, safe), inlined-frame-window cells (doc 24).
+- **Codex review pending** — no codex MCP tool in this session (Rule #21:
+  no substitution); doc 53 flags what a reviewer should attack.
+- **nbody next rocks** (from the new profile): res 92.9%, remaining gap
+  4.5× is now native codegen quality of the big unrolled driver trace +
+  the 0.6% non-loop tail — profile before choosing.
+
 ## Status 2026-09-18 (latest+19) — doc 51 Fix B: konst value canonicalization LANDED
 
 Bart picked Fix B as the most general lever. What landed (task #35, all in
