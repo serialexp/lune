@@ -1456,6 +1456,37 @@ pub fn isDynTableRoot(kinds: []const Kind, slots: []const SlotInfo, slot_id_of_r
     return kinds[ref] == .heap or isCarriedHeapRoot(slots, slot_id_of_ref, ref);
 }
 
+/// Doc 49 P5: the aux an href at `idx` actually lowers with. A SEEDED href
+/// (`aux >= 0`) whose root turns out dynamic at emission (carried-heap — the
+/// recorder saw a `slot_load`, the body's φ rewrites the slot each iteration)
+/// cannot read its slab slot: `computeSeedPlan` deactivates the seed. If the
+/// recorder stamped a valid hrefk `(slot, mask)` hint into that seed
+/// (`InputSeed.hrefk_aux`), lower to hrefk inline guards instead of the
+/// `resolveHashCell` callout; `-1` (no hint) keeps today's callout. Every aux
+/// consumer that dispatches a dyn-rooted href's lowering — the save-frame
+/// reservation (`bodyCalloutOf`) and the emit dispatch — MUST route through
+/// this one helper so they decide identically (a mismatch is either a missing
+/// save frame under a callout, or a dead reserved frame).
+pub fn effectiveHrefAux(
+    t: *const Trace,
+    kinds: []const Kind,
+    slots: []const SlotInfo,
+    slot_id_of_ref: []const i32,
+    idx: usize,
+) i32 {
+    const ins = t.instrs[idx];
+    std.debug.assert(ins.op == .href);
+    if (ins.aux < 0) return ins.aux; // hrefk or callout: already emission-final
+    if (!isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a)) return ins.aux; // live seed
+    for (t.inputs) |seed| {
+        if (seed.kind == .hash_cell and @as(i32, seed.slot) == ins.aux)
+            return seed.hrefk_aux;
+    }
+    // A seed slot with no matching seed is malformed; fail closed to the
+    // callout, whose runtime resolution needs no recorded facts.
+    return -1;
+}
+
 /// Does lowering emit a mid-body side-exit for instruction `idx`? Home
 /// coalescing must not order an in-place carried-home update before ANY of
 /// these — the single-snapshot deopt flush would commit a partial iteration
@@ -1713,9 +1744,11 @@ pub fn bodyCalloutOf(
     return switch (ins.op) {
         // A dynamic-root href calls resolveHashCell — UNLESS it carries an
         // hrefk aux (doc 49): that lowers to inline guards + a `lea`, no call,
-        // so it must NOT reserve the (large) callout save frame.
+        // so it must NOT reserve the (large) callout save frame. Doc 49 P5:
+        // the EFFECTIVE aux — a deactivated seed's stamped hrefk hint counts
+        // as hrefk here, exactly as the emit dispatch will lower it.
         .href => if (isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a) and
-            trace_ir.HrefAux.decode(ins.aux) == null) .resolve_hash_cell else null,
+            trace_ir.HrefAux.decode(effectiveHrefAux(t, kinds, slots, slot_id_of_ref, idx)) == null) .resolve_hash_cell else null,
         .guard_absent => .table_absent,
         .fsin => .fsin,
         .fcos => .fcos,

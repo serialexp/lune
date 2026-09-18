@@ -447,3 +447,51 @@ P0+P1 now on master; P2 (measurement) is the remaining doc 52 phase.
   lean-epilogue design round, or do we accept break-even (the mechanism
   is correct, tested, and self-contained) and move to the next campaign
   gap?
+
+## Status 2026-09-18 (latest+19) — doc 49 P5: hrefk fallback for seeded carried-heap hrefs — nbody 62.8 → 54.0 ms
+
+- **Bart: "since we are already here, might as well try to make it a bit
+  better?"** Profiled nbody post-985110b: the big cost adjacent to the
+  arc was NOT the resident-epilogue residual (+1–2%) but 16.7% of the
+  run in JIT→`resolveHashCell` full-hash callouts. Asked Bart which
+  lever; he picked the seed-hint fast path over the lean epilogue.
+- **Corrected diagnosis**: doc 52's deferred "per-entry seed
+  re-resolution" was actually PER-ITERATION callouts: a `hash_cell`-
+  seeded href whose root turns out carried-heap at emission (nbody
+  advance:132's `bi` — φ `%122` rewrites r7 each iteration) has its
+  seed deactivated by `computeSeedPlan` and lowers to the
+  `resolveHashCell` callout, and the hrefk `(slot, mask)` was never
+  recorded because `hrefAuxFor` returns the seed slot first. 6 seeded
+  hrefs ×2 trace copies = the 6 JIT call sites in the perf chain.
+- **Doc 49 P5 (designed in doc 49, landed this commit)**:
+  `InputSeed.hrefk_aux` (encoded HrefAux, default −1) stamped by
+  `seedHashCell` via the new shared `hrefkAuxOf` helper;
+  emission-side `effectiveHrefAux` (nativegen_alloc) substitutes the
+  hint for a deactivated seed, routed through BOTH `bodyCalloutOf`
+  (save-frame decision) and the href emit dispatch (mismatch would be
+  a missing/dead save frame — one helper, one decision); `emitHrefK`
+  reused verbatim on an aux-substituted instr copy. `computeSeedPlan`,
+  prover, tier-1a, and all seeding twins untouched (hint is pure
+  compile-time data).
+- **Tests**: (1) correct hint → seed stays inactive + full expectMatch
+  agreement battery on the carried-read shape; (2) wrong-slot hint →
+  oracle completes N, native exits at iteration 0 — proof the hint
+  reaches lowering (a callout would have completed). Toggle script
+  (/tmp/toggle_p5_test.py, Rule #6) flipped the stamp to −1: test
+  failed "expected 0, found 8" = callout path restored by default −1,
+  test can fail. Full `just test` + boundaries green; fmt clean.
+- **Measured**: `resolveHashCell` GONE from nbody profile; `liveSlotOf`
+  30.7% → 15.2% (rest = tier-0 untraced outer loops advance:4 /
+  main:211 — known, separate arc). **nbody 62.8 → 54.0–54.5 ms
+  (13.9× → 11.6× LJ)**; binary-trees 386.3 → 373.3; sparse 153.8 →
+  149.0; board otherwise in band (array3d 12.7 re-ran at 12.1 =
+  noise); all cross-tier ok. Boards: 20260918-1542xx-5dcdacc.tsv.
+- **Z-6 check**: fully general — any loop re-picking a record-shaped
+  receiver from a container (`bi = bodies[i]`) records this shape.
+- **Process note**: campaign loop calls for a codex review; no codex
+  MCP tool in this session (Rule #21 — did not substitute another
+  provider). Review pending on request.
+- **Deferred/remaining**: lean resident epilogue (doc 52, +1–2% nbody);
+  doc 49 defers unchanged (guard_hash subsumption, on-trace insertion,
+  scalar-key hrefk); nbody's next rocks are outer-loop coverage
+  (for_prep / aliased_input get_upval, ~30% tier-0).

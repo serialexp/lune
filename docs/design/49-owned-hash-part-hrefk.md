@@ -1,8 +1,8 @@
 # Owned hash part + HREFK constant-key slot specialization — Design
 
-Status: complete — P1–P4 landed and green (nbody 23.3× → 13.4× LJ); defers recorded below
-Owner: mahina JIT campaign (nbody arc, task #32)
-Last updated: 2026-09-16
+Status: complete — P1–P5 landed and green (P1–P4: nbody 23.3× → 13.4× LJ; P5: 13.9× → 11.6×, resolveHashCell callouts eliminated from nbody); defers recorded below
+Owner: mahina JIT campaign (nbody arc, task #32; P5: task #41)
+Last updated: 2026-09-18
 
 ## Implementation status
 
@@ -76,6 +76,20 @@ inside them is checked.
   tier-0 no-trace 32.3% of cycles), plus `replayLedgerFrom` 7.5%
   (~1028 cyc/walk seam). Those are the next rocks, out of scope
   here (recorded below).
+
+- [x] **P5 — hrefk fallback for seeded hrefs on carried-heap roots.**
+  LANDED 2026-09-18. `InputSeed.hrefk_aux` stamped by `seedHashCell`
+  (shared `hrefkAuxOf` helper with `hrefAuxFor`), emission-side
+  `effectiveHrefAux` routing both `bodyCalloutOf` and the href emit
+  dispatch, `emitHrefK` reused verbatim on the substituted aux. Tests:
+  correct-hint agreement battery + wrong-hint divergence proof (native
+  side-exits where the callout would complete — the hint demonstrably
+  reaches lowering; toggling the stamp to `-1` restores the callout
+  end-to-end). Measured: `resolveHashCell` GONE from the nbody profile
+  (`liveSlotOf` 30.7% → 15.2%, remainder is tier-0's untraced outer
+  loops), **nbody 62.8 → 54.0–54.5 ms (−13%, 13.9× → 11.6× LJ)**,
+  binary-trees −3.4%, sparse −3%, rest of the board in band, all
+  cross-tier ok.
 
 ### Outstanding
 - [ ] **Defer — guard_hash subsumption.** With mask + key + live-cell
@@ -433,6 +447,86 @@ The rest of the nbody profile, for the next arcs:
 - **`replayLedger` seam** — ~1014 cyc/walk, 5.6% of run.
 - **Computed (non-konst) keys** — still abort per doc 43 v1 scope.
 - **energy/offsetMomentum** — cold, irrelevant.
+
+## P5 — hrefk fallback for seeded hrefs on carried-heap roots (2026-09-18)
+
+### The gap
+
+`hrefAuxFor` prefers the entry seed: when `seedHashCell` accepts a root
+(any `slot_load`), the href's aux is the seed slab slot and no hrefk
+`(slot, mask)` is ever recorded. But seed validity is decided again at
+EMISSION: `computeSeedPlan` deactivates a `hash_cell` seed whose href
+root is dynamic (`isDynTableRoot` — a carried-heap slot the body
+rewrites each iteration, e.g. nbody's `bi = bodies[i]`), and the emit
+dispatch then lowers that href to the per-iteration `resolveHashCell`
+callout ("its recorded seed, if any, is ignored"). Result: the one
+lowering doc 49 was built to kill — full hash probe + caller-saved
+save/restore per iteration — survives on exactly the record-shape where
+the root LOOKED invariant to the recorder. Measured (nbody 500000,
+post-985110b): 16.7% of the run is `liveSlotOf` reached from these
+callouts (6 sites — advance:132's 6 seeded hrefs, ×2 trace copies);
+`--dump-traces` shows zero aux=-1 hrefs, i.e. every callout in the
+profile is a silently-degraded seed.
+
+### The fix
+
+Record the hrefk encoding alongside the seed, and let emission fall
+back to it:
+
+1. **`InputSeed` (`trace_code.zig`)**: new field `hrefk_aux: i32 = -1`
+   (`hash_cell` only) — the `HrefAux`-encoded `(slot, mask)` observed
+   at record time, `-1` when unavailable (scalar key, encode overflow,
+   key not live). Reuses the one shared encode/decode helper —
+   no second encoding scheme.
+2. **Recorder (`seedHashCell` + its two callers)**: the call sites
+   (`recHashGet`/`recHashSet` paths) already hold the observed table
+   and key; compute the same `tbl.hashSlotOf(vkey)` →
+   `HrefAux.encode` value the non-seeded branch of `hrefAuxFor` uses,
+   and pass it into `seedHashCell` for stamping. The dedup map keeps
+   the first stamp (same table_reg + key ⇒ same observed table ⇒ same
+   hint within one recording).
+3. **Emission consumers**: one shared resolution, no per-consumer
+   re-derivation — `effectiveHrefAux(t, kinds, slots, slot_id_of_ref,
+   idx) i32`: for a dyn-rooted href with `aux >= 0`, look up the
+   `hash_cell` seed with `seed.slot == aux` and return its
+   `hrefk_aux`; else return `ins.aux` unchanged. Audited consumers
+   (the doc 49 round-1 list, same four): `nativegen_prove.zig`
+   (admit the seeded-dyn shape iff the seed carries a valid hint —
+   today it proves the callout), `bodyCalloutOf` (no save frame when
+   the effective aux decodes), the emit dispatch (route to
+   `emitHrefK` with the effective aux), and `computeSeedPlan`
+   (UNCHANGED — the seed stays inactive; the hint is compile-time
+   data, not a slab consumer).
+4. **Lowering**: `emitHrefK` verbatim — it already takes the dynamic
+   root's per-iteration table pointer from its home and guards
+   mask/live/key-id before producing the cell address. Guard failure
+   side-exits at the same instruction index the callout-miss exit
+   uses today, with the same regs[] contract (hrefk clobbers no homes
+   before the exit).
+
+### Soundness
+
+Unchanged from doc 49's hrefk argument: the hint is speculation, the
+per-iteration guards are the proof. A stale hint (rehash, different
+table shape at this slot, dead cell) fails the mask/key-id/live guards
+and side-exits — identical observable behavior to the callout's miss
+exit. Tier-0/tier-1a never read `hrefk_aux` (the oracle re-resolves via
+`fieldPtr`), so 8-mode equivalence is untouched: native either
+produces the identical cell or exits at the same point. Determinism:
+the hint is a pure function of the recorded table's layout (itself
+deterministic — doc 49 P1's deterministic-layout property), no address
+enters the IR (slot+mask only, same as P4).
+
+### Expected payoff (to be measured, Rule #20 / Z-6)
+
+nbody: kills ~16.7%-of-run callout+hash cost, replaced by hrefk's ~7
+inline instructions per access — the same trade P4 measured as a win on
+the dynamic-root path. General (Z-6): every OO-shaped loop whose
+receiver is re-picked per iteration from a container records exactly
+this seeded-then-carried shape; P4's hrefk only reached roots the
+recorder ALREADY saw as non-`slot_load`. Also removes those pages'
+`SEED_HASH_DECLINE` surface (fewer spurious native declines) and
+shrinks their callout save frames.
 
 ## Review ledger
 

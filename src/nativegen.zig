@@ -35,7 +35,6 @@ const RegWindow = @import("regwindow.zig").RegWindow;
 const Trace = trace_code.TraceCode;
 const NativeSeedCtx = trace_code.NativeSeedCtx;
 
-
 // ---------------------------------------------------------------------------
 // Executable-memory plumbing lives in `nativegen_mcode.zig` (file-split
 // pass). Re-exported here so every existing `nativegen.X` spelling keeps
@@ -467,7 +466,6 @@ pub const proveKinds = prove.proveKinds;
 const isNumKind = prove.isNumKind;
 const operandReads = prove.operandReads;
 
-
 // ---------------------------------------------------------------------------
 // Register/slot allocation lives in `nativegen_alloc.zig` (file-split
 // pass). Re-exported here so every existing spelling keeps resolving and
@@ -504,7 +502,6 @@ const BodyCallout = ngalloc.BodyCallout;
 const calloutMayCollect = ngalloc.calloutMayCollect;
 const bodyCalloutOf = ngalloc.bodyCalloutOf;
 const computeSeedPlan = ngalloc.computeSeedPlan;
-
 
 // ---------------------------------------------------------------------------
 // Emission helpers live in `nativegen_emit.zig` (file-split pass).
@@ -1326,17 +1323,24 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // recomputing the hash lookup, exactly as `aref` reads an invariant base.
             .href => {
                 if (isDynTableRoot(kinds, alloc.slots, alloc.slot_id_of_ref, ins.a)) {
-                    if (trace.HrefAux.decode(ins.aux) != null) {
+                    // Doc 49 P5: dispatch on the EFFECTIVE aux — for a
+                    // deactivated seed (carried-heap root) this substitutes
+                    // the seed's stamped hrefk hint, mirroring
+                    // `bodyCalloutOf`'s save-frame decision exactly.
+                    const eff = ngalloc.effectiveHrefAux(t, kinds, alloc.slots, alloc.slot_id_of_ref, i);
+                    if (trace.HrefAux.decode(eff) != null) {
                         // doc 49 hrefk: the recorder pinned the observed live
                         // node `(slot, mask)` — inline mask/live/key-id guards
                         // + the cell address. No callout, no save frame
                         // (`bodyCalloutOf` skips hrefk hrefs by decode).
-                        try emit.emitHrefK(a, t, alloc, ins, i, exit_labels);
+                        var kins = ins;
+                        kins.aux = eff;
+                        try emit.emitHrefK(a, t, alloc, kins, i, exit_labels);
                     } else {
                         // Per-iteration hash-cell resolution via call-out (the root is a
                         // `.heap`-kind aload result, or a carried-heap slot whose current
-                        // table the seed cannot describe — its recorded seed, if any, is
-                        // ignored). Save rdi/rsi (SoA bases) and all live caller-saved
+                        // table the seed cannot describe and whose seed carries no hrefk
+                        // hint). Save rdi/rsi (SoA bases) and all live caller-saved
                         // homes, call resolveHashCell, restore, check result.
                         std.debug.assert(alloc.callout_save_count != 0); // save area must be reserved
                         try emitHrefCallout(a, t, alloc, kinds, ins, i, exit_labels);

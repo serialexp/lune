@@ -162,6 +162,14 @@ pub const InputSeed = struct {
     /// native analogue of the oracle's per-iteration `guard_hash` count check), else
     /// the entry declines native and runs tier-1a (which side-exits at `guard_hash`).
     expected_count: u32 = 0,
+    /// `hash_cell` only (doc 49 P5): the `HrefAux`-encoded `(slot, mask)` observed
+    /// for this key in the recorded table, or `-1` when unavailable (non-heap key,
+    /// encode overflow). When emission discovers the seeded href's root is dynamic
+    /// (carried-heap — the seed is deactivated and its slab slot never read), this
+    /// hint lets the href lower to hrefk inline guards instead of the
+    /// per-iteration `resolveHashCell` callout (`effectiveHrefAux`). Pure
+    /// compile-time data: never consulted by any seeding twin.
+    hrefk_aux: i32 = -1,
     /// `callee_upvalue` only (inlined-callee upvalues): anchor-slab slot where the inlined callee's
     /// closure lives at entry time. The callee was already seeded (as an `upvalue`
     /// or regular `slot_load` input) before this seed, so `regGet(base +

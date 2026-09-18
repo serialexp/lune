@@ -1,6 +1,6 @@
 # Recurrence-resident silent promotion for short natural-terminal bursts — Design
 
-Status: complete (P0–P2 landed; P2 verdict: mechanism sound, payoff ~break-even — see the P2 correction under the payoff model). Deferred: lean resident epilogue, multi-resident, signature relaxation, per-entry seed re-resolution
+Status: complete (P0–P2 landed; P2 verdict: mechanism sound, payoff ~break-even — see the P2 correction under the payoff model). Deferred: lean resident epilogue, multi-resident, signature relaxation. Seed re-resolution follow-on resolved as doc 49 P5
 Owner: Bart + agents
 Last updated: 2026-09-18
 
@@ -75,8 +75,12 @@ inside them is checked.
 - [ ] **Defer — relaxing signature identity.** v1 requires K fieldwise-
   identical qualifying bursts; shape-set equivalence only against a
   measured workload.
-- [ ] **Defer — per-entry seed re-resolution.** Out of scope (see "What
-  this does NOT fix"); doc 49 follow-on.
+- [x] **Defer — per-entry seed re-resolution.** Resolved 2026-09-18 as
+  doc 49 P5, with a corrected diagnosis: the ~17% nbody cost was not
+  per-entry seed re-resolution but PER-ITERATION `resolveHashCell`
+  callouts from seeded hrefs whose carried-heap roots deactivate the
+  seed at emission. The hrefk-hint fallback (doc 49 P5) eliminated
+  them; nbody 62.8 → 54.0 ms.
 
 ## Why this exists
 

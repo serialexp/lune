@@ -13,6 +13,7 @@
 const nativegen = @import("nativegen.zig");
 const std = @import("std");
 const trace = @import("trace.zig");
+const trace_ir = @import("trace_ir.zig");
 const value = @import("value.zig");
 const table = @import("table.zig");
 const arr = @import("array.zig");
@@ -806,4 +807,102 @@ test "nativegen(doc22 B-v §B.6): redundant-seed deactivation — a STALE hash s
     try testing.expectEqual(regs_b[4].payload.bits, pays_b[4]);
     try testing.expectEqual(@intFromEnum(value.Tag.int), tags_b[5]);
     try testing.expectEqual(@as(u64, 1234), pays_b[5]);
+}
+
+test "nativegen(doc49 P5): carried-heap seeded href with an hrefk hint lowers to hrefk and matches the oracle" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    const key = try string.String.create(gpa, "v");
+    defer key.destroy(gpa);
+    const key_val = Value.heap(&key.header);
+
+    const N: usize = 32;
+    var elems: [N]*table.Table = undefined;
+    var built: usize = 0;
+    defer for (elems[0..built]) |e| e.destroy(gpa);
+    const container = try buildUniverse(gpa, key_val, &elems, &built);
+    defer container.destroy(gpa);
+
+    // The hint the recorder would have stamped: every element shares one
+    // creation history, so elems[0]'s (slot, mask) pins them all (doc 49
+    // deterministic-layout property).
+    const sm = elems[0].hashSlotOf(key_val).?;
+    const enc = trace_ir.HrefAux.encode(sm.slot, sm.mask).?;
+
+    var consts: [2]Value = undefined;
+    var full: [CARRIED_READ_LEN]I = undefined;
+    carriedReadIr(&consts, &full);
+    consts[0] = key_val;
+    var es = [_]u16{};
+    var ins_seed = [_]trace.InputSeed{
+        .{ .kind = .hash_cell, .source = 0, .slot = 4, .table_reg = 2, .expected_count = 1, .hrefk_aux = enc },
+    };
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins_seed };
+
+    // The seed stays DEACTIVATED (P5 changes the href lowering, not the plan).
+    var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    try testing.expect(!ct.seed_plan.isActive(0));
+    try testing.expect(!ct.seed_plan.nonEmpty());
+
+    // Full agreement with the oracle across the base test's scenarios — the
+    // hrefk guards resolve the same cell the callout would have.
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(1), Value.heap(&elems[N - 1].header), Value.int(0) });
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(20), Value.heap(&elems[0].header), Value.int(0) });
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(@intCast(N + 5)), Value.heap(&elems[3].header), Value.int(100) });
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(1), Value.int(7), Value.int(0) });
+}
+
+test "nativegen(doc49 P5): the stamped hint is CONSULTED — a wrong-slot hint side-exits where the callout would succeed" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    const key = try string.String.create(gpa, "v");
+    defer key.destroy(gpa);
+    const key_val = Value.heap(&key.header);
+
+    const N: usize = 8;
+    var elems: [N]*table.Table = undefined;
+    var built: usize = 0;
+    defer for (elems[0..built]) |e| e.destroy(gpa);
+    const container = try buildUniverse(gpa, key_val, &elems, &built);
+    defer container.destroy(gpa);
+
+    // A DIFFERENT slot under the same mask: its node is free (one-key tables),
+    // so the hrefk live-cell guard must fire on iteration 0. If the href had
+    // lowered to the resolveHashCell callout instead (hint ignored), the run
+    // would complete — this divergence is the proof the hint reached lowering.
+    const sm = elems[0].hashSlotOf(key_val).?;
+    const wrong_slot = (sm.slot + 1) & sm.mask;
+    try testing.expect(wrong_slot != sm.slot);
+    const enc_wrong = trace_ir.HrefAux.encode(wrong_slot, sm.mask).?;
+
+    var consts: [2]Value = undefined;
+    var full: [CARRIED_READ_LEN]I = undefined;
+    carriedReadIr(&consts, &full);
+    consts[0] = key_val;
+    var es = [_]u16{};
+    var ins_seed = [_]trace.InputSeed{
+        .{ .kind = .hash_cell, .source = 0, .slot = 4, .table_reg = 2, .expected_count = 1, .hrefk_aux = enc_wrong },
+    };
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins_seed };
+
+    // Oracle (aux-blind, re-resolves by probe): full scan.
+    const iregs = try gpa.dupe(Value, &.{ Value.heap(&container.header), Value.int(1), Value.heap(&elems[N - 1].header), Value.int(0) });
+    defer gpa.free(iregs);
+    const values = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(values);
+    const iresult = irinterp.executeValues(&tr, iregs, values);
+    try testing.expectEqual(@as(usize, N), iresult.completed);
+
+    // Native: the wrong-slot hrefk guard exits before any iteration completes.
+    var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    const nregs = try gpa.dupe(Value, &.{ Value.heap(&container.header), Value.int(1), Value.heap(&elems[N - 1].header), Value.int(0) });
+    defer gpa.free(nregs);
+    const nresult = try runNative(ct, nregs);
+    try testing.expectEqual(@as(usize, 0), nresult.local_completed);
+    // Strict prologue/exit contract: nothing committed — acc still 0.
+    try testing.expectEqual(@as(u64, 0), nregs[3].payload.bits);
 }
