@@ -2404,7 +2404,7 @@ test "B-iv.3 (doc 22 §B.5): [I.loop_done_linked, C.prologue_fail] with a SEEDED
     state.registry.native_seed_ctx = ctx; // state.deinit() destroys it
     ctx.proto = @ptrCast(&proto);
     ctx.call_seq = 7;
-    state.region_policy.region_context = .{ .depth = 0, .call_seq = 7 };
+    state.region_policy.setContext(0, 7);
 
     const entries = [_]trace_exec.LedgerEntry{
         .{ .cum = 1, .id = 221, .exit = 0, .reason = .normal, .kind = .loop_done_linked, .outcome = .normal },
@@ -2486,7 +2486,7 @@ test "B-iv.3 (doc 22 §B.5): [C.link_terminal, I.seed_hash_decline] with a SEEDE
     state.registry.native_seed_ctx = ctx; // state.deinit() destroys it
     ctx.proto = @ptrCast(&proto);
     ctx.call_seq = 7;
-    state.region_policy.region_context = .{ .depth = 0, .call_seq = 7 };
+    state.region_policy.setContext(0, 7);
 
     const entries = [_]trace_exec.LedgerEntry{
         .{ .cum = 0, .id = 321, .exit = 0, .reason = .normal, .kind = .link_terminal, .outcome = .normal },
@@ -2590,7 +2590,7 @@ test "B-v (doc 22 §B.6): terminal seed-decline placement pin — a fused declin
     state.registry.native_seed_ctx = ctx; // state.deinit() destroys it
     ctx.proto = @ptrCast(&proto);
     ctx.call_seq = 7;
-    state.region_policy.region_context = .{ .depth = 0, .call_seq = 7 };
+    state.region_policy.setContext(0, 7);
 
     const entries = [_]trace_exec.LedgerEntry{
         .{ .cum = 5, .id = 421, .exit = 0, .reason = .normal, .kind = .loop_done_linked, .outcome = .normal },

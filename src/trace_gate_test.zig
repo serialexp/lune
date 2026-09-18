@@ -516,10 +516,10 @@ test "A-vii-e.2 observer inline cache: only survive verdicts answer inline, and 
 
     // (4) A survive verdict answered inline must still refresh the activation
     // context, exactly as the observer's own member-hit branch does.
-    state.region_policy.region_context = null;
+    state.region_policy.clearContext();
     try testing.expect(state.observeFast(83, 5, 1, 5));
-    try testing.expectEqual(@as(u32, 1), state.region_policy.region_context.?.depth);
-    try testing.expectEqual(@as(u64, 5), state.region_policy.region_context.?.call_seq);
+    try testing.expectEqual(@as(u32, 1), state.region_policy.regionContext().?.depth);
+    try testing.expectEqual(@as(u64, 5), state.region_policy.regionContext().?.call_seq);
 
     // (5) The hot entry borrows the owning span's bitset, so it must die with it.
     // Closing the region frees those words; a stale `words` pointer here would be
@@ -620,8 +620,8 @@ test "A-vii-e.2 observer inline cache: differential — the accelerated call sit
     try testing.expectEqual(states[1].regionProfitCount(), states[0].regionProfitCount());
     try testing.expectEqual(states[1].region_policy.region_profit_flushes, states[0].region_policy.region_profit_flushes);
     try testing.expectEqual(states[1].region_policy.region_profit_flushed_work, states[0].region_policy.region_profit_flushed_work);
-    try testing.expectEqual(states[1].region_policy.region_context.?.depth, states[0].region_policy.region_context.?.depth);
-    try testing.expectEqual(states[1].region_policy.region_context.?.call_seq, states[0].region_policy.region_context.?.call_seq);
+    try testing.expectEqual(states[1].region_policy.regionContext().?.depth, states[0].region_policy.regionContext().?.depth);
+    try testing.expectEqual(states[1].region_policy.regionContext().?.call_seq, states[0].region_policy.regionContext().?.call_seq);
     // The stream ends on a close, and it must be the same close on both sides.
     try testing.expectEqual(@as(usize, 0), states[0].regionProfitCount());
     try testing.expect(states[1].region_policy.region_profit_flushes > 0);

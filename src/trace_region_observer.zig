@@ -17,7 +17,7 @@ pub fn regionMemberPoint(self: *const RegionPolicy, rid: RegionId, point: Progra
 }
 
 pub fn qualifiedActiveMember(self: *RegionPolicy, point: ProgramPoint) ?MemberAccum {
-    const ctx = self.region_context orelse return null;
+    const ctx = self.regionContext() orelse return null;
     self.refreshActCache(ctx.call_seq);
     const m = self.act_cache orelse return null;
     if (!self.regionMemberPoint(m.key.region_id, point)) return null;

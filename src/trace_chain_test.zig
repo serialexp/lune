@@ -638,7 +638,7 @@ test "B-iv.1 stubEnterable (doc 22 §B.4): entry presence, unseeded pass, seeded
     // (3c) Ctx stamped for a DIFFERENT frame proto → false.
     ctx.proto = @ptrCast(&other_proto);
     ctx.call_seq = 7;
-    state.region_policy.region_context = .{ .depth = 0, .call_seq = 7 };
+    state.region_policy.setContext(0, 7);
     try testing.expect(!state.stubEnterable(&seeded, .ordinary, &proto));
 
     // (3d) Ctx matches the live proto but the trace is anchored elsewhere → false.
@@ -651,11 +651,11 @@ test "B-iv.1 stubEnterable (doc 22 §B.4): entry presence, unseeded pass, seeded
     try testing.expect(state.stubEnterable(&seeded, .linked, &proto));
 
     // (3f) Frame token drift (new activation since the episode was stamped) → false.
-    state.region_policy.region_context = .{ .depth = 0, .call_seq = 8 };
+    state.region_policy.setContext(0, 8);
     try testing.expect(!state.stubEnterable(&seeded, .ordinary, &proto));
 
     // (3g) No region context at all (no frame transition observed yet) → false.
-    state.region_policy.region_context = null;
+    state.region_policy.clearContext();
     try testing.expect(!state.stubEnterable(&seeded, .ordinary, &proto));
 }
 
@@ -785,14 +785,14 @@ test "B-iv.3 (doc 22 §B.5): armNativeLink .sibling_handoff arms a seeded child 
     state.registry.native_seed_ctx = ctx; // state.deinit() destroys it
     ctx.proto = @ptrCast(&proto);
     ctx.call_seq = 7;
-    state.region_policy.region_context = .{ .depth = 0, .call_seq = 8 };
+    state.region_policy.setContext(0, 8);
     try testing.expect(!try state.armNativeLink(&parent, 0, &child, .sibling_handoff));
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
     try testing.expectEqual(@as(usize, 0), parent_slots[0]);
 
     // (3) Fresh ctx (tokens agree) → the seeded child ARMS: the page prologue
     // owns the seeding at entry (§B.4), so the bare jump is safe.
-    state.region_policy.region_context = .{ .depth = 0, .call_seq = 7 };
+    state.region_policy.setContext(0, 7);
     try testing.expect(try state.armNativeLink(&parent, 0, &child, .sibling_handoff));
     try testing.expectEqual(@as(usize, 1), state.registry.native_physical.armed_links.items.len);
     try testing.expectEqual(ArmKind.sibling_handoff, state.registry.native_physical.armed_links.items[0].kind);

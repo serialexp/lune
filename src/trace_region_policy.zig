@@ -82,7 +82,16 @@ pub const RegionPolicy = struct {
     /// Opening a logical region is the only operation that may grow this map;
     /// the per-op observer only probes/removes existing entries.
     region_profit: std.AutoHashMapUnmanaged(RegionKey, RegionAccum) = .empty,
-    region_context: ?RegionContext = null,
+    /// The current activation's region context. Doc 54 P0: split into a plain
+    /// payload + explicit validity byte (was `?RegionContext`) so the inline
+    /// native push can maintain it with three plain stores (depth dword,
+    /// call_seq qword, valid byte) — an optional's layout is unspecified and
+    /// unencodable from emitted machine code. All readers go through
+    /// `regionContext()`; writers through `setContext`/`clearContext` (plus
+    /// `nextActivation`'s consume-on-match). Direct field access outside this
+    /// file is reserved for the JIT offset descriptor.
+    region_context: RegionContext = .{ .depth = 0, .call_seq = 0 },
+    region_context_valid: bool = false,
     /// A-vii-e.1: single-accumulator observer fast path (see `ObserverFast`).
     observer_fast: ?ObserverFast = null,
     /// A-vii-e.2: inline hot-span cache over `observer_fast` (see `ObserverHot`).
@@ -247,18 +256,26 @@ pub const RegionPolicy = struct {
     }
     pub fn nextActivation(self: *RegionPolicy, seq: u64) ?RegionKey {
         if (self.activeRegionFor(seq)) |key| return key;
-        if (self.region_context) |ctx| {
-            if (ctx.call_seq == seq) self.region_context = null;
-        }
+        if (self.region_context_valid and self.region_context.call_seq == seq)
+            self.region_context_valid = false;
         return null;
     }
     pub fn resetProfit(self: *RegionPolicy, gpa: std.mem.Allocator) void {
         self.region_profit.clearRetainingCapacity();
-        self.region_context = null;
+        self.region_context_valid = false;
         self.freeObserverFast(gpa);
+    }
+    /// The current context, or null when none is set. The optional view every
+    /// reader outside this file uses (doc 54 P0 field split).
+    pub inline fn regionContext(self: *const RegionPolicy) ?RegionContext {
+        return if (self.region_context_valid) self.region_context else null;
     }
     pub fn setContext(self: *RegionPolicy, depth: u32, seq: u64) void {
         self.region_context = .{ .depth = depth, .call_seq = seq };
+        self.region_context_valid = true;
+    }
+    pub fn clearContext(self: *RegionPolicy) void {
+        self.region_context_valid = false;
     }
     /// True iff a concrete receipt is provably a no-op end to end, so the
     /// coordinator may skip the whole classify/choose/credit/destination

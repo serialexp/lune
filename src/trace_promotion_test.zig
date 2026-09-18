@@ -677,7 +677,7 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
 
     // Reporting-mode oracle for one bridge firing followed by the structural
     // link back into the ring.
-    state.region_policy.region_context = .{ .depth = 1, .call_seq = key.activation };
+    state.region_policy.setContext(1, key.activation);
     const reporting = [_]trace_exec.LedgerEntry{
         .{ .cum = 3, .id = bridge.id, .exit = 11, .reason = .normal, .kind = .region_bridge, .outcome = .normal },
         .{ .cum = 3, .id = succ.id, .exit = 0, .reason = .normal, .kind = .link_terminal, .outcome = .normal },
@@ -803,7 +803,7 @@ test "B-3b suffix preserves bridge materialization for child deopt and prologue 
         .frozen = true,
     };
     try state.region_policy.region_profit.put(gpa, key, initial);
-    state.region_policy.region_context = .{ .depth = 1, .call_seq = key.activation };
+    state.region_policy.setContext(1, key.activation);
     const observed = [_]trace_exec.LedgerEntry{
         b3ObservedRow(bridge, 11, .region_bridge),
         b3ObservedRow(child, 7, .deopt),
@@ -905,7 +905,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
     try installB3PromotionRegion(&state, key, &.{ source, ramp });
     const physical = state.detectPromotableSet(&observed, key).?;
     defer gpa.free(physical);
-    state.region_policy.region_context = .{ .depth = 1, .call_seq = key.activation };
+    state.region_policy.setContext(1, key.activation);
     const initial_accum = state.region_policy.region_profit.get(key).?;
 
     var tags = [_]u8{
@@ -1250,13 +1250,13 @@ test "B-3b.2 prepareNativeEntry retains same activation and demotes a different 
     try installB3PromotionRegion(&state, same, &.{ a, b });
     const edges = state.detectPromotableSet(&observed, same).?;
     defer gpa.free(edges);
-    state.region_policy.region_context = .{ .depth = 1, .call_seq = same.activation };
+    state.region_policy.setContext(1, same.activation);
     try state.promoteSet(edges, same);
     state.prepareNativeEntry();
     try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
     _ = state.region_policy.region_profit.remove(same);
     try state.region_policy.region_profit.put(gpa, other, .{ .root_frame_depth = 1, .root_call_seq = other.activation });
-    state.region_policy.region_context = .{ .depth = 1, .call_seq = other.activation };
+    state.region_policy.setContext(1, other.activation);
     state.prepareNativeEntry();
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
 }
@@ -1457,7 +1457,7 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
         .frozen = true,
     };
     try state.region_policy.region_profit.put(gpa, key, initial_accum);
-    state.region_policy.region_context = .{ .depth = 1, .call_seq = key.activation };
+    state.region_policy.setContext(1, key.activation);
 
     // The unpromoted oracle executes the same armed C↔I workload until the
     // reporting ledger cap forces a yield, then replays every row normally.
@@ -1710,7 +1710,7 @@ test "B-3d.2 repeated-parent set promotes, zero-evidence edges included, and an 
     try testing.expect(try state.armNativeLink(d, 0, p, .link_terminal));
     const key: RegionKey = .{ .region_id = @enumFromInt(1720), .activation = 55 };
     try installB3PromotionRegion(&state, key, &.{ p, c, d });
-    state.region_policy.region_context = .{ .depth = 1, .call_seq = key.activation };
+    state.region_policy.setContext(1, key.activation);
 
     // Evidence touches only the P.e5/C edges; the P.e7 and D edges promote on
     // registry proof alone (§B3.18 R5(c): zero-evidence candidate edges are an
@@ -1841,7 +1841,7 @@ test "C' parked proof: clean region_close parks; next activation re-promotes wit
         .useful_streak = state.config.freeze_windows,
         .frozen = true,
     });
-    state.region_policy.region_context = .{ .depth = 1, .call_seq = key2.activation };
+    state.region_policy.setContext(1, key2.activation);
     var buf: [trace_exec.LEDGER_CAP]trace_exec.LedgerEntry = undefined;
     state.considerSilentPromotion(b3FullYieldedLedger(a, b, &buf));
     try testing.expectEqual(@as(u64, 1), state.silent_parked_reuses);
@@ -1948,7 +1948,7 @@ test "C' parked proof: trace retire and defs mutation drop proofs; a stale proof
     }
     const c2 = try makeB3LinkTrace(gpa, &state, &proto, 3, 2, 1);
     try testing.expect(try state.armNativeLink(a, 0, c2, .link_terminal));
-    state.region_policy.region_context = .{ .depth = 1, .call_seq = key.activation };
+    state.region_policy.setContext(1, key.activation);
     var buf: [trace_exec.LEDGER_CAP]trace_exec.LedgerEntry = undefined;
     state.considerSilentPromotion(b3FullYieldedLedger(a, b, &buf));
     try testing.expectEqual(@as(u64, 0), state.silent_parked_reuses);
@@ -2052,7 +2052,7 @@ test "inc-B no-candidate settlement: consecutive dry full-cap ledgers saturate a
     const key: RegionKey = .{ .region_id = @enumFromInt(24), .activation = 80 };
     try installB3PromotionRegion(&state, key, &.{ a, b });
     state.region_policy.region_defs.getPtr(key.region_id).?.fallback_owner = true;
-    state.region_policy.region_context = .{ .depth = 1, .call_seq = key.activation };
+    state.region_policy.setContext(1, key.activation);
     var buf: [trace_exec.LEDGER_CAP]trace_exec.LedgerEntry = undefined;
     const threshold = state.config.region_no_candidate_tombstone;
     var i: u8 = 0;
@@ -2589,7 +2589,7 @@ test "doc 52 P1: one resident slot globally; per-RegionId dual-key backstop; mix
         cell.last_ordinal = @intCast(phase + 3);
         cell.last_local = 0;
     }
-    state.region_policy.region_context = .{ .depth = 1, .call_seq = key9.activation };
+    state.region_policy.setContext(1, key9.activation);
     var completed: usize = 0;
     var resume_pc_value: u32 = 0;
     var hops: usize = 0;

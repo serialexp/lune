@@ -1189,7 +1189,7 @@ pub fn considerSilentPromotion(self: *TraceState, entries: []const trace_exec.Le
     // a dormant region is out of the receipt maps, so no activation can be
     // open for it yet — the ledger itself is its only voice.
     tryDormantAdmission(self, entries);
-    const ctx = self.region_policy.region_context orelse {
+    const ctx = self.region_policy.regionContext() orelse {
         self.resetPromotionCandidate();
         return;
     };

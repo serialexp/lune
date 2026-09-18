@@ -384,7 +384,7 @@ pub inline fn prepareNativeEntry(self: *TraceState) void {
     // sweep and activation resolution is skipped entirely — the count cache
     // keeps this the same one-branch fast path.
     if (self.registry.native_physical.activation_set_count == 0) return;
-    const active = if (self.region_policy.region_context) |ctx| self.activeRegionFor(ctx.call_seq) else null;
+    const active = if (self.region_policy.regionContext()) |ctx| self.activeRegionFor(ctx.call_seq) else null;
     var i = self.registry.native_physical.promotedSets().len;
     while (i > 0) {
         i -= 1;
@@ -417,7 +417,7 @@ pub inline fn silentStaging(self: *TraceState) nativegen.SilentStaging {
     // unconditional for every promoted edge.
     var zero_run: u64 = 0;
     if (self.registry.native_physical.activation_set_count != 0) {
-        if (self.region_policy.region_context) |ctx| {
+        if (self.region_policy.regionContext()) |ctx| {
             if (self.activeRegionFor(ctx.call_seq)) |key| {
                 if (self.region_policy.region_profit.get(key)) |accum| zero_run = accum.barren_run;
             }
@@ -639,7 +639,7 @@ pub fn tryArmRegionBridge(self: *TraceState, failed: *Trace, exit_instr: u32) vo
     }
     // Profitability: the ACTIVE accumulator for the current activation must
     // belong to this region and have committed a full min_useful window.
-    const ctx = self.region_policy.region_context orelse {
+    const ctx = self.region_policy.regionContext() orelse {
         self.dbg("bridge-arm: decline t={d} ei={d} rid={d} (no activation context)", .{ failed.id, exit_instr, @intFromEnum(id) });
         return;
     };
@@ -743,7 +743,7 @@ pub fn maybeArmCompositeExit(self: *TraceState, t: *Trace, exit_instr: u32, safe
     // and a child's `.unattempted -> .compiled` transition (which bumps no
     // generation) is retried at the next activation, a natural bound.
     if (t.bridge_decline_exit == exit_instr and t.bridge_decline_gen == self.region_policy.region_defs_gen) {
-        if (self.region_policy.region_context) |rctx| {
+        if (self.region_policy.regionContext()) |rctx| {
             if (t.bridge_decline_seq == rctx.call_seq) return;
         }
     }
@@ -1271,7 +1271,7 @@ pub fn chargePayoffReceipt(self: *TraceState, rid: RegionId) void {
 /// gating on its barren receipts).
 pub fn accountRegionProfit(self: *TraceState, key: ?ExitKey, work: usize, dest: RegionDestination) bool {
     const exit_key = key orelse return false;
-    const ctx = self.region_policy.region_context orelse return false;
+    const ctx = self.region_policy.regionContext() orelse return false;
     if (self.region_policy.receiptsInert()) return false;
     const candidates = self.classifyExit(exit_key);
     const selected = self.chooseSource(candidates, ctx);

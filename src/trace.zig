@@ -123,6 +123,7 @@ pub const anchorKind = trace_code.anchorKind;
 pub const entryPc = trace_code.entryPc;
 pub const contAnchorPc = trace_code.contAnchorPc;
 pub const NativeSeedCtx = trace_code.NativeSeedCtx;
+pub const FrameMotionAbi = trace_code.FrameMotionAbi;
 
 pub const Ref = trace_ir.Ref;
 pub const ObsType = trace_ir.ObsType;
@@ -2673,7 +2674,7 @@ pub const TraceState = struct {
         // wall doing nothing. Behavior-identical: the callee returns false on
         // exactly these conditions with nothing mutated before them.
         const region_live = key != null and
-            self.region_policy.region_context != null and
+            self.region_policy.regionContext() != null and
             !self.region_policy.receiptsInert();
         if (!(region_live and self.accountRegionProfit(key, region_work, dest))) {
             self.accountLegacyThrash(t, completed, exit_instr, charge_kind);

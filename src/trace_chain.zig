@@ -163,7 +163,7 @@ pub const StubEnterability = enum {
 // pub for trace_regionops.zig (file-split pass)
 pub fn liveEpisodeProto(self: *const TraceState) ?*const anyopaque {
     const ctx = self.registry.native_seed_ctx orelse return null;
-    const rctx = self.region_policy.region_context orelse return null;
+    const rctx = self.region_policy.regionContext() orelse return null;
     if (ctx.call_seq != rctx.call_seq) return null;
     return ctx.proto;
 }
@@ -1003,7 +1003,7 @@ pub fn driveSilentBurst(
     // panic moved into the per-set loop (nothing gets weaker for the existing
     // path: a fired activation set with no activation, or with a key ≠
     // active, still panics).
-    const active = if (self.region_policy.region_context) |ctx| self.activeRegionFor(ctx.call_seq) else null;
+    const active = if (self.region_policy.regionContext()) |ctx| self.activeRegionFor(ctx.call_seq) else null;
 
     // Doc 52 P1: the fired activation set's accumulator — unique (at most one
     // activation set is live at native-call time, and every fired activation
@@ -1403,7 +1403,7 @@ pub fn replayLedger(
     regs: ?RegWindow,
 ) LedgerReplay {
     var frozen_fast: ?FrozenFast = null;
-    if (self.region_policy.region_context) |rctx| {
+    if (self.region_policy.regionContext()) |rctx| {
         if (self.activeRegionFor(rctx.call_seq)) |akey| {
             if (self.region_policy.region_profit.getPtr(akey)) |accum| {
                 if (accum.frozen) frozen_fast = .{ .key = akey, .accum = accum };
@@ -1437,7 +1437,7 @@ pub fn replayLedgerSuffix(
     const seed_owner = self.traceById(entries[0].id) orelse
         @panic("replayLedgerSuffix: first entry owner id did not resolve");
     var frozen_fast: ?FrozenFast = null;
-    if (self.region_policy.region_context) |rctx| {
+    if (self.region_policy.regionContext()) |rctx| {
         if (self.activeRegionFor(rctx.call_seq)) |akey| {
             if (self.region_policy.region_profit.getPtr(akey)) |accum| {
                 if (accum.frozen) frozen_fast = .{ .key = akey, .accum = accum };

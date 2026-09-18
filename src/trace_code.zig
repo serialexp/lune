@@ -312,6 +312,72 @@ pub const NativeSeedCtx = struct {
     /// optional so hand-built test ctxs keep compiling and compilation
     /// falls back to the plain terminal when absent (fail closed).
     self_ret_pop_fn: ?*const fn (ctx: *const NativeSeedCtx, t: *const TraceCode, terminal_aux: u64, net_pushed: u64) callconv(.c) u64 = null,
+    /// Doc 54 P0: the per-episode descent gate byte — 1 iff the episode may
+    /// perform inline native frame motion. Published by
+    /// `Vm.prepareNativeEpisode` from `receiptsInert() and !reg_top_pending
+    /// and final_cut == null`; all three conjuncts are episode-invariant
+    /// (verified codex round 1: `reg_top_pending` is written only by tier-0
+    /// multret paths, `final_cut` only after a top-level return, and nothing
+    /// mutates region policy between an episode's pushes), so the byte
+    /// written at episode start describes every push in the episode. The
+    /// inline push sequence checks it with one `cmp byte` — the whole
+    /// runtime residue of the helper's per-push preflight.
+    descent_ok: u8 = 0,
+    /// Doc 54 P0: the `Vm`/`CallFrame` field-offset descriptor the inline
+    /// frame-motion sequences encode against (see `FrameMotionAbi`).
+    /// Installed once by `Vm.initBare` next to the helper fns; `null` (a
+    /// hand-built test ctx) means compilation emits no inline push — the
+    /// same fail-closed fallback as an absent helper fn.
+    frame_abi: ?FrameMotionAbi = null,
+};
+
+/// Doc 54 P0: every `Vm`/`CallFrame`-layout byte offset the inline native
+/// frame-motion sequences (push now; pop at P1) encode as displacement
+/// immediates. The JIT lowering layer (`nativegen*.zig`) deliberately cannot
+/// import `interp.zig` (interp imports trace, never the reverse), so it
+/// cannot `@offsetOf` these types itself; instead `Vm.initBare` computes them
+/// — comptime-derived, so a layout change recomputes them or fails interp's
+/// pinned-width asserts, never silently miscompiles (the `nativegen_layout`
+/// discipline, Z-1/Z-2) — and publishes them through the seed ctx. All
+/// offsets are from the episode's `*Vm` (loaded from `NativeSeedCtx.vm` at
+/// run time — `Vm` is a movable by-value struct, so no Vm-interior address
+/// may be baked) except the `frame_*` fields, which are relative to a
+/// `*CallFrame`.
+pub const FrameMotionAbi = struct {
+    /// `Vm.depth` (u32).
+    vm_depth_off: i32,
+    /// `Vm.stack_top` (usize).
+    vm_stack_top_off: i32,
+    /// `Vm.frames` (the inline `[max_call_depth]CallFrame` array base).
+    vm_frames_off: i32,
+    /// `Vm.next_call_seq` (u64; maxInt = exhausted, the emitted wall).
+    vm_next_call_seq_off: i32,
+    /// `Vm.trace.region_policy.region_context.depth` (u32).
+    vm_region_depth_off: i32,
+    /// `Vm.trace.region_policy.region_context.call_seq` (u64).
+    vm_region_call_seq_off: i32,
+    /// `Vm.trace.region_policy.region_context_valid` (bool, 1 byte).
+    vm_region_valid_off: i32,
+    /// `Vm.trace.tick` (u64) — `tickCallEntry` is `tick +%= 1`.
+    vm_tick_off: i32,
+    /// `Vm.trace.self_call_pushes` (u64) — the formation/`--jit-stats` witness.
+    vm_self_call_pushes_off: i32,
+    /// `@sizeOf(CallFrame)` — the `frames[]` stride.
+    frame_size: i32,
+    frame_closure_off: i32,
+    frame_call_seq_off: i32,
+    frame_base_off: i32,
+    frame_pc_off: i32,
+    frame_ret_dest_off: i32,
+    frame_ret_count_off: i32,
+    frame_varargs_base_off: i32,
+    frame_varargs_count_off: i32,
+    /// `CallFrame.code_cache_gen` (u64; write `maxInt` = invalidate the
+    /// doc-20 fetch-image cache, replicating the push struct-literal's
+    /// default).
+    frame_code_cache_gen_off: i32,
+    /// `interp.max_call_depth` — the depth wall immediate.
+    max_call_depth: u32,
 };
 
 pub const TraceCode = struct {

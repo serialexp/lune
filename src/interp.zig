@@ -389,15 +389,27 @@ pub const CallFrame = struct {
     /// Doc 44 D9 (S4): the frame's cached doc-20 fetch image — one `codeFor`
     /// hash per (frame, image generation) instead of one per push/pop boundary
     /// crossing (`opRet`'s per-pop hash was 1.4% of recursive-fib inside
-    /// `getIndex` alone). `null` gen = invalid; gen 0 is a REAL generation and
-    /// an empty image is a cacheable value, so neither doubles as the validity
-    /// bit. Push-time defaults are the invalidation (a full struct-literal
-    /// reassignment covers frame-slot reuse and keyframe restore, which
-    /// recreates frames through `pushFrameVararg`). Transient — keyframes omit
-    /// it, exactly like `call_seq`.
+    /// `getIndex` alone). Gen `CODE_CACHE_GEN_INVALID` = invalid; gen 0 is a
+    /// REAL generation and an empty image is a cacheable value, so neither
+    /// doubles as the validity bit. Push-time defaults are the invalidation (a
+    /// full struct-literal reassignment covers frame-slot reuse and keyframe
+    /// restore, which recreates frames through `pushFrameVararg`). Transient —
+    /// keyframes omit it, exactly like `call_seq`.
+    ///
+    /// Doc 54 P0: the validity encoding is a plain-u64 sentinel, not `?u64` —
+    /// the inline native push (which replicates this struct literal's
+    /// invalidation as one qword store of `-1`) cannot encode an optional's
+    /// unspecified layout. `cachedCodeFor` refuses to hit OR fill when the
+    /// registry gen itself equals the sentinel (a 2⁶⁴-bump wrap), so a stale
+    /// sentinel-gen frame can never false-hit — fail closed, no panic needed.
     code_cache: []const Instr = &.{},
-    code_cache_gen: ?u64 = null,
+    code_cache_gen: u64 = CODE_CACHE_GEN_INVALID,
 };
+
+/// Doc 54 P0: `CallFrame.code_cache_gen`'s "no cached image" sentinel. All-ones
+/// so the emitted inline push invalidates with a single sign-extended
+/// `mov qword [frame+gen], -1`.
+pub const CODE_CACHE_GEN_INVALID: u64 = std.math.maxInt(u64);
 
 /// The outcome of an `exec` run: either the bottom frame returned (carrying the
 /// top-level `FrameResult`), or a mid-execution suspend point was hit (all VM
@@ -846,6 +858,62 @@ pub const Vm = struct {
     /// globals / `print` native / `"print"` string) is unchanged. The caller MUST
     /// assign `globals` before using the VM. Only fails on allocation (the stack),
     /// so the narrow error set lets the keyframe restorer keep a tight `RestoreError`.
+    /// Doc 54 P0: the `Vm`/`CallFrame` offset descriptor for inline native
+    /// frame motion (see `trace_code.FrameMotionAbi`). Computed here — the
+    /// one module that can name every involved type — entirely at comptime,
+    /// so a layout change recomputes it on the next build. The width asserts
+    /// pin every field size the emitted store/compare forms assume (a dword
+    /// depth store against a widened `depth` would silently corrupt the
+    /// neighbouring field — Z-1: fail the build instead).
+    const frame_motion_abi: trace.FrameMotionAbi = blk: {
+        const TraceState = trace.TraceState;
+        const RegionPolicy = @FieldType(TraceState, "region_policy");
+        const RegionContext = trace.RegionContext;
+        // Pinned widths (one per emitted access form).
+        std.debug.assert(@sizeOf(@FieldType(Vm, "depth")) == 4); // dword load/store + dword wall cmp
+        std.debug.assert(@sizeOf(@FieldType(Vm, "stack_top")) == 8);
+        std.debug.assert(@sizeOf(@FieldType(Vm, "next_call_seq")) == 8); // qword cmp -1 wall
+        std.debug.assert(@sizeOf(@FieldType(RegionContext, "depth")) == 4);
+        std.debug.assert(@sizeOf(@FieldType(RegionContext, "call_seq")) == 8);
+        std.debug.assert(@sizeOf(@FieldType(RegionPolicy, "region_context_valid")) == 1);
+        std.debug.assert(@sizeOf(@FieldType(TraceState, "tick")) == 8);
+        std.debug.assert(@sizeOf(@FieldType(TraceState, "self_call_pushes")) == 8);
+        std.debug.assert(@sizeOf(@FieldType(CallFrame, "closure")) == 8);
+        std.debug.assert(@sizeOf(@FieldType(CallFrame, "call_seq")) == 8);
+        std.debug.assert(@sizeOf(@FieldType(CallFrame, "base")) == 8);
+        std.debug.assert(@sizeOf(@FieldType(CallFrame, "pc")) == 8); // qword imm32 store (pc always < 2³¹)
+        std.debug.assert(@sizeOf(@FieldType(CallFrame, "ret_dest")) == 2); // word store
+        std.debug.assert(@sizeOf(@FieldType(CallFrame, "ret_count")) == 2);
+        std.debug.assert(@sizeOf(@FieldType(CallFrame, "varargs_base")) == 8);
+        std.debug.assert(@sizeOf(@FieldType(CallFrame, "varargs_count")) == 8);
+        std.debug.assert(@sizeOf(@FieldType(CallFrame, "code_cache_gen")) == 8); // qword -1 = CODE_CACHE_GEN_INVALID
+        const trace_off = @offsetOf(Vm, "trace");
+        const policy_off = trace_off + @offsetOf(TraceState, "region_policy");
+        const rctx_off = policy_off + @offsetOf(RegionPolicy, "region_context");
+        break :blk .{
+            .vm_depth_off = @offsetOf(Vm, "depth"),
+            .vm_stack_top_off = @offsetOf(Vm, "stack_top"),
+            .vm_frames_off = @offsetOf(Vm, "frames"),
+            .vm_next_call_seq_off = @offsetOf(Vm, "next_call_seq"),
+            .vm_region_depth_off = rctx_off + @offsetOf(RegionContext, "depth"),
+            .vm_region_call_seq_off = rctx_off + @offsetOf(RegionContext, "call_seq"),
+            .vm_region_valid_off = policy_off + @offsetOf(RegionPolicy, "region_context_valid"),
+            .vm_tick_off = trace_off + @offsetOf(TraceState, "tick"),
+            .vm_self_call_pushes_off = trace_off + @offsetOf(TraceState, "self_call_pushes"),
+            .frame_size = @sizeOf(CallFrame),
+            .frame_closure_off = @offsetOf(CallFrame, "closure"),
+            .frame_call_seq_off = @offsetOf(CallFrame, "call_seq"),
+            .frame_base_off = @offsetOf(CallFrame, "base"),
+            .frame_pc_off = @offsetOf(CallFrame, "pc"),
+            .frame_ret_dest_off = @offsetOf(CallFrame, "ret_dest"),
+            .frame_ret_count_off = @offsetOf(CallFrame, "ret_count"),
+            .frame_varargs_base_off = @offsetOf(CallFrame, "varargs_base"),
+            .frame_varargs_count_off = @offsetOf(CallFrame, "varargs_count"),
+            .frame_code_cache_gen_off = @offsetOf(CallFrame, "code_cache_gen"),
+            .max_call_depth = max_call_depth,
+        };
+    };
+
     pub fn initBare(gpa: std.mem.Allocator) std.mem.Allocator.Error!Vm {
         const tags = try gpa.alloc(u8, stack_slots);
         errdefer gpa.free(tags);
@@ -874,6 +942,7 @@ pub const Vm = struct {
             .seed_tier1a_fn = &nativeSeedTier1aFn,
             .self_call_push_fn = &nativeSelfCallPush,
             .self_ret_pop_fn = &nativeSelfRetPop,
+            .frame_abi = frame_motion_abi,
         });
         // Doc 24 D5: the stable mutable heap channel for allocating traces
         // (tier-1a `.alloc` arms + tier-1b baked callouts). Safe to store once
@@ -1429,6 +1498,14 @@ pub const Vm = struct {
         ctx.reg_capacity = self.regCapacity();
         ctx.proto = proto;
         ctx.call_seq = self.frames[self.depth - 1].call_seq;
+        // Doc 54 P0: the episode descent gate — all three conjuncts are
+        // episode-invariant (see `NativeSeedCtx.descent_ok`), so the byte
+        // published here holds for every inline push in the episode. Also
+        // recomputed on the helper-driven mid-episode refreshes (pop helper),
+        // where it cannot have changed — harmless and simpler than special-
+        // casing the call sites.
+        ctx.descent_ok = @intFromBool(self.trace.region_policy.receiptsInert() and
+            !self.reg_top_pending and self.final_cut == null);
     }
 
     // ---- native / callValue boundary scratch --------------------------------
@@ -2479,10 +2556,18 @@ pub const Vm = struct {
     /// push-time defaults invalidate on slot reuse.
     inline fn cachedCodeFor(self: *Vm, frame: *CallFrame, proto: *const Proto) []const Instr {
         const gen = self.trace.registry.entry_registry.image_gen;
-        if (frame.code_cache_gen) |g| if (g == gen) return frame.code_cache;
+        // Doc 54 P0: `gen == INVALID` (a 2⁶⁴-bump wrap onto the sentinel) must
+        // neither hit (a sentinel-gen frame is INVALID, not "cached at gen
+        // maxInt") nor fill (the fill would be indistinguishable from
+        // invalid). One predictable compare; the cache simply never hits for
+        // that one generation — fail closed.
+        if (frame.code_cache_gen == gen and gen != CODE_CACHE_GEN_INVALID)
+            return frame.code_cache;
         const img = self.trace.codeFor(proto);
-        frame.code_cache = img;
-        frame.code_cache_gen = gen;
+        if (gen != CODE_CACHE_GEN_INVALID) {
+            frame.code_cache = img;
+            frame.code_cache_gen = gen;
+        }
         return img;
     }
 

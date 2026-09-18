@@ -1171,7 +1171,7 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
         .root_call_seq = akey.activation,
         .useful_window_seen = true, // past the profitability gate
     });
-    state.region_policy.region_context = .{ .depth = 0, .call_seq = akey.activation };
+    state.region_policy.setContext(0, akey.activation);
     try testing.expect(cont.code.isBridgeCandidate(3));
 
     state.pending_bridge_arm = .{ .trace_id = cont.id, .exit_instr = 3 };
@@ -1204,7 +1204,7 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
         .useful_window_seen = true,
     });
     _ = state.region_policy.region_profit.remove(akey);
-    state.region_policy.region_context = .{ .depth = 0, .call_seq = akey2.activation };
+    state.region_policy.setContext(0, akey2.activation);
     state.pending_bridge_arm = .{ .trace_id = cont.id, .exit_instr = 3 };
     state.drainPendingBridgeArm(true);
     try testing.expectEqual(@as(u64, 3), state.native_region_bridge_arm_attempts);
@@ -1225,7 +1225,7 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     state.registry.native_seed_ctx = seed_ctx; // state.deinit() destroys it
     seed_ctx.proto = @ptrCast(&proto);
     seed_ctx.call_seq = 7;
-    state.region_policy.region_context = .{ .depth = 0, .call_seq = 7 };
+    state.region_policy.setContext(0, 7);
     const seeded_decision = switch (state.validateRegionBridge(rid, &cont, 3)) {
         .ok => |d| d,
         else => return error.TestUnexpectedResult,

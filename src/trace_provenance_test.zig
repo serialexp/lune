@@ -1325,7 +1325,7 @@ test "B-2b: a seeded child needing another episode defers WITHOUT latching the d
     state.registry.native_seed_ctx = seed_ctx; // state.deinit() destroys it
     seed_ctx.proto = @ptrCast(&proto_a);
     seed_ctx.call_seq = 5;
-    state.region_policy.region_context = .{ .depth = 0, .call_seq = 5 };
+    state.region_policy.setContext(0, 5);
     try testing.expect(state.stubEnterability(&child, .ordinary, child.code.anchor.proto) == .no_episode);
 
     state.provenance_arms_pending = true;
