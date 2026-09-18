@@ -885,6 +885,19 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .ustore => try w.print("%{d}  %{d}", .{ ins.a, ins.b }),
         // guard_sid: operand + the expected string's konst id.
         .guard_sid => try w.print("%{d}  sid=k{d}", .{ ins.a, ins.aux }),
+        // href: decode which of the three aux modes (doc 49) this access uses,
+        // so a dump answers "callout or inline?" directly — the doc-52
+        // diagnosis needed exactly this.
+        .href => {
+            try w.print("%{d}  %{d}  ", .{ ins.a, ins.b });
+            if (ins.aux >= 0) {
+                try w.print("seed=r{d}", .{ins.aux});
+            } else if (HrefAux.decode(ins.aux)) |dec| {
+                try w.print("hrefk slot={d} mask={d}", .{ dec.slot, dec.mask });
+            } else {
+                try w.writeAll("callout");
+            }
+        },
         // `guard_builtin` reads the callee `%a` and tags the builtin in `aux`.
         .guard_builtin => try w.print("%{d}  [{s}]", .{ ins.a, @tagName(@as(function.RecordedBuiltin, @enumFromInt(ins.aux))) }),
         .loop, .preheader => {},
