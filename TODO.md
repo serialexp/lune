@@ -1691,13 +1691,17 @@ demotions in trace.zig, compiler-adjudicated). Deferred items:
       (run the eq trace pre-capture and post-restore and compare), rather
       than the simulated same-id/different-address twin.
 
-## Recurring jit-debug test-gate flake (2 occurrences, 2 days)
+## Recurring jit-debug test-gate flake (3 occurrences, 2 days)
 
 - [ ] Hunt the nondeterministic `zig build test -Djit-debug=true` failure:
-      2026-09-17 seed 0x3ace15b0, 2026-09-18 seed 0x34eef2f0 — each failed
-      once, then PASSED with the very same seed on rerun, so it is not
-      seed-deterministic. Suspect test parallelism / shared state / timing
-      rather than the seeded shuffle. Neither occurrence surfaced the failing
-      test's name before the runner exited. Next occurrence: capture full
-      output (`> log 2>&1`) and extract the test name; a nondeterministic
+      2026-09-17 seed 0x3ace15b0, 2026-09-18 seed 0x34eef2f0, 2026-09-18
+      seed 0x4fa150f3 (binary a8ad25c4…, during the doc 52 P0 gate) — each
+      failed once, then PASSED with the very same seed on rerun (occurrence
+      3: re-ran the exact failing binary `./.zig-cache/o/a8ad25c4…/test
+      --seed=0x4fa150f3` directly — 1402/1402 OK), so it is definitively
+      not seed-deterministic. Suspect test parallelism / shared state /
+      timing rather than the seeded shuffle. Occurrence 3's failure output
+      was again lost to a `tail` pipe before the tail-8 window (only
+      unrelated guard-dedup spam survived) — next time run the FULL gate
+      with `> log 2>&1` FIRST, not after the failure. A nondeterministic
       failure in this project is a real bug (Rule #2), not noise.

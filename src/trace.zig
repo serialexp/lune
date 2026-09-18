@@ -164,6 +164,7 @@ pub const RegionContext = trace_region.RegionContext;
 pub const RegionClassifier = trace_region.RegionClassifier;
 pub const RegionBridgeDef = trace_region.RegionBridgeDef;
 pub const RegionDef = trace_region.RegionDef;
+pub const RECURRENCE_SIG_CAP = trace_region.RECURRENCE_SIG_CAP;
 pub const RegionInternMap = trace_region.RegionInternMap;
 pub const ObserverSpan = trace_region.ObserverSpan;
 pub const freeRegionBridges = trace_region.freeRegionBridges;
@@ -610,6 +611,18 @@ pub const TraceConfig = struct {
     /// dormant fallback region is never probed again (terminal dormancy),
     /// bounding the probe cost on shapes that never qualify.
     region_admission_probe_cap: u8 = 64,
+    /// Doc 52: consecutive identical qualifying recurrent pure bursts (short
+    /// natural-terminal dispatcher ledgers) required before a resident
+    /// promotion — the recurrence-evidence analogue of `promote_after`.
+    recurrence_promote_after: u8 = 4,
+    /// Doc 52: recurrence probe budget. Charged on EVERY expensive detector
+    /// probe of a def — owner resolution, win or lose, and threshold
+    /// attempts — so alternating valid shapes saturate instead of scanning
+    /// the armed registry forever. At the cap the def stops being probed.
+    /// Reset only by a successful resident promotion. Deliberately separate
+    /// from `region_admission_probe_cap`: short bursts must never exhaust
+    /// the full-cap dormant-admission budget.
+    recurrence_probe_cap: u8 = 64,
     /// Net-profitability minimum sample: priced receipts a fallback region
     /// may accumulate before the credit/debit balance is enforced. Below
     /// this, no verdict — admission evidence plus the other triggers
@@ -2903,6 +2916,8 @@ pub const TraceState = struct {
     pub const edgeMemberOfRegion = trace_link_mod.edgeMemberOfRegion;
     pub const promotionBelongsToRegion = trace_link_mod.promotionBelongsToRegion;
     pub const detectPromotableSet = trace_link_mod.detectPromotableSet;
+    pub const detectPromotableSetMembers = trace_link_mod.detectPromotableSetMembers;
+    pub const resetRecurrenceStreaks = trace_link_mod.resetRecurrenceStreaks;
     pub const originalRel32Target = trace_link_mod.originalRel32Target;
     pub const patchPromotedEdge = trace_link_mod.patchPromotedEdge;
     pub const promoteSet = trace_link_mod.promoteSet;

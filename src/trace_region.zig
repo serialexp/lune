@@ -263,7 +263,36 @@ pub const RegionDef = struct {
     /// `config.region_admission_probe_cap` the region stops being probed —
     /// terminal dormancy, bounding probe cost on shapes that never qualify.
     admission_failures: u8 = 0,
+    /// Doc 52: signature of the last qualifying recurrent pure burst for this
+    /// region — the full ledger's (trace id, exit, kind) rows as parallel
+    /// scalar arrays. Identity is a fieldwise compare over
+    /// `[0..recurrence_len]`, never a byte compare over padded storage.
+    /// Kinds are the raw `trace_exec.LedgerKind` integer so this file needs
+    /// no trace_exec import; `RECURRENCE_SIG_CAP` mirrors
+    /// `trace_exec.LEDGER_CAP` (comptime-asserted at the use site in
+    /// trace_link.zig). Qualifying bursts are strictly shorter than the cap.
+    /// `recurrence_len == 0` ⇒ no signature. Transient tiering state — never
+    /// serialized, like the rest of the def's learning counters.
+    recurrence_len: u8 = 0,
+    recurrence_ids: [RECURRENCE_SIG_CAP]u32 = undefined,
+    recurrence_exits: [RECURRENCE_SIG_CAP]u32 = undefined,
+    recurrence_kinds: [RECURRENCE_SIG_CAP]u32 = undefined,
+    /// Doc 52: consecutive identical qualifying observed dispatcher ledgers
+    /// (saturating — "held at threshold" while promotion is blocked).
+    /// Promote at `config.recurrence_promote_after`. Reset by any observed
+    /// non-qualifying or non-identical ledger (INCLUDING full-cap ledgers,
+    /// reset at the top of that branch before dormant admission), by
+    /// resident-set demotion, election-tier flip, and invalidation.
+    recurrence_streak: u8 = 0,
+    /// Doc 52: recurrence probe budget (see `config.recurrence_probe_cap`).
+    /// Charged per expensive detector probe of this def, win or lose.
+    recurrence_probe_charges: u8 = 0,
 };
+
+/// Doc 52: capacity of the per-def recurrence signature arrays. Must equal
+/// `trace_exec.LEDGER_CAP`; asserted at comptime in trace_link.zig (this file
+/// deliberately does not import trace_exec).
+pub const RECURRENCE_SIG_CAP: usize = 32;
 
 pub fn freeRegionBridges(gpa: std.mem.Allocator, bridges: []RegionBridgeDef) void {
     for (bridges) |b| {

@@ -989,9 +989,28 @@ pub fn promotionBelongsToRegion(self: *TraceState, edges: []const PromotedEdge, 
 /// registry + region membership + ledger), so the promotion instant stays
 /// reproducible across the replay modes.
 pub fn detectPromotableSet(self: *TraceState, entries: []const trace_exec.LedgerEntry, key: RegionKey) ?[]PromotedEdge {
+    return detectPromotableSetMembers(self, entries, key, entries.len);
+}
+
+/// Doc 52: the detector core with an explicit membership bound. The full-cap
+/// grammar checks EVERY row for candidate membership (`member_rows ==
+/// entries.len`); the recurrence grammar exempts the final natural-terminal
+/// row (`member_rows == entries.len - 1`) — it is a NON-member unpatched
+/// exit, the burst's future reporting suffix. Child adjacency is always
+/// checked over the FULL ledger: for every member row `i` with a successor
+/// row, the matched edge's armed child must own `entries[i + 1]` — so the
+/// last member row's successor proof is the terminal row's owner, never
+/// dropped by slicing the ledger before detection.
+pub fn detectPromotableSetMembers(
+    self: *TraceState,
+    entries: []const trace_exec.LedgerEntry,
+    key: RegionKey,
+    member_rows: usize,
+) ?[]PromotedEdge {
+    std.debug.assert(member_rows <= entries.len);
     const def = self.region_policy.region_defs.get(key.region_id) orelse return self.rejectPromotion(.region_mismatch);
     if (!def.armable) return self.rejectPromotion(.region_mismatch);
-    if (entries.len == 0) return self.rejectPromotion(.open_chain);
+    if (entries.len == 0 or member_rows == 0) return self.rejectPromotion(.open_chain);
 
     // Region-total candidate from the armed-link registry.
     var scratch: [PROMOTED_SET_CAP]PromotedEdge = undefined;
@@ -1026,11 +1045,12 @@ pub fn detectPromotableSet(self: *TraceState, entries: []const trace_exec.Ledger
             return self.rejectPromotion(.child_mismatch);
     }
 
-    // Evidence: every row ∈ candidate, kind-exact, per-adjacent-pair
-    // child-match. Non-final rows are always `.normal`-outcome materialized
-    // transitions, and a `.prologue_fail` row can never match a candidate edge
-    // (`rowPatchKind` has no patch point for it), so the grammar is total.
-    for (entries, 0..) |row, i| {
+    // Evidence: every MEMBER row ∈ candidate, kind-exact, per-adjacent-pair
+    // child-match against the full ledger. Non-final rows are always
+    // `.normal`-outcome materialized transitions, and a `.prologue_fail` row
+    // can never match a candidate edge (`rowPatchKind` has no patch point for
+    // it), so the grammar is total.
+    for (entries[0..member_rows], 0..) |row, i| {
         const observed_kind = rowPatchKind(row.kind) orelse
             return self.rejectPromotion(.no_patch_point);
         var found: ?PromotedEdge = null;
@@ -1112,8 +1132,17 @@ pub fn considerSilentPromotion(self: *TraceState, entries: []const trace_exec.Le
     if (!self.config.silent_promotion_enabled) return;
     if (entries.len != trace_exec.LEDGER_CAP or entries[entries.len - 1].outcome != .yielded) {
         self.resetPromotionCandidate();
+        // Doc 52: short natural-terminal ledgers carry the recurrence
+        // evidence class; every other non-full-cap shape resets the streaks
+        // inside the same funnel.
+        tryRecurrencePromotion(self, entries);
         return;
     }
+    // Doc 52: a full-cap ledger for any region is decisive evidence the
+    // observed shape is NOT a short recurring burst — reset every def's
+    // recurrence streak at the TOP of this branch, before dormant admission
+    // can mutate eligibility (the simplest deterministic ordering).
+    resetRecurrenceStreaks(self);
     // Demand-driven admission runs on the same evidence class as candidacy (a
     // full forced-yield ledger) but BEFORE the activation-context resolution:
     // a dormant region is out of the receipt maps, so no activation can be
@@ -1254,6 +1283,166 @@ fn tryDormantAdmission(self: *TraceState, entries: []const trace_exec.LedgerEntr
     // the post-walk drain tail) and admission only ADDS armability — the
     // stale-bridge sweep sees an unchanged live-armable set.
     self.rebuildRegions();
+}
+
+// ---------------------------------------------------------------------------
+// Doc 52: recurrence evidence for short natural-terminal bursts.
+// ---------------------------------------------------------------------------
+
+comptime {
+    // The RegionDef signature arrays deliberately avoid a trace_exec import;
+    // this is the pinned equivalence.
+    std.debug.assert(trace_mod.RECURRENCE_SIG_CAP == trace_exec.LEDGER_CAP);
+}
+
+/// Doc 52: reset every def's recurrence streak. Called for every observed
+/// non-qualifying dispatcher ledger — including the full-cap branch — and
+/// deliberately unfiltered: resetting a non-eligible def's streak is a no-op
+/// semantically and keeps the funnel one loop with no eligibility drift.
+pub fn resetRecurrenceStreaks(self: *TraceState) void {
+    var it = self.region_policy.region_defs.iterator();
+    while (it.next()) |e| e.value_ptr.recurrence_streak = 0;
+}
+
+fn recurrenceEligible(d: *const RegionDef) bool {
+    return d.fallback_owner and d.dormant and d.armable and !d.tombstoned;
+}
+
+fn recurrenceSigMatches(d: *const RegionDef, entries: []const trace_exec.LedgerEntry) bool {
+    if (d.recurrence_len == 0 or d.recurrence_len != entries.len) return false;
+    for (entries, 0..) |row, i| {
+        if (d.recurrence_ids[i] != row.id or d.recurrence_exits[i] != row.exit or
+            d.recurrence_kinds[i] != @intFromEnum(row.kind)) return false;
+    }
+    return true;
+}
+
+fn recurrenceSigStore(d: *RegionDef, entries: []const trace_exec.LedgerEntry) void {
+    std.debug.assert(entries.len < trace_mod.RECURRENCE_SIG_CAP);
+    d.recurrence_len = @intCast(entries.len);
+    for (entries, 0..) |row, i| {
+        d.recurrence_ids[i] = row.id;
+        d.recurrence_exits[i] = row.exit;
+        d.recurrence_kinds[i] = @intFromEnum(row.kind);
+    }
+}
+
+/// Doc 52: the recurrence funnel — runs once per observed dispatcher ledger
+/// that failed the full-cap gate. The steady state is signature-only
+/// (fieldwise compares against a handful of defs, allocation-free); the
+/// expensive region-total detector runs only at owner resolution of a new
+/// signature, budget-bounded by `recurrence_probe_charges` per def.
+///
+/// A ledger qualifies as a recurrent pure burst iff `len ∈ [2, LEDGER_CAP)`
+/// and its final row is a natural terminal in the STRICT class
+/// `kind == .deopt ∧ reason == .normal ∧ outcome == .normal` (the same
+/// predicate `noteDispatcherLedgerTerminal` keys on — `.normal` outcome
+/// alone is overloaded: prologue fails and seed declines are also
+/// `.normal`-outcome terminals). Membership then covers the NON-final rows
+/// (`detectPromotableSetMembers` with `member_rows = len - 1`); the terminal
+/// row additionally must not itself resolve to a candidate armed edge (an
+/// armed chain source with ledger room dispatches onward — a terminal that
+/// IS a live candidate means registry and execution disagree; never promote
+/// on it).
+///
+/// P0 scope: evidence only. At the threshold the streak saturates and holds
+/// ("held at threshold"); the resident promotion itself is doc 52 P1.
+fn tryRecurrencePromotion(self: *TraceState, entries: []const trace_exec.LedgerEntry) void {
+    if (self.region_policy.region_defs.count() == 0) return;
+    const qualifies = entries.len >= 2 and entries.len < trace_exec.LEDGER_CAP and blk: {
+        const term = entries[entries.len - 1];
+        break :blk term.kind == .deopt and term.reason == .normal and term.outcome == .normal;
+    };
+    if (!qualifies) {
+        resetRecurrenceStreaks(self);
+        return;
+    }
+    // Cheap match: scan ALL eligible defs and take the MINIMUM RegionId whose
+    // stored signature equals this ledger — never first-hit, which would make
+    // the owner depend on hashmap iteration order (two defs can hold the same
+    // signature: overlapping memberships, stale losers).
+    var matched: ?RegionId = null;
+    var it = self.region_policy.region_defs.iterator();
+    while (it.next()) |e| {
+        if (!recurrenceEligible(e.value_ptr)) continue;
+        if (!recurrenceSigMatches(e.value_ptr, entries)) continue;
+        if (matched == null or @intFromEnum(e.key_ptr.*) < @intFromEnum(matched.?))
+            matched = e.key_ptr.*;
+    }
+    if (matched) |rid| {
+        var it2 = self.region_policy.region_defs.iterator();
+        while (it2.next()) |e| {
+            if (e.key_ptr.* == rid) {
+                e.value_ptr.recurrence_streak +|= 1; // saturating: held at threshold
+            } else e.value_ptr.recurrence_streak = 0;
+        }
+        const d = self.region_policy.region_defs.getPtr(rid).?;
+        self.dbg("recurrence: qualify rid={d} len={d} streak={d}/{d}", .{
+            @intFromEnum(rid), entries.len, d.recurrence_streak, self.config.recurrence_promote_after,
+        });
+        if (d.recurrence_streak < @max(self.config.recurrence_promote_after, 1)) return;
+        // Gates BEFORE any expensive work (doc 52, codex round 2 blocker 3).
+        if (d.recurrence_probe_charges >= self.config.recurrence_probe_cap) {
+            self.dbg("recurrence: probe-cap rid={d}", .{@intFromEnum(rid)});
+            return;
+        }
+        // P1 gate slot: `resident_set_count != 0` blocks here (one-resident-
+        // set invariant) once resident sets exist. P0 promotes nothing: the
+        // saturating streak holds and P1 adds the threshold probe + resident
+        // authorization at exactly this point.
+        self.dbg("recurrence: threshold rid={d} held (promotion lands in doc 52 P1)", .{@intFromEnum(rid)});
+        return;
+    }
+    // Owner resolution — the only other expensive path, budget-bounded.
+    // Every probed def is charged, win or lose (alternating valid shapes
+    // must saturate, not scan the armed registry forever). The winner is the
+    // minimum matching RegionId; non-winning successful probes free their
+    // candidate allocation. Reject diagnostics are production candidacy
+    // telemetry — save/restore around every probe, as dormant admission does.
+    var winner: ?RegionId = null;
+    var it3 = self.region_policy.region_defs.iterator();
+    while (it3.next()) |e| {
+        const d = e.value_ptr;
+        if (!recurrenceEligible(d)) continue;
+        if (d.recurrence_probe_charges >= self.config.recurrence_probe_cap) continue;
+        d.recurrence_probe_charges +|= 1;
+        const saved_rejects = self.silent_rejects;
+        const probe_key: RegionKey = .{ .region_id = e.key_ptr.*, .activation = 0 };
+        if (detectPromotableSetMembers(self, entries, probe_key, entries.len - 1)) |edges| {
+            defer self.gpa.free(edges);
+            self.silent_rejects = saved_rejects;
+            // Grammar 3: the terminal row must not be a live candidate edge.
+            const term = entries[entries.len - 1];
+            var terminal_is_candidate = false;
+            for (edges) |edge| {
+                if (edge.parent.id == term.id and edge.exit == term.exit) {
+                    terminal_is_candidate = true;
+                    break;
+                }
+            }
+            if (terminal_is_candidate) continue;
+            if (winner == null or @intFromEnum(e.key_ptr.*) < @intFromEnum(winner.?))
+                winner = e.key_ptr.*;
+        } else {
+            self.silent_rejects = saved_rejects;
+        }
+    }
+    const rid = winner orelse {
+        // A qualifying ledger that NO def owns still breaks every
+        // in-progress streak: the streak is defined over CONSECUTIVE
+        // identical observed ledgers, and this observation wasn't identical
+        // to any streak-holder's shape.
+        resetRecurrenceStreaks(self);
+        return;
+    };
+    var it4 = self.region_policy.region_defs.iterator();
+    while (it4.next()) |e| e.value_ptr.recurrence_streak = 0;
+    const d = self.region_policy.region_defs.getPtr(rid).?;
+    recurrenceSigStore(d, entries);
+    d.recurrence_streak = 1;
+    self.dbg("recurrence: owner-resolve rid={d} len={d} charges={d}", .{
+        @intFromEnum(rid), entries.len, d.recurrence_probe_charges,
+    });
 }
 
 pub const DemotionReason = native_physical.DemotionReason;

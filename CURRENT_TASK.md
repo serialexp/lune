@@ -309,3 +309,46 @@ Bart chose "Own hash part (B)" over the std-map layout-discovery hack. Summary:
   liveSlotOf 31.9% of profile is those tier-0 probes. Seam:
   replayLedgerFrom 7.5%, ~1028 cyc/walk. Defers: guard_hash subsumption on
   hrefk chains, on-trace insertion (asm_newref analogue), scalar-key hrefk.
+
+## Status 2026-09-18 (latest+16) — task #36 (doc 51 Fix C → doc 52): P0 recurrence evidence LANDED
+
+**P0 committed; P1 (resident promotion, mixed support) + P2 (measurement) outstanding.**
+Doc: `docs/design/52-recurrence-resident-promotion.md` (codex rounds 1–3, thread
+`01a0b2b9-914e-7020-82f6-0633070a6376`; all blockers folded). Bart's decisions:
+mixed support (one activation set + one resident set live simultaneously) in
+scope for P1 — NOT the coarse exclusivity I proposed; `recurrence_promote_after`
+default 4.
+
+- **Problem (nbody)**: 499,995 dispatcher bursts, 99.5% identical 8-row
+  natural-terminal ledgers; each drain replays the ledger ~11.9k cyc = 20.5% of
+  wall, on a cycle that already runs native→native via armed links. Four gates
+  block silent promotion for short bursts: evidence needs LEDGER_CAP+.yielded;
+  fallback-elected region mints dormant; min_useful=8 vs work=6; activation-
+  scoped sets demoted at closeRegion. Doc 52 = recurrence evidence (K=4
+  consecutive identical qualifying ledgers) + region-lifetime RESIDENT sets.
+- **P0 (this increment, behavior-neutral)**: `RegionDef` recurrence fields
+  (parallel u32 sig arrays cap 32, streak, probe-charge budget cap 64);
+  qualifying grammar (len∈[2,CAP), terminal strictly deopt/normal/normal, NOT
+  an armed candidate edge, non-final rows pass `detectPromotableSetMembers`
+  (new core, member_rows=len−1, child-match over FULL ledger; 2-arg delegate
+  unchanged)); cheap signature-first steady state; deterministic min-RegionId
+  owner resolution charging every probed def win-or-lose; streak resets on
+  every non-qualifying observed ledger (incl. full-cap branch) AND
+  qualifying-but-unowned; threshold path logs "held" — nothing promotes.
+  Config: `recurrence_promote_after=4`, `recurrence_probe_cap=64`.
+- **Files**: src/trace_region.zig (fields + RECURRENCE_SIG_CAP), src/trace.zig
+  (config + re-exports), src/trace_link.zig (grammar core + tryRecurrence-
+  Promotion + resets), src/trace_promotion_test.zig (2 tests: full lifecycle
+  incl. grammar-3 armed-terminal reject, child-mismatch, full-cap reset,
+  non-qualifying reset + charge-free cheap re-match; min-RegionId determinism
+  with reset-loser). Gates: `just test` green, jit-debug battery green.
+- **Flake note**: jit-debug gate flaked once during the P0 gate (occurrence
+  #3, seed 0x4fa150f3); exact binary + same seed rerun passes 1402/1402 —
+  proven NOT seed-deterministic. TODO.md updated; capture full output FIRST
+  next time.
+- **Next**: doc 52 P1 — resident sentinel key (activation=maxInt) + isResident,
+  mixed-support drain (per-fired-set transitions_credit split, entry-set global
+  credit at trace_chain.zig:1135 removed, barren settlement re-target),
+  barren_exempt epilogue flag, PROVENANCE_VERDICT_CAP 48→64, count caches,
+  demotion notice → streak zero, election-tier reset, full test battery; then
+  P2 measurement (nbody before/after, adversarial benches, sensitive boards).

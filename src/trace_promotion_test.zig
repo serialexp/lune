@@ -2215,3 +2215,199 @@ test "C' parked proof invalidation (codex round 4): membership growth, exit muta
     state.disarmAllLinks();
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.parked_proofs.items.len);
 }
+
+test "doc 52 P0: recurrence evidence — owner resolution, streak build, threshold hold, resets" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [32]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1801, .code = &code, .name = "doc52-p0", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    const key: RegionKey = .{ .region_id = @enumFromInt(7), .activation = 0 };
+    try installB3PromotionRegion(&state, key, &.{ a, b });
+    {
+        const d = state.region_policy.region_defs.getPtr(key.region_id).?;
+        d.fallback_owner = true;
+        d.dormant = true;
+    }
+
+    // Qualifying recurrent pure burst: members a→b→a chained through armed
+    // children, natural terminal (deopt/normal/normal) owned by the last
+    // member's armed child (b) at an exit that is NOT a candidate edge.
+    const burst = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 1, .deopt),
+    };
+
+    // First observation: owner resolution — one expensive probe charged,
+    // signature stored, streak 1.
+    state.considerSilentPromotion(&burst);
+    {
+        const d = state.region_policy.region_defs.get(key.region_id).?;
+        try testing.expectEqual(@as(u8, 1), d.recurrence_streak);
+        try testing.expectEqual(@as(u8, 1), d.recurrence_probe_charges);
+        try testing.expectEqual(@as(u8, 4), d.recurrence_len);
+    }
+
+    // Identical observations ride the cheap signature path: streak builds
+    // with no further charges, saturates past the threshold (held), and P0
+    // promotes nothing.
+    state.considerSilentPromotion(&burst);
+    state.considerSilentPromotion(&burst);
+    state.considerSilentPromotion(&burst);
+    state.considerSilentPromotion(&burst);
+    {
+        const d = state.region_policy.region_defs.get(key.region_id).?;
+        try testing.expectEqual(@as(u8, 5), d.recurrence_streak);
+        try testing.expectEqual(@as(u8, 1), d.recurrence_probe_charges);
+    }
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promotedSets().len);
+
+    // A different qualifying shape re-resolves ownership: second charge, new
+    // signature, streak restarts at 1.
+    const burst_b = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 1, .deopt),
+    };
+    state.considerSilentPromotion(&burst_b);
+    {
+        const d = state.region_policy.region_defs.get(key.region_id).?;
+        try testing.expectEqual(@as(u8, 1), d.recurrence_streak);
+        try testing.expectEqual(@as(u8, 2), d.recurrence_probe_charges);
+        try testing.expectEqual(@as(u8, 3), d.recurrence_len);
+    }
+
+    // A short forced-yield ledger is non-qualifying: streak resets, stored
+    // signature survives (cheap re-match rebuilds the streak without a new
+    // charge).
+    const short_yield = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        .{ .cum = 0, .id = b.id, .exit = 0, .reason = .normal, .kind = .link_terminal, .outcome = .yielded },
+    };
+    state.considerSilentPromotion(&short_yield);
+    try testing.expectEqual(@as(u8, 0), state.region_policy.region_defs.get(key.region_id).?.recurrence_streak);
+    state.considerSilentPromotion(&burst_b);
+    {
+        const d = state.region_policy.region_defs.get(key.region_id).?;
+        try testing.expectEqual(@as(u8, 1), d.recurrence_streak);
+        try testing.expectEqual(@as(u8, 2), d.recurrence_probe_charges);
+    }
+
+    // A full-cap forced-yield ledger resets the streak at the top of the
+    // full-cap branch (before dormant admission, which here fails on
+    // non-member rows and leaves the region dormant).
+    var full: [trace_exec.LEDGER_CAP]trace_exec.LedgerEntry = undefined;
+    for (&full) |*r| r.* = .{ .cum = 0, .id = 999, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal };
+    full[full.len - 1].outcome = .yielded;
+    state.considerSilentPromotion(&full);
+    {
+        const d = state.region_policy.region_defs.get(key.region_id).?;
+        try testing.expectEqual(@as(u8, 0), d.recurrence_streak);
+        try testing.expect(d.dormant);
+    }
+
+    // A terminal that IS a live candidate edge is rejected (grammar 3): the
+    // probe is charged, no def wins, and the qualifying-but-unowned ledger
+    // breaks every in-progress streak.
+    state.considerSilentPromotion(&burst_b); // rebuild streak to 1 (cheap)
+    const armed_terminal = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .deopt),
+    };
+    state.considerSilentPromotion(&armed_terminal);
+    {
+        const d = state.region_policy.region_defs.get(key.region_id).?;
+        try testing.expectEqual(@as(u8, 0), d.recurrence_streak);
+        try testing.expectEqual(@as(u8, 3), d.recurrence_probe_charges);
+    }
+
+    // Last-member→terminal child adjacency is enforced through the FULL
+    // ledger: the last member row (b, child a) does not own a terminal
+    // carried by b.
+    const child_break = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(b, 1, .deopt),
+    };
+    const probe_key: RegionKey = .{ .region_id = key.region_id, .activation = 0 };
+    try testing.expect(state.detectPromotableSetMembers(&child_break, probe_key, child_break.len - 1) == null);
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.child_mismatch);
+
+    // The 2-arg delegate keeps the full-cap grammar: EVERY row is
+    // membership-checked, so the non-member natural terminal fails it.
+    try testing.expect(state.detectPromotableSet(&burst, probe_key) == null);
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.open_chain);
+}
+
+test "doc 52 P0: recurrence owner resolution and cheap match pick the minimum RegionId" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [32]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1802, .code = &code, .name = "doc52-minid", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    // Two eligible defs with identical membership; rid 3 < rid 9.
+    const key_lo: RegionKey = .{ .region_id = @enumFromInt(3), .activation = 0 };
+    const key_hi: RegionKey = .{ .region_id = @enumFromInt(9), .activation = 1 };
+    try installB3PromotionRegion(&state, key_lo, &.{ a, b });
+    try installB3PromotionRegion(&state, key_hi, &.{ a, b });
+    for ([_]RegionKey{ key_lo, key_hi }) |k| {
+        const d = state.region_policy.region_defs.getPtr(k.region_id).?;
+        d.fallback_owner = true;
+        d.dormant = true;
+    }
+
+    const burst = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 1, .deopt),
+    };
+
+    // Owner resolution: BOTH eligible defs are probed and charged (win or
+    // lose); the minimum RegionId wins the signature.
+    state.considerSilentPromotion(&burst);
+    {
+        const lo = state.region_policy.region_defs.get(key_lo.region_id).?;
+        const hi = state.region_policy.region_defs.get(key_hi.region_id).?;
+        try testing.expectEqual(@as(u8, 1), lo.recurrence_streak);
+        try testing.expectEqual(@as(u8, 1), lo.recurrence_probe_charges);
+        try testing.expectEqual(@as(u8, 4), lo.recurrence_len);
+        try testing.expectEqual(@as(u8, 0), hi.recurrence_streak);
+        try testing.expectEqual(@as(u8, 1), hi.recurrence_probe_charges);
+        try testing.expectEqual(@as(u8, 0), hi.recurrence_len);
+    }
+
+    // Cheap match with DUPLICATE signatures must also pick the minimum
+    // RegionId — never hashmap iteration order — and reset the loser.
+    {
+        const lo = state.region_policy.region_defs.get(key_lo.region_id).?;
+        const hi = state.region_policy.region_defs.getPtr(key_hi.region_id).?;
+        hi.recurrence_len = lo.recurrence_len;
+        hi.recurrence_ids = lo.recurrence_ids;
+        hi.recurrence_exits = lo.recurrence_exits;
+        hi.recurrence_kinds = lo.recurrence_kinds;
+        hi.recurrence_streak = 7;
+    }
+    state.considerSilentPromotion(&burst);
+    {
+        const lo = state.region_policy.region_defs.get(key_lo.region_id).?;
+        const hi = state.region_policy.region_defs.get(key_hi.region_id).?;
+        try testing.expectEqual(@as(u8, 2), lo.recurrence_streak);
+        try testing.expectEqual(@as(u8, 0), hi.recurrence_streak);
+        try testing.expectEqual(@as(u8, 1), lo.recurrence_probe_charges);
+        try testing.expectEqual(@as(u8, 1), hi.recurrence_probe_charges);
+    }
+}
