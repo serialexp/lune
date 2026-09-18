@@ -362,6 +362,12 @@ pub const FrameMotionAbi = struct {
     vm_tick_off: i32,
     /// `Vm.trace.self_call_pushes` (u64) — the formation/`--jit-stats` witness.
     vm_self_call_pushes_off: i32,
+    /// `Vm.trace.self_ret_pops` (u64) — the pop's formation witness (doc 54 P1).
+    vm_self_ret_pops_off: i32,
+    /// `Vm.open_upvalue_ceiling` (usize) — the inline pop's one-cmp
+    /// open-upvalue check (`ceiling <= popped base` ⇒ no open cell at or
+    /// above the popped window). Doc 54 P1.
+    vm_open_upvalue_ceiling_off: i32,
     /// `@sizeOf(CallFrame)` — the `frames[]` stride.
     frame_size: i32,
     frame_closure_off: i32,

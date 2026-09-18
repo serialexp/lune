@@ -5646,6 +5646,42 @@ test "descent gate publication (doc 54 P0): prepareNativeEpisode computes descen
     try testing.expectEqual(@as(u8, 1), ctx.descent_ok);
 }
 
+test "open-upvalue ceiling (doc 54 P1): centralized maintenance keeps the watermark exact-or-high" {
+    // The inline native pop replaces the helper's full open-list scan with
+    // one `ceiling <= popped base` compare, so the ceiling must never go
+    // stale-LOW (unsound: a pop would free a window with a live open cell
+    // above it). Pin every maintenance site: append raises via @max,
+    // closeUpvaluesFrom recomputes exactly (0 on empty), clear resets.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    try testing.expectEqual(@as(usize, 0), vm.open_upvalue_ceiling);
+    // closeWith snapshots the live slot — give the slots defined values.
+    vm.regSet(1, Value.int(11));
+    vm.regSet(3, Value.int(13));
+    vm.regSet(5, Value.int(15));
+    vm.regSet(7, Value.int(17));
+    vm.stack_top = 8;
+    try vm.appendOpenUpvalue(3, try vm.heap.newUpvalue(3));
+    try testing.expectEqual(@as(usize, 4), vm.open_upvalue_ceiling);
+    try vm.appendOpenUpvalue(7, try vm.heap.newUpvalue(7));
+    try testing.expectEqual(@as(usize, 8), vm.open_upvalue_ceiling);
+    // A lower open never lowers the watermark.
+    try vm.appendOpenUpvalue(1, try vm.heap.newUpvalue(1));
+    try testing.expectEqual(@as(usize, 8), vm.open_upvalue_ceiling);
+    // Partial close: the exact recompute drops to the surviving max.
+    vm.closeUpvaluesFrom(4);
+    try testing.expectEqual(@as(usize, 4), vm.open_upvalue_ceiling);
+    // Close-all: empty list ⇒ zero.
+    vm.closeUpvaluesFrom(0);
+    try testing.expectEqual(@as(usize, 0), vm.open_upvalue_ceiling);
+    // The wholesale clear resets with the list.
+    try vm.appendOpenUpvalue(5, try vm.heap.newUpvalue(5));
+    try testing.expectEqual(@as(usize, 6), vm.open_upvalue_ceiling);
+    vm.clearOpenUpvalues();
+    try testing.expectEqual(@as(usize, 0), vm.open_upvalue_ceiling);
+}
+
 test "ret pop formation (doc 44 D12c): fused descents unwind through the native pop" {
     // The pop's formation proof, symmetric to the D11 push witness: output
     // equality cannot distinguish a native pop from the (slower) plain
@@ -5844,11 +5880,11 @@ test "pop helper refusal matrix (doc 44 D12c): every wall declines with nothing 
         // the full scan refuses even when an OLDER frame's cell sits first
         // in the (append-ordered, swapRemove-compacted) list.
         const old_cell = try vm.heap.newUpvalue(1); // below the popped base
-        try vm.open_upvalues.append(gpa, .{ .index = 1, .cell = old_cell });
+        try vm.appendOpenUpvalue(1, old_cell);
         const hot_cell = try vm.heap.newUpvalue(5); // inside the popped window
-        try vm.open_upvalues.append(gpa, .{ .index = 5, .cell = hot_cell });
+        try vm.appendOpenUpvalue(5, hot_cell);
         try testing.expectEqual(trace.NativeSeedCtx.POP_DECLINE, pop(ctx, &code, 1, 1));
-        vm.open_upvalues.clearRetainingCapacity();
+        vm.clearOpenUpvalues();
     }
     try testing.expectEqual(@as(u32, 2), vm.depth);
     try testing.expectEqual(tick0, vm.trace.tick);

@@ -1096,6 +1096,9 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
     // Closed upvalue id 4 holds 99; open upvalue id 5 was rebound over stack[0]
     // and therefore reads the table ref now living there.
     try testing.expectEqual(@as(usize, 1), vm.open_upvalues.items.len);
+    // Doc 54 P1: restore republishes the ceiling through the centralized
+    // append (stack_index 0 ⇒ ceiling 1).
+    try testing.expectEqual(@as(usize, 1), vm.open_upvalue_ceiling);
     const open_cell = vm.open_upvalues.items[0].cell;
     try testing.expectEqual(@as(u32, 5), open_cell.header.id);
     try testing.expectEqual(@as(usize, 0), open_cell.loc.open);

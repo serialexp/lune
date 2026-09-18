@@ -620,7 +620,19 @@ pub const Vm = struct {
     pending_error: ?Value = null,
     /// Open upvalues, keyed by absolute stack index. Searched on capture (to
     /// share a cell) and on scope/frame exit (to close cells over dying slots).
+    /// Doc 54 P1: mutated ONLY through the centralized methods that own
+    /// `open_upvalue_ceiling` (`appendOpenUpvalue`, `closeUpvaluesFrom`,
+    /// `clearOpenUpvalues`) — direct list writes would let the ceiling go
+    /// stale-LOW, the one unsound direction.
     open_upvalues: std.ArrayList(OpenUpvalue) = .empty,
+    /// Doc 54 P1: upper bound on `index + 1` over `open_upvalues` — the
+    /// inline native pop's one-load check (`ceiling <= popped frame.base` ⇒
+    /// no open cell at or above the popped window, replacing the helper's
+    /// full-list scan). Raised via `@max` on open, recomputed exactly in
+    /// `closeUpvaluesFrom` (which already walks the list), reset on clear;
+    /// the keyframe restorer republishes it through `appendOpenUpvalue`.
+    /// Stale-HIGH only declines a pop spuriously — fail closed.
+    open_upvalue_ceiling: usize = 0,
     /// Where the `print` host-effect writes. `null` means the process's buffered
     /// stdout (`io.zig`); a test (or a future effect recorder) can point this at
     /// an in-memory writer to capture output without touching the real stdout.
@@ -878,6 +890,8 @@ pub const Vm = struct {
         std.debug.assert(@sizeOf(@FieldType(RegionPolicy, "region_context_valid")) == 1);
         std.debug.assert(@sizeOf(@FieldType(TraceState, "tick")) == 8);
         std.debug.assert(@sizeOf(@FieldType(TraceState, "self_call_pushes")) == 8);
+        std.debug.assert(@sizeOf(@FieldType(TraceState, "self_ret_pops")) == 8);
+        std.debug.assert(@sizeOf(@FieldType(Vm, "open_upvalue_ceiling")) == 8); // qword cmp vs popped base
         std.debug.assert(@sizeOf(@FieldType(CallFrame, "closure")) == 8);
         std.debug.assert(@sizeOf(@FieldType(CallFrame, "call_seq")) == 8);
         std.debug.assert(@sizeOf(@FieldType(CallFrame, "base")) == 8);
@@ -900,6 +914,8 @@ pub const Vm = struct {
             .vm_region_valid_off = policy_off + @offsetOf(RegionPolicy, "region_context_valid"),
             .vm_tick_off = trace_off + @offsetOf(TraceState, "tick"),
             .vm_self_call_pushes_off = trace_off + @offsetOf(TraceState, "self_call_pushes"),
+            .vm_self_ret_pops_off = trace_off + @offsetOf(TraceState, "self_ret_pops"),
+            .vm_open_upvalue_ceiling_off = @offsetOf(Vm, "open_upvalue_ceiling"),
             .frame_size = @sizeOf(CallFrame),
             .frame_closure_off = @offsetOf(CallFrame, "closure"),
             .frame_call_seq_off = @offsetOf(CallFrame, "call_seq"),
@@ -7045,8 +7061,24 @@ pub const Vm = struct {
             if (ou.index == index) return ou.cell;
         }
         const cell = try self.heap.newUpvalue(index);
-        try self.open_upvalues.append(self.gpa, .{ .index = index, .cell = cell });
+        try self.appendOpenUpvalue(index, cell);
         return cell;
+    }
+
+    /// Doc 54 P1: the ONLY append into `open_upvalues` — owns the ceiling
+    /// raise (`@max`, so the watermark can never go stale-LOW on an open).
+    /// Pub for the keyframe restorer's list rebuild and for tests; interp-
+    /// internal opens (`captureUpvalue`) route through here too.
+    pub fn appendOpenUpvalue(self: *Vm, index: usize, cell: *function.Upvalue) std.mem.Allocator.Error!void {
+        try self.open_upvalues.append(self.gpa, .{ .index = index, .cell = cell });
+        self.open_upvalue_ceiling = @max(self.open_upvalue_ceiling, index + 1);
+    }
+
+    /// Doc 54 P1: the ONLY wholesale clear of `open_upvalues` (tests) — the
+    /// ceiling resets with the list, keeping the pair coherent.
+    pub fn clearOpenUpvalues(self: *Vm) void {
+        self.open_upvalues.clearRetainingCapacity();
+        self.open_upvalue_ceiling = 0;
     }
 
     /// Read an upvalue cell's value. Vm-mediated because an *open* cell's value
@@ -7085,6 +7117,12 @@ pub const Vm = struct {
                 _ = self.open_upvalues.swapRemove(i);
             }
         }
+        // Doc 54 P1: exact ceiling recompute — this call already visits the
+        // whole list, so the survivor pass keeps the watermark tight (and 0
+        // on empty) with no separate maintenance site to forget.
+        var ceiling: usize = 0;
+        for (self.open_upvalues.items) |ou| ceiling = @max(ceiling, ou.index + 1);
+        self.open_upvalue_ceiling = ceiling;
     }
 
     /// Place a single native result at `regs[a]` (absolute `stack[base + a]`) and

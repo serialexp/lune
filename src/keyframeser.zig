@@ -846,7 +846,10 @@ pub fn restoreSnapshot(
         const cell = function.Upvalue.fromHeader(uh);
         // Switch the cell from its closed placeholder to open over the live slot.
         cell.loc = .{ .open = ou.stack_index };
-        try vm.open_upvalues.append(gpa, .{ .index = ou.stack_index, .cell = cell });
+        // Doc 54 P1: through the centralized method, so the rebuilt list
+        // republishes `open_upvalue_ceiling` as it grows (round-1 blocker 5:
+        // a restore that bypassed the ceiling would leave it stale-LOW).
+        try vm.appendOpenUpvalue(ou.stack_index, cell);
     }
 
     // VM-level metatable support (chunk 2a). A non-zero `string_metatable_id`
