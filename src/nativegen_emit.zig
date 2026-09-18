@@ -844,6 +844,12 @@ pub fn emitSilentEpilogue(a: *x64.Assembler, kind: ExitPatchKind, metadata_cell:
     try a.movMemReg(.rcx, @offsetOf(SilentSummaryCell, "last_productive_ordinal"), .r9);
     a.bind(not_productive);
 
+    // Doc 52 P1: resident edges are barren-exempt — their firings neither
+    // advance nor reset the activation's zero-run. Each arm tests the per-edge
+    // flag (rax = metadata, still live) immediately before its zero-run
+    // mutation and jumps straight to `zero_done`; all summary-cell work above
+    // is keyed to the edge's own cells and unaffected. Activation edges pay
+    // the test + fall through — the cost-honesty note in doc 52.
     switch (kind) {
         .deopt => {
             try a.addMemReg(.rcx, @offsetOf(SilentSummaryCell, "region_work"), .r8);
@@ -852,6 +858,8 @@ pub fn emitSilentEpilogue(a: *x64.Assembler, kind: ExitPatchKind, metadata_cell:
             try a.jcc(.b, qualified_done);
             try a.incMemQword(.rcx, @offsetOf(SilentSummaryCell, "qualifying_rows"));
             a.bind(qualified_done);
+            try a.cmpQwordMemImm8(.rax, @offsetOf(SilentExitMetadata, "barren_exempt"), 0);
+            try a.jcc(.ne, zero_done);
             try a.cmpRegImm32(.r8, 0);
             try a.jcc(.ne, reset_zero);
             try a.incMemQword(.rdx, @offsetOf(NativeResult, "cur_zero_run"));
@@ -871,10 +879,14 @@ pub fn emitSilentEpilogue(a: *x64.Assembler, kind: ExitPatchKind, metadata_cell:
             try a.jcc(.b, qualified_done);
             try a.incMemQword(.rcx, @offsetOf(SilentSummaryCell, "qualifying_rows"));
             a.bind(qualified_done);
+            try a.cmpQwordMemImm8(.rax, @offsetOf(SilentExitMetadata, "barren_exempt"), 0);
+            try a.jcc(.ne, zero_done);
             try a.jmp(reset_zero);
         },
         .link_terminal => {
             // Structural only: no work cells; a zero-work link advances the barren run.
+            try a.cmpQwordMemImm8(.rax, @offsetOf(SilentExitMetadata, "barren_exempt"), 0);
+            try a.jcc(.ne, zero_done);
             try a.incMemQword(.rdx, @offsetOf(NativeResult, "cur_zero_run"));
             try a.jmp(zero_done);
         },
@@ -891,6 +903,8 @@ pub fn emitSilentEpilogue(a: *x64.Assembler, kind: ExitPatchKind, metadata_cell:
             try a.jcc(.b, qualified_done);
             try a.incMemQword(.rcx, @offsetOf(SilentSummaryCell, "qualifying_rows"));
             a.bind(qualified_done);
+            try a.cmpQwordMemImm8(.rax, @offsetOf(SilentExitMetadata, "barren_exempt"), 0);
+            try a.jcc(.ne, zero_done);
             try a.incMemQword(.rdx, @offsetOf(NativeResult, "cur_zero_run"));
             try a.jmp(zero_done);
         },

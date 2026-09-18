@@ -731,11 +731,14 @@ pub fn compositeContinueProof(t: *const Trace, composite_ei: u32, flp: u32) bool
 }
 
 pub const PROMOTED_SET_CAP: usize = 16;
-// At most 16 promoted phases can contribute prefix relations. A 32-row
-// reporting suffix can evidence at most 31 distinct parent→child relations
-// (each needs a following row), so the merged maximum is 47. Allocate 48 by
-// the natural component sum and keep every overflow path release-panicking.
-pub const PROVENANCE_VERDICT_CAP: usize = PROMOTED_SET_CAP + trace_exec.LEDGER_CAP;
+// Doc 52 P1 (mixed support): at most TWO sets are live at any native call —
+// ≤1 activation-scoped (the entry sweep enforces it) + ≤1 resident (registry
+// invariant 1) — so up to 2 × 16 promoted phases can contribute prefix
+// relations. A 32-row reporting suffix can evidence at most 31 distinct
+// parent→child relations (each needs a following row), so the merged maximum
+// is 63. Allocate 64 by the natural component sum and keep every overflow
+// path release-panicking — the cap is an invariant, not a truncation.
+pub const PROVENANCE_VERDICT_CAP: usize = 2 * PROMOTED_SET_CAP + trace_exec.LEDGER_CAP;
 
 pub const exitPatchFor = native_physical.exitPatchFor;
 
@@ -1120,6 +1123,44 @@ pub fn promoteSet(self: *TraceState, edges: []const PromotedEdge, region_key: Re
     }
 }
 
+/// Doc 52 P1: resident promotion — the shared physical validation of
+/// `promoteSet` with the RESIDENT authorization branch in place of the
+/// activation one. `promotionBelongsToRegion` requires a `region_profit`
+/// accumulator and `accum.frozen`; a dormant region has neither, by design —
+/// residency instead requires the recurrence-eligible class re-checked at the
+/// promotion instant (the streak gate already ran at the caller) plus per-edge
+/// region membership. The region STAYS dormant: it never enters the receipt
+/// maps, and the registry publisher needs no activation.
+pub fn promoteResidentSet(self: *TraceState, edges: []const PromotedEdge, rid: RegionId) !void {
+    const key: RegionKey = .{ .region_id = rid, .activation = native_physical.RESIDENT_ACTIVATION };
+    // Physical precedence first, exactly as the activation path orders it.
+    try self.registry.native_physical.checkPromotable(edges, key);
+    const def = self.region_policy.region_defs.get(rid) orelse return error.InvalidPromotionRegion;
+    if (!recurrenceEligible(&def)) return error.InvalidPromotionRegion;
+    for (edges) |edge| {
+        if (!self.edgeMemberOfRegion(edge, rid, true)) return error.InvalidPromotionRegion;
+    }
+    // Link/slot/patch identity — shared with the activation path.
+    for (edges) |edge| {
+        const validated = self.promotedEdgeFromLink(.{
+            .parent = edge.parent,
+            .slot_index = edge.exit,
+            .child = edge.child,
+            .kind = edge.arm_kind,
+        }) orelse return error.InvalidPromotionSet;
+        if (validated.kind != edge.kind or validated.resume_pc != edge.resume_pc)
+            return error.InvalidPromotionSet;
+    }
+    try self.registry.native_physical.promoteSet(&self.registry.mcode_arena, edges, key, self.config.min_useful);
+    if (comptime jitdbg.enabled) {
+        if (self.config.debug_log) {
+            jitdbg.log("silent-promote: RESIDENT set={d} region={d} len={d}", .{
+                self.registry.native_physical.next_promoted_set_id - 1, @intFromEnum(rid), edges.len,
+            });
+        }
+    }
+}
+
 pub fn resetPromotionCandidate(self: *TraceState) void {
     defer self.syncNativeInvalidation();
     self.registry.native_physical.resetPromotionCandidate();
@@ -1386,11 +1427,56 @@ fn tryRecurrencePromotion(self: *TraceState, entries: []const trace_exec.LedgerE
             self.dbg("recurrence: probe-cap rid={d}", .{@intFromEnum(rid)});
             return;
         }
-        // P1 gate slot: `resident_set_count != 0` blocks here (one-resident-
-        // set invariant) once resident sets exist. P0 promotes nothing: the
-        // saturating streak holds and P1 adds the threshold probe + resident
-        // authorization at exactly this point.
-        self.dbg("recurrence: threshold rid={d} held (promotion lands in doc 52 P1)", .{@intFromEnum(rid)});
+        // Invariant 1: one live resident set globally. Do NOTHING expensive
+        // while the slot is occupied — the saturating streak holds, and the
+        // first qualifying drain after the occupant demotes runs exactly one
+        // detector pass. (A live ACTIVATION set does not block — mixed
+        // support.)
+        if (self.registry.native_physical.resident_set_count != 0) {
+            self.silent_rejects.resident_occupied +|= 1;
+            self.dbg("recurrence: threshold rid={d} held (resident slot occupied)", .{@intFromEnum(rid)});
+            return;
+        }
+        // Threshold probe: charged win-or-lose, same rule as owner resolution
+        // — this is what bounds repeated threshold attempts on a shape whose
+        // registry can no longer produce the candidate.
+        d.recurrence_probe_charges +|= 1;
+        const saved_rejects = self.silent_rejects;
+        const probe_key: RegionKey = .{ .region_id = rid, .activation = 0 };
+        const edges = detectPromotableSetMembers(self, entries, probe_key, entries.len - 1) orelse {
+            self.silent_rejects = saved_rejects;
+            // Evidence proved a repeated execution shape, but the CURRENT
+            // registry cannot produce the candidate (timing-note asymmetry).
+            // Reset the streak — the charge above already counted.
+            resetRecurrenceStreaks(self);
+            self.dbg("recurrence: threshold rid={d} probe failed", .{@intFromEnum(rid)});
+            return;
+        };
+        defer self.gpa.free(edges);
+        self.silent_rejects = saved_rejects;
+        // Grammar 3: the terminal row must not be a live candidate edge.
+        const term = entries[entries.len - 1];
+        for (edges) |edge| {
+            if (edge.parent.id == term.id and edge.exit == term.exit) {
+                resetRecurrenceStreaks(self);
+                self.dbg("recurrence: threshold rid={d} terminal is a candidate", .{@intFromEnum(rid)});
+                return;
+            }
+        }
+        promoteResidentSet(self, edges, rid) catch |err| {
+            switch (err) {
+                error.PromotionRegionIdOwned => self.silent_rejects.region_id_owned +|= 1,
+                error.PromotionResidentOccupied => self.silent_rejects.resident_occupied +|= 1,
+                error.PromotionRegionOwned => self.silent_rejects.region_owned +|= 1,
+                else => self.silent_rejects.no_patch_point +|= 1,
+            }
+            resetRecurrenceStreaks(self);
+            self.dbg("recurrence: threshold rid={d} promotion rejected ({s})", .{ @intFromEnum(rid), @errorName(err) });
+            return;
+        };
+        // Success: the probe budget is a per-promotion-lifetime allowance —
+        // reset ONLY here.
+        d.recurrence_probe_charges = 0;
         return;
     }
     // Owner resolution — the only other expensive path, budget-bounded.

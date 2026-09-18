@@ -248,6 +248,15 @@ pub const SilentExitMetadata = extern struct {
     slot: *usize,
     min_useful: u64,
     reporting_target: usize,
+    /// Doc 52 P1: nonzero for edges of a RESIDENT promoted set. Barren-run is
+    /// an activation-decay detector; a resident set has no activation, so its
+    /// firings must neither advance nor reset `cur_zero_run`. The epilogue
+    /// branches around both the increment arms and the `reset_zero` store when
+    /// this is set (data-driven — one code variant, per-edge metadata). The
+    /// unconditional budget/barren tail compares still run for exempt edges
+    /// and are provably harmless: every staged `cur_zero_run` is < the barren
+    /// budget, and only an activation-edge increment can reach the bound.
+    barren_exempt: u64,
 };
 
 pub const ExitPatchKind = enum(u8) { deopt, link_terminal, loop_done_linked, region_bridge };

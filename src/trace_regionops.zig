@@ -378,13 +378,19 @@ pub fn demotePromotionsForRegionReason(self: *TraceState, key: RegionKey, reason
 /// from the current active key before any patched code can run.
 pub inline fn prepareNativeEntry(self: *TraceState) void {
     // This is on every native entry; preserve the empty-registry common case
-    // as one length branch before resolving activation state.
-    if (self.registry.native_physical.promotedSets().len == 0) return;
+    // as one length branch before resolving activation state. Doc 52 P1:
+    // resident sets are exempt from the sweep (they are activation-blind by
+    // construction), so with only resident sets live there is nothing to
+    // sweep and activation resolution is skipped entirely — the count cache
+    // keeps this the same one-branch fast path.
+    if (self.registry.native_physical.activation_set_count == 0) return;
     const active = if (self.region_policy.region_context) |ctx| self.activeRegionFor(ctx.call_seq) else null;
     var i = self.registry.native_physical.promotedSets().len;
     while (i > 0) {
         i -= 1;
-        if (active == null or !std.meta.eql(self.registry.native_physical.promotedSets()[i].region_key, active.?))
+        const set = &self.registry.native_physical.promotedSets()[i];
+        if (set.isResident()) continue;
+        if (active == null or !std.meta.eql(set.region_key, active.?))
             self.demoteSetReason(i, .activation);
     }
 }
@@ -402,10 +408,19 @@ pub inline fn silentStaging(self: *TraceState) nativegen.SilentStaging {
     // the real staging cost is paid only while patched code exists, where it is
     // amortized across thousands of silent transitions.
     if (self.registry.native_physical.promotedSets().len == 0) return .{};
+    // Doc 52 P1: with no activation-scoped set live there is no activation
+    // barren streak to stage — return the zero-run image WITHOUT the
+    // `activeRegionFor` walk + `region_profit` probe (the +10%-on-pi_leibniz
+    // per-call-cost failure mode above). Resident edges never modify the run
+    // (barren-exempt at the epilogue), so the staged image is inert for them;
+    // the budgets must still be staged — the epilogue tail compares are
+    // unconditional for every promoted edge.
     var zero_run: u64 = 0;
-    if (self.region_policy.region_context) |ctx| {
-        if (self.activeRegionFor(ctx.call_seq)) |key| {
-            if (self.region_policy.region_profit.get(key)) |accum| zero_run = accum.barren_run;
+    if (self.registry.native_physical.activation_set_count != 0) {
+        if (self.region_policy.region_context) |ctx| {
+            if (self.activeRegionFor(ctx.call_seq)) |key| {
+                if (self.region_policy.region_profit.get(key)) |accum| zero_run = accum.barren_run;
+            }
         }
     }
     return .{

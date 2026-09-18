@@ -74,12 +74,31 @@ pub const PromotedEdge = struct {
     arm_kind: ArmKind,
     resume_pc: u32,
 };
+/// Doc 52 P1: the RESIDENT sentinel activation. A resident promoted set is
+/// keyed `RegionKey{ .region_id, .activation = RESIDENT_ACTIVATION }` —
+/// unreachable by real activations (call creation panics long before
+/// `call_seq` could get there). The sentinel is the STORAGE representation
+/// only; every policy site goes through `isResidentKey`/`PromotedSet.
+/// isResident`, never a raw compare.
+pub const RESIDENT_ACTIVATION: u64 = std.math.maxInt(u64);
+
+pub fn isResidentKey(key: RegionKey) bool {
+    return key.activation == RESIDENT_ACTIVATION;
+}
+
 pub const PromotedSet = struct {
     edges: []PromotedEdge,
     summary: []nativegen.SilentSummaryCell,
     metadata: []nativegen.SilentExitMetadata,
     region_key: RegionKey,
     id: u32,
+
+    /// Doc 52 P1: region-lifetime resident set (dormant region, no
+    /// activation). Exempt from the activation sweep, the frozen-accumulator
+    /// drain rules, and barren accounting.
+    pub fn isResident(self: *const PromotedSet) bool {
+        return isResidentKey(self.region_key);
+    }
 };
 /// Parked physical-set evidence (doc 47 Increment B follow-up, codex C′
 /// "parked promotion proofs"): the edge set of a promotion demoted by a clean
@@ -203,6 +222,21 @@ pub const NativePhysicalRegistry = struct {
     /// Parked promotion proofs, one at most per RegionId (few regions live at
     /// once — a linear scan; see `ParkedProof`).
     parked_proofs: std.ArrayListUnmanaged(ParkedProof) = .empty,
+    /// Doc 52 P1: cached counts of live sets by keying, maintained strictly at
+    /// PHYSICAL publication/removal — incremented when a set is actually
+    /// patched in (`promoteSet` append), decremented when it is actually
+    /// unpatched and swap-removed (`demoteSetReason`'s removal path) — never
+    /// when a deferred demotion is merely queued, since the patches stay live
+    /// until `drainBarrier` applies it and the count-gated staging/sweep fast
+    /// paths must agree with the patched reality.
+    activation_set_count: usize = 0,
+    resident_set_count: usize = 0,
+    /// Doc 52 P1: resident-demotion notice. The demotion owner has no
+    /// `RegionDef` access, and a demoted resident set's recurrence proof must
+    /// be re-earned against the post-demotion world — the coordinator drains
+    /// this in `syncNativeInvalidation` and zeroes that def's streak/signature.
+    /// A single slot suffices: at most one resident set is live (invariant 1).
+    resident_demotion_notice: ?RegionId = null,
     silent_promotions: u64 = 0,
     silent_demotions: u64 = 0,
     silent_demotion_reasons: PromotionDemotions = .{},
@@ -288,6 +322,13 @@ pub const NativePhysicalRegistry = struct {
         const result = self.provenance_invalidated;
         self.provenance_invalidated = false;
         return result;
+    }
+    /// Doc 52 P1: drain the resident-demotion notice (see field doc). Take
+    /// semantics; the coordinator zeroes the named def's recurrence proof.
+    pub fn takeResidentDemotionNotice(self: *NativePhysicalRegistry) ?RegionId {
+        const notice = self.resident_demotion_notice;
+        self.resident_demotion_notice = null;
+        return notice;
     }
     pub fn patchPromotedEdge(_: *NativePhysicalRegistry, arena: *nativegen.McodeArena, edge: PromotedEdge, promote: bool) nativegen.PatchError!void {
         const compiled = switch (edge.parent.native) {
@@ -397,9 +438,25 @@ pub const NativePhysicalRegistry = struct {
     pub fn demoteSet(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena, idx: usize) void {
         self.demoteSetReason(arena, idx, .trace_invalidation);
     }
+    /// Doc 52 P1: the cached by-keying counts must always agree with the live
+    /// list — they gate the native-entry sweep and staging fast paths.
+    fn assertSetCountsConsistent(self: *const NativePhysicalRegistry) void {
+        if (std.debug.runtime_safety) {
+            var residents: usize = 0;
+            var activations: usize = 0;
+            for (self.promoted_sets.items) |*s| {
+                if (s.isResident()) residents += 1 else activations += 1;
+            }
+            std.debug.assert(residents == self.resident_set_count);
+            std.debug.assert(activations == self.activation_set_count);
+        }
+    }
     pub fn demoteSetReason(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena, idx: usize, reason: DemotionReason) void {
         const set = self.promoted_sets.items[idx];
         if (self.replay_walk_depth > 0) {
+            // Deferred: patches stay live until `drainBarrier` re-enters this
+            // funnel at depth 0 — counts and notices move only on the physical
+            // removal below (doc 52 P1).
             self.queueDemote(set.id, reason);
             return;
         }
@@ -417,6 +474,17 @@ pub const NativePhysicalRegistry = struct {
         self.gpa.free(set.summary);
         self.gpa.free(set.metadata);
         _ = self.promoted_sets.swapRemove(idx);
+        // Doc 52 P1: physical removal — decrement the keying count and, for a
+        // resident set, record the notice so the coordinator re-earns the
+        // recurrence proof (any demotion reason; the post-demotion world is a
+        // different promotion target).
+        if (isResidentKey(set.region_key)) {
+            self.resident_set_count -= 1;
+            self.resident_demotion_notice = set.region_key.region_id;
+        } else {
+            self.activation_set_count -= 1;
+        }
+        self.assertSetCountsConsistent();
         self.silent_demotions +|= 1;
         switch (reason) {
             .activation => self.silent_demotion_reasons.activation +|= 1,
@@ -605,8 +673,20 @@ pub const NativePhysicalRegistry = struct {
     pub fn checkPromotable(self: *const NativePhysicalRegistry, edges: []const PromotedEdge, region_key: RegionKey) !void {
         if (edges.len == 0 or edges.len > PROMOTED_SET_CAP) return error.InvalidPromotionSet;
         if (self.next_promoted_set_id == std.math.maxInt(u32)) return error.PromotionIdExhausted;
+        // Doc 52 P1 invariant 1: at most one live resident set globally. A
+        // second region's recurrence streak holds — saturating — until the
+        // occupant demotes.
+        if (isResidentKey(region_key) and self.resident_set_count != 0)
+            return error.PromotionResidentOccupied;
         for (self.promoted_sets.items) |s| {
             if (std.meta.eql(s.region_key, region_key)) return error.PromotionRegionOwned;
+            // Doc 52 P1 invariant 3: per-RegionId uniqueness ACROSS keyings —
+            // a sentinel key and a real activation key for the same RegionId
+            // must never coexist (fail-closed backstop; resident regions are
+            // dormant and never open activations, so this is near-impossible
+            // in practice).
+            if (s.region_key.region_id == region_key.region_id)
+                return error.PromotionRegionIdOwned;
         }
         for (edges) |edge| {
             if (self.promoted_exit_owners.contains(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit })) return error.PromotionExitOwned;
@@ -633,6 +713,9 @@ pub const NativePhysicalRegistry = struct {
                     .link_terminal, .loop_done_linked, .region_bridge => @intFromPtr(compiled.page.code.ptr) +
                         exitPatchFor(compiled, edge.exit).?.patch_off + 5,
                 },
+                // Doc 52 P1: residency is decided at promotion time, per set —
+                // resident edges neither advance nor reset the barren run.
+                .barren_exempt = @intFromBool(isResidentKey(region_key)),
             };
         }
 
@@ -674,6 +757,13 @@ pub const NativePhysicalRegistry = struct {
             .{ .trace_id = edge.parent.id, .exit_instr = edge.exit },
             id,
         );
+        // Doc 52 P1: physical publication — the set is patched in as of the
+        // loop above, so the keying count moves here (and only here).
+        if (isResidentKey(region_key))
+            self.resident_set_count += 1
+        else
+            self.activation_set_count += 1;
+        self.assertSetCountsConsistent();
         self.silent_promotions +|= 1;
     }
     pub const ArmOutcome = enum { declined, unchanged, changed };

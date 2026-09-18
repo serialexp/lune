@@ -996,9 +996,18 @@ pub fn driveSilentBurst(
             "driveSilentBurst: summary firings {d} disagree with transition count {d}",
             .{ total_firings, result.silent_transitions },
         );
+    // Doc 52 P1: an activation is required iff an ACTIVATION-SCOPED set fired
+    // — a resident-only burst legitimately runs with no activation open. The
+    // panic moved into the per-set loop (nothing gets weaker for the existing
+    // path: a fired activation set with no activation, or with a key ≠
+    // active, still panics).
     const active = if (self.region_policy.region_context) |ctx| self.activeRegionFor(ctx.call_seq) else null;
-    if (active == null)
-        @panic("driveSilentBurst: silent burst outside an activation");
+
+    // Doc 52 P1: the fired activation set's accumulator — unique (at most one
+    // activation set is live at native-call time, and every fired activation
+    // set must match the one active key) — remembered for barren settlement.
+    var fired_activation_accum: ?*RegionAccum = null;
+    var fired_activation_key: RegionKey = undefined;
 
     var loop_done_count: u64 = 0;
     var suppressed_hops: u64 = 0;
@@ -1010,6 +1019,7 @@ pub fn driveSilentBurst(
     // that needs sequence must be measured into the cells by the epilogues.
     for (self.registry.native_physical.promotedSets()) |*c| {
         var region_work: u64 = 0;
+        var set_firings: u64 = 0;
         var fired = false;
         for (c.edges, 0..) |edge, phase| {
             const cell = c.summary[phase];
@@ -1019,6 +1029,7 @@ pub fn driveSilentBurst(
             if (cell.firings == 0) continue;
             fired = true;
             const fires = cell.firings;
+            set_firings +|= fires;
             // A rowless budget/barren return suppresses the final edge's jump to
             // its successor. Its materialization/work still happened, but replay
             // would not charge a fused/follow counter for that terminal row.
@@ -1070,8 +1081,26 @@ pub fn driveSilentBurst(
             }
         }
         if (!fired) continue;
+        // Doc 52 P1 credit split — BOTH keyings, per fired set: every
+        // suppressed silent transition is work the region machinery actually
+        // delivered (a runtime round-trip avoided); lifetime payoff ledger
+        // read by chargePayoffReceipt. The old once-per-burst block credited
+        // EVERY call-global transition to the entry set's def, which under
+        // mixed firing double-counts or misattributes no matter which set is
+        // the entry.
+        if (self.region_policy.region_defs.getPtr(c.region_key.region_id)) |rd| {
+            if (rd.fallback_owner) rd.transitions_credit +|= set_firings;
+        }
+        // Doc 52 P1: a resident fired set is activation-blind — no active-key
+        // proof, no accumulator, no window credit. Its payoff is the
+        // transitions_credit above; `receipts_debit` stays genuinely ~0 (the
+        // region is dormant, out of the receipt maps) — staleness is the
+        // demotion funnels' job, not economics'.
+        if (c.isResident()) continue;
         // Only a cycle that actually fired must be — and is — provably part of
         // the live activation it credits.
+        if (active == null)
+            @panic("driveSilentBurst: activation-scoped silent burst outside an activation");
         if (!std.meta.eql(active.?, c.region_key))
             @panic("driveSilentBurst: promoted set activation is not active");
         const c_accum = self.region_policy.region_profit.getPtr(c.region_key) orelse
@@ -1081,11 +1110,11 @@ pub fn driveSilentBurst(
         if (region_work > std.math.maxInt(usize))
             @panic("driveSilentBurst: region summary exceeds usize");
         if (region_work != 0) self.creditRegionWork(c.region_key, c_accum, @intCast(region_work));
+        // Unique: at most one activation set is live, and every fired one
+        // proved key == active above.
+        fired_activation_accum = c_accum;
+        fired_activation_key = c.region_key;
     }
-    // Every fired edge proved `region_key == active`, so they all share one
-    // accumulator; the entry set always fired, so its lookup names it.
-    const accum = self.region_policy.region_profit.getPtr(entry_set.region_key) orelse
-        @panic("driveSilentBurst: promoted set accumulator is missing");
     if (loop_done_count > std.math.maxInt(usize) - linked_completed.*)
         linked_completed.* = std.math.maxInt(usize)
     else
@@ -1100,16 +1129,28 @@ pub fn driveSilentBurst(
 
     const barren_exhausted = result.cur_zero_run >= result.barren_budget;
     const budget_exhausted = result.silent_transitions >= result.silent_budget;
-    if (barren_exhausted) {
-        if (self.config.max_barren_run == 0)
-            @panic("driveSilentBurst: zero barren budget");
-        accum.barren_run = self.config.max_barren_run - 1;
-        self.noteBarrenConsumed(entry_set.region_key, accum);
-        self.silent_barren_exhaustions +|= 1;
-    } else {
-        if (result.cur_zero_run > std.math.maxInt(u32))
-            @panic("driveSilentBurst: returned zero-run exceeds u32");
-        accum.barren_run = @intCast(result.cur_zero_run);
+    // Doc 52 P1: barren settlement targets the fired ACTIVATION set's
+    // accumulator (was: the entry set's — under mixed firing the entry set
+    // may be resident). Skipped entirely when no activation set fired: sound
+    // because resident firings are barren-exempt at the epilogue, so the
+    // settled `cur_zero_run` is a pure activation-edge measurement — and only
+    // an activation-edge increment can reach the bound (every staged value is
+    // below it), so barren exhaustion without a fired activation set means
+    // the epilogue exemption broke. Fail closed.
+    if (fired_activation_accum) |accum| {
+        if (barren_exhausted) {
+            if (self.config.max_barren_run == 0)
+                @panic("driveSilentBurst: zero barren budget");
+            accum.barren_run = self.config.max_barren_run - 1;
+            self.noteBarrenConsumed(fired_activation_key, accum);
+            self.silent_barren_exhaustions +|= 1;
+        } else {
+            if (result.cur_zero_run > std.math.maxInt(u32))
+                @panic("driveSilentBurst: returned zero-run exceeds u32");
+            accum.barren_run = @intCast(result.cur_zero_run);
+        }
+    } else if (barren_exhausted) {
+        @panic("driveSilentBurst: barren exhaustion without a fired activation set");
     }
 
     // B-3d (doc 17 §B3.16 D4): the terminal-resume check is MEASURED, and
@@ -1132,13 +1173,9 @@ pub fn driveSilentBurst(
     self.silent_bursts_drained +|= 1;
     self.silent_transitions_total +|= result.silent_transitions;
     self.silent_hops_total +|= result.silent_transitions;
-    // Net-work ledger credit: every suppressed silent transition is work the
-    // region machinery actually delivered (a runtime round-trip avoided).
-    // Rolled up per burst against the entry set's region; weighed against
-    // `receipts_debit` in chargePayoffReceipt.
-    if (self.region_policy.region_defs.getPtr(entry_set.region_key.region_id)) |rd| {
-        if (rd.fallback_owner) rd.transitions_credit +|= result.silent_transitions;
-    }
+    // Net-work `transitions_credit` is applied per fired set inside the
+    // expansion loop above (doc 52 P1) — the entry-set-attributed global
+    // credit that used to live here misattributed under mixed firing.
 
     const last_edge = last_set.edges[last_phase];
     if (result.silent_cum > std.math.maxInt(usize))

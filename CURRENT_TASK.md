@@ -352,3 +352,51 @@ default 4.
   barren_exempt epilogue flag, PROVENANCE_VERDICT_CAP 48→64, count caches,
   demotion notice → streak zero, election-tier reset, full test battery; then
   P2 measurement (nbody before/after, adversarial benches, sensitive boards).
+
+## Status 2026-09-18 (latest+17) — task #36 (doc 52): P1 resident promotion + mixed support LANDED
+
+P0+P1 now on master; P2 (measurement) is the remaining doc 52 phase.
+
+- **P1 delivers**: at the recurrence threshold (K=4 identical qualifying
+  short natural-terminal ledgers) an eligible dormant fallback region now
+  promotes a RESIDENT silent set — sentinel key {rid, activation=maxInt},
+  region stays dormant, no accumulator — that coexists and co-fires with ≤1
+  activation-scoped set (Bart's mixed-support decision).
+- **Mechanisms**: `SilentExitMetadata.barren_exempt` + per-arm epilogue
+  branch (resident firings neither advance nor reset cur_zero_run; verified
+  END TO END — a real promoted native a→b→a cycle left cur_zero_run at 0
+  across 6 link-terminal firings, and the intentional-break check proved the
+  assertion bites); registry count caches (activation_set_count/
+  resident_set_count) moved strictly at physical publication/removal with
+  debug list-agreement assertions (queued demotions leave patched reality —
+  and counts — untouched until drainBarrier); checkPromotable invariants
+  (one resident set globally → PromotionResidentOccupied; per-RegionId
+  dual-key backstop → PromotionRegionIdOwned) + new reject counters;
+  PROVENANCE_VERDICT_CAP → 2×PROMOTED_SET_CAP+LEDGER_CAP (64);
+  prepareNativeEntry/silentStaging count-gated fast paths (resident sets
+  survive the activation sweep; staging skips the activeRegionFor walk when
+  no activation set is live, budgets still staged); driveSilentBurst
+  per-keying drain (activation required iff an activation set fired; barren
+  settlement re-targets to the fired activation set, fail-closed on barren
+  exhaustion with none; per-fired-set transitions_credit split for BOTH
+  keyings, entry-set global credit removed); resident-demotion notice
+  (single ?RegionId slot) drained in syncNativeInvalidation → streak+sig
+  zeroed; election-tier flip + invalidateRegion recurrence clears;
+  threshold path in tryRecurrencePromotion now charges win-or-lose, resets
+  streak on probe/authorization failure, resets the probe budget only on
+  success.
+- **Tests**: 4 new "doc 52 P1" tests (threshold promotion incl. exempt
+  metadata + occupied hold + notice; mixed invariants + dual-key backstop +
+  synthetic mixed drain credit split/barren purity; REAL native
+  resident-only cycle with no activation open; demotion funnels —
+  activation-close skip, deferred count timing, defs mutation). P0 test
+  re-pinned to evidence-only via promote_after=100 (threshold behavior has
+  its own tests now). Gates: `just test` green, jit-debug battery green
+  (×2), ReleaseFast builds.
+- **Flake occurrence #4** (doc 52 P1 gate): NEW SHAPE — stray `failed
+  command` (seed 0x8fdb0d0b) on stderr with overall exit 0, full stderr
+  captured this time; clean rerun green. TODO.md updated.
+- **Next**: doc 52 P2 — nbody --jit-stats/perf before-after, adversarial
+  benches (never-qualifying probe cost, unrelated-phase entry tax vs
+  ≤-noise budget, alternating A/B cap saturation), sensitive boards
+  (scimark-sparse, grid_matmul, scimark-lu), full board, tick doc 51 Fix C.

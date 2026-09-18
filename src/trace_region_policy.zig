@@ -229,6 +229,13 @@ pub const RegionPolicy = struct {
         const def = self.region_defs.getPtr(id) orelse return false;
         def.armable = false;
         def.tombstoned = true;
+        // Doc 52 P1: the recurrence proof dies with the region (the
+        // eligibility gate already excludes tombstoned defs; cleared for the
+        // same reason as the tier-flip reset — stale evidence must not read
+        // as live in dumps or a future un-tombstone path).
+        def.recurrence_len = 0;
+        def.recurrence_streak = 0;
+        def.recurrence_probe_charges = 0;
         self.region_defs_gen +%= 1;
         if (self.region_defs_gen == 0) self.region_defs_gen = 1;
         return true;
@@ -355,6 +362,12 @@ pub const RegionPolicy = struct {
                     d.admission_failures = 0;
                     d.receipts_debit = 0;
                     d.transitions_credit = 0;
+                    // Doc 52 P1: the recurrence proof is fallback evidence of
+                    // the same class — signature, streak, and probe budget
+                    // all reset with the tier flip.
+                    d.recurrence_len = 0;
+                    d.recurrence_streak = 0;
+                    d.recurrence_probe_charges = 0;
                 }
             }
         }

@@ -1691,7 +1691,7 @@ demotions in trace.zig, compiler-adjudicated). Deferred items:
       (run the eq trace pre-capture and post-restore and compare), rather
       than the simulated same-id/different-address twin.
 
-## Recurring jit-debug test-gate flake (3 occurrences, 2 days)
+## Recurring jit-debug test-gate flake (4 occurrences, 2 days)
 
 - [ ] Hunt the nondeterministic `zig build test -Djit-debug=true` failure:
       2026-09-17 seed 0x3ace15b0, 2026-09-18 seed 0x34eef2f0, 2026-09-18
@@ -1705,3 +1705,13 @@ demotions in trace.zig, compiler-adjudicated). Deferred items:
       unrelated guard-dedup spam survived) — next time run the FULL gate
       with `> log 2>&1` FIRST, not after the failure. A nondeterministic
       failure in this project is a real bug (Rule #2), not noise.
+- [ ] Occurrence 4 (2026-09-18, doc 52 P1 gate, seed 0x8fdb0d0b, binary
+      63e9fc8b…): NEW SHAPE — full stderr WAS captured this time (session
+      tool-results bd0ya4p1y.txt) and shows exactly one stray `failed
+      command: …/63e9fc8b…/test --seed=0x8fdb0d0b --listen=-` line with NO
+      `error: '…' failed` test line, no failing Build Summary, and the
+      overall `zig build test -Djit-debug=true` EXITED 0 (checked twice —
+      echo of `$?` immediately after). Immediate clean rerun: exit 0, no
+      stray line. So the flake can also manifest as a test-binary
+      crash/restart that the build runner ultimately reports as success —
+      look at zig's --listen respawn behavior when hunting this.

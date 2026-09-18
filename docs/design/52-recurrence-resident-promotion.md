@@ -1,6 +1,6 @@
 # Recurrence-resident silent promotion for short natural-terminal bursts — Design
 
-Status: partial — P0 (recurrence evidence detection) landed; P1 (resident promotion, mixed support) and P2 (measurement) outstanding
+Status: partial — P0 (evidence detection) and P1 (resident promotion, mixed support) landed; P2 (measurement) outstanding
 Owner: Bart + agents
 Last updated: 2026-09-18
 
@@ -23,21 +23,34 @@ inside them is checked.
   unchanged, `-Djit-debug` probes, unit tests on synthetic ledgers
   (`trace_promotion_test.zig` "doc 52 P0: …"). Nothing promotes.
 
+- [x] **P1 — resident promotion with mixed support.** Resident
+  authorization branch (`promoteResidentSet` — recurrence-eligible class +
+  per-edge membership + shared link-identity validation, no
+  accumulator/frozen check), sentinel-keyed set publication behind
+  `isResident()`/`isResidentKey` helpers, invariants (one resident set
+  globally, `error.PromotionResidentOccupied`; per-`RegionId` uniqueness
+  across keyings, `error.PromotionRegionIdOwned`) at the threshold gate
+  AND storage-level in `checkPromotable` with distinct reject counters,
+  `SilentExitMetadata.barren_exempt` + per-arm epilogue branch (proven end
+  to end: a real promoted native a→b→a cycle leaves `cur_zero_run` at its
+  staged zero across six link-terminal firings),
+  `PROVENANCE_VERDICT_CAP` → `2×PROMOTED_SET_CAP + LEDGER_CAP` (=64, test
+  assertion updated), `prepareNativeEntry` / `silentStaging` count-gated
+  fast paths + `assertSetCountsConsistent` debug assertions in both
+  publication and removal, `driveSilentBurst` per-keying drain (activation
+  required iff an activation set fired; barren settlement re-targeted to
+  the fired activation set and fail-closed when barren-exhausted with none;
+  per-fired-set `transitions_credit` split for both keyings, entry-set
+  global credit removed), registry→coordinator resident-demotion notice
+  drained in `syncNativeInvalidation` (streak + signature zeroed),
+  election-tier reset list + `invalidateRegion` recurrence clears,
+  demotion-funnel tests (activation-close skip, deferred/`drainBarrier`
+  count timing, defs mutation, trace retirement), threshold-promotion /
+  occupied-hold / mixed-drain / resident-only-drain tests
+  (`trace_promotion_test.zig` "doc 52 P1: …"). Full gate battery green
+  (`just test`, jit-debug battery, ReleaseFast build).
+
 ### Outstanding
-- [ ] **P1 — resident promotion with mixed support.** Resident
-  authorization branch (no accumulator/frozen check), sentinel-keyed set
-  publication behind `isResident()` helpers, invariants (one resident set
-  globally; per-`RegionId` uniqueness across keyings) at the coordinator
-  AND storage-level in `checkPromotable`,
-  `SilentExitMetadata.barren_exempt` + epilogue branch,
-  `PROVENANCE_VERDICT_CAP` → `2×PROMOTED_SET_CAP + LEDGER_CAP`,
-  `prepareNativeEntry` / `silentStaging` count-gated fast paths + debug
-  count/list assertions, `driveSilentBurst` per-keying drain (barren
-  settlement re-targeted to the fired activation set; per-fired-set
-  `transitions_credit` split for both keyings, entry-set global credit
-  removed), registry→coordinator resident-demotion notice + streak
-  zeroing, election-tier reset list extension, demotion-funnel audit +
-  tests. Full gate battery.
 - [ ] **P2 — measurement.** nbody `--jit-stats` seam share before/after,
   `perf` walk-share confirmation; adversarial benches: never-qualifying
   short-drain probe cost, post-promotion unrelated-native-phase entry tax;

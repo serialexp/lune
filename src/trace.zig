@@ -807,6 +807,10 @@ pub const PromotedEdge = native_physical.PromotedEdge;
 /// from position.
 // pub for trace_chain.zig (file-split pass)
 pub const PromotedSet = native_physical.PromotedSet;
+/// Doc 52 P1: resident-set sentinel + storage-blind helper (see
+/// trace_native_registry.zig — policy sites never compare raw activations).
+pub const RESIDENT_ACTIVATION = native_physical.RESIDENT_ACTIVATION;
+pub const isResidentKey = native_physical.isResidentKey;
 
 const PromotionRejects = struct {
     bridge_member: u64 = 0,
@@ -819,6 +823,15 @@ const PromotionRejects = struct {
     /// live set — one set per region key is an ENFORCED invariant, and candidacy
     /// must restart from fully-reporting windows after the owning set demotes.
     region_owned: u64 = 0,
+    /// Doc 52 P1 invariant 3: promotion (either keying) refused because a live
+    /// set with the same RegionId exists under the OTHER keying — the
+    /// sentinel/real dual-key backstop. Near-impossible in practice (resident
+    /// regions are dormant and never open activations); fail-closed.
+    region_id_owned: u64 = 0,
+    /// Doc 52 P1 invariant 1: resident promotion refused because the single
+    /// global resident slot is occupied by another region's set. The streak
+    /// holds saturating until the occupant demotes.
+    resident_occupied: u64 = 0,
 };
 
 const PromotionDemotions = struct {
@@ -2010,7 +2023,7 @@ pub const TraceState = struct {
                 self.region_policy.dest_entry_regions.count(),
                 self.region_policy.region_defs.count(),
             });
-            jitdbg.log("  silent rejects: bridge={d} region={d} open={d} child-mismatch={d} no-patch={d} cap={d} region-owned={d}", .{
+            jitdbg.log("  silent rejects: bridge={d} region={d} open={d} child-mismatch={d} no-patch={d} cap={d} region-owned={d} rid-owned={d} resident-occupied={d}", .{
                 self.silent_rejects.bridge_member,
                 self.silent_rejects.region_mismatch,
                 self.silent_rejects.open_chain,
@@ -2018,6 +2031,8 @@ pub const TraceState = struct {
                 self.silent_rejects.no_patch_point,
                 self.silent_rejects.cap,
                 self.silent_rejects.region_owned,
+                self.silent_rejects.region_id_owned,
+                self.silent_rejects.resident_occupied,
             });
             jitdbg.log("  silent demotions: activation={d} region-close={d} slot={d} trace={d} teardown={d} unfreeze={d} growth={d}", .{
                 self.registry.native_physical.silent_demotion_reasons.activation,
@@ -2084,6 +2099,18 @@ pub const TraceState = struct {
 
     pub fn syncNativeInvalidation(self: *TraceState) void {
         if (self.registry.native_physical.takeInvalidation()) self.provenance_arms_pending = true;
+        // Doc 52 P1: a demoted resident set's recurrence proof must be
+        // re-earned against the post-demotion world — any demotion reason.
+        // The registry (which owns every demotion funnel, including deferred
+        // ones applied in drainBarrier) records the notice; this drain zeroes
+        // the named def's streak AND signature. A notice for a def that no
+        // longer exists is dropped.
+        if (self.registry.native_physical.takeResidentDemotionNotice()) |rid| {
+            if (self.region_policy.region_defs.getPtr(rid)) |d| {
+                d.recurrence_streak = 0;
+                d.recurrence_len = 0;
+            }
+        }
     }
 
     pub fn deinit(self: *TraceState) void {
@@ -2921,6 +2948,7 @@ pub const TraceState = struct {
     pub const originalRel32Target = trace_link_mod.originalRel32Target;
     pub const patchPromotedEdge = trace_link_mod.patchPromotedEdge;
     pub const promoteSet = trace_link_mod.promoteSet;
+    pub const promoteResidentSet = trace_link_mod.promoteResidentSet;
     pub const resetPromotionCandidate = trace_link_mod.resetPromotionCandidate;
     pub const considerSilentPromotion = trace_link_mod.considerSilentPromotion;
     pub const DemotionReason = trace_link_mod.DemotionReason;

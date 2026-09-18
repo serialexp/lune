@@ -565,8 +565,10 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     state.stageSilentSiblingProvenance(silent_edge, 1, false, false);
     state.ledger_scratch[0] = incomplete[1];
     var merged: [TraceState.PROVENANCE_VERDICT_CAP]ProvenanceVerdict = undefined;
+    // Doc 52 P1 (mixed support): two live sets — ≤1 activation + ≤1 resident —
+    // bound the prefix contribution at 2 × PROMOTED_SET_CAP.
     try testing.expectEqual(
-        TraceState.PROMOTED_SET_CAP + trace_exec.LEDGER_CAP,
+        2 * TraceState.PROMOTED_SET_CAP + trace_exec.LEDGER_CAP,
         state.silent_provenance.len,
     );
     var merged_len = state.captureSilentSuffixProvenance(.{

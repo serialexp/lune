@@ -2216,11 +2216,15 @@ test "C' parked proof invalidation (codex round 4): membership growth, exit muta
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.parked_proofs.items.len);
 }
 
-test "doc 52 P0: recurrence evidence — owner resolution, streak build, threshold hold, resets" {
+test "doc 52 P0: recurrence evidence — owner resolution, streak build, resets" {
     if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
+    // Pin this test to the EVIDENCE machinery: with the P1 resident promotion
+    // live, a reachable threshold would promote mid-test and change every
+    // downstream expectation. Threshold behavior has its own doc 52 P1 tests.
+    state.config.recurrence_promote_after = 100;
     var code: [32]Instr = @splat(Instr.op0(.halt));
     const proto = Proto{ .id = 1801, .code = &code, .name = "doc52-p0", .num_registers = 2 };
     const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
@@ -2410,4 +2414,327 @@ test "doc 52 P0: recurrence owner resolution and cheap match pick the minimum Re
         try testing.expectEqual(@as(u8, 1), lo.recurrence_probe_charges);
         try testing.expectEqual(@as(u8, 1), hi.recurrence_probe_charges);
     }
+}
+
+test "doc 52 P1: threshold promotes a RESIDENT set — dormant region, exempt metadata, occupied hold, demotion notice" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [32]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1803, .code = &code, .name = "doc52-p1-resident", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    const key: RegionKey = .{ .region_id = @enumFromInt(7), .activation = 0 };
+    try installB3PromotionRegion(&state, key, &.{ a, b });
+    {
+        const d = state.region_policy.region_defs.getPtr(key.region_id).?;
+        d.fallback_owner = true;
+        d.dormant = true;
+    }
+
+    const burst = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 1, .deopt),
+    };
+
+    // Three observations: streak 3 < recurrence_promote_after (4) — nothing
+    // promotes yet.
+    state.considerSilentPromotion(&burst);
+    state.considerSilentPromotion(&burst);
+    state.considerSilentPromotion(&burst);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promotedSets().len);
+
+    // Fourth: threshold → probe → resident promotion. The region STAYS
+    // dormant; the set carries the sentinel key; every edge's metadata is
+    // barren-exempt; the probe budget resets on success (per-promotion-
+    // lifetime allowance).
+    state.considerSilentPromotion(&burst);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promotedSets().len);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.resident_set_count);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.activation_set_count);
+    const set = &state.registry.native_physical.promoted_sets.items[0];
+    try testing.expect(set.isResident());
+    try testing.expectEqual(key.region_id, set.region_key.region_id);
+    try testing.expectEqual(trace.RESIDENT_ACTIVATION, set.region_key.activation);
+    for (set.edges, 0..) |edge, i| {
+        try expectB3Patched(edge, true);
+        try testing.expectEqual(@as(u64, 1), set.metadata[i].barren_exempt);
+    }
+    {
+        const d = state.region_policy.region_defs.get(key.region_id).?;
+        try testing.expect(d.dormant);
+        try testing.expectEqual(@as(u8, 4), d.recurrence_streak);
+        try testing.expectEqual(@as(u8, 0), d.recurrence_probe_charges);
+    }
+
+    // The resident set survives native-entry preparation with NO activation
+    // open (the count-gated sweep exemption), and staging returns the budgets
+    // with a zero run without resolving any activation.
+    state.prepareNativeEntry();
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promotedSets().len);
+    const staging = state.silentStaging();
+    try testing.expectEqual(@as(u64, state.config.silent_budget), staging.silent_budget);
+    try testing.expectEqual(@as(u64, state.config.max_barren_run), staging.barren_budget);
+    try testing.expectEqual(@as(u64, 0), staging.cur_zero_run);
+
+    // A further qualifying drain holds at the occupied resident slot — cheap
+    // path only, streak saturates, no second set, distinct reject counter.
+    state.considerSilentPromotion(&burst);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promotedSets().len);
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.resident_occupied);
+    try testing.expectEqual(@as(u8, 5), state.region_policy.region_defs.get(key.region_id).?.recurrence_streak);
+
+    // Any demotion funnel resets the proof through the notice channel: a
+    // retiring member trace tears the set down and zeroes streak+signature.
+    state.resetLinksTouching(a);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promotedSets().len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.resident_set_count);
+    {
+        const d = state.region_policy.region_defs.get(key.region_id).?;
+        try testing.expectEqual(@as(u8, 0), d.recurrence_streak);
+        try testing.expectEqual(@as(u8, 0), d.recurrence_len);
+    }
+}
+
+test "doc 52 P1: one resident slot globally; per-RegionId dual-key backstop; mixed activation+resident drain splits credit and re-targets barren" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [32]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1804, .code = &code, .name = "doc52-p1-mixed", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 21, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 22, 2, 1);
+    const c = try makeB3LinkTrace(gpa, &state, &proto, 23, 3, 4);
+    const d_t = try makeB3LinkTrace(gpa, &state, &proto, 24, 4, 3);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    try testing.expect(try state.armNativeLink(c, 0, d_t, .link_terminal));
+    try testing.expect(try state.armNativeLink(d_t, 0, c, .link_terminal));
+    const key3: RegionKey = .{ .region_id = @enumFromInt(3), .activation = 0 };
+    const key9: RegionKey = .{ .region_id = @enumFromInt(9), .activation = 1 };
+    try installB3PromotionRegion(&state, key3, &.{ c, d_t });
+    try installB3PromotionRegion(&state, key9, &.{ a, b });
+    for ([_]RegionKey{ key3, key9 }) |k| {
+        const dd = state.region_policy.region_defs.getPtr(k.region_id).?;
+        dd.fallback_owner = true;
+    }
+    state.region_policy.region_defs.getPtr(key3.region_id).?.dormant = true;
+
+    // rid 3 promotes RESIDENT via the recurrence funnel (c/d cycle).
+    const burst3 = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(c, 0, .link_terminal),
+        b3ObservedRow(d_t, 0, .link_terminal),
+        b3ObservedRow(c, 0, .link_terminal),
+        b3ObservedRow(d_t, 1, .deopt),
+    };
+    state.considerSilentPromotion(&burst3);
+    state.considerSilentPromotion(&burst3);
+    state.considerSilentPromotion(&burst3);
+    state.considerSilentPromotion(&burst3);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.resident_set_count);
+
+    // rid 9 promotes an ACTIVATION set (a/b cycle) — mixed support: a live
+    // resident set does NOT block activation promotion.
+    const observed9 = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+    };
+    const edges9 = state.detectPromotableSet(&observed9, key9).?;
+    defer gpa.free(edges9);
+    try state.promoteSet(edges9, key9);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.activation_set_count);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.resident_set_count);
+    try testing.expectEqual(@as(usize, 2), state.registry.native_physical.promotedSets().len);
+
+    // Activation edges are NOT barren-exempt; resident edges are.
+    var res_set: *const trace.PromotedSet = undefined;
+    var act_set: *const trace.PromotedSet = undefined;
+    for (state.registry.native_physical.promoted_sets.items) |*s| {
+        if (s.isResident()) res_set = s else act_set = s;
+    }
+    for (res_set.metadata) |m| try testing.expectEqual(@as(u64, 1), m.barren_exempt);
+    for (act_set.metadata) |m| try testing.expectEqual(@as(u64, 0), m.barren_exempt);
+
+    // Per-RegionId dual-key backstop: an ACTIVATION key for resident-owned
+    // rid 3 is rejected across keyings; a RESIDENT key for a third region is
+    // rejected by the occupied slot.
+    try testing.expectError(error.PromotionRegionIdOwned, state.registry.native_physical.checkPromotable(
+        edges9,
+        .{ .region_id = key3.region_id, .activation = 42 },
+    ));
+    try testing.expectError(error.PromotionResidentOccupied, state.registry.native_physical.checkPromotable(
+        edges9,
+        .{ .region_id = @enumFromInt(11), .activation = trace.RESIDENT_ACTIVATION },
+    ));
+
+    // Mixed burst: resident edges fired ordinals 1–2, activation edges 3–4.
+    // Entry cell is RESIDENT (barren must still settle into the ACTIVATION
+    // accumulator); terminal cell is the activation set's last-fired edge.
+    for (res_set.summary, 0..) |*cell, phase| {
+        cell.* = std.mem.zeroes(nativegen.SilentSummaryCell);
+        cell.firings = 1;
+        cell.last_ordinal = @intCast(phase + 1);
+        cell.last_local = 0;
+    }
+    for (act_set.summary, 0..) |*cell, phase| {
+        cell.* = std.mem.zeroes(nativegen.SilentSummaryCell);
+        cell.firings = 1;
+        cell.last_ordinal = @intCast(phase + 3);
+        cell.last_local = 0;
+    }
+    state.region_policy.region_context = .{ .depth = 1, .call_seq = key9.activation };
+    var completed: usize = 0;
+    var resume_pc_value: u32 = 0;
+    var hops: usize = 0;
+    const dir = state.driveSilentBurst(.{
+        .completed = 0,
+        .exit_instr = 0,
+        .silent_active = 1,
+        .silent_transitions = 4,
+        .silent_budget = 4,
+        .barren_budget = 64,
+        .silent_cell = @intFromPtr(&res_set.metadata[0]),
+        .cur_zero_run = 3,
+        .silent_cum = 0,
+        .silent_last_cell = @intFromPtr(&act_set.metadata[act_set.metadata.len - 1]),
+    }, &proto, &completed, &resume_pc_value, &hops, 8, .continuation_call, true, null);
+    switch (dir) {
+        .return_result => {},
+        else => return error.TestUnexpectedResult,
+    }
+    // Credit split — both keyings, per fired set, in suppressed-transition
+    // units; NOT four call-global transitions attributed to the entry set.
+    try testing.expectEqual(@as(u64, 2), state.region_policy.region_defs.get(key3.region_id).?.transitions_credit);
+    try testing.expectEqual(@as(u64, 2), state.region_policy.region_defs.get(key9.region_id).?.transitions_credit);
+    // Barren purity: settlement targets the fired ACTIVATION set's
+    // accumulator even though the entry set was resident.
+    try testing.expectEqual(@as(u32, 3), state.region_policy.region_profit.get(key9).?.barren_run);
+}
+
+test "doc 52 P1: resident-only native cycle — epilogue barren exemption end to end, drain with no activation open" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    state.config.silent_budget = 6;
+    var code: [32]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1805, .code = &code, .name = "doc52-p1-native", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 31, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 32, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    const key: RegionKey = .{ .region_id = @enumFromInt(6), .activation = 0 };
+    try installB3PromotionRegion(&state, key, &.{ a, b });
+    {
+        const d = state.region_policy.region_defs.getPtr(key.region_id).?;
+        d.fallback_owner = true;
+        d.dormant = true;
+    }
+    // Direct resident promotion (the funnel path is covered above).
+    const observed = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+    };
+    const edges = state.detectPromotableSet(&observed, .{ .region_id = key.region_id, .activation = 0 }).?;
+    defer gpa.free(edges);
+    try state.promoteResidentSet(edges, key.region_id);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.resident_set_count);
+
+    // Run the REAL patched cycle with no activation open. The armed a→b→a
+    // ring spins silently until the budget exhausts. Without the epilogue
+    // exemption, six link-terminal firings would leave cur_zero_run == 6;
+    // the exemption keeps the run untouched at its staged zero.
+    var tags = [_]u8{ @intFromEnum(value.Tag.int), @intFromEnum(value.Tag.int) };
+    var payloads = [_]u64{ 0, 0 };
+    const regs = RegWindow.of(&tags, &payloads);
+    state.prepareNativeEntry();
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promotedSets().len);
+    const result = a.native.compiled.runCapturingLedger(regs, &state.ledger_scratch, state.silentStaging());
+    try testing.expectEqual(@as(u64, 1), result.silent_active);
+    try testing.expectEqual(@as(u64, 6), result.silent_transitions);
+    try testing.expectEqual(@as(u64, 0), result.cur_zero_run);
+    try testing.expectEqual(@as(usize, 0), result.ledger_len);
+
+    // Drain with active == null: the resident-only burst needs no
+    // activation, credits its own def, and settles no barren state.
+    var completed: usize = 0;
+    var resume_pc_value: u32 = 0;
+    var hops: usize = 0;
+    const dir = state.drainSilentResult(result, .continuation_call, &proto, &completed, &resume_pc_value, &hops, 8, true, null) orelse
+        return error.TestUnexpectedResult;
+    switch (dir) {
+        .return_result => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(u64, 6), state.region_policy.region_defs.get(key.region_id).?.transitions_credit);
+    try testing.expectEqual(@as(u64, 1), state.silent_budget_exhaustions);
+    try testing.expectEqual(@as(u64, 0), state.silent_barren_exhaustions);
+}
+
+test "doc 52 P1: demotion funnels — activation close skips residents; deferred demotion moves counts only at physical removal; defs mutation demotes" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [32]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1806, .code = &code, .name = "doc52-p1-funnels", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 41, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 42, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    const key: RegionKey = .{ .region_id = @enumFromInt(4), .activation = 0 };
+    try installB3PromotionRegion(&state, key, &.{ a, b });
+    {
+        const d = state.region_policy.region_defs.getPtr(key.region_id).?;
+        d.fallback_owner = true;
+        d.dormant = true;
+    }
+    const observed = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+    };
+    const edges = state.detectPromotableSet(&observed, .{ .region_id = key.region_id, .activation = 0 }).?;
+    defer gpa.free(edges);
+    try state.promoteResidentSet(edges, key.region_id);
+    state.region_policy.region_defs.getPtr(key.region_id).?.recurrence_streak = 4;
+
+    // An activation-lifecycle close for the SAME region (any real activation
+    // key) must not touch the resident set — full-key match skips the
+    // sentinel naturally.
+    try testing.expectEqual(@as(usize, 0), state.demotePromotionsForRegion(.{ .region_id = key.region_id, .activation = 5 }));
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.resident_set_count);
+    try testing.expectEqual(@as(u8, 4), state.region_policy.region_defs.get(key.region_id).?.recurrence_streak);
+
+    // A demotion queued mid-walk leaves the patched reality — and therefore
+    // the count caches and the recurrence proof — untouched until
+    // drainBarrier applies it at depth 0.
+    state.registry.native_physical.enterReplayWalk();
+    state.demoteSet(0);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.resident_set_count);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promotedSets().len);
+    state.registry.native_physical.exitReplayWalk();
+    state.applyPendingDisarms();
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promotedSets().len);
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.resident_set_count);
+    try testing.expectEqual(@as(u8, 0), state.region_policy.region_defs.get(key.region_id).?.recurrence_streak);
+    try testing.expectEqual(@as(u8, 0), state.region_policy.region_defs.get(key.region_id).?.recurrence_len);
+
+    // Re-promote, then a region-defs mutation demotes wholesale and the
+    // notice drains through the wrapper's sync.
+    const edges2 = state.detectPromotableSet(&observed, .{ .region_id = key.region_id, .activation = 0 }).?;
+    defer gpa.free(edges2);
+    try state.promoteResidentSet(edges2, key.region_id);
+    state.region_policy.region_defs.getPtr(key.region_id).?.recurrence_streak = 4;
+    state.demoteSetsForRegionDefsMutation();
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.resident_set_count);
+    try testing.expectEqual(@as(u8, 0), state.region_policy.region_defs.get(key.region_id).?.recurrence_streak);
 }
