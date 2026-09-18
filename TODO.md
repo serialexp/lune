@@ -1691,7 +1691,7 @@ demotions in trace.zig, compiler-adjudicated). Deferred items:
       (run the eq trace pre-capture and post-restore and compare), rather
       than the simulated same-id/different-address twin.
 
-## Recurring jit-debug test-gate flake (4 occurrences, 2 days)
+## Recurring jit-debug test-gate flake (6 occurrences, 2 days)
 
 - [ ] Hunt the nondeterministic `zig build test -Djit-debug=true` failure:
       2026-09-17 seed 0x3ace15b0, 2026-09-18 seed 0x34eef2f0, 2026-09-18
@@ -1722,3 +1722,12 @@ demotions in trace.zig, compiler-adjudicated). Deferred items:
       ir_len=1617` spam survived, ir_len 1617 suggests one of the big
       driver-trace recordings). Three immediate re-runs: 0 failures each.
       Same lesson as occurrence 3: capture with `> log 2>&1` FIRST.
+- [ ] Occurrence 6 (2026-09-18, codex-review-followups gate, seed
+      0xec370f68, binary b2602e1e…): failed once (`failed command:
+      …/b2602e1e…/test --seed=0xec370f68 --listen=-`); the failing
+      test's name was AGAIN lost to a `tail -3` pipe (third time —
+      the lesson is written twice above and still got skipped; make
+      `> log 2>&1` the reflex for EVERY jit-debug gate run, not the
+      retry). Same `guard-dedup ref=5 op=guard_int ir_len=1617` spam
+      as occurrence 5. Three immediate log-captured re-runs: exit 0,
+      0 failures each.

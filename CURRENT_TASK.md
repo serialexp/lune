@@ -133,8 +133,18 @@ recording survives.
   warmup iterations).
 - **Deferred (doc 53 Outstanding)**: set_upval write side (open-cell
   stores still abort .nyi, safe), inlined-frame-window cells (doc 24).
-- **Codex review pending** — no codex MCP tool in this session (Rule #21:
-  no substitution); doc 53 flags what a reviewer should attack.
+- **Codex reviews DONE (2026-09-18, after the 0.153.4 pin restored the
+  MCP tool)** — doc 53 round-1 APPROVED (thread `01a0b3fe…`): no
+  soundness break; nit incorporated (runtime_safety assert pinning
+  `existing.slot == rel` on the seed-dedup-hit path in
+  `recUpvalSlotAlias`); open question tracked as a doc 53 Outstanding
+  bullet (targeted linked-entry native-handoff test for the seeded
+  trace). Doc 49 P5 round-3 APPROVED (thread `01a0b400…`): code clean;
+  one doc-wording fix (prove pass doesn't gate on `hrefk_aux` — the
+  hrefk-vs-callout choice happens at allocation/emission via
+  `effectiveHrefAux`). Both ledgers updated. Gates: `just test` green;
+  jit-debug gate flaked once more (occurrence 6, TODO.md — name lost
+  to a tail pipe AGAIN, 3 log-captured re-runs clean).
 - **nbody next rocks** (from the new profile): res 92.9%, remaining gap
   4.5× is now native codegen quality of the big unrolled driver trace +
   the 0.6% non-loop tail — profile before choosing.

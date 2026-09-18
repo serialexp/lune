@@ -51,6 +51,11 @@ inlined-frame cells deliberately deferred
   (requires on-trace closure creation, which aborts — doc 24 territory);
   the arm fails closed on `rel >= anchor_num_registers`. Revisit with
   on-trace closures.
+- [ ] **Linked-entry handoff regression test (codex round-1 item 2).**
+  Force an armed/fused native→native handoff into a trace carrying an
+  `.upvalue_slot_alias` seed and assert the alien-activation decline
+  still fires on that path (today it's covered structurally via
+  `body_entry`'s shared seed prologue, not by a dedicated test).
 
 ## Why this exists
 
@@ -217,12 +222,31 @@ the tier-0-no-trace 35.3% is the ceiling on the win; `advance:34`'s
 
 ## Review
 
-Codex review pending — no codex MCP tool available in the authoring
-session (Rule #21: no substitution); route on request. Implemented and
-measured ahead of the review; the soundness section above is the
-contract a reviewer should attack (in particular: the proto-vs-object
-`guard_func` gap the entry validation closes, and the mid-episode
-close-impossibility argument).
+Codex round-1 (thread `01a0b3fe-0601-7f90-ac5d-7f3ed29e656a`,
+2026-09-18, verdict **APPROVED**). Reviewed post-landing (the codex MCP
+tool was down in the authoring session; restored via the 0.153.4 pin).
+No soundness break found; both attack surfaces flagged above held:
+the three seeding twins share one validator (`upvalueSlotAliasOk`,
+interp.zig ~1077) on every entry path incl. native `body_entry` and
+tier-1a chain reseeding, and mid-episode close-impossibility was
+confirmed against the code (`close_upvalues` absent from the record
+switch → fail-closed abort; frame returns close only at/above the
+returning frame's base). Items:
+
+1. [nit, incorporated] The seed dedup key excludes `rel`, relying on
+   the access-path invariant (same `slot_load` callee ⇒ same closure ⇒
+   same open cell) to make a repeat hit re-derive the same slot. No
+   reachable counterexample today; a `runtime_safety`-gated assert on
+   the dedup-hit path now pins `existing.slot == rel` so any future
+   widening of callee resolution / on-trace closures fails loudly at
+   record time (trace_recorder.zig, `recUpvalSlotAlias`).
+2. [question, open] No doc53-specific test forces an armed/fused
+   native linked-entry handoff into the seeded trace; the alien-
+   activation test covers the ten GC/tier matrix legs but enters via
+   the dispatcher. Structurally covered (both native secondary entries
+   funnel through `body_entry`'s seed prologue), but a targeted
+   linked-entry regression would pin the most fragile entry-path
+   claim. Tracked as an Outstanding bullet.
 
 ## References
 

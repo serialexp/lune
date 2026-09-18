@@ -491,8 +491,12 @@ back to it:
    `hash_cell` seed with `seed.slot == aux` and return its
    `hrefk_aux`; else return `ins.aux` unchanged. Audited consumers
    (the doc 49 round-1 list, same four): `nativegen_prove.zig`
-   (admit the seeded-dyn shape iff the seed carries a valid hint —
-   today it proves the callout), `bodyCalloutOf` (no save frame when
+   (as built, prove does NOT gate on the hint — a guarded href with a
+   nonnegative seed-slot aux proves as before, and the hrefk-vs-callout
+   choice is made later, at allocation/emission, by `effectiveHrefAux`;
+   an absent/undecodable hint safely dispatches to the callout — codex
+   round-3 corrected the original "admit iff the hint decodes" wording
+   here), `bodyCalloutOf` (no save frame when
    the effective aux decodes), the emit dispatch (route to
    `emitHrefK` with the effective aux), and `computeSeedPlan`
    (UNCHANGED — the seed stays inactive; the hint is compile-time
@@ -559,6 +563,23 @@ Codex round-2 (same thread, verdict NEEDS CHANGES → resolved):
 3. `put` probes (overwrite/resurrect) before the load test; post-rehash
    sizing formula pinned. Guard ordering in `emitHrefK` confirmed
    sound with no remaining missed-exit hazard.
+
+Codex round-3, P5 only (thread `01a0b400-9ce3-7e71-aa26-ceb0d72d67d2`,
+2026-09-18, verdict **APPROVED**):
+
+1. [nit] The P5 §3 "Emission consumers" text overstated the prove pass
+   ("admit iff the hint decodes"); as built, `proveKinds` does not read
+   `hrefk_aux` — carried-root detection and the hrefk-vs-callout choice
+   happen later (allocation/emission via `effectiveHrefAux`), with the
+   callout as the safe fallback. Wording corrected in place.
+
+No correctness findings: stale-hint guard ordering (mask/live/key-id
+before the href home write, all failures on the href's own exit index,
+`rax`/`rcx` reserved scratch), first-stamp dedup vs on-trace rehash
+(stores require a present cell; recordable append requires an empty
+hash part), synthetic hash-cell slot uniqueness + `.hash_cell` filter
+in `effectiveHrefAux`, and single-helper `(slot,mask)` packing
+(`HrefAux` + `hrefkAuxOf`) all verified against the code.
 
 Load factor 75% / min capacity 4 / no-fingerprint remain provisional
 pending P1b measurements.

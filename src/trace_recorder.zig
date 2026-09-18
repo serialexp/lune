@@ -4941,6 +4941,21 @@ pub const RecordingSession = struct {
             // The stored ref is never read back (see above); the map is used as
             // a set keyed on (kind, path, source).
             try self.input_dedup.put(self.gpa, key, 0);
+        } else if (std.debug.runtime_safety) {
+            // The dedup key excludes `rel`, so a repeat hit MUST re-derive the
+            // same aliased slot. Today that's guaranteed by the access-path
+            // invariant (same `slot_load` callee ⇒ same closure ⇒ same open
+            // cell); assert it so any future widening of callee resolution or
+            // on-trace closure support fails loudly here instead of silently
+            // entry-validating the wrong slot (codex doc 53 review, item 1).
+            for (self.input_seeds.items) |s| {
+                if (s.kind == .upvalue_slot_alias and
+                    s.callee_slot == path_slot and s.source == source)
+                {
+                    std.debug.assert(s.slot == rel);
+                    break;
+                }
+            }
         }
         const ref = try self.refOfAbs(rel);
         self.setReg(dest, ref);
