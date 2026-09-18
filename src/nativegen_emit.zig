@@ -950,6 +950,192 @@ pub fn emitInlineSelfPush(
     try a.jmp(body_entry);
 }
 
+pub const InlineSelfRetPop = struct {
+    /// `instr.a` of the static `.ret` — the result window's first slot.
+    a_reg: i32,
+    /// `instr.b` — the produced result count (never `all_results`; static).
+    count: i32,
+    nreg: i32,
+};
+
+/// Doc 54 P1: the inline return-side frame pop — the emitted twin of the
+/// (deleted) `interp.nativeSelfRetPop` C-ABI helper, mirroring `opRet`'s
+/// non-boundary arm for an episode-pushed same-proto frame. Emitted at a
+/// `.terminal(return_interp)` between the slot flush and the `.ret_pop`
+/// ledger/compare-chain continuation; a decline (`jne/ja/je` to `no_pop`)
+/// mutates NOTHING and the page runs its plain terminal exit (tier-0
+/// re-executes the `ret` generically) — byte-identical to the helper's
+/// decline.
+///
+/// The helper's per-pop preflight maps to:
+/// - emit-time statics (caller's job): aux in bounds, `.ret`,
+///   `b != all_results`, `!is_vararg`, `a + b <= nreg`;
+/// - the per-episode `descent_ok` byte (receipts inert ∧ no pending
+///   reg-top ∧ no final cut);
+/// - inline runtime checks: the net-pushed floor, the open-upvalue
+///   CEILING compare (`open_upvalue_ceiling <= frame.base` ⇒ no open cell
+///   at or above the popped window — the watermark replaces the helper's
+///   full-list scan), and the dynamic return wiring
+///   (`ret_count != all_results`, `ret_dest + want <= nreg`);
+/// - episode-structural invariants, each asserted by the jit-debug-only
+///   `frame_motion_assert_fn` callout: depth ≥ 2, `frame.base == ctx.base`,
+///   `frame.call_seq == ctx.call_seq`, frame/parent proto pins, window
+///   adjacency, and `activeRegionFor(call_seq) == null` (why the region-
+///   activation drop reduces to the context-clear replica below).
+///
+/// Register bracket (same terminal-epilogue facts as the push): rdi/rsi
+/// (lanes, still on the CALLEE window — the armed ret-cont chain shifts
+/// them, not this sequence), rdx (`*NativeResult`), rbx (cumulative
+/// counter) stay untouched; rax/rcx/r8-r11 are dead scratch. During the
+/// copy loop r8/r9 serve as dst-index/payload staging and are recomputed
+/// after (r9 is baked, r8 reloads from ctx); rax holds the frame pointer,
+/// recomputed after the loop.
+///
+/// On the taken (fall-through) path this replicates `opRet`'s non-boundary
+/// arm in VM-state effect: result copy into the parent window WHILE the
+/// callee window is still under `stack_top` (rooting order), the
+/// `dropRegionActivation` residue under the descent gate (just the
+/// region-context validity clear when the popped `call_seq` matches — zero
+/// activations exist, assert-verified), `depth -= 1`, `stack_top =
+/// parent.base + nreg`, the episode-ctx refresh onto the caller activation
+/// (closure/base/call_seq; proto and capacity episode-invariant), the
+/// `ret_resume_pc` publication from the parent's frozen cursor, and the
+/// `self_ret_pops` witness. No tick — `opRet` does not tick; the tick
+/// stream stays a pure function of the call stream.
+pub fn emitInlineSelfRetPop(
+    a: *x64.Assembler,
+    ctx: *const trace_code.NativeSeedCtx,
+    abi: trace_code.FrameMotionAbi,
+    p: InlineSelfRetPop,
+    no_pop: x64.Label,
+) !void {
+    const Ctx = trace_code.NativeSeedCtx;
+    const all_results: i32 = @import("bytecode.zig").all_results;
+    // -- step 1: episode descent gate ------------------------------------
+    try a.movRegImm64(.r9, @bitCast(@as(u64, @intFromPtr(ctx))));
+    try a.cmpByteMemImm(.r9, @offsetOf(Ctx, "descent_ok"), 1);
+    try a.jcc(.ne, no_pop);
+    // -- step 2: the net-pushed floor (an episode only pops frames IT
+    // pushed; the entry frame's own return stays tier-0) -----------------
+    try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "pushed_frames"));
+    try a.subRegMem(.rax, .rdx, @offsetOf(NativeResult, "popped_frames"));
+    try a.jcc(.e, no_pop);
+    // -- step 2b (jit-debug builds only): the structural-invariant assert
+    // callout. Premised on net > 0 (episode-pushed top frame), so it sits
+    // here; the invariants hold whether or not a later wall declines.
+    // Same three-push bracket as the old helpers: rsp ≡8 → ≡0, aligned.
+    if (ctx.frame_motion_assert_fn) |assert_fn| {
+        try a.push(.rdi);
+        try a.push(.rsi);
+        try a.push(.rdx);
+        try a.movRegImm64(.rdi, @bitCast(@as(u64, @intFromPtr(ctx))));
+        try a.movRegImm64(.rsi, p.nreg);
+        try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(assert_fn))));
+        try a.callReg(.rax);
+        try a.pop(.rdx);
+        try a.pop(.rsi);
+        try a.pop(.rdi);
+        try a.movRegImm64(.r9, @bitCast(@as(u64, @intFromPtr(ctx))));
+    }
+    try a.movRegMem(.r8, .r9, @offsetOf(Ctx, "vm"));
+    // -- step 3: rax = &frames[depth-1] (the popped frame) ---------------
+    try a.movRegMem32(.rax, .r8, abi.vm_depth_off);
+    try a.subRegImm32(.rax, 1);
+    try a.movRegImm64(.r10, abi.frame_size);
+    try a.imulRegReg(.rax, .r10);
+    try a.addRegReg(.rax, .r8);
+    try a.addRegImm32(.rax, abi.vm_frames_off);
+    // -- step 4: open-upvalue ceiling wall (the watermark replaces the
+    // helper's full open-list scan; stale-HIGH only declines) ------------
+    try a.movRegMem(.rcx, .r8, abi.vm_open_upvalue_ceiling_off);
+    try a.cmpRegMem(.rcx, .rax, abi.frame_base_off);
+    try a.jcc(.a, no_pop);
+    // -- step 5: dynamic return wiring (the frame may have been pushed by
+    // a DIFFERENT call site than this ret's — fib's two sites) -----------
+    try a.movzxRegMem16(.r11, .rax, abi.frame_ret_count_off); // r11 = want
+    try a.cmpRegImm32(.r11, all_results);
+    try a.jcc(.e, no_pop);
+    try a.movzxRegMem16(.r10, .rax, abi.frame_ret_dest_off); // r10 = dst reg
+    try a.movRegReg(.rcx, .r10);
+    try a.addRegReg(.rcx, .r11);
+    try a.cmpRegImm32(.rcx, p.nreg);
+    try a.jcc(.a, no_pop);
+    // -- step 6: result copy (opRet order: while the callee window is
+    // still under stack_top; nil-fill the tail past `count`). Src slot
+    // a_reg+k of the CALLEE window (lanes); dst slot ret_dest+k of the
+    // PARENT window = lane index ret_dest-nreg+k (window adjacency).
+    try a.subRegImm32(.r10, p.nreg); // r10 = ret_dest - nreg (signed dst base)
+    try a.xorRegReg(.rcx, .rcx); // rcx = k
+    const loop_top = try a.label();
+    const loop_done = try a.label();
+    const nil_case = try a.label();
+    const next = try a.label();
+    a.bind(loop_top);
+    try a.cmpRegReg(.rcx, .r11);
+    try a.jcc(.ae, loop_done);
+    try a.movRegReg(.r8, .rcx); // r8 = dst lane index (vm reloaded after)
+    try a.addRegReg(.r8, .r10);
+    try a.cmpRegImm32(.rcx, p.count);
+    try a.jcc(.ae, nil_case);
+    try a.loadRegMemSib(.rax, .rdi, .rcx, 1, false, p.a_reg);
+    try a.storeMemSibReg(.rdi, .r8, 1, 0, .rax);
+    try a.loadRegMemSib(.r9, .rsi, .rcx, 8, false, p.a_reg * 8);
+    try a.storeMemSibReg(.rsi, .r8, 8, 0, .r9);
+    try a.jmp(next);
+    a.bind(nil_case);
+    try a.movRegImm64(.rax, TAG_NIL);
+    try a.storeMemSibReg(.rdi, .r8, 1, 0, .rax);
+    try a.xorRegReg(.r9, .r9);
+    try a.storeMemSibReg(.rsi, .r8, 8, 0, .r9);
+    a.bind(next);
+    try a.incReg(.rcx);
+    try a.jmp(loop_top);
+    a.bind(loop_done);
+    // -- step 7: recompute the loop-clobbered pointers (r9 is baked; the
+    // frame pointer re-derives from the still-unmutated depth) -----------
+    try a.movRegImm64(.r9, @bitCast(@as(u64, @intFromPtr(ctx))));
+    try a.movRegMem(.r8, .r9, @offsetOf(Ctx, "vm"));
+    try a.movRegMem32(.rax, .r8, abi.vm_depth_off);
+    try a.subRegImm32(.rax, 1);
+    try a.movRegImm64(.r10, abi.frame_size);
+    try a.imulRegReg(.rax, .r10);
+    try a.addRegReg(.rax, .r8);
+    try a.addRegImm32(.rax, abi.vm_frames_off);
+    // -- step 8: dropRegionActivation residue. Under the descent gate the
+    // profit map is empty, so `nextActivation(call_seq)` closes nothing —
+    // but it DOES clear the region-context validity byte when the context
+    // seq matches the popped frame's (which the push set it to). Replicate
+    // exactly; the assert callout pins the zero-activations premise.
+    try a.movRegMem(.rcx, .rax, abi.frame_call_seq_off);
+    try a.cmpRegMem(.rcx, .r8, abi.vm_region_call_seq_off);
+    const no_ctx_clear = try a.label();
+    try a.jcc(.ne, no_ctx_clear);
+    try a.movByteMemImm(.r8, abi.vm_region_valid_off, 0);
+    a.bind(no_ctx_clear);
+    // -- step 9: the pop — depth, stack_top ------------------------------
+    try a.subRegImm32(.rax, abi.frame_size); // rax = parent frame
+    try a.movRegMem32(.rcx, .r8, abi.vm_depth_off);
+    try a.subRegImm32(.rcx, 1);
+    try a.movMemReg32(.r8, abi.vm_depth_off, .rcx);
+    try a.movRegMem(.r10, .rax, abi.frame_base_off); // r10 = parent.base
+    try a.movRegReg(.rcx, .r10);
+    try a.addRegImm32(.rcx, p.nreg);
+    try a.movMemReg(.r8, abi.vm_stack_top_off, .rcx);
+    // -- step 10: episode-ctx refresh onto the caller activation ---------
+    try a.movRegMem(.r11, .rax, abi.frame_closure_off);
+    try a.movMemReg(.r9, @offsetOf(Ctx, "closure"), .r11);
+    try a.movMemReg(.r9, @offsetOf(Ctx, "base"), .r10);
+    try a.movRegMem(.rcx, .rax, abi.frame_call_seq_off);
+    try a.movMemReg(.r9, @offsetOf(Ctx, "call_seq"), .rcx);
+    // ret_resume_pc (u32) from the parent's frozen one-past-call cursor.
+    try a.movRegMem(.rcx, .rax, abi.frame_pc_off);
+    try a.movMemReg32(.r9, @offsetOf(Ctx, "ret_resume_pc"), .rcx);
+    // -- step 11: the formation witness (no tick — opRet does not tick) --
+    try a.incMemQword(.r8, abi.vm_self_ret_pops_off);
+    // Fall through = POP-OK: the caller emits popped_frames++, the
+    // `.ret_pop` ledger row, and the ret-cont compare chain.
+}
+
 /// B-3a's unreachable silent tail. `metadata_cell` is a stable compile-time-owned
 /// pointer cell; B-3b publishes a `*SilentExitMetadata` into it before patching.
 pub fn emitSilentEpilogue(a: *x64.Assembler, kind: ExitPatchKind, metadata_cell: *usize, shared_exit: usize, trace_id: u32) !void {

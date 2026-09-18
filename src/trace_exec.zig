@@ -170,9 +170,9 @@ pub const ExecResult = struct {
     /// activation while the top frame is now the descent's leaf. Native only;
     /// tier-1a leaves it 0 (defaulted, construction sites untouched).
     pushed_frames: u64 = 0,
-    /// Doc 44 D12c: how many episode-pushed frames the native run popped back
-    /// via the return-side helper (`nativeSelfRetPop`). The net floor
-    /// (`popped < pushed` at every pop, enforced in the helper) makes
+    /// Doc 44 D12c / doc 54 P1: how many episode-pushed frames the native
+    /// run popped back via the inline pop sequence. The net floor
+    /// (`popped < pushed` at every pop, emitted inline) makes
     /// `popped_frames > 0` imply `pushed_frames > 0`, so the dispatchers'
     /// existing pushed-frame branch already routes every frame-motion result.
     /// Native only; tier-1a leaves it 0.
@@ -225,7 +225,7 @@ pub const LedgerKind = enum(u32) {
     /// terminal consumer owns resumption; no slot indirection is emitted).
     head_terminal = 7,
     /// Doc 44 D12c: a `.terminal(return_interp)` whose native pop epilogue
-    /// COMMITTED (`nativeSelfRetPop` returned POP_OK): the episode popped one
+    /// COMMITTED (doc 54 P1: the inline sequence): the episode popped one
     /// of its own pushed frames, so the top frame is the popped-into CALLER
     /// and regs are coherent at its frozen one-past-call cursor. With no
     /// `.ret_cont` links armed yet this row is always FINAL (the pop exits

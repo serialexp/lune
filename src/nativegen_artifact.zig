@@ -140,12 +140,12 @@ pub const NativeResult = extern struct {
     /// so this may only ever be appended, never inserted. The wrapper inits it
     /// to 0 and marshals it into `ExecResult.pushed_frames`.
     pushed_frames: u64,
-    /// Doc 44 D12c: count of successful native frame pops this run (the
-    /// `.terminal(return_interp)` pop epilogue increments it after
-    /// `nativeSelfRetPop` returns POP_OK). Appended at the ABI tail like its
-    /// push twin; the wrapper inits it to 0 and marshals it into
-    /// `ExecResult.popped_frames`. The emitted pop preflight also READS both
-    /// motion counters to compute the net floor it passes the helper.
+    /// Doc 44 D12c / doc 54 P1: count of committed native frame pops this
+    /// run (the `.terminal(return_interp)` pop epilogue increments it after
+    /// the inline pop sequence falls through). Appended at the ABI tail like
+    /// its push twin; the wrapper inits it to 0 and marshals it into
+    /// `ExecResult.popped_frames`. The emitted sequence also READS both
+    /// motion counters for its net-pushed floor.
     popped_frames: u64,
     /// Doc 45 D6: one-based `TraceCode.snapshots` index stamped by a precise
     /// exit (`.precise_resume` / `.precise_error`); 0 otherwise. Appended at

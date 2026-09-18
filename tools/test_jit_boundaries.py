@@ -204,6 +204,63 @@ class BoundaryTests(TemporarySourceTest):
         self.write("trace_recording_session.zig", 'const bad = @import("trace.zig");')
         self.assertEqual(2, len(checker.check_boundaries(self.src)))
 
+    def test_body_callout_taking_vm_is_flagged(self) -> None:
+        self.write(
+            "helpers.zig",
+            "pub fn grow(vm: *Vm, n: u64) callconv(.c) u64 {\n"
+            "    return n;\n"
+            "}\n",
+        )
+        violations = checker.check_boundaries(self.src)
+        self.assertEqual(1, len(violations))
+        self.assertIn("grow", violations[0].rule)
+        self.assertIn("frame-mutation authority", violations[0].rule)
+
+    def test_body_callout_taking_seed_ctx_is_flagged_and_allowlist_is_file_scoped(self) -> None:
+        # The allowlisted NAME in the wrong FILE still flags.
+        self.write(
+            "other.zig",
+            "fn nativeSelfCallPush(ctx: *const trace.NativeSeedCtx) callconv(.c) u64 {\n"
+            "    return 0;\n"
+            "}\n",
+        )
+        self.assertEqual(1, len(checker.check_boundaries(self.src)))
+
+    def test_episode_boundary_helpers_are_allowlisted(self) -> None:
+        self.write(
+            "interp.zig",
+            "fn nativeSeedFn(ctx: *const trace.NativeSeedCtx) callconv(.c) u64 { return 0; }\n"
+            "fn nativeSelfCallPush(ctx: *const trace.NativeSeedCtx) callconv(.c) u64 { return 0; }\n"
+            "fn nativeFrameMotionAssert(ctx: *const trace.NativeSeedCtx, nreg: u64) callconv(.c) void {}\n",
+        )
+        self.assertEqual([], checker.check_boundaries(self.src))
+
+    def test_heap_callouts_fn_pointer_types_and_zig_abi_are_not_flagged(self) -> None:
+        self.write(
+            "clean.zig",
+            # A legitimate body callout: heap + value operands only.
+            "pub fn tnew(heap: *gc.Heap, hint: u64) callconv(.c) u64 { return hint; }\n"
+            # An anonymous fn-pointer TYPE naming the ctx (a boundary contract
+            # field, not a declaration).
+            "ctx_fn: ?*const fn (ctx: *const NativeSeedCtx) callconv(.c) u64 = null,\n"
+            # A plain Zig-ABI function may take *Vm freely.
+            "pub fn helper(vm: *Vm) void { _ = vm; }\n"
+            # A fn whose PARAMETER is a C fn pointer taking the ctx: the outer
+            # fn is Zig-ABI, the inner callconv belongs to the parameter type.\n
+            "pub fn install(f: *const fn (ctx: *const NativeSeedCtx) callconv(.c) u64) void { _ = f; }\n",
+        )
+        self.assertEqual([], checker.check_boundaries(self.src))
+
+    def test_callout_declarations_inside_test_blocks_are_ignored(self) -> None:
+        self.write(
+            "sample.zig",
+            'test "local" {\n'
+            "    const S = struct { fn bad(vm: *Vm) callconv(.c) u64 { return 0; } };\n"
+            "    _ = S;\n"
+            "}\n",
+        )
+        self.assertEqual([], checker.check_boundaries(self.src))
+
     def test_cli_returns_nonzero_and_prints_path(self) -> None:
         self.write("tropt.zig", 'const bad = @import("trace.zig");\n')
         self.write("trace.zig")

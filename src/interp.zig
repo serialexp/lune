@@ -957,7 +957,9 @@ pub const Vm = struct {
             .seed_fn = &nativeSeedFn,
             .seed_tier1a_fn = &nativeSeedTier1aFn,
             .self_call_push_fn = &nativeSelfCallPush,
-            .self_ret_pop_fn = &nativeSelfRetPop,
+            // Doc 54 P1: the structural-invariant assert callout exists only
+            // in -Djit-debug builds; normal builds emit no callout at all.
+            .frame_motion_assert_fn = if (@import("jitdbg.zig").enabled) &nativeFrameMotionAssert else null,
             .frame_abi = frame_motion_abi,
         });
         // Doc 24 D5: the stable mutable heap channel for allocating traces
@@ -1412,93 +1414,37 @@ pub const Vm = struct {
         return trace.NativeSeedCtx.PUSH_OK;
     }
 
-    /// Doc 44 D12c: the C-ABI return-side frame-pop twin of `opRet`'s
-    /// non-boundary arm, installed once into `NativeSeedCtx.self_ret_pop_fn`
-    /// at VM init and called from a `.terminal(return_interp)` pop epilogue
-    /// (the callee window is already fully flushed, return-value registers
-    /// included). ALL legality is re-derived here per pop, fail-closed to
-    /// POP_DECLINE with nothing mutated — the page then runs its plain
-    /// terminal exit and tier-0 re-executes the `ret` generically.
-    ///
-    /// The round-6 change-7 floor comes in BY VALUE: `net_pushed` is the
-    /// episode's `pushed_frames - popped_frames`, computed by the emitted
-    /// preflight from the `NativeResult` motion counters. Refusing at net 0
-    /// means an episode only ever pops frames IT pushed (every one a
-    /// same-proto self-call frame — D11), so the popped-into parent is
-    /// same-proto and the window adjacency is the push's mirror; the episode
-    /// ENTRY frame's own return always stays tier-0.
-    ///
-    /// On POP_OK the helper has replicated `opRet`'s non-boundary arm
-    /// verbatim: the result copy runs WHILE the callee window is still under
-    /// `stack_top` (the rooting order — no allocation or safepoint between
-    /// copy and shrink), using the frame's STORED return-wiring (never a
-    /// re-decode of the caller's call instruction); then the region-
-    /// activation drop, the frame pop, the `stack_top` shrink, and the
-    /// episode-ctx refresh onto the caller activation. No tick — tier-0's
-    /// `opRet` does not tick either, so the tick stream stays a pure
-    /// function of the CALL stream on every leg. The v1 helper never
-    /// mutates upvalue cells: ANY open upvalue at or above the popped base
-    /// declines (a FULL read-only scan — the open list is append-discovery-
-    /// ordered and swapRemove-compacted, so no single-compare shortcut is
-    /// sound), handing tier-0 the `closeUpvaluesFrom`.
-    fn nativeSelfRetPop(
-        ctx: *const trace.NativeSeedCtx,
-        ct: *const trace.TraceCode,
-        terminal_aux: u64,
-        net_pushed: u64,
-    ) callconv(.c) u64 {
+    /// Doc 54 P1: the jit-debug-only structural-invariant assert for inline
+    /// native frame motion, installed into
+    /// `NativeSeedCtx.frame_motion_assert_fn` ONLY in `-Djit-debug` builds
+    /// and called by the emitted pop sequence after its net-pushed floor.
+    /// This is where every frame-identity check the old `nativeSelfRetPop`
+    /// helper re-derived per pop keeps a debug assert that can bite (the
+    /// doc's sabotage protocol): the checks were dropped from the hot path
+    /// because their premises are episode-LOCAL — nothing but this episode's
+    /// own emitted code mutates `frames[]`/`depth` mid-episode (tier-0
+    /// dispatch, host reentry, and error unwind are all episode
+    /// terminators), so with net > 0 the top frame is one THIS episode
+    /// pushed (step 6 of the inline push), and its identity/adjacency hold
+    /// by construction. The final two asserts pin the descent gate's
+    /// region premise: receipts stay inert for the whole episode, so
+    /// `dropRegionActivation` can close nothing and reduces to the emitted
+    /// context-clear replica.
+    fn nativeFrameMotionAssert(ctx: *const trace.NativeSeedCtx, nreg: u64) callconv(.c) void {
         const self: *Vm = @ptrCast(@alignCast(ctx.vm));
-        const proto = ct.anchor.proto;
-        // The net floor FIRST — everything below assumes an episode-pushed
-        // top frame.
-        if (net_pushed == 0) return trace.NativeSeedCtx.POP_DECLINE;
-        // Record-time exclusions are DISTANT invariants; re-verify at this
-        // fail-closed boundary before any mutation.
-        if (terminal_aux >= proto.code.len) return trace.NativeSeedCtx.POP_DECLINE;
-        const instr = proto.code[@intCast(terminal_aux)];
-        if (instr.op != .ret) return trace.NativeSeedCtx.POP_DECLINE;
-        if (instr.b == bytecode.all_results) return trace.NativeSeedCtx.POP_DECLINE;
-        if (proto.is_vararg) return trace.NativeSeedCtx.POP_DECLINE;
-        if (self.reg_top_pending) return trace.NativeSeedCtx.POP_DECLINE;
-        if (!self.trace.region_policy.receiptsInert()) return trace.NativeSeedCtx.POP_DECLINE;
-        // Physical shape: a parent must exist (net > 0 implies it, but the
-        // floor is derived state — verify the frames array itself).
-        if (self.depth < 2) return trace.NativeSeedCtx.POP_DECLINE;
+        std.debug.assert(self.depth >= 2);
         const frame = &self.frames[self.depth - 1];
         const parent = &self.frames[self.depth - 2];
-        if (frame.base != ctx.base) return trace.NativeSeedCtx.POP_DECLINE;
-        if (frame.call_seq != ctx.call_seq) return trace.NativeSeedCtx.POP_DECLINE;
-        if (frame.closure.proto != proto) return trace.NativeSeedCtx.POP_DECLINE;
-        if (parent.closure.proto != proto) return trace.NativeSeedCtx.POP_DECLINE;
-        // Exact window adjacency — the push laid it out; verify anyway.
-        const nreg: usize = proto.num_registers;
-        if (frame.base != parent.base + nreg) return trace.NativeSeedCtx.POP_DECLINE;
-        // Stored return-wiring, bounds-checked against both windows.
-        if (frame.ret_count == bytecode.all_results) return trace.NativeSeedCtx.POP_DECLINE;
-        const want: usize = frame.ret_count;
-        const count: usize = instr.b;
-        const a_reg: usize = instr.a;
-        if (a_reg + count > nreg) return trace.NativeSeedCtx.POP_DECLINE;
-        if (@as(usize, frame.ret_dest) + want > nreg) return trace.NativeSeedCtx.POP_DECLINE;
-        // The full open-upvalue scan (see the doc comment).
-        for (self.open_upvalues.items) |ou| {
-            if (ou.index >= frame.base) return trace.NativeSeedCtx.POP_DECLINE;
-        }
-        // All checks passed — `opRet`-verbatim mutation from here down.
-        const dst = parent.base + frame.ret_dest;
-        const src = frame.base + a_reg;
-        var k: usize = 0;
-        while (k < want) : (k += 1) {
-            self.regSet(dst + k, if (k < count) self.regGet(src + k) else Value.nil());
-        }
-        self.trace.dropRegionActivation(frame.call_seq);
-        self.depth -= 1;
-        self.stack_top = parent.base + nreg;
-        self.prepareNativeEpisode(parent.closure, proto, parent.base);
-        // Published only after the pop commits; declined calls leave it irrelevant.
-        @constCast(ctx).ret_resume_pc = @intCast(parent.pc);
-        self.trace.self_ret_pops +%= 1;
-        return trace.NativeSeedCtx.POP_OK;
+        std.debug.assert(frame.base == ctx.base);
+        std.debug.assert(frame.call_seq == ctx.call_seq);
+        const proto: *const Proto = @ptrCast(@alignCast(ctx.proto.?));
+        std.debug.assert(frame.closure.proto == proto);
+        std.debug.assert(parent.closure.proto == proto);
+        std.debug.assert(frame.base == parent.base + nreg);
+        std.debug.assert(!self.reg_top_pending);
+        std.debug.assert(self.final_cut == null);
+        std.debug.assert(self.trace.region_policy.receiptsInert());
+        std.debug.assert(self.trace.region_policy.activeRegionFor(frame.call_seq) == null);
     }
 
     /// Doc 22 §B.1: publish the current activation into the per-VM seeding ctx
@@ -3402,7 +3348,7 @@ pub const Vm = struct {
                 },
                 .ret_pop => {
                     // Doc 44 D12c: the final activation COMMITTED a native
-                    // frame pop (`return_interp` terminal + POP_OK) — the top
+                    // frame pop (`return_interp` terminal, inline pop) — the top
                     // frame is the popped-into CALLER and its `pc` is the
                     // frozen one-past-call cursor the push wrote. Resume
                     // there: that pc may hold a `jcont` patch, making the

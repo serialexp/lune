@@ -316,6 +316,15 @@ pub const Assembler = struct {
         try self.modrmMem(dst.lo(), base, disp);
     }
 
+    /// `movzx dst, word [base + disp]` — REX.W 0F B7 /r (doc 54 P1: the
+    /// inline pop's u16 `ret_count`/`ret_dest` frame-field loads).
+    pub fn movzxRegMem16(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
+        try self.rex(true, dst.hi(), false, base.hi());
+        try self.b(0x0F);
+        try self.b(0xB7);
+        try self.modrmMem(dst.lo(), base, disp);
+    }
+
     /// `mov byte [base + disp], src8` — 88 /r. A REX prefix is mandatory not
     /// only for extended registers, but also for spl/bpl/sil/dil: without it,
     /// encodings 4..7 name ah/ch/dh/bh instead.
@@ -1049,6 +1058,21 @@ test "enc: movzx reg, reg8" {
     try expectEnc(&.{ 0x48, 0x0F, 0xB6, 0xC0 }, struct { // movzx rax, al
         fn f(a: *Assembler) !void {
             try a.movzxRegReg8(.rax, .rax);
+        }
+    }.f);
+}
+
+test "enc: movzx reg, word [base+disp]" {
+    // movzx rax, word [rdi + 8] — REX.W 0F B7 /r, disp8
+    try expectEnc(&.{ 0x48, 0x0F, 0xB7, 0x47, 0x08 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.movzxRegMem16(.rax, .rdi, 8);
+        }
+    }.f);
+    // movzx r11, word [r8 + 0x40] — REX.WRB
+    try expectEnc(&.{ 0x4D, 0x0F, 0xB7, 0x58, 0x40 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.movzxRegMem16(.r11, .r8, 0x40);
         }
     }.f);
 }

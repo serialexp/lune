@@ -1247,9 +1247,9 @@ pub const TraceState = struct {
     /// output-equivalent, just slower) — the formation test asserts on this
     /// witness. No tiering path reads it.
     self_call_pushes: u64 = 0,
-    /// Doc 44 D12c: count of successful native frame pops (`nativeSelfRetPop`
-    /// POP_OK) — the pop's formation witness, symmetric to `self_call_pushes`.
-    /// No tiering path reads it.
+    /// Doc 44 D12c / doc 54 P1: count of committed native frame pops (the
+    /// inline pop sequence's witness increment) — symmetric to
+    /// `self_call_pushes`. No tiering path reads it.
     self_ret_pops: u64 = 0,
     ret_cont_link_arms: u64 = 0,
     ret_cont_link_hits: u64 = 0,

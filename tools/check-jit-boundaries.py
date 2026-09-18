@@ -284,6 +284,122 @@ def check_boundaries(source_root: Path) -> list[Violation]:
         for dependency in graph[root]:
             if dependency in blocked_paths:
                 violations.append(Violation(f"{name} violates its direct ownership dependency boundary", (root, dependency)))
+    violations.extend(check_body_callouts(source_root))
+    return violations
+
+
+# --- Doc 54 P1: the body-callout authority rule ------------------------------
+#
+# Inline native frame motion drops the old helpers' per-transition frame-
+# identity re-verification on the strength of an episode-local invariant:
+# nothing but the episode's own emitted code mutates `frames[]`/`depth`
+# mid-episode.  Native BODIES do make runtime callouts (allocation, string
+# helpers, hash resolves), so the invariant's mechanical form is that no BODY
+# callout carries frame-mutation authority: a C-ABI function reachable from a
+# native page body must take `*Heap` or value operands, never `*Vm` or the
+# episode ctx (`NativeSeedCtx`, which carries `vm`).  The episode-BOUNDARY
+# helpers legitimately hold that authority and are allowlisted by (file,
+# name); adding a new `*Vm`/ctx-taking `callconv(.c)` function anywhere else
+# fails this check instead of silently invalidating every dropped identity
+# check.
+
+CALLOUT_AUTHORITY_TYPES = frozenset({"Vm", "NativeSeedCtx"})
+
+EPISODE_BOUNDARY_ALLOWLIST = frozenset(
+    {
+        ("interp.zig", "nativeSeedFn"),
+        ("interp.zig", "nativeSelfCallPush"),
+        ("interp.zig", "nativeFrameMotionAssert"),
+    }
+)
+
+
+def c_abi_functions(path: Path) -> list[tuple[str, int, tuple[str, ...]]]:
+    """Named ``fn NAME(...) callconv(.c)`` declarations with the identifiers
+    appearing in their parameter list (names and types alike).  Anonymous
+    function-pointer TYPES (`*const fn (...) callconv(.c)`) have no name token
+    and are deliberately not reported — they are boundary contract fields, not
+    declarations."""
+    tokens = _without_test_blocks(tokenize_zig(path.read_text(encoding="utf-8")))
+    found: list[tuple[str, int, tuple[str, ...]]] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if (
+            token.kind == "identifier"
+            and token.value == "fn"
+            and i + 2 < len(tokens)
+            and tokens[i + 1].kind == "identifier"
+            and tokens[i + 2].kind == "symbol"
+            and tokens[i + 2].value == "("
+        ):
+            name = tokens[i + 1].value
+            line = tokens[i + 1].line
+            depth = 1
+            j = i + 3
+            params: list[str] = []
+            while j < len(tokens) and depth:
+                inner = tokens[j]
+                if inner.kind == "symbol" and inner.value == "(":
+                    depth += 1
+                elif inner.kind == "symbol" and inner.value == ")":
+                    depth -= 1
+                elif inner.kind == "identifier":
+                    params.append(inner.value)
+                j += 1
+            # Between the parameter list and the body/semicolon sits the
+            # return type, where a `callconv(.c)` marks the C ABI.  A nested
+            # fn-pointer PARAMETER's own callconv was consumed above and
+            # cannot reach here.
+            is_c_abi = False
+            k = j
+            while k < len(tokens):
+                trailer = tokens[k]
+                if trailer.kind == "symbol" and trailer.value in ("{", ";"):
+                    break
+                if (
+                    trailer.kind == "identifier"
+                    and trailer.value == "callconv"
+                    and k + 4 < len(tokens)
+                    and tokens[k + 1].value == "("
+                    and tokens[k + 2].value == "."
+                    and tokens[k + 3].value == "c"
+                    and tokens[k + 4].value == ")"
+                ):
+                    is_c_abi = True
+                    break
+                k += 1
+            if is_c_abi:
+                found.append((name, line, tuple(params)))
+            i = j
+            continue
+        i += 1
+    return found
+
+
+def check_body_callouts(source_root: Path) -> list[Violation]:
+    source_root = source_root.resolve()
+    violations: list[Violation] = []
+    for source in sorted(source_root.rglob("*.zig")):
+        source = source.resolve()
+        if _is_dedicated_test(source):
+            continue
+        relative = source.relative_to(source_root).as_posix()
+        for name, line, params in c_abi_functions(source):
+            if not CALLOUT_AUTHORITY_TYPES.intersection(params):
+                continue
+            if (relative, name) in EPISODE_BOUNDARY_ALLOWLIST:
+                continue
+            violations.append(
+                Violation(
+                    f"C-ABI function `{name}` ({relative}:{line}) takes frame-"
+                    "mutation authority (*Vm / NativeSeedCtx); body callouts "
+                    "must take *Heap or value operands (doc 54 P1) — an "
+                    "episode-BOUNDARY helper goes on the allowlist only with "
+                    "a soundness argument",
+                    (source,),
+                )
+            )
     return violations
 
 

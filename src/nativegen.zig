@@ -2190,50 +2190,42 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         no_push = decline;
                     };
                 }
-                // Doc 44 D12c: native frame pop at the return terminal — the
-                // symmetric twin of the push above, and like it a LOWERING
-                // decision only (recording and tier-1a keep the interp
-                // terminal). The flush above materialized the callee window,
-                // return-value registers included, so the runtime pop helper
-                // can copy results into the parent slab window verbatim
-                // opRet. The emitted preflight computes the episode's NET
-                // pushed-frame count from the two motion counters and passes
-                // it by value — the round-6 explicit floor (`net == 0`
-                // declines inside the helper: an episode only pops frames IT
-                // pushed; the entry frame's own return stays tier-0). POP_OK
-                // exits through a DISTINCT `.ret_pop` ledger row (top frame =
-                // the popped-into caller at its frozen cursor — the motion
+                // Doc 44 D12c / doc 54 P1: native frame pop at the return
+                // terminal — the symmetric twin of the push above, and like
+                // it a LOWERING decision only (recording and tier-1a keep
+                // the interp terminal). The flush above materialized the
+                // callee window, return-value registers included, so the
+                // INLINE pop sequence copies results into the parent lane
+                // window verbatim opRet. Static eligibility mirrors the
+                // push: an ineligible page emits NO pop epilogue at all
+                // (fail closed — the old C-ABI helper declined on every
+                // single pop, pure waste); an eligible one bakes `instr.a/b`
+                // as immediates and leaves only the descent byte, the
+                // net-pushed floor, the open-upvalue ceiling, and the
+                // dynamic return wiring as runtime checks. A committed pop
+                // exits through a DISTINCT `.ret_pop` ledger row (top frame
+                // = the popped-into caller at its frozen cursor — the motion
                 // consumer's resume contract); any decline falls through to
                 // the plain `head_terminal` exit, byte-identical to pre-D12c
                 // (tier-0 re-executes the `ret` generically).
                 if (@as(trace.TerminalKind, @enumFromInt(@as(u16, @intCast(term.a)))) == .return_interp) {
-                    if (seed_ctx) |ctx| if (ctx.self_ret_pop_fn) |pop_fn| {
+                    const pop_static: ?bytecode.Instr = blk: {
+                        const proto_ = t.anchor.proto;
+                        if (proto_.is_vararg) break :blk null;
+                        if (term.aux < 0 or term.aux >= proto_.code.len) break :blk null;
+                        const ci = proto_.code[@intCast(term.aux)];
+                        if (ci.op != .ret) break :blk null;
+                        if (ci.b == bytecode.all_results) break :blk null;
+                        if (@as(u32, ci.a) + ci.b > proto_.num_registers) break :blk null;
+                        break :blk ci;
+                    };
+                    if (pop_static) |ci| if (seed_ctx) |ctx| if (ctx.frame_abi) |abi| {
                         const no_pop = try a.label();
-                        // Same C-ABI bracket as the push: three pushes take
-                        // rsp ≡8 → ≡0 (aligned call); rdi/rsi/rdx are the
-                        // only live caller-saved regs (homes just flushed).
-                        try a.push(.rdi);
-                        try a.push(.rsi);
-                        try a.push(.rdx);
-                        // net = pushed - popped, read while rdx still holds
-                        // the *NativeResult (before the arg loads clobber it).
-                        try a.movRegMem(.rcx, .rdx, @offsetOf(NativeResult, "pushed_frames"));
-                        try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "popped_frames"));
-                        try a.subRegReg(.rcx, .rax);
-                        // SysV args: rdi = &ctx, rsi = &t, rdx = the
-                        // terminal's `.ret` pc BY VALUE, rcx = net (above).
-                        try a.movRegImm64(.rdi, @bitCast(@as(u64, @intFromPtr(ctx))));
-                        try a.movRegImm64(.rsi, @bitCast(@as(u64, @intFromPtr(t))));
-                        try a.movRegImm64(.rdx, @bitCast(@as(u64, @intCast(term.aux))));
-                        try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(pop_fn))));
-                        try a.callReg(.rax);
-                        try a.pop(.rdx);
-                        try a.pop(.rsi);
-                        try a.pop(.rdi);
-                        // Two-state result, fail closed: POP_OK takes the
-                        // `.ret_pop` exit, EVERYTHING else the plain terminal.
-                        try a.cmpRegImm32(.rax, @intCast(NativeSeedCtx.POP_OK));
-                        try a.jcc(.ne, no_pop);
+                        try emit.emitInlineSelfRetPop(a, ctx, abi, .{
+                            .a_reg = ci.a,
+                            .count = ci.b,
+                            .nreg = t.anchor.proto.num_registers,
+                        }, no_pop);
                         try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "popped_frames"));
                         try a.addRegImm32(.rax, 1);
                         try a.movMemReg(.rdx, @offsetOf(NativeResult, "popped_frames"), .rax);
