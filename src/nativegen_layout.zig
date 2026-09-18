@@ -88,6 +88,13 @@ pub const FUNCTION_TYPE: u8 = @intFromEnum(object.ObjectType.function);
 /// Offset of `Closure.proto` (a `*const Proto`) from a `*GcHeader`. The header is
 /// the first field, so this is the closure's second word.
 pub const CLOSURE_PROTO_OFF: i32 = @offsetOf(function.Closure, "proto");
+comptime {
+    // Everything that applies a Closure field offset to a raw TAG_HEAP payload
+    // (`*GcHeader`) — the guard_func prologue, doc 54's inline push callee
+    // guard, and the push's `frame.closure = payload` store — assumes the
+    // header IS the closure address. Pin it (Z-1).
+    std.debug.assert(@offsetOf(function.Closure, "header") == 0);
+}
 /// Offset of `Proto.id` (a stable `u32` compile-time identity — NOT an address, so
 /// it survives keyframe restore/replay) from a `*const Proto`. `guard_func` compares
 /// the recorded id against `[closure.proto + PROTO_ID_OFF]`.

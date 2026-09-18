@@ -1490,7 +1490,9 @@ pub const Vm = struct {
     /// `driveChain`'s tier-1a seeding (B-iii) describe THIS entry. `proto` +
     /// `call_seq` are the freshness stamp consumers check (`stubEnterable`,
     /// B-iv). No-op when the ctx is absent (hand-built test TraceStates).
-    fn prepareNativeEpisode(self: *Vm, closure: *const function.Closure, proto: *const Proto, base: usize) void {
+    /// Pub for the doc 54 P0 gate-publication test only — production callers
+    /// are all inside this file.
+    pub fn prepareNativeEpisode(self: *Vm, closure: *const function.Closure, proto: *const Proto, base: usize) void {
         const ctx = self.trace.registry.native_seed_ctx orelse return;
         ctx.vm = self;
         ctx.closure = closure;

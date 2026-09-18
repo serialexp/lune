@@ -2083,10 +2083,46 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 // call generically, raising any overflow error itself).
                 var no_push: ?x64.Label = null;
                 const term = t.instrs[i];
-                // Head pages descend into themselves. Continuation pages use
-                // their dedicated `.call_head` trailing slot; if it is not
-                // armed they leave the call to tier-0 unchanged.
-                if (trace_code.anchorKind(t.anchor.pc) != .loop and
+                // Doc 54 P0: commit-time static push eligibility — the four
+                // terminal-shape checks the helper re-derived per push are
+                // record-time invariants of the committed page (`term.aux`
+                // and the proto's code are immutable), so they move to
+                // emission: an ineligible page gets NO push epilogue at all
+                // (the old callout declined on every single push — pure
+                // waste), and an eligible one bakes `instr.a/b/c` as
+                // immediates.
+                const push_static: ?bytecode.Instr = blk: {
+                    const proto_ = t.anchor.proto;
+                    if (term.aux < 0 or term.aux >= proto_.code.len) break :blk null;
+                    const ci = proto_.code[@intCast(term.aux)];
+                    if (ci.op != .call) break :blk null;
+                    if (ci.b == bytecode.all_results) break :blk null;
+                    if (proto_.is_vararg) break :blk null;
+                    break :blk ci;
+                };
+                // Head pages descend into themselves — doc 54 P0: via the
+                // INLINE push sequence (no C-ABI callout; decline = the
+                // plain terminal exit below). Continuation pages keep the
+                // runtime helper and their dedicated `.call_head` trailing
+                // slot until P2 rebuilds that path on the inline sequence.
+                if (trace_code.anchorKind(t.anchor.pc) == .head and
+                    @as(trace.TerminalKind, @enumFromInt(@as(u16, @intCast(term.a)))) == .self_call_interp)
+                {
+                    if (push_static) |ci| if (seed_ctx) |ctx| if (ctx.frame_abi) |abi| {
+                        const decline = try a.label();
+                        try emit.emitInlineSelfPush(a, ctx, abi, .{
+                            .callee_slot = ci.a,
+                            .nargs = ci.b,
+                            .ret_count = ci.c,
+                            .term_aux = term.aux,
+                            .num_params = t.anchor.proto.num_params,
+                            .nreg = t.anchor.proto.num_registers,
+                            .proto_addr = @intFromPtr(t.anchor.proto),
+                        }, body_entry, decline);
+                        no_push = decline;
+                    };
+                } else if (trace_code.anchorKind(t.anchor.pc) == .cont and
+                    push_static != null and
                     @as(trace.TerminalKind, @enumFromInt(@as(u16, @intCast(term.a)))) == .self_call_interp)
                 {
                     if (seed_ctx) |ctx| if (ctx.self_call_push_fn) |push_fn| {
@@ -2134,13 +2170,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         try a.addRegImm32(.rax, 1);
                         try a.movMemReg(.rdx, @offsetOf(NativeResult, "pushed_frames"), .rax);
                         const nreg: i32 = t.anchor.proto.num_registers;
-                        if (trace_code.anchorKind(t.anchor.pc) == .head) {
-                            // Shift onto the pushed callee and re-enter this head.
-                            try a.addRegImm32(.rdi, nreg);
-                            try a.addRegImm32(.rsi, nreg * 8);
-                            try a.movMemImm32(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 0);
-                            try a.jmp(body_entry);
-                        } else if (shared_exit) |se| {
+                        if (shared_exit) |se| {
                             // A continuation push is committed only when its
                             // cross-page head link is live. Otherwise undo is
                             // impossible, so the helper must not have been called.

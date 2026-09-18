@@ -1691,7 +1691,7 @@ demotions in trace.zig, compiler-adjudicated). Deferred items:
       (run the eq trace pre-capture and post-restore and compare), rather
       than the simulated same-id/different-address twin.
 
-## Recurring jit-debug test-gate flake (6 occurrences, 2 days)
+## Recurring jit-debug test-gate flake (7 occurrences, 2 days)
 
 - [ ] Hunt the nondeterministic `zig build test -Djit-debug=true` failure:
       2026-09-17 seed 0x3ace15b0, 2026-09-18 seed 0x34eef2f0, 2026-09-18
@@ -1731,3 +1731,15 @@ demotions in trace.zig, compiler-adjudicated). Deferred items:
       retry). Same `guard-dedup ref=5 op=guard_int ir_len=1617` spam
       as occurrence 5. Three immediate log-captured re-runs: exit 0,
       0 failures each.
+- [ ] Occurrence 7 (2026-09-18, doc 54 P0 inline-push gate, seed
+      0xc31dfac5, binary 54e1dcbe…): failed once (`failed command:
+      …/54e1dcbe…/test --seed=0xc31dfac5 --listen=-`); the failing
+      test's name was lost to a `tail -4` pipe — the FOURTH repetition
+      of the exact mistake documented three times above. Same
+      `guard-dedup … ir_len=1617` spam. Direct re-run of the failing
+      binary with the SAME seed: all 1411 tests pass; three further
+      log-captured full-gate runs: exit 0 each (5 consecutive passes).
+      Extra scrutiny applied because this gate contained fresh native
+      codegen (doc 54 P0 inline push) — profile matches the
+      pre-existing flake (jit-debug only, not seed-deterministic), but
+      the P0 sabotage battery should re-check this once landed.

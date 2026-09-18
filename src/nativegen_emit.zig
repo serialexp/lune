@@ -783,6 +783,173 @@ pub fn emitForcedYieldCheck(a: *x64.Assembler, shared_exit: usize) !void {
     a.bind(do_jmp);
 }
 
+/// Doc 54 P0: everything the inline self-call push needs that is knowable at
+/// commit time. `callee_slot`/`nargs`/`ret_count` are the `.call`
+/// instruction's a/b/c fields (statically eligible: `.call`, `b !=
+/// all_results`, non-vararg proto, `term_aux` in bounds — checked by the
+/// caller, so they are plain immediates here); `proto_addr` is the baked
+/// `t.anchor.proto` the callee guard pins against (pointer identity, exactly
+/// the helper's `cl.proto != proto` — proto-not-closure-identity, so a
+/// same-proto different-upvalue closure descends with ITS OWN closure
+/// pointer in the frame).
+pub const InlineSelfPush = struct {
+    callee_slot: u16,
+    nargs: u16,
+    ret_count: u16,
+    term_aux: i32,
+    num_params: u8,
+    nreg: i32,
+    proto_addr: u64,
+};
+
+/// Doc 54 P0: the inline same-page self-call frame push — the emitted twin of
+/// `interp.nativeSelfCallPush` for HEAD pages, replacing the C-ABI callout.
+/// Emitted between the terminal's slot flush and the plain terminal exit;
+/// every check the helper re-derived per push is now either an emit-time
+/// constant (static eligibility, the caller's job), the per-episode
+/// `descent_ok` byte (receipts inert ∧ no pending reg-top ∧ no final cut),
+/// or one of the inline walls below. "Decline" = `jne/ja` to `decline`
+/// (the plain terminal exit) with NOTHING mutated — every store sits after
+/// the last wall, the helper's own ordering.
+///
+/// Register bracket: rdi/rsi (lanes), rdx (`*NativeResult`), rbx (cumulative
+/// counter) are the only live registers at a terminal epilogue (homes just
+/// flushed); rax/rcx/r8-r11 are dead scratch. Allocation here: r9 = `&ctx`,
+/// r8 = `*Vm` (loaded per push — `Vm` is movable, never baked), r11 = the
+/// guarded callee closure (header == closure address, asserted in
+/// `nativegen_layout`), rcx = caller base then callee base, rax = frame
+/// pointer then depth, r10 = scratch / the new frame's `call_seq`.
+///
+/// On the taken path this replicates `opCall`'s Lua-closure arm byte-for-
+/// byte in VM-state effect: caller one-past-call cursor freeze, callee
+/// window init (params copied, rest nil with zero payloads — `fillNil`
+/// parity), the `pushFrameVararg` frame write (including the doc-20
+/// code-cache invalidation via the `CODE_CACHE_GEN_INVALID` qword and the
+/// `call_seq` mint), depth/stack_top, `setRegionContext`'s three stores,
+/// the call-entry tick, the episode-ctx refresh, and the
+/// `self_call_pushes` witness — then bumps `pushed_frames`, resets
+/// `linked_loop_done` (ordinary-entry replica), shifts the lanes onto the
+/// pushed window and re-enters `body_entry`.
+pub fn emitInlineSelfPush(
+    a: *x64.Assembler,
+    ctx: *const trace_code.NativeSeedCtx,
+    abi: trace_code.FrameMotionAbi,
+    p: InlineSelfPush,
+    body_entry: x64.Label,
+    decline: x64.Label,
+) !void {
+    const Ctx = trace_code.NativeSeedCtx;
+    // -- step 1: episode descent gate ------------------------------------
+    try a.movRegImm64(.r9, @bitCast(@as(u64, @intFromPtr(ctx))));
+    try a.cmpByteMemImm(.r9, @offsetOf(Ctx, "descent_ok"), 1);
+    try a.jcc(.ne, decline);
+    try a.movRegMem(.r8, .r9, @offsetOf(Ctx, "vm"));
+    // -- step 2: callee guard (tag, object type, proto pin) --------------
+    const cs: i32 = p.callee_slot;
+    try a.cmpByteMemImm(.rdi, cs, TAG_HEAP);
+    try a.jcc(.ne, decline);
+    try a.movRegMem(.r11, .rsi, cs * 8);
+    try a.cmpByteMemImm(.r11, HEADER_TYPE_OFF, layout.FUNCTION_TYPE);
+    try a.jcc(.ne, decline);
+    try a.movRegMem(.r10, .r11, layout.CLOSURE_PROTO_OFF);
+    try a.movRegImm64(.rax, @bitCast(p.proto_addr));
+    try a.cmpRegReg(.r10, .rax);
+    try a.jcc(.ne, decline);
+    // -- step 3: walls (depth, register capacity, call_seq space) --------
+    try a.cmpDwordMemImm(.r8, abi.vm_depth_off, abi.max_call_depth);
+    try a.jcc(.ae, decline);
+    // callee_base + nreg = ctx.base + 2*nreg must fit the slab.
+    try a.movRegMem(.rcx, .r9, @offsetOf(Ctx, "base"));
+    try a.movRegReg(.r10, .rcx);
+    try a.addRegImm32(.r10, p.nreg * 2);
+    try a.cmpRegMem(.r10, .r9, @offsetOf(Ctx, "reg_capacity"));
+    try a.jcc(.a, decline);
+    // next_call_seq == maxInt(u64) → decline (tier-0 re-runs and panics).
+    try a.cmpQwordMemImm8(.r8, abi.vm_next_call_seq_off, -1);
+    try a.jcc(.e, decline);
+    // -- step 4: caller one-past-call resume-cursor freeze ---------------
+    // rax = &frames[depth-1] (byte address; frame_size is not a power of
+    // two, so multiply through a scratch immediate).
+    try a.movRegMem32(.rax, .r8, abi.vm_depth_off);
+    try a.subRegImm32(.rax, 1);
+    try a.movRegImm64(.r10, abi.frame_size);
+    try a.imulRegReg(.rax, .r10);
+    try a.addRegReg(.rax, .r8);
+    try a.addRegImm32(.rax, abi.vm_frames_off);
+    try a.movMemImm32(.rax, abi.frame_pc_off, p.term_aux + 1);
+    // -- step 5: callee window init (fully unrolled) ---------------------
+    // Destination slot j lives at lane offset nreg+j of the CURRENT window
+    // (window adjacency: callee_base = base + nreg). Copy bound params from
+    // caller slots callee_slot+1+j; nil-fill the rest with zero payloads
+    // (`fillNil`/`Value.nil()` parity — byte-identical slab bytes).
+    var j: i32 = 0;
+    while (j < p.nreg) : (j += 1) {
+        const dst = p.nreg + j;
+        if (j < p.num_params and j < p.nargs) {
+            const src = cs + 1 + j;
+            try a.movzxRegMem8(.r10, .rdi, src);
+            try a.movByteMemReg(.rdi, dst, .r10);
+            try a.movRegMem(.r10, .rsi, src * 8);
+            try a.movMemReg(.rsi, dst * 8, .r10);
+        } else {
+            try a.movByteMemImm(.rdi, dst, TAG_NIL);
+            try a.movMemImm32(.rsi, dst * 8, 0);
+        }
+    }
+    // -- step 6: the frame write at frames[depth] ------------------------
+    try a.addRegImm32(.rax, abi.frame_size); // rax = &frames[depth]
+    try a.movMemReg(.rax, abi.frame_closure_off, .r11);
+    // ret wiring first: r10 doubles as the u16 immediate stage before it
+    // takes the minted call_seq.
+    try a.movRegImm64(.r10, p.ret_count);
+    try a.storeMemReg(.rax, 2, abi.frame_ret_count_off, .r10);
+    try a.movRegImm64(.r10, p.callee_slot);
+    try a.storeMemReg(.rax, 2, abi.frame_ret_dest_off, .r10);
+    // call_seq mint: frame.call_seq = next_call_seq; next_call_seq += 1.
+    try a.movRegMem(.r10, .r8, abi.vm_next_call_seq_off);
+    try a.movMemReg(.rax, abi.frame_call_seq_off, .r10);
+    try a.addRegImm32(.r10, 1);
+    try a.movMemReg(.r8, abi.vm_next_call_seq_off, .r10);
+    try a.subRegImm32(.r10, 1); // r10 = the minted call_seq, kept for step 7/8
+    try a.addRegImm32(.rcx, p.nreg); // rcx = callee_base
+    try a.movMemReg(.rax, abi.frame_base_off, .rcx);
+    try a.movMemImm32(.rax, abi.frame_pc_off, 0);
+    try a.movMemImm32(.rax, abi.frame_varargs_base_off, 0);
+    try a.movMemImm32(.rax, abi.frame_varargs_count_off, 0);
+    // Doc-20 fetch-image cache invalidation (the struct-literal default):
+    // qword -1 == CODE_CACHE_GEN_INVALID.
+    try a.movMemImm32(.rax, abi.frame_code_cache_gen_off, -1);
+    // ctx.base refresh now, while rcx still holds callee_base (step 8's
+    // base half, hoisted — nothing observes ctx mid-sequence).
+    try a.movMemReg(.r9, @offsetOf(Ctx, "base"), .rcx);
+    // -- step 7: depth, stack_top, region context, tick ------------------
+    try a.movRegMem32(.rax, .r8, abi.vm_depth_off);
+    try a.addRegImm32(.rax, 1);
+    try a.movMemReg32(.r8, abi.vm_depth_off, .rax); // rax = new depth
+    try a.addRegImm32(.rcx, p.nreg); // rcx = callee_base + nreg = new stack_top
+    try a.movMemReg(.r8, abi.vm_stack_top_off, .rcx);
+    // setRegionContext(new_depth, call_seq): payload dword + qword, then
+    // the validity byte (doc 54 P0 field split).
+    try a.movMemReg32(.r8, abi.vm_region_depth_off, .rax);
+    try a.movMemReg(.r8, abi.vm_region_call_seq_off, .r10);
+    try a.movByteMemImm(.r8, abi.vm_region_valid_off, 1);
+    // tickCallEntry: tick +%= 1 (success only, after the push — tier-0 order).
+    try a.incMemQword(.r8, abi.vm_tick_off);
+    // -- step 8: episode-ctx refresh (closure + call_seq; base done above,
+    // proto/reg_capacity/vm/descent_ok episode-invariant) ----------------
+    try a.movMemReg(.r9, @offsetOf(Ctx, "closure"), .r11);
+    try a.movMemReg(.r9, @offsetOf(Ctx, "call_seq"), .r10);
+    // -- step 9: witnesses, lane shift, re-entry -------------------------
+    try a.incMemQword(.r8, abi.vm_self_call_pushes_off);
+    try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "pushed_frames"));
+    try a.addRegImm32(.rax, 1);
+    try a.movMemReg(.rdx, @offsetOf(NativeResult, "pushed_frames"), .rax);
+    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 0);
+    try a.addRegImm32(.rdi, p.nreg);
+    try a.addRegImm32(.rsi, p.nreg * 8);
+    try a.jmp(body_entry);
+}
+
 /// B-3a's unreachable silent tail. `metadata_cell` is a stable compile-time-owned
 /// pointer cell; B-3b publishes a `*SilentExitMetadata` into it before patching.
 pub fn emitSilentEpilogue(a: *x64.Assembler, kind: ExitPatchKind, metadata_cell: *usize, shared_exit: usize, trace_id: u32) !void {

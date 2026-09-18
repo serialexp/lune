@@ -5496,6 +5496,156 @@ test "push helper refusal matrix (doc 44 D11): every wall declines with nothing 
     try testing.expectEqual(vm.frames[1].call_seq, ctx.call_seq);
 }
 
+test "inline push formation (doc 54 P0): head-page descents survive with the cont helper removed" {
+    // The P0 formation proof. `self_call_pushes` is bumped by BOTH the
+    // inline head-page sequence and the cont-page runtime helper, so the
+    // plain witness cannot distinguish them. Removing the helper fn from
+    // the ctx BEFORE any trace commits makes cont pages emit no push
+    // epilogue at all (their `self_call_push_fn` gate) — every remaining
+    // push must have come from the emitted inline sequence. sum(150)'s
+    // linear recursion descends ~149 frames per call from the HEAD page's
+    // own terminal (after the first push, execution re-enters the same
+    // head body), so the witness stays well above 100 on the inline path
+    // alone. Native-only: the push epilogue is a nativegen lowering.
+    if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.registry.native_seed_ctx.?.self_call_push_fn = null;
+    const source =
+        \\local function sum(n)
+        \\  if n == 0 then return 0 end
+        \\  return n + sum(n - 1)
+        \\end
+        \\local s = 0
+        \\for i = 1, 5 do s = s + sum(150) end
+        \\print(s)
+    ;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = true;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.hotcall = 4;
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings("56625\n", sink.buffered());
+    try testing.expect(vm.trace.self_call_pushes >= 100);
+}
+
+test "fail-closed compilation (doc 54 P0): absent frame_abi emits no push epilogue" {
+    // Sabotage the emission gate: with `frame_abi` null (a hand-built-ctx
+    // world) AND the cont helper removed, NO page may carry a push
+    // epilogue — the compiled traces run their plain terminal exits and
+    // tier-0 executes every call generically. Output stays exact and the
+    // witness stays at zero. This is the fail-closed half of the P0
+    // contract (an absent descriptor can never miscompile, only decline).
+    if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.registry.native_seed_ctx.?.self_call_push_fn = null;
+    vm.trace.registry.native_seed_ctx.?.frame_abi = null;
+    const source =
+        \\local function sum(n)
+        \\  if n == 0 then return 0 end
+        \\  return n + sum(n - 1)
+        \\end
+        \\local s = 0
+        \\for i = 1, 5 do s = s + sum(150) end
+        \\print(s)
+    ;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = true;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.hotcall = 4;
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings("56625\n", sink.buffered());
+    try testing.expectEqual(@as(u64, 0), vm.trace.self_call_pushes);
+}
+
+test "descent gate publication (doc 54 P0): prepareNativeEpisode computes descent_ok from all three conjuncts" {
+    // The descent-gate half of the sabotage protocol. The inline sequence
+    // replaced the helper's per-push `receiptsInert()`/`reg_top_pending`/
+    // `final_cut` re-derivation with the per-episode `descent_ok` byte, so
+    // break each replaced conjunct and prove the publication bites. This
+    // is deliberately a UNIT matrix over `prepareNativeEpisode`: at
+    // integration level a healthy single run can never see `descent_ok=0`
+    // (that is exactly the episode-invariance the design leans on — the
+    // top-level epoch resets region receipts before any episode, verified
+    // the hard way: a planted receipt before `run()` was wiped and 743
+    // pushes happened anyway). The emitted `cmp byte` CONSUMING the gate
+    // is pinned by the inline-push formation test (pushes require the
+    // published 1) plus the comptime `@offsetOf` the emission bakes.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var proto = Proto{
+        .code = &.{Instr{ .op = .ret }},
+        .num_registers = 2,
+        .name = "d54gate",
+    };
+    const cl = try vm.heap.newClosure(&proto, 0);
+    try vm.pushFrame(cl, 0, 0, 0);
+    const ctx = vm.trace.registry.native_seed_ctx.?;
+
+    // Clean state: all three conjuncts hold → gate open.
+    vm.prepareNativeEpisode(cl, &proto, 0);
+    try testing.expectEqual(@as(u8, 1), ctx.descent_ok);
+
+    // Live region receipts → closed; drained again → open.
+    try vm.trace.region_policy.region_profit.put(gpa, .{ .region_id = @enumFromInt(999), .activation = 1 }, .{
+        .root_frame_depth = 1,
+        .root_call_seq = 1,
+    });
+    vm.prepareNativeEpisode(cl, &proto, 0);
+    try testing.expectEqual(@as(u8, 0), ctx.descent_ok);
+    _ = vm.trace.region_policy.region_profit.remove(.{ .region_id = @enumFromInt(999), .activation = 1 });
+    vm.prepareNativeEpisode(cl, &proto, 0);
+    try testing.expectEqual(@as(u8, 1), ctx.descent_ok);
+
+    // Pending multret reg-top → closed; cleared → open.
+    vm.reg_top_pending = true;
+    vm.prepareNativeEpisode(cl, &proto, 0);
+    try testing.expectEqual(@as(u8, 0), ctx.descent_ok);
+    vm.reg_top_pending = false;
+    vm.prepareNativeEpisode(cl, &proto, 0);
+    try testing.expectEqual(@as(u8, 1), ctx.descent_ok);
+
+    // Published final cut → closed; nulled → open.
+    vm.final_cut = .{ .result_base = 0, .result_count = 0, .stack_top = 0 };
+    vm.prepareNativeEpisode(cl, &proto, 0);
+    try testing.expectEqual(@as(u8, 0), ctx.descent_ok);
+    vm.final_cut = null;
+    vm.prepareNativeEpisode(cl, &proto, 0);
+    try testing.expectEqual(@as(u8, 1), ctx.descent_ok);
+}
+
 test "ret pop formation (doc 44 D12c): fused descents unwind through the native pop" {
     // The pop's formation proof, symmetric to the D11 push witness: output
     // equality cannot distinguish a native pop from the (slower) plain
