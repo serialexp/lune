@@ -459,7 +459,8 @@ pub fn driveChain(
             // The ≤2 scalar compatibility seam is still a complete native
             // call. Capture its ordinary ledger before any steering and settle
             // before `runLinkedBurst` can re-enter native code.
-            var provenance: NativeCallProvenance = .{};
+            var provenance: NativeCallProvenance = undefined;
+            provenance.len = 0;
             self.captureNativeCallProvenance(
                 .drive_chain_seed,
                 sresult,
@@ -617,7 +618,8 @@ pub fn driveSeedSilentResult(
         safe_to_arm,
         regs,
     ) orelse return null;
-    var provenance: NativeCallProvenance = .{};
+    var provenance: NativeCallProvenance = undefined;
+    provenance.len = 0;
     self.captureNativeCallProvenance(
         .drive_chain_seed,
         result,
@@ -1292,8 +1294,17 @@ pub fn captureSilentSuffixProvenance(
 }
 
 pub const NativeCallProvenance = struct {
-    verdicts: [PROVENANCE_VERDICT_CAP]ProvenanceVerdict = undefined,
-    len: usize = 0,
+    // NO field defaults, deliberately: `= .{}` on this struct is a trap. Once
+    // @sizeOf crossed 1 KiB (PROVENANCE_VERDICT_CAP 48 → 64, doc 52 P1) the
+    // aggregate init stopped eliding the `undefined` array and lowered to a
+    // full 1032-byte memset — one per dispatcher-ledger walk on the hot
+    // seam (~1M/run on scimark-fft: +26% wall; ~500k on nbody: +7%). Callers
+    // must init as `var p: NativeCallProvenance = undefined; p.len = 0;` —
+    // only `verdicts[0..len]` is ever read, so `len = 0` is the entire
+    // meaningful state. Same family as the by-value-return memcpy documented
+    // on captureNativeCallProvenance below.
+    verdicts: [PROVENANCE_VERDICT_CAP]ProvenanceVerdict,
+    len: usize,
 };
 
 pub const NativeCallOrigin = enum {
@@ -2603,7 +2614,8 @@ pub fn driveBurstCore(
                     regs,
                 );
                 const call_a_entries = self.ledger_scratch[0..iresult.ledger_len];
-                var provenance: NativeCallProvenance = .{};
+                var provenance: NativeCallProvenance = undefined;
+                provenance.len = 0;
                 self.captureNativeCallProvenance(.inner_call, iresult, call_a_entries, &provenance);
                 if (silent_directive) |call_a_directive| {
                     self.settleNativeCallProvenance(&provenance, safe_to_arm);
@@ -2868,7 +2880,8 @@ pub fn driveBurstCore(
                 const entries = self.ledger_scratch[0..cresult.ledger_len];
                 // Ordinary capture happens before replay; silent capture happens
                 // after the drain has staged its prefix/suffix evidence.
-                var provenance: NativeCallProvenance = .{};
+                var provenance: NativeCallProvenance = undefined;
+                provenance.len = 0;
                 self.captureNativeCallProvenance(.continuation_call, cresult, entries, &provenance);
                 const call_b_directive = silent_directive orelse self.replayLedger(
                     entries,
@@ -3059,7 +3072,8 @@ pub fn driveDispatcherLedger(
     // B-2b: capture registry-recognized edge service over the COMPLETE ledger
     // before replay can request a deferred physical disarm. Apply only after
     // replay returns, per §B.6.
-    var provenance: NativeCallProvenance = .{};
+    var provenance: NativeCallProvenance = undefined;
+    provenance.len = 0;
     self.captureNativeCallProvenance(.dispatcher_root, .{
         .completed = entries[entries.len - 1].cum,
         .exit_instr = entries[entries.len - 1].exit,
@@ -3196,7 +3210,8 @@ pub fn driveDispatcherSilentResult(
         // its ≤2 scalar seam — and left THIS origin, the one it names, with no
         // settle at all.)
         if (result.ledger_len <= 1) {
-            var provenance: NativeCallProvenance = .{};
+            var provenance: NativeCallProvenance = undefined;
+            provenance.len = 0;
             self.captureNativeCallProvenance(
                 .dispatcher_root,
                 result,
@@ -3207,7 +3222,8 @@ pub fn driveDispatcherSilentResult(
         }
         return null;
     };
-    var provenance: NativeCallProvenance = .{};
+    var provenance: NativeCallProvenance = undefined;
+    provenance.len = 0;
     self.captureNativeCallProvenance(
         .dispatcher_root,
         result,
@@ -3300,7 +3316,8 @@ pub fn driveSeedLedger(
         seed.code.anchor.pc;
     var resume_pc: u32 = seed_inner_pc;
     var hops: usize = 0;
-    var provenance: NativeCallProvenance = .{};
+    var provenance: NativeCallProvenance = undefined;
+    provenance.len = 0;
     self.captureNativeCallProvenance(.drive_chain_seed, .{
         .completed = entries[entries.len - 1].cum,
         .exit_instr = entries[entries.len - 1].exit,

@@ -506,7 +506,8 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     };
     for (native_origins) |native_origin| {
         state.provenance_edges.items[0].strikes = 2;
-        var ordinary_productive: trace.TraceState.NativeCallProvenance = .{};
+        var ordinary_productive: trace.TraceState.NativeCallProvenance = undefined;
+        ordinary_productive.len = 0;
         state.captureNativeCallProvenance(native_origin, .{
             .completed = 1,
             .exit_instr = 0,
@@ -518,7 +519,8 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
 
         state.provenance_edges.items[0].strikes = 2;
         state.stageSilentSiblingProvenance(silent_edge, 1, true, false);
-        var silent_productive: trace.TraceState.NativeCallProvenance = .{};
+        var silent_productive: trace.TraceState.NativeCallProvenance = undefined;
+        silent_productive.len = 0;
         state.captureNativeCallProvenance(native_origin, .{
             .completed = 1,
             .exit_instr = 0,
@@ -528,7 +530,8 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
         try testing.expectEqual(ordinary_reset_strikes, state.provenance_edges.items[0].strikes);
 
         state.provenance_edges.items[0].strikes = 0;
-        var ordinary_zero: trace.TraceState.NativeCallProvenance = .{};
+        var ordinary_zero: trace.TraceState.NativeCallProvenance = undefined;
+        ordinary_zero.len = 0;
         state.captureNativeCallProvenance(native_origin, .{
             .completed = 0,
             .exit_instr = 0,
@@ -540,7 +543,8 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
 
         state.provenance_edges.items[0].strikes = 0;
         state.stageSilentSiblingProvenance(silent_edge, 1, false, true);
-        var silent_zero: trace.TraceState.NativeCallProvenance = .{};
+        var silent_zero: trace.TraceState.NativeCallProvenance = undefined;
+        silent_zero.len = 0;
         state.captureNativeCallProvenance(native_origin, .{
             .completed = 0,
             .exit_instr = 0,
