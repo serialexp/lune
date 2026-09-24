@@ -1,0 +1,3 @@
+# mahina bench suite  rev=6a2b334  stamp=20260916-084304  reps=5  scale=1.0
+program	args	luajit_mode	cross	luajit_match	mahina_t0_ms	mahina_jit_ms	luajit_ms	mahina_t0_execns	mahina_jit_execns	mahina_t0_maxrss_kb	mahina_jit_maxrss_kb	luajit_maxrss_kb	mahina_jit_res_pct
+spectral-norm	200	-	ok	ok	119.812	25.924	2.496	141703710	19681192	2336	3488	2444	40.8
