@@ -1239,6 +1239,75 @@ test "provenanceEdgeVerdict: the backward suffix-max walk agrees with the forwar
     try testing.expectEqual(@as(?trace.ProvenanceAction, null), verdict(&[_]trace_exec.LedgerEntry{row.at(P, 1)}, 0, edge));
 }
 
+test "provenanceEdgeVerdict: committed completion rows are progress that cum cannot see (doc 55 §1)" {
+    // scimark-fft's last butterfly stage: the inner loop runs ONE trip per
+    // entry, so its `loop_done_linked` exit commits a full body while taking
+    // no back-edge — `cum` stays flat across the whole
+    // inner(loop_done_linked) → cont(deopt, armed) → sibling(link_terminal)
+    // → inner lap. The cum-only verdict struck that productive cycle three
+    // times and retired the arm for the rest of the run; every later lap paid
+    // a dispatcher round-trip plus a tier-0 iteration.
+    const I: u32 = 6; // one-trip inner loop page
+    const P: u32 = 7; // continuation page, armed deopt exit
+    const C: u32 = 8; // same-anchor sibling continuation
+    const edge = trace.ProvenanceEdge{ .parent_id = P, .exit_instr = 8, .child_id = C };
+    const row = struct {
+        fn at(id: u32, exit: u32, kind: trace_exec.LedgerKind, cum: usize) trace_exec.LedgerEntry {
+            return .{ .cum = cum, .id = id, .exit = exit, .reason = .normal, .kind = kind, .outcome = .normal };
+        }
+    };
+    const verdict = trace.TraceState.provenanceEdgeVerdict;
+
+    // (1) The measured fft lap, cum flat at 0 throughout: RESET, not strike.
+    const fft_lap = [_]trace_exec.LedgerEntry{
+        row.at(I, 74, .loop_done_linked, 0),
+        row.at(P, 8, .deopt, 0),
+        row.at(C, 62, .link_terminal, 0),
+        row.at(I, 74, .loop_done_linked, 0),
+        row.at(P, 8, .deopt, 0),
+    };
+    try testing.expectEqual(trace.ProvenanceAction.reset, verdict(&fft_lap, 0, edge).?);
+
+    // (2) The committing row may be the child itself.
+    const child_commits = [_]trace_exec.LedgerEntry{
+        row.at(P, 8, .deopt, 0), row.at(C, 62, .link_terminal, 0), row.at(P, 8, .deopt, 0),
+    };
+    try testing.expectEqual(trace.ProvenanceAction.reset, verdict(&child_commits, 0, edge).?);
+
+    // (3) The livelock the strike exists for is untouched: a pure deopt
+    // ping-pong commits nothing, so it still strikes.
+    const ping_pong = [_]trace_exec.LedgerEntry{
+        row.at(P, 8, .deopt, 0), row.at(C, 3, .deopt, 0), row.at(P, 8, .deopt, 0),
+    };
+    try testing.expectEqual(trace.ProvenanceAction.strike, verdict(&ping_pong, 0, edge).?);
+
+    // (4) A committing row BEFORE the matched row is not evidence for it:
+    // only the suffix after the parent's deopt counts.
+    const commit_before = [_]trace_exec.LedgerEntry{
+        row.at(I, 74, .loop_done_linked, 0),
+        row.at(P, 8, .deopt, 0),
+        row.at(C, 3, .deopt, 0),
+        row.at(P, 8, .deopt, 0),
+    };
+    try testing.expectEqual(trace.ProvenanceAction.strike, verdict(&commit_before, 0, edge).?);
+
+    // (5) Declines and prologue fails run no body — not progress.
+    const declines = [_]trace_exec.LedgerEntry{
+        row.at(P, 8, .deopt, 0),
+        row.at(C, std.math.maxInt(u32), .prologue_fail, 0),
+        row.at(P, 8, .deopt, 0),
+    };
+    try testing.expectEqual(trace.ProvenanceAction.strike, verdict(&declines, 0, edge).?);
+}
+
+test "LedgerKind.commitsGuestWork: committing kinds vs no-commit kinds" {
+    const K = trace_exec.LedgerKind;
+    for ([_]K{ .link_terminal, .loop_done_linked, .region_bridge, .head_terminal, .ret_pop, .call_push }) |k|
+        try testing.expect(k.commitsGuestWork());
+    for ([_]K{ .deopt, .prologue_fail, .seed_hash_decline, .seed_capacity_decline, .precise_deopt, .precise_error }) |k|
+        try testing.expect(!k.commitsGuestWork());
+}
+
 fn foreignEpisodeDummySeed(
     ctx: *const trace.NativeSeedCtx,
     t: *const trace.TraceCode,

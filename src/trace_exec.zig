@@ -270,6 +270,36 @@ pub const LedgerKind = enum(u32) {
     /// body exits `.precise_error`. Always terminal; the dispatcher parks the
     /// mapped error at the snapshot's `resume_pc` without re-execution.
     precise_error = 11,
+
+    /// Whether a row of this kind proves the burst COMMITTED guest work at
+    /// that exit, independent of the `cum` back-edge counter. `cum` counts
+    /// only taken loop back-edges, so a segment that ran a body and then
+    /// committed through a completion exit — a one-trip loop's
+    /// `loop_done_linked`, a continuation page's `link_terminal` — advances
+    /// the guest while leaving `cum` flat. Zero-progress detectors must
+    /// count these rows as progress (doc 55 §1). Conservative: a kind that
+    /// commits nothing (`.deopt` re-runs its iteration in tier 0; the
+    /// declines run no body) or only commits partially (`.precise_*`) is
+    /// NOT proof. A `.deopt` row proves progress on its own only through
+    /// `cum`; the detector still credits a later committing row in its suffix.
+    pub fn commitsGuestWork(self: LedgerKind) bool {
+        return switch (self) {
+            .link_terminal,
+            .loop_done_linked,
+            .region_bridge,
+            .head_terminal,
+            .ret_pop,
+            .call_push,
+            => true,
+            .deopt,
+            .prologue_fail,
+            .seed_hash_decline,
+            .seed_capacity_decline,
+            .precise_deopt,
+            .precise_error,
+            => false,
+        };
+    }
 };
 
 /// 2.3c-2c (doc 17): what a chain-source exit DID with its (possibly armed) slot —

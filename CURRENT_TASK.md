@@ -75,6 +75,41 @@ the ones that bite):
   before declaring it hard; "replay/determinism forbids it" only ever means
   *adapt* the mechanism (ids not addresses, deterministic counters).
 
+## Status 2026-09-24 (latest+26) — NEW ARC: scimark-fft (weakest bench, 23.3× LJ), doc 55 §1 LANDED (fft → 14.6×); §2/§3 next
+
+Bart picked fft over doc 54 P3 (P3 stays outstanding in doc 54). The
+record is `docs/design/55-fft-nest-cycle-residency.md`.
+
+**Finding (Z-8 ladder).** The fft nest traces all exist and are armed as one
+cycle: t6 inner `:131` →loop_done_linked→ t7 `:193` →deopt ei=8,
+sibling_handoff→ t8 `:193` →link_terminal→ t6. Two zero-progress detectors
+each judge it dead:
+1. **§1 (fixed in tree).** `provenanceEdgeVerdict` measures progress by
+   `cum` (back-edges) only. The last butterfly stage has one-trip inner
+   loops, so cum stays flat and the edge is retired permanently after 3
+   strikes. Fix: `LedgerKind.commitsGuestWork()` plus a `suffix_commits`
+   bit. Tests are in `trace_provenance_test.zig`. Result: entries 1.02M →
+   100k, follows 8k → 924k, fft A/B 363 → 252 ms, board 393 → 243 ms, no
+   regressions (binary-trees +6% on the board is noise; interleaved A/B
+   shows it faster). `just test` green; jit-debug gate exit 0.
+2. **§2 (open).** The region activation closes after EVERY t6
+   loop_done_linked row (`region: close rid=0 ... work=1`, new probe). That
+   gives 8 window-strikes, then a fallback-owner tombstone during warm-up,
+   so there's no silent promotion and rows mode costs 30.6% of the run.
+   Next step: pin which close site fires and which membership lookup fails.
+   Also: the silent epilogue has its own cum-only productive definition,
+   which must be reconciled.
+3. **§3 (open).** The bitreverse peeled traces are 43% of the run and ~0%
+   traced (doc 40 fusion exclusion + `low_trip_while`).
+
+**Review:** Codex is out of credits until 2026-09-29. At Bart's direction,
+Antigravity reviewed §1: APPROVED, no blockers. §1 is committed; a codex
+re-review is still owed. Antigravity also gave a §2 lead: the close fires in
+`applyDestination` because t7 is not in the region's `member_trace_ids`, so
+`dest_entry_regions` misses it. Verify that first. Baseline shadow:
+`/tmp/lune_d55_base` (HEAD `1c5d1fb`). New dbg probes: `provenance-retire:`,
+`region: close`.
+
 ## Status 2026-09-19 (latest+25) — doc 54 P2 + AMENDMENT LANDED: fib 171.6→~81-87 ms, 24.7×→~10× LJ; episodes 925k→2.3k (task #43)
 
 **The latest+24 block below is resolved.** Bart chose "amend doc 54 + codex

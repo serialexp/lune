@@ -322,6 +322,7 @@ fn applyWindowDecision(self: *TraceState, key: RegionKey, work: u64, decision: @
 
 pub fn closeRegion(self: *TraceState, key: RegionKey) void {
     const close = self.region_policy.beginClose(key, self.config.min_useful) orelse return;
+    self.dbg("region: close rid={d} activation={d} work={d}", .{ @intFromEnum(key.region_id), key.activation, close.work });
     applyWindowDecision(self, key, close.work, close.window);
     const survived = self.demotePromotionsForRegion(key);
     // Instability recovery: a promotion that lived until the activation's own
@@ -1011,10 +1012,14 @@ pub fn provenanceEdgeVerdict(
     if (entries.len < 2) return null;
     var saw_strike = false;
     var suffix_max: usize = entries[entries.len - 1].cum;
+    var suffix_commits: bool = entries[entries.len - 1].kind.commitsGuestWork();
     var k: usize = entries.len - 1;
     while (k > 0) {
         k -= 1;
-        // Invariant: `suffix_max` is the maximum cum over `entries[k+1..]`.
+        // Invariant: `suffix_max` is the maximum cum over `entries[k+1..]`,
+        // and `suffix_commits` is whether any row in `entries[k+1..]` is a
+        // committing kind — progress `cum` cannot see (a one-trip loop's
+        // `loop_done_linked`, a continuation's `link_terminal`).
         row: {
             const e = entries[k];
             if (e.id != edge.parent_id or e.exit != edge.exit_instr or
@@ -1023,7 +1028,7 @@ pub fn provenanceEdgeVerdict(
                 break :row;
             const prior_cum: usize = if (k == 0) initial_cum else entries[k - 1].cum;
             const local = e.cum - prior_cum;
-            if (local != 0 or suffix_max > e.cum) return .reset;
+            if (local != 0 or suffix_max > e.cum or suffix_commits) return .reset;
             var j = k + 2;
             while (j < entries.len) : (j += 1) {
                 if (entries[j].id == edge.parent_id and entries[j].cum == e.cum) {
@@ -1033,6 +1038,7 @@ pub fn provenanceEdgeVerdict(
             }
         }
         suffix_max = @max(suffix_max, entries[k].cum);
+        suffix_commits = suffix_commits or entries[k].kind.commitsGuestWork();
     }
     return if (saw_strike) .strike else null;
 }
@@ -1057,6 +1063,9 @@ pub fn applyProvenanceVerdicts(self: *TraceState, verdicts: []const ProvenanceVe
                 const edge = &self.provenance_edges.items[idx];
                 edge.strikes +|= 1;
                 if (edge.strikes < self.config.max_edge_strikes) continue;
+                self.dbg("provenance-retire: t={d} ei={d} -> t={d} strikes={d}", .{
+                    edge.parent_id, edge.exit_instr, edge.child_id, edge.strikes,
+                });
                 var link_idx = self.registry.native_physical.armedLinks().len;
                 while (link_idx > 0) {
                     link_idx -= 1;
