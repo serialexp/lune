@@ -1,6 +1,6 @@
 # 56 — Exit-started side traces (LuaJIT's side-trace mechanism) — Design
 
-Status: Phase 0 in progress. Revision 5. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED. All findings are folded in. Bart ruled not to wait for Codex.
+Status: Phase 0 in progress; design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
 Owner: Bart
 Last updated: 2026-09-24
 
@@ -36,6 +36,8 @@ consumes yet, so every program's output and trace set stays identical.
   majors and one minor, all verified. They led to revision 5's
   structural change: exit-side traces are continuation traces, and
   there is no new anchor kind. Dispositions are in §14.
+- [x] **Design review round 5 (same sub-agent): APPROVE WITH CHANGES.**
+  One major, one minor, one nit, all verified and folded in (§15).
 - [x] **Phase 0 — baselines.**
   - **Board** (`bench/results/20260924-184058-e587e28.tsv`): fft 205.9
     ms, 12.8× LJ.
@@ -83,6 +85,11 @@ consumes yet, so every program's output and trace set stays identical.
   - Tests:
     - one continuation at a pc serves both a loop-done arrival and an
       exit arrival (the bit-reverse post-`while` pc);
+    - `anchor_abs_base` is correct for an exit arrival (R5-F1);
+  - Update the loop-done-only comments on `pending_exit_anchor`
+    (`trace.zig:1565-1572`), on `pending_replay_anchor`
+    (`trace.zig:1589-1591`) and on dispatch step (9)
+    (`interp.zig:2692-2696`) now that there are two producers (R5-F3).
     - `exit_counts`, want bits and DONE latches are charged once per
       receipt on each tier's leg (round 3, unverified item).
 - [ ] **Phase 4 — native exit adapters.**
@@ -414,7 +421,19 @@ there. There is no re-run and no ambiguity.
   at `P`, and dispatch step (9) (`maybeStartContinuation`,
   `interp.zig:2698`) starts the recording there, before the mirror, so
   `P`'s instruction is the trace's first op. This is exactly how a
-  loop-done continuation starts today. Entry state is the freshly
+  loop-done continuation starts today. The same site also sets the
+  companion `pending_anchor_base` to the resuming frame's absolute slab
+  base (the frame the exit left, i.e. the parent's anchor frame).
+  `maybeStartContinuation` seeds `anchor_abs_base` from it
+  (`trace_link.zig:231`). Today only the back-edge writes it, just
+  before `onBackEdge` (`interp.zig:6314`), so a stale value from an
+  unrelated back-edge is a real hazard. A base that is too low only
+  over-aborts. A base that is too high (say, a deeper callee's) would
+  send a truly aliased open upvalue down the "safe outer read" path in
+  `recUpvalSlotAlias` (`trace_recorder.zig:4810-4920`), which is a
+  soundness bug (review round 5, R5-F1). A Phase 3 test mirrors the
+  `anchor_abs_base` regression in `trace_link_peel_test.zig:256-267`,
+  but arriving through an exit. Entry state is the freshly
   materialized slab. Slots load lazily with type guards, and the
   parent's snapshot is not replayed into the recorder (that belongs to
   register inheritance, deferred).
@@ -557,6 +576,11 @@ only their map entry.
 - **`ArmKind.exit_side`.** The registry records the arm so that
   `resetLinksTouching` and retirement work as for every kind.
   Validation requires:
+  - the parent is loop-anchored: `head_parent` is refused, as for every
+    non-sibling kind (doc 44 D10: one-shot slots carry only
+    `sibling_handoff` arms; `trace_link.zig:1664`). `noteTakenExit`
+    already sends one-shot exits elsewhere first; this is the funnel's
+    own check (review round 5, R5-F2);
   - the parent exit is attachable;
   - the child is a `.link`-tailed continuation anchored at the raw
     `(proto, P)` of the exit's resume pc, and not peeled;
@@ -953,3 +977,22 @@ test). The `link_terminal` reuse was verified sound.
    `trace_exec.zig:285`). §4.8 now has a table with the value and
    reason at each site, and tests for rowed/silent agreement and for
    strike behaviour.
+
+## 15. Review round 5 (same sub-agent, 2026-09-24): APPROVE WITH CHANGES, dispositions
+
+Receipt: `docs/reviews/doc56/subagent-r5.md`. R4-F1/F2/F3 were marked
+RESOLVED. The continuation equivalence was attacked at every layer and
+verified sound:
+- `maybeStartContinuation` never asks why the anchor is pending;
+- `continuationReachesEnclosingBackEdge` works for exits, including
+  nested ones;
+- region membership is purely structural (no `ArmKind` in
+  `trace_region_topology_build.zig`), so no fifth accounting site.
+
+1. **MAJOR (R5-F1) — `pending_anchor_base` must be set at the exit
+   site too.** Verified (`trace_link.zig:231`, `interp.zig:6314`).
+   §4.4 now requires it, with the reason and a Phase 3 test.
+2. **MINOR (R5-F2) — the arm funnel's `head_parent` refusal.**
+   Verified (`trace_link.zig:1664`). Added to §4.6's validation list.
+3. **NIT (R5-F3) — loop-done-only comments on `pending_exit_anchor`
+   and its neighbours.** Added to Phase 3.
