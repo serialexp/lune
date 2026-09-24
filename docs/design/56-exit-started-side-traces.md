@@ -1,6 +1,6 @@
 # 56 — Exit-started side traces (LuaJIT's side-trace mechanism) — Design
 
-Status: Phase 0 in progress. Revision 4. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent round 3 CHANGES REQUESTED. All findings are folded in. Bart ruled not to wait for Codex.
+Status: Phase 0 in progress. Revision 5. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED. All findings are folded in. Bart ruled not to wait for Codex.
 Owner: Bart
 Last updated: 2026-09-24
 
@@ -32,6 +32,10 @@ consumes yet, so every program's output and trace set stays identical.
   REQUESTED.** One blocker, two majors, one minor, one nit, one
   phase-plan gap, all accepted and verified in source. Dispositions are
   in §13. Bart ruled not to wait for Codex (out until 09-29).
+- [x] **Design review round 4 (same sub-agent): CHANGES REQUESTED.** Two
+  majors and one minor, all verified. They led to revision 5's
+  structural change: exit-side traces are continuation traces, and
+  there is no new anchor kind. Dispositions are in §14.
 - [x] **Phase 0 — baselines.**
   - **Board** (`bench/results/20260924-184058-e587e28.tsv`): fft 205.9
     ms, 12.8× LJ.
@@ -70,13 +74,15 @@ consumes yet, so every program's output and trace set stays identical.
   - `irinterp` materializes at an attached or wanted guard.
   - The dispatcher resumes tier-0 at `P`, with recording when a side
     trace is wanted.
-  - New `.exit_side` recorder kind and `AnchorKind.exit`, closing by
-    linking to a loop anchor's trace.
+  - Exit-side traces are ordinary `.continuation` recordings at the raw
+    `(proto, P)`, started through `pending_exit_anchor` (§4.4). There is
+    no new anchor or recorder kind.
   - Commit with `(parent, exit)` provenance and a DONE latch, bounded by
-    `tryside` and `maxside`.
+    `tryside` and `maxside`. A wanted exit binds to an existing matching
+    continuation at `P` instead of recording.
   - Tests:
-    - `.exit` anchors are never picked by `findLinkTrace`,
-      `resolveLoopDoneCont` or `findLoopTrace`;
+    - one continuation at a pc serves both a loop-done arrival and an
+      exit arrival (the bit-reverse post-`while` pc);
     - `exit_counts`, want bits and DONE latches are charged once per
       receipt on each tier's leg (round 3, unverified item).
 - [ ] **Phase 4 — native exit adapters.**
@@ -84,12 +90,11 @@ consumes yet, so every program's output and trace set stays identical.
     exit first becomes hot: materialize, then jump through a data cell
     to either the child's entry or the resume-at-`P` return.
   - `ArmKind.exit_side` and its `arm` validation.
-  - A `.exit` child's prologue failure resumes tier-0 at `P`.
+  - A child's prologue failure resumes tier-0 at `P` (its anchor), as
+    for any continuation.
 - [ ] **Phase 5 — ledger grammar and accounting.** `LedgerKind.exit_side`
   rows, the replay grammar, and completion attribution.
 - [ ] **Phase 6 — regions and silent promotion.**
-  - First, on its own with a board A/B: owner election compares decoded
-    pcs (`entryPc`), not tagged ones (§4.8).
   - `exit_side` edges and the side trace's `.link` back are
     intra-iteration edges of the parent's loop region.
   - A new `SilentSiteKind.exit_side`, so the steady cycle promotes and
@@ -403,34 +408,70 @@ there. There is no re-run and no ambiguity.
   - Tier-1a: a wanted bit is set on the exit.
   - Exits that already have a live arm keep it (Q5, §4.9).
 - **Next firing.** The exit materializes (§4.1) and returns
-  `ExitReason.exit_side {parent, exit, P}`. The dispatcher arms a
-  `.exit_side` recording anchored at `(proto, P)` and resumes tier-0 at
-  `P`, following the `.precise_resume` precedent. Entry state is the
-  freshly materialized slab. Slots load lazily with type guards, like
-  any root, and the parent's snapshot is not replayed into the recorder
-  (that belongs to register inheritance, deferred).
-- **Anchor.** A new `AnchorKind.exit`, encoded like cont anchors with a
-  pc tag bit: `EXIT_PC_BIT = 1 << 30` in `trace_code.zig`, next to
-  `CONT_PC_BIT = 1 << 31` and `FUNC_HEAD_PC`. `anchorKind`, `entryPc`
-  and the `trace` module's `anchorKind` decode it, and the compiler's
-  length contract tightens from `resume_pc < 2^31` to `< 2^30`. Its
-  anchor-coherent contract is coherence at `P`, so an
-  exit-side trace's **own** exits deopt and resume at `P` under today's
-  rules, with no special casing. It sinks its own stores the normal
-  way. It is one-shot: it never loops to itself.
-- **Close.** Reaching a back-edge or loop header whose anchor has a
-  usable trace closes it as `.link` to that anchor. That is usually the
-  parent's loop; it can be an inner loop with a root. Peeled targets
-  are refused (review finding 5: a peeled trace's entry guards are its
-  run-once iteration's types), so the loop is unrolled instead.
-  Interpreted loops are unrolled up to a deterministic
-  `exit_side_unroll` (LuaJIT: 15), then abort (`LUNROLL`). Leaving the
-  anchor frame aborts in v1.
+  `ExitReason.exit_side {parent, exit, P}`. The dispatcher sets
+  `pending_exit_anchor = (proto, P)` and resumes tier-0 at `P`,
+  following the `.precise_resume` precedent. Tier-0's first dispatch is
+  at `P`, and dispatch step (9) (`maybeStartContinuation`,
+  `interp.zig:2698`) starts the recording there, before the mirror, so
+  `P`'s instruction is the trace's first op. This is exactly how a
+  loop-done continuation starts today. Entry state is the freshly
+  materialized slab. Slots load lazily with type guards, and the
+  parent's snapshot is not replayed into the recorder (that belongs to
+  register inheritance, deferred).
+- **An exit-side trace IS a continuation trace** (revision 5, replacing
+  revision 4's `AnchorKind.exit`). A loop-done continuation (doc 15,
+  doc 38) is:
+  - a `.continuation` recording;
+  - anchored at the raw `(proto, pc)` of a non-header pc;
+  - entered with the slab coherent at that pc;
+  - closed by `.link` at the enclosing loop's back-edge.
+
+  An exit-side trace has exactly that contract, so it is recorded,
+  stored, selected and linked as one. Only the way it is *entered*
+  (from a mid-body exit through an adapter) is new. What this buys:
+  - **Sharing across arrival kinds.** One trace at `P` serves both
+    loop-done arrivals and exit arrivals. In bit-reverse, the
+    post-`while` pc `j = j + k` is both the `:55` loop's done pc and the
+    resume pc of t1's ei 60/65/70.
+  - **The anchor-kind sites stay as they are.** About 30 sites branch on
+    the anchor kind (`!= .loop` / `== .cont`, the entry-patch switches
+    in `trace_entry_registry.zig:101-138`, the precise-retry threshold
+    at `trace.zig:3619`). A new kind would fall into their one-shot
+    branches silently, including the `head_parent` sibling-only arm
+    restriction (`trace_link.zig:1664`) and the head-sibling want in
+    `noteTakenExit` (`trace_link.zig:355`). With continuation anchors
+    none of them change (review round 4, R4-F1/F2).
+  - **Their own exits** deopt and resume at `P` under today's rules.
+    Their hot exits go through today's `.loop`-kind routes, including,
+    once §4.9 lands, exit-side routing for their own attachable exits.
+    Those become nested side traces (LuaJIT's T5 off T3).
+  - **No entry patch unless one is warranted.** `resolvePatchPc` scans
+    for a back-edge targeting `P`, and a non-header `P` has none, so no
+    tier-0 entry patch is installed. As in LuaJIT, a side trace is
+    entered only from its parents.
+
+  Attachability adds the continuation's own static gate:
+  `continuationReachesEnclosingBackEdge(proto, P, parent anchor)`
+  (`trace_link.zig:185`). If `P` is itself a loop header, the exit is
+  not attachable in v1: the target would be that loop's root, a
+  different arm shape.
+- **Close.** The `.continuation` recorder's existing grammar. It closes
+  `.link` at the enclosing loop's back-edge (usually the parent's loop),
+  or at an inner while-loop with a root (`recWhileLink`). Peeled
+  targets are refused (review finding 5: a peeled trace's entry guards
+  are its run-once iteration's types), so the loop is unrolled instead.
+  Leaving the anchor frame aborts, as it does for continuations today.
 - **Commit.** The trace commits with provenance
   `ProvenanceEdge{parent, exit, child}`. `finishSideTraceProvenance`
   today requires the same anchor; it grows a cross-anchor branch. The
   commit DONE-latches `parent.exit_counts[exit]` and points the exit's
   cell at the child.
+- **An existing continuation at `P`.** When the exit is wanted and a
+  continuation already exists at `P` whose entry fingerprint matches
+  the exit's static types (§4.5), the exit binds to it with no
+  recording. That replaces `maybeArmContinuation`'s "has trace →
+  refuse" (`trace_link.zig:175`) for this path. A barred `P`
+  (`recordingBarred`) is treated like an abort: it uses up a retry.
 - **Retries and caps.** An abort is not a strike (LuaJIT). The exit
   stays wanted, so its next firings still resume at `P`, which is never
   worse than re-running from the anchor. At `hotexit + tryside` the want
@@ -517,8 +558,8 @@ only their map entry.
   `resetLinksTouching` and retirement work as for every kind.
   Validation requires:
   - the parent exit is attachable;
-  - the child is `.exit`-anchored at the exit's resume pc and not
-    peeled;
+  - the child is a `.link`-tailed continuation anchored at the raw
+    `(proto, P)` of the exit's resume pc, and not peeled;
   - the child's entry fingerprint matches the parent's static types;
   - the child is compiled.
 
@@ -539,8 +580,8 @@ only their map entry.
   a home or the slab. `nativegen_alloc` already extends `last_use` for
   precise snapshot refs (`:795`), and the same extension applies here.
   Q3 measures the pressure; there is no parent recompilation.
-- **Prologue failure.** A `.exit` child's `prologue_fail` resumes tier-0
-  at `P`, which is its anchor. No new contract.
+- **Prologue failure.** The child's `prologue_fail` resumes tier-0 at
+  `P`, which is its anchor, as for any continuation. No new contract.
 
 ### 4.7 Tier-1a and the runtime chain (Phase 3)
 
@@ -577,8 +618,8 @@ So:
      `replayLedgerFrom` arm validates it:
      - the row's owner is the parent, and its exit is armed
        `exit_side`;
-     - the next row's owner is, by id, the child that arm names:
-       `.exit`-anchored at `(proto, P)`.
+     - the next row's owner is, by id, the child that arm names: the
+       continuation at `(proto, P)`.
 
      The arm's cursor transition is a new `ArmKind.exit_side` case in
      `applyEdgeCursorTransition`: `next_entry = .via_exit_side`,
@@ -604,42 +645,49 @@ So:
      grammar is needed here. A Phase 5 replay test pins the whole
      parent → `exit_side` → child → `link_terminal` → parent sequence,
      including a yield after each row.
-  3. **Continuation lookups skip `.exit` anchors.**
-     - `findLinkTrace`/`resolveLoopDoneCont` match on raw
-       `anchor.pc == post_pc` (`trace.zig:2374`), so a tagged `.exit`
-       anchor can never be mistaken for a continuation.
-     - `findLoopTrace` requires a `.loop` tail, which a one-shot `.exit`
-       trace never has.
+  3. **Continuation lookups see exit-side traces, on purpose.**
+     `findLinkTrace`/`resolveLoopDoneCont` (`trace.zig:2374`) will find
+     an exit-side trace at `P` when a loop's done pc is `P`. That is
+     sharing, not confusion: the entry contract (slab coherent at `P`)
+     is identical. `findLoopTrace` still never picks one (it requires a
+     `.loop` tail). A `cont = child` cursor is harmless: round 4 traced
+     every consumer of `cursor.cont` and found none that inspects its
+     value for coherence (`trace_chain.zig:1914-1926`, `2318-2407`).
+- **Accounting: four sites, two axes** (review round 4, R4-F3). A
+  `LedgerKind`/`ArmKind` variant is priced at four exhaustive switches.
+  They answer two different questions, and each needs its own explicit
+  value:
 
-     Phase 3 adds a test for both.
-- **Completions.**
-  - The parent's local completions are counted as today (`rbx`); the
-    interrupted iteration is not in them (it never reached `.loop`).
-  - The child finishes that iteration. Its `.link` is a one-shot close,
-    so its cumulative counter is 0 at the `link_terminal` row, the same
-    as a continuation's. The accounting rule is: the `exit_side` row is
-    a *committing* kind for region progress (doc 55 §2 (c)). It credits
-    the one iteration the pair completes, so the steady cycle is never
-    read as zero progress and never strikes. Coverage attributes that
-    iteration to the parent's anchor as traced. Phase 5 pins this with
-    a test comparing the native and tier-1a iteration totals on the
-    bit-reverse reduction.
+  | Site | Question it answers | `exit_side` value | Why |
+  |---|---|---|---|
+  | `region_work` switch, `trace_chain.zig:1670` | region progress (doc 55 §2 (c)) | `local + 1` | the parent's completed laps (as `.deopt` credits `local`), plus the interrupted iteration, which is committed forward from here and never re-run (the child or tier-0 finishes it from `P`) |
+  | `silentKindForArm` / `rowSilentKind`, `trace_link.zig:745`, `:907` | which silent site kind | new `SilentSiteKind.exit_side` | its own epilogue shape |
+  | `emitSilentEpilogue`, `nativegen_emit.zig:1287-1443` | the same region work, in machine code | `local + 1`, byte-for-byte the same count as row 1 | doc 55 §2 was a multi-round arc caused by the Zig count and the epilogue count disagreeing |
+  | `commitsGuestWork`, `trace_exec.zig:285` | zero-progress edge strikes and retirement (doc 55 §1, `provenanceEdgeVerdict`) | `true` | unlike `.deopt`, which rolls the iteration back to the anchor, the hop makes the partial iteration real (stores and slots are written). A cycle through it cannot be a zero-progress ping-pong in the §1 sense |
+
+  The child's closing `link_terminal` row keeps its existing values
+  (`region_work` 0, `commitsGuestWork` true), so each iteration is
+  counted exactly once. Coverage credits that iteration to the parent's
+  anchor as traced.
+
+  Tests (Phase 5/6):
+  - the same bit-reverse cycle run rowed and silent gives identical
+    `region_work` totals (row 1 against row 3);
+  - native and tier-1a iteration totals agree on the reduction;
+  - a `sibling_handoff` edge fed by an `exit_side` hop is not struck.
 - **Regions.** `exit_side` edges and the side trace's `.link` back are
   classified as intra-iteration edges of the parent's loop region, the
   way `loop_done_linked` → continuation edges already join nest-cycle
   regions. The steady cycle (parent → side → parent) then forms a
   region like fft_transform's `:131`/`:193` nest did after doc 55 §2.
-- **Owner election must decode pcs.** The dispatcher-entered cycle's
-  enclosure test (`trace_region_topology_build.zig:413-421`) compares
-  raw anchor pcs (`b.pc <= a.pc or b.pc > flp`). A tagged `.exit` pc
-  is above `2^30`, so the test fails, the region mints
-  `armable = false`, and silent promotion never happens (Rule Z-8,
-  layer 2). The test must compare `entryPc(b.pc)` instead. A test pins
-  that a `:9`-shaped parent-plus-side-trace cycle mints
-  `armable = true`. Cont anchors (bit 31) hit the same raw comparison
-  today, so decoding also changes which existing cont-member cycles can
-  elect an owner. Phase 6 lands the decode as its own step, with a
-  board A/B, before any `exit_side` edge exists.
+- **Owner election.** Round 2 found that the enclosure test
+  (`trace_region_topology_build.zig:413-421`) compares raw anchor pcs,
+  so a tagged `.exit` pc would make the region unarmable. Revision 5
+  has no tagged pc: exit-side traces sit at raw `P`, which lies inside
+  the parent's `for` span, and that is exactly what the test accepts.
+  The decode step is dropped. A Phase 6 test still pins that a
+  `:9`-shaped parent-plus-side-trace cycle mints `armable = true`
+  (Rule Z-8, layer 2).
 - **Silent promotion.** A new `SilentSiteKind.exit_side`: the adapter's
   jump is a silent site, with its data-cell check and its epilogue.
   Once the region qualifies, the cycle promotes and runs with no ledger
@@ -669,7 +717,7 @@ Every decision is a pure function of deterministic state:
 - `exit_counts`, wanted bits and DONE latches, charged exactly once per
   receipt;
 - trace ids and `(proto, pc)` anchors, never addresses;
-- the constants `hotexit`, `tryside`, `maxside`, `exit_side_unroll` and
+- the constants `hotexit`, `tryside`, `maxside` and
   the snapshot budgets.
 
 Materialization is data-driven from IR snapshots and ordinals. Cell and
@@ -876,3 +924,32 @@ against the source before it was accepted.
    record (§4.2).
 6. **Unverified item — are exit counters charged once per tier?**
    Added as a Phase 3 test.
+
+## 14. Review round 4 (same sub-agent, 2026-09-24): CHANGES REQUESTED, dispositions
+
+Receipt: `docs/reviews/doc56/subagent-r4.md`. Round-3 findings 1–5
+were marked RESOLVED, and the unverified item PARTIAL (it became a
+test). The `link_terminal` reuse was verified sound.
+
+1. **MAJOR (R4-F1) — `resolvePatchPc`/`installEntryPatch` switch on
+   `AnchorPcKind` and the doc never said what `.exit` does there.**
+   Verified (`trace_entry_registry.zig:101-138`). Following it further
+   turned up about 30 non-exhaustive `!= .loop` / `== .cont` sites that
+   a new kind would fall into silently. Among them are the arm funnel's
+   `head_parent` restriction (`trace_link.zig:1664`, one-shot parents
+   may carry only `sibling_handoff` arms, which would have blocked
+   nested side traces) and the head-sibling route in `noteTakenExit`
+   (`trace_link.zig:355`). The resolution is structural, not a patch per
+   site. Revision 5 drops `AnchorKind.exit`: an exit-side trace is a
+   `.continuation` trace at raw `P`, whose contract is identical (§4.4).
+   This also supersedes round-2 findings 1 and 4: there is no tagged pc,
+   so no owner-election decode and no `EXIT_PC_BIT`.
+2. **MINOR (R4-F2) — the precise-retry threshold switch
+   (`trace.zig:3619`).** Verified, and dissolved by the same change:
+   continuation anchors are `.loop`-kind already.
+3. **MAJOR (R4-F3) — "committing kind" spans four sites and two
+   accounting axes.** Verified (`trace_chain.zig:1670`,
+   `trace_link.zig:745/907`, `nativegen_emit.zig:1287-1443`,
+   `trace_exec.zig:285`). §4.8 now has a table with the value and
+   reason at each site, and tests for rowed/silent agreement and for
+   strike behaviour.
