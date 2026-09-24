@@ -1,6 +1,6 @@
 # 56 — Exit-started side traces (LuaJIT's side-trace mechanism) — Design
 
-Status: draft, not yet implemented. Revision 3. Antigravity round 1 returned CHANGES REQUESTED and round 2 APPROVE WITH CHANGES; all findings from both are folded in. A Codex round is still owed.
+Status: Phase 0 in progress. Revision 4. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent round 3 CHANGES REQUESTED. All findings are folded in. Bart ruled not to wait for Codex.
 Owner: Bart
 Last updated: 2026-09-24
 
@@ -28,17 +28,34 @@ consumes yet, so every program's output and trace set stays identical.
 - [x] **Design review round 2 (Antigravity): APPROVE WITH CHANGES.** Two
   majors, one minor, one nit, all accepted. It also answered Q3, Q6, Q7
   and Q8. Dispositions are in §12.
+- [x] **Design review round 3 (independent sub-agent): CHANGES
+  REQUESTED.** One blocker, two majors, one minor, one nit, one
+  phase-plan gap, all accepted and verified in source. Dispositions are
+  in §13. Bart ruled not to wait for Codex (out until 09-29).
+- [x] **Phase 0 — baselines.**
+  - **Board** (`bench/results/20260924-184058-e587e28.tsv`): fft 205.9
+    ms, 12.8× LJ.
+  - **fft `--jit-stats`:** `fft_bitreverse:9` is 24.2% of the run and
+    0.0% traced; `:55` is 33.1% and 0.0% traced; tier-0-with-a-trace is
+    58.3% of the run.
+- [x] **Phase 0 — the bit-reverse reduction test.** In
+  `src/interp_exit_side_test.zig`: the fft kernel at n = 1024, with
+  floats and 30 reps. It must be n = 1024; at n ≤ 128 the outer loop
+  still runs ~40–50% traced. The test is byte-identical on all ten legs
+  and pins today's reading: both hot anchors under 10% traced. The phase
+  that attaches side traces flips it to the §9 target.
 
 ### Outstanding
+- [ ] **Phase 0 — probes.** jit-debug probes for every new event:
+  - snapshot capture;
+  - attachability verdict;
+  - exit-side want, record, commit and arm;
+  - adapter build;
+  - materialize;
+  - tryside give-up.
 
-- [ ] **Design review, Codex round.** Due once Codex is back
-  (2026-09-29). Receipts go in `docs/reviews/doc56/`.
-- [ ] **Phase 0 — baseline and probes.** Board + fft `--jit-stats`
-  baseline; jit-debug probes for every new event (snapshot capture,
-  attachability verdict, exit-side want/record/commit/arm, adapter
-  build, materialize, tryside give-up); a ten-leg bit-reverse reduction
-  test that pins today's shape (parity holds, the residency expectation
-  fails).
+  Each probe lands in the phase that creates its event (none of these
+  events exist yet). This bullet closes when the last one is in.
 - [ ] **Phase 1 — exit snapshots and exit locations (inert).**
   - Boundary ordinals and sparse snapshots per bytecode boundary.
   - Every guard and every sunk store carries its boundary ordinal.
@@ -57,6 +74,11 @@ consumes yet, so every program's output and trace set stays identical.
     linking to a loop anchor's trace.
   - Commit with `(parent, exit)` provenance and a DONE latch, bounded by
     `tryside` and `maxside`.
+  - Tests:
+    - `.exit` anchors are never picked by `findLinkTrace`,
+      `resolveLoopDoneCont` or `findLoopTrace`;
+    - `exit_counts`, want bits and DONE latches are charged once per
+      receipt on each tier's leg (round 3, unverified item).
 - [ ] **Phase 4 — native exit adapters.**
   - Per-exit adapters built from the Phase-1 exit location map when an
     exit first becomes hot: materialize, then jump through a data cell
@@ -290,9 +312,13 @@ Ordinary traces get, at each bytecode boundary:
   (depth 0), each mapped to its ref, plus the resume pc of that
   boundary. `.undef` slots are still coherent in the slab.
   `SnapshotSlot.slot` already exists "so a future sparse form is a
-  validation change" (`trace_snapshot.zig:11`). Identical vectors are
-  interned, so snapshot ids are **not** ordered; the ordinal is.
-  `TraceCode` gains a small `ordinal → snapshot id` table.
+  validation change" (`trace_snapshot.zig:11`). Snapshot record ids
+  do increase in construction order (`Builder.add` appends a record per
+  call and only interns the slot vector). But sunk store instructions
+  have no snapshot record of their own, so guards and stores need a
+  shared ordinal space of their own. `TraceCode` gains a small
+  `ordinal → snapshot id` table. (Revision 3 wrongly said snapshot ids
+  are unordered; review round 3, finding 5.)
 
 Every guard records the ordinal of the bytecode that emitted it, and so
 does every **sunk store IR instruction**: the ordinal of the bytecode
@@ -337,9 +363,13 @@ stay in that range.
 - `inline_depth == 0`;
 - the exit is not a loop-done exit (those stay with the continuation
   machinery, which already solves them);
-- every sunk store from earlier bytecodes is a kind the linked
-  loop-done flush already supports (`loopDoneSnapshotSupported`), else
-  fail closed;
+- every sunk store with ordinal below the guard's is one of the kinds
+  the flush emitters model (`astore`, `hstore`, `gstore`, `ustore`),
+  else fail closed. This is an ordinal filter over the trailing store
+  block, **not** `loopDoneSnapshotSupported`. That helper scans forward
+  from the exit and accepts only stores until the terminal, which is
+  right for a loop-done guard but fails (and would be unsound if
+  loosened) for every mid-body guard (review round 3, finding 1);
 - the trace is neither precise nor peeled (peeled parents are
   deferred);
 - the guard's emitter passed the Q6 audit.
@@ -437,26 +467,43 @@ only their map entry.
     today.
   - Cell nonzero means jump to the adapter the cell names.
 
-  The test must not disturb any register holding a needed ref (Q7,
-  resolved in round 2). Exit cells live in an RW data region placed
-  within ±2 GB of the mcode arena, so the stub needs no register at
-  all:
+  The test must not disturb any register holding a needed ref (Q7).
+  `rax` and `rcx` are never allocated (`ALLOC_ORDER`,
+  `nativegen_alloc.zig:180`), so no value lives in them at a guard, and
+  the stub uses `rax` with the cell's absolute address. That is the
+  same pattern as §2d's silent check and the precise flush
+  (`nativegen.zig:664`):
 
   ```
-  cmp qword [rip + cell], 0
+  mov rax, imm64          ; this exit's cell (heap-allocated, stable)
+  cmp qword [rax], 0
   jne .to_adapter
   ; fall through: today's anchor-coherent exit, unchanged
   .to_adapter:
-  jmp qword [rip + cell]
+  jmp qword [rax]
   ```
 
-  Inside the adapter, `rax` and `rcx` are free scratch registers:
-  neither is in `ALLOC_ORDER` (`nativegen_alloc.zig:180`), so no value
-  ever lives in them at a guard.
+  Revision 3 used RIP-relative cells "within ±2 GB of the mcode
+  arena". The arena does not provide that: each region is an unhinted
+  `mmap(null, …)`, and its own comment defers the ±2 GB check
+  (`nativegen_mcode.zig:124-131`, `:268-282`). Round 3, finding 2. An
+  absolute load needs no placement guarantee, at the cost of about 10
+  more bytes per attachable stub. The cells are ordinary heap memory
+  owned by the parent trace, like §2d's cells. Inside the adapter,
+  `rax` and `rcx` stay free scratch.
 - **The adapter.** A small mcode-arena allocation, reading values from
   the locations the map names:
-  1. the stores from earlier bytecodes, in order, reusing the linked
-     loop-done store emitters (`emitLinkedLoopDoneSnapshot`);
+  1. the stores from earlier bytecodes, in order. `finalize` appends
+     all sunk stores as one contiguous block just before the phi rows
+     and the terminal (`trace_finalize.zig:45-52`), in recording order,
+     which is ordinal order: `pending_stores` is append-only, and
+     forwarding only reads it. The adapter walks that block and emits
+     each store whose ordinal is below the guard's. It reuses the leaf
+     emitters (`emitAStore`, `emitHStore`/`emitGStore`, the `ustore`
+     arm), not `emitLinkedLoopDoneSnapshot`'s driver, which scans from
+     the exit (review round 3, finding 1). The operands of these stores
+     are defined before the guard and are used again at the tail, so
+     they are already live at the guard;
   2. the snapshot slots, reusing `emitPreciseSnapshotFlush`'s rules
      (never skip `.carried` on ref identity; write-dominated carried
      loads flush the home);
@@ -474,6 +521,16 @@ only their map entry.
     peeled;
   - the child's entry fingerprint matches the parent's static types;
   - the child is compiled.
+
+  `exitAttachable` is a pure function of the parent's committed
+  `TraceCode` (IR, ordinals, snapshots, exit map), which never changes
+  after commit. It is computed once at compile time and stored per
+  exit, and `arm` reads that stored verdict. This differs on purpose
+  from `sibling_handoff`, which re-proves `exitIsPreEffect` at the
+  funnel (`trace_link.zig:1721`). There the predicate is evaluated
+  against a watch that can be stale; here there is nothing that can
+  drift. The child-side checks above are all re-run at arm time
+  (review round 3, finding 4).
 
   Retiring the child points the target cell back at resume-at-`P`.
   Retiring the parent drops the adapter with the parent's page.
@@ -513,15 +570,60 @@ Round 1 proposed rowless attached hops. Review blocker 3 rejected that:
 
 So:
 
-- **Rows.** A new `LedgerKind.exit_side` row (append-only ordinal) is
-  written at the hop. `replayLedgerFrom` gains its grammar: row
-  `(parent, exit)` must be armed `exit_side` to the next row's owner,
-  and the hop's coherent point is `P`.
+- **Rows.** Both transitions of the cycle are spelled out (review round
+  3, finding 3).
+  1. **The hop in: a new `LedgerKind.exit_side` row** (append-only
+     ordinal), written by the adapter before its jump. A new
+     `replayLedgerFrom` arm validates it:
+     - the row's owner is the parent, and its exit is armed
+       `exit_side`;
+     - the next row's owner is, by id, the child that arm names:
+       `.exit`-anchored at `(proto, P)`.
+
+     The arm's cursor transition is a new `ArmKind.exit_side` case in
+     `applyEdgeCursorTransition`: `next_entry = .via_exit_side`,
+     `resume_pc = P`, with `cont`/`link_pc` left alone. If the row is
+     the last one (a yield), the walk returns with `resume_pc = P`, and
+     the slab is coherent there because the adapter materialized
+     before the jump.
+  2. **The close back: the existing `link_terminal` row.** The child
+     ends in `.link` whose `aux` names the loop anchor it closes into,
+     the same shape `.side`/`.continuation` recordings use today. The
+     existing arm's checks hold as they are:
+     - the owner ends in `.link` and `e.exit` is its last instruction;
+     - the successor passes `isInnerLoopRoot(succ, proto, aux)`. That
+       only asks for a `.loop`-tailed trace anchored at `(proto, aux)`
+       (`trace.zig:2287`), which t1 at `:9` is.
+
+     Its cursor transition leaves `cont = child` and
+     `link_pc = aux = the loop root's anchor pc`. That is exactly the
+     resume contract of the loop root's own later guards, whose
+     terminal rows resume at `cursor.link_pc`
+     (`trace_chain.zig:2262`). The unarmed and yield path
+     (`run_inner_from`) resumes at `aux`, which is also correct. No new
+     grammar is needed here. A Phase 5 replay test pins the whole
+     parent → `exit_side` → child → `link_terminal` → parent sequence,
+     including a yield after each row.
+  3. **Continuation lookups skip `.exit` anchors.**
+     - `findLinkTrace`/`resolveLoopDoneCont` match on raw
+       `anchor.pc == post_pc` (`trace.zig:2374`), so a tagged `.exit`
+       anchor can never be mistaken for a continuation.
+     - `findLoopTrace` requires a `.loop` tail, which a one-shot `.exit`
+       trace never has.
+
+     Phase 3 adds a test for both.
 - **Completions.**
-  - The parent's local completions are counted as today (`rbx`).
-  - The iteration the parent started and the side trace finished is
-    counted once, at the side trace's `.link` back-edge. That is the
-    same rule continuation traces follow.
+  - The parent's local completions are counted as today (`rbx`); the
+    interrupted iteration is not in them (it never reached `.loop`).
+  - The child finishes that iteration. Its `.link` is a one-shot close,
+    so its cumulative counter is 0 at the `link_terminal` row, the same
+    as a continuation's. The accounting rule is: the `exit_side` row is
+    a *committing* kind for region progress (doc 55 §2 (c)). It credits
+    the one iteration the pair completes, so the steady cycle is never
+    read as zero progress and never strikes. Coverage attributes that
+    iteration to the parent's anchor as traced. Phase 5 pins this with
+    a test comparing the native and tier-1a iteration totals on the
+    bit-reverse reduction.
 - **Regions.** `exit_side` edges and the side trace's `.link` back are
   classified as intra-iteration edges of the parent's loop region, the
   way `loop_done_linked` → continuation edges already join nest-cycle
@@ -644,10 +746,12 @@ peeled) produces these side traces:
   its own bytecode. Round 2 agrees: `exitAttachable` asserts the guard's
   bytecode has made no irreversible effect before the guard.
 - **Q7 — the exit's cell test without a scratch register.** Resolved in
-  round 2: RIP-relative cells in an RW region next to the mcode arena
-  (§4.6). Reserving an allocatable register was rejected. It would take
-  one of the 9 GP registers from every trace (Rule Z-6), and it isn't
-  needed, because `rax`/`rcx` are never allocated.
+  round 2, revised in round 3: `mov rax, imm64` with the cell's
+  absolute address (§4.6). `rax`/`rcx` are never allocated, so nothing
+  is disturbed. Reserving an allocatable register was rejected, because
+  it would take one of the 9 GP registers from every trace (Rule Z-6).
+  Round 2's RIP-relative cells were dropped: the mcode arena gives no
+  ±2 GB placement guarantee.
 - **Q8 — exec-log `ExitKind`.** Resolved in round 2: no new `ExitKind`.
   The parent logs its normal guard exit, and the hop shows up as the
   side trace's entry, as with `sibling_handoff`.
@@ -734,3 +838,41 @@ findings were marked RESOLVED.
    (`nativegen_alloc.zig:777`), §4.2.
 4. **NIT — spell out `EXIT_PC_BIT` and its decoding.** Accepted:
    `1 << 30`, with the tighter compiler length contract (§4.4).
+
+## 13. Review round 3 (independent sub-agent, 2026-09-24): CHANGES REQUESTED, dispositions
+
+Receipt: `docs/reviews/doc56/subagent-r3.md`. Each claim was checked
+against the source before it was accepted.
+
+1. **BLOCKER — `loopDoneSnapshotSupported`/`emitLinkedLoopDoneSnapshot`
+   cannot serve mid-body exits.** Verified (`trace_code.zig:495-503`:
+   the scan from `exit_instr + 1` accepts only stores until the
+   terminal). Every exit in §5's worked example would fail the gate.
+   Replaced with an ordinal-bounded filter over the trailing store
+   block; only the leaf store emitters are reused (§4.3, §4.6).
+2. **MAJOR — the ±2 GB RIP-relative cell region is not something the
+   mcode arena provides.** Verified (`nativegen_mcode.zig:124-131`,
+   `:268-282`). Replaced with an absolute `mov rax, imm64` cell load,
+   the §2d and precise-flush pattern (§4.6, Q7). The reviewer's
+   phase-plan gap (build and test the RW region) goes away with it.
+3. **MAJOR — the close-back row was waved through as "the same rule
+   continuation traces follow".** Accepted and designed now (§4.8).
+   - The hop in is a new `exit_side` row with its own arm and cursor
+     transition.
+   - The close back is the existing `link_terminal` row. Its checks
+     (`isInnerLoopRoot`, `trace.zig:2287`) and its cursor state
+     (`link_pc` = the loop root's anchor) were read and hold as they
+     are.
+   - The completion rule is stated.
+   - The reviewer's worry that `isInnerLoopRoot` would reject the
+     parent does not hold: it only requires a `.loop`-tailed trace at
+     `(proto, aux)`.
+4. **MINOR — `arm` validation vs the `sibling_handoff` re-proof
+   precedent.** Accepted. The attachable verdict is a stored pure
+   function of the immutable parent; child-side checks are re-run
+   (§4.6).
+5. **NIT — "snapshot ids are not ordered" was wrong.** Accepted.
+   Corrected, with the real reason: sunk stores have no snapshot
+   record (§4.2).
+6. **Unverified item — are exit counters charged once per tier?**
+   Added as a Phase 3 test.

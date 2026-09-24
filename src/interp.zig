@@ -7823,4 +7823,5 @@ test {
     _ = @import("interp_tier1a_test.zig");
     _ = @import("interp_native_test.zig");
     _ = @import("interp_lanes_test.zig");
+    _ = @import("interp_exit_side_test.zig");
 }
