@@ -740,9 +740,9 @@ pub const PROMOTED_SET_CAP: usize = 16;
 // path release-panicking — the cap is an invariant, not a truncation.
 pub const PROVENANCE_VERDICT_CAP: usize = 2 * PROMOTED_SET_CAP + trace_exec.LEDGER_CAP;
 
-pub const exitPatchFor = native_physical.exitPatchFor;
+pub const silentSiteAt = native_physical.silentSiteAt;
 
-pub fn patchKindForArm(kind: ArmKind) ?nativegen.ExitPatchKind {
+pub fn silentKindForArm(kind: ArmKind) ?nativegen.SilentSiteKind {
     return switch (kind) {
         .ordinary_guard, .sibling_handoff => .deopt,
         .link_terminal => .link_terminal,
@@ -807,7 +807,7 @@ pub fn validateRegionBridgeReceipt(self: *TraceState, owner: *Trace, exit: u32, 
 /// Re-check the activation-local static shapes in release mode. The arm path
 /// proved these once; promotion deliberately does not trust historical proof.
 pub fn promotedEdgeFromLink(self: *TraceState, link: NativeLink) ?PromotedEdge {
-    const kind = patchKindForArm(link.kind) orelse return null;
+    const kind = silentKindForArm(link.kind) orelse return null;
     const compiled = switch (link.parent.native) {
         .compiled => |*c| c,
         else => return null,
@@ -815,8 +815,8 @@ pub fn promotedEdgeFromLink(self: *TraceState, link: NativeLink) ?PromotedEdge {
     if (link.slot_index >= link.parent.code.instrs.len or link.slot_index >= compiled.slots.len)
         return null;
     if (link.slot_index >= compiled.metadata_cells.len) return null;
-    const patch = exitPatchFor(compiled, link.slot_index) orelse return null;
-    if (patch.kind != kind or patch.metadata_cell != &compiled.metadata_cells[link.slot_index] or
+    const site = silentSiteAt(compiled, link.slot_index) orelse return null;
+    if (site.kind != kind or site.metadata_cell != &compiled.metadata_cells[link.slot_index] or
         compiled.metadata_cells[link.slot_index] != 0) return null;
 
     const child_compiled = switch (link.child.native) {
@@ -886,7 +886,7 @@ pub const PromotionRejectReason = enum {
     region_mismatch,
     open_chain,
     child_mismatch,
-    no_patch_point,
+    no_silent_site,
     cap,
     region_owned,
 };
@@ -897,14 +897,14 @@ pub fn rejectPromotion(self: *TraceState, reason: PromotionRejectReason) ?[]Prom
         .region_mismatch => self.silent_rejects.region_mismatch +|= 1,
         .open_chain => self.silent_rejects.open_chain +|= 1,
         .child_mismatch => self.silent_rejects.child_mismatch +|= 1,
-        .no_patch_point => self.silent_rejects.no_patch_point +|= 1,
+        .no_silent_site => self.silent_rejects.no_silent_site +|= 1,
         .cap => self.silent_rejects.cap +|= 1,
         .region_owned => self.silent_rejects.region_owned +|= 1,
     }
     return null;
 }
 
-pub fn rowPatchKind(kind: trace_exec.LedgerKind) ?nativegen.ExitPatchKind {
+pub fn rowSilentKind(kind: trace_exec.LedgerKind) ?nativegen.SilentSiteKind {
     return switch (kind) {
         .deopt => .deopt,
         .link_terminal => .link_terminal,
@@ -971,10 +971,10 @@ pub fn promotionBelongsToRegion(self: *TraceState, edges: []const PromotedEdge, 
 }
 
 /// B-3d (doc 17 §B3.16 D1): the candidate is the REGION-TOTAL armed-edge set —
-/// every armed, patch-pointed, un-owned region-member edge at the observation
-/// instant, in canonical (parent id, exit) order. The forced-yield ledger is
-/// evidence when every row is one of the candidate's edges, each row's patch
-/// kind matches its edge, and each non-final row's armed child owns the next
+/// every armed, silent-site-bearing, un-owned region-member edge at the
+/// observation instant, in canonical (parent id, exit) order. The forced-yield
+/// ledger is evidence when every row is one of the candidate's edges, each row's
+/// silent-site kind matches its edge, and each non-final row's armed child owns the next
 /// row (per-adjacent-pair child-match — the successor-evidence strength of the
 /// old ring grammar without requiring periodicity; the final `.yielded` row's
 /// jump is suppressed by `emitForcedYieldCheck` and is exempt). Repetition
@@ -984,9 +984,10 @@ pub fn promotionBelongsToRegion(self: *TraceState, edges: []const PromotedEdge, 
 ///
 /// A candidate edge that appears in no evidence ledger still promotes — an
 /// explicit accepted trade (§B3.18 R5(c)): registry proof
-/// (`promotedEdgeFromLink` slot/patch/entry identity) is what makes the jump
-/// target correct; firing evidence then arrives via summary cells. A trace may
-/// have any number of other armed exits: only member edges are patched, and
+/// (`promotedEdgeFromLink` slot/silent-site/entry identity) is what makes the
+/// jump target correct; firing evidence then arrives via summary cells. A trace
+/// may have any number of other armed exits: only member edges' cells are
+/// published, and
 /// taking any other exit naturally terminates silence into a reporting suffix.
 /// The candidate is a pure function of deterministic state (armed-link
 /// registry + region membership + ledger), so the promotion instant stays
@@ -998,7 +999,7 @@ pub fn detectPromotableSet(self: *TraceState, entries: []const trace_exec.Ledger
 /// Doc 52: the detector core with an explicit membership bound. The full-cap
 /// grammar checks EVERY row for candidate membership (`member_rows ==
 /// entries.len`); the recurrence grammar exempts the final natural-terminal
-/// row (`member_rows == entries.len - 1`) — it is a NON-member unpatched
+/// row (`member_rows == entries.len - 1`) — it is a NON-member, unpublished
 /// exit, the burst's future reporting suffix. Child adjacency is always
 /// checked over the FULL ledger: for every member row `i` with a successor
 /// row, the matched edge's armed child must own `entries[i + 1]` — so the
@@ -1051,11 +1052,11 @@ pub fn detectPromotableSetMembers(
     // Evidence: every MEMBER row ∈ candidate, kind-exact, per-adjacent-pair
     // child-match against the full ledger. Non-final rows are always
     // `.normal`-outcome materialized transitions, and a `.prologue_fail` row
-    // can never match a candidate edge (`rowPatchKind` has no patch point for
-    // it), so the grammar is total.
+    // can never match a candidate edge (`rowSilentKind` has no silent-site kind
+    // for it), so the grammar is total.
     for (entries[0..member_rows], 0..) |row, i| {
-        const observed_kind = rowPatchKind(row.kind) orelse
-            return self.rejectPromotion(.no_patch_point);
+        const observed_kind = rowSilentKind(row.kind) orelse
+            return self.rejectPromotion(.no_silent_site);
         var found: ?PromotedEdge = null;
         for (scratch[0..n]) |edge| {
             if (edge.parent.id == row.id and edge.exit == row.exit) {
@@ -1064,7 +1065,7 @@ pub fn detectPromotableSetMembers(
             }
         }
         const edge = found orelse return self.rejectPromotion(.open_chain);
-        if (edge.kind != observed_kind) return self.rejectPromotion(.no_patch_point);
+        if (edge.kind != observed_kind) return self.rejectPromotion(.no_silent_site);
         if (i + 1 < entries.len and edge.child.id != entries[i + 1].id)
             return self.rejectPromotion(.child_mismatch);
     }
@@ -1134,7 +1135,7 @@ pub fn promoteResidentSet(self: *TraceState, edges: []const PromotedEdge, rid: R
     for (edges) |edge| {
         if (!self.edgeMemberOfRegion(edge, rid, true)) return error.InvalidPromotionRegion;
     }
-    // Link/slot/patch identity — shared with the activation path.
+    // Link/slot/silent-site identity — shared with the activation path.
     for (edges) |edge| {
         const validated = self.promotedEdgeFromLink(.{
             .parent = edge.parent,
@@ -1251,7 +1252,7 @@ pub fn considerSilentPromotion(self: *TraceState, entries: []const trace_exec.Le
             // churn is visible on the board; the candidate streak resets and
             // regrows from fully-reporting windows after the demote lands.
             error.PromotionRegionOwned => self.silent_rejects.region_owned +|= 1,
-            else => self.silent_rejects.no_patch_point +|= 1,
+            else => self.silent_rejects.no_silent_site +|= 1,
         }
         self.resetPromotionCandidate();
         return;
@@ -1276,7 +1277,7 @@ pub fn considerSilentPromotion(self: *TraceState, entries: []const trace_exec.Le
 /// drain pressure exists AND (via the same set proof as candidacy) that the
 /// region owns a promotable armed set which could absorb it. One qualifying
 /// ledger admits (the existing `promote_after` streak then supplies
-/// confirmation before anything is patched); repeated failures saturate
+/// confirmation before anything is published); repeated failures saturate
 /// `admission_failures` and end probing — terminal dormancy, bounding the
 /// probe cost on shapes that never qualify (spectral-norm: 2 minted regions,
 /// zero promotable ledgers, +16% wall pre-admission-gating).
@@ -1462,7 +1463,7 @@ fn tryRecurrencePromotion(self: *TraceState, entries: []const trace_exec.LedgerE
                 error.PromotionRegionIdOwned => self.silent_rejects.region_id_owned +|= 1,
                 error.PromotionResidentOccupied => self.silent_rejects.resident_occupied +|= 1,
                 error.PromotionRegionOwned => self.silent_rejects.region_owned +|= 1,
-                else => self.silent_rejects.no_patch_point +|= 1,
+                else => self.silent_rejects.no_silent_site +|= 1,
             }
             resetRecurrenceStreaks(self);
             self.dbg("recurrence: threshold rid={d} promotion rejected ({s})", .{ @intFromEnum(rid), @errorName(err) });
@@ -1759,7 +1760,7 @@ pub fn noteMembershipGrowth(self: *TraceState, parent: *Trace, slot_index: u32, 
         self.registry.native_physical.parked_proofs.items.len == 0) return;
     if (self.registry.native_physical.exitIsPromoted(parent.id, slot_index))
         return;
-    // Not patch-pointed (or otherwise failing arm-shape validation) means the
+    // No silent site (or otherwise failing arm-shape validation) means the
     // edge can never be a candidate member, so it cannot outgrow a set. Same
     // per-edge core as candidacy below (§B3.18 R7: one membership predicate);
     // the bridge stamp is not required here because the trigger runs before

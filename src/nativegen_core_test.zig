@@ -61,7 +61,7 @@ test "nativegen doc 55 §2d: link, linked-loop-done, and deopt exits carry a dat
     var link_ct = compileInto(gpa, &arena, &link_trace, 501, null, null) orelse return error.NativeBailedUnexpectedly;
     defer link_ct.deinit();
     var saw_link = false;
-    for (link_ct.exit_patches) |p| if (p.kind == .link_terminal) {
+    for (link_ct.silent_sites) |p| if (p.kind == .link_terminal) {
         saw_link = true;
         try util.expectSilentCheck(&link_ct, p);
         try testing.expectEqual(@as(usize, 0), p.metadata_cell.*);
@@ -69,11 +69,11 @@ test "nativegen doc 55 §2d: link, linked-loop-done, and deopt exits carry a dat
     try testing.expect(saw_link);
     var no_tags = [_]u8{};
     var no_payloads = [_]u64{};
-    const unpatched = link_ct.run(RegWindow.of(&no_tags, &no_payloads));
-    try testing.expectEqual(@as(u64, 0), unpatched.silent_active);
-    try testing.expectEqual(@as(u64, 0), unpatched.silent_transitions);
-    try testing.expectEqual(@as(u64, 0), unpatched.silent_cell);
-    try testing.expectEqual(@as(u64, 0), unpatched.silent_cum);
+    const unpromoted = link_ct.run(RegWindow.of(&no_tags, &no_payloads));
+    try testing.expectEqual(@as(u64, 0), unpromoted.silent_active);
+    try testing.expectEqual(@as(u64, 0), unpromoted.silent_transitions);
+    try testing.expectEqual(@as(u64, 0), unpromoted.silent_cell);
+    try testing.expectEqual(@as(u64, 0), unpromoted.silent_cum);
 
     var loop_code = [_]bytecode.Instr{ bytecode.Instr.op0(.halt), bytecode.Instr.opAx(.for_loop, 0, 0), bytecode.Instr.op0(.halt) };
     var loop_proto = bytecode.Proto{ .code = &loop_code, .name = "b3-loopdone", .id = 502 };
@@ -90,7 +90,7 @@ test "nativegen doc 55 §2d: link, linked-loop-done, and deopt exits carry a dat
     var loop_ct = compileInto(gpa, &arena, &loop_trace, 502, null, null) orelse return error.NativeBailedUnexpectedly;
     defer loop_ct.deinit();
     var saw_loopdone = false;
-    for (loop_ct.exit_patches) |p| if (p.kind == .loop_done_linked) {
+    for (loop_ct.silent_sites) |p| if (p.kind == .loop_done_linked) {
         saw_loopdone = true;
         try util.expectSilentCheck(&loop_ct, p);
         try testing.expectEqual(@as(usize, 0), p.metadata_cell.*);
@@ -104,7 +104,7 @@ test "nativegen doc 55 §2d: link, linked-loop-done, and deopt exits carry a dat
     var deopt_ct = compileInto(gpa, &arena, &deopt_trace, 503, null, null) orelse return error.NativeBailedUnexpectedly;
     defer deopt_ct.deinit();
     var saw_deopt = false;
-    for (deopt_ct.exit_patches) |p| if (p.kind == .deopt) {
+    for (deopt_ct.silent_sites) |p| if (p.kind == .deopt) {
         saw_deopt = true;
         try util.expectSilentCheck(&deopt_ct, p);
         // The deopt fall-through is the unchanged `jmp deopt_exit` (E9 rel32).

@@ -109,10 +109,10 @@ pub const SilentStaging = artifact.SilentStaging;
 pub const NativeResultLedgerLayout = artifact.NativeResultLedgerLayout;
 pub const SilentSummaryCell = artifact.SilentSummaryCell;
 pub const SilentExitMetadata = artifact.SilentExitMetadata;
-pub const ExitPatchKind = artifact.ExitPatchKind;
+pub const SilentSiteKind = artifact.SilentSiteKind;
 pub const RET_CONT_SLOTS = artifact.RET_CONT_SLOTS;
 pub const NATIVE_TRANSITION_SLOTS = artifact.NATIVE_TRANSITION_SLOTS;
-pub const ExitPatch = artifact.ExitPatch;
+pub const SilentSite = artifact.SilentSite;
 pub const SeedPlan = artifact.SeedPlan;
 pub const CompiledTrace = artifact.CompiledTrace;
 pub const NativeState = artifact.NativeState;
@@ -286,7 +286,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     var link_hit_counters: []artifact.LinkHitCounter = &.{};
     var slot_rowless_ok: []u8 = &.{};
     var metadata_cells: []usize = &.{};
-    var patch_emissions: []?PatchEmission = &.{};
+    var silent_emissions: []?SilentSiteEmission = &.{};
     if (arena) |ar| {
         // Boxed phi tags use one lowering-only spill each so every source tag is
         // snapshotted before parallel destination writes. Include those cells in
@@ -349,7 +349,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
             return null;
         };
         @memset(metadata_cells, 0);
-        patch_emissions = gpa.alloc(?PatchEmission, n) catch {
+        silent_emissions = gpa.alloc(?SilentSiteEmission, n) catch {
             gpa.free(metadata_cells);
             gpa.free(slot_rowless_ok);
             gpa.free(link_hit_counters);
@@ -357,9 +357,9 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
             gpa.free(slots);
             return null;
         };
-        @memset(patch_emissions, null);
+        @memset(silent_emissions, null);
     }
-    defer if (patch_emissions.len > 0) gpa.free(patch_emissions);
+    defer if (silent_emissions.len > 0) gpa.free(silent_emissions);
     var keep_ret_cont_keys = false;
     defer if (ret_cont_keys.len > 0 and !keep_ret_cont_keys) gpa.free(ret_cont_keys);
     var keep_link_hit_counters = false;
@@ -369,27 +369,27 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
 
     var asm_buf = x64.Assembler.init(gpa);
     defer asm_buf.deinit();
-    const entry_stubs = lower(gpa, t, trace_id, kinds, &alloc, &asm_buf, shared_exit, slots, ret_cont_keys, link_hit_counters, slot_rowless_ok, metadata_cells, patch_emissions, seed_ctx, seed_plan, heap) catch {
+    const entry_stubs = lower(gpa, t, trace_id, kinds, &alloc, &asm_buf, shared_exit, slots, ret_cont_keys, link_hit_counters, slot_rowless_ok, metadata_cells, silent_emissions, seed_ctx, seed_plan, heap) catch {
         if (metadata_cells.len > 0) gpa.free(metadata_cells);
         if (slots.len > 0) gpa.free(slots);
         return null;
     };
     asm_buf.resolve();
 
-    var patch_count: usize = 0;
-    for (patch_emissions) |p| if (p != null) {
-        patch_count += 1;
+    var site_count: usize = 0;
+    for (silent_emissions) |e| if (e != null) {
+        site_count += 1;
     };
-    var exit_patches: []ExitPatch = &.{};
-    if (patch_count > 0) {
-        exit_patches = gpa.alloc(ExitPatch, patch_count) catch {
+    var silent_sites: []SilentSite = &.{};
+    if (site_count > 0) {
+        silent_sites = gpa.alloc(SilentSite, site_count) catch {
             gpa.free(metadata_cells);
             gpa.free(slots);
             return null;
         };
-        var pi: usize = 0;
-        for (patch_emissions, 0..) |maybe, ei| if (maybe) |em| {
-            exit_patches[pi] = .{
+        var si: usize = 0;
+        for (silent_emissions, 0..) |maybe, ei| if (maybe) |em| {
+            silent_sites[si] = .{
                 .kind = em.kind,
                 .exit_instr = @intCast(ei),
                 .check_off = @intCast(em.check_off),
@@ -397,20 +397,20 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
                 .epilogue_off = @intCast(asm_buf.labelOffset(em.epilogue)),
                 .metadata_cell = &metadata_cells[ei],
             };
-            pi += 1;
+            si += 1;
         };
     }
 
     const page = if (arena) |a|
         a.alloc(asm_buf.code.items) catch {
-            if (exit_patches.len > 0) gpa.free(exit_patches);
+            if (silent_sites.len > 0) gpa.free(silent_sites);
             if (metadata_cells.len > 0) gpa.free(metadata_cells);
             if (slots.len > 0) gpa.free(slots);
             return null;
         }
     else
         mapExecutable(asm_buf.code.items) catch {
-            if (exit_patches.len > 0) gpa.free(exit_patches);
+            if (silent_sites.len > 0) gpa.free(silent_sites);
             if (metadata_cells.len > 0) gpa.free(metadata_cells);
             if (slots.len > 0) gpa.free(slots);
             return null;
@@ -422,7 +422,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
         if (off >= page.code.len) {
             var invalid_page = page;
             invalid_page.deinit();
-            if (exit_patches.len > 0) gpa.free(exit_patches);
+            if (silent_sites.len > 0) gpa.free(silent_sites);
             if (metadata_cells.len > 0) gpa.free(metadata_cells);
             if (slots.len > 0) gpa.free(slots);
             return null;
@@ -433,7 +433,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
         if (off >= page.code.len) {
             var invalid_page = page;
             invalid_page.deinit();
-            if (exit_patches.len > 0) gpa.free(exit_patches);
+            if (silent_sites.len > 0) gpa.free(silent_sites);
             if (metadata_cells.len > 0) gpa.free(metadata_cells);
             if (slots.len > 0) gpa.free(slots);
             return null;
@@ -471,7 +471,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
         .gpa = gpa,
         .linked_entry = linked_entry,
         .ordinary_entry = ordinary_entry,
-        .exit_patches = exit_patches,
+        .silent_sites = silent_sites,
         .metadata_cells = metadata_cells,
         .seed_plan = seed_plan,
         .seed_prologue = entry_stubs.seed_prologue,
@@ -613,8 +613,8 @@ const EntryStubs = struct {
 /// Doc 55 §2d: one promotable exit's permanent silent check (`emitSilentCheck`):
 /// where the check starts, where its reporting fall-through resumes, and the
 /// out-of-line epilogue it branches to.
-const PatchEmission = struct {
-    kind: ExitPatchKind,
+const SilentSiteEmission = struct {
+    kind: SilentSiteKind,
     check_off: usize,
     resume_off: usize,
     epilogue: x64.Label,
@@ -622,10 +622,10 @@ const PatchEmission = struct {
 
 /// Emit `ei`'s silent check and record it. Called at the exact point where the
 /// kind's state materialization is complete and its reporting path begins.
-fn emitPatchableExit(a: *x64.Assembler, patch_emissions: []?PatchEmission, metadata_cells: []usize, ei: usize, kind: ExitPatchKind) !void {
+fn emitSilentSite(a: *x64.Assembler, silent_emissions: []?SilentSiteEmission, metadata_cells: []usize, ei: usize, kind: SilentSiteKind) !void {
     const silent = try a.label();
     const check_off = try emitSilentCheck(a, &metadata_cells[ei], silent);
-    patch_emissions[ei] = .{ .kind = kind, .check_off = check_off, .resume_off = a.code.items.len, .epilogue = silent };
+    silent_emissions[ei] = .{ .kind = kind, .check_off = check_off, .resume_off = a.code.items.len, .epilogue = silent };
 }
 
 /// Doc 45 D6: deterministic per-trace budget on the TOTAL number of
@@ -709,7 +709,7 @@ fn emitPreciseSnapshotFlush(a: *x64.Assembler, t: *const Trace, kinds: []const K
 /// committed counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers
 /// across iterations (loaded + type-guarded once in the prologue); `regs[]` is written
 /// only on a side-exit (the single snapshot) or for write-only slots at the back-edge.
-fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize, ret_cont_keys: []u32, link_hit_counters: []artifact.LinkHitCounter, slot_rowless_ok: []u8, metadata_cells: []usize, patch_emissions: []?PatchEmission, seed_ctx: ?*const NativeSeedCtx, seed_plan: SeedPlan, heap: ?*gc.Heap) !EntryStubs {
+fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize, ret_cont_keys: []u32, link_hit_counters: []artifact.LinkHitCounter, slot_rowless_ok: []u8, metadata_cells: []usize, silent_emissions: []?SilentSiteEmission, seed_ctx: ?*const NativeSeedCtx, seed_plan: SeedPlan, heap: ?*gc.Heap) !EntryStubs {
     const exit_labels = try gpa.alloc(?x64.Label, t.instrs.len);
     defer gpa.free(exit_labels);
     @memset(exit_labels, null);
@@ -2076,7 +2076,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 }
                 try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
                 try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
-                if (shared_exit != null) try emitPatchableExit(a, patch_emissions, metadata_cells, i, .link_terminal);
+                if (shared_exit != null) try emitSilentSite(a, silent_emissions, metadata_cells, i, .link_terminal);
                 // 2.3c-2a: record this `.link` transition (chain source C→I) before the
                 // handoff. `exit_instr` = i is now in memory; `exit_reason` is the inherited
                 // `.normal`.
@@ -2495,7 +2495,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
 
                     try emitCompositeBridgeSnapshot(a, t, kinds, alloc, ei);
                     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
-                    try emitPatchableExit(a, patch_emissions, metadata_cells, ei, .region_bridge);
+                    try emitSilentSite(a, silent_emissions, metadata_cells, ei, .region_bridge);
                     try emitLedgerAppend(a, trace_id, .region_bridge);
 
                     // Re-resolve after the snapshot/append clobbered scratch regs,
@@ -2519,7 +2519,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 }
             }
             if (shared_exit != null and !isNumericForLoopDoneGuard(t, ei) and !isCompositeBridgeCandidate(t, ei))
-                try emitPatchableExit(a, patch_emissions, metadata_cells, ei, .deopt);
+                try emitSilentSite(a, silent_emissions, metadata_cells, ei, .deopt);
             try a.jmp(deopt_exit);
         }
     }
@@ -2533,7 +2533,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             a.bind(l);
             try emitLinkedLoopDoneSnapshot(a, t, kinds, alloc, ei);
             try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
-            if (shared_exit != null) try emitPatchableExit(a, patch_emissions, metadata_cells, ei, .loop_done_linked);
+            if (shared_exit != null) try emitSilentSite(a, silent_emissions, metadata_cells, ei, .loop_done_linked);
             // 2.3c-2a: record this loop-done transition (chain source I→C once 2.3c-2c
             // arms slot[ei]) before the handoff. `exit_instr` = ei was written into memory
             // by the mini-stub (its `jne` reached here); `exit_reason` is `.normal`.
@@ -2772,7 +2772,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     // Each kind's state materialization precedes its check; ordinary deopt
     // duplicates the shared carried-home flush here.
     if (shared_exit) |se| {
-        for (patch_emissions, 0..) |maybe, ei| if (maybe) |em| {
+        for (silent_emissions, 0..) |maybe, ei| if (maybe) |em| {
             a.bind(em.epilogue);
             if (em.kind == .deopt) {
                 // Doc 39: same zero-local-completion skip + steady-home flush as

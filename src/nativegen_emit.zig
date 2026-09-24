@@ -26,7 +26,7 @@ const Kind = artifact.Kind;
 const NativeResult = artifact.NativeResult;
 const NativeResultLedgerLayout = artifact.NativeResultLedgerLayout;
 const SilentSummaryCell = artifact.SilentSummaryCell;
-const ExitPatchKind = artifact.ExitPatchKind;
+const SilentSiteKind = artifact.SilentSiteKind;
 const RET_CONT_SLOTS = artifact.RET_CONT_SLOTS;
 
 const layout = @import("nativegen_layout.zig");
@@ -1268,7 +1268,7 @@ pub fn emitInlineSelfRetPop(
 /// exit's data cell and branches to the out-of-line silent epilogue when a
 /// `*SilentExitMetadata` is published there, and otherwise falls through to
 /// the reporting path. The code is never rewritten after compile; a flip is a
-/// cell write (see `artifact.ExitPatch`). It clobbers rax and the flags, and
+/// cell write (see `artifact.SilentSite`). It clobbers rax and the flags, and
 /// both are dead at every call site: the `.link` / linked-loop-done / bridge
 /// sites are followed by `emitLedgerAppend` (which loads rax fresh), and the
 /// ordinary deopt site precedes `jmp deopt_exit`, whose flush block clobbers
@@ -1284,7 +1284,7 @@ pub fn emitSilentCheck(a: *x64.Assembler, metadata_cell: *usize, epilogue: x64.L
 
 /// B-3a's silent tail, reached only through `emitSilentCheck` while the exit's
 /// `metadata_cell` holds a published `*SilentExitMetadata`.
-pub fn emitSilentEpilogue(a: *x64.Assembler, kind: ExitPatchKind, metadata_cell: *usize, shared_exit: usize, trace_id: u32) !void {
+pub fn emitSilentEpilogue(a: *x64.Assembler, kind: SilentSiteKind, metadata_cell: *usize, shared_exit: usize, trace_id: u32) !void {
     const can_silence = try a.label();
     const owned = try a.label();
     const qualified_done = try a.label();

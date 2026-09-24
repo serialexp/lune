@@ -1,6 +1,6 @@
 //! Compiled-artifact types for tier-1b native codegen (split from
 //! `nativegen.zig`, file-split pass): the proved `Kind` lattice, the
-//! `NativeResult` exit ABI + silent-episode ledger layouts, exit-patch
+//! `NativeResult` exit ABI + silent-episode ledger layouts, silent-site
 //! descriptors, the entry `SeedPlan`, and `CompiledTrace`/`NativeState` —
 //! the callable artifact and its run wrappers.
 
@@ -116,8 +116,8 @@ pub const NativeResult = extern struct {
     /// `replayLedger` tell a forced yield apart from a natural terminal at the last
     /// entry. Appended last (after `ledger_kind`), same byte-identity rationale.
     ledger_outcome: [trace_exec.LEDGER_CAP]u32,
-    // Doc 17 B-3 frozen tail. These stay unreachable/zero in B-3a: only a future
-    // validated exit patch can enter a silent epilogue.
+    // Doc 17 B-3 frozen tail. These stay zero until a promoted silent site
+    // (nonzero metadata cell) enters a silent epilogue.
     silent_active: u64,
     silent_transitions: u64,
     silent_budget: u64,
@@ -351,7 +351,7 @@ pub const SilentExitMetadata = extern struct {
     barren_exempt: u64,
 };
 
-pub const ExitPatchKind = enum(u8) { deopt, link_terminal, loop_done_linked, region_bridge };
+pub const SilentSiteKind = enum(u8) { deopt, link_terminal, loop_done_linked, region_bridge };
 /// Four dynamic return-continuation slots plus one continuation-to-head slot.
 pub const RET_CONT_SLOTS: usize = 4;
 pub const NATIVE_TRANSITION_SLOTS: usize = RET_CONT_SLOTS + 1;
@@ -365,8 +365,8 @@ pub const NATIVE_TRANSITION_SLOTS: usize = RET_CONT_SLOTS + 1;
 /// lives in data and code changes only at compile time. (Before §2d each
 /// flip rewrote a `nop5`/`jmp` through an RX→RW→RX `mprotect` pair per
 /// edge; fft paid 60,000 of those.)
-pub const ExitPatch = struct {
-    kind: ExitPatchKind,
+pub const SilentSite = struct {
+    kind: SilentSiteKind,
     exit_instr: u32,
     check_off: u32,
     resume_off: u32,
@@ -477,9 +477,10 @@ pub const CompiledTrace = struct {
     /// on the same builds as `linked_entry` (frameless production only). Points into
     /// the same owned `page`; no separate free. INERT until 2.3c-2 arms a slot to it.
     ordinary_entry: ?usize = null,
-    /// B-3a patch descriptors and stable per-exit metadata pointer cells. The cells
-    /// remain null and every epilogue unreachable until B-3b publishes promotion.
-    exit_patches: []ExitPatch = &.{},
+    /// Silent-site descriptors (doc 55 §2d) and stable per-exit metadata pointer
+    /// cells. A cell stays zero, and its epilogue unreachable, until B-3b promotion
+    /// publishes it.
+    silent_sites: []SilentSite = &.{},
     metadata_cells: []usize = &.{},
     /// Doc 22 §B.4: which of the trace's `inputs` this page consumes at entry
     /// (see `SeedPlan`). Set by `compileImpl` for every page; "this page seeds
@@ -730,7 +731,7 @@ pub const CompiledTrace = struct {
         if (self.ret_cont_keys.len > 0) self.gpa.free(self.ret_cont_keys);
         if (self.link_hit_counters.len > 0) self.gpa.free(self.link_hit_counters);
         if (self.slot_rowless_ok.len > 0) self.gpa.free(self.slot_rowless_ok);
-        if (self.exit_patches.len > 0) self.gpa.free(self.exit_patches);
+        if (self.silent_sites.len > 0) self.gpa.free(self.silent_sites);
         if (self.metadata_cells.len > 0) self.gpa.free(self.metadata_cells);
         self.* = undefined;
     }

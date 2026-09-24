@@ -70,7 +70,7 @@ pub const NativeLink = struct {
 pub const PromotedEdge = struct {
     parent: *Trace,
     exit: u32,
-    kind: nativegen.ExitPatchKind,
+    kind: nativegen.SilentSiteKind,
     child: *Trace,
     arm_kind: ArmKind,
     resume_pc: u32,
@@ -132,8 +132,8 @@ pub const ArmRequest = struct {
     kind: ArmKind,
     region: ?RegionArmProof = null,
 };
-pub fn exitPatchFor(compiled: *nativegen.CompiledTrace, exit: u32) ?*nativegen.ExitPatch {
-    for (compiled.exit_patches) |*patch| if (patch.exit_instr == exit) return patch;
+pub fn silentSiteAt(compiled: *nativegen.CompiledTrace, exit: u32) ?*nativegen.SilentSite {
+    for (compiled.silent_sites) |*site| if (site.exit_instr == exit) return site;
     return null;
 }
 pub const SilentSiteError = error{ SilentSiteNotCompiled, SilentSiteMissing, SilentSiteKindMismatch };
@@ -171,8 +171,8 @@ const PromotionDemotions = struct {
     trace_invalidation: u64 = 0,
     teardown: u64 = 0,
     /// B-3d.1 (doc 17 §B3.17 R2): a low-yield window verdict unfroze the region's
-    /// accumulator, so its live promotion was demoted in the same act — patches
-    /// never outlive the frozen state that justified them, and the drain's
+    /// accumulator, so its live promotion was demoted in the same act — published
+    /// cells never outlive the frozen state that justified them, and the drain's
     /// frozen-accumulator check stays a true invariant instead of a latent crash.
     unfreeze: u64 = 0,
     /// B-3d (§B3.17 R1): a NEW armable member edge armed into a region that owns
@@ -216,12 +216,12 @@ pub const NativePhysicalRegistry = struct {
     /// once — a linear scan; see `ParkedProof`).
     parked_proofs: std.ArrayListUnmanaged(ParkedProof) = .empty,
     /// Doc 52 P1: cached counts of live sets by keying, maintained strictly at
-    /// PHYSICAL publication/removal — incremented when a set is actually
-    /// patched in (`promoteSet` append), decremented when it is actually
-    /// unpatched and swap-removed (`demoteSetReason`'s removal path) — never
-    /// when a deferred demotion is merely queued, since the patches stay live
-    /// until `drainBarrier` applies it and the count-gated staging/sweep fast
-    /// paths must agree with the patched reality.
+    /// PHYSICAL publication/removal — incremented when a set's cells are
+    /// actually published (`promoteSet` append), decremented when they are
+    /// actually zeroed and the set swap-removed (`demoteSetReason`'s removal
+    /// path) — never when a deferred demotion is merely queued, since the cells
+    /// stay published until `drainBarrier` applies it and the count-gated
+    /// staging/sweep fast paths must agree with the published reality.
     activation_set_count: usize = 0,
     resident_set_count: usize = 0,
     /// Doc 52 P1: resident-demotion notice. The demotion owner has no
@@ -327,13 +327,13 @@ pub const NativePhysicalRegistry = struct {
     /// compiled parent whose exit carries a silent check of the edge's kind that
     /// tests exactly that exit's cell. Promotion publishes into the cell, so
     /// every check here comes before any publication.
-    pub fn silentSiteFor(edge: PromotedEdge) SilentSiteError!*nativegen.ExitPatch {
+    pub fn silentSiteFor(edge: PromotedEdge) SilentSiteError!*nativegen.SilentSite {
         const compiled = switch (edge.parent.native) {
             .compiled => |*c| c,
             else => return error.SilentSiteNotCompiled,
         };
         if (edge.exit >= compiled.metadata_cells.len) return error.SilentSiteMissing;
-        const site = exitPatchFor(compiled, edge.exit) orelse return error.SilentSiteMissing;
+        const site = silentSiteAt(compiled, edge.exit) orelse return error.SilentSiteMissing;
         if (site.kind != edge.kind) return error.SilentSiteKindMismatch;
         if (site.metadata_cell != &compiled.metadata_cells[edge.exit]) return error.SilentSiteMissing;
         return site;
@@ -716,7 +716,7 @@ pub const NativePhysicalRegistry = struct {
         // Every edge's silent site is proven before anything is allocated or
         // published: publication below is a cell write that cannot fail, so
         // there is nothing to unwind once it starts.
-        var sites: [PROMOTED_SET_CAP]*nativegen.ExitPatch = undefined;
+        var sites: [PROMOTED_SET_CAP]*nativegen.SilentSite = undefined;
         for (edges, 0..) |edge, i| {
             sites[i] = try silentSiteFor(edge);
             // `checkPromotable` proved no live set owns this exit, and the cell

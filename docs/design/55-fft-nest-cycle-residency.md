@@ -40,6 +40,9 @@ peeled traces, now 63% of fft's run) is diagnosed but not designed.
   applied: (1) `checkPromotable` now refuses a set naming one exit twice
   (code patching used to refuse it by accident), pinned in the B-3b.2 test;
   (2) the tail waiver is explicit about `work > 0`.
+- [x] **§2d follow-up — "patch" names retired.** `ExitPatch` →
+  `SilentSite` and friends (full list in §2d). A pure rename: `just test`
+  and the jit-debug gate are green.
 
 ### Outstanding
 
@@ -296,6 +299,16 @@ stays, because it protects the lifetime of summary/metadata storage, not
 code. `patchRel32`, `patchWindow`, and their validation become dead and are
 removed. `ExitPatch` keeps `kind`, `exit_instr`, `resume_off`, and
 `metadata_cell`.
+
+*Follow-up (rename, after the §2d commit):* nothing is patched any more,
+so the "patch" names went too. `ExitPatch` → `SilentSite`, `ExitPatchKind`
+→ `SilentSiteKind`, `CompiledTrace.exit_patches` → `silent_sites`,
+`emitPatchableExit` → `emitSilentSite`, `exitPatchFor` → `silentSiteAt`,
+`patchKindForArm` / `rowPatchKind` → `silentKindForArm` / `rowSilentKind`,
+the `no_patch_point` reject → `no_silent_site` (jitdbg label
+`no-silent-site`), and `dbg_patchable_cycle_rows` →
+`dbg_promotable_cycle_rows`. Link-slot and doc-20 bytecode entry patching
+keep their names; those really are patches.
 
 **Cost.** About 20 bytes per patchable exit stub (cold code), and one
 load + compare + branch per firing of a patchable exit. That is cheap next

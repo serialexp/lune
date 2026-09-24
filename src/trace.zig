@@ -818,7 +818,7 @@ const PromotionRejects = struct {
     bridge_member: u64 = 0,
     region_mismatch: u64 = 0,
     open_chain: u64 = 0,
-    no_patch_point: u64 = 0,
+    no_silent_site: u64 = 0,
     child_mismatch: u64 = 0,
     cap: u64 = 0,
     /// B-3d (§B3.17 R1): `promoteSet` refused because the region already owns a
@@ -1523,7 +1523,7 @@ pub const TraceState = struct {
     dbg_silent_suffix_rows: std.AutoHashMapUnmanaged(DbgTerminalKey, u64) = .empty,
     /// B-3a seam gate input: every replay row is partitioned by whether its physical
     /// armed edge belongs to any bridge-free closed directed subcycle.
-    dbg_patchable_cycle_rows: u64 = 0,
+    dbg_promotable_cycle_rows: u64 = 0,
     dbg_other_replay_rows: u64 = 0,
     /// When non-null, the next back-edge to this anchor will arm a side-trace
     /// recording (even if a trace already exists there).  Set by
@@ -1994,7 +1994,7 @@ pub const TraceState = struct {
         if (comptime jitdbg.enabled) {
             if (!self.config.debug_log) return;
             if (self.armedEdgeInBridgeFreeCycle(owner, exit_instr))
-                self.dbg_patchable_cycle_rows +|= 1
+                self.dbg_promotable_cycle_rows +|= 1
             else
                 self.dbg_other_replay_rows +|= 1;
         }
@@ -2010,9 +2010,9 @@ pub const TraceState = struct {
             var total: u64 = 0;
             for (self.dbg_burst_len_hist) |c| total += c;
             jitdbg.log("burst stats: {d} dispatcher bursts", .{total});
-            const replay_total = self.dbg_patchable_cycle_rows +| self.dbg_other_replay_rows;
+            const replay_total = self.dbg_promotable_cycle_rows +| self.dbg_other_replay_rows;
             jitdbg.log("  B-3 seam rows: bridge-free-closed={d} rest={d} total={d}", .{
-                self.dbg_patchable_cycle_rows, self.dbg_other_replay_rows, replay_total,
+                self.dbg_promotable_cycle_rows, self.dbg_other_replay_rows, replay_total,
             });
             jitdbg.log("  silent: candidates={d} promotions={d} parked-reuses={d} demotions={d} bursts={d} transitions={d} hops={d} budget={d} barren={d} suffix={d}", .{
                 self.silent_promotion_candidates,               self.registry.native_physical.silent_promotions,
@@ -2030,12 +2030,12 @@ pub const TraceState = struct {
                 self.region_policy.arrival_entry_regions.count(),
                 self.region_policy.region_defs.count(),
             });
-            jitdbg.log("  silent rejects: bridge={d} region={d} open={d} child-mismatch={d} no-patch={d} cap={d} region-owned={d} rid-owned={d} resident-occupied={d}", .{
+            jitdbg.log("  silent rejects: bridge={d} region={d} open={d} child-mismatch={d} no-silent-site={d} cap={d} region-owned={d} rid-owned={d} resident-occupied={d}", .{
                 self.silent_rejects.bridge_member,
                 self.silent_rejects.region_mismatch,
                 self.silent_rejects.open_chain,
                 self.silent_rejects.child_mismatch,
-                self.silent_rejects.no_patch_point,
+                self.silent_rejects.no_silent_site,
                 self.silent_rejects.cap,
                 self.silent_rejects.region_owned,
                 self.silent_rejects.region_id_owned,
@@ -2943,7 +2943,7 @@ pub const TraceState = struct {
     // sibling split files can call them through `self.` too.
     pub const PROMOTED_SET_CAP = trace_link_mod.PROMOTED_SET_CAP;
     pub const PROVENANCE_VERDICT_CAP = trace_link_mod.PROVENANCE_VERDICT_CAP;
-    pub const exitPatchFor = trace_link_mod.exitPatchFor;
+    pub const silentSiteAt = trace_link_mod.silentSiteAt;
     pub const validateRegionBridgeReceipt = trace_link_mod.validateRegionBridgeReceipt;
     pub const promotedEdgeFromLink = trace_link_mod.promotedEdgeFromLink;
     pub const rejectPromotion = trace_link_mod.rejectPromotion;

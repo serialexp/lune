@@ -108,12 +108,12 @@ pub fn expectBail(t: *const Trace) !void {
     }
 }
 
-/// Doc 55 §2d: decode `p`'s compiled silent check and pin its shape. It must
+/// Doc 55 §2d: decode silent site `p`'s compiled check and pin its shape. It must
 /// load exactly this exit's cell address (`mov rax, imm64` = REX.W B8), branch
 /// to exactly this exit's epilogue (`jne rel32` = 0F 85), and fall through at
 /// `resume_off`. The check is compile-time code that is never rewritten, so
 /// this holds for the page's whole life, promoted or not.
-pub fn expectSilentCheck(ct: *const CompiledTrace, p: nativegen.ExitPatch) !void {
+pub fn expectSilentCheck(ct: *const CompiledTrace, p: nativegen.SilentSite) !void {
     const code = ct.page.code;
     try testing.expectEqual(@as(u8, 0x48), code[p.check_off]);
     try testing.expectEqual(@as(u8, 0xB8), code[p.check_off + 1]);

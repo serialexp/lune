@@ -302,10 +302,10 @@ fn makeB3M1RampTrace(
 
 /// Doc 55 §2d: an edge is promoted iff its exit's data cell is published. The
 /// compiled silent check is identical in both states (code is never rewritten).
-fn expectB3Patched(edge: PromotedEdge, promoted: bool) !void {
+fn expectB3Promoted(edge: PromotedEdge, promoted: bool) !void {
     const compiled = &edge.parent.native.compiled;
-    const patch = TraceState.exitPatchFor(compiled, edge.exit).?;
-    try nativegen_testutil.expectSilentCheck(compiled, patch.*);
+    const site = TraceState.silentSiteAt(compiled, edge.exit).?;
+    try nativegen_testutil.expectSilentCheck(compiled, site.*);
     const cell = compiled.metadata_cells[edge.exit];
     if (!promoted) {
         try testing.expectEqual(@as(usize, 0), cell);
@@ -314,7 +314,7 @@ fn expectB3Patched(edge: PromotedEdge, promoted: bool) !void {
     try testing.expect(cell != 0);
     const metadata: *nativegen.SilentExitMetadata = @ptrFromInt(cell);
     try testing.expectEqual(&compiled.slots[edge.exit], metadata.slot);
-    try testing.expectEqual(@intFromPtr(compiled.page.code.ptr) + patch.resume_off, metadata.reporting_target);
+    try testing.expectEqual(@intFromPtr(compiled.page.code.ptr) + site.resume_off, metadata.reporting_target);
 }
 
 fn b3ObservedRow(t: *Trace, exit: u32, kind: trace_exec.LedgerKind) trace_exec.LedgerEntry {
@@ -438,7 +438,7 @@ test "B-3d.2 set candidacy accepts 2/3-edge automata in canonical order from any
     try testing.expectEqual(@as(u32, 10), three_a[0].parent.id);
     for (three_a, three_c) |ea, ec| try testing.expectEqual(ea.parent, ec.parent);
 
-    // A second armed outgoing exit that is NOT patch-pointed (out-of-range
+    // A second armed outgoing exit that has NO silent site (out-of-range
     // slot on a one-instruction link trace) is excluded from the candidate —
     // the set grammar admits only edges `promotedEdgeFromLink` validates.
     try state.registry.native_physical.armed_links.append(gpa, .{
@@ -507,19 +507,19 @@ test "B-3d.2 set candidacy rejects non-member rows, kind mismatch, adjacent-pair
     try testing.expect(state.detectPromotableSet(&closed, key) == null);
     try testing.expectEqual(@as(u64, 1), state.silent_rejects.open_chain);
     state.registry.native_physical.armed_links.items[0].kind = .link_terminal;
-    // Same exclusion when the parent has no patch table.
-    const saved_patches = a.native.compiled.exit_patches;
-    a.native.compiled.exit_patches = &.{};
+    // Same exclusion when the parent has no silent-site table.
+    const saved_sites = a.native.compiled.silent_sites;
+    a.native.compiled.silent_sites = &.{};
     try testing.expect(state.detectPromotableSet(&closed, key) == null);
     try testing.expectEqual(@as(u64, 2), state.silent_rejects.open_chain);
-    a.native.compiled.exit_patches = saved_patches;
-    // A row whose observed patch kind disagrees with the armed edge's kind.
+    a.native.compiled.silent_sites = saved_sites;
+    // A row whose observed silent-site kind disagrees with the armed edge's kind.
     const kind_mismatch = [_]trace_exec.LedgerEntry{
         b3ObservedRow(a, 0, .deopt),
         b3ObservedRow(b, 0, .link_terminal),
     };
     try testing.expect(state.detectPromotableSet(&kind_mismatch, key) == null);
-    try testing.expectEqual(@as(u64, 1), state.silent_rejects.no_patch_point);
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.no_silent_site);
     // Per-adjacent-pair child-match: row i's armed child must own row i+1.
     const pair_break = [_]trace_exec.LedgerEntry{
         b3ObservedRow(a, 0, .link_terminal),
@@ -573,7 +573,7 @@ test "B-3b.2 promotion publishes mixed deopt/link/loop-done cells; demotion zero
     defer state.deinit();
     var code: [4]Instr = @splat(Instr.op0(.halt));
     code[1] = Instr.op0(.for_loop);
-    const proto = Proto{ .id = 1703, .code = &code, .name = "b3-patch", .num_registers = 2 };
+    const proto = Proto{ .id = 1703, .code = &code, .name = "b3-silent-site", .num_registers = 2 };
     const guard = try makeB3GuardTrace(gpa, &state, &proto, 2, 0);
     const done = try makeB3LoopDoneTrace(gpa, &state, &proto, 3, 1);
     const link = try makeB3LinkTrace(gpa, &state, &proto, 1, 2, 0);
@@ -595,13 +595,13 @@ test "B-3b.2 promotion publishes mixed deopt/link/loop-done cells; demotion zero
     const dup = [_]PromotedEdge{ edges[0], edges[0] };
     try testing.expectError(error.InvalidPromotionSet, state.registry.native_physical.promoteSet(&dup, key, state.config.min_useful));
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
-    for (edges) |edge| try expectB3Patched(edge, false);
+    for (edges) |edge| try expectB3Promoted(edge, false);
     try state.promoteSet(edges, key);
     try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
-    for (edges) |edge| try expectB3Patched(edge, true);
+    for (edges) |edge| try expectB3Promoted(edge, true);
     try testing.expectEqual(@as(u64, 1), state.registry.native_physical.silent_promotions);
     state.demoteAllSets();
-    for (edges) |edge| try expectB3Patched(edge, false);
+    for (edges) |edge| try expectB3Promoted(edge, false);
     try testing.expectEqual(@as(u64, 1), state.registry.native_physical.silent_demotions);
 }
 
@@ -617,9 +617,9 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
     const bridge = try makeB3BridgeTrace(gpa, &state, &proto, 41, 20, 9);
     const succ = try makeB3LinkTrace(gpa, &state, &proto, 42, 9, 20);
     try testing.expect(nativegen.isCompositeBridgeCandidate(&bridge.code, 11));
-    const patch = TraceState.exitPatchFor(&bridge.native.compiled, 11).?;
-    try testing.expectEqual(nativegen.ExitPatchKind.region_bridge, patch.kind);
-    try nativegen_testutil.expectSilentCheck(&bridge.native.compiled, patch.*);
+    const site = TraceState.silentSiteAt(&bridge.native.compiled, 11).?;
+    try testing.expectEqual(nativegen.SilentSiteKind.region_bridge, site.kind);
+    try nativegen_testutil.expectSilentCheck(&bridge.native.compiled, site.*);
 
     const rid: RegionId = @enumFromInt(1714);
     try state.region_policy.region_defs.put(gpa, rid, .{
@@ -676,7 +676,7 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
         link.region_id = rid;
     };
     try state.promoteSet(edges, key);
-    try expectB3Patched(bridge_edge.?, true);
+    try expectB3Promoted(bridge_edge.?, true);
 
     // Reporting-mode oracle for one bridge firing followed by the structural
     // link back into the ring.
@@ -754,7 +754,7 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
 
     state.rebuildRegions();
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
-    try expectB3Patched(bridge_edge.?, false);
+    try expectB3Promoted(bridge_edge.?, false);
 }
 
 test "B-3b suffix preserves bridge materialization for child deopt and prologue fail" {
@@ -1217,12 +1217,12 @@ test "B-3b.2 slot mutation and closeRegion demote before invalidation" {
     // short-circuits at the funnel and demotes NOTHING.
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
     try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
-    for (edges) |edge| try expectB3Patched(edge, true);
+    for (edges) |edge| try expectB3Promoted(edge, true);
     // A CHANGED relation (different child) still demotes via prepareSlotMutation.
     const c2 = try makeB3LinkTrace(gpa, &state, &proto, 3, 2, 1);
     try testing.expect(try state.armNativeLink(a, 0, c2, .link_terminal));
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
-    for (edges) |edge| try expectB3Patched(edge, false);
+    for (edges) |edge| try expectB3Promoted(edge, false);
 
     // Restore the ring relation (changed again: c2 -> b) for the closeRegion leg.
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
@@ -1295,7 +1295,7 @@ test "B-3b.2 replay walk queues demotion and applies it before pending disarms" 
     state.applyPendingDisarms();
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
-    for (edges) |edge| try expectB3Patched(edge, false);
+    for (edges) |edge| try expectB3Promoted(edge, false);
 }
 
 test "B-3d.1 low-yield unfreeze demotes the region's promotion in the same act" {
@@ -1322,14 +1322,14 @@ test "B-3d.1 low-yield unfreeze demotes the region's promotion in the same act" 
     state.config.min_useful = 8;
 
     // Depth 0: the low-yield verdict unfreezes AND demotes immediately —
-    // patches never outlive the frozen state that justified them (§B3.17 R2;
-    // pre-existing hole: the barren-exhaustion path could unfreeze with the
-    // patches live and panic the next drain on the frozen check).
+    // published cells never outlive the frozen state that justified them
+    // (§B3.17 R2; pre-existing hole: the barren-exhaustion path could unfreeze
+    // with the cells live and panic the next drain on the frozen check).
     state.flushRegionWindow(key, 1);
     try testing.expect(!state.region_policy.region_profit.get(key).?.frozen);
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
     try testing.expectEqual(@as(u64, 1), state.registry.native_physical.silent_demotion_reasons.unfreeze);
-    for (edges) |edge| try expectB3Patched(edge, false);
+    for (edges) |edge| try expectB3Promoted(edge, false);
 
     // Mid-walk: the same verdict QUEUES the demotion; the walk applies it at
     // its exit, exactly like every other deferred demotion source.
@@ -1347,7 +1347,7 @@ test "B-3d.1 low-yield unfreeze demotes the region's promotion in the same act" 
     state.applyPendingDisarms();
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
     try testing.expectEqual(@as(u64, 2), state.registry.native_physical.silent_demotion_reasons.unfreeze);
-    for (edges) |edge| try expectB3Patched(edge, false);
+    for (edges) |edge| try expectB3Promoted(edge, false);
 }
 
 test "B-3d round-6: a repeated-parent SET firing out of order resolves its terminal by measurement" {
@@ -1830,7 +1830,7 @@ test "C' parked proof: clean region_close parks; next activation re-promotes wit
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
     try testing.expectEqual(@as(usize, 1), state.registry.native_physical.parked_proofs.items.len);
     try testing.expectEqual(key1.region_id, state.registry.native_physical.parked_proofs.items[0].region_id);
-    for (edges) |edge| try expectB3Patched(edge, false);
+    for (edges) |edge| try expectB3Promoted(edge, false);
 
     // A NEW activation of the same region: one full-cap yielded ledger with a
     // frozen accumulator re-promotes from the parked proof — no
@@ -1853,7 +1853,7 @@ test "C' parked proof: clean region_close parks; next activation re-promotes wit
     try testing.expect(std.meta.eql(key2, state.registry.native_physical.promoted_sets.items[0].region_key));
     // Take semantics: the proof was consumed by the reuse.
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.parked_proofs.items.len);
-    for (edges) |edge| try expectB3Patched(edge, true);
+    for (edges) |edge| try expectB3Promoted(edge, true);
     state.demoteAllSets();
 }
 
@@ -2465,7 +2465,7 @@ test "doc 52 P1: threshold promotes a RESIDENT set — dormant region, exempt me
     try testing.expectEqual(key.region_id, set.region_key.region_id);
     try testing.expectEqual(trace.RESIDENT_ACTIVATION, set.region_key.activation);
     for (set.edges, 0..) |edge, i| {
-        try expectB3Patched(edge, true);
+        try expectB3Promoted(edge, true);
         try testing.expectEqual(@as(u64, 1), set.metadata[i].barren_exempt);
     }
     {
@@ -2651,7 +2651,7 @@ test "doc 52 P1: resident-only native cycle — epilogue barren exemption end to
     try state.promoteResidentSet(edges, key.region_id);
     try testing.expectEqual(@as(usize, 1), state.registry.native_physical.resident_set_count);
 
-    // Run the REAL patched cycle with no activation open. The armed a→b→a
+    // Run the REAL promoted cycle with no activation open. The armed a→b→a
     // ring spins silently until the budget exhausts. Without the epilogue
     // exemption, six link-terminal firings would leave cur_zero_run == 6;
     // the exemption keeps the run untouched at its staged zero.
@@ -2717,7 +2717,7 @@ test "doc 52 P1: demotion funnels — activation close skips residents; deferred
     try testing.expectEqual(@as(usize, 1), state.registry.native_physical.resident_set_count);
     try testing.expectEqual(@as(u8, 4), state.region_policy.region_defs.get(key.region_id).?.recurrence_streak);
 
-    // A demotion queued mid-walk leaves the patched reality — and therefore
+    // A demotion queued mid-walk leaves the published reality — and therefore
     // the count caches and the recurrence proof — untouched until
     // drainBarrier applies it at depth 0.
     state.registry.native_physical.enterReplayWalk();

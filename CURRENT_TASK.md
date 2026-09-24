@@ -106,9 +106,10 @@ The record is doc 55 §2 / §2d.
   run**. That is the bit-reverse peeled traces (`fft_bitreverse:9`, `:55`;
   doc 40 fusion exclusion + the doc-38 `low_trip_while` gate). Needs a
   design pass (doc 40's open question). Doc 54 P3 is still outstanding.
-- Naming debt, not done: `ExitPatch` / `ExitPatchKind` /
-  `exit_patches` / `emitPatchableExit` still say "patch", though nothing is
-  patched any more. It's a rename across ~9 files; left for Bart to decide.
+- Follow-up rename done: the silent switch's "patch" names are now
+  "silent site" names (`SilentSite`, `silent_sites`, `silentSiteAt`,
+  `no_silent_site`, …; full list in doc 55 §2d). Link-slot and doc-20
+  entry patching keep their names, because those really are patches.
 
 ## Status 2026-09-24 (latest+26) — NEW ARC: scimark-fft (weakest bench, 23.3× LJ), doc 55 §1 LANDED (fft → 14.6×); §2/§3 next
 
