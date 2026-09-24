@@ -75,6 +75,44 @@ the ones that bite):
   before declaring it hard; "replay/determinism forbids it" only ever means
   *adapt* the mechanism (ids not addresses, deterministic counters).
 
+## Status 2026-09-24 (latest+28) — doc 55 §3 diagnosed; NEW ARC: doc 56 exit-started side traces (design round)
+
+- **§3 finding** (doc 55 §3 "Finding"): both bit-reverse anchors (`:9`
+  23.8% of the run, `:55` 32.6%) run at 0.0% traced. `:9`'s t1 unrolls the
+  while for one rare path (swap + 3 trips, ~3% of iterations). Only one
+  sibling ever records (the prime-side bound of 2), the single-slot sibling
+  watch never reaches `hotguard` because the exits alternate, and the
+  anchor is legacy-thrash gated for good. `:55`'s usable trace is peeled
+  (fusion exclusion) and the anchor is `low_trip_while` gated.
+- **Root cause:** our side-trace analogue is a whole-iteration sibling
+  from the anchor (the doc 17 §S coarse-deopt contract), so the shapes
+  multiply as (branches × trip counts). LuaJIT (`-jv`) builds 2 roots and
+  about 8 side traces that each start AT the exit and share the prefix.
+- **Bart's decision:** do the proper Pall mechanism, **exit-started side
+  traces** (doc 17 §S.8's deferred per-exit snapshots), even if it takes
+  weeks. Design round first: **doc 56**.
+- **Doc 56 is at revision 3, not yet implemented.** Antigravity reviewed
+  it twice (Codex is out until 09-29):
+  - **Round 1: CHANGES REQUESTED.** 3 blockers: store positions didn't
+    survive `tropt`; a re-run hits `P` several times in unrolled loops;
+    the rowless mode broke the ledger.
+  - **Round 2: APPROVE WITH CHANGES.** Owner election compares tagged
+    pcs; Q7 must not reserve a register; `aref.a` is a store operand;
+    `EXIT_PC_BIT`.
+
+  All findings are folded in (doc 56 §11/§12). Receipts are in
+  `docs/reviews/doc56/`. The shape now:
+  - **Materialize first**, like LuaJIT: the exit writes the tier-0
+    state at resume pc `P`, then recording starts at `P`.
+  - **Boundary ordinals** on guards and sunk-store IR.
+  - **Lazy per-exit adapters**, built from a compile-time exit location
+    map and switched by RIP-relative data cells.
+  - **Rows plus silent promotion** (no rowless mode).
+  - **Peeled:** never link into a peeled child; peeled parents are
+    deferred.
+- **Next:** Bart reviews doc 56 and decides whether to start Phase 0
+  now or wait for the Codex round (owed 09-29).
+
 ## Status 2026-09-24 (latest+27) — doc 55 §2 + §2d LANDED: fft 14.6× → 12.6× LJ, sparse −31%; silent switch is now data (no runtime code patching)
 
 The record is doc 55 §2 / §2d.

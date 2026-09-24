@@ -397,6 +397,79 @@ two blockers:
 Not investigated further in this pass. It needs its own design (doc 40
 "Open question — persistent fusion for peeled traces").
 
+### Finding (2026-09-24, after §2d)
+
+`--jit-stats` (fft 500): `:9` is 23.8% of the run and `:55` is 32.6%.
+Both run at 0.0% traced. jit-debug (`/tmp/jd`, fft 50 and 500):
+
+- **`:9`, the outer `for`.** Trace t1 unrolls the inner `while` for the
+  one path it happened to record: swap taken (`i < j`) and exactly 3
+  trips. Its exits are ei 12 (no swap, ~50%) and ei 60/65/70/75 (0, 1,
+  2 or ≥4 trips; P(t trips) ≈ 2^-(t+1)). The recorded path covers about
+  3% of iterations, so nearly every entry exits with `completed=0`.
+  - Only one sibling ever records: t3 (the 0-trip exit ei 60, armed
+    `sibling_handoff` both ways). The prime-side route in `noteTakenExit`
+    stops at `anchorPopulation >= 2`, the "one-ramp" bound.
+  - The sibling watch (`noteSiblingTerminal`) is one slot per trace, and
+    it resets whenever a different exit fires. t1's exits alternate
+    (65 → 75 → 65 → 70 → 12 …), so the count never gets past 1.
+  - The `completed=0` receipts reach the legacy-thrash limit
+    (`max_penalty + hotexit` = 18). The anchor gets gated and backs off
+    exponentially (7 strikes, 16k window by fft 500), and nothing at `:9`
+    runs again.
+  - `unroll_fail` reaches 3, above the doc-38 decomposition flip (2). But
+    the flip only applies to a new recording, and the gated anchor never
+    records again.
+- **`:55`, the inner `while`.** t2 (k float at entry) cannot take the
+  first trip, because `k = n` is an int. The peeled t4 can, but the doc-39
+  v1 fusion exclusion refuses every arm into or out of a peeled trace
+  (`provenance-drain … decline: peeled fusion exclusion`). The
+  `low_trip_while` gate (≈1 trip per entry) turns off dispatcher entry
+  entirely, so no receipts arrive to arm anything.
+
+**What LuaJIT builds** (`luajit -jv`, the same function at lines 90–100
+of its `scimark_lib.lua`): two roots, T2 (the outer `for`, with the while
+unrolled) and T4 (the inner while). Around them sit about 8 side traces:
+3 (2/9), 5 (2/4) → T4, 6 (2/1), 7 (3/1), 8 (3/2) → T4, 9 (4/1) → T2,
+10 (4/3), 11 (6/1). Every side trace **starts recording at its parent's
+exit**, so the prefix before the exit is shared and never re-recorded.
+The trip-count × branch variety costs one small trace per hot exit, all
+patched native. A trace that exits often stays enterable: Pall's only
+backoff (`penalty_pc`) is for recording aborts.
+
+**The structural gap.** Our side-trace analogue is a same-anchor sibling
+that re-runs the whole iteration from the anchor. That is the coarse-deopt
+contract; doc 17 §S.2 chose it and §S.8 deferred true per-exit snapshots
+"until a workload demands mid-body exit handoffs". bitreverse is that
+workload. Here the siblings multiply as (branch shapes) × (trip counts),
+about 10 whole-iteration shapes, against `max_traces_per_anchor` = 4 and
+the prime-side bound of 2. Pall's tree grows by one exit suffix at a time.
+
+Options (for Bart; not decided):
+
+1. **Exit-started side traces** (Pall's mechanism, the doc 17 §S.8
+   deferral). A hot exit records from the guard's resume pc, starting
+   from the exit's materialized state (the doc 45 precise snapshot
+   substrate). The side trace links to a loop anchor, and the exit is
+   armed to jump into it natively. It is general: any branchy or
+   variable-trip body stops multiplying siblings. It is also the biggest
+   piece of work: per-exit snapshots on ordinary traces, recording from a
+   mid-body pc, native precise exits, and replay and determinism
+   coverage.
+2. **Decomposition that works.** Make the doc-38 flip reachable, lift the
+   doc-39 peeled fusion exclusion (the doc 40 open question), and stop
+   `low_trip_while` from starving the evidence that native links need.
+   The result is a nest cycle like `fft_transform:131/193` (inner while
+   ⇄ post-while continuation), running on the §1/§2 region and silent
+   machinery. Medium work. The peeled-fusion part is general (any
+   type-unstable loop entered through a link).
+3. **Grow siblings faster inside the current shape.** Per-exit watch
+   counts instead of one moving slot, drop the prime-side bound of 2, and
+   keep the anchor ungated while coverage grows. Smallest work, but still
+   whole-iteration siblings against a combinatorial shape count. The
+   population cap would have to rise for this one loop, which is the Z-6
+   smell.
+
 ## References
 
 - Doc 17 §B.5/§B.6 (provenance edges, `max_edge_strikes`), §B-3 (silent
