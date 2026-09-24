@@ -75,6 +75,41 @@ the ones that bite):
   before declaring it hard; "replay/determinism forbids it" only ever means
   *adapt* the mechanism (ids not addresses, deterministic counters).
 
+## Status 2026-09-24 (latest+27) — doc 55 §2 + §2d LANDED: fft 14.6× → 12.6× LJ, sparse −31%; silent switch is now data (no runtime code patching)
+
+The record is doc 55 §2 / §2d.
+- **§2 had three causes, all fixed.** (a) The inner loop-done lands in
+  sibling t7, which was not a region member. It is fixed with a separate
+  `arrival_entry_regions` index (Bart's pick, "two indexes").
+  `dest_entry_regions` stays the strict member proof for bridge child
+  selection; a one-map version broke nsieve by arming the bridge into a
+  deopting sibling. (b) Stage tails (2^k − 1 laps) struck the region.
+  `beginClose` now waives a `0 < work < N` close after a useful window.
+  (c) The silent path counts committing kinds as progress.
+- **§2d:** (b) exposed that every silent promote/demote rewrote machine
+  code through `mprotect` (lu 53k calls, fft 60k). LuaJIT never flips code
+  per activation (`lj_asm_patchexit` is one-way, on side-trace attach). So
+  each promotable exit now has a permanent compiled check of its data cell
+  (`emitSilentCheck`), and promote/demote are cell writes (Bart's pick,
+  "option 1"). The patch machinery is removed, and so is the `arena`
+  parameter on promote/demote/`prepareSlotMutation`/`publishValidatedLink`.
+- **Measured:** board fft 242.8 → 207.2 ms, sparse 179 → 123, sieve_int
+  −20%, repack −11%, nsieve −10%, binary-trees −8.5%, no regressions (the
+  fib +5% board delta is noise per an interleaved A/B). lu `mprotect`
+  102 → 14. `just test` and the jit-debug gate are green.
+- **Review:** Antigravity (codex out until 09-29): APPROVED WITH NITS, both
+  applied. Duplicate-exit sets are refused in `checkPromotable` (the old
+  patching refused them by accident), pinned in the B-3b.2 test; the tail
+  waiver is explicit about `work > 0`. A codex re-review of §1/§2/§2d is
+  owed.
+- **Next: §3.** fft `--jit-stats`: tier-0-with-a-trace is **63% of the
+  run**. That is the bit-reverse peeled traces (`fft_bitreverse:9`, `:55`;
+  doc 40 fusion exclusion + the doc-38 `low_trip_while` gate). Needs a
+  design pass (doc 40's open question). Doc 54 P3 is still outstanding.
+- Naming debt, not done: `ExitPatch` / `ExitPatchKind` /
+  `exit_patches` / `emitPatchableExit` still say "patch", though nothing is
+  patched any more. It's a rename across ~9 files; left for Bart to decide.
+
 ## Status 2026-09-24 (latest+26) — NEW ARC: scimark-fft (weakest bench, 23.3× LJ), doc 55 §1 LANDED (fft → 14.6×); §2/§3 next
 
 Bart picked fft over doc 54 P3 (P3 stays outstanding in doc 54). The
@@ -109,6 +144,9 @@ re-review is still owed. Antigravity also gave a §2 lead: the close fires in
 `dest_entry_regions` misses it. Verify that first. Baseline shadow:
 `/tmp/lune_d55_base` (HEAD `1c5d1fb`). New dbg probes: `provenance-retire:`,
 `region: close`.
+
+(§2 was resolved in latest+27 above; its bisect, the LuaJIT flip-cost
+reading, and the options Bart chose between are recorded in doc 55 §2/§2d.)
 
 ## Status 2026-09-19 (latest+25) — doc 54 P2 + AMENDMENT LANDED: fib 171.6→~81-87 ms, 24.7×→~10× LJ; episodes 925k→2.3k (task #43)
 

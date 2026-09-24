@@ -207,6 +207,8 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
         .id = 9,
     };
     try state.region_policy.dest_entry_regions.put(gpa, 9, try gpa.dupe(RegionId, &.{rid}));
+    // Doc 55 §2 invariant: arrival ⊇ dest (the destination step reads arrival).
+    try state.region_policy.arrival_entry_regions.put(gpa, 9, try gpa.dupe(RegionId, &.{rid}));
     state.penalty.clearRetainingCapacity();
     state.gate.clearRetainingCapacity();
 
@@ -351,11 +353,28 @@ test "gate-fix consumption boundary: qualified activations own member barren rec
     state.onSideExit(&nonmember, 0, .entered);
     try testing.expectEqual(@as(u32, 1), state.penalty.get(nonmember.code.anchor).?);
 
-    // (g) Departure close still prices the remainder against the owner.
+    // (g) Departure close of a QUALIFIED activation: the sub-window remainder is
+    // the activation's tail, not low-yield evidence (doc 55 §2) — it closes
+    // without a flush and without a strike on the owner.
+    try testing.expect(state.region_policy.region_profit.get(key).?.outer_traversals -
+        state.region_policy.region_profit.get(key).?.window_base > 0); // a real tail
     const flushes_before = state.region_policy.region_profit_flushes;
     state.observeRegionProgramPoint(62, 5, 1, 7); // pc 5 ∉ footprint → close
     try testing.expectEqual(@as(usize, 0), state.regionProfitCount());
-    try testing.expect(state.region_policy.region_profit_flushes > flushes_before);
+    try testing.expectEqual(flushes_before, state.region_policy.region_profit_flushes);
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(owner));
+
+    // (h) An UNQUALIFIED activation's remainder is still priced: a short
+    // activation (total work < N) closes with a low-yield strike on the owner.
+    state.setRegionContext(1, 8);
+    const key8: RegionKey = .{ .region_id = rid, .activation = 8 };
+    _ = state.accountRegionProfit(.{ .trace_id = 9, .exit_instr = 0 }, 1, .deferred);
+    try testing.expect(!state.region_policy.region_profit.get(key8).?.useful_window_seen);
+    const flushes_before_h = state.region_policy.region_profit_flushes;
+    state.observeRegionProgramPoint(62, 5, 1, 8);
+    try testing.expectEqual(@as(usize, 0), state.regionProfitCount());
+    try testing.expect(state.region_policy.region_profit_flushes > flushes_before_h);
+    try testing.expectEqual(@as(u32, 1), state.penalty.get(owner).?);
 }
 
 test "A-vii-e.1 observer fast path: built on open, survive verdicts match the slow predicate, cleared on close" {

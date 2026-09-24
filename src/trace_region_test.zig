@@ -1361,6 +1361,28 @@ test "A-ii.4 sibling boundary edge: only the physical MEMBER's exits are credite
     try testing.expect(state.region_policy.dest_entry_regions.get(2) != null);
     try testing.expect(state.region_policy.dest_entry_regions.get(3) == null);
     try testing.expect(state.region_policy.dest_entry_regions.get(5) == null);
+
+    // Doc 55 §2: a same-anchor provenance link joins the sibling to the member's
+    // physical group FOR ARRIVAL ONLY (fft's `:193` pair — the inner loop-done
+    // lands in the sibling that hands off to the back-edge's realizer). A
+    // cross-anchor link (X@40 → A@2) never joins.
+    const points_before = def.member_points.len;
+    try state.provenance_edges.append(gpa, .{ .parent_id = 3, .exit_instr = 0, .child_id = 1 });
+    try state.provenance_edges.append(gpa, .{ .parent_id = 5, .exit_instr = 0, .child_id = 1 });
+    state.rebuildRegions();
+    try testing.expect(state.region_policy.arrival_entry_regions.get(1) != null); // members arrive too
+    try testing.expect(state.region_policy.arrival_entry_regions.get(2) != null);
+    try testing.expect(state.region_policy.arrival_entry_regions.get(3) != null); // linked sibling: arrival
+    try testing.expect(state.region_policy.arrival_entry_regions.get(5) == null); // cross-anchor: never
+    try testing.expect(state.region_policy.arrival_entry_regions.get(4) == null);
+    // ...but NOT the member proof (bridge child selection — nsieve's bridge armed
+    // into the deopting sibling when one map served both jobs)...
+    try testing.expect(state.region_policy.dest_entry_regions.get(3) == null);
+    try testing.expect(!state.traceInRegion(3, rid));
+    try testing.expect(state.traceInRegion(1, rid));
+    // ...nor source classification, nor the footprint.
+    try testing.expectEqual(@as(usize, 0), state.classifyExit(.{ .trace_id = 3, .exit_instr = 0 }).len);
+    try testing.expectEqual(points_before, state.region_policy.region_defs.get(rid).?.member_points.len);
 }
 
 test "A-ii.4 rebind tombstone: same edge set, incompatible member_points → armable flips false, purged from physical" {

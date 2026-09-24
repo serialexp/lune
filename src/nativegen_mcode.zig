@@ -1,7 +1,8 @@
 //! Executable-memory plumbing for tier-1b native codegen (split from
 //! `nativegen.zig`, file-split pass): the `ExecPage` handle, the standalone
 //! `mapExecutable`, and the shared `McodeArena` — LuaJIT-style co-located
-//! mcode regions with the W^X patch machinery and the frameless trampoline.
+//! mcode regions (W^X: RW only while a compile writes a slot) and the
+//! frameless trampoline.
 //!
 //! x86-64/Linux only at runtime; every OS-specific reference
 //! (`std.posix.mmap`, `mprotect`) sits behind a
@@ -22,16 +23,6 @@ pub const MapError = error{
     UnsupportedTarget,
     MmapFailed,
     MprotectFailed,
-};
-
-pub const PatchError = MapError || error{
-    NotArenaOwned,
-    WrongArena,
-    StalePage,
-    OffsetOutOfBounds,
-    OpcodeMismatch,
-    OriginalBytesMismatch,
-    DisplacementOutOfRange,
 };
 
 /// A callable view of emitted machine code. `entry()` reinterprets its base as a
@@ -260,10 +251,9 @@ pub const McodeArena = struct {
     /// An mprotect's direct cost scales with the range (PTE rewrite + per-page
     /// TLB invalidation), and flipping unrelated pages RX→RW→RX additionally
     /// forces instruction refetch for every other trace co-located in the
-    /// 1 MiB region. The patch path is not compile-time-only: promote/demote
-    /// cycles patch per region activation (grid_matmul measured 1,640
-    /// region-wide flips — 2 per patched edge — before this narrowing), so
-    /// the window must stay proportional to the bytes actually written.
+    /// 1 MiB region, so the window stays proportional to the bytes actually
+    /// written. (Runtime code patching is gone since doc 55 §2d; the silent
+    /// switch is a data cell. Only compile-time allocation writes code now.)
     fn protectWindow(mem: []align(page_align) u8, off: usize, len: usize, exec: bool) MapError!void {
         if (comptime !is_x64_linux) return error.UnsupportedTarget;
         const page = std.heap.pageSize();
@@ -348,72 +338,6 @@ pub const McodeArena = struct {
         self.next_page_generation +%= 1;
         if (self.next_page_generation == 0) self.next_page_generation = 1;
         return generation;
-    }
-
-    fn validatePatchPage(self: *McodeArena, page: *const ExecPage, generation: u64, patch_off: usize) PatchError!*Region {
-        const slot = switch (page.owner) {
-            .arena => |s| s,
-            .owned => return error.NotArenaOwned,
-        };
-        if (slot.arena != self) return error.WrongArena;
-        if (slot.generation != generation) return error.StalePage;
-        var live = false;
-        for (self.live_pages.items) |allocation| {
-            if (allocation.region == slot.region and allocation.offset == slot.offset and allocation.generation == generation) {
-                live = true;
-                break;
-            }
-        }
-        if (!live) return error.StalePage;
-        if (slot.region >= self.regions.items.len) return error.StalePage;
-        if (patch_off > page.code.len or page.code.len - patch_off < 5) return error.OffsetOutOfBounds;
-        const region = &self.regions.items[slot.region];
-        if (slot.offset > region.used or page.code.len > region.used - slot.offset) return error.StalePage;
-        if (page.code.ptr != region.mem.ptr + slot.offset) return error.StalePage;
-        return region;
-    }
-
-    fn rel32Bytes(page: *const ExecPage, patch_off: usize, target: usize) PatchError![5]u8 {
-        const next = @intFromPtr(page.code.ptr) + patch_off + 5;
-        const delta: i128 = @as(i128, @intCast(target)) - @as(i128, @intCast(next));
-        if (delta < std.math.minInt(i32) or delta > std.math.maxInt(i32))
-            return error.DisplacementOutOfRange;
-        const disp: u32 = @bitCast(@as(i32, @intCast(delta)));
-        return .{ 0xE9, @truncate(disp), @truncate(disp >> 8), @truncate(disp >> 16), @truncate(disp >> 24) };
-    }
-
-    fn applyPatch(self: *McodeArena, region: *Region, dst: []u8, replacement: []const u8) PatchError!void {
-        const off = @intFromPtr(dst.ptr) - @intFromPtr(region.mem.ptr);
-        try protectWindow(region.mem, off, dst.len, false);
-        // Once RW is established there is no fallible apply step. RX restoration is
-        // a soundness boundary, not a recoverable compile miss.
-        @memcpy(dst, replacement);
-        protectWindow(region.mem, off, dst.len, true) catch @panic("McodeArena: failed to restore RX after patch");
-        _ = self;
-    }
-
-    /// Swap only the rel32 operand of an existing `E9 rel32`. The opcode and live
-    /// page incarnation are validated before W^X is opened.
-    pub fn patchRel32(self: *McodeArena, page: *ExecPage, generation: u64, patch_off: usize, target: usize) PatchError!void {
-        const region = try self.validatePatchPage(page, generation, patch_off);
-        if (page.code[patch_off] != 0xE9) return error.OpcodeMismatch;
-        const replacement = try rel32Bytes(page, patch_off, target);
-        // Preserve the existing E9 byte: ordinary deopt patching changes its four-byte
-        // operand only, matching the accepted B3.13 contract.
-        try self.applyPatch(region, page.code[patch_off + 1 .. patch_off + 5], replacement[1..5]);
-    }
-
-    /// Promote/demote a canonical five-byte NOP window. Promotion requires the exact
-    /// recorded original bytes; demotion requires the exact E9-to-epilogue bytes and
-    /// restores all five original bytes.
-    pub fn patchWindow(self: *McodeArena, page: *ExecPage, generation: u64, patch_off: usize, original: [5]u8, epilogue: usize, promote: bool) PatchError!void {
-        const region = try self.validatePatchPage(page, generation, patch_off);
-        const patched = try rel32Bytes(page, patch_off, epilogue);
-        const expected = if (promote) original else patched;
-        if (!std.mem.eql(u8, page.code[patch_off..][0..5], &expected))
-            return if (promote) error.OriginalBytesMismatch else error.OpcodeMismatch;
-        const replacement = if (promote) patched else original;
-        try self.applyPatch(region, page.code[patch_off..][0..5], &replacement);
     }
 
     /// Return a slot to the free-list. Best-effort: on OOM the slot is simply leaked

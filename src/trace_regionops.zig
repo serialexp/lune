@@ -1116,7 +1116,11 @@ pub fn stageSilentSuffixProvenance(
     // Every suffix row is later than every silent-prefix firing. Reporting's
     // per-edge scan therefore treats any suffix progress as productive service
     // for every prefix sibling observation still under consideration.
-    if (entries[entries.len - 1].cum > initial_cum) {
+    // Progress is `cum` OR a committing row (doc 55 §1).
+    const suffix_commits = for (entries) |e| {
+        if (e.kind.commitsGuestWork()) break true;
+    } else false;
+    if (entries[entries.len - 1].cum > initial_cum or suffix_commits) {
         for (self.silent_provenance[0..self.silent_provenance_len]) |*evidence|
             evidence.saw_productive = true;
     }
@@ -1172,7 +1176,9 @@ pub fn chooseSource(self: *TraceState, candidates: []const RegionId, ctx: Region
 
 pub fn applyDestination(self: *TraceState, selected: ?RegionKey, dest: RegionDestination, ctx: RegionContext) void {
     const candidates: []const RegionId = switch (dest) {
-        .known_trace => |id| self.region_policy.dest_entry_regions.get(id) orelse &.{},
+        // Doc 55 §2: arrival, not the member proof — a landing in a sibling
+        // linked to a member keeps the activation open.
+        .known_trace => |id| self.region_policy.arrival_entry_regions.get(id) orelse &.{},
         else => &.{},
     };
     var source = selected;
@@ -1627,7 +1633,17 @@ fn topologyView(self: *TraceState, scratch: std.mem.Allocator) !topology.View {
             .exits = exits,
         };
     }
-    return .{ .traces = records };
+    // Doc 55 §2: same-anchor provenance links, for the arrival_entry sibling-group
+    // closure. Unresolvable or cross-anchor edges are skipped (fail toward the
+    // realizer-only membership that preceded this).
+    var links: std.ArrayListUnmanaged(topology.SiblingLink) = .empty;
+    for (self.provenance_edges.items) |edge| {
+        const p = self.traceById(edge.parent_id) orelse continue;
+        const c = self.traceById(edge.child_id) orelse continue;
+        if (p.code.anchor.proto.id != c.code.anchor.proto.id or p.code.anchor.pc != c.code.anchor.pc) continue;
+        try links.append(scratch, .{ .parent_id = edge.parent_id, .child_id = edge.child_id });
+    }
+    return .{ .traces = records, .sibling_links = links.items };
 }
 
 pub fn rebuildEdgeCacheFallible(self: *TraceState) !void {

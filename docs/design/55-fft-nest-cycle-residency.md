@@ -2,8 +2,10 @@
 
 **Status:** partial. §1 landed (committed completion rows count as
 progress; fft 23.3× → 14.6× LJ; Antigravity-approved, codex re-review
-owed). §2 (region laps) and §3 (bit-reverse peeled traces) are diagnosed
-but not designed.
+owed). §2 (a)/(b)/(c) plus §2d (the silent switch as data) landed:
+fft 14.6× → 12.6× LJ, sparse −31%, no regressions; Antigravity
+approved with nits (applied), codex re-review owed. §3 (bit-reverse
+peeled traces, now 63% of fft's run) is diagnosed but not designed.
 **Owner:** claude (campaign: every benchmark ≤1.2× LuaJIT; weakest-bench arc)
 **Last updated:** 2026-09-24
 
@@ -25,17 +27,27 @@ but not designed.
   blockers, one comment nit (applied). Codex re-review is still owed once
   credits return.
 
+- [x] **§2 — the region never sees a whole lap.** Root cause: (a) the
+  landing sibling, (b) remainder strikes, (c) silent cum-only progress.
+  Fixed with tests. (a) is split into two indexes (`arrival_entry_regions`,
+  Bart's pick) after the one-map version broke nsieve.
+- [x] **§2d — silent switch as data.** A compiled per-exit cell check
+  (`emitSilentCheck`) replaces runtime code patching (Bart's pick, "option
+  1"). `patchRel32` / `patchWindow` and their machinery are removed. Board:
+  fft 242.8 → 207.2 ms (12.6× LJ), sparse −31%, no regressions; lu
+  `mprotect` 53,134 → 14. `just test` and the jit-debug gate are green.
+  Antigravity review (codex still out): **APPROVED WITH NITS**. Both are
+  applied: (1) `checkPromotable` now refuses a set naming one exit twice
+  (code patching used to refuse it by accident), pinned in the B-3b.2 test;
+  (2) the tail waiver is explicit about `work > 0`.
+
 ### Outstanding
 
 - [ ] **Codex re-review of §1** once credits return (2026-09-29).
-- [ ] **§2 — the region never sees a whole lap.** The nest cycle's region
-  activation closes after every inner-loop exit with `work=1`, strikes 8
-  times, and gets tombstoned during warm-up. So no silent promotion, and the
-  cycle runs in rows mode forever (30.6% of the run is replay). Needs a
-  root-cause pass on the close site, then a design.
+- [ ] **Codex re-review of §2/§2d** once credits return (2026-09-29).
 - [ ] **§3 — bit-reverse peeled traces barely dispatch.** `fft_bitreverse:9`
   and `:55` have committed peeled traces but run ~0% traced (43% of the run
-  after §1). This is doc 40's open question (fusion exclusion for peeled
+  after §1; tier-0-with-a-trace is 63% of fft's cycles after §2d). This is doc 40's open question (fusion exclusion for peeled
   traces) plus the doc-38 `low_trip_while` gate. Needs its own design pass.
 - [ ] **Post-arc measurement.** Full board, `--jit-stats`, and a re-profile.
 
@@ -194,14 +206,160 @@ departure on every lap. That matches candidate 1 above, and the topology
 builder already knows the concept ("sibling non-member exit at a member
 anchor", ~683).
 
+### Finding (completed 2026-09-24)
+
+The lead held. There are three causes, each needing its own change:
+
+- **(a) Landing sibling.** The inner loop-done lands in t7, a sibling at
+  `:193` that only hands off to t8 (the realizer of the back-edge). t7
+  realizes no internal edge, so it is not in `member_trace_ids`.
+  `applyDestination` then reads every lap as a departure.
+- **(b) Remainder strikes.** Even with (a) fixed, every butterfly stage
+  ends with a tail of 2^k − 1 laps (< `min_useful`). `beginClose` struck
+  each tail, which unfroze and demoted the silent set every stage.
+- **(c) The silent path's cum-only progress** (open question below).
+
+### Change (in tree, uncommitted)
+
+- **(a) Two indexes.** `dest_entry_regions` stays the strict member proof,
+  read by `traceInRegion` for bridge child selection. A new
+  `arrival_entry_regions` is `dest_entry` closed over same-anchor
+  provenance links (`SiblingLink` in the topology `View`). Only
+  `applyDestination` and `receiptsInert` read it. It extends neither
+  `member_points` nor `source_exit_regions`. A first version used one map
+  for both jobs. That broke nsieve: the bridge t2 ei=23 armed into t3, the
+  sibling that deopts on entry. Trace entries went 364 → 10k, the seam went
+  8.7% → 45.8%, and nsieve went 13 → 19 ms. Hence the split (Bart's pick).
+- **(b) Remainder-tail rule.** In `beginClose`, a close with
+  `work < min_useful` after a useful window has already been seen is not
+  low-yield evidence (no strike, no flush).
+- **(c) Committing kinds count as progress on the silent path:**
+  `stageSilentSuffixProvenance`, plus the `emitSilentEpilogue` productive
+  mark (only `.deopt` needs `local != 0`).
+
+### Measurement — (b) exposes the silent flip cost
+
+Plain-timing A/B against `4619829`, with (a) as one map, bisected:
+
+| bench | base | (a)+(b)+(c) | (b) off |
+|---|---|---|---|
+| fft | 235–259 ms | 270–295 | 231–241 |
+| lu | 148–155 | 197–221 | 150–151 |
+| nsieve | 13–14 | 18–19 (a) | 20–21 (a) |
+
+(c) alone is neutral. With (b), the fft and lu regions are never struck,
+so they live forever. Every activation close parks the silent set, and
+every re-entry re-promotes it: lu flips 6,640 times and fft 4,998 times.
+**Every flip rewrites machine code**: `patchRel32` / `patchWindow`, each an
+RX→RW→RX `mprotect` pair per edge. That's lu 102 → 53,134 `mprotect` calls
+and fft 24 → 60,000. On fft the seam fell 449M → 147M cycles, but "other"
+rose 55M → 218M, so the net is zero. On lu, `lu_factor:11` tier-0 went
+145 → 14,867 cyc/iter.
+
+### §2d — The silent switch is data, not code
+
+**What LuaJIT does.** `lj_asm_patchexit` rewrites an exit only when a side
+trace attaches (`lj_trace.c:531`). The patch is one-way and is never
+undone; only a flush clears it. Code changes are rare, monotonic compile
+events, and everything that changes at run time lives in data. The only
+knob Pall offers for protection-toggle cost is the opt-in RWX build
+(`LUAJIT_SECURITY_MCODE=0`, "ONLY if page protection twiddling becomes a
+bottleneck"). He never flips code per activation. Silent mode has no
+LuaJIT counterpart (the ledger is ours), so the mahina equivalent of his
+rule is: **promote/demote must not touch code.**
+
+**Design.** Each patchable exit already owns a per-exit data cell
+(`CompiledTrace.metadata_cells[exit]`, heap RW). It is 0 when the exit is
+not promoted and `*SilentExitMetadata` when it is, and `promoteSet`
+already writes it before patching. The patch site stops being a
+`nop5` / `jmp deopt_exit` rewritten at run time. It becomes a permanent
+check emitted once at compile time:
+
+```
+mov  rax, imm64 &metadata_cells[exit]
+cmp  qword [rax], 0
+jne  silent_epilogue
+<original reporting path>     ; ledger append / jmp deopt_exit
+```
+
+`rax` and the flags are dead at all four sites. The `nop5` sites are
+followed by `emitLedgerAppend`, which loads `rax` fresh. At the deopt site,
+`exit_target` is staged in memory because `deopt_exit` clobbers `rax`.
+The epilogue keeps its own reload of the cell: the `.deopt` epilogue's
+carried-home flush clobbers `rax` before it.
+`reporting_target` (where the epilogue goes when a reporting prefix exists)
+becomes the fall-through address after the `jnz`, the same for every kind.
+For `.deopt` that is `jmp deopt_exit`, identical to the old
+`originalRel32Target`. Promote and demote become cell writes (publication:
+metadata first, then the cell). The deferred demote during a replay walk
+stays, because it protects the lifetime of summary/metadata storage, not
+code. `patchRel32`, `patchWindow`, and their validation become dead and are
+removed. `ExitPatch` keeps `kind`, `exit_instr`, `resume_off`, and
+`metadata_cell`.
+
+**Cost.** About 20 bytes per patchable exit stub (cold code), and one
+load + compare + branch per firing of a patchable exit. That is cheap next
+to the ledger append the firing already does. Measured, not assumed (below).
+
+As built, `promoteSet` proves every edge's site (`silentSiteFor`: live
+compiled parent, a check of the edge's kind, testing that exit's own cell)
+before it allocates anything. Publication is then an infallible cell write,
+so the old patch-unwind path is gone. The `arena` parameter left the whole
+promote/demote family (`promoteSet`, `demoteSet*`, `prepareSlotMutation`,
+`publishValidatedLink`), because none of them touch code any more. Removed:
+`McodeArena.patchRel32` / `patchWindow` / `applyPatch` /
+`validatePatchPage`, `PatchError`, `x64.nop5`, `EXIT_NOP5`,
+`originalRel32Target`, and `CompiledTrace.pageGeneration`. Kept: the page
+generation plus `live_pages`, which still guard `McodeArena.free` against a
+double free.
+
+### §2 + §2d measurement
+
+Interleaved plain-timing A/B against `4619829` (ReleaseFast, 4 reps, ms):
+
+| bench | base | §2 + §2d |
+|---|---|---|
+| fft | 264 259 246 272 | 214 216 223 226 |
+| lu | 168 159 156 159 | 156 153 155 162 |
+| nsieve | 21 14 12 13 | 13 13 14 13 |
+| sor | 90 86 88 88 | 86 86 84 90 |
+| sparse | 40 36 35 31 | 26 24 25 27 |
+| nbody | 47 40 40 41 | 42 43 41 41 |
+| recursive-fib (5 reps) | 79 80 78 79 80 | 81 80 78 87 78 |
+| str_format (5 reps) | 106 108 104 107 107 | 104 105 104 105 110 |
+
+`mprotect` calls: lu 102 → 14 (fewer than the base, since the base's early
+promotions patched code too). fft: 24, the same as the base (60,000 with
+§2 alone). What remains is compile-time allocation only.
+
+Board (`just bench`, 5 reps) vs the §1 board (`20260924-130332`): fft
+242.8 → 207.2 ms (14.7× → **12.6× LJ**), sparse 179.1 → 122.8 (−31%),
+sieve_int −20%, repack −11%, nsieve −10%, binary-trees −8.5%,
+grid_matmul(_f64) −5.5/−7.9%. recursive-fib showed +5.3% on the board, but
+the interleaved A/B above puts it at parity (noise). Everything else is
+within ±3%.
+
+fft `--jit-stats` after §2d: 23k trace entries (1.02M at the arc start),
+seam 13.5%, native 19.4%, and **tier-0 with a trace present at 63% of the
+run**. That is §3 (the bit-reverse peeled traces), now clearly the next
+lever.
+
+**Why not "stay patched longer" (doc 52 residents).** That cuts the number
+of flips but keeps every flip expensive. Each new reason to flip
+(invalidation, membership growth, a second resident) brings the cost
+back. Once a flip is a data write, "should a set stay silent across
+closes" becomes a pure policy question that can be decided on its merits.
+
 ### Open questions
 
-- [ ] Pin the close site: `applyDestination` vs `chooseSource` vs
+- [x] Pin the close site: `applyDestination` vs `chooseSource` vs
   `observeRegionProgramPoint`, and which membership lookup fails.
+  → `applyDestination`; t7 was missing from `dest_entry_regions` (see (a)).
 - [ ] Is region work = "owner loop-done count" the right unit for a nest
   whose owner is the *inner* loop? Per lap, the cycle's real work is one
   middle iteration plus 1..n/2 inner iterations.
-- [ ] **The silent path has its own cum-only progress definition.** In the
+- [x] **The silent path has its own cum-only progress definition.** → (c).
+  In the
   promoted-epilogue summary (`emitSilentEpilogue`, `nativegen_emit.zig`
   ~1319), a firing is "productive" only when `local != 0`, and a
   `link_terminal` firing advances the barren run as zero work. Both

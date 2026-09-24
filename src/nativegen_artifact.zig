@@ -333,7 +333,8 @@ comptime {
 }
 
 /// Runtime-owned payload addressed through a compile-time-owned pointer cell. B-3a
-/// freezes this transport; B-3b will allocate/populate instances before patching.
+/// froze this transport. Since doc 55 §2d the cell IS the silent switch:
+/// publishing a pointer into it promotes the exit, and zeroing it demotes.
 pub const SilentExitMetadata = extern struct {
     summary: *SilentSummaryCell,
     slot: *usize,
@@ -354,13 +355,21 @@ pub const ExitPatchKind = enum(u8) { deopt, link_terminal, loop_done_linked, reg
 /// Four dynamic return-continuation slots plus one continuation-to-head slot.
 pub const RET_CONT_SLOTS: usize = 4;
 pub const NATIVE_TRANSITION_SLOTS: usize = RET_CONT_SLOTS + 1;
-pub const EXIT_NOP5 = [5]u8{ 0x0F, 0x1F, 0x44, 0x00, 0x00 };
 
+/// A promotable exit's silent switch (doc 17 B-3, doc 55 §2d). The code is
+/// emitted once and never rewritten: at `check_off` the exit tests its
+/// per-exit data cell (`mov rax, &metadata_cell; cmp qword [rax], 0;
+/// jne epilogue`), and it falls through to the reporting path at
+/// `resume_off` while the cell is zero. Promotion and demotion are cell
+/// writes, with no `mprotect`, following LuaJIT's rule that runtime state
+/// lives in data and code changes only at compile time. (Before §2d each
+/// flip rewrote a `nop5`/`jmp` through an RX→RW→RX `mprotect` pair per
+/// edge; fft paid 60,000 of those.)
 pub const ExitPatch = struct {
     kind: ExitPatchKind,
     exit_instr: u32,
-    patch_off: u32,
-    original: [5]u8,
+    check_off: u32,
+    resume_off: u32,
     epilogue_off: u32,
     metadata_cell: *usize,
 };
@@ -712,13 +721,6 @@ pub const CompiledTrace = struct {
             .activation_base = result.activation_base,
             .activation_depth = result.activation_depth,
             .frame_motion_taken = result.frame_motion_taken != 0,
-        };
-    }
-
-    pub fn pageGeneration(self: *const CompiledTrace) ?u64 {
-        return switch (self.page.owner) {
-            .arena => |slot| slot.generation,
-            .owned => null,
         };
     }
 

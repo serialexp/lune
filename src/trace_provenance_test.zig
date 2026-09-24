@@ -769,6 +769,27 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     try testing.expectEqual(reporting_productive_strikes, state.provenance_edges.items[0].strikes);
     state.provenance_edges.items[0].strikes = 0;
 
+    // (v) Doc 55 §1 on the silent path: a reporting suffix that COMMITTED guest
+    // work at flat cum (a one-trip loop's loop_done_linked) is progress for the
+    // prefix's sibling observation — the silent twin of the rows-mode verdict.
+    const committing_suffix = [_]trace_exec.LedgerEntry{
+        .{ .cum = 1, .id = child.id, .exit = 0, .reason = .normal, .kind = .loop_done_linked, .outcome = .normal },
+    };
+    state.provenance_edges.items[0].strikes = 2;
+    state.stageSilentSiblingProvenance(silent_edge, 1, false, true);
+    @memcpy(state.ledger_scratch[0..committing_suffix.len], &committing_suffix);
+    state.stageSilentSuffixProvenance(&committing_suffix, 1);
+    merged_len = state.captureSilentSuffixProvenance(.{
+        .completed = 1,
+        .exit_instr = 0,
+        .silent_active = 1,
+        .ledger_len = committing_suffix.len,
+        .silent_cum = 1,
+    }, &merged);
+    state.applyProvenanceVerdicts(merged[0..merged_len]);
+    try testing.expectEqual(@as(u8, 0), state.provenance_edges.items[0].strikes); // reset, not retired
+    try testing.expectEqual(@as(usize, 1), state.provenance_edges.items.len);
+
     // P→C, an intervening child row, then P again at unchanged cum: one strike
     // per complete burst, applied only after replay. The third retires relation
     // and exact physical P→C arm; the reverse Part-S arm remains live.

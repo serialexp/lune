@@ -136,15 +136,7 @@ pub fn exitPatchFor(compiled: *nativegen.CompiledTrace, exit: u32) ?*nativegen.E
     for (compiled.exit_patches) |*patch| if (patch.exit_instr == exit) return patch;
     return null;
 }
-pub fn originalRel32Target(compiled: *const nativegen.CompiledTrace, patch: *const nativegen.ExitPatch) usize {
-    const bits: u32 = @as(u32, patch.original[1]) |
-        (@as(u32, patch.original[2]) << 8) |
-        (@as(u32, patch.original[3]) << 16) |
-        (@as(u32, patch.original[4]) << 24);
-    const disp: i32 = @bitCast(bits);
-    const next = @intFromPtr(compiled.page.code.ptr) + patch.patch_off + 5;
-    return @intCast(@as(i128, @intCast(next)) + disp);
-}
+pub const SilentSiteError = error{ SilentSiteNotCompiled, SilentSiteMissing, SilentSiteKindMismatch };
 fn physicalSlot(link: NativeLink) u32 {
     return if (link.physical_slot == std.math.maxInt(u32)) link.slot_index else link.physical_slot;
 }
@@ -331,31 +323,20 @@ pub const NativePhysicalRegistry = struct {
         self.resident_demotion_notice = null;
         return notice;
     }
-    pub fn patchPromotedEdge(_: *NativePhysicalRegistry, arena: *nativegen.McodeArena, edge: PromotedEdge, promote: bool) nativegen.PatchError!void {
+    /// Doc 55 §2d: the edge's compiled silent switch. The edge must name a live
+    /// compiled parent whose exit carries a silent check of the edge's kind that
+    /// tests exactly that exit's cell. Promotion publishes into the cell, so
+    /// every check here comes before any publication.
+    pub fn silentSiteFor(edge: PromotedEdge) SilentSiteError!*nativegen.ExitPatch {
         const compiled = switch (edge.parent.native) {
             .compiled => |*c| c,
-            else => return error.StalePage,
+            else => return error.SilentSiteNotCompiled,
         };
-        const generation = compiled.pageGeneration() orelse return error.NotArenaOwned;
-        const patch = exitPatchFor(compiled, edge.exit) orelse return error.OffsetOutOfBounds;
-        if (patch.kind != edge.kind) return error.OpcodeMismatch;
-        const epilogue = @intFromPtr(compiled.page.code.ptr) + patch.epilogue_off;
-        switch (edge.kind) {
-            .deopt => try arena.*.patchRel32(
-                &compiled.page,
-                generation,
-                patch.patch_off,
-                if (promote) epilogue else originalRel32Target(compiled, patch),
-            ),
-            .link_terminal, .loop_done_linked, .region_bridge => try arena.*.patchWindow(
-                &compiled.page,
-                generation,
-                patch.patch_off,
-                patch.original,
-                epilogue,
-                promote,
-            ),
-        }
+        if (edge.exit >= compiled.metadata_cells.len) return error.SilentSiteMissing;
+        const site = exitPatchFor(compiled, edge.exit) orelse return error.SilentSiteMissing;
+        if (site.kind != edge.kind) return error.SilentSiteKindMismatch;
+        if (site.metadata_cell != &compiled.metadata_cells[edge.exit]) return error.SilentSiteMissing;
+        return site;
     }
     pub fn resetPromotionCandidate(self: *NativePhysicalRegistry) void {
         if (self.promotion_candidate.len != 0) self.gpa.free(self.promotion_candidate);
@@ -436,8 +417,8 @@ pub const NativePhysicalRegistry = struct {
             }
         }
     }
-    pub fn demoteSet(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena, idx: usize) void {
-        self.demoteSetReason(arena, idx, .trace_invalidation);
+    pub fn demoteSet(self: *NativePhysicalRegistry, idx: usize) void {
+        self.demoteSetReason(idx, .trace_invalidation);
     }
     /// Doc 52 P1: the cached by-keying counts must always agree with the live
     /// list — they gate the native-entry sweep and staging fast paths.
@@ -452,20 +433,19 @@ pub const NativePhysicalRegistry = struct {
             std.debug.assert(activations == self.activation_set_count);
         }
     }
-    pub fn demoteSetReason(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena, idx: usize, reason: DemotionReason) void {
+    pub fn demoteSetReason(self: *NativePhysicalRegistry, idx: usize, reason: DemotionReason) void {
         const set = self.promoted_sets.items[idx];
         if (self.replay_walk_depth > 0) {
-            // Deferred: patches stay live until `drainBarrier` re-enters this
-            // funnel at depth 0 — counts and notices move only on the physical
-            // removal below (doc 52 P1).
+            // Deferred: the set (its published cells and the summary/metadata
+            // storage the walk may still read) stays live until `drainBarrier`
+            // re-enters this funnel at depth 0 — counts and notices move only on
+            // the physical removal below (doc 52 P1).
             self.queueDemote(set.id, reason);
             return;
         }
-        // Teardown order is the inverse publication order: code first, cells
-        // second, then ownership/storage. A failed restore intentionally leaves
-        // every cell and allocation live before terminating the process.
-        for (set.edges) |edge| self.patchPromotedEdge(arena, edge, false) catch
-            @panic("demoteSet: failed to restore reporting code");
+        // Teardown order is the inverse publication order: cells first (each
+        // exit's silent check falls through to reporting from here on — doc 55
+        // §2d, no code is touched), then ownership/storage.
         for (set.edges) |edge| edge.parent.native.compiled.metadata_cells[edge.exit] = 0;
         for (set.edges) |edge| {
             if (!self.promoted_exit_owners.remove(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit }))
@@ -498,17 +478,17 @@ pub const NativePhysicalRegistry = struct {
         }
         self.resetPromotionCandidate();
     }
-    pub fn demoteSetsTouching(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena, parent: *Trace, exit: u32) void {
+    pub fn demoteSetsTouching(self: *NativePhysicalRegistry, parent: *Trace, exit: u32) void {
         const id = self.promoted_exit_owners.get(.{ .trace_id = parent.id, .exit_instr = exit }) orelse return;
         for (self.promoted_sets.items, 0..) |set, i| {
             if (set.id == id) {
-                self.demoteSetReason(arena, i, .slot_mutation);
+                self.demoteSetReason(i, .slot_mutation);
                 return;
             }
         }
         @panic("demoteSetsTouching: owner names no live set");
     }
-    pub fn demoteSetsTouchingTrace(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena, trace: *Trace) void {
+    pub fn demoteSetsTouchingTrace(self: *NativePhysicalRegistry, trace: *Trace) void {
         self.resetPromotionCandidate();
         var i = self.promoted_sets.items.len;
         while (i > 0) {
@@ -520,17 +500,17 @@ pub const NativePhysicalRegistry = struct {
                     break;
                 }
             }
-            if (touches) self.demoteSetReason(arena, i, .trace_invalidation);
+            if (touches) self.demoteSetReason(i, .trace_invalidation);
         }
     }
-    pub fn demoteAllSets(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena) void {
+    pub fn demoteAllSets(self: *NativePhysicalRegistry) void {
         var i = self.promoted_sets.items.len;
         while (i > 0) {
             i -= 1;
-            self.demoteSetReason(arena, i, .teardown);
+            self.demoteSetReason(i, .teardown);
         }
     }
-    pub fn demoteSetsForRegionDefsMutation(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena) void {
+    pub fn demoteSetsForRegionDefsMutation(self: *NativePhysicalRegistry) void {
         // Region membership is part of every parked proof too.
         self.dropAllParkedProofs();
         self.resetPromotionCandidate();
@@ -540,10 +520,10 @@ pub const NativePhysicalRegistry = struct {
             // Region membership is part of every promotion proof, and a bridge
             // additionally freezes its exact structural edge. Any defs mutation
             // invalidates both facts, so no promoted set may survive the gen bump.
-            self.demoteSetReason(arena, i, .trace_invalidation);
+            self.demoteSetReason(i, .trace_invalidation);
         }
     }
-    pub fn prepareSlotMutation(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena, parent: *Trace, exit: u32, reason: SlotMutationReason) !PreparedSlotMutation {
+    pub fn prepareSlotMutation(self: *NativePhysicalRegistry, parent: *Trace, exit: u32, reason: SlotMutationReason) !PreparedSlotMutation {
         // Sole physical slot-write funnel; identical convergence re-arms
         // short-circuit before reaching it, so every call is a REAL relation
         // mutation. A parked proof naming this exit is falsified by it —
@@ -559,7 +539,7 @@ pub const NativePhysicalRegistry = struct {
             else => return error.NativeTraceUnavailable,
         };
         if (exit >= compiled.slots.len) return error.InvalidNativeSlot;
-        self.demoteSetsTouching(arena, parent, exit);
+        self.demoteSetsTouching(parent, exit);
         if (self.promoted_exit_owners.contains(.{ .trace_id = parent.id, .exit_instr = exit }))
             return error.DemotionDeferred;
         return .{ .compiled = compiled, .exit = exit };
@@ -600,7 +580,7 @@ pub const NativePhysicalRegistry = struct {
     pub fn resetLinksTouching(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena, t: *Trace) void {
         if (self.replay_walk_depth != 0) @panic("resetLinksTouching during replay");
         self.dropParkedProofsTouching(t);
-        self.demoteSetsTouchingTrace(arena, t);
+        self.demoteSetsTouchingTrace(t);
         const shared_exit = arena.*.trampoline_exit orelse 0;
         var i: usize = self.armed_links.items.len;
         while (i > 0) {
@@ -615,7 +595,7 @@ pub const NativePhysicalRegistry = struct {
                 const p = physicalSlot(link);
                 switch (link.parent.native) {
                     .compiled => |*c| if (p < c.slots.len) {
-                        const prepared = self.prepareSlotMutation(arena, link.parent, p, .retire) catch
+                        const prepared = self.prepareSlotMutation(link.parent, p, .retire) catch
                             @panic("resetLinksTouching: invalid native slot mutation");
                         self.commitSlotMutation(prepared, shared_exit, false);
                     },
@@ -653,7 +633,7 @@ pub const NativePhysicalRegistry = struct {
             const p = physicalSlot(link);
             switch (link.parent.native) {
                 .compiled => |*c| if (p < c.slots.len) {
-                    const prepared = self.prepareSlotMutation(arena, link.parent, p, .disarm_all) catch
+                    const prepared = self.prepareSlotMutation(link.parent, p, .disarm_all) catch
                         @panic("disarmAllLinks: invalid native slot mutation");
                     self.commitSlotMutation(prepared, shared_exit, false);
                 },
@@ -673,7 +653,7 @@ pub const NativePhysicalRegistry = struct {
         const p = physicalSlot(link);
         switch (link.parent.native) {
             .compiled => |*c| if (p < c.slots.len) {
-                const prepared = self.prepareSlotMutation(arena, link.parent, p, .disarm_one) catch
+                const prepared = self.prepareSlotMutation(link.parent, p, .disarm_one) catch
                     @panic("disarmLinkAt: invalid native slot mutation");
                 self.commitSlotMutation(prepared, shared_exit, false);
             },
@@ -719,12 +699,30 @@ pub const NativePhysicalRegistry = struct {
             if (s.region_key.region_id == region_key.region_id)
                 return error.PromotionRegionIdOwned;
         }
-        for (edges) |edge| {
+        for (edges, 0..) |edge, i| {
             if (self.promoted_exit_owners.contains(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit })) return error.PromotionExitOwned;
+            // Doc 55 §2d: one exit, one cell, one owner. A set naming an exit
+            // twice would publish the cell twice and double-insert its owner.
+            // The code-patching path used to refuse that by accident (the
+            // second patch saw already-patched bytes); now it is an explicit
+            // precondition, O(N²) with N ≤ PROMOTED_SET_CAP.
+            for (edges[0..i]) |prev| {
+                if (prev.parent == edge.parent and prev.exit == edge.exit) return error.InvalidPromotionSet;
+            }
         }
     }
-    pub fn promoteSet(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena, edges: []const PromotedEdge, region_key: RegionKey, min_useful: usize) !void {
+    pub fn promoteSet(self: *NativePhysicalRegistry, edges: []const PromotedEdge, region_key: RegionKey, min_useful: usize) !void {
         try self.checkPromotable(edges, region_key);
+        // Every edge's silent site is proven before anything is allocated or
+        // published: publication below is a cell write that cannot fail, so
+        // there is nothing to unwind once it starts.
+        var sites: [PROMOTED_SET_CAP]*nativegen.ExitPatch = undefined;
+        for (edges, 0..) |edge, i| {
+            sites[i] = try silentSiteFor(edge);
+            // `checkPromotable` proved no live set owns this exit, and the cell
+            // is published only by a live set.
+            std.debug.assert(sites[i].metadata_cell.* == 0);
+        }
         const owned_edges = try self.gpa.dupe(PromotedEdge, edges);
         errdefer self.gpa.free(owned_edges);
         const summary = try self.gpa.alloc(nativegen.SilentSummaryCell, edges.len);
@@ -739,11 +737,9 @@ pub const NativePhysicalRegistry = struct {
                 .summary = &summary[i],
                 .slot = &compiled.slots[edge.exit],
                 .min_useful = min_useful,
-                .reporting_target = switch (edge.kind) {
-                    .deopt => originalRel32Target(compiled, exitPatchFor(compiled, edge.exit).?),
-                    .link_terminal, .loop_done_linked, .region_bridge => @intFromPtr(compiled.page.code.ptr) +
-                        exitPatchFor(compiled, edge.exit).?.patch_off + 5,
-                },
+                // The check's fall-through: the unchanged reporting path for
+                // every kind (for `.deopt`, its `jmp deopt_exit`).
+                .reporting_target = @intFromPtr(compiled.page.code.ptr) + sites[i].resume_off,
                 // Doc 52 P1: residency is decided at promotion time, per set —
                 // resident edges neither advance nor reset the barren run.
                 .barren_exempt = @intFromBool(isResidentKey(region_key)),
@@ -757,23 +753,10 @@ pub const NativePhysicalRegistry = struct {
         // global sweep during replay can queue every set without allocation.
         try self.pending_demote.ensureTotalCapacity(self.gpa, self.promoted_sets.items.len + 1);
 
-        // Publication: initialized metadata first, then pointer cells, code last.
-        for (owned_edges, 0..) |edge, i| {
-            edge.parent.native.compiled.metadata_cells[edge.exit] = @intFromPtr(&metadata[i]);
-        }
-        var patched: usize = 0;
-        errdefer {
-            while (patched > 0) {
-                patched -= 1;
-                self.patchPromotedEdge(arena, owned_edges[patched], false) catch
-                    @panic("promoteSet: failed to restore reporting code during unwind");
-            }
-            for (owned_edges) |edge| edge.parent.native.compiled.metadata_cells[edge.exit] = 0;
-        }
-        for (owned_edges) |edge| {
-            try self.patchPromotedEdge(arena, edge, true);
-            patched += 1;
-        }
+        // Publication (doc 55 §2d): initialized metadata first, then the pointer
+        // cells — each cell write switches its exit's compiled silent check on.
+        // No code is touched; every fallible step is above this line.
+        for (sites[0..edges.len], 0..) |site, i| site.metadata_cell.* = @intFromPtr(&metadata[i]);
 
         const id = self.next_promoted_set_id;
         self.next_promoted_set_id += 1;
@@ -788,8 +771,8 @@ pub const NativePhysicalRegistry = struct {
             .{ .trace_id = edge.parent.id, .exit_instr = edge.exit },
             id,
         );
-        // Doc 52 P1: physical publication — the set is patched in as of the
-        // loop above, so the keying count moves here (and only here).
+        // Doc 52 P1: physical publication — the set is live as of the cell
+        // writes above, so the keying count moves here (and only here).
         if (isResidentKey(region_key))
             self.resident_set_count += 1
         else
@@ -798,7 +781,7 @@ pub const NativePhysicalRegistry = struct {
         self.silent_promotions +|= 1;
     }
     pub const ArmOutcome = enum { declined, unchanged, changed };
-    pub fn publishValidatedLink(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena, request: ArmRequest) !ArmOutcome {
+    pub fn publishValidatedLink(self: *NativePhysicalRegistry, request: ArmRequest) !ArmOutcome {
         const parent = request.parent;
         const child = request.child;
         const kind = request.kind;
@@ -893,7 +876,7 @@ pub const NativePhysicalRegistry = struct {
                 // detection streak; a changed relation invalidates the candidate.
                 if (l.child != child or l.kind != kind or c.slots[physical_slot] != target)
                     self.resetPromotionCandidate();
-                const prepared = self.prepareSlotMutation(arena, parent, physical_slot, .rearm) catch return .declined;
+                const prepared = self.prepareSlotMutation(parent, physical_slot, .rearm) catch return .declined;
                 // A re-arm can displace a provenance-published sibling arm with
                 // a different kind/child — re-open publication so the drain can
                 // re-evaluate the surviving edges at the next safe point. And
@@ -925,7 +908,7 @@ pub const NativePhysicalRegistry = struct {
         // Fresh slot: append the record BEFORE writing the slot, so a failed append
         // leaves the slot at its prior `shared_exit` value with no dangling record.
         self.resetPromotionCandidate();
-        const prepared = self.prepareSlotMutation(arena, parent, physical_slot, .arm) catch return .declined;
+        const prepared = self.prepareSlotMutation(parent, physical_slot, .arm) catch return .declined;
         try self.armed_links.append(self.gpa, .{ .parent = parent, .slot_index = slot_index, .physical_slot = physical_slot, .child = child, .kind = kind, .region_id = region_id, .armed_gen = armed_gen });
         if (kind == .ret_cont) c.ret_cont_keys[physical_slot - ir_slots] = slot_index;
         if (self.armed_links.items.len > self.native_link_peak) self.native_link_peak = self.armed_links.items.len;
@@ -942,7 +925,7 @@ pub const NativePhysicalRegistry = struct {
             const pending = self.pending_demote.pop().?;
             for (self.promoted_sets.items, 0..) |set, i| {
                 if (set.id == pending.id) {
-                    self.demoteSetReason(arena, i, pending.reason);
+                    self.demoteSetReason(i, pending.reason);
                     break;
                 }
             }
@@ -954,7 +937,7 @@ pub const NativePhysicalRegistry = struct {
     }
     pub fn deinit(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena) void {
         if (self.replay_walk_depth != 0) @panic("native registry teardown during replay");
-        self.demoteAllSets(arena);
+        self.demoteAllSets();
         self.disarmAllLinks(arena);
         self.armed_links.deinit(self.gpa);
         self.pending_demote.deinit(self.gpa);
@@ -989,17 +972,17 @@ test "frame link physical cells disarm without recycling the first four return k
     // No executable code is needed: the physical owner mutates data cells only.
     for (0..4) |i| {
         const pc: u32 = @intCast(1000 + i);
-        try std.testing.expect(try registry.publishValidatedLink(&arena, .{ .parent = &parent, .child = &child, .slot_index = pc, .kind = .ret_cont }) == .changed);
+        try std.testing.expect(try registry.publishValidatedLink(.{ .parent = &parent, .child = &child, .slot_index = pc, .kind = .ret_cont }) == .changed);
         try std.testing.expect(keys[i] == pc and slots[i + 1] == 0xCAFE);
     }
     try std.testing.expect(slots[0] == 0);
     registry.disarmAllLinks(&arena);
     for (slots) |target| try std.testing.expect(target == 0);
     for (keys, 0..) |pc, i| try std.testing.expect(pc == 1000 + i);
-    try std.testing.expect(try registry.publishValidatedLink(&arena, .{ .parent = &parent, .child = &child, .slot_index = 2000, .kind = .ret_cont }) == .declined);
-    try std.testing.expect(try registry.publishValidatedLink(&arena, .{ .parent = &parent, .child = &child, .slot_index = 1002, .kind = .ret_cont }) == .changed);
+    try std.testing.expect(try registry.publishValidatedLink(.{ .parent = &parent, .child = &child, .slot_index = 2000, .kind = .ret_cont }) == .declined);
+    try std.testing.expect(try registry.publishValidatedLink(.{ .parent = &parent, .child = &child, .slot_index = 1002, .kind = .ret_cont }) == .changed);
     try std.testing.expect(slots[3] == 0xCAFE);
-    try std.testing.expect(try registry.publishValidatedLink(&arena, .{ .parent = &parent, .child = &child, .slot_index = 0, .kind = .call_head }) == .changed);
+    try std.testing.expect(try registry.publishValidatedLink(.{ .parent = &parent, .child = &child, .slot_index = 0, .kind = .call_head }) == .changed);
     try std.testing.expect(slots[5] == 0xCAFE);
     registry.resetLinksTouching(&arena, &child);
     for (slots) |target| try std.testing.expect(target == 0);

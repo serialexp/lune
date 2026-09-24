@@ -107,6 +107,23 @@ pub fn expectBail(t: *const Trace) !void {
         return error.TestExpectedBail;
     }
 }
+
+/// Doc 55 §2d: decode `p`'s compiled silent check and pin its shape. It must
+/// load exactly this exit's cell address (`mov rax, imm64` = REX.W B8), branch
+/// to exactly this exit's epilogue (`jne rel32` = 0F 85), and fall through at
+/// `resume_off`. The check is compile-time code that is never rewritten, so
+/// this holds for the page's whole life, promoted or not.
+pub fn expectSilentCheck(ct: *const CompiledTrace, p: nativegen.ExitPatch) !void {
+    const code = ct.page.code;
+    try testing.expectEqual(@as(u8, 0x48), code[p.check_off]);
+    try testing.expectEqual(@as(u8, 0xB8), code[p.check_off + 1]);
+    try testing.expectEqual(@as(u64, @intFromPtr(p.metadata_cell)), std.mem.readInt(u64, code[p.check_off + 2 ..][0..8], .little));
+    const jcc = p.resume_off - 6;
+    try testing.expectEqual(@as(u8, 0x0F), code[jcc]);
+    try testing.expectEqual(@as(u8, 0x85), code[jcc + 1]);
+    const disp = std.mem.readInt(i32, code[jcc + 2 ..][0..4], .little);
+    try testing.expectEqual(@as(i64, p.epilogue_off), @as(i64, p.resume_off) + disp);
+}
 /// Assert two tables hold the same logical value at every dense key `1..len`.
 pub fn expectTablesEqual(ta: *table.Table, tb: *table.Table, len: i64) !void {
     var k: i64 = 1;

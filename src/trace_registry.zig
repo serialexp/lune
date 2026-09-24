@@ -71,7 +71,7 @@ pub const TraceRegistry = struct {
     /// Self-contained epoch safety; never relies on coordinator pre-disarm.
     pub fn clear(self: *TraceRegistry) void {
         if (self.native_physical.inReplayWalk()) @panic("trace clear during replay");
-        self.native_physical.demoteAllSets(&self.mcode_arena);
+        self.native_physical.demoteAllSets();
         self.native_physical.disarmAllLinks(&self.mcode_arena);
         self.native_physical.resetPromotionCandidate();
         _ = self.native_physical.drainBarrier(&self.mcode_arena);

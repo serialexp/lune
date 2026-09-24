@@ -2022,11 +2022,12 @@ pub const TraceState = struct {
                 self.silent_budget_exhaustions,                 self.silent_barren_exhaustions,
                 self.silent_suffix_drains,
             });
-            jitdbg.log("  region maps: profit count={d} cap={d} source={d} dest={d} defs={d}", .{
+            jitdbg.log("  region maps: profit count={d} cap={d} source={d} dest={d} arrival={d} defs={d}", .{
                 self.region_policy.region_profit.count(),
                 self.region_policy.region_profit.capacity(),
                 self.region_policy.source_exit_regions.count(),
                 self.region_policy.dest_entry_regions.count(),
+                self.region_policy.arrival_entry_regions.count(),
                 self.region_policy.region_defs.count(),
             });
             jitdbg.log("  silent rejects: bridge={d} region={d} open={d} child-mismatch={d} no-patch={d} cap={d} region-owned={d} rid-owned={d} resident-occupied={d}", .{
@@ -2951,8 +2952,6 @@ pub const TraceState = struct {
     pub const detectPromotableSet = trace_link_mod.detectPromotableSet;
     pub const detectPromotableSetMembers = trace_link_mod.detectPromotableSetMembers;
     pub const resetRecurrenceStreaks = trace_link_mod.resetRecurrenceStreaks;
-    pub const originalRel32Target = trace_link_mod.originalRel32Target;
-    pub const patchPromotedEdge = trace_link_mod.patchPromotedEdge;
     pub const promoteSet = trace_link_mod.promoteSet;
     pub const promoteResidentSet = trace_link_mod.promoteResidentSet;
     pub const resetPromotionCandidate = trace_link_mod.resetPromotionCandidate;

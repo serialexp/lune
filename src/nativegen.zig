@@ -44,7 +44,6 @@ const NativeSeedCtx = trace_code.NativeSeedCtx;
 const mcode = @import("nativegen_mcode.zig");
 pub const is_x64_linux = mcode.is_x64_linux;
 pub const MapError = mcode.MapError;
-pub const PatchError = mcode.PatchError;
 pub const ExecPage = mcode.ExecPage;
 pub const mapExecutable = mcode.mapExecutable;
 pub const SPILL_MAX = mcode.SPILL_MAX;
@@ -113,7 +112,6 @@ pub const SilentExitMetadata = artifact.SilentExitMetadata;
 pub const ExitPatchKind = artifact.ExitPatchKind;
 pub const RET_CONT_SLOTS = artifact.RET_CONT_SLOTS;
 pub const NATIVE_TRANSITION_SLOTS = artifact.NATIVE_TRANSITION_SLOTS;
-pub const EXIT_NOP5 = artifact.EXIT_NOP5;
 pub const ExitPatch = artifact.ExitPatch;
 pub const SeedPlan = artifact.SeedPlan;
 pub const CompiledTrace = artifact.CompiledTrace;
@@ -391,28 +389,11 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
         };
         var pi: usize = 0;
         for (patch_emissions, 0..) |maybe, ei| if (maybe) |em| {
-            const off = em.patch_off;
-            if (off > asm_buf.code.items.len or asm_buf.code.items.len - off < 5) {
-                gpa.free(exit_patches);
-                gpa.free(metadata_cells);
-                gpa.free(slots);
-                return null;
-            }
-            var original: [5]u8 = undefined;
-            @memcpy(&original, asm_buf.code.items[off..][0..5]);
-            if ((em.kind == .deopt and original[0] != 0xE9) or
-                (em.kind != .deopt and !std.mem.eql(u8, &original, &EXIT_NOP5)))
-            {
-                gpa.free(exit_patches);
-                gpa.free(metadata_cells);
-                gpa.free(slots);
-                return null;
-            }
             exit_patches[pi] = .{
                 .kind = em.kind,
                 .exit_instr = @intCast(ei),
-                .patch_off = @intCast(off),
-                .original = original,
+                .check_off = @intCast(em.check_off),
+                .resume_off = @intCast(em.resume_off),
                 .epilogue_off = @intCast(asm_buf.labelOffset(em.epilogue)),
                 .metadata_cell = &metadata_cells[ei],
             };
@@ -586,6 +567,7 @@ const slotAddr = emit.slotAddr;
 const emitLedgerAppend = emit.emitLedgerAppend;
 const emitForcedYieldCheck = emit.emitForcedYieldCheck;
 const emitSilentEpilogue = emit.emitSilentEpilogue;
+const emitSilentCheck = emit.emitSilentCheck;
 const nativeExitLabel = emit.nativeExitLabel;
 const jccNativeExit = emit.jccNativeExit;
 const jmpNativeExit = emit.jmpNativeExit;
@@ -628,11 +610,23 @@ const EntryStubs = struct {
     seed_prologue: bool = false,
 };
 
+/// Doc 55 §2d: one promotable exit's permanent silent check (`emitSilentCheck`):
+/// where the check starts, where its reporting fall-through resumes, and the
+/// out-of-line epilogue it branches to.
 const PatchEmission = struct {
     kind: ExitPatchKind,
-    patch_off: usize,
+    check_off: usize,
+    resume_off: usize,
     epilogue: x64.Label,
 };
+
+/// Emit `ei`'s silent check and record it. Called at the exact point where the
+/// kind's state materialization is complete and its reporting path begins.
+fn emitPatchableExit(a: *x64.Assembler, patch_emissions: []?PatchEmission, metadata_cells: []usize, ei: usize, kind: ExitPatchKind) !void {
+    const silent = try a.label();
+    const check_off = try emitSilentCheck(a, &metadata_cells[ei], silent);
+    patch_emissions[ei] = .{ .kind = kind, .check_off = check_off, .resume_off = a.code.items.len, .epilogue = silent };
+}
 
 /// Doc 45 D6: deterministic per-trace budget on the TOTAL number of
 /// materializer stores (tag+payload pairs) across every precise exit
@@ -2082,11 +2076,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 }
                 try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
                 try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
-                if (shared_exit != null) {
-                    const silent = try a.label();
-                    patch_emissions[i] = .{ .kind = .link_terminal, .patch_off = a.code.items.len, .epilogue = silent };
-                    try a.nop5();
-                }
+                if (shared_exit != null) try emitPatchableExit(a, patch_emissions, metadata_cells, i, .link_terminal);
                 // 2.3c-2a: record this `.link` transition (chain source C→I) before the
                 // handoff. `exit_instr` = i is now in memory; `exit_reason` is the inherited
                 // `.normal`.
@@ -2505,9 +2495,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
 
                     try emitCompositeBridgeSnapshot(a, t, kinds, alloc, ei);
                     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
-                    const silent = try a.label();
-                    patch_emissions[ei] = .{ .kind = .region_bridge, .patch_off = a.code.items.len, .epilogue = silent };
-                    try a.nop5();
+                    try emitPatchableExit(a, patch_emissions, metadata_cells, ei, .region_bridge);
                     try emitLedgerAppend(a, trace_id, .region_bridge);
 
                     // Re-resolve after the snapshot/append clobbered scratch regs,
@@ -2530,10 +2518,8 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     try a.movMemReg(.rdx, @offsetOf(NativeResult, "exit_target"), .rax);
                 }
             }
-            if (shared_exit != null and !isNumericForLoopDoneGuard(t, ei) and !isCompositeBridgeCandidate(t, ei)) {
-                const silent = try a.label();
-                patch_emissions[ei] = .{ .kind = .deopt, .patch_off = a.code.items.len, .epilogue = silent };
-            }
+            if (shared_exit != null and !isNumericForLoopDoneGuard(t, ei) and !isCompositeBridgeCandidate(t, ei))
+                try emitPatchableExit(a, patch_emissions, metadata_cells, ei, .deopt);
             try a.jmp(deopt_exit);
         }
     }
@@ -2547,11 +2533,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             a.bind(l);
             try emitLinkedLoopDoneSnapshot(a, t, kinds, alloc, ei);
             try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
-            if (shared_exit != null) {
-                const silent = try a.label();
-                patch_emissions[ei] = .{ .kind = .loop_done_linked, .patch_off = a.code.items.len, .epilogue = silent };
-                try a.nop5();
-            }
+            if (shared_exit != null) try emitPatchableExit(a, patch_emissions, metadata_cells, ei, .loop_done_linked);
             // 2.3c-2a: record this loop-done transition (chain source I→C once 2.3c-2c
             // arms slot[ei]) before the handoff. `exit_instr` = ei was written into memory
             // by the mini-stub (its `jne` reached here); `exit_reason` is `.normal`.
@@ -2784,10 +2766,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
         try emitReturn(a, frame, callee[0..callee_len], shared_exit, trace_id, null);
     }
 
-    // B-3a: all silent epilogues live out of line in this same allocation. Their
-    // metadata cells are null and no patch targets them yet, so they are unreachable
-    // while the feature is off. Each kind's state materialization precedes its patch
-    // point; ordinary deopt duplicates the shared carried-home flush here.
+    // B-3a: all silent epilogues live out of line in this same allocation. Each is
+    // reached only through its exit's `emitSilentCheck` while that exit's metadata
+    // cell is published (doc 55 §2d), so it is unreachable while the cell is zero.
+    // Each kind's state materialization precedes its check; ordinary deopt
+    // duplicates the shared carried-home flush here.
     if (shared_exit) |se| {
         for (patch_emissions, 0..) |maybe, ei| if (maybe) |em| {
             a.bind(em.epilogue);

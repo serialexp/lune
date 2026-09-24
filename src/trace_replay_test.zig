@@ -781,6 +781,8 @@ test "replayLedger A-vii-c.1: rows a live region CONSUMES take no legacy strike 
     try state.region_policy.source_exit_regions.put(gpa, .{ .trace_id = 201, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
     try state.region_policy.source_exit_regions.put(gpa, .{ .trace_id = 202, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
     try state.region_policy.dest_entry_regions.put(gpa, 202, try gpa.dupe(RegionId, &.{rid}));
+    // Doc 55 §2 invariant: arrival ⊇ dest (the destination step reads arrival).
+    try state.region_policy.arrival_entry_regions.put(gpa, 202, try gpa.dupe(RegionId, &.{rid}));
     state.setRegionContext(1, 5);
 
     // [I.loop_done_linked (work 1), C.deopt local=3 (work 3)] — both sub-min_useful,

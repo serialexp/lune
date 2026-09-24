@@ -684,16 +684,61 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
         try src_builder.add(gpa, e.key, R.id);
     }
     // dest_entry: every physical member of an armable region (in a strongly-connected
-    // component every member anchor is the destination of an internal edge).
+    // component every member anchor is the destination of an internal edge). This is
+    // the member proof — bridge child selection (`traceInRegion`) reads it.
+    //
+    // arrival_entry: dest_entry CLOSED over same-anchor sibling provenance links
+    // (doc 55 §2), read only by the activation's destination step. A physical member
+    // is a realizer of an internal edge (round-12 finding 3), but with same-anchor
+    // siblings the trace an internal edge physically LANDS in need not be one: fft's
+    // inner loop-done lands in the `:193` sibling that only hands off (t7) through
+    // its armed provenance edge to the realizer of the back-edge (t8). Excluding t7
+    // read every lap's landing as a departure, closed the activation with work=1,
+    // and tombstoned the region in warm-up. A sibling joined to a member by a
+    // provenance edge (side trace recorded off a member's exit, or a member recorded
+    // off its exit) is part of the member's physical group at that anchor; a sibling
+    // with no such link (A-ii.4's A′, which only leaves) stays excluded.
+    //
+    // Arrival only: the closure does NOT extend `member_points` (a linked sibling's
+    // recorded path can run outside the cycle — t7 walks into the stage transition),
+    // nor `source_exit_regions` (a linked sibling's rows credit through the
+    // anchor-keyed unclassified-member path, exactly as before), nor `dest_entry`
+    // (a linked sibling is not a bridge target: when one map served both jobs,
+    // nsieve's bridge armed into the sibling that deopts on entry — 364 → 10k
+    // trace entries, seam 8.7% → 45.8%).
+    var arr_builder = RegionSetBuilder(u32){};
+    defer arr_builder.deinit(gpa);
+    var group: std.ArrayListUnmanaged(u32) = .empty;
+    defer group.deinit(gpa);
     for (active_regions.items) |a| {
         if (!a.armable or a.dormant) continue;
         for (a.member_trace_ids) |tid| try dst_builder.add(gpa, tid, a.id);
+        group.clearRetainingCapacity();
+        try group.appendSlice(gpa, a.member_trace_ids);
+        var grew = true;
+        while (grew) {
+            grew = false;
+            for (view.sibling_links) |l| {
+                const has_p = std.mem.indexOfScalar(u32, group.items, l.parent_id) != null;
+                const has_c = std.mem.indexOfScalar(u32, group.items, l.child_id) != null;
+                if (has_p == has_c) continue;
+                const add = if (has_p) l.child_id else l.parent_id;
+                const t = view.traceById(add) orelse continue;
+                const ni = node_index.get(.{ .proto_id = t.code.anchor.proto.id, .pc = t.code.anchor.pc }) orelse continue;
+                if (comp[ni] != a.comp) continue;
+                try group.append(gpa, add);
+                grew = true;
+            }
+        }
+        for (group.items) |tid| try arr_builder.add(gpa, tid, a.id);
     }
 
     var new_source = try src_builder.finalize(gpa);
     errdefer freeRegionSetMap(ExitKey, &new_source, gpa);
     var new_dest = try dst_builder.finalize(gpa);
     errdefer freeRegionSetMap(u32, &new_dest, gpa);
+    var new_arrival = try arr_builder.finalize(gpa);
+    errdefer freeRegionSetMap(u32, &new_arrival, gpa);
 
     // A-vii-d.1 (review blocker 3): the live-armable region-id set for the
     // stale-bridge disarm sweep in the publish phase (fallible scratch).
@@ -717,6 +762,7 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
         .live_armable_ids = live_armable_ids,
         .source = new_source,
         .dest = new_dest,
+        .arrival = new_arrival,
         .next_id = new_id_counter,
     };
 }

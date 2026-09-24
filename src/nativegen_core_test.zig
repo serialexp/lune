@@ -23,7 +23,6 @@ const irinterp = @import("irinterp.zig");
 const I = trace.IrInstr;
 const S = trace.SlotStore;
 
-const EXIT_NOP5 = nativegen.EXIT_NOP5;
 const McodeArena = nativegen.McodeArena;
 const NativeResult = nativegen.NativeResult;
 const NativeResultLedgerLayout = nativegen.NativeResultLedgerLayout;
@@ -49,62 +48,7 @@ test "nativegen B-3a: NativeResult silent ABI tail preserves every ledger offset
     try testing.expectEqual(@sizeOf(NativeResultLedgerLayout), @offsetOf(NativeResult, "silent_active"));
 }
 
-test "nativegen B-3a: McodeArena patchRel32 and patchWindow validate patch and restore" {
-    if (comptime !is_x64_linux) return error.SkipZigTest;
-    var arena = McodeArena.init(testing.allocator);
-    defer arena.deinit();
-
-    var original: [26]u8 = @splat(0xC3);
-    original[0..5].* = .{ 0xE9, 0, 0, 0, 0 };
-    original[5..10].* = EXIT_NOP5;
-    var page = try arena.alloc(&original);
-    defer page.deinit();
-    const generation = switch (page.owner) {
-        .arena => |slot| slot.generation,
-        .owned => unreachable,
-    };
-    const base = @intFromPtr(page.code.ptr);
-
-    try arena.patchRel32(&page, generation, 0, base + 24);
-    try testing.expectEqual(@as(u8, 0xE9), page.code[0]);
-    try testing.expect(!std.mem.eql(u8, page.code[1..5], original[1..5]));
-    try arena.patchRel32(&page, generation, 0, base + 5);
-    try testing.expectEqualSlices(u8, original[0..5], page.code[0..5]);
-
-    try arena.patchWindow(&page, generation, 5, EXIT_NOP5, base + 24, true);
-    try testing.expectEqual(@as(u8, 0xE9), page.code[5]);
-    try arena.patchWindow(&page, generation, 5, EXIT_NOP5, base + 24, false);
-    try testing.expectEqualSlices(u8, &EXIT_NOP5, page.code[5..10]);
-
-    try testing.expectError(error.StalePage, arena.patchRel32(&page, generation + 1, 0, base + 5));
-    try testing.expectError(error.OffsetOutOfBounds, arena.patchRel32(&page, generation, page.code.len - 4, base));
-    try testing.expectError(error.OpcodeMismatch, arena.patchRel32(&page, generation, 10, base));
-    try testing.expectError(error.OriginalBytesMismatch, arena.patchWindow(&page, generation, 5, .{ 1, 2, 3, 4, 5 }, base + 24, true));
-    try testing.expectError(error.OpcodeMismatch, arena.patchWindow(&page, generation, 5, EXIT_NOP5, base + 24, false));
-    try testing.expectError(error.DisplacementOutOfRange, arena.patchRel32(&page, generation, 0, std.math.maxInt(usize)));
-    try testing.expectEqualSlices(u8, original[0..10], page.code[0..10]);
-
-    var other = McodeArena.init(testing.allocator);
-    defer other.deinit();
-    try testing.expectError(error.WrongArena, other.patchRel32(&page, generation, 0, base + 5));
-
-    var owned = try mapExecutable(&.{ 0xE9, 0, 0, 0, 0 });
-    defer owned.deinit();
-    try testing.expectError(error.NotArenaOwned, arena.patchRel32(&owned, generation, 0, @intFromPtr(owned.code.ptr) + 5));
-
-    var retired = try arena.alloc(&.{ 0xE9, 0, 0, 0, 0 });
-    var stale = retired;
-    const stale_generation = switch (stale.owner) {
-        .arena => |slot| slot.generation,
-        .owned => unreachable,
-    };
-    retired.deinit();
-    var replacement = try arena.alloc(&.{ 0xE9, 0, 0, 0, 0 });
-    defer replacement.deinit();
-    try testing.expectError(error.StalePage, arena.patchRel32(&stale, stale_generation, 0, @intFromPtr(stale.code.ptr) + 5));
-}
-
-test "nativegen B-3a: link and linked-loop-done exits contain inert NOP windows" {
+test "nativegen doc 55 §2d: link, linked-loop-done, and deopt exits carry a data-switched silent check" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     var arena = McodeArena.init(gpa);
@@ -119,7 +63,7 @@ test "nativegen B-3a: link and linked-loop-done exits contain inert NOP windows"
     var saw_link = false;
     for (link_ct.exit_patches) |p| if (p.kind == .link_terminal) {
         saw_link = true;
-        try testing.expectEqualSlices(u8, &EXIT_NOP5, link_ct.page.code[p.patch_off..][0..5]);
+        try util.expectSilentCheck(&link_ct, p);
         try testing.expectEqual(@as(usize, 0), p.metadata_cell.*);
     };
     try testing.expect(saw_link);
@@ -148,7 +92,7 @@ test "nativegen B-3a: link and linked-loop-done exits contain inert NOP windows"
     var saw_loopdone = false;
     for (loop_ct.exit_patches) |p| if (p.kind == .loop_done_linked) {
         saw_loopdone = true;
-        try testing.expectEqualSlices(u8, &EXIT_NOP5, loop_ct.page.code[p.patch_off..][0..5]);
+        try util.expectSilentCheck(&loop_ct, p);
         try testing.expectEqual(@as(usize, 0), p.metadata_cell.*);
     };
     try testing.expect(saw_loopdone);
@@ -162,8 +106,9 @@ test "nativegen B-3a: link and linked-loop-done exits contain inert NOP windows"
     var saw_deopt = false;
     for (deopt_ct.exit_patches) |p| if (p.kind == .deopt) {
         saw_deopt = true;
-        try testing.expectEqual(@as(u8, 0xE9), p.original[0]);
-        try testing.expectEqualSlices(u8, &p.original, deopt_ct.page.code[p.patch_off..][0..5]);
+        try util.expectSilentCheck(&deopt_ct, p);
+        // The deopt fall-through is the unchanged `jmp deopt_exit` (E9 rel32).
+        try testing.expectEqual(@as(u8, 0xE9), deopt_ct.page.code[p.resume_off]);
         try testing.expectEqual(@as(usize, 0), p.metadata_cell.*);
     };
     try testing.expect(saw_deopt);

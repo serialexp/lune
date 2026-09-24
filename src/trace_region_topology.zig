@@ -26,8 +26,14 @@ pub const TraceRecord = struct {
     inner_root: bool,
     exits: []const ExitFact,
 };
+/// A same-anchor sibling provenance link (doc 17 §B.5 `ProvenanceEdge`, exit
+/// dropped): `child` was recorded off one of `parent`'s exits at the same anchor.
+pub const SiblingLink = struct { parent_id: u32, child_id: u32 };
+
 pub const View = struct {
     traces: []const TraceRecord,
+    /// Doc 55 §2: closes `arrival_entry_regions` over same-anchor sibling groups.
+    sibling_links: []const SiblingLink = &.{},
     pub fn traceById(self: View, id: u32) ?TraceRecord {
         for (self.traces) |t| if (t.id == id) return t;
         return null;
@@ -92,6 +98,7 @@ pub const Rebuild = struct {
     live_armable_ids: std.ArrayListUnmanaged(RegionId) = .empty,
     source: std.AutoHashMapUnmanaged(types.ExitKey, []RegionId) = .empty,
     dest: std.AutoHashMapUnmanaged(u32, []RegionId) = .empty,
+    arrival: std.AutoHashMapUnmanaged(u32, []RegionId) = .empty,
     next_id: u64,
     pub fn deinit(self: *Rebuild, gpa: std.mem.Allocator) void {
         for (self.staged_interns.items) |s| gpa.free(s.edges);
@@ -110,6 +117,7 @@ pub const Rebuild = struct {
         self.live_armable_ids.deinit(gpa);
         region.freeRegionSetMap(types.ExitKey, &self.source, gpa);
         region.freeRegionSetMap(u32, &self.dest, gpa);
+        region.freeRegionSetMap(u32, &self.arrival, gpa);
         self.* = undefined;
     }
 };

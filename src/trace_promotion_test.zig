@@ -15,6 +15,7 @@ const io = @import("io.zig");
 const tropt = @import("tropt.zig");
 const execlog = @import("execlog.zig");
 const nativegen = @import("nativegen.zig");
+const nativegen_testutil = @import("nativegen_testutil.zig");
 const irinterp = @import("irinterp.zig");
 const trace_exec = @import("trace_exec.zig");
 const jitdbg = @import("jitdbg.zig");
@@ -299,25 +300,21 @@ fn makeB3M1RampTrace(
     return t;
 }
 
+/// Doc 55 §2d: an edge is promoted iff its exit's data cell is published. The
+/// compiled silent check is identical in both states (code is never rewritten).
 fn expectB3Patched(edge: PromotedEdge, promoted: bool) !void {
     const compiled = &edge.parent.native.compiled;
     const patch = TraceState.exitPatchFor(compiled, edge.exit).?;
-    const bytes = compiled.page.code[patch.patch_off..][0..5];
+    try nativegen_testutil.expectSilentCheck(compiled, patch.*);
+    const cell = compiled.metadata_cells[edge.exit];
     if (!promoted) {
-        try testing.expectEqualSlices(u8, &patch.original, bytes);
-        try testing.expectEqual(@as(usize, 0), compiled.metadata_cells[edge.exit]);
+        try testing.expectEqual(@as(usize, 0), cell);
         return;
     }
-    try testing.expectEqual(@as(u8, 0xE9), bytes[0]);
-    const bits: u32 = @as(u32, bytes[1]) | (@as(u32, bytes[2]) << 8) |
-        (@as(u32, bytes[3]) << 16) | (@as(u32, bytes[4]) << 24);
-    const disp: i32 = @bitCast(bits);
-    const target: usize = @intCast(@as(i128, @intCast(@intFromPtr(bytes.ptr) + 5)) + disp);
-    try testing.expectEqual(@intFromPtr(compiled.page.code.ptr) + patch.epilogue_off, target);
-    const cell = compiled.metadata_cells[edge.exit];
     try testing.expect(cell != 0);
     const metadata: *nativegen.SilentExitMetadata = @ptrFromInt(cell);
     try testing.expectEqual(&compiled.slots[edge.exit], metadata.slot);
+    try testing.expectEqual(@intFromPtr(compiled.page.code.ptr) + patch.resume_off, metadata.reporting_target);
 }
 
 fn b3ObservedRow(t: *Trace, exit: u32, kind: trace_exec.LedgerKind) trace_exec.LedgerEntry {
@@ -569,7 +566,7 @@ test "B-3d.2 set candidacy rejects non-member rows, kind mismatch, adjacent-pair
     try testing.expectEqual(@as(u64, 0), state.silent_rejects.region_mismatch);
 }
 
-test "B-3b.2 promotion publishes metadata and patches mixed deopt/NOP exits; demotion restores exact bytes" {
+test "B-3b.2 promotion publishes mixed deopt/link/loop-done cells; demotion zeroes them (code never rewritten)" {
     if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
@@ -593,6 +590,12 @@ test "B-3b.2 promotion publishes metadata and patches mixed deopt/NOP exits; dem
     try installB3PromotionRegion(&state, key, &.{ guard, done, link });
     const edges = state.detectPromotableSet(&observed, key).?;
     defer gpa.free(edges);
+    // Doc 55 §2d: a set naming one exit twice is refused before anything is
+    // published (it would double-publish the cell and double-insert the owner).
+    const dup = [_]PromotedEdge{ edges[0], edges[0] };
+    try testing.expectError(error.InvalidPromotionSet, state.registry.native_physical.promoteSet(&dup, key, state.config.min_useful));
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
+    for (edges) |edge| try expectB3Patched(edge, false);
     try state.promoteSet(edges, key);
     try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
     for (edges) |edge| try expectB3Patched(edge, true);
@@ -616,7 +619,7 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
     try testing.expect(nativegen.isCompositeBridgeCandidate(&bridge.code, 11));
     const patch = TraceState.exitPatchFor(&bridge.native.compiled, 11).?;
     try testing.expectEqual(nativegen.ExitPatchKind.region_bridge, patch.kind);
-    try testing.expectEqualSlices(u8, &nativegen.EXIT_NOP5, &patch.original);
+    try nativegen_testutil.expectSilentCheck(&bridge.native.compiled, patch.*);
 
     const rid: RegionId = @enumFromInt(1714);
     try state.region_policy.region_defs.put(gpa, rid, .{
@@ -1929,7 +1932,7 @@ test "C' parked proof: trace retire and defs mutation drop proofs; a stale proof
         try state.promoteSet(edges, key);
         _ = state.demotePromotionsForRegionReason(key, .region_close);
         try testing.expectEqual(@as(usize, 1), state.registry.native_physical.parked_proofs.items.len);
-        state.registry.native_physical.demoteSetsForRegionDefsMutation(&state.registry.mcode_arena);
+        state.registry.native_physical.demoteSetsForRegionDefsMutation();
         try testing.expectEqual(@as(usize, 0), state.registry.native_physical.parked_proofs.items.len);
     }
 

@@ -76,7 +76,17 @@ pub const RegionPolicy = struct {
     /// Physical classification index (doc 17 §A3.1): a concrete `Trace.id` → the
     /// regions entered by landing in it (destination of an internal edge; physical
     /// members only). Same lifetime/rebuild/ownership rules as `source_exit_regions`.
+    /// This is the MEMBER PROOF (`traceInRegion` → bridge child selection); the
+    /// activation's arrival classification reads `arrival_entry_regions`.
     dest_entry_regions: std.AutoHashMapUnmanaged(u32, []RegionId) = .empty,
+    /// Doc 55 §2: `dest_entry_regions` closed over same-anchor sibling provenance
+    /// links — the traces whose landing keeps an activation open (fft's `:193`
+    /// loop-done lands in a sibling that only hands off to the back-edge's
+    /// realizer). A superset of `dest_entry_regions`; read ONLY by
+    /// `applyDestination`. Never a member proof: a linked sibling is not a
+    /// bridge target (nsieve measured the bridge arming the deopting sibling
+    /// when one map served both jobs). Same lifetime/ownership rules.
+    arrival_entry_regions: std.AutoHashMapUnmanaged(u32, []RegionId) = .empty,
     /// A-iv: persistent across physical trace retirement/re-arm, bounded by live
     /// activation lifetime and cleared on activation death / restore / epoch end.
     /// Opening a logical region is the only operation that may grow this map;
@@ -227,6 +237,14 @@ pub const RegionPolicy = struct {
     pub fn beginClose(self: *RegionPolicy, key: RegionKey, min_useful: u64) ?Close {
         const accum = self.region_profit.get(key) orelse return null;
         const work = accum.outer_traversals - accum.window_base;
+        // Doc 55 §2: a remainder is low-yield evidence only for an activation
+        // that never filled a window. After at least one full useful window the
+        // remainder is the activation's TAIL: fft's middle loop runs 2^k − 1
+        // laps per stage, so every long stage closed with remainder 7 after up
+        // to 63 useful windows, struck, unfroze, and demoted its live silent
+        // set (29/29 demotions were `.unfreeze`). A short activation (total
+        // work < N) still strikes exactly as before.
+        if (work > 0 and work < min_useful and accum.useful_window_seen) return .{ .work = work, .window = .none };
         return .{ .work = work, .window = self.flushWindow(key, work, min_useful) };
     }
     /// Called only after window and physical demotion effects have completed.
@@ -282,15 +300,15 @@ pub const RegionPolicy = struct {
     /// pipeline: with all three maps empty, `classifyExit` yields no candidates
     /// (`source_exit_regions`), `activeRegionFor` yields no activation
     /// (`region_profit` — so nothing to close, credit, or barren-consume), and
-    /// `applyDestination` finds no entry candidates (`dest_entry_regions` — so
-    /// nothing to open or invalidate). Pure function of deterministic policy
+    /// `applyDestination` finds no entry candidates (`arrival_entry_regions`, a
+    /// superset of `dest_entry_regions` — so nothing to open or invalidate). Pure function of deterministic policy
     /// state; three O(1) size loads. This is the per-row cost floor for every
     /// program that has no live armable region — the common case — measured at
     /// ~1M no-op pipeline runs per scimark-fft execution without it.
     pub fn receiptsInert(self: *const RegionPolicy) bool {
         return self.region_profit.count() == 0 and
             self.source_exit_regions.count() == 0 and
-            self.dest_entry_regions.count() == 0;
+            self.arrival_entry_regions.count() == 0;
     }
 
     /// Resolved logical membership, with no registry or physical trace reference.
@@ -346,8 +364,10 @@ pub const RegionPolicy = struct {
     pub fn clearPhysicalIndices(self: *RegionPolicy, gpa: std.mem.Allocator) void {
         region.freeRegionSetMap(ExitKey, &self.source_exit_regions, gpa);
         region.freeRegionSetMap(u32, &self.dest_entry_regions, gpa);
+        region.freeRegionSetMap(u32, &self.arrival_entry_regions, gpa);
         self.source_exit_regions = .empty;
         self.dest_entry_regions = .empty;
+        self.arrival_entry_regions = .empty;
     }
 
     /// Last fallible step; changes capacity only, never logical contents or ids.
@@ -406,8 +426,10 @@ pub const RegionPolicy = struct {
         self.clearPhysicalIndices(gpa);
         self.source_exit_regions = staged.source;
         self.dest_entry_regions = staged.dest;
+        self.arrival_entry_regions = staged.arrival;
         staged.source = .empty;
         staged.dest = .empty;
+        staged.arrival = .empty;
     }
 
     pub fn deinit(self: *RegionPolicy, gpa: std.mem.Allocator) void {
@@ -424,6 +446,7 @@ pub const RegionPolicy = struct {
         self.region_intern.deinit(gpa);
         region.freeRegionSetMap(ExitKey, &self.source_exit_regions, gpa);
         region.freeRegionSetMap(u32, &self.dest_entry_regions, gpa);
+        region.freeRegionSetMap(u32, &self.arrival_entry_regions, gpa);
         self.region_profit.deinit(gpa);
         self.freeObserverFast(gpa); // A-vii-e.1: owned bitset copies
     }

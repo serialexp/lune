@@ -28,7 +28,6 @@ const NativeResultLedgerLayout = artifact.NativeResultLedgerLayout;
 const SilentSummaryCell = artifact.SilentSummaryCell;
 const ExitPatchKind = artifact.ExitPatchKind;
 const RET_CONT_SLOTS = artifact.RET_CONT_SLOTS;
-const EXIT_NOP5 = artifact.EXIT_NOP5;
 
 const layout = @import("nativegen_layout.zig");
 const ArrLayout = layout.ArrLayout;
@@ -1265,8 +1264,26 @@ pub fn emitInlineSelfRetPop(
     // `.ret_pop` ledger row, and the ret-cont compare chain.
 }
 
-/// B-3a's unreachable silent tail. `metadata_cell` is a stable compile-time-owned
-/// pointer cell; B-3b publishes a `*SilentExitMetadata` into it before patching.
+/// Doc 55 §2d: a promotable exit's permanent silent switch. It tests the
+/// exit's data cell and branches to the out-of-line silent epilogue when a
+/// `*SilentExitMetadata` is published there, and otherwise falls through to
+/// the reporting path. The code is never rewritten after compile; a flip is a
+/// cell write (see `artifact.ExitPatch`). It clobbers rax and the flags, and
+/// both are dead at every call site: the `.link` / linked-loop-done / bridge
+/// sites are followed by `emitLedgerAppend` (which loads rax fresh), and the
+/// ordinary deopt site precedes `jmp deopt_exit`, whose flush block clobbers
+/// rax (`exit_target` is staged in memory for exactly that reason). Returns
+/// the check's start offset.
+pub fn emitSilentCheck(a: *x64.Assembler, metadata_cell: *usize, epilogue: x64.Label) !usize {
+    const check_off = a.code.items.len;
+    try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(metadata_cell))));
+    try a.cmpQwordMemImm8(.rax, 0, 0);
+    try a.jcc(.ne, epilogue);
+    return check_off;
+}
+
+/// B-3a's silent tail, reached only through `emitSilentCheck` while the exit's
+/// `metadata_cell` holds a published `*SilentExitMetadata`.
 pub fn emitSilentEpilogue(a: *x64.Assembler, kind: ExitPatchKind, metadata_cell: *usize, shared_exit: usize, trace_id: u32) !void {
     const can_silence = try a.label();
     const owned = try a.label();
@@ -1319,9 +1336,17 @@ pub fn emitSilentEpilogue(a: *x64.Assembler, kind: ExitPatchKind, metadata_cell:
     // Preserve dynamic progress evidence independently from aggregated work.
     // Provenance verdict merging needs occurrence count, not merely a sum that
     // could have come from a different number of firings.
+    //
+    // Doc 55 §1 applied to the silent path: a firing out of a COMMITTING exit
+    // (every kind but `.deopt`, mirroring `LedgerKind.commitsGuestWork`) is
+    // progress even at `local == 0` — a one-trip loop's loop-done, a
+    // continuation's link terminal. Only a `.deopt` firing needs a nonzero
+    // local, since tier 0 re-runs its iteration. The kind is compile-time.
     const not_productive = try a.label();
-    try a.cmpRegImm32(.r8, 0);
-    try a.jcc(.e, not_productive);
+    if (kind == .deopt) {
+        try a.cmpRegImm32(.r8, 0);
+        try a.jcc(.e, not_productive);
+    }
     try a.incMemQword(.rcx, @offsetOf(SilentSummaryCell, "productive_firings"));
     try a.movMemReg(.rcx, @offsetOf(SilentSummaryCell, "last_productive_ordinal"), .r9);
     a.bind(not_productive);

@@ -1074,12 +1074,6 @@ pub fn detectPromotableSetMembers(
     return result;
 }
 
-pub const originalRel32Target = native_physical.originalRel32Target;
-
-pub fn patchPromotedEdge(self: *TraceState, edge: PromotedEdge, promote: bool) nativegen.PatchError!void {
-    defer self.syncNativeInvalidation();
-    return self.registry.native_physical.patchPromotedEdge(&self.registry.mcode_arena, edge, promote);
-}
 
 pub fn promoteSet(self: *TraceState, edges: []const PromotedEdge, region_key: RegionKey) !void {
     // Physical precedence (bounds, id space, region/exit ownership) is the
@@ -1098,7 +1092,7 @@ pub fn promoteSet(self: *TraceState, edges: []const PromotedEdge, region_key: Re
             return error.InvalidPromotionSet;
     }
 
-    try self.registry.native_physical.promoteSet(&self.registry.mcode_arena, edges, region_key, self.config.min_useful);
+    try self.registry.native_physical.promoteSet(edges, region_key, self.config.min_useful);
     if (comptime jitdbg.enabled) {
         if (self.config.debug_log) {
             jitdbg.log("silent-promote: set={d} region={d} len={d}", .{
@@ -1151,7 +1145,7 @@ pub fn promoteResidentSet(self: *TraceState, edges: []const PromotedEdge, rid: R
         if (validated.kind != edge.kind or validated.resume_pc != edge.resume_pc)
             return error.InvalidPromotionSet;
     }
-    try self.registry.native_physical.promoteSet(&self.registry.mcode_arena, edges, key, self.config.min_useful);
+    try self.registry.native_physical.promoteSet(edges, key, self.config.min_useful);
     if (comptime jitdbg.enabled) {
         if (self.config.debug_log) {
             jitdbg.log("silent-promote: RESIDENT set={d} region={d} len={d}", .{
@@ -1541,42 +1535,42 @@ pub fn queueDemote(self: *TraceState, id: u32, reason: DemotionReason) void {
 
 pub fn demoteSet(self: *TraceState, idx: usize) void {
     defer self.syncNativeInvalidation();
-    self.registry.native_physical.demoteSet(&self.registry.mcode_arena, idx);
+    self.registry.native_physical.demoteSet(idx);
 }
 
 pub fn demoteSetReason(self: *TraceState, idx: usize, reason: DemotionReason) void {
     defer self.syncNativeInvalidation();
-    self.registry.native_physical.demoteSetReason(&self.registry.mcode_arena, idx, reason);
+    self.registry.native_physical.demoteSetReason(idx, reason);
 }
 
 pub fn demoteSetsTouching(self: *TraceState, parent: *Trace, exit: u32) void {
     defer self.syncNativeInvalidation();
-    self.registry.native_physical.demoteSetsTouching(&self.registry.mcode_arena, parent, exit);
+    self.registry.native_physical.demoteSetsTouching(parent, exit);
 }
 
 pub fn demoteSetsTouchingTrace(self: *TraceState, trace: *Trace) void {
     defer self.syncNativeInvalidation();
-    self.registry.native_physical.demoteSetsTouchingTrace(&self.registry.mcode_arena, trace);
+    self.registry.native_physical.demoteSetsTouchingTrace(trace);
 }
 
 pub fn demoteAllSets(self: *TraceState) void {
     defer self.syncNativeInvalidation();
-    self.registry.native_physical.demoteAllSets(&self.registry.mcode_arena);
+    self.registry.native_physical.demoteAllSets();
 }
 
 pub fn demoteSetsForRegionDefsMutation(self: *TraceState) void {
     defer self.syncNativeInvalidation();
-    self.registry.native_physical.demoteSetsForRegionDefsMutation(&self.registry.mcode_arena);
+    self.registry.native_physical.demoteSetsForRegionDefsMutation();
 }
 
 pub const SlotMutationReason = native_physical.SlotMutationReason;
 pub const PreparedSlotMutation = native_physical.PreparedSlotMutation;
 
-/// Phase 1 of the sole physical slot-write funnel. B-3a validates ownership and
-/// bounds; B-3b will demote a promotion owning this physical exit here.
+/// Phase 1 of the sole physical slot-write funnel: validates ownership and
+/// bounds, and demotes a promotion owning this physical exit.
 pub fn prepareSlotMutation(self: *TraceState, parent: *Trace, exit: u32, reason: SlotMutationReason) !PreparedSlotMutation {
     defer self.syncNativeInvalidation();
-    return self.registry.native_physical.prepareSlotMutation(&self.registry.mcode_arena, parent, exit, reason);
+    return self.registry.native_physical.prepareSlotMutation(parent, exit, reason);
 }
 
 /// Phase 2 is infallible and occurs only after the caller's registry mutation.
@@ -1739,7 +1733,7 @@ pub fn arm(self: *TraceState, request: ArmRequest) !bool {
     }
     defer self.syncNativeInvalidation();
     self.registry.native_physical.debug_log = self.config.debug_log;
-    const outcome = try self.registry.native_physical.publishValidatedLink(&self.registry.mcode_arena, request);
+    const outcome = try self.registry.native_physical.publishValidatedLink(request);
     if (outcome == .changed) self.noteMembershipGrowth(parent, slot_index, child, kind);
     return outcome != .declined;
 }
