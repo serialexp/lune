@@ -1,6 +1,6 @@
 # 56 — Exit-started side traces (LuaJIT's side-trace mechanism) — Design
 
-Status: Phase 1 in progress (snapshots and the exit location map landed; finalize exit-snapshot tests outstanding); design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
+Status: Phase 1 done (exit snapshots, exit location map, finalize tests); Phase 2 next; design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
 Owner: Bart
 Last updated: 2026-09-25
 
@@ -62,7 +62,8 @@ consumes yet, so every program's output and trace set stays identical.
 
   Each probe lands in the phase that creates its event (none of these
   events exist yet). This bullet closes when the last one is in.
-- [ ] **Phase 1 — exit snapshots and exit locations (inert).**
+- [x] **Phase 1 — exit snapshots and exit locations (inert).** Done
+  2026-09-25 (0889c7b, 1f9b066, and the finalize tests).
   - [x] Boundary ordinals and sparse snapshots per bytecode boundary
     (`exitBoundary`/`commitExitSnap`, `Builder.addSparse`, rewind via
     `Builder.mark`/`truncate` on the doc 47 peel fallback).
@@ -80,8 +81,15 @@ consumes yet, so every program's output and trace set stays identical.
     built by `nativegen_exitloc.build` after emission (§4.2 "As
     built"). Machine code is byte-identical; memory and the per-exit
     held/lost count are in `--jit-stats`.
-  - [ ] Finalize tests for the exit snapshots (`exitSnapshotsValid`, the
-    `compactSparse` path in finalize).
+  - [x] Finalize tests for the exit snapshots (`trace_finalize_test.zig`):
+    - kept as recorded on the unoptimized path;
+    - a folded guard's record is compacted away on the tropt path;
+    - a ref not defined at its exit drops them all;
+    - overflow or no builder attaches none;
+    - an allocation-failure sweep on both paths;
+    - every `exitSnapshotsValid` rejection rule.
+
+    The compaction and validation legs were each mutation-checked.
 - [ ] **Phase 2 — attachability and resume pc (inert).**
   `exitAttachable` and `exitResumePc`, including the branch fix-up and
   the Q6 guard-emitter audit. Pure tests.

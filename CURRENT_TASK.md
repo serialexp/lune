@@ -238,7 +238,17 @@ the ones that bite):
     and scalar are noise. On repack, `perf stat -r 30` has the new build
     ~16% FASTER, with the same instruction count (268.5M vs 268.8M), so
     that bench just swings both ways.
-  - Still to do: the finalize exit-snapshot tests.
+  - Committed as 1f9b066.
+  - **Finalize exit-snapshot tests landed**, closing Phase 1. There are
+    six tests in `trace_finalize_test.zig`; the compaction and validation
+    legs were mutation-checked. Gates: `just test` 0; jit-debug 0, with
+    the known stray line (a pre-existing flake).
+- **Next: Phase 2** (inert):
+  - `exitAttachable` and `exitResumePc`, including the branch fix-up;
+  - the Q6 guard-emitter audit;
+  - pure tests;
+  - extending liveness for attachable exits only, so their exit
+    location map rows become "held".
   - Known cost, and it is by design (LuaJIT pays the same): a NON-konst
     value kept only by a snapshot still gets a register and code. No
     bench has one; every IR difference is a konst.
