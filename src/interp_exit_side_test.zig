@@ -293,3 +293,159 @@ test "doc 56 Phase 2: bit-reverse's while-exit is attachable and resumes after t
     try testing.expect(attachable > 0);
     try testing.expect(after_while > 0);
 }
+
+fn isExecuteMode(mode: TraceMode) bool {
+    return mode == .record_execute or mode == .record_execute_noopt or mode == .record_execute_native;
+}
+
+/// The oracle for a `.link` terminal's `LinkKind`: `.enclosing_iteration`
+/// exactly when some back-edge at or after the anchor returns to the link
+/// target at or before it, i.e. the loop headed at the target contains the
+/// anchor. Returns how many links are `.enclosing_iteration`.
+fn expectLinkKindsMatchLoops(vm: *Vm) !usize {
+    var enclosing: usize = 0;
+    for (vm.trace.registry.cache.items) |t| {
+        const c = &t.code;
+        const n = c.instrs.len;
+        if (n == 0 or c.instrs[n - 1].op != .link) continue;
+        const target: i64 = c.instrs[n - 1].aux;
+        const a: i64 = c.anchor.pc;
+        var contains = false;
+        for (c.anchor.proto.code, 0..) |ins, pc| switch (ins.op) {
+            .for_loop, .tfor_loop, .jmp => {
+                const back: i64 = @intCast(pc);
+                if (back + 1 + ins.aux == target and target <= a and back >= a) contains = true;
+            },
+            else => {},
+        };
+        try testing.expectEqual(contains, c.linkClosesIteration());
+        enclosing += @intFromBool(contains);
+    }
+    return enclosing;
+}
+
+test "doc 56 Phase 3: a continuation that closes at its enclosing loop tags its link as an iteration" {
+    // The post-`while` continuation (`j = j + k`, then the `for` back-edge)
+    // links to the `for` root that CONTAINS it (LuaJIT `LJ_TRLINK_ROOT`):
+    // one run to its `.link` finishes an iteration of that `for`. A ramp
+    // into the inner `while` root keeps the doc 15 `.inner_root` kind.
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            const enclosing = try expectLinkKindsMatchLoops(vm);
+            // Continuations only arm off executed loop-done exits.
+            if (isExecuteMode(mode)) try testing.expect(enclosing > 0);
+        }
+    };
+    try expectProgramTuned(
+        \\local n = 32
+        \\local cnt = 0
+        \\local function f()
+        \\  local j = 0
+        \\  for i = 0, 2 * n - 4, 2 do
+        \\    if i < j then cnt = cnt + 1 end
+        \\    local k = n
+        \\    while k <= j do j = j - k; k = k / 2 end
+        \\    j = j + k
+        \\  end
+        \\end
+        \\for rep = 1, 20 do f() end
+        \\print(cnt)
+    , "240\n", .{ .inspect = Inspect.run });
+}
+
+test "doc 56 Phase 3: an exit materialized past a sunk store applies that store first" {
+    // `t[1] = t[1] + i` is a read-modify-write, so the root sinks its
+    // `astore` below every guard. The `i % 3 == 0` exit sits AFTER that
+    // store's bytecode: materializing it must apply the store before the
+    // resume at the then-branch, which reads `t[1]` (and the next iteration
+    // adds to it). Missing it shows in both printed values. The array holds
+    // floats so its lane never widens: a widened lane would evict the root
+    // before the inspection sees it.
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode != .record_execute and mode != .record_execute_noopt) return;
+            // The exercised shape: an attached exit with a store it applies.
+            var applied: usize = 0;
+            for (vm.trace.registry.cache.items) |t| {
+                for (0..t.code.instrs.len) |e| {
+                    if (t.exitSideAt(e) != .attached) continue;
+                    for (e + 1..t.code.instrs.len) |s| applied += @intFromBool(exit_attach.appliesAtExit(&t.code, e, s));
+                }
+            }
+            try testing.expect(applied > 0);
+        }
+    };
+    try expectProgramTuned(
+        \\local t = {0.5}
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  t[1] = t[1] + i
+        \\  if i % 3 == 0 then s = s + t[1] else s = s - 1 end
+        \\end
+        \\print(s, t[1])
+    , "1530000\t45150.5\n", .{ .inspect = Inspect.run });
+}
+
+test "doc 56 Phase 3: an exit-side continuation reads an open upvalue without aliased_input" {
+    // The exit-side recording starts at the exit's resume pc inside `work`,
+    // whose `floor` upvalue is still OPEN on the caller's frame. The
+    // recorder's aliasing check needs the anchor frame's absolute base (the
+    // `trace_link_peel_test` regression: with a zero base every open
+    // upvalue looks aliased and the recording aborts). NB: this pins the
+    // end-to-end path, not the exit site's own `pending_anchor_base`
+    // assignment — that one is defensive, since the back-edge that entered
+    // the parent already stashed the same frame's base (mutation-checked:
+    // dropping it changes nothing observable today).
+    const source =
+        \\local floor = math.floor
+        \\local function work(n)
+        \\  local count = 0
+        \\  for i = 1, n do
+        \\    if i % 3 == 0 then count = count + floor(i * 0.5) else count = count - 1 end
+        \\  end
+        \\  return count
+        \\end
+        \\print(work(600))
+    ;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.record_aborts = true;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try util.runExecForTrace(&vm, gpa, source, &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("29700\n", sink.buffered());
+    for (vm.trace.abort_log.items) |rec| try testing.expect(rec.reason != .aliased_input);
+    try testing.expect(vm.trace.exit_side_binds >= 1);
+}
+
+test "doc 56 Phase 3: bit-reverse's post-while continuation also serves the root's wrong-trip exits" {
+    // Doc 56 §7: the `for` root unrolls the `while` for the trips it saw,
+    // so its wrong-trip-count exits resume at the post-`while` pc — where
+    // the `while` root's loop-done continuation already lives. Such an exit
+    // binds by CHAINING into that continuation: one trace at `P` serves
+    // both arrivals, and no recording is spent. Tier-1a only (Phase 3).
+    // The ten-leg output parity is the Phase 0 test's.
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            std.debug.assert(mode == .record_execute);
+            try testing.expect(vm.trace.exit_side_chain_binds >= 1);
+            var post_while: usize = 0;
+            for (vm.trace.registry.cache.items) |t| {
+                const proto = t.code.anchor.proto;
+                for (0..t.code.instrs.len) |e| {
+                    if (t.exitSideAt(e) != .attached) continue;
+                    const p = t.code.exitResumePc(e) orelse continue;
+                    if (p >= 1 and proto.code[p - 1].op == .jmp and proto.code[p - 1].aux < 0)
+                        post_while += 1;
+                }
+            }
+            try testing.expect(post_while > 0);
+        }
+    };
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    try util.runCapturedTuned(testing.allocator, bitreverse_src, &sink, false, .record_execute, .{ .inspect = Inspect.run });
+    try testing.expectEqualStrings("0.5\t1024\n", sink.buffered());
+}

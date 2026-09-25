@@ -192,6 +192,43 @@ pub fn resumeClass(op: IrOp) ResumeClass {
     };
 }
 
+/// Doc 56 §4.4 (Phase 3): the runtime state of one exit, one byte per
+/// instruction in `TraceRecord.exit_side` (allocated only for traces with an
+/// attachable exit). A pure function of the receipt stream: `noteTakenExit`
+/// moves `none → wanted` at `hotexit` and `wanted → gave_up` at
+/// `hotexit + tryside`; a bound child moves `wanted → attached`.
+pub const ExitSide = enum(u8) {
+    /// Today's anchor-coherent exit.
+    none = 0,
+    /// Hot: every firing takes the resume-coherent path, and the dispatcher
+    /// records (or binds) a continuation at `P`.
+    wanted = 1,
+    /// A continuation at `P` serves this exit: every firing takes the
+    /// resume-coherent path and chains into it.
+    attached = 2,
+    /// `tryside` firings passed without a child: back to the default path
+    /// and today's routes, for good.
+    gave_up = 3,
+
+    /// Whether a firing takes the resume-coherent contract (§4.1).
+    pub fn materializes(self: ExitSide) bool {
+        return self == .wanted or self == .attached;
+    }
+};
+
+/// Whether instruction `e`, after the failing exit `gi`, is a sunk store of
+/// an EARLIER bytecode that the resume-coherent exit applies (§4.1 step 1):
+/// a flush-kind store whose ordinal is set and below the guard's. Stores of
+/// `B` itself (re-executed at `P`) and of later bytecodes are never applied.
+/// For an attachable exit rule 7 proved every such store is a flush kind
+/// with ready operands.
+pub fn appliesAtExit(code: *const TraceCode, gi: usize, e: usize) bool {
+    if (e <= gi or e >= code.instrs.len) return false;
+    const ins = code.instrs[e];
+    if (resumeClass(ins.op) != .flush_store) return false;
+    return ins.ord != 0 and ins.ord < code.instrs[gi].ord;
+}
+
 /// `P` for an exit whose provenance resolves (rules 3–5), or the verdict
 /// that stopped it.
 pub const Resolved = union(enum) {
@@ -253,7 +290,12 @@ pub fn resumeOf(code: *const TraceCode, idx: usize) Resolved {
     };
     const proto = code.anchor.proto;
     if (gp.inline_depth != 0 or gp.source_proto_id != proto.id) return .{ .refused = .inlined };
-    if (gp.role == .loop_done or code.isNumericForLoopDoneGuard(idx)) return .{ .refused = .loop_done };
+    // A while root's own condition guard is a loop-done too (doc 38 owns
+    // it through the `.while_done` chain); an unrolled INNER while's
+    // wrong-trip-count guard is not — its back-edge targets the inner
+    // header, so `whileLoopDonePostPc` rejects it and it stays attachable.
+    if (gp.role == .loop_done or code.isNumericForLoopDoneGuard(idx) or
+        code.whileLoopDonePostPc(idx) != null) return .{ .refused = .loop_done };
     const g = code.instrs[idx];
     const b = gp.source_pc;
     if (b >= proto.code.len) return .{ .refused = .resume_mismatch };

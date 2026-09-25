@@ -45,6 +45,7 @@
 const std = @import("std");
 const trace_ir = @import("trace_ir.zig");
 const trace_code = @import("trace_code.zig");
+const exit_attach = @import("trace_exit_attach.zig");
 const Trace = trace_code.TraceCode;
 const ir_eval = @import("ir_eval.zig");
 const value = @import("value.zig");
@@ -94,39 +95,17 @@ pub fn flushNumericForLoopDone(t: *const Trace, regs: RegWindow, values: []Value
     if (!t.loopDoneSnapshotSupported(exit_instr)) return false;
 
     var si: usize = @intCast(exit_instr + 1);
+    const direct: DirectRefs = .{ .values = values };
     while (si < t.instrs.len) : (si += 1) {
         const p = t.instrs[si];
         switch (p.op) {
-            .astore => {
-                const ar = t.instrs[p.a];
-                const tbl = table.Table.fromHeader(values[ar.a].asHeap());
-                tbl.array.setInLane(@intCast(values[ar.b].asInt()), values[p.b]);
-            },
-            .hstore => {
-                const hr = t.instrs[p.a];
-                const tbl = table.Table.fromHeader(values[hr.a].asHeap());
-                tbl.fieldPtr(values[hr.b]).?.* = values[p.b];
-            },
-            .gstore => {
-                // Defensive only today. A linked source-level 2D-grid nest
-                // (`m[i][j] = m[i][j] + k`) aborts recording at the fused
-                // `get_index2`/`set_index2` opcode before any continuation link is
-                // committed, so no linked loop-done flush can currently contain a
-                // `gstore`. Keep the commit path functional for the future recorder
-                // work that makes fused grid stores linkable.
-                const gcell = t.instrs[p.a];
-                const ga = t.instrs[gcell.a];
-                const tbl = table.Table.fromHeader(values[ga.a].asHeap());
-                const row: usize = @intCast(values[ga.b].asInt() - 1);
-                const col: usize = @intCast(values[gcell.b].asInt() - 1);
-                tbl.array.gridSet(row, col, values[p.b]);
-            },
-            // Doc 43 P5: flush the sunk closed-cell store — the uref token's
-            // value IS the `*Value` cell pointer (tagged int, seeded at entry).
-            .ustore => {
-                const cell: *Value = @ptrFromInt(@as(usize, @intCast(values[p.a].payload.bits)));
-                cell.* = values[p.b];
-            },
+            // `gstore` is defensive only today. A linked source-level 2D-grid
+            // nest (`m[i][j] = m[i][j] + k`) aborts recording at the fused
+            // `get_index2`/`set_index2` opcode before any continuation link is
+            // committed, so no linked loop-done flush can currently contain a
+            // `gstore`. Keep the commit path functional for the future recorder
+            // work that makes fused grid stores linkable.
+            .astore, .hstore, .gstore, .ustore => applySunkStore(t, p, direct),
             .phi, .loop, .link => break,
             // `loopDoneSnapshotSupported` (consulted above) whitelists exactly
             // the four store arms + the φ block, so any other op here means the
@@ -150,6 +129,91 @@ pub fn flushNumericForLoopDone(t: *const Trace, regs: RegWindow, values: []Value
         }
     }
     return true;
+}
+
+/// Operand resolver for `applySunkStore` when every operand was computed this
+/// iteration (the loop-done flush runs after the whole body).
+const DirectRefs = struct {
+    values: []const Value,
+    inline fn get(self: DirectRefs, r: trace_ir.Ref) Value {
+        return self.values[r];
+    }
+};
+
+/// Operand resolver at a failing guard `gi` (doc 56 §4.1): a ref computed
+/// before the guard reads `values`; a constant or a `uref` is rebuilt from
+/// its source (the constant pool; the seed slot the entry wrote, which
+/// nothing overwrites). Rule 7 (`trace_exit_attach.operandReady`) proved every
+/// operand of an applied store is one of these; address tokens are never read
+/// as values here, only through their own operands.
+const ExitRefs = struct {
+    t: *const Trace,
+    regs: RegWindow,
+    values: []const Value,
+    gi: usize,
+    fn get(self: ExitRefs, r: trace_ir.Ref) Value {
+        if (r < self.gi) return self.values[r];
+        const ins = self.t.instrs[r];
+        return switch (ins.op) {
+            .konst => self.t.consts[@intCast(ins.aux)],
+            .uref => self.regs.get(@intCast(ins.aux)),
+            else => unreachable, // `operandReady` refused it at commit
+        };
+    }
+};
+
+/// Apply one sunk store `p` (the closed store inventory shared by the
+/// loop-done flush and the exit-side materialization), reading every operand
+/// through `refs`. Address tokens (`aref`/`href`/`garow`/`gcell`) are
+/// resolved structurally: only their operands are read.
+fn applySunkStore(t: *const Trace, p: trace_ir.IrInstr, refs: anytype) void {
+    switch (p.op) {
+        .astore => {
+            const ar = t.instrs[p.a];
+            const tbl = table.Table.fromHeader(refs.get(ar.a).asHeap());
+            tbl.array.setInLane(@intCast(refs.get(ar.b).asInt()), refs.get(p.b));
+        },
+        .hstore => {
+            const hr = t.instrs[p.a];
+            const tbl = table.Table.fromHeader(refs.get(hr.a).asHeap());
+            tbl.fieldPtr(refs.get(hr.b)).?.* = refs.get(p.b);
+        },
+        .gstore => {
+            const gcell = t.instrs[p.a];
+            const ga = t.instrs[gcell.a];
+            const tbl = table.Table.fromHeader(refs.get(ga.a).asHeap());
+            const row: usize = @intCast(refs.get(ga.b).asInt() - 1);
+            const col: usize = @intCast(refs.get(gcell.b).asInt() - 1);
+            tbl.array.gridSet(row, col, refs.get(p.b));
+        },
+        // Doc 43 P5: the sunk closed-cell store — the uref token's value IS
+        // the `*Value` cell pointer (tagged int, seeded at entry).
+        .ustore => {
+            const cell: *Value = @ptrFromInt(@as(usize, @intCast(refs.get(p.a).payload.bits)));
+            cell.* = refs.get(p.b);
+        },
+        else => unreachable, // callers dispatch only the four store arms
+    }
+}
+
+/// Doc 56 §4.1, tier-1a: make the slab coherent at the resume pc `P` of the
+/// attachable exit `gi`, which just failed mid-iteration. Tier-1a writes
+/// `regs` only at `.loop`, so the registers still hold the iteration-start
+/// state (the carried slots need nothing). Apply, in instruction order, the
+/// sunk stores that EARLIER bytecodes deferred past the guard, then write the
+/// exit snapshot's slots (every captured ref precedes the guard — finalize's
+/// `refsDefinedAt` — so `values[ref]` is this iteration's value).
+fn materializeExitSide(t: *const Trace, regs: RegWindow, values: []const Value, gi: usize) void {
+    const refs: ExitRefs = .{ .t = t, .regs = regs, .values = values, .gi = gi };
+    for (gi + 1..t.instrs.len) |e| {
+        if (exit_attach.appliesAtExit(t, gi, e)) applySunkStore(t, t.instrs[e], refs);
+    }
+    const si = t.exitSnapIdx(gi).?; // attachable implies a snapshot
+    const s = t.exit_snapshots[si - 1];
+    for (t.exit_snapshot_slots[s.slots_begin..][0..s.slots_len]) |ss| {
+        std.debug.assert(@as(usize, ss.ref) < gi);
+        regs.set(ss.slot, values[ss.ref]);
+    }
 }
 
 /// Execute trace `t` from the current frame's register window `regs`, using the
@@ -180,6 +244,12 @@ pub const ExecCtx = struct {
     /// passes the anchor activation (0, 0) and the dispatcher asserts it.
     activation_base: u32 = 0,
     activation_depth: u32 = 0,
+    /// Doc 56 Phase 3: the entered trace's per-exit exit-side state
+    /// (`TraceRecord.exit_side`). An exit whose state `materializes()`
+    /// takes the resume-coherent contract and returns `.exit_side`; every
+    /// other exit (and every run with the default empty slice, e.g. a
+    /// `driveChain` hop) keeps today's anchor-coherent deopt.
+    exit_side: []const exit_attach.ExitSide = &.{},
 };
 
 /// `execute` with a VM context attached (doc 24): required for traces that
@@ -1335,6 +1405,17 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                 std.debug.assert(runtime_error == 0);
             },
         }
+    }
+    // Doc 56 Phase 3: a wanted or attached exit materializes at its resume pc
+    // `P` instead of deopting to the anchor. Only a failing side-exit guard
+    // can be in that state (the state machine sets it only on attachable
+    // exits, which are never precise, `.loop`/`.link`/`.terminal`, or an
+    // arithmetic exit), so the precise tail above never ran for it.
+    if (out.exit_instr < ctx.exit_side.len and ctx.exit_side[out.exit_instr].materializes()) {
+        std.debug.assert(out.exit_reason == .normal and runtime_error == 0);
+        std.debug.assert(t.exitAttachable(out.exit_instr));
+        materializeExitSide(t, regs, values, out.exit_instr);
+        out.exit_reason = .exit_side;
     }
     // `tnew` only exists in precise traces (finalize-asserted), so a shim
     // failure is always folded above — it can never leak out as `.normal`.

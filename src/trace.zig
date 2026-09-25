@@ -67,6 +67,7 @@ const trace_chain_mod = @import("trace_chain.zig");
 const trace_recorder_mod = @import("trace_recorder.zig");
 const trace_code = @import("trace_code.zig");
 const trace_record = @import("trace_record.zig");
+const exit_attach = @import("trace_exit_attach.zig");
 pub const trace_entry_registry = @import("trace_entry_registry.zig");
 
 pub const TraceCode = trace_code.TraceCode;
@@ -226,30 +227,7 @@ pub fn isLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
 /// Same doc-37 provenance rule as the numeric classifier: an inlined-callee
 /// guard's `guardSourcePc` is in the callee's proto — reject depth > 0.
 pub fn whileLoopDonePostPc(t: *const Trace, idx: usize) ?u32 {
-    if (idx >= t.code.instrs.len) return null;
-    const g = t.code.instrs[idx];
-    if (g.op != .guard_true) return null;
-    const src_pc = guardSourcePc(g) orelse return null;
-    const proto = t.code.anchor.proto;
-    if (src_pc >= proto.code.len) return null;
-    const br = proto.code[src_pc];
-    if (br.op != .jmp_if_false) return null;
-    // Post-loop pc = the branch's jump target (post-increment base, like
-    // `applyJump`): `(src_pc + 1) + aux`. Must be a forward, in-bounds exit.
-    const post_i: i64 = @as(i64, src_pc) + 1 + br.aux;
-    if (post_i <= @as(i64, src_pc) or post_i >= @as(i64, @intCast(proto.code.len))) return null;
-    const post: u32 = @intCast(post_i);
-    if (post == 0) return null;
-    // The instruction immediately before the post-loop pc must be this loop's
-    // backward `jmp`, returning exactly to the trace's anchor (the condition).
-    const back = proto.code[post - 1];
-    if (back.op != .jmp) return null;
-    if (@as(i64, post) + back.aux != @as(i64, t.code.anchor.pc)) return null;
-    if (t.code.provAt(@intCast(idx))) |prov| switch (prov) {
-        .guard => |gp| if (gp.inline_depth > 0) return null,
-        .link_terminal => return null,
-    };
-    return post;
+    return t.code.whileLoopDonePostPc(idx);
 }
 
 /// Doc 38: boolean twin of `whileLoopDonePostPc` for classification-only sites.
@@ -347,6 +325,13 @@ pub const SlotStore = trace_ir.SlotStore;
 pub const ChainResult = struct {
     completed: usize,
     resume_pc: ?u32 = null,
+    /// Doc 56 Phase 3: `driveChain`'s hop-0 `.link` continuation ran to its
+    /// `.link` terminal and the linked burst ran (the scalar seam only; a
+    /// native span drained through a ledger leaves it false). The tier-1a
+    /// exit-side arm reads it to bind a wanted exit to the child that served
+    /// it; a zero-progress candidate that merely redirected the resume leaves
+    /// it false.
+    linked: bool = false,
 };
 
 /// The execution tier a chain drive uses for the candidate traces it enters.
@@ -383,6 +368,12 @@ pub const ExitMaterialization = union(enum) {
     /// The chain walks at the post-loop pc (`whileLoopDonePostPc`), which is
     /// the condition branch's jump target — NOT `guardExitPc`.
     while_done,
+    /// Doc 56 Phase 3: a tier-1a exit-side exit. The executor already made
+    /// the slab coherent at the exit's resume pc `P` (the payload), so the
+    /// chain walks `.link` continuations at `P` and a zero-progress
+    /// candidate resumes tier-0 at `P`, never at the anchor. Tier-1a only
+    /// until Phase 4.
+    exit_side: u32,
 };
 
 /// Doc 20 (patched trace entry): one registry slot binding a `.jfor_loop` or
@@ -710,6 +701,17 @@ pub const TraceConfig = struct {
     /// (`SNAPCOUNT_DONE`) so the exit is never counted again. See
     /// `noteTakenExit`.
     hotexit: u8 = 10,
+    /// Doc 56 (LuaJIT `JIT_P_tryside` = 4): once an attachable exit is wanted
+    /// (at `hotexit`), how many further firings it gets to record or bind an
+    /// exit-side child before it gives up and returns to today's routes.
+    tryside: u8 = 4,
+    /// Doc 56 (LuaJIT `JIT_P_maxside` = 100): the most exit-side children one
+    /// parent trace may bind; past it no exit of that trace becomes wanted.
+    maxside: u32 = 100,
+    /// Doc 56 Phase 3: exit-side routing on the tier-1a executor. Native
+    /// runs keep today's routes until Phase 4 regardless. A test/ablation
+    /// knob; on by default (Bart, 2026-09-25).
+    exit_side: bool = true,
     /// Maximum distinct traces cached per anchor before `countGuardFailure` /
     /// `countFingerprintMiss` stop counting (i.e. before side-trace recording at
     /// that anchor is refused). Four remains the economic bound until native exit
@@ -1234,6 +1236,24 @@ pub const TraceState = struct {
     /// entry replay is observationally equivalent) — the executor tests
     /// assert on this witness. No tiering path reads it.
     precise_resumes: u64 = 0,
+    /// Doc 56 Phase 3 diagnostics (`--jit-stats` "exit side:" line). No
+    /// tiering path reads them.
+    /// Exits that became wanted (`noteTakenExit`'s tier-1a route).
+    exit_side_wants: u64 = 0,
+    /// Wanted exits that gave up after `tryside` firings without a child.
+    exit_side_giveups: u64 = 0,
+    /// `.exit_side` exits consumed by the dispatcher (materialized at `P`).
+    exit_side_hops: u64 = 0,
+    /// Of those, the ones that chained into a continuation at `P`.
+    exit_side_chains: u64 = 0,
+    /// Wanted exits bound to a child (by chaining or by a commit).
+    exit_side_binds: u64 = 0,
+    /// Of those, the ones bound by CHAINING into a continuation that already
+    /// lived at `P` (e.g. a loop-done continuation serving an exit arrival
+    /// too) — no recording spent.
+    exit_side_chain_binds: u64 = 0,
+    /// Recordings armed at `P` for a wanted exit.
+    exit_side_records: u64 = 0,
     /// Doc 45 D5 diagnostic: tier-1a `.precise_error` exits consumed — a
     /// PRECISE trace's effect shim (`tnew`) raised a runtime error, the
     /// executor restored the failing op's snapshot, and the dispatcher
@@ -1557,19 +1577,30 @@ pub const TraceState = struct {
     /// `pending_replay_anchor`; transferred to `Recorder.side_src` by
     /// `maybeStartReplaySide`, cleared with `pending_replay_anchor`.
     pending_replay_src: ?ExitKey = null,
-    /// **Nested-loop trace linking (Phase 1).** When non-null, a *continuation*
-    /// recording is pending at this (non-header) anchor — the bytecode PC tier-0
-    /// resumes at after an inner numeric-`for` loop runs to completion (the inner
-    /// loop-done `guard_true`'s recorded `exit_pc`). Unlike a root or side trace,
-    /// this is **not** a back-edge target, so it cannot arm in `onBackEdge`;
-    /// `maybeArmContinuation` sets it on a hot inner loop-done exit and
-    /// `maybeStartContinuation` consumes it in the dispatch prologue the moment
-    /// `cur_pc` reaches the anchor — *after* tier-0 has deopt-replayed the final
-    /// inner iteration, so the continuation records the **outer** body forward, not
-    /// a stray inner iteration. Recording the inner `for_prep` it then re-reaches
-    /// still aborts (LINNER) until Phase 2 turns it into a `.link`. See
-    /// `docs/design/15-nested-loop-linking.md`.
+    /// **Continuation recording request.** When non-null, a *continuation*
+    /// recording is pending at this (non-header) anchor, a bytecode pc where
+    /// tier-0 holds a coherent slab. `maybeStartContinuation` consumes it in
+    /// the dispatch prologue the moment `cur_pc` reaches the anchor. It is not
+    /// a back-edge target, so it cannot arm in `onBackEdge`. Two producers
+    /// (doc 56 R5-F3):
+    ///   * **loop-done** (doc 15, doc 38): `maybeArmContinuation` on a hot
+    ///     inner loop-done exit, at the post-loop pc. Tier-0 replays the final
+    ///     inner iteration from the inner anchor first, so the continuation
+    ///     records the **outer** body forward, not a stray inner iteration.
+    ///   * **exit-side** (doc 56 Phase 3): `maybeArmExitSide` on a wanted
+    ///     attachable exit, at its resume pc `P`. The executor already
+    ///     materialized there and tier-0 resumes AT `P`, so `P`'s instruction
+    ///     is the first one recorded. `pending_exit_src` names the exit.
+    /// Both set `pending_anchor_base` to the resuming frame's slab base. The
+    /// recording closes with a `.link`: into an inner loop's root
+    /// (`LinkKind.inner_root`), or at the back-edge of the loop containing
+    /// its anchor (`LinkKind.enclosing_iteration`).
     pending_exit_anchor: ?AnchorKey = null,
+    /// Doc 56 Phase 3: the wanted exit `(parent, exit)` an exit-side
+    /// `pending_exit_anchor` was armed for; null for a loop-done request.
+    /// Transferred to `Recorder.side_src` by `maybeStartContinuation` (so
+    /// the commit can bind the exit) and cleared with `pending_exit_anchor`.
+    pending_exit_src: ?ExitKey = null,
     /// **Coherent-state chaining (doc 16, Phase 2).** When non-null, a
     /// branch-guard at this outer-header anchor has gone hot: the next such exit
     /// should arm an *immediate* replay of the current (prime) iteration — recording
@@ -1588,7 +1619,8 @@ pub const TraceState = struct {
     prime_want_src: ?ExitKey = null,
     /// **Coherent-state chaining (doc 16, Phase 2).** When non-null, an outer-header
     /// prime side-trace recording is pending at this anchor. Unlike
-    /// `pending_exit_anchor` (a *post-inner* continuation pc), this anchor is the
+    /// `pending_exit_anchor` (a raw `.continuation` pc: a post-inner-loop pc, or
+    /// a doc 56 exit-side resume pc), this anchor is the
     /// failed trace's OWN coherent anchor — the registers are already coherent there
     /// on the productive exit, so tier-0 re-enters at the anchor and
     /// `maybeStartReplaySide` starts the `.side` recording the instant `cur_pc`
@@ -2847,6 +2879,10 @@ pub const TraceState = struct {
     pub const maybeStartReplaySide = trace_link_mod.maybeStartReplaySide;
     pub const clearPendingExitAnchor = trace_link_mod.clearPendingExitAnchor;
     pub const noteTakenExit = trace_link_mod.noteTakenExit;
+    pub const ExitRoute = trace_link_mod.ExitRoute;
+    pub const bindExitSide = trace_link_mod.bindExitSide;
+    pub const maybeArmExitSide = trace_link_mod.maybeArmExitSide;
+    pub const noteExitSideCommit = trace_link_mod.noteExitSideCommit;
     pub const noteHeadSiblingCompletion = trace_link_mod.noteHeadSiblingCompletion;
     pub const countGuardFailure = trace_link_mod.countGuardFailure;
     pub const countFingerprintMiss = trace_link_mod.countFingerprintMiss;
@@ -3335,11 +3371,20 @@ pub const TraceState = struct {
     pub fn recordInstr(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, resolved: Value) void {
         self.configureRecording();
         const target_i: i64 = @as(i64, pc) + instr.aux;
-        const target: ?u32 = if (instr.op == .for_prep) pc else if (instr.op == .jmp and target_i >= 0 and target_i < proto.code.len) @intCast(target_i) else null;
+        // Doc 56 Phase 3: a `for_loop` back-edge target is resolved too, so a
+        // `.continuation` recording can close `.link` into the root there
+        // (`recForLoop`, the `rec_loop_jit` / `LJ_TRLINK_ROOT` analogue).
+        const target: ?u32 = if (instr.op == .for_prep)
+            pc
+        else if ((instr.op == .jmp or instr.op == .for_loop) and target_i >= 0 and target_i < proto.code.len)
+            @intCast(target_i)
+        else
+            null;
         self.rec.context = .{ .heap = self.rec_heap, .upval_open = self.rec_upval_open, .globals_header = self.rec_globals_header, .upval_cell = self.rec_upval_cell };
         if (target) |dest| {
             const inner = self.findLoopTrace(proto, dest);
             self.rec.context.inner_root = inner != null;
+            self.rec.context.inner_root_peeled = if (inner) |t| t.code.peeled else false;
             self.rec.context.inner_root_guards = if (inner) |t| t.code.entry_guards else &.{};
             const leaves = self.lleave_count.get(.{ .proto = proto, .pc = dest }) orelse 0;
             const fails = self.unroll_fail.get(self.rec.anchor) orelse 0;
@@ -3733,6 +3778,10 @@ pub const TraceState = struct {
                 self.dbg("provenance-edge: t={d} ei={d} -> t={d}", .{ parent.id, src.exit_instr, child.id });
             }
         }
+        // Doc 56 Phase 3: an exit-side child binds (or retires) its wanted
+        // exit. Always cross-anchor (the child sits at the exit's resume pc,
+        // never a loop header), so `may_latch_done` holds.
+        self.noteExitSideCommit(parent, src.exit_instr, child);
         if (may_latch_done and src.exit_instr < parent.exit_counts.len)
             parent.exit_counts[src.exit_instr] = Trace.EXIT_COUNT_DONE;
     }
@@ -3798,6 +3847,15 @@ pub const TraceState = struct {
             t.exit_counts = counts;
         } else |_| {}
         errdefer if (t.exit_counts.len != 0) self.gpa.free(t.exit_counts);
+        // Doc 56 Phase 3: the per-exit exit-side state, only for traces that
+        // can use it. Fail-soft like `exit_counts`.
+        if (t.code.anyExitAttachable()) {
+            if (self.gpa.alloc(exit_attach.ExitSide, t.code.instrs.len)) |sides| {
+                @memset(sides, .none);
+                t.exit_side = sides;
+            } else |_| {}
+        }
+        errdefer if (t.exit_side.len != 0) self.gpa.free(t.exit_side);
         try self.registry.publish(t);
         if (comptime jitdbg.enabled) if (self.config.debug_log) {
             // Lane pins (guard_lane aux per table guard) identify which array
@@ -3821,6 +3879,11 @@ pub const TraceState = struct {
                 const s = t.code.exit_snapshots[si - 1];
                 self.dbg("exit-snap:   ord={d} snap={d} resume_pc={d} slots={any}", .{ ord, si, s.resume_pc, t.code.exit_snapshot_slots[s.slots_begin..][0..s.slots_len] });
             }
+            // The committed IR, as `--dump-traces` prints it — at commit
+            // time, so a run that never finishes still shows its traces.
+            const ew = io.stderrWriter();
+            writeTrace(ew, t) catch {};
+            ew.flush() catch {};
         };
         self.finishSideTraceProvenance(t, candidate.side_src);
         // Coverage (gated): a trace now exists at this anchor, so subsequent
@@ -4097,7 +4160,6 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
         // that has a snapshot, and — over the attachable ones only — how
         // many restored slots the native body still holds (the Phase 4
         // liveness extension's work list).
-        const exit_attach = @import("trace_exit_attach.zig");
         var by_verdict = std.enums.EnumArray(exit_attach.Verdict, usize).initFill(0);
         var att_held: usize = 0;
         var att_lost: usize = 0;
@@ -4126,6 +4188,8 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
             any_refused = true;
         }
         try w.writeAll(if (any_refused) "\n" else " none\n");
+        // Doc 56 Phase 3: the tier-1a exit-side path.
+        try w.print("    exit side:            wants={d} records={d} binds={d} (by chain {d}) giveups={d} hops={d} chained={d}\n", .{ ts.exit_side_wants, ts.exit_side_records, ts.exit_side_binds, ts.exit_side_chain_binds, ts.exit_side_giveups, ts.exit_side_hops, ts.exit_side_chains });
     }
 
     try w.writeAll("  coverage by loop iterations (count — flatters the JIT):\n");

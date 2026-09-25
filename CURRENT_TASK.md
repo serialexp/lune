@@ -279,8 +279,78 @@ the ones that bite):
     `docs/reviews/doc56/antigravity-phase2.md`.
   - Gates: `just test` 0; jit-debug 0 with the known stray line
     (occurrence 11 in TODO.md).
-- **Next: Phase 3** (tier-1a materialize and exit-side recording), per
-  doc 56's checklist.
+- **Phase 3 DONE (2026-09-25).** Bart's calls: the
+  `for_loop` link close applies to ALL `.continuation` recordings
+  (slice 1); exit-side routing is on by default, tier-1a only
+  (`Config.exit_side`); liveness goes in Phase 4.
+  - Built:
+    - `ExitSide` per-exit state (none/wanted/attached/gave_up) with
+      `tryside` 4 and `maxside` 100;
+    - the irinterp materializer (`materializeExitSide`, `ExitRefs`,
+      `applySunkStore`) and `ExitReason.exit_side`;
+    - the dispatcher arm `consumeExitSide` (chain → bind, else arm a
+      `.continuation` recording at P via `pending_exit_anchor`/`_src`);
+    - `noteExitSideCommit` binds on commit;
+    - stats line `exit side:`; probes `exit-side:` and `exit-side hop:`.
+      A refusal probe (`... refused: <why>`) was added this session.
+  - **Bug found and fixed:** a tier-1a burst call B resumed at the
+    hop-top `inner_pc` (the RAMP's link target), not at the link target
+    of the trace that actually ran. Slice 1 made a continuation link to
+    its ENCLOSING root while the ramp linked to the inner, which gave
+    tier-0 a stale `k` → an infinite `while` in bitreverse (and 50
+    instead of 64 in the bit-reversal test). Fix: `trace_chain.zig`
+    call B reads `current_link`'s own `.link.aux`, like the native
+    `replayLedger` already did.
+  - Three test failures came up mid-phase. Here is why each happened:
+    1. *branchy low-yield stays UNGATED*: `entries > 80` now sees 42.
+       Exits chain into the exit-side child, so there are fewer
+       dispatcher entries (32 hops, 31 chained). No gate, no penalty,
+       and the output is right.
+    2. *thrashing anchor recovers*: pc 5 never gates any more. But the
+       NEW continuation at pc 16 (`link -> 5`) gets gated
+       (`legacy_thrash`). Cause: the burst treats the enclosing root
+       (trace 0 at pc 5) as an "inner". When it exits at 0 iterations,
+       the zero-progress tail in `driveBurstCore` strikes the SEED
+       continuation, even though that continuation just finished a whole
+       iteration. This comes from slice 1's shape (a continuation that
+       links to its own enclosing root). The same thing gates pc 38 in
+       the glue test, and it happens even before any exit-side activity.
+    3. *doc 40 glue peel* (fails on the tier-1a legs): exit-side children
+       now serve the exits the old glue `.side` recording grew from. The
+       one exit left (int `k`, skipping the while → pc 38) gives up
+       because pc 38 is barred by the same accounting as #2.
+  - Also noticed: a while ROOT's own condition guard (a real while-done)
+    counts as attachable (`classify` only refuses `.loop_done` role and
+    numeric-for). So exit-side takes over doc 38's while-done route. It
+    works (it chains into the same continuation and binds), but it may
+    not be what doc 56 meant by "loop-done refused".
+  - **Bart's rulings and what was done:**
+    - #2, "count it as a turn": `.link` now carries a `LinkKind`
+      (`inner_root` / `enclosing_iteration`). A run that links back to
+      its enclosing root credits one iteration in `runLinkedBurst`
+      (seed), tier-1a call B and `replayLedger`. The seed credit is
+      mutation-checked. The other two can't be seen today (see TODO.md).
+    - #1, "pin new behaviour": the branchy test expects exit-side to
+      take the exit, with no gate.
+    - #3, "native legs only": NOT applied. After the #2 fix the glue
+      test passes on all legs, so Bart should decide whether he still
+      wants it narrowed.
+    - While-done, "refuse": `resumeOf` refuses a while root's own done
+      guard. doc 38 keeps that route.
+  - Tests added: link-kind oracle, sunk store at the exit, open upvalue,
+    one bit-reverse continuation serving both arrival kinds. The
+    thrashing test runs with exit-side on and off.
+  - Gates: `just test` 0; jit-debug 0 (known stray line). Board: no
+    change (A/B against HEAD, all noise). Tier-1a leg: fft
+    `fft_bitreverse:9` goes from 0% to 52.5% traced; fft `--trace` is
+    1.79s → 2.02s, because tier-1a is slower than tier-0 on that body.
+  - Antigravity review: nothing serious.
+  - Gotcha: while I was measuring, `zig-out/bin/mahina` got replaced by
+    a non-release build (it had `debug.assert` symbols) and gave a fake
+    9× slowdown. Check `nm zig-out/bin/mahina | grep -c 'debug.assert$'`
+    is 0 before trusting any timing.
+- **Next: Phase 4** (native exit adapters plus the liveness extension),
+  per doc 56's checklist.
 
 ## Status 2026-09-24 (latest+27) — doc 55 §2 + §2d LANDED: fft 14.6× → 12.6× LJ, sparse −31%; silent switch is now data (no runtime code patching)
 

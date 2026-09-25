@@ -865,12 +865,22 @@ test "executor: a branchy low-yield loop stays UNGATED under clear-on-productive
     var chunk = try runExecForTrace(&vm, gpa, source, &sink);
     defer chunk.deinit();
     try testing.expectEqualStrings("300\n", sink.buffered());
-    // Pin the new steady state: no gate, no residual penalty, and dispatch keeps
-    // re-entering the cached trace once per even iteration (~98 entries at
-    // n=200 after warmup) instead of being ratcheted out.
+    // Pin the new steady state: no gate, no residual penalty, and the anchor
+    // stays covered instead of being ratcheted out. Doc 56 Phase 3: the
+    // opposite parity's branch exit is exit-side (tier-1a): it becomes wanted
+    // once, its first hop records a `.continuation` at the resume pc (the one
+    // unchained hop), and every later hop chains straight into that child,
+    // which finishes the iteration and links back to the root. So the
+    // iterations are shared between dispatcher entries (55 at n=200) and
+    // chained hops (44); together they cover ~one per even iteration, as the
+    // entries alone did before exit-side.
     try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
     try testing.expectEqual(@as(usize, 0), vm.trace.penalty.count());
-    try testing.expect(vm.trace.entries > 80);
+    try testing.expectEqual(@as(u64, 1), vm.trace.exit_side_wants);
+    try testing.expectEqual(@as(u64, 1), vm.trace.exit_side_binds);
+    try testing.expectEqual(@as(u64, 0), vm.trace.exit_side_giveups);
+    try testing.expectEqual(vm.trace.exit_side_hops, vm.trace.exit_side_chains + 1);
+    try testing.expect(vm.trace.entries + vm.trace.exit_side_chains > 80);
 }
 
 test "executor: a thrashing anchor that later stabilizes recovers from the gate" {
@@ -885,6 +895,16 @@ test "executor: a thrashing anchor that later stabilizes recovers from the gate"
     // i%100=89) well past the last gate's cooldown, so recovery has completed and
     // the gate is empty. A permanent blacklist would have abandoned the anchor on
     // the first low-yield burst and left it gated forever.
+    //
+    // Doc 56 Phase 3: with exit-side routing (tier-1a) the false-phase exit gets
+    // an exit-side child instead — a `.continuation` at the else arm that links
+    // back to the root as an iteration — so the anchor never gates at all, and
+    // the scenario above only exists on the legacy route. Both legs run:
+    //  - `exit_side = false` pins the gate-recovery story above;
+    //  - `exit_side = true` pins that NOTHING gates, the child included. Its
+    //    bursts enter the root as an "inner" that fails at once in a false
+    //    phase; before the `LinkKind.enclosing_iteration` credit the burst's
+    //    zero-progress tail struck the child for that and gated it.
     const gpa = testing.allocator;
     const source =
         \\local s = 0
@@ -903,27 +923,35 @@ test "executor: a thrashing anchor that later stabilizes recovers from the gate"
     defer tree.deinit();
     try testing.expect(!diags.hasErrors());
 
-    var vm = try Vm.init(gpa);
-    defer vm.deinit();
-    vm.trace.config.enabled = true;
-    vm.trace.config.execute = true;
-    vm.trace.config.hotloop = 4;
-    vm.trace.config.max_penalty = 8; // gate after 8 low-yield entries
-    vm.trace.config.backoff_base = 16; // short cooldown so recovery fits in 400 iters
+    inline for (.{ false, true }) |exit_side| {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        vm.trace.config.enabled = true;
+        vm.trace.config.execute = true;
+        vm.trace.config.hotloop = 4;
+        vm.trace.config.max_penalty = 8; // gate after 8 low-yield entries
+        vm.trace.config.backoff_base = 16; // short cooldown so recovery fits in 400 iters
+        vm.trace.config.exit_side = exit_side;
 
-    var buf: [64]u8 = undefined;
-    var sink = io.Writer.fixed(&buf);
-    vm.out = &sink;
-    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
-    defer chunk.deinit();
-    _ = try vm.run(chunk.proto);
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        _ = try vm.run(chunk.proto);
 
-    // `else` (s+2) taken when i%100 ∈ {90..99}: i ∈ {90..99,190..199,290..299} = 30.
-    // `then` (s+1) the other 359. s = 359×1 + 30×2 = 419.
-    try testing.expectEqualStrings("419\n", sink.buffered());
-    // Recovered: the long stable tail committed a useful entry which removed the
-    // gate. If recovery were broken (permanent abandonment) the gate would persist.
-    try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
+        // `else` (s+2) taken when i%100 ∈ {90..99}: i ∈ {90..99,190..199,290..299} = 30.
+        // `then` (s+1) the other 359. s = 359×1 + 30×2 = 419.
+        try testing.expectEqualStrings("419\n", sink.buffered());
+        // Recovered: the long stable tail committed a useful entry which removed the
+        // gate. If recovery were broken (permanent abandonment) the gate would persist.
+        try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
+        if (exit_side) {
+            try testing.expectEqual(@as(u64, 1), vm.trace.exit_side_binds);
+        } else {
+            try testing.expectEqual(@as(u64, 0), vm.trace.exit_side_wants);
+        }
+    }
 }
 
 /// Post-run oracle for the A-vii-c matrix: the EXERCISED form the A-vii-c review

@@ -5117,6 +5117,12 @@ test "recorder (head, doc 44 D8): the sibling lifecycle — want, transfer, seco
     vm.trace.config.hotloop = 4;
     vm.trace.config.hotcall = 4;
     vm.trace.config.hotexit = 3; // few zero exits → want (default 10)
+    // Doc 56 Phase 3: this pins the head-sibling lifecycle, which needs the
+    // alternating `pick` calls to keep arriving from tier-0. With exit-side
+    // routing the outer `for` trace's branch exit grows a child at its
+    // resume pc that inlines the other path, so those calls stop reaching
+    // the head anchor at all. Keep the loop on today's routes here.
+    vm.trace.config.exit_side = false;
     var buf: [256]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;

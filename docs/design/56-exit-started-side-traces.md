@@ -1,6 +1,6 @@
 # 56 — Exit-started side traces (LuaJIT's side-trace mechanism) — Design
 
-Status: Phase 1 done (exit snapshots, exit location map, finalize tests); Phase 2 done (attachability and resume pc); Phase 3 next; design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
+Status: Phase 1 done (exit snapshots, exit location map, finalize tests); Phase 2 done (attachability and resume pc); Phase 3 done (tier-1a materialize and exit-side recording); Phase 4 next; design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
 Owner: Bart
 Last updated: 2026-09-25
 
@@ -62,6 +62,9 @@ consumes yet, so every program's output and trace set stays identical.
 
   Each probe lands in the phase that creates its event (none of these
   events exist yet). This bullet closes when the last one is in.
+  Phase 3 added the `exit-side:` probes (want, record, arm refusal,
+  attach, give-up) and `exit-side hop:` (materialize). Adapter build
+  is left (Phase 4).
 - [x] **Phase 1 — exit snapshots and exit locations (inert).** Done
   2026-09-25 (0889c7b, 1f9b066, and the finalize tests).
   - [x] Boundary ordinals and sparse snapshots per bytecode boundary
@@ -109,7 +112,7 @@ consumes yet, so every program's output and trace set stays identical.
     spectral-norm 150. Most refusals are `trace_shape` or `loop_done`.
   - Review: Antigravity APPROVE WITH CHANGES; both findings were taken
     (`docs/reviews/doc56/antigravity-phase2.md`).
-- [ ] **Phase 3 — tier-1a materialize and exit-side recording.**
+- [x] **Phase 3 — tier-1a materialize and exit-side recording.**
   - `irinterp` materializes at an attached or wanted guard.
   - The dispatcher resumes tier-0 at `P`, with recording when a side
     trace is wanted.
@@ -129,6 +132,99 @@ consumes yet, so every program's output and trace set stays identical.
     (`interp.zig:2692-2696`) now that there are two producers (R5-F3).
     - `exit_counts`, want bits and DONE latches are charged once per
       receipt on each tier's leg (round 3, unverified item).
+  - **Decisions taken at the start of Phase 3 (Bart, 2026-09-25):**
+    - *The `for` back-edge link close is new work.* §4.4 "Close" says
+      the child closes `.link` at the enclosing loop's back-edge. Only
+      the `while` half of that exists: `recWhileLink` links any
+      continuation whose backward `jmp` reaches a root. A `for_loop`
+      back-edge into a root just records on, so bit-reverse's child
+      would unroll the next outer iteration. Bart chose to add the
+      `for_loop` close for **every** `.continuation` recording,
+      loop-done ones included (LuaJIT's `LJ_TRLINK_ROOT` in
+      `rec_loop_jit`). It closes only into a non-peeled `.loop` root
+      whose entry guards match the live registers; otherwise it keeps
+      recording as today. Loop-done continuations can change shape, so
+      the board is measured.
+    - *Routing is pulled forward for tier-1a only, and on by default.*
+      §4.9's routing is Phase 7, but Phase 3 needs wanted exits. A hot
+      attachable exit taken on the **tier-1a** executor becomes
+      wanted; native runs keep today's routes until Phase 4. So the
+      `--trace` legs of the matrix exercise the path at once, and the
+      native board does not move.
+  - **Plan (as built, see the Phase 3 notes in CURRENT_TASK.md):**
+    - `TraceRecord.exit_side` holds a per-exit state byte (none /
+      wanted / attached / gave-up) and `side_children` counts a parent's
+      bound children for `maxside`.
+    - `noteTakenExit` gains the tier-1a route: at `hotexit` an
+      attachable exit becomes wanted and skips the old routes; at
+      `hotexit + tryside` without a child it gives up and returns to
+      the old routes.
+    - The executor takes the state through `ExecCtx.exit_side` and, at a
+      wanted or attached exit, applies the earlier bytecodes' sunk stores
+      and the snapshot slots, then returns `ExitReason.exit_side`.
+    - A new dispatcher arm resumes at `P`. It first chains into a
+      `.link` continuation at `P` (`ExitMaterialization.exit_side`),
+      which binds a wanted exit (DONE latch, attached). Otherwise it
+      arms `pending_exit_anchor` with the exit as `side_src` and
+      `pending_anchor_base = base`.
+    - v1 scope: only the dispatcher's direct tier-1a entry materializes;
+      `driveChain` hops keep the default path.
+  - **As built (2026-09-25):**
+    - Tier-1a burst "call B" resumed at the ramp's link target instead
+      of the link target of the trace that actually ran. Once a
+      continuation could link to its *enclosing* root, this gave tier-0
+      a stale pc (an endless `while` in bit-reverse). Call B now reads
+      `current_link`'s own `.link.aux`, as native `replayLedger` does.
+    - `.link` carries a `LinkKind` in `a`: `inner_root` (doc 15's
+      hand-off into an inner loop) or `enclosing_iteration` (the link
+      goes back to the root of the loop that contains the anchor, so
+      one run finished one iteration). The recorder sets it with
+      `linkKindAt` (`target <= anchor.pc <= back_edge_pc`), finalize
+      validates the tag, and `TraceCode.linkClosesIteration` reads it.
+      `runLinkedBurst` seeds `linked_completed` with it, and tier-1a
+      call B and `replayLedger`'s `.link_terminal` arm add one per
+      such run. Bart ruled it counts as a turn. Without it, the
+      zero-progress tail struck the seed continuation and gated it.
+      The seed credit is mutation-checked (the thrashing test). The
+      call-B and `replayLedger` credits are not observable today:
+      `linked_completed` is already ≥ 1 there, and the dispatcher does
+      not read `ChainResult.completed`.
+    - `resumeOf` refuses every loop-done exit (Bart: "refuse
+      while-done"): the `.loop_done` role, numeric-`for` done guards,
+      and a while root's own condition (`whileLoopDonePostPc`, now on
+      `TraceCode`). Those keep doc 38's route. An inner `while` unrolled
+      in an outer root is not the root's done guard and stays
+      attachable (the bit-reverse case).
+    - A wanted exit binds by chain (a `.link` continuation already
+      sits at `P`) or by commit. `--jit-stats` shows
+      `binds=N (by chain M)`.
+    - `maybeArmExitSide` logs why it refused to arm (recording active,
+      another recording pending, anchor barred, anchor full).
+    - Round-3 item verified (by reading the code): on tier-1a an
+      `exit_side` result returns early from the dispatcher, so each
+      firing reaches `noteTakenExit` once. The native leg is Phase 4.
+    - Tests (`interp_exit_side_test.zig`): the link-kind oracle, a
+      sunk store applied at the exit (mutation-checked), an open
+      upvalue read with no `aliased_input`, and one bit-reverse
+      post-`while` continuation serving both the loop-done exit and the
+      root's wrong-trip exits. The branchy low-yield test pins the new
+      behaviour (exit-side takes the exit, no gate). The thrashing test
+      runs with exit-side on and off. The doc 40 glue-peel test passes
+      on all legs, so it was not narrowed to native.
+    - Board: no change (A/B against HEAD via `just shadow`; everything
+      within noise). On the tier-1a leg (`--trace`), fft
+      `fft_bitreverse:9` goes from 0% to 52.5% traced (5 wants, 5
+      binds, 455k chained hops). fft there is 1.79s → 2.02s, because
+      tier-1a runs this body at ~2260 cycles per iteration against
+      tier-0's ~310. The native path (Phase 4) is where it pays.
+    - Review: Antigravity found nothing serious
+      (`docs/reviews/doc56/antigravity-phase3.md`).
+    - v1 limits: exits of children entered through a chain or burst do
+      not materialize, so such a child can still be struck and gated
+      (glue pc 24). `set_upval` is NYI in the recorder, which blocks
+      some exit-side recordings. An attached exit whose child is
+      retired never records again. Each hop scans the cache. All four
+      are in TODO.md.
 - [ ] **Phase 4 — native exit adapters.**
   - Per-exit adapters built from the Phase-1 exit location map when an
     exit first becomes hot: materialize, then jump through a data cell

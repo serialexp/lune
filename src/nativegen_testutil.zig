@@ -95,6 +95,9 @@ pub fn expectMatch(t: *const Trace, regs_init: []const Value) !void {
         // Doc 45 D6: native never runs a precise trace until its own
         // executor lands (`compileImpl` bails), so these cannot surface here.
         .precise_resume, .precise_error => return error.UnexpectedPreciseExit,
+        // Doc 56 Phase 3: exit-side materialization is tier-1a only until
+        // Phase 4 gives native its own contract.
+        .exit_side => return error.UnexpectedExitSide,
     }
     try expectRegsEqual(iregs, nregs);
 }

@@ -283,6 +283,11 @@ pub fn driveChain(
             if (local == 0 and !whileDoneCoherentAtZero(failed, exit_instr)) return null;
             break :blk whileLoopDonePostPc(failed, exit_instr) orelse return null;
         },
+        // Doc 56 Phase 3: the executor materialized at the exit's resume pc.
+        .exit_side => |p| blk: {
+            std.debug.assert(tier == .ir);
+            break :blk p;
+        },
         // Numeric-for loop-done materializations chain to a `.link` continuation
         // living at the guard's *exit* PC (a real post-loop bytecode pc). Resolve
         // it through the op-gated accessor so an array-guard lane ordinal is never
@@ -355,8 +360,10 @@ pub fn driveChain(
         const is_link = sct.code.instrs.len != 0 and sct.code.instrs[sct.code.instrs.len - 1].op == .link;
         // Loop-done chains (ir and native, numeric-for and while) only follow
         // `.link` continuations; an ordinary side trace at the post-loop PC is
-        // not a valid hand-off.
-        if ((loop_done_values != null or materialization == .while_done) and !is_link) continue;
+        // not a valid hand-off. Neither is one at an exit-side resume pc
+        // (doc 56): only a continuation carries the "coherent at its raw pc"
+        // entry contract.
+        if ((loop_done_values != null or materialization == .while_done or materialization == .exit_side) and !is_link) continue;
         if (tier == .native_only and !is_link) continue;
         // A candidate with synthetic inputs needs per-entry seeding. B-iii
         // (doc 22 §B.3): the TIER-1A walk seeds it right here via the episode
@@ -512,6 +519,10 @@ pub fn driveChain(
                 // a zero-progress continuation run must still resume tier-0 at
                 // the post-loop pc, never back at the loop header.
                 flushed_resume_pc = walk_pc;
+            } else if (materialization == .exit_side) {
+                // Doc 56: likewise, the executor already committed the
+                // interrupted iteration up to `P`.
+                flushed_resume_pc = walk_pc;
             }
             sresult = irinterp.executeCtx(.{ .heap = self.exec_heap }, &sct.code, regs, sbuf);
         }
@@ -568,7 +579,9 @@ pub fn driveChain(
             if (tier == .native_only and materialization == .native_numeric_for_done) {
                 self.armLoopDoneLink(failed, exit_instr, safe_to_arm);
             }
-            return self.runLinkedBurst(sct, sresult, sresult_fused, snt, tier, materialization, proto, regs, safe_to_arm);
+            var burst = self.runLinkedBurst(sct, sresult, sresult_fused, snt, tier, materialization, proto, regs, safe_to_arm);
+            burst.linked = true;
+            return burst;
         }
 
         // Not a completed link run.
@@ -1828,6 +1841,12 @@ pub fn replayLedgerFrom(
                 // One `native_link_exits` bump per `.link` marker — this replaces
                 // BOTH the old per-fused-span bump and the standalone-`.link` bump.
                 self.native_link_exits +|= 1;
+                // Doc 56 Phase 3: a `.link` that closes an iteration of the loop
+                // containing its owner finished that iteration — the native twin
+                // of tier-1a call B's credit. Every `.link` row is walked once,
+                // so this never doubles `runLinkedBurst`'s seed credit (that seed
+                // run is outside any ledger walk).
+                if (owner.code.linkClosesIteration()) linked_completed.* += 1;
                 const owner_inner_pc: u32 = @intCast(owner.code.instrs[owner.code.instrs.len - 1].aux);
                 if (is_last) {
                     // Standalone `.link` (slot un-armed) OR a forced yield: the
@@ -2445,7 +2464,12 @@ pub fn runLinkedBurst(
     if (materialization == .ordinary_header) self.prime_side_chain_follows +|= 1;
     const cursor = BurstCursor{
         .current_link = sct,
-        .linked_completed = 0,
+        // Doc 56 Phase 3: a seed whose `.link` closes an iteration of the loop
+        // containing it (`LinkKind.enclosing_iteration`) already finished one
+        // iteration by reaching that `.link` — the same credit the roll-up
+        // gives an inner loop-done. Without it an enclosing root that exits at
+        // zero iterations right after would strike the seed as zero-progress.
+        .linked_completed = @intFromBool(sct.code.linkClosesIteration()),
         // The design's `coherent_pc` cursor: where tier-0 resumes when the
         // burst yields. Starts at the inner-root PC named by the `.link`.
         .resume_pc = @intCast(sct.code.instrs[sct.code.instrs.len - 1].aux),
@@ -2956,10 +2980,19 @@ pub fn driveBurstCore(
                     0,
                     .deferred,
                 );
-                // Standalone `.link` at the continuation's terminal: `inner_pc` is
-                // this hop's entry-link target (stable across a prime-side→cont
-                // swap; the next hop recomputes it from `current_link`).
-                resume_pc = inner_pc;
+                // Standalone `.link` at the continuation's terminal: `regs` are
+                // now coherent at THIS trace's `.link` target, so resume there.
+                // NOT the hop-top `inner_pc`: after a prime-side→continuation
+                // driver swap that names the RAMP's link target, and the swapped
+                // continuation may link elsewhere (doc 56: a `.continuation`
+                // closing at an enclosing `for_loop` links to the OUTER root,
+                // while the ramp linked to the inner). Resuming at the ramp's
+                // target handed tier-0 a stale inner-loop state — an infinite
+                // `while` on bitreverse. The native twin (`replayLedger`'s
+                // `.link_terminal` arm) already reads the owner's own terminal.
+                resume_pc = @intCast(current_link.code.instrs[current_link.code.instrs.len - 1].aux);
+                // Doc 56 Phase 3: see `runLinkedBurst`'s seed credit.
+                if (current_link.code.linkClosesIteration()) linked_completed += 1;
                 continue;
             }
             if (cresult.completed > 0) {
@@ -3034,7 +3067,7 @@ pub fn noteDispatcherLedgerTerminal(
     const owner = self.traceById(term.id) orelse return;
     self.noteSiblingTerminal(owner, term.exit);
     if (term.exit < owner.code.instrs.len and !isLoopDoneGuardIndex(owner, term.exit))
-        self.noteTakenExit(owner, term.exit, term_local, proto);
+        self.noteTakenExit(owner, term.exit, term_local, proto, .legacy);
 }
 
 pub fn driveDispatcherLedger(

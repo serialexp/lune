@@ -11,6 +11,7 @@ const trace_ir = @import("trace_ir.zig");
 const value = @import("value.zig");
 
 const TraceCode = trace_code.TraceCode;
+const ExitSide = @import("trace_exit_attach.zig").ExitSide;
 
 /// Doc 20 (patched trace entry) §R4-2: per-trace entry-patch lifecycle.
 /// Suppression is split by reason because the arms have different wake behaviour
@@ -113,6 +114,17 @@ pub const TraceRecord = struct {
     /// byte RMW — no hashing (the Part S lesson below: a per-receipt hashmap
     /// probe was a measured 15% regression).
     exit_counts: []u8 = &.{},
+    /// Doc 56 §4.4 (Phase 3): the exit-side state of each instruction
+    /// (`ExitSide`, one byte each), indexed like `exit_counts`. Allocated at
+    /// commit only when the trace has an attachable exit; FAIL-SOFT (an OOM
+    /// or a trace without attachable exits leaves it empty, and every exit
+    /// keeps today's anchor-coherent path). A pure function of the receipt
+    /// stream. Owned; freed in `destroy`; never serialized.
+    exit_side: []ExitSide = &.{},
+    /// Doc 56 (`maxside`, LuaJIT's `J->param[JIT_P_maxside]`): how many
+    /// exit-side children this trace has bound. Once it reaches `maxside`
+    /// no further exit of this trace becomes wanted.
+    side_children: u32 = 0,
 
     /// Part S — the sibling-handoff watch, deliberately a THREE-SCALAR, one-slot,
     /// allocation-free counter rather than a `(trace, exit) -> u32` side map.
@@ -187,7 +199,14 @@ pub const TraceRecord = struct {
         self.native.deinit();
         self.code.deinit(gpa);
         if (self.exit_counts.len != 0) gpa.free(self.exit_counts); // hotexit counters
+        if (self.exit_side.len != 0) gpa.free(self.exit_side);
         gpa.destroy(self);
+    }
+
+    /// Doc 56: the exit-side state of exit `exit_instr` (`.none` when the
+    /// trace carries no state array).
+    pub inline fn exitSideAt(self: *const TraceRecord, exit_instr: usize) ExitSide {
+        return if (exit_instr < self.exit_side.len) self.exit_side[exit_instr] else .none;
     }
 };
 

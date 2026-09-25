@@ -388,9 +388,17 @@ test "doc 56 attach: the resume pc must not be a loop header and must reach a ba
 
     f = .{};
     f.init();
-    // It leads to the `ret`: a continuation from there never closes.
-    f.guest[2].aux = 5;
+    // It leads to a `ret`: a continuation from there never closes.
+    f.guest[6] = Instr.opAB(.ret, 0, 1);
     try testing.expectEqual(Verdict.no_back_edge, try verdict(&f, E_BRANCH));
+
+    f = .{};
+    f.init();
+    // It jumps just past the back-edge `jmp → 1`: the branch is now the
+    // anchor loop's own while condition, a loop-done the doc 38
+    // `.while_done` chain owns — refused before the back-edge rule runs.
+    f.guest[2].aux = 5;
+    try testing.expectEqual(Verdict.loop_done, try verdict(&f, E_BRANCH));
 
     f = .{};
     f.init();

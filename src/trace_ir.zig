@@ -422,7 +422,8 @@ pub const IrOp = enum(u8) {
     /// entry state (`R[a] = init`, `R[a+3] = init`) as the final hand-off snapshot,
     /// then this terminator hands control to the inner root anchored at `aux` (a
     /// bytecode pc in the *same* proto — replay-safe, never a pointer). Carries no
-    /// operand refs (`a`/`b` unused). Structurally a terminal exactly like `.loop`:
+    /// operand refs: `a` is a `LinkKind` tag (doc 56 Phase 3), `b` is unused.
+    /// Structurally a terminal exactly like `.loop`:
     /// exactly one, last in the trace, with the φ block immediately preceding it as
     /// the register hand-off snapshot.
     ///
@@ -726,6 +727,22 @@ pub const IrOp = enum(u8) {
     tset,
 };
 
+/// Doc 56 Phase 3: what a `.link` terminal's hand-off means (rides
+/// `link.a`). Recorded, never derived at run time, so every mode reads the
+/// same tag.
+pub const LinkKind = enum(u16) {
+    /// The doc 15 shape: a continuation hands off to an INNER loop's root.
+    /// Its run is the prefix of an enclosing iteration; the iteration only
+    /// completes when that inner loop reaches its loop-done.
+    inner_root = 0,
+    /// The trace links back to the root of a loop that CONTAINS its own
+    /// anchor (the continuation recorded to that loop's back-edge). One run
+    /// to the `.link` finishes one whole iteration of that loop, so the
+    /// burst counts it as a completed iteration, exactly as it counts an
+    /// inner loop-done.
+    enclosing_iteration = 1,
+};
+
 /// Doc 44: what a `.terminal` hands back to tier-0 (rides `terminal.a`).
 /// The `_interp` suffix is deliberate — P0's staged model has tier-0 execute
 /// the terminating instruction; Phase 4's native frame push will add
@@ -912,7 +929,10 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .guard_builtin => try w.print("%{d}  [{s}]", .{ ins.a, @tagName(@as(function.RecordedBuiltin, @enumFromInt(ins.aux))) }),
         .loop, .preheader => {},
         // `.link` (doc 15): terminal hand-off; `aux` is the inner root's anchor pc.
-        .link => try w.print("-> {d}", .{ins.aux}),
+        .link => switch (@as(LinkKind, @enumFromInt(ins.a))) {
+            .inner_root => try w.print("-> {d}", .{ins.aux}),
+            .enclosing_iteration => try w.print("-> {d} (iteration)", .{ins.aux}),
+        },
         // `.terminal` (doc 44): one-shot close; kind tag + resume pc.
         .terminal => try w.print("{s} @ {d}", .{ @tagName(@as(TerminalKind, @enumFromInt(ins.a))), ins.aux }),
         // φ: a slot-bound φ prints `update=%b → r{slot}` (init is implicit

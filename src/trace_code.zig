@@ -532,6 +532,24 @@ pub const TraceCode = struct {
         return (self.exit_attach[instr_idx >> 3] >> @intCast(instr_idx & 7)) & 1 != 0;
     }
 
+    /// Doc 56 Phase 3: whether the commit-time memo marks any exit
+    /// attachable. An unbuilt memo (OOM) answers false: the trace then gets
+    /// no exit-side state, which costs coverage, never correctness.
+    pub fn anyExitAttachable(self: *const TraceCode) bool {
+        if (!self.exit_attach_built) return false;
+        for (self.exit_attach) |b| if (b != 0) return true;
+        return false;
+    }
+
+    /// Doc 56 Phase 3: whether this trace ends in a `.link` that finishes
+    /// an iteration of a loop containing its anchor (`LinkKind`). The burst
+    /// counts each such run to the `.link` as one completed iteration.
+    pub fn linkClosesIteration(self: *const TraceCode) bool {
+        const n = self.instrs.len;
+        if (n == 0 or self.instrs[n - 1].op != .link) return false;
+        return @as(trace_ir.LinkKind, @enumFromInt(self.instrs[n - 1].a)) == .enclosing_iteration;
+    }
+
     /// Doc 56 §4.3: the resume pc `P` of an attachable exit (the branch
     /// fix-up applied), or null when the exit is not attachable.
     pub fn exitResumePc(self: *const TraceCode, instr_idx: usize) ?u32 {
@@ -576,6 +594,39 @@ pub const TraceCode = struct {
             .link_terminal => return false,
         };
         return true;
+    }
+
+    /// Doc 38: if guard `idx` is this trace's own while-loop condition (the
+    /// `guard_true` sourced at a `jmp_if_false` whose forward target is
+    /// preceded by the loop's backward `jmp` to the anchor), the post-loop pc
+    /// that condition's failure exits to. Fail-closed: null for anything
+    /// else. Lives on `TraceCode` so the doc 56 attach classifier shares it
+    /// (`trace.whileLoopDonePostPc` delegates here).
+    pub fn whileLoopDonePostPc(self: *const TraceCode, idx: usize) ?u32 {
+        if (idx >= self.instrs.len) return null;
+        const g = self.instrs[idx];
+        if (g.op != .guard_true) return null;
+        const src_pc = trace_ir.guardSourcePc(g) orelse return null;
+        const proto = self.anchor.proto;
+        if (src_pc >= proto.code.len) return null;
+        const br = proto.code[src_pc];
+        if (br.op != .jmp_if_false) return null;
+        // Post-loop pc = the branch's jump target (post-increment base, like
+        // `applyJump`): `(src_pc + 1) + aux`. Must be a forward, in-bounds exit.
+        const post_i: i64 = @as(i64, src_pc) + 1 + br.aux;
+        if (post_i <= @as(i64, src_pc) or post_i >= @as(i64, @intCast(proto.code.len))) return null;
+        const post: u32 = @intCast(post_i);
+        if (post == 0) return null;
+        // The instruction immediately before the post-loop pc must be this loop's
+        // backward `jmp`, returning exactly to the trace's anchor (the condition).
+        const back = proto.code[post - 1];
+        if (back.op != .jmp) return null;
+        if (@as(i64, post) + back.aux != @as(i64, self.anchor.pc)) return null;
+        if (self.provAt(@intCast(idx))) |prov| switch (prov) {
+            .guard => |gp| if (gp.inline_depth > 0) return null,
+            .link_terminal => return null,
+        };
+        return post;
     }
 
     pub fn classifyBridgeCandidate(self: *const TraceCode, instr_idx: usize) bool {

@@ -2690,8 +2690,9 @@ pub const Vm = struct {
         if (mode == .full and self.trace.isRecording())
             self.trace.maybeCloseAtAnchor(st.proto, @intCast(cur), st.regs);
         // (9) Nested-loop continuation (Phase 1): a continuation
-        // recording armed by a hot inner loop-done exit begins at its
-        // (non-header) anchor pc, which tier-0 reaches here — *before*
+        // recording armed by a hot inner loop-done exit, or (doc 56) by
+        // a wanted exit-side exit materialized at its resume pc, begins
+        // at its (non-header) anchor pc, which tier-0 reaches here — *before*
         // the mirror below, so the anchor instruction is recorded as
         // the trace's first op (exactly as a root trace's anchor is).
         // A cheap optional-null read when nothing is pending.
@@ -3113,7 +3114,7 @@ pub const Vm = struct {
                     ts.dbg("head zero-exit: trace={d} native={} reason={s} exit={d} completed={d}", .{ owner.id, true, @tagName(row.reason), row.exit, row.cum });
                     if (row.exit != std.math.maxInt(u32))
                         ts.head_walk_fail = .{ .trace_id = owner.id, .exit_instr = row.exit };
-                    ts.noteTakenExit(owner, row.exit, seg_local, proto);
+                    ts.noteTakenExit(owner, row.exit, seg_local, proto, .legacy);
                     ts.onSideExitReceipt(owner, seg_local, row.exit, seg_local, .deferred, .entered);
                     return .next_candidate;
                 },
@@ -3122,7 +3123,7 @@ pub const Vm = struct {
                     // scalar semantics (`exit == maxInt` bounds-refuses the
                     // hot-exit charge inside), `.entry_refusal` charge kind.
                     ts.dbg("head zero-exit: trace={d} native={} reason={s} exit={d} completed={d}", .{ owner.id, true, @tagName(row.reason), row.exit, row.cum });
-                    ts.noteTakenExit(owner, row.exit, seg_local, proto);
+                    ts.noteTakenExit(owner, row.exit, seg_local, proto, .legacy);
                     ts.onSideExitReceipt(owner, seg_local, row.exit, seg_local, .deferred, .entry_refusal);
                     return .next_candidate;
                 },
@@ -3568,7 +3569,7 @@ pub const Vm = struct {
         // nothing about the branch) records the walk-local handoff evidence.
         if (result.exit_instr != std.math.maxInt(u32))
             ts.head_walk_fail = .{ .trace_id = ct.id, .exit_instr = result.exit_instr };
-        ts.noteTakenExit(ct, result.exit_instr, local_done, proto);
+        ts.noteTakenExit(ct, result.exit_instr, local_done, proto, .legacy);
         ts.onSideExitReceipt(
             ct,
             local_done,
@@ -3578,6 +3579,59 @@ pub const Vm = struct {
             if (result.exit_reason == .prologue_fail) .entry_refusal else .entered,
         );
         return .next_candidate;
+    }
+
+    /// Doc 56 Phase 3: consume a direct tier-1a `.exit_side` exit of `ct`.
+    /// The executor already applied the earlier bytecodes' sunk stores and
+    /// the exit snapshot, so `regs` is coherent at the exit's resume pc `P`
+    /// and the run committed `result.completed` iterations plus the start of
+    /// the interrupted one, which the child or tier-0 finishes from `P`.
+    ///   1. Receipt: count the firing (a wanted exit may give up here) and
+    ///      charge it as productive — `completed + 1`, the interrupted
+    ///      iteration being committed forward, like a loop-done completion.
+    ///   2. Chain into a `.link` continuation at `P`. One that runs to its
+    ///      `.link` serves the exit: bind a wanted exit to it.
+    ///   3. Otherwise resume tier-0 at `P`; a still-wanted exit first asks
+    ///      for a continuation recording there (`maybeArmExitSide`), which
+    ///      needs `.full` mode for the dispatch prologue to start it.
+    /// `anchor_pc` is where a chain result without a resume pc resumes (the
+    /// dispatcher's own convention).
+    fn consumeExitSide(
+        self: *Vm,
+        comptime mode: ExecMode,
+        ct: *trace.Trace,
+        result: trace_exec.ExecResult,
+        proto: *const Proto,
+        regs: RegWindow,
+        base: usize,
+        anchor_pc: usize,
+        safe_to_arm: bool,
+    ) EntryDirective {
+        const ts = &self.trace;
+        const ei = result.exit_instr;
+        std.debug.assert(ct.exitSideAt(ei).materializes());
+        const p = ct.code.exitResumePc(ei).?;
+        ts.exit_side_hops +|= 1;
+        const done = result.completed + 1;
+        ts.dbg("exit-side hop: trace={d} exit={d} state={s} resume pc={d} completed={d}", .{ ct.id, ei, @tagName(ct.exitSideAt(ei)), p, result.completed });
+        ts.noteTakenExit(ct, ei, done, proto, .tier1a_direct);
+        ts.onSideExitReceipt(ct, done, ei, done, .deferred, .entered);
+        if (ts.driveChain(ct, result, proto, regs, .ir, .{ .exit_side = p }, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
+            if (chain.linked) {
+                ts.exit_side_chains +|= 1;
+                ts.bindExitSide(ct, ei, .chain);
+                return .{ .resume_tier0 = chain.resume_pc orelse anchor_pc };
+            }
+            // A continuation at `P` zero-exited: its receipt is charged and
+            // the resume is `P`. A wanted exit records a sibling below.
+            std.debug.assert(chain.resume_pc == p);
+        }
+        if (ct.exitSideAt(ei) == .wanted and ts.maybeArmExitSide(ct, ei, proto, p, base)) {
+            if (mode == .fast) return .{ .switch_mode_at = p };
+            return .{ .resume_tier0 = p };
+        }
+        if (mode == .full and self.runFastPath()) return .{ .switch_mode_at = p };
+        return .{ .resume_tier0 = p };
     }
 
     fn enterSelectedTrace(
@@ -3726,10 +3780,14 @@ pub const Vm = struct {
             // hit-count guess made at receipt time.
             self.trace.tryArmSiblingHandoff(ct, safe_to_arm);
             self.trace.tryArmFrameLinks(ct, safe_to_arm);
+            // Doc 56 Phase 3: every direct tier-1a run of `ct` (plain,
+            // exec-log, seed-hash-decline rerun) honours its exit-side
+            // state; a wanted/attached exit comes back `.exit_side`.
+            const ir_ctx: irinterp.ExecCtx = .{ .heap = self.heap, .exit_side = ct.exit_side };
             var result = if (self.trace.config.record_exec_log) blk: {
-                const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.executeCtx(.{ .heap = self.heap }, &ct.code, trace_regs, buf);
-                const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.executeCtx(.{ .heap = self.heap }, &ct.code, trace_regs, buf);
-                break :blk irinterp.executeTracedCtx(.{ .heap = self.heap }, rec, &ct.code, trace_regs, buf);
+                const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.executeCtx(ir_ctx, &ct.code, trace_regs, buf);
+                const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.executeCtx(ir_ctx, &ct.code, trace_regs, buf);
+                break :blk irinterp.executeTracedCtx(ir_ctx, rec, &ct.code, trace_regs, buf);
             } else blk: {
                 // Doc 22 §B.2: `native_page` was resolved above (before VM-side
                 // seeding); non-null implies native_codegen && !record_exec_log.
@@ -3753,7 +3811,7 @@ pub const Vm = struct {
                     else
                         nt.runCapturingLedger(trace_regs, &self.trace.ledger_scratch, self.trace.silentStaging());
                 }
-                break :blk irinterp.executeCtx(.{ .heap = self.heap }, &ct.code, trace_regs, buf);
+                break :blk irinterp.executeCtx(ir_ctx, &ct.code, trace_regs, buf);
             };
             // Doc 44 D11: a pushed descent — the native run changed the VM
             // frame stack, so it MUST branch before EVERY other consumer
@@ -3826,7 +3884,7 @@ pub const Vm = struct {
                 buf = self.trace.valuesPush(ct.code.instrs.len) catch
                     return .next_candidate; // OOM: same skip as the entry push
                 buf_live = true;
-                result = irinterp.executeCtx(.{ .heap = self.heap }, &ct.code, trace_regs, buf);
+                result = irinterp.executeCtx(ir_ctx, &ct.code, trace_regs, buf);
                 ran_native = false;
                 ran_native_link_mode = false;
             }
@@ -4080,6 +4138,16 @@ pub const Vm = struct {
                 }
                 return .{ .resume_tier0 = @intCast(snap.resume_pc) };
             }
+            // Doc 56 Phase 3: a tier-1a exit-side exit. The executor made the
+            // slab coherent at the exit's resume pc, so none of the anchor-
+            // coherent grammar below applies (no sibling trial, no anchor
+            // chain, no deopt replay).
+            if (result.exit_reason == .exit_side) {
+                std.debug.assert(!ran_native and final == ct);
+                const d = self.consumeExitSide(mode, ct, result, proto, trace_regs, base, pc, safe_to_arm);
+                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                return d;
+            }
             // Doc 44 P0/D12b: a one-shot trace's (head or cont) guard-fail
             // exit — deopt to its entry pc (regs untouched since entry). The
             // loop-anchor grammar below (hot-exit wants, continuations,
@@ -4104,7 +4172,7 @@ pub const Vm = struct {
                 // ever unpatching (the pc-0 patch is the sole entry). A
                 // prologue-fail exit (`exit_instr == maxInt`) is bounds-refused
                 // inside, exactly like the loop arms.
-                self.trace.noteTakenExit(final, result.exit_instr, local_done, proto);
+                self.trace.noteTakenExit(final, result.exit_instr, local_done, proto, .legacy);
                 self.trace.onSideExitReceipt(
                     final,
                     local_done,
@@ -4298,7 +4366,10 @@ pub const Vm = struct {
                 (!any_loop_done or
                     (while_done_exit and self.trace.whileDoneHotnessEligible(final.code.anchor)));
             if (count_exit) {
-                self.trace.noteTakenExit(final, result.exit_instr, local_done, proto);
+                // Doc 56 Phase 3: a direct tier-1a run may take the exit-side
+                // route (its executor honours the exit-side state); a native
+                // run keeps today's routes until Phase 4.
+                self.trace.noteTakenExit(final, result.exit_instr, local_done, proto, if (ran_native) .legacy else .tier1a_direct);
             }
 
             if (local_done > 0 or linked_one_trip or while_done_exit) {

@@ -1793,3 +1793,31 @@ demotions in trace.zig, compiler-adjudicated). Deferred items:
       fixes, seed 0xd087841): same shape — a trailing `failed command:
       …/93be93d1…/test --seed=0xd087841 --listen=-` after `[jit]` probe
       lines, overall exit 0.
+- [ ] Occurrence 12 (2026-09-25, doc 56 Phase 3 gate, seed 0xe3a2f6ab):
+      same shape, exit 0; the last non-probe line is the `failed command`.
+
+## Doc 56 Phase 3 leftovers (2026-09-25)
+
+- [ ] **v1: burst hops don't materialize.** Only the dispatcher's direct
+      tier-1a entry takes the exit-side route. A child entered through a
+      chain or burst whose own guard fails at iteration 0 still gets the
+      old strikes and can be gated (glue test pc 24). Its exits never get
+      exit-side children. Phase 4/5 (adapters, ledger grammar) is the
+      natural place.
+- [ ] **A retired child leaves its exit stuck at `attached`.** If the
+      bound continuation is later removed (lane widening, retire), the
+      parent exit stays `attached` and never records again. It needs an
+      unbind on `removeTrace` (DONE latch included).
+- [ ] **Per-hop cache scan.** `consumeExitSide` → `driveChain` looks up
+      the continuation at `P` with a cache scan on every hop (fft: 508k
+      hops). Measure it on the native path in Phase 4, and cache the
+      bound child per exit if it shows.
+- [ ] **`set_upval` is NYI in the recorder.** It blocks some exit-side
+      recordings (seen in a scratch program: the continuation aborts,
+      and the exit gives up after `tryside`).
+- [ ] **Two iteration credits can't be seen yet.** Tier-1a call B's and
+      `replayLedger`'s `enclosing_iteration` credits don't change any
+      test when removed: `linked_completed` is already ≥ 1 there, and the
+      dispatcher doesn't read `ChainResult.completed`. Options: keep them
+      so the counts stay honest for later readers, or drop them. Bart to
+      decide.

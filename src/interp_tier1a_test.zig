@@ -997,8 +997,11 @@ test "doc 38: always-zero-trip while stays sound (no while root, outer traces ov
 test "doc 38: repeat-until is excluded from while linking (backward jmp_if_false)" {
     // `repeat` closes its loop with a backward `jmp_if_false`, never a bare
     // `jmp`, so `recWhileLink` and the while-done classifier both stay inert:
-    // no `.link` trace may commit for this program (no numeric-for inner
-    // either). Output parity still holds — the historical unroll owns it.
+    // no `.link` trace may close INTO the repeat loop. Output parity still
+    // holds — the historical unroll owns it. (Doc 56 Phase 3: exit-side
+    // children at the post-`repeat` pc DO commit, closing `.link` into the
+    // enclosing `for` at its back-edge — that is the new path, not a while
+    // link.)
     const gpa = testing.allocator;
     const source =
         \\local s = 0
@@ -1023,7 +1026,16 @@ test "doc 38: repeat-until is excluded from while linking (backward jmp_if_false
     try testing.expectEqualStrings(tier0.buffered(), jit.buffered());
 
     for (vm.trace.registry.cache.items) |t| {
-        try testing.expect(t.code.instrs[t.code.instrs.len - 1].op != .link);
+        const last = t.code.instrs[t.code.instrs.len - 1];
+        if (last.op != .link) continue;
+        // The repeat loop's header: the target of its backward jmp_if_false.
+        const code = t.code.anchor.proto.code;
+        for (code, 0..) |ins, pc| {
+            if (ins.op != .jmp_if_false) continue;
+            const target: i64 = @as(i64, @intCast(pc)) + 1 + ins.aux;
+            if (target > @as(i64, @intCast(pc))) continue;
+            try testing.expect(last.aux != target);
+        }
     }
 }
 

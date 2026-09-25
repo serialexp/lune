@@ -65,6 +65,15 @@ pub const ExitReason = enum(u32) {
     /// operation is never retried (execute-once), and no strike/receipt/
     /// chain/side-trace accounting runs (the error is about to unwind).
     precise_error = 5,
+    /// Doc 56 §4.1/§4.4 (Phase 3, tier-1a only): an ORDINARY trace's guard
+    /// failed at an exit that is wanted or attached (`TraceRecord.exit_side`),
+    /// and the executor took the resume-coherent contract. It has ALREADY
+    /// applied the earlier bytecodes' sunk stores and written the exit
+    /// snapshot's slots, so the guest registers are the tier-0 state at the
+    /// exit's resume pc `P` (`TraceCode.exitResumePc(exit_instr)`), not at
+    /// the anchor. The dispatcher resumes (or chains) at `P` and never
+    /// re-runs the iteration from the anchor.
+    exit_side = 6,
 };
 
 /// 2.3c-2a (doc 17): capacity of the per-transition native ledger carried in
@@ -368,6 +377,7 @@ test "execution contract wire ordinals and capacity" {
     try std.testing.expectEqual(@as(u32, 3), @intFromEnum(ExitReason.seed_capacity_decline));
     try std.testing.expectEqual(@as(u32, 4), @intFromEnum(ExitReason.precise_resume));
     try std.testing.expectEqual(@as(u32, 5), @intFromEnum(ExitReason.precise_error));
+    try std.testing.expectEqual(@as(u32, 6), @intFromEnum(ExitReason.exit_side));
     try std.testing.expectEqual(@as(u32, 0), @intFromEnum(LedgerKind.link_terminal));
     try std.testing.expectEqual(@as(u32, 1), @intFromEnum(LedgerKind.loop_done_linked));
     try std.testing.expectEqual(@as(u32, 2), @intFromEnum(LedgerKind.deopt));

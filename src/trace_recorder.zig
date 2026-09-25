@@ -552,6 +552,10 @@ pub const RecordingSession = struct {
         /// `recForPrepLink` to decide whether a peel is needed and by
         /// `recForLoop` to verify post-peel compatibility.
         inner_root_guards: []const trace_code.EntryGuard = &.{},
+        /// Doc 56 Phase 3: whether that root is PEELED. `recForLoop`'s
+        /// enclosing-root `.link` close refuses a peeled root: its entry
+        /// guards are its run-once iteration's types (doc 56 review finding 5).
+        inner_root_peeled: bool = false,
         unroll_while: bool = false,
         upval_open: ?usize = null,
         globals_header: ?*const object.GcHeader = null,
@@ -653,6 +657,11 @@ pub const RecordingSession = struct {
     /// unoptimized (link traces skip `tropt`). `null` for every ordinary
     /// root/continuation trace (closes with `.loop`). Reset to `null` by `reset`.
     link_target: ?u32 = null,
+    /// Doc 56 Phase 3: the `.link` terminal's `LinkKind` tag (commit writes it
+    /// into `link.a`). `.enclosing_iteration` only when the close crossed the
+    /// back-edge of a loop containing the anchor (`linkKindAt`). Meaningless
+    /// while `link_target == null`; reset alongside it.
+    link_kind: trace_ir.LinkKind = .inner_root,
     /// Transport for the `.link` terminal's exit provenance (doc 17, A-i.4 / edge 2):
     /// the `.link` op is synthesized at COMMIT (not at `recForPrepLink`, and link
     /// traces bypass `tropt.optimize`), so `recForPrepLink` stashes the terminal's
@@ -3384,6 +3393,34 @@ pub const RecordingSession = struct {
             self.setReg(a, rnext);
         }
 
+        // Doc 56 Phase 3: a `.continuation` recording that loops back into a
+        // numeric `for` whose body start already has a root links to it, the
+        // `for` twin of `recWhileLink` (LuaJIT `rec_loop_jit`, whose side
+        // traces end `LJ_TRLINK_ROOT` at any loop that has a trace). Before
+        // this the recording unrolled the enclosing loop's next iteration.
+        // The continue test and the stepped index/loop var were published
+        // above, so the registers are the root's entry state, exactly as at
+        // the doc 47 peel close below. Only into a non-peeled root whose
+        // entry guards the live registers already satisfy; otherwise keep
+        // recording as before. Skipped while a doc 47 peel is pending (that
+        // close owns this back-edge).
+        if (within and self.pending_link_close == null and self.kind == .continuation and
+            self.inline_depth == 0 and !self.precise and target != self.anchor.pc and
+            self.context.inner_root and !self.context.inner_root_peeled and
+            entryGuardsMatch(self.context.inner_root_guards, regs))
+        {
+            self.link_target = target;
+            self.link_kind = self.linkKindAt(target, self.cur_pc -| 1);
+            self.pending_link_provenance = .{ .link_terminal = .{
+                .path = pathFromFrames(&self.frames, self.inline_depth),
+                .inline_depth = self.inline_depth,
+                .source_proto_id = self.cur_proto_id,
+                .source_pc = self.cur_pc -| 1, // the for_loop opcode
+            } };
+            self.close_requested = true;
+            return;
+        }
+
         // Doc 47 increment A: consume a pending link close from a continuation
         // that recorded through an inner `for_prep` to promote accumulator types.
         if (self.pending_link_close) |*plc| {
@@ -3700,6 +3737,19 @@ pub const RecordingSession = struct {
         self.close_requested = true;
     }
 
+    /// Doc 56 Phase 3: tag a `.link` close made at the back-edge `back_edge_pc`
+    /// of the loop whose body starts at `target`. The loop contains this
+    /// recording's anchor exactly when `target <= anchor <= back_edge_pc`
+    /// (loops nest properly), and then one run to the `.link` finishes one
+    /// iteration of it. Only called at inline depth 0, so `back_edge_pc` and
+    /// `target` are anchor-proto pcs like `anchor.pc` (a `.continuation`
+    /// anchor is a raw pc).
+    fn linkKindAt(self: *const RecordingSession, target: u32, back_edge_pc: u32) trace_ir.LinkKind {
+        std.debug.assert(self.inline_depth == 0);
+        const a = self.anchor.pc;
+        return if (target <= a and a <= back_edge_pc) .enclosing_iteration else .inner_root;
+    }
+
     /// Doc 38 — while-inner nested-loop linking. Extends the doc 15 linking
     /// machinery to `while` loops, whose bytecode structure is
     /// `<cmp>; jmp_if_false <past_end>; <body>; jmp <back_to_cmp>`.
@@ -3783,6 +3833,7 @@ pub const RecordingSession = struct {
         // in `commit()` ensures all modified slots are flushed; unmodified slots
         // remain coherent in the physical register file.
         self.link_target = target;
+        self.link_kind = self.linkKindAt(target, pc - 1);
         self.pending_link_provenance = .{ .link_terminal = .{
             .path = pathFromFrames(&self.frames, self.inline_depth),
             .inline_depth = self.inline_depth,
@@ -5763,6 +5814,7 @@ pub const RecordingSession = struct {
         self.side_src = null;
         self.multret_top = null; // doc 27 §3a: never inherit a stale shadow
         self.link_target = null;
+        self.link_kind = .inner_root;
         self.terminal_close = null;
         self.pending_link_provenance = null;
         if (self.pending_link_close) |plc| self.gpa.free(plc.saved_reg_map);

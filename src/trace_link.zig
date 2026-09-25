@@ -196,14 +196,13 @@ pub fn maybeStartContinuation(self: *TraceState, proto: *const Proto, cur_pc: u3
     const key = self.pending_exit_anchor orelse return;
     if (self.rec.active) return; // never clobber an in-flight recording
     if (key.proto != proto or key.pc != cur_pc) return;
+    const src = self.pending_exit_src;
     self.pending_exit_anchor = null;
+    self.pending_exit_src = null;
     // Doc 31 D1 (review B3): final eligibility check at the actual start —
     // the request may have been gated between creation and activation.
     if (self.recordingBarred(key)) return;
     self.rec.reset(self.gpa, key, proto.num_registers) catch return;
-    // Doc 43 P0a: seed the anchor's absolute slab base (same as armWithPolicy).
-    // Missing this left `anchor_abs_base = 0`, making the open-upvalue aliasing
-    // guard fire on ALL open upvalues regardless of frame depth.
     // Doc 43 P0a: seed the anchor's absolute slab base (same as armWithPolicy).
     // Missing this left `anchor_abs_base = 0`, making the open-upvalue aliasing
     // guard fire on ALL open upvalues regardless of frame depth.
@@ -212,6 +211,70 @@ pub fn maybeStartContinuation(self: *TraceState, proto: *const Proto, cur_pc: u3
     // `.link` at the inner `for_prep` (a root recording, armed via `arm`, leaves
     // this `.root` and instead LINNER-aborts there — LuaJIT's model).
     self.rec.kind = .continuation;
+    // Doc 56 Phase 3: an exit-side request names its wanted exit, so the
+    // commit (`finishSideTraceProvenance`) can bind it.
+    self.rec.side_src = src;
+}
+
+/// Doc 56 Phase 3 (§4.4 "Next firing"): request a continuation recording at
+/// the resume pc `p` of wanted exit `exit_instr` of `parent`, which just
+/// materialized there. Tier-0 resumes AT `p`, so the dispatch prologue's
+/// `maybeStartContinuation` starts the recording on its first instruction.
+/// `base` is the resuming frame's absolute slab base (R5-F1: the recorder's
+/// open-upvalue alias test must never see a stale base from an unrelated
+/// back-edge). Refused, returning false, while another recording or request
+/// is in flight, when `p` is barred, or when `p` already holds
+/// `max_traces_per_anchor` traces (a continuation there that did not fit is
+/// why we are recording a sibling). Deterministic.
+pub fn maybeArmExitSide(self: *TraceState, parent: *const Trace, exit_instr: u32, proto: *const Proto, p: u32, base: usize) bool {
+    const key = AnchorKey{ .proto = proto, .pc = p };
+    const refusal: ?[]const u8 = if (self.rec.active)
+        "recording active"
+    else if (self.pending_exit_anchor != null or self.pending_replay_anchor != null)
+        "another recording pending"
+    else if (self.recordingBarred(key))
+        "anchor barred"
+    else if (self.countTracesAt(key) >= self.config.max_traces_per_anchor)
+        "anchor full"
+    else
+        null;
+    if (refusal) |why| {
+        self.dbg("exit-side: trace={d} exit={d} record at pc={d} refused: {s}", .{ parent.id, exit_instr, p, why });
+        return false;
+    }
+    self.pending_exit_anchor = key;
+    self.pending_exit_src = .{ .trace_id = parent.id, .exit_instr = exit_instr };
+    // Doc 56 round 5: hand the recorder the exit frame's slab base here, at
+    // the arm, rather than trusting the back-edge stash. Today they agree
+    // (the direct route enters the parent at a back-edge of this same
+    // frame, which stashed `st.base` just before), so this keeps the
+    // contract local instead of resting on that ordering.
+    self.pending_anchor_base = base;
+    self.exit_side_records +|= 1;
+    self.dbg("exit-side: trace={d} exit={d} record at pc={d}", .{ parent.id, exit_instr, p });
+    return true;
+}
+
+/// Doc 56 Phase 3: a recording requested by wanted exit `src` just
+/// committed as `child`. A `.link` continuation at the exit's resume pc
+/// serves the exit from now on: bind it. Anything else cannot be chained at
+/// `P` (the walk takes `.link` continuations only), so the exit gives up.
+/// Either way the caller's DONE latch follows, as for any cross-anchor side
+/// trace. A no-op unless the exit is still wanted and `child` sits at its
+/// resume pc (a legacy-route child of the same exit, recorded off a native
+/// run, leaves the exit-side state alone).
+pub fn noteExitSideCommit(self: *TraceState, parent: *Trace, exit_instr: u32, child: *const Trace) void {
+    if (parent.exitSideAt(exit_instr) != .wanted) return;
+    const p = parent.code.exitResumePc(exit_instr) orelse return;
+    if (child.code.anchor.proto != parent.code.anchor.proto or child.code.anchor.pc != p) return;
+    const n = child.code.instrs.len;
+    if (n != 0 and child.code.instrs[n - 1].op == .link) {
+        self.bindExitSide(parent, exit_instr, .commit);
+    } else {
+        parent.exit_side[exit_instr] = .gave_up;
+        self.exit_side_giveups +|= 1;
+        self.dbg("exit-side: trace={d} exit={d} gave up (child t={d} is not a .link continuation)", .{ parent.id, exit_instr, child.id });
+    }
 }
 
 /// Dispatch-prologue hook (doc 16, Phase 2): activate a pending *prime
@@ -246,6 +309,7 @@ pub fn maybeStartReplaySide(self: *TraceState, proto: *const Proto, cur_pc: u32)
 /// pinned in `.full` mode behind a stale pending anchor.
 pub fn clearPendingExitAnchor(self: *TraceState) void {
     self.pending_exit_anchor = null;
+    self.pending_exit_src = null;
     self.pending_replay_anchor = null;
     self.pending_replay_src = null;
 }
@@ -287,7 +351,15 @@ pub fn clearPendingExitAnchor(self: *TraceState) void {
 ///     anchor's trace capacity and lock out the chain machinery (measured:
 ///     routing branch exits there collapsed nsieve's fusion entirely —
 ///     bridge arms 25 940 → 0, +53% wall).
-pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: usize, proto: *const Proto) void {
+///
+/// **Doc 56 Phase 3: the exit-side route (tier-1a only).** `route ==
+/// .tier1a_direct` marks a firing from the dispatcher's direct tier-1a run,
+/// whose executor honours `TraceRecord.exit_side`. There, a hot attachable
+/// exit becomes wanted and owns every later firing until it binds a child or
+/// gives up (`routeExitSide`); the routes above never see it meanwhile. Every
+/// other caller (native, ledger replay, `driveChain` hops) passes `.legacy`
+/// and keeps today's routes until Phase 4.
+pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: usize, proto: *const Proto, route: ExitRoute) void {
     if (exit_instr >= t.exit_counts.len) return; // hand-built / fail-soft commit
     const c = &t.exit_counts[exit_instr];
     if (c.* == Trace.EXIT_COUNT_DONE) return;
@@ -297,6 +369,7 @@ pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: u
     // eviction restarts the exit cold (codex review of 84c86bc).
     if (c.* < Trace.EXIT_COUNT_DONE - 1) c.* += 1;
     if (c.* < self.config.hotexit) return;
+    if (route == .tier1a_direct and routeExitSide(self, t, exit_instr, c.*)) return;
     // Everything below is arming-only, so it runs behind the cheapest
     // possible gates: `isSourceBranchGuardExit` (provenance decode) and
     // `countTracesAt` (an O(cache) scan) must NOT run per receipt on a
@@ -367,6 +440,75 @@ pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: u
         self.markEntryPatchesAt(t.code.anchor);
     }
 }
+
+/// Who reports a taken exit to `noteTakenExit` (doc 56 Phase 3).
+pub const ExitRoute = enum {
+    /// Native runs, ledger replay, `driveChain` hops: today's routes only.
+    legacy,
+    /// The dispatcher's direct tier-1a run, which passes the trace's
+    /// exit-side state to the executor.
+    tier1a_direct,
+};
+
+/// Doc 56 Phase 3: the exit-side state machine for one hot (`count >=
+/// hotexit`) taken exit on a direct tier-1a run. Returns true when the
+/// exit-side path owns this firing, so the routes in `noteTakenExit` must not
+/// run.
+///   * `.none` → `.wanted` for an attachable exit while the parent has fewer
+///     than `maxside` children. The firing that crosses `hotexit` still took
+///     the ordinary deopt (the executor saw `.none`); the next one
+///     materializes at `P`.
+///   * `.wanted` firings materialized, so they are owned even when this one
+///     gives up at `hotexit + tryside` (it resumes at `P`; the next firing
+///     sees `.gave_up`, deopts ordinarily and reaches today's routes).
+///   * `.gave_up` returns to today's routes for good.
+/// `.attached` exits are DONE-latched and never reach here.
+/// Deterministic: a pure function of the receipt stream.
+fn routeExitSide(self: *TraceState, t: *Trace, exit_instr: u32, count: u8) bool {
+    if (!self.config.exit_side or exit_instr >= t.exit_side.len) return false;
+    const s = &t.exit_side[exit_instr];
+    switch (s.*) {
+        .gave_up => return false,
+        .attached => return true,
+        .wanted => {
+            if (count >= self.config.hotexit +| self.config.tryside) {
+                s.* = .gave_up;
+                self.exit_side_giveups +|= 1;
+                self.dbg("exit-side: trace={d} exit={d} gave up after {d} firings", .{ t.id, exit_instr, count });
+            }
+            return true;
+        },
+        .none => {
+            if (t.side_children >= self.config.maxside) return false;
+            if (!t.code.exitAttachable(exit_instr)) return false;
+            s.* = .wanted;
+            self.exit_side_wants +|= 1;
+            self.dbg("exit-side: trace={d} exit={d} wanted (resume pc={d})", .{ t.id, exit_instr, t.code.exitResumePc(exit_instr).? });
+            return true;
+        },
+    }
+}
+
+/// Doc 56 Phase 3: bind wanted exit `src` of `parent` to a child now serving
+/// it (a continuation at its resume pc, found by a chain or just committed
+/// from its recording): mark it attached, DONE-latch its counter (LuaJIT's
+/// `SNAPCOUNT_DONE`) and count the child against `maxside`. A no-op unless
+/// the exit is wanted.
+pub fn bindExitSide(self: *TraceState, parent: *Trace, exit_instr: u32, via: ExitSideBind) void {
+    if (exit_instr >= parent.exit_side.len) return;
+    const s = &parent.exit_side[exit_instr];
+    if (s.* != .wanted) return;
+    s.* = .attached;
+    if (exit_instr < parent.exit_counts.len) parent.exit_counts[exit_instr] = Trace.EXIT_COUNT_DONE;
+    parent.side_children +|= 1;
+    self.exit_side_binds +|= 1;
+    if (via == .chain) self.exit_side_chain_binds +|= 1;
+    self.dbg("exit-side: trace={d} exit={d} attached by {s} (children={d})", .{ parent.id, exit_instr, @tagName(via), parent.side_children });
+}
+
+/// Doc 56 Phase 3: how a wanted exit found its child — a chain into a
+/// continuation already at `P`, or the commit of the recording it armed.
+pub const ExitSideBind = enum { chain, commit };
 
 /// Doc 44 D8 (P1a): a head trace at `anchor` completed terminally. If a
 /// head-sibling want is standing for this anchor, retire it: clear the want
@@ -2248,6 +2390,7 @@ pub fn clearCache(self: *TraceState) void {
     self.wants_prime_side = null;
     self.prime_want_src = null;
     self.pending_exit_anchor = null;
+    self.pending_exit_src = null;
     self.pending_replay_anchor = null;
     self.pending_replay_src = null;
     // B1' (task 27): frame-link arm requests are trace-id-keyed; ids are

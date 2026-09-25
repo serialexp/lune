@@ -82,7 +82,7 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
         // resume pc in `aux`.
         try rec.instrs.append(gpa, .{ .op = .terminal, .a = @intFromEnum(tc.kind), .aux = @intCast(tc.resume_pc) });
     } else if (rec.link_target) |lt| {
-        try rec.instrs.append(gpa, .{ .op = .link, .aux = @intCast(lt) });
+        try rec.instrs.append(gpa, .{ .op = .link, .a = @intFromEnum(rec.link_kind), .aux = @intCast(lt) });
     } else {
         try rec.instrs.append(gpa, .{ .op = .loop });
     }
@@ -460,8 +460,9 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
             .loop => std.debug.assert(i == last), // the only loop, and it is terminal
             // `.link` (doc 15): terminal hand-off to an inner root. Like `.loop`
             // it is the sole terminal; `aux` is the inner anchor pc, not an
-            // operand ref, so nothing to bound-check beyond terminality.
-            .link => std.debug.assert(i == last),
+            // operand ref, so nothing to bound-check beyond terminality; `a`
+            // is a `LinkKind` tag (doc 56).
+            .link => std.debug.assert(i == last and std.enums.fromInt(ir.LinkKind, ins.a) != null),
             // `.terminal` (doc 44): the one-shot head-trace close. Sole
             // terminal; `a` is a TerminalKind tag and `aux` the resume pc —
             // neither is an operand ref.
