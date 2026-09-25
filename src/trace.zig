@@ -4093,6 +4093,39 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
             }
         }
         try w.print("    exit locations:       traces={d} values={d} carried={d} bytes={d} exit-slots held={d} lost={d}\n", .{ n_mapped, n_values, n_carried, map_bytes, held, lost });
+        // Doc 56 §4.3 (Phase 2): the attachability verdict of every exit
+        // that has a snapshot, and — over the attachable ones only — how
+        // many restored slots the native body still holds (the Phase 4
+        // liveness extension's work list).
+        const exit_attach = @import("trace_exit_attach.zig");
+        var by_verdict = std.enums.EnumArray(exit_attach.Verdict, usize).initFill(0);
+        var att_held: usize = 0;
+        var att_lost: usize = 0;
+        for (ts.registry.cache.items) |t| {
+            for (0..t.code.instrs.len) |ei| {
+                const si = t.code.exitSnapIdx(ei) orelse continue;
+                const v = exit_attach.classify(&t.code, ei);
+                std.debug.assert((v == .attachable) == t.code.exitAttachable(ei));
+                by_verdict.getPtr(v).* += 1;
+                if (v != .attachable) continue;
+                const m = switch (t.native) {
+                    .compiled => |*c| &c.exit_locs,
+                    else => continue,
+                };
+                const s = t.code.exit_snapshots[si - 1];
+                for (t.code.exit_snapshot_slots[s.slots_begin..][0..s.slots_len]) |ss| {
+                    if (m.at(ss.ref, ei) != null) att_held += 1 else att_lost += 1;
+                }
+            }
+        }
+        try w.print("    exit attach:          attachable={d} slots held={d} lost={d}; refused:", .{ by_verdict.get(.attachable), att_held, att_lost });
+        var any_refused = false;
+        for (std.enums.values(exit_attach.Verdict)) |v| {
+            if (v == .attachable or by_verdict.get(v) == 0) continue;
+            try w.print(" {s}={d}", .{ @tagName(v), by_verdict.get(v) });
+            any_refused = true;
+        }
+        try w.writeAll(if (any_refused) "\n" else " none\n");
     }
 
     try w.writeAll("  coverage by loop iterations (count — flatters the JIT):\n");

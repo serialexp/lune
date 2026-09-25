@@ -182,30 +182,9 @@ pub fn maybeArmContinuation(self: *TraceState, failed: *const Trace, exit_instr:
     self.pending_exit_anchor = key;
 }
 
-pub fn continuationReachesEnclosingBackEdge(proto: *const Proto, start_pc: u32, inner_anchor: u32) bool {
-    const scan_limit: usize = @min(proto.code.len, @as(usize, @intCast(start_pc)) + 128);
-    var pc: usize = @intCast(start_pc);
-    while (pc < scan_limit) : (pc += 1) {
-        const ins = proto.code[pc];
-        switch (ins.op) {
-            .for_loop, .tfor_loop => {
-                const target = @as(i64, @intCast(pc)) + 1 + ins.aux;
-                if (target >= 0 and target <= @as(i64, @intCast(inner_anchor))) return true;
-            },
-            // Doc 38: an enclosing WHILE loop's back-edge is a plain backward
-            // `jmp`. The scan starts past the inner anchor, so a target at or
-            // before it is necessarily backward and enclosing (rule Z-6:
-            // while-in-while nests arm continuations like for-in-for ones).
-            .jmp => {
-                const target = @as(i64, @intCast(pc)) + 1 + ins.aux;
-                if (target >= 0 and target <= @as(i64, @intCast(inner_anchor))) return true;
-            },
-            .ret, .halt => return false,
-            else => {},
-        }
-    }
-    return false;
-}
+/// Doc 56 §4.3 moved this gate to `trace_exit_attach`, which exit
+/// attachability shares with the loop-done continuation arm.
+pub const continuationReachesEnclosingBackEdge = @import("trace_exit_attach.zig").continuationReachesEnclosingBackEdge;
 
 /// Dispatch-prologue hook (Phase 1): activate a pending continuation recording
 /// the instant tier-0 reaches its (non-header) anchor pc. By construction this
@@ -2382,7 +2361,15 @@ pub fn nativeFor(self: *TraceState, t: *Trace) ?*const nativegen.CompiledTrace {
                         for (t.code.exit_snapshot_slots[s.slots_begin..][0..s.slots_len]) |ss| {
                             if (m.at(ss.ref, ei) != null) held += 1;
                         }
-                        self.dbg("exit-loc:   exit={d} ord={d} snap={d} held={d}/{d}", .{ ei, t.code.instrs[ei].ord, si, held, s.slots_len });
+                        // Doc 56 §4.3: the exit's attachability verdict and
+                        // resume pc (-1 when its provenance does not resolve).
+                        const exit_attach = @import("trace_exit_attach.zig");
+                        const verdict = exit_attach.classify(&t.code, ei);
+                        const rpc: i64 = switch (exit_attach.resumeOf(&t.code, ei)) {
+                            .pc => |p| p,
+                            .refused => -1,
+                        };
+                        self.dbg("exit-loc:   exit={d} ord={d} snap={d} held={d}/{d} attach={s} resume={d}", .{ ei, t.code.instrs[ei].ord, si, held, s.slots_len, @tagName(verdict), rpc });
                     }
                 };
                 return &t.native.compiled;

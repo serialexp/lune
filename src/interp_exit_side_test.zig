@@ -14,6 +14,7 @@ const Vm = interp.Vm;
 const trace_ir = @import("trace_ir.zig");
 const compiler = @import("compiler.zig");
 const io = @import("io.zig");
+const exit_attach = @import("trace_exit_attach.zig");
 
 const util = @import("interp_testutil.zig");
 const expectProgramTuned = util.expectProgramTuned;
@@ -219,4 +220,76 @@ test "doc 56 Phase 1: a compiled trace maps every exit-snapshot value, carried h
         };
     }
     try testing.expect(saw_map);
+}
+
+test "doc 56 Phase 2: bit-reverse's while-exit is attachable and resumes after the while" {
+    const gpa = testing.allocator;
+    // The fft kernel, small: only the recorded root at the `for` matters.
+    const source =
+        \\local function bitreverse(v, n)
+        \\  local j = 0
+        \\  for i = 0, 2 * n - 4, 2 do
+        \\    if i < j then
+        \\      v[i+1], v[i+2], v[j+1], v[j+2] = v[j+1], v[j+2], v[i+1], v[i+2]
+        \\    end
+        \\    local k = n
+        \\    while k <= j do j = j - k; k = k / 2 end
+        \\    j = j + k
+        \\  end
+        \\end
+        \\local n = 64
+        \\local v = {}
+        \\for i = 1, 2 * n do v[i] = i * 0.5 end
+        \\for rep = 1, 2 do bitreverse(v, n) end
+        \\print(v[1], v[2 * n])
+    ;
+    var rec = try Recorded.init(gpa, source, "0.5\t64\n");
+    defer rec.deinit();
+    const vm = rec.vm;
+
+    var attachable: usize = 0;
+    var after_while: usize = 0;
+    for (vm.trace.registry.cache.items) |t| {
+        const c = &t.code;
+        const proto = c.anchor.proto;
+        for (0..c.instrs.len) |e| {
+            // The commit-time memo is the oracle's answer.
+            try testing.expectEqual(exit_attach.classify(c, e) == .attachable, c.exitAttachable(e));
+            const p = c.exitResumePc(e) orelse continue;
+            attachable += 1;
+            try testing.expect(p < proto.code.len);
+            // No backward jump lands on `P`: it is not a loop header.
+            for (proto.code, 0..) |ins, pc| switch (ins.op) {
+                .jmp, .jmp_if_true, .jmp_if_false, .jmp_if_not_nil, .for_loop, .tfor_loop => {
+                    const target: i64 = @as(i64, @intCast(pc)) + 1 + ins.aux;
+                    try testing.expect(!(target <= pc and target == p));
+                },
+                else => {},
+            };
+            const snap = c.exit_snapshots[c.exitSnapIdx(e).? - 1];
+            const b = snap.resume_pc;
+            switch (proto.code[b].op) {
+                .jmp_if_true, .jmp_if_false => {
+                    // A branch resumes at one of its successors, and every
+                    // slot live there was live at the branch, so the
+                    // branch's snapshot covers it.
+                    const target: i64 = @as(i64, b) + 1 + proto.code[b].aux;
+                    try testing.expect(p == b + 1 or p == target);
+                    for (0..proto.num_registers) |r| {
+                        if (proto.reg_live.liveIn(p, @intCast(r)))
+                            try testing.expect(proto.reg_live.liveIn(b, @intCast(r)));
+                    }
+                    // The while's exit edge: its target follows the
+                    // while's backward `jmp`. That is `j = j + k`.
+                    if (p == target and p >= 1 and proto.code[p - 1].op == .jmp and
+                        @as(i64, p) + proto.code[p - 1].aux < p)
+                        after_while += 1;
+                },
+                // Every other exit re-executes its own bytecode.
+                else => try testing.expectEqual(b, p),
+            }
+        }
+    }
+    try testing.expect(attachable > 0);
+    try testing.expect(after_while > 0);
 }

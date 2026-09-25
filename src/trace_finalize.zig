@@ -18,6 +18,7 @@ const EntryGuard = code_mod.EntryGuard;
 const EntryGuardType = code_mod.EntryGuardType;
 const InputSeed = code_mod.InputSeed;
 const trace_snapshot = @import("trace_snapshot.zig");
+const exit_attach = @import("trace_exit_attach.zig");
 pub const RecordingCandidate = @import("trace_candidate.zig").RecordingCandidate;
 
 pub const Options = struct {
@@ -323,6 +324,8 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
         .lane_pins = pins_owned,
     };
     buildBridgeCandMemo(gpa, &code);
+    // Doc 56 §4.3: each exit's attachability, once, from the final code.
+    exit_attach.buildMemo(gpa, &code);
     return RecordingCandidate.init(code, rec.side_src);
 }
 

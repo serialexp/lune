@@ -1,6 +1,6 @@
 # 56 — Exit-started side traces (LuaJIT's side-trace mechanism) — Design
 
-Status: Phase 1 done (exit snapshots, exit location map, finalize tests); Phase 2 next; design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
+Status: Phase 1 done (exit snapshots, exit location map, finalize tests); Phase 2 done (attachability and resume pc); Phase 3 next; design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
 Owner: Bart
 Last updated: 2026-09-25
 
@@ -90,9 +90,25 @@ consumes yet, so every program's output and trace set stays identical.
     - every `exitSnapshotsValid` rejection rule.
 
     The compaction and validation legs were each mutation-checked.
-- [ ] **Phase 2 — attachability and resume pc (inert).**
+- [x] **Phase 2 — attachability and resume pc (inert).**
   `exitAttachable` and `exitResumePc`, including the branch fix-up and
-  the Q6 guard-emitter audit. Pure tests.
+  the Q6 guard-emitter audit. Pure tests. As built:
+  - `src/trace_exit_attach.zig`: `classify` returns a `Verdict` (one per
+    refusal reason, rules 1–9 in its header); `resumeOf` applies the
+    branch fix-up; `resumeClass` is the Q6 audit as an exhaustive `IrOp`
+    switch, so a new op won't compile until it is classified.
+  - `buildMemo` stores one bit per instruction at finalize (fail-soft,
+    like `bridge_cand`); `TraceCode.exitAttachable`/`exitResumePc` read it.
+  - `--jit-stats` prints an `exit attach:` line (verdict counts, and the
+    held/lost slots of attachable exits); the `exit-loc:` probe shows each
+    exit's verdict and `P`.
+  - Tests: one fixture per rule in `trace_exit_attach_test.zig` (memo
+    pinned equal to the oracle), plus bit-reverse's while-exit in
+    `interp_exit_side_test.zig`.
+  - Board: fft has 202 attachable exits, sparse 186, nbody 163,
+    spectral-norm 150. Most refusals are `trace_shape` or `loop_done`.
+  - Review: Antigravity APPROVE WITH CHANGES; both findings were taken
+    (`docs/reviews/doc56/antigravity-phase2.md`).
 - [ ] **Phase 3 — tier-1a materialize and exit-side recording.**
   - `irinterp` materializes at an attached or wanted guard.
   - The dispatcher resumes tier-0 at `P`, with recording when a side
@@ -120,6 +136,11 @@ consumes yet, so every program's output and trace set stays identical.
   - `ArmKind.exit_side` and its `arm` validation.
   - A child's prologue failure resumes tier-0 at `P` (its anchor), as
     for any continuation.
+  - The liveness extension for attachable exits only (§4.6 "Register
+    allocation"), so their exit location map rows become "held", with
+    its register cost measured on the board (Q3). Bart moved it here
+    from Phase 2 (2026-09-25): it changes machine code, and the adapters
+    are its only reader.
 - [ ] **Phase 5 — ledger grammar and accounting.** `LedgerKind.exit_side`
   rows, the replay grammar, and completion attribution.
 - [ ] **Phase 6 — regions and silent promotion.**
@@ -430,8 +451,10 @@ do not.
   - An exit's own view is derived: `exitSnapIdx(e)` → its snapshot's
     slots → `ExitLocMap.at(ref, e)`. There is no per-exit data.
   - It is inert: built after emission, and no liveness is extended. A
-    value whose life ended before an exit is simply "lost" there. Phase 2
-    extends liveness for attachable exits only.
+    value whose life ended before an exit is simply "lost" there. Phase 4
+    extends liveness for attachable exits only (moved from Phase 2 by
+    Bart, 2026-09-25). Phase 2's `--jit-stats` `exit attach:` line counts
+    the attachable exits' held/lost slots, which is that work list.
   - Board measurement (`--jit-stats`): the map is 90 B – 3 KB per bench
     (fft 2.1 KB against 10 KB of IR). Across the board, 159 of 6195
     restored exit slots (2.6%) are lost: fft has the most (36 of 895),
@@ -462,7 +485,12 @@ stay in that range.
   loosened) for every mid-body guard (review round 3, finding 1);
 - the trace is neither precise nor peeled (peeled parents are
   deferred);
-- the guard's emitter passed the Q6 audit.
+- the guard's emitter passed the Q6 audit;
+- the resume pc `P` is not the consumer half of a multret pair (a
+  `call`/`ret` whose `b` is `all_results`). Tier-0 reads that
+  instruction's count from the transient `Vm.reg_top` its producer
+  stamped, and no snapshot carries it (found during Phase 2; resuming
+  AT the producer is fine, it stamps `reg_top` afresh).
 
 `exitResumePc(t, exit)`:
 

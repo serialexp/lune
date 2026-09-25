@@ -252,6 +252,35 @@ the ones that bite):
   - Known cost, and it is by design (LuaJIT pays the same): a NON-konst
     value kept only by a snapshot still gets a register and code. No
     bench has one; every IR difference is a konst.
+- **Phase 2 done (2026-09-25):**
+  - `src/trace_exit_attach.zig`: `classify` (the oracle, with a `Verdict`
+    per refusal reason), `resumeOf` (the branch fix-up), `resumeClass`
+    (the Q6 audit as an exhaustive `IrOp` switch), and `buildMemo`
+    (a per-instruction bitset built once in `finalize`, fail-soft like
+    `bridge_cand`). `TraceCode.exitAttachable`/`exitResumePc` read it.
+  - `continuationReachesEnclosingBackEdge` moved there from
+    `trace_link` (re-exported), since rule 8 shares it.
+  - Rule 9 (from TODO.md): `P` must not be a multret consumer
+    (`call`/`ret` with `b == all_results`). Mutation-checked.
+  - `--jit-stats` has an `exit attach:` line; the `exit-loc:` probe
+    shows each exit's verdict and resume pc.
+  - Tests: `src/trace_exit_attach_test.zig` (one fixture per rule, memo
+    pinned equal to the oracle) plus a real bit-reverse test in
+    `interp_exit_side_test.zig`. `zig build test` green.
+  - Board stats (ReleaseFast): fft attachable=202 (lost slots 35),
+    sparse 186, nbody 163, spectral-norm 150. Refusals are mostly
+    `trace_shape` (func-head/peeled traces) and `loop_done`. No bench
+    hits `multret_consumer`.
+  - **Liveness extension:** Bart moved it to Phase 4 (it changes
+    machine code; the adapters are its only reader). Doc 56 updated.
+  - Antigravity review: APPROVE WITH CHANGES, both taken — `uref` counts
+    as a ready store operand, and new tests walk `uref` and
+    `gstore → gcell → garow` after the guard. Receipt:
+    `docs/reviews/doc56/antigravity-phase2.md`.
+  - Gates: `just test` 0; jit-debug 0 with the known stray line
+    (occurrence 11 in TODO.md).
+- **Next: Phase 3** (tier-1a materialize and exit-side recording), per
+  doc 56's checklist.
 
 ## Status 2026-09-24 (latest+27) — doc 55 §2 + §2d LANDED: fft 14.6× → 12.6× LJ, sparse −31%; silent switch is now data (no runtime code patching)
 

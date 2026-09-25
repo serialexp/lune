@@ -4,7 +4,9 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 
 ## Doc 56 Phase 2: multret pairs are not resumable mid-pair
 
-- [ ] `exitAttachable` must refuse an exit whose resume pc is the CONSUMER
+- [x] (Done 2026-09-25: rule 9 / `Verdict.multret_consumer`, pinned and
+      mutation-checked in `trace_exit_attach_test.zig`.)
+      `exitAttachable` must refuse an exit whose resume pc is the CONSUMER
       half of a multret pair (a `call`/`ret` with `b == all_results` right
       after a `call c=all_results` or `vararg_spread`). Tier-0 needs the
       transient `reg_top`/`reg_top_pending`, which no snapshot carries, so
@@ -1787,3 +1789,7 @@ demotions in trace.zig, compiler-adjudicated). Deferred items:
       exited 0. It reproduces often now (3 of the last 4 uncached runs), so
       it is cheap to hunt. The log is about 40.9k lines of `[jit]` probe
       spam; the large stderr volume is a suspect for the runner.
+- [ ] Occurrence 11 (2026-09-25, doc 56 Phase 2 gate after the review
+      fixes, seed 0xd087841): same shape — a trailing `failed command:
+      …/93be93d1…/test --seed=0xd087841 --listen=-` after `[jit]` probe
+      lines, overall exit 0.

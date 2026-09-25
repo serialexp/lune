@@ -9,6 +9,7 @@ const value = @import("value.zig");
 const trace_ir = @import("trace_ir.zig");
 const trace_snapshot = @import("trace_snapshot.zig");
 const trace_types = @import("trace_types.zig");
+const exit_attach = @import("trace_exit_attach.zig");
 const RegWindow = @import("regwindow.zig").RegWindow;
 
 const Value = value.Value;
@@ -443,6 +444,14 @@ pub const TraceCode = struct {
     exit_snapshots: []trace_snapshot.Snapshot = &.{},
     exit_snapshot_slots: []trace_snapshot.SnapshotSlot = &.{},
     exit_snap_by_ord: []trace_ir.SnapIdx = &.{},
+    /// Doc 56 §4.3: the per-exit attachability verdict (one bit per
+    /// instruction, LSB-first), computed once at commit by
+    /// `trace_exit_attach.buildMemo` — a pure function of this immutable
+    /// code. Same fail-soft contract as `bridge_cand`: an OOM leaves it
+    /// unbuilt and `exitAttachable` asks the identical oracle. Built but
+    /// empty when the trace has no exit snapshots. Owned; freed in `deinit`.
+    exit_attach: []const u8 = &.{},
+    exit_attach_built: bool = false,
     /// Doc 48: eviction metadata ONLY — the record-time table identity behind
     /// each `guard_lane` on a slot_load-covered root, so widen-eviction
     /// (`laneWidenedPast`) fires only against the very table whose monotonic
@@ -469,6 +478,7 @@ pub const TraceCode = struct {
         if (self.exit_snapshots.len != 0) gpa.free(self.exit_snapshots);
         if (self.exit_snapshot_slots.len != 0) gpa.free(self.exit_snapshot_slots);
         if (self.exit_snap_by_ord.len != 0) gpa.free(self.exit_snap_by_ord);
+        if (self.exit_attach.len != 0) gpa.free(self.exit_attach);
         if (self.lane_pins.len != 0) gpa.free(self.lane_pins);
         self.* = undefined;
     }
@@ -511,6 +521,21 @@ pub const TraceCode = struct {
         const si = self.exit_snap_by_ord[ins.ord];
         if (si == 0 or si > self.exit_snapshots.len) return null;
         return si;
+    }
+
+    /// Doc 56 §4.3: whether exit `instr_idx` may take the resume-coherent
+    /// path (materialize at its resume pc, then continue there). Reads the
+    /// commit-time memo; see `trace_exit_attach` for the rules.
+    pub fn exitAttachable(self: *const TraceCode, instr_idx: usize) bool {
+        if (!self.exit_attach_built) return exit_attach.classify(self, instr_idx) == .attachable;
+        if (instr_idx >> 3 >= self.exit_attach.len) return false;
+        return (self.exit_attach[instr_idx >> 3] >> @intCast(instr_idx & 7)) & 1 != 0;
+    }
+
+    /// Doc 56 §4.3: the resume pc `P` of an attachable exit (the branch
+    /// fix-up applied), or null when the exit is not attachable.
+    pub fn exitResumePc(self: *const TraceCode, instr_idx: usize) ?u32 {
+        return exit_attach.resumePc(self, instr_idx);
     }
 
     /// Doc 43 P5 (the sgm_setpos precedent, generalized): the eligibility gate
@@ -642,4 +667,5 @@ pub const BridgeEmissionIterator = struct {
 
 test {
     _ = @import("trace_code_test.zig");
+    _ = exit_attach;
 }
