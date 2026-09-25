@@ -31,6 +31,7 @@ const bytecode = @import("bytecode.zig");
 const value = @import("value.zig");
 const gc = @import("gc.zig");
 const diag = @import("diag.zig");
+const bc_liveness = @import("bc_liveness.zig");
 
 const Instr = bytecode.Instr;
 const OpCode = bytecode.OpCode;
@@ -138,6 +139,8 @@ pub fn compileWithOptions(
         .protos = c.protos.items,
         .name = "main",
         .is_vararg = c.is_vararg,
+        // Doc 56 §4.2: per-pc register liveness, from the finished code.
+        .reg_live = try bc_liveness.compute(c.arena, c.scratch, c.code.items, c.max_reg, c.protos.items),
     };
     // Assign every proto a stable, unique id (pre-order over the proto tree,
     // root = `id_base`). This is the proto's serialization identity — a trace's
@@ -1216,6 +1219,8 @@ const Compiler = struct {
             .protos = child.protos.items,
             .upvalues = child.upvalues.items,
             .name = name,
+            // Doc 56 §4.2: per-pc register liveness, from the finished code.
+            .reg_live = try bc_liveness.compute(self.arena, self.scratch, child.code.items, child.max_reg, child.protos.items),
         };
 
         if (self.protos.items.len > std.math.maxInt(u16)) return self.fail(body.span, "too many nested functions");

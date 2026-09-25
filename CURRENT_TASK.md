@@ -110,8 +110,97 @@ the ones that bite):
   - **Rows plus silent promotion** (no rowless mode).
   - **Peeled:** never link into a peeled child; peeled parents are
     deferred.
-- **Next:** Bart reviews doc 56 and decides whether to start Phase 0
-  now or wait for the Codex round (owed 09-29).
+- **Bart: no waiting for Codex.** A separate sub-agent reviewed it
+  three more times:
+  - round 3: CHANGES REQUESTED (the loop-done store helper, ±2 GB
+    cells, ledger rows);
+  - round 4: CHANGES REQUESTED. This led to **rev 5: exit-side traces
+    ARE `.continuation` traces at raw `P`**; there is no new anchor
+    kind, which would have fallen silently into about 30 one-shot
+    sites;
+  - round 5: **APPROVE WITH CHANGES**, folded in (rev 6, cd25b25). The
+    new requirement: `pending_anchor_base` must be set at the exit
+    site.
+- **Phase 0 done** (ceea80e):
+  - board baseline `bench/results/20260924-184058-e587e28.tsv` (fft
+    205.9 ms, 12.8×);
+  - `src/interp_exit_side_test.zig`, which pins today's <10% traced on
+    the n=1024 bit-reverse reduction (n ≤ 128 does NOT reproduce).
+- **Next: Phase 1** (inert):
+  - boundary ordinals on guards and sunk-store IR;
+  - sparse snapshots on ordinary traces;
+  - `tropt` liveness and remap for snapshot refs;
+  - the native exit location map.
+- **Phase 1 in progress (uncommitted):**
+  - Done so far: ordinals (`IrInstr.ord`, `PendingStore.ord`),
+    sparse capture (`exitBoundary`/`commitExitSnap`,
+    `Builder.addSparse`/`mark`/`truncate`), `tropt` roots + remap,
+    `exitSnapshotsValid` in finalize, and `--jit-stats` bytes.
+  - Fixes: a `pc == 0` underflow in `exitBoundary` and the
+    `trace_finalize_test` fixture fields.
+  - **Dead-slot blocker RESOLVED** (Bart picked "per-proto liveness
+    table"): `src/bc_liveness.zig` computes `Proto.reg_live` at compile
+    time (a round-based worklist, ~1.1 visits per pc on the adversarial
+    `/tmp/bigproto.lua`). Snapshots capture only `.def` AND bytecode-live
+    slots. Capture is lazy (a def bitmap AND the live row, plus undo
+    stamps). A budget latch `exit_snap_exhausted` stops retrying.
+  - **Inertness check vs HEAD** (`/tmp/lune-base`, a `just shadow` copy,
+    nm-verified). Native dumps are ASLR-noisy, so compare
+    `--dump-traces` IR and per-trace native byte counts. Found and fixed
+    three causes:
+    1. `tropt` rooted the snapshots of guards it later folded (for
+       example the type guard on a konst operand of `(2/3)^k`). Now
+       `tropt.optimize` takes `ExitSnaps`. It roots a snapshot only for a
+       live, unfolded side-exit op of that ordinal, and zeroes `by_ord`
+       for ordinals with no surviving body exit. Finalize then compacts
+       the store (`trace_snapshot.compactSparse`).
+    2. A liveness bug. A call or return with more than 4 registers fell
+       back to "reads up to the window top", which made every temp live
+       program-wide (seen in euler14-bit). Now there is an exact
+       `range_lo/range_hi` use range, with a unit test.
+    3. A konst that only a snapshot reads (for example `select("#", …)`
+       args before a builtin guard) was emitted as a `mov` and took a
+       register. Now `proveKinds` gives it kind `.none` (no code; exits
+       rebuild constants from `t.consts`, and the precise flush already
+       does). The allocator gives no `.none` transient a register. One
+       O(n) `markBodyReads` pass replaced the O(n) per-call
+       `snapshotOnlyLoad`. Side effect: href-key konsts no longer take a
+       register either, so array3d, nbody and binary-trees traces
+       shrank.
+  - Result: IR differs from HEAD only by snapshot-needed konsts (array3d,
+    scalar, str_find_match), and those emit no code. Native sizes are
+    equal or smaller, EXCEPT +3 bytes per `Proto.id` check
+    (binary-trees, recursive-fib, spectral-norm). Adding `reg_live`
+    moved `Proto.id` from offset 112 to 136, past disp8. Bart accepted
+    it: the board shows nothing, and Zig's auto layout means moving the
+    declaration wouldn't help anyway.
+  - Board `bench/results/20260924-220310-cd25b25.tsv` vs
+    `20260924-184058-e587e28.tsv`: everything is within noise
+    (byte-identical benches swung ±5.8% in the same run).
+  - The `exit-snap:` jit-debug probe now lists each kept snapshot's
+    slots (`r<slot>=%<ref>`).
+  - **Antigravity code review: APPROVE WITH CHANGES. Both valid
+    findings are fixed:**
+    - `bc_liveness` `useAux`: a negative `aux` register now means every
+      register is live, instead of an `@intCast` that is UB in
+      ReleaseFast.
+    - `tropt` now marks LICM before liveness, so a hoisted
+      `int_of_float` no longer roots a snapshot it then drops.
+
+    Rejected: "commitExitSnap OOM should fall back" (the recorder aborts
+    on OOM there anyway) and "move reg_live to fix Proto.id" (auto
+    layout).
+  - New tests:
+    - tropt: a folded-guard snapshot is dropped; a hoisted exit roots
+      nothing (verified to fail without the fix); a shared vector is
+      remapped once;
+    - `compactSparse`;
+    - the `aux` register in liveness.
+  - Still to do: the native exit location map, and the finalize
+    exit-snapshot tests.
+  - Known cost, and it is by design (LuaJIT pays the same): a NON-konst
+    value kept only by a snapshot still gets a register and code. No
+    bench has one; every IR difference is a konst.
 
 ## Status 2026-09-24 (latest+27) — doc 55 §2 + §2d LANDED: fft 14.6× → 12.6× LJ, sparse −31%; silent switch is now data (no runtime code patching)
 

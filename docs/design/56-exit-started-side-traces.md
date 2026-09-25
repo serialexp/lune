@@ -1,6 +1,6 @@
 # 56 — Exit-started side traces (LuaJIT's side-trace mechanism) — Design
 
-Status: Phase 0 in progress; design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
+Status: Phase 1 in progress (snapshots landed, exit location map outstanding); design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
 Owner: Bart
 Last updated: 2026-09-24
 
@@ -63,11 +63,19 @@ consumes yet, so every program's output and trace set stays identical.
   Each probe lands in the phase that creates its event (none of these
   events exist yet). This bullet closes when the last one is in.
 - [ ] **Phase 1 — exit snapshots and exit locations (inert).**
-  - Boundary ordinals and sparse snapshots per bytecode boundary.
-  - Every guard and every sunk store carries its boundary ordinal.
-  - `tropt` keeps snapshot refs live and remaps them, and preserves the
-    ordinals.
-  - The native compiler records, per attachable exit, where each needed
+  - [x] Boundary ordinals and sparse snapshots per bytecode boundary
+    (`exitBoundary`/`commitExitSnap`, `Builder.addSparse`, rewind via
+    `Builder.mark`/`truncate` on the doc 47 peel fallback).
+  - [x] Every guard and every sunk store carries its boundary ordinal
+    (`IrInstr.ord`, `PendingStore.ord`).
+  - [x] Snapshots hold only bytecode-live slots (`Proto.reg_live`, §4.2
+    "Liveness").
+  - [x] `tropt` keeps snapshot refs live and remaps them, and preserves the
+    ordinals (a hoisted op loses its ordinal).
+  - [x] Finalize validates the snapshots against the committed stream
+    (`exitSnapshotsValid`) and drops them all on any defect; memory is in
+    `--jit-stats`.
+  - [ ] The native compiler records, per attachable exit, where each needed
     ref lives (register, spill, home or constant).
 - [ ] **Phase 2 — attachability and resume pc (inert).**
   `exitAttachable` and `exitResumePc`, including the branch fix-up and
@@ -321,8 +329,31 @@ Ordinary traces get, at each bytecode boundary:
 - **A boundary ordinal.** A monotonic `u16` counting bytecodes executed
   on the recorded path.
 - **A sparse snapshot.** The `.def` slots of the anchor window
-  (depth 0), each mapped to its ref, plus the resume pc of that
-  boundary. `.undef` slots are still coherent in the slab.
+  (depth 0) that are **live in the bytecode** at the resume pc, each
+  mapped to its ref, plus the resume pc of that boundary. `.undef`
+  slots are still coherent in the slab.
+
+  *Liveness (added during Phase 1).* Capturing every `.def` slot is
+  wrong: a snapshot ref is an optimizer liveness root, so a dead local
+  (written, never read again) would stop `tropt` from deleting it in
+  every trace. The first Phase 1 cut did exactly that; the doc 26
+  `.pure3` test caught it. LuaJIT drops dead slots per snapshot with a
+  forward bytecode scan (`snap_usedef`, `lj_snap.c:208`). Bart chose a
+  per-proto table instead: `bc_liveness.compute` runs a backward
+  dataflow over the bytecode CFG once, at compile time, and stores
+  `Proto.reg_live` (one bit per register per pc). It errs live
+  wherever it is unsure:
+  - registers captured by a child closure are live everywhere;
+  - multret consumers read up to the top of the window;
+  - writes with a dynamic extent (`call c=all_results`,
+    `vararg_spread`) kill nothing;
+  - loop ops kill their loop variable only on the taken edge.
+
+  A proto over 2^18 table words, or a hand-built one, has no table.
+  Its traces then carry **no** exit snapshots, so unknown liveness
+  never pins slots. Dead slots are left stale at an exit. That is the
+  same "tier noise" the loop-exit writeback already leaves above
+  `locals_watermark` (doc 21 masks it in final-state keyframes).
   `SnapshotSlot.slot` already exists "so a future sparse form is a
   validation change" (`trace_snapshot.zig:11`). Snapshot record ids
   do increase in construction order (`Builder.add` appends a record per

@@ -754,6 +754,16 @@ pub const IrInstr = struct {
     aux: i32 = 0,
     ty: ObsType = .unknown,
     snap: SnapIdx = 0,
+    /// Doc 56 §4.2: the BOUNDARY ORDINAL of the guest bytecode whose
+    /// recording emitted this instruction — a monotonic count of bytecodes
+    /// on the recorded path, one-based (0 = none: the entry prologue, a
+    /// deserialized trace, a precise trace, or an ordinal overflow). Sunk
+    /// stores carry the ordinal of the bytecode that DEFERRED them (stamped
+    /// at `finalize`), so "which sunk stores precede this guard" is
+    /// `store.ord < guard.ord` in one coordinate space that survives
+    /// `tropt` (DCE/CSE/compaction/LICM copy it verbatim). Fits the
+    /// struct's existing padding (`@sizeOf(IrInstr) <= 16`).
+    ord: u16 = 0,
 };
 
 /// The **post-increment resume/exit PC** recorded in a guard's `aux`, or null if

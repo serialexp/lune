@@ -1128,6 +1128,11 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     var active_xmm_len: usize = 0;
     for (t.instrs, 0..) |ins, i| {
         if (!isTransient(ins.op)) continue;
+        // A `.none` value (a konst only an href key or an exit snapshot
+        // names — proveKinds) carries no native value: `lower` emits nothing
+        // and nothing reads its loc, so it takes no register. Handing it one,
+        // even for a single instruction, would shift every later pick.
+        if (kinds[i] == .none) continue;
         // expire GP transients whose last use precedes i
         var w: usize = 0;
         for (active[0..active_len]) |e| {

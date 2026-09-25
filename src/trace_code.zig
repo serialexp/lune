@@ -430,6 +430,19 @@ pub const TraceCode = struct {
     /// entry replay (the historical contract) or per-bytecode precise deopt
     /// via `snapshots`. Arm/dispatch validation must check this, not infer it.
     deopt_mode: trace_snapshot.DeoptMode = .entry_replay,
+    /// Doc 56 §4.2: the SPARSE exit snapshots of an ordinary (`entry_replay`)
+    /// trace — per guard-bearing bytecode, the `.def` anchor-window slots
+    /// mapped to committed IR refs, resuming at that bytecode. Kept apart
+    /// from the precise `snapshots` above on purpose: `IrInstr.snap != 0`
+    /// means a PRECISE exit everywhere, and ordinary traces keep `snap == 0`.
+    /// A guard finds its snapshot through its `ord`: `exit_snap_by_ord[ord]`
+    /// (one-based; 0 = none; entry 0 is always 0). Fail-soft metadata: empty
+    /// (every exit non-attachable) on precise, peeled and deserialized traces,
+    /// on ordinal overflow, and when validation or allocation failed. Owned;
+    /// freed in `deinit`.
+    exit_snapshots: []trace_snapshot.Snapshot = &.{},
+    exit_snapshot_slots: []trace_snapshot.SnapshotSlot = &.{},
+    exit_snap_by_ord: []trace_ir.SnapIdx = &.{},
     /// Doc 48: eviction metadata ONLY — the record-time table identity behind
     /// each `guard_lane` on a slot_load-covered root, so widen-eviction
     /// (`laneWidenedPast`) fires only against the very table whose monotonic
@@ -453,6 +466,9 @@ pub const TraceCode = struct {
         if (self.bridge_cand.len != 0) gpa.free(self.bridge_cand);
         if (self.snapshots.len != 0) gpa.free(self.snapshots);
         if (self.snapshot_slots.len != 0) gpa.free(self.snapshot_slots);
+        if (self.exit_snapshots.len != 0) gpa.free(self.exit_snapshots);
+        if (self.exit_snapshot_slots.len != 0) gpa.free(self.exit_snapshot_slots);
+        if (self.exit_snap_by_ord.len != 0) gpa.free(self.exit_snap_by_ord);
         if (self.lane_pins.len != 0) gpa.free(self.lane_pins);
         self.* = undefined;
     }

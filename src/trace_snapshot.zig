@@ -150,6 +150,62 @@ pub const Builder = struct {
         return @intCast(self.records.items.len); // one-based
     }
 
+    /// Doc 56 §4.2: append one SPARSE exit snapshot (only the slots the
+    /// recording has written, ascending). Unlike `add`, interning compares
+    /// against the MOST RECENT vector only: consecutive guard-bearing
+    /// bytecodes that wrote nothing in between share a vector, and the cost
+    /// is O(len) per call rather than O(vectors × len) — an ordinary trace
+    /// can carry hundreds of exit snapshots, and recording cost must not
+    /// grow quadratically with trace length (Rule #20). `max_vectors` is
+    /// not consulted (records bound vectors); `max_records`/`max_slots` are,
+    /// before any allocation. Returns the one-based record index.
+    pub fn addSparse(self: *Builder, resume_pc: u32, register_count: u16, vec: []const SnapshotSlot) Error!SnapIdx {
+        if (self.records.items.len >= self.budget.max_records) return error.SnapshotLimit;
+        const begin_len: struct { u32, u32 } = blk: {
+            if (self.vectors.items.len != 0) {
+                const v = self.vectors.items[self.vectors.items.len - 1];
+                if (v.len == vec.len and slotVecEql(self.slots.items[v.begin..][0..v.len], vec))
+                    break :blk .{ v.begin, v.len };
+            }
+            if (self.slots.items.len + vec.len > self.budget.max_slots) return error.SnapshotLimit;
+            const begin: u32 = @intCast(self.slots.items.len);
+            try self.slots.appendSlice(self.gpa, vec);
+            try self.vectors.append(self.gpa, .{ .begin = begin, .len = @intCast(vec.len) });
+            break :blk .{ begin, @as(u32, @intCast(vec.len)) };
+        };
+        try self.records.append(self.gpa, .{
+            .resume_pc = resume_pc,
+            .slots_begin = begin_len[0],
+            .slots_len = begin_len[1],
+            .register_count = register_count,
+        });
+        return @intCast(self.records.items.len); // one-based
+    }
+
+    /// A rewind point (doc 56 §4.2): the builder's lengths at some moment of
+    /// recording. `truncate` drops everything added after it, so a recorder
+    /// rewind (doc 47's peel fallback) can discard the snapshots of the
+    /// truncated IR without discarding the earlier, still-valid ones.
+    pub const Mark = struct { records: u32, slots: u32, vectors: u32 };
+
+    pub fn mark(self: *const Builder) Mark {
+        return .{
+            .records = @intCast(self.records.items.len),
+            .slots = @intCast(self.slots.items.len),
+            .vectors = @intCast(self.vectors.items.len),
+        };
+    }
+
+    /// Drop every record, vector and slot added after `m` (keeps capacity).
+    pub fn truncate(self: *Builder, m: Mark) void {
+        std.debug.assert(m.records <= self.records.items.len);
+        std.debug.assert(m.slots <= self.slots.items.len);
+        std.debug.assert(m.vectors <= self.vectors.items.len);
+        self.records.items.len = m.records;
+        self.slots.items.len = m.slots;
+        self.vectors.items.len = m.vectors;
+    }
+
     /// Hand the accumulated arrays to the trace as owned slices (the builder
     /// stays reusable — `reset()` for the next candidate). The caller frees
     /// both via the same allocator (TraceCode.deinit / candidate error paths).
@@ -196,6 +252,84 @@ pub fn validate(
         }
     }
     return true;
+}
+
+/// Doc 56 §4.2: structural validation of SPARSE exit snapshots. Each
+/// record's vector lies inside the flat array, names strictly ascending
+/// slots below `register_count` (each at most once), and resumes inside the
+/// anchor proto's code. Returns false rather than an error (the finalizer
+/// drops the exit snapshots — they are fail-soft metadata, never a reason to
+/// refuse a trace).
+pub fn validateSparse(
+    snapshots: []const Snapshot,
+    snapshot_slots: []const SnapshotSlot,
+    code_len: u32,
+) bool {
+    for (snapshots) |s| {
+        if (s.resume_pc >= code_len) return false;
+        if (s.slots_begin > snapshot_slots.len) return false;
+        if (snapshot_slots.len - s.slots_begin < s.slots_len) return false;
+        const vec = snapshot_slots[s.slots_begin..][0..s.slots_len];
+        for (vec, 0..) |slot, k| {
+            if (slot.slot >= s.register_count) return false;
+            if (k != 0 and vec[k - 1].slot >= slot.slot) return false;
+        }
+    }
+    return true;
+}
+
+/// Doc 56 §4.2: keep only the records `by_ord` still names (`tropt` zeroes
+/// the ordinals whose every exit it removed), in ordinal order, and renumber
+/// `by_ord` to the compacted records. A vector shared by a run of kept
+/// records stays shared (vectors are only ever shared by consecutive
+/// records — `Builder.addSparse`). Returns null, touching nothing, when
+/// `by_ord` names a record outside `snapshots` or a vector outside
+/// `snapshot_slots` (the caller drops the exit snapshots — fail-soft
+/// metadata); `by_ord` is rewritten only after both allocations succeed, so
+/// an error leaves it untouched too. Nothing kept → empty slices, no
+/// allocation. O(ordinals + kept slots).
+pub fn compactSparse(
+    gpa: std.mem.Allocator,
+    snapshots: []const Snapshot,
+    snapshot_slots: []const SnapshotSlot,
+    by_ord: []SnapIdx,
+) std.mem.Allocator.Error!?Builder.Owned {
+    var n_recs: usize = 0;
+    var n_slots: usize = 0;
+    var last: ?Snapshot = null;
+    for (by_ord) |si| {
+        if (si == 0) continue;
+        if (si > snapshots.len) return null;
+        const r = snapshots[si - 1];
+        if (r.slots_begin > snapshot_slots.len or snapshot_slots.len - r.slots_begin < r.slots_len) return null;
+        n_recs += 1;
+        if (last) |l| if (l.slots_begin == r.slots_begin and l.slots_len == r.slots_len) continue;
+        last = r;
+        n_slots += r.slots_len;
+    }
+    if (n_recs == 0) return .{ .snapshots = &.{}, .snapshot_slots = &.{} };
+    const out_snaps = try gpa.alloc(Snapshot, n_recs);
+    errdefer gpa.free(out_snaps);
+    const out_slots = try gpa.alloc(SnapshotSlot, n_slots);
+    var k: usize = 0;
+    var pos: u32 = 0;
+    var new_begin: u32 = 0;
+    last = null;
+    for (by_ord) |*si| {
+        if (si.* == 0) continue;
+        const r = snapshots[si.* - 1];
+        const shared = if (last) |l| l.slots_begin == r.slots_begin and l.slots_len == r.slots_len else false;
+        if (!shared) {
+            @memcpy(out_slots[pos..][0..r.slots_len], snapshot_slots[r.slots_begin..][0..r.slots_len]);
+            new_begin = pos;
+            pos += r.slots_len;
+            last = r;
+        }
+        out_snaps[k] = .{ .resume_pc = r.resume_pc, .slots_begin = new_begin, .slots_len = r.slots_len, .register_count = r.register_count };
+        k += 1;
+        si.* = @intCast(k);
+    }
+    return .{ .snapshots = out_snaps, .snapshot_slots = out_slots };
 }
 
 /// Every ref a snapshot captures must already be defined when the op that
@@ -370,4 +504,149 @@ test "remapRefs rewrites through canon + new_index, structure untouched" {
     try testing.expectEqual(@as(Ref, 0), slots[1].ref); // 3 → canon 1 → new 0
     try testing.expectEqual(@as(u16, 0), slots[0].slot);
     try testing.expectEqual(@as(u16, 1), slots[1].slot);
+}
+
+test "addSparse shares only an identical PREVIOUS vector and keeps records distinct" {
+    var b = Builder.init(testing.allocator, .{});
+    defer b.deinit();
+    const v1 = [_]SnapshotSlot{ .{ .slot = 2, .ref = 5 }, .{ .slot = 7, .ref = 9 } };
+    const v2 = [_]SnapshotSlot{.{ .slot = 2, .ref = 6 }};
+    const empty = [_]SnapshotSlot{};
+
+    try testing.expectEqual(@as(SnapIdx, 1), try b.addSparse(3, 8, &v1));
+    try testing.expectEqual(@as(SnapIdx, 2), try b.addSparse(4, 8, &v1)); // shares
+    try testing.expectEqual(@as(usize, 2), b.slots.items.len);
+    try testing.expectEqual(b.records.items[0].slots_begin, b.records.items[1].slots_begin);
+
+    _ = try b.addSparse(5, 8, &v2); // novel
+    try testing.expectEqual(@as(usize, 3), b.slots.items.len);
+    // v1 again is NOT interned against the older copy (last-vector-only).
+    _ = try b.addSparse(6, 8, &v1);
+    try testing.expectEqual(@as(usize, 5), b.slots.items.len);
+
+    // An empty vector (nothing written yet) is a legal record.
+    _ = try b.addSparse(0, 8, &empty);
+    try testing.expectEqual(@as(u32, 0), b.records.items[4].slots_len);
+    try testing.expectEqual(@as(usize, 5), b.records.items.len);
+    try testing.expectEqual(@as(u32, 6), b.records.items[3].resume_pc);
+
+    const owned = try b.finalize(testing.allocator);
+    defer owned.deinit(testing.allocator);
+    try testing.expect(validateSparse(owned.snapshots, owned.snapshot_slots, 10));
+}
+
+test "addSparse refuses at max_records / max_slots before any copy, ignores max_vectors" {
+    const a = [_]SnapshotSlot{ .{ .slot = 0, .ref = 1 }, .{ .slot = 1, .ref = 2 } };
+    const c = [_]SnapshotSlot{ .{ .slot = 0, .ref = 3 }, .{ .slot = 1, .ref = 4 } };
+    {
+        var b = Builder.init(testing.allocator, .{ .max_records = 2 });
+        defer b.deinit();
+        _ = try b.addSparse(0, 2, &a);
+        _ = try b.addSparse(1, 2, &a);
+        try testing.expectError(error.SnapshotLimit, b.addSparse(2, 2, &a));
+    }
+    {
+        var b = Builder.init(testing.allocator, .{ .max_slots = 4 });
+        defer b.deinit();
+        _ = try b.addSparse(0, 2, &a);
+        _ = try b.addSparse(1, 2, &c); // exactly 4
+        _ = try b.addSparse(2, 2, &c); // shared with previous → no slot charge
+        try testing.expectError(error.SnapshotLimit, b.addSparse(3, 2, &a));
+        try testing.expectEqual(@as(usize, 4), b.slots.items.len);
+        try testing.expectEqual(@as(usize, 3), b.records.items.len);
+    }
+    {
+        var b = Builder.init(testing.allocator, .{ .max_vectors = 1 });
+        defer b.deinit();
+        _ = try b.addSparse(0, 2, &a);
+        _ = try b.addSparse(1, 2, &c);
+        _ = try b.addSparse(2, 2, &a);
+        try testing.expectEqual(@as(usize, 3), b.records.items.len);
+    }
+}
+
+test "mark/truncate drops only what came after the mark" {
+    var b = Builder.init(testing.allocator, .{});
+    defer b.deinit();
+    const a = [_]SnapshotSlot{.{ .slot = 0, .ref = 1 }};
+    const c = [_]SnapshotSlot{.{ .slot = 0, .ref = 2 }};
+    _ = try b.addSparse(0, 2, &a);
+    const m = b.mark();
+    _ = try b.addSparse(1, 2, &a); // shared
+    _ = try b.addSparse(2, 2, &c); // novel
+    b.truncate(m);
+    try testing.expectEqual(@as(usize, 1), b.records.items.len);
+    try testing.expectEqual(@as(usize, 1), b.slots.items.len);
+    try testing.expectEqual(@as(usize, 1), b.vectors.items.len);
+    // Sharing resumes against the surviving last vector.
+    try testing.expectEqual(@as(SnapIdx, 2), try b.addSparse(3, 2, &a));
+    try testing.expectEqual(@as(usize, 1), b.slots.items.len);
+}
+
+test "validateSparse accepts ascending subsets, rejects disorder, dups, range and pc" {
+    const slots = [_]SnapshotSlot{
+        .{ .slot = 1, .ref = 3 },
+        .{ .slot = 4, .ref = 4 },
+    };
+    const good = [_]Snapshot{
+        .{ .resume_pc = 5, .slots_begin = 0, .slots_len = 2, .register_count = 5 },
+        .{ .resume_pc = 6, .slots_begin = 1, .slots_len = 1, .register_count = 5 },
+        .{ .resume_pc = 7, .slots_begin = 2, .slots_len = 0, .register_count = 5 },
+    };
+    try testing.expect(validateSparse(&good, &slots, 10));
+    // Slot 4 is outside a 4-register window.
+    const narrow = [_]Snapshot{.{ .resume_pc = 5, .slots_begin = 0, .slots_len = 2, .register_count = 4 }};
+    try testing.expect(!validateSparse(&narrow, &slots, 10));
+    // resume_pc out of code.
+    const bad_pc = [_]Snapshot{.{ .resume_pc = 10, .slots_begin = 0, .slots_len = 2, .register_count = 5 }};
+    try testing.expect(!validateSparse(&bad_pc, &slots, 10));
+    // Vector escapes the flat array.
+    const bad_range = [_]Snapshot{.{ .resume_pc = 0, .slots_begin = 1, .slots_len = 2, .register_count = 5 }};
+    try testing.expect(!validateSparse(&bad_range, &slots, 10));
+    const bad_begin = [_]Snapshot{.{ .resume_pc = 0, .slots_begin = 3, .slots_len = 0, .register_count = 5 }};
+    try testing.expect(!validateSparse(&bad_begin, &slots, 10));
+    // Descending and duplicated slots.
+    const desc_slots = [_]SnapshotSlot{ .{ .slot = 4, .ref = 3 }, .{ .slot = 1, .ref = 4 } };
+    const dup_slots = [_]SnapshotSlot{ .{ .slot = 1, .ref = 3 }, .{ .slot = 1, .ref = 4 } };
+    const two = [_]Snapshot{.{ .resume_pc = 0, .slots_begin = 0, .slots_len = 2, .register_count = 5 }};
+    try testing.expect(!validateSparse(&two, &desc_slots, 10));
+    try testing.expect(!validateSparse(&two, &dup_slots, 10));
+}
+
+test "compactSparse keeps the named records in order, keeps runs shared, renumbers by_ord" {
+    const gpa = testing.allocator;
+    // Records 1 and 2 share vector [0,2); record 3 owns [2,3).
+    const snaps = [_]Snapshot{
+        .{ .resume_pc = 4, .slots_begin = 0, .slots_len = 2, .register_count = 8 },
+        .{ .resume_pc = 5, .slots_begin = 0, .slots_len = 2, .register_count = 8 },
+        .{ .resume_pc = 6, .slots_begin = 2, .slots_len = 1, .register_count = 8 },
+    };
+    const slots = [_]SnapshotSlot{ .{ .slot = 0, .ref = 7 }, .{ .slot = 3, .ref = 8 }, .{ .slot = 5, .ref = 9 } };
+
+    // Drop the FIRST of the shared run: its partner still owns the vector.
+    var by_ord = [_]SnapIdx{ 0, 0, 2, 0, 3 };
+    const o = (try compactSparse(gpa, &snaps, &slots, &by_ord)).?;
+    defer o.deinit(gpa);
+    try testing.expectEqualSlices(SnapIdx, &.{ 0, 0, 1, 0, 2 }, &by_ord);
+    try testing.expectEqual(@as(usize, 2), o.snapshots.len);
+    try testing.expectEqualSlices(SnapshotSlot, &slots, o.snapshot_slots);
+    try testing.expectEqual(@as(u32, 5), o.snapshots[0].resume_pc);
+    try testing.expectEqual(@as(u32, 0), o.snapshots[0].slots_begin);
+    try testing.expectEqual(@as(u32, 2), o.snapshots[1].slots_begin);
+
+    // Keep the whole shared run: the vector is copied once, not twice.
+    var by_ord2 = [_]SnapIdx{ 0, 1, 2 };
+    const o2 = (try compactSparse(gpa, &snaps, &slots, &by_ord2)).?;
+    defer o2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), o2.snapshot_slots.len);
+    try testing.expectEqual(o2.snapshots[0].slots_begin, o2.snapshots[1].slots_begin);
+
+    // Nothing kept → empty, no allocation; an out-of-range record → null,
+    // with by_ord untouched.
+    var none = [_]SnapIdx{ 0, 0 };
+    const o3 = (try compactSparse(gpa, &snaps, &slots, &none)).?;
+    try testing.expectEqual(@as(usize, 0), o3.snapshots.len);
+    var bad = [_]SnapIdx{ 0, 4 };
+    try testing.expect((try compactSparse(gpa, &snaps, &slots, &bad)) == null);
+    try testing.expectEqualSlices(SnapIdx, &.{ 0, 4 }, &bad);
 }

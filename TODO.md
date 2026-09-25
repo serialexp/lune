@@ -2,6 +2,23 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Doc 56 Phase 2: multret pairs are not resumable mid-pair
+
+- [ ] `exitAttachable` must refuse an exit whose resume pc is the CONSUMER
+      half of a multret pair (a `call`/`ret` with `b == all_results` right
+      after a `call c=all_results` or `vararg_spread`). Tier-0 needs the
+      transient `reg_top`/`reg_top_pending`, which no snapshot carries, so
+      resuming there reads a garbage count. Doc 56 §4.3 does not list this.
+      Pin it with a test when Phase 2 lands.
+
+## Loop-exit writeback could use bytecode liveness instead of the watermark
+
+- [ ] `trace_finalize` drops loop-end writebacks above `locals_watermark`, a
+      lexical-scope heuristic. The doc 56 per-proto `Proto.reg_live` table
+      gives real liveness at the loop-exit pc and would drop more dead slots
+      (and keep none that are live), on every trace. Evaluate after doc 56
+      Phase 1 lands.
+
 ## Multi-loop trace roots need loop-done ownership
 
 - [ ] Before enabling any recorder path that can put guards from more than one

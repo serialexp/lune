@@ -13,7 +13,7 @@ const Scratch = struct {
     exit_prov: std.ArrayListUnmanaged(?types.ExitProvenance) = .empty,
     rec_path: std.ArrayListUnmanaged(types.ProgramPoint) = .empty,
     lane_pins: std.ArrayListUnmanaged(code.LanePin) = .empty,
-    pending_stores: std.ArrayListUnmanaged(struct { op: ir.IrOp, aref: ir.Ref, value: ir.Ref, lane_ord: i32 }) = .empty,
+    pending_stores: std.ArrayListUnmanaged(struct { op: ir.IrOp, aref: ir.Ref, value: ir.Ref, lane_ord: i32, ord: u16 = 0 }) = .empty,
     reg_map: []const struct { state: enum { undef, input, def }, ref: ir.Ref } = &.{},
     peel: ?struct { slots: []const struct { phi_ref: ?ir.Ref } } = null,
     guard_gc_ref: ?ir.Ref = null,
@@ -31,9 +31,16 @@ const Scratch = struct {
     // builder's snapshot arrays to the code. The fixture stays entry-replay.
     precise: bool = false,
     snap_builder: @import("trace_snapshot.zig").Builder = .{ .gpa = undefined, .budget = .{} },
+    // Doc 56 §4.2: the ordinary recording's exit-snapshot state. The
+    // default fixture has no body bytecodes (`cur_ord == 0`), so finalize
+    // attaches no exit snapshots.
+    snap_builder_init: bool = false,
+    cur_ord: u16 = 0,
+    exit_ord_overflow: bool = false,
+    exit_snap_by_ord: std.ArrayListUnmanaged(ir.SnapIdx) = .empty,
 
     fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
-        inline for (.{ "instrs", "consts", "entry_slots", "input_seeds", "exit_prov", "rec_path", "pending_stores", "lane_pins" }) |field|
+        inline for (.{ "instrs", "consts", "entry_slots", "input_seeds", "exit_prov", "rec_path", "pending_stores", "lane_pins", "exit_snap_by_ord" }) |field|
             @field(self, field).deinit(gpa);
     }
 };

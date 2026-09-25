@@ -334,6 +334,14 @@ pub const PendingLinkClose = struct {
     /// Snapshot of `reg_map[0..anchor_num_registers]` at peel entry.
     /// Allocated with gpa at peel start; freed on rewind or normal close.
     saved_reg_map: []RegSlot,
+    /// Doc 56 §4.2: exit-snapshot rewind state. The `for_prep` bytecode's
+    /// boundary snapshot is committed BEFORE these are taken, so the
+    /// re-emitted close guards (same bytecode, same ordinal) still find it.
+    saved_snap_mark: trace_snapshot.Builder.Mark,
+    saved_ord: u16,
+    saved_ord_overflow: bool,
+    saved_snap_exhausted: bool,
+    saved_by_ord_len: u32,
 
     pub const Phase = enum {
         await_initial_entry,
@@ -394,6 +402,12 @@ pub const PendingStore = struct {
     /// observed truth for the loop-varying (`.may`) key arm. Unused for
     /// other store ops.
     key_idx: i64 = 0,
+    /// Doc 56 §4.2: the BOUNDARY ORDINAL of the bytecode that deferred this
+    /// store (`RecordingSession.cur_ord`), stamped onto the sunk IR store at
+    /// `finalize`. Deliberately no default: every deferral site must say
+    /// which bytecode the store belongs to, or a resume-coherent exit would
+    /// apply it at the wrong program point.
+    ord: u16,
 };
 
 pub const AliasClass = enum { must, no, may };
@@ -890,6 +904,52 @@ pub const RecordingSession = struct {
     /// eager guard_gc) has been emitted yet this recording. Deferred to the
     /// first body `recordInstr`; cleared in `reset`.
     precise_prologue_done: bool = false,
+    /// Doc 56 §4.2 (ORDINARY recordings): the current guest bytecode's
+    /// boundary ordinal — one-based, bumped once per `recordInstr`; 0 before
+    /// the first body bytecode (arm-time ops). `emit` stamps it on every op
+    /// and every deferral stamps it on its `PendingStore`, so guards and sunk
+    /// stores share one program-order coordinate that survives `tropt`.
+    /// Precise recordings leave it 0 (they carry full per-bytecode snapshots).
+    cur_ord: u16 = 0,
+    /// The ordinal space saturated (> 65535 bytecodes): later bytecodes get
+    /// no ordinal and `finalize` drops every exit snapshot (fail closed —
+    /// the exits stay anchor-coherent, never attachable).
+    exit_ord_overflow: bool = false,
+    /// The current bytecode opened an eligible boundary (resume pc
+    /// `exit_resume_pc`) whose snapshot is not committed yet. It is built
+    /// and committed at the bytecode's first side-exit guard, so bytecodes
+    /// that cannot exit cost no snapshot at all (LuaJIT likewise snapshots
+    /// only where a guard needs one).
+    exit_snap_pending: bool = false,
+    exit_resume_pc: u32 = 0,
+    /// Lazy capture's undo state, one entry per anchor-window slot: when
+    /// `exit_undo_stamp[slot] == exit_seq`, the CURRENT bytecode rebound the
+    /// slot while its snapshot was pending and `exit_undo_prev[slot]` is the
+    /// binding it had at the boundary (saved on the first write only). The
+    /// commit reads `reg_map` through it, so the snapshot is exactly the
+    /// boundary state even when the bytecode writes a slot before its first
+    /// guard. `exit_seq` bumps per boundary and never rewinds (a peel rewind
+    /// cannot resurrect stale stamps); the stamps are cleared per recording.
+    exit_undo_prev: []RegSlot = &.{},
+    exit_undo_stamp: []u32 = &.{},
+    exit_seq: u32 = 0,
+    /// Bit `s` set ⇔ anchor-window slot `s` is `.def` in `reg_map` (slots
+    /// only ever become `.def` during a recording, except a peel rewind,
+    /// which recomputes it). ANDed with the resume pc's liveness row, it
+    /// makes a commit O(words + captured slots) instead of O(registers) —
+    /// a 60k-register proto would otherwise scan its whole window per
+    /// guarded bytecode (Rule #20).
+    exit_def_bits: []u64 = &.{},
+    /// The snapshot budget refused a commit: every LATER boundary of this
+    /// recording skips capture entirely (its exits stay non-attachable), so
+    /// a budget-exhausted recording stops paying O(registers) per guarded
+    /// bytecode for vectors the builder would refuse anyway.
+    exit_snap_exhausted: bool = false,
+    /// ordinal → one-based exit snapshot index into `snap_builder` (0 = the
+    /// bytecode has no snapshot: it emitted no side-exit guard, ran inside an
+    /// inlined frame, or hit the snapshot budget). Index 0 is the "no
+    /// ordinal" entry and is always 0.
+    exit_snap_by_ord: std.ArrayListUnmanaged(trace_ir.SnapIdx) = .empty,
 
     pub fn abort(self: *RecordingSession, reason: AbortReason) void {
         if (!self.active) return;
@@ -935,6 +995,18 @@ pub const RecordingSession = struct {
         // Restore side-effect flags that body recording may have set.
         self.recorded_global_seed = plc.saved_global_seed;
         self.recorded_global_store = plc.saved_global_store;
+        // Doc 56 §4.2: drop the truncated bytecodes' exit snapshots and
+        // ordinals. The re-emitted close below belongs to the `for_prep`
+        // bytecode again (same ordinal), whose snapshot was committed before
+        // the mark was taken.
+        if (self.snap_builder_init) self.snap_builder.truncate(plc.saved_snap_mark);
+        self.exit_snap_by_ord.items.len = plc.saved_by_ord_len;
+        self.cur_ord = plc.saved_ord;
+        self.exit_ord_overflow = plc.saved_ord_overflow;
+        // The restored `reg_map` may have un-defined slots the peel defined.
+        if (self.exit_def_bits.len != 0 and self.cur_ord != 0) self.recomputeExitDefBits();
+        self.exit_snap_exhausted = plc.saved_snap_exhausted;
+        self.exit_snap_pending = false;
         // Purge any guarded_refs whose GUARD instruction was truncated. The
         // map value is the guard's own index — never the guarded ref's, which
         // is always lower: a ref below the rewind point whose guard sat above
@@ -1148,24 +1220,18 @@ pub const RecordingSession = struct {
                 error.SnapshotLimit => return self.abort(.snapshot_limit),
                 error.OutOfMemory => return self.abort(.alloc),
             };
+        } else {
+            self.exitBoundary(proto, pc) catch return self.abort(.alloc);
         }
         self.recordOne(instr, regs, proto, pc, resolved) catch self.abort(.alloc);
     }
 
-    /// Doc 45 D2: emit a PRECISE recording's entry prologue — force the full
-    /// entry `slot_load` map (every anchor-window register, ascending) so
-    /// unwritten slots keep a ref to their ORIGINAL entry values in every later
-    /// snapshot; then emit the eager `guard_gc` (doc 45 D4: after the entry-load
-    /// block, before ALL effects — `aux` stays 0 for a nonallocating body;
-    /// finalize stamps the real bound). Run lazily at the FIRST body
-    /// `recordInstr` (not at `arm` — an eager emit would make
-    /// `maybeCloseAtAnchor` close an empty-body trace). Everything emitted here
-    /// carries `snap == 0`: prologue/seed failures remain pre-body ENTRY
-    /// failures, not mid-body deopts.
-    fn beginPreciseInner(self: *RecordingSession) !void {
-        // Builder + scratch are reusable across recordings (Z-4), sized to
-        // the anchor window. The budget is re-read per recording so tests can
-        // inject a smaller one.
+    /// Size the reusable snapshot builder + scratch for this recording (Z-4:
+    /// reset between recordings, no per-iteration allocation). The budget is
+    /// re-read per recording so tests can inject a smaller one. Shared by the
+    /// precise prologue (doc 45) and the ordinary exit-snapshot capture
+    /// (doc 56) — a recording is one or the other, never both.
+    fn prepareSnapBuilder(self: *RecordingSession) std.mem.Allocator.Error!void {
         if (!self.snap_builder_init) {
             self.snap_builder = trace_snapshot.Builder.init(self.gpa, self.options.snapshot_budget);
             self.snap_builder_init = true;
@@ -1179,6 +1245,152 @@ pub const RecordingSession = struct {
             if (self.snap_scratch.len != 0) self.gpa.free(self.snap_scratch);
             self.snap_scratch = replacement;
         }
+    }
+
+    /// Doc 56 §4.2: open an ORDINARY recording's guest-bytecode boundary —
+    /// bump the ordinal and, when the boundary is eligible, mark its
+    /// snapshot pending. O(1): nothing is copied here. The snapshot is built
+    /// only if the bytecode reaches a side-exit guard (`commitExitSnap`),
+    /// from `reg_map` read through the undo log that `noteSlotWrite` fills
+    /// if the bytecode rebinds a slot first. A boundary is eligible only in
+    /// the anchor proto's own frame (exits inside an inlined frame are
+    /// deferred until frame reconstruction exists, doc 56 "Defer") and with
+    /// a liveness table (unknown liveness must never pin every slot).
+    fn exitBoundary(self: *RecordingSession, proto: *const Proto, pc: u32) std.mem.Allocator.Error!void {
+        self.exit_snap_pending = false;
+        if (self.exit_ord_overflow) return;
+        if (self.cur_ord == std.math.maxInt(u16)) {
+            self.exit_ord_overflow = true;
+            return;
+        }
+        if (self.cur_ord == 0) {
+            try self.prepareSnapBuilder();
+            try self.prepareExitCapture();
+            try self.exit_snap_by_ord.append(self.gpa, 0); // ordinal 0: "none"
+        }
+        self.cur_ord += 1;
+        try self.exit_snap_by_ord.append(self.gpa, 0);
+        if (self.inline_depth != 0 or self.exit_snap_exhausted) return;
+        // `pc` is post-increment; 0 names no bytecode (synthetic recorder
+        // drives in unit tests), so there is no resume point to snapshot —
+        // the bytecode's exits simply stay non-attachable.
+        if (pc == 0) return;
+        if (proto != self.anchor.proto or self.base_off != 0) return;
+        // The liveness row must cover the whole anchor window (it always
+        // does in production: the window IS `proto.num_registers`).
+        if (self.anchor_num_registers != proto.num_registers) return;
+        if (!proto.reg_live.available() or pc - 1 >= proto.code.len) return;
+        self.exit_resume_pc = pc - 1; // resume at the CURRENT bytecode
+        self.exit_seq +%= 1;
+        if (self.exit_seq == 0) {
+            // Wrapped (after 2^32 boundaries): restart the stamp space.
+            @memset(self.exit_undo_stamp, 0);
+            self.exit_seq = 1;
+        }
+        self.exit_snap_pending = true;
+    }
+
+    /// Size and clear the lazy capture's per-slot stamps for this recording
+    /// (Z-4: reused across recordings; O(registers) once per recording).
+    fn prepareExitCapture(self: *RecordingSession) std.mem.Allocator.Error!void {
+        const n: usize = self.anchor_num_registers;
+        if (self.exit_undo_stamp.len != n) {
+            const stamps = try self.gpa.alloc(u32, n);
+            errdefer self.gpa.free(stamps);
+            const prevs = try self.gpa.alloc(RegSlot, n);
+            errdefer self.gpa.free(prevs);
+            const defs = try self.gpa.alloc(u64, (n + 63) / 64);
+            if (self.exit_undo_stamp.len != 0) self.gpa.free(self.exit_undo_stamp);
+            if (self.exit_undo_prev.len != 0) self.gpa.free(self.exit_undo_prev);
+            if (self.exit_def_bits.len != 0) self.gpa.free(self.exit_def_bits);
+            self.exit_undo_stamp = stamps;
+            self.exit_undo_prev = prevs;
+            self.exit_def_bits = defs;
+        }
+        @memset(self.exit_undo_stamp, 0);
+        self.exit_seq = 0;
+        self.recomputeExitDefBits();
+    }
+
+    /// Rebuild `exit_def_bits` from `reg_map` (once per recording, and after
+    /// a peel rewind restores `reg_map`). O(registers).
+    fn recomputeExitDefBits(self: *RecordingSession) void {
+        @memset(self.exit_def_bits, 0);
+        for (self.reg_map[0..self.exit_undo_stamp.len], 0..) |s, slot| {
+            if (s.state == .def) self.exit_def_bits[slot / 64] |= @as(u64, 1) << @intCast(slot % 64);
+        }
+    }
+
+    /// Doc 56 §4.2: the current bytecode is about to rebind anchor-window
+    /// slot `abs`. While its boundary snapshot is pending, save the slot's
+    /// boundary binding (first write per slot only) so the lazy commit still
+    /// sees the state before this bytecode. O(1), no allocation.
+    fn noteSlotWrite(self: *RecordingSession, abs: usize) void {
+        // The capture state is (re)built at this recording's first boundary
+        // (`prepareExitCapture` recomputes the def bits from `reg_map`), so
+        // before it — and for inlined-callee slots — there is nothing to do.
+        if (self.cur_ord == 0 or abs >= self.exit_undo_stamp.len) return;
+        self.exit_def_bits[abs / 64] |= @as(u64, 1) << @intCast(abs % 64);
+        if (!self.exit_snap_pending) return;
+        if (self.exit_undo_stamp[abs] == self.exit_seq) return;
+        self.exit_undo_stamp[abs] = self.exit_seq;
+        self.exit_undo_prev[abs] = self.reg_map[abs];
+    }
+
+    /// Doc 56 §4.2: build and commit the current bytecode's boundary
+    /// snapshot (idempotent; no-op when nothing is pending): the `.def`
+    /// anchor-window slots at the boundary that tier-0 may still READ from
+    /// the resume pc (`Proto.reg_live`, the `snap_usedef` analogue).
+    /// `.undef`/`.input` slots are still coherent in the slab; dead `.def`
+    /// slots are left stale on purpose — a snapshot ref is a `tropt`
+    /// liveness root, so capturing a dead local would cost DCE in every
+    /// trace. O(registers) per committed snapshot, as LuaJIT's
+    /// `snapshot_slots`. The snapshot budget is fail-soft: over it, this and
+    /// later exits simply have no snapshot and stay non-attachable — never
+    /// an abort (doc 56 §4.2 "Budgets").
+    fn commitExitSnap(self: *RecordingSession) std.mem.Allocator.Error!void {
+        if (!self.exit_snap_pending) return;
+        self.exit_snap_pending = false;
+        const rpc = self.exit_resume_pc;
+        const n = self.anchor_num_registers;
+        const live_row = self.anchor.proto.reg_live.row(rpc);
+        // Candidates: slots `.def` NOW and live at the resume pc, ascending.
+        // A slot this bytecode rebound reads its saved BOUNDARY binding; one
+        // that was not `.def` at the boundary is skipped (writes only ever
+        // make a slot `.def`, so every boundary-`.def` slot is `.def` now).
+        var len: u16 = 0;
+        for (self.exit_def_bits, live_row, 0..) |d, l, wi| {
+            var m = d & l;
+            while (m != 0) : (m &= m - 1) {
+                const slot: usize = wi * 64 + @ctz(m);
+                const s = if (self.exit_undo_stamp[slot] == self.exit_seq) self.exit_undo_prev[slot] else self.reg_map[slot];
+                if (s.state != .def) continue;
+                self.snap_scratch[len] = .{ .slot = @intCast(slot), .ref = s.ref };
+                len += 1;
+            }
+        }
+        const idx = self.snap_builder.addSparse(rpc, n, self.snap_scratch[0..len]) catch |e| switch (e) {
+            error.SnapshotLimit => {
+                self.exit_snap_exhausted = true;
+                return;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        self.exit_snap_by_ord.items[self.cur_ord] = idx;
+    }
+
+    /// Doc 45 D2: emit a PRECISE recording's entry prologue — force the full
+    /// entry `slot_load` map (every anchor-window register, ascending) so
+    /// unwritten slots keep a ref to their ORIGINAL entry values in every later
+    /// snapshot; then emit the eager `guard_gc` (doc 45 D4: after the entry-load
+    /// block, before ALL effects — `aux` stays 0 for a nonallocating body;
+    /// finalize stamps the real bound). Run lazily at the FIRST body
+    /// `recordInstr` (not at `arm` — an eager emit would make
+    /// `maybeCloseAtAnchor` close an empty-body trace). Everything emitted here
+    /// carries `snap == 0`: prologue/seed failures remain pre-body ENTRY
+    /// failures, not mid-body deopts.
+    fn beginPreciseInner(self: *RecordingSession) !void {
+        try self.prepareSnapBuilder();
         var slot: u16 = 0;
         while (slot < self.anchor_num_registers) : (slot += 1) _ = try self.refOf(slot);
         self.guard_gc_ref = try self.emit(.{ .op = .guard_gc });
@@ -1428,6 +1640,11 @@ pub const RecordingSession = struct {
         // runs before any boundary exists (`cur_snap == 0`), which is exactly
         // the entry-replay marker those pre-body failures need.
         if (self.precise) ins_mut.snap = self.cur_snap;
+        // Doc 56 §4.2: every op carries its bytecode's boundary ordinal
+        // (dead metadata on ops that cannot exit); the bytecode's first
+        // side-exit guard commits the boundary snapshot it will resume from.
+        ins_mut.ord = self.cur_ord;
+        if (self.exit_snap_pending and trace_ir.isSideExitGuardOp(ins_mut.op)) try self.commitExitSnap();
         const ref: Ref = @intCast(self.instrs.items.len);
         try self.instrs.append(self.gpa, ins_mut);
         // Grow the exit-provenance table in lockstep (A-i.1): one `null` per append,
@@ -1517,6 +1734,7 @@ pub const RecordingSession = struct {
                         });
                         ps.rebound = true;
                         ps.phi_ref = phi_ref;
+                        self.noteSlotWrite(abs); // doc 56 §4.2: boundary binding
                         s.* = .{ .ref = phi_ref, .state = .def, .entry_kind = s.entry_kind };
                         return phi_ref;
                     }
@@ -1584,6 +1802,7 @@ pub const RecordingSession = struct {
         if (self.peel) |*p| {
             if (abs < self.anchor_num_registers) p.slots[abs].rebound = true;
         }
+        self.noteSlotWrite(abs); // doc 56 §4.2: keep the boundary binding
         const s = &self.reg_map[abs];
         s.* = .{ .ref = ref, .state = .def, .entry_kind = s.entry_kind };
     }
@@ -2332,6 +2551,7 @@ pub const RecordingSession = struct {
                 .lane_ord = lane_ord,
                 .tab_obj = vtab.asHeap(),
                 .key_idx = idx,
+                .ord = self.cur_ord,
             });
         } else {
             _ = try self.emit(.{ .op = .astore, .a = ref, .b = rval, .aux = lane_ord });
@@ -2842,6 +3062,7 @@ pub const RecordingSession = struct {
                 .lane_ord = 0,
                 .op = .hstore,
                 .tab_obj = vtab.asHeap(),
+                .ord = self.cur_ord,
             });
         } else {
             _ = try self.emit(.{ .op = .hstore, .a = ref, .b = rval });
@@ -3368,6 +3589,10 @@ pub const RecordingSession = struct {
                 // Save rewind state BEFORE emitting any IR so that a mid-body
                 // abort can truncate back and close `.link` immediately.
                 const n_regs = self.anchor_num_registers;
+                // Doc 56 §4.2: commit this bytecode's boundary snapshot now —
+                // the scratch is overwritten by the peel's bytecodes, and a
+                // rewind re-emits this bytecode's guards, which resume here.
+                try self.commitExitSnap();
                 const saved_regs = self.gpa.dupe(RegSlot, self.reg_map[0..n_regs]) catch
                     return; // OOM → fall through to the normal `.link` close below
                 const rewind_ir = @as(u32, @intCast(self.instrs.items.len));
@@ -3396,6 +3621,11 @@ pub const RecordingSession = struct {
                     .saved_global_seed = self.recorded_global_seed,
                     .saved_global_store = self.recorded_global_store,
                     .saved_reg_map = saved_regs,
+                    .saved_snap_mark = if (self.snap_builder_init) self.snap_builder.mark() else .{ .records = 0, .slots = 0, .vectors = 0 },
+                    .saved_ord = self.cur_ord,
+                    .saved_ord_overflow = self.exit_ord_overflow,
+                    .saved_snap_exhausted = self.exit_snap_exhausted,
+                    .saved_by_ord_len = @intCast(self.exit_snap_by_ord.items.len),
                 };
                 return;
             }
@@ -4336,7 +4566,7 @@ pub const RecordingSession = struct {
         const np = try self.emit(.{ .op = .scap_int, .a = m, .b = @intCast(gc.MatchScratch.slot_next_pos), .ty = .int });
         // Doc 45 D3: no sunk stores on a precise candidate (see astore).
         if (self.precise) return self.abort(.nyi_opcode);
-        try self.pending_stores.append(self.gpa, .{ .op = .sgm_setpos, .aref = state_ref, .value = np, .lane_ord = 0 });
+        try self.pending_stores.append(self.gpa, .{ .op = .sgm_setpos, .aref = state_ref, .value = np, .lane_ord = 0, .ord = self.cur_ord });
     }
 
     /// `tonumber(v[, base])` — konst arguments fold at record time through
@@ -5250,6 +5480,7 @@ pub const RecordingSession = struct {
                 .value = rval,
                 .lane_ord = 0,
                 .op = .ustore,
+                .ord = self.cur_ord,
             });
         } else {
             _ = try self.emit(.{ .op = .ustore, .a = uref, .b = rval });
@@ -5513,6 +5744,10 @@ pub const RecordingSession = struct {
         if (self.reg_map.len != 0) gpa.free(self.reg_map);
         if (self.snap_scratch.len != 0) gpa.free(self.snap_scratch);
         if (self.snap_builder_init) self.snap_builder.deinit();
+        self.exit_snap_by_ord.deinit(gpa);
+        if (self.exit_undo_prev.len != 0) gpa.free(self.exit_undo_prev);
+        if (self.exit_undo_stamp.len != 0) gpa.free(self.exit_undo_stamp);
+        if (self.exit_def_bits.len != 0) gpa.free(self.exit_def_bits);
     }
 
     /// Clear the buffer and arm a fresh recording for `anchor` over a frame with
@@ -5556,6 +5791,11 @@ pub const RecordingSession = struct {
         self.force_ordinary = false; // A1' (task 27): arm() sets it from the pending's policy
         self.cur_snap = 0; // doc 45 D2: no boundary exists until the first precise bytecode
         self.precise_prologue_done = false; // doc 45 D2: prologue emitted at first body instr
+        self.cur_ord = 0; // doc 56 §4.2: first body bytecode opens ordinal 1
+        self.exit_ord_overflow = false;
+        self.exit_snap_exhausted = false;
+        self.exit_snap_pending = false;
+        self.exit_snap_by_ord.clearRetainingCapacity();
         self.pending_stores.clearRetainingCapacity();
         self.alloc_count = 0;
         self.guard_gc_ref = null;
@@ -5600,6 +5840,106 @@ test "recorder failed resize stays inactive and retains valid storage" {
     try testing.expectEqual(old_map.ptr, rec.reg_map.ptr);
     try rec.reset(testing.allocator, anchor, 3);
     try testing.expect(rec.active);
+}
+
+test "doc 56 §4.2: lazy exit capture snapshots the BOUNDARY binding of a slot rebound before the first guard" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    // Three bytecodes, every register live everywhere (a hand-built table).
+    const bits = [_]u64{ 0b11, 0b11, 0b11 };
+    const proto = Proto{
+        .code = &.{ Instr.op0(.halt), Instr.op0(.halt), Instr.op0(.halt) },
+        .name = "lazy",
+        .num_registers = 2,
+        .reg_live = .{ .words = 1, .bits = &bits },
+    };
+    var rec: RecordingSession = .{};
+    defer rec.deinit(gpa);
+    try rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, 2);
+
+    // Bytecode 1 (pc 0): binds r0 = A. No guard, so no snapshot.
+    try rec.exitBoundary(&proto, 1);
+    const a = try rec.emit(.{ .op = .slot_load, .aux = 0 });
+    rec.defineSlotAbs(0, a);
+    // Bytecode 2 (pc 1): rebinds r0 = B, THEN guards. The exit resumes at
+    // pc 1, where tier-0 still expects r0 = A.
+    try rec.exitBoundary(&proto, 2);
+    const b = try rec.emit(.{ .op = .slot_load, .aux = 1 });
+    rec.defineSlotAbs(0, b);
+    rec.defineSlotAbs(0, a); // a second write must not overwrite the saved binding
+    rec.defineSlotAbs(0, b);
+    _ = try rec.emit(.{ .op = .guard_int, .a = b });
+    _ = try rec.emit(.{ .op = .guard_int, .a = b }); // same bytecode: one snapshot
+    // Bytecode 3 (pc 2): no writes; guards see r0 = B.
+    try rec.exitBoundary(&proto, 3);
+    _ = try rec.emit(.{ .op = .guard_int, .a = b });
+
+    try testing.expectEqual(@as(usize, 4), rec.exit_snap_by_ord.items.len);
+    try testing.expectEqual(@as(trace_ir.SnapIdx, 0), rec.exit_snap_by_ord.items[1]);
+    try testing.expectEqual(@as(trace_ir.SnapIdx, 1), rec.exit_snap_by_ord.items[2]);
+    try testing.expectEqual(@as(trace_ir.SnapIdx, 2), rec.exit_snap_by_ord.items[3]);
+    const recs = rec.snap_builder.records.items;
+    try testing.expectEqual(@as(usize, 2), recs.len);
+    const slots = rec.snap_builder.slots.items;
+    try testing.expectEqual(@as(u32, 1), recs[0].resume_pc);
+    try testing.expectEqual(@as(u32, 1), recs[0].slots_len);
+    try testing.expectEqual(a, slots[recs[0].slots_begin].ref);
+    try testing.expectEqual(@as(u32, 2), recs[1].resume_pc);
+    try testing.expectEqual(b, slots[recs[1].slots_begin].ref);
+    // Every op carries its bytecode's ordinal.
+    try testing.expectEqual(@as(u16, 1), rec.instrs.items[@intCast(a)].ord);
+    try testing.expectEqual(@as(u16, 2), rec.instrs.items[@intCast(b)].ord);
+}
+
+test "doc 56 §4.2: a dead slot stays out of the snapshot; no liveness table means no snapshots" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    // r1 is dead at pc 1 (bit clear), r0 live.
+    const bits = [_]u64{ 0b11, 0b01 };
+    const proto = Proto{
+        .code = &.{ Instr.op0(.halt), Instr.op0(.halt) },
+        .name = "dead",
+        .num_registers = 2,
+        .reg_live = .{ .words = 1, .bits = &bits },
+    };
+    var rec: RecordingSession = .{};
+    defer rec.deinit(gpa);
+    try rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, 2);
+    try rec.exitBoundary(&proto, 1);
+    const x = try rec.emit(.{ .op = .slot_load, .aux = 0 });
+    rec.defineSlotAbs(0, x);
+    rec.defineSlotAbs(1, x);
+    try rec.exitBoundary(&proto, 2);
+    _ = try rec.emit(.{ .op = .guard_int, .a = x });
+    const recs = rec.snap_builder.records.items;
+    try testing.expectEqual(@as(usize, 1), recs.len);
+    try testing.expectEqual(@as(u32, 1), recs[0].slots_len);
+    try testing.expectEqual(@as(u16, 0), rec.snap_builder.slots.items[recs[0].slots_begin].slot);
+
+    // A budget-refused commit latches: later guarded bytecodes skip capture.
+    try rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, 2);
+    rec.options.snapshot_budget = .{ .max_records = 1 };
+    try rec.exitBoundary(&proto, 1);
+    const z = try rec.emit(.{ .op = .slot_load, .aux = 0 });
+    rec.defineSlotAbs(0, z);
+    _ = try rec.emit(.{ .op = .guard_int, .a = z }); // record 1: fits
+    try rec.exitBoundary(&proto, 2);
+    _ = try rec.emit(.{ .op = .guard_int, .a = z }); // refused → latch
+    try testing.expect(rec.exit_snap_exhausted);
+    try rec.exitBoundary(&proto, 2);
+    try testing.expect(!rec.exit_snap_pending);
+    try testing.expectEqual(@as(usize, 1), rec.snap_builder.records.items.len);
+
+    // The same shape on a proto without a table: ordinals, but no snapshot.
+    rec.options.snapshot_budget = .{};
+    const bare = Proto{ .code = proto.code, .name = "bare", .num_registers = 2 };
+    try rec.reset(gpa, .{ .proto = &bare, .pc = 0 }, 2);
+    try rec.exitBoundary(&bare, 1);
+    const y = try rec.emit(.{ .op = .slot_load, .aux = 0 });
+    rec.defineSlotAbs(0, y);
+    _ = try rec.emit(.{ .op = .guard_int, .a = y });
+    try testing.expectEqual(@as(usize, 0), rec.snap_builder.records.items.len);
+    try testing.expectEqual(@as(u16, 1), rec.cur_ord);
 }
 
 test "session abort snapshot is consumed exactly once" {

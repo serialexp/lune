@@ -3812,6 +3812,15 @@ pub const TraceState = struct {
                 }
             }
             self.dbg("commit: trace={d} anchor pc={d} ir_len={d} proto={s} lanes={any}", .{ t.id, t.code.anchor.pc, t.code.instrs.len, t.code.anchor.proto.name, lanes[0..nl] });
+            // Doc 56 Phase 1 probe: the exit snapshots the trace carries.
+            self.dbg("exit-snap: trace={d} ords={d} snaps={d} slots={d}", .{ t.id, t.code.exit_snap_by_ord.len -| 1, t.code.exit_snapshots.len, t.code.exit_snapshot_slots.len });
+            // One line per kept snapshot: which slots it restores, from which
+            // committed refs (`r<slot>=%<ref>`), at which resume pc.
+            for (t.code.exit_snap_by_ord, 0..) |si, ord| {
+                if (si == 0) continue;
+                const s = t.code.exit_snapshots[si - 1];
+                self.dbg("exit-snap:   ord={d} snap={d} resume_pc={d} slots={any}", .{ ord, si, s.resume_pc, t.code.exit_snapshot_slots[s.slots_begin..][0..s.slots_len] });
+            }
         };
         self.finishSideTraceProvenance(t, candidate.side_src);
         // Coverage (gated): a trace now exists at this anchor, so subsequent
@@ -4035,6 +4044,26 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
     try w.print("    native link exits:    {d} (follows={d})\n", .{ ts.native_link_exits, ts.native_link_follow_count });
     try w.print("    ir link exits:        {d} (follows={d})\n", .{ ts.link_ir_exits, ts.link_follow_count });
     try w.print("    prime-side:           arms={d} chain-follows={d} tier0-body-entries={d}\n", .{ ts.prime_side_arms, ts.prime_side_chain_follows, ts.tier0_outer_body_entries });
+    {
+        // Doc 56 §4.2: exit-snapshot memory over the live traces, next to the
+        // IR it describes (LuaJIT's snapshots cost about the IR's size; ours
+        // must stay in that range).
+        var n_traces: usize = 0;
+        var n_snaps: usize = 0;
+        var n_slots: usize = 0;
+        var n_ords: usize = 0;
+        var n_ir: usize = 0;
+        for (ts.registry.cache.items) |t| {
+            if (t.code.exit_snap_by_ord.len != 0) n_traces += 1;
+            n_snaps += t.code.exit_snapshots.len;
+            n_slots += t.code.exit_snapshot_slots.len;
+            n_ords += t.code.exit_snap_by_ord.len;
+            n_ir += t.code.instrs.len;
+        }
+        const tsnap = @import("trace_snapshot.zig");
+        const snap_bytes = n_snaps * @sizeOf(tsnap.Snapshot) + n_slots * @sizeOf(tsnap.SnapshotSlot) + n_ords * @sizeOf(trace_ir.SnapIdx);
+        try w.print("    exit snapshots:       traces={d} snaps={d} slots={d} bytes={d} (ir bytes={d})\n", .{ n_traces, n_snaps, n_slots, snap_bytes, n_ir * @sizeOf(trace_ir.IrInstr) });
+    }
 
     try w.writeAll("  coverage by loop iterations (count — flatters the JIT):\n");
     try w.print("    traced (ran as trace):  {d:>12}  ({d:.1}%)\n", .{ traced, pctOf(traced, total) });

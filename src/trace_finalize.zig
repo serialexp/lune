@@ -48,6 +48,9 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
             .a = ps.aref,
             .b = ps.value,
             .aux = ps.lane_ord,
+            // Doc 56 §4.2: the deferring bytecode's ordinal, so "which sunk
+            // stores precede this guard" is `store.ord < guard.ord`.
+            .ord = ps.ord,
         });
     }
     for (rec.reg_map, 0..) |s, slot| {
@@ -95,8 +98,32 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
     // yet and `old_to_new` cannot remap through CSE merges; the optimizer
     // integration (canonical-map remap + liveness extension) is its own
     // increment.
+    //
+    // Doc 56 §4.2: take ownership of the ordinary recording's sparse exit
+    // snapshots BEFORE `tropt`, which roots the refs of the snapshots an exit
+    // still uses, remaps them in place, and drops the rest.
+    // Fail-soft metadata: precise traces (own snapshots), peeled traces
+    // (deferred), an overflowed ordinal space, or an OOM all leave the trace
+    // with none — every exit then stays anchor-coherent only.
+    var exit_owned: ?trace_snapshot.Builder.Owned = null;
+    var exit_by_ord: []ir.SnapIdx = &.{};
+    errdefer if (exit_owned) |o| o.deinit(gpa);
+    errdefer if (exit_by_ord.len != 0) gpa.free(exit_by_ord);
+    if (!rec.precise and rec.peel == null and !rec.exit_ord_overflow and rec.cur_ord != 0 and rec.snap_builder_init and rec.snap_builder.records.items.len != 0) {
+        if (rec.snap_builder.finalize(gpa)) |o| {
+            if (gpa.dupe(ir.SnapIdx, rec.exit_snap_by_ord.items)) |m| {
+                exit_owned = o;
+                exit_by_ord = m;
+            } else |_| o.deinit(gpa);
+        } else |_| {}
+    }
+    const exit_for_opt: tropt.ExitSnaps = if (exit_owned) |o|
+        .{ .snapshots = o.snapshots, .slots = o.snapshot_slots, .by_ord = exit_by_ord }
+    else
+        .{};
+
     const fields: tropt.Optimized = if (options.optimize and !rec.precise and rec.link_target == null and rec.peel == null and rec.terminal_close == null)
-        tropt.optimize(gpa, instrs, consts) catch |e| switch (e) {
+        tropt.optimize(gpa, instrs, consts, exit_for_opt) catch |e| switch (e) {
             error.OutOfMemory => try tropt.dupe(gpa, instrs, consts, entry),
         }
     else
@@ -234,6 +261,40 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
         }
     }
 
+    // Doc 56 §4.2: tropt zeroed every ordinal whose exits it all removed
+    // (their refs were not rooted, nor remapped); compact the store down to
+    // the kept records. Every recorded ordinal names its own record, so
+    // "kept == records" means nothing was dropped. Fail-soft: an OOM or an
+    // inconsistent map drops them all.
+    if (exit_owned) |o| {
+        var kept: usize = 0;
+        for (exit_by_ord) |si| kept += @intFromBool(si != 0);
+        if (kept != o.snapshots.len) {
+            const c = trace_snapshot.compactSparse(gpa, o.snapshots, o.snapshot_slots, exit_by_ord) catch null;
+            o.deinit(gpa);
+            exit_owned = null;
+            if (c) |co| {
+                if (co.snapshots.len != 0) exit_owned = co;
+            }
+            if (exit_owned == null) {
+                gpa.free(exit_by_ord);
+                exit_by_ord = &.{};
+            }
+        }
+    }
+
+    // Doc 56 §4.2: validate the exit snapshots against the COMMITTED stream
+    // (after tropt's remap). Any defect drops them all — fail-soft, since an
+    // exit without a snapshot merely stays anchor-coherent.
+    if (exit_owned) |o| {
+        if (!exitSnapshotsValid(fields.instrs, o, exit_by_ord, rec.anchor_num_registers, @intCast(rec.anchor.proto.code.len))) {
+            o.deinit(gpa);
+            exit_owned = null;
+            gpa.free(exit_by_ord);
+            exit_by_ord = &.{};
+        }
+    }
+
     var code: TraceCode = .{
         .anchor = rec.anchor,
         .instrs = fields.instrs,
@@ -256,10 +317,46 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
         .snapshots = if (snap_owned) |o| o.snapshots else &.{},
         .snapshot_slots = if (snap_owned) |o| o.snapshot_slots else &.{},
         .deopt_mode = if (rec.precise) .precise else .entry_replay,
+        .exit_snapshots = if (exit_owned) |o| o.snapshots else &.{},
+        .exit_snapshot_slots = if (exit_owned) |o| o.snapshot_slots else &.{},
+        .exit_snap_by_ord = exit_by_ord,
         .lane_pins = pins_owned,
     };
     buildBridgeCandMemo(gpa, &code);
     return RecordingCandidate.init(code, rec.side_src);
+}
+
+/// Doc 56 §4.2: an ordinary trace's exit snapshots, checked in the COMMITTED
+/// index space (after `tropt`'s remap): structurally sound sparse vectors over
+/// the anchor window, a well-formed ordinal table, every op's ordinal in
+/// range, and every side-exit guard's snapshot refs defined before the guard
+/// (a forward ref would write an undefined value at the exit).
+pub fn exitSnapshotsValid(
+    instrs: []const IrInstr,
+    o: trace_snapshot.Builder.Owned,
+    by_ord: []const ir.SnapIdx,
+    register_count: u16,
+    code_len: u32,
+) bool {
+    if (!trace_snapshot.validateSparse(o.snapshots, o.snapshot_slots, code_len)) return false;
+    for (o.snapshots) |s| {
+        if (s.register_count != register_count) return false;
+    }
+    for (o.snapshot_slots) |ss| {
+        if (ss.ref >= instrs.len) return false;
+    }
+    if (by_ord.len == 0 or by_ord[0] != 0) return false;
+    for (by_ord) |si| {
+        if (si > o.snapshots.len) return false;
+    }
+    for (instrs, 0..) |ins, i| {
+        if (ins.ord >= by_ord.len) return false;
+        if (!ir.isSideExitGuardOp(ins.op)) continue;
+        const si = by_ord[ins.ord];
+        if (si == 0) continue;
+        if (!trace_snapshot.refsDefinedAt(si, i, o.snapshots, o.snapshot_slots)) return false;
+    }
+    return true;
 }
 
 /// Populate `code.bridge_cand` / `code.bridge_cand_built` by evaluating the

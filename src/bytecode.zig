@@ -286,6 +286,39 @@ pub const UpvalDesc = struct {
     index: u16,
 };
 
+/// Doc 56 §4.2: per-pc register liveness of one proto, computed once at
+/// compile time by `bc_liveness.compute`. `liveIn(pc, r)` is true when the
+/// value in register `r` just BEFORE `pc` executes may be read on some path
+/// from `pc` before it is overwritten (the LuaJIT `snap_usedef` question,
+/// answered by a whole-proto dataflow instead of a per-snapshot scan). An
+/// exit snapshot resuming at `pc` needs only these slots; a trace that
+/// computed a dead local may let `tropt` delete it. `words == 0` means "no
+/// table" (a hand-built proto, or one over the memory budget): callers must
+/// then treat liveness as unknown, never as "dead".
+pub const RegLiveness = struct {
+    /// `u64` words per pc; the table is `code.len * words` long.
+    words: u32 = 0,
+    bits: []const u64 = &.{},
+
+    pub fn available(self: RegLiveness) bool {
+        return self.words != 0;
+    }
+
+    /// Requires `available()`, `pc < code.len` and `reg < num_registers`.
+    pub fn liveIn(self: RegLiveness, pc: u32, reg: u16) bool {
+        std.debug.assert(self.words != 0);
+        const w = self.bits[@as(usize, pc) * self.words + reg / 64];
+        return (w >> @intCast(reg % 64)) & 1 != 0;
+    }
+
+    /// The whole live-in row at `pc` (`words` words; bit `r % 64` of word
+    /// `r / 64` is register `r`). Requires `available()`, `pc < code.len`.
+    pub fn row(self: RegLiveness, pc: u32) []const u64 {
+        std.debug.assert(self.words != 0);
+        return self.bits[@as(usize, pc) * self.words ..][0..self.words];
+    }
+};
+
 /// A function prototype: the immutable compiled form of one function body (the
 /// main chunk is just the top-level prototype). A runtime *closure* (Increment D)
 /// pairs a `Proto` with captured upvalues; the `Proto` itself is shared and
@@ -318,6 +351,9 @@ pub const Proto = struct {
     /// Upvalue capture plan: how a `closure` of this proto fills its cells from
     /// the enclosing frame. Empty for functions that capture nothing.
     upvalues: []const UpvalDesc = &.{},
+    /// Doc 56 §4.2: per-pc register liveness (see `RegLiveness`). Filled by
+    /// the compiler; empty (unavailable) on hand-built protos.
+    reg_live: RegLiveness = .{},
     /// Debug name for disassembly / diagnostics (not semantically meaningful).
     name: []const u8 = "?",
     /// Stable, unique id assigned at compile time (pre-order over the proto

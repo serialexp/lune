@@ -66,31 +66,39 @@ fn boxedPassThroughOnly(t: *const Trace, ref: usize) bool {
     return copied;
 }
 
-/// Doc 45 D6: true iff `ref` (a slot_load in a PRECISE trace) has no semantic
-/// use at all — no instruction operand reads it, no φ names it, no hidden
-/// reader (dyn-href root, ternary `aux` ref) touches it. Such a load exists
-/// only so full-window snapshots can reference a dead anchor slot; it is
-/// admitted as kind `.none` and every exit materializer skips it. The hidden-
-/// reader list mirrors `analyzeInner`'s liveness extensions — an op Pass B
-/// accepts while reading a ref invisible to BOTH `operandReads` and this list
-/// would be a soundness hole, so keep the two in lockstep.
-fn snapshotOnlyLoad(t: *const Trace, ref: usize) bool {
+/// `body_read[r]` iff some OTHER instruction semantically uses ref `r`: an
+/// operand read, a φ naming it, or a hidden reader (dyn-href root, ternary
+/// `aux` ref). A ref with no such use exists only for a snapshot — doc 45
+/// D6's force-loaded dead window slot (precise traces) or doc 56 §4.2's
+/// exit-snapshot konst — and is admitted as kind `.none`: no home, nothing
+/// emitted. The hidden-reader list mirrors `analyzeInner`'s liveness
+/// extensions — an op Pass B accepts while reading a ref invisible to BOTH
+/// `operandReads` and this list would be a soundness hole, so keep the two
+/// in lockstep. One O(n) pass.
+fn markBodyReads(t: *const Trace, body_read: []bool) void {
+    @memset(body_read, false);
+    const n = body_read.len;
     for (t.instrs, 0..) |ins, i| {
-        if (i == ref) continue;
         const reads = operandReads(ins);
-        if ((reads.a and ins.a == ref) or (reads.b and ins.b == ref)) return false;
-        // A φ mentioning the ref anywhere (writeback `b`, internal init /
+        if (reads.a) markRead(body_read, ins.a, i);
+        if (reads.b) markRead(body_read, ins.b, i);
+        // A φ mentioning a ref anywhere (writeback `b`, internal init /
         // steady association `a`) is a use.
-        if (ins.op == .phi and (ins.a == ref or ins.b == ref)) return false;
         // href's operandReads is {false,false} (seeded-slab discipline), but a
         // dynamically-rooted href DOES read its table root (`a`); count the
         // key (`b`) too, conservatively.
-        if (ins.op == .href and (ins.a == ref or ins.b == ref)) return false;
+        if (ins.op == .phi or ins.op == .href) {
+            markRead(body_read, ins.a, i);
+            markRead(body_read, ins.b, i);
+        }
         // Ternary ops whose third ref rides `aux` (the analyzeInner list).
         if ((ins.op == .ssub or ins.op == .scp or ins.op == .sfindp or ins.op == .smatch) and
-            ins.aux >= 0 and @as(usize, @intCast(ins.aux)) == ref) return false;
+            ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < n) markRead(body_read, @intCast(ins.aux), i);
     }
-    return true;
+}
+
+fn markRead(body_read: []bool, ref: usize, reader: usize) void {
+    if (ref != reader and ref < body_read.len) body_read[ref] = true;
 }
 
 /// Forward type-proof over the linear SSA. Fills `kinds` (and `slot_of`, the
@@ -196,6 +204,10 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
     const href_key = gpa.alloc(bool, n) catch return false;
     defer gpa.free(href_key);
     @memset(href_key, false);
+
+    const body_read = gpa.alloc(bool, n) catch return false;
+    defer gpa.free(body_read);
+    markBodyReads(t, body_read);
 
     // Task #29 (codex): reject duplicate `slot_load`s of one VM slot. The
     // recorder deduplicates real inputs, so a dup only appears in a malformed
@@ -400,7 +412,7 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                     // keeps payload and tag in their source slots; terminal
                     // writeback copies the complete boxed Value.
                     kinds[i] = .boxed;
-                } else if (t.deopt_mode == .precise and snapshotOnlyLoad(t, i)) {
+                } else if (t.deopt_mode == .precise and !body_read[i]) {
                     // Doc 45 D6: a PRECISE recording force-loads EVERY anchor-
                     // window register so full-window snapshots have a ref —
                     // including dead temporaries of arbitrary type. A load with
@@ -408,7 +420,7 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                     // no prologue check, nothing emitted; the exit
                     // materializers skip it because its slab slot is untouched
                     // by the native run (nothing writes it — that is exactly
-                    // what `snapshotOnlyLoad` proved), hence already current.
+                    // what `body_read` proved), hence already current.
                     kinds[i] = .none;
                 } else {
                     return false; // unguarded typed/inspected use → bail
@@ -416,6 +428,15 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             },
             .konst => {
                 if (ins.aux < 0 or ins.aux >= t.consts.len) return false;
+                // Doc 56 §4.2: a konst no instruction reads is kept only by
+                // an exit snapshot. A constant needs no home (LuaJIT's
+                // snapshot constants): an exit rebuilds it from `t.consts`
+                // (the precise flush already does, never reading its loc),
+                // so emit nothing — and never bail on its type.
+                if (!body_read[i]) {
+                    kinds[i] = .none;
+                    continue;
+                }
                 kinds[i] = switch (t.consts[@intCast(ins.aux)].tag) {
                     .int => .int,
                     .boolean => .bool,

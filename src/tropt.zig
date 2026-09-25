@@ -43,6 +43,7 @@ const value = @import("value.zig");
 const RegWindow = @import("regwindow.zig").RegWindow;
 const ir_eval = @import("ir_eval.zig");
 const arr = @import("array.zig");
+const trace_snapshot = @import("trace_snapshot.zig");
 
 const Value = value.Value;
 const IrInstr = trace.IrInstr;
@@ -393,10 +394,54 @@ pub fn dupe(
 /// owned slices. Runs one forward fold/CSE-tagging stage, one backward liveness
 /// stage, and one compaction (which *is* the ref-remap — refs are instruction
 /// indices, so removal/replacement renumbers).
+///
+/// Doc 56 §4.2: a trace's sparse exit snapshots, as `optimize` sees them.
+/// `by_ord[ord]` is the one-based record of boundary `ord` (0 = none).
+/// Records are in ordinal order, and a vector is shared only by a run of
+/// consecutive records (`Builder.addSparse` interns against the last vector).
+pub const ExitSnaps = struct {
+    snapshots: []const trace_snapshot.Snapshot = &.{},
+    slots: []trace_snapshot.SnapshotSlot = &.{},
+    by_ord: []trace.SnapIdx = &.{},
+};
+
+/// Doc 56 §4.2: root boundary `ord`'s snapshot (if it has one) for its side
+/// exit at index `i`, and mark the ord rooted. Every captured ref must
+/// precede `i` (a boundary binding is bound before its bytecode's first op),
+/// or the descending liveness sweep would never propagate its operands; a
+/// snapshot that breaks that (a recorder bug) is left unrooted, so it is
+/// dropped rather than committed with a dangling ref — exit snapshots are
+/// fail-soft metadata. O(vector length), once per ordinal.
+fn rootExitSnap(exit: ExitSnaps, ord: u16, i: usize, canon: []const Ref, live: []bool, ord_rooted: []bool) void {
+    const si = exit.by_ord[ord];
+    if (si == 0 or si > exit.snapshots.len) return;
+    const rec = exit.snapshots[si - 1];
+    const vec = exit.slots[rec.slots_begin..][0..rec.slots_len];
+    for (vec) |s| {
+        if (s.ref >= i or canon[s.ref] >= i) return;
+    }
+    for (vec) |s| live[canon[s.ref]] = true;
+    ord_rooted[ord] = true;
+}
+
+/// `exit` (doc 56 §4.2) is the trace's sparse exit snapshots. A snapshot's
+/// refs are liveness roots (LuaJIT's `dce_marksnap`: an exit may need to
+/// write a value the body no longer reads) only while an EXIT still uses it:
+/// a live, unfolded side-exit op with that ordinal. A snapshot whose every
+/// exit was folded or proven redundant (e.g. the type guard on a konst
+/// operand) roots nothing — otherwise it would keep dead values alive in
+/// every trace. On success, `exit.by_ord` loses every ordinal with no
+/// surviving body exit (set to 0; the caller compacts the store), and the
+/// kept snapshots' refs are rewritten IN PLACE through `canon`/`new_index`
+/// to name committed instructions. Untouched on error. Every op's `ord` is
+/// copied verbatim, except that an op hoisted into the preheader loses it
+/// (`ord = 0`): its failure there happens before the body, where no
+/// boundary snapshot describes the state.
 pub fn optimize(
     gpa: std.mem.Allocator,
     instrs: []const IrInstr,
     consts: []const Value,
+    exit: ExitSnaps,
 ) !Optimized {
     const n = instrs.len;
     std.debug.assert(n >= 1 and instrs[n - 1].op == .loop);
@@ -537,102 +582,6 @@ pub fn optimize(
         }
     }
 
-    // --- backward liveness from explicit roots ---
-    // Roots: the `loop` terminator, every kept guard (side-effecting), and every
-    // `phi` (the loop carry / deopt writeback — forgetting one would strip the
-    // loop-carried computation and resume tier-0 with stale registers).
-    const live = try gpa.alloc(bool, n);
-    defer gpa.free(live);
-    @memset(live, false);
-    live[n - 1] = true; // loop
-    for (instrs, 0..) |ins, i| {
-        const k = kindOf(ins.op);
-        // Kept guards and every `astore` are side-effecting roots (I1: an
-        // `astore` and its feeding `aref` must never be DCE'd). Every φ is a root:
-        // it is the loop carry / the deopt writeback, never dead.
-        // `.cvt` (int_of_float) is a side-effecting root: it can side-exit, so it must
-        // never be DCE'd even if its value looked dead — exactly like a kept guard.
-        if ((k == .guard and !dead[i]) or k == .astore or k == .phi or k == .cvt or k == .alloc or k == .gcguard) live[i] = true;
-        // Doc 30 roots: the scratch producers (the projections' data source,
-        // and their status side-exit), scap_str (an ALLOC root — a dead
-        // capture is still executed, the id stream is the observable, B02),
-        // and sgm_setpos (the deferred store). scap_int and str2num_* are
-        // deliberately NOT roots: DCE admitted (kindOf's contract).
-        if (k == .scratch3 or k == .scratch1k or k == .alloc_proj or k == .setpos) live[i] = true;
-        // A φ's back-edge update `b` may be a FORWARD ref (`b > i`) —
-        // `assertWellFormed` permits it (only φ.b may point past its own index),
-        // and an internal SR φ's `update = add(φ, Δ)` necessarily does. The single
-        // backward propagation pass below sweeps high→low, so it would pass `b`
-        // *before* the φ marks it live and never revisit `b`'s operands, dropping
-        // them as dead → wild refs after compaction. Pre-mark every φ.b live here
-        // (canon is final) so the backward pass propagates `b`'s operands when it
-        // reaches `b`. For a backward `b` (every E0 φ) this is a redundant no-op.
-        if (ins.op == .phi) live[canon[ins.b]] = true;
-    }
-    {
-        var i = n;
-        while (i > 0) {
-            i -= 1;
-            if (!live[i]) continue;
-            const ins = instrs[i];
-            // Only canonical, emittable instrs are ever marked live (roots use
-            // `canon[...]`; propagation marks `canon[operand]`), so canon[i]==i.
-            if (fold_aux[i] != null) continue; // now a konst: no operands to keep alive
-            switch (kindOf(ins.op)) {
-                .binary => {
-                    live[canon[ins.a]] = true;
-                    live[canon[ins.b]] = true;
-                },
-                .unary, .cvt, .guard, .aload => live[canon[ins.a]] = true,
-                // `.alloc` reads its single guarded operand `a`. `.gcguard`
-                // reads nothing (`a` unused).
-                .alloc => {
-                    live[canon[ins.a]] = true;
-                    if (ins.op == .ssub or ins.op == .srep2) live[canon[ins.b]] = true;
-                    if (ins.op == .ssub) live[canon[@intCast(ins.aux)]] = true;
-                },
-                .gcguard => {},
-                // `aref` (table+index) and `astore` (aref+value) both keep two
-                // operands alive.
-                .aref, .astore => {
-                    live[canon[ins.a]] = true;
-                    live[canon[ins.b]] = true;
-                },
-                // `.pure3` (scp): ALL THREE operands stay alive — `aux` is the
-                // end ref (the reason this kind exists; review M4).
-                .pure3 => {
-                    live[canon[ins.a]] = true;
-                    live[canon[ins.b]] = true;
-                    live[canon[@intCast(ins.aux)]] = true;
-                },
-                // Doc 30: `smatch` has three ref operands (subject, init,
-                // pattern-in-aux — the scp encoding).
-                .scratch3 => {
-                    live[canon[ins.a]] = true;
-                    live[canon[ins.b]] = true;
-                    live[canon[@intCast(ins.aux)]] = true;
-                },
-                // `sgmatch`: ONE ref (`a` = state); `aux` is a konst-pool id
-                // IMMEDIATE — never treated as a ref (round-2 B02).
-                // Projections and str2num read `a` only (`b`/slot is imm).
-                .scratch1k, .proj, .alloc_proj, .parse => live[canon[ins.a]] = true,
-                // `sgm_setpos` keeps both the state ref and the pos ref alive.
-                .setpos => {
-                    live[canon[ins.a]] = true;
-                    live[canon[ins.b]] = true;
-                },
-                // φ always keeps its back-edge update `b` alive. The init `a` is a
-                // real ref only for an *internal* φ (the preheader value); a
-                // slot-bound φ's init is implicit (`regs[slot]`), so `a` is 0/unused.
-                .phi => {
-                    live[canon[ins.b]] = true;
-                    if (ins.aux == trace.PHI_INTERNAL) live[canon[ins.a]] = true;
-                },
-                .konst, .slot_load, .loop, .preheader => {},
-            }
-        }
-    }
-
     // --- LICM (Phase E1): mark the loop-invariant computation to hoist ---
     //
     // A tier-0 slot is *carried* iff some φ flushes to it (`aux >= 0`): its
@@ -644,6 +593,11 @@ pub fn optimize(
     // its invariant operand cone moves with it. Guards/memory/φ are never hoisted
     // in this first cut (a guard on an invariant value is cheap and re-checking it
     // each iteration is harmless; hoisting it is a later refinement).
+    //
+    // Marked BEFORE liveness (it reads only canon/dead/fold_aux and the φs): a
+    // hoisted side exit (`int_of_float`) leaves the body, so the liveness sweep
+    // must not root its boundary snapshot (doc 56 §4.2). A live op lands in the
+    // preheader exactly when `hoist[i]` (the cone below only pulls in operands).
     //
     // Soundness: a preheader value is computed once and reused. Because it is pure
     // and depends only on invariants, the iteration-1 value is bit-identical to
@@ -712,6 +666,114 @@ pub fn optimize(
             // Doc 30: all excluded from LICM/hoisting fail-closed (scratch
             // effect order; alloc id stream; per-iteration status exits).
             .scratch3, .scratch1k, .proj, .alloc_proj, .parse, .setpos => {},
+        }
+    }
+
+    // --- backward liveness from explicit roots ---
+    // Roots: the `loop` terminator, every kept guard (side-effecting), and every
+    // `phi` (the loop carry / deopt writeback — forgetting one would strip the
+    // loop-carried computation and resume tier-0 with stale registers).
+    const live = try gpa.alloc(bool, n);
+    defer gpa.free(live);
+    @memset(live, false);
+    live[n - 1] = true; // loop
+    for (instrs, 0..) |ins, i| {
+        const k = kindOf(ins.op);
+        // Kept guards and every `astore` are side-effecting roots (I1: an
+        // `astore` and its feeding `aref` must never be DCE'd). Every φ is a root:
+        // it is the loop carry / the deopt writeback, never dead.
+        // `.cvt` (int_of_float) is a side-effecting root: it can side-exit, so it must
+        // never be DCE'd even if its value looked dead — exactly like a kept guard.
+        if ((k == .guard and !dead[i]) or k == .astore or k == .phi or k == .cvt or k == .alloc or k == .gcguard) live[i] = true;
+        // Doc 30 roots: the scratch producers (the projections' data source,
+        // and their status side-exit), scap_str (an ALLOC root — a dead
+        // capture is still executed, the id stream is the observable, B02),
+        // and sgm_setpos (the deferred store). scap_int and str2num_* are
+        // deliberately NOT roots: DCE admitted (kindOf's contract).
+        if (k == .scratch3 or k == .scratch1k or k == .alloc_proj or k == .setpos) live[i] = true;
+        // A φ's back-edge update `b` may be a FORWARD ref (`b > i`) —
+        // `assertWellFormed` permits it (only φ.b may point past its own index),
+        // and an internal SR φ's `update = add(φ, Δ)` necessarily does. The single
+        // backward propagation pass below sweeps high→low, so it would pass `b`
+        // *before* the φ marks it live and never revisit `b`'s operands, dropping
+        // them as dead → wild refs after compaction. Pre-mark every φ.b live here
+        // (canon is final) so the backward pass propagates `b`'s operands when it
+        // reaches `b`. For a backward `b` (every E0 φ) this is a redundant no-op.
+        if (ins.op == .phi) live[canon[ins.b]] = true;
+    }
+    // Doc 56 §4.2: `ord_rooted[ord]` — boundary `ord`'s snapshot is rooted,
+    // because a live, unfolded side-exit op of that bytecode survives. Set by
+    // the backward sweep at the ord's LAST such op; a snapshot ref is a
+    // boundary binding, bound before its bytecode's first op, so it precedes
+    // the op and the same descending sweep propagates its operands.
+    const ord_rooted = try gpa.alloc(bool, exit.by_ord.len);
+    defer gpa.free(ord_rooted);
+    @memset(ord_rooted, false);
+    {
+        var i = n;
+        while (i > 0) {
+            i -= 1;
+            if (!live[i]) continue;
+            const ins = instrs[i];
+            // Only canonical, emittable instrs are ever marked live (roots use
+            // `canon[...]`; propagation marks `canon[operand]`), so canon[i]==i.
+            if (fold_aux[i] != null) continue; // now a konst: no operands to keep alive
+            // A hoisted side exit fails in the preheader, before any
+            // boundary: it roots nothing (its ordinal is dropped below).
+            if (!dead[i] and !hoist[i] and ins.ord != 0 and ins.ord < exit.by_ord.len and !ord_rooted[ins.ord] and trace.isSideExitGuardOp(ins.op))
+                rootExitSnap(exit, ins.ord, i, canon, live, ord_rooted);
+            switch (kindOf(ins.op)) {
+                .binary => {
+                    live[canon[ins.a]] = true;
+                    live[canon[ins.b]] = true;
+                },
+                .unary, .cvt, .guard, .aload => live[canon[ins.a]] = true,
+                // `.alloc` reads its single guarded operand `a`. `.gcguard`
+                // reads nothing (`a` unused).
+                .alloc => {
+                    live[canon[ins.a]] = true;
+                    if (ins.op == .ssub or ins.op == .srep2) live[canon[ins.b]] = true;
+                    if (ins.op == .ssub) live[canon[@intCast(ins.aux)]] = true;
+                },
+                .gcguard => {},
+                // `aref` (table+index) and `astore` (aref+value) both keep two
+                // operands alive.
+                .aref, .astore => {
+                    live[canon[ins.a]] = true;
+                    live[canon[ins.b]] = true;
+                },
+                // `.pure3` (scp): ALL THREE operands stay alive — `aux` is the
+                // end ref (the reason this kind exists; review M4).
+                .pure3 => {
+                    live[canon[ins.a]] = true;
+                    live[canon[ins.b]] = true;
+                    live[canon[@intCast(ins.aux)]] = true;
+                },
+                // Doc 30: `smatch` has three ref operands (subject, init,
+                // pattern-in-aux — the scp encoding).
+                .scratch3 => {
+                    live[canon[ins.a]] = true;
+                    live[canon[ins.b]] = true;
+                    live[canon[@intCast(ins.aux)]] = true;
+                },
+                // `sgmatch`: ONE ref (`a` = state); `aux` is a konst-pool id
+                // IMMEDIATE — never treated as a ref (round-2 B02).
+                // Projections and str2num read `a` only (`b`/slot is imm).
+                .scratch1k, .proj, .alloc_proj, .parse => live[canon[ins.a]] = true,
+                // `sgm_setpos` keeps both the state ref and the pos ref alive.
+                .setpos => {
+                    live[canon[ins.a]] = true;
+                    live[canon[ins.b]] = true;
+                },
+                // φ always keeps its back-edge update `b` alive. The init `a` is a
+                // real ref only for an *internal* φ (the preheader value); a
+                // slot-bound φ's init is implicit (`regs[slot]`), so `a` is 0/unused.
+                .phi => {
+                    live[canon[ins.b]] = true;
+                    if (ins.aux == trace.PHI_INTERNAL) live[canon[ins.a]] = true;
+                },
+                .konst, .slot_load, .loop, .preheader => {},
+            }
         }
     }
 
@@ -784,6 +846,10 @@ pub fn optimize(
         if (!in_pre[i]) try order.append(gpa, i);
     }
 
+    const ord_kept = try gpa.alloc(bool, exit.by_ord.len);
+    defer gpa.free(ord_kept);
+    @memset(ord_kept, false);
+
     for (order.items) |entry| {
         if (entry == MARKER) {
             try out_instrs.append(gpa, .{ .op = .preheader });
@@ -794,6 +860,14 @@ pub fn optimize(
         new_index[i] = @intCast(out_instrs.items.len);
         old_to_new[i] = @intCast(out_instrs.items.len); // A-i.1: emitted survivor
         var out = ins;
+        // Doc 56 §4.2: a hoisted op (e.g. a hoisted `int_of_float`, which can
+        // side-exit) runs before the body; no boundary snapshot describes the
+        // state there, so it must never look attachable.
+        if (in_pre[i]) out.ord = 0;
+        // Doc 56 §4.2: an emitted, unfolded BODY side exit keeps its rooted
+        // boundary snapshot.
+        if (!in_pre[i] and fold_aux[i] == null and ins.ord != 0 and ins.ord < ord_kept.len and ord_rooted[ins.ord] and trace.isSideExitGuardOp(ins.op))
+            ord_kept[ins.ord] = true;
         if (fold_aux[i]) |aux| {
             out = .{ .op = .konst, .aux = aux, .ty = ins.ty };
         } else switch (kindOf(ins.op)) {
@@ -857,6 +931,26 @@ pub fn optimize(
     const final_consts = try out_consts.toOwnedSlice(gpa);
     errdefer gpa.free(final_consts);
     const final_entry = try out_entry.toOwnedSlice(gpa);
+    // Doc 56 §4.2: drop every snapshot with no surviving body exit and
+    // rewrite the kept ones' refs into the committed index space. After the
+    // last fallible call, so an error leaves `exit` untouched (the caller's
+    // `dupe` fallback keeps the identity map). Every kept ref was rooted (a
+    // live canonical survivor), so `new_index` is defined there. A vector
+    // shared by a run of kept records is remapped once.
+    var last: ?trace_snapshot.Snapshot = null;
+    for (exit.by_ord, 0..) |*si, ord| {
+        if (si.* == 0) continue;
+        if (!ord_kept[ord]) {
+            si.* = 0;
+            continue;
+        }
+        const rec = exit.snapshots[si.* - 1];
+        if (last) |l| if (l.slots_begin == rec.slots_begin and l.slots_len == rec.slots_len) continue;
+        last = rec;
+        const vec = exit.slots[rec.slots_begin..][0..rec.slots_len];
+        for (vec) |s| std.debug.assert(old_to_new[canon[s.ref]] != null);
+        trace_snapshot.remapRefs(vec, canon, new_index);
+    }
     return .{ .instrs = final_instrs, .consts = final_consts, .entry_slots = final_entry, .old_to_new = old_to_new };
 }
 
@@ -900,7 +994,7 @@ test "tropt: old_to_new compaction map — survivors mapped, dropped instrs null
         .{ .op = .phi, .a = 0, .b = 3, .aux = 0, .ty = .int }, // %5 slot-bound φ → r0
         .{ .op = .loop }, // %6
     };
-    var opt = try optimize(gpa, &instrs, &.{});
+    var opt = try optimize(gpa, &instrs, &.{}, .{});
     defer freeOpt(gpa, &opt);
 
     const m = opt.old_to_new orelse return error.TestUnexpectedResult;
@@ -943,7 +1037,7 @@ test "tropt: a constant subexpression folds to one konst and its operands die" {
         .{ .op = .loop }, // %5
     }, &[_]SlotStore{.{ .slot = 0, .ref = 4 }});
     const consts = [_]Value{ Value.int(2), Value.int(3) };
-    var opt = try optimize(gpa, &instrs, &consts);
+    var opt = try optimize(gpa, &instrs, &consts, .{});
     defer freeOpt(gpa, &opt);
 
     // %2 folded to a konst; %0 and %1 fed only the fold, so DCE drops them.
@@ -975,7 +1069,7 @@ test "tropt: a φ with a FORWARD back-edge update keeps the update's operands li
         .{ .op = .loop }, // %7
     };
     const consts = [_]Value{ Value.int(1), Value.int(2) };
-    var opt = try optimize(gpa, &instrs, &consts);
+    var opt = try optimize(gpa, &instrs, &consts, .{});
     defer freeOpt(gpa, &opt);
 
     // Both konsts survive (the bug would drop konst 2), both adds survive, both φs.
@@ -1007,7 +1101,7 @@ test "tropt: a guard on a proven-constant value is dropped; a guard on a live va
         .{ .op = .loop }, // %5
     }, &[_]SlotStore{.{ .slot = 0, .ref = 4 }});
     const consts = [_]Value{Value.int(5)};
-    var opt = try optimize(gpa, &instrs, &consts);
+    var opt = try optimize(gpa, &instrs, &consts, .{});
     defer freeOpt(gpa, &opt);
 
     // Survivors: konst(5), slot_load r0, guard_int, add, φ(r0), loop.
@@ -1024,7 +1118,7 @@ test "tropt: an exact-duplicate guard is dropped (the earlier copy dominates)" {
         .{ .op = .add, .a = 0, .b = 0 }, // %3
         .{ .op = .loop }, // %4
     }, &[_]SlotStore{.{ .slot = 0, .ref = 3 }});
-    var opt = try optimize(gpa, &instrs, &.{});
+    var opt = try optimize(gpa, &instrs, &.{}, .{});
     defer freeOpt(gpa, &opt);
 
     // Survivors: slot_load r0, guard_int, add, φ(r0), loop.
@@ -1050,7 +1144,7 @@ test "tropt: guard_gcol keeps and remaps its explicit column operand" {
         .{ .op = .loop }, // %7
     };
     const consts = [_]Value{Value.int(99)};
-    var opt = try optimize(gpa, &instrs, &consts);
+    var opt = try optimize(gpa, &instrs, &consts, .{});
     defer freeOpt(gpa, &opt);
 
     try testing.expectEqual(@as(usize, 0), countOp(opt.instrs, .konst));
@@ -1087,7 +1181,7 @@ test "tropt: a guard_fits on a constant value uses laneFits (never the type-guar
             .{ .op = .loop }, // %3
         }, &[_]SlotStore{.{ .slot = 0, .ref = 2 }});
         const consts = [_]Value{Value.boolean(false)};
-        var opt = try optimize(gpa, &instrs, &consts);
+        var opt = try optimize(gpa, &instrs, &consts, .{});
         defer freeOpt(gpa, &opt);
         try testing.expectEqual(@as(usize, 0), countOp(opt.instrs, .guard_fits));
     }
@@ -1102,7 +1196,7 @@ test "tropt: a guard_fits on a constant value uses laneFits (never the type-guar
             .{ .op = .loop }, // %2
         }, &[_]SlotStore{.{ .slot = 0, .ref = 0 }});
         const consts = [_]Value{Value.int(5)};
-        var opt = try optimize(gpa, &instrs, &consts);
+        var opt = try optimize(gpa, &instrs, &consts, .{});
         defer freeOpt(gpa, &opt);
         try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .guard_fits));
     }
@@ -1127,7 +1221,7 @@ test "tropt: two guard_fits on one value but different lanes are both kept" {
             .{ .op = .guard_fits, .a = 0, .aux = i32_lane }, // %2 — narrow lane (was dropped)
             .{ .op = .loop }, // %3
         }, &[_]SlotStore{.{ .slot = 0, .ref = 0 }});
-        var opt = try optimize(gpa, &instrs, &.{});
+        var opt = try optimize(gpa, &instrs, &.{}, .{});
         defer freeOpt(gpa, &opt);
         try testing.expectEqual(@as(usize, 2), countOp(opt.instrs, .guard_fits));
     }
@@ -1140,7 +1234,7 @@ test "tropt: two guard_fits on one value but different lanes are both kept" {
             .{ .op = .guard_fits, .a = 0, .aux = i64_lane }, // %2 — exact dup → drop
             .{ .op = .loop }, // %3
         }, &[_]SlotStore{.{ .slot = 0, .ref = 0 }});
-        var opt = try optimize(gpa, &instrs, &.{});
+        var opt = try optimize(gpa, &instrs, &.{}, .{});
         defer freeOpt(gpa, &opt);
         try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .guard_fits));
     }
@@ -1154,7 +1248,7 @@ test "tropt: two guard_fits on one value but different lanes are both kept" {
             .{ .op = .guard_int, .a = 0, .aux = 20 }, // %2 — PC 20, redundant → drop
             .{ .op = .loop }, // %3
         }, &[_]SlotStore{.{ .slot = 0, .ref = 0 }});
-        var opt = try optimize(gpa, &instrs, &.{});
+        var opt = try optimize(gpa, &instrs, &.{}, .{});
         defer freeOpt(gpa, &opt);
         try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .guard_int));
     }
@@ -1170,7 +1264,7 @@ test "tropt: a repeated subexpression is CSE'd to a single instruction" {
         .{ .op = .add, .a = 2, .b = 3 }, // %4 = %2 + %3
         .{ .op = .loop }, // %5
     }, &[_]SlotStore{.{ .slot = 0, .ref = 4 }});
-    var opt = try optimize(gpa, &instrs, &.{});
+    var opt = try optimize(gpa, &instrs, &.{}, .{});
     defer freeOpt(gpa, &opt);
 
     // %3 vanishes; %4's two operands now both resolve to the surviving add.
@@ -1198,7 +1292,7 @@ test "tropt doc 51 F3: equal-valued konsts canonicalize to one ref and unlock CS
         .{ .op = .loop }, // %6
     }, &[_]SlotStore{.{ .slot = 0, .ref = 5 }});
     const consts = [_]Value{ Value.int(7), Value.int(7) };
-    var opt = try optimize(gpa, &instrs, &consts);
+    var opt = try optimize(gpa, &instrs, &consts, .{});
     defer freeOpt(gpa, &opt);
 
     // One konst survives (the duplicate is non-canonical → dead) and the two
@@ -1226,7 +1320,7 @@ test "tropt doc 51 F3: a fold result reuses an equal-valued pool entry and an eq
         .{ .op = .loop }, // %8
     }, &[_]SlotStore{.{ .slot = 0, .ref = 7 }});
     const consts = [_]Value{ Value.int(2), Value.int(3), Value.int(5) };
-    var opt = try optimize(gpa, &instrs, &consts);
+    var opt = try optimize(gpa, &instrs, &consts, .{});
     defer freeOpt(gpa, &opt);
 
     try testing.expectEqual(consts.len, opt.consts.len); // no pool growth
@@ -1253,7 +1347,7 @@ test "tropt doc 51 F3: two folds producing the same value share one konst and on
         .{ .op = .loop }, // %10
     }, &[_]SlotStore{.{ .slot = 0, .ref = 9 }});
     const consts = [_]Value{ Value.int(2), Value.int(3), Value.int(1), Value.int(4) };
-    var opt = try optimize(gpa, &instrs, &consts);
+    var opt = try optimize(gpa, &instrs, &consts, .{});
     defer freeOpt(gpa, &opt);
 
     try testing.expectEqual(consts.len + 1, opt.consts.len); // exactly one new entry (5)
@@ -1279,7 +1373,7 @@ test "tropt doc 51 F3: distinct heap konsts with identical ids never canonicaliz
         .{ .op = .loop }, // %6
     }, &[_]SlotStore{.{ .slot = 0, .ref = 5 }});
     const consts = [_]Value{ Value.heap(&h1), Value.heap(&h2) };
-    var opt = try optimize(gpa, &instrs, &consts);
+    var opt = try optimize(gpa, &instrs, &consts, .{});
     defer freeOpt(gpa, &opt);
 
     try testing.expectEqual(@as(usize, 2), countOp(opt.instrs, .konst));
@@ -1295,7 +1389,7 @@ test "tropt: a dead computation (and its now-unused input) is eliminated" {
         .{ .op = .mul, .a = 0, .b = 0 }, // %3 = r0 * r0  (the live result)
         .{ .op = .loop }, // %4
     }, &[_]SlotStore{.{ .slot = 0, .ref = 3 }});
-    var opt = try optimize(gpa, &instrs, &.{});
+    var opt = try optimize(gpa, &instrs, &.{}, .{});
     defer freeOpt(gpa, &opt);
 
     // Survivors: slot_load r0, mul, φ(r0), loop. r1's slot_load dies with the dead
@@ -1314,7 +1408,7 @@ test "tropt: a fold that would error (int //-by-zero) is left as a runtime op, n
         .{ .op = .loop }, // %3
     }, &[_]SlotStore{.{ .slot = 0, .ref = 2 }});
     const consts = [_]Value{ Value.int(1), Value.int(0) };
-    var opt = try optimize(gpa, &instrs, &consts);
+    var opt = try optimize(gpa, &instrs, &consts, .{});
     defer freeOpt(gpa, &opt);
 
     // The idiv stays (so it side-exits at runtime and tier-0 re-raises); its const
@@ -1334,7 +1428,7 @@ fn foldBinaryConst(gpa: std.mem.Allocator, op: IrOp, a: Value, b: Value) !Value 
         .{ .op = .loop },
     }, &[_]SlotStore{.{ .slot = 0, .ref = 2 }});
     const consts = [_]Value{ a, b };
-    var opt = try optimize(gpa, &instrs, &consts);
+    var opt = try optimize(gpa, &instrs, &consts, .{});
     defer freeOpt(gpa, &opt);
     try testing.expectEqual(@as(usize, 3), opt.instrs.len); // konst + φ + loop
     try testing.expectEqual(IrOp.konst, opt.instrs[0].op);
@@ -1405,7 +1499,7 @@ fn licmInvariantMulTrace() struct { instrs: [13]IrInstr, consts: [1]Value } {
 test "tropt E1: a loop-invariant subexpression is hoisted before a preheader marker" {
     const gpa = testing.allocator;
     var t = licmInvariantMulTrace();
-    var opt = try optimize(gpa, &t.instrs, &t.consts);
+    var opt = try optimize(gpa, &t.instrs, &t.consts, .{});
     defer freeOpt(gpa, &opt);
 
     // Exactly one preheader marker and one `mul`, and the `mul` precedes the
@@ -1429,7 +1523,7 @@ test "tropt E1: hoisting preserves behaviour (optimized ≡ unoptimized over a b
     const irinterp = @import("irinterp.zig");
     const gpa = testing.allocator;
     var t = licmInvariantMulTrace();
-    var opt = try optimize(gpa, &t.instrs, &t.consts);
+    var opt = try optimize(gpa, &t.instrs, &t.consts, .{});
     defer freeOpt(gpa, &opt);
 
     // Drive both traces from the same entry state. a=3, b=4, acc=0, cnt=5, r4=0.
@@ -1486,7 +1580,7 @@ test "doc 30: smatch/scap_str/setpos are roots; unused scap_int and str2num are 
         .{ .op = .loop }, // %7
     }, &[_]SlotStore{.{ .slot = 0, .ref = 0 }});
     const consts = [_]Value{ Value.int(1), Value.int(2) };
-    var opt = try optimize(gpa, &instrs, &consts);
+    var opt = try optimize(gpa, &instrs, &consts, .{});
     defer freeOpt(gpa, &opt);
 
     try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .smatch));
@@ -1508,7 +1602,7 @@ test "doc 30: sgmatch chain is kept; its aux rides verbatim as a konst id throug
         .{ .op = .loop }, // %5
     }, &[_]SlotStore{.{ .slot = 0, .ref = 0 }});
     const consts = [_]Value{ Value.int(99), Value.int(42) };
-    var opt = try optimize(gpa, &instrs, &consts);
+    var opt = try optimize(gpa, &instrs, &consts, .{});
     defer freeOpt(gpa, &opt);
 
     try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .sgmatch));
@@ -1536,7 +1630,7 @@ test "doc 30: guard_sid dedup keys on its konst id — same id dropped, differen
         .{ .op = .loop }, // %4
     }, &[_]SlotStore{.{ .slot = 0, .ref = 0 }});
     const consts = [_]Value{ Value.int(7), Value.int(8) };
-    var opt = try optimize(gpa, &instrs, &consts);
+    var opt = try optimize(gpa, &instrs, &consts, .{});
     defer freeOpt(gpa, &opt);
     try testing.expectEqual(@as(usize, 2), countOp(opt.instrs, .guard_sid));
 }
@@ -1551,4 +1645,95 @@ test "doc 30: exit provenance — no callout op carries a PC or joins the side-e
         try testing.expectEqual(@as(?u32, null), trace.guardSourcePc(.{ .op = op, .a = 0, .aux = 5 }));
         try testing.expect(!trace.isSideExitGuardOp(op));
     }
+}
+
+/// Doc 56 §4.2 test fixture: one exit snapshot record per `(begin, len)`.
+fn snapRec(begin: u32, len: u32) trace_snapshot.Snapshot {
+    return .{ .resume_pc = 1, .slots_begin = begin, .slots_len = len, .register_count = 8 };
+}
+
+fn indexOfOp(instrs: []const IrInstr, op: IrOp) ?usize {
+    for (instrs, 0..) |ins, i| if (ins.op == op) return i;
+    return null;
+}
+
+test "doc 56: a snapshot roots its refs only while a body exit uses it; a folded guard's snapshot is dropped" {
+    const gpa = testing.allocator;
+    const instrs = trace.withPhis(&[_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0 = r0
+        .{ .op = .slot_load, .aux = 1 }, // %1 = r1
+        .{ .op = .mul, .a = 1, .b = 1, .ord = 1 }, // %2 — read only by ord 2's snapshot
+        .{ .op = .add, .a = 1, .b = 1, .ord = 1 }, // %3 — read only by ord 3's snapshot
+        .{ .op = .konst, .aux = 0, .ord = 2 }, // %4 = 5
+        .{ .op = .guard_int, .a = 0, .ord = 2 }, // %5 — a runtime guard: kept
+        .{ .op = .guard_int, .a = 4, .ord = 3 }, // %6 — guards a konst: dropped
+        .{ .op = .loop }, // %7
+    }, &[_]SlotStore{.{ .slot = 0, .ref = 0 }});
+    const consts = [_]Value{Value.int(5)};
+    const snaps = [_]trace_snapshot.Snapshot{ snapRec(0, 1), snapRec(1, 1) };
+    var slots = [_]trace_snapshot.SnapshotSlot{ .{ .slot = 2, .ref = 2 }, .{ .slot = 3, .ref = 3 } };
+    var by_ord = [_]trace.SnapIdx{ 0, 0, 1, 2 };
+    var opt = try optimize(gpa, &instrs, &consts, .{ .snapshots = &snaps, .slots = &slots, .by_ord = &by_ord });
+    defer freeOpt(gpa, &opt);
+
+    // Ord 2 keeps its snapshot, which keeps the mul alive and names its
+    // committed index; ord 3 lost its only exit, so its snapshot roots
+    // nothing (the add and the konst die) and its ordinal is cleared.
+    try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .mul));
+    try testing.expectEqual(@as(usize, 0), countOp(opt.instrs, .add));
+    try testing.expectEqual(@as(usize, 0), countOp(opt.instrs, .konst));
+    try testing.expectEqual(@as(trace.SnapIdx, 1), by_ord[2]);
+    try testing.expectEqual(@as(trace.SnapIdx, 0), by_ord[3]);
+    try testing.expectEqual(@as(u32, @intCast(indexOfOp(opt.instrs, .mul).?)), slots[0].ref);
+}
+
+test "doc 56: a hoisted side exit (int_of_float) roots nothing and drops its snapshot" {
+    const gpa = testing.allocator;
+    const instrs = trace.withPhis(&[_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0 = r0: invariant float limit
+        .{ .op = .slot_load, .aux = 1 }, // %1 = r1: carried
+        .{ .op = .mul, .a = 1, .b = 1, .ord = 1 }, // %2 — read only by ord 2's snapshot
+        .{ .op = .int_of_float, .a = 0, .ord = 2 }, // %3 — invariant → hoisted
+        .{ .op = .konst, .aux = 0, .ord = 3 }, // %4 = 1
+        .{ .op = .add, .a = 1, .b = 4, .ord = 3 }, // %5 — r1's carry
+        .{ .op = .loop }, // %6
+    }, &[_]SlotStore{.{ .slot = 1, .ref = 5 }});
+    const consts = [_]Value{Value.int(1)};
+    const snaps = [_]trace_snapshot.Snapshot{snapRec(0, 1)};
+    var slots = [_]trace_snapshot.SnapshotSlot{.{ .slot = 2, .ref = 2 }};
+    var by_ord = [_]trace.SnapIdx{ 0, 0, 1, 0 };
+    var opt = try optimize(gpa, &instrs, &consts, .{ .snapshots = &snaps, .slots = &slots, .by_ord = &by_ord });
+    defer freeOpt(gpa, &opt);
+
+    // The conversion moved to the preheader (it keeps no ordinal there), so
+    // its boundary snapshot is dropped and never kept the mul alive.
+    const cvt = indexOfOp(opt.instrs, .int_of_float).?;
+    try testing.expect(cvt < indexOfOp(opt.instrs, .preheader).?);
+    try testing.expectEqual(@as(u16, 0), opt.instrs[cvt].ord);
+    try testing.expectEqual(@as(usize, 0), countOp(opt.instrs, .mul));
+    try testing.expectEqual(@as(trace.SnapIdx, 0), by_ord[2]);
+}
+
+test "doc 56: a vector shared by two kept snapshots is remapped exactly once" {
+    const gpa = testing.allocator;
+    const instrs = trace.withPhis(&[_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0 = r0
+        .{ .op = .slot_load, .aux = 1 }, // %1 = r1: dead → compaction shifts refs
+        .{ .op = .slot_load, .aux = 2 }, // %2 = r2: carried
+        .{ .op = .mul, .a = 2, .b = 2, .ord = 1 }, // %3 — both snapshots capture it
+        .{ .op = .guard_int, .a = 0, .ord = 2 }, // %4
+        .{ .op = .guard_int, .a = 2, .ord = 3 }, // %5
+        .{ .op = .loop }, // %6
+    }, &[_]SlotStore{ .{ .slot = 0, .ref = 0 }, .{ .slot = 2, .ref = 3 } });
+    const snaps = [_]trace_snapshot.Snapshot{ snapRec(0, 1), snapRec(0, 1) };
+    var slots = [_]trace_snapshot.SnapshotSlot{.{ .slot = 4, .ref = 3 }};
+    var by_ord = [_]trace.SnapIdx{ 0, 0, 1, 2 };
+    var opt = try optimize(gpa, &instrs, &.{}, .{ .snapshots = &snaps, .slots = &slots, .by_ord = &by_ord });
+    defer freeOpt(gpa, &opt);
+
+    // Remapping the shared vector twice would push the ref through
+    // `new_index` a second time (3 → 2 → 1, a slot_load). Once is the mul.
+    try testing.expectEqual(@as(trace.SnapIdx, 1), by_ord[2]);
+    try testing.expectEqual(@as(trace.SnapIdx, 2), by_ord[3]);
+    try testing.expectEqual(IrOp.mul, opt.instrs[slots[0].ref].op);
 }

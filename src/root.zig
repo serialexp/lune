@@ -144,6 +144,7 @@ test {
     _ = @import("trace_candidate.zig");
     _ = @import("trace_finalize_test.zig");
     _ = @import("trace_snapshot.zig");
+    _ = @import("bc_liveness.zig");
     _ = jitdbg;
     _ = irinterp;
     _ = x64;
