@@ -1,8 +1,8 @@
 # 56 — Exit-started side traces (LuaJIT's side-trace mechanism) — Design
 
-Status: Phase 1 in progress (snapshots landed, exit location map outstanding); design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
+Status: Phase 1 in progress (snapshots and the exit location map landed; finalize exit-snapshot tests outstanding); design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
 Owner: Bart
-Last updated: 2026-09-24
+Last updated: 2026-09-25
 
 ## Implementation status
 
@@ -75,8 +75,13 @@ consumes yet, so every program's output and trace set stays identical.
   - [x] Finalize validates the snapshots against the committed stream
     (`exitSnapshotsValid`) and drops them all on any defect; memory is in
     `--jit-stats`.
-  - [ ] The native compiler records, per attachable exit, where each needed
-    ref lives (register, spill, home or constant).
+  - [x] The native compiler records where each needed ref lives
+    (register, spill, home or constant): `CompiledTrace.exit_locs`,
+    built by `nativegen_exitloc.build` after emission (§4.2 "As
+    built"). Machine code is byte-identical; memory and the per-exit
+    held/lost count are in `--jit-stats`.
+  - [ ] Finalize tests for the exit snapshots (`exitSnapshotsValid`, the
+    `compactSparse` path in finalize).
 - [ ] **Phase 2 — attachability and resume pc (inert).**
   `exitAttachable` and `exitResumePc`, including the branch fix-up and
   the Q6 guard-emitter audit. Pure tests.
@@ -392,6 +397,40 @@ do not.
   is data, compact and per exit. It is what lets an adapter be built
   later without recompiling the parent (§4.6), and it is exactly the
   input register inheritance will need.
+
+  *As built (Phase 1, 2026-09-25).* Bart picked a **per-value table**
+  over per-exit rows or keeping the whole allocator output:
+  - `ExitLocMap.values`: one 12-byte `ExitLoc` per distinct needed
+    value, sorted by ref. Each row has the place (`reg`/`xmm`/`spill`
+    byte displacement/`konst` index/`none`), the boxing kind (for a
+    slot load, its slot's kind: a carried table is `.heap`), and
+    `live_until`. The allocator never splits a live range, so a value
+    has one place for its whole life. The place holds the value at exit
+    `e` exactly when `ref < e <= live_until` (`holdsAt`). Refinements:
+    - slot homes are held all body long, except a win-2 in-place
+      update, which the allocator only allows after the last body exit;
+    - a transient whose register its last reader takes over (win-1
+      operand reuse) ends one instruction early, because an exit taken
+      by that reader (`int_of_float`, `alen`) already sees the new value;
+    - an invariant `slot_load` records its own slot (`invariant_slot`):
+      restoring that slot needs no store.
+  - `ExitLocMap.carried`: the carried homes, exactly the slots
+    `deopt_exit` flushes.
+  - "Needed" means: every exit-snapshot ref; every ref a sunk store
+    below the first exit reads, through its `aref`/`href`/`garow`/`gcell`
+    token down to table, index and value; and each carried slot's load.
+  - An exit's own view is derived: `exitSnapIdx(e)` → its snapshot's
+    slots → `ExitLocMap.at(ref, e)`. There is no per-exit data.
+  - It is inert: built after emission, and no liveness is extended. A
+    value whose life ended before an exit is simply "lost" there. Phase 2
+    extends liveness for attachable exits only.
+  - Board measurement (`--jit-stats`): the map is 90 B – 3 KB per bench
+    (fft 2.1 KB against 10 KB of IR). Across the board, 159 of 6195
+    restored exit slots (2.6%) are lost: fft has the most (36 of 895),
+    grid_matmul the highest share (20 of 325, 6%). Snapshots plus map
+    stay under 1× IR everywhere except
+    partialsums (1.36×: 26 snapshots of about 8 live floats over a
+    1.6 KB trace; the snapshots alone are already 0.98×).
 
 Snapshot and map memory are reported per trace in `--jit-stats`.
 LuaJIT's measured snapshot cost is about the size of the IR; ours must

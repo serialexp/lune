@@ -118,6 +118,11 @@ pub const CompiledTrace = artifact.CompiledTrace;
 pub const NativeState = artifact.NativeState;
 pub const LinkHitCounter = artifact.LinkHitCounter;
 pub const LinkHitKind = artifact.LinkHitKind;
+pub const ExitLoc = artifact.ExitLoc;
+pub const ExitLocMap = artifact.ExitLocMap;
+pub const CarriedHome = artifact.CarriedHome;
+/// Doc 56 §4.2 (Phase 1): the exit location map builder.
+pub const exitloc = @import("nativegen_exitloc.zig");
 
 /// Try to compile `t` to native code. Returns `null` to **bail** — for any reason:
 /// an off-target build, a value/op outside the proven-int/bool subset, malformed
@@ -458,6 +463,10 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     // which is where a future conditional-emission path in `lower` would
     // actually break it.
     std.debug.assert(seed_plan.nonEmpty() == entry_stubs.seed_prologue);
+    // Doc 56 §4.2 (Phase 1): where each value an exit may need lives. Read
+    // off the finished allocation, after emission, so it cannot influence
+    // the code. Fail-soft: no map on OOM, like the exit snapshots.
+    const exit_locs = exitloc.build(gpa, t, kinds, &alloc) catch ExitLocMap{};
     keep_ret_cont_keys = true;
     keep_link_hit_counters = true;
     keep_slot_rowless_ok = true;
@@ -482,6 +491,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
             break :hhs false;
         },
         .peeled = t.peeled,
+        .exit_locs = exit_locs,
     };
 }
 
@@ -2857,4 +2867,5 @@ test {
     _ = @import("nativegen_arraywrite_test.zig");
     _ = @import("nativegen_carriedheap_test.zig");
     _ = @import("nativegen_hrefk_test.zig");
+    _ = @import("nativegen_exitloc_test.zig");
 }

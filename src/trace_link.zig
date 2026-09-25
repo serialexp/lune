@@ -2370,6 +2370,21 @@ pub fn nativeFor(self: *TraceState, t: *Trace) ?*const nativegen.CompiledTrace {
         .unattempted => {
             if (nativegen.compileInto(self.gpa, &self.registry.mcode_arena, &t.code, t.id, self.registry.native_seed_ctx, self.exec_heap)) |ct| {
                 t.native = .{ .compiled = ct };
+                // Doc 56 Phase 1 probe: the exit location map, and per
+                // exit how many restored slots the body still holds.
+                if (comptime jitdbg.enabled) if (self.config.debug_log) {
+                    const m = &t.native.compiled.exit_locs;
+                    self.dbg("exit-loc: trace={d} values={d} carried={d} bytes={d}", .{ t.id, m.values.len, m.carried.len, m.bytes() });
+                    for (0..t.code.instrs.len) |ei| {
+                        const si = t.code.exitSnapIdx(ei) orelse continue;
+                        const s = t.code.exit_snapshots[si - 1];
+                        var held: usize = 0;
+                        for (t.code.exit_snapshot_slots[s.slots_begin..][0..s.slots_len]) |ss| {
+                            if (m.at(ss.ref, ei) != null) held += 1;
+                        }
+                        self.dbg("exit-loc:   exit={d} ord={d} snap={d} held={d}/{d}", .{ ei, t.code.instrs[ei].ord, si, held, s.slots_len });
+                    }
+                };
                 return &t.native.compiled;
             }
             if (comptime jitdbg.enabled) if (self.config.debug_log) {

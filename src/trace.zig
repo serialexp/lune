@@ -4063,6 +4063,36 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
         const tsnap = @import("trace_snapshot.zig");
         const snap_bytes = n_snaps * @sizeOf(tsnap.Snapshot) + n_slots * @sizeOf(tsnap.SnapshotSlot) + n_ords * @sizeOf(trace_ir.SnapIdx);
         try w.print("    exit snapshots:       traces={d} snaps={d} slots={d} bytes={d} (ir bytes={d})\n", .{ n_traces, n_snaps, n_slots, snap_bytes, n_ir * @sizeOf(trace_ir.IrInstr) });
+        // Doc 56 §4.2 (Phase 1): the native exit location maps of the
+        // compiled traces, and — per exit, per restored slot — whether the
+        // body still holds the value there (`lost` is what a later phase
+        // pays for in extended liveness).
+        var n_mapped: usize = 0;
+        var n_values: usize = 0;
+        var n_carried: usize = 0;
+        var map_bytes: usize = 0;
+        var held: usize = 0;
+        var lost: usize = 0;
+        for (ts.registry.cache.items) |t| {
+            const c = switch (t.native) {
+                .compiled => |*c| c,
+                else => continue,
+            };
+            const m = &c.exit_locs;
+            if (m.values.len == 0) continue;
+            n_mapped += 1;
+            n_values += m.values.len;
+            n_carried += m.carried.len;
+            map_bytes += m.bytes();
+            for (0..t.code.instrs.len) |ei| {
+                const si = t.code.exitSnapIdx(ei) orelse continue;
+                const s = t.code.exit_snapshots[si - 1];
+                for (t.code.exit_snapshot_slots[s.slots_begin..][0..s.slots_len]) |ss| {
+                    if (m.at(ss.ref, ei) != null) held += 1 else lost += 1;
+                }
+            }
+        }
+        try w.print("    exit locations:       traces={d} values={d} carried={d} bytes={d} exit-slots held={d} lost={d}\n", .{ n_mapped, n_values, n_carried, map_bytes, held, lost });
     }
 
     try w.writeAll("  coverage by loop iterations (count — flatters the JIT):\n");

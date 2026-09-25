@@ -196,8 +196,49 @@ the ones that bite):
       remapped once;
     - `compactSparse`;
     - the `aux` register in liveness.
-  - Still to do: the native exit location map, and the finalize
-    exit-snapshot tests.
+  - Committed as 0889c7b.
+  - **Native exit location map landed (uncommitted, 2026-09-25).** Bart
+    picked a "per-value table" (over per-exit rows or keeping the whole
+    allocator output).
+    - What it is: `CompiledTrace.exit_locs` (`ExitLocMap` in
+      `nativegen_artifact.zig`), built by `nativegen_exitloc.build`.
+    - Where it's built: in `compileImpl`, after emission; fail-soft.
+    - Details are in doc 56 §4.2 "As built".
+    - New helper `TraceCode.exitSnapIdx(i)`.
+    - Probe: `exit-loc:` lines in `nativeFor` (jit-debug).
+    - Stats: an `exit locations:` line in `--jit-stats` (bytes, held/lost
+      exit slots).
+    - Tests: `src/nativegen_exitloc_test.zig` (4 tests; the store closure
+      and the win-1 reuse rule were each mutation-checked) plus a
+      real-program test in `interp_exit_side_test.zig`.
+    - Inert: per-trace native sizes are identical to HEAD on every bench
+      (shadow `/tmp/lune-head`, nm-verified).
+    - Memory: 90 B – 3 KB per bench. 2.6% of exit slots are lost (what
+      Phase 2's liveness extension will pay for). partialsums is
+      snapshots + map = 1.36× IR, over the §9 budget of about 1×; the
+      snapshots alone are 0.98× there.
+  - Gates: `just test` exit 0. The jit-debug gate exits 0 but printed
+    the known stray "failed command" line three times (occurrences 8–10
+    in TODO.md). It shows up on a clean HEAD shadow too, so this change
+    didn't cause it.
+  - Antigravity review: APPROVE WITH CHANGES. All three findings were
+    taken:
+    - a slot-load row now carries the SLOT's kind (a carried table is
+      `.heap`, its load `.ptr`);
+    - new tests: a carried table with a sunk hstore, a win-2 home, a
+      float XMM row, spill rows; the kind fix and the win-2 rule were
+      mutation-checked;
+    - `sgm_setpos` added to the real-program store check.
+    Not covered by a unit test: the `gstore → gcell → garow` chain (no
+    native grid fixture exists); its closure is the same generic
+    recursion the aref/href tests exercise.
+  - Board `bench/results/20260925-110224-0889c7b.tsv` against
+    20260924-220310: within noise. It flagged repack +14%, nbody +7% and
+    scalar +5%. An interleaved A/B against the HEAD shadow showed nbody
+    and scalar are noise. On repack, `perf stat -r 30` has the new build
+    ~16% FASTER, with the same instruction count (268.5M vs 268.8M), so
+    that bench just swings both ways.
+  - Still to do: the finalize exit-snapshot tests.
   - Known cost, and it is by design (LuaJIT pays the same): a NON-konst
     value kept only by a snapshot still gets a register and code. No
     bench has one; every IR difference is a konst.

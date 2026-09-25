@@ -156,3 +156,67 @@ test "doc 56 Phase 1: ordinary traces carry sparse exit snapshots of bytecode-LI
     }
     try testing.expect(saw_snap_trace);
 }
+
+test "doc 56 Phase 1: a compiled trace maps every exit-snapshot value, carried home and sunk-store read" {
+    const nativegen = @import("nativegen.zig");
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // The inner loop has side exits (the `t[i] > 32` branch, the table
+    // reads) with snapshots, a carried accumulator, and a store to `u`.
+    const source =
+        \\local t, u = {}, {}
+        \\for i = 1, 64 do t[i] = i; u[i] = 0 end
+        \\local acc = 0
+        \\for i = 1, 64 do
+        \\  local x = t[i]
+        \\  if x > 32 then acc = acc + x else acc = acc - 1 end
+        \\  u[i] = acc
+        \\end
+        \\print(acc)
+    ;
+    var rec = try Recorded.init(gpa, source, "1520\n");
+    defer rec.deinit();
+    const vm = rec.vm;
+
+    var saw_map = false;
+    for (vm.trace.registry.cache.items) |t| {
+        const c = &t.code;
+        if (c.exit_snapshots.len == 0) continue;
+        const ct = vm.trace.nativeFor(t) orelse continue;
+        const m = &ct.exit_locs;
+        saw_map = true;
+        // One row per value, strictly sorted by ref.
+        for (1..m.values.len) |vi| try testing.expect(m.values[vi - 1].ref < m.values[vi].ref);
+        // Every value a snapshot restores has a row; a constant is always
+        // recoverable.
+        for (c.exit_snapshot_slots) |ss| {
+            const row = m.find(ss.ref) orelse return error.SnapshotRefUnmapped;
+            if (c.instrs[ss.ref].op == .konst) try testing.expectEqual(nativegen.ExitLoc.Tag.konst, row.tag);
+        }
+        // Every carried home names a real place for its entry load.
+        for (m.carried) |h| {
+            const row = m.find(h.ref) orelse return error.CarriedHomeUnmapped;
+            try testing.expectEqual(trace_ir.IrOp.slot_load, c.instrs[h.ref].op);
+            try testing.expect(row.tag != .none and row.tag != .konst);
+            try testing.expectEqual(nativegen.ExitLoc.LIVE_WHOLE_BODY, row.live_until);
+        }
+        // Every sunk store below an exit has its operands mapped.
+        var first_exit: ?usize = null;
+        for (0..c.instrs.len) |i| if (c.exitSnapIdx(i) != null) {
+            first_exit = i;
+            break;
+        };
+        if (first_exit) |fe| for (c.instrs[fe + 1 ..], fe + 1..) |ins, i| switch (ins.op) {
+            .astore, .hstore, .ustore, .gstore, .sgm_setpos => {
+                try testing.expect(m.find(ins.a) != null);
+                try testing.expect(m.find(ins.b) != null);
+                // The value is still held at every exit above the store.
+                for (fe..i) |e| {
+                    if (c.exitSnapIdx(e) != null and ins.b < e) try testing.expect(m.at(ins.b, e) != null);
+                }
+            },
+            else => {},
+        };
+    }
+    try testing.expect(saw_map);
+}

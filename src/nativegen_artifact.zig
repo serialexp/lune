@@ -408,6 +408,106 @@ pub const SeedPlan = struct {
     }
 };
 
+/// Doc 56 §4.2 (Phase 1): what kind of place holds one value in a compiled
+/// body. `reg`/`xmm` carry the register number, `spill` the frame byte
+/// displacement (`[rsp + disp]` in the body frame), `konst` the index into
+/// `TraceCode.consts` (rebuilt from the constant, never read from the
+/// body), and `none` means the body keeps no copy at all (a `.none`-kind
+/// value, e.g. a dead window load).
+pub const ExitPlaceTag = enum(u8) { reg, xmm, spill, konst, none };
+
+/// Doc 56 §4.2 (Phase 1): one row of the exit location map — where the
+/// value of IR ref `ref` lives in the compiled body.
+///
+/// The allocator never splits a live range, so a value has ONE place for
+/// its whole life; only the life itself varies. The place holds the value
+/// at an exit instruction `e` exactly when `ref < e <= live_until`
+/// (`holdsAt`). A slot home is pinned all body long (`live_until` =
+/// `LIVE_WHOLE_BODY`) unless an in-place (win 2) update overwrites it, and
+/// a constant is always recoverable.
+pub const ExitLoc = struct {
+    ref: u16,
+    live_until: u16,
+    kind: Kind,
+    tag: ExitPlaceTag,
+    /// For a `slot_load` of an INVARIANT slot: that slot. Restoring the
+    /// same slot from this value needs no store (nothing in the body writes
+    /// it, so the slab is already current). `NO_SLOT` otherwise.
+    invariant_slot: u16 = NO_SLOT,
+    /// `reg`/`xmm`: the register's enum value; `spill`: byte displacement;
+    /// `konst`: constant index; `none`: 0.
+    payload: u32 = 0,
+
+    pub const Tag = ExitPlaceTag;
+    pub const NO_SLOT: u16 = std.math.maxInt(u16);
+    pub const LIVE_WHOLE_BODY: u16 = std.math.maxInt(u16);
+
+    pub fn holdsAt(self: ExitLoc, exit_instr: usize) bool {
+        if (self.tag == .none) return false;
+        if (self.tag == .konst) return true;
+        return self.ref < exit_instr and exit_instr <= self.live_until;
+    }
+};
+
+/// Doc 56 §4.2 (Phase 1): a carried slot whose current value lives in a
+/// machine home, not the slab (the slab is stale after the first
+/// back-edge). An exit that resumes mid-iteration must write it back unless
+/// its snapshot restores that slot itself. `ref` is the slot's entry
+/// `slot_load`; its place is in `ExitLocMap.values`.
+pub const CarriedHome = struct {
+    slot: u16,
+    ref: u16,
+    kind: Kind,
+};
+
+/// Doc 56 §4.2 (Phase 1): the native EXIT LOCATION MAP. For every value an
+/// exit may need — an exit-snapshot ref, anything a sunk store reads
+/// (through its address tokens), and each carried slot's home — the place
+/// that value lives in the compiled body. One row per distinct value,
+/// sorted by `ref`; an exit's view is derived through its snapshot
+/// (`TraceCode.exit_snap_by_ord`) plus `ExitLoc.holdsAt`. It is data, so an
+/// adapter can be built later without recompiling the parent (§4.6).
+///
+/// Inert in Phase 1: nothing reads it, and building it changes neither the
+/// allocation nor the code. A value whose life ended before an exit is
+/// simply not held there; attachable exits get their liveness extended in
+/// a later phase. Fail-soft: empty on precise, peeled and snapshot-less
+/// traces, and on allocation failure. Owned by the `CompiledTrace`.
+pub const ExitLocMap = struct {
+    values: []ExitLoc = &.{},
+    carried: []CarriedHome = &.{},
+
+    pub fn deinit(self: *ExitLocMap, gpa: std.mem.Allocator) void {
+        if (self.values.len != 0) gpa.free(self.values);
+        if (self.carried.len != 0) gpa.free(self.carried);
+        self.* = .{};
+    }
+
+    /// The row for `ref`, or null when no exit needs it.
+    pub fn find(self: *const ExitLocMap, ref: usize) ?ExitLoc {
+        var lo: usize = 0;
+        var hi: usize = self.values.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const r = self.values[mid].ref;
+            if (r == ref) return self.values[mid];
+            if (r < ref) lo = mid + 1 else hi = mid;
+        }
+        return null;
+    }
+
+    /// Where `ref` lives at exit instruction `exit_instr`, or null when the
+    /// body no longer holds it there (or never did).
+    pub fn at(self: *const ExitLocMap, ref: usize, exit_instr: usize) ?ExitLoc {
+        const loc = self.find(ref) orelse return null;
+        return if (loc.holdsAt(exit_instr)) loc else null;
+    }
+
+    pub fn bytes(self: *const ExitLocMap) usize {
+        return self.values.len * @sizeOf(ExitLoc) + self.carried.len * @sizeOf(CarriedHome);
+    }
+};
+
 /// A compiled trace: an executable page whose entry is
 /// `fn(tags: [*]u8, payloads: [*]u64, result: *NativeResult) callconv(.c) void` —
 /// the SoA register file's two base pointers (tags in rdi, payloads in rsi), plus
@@ -506,6 +606,10 @@ pub const CompiledTrace = struct {
     /// `local_completed` whenever local progress is nonzero — mirroring
     /// irinterp's `completed += 1 + (peeled and completed == 0)` at `.loop`.
     peeled: bool = false,
+    /// Doc 56 §4.2 (Phase 1): where each value an exit may need lives in
+    /// this body (see `ExitLocMap`). Inert until the exit adapters land.
+    /// Owned; freed in `deinit` via `gpa`.
+    exit_locs: ExitLocMap = .{},
 
     pub const EntryFn = fn ([*]u8, [*]u64, *NativeResult) callconv(.c) void;
     /// The shared frameless trampoline's C-ABI type: SoA lanes + result out-param,
@@ -733,6 +837,7 @@ pub const CompiledTrace = struct {
         if (self.slot_rowless_ok.len > 0) self.gpa.free(self.slot_rowless_ok);
         if (self.silent_sites.len > 0) self.gpa.free(self.silent_sites);
         if (self.metadata_cells.len > 0) self.gpa.free(self.metadata_cells);
+        self.exit_locs.deinit(self.gpa);
         self.* = undefined;
     }
 };

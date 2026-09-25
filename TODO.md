@@ -1760,3 +1760,30 @@ demotions in trace.zig, compiler-adjudicated). Deferred items:
       codegen (doc 54 P0 inline push) — profile matches the
       pre-existing flake (jit-debug only, not seed-deterministic), but
       the P0 sabotage battery should re-check this once landed.
+- [ ] Occurrence 8 (2026-09-25, doc 56 Phase 1 exit-location-map gate,
+      seed 0xb4d300c9, binary 29c17f2e…): one stray `failed command:
+      …/29c17f2e…/test --seed=0xb4d300c9 --listen=-` line; the output
+      was lost to a `grep | head` pipe (the fifth repeat of the mistake
+      above) and the exit code was not captured. Four log-captured
+      re-runs (three fresh seeds, one the same seed): exit 0, empty
+      output each.
+- [ ] Occurrence 9 (same day, same change, seed 0x16cbc5fb, binary
+      b8d0508e…): FULLY captured (`> log 2>&1`). It has occurrence 4's
+      shape exactly: the overall run EXITED 0, and the 40925-line log has
+      only three lines that aren't `[jit]` probe spam — `test`, a
+      truncated progress line `+- run test w`, and the final `failed
+      command: …/b8d0508e…/test --seed=0x16cbc5fb --listen=-`. There is
+      no `error: '…' failed` line, no panic/signal and no Build Summary.
+      This is strong evidence the stray line is the build runner's
+      progress/respawn output, not a failing test. The next step is to
+      read the pinned zig's build runner (`lib/compiler/build_runner.zig`
+      / `std.Build.Step.Run` `--listen` handling) for when it prints
+      "failed command" on a step that ends up succeeding.
+- [ ] Occurrence 10 (same day, after the review fixes, seed 0xa167519b):
+      identical shape, exit 0. It is **not caused by the doc 56 exit
+      location map**: the first jit-debug gate run on a clean HEAD shadow
+      (0889c7b, `/tmp/lune-head`, seed 0x2bc1a9b3) printed the same three
+      non-probe lines (`test`, `+- run test w`, `failed command: …`) and
+      exited 0. It reproduces often now (3 of the last 4 uncached runs), so
+      it is cheap to hunt. The log is about 40.9k lines of `[jit]` probe
+      spam; the large stderr volume is a suspect for the runner.
