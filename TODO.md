@@ -1782,7 +1782,18 @@ nothing at all.
       IR types); read `lj_record.c`/`lj_snap.c` first.
 - [ ] **`not` is unsupported in `proveKinds`.** `if p[i] and not q[i]`
       stops a loop going native (`fail-at %17 op=not ty=boolean`).
-      General boolean coverage; do it with the item above.
+      General boolean coverage; do it with the item above. Probe of six
+      boolean loop shapes (2026-09-27): only `t[i] = (i % 2 == 0)` runs
+      native. `if flag` (invariant bool local) and `b = not b` fail on the
+      untyped slot_load; `not t[i]` fails on `not`; `t[i] == true` aborts
+      the RECORDING (`bad_type`, pc 72 op 23). Needs a design note
+      ("native booleans") — no `guard_bool` IR op exists.
+- [ ] **A branch that flips for good strands the loop on tier-0 (switch
+      off).** `for i = 1, N do local lt = i < 500; if lt then … end end`:
+      after i = 500 the root trace fails its first guard every entry,
+      legacy strikes gate it, 99.5% runs on tier-0. With the switch on it
+      runs 94% as a trace but the seam is 63% of the run — a Phase 6
+      test case.
 - [ ] **Exit stub precedence (doc 56 Phase 7).** An exit with a
       published adapter takes it even when its ordinary slot holds a
       live, silent region bridge (sieve_int, nsieve-bit: 232 → 39,732

@@ -460,6 +460,24 @@ the ones that bite):
     b. doc 56 Phase 6 plan (silent promotion of exit-side edges) →
        Antigravity review → build;
     c. Phase 7 (stub precedence, nested exits), then flip the switch.
+  - A six-shape boolean probe (`/tmp/boolshapes.lua`, copied into
+    TODO.md) shows 5 of 6 boolean loops never go native. A flipped branch
+    (`/tmp/boolC.lua`) is a clean Phase 6 case: switch on gives 94%
+    traced but a 63% seam.
+- **NEW ARC (a): doc 57 native booleans (2026-09-27).** Design written,
+  Bart picked **Option B** (LuaJIT value specialization: `nil`/`false`/
+  `true` inputs are pinned by strict guards and folded to konsts; dynamic
+  `.bool` stays for compare results and bool-lane loads). Reviewed twice
+  by Antigravity (r1 CHANGES REQUESTED 8 findings, r2 APPROVE WITH CHANGES
+  5 findings), all folded in → rev 4. Receipt:
+  `docs/reviews/doc57/antigravity.md`. Shape: three guards
+  `guard_is_nil/false/true`, recorder `pinPrim`, close-time check in
+  `loopCloseSelfDefeating`, prove/alloc `pin_only` slots, native `not`/
+  bool `eq`. P3 (LuaJIT `instunroll` for a flipped carried bool) is later.
+  - Rule slips this session (report to Bart): a heredoc append to
+    `docs/reviews/doc57/antigravity.md` and a no-op `sed -i` on doc 57
+    (Rule #6). Content is correct; left in place (Rule #19).
+  - NEXT: implement P1 (IR + recorder + tier-1a), then P2 (native).
 
 ## Status 2026-09-24 (latest+27) — doc 55 §2 + §2d LANDED: fft 14.6× → 12.6× LJ, sparse −31%; silent switch is now data (no runtime code patching)
 
