@@ -809,6 +809,139 @@ only their map entry.
 - **Prologue failure.** The child's `prologue_fail` resumes tier-0 at
   `P`, which is its anchor, as for any continuation. No new contract.
 
+#### 4.6.1 Phase 4 plan (2026-09-26)
+
+Phase 4 does, for native code, what Phase 3 did for tier-1a: a wanted
+or attached exit materializes at `P` and returns to the runtime, which
+then chains into the continuation at `P` or records one there. The
+adapter's direct jump into the child needs the ledger grammar and so
+moves with it to Phase 5.
+
+- **A native-only switch, off by default.** `Config.exit_side_native`.
+  Until Phase 5, every native hop returns to the runtime and re-enters
+  the child through `driveChain`, which costs about 600 ns. fft makes
+  about 500k hops, so turning this on now would make fft slower. The
+  switch turns on at the end of Phase 6 (direct jump plus silent cycles)
+  and is measured then. Tests turn it on. It also gates the stub and the
+  liveness extension below, so with it off the machine code is
+  byte-identical and the native board does not change.
+- **Who may take the path (v1).** The same rule as Phase 3: only the
+  dispatcher's direct entry. A new `NativeResult.exit_side_ok` byte is
+  set only by that call site. The stub also requires `ledger_len == 0`
+  and `silent_active == 0`: the exiting trace is the entered trace,
+  nothing chained before it, and no silent transition ran (a silent
+  transition writes no row, so `ledger_len` alone can't see it, and the
+  dispatcher sends any `silent_active` result through the silent drain
+  and `replayLedgerFrom` first; review finding 1). Every other native run
+  (bursts, chains, silent drains, and any trace reached through a link)
+  keeps the anchor-coherent exit, so no ledger replay can meet the new
+  row yet. Phase 5 widens this.
+- **The stub.** For an attachable exit of a native page with a
+  non-empty exit location map, right after `exit_instr` is written:
+
+  ```
+  mov rax, imm64            ; &exit_side_cells[ei]
+  cmp qword [rax], 0
+  je  .ordinary
+  cmp byte [rdx + exit_side_ok], 0
+  je  .ordinary
+  cmp qword [rdx + ledger_len], 0
+  jne .ordinary
+  cmp qword [rdx + silent_active], 0
+  jne .ordinary
+  jmp qword [rax]           ; the adapter
+  .ordinary:                ; today's code, unchanged
+  ```
+
+  Only `rax` and the flags are touched, and neither is live at a guard.
+  The cells array (one `usize` per instruction, zero by default) is owned
+  by the `CompiledTrace`, so its addresses are stable for the page's
+  life.
+- **The adapter**, built when the exit becomes wanted, from the exit
+  location map alone (the allocator's output is gone by then). It gets a
+  synthetic `Alloc`:
+  - `loc[ref]` comes from the map row (register, XMM or spill);
+  - `slot_id_of_ref` is all `-1`, so `arrayFieldReg` reloads the
+    array's `data`/`present` pointer from the table ref instead of using a
+    hoisted base register (the same pointer, by the B5 invariant);
+  - a synthetic `kinds` slice of the trace's length (`.none`, then each
+    map row's kind), since the store emitters branch on `kinds[ins.b]`
+    (review finding 2);
+  - a constant a store reads is first written into a spill cell above
+    the parent's frame, so it has a place like any other value. The
+    frame's end is `spill_count` plus the boxed-tag spill cells
+    (`boxedTagSpill` addresses them past `spill_count`); the map records
+    that total at compile time (review finding 5). The trampoline
+    reserves `SPILL_MAX` words, so the cells above it are free. Refuse if
+    they run out.
+
+  With that, the existing store leaf emitters (`emitAStore`,
+  `emitHStore`, `emitGStore`) and `flushSlot` are reused unchanged. The
+  snapshot flush is a dedicated loop over the map rows, not
+  `emitPreciseSnapshotFlush`, which needs the real slot table (review
+  finding 3). The sequence:
+  1. every sunk store with `0 < ord < guard.ord`, in stream order;
+  2. every carried home (what `deopt_exit` writes: at this exit the slab
+     is stale for those);
+  3. the exit snapshot's slots, which override step 2. A constant is
+     written as an immediate. A slot restored from its own invariant load
+     (`ExitLoc.invariant_slot`) is skipped (the slab is current);
+  4. `completed = rbx`, `exit_reason = .exit_side`, a
+     `LedgerKind.exit_side` row, `final_trace_id`, then `jmp` through
+     the adapter's target cell. In Phase 4 the target is always
+     `shared_exit`.
+
+  Build refuses, and the exit gives up (it keeps today's routes), when a
+  needed value is not held at the exit (`ExitLocMap.at` is null: a
+  `uref` placed after the guard, a `.none` load, a φ), when the map is
+  empty, or when constant staging would pass `SPILL_MAX`. Refusals are
+  counted in `--jit-stats`.
+- **Liveness extension** (§4.6 "Register allocation", Q3). With the
+  switch on, `nativegen_alloc` extends every value an attachable exit
+  needs to that exit: its snapshot refs, the operand closure of every
+  sunk store with a lower ordinal, and carried loads (already pinned).
+  When the guard itself reads the value, the extension goes one past the
+  guard, so operand reuse (win 1) cannot hand its register to the
+  guard's result. The attachable set is the Phase 2 memo.
+- **Ownership.** New `CompiledTrace` fields: `exit_side_cells: []usize`
+  (heap, RW, one per instruction) and the adapter pages, each with its
+  own heap target cell (never inside the RX page). Adapter pages live in
+  the shared `McodeArena`; `CompiledTrace.deinit` frees them, the cells
+  and the target cells (review finding 4). Giving up clears the exit's
+  cell back to zero; the page stays until the parent dies.
+- **Runtime.**
+  - The native run wrappers take the `exit_side_ok` flag, and only the
+    dispatcher's direct entry sets it.
+  - `ExitReason.exit_side` may now come from native. The dispatcher's
+    arm asserts a single `exit_side` row owned by the entered trace, then
+    calls `consumeExitSide`, whose chain uses the native tier and whose
+    receipt uses `.native_direct` (review finding 6).
+    `driveChain`'s `.exit_side` materialization accepts native (its
+    tier-1a-only assert goes) and skips the arms that assume an
+    anchor-coherent exit (the M1 half-fusion arm and the composite-bridge
+    arm of the failed guard).
+  - `LedgerKind.exit_side` (append-only ordinal) is added to every
+    exhaustive switch: `commitsGuestWork` is true, and region work is
+    `local + 1` (§4.8's table). `replayLedgerFrom` panics on it in Phase
+    4, since v1 scoping guarantees it never reaches a chain ledger.
+  - Routing: a new `ExitRoute.native_direct` from the dispatcher's
+    direct native receipt. `routeExitSide` builds the adapter and sets
+    the cell at `.none → .wanted`; a failed build goes straight to
+    `.gave_up`. `.wanted → .gave_up` clears the cell. An attached exit
+    keeps its cell, and every firing returns to the runtime and chains
+    until Phase 5 retargets the adapter.
+- **Tests.**
+  - The Phase 3 exit-side tests on the native legs, with the switch on:
+    output parity, and proof that the path actually fires (adapter
+    builds, native exit-side hops, binds);
+  - adapter unit tests: each store lane (int widths, bool, f64, value
+    lane), `hstore`, `ustore`, `gstore`, a spilled operand, a constant
+    operand, a float XMM value, a carried home overridden by a snapshot
+    slot;
+  - a refusal for each reason;
+  - the switch off leaves the machine code byte-identical (native sizes
+    equal to HEAD).
+
 ### 4.7 Tier-1a and the runtime chain (Phase 3)
 
 Tier-1a materializes **inside `irinterp.executeImpl`**, at the guard
