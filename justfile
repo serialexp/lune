@@ -62,11 +62,11 @@ hashgate *args: release
 # hour on a phantom regression (CURRENT_TASK LATEST-69). After this, restore the
 # baseline sources in DEST (`git show HEAD:<file> > <file>`), build there, and
 # verify the binary is really the baseline: `nm DEST/zig-out/bin/mahina | grep
-# <new-symbol>` must come up empty.
+# <new-symbol>` must come up empty. The caches are never copied at all (the
+# local .zig-cache runs to tens of GB; copy-then-delete once filled /tmp).
 shadow dest:
     rm -rf {{dest}}
-    cp -r . {{dest}}
-    rm -rf {{dest}}/.zig-cache {{dest}}/zig-out
+    rsync -a --exclude /.zig-cache --exclude /zig-out ./ {{dest}}/
 
 # Regenerate src/gen/unicode_case.zig from the vendored UCD (design doc 06, S-C).
 # Pure + offline; only needed when re-vendoring a new pinned Unicode version.
