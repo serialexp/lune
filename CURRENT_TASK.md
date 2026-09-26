@@ -404,6 +404,62 @@ the ones that bite):
     links.
   - Implementation order: the checklist under doc 56 "Phase 5".
   - Then Phase 6 (silent promotion), then flip the switch and measure.
+- **Phase 5 DONE and committed (2026-09-27), switch still off.** Arm
+  kind, cells, adapter tail, replay grammar, dispatcher routing, arming.
+  Gates: `just test` 0, jit-debug 0. Review: Antigravity APPROVE WITH
+  CHANGES, both findings fixed (`docs/reviews/doc56/antigravity-phase5.md`).
+  Full as-built + measurements: doc 56 checklist "Phase 5".
+  - Tests added: hand-built replay grammar on real armed traces (fused
+    hop, unarmed terminal, 32-row yield, child deopt, child prologue
+    fail + disarm), registry cells (own cell, sibling on the same exit,
+    re-arm, retire, blackout), and two regressions below.
+  - New counter `exit_side_yields` (on the `--jit-stats` arms line).
+  - **Bug 1 (Phase 3/4 latent, crashed the CLI on fft bit-reverse):**
+    `driveChain` said "not linked" when the continuation's own `.link`
+    was armed (multi-row ledger), and `routeExitSide` asserted the
+    chain stopped at `P`. Fix: the seed-ledger path sets `linked` when
+    the head row is the seed's `.link`; the router honours a resume
+    away from `P` (a missing pc there is a release panic, per review). The
+    harness never hit it (hotloop 4); `CapturedOpts.hotloop` added and a
+    test runs at the CLI threshold.
+  - **Bug 2 (wrong answers, nsieve with the switch on):**
+    `resolveSuccessorAnchor` used a branch guard's `guardExitPc` (its
+    fall-through pc, whichever way it recorded) as a successor whenever a
+    trace sat there. Doc 56 children sit mid-body, so nsieve's composite
+    exit got a region bridge onto the prime path; later calls counted
+    composites as primes. Fix: plain guard edges only for numeric-for
+    loop-done guards (post-loop pc) and exit-side exits (their `P`);
+    composites keep the CFG overlay. 18 region fixtures used fake `ret`
+    bytecode with the old rule; they now use `loopDoneCode` (every op a
+    `for_loop` with a back-edge to nowhere). A-vii-b moved its composite
+    branch to pc 10 (+`jmp` at 11). Regression test: repeated nsieve.
+  - Parity sweep (ReleaseSafe, 28 benches × tier-0/tier-1a/native/
+    native+exit-side): all identical. nsieve default mode still arms 2
+    bridges, ~94k bridge hops.
+  - Measured (Debug, no timing claims): sunk-store loop 9382/9384 hops
+    fused; fft bit-reverse 24881/24888 fused, 4 exits armed. The seam
+    (replayLedger walks) is still most of the cost — that is Phase 6.
+  - Added after the first write-up: a real machine-code test where a
+    native run entered at the child fills the ledger so the adapter
+    itself yields (case (c') in `checkExitSideReplay`; mutation-checked:
+    breaking the `exit_reason` reset fails it).
+  - Measured (ReleaseFast, machine loaded, best of 2×5): switch off =
+    HEAD within noise. Switch on is slower: fft 209 → 333 ms, nsieve
+    12 → 181, nsieve-bit 14 → 36, nsieve-bit-fp 283 → 389, sieve_int 6
+    → 23. Three causes, all in doc 56 "Measured (2026-09-27)" and
+    TODO.md "Doc 56 Phase 5 findings":
+    1. the replay seam (exit-side cycles not silent) — Phase 6;
+    2. a boolean read from a slot has no native kind, so nsieve's child
+       never compiles (general gap: `t[i] = flag` loops never go native;
+       `not` also unsupported);
+    3. exits of exit-side children are never wanted, and the stub
+       prefers the adapter over a live silent bridge — Phase 7.
+  - NEXT (pick in this order unless evidence says otherwise):
+    a. the boolean slot kind + `not` in `proveKinds` (general native
+       coverage, own design note, small; read LuaJIT's typed SLOAD);
+    b. doc 56 Phase 6 plan (silent promotion of exit-side edges) →
+       Antigravity review → build;
+    c. Phase 7 (stub precedence, nested exits), then flip the switch.
 
 ## Status 2026-09-24 (latest+27) — doc 55 §2 + §2d LANDED: fft 14.6× → 12.6× LJ, sparse −31%; silent switch is now data (no runtime code patching)
 

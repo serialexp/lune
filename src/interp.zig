@@ -3433,6 +3433,9 @@ pub const Vm = struct {
             switch (@as(nativegen.LinkHitKind, @enumFromInt(rec.kind))) {
                 .ret_cont => ts.ret_cont_link_hits +|= rec.count,
                 .call_head => ts.call_head_link_hits +|= rec.count,
+                // Doc 56 Phase 5: exit-side cells are never followed
+                // rowlessly, so their records are never published.
+                .exit_side => @panic("motion totals: exit-side record published"),
                 .sibling_handoff => {
                     // P2 amendment: rowless sibling records validate STRONGLY
                     // against the registry (immutable between episode start
@@ -3595,8 +3598,6 @@ pub const Vm = struct {
     ///   3. Otherwise resume tier-0 at `P`; a still-wanted exit first asks
     ///      for a continuation recording there (`maybeArmExitSide`), which
     ///      needs `.full` mode for the dispatch prologue to start it.
-    /// `anchor_pc` is where a chain result without a resume pc resumes (the
-    /// dispatcher's own convention).
     fn consumeExitSide(
         self: *Vm,
         comptime mode: ExecMode,
@@ -3606,7 +3607,6 @@ pub const Vm = struct {
         proto: *const Proto,
         regs: RegWindow,
         base: usize,
-        anchor_pc: usize,
         safe_to_arm: bool,
     ) EntryDirective {
         const ts = &self.trace;
@@ -3619,15 +3619,76 @@ pub const Vm = struct {
         ts.dbg("exit-side hop: trace={d} exit={d} state={s} tier={s} resume pc={d} completed={d}", .{ ct.id, ei, @tagName(ct.exitSideAt(ei)), @tagName(tier), p, result.completed });
         ts.noteTakenExit(ct, ei, done, proto, if (tier == .native_only) .native_direct else .tier1a_direct);
         ts.onSideExitReceipt(ct, done, ei, done, .deferred, .entered);
+        return self.routeExitSide(mode, tier, ct, result, proto, regs, base, safe_to_arm);
+    }
+
+    /// Doc 56 Phase 5: an UNARMED exit adapter ended a replayed native
+    /// ledger (`ChainResult.exit_side`). The replay already charged its row
+    /// (region receipt and selection) and published `P` as the resume; the
+    /// hot-exit count and the routing run here, after the walk, because
+    /// routing can arm.
+    fn consumeExitSideTerminal(
+        self: *Vm,
+        comptime mode: ExecMode,
+        es: trace.ExitSideTerminal,
+        proto: *const Proto,
+        regs: RegWindow,
+        base: usize,
+        safe_to_arm: bool,
+    ) EntryDirective {
+        const ts = &self.trace;
+        std.debug.assert(es.trace.exitSideAt(es.exit).materializes());
+        ts.dbg("exit-side hop: trace={d} exit={d} state={s} tier=native_ledger resume pc={d} done={d}", .{ es.trace.id, es.exit, @tagName(es.trace.exitSideAt(es.exit)), es.trace.code.exitResumePc(es.exit).?, es.done });
+        ts.noteTakenExit(es.trace, es.exit, es.done, proto, .native_direct);
+        return self.routeExitSide(mode, .native_only, es.trace, .{ .completed = es.done -| 1, .exit_instr = es.exit }, proto, regs, base, safe_to_arm);
+    }
+
+    /// Doc 56 Phase 5: the routing half of `consumeExitSide` — everything
+    /// after the receipt. Also run for an exit whose unarmed adapter ended a
+    /// replayed native ledger (`consumeExitSideTerminal`).
+    ///   1. Chain into a `.link` continuation at `P`. One that runs to its
+    ///      `.link` serves the exit: bind a wanted exit to it, and (native)
+    ///      arm the adapter to jump straight into it next time.
+    ///   2. Otherwise resume tier-0 at `P`; a still-wanted exit first asks
+    ///      for a continuation recording there (`maybeArmExitSide`), which
+    ///      needs `.full` mode for the dispatch prologue to start it.
+    /// A LINKED chain without a resume pc resumes at the loop header, `ct`'s
+    /// anchor (`ChainResult`'s convention: the `.link` closed the iteration
+    /// there). A chain that did not link always publishes one under
+    /// `.exit_side` materialization — the slab is coherent at `P` or later,
+    /// never back at the header — so a missing pc there is a broken
+    /// invariant, not a default.
+    fn routeExitSide(
+        self: *Vm,
+        comptime mode: ExecMode,
+        comptime tier: trace.ChainTier,
+        ct: *trace.Trace,
+        result: trace_exec.ExecResult,
+        proto: *const Proto,
+        regs: RegWindow,
+        base: usize,
+        safe_to_arm: bool,
+    ) EntryDirective {
+        const ts = &self.trace;
+        const ei = result.exit_instr;
+        const p = ct.code.exitResumePc(ei).?;
+        const anchor_pc: usize = ct.code.anchor.pc;
         if (ts.driveChain(ct, result, proto, regs, tier, .{ .exit_side = p }, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
             if (chain.linked) {
                 ts.exit_side_chains +|= 1;
                 ts.bindExitSide(ct, ei, .chain);
+                if (tier == .native_only) ts.armExitSide(ct, ei, proto, p, safe_to_arm);
                 return .{ .resume_tier0 = chain.resume_pc orelse anchor_pc };
             }
-            // A continuation at `P` zero-exited: its receipt is charged and
-            // the resume is `P`. A wanted exit records a sibling below.
-            std.debug.assert(chain.resume_pc == p);
+            // No continuation ran to its `.link`. One that deopted before it
+            // resumes at `P` (its receipt charged), and a wanted exit records
+            // a sibling below. But a native one can also deopt through an
+            // armed handoff into a same-anchor sibling that carries the run
+            // on elsewhere: honour the chain's resume, and record nothing —
+            // tier-0 is no longer at `P`.
+            const rpc = chain.resume_pc orelse
+                @panic("routeExitSide: an exit-side chain that did not link left no resume pc");
+            if (rpc != p) return .{ .resume_tier0 = rpc };
         }
         if (ct.exitSideAt(ei) == .wanted and ts.maybeArmExitSide(ct, ei, proto, p, base)) {
             if (mode == .fast) return .{ .switch_mode_at = p };
@@ -3834,6 +3895,12 @@ pub const Vm = struct {
             if (ran_native) {
                 if (self.trace.driveDispatcherSilentResult(ct, result, proto, regs, safe_to_arm)) |chain| {
                     if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                    // Doc 56 Phase 5: never an adapter row here. The stub
+                    // refuses once a silent transition ran, and a silent
+                    // epilogue refuses once any row (an adapter's included)
+                    // was written. Phase 6 revisits this with its silent
+                    // exit-side site.
+                    std.debug.assert(chain.exit_side == null);
                     const armed_side = self.trace.consumeSideTraceWantAtResume(proto, @intCast(pc));
                     for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
                     if (armed_side and mode == .fast) {
@@ -4148,19 +4215,22 @@ pub const Vm = struct {
             // Doc 56 Phases 3–4: an exit-side exit (tier-1a, or a native exit
             // adapter). The slab is coherent at the exit's resume pc, so none
             // of the anchor-coherent grammar below applies (no sibling trial,
-            // no anchor chain, no deopt replay). Natively the adapter is only
-            // reachable from this direct entry with an empty ledger, so its
-            // row is the only one and belongs to `ct`.
-            if (result.exit_reason == .exit_side) {
+            // no anchor chain, no deopt replay). This arm owns only the
+            // scalar case, the entered trace's own adapter as the only row
+            // (doc 56 Phase 5): a longer native ledger ending in an adapter
+            // row (a yield at the adapter, or an unarmed exit reached after
+            // chained rows) must replay its prefix, so it flows to
+            // `driveDispatcherLedger` below.
+            if (result.exit_reason == .exit_side and (!ran_native or result.ledger_len <= 1)) {
                 std.debug.assert(final == ct);
                 if (ran_native) std.debug.assert(result.ledger_len == 1 and
                     self.trace.ledger_scratch[0].kind == .exit_side and
                     self.trace.ledger_scratch[0].id == ct.id and
                     result.local_completed == result.completed);
                 const d = if (ran_native)
-                    self.consumeExitSide(mode, .native_only, ct, result, proto, trace_regs, base, pc, safe_to_arm)
+                    self.consumeExitSide(mode, .native_only, ct, result, proto, trace_regs, base, safe_to_arm)
                 else
-                    self.consumeExitSide(mode, .ir, ct, result, proto, trace_regs, base, pc, safe_to_arm);
+                    self.consumeExitSide(mode, .ir, ct, result, proto, trace_regs, base, safe_to_arm);
                 for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
                 return d;
             }
@@ -4305,6 +4375,13 @@ pub const Vm = struct {
             if (ran_native and result.ledger_len > 1) {
                 const chain = self.trace.driveDispatcherLedger(ct, self.trace.ledger_scratch[0..result.ledger_len], proto, regs, safe_to_arm);
                 if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                // Doc 56 Phase 5: the span ended on an unarmed exit
+                // adapter; the slab is coherent at `pc` (its resume pc).
+                if (chain.exit_side) |es| {
+                    const d = self.consumeExitSideTerminal(mode, es, proto, regs, base, safe_to_arm);
+                    for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                    return d;
+                }
                 // Side-trace precision: if this burst's terminal
                 // crossed the hotguard threshold, arm the recording
                 // AT the resume so it captures the failing

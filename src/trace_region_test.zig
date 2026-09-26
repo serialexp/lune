@@ -42,6 +42,17 @@ const TraceState = trace.TraceState;
 const util = @import("trace_testutil.zig");
 const winRO = util.winRO;
 
+/// Fixture bytecode for the region-graph tests: every op a numeric `for_loop`
+/// whose back-edge lands nowhere (so `forLoopEndFor` never matches it). A
+/// fixture `guard_true` with exit pc `wp <= code.len` is then a numeric-for
+/// loop-done guard — the one plain guard kind whose exit pc really is a
+/// structural successor (`resolveSuccessorAnchor`; a branch guard's exit pc
+/// is only its fall-through pc and is never an edge). An exit pc past the
+/// array still resolves to nothing.
+fn loopDoneCode(code: []Instr) void {
+    for (code) |*c| c.* = Instr.opAx(.for_loop, 0, -1_000_000);
+}
+
 test "A-ii.2 edge_cache: a 2-anchor cont↔inner cycle resolves both structural edges" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
@@ -49,7 +60,7 @@ test "A-ii.2 edge_cache: a 2-anchor cont↔inner cycle resolves both structural 
     defer state.registry.cache.clearRetainingCapacity(); // traces are stack-allocated; drop pointers pre-deinit
 
     var code: [8]Instr = undefined;
-    for (&code) |*c| c.* = Instr.op0(.ret);
+    loopDoneCode(&code);
     const proto = Proto{ .code = &code, .name = "t", .num_registers = 1 };
 
     // cont @pc2: a `.link` terminal (instrs[1], aux=7) to the inner root at pc7.
@@ -216,8 +227,8 @@ test "A-ii.4 discovery: skip→ramp→inner→cont→skip cycle — owner==skip@
     defer state.registry.cache.clearRetainingCapacity();
 
     const P_ID: u32 = 7;
-    var code: [8]Instr = undefined;
-    for (&code) |*c| c.* = Instr.op0(.ret);
+    var code: [41]Instr = undefined;
+    loopDoneCode(&code);
     const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
 
     // The 4-node cycle. `skip@14` and `inner@7` end `.loop` (loop-root shape); `cont@20`
@@ -336,8 +347,8 @@ test "A-vii-d.0 armability recovery: first-sight unarmable arms on the rebind th
     defer state.registry.cache.clearRetainingCapacity();
 
     const P_ID: u32 = 8;
-    var code: [8]Instr = undefined;
-    for (&code) |*c| c.* = Instr.op0(.ret);
+    var code: [41]Instr = undefined;
+    loopDoneCode(&code);
     const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
 
     // The same 4-node cycle as the discovery pin above, but WITHOUT the external
@@ -459,8 +470,8 @@ test "A-ii.4 finding-3: a member with an incomplete recorded path mints the regi
     // discovered — its structural identity is unaffected — but must NOT be armable, and no
     // member exit may be classified (the def's member_points under-describe the footprint).
     const P_ID: u32 = 7;
-    var code: [8]Instr = undefined;
-    for (&code) |*c| c.* = Instr.op0(.ret);
+    var code: [41]Instr = undefined;
+    loopDoneCode(&code);
     const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
 
     var skip_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
@@ -563,8 +574,8 @@ test "A-ii.4 exit_prov fail-soft: an incomplete-exit_prov trace disarms the whol
     // clear the taint → the region re-arms (auto-recovery). We flip only the flag (leaving
     // `exit_prov` populated) to exercise the graph-completeness gate in isolation.
     const P_ID: u32 = 7;
-    var code: [8]Instr = undefined;
-    for (&code) |*c| c.* = Instr.op0(.ret);
+    var code: [41]Instr = undefined;
+    loopDoneCode(&code);
     const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
 
     var skip_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
@@ -684,8 +695,8 @@ test "A-ii.4 finding-5: a boundary edge added on rebind flips both_count 1→2, 
     // (`cand.armable_owner`) is now false, so the rebind must DISARM it despite the stored
     // armable bit (finding 5). The owner is refreshed to the deterministic placeholder.
     const P_ID: u32 = 7;
-    var code: [8]Instr = undefined;
-    for (&code) |*c| c.* = Instr.op0(.ret);
+    var code: [41]Instr = undefined;
+    loopDoneCode(&code);
     const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
 
     var skip_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
@@ -813,8 +824,8 @@ test "A-ii.4 finding-6: a region-rebuild OOM fails CLOSED — physical indices e
     defer state.registry.cache.clearRetainingCapacity();
 
     const P_ID: u32 = 7;
-    var code: [8]Instr = undefined;
-    for (&code) |*c| c.* = Instr.op0(.ret);
+    var code: [41]Instr = undefined;
+    loopDoneCode(&code);
     const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
 
     var skip_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
@@ -915,8 +926,8 @@ test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) r
     defer state.deinit();
 
     const P_ID: u32 = 7;
-    var code: [8]Instr = undefined;
-    for (&code) |*c| c.* = Instr.op0(.ret);
+    var code: [41]Instr = undefined;
+    loopDoneCode(&code);
     const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
 
     // A minimal non-armable 2-node cycle A@2 ↔ B@7. Build it twice with DIFFERENT
@@ -997,26 +1008,29 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     defer state.registry.cache.clearRetainingCapacity();
 
     var code: [41]Instr = undefined;
-    for (&code) |*ins| ins.* = Instr.op0(.ret);
-    code[13] = Instr.opAx(.jmp_if_true, 0, 0);
-    code[28] = Instr.opAx(.jmp_if_true, 0, 0);
-    code[39] = Instr.opAx(.jmp_if_true, 0, 0);
+    loopDoneCode(&code);
+    // cont's composite branch at pc 10: the recording took the jump, so the
+    // failing guard falls through to pc 11, whose `jmp` lands on skip@14 —
+    // the static-CFG edge `resolveCompositeBridgeSuccessor` discovers. The
+    // loop-done guards (skip's at 28, ext's at 13) keep their `for_loop`.
+    code[10] = Instr.opAx(.jmp_if_true, 0, 0);
+    code[11] = Instr.opJ(.jmp, 2);
     const proto = Proto{ .code = &code, .id = 77, .name = "a-vii-b", .num_registers = 4 };
 
-    // cont@29 --composite--> skip@14 --ordinary--> cont@29.  skip's direct
+    // cont@29 --composite--> skip@14 --loop-done--> cont@29.  skip's direct
     // entry set is {r0,r1}; cont additionally needs r2, so the cycle fixed point
     // makes the bridge descriptor S={r0,r1,r2}. E={r0}, invariants={r1,r2}.
     var cont_i = [_]IrInstr{
         .{ .op = .slot_load, .aux = 0 },
         .{ .op = .slot_load, .aux = 1 },
         .{ .op = .slot_load, .aux = 2 },
-        .{ .op = .guard_true, .a = 0, .aux = 14 },
+        .{ .op = .guard_true, .a = 0, .aux = 11 },
         .{ .op = .phi, .b = 0, .aux = 0 },
         .{ .op = .loop },
     };
     var cont_p = [_]ExitProvEntry{.{ .index = 3, .prov = .{ .guard = .{
         .source_proto_id = proto.id,
-        .source_pc = 13,
+        .source_pc = 10,
         .role = .branch_cond,
         .operand = .a,
         .polarity = .taken,
@@ -1265,8 +1279,8 @@ test "A-ii.4 sibling boundary edge: only the physical MEMBER's exits are credite
     defer state.registry.cache.clearRetainingCapacity();
 
     const P_ID: u32 = 7;
-    var code: [8]Instr = undefined;
-    for (&code) |*c| c.* = Instr.op0(.ret);
+    var code: [41]Instr = undefined;
+    loopDoneCode(&code);
     const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
 
     // Cycle A@2 ↔ B@7 made armable by an external entry X@40→A@2 with A loop-root. A
@@ -1391,8 +1405,8 @@ test "A-ii.4 rebind tombstone: same edge set, incompatible member_points → arm
     defer state.deinit();
 
     const P_ID: u32 = 7;
-    var code: [8]Instr = undefined;
-    for (&code) |*c| c.* = Instr.op0(.ret);
+    var code: [41]Instr = undefined;
+    loopDoneCode(&code);
     const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
 
     // An armable 2-node cycle A@2 ↔ B@7 (X@40→A external entry, A loop-root), where A
@@ -1476,8 +1490,8 @@ test "A-ii.4 lifetime: removeTrace preserves region_defs (logical); clearCache e
     defer state.deinit();
 
     const P_ID: u32 = 7;
-    var code: [8]Instr = undefined;
-    for (&code) |*c| c.* = Instr.op0(.ret);
+    var code: [41]Instr = undefined;
+    loopDoneCode(&code);
     const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
 
     // A plain (non-armable) 2-node cycle on HEAP traces so removeTrace/clearCache can
@@ -1543,8 +1557,8 @@ test "inc-B closed SCC: link-fed root elected + armable; boundary edge hands ele
     defer state.registry.cache.clearRetainingCapacity();
 
     const P_ID: u32 = 21;
-    var code: [8]Instr = undefined;
-    for (&code) |*c| c.* = Instr.op0(.ret);
+    var code: [41]Instr = undefined;
+    loopDoneCode(&code);
     const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
 
     // root@7 (loop shape) --loop_done--> cont@2 --link--> root@7. Closed 2-node SCC.
@@ -1638,8 +1652,8 @@ test "inc-B negatives: guard-fed root, foreign-proto link, and inlined link all 
     const gpa = testing.allocator;
 
     const P_ID: u32 = 22;
-    var code: [8]Instr = undefined;
-    for (&code) |*c| c.* = Instr.op0(.ret);
+    var code: [41]Instr = undefined;
+    loopDoneCode(&code);
     const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
 
     // (a) The cont enters the root through a BRANCH GUARD, not `.link` — the
@@ -1728,8 +1742,8 @@ test "inc-B ambiguity + node-counting: two link-fed roots stay unarmable; two li
     const gpa = testing.allocator;
 
     const P_ID: u32 = 23;
-    var code: [40]Instr = undefined;
-    for (&code) |*c| c.* = Instr.op0(.ret);
+    var code: [41]Instr = undefined;
+    loopDoneCode(&code);
     const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
 
     // (a) rootA@7 --loop_done--> contA@10 --link--> rootB@20 --loop_done-->
@@ -1816,8 +1830,8 @@ test "inc-B open SCC: an incoming boundary edge into a NON-root member disables 
     defer state.registry.cache.clearRetainingCapacity();
 
     const P_ID: u32 = 24;
-    var code: [8]Instr = undefined;
-    for (&code) |*c| c.* = Instr.op0(.ret);
+    var code: [41]Instr = undefined;
+    loopDoneCode(&code);
     const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
 
     // The armable T1 shape (root@7 ↔ cont@2, correct link provenance) PLUS a
@@ -1858,8 +1872,8 @@ test "inc-B fallback_owner flag: set on fallback mint, cleared when the primary 
     defer state.registry.cache.clearRetainingCapacity();
 
     const P_ID: u32 = 25;
-    var code: [40]Instr = undefined;
-    for (&code) |*c| c.* = Instr.op0(.ret);
+    var code: [41]Instr = undefined;
+    loopDoneCode(&code);
     const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
 
     // T1 shape: link-fed root@7 ↔ cont@2, fully closed → fallback tier elects.
@@ -2014,8 +2028,8 @@ test "inc-B dormancy: fallback mint is dormant + excluded from receipt maps; tie
     defer state.registry.cache.clearRetainingCapacity();
 
     const P_ID: u32 = 27;
-    var code: [40]Instr = undefined;
-    for (&code) |*c| c.* = Instr.op0(.ret);
+    var code: [41]Instr = undefined;
+    loopDoneCode(&code);
     const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
 
     // T1 shape: link-fed root@7 ↔ cont@2, fully closed → fallback tier elects.

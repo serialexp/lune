@@ -19,6 +19,7 @@ const ExitLoc = nativegen.ExitLoc;
 const ExitLocMap = nativegen.ExitLocMap;
 const McodeArena = nativegen.McodeArena;
 const TraceCode = @import("trace_code.zig").TraceCode;
+const trace_mod = @import("trace.zig");
 
 /// The Phase 3 sunk-store shape: its `i % 3` exit's adapter applies an
 /// `astore` (whose constant index the store emitter encodes inline),
@@ -78,7 +79,7 @@ fn expectRefused(want: adapter.Refusal, built: adapter.Built) !void {
     switch (built) {
         .adapter => |ad| {
             var owned = ad;
-            owned.deinit(testing.allocator);
+            owned.deinit();
             return error.TestExpectedRefusal;
         },
         .refused => |r| try testing.expectEqual(want, r.why),
@@ -98,17 +99,28 @@ test "doc 56 Phase 4 adapter: a rebuild from the stored map reproduces the publi
     const Check = struct {
         fn run(vm: *Vm, t: *const TraceCode, id: u32, ct: *nativegen.CompiledTrace, gi: u32) !void {
             const published = ct.exitAdapter(gi).?;
-            const built = try adapter.build(testing.allocator, &vm.trace.registry.mcode_arena, t, id, &ct.exit_locs, gi);
+            const cell = ct.exitSideSlot(gi).?;
+            const built = try adapter.build(testing.allocator, &vm.trace.registry.mcode_arena, t, id, &ct.exit_locs, gi, &ct.slots[cell]);
             switch (built) {
                 .refused => return error.RebuildRefused,
                 .adapter => |ad| {
                     var owned = ad;
-                    defer owned.deinit(testing.allocator);
-                    // Same instruction sequence: only the target cell's
-                    // address (an imm64) differs between the two builds.
+                    defer owned.deinit();
+                    // Same instruction sequence (imm64 addresses aside).
                     try testing.expectEqual(published.page.code.len, owned.page.code.len);
                     try testing.expectEqual(gi, owned.exit);
-                    try testing.expectEqual(published.target.*, owned.target.*);
+                    // Phase 5: the exit-side cell lives past the ordinary and
+                    // transition cells. It holds the trampoline exit, or —
+                    // once an `.exit_side` arm is published (this program
+                    // arms it) — exactly that arm's child entry.
+                    try testing.expectEqual(ct.exit_side_cells.len + nativegen.NATIVE_TRANSITION_SLOTS + gi, cell);
+                    var armed: ?*const trace_mod.Trace = null;
+                    for (vm.trace.registry.native_physical.armedLinks()) |l| {
+                        if (l.kind == .exit_side and l.parent.id == id and l.slot_index == gi) armed = l.child;
+                    }
+                    const want = if (armed) |ch| ch.native.compiled.ordinary_entry.? else vm.trace.registry.mcode_arena.trampoline_exit.?;
+                    try testing.expectEqual(want, ct.slots[cell]);
+                    try testing.expect(armed != null);
                 },
             }
         }
@@ -121,9 +133,10 @@ test "doc 56 Phase 4 adapter: every refusal reason fires on the map shape that c
         fn run(vm: *Vm, t: *const TraceCode, id: u32, ct: *nativegen.CompiledTrace, gi: u32) !void {
             const gpa = testing.allocator;
             const arena = &vm.trace.registry.mcode_arena;
+            const target = &ct.slots[ct.exitSideSlot(gi).?];
 
             // no_map: an empty map (a precise/peeled/snapshot-less trace's).
-            try expectRefused(.no_map, try adapter.build(gpa, arena, t, id, &ExitLocMap{}, gi));
+            try expectRefused(.no_map, try adapter.build(gpa, arena, t, id, &ExitLocMap{}, gi, target));
 
             // no_stub: publishing an exit the page has no stub for.
             const past: u32 = @intCast(ct.exit_side_cells.len);
@@ -141,7 +154,7 @@ test "doc 56 Phase 4 adapter: every refusal reason fires on the map shape that c
                     dropped = true;
                 }
                 try testing.expect(dropped);
-                const built = try adapter.build(gpa, arena, t, id, &m, gi);
+                const built = try adapter.build(gpa, arena, t, id, &m, gi, target);
                 try expectRefused(.not_held, built);
                 try testing.expect(built.refused.ref != null);
             }
@@ -152,7 +165,7 @@ test "doc 56 Phase 4 adapter: every refusal reason fires on the map shape that c
                 defer m.deinit(gpa);
                 try testing.expect(m.carried.len != 0);
                 m.carried[0].kind = .boxed;
-                try expectRefused(.kind, try adapter.build(gpa, arena, t, id, &m, gi));
+                try expectRefused(.kind, try adapter.build(gpa, arena, t, id, &m, gi, target));
             }
 
             // spill: no room above the frame for the staged constant 7.
@@ -160,7 +173,7 @@ test "doc 56 Phase 4 adapter: every refusal reason fires on the map shape that c
                 var m = try copyMap(&ct.exit_locs);
                 defer m.deinit(gpa);
                 m.frame_words = nativegen.SPILL_MAX;
-                try expectRefused(.spill, try adapter.build(gpa, arena, t, id, &m, gi));
+                try expectRefused(.spill, try adapter.build(gpa, arena, t, id, &m, gi, target));
             }
         }
     };
@@ -169,17 +182,17 @@ test "doc 56 Phase 4 adapter: every refusal reason fires on the map shape that c
 
 test "doc 56 Phase 4 adapter: allocation failure at any point is clean" {
     const Check = struct {
-        fn buildOnce(gpa: std.mem.Allocator, arena: *McodeArena, t: *const TraceCode, id: u32, map: *const ExitLocMap, gi: u32) !void {
-            switch (try adapter.build(gpa, arena, t, id, map, gi)) {
+        fn buildOnce(gpa: std.mem.Allocator, arena: *McodeArena, t: *const TraceCode, id: u32, map: *const ExitLocMap, gi: u32, target: *const usize) !void {
+            switch (try adapter.build(gpa, arena, t, id, map, gi, target)) {
                 .adapter => |ad| {
                     var owned = ad;
-                    owned.deinit(gpa);
+                    owned.deinit();
                 },
                 .refused => return error.TestUnexpectedRefusal,
             }
         }
         fn run(vm: *Vm, t: *const TraceCode, id: u32, ct: *nativegen.CompiledTrace, gi: u32) !void {
-            try testing.checkAllAllocationFailures(testing.allocator, buildOnce, .{ &vm.trace.registry.mcode_arena, t, id, &ct.exit_locs, gi });
+            try testing.checkAllAllocationFailures(testing.allocator, buildOnce, .{ &vm.trace.registry.mcode_arena, t, id, &ct.exit_locs, gi, &ct.slots[ct.exitSideSlot(gi).?] });
         }
     };
     try withAdapter(konst_store_src, konst_store_out, Check.run);

@@ -68,6 +68,11 @@ pub fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Write
 /// (region discovery, window flushes) that does not survive `deinit`.
 pub const CapturedOpts = struct {
     hotguard: ?u32 = null,
+    /// The loop-recording threshold. The harness default (4) records short
+    /// test loops; pass `trace.Config`'s own default to reproduce the CLI's
+    /// tiering order (arms land at different moments, which exercises
+    /// different ledger shapes).
+    hotloop: u32 = 4,
     coverage: bool = false,
     /// Per-VM jitdbg receipts (`src/jitdbg.zig`): only observable in a
     /// `-Djit-debug=true` build, comptime-inert otherwise. The sanctioned way
@@ -108,7 +113,7 @@ pub fn runCapturedTuned(
     vm.trace.config.execute = mode == .record_execute or mode == .record_execute_noopt or mode == .record_execute_native;
     vm.trace.config.optimize = mode == .record_execute or mode == .record_execute_native;
     vm.trace.config.native_codegen = mode == .record_execute_native;
-    vm.trace.config.hotloop = 4; // record short test loops
+    vm.trace.config.hotloop = opts.hotloop;
     vm.trace.config.coverage = opts.coverage;
     vm.trace.config.debug_log = opts.debug_log;
     vm.trace.config.exit_side_native = opts.exit_side_native;

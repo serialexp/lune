@@ -446,14 +446,24 @@ pub fn driveChain(
                 // grammar the dispatcher's direct-entry drain already walks —
                 // hand the span to it wholesale.
                 return switch (self.ledger_scratch[0].kind) {
-                    .link_terminal, .region_bridge => self.driveSeedLedger(
-                        sct,
-                        self.ledger_scratch[0..sresult.ledger_len],
-                        proto,
-                        regs,
-                        safe_to_arm,
-                        materialization,
-                    ),
+                    .link_terminal, .region_bridge => blk: {
+                        // Doc 56 Phase 5: a span opened by the seed's own
+                        // `.link` row means the continuation ran to its
+                        // `.link` — it served the exit exactly like the
+                        // scalar burst below, however far its armed `.link`
+                        // then fused. A bridge head never reached `.link`.
+                        const head = self.ledger_scratch[0];
+                        var r = self.driveSeedLedger(
+                            sct,
+                            self.ledger_scratch[0..sresult.ledger_len],
+                            proto,
+                            regs,
+                            safe_to_arm,
+                            materialization,
+                        );
+                        r.linked = head.kind == .link_terminal and head.id == sct.id;
+                        break :blk r;
+                    },
                     else => self.driveDispatcherLedger(
                         sct,
                         self.ledger_scratch[0..sresult.ledger_len],
@@ -760,6 +770,9 @@ pub const FrozenFast = struct { key: RegionKey, accum: *RegionAccum };
 
 pub const OrdinaryGuardEntry = struct { parent: *Trace, source_local: usize };
 
+/// Doc 56 Phase 5: the armed exit whose adapter entered the successor.
+pub const ExitSideEntry = struct { parent: *Trace, exit: u32 };
+
 pub const EntryMaterialization = union(enum) {
     ordinary,
     via_bridge,
@@ -767,6 +780,11 @@ pub const EntryMaterialization = union(enum) {
     /// Suppressed M1 source guard. The successor ramp's terminal contract
     /// resumes at this predecessor's coherent anchor, not at the ramp.
     via_ordinary_guard: OrdinaryGuardEntry,
+    /// Doc 56 Phase 5: an exit adapter materialized at the exit's resume pc
+    /// `P` and jumped into this continuation anchored at `P`. Its terminal
+    /// rows resume at its own anchor (like a bridged successor), and a
+    /// prologue failure disarms the arm (`pending_exit_side_disarm`).
+    via_exit_side: ExitSideEntry,
 };
 
 pub const ReplayCursor = struct {
@@ -797,6 +815,7 @@ pub fn applyEdgeCursorTransition(
     kind: ArmKind,
     parent: *Trace,
     child: *Trace,
+    edge_exit: u32,
     edge_resume_pc: u32,
     edge_local: usize,
     resume_pc: *u32,
@@ -817,6 +836,12 @@ pub fn applyEdgeCursorTransition(
         .ordinary_guard => cursor.next_entry = .{ .via_ordinary_guard = .{
             .parent = parent,
             .source_local = edge_local,
+        } },
+        // Doc 56 Phase 5: `cont`/`link_pc` stay as they are — the child's
+        // own `.link` sets them when it closes the iteration.
+        .exit_side => cursor.next_entry = .{ .via_exit_side = .{
+            .parent = parent,
+            .exit = edge_exit,
         } },
     }
     resume_pc.* = edge_resume_pc;
@@ -1075,6 +1100,8 @@ pub fn driveSilentBurst(
                     suppressed_hops +|= fires;
                 },
                 .ret_cont, .call_head => @panic("driveSilentBurst: frame-motion edge promoted"),
+                // Doc 56 Phase 5: no silent site until Phase 6.
+                .exit_side => @panic("driveSilentBurst: exit-side edge promoted"),
                 .sibling_handoff => {
                     self.sibling_handoff_fused +|= followed;
                     const evidence = self.silentSiblingEvidence(
@@ -1218,6 +1245,7 @@ pub fn driveSilentBurst(
             last_edge.arm_kind,
             last_edge.parent,
             last_edge.child,
+            last_edge.exit,
             last_edge.resume_pc,
             @intCast(last_edge_local),
             resume_pc,
@@ -1358,6 +1386,7 @@ pub fn settleNativeCallProvenance(
     safe_to_arm: bool,
 ) void {
     self.applyPendingDisarms();
+    self.drainPendingExitSideDisarm();
     self.applyProvenanceVerdicts(captured.verdicts[0..captured.len]);
     self.drainPendingBridgeArm(safe_to_arm);
     self.drainProvenanceArms(safe_to_arm);
@@ -1490,6 +1519,7 @@ pub fn replayLedgerFrom(
         @panic("replayLedger: ledger length outside [1, LEDGER_CAP]");
     // A-vii-d.1: never inherit a bridge-arm request from a previous ledger.
     self.pending_bridge_arm = null;
+    self.pending_exit_side_disarm = null;
     // Seam timing (diagnostic, `--jit-stats` only): bracket the OUTERMOST walk
     // so `cycles_seam` splits the traced bucket into native-vs-steering. A
     // `seam_t0` of 0 doubles as the "not bracketed" sentinel (coverage off,
@@ -1570,6 +1600,15 @@ pub fn replayLedgerFrom(
             .via_ordinary_guard => |entry| entry,
             else => null,
         };
+        // Doc 56 Phase 5: entered by an exit adapter's armed jump. The row's
+        // owner is a continuation anchored at the exit's resume pc, which
+        // the `.exit_side` row published into `resume_pc`; its terminal
+        // rows resume there (the bridged-successor discipline).
+        const exit_side_entry: ?ExitSideEntry = switch (entry_materialization) {
+            .via_exit_side => |entry| entry,
+            else => null,
+        };
+        const entered_via_exit_side = exit_side_entry != null;
         const owner = self.traceById(e.id) orelse
             @panic("replayLedger: entry owner id did not resolve");
         self.dbgNoteReplayRow(owner, e.exit);
@@ -1674,6 +1713,11 @@ pub fn replayLedgerFrom(
                 } };
             },
             .link_terminal => {},
+            // Doc 56 Phase 5: the ramp's own attachable exit took its armed
+            // or unarmed adapter. The ramp commits none of its own laps, so
+            // the generic `.exit_side` arm below applies unchanged.
+            .exit_side => if (row_local != 0)
+                @panic("replayLedger: silent M1 ramp exit_side committed iterations"),
             else => @panic("replayLedger: silent M1 successor has an invalid row kind"),
         };
         const local = if (ordinary_guard_entry != null and sibling_succ != null)
@@ -1695,17 +1739,20 @@ pub fn replayLedgerFrom(
             // Doc 45 D6: precise exits are always terminal — never armed,
             // never fused, never chain members.
             .precise_deopt, .precise_error => @panic("replayLedger: precise row in a chain ledger"),
-            // Doc 56 Phase 4: only the dispatcher's direct entry with an
-            // empty ledger may take an exit adapter, so the row is never
-            // part of a chain ledger until Phase 5 adds its replay arm.
-            .exit_side => @panic("replayLedger: exit_side row in a chain ledger"),
+            // Doc 56 §4.8: the parent's completed laps plus the interrupted
+            // iteration, committed forward at `P` and never re-run.
+            .exit_side => local + 1,
         };
 
         // Destination `.deferred` for a handoff, NEVER `.known_trace`: this edge is
         // deliberately absent from the structural graph (it is same-anchor), so
         // letting `applyDestination` see the successor could close/open activations
         // and reproduce the §A8-v cross-credit pathology.
-        const region_dest: RegionDestination = if (sibling_succ != null)
+        // Doc 56 Phase 5: an `.exit_side` edge is `.deferred` too — its child
+        // is not a region member until Phase 6 adds the edge to the
+        // structural graph, so a `.known_trace` successor would close the
+        // activation (the same cross-credit pathology).
+        const region_dest: RegionDestination = if (sibling_succ != null or e.kind == .exit_side)
             .deferred
         else if (!is_last)
             .{ .known_trace = entries[k + 1].id }
@@ -1775,8 +1822,53 @@ pub fn replayLedgerFrom(
             // Doc 45 D6: precise exits are always terminal and never armed —
             // this row kind cannot reach a chain ledger.
             .precise_deopt, .precise_error => @panic("replayLedger: precise row in a chain ledger"),
-            // Doc 56 Phase 4: see the work switch above.
-            .exit_side => @panic("replayLedger: exit_side row in a chain ledger"),
+            .exit_side => {
+                // Doc 56 Phase 5: an exit adapter made the slab coherent at
+                // the exit's resume pc `P`, wrote this row, and then jumped
+                // into its armed child (not last), yielded on a full ledger
+                // (last, `.yielded`), or returned unarmed (last, `.normal`).
+                if (!(e.reason == .exit_side and e.exit < owner.code.instrs.len and
+                    owner.code.exitAttachable(e.exit)))
+                    @panic("replayLedger: exit_side row violates its static contract");
+                switch (owner.exitSideAt(e.exit)) {
+                    .wanted, .attached => {},
+                    .none, .gave_up => @panic("replayLedger: exit_side row on an exit that takes no adapter"),
+                }
+                const p = owner.code.exitResumePc(e.exit) orelse
+                    @panic("replayLedger: exit_side row has no resume pc");
+                self.exit_side_hops +|= 1;
+                self.exit_side_native_hops +|= 1;
+                // Selection: the parent's laps plus the interrupted
+                // iteration — the direct consumer's `completed + 1`.
+                self.accountLedgerRow(owner, local + 1, e.exit, region_consumed, .entered);
+                // The interrupted iteration's own `+1` reaches
+                // `linked_completed` through the child's closing `.link`
+                // (`linkClosesIteration`), or not at all when tier-0
+                // finishes it from `P`.
+                linked_completed.* += local;
+                if (is_last) {
+                    resume_pc.* = p;
+                    if (e.outcome == .yielded) self.exit_side_yields +|= 1;
+                    // Yield: the child was armed but the ledger was full.
+                    // Unarmed: the dispatcher owes the exit its routing
+                    // (chain, bind, arm, record) — after the walk, never
+                    // here, because routing can arm.
+                    return .{ .return_result = .{
+                        .completed = linked_completed.*,
+                        .resume_pc = p,
+                        .exit_side = if (e.outcome == .yielded) null else .{ .trace = owner, .exit = e.exit, .done = local + 1 },
+                    } };
+                }
+                const succ = self.traceById(entries[k + 1].id) orelse
+                    @panic("replayLedger: exit_side successor id did not resolve");
+                if (!self.hasArmedExitSide(owner, e.exit, succ))
+                    @panic("replayLedger: exit_side row has no armed exit-side link to its successor");
+                if (!(succ.code.anchor.proto == owner.code.anchor.proto and succ.code.anchor.pc == p and
+                    succ.code.instrs.len != 0 and succ.code.instrs[succ.code.instrs.len - 1].op == .link))
+                    @panic("replayLedger: exit_side successor is not a continuation at the resume pc");
+                self.exit_side_fused +|= 1;
+                applyEdgeCursorTransition(cursor, .exit_side, owner, succ, e.exit, p, local, resume_pc);
+            },
             .region_bridge => {
                 // A bridge commits its distinct cross-anchor snapshot before
                 // entering the successor. It is therefore never terminal or a
@@ -1833,7 +1925,7 @@ pub fn replayLedgerFrom(
                 self.accountTraceRun(owner, @max(local, 1));
                 accountCandidateCharge(owner, .entered);
                 self.native_region_bridge_fused +|= 1;
-                applyEdgeCursorTransition(cursor, .region_bridge, owner, succ, edge.succ_anchor_pc, local, resume_pc);
+                applyEdgeCursorTransition(cursor, .region_bridge, owner, succ, e.exit, edge.succ_anchor_pc, local, resume_pc);
             },
             .link_terminal => {
                 // A continuation reached its single-contract `.link` terminal.
@@ -1907,7 +1999,7 @@ pub fn replayLedgerFrom(
                 self.link_follow_count +|= 1;
                 // Advance the link cursor; the `.link` marker itself takes no
                 // `onSideExit` (only the bodies that commit iterations do).
-                applyEdgeCursorTransition(cursor, .link_terminal, owner, succ, owner_inner_pc, local, resume_pc);
+                applyEdgeCursorTransition(cursor, .link_terminal, owner, succ, e.exit, owner_inner_pc, local, resume_pc);
             },
             .loop_done_linked => {
                 // An inner root reached its numeric-`for` loop-done in LINKED
@@ -2015,7 +2107,7 @@ pub fn replayLedgerFrom(
                 // 2c-E: the armed `I.loopdone → C.ordinary_entry` edge actually
                 // fired in native code — the consumer-side proof of the arm.
                 self.native_loopdone_link_fused +|= 1;
-                applyEdgeCursorTransition(cursor, .loop_done_linked, owner, succ, post_pc, local, resume_pc);
+                applyEdgeCursorTransition(cursor, .loop_done_linked, owner, succ, e.exit, post_pc, local, resume_pc);
             },
             .deopt => {
                 // The shared `deopt_exit` flush: an ordinary per-guard side exit.
@@ -2079,7 +2171,7 @@ pub fn replayLedgerFrom(
                         // successor row anchor-entered, so a terminal deopt or
                         // prologue-fail on it resumes THERE — never at a `link_pc`
                         // left behind by earlier linked rows in the same burst.
-                        applyEdgeCursorTransition(cursor, .sibling_handoff, owner, sibling_succ.?, owner.code.anchor.pc, local, resume_pc);
+                        applyEdgeCursorTransition(cursor, .sibling_handoff, owner, sibling_succ.?, e.exit, owner.code.anchor.pc, local, resume_pc);
                         continue;
                     }
                     if (e.outcome != .normal)
@@ -2248,7 +2340,9 @@ pub fn replayLedgerFrom(
                 // bridge row already published the successor's validated
                 // anchor into `resume_pc`; hard-verify the two agree
                 // rather than trusting either alone.
-                if (entered_via_bridge or entered_via_handoff) {
+                // Doc 56 Phase 5: an exit-side child's own guard rolls back to
+                // its anchor `P`, which its `.exit_side` row published.
+                if (entered_via_bridge or entered_via_handoff or entered_via_exit_side) {
                     if (!(ends_link or ends_loop))
                         @panic("replayLedger: bridged successor deopt on a non-body owner shape");
                     if (resume_pc.* != owner.code.anchor.pc)
@@ -2312,12 +2406,17 @@ pub fn replayLedgerFrom(
                 // coherent at the successor's anchor (which the bridge row
                 // published into `resume_pc`). Zero-progress charge;
                 // resume there, never at the stale `link_pc`.
-                if (entered_via_bridge or entered_via_handoff) {
+                if (entered_via_bridge or entered_via_handoff or entered_via_exit_side) {
                     if (!(ends_link or ends_loop))
                         @panic("replayLedger: bridged successor prologue-fail on a non-body owner shape");
                     if (resume_pc.* != owner.code.anchor.pc)
                         @panic("replayLedger: bridged successor prologue-fail resume mismatches its anchor");
                     self.accountLedgerRow(owner, 0, std.math.maxInt(u32), region_consumed, .entry_refusal);
+                    // Doc 56 Phase 5: the exit's child refused this state —
+                    // disarm after the walk; the exit re-arms only when a
+                    // chain into the child links again.
+                    if (exit_side_entry) |es|
+                        self.pending_exit_side_disarm = .{ .trace_id = es.parent.id, .exit_instr = es.exit };
                     return .{ .return_result = .{
                         .completed = linked_completed.*,
                         .resume_pc = resume_pc.*,
@@ -2373,7 +2472,7 @@ pub fn replayLedgerFrom(
                 // decline fires before the body commits anything). Same
                 // validation as the bridged prologue-fail; zero-progress,
                 // resume there — never at a stale `link_pc`.
-                if (entered_via_bridge or entered_via_handoff) {
+                if (entered_via_bridge or entered_via_handoff or entered_via_exit_side) {
                     if (!(ends_link or ends_loop))
                         @panic("replayLedger: bridged successor seed-decline on a non-body owner shape");
                     if (resume_pc.* != owner.code.anchor.pc)

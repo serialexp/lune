@@ -32,6 +32,14 @@ pub const ArmKind = enum {
     ret_cont,
     /// Continuation-page self-call slot into the proto head page.
     call_head,
+    /// Doc 56 Phase 5: an attachable exit's EXIT ADAPTER jumps into a
+    /// continuation anchored at the exit's resume pc `P` (LuaJIT's patched
+    /// side-exit branch). The adapter left the slab coherent at `P`, so the
+    /// child enters at its `ordinary_entry`. Logical key: the exit's IR
+    /// index; physical cell: the page's exit-side cell for it
+    /// (`CompiledTrace.exitSideSlot`), never the ordinary cell `slots[ei]`,
+    /// which may hold an anchor-coherent arm of the same exit.
+    exit_side,
 };
 pub const NativeLink = struct {
     parent: *Trace,
@@ -266,6 +274,9 @@ pub const NativePhysicalRegistry = struct {
     pub fn memoizeBridgeEdge(self: *NativePhysicalRegistry, parent: *Trace, slot: u32, child: *Trace, expected: RegionArmProof, edge: StructuralEdgeId, generation: u32) bool {
         for (self.armed_links.items) |*link| {
             if (link.parent != parent or link.slot_index != slot or link.child != child) continue;
+            // Doc 56 Phase 5: an exit-side arm shares the exit's logical key
+            // but lives in its own cell; it is never the bridge relation.
+            if (link.kind == .exit_side) continue;
             if (link.kind != .region_bridge or link.region_id != expected.id or link.armed_gen != expected.generation) return false;
             link.bridge_edge = edge;
             link.bridge_edge_gen = generation;
@@ -810,6 +821,9 @@ pub const NativePhysicalRegistry = struct {
                 } else return .declined;
             },
             .call_head => physical_slot = ir_slots + @as(u32, nativegen.RET_CONT_SLOTS),
+            // Doc 56 Phase 5: the exit's own exit-side cell — never
+            // `slots[ei]`, the ordinary deopt cell of the same exit.
+            .exit_side => physical_slot = c.exitSideSlot(slot_index) orelse return .declined,
             else => {},
         }
         if (physical_slot >= c.slots.len) return .declined;
@@ -988,6 +1002,85 @@ test "frame link physical cells disarm without recycling the first four return k
     for (slots) |target| try std.testing.expect(target == 0);
     for (keys, 0..) |pc, i| try std.testing.expect(pc == 1000 + i);
     try std.testing.expect(registry.armedLinks().len == 0);
+}
+
+test "doc 56 Phase 5: an exit-side arm owns its own cell and lives beside a sibling arm on the same exit" {
+    var arena = nativegen.McodeArena.init(std.testing.allocator);
+    defer arena.deinit();
+    var registry = NativePhysicalRegistry.init(std.testing.allocator);
+    defer registry.deinit(&arena);
+    var proto: @import("bytecode.zig").Proto = .{ .code = &.{} };
+    var instrs = [_]@import("trace_ir.zig").IrInstr{ .{ .op = .terminal }, .{ .op = .terminal } };
+    const n = instrs.len;
+    const T = nativegen.NATIVE_TRANSITION_SLOTS;
+    // Layout: n ordinary cells, the transition cells, then n exit-side cells.
+    const slot_count = n + T + n;
+    var slots: [slot_count]usize = @splat(0);
+    var cells: [n]usize = @splat(0);
+    var parent: Trace = .{
+        .id = 100,
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} },
+        .native = .{ .compiled = .{ .page = undefined, .gpa = std.testing.allocator, .slots = &slots, .exit_side_cells = &cells } },
+    };
+    const side_code: @import("trace_code.zig").TraceCode = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var side: Trace = .{ .id = 101, .code = side_code, .native = .{ .compiled = .{ .page = undefined, .gpa = std.testing.allocator, .ordinary_entry = 0xCAFE } } };
+    var other: Trace = .{ .id = 102, .code = side_code, .native = .{ .compiled = .{ .page = undefined, .gpa = std.testing.allocator, .ordinary_entry = 0xF00D } } };
+    var sibling: Trace = .{
+        .id = 103,
+        .code = .{ .anchor = parent.code.anchor, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} },
+        .native = .{ .compiled = .{ .page = undefined, .gpa = std.testing.allocator, .ordinary_entry = 0xBEEF } },
+    };
+    const pc = &parent.native.compiled;
+    const cell0 = pc.exitSideSlot(0).?;
+    try std.testing.expectEqual(n + T, cell0);
+    try std.testing.expectEqual(@as(?u32, null), pc.exitSideSlot(n));
+
+    // The exit-side arm writes only its exit-side cell.
+    try std.testing.expect(try registry.publishValidatedLink(.{ .parent = &parent, .child = &side, .slot_index = 0, .kind = .exit_side }) == .changed);
+    try std.testing.expectEqual(@as(usize, 0xCAFE), slots[cell0]);
+    for (slots, 0..) |target, i| if (i != cell0) try std.testing.expectEqual(@as(usize, 0), target);
+    // A sibling arm on the SAME exit takes the ordinary cell; both records live.
+    try std.testing.expect(try registry.publishValidatedLink(.{ .parent = &parent, .child = &sibling, .slot_index = 0, .kind = .sibling_handoff }) == .changed);
+    try std.testing.expectEqual(@as(usize, 0xBEEF), slots[0]);
+    try std.testing.expectEqual(@as(usize, 0xCAFE), slots[cell0]);
+    try std.testing.expectEqual(@as(usize, 2), registry.armedLinks().len);
+    // An identical re-arm changes nothing; a re-arm to another child replaces
+    // the one record in place and leaves the sibling alone.
+    try std.testing.expect(try registry.publishValidatedLink(.{ .parent = &parent, .child = &side, .slot_index = 0, .kind = .exit_side }) == .unchanged);
+    try std.testing.expect(try registry.publishValidatedLink(.{ .parent = &parent, .child = &other, .slot_index = 0, .kind = .exit_side }) == .changed);
+    try std.testing.expectEqual(@as(usize, 0xF00D), slots[cell0]);
+    try std.testing.expectEqual(@as(usize, 0xBEEF), slots[0]);
+    try std.testing.expectEqual(@as(usize, 2), registry.armedLinks().len);
+    // No exit-side cell past the page's exits.
+    try std.testing.expect(try registry.publishValidatedLink(.{ .parent = &parent, .child = &side, .slot_index = n, .kind = .exit_side }) == .declined);
+
+    // Disarming one record resets only its own cell.
+    const es_idx = for (registry.armedLinks(), 0..) |l, i| {
+        if (l.kind == .exit_side) break i;
+    } else unreachable;
+    registry.disarmLinkAt(&arena, es_idx);
+    try std.testing.expectEqual(@as(usize, 0), slots[cell0]);
+    try std.testing.expectEqual(@as(usize, 0xBEEF), slots[0]);
+    // Retiring the exit-side child resets its cell and keeps the sibling;
+    // retiring the sibling then resets the ordinary cell.
+    try std.testing.expect(try registry.publishValidatedLink(.{ .parent = &parent, .child = &side, .slot_index = 1, .kind = .exit_side }) == .changed);
+    try std.testing.expectEqual(@as(usize, 0xCAFE), slots[pc.exitSideSlot(1).?]);
+    registry.resetLinksTouching(&arena, &side);
+    try std.testing.expectEqual(@as(usize, 0), slots[pc.exitSideSlot(1).?]);
+    try std.testing.expectEqual(@as(usize, 0xBEEF), slots[0]);
+    registry.resetLinksTouching(&arena, &sibling);
+    try std.testing.expectEqual(@as(usize, 0), slots[0]);
+    try std.testing.expectEqual(@as(usize, 0), registry.armedLinks().len);
+    // Retiring the PARENT drops its records (its page dies with it); a
+    // blackout resets every cell.
+    try std.testing.expect(try registry.publishValidatedLink(.{ .parent = &parent, .child = &side, .slot_index = 0, .kind = .exit_side }) == .changed);
+    registry.resetLinksTouching(&arena, &parent);
+    try std.testing.expectEqual(@as(usize, 0), registry.armedLinks().len);
+    try std.testing.expect(try registry.publishValidatedLink(.{ .parent = &parent, .child = &side, .slot_index = 0, .kind = .exit_side }) == .changed);
+    try std.testing.expect(try registry.publishValidatedLink(.{ .parent = &parent, .child = &sibling, .slot_index = 0, .kind = .sibling_handoff }) == .changed);
+    registry.disarmAllLinks(&arena);
+    for (slots) |target| try std.testing.expectEqual(@as(usize, 0), target);
+    try std.testing.expectEqual(@as(usize, 0), registry.armedLinks().len);
 }
 
 test "native owner barrier cancels policy arm even with no live links" {

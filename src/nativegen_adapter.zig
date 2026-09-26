@@ -3,8 +3,8 @@
 //! An adapter is what a native attachable exit runs instead of the ordinary
 //! anchor-coherent exit once it is wanted or attached: it makes the slab the
 //! tier-0 state at the exit's resume pc `P` — exactly what tier-1a's
-//! `irinterp.materializeExitSide` does — and leaves through its own target
-//! cell (the shared trampoline exit in Phase 4). Built after the parent was
+//! `irinterp.materializeExitSide` does — and leaves through the exit's
+//! exit-side cell in the parent's `slots`. Built after the parent was
 //! compiled, from the exit location map alone (the allocator's output is
 //! gone by then), so it is never a recompile of the parent.
 //!
@@ -15,7 +15,10 @@
 //!      `deopt_exit` writes the same homes);
 //!   3. the exit snapshot's slots, overriding step 2;
 //!   4. `completed`, reason `.exit_side`, an `.exit_side` ledger row, the
-//!      final trace id, then `jmp` through the target cell.
+//!      final trace id, then `jmp` through the exit's exit-side cell in the
+//!      parent's `slots`: the runtime while unarmed, the child's
+//!      `ordinary_entry` once armed (Phase 5; a full ledger yields to the
+//!      runtime instead, and a jump into a child resets `exit_reason`).
 //!
 //! The leaf emitters read a value's place through an `Alloc`. The adapter
 //! builds a synthetic one: `loc` from the map rows; `slot_id_of_ref` all
@@ -90,8 +93,10 @@ pub const Built = union(enum) {
 };
 
 /// Build the adapter of attachable exit `gi` of `t` (compiled as `trace_id`,
-/// with exit location map `map`). Errors only on allocation failure.
-pub fn build(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace, trace_id: u32, map: *const ExitLocMap, gi: usize) std.mem.Allocator.Error!Built {
+/// with exit location map `map`). `target` is the exit's exit-side cell in
+/// the parent's `slots` (`CompiledTrace.exitSideSlot`): the adapter ends by
+/// jumping through it. Errors only on allocation failure.
+pub fn build(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace, trace_id: u32, map: *const ExitLocMap, gi: usize, target: *const usize) std.mem.Allocator.Error!Built {
     if (comptime !mcode.is_x64_linux) return .{ .refused = .{ .why = .no_stub } };
     const si = t.exitSnapIdx(gi) orelse return .{ .refused = .{ .why = .no_map } };
     if (map.values.len == 0) return .{ .refused = .{ .why = .no_map } };
@@ -100,21 +105,15 @@ pub fn build(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace, trace_
         else => return .{ .refused = .{ .why = .emit } },
     };
 
-    const target = try gpa.create(usize);
-    var keep_target = false;
-    defer if (!keep_target) gpa.destroy(target);
-    target.* = tr.shared_exit;
-
     var a = x64.Assembler.init(gpa);
     defer a.deinit();
-    if (try emitAdapter(gpa, &a, t, trace_id, map, gi, si, target)) |r| return .{ .refused = r };
+    if (try emitAdapter(gpa, &a, t, trace_id, map, gi, si, target, tr.shared_exit)) |r| return .{ .refused = r };
     a.resolve();
     const page = arena.alloc(a.code.items) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .refused = .{ .why = .emit } },
     };
-    keep_target = true;
-    return .{ .adapter = .{ .exit = @intCast(gi), .page = page, .target = target } };
+    return .{ .adapter = .{ .exit = @intCast(gi), .page = page } };
 }
 
 /// Publish exit `gi`'s adapter in `ct`'s exit-side cell, building it the
@@ -122,16 +121,17 @@ pub fn build(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace, trace_
 /// after a clear reuses the one already built.
 pub fn publish(arena: *McodeArena, t: *const Trace, trace_id: u32, ct: *CompiledTrace, gi: u32) std.mem.Allocator.Error!?Refused {
     if (gi >= ct.exit_side_cells.len or !t.exitAttachable(gi)) return .{ .why = .no_stub };
+    const cell = ct.exitSideSlot(gi) orelse return .{ .why = .no_stub };
     if (ct.exitAdapter(gi)) |ad| {
         ct.exit_side_cells[gi] = @intFromPtr(ad.page.code.ptr);
         return null;
     }
-    switch (try build(ct.gpa, arena, t, trace_id, &ct.exit_locs, gi)) {
+    switch (try build(ct.gpa, arena, t, trace_id, &ct.exit_locs, gi, &ct.slots[cell])) {
         .refused => |r| return r,
         .adapter => |ad| {
             ct.exit_adapters.append(ct.gpa, ad) catch |e| {
                 var owned = ad;
-                owned.deinit(ct.gpa);
+                owned.deinit();
                 return e;
             };
             ct.exit_side_cells[gi] = @intFromPtr(ad.page.code.ptr);
@@ -163,7 +163,8 @@ fn emitAdapter(
     map: *const ExitLocMap,
     gi: usize,
     si: usize,
-    target: *usize,
+    target: *const usize,
+    shared_exit: usize,
 ) !?Refused {
     const n = t.instrs.len;
     const loc = try gpa.alloc(Loc, n);
@@ -282,12 +283,28 @@ fn emitAdapter(
     }
 
     // 4. The tail. `exit_instr` was written by the exit's own mini-stub.
+    // The row reads its reason from `exit_reason`, so `.exit_side` is
+    // written before the append.
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_reason"), @intFromEnum(trace_exec.ExitReason.exit_side));
     try emit.emitLedgerAppend(a, trace_id, .exit_side);
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "final_trace_id"), @bitCast(trace_id));
+    // Doc 56 Phase 5: the exit-side cell holds `shared_exit` (unarmed) or
+    // the armed child's `ordinary_entry`. A full ledger turns an armed jump
+    // into a yield (row `.yielded`, rax = shared_exit), exactly like every
+    // other chain source.
     try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(target))));
     try a.movRegMem(.rax, .rax, 0);
+    try emit.emitForcedYieldCheck(a, shared_exit);
+    // Into a child: its later rows and exits read `exit_reason`, which
+    // every ordinary exit leaves at the wrapper's `.normal` — restore it.
+    // The runtime path (unarmed or yield) keeps `.exit_side`.
+    const out = try a.label();
+    try a.movRegImm64(.rcx, @bitCast(@as(u64, shared_exit)));
+    try a.cmpRegReg(.rax, .rcx);
+    try a.jcc(.e, out);
+    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_reason"), @intFromEnum(trace_exec.ExitReason.normal));
+    a.bind(out);
     try a.jmpReg(.rax);
     return null;
 }

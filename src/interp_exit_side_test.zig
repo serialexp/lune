@@ -16,6 +16,10 @@ const compiler = @import("compiler.zig");
 const io = @import("io.zig");
 const exit_attach = @import("trace_exit_attach.zig");
 const nativegen = @import("nativegen.zig");
+const trace_exec = @import("trace_exec.zig");
+const value = @import("value.zig");
+const table = @import("table.zig");
+const RegWindow = @import("regwindow.zig").RegWindow;
 
 const util = @import("interp_testutil.zig");
 const expectProgramTuned = util.expectProgramTuned;
@@ -471,6 +475,11 @@ fn expectNativeAdaptersAnd(source: [:0]const u8, expected: []const u8, comptime 
             try testing.expect(vm.trace.exit_adapter_builds > 0);
             try testing.expect(vm.trace.exit_side_native_hops > 0);
             try testing.expect(vm.trace.exit_side_binds > 0);
+            // Phase 5: the bound exit is armed and its adapter then jumps
+            // straight into the child, which the ledger replay validates.
+            try testing.expect(vm.trace.exit_side_arms > 0);
+            try testing.expect(vm.trace.exit_side_fused > 0);
+            try testing.expectEqual(@as(u64, 0), vm.trace.exit_side_disarms);
             for (vm.trace.exit_adapter_refusals) |n| try testing.expectEqual(@as(u64, 0), n);
             // Every built adapter hangs off a native page that carries the
             // exit-side cells.
@@ -645,4 +654,312 @@ test "doc 56 Phase 4: an open-upvalue continuation runs behind a native adapter"
 
 test "doc 56 Phase 4: fft bit-reverse's exits run through native adapters" {
     try expectNativeAdapters(bitreverse_src, "0.5\t1024\n");
+}
+
+/// Doc 56 Phase 5: the `.exit_side` replay grammar, pinned on hand-made
+/// ledgers over REAL armed traces (a program that arms its exit, then the
+/// ledgers each rare branch writes). The end-to-end tests above cover the
+/// common fused hop; these cover the yield, the unarmed terminal, and the
+/// child's own terminals after an adapter jump.
+fn checkExitSideReplay(vm: *Vm, mode: TraceMode) !void {
+    if (mode != .record_execute_native) return;
+    const ts = &vm.trace;
+    const Entry = trace_exec.LedgerEntry;
+    const l = for (ts.registry.native_physical.armedLinks()) |x| {
+        if (x.kind == .exit_side) break x;
+    } else return error.TestNoExitSideArm;
+    const parent = l.parent;
+    const child = l.child;
+    const ei = l.slot_index;
+    const proto = parent.code.anchor.proto;
+    const p = parent.code.exitResumePc(ei).?;
+    // The fixture's shape: the child is the `.link` continuation at `P`,
+    // closing an iteration of the parent's loop; neither takes inputs.
+    try testing.expectEqual(p, child.code.anchor.pc);
+    try testing.expect(child.code.linkClosesIteration());
+    const link_exit: u32 = @intCast(child.code.instrs.len - 1);
+    const aux: u32 = @intCast(child.code.instrs[link_exit].aux);
+    try testing.expectEqual(parent.code.anchor.pc, aux);
+    try testing.expectEqual(@as(usize, 0), parent.code.inputs.len);
+    try testing.expectEqual(@as(usize, 0), child.code.inputs.len);
+    try testing.expect(ts.hasArmedExitSide(parent, ei, child));
+    const es_row = Entry{ .cum = 4, .id = parent.id, .exit = ei, .reason = .exit_side, .kind = .exit_side, .outcome = .normal };
+
+    // (a) A fused hop, then the child's own `.link` (unarmed): 4 laps plus
+    // the iteration the child closed; resume at the loop the `.link` names.
+    {
+        const rows = [_]Entry{ es_row, .{ .cum = 4, .id = child.id, .exit = link_exit, .reason = .normal, .kind = .link_terminal, .outcome = .normal } };
+        const fused0 = ts.exit_side_fused;
+        const hops0 = ts.exit_side_hops;
+        var lc: usize = 0;
+        var rpc: u32 = 999;
+        var hops: usize = 0;
+        switch (ts.replayLedger(&rows, parent, parent.code.anchor.pc, proto, &lc, &rpc, &hops, 8, .dispatcher_root, false, null)) {
+            .run_inner_from => |d| try testing.expectEqual(child, d),
+            else => return error.TestUnexpectedResult,
+        }
+        try testing.expectEqual(@as(usize, 5), lc);
+        try testing.expectEqual(aux, rpc);
+        try testing.expectEqual(fused0 + 1, ts.exit_side_fused);
+        try testing.expectEqual(hops0 + 1, ts.exit_side_hops);
+    }
+    // (b) The adapter is the last row and was unarmed: the replay hands the
+    // exit to the dispatcher's routing at `P`, with the row's work.
+    {
+        const rows = [_]Entry{es_row};
+        var lc: usize = 0;
+        var rpc: u32 = 999;
+        var hops: usize = 0;
+        const r = switch (ts.replayLedger(&rows, parent, parent.code.anchor.pc, proto, &lc, &rpc, &hops, 8, .dispatcher_root, false, null)) {
+            .return_result => |r| r,
+            else => return error.TestUnexpectedResult,
+        };
+        try testing.expectEqual(p, r.resume_pc.?);
+        try testing.expectEqual(@as(usize, 4), r.completed);
+        const es = r.exit_side orelse return error.TestNoExitSideTerminal;
+        try testing.expectEqual(parent, es.trace);
+        try testing.expectEqual(ei, es.exit);
+        try testing.expectEqual(@as(usize, 5), es.done);
+    }
+    // (c) A full ledger whose last row is the adapter's forced yield: the
+    // dispatcher entered the child at `P`, and the cycle `child.link →
+    // parent.exit_side → child` runs 16 times, the last adapter yielding.
+    // The walk resumes at `P` with nothing left to route.
+    {
+        var rows: [trace_exec.LEDGER_CAP]Entry = undefined;
+        var cum: usize = 0;
+        for (&rows, 0..) |*row, k| {
+            if (k % 2 == 0) {
+                row.* = .{ .cum = cum, .id = child.id, .exit = link_exit, .reason = .normal, .kind = .link_terminal, .outcome = .normal };
+            } else {
+                cum += 3;
+                row.* = .{ .cum = cum, .id = parent.id, .exit = ei, .reason = .exit_side, .kind = .exit_side, .outcome = if (k + 1 == rows.len) .yielded else .normal };
+            }
+        }
+        const fused0 = ts.exit_side_fused;
+        const hops0 = ts.exit_side_hops;
+        var lc: usize = 0;
+        var rpc: u32 = 999;
+        var hops: usize = 0;
+        const r = switch (ts.replayLedger(&rows, child, child.code.anchor.pc, proto, &lc, &rpc, &hops, 8, .dispatcher_root, false, null)) {
+            .return_result => |r| r,
+            else => return error.TestUnexpectedResult,
+        };
+        try testing.expectEqual(p, r.resume_pc.?);
+        try testing.expect(r.exit_side == null);
+        // 16 closed iterations, plus 16 adapter rows of 3 laps each; the
+        // yielded row's own iteration is left to the dispatcher.
+        try testing.expectEqual(@as(usize, 16 + 16 * 3), r.completed);
+        try testing.expectEqual(fused0 + 15, ts.exit_side_fused);
+        try testing.expectEqual(hops0 + 16, ts.exit_side_hops);
+    }
+    // (c') The same full ledger, but written by the real machine code: a
+    // native run entered at the child with both arms live. The rows go
+    // `child.link, parent.exit_side, …`, so row 32 is the adapter's own, and
+    // its forced-yield check must stamp it `.yielded`, keep
+    // `exit_reason = .exit_side`, and leave the slab coherent at `P`.
+    {
+        var link_armed = false;
+        for (ts.registry.native_physical.armedLinks()) |x| {
+            if (x.kind == .link_terminal and x.parent == child and x.child == parent) link_armed = true;
+        }
+        if (!link_armed) try testing.expect(try ts.armNativeLink(child, link_exit, parent, .link_terminal));
+
+        const gpa = testing.allocator;
+        const tbl = try table.Table.create(gpa);
+        defer tbl.destroy(gpa);
+        const t_at_p: f64 = 10.5; // t[1] once iteration i = 3 updated it
+        try tbl.set(gpa, value.Value.int(1), value.Value.float(t_at_p));
+        try testing.expectEqual(@import("array.zig").Lane.f64, tbl.array.lane);
+
+        // The loop's registers at `P` for i = 3: r0 = t, r1 = s, r2..r4 =
+        // the numeric-for index/limit/step, r5 = i. The traces write
+        // scratch slots up to r10.
+        const Tag = value.Tag;
+        var tags: [16]u8 = @splat(@intFromEnum(Tag.nil));
+        var pays: [16]u64 = @splat(0);
+        const tv = value.Value.heap(&tbl.header);
+        tags[0] = @intFromEnum(tv.tag);
+        pays[0] = tv.payload.bits;
+        tags[1] = @intFromEnum(Tag.float);
+        pays[1] = @bitCast(@as(f64, 0.0));
+        for ([_]usize{ 2, 5 }) |r| {
+            tags[r] = @intFromEnum(Tag.int);
+            pays[r] = 3;
+        }
+        tags[3] = @intFromEnum(Tag.int);
+        pays[3] = 1000;
+        tags[4] = @intFromEnum(Tag.int);
+        pays[4] = 1;
+
+        var ledger: [trace_exec.LEDGER_CAP]Entry = undefined;
+        const r = child.native.compiled.runCapturingLedgerEntry(RegWindow.of(&tags, &pays), &ledger, ts.silentStaging(), true);
+        try testing.expectEqual(trace_exec.ExitReason.exit_side, r.exit_reason);
+        try testing.expectEqual(@as(u32, trace_exec.LEDGER_CAP), r.ledger_len);
+        for (ledger, 0..) |row, k| {
+            if (k % 2 == 0) {
+                try testing.expectEqual(child.id, row.id);
+                try testing.expectEqual(trace_exec.LedgerKind.link_terminal, row.kind);
+                // The adapter reset `exit_reason` before jumping in.
+                try testing.expectEqual(trace_exec.ExitReason.normal, row.reason);
+                try testing.expectEqual(trace_exec.LedgerOutcome.normal, row.outcome);
+            } else {
+                try testing.expectEqual(parent.id, row.id);
+                try testing.expectEqual(trace_exec.LedgerKind.exit_side, row.kind);
+                try testing.expectEqual(ei, row.exit);
+                // Every jump into the child reset `exit_reason`, so only
+                // the last row reads `.exit_side` from the adapter itself.
+                try testing.expectEqual(trace_exec.ExitReason.exit_side, row.reason);
+                const want: trace_exec.LedgerOutcome = if (k + 1 == ledger.len) .yielded else .normal;
+                try testing.expectEqual(want, row.outcome);
+            }
+        }
+
+        // The slab is coherent at `P` of i = 51 (the 16th exit: i = 6, 9,
+        // …, 51), with that iteration's sunk `t[1]` store applied. The same
+        // walk in plain f64 arithmetic gives the exact bits.
+        var t1 = t_at_p;
+        var s: f64 = 0.0;
+        s += t1; // the child closes i = 3
+        var i: i64 = 4;
+        while (i <= 50) : (i += 1) {
+            t1 += @floatFromInt(i);
+            if (@mod(i, 3) == 0) s += t1 else s -= 1;
+        }
+        t1 += 51;
+        try testing.expectEqual(@as(u64, 51), pays[2]);
+        try testing.expectEqual(@as(u64, 51), pays[5]);
+        try testing.expectEqual(@as(u64, @bitCast(s)), pays[1]);
+        try testing.expectEqual(@as(u64, @bitCast(t1)), tbl.get(value.Value.int(1)).payload.bits);
+
+        // Its replay: 16 closed iterations (i = 3 … 48 by the child's
+        // links) plus 16 × 2 parent laps; i = 51 is left to tier-0 at `P`.
+        const yields0 = ts.exit_side_yields;
+        var lc: usize = 0;
+        var rpc: u32 = 999;
+        var hops: usize = 0;
+        const rr = switch (ts.replayLedger(&ledger, child, child.code.anchor.pc, proto, &lc, &rpc, &hops, 8, .dispatcher_root, false, null)) {
+            .return_result => |x| x,
+            else => return error.TestUnexpectedResult,
+        };
+        try testing.expectEqual(p, rr.resume_pc.?);
+        try testing.expect(rr.exit_side == null);
+        try testing.expectEqual(@as(usize, 16 + 16 * 2), rr.completed);
+        try testing.expectEqual(yields0 + 1, ts.exit_side_yields);
+    }
+    // (d) The child's own guard fails after the jump: it rolls back to its
+    // anchor `P` (the bridged-successor contract, never `break_burst`).
+    {
+        const gi: u32 = for (child.code.instrs, 0..) |ins, i| {
+            if (trace_ir.isSideExitGuardOp(ins.op)) break @intCast(i);
+        } else return error.TestChildHasNoGuard;
+        const rows = [_]Entry{ es_row, .{ .cum = 4, .id = child.id, .exit = gi, .reason = .normal, .kind = .deopt, .outcome = .normal } };
+        var lc: usize = 0;
+        var rpc: u32 = 999;
+        var hops: usize = 0;
+        const r = switch (ts.replayLedger(&rows, parent, parent.code.anchor.pc, proto, &lc, &rpc, &hops, 8, .dispatcher_root, false, null)) {
+            .return_result => |r| r,
+            else => return error.TestUnexpectedResult,
+        };
+        try testing.expectEqual(p, r.resume_pc.?);
+        try testing.expectEqual(@as(usize, 4), r.completed);
+        try testing.expect(r.exit_side == null);
+        try testing.expect(ts.pending_exit_side_disarm == null);
+    }
+    // (e) The child refuses its entry: same resume, and the arm is disarmed
+    // after the walk (the exit stays attached; only a new link re-arms it).
+    {
+        const rows = [_]Entry{ es_row, .{ .cum = 4, .id = child.id, .exit = std.math.maxInt(u32), .reason = .prologue_fail, .kind = .prologue_fail, .outcome = .normal } };
+        var lc: usize = 0;
+        var rpc: u32 = 999;
+        var hops: usize = 0;
+        const r = switch (ts.replayLedger(&rows, parent, parent.code.anchor.pc, proto, &lc, &rpc, &hops, 8, .dispatcher_root, false, null)) {
+            .return_result => |r| r,
+            else => return error.TestUnexpectedResult,
+        };
+        try testing.expectEqual(p, r.resume_pc.?);
+        try testing.expectEqual(@as(usize, 4), r.completed);
+        const disarms0 = ts.exit_side_disarms;
+        try testing.expect(ts.pending_exit_side_disarm != null);
+        ts.drainPendingExitSideDisarm();
+        try testing.expectEqual(disarms0 + 1, ts.exit_side_disarms);
+        try testing.expect(!ts.hasArmedExitSide(parent, ei, child));
+        const pc = &parent.native.compiled;
+        try testing.expectEqual(ts.registry.mcode_arena.trampoline_exit.?, pc.slots[pc.exitSideSlot(ei).?]);
+        try testing.expectEqual(exit_attach.ExitSide.attached, parent.exitSideAt(ei));
+    }
+}
+
+// Doc 56 Phase 5 regression: fft bit-reverse at the CLI's own recording
+// threshold. There the continuation serving an exit has its `.link` armed
+// back to the parent before the exit is armed, so the exit's chain runs as
+// a multi-row native ledger (continuation `.link`, then the parent, then a
+// sibling handoff) and ends away from `P`. `driveChain` used to report that
+// span as "not linked", so the exit never bound, and the router asserted
+// the chain had stopped at `P`. It crashed the CLI; the harness's short
+// threshold arms things in another order and never reached it.
+test "doc 56 Phase 5: fft bit-reverse at the CLI's hot threshold binds and arms its exits" {
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode != .record_execute_native) return;
+            const ts = &vm.trace;
+            try testing.expect(ts.exit_side_binds > 0);
+            try testing.expect(ts.exit_side_arms > 0);
+            try testing.expect(ts.exit_side_fused > 0);
+            try testing.expectEqual(@as(u64, 0), ts.exit_side_disarms);
+            for (ts.exit_adapter_refusals) |n| try testing.expectEqual(@as(u64, 0), n);
+        }
+    };
+    try expectProgramTuned(bitreverse_src, "0.5\t1024\n", .{
+        .exit_side_native = true,
+        .hotloop = (@import("trace.zig").TraceConfig{}).hotloop,
+        .inspect = Inspect.run,
+    });
+}
+
+// Doc 56 Phase 5 regression: nsieve called several times. Its prime-path
+// exit gets an exit-side child anchored at `P` (the `for k` setup, which is
+// also the `if p[i]` branch's fall-through pc). Region discovery used to take
+// a branch guard's `guardExitPc` — that fall-through pc, whichever way the
+// recording went — as the exit's successor once a trace anchored there, so
+// the continuation's COMPOSITE exit got a region bridge onto the prime path:
+// every later call counted composites as primes (the table stayed right,
+// only `count` was wrong). Both recording thresholds, since the arm order
+// differs.
+const nsieve_calls_src =
+    \\local function nsieve(p, m)
+    \\  for i=2,m do p[i] = true end
+    \\  local count = 0
+    \\  for i=2,m do
+    \\    if p[i] then
+    \\      for k=i+i,m,i do p[k] = false end
+    \\      count = count + 1
+    \\    end
+    \\  end
+    \\  return count
+    \\end
+    \\local primes = {}
+    \\for _, m in ipairs({400, 200, 100, 50}) do
+    \\  print(m, nsieve(primes, m))
+    \\end
+;
+test "doc 56 Phase 5: repeated nsieve calls keep their prime count with exit-side arms" {
+    const out = "400\t78\n200\t46\n100\t25\n50\t15\n";
+    try expectProgramTuned(nsieve_calls_src, out, .{ .exit_side_native = true });
+    try expectProgramTuned(nsieve_calls_src, out, .{
+        .exit_side_native = true,
+        .hotloop = (@import("trace.zig").TraceConfig{}).hotloop,
+    });
+}
+
+test "doc 56 Phase 5: the .exit_side replay grammar on real armed traces" {
+    try expectProgramTuned(
+        \\local t = {0.5}
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  t[1] = t[1] + i
+        \\  if i % 3 == 0 then s = s + t[1] else s = s - 1 end
+        \\end
+        \\print(s, t[1])
+    , "1530000\t45150.5\n", .{ .exit_side_native = true, .inspect = checkExitSideReplay });
 }

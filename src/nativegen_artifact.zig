@@ -303,8 +303,10 @@ pub const LinkHitCounter = extern struct {
 
 /// Doc 54 P2: which slot family a `LinkHitCounter` describes.
 /// `.sibling_handoff` (amendment) covers the ordinary exit slots — the
-/// only arm kind eligible for a rowless post-motion follow.
-pub const LinkHitKind = enum(u32) { ret_cont = 0, call_head = 1, sibling_handoff = 2 };
+/// only arm kind eligible for a rowless post-motion follow. `.exit_side`
+/// (doc 56 Phase 5) covers the trailing exit-side cells; they are never
+/// followed rowlessly, so their records are never published.
+pub const LinkHitKind = enum(u32) { ret_cont = 0, call_head = 1, sibling_handoff = 2, exit_side = 3 };
 
 comptime {
     std.debug.assert(@offsetOf(LinkHitCounter, "gen") == 0);
@@ -555,6 +557,15 @@ pub const CompiledTrace = struct {
     /// ordinary GPA heap memory, always RW; no `mprotect`, no rel32 constraint since
     /// the exit loads the slot address as a full imm64). Empty for self-framed test
     /// pages (`trampoline_entry == null`). Owned; freed in `deinit` via `gpa`.
+    ///
+    /// Layout: `instrs.len` ordinary exit cells, then the
+    /// `NATIVE_TRANSITION_SLOTS` frame cells, then — only on a page built
+    /// with the exit-side stub (`exit_side_cells.len != 0`) — one exit-side
+    /// cell per instruction (doc 56 Phase 5, `exitSideSlot`). An exit
+    /// adapter jumps through its exit's cell; an `ArmKind.exit_side` arm
+    /// writes the child's `ordinary_entry` there. It is separate from the
+    /// ordinary cell of the same exit because the two send different
+    /// register states (coherent at the resume pc vs at the anchor).
     slots: []usize = &.{},
     /// Resume-PC keys parallel to the four trailing `.ret_cont` cells. A zero
     /// target means unarmed; keys are metadata, never executable addresses.
@@ -837,13 +848,15 @@ pub const CompiledTrace = struct {
                     (term_kind == .precise_error));
                 if (term_kind == .precise_deopt or term_kind == .precise_error)
                     std.debug.assert(result.snapshot_id >= 1);
-                // Doc 56 Phase 4: the exit adapter stamps `.exit_side` then
-                // appends its own kind, and it is only ever reachable from a
-                // flagged direct entry with an empty ledger — so its row is
-                // the ONLY row.
+                // Doc 56 Phases 4–5: the exit adapter stamps `.exit_side`
+                // then appends its own kind; it resets the reason to
+                // `.normal` only when it jumps into an armed child, so the
+                // call returns `.exit_side` exactly when its terminal row
+                // is an adapter's (unarmed, or a full-ledger yield). Only a
+                // flagged direct entry with no silent transition takes it.
                 std.debug.assert((result.exit_reason == @intFromEnum(trace_exec.ExitReason.exit_side)) ==
                     (term_kind == .exit_side));
-                if (term_kind == .exit_side) std.debug.assert(exit_side_ok and n == 1 and result.silent_active == 0);
+                if (term_kind == .exit_side) std.debug.assert(exit_side_ok and result.silent_active == 0);
             }
         }
         // 2.3c-2b: decode the per-transition ledger for the caller's replay. Only
@@ -897,7 +910,7 @@ pub const CompiledTrace = struct {
         if (self.metadata_cells.len > 0) self.gpa.free(self.metadata_cells);
         self.exit_locs.deinit(self.gpa);
         if (self.exit_side_cells.len > 0) self.gpa.free(self.exit_side_cells);
-        for (self.exit_adapters.items) |*ad| ad.deinit(self.gpa);
+        for (self.exit_adapters.items) |*ad| ad.deinit();
         self.exit_adapters.deinit(self.gpa);
         self.* = undefined;
     }
@@ -915,21 +928,31 @@ pub const CompiledTrace = struct {
     pub fn exitSidePublished(self: *const CompiledTrace, exit_instr: u32) bool {
         return exit_instr < self.exit_side_cells.len and self.exit_side_cells[exit_instr] != 0;
     }
+
+    /// Doc 56 Phase 5: the physical `slots` index of exit `exit_instr`'s
+    /// exit-side cell, or null when this page has no exit-side cells
+    /// (built without the stub, or a self-framed test page).
+    pub fn exitSideSlot(self: *const CompiledTrace, exit_instr: u32) ?u32 {
+        const n = self.exit_side_cells.len;
+        if (n == 0 or exit_instr >= n) return null;
+        const p = n + NATIVE_TRANSITION_SLOTS + exit_instr;
+        if (p >= self.slots.len) return null;
+        return @intCast(p);
+    }
 };
 
 /// Doc 56 Phase 4: one native exit adapter — a small arena page that makes
-/// the slab coherent at the exit's resume pc and then jumps through its own
-/// heap target cell (never inside the RX page). In Phase 4 the target is
-/// always the shared trampoline exit; Phase 5 retargets it to the child.
+/// the slab coherent at the exit's resume pc and then jumps through the
+/// exit's exit-side cell in the parent's `slots` (`exitSideSlot`): the
+/// shared trampoline exit while unarmed, the child's `ordinary_entry` once
+/// an `ArmKind.exit_side` arm is published (Phase 5).
 pub const ExitAdapter = struct {
     exit: u32,
     page: ExecPage,
-    target: *usize,
 
-    /// Release the page slot and the target cell (`gpa` created the cell).
-    pub fn deinit(self: *ExitAdapter, gpa: std.mem.Allocator) void {
+    /// Release the page slot.
+    pub fn deinit(self: *ExitAdapter) void {
         self.page.deinit();
-        gpa.destroy(self.target);
         self.* = undefined;
     }
 };

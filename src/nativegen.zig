@@ -337,9 +337,14 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
         const tr = ar.ensureTrampoline() catch return null;
         shared_exit = tr.shared_exit;
         tramp_entry = tr.entry;
+        const slot_count = n + NATIVE_TRANSITION_SLOTS + exit_side_cells.len;
         // Five trailing cells are first-class physical links: four keyed
         // return-continuation targets and one continuation-to-head target.
-        slots = gpa.alloc(usize, n + NATIVE_TRANSITION_SLOTS) catch return null;
+        // Doc 56 Phase 5: a page with the exit-side stub gets one more cell
+        // per instruction after the transition cells (`exitSideSlot`), the
+        // exit adapters' jump targets. Without the stub the layout is
+        // unchanged.
+        slots = gpa.alloc(usize, slot_count) catch return null;
         @memset(slots, tr.shared_exit);
         ret_cont_keys = gpa.alloc(u32, RET_CONT_SLOTS) catch {
             gpa.free(slots);
@@ -355,7 +360,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
         // runs. `gen = 0` never matches a live `episode_gen` (prepare
         // increments before first use, and the gen saturates below maxInt),
         // so every record starts cold.
-        link_hit_counters = gpa.alloc(artifact.LinkHitCounter, n + NATIVE_TRANSITION_SLOTS) catch {
+        link_hit_counters = gpa.alloc(artifact.LinkHitCounter, slot_count) catch {
             gpa.free(ret_cont_keys);
             gpa.free(slots);
             return null;
@@ -366,13 +371,15 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
                 .sibling_handoff
             else if (ri < n + RET_CONT_SLOTS)
                 .ret_cont
+            else if (ri < n + NATIVE_TRANSITION_SLOTS)
+                .call_head
             else
-                .call_head)),
+                .exit_side)),
         };
         // Doc 54 P2 amendment: the per-slot rowless-follow gate, parallel
         // to `slots` (full length, zero-init = no slot eligible). Written
         // only by `commitSlotMutation`'s paired commit.
-        slot_rowless_ok = gpa.alloc(u8, n + NATIVE_TRANSITION_SLOTS) catch {
+        slot_rowless_ok = gpa.alloc(u8, slot_count) catch {
             gpa.free(link_hit_counters);
             gpa.free(ret_cont_keys);
             gpa.free(slots);
@@ -2495,12 +2502,13 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 }
                 continue;
             }
-            // Doc 56 Phase 4: the exit-side stub. A published cell sends this
-            // exit to its adapter (resume-coherent at `P`), but only on the
-            // dispatcher's direct entry (`exit_side_ok`), with nothing chained
-            // before it (empty ledger) and no silent transition — so no
-            // ledger replay can ever meet the adapter's `.exit_side` row.
-            // Touches only rax and the flags, both dead at a guard exit.
+            // Doc 56 Phases 4–5: the exit-side stub. A published cell sends
+            // this exit to its adapter (resume-coherent at `P`), but only
+            // within a native call started by the dispatcher's direct entry
+            // (`exit_side_ok`; every trace that call chains into included —
+            // the dispatcher replays the ledger, whose `.exit_side` grammar
+            // is Phase 5's) and with no silent transition (Phase 6). Touches
+            // only rax and the flags, both dead at a guard exit.
             if (exit_side_cells.len != 0 and t.exitAttachable(ei)) {
                 const ordinary = try a.label();
                 try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&exit_side_cells[ei]))));
@@ -2508,8 +2516,6 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 try a.jcc(.e, ordinary);
                 try a.cmpByteMemImm(.rdx, @offsetOf(NativeResult, "exit_side_ok"), 0);
                 try a.jcc(.e, ordinary);
-                try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "ledger_len"), 0);
-                try a.jcc(.ne, ordinary);
                 try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "silent_active"), 0);
                 try a.jcc(.ne, ordinary);
                 try a.jmpMem(.rax, 0);

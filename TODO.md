@@ -2,17 +2,6 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
-## Doc 56 Phase 2: multret pairs are not resumable mid-pair
-
-- [x] (Done 2026-09-25: rule 9 / `Verdict.multret_consumer`, pinned and
-      mutation-checked in `trace_exit_attach_test.zig`.)
-      `exitAttachable` must refuse an exit whose resume pc is the CONSUMER
-      half of a multret pair (a `call`/`ret` with `b == all_results` right
-      after a `call c=all_results` or `vararg_spread`). Tier-0 needs the
-      transient `reg_top`/`reg_top_pending`, which no snapshot carries, so
-      resuming there reads a garbage count. Doc 56 §4.3 does not list this.
-      Pin it with a test when Phase 2 lands.
-
 ## Loop-exit writeback could use bytecode liveness instead of the watermark
 
 - [ ] `trace_finalize` drops loop-end writebacks above `locals_watermark`, a
@@ -1752,8 +1741,10 @@ nothing at all.
       hops). Measured on the native path in Phase 4 (nsieve, switch on):
       the whole runtime round-trip dominates (33% `enterSelectedTrace`,
       plus hashing, `resumeOf`, `memcpy`, `replayLedgerFrom`). Phase 5's
-      direct jump removes the round-trip for bound exits; re-measure
-      what is left after it before caching anything.
+      direct jump removed the round-trip for ARMED exits (fft: 843k of
+      963k hops fused). The scan is still paid by exits that are bound
+      but can't arm (nsieve's tier-1a-only child); re-measure after the
+      boolean-slot item below and Phase 6.
 - [ ] **Tier-1a materialize scans every later instruction per hop.**
       `irinterp.materializeExitSide` walks `gi+1..n` for the sunk stores
       on every hop. The native adapter uses `flushStoreIndices` once at
@@ -1775,3 +1766,29 @@ nothing at all.
       dispatcher doesn't read `ChainResult.completed`. Options: keep them
       so the counts stay honest for later readers, or drop them. Bart to
       decide.
+
+## Doc 56 Phase 5 findings (2026-09-27)
+
+- [ ] **A boolean read from a slot never goes native.** `proveKinds` has
+      no kind for a `slot_load` holding a boolean: the bool-lane
+      `guard_fits` is only a check in tier-1a (`nativegen_prove.zig`
+      Pass A skips it). So `local f = true; for i = 1, n do t[i] = f end`
+      stays tier-1a/tier-0 (`/tmp/boolstore.lua`-style probe: 0% traced),
+      and nsieve's exit-side child at pc 7 (`p[i] = true`, with `true`
+      read from r6) never compiles, so that exit never arms and its 3.8M
+      hops go back to tier-0 with the switch on. General fix: a typed
+      bool slot input (prologue tag check + payload), like `guard_int`
+      does for ints. LuaJIT types every SLOAD (true/false are their own
+      IR types); read `lj_record.c`/`lj_snap.c` first.
+- [ ] **`not` is unsupported in `proveKinds`.** `if p[i] and not q[i]`
+      stops a loop going native (`fail-at %17 op=not ty=boolean`).
+      General boolean coverage; do it with the item above.
+- [ ] **Exit stub precedence (doc 56 Phase 7).** An exit with a
+      published adapter takes it even when its ordinary slot holds a
+      live, silent region bridge (sieve_int, nsieve-bit: 232 → 39,732
+      ledger walks with the switch on). The Phase 7 rule "existing live
+      arms first" must hold in the stub, not only in `noteTakenExit`.
+- [ ] **Exits of exit-side children are never wanted (Phase 7).** A
+      child's own branch exit rolls back to its anchor and earns legacy
+      and window strikes that gate the loop (two-level branch probe: 65%
+      traced with the switch off, 13% on).

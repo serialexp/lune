@@ -574,6 +574,38 @@ pub fn bindExitSide(self: *TraceState, parent: *Trace, exit_instr: u32, via: Exi
 /// continuation already at `P`, or the commit of the recording it armed.
 pub const ExitSideBind = enum { chain, commit };
 
+/// Doc 56 Phase 5 (LuaJIT's `lj_asm_patchexit` at side-trace commit): point
+/// attached exit `exit_instr`'s adapter straight at the continuation that
+/// serves its resume pc `p`, so the next firing runs the child natively
+/// instead of returning to the runtime. Called after a chain into the
+/// continuation at `p` ran to its `.link`. The target is the canonical
+/// continuation pick every other continuation arm uses
+/// (`resolveLoopDoneCont(...).arm`); every shape gate lives in `arm`. An
+/// identical re-arm is a no-op in the registry.
+pub fn armExitSide(self: *TraceState, parent: *Trace, exit_instr: u32, proto: *const Proto, p: u32, safe_to_arm: bool) void {
+    if (!safe_to_arm) return;
+    if (parent.exitSideAt(exit_instr) != .attached) return;
+    const child = self.resolveLoopDoneCont(proto, p, null).arm orelse return;
+    const armed = self.armNativeLink(parent, exit_instr, child, .exit_side) catch false;
+    if (armed) self.exit_side_arms +|= 1;
+    self.dbg("exit-side: trace={d} exit={d} arm -> child={d} at pc={d}: {s}", .{ parent.id, exit_instr, child.id, p, if (armed) "armed" else "refused" });
+}
+
+/// Doc 56 Phase 5: apply the disarm a replayed child prologue failure
+/// requested (`pending_exit_side_disarm`), after the walk. Called from the
+/// common settlement funnel of every ledger driver.
+pub fn drainPendingExitSideDisarm(self: *TraceState) void {
+    const key = self.pending_exit_side_disarm orelse return;
+    self.pending_exit_side_disarm = null;
+    for (self.registry.native_physical.armedLinks(), 0..) |l, i| {
+        if (l.kind != .exit_side or l.parent.id != key.trace_id or l.slot_index != key.exit_instr) continue;
+        self.dbg("exit-side: trace={d} exit={d} disarm (child={d} refused its entry)", .{ key.trace_id, key.exit_instr, l.child.id });
+        self.disarmLinkAt(i);
+        self.exit_side_disarms +|= 1;
+        return;
+    }
+}
+
 /// Doc 44 D8 (P1a): a head trace at `anchor` completed terminally. If a
 /// head-sibling want is standing for this anchor, retire it: clear the want
 /// and DONE-latch the raising `(trace, exit)` counter — without the latch a
@@ -681,7 +713,9 @@ pub fn hasArmedSourceBranchLinkAt(self: *const TraceState, parent: *Trace, slot:
     if (child.code.anchor.proto != parent.code.anchor.proto or child.code.anchor.pc != parent.code.anchor.pc) return false;
     if (!self.isSourceBranchGuardExit(parent, slot, proto)) return false;
     for (self.registry.native_physical.armedLinks()) |l| {
-        if (l.parent == parent and l.child == child and l.slot_index == slot) return true;
+        // Doc 56 Phase 5: an exit-side arm of the same exit is a different
+        // relation (its own cell, resume-coherent), never the M1 source link.
+        if (l.parent == parent and l.child == child and l.slot_index == slot and l.kind != .exit_side) return true;
     }
     return false;
 }
@@ -744,9 +778,14 @@ pub const SuccAnchor = struct { proto_id: u32, pc: u32 };
 /// resolution faithfully but keyed by anchor, not the concrete successor trace:
 ///   • `.link_terminal` → the named inner root at `(t.proto, link.aux)`, iff a
 ///     trace of inner-root shape is bound there.
-///   • a guard exit → `(t.proto, wp)` where `wp = guardExitPc(...)` (non-null only
-///     for the numeric/branch guards `driveChain` chains on), iff `wp != 0`,
-///     `wp != t.code.anchor.pc`, and a trace is bound at `(t.proto, wp)`.
+///   • a numeric-for loop-done guard → `(t.proto, wp)` where `wp =
+///     guardExitPc(...)` (the post-loop pc `driveChain` chains on), iff
+///     `wp != 0`, `wp != t.code.anchor.pc`, and a trace is bound there.
+///   • a doc 56 exit-side exit (config on, exit attachable) → its resume pc
+///     `P`, under the same two conditions.
+///   • a composite bridge candidate → the static-CFG overlay
+///     (`resolveCompositeBridgeSuccessor`). Every other guard deopts to its
+///     own anchor and contributes no edge.
 /// The successor proto is `t.code.anchor.proto` — the same-proto assumption
 /// `driveChain` makes (it threads one `proto` into `nextTraceExcluding`); a
 /// cross-proto inlined-callee resume is a known deferred refinement (§A8-ii).
@@ -770,10 +809,28 @@ pub fn resolveSuccessorAnchor(self: *const TraceState, t: *const Trace, e: ExitP
             return .{ .proto_id = proto.id, .pc = succ_pc };
         },
         .guard => {
-            if (guardExitPc(t.code.instrs[e.index])) |wp| {
-                if (wp != 0 and wp != t.code.anchor.pc and
-                    self.countTracesAt(.{ .proto = proto, .pc = wp }) != 0)
-                    return .{ .proto_id = proto.id, .pc = wp };
+            // Only two kinds of guard exit move execution to another pc:
+            //  • a numeric-for loop-done: `driveChain` chains at the guard's
+            //    exit pc, the post-loop pc;
+            //  • a doc 56 exit-side exit: it materializes at its resume pc
+            //    `P`, which the exit snapshot takes from the branch polarity.
+            // Any other guard deopts to its own anchor. `guardExitPc` of a
+            // BRANCH guard is the branch's fall-through pc whichever way the
+            // recording went, so it is NOT a successor: taking it as one once
+            // a trace anchored there (doc 56 children anchor mid-body) wired
+            // nsieve's composite exit to the prime path, and its bridge
+            // counted composites as primes.
+            if (t.code.isNumericForLoopDoneGuard(e.index)) {
+                if (guardExitPc(t.code.instrs[e.index])) |wp| {
+                    if (wp != 0 and wp != t.code.anchor.pc and
+                        self.countTracesAt(.{ .proto = proto, .pc = wp }) != 0)
+                        return .{ .proto_id = proto.id, .pc = wp };
+                }
+            } else if (self.config.exit_side and t.code.exitAttachable(e.index)) {
+                if (t.code.exitResumePc(e.index)) |p| {
+                    if (p != t.code.anchor.pc and self.countTracesAt(.{ .proto = proto, .pc = p }) != 0)
+                        return .{ .proto_id = proto.id, .pc = p };
+                }
             }
             // A-vii-d.1 overlay: composite bridge candidates get the
             // opposite-polarity static-CFG successor (with the crossed
@@ -934,6 +991,9 @@ pub fn silentKindForArm(kind: ArmKind) ?nativegen.SilentSiteKind {
         .loop_done_linked => .loop_done_linked,
         .region_bridge => .region_bridge,
         .ret_cont, .call_head => null,
+        // Doc 56 Phase 5: no silent site until Phase 6 adds
+        // `SilentSiteKind.exit_side`, so the edge never promotes.
+        .exit_side => null,
     };
 }
 
@@ -957,6 +1017,9 @@ pub fn validateRegionBridgeReceipt(self: *TraceState, owner: *Trace, exit: u32, 
     var armed_link: ?*const NativeLink = null;
     for (self.registry.native_physical.armedLinks()) |*link| {
         if (link.parent != owner or link.slot_index != exit or link.child != succ) continue;
+        // Doc 56 Phase 5: the exit's exit-side arm (own cell) is not the
+        // ordinary cell's relation this proof is about.
+        if (link.kind == .exit_side) continue;
         if (link.kind != .region_bridge) return error.WrongArmKind;
         if (armed_link != null) return error.NoArmedProvenance;
         armed_link = link;
@@ -1016,16 +1079,22 @@ pub fn promotedEdgeFromLink(self: *TraceState, link: NativeLink) ?PromotedEdge {
     if (!self.stubEnterable(link.child, switch (link.kind) {
         .link_terminal => .linked,
         .ordinary_guard, .loop_done_linked, .sibling_handoff, .region_bridge, .ret_cont, .call_head => .ordinary,
+        // Doc 56 Phase 5: `silentKindForArm` refused it above (no silent
+        // site until Phase 6, whose promotion must also read the
+        // exit-side cell, not `slots[slot_index]`).
+        .exit_side => return null,
     }, link.child.code.anchor.proto)) return null;
     const target = switch (link.kind) {
         .link_terminal => child_compiled.linked_entry orelse return null,
         .ordinary_guard, .loop_done_linked, .sibling_handoff, .ret_cont, .call_head => child_compiled.ordinary_entry orelse return null,
+        .exit_side => return null,
         .region_bridge => child_compiled.ordinary_entry orelse return null,
     };
     if (compiled.slots[link.slot_index] != target) return null;
 
     const resume_pc: u32 = switch (link.kind) {
         .ret_cont, .call_head => return null, // frame-motion links never promote
+        .exit_side => return null, // Phase 6 (see above)
         .sibling_handoff => blk: {
             if (link.parent.code.anchor.proto != link.child.code.anchor.proto or
                 link.parent.code.anchor.pc != link.child.code.anchor.pc or
@@ -1917,6 +1986,20 @@ pub fn arm(self: *TraceState, request: ArmRequest) !bool {
             // (§B.4), so a seeded child IS stub-enterable when its episode
             // ctx is fresh — consult the shared predicate instead of the
             // pre-B-iv "ordinary_entry cannot seed" blanket rule.
+            if (!self.stubEnterable(child, .ordinary, child.code.anchor.proto)) return false;
+        },
+        // Doc 56 Phase 5: an attached exit's published adapter jumps into a
+        // `.link` continuation anchored at the exit's resume pc `P` (the
+        // adapter left the slab coherent there). The physical cell is the
+        // exit-side cell, resolved by the registry.
+        .exit_side => {
+            if (head_parent) return false;
+            if (!parent.code.exitAttachable(slot_index)) return false;
+            if (parent.exitSideAt(slot_index) != .attached) return false;
+            if (!c.exitSidePublished(slot_index)) return false;
+            const p = parent.code.exitResumePc(slot_index) orelse return false;
+            if (child.code.anchor.proto != parent.code.anchor.proto or child.code.anchor.pc != p) return false;
+            if (child.code.instrs.len == 0 or child.code.instrs[child.code.instrs.len - 1].op != .link) return false;
             if (!self.stubEnterable(child, .ordinary, child.code.anchor.proto)) return false;
         },
     }

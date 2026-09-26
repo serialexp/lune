@@ -326,13 +326,24 @@ pub const ChainResult = struct {
     completed: usize,
     resume_pc: ?u32 = null,
     /// Doc 56 Phase 3: `driveChain`'s hop-0 `.link` continuation ran to its
-    /// `.link` terminal and the linked burst ran (the scalar seam only; a
-    /// native span drained through a ledger leaves it false). The tier-1a
-    /// exit-side arm reads it to bind a wanted exit to the child that served
-    /// it; a zero-progress candidate that merely redirected the resume leaves
-    /// it false.
+    /// `.link` terminal — through the scalar burst, or (Phase 5) as the head
+    /// row of a native span drained through the seed ledger, however far its
+    /// armed `.link` then fused. The exit-side router reads it to bind a
+    /// wanted exit to the child that served it (and, natively, to arm it); a
+    /// candidate that deopted before its `.link` leaves it false.
     linked: bool = false,
+    /// Doc 56 Phase 5: a ledger replay ended on an UNARMED exit adapter's
+    /// row (the exit is wanted, or attached but not armed): the slab is
+    /// coherent at `resume_pc` (the exit's resume pc) and the row's receipt
+    /// is already charged. The dispatcher runs the routing half of the
+    /// exit-side consumer for it (chain, bind, arm, or ask for a recording).
+    exit_side: ?ExitSideTerminal = null,
 };
+
+/// Doc 56 Phase 5: the exit whose adapter ended a replayed ledger, and the
+/// work its row committed (the parent's laps plus the interrupted
+/// iteration, as `consumeExitSide`'s `completed + 1`).
+pub const ExitSideTerminal = struct { trace: *Trace, exit: u32, done: usize };
 
 /// The execution tier a chain drive uses for the candidate traces it enters.
 /// Chosen at each dispatcher call site (comptime), NOT per-candidate:
@@ -1050,6 +1061,12 @@ pub const TraceState = struct {
     /// Cleared at every `replayLedger` entry so a stale request can never leak
     /// across ledgers.
     pending_bridge_arm: ?ExitKey = null,
+    /// Doc 56 Phase 5: an armed exit-side child failed its prologue in a
+    /// replayed ledger; its `.exit_side` arm is disarmed after the walk
+    /// (`drainPendingExitSideDisarm`, never mid-walk). The exit stays
+    /// attached and re-arms only when a chain into the child links again.
+    /// Cleared at every `replayLedger` entry, like `pending_bridge_arm`.
+    pending_exit_side_disarm: ?ExitKey = null,
     /// Doc 47 Increment B follow-up: set by `invalidateRegion`; drained at the
     /// dispatcher drain tail (post-replay-walk safe point) by
     /// `drainPendingRegionRebuild` — rebuilds the region topology so the
@@ -1266,6 +1283,19 @@ pub const TraceState = struct {
     /// Doc 56 Phase 4: of `exit_side_hops`, the ones a native exit adapter
     /// materialized.
     exit_side_native_hops: u64 = 0,
+    /// Doc 56 Phase 5: armed exit-side hops replayed from a ledger (the
+    /// adapter jumped straight into the child).
+    exit_side_fused: u64 = 0,
+    /// Doc 56 Phase 5: armed exit-side hops that force-yielded instead (the
+    /// adapter found the ledger full and went back to the runtime). The
+    /// rest of `exit_side_native_hops` minus `exit_side_fused` returned
+    /// unarmed.
+    exit_side_yields: u64 = 0,
+    /// Doc 56 Phase 5: `.exit_side` arm requests the registry accepted
+    /// (identical re-arms included) / arms disarmed after a child prologue
+    /// failure.
+    exit_side_arms: u64 = 0,
+    exit_side_disarms: u64 = 0,
     /// Doc 56 Phase 4: native exit adapters built.
     exit_adapter_builds: u64 = 0,
     /// Doc 56 Phase 4: adapter builds refused, per `adapter.Refusal`.
@@ -1715,6 +1745,39 @@ pub const TraceState = struct {
         return false;
     }
 
+    /// Doc 56 Phase 5: does an armed `.exit_side` link send exit
+    /// `exit_instr` of `parent` into `child`? Validates a non-last
+    /// `.exit_side` ledger row by armed-edge provenance, the way
+    /// `hasArmedSiblingHandoff` validates a handoff row.
+    ///
+    /// O(1) on the hot replay path (one call per fused hop): the exit-side
+    /// cell has a single writer, the registry's `commitSlotMutation`, which
+    /// writes a child's `ordinary_entry` there only for a registered
+    /// `.exit_side` link — so the cell holding `child`'s entry IS the proof.
+    /// Debug builds cross-check the registry.
+    pub fn hasArmedExitSide(self: *const TraceState, parent: *const Trace, exit_instr: u32, child: *const Trace) bool {
+        const pc = switch (parent.native) {
+            .compiled => |*c| c,
+            else => return false,
+        };
+        const cc = switch (child.native) {
+            .compiled => |*c| c,
+            else => return false,
+        };
+        const cell = pc.exitSideSlot(exit_instr) orelse return false;
+        const entry = cc.ordinary_entry orelse return false;
+        const armed = pc.slots[cell] == entry;
+        if (comptime std.debug.runtime_safety) {
+            var registered = false;
+            for (self.registry.native_physical.armedLinks()) |l| {
+                if (l.kind == .exit_side and l.parent == parent and
+                    l.slot_index == exit_instr and l.child == child) registered = true;
+            }
+            std.debug.assert(armed == registered);
+        }
+        return armed;
+    }
+
     /// Part S / §S-a: the ANCHOR-COHERENCE proof for a handoff exit — does no
     /// heap-mutating op precede `exit_instr` in the trace body?
     ///
@@ -2001,7 +2064,12 @@ pub const TraceState = struct {
     fn armedEdgeInBridgeFreeCycle(self: *const TraceState, parent: *const Trace, exit_instr: u32) bool {
         var first_child: ?*Trace = null;
         for (self.registry.native_physical.armedLinks()) |link| {
-            if (link.parent == parent and link.slot_index == exit_instr and link.kind != .region_bridge) {
+            // Doc 56 Phase 5: an `.exit_side` arm shares its logical slot
+            // with the exit's ordinary cell but is not a promotable edge yet
+            // (Phase 6), so it must not answer for a sibling arm here.
+            if (link.parent == parent and link.slot_index == exit_instr and
+                link.kind != .region_bridge and link.kind != .exit_side)
+            {
                 first_child = link.child;
                 break;
             }
@@ -2898,6 +2966,8 @@ pub const TraceState = struct {
     pub const ExitRoute = trace_link_mod.ExitRoute;
     pub const exitSideNative = trace_link_mod.exitSideNative;
     pub const bindExitSide = trace_link_mod.bindExitSide;
+    pub const armExitSide = trace_link_mod.armExitSide;
+    pub const drainPendingExitSideDisarm = trace_link_mod.drainPendingExitSideDisarm;
     pub const maybeArmExitSide = trace_link_mod.maybeArmExitSide;
     pub const noteExitSideCommit = trace_link_mod.noteExitSideCommit;
     pub const noteHeadSiblingCompletion = trace_link_mod.noteHeadSiblingCompletion;
@@ -4217,6 +4287,8 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
             any_adapter_refused = true;
         }
         try w.writeAll(if (any_adapter_refused) "\n" else " none\n");
+        // Doc 56 Phase 5: the adapter's direct jump into the child.
+        try w.print("    exit-side arms:       armed={d} fused hops={d} yields={d} disarmed (child prologue)={d}\n", .{ ts.exit_side_arms, ts.exit_side_fused, ts.exit_side_yields, ts.exit_side_disarms });
     }
 
     try w.writeAll("  coverage by loop iterations (count — flatters the JIT):\n");

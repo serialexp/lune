@@ -1,6 +1,6 @@
 # 56 — Exit-started side traces (LuaJIT's side-trace mechanism) — Design
 
-Status: Phase 1 done (exit snapshots, exit location map, finalize tests); Phase 2 done (attachability and resume pc); Phase 3 done (tier-1a materialize and exit-side recording); Phase 4 done (native exit adapters, behind a switch that is off); Phase 5 planned and reviewed (§4.8.1), in progress; design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
+Status: Phase 1 done (exit snapshots, exit location map, finalize tests); Phase 2 done (attachability and resume pc); Phase 3 done (tier-1a materialize and exit-side recording); Phase 4 done (native exit adapters, behind a switch that is off); Phase 5 done (direct jump and ledger grammar, switch still off; §4.8.1 and the as-built notes in the checklist); Phase 6 next; design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
 Owner: Bart
 Last updated: 2026-09-26
 
@@ -305,17 +305,99 @@ consumes yet, so every program's output and trace set stays identical.
     - Tier-1a-only board unchanged.
   - Review: Antigravity found nothing serious; one nit fixed, one
     finding rejected after checking (`docs/reviews/doc56/antigravity-phase4.md`).
-- [ ] **Phase 5 — direct jump, ledger grammar and accounting.** Plan in
+- [x] **Phase 5 — direct jump, ledger grammar and accounting.** Plan in
   §4.8.1 (reviewed: Antigravity CHANGES REQUESTED, all 8 findings
-  folded in).
-  - [ ] `ArmKind.exit_side`, its own physical cells, registry tests.
-  - [ ] Replay grammar for the `.exit_side` row and `.via_exit_side`;
-    hand-built ledger tests.
-  - [ ] Adapter tail: jump into the child, `exit_reason` reset.
-  - [ ] Dispatcher routing and the `consumeExitSide` split.
-  - [ ] Arming and disarming; drop the stub's `ledger_len == 0`;
+  folded in). Built 2026-09-26/27, switch still off.
+  - [x] `ArmKind.exit_side`, its own physical cells, registry tests.
+  - [x] Replay grammar for the `.exit_side` row and `.via_exit_side`;
+    ledger tests.
+  - [x] Adapter tail: jump into the child, `exit_reason` reset.
+  - [x] Dispatcher routing and the `consumeExitSide` split.
+  - [x] Arming and disarming; drop the stub's `ledger_len == 0`;
     end-to-end tests.
-  - [ ] Measure, docs, code review.
+  - [x] Measure, docs, code review.
+  - **As built (where it differs from §4.8.1):**
+    - No new directive for "last and `.normal`". The replay returns
+      `return_result` with a new optional field
+      `ChainResult.exit_side = { trace, exit, done }`; the dispatcher
+      reads it after `driveDispatcherLedger` and runs the routing half
+      (`routeExitSide`), which calls `noteTakenExit` itself. A yielded
+      row leaves the field null (nothing to route: the arm exists).
+    - `consumeExitSide` splits into `consumeExitSide` (receipt: hop
+      counters, selection charge) and `routeExitSide` (chain at `P`,
+      bind, arm, record). Neither takes an `anchor_pc` any more; it is
+      the parent's own anchor.
+    - The router asserts the silent path is inactive, and a chain that
+      did not link but stopped away from `P` resumes tier-0 where it
+      stopped (it can deopt through an armed sibling handoff).
+    - New counter `exit_side_yields` (the `exit-side arms:` stats line).
+    - `ChainResult.linked` is also true when a native seed ledger's
+      first row is the seed's own `.link` (bug 1 below).
+    - The ledger tests live in `interp_exit_side_test.zig` on real
+      armed traces (not hand-built traces in `trace_replay_test.zig`):
+      fused, unarmed-last, yielded-last (hand-built rows AND a real
+      machine-code run that fills the ledger so the adapter itself
+      yields), child deopt, child prologue failure and its disarm.
+    - Not reached by any program yet: an M1 ramp's `.exit_side` row
+      (the switch arm is in place, with its `row_local == 0` panic).
+  - **Bug 1 (CLI crash, fft bit-reverse at the CLI's hotloop 56).**
+    The continuation serving an exit can have its `.link` armed back to
+    the parent before the exit is armed. Its chain then runs as a
+    multi-row native ledger and `driveChain` reported "not linked", so
+    the exit never bound, and the router asserted the chain stopped at
+    `P`. Fixed in `driveChain` (a seed ledger headed by the seed's own
+    `.link` row is linked) and in the router (above). The test harness
+    now takes a `hotloop` option; the regression test runs at the CLI's
+    threshold.
+  - **Bug 2 (wrong nsieve prime counts on repeated calls).** A region
+    successor for a branch guard came from `guardExitPc`, which is
+    always the branch's fall-through pc, whatever way the recording
+    went. Once an exit-side child anchored at that pc, a continuation's
+    composite exit got a region bridge onto the prime path. Fixed in
+    `resolveSuccessorAnchor`: a plain guard edge now exists only for a
+    numeric-for loop-done guard (successor = post-loop pc) or, with the
+    switch on, an attachable exit (successor = its resume pc). Every
+    other guard goes through `resolveCompositeBridgeSuccessor` (the
+    polarity-aware CFG walk). This changes the doc 17 A-ii.2 model
+    (noted there). 18 region fixtures in `trace_region_test.zig` now
+    build their guard edges from real loop-done shapes
+    (`loopDoneCode`).
+  - **Measured (2026-09-27).**
+    - Switch off vs HEAD (default mode): no change beyond noise on all
+      28 benches (the machine was loaded; the three rows over 5% were
+      equal when re-run interleaved).
+    - Switch on: ReleaseSafe output identical to tier-0 on all 28
+      benches in all four modes. Best of 2×5, off → on: fft 209 → 333
+      ms, nsieve 12 → 181, nsieve-bit 14 → 36, nsieve-bit-fp 283 → 389,
+      sieve_int 6 → 23, repack 22 → 28; the rest within noise.
+    - Why (from `--jit-stats`), three separate causes:
+      1. **The seam, not the hop.** Exit-side cycles are not silent
+         yet, so every 32 rows cost a replay walk. fft: tier-0 fallback
+         time 58% → 9% (the direct jump works), but the seam 15% → 51%
+         (330k walks). nsieve-bit-fp: tier-0 53% → 19%, seam 3% → 37%.
+         sieve_int and nsieve-bit: exit-side arms replace region
+         bridges that were already silent (232 walks → 39,732).
+         Phase 6 (silent promotion) removes this; the sieve_int case
+         also needs the Phase 7 rule "existing live arms first" at the
+         exit stub, since the adapter wins over a live bridge there.
+      2. **Children that never compile.** nsieve's init-loop exit
+         (`p[i] = true` growing the array) gets a child at pc 7 that
+         reads `true` from a slot. `proveKinds` has no kind for a
+         boolean read from a slot (the bool-lane `guard_fits` is only a
+         check in tier-1a), so the child is tier-1a only, the exit
+         never arms, and its 3.8M hops go back to tier-0. This is a
+         general gap: `local f = true; for i = 1, n do t[i] = f end`
+         never goes native either. Tracked in TODO.md.
+      3. **Exits of exit-side children are never wanted.** A child's
+         own branch exit goes to tier-0 at the child's anchor and
+         earns legacy and window strikes, which gate the loop (a
+         two-level branch program: 65% of iterations traced with the
+         switch off, 13% on). Phase 7 routing.
+    - The forced yield in the adapter happens in no benchmark (the
+      ledger fills on the child's `.link` row); `yields=0` everywhere.
+    - Widening `exit_side_ok` to bursts: not measured (no counter for
+      exits a burst takes the old way). Deferred until the three causes
+      above are fixed; it goes in the Phase 6 measurement.
 - [ ] **Phase 6 — regions and silent promotion.**
   - `exit_side` edges and the side trace's `.link` back are
     intra-iteration edges of the parent's loop region.

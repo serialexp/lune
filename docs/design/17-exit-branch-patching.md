@@ -456,6 +456,12 @@ land; move whole sections to Done once everything inside is checked.
     `countTracesAt>0`; succ proto = `t.anchor.proto` (same-proto, cross-proto deferred). Anchor-keyed graph,
     NOT `findTrace`-selected identity. Read by nothing. Tests: 2-anchor cont↔inner cycle; retire empties;
     `eql`/`order` field-wise.
+    **Amended 2026-09-27 (doc 56 Phase 5, bug 2):** the plain guard rule was too wide. `guardExitPc` of a
+    branch guard is always the fall-through pc, whichever way the recording went, so a trace anchored there
+    made a wrong-polarity edge (nsieve counted composites as primes). A plain guard edge now exists only for
+    a numeric-for loop-done guard (`isNumericForLoopDoneGuard`, successor = post-loop pc) or, with
+    `exit_side` on, an attachable exit (successor = `exitResumePc`). Every other guard goes through
+    `resolveCompositeBridgeSuccessor`. Fixtures build guard edges from `for_loop` code (`loopDoneCode`).
   - [x] **A-ii.3 — recorded `{proto_id, source_pc}` membership substrate (inert). LANDED 2026-07-21.**
     `just test` green (default + `-Djit-debug`); nsieve/nbody/mandelbrot tier-0 ≡ native. `ProgramPoint
     {proto_id, source_pc}`; `Recorder.rec_path` + `rec_path_ok` accumulate one `{proto.id, pc −| 1}` per
