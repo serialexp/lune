@@ -12,6 +12,7 @@ const trace_code = @import("trace_code.zig");
 const layout = @import("nativegen_layout.zig");
 const prove = @import("nativegen_prove.zig");
 const mcode = @import("nativegen_mcode.zig");
+const exit_attach = @import("trace_exit_attach.zig");
 const Reg = x64.Reg;
 const Trace = trace_code.TraceCode;
 const Kind = @import("nativegen_artifact.zig").Kind;
@@ -320,13 +321,65 @@ pub fn findOrAddSlot(slots: *std.ArrayListUnmanaged(SlotInfo), gpa: std.mem.Allo
 /// See module header. Returns `null` to bail (cut-2 cannot compile this trace); the
 /// caller falls back. Runs only on a `proveKinds`-accepted trace, so every op is in the
 /// supported subset and `kinds`/`slot_of` are filled.
+/// Doc 56 Phase 4 (§4.6 "Register allocation", Q3): an exit adapter reads,
+/// at an attachable exit `gi`, every exit-snapshot ref and what the stores it
+/// applies read (`exit_attach.forEachStoreRead`) — reads `operandReads` cannot
+/// see. Extend each such value computed before `gi` to `gi`, so its place
+/// still holds it there; to `gi + 1` when `gi` itself reads it, so operand
+/// reuse (win 1, which needs `last_use == gi`) cannot hand its register to
+/// `gi`'s own result. Constants and `uref`s need nothing: the adapter
+/// rebuilds them. Must run before any allocation decision (the win-2 home
+/// coalescing reads `last_use`). Cost O(exits × (snapshot + stores)).
+fn extendExitSideLiveness(gpa: std.mem.Allocator, t: *const Trace, last_use: []u32) std.mem.Allocator.Error!void {
+    if (t.deopt_mode == .precise or t.peeled or t.exit_snapshots.len == 0) return;
+    const stores = try exit_attach.flushStoreIndices(gpa, t);
+    defer gpa.free(stores);
+    for (0..t.instrs.len) |gi| {
+        if (!t.exitAttachable(gi)) continue;
+        const ext: ExitNeedExtender = .{ .t = t, .gi = gi, .last_use = last_use };
+        const si = t.exitSnapIdx(gi).?; // attachable implies a snapshot
+        const s = t.exit_snapshots[si - 1];
+        for (t.exit_snapshot_slots[s.slots_begin..][0..s.slots_len]) |ss| ext.need(ss.ref);
+        exit_attach.forEachStoreRead(t, gi, stores, ext);
+    }
+}
+
+const ExitNeedExtender = struct {
+    t: *const Trace,
+    gi: usize,
+    last_use: []u32,
+
+    pub fn need(self: ExitNeedExtender, ref: usize) void {
+        if (ref >= self.gi) return; // rebuilt by the adapter, or refused by it
+        switch (self.t.instrs[ref].op) {
+            .konst, .uref => return,
+            else => {},
+        }
+        const rd = operandReads(self.t.instrs[self.gi]);
+        const reads = (rd.a and self.t.instrs[self.gi].a == ref) or (rd.b and self.t.instrs[self.gi].b == ref);
+        const until: u32 = @intCast(if (reads) self.gi + 1 else self.gi);
+        if (self.last_use[ref] < until) self.last_use[ref] = until;
+    }
+};
+
 pub fn analyze(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, slot_of: []const i32) ?Alloc {
-    return analyzeInner(gpa, t, kinds, slot_of) catch |e| switch (e) {
+    return analyzeWith(gpa, t, kinds, slot_of, .{});
+}
+
+/// Allocation options. The defaults reproduce `analyze` exactly.
+pub const AnalyzeOpts = struct {
+    /// Doc 56 Phase 4: keep every value an attachable exit's adapter reads
+    /// live up to that exit (`extendExitSideLiveness`).
+    exit_side: bool = false,
+};
+
+pub fn analyzeWith(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, slot_of: []const i32, opts: AnalyzeOpts) ?Alloc {
+    return analyzeInner(gpa, t, kinds, slot_of, opts) catch |e| switch (e) {
         error.Bail, error.OutOfMemory => null,
     };
 }
 
-pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, slot_of: []const i32) AnalyzeError!Alloc {
+pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, slot_of: []const i32, opts: AnalyzeOpts) AnalyzeError!Alloc {
     const n = t.instrs.len;
 
     // Phase E1/E2: the preheader marker (if any) splits the trace into a run-once
@@ -810,6 +863,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             }
         }
     }
+    if (opts.exit_side) try extendExitSideLiveness(gpa, t, last_use);
 
     // --- allocation: pin slot homes, then linear-scan the transients ---
     const loc = try gpa.alloc(Loc, n);

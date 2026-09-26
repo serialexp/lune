@@ -229,6 +229,50 @@ pub fn appliesAtExit(code: *const TraceCode, gi: usize, e: usize) bool {
     return ins.ord != 0 and ins.ord < code.instrs[gi].ord;
 }
 
+/// Doc 56 Phase 4: what the NATIVE resume-coherent exit `gi` reads for the
+/// stores it applies (`appliesAtExit`), exactly what each store's leaf
+/// emitter reads: the address token (an `aref`'s index, an `href`'s cell
+/// pointer, a `gcell`'s flat index, a `ustore`'s `uref` cell pointer), the
+/// table behind an `aref`/`gcell` (the adapter reloads the array base from
+/// it), and the stored value. Calls `sink.need(ref)` per read; a ref may be
+/// reported more than once. Constants and `uref`s are reported like any
+/// other value; the adapter rebuilds them (constant pool, seed slot), so the
+/// allocator need not keep them live. The exit snapshot's refs are the
+/// other half of what the exit reads; callers walk those themselves.
+///
+/// `stores` is `flushStoreIndices(code)`: walking only those keeps a
+/// whole-trace pass at O(exits × stores) instead of O(exits × n).
+pub fn forEachStoreRead(code: *const TraceCode, gi: usize, stores: []const u32, sink: anytype) void {
+    for (stores) |e32| {
+        const e: usize = e32;
+        if (!appliesAtExit(code, gi, e)) continue;
+        const ins = code.instrs[e];
+        sink.need(ins.a);
+        sink.need(ins.b);
+        switch (ins.op) {
+            .astore => sink.need(code.instrs[ins.a].a),
+            .gstore => sink.need(code.instrs[code.instrs[ins.a].a].a),
+            .hstore, .ustore => {},
+            else => unreachable, // `appliesAtExit` admits only the four flush stores
+        }
+    }
+}
+
+/// Ascending indices of every `.flush_store` instruction of `code` (the only
+/// ones `appliesAtExit` can admit). Caller owns the slice.
+pub fn flushStoreIndices(gpa: std.mem.Allocator, code: *const TraceCode) std.mem.Allocator.Error![]u32 {
+    var count: usize = 0;
+    for (code.instrs) |ins| count += @intFromBool(resumeClass(ins.op) == .flush_store);
+    const out = try gpa.alloc(u32, count);
+    var k: usize = 0;
+    for (code.instrs, 0..) |ins, i| {
+        if (resumeClass(ins.op) != .flush_store) continue;
+        out[k] = @intCast(i);
+        k += 1;
+    }
+    return out;
+}
+
 /// `P` for an exit whose provenance resolves (rules 3–5), or the verdict
 /// that stopped it.
 pub const Resolved = union(enum) {

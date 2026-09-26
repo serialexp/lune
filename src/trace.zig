@@ -368,11 +368,11 @@ pub const ExitMaterialization = union(enum) {
     /// The chain walks at the post-loop pc (`whileLoopDonePostPc`), which is
     /// the condition branch's jump target — NOT `guardExitPc`.
     while_done,
-    /// Doc 56 Phase 3: a tier-1a exit-side exit. The executor already made
-    /// the slab coherent at the exit's resume pc `P` (the payload), so the
-    /// chain walks `.link` continuations at `P` and a zero-progress
-    /// candidate resumes tier-0 at `P`, never at the anchor. Tier-1a only
-    /// until Phase 4.
+    /// Doc 56 Phases 3–4: an exit-side exit. The executor (tier-1a) or the
+    /// exit adapter (native) already made the slab coherent at the exit's
+    /// resume pc `P` (the payload), so the chain walks `.link` continuations
+    /// at `P` and a zero-progress candidate resumes tier-0 at `P`, never at
+    /// the anchor.
     exit_side: u32,
 };
 
@@ -712,6 +712,15 @@ pub const TraceConfig = struct {
     /// runs keep today's routes until Phase 4 regardless. A test/ablation
     /// knob; on by default (Bart, 2026-09-25).
     exit_side: bool = true,
+    /// Doc 56 Phase 4: exit-side routing on NATIVE pages (needs
+    /// `exit_side`). Compiles the exit-side stub at every attachable exit
+    /// and keeps the values its adapter reads live there; a wanted or
+    /// attached exit then materializes at `P` natively. Off by default until
+    /// Phase 6: before the adapter can jump straight into its child (Phase
+    /// 5) and the cycle can run silent (Phase 6), every native hop returns to
+    /// the runtime (~600 ns), which would make hot hops slower than today's
+    /// exit. Off, the machine code is byte-identical.
+    exit_side_native: bool = false,
     /// Maximum distinct traces cached per anchor before `countGuardFailure` /
     /// `countFingerprintMiss` stop counting (i.e. before side-trace recording at
     /// that anchor is refused). Four remains the economic bound until native exit
@@ -1254,6 +1263,13 @@ pub const TraceState = struct {
     exit_side_chain_binds: u64 = 0,
     /// Recordings armed at `P` for a wanted exit.
     exit_side_records: u64 = 0,
+    /// Doc 56 Phase 4: of `exit_side_hops`, the ones a native exit adapter
+    /// materialized.
+    exit_side_native_hops: u64 = 0,
+    /// Doc 56 Phase 4: native exit adapters built.
+    exit_adapter_builds: u64 = 0,
+    /// Doc 56 Phase 4: adapter builds refused, per `adapter.Refusal`.
+    exit_adapter_refusals: [@typeInfo(nativegen.adapter.Refusal).@"enum".field_names.len]u64 = @splat(0),
     /// Doc 45 D5 diagnostic: tier-1a `.precise_error` exits consumed — a
     /// PRECISE trace's effect shim (`tnew`) raised a runtime error, the
     /// executor restored the failing op's snapshot, and the dispatcher
@@ -2880,6 +2896,7 @@ pub const TraceState = struct {
     pub const clearPendingExitAnchor = trace_link_mod.clearPendingExitAnchor;
     pub const noteTakenExit = trace_link_mod.noteTakenExit;
     pub const ExitRoute = trace_link_mod.ExitRoute;
+    pub const exitSideNative = trace_link_mod.exitSideNative;
     pub const bindExitSide = trace_link_mod.bindExitSide;
     pub const maybeArmExitSide = trace_link_mod.maybeArmExitSide;
     pub const noteExitSideCommit = trace_link_mod.noteExitSideCommit;
@@ -3557,7 +3574,7 @@ pub const TraceState = struct {
     }
 
     fn armWithPolicy(self: *TraceState, proto: *const Proto, target_pc: u32, force_ordinary: bool) void {
-        self.rec.reset(self.gpa, .{ .proto = proto, .pc = target_pc }, proto.num_registers) catch return;
+        self.rec.start(self.gpa, .{ .proto = proto, .pc = target_pc }, proto.num_registers, self.config.debug_log) catch return;
         self.dbg("rec-arm: pc={d} force_ordinary={}", .{ target_pc, force_ordinary });
         // Doc 43 §3.1 (P0a): seed the anchor's absolute slab base for the open-cell
         // aliasing check. `reset` zeroes it; the dispatch loop stashed `st.base`
@@ -4190,6 +4207,16 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
         try w.writeAll(if (any_refused) "\n" else " none\n");
         // Doc 56 Phase 3: the tier-1a exit-side path.
         try w.print("    exit side:            wants={d} records={d} binds={d} (by chain {d}) giveups={d} hops={d} chained={d}\n", .{ ts.exit_side_wants, ts.exit_side_records, ts.exit_side_binds, ts.exit_side_chain_binds, ts.exit_side_giveups, ts.exit_side_hops, ts.exit_side_chains });
+        // Doc 56 Phase 4: native exit adapters.
+        try w.print("    exit adapters:        built={d} native hops={d}; refused:", .{ ts.exit_adapter_builds, ts.exit_side_native_hops });
+        var any_adapter_refused = false;
+        for (std.enums.values(nativegen.adapter.Refusal)) |why| {
+            const c = ts.exit_adapter_refusals[@intFromEnum(why)];
+            if (c == 0) continue;
+            try w.print(" {s}={d}", .{ @tagName(why), c });
+            any_adapter_refused = true;
+        }
+        try w.writeAll(if (any_adapter_refused) "\n" else " none\n");
     }
 
     try w.writeAll("  coverage by loop iterations (count — flatters the JIT):\n");

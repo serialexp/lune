@@ -65,9 +65,10 @@ pub const ExitReason = enum(u32) {
     /// operation is never retried (execute-once), and no strike/receipt/
     /// chain/side-trace accounting runs (the error is about to unwind).
     precise_error = 5,
-    /// Doc 56 §4.1/§4.4 (Phase 3, tier-1a only): an ORDINARY trace's guard
-    /// failed at an exit that is wanted or attached (`TraceRecord.exit_side`),
-    /// and the executor took the resume-coherent contract. It has ALREADY
+    /// Doc 56 §4.1/§4.4 (Phase 3 tier-1a, Phase 4 native): an ORDINARY
+    /// trace's guard failed at an exit that is wanted or attached
+    /// (`TraceRecord.exit_side`; natively, a published exit adapter), and the
+    /// executor took the resume-coherent contract. It has ALREADY
     /// applied the earlier bytecodes' sunk stores and written the exit
     /// snapshot's slots, so the guest registers are the tier-0 state at the
     /// exit's resume pc `P` (`TraceCode.exitResumePc(exit_instr)`), not at
@@ -279,6 +280,15 @@ pub const LedgerKind = enum(u32) {
     /// body exits `.precise_error`. Always terminal; the dispatcher parks the
     /// mapped error at the snapshot's `resume_pc` without re-execution.
     precise_error = 11,
+    /// Doc 56 Phase 4: a native exit adapter materialized the tier-0 state at
+    /// the exit's resume pc `P` (`reason = .exit_side`): the earlier
+    /// bytecodes' sunk stores, the carried homes and the exit snapshot. The
+    /// interrupted iteration is committed forward up to `P`. Always terminal
+    /// in Phase 4 (the adapter returns to the runtime) and only ever written
+    /// by the dispatcher's direct entry with an empty ledger, so no chain
+    /// ledger can contain it until Phase 5 adds the direct jump and its
+    /// replay arm.
+    exit_side = 12,
 
     /// Whether a row of this kind proves the burst COMMITTED guest work at
     /// that exit, independent of the `cum` back-edge counter. `cum` counts
@@ -299,6 +309,8 @@ pub const LedgerKind = enum(u32) {
             .head_terminal,
             .ret_pop,
             .call_push,
+            // The interrupted iteration is committed forward up to `P`.
+            .exit_side,
             => true,
             .deopt,
             .prologue_fail,
@@ -390,6 +402,7 @@ test "execution contract wire ordinals and capacity" {
     try std.testing.expectEqual(@as(u32, 9), @intFromEnum(LedgerKind.call_push));
     try std.testing.expectEqual(@as(u32, 10), @intFromEnum(LedgerKind.precise_deopt));
     try std.testing.expectEqual(@as(u32, 11), @intFromEnum(LedgerKind.precise_error));
+    try std.testing.expectEqual(@as(u32, 12), @intFromEnum(LedgerKind.exit_side));
     try std.testing.expectEqual(@as(u32, 0), @intFromEnum(LedgerOutcome.normal));
     try std.testing.expectEqual(@as(u32, 1), @intFromEnum(LedgerOutcome.yielded));
     try std.testing.expectEqual(@as(usize, 32), LEDGER_CAP);

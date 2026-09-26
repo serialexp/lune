@@ -3581,7 +3581,8 @@ pub const Vm = struct {
         return .next_candidate;
     }
 
-    /// Doc 56 Phase 3: consume a direct tier-1a `.exit_side` exit of `ct`.
+    /// Doc 56 Phases 3–4: consume a direct `.exit_side` exit of `ct`, from
+    /// tier-1a (`tier == .ir`) or a native exit adapter (`.native_only`).
     /// The executor already applied the earlier bytecodes' sunk stores and
     /// the exit snapshot, so `regs` is coherent at the exit's resume pc `P`
     /// and the run committed `result.completed` iterations plus the start of
@@ -3599,6 +3600,7 @@ pub const Vm = struct {
     fn consumeExitSide(
         self: *Vm,
         comptime mode: ExecMode,
+        comptime tier: trace.ChainTier,
         ct: *trace.Trace,
         result: trace_exec.ExecResult,
         proto: *const Proto,
@@ -3612,11 +3614,12 @@ pub const Vm = struct {
         std.debug.assert(ct.exitSideAt(ei).materializes());
         const p = ct.code.exitResumePc(ei).?;
         ts.exit_side_hops +|= 1;
+        if (tier == .native_only) ts.exit_side_native_hops +|= 1;
         const done = result.completed + 1;
-        ts.dbg("exit-side hop: trace={d} exit={d} state={s} resume pc={d} completed={d}", .{ ct.id, ei, @tagName(ct.exitSideAt(ei)), p, result.completed });
-        ts.noteTakenExit(ct, ei, done, proto, .tier1a_direct);
+        ts.dbg("exit-side hop: trace={d} exit={d} state={s} tier={s} resume pc={d} completed={d}", .{ ct.id, ei, @tagName(ct.exitSideAt(ei)), @tagName(tier), p, result.completed });
+        ts.noteTakenExit(ct, ei, done, proto, if (tier == .native_only) .native_direct else .tier1a_direct);
         ts.onSideExitReceipt(ct, done, ei, done, .deferred, .entered);
-        if (ts.driveChain(ct, result, proto, regs, .ir, .{ .exit_side = p }, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
+        if (ts.driveChain(ct, result, proto, regs, tier, .{ .exit_side = p }, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
             if (chain.linked) {
                 ts.exit_side_chains +|= 1;
                 ts.bindExitSide(ct, ei, .chain);
@@ -3806,10 +3809,14 @@ pub const Vm = struct {
                     // `ledger_scratch` fill is inert until D2b
                     // activates the `ledger_len > 1` replay.
                     self.trace.prepareNativeEntry(); // B-3a direct-entry sweep hook
+                    // Doc 56 Phase 4: the one native call that may take an
+                    // exit adapter; its `.exit_side` result is consumed by
+                    // the arm below, before any ledger replay.
+                    const exit_side_ok = self.trace.exitSideNative();
                     break :blk if (ran_native_link_mode)
-                        nt.runLinkedLoopDoneCapturing(trace_regs, &self.trace.ledger_scratch, self.trace.silentStaging())
+                        nt.runLinkedLoopDoneCapturingEntry(trace_regs, &self.trace.ledger_scratch, self.trace.silentStaging(), exit_side_ok)
                     else
-                        nt.runCapturingLedger(trace_regs, &self.trace.ledger_scratch, self.trace.silentStaging());
+                        nt.runCapturingLedgerEntry(trace_regs, &self.trace.ledger_scratch, self.trace.silentStaging(), exit_side_ok);
                 }
                 break :blk irinterp.executeCtx(ir_ctx, &ct.code, trace_regs, buf);
             };
@@ -4138,13 +4145,22 @@ pub const Vm = struct {
                 }
                 return .{ .resume_tier0 = @intCast(snap.resume_pc) };
             }
-            // Doc 56 Phase 3: a tier-1a exit-side exit. The executor made the
-            // slab coherent at the exit's resume pc, so none of the anchor-
-            // coherent grammar below applies (no sibling trial, no anchor
-            // chain, no deopt replay).
+            // Doc 56 Phases 3–4: an exit-side exit (tier-1a, or a native exit
+            // adapter). The slab is coherent at the exit's resume pc, so none
+            // of the anchor-coherent grammar below applies (no sibling trial,
+            // no anchor chain, no deopt replay). Natively the adapter is only
+            // reachable from this direct entry with an empty ledger, so its
+            // row is the only one and belongs to `ct`.
             if (result.exit_reason == .exit_side) {
-                std.debug.assert(!ran_native and final == ct);
-                const d = self.consumeExitSide(mode, ct, result, proto, trace_regs, base, pc, safe_to_arm);
+                std.debug.assert(final == ct);
+                if (ran_native) std.debug.assert(result.ledger_len == 1 and
+                    self.trace.ledger_scratch[0].kind == .exit_side and
+                    self.trace.ledger_scratch[0].id == ct.id and
+                    result.local_completed == result.completed);
+                const d = if (ran_native)
+                    self.consumeExitSide(mode, .native_only, ct, result, proto, trace_regs, base, pc, safe_to_arm)
+                else
+                    self.consumeExitSide(mode, .ir, ct, result, proto, trace_regs, base, pc, safe_to_arm);
                 for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
                 return d;
             }
@@ -4366,10 +4382,17 @@ pub const Vm = struct {
                 (!any_loop_done or
                     (while_done_exit and self.trace.whileDoneHotnessEligible(final.code.anchor)));
             if (count_exit) {
-                // Doc 56 Phase 3: a direct tier-1a run may take the exit-side
-                // route (its executor honours the exit-side state); a native
-                // run keeps today's routes until Phase 4.
-                self.trace.noteTakenExit(final, result.exit_instr, local_done, proto, if (ran_native) .legacy else .tier1a_direct);
+                // Doc 56 Phases 3–4: a direct run may take the exit-side
+                // route — tier-1a always (its executor honours the exit-side
+                // state), native when its page carries exit adapters and the
+                // exit is the entered trace's own.
+                const route: trace.TraceState.ExitRoute = if (!ran_native)
+                    .tier1a_direct
+                else if (self.trace.exitSideNative() and final == ct)
+                    .native_direct
+                else
+                    .legacy;
+                self.trace.noteTakenExit(final, result.exit_instr, local_done, proto, route);
             }
 
             if (local_done > 0 or linked_one_trip or while_done_exit) {

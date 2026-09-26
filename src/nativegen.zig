@@ -123,6 +123,7 @@ pub const ExitLocMap = artifact.ExitLocMap;
 pub const CarriedHome = artifact.CarriedHome;
 /// Doc 56 §4.2 (Phase 1): the exit location map builder.
 pub const exitloc = @import("nativegen_exitloc.zig");
+pub const adapter = @import("nativegen_adapter.zig");
 
 /// Try to compile `t` to native code. Returns `null` to **bail** — for any reason:
 /// an off-target build, a value/op outside the proven-int/bool subset, malformed
@@ -130,22 +131,31 @@ pub const exitloc = @import("nativegen_exitloc.zig");
 /// back to the tier-1a IR-interpreter. Success transfers ownership of an executable
 /// page to the returned `CompiledTrace` (free it with `deinit`).
 pub fn compile(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32) ?CompiledTrace {
-    return compileImpl(gpa, t, trace_id, null, null, null);
+    return compileImpl(gpa, t, trace_id, null, null, null, .{});
 }
+
+/// Compile options. The defaults reproduce the historical code exactly.
+pub const CompileOpts = struct {
+    /// Doc 56 Phase 4: emit the exit-side stub at every attachable exit
+    /// (with its `exit_side_cells`) and keep what each such exit's adapter
+    /// reads live to it. Frameless (arena) pages only; off, the machine code
+    /// is byte-identical to a build without the feature.
+    exit_side: bool = false,
+};
 
 /// Test entry point for ALLOCATING traces (doc 24): like `compile` but with the
 /// heap whose counters/`gc_stress` the `guard_gc` lowering and the `tostr_*`
 /// callouts bake as absolute addresses. Without one, an allocating trace bails
 /// (fail closed) — see `compileImpl`.
 pub fn compileWithHeap(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, heap: *gc.Heap) ?CompiledTrace {
-    return compileImpl(gpa, t, trace_id, null, null, heap);
+    return compileImpl(gpa, t, trace_id, null, null, heap, .{});
 }
 
 /// Test entry point for SEEDED traces (doc 22 §B.2): like `compile` but with a
 /// seeding ctx to bake into the entry prologue. A trace whose seed plan is
 /// non-empty cannot compile without one (fail closed, §B.4).
 pub fn compileSeeded(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, seed_ctx: *const NativeSeedCtx) ?CompiledTrace {
-    return compileImpl(gpa, t, trace_id, null, seed_ctx, null);
+    return compileImpl(gpa, t, trace_id, null, seed_ctx, null, .{});
 }
 
 /// Production entry point: compile `t` and co-locate its code in the shared `arena`
@@ -154,12 +164,17 @@ pub fn compileSeeded(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, see
 /// context (doc 22 §B.1) a seeded trace's entry prologue bakes; nullable because
 /// hand-built test TraceStates carry none — a seeded trace then bails to tier-1a.
 pub fn compileInto(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace, trace_id: u32, seed_ctx: ?*const NativeSeedCtx, heap: ?*gc.Heap) ?CompiledTrace {
-    return compileImpl(gpa, t, trace_id, arena, seed_ctx, heap);
+    return compileImpl(gpa, t, trace_id, arena, seed_ctx, heap, .{});
+}
+
+/// `compileInto` with explicit `CompileOpts`.
+pub fn compileIntoWith(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace, trace_id: u32, seed_ctx: ?*const NativeSeedCtx, heap: ?*gc.Heap, opts: CompileOpts) ?CompiledTrace {
+    return compileImpl(gpa, t, trace_id, arena, seed_ctx, heap, opts);
 }
 
 /// Shared compile body. `arena == null` maps a standalone owned page (test path);
 /// non-null co-locates the code as an arena slot (production path).
-fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*McodeArena, seed_ctx: ?*const NativeSeedCtx, heap: ?*gc.Heap) ?CompiledTrace {
+fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*McodeArena, seed_ctx: ?*const NativeSeedCtx, heap: ?*gc.Heap, opts: CompileOpts) ?CompiledTrace {
     if (comptime !is_x64_linux) return null;
 
     const n = t.instrs.len;
@@ -231,7 +246,16 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     // cut-2: the register allocator + single-snapshot deopt. A `null` is a bail (the
     // trace runs on tier-1a) — e.g. a type-unstable carried slot the hoisted guard
     // can't catch.
-    var alloc = analyze(gpa, t, kinds, slot_of) orelse return null;
+    // Doc 56 Phase 4: the exit-side stub needs the frameless ABI (the
+    // adapter ends in a jump, like every frameless exit) and an attachable
+    // exit to serve; precise and peeled bodies have none by construction.
+    const exit_side = opts.exit_side and arena != null and blk: {
+        for (0..n) |i| {
+            if (t.exitAttachable(i)) break :blk true;
+        }
+        break :blk false;
+    };
+    var alloc = ngalloc.analyzeWith(gpa, t, kinds, slot_of, .{ .exit_side = exit_side }) orelse return null;
     defer alloc.deinit(gpa);
 
     // Doc 22 §A.1b/§B.4: the page-owned seed plan. Needs the slot classes
@@ -286,6 +310,15 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     // `slot[ei]`, which is the EXCLUSIVE linked-materialized exit — P-C option (b)),
     // so `slots.len == n` and every index is a real IR exit slot that `armNativeLink`
     // may legitimately arm.
+    // Doc 56 Phase 4: one exit-side cell per instruction (zero = ordinary
+    // exit), heap-stable before `lower` bakes `&cells[i]`.
+    var exit_side_cells: []usize = &.{};
+    var keep_exit_side_cells = false;
+    defer if (exit_side_cells.len > 0 and !keep_exit_side_cells) gpa.free(exit_side_cells);
+    if (exit_side) {
+        exit_side_cells = gpa.alloc(usize, n) catch return null;
+        @memset(exit_side_cells, 0);
+    }
     var slots: []usize = &.{};
     var ret_cont_keys: []u32 = &.{};
     var link_hit_counters: []artifact.LinkHitCounter = &.{};
@@ -374,7 +407,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
 
     var asm_buf = x64.Assembler.init(gpa);
     defer asm_buf.deinit();
-    const entry_stubs = lower(gpa, t, trace_id, kinds, &alloc, &asm_buf, shared_exit, slots, ret_cont_keys, link_hit_counters, slot_rowless_ok, metadata_cells, silent_emissions, seed_ctx, seed_plan, heap) catch {
+    const entry_stubs = lower(gpa, t, trace_id, kinds, &alloc, &asm_buf, shared_exit, slots, ret_cont_keys, link_hit_counters, slot_rowless_ok, metadata_cells, silent_emissions, exit_side_cells, seed_ctx, seed_plan, heap) catch {
         if (metadata_cells.len > 0) gpa.free(metadata_cells);
         if (slots.len > 0) gpa.free(slots);
         return null;
@@ -467,6 +500,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     // off the finished allocation, after emission, so it cannot influence
     // the code. Fail-soft: no map on OOM, like the exit snapshots.
     const exit_locs = exitloc.build(gpa, t, kinds, &alloc) catch ExitLocMap{};
+    keep_exit_side_cells = true;
     keep_ret_cont_keys = true;
     keep_link_hit_counters = true;
     keep_slot_rowless_ok = true;
@@ -492,6 +526,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
         },
         .peeled = t.peeled,
         .exit_locs = exit_locs,
+        .exit_side_cells = exit_side_cells,
     };
 }
 
@@ -719,7 +754,7 @@ fn emitPreciseSnapshotFlush(a: *x64.Assembler, t: *const Trace, kinds: []const K
 /// committed counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers
 /// across iterations (loaded + type-guarded once in the prologue); `regs[]` is written
 /// only on a side-exit (the single snapshot) or for write-only slots at the back-edge.
-fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize, ret_cont_keys: []u32, link_hit_counters: []artifact.LinkHitCounter, slot_rowless_ok: []u8, metadata_cells: []usize, silent_emissions: []?SilentSiteEmission, seed_ctx: ?*const NativeSeedCtx, seed_plan: SeedPlan, heap: ?*gc.Heap) !EntryStubs {
+fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize, ret_cont_keys: []u32, link_hit_counters: []artifact.LinkHitCounter, slot_rowless_ok: []u8, metadata_cells: []usize, silent_emissions: []?SilentSiteEmission, exit_side_cells: []usize, seed_ctx: ?*const NativeSeedCtx, seed_plan: SeedPlan, heap: ?*gc.Heap) !EntryStubs {
     const exit_labels = try gpa.alloc(?x64.Label, t.instrs.len);
     defer gpa.free(exit_labels);
     @memset(exit_labels, null);
@@ -2460,6 +2495,26 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 }
                 continue;
             }
+            // Doc 56 Phase 4: the exit-side stub. A published cell sends this
+            // exit to its adapter (resume-coherent at `P`), but only on the
+            // dispatcher's direct entry (`exit_side_ok`), with nothing chained
+            // before it (empty ledger) and no silent transition — so no
+            // ledger replay can ever meet the adapter's `.exit_side` row.
+            // Touches only rax and the flags, both dead at a guard exit.
+            if (exit_side_cells.len != 0 and t.exitAttachable(ei)) {
+                const ordinary = try a.label();
+                try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&exit_side_cells[ei]))));
+                try a.cmpQwordMemImm8(.rax, 0, 0);
+                try a.jcc(.e, ordinary);
+                try a.cmpByteMemImm(.rdx, @offsetOf(NativeResult, "exit_side_ok"), 0);
+                try a.jcc(.e, ordinary);
+                try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "ledger_len"), 0);
+                try a.jcc(.ne, ordinary);
+                try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "silent_active"), 0);
+                try a.jcc(.ne, ordinary);
+                try a.jmpMem(.rax, 0);
+                a.bind(ordinary);
+            }
             if (isNumericForLoopDoneGuard(t, ei)) {
                 // [doc 30 §6 named coupling] Only emit the linked branch when the
                 // snapshot walk can commit EVERY sunk store below the guard — a
@@ -2868,4 +2923,5 @@ test {
     _ = @import("nativegen_carriedheap_test.zig");
     _ = @import("nativegen_hrefk_test.zig");
     _ = @import("nativegen_exitloc_test.zig");
+    _ = adapter;
 }

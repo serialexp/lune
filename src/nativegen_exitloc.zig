@@ -95,7 +95,16 @@ pub fn build(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc
         values[vi] = row(t, kinds, alloc, r);
         vi += 1;
     }
-    return .{ .values = values, .carried = carried };
+    return .{ .values = values, .carried = carried, .frame_words = frameWords(kinds, alloc) };
+}
+
+/// The body's frame in spill words: the allocator's cells plus one
+/// boxed-tag cell per `.boxed` value (`boxedTagSpill` numbers them past
+/// `spill_count`).
+fn frameWords(kinds: []const Kind, alloc: *const Alloc) u32 {
+    var boxed: u32 = 0;
+    for (kinds) |k| boxed += @intFromBool(k == .boxed);
+    return alloc.spill_count + boxed;
 }
 
 /// The deferred store ops `finalize` sinks below every guard (the
@@ -136,7 +145,14 @@ fn flushedCarried(s: SlotInfo, n: usize) bool {
 fn row(t: *const Trace, kinds: []const Kind, alloc: *const Alloc, ref: usize) ExitLoc {
     const ins = t.instrs[ref];
     const k = kinds[ref];
-    var out: ExitLoc = .{ .ref = @intCast(ref), .live_until = ExitLoc.LIVE_WHOLE_BODY, .kind = k, .tag = .none };
+    var out: ExitLoc = .{
+        .ref = @intCast(ref),
+        .live_from = @intCast(ref + 1),
+        .live_until = ExitLoc.LIVE_WHOLE_BODY,
+        .kind = k,
+        .tag = .none,
+        .ir_kind = k,
+    };
     if (ins.op == .konst) {
         // Rebuilt from the constant table, whatever the body did with it
         // (a snapshot-only konst has kind `.none` and no code at all).
@@ -146,7 +162,20 @@ fn row(t: *const Trace, kinds: []const Kind, alloc: *const Alloc, ref: usize) Ex
         out.payload = ci;
         return out;
     }
-    if (k == .none) return out;
+    if (k == .none) {
+        // A dead (`.none`) load has no place. An adapter restoring its OWN
+        // slot from it still needs to know when that is free: an invariant
+        // slot's slab is current (a carried one is written by its home's
+        // flush, which `carried` already lists).
+        if (ins.op == .slot_load) {
+            const sid = alloc.slot_id_of_ref[ref];
+            if (sid >= 0) {
+                const s = alloc.slots[@intCast(sid)];
+                if (s.class == .invariant) out.invariant_slot = s.slot;
+            }
+        }
+        return out;
+    }
     if (ins.op == .slot_load) {
         const sid = alloc.slot_id_of_ref[ref];
         if (sid < 0) return out;
@@ -156,6 +185,10 @@ fn row(t: *const Trace, kinds: []const Kind, alloc: *const Alloc, ref: usize) Ex
         // win-2 in-place update, which the allocator only allows after the
         // last body exit; the home stops holding the entry value there.
         setPlace(&out, s.home);
+        // The prologue loads the home, so it holds the iteration-entry
+        // value before the `slot_load`'s IR position too (an exit above it
+        // still sees — and a carried flush still writes — that value).
+        out.live_from = 0;
         // The home is boxed with the SLOT's kind, which is what every flush
         // uses. It differs from the load's own kind for a carried-heap
         // table (`.ptr` load, `.heap` slot: the table changes per

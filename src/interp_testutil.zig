@@ -74,6 +74,10 @@ pub const CapturedOpts = struct {
     /// to watch dispatcher/link events for a single harness leg without
     /// touching the CLI's global flag.
     debug_log: bool = false,
+    /// Doc 56 Phase 4: native traces take exit adapters
+    /// (`Config.exit_side_native`). Only the native leg compiles pages, so
+    /// the other legs are unaffected.
+    exit_side_native: bool = false,
     inspect: ?*const fn (*Vm, TraceMode) anyerror!void = null,
 };
 
@@ -107,6 +111,7 @@ pub fn runCapturedTuned(
     vm.trace.config.hotloop = 4; // record short test loops
     vm.trace.config.coverage = opts.coverage;
     vm.trace.config.debug_log = opts.debug_log;
+    vm.trace.config.exit_side_native = opts.exit_side_native;
     if (opts.hotguard) |hg| vm.trace.config.hotguard = hg;
 
     var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);

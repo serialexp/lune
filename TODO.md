@@ -1710,91 +1710,30 @@ demotions in trace.zig, compiler-adjudicated). Deferred items:
       (run the eq trace pre-capture and post-restore and compare), rather
       than the simulated same-id/different-address twin.
 
-## Recurring jit-debug test-gate flake (7 occurrences, 2 days)
+## Recurring jit-debug test-gate "flake" — diagnosed and fixed (2026-09-26)
 
-- [ ] Hunt the nondeterministic `zig build test -Djit-debug=true` failure:
-      2026-09-17 seed 0x3ace15b0, 2026-09-18 seed 0x34eef2f0, 2026-09-18
-      seed 0x4fa150f3 (binary a8ad25c4…, during the doc 52 P0 gate) — each
-      failed once, then PASSED with the very same seed on rerun (occurrence
-      3: re-ran the exact failing binary `./.zig-cache/o/a8ad25c4…/test
-      --seed=0x4fa150f3` directly — 1402/1402 OK), so it is definitively
-      not seed-deterministic. Suspect test parallelism / shared state /
-      timing rather than the seeded shuffle. Occurrence 3's failure output
-      was again lost to a `tail` pipe before the tail-8 window (only
-      unrelated guard-dedup spam survived) — next time run the FULL gate
-      with `> log 2>&1` FIRST, not after the failure. A nondeterministic
-      failure in this project is a real bug (Rule #2), not noise.
-- [ ] Occurrence 4 (2026-09-18, doc 52 P1 gate, seed 0x8fdb0d0b, binary
-      63e9fc8b…): NEW SHAPE — full stderr WAS captured this time (session
-      tool-results bd0ya4p1y.txt) and shows exactly one stray `failed
-      command: …/63e9fc8b…/test --seed=0x8fdb0d0b --listen=-` line with NO
-      `error: '…' failed` test line, no failing Build Summary, and the
-      overall `zig build test -Djit-debug=true` EXITED 0 (checked twice —
-      echo of `$?` immediately after). Immediate clean rerun: exit 0, no
-      stray line. So the flake can also manifest as a test-binary
-      crash/restart that the build runner ultimately reports as success —
-      look at zig's --listen respawn behavior when hunting this.
-- [ ] Occurrence 5 (2026-09-18, doc 53 P0 gate, seed 0xe84b76c2, binary
-      5d7c4dcc…): failed once (`failed command: …/5d7c4dcc…/test
-      --seed=0xe84b76c2 --listen=-`; the failing test's name was lost to a
-      `tail -3` pipe again — only `guard-dedup: ref=5 op=guard_int
-      ir_len=1617` spam survived, ir_len 1617 suggests one of the big
-      driver-trace recordings). Three immediate re-runs: 0 failures each.
-      Same lesson as occurrence 3: capture with `> log 2>&1` FIRST.
-- [ ] Occurrence 6 (2026-09-18, codex-review-followups gate, seed
-      0xec370f68, binary b2602e1e…): failed once (`failed command:
-      …/b2602e1e…/test --seed=0xec370f68 --listen=-`); the failing
-      test's name was AGAIN lost to a `tail -3` pipe (third time —
-      the lesson is written twice above and still got skipped; make
-      `> log 2>&1` the reflex for EVERY jit-debug gate run, not the
-      retry). Same `guard-dedup ref=5 op=guard_int ir_len=1617` spam
-      as occurrence 5. Three immediate log-captured re-runs: exit 0,
-      0 failures each.
-- [ ] Occurrence 7 (2026-09-18, doc 54 P0 inline-push gate, seed
-      0xc31dfac5, binary 54e1dcbe…): failed once (`failed command:
-      …/54e1dcbe…/test --seed=0xc31dfac5 --listen=-`); the failing
-      test's name was lost to a `tail -4` pipe — the FOURTH repetition
-      of the exact mistake documented three times above. Same
-      `guard-dedup … ir_len=1617` spam. Direct re-run of the failing
-      binary with the SAME seed: all 1411 tests pass; three further
-      log-captured full-gate runs: exit 0 each (5 consecutive passes).
-      Extra scrutiny applied because this gate contained fresh native
-      codegen (doc 54 P0 inline push) — profile matches the
-      pre-existing flake (jit-debug only, not seed-deterministic), but
-      the P0 sabotage battery should re-check this once landed.
-- [ ] Occurrence 8 (2026-09-25, doc 56 Phase 1 exit-location-map gate,
-      seed 0xb4d300c9, binary 29c17f2e…): one stray `failed command:
-      …/29c17f2e…/test --seed=0xb4d300c9 --listen=-` line; the output
-      was lost to a `grep | head` pipe (the fifth repeat of the mistake
-      above) and the exit code was not captured. Four log-captured
-      re-runs (three fresh seeds, one the same seed): exit 0, empty
-      output each.
-- [ ] Occurrence 9 (same day, same change, seed 0x16cbc5fb, binary
-      b8d0508e…): FULLY captured (`> log 2>&1`). It has occurrence 4's
-      shape exactly: the overall run EXITED 0, and the 40925-line log has
-      only three lines that aren't `[jit]` probe spam — `test`, a
-      truncated progress line `+- run test w`, and the final `failed
-      command: …/b8d0508e…/test --seed=0x16cbc5fb --listen=-`. There is
-      no `error: '…' failed` line, no panic/signal and no Build Summary.
-      This is strong evidence the stray line is the build runner's
-      progress/respawn output, not a failing test. The next step is to
-      read the pinned zig's build runner (`lib/compiler/build_runner.zig`
-      / `std.Build.Step.Run` `--listen` handling) for when it prints
-      "failed command" on a step that ends up succeeding.
-- [ ] Occurrence 10 (same day, after the review fixes, seed 0xa167519b):
-      identical shape, exit 0. It is **not caused by the doc 56 exit
-      location map**: the first jit-debug gate run on a clean HEAD shadow
-      (0889c7b, `/tmp/lune-head`, seed 0x2bc1a9b3) printed the same three
-      non-probe lines (`test`, `+- run test w`, `failed command: …`) and
-      exited 0. It reproduces often now (3 of the last 4 uncached runs), so
-      it is cheap to hunt. The log is about 40.9k lines of `[jit]` probe
-      spam; the large stderr volume is a suspect for the runner.
-- [ ] Occurrence 11 (2026-09-25, doc 56 Phase 2 gate after the review
-      fixes, seed 0xd087841): same shape — a trailing `failed command:
-      …/93be93d1…/test --seed=0xd087841 --listen=-` after `[jit]` probe
-      lines, overall exit 0.
-- [ ] Occurrence 12 (2026-09-25, doc 56 Phase 3 gate, seed 0xe3a2f6ab):
-      same shape, exit 0; the last non-probe line is the `failed command`.
+Twelve+ occurrences since 2026-09-17: a stray `failed command: …/test
+--seed=… --listen=-` line after `[jit]` probe spam. Every fully captured
+one exited 0 with `+- run test w` and no `error: '…' failed` line.
+
+**Cause** (read in the pinned zig, `lib/compiler/Maker.zig`): a step
+whose `result_stderr` is non-empty is printed even on success, labelled
+` w` (`printStepFailure`'s last arm), followed by its `failed command`.
+A passing test's stderr is buffered and handed over as `result_stderr`
+at the end, so whether any is left depends on buffering. The stderr was
+the recorder's jitdbg probes (`guard-dedup`, `ABORT`, `bad_type`), which
+skipped the per-VM `debug_log` gate and printed for every VM in a
+`-Djit-debug` build. Fixed in doc 56 Phase 4: `RecordingSession.dbg`,
+gated by the flag `RecordingSession.start` stamps. The gate now prints
+nothing at all.
+
+- [ ] **Watch.** Occurrences 1–3 and 5–8 lost their output to pipes, so
+      a real failure hiding among them can't be ruled out. The gate is
+      silent now, so any line it prints is real: if a `failed command`
+      shows up again, keep the whole log (`> log 2>&1`) and treat it as a
+      failure. (2026-09-26: a background loop of 30 direct runs of the
+      pre-fix test binary with random seeds was started to look for a
+      real non-zero exit; see CURRENT_TASK for its result.)
 
 ## Doc 56 Phase 3 leftovers (2026-09-25)
 
@@ -1810,11 +1749,26 @@ demotions in trace.zig, compiler-adjudicated). Deferred items:
       unbind on `removeTrace` (DONE latch included).
 - [ ] **Per-hop cache scan.** `consumeExitSide` → `driveChain` looks up
       the continuation at `P` with a cache scan on every hop (fft: 508k
-      hops). Measure it on the native path in Phase 4, and cache the
-      bound child per exit if it shows.
-- [ ] **`set_upval` is NYI in the recorder.** It blocks some exit-side
-      recordings (seen in a scratch program: the continuation aborts,
-      and the exit gives up after `tryside`).
+      hops). Measured on the native path in Phase 4 (nsieve, switch on):
+      the whole runtime round-trip dominates (33% `enterSelectedTrace`,
+      plus hashing, `resumeOf`, `memcpy`, `replayLedgerFrom`). Phase 5's
+      direct jump removes the round-trip for bound exits; re-measure
+      what is left after it before caching anything.
+- [ ] **Tier-1a materialize scans every later instruction per hop.**
+      `irinterp.materializeExitSide` walks `gi+1..n` for the sunk stores
+      on every hop. The native adapter uses `flushStoreIndices` once at
+      build; tier-1a could keep the same store list per trace.
+- [ ] **No sunk grid store can precede an attachable exit.** Every grid
+      shape tried (read-modify-write, or a write after any other heap
+      load) aborts with `store_after_load` on `set_index2`, so the exit
+      adapter's `gstore` path is reached by no program. It reuses the
+      body's `emitGStore`; add a parity test once the recorder allows it.
+- [ ] **`set_upval` on an OPEN upvalue is NYI in the recorder**
+      (`recSetUpval` aborts `nyi_opcode` when `cell.isOpen()`; closed
+      cells record as `ustore`). The same goes for `set_global`. Both
+      stop whole loops from tracing (`u = u + i` in a nested function
+      whose parent is still running; `G = G + i`). It blocks some
+      exit-side recordings too.
 - [ ] **Two iteration credits can't be seen yet.** Tier-1a call B's and
       `replayLedger`'s `enclosing_iteration` credits don't change any
       test when removed: `linked_completed` is already ≥ 1 there, and the

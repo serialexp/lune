@@ -73,6 +73,10 @@ const usage =
     \\  --jit-stats          imply --trace + --jit-coverage and print the FULL JIT
     \\                       stats block to stderr after the run: event counters + the
     \\                       native-vs-tier-0 coverage split + a per-anchor table.
+    \\  --jit-exit-side-native  let native traces take exit adapters (doc 56
+    \\                       Phase 4): a hot attachable exit resumes mid-iteration
+    \\                       and continues in a side trace there. Experimental;
+    \\                       off by default until doc 56 Phase 6.
     \\  --trace-hotguard <N>  imply --trace and override the guard-failure threshold
     \\                       for side-trace recording (default 50).  When a specific
     \\                       guard fails this many times, the next back-edge records
@@ -149,6 +153,9 @@ const TraceOpts = struct {
     /// `--trace-silent-budget <N>`: override the promoted-cycle silent-transition
     /// budget (default 4096). B-3c sweep knob; tiering heuristic, never output.
     silent_budget: ?usize = null,
+    /// `--jit-exit-side-native`: doc 56 Phase 4 — native pages take exit
+    /// adapters (`Config.exit_side_native`). Off by default until Phase 6.
+    exit_side_native: bool = false,
     /// `--dump-aborts`: imply `--trace`, record every abandoned recording into the
     /// abort log (`config.record_aborts`), and print the aggregated table to stderr
     /// after the run — which loop dies on which opcode/reason, and how far it got.
@@ -240,6 +247,8 @@ pub fn main(init: std.process.Init) u8 {
             topts.execute = true;
             topts.coverage = true;
             topts.jit_coverage = true;
+        } else if (std.mem.eql(u8, arg, "--jit-exit-side-native")) {
+            topts.exit_side_native = true;
         } else if (std.mem.eql(u8, arg, "--jit-stats")) {
             topts.enabled = true;
             topts.execute = true;
@@ -368,6 +377,7 @@ fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source:
     vm.trace.config.coverage = topts.coverage;
     if (topts.hotguard) |v| vm.trace.config.hotguard = v;
     if (topts.silent_budget) |v| vm.trace.config.silent_budget = v;
+    vm.trace.config.exit_side_native = topts.exit_side_native;
     // The source backs located error messages: `error(msg, level)` prefixes
     // `chunk:line:` and `synthErrorValue`/`describeFault` read spans against it.
     // Set unconditionally so a fault anywhere has a real location, not `""`.

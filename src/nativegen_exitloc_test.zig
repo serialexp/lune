@@ -136,6 +136,12 @@ test "doc 56 exit locations: each needed value gets the allocator's place and it
         try testing.expect(m.at(0, e) != null);
         try testing.expect(m.at(1, e) != null);
     }
+    // The prologue loads every home, so a slot home is held from the very
+    // start of the body — also at an exit above its `slot_load` (a carried
+    // load recorded mid-body still has its iteration-entry value there).
+    try testing.expectEqual(@as(u16, 0), i_row.live_from);
+    try testing.expectEqual(@as(u16, 0), lim_row.live_from);
+    try testing.expect(lim_row.holdsAt(0));
 
     // A constant is rebuilt from the table, never read from the body.
     const k_row = m.find(6).?;
@@ -149,6 +155,8 @@ test "doc 56 exit locations: each needed value gets the allocator's place and it
     try testing.expect(m.at(8, 10) != null);
     try testing.expect(m.at(8, 13) != null);
     try testing.expect(m.at(8, 5) == null); // not yet defined
+    try testing.expectEqual(@as(u16, 9), u_row.live_from);
+    try testing.expect(!u_row.holdsAt(8)); // its own def: not yet
 
     // t (%7) dies at instr 8, before the exit at 10 that names it: lost
     // there (Phase 1 extends no liveness).

@@ -257,7 +257,9 @@ pub fn driveChain(
     // observation-blackout gated (`safe_to_arm`, same rule as every other
     // persistent arm), and only for the composite-guard shape the M1 arm
     // refuses. Arm-only: steering below is unaffected this deopt.
-    if (tier == .native_only) self.maybeArmCompositeExit(failed, exit_instr, safe_to_arm);
+    // Doc 56 Phase 4: never for an exit-side exit — the composite bridge
+    // assumes the anchor-coherent exit, and this exit resumed at `P`.
+    if (tier == .native_only and materialization != .exit_side) self.maybeArmCompositeExit(failed, exit_instr, safe_to_arm);
     const walk_pc = switch (materialization) {
         // Coherent-anchor chaining (doc 16): after an *ordinary* guard deopt the
         // registers are coherent at the failed trace's **anchor**, not the
@@ -283,11 +285,9 @@ pub fn driveChain(
             if (local == 0 and !whileDoneCoherentAtZero(failed, exit_instr)) return null;
             break :blk whileLoopDonePostPc(failed, exit_instr) orelse return null;
         },
-        // Doc 56 Phase 3: the executor materialized at the exit's resume pc.
-        .exit_side => |p| blk: {
-            std.debug.assert(tier == .ir);
-            break :blk p;
-        },
+        // Doc 56 Phases 3–4: the executor (tier-1a) or the exit adapter
+        // (native) materialized at the exit's resume pc.
+        .exit_side => |p| p,
         // Numeric-for loop-done materializations chain to a `.link` continuation
         // living at the guard's *exit* PC (a real post-loop bytecode pc). Resolve
         // it through the op-gated accessor so an array-guard lane ordinal is never
@@ -1695,6 +1695,10 @@ pub fn replayLedgerFrom(
             // Doc 45 D6: precise exits are always terminal — never armed,
             // never fused, never chain members.
             .precise_deopt, .precise_error => @panic("replayLedger: precise row in a chain ledger"),
+            // Doc 56 Phase 4: only the dispatcher's direct entry with an
+            // empty ledger may take an exit adapter, so the row is never
+            // part of a chain ledger until Phase 5 adds its replay arm.
+            .exit_side => @panic("replayLedger: exit_side row in a chain ledger"),
         };
 
         // Destination `.deferred` for a handoff, NEVER `.known_trace`: this edge is
@@ -1771,6 +1775,8 @@ pub fn replayLedgerFrom(
             // Doc 45 D6: precise exits are always terminal and never armed —
             // this row kind cannot reach a chain ledger.
             .precise_deopt, .precise_error => @panic("replayLedger: precise row in a chain ledger"),
+            // Doc 56 Phase 4: see the work switch above.
+            .exit_side => @panic("replayLedger: exit_side row in a chain ledger"),
             .region_bridge => {
                 // A bridge commits its distinct cross-anchor snapshot before
                 // entering the successor. It is therefore never terminal or a

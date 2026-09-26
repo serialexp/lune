@@ -349,8 +349,50 @@ the ones that bite):
     a non-release build (it had `debug.assert` symbols) and gave a fake
     9× slowdown. Check `nm zig-out/bin/mahina | grep -c 'debug.assert$'`
     is 0 before trusting any timing.
-- **Next: Phase 4** (native exit adapters plus the liveness extension),
-  per doc 56's checklist.
+- **Phase 4 DONE (2026-09-26): native exit adapters**, behind
+  `Config.exit_side_native` / `--jit-exit-side-native` (off by default).
+  Plan committed as b736c8e (doc 56 §4.6.1); the as-built notes and
+  measurements are in doc 56's checklist.
+  - Built: `src/nativegen_adapter.zig` (build/publish/unpublish, refusals
+    carry the offending ref), the exit-side stub + `exit_side_cells`,
+    `NativeResult.exit_side_ok` (dispatcher direct entry only),
+    `LedgerKind.exit_side`, `ExitRoute.native_direct`, the liveness
+    extension, `ExitAdapter.deinit`, stats line `exit adapters:`, probe
+    `exit-adapter:`.
+  - Bug found on the first real program: `ExitLoc.holdsAt` said a slot
+    home is only held after its `slot_load`'s IR position, but homes are
+    loaded in the prologue. A carried accumulator first read after the
+    exit's guard was refused `not_held`. New `ExitLoc.live_from` (0 for
+    homes).
+  - **The recurring jit-debug "flake" is explained and fixed.** The
+    pinned zig's `Maker.zig` prints a PASSING step that left stderr as
+    `run test w` + `failed command:`. The stderr was the recorder's
+    ungated jitdbg probes. Now `RecordingSession.dbg` + `start(…,
+    debug_log)`; the jit-debug gate prints nothing at all. TODO.md
+    section replaced with the diagnosis plus a watch item. A background
+    loop of 30 direct runs of the PRE-fix test binary (random seeds,
+    logs in `/tmp/flake/`) was started to look for a real non-zero exit;
+    it was still running at hand-off (≈18/30 done, no failure).
+  - `just shadow` copied the 40 GB `.zig-cache` before deleting it and
+    filled /tmp; it now uses `rsync` with excludes (215 MB).
+  - Tests: see doc 56 Phase 4 "Tests". Mutation-checked (no stores → 8
+    failures; no snapshot slots → the parity legs hang).
+  - Measured: switch off = identical per-trace sizes to HEAD on all 28
+    benches; switch on = identical output on all 28, zero refusals, but
+    SLOWER (fft 208→344 ms, nsieve 13→134, nsieve-bit-fp 273→599)
+    because every hop goes back through the runtime. Phase 5 removes
+    that.
+  - Gates: `just test` 0; jit-debug 0 with an empty log.
+  - Antigravity review: nothing serious; `docs/reviews/doc56/antigravity-phase4.md`.
+  - Rule slip to report to Bart: one test-file edit was made with
+    `sed -i` instead of the Edit tool (Rule #6). The change itself was
+    correct and was left in place (Rule #19).
+- **Next: Phase 5** — the adapter jumps straight into the bound child
+  (retarget the adapter's target cell), `ArmKind.exit_side` and its
+  `arm` validation, the ledger grammar for `.exit_side` rows in chain
+  replay (drop the Phase 4 panics), the child's prologue-failure resume
+  at `P`, and widening who may take the path beyond the direct entry.
+  Then Phase 6 (silent promotion), then flip the switch and measure.
 
 ## Status 2026-09-24 (latest+27) — doc 55 §2 + §2d LANDED: fft 14.6× → 12.6× LJ, sparse −31%; silent switch is now data (no runtime code patching)
 

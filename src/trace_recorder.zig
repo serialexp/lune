@@ -14,6 +14,7 @@ const table_mod = @import("table.zig");
 const arith = @import("arith.zig");
 const gc = @import("gc.zig");
 const object = @import("object.zig");
+const jitdbg = @import("jitdbg.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
@@ -888,6 +889,11 @@ pub const RecordingSession = struct {
     /// in precise mode from the first instruction. Per-anchor policy, never
     /// a retroactive mid-candidate promotion.
     precise: bool = false,
+    /// The owning VM's `Config.debug_log`, stamped by every `start`: the
+    /// runtime gate for the recorder's jitdbg probes (`dbg`). Without it a
+    /// `-Djit-debug` build prints recorder probes for EVERY VM, and the test
+    /// runner then shows that stray stderr on a passing gate.
+    debug_log: bool = false,
     /// A1' (doc 45 / task 27): this recording is an ORDINARY PROBE at a
     /// precise-occupied one-shot anchor — the `precise_anchor_memo` seed is
     /// suppressed (arm() leaves `precise` false) and `.needs_precise` aborts
@@ -960,11 +966,18 @@ pub const RecordingSession = struct {
     /// ordinal" entry and is always 0.
     exit_snap_by_ord: std.ArrayListUnmanaged(trace_ir.SnapIdx) = .empty,
 
+    /// A jitdbg probe line, behind both gates: compiled in only with
+    /// `-Djit-debug`, printed only when this VM set `Config.debug_log`.
+    pub inline fn dbg(self: *const RecordingSession, comptime fmt: []const u8, args: anytype) void {
+        if (comptime jitdbg.enabled) {
+            if (self.debug_log) jitdbg.log(fmt, args);
+        }
+    }
+
     pub fn abort(self: *RecordingSession, reason: AbortReason) void {
         if (!self.active) return;
-        if (comptime @import("jitdbg.zig").enabled) {
-            if (reason == .bad_type or reason == .store_fwd_ambiguity or reason == .store_after_load) @import("jitdbg.zig").log("ABORT {s}: pc={d} op={d} ir_len={d} ret={x}", .{ @tagName(reason), self.cur_pc, @intFromEnum(self.cur_op), self.instrs.items.len, @returnAddress() });
-        }
+        if (reason == .bad_type or reason == .store_fwd_ambiguity or reason == .store_after_load)
+            self.dbg("ABORT {s}: pc={d} op={d} ir_len={d} ret={x}", .{ @tagName(reason), self.cur_pc, @intFromEnum(self.cur_op), self.instrs.items.len, @returnAddress() });
         // Doc 47 increment A fallback: if a peel is in flight and the body
         // recording aborts (aliased_input, nyi_opcode, etc.), don't kill the
         // recording — rewind the IR to the pre-peel state and close `.link`
@@ -1555,7 +1568,7 @@ pub const RecordingSession = struct {
             else if (isStringKey(regs.get(instr.c)))
                 try self.recHashGet(instr, regs)
             else blk: {
-                if (comptime @import("jitdbg.zig").enabled) @import("jitdbg.zig").log("bad_type get_index dispatch: isInt={} isFloat={} isNil={} isHeap={} pc={d}", .{ regs.get(instr.c).isInt(), regs.get(instr.c).isFloat(), regs.get(instr.c).isNil(), regs.get(instr.c).isHeap(), self.cur_pc });
+                self.dbg("bad_type get_index dispatch: isInt={} isFloat={} isNil={} isHeap={} pc={d}", .{ regs.get(instr.c).isInt(), regs.get(instr.c).isFloat(), regs.get(instr.c).isNil(), regs.get(instr.c).isHeap(), self.cur_pc });
                 break :blk self.abort(.bad_type);
             },
 
@@ -1861,7 +1874,7 @@ pub const RecordingSession = struct {
             else => {},
         }
         if (self.guarded_refs.contains(ref)) {
-            @import("jitdbg.zig").log("guard-dedup: ref={d} op={s} ir_len={d}", .{ ref, @tagName(op), self.instrs.items.len });
+            self.dbg("guard-dedup: ref={d} op={s} ir_len={d}", .{ ref, @tagName(op), self.instrs.items.len });
             return;
         }
         const gref = try self.emit(.{ .op = op, .a = ref });
@@ -2070,7 +2083,7 @@ pub const RecordingSession = struct {
         const vkey = regs.get(f.key);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         const idx = keyIndexOf(vkey) orelse {
-            if (comptime @import("jitdbg.zig").enabled) @import("jitdbg.zig").log("bad_type arrayGet key: isInt={} isFloat={} pc={d}", .{ vkey.isInt(), vkey.isFloat(), self.cur_pc });
+            self.dbg("bad_type arrayGet key: isInt={} isFloat={} pc={d}", .{ vkey.isInt(), vkey.isFloat(), self.cur_pc });
             return self.abort(.bad_type);
         };
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
@@ -2082,7 +2095,7 @@ pub const RecordingSession = struct {
         const loaded = tbl.getInt(idx);
         if (loaded.isNil()) return self.recordAbsentGet(regs, f);
         if (!arr.ArrayPart.inArray(idx, tbl.array.asize)) {
-            if (comptime @import("jitdbg.zig").enabled) @import("jitdbg.zig").log("bad_type arrayGet: idx={d} asize={d} lane={d} pc={d}", .{ idx, tbl.array.asize, @intFromEnum(lane), self.cur_pc });
+            self.dbg("bad_type arrayGet: idx={d} asize={d} lane={d} pc={d}", .{ idx, tbl.array.asize, @intFromEnum(lane), self.cur_pc });
             return self.abort(.bad_type);
         }
 
@@ -5799,6 +5812,15 @@ pub const RecordingSession = struct {
         if (self.exit_undo_prev.len != 0) gpa.free(self.exit_undo_prev);
         if (self.exit_undo_stamp.len != 0) gpa.free(self.exit_undo_stamp);
         if (self.exit_def_bits.len != 0) gpa.free(self.exit_def_bits);
+    }
+
+    /// The production entry: `reset` for a VM whose `Config.debug_log` is
+    /// `debug_log` (the `dbg` gate). Every `TraceState` arming path goes
+    /// through here, so no recording runs with a stale gate; hand-driven
+    /// recorder tests call `reset` and stay silent (the field's default).
+    pub fn start(self: *RecordingSession, gpa: std.mem.Allocator, anchor: AnchorKey, num_registers: u16, debug_log: bool) !void {
+        self.debug_log = debug_log;
+        return self.reset(gpa, anchor, num_registers);
     }
 
     /// Clear the buffer and arm a fresh recording for `anchor` over a frame with

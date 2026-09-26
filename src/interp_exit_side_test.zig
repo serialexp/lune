@@ -15,6 +15,7 @@ const trace_ir = @import("trace_ir.zig");
 const compiler = @import("compiler.zig");
 const io = @import("io.zig");
 const exit_attach = @import("trace_exit_attach.zig");
+const nativegen = @import("nativegen.zig");
 
 const util = @import("interp_testutil.zig");
 const expectProgramTuned = util.expectProgramTuned;
@@ -159,7 +160,6 @@ test "doc 56 Phase 1: ordinary traces carry sparse exit snapshots of bytecode-LI
 }
 
 test "doc 56 Phase 1: a compiled trace maps every exit-snapshot value, carried home and sunk-store read" {
-    const nativegen = @import("nativegen.zig");
     if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     // The inner loop has side exits (the `t[i] > 32` branch, the table
@@ -448,4 +448,201 @@ test "doc 56 Phase 3: bit-reverse's post-while continuation also serves the root
     var sink = io.Writer.fixed(&buf);
     try util.runCapturedTuned(testing.allocator, bitreverse_src, &sink, false, .record_execute, .{ .inspect = Inspect.run });
     try testing.expectEqualStrings("0.5\t1024\n", sink.buffered());
+}
+
+// ---- Doc 56 Phase 4: native exit adapters ----------------------------------
+
+/// All ten legs with `Config.exit_side_native` on print `expected`, and the
+/// native leg really took the adapter path: an adapter was built, the
+/// dispatcher consumed native exit-side hops, a continuation bound, and no
+/// build was refused. Output parity against tier-0 is the oracle for what
+/// each adapter wrote back (a missed store, home or snapshot slot shows in
+/// the printed values).
+fn expectNativeAdapters(source: [:0]const u8, expected: []const u8) !void {
+    return expectNativeAdaptersAnd(source, expected, null);
+}
+
+/// `expectNativeAdapters` plus `extra`, run on the native leg's VM.
+fn expectNativeAdaptersAnd(source: [:0]const u8, expected: []const u8, comptime extra: ?fn (*Vm) anyerror!void) !void {
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode != .record_execute_native) return;
+            if (extra) |f| try f(vm);
+            try testing.expect(vm.trace.exit_adapter_builds > 0);
+            try testing.expect(vm.trace.exit_side_native_hops > 0);
+            try testing.expect(vm.trace.exit_side_binds > 0);
+            for (vm.trace.exit_adapter_refusals) |n| try testing.expectEqual(@as(u64, 0), n);
+            // Every built adapter hangs off a native page that carries the
+            // exit-side cells.
+            var adapters: usize = 0;
+            for (vm.trace.registry.cache.items) |t| switch (t.native) {
+                .compiled => |*ct| {
+                    adapters += ct.exit_adapters.items.len;
+                    if (ct.exit_adapters.items.len != 0)
+                        try testing.expectEqual(t.code.instrs.len, ct.exit_side_cells.len);
+                },
+                .unattempted, .unsupported => {},
+            };
+            try testing.expect(adapters > 0);
+        }
+    };
+    try expectProgramTuned(source, expected, .{ .exit_side_native = true, .inspect = Inspect.run });
+}
+
+test "doc 56 Phase 4: a native adapter applies an earlier bytecode's sunk array store" {
+    // The Phase 3 sunk-store shape, natively: the adapter writes `t[1]`
+    // (float lane, konst index staged above the frame) before the resume.
+    try expectNativeAdapters(
+        \\local t = {0.5}
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  t[1] = t[1] + i
+        \\  if i % 3 == 0 then s = s + t[1] else s = s - 1 end
+        \\end
+        \\print(s, t[1])
+    , "1530000\t45150.5\n");
+}
+
+test "doc 56 Phase 4: a native adapter applies sunk stores on every array lane" {
+    // Each lane has its own store encoding (`emitAStore`): `i64`, the `u8`
+    // byte lane, `boolean` (presence in-band) and the tagged `value` lane
+    // (a mixed array). Each value stays inside its lane, so no store widens
+    // it and evicts the root. `t[1]` is read after the exit, so a store the
+    // adapter misses shows in the output.
+    try expectNativeAdapters(
+        \\local t = {1000000000000}
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  t[1] = t[1] + i
+        \\  if i % 3 == 0 then s = s + t[1] else s = s - 1 end
+        \\end
+        \\print(s, t[1])
+    , "100000001529950\t1000000045150\n");
+    try expectNativeAdapters(
+        \\local t = {1, 2}
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  t[1] = i % 7
+        \\  if i % 3 == 0 then s = s + t[1] else s = s - 1 end
+        \\end
+        \\print(s, t[1])
+    , "103\t6\n");
+    try expectNativeAdapters(
+        \\local t = {true, false}
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  t[1] = i % 2 == 0
+        \\  if i % 3 == 0 then if t[1] then s = s + 2 else s = s + 1 end else s = s - 1 end
+        \\end
+        \\print(s, t[1])
+    , "-50\ttrue\n");
+    try expectNativeAdapters(
+        \\local t = {0.5, "x"}
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  t[1] = t[1] + i
+        \\  if i % 3 == 0 then s = s + t[1] else s = s - 1 end
+        \\end
+        \\print(s, t[1], t[2])
+    , "1530000\t45150.5\tx\n");
+}
+
+test "doc 56 Phase 4: a native adapter applies sunk hash stores, one of a constant" {
+    try expectNativeAdapters(
+        \\local t = {x = 0.5, y = 0}
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  t.x = t.x + i
+        \\  t.y = 7
+        \\  if i % 3 == 0 then s = s + t.x + t.y else s = s - 1 end
+        \\end
+        \\print(s, t.x, t.y)
+    , "1530700\t45150.5\t7\n");
+}
+
+test "doc 56 Phase 4: a native adapter applies a sunk closed-upvalue store" {
+    // `u` is a CLOSED upvalue (its maker returned), so `u = u + i` records
+    // as a sunk `ustore` through a `uref` the adapter stages from the
+    // closure's upvalue array.
+    try expectNativeAdapters(
+        \\local function mk()
+        \\  local u = 0.25
+        \\  return function(n)
+        \\    local s = 0
+        \\    for i = 1, n do
+        \\      u = u + i
+        \\      if i % 3 == 0 then s = s + u else s = s - 1 end
+        \\    end
+        \\    return s
+        \\  end, function() return u end
+        \\end
+        \\local f, get = mk()
+        \\print(f(300), get())
+    , "1529975\t45150.25\n");
+}
+
+test "doc 56 Phase 4: an exit snapshot slot overrides its carried home in the adapter" {
+    // `c` and `s` are carried AND updated before the exit: the carried-home
+    // flush writes their iteration-entry values, then the snapshot's slots
+    // must overwrite them with the updated ones (int and float homes).
+    try expectNativeAdapters(
+        \\local s, c = 0, 0
+        \\for i = 1, 300 do
+        \\  c = c + 2
+        \\  s = s + 0.5
+        \\  if i % 3 == 0 then s = s + c else s = s - 1 end
+        \\end
+        \\print(s, c)
+    , "30250\t600\n");
+}
+
+test "doc 56 Phase 4: an adapter restores many carried values at once" {
+    // Twelve carried ints plus the table and a float accumulator: more
+    // homes than registers, so the adapter reads spilled homes as well as
+    // GP and XMM ones.
+    const Places = struct {
+        fn check(vm: *Vm) !void {
+            var seen: [@typeInfo(nativegen.ExitLoc.Tag).@"enum".field_names.len]bool = @splat(false);
+            for (vm.trace.registry.cache.items) |t| switch (t.native) {
+                .compiled => |*ct| {
+                    if (ct.exit_adapters.items.len == 0) continue;
+                    for (ct.exit_locs.carried) |c| seen[@intFromEnum(ct.exit_locs.find(c.ref).?.tag)] = true;
+                },
+                .unattempted, .unsupported => {},
+            };
+            try testing.expect(seen[@intFromEnum(nativegen.ExitLoc.Tag.reg)]);
+            try testing.expect(seen[@intFromEnum(nativegen.ExitLoc.Tag.spill)]);
+            try testing.expect(seen[@intFromEnum(nativegen.ExitLoc.Tag.xmm)]);
+        }
+    };
+    try expectNativeAdaptersAnd(
+        \\local a, b, c, d, e, f, g, h, k, l, m, n2 = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
+        \\local t = {0.5}
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  a = a + i; b = b + a; c = c + b; d = d + c; e = e + d; f = f + e
+        \\  g = g + f; h = h + g; k = k + h; l = l + k; m = m + l; n2 = n2 + m
+        \\  t[1] = t[1] + a + b + c + d + e + f + g + h + k + l + m + n2
+        \\  if i % 3 == 0 then s = s + t[1] + a + n2 else s = s - 1 end
+        \\end
+        \\print(s, t[1], a, n2)
+    , "12661121433520190000000\t352480413526858700000\t45151\t-3210781427597235360\n", Places.check);
+}
+
+test "doc 56 Phase 4: an open-upvalue continuation runs behind a native adapter" {
+    try expectNativeAdapters(
+        \\local floor = math.floor
+        \\local function work(n)
+        \\  local count = 0
+        \\  for i = 1, n do
+        \\    if i % 3 == 0 then count = count + floor(i * 0.5) else count = count - 1 end
+        \\  end
+        \\  return count
+        \\end
+        \\print(work(600))
+    , "29700\n");
+}
+
+test "doc 56 Phase 4: fft bit-reverse's exits run through native adapters" {
+    try expectNativeAdapters(bitreverse_src, "0.5\t1024\n");
 }

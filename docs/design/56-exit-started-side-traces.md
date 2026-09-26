@@ -1,8 +1,8 @@
 # 56 — Exit-started side traces (LuaJIT's side-trace mechanism) — Design
 
-Status: Phase 1 done (exit snapshots, exit location map, finalize tests); Phase 2 done (attachability and resume pc); Phase 3 done (tier-1a materialize and exit-side recording); Phase 4 next; design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
+Status: Phase 1 done (exit snapshots, exit location map, finalize tests); Phase 2 done (attachability and resume pc); Phase 3 done (tier-1a materialize and exit-side recording); Phase 4 done (native exit adapters, behind a switch that is off); Phase 5 next; design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
 Owner: Bart
-Last updated: 2026-09-25
+Last updated: 2026-09-26
 
 ## Implementation status
 
@@ -52,7 +52,7 @@ consumes yet, so every program's output and trace set stays identical.
   that attaches side traces flips it to the §9 target.
 
 ### Outstanding
-- [ ] **Phase 0 — probes.** jit-debug probes for every new event:
+- [x] **Phase 0 — probes.** jit-debug probes for every new event:
   - snapshot capture;
   - attachability verdict;
   - exit-side want, record, commit and arm;
@@ -63,8 +63,10 @@ consumes yet, so every program's output and trace set stays identical.
   Each probe lands in the phase that creates its event (none of these
   events exist yet). This bullet closes when the last one is in.
   Phase 3 added the `exit-side:` probes (want, record, arm refusal,
-  attach, give-up) and `exit-side hop:` (materialize). Adapter build
-  is left (Phase 4).
+  attach, give-up) and `exit-side hop:` (materialize). Phase 4 added
+  `exit-adapter:` (built with its size, or refused with the reason and
+  the ref). Snapshot capture is `exit-snap:` (Phase 1), the verdict is
+  `exit-loc:` (Phase 2), so every event now has its probe.
 - [x] **Phase 1 — exit snapshots and exit locations (inert).** Done
   2026-09-25 (0889c7b, 1f9b066, and the finalize tests).
   - [x] Boundary ordinals and sparse snapshots per bytecode boundary
@@ -225,18 +227,84 @@ consumes yet, so every program's output and trace set stays identical.
       some exit-side recordings. An attached exit whose child is
       retired never records again. Each hop scans the cache. All four
       are in TODO.md.
-- [ ] **Phase 4 — native exit adapters.**
-  - Per-exit adapters built from the Phase-1 exit location map when an
-    exit first becomes hot: materialize, then jump through a data cell
-    to either the child's entry or the resume-at-`P` return.
-  - `ArmKind.exit_side` and its `arm` validation.
-  - A child's prologue failure resumes tier-0 at `P` (its anchor), as
-    for any continuation.
-  - The liveness extension for attachable exits only (§4.6 "Register
-    allocation"), so their exit location map rows become "held", with
-    its register cost measured on the board (Q3). Bart moved it here
-    from Phase 2 (2026-09-25): it changes machine code, and the adapters
-    are its only reader.
+- [x] **Phase 4 — native exit adapters** (plan §4.6.1; built
+  2026-09-26, behind `Config.exit_side_native` /
+  `--jit-exit-side-native`, off by default).
+  - [x] Per-exit adapters built from the exit location map when an
+    exit becomes wanted (`src/nativegen_adapter.zig`): materialize,
+    then jump through a heap target cell. In Phase 4 the target is
+    always the shared trampoline exit; the runtime then chains or
+    records at `P` exactly as Phase 3 does for tier-1a.
+  - [x] The exit-side stub and `exit_side_cells`, the
+    `NativeResult.exit_side_ok` byte (dispatcher direct entry only), the
+    `.exit_side` ledger row, `ExitRoute.native_direct`, publish at
+    `none → wanted` (and at native compile for exits already wanted or
+    attached), unpublish on every `gave_up`.
+  - [x] The liveness extension for attachable exits only
+    (`extendExitSideLiveness`), with the switch on.
+  - [ ] Moved to Phase 5: the adapter's direct jump into the child,
+    `ArmKind.exit_side` and its `arm` validation, and the child's
+    prologue-failure resume at `P` (they need the ledger grammar).
+  - [ ] Q3's register cost on the board is measured when the switch
+    turns on (end of Phase 6); with it off nothing changes.
+  - **As built:**
+    - `ExitLoc.live_from`. A slot home is loaded in the prologue, so it
+      holds the slot's iteration-entry value from instruction 0 — also
+      at an exit ABOVE the carried `slot_load` in IR order (a carried
+      load is recorded lazily, at its first read). The old rule
+      `ref < exit` refused the very first program tried (`not_held` on
+      a carried accumulator loaded after the exit's guard). Transient
+      values keep `live_from = ref + 1`.
+    - A refusal carries the IR ref that caused it (`adapter.Refused`),
+      and the `exit-adapter:` probe prints it.
+    - A constant array index is encoded inline by `emitAStore`, so only
+      a constant stored VALUE (or a `uref` base) is staged above the
+      frame.
+    - The recorder's jitdbg probes (`guard-dedup`, `ABORT`, `bad_type`)
+      bypassed the per-VM `debug_log` gate, so a `-Djit-debug` test run
+      printed them for every VM. The build runner shows a passing test
+      step's leftover stderr as `run test w` plus a `failed command:`
+      line, with exit 0, and whether any stderr is left over depends on
+      buffering. That was the "exit 0 with a stray line" shape of the
+      TODO's recurring jit-debug flake. The probes now go through
+      `RecordingSession.dbg`, gated by the flag `RecordingSession.start`
+      stamps on every production arming path; the gate prints nothing.
+  - **Tests.** `interp_exit_side_test.zig` (all ten legs with the switch
+    on; the native leg must build an adapter, take native hops, bind and
+    refuse nothing): the sunk array store; every array lane (`i64`,
+    `u8`, `boolean`, `value`); hash stores including a constant value;
+    a closed-upvalue `ustore`; snapshot slots overriding carried homes;
+    many carried values (the test asserts reg, spill and XMM homes); an
+    open-upvalue continuation; fft bit-reverse. `nativegen_adapter_test.zig`:
+    a rebuild from the stored map matches the published adapter; each
+    refusal reason (`no_map`, `no_stub`, `not_held` with its ref,
+    `kind`, `spill`); an allocation-failure sweep; switch off leaves no
+    cells, no adapters, and the page layout of a plain compile. The
+    exitloc unit test pins `live_from`. Mutation-checked: dropping the
+    sunk stores fails 8 tests; dropping the snapshot slots hangs the
+    parity legs (the loop state is wrong).
+  - **Not exercisable yet:** a sunk `gstore` ahead of an attachable exit.
+    Every grid shape tried aborts first (`store_after_load` on
+    `set_index2` after any heap load), so the adapter's `emitGStore` call
+    is reached by no program today. It reuses the body's emitter
+    unchanged. `emit` and `out_of_memory` refusals have no map-shape
+    trigger; OOM is covered by the sweep.
+  - **Measured (2026-09-26).**
+    - Switch off: every trace of all 28 bench programs has the same
+      size line in `--dump-native` as HEAD (A/B via `just shadow`, nm
+      checked).
+    - Switch on: all 28 print the same output, with zero refusals.
+      Adapters fire on nsieve (1.14M hops), nsieve-bit-fp (979k), fft
+      (509k), nsieve-bit, sieve_int, grid_matmul.
+    - Switch on is slower, as §4.6.1 predicted, because every hop
+      returns to the runtime: best of 5, fft 208 → 344 ms, nsieve 13 →
+      134 ms, nsieve-bit-fp 273 → 599 ms. perf on nsieve: 33%
+      `enterSelectedTrace`, plus per-hop hashing, `resumeOf`, `memcpy`,
+      `replayLedgerFrom` and `driveChain`. That is the round-trip Phase 5
+      removes, so it is not tuned here (Z-7).
+    - Tier-1a-only board unchanged.
+  - Review: Antigravity found nothing serious; one nit fixed, one
+    finding rejected after checking (`docs/reviews/doc56/antigravity-phase4.md`).
 - [ ] **Phase 5 — ledger grammar and accounting.** `LedgerKind.exit_side`
   rows, the replay grammar, and completion attribution.
 - [ ] **Phase 6 — regions and silent promotion.**

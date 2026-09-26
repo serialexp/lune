@@ -206,6 +206,15 @@ pub const NativeResult = extern struct {
     /// bound that makes a 65,536-hop silent burn impossible. Zero-init
     /// per episode; scratch (not marshaled).
     sibling_hop_taken: u8,
+    /// Doc 56 Phase 4: 1 lets an exit whose `exit_side_cells` entry is
+    /// published take its exit adapter (resume-coherent at `P`). Set ONLY by
+    /// the dispatcher's direct entry (`runCapturingLedgerEntry` /
+    /// `runLinkedLoopDoneCapturingEntry`); every other native call leaves it
+    /// 0, so bursts, chains and silent drains keep the anchor-coherent exit
+    /// and no ledger replay can meet an `.exit_side` row. The stub also
+    /// requires an empty ledger and no silent transition. Appended at the
+    /// ABI tail (frozen-offset rule); scratch (not marshaled).
+    exit_side_ok: u8,
 };
 
 /// Host-staged bounds/state for a native call that may enter a promoted silent
@@ -260,6 +269,8 @@ comptime {
     // Doc 54 P2 amendment: the sibling-hop byte is appended after the
     // motion byte, same append-only rule.
     std.debug.assert(@offsetOf(NativeResult, "sibling_hop_taken") == @offsetOf(NativeResult, "frame_motion_taken") + @sizeOf(u8));
+    // Doc 56 Phase 4: the exit-side gate byte, same append-only rule.
+    std.debug.assert(@offsetOf(NativeResult, "exit_side_ok") == @offsetOf(NativeResult, "sibling_hop_taken") + @sizeOf(u8));
 }
 
 /// Doc 54 P2: one per-slot hit-counter record — page-owned storage
@@ -421,12 +432,17 @@ pub const ExitPlaceTag = enum(u8) { reg, xmm, spill, konst, none };
 ///
 /// The allocator never splits a live range, so a value has ONE place for
 /// its whole life; only the life itself varies. The place holds the value
-/// at an exit instruction `e` exactly when `ref < e <= live_until`
-/// (`holdsAt`). A slot home is pinned all body long (`live_until` =
-/// `LIVE_WHOLE_BODY`) unless an in-place (win 2) update overwrites it, and
-/// a constant is always recoverable.
+/// at an exit instruction `e` exactly when `live_from <= e <= live_until`
+/// (`holdsAt`). An ordinary value is held from the instruction after its
+/// definition (`live_from = ref + 1`). A slot home is loaded in the
+/// prologue, so it holds the slot's iteration-entry value from the very
+/// start of the body (`live_from = 0`) — even at exits above the
+/// `slot_load` in IR order — and all body long (`live_until` =
+/// `LIVE_WHOLE_BODY`) unless an in-place (win 2) update overwrites it. A
+/// constant is always recoverable.
 pub const ExitLoc = struct {
     ref: u16,
+    live_from: u16,
     live_until: u16,
     kind: Kind,
     tag: ExitPlaceTag,
@@ -437,6 +453,11 @@ pub const ExitLoc = struct {
     /// `reg`/`xmm`: the register's enum value; `spill`: byte displacement;
     /// `konst`: constant index; `none`: 0.
     payload: u32 = 0,
+    /// Doc 56 Phase 4: the proved kind of the IR value itself. `kind` is
+    /// what a slot flush boxes with (the SLOT's kind for a `slot_load`);
+    /// this is what the store emitters branch on (`kinds[ref]`), so an exit
+    /// adapter can rebuild the kinds slice the body was lowered with.
+    ir_kind: Kind = .none,
 
     pub const Tag = ExitPlaceTag;
     pub const NO_SLOT: u16 = std.math.maxInt(u16);
@@ -445,7 +466,7 @@ pub const ExitLoc = struct {
     pub fn holdsAt(self: ExitLoc, exit_instr: usize) bool {
         if (self.tag == .none) return false;
         if (self.tag == .konst) return true;
-        return self.ref < exit_instr and exit_instr <= self.live_until;
+        return self.live_from <= exit_instr and exit_instr <= self.live_until;
     }
 };
 
@@ -476,6 +497,11 @@ pub const CarriedHome = struct {
 pub const ExitLocMap = struct {
     values: []ExitLoc = &.{},
     carried: []CarriedHome = &.{},
+    /// Doc 56 Phase 4: the body's frame size in 8-byte spill words — the
+    /// allocator's `spill_count` plus the boxed-tag spill cells past it
+    /// (`boxedTagSpill`). Words from here up to `SPILL_MAX` are free at every
+    /// exit, so an exit adapter stages constants there.
+    frame_words: u32 = 0,
 
     pub fn deinit(self: *ExitLocMap, gpa: std.mem.Allocator) void {
         if (self.values.len != 0) gpa.free(self.values);
@@ -607,9 +633,20 @@ pub const CompiledTrace = struct {
     /// irinterp's `completed += 1 + (peeled and completed == 0)` at `.loop`.
     peeled: bool = false,
     /// Doc 56 §4.2 (Phase 1): where each value an exit may need lives in
-    /// this body (see `ExitLocMap`). Inert until the exit adapters land.
+    /// this body (see `ExitLocMap`). Read when an exit adapter is built.
     /// Owned; freed in `deinit` via `gpa`.
     exit_locs: ExitLocMap = .{},
+    /// Doc 56 Phase 4: one cell per IR instruction. The exit-side stub of an
+    /// attachable exit loads its cell and, when it is nonzero (and the entry
+    /// allows it), jumps to that address: the exit's adapter. Zero = the
+    /// ordinary exit. Plain heap memory (RW), so publishing or clearing an
+    /// adapter is a data write, like the link slots. Empty unless the page
+    /// was compiled with `CompileOpts.exit_side`. Owned; freed in `deinit`.
+    exit_side_cells: []usize = &.{},
+    /// Doc 56 Phase 4: the exit adapters built for this page, at most one
+    /// per exit. An adapter lives until the page dies (a give-up only clears
+    /// its cell). Owned; freed in `deinit`.
+    exit_adapters: std.ArrayListUnmanaged(ExitAdapter) = .empty,
 
     pub const EntryFn = fn ([*]u8, [*]u64, *NativeResult) callconv(.c) void;
     /// The shared frameless trampoline's C-ABI type: SoA lanes + result out-param,
@@ -622,7 +659,7 @@ pub const CompiledTrace = struct {
     /// lanes are passed as the SysV first two args (rdi=tags, rsi=payloads); the
     /// result pointer is the third (rdx), reserved out of the allocator pools.
     pub inline fn run(self: CompiledTrace, regs: RegWindow) trace_exec.ExecResult {
-        return self.runWithLinkedLoopDone(regs, false, null, .{});
+        return self.runWithLinkedLoopDone(regs, false, null, .{}, false);
     }
 
     /// Run in the chain-consumed loop-done mode. Numeric-for loop-done exits commit
@@ -630,7 +667,7 @@ pub const CompiledTrace = struct {
     /// so the native nested-loop chainer can jump to the `.link` continuation
     /// without tier-0 replay.
     pub inline fn runLinkedLoopDone(self: CompiledTrace, regs: RegWindow) trace_exec.ExecResult {
-        return self.runWithLinkedLoopDone(regs, true, null, .{});
+        return self.runWithLinkedLoopDone(regs, true, null, .{}, false);
     }
 
     /// 2.3c-2b (doc 17): like `run` (ordinary mode, `linked_loop_done = 0`) but ALSO
@@ -641,7 +678,15 @@ pub const CompiledTrace = struct {
     /// consumed immediately by the caller's replay — no native call / resize / nested
     /// replay may intervene between this capture and its consumption.
     pub inline fn runCapturingLedger(self: CompiledTrace, regs: RegWindow, ledger_out: []trace_exec.LedgerEntry, silent: SilentStaging) trace_exec.ExecResult {
-        return self.runWithLinkedLoopDone(regs, false, ledger_out, silent);
+        return self.runWithLinkedLoopDone(regs, false, ledger_out, silent, false);
+    }
+
+    /// Doc 56 Phase 4: `runCapturingLedger` for the dispatcher's DIRECT
+    /// entry only — the one caller that may let an exit take its published
+    /// exit adapter (`exit_side_ok`), because it consumes an `.exit_side`
+    /// result itself before any ledger replay.
+    pub inline fn runCapturingLedgerEntry(self: CompiledTrace, regs: RegWindow, ledger_out: []trace_exec.LedgerEntry, silent: SilentStaging, exit_side_ok: bool) trace_exec.ExecResult {
+        return self.runWithLinkedLoopDone(regs, false, ledger_out, silent, exit_side_ok);
     }
 
     /// 2.3c-2d (D1): the LINKED-mode counterpart of `runCapturingLedger`. Call A
@@ -654,7 +699,12 @@ pub const CompiledTrace = struct {
     /// borrow contract as `runCapturingLedger`: `ledger_out` holds `LEDGER_CAP` entries
     /// and is consumed immediately, with no intervening native call.
     pub inline fn runLinkedLoopDoneCapturing(self: CompiledTrace, regs: RegWindow, ledger_out: []trace_exec.LedgerEntry, silent: SilentStaging) trace_exec.ExecResult {
-        return self.runWithLinkedLoopDone(regs, true, ledger_out, silent);
+        return self.runWithLinkedLoopDone(regs, true, ledger_out, silent, false);
+    }
+
+    /// Doc 56 Phase 4: the linked-mode twin of `runCapturingLedgerEntry`.
+    pub inline fn runLinkedLoopDoneCapturingEntry(self: CompiledTrace, regs: RegWindow, ledger_out: []trace_exec.LedgerEntry, silent: SilentStaging, exit_side_ok: bool) trace_exec.ExecResult {
+        return self.runWithLinkedLoopDone(regs, true, ledger_out, silent, exit_side_ok);
     }
 
     /// Task #28 (doc 45 seam overhead): this wrapper and the four public
@@ -667,7 +717,7 @@ pub const CompiledTrace = struct {
     /// cycles per binary-trees run (~+9% wall). Both levels must stay inline:
     /// forcing only the inner fn would just move the call boundary to the
     /// ~1KB public wrappers.
-    inline fn runWithLinkedLoopDone(self: CompiledTrace, regs: RegWindow, linked_loop_done: bool, ledger_out: ?[]trace_exec.LedgerEntry, silent: SilentStaging) trace_exec.ExecResult {
+    inline fn runWithLinkedLoopDone(self: CompiledTrace, regs: RegWindow, linked_loop_done: bool, ledger_out: ?[]trace_exec.LedgerEntry, silent: SilentStaging, exit_side_ok: bool) trace_exec.ExecResult {
         var result = NativeResult{
             .completed = 0,
             .exit_instr = std.math.maxInt(u32),
@@ -708,6 +758,7 @@ pub const CompiledTrace = struct {
             .frame_motion_taken = 0,
             // Doc 54 P2 amendment: fresh sibling-hop allowance per episode.
             .sibling_hop_taken = 0,
+            .exit_side_ok = if (exit_side_ok) 1 else 0,
         };
         if (self.trampoline_entry) |tramp| {
             const f: *const TrampolineFn = @ptrFromInt(tramp);
@@ -786,6 +837,13 @@ pub const CompiledTrace = struct {
                     (term_kind == .precise_error));
                 if (term_kind == .precise_deopt or term_kind == .precise_error)
                     std.debug.assert(result.snapshot_id >= 1);
+                // Doc 56 Phase 4: the exit adapter stamps `.exit_side` then
+                // appends its own kind, and it is only ever reachable from a
+                // flagged direct entry with an empty ledger — so its row is
+                // the ONLY row.
+                std.debug.assert((result.exit_reason == @intFromEnum(trace_exec.ExitReason.exit_side)) ==
+                    (term_kind == .exit_side));
+                if (term_kind == .exit_side) std.debug.assert(exit_side_ok and n == 1 and result.silent_active == 0);
             }
         }
         // 2.3c-2b: decode the per-transition ledger for the caller's replay. Only
@@ -838,6 +896,40 @@ pub const CompiledTrace = struct {
         if (self.silent_sites.len > 0) self.gpa.free(self.silent_sites);
         if (self.metadata_cells.len > 0) self.gpa.free(self.metadata_cells);
         self.exit_locs.deinit(self.gpa);
+        if (self.exit_side_cells.len > 0) self.gpa.free(self.exit_side_cells);
+        for (self.exit_adapters.items) |*ad| ad.deinit(self.gpa);
+        self.exit_adapters.deinit(self.gpa);
+        self.* = undefined;
+    }
+
+    /// Doc 56 Phase 4: the adapter built for exit `exit_instr`, if any.
+    pub fn exitAdapter(self: *const CompiledTrace, exit_instr: u32) ?*const ExitAdapter {
+        for (self.exit_adapters.items) |*ad| {
+            if (ad.exit == exit_instr) return ad;
+        }
+        return null;
+    }
+
+    /// Doc 56 Phase 4: whether exit `exit_instr` currently takes its adapter
+    /// (its cell is published).
+    pub fn exitSidePublished(self: *const CompiledTrace, exit_instr: u32) bool {
+        return exit_instr < self.exit_side_cells.len and self.exit_side_cells[exit_instr] != 0;
+    }
+};
+
+/// Doc 56 Phase 4: one native exit adapter — a small arena page that makes
+/// the slab coherent at the exit's resume pc and then jumps through its own
+/// heap target cell (never inside the RX page). In Phase 4 the target is
+/// always the shared trampoline exit; Phase 5 retargets it to the child.
+pub const ExitAdapter = struct {
+    exit: u32,
+    page: ExecPage,
+    target: *usize,
+
+    /// Release the page slot and the target cell (`gpa` created the cell).
+    pub fn deinit(self: *ExitAdapter, gpa: std.mem.Allocator) void {
+        self.page.deinit();
+        gpa.destroy(self.target);
         self.* = undefined;
     }
 };

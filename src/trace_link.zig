@@ -202,7 +202,7 @@ pub fn maybeStartContinuation(self: *TraceState, proto: *const Proto, cur_pc: u3
     // Doc 31 D1 (review B3): final eligibility check at the actual start —
     // the request may have been gated between creation and activation.
     if (self.recordingBarred(key)) return;
-    self.rec.reset(self.gpa, key, proto.num_registers) catch return;
+    self.rec.start(self.gpa, key, proto.num_registers, self.config.debug_log) catch return;
     // Doc 43 P0a: seed the anchor's absolute slab base (same as armWithPolicy).
     // Missing this left `anchor_abs_base = 0`, making the open-upvalue aliasing
     // guard fire on ALL open upvalues regardless of frame depth.
@@ -272,6 +272,7 @@ pub fn noteExitSideCommit(self: *TraceState, parent: *Trace, exit_instr: u32, ch
         self.bindExitSide(parent, exit_instr, .commit);
     } else {
         parent.exit_side[exit_instr] = .gave_up;
+        unpublishExitAdapter(parent, exit_instr);
         self.exit_side_giveups +|= 1;
         self.dbg("exit-side: trace={d} exit={d} gave up (child t={d} is not a .link continuation)", .{ parent.id, exit_instr, child.id });
     }
@@ -296,7 +297,7 @@ pub fn maybeStartReplaySide(self: *TraceState, proto: *const Proto, cur_pc: u32)
     // Doc 31 D1 (review B3): final eligibility check at the actual start —
     // the request may have been gated between creation and activation.
     if (self.recordingBarred(key)) return;
-    self.rec.reset(self.gpa, key, proto.num_registers) catch return;
+    self.rec.start(self.gpa, key, proto.num_registers, self.config.debug_log) catch return;
     // Doc 43 P0a: seed the anchor's absolute slab base (same as armWithPolicy).
     self.rec.anchor_abs_base = self.pending_anchor_base;
     self.rec.kind = .side;
@@ -352,13 +353,15 @@ pub fn clearPendingExitAnchor(self: *TraceState) void {
 ///     routing branch exits there collapsed nsieve's fusion entirely —
 ///     bridge arms 25 940 → 0, +53% wall).
 ///
-/// **Doc 56 Phase 3: the exit-side route (tier-1a only).** `route ==
-/// .tier1a_direct` marks a firing from the dispatcher's direct tier-1a run,
-/// whose executor honours `TraceRecord.exit_side`. There, a hot attachable
-/// exit becomes wanted and owns every later firing until it binds a child or
-/// gives up (`routeExitSide`); the routes above never see it meanwhile. Every
-/// other caller (native, ledger replay, `driveChain` hops) passes `.legacy`
-/// and keeps today's routes until Phase 4.
+/// **Doc 56 Phases 3–4: the exit-side route.** `route == .tier1a_direct`
+/// marks a firing from the dispatcher's direct tier-1a run, whose executor
+/// honours `TraceRecord.exit_side`; `.native_direct` one from its direct
+/// native entry with `exit_side_native` on, where a published exit adapter
+/// does the same. There, a hot attachable exit becomes wanted and owns every
+/// later firing until it binds a child or gives up (`routeExitSide`); the
+/// routes above never see it meanwhile. Every other caller (native bursts
+/// and chains, ledger replay, `driveChain` hops) passes `.legacy` and keeps
+/// today's routes.
 pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: usize, proto: *const Proto, route: ExitRoute) void {
     if (exit_instr >= t.exit_counts.len) return; // hand-built / fail-soft commit
     const c = &t.exit_counts[exit_instr];
@@ -369,7 +372,7 @@ pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: u
     // eviction restarts the exit cold (codex review of 84c86bc).
     if (c.* < Trace.EXIT_COUNT_DONE - 1) c.* += 1;
     if (c.* < self.config.hotexit) return;
-    if (route == .tier1a_direct and routeExitSide(self, t, exit_instr, c.*)) return;
+    if (route != .legacy and routeExitSide(self, t, exit_instr, c.*)) return;
     // Everything below is arming-only, so it runs behind the cheapest
     // possible gates: `isSourceBranchGuardExit` (provenance decode) and
     // `countTracesAt` (an O(cache) scan) must NOT run per receipt on a
@@ -443,12 +446,59 @@ pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: u
 
 /// Who reports a taken exit to `noteTakenExit` (doc 56 Phase 3).
 pub const ExitRoute = enum {
-    /// Native runs, ledger replay, `driveChain` hops: today's routes only.
+    /// Native bursts and chains, ledger replay, `driveChain` hops: today's
+    /// routes only.
     legacy,
     /// The dispatcher's direct tier-1a run, which passes the trace's
     /// exit-side state to the executor.
     tier1a_direct,
+    /// Doc 56 Phase 4: the dispatcher's direct native entry with
+    /// `exit_side_native` on — the one native call that lets an exit take
+    /// its published adapter.
+    native_direct,
 };
+
+/// Doc 56 Phase 4: whether native pages carry the exit-side stub.
+pub fn exitSideNative(self: *const TraceState) bool {
+    return self.config.exit_side and self.config.exit_side_native;
+}
+
+/// Doc 56 Phase 4: publish exit `exit_instr`'s adapter on `t`'s native page,
+/// building it the first time. False when there is no native page, the
+/// feature is off, or the build was refused (counted per reason).
+fn publishExitAdapter(self: *TraceState, t: *Trace, exit_instr: u32) bool {
+    if (!self.exitSideNative()) return false;
+    const ct = switch (t.native) {
+        .compiled => |*c| c,
+        .unattempted, .unsupported => return false,
+    };
+    const built_before = ct.exit_adapters.items.len;
+    const refused = nativegen.adapter.publish(&self.registry.mcode_arena, &t.code, t.id, ct, exit_instr) catch
+        nativegen.adapter.Refused{ .why = .out_of_memory };
+    if (refused) |r| {
+        self.exit_adapter_refusals[@intFromEnum(r.why)] +|= 1;
+        if (r.ref) |ref| {
+            self.dbg("exit-adapter: trace={d} exit={d} refused: {s} (%{d})", .{ t.id, exit_instr, @tagName(r.why), ref });
+        } else {
+            self.dbg("exit-adapter: trace={d} exit={d} refused: {s}", .{ t.id, exit_instr, @tagName(r.why) });
+        }
+        return false;
+    }
+    if (ct.exit_adapters.items.len != built_before) {
+        self.exit_adapter_builds +|= 1;
+        self.dbg("exit-adapter: trace={d} exit={d} built ({d} bytes)", .{ t.id, exit_instr, ct.exitAdapter(exit_instr).?.page.code.len });
+    }
+    return true;
+}
+
+/// Doc 56 Phase 4: send exit `exit_instr` of `t`'s native page back to the
+/// ordinary exit (its adapter stays built until the page dies).
+fn unpublishExitAdapter(t: *Trace, exit_instr: u32) void {
+    switch (t.native) {
+        .compiled => |*c| nativegen.adapter.unpublish(c, exit_instr),
+        .unattempted, .unsupported => {},
+    }
+}
 
 /// Doc 56 Phase 3: the exit-side state machine for one hot (`count >=
 /// hotexit`) taken exit on a direct tier-1a run. Returns true when the
@@ -464,6 +514,13 @@ pub const ExitRoute = enum {
 ///   * `.gave_up` returns to today's routes for good.
 /// `.attached` exits are DONE-latched and never reach here.
 /// Deterministic: a pure function of the receipt stream.
+///
+/// Doc 56 Phase 4: the state is the trace's, shared by both tiers, and a
+/// native page mirrors it in its exit-side cells: `.none → .wanted` first
+/// publishes the exit's adapter (a refused build gives up at once, so a
+/// wanted exit's native firings always materialize), `.wanted → .gave_up`
+/// unpublishes it. A page compiled later publishes its wanted and attached
+/// exits in `nativeFor`.
 fn routeExitSide(self: *TraceState, t: *Trace, exit_instr: u32, count: u8) bool {
     if (!self.config.exit_side or exit_instr >= t.exit_side.len) return false;
     const s = &t.exit_side[exit_instr];
@@ -473,6 +530,7 @@ fn routeExitSide(self: *TraceState, t: *Trace, exit_instr: u32, count: u8) bool 
         .wanted => {
             if (count >= self.config.hotexit +| self.config.tryside) {
                 s.* = .gave_up;
+                unpublishExitAdapter(t, exit_instr);
                 self.exit_side_giveups +|= 1;
                 self.dbg("exit-side: trace={d} exit={d} gave up after {d} firings", .{ t.id, exit_instr, count });
             }
@@ -481,6 +539,12 @@ fn routeExitSide(self: *TraceState, t: *Trace, exit_instr: u32, count: u8) bool 
         .none => {
             if (t.side_children >= self.config.maxside) return false;
             if (!t.code.exitAttachable(exit_instr)) return false;
+            if (self.exitSideNative() and t.native == .compiled and !publishExitAdapter(self, t, exit_instr)) {
+                s.* = .gave_up;
+                self.exit_side_giveups +|= 1;
+                self.dbg("exit-side: trace={d} exit={d} gave up (no native adapter)", .{ t.id, exit_instr });
+                return false;
+            }
             s.* = .wanted;
             self.exit_side_wants +|= 1;
             self.dbg("exit-side: trace={d} exit={d} wanted (resume pc={d})", .{ t.id, exit_instr, t.code.exitResumePc(exit_instr).? });
@@ -1043,6 +1107,9 @@ pub fn rowSilentKind(kind: trace_exec.LedgerKind) ?nativegen.SilentSiteKind {
         // Doc 45 D6: precise exits carry no patch window — a precise trace
         // is never a chain source, so there is no exit branch to patch.
         .precise_deopt, .precise_error => null,
+        // Doc 56 Phase 4: the exit adapter returns to the runtime (no
+        // slot, no silent site) until Phases 5–6.
+        .exit_side => null,
     };
 }
 
@@ -2490,8 +2557,18 @@ pub fn nativeFor(self: *TraceState, t: *Trace) ?*const nativegen.CompiledTrace {
         .compiled => return &t.native.compiled,
         .unsupported => return null,
         .unattempted => {
-            if (nativegen.compileInto(self.gpa, &self.registry.mcode_arena, &t.code, t.id, self.registry.native_seed_ctx, self.exec_heap)) |ct| {
+            const opts: nativegen.CompileOpts = .{ .exit_side = self.exitSideNative() };
+            if (nativegen.compileIntoWith(self.gpa, &self.registry.mcode_arena, &t.code, t.id, self.registry.native_seed_ctx, self.exec_heap, opts)) |ct| {
                 t.native = .{ .compiled = ct };
+                // Doc 56 Phase 4: exits that became wanted or attached before
+                // this page existed (on tier-1a) get their adapters now. A
+                // refusal leaves the exit's state alone: tier-1a still serves
+                // it, and the page keeps the ordinary exit there.
+                if (opts.exit_side) {
+                    for (t.exit_side, 0..) |st, ei| {
+                        if (st.materializes()) _ = publishExitAdapter(self, t, @intCast(ei));
+                    }
+                }
                 // Doc 56 Phase 1 probe: the exit location map, and per
                 // exit how many restored slots the body still holds.
                 if (comptime jitdbg.enabled) if (self.config.debug_log) {
