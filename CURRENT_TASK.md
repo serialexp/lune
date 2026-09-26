@@ -370,9 +370,8 @@ the ones that bite):
     ungated jitdbg probes. Now `RecordingSession.dbg` + `start(…,
     debug_log)`; the jit-debug gate prints nothing at all. TODO.md
     section replaced with the diagnosis plus a watch item. A background
-    loop of 30 direct runs of the PRE-fix test binary (random seeds,
-    logs in `/tmp/flake/`) was started to look for a real non-zero exit;
-    it was still running at hand-off (≈18/30 done, no failure).
+    loop of 30 direct runs of the PRE-fix test binary (random seeds)
+    looked for a real non-zero exit: all 30 exited 0. Logs deleted.
   - `just shadow` copied the 40 GB `.zig-cache` before deleting it and
     filled /tmp; it now uses `rsync` with excludes (215 MB).
   - Tests: see doc 56 Phase 4 "Tests". Mutation-checked (no stores → 8
@@ -387,12 +386,24 @@ the ones that bite):
   - Rule slip to report to Bart: one test-file edit was made with
     `sed -i` instead of the Edit tool (Rule #6). The change itself was
     correct and was left in place (Rule #19).
-- **Next: Phase 5** — the adapter jumps straight into the bound child
-  (retarget the adapter's target cell), `ArmKind.exit_side` and its
-  `arm` validation, the ledger grammar for `.exit_side` rows in chain
-  replay (drop the Phase 4 panics), the child's prologue-failure resume
-  at `P`, and widening who may take the path beyond the direct entry.
-  Then Phase 6 (silent promotion), then flip the switch and measure.
+- **Phase 5 IN PROGRESS (2026-09-26): plan written and reviewed.**
+  Doc 56 §4.8.1. Antigravity said CHANGES REQUESTED (2 blockers, 3
+  majors, 2 minors, 1 nit). All 8 were checked in source, accepted and
+  folded in (`docs/reviews/doc56/antigravity-phase5-plan.md`). The
+  first review call timed out after 900 s; the second worked because
+  it was given exact source ranges.
+  - Key decisions: the exit-side arm gets its own physical slot cells
+    (`n + NATIVE_TRANSITION_SLOTS + ei`), so it can live next to a
+    `sibling_handoff` on the same exit. The adapter tail jumps through
+    that cell and resets `exit_reason` before entering a child. The
+    `.exit_side` replay row covers three cases: not last, last+yielded
+    (resume `P`) and last+normal (a new directive, which ends in
+    `ChainResult.exit_side` and the routing half of `consumeExitSide`).
+    `region_dest` is `.deferred` until Phase 6. A child prologue
+    failure disarms the arm; it re-arms only after the next chain
+    links.
+  - Implementation order: the checklist under doc 56 "Phase 5".
+  - Then Phase 6 (silent promotion), then flip the switch and measure.
 
 ## Status 2026-09-24 (latest+27) — doc 55 §2 + §2d LANDED: fft 14.6× → 12.6× LJ, sparse −31%; silent switch is now data (no runtime code patching)
 

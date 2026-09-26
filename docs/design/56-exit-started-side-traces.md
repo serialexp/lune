@@ -1,6 +1,6 @@
 # 56 — Exit-started side traces (LuaJIT's side-trace mechanism) — Design
 
-Status: Phase 1 done (exit snapshots, exit location map, finalize tests); Phase 2 done (attachability and resume pc); Phase 3 done (tier-1a materialize and exit-side recording); Phase 4 done (native exit adapters, behind a switch that is off); Phase 5 next; design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
+Status: Phase 1 done (exit snapshots, exit location map, finalize tests); Phase 2 done (attachability and resume pc); Phase 3 done (tier-1a materialize and exit-side recording); Phase 4 done (native exit adapters, behind a switch that is off); Phase 5 planned and reviewed (§4.8.1), in progress; design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
 Owner: Bart
 Last updated: 2026-09-26
 
@@ -305,8 +305,17 @@ consumes yet, so every program's output and trace set stays identical.
     - Tier-1a-only board unchanged.
   - Review: Antigravity found nothing serious; one nit fixed, one
     finding rejected after checking (`docs/reviews/doc56/antigravity-phase4.md`).
-- [ ] **Phase 5 — ledger grammar and accounting.** `LedgerKind.exit_side`
-  rows, the replay grammar, and completion attribution.
+- [ ] **Phase 5 — direct jump, ledger grammar and accounting.** Plan in
+  §4.8.1 (reviewed: Antigravity CHANGES REQUESTED, all 8 findings
+  folded in).
+  - [ ] `ArmKind.exit_side`, its own physical cells, registry tests.
+  - [ ] Replay grammar for the `.exit_side` row and `.via_exit_side`;
+    hand-built ledger tests.
+  - [ ] Adapter tail: jump into the child, `exit_reason` reset.
+  - [ ] Dispatcher routing and the `consumeExitSide` split.
+  - [ ] Arming and disarming; drop the stub's `ledger_len == 0`;
+    end-to-end tests.
+  - [ ] Measure, docs, code review.
 - [ ] **Phase 6 — regions and silent promotion.**
   - `exit_side` edges and the side trace's `.link` back are
     intra-iteration edges of the parent's loop region.
@@ -1119,6 +1128,238 @@ So:
   jump is a silent site, with its data-cell check and its epilogue.
   Once the region qualifies, the cycle promotes and runs with no ledger
   appends, bounded by `silent_budget`.
+
+#### 4.8.1 Phase 5 plan (2026-09-26)
+
+Phase 5 makes the adapter jump straight into the child (LuaJIT's
+`lj_asm_patchexit`: the exit branch goes to the side trace, not the
+VM), and teaches the ledger replay the new row. Silent cycles stay in
+Phase 6. `exit_side_native` stays off by default until Phase 6 is
+measured; tests turn it on.
+
+**Where the arm lives (Q1, Q2).** An exit already has one cell,
+`c.slots[ei]`, used by the ordinary deopt tail (for example a
+`sibling_handoff` arm). The exit-side arm must not share it: the two
+arms send different register states (anchor-coherent vs coherent at
+`P`), and they can both be valid at once. So the exit-side arm gets
+its own physical cell, the same way `ret_cont` and `call_head`
+already do:
+
+- pages compiled with the stub get `n` more slots after the transition
+  slots: `c.slots.len = n + NATIVE_TRANSITION_SLOTS + n`, and the
+  exit-side cell of exit `ei` is `exit_side_base + ei` with
+  `exit_side_base = n + NATIVE_TRANSITION_SLOTS`. Pages without the
+  stub keep today's length, so the switch-off layout does not change;
+- the adapter's `jmp` goes through `&c.slots[exit_side_base + ei]`.
+  The Phase 4 heap `target` cell goes away (the slot array is
+  allocated once and freed with the page, so the address is stable);
+- a new `ArmKind.exit_side` whose logical `slot_index` is `ei` and
+  whose `physical_slot` is `exit_side_base + ei`: `publishValidatedLink`
+  gets an explicit `.exit_side` case in its physical-slot switch (without
+  it the kind falls to `else` and writes `c.slots[ei]`, the ordinary
+  deopt cell; review finding 2). `prepareSlotMutation`,
+  `commitSlotMutation`, `resetLinksTouching`, `disarmAllLinks` and
+  `disarmLinkAt` then work unchanged, since they already key on the
+  physical slot and the new index is `< slots.len`;
+- the target is the child's `ordinary_entry` (the child enters at its
+  own anchor `P` with the slab coherent there);
+- every other `armed_links` lookup that matches on `(parent,
+  slot_index)` gets audited to also match the kind, so a
+  `sibling_handoff` and an `exit_side` arm on the same exit never
+  answer for each other. The parallel per-slot arrays
+  (`slot_rowless_ok`, `link_hit_counters`) are sized to `slots.len` on
+  stub pages, so every per-slot invariant covers the new cells (review
+  finding 8).
+
+**The adapter tail (A1).** The row's `ledger_reason` is read from
+`NativeResult.exit_reason`, so the adapter must still write
+`.exit_side` before its append. But when it then jumps into a child,
+the child's later rows would read `.exit_side` too. So:
+
+```
+mov [rdx+exit_reason], .exit_side
+<ledger append: kind exit_side>
+mov [rdx+final_trace_id], parent id
+mov rax, &c.slots[exit_side_base+ei] ; mov rax, [rax]
+emitForcedYieldCheck(shared_exit)   ; full ledger → row .yielded, rax = shared_exit
+mov rcx, shared_exit ; cmp rax, rcx ; je .out
+mov [rdx+exit_reason], .normal      ; the child runs under the wrapper's value
+.out: jmp rax
+```
+
+The yield and unarmed paths return with `exit_reason = .exit_side`.
+The wrapper check in `nativegen_artifact.zig` (the `exit_side` asserts
+added in Phase 4) drops `n == 1`: the terminal row is `.exit_side` if
+and only if `exit_reason` is, and `exit_side_ok` and
+`silent_active == 0` still hold.
+
+**Who may take the path (widening, Q9).** The stub drops its
+`ledger_len == 0` test. It keeps `exit_side_ok` (set only by the
+dispatcher's direct entry) and `silent_active == 0`. The flag lives in
+the `NativeResult` of the call, so every trace that native call chains
+into may use its adapters: the whole direct-entry episode, including
+the steady cycle parent → child → parent (the child's `.link` is armed
+to the parent's `linked_entry` by the existing `link_terminal`
+machinery). Runs started elsewhere (bursts, chains, silent drains)
+keep `exit_side_ok = 0` and so the anchor-coherent exit. Opening
+bursts too is a single flag once the steering below is
+origin-agnostic; it is measured at the end of Phase 5 and done there
+or in Phase 6, by evidence (see "Measure").
+
+**Replay: the `.exit_side` row.** It replaces both Phase 4 panics in
+`replayLedgerFrom`.
+
+- Static contract: `e.reason == .exit_side`, `e.exit` is an
+  instruction of the owner, `owner.code.exitAttachable(e.exit)`, the
+  owner's `exit_side` state is `.wanted` or `.attached`. A
+  `.yielded` outcome only as the last row of a full ledger (the
+  generic rule).
+- Every `.exit_side` row bumps `exit_side_hops` and
+  `exit_side_native_hops`, as `consumeExitSide` does for the direct
+  path (review finding 6).
+- `region_work = local + 1` (the §4.8 table) and
+  `region_dest = .deferred` in Phase 5 (Q4; the `region_dest`
+  expression gains `or e.kind == .exit_side`, since today it gives
+  every non-last non-handoff row `.known_trace`; review finding 3): the child is not yet a
+  region member (exit-side edges join the structural graph in Phase
+  6), and a `.known_trace` successor outside the region would let
+  `applyDestination` close the activation, the same cross-credit
+  problem the `sibling_handoff` comment describes.
+- **Not last:** the successor must be the child an armed
+  `.exit_side` link names: a new `hasArmedExitSide(owner, exit, succ)`
+  (by physical slot, like `hasArmedSiblingHandoff`), plus the shape
+  check (`.link`-tailed, anchored at `(proto, P)`). Then
+  `accountLedgerRow(owner, local + 1, e.exit, region_consumed,
+  .entered)` (the same selection charge as `consumeExitSide`'s
+  `completed + 1`), `linked_completed += local` (the `+1` for the
+  interrupted iteration comes from the child's closing `.link`, whose
+  `linkClosesIteration` credit already exists; Q3), a new
+  `exit_side_fused` counter, `cursor.prev_cum = e.cum`, and
+  `applyEdgeCursorTransition(.exit_side, …)`, which sets
+  `resume_pc = P` and `next_entry = .via_exit_side{ parent, exit }`,
+  leaving `cont`/`link_pc` alone. That needs a new
+  `EntryMaterialization.via_exit_side: ExitSideEntry { parent, exit }`
+  and an `edge_exit` argument on `applyEdgeCursorTransition` (all
+  callers updated; review finding 4).
+- **Last and `.yielded`:** the ledger was full, so the adapter
+  materialized and returned. Same charge and `linked_completed` as
+  above, then `return_result{ completed = linked_completed, resume_pc
+  = P }` (Q11). `run_continuation` was the other option; it would
+  enter the child through the burst driver, whose runs have
+  `exit_side_ok = 0`. Resuming tier-0 at `P` costs one partial
+  iteration per 16 cycles and never enters a trace at a pc it does
+  not own.
+- **Last and `.normal`:** the target was `shared_exit` (the exit is
+  wanted, or attached but not armed). The replay does the region
+  receipt (generic), `accountLedgerRow(owner, local + 1, …)` and
+  `noteTakenExit`, and returns a new directive
+  `exit_side{ owner, exit }` with `resume_pc = P` (Q7). The drivers
+  turn it into a new field `ChainResult.exit_side: ?ExitSideTerminal`
+  (today the dispatcher reads only `resume_pc` after
+  `driveDispatcherLedger`; review finding 5), and the dispatcher, before
+  its generic resume, runs the
+  routing half of `consumeExitSide` (chain into the continuation at
+  `P`, bind a wanted exit, arm, or ask for a recording). So
+  `consumeExitSide` splits into a receipt half and a routing half; the
+  direct path calls both, the ledger path only the routing half, so
+  nothing is charged twice.
+- **The child's own terminal rows** under `.via_exit_side` join the
+  `entered_via_bridge or entered_via_handoff` groups of the `.deopt`,
+  `.prologue_fail` and seed-decline arms: the child resumes at its own
+  anchor, which is `P` and equals `resume_pc`. `completed =
+  linked_completed + local`.
+- **M1 ramps (Q8).** An M1 ramp is a `.link` trace at the loop anchor,
+  so it can own an attachable exit. The M1 row switch gets an explicit
+  `.exit_side` case that panics unless `row_local == 0`, then the
+  generic arm above applies (review finding 7). A hand-built ledger
+  test pins it.
+
+**Dispatcher routing.** The dispatcher's `.exit_side` arm
+(`interp.zig`, before `driveDispatcherLedger`) is gated on
+`!ran_native or ledger_len <= 1`, the same gate the seed-decline
+handlers use. A longer ledger ending in `.exit_side` (a yield at the
+adapter, or an unarmed exit reached after chained rows) flows to
+`driveDispatcherLedger` so its prefix is replayed (review finding 1).
+Every consumer between the two is checked for `exit_reason ==
+.exit_side` with `ledger_len > 1`.
+
+**Every other ledger consumer.** `noteDispatcherLedgerTerminal`
+(sibling evidence must ignore a terminal `.exit_side` row),
+`captureNativeCallProvenance` / `settleNativeCallProvenance` (no
+structural edge for it in Phase 5), `considerSilentPromotion`
+(`silentKindForArm(.exit_side) = null` until Phase 6),
+`promotedEdgeFromLink`, `driveSilentBurst` (panics on the kind, since
+it can't be promoted yet), and the ArmKind switch in `trace_link.zig`.
+Each gets an explicit case, not an `else`.
+
+**Arming (Q5, Q6).** `armExitSide(parent, ei, P, proto, safe_to_arm)`
+runs in the routing half after a chain into the continuation at `P`
+ran to its `.link` (`chain.linked`, which also covers a fused
+continuation run: `driveChain` sets it on `sresult_fused` too). It
+arms only when:
+
+- `safe_to_arm`, the parent's page is compiled with the stub and has a
+  published adapter at `ei`, and the exit is `.attached` (after the
+  bind on this same call, or earlier);
+- the target is `resolveLoopDoneCont(proto, P, null).arm`: the same
+  canonical pick every other continuation arm uses (sharing by resume
+  pc, §4.5), native, with an `ordinary_entry`, not precise, and
+  `stubEnterable(child, .ordinary, proto)`.
+
+An identical re-arm short-circuits in `publishValidatedLink`. Arming
+at the child's commit was the other option; the first firing after the
+commit takes the runtime path anyway and arms there, so one path is
+enough. Static type proof between the parent's exit snapshot and the
+child's entry guards (the "fingerprint" idea) is not needed: the
+child's own prologue checks the types and fails before it commits.
+
+**Disarming (Q10).** A child prologue failure entered
+`.via_exit_side` sets `pending_exit_side_disarm = (parent, exit)`,
+applied after the walk (the `pending_bridge_arm` pattern; the
+registry cannot change mid-walk). The exit stays attached; it re-arms
+only after a chain into the child links again. So a child whose types
+never match costs one failure, not one per firing. Retirement of
+either trace clears the arm through the existing
+`resetLinksTouching`, now that the cell is a real slot.
+
+**Tests.**
+
+- Hand-built ledgers in `trace_replay_test.zig`: parent
+  `exit_side` → child `link_terminal` → parent (fused and last);
+  `exit_side` last and `.yielded`; `exit_side` last and `.normal`
+  (directive); child `deopt`, `prologue_fail` and a seed decline after
+  `.via_exit_side` (resume `P`); an M1 ramp's `exit_side`; the static
+  contract panics are not tested (they are release panics).
+- Registry: arm, identical re-arm, re-arm to another child,
+  coexistence with a `sibling_handoff` on the same exit, disarm on
+  retire of either trace, `disarmAllLinks`.
+- Adapter: the tail's three exits (child, unarmed, yield) and the
+  `exit_reason` reset, via the adapter unit harness.
+- End to end with the switch on (`interp_exit_side_test.zig`): the
+  Phase 4 programs gain `exit_side_fused > 0`, byte-identical output
+  on all legs; native and tier-1a iteration totals agree; a
+  prologue-failure child disarms; a child retired mid-run; a
+  `sibling_handoff` edge fed through an `exit_side` hop is not struck.
+- Gates: `just test`, the jit-debug gate.
+
+**Order.** (1) arm kind, physical cells and registry tests; (2) replay
+grammar and hand-built ledger tests; (3) adapter tail; (4) dispatcher
+routing and the `consumeExitSide` split; (5) enable arming, drop
+`ledger_len == 0`, end-to-end tests; (6) measure, docs, review.
+
+**Measure.** fft and the board with the switch on vs off, `--jit-stats`
+residency for the two bit-reverse anchors, and how many hops end in a
+yield, a burst run or the runtime path. If bursts carry a large share
+of the hops, widening `exit_side_ok` to bursts comes next, before
+Phase 6.
+
+**Review.** Antigravity, CHANGES REQUESTED: two blockers (the
+dispatcher arm swallowing multi-row ledgers; `publishValidatedLink`
+needing an explicit physical-slot case), three majors (`region_dest`,
+the `via_exit_side` payload, `ChainResult.exit_side`), two minors (hop
+counters, the M1 assert) and a nit (per-slot array sizes). All
+verified in source and folded in above
+(`docs/reviews/doc56/antigravity-phase5-plan.md`).
 
 ### 4.9 Tiering policy (Phase 7)
 
