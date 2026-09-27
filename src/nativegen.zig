@@ -2554,10 +2554,23 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // within a native call started by the dispatcher's direct entry
             // (`exit_side_ok`; every trace that call chains into included —
             // the dispatcher replays the ledger, whose `.exit_side` grammar
-            // is Phase 5's) and with no silent transition (Phase 6). Touches
-            // only rax and the flags, both dead at a guard exit.
+            // is Phase 5's) and with no silent transition (Phase 6). §4.8.3
+            // R1: a live ORDINARY arm (a sibling handoff, an M1
+            // `ordinary_guard`, a region bridge — anything but `shared_exit`
+            // in `slots[ei]`) wins: the exit takes the ordinary path it was
+            // armed for. Touches only rax, rcx and the flags, all dead at a
+            // coarse guard exit (rcx is outside `ALLOC_ORDER`; the bridge
+            // stub below uses it too). Attachable exits are never loop-done
+            // guards, so `slots[ei]` is always the ordinary cell here.
             if (exit_side_cells.len != 0 and t.exitAttachable(ei)) {
                 const ordinary = try a.label();
+                if (shared_exit) |se| if (slotAddr(slots, ei)) |sa| {
+                    try a.movRegImm64(.rax, @bitCast(@as(u64, sa)));
+                    try a.movRegMem(.rax, .rax, 0);
+                    try a.movRegImm64(.rcx, @bitCast(@as(u64, se)));
+                    try a.cmpRegReg(.rax, .rcx);
+                    try a.jcc(.ne, ordinary);
+                };
                 try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&exit_side_cells[ei]))));
                 try a.cmpQwordMemImm8(.rax, 0, 0);
                 try a.jcc(.e, ordinary);

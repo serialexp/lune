@@ -545,6 +545,10 @@ fn routeExitSide(self: *TraceState, t: *Trace, exit_instr: u32, count: u8) bool 
         .none => {
             if (t.side_children >= self.config.maxside) return false;
             if (!t.code.exitAttachable(exit_instr)) return false;
+            // §4.8.3 R1: an exit whose ordinary cell is armed is served
+            // natively already; its stub takes that arm first, so wanting
+            // it would record nothing the arm does not run.
+            if (ordinaryArmLive(self, t, exit_instr)) return false;
             if (self.exitSideNative() and t.native == .compiled and !publishExitAdapter(self, t, exit_instr)) {
                 s.* = .gave_up;
                 self.exit_side_giveups +|= 1;
@@ -557,6 +561,20 @@ fn routeExitSide(self: *TraceState, t: *Trace, exit_instr: u32, count: u8) bool 
             return true;
         },
     }
+}
+
+/// Doc 56 §4.8.3 R1: whether exit `exit_instr`'s ORDINARY cell on `t`'s
+/// native page holds a live arm (anything but the shared exit) — the same
+/// test the exit-side stub makes before its adapter branch. False without a
+/// native page.
+pub fn ordinaryArmLive(self: *const TraceState, t: *const Trace, exit_instr: u32) bool {
+    const ct = switch (t.native) {
+        .compiled => |*c| c,
+        .unattempted, .unsupported => return false,
+    };
+    if (exit_instr >= ct.slots.len) return false;
+    const shared_exit = self.registry.mcode_arena.trampoline_exit orelse 0;
+    return ct.slots[exit_instr] != shared_exit;
 }
 
 /// Doc 56 Phase 3: bind wanted exit `src` of `parent` to a child now serving
@@ -584,17 +602,55 @@ pub const ExitSideBind = enum { chain, commit };
 /// attached exit `exit_instr`'s adapter straight at the continuation that
 /// serves its resume pc `p`, so the next firing runs the child natively
 /// instead of returning to the runtime. Called after a chain into the
-/// continuation at `p` ran to its `.link`. The target is the canonical
-/// continuation pick every other continuation arm uses
-/// (`resolveLoopDoneCont(...).arm`); every shape gate lives in `arm`. An
-/// identical re-arm is a no-op in the registry.
-pub fn armExitSide(self: *TraceState, parent: *Trace, exit_instr: u32, proto: *const Proto, p: u32, safe_to_arm: bool) void {
+/// continuation `child` at the exit's resume pc ran to its `.link`.
+/// §4.8.3 R2 (G1): the target is the continuation that LINKED, not the
+/// canonical pick at `P` (`resolveLoopDoneCont`, which ranks by hit count
+/// and id and knows nothing of entry types): at bit-reverse's zero-trip
+/// exit the canonical pick is the float twin, which refuses the exit's int
+/// `k`. The exit's snapshot types are fixed by the parent's IR, so the
+/// child that linked once keeps fitting. Every shape gate lives in `arm`.
+/// An identical re-arm is a no-op in the registry.
+pub fn armExitSide(self: *TraceState, parent: *Trace, exit_instr: u32, child: *Trace, safe_to_arm: bool) void {
     if (!safe_to_arm) return;
     if (parent.exitSideAt(exit_instr) != .attached) return;
-    const child = self.resolveLoopDoneCont(proto, p, null).arm orelse return;
     const armed = self.armNativeLink(parent, exit_instr, child, .exit_side) catch false;
     if (armed) self.exit_side_arms +|= 1;
-    self.dbg("exit-side: trace={d} exit={d} arm -> child={d} at pc={d}: {s}", .{ parent.id, exit_instr, child.id, p, if (armed) "armed" else "refused" });
+    self.dbg("exit-side: trace={d} exit={d} arm -> child={d} at pc={d}: {s}", .{ parent.id, exit_instr, child.id, child.code.anchor.pc, if (armed) "armed" else "refused" });
+}
+
+/// Doc 56 §4.8.3 R4 (G4): account one routed firing of exit `exit_instr`
+/// whose chain at the resume pc did (`linked`) or did not reach a
+/// continuation's `.link`. Only ATTACHED exits count (a wanted exit has its
+/// own `hotexit + tryside` bound). `tryside` consecutive misses mean no
+/// continuation at `P` fits what this exit brings — nsieve's init-loop exit
+/// bound a child recorded while the array grew, whose own `guard_append`
+/// then fails at its first instruction on every later call — so the exit
+/// gives up: its exit-side arm is disarmed, the adapter unpublished, the
+/// state set to `.gave_up`, and its DONE latch cleared so today's routes see
+/// it again once it re-heats. Deterministic: a pure function of receipts.
+pub fn noteExitSideChain(self: *TraceState, parent: *Trace, exit_instr: u32, linked: bool) void {
+    if (parent.exitSideAt(exit_instr) != .attached) return;
+    if (exit_instr >= parent.exit_side_misses.len) return;
+    const m = &parent.exit_side_misses[exit_instr];
+    if (linked) {
+        m.* = 0;
+        return;
+    }
+    m.* +|= 1;
+    if (m.* < self.config.tryside) return;
+    for (self.registry.native_physical.armedLinks(), 0..) |l, i| {
+        if (l.kind != .exit_side or l.parent != parent or l.slot_index != exit_instr) continue;
+        self.disarmLinkAt(i);
+        self.exit_side_disarms +|= 1;
+        break;
+    }
+    unpublishExitAdapter(parent, exit_instr);
+    parent.exit_side[exit_instr] = .gave_up;
+    m.* = 0;
+    if (exit_instr < parent.exit_counts.len) parent.exit_counts[exit_instr] = 0;
+    self.exit_side_giveups +|= 1;
+    self.exit_side_miss_giveups +|= 1;
+    self.dbg("exit-side: trace={d} exit={d} gave up after {d} unlinked chains", .{ parent.id, exit_instr, self.config.tryside });
 }
 
 /// Doc 56 Phase 5: apply the disarm a replayed child prologue failure

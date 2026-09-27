@@ -115,6 +115,69 @@ test "nextTraceExcluding: visits each anchor trace once, highest-hit first, then
     try testing.expect(state.nextTraceExcluding(&proto, 10, visited[0..n]) == null);
 }
 
+test "nextTraceExcluding: equal hit counts go to the lowest id, whatever the cache order" {
+    // Doc 56 §4.8.3 review 5: the same tie-break as `resolveLoopDoneCont`, so
+    // a chain's first candidate is the canonical pick. A retire's
+    // `swapRemove` is what puts a higher id ahead in the cache.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 0 };
+    const loop_only = [_]IrInstr{.{ .op = .loop }};
+    var traces: [3]*Trace = undefined;
+    for (&traces, [_]u32{ 7, 3, 5 }) |*slot, id| {
+        const tr = try gpa.create(Trace);
+        tr.* = .{
+            .id = id,
+            .code = .{
+                .anchor = .{ .proto = &proto, .pc = 10 },
+                .instrs = @constCast(&loop_only),
+                .consts = &.{},
+                .entry_slots = &.{},
+                .entry_guards = &.{},
+            },
+            .hit_count = 4,
+        };
+        slot.* = tr;
+        try state.registry.cache.append(gpa, tr);
+    }
+    defer {
+        state.registry.cache.clearRetainingCapacity();
+        for (traces) |tr| gpa.destroy(tr);
+    }
+    var visited: [8]*Trace = undefined;
+    var n: usize = 0;
+    for ([_]u32{ 3, 5, 7 }) |want| {
+        const next = state.nextTraceExcluding(&proto, 10, visited[0..n]) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(want, next.id);
+        visited[n] = next;
+        n += 1;
+    }
+}
+
+test "exitIsPreEffect: every state effect before the exit counts, an inline ustore included" {
+    // Doc 56 §4.8.3 review 2: the list once missed `ustore`, which the
+    // recorder emits inline when the trace has no heap load.
+    const ops = [_]IrOp{ .astore, .astore_append, .hstore, .gstore, .ustore, .sgm_setpos };
+    for (ops) |op| {
+        const instrs = [_]IrInstr{
+            .{ .op = .guard_int, .a = 0 },
+            .{ .op = op, .a = 0, .b = 0 },
+            .{ .op = .guard_true, .a = 0 },
+            .{ .op = .loop },
+        };
+        const t = Trace{ .code = .{
+            .anchor = undefined,
+            .instrs = @constCast(&instrs),
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+        } };
+        try testing.expect(TraceState.exitIsPreEffect(&t, 0));
+        try testing.expect(!TraceState.exitIsPreEffect(&t, 2));
+    }
+}
+
 test "matchesFingerprint: matching types" {
     const entry_guards = [_]EntryGuard{
         .{ .slot = 0, .ty = .int },

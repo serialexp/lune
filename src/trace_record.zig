@@ -121,6 +121,13 @@ pub const TraceRecord = struct {
     /// keeps today's anchor-coherent path). A pure function of the receipt
     /// stream. Owned; freed in `destroy`; never serialized.
     exit_side: []ExitSide = &.{},
+    /// Doc 56 §4.8.3 R4 (G4): per exit, the consecutive firings of an
+    /// ATTACHED exit whose chain at `P` did not link (no continuation there
+    /// fits what this exit brings). Reset by a firing that links; at
+    /// `tryside` the exit gives up. Allocated with `exit_side` (both or
+    /// neither), indexed like it. Owned; freed in `destroy`; never
+    /// serialized.
+    exit_side_misses: []u8 = &.{},
     /// Doc 56 (`maxside`, LuaJIT's `J->param[JIT_P_maxside]`): how many
     /// exit-side children this trace has bound. Once it reaches `maxside`
     /// no further exit of this trace becomes wanted.
@@ -200,6 +207,7 @@ pub const TraceRecord = struct {
         self.code.deinit(gpa);
         if (self.exit_counts.len != 0) gpa.free(self.exit_counts); // hotexit counters
         if (self.exit_side.len != 0) gpa.free(self.exit_side);
+        if (self.exit_side_misses.len != 0) gpa.free(self.exit_side_misses);
         gpa.destroy(self);
     }
 

@@ -719,10 +719,9 @@ pub const TraceCode = struct {
         // sunk-store shapes (P1–P3 `hstore`). Ordinary deopt (tier-0 replay) stays
         // correct for these guards.
         var si = instr_idx + 1;
-        while (si < self.instrs.len) : (si += 1) switch (self.instrs[si].op) {
-            .astore, .astore_append, .hstore, .gstore, .sgm_setpos, .ustore => return false,
-            else => {},
-        };
+        while (si < self.instrs.len) : (si += 1) {
+            if (trace_ir.isStateEffectOp(self.instrs[si].op)) return false;
+        }
         for (self.instrs) |ins| if (ins.op == .phi and ins.aux != trace_ir.PHI_INTERNAL and ins.b < instr_idx) return true;
         return false;
     }

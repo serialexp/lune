@@ -135,6 +135,7 @@ pub inline fn accountLegacyThrash(self: *TraceState, t: *Trace, completed: usize
     // alternate strike/clear forever — penalty churn on a healthy anchor.
     if (exit_instr != std.math.maxInt(u32) and exit_instr < t.code.instrs.len and
         isAnyLoopDoneGuardIndex(t, exit_instr)) return;
+    if (exitSideWaiting(self, t, exit_instr)) return;
     const gop = self.penalty.getOrPut(self.gpa, key) catch return;
     if (!gop.found_existing) gop.value_ptr.* = 0;
     gop.value_ptr.* +|= 1;
@@ -168,6 +169,25 @@ pub inline fn accountLegacyThrash(self: *TraceState, t: *Trace, completed: usize
     } else {
         self.dbg("legacy-strike: anchor pc={d} completed={d} penalty={d}/{d}", .{ key.pc, completed, gop.value_ptr.*, limit });
     }
+}
+
+/// Doc 56 §4.8.3 R4: is a zero-progress receipt at `exit_instr` part of an
+/// attachable exit's bounded wait for a native side trace? True while the
+/// exit is `.wanted` (at most `tryside` more firings), or `.none` with its
+/// hot count still below `hotexit`. Such a receipt must not strike the
+/// anchor: gating it would stop the very firings that make the exit hot
+/// or record its child. The `hotexit` bound matters (review 3): an exit
+/// that can never go wanted (`maxside` reached, or a live ordinary arm,
+/// R1) stays `.none` for good and strikes again once it is hot. Applies
+/// only with native exit-side on, so the switch-off path is unchanged.
+fn exitSideWaiting(self: *const TraceState, t: *const Trace, exit_instr: u32) bool {
+    if (!self.exitSideNative()) return false;
+    if (exit_instr >= t.exit_side.len or !t.code.exitAttachable(exit_instr)) return false;
+    return switch (t.exit_side[exit_instr]) {
+        .wanted => true,
+        .none => exit_instr < t.exit_counts.len and t.exit_counts[exit_instr] < self.config.hotexit,
+        .attached, .gave_up => false,
+    };
 }
 
 /// A-vii-c.1: the selection receipt for a ledger row whose REGION receipt was

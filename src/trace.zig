@@ -327,13 +327,15 @@ pub const SlotStore = trace_ir.SlotStore;
 pub const ChainResult = struct {
     completed: usize,
     resume_pc: ?u32 = null,
-    /// Doc 56 Phase 3: `driveChain`'s hop-0 `.link` continuation ran to its
-    /// `.link` terminal — through the scalar burst, or (Phase 5) as the head
-    /// row of a native span drained through the seed ledger, however far its
-    /// armed `.link` then fused. The exit-side router reads it to bind a
-    /// wanted exit to the child that served it (and, natively, to arm it); a
-    /// candidate that deopted before its `.link` leaves it false.
-    linked: bool = false,
+    /// Doc 56 Phase 3: the `driveChain` candidate whose `.link` continuation
+    /// ran to its `.link` terminal — through the scalar burst, or (Phase 5)
+    /// as the head row of a native span drained through the seed ledger,
+    /// however far its armed `.link` then fused. The exit-side router reads
+    /// it to bind a wanted exit to the child that served it and (§4.8.3 R2)
+    /// to arm exactly that child, which need not be the canonical pick at
+    /// `P` when an earlier candidate refused its entry. Null when no
+    /// candidate reached its `.link`.
+    linked_trace: ?*Trace = null,
     /// Doc 56 Phase 5: a ledger replay ended on an UNARMED exit adapter's
     /// row (the exit is wanted, or attached but not armed): the slab is
     /// coherent at `resume_pc` (the exit's resume pc) and the row's receipt
@@ -1304,6 +1306,14 @@ pub const TraceState = struct {
     /// failure.
     exit_side_arms: u64 = 0,
     exit_side_disarms: u64 = 0,
+    /// Doc 56 §4.8.3 R2: exit-side chain candidates at `P` that refused
+    /// their entry or deopted before any effect, after which the walk tried
+    /// the next continuation there.
+    exit_side_retries: u64 = 0,
+    /// Doc 56 §4.8.3 R4: attached exits that gave up after `tryside`
+    /// consecutive chains at `P` that did not link (also counted in
+    /// `exit_side_giveups`).
+    exit_side_miss_giveups: u64 = 0,
     /// Doc 56 Phase 4: native exit adapters built.
     exit_adapter_builds: u64 = 0,
     /// Doc 56 Phase 4: adapter builds refused, per `adapter.Refusal`.
@@ -1802,23 +1812,21 @@ pub const TraceState = struct {
     /// this is consulted only when the watch MOVES and again at arm time, both cold.
     /// A memo here would buy nothing and cost a build/free/serialize lifecycle.
     ///
-    /// The store ops here are `tropt.kindOf`'s `.astore` class. `sgm_setpos`
-    /// (kind `.setpos`, doc 30) is a store too, but it is NEVER emitted inline —
-    /// it only enters the IR through the pending-store sink, below every guard —
-    /// so no exit can precede one and the scan need not name it. That safety
-    /// lives in `commit`'s sinking discipline, not here: if `sgm_setpos` ever
-    /// gains an inline emission path it must join this list. Guards (which
-    /// side-exit but mutate nothing) and `int_of_float` are deliberately fine.
-    /// The doc-24 allocating producers (`tostr_*`, snew, `scap_str`) also fall
-    /// through: they only intern (grow the heap), never mutate guest-visible
-    /// state, so re-running the iteration re-interns identically (D2 id-stream).
+    /// The ops are `trace_ir.isStateEffectOp`, shared with the bridge-candidate
+    /// test (doc 56 §4.8.3 review 2: this list once named only four of
+    /// `tropt.kindOf`'s `.astore` class and missed `ustore`, which the recorder
+    /// emits INLINE when the trace has no heap load). `sgm_setpos` only enters
+    /// the IR through the pending-store sink, below every guard, so it cannot
+    /// precede an exit today, but the shared list names it anyway rather than
+    /// resting on that sinking discipline. Guards (which side-exit but mutate
+    /// nothing) and `int_of_float` are deliberately fine. The doc-24 allocating
+    /// producers (`tostr_*`, snew, `scap_str`) also fall through: they only
+    /// intern (grow the heap), never mutate guest-visible state, so re-running
+    /// the iteration re-interns identically (D2 id-stream).
     // pub for trace_link.zig (file-split pass)
     pub fn exitIsPreEffect(t: *const Trace, exit_instr: u32) bool {
         const n = @min(@as(usize, exit_instr), t.code.instrs.len);
-        for (t.code.instrs[0..n]) |ins| switch (ins.op) {
-            .astore, .astore_append, .hstore, .gstore => return false,
-            else => {},
-        };
+        for (t.code.instrs[0..n]) |ins| if (trace_ir.isStateEffectOp(ins.op)) return false;
         return true;
     }
 
@@ -2565,7 +2573,11 @@ pub const TraceState = struct {
             for (visited) |v| {
                 if (v == t) continue :outer;
             }
-            if (best == null or t.hit_count > best_hits) {
+            // Ties go to the lowest id, like `resolveLoopDoneCont` (doc 56
+            // §4.8.3 review 5), so a chain's first candidate at a pc is the
+            // canonical pick there. Cache order equals id order until a
+            // retire's `swapRemove`, which is the only case this changes.
+            if (best == null or t.hit_count > best_hits or (t.hit_count == best_hits and t.id < best.?.id)) {
                 best = t;
                 best_hits = t.hit_count;
             }
@@ -2975,6 +2987,8 @@ pub const TraceState = struct {
     pub const exitSideNative = trace_link_mod.exitSideNative;
     pub const bindExitSide = trace_link_mod.bindExitSide;
     pub const armExitSide = trace_link_mod.armExitSide;
+    pub const ordinaryArmLive = trace_link_mod.ordinaryArmLive;
+    pub const noteExitSideChain = trace_link_mod.noteExitSideChain;
     pub const drainPendingExitSideDisarm = trace_link_mod.drainPendingExitSideDisarm;
     pub const maybeArmExitSide = trace_link_mod.maybeArmExitSide;
     pub const noteExitSideCommit = trace_link_mod.noteExitSideCommit;
@@ -3944,13 +3958,21 @@ pub const TraceState = struct {
         errdefer if (t.exit_counts.len != 0) self.gpa.free(t.exit_counts);
         // Doc 56 Phase 3: the per-exit exit-side state, only for traces that
         // can use it. Fail-soft like `exit_counts`.
+        // §4.8.3 R4: the miss counters come with it (both or neither).
         if (t.code.anyExitAttachable()) {
             if (self.gpa.alloc(exit_attach.ExitSide, t.code.instrs.len)) |sides| {
-                @memset(sides, .none);
-                t.exit_side = sides;
+                if (self.gpa.alloc(u8, t.code.instrs.len)) |misses| {
+                    @memset(sides, .none);
+                    @memset(misses, 0);
+                    t.exit_side = sides;
+                    t.exit_side_misses = misses;
+                } else |_| self.gpa.free(sides);
             } else |_| {}
         }
-        errdefer if (t.exit_side.len != 0) self.gpa.free(t.exit_side);
+        errdefer if (t.exit_side.len != 0) {
+            self.gpa.free(t.exit_side);
+            self.gpa.free(t.exit_side_misses);
+        };
         try self.registry.publish(t);
         if (comptime jitdbg.enabled) if (self.config.debug_log) {
             // Lane pins (guard_lane aux per table guard) identify which array
@@ -4296,7 +4318,7 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
         }
         try w.writeAll(if (any_refused) "\n" else " none\n");
         // Doc 56 Phase 3: the tier-1a exit-side path.
-        try w.print("    exit side:            wants={d} records={d} binds={d} (by chain {d}) giveups={d} hops={d} chained={d}\n", .{ ts.exit_side_wants, ts.exit_side_records, ts.exit_side_binds, ts.exit_side_chain_binds, ts.exit_side_giveups, ts.exit_side_hops, ts.exit_side_chains });
+        try w.print("    exit side:            wants={d} records={d} binds={d} (by chain {d}) giveups={d} hops={d} chained={d} retries={d} miss-giveups={d}\n", .{ ts.exit_side_wants, ts.exit_side_records, ts.exit_side_binds, ts.exit_side_chain_binds, ts.exit_side_giveups, ts.exit_side_hops, ts.exit_side_chains, ts.exit_side_retries, ts.exit_side_miss_giveups });
         // Doc 56 Phase 4: native exit adapters.
         try w.print("    exit adapters:        built={d} native hops={d}; refused:", .{ ts.exit_adapter_builds, ts.exit_side_native_hops });
         var any_adapter_refused = false;

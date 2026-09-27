@@ -461,7 +461,7 @@ pub fn driveChain(
                             safe_to_arm,
                             materialization,
                         );
-                        r.linked = head.kind == .link_terminal and head.id == sct.id;
+                        if (head.kind == .link_terminal and head.id == sct.id) r.linked_trace = sct;
                         break :blk r;
                     },
                     else => self.driveDispatcherLedger(
@@ -590,7 +590,7 @@ pub fn driveChain(
                 self.armLoopDoneLink(failed, exit_instr, safe_to_arm);
             }
             var burst = self.runLinkedBurst(sct, sresult, sresult_fused, snt, tier, materialization, proto, regs, safe_to_arm);
-            burst.linked = true;
+            burst.linked_trace = sct;
             return burst;
         }
 
@@ -602,6 +602,14 @@ pub fn driveChain(
         if (tier == .native_only) self.maybeArmCompositeExit(sct, sresult.exit_instr, safe_to_arm);
         if (flushed_resume_pc) |target_pc| {
             self.onSideExitReceipt(sct, 0, sresult.exit_instr, 0, .deferred, if (sresult.exit_reason == .prologue_fail) .entry_refusal else .entered);
+            // Doc 56 §4.8.3 R2 (G1): at an exit-side resume pc, a candidate
+            // that left the slab exactly as it found it (coherent at `P`)
+            // does not end the walk — the next continuation at `P` may be
+            // the one whose entry types fit this exit.
+            if (materialization == .exit_side and candidateLeftEntryState(sct, sresult, tier)) {
+                self.exit_side_retries +|= 1;
+                continue;
+            }
             return .{ .completed = 0, .resume_pc = target_pc };
         }
         if (sresult.completed > 0) {
@@ -612,6 +620,26 @@ pub fn driveChain(
         // Zero iterations, no flush owed (ordinary path): try the next candidate.
     }
     return null;
+}
+
+/// Doc 56 §4.8.3 R2: did chain candidate `sct`'s run leave the slab exactly
+/// as it was at `sct`'s entry? True for a prologue refusal (nothing ran) and
+/// for a deopt of `sct` itself at an exit with no state effect before it
+/// (`exitIsPreEffect`): a `.link` continuation does not loop, and neither
+/// tier writes registers before a completion (native carried homes keep
+/// their entry values up to the last body guard; tier-1a flushes φs only at
+/// `.loop`/`.link`/`.terminal`), so the coarse deopt restores the entry
+/// registers. False for anything that ran into another trace (a fused
+/// native span), a seed decline, or any other exit reason.
+fn candidateLeftEntryState(sct: *const Trace, r: trace_exec.ExecResult, comptime tier: ChainTier) bool {
+    if (tier == .native_only and (r.final_trace_id != sct.id or r.ledger_len > 1)) return false;
+    return switch (r.exit_reason) {
+        .prologue_fail => true,
+        .normal => r.exit_instr < sct.code.instrs.len and
+            isSideExitGuardOp(sct.code.instrs[r.exit_instr].op) and
+            TraceState.exitIsPreEffect(sct, r.exit_instr),
+        else => false,
+    };
 }
 
 pub fn driveSeedSilentResult(
@@ -3175,7 +3203,23 @@ pub fn noteDispatcherLedgerTerminal(
     const owner = self.traceById(term.id) orelse return;
     self.noteSiblingTerminal(owner, term.exit);
     if (term.exit < owner.code.instrs.len and !isLoopDoneGuardIndex(owner, term.exit))
-        self.noteTakenExit(owner, term.exit, term_local, proto, .legacy);
+        self.noteTakenExit(owner, term.exit, term_local, proto, dispatcherTerminalRoute(self, owner, term.exit));
+}
+
+/// Doc 56 §4.8.3 R3 (G2): the route a dispatcher-ledger terminal `.deopt`
+/// reports. The terminal trace is often an exit-side child the parent's
+/// adapter jumped into, whose exits would otherwise never become wanted.
+/// `.native_direct` only while the exit is `.none`: this firing took the
+/// ordinary deopt, so the one step it may drive is `.none → .wanted` (the
+/// firing that crosses `hotexit` deopts ordinarily on every route; the
+/// adapter it publishes serves the next one). A wanted or attached exit can
+/// end a ledger in `.deopt` without materializing — an adapter build
+/// refused, a silent transition, or a `driveChain` candidate's ledger from a
+/// run with `exit_side_ok = 0` — and counting that as owned would give it
+/// up unrecorded (review 1), so those stay `.legacy`.
+fn dispatcherTerminalRoute(self: *const TraceState, owner: *const Trace, exit_instr: u32) TraceState.ExitRoute {
+    if (!self.exitSideNative()) return .legacy;
+    return if (owner.exitSideAt(exit_instr) == .none) .native_direct else .legacy;
 }
 
 pub fn driveDispatcherLedger(

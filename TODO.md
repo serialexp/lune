@@ -1793,29 +1793,13 @@ nothing at all.
 
 ## Doc 56 Phase 5 findings (2026-09-27)
 
-- [ ] **nsieve with the switch ON got 30% slower once its exit-side
-      child went native (doc 57 P2).** The child at pc 7 (`p[i] = true`)
-      now compiles (it was tier-1a), and the 4.4M exit-side hops into it
-      cost more per hop: 0.82 s → 1.08 s wall (×3 interleaved vs the P1
-      shadow build; switch OFF is 0.04 s on both). Same event counts;
-      perf moves to the runtime seam — `accountRegionProfit` 14% → 26%,
-      `driveChain` 6% → 10% — not to native code. This is the per-hop
-      seam of the "Per-hop cache scan" item above and doc 56 Phase 6
-      (silent promotion of exit-side edges); re-measure there.
-      **Re-diagnosed 2026-09-27 (doc 56 §4.8.2): not a silence case.**
-      The init loop's `guard_append` exit takes its adapter although a
-      sibling handoff is armed on the ordinary cell (G3), and the child
-      at pc 7 fails its own `guard_append` at its first instruction on
-      every hop after the array stopped growing (G4, 960k hops,
-      `completed=0`). Now 12 → 259 ms.
-- [ ] **Doc 56 G1: the child pick at `P` ignores entry types.**
-      Bit-reverse exit 60 (`k` still an int) chains and arms through
-      `resolveLoopDoneCont(proto, P, null)`, which picks the float
-      variant at pc 68; its entry guard fails, so exit 60 never arms
-      (226k runtime round-trips). Its own int child was recorded and
-      bound. See doc 56 §4.8.2.
-- [ ] **Doc 56 G4: no rule gives up on a child that fails its first
-      guard every hop.** Only a prologue failure disarms (Phase 5).
+- [ ] **nsieve with the switch ON is still 12 → 43 ms (doc 56 G6).**
+      R4 fixed the G4 turnstile (was 259 ms). What is left (doc 56
+      §4.8.3 "What nsieve still pays"): full 32-row ledgers ending at t3
+      exit 23 (Phase 6's work), and t6 — a pc 18 trace that unrolled the
+      inner `for k` — whose per-trip-count exits fill the pc 18 anchor
+      with children, so exits 71 and 107 are refused ("anchor full"),
+      give up, and end 13.5k ledgers. Re-diagnose after Phase 6.
 - [ ] **Doc 56 G5: a `while` root's loop-done exit never links
       natively.** Numeric `for` has `loop_done_linked`; `while` has only
       the runtime `.while_done` chain (bit-reverse inner `while`, 122k
@@ -1828,12 +1812,10 @@ nothing at all.
       runs 94% as a trace but the seam is 63% of the run — a Phase 6
       test case. (2026-09-27: 70% seam, `no-silent-site` rejects on
       every full ledger — confirmed the one layer-2 case.)
-- [ ] **Exit stub precedence (doc 56 Phase 7).** An exit with a
-      published adapter takes it even when its ordinary slot holds a
-      live, silent region bridge (sieve_int, nsieve-bit: 232 → 39,732
-      ledger walks with the switch on). The Phase 7 rule "existing live
-      arms first" must hold in the stub, not only in `noteTakenExit`.
-- [ ] **Exits of exit-side children are never wanted (Phase 7).** A
-      child's own branch exit rolls back to its anchor and earns legacy
-      and window strikes that gate the loop (two-level branch probe: 65%
-      traced with the switch off, 13% on).
+- [ ] **sieve_int / nsieve-bit are still slower with the switch on**
+      (21 → 58 ms, 14 → 33 ms after R1–R4). The stub now yields to a
+      live region bridge (R1), so the remaining cause is something else;
+      diagnose with the Z-8 ladder after Phase 6.
+- [ ] **Measure R3 on the two-level branch probe** (Phase 5 finding: 65%
+      traced with the switch off, 13% on). R3 now lets a child's exits
+      become wanted; the probe program is not in the tree yet.

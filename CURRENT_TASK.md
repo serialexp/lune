@@ -551,6 +551,19 @@ the ones that bite):
     (`docs/reviews/doc56/antigravity-phase67-plan.md`).
     **NEXT: implement in order R1 → R2 → R3+R4 → Phase 6 items 1–10 →
     measure (switch off/on, board) → docs → code review → commit.**
+  - **R1–R4 LANDED (2026-09-27)**, doc 56 "R1–R4 landed". Switch on, best
+    of 5, before → after (switch off in brackets): boolC 10 → 8 (3),
+    bitrev 500 → 233 (227), fft 357 → 217 (206), nsieve 259 → 43 (12),
+    nsieve-bit 38 → 33 (14), sieve_int 58 (21). G1 fixed (bitrev exit 60
+    arms t4), G4 fixed (nsieve t0 exit 10 gives up after 4 misses, then a
+    sibling arm). Also: `exitIsPreEffect` missed `ustore` (shared
+    `trace_ir.isStateEffectOp` now). Switch-off board
+    `20260927-124025-2db8e1d.tsv`: flat; nsieve's +12% was noise (A/B
+    15 reps: 12.1 vs 12.2 ms). Gates: `just test` + jit-debug 1529/1529.
+    What nsieve still pays with the switch on (G6, TODO.md): 9.5k full
+    ledgers at t3 exit 23 (layer 2 → Phase 6) and 13.5k short ledgers at
+    t6 exits 71/107 (pc 18 full, gave up).
+    **NEXT: Phase 6 items 1–10 (§4.8.2).**
   - Background (LuaJIT)
     reference read: `lj_opt_loop.c` ~l.340 raises `TYPEINS` when a
     loop-carried ref's type differs from its SLOAD's; `lj_opt_loop()`

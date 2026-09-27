@@ -917,6 +917,36 @@ test "doc 56 Phase 5: fft bit-reverse at the CLI's hot threshold binds and arms 
     });
 }
 
+// Doc 56 §4.8.3 R2 (G1): bit-reverse's zero-trip `while` exit arrives at
+// the post-`while` pc with `k` still an int, but the canonical pick there
+// (`resolveLoopDoneCont`: hit count, then id) is the float-`k` twin, which
+// refuses the entry. The chain now tries the next continuation, and the
+// exit arms the one that linked. At the CLI threshold (the order the board
+// sees) at least one exit-side arm must target a non-canonical child.
+test "doc 56 §4.8.3 R2: an exit-side exit arms the continuation that fits, not the canonical one" {
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode != .record_execute_native) return;
+            const ts = &vm.trace;
+            try testing.expect(ts.exit_side_retries > 0);
+            var off_canonical: u32 = 0;
+            for (ts.registry.native_physical.armedLinks()) |l| {
+                if (l.kind != .exit_side) continue;
+                const p = l.parent.code.exitResumePc(l.slot_index).?;
+                try testing.expectEqual(p, l.child.code.anchor.pc);
+                const pick = ts.resolveLoopDoneCont(l.parent.code.anchor.proto, p, null).arm orelse continue;
+                if (pick != l.child) off_canonical += 1;
+            }
+            try testing.expect(off_canonical > 0);
+        }
+    };
+    try expectProgramTuned(bitreverse_src, "0.5\t1024\n", .{
+        .exit_side_native = true,
+        .hotloop = (@import("trace.zig").TraceConfig{}).hotloop,
+        .inspect = Inspect.run,
+    });
+}
+
 // Doc 56 Phase 5 regression: nsieve called several times. Its prime-path
 // exit gets an exit-side child anchored at `P` (the `for k` setup, which is
 // also the `if p[i]` branch's fall-through pc). Region discovery used to take
@@ -952,14 +982,100 @@ test "doc 56 Phase 5: repeated nsieve calls keep their prime count with exit-sid
     });
 }
 
+const exit_side_replay_src =
+    \\local t = {0.5}
+    \\local s = 0
+    \\for i = 1, 300 do
+    \\  t[1] = t[1] + i
+    \\  if i % 3 == 0 then s = s + t[1] else s = s - 1 end
+    \\end
+    \\print(s, t[1])
+;
+
 test "doc 56 Phase 5: the .exit_side replay grammar on real armed traces" {
-    try expectProgramTuned(
-        \\local t = {0.5}
-        \\local s = 0
-        \\for i = 1, 300 do
-        \\  t[1] = t[1] + i
-        \\  if i % 3 == 0 then s = s + t[1] else s = s - 1 end
-        \\end
-        \\print(s, t[1])
-    , "1530000\t45150.5\n", .{ .exit_side_native = true, .inspect = checkExitSideReplay });
+    try expectProgramTuned(exit_side_replay_src, "1530000\t45150.5\n", .{ .exit_side_native = true, .inspect = checkExitSideReplay });
+}
+
+/// Doc 56 §4.8.3 R1, in machine code: an exit whose ORDINARY cell is armed
+/// takes that arm even though its adapter is published and armed too. The
+/// fixture's exit gets an `.ordinary_guard` arm back into its own parent
+/// (same anchor; the coarse deopt re-runs the failing iteration), so every
+/// firing after the first is the parent re-entering itself until the ledger
+/// cap yields. Before R1 the stub branched to the adapter first.
+fn checkOrdinaryArmFirst(vm: *Vm, mode: TraceMode) !void {
+    if (mode != .record_execute_native) return;
+    const ts = &vm.trace;
+    const Entry = trace_exec.LedgerEntry;
+    const l = for (ts.registry.native_physical.armedLinks()) |x| {
+        if (x.kind == .exit_side) break x;
+    } else return error.TestNoExitSideArm;
+    const parent = l.parent;
+    const child = l.child;
+    const ei = l.slot_index;
+    const link_exit: u32 = @intCast(child.code.instrs.len - 1);
+    var link_armed = false;
+    for (ts.registry.native_physical.armedLinks()) |x| {
+        if (x.kind == .link_terminal and x.parent == child and x.child == parent) link_armed = true;
+    }
+    if (!link_armed) try testing.expect(try ts.armNativeLink(child, link_exit, parent, .link_terminal));
+
+    // No ordinary arm yet: the exit's router may want it. With one, it may not.
+    try testing.expect(!ts.ordinaryArmLive(parent, ei));
+    try testing.expect(try ts.armNativeLink(parent, ei, parent, .ordinary_guard));
+    try testing.expect(ts.ordinaryArmLive(parent, ei));
+    try testing.expect(ts.hasArmedExitSide(parent, ei, child));
+
+    const gpa = testing.allocator;
+    const tbl = try table.Table.create(gpa);
+    defer tbl.destroy(gpa);
+    try tbl.set(gpa, value.Value.int(1), value.Value.float(10.5));
+    // The loop's registers at `P` for i = 3, as in `checkExitSideReplay` (c').
+    const Tag = value.Tag;
+    var tags: [16]u8 = @splat(@intFromEnum(Tag.nil));
+    var pays: [16]u64 = @splat(0);
+    const tv = value.Value.heap(&tbl.header);
+    tags[0] = @intFromEnum(tv.tag);
+    pays[0] = tv.payload.bits;
+    tags[1] = @intFromEnum(Tag.float);
+    pays[1] = @bitCast(@as(f64, 0.0));
+    for ([_]usize{ 2, 5 }) |r| {
+        tags[r] = @intFromEnum(Tag.int);
+        pays[r] = 3;
+    }
+    tags[3] = @intFromEnum(Tag.int);
+    pays[3] = 1000;
+    tags[4] = @intFromEnum(Tag.int);
+    pays[4] = 1;
+
+    var ledger: [trace_exec.LEDGER_CAP]Entry = undefined;
+    const r = child.native.compiled.runCapturingLedgerEntry(RegWindow.of(&tags, &pays), &ledger, ts.silentStaging(), true);
+    try testing.expectEqual(@as(u32, trace_exec.LEDGER_CAP), r.ledger_len);
+    try testing.expect(r.exit_reason != .exit_side);
+    // The child closes i = 3; the parent runs i = 4, 5 and fails at i = 6,
+    // then re-enters itself through the ordinary arm on every later row.
+    try testing.expectEqual(child.id, ledger[0].id);
+    try testing.expectEqual(trace_exec.LedgerKind.link_terminal, ledger[0].kind);
+    for (ledger[1..], 1..) |row, k| {
+        try testing.expectEqual(parent.id, row.id);
+        try testing.expectEqual(ei, row.exit);
+        try testing.expectEqual(trace_exec.LedgerKind.deopt, row.kind);
+        const want: trace_exec.LedgerOutcome = if (k + 1 == ledger.len) .yielded else .normal;
+        try testing.expectEqual(want, row.outcome);
+    }
+    // Every row re-ran i = 6 from the anchor: the slab still holds it, and
+    // the iteration's sunk `t[1]` store was never applied twice.
+    try testing.expectEqual(@as(f64, 10.5 + 4 + 5), @as(f64, @bitCast(tbl.get(value.Value.int(1)).payload.bits)));
+
+    // Disarming the ordinary cell hands the exit back to its adapter.
+    for (ts.registry.native_physical.armedLinks(), 0..) |x, i| {
+        if (x.kind == .ordinary_guard and x.parent == parent and x.slot_index == ei) {
+            ts.disarmLinkAt(i);
+            break;
+        }
+    }
+    try testing.expect(!ts.ordinaryArmLive(parent, ei));
+}
+
+test "doc 56 §4.8.3 R1: a live ordinary arm wins over a published exit adapter" {
+    try expectProgramTuned(exit_side_replay_src, "1530000\t45150.5\n", .{ .exit_side_native = true, .inspect = checkOrdinaryArmFirst });
 }

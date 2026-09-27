@@ -860,6 +860,22 @@ pub fn isSideExitGuardOp(op: IrOp) bool {
     };
 }
 
+/// Every IR op that changes guest-visible state: the heap stores (`astore`,
+/// `astore_append`, `hstore`, `gstore`), the closed-cell store (`ustore`),
+/// the deferred gmatch position store (`sgm_setpos`) and the precise-only
+/// table effects (`tnew`, `tset`). An exit with none of these before it can
+/// be re-run from the trace's entry state without doing anything twice
+/// (`exitIsPreEffect`); a bridge exit with one after it would drop a sunk
+/// store (`TraceCode.classifyBridgeCandidate`). The same set as
+/// `trace_exit_attach.resumeClass`'s `.flush_store` and `.effect` classes.
+/// Allocating producers (`tostr_*`, `snew`, …) only intern and are not here.
+pub fn isStateEffectOp(op: IrOp) bool {
+    return switch (op) {
+        .astore, .astore_append, .hstore, .gstore, .ustore, .sgm_setpos, .tnew, .tset => true,
+        else => false,
+    };
+}
+
 /// Doc 45 D3: every op a PRECISE trace must carry a snapshot for, because its
 /// runtime failure exits mid-iteration. The side-exit guards (shape/type
 /// misses → `.precise_resume`) PLUS the fallible effect ops (`tnew`/`tset`

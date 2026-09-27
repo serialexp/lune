@@ -3673,11 +3673,14 @@ pub const Vm = struct {
         const ei = result.exit_instr;
         const p = ct.code.exitResumePc(ei).?;
         const anchor_pc: usize = ct.code.anchor.pc;
-        if (ts.driveChain(ct, result, proto, regs, tier, .{ .exit_side = p }, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
-            if (chain.linked) {
+        const chained = ts.driveChain(ct, result, proto, regs, tier, .{ .exit_side = p }, &.{}, safe_to_arm, self.unicode_version_pinned);
+        // §4.8.3 R4: an attached exit whose chain keeps missing gives up.
+        ts.noteExitSideChain(ct, ei, if (chained) |c| c.linked_trace != null else false);
+        if (chained) |chain| {
+            if (chain.linked_trace) |child| {
                 ts.exit_side_chains +|= 1;
                 ts.bindExitSide(ct, ei, .chain);
-                if (tier == .native_only) ts.armExitSide(ct, ei, proto, p, safe_to_arm);
+                if (tier == .native_only) ts.armExitSide(ct, ei, child, safe_to_arm);
                 return .{ .resume_tier0 = chain.resume_pc orelse anchor_pc };
             }
             // No continuation ran to its `.link`. One that deopted before it

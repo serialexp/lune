@@ -1683,8 +1683,16 @@ strike rules land here too. G5 is out (its own doc).
 - An ordinary arm that arrives after the exit went wanted or attached
   needs nothing: the stub prefers it, and the exit-side arm is
   reachable again if it is disarmed.
-- Fixes nsieve (its `guard_append` exit keeps the doc 47 sibling
-  handoff) and sieve_int/nsieve-bit (the region bridge stays silent).
+- Serves an exit whose ordinary arm came FIRST. **Correction
+  (implementation, 2026-09-27):** that is not nsieve's order. With the
+  switch on, its init-loop `guard_append` exit (t0 exit 10) goes wanted
+  at `hotexit`, before the doc 47 sibling (t6) exists, and binds the
+  pc 7 child; the sibling is never recorded, so there is no handoff to
+  prefer (switch off: `sibling-arm: t=0 ei=10 -> t=6`; switch on: no
+  arm, 960k `completed=0` hops). nsieve is fixed by R4 (the attached
+  exit gives up, today's routes record and arm the sibling), and R1
+  then keeps the handoff once it is armed. sieve_int/nsieve-bit are
+  measured after R4.
 
 **R2 — the child that fits (G1).**
 
@@ -1804,6 +1812,64 @@ seam and terminal-row histograms (the jit-debug build) as in §4.8.2.
 Board with the switch off (expected unchanged) and on. Budget: with
 the switch on, no bench slower than switch off by more than noise
 except where G5 is the stated cause.
+
+**R1–R4 landed (2026-09-27).** What was built, where it differs from
+the plan text above:
+
+- R1: the stub tests `slots[ei]` first (rax/rcx), as planned.
+  `routeExitSide`'s `.none → .wanted` asks `ordinaryArmLive`, which
+  reads the physical cell (`slots[ei] != trampoline_exit`) rather
+  than scanning the registry: the same test the stub makes. Test:
+  `.ordinary_guard` armed from the exit back into its own parent next
+  to a live exit-side arm; a machine-code run writes 31 `.deopt` rows
+  (the last `.yielded`), no `.exit_side` row, and the sunk store is
+  never applied twice. Removing the stub's `jne` fails it.
+- R2: `candidateLeftEntryState` (`trace_chain.zig`) is the retry test;
+  `ChainResult.linked` became `linked_trace: ?*Trace`, and
+  `armExitSide` takes the child. `exitIsPreEffect` and the
+  bridge-candidate test share `trace_ir.isStateEffectOp` (the eight
+  ops of `trace_exit_attach.resumeClass`'s `.flush_store`/`.effect`
+  classes). New counter `exit_side_retries`. Bit-reverse exit 60 now
+  arms t4 (the int twin).
+- R3: `dispatcherTerminalRoute` (`.native_direct` only from `.none`).
+- R4: `exitSideWaiting` in `accountLegacyThrash`, applied only with the
+  native switch on (the switch-off path is unchanged).
+  `TraceRecord.exit_side_misses` is allocated with `exit_side` (both
+  or neither); `noteExitSideChain` gives up at `tryside`. New counter
+  `exit_side_miss_giveups`. nsieve's t0 exit 10 gives up after 4
+  unlinked chains, and today's routes then record and arm the doc 47
+  sibling (`sibling-arm: t=0 ei=10 -> t=10`).
+
+Switch off → on, best of 5, before (§4.8.2) and after R1–R4:
+
+| program | off | on before | on after |
+|---|---|---|---|
+| boolC | 3 ms | 10 ms | 8 ms |
+| bit-reverse alone | 227 ms | 500 ms | 233 ms |
+| scimark-fft 500 | 206 ms | 357 ms | 217 ms |
+| nsieve 7 | 12 ms | 259 ms | 43 ms |
+| nsieve-bit 6 | 14 ms | 38 ms | 33 ms |
+| sieve_int | 21 ms | — | 58 ms |
+
+(sieve_int's "off" differs from §4.8.2's 6 ms: that row was a
+different run; both columns here are the same binary.)
+
+**What nsieve still pays (G6, new).** Terminal rows with the switch on
+(nsieve 7, jit-debug): 9.5k FULL ledgers ending at t3 exit 23 (layer 2,
+Phase 6's work) and 13.5k short ledgers ending at t6 exits 71 and 107.
+t6 is a trace at pc 18 (the `for k` setup) that unrolled the inner
+`for k` loop; its exits 53/71/89/107/125 are the per-trip-count exits
+of that unroll, all resuming at pc 18 or 34. Exits 53 and 89 recorded
+children at pc 18 (t8, t9), which filled the anchor
+(`max_traces_per_anchor`), so 71 and 107 were refused ("anchor full")
+and gave up. Switch off, the same program runs about 90 native calls in
+all (silent regions; 316 ledger walks). So the unrolled trace and its
+per-trip-count exits are the next layer-1 cause on nsieve, and it is
+separate from G1–G4. (Also seen: t5 exit 10, the zero-trip test of
+`for k` inside the pc 18 continuation, is refused as `loop_done`; it
+ends only 11 ledgers here.) Recorded in TODO.md; it is looked at after
+Phase 6 lands, when the full ledgers are gone and the remaining
+terminals are clearer.
 
 ### 4.9 Tiering policy (Phase 7)
 
