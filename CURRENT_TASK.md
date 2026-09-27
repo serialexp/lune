@@ -576,12 +576,25 @@ the ones that bite):
     flat (repack +18.8% was noise: A/B 20.5 vs 20.8 ms).
     Bit-reverse: armable cycle, but G5 ends every ledger early → 0
     candidates. Gates: `just test` + jit-debug green.
-    **NEXT (Bart picks, else the order below):** (1) Z-8 layer 2 on the
-    nsieve family: thousands of silent candidates, a handful of
-    promotions (TODO "candidates that never promote"); (2) sieve_int's
-    30k walks with 0 candidates; (3) G5 design doc (`while` loop-done
-    link); (4) G6; (5) Phase 8 (flip the switch). Open for Bart: widen
-    `exit_side_ok` to bursts (P6-Q3 (b)), now with burst-skip numbers.
+  - **G6 DIAGNOSED (2026-09-27)**, doc 56 §4.8.4. The nsieve family's
+    "candidates that never promote" is G6: a `.side` recording at the
+    inner loop's `for_prep` unrolls the OUTER loop because
+    `recForLoop`'s `LJ_TRLINK_ROOT` close is gated on `.continuation`
+    only (`recForPrepLink`/`recWhileLink` already take `.side`).
+    Widening it (experiment, reverted): switch on fft 224 → 131, nsieve
+    38 → 25, nsieve-bit 34 → 18, sieve_int 23 → 11; switch off fft
+    215 → 512 (bit-reverse's new links all end at G5's `while`
+    loop-done: 540k walks). Two shape tests fail (doc 56 Phase 0 pin,
+    doc 40 glue peel). Antigravity APPROVE WITH CHANGES
+    (`docs/reviews/doc56/antigravity-g6.md`): recommends G5 first + a
+    `loopunroll` = 15 bound. **Waiting on Bart: G6-Q1 (a/b/c/d),
+    G6-Q2.**
+    **NEXT:** (1) G5 design doc (`while` loop-done native link; Bart
+    ruled P6-Q4 (a) "own doc"; it is the switch-off blocker for G6 and
+    the remaining switch-on fft seam); (2) sieve_int with the switch on
+    (re-check after G6: the experiment took it 23 → 11); (3) Phase 8.
+    Open for Bart: G6-Q1/Q2; widen `exit_side_ok` to bursts (P6-Q3
+    (b)), with burst-skip numbers.
     Gotcha: an Antigravity review that "runs the tests" leaves
     `zig-out/bin/mahina` as Debug — rebuild ReleaseFast before timing.
   - Background (LuaJIT)

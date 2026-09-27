@@ -1963,8 +1963,8 @@ which is true for bit-reverse and not for the rest. What's left:
 
 1. **Candidates that never promote** (nsieve, nsieve-bit,
    nsieve-bit-fp): thousands of detected candidates, a handful of
-   promotions. Next diagnosis step is the streak and the `silent
-   rejects:` line (layer 2).
+   promotions. Diagnosed in §4.8.4: it is G6 (short ledgers from a
+   `.side` trace that unrolls the outer loop reset the streak).
 2. **Burst skips** are large on nsieve, nsieve-bit-fp, fft and
    bit-reverse: those bursts end in the ordinary deopt where the adapter
    would have hopped. Widening `exit_side_ok` to bursts (P6-Q3 (b)) is
@@ -1973,6 +1973,100 @@ which is true for bit-reverse and not for the rest. What's left:
    silent region bridges are replaced by something that is neither a
    candidate nor promotable. Not diagnosed yet.
 4. G5 (own doc) and G6 (nsieve's unrolled `for k` exits).
+
+#### 4.8.4 G6 diagnosed: `.side` recordings unroll an enclosing loop that has a root (2026-09-27)
+
+**Item 1 above is G6.** nsieve, nsieve-bit and nsieve-bit-fp fail the
+same way. Each has one big trace (nsieve t6, 133 IR; nsieve-bit t5,
+381; nsieve-bit-fp t8, 442) anchored at the inner loop's `for_prep`
+(nsieve pc 18, "a prime was found"). It records the zero-trip inner
+loop, `count + 1`, then goes round the OUTER loop, one `p[i]` guard per
+composite, until the next prime brings it back to its own anchor, where
+it closes `.loop`. So it has one particular prime gap baked in, and
+every other gap leaves through one of its per-step exits. Those exits
+all resume at the anchor, which is full (`max_traces_per_anchor`), so
+they give up. Their ledgers end early (nsieve-bit: lengths 3, 7, 11,
+… — one 4-row cycle per iteration plus a 3-row tail), and every short
+ledger resets the silent-promotion streak (`considerSilentPromotion`
+needs `promote_after` = 4 full yielded ledgers in a row). So the
+candidates never promote.
+
+**Why it unrolls.** The trace is a `.side` recording (the old
+hotexit route: t5's exit 10, the zero-trip `for k` test, is refused
+for exit-side as `loop_done`, so it arms a replay-side recording at pc
+18). When a recording crosses a back-edge to another anchor,
+`onBackEdge` keeps going (bounded only by `maxrecord`). `recForLoop`'s
+link close — the `LJ_TRLINK_ROOT` analogue added in Phase 3 — is gated
+on `kind == .continuation`, which was Bart's Phase 3 choice ("every
+`.continuation` recording"); `.side` was not considered. The other two
+link sites already take `.side`: `recForPrepLink` (a `.side` recording
+links into an inner root) and `recWhileLink` ("a continuation/side
+recording"). LuaJIT's rule (`rec_loop_jit`) is: any trace with a parent
+that enters a compiled loop stops with `LJ_TRLINK_ROOT`; only a ROOT
+trace hitting a compiled inner loop aborts (`LINNER`). The outer root
+(nsieve t4 at pc 14) existed when t6 was recorded.
+
+**Experiment: widen the gate to `.side`.** One condition,
+`(kind == .continuation or kind == .side)` in `recForLoop`. Outputs
+identical on every bench in all three modes (tier-0, switch off,
+switch on). Best of 5, interleaved, clean HEAD build vs the experiment
+(all other rows, including `bench/stdlib`, within noise):
+
+| program | HEAD off | HEAD on | exp off | exp on |
+|---|---|---|---|---|
+| scimark-fft 500 | 215 | 224 | **512** | **131** |
+| nsieve 7 | 12.0 | 37.6 | 12.2 | 24.6 |
+| nsieve-bit 6 | 14.3 | 34.0 | 14.2 | 18.0 |
+| sieve_int | 6.4 | 22.6 | 6.2 | 10.7 |
+| nsieve-bit-fp 6 | 310 | 308 | 314 | 306 |
+
+- Switch on, fft: bit-reverse `:9` goes 6% → 99.6% traced; fft's
+  tier-0 share is 6.8% of the run. What's left is the seam (35%,
+  25k walks) — mostly G5's `while` loop-done.
+- Switch off, fft: bit-reverse `:9` goes 0.2% → 78% traced, but at
+  ~2300 cycles per iteration against tier-0's ~1075: the new `.side` →
+  root links make cycles whose ledgers all end at G5's `while`
+  loop-done, 540k walks, seam 43% of the run.
+- Tests: two fail, both shape pins. "doc 56 Phase 0: fft bit-reverse …
+  (today) barely runs traced" (the doc says the side-trace phase flips
+  it), and "doc 40 phases 2-4: the reset-to-int glue peels through the
+  side channel": the glue `.side` recording now closes `.link` into the
+  enclosing `for` root instead of peeling as a `.loop`
+  (`assertPeelCommitted` finds no peeled trace). Its output check
+  (`360` on every leg) is not what fails.
+
+The experiment is reverted; the tree is HEAD.
+
+**Decisions for Bart.**
+
+- **G6-Q1 — the `.side` link close.** (a) Widen `recForLoop`'s close
+  to `.side` recordings unconditionally (LuaJIT's rule); fft with the
+  switch off regresses 215 → 512 until G5 (or Phase 8); the doc 40
+  peel test is rewritten to pin the new shape. (b) Widen only when the
+  exit-side switch is on, so the switch-off path is unchanged and Phase
+  8 turns both on together. (c) G5 first, then re-measure (a) with the
+  switch off. (d) (review) Also add LuaJIT's `loopunroll` bound (15;
+  `rec_loop_interp`, `LJ_TRERR_LUNROLL`): a side or continuation
+  recording that crosses a back-edge it cannot link (no root there,
+  entry guards mismatch, peeled root) aborts after 15 crossings
+  instead of unrolling to `maxrecord`. It goes with (a), (b) or (c);
+  on its own it would not fix nsieve (t6 crossed a compiled loop,
+  ~10 times).
+- **G6-Q2 — the doc 40 glue peel.** With the link close taken, the
+  glue recording no longer peels in that program. (a) Rewrite the test
+  to pin the link (the peel stays reachable from `.continuation`
+  recordings that close `.loop`, and other shapes); (b) keep a program
+  that still peels (find one) and add a separate link test.
+
+**Review.** Antigravity, APPROVE WITH CHANGES: the widening is sound
+(provenance, sibling handoff, `linkKindAt` accounting, region election,
+the peel bypass; `recForPrepLink`/`recWhileLink` already take `.side`)
+and matches `rec_loop_jit`. Two majors: the switch-off regression is
+G5's (it recommends (c)), and there is no `loopunroll` bound (taken as
+option (d)). One minor (the peel test, in G6-Q2) and one nit (assert
+the anchor proto in `linkKindAt`, for the implementation). Its claim
+that (b) breaks determinism is not taken: the switch is a config input,
+the same on every leg. `docs/reviews/doc56/antigravity-g6.md`.
 
 ### 4.9 Tiering policy (Phase 7)
 

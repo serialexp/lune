@@ -1794,14 +1794,10 @@ nothing at all.
 ## Doc 56 Phase 5 findings (2026-09-27)
 
 - [ ] **nsieve with the switch ON is still 12 → 38 ms (doc 56 G6).**
-      R4 fixed the G4 turnstile (was 259 ms); Phase 6 took 43 → 38. What
-      is left (doc 56 §4.8.3 "What nsieve still pays"): full 32-row
-      ledgers ending at t3 exit 23 now become silent candidates but
-      almost never promote (see "candidates that never promote"), and
-      t6 — a pc 18 trace that unrolled the inner `for k` — whose
-      per-trip-count exits fill the pc 18 anchor with children, so exits
-      71 and 107 are refused ("anchor full"), give up, and end 13.5k
-      ledgers.
+      R4 fixed the G4 turnstile (was 259 ms); Phase 6 took 43 → 38.
+      Diagnosed (doc 56 §4.8.4): t6 is a `.side` trace at pc 18 that
+      unrolled the OUTER loop, not the inner `for k`. Waiting on Bart's
+      G6-Q1 (item above).
 - [ ] **Doc 56 G5: a `while` root's loop-done exit never links
       natively.** Numeric `for` has `loop_done_linked`; `while` has only
       the runtime `.while_done` chain (bit-reverse inner `while`: ~20k of
@@ -1823,11 +1819,18 @@ nothing at all.
       with the jit-debug build). nsieve-bit: 1.7k candidates, 1
       promotion. Diagnose with the Z-8 ladder. Doc 56 §4.8.3 "Phase 6
       landed" has the table.
-- [ ] **Silent candidates that never promote (switch on).** nsieve 4.2k
-      candidates / 3 promotions, nsieve-bit 1.7k / 1, nsieve-bit-fp
-      9.6k / 164. Z-8 layer 2: read the `silent rejects:` line and the
-      candidate streak (`promote_after`) — does the detected set change
-      between consecutive full ledgers?
+- [ ] **BART: G6-Q1 / G6-Q2 (doc 56 §4.8.4).** The nsieve family's
+      silent candidates never promote because a `.side` recording at the
+      inner loop's `for_prep` unrolls the OUTER loop (one guard per
+      composite) instead of linking to the outer root, like LuaJIT's
+      `rec_loop_jit` would; its per-step exits give up ("anchor full")
+      and their short ledgers reset the promotion streak. Widening
+      `recForLoop`'s link close to `.side` (one condition) measured:
+      switch on fft 224 → 131, nsieve 38 → 25, nsieve-bit 34 → 18,
+      sieve_int 23 → 11; switch off fft 215 → 512 (G5). Options: (a)
+      unconditional, (b) only with the switch, (c) G5 first, (d) also a
+      `loopunroll` = 15 bound. Antigravity: APPROVE WITH CHANGES,
+      recommends (c) + (d). Experiment reverted.
 - [ ] **Bart to decide: widen `exit_side_ok` to bursts (P6-Q3 (b))?**
       Phase 6's counter (`burst skips=` on the `exit-side arms:` stats
       line) counts burst ledgers that ended in the ordinary deopt where
