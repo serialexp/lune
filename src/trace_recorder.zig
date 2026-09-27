@@ -513,6 +513,9 @@ pub const RecordingSession = struct {
     pub const Options = struct {
         maxrecord: usize = 4096,
         peel: bool = true,
+        /// Doc 57 P3: `Config.instunroll` (extra source iterations a
+        /// pin-defeated close may record before aborting).
+        instunroll: u8 = 4,
         optimize: bool = true,
         /// Doc 45 D2: deterministic snapshot admission budgets for PRECISE
         /// recordings. Defaults are the contract values; tests inject smaller
@@ -574,6 +577,15 @@ pub const RecordingSession = struct {
     /// φ) and `defineSlotAbs` (rebound tracking); consumed by `finishPeel` +
     /// `commit`. Cleared (slice freed) by `reset`/`deinit`.
     peel: ?PeelState = null,
+    /// Doc 57 P3 (LuaJIT `instunroll`): extra source iterations this
+    /// recording has added to its loop body because a close found a
+    /// value-pinned carried slot holding another value. Bounded by
+    /// `options.instunroll`; becomes `TraceCode.instunrolled`.
+    unroll_used: u8 = 0,
+    /// Doc 57 P3: `instrs.len` at the latest unroll decision. A second close
+    /// call at the same arrival (`onBackEdge` then `maybeCloseAtAnchor`, the
+    /// doc 39 shared-arrival rule) sees the stream unchanged and is ignored.
+    unroll_mark_len: usize = 0,
     /// Doc 38 unroll-first policy: this ROOT recording followed at least one
     /// inner-while back-edge inline (unrolled it) instead of aborting LINNER.
     /// Read at abort (an unrolling root that dies bumps the outer anchor's
@@ -1150,13 +1162,19 @@ pub const RecordingSession = struct {
         // machinery, no loop-close fingerprint check. `finalize` appends the
         // `.terminal` and the full writeback rows.
         if (self.terminal_close != null) return true;
+        // Doc 57 P3: the second close call of the arrival that just decided
+        // to unroll (nothing was recorded in between).
+        if (self.unroll_used != 0 and self.link_target == null and
+            self.instrs.items.len == self.unroll_mark_len) return false;
         if (self.peel) |*p| {
             if (self.instrs.items.len == p.mark_len) return false; // same arrival
             if (!self.finishPeel(p)) {
                 self.abort(.type_instability);
                 return false;
             }
-        } else if (self.maybeEnterPeel(regs)) {
+        } else if (self.unroll_used == 0 and self.maybeEnterPeel(regs)) {
+            // (Never once unrolled: the peel's prefix would swallow the
+            // unrolled iterations, and each mode owns the back-edge.)
             return false; // peel entered (keep recording iteration 2) or aborted
         }
         // Doc 40 Phase 1: refuse a self-defeating `.loop` close (entry
@@ -1165,13 +1183,69 @@ pub const RecordingSession = struct {
         // precisely where the reset-to-int shape records (codex finding 1).
         // Peeled closes are legitimately entry≠steady by design; `.link`
         // closes carry no back-edge.
-        if (self.peel == null and self.link_target == null and
-            self.loopCloseSelfDefeating(regs))
-        {
-            self.abort(.type_instability);
-            return false;
+        if (self.peel == null and self.link_target == null) {
+            switch (self.loopCloseDefeat(regs)) {
+                .none => {},
+                // Doc 57 P3 (LuaJIT `lj_opt_loop` TYPEINS/GFAIL → keep
+                // recording): only value pins are contradicted, so another
+                // iteration may bring every carried value back to its pin.
+                .pins => {
+                    if (self.enterUnroll()) return false;
+                    self.abort(.type_instability);
+                    return false;
+                },
+                // An int/float contradiction: another iteration cannot fix it
+                // (a float stays a float); that is doc 39's peel territory.
+                .numeric => {
+                    self.abort(.type_instability);
+                    return false;
+                },
+            }
         }
         return true;
+    }
+
+    /// Doc 57 P3: keep recording one more source iteration as more loop body
+    /// instead of aborting a pin-defeated close. Returns false (the caller
+    /// aborts, as before P3) when the budget is spent or the recording has a
+    /// shape whose back-edge another mechanism owns.
+    fn enterUnroll(self: *RecordingSession) bool {
+        if (self.unroll_used >= self.options.instunroll) return false;
+        // Doc 45 D3 precedent (the peel is refused too): a precise recording
+        // keeps its one-iteration snapshot contract.
+        if (self.precise) return false;
+        if (self.inline_depth != 0) return false;
+        if (self.pending_link_close != null) return false;
+        // A numeric `for` arrives through its own `for_loop`, whose continue
+        // test `recForLoop` just stamped `.loop_done`. It now sits mid-trip:
+        // re-mark it so no loop-done classifier takes it (`isLoopTestCopy`).
+        // (A `while` copy is marked where it is emitted, in `recBranch`.)
+        if (self.cur_op == .for_loop) self.markForLoopTestCopy(self.cur_pc -| 1);
+        self.unroll_used += 1;
+        self.unroll_mark_len = self.instrs.items.len;
+        self.dbg("unroll: anchor pc={d} iteration={d} ir={d}", .{ self.anchor.pc, @as(u32, self.unroll_used) + 1, self.instrs.items.len });
+        return true;
+    }
+
+    /// Doc 57 P3: re-mark the anchor-frame `.loop_done` guard that the
+    /// `for_loop` at `for_pc` emitted on this arrival as a mid-trip copy.
+    /// Scans back from the stream end (the guard is among the last few
+    /// instructions) and stops at the first match.
+    fn markForLoopTestCopy(self: *RecordingSession, for_pc: u32) void {
+        var i = self.instrs.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.instrs.items[i].op != .guard_true) continue;
+            if (self.exit_prov.items[i]) |*prov| switch (prov.*) {
+                .guard => |*gp| {
+                    if (gp.role != .loop_done or gp.inline_depth != 0) continue;
+                    if (gp.source_proto_id != self.anchor.proto.id or gp.source_pc != for_pc) continue;
+                    gp.role = .loop_test_copy;
+                    return;
+                },
+                .link_terminal => {},
+            };
+        }
     }
     pub fn finalize(self: *RecordingSession) !@import("trace_candidate.zig").RecordingCandidate {
         if (!self.active) return error.InactiveRecording;
@@ -3288,7 +3362,25 @@ pub const RecordingSession = struct {
         // `jmp_if_false` jumps when the value is falsy, a `jmp_if_true` when truthy.
         // So the recorded path took the branch iff `(op == jmp_if_true) == truthy`.
         const jumped = (instr.op == .jmp_if_true) == truthy;
-        self.stampProv(gref, .branch_cond, .a, if (jumped) .taken else .fallthrough);
+        // Doc 57 P3: once an instability unroll started, this anchor's own
+        // `while` condition is recorded again mid-trip. That copy is an
+        // ordinary exit (tier-0 replays the trip), never the doc 38
+        // while-done that resumes after the loop.
+        const role: GuardRole = if (self.isOwnWhileTestCopy(instr, proto, pc)) .loop_test_copy else .branch_cond;
+        self.stampProv(gref, role, .a, if (jumped) .taken else .fallthrough);
+    }
+
+    /// Doc 57 P3: in an unrolled recording, is this branch (at post-increment
+    /// `pc`) the anchor loop's own `while` condition — a forward branch over
+    /// the body whose last instruction is the backward `jmp` to the anchor
+    /// (the same structure `TraceCode.whileLoopDonePostPc` classifies)?
+    fn isOwnWhileTestCopy(self: *const RecordingSession, instr: Instr, proto: *const Proto, pc: u32) bool {
+        if (self.unroll_used == 0 or self.inline_depth != 0 or proto != self.anchor.proto) return false;
+        const target_i: i64 = @as(i64, pc) + instr.aux;
+        if (target_i <= @as(i64, pc) or target_i >= @as(i64, @intCast(proto.code.len))) return false;
+        const target: u32 = @intCast(target_i);
+        const back = proto.code[target - 1];
+        return back.op == .jmp and @as(i64, target) + back.aux == @as(i64, self.anchor.pc);
     }
 
     /// `for_loop` (numeric-for back-edge): record the increment and the
@@ -5814,6 +5906,12 @@ pub const RecordingSession = struct {
         return true;
     }
 
+    /// Doc 57 P3: which kind of contradiction `loopCloseDefeat` found —
+    /// `.numeric` if any int/float one (never fixable by another iteration,
+    /// so it wins), else `.pins` if only value pins are contradicted (the
+    /// close may unroll), else `.none`.
+    const CloseDefeat = enum { none, pins, numeric };
+
     /// Doc 40 Phase 1 — commit preflight: would this `.loop` close be
     /// self-defeating? A trace whose entry fingerprint pins a carried slot to
     /// one numeric kind while its back-edge φ would store the other can never
@@ -5836,11 +5934,12 @@ pub const RecordingSession = struct {
     /// live anchor-return registers. Commit's φ-emission slot filter is
     /// mirrored too: a slot that gets no φ is never written at the back-edge,
     /// so its entry guard cannot be contradicted.
-    fn loopCloseSelfDefeating(self: *const RecordingSession, regs: RegWindow) bool {
+    fn loopCloseDefeat(self: *const RecordingSession, regs: RegWindow) CloseDefeat {
         // The live-value read below indexes the ANCHOR frame; at inline depth
         // the window belongs to a callee. Depth-0 covers every channel the
         // reset-to-int shape records through (glue side / continuation).
-        if (self.inline_depth != 0) return false;
+        if (self.inline_depth != 0) return .none;
+        var found: CloseDefeat = .none;
         const instrs = self.instrs.items;
         for (instrs, 0..) |ins, i| {
             switch (ins.op) {
@@ -5860,20 +5959,21 @@ pub const RecordingSession = struct {
             // the recorded path. (The IR `ty` is useless here: an unguarded
             // `slot_load` store — the fft `k = n` reset — is `.unknown`.)
             const v = regs.get(@intCast(slot));
-            const defeated = switch (ins.op) {
-                .guard_int => v.isFloat(),
-                .guard_float => v.isInt(),
+            switch (ins.op) {
+                .guard_int => if (v.isFloat()) return .numeric,
+                .guard_float => if (v.isInt()) return .numeric,
                 // Doc 57 §4.3 (LuaJIT GFAIL/TYPEINS): a value-specialized input
                 // must carry exactly its pin around the back-edge, or iteration
                 // 2 fails the pin every time — the flipped bool (`b = not b`).
                 // Whatever produced the carried value, only strict equality
-                // with the pin is stable. P3 will unroll instead of aborting.
-                .guard_is_nil, .guard_is_false, .guard_is_true => !trace_ir.primPinPasses(ins.op, v),
+                // with the pin is stable. P3 unrolls on this kind alone.
+                .guard_is_nil, .guard_is_false, .guard_is_true => if (!trace_ir.primPinPasses(ins.op, v)) {
+                    found = .pins;
+                },
                 else => unreachable,
-            };
-            if (defeated) return true;
+            }
         }
-        return false;
+        return found;
     }
 
     pub fn deinit(self: *RecordingSession, gpa: std.mem.Allocator) void {
@@ -5934,6 +6034,8 @@ pub const RecordingSession = struct {
         self.inline_depth = 0;
         if (self.peel) |p| gpa.free(p.slots);
         self.peel = null;
+        self.unroll_used = 0;
+        self.unroll_mark_len = 0;
         self.instrs.clearRetainingCapacity();
         self.consts.clearRetainingCapacity();
         self.entry_slots.clearRetainingCapacity();
@@ -6104,6 +6206,47 @@ test "doc 56 §4.2: a dead slot stays out of the snapshot; no liveness table mea
     _ = try rec.emit(.{ .op = .guard_int, .a = y });
     try testing.expectEqual(@as(usize, 0), rec.snap_builder.records.items.len);
     try testing.expectEqual(@as(u16, 1), rec.cur_ord);
+}
+
+test "doc 57 P3: enterUnroll spends its budget and refuses precise or inlined recordings" {
+    const testing = std.testing;
+    var s: RecordingSession = .{};
+    defer s.deinit(testing.allocator);
+    const proto = Proto{ .code = &.{}, .id = 1, .name = "unroll", .num_registers = 1 };
+    const key: AnchorKey = .{ .proto = &proto, .pc = 0 };
+
+    try s.reset(testing.allocator, key, 1);
+    s.options.instunroll = 2;
+    s.cur_op = .jmp; // a `while` arrival: nothing to re-mark
+    try testing.expect(s.enterUnroll());
+    try testing.expectEqual(@as(u8, 1), s.unroll_used);
+    _ = try s.emit(.{ .op = .konst }); // the next iteration records something
+    try testing.expect(s.enterUnroll());
+    try testing.expectEqual(s.instrs.items.len, s.unroll_mark_len);
+    try testing.expect(!s.enterUnroll()); // budget spent
+    try testing.expectEqual(@as(u8, 2), s.unroll_used);
+
+    // `reset` starts every recording with a fresh budget.
+    try s.reset(testing.allocator, key, 1);
+    try testing.expectEqual(@as(u8, 0), s.unroll_used);
+    try testing.expectEqual(@as(usize, 0), s.unroll_mark_len);
+
+    // Budget 0 = the pre-P3 abort.
+    s.options.instunroll = 0;
+    try testing.expect(!s.enterUnroll());
+
+    // A precise recording keeps its one-iteration snapshot contract.
+    try s.reset(testing.allocator, key, 1);
+    s.options.instunroll = 4;
+    s.precise = true;
+    try testing.expect(!s.enterUnroll());
+
+    // A close inside an inlined frame never unrolls.
+    try s.reset(testing.allocator, key, 1);
+    s.inline_depth = 1;
+    try testing.expect(!s.enterUnroll());
+    s.inline_depth = 0;
+    try testing.expect(s.enterUnroll());
 }
 
 test "session abort snapshot is consumed exactly once" {

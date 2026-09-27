@@ -110,33 +110,281 @@ test "doc 57: a flag that changes type between entries exits its pin" {
     , "200\t200\t-200\t-200\t200\n");
 }
 
-test "doc 57: a flipped carried bool is refused at close (shape B, until P3)" {
+/// Nothing committed carries a contradicted pin: every pinned slot's
+/// slot-bound φ, if its update is a konst, carries exactly the pin.
+fn expectPinsCarryTheirPin(vm: *Vm) !void {
+    for (vm.trace.registry.cache.items) |t| {
+        for (t.code.instrs) |ins| {
+            const pin = trace_ir.primPinValue(ins.op) orelse continue;
+            const src = t.code.instrs[ins.a];
+            if (src.op != .slot_load) continue;
+            for (t.code.instrs) |phi| {
+                if (phi.op != .phi or phi.aux != src.aux) continue;
+                const upd = t.code.instrs[phi.b];
+                if (upd.op != .konst) continue;
+                try testing.expect(t.code.consts[@intCast(upd.aux)].eql(pin));
+            }
+        }
+    }
+}
+
+fn countAborts(vm: *Vm, reason: anytype) usize {
+    var n: usize = 0;
+    for (vm.trace.abort_log.items) |r| {
+        if (r.reason == reason) n += 1;
+    }
+    return n;
+}
+
+/// The committed trace with the most extra iterations (doc 57 P3), or null.
+fn mostUnrolled(vm: *Vm) ?*const @import("trace.zig").Trace {
+    var best: ?*const @import("trace.zig").Trace = null;
+    for (vm.trace.registry.cache.items) |t| {
+        if (t.code.instunrolled == 0) continue;
+        if (best == null or t.code.instunrolled > best.?.code.instunrolled) best = t;
+    }
+    return best;
+}
+
+/// Doc 57 P3: how the copies of an unrolled trace's own loop test are
+/// classified. `looped` counts the guards the loop-done classifiers take,
+/// `copies` the mid-trip copies (`isLoopTestCopy`), `branch` the copies a
+/// source-branch consumer would take (must stay 0).
+const LoopTests = struct { looped: usize = 0, copies: usize = 0, branch: usize = 0 };
+
+fn loopTests(vm: *Vm, t: *const @import("trace.zig").Trace, src_op: @import("bytecode.zig").OpCode) LoopTests {
+    var out: LoopTests = .{};
+    const code = t.code.anchor.proto.code;
+    for (t.code.instrs, 0..) |ins, i| {
+        if (ins.op != .guard_true) continue;
+        const sp = trace_ir.guardSourcePc(ins) orelse continue;
+        if (sp >= code.len or code[sp].op != src_op) continue;
+        const done = t.code.isNumericForLoopDoneGuard(i) or t.code.whileLoopDonePostPc(i) != null;
+        if (done) out.looped += 1;
+        if (t.code.isLoopTestCopy(i)) {
+            out.copies += 1;
+            if (vm.trace.isSourceBranchGuardExit(t, @intCast(i), t.code.anchor.proto)) out.branch += 1;
+        }
+    }
+    return out;
+}
+
+test "doc 57 P3: a flipped carried bool unrolls into one two-iteration trace (shape B)" {
+    // Odd and even trip counts, both entry polarities: an odd count ends the
+    // loop at iteration 1's `for` test, which sits mid-trip and must resume
+    // by replaying the trip in tier-0 (not by the loop-done flush).
     const Inspect = struct {
         fn run(vm: *Vm, mode: TraceMode) !void {
             if (mode == .off) return;
-            // The pin on `b`'s entry value contradicts the value it carries
-            // around the back-edge, so the close aborts instead of committing
-            // a trace that exits every second iteration.
-            var unstable: usize = 0;
-            for (vm.trace.abort_log.items) |r| {
-                if (r.reason == .type_instability) unstable += 1;
-            }
-            try testing.expect(unstable >= 1);
-            // And nothing committed carries a contradicted pin: every pinned
-            // slot's slot-bound φ, if any, carries the same konst.
-            for (vm.trace.registry.cache.items) |t| {
-                for (t.code.instrs) |ins| {
-                    const pin = trace_ir.primPinValue(ins.op) orelse continue;
-                    const src = t.code.instrs[ins.a];
-                    if (src.op != .slot_load) continue;
-                    for (t.code.instrs) |phi| {
-                        if (phi.op != .phi or phi.aux != src.aux) continue;
-                        const upd = t.code.instrs[phi.b];
-                        if (upd.op != .konst) continue;
-                        try testing.expect(t.code.consts[@intCast(upd.aux)].eql(pin));
-                    }
-                }
-            }
+            try expectPinsCarryTheirPin(vm);
+            // The close no longer aborts: it records another iteration.
+            try testing.expectEqual(@as(usize, 0), countAborts(vm, .type_instability));
+            if (!executes(mode)) return;
+            const t = mostUnrolled(vm) orelse return error.TestExpectedUnrolledTrace;
+            try testing.expectEqual(@as(u8, 1), t.code.instunrolled);
+            // Two `for_loop` tests: the last is the loop-done, the first a
+            // mid-trip copy that no branch consumer takes either.
+            const lt = loopTests(vm, t, .for_loop);
+            try testing.expectEqual(LoopTests{ .looped = 1, .copies = 1, .branch = 0 }, lt);
+            try expectNativeHolds(vm, mode, &pin_ops);
+        }
+    };
+    try expectProgramTuned(
+        \\local function run(n, b)
+        \\  local m = 0
+        \\  for i = 1, n do b = not b; if b then m = m + 1 end end
+        \\  return m
+        \\end
+        \\print(run(300, false), run(301, false), run(301, true), run(7, false), run(40, true))
+    , "150\t151\t150\t4\t20\n", .{ .record_aborts = true, .inspect = Inspect.run });
+}
+
+test "doc 57 P3: an unrolled while keeps only its first condition as the while-done" {
+    // Iteration 2's condition sits mid-trip. Classified as the doc 38
+    // while-done it would resume after the loop with the trip-start
+    // registers and lose iteration 1 (odd counts end there).
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (!executes(mode)) return;
+            const t = mostUnrolled(vm) orelse return error.TestExpectedUnrolledTrace;
+            try testing.expectEqual(@as(u8, 1), t.code.instunrolled);
+            const lt = loopTests(vm, t, .jmp_if_false);
+            try testing.expectEqual(LoopTests{ .looped = 1, .copies = 1, .branch = 0 }, lt);
+            try expectNativeHolds(vm, mode, &pin_ops);
+        }
+    };
+    try expectProgramTuned(
+        \\local function run(n, b)
+        \\  local m, i = 0, 0
+        \\  while i < n do i = i + 1; b = not b; if b then m = m + 1 end end
+        \\  return m
+        \\end
+        \\print(run(300, false), run(301, false), run(301, true), run(7, false), run(40, true))
+    , "150\t151\t150\t4\t20\n", .{ .inspect = Inspect.run });
+}
+
+test "doc 57 P3: a nested unrolled while whose loop ends mid-trip chains correctly" {
+    // The inner while's trip count varies (5..8) and code follows it, so its
+    // loop-done exits CHAIN to a continuation at the post-loop pc. Mutation
+    // (checked): with iteration 2's condition classified as the doc 38
+    // while-done, that chain resumes after the loop with the trip-start
+    // registers and prints 15023 / 14951 instead of 15600.
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (!executes(mode)) return;
+            try testing.expect(mostUnrolled(vm) != null);
+        }
+    };
+    try expectProgramTuned(
+        \\local b = false
+        \\local total = 0
+        \\for j = 1, 400 do
+        \\  local m, i = 0, 0
+        \\  local n = 5 + (j % 4)
+        \\  while i < n do i = i + 1; b = not b; if b then m = m + 1 end end
+        \\  total = total + m * 10 + i
+        \\end
+        \\print(total)
+    , "15600\n", .{ .hotloop = 56, .inspect = Inspect.run });
+}
+
+test "doc 57 P3: a nested unrolled for whose loop ends mid-trip chains correctly" {
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (!executes(mode)) return;
+            try testing.expect(mostUnrolled(vm) != null);
+        }
+    };
+    try expectProgramTuned(
+        \\local b = false
+        \\local total = 0
+        \\for j = 1, 400 do
+        \\  local m, k = 0, 0
+        \\  local n = 5 + (j % 4)
+        \\  for i = 1, n do k = i; b = not b; if b then m = m + 1 end end
+        \\  total = total + m * 10 + k
+        \\end
+        \\print(total)
+    , "15600\n", .{ .hotloop = 56, .inspect = Inspect.run });
+}
+
+test "doc 57 P3: a period-3 nil/false/true cycle unrolls twice" {
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode == .off) return;
+            try testing.expectEqual(@as(usize, 0), countAborts(vm, .type_instability));
+            if (!executes(mode)) return;
+            const t = mostUnrolled(vm) orelse return error.TestExpectedUnrolledTrace;
+            try testing.expectEqual(@as(u8, 2), t.code.instunrolled);
+            const lt = loopTests(vm, t, .for_loop);
+            try testing.expectEqual(LoopTests{ .looped = 1, .copies = 2, .branch = 0 }, lt);
+        }
+    };
+    try expectProgramTuned(
+        \\local s = nil
+        \\local c = 0
+        \\for i = 1, 300 do
+        \\  if s == nil then s = false elseif s == false then s = true else s = nil end
+        \\  if s then c = c + 1 end
+        \\end
+        \\print(c)
+    , "100\n", .{ .record_aborts = true, .inspect = Inspect.run });
+}
+
+test "doc 57 P3: two flags flipping together unroll once" {
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode == .off) return;
+            try testing.expectEqual(@as(usize, 0), countAborts(vm, .type_instability));
+            try expectPinsCarryTheirPin(vm);
+            if (!executes(mode)) return;
+            const t = mostUnrolled(vm) orelse return error.TestExpectedUnrolledTrace;
+            try testing.expectEqual(@as(u8, 1), t.code.instunrolled);
+            try expectNativeHolds(vm, mode, &pin_ops);
+        }
+    };
+    try expectProgramTuned(
+        \\local b1, b2 = false, true
+        \\local m = 0
+        \\for i = 1, 301 do
+        \\  b1 = not b1; b2 = not b2
+        \\  if b1 then m = m + 1 end
+        \\  if b2 then m = m + 10 end
+        \\end
+        \\print(m)
+    , "1651\n", .{ .record_aborts = true, .inspect = Inspect.run });
+}
+
+test "doc 57 P3: periods 2 and 3 together (cycle 6) exceed the default budget" {
+    // Settling needs 5 extra iterations; `instunroll` = 4 gives up.
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode == .off) return;
+            try testing.expect(countAborts(vm, .type_instability) >= 1);
+            try testing.expect(mostUnrolled(vm) == null);
+            try expectPinsCarryTheirPin(vm);
+        }
+    };
+    try expectProgramTuned(
+        \\local b, s = false, nil
+        \\local c = 0
+        \\for i = 1, 300 do
+        \\  b = not b
+        \\  if s == nil then s = false elseif s == false then s = true else s = nil end
+        \\  if b then c = c + 1 end
+        \\  if s then c = c + 100 end
+        \\end
+        \\print(c)
+    , "10150\n", .{ .record_aborts = true, .inspect = Inspect.run });
+}
+
+test "doc 57 P3: an unrolled while with a compound condition" {
+    // `i < n and flag`: the short-circuit branch targets the end of the
+    // condition, not the loop exit, so only the final test is the loop's own.
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (!executes(mode)) return;
+            try testing.expect(mostUnrolled(vm) != null);
+        }
+    };
+    try expectProgramTuned(
+        \\local function run(n, b, flag)
+        \\  local m, i = 0, 0
+        \\  while i < n and flag do i = i + 1; b = not b; if b then m = m + 1 end end
+        \\  return m
+        \\end
+        \\print(run(300, false, true), run(301, false, true), run(7, true, true), run(5, false, false))
+    , "150\t151\t3\t0\n", .{ .inspect = Inspect.run });
+}
+
+test "doc 57 P3: a cycle longer than the budget aborts as before" {
+    // Budget 1: the period-3 cycle needs 2 extra iterations.
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode == .off) return;
+            try testing.expect(countAborts(vm, .type_instability) >= 1);
+            try testing.expect(mostUnrolled(vm) == null);
+            try expectPinsCarryTheirPin(vm);
+        }
+    };
+    try expectProgramTuned(
+        \\local s = nil
+        \\local c = 0
+        \\for i = 1, 300 do
+        \\  if s == nil then s = false elseif s == false then s = true else s = nil end
+        \\  if s then c = c + 1 end
+        \\end
+        \\print(c)
+    , "100\n", .{ .record_aborts = true, .instunroll = 1, .inspect = Inspect.run });
+}
+
+test "doc 57 P3: budget 0 is the pre-P3 abort (shape B)" {
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode == .off) return;
+            try testing.expect(countAborts(vm, .type_instability) >= 1);
+            try testing.expect(mostUnrolled(vm) == null);
+            try expectPinsCarryTheirPin(vm);
         }
     };
     try expectProgramTuned(
@@ -144,7 +392,89 @@ test "doc 57: a flipped carried bool is refused at close (shape B, until P3)" {
         \\local m = 0
         \\for i = 1, 300 do b = not b; if b then m = m + 1 end end
         \\print(m)
-    , "150\n", .{ .record_aborts = true, .inspect = Inspect.run });
+    , "150\n", .{ .record_aborts = true, .instunroll = 0, .inspect = Inspect.run });
+}
+
+test "doc 57 P3: a pin defeat next to an int/float defeat does not unroll" {
+    // `x` enters int and carries float on alternate iterations: another
+    // iteration cannot settle an int/float contradiction (Bart: unroll on
+    // pin defeats only), so the close aborts without unrolling.
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode == .off) return;
+            try testing.expect(countAborts(vm, .type_instability) >= 1);
+            try testing.expect(mostUnrolled(vm) == null);
+        }
+    };
+    try expectProgramTuned(
+        \\local b = false
+        \\local x, y = 1, 0
+        \\for i = 1, 300 do
+        \\  y = y + x
+        \\  b = not b
+        \\  if b then x = 1 else x = 1.5 end
+        \\end
+        \\print(y)
+    , "374.5\n", .{ .record_aborts = true, .inspect = Inspect.run });
+}
+
+test "doc 57 P3: iteration 2 reads a field iteration 1 stored, and exits after it" {
+    // `acc.v` is read-modify-written in both iterations (one sunk store per
+    // iteration, forwarded to iteration 2's read). `u[i]` turns float once,
+    // failing a guard in whichever iteration reads it: tier-0 replays the
+    // trip from its start, so neither sunk store may have landed.
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (!executes(mode)) return;
+            const t = mostUnrolled(vm) orelse return error.TestExpectedUnrolledTrace;
+            try testing.expectEqual(@as(u8, 1), t.code.instunrolled);
+        }
+    };
+    try expectProgramTuned(
+        \\local u = {}
+        \\for i = 1, 400 do u[i] = 1 end
+        \\u[333] = 1.5
+        \\local acc = { v = 0 }
+        \\local b = false
+        \\for i = 1, 400 do
+        \\  b = not b
+        \\  if b then acc.v = acc.v + u[i] else acc.v = acc.v + 2 * u[i] end
+        \\end
+        \\print(acc.v)
+    , "600.5\n", .{ .inspect = Inspect.run });
+}
+
+test "doc 57 P3: array stores in both iterations stay correct" {
+    // Iteration 2 reads `t[i - 1]` that iteration 1 stored. Today the
+    // recorder cannot prove the keys equal (the `for` step is a register
+    // load, not a konst) and aborts `store_fwd_ambiguity`; whatever it does,
+    // every tier must agree.
+    try expectProgram(
+        \\local t, u = {}, {}
+        \\for i = 1, 400 do t[i] = 0; u[i] = 1 end
+        \\u[333] = 1.5
+        \\local b = false
+        \\for i = 2, 400 do
+        \\  b = not b
+        \\  if b then t[i] = t[i - 1] + u[i] else t[i] = t[i - 1] + 2 * u[i] end
+        \\end
+        \\print(t[400], t[200])
+    , "599\t298\n");
+}
+
+test "doc 57 P3: a flipping loop inside a function called from a traced loop" {
+    // The callee's loop gets its own (unrolled) root; the caller's recording
+    // meets it inlined, where no unroll decision is ever taken.
+    try expectProgram(
+        \\local function f(n, b)
+        \\  local m = 0
+        \\  for i = 1, n do b = not b; if b then m = m + 1 end end
+        \\  return m
+        \\end
+        \\local s = 0
+        \\for j = 1, 200 do s = s + f(3, j % 2 == 0) end
+        \\print(s)
+    , "300\n");
 }
 
 test "doc 57: a carried bool from a compare keeps a real per-iteration pin" {

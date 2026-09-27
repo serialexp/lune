@@ -2877,8 +2877,11 @@ pub fn driveBurstCore(
             // at the outer header — which would misclassify a *completed*
             // inner loop as a mid-loop side-exit and resume tier-0 back at the
             // inner header, re-running the whole (idempotent) marking loop.
+            // Doc 57 P3: a mid-trip loop-test copy (instability unroll) is an
+            // ordinary exit, never a completed loop.
             const numeric_done = inner_exit_pc >= 1 and
-                proto.code[guardSourcePc(inner_guard).?].op == .for_loop;
+                proto.code[guardSourcePc(inner_guard).?].op == .for_loop and
+                !inner.code.isLoopTestCopy(iresult.exit_instr);
             // Doc 38: the while twin. The post-loop pc for a while-done is the
             // condition branch's jump target — NOT `inner_exit_pc`, which is
             // the loop-body start (inside the loop).

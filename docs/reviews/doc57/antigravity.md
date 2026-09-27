@@ -111,3 +111,25 @@ Findings (all checked in source and accepted):
    budget-exhaustion cycle, a mixed pin + int/float defeat, source-branch
    exclusion of a `while` copy, cross-iteration store forwarding, an inlined
    loop never unrolling.
+
+## r5 — P3 implementation review (uncommitted diff, 2026-09-27)
+
+Verdict: **APPROVE WITH CHANGES** — no BLOCKER or MAJOR. Confirmed:
+`markForLoopTestCopy` cannot hit an inner or earlier-iteration test
+(depth, source pc, and earlier copies no longer carry `.loop_done`) and
+always finds the one `recForLoop` just emitted; `isOwnWhileTestCopy`
+matches `whileLoopDonePostPc`'s structure; every loop-done / source-branch
+consumer consults `isLoopTestCopy`; peel and unroll are mutually exclusive;
+nothing commits while a pin is contradicted.
+
+Findings:
+
+1. **MINOR — make `isOwnWhileTestCopy` require `jmp_if_false`**, mirroring
+   `whileLoopDonePostPc`. **Declined:** marking is the safe direction. An
+   extra copy is only an ordinary exit, while an unmarked `jmp_if_true`
+   copy of the loop's own test would pass `isSourceBranchGuardExit` as a
+   source branch. The compiler never emits `jmp_if_true` for a `while`
+   today, so neither choice changes behaviour.
+2. **MINOR — tests**: two flags flipping together, coprime periods (2 and
+   3 → cycle 6, over the budget), a compound `while` condition. **Taken**
+   (three new tests).

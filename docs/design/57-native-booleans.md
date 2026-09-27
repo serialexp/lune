@@ -1,8 +1,10 @@
 # 57 — Native booleans (value-specialized `nil`/`true`/`false` inputs)
 
-**Status:** design rev 4 (Bart picked Option B, LuaJIT's model); reviewed
-twice (Antigravity: r1 CHANGES REQUESTED, r2 APPROVE WITH CHANGES), all
-findings folded in — not implemented
+**Status:** implemented — P1, P2, P4 and P3 (instability unroll) landed.
+Design rev 4 (Bart picked Option B, LuaJIT's model); reviews: Antigravity r1
+CHANGES REQUESTED, r2 APPROVE WITH CHANGES (design), r3 no soundness bugs
+(P2 code), r4 APPROVE WITH CHANGES (P3 design); all findings folded in.
+Follow-ups are in `TODO.md` ("Doc 57 P3 follow-ups").
 **Owner:** claude
 **Last updated:** 2026-09-27
 
@@ -81,10 +83,51 @@ findings folded in — not implemented
   - Shape C (a compare-result branch that flips for good) is the doc 56
     Phase 6 case already in TODO.md, not a bool gap.
 
+- [x] P3 — instability unroll (2026-09-27, §4.7). As built:
+  - `Config.instunroll = 4` → `RecordingSession.options.instunroll`;
+    `unroll_used`/`unroll_mark_len` on the session, `TraceCode.instunrolled`
+    on the trace.
+  - `close()`: `loopCloseSelfDefeating` became `loopCloseDefeat` →
+    `none`/`pins`/`numeric`. `pins` calls `enterUnroll` (budget, not
+    precise, depth 0, no pending doc 47 link peel); refusal aborts
+    `type_instability` as before. A peel is never entered once unrolled.
+    Same-arrival rule on `unroll_mark_len`, refreshed per decision.
+  - `GuardRole.loop_test_copy`: `markForLoopTestCopy` re-marks the
+    `for_loop` test at the decision; `recBranch` marks a later `while`
+    condition (`isOwnWhileTestCopy`). `TraceCode.isLoopTestCopy` (fail-closed
+    on missing provenance) is consulted by `isNumericForLoopDoneGuard`,
+    `isLoopDoneGuardIndex`, `flushNumericForLoopDone`, `whileLoopDonePostPc`,
+    `isSourceBranchGuardExit`, `driveChain`'s `numeric_done`,
+    `maybeArmContinuation`, `computeNativeLoopDoneLink`; the doc 56 attach
+    classifier refuses it (`Verdict.loop_test_copy`).
+  - Coverage counts source iterations (`TraceCode.sourceIters`);
+    `--jit-stats` line `instability unroll:`; probe `unroll:`.
+  - Tests (`interp_bool_test.zig`, 14 P3 tests + one recorder unit test):
+    shape B odd/even/both polarities, unrolled `while`, period-3 cycle,
+    budget 1 and 0, two flags flipping together, periods 2 and 3 (cycle 6,
+    over budget), a compound `while` condition (review r5),
+    mixed pin + int/float defeat, a field RMW in both
+    iterations with an exit after it, array stores in both iterations
+    (parity; aborts `store_fwd_ambiguity`, see `TODO.md`), a flipping loop
+    in a called function, nested `while` and `for` whose loops end mid-trip
+    and chain. Mutation-checked: dropping the `while` mark gives WRONG
+    answers (15023 / 14951 for 15600 — the while-done chain resumes after
+    the loop with trip-start registers) and fails the nested test; dropping
+    the `for` mark fails the shape tests (answers stay right: the loop-done
+    flush already refuses when more body follows); dropping the
+    same-arrival rule fails 4 tests.
+  - Measured (ReleaseFast): shape B 20M turns 0.39 s → 0.007 s; 200M turns
+    67 ms vs LuaJIT 38 ms. Board `bench/results/20260927-110653-128a6b2.tsv`
+    (built from the P3 tree; the rev is HEAD at the time) vs
+    `20260927-094715-4d3595c.tsv`: every row within ±5% except nsieve −6%
+    and sieve_int −8% (both ~6–12 ms rows); no bench commits an unrolled
+    trace (`instability unroll: traces=0` on all 28), so the moves are noise.
+  - Review r5 (Antigravity, code): APPROVE WITH CHANGES; tests taken, the
+    `jmp_if_false` narrowing declined (receipt).
+
 ### Outstanding
 
-- [ ] P3 — instability unroll (LuaJIT `instunroll`) for the flipped carried
-  bool. Own investigation first (§4.7).
+- (none in this doc; follow-ups in `TODO.md`)
 
 ## Why this exists
 

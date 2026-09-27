@@ -416,6 +416,11 @@ pub const TraceCode = struct {
     /// The first completed back-edge accounts for TWO guest iterations. A
     /// zero-progress exit must leave carried boxes at the original entry state.
     peeled: bool = false,
+    /// Doc 57 P3: extra source iterations an instability unroll added to the
+    /// loop body (0 = one iteration per trip). Each copy of the loop's own
+    /// test left mid-trip carries `GuardRole.loop_test_copy`
+    /// (`isLoopTestCopy`).
+    instunrolled: u8 = 0,
     /// Owned SSA instruction array. Frozen after publication.
     instrs: []IrInstr,
     /// Owned constants, including heap values rooted by the runtime while live.
@@ -515,6 +520,30 @@ pub const TraceCode = struct {
         return null;
     }
 
+    /// Doc 57 P3: is guard `idx` a copy of the loop's own test that an
+    /// instability unroll left mid-trip (`GuardRole.loop_test_copy`)? Such a
+    /// guard is an ordinary coarse exit: every loop-done classifier and every
+    /// source-branch consumer must refuse it. Fail-closed: in an unrolled
+    /// trace a guard with no provenance counts as a copy, because treating a
+    /// real loop-done as ordinary only costs a tier-0 replay, while the
+    /// reverse loses an iteration.
+    pub fn isLoopTestCopy(self: *const TraceCode, idx: usize) bool {
+        if (self.instunrolled == 0) return false;
+        if (idx >= self.instrs.len) return true;
+        const prov = self.provAt(@intCast(idx)) orelse return true;
+        return switch (prov) {
+            .guard => |gp| gp.role == .loop_test_copy,
+            .link_terminal => false,
+        };
+    }
+
+    /// Doc 57 P3: source (tier-0 back-edge) iterations covered by `trips`
+    /// completed trips. For coverage accounting only — `completed` itself
+    /// stays a trip count everywhere else.
+    pub fn sourceIters(self: *const TraceCode, trips: usize) u64 {
+        return @as(u64, trips) *| (@as(u64, self.instunrolled) + 1);
+    }
+
     pub fn matchesFingerprint(self: *const TraceCode, regs: RegWindow) bool {
         for (self.entry_guards) |g| {
             if (!g.ty.accepts(regs.get(g.slot))) return false;
@@ -603,6 +632,8 @@ pub const TraceCode = struct {
         const exit_pc = trace_ir.guardExitPc(guard) orelse return false;
         if (exit_pc == 0 or exit_pc > self.anchor.proto.code.len) return false;
         if (self.anchor.proto.code[trace_ir.guardSourcePc(guard).?].op != .for_loop) return false;
+        // Doc 57 P3: a non-final iteration's `for_loop` test sits mid-trip.
+        if (self.isLoopTestCopy(instr_idx)) return false;
         if (self.provAt(@intCast(instr_idx))) |prov| switch (prov) {
             .guard => |gp| if (gp.inline_depth > 0) return false,
             .link_terminal => return false,
@@ -640,6 +671,10 @@ pub const TraceCode = struct {
             .guard => |gp| if (gp.inline_depth > 0) return null,
             .link_terminal => return null,
         };
+        // Doc 57 P3: a later iteration's condition sits mid-trip; resuming
+        // after the loop with the trip-start registers would lose the
+        // iterations before it.
+        if (self.isLoopTestCopy(idx)) return null;
         return post;
     }
 

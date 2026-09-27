@@ -86,6 +86,10 @@ pub const Verdict = enum(u8) {
     no_back_edge,
     /// Rule 9: `P` consumes a multret producer's `reg_top`.
     multret_consumer,
+    /// Doc 57 P3: a copy of the loop's own test left mid-trip by an
+    /// instability unroll (`GuardRole.loop_test_copy`). Tier-0 replays the
+    /// trip; no child is built for it.
+    loop_test_copy,
 };
 
 /// How an IR op behaves when its bytecode is re-executed from the
@@ -337,6 +341,8 @@ pub fn resumeOf(code: *const TraceCode, idx: usize) Resolved {
     };
     const proto = code.anchor.proto;
     if (gp.inline_depth != 0 or gp.source_proto_id != proto.id) return .{ .refused = .inlined };
+    // Doc 57 P3: checked before the loop-done shapes, which refuse a copy.
+    if (gp.role == .loop_test_copy) return .{ .refused = .loop_test_copy };
     // A while root's own condition guard is a loop-done too (doc 38 owns
     // it through the `.while_done` chain); an unrolled INNER while's
     // wrong-trip-count guard is not — its back-edge targets the inner

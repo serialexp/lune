@@ -204,6 +204,8 @@ pub fn isLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
         .guard => |gp| if (gp.inline_depth > 0) return false,
         .link_terminal => return false, // a link terminal is never a loop-done guard
     };
+    // Doc 57 P3: a non-final iteration's `for_loop` test sits mid-trip.
+    if (t.code.isLoopTestCopy(idx)) return false;
     return true;
 }
 
@@ -520,6 +522,12 @@ pub const TraceConfig = struct {
     /// roots (numeric φ widening). Off = every close is a first-return close
     /// (pre-doc-39 behaviour); tests and A/B isolation flip it.
     peel: bool = true,
+    /// Doc 57 P3 (LuaJIT `instunroll`, `lj_jit.h` default 4): how many extra
+    /// source iterations one recording may add to its loop body when the
+    /// close finds a value-pinned carried slot (nil/false/true) holding
+    /// another value — the flipped boolean. 0 = abort `type_instability`
+    /// at the first such close (pre-P3 behaviour).
+    instunroll: u8 = 4,
     /// Back-edge count at which a loop header becomes a trace anchor.
     hotloop: u32 = 56,
     /// Doc 44: call count at which a Lua function head becomes a trace anchor.
@@ -3453,7 +3461,7 @@ pub const TraceState = struct {
     /// frame; recording proper begins at the next dispatch-loop iteration (which
     /// is the anchor instruction). On OOM we simply don't arm.
     fn configureRecording(self: *TraceState) void {
-        self.rec.options = .{ .maxrecord = self.config.maxrecord, .peel = self.config.peel, .optimize = self.config.optimize, .snapshot_budget = self.config.snapshot_budget };
+        self.rec.options = .{ .maxrecord = self.config.maxrecord, .peel = self.config.peel, .instunroll = self.config.instunroll, .optimize = self.config.optimize, .snapshot_budget = self.config.snapshot_budget };
     }
     pub fn recordInstr(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, resolved: Value) void {
         self.configureRecording();
@@ -4194,6 +4202,18 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
     try w.print("    native link exits:    {d} (follows={d})\n", .{ ts.native_link_exits, ts.native_link_follow_count });
     try w.print("    ir link exits:        {d} (follows={d})\n", .{ ts.link_ir_exits, ts.link_follow_count });
     try w.print("    prime-side:           arms={d} chain-follows={d} tier0-body-entries={d}\n", .{ ts.prime_side_arms, ts.prime_side_chain_follows, ts.tier0_outer_body_entries });
+    {
+        // Doc 57 P3: live traces whose loop body is several source
+        // iterations (instability unroll), and the extra iterations total.
+        var n_unrolled: usize = 0;
+        var n_extra: usize = 0;
+        for (ts.registry.cache.items) |t| {
+            if (t.code.instunrolled == 0) continue;
+            n_unrolled += 1;
+            n_extra += t.code.instunrolled;
+        }
+        try w.print("    instability unroll:   traces={d} extra iterations={d}\n", .{ n_unrolled, n_extra });
+    }
     {
         // Doc 56 §4.2: exit-snapshot memory over the live traces, next to the
         // IR it describes (LuaJIT's snapshots cost about the IR's size; ours

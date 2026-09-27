@@ -504,7 +504,26 @@ the ones that bite):
   - **P3 design DONE** (doc 57 §4.7, reviewed: Antigravity r4 APPROVE
     WITH CHANGES, all folded in). Bart: new `GuardRole.loop_test_copy`,
     unroll on pin defeats only, `Config.instunroll = 4` (no CLI flag).
-    NEXT: implement per §4.7.3 + tests §4.7.5. Background (LuaJIT)
+  - **P3 DONE (2026-09-27)** — as-built in doc 57 "Done" (P3 entry). Doc 57
+    is complete. Gates: `just test` 0; `-Djit-debug=true` 0 with an empty
+    log. Review r5 (code): APPROVE WITH CHANGES, 3 tests taken, one
+    narrowing declined (receipt). Shape B 20M turns 0.39 s → 0.007 s
+    (200M: 67 ms vs LuaJIT 38 ms). Board
+    `bench/results/20260927-110653-128a6b2.tsv`: noise; no bench unrolls.
+    Mutation proof: without the `while` copy mark a nested while gives
+    WRONG answers (15023 for 15600).
+    Follow-ups in TODO.md "Doc 57 P3 follow-ups": constant `for` step
+    (LuaJIT `find_kinit`, general store-forwarding gap), P3-D4 pin fold,
+    trace file/viz `instunrolled`.
+    Rule notes for Bart: (1) a no-op `cat > /dev/null <<EOF` heredoc slipped
+    into one command (wrote nothing; Rule #6 spirit); (2) the A/B baseline
+    used the justfile's documented `git show HEAD:<f> > /tmp/lune-p3base/<f>`
+    restore in the shadow copy (outside the repo).
+  - NEXT (from the list above): (b) doc 56 Phase 6 plan (silent promotion
+    of exit-side edges) → Antigravity review → build; (c) Phase 7, then
+    flip the doc 56 switch. Candidate side arc: the constant-step
+    `find_kinit` gap (general; see TODO.md).
+  - Background (LuaJIT)
     reference read: `lj_opt_loop.c` ~l.340 raises `TYPEINS` when a
     loop-carried ref's type differs from its SLOAD's; `lj_opt_loop()`
     catches TYPEINS/GFAIL, `loop_undo`s and CONTINUES RECORDING (≤

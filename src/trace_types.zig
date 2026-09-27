@@ -74,6 +74,12 @@ pub const GuardRole = enum(u8) {
     callee_pure, // pure-builtin identity (guard_builtin)
     border, // `#t` fast-case border computable (alen's own producer-exit)
     alias_disambig, // store-forwarding key/table alias disambiguation (ne guard)
+    /// Doc 57 P3: a copy of the trace's OWN loop test that an instability
+    /// unroll left in the middle of the trip — a non-final iteration's
+    /// numeric `for_loop` continue test, or a later iteration's `while`
+    /// condition. It is an ordinary coarse exit: no loop-done classifier,
+    /// no branch consumer, no exit attach (`TraceCode.isLoopTestCopy`).
+    loop_test_copy,
 };
 
 /// Static register designator for the guarded operand (H-1c). Covers `a`/`b`/`c`,

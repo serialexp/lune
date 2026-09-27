@@ -27,6 +27,7 @@ const Scratch = struct {
     rec_path_ok: bool = true,
     anchor: types.AnchorKey = undefined,
     unrolled_while: bool = false,
+    unroll_used: u8 = 0,
     side_src: ?types.ExitKey = .{ .trace_id = 12, .exit_instr = 2 },
     // Doc 45 D2: finalize reads the precise flag and, when set, hands the
     // builder's snapshot arrays to the code. The fixture stays entry-replay.

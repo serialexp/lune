@@ -98,11 +98,13 @@ pub fn hasNativeLoopDoneLink(self: *const TraceState, failed: *Trace, proto: *co
 }
 
 pub fn computeNativeLoopDoneLink(self: *const TraceState, failed: *const Trace, proto: *const Proto) bool {
-    for (failed.code.instrs) |ins| {
+    for (failed.code.instrs, 0..) |ins, ii| {
         if (ins.op != .guard_true) continue;
         const exit_pc = guardExitPc(ins) orelse continue;
         if (exit_pc == 0 or exit_pc == failed.code.anchor.pc or exit_pc > proto.code.len) continue;
         if (proto.code[guardSourcePc(ins).?].op != .for_loop) continue;
+        // Doc 57 P3: a mid-trip loop-test copy never links as a loop-done.
+        if (failed.code.isLoopTestCopy(ii)) continue;
 
         var visited: [8]*Trace = undefined;
         var nvisited: usize = 0;
@@ -152,6 +154,10 @@ pub fn maybeArmContinuation(self: *TraceState, failed: *const Trace, exit_instr:
     const exit_pc = guardExitPc(ins) orelse return;
     if (exit_pc == 0 or exit_pc == failed.code.anchor.pc) return;
     if (exit_pc >= proto.code.len) return;
+    // Doc 57 P3: a loop-test copy left mid-trip by an instability unroll is
+    // not "the loop ran to completion" — tier-0 replays the trip from the
+    // anchor, so no continuation is owed here.
+    if (failed.code.isLoopTestCopy(exit_instr)) return;
     // Doc 38: two loop-done shapes seed a continuation. A numeric-for's
     // continuation anchors at the guard's exit PC (the `for_loop`
     // fall-through). A while loop's anchors at the condition branch's JUMP
@@ -698,6 +704,10 @@ pub fn isSourceBranchGuardExit(self: *const TraceState, failed: *const Trace, ex
     const exit_pc = guardExitPc(ins) orelse return false;
     if (exit_pc == 0 or exit_pc == failed.code.anchor.pc) return false;
     if (exit_pc <= proto.code.len and proto.code[guardSourcePc(ins).?].op == .for_loop) return false;
+    // Doc 57 P3: a `while` condition copy left mid-trip by an instability
+    // unroll is the loop's own test, not a source branch (no prime-side
+    // want, no sibling handoff — both funnel through here).
+    if (failed.code.isLoopTestCopy(exit_instr)) return false;
     return true;
 }
 

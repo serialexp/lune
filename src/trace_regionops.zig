@@ -214,7 +214,7 @@ pub fn accountLedgerRowsBulk(
         @panic("driveSilentBurst: bulk selection row was not region-consumed");
     accountCandidateCharge(t, .entered);
     if (self.config.coverage) {
-        if (completed > 0) self.noteTraceIters(t.code.anchor, completed);
+        if (completed > 0) self.noteTraceIters(t.code.anchor, t.code.sourceIters(completed));
         // Iteration totals remain exact. Per-trace TSC attribution cannot be:
         // the promoted set executed as one uninterrupted native span, so
         // there is no per-member timestamp boundary to reconstruct here.
@@ -1531,7 +1531,7 @@ pub inline fn accountTraceRun(self: *TraceState, t: *Trace, completed: usize) vo
     // never the outer entry anchor. Both are disjoint from the interpreted
     // back-edge accounting in the dispatcher (Rule #3: self-consistent).
     if (self.config.coverage) {
-        if (completed > 0) self.noteTraceIters(key, completed);
+        if (completed > 0) self.noteTraceIters(key, t.code.sourceIters(completed));
         // Even a zero-progress hop executed trace code (it side-exited), so it is
         // charged too; a bookkeeping-only `onSideExit` merely charges ~0 (the
         // boundary was just advanced by the prior real hop).

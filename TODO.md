@@ -2,6 +2,30 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Doc 57 P3 follow-ups (noted 2026-09-27)
+
+- [ ] **Numeric-`for` step is a register load, not a konst.** `recForLoop`
+      reads the step through `refOf(a + 2)` (a `slot_load`), so `idx + step`
+      is never affine in the loop index. Seen in P3: an unrolled
+      `t[i] = t[i-1] + …` aborts `store_fwd_ambiguity`, because iteration 2's
+      `i - 1` cannot be proven equal to iteration 1's `i`. LuaJIT folds a
+      constant step (`lj_record.c` `fori_arg` → `find_kinit`, which finds the
+      `KSHORT`/`KNUM` that initialized the slot before `FORI`). General gap
+      (any trace that indexes with the loop variable after a step), not a
+      P3 defect. Test: "doc 57 P3: array stores in both iterations stay
+      correct" (parity only today).
+- [ ] **P3-D4: a pinned carried slot whose φ always carries its pin** (shape
+      B's `true`) re-checks the pin every trip, and the φ rewrites the konst
+      home. Once the prologue checked the entry, the body pin cannot fail. A
+      tropt fold could move it to the invariant (`pin_only`) class. Shape B
+      runs at ~1.75× LuaJIT (200M turns: 67 ms vs 38 ms); measure what this
+      buys before building it.
+- [ ] **Trace file / visualiser does not know about unrolled trips.**
+      `traceser` writes `peeled` (wire v3) but not `instunrolled`, so the viz
+      labels an unrolled trip as one iteration. A schema bump (wire v5,
+      `schema/trace.json`, regenerated codecs, `TraceView.tsx` label) would
+      fix it; display-only.
+
 ## Loop-exit writeback could use bytecode liveness instead of the watermark
 
 - [ ] `trace_finalize` drops loop-end writebacks above `locals_watermark`, a

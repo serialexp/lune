@@ -38,7 +38,8 @@ Every phase lands behind its own `just test` gate.
   84/84.
 
 - [x] **Phase 1 — commit preflight: int↔float kind-coherence refusal.**
-  Landed as `loopCloseSelfDefeating` in `closeTrace`, before
+  Landed as `loopCloseSelfDefeating` (renamed `loopCloseDefeat` by doc 57
+  P3, which returns the defeat kind) in `closeTrace`, before
   `commit()` (codex finding 4). One implementation departure from the
   plan, discovered the hard way: the store side CANNOT be read from
   the carried ref's IR `ty` — an unguarded `slot_load` store (exactly

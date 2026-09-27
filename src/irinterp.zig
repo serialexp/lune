@@ -92,6 +92,9 @@ pub fn flushNumericForLoopDone(t: *const Trace, regs: RegWindow, values: []Value
         .guard => |gp| if (gp.inline_depth > 0) return false,
         .link_terminal => return false,
     };
+    // Doc 57 P3: a non-final iteration's `for_loop` test sits mid-trip; the
+    // φ values below are the END of the trip, not this iteration's.
+    if (t.isLoopTestCopy(exit_instr)) return false;
     if (!t.loopDoneSnapshotSupported(exit_instr)) return false;
 
     var si: usize = @intCast(exit_instr + 1);

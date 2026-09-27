@@ -86,6 +86,9 @@ pub const CapturedOpts = struct {
     /// Populate `vm.trace.abort_log` (what `--dump-aborts` turns on), so an
     /// `inspect` callback can assert which abort reasons fired.
     record_aborts: bool = false,
+    /// Doc 57 P3: override `Config.instunroll` (the instability-unroll
+    /// budget); null keeps the default.
+    instunroll: ?u8 = null,
     inspect: ?*const fn (*Vm, TraceMode) anyerror!void = null,
 };
 
@@ -122,6 +125,7 @@ pub fn runCapturedTuned(
     vm.trace.config.exit_side_native = opts.exit_side_native;
     vm.trace.config.record_aborts = opts.record_aborts;
     if (opts.hotguard) |hg| vm.trace.config.hotguard = hg;
+    if (opts.instunroll) |n| vm.trace.config.instunroll = n;
 
     var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
