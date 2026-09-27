@@ -62,12 +62,29 @@ findings folded in — not implemented
     carried compare fails 2; `xor 0` fails 2.
   - Probe (`--jit-stats`): shape A (`if flag`) 99.9% native at ~4 c/it;
     `t[i] = f` / `u[i] = g` / `if t[i] and not u[i]` 0% → 99.9% native.
+  - Review r3 (Antigravity) on the P2 commit: no soundness bugs
+    (`docs/reviews/doc57/antigravity.md`).
+- [x] P4 — tests + measurement (2026-09-27).
+  - Tests: `interp_bool_test.zig` asserts on the native leg that every
+    trace holding a pin (shapes A, F, nil, carried compare) or a `not`/bool
+    `eq` (D, E) compiled (`expectNativeHolds`; mutation: rejecting `not`
+    in `proveKinds` fails it). The §5 mutation list is covered (payload
+    compare, `xor`, close check).
+  - Board (`bench/results/20260927-094715-4d3595c.tsv`): no regression;
+    ×3 interleaved A/B vs the P1 shadow build is noise-level on every row
+    checked. nsieve (doc 56 switch off) unchanged, 0.04 s.
+  - nsieve with the doc 56 switch ON: +30% (0.82 → 1.08 s). Its exit-side
+    child now compiles native and each of 4.4M hops pays the runtime seam
+    (`accountRegionProfit`, `driveChain`) — tracked in TODO.md for doc 56
+    Phase 6, not a doc 57 defect.
+  - Shape B (flipped carried bool) still aborts `type_instability` → P3.
+  - Shape C (a compare-result branch that flips for good) is the doc 56
+    Phase 6 case already in TODO.md, not a bool gap.
 
 ### Outstanding
 
 - [ ] P3 — instability unroll (LuaJIT `instunroll`) for the flipped carried
   bool. Own investigation first (§4.7).
-- [ ] P4 — tests + measurement (board, `--jit-stats` on the probe and nsieve).
 
 ## Why this exists
 

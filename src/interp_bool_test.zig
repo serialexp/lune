@@ -46,9 +46,28 @@ fn countOpOnSlotLoad(vm: *Vm, op: IrOp) usize {
     return n;
 }
 
+/// Doc 57 P2: on the native leg, every committed trace holding one of `ops`
+/// must have compiled to machine code (and at least one such trace exists).
+fn expectNativeHolds(vm: *Vm, mode: TraceMode, ops: []const IrOp) !void {
+    if (mode != .record_execute_native) return;
+    var holders: usize = 0;
+    for (vm.trace.registry.cache.items) |t| {
+        const holds = for (t.code.instrs) |ins| {
+            if (std.mem.indexOfScalar(IrOp, ops, ins.op) != null) break true;
+        } else false;
+        if (!holds) continue;
+        holders += 1;
+        try testing.expect(t.native == .compiled);
+    }
+    try testing.expect(holders >= 1);
+}
+
+const pin_ops = [_]IrOp{ .guard_is_nil, .guard_is_false, .guard_is_true };
+
 test "doc 57: an invariant bool input is pinned and its branch folds (shape A)" {
     const Inspect = struct {
         fn run(vm: *Vm, mode: TraceMode) !void {
+            try expectNativeHolds(vm, mode, &pin_ops);
             if (!executes(mode)) return;
             try testing.expect(countOpOnSlotLoad(vm, .guard_is_true) >= 1);
             // The `if flag` left no truthiness test on the input: the pin is
@@ -131,8 +150,14 @@ test "doc 57: a flipped carried bool is refused at close (shape B, until P3)" {
 test "doc 57: a carried bool from a compare keeps a real per-iteration pin" {
     // `b` enters `false`, is read by the `if`, then rewritten by a compare.
     // The pin stays a live check on the carried value (it holds `true` on
-    // iterations 2..100, so those take the other path).
-    try expectProgram(
+    // iterations 2..100, so those take the other path). Native keeps it as a
+    // body compare on the carried GP home.
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            try expectNativeHolds(vm, mode, &pin_ops);
+        }
+    };
+    try expectProgramTuned(
         \\local b = false
         \\local c = 0
         \\for i = 1, 300 do
@@ -140,7 +165,7 @@ test "doc 57: a carried bool from a compare keeps a real per-iteration pin" {
         \\  b = i < 100
         \\end
         \\print(c)
-    , "99\n");
+    , "99\n", .{ .inspect = Inspect.run });
 }
 
 test "doc 57: bool-lane loads compare and negate as dynamic booleans (shapes D, E)" {
@@ -166,6 +191,7 @@ test "doc 57: bool-lane loads compare and negate as dynamic booleans (shapes D, 
             }
             try testing.expect(eq_on_load >= 1);
             try testing.expect(not_on_load >= 1);
+            try expectNativeHolds(vm, mode, &.{ .not, .eq, .ne });
         }
     };
     try expectProgramTuned(
@@ -182,6 +208,7 @@ test "doc 57: bool-lane loads compare and negate as dynamic booleans (shapes D, 
 test "doc 57: a bool input stored into a bool lane stores the pinned konst (shape F)" {
     const Inspect = struct {
         fn run(vm: *Vm, mode: TraceMode) !void {
+            try expectNativeHolds(vm, mode, &pin_ops);
             if (!executes(mode)) return;
             try testing.expect(countOpOnSlotLoad(vm, .guard_is_true) >= 1);
             try testing.expect(countOpOnSlotLoad(vm, .guard_is_false) >= 1);
@@ -225,6 +252,7 @@ test "doc 57: equality folds on pinned inputs (x == nil, x == 1, x == 's', bool 
 test "doc 57: a nil input is pinned and folds" {
     const Inspect = struct {
         fn run(vm: *Vm, mode: TraceMode) !void {
+            try expectNativeHolds(vm, mode, &pin_ops);
             if (!executes(mode)) return;
             try testing.expect(countOpOnSlotLoad(vm, .guard_is_nil) >= 1);
         }

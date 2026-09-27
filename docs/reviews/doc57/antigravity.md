@@ -58,3 +58,21 @@ one observed value; the set is only tested for membership; it already held
 4. **Minor — body lowering must use `placeOfRef`** (an internal φ is not a
    slot); say explicitly that invariant pins and `guard_is_nil` emit nothing.
 5. **Nit — the predicate is `isSideExitGuardOp`**, not `isGuard`.
+
+## r3 — P2 implementation review (commit a0f84ab, 2026-09-27)
+
+Scope: soundness of the native lowering only (`git show a0f84ab`), with six
+asked-for checks: every `home`/`loc` consumer handles `pin_only`;
+`opMayExitInBody` agrees with the lowering; the internal-φ `bool_init` path;
+`hasNonPinReader` vs `markBodyReads`/liveness; `.terminal`/`.link` traces;
+doc 56 adapters with `pin_only` rows.
+
+Verdict: **no soundness bugs found.** Each check was traced to code: the
+prologue skips the `pin_only` payload load and the alloc assertion skips its
+home; the precise flush rebuilds a cross-slot `pin_only` capture from
+`pinnedValue`; coarse/silent deopt flush only carried slots; both
+`opMayExitInBody` and the lowering key on `pinHoisted`; a `bool_init` load is
+read by its internal φ so it is never `pin_only`, gets a home and a TAG_BOOL
+check, and the φ's body pin catches a wrong entry value on iteration 1; a
+store-ref copy of a pinned load makes it non-`pin_only`; an adapter restoring
+another slot from a `pin_only` row fails closed (`not_held`).
