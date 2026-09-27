@@ -113,8 +113,8 @@ pub const EntryRegistry = struct {
         var found: ?u32 = null;
         for (proto.code, 0..) |ins, i| {
             if (patchedEntryOp(ins.op) == null) continue;
-            const target: i64 = @as(i64, @intCast(i + 1)) + ins.aux;
-            if (target == anchor_pc and target <= @as(i64, @intCast(i))) {
+            // Doc 58: the loop header comes from the one shared definition.
+            if (bytecode.loopHeaderOf(ins, i) == anchor_pc) {
                 if (found != null) return null;
                 found = @intCast(i);
             }

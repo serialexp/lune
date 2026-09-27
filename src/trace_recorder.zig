@@ -182,13 +182,8 @@ const GuardProvenance = @import("trace_types.zig").GuardProvenance;
 pub fn isPlainWhileAnchor(proto: *const Proto, pc: u32) bool {
     var has_plain = false;
     for (proto.code, 0..) |ins, j| {
-        const is_jump = switch (ins.op) {
-            .jmp, .jmp_if_false, .jmp_if_true, .for_loop, .tfor_loop, .jfor_loop => true,
-            else => false,
-        };
-        if (!is_jump) continue;
-        const t = @as(i64, @intCast(j)) + 1 + ins.aux;
-        if (t != pc or j <= pc) continue;
+        // Doc 58: the loop header comes from the one shared definition.
+        if (bytecode.loopHeaderOf(ins, j) != pc) continue;
         if (ins.op == .jmp) {
             has_plain = true;
         } else {
@@ -1547,6 +1542,8 @@ pub const RecordingSession = struct {
             // side) or aborts LINNER (root), instead of unrolling the while body.
             // Forward jumps and jumps to unknown targets stay no-ops.
             .jmp => try self.recWhileLink(instr, regs, proto, pc),
+            // Doc 58 B1: the loop marker is a no-op; it records nothing.
+            .loop => {},
             .jmp_if_false, .jmp_if_true => try self.recBranch(instr, regs, proto, pc),
             .for_loop => try self.recForLoop(instr, regs, pc),
             // Doc 30 c4: the generic-for back-edge — mirrors the CONTINUE

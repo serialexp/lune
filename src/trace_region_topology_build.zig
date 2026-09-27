@@ -3,7 +3,8 @@ const std = @import("std");
 const region = @import("trace_region.zig");
 const types = @import("trace_types.zig");
 const api = @import("trace_region_topology.zig");
-const Proto = @import("bytecode.zig").Proto;
+const bytecode = @import("bytecode.zig");
+const Proto = bytecode.Proto;
 const AnchorKey = types.AnchorKey;
 const ExitKey = types.ExitKey;
 const StructuralEdgeId = types.StructuralEdgeId;
@@ -24,19 +25,6 @@ const StagedDef = api.StagedDef;
 const StagedBridgeUpdate = api.StagedBridgeUpdate;
 const StagedOwnerUpdate = api.StagedOwnerUpdate;
 const StagedArmableUpdate = api.StagedArmableUpdate;
-pub fn forLoopEndFor(proto: *const Proto, pc: u32) ?u32 {
-    var found: ?u32 = null;
-    for (proto.code, 0..) |ins, i| {
-        if (ins.op != .for_loop) continue;
-        const target: i64 = @as(i64, @intCast(i)) + 1 + ins.aux;
-        if (target == pc) {
-            if (found != null) return null; // ambiguous
-            found = @intCast(i);
-        }
-    }
-    return found;
-}
-
 pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cache: *const api.EdgeMap) !api.Rebuild {
     for (view.traces) |t| if (!t.code.exit_prov_complete) return error.IncompleteRegionGraph;
     // Guest-logical anchor node identity {proto_id, pc} — NOT a concrete `Trace`
@@ -411,12 +399,15 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
             // fail the test — the region then simply stays unarmable, the
             // pre-d.1 status quo.
             const enclosing = !is_ext and blk: {
-                const flp = forLoopEndFor(proto, a.pc) orelse break :blk false;
+                const ext = bytecode.loopExtentFor(proto, a.pc) orelse break :blk false;
+                // Doc 58 B1: numeric roots only, as before; B2 admits every
+                // loop kind.
+                if (ext.back_edge_op != .for_loop) break :blk false;
                 for (0..nnodes) |m| {
                     if (comp[m] != c or m == n) continue;
                     const b = nodes.items[m];
                     if (b.proto_id != a.proto_id) break :blk false;
-                    if (b.pc <= a.pc or b.pc > flp) break :blk false;
+                    if (b.pc == a.pc or b.pc < ext.start or b.pc > ext.end) break :blk false;
                 }
                 break :blk true;
             };

@@ -444,18 +444,6 @@ fn operandReady(code: *const TraceCode, r: Ref, gi: usize) bool {
     };
 }
 
-/// The target of `ins` at `pc` when it is a BACKWARD jump (a loop's
-/// back-edge), else null.
-fn backEdgeTarget(ins: Instr, pc: usize) ?u32 {
-    switch (ins.op) {
-        .jmp, .jmp_if_true, .jmp_if_false, .jmp_if_not_nil, .for_loop, .tfor_loop => {},
-        else => return null,
-    }
-    const t: i64 = @as(i64, @intCast(pc)) + 1 + ins.aux;
-    if (t < 0 or t > @as(i64, @intCast(pc))) return null;
-    return @intCast(t);
-}
-
 /// Rule 9: `ins` reads `Vm.reg_top`, which only the instruction right
 /// before it (its multret producer) sets — `interp.zig`'s `call` argument
 /// count and `ret` result count under `all_results` are the only readers.
@@ -470,7 +458,7 @@ fn isMultretConsumer(ins: Instr) bool {
 fn isLoopHeader(proto: *const Proto, p: u32, headers: ?[]const u8) bool {
     if (headers) |h| return (h[p >> 3] >> @intCast(p & 7)) & 1 != 0;
     for (proto.code, 0..) |ins, pc| {
-        if (backEdgeTarget(ins, pc) == p) return true;
+        if (bytecode.loopHeaderOf(ins, pc) == p) return true;
     }
     return false;
 }
@@ -535,7 +523,7 @@ pub fn buildMemo(gpa: std.mem.Allocator, code: *TraceCode) void {
     defer gpa.free(headers);
     @memset(headers, 0);
     for (proto.code, 0..) |ins, pc| {
-        const t = backEdgeTarget(ins, pc) orelse continue;
+        const t = bytecode.loopHeaderOf(ins, pc) orelse continue;
         headers[t >> 3] |= @as(u8, 1) << @intCast(t & 7);
     }
     const bits = gpa.alloc(u8, (n + 7) / 8) catch return;

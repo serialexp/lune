@@ -211,7 +211,76 @@ pub const OpCode = enum(u8) {
     ///             ordinary handler table. `.b` carries the entry-patch slot
     ///             index; appended LAST to keep the enum dense (doc 42 §4.6).
     jcont,
+
+    /// `b, aux`    loop marker (doc 58, LuaJIT's `BC_LOOP`). Emitted right
+    ///             after a `while` loop's condition branch and at the top of a
+    ///             `repeat` loop. `.b` is the loop kind (`LoopKind`); `.aux` is
+    ///             the offset from `pc + 1` to the loop's exit pc (the first
+    ///             instruction after the loop) — NOT a jump: execution always
+    ///             falls through to `pc + 1`. Doc 58 B1: a no-op in every tier;
+    ///             B2 makes it the loop's back-edge, whose header is `pc + 1`.
+    ///             Appended LAST to keep the enum dense (doc 42 §4.6).
+    loop,
 };
+
+/// Doc 58: the kind of loop a `loop` marker belongs to, in its `.b` operand.
+pub const LoopKind = enum(u16) {
+    while_loop = 0,
+    repeat_loop = 1,
+};
+
+/// Doc 58: the header of the loop whose back-edge instruction is `ins` at
+/// `pc` — the pc a trace for that loop is anchored at — or null when `ins` is
+/// not a loop back-edge. The one definition of "which instructions are
+/// back-edges"; every walker that needs a loop header asks here instead of
+/// decoding `aux` itself (a `loop` marker's `aux` is its exit offset, so the
+/// generic `pc + 1 + aux` would be wrong for it).
+///
+/// B1 (today's shape): a backward jump of any kind, `for_loop` and
+/// `tfor_loop` are back-edges; the `loop` marker is not one yet.
+pub fn loopHeaderOf(ins: Instr, pc: usize) ?u32 {
+    switch (ins.op) {
+        .jmp, .jmp_if_true, .jmp_if_false, .jmp_if_not_nil, .for_loop, .tfor_loop => {},
+        else => return null,
+    }
+    const t: i64 = @as(i64, @intCast(pc)) + 1 + ins.aux;
+    if (t < 0 or t > @as(i64, @intCast(pc))) return null;
+    return @intCast(t);
+}
+
+/// Doc 58: the static extent of one loop — every instruction from `start` to
+/// `end` inclusive runs inside it — plus its back-edge instruction.
+pub const LoopExtent = struct {
+    start: u32,
+    end: u32,
+    back_edge_pc: u32,
+    back_edge_op: OpCode,
+};
+
+/// Doc 58: the extent of the loop whose header is `header`, found through its
+/// unique back-edge (`loopHeaderOf`). Null when no back-edge has this header,
+/// or more than one does (ambiguous: callers fail closed). Replaces the two
+/// numeric-only `forLoopEndFor` copies.
+///
+/// B1 (today's shape): every loop runs from its header to its back-edge.
+pub fn loopExtentFor(proto: *const Proto, header: u32) ?LoopExtent {
+    var found: ?LoopExtent = null;
+    for (proto.code, 0..) |ins, i| {
+        if (loopHeaderOf(ins, i) != header) continue;
+        if (found != null) return null; // ambiguous
+        found = .{ .start = header, .end = @intCast(i), .back_edge_pc = @intCast(i), .back_edge_op = ins.op };
+    }
+    return found;
+}
+
+/// Doc 58: the exit pc (first instruction after the loop) of a `loop` marker
+/// at `pc`.
+pub fn loopMarkerExit(ins: Instr, pc: usize) usize {
+    std.debug.assert(ins.op == .loop);
+    const e: i64 = @as(i64, @intCast(pc)) + 1 + ins.aux;
+    std.debug.assert(e > @as(i64, @intCast(pc)));
+    return @intCast(e);
+}
 
 // Doc 42 §4.6: the tail-call dispatch tables index `[@intFromEnum(op)]`
 // directly, which is only sound while the enum stays dense from 0. Explicit
@@ -389,6 +458,11 @@ pub fn writeInstr(w: *io.Writer, instr: Instr) io.Writer.Error!void {
         .load_nil, .new_table, .close_upvalues, .vararg_first, .vararg_len, .vararg_spread => try w.print(" r{d}", .{instr.a}),
         .load_int => try w.print(" r{d}  {d}", .{ instr.a, instr.aux }),
         .jmp_if_false, .jmp_if_true, .jmp_if_not_nil, .for_prep, .for_loop => try w.print(" r{d}  {d:>4}", .{ instr.a, instr.aux }),
+        // Doc 58: the loop kind and the exit offset (a fall-through op).
+        .loop => try w.print(" {s}  exit {d:>4}", .{
+            if (instr.b == @intFromEnum(LoopKind.repeat_loop)) "repeat" else "while",
+            instr.aux,
+        }),
         .load_bool,
         .load_const,
         .move,

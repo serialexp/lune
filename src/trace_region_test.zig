@@ -43,7 +43,7 @@ const util = @import("trace_testutil.zig");
 const winRO = util.winRO;
 
 /// Fixture bytecode for the region-graph tests: every op a numeric `for_loop`
-/// whose back-edge lands nowhere (so `forLoopEndFor` never matches it). A
+/// whose back-edge lands nowhere (so `bytecode.loopExtentFor` never matches it). A
 /// fixture `guard_true` with exit pc `wp <= code.len` is then a numeric-for
 /// loop-done guard — the one plain guard kind whose exit pc really is a
 /// structural successor (`resolveSuccessorAnchor`; a branch guard's exit pc

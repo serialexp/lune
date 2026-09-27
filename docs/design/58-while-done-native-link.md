@@ -25,8 +25,8 @@ design and its review are kept as Appendix R2.
 - [x] Rev 3 design review: r2 CHANGES REQUESTED, r3 APPROVE WITH
   CHANGES, all folded in (§8).
 - [x] B0: baseline (§5, "B0 done").
-- [ ] B1: the `loop` op is emitted and every walker knows it; inert
-  (§5).
+- [x] B1: the `loop` op is emitted and every walker knows it; inert
+  (§5, "B1 done").
 - [ ] B2: `while`/`repeat` anchors move to after the `loop` op; the
   condition guard becomes an ordinary exit; the machinery whose
   premise was the condition anchor is deleted (§5).
@@ -617,6 +617,34 @@ increments are slices of the final shape, not scaffolding.
   - Tests that pin pcs are updated for the shift.
   - Check: `--dump-traces` IR is identical, up to pc numbering, on
     every bench.
+  - **B1 done (2026-09-27).** As built:
+    - `OpCode.loop`, `LoopKind` and `loopMarkerExit` in `bytecode.zig`.
+      `compileWhile` emits the marker after the branch;
+      `compileRepeat` emits it at the top, and its closer still targets
+      the body.
+    - Tier-0 `opLoop` is a fall-through. `bc_liveness` treats it as a
+      fall-through. The recorder records nothing for it.
+      `resolveCompositeBridgeSuccessor` steps over it.
+    - `bytecode.loopHeaderOf` replaces `trace_exit_attach.backEdgeTarget`,
+      and `resolvePatchPc` and `isPlainWhileAnchor` now call it.
+    - `bytecode.loopExtentFor` (returns `LoopExtent`, with
+      `back_edge_op`) replaces both `forLoopEndFor` copies. The
+      `trace_link` copy only had a dead alias in `trace_regionops`.
+      Owner election keeps B1 inert by requiring
+      `back_edge_op == .for_loop`; B2 drops that. The member test now
+      reads `b.pc == a.pc or b.pc < ext.start or b.pc > ext.end`, which
+      equals the old test while `start == header`.
+    - Tests:
+      - compiler: the `while` marker (branch, exit, `break`, header,
+        extent) and the `repeat` marker;
+      - `bc_liveness`: the marker falls through. Mutation-checked:
+        reading `aux` as a branch fails the test.
+    - Gates: `just test` 0; `-Djit-debug=true` 0, empty log.
+    - Inertness: `/tmp/irdiff.sh`, `--dump-traces` IR with pcs
+      normalised. All 28 benches are identical to the B0 shadow.
+    - Tier-0 cost: noise level. lowtrip 394 → 401 ms; pi_leibniz and
+      hightrip were within ±2% (interleaved, best of 5, loaded
+      machine).
 - **B2 — the anchor moves, and everything in §4.5 goes.**
   - `opLoop` becomes the back-edge, and `opJump` drops its test.
   - Patching moves to the `loop` op.

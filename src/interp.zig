@@ -5113,6 +5113,7 @@ pub const Vm = struct {
             .get_upval => opGetUpval(mode),
             .set_upval => opSetUpval(mode),
             .close_upvalues => opCloseUpvalues(mode),
+            .loop => opLoop(mode),
             .call => opCall(mode),
             .ret, .halt => opRet(mode),
             .vararg_first => opVarargFirst(mode),
@@ -6077,6 +6078,17 @@ pub const Vm = struct {
                 const v = regs.get(instr.a);
                 self.upvalSet(st.closure.upvalues[instr.b], v);
                 self.heap.writeBarrier(&st.closure.upvalues[instr.b].header, v); // no-op until generational
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// Doc 58: the loop marker (LuaJIT `BC_LOOP`). B1: a pure no-op — it
+    /// always falls through, and its `aux` (the loop's exit offset) is never
+    /// a jump.
+    fn opLoop(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;

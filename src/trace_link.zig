@@ -819,24 +819,6 @@ pub fn hasInnerRootAt(self: *const TraceState, proto: *const Proto, pc: u32) boo
     return false;
 }
 
-/// A-vii-d.1: the closing `for_loop` pc of the numeric loop whose body starts
-/// at anchor `pc` — i.e. the unique `for_loop` op whose back-edge target is
-/// `pc`. Null when none or ambiguous (fail-closed: the anchor then cannot be
-/// elected as a closed region's enclosing owner). Static bytecode only; the
-/// body span of the loop is `[pc, result]`.
-pub fn forLoopEndFor(proto: *const Proto, pc: u32) ?u32 {
-    var found: ?u32 = null;
-    for (proto.code, 0..) |ins, i| {
-        if (ins.op != .for_loop) continue;
-        const target: i64 = @as(i64, @intCast(i)) + 1 + ins.aux;
-        if (target == pc) {
-            if (found != null) return null; // ambiguous
-            found = @intCast(i);
-        }
-    }
-    return found;
-}
-
 pub const SuccAnchor = struct { proto_id: u32, pc: u32 };
 
 /// Resolve the guest-logical successor **anchor** `{proto_id, pc}` of one keyed
@@ -974,6 +956,9 @@ pub fn resolveCompositeBridgeSuccessor(self: *const TraceState, t: *const Trace,
         const ins = proto.code[pc];
         switch (ins.op) {
             .jmp => pc_i = pc_i + 1 + ins.aux,
+            // Doc 58: a loop marker always falls through (its `aux` is the
+            // loop's exit offset, not a jump).
+            .loop => pc_i = pc_i + 1,
             .for_loop => {
                 if (crossed_for_loop != null) return null; // at most one
                 crossed_for_loop = pc;

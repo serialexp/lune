@@ -66,7 +66,6 @@ const RegionClassifier = trace_mod.RegionClassifier;
 const freeRegionSetMap = trace_mod.freeRegionSetMap;
 const appendUniqueSlot = trace_mod.appendUniqueSlot;
 const DemotionReason = trace_mod.TraceState.DemotionReason;
-const forLoopEndFor = trace_mod.TraceState.forLoopEndFor;
 // pub'd in trace.zig for trace_link.zig (file-split pass):
 const bumpGen = TraceState.bumpGen;
 const exitIsPreEffect = TraceState.exitIsPreEffect;

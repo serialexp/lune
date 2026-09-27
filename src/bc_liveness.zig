@@ -158,6 +158,9 @@ fn effectOf(ins: Instr, pc: u32, code_len: usize) Effect {
             e.succ[0] = next;
         },
         .close_upvalues => e.succ[0] = next, // reads captured regs only
+        // Doc 58: a loop marker reads and writes nothing and always falls
+        // through; its `aux` is the loop's exit offset, not a branch.
+        .loop => e.succ[0] = next,
         .jmp => e.succ[0] = jumpTarget(pc, ins.aux, code_len),
         .jmp_if_false, .jmp_if_true, .jmp_if_not_nil => {
             e.use(a);
@@ -552,6 +555,27 @@ test "conditional branches union both successors" {
     try testing.expectEqual(@as(u64, 0b0111), liveSet(l, 0, 4));
     try testing.expectEqual(@as(u64, 0b0010), liveSet(l, 1, 4));
     try testing.expectEqual(@as(u64, 0b0100), liveSet(l, 3, 4));
+}
+
+test "doc 58: a loop marker falls through; its exit offset is not a branch" {
+    // `while r0 do r2 = r1 end return r2`, with the marker's `aux` pointing
+    // at the exit (pc 5). Were `aux` read as a branch, r1 would be live at
+    // the marker only through the body, and r2 would leak live into pc 2
+    // from the exit path.
+    const code = [_]Instr{
+        Instr.opAx(.jmp_if_false, 0, 3), // 0 → 4
+        .{ .op = .loop, .aux = 2 }, // 1   exit = 1 + 1 + 2 = 4
+        Instr.opAB(.move, 2, 1), // 2
+        Instr.opJ(.jmp, -4), // 3 → 0
+        Instr.opAB(.ret, 2, 1), // 4
+    };
+    const l = try computeT(&code, 3, &.{});
+    defer freeT(l);
+    // At the marker: r0 (the next condition) and r1 (the body) are live;
+    // r2 is not, because the body writes it before anything reads it.
+    try testing.expectEqual(@as(u64, 0b011), liveSet(l, 1, 3));
+    try testing.expectEqual(@as(u64, 0b011), liveSet(l, 2, 3));
+    try testing.expectEqual(@as(u64, 0b100), liveSet(l, 4, 3));
 }
 
 test "wide windows span several words; an over-budget proto gets no table" {

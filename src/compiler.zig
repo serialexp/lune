@@ -858,6 +858,9 @@ const Compiler = struct {
         try self.compileExprTo(w.cond, cr);
         const exit = try self.emitJump(.jmp_if_false, cr);
         self.freeTo(mark);
+        // Doc 58: the loop marker (LuaJIT `BC_LOOP`) sits right after the
+        // condition, so the body starts at `marker + 1`.
+        const marker = try self.emit(.{ .op = .loop, .b = @intFromEnum(bytecode.LoopKind.while_loop) });
 
         try self.loops.append(self.scratch, .{ .scope_base = self.next_reg });
         const loop_idx = self.loops.items.len - 1;
@@ -869,6 +872,7 @@ const Compiler = struct {
         try self.emitJumpTo(.jmp, 0, loop_top);
 
         self.patchToHere(exit);
+        self.patchToHere(marker); // the marker's exit offset
         self.patchBreaks(loop_idx);
     }
 
@@ -881,6 +885,10 @@ const Compiler = struct {
     /// before the back-edge — each iteration gets fresh captured cells.
     fn compileRepeat(self: *Compiler, r: anytype) Error!void {
         const base = self.next_reg;
+        // Doc 58: the loop marker (LuaJIT `BC_LOOP`) opens the loop. B1: the
+        // closer still targets the body (`marker + 1`), so the back-edge
+        // target — and every anchor — is unchanged.
+        const marker = try self.emit(.{ .op = .loop, .b = @intFromEnum(bytecode.LoopKind.repeat_loop) });
         const loop_top = self.code.items.len;
 
         const cr = try self.alloc1(); // condition slot, reserved across the body
@@ -899,6 +907,7 @@ const Compiler = struct {
         // Loop back while the condition is false; fall through (exit) when true.
         try self.emitJumpTo(.jmp_if_false, cr, loop_top);
 
+        self.patchToHere(marker); // the marker's exit offset
         self.freeTo(base); // release the condition slot
         self.patchBreaks(loop_idx);
     }
@@ -1678,6 +1687,78 @@ test "while loop accumulates" {
         \\end
         \\return sum
     )).asInt());
+}
+
+/// Doc 58: the single `loop` marker of `code`, or a test failure.
+fn onlyLoopMarker(code: []const Instr) !usize {
+    var found: ?usize = null;
+    for (code, 0..) |ins, pc| {
+        if (ins.op != .loop) continue;
+        try testing.expect(found == null);
+        found = pc;
+    }
+    return found orelse error.TestExpectedLoopMarker;
+}
+
+test "doc 58: a while loop emits a loop marker right after its condition branch" {
+    var r = try run(
+        \\local i = 1
+        \\local sum = 0
+        \\while i <= 5 do
+        \\  sum = sum + i
+        \\  if sum > 100 then break end
+        \\  i = i + 1
+        \\end
+        \\return sum
+    );
+    defer r.deinit();
+    try testing.expectEqual(@as(i64, 15), r.value.asInt());
+    const code = r.chunk.proto.code;
+    const m = try onlyLoopMarker(code);
+    try testing.expectEqual(@as(u16, @intFromEnum(bytecode.LoopKind.while_loop)), code[m].b);
+    // `cond; jmp_if_false -> E; loop; body; jmp -> C`, E = the marker's exit.
+    try testing.expectEqual(OpCode.jmp_if_false, code[m - 1].op);
+    const e = bytecode.loopMarkerExit(code[m], m);
+    const branch_target: i64 = @as(i64, @intCast(m)) + code[m - 1].aux;
+    try testing.expectEqual(@as(i64, @intCast(e)), branch_target);
+    try testing.expectEqual(OpCode.jmp, code[e - 1].op);
+    const back: i64 = @as(i64, @intCast(e)) + code[e - 1].aux;
+    try testing.expect(back < m - 1 or back == m - 1);
+    // The `break` lands on the same exit pc.
+    var saw_break = false;
+    for (code[m + 1 .. e - 1], m + 1..) |ins, pc| {
+        if (ins.op != .jmp) continue;
+        if (@as(i64, @intCast(pc)) + 1 + ins.aux == @as(i64, @intCast(e))) saw_break = true;
+    }
+    try testing.expect(saw_break);
+    // B1: the marker is not a back-edge; the backward `jmp` is, with its
+    // header at the condition, and the loop's extent is header..jmp.
+    try testing.expectEqual(@as(?u32, null), bytecode.loopHeaderOf(code[m], m));
+    try testing.expectEqual(@as(?u32, @intCast(back)), bytecode.loopHeaderOf(code[e - 1], e - 1));
+    const ext = bytecode.loopExtentFor(r.chunk.proto, @intCast(back)).?;
+    try testing.expectEqual(@as(u32, @intCast(back)), ext.start);
+    try testing.expectEqual(@as(u32, @intCast(e - 1)), ext.end);
+    try testing.expectEqual(OpCode.jmp, ext.back_edge_op);
+}
+
+test "doc 58: a repeat loop emits a loop marker at its top" {
+    var r = try run(
+        \\local i = 0
+        \\repeat
+        \\  i = i + 1
+        \\until i >= 5
+        \\return i
+    );
+    defer r.deinit();
+    try testing.expectEqual(@as(i64, 5), r.value.asInt());
+    const code = r.chunk.proto.code;
+    const m = try onlyLoopMarker(code);
+    try testing.expectEqual(@as(u16, @intFromEnum(bytecode.LoopKind.repeat_loop)), code[m].b);
+    // The closer is the instruction right before the exit. B1: it still
+    // targets the body (`m + 1`), not the marker.
+    const e = bytecode.loopMarkerExit(code[m], m);
+    try testing.expectEqual(OpCode.jmp_if_false, code[e - 1].op);
+    try testing.expectEqual(@as(?u32, @intCast(m + 1)), bytecode.loopHeaderOf(code[e - 1], e - 1));
 }
 
 test "repeat/until runs the body before testing and loops while false" {

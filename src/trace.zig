@@ -3006,7 +3006,6 @@ pub const TraceState = struct {
     pub const countTracesAt = trace_link_mod.countTracesAt;
     pub const anchorPopulation = trace_link_mod.anchorPopulation;
     pub const hasInnerRootAt = trace_link_mod.hasInnerRootAt;
-    pub const forLoopEndFor = trace_link_mod.forLoopEndFor;
     pub const SuccAnchor = trace_link_mod.SuccAnchor;
     pub const resolveSuccessorAnchor = trace_link_mod.resolveSuccessorAnchor;
     pub const resolveCompositeBridgeSuccessor = trace_link_mod.resolveCompositeBridgeSuccessor;
