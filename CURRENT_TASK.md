@@ -537,8 +537,20 @@ the ones that bite):
     `guard_append`), G5 `while` loop-done never links natively. All in
     TODO.md. Review: Antigravity CHANGES REQUESTED, 9 findings all
     verified and folded in (`docs/reviews/doc56/antigravity-phase6-plan.md`).
-    **Blocked on Bart: P6-Q1 order (6 first / G1–G4 first / combined),
-    P6-Q2 keying, P6-Q3 bursts, P6-Q4 `while` loop-done.**
+    Bart answered: P6-Q1 **combined** (one plan for Phase 6 + 7 + G1–G4,
+    one review, then build), P6-Q2 **key by cell**, P6-Q3 **bursts keep
+    `exit_side_ok = 0`, add a counter**, P6-Q4 **G5 gets its own doc**.
+  - **Doc 56 combined Phase 6–7 PLAN DONE (2026-09-27), reviewed.** §4.8.3:
+    R1 (stub yields to a live ordinary arm; no `.wanted` while one is
+    armed), R2 (exit-side `driveChain` tries the next candidate after a
+    prologue refusal or pre-effect deopt; arm the trace that linked;
+    `exitIsPreEffect` gets `ustore`/`sgm_setpos`; id tie-break), R3
+    (`.native_direct` only from `.none`), R4 (no strike while waiting,
+    bounded by `hotexit`; `tryside` unlinked chains → give up). Review:
+    Antigravity CHANGES REQUESTED, 6 findings verified and folded in
+    (`docs/reviews/doc56/antigravity-phase67-plan.md`).
+    **NEXT: implement in order R1 → R2 → R3+R4 → Phase 6 items 1–10 →
+    measure (switch off/on, board) → docs → code review → commit.**
   - Background (LuaJIT)
     reference read: `lj_opt_loop.c` ~l.340 raises `TYPEINS` when a
     loop-carried ref's type differs from its SLOAD's; `lj_opt_loop()`

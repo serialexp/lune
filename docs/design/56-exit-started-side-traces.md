@@ -1654,6 +1654,157 @@ above (`docs/reviews/doc56/antigravity-phase6-plan.md`).
   attachable (reverses the "refuse while-done" ruling) so doc 56's
   adapter serves it; (c) later.
 
+**Bart's answers (2026-09-27).** Q1 (c): one combined phase, planned
+and reviewed together (§4.8.3). Q2 (a): key by cell. Q3 (a): keep
+bursts at `exit_side_ok = 0` and measure. Q4 (a): G5 gets its own doc.
+
+#### 4.8.3 Combined Phase 6–7 plan: routing and G1–G4 (2026-09-27)
+
+This adds the layer-1 work to §4.8.2 so the switch-on regressions go
+away in the same phase that silences the cycles. §4.9's routing and
+strike rules land here too. G5 is out (its own doc).
+
+**R1 — existing live arms first (G3, §4.9 rule 1).**
+
+- **The stub.** The exit-side stub first loads the exit's ORDINARY
+  cell `slots[ei]` and takes the ordinary path when it is not
+  `shared_exit` (a sibling handoff, an M1 `ordinary_guard` or a region
+  bridge is armed there; only `commitSlotMutation` ever changes that
+  cell). Then its current tests (exit-side cell published,
+  `exit_side_ok`) and `jmp [rax]` on the exit-side cell, so rax needs
+  no reload (review 6). It clobbers rcx as well as rax; both are dead
+  at a guard exit (rcx is outside `ALLOC_ORDER`, and the bridge stub
+  right below uses it as scratch). An exit with no ordinary cell
+  (`shared_exit == null`) keeps today's stub.
+- **The want.** `routeExitSide`'s `.none → .wanted` refuses while the
+  exit's ordinary cell holds a live arm (a registry lookup for an
+  armed link on `(parent, ei)` whose kind is not `.exit_side`), and
+  returns false so today's routes run.
+- An ordinary arm that arrives after the exit went wanted or attached
+  needs nothing: the stub prefers it, and the exit-side arm is
+  reachable again if it is disarmed.
+- Fixes nsieve (its `guard_append` exit keeps the doc 47 sibling
+  handoff) and sieve_int/nsieve-bit (the region bridge stays silent).
+
+**R2 — the child that fits (G1).**
+
+- **Try the next candidate.** `driveChain` under `.exit_side`
+  materialization returns after the first candidate that does not
+  link. It continues to the next candidate at `P` instead when the
+  failed run left the slab coherent at `P`: a prologue refusal
+  (`exit_reason == .prologue_fail`, nothing ran) or a deopt of a
+  `.link` continuation at a pre-effect exit (`exitIsPreEffect`; a
+  continuation does not loop, so its coarse deopt restores its entry
+  registers at its anchor `P`). Anything else returns at `P` as today.
+  This is the scalar seam only; a multi-row native ledger keeps its
+  current drain.
+- **`exitIsPreEffect` gets the full effect list** (review 2): it checks
+  `astore`, `astore_append`, `hstore`, `gstore` but not `ustore` or
+  `sgm_setpos`, which `TraceCode`'s bridge-candidate test (~723)
+  counts as effects. One shared effect-op predicate serves both. This
+  also closes the same gap in sibling-handoff eligibility today.
+- **Candidate order breaks ties by id** (review 5):
+  `nextTraceExcluding` picks the highest `hit_count`, then the lowest
+  id, like `resolveLoopDoneCont`; today a tie goes to cache order.
+- **Arm what linked.** `ChainResult` gains `linked_trace: ?*Trace`, the
+  candidate that ran to its `.link` (also on the fused path: a seed
+  ledger headed by that candidate's own `.link` row). `armExitSide`
+  arms it instead of `resolveLoopDoneCont(proto, P, null).arm`; every
+  shape gate in `arm` still applies. An exit's snapshot types are
+  fixed by the parent's IR, so the child that links first keeps
+  linking; no static type match is needed (§4.8.1's "the child's own
+  prologue checks the types" still holds).
+- Fixes bit-reverse exit 60 (its int-`k` child t4 links and arms; the
+  float twin t3 is skipped after its entry refusal).
+- Review item: `armLoopDoneLink` and the doc 38 continuation arms also
+  pick through `resolveLoopDoneCont`; the reviewer is asked whether the
+  same typed-twin problem exists there (not changed in this phase
+  unless it does).
+
+**R3 — exits of exit-side children are wanted (G2).**
+
+- `noteDispatcherLedgerTerminal` passes `.native_direct` instead of
+  `.legacy` when `exitSideNative()` **and the exit's state is `.none`**
+  (review 1). A terminal `.deopt` row did not materialize, so the only
+  exit-side step it may drive is `.none → .wanted`: the firing that
+  crosses `hotexit` takes the ordinary deopt, exactly the direct
+  route's contract, and the adapter it publishes serves the next
+  firing. A wanted or attached exit CAN end a ledger in `.deopt` (an
+  adapter build refused in `nativeFor`; `silent_active` before item 7;
+  a `driveChain` candidate's multi-row ledger, drained by
+  `driveDispatcherLedger` from a run with `exit_side_ok = 0`, review
+  4), and counting such a firing as owned would give the exit up
+  without it ever recording. Those stay `.legacy`.
+- Other origins (bursts, chains, silent drains of burst runs) keep
+  `.legacy` for every state.
+- A child's exit whose `P` equals the child's own anchor (a guard on
+  the child's first bytecode, the nsieve pc 7 shape) records a
+  same-anchor sibling at `P`; the exit-side arm then goes child →
+  sibling, both at `P`. That is LuaJIT's side trace of a side trace.
+- Fixes bit-reverse child t5 exit 6 (a grandchild at the `while` body
+  that links to the inner `while` root). The inner root's own
+  loop-done (G5) still returns to the runtime.
+
+**R4 — strikes and give-up (G4, §4.9 strikes).**
+
+- **No strike while waiting.** A zero-progress receipt at an attachable
+  exit does not strike its anchor (`accountLegacyThrash`, the only
+  strike such a receipt earns) while the exit is `.wanted`, or `.none`
+  with its counter still below `hotexit` (review 3: an exit that can
+  never go wanted — `maxside` reached, or R1's live ordinary arm —
+  stays `.none` for good, so `.none` alone is no bound). So the wait
+  is bounded by `hotexit + tryside` firings; a `.gave_up` exit strikes
+  as today. Receipts at an `.attached` exit are exit-side hops charged
+  `local + 1`, which never strike.
+- **An attached exit that never links gives up.** Each unarmed firing
+  of an attached exit runs the router's chain. A new per-exit counter
+  (`TraceRecord.exit_side_misses`, allocated with `exit_side`) counts
+  consecutive firings whose chain did not link and resets on a linked
+  one. At `tryside` the exit gives up: its exit-side arm is disarmed,
+  the adapter unpublished, the state set to `.gave_up`, and its
+  `exit_counts` DONE latch cleared to 0 so today's routes can see it
+  again once it re-heats. This is the turnstile R2 cannot remove: no
+  continuation at `P` fits.
+- Deterministic: pure functions of receipts and counters.
+
+**Tests (R1–R4).**
+
+- R1: an exit with a live sibling handoff and a published adapter takes
+  the handoff (its row is the fused `.deopt`, no `.exit_side` row); an
+  nsieve-shaped program with the switch on keeps its sibling arm and
+  has no exit-side hops on that exit.
+- R2: a bit-reverse-shaped program whose exit sees an int where the
+  first continuation expects a float arms the int twin; a prologue
+  refusal falls through to the next candidate; output identical.
+- R3: the two-level branch probe (Phase 5 finding: 65% traced off, 13%
+  on) grows a grandchild and is traced at least as much as with the
+  switch off; child exit rows route `.native_direct` only from the
+  dispatcher origin.
+- R4: a loop whose attachable exit is wanted is not gated while it
+  waits; an attached exit whose chain never links gives up after
+  `tryside` firings and returns to today's routes.
+
+**Review.** Antigravity, CHANGES REQUESTED: one blocker (R3's "a
+wanted exit cannot end in `.deopt`" is false; route `.native_direct`
+only from `.none`), two majors (`exitIsPreEffect` misses `ustore` and
+`sgm_setpos`; the `.none` strike exemption needs the `hotexit` bound),
+two minors (`driveDispatcherLedger`'s `driveChain` caller; the
+candidate tie-break) and a nit (stub order). It confirmed R1's cell
+test and rcx, R2's coherence after a refusal or a pre-effect deopt,
+`linked_trace` on both paths, and determinism. All verified and folded
+in above (`docs/reviews/doc56/antigravity-phase67-plan.md`).
+
+**Order.** (1) R1; (2) R2; (3) R3 and R4; (4) Phase 6 items 1–10
+(§4.8.2); (5) measure, docs, code review. The tree stays green after
+each step.
+
+**Measure.** Switch off vs on, best of 5: boolC, bit-reverse alone,
+scimark-fft, nsieve, nsieve-bit, sieve_int; `--jit-stats` for the
+seam and terminal-row histograms (the jit-debug build) as in §4.8.2.
+Board with the switch off (expected unchanged) and on. Budget: with
+the switch on, no bench slower than switch off by more than noise
+except where G5 is the stated cause.
+
 ### 4.9 Tiering policy (Phase 7)
 
 - **Routing precedence** (review Q5), in `noteTakenExit`:
