@@ -133,6 +133,7 @@ fn detectDeadCarries(
             },
             .neg, .not, .bnot,
             .guard_int, .guard_float, .guard_number, .guard_true, .guard_false,
+            .guard_is_nil, .guard_is_false, .guard_is_true,
             .aload,
             .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits,
             .guard_append,
@@ -301,6 +302,7 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
             => ins.a == idx or ins.b == idx,
             .neg, .not, .bnot,
             .guard_int, .guard_float, .guard_number, .guard_true, .guard_false,
+            .guard_is_nil, .guard_is_false, .guard_is_true,
             .aload,
             .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits,
             .guard_append,
@@ -498,6 +500,7 @@ fn detectRedundantGuards(
     for (t.instrs, 0..) |ins, i| {
         switch (ins.op) {
             .guard_int, .guard_float, .guard_number, .guard_true, .guard_false,
+            .guard_is_nil, .guard_is_false, .guard_is_true,
             .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits,
             => {
                 const key = GuardKey{ .op = ins.op, .a = ins.a };

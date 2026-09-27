@@ -12,15 +12,28 @@ findings folded in — not implemented
 
 - [x] Bart picked the model (2026-09-27): **B — value specialization**, as
   LuaJIT does (§3).
-
-### Outstanding
-
 - [x] Review r1 (Antigravity): CHANGES REQUESTED, 8 findings, all accepted
   and folded into rev 3 (`docs/reviews/doc57/antigravity.md`).
 - [x] Review r2 (Antigravity) on rev 3: APPROVE WITH CHANGES, 5 findings, all
   accepted and folded into rev 4 (same file).
-- [ ] P1 — IR + recorder + tier-1a: `guard_is_*`, `pinPrim`, folds, entry
-  fingerprint, close-time instability abort.
+- [x] P1 — IR + recorder + tier-1a (2026-09-27). As built:
+  - Ops `guard_is_nil/false/true` at wire ordinals 90–92 (aux = recording
+    pc); helpers `primPinValue/primPinOp/primPinPasses` in `trace_ir.zig`.
+  - `pinPrim` in the recorder pins `slot_load`/`phi` inputs and returns a
+    konst; used by branches, `not`, `eq`/`ne`, array/hash/upvalue stores,
+    `type`/`math.type`/`tostring`. `boolTyped` admits the typed producers.
+  - Close check in `loopCloseSelfDefeating` aborts `type_instability` when
+    a carried value no longer passes its pin.
+  - Entry fingerprint: `EntryGuardType.nil/false_/true_` + `accepts(v)`.
+  - Tests: `src/interp_bool_test.zig` (11, mutation-checked); two older
+    tests rewritten for the new behaviour (the fingerprint polarity test
+    now uses a compare result as its falsy operand; the "unproven bool
+    store aborts" hash test now expects the pin + store).
+  - Tier-1a runs the pins; native does not yet (a trace with a pin still
+    stays on tier-1a / falls back until P2).
+
+### Outstanding
+
 - [ ] P2 — native: prove/alloc/prologue, `not` and `eq` on dynamic `.bool`.
 - [ ] P3 — instability unroll (LuaJIT `instunroll`) for the flipped carried
   bool. Own investigation first (§4.7).

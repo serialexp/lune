@@ -725,7 +725,50 @@ pub const IrOp = enum(u8) {
     /// then nothing emits it and every executor/prover rejects it. `a` =
     /// table, `b` = key, `aux` = value ref; produces no value.
     tset,
+
+    // ---- doc 57: value-specialized primitive pins (LuaJIT's typed SLOAD) ----
+    //
+    // `a` = value ref → the value is EXACTLY the primitive the opcode names
+    // (tag `nil`; or tag `boolean` with payload 0 / 1). Produces nothing; the
+    // recorder reads a konst of that value for every later use of `a`, so
+    // `if flag`/`not flag`/`flag == true` fold away. Unlike `guard_true`/
+    // `guard_false` (truthiness), these pin the value: a table where `true`
+    // was seen fails. Stamp the recording pc in `aux` like the other type
+    // guards. Wire ordinals 90–92.
+    guard_is_nil,
+    guard_is_false,
+    guard_is_true,
 };
+
+/// Doc 57: the primitive a `guard_is_*` pins, or null for any other op.
+pub fn primPinValue(op: IrOp) ?value_mod.Value {
+    return switch (op) {
+        .guard_is_nil => value_mod.Value.nil(),
+        .guard_is_false => value_mod.Value.boolean(false),
+        .guard_is_true => value_mod.Value.boolean(true),
+        else => null,
+    };
+}
+
+/// Doc 57: the `guard_is_*` that pins `v`, or null when `v` is not nil/bool.
+pub fn primPinOp(v: value_mod.Value) ?IrOp {
+    return switch (v.tag) {
+        .nil => .guard_is_nil,
+        .boolean => if (v.asBool()) .guard_is_true else .guard_is_false,
+        else => null,
+    };
+}
+
+/// Doc 57: `v` is exactly the primitive `op` pins (strict: tag, and for a bool
+/// the payload). The one predicate every tier's `guard_is_*` check uses.
+pub fn primPinPasses(op: IrOp, v: value_mod.Value) bool {
+    return switch (op) {
+        .guard_is_nil => v.isNil(),
+        .guard_is_false => v.isBool() and !v.asBool(),
+        .guard_is_true => v.isBool() and v.asBool(),
+        else => unreachable,
+    };
+}
 
 /// Doc 56 Phase 3: what a `.link` terminal's hand-off means (rides
 /// `link.a`). Recorded, never derived at run time, so every mode reads the
@@ -784,8 +827,9 @@ pub const IrInstr = struct {
 };
 
 /// The **post-increment resume/exit PC** recorded in a guard's `aux`, or null if
-/// this op doesn't carry one. ONLY the SIX ops
-/// `guard_int/float/number/true/false` + `int_of_float` stamp their recording PC
+/// this op doesn't carry one. ONLY the type guards
+/// `guard_int/float/number/true/false`, doc 57's `guard_is_nil/false/true`,
+/// `int_of_float` and `alen` stamp their recording PC
 /// into `aux` (see `emit`); the array guards (`guard_lane`, `guard_fits`) reuse
 /// `aux` for lane ordinals, and the rest leave it zero — so reading `aux` as a PC
 /// there is a category error that can mis-key a guard-failure counter or, worse,
@@ -798,6 +842,7 @@ pub const IrInstr = struct {
 pub fn guardExitPc(ins: IrInstr) ?u32 {
     return switch (ins.op) {
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .alen => @intCast(ins.aux),
+        .guard_is_nil, .guard_is_false, .guard_is_true => @intCast(ins.aux),
         else => null,
     };
 }
@@ -809,6 +854,7 @@ pub fn guardExitPc(ins: IrInstr) ?u32 {
 pub fn isSideExitGuardOp(op: IrOp) bool {
     return switch (op) {
         .guard_absent => true,
+        .guard_is_nil, .guard_is_false, .guard_is_true => true,
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent, .alen => true,
         else => false,
     };
@@ -868,6 +914,9 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .guard_number,
         .guard_true,
         .guard_false,
+        .guard_is_nil,
+        .guard_is_false,
+        .guard_is_true,
         .aload,
         .guard_table,
         .guard_bounds,

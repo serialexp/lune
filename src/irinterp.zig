@@ -440,6 +440,13 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     if (record) rec.exit(i, .guard, values[ins.a]);
                     break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
+                // Doc 57: strict primitive pins (the value, not its truthiness).
+                .guard_is_nil, .guard_is_false, .guard_is_true => if (trace_ir.primPinPasses(ins.op, values[ins.a])) {
+                    if (record) rec.guardPass(i, values[ins.a]);
+                } else {
+                    if (record) rec.exit(i, .guard, values[ins.a]);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
 
                 // ---- float→int loop-limit specialization ----
                 // Convert the (loop-invariant) float limit to its exact integer

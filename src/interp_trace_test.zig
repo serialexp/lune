@@ -3314,15 +3314,15 @@ test "recorder (hash field, P1): a bool-proven copy (dst.f = src.g) records; hlo
     try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
 }
 
-test "recorder (hash field, P1): an UNPROVEN bool store (plain local) aborts fail-closed" {
+test "recorder (hash field, P1 + doc 57): a plain-local bool store is pinned, then stored as a konst" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    // `x` reaches the store as a `slot_load` ref that merely HAPPENED to hold a
-    // bool at record time — nothing pins it (no bool guard exists), so a later
-    // iteration could deliver a heap value straight into the cell. That is
-    // exactly the drifting-store-value hole `guardNum` plugs for scalars;
-    // fail-closed, the recorder aborts and the loop stays tier-0.
+    // `x` reaches the store as a `slot_load` ref. Before doc 57 nothing proved it
+    // stayed a bool, so the recorder aborted fail-closed (a later iteration could
+    // deliver a heap value into the cell). Doc 57 pins it: a `guard_is_true` on
+    // the input, and the store writes the konst `true`. A later non-`true` value
+    // fails the pin and exits, so the drifting-store hole stays shut.
     var chunk = try runForTrace(&vm, gpa,
         \\local t = {b = false}
         \\local x = true
@@ -3331,8 +3331,11 @@ test "recorder (hash field, P1): an UNPROVEN bool store (plain local) aborts fai
     , true);
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
-    try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
+    var buf: [8192]u8 = undefined;
+    const text = try dumpTrace(&buf, &vm);
+    try testing.expect(std.mem.indexOf(u8, text, "guard_is_true") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "hstore") != null);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
     try testing.expect(!vm.trace.isRecording());
 }
 

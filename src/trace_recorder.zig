@@ -226,14 +226,7 @@ pub fn obsTypeOf(v: Value) ObsType {
 pub fn entryGuardsMatch(guards: []const trace_code.EntryGuard, regs: RegWindow) bool {
     for (guards) |g| {
         if (g.slot >= regs.len()) return false;
-        const v = regs.get(g.slot);
-        const ok = switch (g.ty) {
-            .int => v.isInt(),
-            .float => v.isFloat(),
-            .number => v.isNumber(),
-            .table => v.isHeap() and v.heapType() == .table,
-        };
-        if (!ok) return false;
+        if (!g.ty.accepts(regs.get(g.slot))) return false;
     }
     return true;
 }
@@ -247,13 +240,9 @@ pub fn entryGuardsMismatchPromotable(guards: []const trace_code.EntryGuard, regs
     for (guards) |g| {
         if (g.slot >= regs.len()) return false;
         const v = regs.get(g.slot);
-        const ok = switch (g.ty) {
-            .int => v.isInt(),
-            .float => v.isFloat(),
-            .number => v.isNumber(),
-            .table => v.isHeap() and v.heapType() == .table,
-        };
-        if (!ok) {
+        if (!g.ty.accepts(v)) {
+            // Only int→float is fixable by peeling; a primitive pin (doc 57)
+            // or any other mismatch is not.
             if (g.ty != .float or !v.isInt()) return false;
             has_mismatch = true;
         }
@@ -1467,7 +1456,7 @@ pub const RecordingSession = struct {
             .shr => try self.recBitwise(.shr, instr, regs),
             .sar => try self.recBitwise(.sar, instr, regs),
             .neg => try self.recNeg(instr, regs),
-            .not => try self.recNot(instr),
+            .not => try self.recNot(instr, regs),
             .bnot => try self.recBnot(instr, regs),
 
             // comparisons (gt/ge normalise to lt/le with swapped operands).
@@ -1652,6 +1641,10 @@ pub const RecordingSession = struct {
             // `aux` is unused for anything else — the result kind is `.int`, the
             // operand is `a`).
             .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .alen => {
+                ins_mut.aux = @intCast(self.cur_pc);
+            },
+            // Doc 57: the primitive pins are type guards too.
+            .guard_is_nil, .guard_is_false, .guard_is_true => {
                 ins_mut.aux = @intCast(self.cur_pc);
             },
             else => {},
@@ -1882,6 +1875,51 @@ pub const RecordingSession = struct {
         self.stampProv(gref, role, operand, .neutral);
     }
 
+    /// Doc 57 §4.2: value-specialize an untyped nil/bool input (LuaJIT's typed
+    /// SLOAD of `IRT_NIL`/`IRT_FALSE`/`IRT_TRUE`). Returns the konst ref that
+    /// stands for `ref` from here on, or null when no pin applies:
+    ///   * `v` is not nil/bool → null (numbers/heap keep their own paths);
+    ///   * `ref` is already a konst → `ref`;
+    ///   * `ref` is a `slot_load` or a `phi` (the untyped sources) → emit the
+    ///     strict `guard_is_*` (deduped through `guarded_refs`, which
+    ///     `peelRewind` already purges correctly — no second map) and return
+    ///     the interned konst of `v`;
+    ///   * any other producer → null: compares, `not`, bool-lane `aload`, bool
+    ///     `hload`/`uload` are typed producers that stay dynamic `.bool`, and
+    ///     value-lane loads keep today's behaviour.
+    /// The register is NOT rebound: the slot stays `.input` (no φ, no
+    /// writeback); later consumers of the same ref pin again and hit the dedup.
+    /// Provenance is `(.operand_type, operand)` even at a branch: a pin failing
+    /// there is not always the other CFG edge (`true` → a table stays truthy).
+    pub fn pinPrim(self: *RecordingSession, ref: Ref, v: Value, operand: OperandDesig) !?Ref {
+        const op = trace_ir.primPinOp(v) orelse return null;
+        if (self.konstValueOf(ref) != null) return ref;
+        switch (self.instrs.items[@intCast(ref)].op) {
+            .slot_load, .phi => {},
+            else => return null,
+        }
+        try self.guard(ref, op, .operand_type, operand);
+        return try self.konst(v);
+    }
+
+    /// Doc 57: is `ref` statically a boolean on every run of the trace? A bool
+    /// konst, or a producer whose result type is fixed: the compares and `not`
+    /// (always a bool), a bool-LANE `aload` (checked by lane, not by the
+    /// observed `ty`, which a value-lane load also stamps), and a bool
+    /// `hload`/`uload` field (their fused tag check exits on drift — the
+    /// `recHashSet` P1 discipline). `slot_load`/`phi` are never typed: a peel
+    /// φ copies its init's `ty`, which proves nothing about the update.
+    fn boolTyped(self: *const RecordingSession, ref: Ref) bool {
+        if (self.konstValueOf(ref)) |kv| return kv.isBool();
+        const ins = self.instrs.items[@intCast(ref)];
+        return switch (ins.op) {
+            .eq, .ne, .lt, .le, .not => true,
+            .aload => ins.aux == @intFromEnum(arr.Lane.boolean),
+            .hload, .uload => ins.ty == .boolean,
+            else => false,
+        };
+    }
+
     pub fn guardInt(self: *RecordingSession, ref: Ref, role: GuardRole, operand: OperandDesig) !void {
         try self.guard(ref, .guard_int, role, operand);
     }
@@ -1975,9 +2013,18 @@ pub const RecordingSession = struct {
     }
 
     /// `not` works on any value via Lua truthiness, so it needs no type guard —
-    /// the IR `not` is defined over truthiness, like tier-0.
-    pub fn recNot(self: *RecordingSession, instr: Instr) !void {
-        const rb = try self.refOf(instr.b);
+    /// the IR `not` is defined over truthiness, like tier-0. Doc 57: a nil/bool
+    /// input is value-specialized first, and a konst operand folds to the konst
+    /// result (LuaJIT BC_NOT: "type specialization already forces const
+    /// result"). Only a dynamic operand (a compare result, a bool-lane load, a
+    /// heap value) still emits the IR `not`.
+    pub fn recNot(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
+        const rb_raw = try self.refOf(instr.b);
+        const rb = (try self.pinPrim(rb_raw, regs.get(instr.b), .b)) orelse rb_raw;
+        if (self.konstValueOf(rb)) |kv| {
+            self.setReg(instr.a, try self.konst(Value.boolean(!kv.isTruthy())));
+            return;
+        }
         const r = try self.emit(.{ .op = .not, .a = rb, .ty = .boolean });
         self.setReg(instr.a, r);
     }
@@ -2468,7 +2515,10 @@ pub const RecordingSession = struct {
             // disjoint, and same-table hstore+append contradict at the guards
             // (`docs/design/08-multi-store-sinking.md` §soundness).
             if (self.traceHasArrayRead()) return self.abort(.store_after_load);
-            const rval = try self.refOf(f.val);
+            // Doc 57: a bool input is value-specialized (the store writes the
+            // konst; its `guard_fits` then folds in tropt).
+            const rval_raw = try self.refOf(f.val);
+            const rval = (try self.pinPrim(rval_raw, vval, f.val_od)) orelse rval_raw;
             const lane_ord: i32 = @intFromEnum(lane);
             const rtab = try self.refOf(f.tab);
             // P0d: `t[#t+1] = v` (length-dependent append) is non-idempotent under
@@ -2510,7 +2560,9 @@ pub const RecordingSession = struct {
         // because it changes shape. A pure-write store (no prior `aload`) is
         // deopt-idempotent and emits inline as before.
         const defer_store = self.traceHasHeapLoad();
-        const rval = try self.refOf(f.val);
+        // Doc 57: a bool input is value-specialized (see the append path).
+        const rval_raw = try self.refOf(f.val);
+        const rval = (try self.pinPrim(rval_raw, vval, f.val_od)) orelse rval_raw;
 
         const lane_ord: i32 = @intFromEnum(lane);
         const rtab = try self.refOf(f.tab);
@@ -3033,7 +3085,7 @@ pub const RecordingSession = struct {
         // read is a read-modify-write that must be deferred below every guard so a
         // side-exit leaves it un-executed and deopt-replay applies it exactly once.
         const defer_store = self.traceHasHeapLoad();
-        const rval = try self.refOf(f.val);
+        var rval = try self.refOf(f.val);
         // Pin the **store value's** type. A hash cell holds a full tagged `Value`
         // with no lane to constrain it, so this pin is the analogue of the array
         // path's `guard_fits`: it is the sole guarantee the field stays this type
@@ -3047,16 +3099,15 @@ pub const RecordingSession = struct {
         //  * bool (doc 43 P1): there is no runtime bool guard — instead the value
         //    ref must be STATICALLY bool-proven: a konst bool, or a producer whose
         //    `.ty == .boolean` (an `hload` bool field, whose fused tag exit
-        //    already side-exits upstream on drift). An unproven ref (e.g. a
-        //    `slot_load` of a plain register that merely happened to hold a bool)
-        //    aborts — that is exactly the drifting-store-value hole `guardNum`
-        //    plugs for scalars, and fail-closed is the P0 discipline.
+        //    already side-exits upstream on drift). Doc 57: an untyped input
+        //    (`slot_load`/`phi`) is value-specialized first — its strict pin
+        //    is the runtime guard, and the store writes the konst. Anything
+        //    still unproven aborts — that is exactly the drifting-store-value
+        //    hole `guardNum` plugs for scalars, and fail-closed is the P0
+        //    discipline.
         if (vval.isBool()) {
-            const bool_proven = if (self.konstValueOf(rval)) |kv|
-                kv.isBool()
-            else
-                self.instrs.items[@intCast(rval)].ty == .boolean;
-            if (!bool_proven) return self.abort(.nyi_opcode);
+            if (try self.pinPrim(rval, vval, f.val_od)) |k| rval = k;
+            if (!self.boolTyped(rval)) return self.abort(.nyi_opcode);
         } else {
             try self.guardNum(rval, vval, .value_type, f.val_od);
         }
@@ -3094,8 +3145,13 @@ pub const RecordingSession = struct {
     /// `eq`/`ne`. First cut: numeric operands only (the common loop-condition
     /// case); other types abort.
     pub fn recEq(self: *RecordingSession, op: IrOp, instr: Instr, regs: RegWindow) !void {
-        const rb = try self.refOf(instr.b);
-        const rc = try self.refOf(instr.c);
+        // Doc 57: value-specialize nil/bool inputs first, so a pinned input
+        // takes the konst paths below (LuaJIT `lj_record_objcmp` on typed
+        // primitives).
+        const rb_raw = try self.refOf(instr.b);
+        const rc_raw = try self.refOf(instr.c);
+        const rb = (try self.pinPrim(rb_raw, regs.get(instr.b), .b)) orelse rb_raw;
+        const rc = (try self.pinPrim(rc_raw, regs.get(instr.c), .c)) orelse rc_raw;
         // Konst×konst folds to a bool konst with zero runtime work — `Value.eql`
         // at record time is exact for every type (interned strings compare by
         // identity). This is what makes the `type(x) == "number"` idiom (doc 23)
@@ -3110,30 +3166,35 @@ pub const RecordingSession = struct {
         const vb = regs.get(instr.b);
         const vc = regs.get(instr.c);
         if (!vb.isNumber() or !vc.isNumber()) {
+            // Doc 57: two booleans whose types are both proven (a konst, or a
+            // typed producer — a compare, `not`, a bool-lane load, a bool
+            // field) compare by value on every tier; native lowers it as the
+            // int compare of the 0/1 payloads. (Untyped inputs were pinned to
+            // konsts above, so any other bool ref here is a typed producer.)
+            if (vb.isBool() and vc.isBool() and self.boolTyped(rb) and self.boolTyped(rc)) {
+                const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
+                self.setReg(instr.a, r);
+                return;
+            }
             // Cross-type fold — the `x == nil` idiom. Lua equality across
             // distinct type classes is unconditionally false (`__eq` only fires
             // table×table / userdata×userdata, never number×anything-else), and
             // int↔float — the one cross-type pair that CAN compare equal — is
-            // excluded here because both sides would satisfy `isNumber`. So an
-            // observed NUMBER compared against a konst NON-number can never be
-            // true: pin the number side's type (guardNum — an iteration where
-            // the operand drifts off-number side-exits before the fold lies)
-            // and fold to a bool konst. The konst side is the bytecode literal
-            // and needs no guard. An observed (non-konst) non-number operand
-            // still aborts: bool/nil/heap have no strict type guard to pin them
-            // (`guard_true`/`guard_false` pin truthiness, not type).
-            if (vb.isNumber()) {
-                if (self.konstValueOf(rc)) |kc| if (!kc.isNumber()) {
-                    try self.guardNum(rb, vb, .operand_type, .b);
-                    self.setReg(instr.a, try self.konst(Value.boolean(op == .ne)));
-                    return;
-                };
-            } else if (vc.isNumber()) {
-                if (self.konstValueOf(rb)) |kb| if (!kb.isNumber()) {
-                    try self.guardNum(rc, vc, .operand_type, .c);
-                    self.setReg(instr.a, try self.konst(Value.boolean(op == .ne)));
-                    return;
-                };
+            // one class here. So when BOTH sides' classes are pinned and they
+            // differ, the answer is fixed: pin a non-konst number side with
+            // guardNum (an iteration where it drifts off-number side-exits
+            // before the fold lies) and fold to a bool konst. Pinned means: a
+            // konst (the bytecode literal, or a doc 57 pin), a number (pinned by
+            // the guardNum emitted here), or a proven-bool producer. Anything
+            // else (an unproven heap/nil value) still aborts.
+            const b_pinned = self.konstValueOf(rb) != null or vb.isNumber() or self.boolTyped(rb);
+            const c_pinned = self.konstValueOf(rc) != null or vc.isNumber() or self.boolTyped(rc);
+            const same_class = (vb.isNumber() and vc.isNumber()) or vb.tag == vc.tag;
+            if (b_pinned and c_pinned and !same_class) {
+                if (vb.isNumber() and self.konstValueOf(rb) == null) try self.guardNum(rb, vb, .operand_type, .b);
+                if (vc.isNumber() and self.konstValueOf(rc) == null) try self.guardNum(rc, vc, .operand_type, .c);
+                self.setReg(instr.a, try self.konst(Value.boolean(op == .ne)));
+                return;
             }
             return self.abort(.bad_type);
         }
@@ -3195,7 +3256,11 @@ pub const RecordingSession = struct {
                 }
             }
         }
-        const ra = try self.refOf(instr.a);
+        // Doc 57: a nil/bool input is value-specialized first (its strict pin
+        // is the only guard left), so the konst fold below removes the branch
+        // — LuaJIT's "type specialization suffices" for BC_IST/BC_ISF.
+        const ra_raw = try self.refOf(instr.a);
+        const ra = (try self.pinPrim(ra_raw, regs.get(instr.a), .a)) orelse ra_raw;
         const truthy = truthy_early;
         // Fold statically-decided branches (doc 30 c5): a konst's truthiness is
         // fixed forever, and a proven-string producer result (`scap_str`,
@@ -4085,8 +4150,9 @@ pub const RecordingSession = struct {
     /// ride-along): a numeric argument's `guardNum` pin decides
     /// "integer"/"float" (the pin is exactly the query!), a pinned
     /// table/native/closure folds `nil` (Value.nil needs no interning), and
-    /// the pin-less observations (string/nil/bool non-konst) abort as in
-    /// `recBType`. Never allocates: string results via `foldInternedStr`.
+    /// a nil/bool input is value-specialized (doc 57) and folds `nil` too, and
+    /// the pin-less observations (a non-konst string) abort as in `recBType`.
+    /// Never allocates: string results via `foldInternedStr`.
     pub fn recBMType(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
         if (instr.b != 1) return self.abort(.cross_frame);
         if (instr.c != 1) return self.abort(.cross_frame);
@@ -4097,6 +4163,10 @@ pub const RecordingSession = struct {
         if (self.konstValueOf(arg_ref) == null) {
             if (argv.isNumber()) {
                 try self.guardNum(arg_ref, argv, .operand_type, .a1);
+            } else if ((try self.pinPrim(arg_ref, argv, .a1)) != null or self.boolTyped(arg_ref)) {
+                // Doc 57: a nil/bool input is value-specialized, and a typed
+                // bool producer is always a bool — either way the result is
+                // fixed.
             } else if (argv.isHeap()) switch (argv.heapType()) {
                 .table => {
                     const tbl = table_mod.Table.fromHeader(argv.asHeap());
@@ -4180,6 +4250,10 @@ pub const RecordingSession = struct {
         if (self.konstValueOf(arg_ref) == null) {
             if (argv.isNumber()) {
                 try self.guardNum(arg_ref, argv, .operand_type, .a1);
+            } else if ((try self.pinPrim(arg_ref, argv, .a1)) != null or self.boolTyped(arg_ref)) {
+                // Doc 57: a nil/bool input is value-specialized, and a typed
+                // bool producer is always a bool — either way the result is
+                // fixed.
             } else if (argv.isHeap()) switch (argv.heapType()) {
                 .table => {
                     const tbl = table_mod.Table.fromHeader(argv.asHeap());
@@ -4228,7 +4302,10 @@ pub const RecordingSession = struct {
         if (instr.b != 1) return self.abort(.cross_frame);
         if (instr.c != 1) return self.abort(.cross_frame);
         const arg_slot: u16 = @intCast(@as(usize, instr.a) + 1);
-        const arg_ref = try self.refOf(arg_slot);
+        // Doc 57: a nil/bool input is value-specialized, so it takes the konst
+        // fold below ("true"/"false"/"nil").
+        const arg_raw = try self.refOf(arg_slot);
+        const arg_ref = (try self.pinPrim(arg_raw, regs.get(arg_slot), .a1)) orelse arg_raw;
         if (self.konstValueOf(arg_ref)) |kv| {
             if (kv.isHeap()) return self.abort(.bad_type);
             try self.guardBuiltinCallee(instr.a, .tostring);
@@ -5525,13 +5602,12 @@ pub const RecordingSession = struct {
         if (cell.isOpen()) return self.abort(.nyi_opcode);
         if (self.snapshot_read_cells.contains(@intFromPtr(cell))) return self.abort(.upvalue_mutable);
         const path_slot = self.upvalAccessPathSlot() orelse return self.abort(.cross_frame);
-        const rval = try self.refOf(instr.a);
+        var rval = try self.refOf(instr.a);
         if (vval.isBool()) {
-            const bool_proven = if (self.konstValueOf(rval)) |kv|
-                kv.isBool()
-            else
-                self.instrs.items[@intCast(rval)].ty == .boolean;
-            if (!bool_proven) return self.abort(.nyi_opcode);
+            // Doc 57: pin an untyped input, then require a proven bool (the
+            // same rule as `recHashSet`).
+            if (try self.pinPrim(rval, vval, .a)) |k| rval = k;
+            if (!self.boolTyped(rval)) return self.abort(.nyi_opcode);
         } else {
             try self.guardNum(rval, vval, .value_type, .a);
         }
@@ -5598,6 +5674,9 @@ pub const RecordingSession = struct {
             .guard_number,
             .guard_true,
             .guard_false,
+            .guard_is_nil,
+            .guard_is_false,
+            .guard_is_true,
             .guard_func,
             .guard_builtin,
             .fsqrt,
@@ -5746,9 +5825,11 @@ pub const RecordingSession = struct {
     /// anchor's accounting live and the producing channel retrying under the
     /// record gate.
     ///
-    /// Scope (codex finding 6): proven int↔float contradictions only —
+    /// Scope (codex finding 6): proven int↔float contradictions —
     /// `guard_number` matches both numeric kinds and non-numeric carried slots
-    /// have legitimate specialized load/store relationships. The ENTRY side
+    /// have legitimate specialized load/store relationships — plus doc 57's
+    /// value pins, where any carried value other than the pin contradicts
+    /// (the pin is also an entry-fingerprint guard). The ENTRY side
     /// mirrors the fingerprint-extraction criteria exactly (a guard over a
     /// `slot_load` of an anchor-window slot — `matchesFingerprint` is what
     /// makes the contradiction fatal at re-entry); the STORE side reads the
@@ -5762,11 +5843,10 @@ pub const RecordingSession = struct {
         if (self.inline_depth != 0) return false;
         const instrs = self.instrs.items;
         for (instrs, 0..) |ins, i| {
-            const want_int = switch (ins.op) {
-                .guard_int => true,
-                .guard_float => false,
+            switch (ins.op) {
+                .guard_int, .guard_float, .guard_is_nil, .guard_is_false, .guard_is_true => {},
                 else => continue,
-            };
+            }
             const ref: usize = @intCast(ins.a);
             if (ref >= i or instrs[ref].op != .slot_load) continue;
             const slot: usize = @intCast(instrs[ref].aux);
@@ -5780,8 +5860,18 @@ pub const RecordingSession = struct {
             // the recorded path. (The IR `ty` is useless here: an unguarded
             // `slot_load` store — the fft `k = n` reset — is `.unknown`.)
             const v = regs.get(@intCast(slot));
-            if (want_int and v.isFloat()) return true;
-            if (!want_int and v.isInt()) return true;
+            const defeated = switch (ins.op) {
+                .guard_int => v.isFloat(),
+                .guard_float => v.isInt(),
+                // Doc 57 §4.3 (LuaJIT GFAIL/TYPEINS): a value-specialized input
+                // must carry exactly its pin around the back-edge, or iteration
+                // 2 fails the pin every time — the flipped bool (`b = not b`).
+                // Whatever produced the carried value, only strict equality
+                // with the pin is stable. P3 will unroll instead of aborting.
+                .guard_is_nil, .guard_is_false, .guard_is_true => !trace_ir.primPinPasses(ins.op, v),
+                else => unreachable,
+            };
+            if (defeated) return true;
         }
         return false;
     }

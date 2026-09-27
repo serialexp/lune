@@ -538,31 +538,35 @@ test "recArraySet: t[k]=false on a bool lane records the full guarded write sequ
 
     try testing.expect(state.isRecording()); // clean record — no abort
     const ops = state.rec.instrs.items;
-    // value resolved first (for the C1 taint scan): slot_load(value), then
-    // slot_load(table), guard_table, guard_lane, slot_load(key), guard_int, aref,
-    // guard_bounds, guard_fits, astore. No guard_present — astore creates presence.
-    // guard_fits is now emitted for the bool lane too (value-stability: a non-bool
-    // free-variable store side-exits to tier-0 instead of tripping the oracle).
-    try testing.expectEqual(@as(usize, 10), ops.len);
+    // value resolved first (for the C1 taint scan): slot_load(value), which doc 57
+    // value-specializes — guard_is_false on it, then the konst `false` every later
+    // use reads. Then slot_load(table), guard_table, guard_lane, slot_load(key),
+    // guard_int, aref, guard_bounds, guard_fits, astore. No guard_present — astore
+    // creates presence. guard_fits is still emitted for the bool lane (it guards
+    // the konst now, and tropt folds it as always-pass).
+    try testing.expectEqual(@as(usize, 12), ops.len);
     try testing.expectEqual(IrOp.slot_load, ops[0].op); // value (r0)
-    try testing.expectEqual(IrOp.slot_load, ops[1].op); // table (r1)
-    try testing.expectEqual(IrOp.guard_table, ops[2].op);
-    try testing.expectEqual(IrOp.guard_lane, ops[3].op);
-    try testing.expectEqual(@intFromEnum(arr.Lane.boolean), ops[3].aux);
-    try testing.expectEqual(IrOp.slot_load, ops[4].op); // key (r2)
-    try testing.expectEqual(IrOp.guard_int, ops[5].op);
-    try testing.expectEqual(IrOp.aref, ops[6].op);
-    try testing.expectEqual(@as(Ref, 1), ops[6].a); // table ref
-    try testing.expectEqual(@as(Ref, 4), ops[6].b); // key ref
-    try testing.expectEqual(IrOp.guard_bounds, ops[7].op);
-    try testing.expectEqual(@as(Ref, 6), ops[7].a); // guards the aref
-    try testing.expectEqual(IrOp.guard_fits, ops[8].op);
-    try testing.expectEqual(@as(Ref, 0), ops[8].a); // range-checks the false slot_load
-    try testing.expectEqual(@intFromEnum(arr.Lane.boolean), ops[8].aux);
-    try testing.expectEqual(IrOp.astore, ops[9].op);
-    try testing.expectEqual(@as(Ref, 6), ops[9].a); // stores through the aref
-    try testing.expectEqual(@as(Ref, 0), ops[9].b); // value = the false slot_load
-    try testing.expectEqual(@intFromEnum(arr.Lane.boolean), ops[9].aux);
+    try testing.expectEqual(IrOp.guard_is_false, ops[1].op);
+    try testing.expectEqual(@as(Ref, 0), ops[1].a); // pins the value slot_load
+    try testing.expectEqual(IrOp.konst, ops[2].op); // the pinned `false`
+    try testing.expectEqual(IrOp.slot_load, ops[3].op); // table (r1)
+    try testing.expectEqual(IrOp.guard_table, ops[4].op);
+    try testing.expectEqual(IrOp.guard_lane, ops[5].op);
+    try testing.expectEqual(@intFromEnum(arr.Lane.boolean), ops[5].aux);
+    try testing.expectEqual(IrOp.slot_load, ops[6].op); // key (r2)
+    try testing.expectEqual(IrOp.guard_int, ops[7].op);
+    try testing.expectEqual(IrOp.aref, ops[8].op);
+    try testing.expectEqual(@as(Ref, 3), ops[8].a); // table ref
+    try testing.expectEqual(@as(Ref, 6), ops[8].b); // key ref
+    try testing.expectEqual(IrOp.guard_bounds, ops[9].op);
+    try testing.expectEqual(@as(Ref, 8), ops[9].a); // guards the aref
+    try testing.expectEqual(IrOp.guard_fits, ops[10].op);
+    try testing.expectEqual(@as(Ref, 2), ops[10].a); // range-checks the pinned konst
+    try testing.expectEqual(@intFromEnum(arr.Lane.boolean), ops[10].aux);
+    try testing.expectEqual(IrOp.astore, ops[11].op);
+    try testing.expectEqual(@as(Ref, 8), ops[11].a); // stores through the aref
+    try testing.expectEqual(@as(Ref, 2), ops[11].b); // value = the pinned konst
+    try testing.expectEqual(@intFromEnum(arr.Lane.boolean), ops[11].aux);
 }
 
 test "recArraySet: a bool-lane append (t[asize]=true) records the guarded grow sequence" {
@@ -591,18 +595,20 @@ test "recArraySet: a bool-lane append (t[asize]=true) records the guarded grow s
     try testing.expect(state.isRecording()); // clean record — the append path, no abort
     const ops = state.rec.instrs.items;
     // Same prologue as the in-bounds store, but guard_bounds → guard_append and
-    // astore → astore_append: slot_load(value), slot_load(table), guard_table,
-    // guard_lane, slot_load(key), guard_int, aref, guard_append, guard_fits,
-    // astore_append.
-    try testing.expectEqual(@as(usize, 10), ops.len);
-    try testing.expectEqual(IrOp.aref, ops[6].op);
-    try testing.expectEqual(IrOp.guard_append, ops[7].op);
-    try testing.expectEqual(@as(Ref, 6), ops[7].a); // guards the aref
-    try testing.expectEqual(IrOp.guard_fits, ops[8].op);
-    try testing.expectEqual(IrOp.astore_append, ops[9].op);
-    try testing.expectEqual(@as(Ref, 6), ops[9].a); // stores through the aref
-    try testing.expectEqual(@as(Ref, 0), ops[9].b); // value = the true slot_load
-    try testing.expectEqual(@intFromEnum(arr.Lane.boolean), ops[9].aux);
+    // astore → astore_append: slot_load(value), guard_is_true + konst (doc 57
+    // pin), slot_load(table), guard_table, guard_lane, slot_load(key), guard_int,
+    // aref, guard_append, guard_fits, astore_append.
+    try testing.expectEqual(@as(usize, 12), ops.len);
+    try testing.expectEqual(IrOp.guard_is_true, ops[1].op);
+    try testing.expectEqual(IrOp.konst, ops[2].op);
+    try testing.expectEqual(IrOp.aref, ops[8].op);
+    try testing.expectEqual(IrOp.guard_append, ops[9].op);
+    try testing.expectEqual(@as(Ref, 8), ops[9].a); // guards the aref
+    try testing.expectEqual(IrOp.guard_fits, ops[10].op);
+    try testing.expectEqual(IrOp.astore_append, ops[11].op);
+    try testing.expectEqual(@as(Ref, 8), ops[11].a); // stores through the aref
+    try testing.expectEqual(@as(Ref, 2), ops[11].b); // value = the pinned konst
+    try testing.expectEqual(@intFromEnum(arr.Lane.boolean), ops[11].aux);
 
     // The recorder must NOT have mutated the table — recording is side-effect free.
     try testing.expectEqual(len_before, t.array.asize);
@@ -2048,15 +2054,40 @@ test "recEq: observed float vs konst nil folds under guard_float; ne folds true;
     try testing.expect(!state.rec.konstValueOf(try state.rec.refOf(4)).?.asBool());
 }
 
-test "recEq: observed non-number vs konst nil still aborts bad_type (no strict guard to pin it)" {
+test "recEq: doc 57 — an observed bool input vs konst nil pins the input and folds" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
     try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
-    // r1 = observed bool. guard_true/guard_false pin TRUTHINESS, not type —
-    // a truthy heap value would wave through — so this stays out of scope.
+    // r1 = observed bool (an untyped slot_load). Doc 57 value-specializes it
+    // (`guard_is_true`), so both sides are konsts and the compare folds away.
     var regs = [_]Value{ Value.nil(), Value.boolean(true), Value.nil(), Value.nil() };
+    state.recordInstr(.{ .op = .load_nil, .a = 2 }, winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.eq, 0, 1, 2), winRO(&regs), &proto, 1, Value.nil());
+    try testing.expect(state.isRecording());
+    var pins: usize = 0;
+    for (state.rec.instrs.items) |ins| {
+        try testing.expect(ins.op != .eq);
+        if (ins.op == .guard_is_true) pins += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), pins);
+    // r0 now holds the folded konst `false`.
+    const r0 = state.rec.reg_map[0].ref;
+    try testing.expect(state.rec.konstValueOf(r0).?.eql(Value.boolean(false)));
+}
+
+test "recEq: an observed unproven heap value vs konst nil still aborts bad_type" {
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    // r1 = observed table: no pin covers a heap value's type here (only the
+    // numeric guards and doc 57's nil/bool pins do), so this stays out of scope.
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.nil(), Value.nil() };
     state.recordInstr(.{ .op = .load_nil, .a = 2 }, winRO(&regs), &proto, 0, Value.nil());
     state.recordInstr(Instr.opABC(.eq, 0, 1, 2), winRO(&regs), &proto, 1, Value.nil());
     try testing.expect(!state.isRecording());

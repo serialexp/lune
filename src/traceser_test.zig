@@ -335,9 +335,13 @@ test "wire enum ordinals are a pinned contract (mirrored by viz/src/enums.ts)" {
     // Doc 45 D3: identity-bearing table effects (precise traces only).
     try testing.expectEqual(@as(u8, 88), @intFromEnum(IrOp.tnew));
     try testing.expectEqual(@as(u8, 89), @intFromEnum(IrOp.tset));
+    // Doc 57: value-specialized primitive pins.
+    try testing.expectEqual(@as(u8, 90), @intFromEnum(IrOp.guard_is_nil));
+    try testing.expectEqual(@as(u8, 91), @intFromEnum(IrOp.guard_is_false));
+    try testing.expectEqual(@as(u8, 92), @intFromEnum(IrOp.guard_is_true));
     // Exhaustiveness: if a member is added/removed, this count changes and forces
     // both this test and enums.ts to be revisited.
-    try testing.expectEqual(@as(usize, 90), @typeInfo(IrOp).@"enum".field_names.len);
+    try testing.expectEqual(@as(usize, 93), @typeInfo(IrOp).@"enum".field_names.len);
 
     const ObsType = trace_ir.ObsType;
     try testing.expectEqual(@as(u8, 0), @intFromEnum(ObsType.unknown));

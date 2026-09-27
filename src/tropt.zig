@@ -90,6 +90,8 @@ fn kindOf(op: IrOp) OpKind {
         // hoistable (its result depends only on the loop-invariant float limit).
         .int_of_float => .cvt,
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => .guard,
+        // Doc 57: the primitive pins are ordinary one-operand type guards.
+        .guard_is_nil, .guard_is_false, .guard_is_true => .guard,
         // Cross-frame tracing: `guard_func` pins the runtime callee to the recorded
         // `Proto.id`. A side-effecting (side-exiting) root, deduped by (op, callee
         // ref), never folded away — `guardConstPasses` defaults to keep. Reads `a`.
@@ -279,6 +281,7 @@ fn guardConstPasses(ins: IrInstr, v: Value) bool {
         .guard_number => v.isNumber(),
         .guard_true => v.isTruthy(),
         .guard_false => !v.isTruthy(),
+        .guard_is_nil, .guard_is_false, .guard_is_true => trace.primPinPasses(ins.op, v),
         // The value still fits the recorded narrow lane (a const value here is
         // the bool lane's `astore` constant, e.g. `false`). Lane from `aux`.
         .guard_fits => arr.ArrayPart.laneFits(@enumFromInt(ins.aux), v),

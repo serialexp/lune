@@ -171,6 +171,9 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
             .guard_float => .float,
             .guard_number => .number,
             .guard_table => .table,
+            .guard_is_nil => .nil,
+            .guard_is_false => .false_,
+            .guard_is_true => .true_,
             else => null,
         };
         if (egt) |ty| {
@@ -475,6 +478,8 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
             .neg, .not, .bnot, .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .guard_func => {
                 std.debug.assert(ins.a < i);
             },
+            // Doc 57: the primitive pins read `a` only.
+            .guard_is_nil, .guard_is_false, .guard_is_true => std.debug.assert(ins.a < i),
             // `int_of_float` reads its sole float operand `a` (a prior node).
             .int_of_float => std.debug.assert(ins.a < i),
             // `alen` reads its sole table operand `a` (a prior node).

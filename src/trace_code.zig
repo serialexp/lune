@@ -25,6 +25,26 @@ pub const EntryGuardType = enum(u8) {
     float,
     number, // accepts both int and float (guard_number)
     table,
+    // Doc 57: value-specialized primitive pins (`guard_is_*`) — the value
+    // itself, not only its type.
+    nil,
+    false_,
+    true_,
+
+    /// Does an entry value `v` satisfy this guard? The one definition every
+    /// fingerprint check (the dispatcher's `matchesFingerprint` and the
+    /// recorder's `entryGuardsMatch`/`entryGuardsMismatchPromotable`) uses.
+    pub fn accepts(self: EntryGuardType, v: Value) bool {
+        return switch (self) {
+            .int => v.isInt(),
+            .float => v.isFloat(),
+            .number => v.isNumber(),
+            .table => v.isHeap() and v.heapType() == .table,
+            .nil => v.isNil(),
+            .false_ => v.isBool() and !v.asBool(),
+            .true_ => v.isBool() and v.asBool(),
+        };
+    }
 };
 
 /// A register and the type it must have for this trace to be entered.
@@ -497,13 +517,7 @@ pub const TraceCode = struct {
 
     pub fn matchesFingerprint(self: *const TraceCode, regs: RegWindow) bool {
         for (self.entry_guards) |g| {
-            const v = regs.get(g.slot);
-            switch (g.ty) {
-                .int => if (!v.isInt()) return false,
-                .float => if (!v.isFloat()) return false,
-                .number => if (!v.isNumber()) return false,
-                .table => if (!v.isHeap() or v.heapType() != .table) return false,
-            }
+            if (!g.ty.accepts(regs.get(g.slot))) return false;
         }
         return true;
     }

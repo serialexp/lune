@@ -456,6 +456,9 @@ test "A-i.3 stamp: branch polarity keys on the guest jump-taken edge, not raw tr
     // `jmp_if_true` jumps when truthy. So for one operand value the two opcodes give
     // OPPOSITE polarity, while the guard op (true/false) tracks truthiness alone.
     // { opcode, operand, expected guard op, expected polarity }.
+    // A falsy operand is a compare result (`2 < 1`): a bare `false`/`nil` input
+    // would be value-specialized by doc 57 (a `guard_is_false` pin, no branch
+    // guard), while a compare is a typed producer the branch still tests.
     inline for (.{
         .{ bytecode.OpCode.jmp_if_false, Value.int(1), IrOp.guard_true, Polarity.fallthrough }, // truthy: doesn't jump
         .{ bytecode.OpCode.jmp_if_false, Value.boolean(false), IrOp.guard_false, Polarity.taken }, // falsy: jumps
@@ -464,12 +467,14 @@ test "A-i.3 stamp: branch polarity keys on the guest jump-taken edge, not raw tr
     }) |c| {
         var state = TraceState.init(gpa);
         defer state.deinit();
-        const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 2 };
+        const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
         try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
-        var regs = [_]Value{ c[1], Value.nil() };
+        var regs = [_]Value{ c[1], Value.int(2), Value.int(1) };
+        if (c[1].isBool()) state.recordInstr(Instr.opABC(.lt, 0, 1, 2), winRO(&regs), &proto, 6, Value.nil());
         state.recordInstr(Instr.opABC(c[0], 0, 0, 0), winRO(&regs), &proto, 7, Value.nil());
-        try testing.expectEqual(c[2], state.rec.instrs.items[1].op);
-        const g = state.rec.exit_prov.items[1].?.guard;
+        const gi = state.rec.instrs.items.len - 1; // the branch guard is last
+        try testing.expectEqual(c[2], state.rec.instrs.items[gi].op);
+        const g = state.rec.exit_prov.items[gi].?.guard;
         try testing.expectEqual(GuardRole.branch_cond, g.role);
         try testing.expectEqual(OperandDesig.a, g.operand);
         try testing.expectEqual(@as(u32, 6), g.source_pc); // 7 − 1

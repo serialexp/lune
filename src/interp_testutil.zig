@@ -83,6 +83,9 @@ pub const CapturedOpts = struct {
     /// (`Config.exit_side_native`). Only the native leg compiles pages, so
     /// the other legs are unaffected.
     exit_side_native: bool = false,
+    /// Populate `vm.trace.abort_log` (what `--dump-aborts` turns on), so an
+    /// `inspect` callback can assert which abort reasons fired.
+    record_aborts: bool = false,
     inspect: ?*const fn (*Vm, TraceMode) anyerror!void = null,
 };
 
@@ -117,6 +120,7 @@ pub fn runCapturedTuned(
     vm.trace.config.coverage = opts.coverage;
     vm.trace.config.debug_log = opts.debug_log;
     vm.trace.config.exit_side_native = opts.exit_side_native;
+    vm.trace.config.record_aborts = opts.record_aborts;
     if (opts.hotguard) |hg| vm.trace.config.hotguard = hg;
 
     var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);

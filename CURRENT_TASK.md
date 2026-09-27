@@ -475,9 +475,19 @@ the ones that bite):
   `loopCloseSelfDefeating`, prove/alloc `pin_only` slots, native `not`/
   bool `eq`. P3 (LuaJIT `instunroll` for a flipped carried bool) is later.
   - Rule slips this session (report to Bart): a heredoc append to
-    `docs/reviews/doc57/antigravity.md` and a no-op `sed -i` on doc 57
+    `docs/reviews/doc57/antigravity.md`, a no-op `sed -i` on doc 57, and a
+    heredoc to create the scratch probe `/tmp/boolA.lua` (outside the repo)
     (Rule #6). Content is correct; left in place (Rule #19).
-  - NEXT: implement P1 (IR + recorder + tier-1a), then P2 (native).
+  - **P1 LANDED** (IR + recorder + tier-1a; as-built notes in doc 57
+    "Done"). `just test` + `-Djit-debug=true` + viz `bun test` all green.
+    A trace holding a pin is still "unsupported" for native (checked with
+    `--dump-native` on `/tmp/boolA.lua`), so it runs tier-1a until P2.
+  - NEXT: P2 (native): prove kinds, `pin_only` slots + prologue tag/payload
+    check, carried `.bool` GP homes, `not` as xor 1, bool `eq` via the int
+    compare. Known spots: `nativegen_alloc` `opMayExitInBody` must list
+    `guard_is_false/true`; `operandReads` needs `.not` + `guard_is_*`;
+    check `nativegen_exitloc`/adapter treat `.bool` as GP and `.nil` as no
+    location.
 
 ## Status 2026-09-24 (latest+27) — doc 55 §2 + §2d LANDED: fft 14.6× → 12.6× LJ, sparse −31%; silent switch is now data (no runtime code patching)
 

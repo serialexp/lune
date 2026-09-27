@@ -109,6 +109,9 @@ export const IR_OP_NAMES = [
   "guard_absent", // 87 raw table lookup is nil — a=table, b=key
   "tnew", // 88  identity-bearing table allocation (doc 45, precise traces only)
   "tset", // 89  reserved: general constructor store (doc 45) — a=table, b=key, aux=value
+  "guard_is_nil", // 90  value pin: a is exactly nil (doc 57) — aux=pc
+  "guard_is_false", // 91  value pin: a is exactly false (doc 57) — aux=pc
+  "guard_is_true", // 92  value pin: a is exactly true (doc 57) — aux=pc
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
@@ -168,6 +171,10 @@ export const UNARY_OR_GUARD_OPS: ReadonlySet<IrOpName> = new Set([
   "guard_number",
   "guard_true",
   "guard_false",
+  // Doc 57 value pins: one operand; aux carries the recording pc (not a ref).
+  "guard_is_nil",
+  "guard_is_false",
+  "guard_is_true",
   "aload",
   "guard_table",
   "guard_lane",
