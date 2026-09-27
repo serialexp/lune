@@ -2058,6 +2058,11 @@ The experiment is reverted; the tree is HEAD.
   recordings that close `.loop`, and other shapes); (b) keep a program
   that still peels (find one) and add a separate link test.
 
+**Bart's answers (2026-09-27).** G6-Q1 **(c)**: G5 (doc 58) first,
+then re-measure the widening with the switch off. G6-Q2 waits with it.
+P6-Q3: **later** — bursts keep `exit_side_ok = 0` until G5/G6 land,
+then the burst-skip counts are re-measured.
+
 **Review.** Antigravity, APPROVE WITH CHANGES: the widening is sound
 (provenance, sibling handoff, `linkKindAt` accounting, region election,
 the peel bypass; `recForPrepLink`/`recWhileLink` already take `.side`)

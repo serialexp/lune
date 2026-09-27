@@ -600,7 +600,19 @@ the ones that bite):
     CHANGES (`docs/reviews/doc58/antigravity-r1.md`); its S2 slot
     recommendation isn't buildable on one cell (one silent site per
     exit) → offered S3 (second cell).
-    **WAITING ON BART:** doc 58 §7 G5-Q1..Q4; doc 56 §4.8.4 G6-Q1/Q2;
+    **UPDATE 2026-09-27: G5-Q1 = Option B** (a bytecode `loop` op
+    after a `while`'s condition = LuaJIT `BC_LOOP`). Bart: B subsumes A,
+    and Z-7 + the replicate-LuaJIT rule already decide it, so it should
+    not have been asked. **Doc 58 rev 3 written and reviewed**
+    (Antigravity r2 CHANGES REQUESTED → 2 "blockers" rejected with
+    source evidence (coarse deopt restores the START-of-pass state) →
+    r3 APPROVE WITH CHANGES, agreeing; all folded in, §8/§8b, receipts
+    `docs/reviews/doc58/antigravity-r2.md`, `-r3.md`). No open
+    questions. **NEXT: B0 baseline → B1 (op exists, inert) → B2 (anchor
+    moves + delete §4.5) → B3 probes → B4 measure + flip doc 56
+    switch + re-run G6.** Also answered earlier: G6-Q1 (c), P6-Q3
+    later (doc 56 §4.8.4).
+    (older) **WAITING ON BART:** doc 58 §7 G5-Q1..Q4; doc 56 §4.8.4 G6-Q1/Q2;
     P6-Q3 (b) (widen `exit_side_ok` to bursts, burst-skip numbers in
     doc 56). Nothing else in this campaign's queue is independent of
     those answers except: sieve_int with the switch on (re-check after
