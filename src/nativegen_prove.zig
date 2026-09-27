@@ -205,6 +205,19 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
     defer gpa.free(href_key);
     @memset(href_key, false);
 
+    // Doc 57: which slot_loads a value pin (`guard_is_nil/false/true`) covers —
+    // the pin op itself, so Pass B can type the load `.nil` or `.bool`. A pin
+    // on an INTERNAL φ whose init is a slot_load types that init `.bool` too
+    // (`bool_init`): the doc 40 φ-hoist, one step removed — the init gets a
+    // prologue TAG_BOOL check and a home, and the φ's own pin stays a real
+    // per-iteration body check.
+    const pin_of = gpa.alloc(?trace_ir.IrOp, n) catch return false;
+    defer gpa.free(pin_of);
+    @memset(pin_of, null);
+    const bool_init = gpa.alloc(bool, n) catch return false;
+    defer gpa.free(bool_init);
+    @memset(bool_init, false);
+
     const body_read = gpa.alloc(bool, n) catch return false;
     defer gpa.free(body_read);
     markBodyReads(t, body_read);
@@ -343,6 +356,21 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (r >= i) return false; // not linear SSA → malformed
                 if (t.instrs[r].op == .slot_load) string_guarded[r] = true;
             },
+            // Doc 57: a value pin. On a slot_load it types the load (Pass B);
+            // two different pins on one load are malformed (the recorder pins
+            // a ref once, from its one observed value).
+            .guard_is_nil, .guard_is_false, .guard_is_true => {
+                const r = ins.a;
+                if (r >= i) return false; // not linear SSA → malformed
+                if (t.instrs[r].op == .slot_load) {
+                    if (pin_of[r]) |p| if (p != ins.op) return false;
+                    pin_of[r] = ins.op;
+                }
+                if (ins.op != .guard_is_nil and t.instrs[r].op == .phi and t.instrs[r].aux == trace.PHI_INTERNAL) {
+                    const init = t.instrs[r].a;
+                    if (init < r and t.instrs[init].op == .slot_load) bool_init[init] = true;
+                }
+            },
             else => {},
         }
     }
@@ -407,6 +435,13 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                     // prologue pins TAG_HEAP + `header.type == string` once.
                     kinds[i] = .heap;
                     is_string[i] = true;
+                } else if (pin_of[i]) |p| {
+                    // Doc 57: a pinned input. `true`/`false` → `.bool` (payload
+                    // canonical 0/1); `nil` → `.nil`. The prologue checks the tag
+                    // (and, for an invariant bool, the payload).
+                    kinds[i] = if (p == .guard_is_nil) .nil else .bool;
+                } else if (bool_init[i]) {
+                    kinds[i] = .bool; // doc 57: init of a pinned internal φ
                 } else if (boxedPassThroughOnly(t, i)) {
                     // Preserve both lanes without inventing a type. Allocation
                     // keeps payload and tag in their source slots; terminal
@@ -544,6 +579,10 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 const kb = kinds[ins.b];
                 if ((ka == .int and kb == .int) or (ka == .float and kb == .float)) {
                     kinds[i] = .bool;
+                } else if ((ins.op == .eq or ins.op == .ne) and ka == .bool and kb == .bool) {
+                    // Doc 57: two bools compare as their canonical 0/1 payloads
+                    // (the int compare path; a konst bool materializes 0/1).
+                    kinds[i] = .bool;
                 } else if ((ins.op == .eq or ins.op == .ne) and
                     (ka == .ptr or ka == .heap) and (kb == .ptr or kb == .heap))
                 {
@@ -577,6 +616,28 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (k != .int and k != .bool and k != .float and k != .nil and
                     k != .ptr and k != .heap and k != .func and k != .native) return false;
                 kinds[i] = .none;
+            },
+            // Doc 57: value pins. `guard_is_false/true` need a `.bool` operand —
+            // an invariant pinned slot (prologue-checked, body no-op) or a
+            // carried slot / internal φ (a real body compare). `guard_is_nil`
+            // needs a `.nil` operand, which only a nil-pinned slot_load has; it
+            // is always prologue-checked (a `.nil` slot is never carried).
+            .guard_is_false, .guard_is_true => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .bool) return false;
+                kinds[i] = .none;
+            },
+            .guard_is_nil => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .nil or t.instrs[ins.a].op != .slot_load) return false;
+                kinds[i] = .none;
+            },
+            // Doc 57: `not` of a dynamic bool (a compare result or a bool-lane
+            // load — the recorder folds every konst/pinned operand). `xor 1`.
+            .not => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .bool) return false;
+                kinds[i] = .bool;
             },
             // --- lane-aware array read path (B2) ---------------------------------
             // guard_table / guard_lane: cover the table slot_load (proven .ptr).
@@ -1408,6 +1469,7 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                         else => switch (kinds[@intCast(ins.a)]) {
                             .int => .int,
                             .float => .float,
+                            .bool => .bool, // doc 57: a pin-typed init
                             else => return false,
                         },
                     };
@@ -1510,6 +1572,9 @@ pub fn operandReads(ins: trace_ir.IrInstr) struct { a: bool, b: bool } {
     return switch (ins.op) {
         .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .sar, .eq, .ne, .lt, .le => .{ .a = true, .b = true },
         .neg, .bnot, .guard_int, .guard_true, .guard_false => .{ .a = true, .b = false },
+        // Doc 57: `not` reads its bool operand; the value pins read what they
+        // check (a body compare for a carried/φ operand, liveness either way).
+        .not, .guard_is_nil, .guard_is_false, .guard_is_true => .{ .a = true, .b = false },
         // int_of_float reads its sole float operand (a); alen its sole table
         // operand (a).
         .int_of_float, .alen => .{ .a = true, .b = false },

@@ -181,6 +181,13 @@ fn row(t: *const Trace, kinds: []const Kind, alloc: *const Alloc, ref: usize) Ex
         if (sid < 0) return out;
         const s = alloc.slots[@intCast(sid)];
         if (s.class == .write_only or s.kind == .none) return out;
+        // Doc 57: a home-less pinned slot has no place. Its slab is current
+        // (invariant), so an adapter restoring its OWN slot may skip it; any
+        // other consumer finds no place and fails closed.
+        if (s.pin_only) {
+            out.invariant_slot = s.slot;
+            return out;
+        }
         // A slot home is pinned for the whole body. The one exception is a
         // win-2 in-place update, which the allocator only allows after the
         // last body exit; the home stops holding the entry value there.

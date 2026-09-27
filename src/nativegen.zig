@@ -740,9 +740,19 @@ fn emitPreciseSnapshotFlush(a: *x64.Assembler, t: *const Trace, kinds: []const K
                 continue;
             }
             if (s.slot == ss.slot and s.class == .invariant) continue;
+            if (s.pin_only) {
+                // Doc 57: a home-less pinned slot captured for ANOTHER slot.
+                // The prologue proved its exact Value; write that.
+                const v = ngalloc.pinnedValue(s);
+                try a.movByteMemImm(.rdi, @as(i32, ss.slot), @intFromEnum(v.tag));
+                try a.movRegImm64(.rax, @bitCast(v.payload.bits));
+                try a.movMemReg(.rsi, @as(i32, ss.slot) * 8, .rax);
+                stores += 1;
+                continue;
+            }
         }
         switch (k) {
-            .int, .bool, .float, .ptr, .heap, .func => try flushSlot(a, @as(i32, ss.slot), k, placeOfRef(alloc, ref)),
+            .int, .bool, .float, .ptr, .heap, .func, .nil => try flushSlot(a, @as(i32, ss.slot), k, placeOfRef(alloc, ref)),
             // `.native` is a raw *GcHeader exactly like `.func`; flushSlot's
             // scalar else-arm would mis-tag it TAG_INT, so re-box it through
             // the `.heap` (TAG_HEAP) path.
@@ -918,11 +928,22 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // re-checks the CURRENT table every iteration (doc 22 §A.1).
             .heap => TAG_HEAP,
             .float => TAG_FLOAT,
+            // Doc 57: a pinned bool/nil input.
+            .bool => TAG_BOOL,
+            .nil => TAG_NIL,
             else => TAG_INT,
         };
         // tag lane: `tags[slot]` at rdi+slot (scale-1, free).
         try a.cmpByteMemImm(.rdi, @as(i32, s.slot), tag);
         try a.jcc(.ne, prologue_fail);
+        // Doc 57: an INVARIANT bool pin also compares the payload once (the
+        // body pin then emits nothing). `Value.boolean` defines all 8 payload
+        // bytes as canonical 0/1, so a qword compare is exact. A carried
+        // slot's pin stays a body compare (its value changes per iteration).
+        if (s.class == .invariant) if (s.pin) |p| {
+            try a.cmpQwordMemImm8(.rsi, @as(i32, s.slot) * 8, @intFromBool(p));
+            try a.jcc(.ne, prologue_fail);
+        };
     }
     // Boxed tags are immutable source state for the whole one-shot body. Taking
     // this snapshot only after every hoisted guard passed preserves the strict
@@ -931,6 +952,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     for (alloc.slots) |s| {
         if (s.class == .write_only) continue;
         if (s.kind == .none) continue; // doc 45 D6: no home to load into
+        if (s.pin_only) continue; // doc 57: checked in memory above, no home
         // payload lane: `payloads[slot]` at rsi+slot*8 (scale-8, free).
         const off: i32 = @as(i32, s.slot) * 8;
         switch (slotHomePlace(s)) {
@@ -2051,6 +2073,31 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 },
                 .none, .aref, .href, .boxed => unreachable, // proveKinds restricts to inspected value kinds
             },
+            // Doc 57: value pins. On an invariant slot the prologue compared tag
+            // and payload once → nothing here. On a carried slot or an internal
+            // φ the value changes per iteration → compare the 0/1 payload with
+            // the pin and side-exit on a mismatch. `guard_is_nil` is always the
+            // prologue check (proveKinds: its operand is a `.nil` slot_load,
+            // which is never carried).
+            .guard_is_nil => {},
+            .guard_is_false, .guard_is_true => {
+                if (!ngalloc.pinHoisted(t, alloc.slots, alloc.slot_id_of_ref, ins.a)) {
+                    const want: i8 = @intFromBool(ins.op == .guard_is_true);
+                    switch (placeOfRef(alloc, ins.a)) {
+                        .reg => |r| try a.cmpRegImm32(r, want),
+                        .mem => |d| try a.cmpQwordMemImm8(.rsp, d, want),
+                        .xmm => unreachable, // a bool is never homed in an XMM
+                    }
+                    try jccNativeExit(a, exit_labels, i, .ne);
+                }
+            },
+            // Doc 57: `not` of a proven bool (canonical 0/1) → `xor 1`.
+            .not => {
+                const dst = placeOfRef(alloc, i);
+                try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
+                try a.xorRegImm32(.rax, 1);
+                try regToPlace(a, dst, .rax);
+            },
             .loop => {
                 // [RV-2] write-only slots commit to regs[] BEFORE the shuffle, so the
                 // shuffle can't clobber a write-only source that aliases a carried home.
@@ -2929,5 +2976,6 @@ test {
     _ = @import("nativegen_carriedheap_test.zig");
     _ = @import("nativegen_hrefk_test.zig");
     _ = @import("nativegen_exitloc_test.zig");
+    _ = @import("nativegen_bool_test.zig");
     _ = adapter;
 }

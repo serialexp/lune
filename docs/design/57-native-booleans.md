@@ -31,10 +31,40 @@ findings folded in — not implemented
     store aborts" hash test now expects the pin + store).
   - Tier-1a runs the pins; native does not yet (a trace with a pin still
     stays on tier-1a / falls back until P2).
+- [x] P2 — native (2026-09-27). As built:
+  - `proveKinds`: Pass A records each slot_load's pin (`pin_of`; two
+    different pins on one load bail) and types an internal φ's slot_load
+    init `.bool` (`bool_init`). Pass B: pinned load → `.bool`/`.nil`;
+    `guard_is_false/true` need `.bool`, `guard_is_nil` a `.nil` slot_load;
+    `not` `.bool → .bool`; `eq/ne` `(.bool, .bool) → .bool`; an unknown-ty
+    internal φ over a `.bool` init is `.bool`. `operandReads` lists `not`
+    and the pins.
+  - `nativegen_alloc`: `SlotInfo.pin` (the pinned payload) and `pin_only`
+    (invariant pinned slot read only by its own pin → no home). A carried
+    `.bool` is admitted (RV-3 still demands a `.bool` update; a `.nil` is
+    never carried). `pinHoisted` (operand is an invariant slot's load) is
+    shared by the lowering and `opMayExitInBody`. `not` is a transient.
+  - Prologue: `TAG_BOOL`/`TAG_NIL` tag rows; an invariant bool pin also
+    compares the payload (`cmp qword [rsi+slot*8], 0/1`). A `pin_only` slot
+    skips the payload load.
+  - Body: a hoisted pin and `guard_is_nil` emit nothing; a carried/φ pin is
+    `cmp home, 0/1; jne exit`. `not` is `xor 1` (new `xorRegImm32`
+    encoder + encoding test). Bool `eq/ne` uses the int compare.
+  - Exits: the precise flush rebuilds a `pin_only` slot captured for
+    another slot from its pin (`pinnedValue`), and flushes a homed `.nil`.
+    The doc 56 exit map gives a `pin_only` load no place (an adapter
+    restoring its own slot skips it; any other use fails closed).
+  - Tests: `src/nativegen_bool_test.zig` (6: invariant pin_only true/nil,
+    copied pin keeps a home, carried body compare incl. mid-run exit,
+    `not`/`eq`/`ne`, bails). Mutation-checked: dropping the prologue
+    payload compare fails 4 tests (incl. the interp flag-changes-value
+    test — the fingerprint alone does not cover every entry); dropping the
+    carried compare fails 2; `xor 0` fails 2.
+  - Probe (`--jit-stats`): shape A (`if flag`) 99.9% native at ~4 c/it;
+    `t[i] = f` / `u[i] = g` / `if t[i] and not u[i]` 0% → 99.9% native.
 
 ### Outstanding
 
-- [ ] P2 — native: prove/alloc/prologue, `not` and `eq` on dynamic `.bool`.
 - [ ] P3 — instability unroll (LuaJIT `instunroll`) for the flipped carried
   bool. Own investigation first (§4.7).
 - [ ] P4 — tests + measurement (board, `--jit-stats` on the probe and nsieve).

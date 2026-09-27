@@ -1769,25 +1769,15 @@ nothing at all.
 
 ## Doc 56 Phase 5 findings (2026-09-27)
 
-- [ ] **A boolean read from a slot never goes native.** `proveKinds` has
-      no kind for a `slot_load` holding a boolean: the bool-lane
-      `guard_fits` is only a check in tier-1a (`nativegen_prove.zig`
-      Pass A skips it). So `local f = true; for i = 1, n do t[i] = f end`
-      stays tier-1a/tier-0 (`/tmp/boolstore.lua`-style probe: 0% traced),
-      and nsieve's exit-side child at pc 7 (`p[i] = true`, with `true`
-      read from r6) never compiles, so that exit never arms and its 3.8M
-      hops go back to tier-0 with the switch on. General fix: a typed
-      bool slot input (prologue tag check + payload), like `guard_int`
-      does for ints. LuaJIT types every SLOAD (true/false are their own
-      IR types); read `lj_record.c`/`lj_snap.c` first.
-- [ ] **`not` is unsupported in `proveKinds`.** `if p[i] and not q[i]`
-      stops a loop going native (`fail-at %17 op=not ty=boolean`).
-      General boolean coverage; do it with the item above. Probe of six
-      boolean loop shapes (2026-09-27): only `t[i] = (i % 2 == 0)` runs
-      native. `if flag` (invariant bool local) and `b = not b` fail on the
-      untyped slot_load; `not t[i]` fails on `not`; `t[i] == true` aborts
-      the RECORDING (`bad_type`, pc 72 op 23). Needs a design note
-      ("native booleans") — no `guard_bool` IR op exists.
+- [ ] **nsieve with the switch ON got 30% slower once its exit-side
+      child went native (doc 57 P2).** The child at pc 7 (`p[i] = true`)
+      now compiles (it was tier-1a), and the 4.4M exit-side hops into it
+      cost more per hop: 0.82 s → 1.08 s wall (×3 interleaved vs the P1
+      shadow build; switch OFF is 0.04 s on both). Same event counts;
+      perf moves to the runtime seam — `accountRegionProfit` 14% → 26%,
+      `driveChain` 6% → 10% — not to native code. This is the per-hop
+      seam of the "Per-hop cache scan" item above and doc 56 Phase 6
+      (silent promotion of exit-side edges); re-measure there.
 - [ ] **A branch that flips for good strands the loop on tier-0 (switch
       off).** `for i = 1, N do local lt = i < 500; if lt then … end end`:
       after i = 500 the root trace fails its first guard every entry,

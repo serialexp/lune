@@ -687,6 +687,15 @@ pub const Assembler = struct {
         try self.imm32(v);
     }
 
+    /// `xor reg, imm32` — REX.W 81 /6 id (imm sign-extended to 64). Doc 57:
+    /// `not` of a canonical 0/1 bool is `xor reg, 1`.
+    pub fn xorRegImm32(self: *Assembler, reg: Reg, v: i32) !void {
+        try self.rex(true, false, false, reg.hi());
+        try self.b(0x81);
+        try self.modrmReg(6, reg.lo());
+        try self.imm32(v);
+    }
+
     /// `cmp reg, imm32` — REX.W 81 /7 id (imm sign-extended to 64).
     pub fn cmpRegImm32(self: *Assembler, reg: Reg, v: i32) !void {
         try self.rex(true, false, false, reg.hi());
@@ -1528,6 +1537,19 @@ test "enc: imul / neg / not / inc" {
     try expectEnc(&.{ 0x48, 0xFF, 0xC3 }, struct { // inc rbx
         fn f(a: *Assembler) !void {
             try a.incReg(.rbx);
+        }
+    }.f);
+}
+
+test "enc: xor reg, imm32 (doc 57 bool not)" {
+    try expectEnc(&.{ 0x48, 0x81, 0xF0, 0x01, 0x00, 0x00, 0x00 }, struct { // xor rax, 1
+        fn f(a: *Assembler) !void {
+            try a.xorRegImm32(.rax, 1);
+        }
+    }.f);
+    try expectEnc(&.{ 0x49, 0x81, 0xF1, 0x01, 0x00, 0x00, 0x00 }, struct { // xor r9, 1
+        fn f(a: *Assembler) !void {
+            try a.xorRegImm32(.r9, 1);
         }
     }.f);
 }

@@ -482,12 +482,29 @@ the ones that bite):
     "Done"). `just test` + `-Djit-debug=true` + viz `bun test` all green.
     A trace holding a pin is still "unsupported" for native (checked with
     `--dump-native` on `/tmp/boolA.lua`), so it runs tier-1a until P2.
-  - NEXT: P2 (native): prove kinds, `pin_only` slots + prologue tag/payload
-    check, carried `.bool` GP homes, `not` as xor 1, bool `eq` via the int
-    compare. Known spots: `nativegen_alloc` `opMayExitInBody` must list
-    `guard_is_false/true`; `operandReads` needs `.not` + `guard_is_*`;
-    check `nativegen_exitloc`/adapter treat `.bool` as GP and `.nil` as no
-    location.
+  - **P2 DONE (native)** — as-built notes in doc 57 "Done". Gates green
+    (`just test`, `-Djit-debug=true`). New `src/nativegen_bool_test.zig`
+    (6 tests, mutation-checked). Probe: `if flag` 99.9% native ~4 c/it;
+    `t[i] = f`, `u[i] = g`, `if t[i] and not u[i]` 0% → 99.9% native.
+    nsieve (switch off) unchanged vs P1 baseline (0.04 s both;
+    `/tmp/lune-base` is the P1 shadow build).
+  - Board (`bench/results/20260927-094715-4d3595c.tsv`, taken on the P2
+    tree): no row regressed vs P1. ×3 interleaved A/B vs the P1 shadow on
+    the rows that moved most against the 09-25 board: nsieve-bit-fp
+    ~−1%, repack ~−3%, sieve_int ~−4% (noise-level; the big deltas vs
+    09-25 came from earlier commits).
+  - nsieve with the doc 56 switch ON: +30% (0.82 → 1.08 s) because the
+    exit-side child at pc 7 now compiles native and each hop pays the
+    runtime seam (`accountRegionProfit`, `driveChain`). Switch OFF:
+    unchanged. Recorded in TODO.md (doc 56 Phase 5 findings) for the
+    Phase 6 arc.
+  - NEXT: P3 (instunroll) investigation. LuaJIT
+    reference read: `lj_opt_loop.c` ~l.340 raises `TYPEINS` when a
+    loop-carried ref's type differs from its SLOAD's; `lj_opt_loop()`
+    catches TYPEINS/GFAIL, `loop_undo`s and CONTINUES RECORDING (≤
+    `instunroll`=4 times), so a flipped bool closes with a 2-iteration
+    body. `instunroll` is zeroed when recording crosses a compiled loop
+    op, an ITERN, or a compiled function.
 
 ## Status 2026-09-24 (latest+27) — doc 55 §2 + §2d LANDED: fft 14.6× → 12.6× LJ, sparse −31%; silent switch is now data (no runtime code patching)
 

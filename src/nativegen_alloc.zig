@@ -9,6 +9,7 @@ const x64 = @import("x64.zig");
 const trace_ir = @import("trace_ir.zig");
 const trace = trace_ir;
 const trace_code = @import("trace_code.zig");
+const value = @import("value.zig");
 const layout = @import("nativegen_layout.zig");
 const prove = @import("nativegen_prove.zig");
 const mcode = @import("nativegen_mcode.zig");
@@ -93,6 +94,17 @@ pub const SlotInfo = struct {
     /// carried string bails in classification), so the pin holds for the whole
     /// native run. `false` for every other slot.
     is_string: bool = false,
+    /// Doc 57: the payload a value pin (`guard_is_false/true` directly on this
+    /// slot's `slot_load`) demands. An INVARIANT slot's prologue compares it
+    /// once and the body pin emits nothing; a carried slot leaves it to the
+    /// body pin (a real per-iteration compare). `null` when no bool pin.
+    pin: ?bool = null,
+    /// Doc 57 (review r1 finding 4): an invariant pinned slot (`.bool` with
+    /// `pin`, or `.nil`) whose load has no reader except its own pin — every
+    /// consumer got the recorder's konst. It gets NO home: the prologue checks
+    /// tag (+ payload) in memory, and an exit that needs the value rebuilds it
+    /// from the pin (`pinnedValue`).
+    pin_only: bool = false,
     /// win 2: the store_ref transient was allocated *into* home, so the op updates the
     /// home in place and the back-edge shuffle move for this slot self-elides. Only set
     /// for `carried` slots passing the safety predicate (see `analyzeInner`).
@@ -216,6 +228,8 @@ pub const AnalyzeError = std.mem.Allocator.Error || error{
 pub fn isTransient(op: trace_ir.IrOp) bool {
     return switch (op) {
         .konst, .add, .sub, .mul, .div, .band, .bor, .bxor, .shl, .shr, .sar, .neg, .bnot, .eq, .ne, .lt, .le => true,
+        // doc 57: `not` materializes its 0/1 bool result.
+        .not => true,
         // aref materializes idx0 in a register; aload materializes the decoded bool.
         .aref, .aload => true,
         // int_of_float materializes the converted int limit in a register; alen
@@ -518,8 +532,10 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                 // home's register class. Outside the carried-heap and carried-string
                 // cases above, a `.ptr` load carried would skip the table/lane checks
                 // and reinterpret an int/float payload as a `*GcHeader` → type
-                // confusion; only a boxable scalar may be carried.
-                if (lk != .int and lk != .float) return error.Bail;
+                // confusion; only a boxable scalar may be carried. Doc 57: a pinned
+                // `.bool` is one (GP home, canonical 0/1; RV-3 below demands a
+                // `.bool` update). A `.nil` never is.
+                if (lk != .int and lk != .float and lk != .bool) return error.Bail;
                 // [RV-3] type-stability: the store class must match the load class in a
                 // `.loop` trace. A slot loaded int but stored float (or vice versa)
                 // would pass the once-hoisted prologue guard forever while the oracle
@@ -564,6 +580,23 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             s.class = .write_only;
             s.kind = kinds[@intCast(s.store_ref)];
         }
+    }
+    // Doc 57: value pins on slot loads — record the pinned payload, and mark
+    // an invariant pinned slot nothing else reads as home-less (`pin_only`).
+    for (slots.items) |*s| {
+        if (s.load_ref < 0) continue;
+        const lr: u16 = @intCast(s.load_ref);
+        for (t.instrs) |g| {
+            if (g.a != lr) continue;
+            switch (g.op) {
+                .guard_is_false => s.pin = false,
+                .guard_is_true => s.pin = true,
+                else => {},
+            }
+        }
+        if (s.class != .invariant) continue;
+        if (s.kind != .nil and !(s.kind == .bool and s.pin != null)) continue;
+        s.pin_only = !hasNonPinReader(t, lr);
     }
     // Doc 39: peeled-trace steady-φ association. For every carried slot of a
     // peeled trace, connect the slot to its internal (steady-state) φ via the
@@ -895,6 +928,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         // SKIP it (its slab slot is untouched, so the slab is already
         // current), and pinning a home would burn a register per dead slot.
         if (s.kind == .none) continue;
+        if (s.pin_only) continue; // doc 57: checked in memory, never read
         if (s.kind == .float) {
             // Float home: draw from the XMM pool, else a shared 8-byte spill cell.
             if (pickRegFrom(&free_xmm, &XMM_ALLOC_ORDER)) |r| {
@@ -920,7 +954,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     for (t.instrs, 0..) |ins, i| {
         if (ins.op != .slot_load) continue;
         const s = slots.items[@intCast(slot_id_of_ref[i])];
-        if (s.kind == .none) continue;
+        if (s.kind == .none or s.pin_only) continue;
         loc[i] = s.home;
     }
 
@@ -1280,7 +1314,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         var seen: u16 = 0;
         var seen_xmm: u16 = 0;
         for (slots.items) |s| {
-            if (s.class == .write_only) continue;
+            if (s.class == .write_only or s.pin_only) continue;
             switch (s.home) {
                 .reg => |r| {
                     const b = regBit(r);
@@ -1476,6 +1510,42 @@ pub fn locToPlace(l: Loc) Place {
     };
 }
 
+/// Doc 57: true iff some instruction reads `ref` other than a value pin on it
+/// — an operand read, a φ naming it, an href's operands, or a ternary op's
+/// `aux` ref (the `markBodyReads` reader set). Decides `pin_only`.
+fn hasNonPinReader(t: *const Trace, ref: u16) bool {
+    for (t.instrs) |ins| {
+        const reads = operandReads(ins);
+        const is_pin = ins.op == .guard_is_nil or ins.op == .guard_is_false or ins.op == .guard_is_true;
+        if (reads.a and ins.a == ref and !is_pin) return true;
+        if (reads.b and ins.b == ref) return true;
+        // A slot-bound φ's `a` is metadata (0 = no steady association), so
+        // only its writeback `b` reads; an internal φ also reads its init `a`.
+        if (ins.op == .phi and (ins.b == ref or (ins.aux == trace.PHI_INTERNAL and ins.a == ref))) return true;
+        if (ins.op == .href and (ins.a == ref or ins.b == ref)) return true;
+        if ((ins.op == .ssub or ins.op == .scp or ins.op == .sfindp or ins.op == .smatch) and ins.aux == ref) return true;
+    }
+    return false;
+}
+
+/// Doc 57: true iff a value pin on `ref` is checked once in the prologue and
+/// lowers to nothing in the body — `ref` is the `slot_load` of an INVARIANT
+/// slot (the prologue compared its tag and pinned payload). A pin on a
+/// carried slot or an internal φ is a real per-iteration body compare.
+pub fn pinHoisted(t: *const Trace, slots: []const SlotInfo, slot_id_of_ref: []const i32, ref: u16) bool {
+    if (t.instrs[ref].op != .slot_load) return false;
+    const sid = slot_id_of_ref[ref];
+    if (sid < 0) return false;
+    return slots[@intCast(sid)].class == .invariant;
+}
+
+/// Doc 57: the exact Value a `pin_only` slot holds for the whole native run
+/// (its prologue checked it), so an exit can rebuild it without a home.
+pub fn pinnedValue(s: SlotInfo) value.Value {
+    std.debug.assert(s.pin_only);
+    return if (s.kind == .nil) value.Value.nil() else value.Value.boolean(s.pin.?);
+}
+
 /// The home of a carried/invariant slot: its assigned register or spill slot.
 pub fn slotHomePlace(s: SlotInfo) Place {
     return locToPlace(s.home);
@@ -1637,6 +1707,11 @@ pub fn opMayExitInBody(
         // coalescing could commit a resumable home before the identity check
         // and a failed method guard would deopt a partial iteration.
         .guard_func => kinds[ins.a] == .heap,
+        // Doc 57: a bool pin on a carried slot or an internal φ compares the
+        // value per iteration and side-exits; on an invariant slot it is the
+        // prologue check and emits nothing. `guard_is_nil` is always the
+        // prologue check (a `.nil` slot is never carried).
+        .guard_is_false, .guard_is_true => !pinHoisted(t, slots, slot_id_of_ref, ins.a),
         // A dynamically-resolved href side-exits on callout miss (cell == 0).
         .href => isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a),
         .guard_hash => isDynTableRoot(kinds, slots, slot_id_of_ref, t.instrs[ins.a].a),
