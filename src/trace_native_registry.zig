@@ -4,7 +4,6 @@ const std = @import("std");
 const nativegen = @import("nativegen.zig");
 const trace_code = @import("trace_code.zig");
 const Trace = @import("trace_record.zig").TraceRecord;
-const ExitKey = @import("trace_types.zig").ExitKey;
 const StructuralEdgeId = @import("trace_types.zig").StructuralEdgeId;
 const RegionId = @import("trace_region.zig").RegionId;
 const RegionKey = @import("trace_region.zig").RegionKey;
@@ -77,11 +76,43 @@ pub const NativeLink = struct {
 };
 pub const PromotedEdge = struct {
     parent: *Trace,
+    /// The logical exit every ledger row carries.
     exit: u32,
     kind: nativegen.SilentSiteKind,
     child: *Trace,
     arm_kind: ArmKind,
     resume_pc: u32,
+    /// Doc 56 Phase 6 (P6-Q2, "key by cell"): the physical `slots` index
+    /// the silent path jumps through — `exit` for every ordinary kind,
+    /// `exitSideSlot(exit)` for `.exit_side`. One exit can own a sibling
+    /// handoff and an exit-side arm at once, so ownership, the duplicate
+    /// test and parked-proof invalidation key on `(parent, cell)`.
+    cell: u32,
+};
+/// Doc 56 Phase 6: the promotion ownership key — one physical cell, one
+/// owner.
+pub const CellKey = struct {
+    trace_id: u32,
+    cell: u32,
+};
+/// The physical `slots` index a promoted edge of `arm_kind` at logical exit
+/// `exit` jumps through, or null when the page has no such cell.
+pub fn promotedCell(compiled: *const nativegen.CompiledTrace, arm_kind: ArmKind, exit: u32) ?u32 {
+    return switch (arm_kind) {
+        .exit_side => compiled.exitSideSlot(exit),
+        else => exit,
+    };
+}
+/// Doc 56 Phase 6: a promotable silent site resolved to its physical parts.
+/// The ordinary kinds live on the parent's page and test
+/// `metadata_cells[exit]`; `.exit_side` lives on the exit adapter's page and
+/// tests `exit_side_metadata_cells[exit]`.
+pub const ResolvedSilentSite = struct {
+    site: *nativegen.SilentSite,
+    /// Base address of the page holding the site's code.
+    page_base: usize,
+    /// The cell the silent path jumps through (`slots[edge.cell]`).
+    slot: *usize,
 };
 /// Doc 52 P1: the RESIDENT sentinel activation. A resident promoted set is
 /// keyed `RegionKey{ .region_id, .activation = RESIDENT_ACTIVATION }` —
@@ -144,6 +175,34 @@ pub fn silentSiteAt(compiled: *nativegen.CompiledTrace, exit: u32) ?*nativegen.S
     for (compiled.silent_sites) |*site| if (site.exit_instr == exit) return site;
     return null;
 }
+/// Doc 56 Phase 6: exit `exit`'s silent site of `kind`, resolved, or null
+/// when the page carries none that tests exactly that exit's data cell. The
+/// returned `site` points into the page's storage (the adapter list for
+/// `.exit_side`) and is only for immediate use: building an adapter can
+/// move it.
+pub fn resolveSilentSite(compiled: *nativegen.CompiledTrace, kind: nativegen.SilentSiteKind, exit: u32) ?ResolvedSilentSite {
+    if (kind == .exit_side) {
+        if (exit >= compiled.exit_side_metadata_cells.len) return null;
+        const p = compiled.exitSideSlot(exit) orelse return null;
+        const ad = compiled.exitAdapterMut(exit) orelse return null;
+        const site: *nativegen.SilentSite = if (ad.site) |*s| s else return null;
+        if (site.kind != .exit_side or site.exit_instr != exit or
+            site.metadata_cell != &compiled.exit_side_metadata_cells[exit]) return null;
+        return .{ .site = site, .page_base = @intFromPtr(ad.page.code.ptr), .slot = &compiled.slots[p] };
+    }
+    if (exit >= compiled.metadata_cells.len or exit >= compiled.slots.len) return null;
+    const site = silentSiteAt(compiled, exit) orelse return null;
+    if (site.kind != kind or site.metadata_cell != &compiled.metadata_cells[exit]) return null;
+    return .{ .site = site, .page_base = @intFromPtr(compiled.page.code.ptr), .slot = &compiled.slots[exit] };
+}
+/// The data cell a promoted edge's silent check tests.
+fn edgeDataCell(edge: PromotedEdge) *usize {
+    const compiled = &edge.parent.native.compiled;
+    return if (edge.kind == .exit_side)
+        &compiled.exit_side_metadata_cells[edge.exit]
+    else
+        &compiled.metadata_cells[edge.exit];
+}
 pub const SilentSiteError = error{ SilentSiteNotCompiled, SilentSiteMissing, SilentSiteKindMismatch };
 fn physicalSlot(link: NativeLink) u32 {
     return if (link.physical_slot == std.math.maxInt(u32)) link.slot_index else link.physical_slot;
@@ -166,7 +225,8 @@ pub fn samePromotionEdges(a: []const PromotedEdge, b: []const PromotedEdge) bool
     if (a.len != b.len) return false;
     for (a, b) |x, y| {
         if (x.parent.id != y.parent.id or x.exit != y.exit or x.child.id != y.child.id or
-            x.kind != y.kind or x.arm_kind != y.arm_kind or x.resume_pc != y.resume_pc)
+            x.kind != y.kind or x.arm_kind != y.arm_kind or x.resume_pc != y.resume_pc or
+            x.cell != y.cell)
             return false;
     }
     return true;
@@ -207,9 +267,10 @@ pub const NativePhysicalRegistry = struct {
     armed_links: std.ArrayListUnmanaged(NativeLink) = .empty,
     /// B-3b.2 silent-cycle registry; `promotedSets()` is the readers' view.
     promoted_sets: std.ArrayListUnmanaged(PromotedSet) = .empty,
-    /// The exclusive physical-exit ownership index required by §B3.9(4); ids,
-    /// rather than list indices, remain stable across swap-removal.
-    promoted_exit_owners: std.AutoHashMapUnmanaged(ExitKey, u32) = .empty,
+    /// The exclusive physical-cell ownership index required by §B3.9(4),
+    /// keyed by `(trace, cell)` since doc 56 Phase 6 (`PromotedEdge.cell`);
+    /// ids, rather than list indices, remain stable across swap-removal.
+    promoted_cell_owners: std.AutoHashMapUnmanaged(CellKey, u32) = .empty,
     next_promoted_set_id: u32 = 1,
     promotion_candidate: []PromotedEdge = &.{},
     promotion_candidate_run: u32 = 0,
@@ -290,9 +351,10 @@ pub const NativePhysicalRegistry = struct {
     pub fn promotedSets(self: *const NativePhysicalRegistry) []const PromotedSet {
         return self.promoted_sets.items;
     }
-    /// Whether a live promoted set already owns this (trace, exit) relation.
-    pub fn exitIsPromoted(self: *const NativePhysicalRegistry, trace_id: u32, exit_instr: u32) bool {
-        return self.promoted_exit_owners.contains(.{ .trace_id = trace_id, .exit_instr = exit_instr });
+    /// Whether a live promoted set already owns this physical `(trace,
+    /// cell)` relation (`PromotedEdge.cell`).
+    pub fn cellIsPromoted(self: *const NativePhysicalRegistry, trace_id: u32, cell: u32) bool {
+        return self.promoted_cell_owners.contains(.{ .trace_id = trace_id, .cell = cell });
     }
     /// Clear every live set's per-call summary mailbox. Native epilogues only
     /// add; the burst driver calls this once after consuming the complete
@@ -337,17 +399,23 @@ pub const NativePhysicalRegistry = struct {
     /// Doc 55 §2d: the edge's compiled silent switch. The edge must name a live
     /// compiled parent whose exit carries a silent check of the edge's kind that
     /// tests exactly that exit's cell. Promotion publishes into the cell, so
-    /// every check here comes before any publication.
-    pub fn silentSiteFor(edge: PromotedEdge) SilentSiteError!*nativegen.SilentSite {
+    /// every check here comes before any publication. Doc 56 Phase 6: an
+    /// `.exit_side` edge resolves to its exit adapter's site, and the edge's
+    /// `cell` must be the physical cell its kind jumps through.
+    pub fn silentSiteFor(edge: PromotedEdge) SilentSiteError!ResolvedSilentSite {
         const compiled = switch (edge.parent.native) {
             .compiled => |*c| c,
             else => return error.SilentSiteNotCompiled,
         };
-        if (edge.exit >= compiled.metadata_cells.len) return error.SilentSiteMissing;
-        const site = silentSiteAt(compiled, edge.exit) orelse return error.SilentSiteMissing;
-        if (site.kind != edge.kind) return error.SilentSiteKindMismatch;
-        if (site.metadata_cell != &compiled.metadata_cells[edge.exit]) return error.SilentSiteMissing;
-        return site;
+        if ((edge.kind == .exit_side) != (edge.arm_kind == .exit_side)) return error.SilentSiteKindMismatch;
+        const cell = promotedCell(compiled, edge.arm_kind, edge.exit) orelse return error.SilentSiteMissing;
+        if (cell != edge.cell or cell >= compiled.slots.len) return error.SilentSiteMissing;
+        if (edge.kind != .exit_side) {
+            if (edge.exit >= compiled.metadata_cells.len) return error.SilentSiteMissing;
+            const site = silentSiteAt(compiled, edge.exit) orelse return error.SilentSiteMissing;
+            if (site.kind != edge.kind) return error.SilentSiteKindMismatch;
+        }
+        return resolveSilentSite(compiled, edge.kind, edge.exit) orelse error.SilentSiteMissing;
     }
     pub fn resetPromotionCandidate(self: *NativePhysicalRegistry) void {
         if (self.promotion_candidate.len != 0) self.gpa.free(self.promotion_candidate);
@@ -397,14 +465,15 @@ pub const NativePhysicalRegistry = struct {
         for (self.parked_proofs.items) |p| self.gpa.free(p.edges);
         self.parked_proofs.clearRetainingCapacity();
     }
-    /// A physical (parent, exit) relation is being mutated; every parked
-    /// proof naming that exit is falsified and dropped.
-    pub fn dropParkedProofsTouchingExit(self: *NativePhysicalRegistry, parent: *Trace, exit: u32) void {
+    /// A physical (parent, cell) relation is being mutated; every parked
+    /// proof naming that cell is falsified and dropped. `cell` is the
+    /// physical slot `prepareSlotMutation` was handed (`PromotedEdge.cell`).
+    pub fn dropParkedProofsTouchingCell(self: *NativePhysicalRegistry, parent: *Trace, cell: u32) void {
         var i = self.parked_proofs.items.len;
         while (i > 0) {
             i -= 1;
             for (self.parked_proofs.items[i].edges) |edge| {
-                if (edge.parent == parent and edge.exit == exit) {
+                if (edge.parent == parent and edge.cell == cell) {
                     self.gpa.free(self.parked_proofs.items[i].edges);
                     _ = self.parked_proofs.swapRemove(i);
                     break;
@@ -456,11 +525,12 @@ pub const NativePhysicalRegistry = struct {
         }
         // Teardown order is the inverse publication order: cells first (each
         // exit's silent check falls through to reporting from here on — doc 55
-        // §2d, no code is touched), then ownership/storage.
-        for (set.edges) |edge| edge.parent.native.compiled.metadata_cells[edge.exit] = 0;
+        // §2d, no code is touched), then ownership/storage. Each edge zeroes
+        // its own data cell (the adapter's for `.exit_side`, doc 56 Phase 6).
+        for (set.edges) |edge| edgeDataCell(edge).* = 0;
         for (set.edges) |edge| {
-            if (!self.promoted_exit_owners.remove(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit }))
-                @panic("demoteSet: missing physical-exit ownership");
+            if (!self.promoted_cell_owners.remove(.{ .trace_id = edge.parent.id, .cell = edge.cell }))
+                @panic("demoteSet: missing physical-cell ownership");
         }
         self.gpa.free(set.edges);
         self.gpa.free(set.summary);
@@ -489,8 +559,9 @@ pub const NativePhysicalRegistry = struct {
         }
         self.resetPromotionCandidate();
     }
-    pub fn demoteSetsTouching(self: *NativePhysicalRegistry, parent: *Trace, exit: u32) void {
-        const id = self.promoted_exit_owners.get(.{ .trace_id = parent.id, .exit_instr = exit }) orelse return;
+    /// `cell` is the physical slot (`PromotedEdge.cell`).
+    pub fn demoteSetsTouching(self: *NativePhysicalRegistry, parent: *Trace, cell: u32) void {
+        const id = self.promoted_cell_owners.get(.{ .trace_id = parent.id, .cell = cell }) orelse return;
         for (self.promoted_sets.items, 0..) |set, i| {
             if (set.id == id) {
                 self.demoteSetReason(i, .slot_mutation);
@@ -534,13 +605,15 @@ pub const NativePhysicalRegistry = struct {
             self.demoteSetReason(i, .trace_invalidation);
         }
     }
+    /// `exit` is the PHYSICAL slot being written (an exit-side arm passes
+    /// its `exitSideSlot`), which is exactly `PromotedEdge.cell`.
     pub fn prepareSlotMutation(self: *NativePhysicalRegistry, parent: *Trace, exit: u32, reason: SlotMutationReason) !PreparedSlotMutation {
         // Sole physical slot-write funnel; identical convergence re-arms
         // short-circuit before reaching it, so every call is a REAL relation
-        // mutation. A parked proof naming this exit is falsified by it —
+        // mutation. A parked proof naming this cell is falsified by it —
         // dropped here so a later equivalent re-arm cannot resurrect evidence
         // that negative provenance invalidated (codex round-4 blocker).
-        self.dropParkedProofsTouchingExit(parent, exit);
+        self.dropParkedProofsTouchingCell(parent, exit);
         switch (reason) {
             .retire, .disarm_all, .disarm_one => self.resetPromotionCandidate(),
             .arm, .rearm => {}, // caller distinguishes identical convergence re-arms
@@ -551,7 +624,7 @@ pub const NativePhysicalRegistry = struct {
         };
         if (exit >= compiled.slots.len) return error.InvalidNativeSlot;
         self.demoteSetsTouching(parent, exit);
-        if (self.promoted_exit_owners.contains(.{ .trace_id = parent.id, .exit_instr = exit }))
+        if (self.promoted_cell_owners.contains(.{ .trace_id = parent.id, .cell = exit }))
             return error.DemotionDeferred;
         return .{ .compiled = compiled, .exit = exit };
     }
@@ -711,14 +784,16 @@ pub const NativePhysicalRegistry = struct {
                 return error.PromotionRegionIdOwned;
         }
         for (edges, 0..) |edge, i| {
-            if (self.promoted_exit_owners.contains(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit })) return error.PromotionExitOwned;
-            // Doc 55 §2d: one exit, one cell, one owner. A set naming an exit
-            // twice would publish the cell twice and double-insert its owner.
-            // The code-patching path used to refuse that by accident (the
-            // second patch saw already-patched bytes); now it is an explicit
-            // precondition, O(N²) with N ≤ PROMOTED_SET_CAP.
+            if (self.promoted_cell_owners.contains(.{ .trace_id = edge.parent.id, .cell = edge.cell })) return error.PromotionExitOwned;
+            // Doc 55 §2d: one cell, one owner. A set naming a cell twice
+            // would publish it twice and double-insert its owner. The
+            // code-patching path used to refuse that by accident (the second
+            // patch saw already-patched bytes); now it is an explicit
+            // precondition, O(N²) with N ≤ PROMOTED_SET_CAP. Doc 56 Phase 6:
+            // keyed by the physical cell, so one exit's sibling handoff and
+            // its exit-side arm are two cells and may share a set.
             for (edges[0..i]) |prev| {
-                if (prev.parent == edge.parent and prev.exit == edge.exit) return error.InvalidPromotionSet;
+                if (prev.parent == edge.parent and prev.cell == edge.cell) return error.InvalidPromotionSet;
             }
         }
     }
@@ -727,12 +802,14 @@ pub const NativePhysicalRegistry = struct {
         // Every edge's silent site is proven before anything is allocated or
         // published: publication below is a cell write that cannot fail, so
         // there is nothing to unwind once it starts.
-        var sites: [PROMOTED_SET_CAP]*nativegen.SilentSite = undefined;
+        // Resolved sites point into page storage; nothing below builds an
+        // adapter, so they stay valid until publication.
+        var sites: [PROMOTED_SET_CAP]ResolvedSilentSite = undefined;
         for (edges, 0..) |edge, i| {
             sites[i] = try silentSiteFor(edge);
-            // `checkPromotable` proved no live set owns this exit, and the cell
-            // is published only by a live set.
-            std.debug.assert(sites[i].metadata_cell.* == 0);
+            // `checkPromotable` proved no live set owns this cell, and the data
+            // cell is published only by a live set.
+            std.debug.assert(sites[i].site.metadata_cell.* == 0);
         }
         const owned_edges = try self.gpa.dupe(PromotedEdge, edges);
         errdefer self.gpa.free(owned_edges);
@@ -742,15 +819,16 @@ pub const NativePhysicalRegistry = struct {
         const metadata = try self.gpa.alloc(nativegen.SilentExitMetadata, edges.len);
         errdefer self.gpa.free(metadata);
 
-        for (owned_edges, 0..) |edge, i| {
-            const compiled = &edge.parent.native.compiled;
+        for (sites[0..edges.len], 0..) |rs, i| {
             metadata[i] = .{
                 .summary = &summary[i],
-                .slot = &compiled.slots[edge.exit],
+                // `slots[edge.cell]`: the exit-side cell for `.exit_side`.
+                .slot = rs.slot,
                 .min_useful = min_useful,
                 // The check's fall-through: the unchanged reporting path for
-                // every kind (for `.deopt`, its `jmp deopt_exit`).
-                .reporting_target = @intFromPtr(compiled.page.code.ptr) + sites[i].resume_off,
+                // every kind (for `.deopt`, its `jmp deopt_exit`), on the page
+                // that holds the site (the adapter's for `.exit_side`).
+                .reporting_target = rs.page_base + rs.site.resume_off,
                 // Doc 52 P1: residency is decided at promotion time, per set —
                 // resident edges neither advance nor reset the barren run.
                 .barren_exempt = @intFromBool(isResidentKey(region_key)),
@@ -758,7 +836,7 @@ pub const NativePhysicalRegistry = struct {
         }
 
         try self.promoted_sets.ensureUnusedCapacity(self.gpa, 1);
-        try self.promoted_exit_owners.ensureUnusedCapacity(self.gpa, @intCast(edges.len));
+        try self.promoted_cell_owners.ensureUnusedCapacity(self.gpa, @intCast(edges.len));
         // At most one queued id per live set. Reserve against the registry
         // size (not the pending list's current length, normally zero), so a
         // global sweep during replay can queue every set without allocation.
@@ -767,7 +845,7 @@ pub const NativePhysicalRegistry = struct {
         // Publication (doc 55 §2d): initialized metadata first, then the pointer
         // cells — each cell write switches its exit's compiled silent check on.
         // No code is touched; every fallible step is above this line.
-        for (sites[0..edges.len], 0..) |site, i| site.metadata_cell.* = @intFromPtr(&metadata[i]);
+        for (sites[0..edges.len], 0..) |rs, i| rs.site.metadata_cell.* = @intFromPtr(&metadata[i]);
 
         const id = self.next_promoted_set_id;
         self.next_promoted_set_id += 1;
@@ -778,8 +856,8 @@ pub const NativePhysicalRegistry = struct {
             .region_key = region_key,
             .id = id,
         });
-        for (owned_edges) |edge| self.promoted_exit_owners.putAssumeCapacityNoClobber(
-            .{ .trace_id = edge.parent.id, .exit_instr = edge.exit },
+        for (owned_edges) |edge| self.promoted_cell_owners.putAssumeCapacityNoClobber(
+            .{ .trace_id = edge.parent.id, .cell = edge.cell },
             id,
         );
         // Doc 52 P1: physical publication — the set is live as of the cell
@@ -958,7 +1036,7 @@ pub const NativePhysicalRegistry = struct {
         self.resetPromotionCandidate();
         self.dropAllParkedProofs();
         self.parked_proofs.deinit(self.gpa);
-        self.promoted_exit_owners.deinit(self.gpa);
+        self.promoted_cell_owners.deinit(self.gpa);
         self.promoted_sets.deinit(self.gpa);
     }
 };
@@ -1110,7 +1188,7 @@ test "native owner candidate consumes equal observations and replaces by region"
     parent.id = 1;
     var child: Trace = undefined;
     child.id = 2;
-    const edges = [_]PromotedEdge{.{ .parent = &parent, .child = &child, .exit = 3, .kind = .deopt, .arm_kind = .ordinary_guard, .resume_pc = 4 }};
+    const edges = [_]PromotedEdge{.{ .parent = &parent, .child = &child, .exit = 3, .kind = .deopt, .arm_kind = .ordinary_guard, .resume_pc = 4, .cell = 3 }};
     const key = RegionKey{ .region_id = @enumFromInt(1), .activation = 7 };
     const first = try std.testing.allocator.dupe(PromotedEdge, &edges);
     try std.testing.expectEqual(@as(u32, 1), registry.observePromotionCandidate(first, key));

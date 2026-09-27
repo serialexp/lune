@@ -100,7 +100,7 @@ test "doc 56 Phase 4 adapter: a rebuild from the stored map reproduces the publi
         fn run(vm: *Vm, t: *const TraceCode, id: u32, ct: *nativegen.CompiledTrace, gi: u32) !void {
             const published = ct.exitAdapter(gi).?;
             const cell = ct.exitSideSlot(gi).?;
-            const built = try adapter.build(testing.allocator, &vm.trace.registry.mcode_arena, t, id, &ct.exit_locs, gi, &ct.slots[cell]);
+            const built = try adapter.build(testing.allocator, &vm.trace.registry.mcode_arena, t, id, &ct.exit_locs, gi, &ct.slots[cell], &ct.exit_side_metadata_cells[gi]);
             switch (built) {
                 .refused => return error.RebuildRefused,
                 .adapter => |ad| {
@@ -136,7 +136,7 @@ test "doc 56 Phase 4 adapter: every refusal reason fires on the map shape that c
             const target = &ct.slots[ct.exitSideSlot(gi).?];
 
             // no_map: an empty map (a precise/peeled/snapshot-less trace's).
-            try expectRefused(.no_map, try adapter.build(gpa, arena, t, id, &ExitLocMap{}, gi, target));
+            try expectRefused(.no_map, try adapter.build(gpa, arena, t, id, &ExitLocMap{}, gi, target, null));
 
             // no_stub: publishing an exit the page has no stub for.
             const past: u32 = @intCast(ct.exit_side_cells.len);
@@ -154,7 +154,7 @@ test "doc 56 Phase 4 adapter: every refusal reason fires on the map shape that c
                     dropped = true;
                 }
                 try testing.expect(dropped);
-                const built = try adapter.build(gpa, arena, t, id, &m, gi, target);
+                const built = try adapter.build(gpa, arena, t, id, &m, gi, target, null);
                 try expectRefused(.not_held, built);
                 try testing.expect(built.refused.ref != null);
             }
@@ -165,7 +165,7 @@ test "doc 56 Phase 4 adapter: every refusal reason fires on the map shape that c
                 defer m.deinit(gpa);
                 try testing.expect(m.carried.len != 0);
                 m.carried[0].kind = .boxed;
-                try expectRefused(.kind, try adapter.build(gpa, arena, t, id, &m, gi, target));
+                try expectRefused(.kind, try adapter.build(gpa, arena, t, id, &m, gi, target, null));
             }
 
             // spill: no room above the frame for the staged constant 7.
@@ -173,7 +173,7 @@ test "doc 56 Phase 4 adapter: every refusal reason fires on the map shape that c
                 var m = try copyMap(&ct.exit_locs);
                 defer m.deinit(gpa);
                 m.frame_words = nativegen.SPILL_MAX;
-                try expectRefused(.spill, try adapter.build(gpa, arena, t, id, &m, gi, target));
+                try expectRefused(.spill, try adapter.build(gpa, arena, t, id, &m, gi, target, null));
             }
         }
     };
@@ -182,8 +182,8 @@ test "doc 56 Phase 4 adapter: every refusal reason fires on the map shape that c
 
 test "doc 56 Phase 4 adapter: allocation failure at any point is clean" {
     const Check = struct {
-        fn buildOnce(gpa: std.mem.Allocator, arena: *McodeArena, t: *const TraceCode, id: u32, map: *const ExitLocMap, gi: u32, target: *const usize) !void {
-            switch (try adapter.build(gpa, arena, t, id, map, gi, target)) {
+        fn buildOnce(gpa: std.mem.Allocator, arena: *McodeArena, t: *const TraceCode, id: u32, map: *const ExitLocMap, gi: u32, target: *const usize, cell: *usize) !void {
+            switch (try adapter.build(gpa, arena, t, id, map, gi, target, cell)) {
                 .adapter => |ad| {
                     var owned = ad;
                     owned.deinit();
@@ -192,7 +192,7 @@ test "doc 56 Phase 4 adapter: allocation failure at any point is clean" {
             }
         }
         fn run(vm: *Vm, t: *const TraceCode, id: u32, ct: *nativegen.CompiledTrace, gi: u32) !void {
-            try testing.checkAllAllocationFailures(testing.allocator, buildOnce, .{ &vm.trace.registry.mcode_arena, t, id, &ct.exit_locs, gi, &ct.slots[ct.exitSideSlot(gi).?] });
+            try testing.checkAllAllocationFailures(testing.allocator, buildOnce, .{ &vm.trace.registry.mcode_arena, t, id, &ct.exit_locs, gi, &ct.slots[ct.exitSideSlot(gi).?], &ct.exit_side_metadata_cells[gi] });
         }
     };
     try withAdapter(konst_store_src, konst_store_out, Check.run);

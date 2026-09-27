@@ -1415,6 +1415,25 @@ pub fn emitSilentEpilogue(a: *x64.Assembler, kind: SilentSiteKind, metadata_cell
             try a.incMemQword(.rdx, @offsetOf(NativeResult, "cur_zero_run"));
             try a.jmp(zero_done);
         },
+        .exit_side => {
+            // Doc 56 §4.8.2 item 4, the `.exit_side` replay row byte for
+            // byte: the parent's laps plus the interrupted iteration,
+            // committed forward at `P`. region_work += local + 1;
+            // selection_work += local + 1; qualifying when local + 1 >=
+            // min_useful; the work is never zero, so the barren run resets.
+            // r8 = local + 1 is built after `last_local` was stored above;
+            // the shared tail reloads r8 before reading it.
+            try a.incReg(.r8);
+            try a.addMemReg(.rcx, @offsetOf(SilentSummaryCell, "region_work"), .r8);
+            try a.addMemReg(.rcx, @offsetOf(SilentSummaryCell, "selection_work"), .r8);
+            try a.cmpRegMem(.r8, .rax, @offsetOf(SilentExitMetadata, "min_useful"));
+            try a.jcc(.b, qualified_done);
+            try a.incMemQword(.rcx, @offsetOf(SilentSummaryCell, "qualifying_rows"));
+            a.bind(qualified_done);
+            try a.cmpQwordMemImm8(.rax, @offsetOf(SilentExitMetadata, "barren_exempt"), 0);
+            try a.jcc(.ne, zero_done);
+            try a.jmp(reset_zero);
+        },
     }
     a.bind(reset_zero);
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "cur_zero_run"), 0);

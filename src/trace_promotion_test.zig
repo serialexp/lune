@@ -1366,10 +1366,10 @@ test "B-3d round-6: a repeated-parent SET firing out of order resolves its termi
     const c = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
     const d = try makeB3LinkTrace(gpa, &state, &proto, 3, 3, 1);
     const set = [_]PromotedEdge{
-        .{ .parent = p, .exit = 0, .kind = .deopt, .child = c, .arm_kind = .loop_done_linked, .resume_pc = c.code.anchor.pc },
-        .{ .parent = p, .exit = 1, .kind = .deopt, .child = d, .arm_kind = .loop_done_linked, .resume_pc = d.code.anchor.pc },
-        .{ .parent = c, .exit = 0, .kind = .deopt, .child = p, .arm_kind = .loop_done_linked, .resume_pc = p.code.anchor.pc },
-        .{ .parent = d, .exit = 0, .kind = .deopt, .child = p, .arm_kind = .loop_done_linked, .resume_pc = p.code.anchor.pc },
+        .{ .parent = p, .exit = 0, .kind = .deopt, .child = c, .arm_kind = .loop_done_linked, .resume_pc = c.code.anchor.pc, .cell = 0 },
+        .{ .parent = p, .exit = 1, .kind = .deopt, .child = d, .arm_kind = .loop_done_linked, .resume_pc = d.code.anchor.pc, .cell = 1 },
+        .{ .parent = c, .exit = 0, .kind = .deopt, .child = p, .arm_kind = .loop_done_linked, .resume_pc = p.code.anchor.pc, .cell = 0 },
+        .{ .parent = d, .exit = 0, .kind = .deopt, .child = p, .arm_kind = .loop_done_linked, .resume_pc = p.code.anchor.pc, .cell = 0 },
     };
 
     // Three transitions, all on edges 0 and 2: P.e0, C.e0, P.e0. Round-robin

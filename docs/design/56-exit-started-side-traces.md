@@ -1,8 +1,8 @@
 # 56 — Exit-started side traces (LuaJIT's side-trace mechanism) — Design
 
-Status: Phase 1 done (exit snapshots, exit location map, finalize tests); Phase 2 done (attachability and resume pc); Phase 3 done (tier-1a materialize and exit-side recording); Phase 4 done (native exit adapters, behind a switch that is off); Phase 5 done (direct jump and ledger grammar, switch still off; §4.8.1 and the as-built notes in the checklist); Phase 6 next; design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
+Status: Phase 1 done (exit snapshots, exit location map, finalize tests); Phase 2 done (attachability and resume pc); Phase 3 done (tier-1a materialize and exit-side recording); Phase 4 done (native exit adapters, behind a switch that is off); Phase 5 done (direct jump and ledger grammar, switch still off; §4.8.1 and the as-built notes in the checklist); Phase 6 done with R1–R4 of Phase 7 (silent exit-side cycles, keyed by cell; §4.8.3); design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
 Owner: Bart
-Last updated: 2026-09-26
+Last updated: 2026-09-27
 
 ## Implementation status
 
@@ -398,11 +398,12 @@ consumes yet, so every program's output and trace set stays identical.
     - Widening `exit_side_ok` to bursts: not measured (no counter for
       exits a burst takes the old way). Deferred until the three causes
       above are fixed; it goes in the Phase 6 measurement.
-- [ ] **Phase 6 — regions and silent promotion.** Plan in §4.8.2
-  (reviewed: Antigravity CHANGES REQUESTED, all 9 findings folded in).
-  Waiting on Bart's P6-Q1..Q4. The measurement before the plan found
-  that only a boolC-shaped cycle needs silence; the board's switch-on
-  regressions are unarmed or pre-empted exits (G1–G5).
+- [x] **Phase 6 — regions and silent promotion.** Plan in §4.8.2
+  (reviewed: Antigravity CHANGES REQUESTED, all 9 findings folded in),
+  combined with §4.8.3's R1–R4. Landed 2026-09-27: see "Phase 6
+  landed" at the end of §4.8.3 (boolC runs silent, 8 → 1 ms with the
+  switch on; bit-reverse mints an armable cycle but waits on G5; the
+  remaining switch-on costs are listed there).
   - `exit_side` edges and the side trace's `.link` back are
     intra-iteration edges of the parent's loop region (already true
     since Phase 5 bug 2).
@@ -1870,6 +1871,108 @@ separate from G1–G4. (Also seen: t5 exit 10, the zero-trip test of
 ends only 11 ledgers here.) Recorded in TODO.md; it is looked at after
 Phase 6 lands, when the full ledgers are gone and the remaining
 terminals are clearer.
+
+**Phase 6 landed (2026-09-27).** Items 1–10 of §4.8.2 as planned, with
+these as-built notes and differences:
+
+- **The site and its cell.** `ExitAdapter.site` holds the silent site
+  (offsets relative to the adapter page);
+  `CompiledTrace.exit_side_metadata_cells` (length `n`, allocated and
+  freed with `exit_side_cells`) is its data cell. `nativegen_adapter`
+  emits `emitSilentCheck` right after `completed = rbx` and binds the
+  `.exit_side` epilogue after the reporting tail.
+- **Keying.** `PromotedEdge.cell`; the owner map is
+  `promoted_cell_owners` keyed by `CellKey{trace_id, cell}`.
+  `native_physical.promotedCell` maps (kind, exit) to the cell, and
+  `resolveSilentSite` returns the site, the page base that
+  `reporting_target` is relative to, and the slot, for both the adapter
+  and the parent page. `silentSiteFor` also refuses an edge whose `cell`
+  does not match its kind.
+- **Item 8, hops.** The silent drain adds `fires` (not `followed`) to
+  `exit_side_hops` / `exit_side_native_hops`, and `followed` to
+  `exit_side_fused`. That matches the replay, which counts a hop for a
+  yielded last `.exit_side` row as well. The `.link_terminal` iteration
+  credit (`link_closed_count`) is in, and the rowless return is
+  `silent_cum + linked_completed`.
+- **Rowed vs silent is not path-identical.** The plan's test asked for
+  identical `region_work`, `linked_completed` and coverage iterations.
+  They differ, and correctly: a rowed ledger yields at `LEDGER_CAP`
+  and tier-0 finishes the interrupted iteration, while a silent run goes
+  up to `silent_budget` transitions per call, so the two runs split the
+  same iterations differently between trace and tier-0. What is
+  conserved is the TOTAL iteration count (traced + tier-0), and the
+  test pins that (flip program, N = 20000: 20002 both ways), plus
+  silent traced > rowed traced. The exact accounting identity is pinned
+  on a fixed budget-8 run instead (the cycle test (a): `completed` 12 =
+  4 silent + 4 link closes × 2, summaries per edge).
+- **Item 10 counter.** `exit_side_burst_skips` (stats line `exit-side
+  arms: … burst skips=N`): a burst-origin ledger ending in an ordinary
+  `.deopt` at an exit whose adapter is published and that has no live
+  ordinary arm, so that with `exit_side_ok = 1` it would have hopped.
+- **Tests** (`interp_exit_side_test.zig`): the cycle test (silent at a
+  fixed budget; only the link promoted, so the suffix starts with
+  `.exit_side`; the exit-side arm disarmed, so the suffix ends in an
+  unarmed `.exit_side` routed after the drain; an ordinary arm and an
+  exit-side arm on one exit, both promoted with different cells, and a
+  duplicate-cell set refused; retiring the child demotes the set); the
+  flip program rowed vs silent; bit-reverse mints an armable cycle.
+- **Review.** Antigravity, APPROVE: one minor (no test disarmed a
+  promoted exit-side link directly; added as block (d'), mutation
+  checked) and one nit (`promoteSet` also compares `cell`; taken).
+  `docs/reviews/doc56/antigravity-phase6.md`.
+- **Bit-reverse does not promote yet.** It mints an armable
+  `cross_trace_cycle` (layer 2 is fine), but every ledger ends at the
+  inner `while` root's loop-done `.deopt` (t2 exit 5, about 20k of 22k
+  ledgers, lengths 2–31), so no ledger reaches the forced yield that
+  promotion needs: `candidates=0`. That is G5 (layer 3: nothing can arm
+  a `while` loop-done). The test pins only `armable`; the promotion
+  checks go in when G5 lands.
+
+Switch off → on, best of 5, after Phase 6 (same binary per row):
+
+| program | off | on after R1–R4 | on after Phase 6 |
+|---|---|---|---|
+| boolC | 2 ms | 8 ms | 1 ms |
+| bit-reverse alone | 230 ms | 233 ms | 240 ms |
+| scimark-fft 500 | 210 ms | 217 ms | 219 ms |
+| nsieve 7 | 12 ms | 43 ms | 38 ms |
+| nsieve-bit 6 | 14 ms | 33 ms | 35 ms |
+| nsieve-bit-fp 6 | 307 ms | — | 315 ms |
+| sieve_int | 6 ms | — | 22 ms |
+
+Switch on, from `--jit-stats` and the jit-debug `silent:` line:
+
+| program | seam (off → on) | ledger walks (off → on) | promotions | burst skips |
+|---|---|---|---|---|
+| boolC | — → 7.8% | — → 54 | 1 (198k silent transitions) | — |
+| bit-reverse | — → 6.3% | — → 22k | 0 (G5) | 2.4k |
+| scimark-fft | 17% → 26% | 21k → 44k | 4.9k (4.8k parked reuses) | 2.6k |
+| nsieve | 8.5% → 49% | 316 → 31k | 3 (4.2k candidates) | 4.2k |
+| nsieve-bit | 4.0% → 34% | 232 → 29k | 1 (1.7k candidates) | 1.7k |
+| nsieve-bit-fp | 2.8% → 38% | 95k → 240k | 164 (9.6k candidates) | 9.5k |
+| sieve_int | 8.8% → 39% | 203 → 30k | 1 (0 candidates) | 4 |
+
+Board with the switch off (`bench/results/20260927-132931-9c98fcd.tsv`,
+vs `20260927-124025-2db8e1d.tsv`): flat. The one row over 5% (repack
++18.8%) is noise: an interleaved A/B against a clean HEAD build, 3×5
+reps, reads 20.5 vs 20.8 ms.
+
+boolC meets the §4.8.2 budget (seam 70% → 8%, 1 ms, under switch-off).
+The other rows are what the budget allows only where G5 is the cause,
+which is true for bit-reverse and not for the rest. What's left:
+
+1. **Candidates that never promote** (nsieve, nsieve-bit,
+   nsieve-bit-fp): thousands of detected candidates, a handful of
+   promotions. Next diagnosis step is the streak and the `silent
+   rejects:` line (layer 2).
+2. **Burst skips** are large on nsieve, nsieve-bit-fp, fft and
+   bit-reverse: those bursts end in the ordinary deopt where the adapter
+   would have hopped. Widening `exit_side_ok` to bursts (P6-Q3 (b)) is
+   Bart's decision, now with numbers.
+3. **sieve_int**: 30k walks with no candidates; the switch-off run's
+   silent region bridges are replaced by something that is neither a
+   candidate nor promotable. Not diagnosed yet.
+4. G5 (own doc) and G6 (nsieve's unrolled `for k` exits).
 
 ### 4.9 Tiering policy (Phase 7)
 

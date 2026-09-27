@@ -563,7 +563,27 @@ the ones that bite):
     What nsieve still pays with the switch on (G6, TODO.md): 9.5k full
     ledgers at t3 exit 23 (layer 2 → Phase 6) and 13.5k short ledgers at
     t6 exits 71/107 (pc 18 full, gave up).
-    **NEXT: Phase 6 items 1–10 (§4.8.2).**
+  - **PHASE 6 LANDED (2026-09-27)**, doc 56 §4.8.3 "Phase 6 landed"
+    (items 1–10: adapter silent site + `exit_side_metadata_cells`,
+    promotion keyed by physical cell, `.exit_side` epilogue, silent
+    drain accounting incl. `.link` iteration credit, the dispatcher's
+    silent branch routes `ChainResult.exit_side`, `burst skips=`
+    counter). Antigravity code review APPROVE (1 minor test gap + 1 nit,
+    both taken; `docs/reviews/doc56/antigravity-phase6.md`). Switch on,
+    best of 5 (off in brackets): boolC 1 (2), bitrev 240 (230), fft 219
+    (210), nsieve 38 (12), nsieve-bit 35 (14), nsieve-bit-fp 315 (307),
+    sieve_int 22 (6). Switch-off board `20260927-132931-9c98fcd.tsv`:
+    flat (repack +18.8% was noise: A/B 20.5 vs 20.8 ms).
+    Bit-reverse: armable cycle, but G5 ends every ledger early → 0
+    candidates. Gates: `just test` + jit-debug green.
+    **NEXT (Bart picks, else the order below):** (1) Z-8 layer 2 on the
+    nsieve family: thousands of silent candidates, a handful of
+    promotions (TODO "candidates that never promote"); (2) sieve_int's
+    30k walks with 0 candidates; (3) G5 design doc (`while` loop-done
+    link); (4) G6; (5) Phase 8 (flip the switch). Open for Bart: widen
+    `exit_side_ok` to bursts (P6-Q3 (b)), now with burst-skip numbers.
+    Gotcha: an Antigravity review that "runs the tests" leaves
+    `zig-out/bin/mahina` as Debug — rebuild ReleaseFast before timing.
   - Background (LuaJIT)
     reference read: `lj_opt_loop.c` ~l.340 raises `TYPEINS` when a
     loop-carried ref's type differs from its SLOAD's; `lj_opt_loop()`

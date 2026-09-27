@@ -364,7 +364,11 @@ pub const SilentExitMetadata = extern struct {
     barren_exempt: u64,
 };
 
-pub const SilentSiteKind = enum(u8) { deopt, link_terminal, loop_done_linked, region_bridge };
+/// `exit_side` (doc 56 Phase 6): the silent switch of an exit adapter. Its
+/// site lives on the adapter's own page (`ExitAdapter.site`), and its data
+/// cell is `CompiledTrace.exit_side_metadata_cells[exit]`, not
+/// `metadata_cells[exit]` (the same exit's ordinary deopt site).
+pub const SilentSiteKind = enum(u8) { deopt, link_terminal, loop_done_linked, region_bridge, exit_side };
 /// Four dynamic return-continuation slots plus one continuation-to-head slot.
 pub const RET_CONT_SLOTS: usize = 4;
 pub const NATIVE_TRANSITION_SLOTS: usize = RET_CONT_SLOTS + 1;
@@ -654,6 +658,15 @@ pub const CompiledTrace = struct {
     /// adapter is a data write, like the link slots. Empty unless the page
     /// was compiled with `CompileOpts.exit_side`. Owned; freed in `deinit`.
     exit_side_cells: []usize = &.{},
+    /// Doc 56 Phase 6: one silent data cell per IR instruction, allocated
+    /// with `exit_side_cells` (same length, stable address, zero = not
+    /// promoted). Exit `ei`'s adapter tests `exit_side_metadata_cells[ei]`;
+    /// promotion of its `.exit_side` edge publishes a `*SilentExitMetadata`
+    /// there. Separate from `metadata_cells[ei]` because the ordinary deopt
+    /// site of the same exit is different code with a different state
+    /// (coherent at the anchor, not at the resume pc). Owned; freed in
+    /// `deinit`.
+    exit_side_metadata_cells: []usize = &.{},
     /// Doc 56 Phase 4: the exit adapters built for this page, at most one
     /// per exit. An adapter lives until the page dies (a give-up only clears
     /// its cell). Owned; freed in `deinit`.
@@ -853,10 +866,12 @@ pub const CompiledTrace = struct {
                 // `.normal` only when it jumps into an armed child, so the
                 // call returns `.exit_side` exactly when its terminal row
                 // is an adapter's (unarmed, or a full-ledger yield). Only a
-                // flagged direct entry with no silent transition takes it.
+                // flagged direct entry takes it; since Phase 6 that includes
+                // one that went silent first (the adapter's reporting path
+                // then writes a suffix row, doc 56 §4.8.2 item 7).
                 std.debug.assert((result.exit_reason == @intFromEnum(trace_exec.ExitReason.exit_side)) ==
                     (term_kind == .exit_side));
-                if (term_kind == .exit_side) std.debug.assert(exit_side_ok and result.silent_active == 0);
+                if (term_kind == .exit_side) std.debug.assert(exit_side_ok);
             }
         }
         // 2.3c-2b: decode the per-transition ledger for the caller's replay. Only
@@ -910,6 +925,7 @@ pub const CompiledTrace = struct {
         if (self.metadata_cells.len > 0) self.gpa.free(self.metadata_cells);
         self.exit_locs.deinit(self.gpa);
         if (self.exit_side_cells.len > 0) self.gpa.free(self.exit_side_cells);
+        if (self.exit_side_metadata_cells.len > 0) self.gpa.free(self.exit_side_metadata_cells);
         for (self.exit_adapters.items) |*ad| ad.deinit();
         self.exit_adapters.deinit(self.gpa);
         self.* = undefined;
@@ -917,6 +933,15 @@ pub const CompiledTrace = struct {
 
     /// Doc 56 Phase 4: the adapter built for exit `exit_instr`, if any.
     pub fn exitAdapter(self: *const CompiledTrace, exit_instr: u32) ?*const ExitAdapter {
+        for (self.exit_adapters.items) |*ad| {
+            if (ad.exit == exit_instr) return ad;
+        }
+        return null;
+    }
+
+    /// Doc 56 Phase 6: the mutable adapter of exit `exit_instr` (its
+    /// silent site is handed out as `*SilentSite`, like the page's own).
+    pub fn exitAdapterMut(self: *CompiledTrace, exit_instr: u32) ?*ExitAdapter {
         for (self.exit_adapters.items) |*ad| {
             if (ad.exit == exit_instr) return ad;
         }
@@ -949,6 +974,11 @@ pub const CompiledTrace = struct {
 pub const ExitAdapter = struct {
     exit: u32,
     page: ExecPage,
+    /// Doc 56 Phase 6: the adapter's silent switch (kind `.exit_side`;
+    /// offsets relative to `page`, data cell
+    /// `exit_side_metadata_cells[exit]`). Null when the adapter was built
+    /// without a data cell (a page with no silent machinery).
+    site: ?SilentSite = null,
 
     /// Release the page slot.
     pub fn deinit(self: *ExitAdapter) void {

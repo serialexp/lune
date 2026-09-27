@@ -1078,6 +1078,7 @@ pub fn driveSilentBurst(
     var fired_activation_key: RegionKey = undefined;
 
     var loop_done_count: u64 = 0;
+    var link_closed_count: u64 = 0;
     var suppressed_hops: u64 = 0;
     // COMMENT-ASSERT (§B3.18 R5(a)): this expansion iterates sets and cells in
     // STORAGE order, which carries no information about firing order. That is
@@ -1121,6 +1122,14 @@ pub fn driveSilentBurst(
                     self.native_link_exits +|= fires;
                     self.native_link_follow_count +|= followed;
                     self.link_follow_count +|= followed;
+                    // Doc 56 §4.8.2 item 8: the twin of the replay's `.link`
+                    // row credit — a `.link` that closes an iteration of its
+                    // enclosing loop finished that iteration. Fires, not
+                    // `followed`: the replay credits a yielded last `.link`
+                    // row too. rbx does not count it (a `.link` never bumps
+                    // it), so without this an exit-side cycle — whose parent
+                    // never reaches its `.loop` — would lose every iteration.
+                    if (edge.parent.code.linkClosesIteration()) link_closed_count +|= fires;
                 },
                 .loop_done_linked => {
                     self.native_loopdone_link_fused +|= followed;
@@ -1128,8 +1137,15 @@ pub fn driveSilentBurst(
                     suppressed_hops +|= fires;
                 },
                 .ret_cont, .call_head => @panic("driveSilentBurst: frame-motion edge promoted"),
-                // Doc 56 Phase 5: no silent site until Phase 6.
-                .exit_side => @panic("driveSilentBurst: exit-side edge promoted"),
+                // Doc 56 Phase 6: the replay's `.exit_side` row counters —
+                // one hop per firing, fused only when the jump was taken.
+                // Its selection/region work arrived through the generic
+                // bulk charge above and the set's region credit below.
+                .exit_side => {
+                    self.exit_side_hops +|= fires;
+                    self.exit_side_native_hops +|= fires;
+                    self.exit_side_fused +|= followed;
+                },
                 .sibling_handoff => {
                     self.sibling_handoff_fused +|= followed;
                     const evidence = self.silentSiblingEvidence(
@@ -1185,10 +1201,11 @@ pub fn driveSilentBurst(
         fired_activation_accum = c_accum;
         fired_activation_key = c.region_key;
     }
-    if (loop_done_count > std.math.maxInt(usize) - linked_completed.*)
+    const closed_count = loop_done_count +| link_closed_count;
+    if (closed_count > std.math.maxInt(usize) - linked_completed.*)
         linked_completed.* = std.math.maxInt(usize)
     else
-        linked_completed.* += @intCast(loop_done_count);
+        linked_completed.* += @intCast(closed_count);
     // Sequential replay charges one hop per loop-done except the first row of
     // an inner-call ledger. Preserve that exception when the first suppressed
     // transition is itself loop-done, then saturate at the caller's bound.
@@ -1295,8 +1312,13 @@ pub fn driveSilentBurst(
         @panic("driveSilentBurst: rowless silent result exhausted no budget");
     if (budget_exhausted) self.silent_budget_exhaustions +|= 1;
     resume_pc.* = last_edge.resume_pc;
+    // Doc 56 §4.8.2 item 8 (review 1): rbx (`silent_cum`) counts committed
+    // laps only; the iterations closed by `.link`s and loop-dones live in
+    // `linked_completed`. An exit-side cycle's parent never reaches its
+    // `.loop`, so reporting `silent_cum` alone would drop the whole cycle.
+    const silent_cum: usize = @intCast(result.silent_cum);
     return .{ .return_result = .{
-        .completed = @intCast(result.silent_cum),
+        .completed = silent_cum +| linked_completed.*,
         .resume_pc = last_edge.resume_pc,
     } };
 }
@@ -1401,11 +1423,31 @@ pub fn captureNativeCallProvenance(
     entries: []const trace_exec.LedgerEntry,
     captured: *NativeCallProvenance,
 ) void {
-    _ = origin; // Required at each call site so origin coverage cannot hide.
+    // Required at each call site so origin coverage cannot hide. Only the
+    // dispatcher's direct entry runs with `exit_side_ok = 1`.
+    if (origin != .dispatcher_root) noteExitSideBurstSkip(self, entries);
     captured.len = if (result.silent_active != 0)
         self.captureSilentSuffixProvenance(result, &captured.verdicts)
     else
         self.captureProvenanceVerdicts(entries, 0, &captured.verdicts);
+}
+
+/// Doc 56 §4.8.2 item 10: count a burst-origin call (`exit_side_ok = 0`)
+/// whose terminal row is an ordinary deopt the direct entry's stub would
+/// have sent to a published adapter (ordinary cell unarmed, §4.8.3 R1).
+/// Runs before replay, so the arm registry is the one the call ran against.
+fn noteExitSideBurstSkip(self: *TraceState, entries: []const trace_exec.LedgerEntry) void {
+    if (entries.len == 0 or !self.exitSideNative()) return;
+    const last = entries[entries.len - 1];
+    if (last.kind != .deopt or last.reason != .normal) return;
+    const owner = self.traceById(last.id) orelse return;
+    const compiled = switch (owner.native) {
+        .compiled => |*c| c,
+        else => return,
+    };
+    if (!owner.code.exitAttachable(last.exit) or !compiled.exitSidePublished(last.exit)) return;
+    if (TraceState.ordinaryArmLive(self, owner, last.exit)) return;
+    self.exit_side_burst_skips +|= 1;
 }
 
 pub fn settleNativeCallProvenance(

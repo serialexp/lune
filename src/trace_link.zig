@@ -1057,9 +1057,8 @@ pub fn silentKindForArm(kind: ArmKind) ?nativegen.SilentSiteKind {
         .loop_done_linked => .loop_done_linked,
         .region_bridge => .region_bridge,
         .ret_cont, .call_head => null,
-        // Doc 56 Phase 5: no silent site until Phase 6 adds
-        // `SilentSiteKind.exit_side`, so the edge never promotes.
-        .exit_side => null,
+        // Doc 56 Phase 6: the exit adapter's own silent site.
+        .exit_side => .exit_side,
     };
 }
 
@@ -1128,10 +1127,14 @@ pub fn promotedEdgeFromLink(self: *TraceState, link: NativeLink) ?PromotedEdge {
     };
     if (link.slot_index >= link.parent.code.instrs.len or link.slot_index >= compiled.slots.len)
         return null;
-    if (link.slot_index >= compiled.metadata_cells.len) return null;
-    const site = silentSiteAt(compiled, link.slot_index) orelse return null;
-    if (site.kind != kind or site.metadata_cell != &compiled.metadata_cells[link.slot_index] or
-        compiled.metadata_cells[link.slot_index] != 0) return null;
+    // Doc 56 Phase 6: the physical cell (`PromotedEdge.cell`) and the site
+    // that tests it — the exit adapter's for `.exit_side`.
+    const cell = native_physical.promotedCell(compiled, link.kind, link.slot_index) orelse return null;
+    const resolved = native_physical.resolveSilentSite(compiled, kind, link.slot_index) orelse return null;
+    if (resolved.site.metadata_cell.* != 0) return null;
+    // An exit-side edge exists only while its adapter is published: an
+    // unpublished exit never reaches the adapter's silent check.
+    if (link.kind == .exit_side and !compiled.exitSidePublished(link.slot_index)) return null;
 
     const child_compiled = switch (link.child.native) {
         .compiled => |*c| c,
@@ -1144,23 +1147,28 @@ pub fn promotedEdgeFromLink(self: *TraceState, link: NativeLink) ?PromotedEdge {
     // `prepareNativeEpisode`). Entry kind mirrors the target switch below.
     if (!self.stubEnterable(link.child, switch (link.kind) {
         .link_terminal => .linked,
-        .ordinary_guard, .loop_done_linked, .sibling_handoff, .region_bridge, .ret_cont, .call_head => .ordinary,
-        // Doc 56 Phase 5: `silentKindForArm` refused it above (no silent
-        // site until Phase 6, whose promotion must also read the
-        // exit-side cell, not `slots[slot_index]`).
-        .exit_side => return null,
+        .ordinary_guard, .loop_done_linked, .sibling_handoff, .region_bridge, .ret_cont, .call_head, .exit_side => .ordinary,
     }, link.child.code.anchor.proto)) return null;
     const target = switch (link.kind) {
         .link_terminal => child_compiled.linked_entry orelse return null,
-        .ordinary_guard, .loop_done_linked, .sibling_handoff, .ret_cont, .call_head => child_compiled.ordinary_entry orelse return null,
-        .exit_side => return null,
+        .ordinary_guard, .loop_done_linked, .sibling_handoff, .ret_cont, .call_head, .exit_side => child_compiled.ordinary_entry orelse return null,
         .region_bridge => child_compiled.ordinary_entry orelse return null,
     };
-    if (compiled.slots[link.slot_index] != target) return null;
+    if (resolved.slot.* != target) return null;
 
     const resume_pc: u32 = switch (link.kind) {
         .ret_cont, .call_head => return null, // frame-motion links never promote
-        .exit_side => return null, // Phase 6 (see above)
+        .exit_side => blk: {
+            // Doc 56 §4.8.2 item 6: the adapter left the slab coherent at
+            // the exit's resume pc `P`; the child is a `.link`-tailed
+            // continuation anchored at `(proto, P)`.
+            const p = link.parent.code.exitResumePc(link.slot_index) orelse return null;
+            const n = link.child.code.instrs.len;
+            if (link.parent.code.anchor.proto != link.child.code.anchor.proto or
+                link.child.code.anchor.pc != p or n == 0 or
+                link.child.code.instrs[n - 1].op != .link) return null;
+            break :blk p;
+        },
         .sibling_handoff => blk: {
             if (link.parent.code.anchor.proto != link.child.code.anchor.proto or
                 link.parent.code.anchor.pc != link.child.code.anchor.pc or
@@ -1198,6 +1206,7 @@ pub fn promotedEdgeFromLink(self: *TraceState, link: NativeLink) ?PromotedEdge {
         .child = link.child,
         .arm_kind = link.kind,
         .resume_pc = resume_pc,
+        .cell = cell,
     };
 }
 
@@ -1242,9 +1251,9 @@ pub fn rowSilentKind(kind: trace_exec.LedgerKind) ?nativegen.SilentSiteKind {
         // Doc 45 D6: precise exits carry no patch window — a precise trace
         // is never a chain source, so there is no exit branch to patch.
         .precise_deopt, .precise_error => null,
-        // Doc 56 Phase 4: the exit adapter returns to the runtime (no
-        // slot, no silent site) until Phases 5–6.
-        .exit_side => null,
+        // Doc 56 Phase 6: an exit adapter's row (its site is on the
+        // adapter's page).
+        .exit_side => .exit_side,
     };
 }
 
@@ -1345,7 +1354,7 @@ pub fn detectPromotableSetMembers(
     for (self.registry.native_physical.armedLinks()) |link| {
         const edge = self.promotedEdgeFromLink(link) orelse continue;
         if (!self.edgeMemberOfRegion(edge, key.region_id, true)) continue;
-        if (self.registry.native_physical.exitIsPromoted(edge.parent.id, edge.exit))
+        if (self.registry.native_physical.cellIsPromoted(edge.parent.id, edge.cell))
             continue;
         if (n == PROMOTED_SET_CAP) return self.rejectPromotion(.cap);
         scratch[n] = edge;
@@ -1353,22 +1362,24 @@ pub fn detectPromotableSetMembers(
     }
     if (n == 0) return self.rejectPromotion(.open_chain);
 
-    // Canonical order: (parent id, exit). Insertion sort; n <= 16.
+    // Canonical order: (parent id, cell) — doc 56 Phase 6 keys by the
+    // physical cell, so one exit's ordinary and exit-side edges are two
+    // members. Insertion sort; n <= 16.
     for (1..n) |i| {
         const e = scratch[i];
         var j = i;
         while (j > 0 and (scratch[j - 1].parent.id > e.parent.id or
-            (scratch[j - 1].parent.id == e.parent.id and scratch[j - 1].exit > e.exit))) : (j -= 1)
+            (scratch[j - 1].parent.id == e.parent.id and scratch[j - 1].cell > e.cell))) : (j -= 1)
         {
             scratch[j] = scratch[j - 1];
         }
         scratch[j] = e;
     }
-    // One record per (parent, slot) is an `armNativeLink` invariant; a
+    // One record per (parent, cell) is an `armNativeLink` invariant; a
     // duplicate here means the registry broke it. Fail closed.
     for (1..n) |i| {
         if (scratch[i].parent.id == scratch[i - 1].parent.id and
-            scratch[i].exit == scratch[i - 1].exit)
+            scratch[i].cell == scratch[i - 1].cell)
             return self.rejectPromotion(.child_mismatch);
     }
 
@@ -1376,19 +1387,25 @@ pub fn detectPromotableSetMembers(
     // child-match against the full ledger. Non-final rows are always
     // `.normal`-outcome materialized transitions, and a `.prologue_fail` row
     // can never match a candidate edge (`rowSilentKind` has no silent-site kind
-    // for it), so the grammar is total.
+    // for it), so the grammar is total. A row names its logical exit and its
+    // kind; the kind picks the cell (a `.deopt` row is the ordinary cell's,
+    // an `.exit_side` row the adapter's), so `(parent, exit, kind)` matches
+    // at most one member.
     for (entries[0..member_rows], 0..) |row, i| {
         const observed_kind = rowSilentKind(row.kind) orelse
             return self.rejectPromotion(.no_silent_site);
         var found: ?PromotedEdge = null;
+        var same_exit = false;
         for (scratch[0..n]) |edge| {
-            if (edge.parent.id == row.id and edge.exit == row.exit) {
+            if (edge.parent.id != row.id or edge.exit != row.exit) continue;
+            same_exit = true;
+            if (edge.kind == observed_kind) {
                 found = edge;
                 break;
             }
         }
-        const edge = found orelse return self.rejectPromotion(.open_chain);
-        if (edge.kind != observed_kind) return self.rejectPromotion(.no_silent_site);
+        const edge = found orelse
+            return self.rejectPromotion(if (same_exit) .no_silent_site else .open_chain);
         if (i + 1 < entries.len and edge.child.id != entries[i + 1].id)
             return self.rejectPromotion(.child_mismatch);
     }
@@ -1412,7 +1429,8 @@ pub fn promoteSet(self: *TraceState, edges: []const PromotedEdge, region_key: Re
             .child = edge.child,
             .kind = edge.arm_kind,
         }) orelse return error.InvalidPromotionSet;
-        if (validated.kind != edge.kind or validated.resume_pc != edge.resume_pc)
+        if (validated.kind != edge.kind or validated.resume_pc != edge.resume_pc or
+            validated.cell != edge.cell)
             return error.InvalidPromotionSet;
     }
 
@@ -1466,7 +1484,8 @@ pub fn promoteResidentSet(self: *TraceState, edges: []const PromotedEdge, rid: R
             .child = edge.child,
             .kind = edge.arm_kind,
         }) orelse return error.InvalidPromotionSet;
-        if (validated.kind != edge.kind or validated.resume_pc != edge.resume_pc)
+        if (validated.kind != edge.kind or validated.resume_pc != edge.resume_pc or
+            validated.cell != edge.cell)
             return error.InvalidPromotionSet;
     }
     try self.registry.native_physical.promoteSet(edges, key, self.config.min_useful);
@@ -1867,9 +1886,10 @@ pub fn demoteSetReason(self: *TraceState, idx: usize, reason: DemotionReason) vo
     self.registry.native_physical.demoteSetReason(idx, reason);
 }
 
-pub fn demoteSetsTouching(self: *TraceState, parent: *Trace, exit: u32) void {
+/// `cell` is the physical slot (`PromotedEdge.cell`).
+pub fn demoteSetsTouching(self: *TraceState, parent: *Trace, cell: u32) void {
     defer self.syncNativeInvalidation();
-    self.registry.native_physical.demoteSetsTouching(parent, exit);
+    self.registry.native_physical.demoteSetsTouching(parent, cell);
 }
 
 pub fn demoteSetsTouchingTrace(self: *TraceState, trace: *Trace) void {
@@ -2095,7 +2115,13 @@ pub fn arm(self: *TraceState, request: ArmRequest) !bool {
 pub fn noteMembershipGrowth(self: *TraceState, parent: *Trace, slot_index: u32, child: *Trace, kind: ArmKind) void {
     if (self.registry.native_physical.promotedSets().len == 0 and
         self.registry.native_physical.parked_proofs.items.len == 0) return;
-    if (self.registry.native_physical.exitIsPromoted(parent.id, slot_index))
+    // Doc 56 Phase 6: ownership is by physical cell (an exit-side arm's is
+    // its `exitSideSlot`).
+    const cell = switch (parent.native) {
+        .compiled => |*c| native_physical.promotedCell(c, kind, slot_index) orelse return,
+        else => return,
+    };
+    if (self.registry.native_physical.cellIsPromoted(parent.id, cell))
         return;
     // No silent site (or otherwise failing arm-shape validation) means the
     // edge can never be a candidate member, so it cannot outgrow a set. Same
@@ -2135,7 +2161,8 @@ pub fn noteMembershipGrowth(self: *TraceState, parent: *Trace, slot_index: u32, 
         for (p.edges) |pe| {
             if (pe.parent.id == edge.parent.id and pe.exit == edge.exit and
                 pe.child.id == edge.child.id and pe.kind == edge.kind and
-                pe.arm_kind == edge.arm_kind and pe.resume_pc == edge.resume_pc)
+                pe.arm_kind == edge.arm_kind and pe.resume_pc == edge.resume_pc and
+                pe.cell == edge.cell)
             {
                 covered = true;
                 break;

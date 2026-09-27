@@ -95,8 +95,12 @@ pub const Built = union(enum) {
 /// Build the adapter of attachable exit `gi` of `t` (compiled as `trace_id`,
 /// with exit location map `map`). `target` is the exit's exit-side cell in
 /// the parent's `slots` (`CompiledTrace.exitSideSlot`): the adapter ends by
-/// jumping through it. Errors only on allocation failure.
-pub fn build(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace, trace_id: u32, map: *const ExitLocMap, gi: usize, target: *const usize) std.mem.Allocator.Error!Built {
+/// jumping through it. `metadata_cell` is the exit's silent data cell
+/// (`CompiledTrace.exit_side_metadata_cells[gi]`, doc 56 Phase 6): when
+/// given, the adapter carries a silent switch of kind `.exit_side` and the
+/// result's `site` describes it; null builds an adapter with no silent
+/// path. Errors only on allocation failure.
+pub fn build(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace, trace_id: u32, map: *const ExitLocMap, gi: usize, target: *const usize, metadata_cell: ?*usize) std.mem.Allocator.Error!Built {
     if (comptime !mcode.is_x64_linux) return .{ .refused = .{ .why = .no_stub } };
     const si = t.exitSnapIdx(gi) orelse return .{ .refused = .{ .why = .no_map } };
     if (map.values.len == 0) return .{ .refused = .{ .why = .no_map } };
@@ -107,14 +111,30 @@ pub fn build(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace, trace_
 
     var a = x64.Assembler.init(gpa);
     defer a.deinit();
-    if (try emitAdapter(gpa, &a, t, trace_id, map, gi, si, target, tr.shared_exit)) |r| return .{ .refused = r };
+    var silent: ?SilentEmission = null;
+    if (try emitAdapter(gpa, &a, t, trace_id, map, gi, si, target, tr.shared_exit, metadata_cell, &silent)) |r| return .{ .refused = r };
     a.resolve();
     const page = arena.alloc(a.code.items) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .refused = .{ .why = .emit } },
     };
-    return .{ .adapter = .{ .exit = @intCast(gi), .page = page } };
+    const site: ?artifact.SilentSite = if (silent) |s| .{
+        .kind = .exit_side,
+        .exit_instr = @intCast(gi),
+        .check_off = @intCast(s.check_off),
+        .resume_off = @intCast(s.resume_off),
+        .epilogue_off = @intCast(a.labelOffset(s.epilogue)),
+        .metadata_cell = metadata_cell.?,
+    } else null;
+    return .{ .adapter = .{ .exit = @intCast(gi), .page = page, .site = site } };
 }
+
+/// Where the adapter's silent check was emitted (doc 56 Phase 6).
+const SilentEmission = struct {
+    check_off: usize,
+    resume_off: usize,
+    epilogue: x64.Label,
+};
 
 /// Publish exit `gi`'s adapter in `ct`'s exit-side cell, building it the
 /// first time. A page keeps its adapters until it dies, so re-publishing
@@ -126,7 +146,8 @@ pub fn publish(arena: *McodeArena, t: *const Trace, trace_id: u32, ct: *Compiled
         ct.exit_side_cells[gi] = @intFromPtr(ad.page.code.ptr);
         return null;
     }
-    switch (try build(ct.gpa, arena, t, trace_id, &ct.exit_locs, gi, &ct.slots[cell])) {
+    const data_cell: ?*usize = if (gi < ct.exit_side_metadata_cells.len) &ct.exit_side_metadata_cells[gi] else null;
+    switch (try build(ct.gpa, arena, t, trace_id, &ct.exit_locs, gi, &ct.slots[cell], data_cell)) {
         .refused => |r| return r,
         .adapter => |ad| {
             ct.exit_adapters.append(ct.gpa, ad) catch |e| {
@@ -165,6 +186,8 @@ fn emitAdapter(
     si: usize,
     target: *const usize,
     shared_exit: usize,
+    metadata_cell: ?*usize,
+    silent_out: *?SilentEmission,
 ) !?Refused {
     const n = t.instrs.len;
     const loc = try gpa.alloc(Loc, n);
@@ -286,6 +309,17 @@ fn emitAdapter(
     // The row reads its reason from `exit_reason`, so `.exit_side` is
     // written before the append.
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+    // Doc 56 Phase 6: the silent switch, once the slab is coherent at `P`
+    // and `completed` is written (the silent path's exhausted return
+    // reads both). The silent path never writes `exit_reason`, so a child
+    // it jumps into runs under the wrapper's `.normal`. The check clobbers
+    // rax and the flags; the reporting tail below reloads rax.
+    const silent: ?x64.Label = if (metadata_cell) |cell| blk: {
+        const l = try a.label();
+        const check_off = try emit.emitSilentCheck(a, cell, l);
+        silent_out.* = .{ .check_off = check_off, .resume_off = a.code.items.len, .epilogue = l };
+        break :blk l;
+    } else null;
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_reason"), @intFromEnum(trace_exec.ExitReason.exit_side));
     try emit.emitLedgerAppend(a, trace_id, .exit_side);
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "final_trace_id"), @bitCast(trace_id));
@@ -306,6 +340,12 @@ fn emitAdapter(
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_reason"), @intFromEnum(trace_exec.ExitReason.normal));
     a.bind(out);
     try a.jmpReg(.rax);
+    // The out-of-line silent epilogue (`.exit_side` accounting; it jumps
+    // through the published metadata's `slot`, the exit-side cell).
+    if (silent) |l| {
+        a.bind(l);
+        try emit.emitSilentEpilogue(a, .exit_side, metadata_cell.?, shared_exit, trace_id);
+    }
     return null;
 }
 

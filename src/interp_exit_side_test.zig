@@ -656,6 +656,68 @@ test "doc 56 Phase 4: fft bit-reverse's exits run through native adapters" {
     try expectNativeAdapters(bitreverse_src, "0.5\t1024\n");
 }
 
+/// The `exit_side_replay_src` loop's registers at its exit's resume pc `P`
+/// for i = 3, with `t[1] = 10.5` (the value once iteration 3 updated it):
+/// r0 = t, r1 = s, r2..r4 = the numeric-for index/limit/step, r5 = i. The
+/// traces write scratch slots up to r10.
+const LoopAtP = struct {
+    const t_at_p: f64 = 10.5;
+    tbl: *table.Table,
+    tags: [16]u8,
+    pays: [16]u64,
+
+    fn init(gpa: std.mem.Allocator) !LoopAtP {
+        const tbl = try table.Table.create(gpa);
+        errdefer tbl.destroy(gpa);
+        try tbl.set(gpa, value.Value.int(1), value.Value.float(t_at_p));
+        try testing.expectEqual(@import("array.zig").Lane.f64, tbl.array.lane);
+        const Tag = value.Tag;
+        var s: LoopAtP = .{ .tbl = tbl, .tags = @splat(@intFromEnum(Tag.nil)), .pays = @splat(0) };
+        const tv = value.Value.heap(&tbl.header);
+        s.tags[0] = @intFromEnum(tv.tag);
+        s.pays[0] = tv.payload.bits;
+        s.tags[1] = @intFromEnum(Tag.float);
+        s.pays[1] = @bitCast(@as(f64, 0.0));
+        for ([_]usize{ 2, 5 }) |r| {
+            s.tags[r] = @intFromEnum(Tag.int);
+            s.pays[r] = 3;
+        }
+        s.tags[3] = @intFromEnum(Tag.int);
+        s.pays[3] = 1000;
+        s.tags[4] = @intFromEnum(Tag.int);
+        s.pays[4] = 1;
+        return s;
+    }
+
+    fn deinit(self: *LoopAtP, gpa: std.mem.Allocator) void {
+        self.tbl.destroy(gpa);
+    }
+
+    fn regs(self: *LoopAtP) RegWindow {
+        return RegWindow.of(&self.tags, &self.pays);
+    }
+
+    /// The slab must be coherent at `P` of iteration `k` (a multiple of
+    /// 3, reached by the child closing i = 3 and the loop running on):
+    /// `t[1]` updated through `k`, `s` through `k - 1`. The same walk in
+    /// plain f64 arithmetic gives the exact bits.
+    fn expectAtP(self: *LoopAtP, k: i64) !void {
+        var t1 = t_at_p;
+        var s: f64 = 0.0;
+        s += t1; // the child closes i = 3
+        var i: i64 = 4;
+        while (i < k) : (i += 1) {
+            t1 += @floatFromInt(i);
+            if (@mod(i, 3) == 0) s += t1 else s -= 1;
+        }
+        t1 += @floatFromInt(k);
+        try testing.expectEqual(@as(u64, @intCast(k)), self.pays[2]);
+        try testing.expectEqual(@as(u64, @intCast(k)), self.pays[5]);
+        try testing.expectEqual(@as(u64, @bitCast(s)), self.pays[1]);
+        try testing.expectEqual(@as(u64, @bitCast(t1)), self.tbl.get(value.Value.int(1)).payload.bits);
+    }
+};
+
 /// Doc 56 Phase 5: the `.exit_side` replay grammar, pinned on hand-made
 /// ledgers over REAL armed traces (a program that arms its exit, then the
 /// ledgers each rare branch writes). The end-to-end tests above cover the
@@ -765,35 +827,11 @@ fn checkExitSideReplay(vm: *Vm, mode: TraceMode) !void {
         }
         if (!link_armed) try testing.expect(try ts.armNativeLink(child, link_exit, parent, .link_terminal));
 
-        const gpa = testing.allocator;
-        const tbl = try table.Table.create(gpa);
-        defer tbl.destroy(gpa);
-        const t_at_p: f64 = 10.5; // t[1] once iteration i = 3 updated it
-        try tbl.set(gpa, value.Value.int(1), value.Value.float(t_at_p));
-        try testing.expectEqual(@import("array.zig").Lane.f64, tbl.array.lane);
-
-        // The loop's registers at `P` for i = 3: r0 = t, r1 = s, r2..r4 =
-        // the numeric-for index/limit/step, r5 = i. The traces write
-        // scratch slots up to r10.
-        const Tag = value.Tag;
-        var tags: [16]u8 = @splat(@intFromEnum(Tag.nil));
-        var pays: [16]u64 = @splat(0);
-        const tv = value.Value.heap(&tbl.header);
-        tags[0] = @intFromEnum(tv.tag);
-        pays[0] = tv.payload.bits;
-        tags[1] = @intFromEnum(Tag.float);
-        pays[1] = @bitCast(@as(f64, 0.0));
-        for ([_]usize{ 2, 5 }) |r| {
-            tags[r] = @intFromEnum(Tag.int);
-            pays[r] = 3;
-        }
-        tags[3] = @intFromEnum(Tag.int);
-        pays[3] = 1000;
-        tags[4] = @intFromEnum(Tag.int);
-        pays[4] = 1;
+        var st = try LoopAtP.init(testing.allocator);
+        defer st.deinit(testing.allocator);
 
         var ledger: [trace_exec.LEDGER_CAP]Entry = undefined;
-        const r = child.native.compiled.runCapturingLedgerEntry(RegWindow.of(&tags, &pays), &ledger, ts.silentStaging(), true);
+        const r = child.native.compiled.runCapturingLedgerEntry(st.regs(), &ledger, ts.silentStaging(), true);
         try testing.expectEqual(trace_exec.ExitReason.exit_side, r.exit_reason);
         try testing.expectEqual(@as(u32, trace_exec.LEDGER_CAP), r.ledger_len);
         for (ledger, 0..) |row, k| {
@@ -816,21 +854,8 @@ fn checkExitSideReplay(vm: *Vm, mode: TraceMode) !void {
         }
 
         // The slab is coherent at `P` of i = 51 (the 16th exit: i = 6, 9,
-        // …, 51), with that iteration's sunk `t[1]` store applied. The same
-        // walk in plain f64 arithmetic gives the exact bits.
-        var t1 = t_at_p;
-        var s: f64 = 0.0;
-        s += t1; // the child closes i = 3
-        var i: i64 = 4;
-        while (i <= 50) : (i += 1) {
-            t1 += @floatFromInt(i);
-            if (@mod(i, 3) == 0) s += t1 else s -= 1;
-        }
-        t1 += 51;
-        try testing.expectEqual(@as(u64, 51), pays[2]);
-        try testing.expectEqual(@as(u64, 51), pays[5]);
-        try testing.expectEqual(@as(u64, @bitCast(s)), pays[1]);
-        try testing.expectEqual(@as(u64, @bitCast(t1)), tbl.get(value.Value.int(1)).payload.bits);
+        // …, 51), with that iteration's sunk `t[1]` store applied.
+        try st.expectAtP(51);
 
         // Its replay: 16 closed iterations (i = 3 … 48 by the child's
         // links) plus 16 × 2 parent laps; i = 51 is left to tier-0 at `P`.
@@ -1025,30 +1050,11 @@ fn checkOrdinaryArmFirst(vm: *Vm, mode: TraceMode) !void {
     try testing.expect(ts.ordinaryArmLive(parent, ei));
     try testing.expect(ts.hasArmedExitSide(parent, ei, child));
 
-    const gpa = testing.allocator;
-    const tbl = try table.Table.create(gpa);
-    defer tbl.destroy(gpa);
-    try tbl.set(gpa, value.Value.int(1), value.Value.float(10.5));
-    // The loop's registers at `P` for i = 3, as in `checkExitSideReplay` (c').
-    const Tag = value.Tag;
-    var tags: [16]u8 = @splat(@intFromEnum(Tag.nil));
-    var pays: [16]u64 = @splat(0);
-    const tv = value.Value.heap(&tbl.header);
-    tags[0] = @intFromEnum(tv.tag);
-    pays[0] = tv.payload.bits;
-    tags[1] = @intFromEnum(Tag.float);
-    pays[1] = @bitCast(@as(f64, 0.0));
-    for ([_]usize{ 2, 5 }) |r| {
-        tags[r] = @intFromEnum(Tag.int);
-        pays[r] = 3;
-    }
-    tags[3] = @intFromEnum(Tag.int);
-    pays[3] = 1000;
-    tags[4] = @intFromEnum(Tag.int);
-    pays[4] = 1;
+    var st = try LoopAtP.init(testing.allocator);
+    defer st.deinit(testing.allocator);
 
     var ledger: [trace_exec.LEDGER_CAP]Entry = undefined;
-    const r = child.native.compiled.runCapturingLedgerEntry(RegWindow.of(&tags, &pays), &ledger, ts.silentStaging(), true);
+    const r = child.native.compiled.runCapturingLedgerEntry(st.regs(), &ledger, ts.silentStaging(), true);
     try testing.expectEqual(@as(u32, trace_exec.LEDGER_CAP), r.ledger_len);
     try testing.expect(r.exit_reason != .exit_side);
     // The child closes i = 3; the parent runs i = 4, 5 and fails at i = 6,
@@ -1064,7 +1070,7 @@ fn checkOrdinaryArmFirst(vm: *Vm, mode: TraceMode) !void {
     }
     // Every row re-ran i = 6 from the anchor: the slab still holds it, and
     // the iteration's sunk `t[1]` store was never applied twice.
-    try testing.expectEqual(@as(f64, 10.5 + 4 + 5), @as(f64, @bitCast(tbl.get(value.Value.int(1)).payload.bits)));
+    try testing.expectEqual(@as(f64, 10.5 + 4 + 5), @as(f64, @bitCast(st.tbl.get(value.Value.int(1)).payload.bits)));
 
     // Disarming the ordinary cell hands the exit back to its adapter.
     for (ts.registry.native_physical.armedLinks(), 0..) |x, i| {
@@ -1074,6 +1080,338 @@ fn checkOrdinaryArmFirst(vm: *Vm, mode: TraceMode) !void {
         }
     }
     try testing.expect(!ts.ordinaryArmLive(parent, ei));
+}
+
+/// Doc 56 Phase 6 (§4.8.2), in machine code on the replay fixture's real
+/// traces: the exit-side cycle `child.link → parent … adapter → child` as a
+/// promoted set. Promotion is physical and resident (no activation), so the
+/// drain runs without a region; the region half is pinned by the bit-reverse
+/// test below.
+fn checkSilentExitSide(vm: *Vm, mode: TraceMode) !void {
+    if (mode != .record_execute_native) return;
+    const ts = &vm.trace;
+    const gpa = testing.allocator;
+    const Entry = trace_exec.LedgerEntry;
+    const trace_mod = @import("trace.zig");
+    const l = for (ts.registry.native_physical.armedLinks()) |x| {
+        if (x.kind == .exit_side) break x;
+    } else return error.TestNoExitSideArm;
+    const parent = l.parent;
+    const child = l.child;
+    const ei = l.slot_index;
+    const proto = parent.code.anchor.proto;
+    const p = parent.code.exitResumePc(ei).?;
+    const pc = &parent.native.compiled;
+    const es_cell = pc.exitSideSlot(ei).?;
+    const link_exit: u32 = @intCast(child.code.instrs.len - 1);
+    var link_armed = false;
+    for (ts.registry.native_physical.armedLinks()) |x| {
+        if (x.kind == .link_terminal and x.parent == child and x.child == parent) link_armed = true;
+    }
+    if (!link_armed) try testing.expect(try ts.armNativeLink(child, link_exit, parent, .link_terminal));
+    ts.demoteAllSets();
+    const key: trace_mod.RegionKey = .{ .region_id = @enumFromInt(0xfeed_0000), .activation = trace_mod.RESIDENT_ACTIVATION };
+
+    // The adapter carries its own silent site, on its own page, testing
+    // its own data cell (not the ordinary deopt site's).
+    const ad = pc.exitAdapter(ei).?;
+    const site = ad.site.?;
+    try testing.expectEqual(nativegen.SilentSiteKind.exit_side, site.kind);
+    try testing.expectEqual(&pc.exit_side_metadata_cells[ei], site.metadata_cell);
+    try testing.expect(site.metadata_cell != &pc.metadata_cells[ei]);
+
+    const es_edge = ts.promotedEdgeFromLink(.{ .parent = parent, .slot_index = ei, .child = child, .kind = .exit_side }) orelse
+        return error.TestExitSideEdgeRefused;
+    try testing.expectEqual(nativegen.SilentSiteKind.exit_side, es_edge.kind);
+    try testing.expectEqual(es_cell, es_edge.cell);
+    try testing.expectEqual(ei, es_edge.exit);
+    try testing.expectEqual(p, es_edge.resume_pc);
+    const link_edge = ts.promotedEdgeFromLink(.{ .parent = child, .slot_index = link_exit, .child = parent, .kind = .link_terminal }) orelse
+        return error.TestLinkEdgeRefused;
+    try testing.expectEqual(link_exit, link_edge.cell);
+    const min_useful = ts.config.min_useful;
+
+    // (a) Both edges promoted: the cycle runs rowless until the budget. The
+    // eighth transition is the fourth adapter firing (exits at i = 6, 9,
+    // 12, 15), so the run stops at `P` of i = 15 with no row written.
+    {
+        try ts.registry.native_physical.promoteSet(&.{ link_edge, es_edge }, key, min_useful);
+        try testing.expect(pc.exit_side_metadata_cells[ei] != 0);
+        try testing.expectEqual(@as(usize, 0), pc.metadata_cells[ei]);
+        try testing.expect(ts.registry.native_physical.cellIsPromoted(parent.id, es_cell));
+        try testing.expect(!ts.registry.native_physical.cellIsPromoted(parent.id, ei));
+        // The metadata jumps through the exit-side cell, and falls back to
+        // the adapter's reporting tail, not the parent page.
+        const md: *const nativegen.SilentExitMetadata = @ptrFromInt(pc.exit_side_metadata_cells[ei]);
+        try testing.expectEqual(&pc.slots[es_cell], md.slot);
+        try testing.expectEqual(@intFromPtr(ad.page.code.ptr) + site.resume_off, md.reporting_target);
+
+        var st = try LoopAtP.init(gpa);
+        defer st.deinit(gpa);
+        var ledger: [trace_exec.LEDGER_CAP]Entry = undefined;
+        const staging: nativegen.SilentStaging = .{ .silent_budget = 8, .barren_budget = ts.config.max_barren_run, .cur_zero_run = 0 };
+        const r = child.native.compiled.runCapturingLedgerEntry(st.regs(), &ledger, staging, true);
+        try testing.expectEqual(@as(u32, 0), r.ledger_len);
+        try testing.expect(r.silent_active != 0);
+        try testing.expectEqual(@as(u64, 8), r.silent_transitions);
+        try testing.expectEqual(trace_exec.ExitReason.normal, r.exit_reason);
+        try st.expectAtP(15);
+
+        // The summary image, as the epilogues wrote it: four firings each;
+        // the adapter's carries the replay row's `local + 1` = 3 per firing.
+        const set = ts.registry.native_physical.promotedSets()[0];
+        try testing.expectEqual(@as(u64, 4), set.summary[0].firings);
+        try testing.expectEqual(@as(u64, 0), set.summary[0].region_work);
+        try testing.expectEqual(@as(u64, 4), set.summary[1].firings);
+        try testing.expectEqual(@as(u64, 12), set.summary[1].region_work);
+        try testing.expectEqual(@as(u64, 12), set.summary[1].selection_work);
+        try testing.expectEqual(@as(u64, 2), set.summary[1].last_local);
+        try testing.expectEqual(@as(u64, 4), set.summary[1].productive_firings);
+
+        // The drain: rowless at `P`, and the count a rowed ledger of the
+        // same eight rows reports (`checkExitSideReplay` (c)): four closed
+        // iterations plus four adapter rows of two laps each.
+        const hops0 = ts.exit_side_hops;
+        const fused0 = ts.exit_side_fused;
+        var lc: usize = 0;
+        var rpc: u32 = 999;
+        var hops: usize = 0;
+        const d = ts.drainSilentResult(r, .dispatcher_root, proto, &lc, &rpc, &hops, 8, false, st.regs()) orelse
+            return error.TestNotDrained;
+        const rr = switch (d) {
+            .return_result => |x| x,
+            else => return error.TestUnexpectedResult,
+        };
+        try testing.expectEqual(p, rr.resume_pc.?);
+        try testing.expect(rr.exit_side == null);
+        try testing.expectEqual(@as(usize, 4 + 4 * 2), rr.completed);
+        try testing.expectEqual(hops0 + 4, ts.exit_side_hops);
+        try testing.expectEqual(fused0 + 3, ts.exit_side_fused);
+        ts.demoteAllSets();
+        try testing.expectEqual(@as(usize, 0), pc.exit_side_metadata_cells[ei]);
+        try testing.expect(!ts.registry.native_physical.cellIsPromoted(parent.id, es_cell));
+    }
+
+    // (b) Only the `.link` promoted: silence starts at the child's `.link`,
+    // and the unpromoted adapter takes its reporting path — the suffix
+    // starts with its `.exit_side` row and runs to the ledger cap.
+    {
+        try ts.registry.native_physical.promoteSet(&.{link_edge}, key, min_useful);
+        var st = try LoopAtP.init(gpa);
+        defer st.deinit(gpa);
+        var ledger: [trace_exec.LEDGER_CAP]Entry = undefined;
+        const r = child.native.compiled.runCapturingLedgerEntry(st.regs(), &ledger, ts.silentStaging(), true);
+        try testing.expect(r.silent_active != 0);
+        try testing.expectEqual(@as(u64, 1), r.silent_transitions);
+        try testing.expectEqual(@as(u32, trace_exec.LEDGER_CAP), r.ledger_len);
+        try testing.expectEqual(parent.id, ledger[0].id);
+        try testing.expectEqual(trace_exec.LedgerKind.exit_side, ledger[0].kind);
+        try testing.expectEqual(ei, ledger[0].exit);
+        try testing.expectEqual(trace_exec.LedgerKind.link_terminal, ledger[1].kind);
+        @memcpy(ts.ledger_scratch[0..r.ledger_len], ledger[0..r.ledger_len]);
+        var lc: usize = 0;
+        var rpc: u32 = 999;
+        var hops: usize = 0;
+        const d = ts.drainSilentResult(r, .dispatcher_root, proto, &lc, &rpc, &hops, 8, false, st.regs()) orelse
+            return error.TestNotDrained;
+        switch (d) {
+            .return_result => |x| try testing.expect(x.exit_side == null),
+            .run_inner_from, .run_continuation => {},
+            .break_burst => return error.TestUnexpectedResult,
+        }
+        ts.demoteAllSets();
+    }
+
+    // (c) The same, with the exit-side arm gone: the suffix is the unarmed
+    // adapter's one row, and the drain hands the exit to the dispatcher's
+    // routing (`ChainResult.exit_side`) at `P`.
+    {
+        for (ts.registry.native_physical.armedLinks(), 0..) |x, i| {
+            if (x.kind == .exit_side and x.parent == parent and x.slot_index == ei) {
+                ts.disarmLinkAt(i);
+                break;
+            }
+        }
+        try testing.expect(!ts.hasArmedExitSide(parent, ei, child));
+        try ts.registry.native_physical.promoteSet(&.{link_edge}, key, min_useful);
+        var st = try LoopAtP.init(gpa);
+        defer st.deinit(gpa);
+        var ledger: [trace_exec.LEDGER_CAP]Entry = undefined;
+        const r = child.native.compiled.runCapturingLedgerEntry(st.regs(), &ledger, ts.silentStaging(), true);
+        try testing.expect(r.silent_active != 0);
+        try testing.expectEqual(@as(u32, 1), r.ledger_len);
+        try testing.expectEqual(trace_exec.ExitReason.exit_side, r.exit_reason);
+        try st.expectAtP(6);
+        @memcpy(ts.ledger_scratch[0..r.ledger_len], ledger[0..r.ledger_len]);
+        var lc: usize = 0;
+        var rpc: u32 = 999;
+        var hops: usize = 0;
+        const d = ts.drainSilentResult(r, .dispatcher_root, proto, &lc, &rpc, &hops, 8, false, st.regs()) orelse
+            return error.TestNotDrained;
+        const rr = switch (d) {
+            .return_result => |x| x,
+            else => return error.TestUnexpectedResult,
+        };
+        try testing.expectEqual(p, rr.resume_pc.?);
+        const es = rr.exit_side orelse return error.TestNoExitSideTerminal;
+        try testing.expectEqual(parent, es.trace);
+        try testing.expectEqual(ei, es.exit);
+        try testing.expectEqual(@as(usize, 3), es.done);
+        ts.demoteAllSets();
+        try testing.expect(try ts.armNativeLink(parent, ei, child, .exit_side));
+    }
+
+    // (d) Keying by cell: one exit with an ordinary arm AND an exit-side
+    // arm is two cells, two data cells, one set.
+    {
+        try testing.expect(try ts.armNativeLink(parent, ei, parent, .ordinary_guard));
+        const og_edge = ts.promotedEdgeFromLink(.{ .parent = parent, .slot_index = ei, .child = parent, .kind = .ordinary_guard }) orelse
+            return error.TestOrdinaryEdgeRefused;
+        try testing.expectEqual(ei, og_edge.cell);
+        const es2 = ts.promotedEdgeFromLink(.{ .parent = parent, .slot_index = ei, .child = child, .kind = .exit_side }).?;
+        try ts.registry.native_physical.promoteSet(&.{ og_edge, es2 }, key, min_useful);
+        try testing.expect(ts.registry.native_physical.cellIsPromoted(parent.id, ei));
+        try testing.expect(ts.registry.native_physical.cellIsPromoted(parent.id, es_cell));
+        try testing.expect(pc.metadata_cells[ei] != 0);
+        try testing.expect(pc.exit_side_metadata_cells[ei] != 0);
+        try testing.expect(pc.metadata_cells[ei] != pc.exit_side_metadata_cells[ei]);
+        // A set naming one cell twice is refused.
+        ts.demoteAllSets();
+        try testing.expectError(error.InvalidPromotionSet, ts.registry.native_physical.promoteSet(&.{ es2, es2 }, key, min_useful));
+        try testing.expectEqual(@as(usize, 0), pc.metadata_cells[ei]);
+        try testing.expectEqual(@as(usize, 0), pc.exit_side_metadata_cells[ei]);
+        for (ts.registry.native_physical.armedLinks(), 0..) |x, i| {
+            if (x.kind == .ordinary_guard and x.parent == parent and x.slot_index == ei) {
+                ts.disarmLinkAt(i);
+                break;
+            }
+        }
+    }
+
+    // (d') Disarming a PROMOTED exit-side link demotes its set through
+    // `prepareSlotMutation` on the exit-side cell (not the ordinary one)
+    // and zeroes the adapter's data cell.
+    {
+        const es4 = ts.promotedEdgeFromLink(.{ .parent = parent, .slot_index = ei, .child = child, .kind = .exit_side }).?;
+        try ts.registry.native_physical.promoteSet(&.{ link_edge, es4 }, key, min_useful);
+        try testing.expect(pc.exit_side_metadata_cells[ei] != 0);
+        const demotions0 = ts.registry.native_physical.silent_demotions;
+        const disarmed = for (ts.registry.native_physical.armedLinks(), 0..) |x, i| {
+            if (x.kind == .exit_side and x.parent == parent and x.slot_index == ei) {
+                ts.disarmLinkAt(i);
+                break true;
+            }
+        } else false;
+        try testing.expect(disarmed);
+        try testing.expectEqual(demotions0 + 1, ts.registry.native_physical.silent_demotions);
+        try testing.expectEqual(@as(usize, 0), ts.registry.native_physical.promotedSets().len);
+        try testing.expectEqual(@as(usize, 0), pc.exit_side_metadata_cells[ei]);
+        try testing.expect(!ts.registry.native_physical.cellIsPromoted(parent.id, es_cell));
+        try testing.expect(try ts.armNativeLink(parent, ei, child, .exit_side));
+    }
+
+    // (e) Retiring the child demotes the set through `resetLinksTouching`
+    // and zeroes the adapter's data cell.
+    {
+        const es3 = ts.promotedEdgeFromLink(.{ .parent = parent, .slot_index = ei, .child = child, .kind = .exit_side }).?;
+        try ts.registry.native_physical.promoteSet(&.{ link_edge, es3 }, key, min_useful);
+        const demotions0 = ts.registry.native_physical.silent_demotions;
+        ts.resetLinksTouching(child);
+        try testing.expectEqual(demotions0 + 1, ts.registry.native_physical.silent_demotions);
+        try testing.expectEqual(@as(usize, 0), ts.registry.native_physical.promotedSets().len);
+        try testing.expectEqual(@as(usize, 0), pc.exit_side_metadata_cells[ei]);
+        try testing.expect(!ts.registry.native_physical.cellIsPromoted(parent.id, es_cell));
+    }
+}
+
+test "doc 56 Phase 6: an exit-side cycle runs silent, keyed by cell" {
+    try expectProgramTuned(exit_side_replay_src, "1530000\t45150.5\n", .{ .exit_side_native = true, .inspect = checkSilentExitSide });
+}
+
+// Doc 56 Phase 6: a branch that flips for good (`boolC`, TODO.md). After
+// i = 500 every iteration leaves the loop trace through its exit adapter
+// into the continuation at `P`, whose `.link` closes the iteration: the
+// one exit-side cycle that needed silence (70% seam before). Rowed and
+// silent must account the same work: traced iterations and adapter hops.
+const flip_src =
+    \\local N = 20000
+    \\local c = 0
+    \\for i = 1, N do local lt = i < 500; if lt then c = c + 1 end end
+    \\print(c)
+;
+test "doc 56 Phase 6: a flipped branch's exit-side cycle promotes, and accounts like the rowed one" {
+    const Seen = struct {
+        var traced: [2]u64 = .{ 0, 0 };
+        var total: [2]u64 = .{ 0, 0 };
+        var hops: [2]u64 = .{ 0, 0 };
+        var promotions: [2]u64 = .{ 0, 0 };
+        var transitions: [2]u64 = .{ 0, 0 };
+        fn record(vm: *Vm, mode: TraceMode, leg: usize) void {
+            if (mode != .record_execute_native) return;
+            const ts = &vm.trace;
+            traced[leg] = ts.iters_traced;
+            total[leg] = ts.iters_traced + ts.iters_tier0_covered + ts.iters_tier0_uncovered;
+            hops[leg] = ts.exit_side_hops;
+            promotions[leg] = ts.registry.native_physical.silent_promotions;
+            transitions[leg] = ts.silent_transitions_total;
+        }
+        fn rowed(vm: *Vm, mode: TraceMode) !void {
+            record(vm, mode, 0);
+        }
+        fn silent(vm: *Vm, mode: TraceMode) !void {
+            record(vm, mode, 1);
+        }
+    };
+    const base: @import("interp_testutil.zig").CapturedOpts = .{ .exit_side_native = true, .coverage = true };
+    var opts = base;
+    opts.silent_promotion = false;
+    opts.inspect = Seen.rowed;
+    try expectProgramTuned(flip_src, "499\n", opts);
+    opts = base;
+    opts.inspect = Seen.silent;
+    try expectProgramTuned(flip_src, "499\n", opts);
+
+    try testing.expectEqual(@as(u64, 0), Seen.promotions[0]);
+    try testing.expect(Seen.promotions[1] > 0);
+    // Most of the cycle's hops ran silent.
+    try testing.expect(Seen.transitions[1] > Seen.hops[1] / 2);
+    try testing.expect(Seen.hops[0] > 0);
+    // The two runs take different paths — a rowed ledger yields every 16
+    // hops and tier-0 finishes the interrupted iteration; silence yields
+    // only at its budget — so their per-path totals differ, but every
+    // iteration is counted exactly once either way, and silence runs more
+    // of them as a trace.
+    try testing.expectEqual(Seen.total[0], Seen.total[1]);
+    try testing.expect(Seen.traced[1] > Seen.traced[0]);
+    try testing.expect(Seen.hops[1] > Seen.hops[0]);
+}
+
+// Doc 56 Phase 6 / Rule Z-8 layer 2: an armed exit-side cycle only stops
+// paying per-row ledger costs once its region is ARMABLE and the set is
+// promoted. Bit-reverse at the CLI threshold must mint an armable
+// cross-trace cycle. It does not promote yet: every burst ends at the
+// inner `while` root's loop-done `.deopt` (G5, §4.8.2 — `while` loops
+// have no native loop-done link), so no ledger ever fills to the forced
+// yield that promotion needs. When G5 lands, add the promotion checks.
+test "doc 56 Phase 6: fft bit-reverse's exit-side cycle mints armable" {
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode != .record_execute_native) return;
+            const ts = &vm.trace;
+            var armable_cycle = false;
+            var it = ts.region_policy.region_defs.valueIterator();
+            while (it.next()) |def| {
+                if (def.classifier.kind == .cross_trace_cycle and def.armable) armable_cycle = true;
+            }
+            try testing.expect(armable_cycle);
+            try testing.expect(ts.exit_side_hops > 0);
+        }
+    };
+    try expectProgramTuned(bitreverse_src, "0.5\t1024\n", .{
+        .exit_side_native = true,
+        .hotloop = (@import("trace.zig").TraceConfig{}).hotloop,
+        .inspect = Inspect.run,
+    });
 }
 
 test "doc 56 §4.8.3 R1: a live ordinary arm wins over a published exit adapter" {

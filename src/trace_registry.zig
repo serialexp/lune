@@ -152,7 +152,7 @@ test "registry clear drops candidate references even without armed links" {
     try registry.publish(t);
     const Edge = @import("trace_native_registry.zig").PromotedEdge;
     const edges = try testing.allocator.alloc(Edge, 1);
-    edges[0] = .{ .parent = t, .child = t, .exit = 0, .kind = .deopt, .arm_kind = .ordinary_guard, .resume_pc = 0 };
+    edges[0] = .{ .parent = t, .child = t, .exit = 0, .kind = .deopt, .arm_kind = .ordinary_guard, .resume_pc = 0, .cell = 0 };
     // Candidate storage is independent from live promotions and armed links.
     registry.native_physical.promotion_candidate = edges;
     registry.clear();

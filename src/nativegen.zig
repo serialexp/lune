@@ -312,12 +312,20 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     // may legitimately arm.
     // Doc 56 Phase 4: one exit-side cell per instruction (zero = ordinary
     // exit), heap-stable before `lower` bakes `&cells[i]`.
+    // Doc 56 Phase 6: the adapters' silent data cells come with them (zero =
+    // not promoted); an adapter bakes `&exit_side_metadata_cells[ei]`.
     var exit_side_cells: []usize = &.{};
+    var exit_side_metadata_cells: []usize = &.{};
     var keep_exit_side_cells = false;
-    defer if (exit_side_cells.len > 0 and !keep_exit_side_cells) gpa.free(exit_side_cells);
+    defer if (!keep_exit_side_cells) {
+        if (exit_side_cells.len > 0) gpa.free(exit_side_cells);
+        if (exit_side_metadata_cells.len > 0) gpa.free(exit_side_metadata_cells);
+    };
     if (exit_side) {
         exit_side_cells = gpa.alloc(usize, n) catch return null;
         @memset(exit_side_cells, 0);
+        exit_side_metadata_cells = gpa.alloc(usize, n) catch return null;
+        @memset(exit_side_metadata_cells, 0);
     }
     var slots: []usize = &.{};
     var ret_cont_keys: []u32 = &.{};
@@ -534,6 +542,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
         .peeled = t.peeled,
         .exit_locs = exit_locs,
         .exit_side_cells = exit_side_cells,
+        .exit_side_metadata_cells = exit_side_metadata_cells,
     };
 }
 
@@ -2554,7 +2563,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // within a native call started by the dispatcher's direct entry
             // (`exit_side_ok`; every trace that call chains into included —
             // the dispatcher replays the ledger, whose `.exit_side` grammar
-            // is Phase 5's) and with no silent transition (Phase 6). §4.8.3
+            // is Phase 5's). Silence does not matter (doc 56 Phase 6): a
+            // promoted adapter continues silently, and an unpromoted one
+            // takes its reporting path, which ends silence into a suffix
+            // whose first row is its `.exit_side` row. §4.8.3
             // R1: a live ORDINARY arm (a sibling handoff, an M1
             // `ordinary_guard`, a region bridge — anything but `shared_exit`
             // in `slots[ei]`) wins: the exit takes the ordinary path it was
@@ -2576,8 +2588,6 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 try a.jcc(.e, ordinary);
                 try a.cmpByteMemImm(.rdx, @offsetOf(NativeResult, "exit_side_ok"), 0);
                 try a.jcc(.e, ordinary);
-                try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "silent_active"), 0);
-                try a.jcc(.ne, ordinary);
                 try a.jmpMem(.rax, 0);
                 a.bind(ordinary);
             }

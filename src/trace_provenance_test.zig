@@ -483,6 +483,7 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
         .child = &child,
         .arm_kind = .sibling_handoff,
         .resume_pc = child.code.anchor.pc,
+        .cell = 0,
     };
 
     // Every internal native origin uses the same ordinary-vs-silent capture
@@ -672,7 +673,7 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     // the arrival evidence the ring's return distance used to reconstruct.
     var fab_edges = [_]PromotedEdge{
         silent_edge,
-        .{ .parent = &parent, .exit = 1, .kind = .deopt, .child = &x, .arm_kind = .ordinary_guard, .resume_pc = x.code.anchor.pc },
+        .{ .parent = &parent, .exit = 1, .kind = .deopt, .child = &x, .arm_kind = .ordinary_guard, .resume_pc = x.code.anchor.pc, .cell = 1 },
     };
     var fab_summary = [_]nativegen.SilentSummaryCell{
         .{ .region_work = 0, .selection_work = 0, .qualifying_rows = 0, .productive_firings = 0, .last_local = 0, .last_productive_ordinal = 0, .firings = 1, .last_ordinal = 1 },

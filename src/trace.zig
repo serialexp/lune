@@ -1314,6 +1314,12 @@ pub const TraceState = struct {
     /// consecutive chains at `P` that did not link (also counted in
     /// `exit_side_giveups`).
     exit_side_miss_giveups: u64 = 0,
+    /// Doc 56 §4.8.2 item 10 (P6-Q3): native calls from a burst origin
+    /// (`exit_side_ok = 0`) that ended on an ordinary deopt at an exit whose
+    /// adapter is published and whose ordinary cell is unarmed — exits the
+    /// direct entry would have sent to the adapter. Measures what widening
+    /// `exit_side_ok` to bursts would reach.
+    exit_side_burst_skips: u64 = 0,
     /// Doc 56 Phase 4: native exit adapters built.
     exit_adapter_builds: u64 = 0,
     /// Doc 56 Phase 4: adapter builds refused, per `adapter.Refusal`.
@@ -4330,7 +4336,7 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
         }
         try w.writeAll(if (any_adapter_refused) "\n" else " none\n");
         // Doc 56 Phase 5: the adapter's direct jump into the child.
-        try w.print("    exit-side arms:       armed={d} fused hops={d} yields={d} disarmed (child prologue)={d}\n", .{ ts.exit_side_arms, ts.exit_side_fused, ts.exit_side_yields, ts.exit_side_disarms });
+        try w.print("    exit-side arms:       armed={d} fused hops={d} yields={d} disarmed (child prologue)={d} burst skips={d}\n", .{ ts.exit_side_arms, ts.exit_side_fused, ts.exit_side_yields, ts.exit_side_disarms, ts.exit_side_burst_skips });
     }
 
     try w.writeAll("  coverage by loop iterations (count — flatters the JIT):\n");

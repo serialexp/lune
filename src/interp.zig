@@ -3898,12 +3898,16 @@ pub const Vm = struct {
             if (ran_native) {
                 if (self.trace.driveDispatcherSilentResult(ct, result, proto, regs, safe_to_arm)) |chain| {
                     if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                    // Doc 56 Phase 5: never an adapter row here. The stub
-                    // refuses once a silent transition ran, and a silent
-                    // epilogue refuses once any row (an adapter's included)
-                    // was written. Phase 6 revisits this with its silent
-                    // exit-side site.
-                    std.debug.assert(chain.exit_side == null);
+                    // Doc 56 Phase 6 (§4.8.2 item 7): silence can end in a
+                    // reporting suffix whose last row is an UNARMED exit
+                    // adapter's (an unpromoted adapter takes its reporting
+                    // path under silence). The slab is coherent at `pc`, its
+                    // resume pc; route it exactly as the ledger branch does.
+                    if (chain.exit_side) |es| {
+                        const d = self.consumeExitSideTerminal(mode, es, proto, regs, base, safe_to_arm);
+                        for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                        return d;
+                    }
                     const armed_side = self.trace.consumeSideTraceWantAtResume(proto, @intCast(pc));
                     for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
                     if (armed_side and mode == .fast) {

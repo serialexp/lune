@@ -89,6 +89,9 @@ pub const CapturedOpts = struct {
     /// Doc 57 P3: override `Config.instunroll` (the instability-unroll
     /// budget); null keeps the default.
     instunroll: ?u8 = null,
+    /// Override `Config.silent_promotion_enabled` (doc 56 Phase 6's rowed
+    /// vs silent comparisons); null keeps the default.
+    silent_promotion: ?bool = null,
     inspect: ?*const fn (*Vm, TraceMode) anyerror!void = null,
 };
 
@@ -126,6 +129,7 @@ pub fn runCapturedTuned(
     vm.trace.config.record_aborts = opts.record_aborts;
     if (opts.hotguard) |hg| vm.trace.config.hotguard = hg;
     if (opts.instunroll) |n| vm.trace.config.instunroll = n;
+    if (opts.silent_promotion) |on| vm.trace.config.silent_promotion_enabled = on;
 
     var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();

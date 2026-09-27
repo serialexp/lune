@@ -1793,29 +1793,46 @@ nothing at all.
 
 ## Doc 56 Phase 5 findings (2026-09-27)
 
-- [ ] **nsieve with the switch ON is still 12 → 43 ms (doc 56 G6).**
-      R4 fixed the G4 turnstile (was 259 ms). What is left (doc 56
-      §4.8.3 "What nsieve still pays"): full 32-row ledgers ending at t3
-      exit 23 (Phase 6's work), and t6 — a pc 18 trace that unrolled the
-      inner `for k` — whose per-trip-count exits fill the pc 18 anchor
-      with children, so exits 71 and 107 are refused ("anchor full"),
-      give up, and end 13.5k ledgers. Re-diagnose after Phase 6.
+- [ ] **nsieve with the switch ON is still 12 → 38 ms (doc 56 G6).**
+      R4 fixed the G4 turnstile (was 259 ms); Phase 6 took 43 → 38. What
+      is left (doc 56 §4.8.3 "What nsieve still pays"): full 32-row
+      ledgers ending at t3 exit 23 now become silent candidates but
+      almost never promote (see "candidates that never promote"), and
+      t6 — a pc 18 trace that unrolled the inner `for k` — whose
+      per-trip-count exits fill the pc 18 anchor with children, so exits
+      71 and 107 are refused ("anchor full"), give up, and end 13.5k
+      ledgers.
 - [ ] **Doc 56 G5: a `while` root's loop-done exit never links
       natively.** Numeric `for` has `loop_done_linked`; `while` has only
-      the runtime `.while_done` chain (bit-reverse inner `while`, 122k
-      runtime round-trips). General, affects every `while` loop that
-      exits into traced code. Bart's P6-Q4.
+      the runtime `.while_done` chain (bit-reverse inner `while`: ~20k of
+      22k ledgers end at its `.deopt`, so the armable exit-side cycle
+      never reaches a full ledger and never promotes). General, affects
+      every `while` loop that exits into traced code. Bart ruled P6-Q4
+      (a): its own doc. When it lands, add promotion checks to the test
+      "doc 56 Phase 6: fft bit-reverse's exit-side cycle mints armable".
 - [ ] **A branch that flips for good strands the loop on tier-0 (switch
       off).** `for i = 1, N do local lt = i < 500; if lt then … end end`:
       after i = 500 the root trace fails its first guard every entry,
-      legacy strikes gate it, 99.5% runs on tier-0. With the switch on it
-      runs 94% as a trace but the seam is 63% of the run — a Phase 6
-      test case. (2026-09-27: 70% seam, `no-silent-site` rejects on
-      every full ledger — confirmed the one layer-2 case.)
+      legacy strikes gate it, 99.5% runs on tier-0. Switch on, since
+      Phase 6: silent, 1 ms (switch off 2 ms). So this is fixed by
+      Phase 8 (turning the switch on); nothing to do until then.
 - [ ] **sieve_int / nsieve-bit are still slower with the switch on**
-      (21 → 58 ms, 14 → 33 ms after R1–R4). The stub now yields to a
-      live region bridge (R1), so the remaining cause is something else;
-      diagnose with the Z-8 ladder after Phase 6.
+      (after Phase 6, best of 5: 6 → 22 ms, 14 → 35 ms). sieve_int: 203
+      ledger walks off → 30k on, with ZERO silent candidates (so its
+      ledgers never fill to the forced yield — find the terminal rows
+      with the jit-debug build). nsieve-bit: 1.7k candidates, 1
+      promotion. Diagnose with the Z-8 ladder. Doc 56 §4.8.3 "Phase 6
+      landed" has the table.
+- [ ] **Silent candidates that never promote (switch on).** nsieve 4.2k
+      candidates / 3 promotions, nsieve-bit 1.7k / 1, nsieve-bit-fp
+      9.6k / 164. Z-8 layer 2: read the `silent rejects:` line and the
+      candidate streak (`promote_after`) — does the detected set change
+      between consecutive full ledgers?
+- [ ] **Bart to decide: widen `exit_side_ok` to bursts (P6-Q3 (b))?**
+      Phase 6's counter (`burst skips=` on the `exit-side arms:` stats
+      line) counts burst ledgers that ended in the ordinary deopt where
+      the adapter would have hopped: nsieve 4.2k, nsieve-bit 1.7k,
+      nsieve-bit-fp 9.5k, fft 2.6k, bit-reverse 2.4k, sieve_int 4.
 - [ ] **Measure R3 on the two-level branch probe** (Phase 5 finding: 65%
       traced with the switch off, 13% on). R3 now lets a child's exits
       become wanted; the probe program is not in the tree yet.
