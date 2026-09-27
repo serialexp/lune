@@ -523,6 +523,22 @@ the ones that bite):
     of exit-side edges) → Antigravity review → build; (c) Phase 7, then
     flip the doc 56 switch. Candidate side arc: the constant-step
     `find_kinit` gap (general; see TODO.md).
+  - **Doc 56 Phase 6 PLAN DONE (2026-09-27), reviewed, waiting on Bart.**
+    Doc 56 §4.8.2. Measured first (Z-8 ladder), switch off → on:
+    boolC 3 → 10 ms (70% seam, full ledgers, `no-silent-site` rejects: the
+    one real silence case); bit-reverse alone (`/tmp/bitrev.lua`, n=1024
+    ×2000) 0.23 → 0.50 s (LuaJIT 0.01 s, tier-0 0.21 s); fft 210 → 357;
+    nsieve 12 → 259; nsieve-bit 14 → 38; sieve_int 6 → 25. Every board
+    regression is layer 1 (cycles break every 2–4 rows on unarmed or
+    pre-empted exits), so Phase 6 alone moves only boolC. Found:
+    G1 typed pick at `P` (bit-reverse exit 60 never arms: the pick takes
+    the float twin at pc 68), G2 child exits never wanted, G3 stub
+    precedence, G4 a child failing its first guard every hop (nsieve pc 7
+    `guard_append`), G5 `while` loop-done never links natively. All in
+    TODO.md. Review: Antigravity CHANGES REQUESTED, 9 findings all
+    verified and folded in (`docs/reviews/doc56/antigravity-phase6-plan.md`).
+    **Blocked on Bart: P6-Q1 order (6 first / G1–G4 first / combined),
+    P6-Q2 keying, P6-Q3 bursts, P6-Q4 `while` loop-done.**
   - Background (LuaJIT)
     reference read: `lj_opt_loop.c` ~l.340 raises `TYPEINS` when a
     loop-carried ref's type differs from its SLOAD's; `lj_opt_loop()`

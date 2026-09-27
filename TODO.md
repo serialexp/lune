@@ -1802,12 +1802,32 @@ nothing at all.
       `driveChain` 6% → 10% — not to native code. This is the per-hop
       seam of the "Per-hop cache scan" item above and doc 56 Phase 6
       (silent promotion of exit-side edges); re-measure there.
+      **Re-diagnosed 2026-09-27 (doc 56 §4.8.2): not a silence case.**
+      The init loop's `guard_append` exit takes its adapter although a
+      sibling handoff is armed on the ordinary cell (G3), and the child
+      at pc 7 fails its own `guard_append` at its first instruction on
+      every hop after the array stopped growing (G4, 960k hops,
+      `completed=0`). Now 12 → 259 ms.
+- [ ] **Doc 56 G1: the child pick at `P` ignores entry types.**
+      Bit-reverse exit 60 (`k` still an int) chains and arms through
+      `resolveLoopDoneCont(proto, P, null)`, which picks the float
+      variant at pc 68; its entry guard fails, so exit 60 never arms
+      (226k runtime round-trips). Its own int child was recorded and
+      bound. See doc 56 §4.8.2.
+- [ ] **Doc 56 G4: no rule gives up on a child that fails its first
+      guard every hop.** Only a prologue failure disarms (Phase 5).
+- [ ] **Doc 56 G5: a `while` root's loop-done exit never links
+      natively.** Numeric `for` has `loop_done_linked`; `while` has only
+      the runtime `.while_done` chain (bit-reverse inner `while`, 122k
+      runtime round-trips). General, affects every `while` loop that
+      exits into traced code. Bart's P6-Q4.
 - [ ] **A branch that flips for good strands the loop on tier-0 (switch
       off).** `for i = 1, N do local lt = i < 500; if lt then … end end`:
       after i = 500 the root trace fails its first guard every entry,
       legacy strikes gate it, 99.5% runs on tier-0. With the switch on it
       runs 94% as a trace but the seam is 63% of the run — a Phase 6
-      test case.
+      test case. (2026-09-27: 70% seam, `no-silent-site` rejects on
+      every full ledger — confirmed the one layer-2 case.)
 - [ ] **Exit stub precedence (doc 56 Phase 7).** An exit with a
       published adapter takes it even when its ordinary slot holds a
       live, silent region bridge (sieve_int, nsieve-bit: 232 → 39,732

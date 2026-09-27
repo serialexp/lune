@@ -398,9 +398,14 @@ consumes yet, so every program's output and trace set stays identical.
     - Widening `exit_side_ok` to bursts: not measured (no counter for
       exits a burst takes the old way). Deferred until the three causes
       above are fixed; it goes in the Phase 6 measurement.
-- [ ] **Phase 6 — regions and silent promotion.**
+- [ ] **Phase 6 — regions and silent promotion.** Plan in §4.8.2
+  (reviewed: Antigravity CHANGES REQUESTED, all 9 findings folded in).
+  Waiting on Bart's P6-Q1..Q4. The measurement before the plan found
+  that only a boolC-shaped cycle needs silence; the board's switch-on
+  regressions are unarmed or pre-empted exits (G1–G5).
   - `exit_side` edges and the side trace's `.link` back are
-    intra-iteration edges of the parent's loop region.
+    intra-iteration edges of the parent's loop region (already true
+    since Phase 5 bug 2).
   - A new `SilentSiteKind.exit_side`, so the steady cycle promotes and
     stops writing rows (doc 55 §2d machinery).
 - [ ] **Phase 7 — tiering policy.**
@@ -1442,6 +1447,212 @@ the `via_exit_side` payload, `ChainResult.exit_side`), two minors (hop
 counters, the M1 assert) and a nit (per-slot array sizes). All
 verified in source and folded in above
 (`docs/reviews/doc56/antigravity-phase5-plan.md`).
+
+#### 4.8.2 Phase 6 plan (2026-09-27)
+
+Phase 6 lets a steady exit-side cycle (parent → adapter → child →
+`.link` → parent) run silent: no ledger rows, no replay walk, bounded by
+`silent_budget`, exactly like the other promoted kinds (doc 55 §2d).
+
+**Measured first (Rule Z-8 ladder).** Switch on vs off, ReleaseFast,
+after doc 57 (best of 5):
+
+| program | off | on | what cuts the cycle short |
+|---|---|---|---|
+| boolC (a branch that flips for good, TODO) | 3 ms | 10 ms | nothing: full 32-row ledgers, 70% seam, `silent rejects: no-silent-site=5852` |
+| bit-reverse alone (`fft_bitreverse`, n=1024 ×2000) | 0.23 s | 0.50 s | ledgers of 3–5 rows ending in an unarmed exit (below) |
+| scimark-fft 500 | 210 ms | 357 ms | same as bit-reverse; seam 53%, 330k walks |
+| nsieve 7 | 12 ms | 259 ms | the adapter pre-empts a live sibling handoff (below) |
+| nsieve-bit 6, sieve_int | 14, 6 ms | 38, 25 ms | the adapter pre-empts a live silent region bridge (Phase 5 finding) |
+
+Only boolC is a layer-2 problem (armed, needs silence). Every
+regression on the board is layer 1: the cycle breaks every 2–4 rows on
+an exit that is not armed, so there is nothing long enough to silence.
+Phase 6 alone moves boolC and none of the board rows. The layer-1
+causes, with the terminal row that ends each native call:
+
+- **G1 — the pick at `P` ignores entry types.** Bit-reverse, parent
+  exit 60 (zero trips of the inner `while`, `k` still an int): 226k
+  ledgers end in its unarmed `.exit_side` row. Its own child (t4 at
+  pc 68, `guard_int r7`) was recorded and bound by commit, but
+  `routeExitSide` chains and `armExitSide` arms through
+  `resolveLoopDoneCont(proto, P, null)`, which picks t3 (the float
+  variant at pc 68). t3's entry guard fails, the chain never links,
+  so exit 60 never arms. Sharing by resume pc (§4.5) needs the
+  child whose entry types match the exit, not the canonical one.
+- **G2 — exits of exit-side children are never wanted** (Phase 7,
+  known). Bit-reverse child t5 (pc 54) exit 6, the inner `while`
+  taking at least one trip: 270k ledgers end in its `.deopt`.
+- **G3 — stub precedence** (Phase 7, known). nsieve: the init loop's
+  `guard_append` exit has a published adapter, so it takes the
+  adapter even though a sibling handoff (the doc 47 fill-then-reuse
+  path) is armed on the ordinary cell. sieve_int/nsieve-bit: same
+  with a live region bridge.
+- **G4 — a child that cannot make progress.** nsieve's child at pc 7
+  was recorded when the array grew; on the next calls the exit fires
+  for an in-bounds store and the child's own `guard_append` fails at
+  its first instruction, every time (960k hops, `completed=0`). No
+  rule gives up on that pairing: it is not a prologue failure, so the
+  Phase 5 disarm does not fire.
+- **G5 — a `while` root's loop-done exit never links natively.**
+  Bit-reverse, the inner `while` root t2 exit 5: 122k ledgers end in
+  its `.deopt`. Numeric `for` loops have `loop_done_linked`; `while`
+  loops have only the runtime `.while_done` chain (doc 38). This is
+  general (every `while` loop that exits into traced code pays a
+  runtime round-trip per exit) and is outside doc 56 today: Bart ruled
+  "refuse while-done" for exit attachment.
+
+The order question this raises is Bart's (below, P6-Q1).
+
+**The design.**
+
+1. **`SilentSiteKind.exit_side`** (appended). `silentKindForArm(.exit_side)`
+   and `rowSilentKind(.exit_side)` both return it.
+2. **The site lives in the adapter.** Adapters are separate pages
+   built after the parent, so the site is recorded on the
+   `ExitAdapter` (`check_off`, `resume_off`, `epilogue_off`, relative
+   to the adapter page), and its data cell is a new per-page array
+   `exit_side_metadata_cells` (length `n`, allocated with
+   `exit_side_cells`, stable address, zero = not promoted). The
+   ordinary deopt site of the same exit keeps `metadata_cells[ei]`: the
+   two sites are different code with different states (§4.8.1's
+   "two cells" argument again).
+3. **Adapter order.** Steps 1–3 (materialize) unchanged, then
+   `completed = rbx`, then `emitSilentCheck(&exit_side_metadata_cells[ei])`,
+   then today's reporting tail (`exit_reason = .exit_side`, the
+   `.exit_side` append, the forced-yield check, the jump). The silent
+   path never writes `exit_reason`, so the child runs under the
+   wrapper's `.normal` with no reset.
+4. **The epilogue's `.exit_side` arm** (`emitSilentEpilogue`), matching
+   the replay row byte for byte (§4.8 table): `region_work += local + 1`,
+   `selection_work += local + 1`, a qualifying row when
+   `local + 1 >= min_useful`, always productive (the hop commits guest
+   work, like every kind but `.deopt`), and it resets the barren run.
+   The shared tail (budget, barren, `jmp [slot]`) is unchanged; `slot`
+   is the exit-side cell `&slots[exitSideSlot(ei)]`. The exhausted path
+   returns rowless through `shared_exit`; the slab is coherent at `P`,
+   which is the edge's `resume_pc`.
+   Register note (review 9): r8 holds `local`; the `.exit_side` arm
+   builds `local + 1` in r8 after `last_local` is stored (as the
+   `.loop_done_linked` arm already rewrites r8 to `max(local, 1)`), and
+   the shared tail reloads r8 before it reads it.
+5. **Keying (P6-Q2).** Promotion is keyed by `(trace id, exit)` today
+   ("one exit, one cell, one owner"), and a sibling handoff and an
+   exit-side arm can both be live on one exit. Proposed: `PromotedEdge`
+   gains `cell` (the physical slot: `ei` for the ordinary kinds,
+   `exitSideSlot(ei)` for `.exit_side`). Every `(trace, exit)` key
+   becomes `(trace, cell)` (review 4–8):
+   - `promoted_exit_owners`, `exitIsPromoted`, `checkPromotable`'s
+     duplicate test;
+   - `promoteSet`'s metadata: `slot = &slots[edge.cell]`, and
+     `reporting_target` from the page that holds the site (the
+     adapter's page for `.exit_side`, not the parent's);
+   - `demoteSet` zeroes the edge's own data cell
+     (`exit_side_metadata_cells[ei]` for `.exit_side`);
+   - `dropParkedProofsTouchingExit` compares `edge.cell` with the
+     physical slot `prepareSlotMutation` passes;
+   - `detectPromotableSetMembers` sorts and deduplicates on
+     `(parent, cell)`, and matches a row to an edge by
+     `(parent, exit, rowSilentKind)`;
+   - `noteMembershipGrowth` asks `exitIsPromoted` with the arm's cell;
+   - `silentSiteFor`/`silentSiteAt` resolve an `.exit_side` edge to
+     the adapter's site and its `exit_side_metadata_cells` cell.
+
+   `exit` stays the logical exit every ledger row carries. Unaffected
+   (checked): `silentCellOwner` (by metadata address), summary
+   indexing (by phase), sibling provenance (sibling edges only).
+6. **`promotedEdgeFromLink` `.exit_side` case.** Site = the adapter's,
+   its cell zero; child enterable `.ordinary`; target = the child's
+   `ordinary_entry`, and `slots[exitSideSlot(ei)]` holds it; the child
+   is `.link`-tailed and anchored at `(proto, P)`; `resume_pc = P`.
+   The adapter must still be published (`exit_side_cells[ei] != 0`).
+7. **The stub drops `silent_active == 0`.** Under silence, an unpromoted
+   adapter takes its reporting path, so silence ends in a reporting
+   suffix whose first row is `.exit_side`. `replayLedgerSuffix` walks
+   it with the Phase 5 grammar (the dispatcher drains a silent result
+   before its scalar `.exit_side` arm, `interp.zig` ~3896 vs ~4224).
+   A suffix that ends in an unarmed `.exit_side` row sets
+   `ChainResult.exit_side`; the dispatcher's silent branch asserts it
+   null today (~3903, review 2) and must route it through
+   `consumeExitSideTerminal` as the ledger branch does (~4380). The
+   wrapper assert `term == .exit_side ⇒ silent_active == 0` goes; the
+   rest of it stays.
+8. **`driveSilentBurst` `.exit_side` arm.** `exit_side_hops`,
+   `exit_side_native_hops` and `exit_side_fused` gain `followed`; the
+   generic `accountLedgerRowsBulk(parent, selection_work, …)` applies.
+   **Iteration credit:** the replay credits `+1` for every `.link` row
+   whose owner `linkClosesIteration()`; the silent drain credits none
+   today. It gains the twin of `loop_done_count`: every fired
+   `.link_terminal` edge whose parent `linkClosesIteration()` adds its
+   `fires` to `linked_completed` (fires, not `followed`: the replay
+   credits a yielded last `.link` row too). This also fixes the same
+   asymmetry for doc 38 continuations promoted today. **The rowless
+   return** (review 1) reports `silent_cum` only and drops
+   `linked_completed` (~1271, passed through by
+   `finishDispatcherDirective`). In an exit-side cycle the parent never
+   reaches its `.loop` and `.link` does not bump rbx, so the whole
+   cycle's count would be lost. It returns `silent_cum +
+   linked_completed` instead; the rowed-vs-silent test decides it.
+   (The dispatcher origin does not read `ChainResult.completed`; burst
+   origins do.)
+9. **Regions: nothing new.** Phase 5 bug 2 already made an attachable
+   exit a structural edge to its resume pc. Bit-reverse mints
+   `cross_trace_cycle` regions with `armable=true`; a test pins it
+   (Rule Z-8 layer 2).
+10. **Bursts keep `exit_side_ok = 0` (P6-Q3).** A promoted exit-side
+    edge reached in a burst-origin run takes the ordinary deopt, which
+    ends silence into a suffix. Widening is one flag; it is measured
+    with the counter "adapter exits skipped for `exit_side_ok = 0`"
+    added here.
+
+**Tests.**
+
+- Adapter harness: a published metadata cell jumps through the slot
+  with no row; the exhausted path returns rowless at `P`; an
+  unpromoted adapter under silence writes the `.exit_side` suffix row.
+- Rowed vs silent on the boolC cycle (promotion on/off): identical
+  `region_work` totals, `linked_completed` and coverage iterations;
+  output identical on every leg.
+- One exit with a sibling handoff and an exit-side arm, both promoted
+  (keying).
+- A suffix that starts with `.exit_side` after silence; one that ends in
+  an unarmed `.exit_side` row (routed after the drain).
+- Demotion: retiring the child demotes the set (existing
+  `resetLinksTouching` funnel).
+- The bit-reverse cycle mints `armable=true`.
+- Gates: `just test`, the jit-debug gate, the board with the switch
+  off (no change expected: nothing promotes an exit-side edge while the
+  switch is off).
+
+**Measure.** boolC with the switch on: seam 70% → near zero, and wall
+at or below the switch-off 3 ms. The board rows above are not expected
+to move until G1–G4 are fixed; that is recorded, not hidden.
+
+**Review.** Antigravity, CHANGES REQUESTED: three blockers (the rowless
+return drops `linked_completed`, taken as major since the dispatcher
+does not read it; the dispatcher's silent-branch assert on
+`ChainResult.exit_side`; `promoteSet`'s slot and `reporting_target`
+from the parent page), four majors (`demoteSet`'s cell, parked-proof
+drop, detection sort/dedup, `silentSiteFor`), a minor
+(`noteMembershipGrowth`) and a nit (epilogue registers). It confirmed
+the accounting match, the drain order, the suffix grammar, the
+register discipline and G1–G4 in source. All verified and folded in
+above (`docs/reviews/doc56/antigravity-phase6-plan.md`).
+
+**Decisions for Bart.**
+
+- **P6-Q1 — order.** (a) Phase 6 as designed now, then Phase 7 grows
+  to cover G1–G4; (b) G1–G4 (with Phase 7) first, then Phase 6;
+  (c) one combined phase.
+- **P6-Q2 — keying.** (a) physical-cell keying (item 5); (b) refuse to
+  promote an exit-side edge whose exit also has a live ordinary arm
+  (one owner per logical exit stays true).
+- **P6-Q3 — bursts.** (a) keep `exit_side_ok = 0` and measure (item
+  10); (b) widen now.
+- **P6-Q4 — G5 (`while` loop-done).** (a) a native `while_done_linked`
+  transition in its own doc; (b) make a `while` root's done exit
+  attachable (reverses the "refuse while-done" ruling) so doc 56's
+  adapter serves it; (c) later.
 
 ### 4.9 Tiering policy (Phase 7)
 
