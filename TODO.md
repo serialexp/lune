@@ -1804,8 +1804,10 @@ nothing at all.
       22k ledgers end at its `.deopt`, so the armable exit-side cycle
       never reaches a full ledger and never promotes). General, affects
       every `while` loop that exits into traced code. Bart ruled P6-Q4
-      (a): its own doc. When it lands, add promotion checks to the test
-      "doc 56 Phase 6: fft bit-reverse's exit-side cycle mints armable".
+      (a): its own doc — **doc 58, rev 2, reviewed (Antigravity APPROVE
+      WITH CHANGES); BART: G5-Q1..Q4 in doc 58 §7.** When it lands, add
+      promotion checks to the test "doc 56 Phase 6: fft bit-reverse's
+      exit-side cycle mints armable".
 - [ ] **A branch that flips for good strands the loop on tier-0 (switch
       off).** `for i = 1, N do local lt = i < 500; if lt then … end end`:
       after i = 500 the root trace fails its first guard every entry,

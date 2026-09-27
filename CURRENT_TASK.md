@@ -589,12 +589,22 @@ the ones that bite):
     (`docs/reviews/doc56/antigravity-g6.md`): recommends G5 first + a
     `loopunroll` = 15 bound. **Waiting on Bart: G6-Q1 (a/b/c/d),
     G6-Q2.**
-    **NEXT:** (1) G5 design doc (`while` loop-done native link; Bart
-    ruled P6-Q4 (a) "own doc"; it is the switch-off blocker for G6 and
-    the remaining switch-on fft seam); (2) sieve_int with the switch on
-    (re-check after G6: the experiment took it 23 → 11); (3) Phase 8.
-    Open for Bart: G6-Q1/Q2; widen `exit_side_ok` to bursts (P6-Q3
-    (b)), with burst-skip numbers.
+  - **DOC 58 (G5) DRAFTED + REVIEWED (2026-09-27)**:
+    `docs/design/58-while-done-native-link.md` rev 2. Option A: a
+    `while_done_linked` arm with its own exit label (the ordinary
+    carried-home flush is already the right state: the condition guard
+    is at the trace top); accounting region 1 / selection `local` / no
+    iteration credit; peeled roots never link; one post-loop-pc helper
+    (`guardExitPc` is the loop BODY for `while`, used wrongly in 4
+    places); region edge + `whileLoopEndFor`. Antigravity APPROVE WITH
+    CHANGES (`docs/reviews/doc58/antigravity-r1.md`); its S2 slot
+    recommendation isn't buildable on one cell (one silent site per
+    exit) → offered S3 (second cell).
+    **WAITING ON BART:** doc 58 §7 G5-Q1..Q4; doc 56 §4.8.4 G6-Q1/Q2;
+    P6-Q3 (b) (widen `exit_side_ok` to bursts, burst-skip numbers in
+    doc 56). Nothing else in this campaign's queue is independent of
+    those answers except: sieve_int with the switch on (re-check after
+    G6: the experiment took it 23 → 11) and Phase 8.
     Gotcha: an Antigravity review that "runs the tests" leaves
     `zig-out/bin/mahina` as Debug — rebuild ReleaseFast before timing.
   - Background (LuaJIT)
