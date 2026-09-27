@@ -76,3 +76,38 @@ read by its internal φ so it is never `pin_only`, gets a home and a TAG_BOOL
 check, and the φ's body pin catches a wrong entry value on iteration 1; a
 store-ref copy of a pinned load makes it non-`pin_only`; an adapter restoring
 another slot from a `pin_only` row fails closed (`not_held`).
+
+## r4 — P3 design review (§4.7, 2026-09-27)
+
+Scope: the §4.7 instability-unroll design, checked against source. Verdict:
+**APPROVE WITH CHANGES.**
+
+Confirmed: coarse exits stay correct over a multi-iteration trip (stores
+sunk or idempotent pure writes; recorder caches key on refs; φs take the
+final `reg_map`; doc 56 ordinals stay monotonic; `rec_path` is deduped); the
+same-arrival rule is right for `for` and `while` (nothing is recorded between
+`onBackEdge` and `maybeCloseAtAnchor`; the other `closeTrace` caller only
+fires for `.link`/`.terminal` closes, which are excluded).
+
+Findings (all checked in source and accepted):
+
+1. **MAJOR — branch-shape consumers ignore the role on loop anchors.**
+   `isSourceBranchGuardExit` (`trace_link.zig` ~693) only excludes
+   `for_loop`-sourced guards, and `noteTakenExit` (~418) and
+   `siblingHandoffEligible` (`trace.zig` ~1862) test the source opcode, not
+   the role, for loop anchors. A `while` copy (source `jmp_if_false`) would
+   be taken for a source-branch exit (prime-side want, sibling handoff).
+   Fix: `isSourceBranchGuardExit` rejects a loop-test copy (the funnel for
+   both).
+2. **MAJOR — `driveChain` hand-rolls the numeric loop-done test**
+   (`trace_chain.zig` ~2880: source op `== .for_loop`). A `for` copy would be
+   flushed as a loop-done. Fix: consult the copy check.
+3. **MINOR — `maybeArmContinuation` hand-rolls it too** (`trace_link.zig`
+   ~160). Same fix. (Found while checking: `computeNativeLoopDoneLink`,
+   `trace_link.zig` ~105, is a third hand-rolled scan; same fix.)
+4. **MINOR — refresh `unroll_mark_len` on every unroll decision**, not only
+   the first.
+5. **MINOR — tests**: an unrolled `while` (role of each condition copy), a
+   budget-exhaustion cycle, a mixed pin + int/float defeat, source-branch
+   exclusion of a `while` copy, cross-iteration store forwarding, an inlined
+   loop never unrolling.

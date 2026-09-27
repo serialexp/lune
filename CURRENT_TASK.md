@@ -498,7 +498,18 @@ the ones that bite):
     runtime seam (`accountRegionProfit`, `driveChain`). Switch OFF:
     unchanged. Recorded in TODO.md (doc 56 Phase 5 findings) for the
     Phase 6 arc.
-  - NEXT: P3 (instunroll) investigation. LuaJIT
+  - **P4 DONE** (commit 0837d12): interp tests assert the bool shapes
+    compile native; Antigravity review r3 of the P2 commit found no
+    soundness bugs.
+  - **P3 design DONE** (doc 57 §4.7, reviewed: Antigravity r4 APPROVE
+    WITH CHANGES, all folded in). Bart: new `GuardRole.loop_test_copy`,
+    unroll on pin defeats only, `Config.instunroll = 4` (no CLI flag).
+    NEXT: implement per §4.7.3 + tests §4.7.5. Background (LuaJIT)
+    reference read: `lj_opt_loop.c` ~l.340 raises `TYPEINS` when a
+    loop-carried ref's type differs from its SLOAD's; `lj_opt_loop()`
+    catches TYPEINS/GFAIL, `loop_undo`s and CONTINUES RECORDING (≤
+    `instunroll`=4 times), so a flipped bool closes with a 2-iteration
+    body. (Old note follows.) LuaJIT
     reference read: `lj_opt_loop.c` ~l.340 raises `TYPEINS` when a
     loop-carried ref's type differs from its SLOAD's; `lj_opt_loop()`
     catches TYPEINS/GFAIL, `loop_undo`s and CONTINUES RECORDING (≤

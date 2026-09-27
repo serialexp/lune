@@ -316,24 +316,191 @@ would commit a trace that fails on every second iteration.)
 - Determinism: no clock, address or RNG enters any decision. The fingerprint
   grows a value check that is a pure function of the register window.
 
-### 4.7 P3: instability unroll (sketch, needs its own investigation)
+### 4.7 P3: instability unroll (design, 2026-09-27 — decided; review r4 APPROVE WITH CHANGES, folded in)
 
-LuaJIT keeps recording past the back-edge until the carried types match the
-entry (`instunroll` ≤ 4). Our nearest machinery is doc 39's peel
-(`maybeEnterPeel`), which also keeps recording past the back-edge, but it is
-narrow (plain `while`, pure ops) and makes iteration 1 a run-once prefix — it
-does not converge for a period-2 flip. P3 needs:
+Until P3, shape B aborts `type_instability` and runs on tier-0.
 
-- a recorder mode that re-records the next iteration as more straight-line body
-  (no prefix), bounded by an `instunroll`-style budget, and closes when every
-  pinned slot's carry equals its pin;
-- the mid-body `for_loop` guard of the unrolled iteration classified correctly
-  (it is a loop-done exit that is not the trace's terminal guard: region
-  topology, doc 56 attachability, `loop_done` roles);
-- measurement on shape B and on the board.
+#### 4.7.1 What LuaJIT does (read, not remembered)
 
-Until P3, shape B aborts `type_instability` and runs on tier-0 (today it runs a
-tier-1a trace that is not faster than tier-0 on that body).
+- `lj_trace.c` `LJ_TRACE_END`: a trace that links to itself runs
+  `lj_opt_loop`. If that fails, the link is cleared and the state goes back to
+  `LJ_TRACE_RECORD` ("Try to continue recording").
+- `lj_opt_loop.c` `lj_opt_loop`: only `LJ_TRERR_TYPEINS` (a carried ref's type
+  differs from its `SLOAD`) and `LJ_TRERR_GFAIL` (a guard would always fail)
+  are caught. `loop_undo` rolls back the half-built loop copy, and recording
+  goes on while `--J->instunroll >= 0` (default 4, `lj_jit.h`). Any other
+  error propagates.
+- `J->instunroll` is set per recording (`lj_record_setup`) and zeroed when the
+  recording crosses a compiled loop (`rec_loop_jit`), an `ITERN` or a compiled
+  function.
+- So the flipped bool becomes one trace whose loop body is two source
+  iterations. Iteration 1's `FORL` test stays as an ordinary mid-body guard;
+  its snapshot restores iteration 1's state and resumes after the loop.
+
+#### 4.7.2 Where our shape differs
+
+- We close with φs, not by copying the body. So "the loop copy failed" is
+  our close-time check `loopCloseSelfDefeating` (§4.3), and "undo" is
+  nothing: we have not built anything yet when it fires.
+- Our ordinary exits are **coarse**: a failing guard resumes tier-0 at the
+  anchor with the trip-start registers (stores are sunk below every guard), and
+  tier-0 re-runs the trip. That stays correct for a two-iteration trip: tier-0
+  re-runs iteration 1 (and the part of iteration 2 before the exit).
+- Only **loop-done exits** are not coarse. They are classified by *shape*, not
+  by position:
+  - numeric `for` (`isNumericForLoopDoneGuard` / `isLoopDoneGuardIndex` /
+    `flushNumericForLoopDone`): any `guard_true` sourced at the anchor's
+    `for_loop`. Its exit commits the final iteration (the linked flush) and
+    resumes after the loop.
+  - `while` (`whileLoopDonePostPc`, doc 38): any `guard_true` at the anchor's
+    own `jmp_if_false`. Its exit resumes after the loop with the registers
+    untouched, because it sits at the trip TOP.
+
+  In an unrolled trace, iteration 1's `for_loop` test and iteration 2's
+  `while` test both match those shapes, but neither is at the right place:
+  - iteration 1's `for` test sits mid-trip. Today's flush would decline (the
+    whitelist in `loopDoneSnapshotSupported` sees iteration 2's ops after it),
+    but the arming side (`loop_done_linked`, `trace_link.zig`), native's
+    loop-done slot handling (`nativegen.zig` ~2571/2639) and
+    `linked_one_trip` in `interp.zig` would still treat it as a loop-done.
+  - iteration 2's `while` test sits mid-trip. A while-done exit there would
+    resume after the loop with the trip-start registers and **lose iteration
+    1** — a wrong answer.
+
+  So the one real soundness item: a copy of the loop's own test that is not in
+  its natural place must be an ordinary (coarse) exit everywhere.
+
+#### 4.7.3 Proposed shape
+
+1. **Trigger.** In `close()`, after the peel check: if `loopCloseSelfDefeating`
+   fires, count the defeats by kind. When every defeat is a doc 57 pin
+   (`guard_is_nil/false/true`) and the budget allows, enter unroll mode instead
+   of aborting. An int/float defeat still aborts: another iteration cannot fix
+   it (a float stays a float; that is doc 39's peel, and LuaJIT fixes it with
+   `CONV`, not by unrolling).
+2. **Unroll mode.** `RecordingSession.unroll_left` (from a new
+   `Config.instunroll`, default 4 like LuaJIT) and `unroll_mark_len` (the
+   `instrs.len` at the decision). `close()` returns false and the recording
+   keeps going; tier-0 runs the back-edge and the next iteration is recorded as
+   more body. A second `close()` call at the SAME arrival (`onBackEdge` then
+   `maybeCloseAtAnchor`, the doc 39 shared-arrival rule) is seen by
+   `instrs.len == unroll_mark_len` and ignored. The next real arrival re-runs
+   the whole check: stable → commit; still pin-defeated → unroll again while
+   the budget lasts; else abort `type_instability` as today.
+3. **Not eligible** (fall back to today's abort): a precise recording (doc 45
+   D3 refuses the peel for the same reason), a `.link` close, a pending doc 47
+   link peel, a doc 39 peel already in flight, a doc 44 terminal close, or
+   `inline_depth != 0`. A peel is never entered once unroll mode started (the
+   two would each own the back-edge).
+4. **Loop-test copies.** Mark the misplaced copies at record time and teach the
+   shape classifiers to skip them:
+   - numeric `for`: at the unroll decision, the loop-done guard just emitted by
+     `recForLoop` for the anchor's `for_loop` (the last `.loop_done`
+     provenance entry at depth 0 with that source pc) is re-marked;
+   - `while`: in unroll mode, `recBranch` marks the guard it emits for the
+     anchor's own condition (the same structural test `recBranch` already
+     does for LLEAVE);
+   - `repeat … until`: nothing to do (its test is already an ordinary
+     `branch_cond` guard).
+
+   Then `isNumericForLoopDoneGuard`, `isLoopDoneGuardIndex`,
+   `flushNumericForLoopDone` and `whileLoopDonePostPc` return "not a loop-done"
+   for a marked guard, and the doc 56 attach classifier refuses it (new
+   `Verdict`). How to mark it is **decision P3-D1** below (decided: a new
+   `GuardRole.loop_test_copy`, read through one `TraceCode.isLoopTestCopy`).
+
+   Review r4 found more places that decide "loop test" by source opcode
+   alone; each consults `isLoopTestCopy` too:
+   - `isSourceBranchGuardExit` (`trace_link.zig`) — the funnel for
+     `noteTakenExit` and `siblingHandoffEligible`, so a `while` copy never
+     becomes a prime-side want or a sibling handoff;
+   - `driveChain`'s `numeric_done` (`trace_chain.zig`);
+   - `maybeArmContinuation` and `computeNativeLoopDoneLink`
+     (`trace_link.zig`).
+
+   `unroll_mark_len` is refreshed at every unroll decision (a period-3 cycle
+   decides twice).
+5. **Accounting.** One trip is now k source iterations. `completed` and the
+   ledger count trips, as they do for any trace; only heuristics read them.
+   The per-anchor trip statistics that gate low-trip loops
+   (`low_trip_while`, `whileDoneHotnessEligible`) will see half the trips;
+   noted, not changed.
+6. **Probe + stats.** `unroll:` jit-debug line at each decision
+   (`anchor pc, iteration k, defeated slots`); `--jit-stats` gets a count of
+   committed unrolled traces.
+
+What stays as is, and why:
+
+- tier-1a and native just see a longer body: φs carry the end-of-trip values
+  (for shape B the φ carries konst `true`, equal to the pin).
+- Store sinking, store forwarding and alias guards (doc 51) already handle a
+  read after an earlier store in the same trip; iteration 2 reading what
+  iteration 1 stored is the same case.
+- Doc 56 ordinals keep counting up through iteration 2, so every exit keeps
+  its own resume-coherent snapshot.
+- Region membership (`rec_path`) is a set of program points; visiting each
+  twice changes nothing.
+
+#### 4.7.4 Decisions for Bart
+
+**Decided 2026-09-27:** P3-D1 **(a) new `GuardRole`**; P3-D2 **(a) pin
+defeats only**; P3-D3 **`Config.instunroll = 4`, no CLI flag**. P3-D4 stays a
+measured follow-up.
+
+- **P3-D1: how to mark a misplaced loop-test copy.**
+  - (a) A new `GuardRole` (e.g. `loop_test_copy`) replacing `loop_done` /
+    `branch_cond` on that guard. The classifiers compare roles; every
+    role-keyed consumer then sees a plain non-branch guard (no composite
+    bridge, no sibling handoff at that exit).
+  - (b) A `copy: bool` flag on `GuardProvenance`, role unchanged. The loop-done
+    classifiers check the flag; other role consumers keep treating a `while`
+    copy as a `branch_cond` (so a composite bridge or sibling handoff could
+    still form there).
+  - (c) No mark; the classifiers use position ("the numeric loop-done is the
+    last guard sourced at that `for_loop`; the while-done is the first").
+    Needs a scan per query unless cached, and is only as good as
+    "nothing reorders guards" (tropt keeps order today).
+- **P3-D2: trigger scope.**
+  - (a) Pin defeats only (above). Converges for any period ≤ 5 value cycle of
+    nil/false/true.
+  - (b) LuaJIT-literal: any `loopCloseSelfDefeating` defeat. The int/float
+    cases never converge here, so they would spend up to 4 extra iterations of
+    recording and then abort anyway.
+- **P3-D3: budget.** `Config.instunroll` = 4 (LuaJIT's default), CLI flag or
+  not.
+- **P3-D4: optional follow-up.** When a pinned slot's φ always carries its pin
+  (shape B's `true`), the per-trip body pin can never fail after the prologue
+  checked it. A tropt fold could turn it into the invariant (`pin_only`)
+  class. Not needed for correctness; measure first.
+
+#### 4.7.5 Tests (P3)
+
+- Recorder: shape B commits one trace with two `for_loop` tests, exactly one of
+  them classified loop-done (the last); a period-3 cycle (`s` over
+  nil/false/true) commits with three iterations; a budget of 0 aborts as
+  today; an int/float defeat still aborts; a precise recording never unrolls.
+- The same-arrival rule: one arrival never unrolls twice (mutation: drop the
+  `unroll_mark_len` check).
+- Parity per tier: shape B with odd and even trip counts (the loop ends at
+  iteration 1's test, which must resume by re-running, not by the flush); a
+  `while` version whose iteration-2 test fails (the lose-iteration-1 bug:
+  mutation — drop the `while` mark, must fail); stores in both iterations; an
+  exit in iteration 2 after an iteration-1 store.
+- Native: shape B's trace compiles and holds (`expectNativeHolds`).
+- Replace the "refused at close (until P3)" test with the committed shape.
+- From review r4: an unrolled `while` (the first condition guard keeps
+  `branch_cond`, the later ones are copies); a cycle longer than the budget
+  aborts; a mixed pin + int/float defeat aborts without unrolling; a `while`
+  copy is not a source-branch exit; iteration 2 reads an array cell iteration
+  1 stored; a loop inside an inlined callee never unrolls.
+
+#### 4.7.6 Measurement
+
+- Shape B (`/tmp/boolshapes.lua` B alone): `--jit-stats` residency and time,
+  before/after.
+- Board before/after, ×3 interleaved A/B against a `just shadow` baseline on
+  any row that moves. No bench is expected to move (none has a flipped
+  carried value); this is coverage.
 
 ### 4.8 Costs
 
