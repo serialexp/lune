@@ -24,7 +24,7 @@ design and its review are kept as Appendix R2.
 
 - [x] Rev 3 design review: r2 CHANGES REQUESTED, r3 APPROVE WITH
   CHANGES, all folded in (§8).
-- [ ] B0: baseline (§5).
+- [x] B0: baseline (§5, "B0 done").
 - [ ] B1: the `loop` op is emitted and every walker knows it; inert
   (§5).
 - [ ] B2: `while`/`repeat` anchors move to after the `loop` op; the
@@ -554,6 +554,53 @@ increments are slices of the final shape, not scaffolding.
   `/tmp/bitrev.lua`, and the doc 38 `j = i % 64` nest (recreated and
   copied into this doc). `--jit-stats` for each. Shadow build at the
   B0 commit.
+  - **B0 done (2026-09-27, HEAD 062a9b0).**
+    - Board: `bench/results/20260927-132931-9c98fcd.tsv`. There are no
+      code changes since that board.
+    - Timings: best of 5 wall ms, `/tmp/b0.sh` (ReleaseFast). LuaJIT
+      is best of 5 (fft best of 3).
+
+      | program | tier-0 | native | native + switch | LuaJIT |
+      |---|---|---|---|---|
+      | lowtrip (below) | 331 | 201 | 197 | 34 |
+      | hightrip (below) | 727 | 72 | 81 | 156 |
+      | `/tmp/bitrev.lua` | 210 | 226 | 236 | 13 |
+      | pi_leibniz | 1784 | 364 | 363 | 46 |
+      | nsieve-bit-fp 6 | 282 | 309 | 306 | 19 |
+      | scimark-fft 500 | 680 | 211 | 220 | 22 |
+
+    - `--jit-stats` (native, switch off):
+      - lowtrip: 99% of iterations traced, but the seam is **74% of
+        the run** (123k `replayLedger` walks at about 9.3k cycles each).
+      - bitrev: 0.1% traced (the `.low_trip_while` gate); tier-0 with
+        a trace is 99%.
+      - nsieve-bit-fp: 31% traced; tier-0 with a trace is 49% of the
+        run.
+    - Probe sources:
+
+      ```lua
+      -- /tmp/lowtrip.lua: doc 38's bounded-variance nest, ~5 trips/entry
+      local floor = math.floor
+      local s = 0
+      for i = 1, 2000000 do
+        local j = i % 64
+        while j > 0 do j = floor(j / 2); s = s + 1 end
+      end
+      print(s)
+      -- /tmp/hightrip.lua: ~100 trips/entry, a while and a repeat
+      local s = 0
+      for i = 1, 200000 do
+        local k = 0
+        while k < 100 do k = k + 1; s = s + k end
+        local r = 0
+        repeat r = r + 1; s = s - r until r >= 100
+      end
+      print(s)
+      ```
+
+    - Aside: with `math.floor` written inline in the loop, lowtrip
+      never traces (`nyi_opcode get_index` in the main chunk). That
+      gap is logged in TODO.md.
 - **B1 — the op exists, inert.**
   - The compiler emits `loop`. Tier-0 runs it as a no-op. It is not
     yet a back-edge, and backward jumps keep their back-edge role, so

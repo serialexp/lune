@@ -2,6 +2,18 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## A module field read inside a main-chunk loop aborts recording (noted 2026-09-27)
+
+- [ ] **`math.floor(x)` inside a loop in the MAIN chunk aborts
+      `nyi_opcode get_index`** (`/tmp/lowtrip.lua` from doc 58 B0,
+      before `floor` was hoisted to a local: 2 anchors, 6 aborts each,
+      0% traced, native slower than tier-0). With `local floor =
+      math.floor` the same loop traces 99%. LuaJIT records `math.floor`
+      through the global table plus an `HREFK`. The bench corpus
+      hoists these, so no board row shows it, but real programs don't.
+      Find which `get_index` shape the recorder refuses (the global
+      `math` table's hash field; doc 49 hrefk?) and close it.
+
 ## Doc 57 P3 follow-ups (noted 2026-09-27)
 
 - [ ] **Numeric-`for` step is a register load, not a konst.** `recForLoop`
