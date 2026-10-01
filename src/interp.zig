@@ -2734,10 +2734,10 @@ pub const Vm = struct {
             // instruction. `i` came from the fetch `code` slice, which
             // may be a patched image — a recording crossing a patched
             // pc (a sibling loop of the one being recorded) must see
-            // the virgin loop closer (`.for_loop`, `.jmp`, or
-            // `.jmp_if_false`) and virgin shape checks, byte-identical
-            // with or without the patch. `proto.code` is canonical by
-            // construction (§R1).
+            // the virgin back-edge (`.for_loop`, `.tfor_loop`, or — doc
+            // 58 — the `.loop` marker) and virgin shape checks,
+            // byte-identical with or without the patch. `proto.code` is
+            // canonical by construction (§R1).
             const mi = recordingMirrorInstr(st.proto, cur, i);
             const resolved: Value = switch (mi.op) {
                 .get_upval => self.upvalGet(st.closure.upvalues[mi.b]),
@@ -4412,59 +4412,35 @@ pub const Vm = struct {
             // taken side exit — productive or not — charges
             // its own per-(trace, exit) counter; crossing
             // `hotexit` wants a side trace for the alternate
-            // path. NUMERIC-FOR loop-done exits are excluded:
-            // they are productive completions owned by the
-            // continuation machinery, not side-trace
-            // candidates (`linked_one_trip` exits are
-            // loop-done by construction and fall out of the
-            // same check). A WHILE loop-done exit counts iff
-            // the anchor's OBSERVED average trips/entry is
-            // low (doc 38, `whileDoneHotnessEligible`): the
-            // cond-false direction of an enclosed while is
-            // where the outer-glue sibling anchors
-            // (`guard_false → outer body → loop` back to the
-            // same anchor, the two-sibling figure-eight the
-            // handoff machinery fuses). For LOW-trip whiles
-            // that fusion amortizes the per-instance
-            // entry+seam turnstile (nest avg 5: 78 cyc/it vs
-            // 137 for root+link — excluding it was a 3.5×
-            // regression); for HIGH-trip whiles the body
-            // loop already amortizes the seam and the glue
-            // family is measured pure downside (nsieve-bit-fp
-            // avg ~30+: glue formation was 2.7× worse than
-            // the root+link chain it displaced).
-            // Classify the exit ONCE — this is the per-completion hot path
-            // (2M+ entries/run on scimark-lu), and each classifier walks trace
-            // instrs + proto code. `numeric_for_done`/`while_done_exit` are
-            // mutually exclusive by construction (guard_true on `for_loop` vs
-            // the while condition-branch shape), so together they decompose
-            // `isAnyLoopDoneGuardIndex` with at most one call to each.
+            // path.
             //
-            // Doc 38: a while-loop-done exit is a COMPLETION at any count —
-            // including zero trips (the top-of-trace condition guard observed
-            // "done" before any body ran; regs are coherent at the post-loop pc
-            // untouched). Classifying it productive lets a zero-trip completion
-            // take the receipt + continuation-arm + `.while_done` chain path
-            // instead of the zero-iteration penalty path below, which misread
-            // HALF of fft_bitreverse's instances (~25.5M zero-trip entries per
-            // run) as failed entries: pure turnstile cost, penalty churn, and
-            // no chain attempt.
+            // A numeric-`for` loop-done exit is a productive completion owned
+            // by the continuation machinery (`maybeArmContinuation` below), so
+            // it is not counted (`linked_one_trip` exits are loop-done by
+            // construction and fall out of the same check).
+            //
+            // Doc 58 B2 review, blocker 2: a `while`/`repeat` loop's OWN test
+            // (`isOwnLoopTest`) IS counted. Its post-loop continuation has no
+            // `maybeArmContinuation` leg any more — doc 56's exit-side route
+            // is what records it, and that route is fed only from here.
+            // `noteTakenExit` routes it to exit-side first and stops it
+            // before every legacy route (§4.3, review r3 finding 1: a legacy
+            // want would unpatch the entry and record a pass that can only
+            // end in LLEAVE). Excluding it here starved exit-side completely.
+            //
+            // Classify ONCE — this is the per-completion hot path (2M+
+            // entries/run on scimark-lu) and each classifier walks trace instrs
+            // + proto code.
             const exit_ok = result.exit_instr != std.math.maxInt(u32) and
                 result.exit_instr < final.code.instrs.len;
             const numeric_for_done = exit_ok and
                 trace.isLoopDoneGuardIndex(final, result.exit_instr);
-            // Doc 40 Phase 0: the zero-trip coherence claim above is peel-aware —
-            // a PEELED trace's steady-region loop-done at zero local completions
-            // has executed (but never flushed) its run-once iteration, so the
-            // post-loop pc is NOT coherent there; that exit must fall to the
-            // ordinary deopt-replay path below (185.5-vs-186 divergence otherwise).
-            const while_done_exit = exit_ok and !numeric_for_done and
-                trace.isWhileLoopDoneGuardIndex(final, result.exit_instr) and
-                (local_done > 0 or trace.whileDoneCoherentAtZero(final, result.exit_instr));
-            const any_loop_done = numeric_for_done or while_done_exit;
-            const count_exit = exit_ok and
-                (!any_loop_done or
-                    (while_done_exit and self.trace.whileDoneHotnessEligible(final.code.anchor)));
+            const any_loop_done = exit_ok and
+                (numeric_for_done or trace.isOwnLoopTestIndex(final, result.exit_instr));
+            const count_exit = exit_ok and !numeric_for_done;
+            if (exit_ok and local_done == 0 and !linked_one_trip and
+                final.code.isSteadyRegionExit(result.exit_instr))
+                self.trace.peeled_steady_zero_exits +|= 1;
             if (count_exit) {
                 // Doc 56 Phases 3–4: a direct run may take the exit-side
                 // route — tier-1a always (its executor honours the exit-side
@@ -4479,7 +4455,7 @@ pub const Vm = struct {
                 self.trace.noteTakenExit(final, result.exit_instr, local_done, proto, route);
             }
 
-            if (local_done > 0 or linked_one_trip or while_done_exit) {
+            if (local_done > 0 or linked_one_trip) {
                 // This trace did useful work — keep its result.
                 // (`linked_one_trip`: the committed loop-done IS one
                 // enclosing iteration, replayLedger's `max(local, 1)`.)
@@ -4568,37 +4544,17 @@ pub const Vm = struct {
                 // from `buf`, runs continuation ⇄ inner-root
                 // for a bounded burst, and tells us where
                 // tier-0 should resume when it yields.
-                // Doc 38: classify once — a while-loop-done exit chains through
-                // the `.while_done` materialization on BOTH tiers (no flush owed,
-                // walk at the condition branch's jump target). Numeric-for keeps
-                // its historical arms verbatim.
-                const while_done = while_done_exit;
+                // Doc 58: only a numeric `for` loop-done chains here. A
+                // `while`/`repeat` condition guard is an ordinary exit — its
+                // continuation at the post-loop pc is reached through the
+                // exit-side route, not through a loop-done materialization.
                 if (ran_native and ran_native_link_mode) {
                     if (self.trace.driveChain(final, result, proto, trace_regs, .native_only, .native_numeric_for_done, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
                         if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                         for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
                         return .{ .resume_tier0 = pc };
                     }
-                } else if (ran_native) {
-                    // Doc 38: a while inner root always enters native in ORDINARY
-                    // mode (`hasNativeLoopDoneLink` is numeric-only), so its
-                    // loop-done surfaces here — an ordinary deopt with regs
-                    // coherent at the anchor, which for a top-of-trace condition
-                    // guard is also coherent at the post-loop pc.
-                    if (while_done) {
-                        if (self.trace.driveChain(final, result, proto, trace_regs, .native_only, .while_done, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
-                            if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                            for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
-                            return .{ .resume_tier0 = pc };
-                        }
-                    }
-                } else if (while_done) {
-                    if (self.trace.driveChain(final, result, proto, trace_regs, .ir, .while_done, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
-                        if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                        for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
-                        return .{ .resume_tier0 = pc };
-                    }
-                } else {
+                } else if (!ran_native) {
                     if (self.trace.driveChain(final, result, proto, trace_regs, .ir, .{ .ir_numeric_for_done = buf }, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
                         if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                         for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
@@ -4642,13 +4598,12 @@ pub const Vm = struct {
                 // anchor, so there is nothing to thread and
                 // the live regs remain exactly what each
                 // entered trace expects.
-                // Doc 38: a while-loop-done IS a source-branch guard (guard_true
-                // from `jmp_if_false`) but it is a COMPLETION — chaining to a
-                // same-anchor sibling could only re-check a finished loop (every
-                // sibling condition-fails at its top with zero committed). The
-                // while chain above already tried the continuation; fall through
-                // to tier-0.
-                if (!while_done and self.trace.isSourceBranchGuardExit(final, result.exit_instr, proto)) {
+                // Doc 58 §4.3: a loop's own test has the SHAPE of a source-branch
+                // guard (`guard_true` from a `jmp_if_false`) but it is a
+                // COMPLETION — chaining to a same-anchor sibling could only
+                // re-check a finished loop. `isSourceBranchGuardExit` excludes
+                // it, so no test is needed here.
+                if (self.trace.isSourceBranchGuardExit(final, result.exit_instr, proto)) {
                     if (ran_native) {
                         if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl[0..nexcl], safe_to_arm, self.unicode_version_pinned)) |chain| {
                             if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
@@ -5374,7 +5329,6 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                const cur_pc = pc - 1;
                 var npc = pc;
                 switch (op) {
                     .jmp => npc = applyJump(pc, instr.aux),
@@ -5389,8 +5343,11 @@ pub const Vm = struct {
                     },
                     else => unreachable,
                 }
-                if (vm.trace.config.enabled and npc <= cur_pc)
-                    return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
+                // Doc 58 §4.2: no jump is a back-edge any more. The only
+                // backward jumps the compiler emits are the two loop closers
+                // (`while`'s `jmp` to its condition, `repeat`'s `jmp_if_false`
+                // to its marker), and the marker is the back-edge that counts
+                // the iteration. `for_loop`/`tfor_loop` keep their own.
                 return dispatchTail(mode, st, npc, vm);
             }
         }.h;
@@ -5588,14 +5545,13 @@ pub const Vm = struct {
             fn h(st: *ExecState, pc: usize, instr_in: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const self = vm;
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                const cur_pc = pc - 1;
                 const slot: u16 = instr_in.b;
                 const patch = self.trace.registry.entry_registry.entry_patches.items[slot];
                 const live = patch.live;
                 if (!live) {
-                    // Same load-bearing deferred-unpatch recovery as the
-                    // numeric-for arm: complete the transaction before
-                    // executing the canonical jump once.
+                    // Same deferred-unpatch recovery as the numeric-for arm:
+                    // complete the transaction before executing the canonical
+                    // instruction once.
                     self.trace.unpatchSlot(slot);
                 }
                 // Pointer, not a local copy: the musttail chain outlives this
@@ -5606,11 +5562,16 @@ pub const Vm = struct {
                 const instr = &patch.orig;
                 const a: usize = instr.a;
                 var npc = pc;
+                // Doc 58 §4.2: `took` replaces the old `npc <= cur_pc` test.
+                // A `loop` marker's header is FORWARD (`pc`, the body start),
+                // so the back-edge cannot be recognised by direction any more.
+                var took = false;
                 switch (instr.op) {
-                    .jmp => npc = applyJump(pc, instr.aux),
-                    .jmp_if_false => if (!regs.get(a).isTruthy()) {
-                        npc = applyJump(pc, instr.aux);
-                    },
+                    // Doc 58: the loop marker always takes its back-edge —
+                    // reaching it means the `while`/`repeat` condition already
+                    // said "run the body". Execution falls through to `pc`,
+                    // which is the header.
+                    .loop => took = true,
                     // Generic-for test+continue (doc 30 c5): first loop var
                     // non-nil → publish it as ctrl and take the back-edge;
                     // nil → fall through (loop done). Byte-identical to the
@@ -5618,12 +5579,12 @@ pub const Vm = struct {
                     .tfor_loop => if (!regs.get(a + 3).isNil()) {
                         regs.set(a + 2, regs.get(a + 3));
                         npc = applyJump(pc, instr.aux);
+                        took = true;
                     },
-                    else => unreachable, // install accepts only compiler loop closers
+                    else => unreachable, // install accepts only loop back-edges
                 }
-                // A repeat condition that is true exits the loop. `while`'s
-                // unconditional closer always takes its back-edge.
-                if (!(npc <= cur_pc)) {
+                // A generic-for whose control var went nil leaves the loop.
+                if (!took) {
                     return dispatchTail(mode, st, npc, vm);
                 }
                 if (!live) return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads }); // restored virgin cascade
@@ -6086,9 +6047,16 @@ pub const Vm = struct {
     /// Doc 58: the loop marker (LuaJIT `BC_LOOP`). B1: a pure no-op — it
     /// always falls through, and its `aux` (the loop's exit offset) is never
     /// a jump.
+    // Doc 58 §4.2: the loop marker (LuaJIT `BC_LOOP`) is the back-edge of a
+    // `while`/`repeat` loop. It always "takes" it — execution falls through to
+    // `pc`, which IS the loop header (the body start), so hot counting, trace
+    // entry, gates and coverage run exactly once per iteration keyed on the
+    // body start, exactly as `for_loop` does. With tracing off it is a no-op.
     fn opLoop(comptime mode: ExecMode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                if (vm.trace.config.enabled)
+                    return @call(.always_tail, backEdgeHandler(mode), .{ st, pc, instr, vm, tags, payloads });
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;

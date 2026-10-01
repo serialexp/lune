@@ -116,6 +116,25 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run the trace-optimizer benchmark (ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
 
+    // `zig build bench-topology` — doc 58 §4.8: the region-topology rebuild
+    // boundary as proto size and qualifying-root count grow. ReleaseFast,
+    // informational, not a test (global Rule #22).
+    const bench_topo_exe = b.addExecutable(.{
+        .name = "bench-topology",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_topology.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "mahina", .module = mod },
+            },
+        }),
+    });
+    bench_topo_exe.use_llvm = true;
+    const run_bench_topo = b.addRunArtifact(bench_topo_exe);
+    const bench_topo_step = b.step("bench-topology", "Run the region-topology rebuild benchmark (ReleaseFast)");
+    bench_topo_step.dependOn(&run_bench_topo.step);
+
     // --- wasm32-freestanding browser target ---------------------------------
     //
     // `zig build wasm` compiles the VM core to a reactor-style wasm module that

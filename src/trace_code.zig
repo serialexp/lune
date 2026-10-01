@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const value = @import("value.zig");
+const bytecode = @import("bytecode.zig");
 const trace_ir = @import("trace_ir.zig");
 const trace_snapshot = @import("trace_snapshot.zig");
 const trace_types = @import("trace_types.zig");
@@ -641,41 +642,61 @@ pub const TraceCode = struct {
         return true;
     }
 
-    /// Doc 38: if guard `idx` is this trace's own while-loop condition (the
-    /// `guard_true` sourced at a `jmp_if_false` whose forward target is
-    /// preceded by the loop's backward `jmp` to the anchor), the post-loop pc
-    /// that condition's failure exits to. Fail-closed: null for anything
-    /// else. Lives on `TraceCode` so the doc 56 attach classifier shares it
-    /// (`trace.whileLoopDonePostPc` delegates here).
-    pub fn whileLoopDonePostPc(self: *const TraceCode, idx: usize) ?u32 {
-        if (idx >= self.instrs.len) return null;
+    /// Doc 58 §4.3: is guard `idx` the test of the loop this trace is anchored
+    /// at — the guard whose other direction LEAVES the loop? Purely structural,
+    /// from the guard's source instruction and `bytecode.loopHeaderOf`, so it
+    /// needs no role and matches every unrolled copy of the test (a copy has the
+    /// same source instruction). One classifier for all three loop shapes:
+    ///  - a `for_loop`/`tfor_loop` whose header is the anchor;
+    ///  - a `jmp_if_false` immediately followed by a `loop` marker whose header
+    ///    is the anchor (`while`);
+    ///  - a backward `jmp_if_false` targeting a `loop` marker whose header is
+    ///    the anchor (`repeat`).
+    ///
+    /// A loop's own test is not a branch alternation: it must not raise
+    /// `wants_prime_side` (which would unpatch the entry and chain same-anchor
+    /// siblings on every loop completion). Its hotness feeds exit-side only
+    /// (review r3 finding 1; the dispatcher counts it — B2 review blocker 2 —
+    /// and `noteTakenExit` stops it before every legacy route).
+    pub fn isOwnLoopTest(self: *const TraceCode, idx: usize) bool {
+        if (idx >= self.instrs.len) return false;
+        if (anchorKind(self.anchor.pc) != .loop) return false;
         const g = self.instrs[idx];
-        if (g.op != .guard_true) return null;
-        const src_pc = trace_ir.guardSourcePc(g) orelse return null;
-        const proto = self.anchor.proto;
-        if (src_pc >= proto.code.len) return null;
-        const br = proto.code[src_pc];
-        if (br.op != .jmp_if_false) return null;
-        // Post-loop pc = the branch's jump target (post-increment base, like
-        // `applyJump`): `(src_pc + 1) + aux`. Must be a forward, in-bounds exit.
-        const post_i: i64 = @as(i64, src_pc) + 1 + br.aux;
-        if (post_i <= @as(i64, src_pc) or post_i >= @as(i64, @intCast(proto.code.len))) return null;
-        const post: u32 = @intCast(post_i);
-        if (post == 0) return null;
-        // The instruction immediately before the post-loop pc must be this loop's
-        // backward `jmp`, returning exactly to the trace's anchor (the condition).
-        const back = proto.code[post - 1];
-        if (back.op != .jmp) return null;
-        if (@as(i64, post) + back.aux != @as(i64, self.anchor.pc)) return null;
+        if (g.op != .guard_true and g.op != .guard_false) return false;
+        // Depth 0 only: an inlined callee's loop test is not this loop's.
         if (self.provAt(@intCast(idx))) |prov| switch (prov) {
-            .guard => |gp| if (gp.inline_depth > 0) return null,
-            .link_terminal => return null,
+            .guard => |gp| if (gp.inline_depth > 0) return false,
+            .link_terminal => return false,
         };
-        // Doc 57 P3: a later iteration's condition sits mid-trip; resuming
-        // after the loop with the trip-start registers would lose the
-        // iterations before it.
-        if (self.isLoopTestCopy(idx)) return null;
-        return post;
+        const src_pc = trace_ir.guardSourcePc(g) orelse return false;
+        const proto = self.anchor.proto;
+        if (src_pc >= proto.code.len) return false;
+        const src = proto.code[src_pc];
+        // `for_loop` / `tfor_loop`: the back-edge itself is the test.
+        if (bytecode.loopHeaderOf(src, src_pc) == self.anchor.pc) return true;
+        if (src.op != .jmp_if_false) return false;
+        // `while`: the branch sits right above the marker.
+        if (src_pc + 1 < proto.code.len and
+            bytecode.loopHeaderOf(proto.code[src_pc + 1], src_pc + 1) == self.anchor.pc) return true;
+        // `repeat`: the branch is the backward closer onto the marker.
+        const t: i64 = @as(i64, src_pc) + 1 + src.aux;
+        if (t < 0 or t >= @as(i64, @intCast(proto.code.len))) return false;
+        const target: usize = @intCast(t);
+        return target <= src_pc and bytecode.loopHeaderOf(proto.code[target], target) == self.anchor.pc;
+    }
+
+    /// Doc 39: is exit `idx` in a PEELED trace's steady region — past the
+    /// `.preheader` marker that ends the run-once guest iteration? False on an
+    /// unpeeled trace (its `.preheader`, if any, is an LICM boundary, not a
+    /// guest iteration). A linear scan: asked only on the rare zero-completion
+    /// exit of a peeled trace, which replays the whole iteration in tier-0
+    /// anyway.
+    pub fn isSteadyRegionExit(self: *const TraceCode, idx: usize) bool {
+        if (!self.peeled or idx >= self.instrs.len) return false;
+        for (self.instrs[0..idx]) |ins| {
+            if (ins.op == .preheader) return true;
+        }
+        return false;
     }
 
     pub fn classifyBridgeCandidate(self: *const TraceCode, instr_idx: usize) bool {
@@ -722,8 +743,76 @@ pub const TraceCode = struct {
         while (si < self.instrs.len) : (si += 1) {
             if (trace_ir.isStateEffectOp(self.instrs[si].op)) return false;
         }
-        for (self.instrs) |ins| if (ins.op == .phi and ins.aux != trace_ir.PHI_INTERNAL and ins.b < instr_idx) return true;
-        return false;
+        // The pc the bridge lands on first: the branch edge the recording did
+        // NOT take (`resolveCompositeBridgeSuccessor` starts its walk here).
+        if (gp.polarity == .neutral) return false;
+        const fallthrough: i64 = @as(i64, source_pc) + 1;
+        const landing: i64 = if (gp.polarity == .fallthrough) fallthrough + self.anchor.proto.code[source_pc].aux else fallthrough;
+        if (landing < 0 or landing >= self.anchor.proto.code.len) return false;
+        return self.bridgeMatchesExitSnapshot(instr_idx, @intCast(landing));
+    }
+
+    /// Doc 58 B2 review, blocker 1: an armed composite bridge hands off with
+    /// NO tier-0 replay, so the state it commits must BE the guest state at
+    /// the exit — what LuaJIT restores from the exit's snapshot. The emitted
+    /// set E (`bridgeEmissions`) infers that state from φs: "a φ whose update
+    /// ref precedes the guard wrote its slot before the guard". The IR index
+    /// of a VALUE is not the program point of a slot WRITE: `konst` is
+    /// interned at first use and CSE reuses earlier refs, so a slot written
+    /// AFTER the guard (a `while` condition temp re-set by an unrolled copy's
+    /// `loadk true`) can own a φ whose update precedes it, and a slot written
+    /// before the guard and again after it leaves E without the earlier
+    /// write. Either way the bridge committed a state the guest never had
+    /// (`bench/while_shortcircuit_probe.lua`: one extra `while` trip).
+    ///
+    /// The exit snapshot (doc 56 §4.2) is the recorder's exact slot state at
+    /// the guard's bytecode (the branch writes nothing, so it is also the
+    /// state on the edge out of it). E is admitted only when it agrees with
+    /// that state on every slot live at `landing`, the pc the bridge lands on:
+    /// a live E member must be in the snapshot with the SAME ref, and a live
+    /// snapshot write must be in E (or re-store the slot's own entry value,
+    /// which the carried flush already leaves in place). Liveness is taken at
+    /// `landing`, not at the guard: the branch's own condition temp is read by
+    /// the branch and dead past it (nsieve's `if flags[i]`). Anything the
+    /// bridge successor reads is live at `landing` — the overlay walks only
+    /// `jmp`s, which read nothing, and at most one `for_loop`, whose written
+    /// slots the continue proof covers. No snapshot (precise, budget
+    /// exhausted, dropped by validation) ⇒ no candidacy: fail closed.
+    fn bridgeMatchesExitSnapshot(self: *const TraceCode, instr_idx: usize, landing: u32) bool {
+        const si = self.exitSnapIdx(instr_idx) orelse return false;
+        const s = self.exit_snapshots[si - 1];
+        const proto = self.anchor.proto;
+        // No liveness (a hand-built proto): every slot counts as observable,
+        // which only makes the agreement check stricter.
+        const live_row: []const u64 = if (proto.reg_live.available()) proto.reg_live.row(landing) else &.{};
+        const snap = self.exit_snapshot_slots[s.slots_begin..][0..s.slots_len];
+        var any = false;
+        var emitted = self.bridgeEmissions(instr_idx);
+        while (emitted.next()) |p| {
+            any = true;
+            const slot: usize = @intCast(p.aux);
+            if (!liveIn(live_row, slot)) continue;
+            const ref = snapshotRefOf(snap, slot) orelse return false;
+            if (ref != p.b) return false;
+        }
+        for (snap) |ss| {
+            if (!liveIn(live_row, ss.slot)) continue;
+            if (self.bridgeEmitsSlot(instr_idx, ss.slot)) continue;
+            const d = self.instrs[ss.ref];
+            if (d.op == .slot_load and d.aux == @as(i32, ss.slot)) continue;
+            return false;
+        }
+        return any;
+    }
+
+    fn liveIn(row: []const u64, slot: usize) bool {
+        if (slot / 64 >= row.len) return true; // outside the row (or no row): observable
+        return (row[slot / 64] >> @intCast(slot % 64)) & 1 != 0;
+    }
+
+    fn snapshotRefOf(snap: []const trace_snapshot.SnapshotSlot, slot: usize) ?trace_ir.Ref {
+        for (snap) |ss| if (ss.slot == slot) return ss.ref;
+        return null;
     }
 
     pub fn isBridgeCandidate(self: *const TraceCode, idx: usize) bool {

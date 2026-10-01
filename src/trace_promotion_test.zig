@@ -206,6 +206,7 @@ fn makeB3BridgeTrace(
         },
         .id = id,
     };
+    try @import("trace_testutil.zig").snapshotBranchGuardsFromPhis(gpa, &t.code);
     t.native = .{ .compiled = nativegen.compileInto(gpa, &state.registry.mcode_arena, &(t).code, (t).id, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();

@@ -240,6 +240,7 @@ test "doc 56 Phase 4 adapter: with the switch off a native page carries no exit-
     };
     var buf: [64]u8 = undefined;
     var sink = @import("io.zig").Writer.fixed(&buf);
-    try util.runCapturedTuned(testing.allocator, sunk_store_src, &sink, false, .record_execute_native, .{ .inspect = Inspect.run });
+    // The switch is on by default (doc 58 B2): this pins the ablation.
+    try util.runCapturedTuned(testing.allocator, sunk_store_src, &sink, false, .record_execute_native, .{ .exit_side_native = false, .inspect = Inspect.run });
     try testing.expectEqualStrings(sunk_store_out, sink.buffered());
 }

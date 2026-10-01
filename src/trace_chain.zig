@@ -41,10 +41,6 @@ const guardExitPc = trace_mod.guardExitPc;
 const guardSourcePc = trace_mod.guardSourcePc;
 const isSideExitGuardOp = trace_mod.isSideExitGuardOp;
 const isLoopDoneGuardIndex = trace_mod.isLoopDoneGuardIndex;
-const isWhileLoopDoneGuardIndex = trace_mod.isWhileLoopDoneGuardIndex;
-const isAnyLoopDoneGuardIndex = trace_mod.isAnyLoopDoneGuardIndex;
-const whileLoopDonePostPc = trace_mod.whileLoopDonePostPc;
-const whileDoneCoherentAtZero = trace_mod.whileDoneCoherentAtZero;
 const accountCandidateCharge = TraceState.accountCandidateCharge;
 const readCycles = trace_mod.readCycles;
 const cycleDelta = trace_mod.cycleDelta;
@@ -271,20 +267,6 @@ pub fn driveChain(
         // `visited` set) keeps us from re-running the failed trace or any
         // sibling the cold walk already tried this back-edge.
         .ordinary_header => failed.code.anchor.pc,
-        // Doc 38: a while-loop-done chains to the continuation at the condition
-        // branch's JUMP TARGET (the post-loop pc). Re-derived through the
-        // fail-closed classifier — a mis-tagged call (exit isn't actually a
-        // while-loop-done) returns null rather than walking a bogus pc.
-        // Doc 40 Phase 0: fail-closed twin of the dispatcher's peel-aware
-        // classification gate. A peeled trace's STEADY-region loop-done at
-        // zero local completions owes a replay (its run-once iteration is
-        // real but unflushed); chaining would resume the post-loop pc on
-        // stale boxes. Belt-and-braces for any future `.while_done` caller.
-        .while_done => blk: {
-            const local: usize = if (tier == .native_only) result.local_completed else result.completed;
-            if (local == 0 and !whileDoneCoherentAtZero(failed, exit_instr)) return null;
-            break :blk whileLoopDonePostPc(failed, exit_instr) orelse return null;
-        },
         // Doc 56 Phases 3–4: the executor (tier-1a) or the exit adapter
         // (native) materialized at the exit's resume pc.
         .exit_side => |p| p,
@@ -358,12 +340,12 @@ pub fn driveChain(
         // Doc 26 D1 tripwire, chain half: see `enterSelectedTrace`.
         if (sct.code.requires_unicode_pin) std.debug.assert(unicode_pinned);
         const is_link = sct.code.instrs.len != 0 and sct.code.instrs[sct.code.instrs.len - 1].op == .link;
-        // Loop-done chains (ir and native, numeric-for and while) only follow
-        // `.link` continuations; an ordinary side trace at the post-loop PC is
-        // not a valid hand-off. Neither is one at an exit-side resume pc
-        // (doc 56): only a continuation carries the "coherent at its raw pc"
-        // entry contract.
-        if ((loop_done_values != null or materialization == .while_done or materialization == .exit_side) and !is_link) continue;
+        // Loop-done chains (ir and native numeric-`for`) only follow `.link`
+        // continuations; an ordinary side trace at the post-loop PC is not a
+        // valid hand-off. Neither is one at an exit-side resume pc (doc 56):
+        // only a continuation carries the "coherent at its raw pc" entry
+        // contract.
+        if ((loop_done_values != null or materialization == .exit_side) and !is_link) continue;
         if (tier == .native_only and !is_link) continue;
         // A candidate with synthetic inputs needs per-entry seeding. B-iii
         // (doc 22 §B.3): the TIER-1A walk seeds it right here via the episode
@@ -520,14 +502,6 @@ pub fn driveChain(
             const sbuf = self.valuesPush(sct.code.instrs.len) catch continue;
             if (loop_done_values) |vals| {
                 if (!irinterp.flushNumericForLoopDone(&failed.code, regs, vals, exit_instr)) return null;
-                flushed_resume_pc = walk_pc;
-            } else if (materialization == .while_done) {
-                // Doc 38: no flush owed — the while condition guard fails at
-                // the trace TOP, before any of the final pass's body ran; the
-                // completed iterations committed at their `.loop` terminals.
-                // But the loop IS done (the condition was observed falsy), so
-                // a zero-progress continuation run must still resume tier-0 at
-                // the post-loop pc, never back at the loop header.
                 flushed_resume_pc = walk_pc;
             } else if (materialization == .exit_side) {
                 // Doc 56: likewise, the executor already committed the
@@ -2949,15 +2923,15 @@ pub fn driveBurstCore(
             // inner header, re-running the whole (idempotent) marking loop.
             // Doc 57 P3: a mid-trip loop-test copy (instability unroll) is an
             // ordinary exit, never a completed loop.
-            const numeric_done = inner_exit_pc >= 1 and
+            // Doc 58: only a numeric `for` has a loop-done exit here. A
+            // `while`/`repeat` inner loop's condition guard is an ORDINARY exit
+            // now (its resume pc is the post-loop pc, through the branch
+            // fix-up), so it takes the `!loop_done` path below and exit-side
+            // serves it — the same route every other ordinary exit takes.
+            const loop_done = inner_exit_pc >= 1 and
                 proto.code[guardSourcePc(inner_guard).?].op == .for_loop and
                 !inner.code.isLoopTestCopy(iresult.exit_instr);
-            // Doc 38: the while twin. The post-loop pc for a while-done is the
-            // condition branch's jump target — NOT `inner_exit_pc`, which is
-            // the loop-body start (inside the loop).
-            const while_post: ?u32 = if (numeric_done) null else whileLoopDonePostPc(inner, iresult.exit_instr);
-            const loop_done = numeric_done or while_post != null;
-            const post_pc: u32 = if (numeric_done) inner_exit_pc else while_post orelse 0;
+            const post_pc: u32 = inner_exit_pc;
             if (!loop_done) {
                 if (inner_local > 0) {
                     self.onSideExitReceipt(inner, inner_local, iresult.exit_instr, 0, .deferred, .entered);
@@ -2970,10 +2944,8 @@ pub fn driveBurstCore(
                 break;
             }
             // Native committed the loop-done inside `runLinkedLoopDone`; the
-            // tier-1a path still owes the final-iteration flush. Doc 38: a
-            // while-done owes NO flush on either tier — its condition guard
-            // fails at the trace top, before the final pass ran any body.
-            if (tier == .ir and numeric_done) {
+            // tier-1a path still owes the final-iteration flush.
+            if (tier == .ir) {
                 if (!irinterp.flushNumericForLoopDone(&inner.code, regs, ibuf, iresult.exit_instr)) break;
             }
             // Hole B (doc 16, Phase 3): hand the ping-pong to the continuation

@@ -568,6 +568,9 @@ pub const SlotClass = ngalloc.SlotClass;
 pub const Alloc = ngalloc.Alloc;
 pub const regBit = ngalloc.regBit;
 pub const analyze = ngalloc.analyze;
+/// The erroring form, for the jitdbg "unsupported in analyze" probe: its
+/// error-return trace names the exact `error.Bail` site.
+pub const analyzeInner = ngalloc.analyzeInner;
 const Loc = ngalloc.Loc;
 const SlotInfo = ngalloc.SlotInfo;
 const CALLEE_SAVED_MASK = ngalloc.CALLEE_SAVED_MASK;

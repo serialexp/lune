@@ -50,27 +50,61 @@ const bitreverse_src =
     \\print(v[1], v[2 * n])
 ;
 
-test "doc 56 Phase 0: fft bit-reverse is byte-identical and (today) barely runs traced" {
+test "doc 58: fft bit-reverse runs mostly traced at both hot anchors (doc 56 §9 target)" {
+    // The arc's headline coverage claim, and the reason doc 58 exists. Doc 55
+    // §3 measured both hot anchors of this kernel under 10% traced, and doc 56
+    // Phase 0 pinned that as a baseline. What was in the way: the inner
+    // `while`'s exit could not be served by a side trace, because its condition
+    // guard sat at the TOP of the trace and was owned by the doc 38 while-done
+    // chain instead of being an ordinary, attachable exit.
+    //
+    // Doc 58 moves the condition to the END of the trace (LuaJIT's `BC_LOOP`
+    // shape), so exit-side serves it like any other exit. Measured here: the
+    // outer `for` goes 0.2% → 83.4% traced, the inner `while` 36.8% → 75.7%.
+    // Iteration counts are deterministic, so these are real thresholds, not
+    // timing.
     const Inspect = struct {
         fn run(vm: *Vm, mode: TraceMode) !void {
             if (mode != .record_execute_native) return;
-            var anchors: u32 = 0;
+            // The two loop headers, named from the bytecode: the outer `for`'s
+            // (its `for_loop`'s backward target) and the inner `while`'s (the
+            // instruction after its `loop` marker). The exit-side continuation
+            // the `while`'s exit records at the post-loop pc is also a hot
+            // anchor, so counting "hot anchors" could let it stand in for
+            // one of these.
+            var proto: ?*const @import("bytecode.zig").Proto = null;
             var it = vm.trace.coverage.iterator();
             while (it.next()) |entry| {
-                if (!std.mem.eql(u8, entry.key_ptr.proto.name, "bitreverse")) continue;
-                const traced = entry.value_ptr.traced;
-                const total = traced + entry.value_ptr.interp;
-                if (total < 1000) continue; // not one of the two hot loop anchors
-                anchors += 1;
-                // TODAY (doc 55 §3): both the outer `for` and the inner
-                // `while` anchor run under 10% of their iterations traced.
-                // Doc 56 flips this to the §9 target once side traces attach.
-                try testing.expect(traced * 10 < total);
+                if (std.mem.eql(u8, entry.key_ptr.proto.name, "bitreverse")) proto = entry.key_ptr.proto;
             }
-            try testing.expectEqual(@as(u32, 2), anchors);
+            const p = proto orelse return error.TestUnexpectedResult;
+            var for_header: ?u32 = null;
+            var while_header: ?u32 = null;
+            for (p.code, 0..) |ins, pc| switch (ins.op) {
+                .for_loop => {
+                    try testing.expect(for_header == null);
+                    for_header = @intCast(@as(i64, @intCast(pc)) + 1 + ins.aux);
+                },
+                .loop => {
+                    try testing.expect(while_header == null);
+                    while_header = @intCast(pc + 1);
+                },
+                else => {},
+            };
+            for ([_]?u32{ for_header, while_header }) |h| {
+                const cov = vm.trace.coverage.get(.{ .proto = p, .pc = h.? }) orelse
+                    return error.TestUnexpectedResult;
+                const total = cov.traced + cov.interp;
+                try testing.expect(total >= 1000); // genuinely hot
+                try testing.expect(cov.traced * 2 > total); // majority traced
+            }
         }
     };
-    try expectProgramTuned(bitreverse_src, "0.5\t1024\n", .{ .coverage = true, .inspect = Inspect.run });
+    try expectProgramTuned(bitreverse_src, "0.5\t1024\n", .{
+        .coverage = true,
+        .exit_side_native = true,
+        .inspect = Inspect.run,
+    });
 }
 
 /// A recorded-only (no execute, optimizer on) run: the VM plus the compiled
@@ -303,29 +337,69 @@ fn isExecuteMode(mode: TraceMode) bool {
 }
 
 /// The oracle for a `.link` terminal's `LinkKind`: `.enclosing_iteration`
-/// exactly when some back-edge at or after the anchor returns to the link
-/// target at or before it, i.e. the loop headed at the target contains the
-/// anchor. Returns how many links are `.enclosing_iteration`.
+/// exactly when the loop headed at the link target CONTAINS the anchor — so
+/// one run to the `.link` finishes one iteration of it.
+///
+/// Deliberately NOT `bytecode.loopExtentFor` (B2 review should-fix: the
+/// implementation asks that, so a wrong extent would make implementation and
+/// oracle agree). Containment here is the textbook natural loop of the
+/// proto's CFG (`naturalLoopContains`), which knows nothing of loop shapes.
+/// Returns how many links are `.enclosing_iteration`.
 fn expectLinkKindsMatchLoops(vm: *Vm) !usize {
     var enclosing: usize = 0;
     for (vm.trace.registry.cache.items) |t| {
         const c = &t.code;
         const n = c.instrs.len;
         if (n == 0 or c.instrs[n - 1].op != .link) continue;
-        const target: i64 = c.instrs[n - 1].aux;
-        const a: i64 = c.anchor.pc;
-        var contains = false;
-        for (c.anchor.proto.code, 0..) |ins, pc| switch (ins.op) {
-            .for_loop, .tfor_loop, .jmp => {
-                const back: i64 = @intCast(pc);
-                if (back + 1 + ins.aux == target and target <= a and back >= a) contains = true;
-            },
-            else => {},
-        };
+        const target: u32 = @intCast(c.instrs[n - 1].aux);
+        const contains = try naturalLoopContains(testing.allocator, c.anchor.proto, target, c.anchor.pc);
         try testing.expectEqual(contains, c.linkClosesIteration());
         enclosing += @intFromBool(contains);
     }
     return enclosing;
+}
+
+/// Does the loop headed at `h` contain pc `a`? "The loop headed at `h`" is
+/// the SMALLEST natural loop whose body contains `h`: every back edge
+/// `t → hd` (`hd` dominates `t`) has the body `{hd}` plus every pc that
+/// reaches `t` without passing `hd`. False when no loop contains `h`. Quadratic
+/// in the proto's size — test protos only.
+fn naturalLoopContains(gpa: std.mem.Allocator, proto: *const @import("bytecode.zig").Proto, h: u32, a: u32) !bool {
+    const succOf = @import("bc_liveness.zig").successors;
+    const code = proto.code;
+    try testing.expect(proto.dom.available());
+    var body = try std.DynamicBitSetUnmanaged.initEmpty(gpa, code.len);
+    defer body.deinit(gpa);
+    var work: std.ArrayListUnmanaged(u32) = .empty;
+    defer work.deinit(gpa);
+    var best: usize = std.math.maxInt(usize);
+    var contains = false;
+    for (code, 0..) |tail_ins, tail| for (succOf(tail_ins, @intCast(tail), code.len)) |s| {
+        const hd = s orelse continue;
+        if (!proto.dom.dominates(hd, @intCast(tail))) continue; // not a back edge
+        body.unsetAll();
+        body.set(hd);
+        work.clearRetainingCapacity();
+        if (!body.isSet(tail)) {
+            body.set(tail);
+            try work.append(gpa, @intCast(tail));
+        }
+        while (work.pop()) |x| {
+            // Predecessors of `x`, by scanning every edge.
+            for (code, 0..) |p_ins, p| for (succOf(p_ins, @intCast(p), code.len)) |ps| {
+                if (ps != x or body.isSet(p)) continue;
+                body.set(p);
+                try work.append(gpa, @intCast(p));
+            };
+        }
+        if (h >= code.len or !body.isSet(h)) continue;
+        const size = body.count();
+        if (size < best) {
+            best = size;
+            contains = a < code.len and body.isSet(a);
+        }
+    };
+    return contains;
 }
 
 test "doc 56 Phase 3: a continuation that closes at its enclosing loop tags its link as an iteration" {
@@ -336,7 +410,10 @@ test "doc 56 Phase 3: a continuation that closes at its enclosing loop tags its 
     const Inspect = struct {
         fn run(vm: *Vm, mode: TraceMode) !void {
             const enclosing = try expectLinkKindsMatchLoops(vm);
-            // Continuations only arm off executed loop-done exits.
+            // Continuations only arm off EXECUTED exits. Doc 58: the inner
+            // `while`'s exit is an ordinary exit now, so the continuation is
+            // recorded by the exit-side route — which on the native leg needs
+            // the adapters, hence `exit_side_native` below.
             if (isExecuteMode(mode)) try testing.expect(enclosing > 0);
         }
     };
@@ -354,7 +431,7 @@ test "doc 56 Phase 3: a continuation that closes at its enclosing loop tags its 
         \\end
         \\for rep = 1, 20 do f() end
         \\print(cnt)
-    , "240\n", .{ .inspect = Inspect.run });
+    , "240\n", .{ .exit_side_native = true, .inspect = Inspect.run });
 }
 
 test "doc 56 Phase 3: an exit materialized past a sunk store applies that store first" {
@@ -431,6 +508,12 @@ test "doc 56 Phase 3: bit-reverse's post-while continuation also serves the root
     // binds by CHAINING into that continuation: one trace at `P` serves
     // both arrivals, and no recording is spent. Tier-1a only (Phase 3).
     // The ten-leg output parity is the Phase 0 test's.
+    //
+    // Doc 58: at the CLI's own recording threshold. The `while` root's
+    // continuation at `P` is now recorded by the exit-side route rather than by
+    // the deleted loop-done arm, so which of the two arrivals reaches `P` first
+    // depends on the threshold; at `hotloop = 4` the root's wrong-trip exit gets
+    // there first and records it, and no chain bind is left to observe.
     const Inspect = struct {
         fn run(vm: *Vm, mode: TraceMode) !void {
             std.debug.assert(mode == .record_execute);
@@ -450,7 +533,10 @@ test "doc 56 Phase 3: bit-reverse's post-while continuation also serves the root
     };
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
-    try util.runCapturedTuned(testing.allocator, bitreverse_src, &sink, false, .record_execute, .{ .inspect = Inspect.run });
+    try util.runCapturedTuned(testing.allocator, bitreverse_src, &sink, false, .record_execute, .{
+        .hotloop = (@import("trace.zig").TraceConfig{}).hotloop,
+        .inspect = Inspect.run,
+    });
     try testing.expectEqualStrings("0.5\t1024\n", sink.buffered());
 }
 
@@ -1416,4 +1502,169 @@ test "doc 56 Phase 6: fft bit-reverse's exit-side cycle mints armable" {
 
 test "doc 56 §4.8.3 R1: a live ordinary arm wins over a published exit adapter" {
     try expectProgramTuned(exit_side_replay_src, "1530000\t45150.5\n", .{ .exit_side_native = true, .inspect = checkOrdinaryArmFirst });
+}
+
+/// Doc 58 B2 review, blocker 1 (`bench/while_shortcircuit_probe.lua`). The
+/// `and` makes the `while` test a two-branch chain whose second test reads a
+/// condition temp the first one wrote, and `b = not b` unrolls the body
+/// twice, so the second copy's guard sits BEFORE the copy's `loadk true`
+/// into that temp — whose φ update is the interned `konst true` defined at
+/// the top of the trace. A composite bridge that flushed that φ committed
+/// `cr = true` where the guest had `cr = false`, and the `while` ran one
+/// trip past its bound (215 instead of 76).
+const while_shortcircuit_src =
+    \\local s = 0
+    \\for r = 1, 120 do
+    \\  local b = false
+    \\  local i = 0
+    \\  while i < (r % 9 + 3) and true do
+    \\    b = not b
+    \\    i = i + 1
+    \\    if b then s = s + i else s = s - i end
+    \\  end
+    \\end
+    \\print(s)
+;
+
+/// Every branch guard whose emitted φ set disagrees with its exit snapshot on
+/// a slot live where the bridge would land (the branch edge the recording did
+/// not take) must be refused bridge candidacy; returns how many such guards
+/// the registry holds, so the caller can demand the hazard occurred.
+fn countRefusedSnapshotDisagreements(vm: *Vm) !usize {
+    var hazards: usize = 0;
+    for (vm.trace.registry.cache.items) |t| {
+        const c = &t.code;
+        const proto = c.anchor.proto;
+        if (!proto.reg_live.available()) continue;
+        for (c.instrs, 0..) |g, gi| {
+            if (g.op != .guard_true and g.op != .guard_false) continue;
+            const si = c.exitSnapIdx(gi) orelse continue;
+            const gp = switch (c.provAt(@intCast(gi)) orelse continue) {
+                .guard => |x| x,
+                .link_terminal => continue,
+            };
+            if (gp.role != .branch_cond or gp.polarity == .neutral) continue;
+            const src = proto.code[gp.source_pc];
+            if (src.op != .jmp_if_true and src.op != .jmp_if_false) continue;
+            const landing: usize = if (gp.polarity == .fallthrough)
+                @intCast(@as(i64, gp.source_pc) + 1 + src.aux)
+            else
+                gp.source_pc + 1;
+            const s = c.exit_snapshots[si - 1];
+            const snap = c.exit_snapshot_slots[s.slots_begin..][0..s.slots_len];
+            const live_row = proto.reg_live.row(@intCast(landing));
+            var disagrees = false;
+            var emitted = c.bridgeEmissions(gi);
+            while (emitted.next()) |p| {
+                const slot: usize = @intCast(p.aux);
+                if ((live_row[slot / 64] >> @intCast(slot % 64)) & 1 == 0) continue;
+                var ref: ?u16 = null;
+                for (snap) |ss| if (ss.slot == slot) {
+                    ref = ss.ref;
+                };
+                if (ref == null or ref.? != p.b) disagrees = true;
+            }
+            if (!disagrees) continue;
+            hazards += 1;
+            try testing.expect(!c.isBridgeCandidate(gi));
+        }
+    }
+    return hazards;
+}
+
+test "doc 58 B2: a composite bridge never commits a φ the exit snapshot contradicts" {
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            const hazards = try countRefusedSnapshotDisagreements(vm);
+            if (isExecuteMode(mode)) try testing.expect(hazards > 0);
+        }
+    };
+    // The CLI's tiering order is the one that arms the bad bridge.
+    try expectProgramTuned(while_shortcircuit_src, "76\n", .{
+        .exit_side_native = true,
+        .hotloop = (@import("trace.zig").TraceConfig{}).hotloop,
+        .inspect = Inspect.run,
+    });
+}
+
+/// Doc 58 §4.8 (B2 blocker 3): fft_transform's shape (`bench/luajit/
+/// scimark_lib.lua:190`, n = 256, normalised round trips so the data stay
+/// bounded). B2 makes the `repeat` back-path traceable, so the whole
+/// `repeat` body becomes ONE closed cycle — first `for i` root → its
+/// continuation → the inner `for i` root → the `for a` continuation → back
+/// to the first root — with two link-fed loop roots. Increment B refused
+/// that tie, the cycle minted `armable=false`, and every burst drained at
+/// the ledger cap (fft +50% with the switch on). Gate dominance elects the
+/// first loop's root, and the region is admitted and promotes.
+const fft_transform_src =
+    \\local sin, pi = math.sin, math.pi
+    \\local function transform(v, n, dir)
+    \\  local dual = 1
+    \\  repeat
+    \\    local dual2 = 2 * dual
+    \\    for i = 1, 2 * n - 1, 2 * dual2 do
+    \\      local j = i + dual2
+    \\      local ir, ii = v[i], v[i + 1]
+    \\      local jr, ji = v[j], v[j + 1]
+    \\      v[j], v[j + 1] = ir - jr, ii - ji
+    \\      v[i], v[i + 1] = ir + jr, ii + ji
+    \\    end
+    \\    local theta = dir * pi / dual
+    \\    local s, s2 = sin(theta), 2.0 * sin(theta * 0.5) ^ 2
+    \\    local wr, wi = 1.0, 0.0
+    \\    for a = 3, dual2 - 1, 2 do
+    \\      wr, wi = wr - s * wi - s2 * wr, wi + s * wr - s2 * wi
+    \\      for i = a, a + 2 * (n - dual2), 2 * dual2 do
+    \\        local j = i + dual2
+    \\        local jr, ji = v[j], v[j + 1]
+    \\        local dr, di = wr * jr - wi * ji, wr * ji + wi * jr
+    \\        local ir, ii = v[i], v[i + 1]
+    \\        v[j], v[j + 1] = ir - dr, ii - di
+    \\        v[i], v[i + 1] = ir + dr, ii + di
+    \\      end
+    \\    end
+    \\    dual = dual2
+    \\  until dual >= n
+    \\end
+    \\local n = 256
+    \\local v = {}
+    \\for i = 1, 2 * n do v[i] = (i % 7) * 0.25 end
+    \\for rep = 1, 20 do
+    \\  transform(v, n, -1)
+    \\  transform(v, n, 1)
+    \\  for i = 1, 2 * n do v[i] = v[i] / n end
+    \\end
+    \\print(v[1], v[2 * n])
+;
+
+test "doc 58 §4.8: fft_transform's multi-root repeat cycle elects its first loop, admits and promotes" {
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode != .record_execute_native) return;
+            const bc = @import("bytecode.zig");
+            const ts = &vm.trace;
+            var found = false;
+            var it = ts.region_policy.region_defs.valueIterator();
+            while (it.next()) |def| {
+                if (def.classifier.kind != .cross_trace_cycle or def.classifier.member_count != 4) continue;
+                found = true;
+                try testing.expect(def.armable);
+                try testing.expect(def.fallback_owner);
+                try testing.expect(!def.dormant); // admitted
+                // The owner is the root of the repeat body's FIRST loop.
+                const first = for (def.owner.proto.code, 0..) |ins, pc| {
+                    if (ins.op == .for_loop) break bc.loopHeaderOf(ins, pc).?;
+                } else unreachable;
+                try testing.expectEqual(first, def.owner.pc);
+            }
+            try testing.expect(found);
+            try testing.expect(ts.registry.native_physical.silent_promotions > 0);
+            try testing.expect(ts.silent_parked_reuses > 0);
+        }
+    };
+    try expectProgramTuned(fft_transform_src, "0.2500000000000003\t0.5998951286759093\n", .{
+        .exit_side_native = true,
+        .hotloop = (@import("trace.zig").TraceConfig{}).hotloop,
+        .inspect = Inspect.run,
+    });
 }

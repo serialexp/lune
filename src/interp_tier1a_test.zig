@@ -658,6 +658,11 @@ test "coherent-state chaining (doc 16, Phase 2): nsieve prime path chains, not t
         native_vm.trace.config.execute = true;
         native_vm.trace.config.optimize = true;
         native_vm.trace.config.native_codegen = true;
+        // Native exit adapters OFF: this pins doc 16's prime-side chain.
+        // With them on (the default since doc 58 B2) the skip trace's prime
+        // exit is attachable and doc 56's exit-side route serves it first —
+        // that default path is `interp_exit_side_test`'s nsieve coverage.
+        native_vm.trace.config.exit_side_native = false;
         native_vm.out = &native;
         var chunk = try compiler.compile(gpa, native_vm.heap, source, tree.root, &diags);
         defer chunk.deinit();
@@ -928,7 +933,17 @@ test "doc 38: no trace unrolls the variable-trip while (LINNER holds)" {
     }
 }
 
-test "doc 38: while-inner link goes native" {
+test "doc 58: a while-inner nest links natively through the exit-side route" {
+    // Doc 38 grew this link from the `while`-done continuation arm: the inner
+    // root's condition guard (then at the trace TOP) armed a continuation at
+    // the post-loop pc and chained into it. Doc 58 deletes that arm — the
+    // condition is an ORDINARY exit at the end of the trace now — and doc 56's
+    // exit-side route provides the same fusion the way LuaJIT does: a side
+    // trace recorded from the exit, patched in, entered natively.
+    //
+    // So this pins the new path, with the switch on. With it off the exit is a
+    // coarse deopt and tier-0 replays the final pass (§4.4); B4 flips the
+    // default and re-measures.
     if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     const source =
@@ -948,6 +963,7 @@ test "doc 38: while-inner link goes native" {
 
     var vm = try Vm.init(gpa);
     defer vm.deinit();
+    vm.trace.config.exit_side_native = true;
     var native_buf: [64]u8 = undefined;
     var native = io.Writer.fixed(&native_buf);
     var chunk = try runNativeForTrace(&vm, gpa, source, &native);
@@ -956,6 +972,11 @@ test "doc 38: while-inner link goes native" {
     try testing.expectEqualStrings(tier0.buffered(), native.buffered());
     try testing.expect(vm.trace.native_link_exits > 0);
     try testing.expect(vm.trace.native_link_follow_count > 0);
+    // The link is the exit-side one: the inner `while`'s condition exit bound a
+    // continuation at the post-loop pc, armed its adapter, and the hops fused
+    // into the native run instead of returning to the runtime.
+    try testing.expect(vm.trace.exit_side_arms > 0);
+    try testing.expect(vm.trace.exit_side_fused > 0);
 }
 
 test "doc 38: always-zero-trip while stays sound (no while root, outer traces over it)" {
@@ -994,14 +1015,13 @@ test "doc 38: always-zero-trip while stays sound (no while root, outer traces ov
     try testing.expect(loop_traces >= 1);
 }
 
-test "doc 38: repeat-until is excluded from while linking (backward jmp_if_false)" {
-    // `repeat` closes its loop with a backward `jmp_if_false`, never a bare
-    // `jmp`, so `recWhileLink` and the while-done classifier both stay inert:
-    // no `.link` trace may close INTO the repeat loop. Output parity still
-    // holds — the historical unroll owns it. (Doc 56 Phase 3: exit-side
-    // children at the post-`repeat` pc DO commit, closing `.link` into the
-    // enclosing `for` at its back-edge — that is the new path, not a while
-    // link.)
+test "doc 58: a repeat loop anchors at its marker's header and keeps cross-tier parity" {
+    // `repeat` is shaped like every other loop now: its `loop` marker opens the
+    // loop, the closer's backward `jmp_if_false` targets the MARKER, and the
+    // anchor is `marker + 1` (the body start). Any `.link` whose target is a
+    // loop header must therefore name a header whose marker exists — the old
+    // doc 38 rule ("no link may close into a repeat loop", because its closer
+    // was a `jmp_if_false` that `recWhileLink` ignored) is gone.
     const gpa = testing.allocator;
     const source =
         \\local s = 0
@@ -1025,33 +1045,69 @@ test "doc 38: repeat-until is excluded from while linking (backward jmp_if_false
     defer chunk.deinit();
     try testing.expectEqualStrings(tier0.buffered(), jit.buffered());
 
+    // The `repeat` loop's marker exists, is of kind `repeat`, and its closer
+    // targets it — so its header is `marker + 1`.
+    const bc = @import("bytecode.zig");
+    const code = chunk.proto.code;
+    var markers: usize = 0;
+    var repeat_header: u32 = 0;
+    for (code, 0..) |ins, pc| {
+        if (ins.op != .loop) continue;
+        if (@as(bc.LoopKind, @enumFromInt(ins.b)) != .repeat_loop) continue;
+        markers += 1;
+        repeat_header = @intCast(pc + 1);
+        try testing.expectEqual(@as(?u32, @intCast(pc + 1)), bc.loopHeaderOf(ins, pc));
+        // The closer sits at `E − 1` and jumps back to the marker.
+        const closer_pc = bc.loopMarkerExit(ins, pc) - 1;
+        try testing.expectEqual(bc.OpCode.jmp_if_false, code[closer_pc].op);
+        const t: i64 = @as(i64, @intCast(closer_pc)) + 1 + code[closer_pc].aux;
+        try testing.expectEqual(@as(i64, @intCast(pc)), t);
+    }
+    try testing.expectEqual(@as(usize, 1), markers);
+
+    // The repeat loop is a real trace root, and something links INTO it (the
+    // outer body's ramp): a `.link` naming the repeat header resolves to the
+    // repeat's own marker as its back-edge. B2 review should-fix: this used to
+    // skip every link whose target had no extent, so it passed with no link
+    // into the repeat at all.
+    try testing.expect(vm.trace.findLoopTrace(chunk.proto, repeat_header) != null);
+    var links_into_repeat: usize = 0;
     for (vm.trace.registry.cache.items) |t| {
         const last = t.code.instrs[t.code.instrs.len - 1];
         if (last.op != .link) continue;
-        // The repeat loop's header: the target of its backward jmp_if_false.
-        const code = t.code.anchor.proto.code;
-        for (code, 0..) |ins, pc| {
-            if (ins.op != .jmp_if_false) continue;
-            const target: i64 = @as(i64, @intCast(pc)) + 1 + ins.aux;
-            if (target > @as(i64, @intCast(pc))) continue;
-            try testing.expect(last.aux != target);
-        }
+        const target: u32 = @intCast(last.aux);
+        if (t.code.anchor.proto != chunk.proto or target != repeat_header) continue;
+        const ext = bc.loopExtentFor(chunk.proto, target) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(bc.OpCode.loop, ext.back_edge_op);
+        try testing.expectEqual(repeat_header - 1, ext.back_edge_pc);
+        links_into_repeat += 1;
     }
+    try testing.expect(links_into_repeat >= 1);
 }
 
-test "doc 38: low-trip while anchor earns a .low_trip_while yield gate" {
-    // Trips cycle 0/1/2 (avg 1.0 < while_yield_min_avg=3). Every dispatch
-    // entry at the while anchor is a COMPLETION — never a strike, often
-    // zero-trip — so neither the legacy penalty machine nor the region
-    // machine can see that the per-entry runtime turnstile outweighs 0–2
-    // interpreted iterations. Only the yield-gate probe can, and it must
-    // install a `.low_trip_while` dispatch gate that the clear-on-productive
-    // paths do not remove.
+test "doc 58: a low-trip while root's own condition is an ordinary exit that exit-side binds" {
+    // Trips cycle 1/2/3. Doc 38 met this shape with a `.low_trip_while` yield
+    // gate, because every entry was a zero-or-few-trip COMPLETION whose exit
+    // paid a runtime round-trip that cost more than tier-0. Doc 58 removes the
+    // premise instead of gating it: the loop is entered at its BODY, so a
+    // zero-trip instance never reaches the trace at all, and the condition
+    // guard now sits at the END of the trace as an ORDINARY exit whose resume pc
+    // is the post-loop pc. Exit-side serves it: the exit is counted as taken,
+    // goes hot, records the post-loop continuation and binds it. B2 review
+    // blocker 2: the dispatcher used to drop it before `noteTakenExit`, so the
+    // classification held while nothing was ever wanted — this test now
+    // demands the binding itself, on the tier-1a and the native direct route.
+    //
+    // No zero trips: a continuation recorded on a ZERO-trip outer iteration
+    // re-reaches its own (non-header) anchor through the outer `for` and
+    // `maybeCloseAtAnchor` closes it `.loop`, which exit-side cannot bind
+    // (it gives up). LuaJIT keeps recording there and links at the next
+    // compiled loop op — that is doc 56 G6 (TODO.md), not this test.
     const gpa = testing.allocator;
     const source =
         \\local s = 0
         \\for i = 1, 600 do
-        \\  local j = i % 3
+        \\  local j = i % 3 + 1
         \\  local k = 0
         \\  while k < j do k = k + 1 end
         \\  s = s + k
@@ -1061,33 +1117,119 @@ test "doc 38: low-trip while anchor earns a .low_trip_while yield gate" {
     var tier0_buf: [64]u8 = undefined;
     var tier0 = io.Writer.fixed(&tier0_buf);
     try runCaptured(gpa, source, &tier0, false, .off);
-    try testing.expectEqualStrings("600\n", tier0.buffered());
+    try testing.expectEqualStrings("1200\n", tier0.buffered());
 
-    var vm = try Vm.init(gpa);
-    defer vm.deinit();
-    vm.trace.config.while_yield_window = 8; // probe fast in a short test
-    vm.trace.config.unroll_fail_flip = 0; // decomposition mode: the yield gate
-    // only matters post-flip (with the default policy this bounded 0/1/2-trip
-    // while is simply unrolled into the outer root and never dispatches)
-    var jit_buf: [64]u8 = undefined;
-    var jit = io.Writer.fixed(&jit_buf);
-    var chunk = try runExecForTrace(&vm, gpa, source, &jit);
-    defer chunk.deinit();
-    try testing.expectEqualStrings(tier0.buffered(), jit.buffered());
+    inline for (.{ false, true }) |native| {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        // Decomposition mode: with the default policy this bounded 0/1/2-trip
+        // `while` is simply unrolled into the outer root and never dispatches.
+        vm.trace.config.unroll_fail_flip = 0;
+        vm.trace.config.exit_side_native = native;
+        var jit_buf: [64]u8 = undefined;
+        var jit = io.Writer.fixed(&jit_buf);
+        var chunk = if (native)
+            try runNativeForTrace(&vm, gpa, source, &jit)
+        else
+            try runExecForTrace(&vm, gpa, source, &jit);
+        defer chunk.deinit();
+        try testing.expectEqualStrings(tier0.buffered(), jit.buffered());
+        try checkWhileOwnTestBound(&vm);
+    }
+}
 
-    // The while root committed (the gate must have gated a REAL dispatching
-    // anchor, not an anchor that never traced) …
-    var loop_traces: usize = 0;
+fn checkWhileOwnTestBound(vm: *Vm) !void {
+    // The `while` root committed …
+    const bc = @import("bytecode.zig");
+    const exit_attach = @import("trace_exit_attach.zig");
+    var checked: usize = 0;
     for (vm.trace.registry.cache.items) |t| {
-        if (t.code.instrs[t.code.instrs.len - 1].op == .loop) loop_traces += 1;
+        if (t.code.instrs[t.code.instrs.len - 1].op != .loop) continue;
+        if (!bc.isWhileHeader(t.code.anchor.proto, t.code.anchor.pc)) continue;
+        // … its own condition guard is the LAST guard of the trace (the body
+        // ran first) …
+        var own: ?usize = null;
+        for (t.code.instrs, 0..) |_, i| {
+            if (t.code.isOwnLoopTest(i)) own = i;
+        }
+        const idx = own orelse continue;
+        checked += 1;
+        // … it is NOT a numeric loop-done (no final-iteration flush is owed) …
+        try testing.expect(!t.code.isNumericForLoopDoneGuard(idx));
+        // … a source-branch consumer refuses it (no prime-side want, no
+        // same-anchor sibling chase on a finished loop) …
+        try testing.expect(!vm.trace.isSourceBranchGuardExit(t, @intCast(idx), t.code.anchor.proto));
+        // … it resumes AFTER the loop and is attachable, which is what
+        // exit-side needs …
+        const post = bc.loopMarkerExit(
+            t.code.anchor.proto.code[t.code.anchor.pc - 1],
+            t.code.anchor.pc - 1,
+        );
+        switch (exit_attach.resumeOf(&t.code, idx)) {
+            .pc => |p| try testing.expectEqual(@as(u32, @intCast(post)), p),
+            .refused => return error.TestUnexpectedResult,
+        }
+        try testing.expect(t.code.exitAttachable(idx));
+        // … and exit-side actually served it: counted, wanted, recorded and
+        // bound a continuation at the post-loop pc.
+        try testing.expect(idx < t.exit_side.len);
+        try testing.expectEqual(exit_attach.ExitSide.attached, t.exit_side[idx]);
+        try testing.expect(vm.trace.countTracesAt(.{ .proto = t.code.anchor.proto, .pc = @intCast(post) }) >= 1);
     }
-    try testing.expect(loop_traces >= 1);
+    try testing.expect(checked >= 1);
+    try testing.expect(vm.trace.exit_side_binds >= 1);
+}
 
-    // … and the probe verdict gated it for low yield.
-    var yield_gates: usize = 0;
-    var it = vm.trace.gate.valueIterator();
-    while (it.next()) |g| {
-        if (g.reason == .low_trip_while) yield_gates += 1;
+test "doc 58 §4.5: a while root's zero-completion own-test exits are exempt only while exit-side serves them" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // The first 40 instances run three or more trips, which records the
+    // `while` root (a loop that never reaches its back-edge cannot record one
+    // — LLEAVE). Every later instance runs exactly ONE trip, so its entry runs
+    // the body once and fails the own test at the end with zero completions —
+    // and no productive receipt follows to clear a penalty (doc 31 D2). The
+    // trip count is branch-free arithmetic on purpose: a phase branch in the
+    // post-loop code would make the bound child deopt at its OWN exit inside
+    // the burst, which exit-side does not serve yet (doc 56 P6-Q3), and the
+    // parent exit would rightly give up. Served
+    // (native exit-side on, the default), the exit binds
+    // a post-loop child and those receipts never strike the anchor. Not
+    // served (switch off), they are the enter/exit turnstile the deleted
+    // `.low_trip_while` gate stood in front of, and the legacy machine must
+    // strike — and here gate — the anchor (B2 review: the policy was keyed on
+    // the own test unconditionally, which left it with no protection).
+    const gpa = testing.allocator;
+    const source =
+        \\local s = 0
+        \\for i = 1, 2000 do
+        \\  local j = 1 + 2 * (40 // i)
+        \\  local k = 0
+        \\  while k < j do k = k + 1 end
+        \\  s = s + k
+        \\end
+        \\print(s)
+    ;
+    inline for (.{ true, false }) |served| {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        // Decomposition mode, as above: keep the `while` its own root.
+        vm.trace.config.unroll_fail_flip = 0;
+        vm.trace.config.exit_side_native = served;
+        var jit_buf: [64]u8 = undefined;
+        var jit = io.Writer.fixed(&jit_buf);
+        var chunk = try runNativeForTrace(&vm, gpa, source, &jit);
+        defer chunk.deinit();
+        try testing.expectEqualStrings("2316\n", jit.buffered());
+
+        const header: u32 = for (chunk.proto.code, 0..) |ins, pc| {
+            if (ins.op == .loop) break @intCast(pc + 1);
+        } else return error.TestUnexpectedResult;
+        const key: @import("trace.zig").AnchorKey = .{ .proto = chunk.proto, .pc = header };
+        if (served) {
+            try testing.expect(vm.trace.exit_side_binds >= 1);
+            try testing.expect(!vm.trace.gate.contains(key));
+            try testing.expectEqual(@as(u32, 0), vm.trace.penalty.get(key) orelse 0);
+        } else {
+            try testing.expect(vm.trace.gate.contains(key));
+        }
     }
-    try testing.expect(yield_gates >= 1);
 }

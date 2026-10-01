@@ -436,11 +436,18 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     for (slots.items) |*s| {
         const loaded = s.load_ref >= 0;
         const stored = s.store_ref >= 0;
-        if (loaded and stored and t.instrs[n - 1].op == .terminal) {
-            // A one-shot root never feeds its snapshot back into its own
-            // prologue. Keep the entry home immutable, independently of the
-            // outgoing value's kind. Terminal lowering reads store_ref and
-            // boxes that value separately; failed guards leave entry regs intact.
+        const one_shot = t.instrs[n - 1].op == .terminal or t.instrs[n - 1].op == .link;
+        if (loaded and stored and one_shot) {
+            // A one-shot trace (a `.terminal` head close, or a `.link`
+            // hand-off to ANOTHER trace) never feeds its snapshot back into
+            // its own prologue. Keep the entry home immutable, independently
+            // of the outgoing value's kind: both closes flush every slot-bound
+            // φ from its `store_ref` with the STORE kind, never from the home,
+            // and failed guards leave entry regs intact. So the entry and the
+            // writeback may be of any two classes — a doc 56 exit-side child
+            // starting mid-statement routinely loads a table temp that the
+            // body then reuses for an int (doc 58 B2 flip), and doc 34's
+            // spectral `a` loads float and stores int 0.
             s.class = .invariant;
             s.kind = kinds[@intCast(s.load_ref)];
         } else if (loaded and stored) {
@@ -540,25 +547,11 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                 // `.loop` trace. A slot loaded int but stored float (or vice versa)
                 // would pass the once-hoisted prologue guard forever while the oracle
                 // re-checks every iteration and deopts — and the home's register class
-                // (GP vs XMM) would be wrong.
-                //
-                // doc 34: `.link` traces are exempt. Their phis write to `regs[]` and
-                // then control transfers to a DIFFERENT trace (the link target) with
-                // its own prologue and guards. The type of the phi writeback is
-                // re-checked by the receiving trace's prologue, so type instability
-                // between load and store is safe — the link trace never loops back
-                // into its own body. The deopt flush re-boxes the value with whatever
-                // tag it actually has, which is correct. The slot's home class follows
-                // the LOAD type (the prologue pin). The `.link` terminal flush
-                // (below) tags the store value with its own kind, not the slot's.
+                // (GP vs XMM) would be wrong. (Doc 34's `.link` exemption is gone
+                // from here: one-shot traces never reach this branch — they are
+                // `.invariant` above, which admits any load/store pair.)
                 if (sk != lk) {
-                    if ((t.instrs[n - 1].op == .link or t.instrs[n - 1].op == .terminal) and isNumKind(lk) and isNumKind(sk)) {
-                        // Accept: the slot homes as the load class; the φ writeback
-                        // converts at the one-shot flush. Doc 44: a `.terminal`
-                        // head close shares `.link`'s exemption verbatim — it
-                        // never loops back into its own body either, and tier-0
-                        // re-checks types at the resume pc.
-                    } else if (t.peeled and isNumKind(lk) and isNumKind(sk)) {
+                    if (t.peeled and isNumKind(lk) and isNumKind(sk)) {
                         // Doc 39: a peeled trace's widened carried slot (int entry,
                         // float steady state). Accepted iff the peeled post-pass
                         // below finds the slot-bound φ's steady-φ association —
@@ -1169,10 +1162,12 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             // scratch XMM before writing its home, so there is no in-place win to
             // capture. Skip — the back-edge shuffle handles the float carry.
             if (s.kind == .float) continue;
-            // doc 34: a type-unstable carried slot (`.link` exemption) homes as the
-            // load kind, but its phi store_ref may be a different numeric kind.
-            // Coalescing a float-kind store_ref into an int-kind GP home → unreachable
-            // in the float lowering. Skip coalescing entirely for type-unstable slots.
+            // A carried slot whose store kind differs from its home's (load)
+            // kind cannot coalesce: a float-kind store_ref into an int-kind GP
+            // home is unreachable in the float lowering. Classification admits
+            // no such slot today (one-shot traces are `.invariant`; a peeled
+            // widened slot rides its steady φ, skipped above), so this is the
+            // fail-safe for any future admission.
             if (kinds[@intCast(s.store_ref)] != s.kind) continue;
             const j: usize = @intCast(s.store_ref);
             const def = t.instrs[j];

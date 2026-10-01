@@ -179,18 +179,13 @@ const ExitKey = @import("trace_types.zig").ExitKey;
 const InputSeed = @import("trace_code.zig").InputSeed;
 const GuardProvenance = @import("trace_types.zig").GuardProvenance;
 
+/// Doc 58 §4.6: a `while` loop's header is the instruction right after its
+/// `loop` marker, so the anchor is plain-`while`-shaped exactly when
+/// `code[anchor − 1]` is a marker of kind `while`. Keeps the peel's scope as
+/// it was: only `while` loops peel — `repeat` markers and `for` back-edges
+/// answer false.
 pub fn isPlainWhileAnchor(proto: *const Proto, pc: u32) bool {
-    var has_plain = false;
-    for (proto.code, 0..) |ins, j| {
-        // Doc 58: the loop header comes from the one shared definition.
-        if (bytecode.loopHeaderOf(ins, j) != pc) continue;
-        if (ins.op == .jmp) {
-            has_plain = true;
-        } else {
-            return false;
-        }
-    }
-    return has_plain;
+    return bytecode.isWhileHeader(proto, pc);
 }
 
 /// Result type of a recorded arithmetic op given its observed operands. Mirrors
@@ -1537,13 +1532,17 @@ pub const RecordingSession = struct {
             .ge => try self.recCompare(.le, true, instr, regs),
 
             // control flow.
-            // Doc 38: while-inner nested-loop linking. A backward `jmp` whose
-            // target already has a `.loop` root trace links to it (continuation/
-            // side) or aborts LINNER (root), instead of unrolling the while body.
-            // Forward jumps and jumps to unknown targets stay no-ops.
-            .jmp => try self.recWhileLink(instr, regs, proto, pc),
-            // Doc 58 B1: the loop marker is a no-op; it records nothing.
-            .loop => {},
+            // Doc 58: a `jmp` records nothing. Every jump is now straight-line
+            // control flow in the trace — the two backward ones are loop
+            // closers, and the loop's iteration is owned by its marker below
+            // (LuaJIT's `BC_JMP`, which only shrinks `maxslot`).
+            .jmp => {},
+            // Doc 58: the loop marker is where a nested `while`/`repeat` is
+            // entered, so it carries the linking decision the backward `jmp`
+            // used to (LuaJIT `rec_loop_jit` on `JLOOP` / `rec_loop_interp` on
+            // `LOOP`): link to the inner root at its header, unroll it, or
+            // abort LINNER. Otherwise it records nothing.
+            .loop => try self.recLoopLink(instr, regs, proto, pc),
             .jmp_if_false, .jmp_if_true => try self.recBranch(instr, regs, proto, pc),
             .for_loop => try self.recForLoop(instr, regs, pc),
             // Doc 30 c4: the generic-for back-edge — mirrors the CONTINUE
@@ -3296,33 +3295,27 @@ pub const RecordingSession = struct {
             const target_i: i64 = @as(i64, pc) + instr.aux; // `pc` = post-increment cursor, as in applyJump
             if (target_i >= 0 and target_i < @as(i64, @intCast(proto.code.len))) {
                 const target: u32 = @intCast(target_i);
+                // Doc 58 §4.3: the own-loop test is structural and LOCAL now —
+                // the branch sits right next to this loop's `loop` marker,
+                // whose header is our anchor. No CFG walk, and no dependence on
+                // where the condition sits.
+                //
+                // ROOT recordings abort unconditionally (LuaJIT LLEAVE): the
+                // retry lands on a condition-true pass and records the body
+                // root first.
                 if (target > pc) {
-                    // `while` shape: forward branch over the body whose last
-                    // instruction is the backward `jmp` to our anchor (the
-                    // condition start). Taking the branch leaves the loop.
-                    //
-                    // ROOT recordings abort unconditionally (LuaJIT LLEAVE):
-                    // the retry lands on a cond-true pass and records the
-                    // body root first. The cond-false GLUE sibling
-                    // (`guard_false → outer body → loop`, the figure-eight —
-                    // measured 78.5 cyc/it vs 137 for root+link on a
-                    // bounded-variance nest) is deliberately reachable only
-                    // through the SIDE-trace route: `.side` recordings skip
-                    // this check by kind, and the side want at a while-done
-                    // exit only accrues once the anchor's OBSERVED trips/entry
-                    // prove low (`whileDoneHotnessEligible`) — evidence a root
-                    // recording cannot have yet (no committed trace → no
-                    // receipts). That ordering keeps high-trip whiles
-                    // (nsieve-bit-fp) on the pure body-root + link family the
-                    // glue formation measurably degrades.
-                    if (jumped and target >= 1 and proto.code[target - 1].op == .jmp and
-                        @as(i64, target) + proto.code[target - 1].aux == @as(i64, self.anchor.pc))
+                    // `while`: the branch is at `b`, `code[b + 1]` is the
+                    // marker, and taking the branch leaves the loop.
+                    if (jumped and pc < proto.code.len and
+                        bytecode.loopHeaderOf(proto.code[pc], pc) == self.anchor.pc)
                     {
                         return self.abort(.loop_leave);
                     }
-                } else if (instr.op == .jmp_if_false and target == self.anchor.pc and !jumped) {
-                    // `repeat`/`until` shape: backward `jmp_if_false` to our
-                    // anchor (the body start). Falling through leaves the loop.
+                } else if (instr.op == .jmp_if_false and !jumped and
+                    bytecode.loopHeaderOf(proto.code[target], target) == self.anchor.pc)
+                {
+                    // `repeat`: the backward `jmp_if_false` targets our marker,
+                    // and falling through leaves the loop.
                     return self.abort(.loop_leave);
                 }
             }
@@ -3359,25 +3352,14 @@ pub const RecordingSession = struct {
         // `jmp_if_false` jumps when the value is falsy, a `jmp_if_true` when truthy.
         // So the recorded path took the branch iff `(op == jmp_if_true) == truthy`.
         const jumped = (instr.op == .jmp_if_true) == truthy;
-        // Doc 57 P3: once an instability unroll started, this anchor's own
-        // `while` condition is recorded again mid-trip. That copy is an
-        // ordinary exit (tier-0 replays the trip), never the doc 38
-        // while-done that resumes after the loop.
-        const role: GuardRole = if (self.isOwnWhileTestCopy(instr, proto, pc)) .loop_test_copy else .branch_cond;
-        self.stampProv(gref, role, .a, if (jumped) .taken else .fallthrough);
-    }
-
-    /// Doc 57 P3: in an unrolled recording, is this branch (at post-increment
-    /// `pc`) the anchor loop's own `while` condition — a forward branch over
-    /// the body whose last instruction is the backward `jmp` to the anchor
-    /// (the same structure `TraceCode.whileLoopDonePostPc` classifies)?
-    fn isOwnWhileTestCopy(self: *const RecordingSession, instr: Instr, proto: *const Proto, pc: u32) bool {
-        if (self.unroll_used == 0 or self.inline_depth != 0 or proto != self.anchor.proto) return false;
-        const target_i: i64 = @as(i64, pc) + instr.aux;
-        if (target_i <= @as(i64, pc) or target_i >= @as(i64, @intCast(proto.code.len))) return false;
-        const target: u32 = @intCast(target_i);
-        const back = proto.code[target - 1];
-        return back.op == .jmp and @as(i64, target) + back.aux == @as(i64, self.anchor.pc);
+        // Doc 58: a `while`'s own condition guard keeps role `.branch_cond` —
+        // the role describes the guard's SHAPE, and `resumeOf` needs it for the
+        // branch fix-up that sends the exit to the post-loop pc. Which guards
+        // are a loop's own test is answered structurally instead, by
+        // `TraceCode.isOwnLoopTest`, so it needs no role and matches every
+        // unrolled copy (doc 57 P3's `.loop_test_copy` for `while` is gone with
+        // the top-of-trace classifier that needed it).
+        self.stampProv(gref, .branch_cond, .a, if (jumped) .taken else .fallthrough);
     }
 
     /// `for_loop` (numeric-for back-edge): record the increment and the
@@ -3577,7 +3559,7 @@ pub const RecordingSession = struct {
             entryGuardsMatch(self.context.inner_root_guards, regs))
         {
             self.link_target = target;
-            self.link_kind = self.linkKindAt(target, self.cur_pc -| 1);
+            self.link_kind = self.linkKindAt(self.anchor.proto, target);
             self.pending_link_provenance = .{ .link_terminal = .{
                 .path = pathFromFrames(&self.frames, self.inline_depth),
                 .inline_depth = self.inline_depth,
@@ -3904,53 +3886,61 @@ pub const RecordingSession = struct {
         self.close_requested = true;
     }
 
-    /// Doc 56 Phase 3: tag a `.link` close made at the back-edge `back_edge_pc`
-    /// of the loop whose body starts at `target`. The loop contains this
-    /// recording's anchor exactly when `target <= anchor <= back_edge_pc`
-    /// (loops nest properly), and then one run to the `.link` finishes one
-    /// iteration of it. Only called at inline depth 0, so `back_edge_pc` and
-    /// `target` are anchor-proto pcs like `anchor.pc` (a `.continuation`
-    /// anchor is a raw pc).
-    fn linkKindAt(self: *const RecordingSession, target: u32, back_edge_pc: u32) trace_ir.LinkKind {
+    /// Doc 56 Phase 3: tag a `.link` close made into the loop whose header (body
+    /// start) is `target`. The loop contains this recording's anchor exactly
+    /// when the anchor lies inside the loop's static extent (loops nest
+    /// properly), and then one run to the `.link` finishes one iteration of it.
+    ///
+    /// Doc 58 (review r2 finding 6): the extent comes from
+    /// `bytecode.loopExtentFor`, not from "header .. back-edge pc" — for the
+    /// two marker kinds the back-edge sits at the TOP of the loop, and a
+    /// `while`'s condition sits BELOW its header, so a pc-ordering test on the
+    /// header alone would misclassify both. No extent (ambiguous or malformed)
+    /// fails closed to `.inner_root`, the conservative answer: it credits no
+    /// enclosing iteration.
+    ///
+    /// Only called at inline depth 0, so `target` is an anchor-proto pc like
+    /// `anchor.pc` (a `.continuation` anchor is a raw pc).
+    fn linkKindAt(self: *const RecordingSession, proto: *const Proto, target: u32) trace_ir.LinkKind {
         std.debug.assert(self.inline_depth == 0);
         const a = self.anchor.pc;
-        return if (target <= a and a <= back_edge_pc) .enclosing_iteration else .inner_root;
+        const ext = bytecode.loopExtentFor(proto, target) orelse return .inner_root;
+        return if (ext.start <= a and a <= ext.end) .enclosing_iteration else .inner_root;
     }
 
-    /// Doc 38 — while-inner nested-loop linking. Extends the doc 15 linking
-    /// machinery to `while` loops, whose bytecode structure is
-    /// `<cmp>; jmp_if_false <past_end>; <body>; jmp <back_to_cmp>`.
+    /// Doc 58 — nested `while`/`repeat` loop linking, at the loop's `loop`
+    /// marker (LuaJIT `rec_loop_jit` on `JLOOP`, `rec_loop_interp` on `LOOP`).
+    /// This is doc 38's `recWhileLink` re-keyed: the decision now happens where
+    /// the inner loop is ENTERED — its marker, whose header is the body start —
+    /// instead of at the backward `jmp` that closed it, which is no longer a
+    /// back-edge and records nothing.
     ///
-    /// When a continuation/side recording encounters a backward `jmp` whose
-    /// target already has a `.loop` root trace (the inner while-loop root),
-    /// this function closes the recording with a `.link` terminal to that root
-    /// — exactly the numeric-for pattern from `recForPrepLink`, but simpler:
-    /// no pre-decrement arithmetic and no explicit bounds guard (the inner
-    /// root's own condition-prefix guard handles zero-trip).
+    /// When a continuation/side recording reaches an inner loop's marker and a
+    /// `.loop` root trace exists at its header, the recording closes with a
+    /// `.link` terminal to that root — the numeric-for pattern from
+    /// `recForPrepLink`, but simpler: no pre-decrement arithmetic and no
+    /// explicit bounds guard. The inner loop's condition has already been
+    /// recorded as an ordinary guard before the marker is reached, so a
+    /// zero-trip arrival never gets here at all (the guard's other direction
+    /// leaves the loop, and the recording simply continues past it — LuaJIT's
+    /// "a side trace continues across a loop that is left or not entered").
     ///
     /// Root recordings abort LINNER (matching `recForPrepLink` and LuaJIT's
-    /// `rec_loop_jit` root gate): the inner loop must spawn its own root
-    /// first.
+    /// `rec_loop_jit` root gate): the inner loop must spawn its own root first.
     ///
-    /// Forward jumps, self-anchor jumps, OOB jumps, and jumps at inline
-    /// depth > 0 are silently ignored (the `.jmp` stays a no-op and the
-    /// recording unrolls the while body as before).
-    pub fn recWhileLink(self: *RecordingSession, instr: Instr, _: RegWindow, proto: *const Proto, pc: u32) !void {
-        // Compute the jump target in signed arithmetic, matching `applyJump`.
-        // `pc` is the post-increment cursor (the instruction AFTER this `jmp`),
-        // so `pc + aux` gives the jump destination.
-        const target_i: i64 = @as(i64, pc) + instr.aux;
-        if (target_i < 0 or target_i >= @as(i64, @intCast(proto.code.len))) return; // OOB → no-op
-        const target: u32 = @intCast(target_i);
+    /// Our own anchor's marker, OOB markers, and markers at inline depth > 0
+    /// are silently ignored (the marker stays a no-op).
+    pub fn recLoopLink(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32) !void {
+        std.debug.assert(instr.op == .loop);
+        // `pc` is the post-increment cursor — the instruction after the marker,
+        // which IS the loop header (`bytecode.loopHeaderOf`).
+        if (pc >= proto.code.len) return; // marker at end-of-code → no-op
+        const target: u32 = pc;
 
-        // Only backward jumps are while-loop re-entries. Forward jumps (break,
-        // goto, if-skip) are straight-line in the trace.
-        if (target >= pc) return;
-
-        // If this jump targets our own anchor, `maybeCloseAtAnchor` (called
-        // before the mirror) or `onBackEdge` already closed the trace. This is
-        // a safety net — in practice we shouldn't reach here for our own anchor.
-        // Compare the full (proto, pc) pair, not just pc, to be future-proof.
+        // Our own loop: reaching the marker again means the iteration closed,
+        // which `maybeCloseAtAnchor` (called before the mirror) and `onBackEdge`
+        // own — the same path `for_loop` takes. Compare the full (proto, pc)
+        // pair, not just pc, to be future-proof.
         if (self.anchor.proto == proto and target == self.anchor.pc) return;
 
         // Links at inline depth > 0 can't work: `driveChain` resolves
@@ -3962,9 +3952,12 @@ pub const RecordingSession = struct {
         // has a root yet (LuaJIT `rec_loop_interp`: entering an inner loop in a
         // root aborts so the inner loop traces FIRST; making it conditional on
         // an existing inner root made the outcome a recording race). The
-        // continuation machinery then owns the nest: the inner root's loop-done
-        // exits arm a continuation at the post-loop pc (`maybeArmContinuation`,
-        // doc 38), which records the outer body and links back here. Unrolling
+        // continuation machinery then owns the nest: doc 38's `while` leg of
+        // `maybeArmContinuation` is GONE (doc 58 B2 — a `while`/`repeat`
+        // condition is now an ordinary exit, and only `for_loop` arms a
+        // continuation), so for those two shapes the nest re-forms through doc
+        // 56's exit-side route at the post-loop pc, which records the outer body
+        // and links back here. A numeric `for` still arms. Unrolling
         // instead would commit a trip-count-pinned trace that thrashes on trip
         // variance AND clogs the anchor's trace population.
         //
@@ -3996,11 +3989,21 @@ pub const RecordingSession = struct {
         // Doc 45 D6 (P2): no `.link` close on a PRECISE candidate (see
         // `recForPrepLink` — same refusal, same rationale).
         if (self.precise) return self.abort(.nyi_opcode);
+        // The root's entry contract, exactly as `recForLoop`'s link close
+        // checks it (doc 58 B2 review should-fix 4): never into a PEELED root
+        // (its entry guards are its run-once iteration's types, doc 56 review
+        // finding 5), and only when the live registers already satisfy its
+        // entry guards. A link the root's prologue would refuse is a hop that
+        // fails before the body; the body-start link point makes that easy to
+        // reach (a reset int arriving at a root specialised for a later float
+        // trip). Otherwise keep recording into the loop, as with no root.
+        if (self.context.inner_root_peeled or
+            !entryGuardsMatch(self.context.inner_root_guards, regs)) return;
         // Close with a `.link` terminal to the inner while root. The φ writeback
         // in `commit()` ensures all modified slots are flushed; unmodified slots
         // remain coherent in the physical register file.
         self.link_target = target;
-        self.link_kind = self.linkKindAt(target, pc - 1);
+        self.link_kind = self.linkKindAt(proto, target);
         self.pending_link_provenance = .{ .link_terminal = .{
             .path = pathFromFrames(&self.frames, self.inline_depth),
             .inline_depth = self.inline_depth,
@@ -6294,4 +6297,49 @@ test "session failed finalization rejects recording until reset" {
     session.context.unroll_while = true;
     try session.reset(testing.allocator, .{ .proto = &proto, .pc = 0 }, 0);
     try testing.expect(!session.context.inner_root and !session.context.unroll_while);
+}
+
+test "doc 58 B2 review: a continuation links into a while root only under its entry contract" {
+    // `recLoopLink` must check the inner root's entry contract exactly as
+    // `recForLoop`'s link close does: never into a peeled root, and only when
+    // the live registers satisfy its entry guards. (It used to discard the
+    // registers and link unconditionally — a hop the root's prologue then
+    // refuses on every run.)
+    const testing = std.testing;
+    const bc = @import("bytecode.zig");
+    const marker: Instr = .{ .op = .loop, .b = @intFromEnum(bc.LoopKind.while_loop), .aux = 2 };
+    // `C: load_bool; jmp_if_false → E; loop; body (header 3); jmp → C; E: ret`.
+    const code = [_]Instr{
+        Instr.opA(.load_bool, 0),    Instr.opAx(.jmp_if_false, 0, 3), marker,
+        Instr.opAx(.load_int, 1, 0), Instr.opAx(.jmp, 0, -5),          Instr.op0(.ret),
+    };
+    const proto = Proto{ .code = &code, .id = 1, .name = "while", .num_registers = 2 };
+    const header: u32 = 3;
+    // The root wants slot 1 float (it recorded a later, floated trip).
+    const guards = [_]trace_code.EntryGuard{.{ .slot = 1, .ty = .float }};
+
+    var tags = [_]u8{ 0, 0 };
+    var payloads = [_]u64{ 0, 0 };
+    const regs = RegWindow.of(&tags, &payloads);
+
+    const Case = struct { slot1: Value, peeled: bool, links: bool };
+    const cases = [_]Case{
+        .{ .slot1 = Value.int(8), .peeled = false, .links = false }, // reset int
+        .{ .slot1 = Value.float(0.5), .peeled = false, .links = true }, // compatible
+        .{ .slot1 = Value.float(0.5), .peeled = true, .links = false }, // peeled root
+    };
+    for (cases) |cs| {
+        var session: RecordingSession = .{};
+        defer session.deinit(testing.allocator);
+        // A continuation anchored past the loop (the post-loop pc).
+        try session.reset(testing.allocator, .{ .proto = &proto, .pc = 5 }, 2);
+        session.kind = .continuation;
+        session.context.inner_root = true;
+        session.context.inner_root_guards = &guards;
+        session.context.inner_root_peeled = cs.peeled;
+        regs.set(1, cs.slot1);
+        try session.recLoopLink(marker, regs, &proto, header);
+        try testing.expectEqual(cs.links, session.close_requested);
+        try testing.expectEqual(if (cs.links) @as(?u32, header) else null, session.link_target);
+    }
 }

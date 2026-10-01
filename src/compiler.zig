@@ -32,6 +32,7 @@ const value = @import("value.zig");
 const gc = @import("gc.zig");
 const diag = @import("diag.zig");
 const bc_liveness = @import("bc_liveness.zig");
+const bc_dom = @import("bc_dom.zig");
 
 const Instr = bytecode.Instr;
 const OpCode = bytecode.OpCode;
@@ -130,6 +131,8 @@ pub fn compileWithOptions(
     // don't warn.
     if (!diags.hasErrors()) try c.warnUnknownGlobals();
 
+    // Doc 58 §4.2: the two loop closers are the only backward jumps.
+    bytecode.assertLoopClosersWellFormed(c.code.items);
     const proto = try c.arena.create(Proto);
     proto.* = .{
         .code = c.code.items,
@@ -141,6 +144,8 @@ pub fn compileWithOptions(
         .is_vararg = c.is_vararg,
         // Doc 56 §4.2: per-pc register liveness, from the finished code.
         .reg_live = try bc_liveness.compute(c.arena, c.scratch, c.code.items, c.max_reg, c.protos.items),
+        // Doc 58 §4.8: the CFG's dominator tree, from the finished code.
+        .dom = try bc_dom.compute(c.arena, c.scratch, c.code.items),
     };
     // Assign every proto a stable, unique id (pre-order over the proto tree,
     // root = `id_base`). This is the proto's serialization identity — a trace's
@@ -885,11 +890,12 @@ const Compiler = struct {
     /// before the back-edge — each iteration gets fresh captured cells.
     fn compileRepeat(self: *Compiler, r: anytype) Error!void {
         const base = self.next_reg;
-        // Doc 58: the loop marker (LuaJIT `BC_LOOP`) opens the loop. B1: the
-        // closer still targets the body (`marker + 1`), so the back-edge
-        // target — and every anchor — is unchanged.
+        // Doc 58: the loop marker (LuaJIT `BC_LOOP`) opens the loop, and the
+        // closer targets IT, not the body — so the marker runs once per
+        // iteration and is the loop's only back-edge (LuaJIT `parse_repeat`).
+        // The anchor is the marker's target, `marker + 1`, the body start.
         const marker = try self.emit(.{ .op = .loop, .b = @intFromEnum(bytecode.LoopKind.repeat_loop) });
-        const loop_top = self.code.items.len;
+        const loop_top = marker;
 
         const cr = try self.alloc1(); // condition slot, reserved across the body
 
@@ -1217,6 +1223,8 @@ const Compiler = struct {
         // Implicit `return` (no values) if control reaches the end.
         _ = try child.emit(Instr.opAB(.ret, 0, 0));
 
+        // Doc 58 §4.2: the two loop closers are the only backward jumps.
+        bytecode.assertLoopClosersWellFormed(child.code.items);
         const proto = try self.arena.create(Proto);
         proto.* = .{
             .code = child.code.items,
@@ -1230,6 +1238,8 @@ const Compiler = struct {
             .name = name,
             // Doc 56 §4.2: per-pc register liveness, from the finished code.
             .reg_live = try bc_liveness.compute(self.arena, self.scratch, child.code.items, child.max_reg, child.protos.items),
+            // Doc 58 §4.8: the CFG's dominator tree, from the finished code.
+            .dom = try bc_dom.compute(self.arena, self.scratch, child.code.items),
         };
 
         if (self.protos.items.len > std.math.maxInt(u16)) return self.fail(body.span, "too many nested functions");
@@ -1731,14 +1741,18 @@ test "doc 58: a while loop emits a loop marker right after its condition branch"
         if (@as(i64, @intCast(pc)) + 1 + ins.aux == @as(i64, @intCast(e))) saw_break = true;
     }
     try testing.expect(saw_break);
-    // B1: the marker is not a back-edge; the backward `jmp` is, with its
-    // header at the condition, and the loop's extent is header..jmp.
-    try testing.expectEqual(@as(?u32, null), bytecode.loopHeaderOf(code[m], m));
-    try testing.expectEqual(@as(?u32, @intCast(back)), bytecode.loopHeaderOf(code[e - 1], e - 1));
-    const ext = bytecode.loopExtentFor(r.chunk.proto, @intCast(back)).?;
+    // B2: the MARKER is the back-edge, and its header is the body start
+    // (`m + 1`); the backward `jmp` is only the loop's physical closer.
+    try testing.expectEqual(@as(?u32, @intCast(m + 1)), bytecode.loopHeaderOf(code[m], m));
+    try testing.expectEqual(@as(?u32, null), bytecode.loopHeaderOf(code[e - 1], e - 1));
+    try testing.expect(bytecode.isWhileHeader(r.chunk.proto, @intCast(m + 1)));
+    // The extent runs from the condition `C` (below the header) to `E − 1`, so
+    // a member inside the condition is still inside the loop.
+    const ext = bytecode.loopExtentFor(r.chunk.proto, @intCast(m + 1)).?;
     try testing.expectEqual(@as(u32, @intCast(back)), ext.start);
     try testing.expectEqual(@as(u32, @intCast(e - 1)), ext.end);
-    try testing.expectEqual(OpCode.jmp, ext.back_edge_op);
+    try testing.expectEqual(OpCode.loop, ext.back_edge_op);
+    try testing.expectEqual(@as(u32, @intCast(m)), ext.back_edge_pc);
 }
 
 test "doc 58: a repeat loop emits a loop marker at its top" {
@@ -1754,11 +1768,20 @@ test "doc 58: a repeat loop emits a loop marker at its top" {
     const code = r.chunk.proto.code;
     const m = try onlyLoopMarker(code);
     try testing.expectEqual(@as(u16, @intFromEnum(bytecode.LoopKind.repeat_loop)), code[m].b);
-    // The closer is the instruction right before the exit. B1: it still
-    // targets the body (`m + 1`), not the marker.
+    // The closer is the instruction right before the exit. B2: it targets the
+    // MARKER (LuaJIT `parse_repeat`), and the marker is the back-edge whose
+    // header is the body start.
     const e = bytecode.loopMarkerExit(code[m], m);
     try testing.expectEqual(OpCode.jmp_if_false, code[e - 1].op);
-    try testing.expectEqual(@as(?u32, @intCast(m + 1)), bytecode.loopHeaderOf(code[e - 1], e - 1));
+    try testing.expectEqual(@as(i64, @intCast(m)), @as(i64, @intCast(e)) + code[e - 1].aux);
+    try testing.expectEqual(@as(?u32, null), bytecode.loopHeaderOf(code[e - 1], e - 1));
+    try testing.expectEqual(@as(?u32, @intCast(m + 1)), bytecode.loopHeaderOf(code[m], m));
+    // A `repeat` is not a `while` header (the peel's scope is unchanged).
+    try testing.expect(!bytecode.isWhileHeader(r.chunk.proto, @intCast(m + 1)));
+    // Its extent opens at the marker and ends at the closer.
+    const ext = bytecode.loopExtentFor(r.chunk.proto, @intCast(m + 1)).?;
+    try testing.expectEqual(@as(u32, @intCast(m)), ext.start);
+    try testing.expectEqual(@as(u32, @intCast(e - 1)), ext.end);
 }
 
 test "repeat/until runs the body before testing and loops while false" {

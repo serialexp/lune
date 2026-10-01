@@ -90,10 +90,14 @@ pub const EntryRegistry = struct {
         return gop.value_ptr.*;
     }
 
+    /// Doc 58 §4.2: only the three loop back-edges are patchable
+    /// (`LOOP → JLOOP`, `ITERL → JITERL`, `FORL → JFORL` in LuaJIT). The loop
+    /// closers (`while`'s backward `jmp`, `repeat`'s backward `jmp_if_false`)
+    /// are never patched — they are not back-edges.
     pub fn patchedEntryOp(op: OpCode) ?OpCode {
         return switch (op) {
             .for_loop => .jfor_loop,
-            .jmp, .jmp_if_false, .tfor_loop => .jloop,
+            .loop, .tfor_loop => .jloop,
             else => null,
         };
     }

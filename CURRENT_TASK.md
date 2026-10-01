@@ -1,3 +1,27 @@
+IN PROGRESS (2026-10-01) — B2 + fix-all + `exit_side_native` default flip are
+COMMITTED (Bart: "commit now, then work on the fix"). Known regression it
+carries: nsieve / nsieve-bit / sieve_int ~3× (pre-existing switch-on cost,
+doc 56 G6 + silent promotion). NOW: fixing that (G6-Q1 widening + `loopunroll`
+bound + nsieve silent-promotion diagnosis). The codex re-review owed on B2
+runs together with that fix.
+
+IN PROGRESS (2026-10-01) — Bart picked option (a): fix ALL three B2 blockers
++ every should-fix on the uncommitted tree, re-review with codex (default
+`gpt-6.1-sol`), then land B2 together with the `exit_side_native` default flip
+as one change. Progress log at "B2 FIX-ALL 2026-10-01" below.
+
+(prior state) doc 58 B2 was reviewed and the verdict was **DO NOT LAND**. It stays
+UNCOMMITTED. Bart said to try codex, so the review ran on the codex CLI
+(0.159.2, its default `gpt-6-astra`); receipt at `docs/reviews/doc58/codex-b2.md`.
+Three blockers, the first a **verified mode-equivalence violation**:
+`/tmp/codex-repro.lua` prints 76 in tier-0 / `--trace` / `--jit-native` and
+**215** under `--jit-native --jit-exit-side-native`. I reproduced it, built a
+HEAD shadow (`/tmp/b0shadow`, `nm | grep isOwnLoopTest` = 0) and confirmed HEAD
+prints 76 in both modes — **B2 introduces it**. Root cause narrowed to a
+compound (`and`) `while` condition; the loop overruns its bound by exactly one
+iteration. Full detail + the fix options needing Bart's pick at
+"B2 REVIEW OUTCOME 2026-09-30" below.
+
 # CURRENT_TASK — Campaign: every benchmark ≤1.2× LuaJIT (Bart 2026-08-20 mandate)
 
 Loop: profile → worst *general* gap (Z-6) → design → codex (gpt-5.6-sol) review →
@@ -608,10 +632,262 @@ the ones that bite):
     source evidence (coarse deopt restores the START-of-pass state) →
     r3 APPROVE WITH CHANGES, agreeing; all folded in, §8/§8b, receipts
     `docs/reviews/doc58/antigravity-r2.md`, `-r3.md`). No open
-    questions. **NEXT: B0 baseline → B1 (op exists, inert) → B2 (anchor
-    moves + delete §4.5) → B3 probes → B4 measure + flip doc 56
-    switch + re-run G6.** Also answered earlier: G6-Q1 (c), P6-Q3
-    later (doc 56 §4.8.4).
+    questions. **B0 DONE** (44badce; numbers in doc 58 §5; B0 shadow
+    build at `/tmp/lune-b0`, probes `/tmp/lowtrip.lua`,
+    `/tmp/hightrip.lua`, `/tmp/bitrev.lua`, timing script `/tmp/b0.sh`,
+    IR-inertness script `/tmp/irdiff.sh`). **B1 DONE** (55137e0: `loop`
+    op emitted, inert, IR identical on 28 benches; `loopHeaderOf` /
+    `loopExtentFor` helpers).
+    **B2 IMPLEMENTED 2026-09-30 — UNCOMMITTED, review pending (see
+    BLOCKED below).** The anchor moved: `opLoop` is the back-edge, no
+    jump is one, `opJLoop` takes on a `took` flag, the patch site is the
+    marker, the recorder links at `.loop` (`recLoopLink`), LLEAVE is
+    local, and all of §4.5 is deleted except one deliberate deviation
+    (the `trace_regionops` zero-completion exemption is RE-KEYED to
+    `isOwnLoopTestIndex`, not deleted — §4.5's premise is false for its
+    numeric-`for` half; flagged for review). New: `isOwnLoopTest` (one
+    structural classifier for all three loop shapes),
+    `loopExtentFor` returning real per-kind extents, `isWhileHeader`,
+    `assertLoopClosersWellFormed`. Full as-built + numbers: doc 58 §5
+    "B2 done" / "B2 measured".
+    - Gates: `just test` 0; `-Djit-debug=true` 0 (empty log). Parity
+      sweep 28 benches × 4 modes identical (`/tmp/sweep.sh`,
+      `/tmp/rs_b2`), plus `while`/`repeat`/nest probes.
+    - 20 tests pinned the old shape and were rewritten (compiler,
+      entry-patch, exit-attach fixture, doc 57 P3 counts, doc 39/40 peel
+      matrix, doc 38/56 nest). Peel thresholds moved `hotloop` 4 → 5 in
+      five tests: the marker counts on trip 1, so every trip-aligned
+      threshold shifts by exactly one (§4.6 predicted this).
+    - **The win:** bit-reverse 0.2% / 36.8% → **83.4% / 75.7%** of
+      iterations traced (switch on). Doc 56 Phase 0's "barely traced"
+      baseline test is now a majority-traced gate.
+    - **The costs, all in doc 58 §5:** switch OFF regresses `while`-heavy
+      code as §4.4 predicted (lowtrip +115%, fft +75%; fft's replay walks
+      21k → 98k) because the exit is a coarse deopt arming no
+      continuation — B4's flip is what ends it. Switch ON wins big on
+      low-trip shapes (lowtrip −69%, hightrip −89%) but fft is 336 ms vs
+      B0's 215 and §6's 131 target, because these exit-side cycles report
+      `silent_promotions = 0`. Tier-0 marker cost +5.3%/+4.6% on the two
+      synthetic `while` probes vs §4.2's 2% budget (real benches +2.1%,
+      +1.8%, −2.3%).
+    - **B4 diagnosis done 2026-09-30 (Z-8 ladder, fft 100 iters,
+      ReleaseFast + `-Djit-debug=true`, switch ON).** Log `/tmp/fft.dbg`.
+      Two independent findings; `silent_promotions = 0` is the second one,
+      and it is NOT owner election.
+      1. **The seam is the whole run, not codegen.** `--jit-stats`:
+         traced 93.9% of iterations / 95.4% of cycles, but of that
+         **native execution is 8.2% and the steering seam is 87.2%**
+         (2.286 G of 2.500 G cycles) — `replayLedger: 66032 walks,
+         ~34624 cyc/walk`. 66,029 dispatcher bursts; burst-len 32
+         (= `LEDGER_CAP`) hit 23,983 times. Coverage confirmed at the
+         anchors: `fft_bitreverse:9` 83.6%, `fft_bitreverse:60` 77.0%.
+         So B2 bought the coverage and the seam ate it.
+      2. **70% of bursts are `prologue_fail`.** Terminals:
+         `t=2 ei=-1 prologue_fail 26,989` + `t=3 ei=-1 prologue_fail
+         19,195` = 46,184 of 66,029 bursts. `t=2` is `fft_bitreverse:60`
+         and `t=3` is `fft_bitreverse:69` — the pair joined by the one
+         `region_bridge` arm. Dispatch keeps entering these two and the
+         entry guard rejects before the body runs. This is pure wasted
+         dispatch and is the largest single line item; it is NOT in doc
+         58 §5's story and needs its own diagnosis.
+      3. **Why `silent_promotions = 0` — rules out owner election.**
+         `silent: candidates=0` with **every** `silent rejects:` counter
+         at 0, so `considerSilentPromotion` returns *before* the
+         candidate counter, not at a reject. Owner election is fine: 6
+         regions minted, **4 `armable=true`**, 2 false. The smell is
+         `region maps: profit count=0` against **203 `region: close`**
+         for 6 mints — the region closes faster than it can freeze, so
+         no *frozen* accumulator is ever live when a full-cap yielded
+         ledger arrives, and the bail is one of the
+         `regionContext` / `activeRegionFor` / `region_profit.get` /
+         `!accum.frozen` quartet (`trace_link.zig:1524-1537`). Arming is
+         NOT the blocker (Z-8 step 1): `t=10 ei=8 deopt outcome=yielded
+         17,599` proves that slot is armed.
+      - Next on this: instrument which of the four gates bails (a
+        permanent `self.dbg` probe, not scaffolding), and separately
+        diagnose the 46k `prologue_fail`s.
+    **B2 REVIEW OUTCOME 2026-09-30 — codex says DO NOT LAND. Verified.**
+    Receipt `docs/reviews/doc58/codex-b2.md` (codex CLI 0.159.2, default
+    `gpt-6-astra`, read-only). The `codex` on `PATH` is fixed as of
+    2026-10-01 (`~/.local/bin/codex`, 0.159.0), and its configured default
+    is now `gpt-6.1-sol` per Bart — use plain `codex`, no model pin.
+    - **BLOCKER 1 — mode-equivalence violation. Reproduced and bisected.**
+      `/tmp/codex-repro.lua` → 76 / 76 / 76 / **215**. HEAD shadow
+      `/tmp/b0shadow` (src restored via `git show HEAD:<f>`, verified with
+      `nm | grep -c isOwnLoopTest` = 0) prints 76 under exit-side too, so
+      **B2 introduces it**. Minimal repro `/tmp/repro40.lua` (1202 vs
+      1225); per-iteration bisect `/tmp/trace40b.lua` logs
+      `i*1000000 + s` into a table (printing INSIDE the loop perturbs
+      recording and hides the bug). **The loop overruns its bound by
+      exactly one iteration**, on outer iterations r=34/37/39 and only
+      after the exit-side child arms (first divergence r=34).
+      Ingredients, each necessary: a **compound `and`** condition
+      (dropping `and true` fixes it), a **varying trip count**
+      (`r % 9 + 3`), and a **loop-carried boolean** (`b = not b`). The
+      same `and` in an `if`, or bound to a real local, does NOT diverge
+      (`/tmp/andif.lua`, `/tmp/andif2.lua` — both modes agree on B2 AND
+      HEAD).
+      - **Coverage gap closed:** the shape is now
+        `bench/while_shortcircuit_probe.lua` (NEW, in-tree), so the 4-mode
+        parity sweep carries it. LuaJIT prints 76 too, so 215 is simply
+        wrong. **The sweep is consequently RED with B2 applied** — correct
+        and expected. Keep the probe after the fix; its absence is exactly
+        why 28 benches × 4 modes came back clean.
+      - Shape, from `compileWhile` + `compileBinary(.and_)`: pc 14
+        `jmp_if_false cr → 16` (the `and`'s short-circuit), pc 15 `loadk
+        true → cr`, pc 16 `jmp_if_false cr → post` (the while's own
+        test), pc 17 `loop` marker, pc 18 body = anchor. Trace 0
+        (`main:18`) is the body unrolled 2×; exits 21 and 27 are the two
+        copies of the lhs test, both `resume=16`. The exit-side child
+        trace 1 is recorded AT pc=16 and opens `slot_load r7;
+        guard_is_false %0` — r7 IS `cr`, so the child expects `cr` falsy.
+      - **Ruled out:** mahina's `and` lowering is NOT the LuaJIT-`ISTC`
+        hazard I first suspected. `compileBinary(.and_)` writes `dest`
+        BEFORE the short-circuit jump, so `cr` is defined on both edges —
+        semantically equivalent to `ISTC`/`ISFC` (`lj_parse.c:731`,
+        copy-and-test). Tier-0 bytecode is correct; the fault is on the
+        trace/adapter side. Also ruled out: `resumeOf`'s branch fix-up
+        arithmetic itself — `14+1+aux = 16` is the right not-taken
+        successor, matching `rec_comp_fixup` (`lj_record.c:2205`).
+      - **Still to isolate:** which of (a) trace 0's exit-21 snapshot
+        failing to carry slot 7 ← `%020`, or (b) the native exit adapter's
+        state transfer into the child, leaves `cr` truthy. Trace 1's own
+        exit 24 DOES carry `slot 7 ← ref 23`, which is the shape exit 21
+        needs — so compare them. Trace 0's `exit-snap:` block is NOT in
+        the log (only trace=1's is) — find out why and get it, that is
+        the next concrete step.
+    - **BLOCKER 2 (codex, not yet verified by me):** `interp.zig` ~4434
+      `count_exit = exit_ok and !any_loop_done` means direct
+      `while`/`repeat` completion exits never reach `noteTakenExit`, so
+      they can never warm the exit-side path that is supposed to replace
+      the deleted doc-38 machinery — while `trace_link.zig` ~378
+      deliberately routes hot exits to exit-side BEFORE its own-loop-test
+      early return. codex saw 40 native entries with **zero** wants /
+      records / bindings / adapters / hops.
+    - **BLOCKER 3 (codex):** deleting `.low_trip_while` removes
+      load-bearing protection while `exit_side_native` defaults false;
+      the measured +115% / +75% regressions are that. Land the migration
+      WITH an effective replacement and its default, not before.
+    - **codex also corrected two of my claims**, and it is right on both:
+      (a) `isOwnLoopTest` is NOT "refusal-only" — through the dispatcher
+      it changes receipt `region_work` to 1 (`interp.zig` ~4459), and it
+      reaches ledger-replay validation (`trace_chain.zig` ~2226) which
+      can panic on inconsistent rows; (b) the §4.5 exemption should be
+      SPLIT (numeric final-test exemption vs a new, explicit marker-loop
+      zero-completion policy) rather than re-keyed, because matching
+      every unrolled copy is a new policy decision, not preservation.
+      Also: the `isOwnLoopTestIndex` imports in `trace_chain.zig` and
+      `trace_link.zig` are unused; the `interp.zig` panic is pre-existing
+      in HEAD, not mine; 6 should-fix items on `loopExtentFor` failing
+      closed and on tests that no longer establish their advertised
+      behaviour (notably `interp_native_test.zig:1727`, whose
+      zero-completion case now exits during run-once — use bound 7 — and
+      `interp_tier1a_test.zig:1132`, which accepts every refusal but
+      `loop_done`). Full list in the receipt.
+    - **B2 FIX-ALL 2026-10-01 (Bart picked (a)) — progress log.**
+      - **Blocker 1 FIXED.** Root cause was NOT in B2's code: doc 17's
+        composite bridge (`TraceCode.classifyBridgeCandidate` /
+        `bridgeEmissions`) commits every slot-bound φ whose update REF is
+        defined before the guard, taking that as "the slot was written before
+        the guard". `konst` interning/CSE break it: in the probe the unrolled
+        root's 2nd-copy guard (exit 27) has `phi r7 ← %3 = konst true` while
+        the `loadk true → cr` happens AFTER the guard, so the armed
+        `region_bridge` (exit 27 → pc-16 child) committed `cr = true` and the
+        child's `guard_is_false r7` deopted at pc 16 → one extra trip. The
+        exit snapshot (snap 9: `slot 7 ← %26`) was right all along. Fix:
+        `bridgeMatchesExitSnapshot` — candidacy requires E to agree with the
+        guard's exit snapshot on every slot live at the bridge's LANDING pc
+        (the untaken branch edge; liveness at the guard itself wrongly refused
+        nsieve, whose `if flags[i]` temp is dead past the branch); no snapshot
+        ⇒ refuse. Fixtures: `trace_testutil.snapshotBranchGuardsFromPhis`
+        (14 hand-built bridge fixtures declare a sound bridge through it); new
+        tests `§T.9c` (fingerprint, 4 refusal variants) and the e2e
+        `doc 58 B2: a composite bridge never commits a φ the exit snapshot
+        contradicts` (verified FAILING under the old rule). Gates green;
+        parity sweep 29/29 OK (probe included); bridge arms identical on all
+        28 other benches (`/tmp/bridge_pre.txt` vs `/tmp/bridge_fix1.txt`).
+        Debug gotcha: `2>file` makes the two stderr writers clobber each other
+        (positional writes) — pipe through `| cat` to read `exit-snap:`.
+      - **Blockers 2 and 3, all six should-fixes, the §4.8 owner tie-break
+        and the default flip are DONE** — full write-up in doc 58 §5 "B2
+        FIX-ALL" items 2–7 and §4.8 "As built (rev 2)". Gates green
+        (1552/1552 both suites, empty jit-debug log), parity sweep 29/29
+        in 4 modes (`/tmp/sweep.sh` and `/tmp/b0.sh` now take the
+        post-flip flags; `b0.sh <bin> <reps> old|new`).
+      - **Bart: commit now, then fix (2026-10-01). The flip regresses the sieves ~3×.**
+        Board vs a same-session HEAD board: fft 206.7 → 177.4, lowtrip
+        204 → 76, hightrip 79 → 10, but nsieve 12 → 39, nsieve-bit
+        14 → 33, sieve_int 6 → 24. Not B2: HEAD with the switch on is
+        already 39/35/24, and the new tree with the switch off is 12/14/6.
+        It is doc 56 G6 plus a silent-promotion failure (nsieve switch
+        on: seam 52.4% of the run, 30,717 ledger walks, 206k fused
+        exit-side hops that never go silent). The G6 widening experiment
+        on top of B2 (reverted) gets the sieves to 26/19/11, so it is
+        not enough on its own. Committed as-is; the fix is the next arc.
+      - Next: G6 widening + `loopunroll` bound + nsieve silent promotion;
+        then one codex review covering B2 + fixes + flip + that fix.
+    - **(superseded — Bart picked (a))** Options, no recommendation:
+      (a) fix all three blockers + the should-fixes on top of the current
+      uncommitted tree, then re-review, and land B2 together with the
+      default flip as one change (codex's 7a);
+      (b) land the *inert*, provably-safe subset now (the shared
+      `bytecode.zig` helpers + `assertLoopClosersWellFormed`, which B1
+      already half-landed) and keep the anchor move uncommitted until the
+      exit-side path is correct;
+      (c) commit the whole thing on a branch purely as a savepoint,
+      clearly marked broken, so it is not lost while it is reworked.
+      Rule #15 means I will not create a branch without your say-so, and
+      nothing gets pushed either way.
+    - **B4 diagnosis done 2026-09-30 (Z-8 ladder, fft 100 iters,
+      ReleaseFast + `-Djit-debug=true`, switch ON).** Log `/tmp/fft.dbg`.
+      Two independent findings; `silent_promotions = 0` is the second one,
+      and it is NOT owner election.
+      1. **The seam is the whole run, not codegen.** `--jit-stats`:
+         traced 93.9% of iterations / 95.4% of cycles, but of that
+         **native execution is 8.2% and the steering seam is 87.2%**
+         (2.286 G of 2.500 G cycles) — `replayLedger: 66032 walks,
+         ~34624 cyc/walk`. 66,029 dispatcher bursts; burst-len 32
+         (= `LEDGER_CAP`) hit 23,983 times. Coverage confirmed at the
+         anchors: `fft_bitreverse:9` 83.6%, `fft_bitreverse:60` 77.0%.
+         So B2 bought the coverage and the seam ate it.
+      2. **70% of bursts are `prologue_fail`.** Terminals:
+         `t=2 ei=-1 prologue_fail 26,989` + `t=3 ei=-1 prologue_fail
+         19,195` = 46,184 of 66,029 bursts. `t=2` is `fft_bitreverse:60`
+         and `t=3` is `fft_bitreverse:69` — the pair joined by the one
+         `region_bridge` arm. Dispatch keeps entering these two and the
+         entry guard rejects before the body runs. This is pure wasted
+         dispatch and is the largest single line item; it is NOT in doc
+         58 §5's story and needs its own diagnosis. **codex reached the
+         same place independently** (6,901 of 6,969 bursts prologue-fail
+         on its isolated bit-reverse probe) and names a concrete cause:
+         `recLoopLink` (`trace_recorder.zig` ~3933) **discards `regs` and
+         closes the inner-root link with no entry-contract check**,
+         unlike the numeric path's explicit `entryGuardsMatch`
+         (~3559) — moving the link point from the closer to the first
+         body entry lets a reset integer reach a root specialised for a
+         later float iteration. That is its should-fix #4 and is the
+         first thing to test.
+      3. **Why `silent_promotions = 0` — rules out owner election.**
+         `silent: candidates=0` with **every** `silent rejects:` counter
+         at 0, so `considerSilentPromotion` returns *before* the
+         candidate counter, not at a reject. Owner election is fine: 6
+         regions minted, **4 `armable=true`**, 2 false. The smell is
+         `region maps: profit count=0` against **203 `region: close`**
+         for 6 mints — the region closes faster than it can freeze, so
+         no *frozen* accumulator is ever live when a full-cap yielded
+         ledger arrives, and the bail is one of the
+         `regionContext` / `activeRegionFor` / `region_profit.get` /
+         `!accum.frozen` quartet (`trace_link.zig:1524-1537`). Arming is
+         NOT the blocker (Z-8 step 1): `t=10 ei=8 deopt outcome=yielded
+         17,599` proves that slot is armed. codex adds the sharper
+         point: **prologue failures satisfy neither promotion route's
+         evidence class** (full-cap `.yielded` at `trace_link.zig:1505`,
+         or short natural-terminal deopt at ~1724), so finding 2 is
+         upstream of finding 3 — fix the entry contract first and the
+         promotion question may answer itself.
+    - **NEXT: blocked on the pick above.** After that: B3 probes → B4
+      measure + flip doc 56's switch + re-run G6. Also answered earlier:
+      G6-Q1 (c), P6-Q3 later (doc 56 §4.8.4).
     (older) **WAITING ON BART:** doc 58 §7 G5-Q1..Q4; doc 56 §4.8.4 G6-Q1/Q2;
     P6-Q3 (b) (widen `exit_side_ok` to bursts, burst-skip numbers in
     doc 56). Nothing else in this campaign's queue is independent of

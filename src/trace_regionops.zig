@@ -51,7 +51,7 @@ const ProvenanceVerdict = trace_mod.ProvenanceVerdict;
 const ExitProvenance = trace_mod.ExitProvenance;
 const GateReason = trace_mod.GateReason;
 const freeRegionBridges = trace_mod.freeRegionBridges;
-const isAnyLoopDoneGuardIndex = trace_mod.isAnyLoopDoneGuardIndex;
+const isOwnLoopTestIndex = trace_mod.isOwnLoopTestIndex;
 const isLoopDoneGuardIndex = trace_mod.isLoopDoneGuardIndex;
 const readCycles = trace_mod.readCycles;
 const cycleDelta = trace_mod.cycleDelta;
@@ -125,15 +125,31 @@ pub inline fn accountLegacyThrash(self: *TraceState, t: *Trace, completed: usize
         if (self.gate.count() != 0) self.clearDispatchGate(key);
         return;
     }
-    // Doc 38: a zero-COMPLETION loop-done receipt (a while whose top-of-
-    // trace condition guard observed "done" before any body ran) is a
-    // completed empty loop — evidence of NEITHER productivity NOR thrash.
-    // It must not strike (task #62's completions-are-not-thrash, extended
-    // to the legacy machine) and must not clear (it did no work to earn
-    // one). Without this, fft_bitreverse's ~50% zero-trip instances
-    // alternate strike/clear forever — penalty churn on a healthy anchor.
-    if (exit_instr != std.math.maxInt(u32) and exit_instr < t.code.instrs.len and
-        isAnyLoopDoneGuardIndex(t, exit_instr)) return;
+    // A zero-COMPLETION receipt that ended at the loop's OWN test is a loop
+    // that ran to completion committing nothing — evidence of NEITHER
+    // productivity NOR thrash. It must not strike (task #62's
+    // completions-are-not-thrash, extended to the legacy machine) and must not
+    // clear (it did no work to earn one). Without this, the strike/clear pair
+    // alternates forever on a healthy anchor (measured on fft_bitreverse's
+    // ~50% zero-trip instances). Two policies, kept apart on purpose (doc 58
+    // §4.5, B2 review):
+    if (exit_instr != std.math.maxInt(u32) and exit_instr < t.code.instrs.len) {
+        // (1) A numeric `for`'s FINAL test — unchanged since task #62. Its
+        // completion is served by the loop-done machinery (the linked
+        // materialization / continuation), so it never strikes. A doc 57
+        // mid-trip copy is not a final test and still strikes, as before.
+        if (isLoopDoneGuardIndex(t, exit_instr)) return;
+        // (2) A `while`/`repeat` loop's own test, unrolled copies included (a
+        // copy failing is the same loop ending one trip earlier, resuming at
+        // the same post-loop pc). Doc 58 made this an ordinary exit that only
+        // doc 56's exit-side route serves, so it is exempt exactly while that
+        // route serves or is warming up to serve it. When it cannot — native
+        // exit-side off, the exit gave up, or it can never go wanted — the
+        // zero-completion entries are the pure enter/exit turnstile the
+        // deleted `.low_trip_while` yield gate stood in front of, and they
+        // strike like any zero-progress exit.
+        if (isMarkerLoopTest(t, exit_instr) and exitSideServes(self, t, exit_instr)) return;
+    }
     if (exitSideWaiting(self, t, exit_instr)) return;
     const gop = self.penalty.getOrPut(self.gpa, key) catch return;
     if (!gop.found_existing) gop.value_ptr.* = 0;
@@ -187,6 +203,26 @@ fn exitSideWaiting(self: *const TraceState, t: *const Trace, exit_instr: u32) bo
         .none => exit_instr < t.exit_counts.len and t.exit_counts[exit_instr] < self.config.hotexit,
         .attached, .gave_up => false,
     };
+}
+
+/// Doc 58 §4.5: does exit-side serve attachable exit `exit_instr` — bound to
+/// a child, or still on its bounded way there (`exitSideWaiting`)? False with
+/// native exit-side off, once the exit gave up, and for an exit that can
+/// never go wanted.
+fn exitSideServes(self: *const TraceState, t: *const Trace, exit_instr: u32) bool {
+    if (exitSideWaiting(self, t, exit_instr)) return true;
+    if (!self.exitSideNative() or exit_instr >= t.exit_side.len) return false;
+    return t.exit_side[exit_instr] == .attached;
+}
+
+/// Doc 58: is `exit_instr` the own test of a `while`/`repeat` loop — a marker
+/// loop, whose header has its `loop` marker right above it? (`isOwnLoopTest`
+/// answers for `for` loops too; those keep their own policy.)
+fn isMarkerLoopTest(t: *const Trace, exit_instr: u32) bool {
+    if (!isOwnLoopTestIndex(t, exit_instr)) return false;
+    const code = t.code.anchor.proto.code;
+    const h = t.code.anchor.pc;
+    return h > 0 and h < code.len and code[h - 1].op == .loop;
 }
 
 /// A-vii-c.1: the selection receipt for a ledger row whose REGION receipt was
@@ -1413,12 +1449,7 @@ pub fn clearMemberAnchorState(self: *TraceState, rid: RegionId) void {
     gates: while (true) {
         var git = self.gate.iterator();
         while (git.next()) |e| {
-            // Doc 38: `.low_trip_while` yield gates survive amnesty (see
-            // `clearDispatchGate`); skipping without removal keeps the
-            // restart-per-mutation loop finite.
-            if (e.value_ptr.reason != .low_trip_while and
-                self.regionMemberPoint(rid, e.key_ptr.proto.id, e.key_ptr.pc))
-            {
+            if (self.regionMemberPoint(rid, e.key_ptr.proto.id, e.key_ptr.pc)) {
                 _ = self.gate.remove(e.key_ptr.*);
                 continue :gates;
             }

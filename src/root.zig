@@ -43,6 +43,8 @@ pub const table = @import("table.zig");
 pub const function = @import("function.zig");
 pub const gc = @import("gc.zig");
 pub const bytecode = @import("bytecode.zig");
+/// Doc 58 §4.8: bytecode dominator tree (closed-SCC owner election).
+pub const bc_dom = @import("bc_dom.zig");
 pub const compiler = @import("compiler.zig");
 pub const interp = @import("interp.zig");
 
@@ -145,6 +147,7 @@ test {
     _ = @import("trace_finalize_test.zig");
     _ = @import("trace_snapshot.zig");
     _ = @import("bc_liveness.zig");
+    _ = bc_dom;
     _ = jitdbg;
     _ = irinterp;
     _ = x64;

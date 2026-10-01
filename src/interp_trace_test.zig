@@ -5193,6 +5193,13 @@ test "head arm formation (doc 44 D10): the walk evidence channel arms a .sibling
     // above would silently pass on a regression that never arms (the scalar
     // walk is output-equivalent, just slower). Native-only: evidence and
     // arms are both native-physical.
+    //
+    // Native exit adapters OFF: with them on (the default since doc 58 B2)
+    // the incumbent's branch exit is attachable, so doc 56's exit-side route
+    // claims it first and binds a side trace at its resume pc — the Part-S
+    // walk channel then never charges. Part S still serves every exit
+    // exit-side refuses (peeled, precise, non-attachable); this pins that
+    // channel, not the default route.
     if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
@@ -5222,6 +5229,7 @@ test "head arm formation (doc 44 D10): the walk evidence channel arms a .sibling
     vm.trace.config.hotcall = 4;
     vm.trace.config.hotexit = 3;
     vm.trace.config.hotguard = 5;
+    vm.trace.config.exit_side_native = false;
     var buf: [256]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;

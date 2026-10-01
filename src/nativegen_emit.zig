@@ -1494,10 +1494,12 @@ pub fn isNumericForLoopDoneGuard(t: *const Trace, instr_idx: usize) bool {
 /// guard provenance must identify a source-level branch condition owned by the
 /// anchor proto, and its post-fetch PC must precede this continuation's anchor.
 /// This excludes inlined-callee guards, forward branches, and numeric-for
-/// loop-done guards. The dominance-scoped set E is the slot-bound phi set whose
-/// update ref was defined before the guard; a slot-bound phi is precisely a value
-/// live at the trace successor/back-edge. Internal phis do not name VM slots and
-/// are excluded.
+/// loop-done guards. The set E is the slot-bound phi set whose update ref was
+/// defined before the guard; a slot-bound phi is precisely a value live at the
+/// trace successor/back-edge. Internal phis do not name VM slots and are
+/// excluded. A ref defined before the guard does NOT prove its slot was written
+/// before it (konst interning, CSE), so candidacy also requires E to agree with
+/// the guard's exit snapshot (`TraceCode.bridgeMatchesExitSnapshot`).
 pub fn isCompositeBridgeCandidate(t: *const Trace, instr_idx: usize) bool {
     return t.classifyBridgeCandidate(instr_idx);
 }
@@ -2509,9 +2511,11 @@ pub fn emitLinkedLoopDoneSnapshot(
 }
 
 /// Part A-v (doc 17 §A2.1): materialize the bridge's compile-time set E.
-/// Slot-bound phis are the trace successor's live VM-slot writebacks; only an
-/// update defined before `exit_instr` dominates that guard. Post-guard phis and
-/// internal optimizer phis are deliberately excluded.
+/// Slot-bound phis are the trace successor's live VM-slot writebacks, restricted
+/// to updates defined before `exit_instr`. Candidacy already proved this set
+/// equals the exit snapshot's state on every live slot, so flushing it commits
+/// exactly the guest state at the guard. Post-guard phis and internal optimizer
+/// phis are deliberately excluded.
 pub fn emitCompositeBridgeSnapshot(
     a: *x64.Assembler,
     t: *const Trace,

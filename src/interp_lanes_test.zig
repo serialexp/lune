@@ -437,6 +437,11 @@ test "A-viii (doc 17 §A8 step 8): opening the window MID-EPOCH over a live arme
     vm.trace.config.native_codegen = true;
     vm.trace.config.hotloop = 4;
     vm.trace.config.hotguard = 3;
+    // The scope boundary below was measured with native exit adapters OFF
+    // (doc 17's arm kinds); with them on (the default since doc 58 B2) the
+    // exit-side route reshapes the region and the bridge arms once. The
+    // teardown invariant itself, (2), holds either way.
+    vm.trace.config.exit_side_native = false;
 
     const native = try vm.heap.newNative(aviiiProbe, "aviii_probe");
     try vm.globals.set(gpa, try vm.heap.internValue("aviii_probe"), Value.heap(&native.header));
@@ -634,15 +639,23 @@ test "doc 20 Phase 3: while/repeat jloop patches bind and stay byte-identical ac
                 try testing.expectEqual(@as(usize, 0), vm.trace.registry.entry_registry.entry_patches.items.len);
                 return;
             }
+            // Doc 58: both loops are patched at their `loop` MARKER, so the
+            // canonical op under every live patch is `.loop`; the kind in `.b`
+            // says which loop it is.
             var saw_while = false;
             var saw_repeat = false;
             for (vm.trace.registry.entry_registry.entry_patches.items) |p| {
                 if (p.tombstone or !p.live) continue;
                 try testing.expectEqual(bytecode.OpCode.jloop, vm.trace.codeFor(p.proto)[p.patch_pc].op);
-                switch (p.orig.op) {
-                    .jmp => saw_while = true,
-                    .jmp_if_false => saw_repeat = true,
-                    else => {},
+                if (p.orig.op != .loop) continue;
+                // The marker's header is the trace's anchor.
+                try testing.expectEqual(
+                    @as(?u32, @intCast(p.patch_pc + 1)),
+                    bytecode.loopHeaderOf(p.orig, p.patch_pc),
+                );
+                switch (@as(bytecode.LoopKind, @enumFromInt(p.orig.b))) {
+                    .while_loop => saw_while = true,
+                    .repeat_loop => saw_repeat = true,
                 }
             }
             try testing.expect(saw_while);
@@ -725,12 +738,13 @@ test "doc 20 Phase 3: jloop prologue strike exhaustion unpatches same-turn" {
     try testing.expectEqualStrings("20100\n1.5\n", sink.buffered());
 
     // The int-specialized binding installed during the first call. The float
-    // second call fails its native prologue at the patched while closer; with
-    // a one-strike budget the common patched-entry tail must restore `.jmp`
-    // and tombstone the slot before the terminal condition exits the loop.
+    // second call fails its native prologue at the patched while MARKER (doc
+    // 58); with a one-strike budget the common patched-entry tail must restore
+    // `.loop` and tombstone the slot before the terminal condition exits.
     var saw_exhausted_while = false;
     for (vm.trace.registry.entry_registry.entry_patches.items) |p| {
-        if (p.orig.op != .jmp or !p.tombstone) continue;
+        if (p.orig.op != .loop or !p.tombstone) continue;
+        if (@as(bytecode.LoopKind, @enumFromInt(p.orig.b)) != .while_loop) continue;
         try testing.expect(std.meta.eql(p.orig, vm.trace.codeFor(p.proto)[p.patch_pc]));
         saw_exhausted_while = true;
     }

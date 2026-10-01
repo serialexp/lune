@@ -146,11 +146,26 @@ fn mostUnrolled(vm: *Vm) ?*const @import("trace.zig").Trace {
     return best;
 }
 
-/// Doc 57 P3: how the copies of an unrolled trace's own loop test are
-/// classified. `looped` counts the guards the loop-done classifiers take,
-/// `copies` the mid-trip copies (`isLoopTestCopy`), `branch` the copies a
-/// source-branch consumer would take (must stay 0).
-const LoopTests = struct { looped: usize = 0, copies: usize = 0, branch: usize = 0 };
+/// Doc 57 P3 / doc 58: how the copies of an unrolled trace's own loop test are
+/// classified.
+///  * `flush` — guards that owe the final-iteration flush and drive a resume
+///    (`isNumericForLoopDoneGuard`). EXACTLY ONE per unrolled trace: a mid-trip
+///    copy classified here would resume after the loop with the trip-start
+///    registers and lose the iterations before it (doc 57 P3's hazard).
+///  * `own` — guards the structural "this is my loop's test" classifier takes
+///    (`isOwnLoopTest`, doc 58). It deliberately matches EVERY copy, because a
+///    copy has the same source instruction and its consumers only ever REFUSE
+///    things for it (side-trace hotness, prime-side wants, sibling handoffs,
+///    legacy strikes) — none of them resumes anywhere, so matching a copy is
+///    conservative, not a hazard.
+///  * `copies` — mid-trip copies carrying `GuardRole.loop_test_copy`
+///    (`isLoopTestCopy`). Doc 58: only numeric `for` copies still carry the
+///    role; a `while` condition copy needs none, because the classifier that
+///    the role protected (the top-of-trace while-done) is gone.
+///  * `branch` — own-loop-test guards a source-branch consumer would take
+///    (must stay 0: no prime-side want and no sibling handoff may grow from
+///    any copy of a loop's own test).
+const LoopTests = struct { flush: usize = 0, own: usize = 0, copies: usize = 0, branch: usize = 0 };
 
 fn loopTests(vm: *Vm, t: *const @import("trace.zig").Trace, src_op: @import("bytecode.zig").OpCode) LoopTests {
     var out: LoopTests = .{};
@@ -159,10 +174,10 @@ fn loopTests(vm: *Vm, t: *const @import("trace.zig").Trace, src_op: @import("byt
         if (ins.op != .guard_true) continue;
         const sp = trace_ir.guardSourcePc(ins) orelse continue;
         if (sp >= code.len or code[sp].op != src_op) continue;
-        const done = t.code.isNumericForLoopDoneGuard(i) or t.code.whileLoopDonePostPc(i) != null;
-        if (done) out.looped += 1;
-        if (t.code.isLoopTestCopy(i)) {
-            out.copies += 1;
+        if (t.code.isNumericForLoopDoneGuard(i)) out.flush += 1;
+        if (t.code.isLoopTestCopy(i)) out.copies += 1;
+        if (t.code.isOwnLoopTest(i)) {
+            out.own += 1;
             if (vm.trace.isSourceBranchGuardExit(t, @intCast(i), t.code.anchor.proto)) out.branch += 1;
         }
     }
@@ -182,10 +197,11 @@ test "doc 57 P3: a flipped carried bool unrolls into one two-iteration trace (sh
             if (!executes(mode)) return;
             const t = mostUnrolled(vm) orelse return error.TestExpectedUnrolledTrace;
             try testing.expectEqual(@as(u8, 1), t.code.instunrolled);
-            // Two `for_loop` tests: the last is the loop-done, the first a
-            // mid-trip copy that no branch consumer takes either.
+            // Two `for_loop` tests: only the last owes the flush, the first is
+            // a mid-trip copy that no branch consumer takes. Both are the
+            // loop's own test structurally (doc 58).
             const lt = loopTests(vm, t, .for_loop);
-            try testing.expectEqual(LoopTests{ .looped = 1, .copies = 1, .branch = 0 }, lt);
+            try testing.expectEqual(LoopTests{ .flush = 1, .own = 2, .copies = 1, .branch = 0 }, lt);
             try expectNativeHolds(vm, mode, &pin_ops);
         }
     };
@@ -199,17 +215,22 @@ test "doc 57 P3: a flipped carried bool unrolls into one two-iteration trace (sh
     , "150\t151\t150\t4\t20\n", .{ .record_aborts = true, .inspect = Inspect.run });
 }
 
-test "doc 57 P3: an unrolled while keeps only its first condition as the while-done" {
-    // Iteration 2's condition sits mid-trip. Classified as the doc 38
-    // while-done it would resume after the loop with the trip-start
-    // registers and lose iteration 1 (odd counts end there).
+test "doc 57 P3: an unrolled while's mid-trip condition copies owe no resume" {
+    // Iteration 2's condition sits mid-trip. Under doc 38 it could be claimed
+    // by the top-of-trace while-done classifier and would then resume after the
+    // loop with the trip-start registers, losing iteration 1 (odd counts end
+    // there). Doc 58 removes that classifier: no `while` condition guard drives
+    // a resume any more, so `flush` is 0 for every copy.
     const Inspect = struct {
         fn run(vm: *Vm, mode: TraceMode) !void {
             if (!executes(mode)) return;
             const t = mostUnrolled(vm) orelse return error.TestExpectedUnrolledTrace;
             try testing.expectEqual(@as(u8, 1), t.code.instunrolled);
+            // Doc 58: a `while` condition owes NO flush on any copy (its exit is
+            // ordinary), both copies ARE the loop's own test structurally, and
+            // neither needs the `.loop_test_copy` role any more.
             const lt = loopTests(vm, t, .jmp_if_false);
-            try testing.expectEqual(LoopTests{ .looped = 1, .copies = 1, .branch = 0 }, lt);
+            try testing.expectEqual(LoopTests{ .flush = 0, .own = 2, .copies = 0, .branch = 0 }, lt);
             try expectNativeHolds(vm, mode, &pin_ops);
         }
     };
@@ -277,7 +298,7 @@ test "doc 57 P3: a period-3 nil/false/true cycle unrolls twice" {
             const t = mostUnrolled(vm) orelse return error.TestExpectedUnrolledTrace;
             try testing.expectEqual(@as(u8, 2), t.code.instunrolled);
             const lt = loopTests(vm, t, .for_loop);
-            try testing.expectEqual(LoopTests{ .looped = 1, .copies = 2, .branch = 0 }, lt);
+            try testing.expectEqual(LoopTests{ .flush = 1, .own = 3, .copies = 2, .branch = 0 }, lt);
         }
     };
     try expectProgramTuned(

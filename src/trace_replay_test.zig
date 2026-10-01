@@ -1124,6 +1124,9 @@ test "replayLedger A-vii-a: region_bridge validates registered cross-anchor edge
         },
         .id = 602,
     };
+    var snap_arena = std.heap.ArenaAllocator.init(gpa);
+    defer snap_arena.deinit();
+    try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &cont.code);
     try testing.expect(nativegen.isCompositeBridgeCandidate(&cont.code, 3));
     try state.registry.cache.append(gpa, &cont);
     try state.registry.cache.append(gpa, &skip);
@@ -1234,6 +1237,9 @@ test "A-vii-d.1 overlay: composite guard resolves the opposite-polarity CFG succ
         },
         .id = 701,
     };
+    var snap_arena = std.heap.ArenaAllocator.init(gpa);
+    defer snap_arena.deinit();
+    try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &cont.code);
     try testing.expect(nativegen.isCompositeBridgeCandidate(&cont.code, 3));
 
     // No successor trace bound anywhere yet → both polarities decline.
@@ -1286,6 +1292,7 @@ test "A-vii-d.1 overlay: composite guard resolves the opposite-polarity CFG succ
         },
         .id = 704,
     };
+    try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &selfy.code);
     try testing.expect(nativegen.isCompositeBridgeCandidate(&selfy.code, 3));
     try testing.expectEqual(@as(?TraceState.SuccAnchor, null), state.resolveSuccessorAnchor(&selfy, selfy.code.exit_prov[0]));
 }
@@ -1348,6 +1355,9 @@ test "A-vii-d.1 overlay: a crossed for_loop is published ONLY under the exact-da
         },
         .id = 711,
     };
+    var snap_arena = std.heap.ArenaAllocator.init(gpa);
+    defer snap_arena.deinit();
+    try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &good.code);
     try testing.expect(nativegen.isCompositeBridgeCandidate(&good.code, 7));
 
     var skip_instrs = [_]IrInstr{ .{ .op = .guard_int, .a = 0 }, .{ .op = .loop } };
@@ -1381,6 +1391,7 @@ test "A-vii-d.1 overlay: a crossed for_loop is published ONLY under the exact-da
         },
         .id = 713,
     };
+    try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &noval.code);
     try testing.expect(nativegen.isCompositeBridgeCandidate(&noval.code, 7));
     try testing.expectEqual(@as(?TraceState.SuccAnchor, null), state.resolveSuccessorAnchor(&noval, noval.code.exit_prov[1]));
 
@@ -1399,6 +1410,7 @@ test "A-vii-d.1 overlay: a crossed for_loop is published ONLY under the exact-da
         },
         .id = 714,
     };
+    try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &nocmp.code);
     try testing.expect(nativegen.isCompositeBridgeCandidate(&nocmp.code, 7));
     try testing.expectEqual(@as(?TraceState.SuccAnchor, null), state.resolveSuccessorAnchor(&nocmp, nocmp.code.exit_prov[1]));
 }
@@ -1461,6 +1473,9 @@ test "A-vii-d.1 bridged successor terminal: a loop-body successor deopt resumes 
         },
         .id = 622,
     };
+    var snap_arena = std.heap.ArenaAllocator.init(gpa);
+    defer snap_arena.deinit();
+    try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &cont.code);
     try testing.expect(nativegen.isCompositeBridgeCandidate(&cont.code, 3));
     try testing.expect(isLoopDoneGuardIndex(&skip, 0));
     try state.registry.cache.append(gpa, &cont);
@@ -1556,6 +1571,9 @@ test "A-vii-d.1 bridged .link successor (codex blocker): zero-progress deopt and
         },
         .id = 632,
     };
+    var snap_arena = std.heap.ArenaAllocator.init(gpa);
+    defer snap_arena.deinit();
+    try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &cont.code);
     try state.registry.cache.append(gpa, &cont);
     try state.registry.cache.append(gpa, &skip);
     const rid: RegionId = @enumFromInt(93);
@@ -1748,6 +1766,9 @@ test "A-vii-d.1 two-phase arming: a terminal composite deopt records ONE pending
         },
         .id = 821,
     };
+    var snap_arena = std.heap.ArenaAllocator.init(gpa);
+    defer snap_arena.deinit();
+    try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &cont.code);
     try testing.expect(nativegen.isCompositeBridgeCandidate(&cont.code, 3));
     try state.registry.cache.append(gpa, &cont);
 

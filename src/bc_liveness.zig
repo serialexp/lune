@@ -103,6 +103,14 @@ fn jumpTarget(pc: u32, aux: i32, code_len: usize) ?u32 {
     return @intCast(t);
 }
 
+/// The CFG successors of `ins` at `pc` — the one successor model, shared with
+/// `bc_dom` (doc 58 §4.8) so dominance and liveness see the same graph. A
+/// null entry is no edge (none, a `ret`/`halt`, or a target outside the code,
+/// which leads to no instruction).
+pub fn successors(ins: Instr, pc: u32, code_len: usize) [2]?u32 {
+    return effectOf(ins, pc, code_len).succ;
+}
+
 fn effectOf(ins: Instr, pc: u32, code_len: usize) Effect {
     var e: Effect = .{};
     const next: ?u32 = if (pc + 1 < code_len) pc + 1 else null;

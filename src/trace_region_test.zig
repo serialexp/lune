@@ -1107,6 +1107,9 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
         },
         .id = 4,
     };
+    var snap_arena = std.heap.ArenaAllocator.init(gpa);
+    defer snap_arena.deinit();
+    try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &cont.code);
     for ([_]*Trace{ &cont, &skip, &sibling, &ext }) |t| try state.registry.cache.append(gpa, t);
     state.rebuildEdgeCache();
     state.rebuildRegions();
@@ -1747,8 +1750,11 @@ test "inc-B ambiguity + node-counting: two link-fed roots stay unarmable; two li
     const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
 
     // (a) rootA@7 --loop_done--> contA@10 --link--> rootB@20 --loop_done-->
-    //     contB@30 --link--> rootA@7: BOTH roots are link-fed — two qualifiers,
-    //     "multiple qualifying roots stay unarmable".
+    //     contB@30 --link--> rootA@7: BOTH roots are link-fed — two qualifiers.
+    //     Doc 58 §4.8 breaks such a tie by gate dominance, but this synthetic
+    //     bytecode has no recognisable loops (no gate, no `Proto.dom`), so the
+    //     tie-break fails closed and the region stays unarmable. The elected
+    //     and sibling-branch cases run on compiled code below.
     {
         var state = TraceState.init(gpa);
         defer state.deinit();
@@ -1821,6 +1827,236 @@ test "inc-B ambiguity + node-counting: two link-fed roots stay unarmable; two li
         try testing.expect(def.armable);
         try testing.expectEqual(@as(u32, 7), def.owner.pc);
     }
+}
+
+// ---- doc 58 §4.8: several qualifying roots, on compiler-shaped CFGs --------
+//
+// The fixtures above run on `loopDoneCode`, whose ops are all unreachable-
+// target `for_loop`s, so no loop there has a gate and the multi-root
+// tie-break always fails closed — which is why the ambiguity fixture's (a)
+// still holds. These
+// fixtures compile real source so the gates (`bytecode.loopGateOf`) and the
+// dominance (`bc_dom`) are the compiler's own (codex review of §4.8, finding 4).
+
+const CompiledFixture = struct {
+    vm: @import("interp.zig").Vm,
+    chunk: @import("compiler.zig").Chunk,
+
+    fn deinit(self: *CompiledFixture) void {
+        self.chunk.deinit();
+        self.vm.deinit();
+    }
+};
+
+fn compileFixture(src: [:0]const u8) !CompiledFixture {
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var tree = try @import("parser.zig").parse(testing.allocator, src, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+    var vm = try @import("interp.zig").Vm.init(testing.allocator);
+    errdefer vm.deinit();
+    const chunk = try @import("compiler.zig").compile(testing.allocator, vm.heap, src, tree.root, &diags);
+    try testing.expect(!diags.hasErrors());
+    return .{ .vm = vm, .chunk = chunk };
+}
+
+/// The `for_loop` pcs of `code`, in pc order.
+fn forLoopPcs(code: []const Instr, out: []u32) []u32 {
+    var n: usize = 0;
+    for (code, 0..) |ins, pc| {
+        if (ins.op != .for_loop) continue;
+        out[n] = @intCast(pc);
+        n += 1;
+    }
+    return out[0..n];
+}
+
+/// One numeric `for` of a doc 47 nest: a root at the loop's header whose
+/// loop-done exit leaves to `fl + 1`, and a continuation anchored there that
+/// `.link`s to the root at `link_to`. Initialised in place: the traces point
+/// at the arrays beside them.
+const RootCont = struct {
+    root_i: [2]IrInstr,
+    root_p: [1]ExitProvEntry,
+    root: Trace,
+    cont_i: [1]IrInstr,
+    cont_p: [1]ExitProvEntry,
+    cont: Trace,
+
+    fn init(self: *RootCont, proto: *const Proto, fl: u32, link_to: u32, first_id: u32) void {
+        const header = bytecode.loopHeaderOf(proto.code[fl], fl).?;
+        self.root_i = .{ .{ .op = .guard_true, .a = 0, .aux = @intCast(fl + 1) }, .{ .op = .loop } };
+        self.root_p = .{.{ .index = 0, .prov = guardProv(fl, .loop_done) }};
+        self.root = .{
+            .code = .{ .anchor = .{ .proto = proto, .pc = header }, .instrs = &self.root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &self.root_p },
+            .id = first_id,
+        };
+        self.cont_i = .{.{ .op = .link, .aux = @intCast(link_to) }};
+        self.cont_p = .{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = proto.id, .source_pc = fl + 1, .inline_depth = 0 } } }};
+        self.cont = .{
+            .code = .{ .anchor = .{ .proto = proto, .pc = fl + 1 }, .instrs = &self.cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &self.cont_p },
+            .id = first_id + 1,
+        };
+    }
+};
+
+fn onlyRegion(state: *TraceState) !RegionId {
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var kit = state.region_policy.region_defs.keyIterator();
+    return kit.next().?.*;
+}
+
+test "doc 58 §4.8: sequential loop roots in a closed cycle elect the root whose gate dominates — stable across rebinds, trace order and tier flips" {
+    const gpa = testing.allocator;
+    // fft_transform's shape: two sequential numeric loops in a `repeat` body,
+    // each followed by a continuation that links into the other loop's root.
+    var fx = try compileFixture(
+        \\local s = 0
+        \\repeat
+        \\  for i = 1, 3 do s = s + i end
+        \\  s = s + 1
+        \\  for j = 1, 3 do s = s + j end
+        \\  s = s + 2
+        \\until s > 100
+        \\return s
+    );
+    defer fx.deinit();
+    const proto = fx.chunk.proto;
+    var buf: [4]u32 = undefined;
+    const fls = forLoopPcs(proto.code, &buf);
+    try testing.expectEqual(@as(usize, 2), fls.len);
+    const ha = bytecode.loopHeaderOf(proto.code[fls[0]], fls[0]).?;
+    const hb = bytecode.loopHeaderOf(proto.code[fls[1]], fls[1]).?;
+
+    // rootA --loop_done--> contA --link--> rootB --loop_done--> contB --link--> rootA:
+    // both roots are link-fed; only A's gate dominates the rest.
+    var a: RootCont = undefined;
+    a.init(proto, fls[0], hb, 1);
+    var b: RootCont = undefined;
+    b.init(proto, fls[1], ha, 3);
+    const all = [_]*Trace{ &a.root, &a.cont, &b.root, &b.cont };
+
+    const orders = [_][4]u8{ .{ 0, 1, 2, 3 }, .{ 3, 2, 1, 0 }, .{ 2, 0, 3, 1 }, .{ 1, 3, 0, 2 } };
+    for (orders) |order| {
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        defer state.registry.cache.clearRetainingCapacity();
+        for (order) |i| try state.registry.cache.append(gpa, all[i]);
+        state.rebuildEdgeCache();
+        state.rebuildRegions();
+
+        // (1) First sight: the fallback tier elects rootA, armable.
+        const rid = try onlyRegion(&state);
+        {
+            const def = state.region_policy.region_defs.get(rid).?;
+            try testing.expectEqual(@as(u32, 4), def.classifier.member_count);
+            try testing.expect(def.armable);
+            try testing.expect(def.fallback_owner);
+            try testing.expectEqual(ha, def.owner.pc);
+        }
+
+        // (2) A plain rebind keeps the RegionId and the owner.
+        state.rebuildEdgeCache();
+        state.rebuildRegions();
+        try testing.expectEqual(rid, try onlyRegion(&state));
+        {
+            const def = state.region_policy.region_defs.get(rid).?;
+            try testing.expect(def.armable and def.fallback_owner);
+            try testing.expectEqual(ha, def.owner.pc);
+        }
+
+        // (3) An external entry into rootA (a trace at the `repeat` header
+        // linking in) opens the SCC: the primary tier takes over — same
+        // RegionId, same owner, `fallback_owner` cleared.
+        const hr = blk: {
+            for (proto.code, 0..) |ins, pc| if (ins.op == .loop) break :blk @as(u32, @intCast(pc + 1));
+            unreachable;
+        };
+        var ext_i = [_]IrInstr{.{ .op = .link, .aux = @intCast(ha) }};
+        var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = proto.id, .source_pc = hr, .inline_depth = 0 } } }};
+        var ext: Trace = .{
+            .code = .{ .anchor = .{ .proto = proto, .pc = hr }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p },
+            .id = 9,
+        };
+        try state.registry.cache.append(gpa, &ext);
+        state.rebuildEdgeCache();
+        state.rebuildRegions();
+        try testing.expectEqual(rid, try onlyRegion(&state));
+        {
+            const def = state.region_policy.region_defs.get(rid).?;
+            try testing.expect(def.armable);
+            try testing.expect(!def.fallback_owner);
+            try testing.expectEqual(ha, def.owner.pc);
+        }
+
+        // (4) The external entry retires: back to the fallback tier's election.
+        for (state.registry.cache.items, 0..) |t, i| {
+            if (t.id == 9) {
+                _ = state.registry.cache.swapRemove(i);
+                break;
+            }
+        }
+        state.rebuildEdgeCache();
+        state.rebuildRegions();
+        try testing.expectEqual(rid, try onlyRegion(&state));
+        {
+            const def = state.region_policy.region_defs.get(rid).?;
+            try testing.expect(def.armable and def.fallback_owner);
+            try testing.expectEqual(ha, def.owner.pc);
+        }
+
+        // (5) A tombstone stays sticky across the multi-root re-election.
+        state.invalidateRegion(rid);
+        state.rebuildEdgeCache();
+        state.rebuildRegions();
+        {
+            const def = state.region_policy.region_defs.get(rid).?;
+            try testing.expect(def.tombstoned);
+            try testing.expect(!def.armable);
+        }
+    }
+}
+
+test "doc 58 §4.8: loop roots in sibling branches of a closed cycle stay unarmable (no gate dominates)" {
+    const gpa = testing.allocator;
+    var fx = try compileFixture(
+        \\local s = 0
+        \\while s < 100 do
+        \\  if s % 2 == 0 then
+        \\    for i = 1, 3 do s = s + i end
+        \\    s = s + 1
+        \\  else
+        \\    for j = 1, 3 do s = s + j end
+        \\    s = s + 2
+        \\  end
+        \\end
+        \\return s
+    );
+    defer fx.deinit();
+    const proto = fx.chunk.proto;
+    var buf: [4]u32 = undefined;
+    const fls = forLoopPcs(proto.code, &buf);
+    try testing.expectEqual(@as(usize, 2), fls.len);
+    const ha = bytecode.loopHeaderOf(proto.code[fls[0]], fls[0]).?;
+    const hb = bytecode.loopHeaderOf(proto.code[fls[1]], fls[1]).?;
+
+    var a: RootCont = undefined;
+    a.init(proto, fls[0], hb, 1);
+    var b: RootCont = undefined;
+    b.init(proto, fls[1], ha, 3);
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.registry.cache.clearRetainingCapacity();
+    for ([_]*Trace{ &a.root, &a.cont, &b.root, &b.cont }) |t| try state.registry.cache.append(gpa, t);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+    const def = state.region_policy.region_defs.get(try onlyRegion(&state)).?;
+    try testing.expectEqual(@as(u32, 4), def.classifier.member_count);
+    try testing.expect(!def.armable);
+    try testing.expect(!def.fallback_owner);
 }
 
 test "inc-B open SCC: an incoming boundary edge into a NON-root member disables the fallback (codex closed-proof pin)" {

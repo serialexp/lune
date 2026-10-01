@@ -43,7 +43,12 @@ fn guestCode() [9]Instr {
         Instr.opABC(.set_index, 4, 0, 3),
         Instr.opABC(.add, 5, 0, 3),
         Instr.opABC(.add, 5, 5, 3),
-        Instr.opJ(.jmp, -7),
+        // Doc 58: the loop's back-edge. A backward `jmp` is only a closer now,
+        // so the fixture's enclosing loop is spelled with a real back-edge
+        // whose header is the anchor (pc 1). Which of the three loop ops it is
+        // does not matter to any rule under test — they all answer through
+        // `bytecode.loopHeaderOf`.
+        Instr.opAx(.for_loop, 0, -7),
         Instr.opAB(.ret, 0, 1),
     };
 }
@@ -394,16 +399,19 @@ test "doc 56 attach: the resume pc must not be a loop header and must reach a ba
 
     f = .{};
     f.init();
-    // It jumps just past the back-edge `jmp → 1`: the branch is now the
-    // anchor loop's own while condition, a loop-done the doc 38
-    // `.while_done` chain owns — refused before the back-edge rule runs.
+    // It jumps just past the loop's back-edge, onto the `ret`. Doc 58: a
+    // `while` condition exit is no longer refused as a loop-done — the generic
+    // back-edge rule decides, and a resume pc that falls straight into a `ret`
+    // still has no enclosing back-edge to close against. (That a real
+    // B2-shaped `while` condition IS attachable, with `P` = the post-loop pc,
+    // is pinned in `interp_tier1a_test` and `compiler`.)
     f.guest[2].aux = 5;
-    try testing.expectEqual(Verdict.loop_done, try verdict(&f, E_BRANCH));
+    try testing.expectEqual(Verdict.no_back_edge, try verdict(&f, E_BRANCH));
 
     f = .{};
     f.init();
-    // An inner loop headed at pc 5: pc 6 jumps back to it.
-    f.guest[6] = Instr.opJ(.jmp, -2);
+    // An inner loop headed at pc 5: pc 6 is its back-edge.
+    f.guest[6] = Instr.opAx(.for_loop, 0, -2);
     try testing.expectEqual(Verdict.resume_header, try verdict(&f, E_LATE));
 }
 

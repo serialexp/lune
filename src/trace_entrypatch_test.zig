@@ -86,46 +86,57 @@ test "doc 20 Phase 3: resolve and lifecycle cover compiler while/repeat closers 
     var state = TraceState.init(gpa);
     defer state.deinit();
 
-    // `compileWhile` closes with an unconditional backward `.jmp`.
+    // Doc 58: a `while` loop is patched at its `loop` MARKER, which sits right
+    // above the body start — so a marker at pc 1 is the back-edge of the loop
+    // anchored at pc 2. Its `aux` is the exit offset (exit pc 8 here), not a
+    // jump target, and the patch must preserve it.
     var while_code = entryPatchTestCode();
-    while_code[5] = .{ .op = .jmp, .aux = -4 };
+    while_code[5] = Instr.op0(.ret);
+    while_code[1] = .{ .op = .loop, .b = @intFromEnum(bytecode.LoopKind.while_loop), .aux = 6 };
     const while_proto = Proto{ .code = &while_code, .id = 8, .name = "while", .num_registers = 8 };
-    try testing.expectEqual(@as(?u32, 5), TraceState.resolvePatchPc(&while_proto, 2));
+    try testing.expectEqual(@as(?u32, 1), TraceState.resolvePatchPc(&while_proto, 2));
     const wt = try entryPatchTestTrace(gpa, 10, &while_proto, 2);
     try state.registry.cache.append(gpa, wt);
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(wt));
-    try testing.expectEqual(OpCode.jloop, state.codeFor(&while_proto)[5].op);
-    try testing.expectEqual(OpCode.jmp, while_proto.code[5].op); // canonical stays virgin
+    try testing.expectEqual(OpCode.jloop, state.codeFor(&while_proto)[1].op);
+    try testing.expectEqual(OpCode.loop, while_proto.code[1].op); // canonical stays virgin
     state.markEntryPatchPending(wt.entry_slot.?);
     state.drainEntryPatchWork();
-    try testing.expectEqual(OpCode.jmp, state.codeFor(&while_proto)[5].op);
+    try testing.expectEqual(OpCode.loop, state.codeFor(&while_proto)[1].op);
     try testing.expect(state.registry.entry_registry.entry_patches.items[0].tombstone);
-    while_code[7] = .{ .op = .jmp_if_false, .a = 1, .aux = -6 };
-    try testing.expectEqual(@as(?u32, null), TraceState.resolvePatchPc(&while_proto, 2)); // mixed closer ambiguity
+    // Two back-edges with the same header is ambiguous → no patch.
+    while_code[7] = .{ .op = .for_loop, .a = 3, .aux = -6 };
+    try testing.expectEqual(@as(?u32, null), TraceState.resolvePatchPc(&while_proto, 2));
 
-    // `compileRepeat` closes with a backward `.jmp_if_false`; `.a` (the
-    // condition register) and `.aux` survive the patch/unpatch transaction.
+    // A `repeat` marker is the same site with the other kind; `.b` (the kind)
+    // and `.aux` survive the patch/unpatch transaction. NB the patch stores the
+    // slot index in `.b` of the IMAGE instruction, so the canonical `.b` must
+    // come back.
     var repeat_code = entryPatchTestCode();
-    repeat_code[5] = .{ .op = .jmp_if_false, .a = 6, .aux = -4 };
+    repeat_code[5] = Instr.op0(.ret);
+    repeat_code[1] = .{ .op = .loop, .b = @intFromEnum(bytecode.LoopKind.repeat_loop), .aux = 6 };
     const repeat_proto = Proto{ .code = &repeat_code, .id = 9, .name = "repeat", .num_registers = 8 };
-    try testing.expectEqual(@as(?u32, 5), TraceState.resolvePatchPc(&repeat_proto, 2));
+    try testing.expectEqual(@as(?u32, 1), TraceState.resolvePatchPc(&repeat_proto, 2));
     const rt = try entryPatchTestTrace(gpa, 11, &repeat_proto, 2);
     try state.registry.cache.append(gpa, rt);
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(rt));
-    const patched = state.codeFor(&repeat_proto)[5];
-    try testing.expectEqual(OpCode.jloop, patched.op);
-    try testing.expectEqual(@as(u16, 6), patched.a);
-    try testing.expectEqual(@as(i32, -4), patched.aux);
+    try testing.expectEqual(OpCode.jloop, state.codeFor(&repeat_proto)[1].op);
+    try testing.expectEqual(@as(i32, 6), state.codeFor(&repeat_proto)[1].aux);
     state.markEntryPatchPending(rt.entry_slot.?);
     state.drainEntryPatchWork();
-    try testing.expect(std.meta.eql(repeat_proto.code[5], state.codeFor(&repeat_proto)[5]));
+    try testing.expect(std.meta.eql(repeat_proto.code[1], state.codeFor(&repeat_proto)[1]));
 
-    // The compiler does not close while/repeat with these conditional forms;
-    // deliberately leave them on the virgin cascade instead of broadening the
-    // patch surface to bytecode shapes with no language producer.
+    // Doc 58: the loop CLOSERS are no longer back-edges, so they are never
+    // patched — not the `while`'s backward `jmp`, not the `repeat`'s backward
+    // `jmp_if_false`, and not the conditional forms the compiler never emits
+    // as closers.
     var skipped_code = entryPatchTestCode();
-    skipped_code[5] = .{ .op = .jmp_if_true, .a = 1, .aux = -4 };
+    skipped_code[5] = .{ .op = .jmp, .aux = -4 };
     const skipped_proto = Proto{ .code = &skipped_code, .id = 10, .name = "skipped", .num_registers = 8 };
+    try testing.expectEqual(@as(?u32, null), TraceState.resolvePatchPc(&skipped_proto, 2));
+    skipped_code[5] = .{ .op = .jmp_if_false, .a = 1, .aux = -4 };
+    try testing.expectEqual(@as(?u32, null), TraceState.resolvePatchPc(&skipped_proto, 2));
+    skipped_code[5].op = .jmp_if_true;
     try testing.expectEqual(@as(?u32, null), TraceState.resolvePatchPc(&skipped_proto, 2));
     skipped_code[5].op = .jmp_if_not_nil;
     try testing.expectEqual(@as(?u32, null), TraceState.resolvePatchPc(&skipped_proto, 2));
@@ -136,8 +147,11 @@ test "doc 20 Phase 3: jloop strike exhaustion policy restores canonical and cool
     var state = TraceState.init(gpa);
     defer state.deinit();
 
+    // Doc 58: a `while` loop's patch site is its `loop` marker at pc 1 (header
+    // = the anchor pc 2).
     var code = entryPatchTestCode();
-    code[5] = .{ .op = .jmp, .aux = -4 };
+    code[5] = Instr.op0(.ret);
+    code[1] = .{ .op = .loop, .b = @intFromEnum(bytecode.LoopKind.while_loop), .aux = 6 };
     const proto = Proto{ .code = &code, .id = 11, .name = "strike", .num_registers = 8 };
     const t = try entryPatchTestTrace(gpa, 12, &proto, 2);
     try state.registry.cache.append(gpa, t);
@@ -150,7 +164,7 @@ test "doc 20 Phase 3: jloop strike exhaustion policy restores canonical and cool
     state.registry.entry_registry.entry_patches.items[slot].strikes = state.config.patch_strikes;
     state.markEntryPatchPending(slot);
     state.drainEntryPatchWork();
-    try testing.expectEqual(OpCode.jmp, state.codeFor(&proto)[5].op);
+    try testing.expectEqual(OpCode.loop, state.codeFor(&proto)[1].op);
     try testing.expect(state.registry.entry_registry.entry_patches.items[slot].tombstone);
     try testing.expectEqual(trace.EntryPatchState.eligible, t.entry_patch);
     try testing.expectEqual(@as(?u16, null), t.entry_slot);

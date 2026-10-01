@@ -1080,7 +1080,7 @@ test "nativegen A-v: composite bridge prefix emits but unarmed exit takes ordina
         } },
     }};
     var es = [_]u16{};
-    const t = Trace{
+    var t = Trace{
         .anchor = .{ .proto = &proto, .pc = 29 },
         .instrs = &instrs,
         .consts = &consts,
@@ -1088,6 +1088,9 @@ test "nativegen A-v: composite bridge prefix emits but unarmed exit takes ordina
         .entry_guards = &.{},
         .exit_prov = &exit_prov,
     };
+    var snap_arena = std.heap.ArenaAllocator.init(gpa);
+    defer snap_arena.deinit();
+    try @import("trace_testutil.zig").snapshotBranchGuardsFromPhis(snap_arena.allocator(), &t);
     try testing.expect(isCompositeBridgeCandidate(&t, 7));
 
     var arena = McodeArena.init(gpa);

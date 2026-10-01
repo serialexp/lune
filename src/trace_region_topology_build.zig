@@ -204,6 +204,12 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
         candidates.deinit(gpa);
     }
 
+    // Doc 58 §4.8: the multi-root fallback tie-break's qualifier list, reused
+    // across candidates. Its dominance facts are the proto's own
+    // (`Proto.dom`, computed once at compile time), never rebuilt here.
+    var fallback_qualifiers: std.ArrayListUnmanaged(u32) = .empty;
+    defer fallback_qualifiers.deinit(gpa);
+
     for (0..ncomp) |cc| {
         const c: u32 = @intCast(cc);
         if (!(comp_size[c] >= 2 or has_self[c])) continue;
@@ -395,14 +401,17 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
             // with a static enclosure test: a member is dispatcher-entry-
             // shaped if its numeric loop's body span contains every other
             // same-proto member (the outermost loop root of the cycle).
-            // Cross-proto members and non-numeric (while) roots conservatively
-            // fail the test — the region then simply stays unarmable, the
-            // pre-d.1 status quo.
+            // Cross-proto members conservatively fail the test — the region
+            // then simply stays unarmable, the pre-d.1 status quo.
+            //
+            // Doc 58 §4.6: the extent comes from `loopExtentFor`, which handles
+            // all three loop shapes, so `while`/`repeat` roots are no longer
+            // conservatively refused. A `while` member sitting in the condition
+            // has `pc < anchor` and is still inside the loop, which is why the
+            // member test below compares against both ends of the extent rather
+            // than ordering against the anchor (review r2 finding 8).
             const enclosing = !is_ext and blk: {
                 const ext = bytecode.loopExtentFor(proto, a.pc) orelse break :blk false;
-                // Doc 58 B1: numeric roots only, as before; B2 admits every
-                // loop kind.
-                if (ext.back_edge_op != .for_loop) break :blk false;
                 for (0..nnodes) |m| {
                     if (comp[m] != c or m == n) continue;
                     const b = nodes.items[m];
@@ -429,13 +438,24 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
         // matches ordinary side anchors). v1 scope is deliberately same-proto
         // and top-level (`inline_depth == 0`, local source proto), matching
         // `enclosing`'s conservative posture — cross-proto cycles stay
-        // unarmable. Zero or several qualifying roots keep today's
-        // deterministic placeholder + armable=false ("multiple qualifying
-        // roots stay unarmable"), and qualification counts destination NODES,
-        // not edges, so several physical `.link` continuations targeting one
-        // root still elect exactly that root. Runs strictly as a fallback
-        // tier (`both_count == 0`), so every region that elects an owner
-        // under the primary predicate is untouched by construction.
+        // unarmable. Qualification counts destination NODES, not edges, so
+        // several physical `.link` continuations targeting one root still
+        // elect exactly that root. Zero qualifiers keep the deterministic
+        // placeholder + armable=false. Runs strictly as a fallback tier
+        // (`both_count == 0`), so every region that elects an owner under the
+        // primary predicate is untouched by construction.
+        //
+        // Several qualifiers (doc 58 §4.8): a closed cycle through sequential
+        // loops of one enclosing loop — fft's `repeat` body, root → cont →
+        // root → cont → root — has a link-fed root per loop. Elect the one
+        // whose loop GATE (`bytecode.loopGateOf`) dominates every other member
+        // anchor in the proto's CFG: the loop every entry into the rest of the
+        // region passes through. Dominance is a tie-break only — the single
+        // qualifier keeps today's rule (a legitimate continuation may precede
+        // a sole root's gate), and the path is chosen by the structural
+        // qualifier count, so a root without a gate can never collapse an
+        // ambiguous case into the single-qualifier shortcut. No dominant root,
+        // or several, stays unarmable (sibling-branch loops).
         const primary_count = both_count;
         if (both_count == 0) closed: {
             for (edges.items) |e| {
@@ -451,6 +471,7 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
             }
             const pid = scc_proto_id orelse break :closed;
             const proto = proto_by_id.get(pid) orelse return error.RegionGraphInconsistent;
+            fallback_qualifiers.clearRetainingCapacity();
             for (0..nnodes) |n| {
                 if (comp[n] != c) continue;
                 if (!view.hasInnerRootAt(proto, nodes.items[n].pc)) continue;
@@ -470,10 +491,29 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
                     }
                     break :blk false;
                 };
-                if (qualifies) {
-                    both_count += 1;
-                    owner_node = @intCast(n);
+                if (qualifies) try fallback_qualifiers.append(gpa, @intCast(n));
+            }
+            const qualifiers = fallback_qualifiers.items;
+            both_count = qualifiers.len;
+            if (qualifiers.len == 1) {
+                owner_node = qualifiers[0];
+            } else if (qualifiers.len >= 2) {
+                // No tree (a hand-built proto): nothing dominates — fail closed.
+                const dom = proto.dom;
+                var dominant: usize = 0;
+                for (qualifiers) |q| {
+                    const gate = bytecode.loopGateOf(proto, nodes.items[q].pc) orelse continue;
+                    const gates_all = for (0..nnodes) |m| {
+                        if (comp[m] != c or m == q) continue;
+                        if (!dom.dominates(gate, nodes.items[m].pc)) break false;
+                    } else true;
+                    if (!gates_all) continue;
+                    dominant += 1;
+                    owner_node = q;
                 }
+                // Exactly one dominant root elects; otherwise `both_count`
+                // stays the (≥2) qualifier count → placeholder, unarmable.
+                if (dominant == 1) both_count = 1;
             }
         }
         const owner_anchor: AnchorId = if (both_count == 1) nodes.items[owner_node] else (smallest orelse return error.RegionGraphInconsistent);

@@ -80,9 +80,10 @@ pub const CapturedOpts = struct {
     /// touching the CLI's global flag.
     debug_log: bool = false,
     /// Doc 56 Phase 4: native traces take exit adapters
-    /// (`Config.exit_side_native`). Only the native leg compiles pages, so
-    /// the other legs are unaffected.
-    exit_side_native: bool = false,
+    /// (`Config.exit_side_native`); null keeps the config default (on), so
+    /// every matrix test covers the shipped native path. Only the native leg
+    /// compiles pages, so the other legs are unaffected.
+    exit_side_native: ?bool = null,
     /// Populate `vm.trace.abort_log` (what `--dump-aborts` turns on), so an
     /// `inspect` callback can assert which abort reasons fired.
     record_aborts: bool = false,
@@ -125,7 +126,7 @@ pub fn runCapturedTuned(
     vm.trace.config.hotloop = opts.hotloop;
     vm.trace.config.coverage = opts.coverage;
     vm.trace.config.debug_log = opts.debug_log;
-    vm.trace.config.exit_side_native = opts.exit_side_native;
+    if (opts.exit_side_native) |on| vm.trace.config.exit_side_native = on;
     vm.trace.config.record_aborts = opts.record_aborts;
     if (opts.hotguard) |hg| vm.trace.config.hotguard = hg;
     if (opts.instunroll) |n| vm.trace.config.instunroll = n;

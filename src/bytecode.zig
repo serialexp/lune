@@ -236,11 +236,16 @@ pub const LoopKind = enum(u16) {
 /// decoding `aux` itself (a `loop` marker's `aux` is its exit offset, so the
 /// generic `pc + 1 + aux` would be wrong for it).
 ///
-/// B1 (today's shape): a backward jump of any kind, `for_loop` and
-/// `tfor_loop` are back-edges; the `loop` marker is not one yet.
+/// The back-edges are exactly the three loop ops, as in LuaJIT (`FORL`,
+/// `ITERL`, `LOOP`): a taken `for_loop`/`tfor_loop` (header = its backward
+/// target, the body start) and a `loop` marker (header = `pc + 1`, the body
+/// start). A backward `jmp`/`jmp_if_false` is only a loop's physical closer
+/// (`while`'s jump back to its condition, `repeat`'s jump back to its
+/// marker), never a back-edge.
 pub fn loopHeaderOf(ins: Instr, pc: usize) ?u32 {
     switch (ins.op) {
-        .jmp, .jmp_if_true, .jmp_if_false, .jmp_if_not_nil, .for_loop, .tfor_loop => {},
+        .loop => return @intCast(pc + 1),
+        .for_loop, .tfor_loop => {},
         else => return null,
     }
     const t: i64 = @as(i64, @intCast(pc)) + 1 + ins.aux;
@@ -257,24 +262,193 @@ pub const LoopExtent = struct {
     back_edge_op: OpCode,
 };
 
-/// Doc 58: the extent of the loop whose header is `header`, found through its
-/// unique back-edge (`loopHeaderOf`). Null when no back-edge has this header,
-/// or more than one does (ambiguous: callers fail closed). Replaces the two
-/// numeric-only `forLoopEndFor` copies.
+/// Doc 58: the extent of the loop whose header is `header`, or null when
+/// `header` is not a loop header. Replaces the two numeric-only
+/// `forLoopEndFor` copies.
 ///
-/// B1 (today's shape): every loop runs from its header to its back-edge.
+/// O(1), from the header side (doc 58 §4.8 — it is asked per region member on
+/// every topology rebuild, so a whole-proto scan made the rebuild
+/// O(members × code)). Every loop shape the compiler emits pins its own
+/// back-edge from the instruction right above its header:
+///  - numeric `for`: `for_prep` at `header − 1` jumps to its `for_loop`, whose
+///    taken edge returns to `header` (`compileNumericFor`);
+///  - generic `for`: a forward `jmp` at `header − 1` enters the test block
+///    (`move`s and the iterator `call`) that ends in the `tfor_loop` returning
+///    to `header` (`compileGenericFor`);
+///  - `while`/`repeat`: the `loop` marker at `header − 1` (below).
+/// Each link is checked, so anything else is null. That one back-edge per
+/// header is unique is a property of compiler output (each loop owns its
+/// header), not re-proved here by scanning for rivals.
+///
+/// The extent is every instruction that runs inside the loop, which for the
+/// two marker kinds is NOT `[header, back_edge]` — the marker sits at the top
+/// and the code that closes the loop sits below the body:
+///  - numeric `for`: `[header, the for_loop]`;
+///  - generic `for`: `[header, the tfor_loop]` (the forward `jmp` to the test
+///    block at `header − 1` runs only on entry, like `for_prep`);
+///  - `while`: `[C, E − 1]`, where `E` is the marker's exit pc and `C` is the
+///    first condition instruction — the target of the backward `jmp` that
+///    closes the loop at `E − 1`. The condition sits BELOW the header, so a
+///    member in it has `pc < header` and is still inside the loop;
+///  - `repeat`: `[the marker, E − 1]` (`E − 1` is the backward `jmp_if_false`
+///    that closes it).
+///
+/// A structural query, not a compiler assertion: every shape is checked
+/// against exactly what `compileWhile`/`compileRepeat` emit, and anything else
+/// — a marker whose exit is out of range or not past it, an unknown loop
+/// kind, a `while` whose condition branch does not sit right above the marker
+/// and target `E`, a `repeat` whose closer does not target its marker —
+/// returns null instead of trapping (doc 58 B2 review should-fix).
 pub fn loopExtentFor(proto: *const Proto, header: u32) ?LoopExtent {
-    var found: ?LoopExtent = null;
-    for (proto.code, 0..) |ins, i| {
-        if (loopHeaderOf(ins, i) != header) continue;
-        if (found != null) return null; // ambiguous
-        found = .{ .start = header, .end = @intCast(i), .back_edge_pc = @intCast(i), .back_edge_op = ins.op };
+    const code = proto.code;
+    if (header == 0 or header >= code.len) return null;
+    const i: u32 = header - 1;
+    const entry = code[i];
+    switch (entry.op) {
+        .for_prep => {
+            const fl = jumpTargetOf(entry, i);
+            if (fl <= i or fl >= @as(i64, @intCast(code.len))) return null;
+            const back: u32 = @intCast(fl);
+            if (code[back].op != .for_loop or loopHeaderOf(code[back], back) != header) return null;
+            return .{ .start = header, .end = back, .back_edge_pc = back, .back_edge_op = .for_loop };
+        },
+        .jmp => {
+            const t = jumpTargetOf(entry, i);
+            if (t <= i or t >= @as(i64, @intCast(code.len))) return null;
+            var back: usize = @intCast(t);
+            while (back < code.len) : (back += 1) switch (code[back].op) {
+                .move, .call => {},
+                else => break,
+            };
+            if (back >= code.len or code[back].op != .tfor_loop or loopHeaderOf(code[back], back) != header) return null;
+            return .{ .start = header, .end = @intCast(back), .back_edge_pc = @intCast(back), .back_edge_op = .tfor_loop };
+        },
+        .loop => {
+            const exit = loopMarkerExitChecked(entry, i, code.len) orelse return null;
+            const end = exit - 1;
+            if (end <= i) return null; // the closer must sit past the marker
+            const closer = code[end];
+            const kind = std.enums.fromInt(LoopKind, entry.b) orelse return null;
+            const start: u32 = switch (kind) {
+                // `C … jmp_if_false → E; loop; body; jmp → C`: the condition
+                // branch sits right above the marker and leaves to `E`, and the
+                // closer at `E − 1` jumps back to `C`.
+                .while_loop => blk: {
+                    if (i == 0) return null;
+                    const branch = code[i - 1];
+                    if (branch.op != .jmp_if_false) return null;
+                    if (jumpTargetOf(branch, i - 1) != @as(i64, exit)) return null;
+                    if (closer.op != .jmp) return null;
+                    const c = jumpTargetOf(closer, end);
+                    if (c < 0 or c > @as(i64, i - 1)) return null;
+                    break :blk @intCast(c);
+                },
+                // `loop; body; cond; jmp_if_false → loop`: the closer at `E − 1`
+                // jumps back to the marker, which opens the loop.
+                .repeat_loop => blk: {
+                    if (closer.op != .jmp_if_false) return null;
+                    if (jumpTargetOf(closer, end) != @as(i64, i)) return null;
+                    break :blk i;
+                },
+            };
+            return .{ .start = start, .end = end, .back_edge_pc = i, .back_edge_op = .loop };
+        },
+        else => return null,
     }
-    return found;
+}
+
+/// Doc 58 §4.8: the GATE of the loop whose header is `header` — the one
+/// instruction every entry into its body passes through, first entry and
+/// repetition alike — or null when the loop's shape is not recognised (fail
+/// closed). For a `while`/`repeat` loop it is the `loop` marker at
+/// `header − 1`. For a numeric or generic `for` it is the back-edge op
+/// (`for_loop`/`tfor_loop`): `for_prep` never falls through into the body but
+/// jumps to the `for_loop`, which performs the first test, and a generic
+/// `for` enters through the iterator call block that ends at its
+/// `tfor_loop`. The header itself is NOT a gate: a zero-trip loop reaches the
+/// code after it without passing the header.
+pub fn loopGateOf(proto: *const Proto, header: u32) ?u32 {
+    const ext = loopExtentFor(proto, header) orelse return null;
+    return switch (ext.back_edge_op) {
+        .loop, .for_loop, .tfor_loop => ext.back_edge_pc,
+        else => null,
+    };
+}
+
+/// `pc + 1 + aux` for a jump-shaped instruction, unchecked (may be out of
+/// range — callers compare it against a known pc).
+fn jumpTargetOf(ins: Instr, pc: usize) i64 {
+    return @as(i64, @intCast(pc)) + 1 + ins.aux;
+}
+
+/// Doc 58 §4.2: the compiler's own check that the only backward jumps it emits
+/// are the two loop closers, each in its pinned shape. Every other backward
+/// jump would be an untracked back-edge now that `loopHeaderOf` recognises
+/// only the three loop ops. Debug/safe builds only; called once per finished
+/// proto.
+pub fn assertLoopClosersWellFormed(code: []const Instr) void {
+    if (!std.debug.runtime_safety) return;
+    for (code, 0..) |ins, pc| {
+        const t: i64 = switch (ins.op) {
+            .jmp, .jmp_if_true, .jmp_if_false, .jmp_if_not_nil => @as(i64, @intCast(pc)) + 1 + ins.aux,
+            else => continue,
+        };
+        if (t > @as(i64, @intCast(pc))) continue; // forward: not a closer
+        const target: usize = @intCast(t);
+        switch (ins.op) {
+            // `while`: a backward `jmp` at `E − 1` targets the condition `C`,
+            // and the loop's marker `m` sits between them with `code[m − 1]`
+            // the condition's branch: `C ≤ m − 1 < m < E`. The marker is
+            // identified by its extent ENDING at this closer (`E == pc + 1`),
+            // not by being the nearest one — an inner loop's marker also lies
+            // in `(C, pc)`.
+            .jmp => {
+                var m: usize = target + 1;
+                const found = while (m <= pc) : (m += 1) {
+                    if (code[m].op == .loop and loopMarkerExit(code[m], m) == pc + 1) break true;
+                } else false;
+                std.debug.assert(found);
+                std.debug.assert(@as(LoopKind, @enumFromInt(code[m].b)) == .while_loop);
+                std.debug.assert(m > target); // `C ≤ m − 1`
+                std.debug.assert(code[m - 1].op == .jmp_if_false);
+            },
+            // `repeat`: a backward `jmp_if_false` targets its `loop` marker.
+            .jmp_if_false => {
+                std.debug.assert(code[target].op == .loop);
+                std.debug.assert(@as(LoopKind, @enumFromInt(code[target].b)) == .repeat_loop);
+                std.debug.assert(loopMarkerExit(code[target], target) == pc + 1);
+            },
+            else => unreachable, // no other backward jump shape exists
+        }
+    }
+}
+
+/// Doc 58: is `header` the header of a `while` loop — i.e. does a `loop` marker
+/// of kind `while` sit right above it? (`repeat` markers and `for` back-edges
+/// answer false.) The peel's shape gate and tests share this one definition.
+pub fn isWhileHeader(proto: *const Proto, header: u32) bool {
+    // The header is a real instruction (the body start), so `code.len` is
+    // out of range like anything past it.
+    if (header == 0 or header >= proto.code.len) return false;
+    const above = proto.code[header - 1];
+    if (above.op != .loop) return false;
+    return std.enums.fromInt(LoopKind, above.b) == .while_loop;
 }
 
 /// Doc 58: the exit pc (first instruction after the loop) of a `loop` marker
-/// at `pc`.
+/// at `pc`, checked: null unless the exit lies past the marker and within
+/// `code_len` (the exit may equal `code_len` — a loop ending the code). The
+/// structural queries use this; trusted compiler-output callers may use the
+/// asserting `loopMarkerExit`.
+pub fn loopMarkerExitChecked(ins: Instr, pc: usize, code_len: usize) ?u32 {
+    if (ins.op != .loop) return null;
+    const e = jumpTargetOf(ins, pc);
+    if (e <= @as(i64, @intCast(pc)) or e > @as(i64, @intCast(code_len))) return null;
+    return @intCast(e);
+}
+
+/// Doc 58: the exit pc (first instruction after the loop) of a `loop` marker
+/// at `pc`, for compiler output (asserts the shape).
 pub fn loopMarkerExit(ins: Instr, pc: usize) usize {
     std.debug.assert(ins.op == .loop);
     const e: i64 = @as(i64, @intCast(pc)) + 1 + ins.aux;
@@ -341,6 +515,36 @@ pub const Instr = struct {
     /// `op aux` (bare jump)
     pub fn opJ(o: OpCode, aux: i32) Instr {
         return .{ .op = o, .aux = aux };
+    }
+};
+
+/// Doc 58 §4.8: the dominator tree of one proto's CFG, rooted at pc 0,
+/// computed once at compile time by `bc_dom.compute` and stored as each pc's
+/// DFS interval in the tree, so `dominates(a, b)` is O(1) interval
+/// containment. A pc unreachable from pc 0 is `none` in both arrays and
+/// dominates nothing / is dominated by nothing. Empty (`!available()`) on a
+/// hand-built proto or one over the size limit: callers then have no
+/// dominance facts and must fail closed.
+pub const DomTree = struct {
+    pre: []const u32 = &.{},
+    post: []const u32 = &.{},
+
+    pub const none = std.math.maxInt(u32);
+
+    pub fn available(self: DomTree) bool {
+        return self.pre.len != 0;
+    }
+
+    /// Is `pc` reachable from pc 0? False when no tree is available.
+    pub fn reachable(self: DomTree, pc: u32) bool {
+        return pc < self.pre.len and self.pre[pc] != none;
+    }
+
+    /// Does every path from pc 0 to `b` pass through `a`? Reflexive. False
+    /// when no tree is available, or either pc is out of range or unreachable.
+    pub fn dominates(self: DomTree, a: u32, b: u32) bool {
+        if (!self.reachable(a) or !self.reachable(b)) return false;
+        return self.pre[a] <= self.pre[b] and self.post[b] <= self.post[a];
     }
 };
 
@@ -423,6 +627,9 @@ pub const Proto = struct {
     /// Doc 56 §4.2: per-pc register liveness (see `RegLiveness`). Filled by
     /// the compiler; empty (unavailable) on hand-built protos.
     reg_live: RegLiveness = .{},
+    /// Doc 58 §4.8: the CFG's dominator tree (see `DomTree`). Filled by the
+    /// compiler; empty (unavailable) on hand-built protos.
+    dom: DomTree = .{},
     /// Debug name for disassembly / diagnostics (not semantically meaningful).
     name: []const u8 = "?",
     /// Stable, unique id assigned at compile time (pre-order over the proto
@@ -542,4 +749,94 @@ test "disassembly renders a small program" {
     try testing.expect(std.mem.indexOf(u8, text, "proto main") != null);
     try testing.expect(std.mem.indexOf(u8, text, "load_int") != null);
     try testing.expect(std.mem.indexOf(u8, text, "add") != null);
+}
+
+fn marker(kind: u16, aux: i32) Instr {
+    return .{ .op = .loop, .b = kind, .aux = aux };
+}
+
+test "doc 58 §4.8: loopExtentFor and loopGateOf on every compiler loop shape" {
+    const w: u16 = @intFromEnum(LoopKind.while_loop);
+    const r: u16 = @intFromEnum(LoopKind.repeat_loop);
+    // `while`: C=0; jmp_if_false → E=5; loop; body (header 3); jmp → C.
+    const while_code = [_]Instr{
+        Instr.opA(.load_bool, 0),     Instr.opAx(.jmp_if_false, 0, 3), marker(w, 2),
+        Instr.opAx(.load_int, 1, 0), Instr.opAx(.jmp, 0, -5),          Instr.op0(.ret),
+    };
+    const wp = Proto{ .code = &while_code };
+    try testing.expectEqual(LoopExtent{ .start = 0, .end = 4, .back_edge_pc = 2, .back_edge_op = .loop }, loopExtentFor(&wp, 3).?);
+    try testing.expectEqual(@as(?u32, 2), loopGateOf(&wp, 3));
+    try testing.expect(isWhileHeader(&wp, 3));
+    // `repeat`: loop (exit 4); body (header 1); cond; jmp_if_false → marker.
+    const repeat_code = [_]Instr{
+        marker(r, 3),                Instr.opAx(.load_int, 1, 0),
+        Instr.opA(.load_bool, 0),    Instr.opAx(.jmp_if_false, 0, -4),
+        Instr.op0(.ret),
+    };
+    const rp = Proto{ .code = &repeat_code };
+    try testing.expectEqual(LoopExtent{ .start = 0, .end = 3, .back_edge_pc = 0, .back_edge_op = .loop }, loopExtentFor(&rp, 1).?);
+    try testing.expectEqual(@as(?u32, 0), loopGateOf(&rp, 1));
+    // Numeric `for`: for_prep → for_loop; body (header 1); for_loop → header.
+    const for_code = [_]Instr{ Instr.opAx(.for_prep, 0, 1), Instr.opAx(.load_int, 4, 0), Instr.opAx(.for_loop, 0, -2), Instr.op0(.ret) };
+    const fp = Proto{ .code = &for_code };
+    try testing.expectEqual(LoopExtent{ .start = 1, .end = 2, .back_edge_pc = 2, .back_edge_op = .for_loop }, loopExtentFor(&fp, 1).?);
+    try testing.expectEqual(@as(?u32, 2), loopGateOf(&fp, 1));
+    // Generic `for`: jmp → test block; body (header 1); move×3; call; tfor_loop → header.
+    const gen_code = [_]Instr{
+        Instr.opAx(.jmp, 0, 1),      Instr.opAx(.load_int, 6, 0),
+        Instr.opAB(.move, 3, 0),     Instr.opAB(.move, 4, 1),
+        Instr.opAB(.move, 5, 2),     Instr.opABC(.call, 3, 2, 1),
+        Instr.opAx(.tfor_loop, 0, -6), Instr.op0(.ret),
+    };
+    const gp = Proto{ .code = &gen_code };
+    try testing.expectEqual(LoopExtent{ .start = 1, .end = 6, .back_edge_pc = 6, .back_edge_op = .tfor_loop }, loopExtentFor(&gp, 1).?);
+    try testing.expectEqual(@as(?u32, 6), loopGateOf(&gp, 1));
+    // A pc that is not a header (inside a body, past the end) has no loop.
+    try testing.expectEqual(@as(?LoopExtent, null), loopExtentFor(&wp, 4));
+    try testing.expectEqual(@as(?LoopExtent, null), loopExtentFor(&fp, 3));
+    try testing.expectEqual(@as(?LoopExtent, null), loopExtentFor(&fp, 0));
+    try testing.expectEqual(@as(?LoopExtent, null), loopExtentFor(&gp, 3));
+}
+
+test "doc 58 B2 review: loopExtentFor fails closed on malformed loop shapes instead of trapping" {
+    const w: u16 = @intFromEnum(LoopKind.while_loop);
+    const r: u16 = @intFromEnum(LoopKind.repeat_loop);
+    const Case = struct { code: []const Instr, header: u32 };
+    const cases = [_]Case{
+        // A marker whose exit lies behind it.
+        .{ .code = &.{ marker(r, -3), Instr.op0(.ret) }, .header = 1 },
+        // A marker whose exit lies past the code.
+        .{ .code = &.{ marker(r, 40), Instr.op0(.ret) }, .header = 1 },
+        // A `repeat` marker whose exit is the next pc: no closer past it.
+        .{ .code = &.{ marker(r, 0), Instr.op0(.ret) }, .header = 1 },
+        // An unknown loop kind.
+        .{ .code = &.{ marker(9, 1), Instr.opA(.load_bool, 0), Instr.op0(.ret) }, .header = 1 },
+        // A `while` whose condition branch leaves to the wrong pc.
+        .{ .code = &.{ Instr.opA(.load_bool, 0), Instr.opAx(.jmp_if_false, 0, 2), marker(w, 2), Instr.opAx(.load_int, 1, 0), Instr.opAx(.jmp, 0, -5), Instr.op0(.ret) }, .header = 3 },
+        // A `while` marker with no condition branch above it.
+        .{ .code = &.{ Instr.opA(.load_bool, 0), Instr.opA(.load_bool, 0), marker(w, 2), Instr.opAx(.load_int, 1, 0), Instr.opAx(.jmp, 0, -5), Instr.op0(.ret) }, .header = 3 },
+        // A `while` marker at pc 0 (nothing above it).
+        .{ .code = &.{ marker(w, 2), Instr.opAx(.load_int, 1, 0), Instr.opAx(.jmp, 0, -3), Instr.op0(.ret) }, .header = 1 },
+        // A `repeat` whose closer does not jump back to its marker.
+        .{ .code = &.{ marker(r, 3), Instr.opAx(.load_int, 1, 0), Instr.opA(.load_bool, 0), Instr.opAx(.jmp_if_false, 0, -3), Instr.op0(.ret) }, .header = 1 },
+        // A `for_prep` that jumps to something other than a `for_loop`.
+        .{ .code = &.{ Instr.opAx(.for_prep, 0, 1), Instr.opAx(.load_int, 4, 0), Instr.opAx(.load_int, 4, 0), Instr.op0(.ret) }, .header = 1 },
+        // A `for_prep` jumping out of the code.
+        .{ .code = &.{ Instr.opAx(.for_prep, 0, 99), Instr.op0(.ret) }, .header = 1 },
+        // A forward `jmp` that does not enter a generic-`for` test block.
+        .{ .code = &.{ Instr.opAx(.jmp, 0, 1), Instr.opAx(.load_int, 6, 0), Instr.opAx(.load_int, 6, 0), Instr.op0(.ret) }, .header = 1 },
+    };
+    for (cases) |cs| {
+        const p = Proto{ .code = cs.code };
+        try testing.expectEqual(@as(?LoopExtent, null), loopExtentFor(&p, cs.header));
+        try testing.expectEqual(@as(?u32, null), loopGateOf(&p, cs.header));
+    }
+    // An unknown kind is not a `while` either (checked decode, not a trap).
+    const unknown = [_]Instr{ marker(9, 1), Instr.opA(.load_bool, 0), Instr.op0(.ret) };
+    try testing.expect(!isWhileHeader(&Proto{ .code = &unknown }, 1));
+    // A marker as the last instruction: its "header" is `code.len`, not a pc.
+    const tail = [_]Instr{ Instr.opA(.load_bool, 0), Instr.opAx(.jmp_if_false, 0, 1), marker(w, 0) };
+    const tp = Proto{ .code = &tail };
+    try testing.expect(!isWhileHeader(&tp, 3));
+    try testing.expectEqual(@as(?LoopExtent, null), loopExtentFor(&tp, 3));
 }

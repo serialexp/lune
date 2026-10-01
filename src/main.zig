@@ -73,10 +73,10 @@ const usage =
     \\  --jit-stats          imply --trace + --jit-coverage and print the FULL JIT
     \\                       stats block to stderr after the run: event counters + the
     \\                       native-vs-tier-0 coverage split + a per-anchor table.
-    \\  --jit-exit-side-native  let native traces take exit adapters (doc 56
-    \\                       Phase 4): a hot attachable exit resumes mid-iteration
-    \\                       and continues in a side trace there. Experimental;
-    \\                       off by default until doc 56 Phase 6.
+    \\  --jit-no-exit-side-native  native traces take NO exit adapters (doc 56
+    \\                       Phase 4 ablation): a hot attachable exit falls back to
+    \\                       the coarse deopt instead of resuming mid-iteration in
+    \\                       a side trace. On by default since doc 58 B2.
     \\  --trace-hotguard <N>  imply --trace and override the guard-failure threshold
     \\                       for side-trace recording (default 50).  When a specific
     \\                       guard fails this many times, the next back-edge records
@@ -153,9 +153,9 @@ const TraceOpts = struct {
     /// `--trace-silent-budget <N>`: override the promoted-cycle silent-transition
     /// budget (default 4096). B-3c sweep knob; tiering heuristic, never output.
     silent_budget: ?usize = null,
-    /// `--jit-exit-side-native`: doc 56 Phase 4 — native pages take exit
-    /// adapters (`Config.exit_side_native`). Off by default until Phase 6.
-    exit_side_native: bool = false,
+    /// `--jit-no-exit-side-native` clears it: doc 56 Phase 4 — native pages
+    /// take exit adapters (`Config.exit_side_native`). On by default (doc 58 B2).
+    exit_side_native: bool = true,
     /// `--dump-aborts`: imply `--trace`, record every abandoned recording into the
     /// abort log (`config.record_aborts`), and print the aggregated table to stderr
     /// after the run — which loop dies on which opcode/reason, and how far it got.
@@ -247,8 +247,8 @@ pub fn main(init: std.process.Init) u8 {
             topts.execute = true;
             topts.coverage = true;
             topts.jit_coverage = true;
-        } else if (std.mem.eql(u8, arg, "--jit-exit-side-native")) {
-            topts.exit_side_native = true;
+        } else if (std.mem.eql(u8, arg, "--jit-no-exit-side-native")) {
+            topts.exit_side_native = false;
         } else if (std.mem.eql(u8, arg, "--jit-stats")) {
             topts.enabled = true;
             topts.execute = true;

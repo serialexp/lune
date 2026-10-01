@@ -58,9 +58,6 @@ const guardExitPc = trace_mod.guardExitPc;
 const guardSourcePc = trace_mod.guardSourcePc;
 const isSideExitGuardOp = trace_mod.isSideExitGuardOp;
 const isLoopDoneGuardIndex = trace_mod.isLoopDoneGuardIndex;
-const isWhileLoopDoneGuardIndex = trace_mod.isWhileLoopDoneGuardIndex;
-const isAnyLoopDoneGuardIndex = trace_mod.isAnyLoopDoneGuardIndex;
-const whileLoopDonePostPc = trace_mod.whileLoopDonePostPc;
 const ProvenanceEdge = trace_mod.ProvenanceEdge;
 const ProvenanceAction = trace_mod.ProvenanceAction;
 const ProvenanceVerdict = trace_mod.ProvenanceVerdict;
@@ -158,15 +155,14 @@ pub fn maybeArmContinuation(self: *TraceState, failed: *const Trace, exit_instr:
     // not "the loop ran to completion" — tier-0 replays the trip from the
     // anchor, so no continuation is owed here.
     if (failed.code.isLoopTestCopy(exit_instr)) return;
-    // Doc 38: two loop-done shapes seed a continuation. A numeric-for's
-    // continuation anchors at the guard's exit PC (the `for_loop`
-    // fall-through). A while loop's anchors at the condition branch's JUMP
-    // TARGET (the post-loop pc) — `guardExitPc` there is the loop-body
-    // start, inside the loop, never a valid continuation anchor.
-    const cont_pc: u32 = if (proto.code[guardSourcePc(ins).?].op == .for_loop)
-        exit_pc
-    else
-        whileLoopDonePostPc(failed, exit_instr) orelse return;
+    // Doc 58: only a numeric `for` seeds a continuation from its loop-done
+    // guard, at the guard's exit PC (the `for_loop` fall-through). A
+    // `while`/`repeat` root's condition guard is an ordinary exit whose resume
+    // pc is already the post-loop pc, so the EXIT-SIDE route records and arms
+    // the continuation there (doc 56) — the same way LuaJIT grows a side trace
+    // from the exit.
+    if (proto.code[guardSourcePc(ins).?].op != .for_loop) return;
+    const cont_pc: u32 = exit_pc;
     if (!continuationReachesEnclosingBackEdge(proto, cont_pc, failed.code.anchor.pc)) {
         self.dbg("cont-arm refuse: no enclosing back-edge from pc={d} (inner anchor {d})", .{ cont_pc, failed.code.anchor.pc });
         return;
@@ -379,6 +375,13 @@ pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: u
     if (c.* < Trace.EXIT_COUNT_DONE - 1) c.* += 1;
     if (c.* < self.config.hotexit) return;
     if (route != .legacy and routeExitSide(self, t, exit_instr, c.*)) return;
+    // Doc 58 §4.3 (review r3 finding 1): a loop's own test feeds ONLY
+    // exit-side. Falling through would reach the `completed == 0` same-anchor
+    // side want below, which unpatches the entry and records a pass that can
+    // only end in LLEAVE. This is the one place that rule lives: the
+    // dispatcher counts such exits (B2 review blocker 2 — they are how the
+    // post-loop continuation warms), and chains/bursts reach here too.
+    if (t.code.isOwnLoopTest(exit_instr)) return;
     // Everything below is arming-only, so it runs behind the cheapest
     // possible gates: `isSourceBranchGuardExit` (provenance decode) and
     // `countTracesAt` (an O(cache) scan) must NOT run per receipt on a
@@ -760,9 +763,14 @@ pub fn isSourceBranchGuardExit(self: *const TraceState, failed: *const Trace, ex
     const exit_pc = guardExitPc(ins) orelse return false;
     if (exit_pc == 0 or exit_pc == failed.code.anchor.pc) return false;
     if (exit_pc <= proto.code.len and proto.code[guardSourcePc(ins).?].op == .for_loop) return false;
-    // Doc 57 P3: a `while` condition copy left mid-trip by an instability
-    // unroll is the loop's own test, not a source branch (no prime-side
-    // want, no sibling handoff — both funnel through here).
+    // Doc 58 §4.3 (review r2 finding 5): the loop's OWN test is a loop exit,
+    // not a branch alternation — for every loop shape, and for every unrolled
+    // copy of the test. Treating it as one would raise `wants_prime_side`,
+    // unpatch the entry, and chain same-anchor siblings on each completion.
+    // Both consumers (the prime-side want and the sibling handoff) funnel
+    // through here. This subsumes doc 57 P3's `.loop_test_copy` check for
+    // `while`, and `repeat`'s own test — never excluded before — with it.
+    if (failed.code.isOwnLoopTest(exit_instr)) return false;
     if (failed.code.isLoopTestCopy(exit_instr)) return false;
     return true;
 }
@@ -2441,12 +2449,12 @@ pub fn patchedEntryOp(op: OpCode) ?OpCode {
     return trace_mod.trace_entry_registry.EntryRegistry.patchedEntryOp(op);
 }
 
-/// §R3-1 patch-pc resolution, fail closed: the unique supported loop-closing
-/// instruction whose taken back-edge targets `anchor_pc` (target = pc + 1 +
-/// aux, matching the dispatcher's post-fetch `applyJump`). This covers the
-/// actual compiler shapes: numeric `for` (`.for_loop`), `while` (`.jmp`), and
-/// `repeat` (`.jmp_if_false`). Zero or multiple matches → null (ambiguity is a
-/// property of immutable bytecode; the caller routes `.suppressed_permanent`).
+/// §R3-1 patch-pc resolution, fail closed: the unique loop back-edge whose
+/// header is `anchor_pc` (`bytecode.loopHeaderOf`). This covers every compiler
+/// shape: numeric `for` (`.for_loop`), generic `for` (`.tfor_loop`), and — doc
+/// 58 — `while`/`repeat` (the `.loop` marker, whose header is `pc + 1`). Zero
+/// or multiple matches → null (ambiguity is a property of immutable bytecode;
+/// the caller routes `.suppressed_permanent`).
 pub fn resolvePatchPc(proto: *const Proto, anchor_pc: u32) ?u32 {
     return trace_mod.trace_entry_registry.EntryRegistry.resolvePatchPc(proto, anchor_pc);
 }
@@ -2608,7 +2616,6 @@ pub fn clearCache(self: *TraceState) void {
     self.record_gate.clearRetainingCapacity();
     self.lleave_count.clearRetainingCapacity();
     self.unroll_fail.clearRetainingCapacity();
-    self.while_yield.clearRetainingCapacity();
     self.penalty.clearRetainingCapacity();
     self.guard_failures.clearRetainingCapacity();
     self.wants_side_trace = null;
@@ -2763,12 +2770,15 @@ pub fn nativeFor(self: *TraceState, t: *Trace) ?*const nativegen.CompiledTrace {
                     defer self.gpa.free(slots);
                     const proved = nativegen.proveKinds(self.gpa, &t.code, kinds, slots);
                     if (proved) {
-                        if (nativegen.analyze(self.gpa, &t.code, kinds, slots)) |alloc_value| {
+                        if (nativegen.analyzeInner(self.gpa, &t.code, kinds, slots, .{ .exit_side = self.exitSideNative() })) |alloc_value| {
                             var alloc = alloc_value;
                             defer alloc.deinit(self.gpa);
                             self.dbg("native unsupported after analyze: trace={d} anchor={d} spill_count={d}", .{ t.id, t.code.anchor.pc, alloc.spill_count });
-                        } else {
-                            self.dbg("native unsupported in analyze: trace={d} anchor={d}", .{ t.id, t.code.anchor.pc });
+                        } else |e| {
+                            self.dbg("native unsupported in analyze: trace={d} anchor={d} ({s}; bail site below)", .{ t.id, t.code.anchor.pc, @errorName(e) });
+                            // The error-return trace's innermost frame is the
+                            // `return error.Bail` that refused the trace.
+                            if (@errorReturnTrace()) |et| std.debug.dumpErrorReturnTrace(et);
                         }
                     } else {
                         self.dbg("native unsupported in proveKinds: trace={d} anchor={d}", .{ t.id, t.code.anchor.pc });

@@ -543,6 +543,33 @@ test "astore_append: a `.value`-lane append still refuses (no astore_append reco
     try testing.expectEqualStrings("5000\n", nsink.buffered());
 }
 
+/// scimark-sparse's grow-then-reuse shape (doc 47 convergence): a calibration
+/// call grows `vy` from empty (an append), the steady calls store in-bounds.
+const sparse_grow_reuse_src =
+    \\local n, nr = 1000, 5
+    \\local vx, val, vy, col, row = {}, {}, {}, {}, {}
+    \\for i = 1, n do vx[i] = i * 0.5 end
+    \\for i = 1, n * nr do val[i] = i * 0.25 end
+    \\row[1] = 1
+    \\for r = 1, n do
+    \\  local rr = row[r]
+    \\  row[r+1] = rr + nr
+    \\  for i = 0, nr - 1 do col[rr+i] = 1 + i end
+    \\end
+    \\local function sparse_mult(nn, cycles, vy_, val_, row_, col_, vx_)
+    \\  for p = 1, cycles do
+    \\    for r = 1, nn do
+    \\      local sum = 0
+    \\      for i = row_[r], row_[r+1] - 1 do sum = sum + vx_[col_[i]] * val_[i] end
+    \\      vy_[r] = sum
+    \\    end
+    \\  end
+    \\end
+    \\sparse_mult(n, 1, vy, val, row, col, vx)
+    \\sparse_mult(n, 40, vy, val, row, col, vx)
+    \\print(vy[n])
+;
+
 test "doc 47 convergence: grow-then-reuse commits an append continuation, then the in-bounds sibling takes over" {
     if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     // The codex-required end-to-end regression for the doc 47 convergence story
@@ -560,33 +587,17 @@ test "doc 47 convergence: grow-then-reuse commits an append continuation, then t
     //   * the continuation anchor never took a record_gate strike (the pre-doc-47
     //     failure mode was 6 append aborts → permanent record blacklist);
     //   * no retirement was needed: the append trace is still cached.
-    const source =
-        \\local n, nr = 1000, 5
-        \\local vx, val, vy, col, row = {}, {}, {}, {}, {}
-        \\for i = 1, n do vx[i] = i * 0.5 end
-        \\for i = 1, n * nr do val[i] = i * 0.25 end
-        \\row[1] = 1
-        \\for r = 1, n do
-        \\  local rr = row[r]
-        \\  row[r+1] = rr + nr
-        \\  for i = 0, nr - 1 do col[rr+i] = 1 + i end
-        \\end
-        \\local function sparse_mult(nn, cycles, vy_, val_, row_, col_, vx_)
-        \\  for p = 1, cycles do
-        \\    for r = 1, nn do
-        \\      local sum = 0
-        \\      for i = row_[r], row_[r+1] - 1 do sum = sum + vx_[col_[i]] * val_[i] end
-        \\      vy_[r] = sum
-        \\    end
-        \\  end
-        \\end
-        \\sparse_mult(n, 1, vy, val, row, col, vx)
-        \\sparse_mult(n, 40, vy, val, row, col, vx)
-        \\print(vy[n])
-    ;
+    //
+    // Native exit adapters OFF: this pins doc 47's same-anchor sibling. With
+    // them on (the default since doc 58 B2) the append continuation's
+    // `guard_append` exit is attachable, and doc 56's exit-side route serves
+    // it with a child that starts AT the exit — LuaJIT's side-trace shape —
+    // before the sibling's evidence accrues. The next test pins that form.
+    const source = sparse_grow_reuse_src;
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
+    vm.trace.config.exit_side_native = false;
     var nbuf: [64]u8 = undefined;
     var nsink = io.Writer.fixed(&nbuf);
     var chunk = try runNativeForTrace(&vm, gpa, source, &nsink);
@@ -653,6 +664,48 @@ test "doc 47 convergence: grow-then-reuse commits an append continuation, then t
     try testing.expectEqual(@as(u64, 0), vm.trace.silent_rejects.open_chain);
     try testing.expectEqual(@as(u64, 0), vm.trace.silent_rejects.child_mismatch);
     try testing.expectEqualStrings("9372.5\n", nsink.buffered());
+}
+
+test "doc 47 convergence, default config: the append continuation's guard_append exit binds an in-bounds exit-side child" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // The same grow-then-reuse transition with native exit adapters on (the
+    // default since doc 58 B2). The steady-state calls fail the append
+    // continuation's `guard_append` on every entry; doc 56 serves that exit
+    // with a `.link` child recorded AT its resume pc, storing in-bounds — and
+    // the resulting cycle still elects, promotes and runs silent.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var nbuf: [64]u8 = undefined;
+    var nsink = io.Writer.fixed(&nbuf);
+    var chunk = try runNativeForTrace(&vm, gpa, sparse_grow_reuse_src, &nsink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("9372.5\n", nsink.buffered());
+
+    const f64_ord = @intFromEnum(array.Lane.f64);
+    var bound: usize = 0;
+    for (vm.trace.registry.cache.items) |ap| {
+        const n = ap.code.instrs.len;
+        if (n == 0 or ap.code.instrs[n - 1].op != .link) continue;
+        for (ap.code.instrs, 0..) |ins, ei| {
+            if (ins.op != .guard_append) continue;
+            // The append continuation's growth guard is attached …
+            if (ap.exitSideAt(ei) != .attached) continue;
+            const p = ap.code.exitResumePc(ei) orelse continue;
+            // … to an in-bounds `.link` child anchored at its resume pc.
+            for (vm.trace.registry.cache.items) |ch| {
+                const cn = ch.code.instrs.len;
+                if (ch.code.anchor.proto != ap.code.anchor.proto or ch.code.anchor.pc != p) continue;
+                if (cn == 0 or ch.code.instrs[cn - 1].op != .link) continue;
+                for (ch.code.instrs) |ci| {
+                    if (ci.op == .astore and ci.aux == f64_ord) bound += 1;
+                }
+            }
+        }
+    }
+    try testing.expect(bound >= 1);
+    try testing.expect(vm.trace.registry.native_physical.silent_promotions > 0);
+    try testing.expect(vm.trace.silent_transitions_total > 0);
 }
 
 // ---- doc 18 §T: slot-0 array part, cross-tier ----
@@ -1619,11 +1672,17 @@ fn assertNoPeel(vm: *Vm, mode: TraceMode) anyerror!void {
 
 test "doc 39: recurring int-entry/float-body while root peels, compiles, and stays byte-identical" {
     // Each kernel() instance re-arrives at the while anchor with `x` int; the
-    // body forces it float at trip >= 5. With `hotloop = 4` the root records at
-    // trip 5 of instance 1 — the transition trip — so the recording sees the
-    // int entry AND the float body: the doc-39 peel shape. Every later
-    // instance re-enters the peeled trace at ITS trip-5 arrival and runs the
-    // float steady state to completion inside the trace.
+    // body forces it float at trip >= 5. The root must record ON the transition
+    // trip, so that the recording sees the int entry AND the float body: the
+    // doc-39 peel shape. Every later instance re-enters the peeled trace at ITS
+    // trip-5 arrival and runs the float steady state to completion inside the
+    // trace.
+    //
+    // Doc 58: `hotloop = 5`, not 4. The `loop` marker counts the iteration on
+    // trip 1 (a `while` root is entered at its body now), where the old
+    // condition anchor only counted from trip 2 — so every trip-aligned peel
+    // threshold in this family moves up by exactly one. That the peel can now
+    // see trip 1 at all is the point of §4.6.
     try expectProgramTuned(
         \\local function kernel()
         \\  local x = 0
@@ -1637,7 +1696,7 @@ test "doc 39: recurring int-entry/float-body while root peels, compiles, and sta
         \\local s = 0
         \\for m = 1, 8 do s = s + kernel() end
         \\print(s)
-    , "132\n", .{ .inspect = &assertPeelCommitted });
+    , "132\n", .{ .hotloop = 5, .inspect = &assertPeelCommitted });
 }
 
 test "doc 39: zero-completion deopt leaves the boxes untouched (tier-0 replays iterations 1-2)" {
@@ -1658,7 +1717,7 @@ test "doc 39: zero-completion deopt leaves the boxes untouched (tier-0 replays i
         \\local s = 0
         \\for m = 1, 8 do s = s + kernel(m == 4 and 3 or 0) end
         \\print(s)
-    , "133.5\n", .{ .inspect = &assertPeelCommitted });
+    , "133.5\n", .{ .hotloop = 5, .inspect = &assertPeelCommitted });
 }
 
 test "doc 39: run-once region keeps exact int semantics above 2^53" {
@@ -1680,13 +1739,13 @@ test "doc 39: run-once region keeps exact int semantics above 2^53" {
         \\local r = 0
         \\for m = 1, 8 do r = kernel() end
         \\print(r)
-    , "12\n", .{ .inspect = &assertPeelCommitted });
+    , "12\n", .{ .hotloop = 5, .inspect = &assertPeelCommitted });
 }
 
 test "doc 40: the F1 reverse shape (float entry, int store) peels organically at a root anchor" {
     // Doc 39 pinned this shape as "does not peel" (the sweep was int-entry
-    // only); doc 40's bidirectional sweep lifts that defer. With hotloop = 4
-    // the root records at trip 5 — the FIRST of five consecutive reset trips
+    // only); doc 40's bidirectional sweep lifts that defer. The root must
+    // record at trip 5 — the FIRST of five consecutive reset trips
     // (i % 10 >= 5), where the carried `x` enters FLOAT (the div run floated
     // it), is READ (`t = t + x + u`, so the entry is guard_float-proven — a
     // write-only reset leaves `entry_kind` unstamped and the sweep blind, by
@@ -1715,27 +1774,32 @@ test "doc 40: the F1 reverse shape (float entry, int store) peels organically at
         \\print(x)
         \\print(t)
         \\print(u)
-    , "8\n2873.25\n22.78125\n", .{ .inspect = &assertPeelCommitted });
+    , "8\n2873.25\n22.78125\n", .{ .hotloop = 5, .inspect = &assertPeelCommitted });
 }
 
-test "doc 40 phase 0: zero-completion while-done on a peeled trace must not chain stale state" {
-    // Codex finding 3 on the landed doc-39 code. Instances with n == 30 commit
-    // the peel and drive the while-loopdone continuation machinery hot. The
-    // m == 7 instance passes n == 6: it arrives at trip 5 with x == 4 (int, so
-    // the peeled trace's fingerprint matches), the run-once region executes
-    // iteration 5 (x -> 4.5, i -> 6), and the STEADY region's condition check
-    // `i < n` fails before the first `.loop` — a while-done-classified exit
-    // with zero local completions whose run-once work is real but unflushed.
-    // If the loop-done chain continues at the post-loop PC from the untouched
-    // boxes, the instance contributes the stale 4 instead of 4.5 and the sum
-    // drifts. The inner while must share the OUTER loop's frame — a while
-    // inside a called function can never arm the loop-done continuation
-    // ("cont-arm refuse: no enclosing back-edge"), which would leave this
-    // test green without ever reaching the chain path.
+test "doc 40 phase 0: a peeled while root exiting at zero completions replays its run-once work" {
+    // Codex finding 3 on the landed doc-39 code, kept as a correctness pin.
+    // Instances with bound == 30 commit the peel. The m == 7 instance passes
+    // bound == 7: it arrives at trip 5 with x == 4 (int, so the peeled trace's
+    // fingerprint matches), the run-once region executes iteration 5
+    // (x -> 4.5, i -> 6) and passes its condition, the STEADY region executes
+    // iteration 6 (x -> 5, i -> 7), and its condition fails before the first
+    // `.loop` — an exit with ZERO local completions whose work is real but
+    // unflushed. The instance must still contribute 5, not a stale 4.
+    //
+    // Doc 58: the hazard used to be the `.while_done` chain resuming at the
+    // post-loop pc from those untouched boxes, and doc 40 answered it with the
+    // peel-aware `whileDoneCoherentAtZero` gate. That chain is deleted: the
+    // condition guard is now an ORDINARY exit at the END of each region, so a
+    // zero-completion exit takes the coarse deopt, which for a peeled trace
+    // replays from the entry state (`rbx == entry_rbx`). B2 review: the bound
+    // was 6, which with the condition at the end fails in the RUN-ONCE region
+    // instead; `assertPeeledSteadyZeroExit` now pins that the steady-region
+    // exit is really taken.
     try expectProgramTuned(
         \\local s = 0
         \\for m = 1, 12 do
-        \\  local bound = (m == 7) and 6 or 30
+        \\  local bound = (m == 7) and 7 or 30
         \\  local x = 0
         \\  local i = 1
         \\  while i < bound do
@@ -1745,7 +1809,16 @@ test "doc 40 phase 0: zero-completion while-done on a peeled trace must not chai
         \\  s = s + x
         \\end
         \\print(s)
-    , "186\n", .{ .inspect = &assertPeelCommitted });
+    , "186.5\n", .{ .hotloop = 5, .inspect = &assertPeeledSteadyZeroExit });
+}
+
+/// `assertPeelCommitted`, plus: every executing leg took at least one
+/// zero-completion exit from the peeled trace's STEADY region (the
+/// dispatcher's `peeled_steady_zero_exits` witness).
+fn assertPeeledSteadyZeroExit(vm: *Vm, mode: TraceMode) anyerror!void {
+    try assertPeelCommitted(vm, mode);
+    if (mode == .off or mode == .record_only) return;
+    try testing.expect(vm.trace.peeled_steady_zero_exits > 0);
 }
 
 /// Doc 40 Phase 1: no cached trace may be a native `.unsupported` verdict.
@@ -1798,13 +1871,21 @@ fn assertGluePeelCompiled(vm: *Vm, mode: TraceMode) anyerror!void {
     try assertPeelCommitted(vm, mode);
 }
 
-test "doc 40 phases 2-4: the reset-to-int glue peels through the side channel and compiles" {
+test "doc 40 phases 2-4: the reset-to-int shape peels at the while root and compiles" {
     // The same fft_bitreverse reduction as the phase 1 test, but now the
-    // refusal is only the fallback: the glue recording (a `.side` /
-    // `.continuation` recording closing as `.loop` at the plain-while anchor)
-    // is peel-ELIGIBLE (Phase 2), the bidirectional sweep detects the
-    // float-entry/int-store slot `k` (Phase 3), and the committed peel
-    // lowers to native — `proveKinds` hoists the steady body's `guard_int`
+    // refusal is only the fallback: the recording is peel-ELIGIBLE (Phase 2),
+    // the bidirectional sweep detects the float-entry/int-store slot `k`
+    // (Phase 3), and the committed peel lowers to native.
+    //
+    // Doc 58: the peel now commits at the inner `while`'s own ROOT anchor (its
+    // body start), where doc 40 could only reach this shape through the GLUE
+    // side channel (a `.side`/`.continuation` recording closing as `.loop` at
+    // the plain-while anchor). Two reasons, both from §4.6: a root can record
+    // on trip 1 now, which is when `k` is still float; and the glue channel
+    // itself is gone with the doc 38 while-done hotness it grew from. This is
+    // the peel's original motivation, reached directly.
+    //
+    // `proveKinds` hoists the steady body's `guard_int`
     // on the internal φ through to its unguarded `slot_load` init, the
     // reset-to-int `k = n` (Phase 4). The run-once region swallows the float
     // `k`; the steady loop carries the int; every value the φ delivers is
@@ -1822,7 +1903,7 @@ test "doc 40 phases 2-4: the reset-to-int glue peels through the side channel an
         \\  end
         \\end
         \\print(total)
-    , "360\n", .{ .inspect = &assertGluePeelCompiled });
+    , "360\n", .{ .hotloop = 5, .inspect = &assertGluePeelCompiled });
 }
 
 test "doc 39: a numeric-for anchor with the same transition does not peel" {

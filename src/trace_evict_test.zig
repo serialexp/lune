@@ -566,10 +566,17 @@ fn inspectMonotonicRetirement(vm: *Vm, mode: testutil.TraceMode) anyerror!void {
     // widen and must be retired from the cache — not merely flagged by the
     // standalone predicate. (Phase-1 traces at anchors phase 2 never
     // re-enters — the first outer `for k` loop — legitimately survive:
-    // eviction is entry-driven, so they stay out of this census.)
+    // eviction is entry-driven, so they stay out of this census. So does the
+    // doc 56 exit-side child phase 1 records mid-body in `fill`: it is entered
+    // only through its parent's adapter, which retirement disarms.)
     var has_value = false;
     for (vm.trace.registry.cache.items) |t| {
-        if (!std.mem.eql(u8, t.code.anchor.proto.name, "fill")) continue;
+        const p = t.code.anchor.proto;
+        if (!std.mem.eql(u8, p.name, "fill")) continue;
+        const loop_header = for (p.code, 0..) |ins, pc| {
+            if (ins.op == .for_loop) break @import("bytecode.zig").loopHeaderOf(ins, pc).?;
+        } else return error.TestUnexpectedResult;
+        if (t.code.anchor.pc != loop_header) continue;
         try testing.expect(!guardsIntLane(t));
         if (laneAt(t, .value)) has_value = true;
     }

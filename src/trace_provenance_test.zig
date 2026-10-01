@@ -1170,6 +1170,9 @@ test "A-viii (doc 17 ยงA8 step 8): one disarm tears down the whole OUTER cycle โ
         .id = 3,
         .native = .{ .compiled = .{ .page = undefined, .slots = cont_slots, .gpa = gpa, .linked_entry = 0x5333, .ordinary_entry = 0x6333 } },
     };
+    var snap_arena = std.heap.ArenaAllocator.init(gpa);
+    defer snap_arena.deinit();
+    try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &cont.code);
     // The three distinct shapes, as the arm path's validators will classify them.
     try testing.expect(isLoopDoneGuardIndex(&inner, 4)); // loop-done slot
     try testing.expect(nativegen.isCompositeBridgeCandidate(&cont.code, 7)); // bridge slot

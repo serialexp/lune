@@ -1810,18 +1810,146 @@ nothing at all.
       Diagnosed (doc 56 §4.8.4): t6 is a `.side` trace at pc 18 that
       unrolled the OUTER loop, not the inner `for k`. Waiting on Bart's
       G6-Q1 (item above).
-- [ ] **Doc 56 G5: a `while` root's loop-done exit never links
-      natively.** Numeric `for` has `loop_done_linked`; `while` has only
-      the runtime `.while_done` chain (bit-reverse inner `while`: ~20k of
-      22k ledgers end at its `.deopt`, so the armable exit-side cycle
-      never reaches a full ledger and never promotes). General, affects
-      every `while` loop that exits into traced code. Bart ruled P6-Q4
-      (a): its own doc — **doc 58, rev 2, reviewed (Antigravity APPROVE
-      WITH CHANGES); BART: G5-Q1..Q4 in doc 58 §7.** When it lands, add
-      promotion checks to the test "doc 56 Phase 6: fft bit-reverse's
-      exit-side cycle mints armable".
+- [x] **Doc 56 G5: a `while` root's loop-done exit never links
+      natively.** Fixed by doc 58 B2 (2026-09-30): the condition moved to
+      the END of the trace (LuaJIT's `BC_LOOP` shape), so the exit is an
+      ordinary exit that exit-side serves. The `.while_done` chain is
+      deleted. Bit-reverse: 0.2% / 36.8% → 83.4% / 75.7% of iterations
+      traced at its two hot anchors with the switch on.
+- [ ] **DOC 58 B2 IS REVIEW-REJECTED — read this before touching the arc.**
+      codex (2026-09-30, `docs/reviews/doc58/codex-b2.md`): *do not land*.
+      B2 is implemented and both gates are green, but it is UNCOMMITTED and
+      must stay that way until three blockers are fixed. Details and the
+      options awaiting Bart's pick are in `CURRENT_TASK.md`
+      ("B2 REVIEW OUTCOME 2026-09-30") and doc 58 §5.
+      - **Blocker 1 is a verified mode-equivalence violation**, now covered
+        by `bench/while_shortcircuit_probe.lua` (NEW). That probe prints 76
+        under tier-0 / `--trace` / `--jit-native` and **215** under
+        `--jit-native --jit-exit-side-native`; LuaJIT also prints 76, so 215
+        is simply wrong. **The 4-mode parity sweep is therefore RED with B2
+        applied — that is correct and expected, not a sweep bug.** The probe
+        stays in the tree after the fix: it is the only parity coverage of a
+        short-circuit condition on a `while` root, and its absence is why
+        28 benches × 4 modes came back clean.
+      - **Blocker 1 FIXED 2026-10-01** (composite bridge vs exit snapshot,
+        `TraceCode.bridgeMatchesExitSnapshot`; see CURRENT_TASK "B2 FIX-ALL").
+      - **Blocker 2 FIXED 2026-10-01** — the dispatcher now counts
+        own-loop-test exits; `noteTakenExit` routes them to exit-side and
+        stops them before every legacy route.
+      - **Follow-up from blocker 2 (doc 56 G6 territory, after B2 lands):** an
+        exit-side `.continuation` recorded on a ZERO-trip outer iteration
+        re-reaches its own non-header anchor through the outer `for`, and
+        `TraceState.maybeCloseAtAnchor` closes it `.loop`; exit-side only
+        binds `.link` children, so that exit gives up for good (seen on
+        `for i … do local j = i % 3; while k < j … end end` under tier-1a).
+        LuaJIT never closes a side trace at a non-loop-op pc: it keeps
+        recording across an uncompiled loop (`rec_loop_interp`, bounded by
+        `loopunroll`) and stops `LJ_TRLINK_ROOT` at the next compiled loop op
+        (`rec_loop_jit`). Fix together with G6-Q1(d)'s `loopunroll` bound.
+      - **Blocker 3 FIXED 2026-10-01** — two parts. (a) fft's `repeat`
+        body became a closed SCC with two qualifying loop roots and minted
+        `armable=false`; doc 58 §4.8's gate-dominance tie-break elects the
+        first loop (`Proto.dom`, `bc_dom.zig`). (b) `exit_side_native` is ON
+        by default (CLI ablation: `--jit-no-exit-side-native`; the harness
+        follows the config default), so the replacement for
+        `.low_trip_while` is the shipped path.
+      - **All six should-fixes DONE 2026-10-01:** `loopExtentFor` is an O(1)
+        checked query that fails closed (malformed-bytecode tests;
+        `isWhileHeader` no longer `@enumFromInt`s an unchecked kind);
+        `recLoopLink` checks the root's entry contract like `recForLoop`;
+        the bound-7 steady-region test with a `peeled_steady_zero_exits`
+        witness; the link-kind oracle is CFG natural loops, not
+        `loopExtentFor`; bit-reverse names its two headers; the repeat test
+        demands a link into the repeat root; unused imports gone; §4.5 split
+        into a numeric final-test exemption and a marker-loop policy that
+        strikes once exit-side cannot serve the exit (test + mutation).
+      - **Flip fallout, fixed in the same change:** one-shot `.link` traces
+        now classify loaded+stored slots `.invariant` like `.terminal`
+        (`nativegen_alloc.zig`) — an exit-side child starting mid-statement
+        loads a table temp the body reuses for an int, and bailed native.
+        Five tests that pin legacy arm kinds (Part S head arms, doc 16
+        prime-side, doc 17 A-viii scope, doc 47 same-anchor sibling, the
+        adapter-off layout) set `exit_side_native = false` explicitly; doc 47
+        gained a default-config twin asserting the exit-side form.
+      - Gates, parity sweep and board done (doc 58 §5 "B2 FIX-ALL" 6–7).
+        Committed (Bart: commit now, fix after). **Open:** the flip regresses
+        nsieve/nsieve-bit/sieve_int ~3× (pre-existing switch-on cost: doc 56
+        G6 + silent promotion) — fixing next; the owed codex re-review of B2
+        runs together with that fix.
+- [ ] **Exit-side children are never retired with their parents.** Found
+      by the doc 58 flip (`trace_evict_test` monotonic widening): doc 48
+      retires a stale narrow-lane root on entry, its exit-side child (a
+      `.continuation` at the raw resume pc) loses its only arm and stays
+      cached for good — unreachable, still guarding the stale lane, still
+      counting against `max_traces_per_anchor` at its pc. LuaJIT flushes a
+      root's side traces with it (`trace_flushroot`). Ours are shared by
+      resume pc (doc 56 rev 5), so the analogue needs a binder count
+      (retire when the last binding parent goes), not a parent pointer.
+- [ ] **Exits of a child reached inside a burst never get exit-side
+      service (doc 56 P6-Q3, deferred).** Seen writing the doc 58 §4.5 test:
+      a post-loop child that guards a phase branch deopts at its OWN exit
+      on every hop, nothing wants that exit (exit-side serves only the
+      directly entered trace's exits), the parent's exit gives up after
+      `tryside` unlinked chains and the anchor is gated. LuaJIT would grow a
+      side trace of the side trace there.
+- [ ] **`continuationReachesEnclosingBackEdge` scans at most 128
+      instructions** (`trace_exit_attach.zig` ~471): an enclosing loop
+      whose closer is further away is missed, so a big `repeat`/`while` body
+      (fft at n=64 before hoisting `sin`/`pi`) never forms the cycle. Replace
+      the bounded scan with an exact structural query (`Proto.dom` /
+      `loopExtentFor` from the enclosing header side are both O(1) now).
+- [ ] **Topology rebuild is ~k² in region members** (`bench-topology`,
+      `zig build bench-topology`): k=512 ≈ 3.5 ms per rebuild, k=128 ≈
+      0.2 ms; independent of proto size since doc 58 §4.8. The cost is the
+      per-node `hasInnerRootAt` / edge loops, pre-existing (the §4.8
+      tie-break is ~2% of it). Index them.
+- [ ] **Unused import aliases** in `trace_chain.zig`, `trace_link.zig` and
+      `trace_regionops.zig` (dozens: `IrOp`, `Ref`, `ProgramPoint`, …), left
+      by the file split. Zig does not flag unused file-scope decls; prune.
+- [ ] **Legacy exit routes are fallback-only now that exit-side native is
+      the default.** Part S sibling handoff, doc 16 prime-side chains and
+      doc 47 same-anchor siblings only serve exits exit-side refuses
+      (peeled, precise, non-attachable, gave up). Audit which remain
+      reachable in the default config and retire the rest (Z-7).
+- [ ] **Doc 58 B4 leftovers (the arc is not finished).**
+      - fft is still 336 ms with the switch on (B0 215, doc 58 §6 target
+        131). **Diagnosed 2026-09-30 (Z-8 ladder) — the earlier "every 32
+        rows pays a replay walk" reading was wrong.** On fft the seam IS
+        the run (native 8.2% of cycles, steering seam **87.2%**, 66,032
+        replay walks at ~34,624 cyc/walk), but **70% of dispatcher bursts
+        end in `prologue_fail`** (46,184 of 66,029, on `fft_bitreverse:60`
+        and `:69`) — entry failures, mostly well before the cap. codex
+        reached the same place independently (6,901/6,969 on its isolated
+        probe) and names a cause to test first: `recLoopLink`
+        (`trace_recorder.zig` ~3933) discards `regs` and closes the
+        inner-root link with **no `entryGuardsMatch` check**, unlike the
+        numeric path at ~3559 — so a reset integer can reach a root
+        specialised for a later float iteration.
+      - `silent_promotions = 0` is a SEPARATE, downstream finding, and it is
+        **not** owner election: 6 regions minted, 4 `armable=true`, and every
+        `silent rejects:` counter is 0 with `candidates=0`, so
+        `considerSilentPromotion` bails *before* the candidate counter. The
+        smell is `region maps: profit count=0` against 203 `region: close`
+        for 6 mints — no frozen accumulator is live when a full-cap yielded
+        ledger arrives (`trace_link.zig:1524-1537`). And prologue failures
+        satisfy neither promotion route's evidence class (~1505, ~1724), so
+        fixing the entry contract may answer this on its own. Arming is fine
+        (`t=10 ei=8 deopt outcome=yielded` 17,599 times proves the slot is
+        armed). Next step: a permanent `self.dbg` probe naming which of the
+        four gates bails.
+      - This is the promotion-check item G5 asked for — add it to the
+        test "doc 56 Phase 6: fft bit-reverse's exit-side cycle mints
+        armable" once B4 diagnoses why they do not promote (Z-8 ladder).
+      - With the switch OFF, `while`-heavy code is slower than B0 by
+        design (lowtrip +115%, fft +75%): the exit is a coarse deopt that
+        replays the final body pass and arms no continuation. B4 flips
+        the switch, which is what ends it.
+      - Tier-0 cost of the extra marker instruction: +5.3% lowtrip,
+        +4.6% hightrip (doc 58 §4.2 budgeted 2%; real benches are
+        +2.1% pi_leibniz, +1.8% nsieve-bit-fp, −2.3% fft). BART's call
+        whether the synthetic-probe overage matters.
 - [ ] **A branch that flips for good strands the loop on tier-0 (switch
-      off).** `for i = 1, N do local lt = i < 500; if lt then … end end`:
+      off).** `for i = 1, N do local lt = i < 500; if lt then ... end end`:
       after i = 500 the root trace fails its first guard every entry,
       legacy strikes gate it, 99.5% runs on tier-0. Switch on, since
       Phase 6: silent, 1 ms (switch off 2 ms). So this is fixed by

@@ -209,62 +209,23 @@ pub fn isLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
     return true;
 }
 
-/// Doc 38 — the WHILE twin of `isLoopDoneGuardIndex`, returning the post-loop
-/// resume PC on a match (null otherwise). A while loop compiles to
-/// `<cond>; jmp_if_false <past_end>; <body>; jmp <back_to_cond>`, so its
-/// loop-done exit is the CONDITION guard: a `guard_true` (recBranch pinned the
-/// observed continue direction) whose source opcode is the `jmp_if_false`.
-/// Classified structurally, tied to the trace's own anchor: the branch's jump
-/// target must be exactly one past a backward `jmp` that returns to
-/// `t.code.anchor.pc` — that shape IS the while loop this trace is the root of, and
-/// it cannot match an inner while unrolled inside the trace (its back-edge
-/// targets the inner header, not our anchor).
+/// Doc 58: the test of the loop this trace is anchored at, for ALL three loop
+/// shapes — `for_loop`/`tfor_loop`, `while` (the branch above the `loop`
+/// marker) and `repeat` (the backward branch onto it). Use at accounting sites
+/// where "the loop ran to completion" matters regardless of loop shape
+/// (hot-exit exclusion, receipt region-work) and wherever a loop exit must not
+/// be mistaken for a branch alternation. Kind-specific machinery (the native
+/// linked materialization, `flushNumericForLoopDone`) keeps using
+/// `isLoopDoneGuardIndex` / `isNumericForLoopDoneGuard`, because only a
+/// numeric/generic `for` owes the final-iteration flush.
 ///
-/// Two structural differences from the numeric-for loop-done:
-///  * the guard sits at the trace TOP (before the body), so the failing pass
-///    ran only the condition prefix — completed iterations already committed
-///    at their `.loop` terminals and NO final-iteration flush is owed;
-///  * the post-loop PC is the branch's JUMP TARGET, not `guardExitPc` (which
-///    is the fall-through = the loop body start).
-/// Same doc-37 provenance rule as the numeric classifier: an inlined-callee
-/// guard's `guardSourcePc` is in the callee's proto — reject depth > 0.
-pub fn whileLoopDonePostPc(t: *const Trace, idx: usize) ?u32 {
-    return t.code.whileLoopDonePostPc(idx);
-}
-
-/// Doc 38: boolean twin of `whileLoopDonePostPc` for classification-only sites.
-pub fn isWhileLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
-    return whileLoopDonePostPc(t, idx) != null;
-}
-
-/// Doc 40 Phase 0 (codex finding 3): is a while-loop-done exit's "zero
-/// completions ⇒ regs coherent at the post-loop pc" claim actually true for
-/// this trace? For an ordinary trace, always — the condition guard sits at the
-/// trace top, before any of the final pass's body ran (the doc 38 zero-trip
-/// argument). For a PEELED trace (doc 39) the claim breaks in the STEADY
-/// region: the run-once region is a real tier-0 iteration, and a
-/// zero-completion deopt deliberately leaves the carried-slot boxes untouched
-/// — so a steady-region loop-done firing at zero local completions has
-/// *executed* (but never flushed) iteration 1, and the post-loop pc is NOT
-/// coherent. Such an exit must take the ordinary deopt-replay path (tier-0
-/// re-runs from the entry state), never the `.while_done` chain. A
-/// run-once-region loop-done (idx before the marker) stays chain-safe: zero
-/// completions there really is zero iterations.
-pub fn whileDoneCoherentAtZero(t: *const Trace, idx: usize) bool {
-    if (!t.code.peeled) return true;
-    for (t.code.instrs[0..@min(idx, t.code.instrs.len)]) |ins| {
-        if (ins.op == .preheader) return false; // marker precedes the exit → steady region
-    }
-    return true;
-}
-
-/// Doc 38: either loop-done kind — numeric-for OR while. Use at accounting
-/// sites where "the loop ran to completion" matters regardless of loop shape
-/// (hot-exit exclusion, receipt region-work). Kind-specific machinery (the
-/// native linked materialization, `flushNumericForLoopDone`) keeps using the
-/// specific classifiers.
-pub fn isAnyLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
-    return isLoopDoneGuardIndex(t, idx) or isWhileLoopDoneGuardIndex(t, idx);
+/// This replaces doc 38's `while`-specific chain (`whileLoopDonePostPc`,
+/// `isWhileLoopDoneGuardIndex`, `whileDoneCoherentAtZero`,
+/// `isAnyLoopDoneGuardIndex`): with the condition at the END of the trace, a
+/// `while` exit is an ordinary exit that resumes after the loop, so there is
+/// nothing left for those to classify.
+pub fn isOwnLoopTestIndex(t: *const Trace, idx: usize) bool {
+    return t.code.isOwnLoopTest(idx);
 }
 
 /// Caller-declared intent for `armNativeLink`, enforcing the P-C option (b) invariant
@@ -376,13 +337,6 @@ pub const ExitMaterialization = union(enum) {
     ordinary_header,
     ir_numeric_for_done: []Value,
     native_numeric_for_done,
-    /// Doc 38: a while-loop-done exit (either tier — the tier is `driveChain`'s
-    /// comptime param). The condition guard sits at the trace TOP, so the
-    /// failing pass ran only the condition prefix: completed iterations already
-    /// committed at their `.loop` terminals and NO flush is owed on any tier.
-    /// The chain walks at the post-loop pc (`whileLoopDonePostPc`), which is
-    /// the condition branch's jump target — NOT `guardExitPc`.
-    while_done,
     /// Doc 56 Phases 3–4: an exit-side exit. The executor (tier-1a) or the
     /// exit adapter (native) already made the slab coherent at the exit's
     /// resume pc `P` (the payload), so the chain walks `.link` continuations
@@ -415,12 +369,7 @@ pub const Gate = struct {
     window: u32,
     /// How many times this anchor has been gated; `>= max_strikes` ⇒ permanent.
     strikes: u32,
-    /// Why the LAST escalation fired (doc 38 yield gate). A `.low_trip_while`
-    /// dispatch gate is exempt from the clear-on-productive paths: the very
-    /// receipts that would clear it (1–2-trip completions) are the evidence it
-    /// gates on. It expires only via the standard cooldown, after which a
-    /// probe window that clears the yield bar simply never re-gates
-    /// (`noteWhileYield`). All other reasons keep doc 31 D2 semantics.
+    /// Why the LAST escalation fired (doc 31 D3 receipt line).
     reason: GateReason,
 };
 
@@ -432,25 +381,8 @@ pub const GateReason = enum {
     legacy_thrash,
     region_decay,
     native_unsupported,
-    /// Doc 38 yield gate: a while anchor whose entries average below
-    /// `config.while_yield_min_avg` trips over a `while_yield_window`-entry
-    /// probe. Each entry is productive (a completion, often 1–2 trips, half
-    /// zero-trip on fft_bitreverse) but the per-entry runtime turnstile
-    /// (entry + seam re-entry; our exits are not patched branches) costs more
-    /// than tier-0 running the same 0–2 iterations. Dispatch-gate source;
-    /// exempt from clear-on-productive (see `Gate.reason`).
-    low_trip_while,
     record_abort,
     commit_failure,
-};
-
-/// Doc 38 yield-gate accumulator (`TraceState.while_yield`): entries and total
-/// completed iterations observed for one while anchor over the current probe
-/// window. Both saturate; the verdict compares `iters` against
-/// `entries * while_yield_min_avg` at `entries == while_yield_window`.
-pub const WhileYield = struct {
-    entries: u32,
-    iters: u32,
 };
 
 /// Identifies a guard-failure site: the trace anchor and the bytecode PC of the
@@ -681,33 +613,6 @@ pub const TraceConfig = struct {
     /// roots) before `recWhileLink` stops unrolling there and decomposes into
     /// inner-root + link (LINNER). 2 = LuaJIT `innerloopleft` penalty parity.
     unroll_fail_flip: u32 = 2,
-    /// Doc 38 glue-sibling eligibility: maximum observed average trips/entry
-    /// (from the `while_yield` accumulator) at which a while anchor's
-    /// loop-done exit still accrues side-trace hotness — i.e. may grow the
-    /// cond-false GLUE sibling (`guard_false → outer body → loop`, the
-    /// figure-eight). Cost model: the glue fusion's benefit is amortizing the
-    /// per-instance entry+seam turnstile, which dominates only for low-trip
-    /// whiles (nest avg 5: glue = 78 cyc/it vs 137 decomposed; fft avg 1.5).
-    /// For high-trip whiles the body loop already amortizes the seam and the
-    /// glue family is measured pure downside (nsieve-bit-fp avg ~30+: glue
-    /// formation was a 2.7× bench regression vs the root+link chain). Below
-    /// the minimum sample (8 entries) hotness does not accrue (conservative:
-    /// glue formation defers until the trip pattern is observed).
-    while_glue_max_avg: u32 = 8,
-    /// Doc 38 yield gate probe window: how many while-loop-done ENTRY receipts
-    /// are accumulated per anchor before the average-trip verdict. Small enough
-    /// that a hopeless turnstile (fft_bitreverse: 25.5M entries/run at ~1.5
-    /// trips avg) gates within noise; large enough that a bursty-but-healthy
-    /// while (mixed zero-trip and long instances) shows its true average.
-    while_yield_window: u32 = 64,
-    /// Minimum average trips per entry (integer, compared as
-    /// `iters < entries * min_avg`) a while anchor must sustain over a probe
-    /// window to stay dispatched. Below it, entering the trace costs more in
-    /// runtime turnstile (entry + seam) than tier-0 running the same 0–2
-    /// iterations, so the anchor is dispatch-gated (`.low_trip_while`).
-    /// Recovery is probe-based: post-cooldown windows that clear the bar
-    /// never re-gate. Pure deterministic counters — no clocks, no RNG.
-    while_yield_min_avg: u32 = 3,
     /// Guard-failure count at which a side trace is recorded for this
     /// `(anchor, exit_pc)` pair.  When a guard at PC X in a trace anchored
     /// at A fails this many times, the next back-edge to A arms a new
@@ -736,12 +641,13 @@ pub const TraceConfig = struct {
     /// Doc 56 Phase 4: exit-side routing on NATIVE pages (needs
     /// `exit_side`). Compiles the exit-side stub at every attachable exit
     /// and keeps the values its adapter reads live there; a wanted or
-    /// attached exit then materializes at `P` natively. Off by default until
-    /// Phase 6: before the adapter can jump straight into its child (Phase
-    /// 5) and the cycle can run silent (Phase 6), every native hop returns to
-    /// the runtime (~600 ns), which would make hot hops slower than today's
-    /// exit. Off, the machine code is byte-identical.
-    exit_side_native: bool = false,
+    /// attached exit then materializes at `P` natively. On by default since
+    /// doc 58 B2: a `while`/`repeat` loop's own test is an ordinary exit at
+    /// the end of its trace, and exit-side is what serves it (the deleted
+    /// doc 38 `.while_done` chain and `.low_trip_while` gate did before).
+    /// Off (`--jit-no-exit-side-native`), the machine code is byte-identical
+    /// to a pre-Phase-4 page — an ablation knob, not a supported tier.
+    exit_side_native: bool = true,
     /// Maximum distinct traces cached per anchor before `countGuardFailure` /
     /// `countFingerprintMiss` stop counting (i.e. before side-trace recording at
     /// that anchor is refused). Four remains the economic bound until native exit
@@ -1184,11 +1090,6 @@ pub const TraceState = struct {
     /// decomposition 4x faster than failed unrolling). Reset wholesale with
     /// the gates (epoch boundary).
     unroll_fail: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
-    /// Doc 38 yield gate accumulator: per-anchor (entries, iters) over the
-    /// current probe window, fed by every ENTERED receipt whose exit is a
-    /// while-loop-done guard (`noteWhileYield`). Reset per verdict and on the
-    /// epoch boundary with the gates.
-    while_yield: std.AutoHashMapUnmanaged(AnchorKey, WhileYield) = .empty,
     /// Doc 43 P5 (the read-routing memo): anchors where a recording aborted
     /// `.upvalue_mutable` — a `set_upval` hit a cell whose value the same
     /// recording had already baked into the per-entry snapshot. The gated
@@ -1368,6 +1269,13 @@ pub const TraceState = struct {
     /// 2.3b-1 continuation→inner `.link`-terminal arms) so the 2.3c-1 differential test
     /// can prove THIS arm fires; `> 0` is the "skip→ramp arm actually happened" signal.
     native_source_link_arms: u64 = 0,
+    /// Doc 40 phase 0 (doc 58 B2 review): dispatcher exits of a PEELED trace
+    /// from its steady region with ZERO local completions — the run-once
+    /// iteration ran but no back-edge committed, so the coarse deopt must
+    /// replay from the entry state. Witness only: `> 0` is the "that exit was
+    /// actually taken" signal its regression test needs (the output alone
+    /// cannot tell it from a run-once-region exit).
+    peeled_steady_zero_exits: u64 = 0,
     /// Part S: how many sibling-handoff slots were armed / actually fired natively.
     sibling_handoff_arms: u64 = 0,
     sibling_handoff_fused: u64 = 0,
@@ -2270,7 +2178,6 @@ pub const TraceState = struct {
         self.unroll_fail.deinit(self.gpa);
         self.upvalue_mutable_memo.deinit(self.gpa);
         self.precise_anchor_memo.deinit(self.gpa);
-        self.while_yield.deinit(self.gpa);
         self.penalty.deinit(self.gpa);
         self.guard_failures.deinit(self.gpa);
         for (self.values_chunks.items) |c| self.gpa.free(c);
@@ -2798,14 +2705,6 @@ pub const TraceState = struct {
             accountCandidateCharge(t, charge_kind);
             return;
         }
-        // Doc 38 yield gate: every ENTERED receipt that ended at a while-loop-
-        // done guard feeds the per-anchor trip accumulator — regardless of
-        // which profitability machine (region or legacy) consumes the receipt
-        // below, because the turnstile cost being measured (entry + seam
-        // re-entry per 0–2-trip completion) is real either way.
-        if (exit_instr < t.code.instrs.len and isWhileLoopDoneGuardIndex(t, exit_instr)) {
-            self.noteWhileYield(t.code.anchor, completed);
-        }
         const key: ?ExitKey = if (exit_instr < t.code.instrs.len)
             .{ .trace_id = t.id, .exit_instr = exit_instr }
         else
@@ -2831,73 +2730,14 @@ pub const TraceState = struct {
         }
     }
 
-    /// Doc 38 glue-sibling eligibility (see `Config.while_glue_max_avg`): may
-    /// this anchor's while-loop-done exit accrue side-trace hotness (and so
-    /// grow the cond-false glue sibling)? Deterministic — reads the
-    /// `while_yield` probe accumulator: requires a minimum sample of 8
-    /// entries in the current window AND an observed average strictly below
-    /// the glue ceiling. Consulted by the dispatch loop's hot-exit counting.
-    pub fn whileDoneHotnessEligible(self: *const TraceState, anchor: AnchorKey) bool {
-        const wy = self.while_yield.get(anchor) orelse return false;
-        if (wy.entries < 8) return false;
-        return wy.iters < wy.entries *| self.config.while_glue_max_avg;
-    }
-
-    /// Doc 38 yield gate: remove `anchor`'s dispatch gate UNLESS it is a
-    /// `.low_trip_while` yield gate — those are cleared only by
-    /// `noteWhileYield` on a genuinely high-trip completion, because the
-    /// receipts reaching the ordinary clear-on-productive paths (1–2-trip
-    /// while completions) are precisely the evidence the yield gate exists to
-    /// act on. Every other reason keeps its doc 31 D2 clear semantics.
+    /// Remove `anchor`'s dispatch gate (doc 31 D2 clear-on-productive).
     // pub for trace_regionops.zig (file-split pass)
     pub fn clearDispatchGate(self: *TraceState, anchor: AnchorKey) void {
         // Single-hash form (getEntry + removeByPtr, not getPtr + remove):
         // this runs on every productive receipt, and the extra hash of the
         // two-op form was a measured ~2% of a scimark-lu run.
         const e = self.gate.getEntry(anchor) orelse return;
-        if (e.value_ptr.reason == .low_trip_while) return;
         self.gate.removeByPtr(e.key_ptr);
-    }
-
-    /// Doc 38 yield gate: account one while-loop-done ENTRY receipt
-    /// (`completed` = trips this entry ran; 0 for a zero-trip completion —
-    /// the top-of-trace condition guard observed "done" before any body ran).
-    /// Rationale: a while completion at ANY trip count is productive-shaped,
-    /// so neither the legacy strike machine nor the region machine can see the
-    /// per-entry runtime turnstile (entry + seam re-entry; our exits are not
-    /// patched branches) that makes a 0–2-trip while NET SLOWER on the trace
-    /// tier than on tier-0 — fft_bitreverse pays it 25.5M times per run at
-    /// ~1.5 trips average, a measured +17% wall regression. This is the
-    /// LuaJIT-shape-free analog of the demoted `min_trip_entry` config: gate
-    /// on OBSERVED trips, not a predicted minimum. Pure deterministic
-    /// counters (mahina determinism): a `while_yield_window`-entry probe per
-    /// anchor; average below `while_yield_min_avg` ⇒ dispatch gate with the
-    /// standard doubling cooldown; `max_strikes` abandons the anchor to
-    /// tier-0 for good. Recovery is probe-based, not per-receipt: after the
-    /// cooldown the anchor free-runs one more window, and a probe whose
-    /// average clears the bar simply never re-gates. (A per-receipt "one
-    /// high-trip completion lifts the gate" rule was tried first and
-    /// oscillated: chain-driven entries — driveChain does not consult the
-    /// dispatch gate — kept delivering occasional 6-trip completions that
-    /// un-gated an anchor still averaging <1 trip/entry, measured live on
-    /// fft_bitreverse pc=55: `entries=64 iters=58 -> gate` then
-    /// `completed=6 -> ungate`, forever.)
-    fn noteWhileYield(self: *TraceState, anchor: AnchorKey, completed: usize) void {
-        const min_avg = self.config.while_yield_min_avg;
-        if (min_avg == 0) return; // knob disabled
-        const gop = self.while_yield.getOrPut(self.gpa, anchor) catch return;
-        if (!gop.found_existing) gop.value_ptr.* = .{ .entries = 0, .iters = 0 };
-        gop.value_ptr.entries +|= 1;
-        gop.value_ptr.iters +|= @as(u32, @intCast(@min(completed, std.math.maxInt(u32))));
-        if (gop.value_ptr.entries >= self.config.while_yield_window) {
-            const entries = gop.value_ptr.entries;
-            const iters = gop.value_ptr.iters;
-            gop.value_ptr.* = .{ .entries = 0, .iters = 0 };
-            if (iters < entries *| min_avg) {
-                self.dbg("while-yield: anchor pc={d} probe entries={d} iters={d} (< {d}) -> gate", .{ anchor.pc, entries, iters, entries *| min_avg });
-                self.gateAnchor(anchor, .low_trip_while);
-            }
-        }
     }
 
     // Region-ops: accounting, bridges, provenance, observer cache — moved to trace_regionops.zig (file-split pass);
@@ -3485,12 +3325,16 @@ pub const TraceState = struct {
     pub fn recordInstr(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, resolved: Value) void {
         self.configureRecording();
         const target_i: i64 = @as(i64, pc) + instr.aux;
-        // Doc 56 Phase 3: a `for_loop` back-edge target is resolved too, so a
-        // `.continuation` recording can close `.link` into the root there
-        // (`recForLoop`, the `rec_loop_jit` / `LJ_TRLINK_ROOT` analogue).
-        const target: ?u32 = if (instr.op == .for_prep)
+        // The loop header this instruction leads into, when it is one a
+        // recording can link to: doc 56 Phase 3 resolves a `for_loop`
+        // back-edge target so a `.continuation` recording can close `.link`
+        // into the root there (`recForLoop`, the `rec_loop_jit` /
+        // `LJ_TRLINK_ROOT` analogue), and doc 58 resolves a `loop` marker's
+        // header the same way (its own `pc + 1`, which is this post-increment
+        // cursor) for `while`/`repeat` — the `.jmp` closer carries no header.
+        const target: ?u32 = if (instr.op == .for_prep or instr.op == .loop)
             pc
-        else if ((instr.op == .jmp or instr.op == .for_loop) and target_i >= 0 and target_i < proto.code.len)
+        else if (instr.op == .for_loop and target_i >= 0 and target_i < proto.code.len)
             @intCast(target_i)
         else
             null;

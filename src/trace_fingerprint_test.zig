@@ -333,6 +333,9 @@ test "§T.9 bridge-candidate memo: bit-identical to the oracle at every index, u
         },
         .id = 900,
     };
+    var snap_arena = std.heap.ArenaAllocator.init(gpa);
+    defer snap_arena.deinit();
+    try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &cont.code);
 
     // (a) Unbuilt — hand-built test traces never go through commit; the accessor
     // must BE the oracle.
@@ -429,6 +432,10 @@ test "§T.9b P0c: a sunk store below a branch guard refuses bridge candidacy" {
         },
         .id = 903,
     };
+    // The snapshot agrees with the φs, so the store is the only refusal reason.
+    var snap_arena = std.heap.ArenaAllocator.init(gpa);
+    defer snap_arena.deinit();
+    try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &cont.code);
     // Without the store this index IS a candidate (§T.9 asserts it); the store
     // below the guard must now refuse it, and the memo must agree.
     try testing.expect(!cont.code.isBridgeCandidate(3));
@@ -437,6 +444,77 @@ test "§T.9b P0c: a sunk store below a branch guard refuses bridge candidacy" {
     try testing.expect(!cont.code.isBridgeCandidate(3));
     for (0..cont_instrs.len + 2) |i|
         try testing.expectEqual(nativegen.isCompositeBridgeCandidate(&cont.code, i), cont.code.isBridgeCandidate(i));
+}
+
+test "§T.9c doc 58 B2 blocker 1: a bridge whose φs contradict the exit snapshot is refused" {
+    // An armed composite bridge commits its φs with NO tier-0 replay, so they
+    // must be the guest state at the guard. A φ update defined before the guard
+    // does not prove the slot was written before it — `konst` interning and
+    // CSE hoist values — so the exit snapshot is the referee. Same §T.9 shape
+    // (candidate at 3, φ r0 ← %2), then three snapshot variants.
+    const gpa = testing.allocator;
+    var code: [30]Instr = undefined;
+    @memset(code[0..], Instr.op0(.halt));
+    code[13] = Instr.opAx(.jmp_if_true, 0, 0);
+    const proto = Proto{ .id = 42, .code = &code, .name = "snapref", .num_registers = 2 };
+    var cont_prov = [_]ExitProvEntry{.{ .index = 3, .prov = .{ .guard = .{
+        .source_proto_id = proto.id,
+        .source_pc = 13,
+        .role = .branch_cond,
+        .operand = .a,
+        .polarity = .taken,
+    } } }};
+    var cont_instrs = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .add, .a = 0, .b = 1, .ty = .int },
+        .{ .op = .guard_true, .a = 0, .aux = 14 },
+        .{ .op = .phi, .b = 2, .aux = 0 },
+        .{ .op = .link, .aux = 7 },
+    };
+    var cont: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 29 },
+            .instrs = &cont_instrs,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &cont_prov,
+        },
+        .id = 904,
+    };
+    var snap_arena = std.heap.ArenaAllocator.init(gpa);
+    defer snap_arena.deinit();
+    try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &cont.code);
+    try testing.expect(cont.code.isBridgeCandidate(3)); // agreeing: admitted
+    const snap = cont.code.exit_snapshot_slots;
+    try testing.expectEqual(@as(usize, 1), snap.len);
+
+    // (a) The slot holds a DIFFERENT value at the guard (written later with
+    // the φ's value): the bridge would commit a state the guest never had.
+    snap[0].ref = 1;
+    try testing.expect(!cont.code.isBridgeCandidate(3));
+
+    // (b) The φ's slot is not written yet at the guard at all.
+    snap[0] = .{ .slot = 1, .ref = 0 };
+    cont.code.exit_snapshots[0].slots_len = 0;
+    try testing.expect(!cont.code.isBridgeCandidate(3));
+
+    // (c) A slot written before the guard that no emitted φ carries (its φ
+    // update comes after the guard): the bridge would leave it stale.
+    cont.code.exit_snapshots[0].slots_len = 1;
+    snap[0] = .{ .slot = 0, .ref = 2 };
+    try testing.expect(cont.code.isBridgeCandidate(3)); // restored: admitted
+    const extra = try snap_arena.allocator().alloc(@TypeOf(snap[0]), 2);
+    extra[0] = snap[0];
+    extra[1] = .{ .slot = 1, .ref = 1 };
+    cont.code.exit_snapshot_slots = extra;
+    cont.code.exit_snapshots[0].slots_len = 2;
+    try testing.expect(!cont.code.isBridgeCandidate(3));
+
+    // (d) No snapshot at all: fail closed.
+    cont.code.exit_snap_by_ord = &.{};
+    try testing.expect(!cont.code.isBridgeCandidate(3));
 }
 
 test "pathFromFrames: f(a);f(b) at distinct call sites give distinct inline paths (A-i.2)" {

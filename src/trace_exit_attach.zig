@@ -343,12 +343,13 @@ pub fn resumeOf(code: *const TraceCode, idx: usize) Resolved {
     if (gp.inline_depth != 0 or gp.source_proto_id != proto.id) return .{ .refused = .inlined };
     // Doc 57 P3: checked before the loop-done shapes, which refuse a copy.
     if (gp.role == .loop_test_copy) return .{ .refused = .loop_test_copy };
-    // A while root's own condition guard is a loop-done too (doc 38 owns
-    // it through the `.while_done` chain); an unrolled INNER while's
-    // wrong-trip-count guard is not — its back-edge targets the inner
-    // header, so `whileLoopDonePostPc` rejects it and it stays attachable.
-    if (gp.role == .loop_done or code.isNumericForLoopDoneGuard(idx) or
-        code.whileLoopDonePostPc(idx) != null) return .{ .refused = .loop_done };
+    // Doc 58: a `while`/`repeat` root's own condition guard is now an ORDINARY
+    // exit and stays attachable — its resume pc is the post-loop pc, through
+    // the branch fix-up below (LuaJIT's `rec_comp_fixup`), and exit-side serves
+    // it like any other exit. Only the numeric/generic `for` loop-done keeps
+    // its refusal, because the native loop-done link owns that exit.
+    if (gp.role == .loop_done or code.isNumericForLoopDoneGuard(idx))
+        return .{ .refused = .loop_done };
     const g = code.instrs[idx];
     const b = gp.source_pc;
     if (b >= proto.code.len) return .{ .refused = .resume_mismatch };
@@ -477,11 +478,16 @@ pub fn continuationReachesEnclosingBackEdge(proto: *const Proto, start_pc: u32, 
                 const target = @as(i64, @intCast(pc)) + 1 + ins.aux;
                 if (target >= 0 and target <= @as(i64, @intCast(inner_anchor))) return true;
             },
-            // Doc 38: an enclosing WHILE loop's back-edge is a plain backward
-            // `jmp`. The scan starts past the inner anchor, so a target at or
-            // before it is necessarily backward and enclosing (rule Z-6:
-            // while-in-while nests arm continuations like for-in-for ones).
-            .jmp => {
+            // An enclosing `while`/`repeat` loop's physical bottom is its
+            // backward closer, which is what this forward scan meets — the
+            // `loop` marker itself sits at the top, behind the scan. A `while`
+            // closes with a `jmp` back to its condition; a `repeat` with a
+            // `jmp_if_false` back to its marker (doc 58 review r3 finding 4 —
+            // a loop inside a `repeat` could never arm a continuation before).
+            // The scan starts past the inner anchor, so a target at or before
+            // it is necessarily backward and enclosing (rule Z-6: while-in-
+            // while nests arm continuations like for-in-for ones).
+            .jmp, .jmp_if_false => {
                 const target = @as(i64, @intCast(pc)) + 1 + ins.aux;
                 if (target >= 0 and target <= @as(i64, @intCast(inner_anchor))) return true;
             },
