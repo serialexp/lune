@@ -4,7 +4,7 @@
 tests), E3/E4 (the Rust crates + `just embed-test` gate) and E5 (boundary
 benchmark) landed; E6–E9 deferred by design.
 **Owner:** claude (fable)
-**Last updated:** 2026-10-01
+**Last updated:** 2026-10-02
 
 ## Implementation status
 
@@ -118,6 +118,29 @@ land; move whole phases to Done once everything inside them is checked.
   callValue → execWith → execImpl → chain), a doc-42-level structural
   question. Language suite: no regressions (flagged rows A/B'd against a
   shadow baseline — noise).
+- [x] **Tier-0 entry flattening (2026-10-02),** the follow-up attacking that
+  layered-entry chain (Bart: game-engine host, call latency registers).
+  Two changes in `src/interp.zig`: (1) `execWithEntry` — `callValue` enters
+  the doc-42 dispatch chain directly, building `ExecState` from the
+  closure/proto it already holds (pc = 0) instead of re-deriving
+  frame→closure→proto→code through `execWith`→`execImpl`; general fallback
+  for recording/suspend/mode-switch preserved. (2) `pushFrameTrusted` —
+  `callValue`'s closure arms skip the bounds re-checks they just performed
+  and the region-context publish the entry re-derives. Measured (2M-call
+  probe, x86-64-v3, perf stat -r 9): 295.4M→248.5M cycles (**−15.9%**),
+  ~28.5→~24.5 ns/call; cycles fell faster than instructions on step (1),
+  confirming the serial-latency diagnosis, after which the path runs at
+  ~4.7 IPC (throughput-bound). eval −2.2%, callback −4.1%, table rows
+  instruction-identical. The `.call` opcode arm deliberately KEEPS the
+  outlined checked push: inlining it there grew the hottest handler and
+  cost scalar ~4% wall from pure code placement (fewer instructions, more
+  cycles) — reverted, scalar ties baseline, nsieve/recursive-fib tie.
+  Remaining gap to LuaJIT's 13 ns `lua_pcall` is now ~1.9×: the surviving
+  per-call costs are the mh_call park/validate contract (~109 insns), the
+  CallFrame init, `runFastPath`'s 9 scattered flag loads, and the
+  copy-in/copy-out loops — candidates: a packed fast-path flag, a
+  prepared-call handle (API addition, caches the closure/proto derivation
+  for repeated same-callee calls — the game-engine `update()` shape).
 ### Outstanding
 
 - [ ] **E6 — host-call record/replay.** Defer. v1 refuses `.record` AND

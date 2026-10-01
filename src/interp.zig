@@ -1997,6 +1997,26 @@ pub const Vm = struct {
 
         const nreg = closure.proto.num_registers;
         if (base + nreg > self.regCapacity()) return Error.StackOverflow;
+        self.pushFrameTrusted(closure, nreg, base, ret_dest, ret_count, varargs_base, varargs_count);
+        self.trace.setRegionContext(self.depth, self.frames[self.depth - 1].call_seq);
+    }
+
+    /// The trusted core of `pushFrameVararg` for `callValue`'s two closure
+    /// arms: the caller has ALREADY proven `depth < max_call_depth` and
+    /// `base + nreg <= regCapacity()` (it had to, to lay out the callee
+    /// window first), and the very next thing it does re-derives the region
+    /// context (the host-entry `ExecState` build / `reloadTopFrame`), so
+    /// neither check nor the context store is repeated here. Cold callers
+    /// (`run`, keyframe restore) go through the checked `pushFrameVararg`
+    /// above, which also publishes the region context. The `.call` opcode
+    /// arm deliberately does NOT use this: inlining the push there grew the
+    /// hottest handler and cost scalar ~4% wall from pure code placement
+    /// (fewer instructions, more cycles — measured 2026-10-01), so it keeps
+    /// the outlined checked call.
+    pub inline fn pushFrameTrusted(self: *Vm, closure: *const Closure, nreg: usize, base: usize, ret_dest: u16, ret_count: u16, varargs_base: usize, varargs_count: usize) void {
+        std.debug.assert(self.final_cut == null);
+        std.debug.assert(self.depth < max_call_depth);
+        std.debug.assert(base + nreg <= self.regCapacity());
         const call_seq = self.next_call_seq;
         if (call_seq == std.math.maxInt(u64)) @panic("VM call_seq space exhausted");
         self.next_call_seq = call_seq + 1;
@@ -2012,7 +2032,6 @@ pub const Vm = struct {
         };
         self.depth += 1;
         self.stack_top = base + nreg;
-        self.trace.setRegionContext(self.depth, call_seq);
     }
 
     /// Drop transient region accounting for every physical activation destroyed
@@ -2142,7 +2161,7 @@ pub const Vm = struct {
                     for (args[0..np], 0..) |v, i| self.regSet(cb + i, v);
                     var i: usize = np;
                     while (i < cp.num_registers) : (i += 1) self.regSet(cb + i, Value.nil());
-                    try self.pushFrameVararg(cl, cb, 0, 0, 0, 0);
+                    self.pushFrameTrusted(cl, cp.num_registers, cb, 0, 0, 0, 0);
                     break :blk cb;
                 } else blk: {
                     // Surplus varargs: args land in a region at `arg_base`; the
@@ -2163,7 +2182,7 @@ pub const Vm = struct {
                     }
                     const va_count: usize = args.len - cp.num_params;
                     const va_base: usize = arg_base + cp.num_params;
-                    try self.pushFrameVararg(cl, cb, 0, 0, va_base, va_count);
+                    self.pushFrameTrusted(cl, cp.num_registers, cb, 0, 0, va_base, va_count);
                     break :blk cb;
                 };
 
@@ -2172,7 +2191,7 @@ pub const Vm = struct {
                 // located message before it restores the boundary — the whole-VM
                 // "errors don't unwind frames" invariant. Success falls through to
                 // the explicit `stack_top` restore below.
-                const outcome = try self.execWith(entry_depth + 1);
+                const outcome = try self.execWithEntry(cl, cp, callee_base, entry_depth + 1);
                 const fr = switch (outcome) {
                     .finished => |f| f,
                     // `suspend_ctl == null` (asserted above) ⇒ exec never suspends.
@@ -2439,6 +2458,54 @@ pub const Vm = struct {
     /// frame for `stop_depth == 1`; a reentrant `callValue`'s nested top frame for
     /// `stop_depth == entry_depth + 1`). Threads `stop_depth` through the
     /// `switch_mode` re-entry so a mode flip mid-nested-run resumes the same bound.
+    /// Host-entry fast path (doc 59): enter the dispatch chain for the frame
+    /// `callValue` JUST pushed, building `ExecState` from the values it still
+    /// holds in registers (`cl`/`cp`/`base`, pc = 0) instead of re-deriving
+    /// the frame→closure→proto→code pointer chain through `execWith` →
+    /// `execImpl`. That re-derivation is a serial dependent-load spine the
+    /// boundary crossing pays on every entry; nothing else differs — same
+    /// errdefers, same exit handling, and a `.switch_mode` (or a non-fast VM
+    /// state) falls through to the general `execWith` loop.
+    fn execWithEntry(self: *Vm, cl: *const Closure, cp: *const Proto, base: usize, stop_depth: u32) Error!ExecOutcome {
+        errdefer self.trace.clearPendingExitAnchor();
+        errdefer self.trace.abortRaised(); // guarded no-op when idle (doc 26 D1a)
+        if (self.runFastPath()) {
+            const frame = &self.frames[self.depth - 1];
+            var st: ExecState = .{
+                .vm = self,
+                .frame = frame,
+                .closure = cl,
+                .proto = cp,
+                .code = self.cachedCodeFor(frame, cp), // doc 20 image
+                .code_gen = self.trace.registry.entry_registry.image_gen,
+                .base = base,
+                .regs = self.frameWindow(base, cp.num_registers),
+                .stop_depth = stop_depth,
+                .step = undefined,
+                .err = null,
+            };
+            self.trace.setRegionContext(self.depth, frame.call_seq);
+            switch (@call(.never_inline, chainEntry(.fast), .{ &st, 0, undefined, self, st.regs.tags, st.regs.payloads })) {
+                .finished => {
+                    self.trace.clearPendingExitAnchor();
+                    return .{ .finished = switch (st.step) {
+                        .finished => |fr| fr,
+                        else => unreachable, // chain `.finished` always stamps `.step`
+                    } };
+                },
+                .suspended => {
+                    self.trace.clearPendingExitAnchor();
+                    return .suspended;
+                },
+                .switch_mode => {}, // mode flip parked `frame.pc`; general loop resumes
+                .err => return st.err.?,
+            }
+        }
+        // The nested errdefers in `execWith` re-run ours on an error edge;
+        // both are idempotent (anchor clear, guarded abort).
+        return self.execWith(stop_depth);
+    }
+
     fn execWith(self: *Vm, stop_depth: u32) Error!ExecOutcome {
         errdefer self.trace.clearPendingExitAnchor();
         // Doc 26 D1a: an error unwinding through the dispatch loop kills any
