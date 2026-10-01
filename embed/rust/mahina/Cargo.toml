@@ -1,0 +1,8 @@
+[package]
+name = "mahina"
+version = "0.1.0"
+edition = "2021"
+description = "Safe Rust embedding API for the mahina VM (doc 59)"
+
+[dependencies]
+mahina-sys = { path = "../mahina-sys" }

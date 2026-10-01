@@ -1,7 +1,8 @@
 # 59 — Embedding mahina in Rust: the C-ABI `libmahina` surface and the `mahina` crate
 
-**Status:** partial — E0 (review) + E1/E2 (the Zig C-ABI surface, lib build,
-tests) landed; E3/E4 (Rust crates) next; E5–E9 outstanding.
+**Status:** partial — E0 (review), E1/E2 (the Zig C-ABI surface, lib build,
+tests), E3/E4 (the Rust crates + `just embed-test` gate) and E5 (boundary
+benchmark) landed; E6–E9 deferred by design.
 **Owner:** claude (fable)
 **Last updated:** 2026-10-01
 
@@ -55,19 +56,39 @@ land; move whole phases to Done once everything inside them is checked.
   with host fns) are NOT yet wired — effects are plain `.off` in embedding
   and nothing exposes mode switching through the C API yet; the refusal
   belongs with whatever first exposes those modes (tracked under E6/E8).
-- [ ] **E3 — `mahina-sys` crate.** Hand-written extern decls mirroring
-  `mahina.h`; `build.rs` (PROFILE→optimize mapping, `$ZIG` + `.zig-version`
-  respect, `MAHINA_LIB_DIR` prebuilt override, isolated zig cache); plus a
-  compiled **C** header-consumer smoke test so the header itself is
-  validated, not just the Rust decls.
-- [ ] **E4 — safe `mahina` crate.** `Vm`, `Value`, `Ref`, `Error`; closures
-  as host functions (`'static` + `catch_unwind`, destructors included);
-  foreign-VM rejection; integration tests (both call directions, GC stress,
-  leak check via `TrackingAllocator`, compile-fail tests for the borrow
-  contracts). Wire `cargo test` into the validation gate (`just embed-test`).
-- [ ] **E5 — boundary benchmark.** Host→guest + guest→host calls, scalar
-  marshaling, large-hash-table iteration, ref churn under GC, repeated
-  compilation — cargo bench, informational (global Rule #22).
+- [x] **E3 — `mahina-sys` crate.** Hand-written extern decls mirroring
+  `mahina.h` (`embed/rust/mahina-sys`); `build.rs` (PROFILE→optimize mapping,
+  `$ZIG` + `.zig-version` drift check, `MAHINA_LIB_DIR` prebuilt override,
+  isolated zig cache under `OUT_DIR`); layout tests + a raw-FFI lifecycle
+  smoke test. (The compiled **C** header-consumer smoke test landed in E1 as
+  `tests/capi_smoke.c` on the `zig build test` gate.) The lib step needed
+  `bundle_compiler_rt = true` — a static archive handed to rustc's linker has
+  nothing else providing `__zig_probe_stack`.
+- [x] **E4 — safe `mahina` crate.** `Vm` (Rc-shared, `!Send`), `Value` with
+  auto-reffed heap handles (every heap value crossing out is promoted to a
+  generational ref owned by the `Value`; Drop frees it — the C layer's
+  borrow window never reaches safe code), `Error` enum with rendered
+  messages, `Script`, `Table` + deterministic iterator, closures as host
+  functions (`'static` + `catch_unwind` on call AND destroy), foreign-VM
+  rejection via `Rc::ptr_eq`. 25 integration tests (both call directions,
+  reentrant callback, panic containment, GC stress, ref churn, values
+  outliving the `Vm` handle). Gate: `just embed-test` (= Zig gate + `cargo
+  test` in `embed/rust`). Deviations: no compile-fail (trybuild) tests — the
+  safe layer's auto-ref design removed the borrow contracts they would have
+  pinned (nothing borrowed crosses the safe boundary except `Str::as_bytes`,
+  whose lifetime ties to the handle by ordinary borrowck); leak checking
+  rides the C layer's `TrackingAllocator` tests rather than a Rust-side
+  assert.
+- [x] **E5 — boundary benchmark.** `examples/boundary_bench.rs`, run via
+  `just embed-bench` — informational, never a gate (global Rule #22), manual
+  `Instant` timing rather than cargo-bench (no external dev-deps). First
+  numbers (ReleaseFast, 2026-10-01): host→guest call 192 ns, guest→host
+  callback ~54 ns, table get/set ~60 ns, iteration ~134 ns/entry, ref
+  create+drop 28 ns, compile-small-chunk 2.1 µs, eval 1.1 µs. The bench also
+  surfaces the designed VM-lifetime chunk ownership (10k compiles retain
+  ~35 MiB — same trade-off as guest `load()`, §3.2).
+### Outstanding
+
 - [ ] **E6 — host-call record/replay.** Defer. v1 refuses `.record` AND
   `.replay` whenever a host fn is registered (§3.7). A result-only
   `host_call` EffectKind is NOT sufficient (codex #11 — callbacks mutate

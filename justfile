@@ -68,6 +68,23 @@ shadow dest:
     rm -rf {{dest}}
     rsync -a --exclude /.zig-cache --exclude /zig-out ./ {{dest}}/
 
+# Build the embedding static library + header (doc 59): libmahina.a + mahina.h
+# into zig-out/lib + zig-out/include.
+lib:
+    zig build lib
+
+# The embedding gate (doc 59 E4): the Zig test gate plus the Rust workspace
+# under embed/rust (whose build.rs runs `zig build lib` itself, so this also
+# proves the cargo→zig build path end to end).
+embed-test: test
+    cd embed/rust && cargo test
+
+# The embedding boundary benchmark (doc 59 E5). Deliberate, not a gate:
+# measures host→guest call, callback, table get/set, iteration, ref churn and
+# repeated compilation through the C ABI. Release build, manual timing.
+embed-bench:
+    cd embed/rust && cargo run --release --example boundary_bench
+
 # Regenerate src/gen/unicode_case.zig from the vendored UCD (design doc 06, S-C).
 # Pure + offline; only needed when re-vendoring a new pinned Unicode version.
 gen-unicode:

@@ -1,0 +1,3 @@
+[workspace]
+members = ["mahina-sys", "mahina"]
+resolver = "2"

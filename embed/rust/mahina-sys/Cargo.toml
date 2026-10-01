@@ -1,0 +1,12 @@
+[package]
+name = "mahina-sys"
+version = "0.1.0"
+edition = "2021"
+links = "mahina"
+build = "build.rs"
+description = "Raw FFI bindings to libmahina (the mahina VM C embedding API, doc 59)"
+
+[lib]
+# The bindings mirror include/mahina.h by hand (no bindgen — the surface is
+# small and a clang dependency would burden every embedder build). Drift is
+# caught by the layout tests here and the integration tests in `mahina`.
