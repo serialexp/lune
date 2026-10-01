@@ -1936,6 +1936,65 @@ test "chunk rooting: releaseChunk unroots a retained chunk's constants" {
     try testing.expect(vm.heap.internedLookup("releaselit") == null);
 }
 
+test "chunk rooting: appendLoadedChunk pins constants (survive GC without per-cycle rooting)" {
+    // `loaded_chunks` constants are immortal via the pin set in
+    // `appendLoadedChunk` — NOT via the `.gc` root walk, which skips the
+    // loaded list entirely (re-walking every loaded tree each cycle made GC
+    // O(all chunks ever loaded)). Three assertions: the pin bit is set, the
+    // literal survives a stress GC even though the chunk never ran and nothing
+    // else references it, and the `.gc` walk really does not enumerate it
+    // (while the `.snapshot` walk still does — restore needs the ids).
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+
+    const src_b: [:0]const u8 = "print(\"pinnedlit\")\n"; // never run
+    const src_c: [:0]const u8 = "for i = 1, 100 do local j = {} end\n"; // GC driver
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.heap.gc_stress = true;
+    var sink: [16]u8 = undefined;
+    var w = io.Writer.fixed(&sink);
+    vm.out = &w;
+
+    var tb = try parser.parse(gpa, src_b, &diags);
+    defer tb.deinit();
+    const chunk_b = try compiler.compile(gpa, vm.heap, src_b, tb.root, &diags);
+    var tc = try parser.parse(gpa, src_c, &diags);
+    defer tc.deinit();
+    var cc = try compiler.compile(gpa, vm.heap, src_c, tc.root, &diags);
+    defer cc.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    // Hand B to the VM the way load()/the C API do (VM owns chunk + source now).
+    const owned: [:0]u8 = try gpa.dupeSentinel(u8, src_b, 0);
+    try vm.appendLoadedChunk(.{ .chunk = chunk_b, .source = owned });
+
+    const lit = vm.heap.internedLookup("pinnedlit") orelse return error.TestUnexpectedResult;
+    try testing.expect(lit.header.flags.pinned);
+
+    _ = try vm.run(cc.proto); // stress GC — survives via the pin alone
+    try testing.expect(vm.heap.internedLookup("pinnedlit") != null);
+
+    // The .gc walk must NOT enumerate the pinned constant; .snapshot must.
+    const Counter = struct {
+        target: *object.GcHeader,
+        hits: usize = 0,
+        fn cb(self: *@This(), h: *object.GcHeader) void {
+            if (h == self.target) self.hits += 1;
+        }
+    };
+    var gc_count: Counter = .{ .target = &lit.header };
+    vm.forEachRootHeader(.gc, null, &gc_count, Counter.cb);
+    try testing.expectEqual(@as(usize, 0), gc_count.hits);
+    var snap_count: Counter = .{ .target = &lit.header };
+    vm.forEachRootHeader(.snapshot, null, &snap_count, Counter.cb);
+    try testing.expect(snap_count.hits > 0);
+}
+
 test "chunk rooting: releaseChunk preserves survivor order (orderedRemove, not swapRemove)" {
     // Root-discovery order = retain order (docs/design/03), so releasing a NON-last
     // borrow must keep the survivors' relative order: releasing X from [X,Y,Z] leaves

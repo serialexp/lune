@@ -145,7 +145,7 @@ pub fn compileToClosure(vm: *Vm, src_bytes: []const u8, chunk_name: []const u8, 
     // reused, so no id ever collides. (OOM is non-catchable → the VM tears down
     // anyway, so this retention is benign.) If the append itself fails, free both
     // here — neither is VM-owned yet.
-    vm.loaded_chunks.append(vm.gpa, .{ .chunk = chunk, .source = owned }) catch |e| {
+    vm.appendLoadedChunk(.{ .chunk = chunk, .source = owned }) catch |e| {
         chunk.deinit();
         vm.gpa.free(owned);
         return e;

@@ -76,7 +76,7 @@ test "eval: scalar arithmetic" {
     try expectInt(v, 3);
 }
 
-test "eval: multiple results, truncation, nil padding" {
+test "eval: multiple results and truncation" {
     const box = try newVm();
     defer freeVm(box);
     var results: [4]mh_value = undefined;
@@ -86,7 +86,8 @@ test "eval: multiple results, truncation, nil padding" {
     try expectInt(results[0], 1);
     try expectStrEql(box, results[1], "two");
     try testing.expectEqual(capi.mh_type.boolean, capi.mh_value_type(results[2]));
-    try testing.expectEqual(capi.mh_type.nil, capi.mh_value_type(results[3]));
+    // results[3] is deliberately NOT inspected: beyond *nresults the buffer is
+    // undefined by contract (no O(max_results) nil-fill per call).
 
     // Truncation: more results than the buffer wants is fine.
     try testing.expectEqual(capi.mh_status.ok, capi.mh_eval(box, s("return 1, 2, 3"), s("t"), &results, 2, &n));

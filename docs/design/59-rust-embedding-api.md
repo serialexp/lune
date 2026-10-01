@@ -100,6 +100,24 @@ land; move whole phases to Done once everything inside them is checked.
   The Rust safe layer's own numbers (`just embed-bench-rust`) sit well above
   the C-ABI column (192 ns vs 28 ns per host→guest call) — the auto-ref
   promotion per crossing heap value is the gap; a candidate E9 refinement.
+- [x] **Tier-0 boundary pass (2026-10-01),** profile-driven (perf +
+  callgrind), extending beyond the original plan. The big one: loaded-chunk
+  constants are now **pinned once** at retention (`Vm.appendLoadedChunk`, the
+  single funnel for `load()`/C API/keyframe restore) instead of re-rooted
+  every GC cycle — the per-cycle walk over every chunk ever compiled made
+  repeated `mh_eval`/`load()` quadratic (4.1 µs/eval and climbing at 500k
+  evals; 1.1 µs flat after; liveness identical, `.snapshot` walk unchanged).
+  Plus three general cuts: `dropRegionActivation` empty fast path (was a
+  hash-map key walk on EVERY tier-0 return), single-copy param bind in
+  `callValue` (no-surplus-varargs case), and the results-buffer contract is
+  now "undefined beyond `*nresults`" (the nil-fill cost O(max_results)
+  stores per call). Small-size boundary rows are ~unchanged — callgrind
+  shows 705→651 instructions/call but the path is latency-bound on the
+  serial frame→closure→proto→code chain; the remaining ~2× gap to LuaJIT's
+  `lua_pcall` lives in the layered entry protocol (mh_call → runProtected →
+  callValue → execWith → execImpl → chain), a doc-42-level structural
+  question. Language suite: no regressions (flagged rows A/B'd against a
+  shadow baseline — noise).
 ### Outstanding
 
 - [ ] **E6 — host-call record/replay.** Defer. v1 refuses `.record` AND

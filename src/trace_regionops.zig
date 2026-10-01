@@ -1547,6 +1547,19 @@ pub fn observeRegionProgramPoint(self: *TraceState, proto_id: u32, pc: u32, dept
 }
 
 pub fn dropRegionActivation(self: *TraceState, call_seq: u64) void {
+    // Empty fast path first: this runs on EVERY tier-0 function return
+    // (`opRet`), and with no live profit windows the only possible side
+    // effect is invalidating a matching region context — one compare. Without
+    // the early-out every return paid `nextActivation`'s call chain and
+    // `activeRegionFor`'s key-iterator walk (~19 instructions per return,
+    // measured in the embedding-boundary callgrind profile; the map is empty
+    // whenever no region accumulation is in flight, i.e. almost always).
+    const pol = &self.region_policy;
+    if (pol.region_profit.count() == 0) {
+        if (pol.region_context_valid and pol.region_context.call_seq == call_seq)
+            pol.region_context_valid = false;
+        return;
+    }
     while (self.region_policy.nextActivation(call_seq)) |key| self.closeRegion(key);
 }
 

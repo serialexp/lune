@@ -788,7 +788,17 @@ pub const Vm = struct {
     /// copies every heap value it hands across the boundary in here; the park is
     /// cleared at the next idle-VM C entry that can allocate or run guest code.
     /// `.gc` walk only, like `host_refs`.
+    ///
+    /// Split for locality: the first `parked_inline.len` values live inline in
+    /// the Vm struct (lines the entry path keeps warm), the ArrayList is
+    /// overflow only. The typical entry parks 1–3 values (callee + args, or a
+    /// result); storing those into a separately heap-allocated backing buffer
+    /// made the park store the single hottest instruction of `mh_call` (a cold
+    /// line touched once per call, ~1/3 of the whole crossing). The logical
+    /// park is the concatenation inline[0..parked_inline_len] ++ items.
     parked_results: std.ArrayList(Value) = .empty,
+    parked_inline: [6]Value = @splat(Value.nil()),
+    parked_inline_len: u32 = 0,
 
     /// A runtime-compiled chunk owned by the VM: the `Chunk` (whose arena owns the
     /// proto tree) and the NUL-terminated source the protos borrow.
@@ -836,6 +846,29 @@ pub const Vm = struct {
     ) void {
         for (proto.constants) |v| if (v.isHeap()) cb(ctx, v.asHeap());
         for (proto.protos) |child| rootProtoConsts(child, ctx, cb);
+    }
+
+    fn pinHeader(_: void, h: *object.GcHeader) void {
+        h.flags.pinned = true;
+    }
+
+    /// Take VM-lifetime ownership of a dynamically compiled chunk (`load`, the
+    /// C API's compile/eval, keyframe restore — the single funnel for all
+    /// `loaded_chunks` appends). Appends, then **pins** every heap constant in
+    /// the proto tree: `loaded_chunks` never shrinks, so its constants are
+    /// immortal, and pinning lets the `.gc` root walk skip them entirely.
+    /// Re-rooting every loaded chunk's constant tree each GC cycle made every
+    /// cycle O(all chunks ever loaded) — quadratic for a guest (or embedder)
+    /// that compiles in a loop. Pinned objects survive sweep unmarked
+    /// (`gc.Heap.sweep`) and are freed at heap teardown like everything else;
+    /// liveness is unchanged (these constants were unconditionally rooted
+    /// before), so determinism and heap ids are untouched. The `.snapshot`
+    /// walk still enumerates them (`forEachRootHeader`) — snapshot semantics
+    /// know nothing of pinning. On append failure the caller still owns
+    /// chunk + source (the append-first OOM contracts at the call sites hold).
+    pub fn appendLoadedChunk(self: *Vm, lc: LoadedChunk) !void {
+        try self.loaded_chunks.append(self.gpa, lc);
+        rootProtoConsts(lc.chunk.proto, {}, pinHeader);
     }
 
     pub fn init(gpa: std.mem.Allocator) Error!Vm {
@@ -2092,23 +2125,47 @@ pub const Vm = struct {
                 // `callee_base`), stable and — once `pushFrame` raises `stack_top` —
                 // GC-rooted, exactly as the `.call` arm leaves them in the caller's
                 // window. Reserve `args.len + num_registers` slots.
-                const arg_base = self.stack_top;
-                const callee_base = arg_base + args.len;
-                if (callee_base + cp.num_registers > self.regCapacity()) return Error.StackOverflow;
                 // Straight-line, allocation-free up to `pushFrameVararg` (which
                 // raises `stack_top`): no safepoint may intervene, so the args we
                 // park above `stack_top` are never seen unrooted by the collector.
-                for (args, 0..) |v, i| self.regSet(arg_base + i, v);
-                var i: usize = 0;
-                while (i < cp.num_registers) : (i += 1) {
-                    self.regSet(callee_base + i, if (i < cp.num_params and i < args.len)
-                        self.regGet(arg_base + i)
-                    else
-                        Value.nil());
-                }
-                const va_count: usize = if (cp.is_vararg and args.len > cp.num_params) args.len - cp.num_params else 0;
-                const va_base: usize = if (va_count > 0) arg_base + cp.num_params else 0;
-                try self.pushFrameVararg(cl, callee_base, 0, 0, va_base, va_count);
+                const callee_base = if (!cp.is_vararg or args.len <= cp.num_params) blk: {
+                    // No surplus varargs ⇒ the separate arg region below the
+                    // window is redundant: bind params straight into the callee
+                    // window (one copy, not two — this is the common boundary
+                    // crossing, and the double copy was ~30 instructions/call
+                    // in the embedding callgrind profile). Surplus args to a
+                    // non-vararg callee are simply dropped, exactly what the
+                    // two-region layout did by never reading them.
+                    const cb = self.stack_top;
+                    if (cb + cp.num_registers > self.regCapacity()) return Error.StackOverflow;
+                    const np = @min(cp.num_params, args.len);
+                    for (args[0..np], 0..) |v, i| self.regSet(cb + i, v);
+                    var i: usize = np;
+                    while (i < cp.num_registers) : (i += 1) self.regSet(cb + i, Value.nil());
+                    try self.pushFrameVararg(cl, cb, 0, 0, 0, 0);
+                    break :blk cb;
+                } else blk: {
+                    // Surplus varargs: args land in a region at `arg_base`; the
+                    // callee window sits directly above. The surplus stays in
+                    // the arg region (below `callee_base`), stable and — once
+                    // `pushFrameVararg` raises `stack_top` — GC-rooted, exactly
+                    // as the `.call` arm leaves them in the caller's window.
+                    const arg_base = self.stack_top;
+                    const cb = arg_base + args.len;
+                    if (cb + cp.num_registers > self.regCapacity()) return Error.StackOverflow;
+                    for (args, 0..) |v, i| self.regSet(arg_base + i, v);
+                    var i: usize = 0;
+                    while (i < cp.num_registers) : (i += 1) {
+                        self.regSet(cb + i, if (i < cp.num_params)
+                            self.regGet(arg_base + i)
+                        else
+                            Value.nil());
+                    }
+                    const va_count: usize = args.len - cp.num_params;
+                    const va_base: usize = arg_base + cp.num_params;
+                    try self.pushFrameVararg(cl, cb, 0, 0, va_base, va_count);
+                    break :blk cb;
+                };
 
                 // No `errdefer` restore: a runtime error must leave `self.frames`
                 // live (depth raised) so the catching `pcall` can synthesize the
@@ -2277,15 +2334,20 @@ pub const Vm = struct {
         for (self.retained_chunks.items) |proto| rootProtoConsts(proto, ctx, cb);
         // Loaded chunks (docs/design/19): a `load`/`loadfile`/`dofile`/`require`
         // chunk's protos are VM-owned until deinit (`loaded_chunks` never shrinks),
-        // so their interned constants are rooted for the VM's lifetime too — in
-        // BOTH walks, like `retained_chunks` above: membership is deterministic
-        // guest behaviour, hence mode-invariant, so the `.snapshot` walk stays
-        // byte-identical across modes and restore preserves constant-id
-        // continuity (keyframe v8's zero-allocation recompile invariant). This
-        // makes a trace const over a loaded proto ALWAYS redundant, which is what
-        // licenses tracing the loaded tree (doc 17's H-2 dynamic-proto gate,
-        // lifted by doc 19).
-        for (self.loaded_chunks.items) |lc| rootProtoConsts(lc.chunk.proto, ctx, cb);
+        // so their interned constants live for the VM's lifetime too. In the
+        // `.gc` walk they are NOT re-rooted here: `appendLoadedChunk` pinned
+        // them once (sweep never frees a pinned object), and walking every
+        // loaded tree every cycle made GC cost grow with every `load`/`mh_eval`.
+        // The `.snapshot` walk still enumerates them: membership is
+        // deterministic guest behaviour, hence mode-invariant, so the snapshot
+        // stays byte-identical across modes and restore preserves constant-id
+        // continuity (keyframe v8's zero-allocation recompile invariant). Their
+        // guaranteed liveness (now via the pin) is what makes a trace const
+        // over a loaded proto ALWAYS redundant, which is what licenses tracing
+        // the loaded tree (doc 17's H-2 dynamic-proto gate, lifted by doc 19).
+        if (kind == .snapshot) {
+            for (self.loaded_chunks.items) |lc| rootProtoConsts(lc.chunk.proto, ctx, cb);
+        }
         // Trace consts are GC-liveness roots ONLY — never snapshot semantic roots
         // (doc 17 H-2/G-2). See the item-5 note above.
         if (kind == .gc) {
@@ -2299,6 +2361,7 @@ pub const Vm = struct {
             // results are GC-liveness roots ONLY — host state must never leak
             // into snapshot bytes (freed ref slots hold nil, so no stale marks).
             for (self.host_refs.items) |slot| if (slot.value.isHeap()) cb(ctx, slot.value.asHeap());
+            for (self.parked_inline[0..self.parked_inline_len]) |v| if (v.isHeap()) cb(ctx, v.asHeap());
             for (self.parked_results.items) |v| if (v.isHeap()) cb(ctx, v.asHeap());
         }
         for (self.effect_log.items) |e| if (e.result.isHeap()) cb(ctx, e.result.asHeap());

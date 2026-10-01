@@ -263,15 +263,26 @@ inline fn vmIdle(box: *const VmBox) bool {
 /// the park iff idle. Callers with heap-value *arguments* must re-park them
 /// (`park`) immediately after this, before anything that can collect.
 fn parkClearIfIdle(box: *VmBox) void {
-    if (vmIdle(box)) box.vm.parked_results.clearRetainingCapacity();
+    if (vmIdle(box)) {
+        box.vm.parked_inline_len = 0;
+        box.vm.parked_results.clearRetainingCapacity();
+    }
 }
 
 /// Root a value in the park. Appending never triggers a collection (the GC
 /// runs only at VM allocation sites), so parking freshly-received C arguments
-/// is safe even before they are otherwise rooted.
+/// is safe even before they are otherwise rooted. The inline slots in the Vm
+/// struct take the common 1–3 values of an entry (warm lines — see the
+/// `parked_inline` doc comment); the ArrayList is overflow only.
 fn park(box: *VmBox, v: Value) mh_status {
     if (!v.isHeap()) return .ok;
-    box.vm.parked_results.append(box.vm.gpa, v) catch return oom(box);
+    const vm = &box.vm;
+    if (vm.parked_inline_len < vm.parked_inline.len) {
+        vm.parked_inline[vm.parked_inline_len] = v;
+        vm.parked_inline_len += 1;
+        return .ok;
+    }
+    vm.parked_results.append(vm.gpa, v) catch return oom(box);
     return .ok;
 }
 
@@ -332,7 +343,10 @@ fn checkFatal(box: *VmBox) ?mh_status {
 fn runProtected(box: *VmBox, callee: Value, args: []const Value, results: []Value, nresults: *usize) mh_status {
     const vm = &box.vm;
     nresults.* = 0;
-    for (results) |*r| r.* = Value.nil();
+    // No defensive nil-fill of `results`: the contract (mahina.h) is that only
+    // results[0..*nresults] are defined. `callValue` writes exactly the
+    // `produced` prefix it reports, and the fill cost O(max_results) stores on
+    // every call (17+ instructions even for a 1-slot buffer).
     const entry_depth = vm.depth;
     const entry_top = vm.stack_top;
     const produced = vm.callValue(callee, args, results) catch |e| return guestFault(box, entry_depth, entry_top, e);
@@ -531,7 +545,7 @@ fn compileImage(box: *VmBox, src: []const u8, name: []const u8) error{ Compile, 
 
     // Ownership handoff — append-first, exactly like `load()` (on an append
     // failure neither is VM-owned yet; after it, both are freed at deinit).
-    vm.loaded_chunks.append(vm.gpa, .{ .chunk = chunk, .source = owned }) catch {
+    vm.appendLoadedChunk(.{ .chunk = chunk, .source = owned }) catch {
         chunk.deinit();
         vm.gpa.free(owned);
         return error.OutOfMemory;

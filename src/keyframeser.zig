@@ -536,7 +536,7 @@ fn recompileLoadedChunks(vm: *Vm, root: *const Proto, loaded: []const schema.Loa
             return error.OutOfMemory;
         };
 
-        vm.loaded_chunks.append(vm.gpa, .{ .chunk = chunk, .source = owned }) catch |e| {
+        vm.appendLoadedChunk(.{ .chunk = chunk, .source = owned }) catch |e| {
             chunk.deinit();
             vm.gpa.free(owned);
             return e;

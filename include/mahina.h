@@ -143,7 +143,8 @@ mh_status mh_eval(mh_vm *vm, mh_str src, mh_str name, mh_value *results, size_t 
 
 /* ---- calling guest functions ------------------------------------------- */
 /* Surplus results are truncated to max_results; results[*nresults..] are
- * nil. args and results must not overlap. */
+ * UNDEFINED (read only the reported prefix). args and results must not
+ * overlap. */
 
 mh_status mh_call(mh_vm *vm, mh_value callee, const mh_value *args, size_t nargs,
                   mh_value *results, size_t max_results, size_t *nresults);
