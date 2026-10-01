@@ -64,6 +64,24 @@ eval 'return 1 + 2'              916ns     199ns     481ns    4.6x     1.9x
 peak RSS                          69MB      23MB      23MB
 ```
 
+### JIT state
+
+Both JIT engines run with the JIT **enabled** (mahina's config default is the
+CLI's production shape, `capi.zig`; embedded LuaJIT sets `JIT_F_ON` in
+`jit_init`, `lib_jit.c`) — but every row is boundary-dominated, so the table
+is effectively a comparison of *interpreter-mode* crossing costs:
+
+- Seven of the eight rows are host-side loops crossing into trivial guest
+  code — there is no guest loop to trace. A pure guest hot loop through the
+  same embedding path tiers up fine (probe, 2026-10-01: 20M-iteration sum is
+  27× faster with JIT default than `jit=2` in mahina, 4× in LuaJIT).
+- The `callback` row has a guest loop, but the host call inside it blocks
+  trace formation in BOTH JIT engines: mahina's host natives are
+  recorder-opaque by design (doc 59 §3.5), and LuaJIT aborts on
+  non-monomorphic C functions (`lj_record.c`). Measured: mahina's callback
+  loop is unchanged with the JIT off (34.6 → 32.8 ms); LuaJIT's is actually
+  *faster* with `jit.off()` (9.7 → 6.3 ms — no abort/retry overhead).
+
 Two rows are structural, not incidental:
 
 - **`iterate`** — `mh_table_iter_new` *materializes* the deterministic key
