@@ -80,9 +80,15 @@ embed-test: test
     cd embed/rust && cargo test
 
 # The embedding boundary benchmark (doc 59 E5). Deliberate, not a gate:
-# measures host→guest call, callback, table get/set, iteration, ref churn and
-# repeated compilation through the C ABI. Release build, manual timing.
-embed-bench:
+# identical C host programs drive the same guest code through mahina's C ABI,
+# LuaJIT and Lua 5.4, with checksum parity + ns/op ratios (bench/embed/README).
+embed-bench *args:
+    python3 bench/embed/run.py {{args}}
+
+# The Rust safe-crate view of the same boundary: the cargo example measures
+# the mahina crate (C ABI + auto-ref safe layer). Compare against the mahina
+# column of `just embed-bench` to isolate the safe-layer overhead.
+embed-bench-rust:
     cd embed/rust && cargo run --release --example boundary_bench
 
 # Regenerate src/gen/unicode_case.zig from the vendored UCD (design doc 06, S-C).

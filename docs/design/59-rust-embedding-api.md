@@ -87,6 +87,19 @@ land; move whole phases to Done once everything inside them is checked.
   create+drop 28 ns, compile-small-chunk 2.1 µs, eval 1.1 µs. The bench also
   surfaces the designed VM-lifetime chunk ownership (10k compiles retain
   ~35 MiB — same trade-off as guest `load()`, §3.2).
+- [x] **E5b — comparative embedding suite (`bench/embed/`),** extended beyond
+  the original plan: identical C host programs drive byte-identical guest
+  code through mahina's C ABI, LuaJIT, and Lua 5.4 (one `bench_lua.c` for
+  both Lua engines; Lua 5.4 fetched+built into a gitignored cache), with
+  checksum parity across engines and best-of-N ns/op ratios, run.py-style
+  (`just embed-bench`, see `bench/embed/README.md`). First snapshot
+  (2026-10-01): mahina C ABI is 1.6–2.1× LuaJIT on call/get/set, 3.4× on
+  callback, 3.4×/4.6× on compile/eval, 0.3× (faster) on ref churn; the two
+  structural rows are iteration (8.3× — the materialized deterministic
+  iterator amortized per entry, §3.4) and peak RSS (chunk retention, §3.2).
+  The Rust safe layer's own numbers (`just embed-bench-rust`) sit well above
+  the C-ABI column (192 ns vs 28 ns per host→guest call) — the auto-ref
+  promotion per crossing heap value is the gap; a candidate E9 refinement.
 ### Outstanding
 
 - [ ] **E6 — host-call record/replay.** Defer. v1 refuses `.record` AND

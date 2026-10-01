@@ -11,3 +11,6 @@ viz/dist/
 
 # Python bytecode from bench/tools scripts
 __pycache__/
+
+# embedding benchmark build cache (built engines + hosts, bench/embed/run.py)
+bench/embed/.cache/
