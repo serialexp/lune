@@ -1779,7 +1779,11 @@ test "doc 40: the F1 reverse shape (float entry, int store) peels organically at
 
 test "doc 40 phase 0: a peeled while root exiting at zero completions replays its run-once work" {
     // Codex finding 3 on the landed doc-39 code, kept as a correctness pin.
-    // Instances with bound == 30 commit the peel. The m == 7 instance passes
+    // Instances with bound == 14 commit the peel. (It was 30; doc 56 G6-Q1(d)
+    // bounds a root's `innerloopleft` unrolling at `loopunroll` = 15 like
+    // LuaJIT, so a 29-trip inner while now aborts the outer root and the m == 7
+    // instance no longer reached the peeled trace at trip 5. 13 trips stay
+    // under the bound and keep the original formation order.) The m == 7 instance passes
     // bound == 7: it arrives at trip 5 with x == 4 (int, so the peeled trace's
     // fingerprint matches), the run-once region executes iteration 5
     // (x -> 4.5, i -> 6) and passes its condition, the STEADY region executes
@@ -1799,7 +1803,7 @@ test "doc 40 phase 0: a peeled while root exiting at zero completions replays it
     try expectProgramTuned(
         \\local s = 0
         \\for m = 1, 12 do
-        \\  local bound = (m == 7) and 7 or 30
+        \\  local bound = (m == 7) and 7 or 14
         \\  local x = 0
         \\  local i = 1
         \\  while i < bound do
@@ -1809,7 +1813,7 @@ test "doc 40 phase 0: a peeled while root exiting at zero completions replays it
         \\  s = s + x
         \\end
         \\print(s)
-    , "186.5\n", .{ .hotloop = 5, .inspect = &assertPeeledSteadyZeroExit });
+    , "98.5\n", .{ .hotloop = 5, .inspect = &assertPeeledSteadyZeroExit });
 }
 
 /// `assertPeelCommitted`, plus: every executing leg took at least one

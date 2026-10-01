@@ -2366,6 +2366,18 @@ pub fn replayLedgerFrom(
                 // returns (never mid-walk — review blocker 5).
                 if (e.outcome == .normal and owner.code.isBridgeCandidate(e.exit))
                     self.pending_bridge_arm = .{ .trace_id = owner.id, .exit_instr = e.exit };
+                // An armed bridge the ledger cap suppressed (nativegen's
+                // `bridge_full`): the deopt itself is ordinary. (A yielded
+                // deopt is the last row of a full ledger, so this scan runs at
+                // most once per walk.)
+                if (e.outcome == .yielded and owner.code.isBridgeCandidate(e.exit)) {
+                    for (self.registry.native_physical.armedLinks()) |l| {
+                        if (l.parent == owner and l.slot_index == e.exit and l.kind == .region_bridge) {
+                            self.native_region_bridge_cap_yields +|= 1;
+                            break;
+                        }
+                    }
+                }
                 // A-vii-d.1: (b') bridged successor — an ordinary-mode
                 // (`ordinary_entry`) body entered through the composite
                 // bridge. Checked BEFORE the `ends_link` split (codex

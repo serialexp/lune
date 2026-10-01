@@ -1,8 +1,8 @@
 # 56 — Exit-started side traces (LuaJIT's side-trace mechanism) — Design
 
-Status: Phase 1 done (exit snapshots, exit location map, finalize tests); Phase 2 done (attachability and resume pc); Phase 3 done (tier-1a materialize and exit-side recording); Phase 4 done (native exit adapters, behind a switch that is off); Phase 5 done (direct jump and ledger grammar, switch still off; §4.8.1 and the as-built notes in the checklist); Phase 6 done with R1–R4 of Phase 7 (silent exit-side cycles, keyed by cell; §4.8.3); design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
+Status: Phase 1 done (exit snapshots, exit location map, finalize tests); Phase 2 done (attachability and resume pc); Phase 3 done (tier-1a materialize and exit-side recording); Phase 4 done (native exit adapters, behind a switch that is off); Phase 5 done (direct jump and ledger grammar, switch still off; §4.8.1 and the as-built notes in the checklist); Phase 6 done with R1–R4 of Phase 7 (silent exit-side cycles, keyed by cell; §4.8.3); switch on by default since doc 58 B2, and G6 (side link close, `loopunroll`) landed with the region-bridge cap fix (§4.8.5, Codex re-reviewed); design approved. Revision 6. Review rounds: Antigravity round 1 CHANGES REQUESTED, round 2 APPROVE WITH CHANGES; independent sub-agent rounds 3 and 4 CHANGES REQUESTED, round 5 APPROVE WITH CHANGES. All findings are folded in. Bart ruled not to wait for Codex.
 Owner: Bart
-Last updated: 2026-09-27
+Last updated: 2026-10-01
 
 ## Implementation status
 
@@ -2072,6 +2072,116 @@ option (d)). One minor (the peel test, in G6-Q2) and one nit (assert
 the anchor proto in `linkKindAt`, for the implementation). Its claim
 that (b) breaks determinism is not taken: the switch is a config input,
 the same on every leg. `docs/reviews/doc56/antigravity-g6.md`.
+
+#### 4.8.5 G6 landed, and the bridge cap it exposed (2026-10-01)
+
+G5 landed as doc 58 B2, together with the `exit_side_native` default
+flip. The flip made the sieves ~3× slower (board: nsieve 12 → 39 ms,
+nsieve-bit 14 → 33, sieve_int 6 → 24; HEAD with the switch on was
+already that slow). Bart: commit B2, then fix. Three changes:
+
+1. **G6-Q1(a): the `.side` link close.** `recForLoop`'s link close
+   takes `.side` recordings as well as `.continuation` ones (LuaJIT's
+   rule: any trace with a parent). With G5 in place the switch-off
+   regression the experiment showed is gone: fft switch-off is 376
+   with or without the widening. G6-Q2 is moot. The doc 40 glue test
+   no longer breaks, because B2 moved that peel to the `while` root.
+   Alone, the widening takes the sieves to 26 / 18 / 11 ms.
+2. **G6-Q1(d): the `loopunroll` bound.** `noteLoopIteration`, called
+   wherever a recording goes round a loop without closing or linking:
+   a taken `for_loop` or `tfor_loop` back-edge that is not its own
+   anchor's, or a passed `loop` marker with no linkable root —
+   including markers inside inlined callees (no link is possible
+   there), and a root's marker on the `innerloopleft` escape
+   (`unroll_while`). After `Config.loopunroll` (15, LuaJIT's default)
+   such iterations it aborts `.loop_unroll` (LuaJIT `LJ_TRERR_LUNROLL`,
+   both arms of `rec_loop_interp`). Like LuaJIT's counter it is
+   recording-wide and kind-blind; the own-anchor exemption is depth 0
+   only (an inlined recursive instance is another loop). The inlined
+   and root-escape cases came from the Codex re-review
+   (`docs/reviews/doc56/codex-g6-bridge-cap.md`): before, an inlined
+   `while` in a side recording unrolled to `too_long` at 2,000 IR. Not
+   ported: the root arm's `nins - loopref > 24` clause, since our IR
+   density differs and 24 needs calibrating (TODO).
+3. **The region bridge's ledger cap (new finding, Z-8 layer 2).** After
+   (1), nsieve's steady cycle is four rows:
+   - `t4 ei=12` exit-side → `t5`,
+   - `t5` link → the inner root `t2`,
+   - `t2` loop-done linked → the post-loop continuation `t3`,
+   - `t3 ei=23` ("next `i` is composite") region bridge → `t4`.
+
+   So every 32-row ledger fills on the bridge, and the bridge stub's
+   full case was a plain `.normal` deopt. `considerSilentPromotion`
+   accepts only a full ledger ending `.yielded`, so the cycle stayed
+   in rows mode: 11,789 coarse deopts, tier-0 replays and ledger
+   walks per run. (With the switch off the cycle has a different row
+   count, the cap lands on a `link_terminal`, and it promotes at once.)
+
+   Fix:
+   - The stub's full case (`bridge_full`) stages the armed target.
+     The deopt tail's row then fills the ledger, and
+     `emitForcedYieldCheck` stamps it `.yielded` and redirects to
+     `shared_exit`. This is sound by construction: the case is taken
+     only at `ledger_len ≥ CAP − 1`, so after the append the cap check
+     always yields and never enters the child without the bridge
+     commit.
+   - Detection matches a final `.yielded` `.deopt` row to the exit's
+     `.region_bridge` edge. A bridge and a sibling handoff share the
+     ordinary cell, which holds one record, so the match is
+     unambiguous. The rule is one pure predicate,
+     `rowMatchesSilentKind`.
+   - New counter `native_region_bridge_cap_yields`, shown in
+     `--jit-stats` on the "link fused" line.
+
+**Measured** before the review fixes (ReleaseFast, best of 5, switch
+on; switch off in brackets): nsieve 15 [13], nsieve-bit 14 [14],
+sieve_int 6 [6], fft 182 [365], nsieve-bit-fp 326 [334], lu 154 [153],
+sparse 124 [121]. nsieve jit-debug: 6 promotions, 628k silent
+transitions, 12 cap-yields at the bridge (was 11,789 `.normal`
+deopts).
+
+**Board after the review fixes** (`bench/results/20261001-180122-387118e.tsv`,
+tree = 387118e + this change, vs the B2 board 20261001-114121):
+sieve_int 23.6 → 6.6 ms (1.07× LuaJIT), nsieve 38.1 → 14.4 (1.26×),
+nsieve-bit 33.7 → 13.7. Everything else is within ±5% except
+**scimark-fft 177 → 212 (+19%)**. (lua54's +58% is noise: its tier-0
+column, which this change cannot touch, moved +43% in the same run;
+repack's execute-only time is +1.4%.) The fft cost is real (+13%
+instructions, `perf stat`) and comes only from counting inlined
+markers: without that count fft is 175, the root-escape count is
+neutral. It is NOT the bound's own work: both builds abort the same
+recordings the same number of times. Instead the earlier abort
+(`anonymous:33` stops at fft_bitreverse's inlined marker at ~1,110 IR
+rather than `too_long` at ~2,025) shifts when `fft_bitreverse:60` (the
+bit-reverse `while`) re-records, and that anchor commits **byte-identical
+duplicate root traces**: 3 copies plus a peeled int-entry variant here,
+2 copies in the faster build. Every dispatch then selects among the
+duplicates (`enterSelectedTrace`, `accountRegionProfit` carry the extra
+instructions). The duplicates are a pre-existing formation bug — the
+ordinary hot counter re-arms a root at an anchor that already has one,
+and the recording, starting on a later back-edge iteration, reproduces
+the existing trace exactly. LuaJIT never re-roots a `JLOOP` anchor; an
+entry its root can't take becomes a side trace from the failing guard.
+Fixing that is the next step (TODO, CURRENT_TASK).
+
+**Tests** (each mutation-checked):
+- Recorder: "doc 56 G6-Q1(a): a side recording links into a for root
+  …" and "doc 56 G6-Q1(d): … unrolls at most loopunroll iterations …"
+  (for-loop and marker shapes, side/continuation, inlined markers for
+  every kind, the root/head escape, plain-root LINNER, own-anchor
+  exemption).
+- Native: "doc 56 G6 follow-up: the native bridge stub fires at CAP-2
+  and at CAP-1 yields the ordinary deopt's exact state" (a bridge→link
+  ring entered at either member puts the bridge at each parity; CAP-1
+  state compared against an unarmed twin's ordinary deopt).
+- Detector: "doc 56 G6 follow-up: a cap-yielded deopt at an armed
+  bridge exit is that bridge's evidence; only as the final yielded
+  row" (plus stale region proof and disarmed bridge), and "…evidence
+  matching is kind-exact except a final cap-yielded deopt, which names
+  only a region bridge" (table over every silent-site kind).
+- e2e: "doc 56 G6 follow-up: a cycle whose ledger cap lands on its
+  region bridge yields there and goes silent" (the nsieve kernel at
+  test size, in every mode).
 
 ### 4.9 Tiering policy (Phase 7)
 

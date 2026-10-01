@@ -12,8 +12,11 @@ flip pulled forward, because the switch-off path is what B2 regresses;
 `--jit-no-exit-side-native` is the ablation). B2 + flip landed as one commit
 (2026-10-01, at Bart's call, before the re-review). It carries a known
 regression: nsieve/nsieve-bit/sieve_int ~3× from the pre-existing switch-on
-cost (§5 "B2 FIX-ALL" item 7, doc 56 G6). That fix comes next, and the codex
-re-review covers B2 and it together. B3 (probes) and B4's remaining measurement and
+cost (§5 "B2 FIX-ALL" item 7, doc 56 G6). That fix landed next (doc 56
+§4.8.5), and the codex re-review of B2 and it together found no blocker
+(`docs/reviews/doc56/codex-g6-bridge-cap.md`, should-fixes folded in). It
+leaves scimark-fft +19% from duplicate root traces at the bit-reverse
+`while`, a pre-existing formation bug, which is next. B3 (probes) and B4's remaining measurement and
 G6 re-run follow. Rev 2's Option A design and its review are kept as
 Appendix R2.
 **Owner:** claude
@@ -45,8 +48,17 @@ Appendix R2.
 - [x] B2 review fix-all: three blockers, six should-fixes, §4.8 owner
   tie-break, default flip of `exit_side_native` (§5 "B2 FIX-ALL").
 - [x] B2 + flip committed (2026-10-01, Bart's call, before re-review).
-- [ ] Fix the sieve switch-on regression (doc 56 G6 + silent promotion).
-- [ ] codex re-review of B2 + fix-all + flip + the sieve fix.
+- [x] Fix the sieve switch-on regression (doc 56 G6 + silent promotion):
+  G6-Q1(a) side link close, G6-Q1(d) `loopunroll`, the region bridge's
+  ledger-cap yield (doc 56 §4.8.5). Board: sieve_int 23.6 → 6.6,
+  nsieve 38.1 → 14.4, nsieve-bit 33.7 → 13.7.
+- [x] codex re-review of B2 + fix-all + flip + the sieve fix: no
+  blocker, three should-fixes, all fixed
+  (`docs/reviews/doc56/codex-g6-bridge-cap.md`). The B2 fixes hold.
+- [ ] scimark-fft +19% on the same board: duplicate root traces at the
+  bit-reverse `while` anchor (doc 56 §4.8.5, "Board after the review
+  fixes"). Pre-existing formation bug that the inlined `loopunroll`
+  count exposed; fix next.
 - [ ] B3: `repeat` and low-trip probes (§5).
 - [ ] B4: measure with the doc 56 switch off and on (the flip itself is
   done with B2); re-run doc 56 §4.8.4's G6 experiment (§5).

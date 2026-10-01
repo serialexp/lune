@@ -172,6 +172,14 @@ pub const AbortReason = enum {
     /// `maxrecord`. Ordinary strike semantics: the shape is honestly
     /// uncompilable under the budget, no partial candidate publishes.
     snapshot_limit,
+    /// Doc 56 G6-Q1(d), LuaJIT `LJ_TRERR_LUNROLL` (`rec_loop_interp`): a
+    /// side or continuation recording went round a loop it could not link
+    /// to (no root at its header, a peeled root, an entry-contract mismatch)
+    /// more than `Options.loopunroll` times. Without the bound it would grow
+    /// to `maxrecord` with one particular trip count baked in. Ordinary
+    /// strike semantics; the loop warms its own root meanwhile, and a later
+    /// recording links to it.
+    loop_unroll,
 };
 const ExitProvenance = @import("trace_types.zig").ExitProvenance;
 const ProgramPoint = @import("trace_types.zig").ProgramPoint;
@@ -506,6 +514,9 @@ pub const RecordingSession = struct {
         /// Doc 57 P3: `Config.instunroll` (extra source iterations a
         /// pin-defeated close may record before aborting).
         instunroll: u8 = 4,
+        /// Doc 56 G6-Q1(d): LuaJIT's `loopunroll` (15) — loop iterations a
+        /// side or continuation recording may unroll before `.loop_unroll`.
+        loopunroll: u8 = 15,
         optimize: bool = true,
         /// Doc 45 D2: deterministic snapshot admission budgets for PRECISE
         /// recordings. Defaults are the contract values; tests inject smaller
@@ -576,6 +587,9 @@ pub const RecordingSession = struct {
     /// call at the same arrival (`onBackEdge` then `maybeCloseAtAnchor`, the
     /// doc 39 shared-arrival rule) sees the stream unchanged and is ignored.
     unroll_mark_len: usize = 0,
+    /// Doc 56 G6-Q1(d) (LuaJIT `loopunroll`): loop iterations this side or
+    /// continuation recording has unrolled — `noteLoopIteration`.
+    loop_iterations: u8 = 0,
     /// Doc 38 unroll-first policy: this ROOT recording followed at least one
     /// inner-while back-edge inline (unrolled it) instead of aborting LINNER.
     /// Read at abort (an unrolling root that dies bumps the outer anchor's
@@ -1547,7 +1561,7 @@ pub const RecordingSession = struct {
             .for_loop => try self.recForLoop(instr, regs, pc),
             // Doc 30 c4: the generic-for back-edge — mirrors the CONTINUE
             // direction (first loop var non-nil → publish it as ctrl).
-            .tfor_loop => try self.recTForLoop(instr, regs),
+            .tfor_loop => try self.recTForLoop(instr, regs, pc),
             // Nested-loop trace linking (doc 15, Phase 2). A continuation recording
             // re-reaching an inner numeric-`for`'s `for_prep` whose loop header
             // already has a root trace records `for_prep`'s pre-decrement and closes
@@ -3382,7 +3396,23 @@ pub const RecordingSession = struct {
     /// expresses "non-nil" without also pinning truthiness. No
     /// `locals_watermark` here: generic-for keeps the maxInt sentinel (the
     /// loop variables live below the call window and stay in the snapshot).
-    pub fn recTForLoop(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
+    /// Doc 56 G6-Q1(d), LuaJIT `rec_loop_interp`'s side-trace arm ("side
+    /// trace enters an inner loop": `--J->loopunroll < 0` → `LJ_TRERR_LUNROLL`).
+    /// Called where a side or continuation recording goes round a loop
+    /// without closing or linking — a taken `for_loop`/`tfor_loop` back-edge,
+    /// or a passed `loop` marker, at any inline depth. Its own anchor's
+    /// back-edge never gets here (that one closes the trace). Like LuaJIT the
+    /// budget is recording-wide and kind-blind: a root reaches it only where it
+    /// may unroll at all — the `innerloopleft` escape (`recLoopLink`) and loops
+    /// inside inlined callees; elsewhere roots abort LINNER first, and
+    /// one-shots abort `cont_backedge`.
+    fn noteLoopIteration(self: *RecordingSession) void {
+        if (self.close_requested or !self.active) return;
+        if (self.loop_iterations >= self.options.loopunroll) return self.abort(.loop_unroll);
+        self.loop_iterations += 1;
+    }
+
+    pub fn recTForLoop(self: *RecordingSession, instr: Instr, regs: RegWindow, pc: u32) !void {
         // Same cross-proto pc hazard as `recForLoop`: never process a
         // back-edge inside an inlined callee.
         if (self.inline_depth > 0) return self.abort(.cross_frame);
@@ -3441,6 +3471,10 @@ pub const RecordingSession = struct {
             } else return self.abort(.bad_type);
         }
         self.setReg(a + 2, r1); // publish ctrl = v1
+        // Going round a generic `for` that is not our own anchor's unrolls it
+        // (G6-Q1(d)); depth is 0 here (inlined back-edges abort above).
+        const target: u32 = @intCast(@as(i64, pc) + instr.aux);
+        if (target != self.anchor.pc) self.noteLoopIteration();
     }
 
     pub fn recForLoop(self: *RecordingSession, instr: Instr, regs: RegWindow, pc: u32) !void {
@@ -3544,16 +3578,19 @@ pub const RecordingSession = struct {
 
         // Doc 56 Phase 3: a `.continuation` recording that loops back into a
         // numeric `for` whose body start already has a root links to it, the
-        // `for` twin of `recWhileLink` (LuaJIT `rec_loop_jit`, whose side
+        // `for` twin of `recLoopLink` (LuaJIT `rec_loop_jit`, whose side
         // traces end `LJ_TRLINK_ROOT` at any loop that has a trace). Before
         // this the recording unrolled the enclosing loop's next iteration.
+        // Doc 56 G6-Q1(a): `.side` recordings too — LuaJIT's rule is any trace
+        // with a parent; leaving them out let nsieve's `.side` trace unroll
+        // the outer loop with one prime gap baked in (§4.8.4).
         // The continue test and the stepped index/loop var were published
         // above, so the registers are the root's entry state, exactly as at
         // the doc 47 peel close below. Only into a non-peeled root whose
         // entry guards the live registers already satisfy; otherwise keep
         // recording as before. Skipped while a doc 47 peel is pending (that
         // close owns this back-edge).
-        if (within and self.pending_link_close == null and self.kind == .continuation and
+        if (within and self.pending_link_close == null and (self.kind == .continuation or self.kind == .side) and
             self.inline_depth == 0 and !self.precise and target != self.anchor.pc and
             self.context.inner_root and !self.context.inner_root_peeled and
             entryGuardsMatch(self.context.inner_root_guards, regs))
@@ -3569,6 +3606,13 @@ pub const RecordingSession = struct {
             self.close_requested = true;
             return;
         }
+
+        // No link: going round this loop unrolls it (bounded, G6-Q1(d)). Not
+        // our own anchor's back-edge (that closes), and not under a doc 47
+        // peel (the peel bounds itself and owns this back-edge).
+        if (within and self.pending_link_close == null and
+            !(self.inline_depth == 0 and target == self.anchor.pc))
+            self.noteLoopIteration();
 
         // Doc 47 increment A: consume a pending link close from a continuation
         // that recorded through an inner `for_prep` to promote accumulator types.
@@ -3941,12 +3985,15 @@ pub const RecordingSession = struct {
         // which `maybeCloseAtAnchor` (called before the mirror) and `onBackEdge`
         // own — the same path `for_loop` takes. Compare the full (proto, pc)
         // pair, not just pc, to be future-proof.
-        if (self.anchor.proto == proto and target == self.anchor.pc) return;
+        // Depth 0 only: the same (proto, pc) inside an inlined recursive call is
+        // a different loop instance, unrolled like any other.
+        if (self.inline_depth == 0 and self.anchor.proto == proto and target == self.anchor.pc) return;
 
         // Links at inline depth > 0 can't work: `driveChain` resolves
         // `link_target` in the anchor proto, not the callee's. Same constraint
-        // as `recForPrepLink`.
-        if (self.inline_depth > 0) return;
+        // as `recForPrepLink`. Going round the callee's loop unrolls it, so it
+        // counts against `loopunroll` (G6-Q1(d)) for every kind.
+        if (self.inline_depth > 0) return self.noteLoopIteration();
 
         // Root recordings abort LINNER — REGARDLESS of whether the inner while
         // has a root yet (LuaJIT `rec_loop_interp`: entering an inner loop in a
@@ -3973,7 +4020,11 @@ pub const RecordingSession = struct {
             // (doc 44: `.head` is root-like — same policy, same escape hatch.)
             if (self.context.unroll_while) {
                 self.unrolled_while = true;
-                return;
+                // LuaJIT bounds this unrolling too (`--J->loopunroll < 0` in
+                // the root arm of `rec_loop_interp`). An abort here carries
+                // `unrolled_while`, so it feeds the outer anchor's
+                // `unroll_fail` evidence like any dying unrolled root.
+                return self.noteLoopIteration();
             }
             return self.abort(.nyi_opcode); // LINNER → inner root + link
         }
@@ -3981,10 +4032,11 @@ pub const RecordingSession = struct {
         // while — any backward jmp aborts (straight-line-to-terminal v1).
         if (self.kind == .cont) return self.abort(.cont_backedge);
 
-        // Side/continuation recordings: no inner root yet → no-op (the historical
-        // straight-line unroll). The inner while warms up via `onBackEdge` and
-        // spawns its own root; a later continuation then links here.
-        if (!self.context.inner_root) return;
+        // Side/continuation recordings: no inner root yet → unroll this
+        // iteration (bounded by `loopunroll`, G6-Q1(d)). The inner while warms
+        // up via `onBackEdge` and spawns its own root; a later continuation
+        // then links here.
+        if (!self.context.inner_root) return self.noteLoopIteration();
 
         // Doc 45 D6 (P2): no `.link` close on a PRECISE candidate (see
         // `recForPrepLink` — same refusal, same rationale).
@@ -3998,7 +4050,7 @@ pub const RecordingSession = struct {
         // reach (a reset int arriving at a root specialised for a later float
         // trip). Otherwise keep recording into the loop, as with no root.
         if (self.context.inner_root_peeled or
-            !entryGuardsMatch(self.context.inner_root_guards, regs)) return;
+            !entryGuardsMatch(self.context.inner_root_guards, regs)) return self.noteLoopIteration();
         // Close with a `.link` terminal to the inner while root. The φ writeback
         // in `commit()` ensures all modified slots are flushed; unmodified slots
         // remain coherent in the physical register file.
@@ -6036,6 +6088,7 @@ pub const RecordingSession = struct {
         self.peel = null;
         self.unroll_used = 0;
         self.unroll_mark_len = 0;
+        self.loop_iterations = 0;
         self.instrs.clearRetainingCapacity();
         self.consts.clearRetainingCapacity();
         self.entry_slots.clearRetainingCapacity();
@@ -6342,4 +6395,122 @@ test "doc 58 B2 review: a continuation links into a while root only under its en
         try testing.expectEqual(cs.links, session.close_requested);
         try testing.expectEqual(if (cs.links) @as(?u32, header) else null, session.link_target);
     }
+}
+
+/// `for r0 = 1, 10 do <load_int r4> end` after a prologue, then `ret`:
+/// `for_prep` at 3, header 4, `for_loop` at 5, post-loop pc 6.
+const g6_for_code = [_]Instr{
+    Instr.opAx(.load_int, 0, 1), Instr.opAx(.load_int, 1, 10), Instr.opAx(.load_int, 2, 1),
+    Instr.opAx(.for_prep, 0, 1), Instr.opAx(.load_int, 4, 0),  Instr.opAx(.for_loop, 0, -2),
+    Instr.op0(.ret),
+};
+const g6_for_loop = g6_for_code[5];
+const g6_for_header: u32 = 4;
+
+fn g6ForRegs(tags: *[5]u8, payloads: *[5]u64) RegWindow {
+    const regs = RegWindow.of(tags, payloads);
+    regs.set(0, Value.int(1)); // idx: 1 + 1 <= 10, the loop goes round
+    regs.set(1, Value.int(10));
+    regs.set(2, Value.int(1));
+    return regs;
+}
+
+test "doc 56 G6-Q1(a): a side recording links into a for root at its back-edge, like a continuation" {
+    const testing = std.testing;
+    const proto = Proto{ .code = &g6_for_code, .id = 1, .name = "for", .num_registers = 5 };
+    var tags = [_]u8{ 0, 0, 0, 0, 0 };
+    var payloads = [_]u64{ 0, 0, 0, 0, 0 };
+    const regs = g6ForRegs(&tags, &payloads);
+    const Case = struct { kind: TraceKind, links: bool };
+    for ([_]Case{ .{ .kind = .side, .links = true }, .{ .kind = .continuation, .links = true } }) |cs| {
+        var session: RecordingSession = .{};
+        defer session.deinit(testing.allocator);
+        try session.reset(testing.allocator, .{ .proto = &proto, .pc = 6 }, 5);
+        session.kind = cs.kind;
+        session.context.inner_root = true;
+        // `pc` is the post-increment cursor, as in `recordInstr`.
+        try session.recForLoop(g6_for_loop, regs, 6);
+        try testing.expectEqual(cs.links, session.close_requested);
+        try testing.expectEqual(@as(?u32, g6_for_header), session.link_target);
+        try testing.expectEqual(@as(u8, 0), session.loop_iterations); // a link unrolls nothing
+    }
+}
+
+test "doc 56 G6-Q1(d): a recording unrolls at most loopunroll iterations of loops it cannot link, inlined ones and root escapes included" {
+    const testing = std.testing;
+    const bc = @import("bytecode.zig");
+    const for_proto = Proto{ .code = &g6_for_code, .id = 1, .name = "for", .num_registers = 5 };
+    const marker: Instr = .{ .op = .loop, .b = @intFromEnum(bc.LoopKind.while_loop), .aux = 2 };
+    const while_code = [_]Instr{
+        Instr.opA(.load_bool, 0),    Instr.opAx(.jmp_if_false, 0, 3), marker,
+        Instr.opAx(.load_int, 1, 0), Instr.opAx(.jmp, 0, -5),          Instr.op0(.ret),
+    };
+    const while_proto = Proto{ .code = &while_code, .id = 2, .name = "while", .num_registers = 5 };
+    var tags = [_]u8{ 0, 0, 0, 0, 0 };
+    var payloads = [_]u64{ 0, 0, 0, 0, 0 };
+    const regs = g6ForRegs(&tags, &payloads);
+
+    // `inlined`: the marker sits in an inlined callee (no link is possible
+    // there) — counted for every kind, roots included (codex re-review
+    // should-fix 1: it used to be skipped, and a side recording unrolled an
+    // inlined `while` until `too_long`). The callee is the anchor's own proto at
+    // the anchor pc — a recursive instance, so the depth-0 own-anchor exemption
+    // must not apply. `unroll_root`: a root on the `innerloopleft` escape
+    // (`unroll_while`), LuaJIT's root-arm `LUNROLL`.
+    const Shape = enum { for_loop, marker, inlined, unroll_root };
+    const Case = struct { kind: TraceKind, shape: Shape };
+    const cases = [_]Case{
+        .{ .kind = .side, .shape = .for_loop },         .{ .kind = .continuation, .shape = .for_loop },
+        .{ .kind = .side, .shape = .marker },           .{ .kind = .continuation, .shape = .marker },
+        .{ .kind = .side, .shape = .inlined },          .{ .kind = .continuation, .shape = .inlined },
+        .{ .kind = .root, .shape = .inlined },          .{ .kind = .root, .shape = .unroll_root },
+        .{ .kind = .head, .shape = .unroll_root },
+    };
+    for (cases) |cs| {
+        var session: RecordingSession = .{};
+        defer session.deinit(testing.allocator);
+        const proto = if (cs.shape == .for_loop) &for_proto else &while_proto;
+        const anchor_pc: u32 = if (cs.shape == .inlined) 3 else @intCast(proto.code.len - 1);
+        try session.reset(testing.allocator, .{ .proto = proto, .pc = anchor_pc }, 5);
+        session.kind = cs.kind;
+        session.options.loopunroll = 3;
+        if (cs.shape == .inlined) session.inline_depth = 1;
+        if (cs.shape == .unroll_root) session.context.unroll_while = true;
+        // No root at the loop: every crossing unrolls one iteration.
+        for (0..3) |_| {
+            switch (cs.shape) {
+                .for_loop => try session.recForLoop(g6_for_loop, regs, 6),
+                .marker, .inlined, .unroll_root => try session.recLoopLink(marker, regs, &while_proto, 3),
+            }
+            try testing.expect(session.active);
+        }
+        try testing.expectEqual(@as(u8, 3), session.loop_iterations);
+        switch (cs.shape) {
+            .for_loop => try session.recForLoop(g6_for_loop, regs, 6),
+            .marker, .inlined, .unroll_root => try session.recLoopLink(marker, regs, &while_proto, 3),
+        }
+        try testing.expect(!session.active);
+        try testing.expectEqual(@as(?AbortReason, .loop_unroll), session.abort_reason);
+        if (cs.shape == .unroll_root) try testing.expect(session.unrolled_while);
+    }
+
+    // A root without the escape still aborts LINNER at the marker, uncounted.
+    var linner: RecordingSession = .{};
+    defer linner.deinit(testing.allocator);
+    try linner.reset(testing.allocator, .{ .proto = &while_proto, .pc = 5 }, 5);
+    linner.kind = .root;
+    try linner.recLoopLink(marker, regs, &while_proto, 3);
+    try testing.expectEqual(@as(?AbortReason, .nyi_opcode), linner.abort_reason);
+    try testing.expectEqual(@as(u8, 0), linner.loop_iterations);
+
+    // A recording's own anchor back-edge closes the trace; it is never an
+    // unrolled iteration. (A `.side` recording anchored at the loop header.)
+    var own: RecordingSession = .{};
+    defer own.deinit(testing.allocator);
+    try own.reset(testing.allocator, .{ .proto = &for_proto, .pc = g6_for_header }, 5);
+    own.kind = .side;
+    own.options.loopunroll = 0;
+    try own.recForLoop(g6_for_loop, regs, 6);
+    try testing.expect(own.active);
+    try testing.expectEqual(@as(u8, 0), own.loop_iterations);
 }

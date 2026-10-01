@@ -1668,3 +1668,51 @@ test "doc 58 §4.8: fft_transform's multi-root repeat cycle elects its first loo
         .inspect = Inspect.run,
     });
 }
+
+/// The nsieve kernel (LuaJIT `bench/nsieve.lua`) at test size. With exit-side
+/// on, its steady cycle is four rows — the outer root's prime exit (exit-side)
+/// → the `for_prep` child (link) → the inner `for k` root (loop-done linked) →
+/// the post-loop continuation, whose "next i is composite" exit bridges back to
+/// the outer root (region bridge). Every 32-row ledger therefore fills on the
+/// bridge.
+const nsieve_src =
+    \\local function nsieve(p, m)
+    \\  for i=2,m do p[i] = true end
+    \\  local count = 0
+    \\  for i=2,m do
+    \\    if p[i] then
+    \\      for k=i+i,m,i do p[k] = false end
+    \\      count = count + 1
+    \\    end
+    \\  end
+    \\  return count
+    \\end
+    \\local primes = {}
+    \\local s = 0
+    \\for i=0,2 do s = s + nsieve(primes, 20000 >> i) end
+    \\print(s)
+;
+
+test "doc 56 G6 follow-up: a cycle whose ledger cap lands on its region bridge yields there and goes silent" {
+    // The bridge stub's ledger-full case used to take a plain `.normal` deopt,
+    // which is not silent-promotion evidence: the sieves sat in rows mode with
+    // a coarse deopt + tier-0 replay + ledger walk every 32 rows (3× slower
+    // than with exit-side off). Now the cap is a `.yielded` deopt that names
+    // the suppressed bridge, and detection accepts it as that bridge's row.
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode != .record_execute_native) return;
+            const ts = &vm.trace;
+            try testing.expect(ts.native_region_bridge_fused > 0);
+            // Native half: the cap at the bridge is reported as a yield.
+            try testing.expect(ts.native_region_bridge_cap_yields > 0);
+            // Detection half: no such yield is rejected as a kind mismatch.
+            try testing.expectEqual(@as(u64, 0), ts.silent_rejects.no_silent_site);
+            try testing.expect(ts.registry.native_physical.silent_promotions > 0);
+        }
+    };
+    try expectProgramTuned(nsieve_src, "4160\n", .{
+        .hotloop = (@import("trace.zig").TraceConfig{}).hotloop,
+        .inspect = Inspect.run,
+    });
+}

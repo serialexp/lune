@@ -2633,9 +2633,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     // Cap check FIRST, before any VM-state or result mutation beyond
                     // the legacy exit_instr write above. Reserve two ledger cells:
                     // this bridge receipt and the successor's terminal receipt.
+                    const bridge_full = try a.label();
                     try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "ledger_len"));
                     try a.cmpRegImm32(.rax, @intCast(trace_exec.LEDGER_CAP - 2));
-                    try a.jcc(.a, ordinary_mini);
+                    try a.jcc(.a, bridge_full);
 
                     try emitCompositeBridgeSnapshot(a, t, kinds, alloc, ei);
                     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
@@ -2649,11 +2650,30 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     try a.movMemReg(.rdx, @offsetOf(NativeResult, "exit_target"), .rax);
                     try a.jmpMem(.rdx, @offsetOf(NativeResult, "exit_target"));
 
-                    // Shared fallback for BOTH unarmed and ledger-full cases. This is
-                    // VM-state/output-equivalent to the pre-A-v mini-stub.
+                    // Armed, but no room for the bridge row plus the successor's
+                    // terminal row: `ledger_len` is CAP − 1 here (an exit never
+                    // runs on a full ledger — every armed dispatch yields at CAP).
+                    // Take the ordinary deopt with the ARMED target staged: the
+                    // deopt tail's row fills the ledger, and `emitForcedYieldCheck`
+                    // stamps it `.yielded` and redirects to `shared_exit`. That is
+                    // the cap-yield every other arm kind reports, and the evidence
+                    // silent promotion waits for (`considerSilentPromotion`). A
+                    // plain `.normal` deopt here made a cycle whose cap always
+                    // lands on its bridge — the sieves under exit-side (doc 56
+                    // G6 follow-up) — unpromotable, paying a coarse deopt, a
+                    // tier-0 replay and a ledger walk every 32 rows.
+                    a.bind(bridge_full);
+                    try a.movRegImm64(.rax, @bitCast(@as(u64, slotAddr(slots, ei).?)));
+                    try a.movRegMem(.rax, .rax, 0);
+                    try a.movMemReg(.rdx, @offsetOf(NativeResult, "exit_target"), .rax);
+                    const staged = try a.label();
+                    try a.jmp(staged);
+
+                    // Unarmed: VM-state/output-equivalent to the pre-A-v mini-stub.
                     a.bind(ordinary_mini);
                     try a.movRegImm64(.rax, @bitCast(@as(u64, se)));
                     try a.movMemReg(.rdx, @offsetOf(NativeResult, "exit_target"), .rax);
+                    a.bind(staged);
                 } else {
                     // Non-candidate ordinary guard: preserve the exact pre-A-v
                     // emission — resolve through its own slot (deref → stage).

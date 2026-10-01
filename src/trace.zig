@@ -462,6 +462,10 @@ pub const TraceConfig = struct {
     /// another value — the flipped boolean. 0 = abort `type_instability`
     /// at the first such close (pre-P3 behaviour).
     instunroll: u8 = 4,
+    /// Doc 56 G6-Q1(d) (LuaJIT `loopunroll`, `lj_jit.h` default 15): how many
+    /// loop iterations a side or continuation recording may unroll — loops it
+    /// goes round without linking to a root — before aborting `.loop_unroll`.
+    loopunroll: u8 = 15,
     /// Back-edge count at which a loop header becomes a trace anchor.
     hotloop: u32 = 56,
     /// Doc 44: call count at which a Lua function head becomes a trace anchor.
@@ -1353,6 +1357,11 @@ pub const TraceState = struct {
     /// counter (an arm can happen without ever firing: the parent may retire, or the
     /// guard may never fail again); `> 0` proves the fused edge-4 hop is exercised.
     native_region_bridge_fused: u64 = 0,
+    /// Doc 56 G6 follow-up: full ledgers whose last row is a `.yielded` deopt
+    /// at a bridge-candidate exit — an armed bridge suppressed by the ledger
+    /// cap (nativegen's `bridge_full`), reported the way every other arm kind
+    /// reports its cap. Stays 0 if the cap falls back to a plain deopt.
+    native_region_bridge_cap_yields: u64 = 0,
     /// **Coherent-state chaining (doc 16, Phase 2) diagnostics.** `prime_side_arms`
     /// counts outer-header prime side-traces armed (a productive branch-guard went
     /// hot and we switched to `.full` to record the current prime iteration).
@@ -3320,7 +3329,7 @@ pub const TraceState = struct {
     /// frame; recording proper begins at the next dispatch-loop iteration (which
     /// is the anchor instruction). On OOM we simply don't arm.
     fn configureRecording(self: *TraceState) void {
-        self.rec.options = .{ .maxrecord = self.config.maxrecord, .peel = self.config.peel, .instunroll = self.config.instunroll, .optimize = self.config.optimize, .snapshot_budget = self.config.snapshot_budget };
+        self.rec.options = .{ .maxrecord = self.config.maxrecord, .peel = self.config.peel, .instunroll = self.config.instunroll, .loopunroll = self.config.loopunroll, .optimize = self.config.optimize, .snapshot_budget = self.config.snapshot_budget };
     }
     pub fn recordInstr(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, resolved: Value) void {
         self.configureRecording();
@@ -4068,7 +4077,7 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
     try w.print("    rowless sibling hits: {d} (doc 54 P2 amendment hops)\n", .{ts.sibling_link_hits});
     try w.print("    link arms:            native={d} source={d} loopdone={d} bridge={d}\n", .{ ts.native_link_arms, ts.native_source_link_arms, ts.native_loopdone_link_arms, ts.native_region_bridge_arms });
     try w.print("    bridge arm attempts:  {d} (pipeline runs; vs {d} arms)\n", .{ ts.native_region_bridge_arm_attempts, ts.native_region_bridge_arms });
-    try w.print("    link fused:           source={d} loopdone={d} bridge={d}\n", .{ ts.native_source_link_fused, ts.native_loopdone_link_fused, ts.native_region_bridge_fused });
+    try w.print("    link fused:           source={d} loopdone={d} bridge={d} (bridge cap yields={d})\n", .{ ts.native_source_link_fused, ts.native_loopdone_link_fused, ts.native_region_bridge_fused, ts.native_region_bridge_cap_yields });
     try w.print("    link disarms:         {d} (peak simultaneous arms: {d})\n", .{ ts.registry.native_physical.native_link_disarms, ts.registry.native_physical.native_link_peak });
     try w.print("    native link exits:    {d} (follows={d})\n", .{ ts.native_link_exits, ts.native_link_follow_count });
     try w.print("    ir link exits:        {d} (follows={d})\n", .{ ts.link_ir_exits, ts.link_follow_count });

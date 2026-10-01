@@ -758,6 +758,229 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
     try expectB3Promoted(bridge_edge.?, false);
 }
 
+test "doc 56 G6 follow-up: a cap-yielded deopt at an armed bridge exit is that bridge's evidence; only as the final yielded row" {
+    // With no room for the bridge row plus its successor's, the bridge stub
+    // takes the coarse deopt with the arm staged and the forced-yield cap
+    // stamps it — the ledger's last row is `.deopt`/`.yielded` at the bridge
+    // exit. It names the suppressed bridge arm, so detection must match it to
+    // the `.region_bridge` edge; a `.normal` deopt there is a real guard
+    // failure and must not.
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [32]Instr = @splat(Instr.op0(.halt));
+    code[5] = Instr.opAx(.jmp_if_true, 0, 10);
+    code[6] = Instr.opAx(.for_loop, 0, 2);
+    const proto = Proto{ .id = 1715, .code = &code, .name = "b3-bridge-cap", .num_registers = 4 };
+    const bridge = try makeB3BridgeTrace(gpa, &state, &proto, 43, 20, 9);
+    const succ = try makeB3LinkTrace(gpa, &state, &proto, 44, 9, 20);
+    const rid: RegionId = @enumFromInt(1715);
+    try state.region_policy.region_defs.put(gpa, rid, .{
+        .members = try gpa.dupe(StructuralEdgeId, &.{.{
+            .anchor_proto_id = proto.id,
+            .anchor_pc = bridge.code.anchor.pc,
+            .exit = bridge.code.exit_prov[1].prov,
+            .succ_anchor_proto_id = proto.id,
+            .succ_anchor_pc = succ.code.anchor.pc,
+        }}),
+        .member_points = try gpa.dupe(ProgramPoint, &.{
+            .{ .proto_id = proto.id, .source_pc = bridge.code.anchor.pc },
+            .{ .proto_id = proto.id, .source_pc = succ.code.anchor.pc },
+        }),
+        .owner = bridge.code.anchor,
+        .classifier = .{ .kind = .cross_trace_cycle, .member_count = 2 },
+        .armable = true,
+        .bridges = try gpa.alloc(RegionBridgeDef, 0),
+    });
+    try testing.expect(try state.armNativeLink(bridge, 11, succ, .region_bridge));
+    try testing.expect(try state.armNativeLink(succ, 0, bridge, .link_terminal));
+    for (state.registry.native_physical.armed_links.items) |*link| if (link.kind == .region_bridge) {
+        link.region_id = rid;
+        link.armed_gen = state.region_policy.region_defs_gen;
+    };
+    const key: RegionKey = .{ .region_id = rid, .activation = 7 };
+
+    var cap_yield = b3ObservedRow(bridge, 11, .deopt);
+    cap_yield.outcome = .yielded;
+    const yielded = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(bridge, 11, .region_bridge),
+        b3ObservedRow(succ, 0, .link_terminal),
+        cap_yield,
+    };
+    const edges = state.detectPromotableSet(&yielded, key).?;
+    defer gpa.free(edges);
+    try testing.expectEqual(@as(usize, 2), edges.len);
+
+    // The same row with outcome `.normal` is a guard failure, not the bridge.
+    const normal = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(bridge, 11, .region_bridge),
+        b3ObservedRow(succ, 0, .link_terminal),
+        b3ObservedRow(bridge, 11, .deopt),
+    };
+    try testing.expect(state.detectPromotableSet(&normal, key) == null);
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.no_silent_site);
+    // ...and a yielded deopt is only the bridge's as the FINAL row.
+    const not_final = [_]trace_exec.LedgerEntry{ cap_yield, b3ObservedRow(succ, 0, .link_terminal) };
+    try testing.expect(state.detectPromotableSet(&not_final, key) == null);
+    try testing.expectEqual(@as(u64, 2), state.silent_rejects.no_silent_site);
+
+    // A bridge whose region proof went stale is no candidate, so the cap row
+    // names nothing: the ledger is an open chain.
+    const bridge_link = for (state.registry.native_physical.armed_links.items) |*link| {
+        if (link.kind == .region_bridge) break link;
+    } else return error.TestNoBridgeArm;
+    bridge_link.region_id = @enumFromInt(9999);
+    try testing.expect(state.detectPromotableSet(&yielded, key) == null);
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.open_chain);
+    bridge_link.region_id = rid;
+    const again = state.detectPromotableSet(&yielded, key).?;
+    gpa.free(again);
+    // ...and nor is a disarmed one.
+    for (state.registry.native_physical.armedLinks(), 0..) |link, idx| {
+        if (link.kind == .region_bridge) {
+            state.disarmLinkAt(idx);
+            break;
+        }
+    }
+    try testing.expect(state.detectPromotableSet(&yielded, key) == null);
+    try testing.expectEqual(@as(u64, 2), state.silent_rejects.open_chain);
+}
+
+test "doc 56 G6 follow-up: evidence matching is kind-exact except a final cap-yielded deopt, which names only a region bridge" {
+    const rowMatches = @import("trace_link.zig").rowMatchesSilentKind;
+    const K = nativegen.SilentSiteKind;
+    const Case = struct { kind: trace_exec.LedgerKind, outcome: trace_exec.LedgerOutcome, final: bool, matches: []const K };
+    const cases = [_]Case{
+        // The one exception: final + yielded + deopt also names the bridge.
+        .{ .kind = .deopt, .outcome = .yielded, .final = true, .matches = &.{ .deopt, .region_bridge } },
+        .{ .kind = .deopt, .outcome = .yielded, .final = false, .matches = &.{.deopt} },
+        .{ .kind = .deopt, .outcome = .normal, .final = true, .matches = &.{.deopt} },
+        // Every other row stays kind-exact, final and yielded or not — in
+        // particular an exit-side row never names the bridge, nor a deopt the
+        // exit-side adapter.
+        .{ .kind = .exit_side, .outcome = .yielded, .final = true, .matches = &.{.exit_side} },
+        .{ .kind = .link_terminal, .outcome = .yielded, .final = true, .matches = &.{.link_terminal} },
+        .{ .kind = .loop_done_linked, .outcome = .yielded, .final = true, .matches = &.{.loop_done_linked} },
+        .{ .kind = .region_bridge, .outcome = .normal, .final = true, .matches = &.{.region_bridge} },
+        .{ .kind = .prologue_fail, .outcome = .normal, .final = true, .matches = &.{} },
+    };
+    for (cases) |cs| {
+        const row: trace_exec.LedgerEntry = .{ .cum = 0, .id = 1, .exit = 3, .reason = .normal, .kind = cs.kind, .outcome = cs.outcome };
+        for (std.enums.values(K)) |edge_kind| {
+            const want = std.mem.indexOfScalar(K, cs.matches, edge_kind) != null;
+            try testing.expectEqual(want, rowMatches(row, cs.final, edge_kind));
+        }
+    }
+}
+
+test "doc 56 G6 follow-up: the native bridge stub fires at CAP-2 and at CAP-1 yields the ordinary deopt's exact state" {
+    // The stub reserves two ledger cells (its row plus the successor's). The
+    // ring is bridge(41) --exit 11--> link trace --link--> bridge, two rows a
+    // lap, and each bridge pass bumps slot 0 (and its slot-3 twin) once, so the
+    // entry point picks the parity at which the bridge meets the cap:
+    //   * entered at the bridge, it fires at even lengths — 30 = CAP-2 must
+    //     still take the armed path and run the successor;
+    //   * entered at the link trace, it fires at odd lengths — 31 = CAP-1 is
+    //     full: the coarse deopt runs with the arm staged and the forced-yield
+    //     check stamps it `.yielded`, and the successor must NOT run.
+    // The CAP-1 exit must leave exactly what an unarmed bridge's ordinary deopt
+    // leaves from the same entry registers — same flush, same exit identity.
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [32]Instr = @splat(Instr.op0(.halt));
+    code[5] = Instr.opAx(.jmp_if_true, 0, 10);
+    code[6] = Instr.opAx(.for_loop, 0, 2);
+    const proto = Proto{ .id = 1717, .code = &code, .name = "b3-bridge-cap-native", .num_registers = 4 };
+    const bridge = try makeB3BridgeTrace(gpa, &state, &proto, 45, 20, 9);
+    const succ = try makeB3LinkTrace(gpa, &state, &proto, 46, 9, 20);
+    // The oracle: the same bridge shape with its exit left unarmed.
+    const oracle = try makeB3BridgeTrace(gpa, &state, &proto, 47, 20, 9);
+    const rid: RegionId = @enumFromInt(1717);
+    try state.region_policy.region_defs.put(gpa, rid, .{
+        .members = try gpa.dupe(StructuralEdgeId, &.{.{
+            .anchor_proto_id = proto.id,
+            .anchor_pc = bridge.code.anchor.pc,
+            .exit = bridge.code.exit_prov[1].prov,
+            .succ_anchor_proto_id = proto.id,
+            .succ_anchor_pc = succ.code.anchor.pc,
+        }}),
+        .member_points = try gpa.dupe(ProgramPoint, &.{
+            .{ .proto_id = proto.id, .source_pc = bridge.code.anchor.pc },
+            .{ .proto_id = proto.id, .source_pc = succ.code.anchor.pc },
+        }),
+        .owner = bridge.code.anchor,
+        .classifier = .{ .kind = .cross_trace_cycle, .member_count = 2 },
+        .armable = true,
+        .bridges = try gpa.alloc(RegionBridgeDef, 0),
+    });
+    try testing.expect(try state.armNativeLink(bridge, 11, succ, .region_bridge));
+    try testing.expect(try state.armNativeLink(succ, 0, bridge, .link_terminal));
+
+    const cap = trace_exec.LEDGER_CAP;
+    const start_x: i64 = -100; // far from the loop-done guard for 16+ laps
+    const Regs = struct {
+        tags: [4]u8 = @splat(@intFromEnum(value.Tag.int)),
+        payloads: [4]u64,
+        fn init(x: i64) @This() {
+            return .{ .payloads = .{ @bitCast(x), @bitCast(@as(i64, 2)), @bitCast(@as(i64, 7)), @bitCast(@as(i64, 9)) } };
+        }
+    };
+    var ledger: [cap]trace_exec.LedgerEntry = undefined;
+
+    // CAP-2: entered at the bridge, it fires at 0, 2, …, 30; the last one still
+    // materializes and its successor runs.
+    {
+        var r = Regs.init(start_x);
+        const res = bridge.native.compiled.runCapturingLedger(RegWindow.of(&r.tags, &r.payloads), &ledger, .{});
+        try testing.expectEqual(@as(usize, cap), res.ledger_len);
+        try testing.expectEqual(trace_exec.LedgerKind.region_bridge, ledger[cap - 2].kind);
+        try testing.expectEqual(bridge.id, ledger[cap - 2].id);
+        try testing.expectEqual(trace_exec.LedgerOutcome.normal, ledger[cap - 2].outcome);
+        try testing.expectEqual(succ.id, ledger[cap - 1].id); // the successor ran
+        for (ledger[0 .. cap - 2], 0..) |row, i| {
+            try testing.expectEqual(if (i % 2 == 0) bridge.id else succ.id, row.id);
+            try testing.expect(row.outcome == .normal);
+        }
+    }
+
+    // CAP-1: entered at the link trace, the bridge fires at 1, 3, …, 29 and
+    // meets 31 full on its 16th pass.
+    var r = Regs.init(start_x);
+    const res = succ.native.compiled.runCapturingLedger(RegWindow.of(&r.tags, &r.payloads), &ledger, .{});
+    try testing.expectEqual(@as(usize, cap), res.ledger_len);
+    for (ledger[0 .. cap - 1], 0..) |row, i| {
+        try testing.expectEqual(if (i % 2 == 0) succ.id else bridge.id, row.id);
+        try testing.expectEqual(if (i % 2 == 0) trace_exec.LedgerKind.link_terminal else .region_bridge, row.kind);
+        try testing.expect(row.outcome == .normal);
+    }
+    const last = ledger[cap - 1];
+    try testing.expectEqual(bridge.id, last.id);
+    try testing.expectEqual(@as(u32, 11), last.exit);
+    try testing.expectEqual(trace_exec.LedgerKind.deopt, last.kind);
+    try testing.expectEqual(trace_exec.LedgerOutcome.yielded, last.outcome);
+    try testing.expectEqual(bridge.id, res.final_trace_id);
+
+    // The oracle: the unarmed bridge entered with the 16th pass's registers
+    // (15 earlier passes each bumped slot 0 and set slot 3 to it).
+    var o = Regs.init(start_x + 15);
+    o.payloads[3] = @bitCast(start_x + 15);
+    var oledger: [cap]trace_exec.LedgerEntry = undefined;
+    const ores = oracle.native.compiled.runCapturingLedger(RegWindow.of(&o.tags, &o.payloads), &oledger, .{});
+    try testing.expectEqual(@as(usize, 1), ores.ledger_len);
+    try testing.expectEqual(trace_exec.LedgerKind.deopt, oledger[0].kind);
+    try testing.expectEqual(trace_exec.LedgerOutcome.normal, oledger[0].outcome);
+    try testing.expectEqual(ores.exit_instr, res.exit_instr);
+    try testing.expectEqual(ores.exit_reason, res.exit_reason);
+    try testing.expectEqual(ores.local_completed, res.local_completed);
+    try testing.expectEqual(oledger[0].exit, last.exit);
+    try testing.expectEqual(oledger[0].reason, last.reason);
+    try testing.expectEqualSlices(u8, &o.tags, &r.tags);
+    try testing.expectEqualSlices(u64, &o.payloads, &r.payloads);
+}
+
 test "B-3b suffix preserves bridge materialization for child deopt and prologue fail" {
     if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;

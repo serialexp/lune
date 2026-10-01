@@ -1250,6 +1250,22 @@ pub fn rowSilentKind(kind: trace_exec.LedgerKind) ?nativegen.SilentSiteKind {
     };
 }
 
+/// Candidacy's evidence match: may ledger row `row` (the ledger's last row
+/// when `final`) stand for a candidate edge whose silent site is `edge_kind`?
+/// Kind-exact, with one exception: the cap-yielded row of an armed region
+/// bridge is a `.deopt`. With no room for the bridge row plus its successor's,
+/// the stub takes the ordinary coarse deopt with the arm staged and the
+/// forced-yield cap stamps it (nativegen's `bridge_full`), so a FINAL
+/// `.yielded` `.deopt` names the suppressed bridge arm. Unambiguous: a bridge
+/// and a sibling handoff (the other `.deopt` arm) share the exit's ordinary
+/// cell, which holds one record; the exit-side adapter's cell reports its own
+/// `.exit_side` rows and never matches it.
+pub fn rowMatchesSilentKind(row: trace_exec.LedgerEntry, final: bool, edge_kind: nativegen.SilentSiteKind) bool {
+    const observed = rowSilentKind(row.kind) orelse return false;
+    if (edge_kind == observed) return true;
+    return edge_kind == .region_bridge and final and row.kind == .deopt and row.outcome == .yielded;
+}
+
 /// B-3d (doc 17 §B3.16 D1, §B3.18 R7): the ONE per-edge membership predicate
 /// shared by candidacy (`detectPromotableSet`), promotion re-validation
 /// (`promotionBelongsToRegion`), and the membership-growth trigger at the
@@ -1385,14 +1401,14 @@ pub fn detectPromotableSetMembers(
     // an `.exit_side` row the adapter's), so `(parent, exit, kind)` matches
     // at most one member.
     for (entries[0..member_rows], 0..) |row, i| {
-        const observed_kind = rowSilentKind(row.kind) orelse
-            return self.rejectPromotion(.no_silent_site);
+        if (rowSilentKind(row.kind) == null) return self.rejectPromotion(.no_silent_site);
+        const final = i + 1 == entries.len;
         var found: ?PromotedEdge = null;
         var same_exit = false;
         for (scratch[0..n]) |edge| {
             if (edge.parent.id != row.id or edge.exit != row.exit) continue;
             same_exit = true;
-            if (edge.kind == observed_kind) {
+            if (rowMatchesSilentKind(row, final, edge.kind)) {
                 found = edge;
                 break;
             }

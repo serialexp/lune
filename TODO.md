@@ -1872,10 +1872,39 @@ nothing at all.
         adapter-off layout) set `exit_side_native = false` explicitly; doc 47
         gained a default-config twin asserting the exit-side form.
       - Gates, parity sweep and board done (doc 58 §5 "B2 FIX-ALL" 6–7).
-        Committed (Bart: commit now, fix after). **Open:** the flip regresses
-        nsieve/nsieve-bit/sieve_int ~3× (pre-existing switch-on cost: doc 56
-        G6 + silent promotion) — fixing next; the owed codex re-review of B2
-        runs together with that fix.
+        Committed (Bart: commit now, fix after). The flip's sieve regression
+        is **FIXED 2026-10-01** (doc 56 §4.8.5: G6-Q1(a) side link close,
+        G6-Q1(d) `loopunroll`, the region bridge's ledger-cap yield; sieve_int
+        23.6 → 6.6, nsieve 38.1 → 14.4, nsieve-bit 33.7 → 13.7), and the codex
+        re-review of B2 + that fix found no blocker
+        (`docs/reviews/doc56/codex-g6-bridge-cap.md`; three should-fixes
+        folded in).
+- [ ] **Duplicate root traces at one anchor (fft +19%, found 2026-10-01).**
+      `fft_bitreverse:60` (the bit-reverse `while`) commits byte-identical
+      root traces: the ordinary hot counter re-arms a root recording at an
+      anchor that already holds one, and the recording, starting on a later
+      back-edge iteration, reproduces the existing trace exactly (3 copies +
+      a peeled int-entry variant on the 20261001-180122 board; 2 copies even
+      in the faster build). Every dispatch then selects among them
+      (`enterSelectedTrace`, `accountRegionProfit`): +13% instructions.
+      Counting inlined markers in `loopunroll` only moved the formation
+      timing that decides how many copies form. Find which entry the
+      existing root refuses that triggers the re-arm, and answer it the
+      LuaJIT way (a side trace from the failing guard, never a second root
+      at a `JLOOP` anchor); a commit-time identical-trace refusal is a
+      safety net, not the fix. Doc 56 §4.8.5 has the measurements.
+- [ ] **Port LuaJIT's root-arm `nins - loopref > 24` unroll clause.**
+      `rec_loop_interp` also aborts a root that unrolls an inner loop whose
+      body (IR since the last loop event) exceeds 24 instructions, outside
+      `LOOPEV_ENTERLO`. We count only `loopunroll` (doc 56 G6-Q1(d)); our IR
+      density differs from LuaJIT's, so the 24 needs calibrating against
+      our recorder before porting.
+- [ ] **The nsieve init loop's 2-member region takes a window gate-strike
+      every `nsieve` call**, and the strike runs a global `disarmAllLinks`
+      (seen diagnosing the sieve regression, 2026-10-01). nsieve is 14.4 ms
+      switch-on vs ~13 switch-off; this is the leading suspect for the
+      remaining gap. A per-region disarm, or not striking a region that is
+      merely re-entered, would be the general direction.
 - [ ] **Exit-side children are never retired with their parents.** Found
       by the doc 58 flip (`trace_evict_test` monotonic widening): doc 48
       retires a stale narrow-lane root on entry, its exit-side child (a

@@ -1,9 +1,22 @@
-IN PROGRESS (2026-10-01) — B2 + fix-all + `exit_side_native` default flip are
-COMMITTED (Bart: "commit now, then work on the fix"). Known regression it
-carries: nsieve / nsieve-bit / sieve_int ~3× (pre-existing switch-on cost,
-doc 56 G6 + silent promotion). NOW: fixing that (G6-Q1 widening + `loopunroll`
-bound + nsieve silent-promotion diagnosis). The codex re-review owed on B2
-runs together with that fix.
+IN PROGRESS (2026-10-01) — the sieve switch-on regression is FIXED and
+committed on top of B2 (doc 56 §4.8.5: G6-Q1(a) side link close, G6-Q1(d)
+`loopunroll` incl. inlined markers and the root `innerloopleft` escape, the
+region bridge's ledger-cap yield + detector evidence). Codex re-reviewed B2 +
+the fix: no blocker, three should-fixes, all fixed
+(`docs/reviews/doc56/codex-g6-bridge-cap.md`). Gates green (both modes),
+parity sweep 29/29 + probes, board `bench/results/20261001-180122-387118e.tsv`:
+sieve_int 23.6 → 6.6, nsieve 38.1 → 14.4, nsieve-bit 33.7 → 13.7.
+**Known regression carried, same "commit now, then fix" rule:** scimark-fft
+177 → 212 (+19%). Cause, diagnosed: `fft_bitreverse:60` commits byte-identical
+DUPLICATE root traces (the hot counter re-arms a root at an anchor that has
+one; the recording reproduces it), and the inlined `loopunroll` count only
+shifted the timing that decides how many copies form (3+peel vs 2). NEXT: fix
+the duplicate-root formation the LuaJIT way (TODO "Duplicate root traces at
+one anchor"). Then B3 probes, B4 measurement.
+
+(prior state) IN PROGRESS (2026-10-01) — B2 + fix-all + `exit_side_native`
+default flip are COMMITTED (Bart: "commit now, then work on the fix"). Known
+regression it carried: nsieve / nsieve-bit / sieve_int ~3× — now fixed, above.
 
 IN PROGRESS (2026-10-01) — Bart picked option (a): fix ALL three B2 blockers
 + every should-fix on the uncommitted tree, re-review with codex (default
