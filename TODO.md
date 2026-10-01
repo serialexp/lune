@@ -2,6 +2,14 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## `hashgate.py --generate --filter X` wipes every other program's refs (noted 2026-10-01)
+
+- [ ] `write_refs` writes only the observed (filtered) rows, so a filtered
+      generate replaces `bench/refs/output-hashes.tsv` with X's rows alone.
+      Merge instead: load the existing refs, replace the rows for the
+      programs regenerated this run, keep the rest. Workaround for now:
+      generate into a scratch `--refs` and add the rows by hand.
+
 ## A module field read inside a main-chunk loop aborts recording (noted 2026-09-27)
 
 - [ ] **`math.floor(x)` inside a loop in the MAIN chunk aborts
