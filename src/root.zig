@@ -39,6 +39,9 @@ pub const array = @import("array.zig");
 /// The owned hash part backing `Table.hash` (doc 49) — extern layout for the
 /// JIT's inline HREFK access.
 pub const hash_part = @import("hash_part.zig");
+/// The canonical deterministic key order (`next`/`pairs` traversal; also used
+/// by the embedding C API's table iterator, doc 59 §3.4).
+pub const key_order = @import("key_order.zig");
 pub const table = @import("table.zig");
 pub const function = @import("function.zig");
 pub const gc = @import("gc.zig");

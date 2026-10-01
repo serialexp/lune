@@ -97,6 +97,54 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // --- embedding C ABI (doc 59) -------------------------------------------
+    //
+    // `zig build lib` — `libmahina.a` + `include/mahina.h`: the C-ABI embedding
+    // surface (`src/capi.zig`) a host (the Rust crates under `embed/rust/`, or
+    // any C program) links against. Static first (no soname story); needs libc
+    // (the exports allocate through malloc).
+    const capi_mod = b.createModule(.{
+        .root_source_file = b.path("src/capi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "mahina", .module = mod },
+        },
+    });
+    const capi_lib = b.addLibrary(.{
+        .name = "mahina",
+        .root_module = capi_mod,
+        .linkage = .static,
+    });
+    capi_lib.use_llvm = true; // tail-call dispatch needs LLVM (see above)
+    capi_lib.installHeader(b.path("include/mahina.h"), "mahina.h");
+    const install_capi_lib = b.addInstallArtifact(capi_lib, .{});
+    const lib_step = b.step("lib", "Build the embedding static library (libmahina.a + mahina.h)");
+    lib_step.dependOn(&install_capi_lib.step);
+
+    // capi unit tests (src/capi_test.zig) ride the normal test gate.
+    const capi_tests = b.addTest(.{ .root_module = capi_mod, .filters = test_filters });
+    capi_tests.use_llvm = true;
+    const run_capi_tests = b.addRunArtifact(capi_tests);
+    test_step.dependOn(&run_capi_tests.step);
+
+    // The C header-consumer smoke test (doc 59 §3.8): a real C program compiled
+    // against include/mahina.h and linked with libmahina.a, so the HEADER is
+    // validated (Zig-side tests can't see it drift) along with layout and one
+    // full lifecycle. Runs under `zig build test`.
+    const smoke_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    smoke_mod.addCSourceFile(.{ .file = b.path("tests/capi_smoke.c"), .flags = &.{"-std=c99"} });
+    smoke_mod.addIncludePath(b.path("include"));
+    smoke_mod.linkLibrary(capi_lib);
+    const smoke_exe = b.addExecutable(.{ .name = "capi-smoke", .root_module = smoke_mod });
+    const run_smoke = b.addRunArtifact(smoke_exe);
+    test_step.dependOn(&run_smoke.step);
+
     // `zig build bench` — the Phase 6b trace-optimizer benchmark. Always
     // ReleaseFast (a Debug bench would be dominated by safety checks and tell us
     // nothing about the optimizer); informational, not a test.

@@ -772,11 +772,35 @@ pub const Vm = struct {
     /// UNRUN chunks (once run, a closure roots the constants → `releaseChunk`).
     retained_chunks: std.ArrayList(*const Proto) = .empty,
 
+    /// Embedding (doc 59 §3.2): the host-ref registry backing the C API's
+    /// `mh_ref` — values the host holds across the boundary, GC-rooted for as
+    /// long as the ref lives. Slots are generational (a freed-and-reused index
+    /// bumps `generation`, so a stale ref is a deterministic API error, never a
+    /// dangling read); freed slots hold nil so the root walk cannot mark stale
+    /// pointers. Rooted in the **`.gc` walk only** (`forEachRootHeader`): host
+    /// refs are host state, not guest-deterministic state, so they must not
+    /// perturb `.snapshot` bytes (same split as trace consts).
+    host_refs: std.ArrayList(HostRefSlot) = .empty,
+    /// Free slot indices for `host_refs` (LIFO reuse).
+    host_ref_free_list: std.ArrayList(u32) = .empty,
+    /// Embedding (doc 59 §3.3): the parked-results root. `callValue` unroots its
+    /// results the moment it returns (it restores `stack_top`), so the C API
+    /// copies every heap value it hands across the boundary in here; the park is
+    /// cleared at the next idle-VM C entry that can allocate or run guest code.
+    /// `.gc` walk only, like `host_refs`.
+    parked_results: std.ArrayList(Value) = .empty,
+
     /// A runtime-compiled chunk owned by the VM: the `Chunk` (whose arena owns the
     /// proto tree) and the NUL-terminated source the protos borrow.
     pub const LoadedChunk = struct {
         chunk: compiler.Chunk,
         source: [:0]u8,
+    };
+
+    /// One `host_refs` slot: the rooted value and the slot's generation counter.
+    pub const HostRefSlot = struct {
+        value: Value = Value.nil(),
+        generation: u32 = 0,
     };
 
     /// Keep a host-compiled proto tree's constants GC-rooted across the compile→run
@@ -985,6 +1009,9 @@ pub const Vm = struct {
         // Borrows only — free the list, never the borrowed chunks (the host owns
         // those and must have released them before its own `Chunk.deinit`).
         self.retained_chunks.deinit(self.gpa);
+        self.host_refs.deinit(self.gpa);
+        self.host_ref_free_list.deinit(self.gpa);
+        self.parked_results.deinit(self.gpa);
         self.heap.deinit();
         self.gpa.destroy(self.heap);
         self.gpa.free(self.tags);
@@ -1995,6 +2022,21 @@ pub const Vm = struct {
     /// GC contract for callers: `results_out` heap values are rooted only while the
     /// caller's own register window / scratch holds them; consume them before the
     /// next allocation without stashing a raw `Value` across a safepoint.
+    /// Embedding (doc 59 §3.5): invoke an embedder-registered host function —
+    /// the SINGLE funnel for every host-native invocation (the dispatch `.call`
+    /// native arm and `callValue`'s `.native` arm both route here, so a future
+    /// effect-recording chunk cannot miss a path). Contract differences from
+    /// builtin natives: `out` must be DISJOINT from `args` (host callbacks are
+    /// arbitrary embedder code — the NativeMultiFn read-args-first alias
+    /// discipline cannot be imposed on them), and the binding owns its own
+    /// result protocol (`host != null ⇒ effect/multi/recorded all null`).
+    fn callHostNative(self: *Vm, nat: *const function.Native, args: []const Value, out: []Value) Error!usize {
+        const hb = nat.host.?;
+        std.debug.assert(nat.effect == null and nat.multi == null and nat.recorded == null);
+        const produced = hb.call(hb.ctx, @ptrCast(self), args, out) catch |e| return narrowError(e);
+        return @min(produced, out.len);
+    }
+
     pub fn callValue(self: *Vm, callee: Value, args: []const Value, results_out: []Value) Error!usize {
         if (!callee.isHeap()) return Error.TypeError;
         std.debug.assert(!self.reg_top_pending);
@@ -2010,6 +2052,13 @@ pub const Vm = struct {
             // wanted here; the `all_results` stamping path is dispatch-only).
             .native => {
                 const nat = function.Native.fromHeader(callee.asHeap());
+                if (nat.host != null) {
+                    // Embedder host fn (doc 59 §3.5): the single invocation
+                    // funnel. `results_out` never aliases `args` here (direct
+                    // call: two caller buffers; `__call` redirect: parked window
+                    // above vs caller buffer below — see the multi note).
+                    return self.callHostNative(nat, args, results_out);
+                }
                 if (nat.effect) |kind| {
                     const r = try performEffect(self, kind, nat, args);
                     if (results_out.len == 0) return 0;
@@ -2246,6 +2295,11 @@ pub const Vm = struct {
             if (self.trace.isRecording()) {
                 for (self.trace.rec.consts.items) |v| if (v.isHeap()) cb(ctx, v.asHeap());
             }
+            // Embedding (doc 59 §3.3): host-held refs and parked C-boundary
+            // results are GC-liveness roots ONLY — host state must never leak
+            // into snapshot bytes (freed ref slots hold nil, so no stale marks).
+            for (self.host_refs.items) |slot| if (slot.value.isHeap()) cb(ctx, slot.value.asHeap());
+            for (self.parked_results.items) |v| if (v.isHeap()) cb(ctx, v.asHeap());
         }
         for (self.effect_log.items) |e| if (e.result.isHeap()) cb(ctx, e.result.asHeap());
         // 7. the in-flight Lua error value — rooted while parked between a raise and
@@ -6185,7 +6239,33 @@ pub const Vm = struct {
                         // A native call is a trace barrier (recording aborts
                         // at it), so none of this touches the JIT.
                         const all = nwanted == bytecode.all_results;
-                        if (nat.effect) |kind| {
+                        if (nat.host != null) {
+                            // Embedder host fn (doc 59 §3.5): results must NOT
+                            // alias the args (arbitrary embedder code — no
+                            // read-args-first discipline), so park them in the
+                            // boundary scratch ABOVE the args and copy down to
+                            // the destination afterwards. Host calls are trace
+                            // barriers and cross the C boundary anyway — the
+                            // extra copy is noise there.
+                            const out_lo = base + a + 1 + nargs;
+                            const want: usize = if (all) self.regCapacity() -| out_lo else nwanted;
+                            if (out_lo + want > self.regCapacity()) return parkErr(st, Error.StackOverflow);
+                            const out = self.scratchOut(out_lo, out_lo + want);
+                            const produced = self.callHostNative(nat, args, out) catch |e| return parkErr(st, e);
+                            // Straight-line from here to the register writes —
+                            // no allocation, so the scratch results (rooted
+                            // only via the host's park/refs) can't be swept
+                            // mid-copy.
+                            var k: usize = 0;
+                            while (k < produced) : (k += 1) self.regSet(base + a + k, self.boundary_scratch[out_lo + k]);
+                            if (all) {
+                                std.debug.assert(!self.reg_top_pending);
+                                self.reg_top = base + a + produced;
+                                self.reg_top_pending = true;
+                            } else {
+                                while (k < nwanted) : (k += 1) self.regSet(base + a + k, Value.nil());
+                            }
+                        } else if (nat.effect) |kind| {
                             const result = performEffect(self, kind, nat, args) catch |e| return parkErr(st, e);
                             if (all) self.stampSingleResult(base, a, result) else writeSingleResult(st.regs, a, nwanted, result);
                         } else if (nat.multi != null and (all or nwanted >= 2)) {

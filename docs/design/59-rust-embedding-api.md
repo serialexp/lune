@@ -1,8 +1,7 @@
 # 59 — Embedding mahina in Rust: the C-ABI `libmahina` surface and the `mahina` crate
 
-**Status:** rev 2 — reviewed (codex CHANGES REQUESTED ×16, antigravity
-CHANGES REQUESTED ×10; both archived under `docs/reviews/doc59/`), all
-findings folded in below. Ready to implement E1.
+**Status:** partial — E0 (review) + E1/E2 (the Zig C-ABI surface, lib build,
+tests) landed; E3/E4 (Rust crates) next; E5–E9 outstanding.
 **Owner:** claude (fable)
 **Last updated:** 2026-10-01
 
@@ -30,21 +29,32 @@ land; move whole phases to Done once everything inside them is checked.
 - [x] **E0 — design review.** codex + antigravity reviewed rev 1 (both
   CHANGES REQUESTED); every blocker/should-fix/nit folded into rev 2
   (`docs/reviews/doc59/`).
-
-### Outstanding
-
-- [ ] **E1 — C-ABI core (`src/capi.zig` + `include/mahina.h` + build).**
-  VM lifecycle + config, compile/run/eval through `loaded_chunks`, the
-  parked-results root + host-ref registry (rooting lands HERE, not E2 —
-  review moved it), protected-entry error boundary, scalars + strings +
-  stable `MH_TYPE_*` enum, globals get/set, rendered errors, output sink/
-  callback (incl. `vm.err` capture), host-source setters, memory stats.
-  Zig unit tests incl. GC-stress on parked results and refs.
-- [ ] **E2 — host functions + tables + call-in.** `mh_register_fn`
-  (multi-result C signature from day one, binding owned by the `Native`,
-  name-collision + mode refusals), `mh_call`, table create/get/set/len/
-  metatable get/set, the materialized-key iterator handle. Zig unit tests
-  incl. guest-drops-native destructor test.
+- [x] **E1 — C-ABI core (`src/capi.zig` + `include/mahina.h` + build).**
+  VM lifecycle + config (JIT tri-state), compile/run/eval through
+  `loaded_chunks` (`id_base` from `next_proto_id`), the parked-results root
+  + generational host-ref registry (both `.gc`-walk-only Vm fields),
+  protected-entry error boundary (located messages, boundary restore, fatal
+  poisoning on non-catchable), scalars + strings + stable `MH_TYPE_*`
+  translation with C-side tag validation, globals get/set, output + warn
+  sinks, memory stats, `mh_collect`. `zig build lib` (static + header
+  install); Zig unit tests + the compiled-C header smoke test
+  (`tests/capi_smoke.c`) both on the `zig build test` gate. Deviation from
+  the letter of the plan: the output *callback* and clock/random override
+  setters are deferred (internal sinks + real CLI-shaped clock/random
+  defaults landed); host entries run the VM as one continuous epoch via
+  `callValue` (no per-call trace-cache retirement — the game-loop-friendly
+  reading; flagged for the implementation review).
+- [x] **E2 — host functions + tables + call-in.** `mh_register_fn` (multi-
+  result C signature, `function.HostBinding` owned by the `Native` and
+  destroyed at GC, builtin-name collision rejection), `mh_call`,
+  `mh_error_set` → located catchable guest errors, table new/get/set/len/
+  metatable get/set (metamethod-aware get/set), the materialized-key O(1)/
+  step iterator. Tests incl. guest-drops-native destructor, reentrant
+  callback (`mh_call` from inside a host fn), vm-free-during-callback
+  refusal, bad-tag rejection. Mode refusals (`.record`/`.replay`/capture
+  with host fns) are NOT yet wired — effects are plain `.off` in embedding
+  and nothing exposes mode switching through the C API yet; the refusal
+  belongs with whatever first exposes those modes (tracked under E6/E8).
 - [ ] **E3 — `mahina-sys` crate.** Hand-written extern decls mirroring
   `mahina.h`; `build.rs` (PROFILE→optimize mapping, `$ZIG` + `.zig-version`
   respect, `MAHINA_LIB_DIR` prebuilt override, isolated zig cache); plus a

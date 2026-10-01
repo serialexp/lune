@@ -154,6 +154,31 @@ pub const NativeFn = *const fn (ctx: *anyopaque, args: []const Value) anyerror!V
 /// mirroring Lua's stack), so it must not be made to copy.
 pub const NativeMultiFn = *const fn (ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize;
 
+/// Embedding (doc 59 §3.5): an embedder-registered host function. Generic Zig —
+/// no C types here (the C adaptation lives entirely in `capi.zig`, per the
+/// wrapper-boundary rule). `ctx` is the binding's own userdata (NOT the VM; the
+/// VM arrives as the opaque second parameter so this module needn't import
+/// `interp`). Writes up to `out.len` results and returns the count produced;
+/// the VM nil-pads the rest. Unlike `NativeMultiFn`, `out` NEVER aliases `args`
+/// (the invocation funnel guarantees disjoint buffers), so a host fn may write
+/// results before it finishes reading args.
+pub const HostFn = *const fn (ctx: ?*anyopaque, vm: *anyopaque, args: []const Value, out: []Value) anyerror!usize;
+
+/// Embedding (doc 59 §3.5): the per-registration state a host `Native` carries.
+/// **Owned by the `Native` heap object**: `Native.destroy` runs `destroy(ctx)`
+/// (releasing e.g. a boxed Rust closure the moment the guest drops the last
+/// reference, at GC time — not at VM teardown) and frees `name` + the binding
+/// itself. Individually heap-allocated so its address is stable for the
+/// `Native`'s lifetime. `name` is a gpa-owned copy of the registration name;
+/// `Native.name` aliases it, so the bytes live exactly as long as the Native
+/// (never a borrowed C pointer, never a GC-interned string that could be swept).
+pub const HostBinding = struct {
+    call: HostFn,
+    ctx: ?*anyopaque = null,
+    destroy: ?*const fn (?*anyopaque) void = null,
+    name: []u8,
+};
+
 /// Which **recordable builtin** a native is, if any — the JIT's stable,
 /// replay-safe identity for a native whose calls the trace recorder knows how
 /// to record (doc 23): as a fold-to-constant, a reuse of existing IR shapes,
@@ -327,6 +352,13 @@ pub const Native = struct {
     /// knows how to record (see `RecordedBuiltin`). Set from the registry like
     /// `effect`/`multi`, so install and replay can never disagree.
     recorded: ?RecordedBuiltin = null,
+    /// Embedding (doc 59 §3.5): non-null ⇒ an embedder-registered host function;
+    /// the VM's native invocation funnel routes through `host.call` instead of
+    /// `func`/`multi`. Owned by this Native (freed in `destroy`). Invariant:
+    /// `host != null ⇒ recorded == null and effect == null and multi == null`
+    /// (host fns are recorder-opaque — automatic trace barrier — and own their
+    /// whole result protocol); asserted at creation in `capi`.
+    host: ?*HostBinding = null,
 
     pub fn create(
         gpa: std.mem.Allocator,
@@ -345,6 +377,15 @@ pub const Native = struct {
     }
 
     pub fn destroy(self: *Native, gpa: std.mem.Allocator) void {
+        // A host binding dies with its Native (doc 59 §3.5): run the embedder's
+        // destructor (e.g. dropping a boxed Rust closure) and free the owned
+        // name + binding. GC-time, so a guest dropping the last reference to a
+        // registered function releases the host resources promptly.
+        if (self.host) |hb| {
+            if (hb.destroy) |d| d(hb.ctx);
+            gpa.free(hb.name);
+            gpa.destroy(hb);
+        }
         gpa.destroy(self);
     }
 };
