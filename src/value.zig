@@ -64,6 +64,29 @@ pub const Value = extern struct {
     tag: Tag,
     payload: Payload,
 
+    // ---- whole-word memory access ----
+
+    /// Store `v` at `dst` as two whole 8-byte words: the tag zero-extended
+    /// into word 0 (which also defines the padding), the payload into word 1.
+    /// A plain struct store writes the tag as ONE byte; a later 8- or 16-byte
+    /// load of the slot then spans a smaller store, cannot store-forward, and
+    /// stalls until the store reaches the cache (~a dozen cycles each). Use
+    /// where a Value is written to memory that is read back whole — above all
+    /// the C ABI boundary, where C reads an `mh_value` as two 8-byte words.
+    pub inline fn storeWords(dst: *Value, v: Value) void {
+        const w: *[2]u64 = @ptrCast(dst);
+        w[0] = @intFromEnum(v.tag);
+        w[1] = v.payload.bits;
+    }
+
+    /// Load a Value as two 8-byte words — the read half of `storeWords`.
+    /// Each word load is contained in one earlier word store, so it forwards;
+    /// a 16-byte struct copy spanning the two stores would not.
+    pub inline fn loadWords(src: *const Value) Value {
+        const w: *const [2]u64 = @ptrCast(src);
+        return .{ .tag = @enumFromInt(@as(u8, @truncate(w[0]))), .payload = .{ .bits = w[1] } };
+    }
+
     // ---- constructors ----
 
     pub fn nil() Value {

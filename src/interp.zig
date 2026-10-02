@@ -335,7 +335,11 @@ pub const builtin_global_names = blk: {
 
 /// Result of running one frame: the `count` return values live at
 /// `regs[reg .. reg + count]` of that frame's window (i.e. `stack[base + reg]`).
-const FrameResult = struct { reg: u16, count: u16 };
+/// Packed into one word so `opRet` publishes it with a single 4-byte store:
+/// as two `u16` fields it was written half by half and then read back whole
+/// by the boundary (`callValue`'s `st.step` switch), a load that cannot be
+/// store-forwarded — the single biggest stall of an embedder call.
+const FrameResult = packed struct(u32) { reg: u16, count: u16 };
 
 /// Doc 21 Phase A: the top-level result span published at a genuine finish.
 /// `stack_top` is the (possibly B-6-raised) value the description is valid
@@ -2203,7 +2207,9 @@ pub const Vm = struct {
                 const src = callee_base + fr.reg;
                 const n = @min(@as(usize, fr.count), results_out.len);
                 var k: usize = 0;
-                while (k < n) : (k += 1) results_out[k] = self.regGet(src + k);
+                // Whole-word stores: `results_out` is often a host buffer the
+                // C side reads as 8-byte words (`Value.storeWords`).
+                while (k < n) : (k += 1) Value.storeWords(&results_out[k], self.regGet(src + k));
                 self.stack_top = saved_top;
                 return n;
             },

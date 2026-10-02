@@ -42,6 +42,7 @@
 //! Thread discipline: one VM, one thread at a time. Not thread-safe.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mahina = @import("mahina");
 
 const interp = mahina.interp;
@@ -64,6 +65,42 @@ const Proto = mahina.bytecode.Proto;
 /// choice for a C library (tests use `createVm` with `std.testing.allocator`
 /// instead, so leaks fail the suite).
 const c_gpa = std.heap.c_allocator;
+
+// The static library is linked by a foreign toolchain (cc, rustc), so it must
+// supply `__zig_probe_stack` — the x86 stack-probe routine LLVM calls for
+// frames larger than a page — itself. It must NOT bundle the rest of Zig's
+// compiler-rt: that brings its own memset/memcpy/memmove, which the host's
+// linker then resolves for the WHOLE host process instead of libc's (Zig's
+// memset is a byte loop — it made the Rust crate's call 47% memset). Weak, so
+// another Zig library carrying full compiler-rt in the same host still links.
+// Body: lib/compiler_rt/stack_probe.zig of the pinned toolchain.
+comptime {
+    if (builtin.output_mode == .Lib and builtin.cpu.arch == .x86_64)
+        @export(&zigProbeStack, .{ .name = "__zig_probe_stack", .linkage = .weak, .visibility = .hidden });
+}
+
+fn zigProbeStack() callconv(.naked) void {
+    // %rax = probe length, %rsp = stack pointer. Touch every page between the
+    // current and the new stack pointer so a guard page is never skipped.
+    asm volatile (
+        \\        push   %%rcx
+        \\        mov    %%rax, %%rcx
+        \\        cmp    $0x1000,%%rcx
+        \\        jb     2f
+        \\ 1:
+        \\        sub    $0x1000,%%rsp
+        \\        orl    $0,16(%%rsp)
+        \\        sub    $0x1000,%%rcx
+        \\        cmp    $0x1000,%%rcx
+        \\        ja     1b
+        \\ 2:
+        \\        sub    %%rcx, %%rsp
+        \\        orl    $0,16(%%rsp)
+        \\        add    %%rax,%%rsp
+        \\        pop    %%rcx
+        \\        ret
+    );
+}
 
 // ---------------------------------------------------------------------------
 // public C types (mirrored in include/mahina.h — keep in lockstep)
@@ -195,9 +232,21 @@ pub const IterBox = struct {
 // value conversion + validation
 // ---------------------------------------------------------------------------
 
+// Conversions are built field by field, never `@bitCast` between the two
+// 16-byte structs: a bitcast round-trips through memory as a tag-byte store
+// plus a 16-byte reload, which cannot store-forward (see `Value.storeWords`).
+// Field-wise, both halves stay in registers — an `mh_value` passed or
+// returned by value travels as two 8-byte words.
 inline fn toC(v: Value) mh_value {
     std.debug.assert(v.tag != .row_view); // never escapes (doc 59 §3.2)
-    return @bitCast(v);
+    return .{ .tag = @intFromEnum(v.tag), .payload = v.payload.bits };
+}
+
+/// Write `v` to a C out-pointer as two whole words (`Value.storeWords`), so
+/// the host's 8-byte reads of the result forward instead of stalling.
+inline fn putC(o: *mh_value, v: Value) void {
+    std.debug.assert(v.tag != .row_view); // never escapes (doc 59 §3.2)
+    Value.storeWords(@ptrCast(o), v);
 }
 
 /// Validate a value arriving from C. Rejects unknown tag bytes, `row_view`
@@ -207,9 +256,8 @@ inline fn toC(v: Value) mh_value {
 fn fromC(cv: mh_value) ?Value {
     const max_tag = @intFromEnum(value.Tag.row_view);
     if (cv.tag >= max_tag) return null; // unknown tags AND row_view
-    const v: Value = @bitCast(cv);
-    if (v.tag == .heap_ref and cv.payload == 0) return null;
-    return v;
+    if (cv.tag == @intFromEnum(value.Tag.heap_ref) and cv.payload == 0) return null;
+    return .{ .tag = @enumFromInt(cv.tag), .payload = .{ .bits = cv.payload } };
 }
 
 fn typeOf(v: Value) mh_type {
@@ -278,7 +326,7 @@ fn park(box: *VmBox, v: Value) mh_status {
     if (!v.isHeap()) return .ok;
     const vm = &box.vm;
     if (vm.parked_inline_len < vm.parked_inline.len) {
-        vm.parked_inline[vm.parked_inline_len] = v;
+        Value.storeWords(&vm.parked_inline[vm.parked_inline_len], v);
         vm.parked_inline_len += 1;
         return .ok;
     }
@@ -339,8 +387,9 @@ fn checkFatal(box: *VmBox) ?mh_status {
 
 /// Run `callee(args...)` protected, writing into `results` (pre-nil-filled
 /// here). On success parks every heap result and returns the produced count
-/// via `nresults`.
-fn runProtected(box: *VmBox, callee: Value, args: []const Value, results: []Value, nresults: *usize) mh_status {
+/// via `nresults`. `inline`: two callers, and as a separate function it was
+/// a second prologue/epilogue plus argument shuffle on every embedder call.
+inline fn runProtected(box: *VmBox, callee: Value, args: []const Value, results: []Value, nresults: *usize) mh_status {
     const vm = &box.vm;
     nresults.* = 0;
     // No defensive nil-fill of `results`: the contract (mahina.h) is that only
@@ -351,8 +400,8 @@ fn runProtected(box: *VmBox, callee: Value, args: []const Value, results: []Valu
     const entry_top = vm.stack_top;
     const produced = vm.callValue(callee, args, results) catch |e| return guestFault(box, entry_depth, entry_top, e);
     std.debug.assert(vm.pending_error == null);
-    for (results[0..produced]) |v| {
-        if (park(box, v) != .ok) return .err_oom;
+    for (results[0..produced]) |*r| {
+        if (park(box, Value.loadWords(r)) != .ok) return .err_oom;
     }
     nresults.* = produced;
     return .ok;
@@ -651,7 +700,7 @@ pub export fn mh_call(vm: ?*VmBox, callee: mh_value, args: ?[*]const mh_value, n
     // the (just-cleared) park, so root them again before anything collects.
     parkClearIfIdle(box);
     if (park(box, cv) != .ok) return .err_oom;
-    for (cargs) |a| if (park(box, a) != .ok) return .err_oom;
+    for (cargs) |*a| if (park(box, Value.loadWords(a)) != .ok) return .err_oom;
     return runProtected(box, cv, cargs, resultsSlice(results, max_results), nres);
 }
 
@@ -660,8 +709,10 @@ fn argsSlice(box: *VmBox, args: ?[*]const mh_value, nargs: usize) ?[]const Value
     _ = box;
     if (nargs == 0) return &.{};
     const p = args orelse return null;
-    for (p[0..nargs]) |cv| {
-        if (fromC(cv) == null) return null;
+    // Validate through the two words only — copying each `mh_value` whole
+    // drags its padding through odd-sized stack moves that stall the reload.
+    for (p[0..nargs]) |*cv| {
+        if (fromC(.{ .tag = cv.tag, .payload = cv.payload }) == null) return null;
     }
     const vp: [*]const Value = @ptrCast(p);
     return vp[0..nargs];
@@ -754,7 +805,7 @@ pub export fn mh_string_new(vm: ?*VmBox, bytes: mh_str, out: ?*mh_value) mh_stat
     parkClearIfIdle(box);
     const v = box.vm.heap.internValue(b) catch return oom(box);
     if (park(box, v) != .ok) return .err_oom;
-    o.* = toC(v);
+    putC(o, v);
     return .ok;
 }
 
@@ -771,7 +822,7 @@ pub export fn mh_global_get(vm: ?*VmBox, name: mh_str, out: ?*mh_value) mh_statu
     const key = box.vm.heap.internValue(n) catch return oom(box);
     const v = box.vm.globals.get(key);
     if (park(box, v) != .ok) return .err_oom;
-    o.* = toC(v);
+    putC(o, v);
     return .ok;
 }
 
@@ -825,7 +876,7 @@ pub export fn mh_ref_get(vm: ?*VmBox, ref: u64, out: ?*mh_value) mh_status {
     const box = vm orelse return .err_api;
     const o = out orelse return .err_api;
     const slot = refSlot(box, ref) orelse return staleRef(box);
-    o.* = toC(slot.value);
+    putC(o, slot.value);
     return .ok;
 }
 
@@ -1011,7 +1062,7 @@ pub export fn mh_table_new(vm: ?*VmBox, out: ?*mh_value) mh_status {
     const t = box.vm.heap.newTable() catch return oom(box);
     const v = Value.heap(&t.header);
     if (park(box, v) != .ok) return .err_oom;
-    o.* = toC(v);
+    putC(o, v);
     return .ok;
 }
 
@@ -1030,7 +1081,7 @@ pub export fn mh_table_get(vm: ?*VmBox, tbl: mh_value, key: mh_value, out: ?*mh_
     const et = box.vm.stack_top;
     const v = box.vm.indexGet(tv, kv) catch |e| return guestFault(box, ed, et, e);
     if (park(box, v) != .ok) return .err_oom;
-    o.* = toC(v);
+    putC(o, v);
     return .ok;
 }
 
@@ -1073,7 +1124,7 @@ pub export fn mh_table_metatable_get(vm: ?*VmBox, tbl: mh_value, out: ?*mh_value
     };
     const v = if (t.metatable) |mt| Value.heap(&mt.header) else Value.nil();
     if (park(box, v) != .ok) return .err_oom;
-    o.* = toC(v);
+    putC(o, v);
     return .ok;
 }
 
@@ -1191,13 +1242,13 @@ pub export fn mh_table_iter_next(vm: ?*VmBox, iter: ?*IterBox, key: ?*mh_value, 
         if (v.isNil()) continue; // deleted since iter_new
         if (park(box, k) != .ok) return .err_oom;
         if (park(box, v) != .ok) return .err_oom;
-        ko.* = toC(k);
-        vo.* = toC(v);
+        putC(ko, k);
+        putC(vo, v);
         do.* = 0;
         return .ok;
     }
-    ko.* = toC(Value.nil());
-    vo.* = toC(Value.nil());
+    putC(ko, Value.nil());
+    putC(vo, Value.nil());
     do.* = 1;
     return .ok;
 }

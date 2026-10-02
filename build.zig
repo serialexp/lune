@@ -118,9 +118,12 @@ pub fn build(b: *std.Build) void {
         .linkage = .static,
     });
     capi_lib.use_llvm = true; // tail-call dispatch needs LLVM (see above)
-    // A static lib handed to a foreign linker (rustc/cc) must carry Zig's
-    // compiler-rt itself (__zig_probe_stack etc.) — nothing else provides it.
-    capi_lib.bundle_compiler_rt = true;
+    // NOT bundled: Zig's compiler-rt carries memset/memcpy/memmove, which a
+    // foreign linker (rustc/cc) would resolve for the whole host process in
+    // place of libc's. capi.zig exports the one routine the host can't supply
+    // (__zig_probe_stack); the rest (__divti3, …) come from libgcc / Rust's
+    // compiler_builtins.
+    capi_lib.bundle_compiler_rt = false;
     capi_lib.installHeader(b.path("include/mahina.h"), "mahina.h");
     const install_capi_lib = b.addInstallArtifact(capi_lib, .{});
     const lib_step = b.step("lib", "Build the embedding static library (libmahina.a + mahina.h)");
