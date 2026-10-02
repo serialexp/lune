@@ -2,6 +2,22 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## libmahina.a replaces the host's memset/memcpy with byte loops (noted 2026-10-02)
+
+- [ ] **`capi_lib.bundle_compiler_rt = true` (build.zig, doc 59 E3) exports
+      Zig compiler-rt's `memset`/`memcpy`/`memmove` from the static lib, and
+      the host linker prefers them to glibc's.** Every mem* call in the whole
+      host process (a Rust game engine, say) becomes Zig's generic loop:
+      `memset` is 8 single-byte stores per iteration. Measured: the Rust
+      crate's call cost was 47% `compiler_rt.memset`. A shadow build with
+      `stack_check = false` on the lib modules and no compiler-rt bundle (so
+      `__zig_probe_stack`, the reason for bundling, is never referenced)
+      links clean under cargo and takes a Rust call from 172 to 76 ns.
+      Options to choose between: (1) `stack_check = false` with no bundle
+      (big frames lose their probes); (2) keep the bundle and
+      strip or weaken the mem* symbols from the archive; (3) ship only the
+      stack-probe routine. Also check `tests/capi_smoke.c` still links.
+
 ## `hashgate.py --generate --filter X` wipes every other program's refs (noted 2026-10-01)
 
 - [ ] `write_refs` writes only the observed (filtered) rows, so a filtered
