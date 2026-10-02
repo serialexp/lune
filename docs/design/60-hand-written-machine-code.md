@@ -24,7 +24,8 @@ land; move whole phases to Done once everything inside them is checked.
 - [ ] **H1 — the minimal-work host call, in Zig.** Settle §5.1, the work
   a host call must do, and build a dedicated entry path that does only
   that, bypassing `callValue`'s generic dispatch. It stays forever as the
-  reference and the non-x86-64 path. Measure it against §5.2's budget.
+  reference and the non-x86-64 path. Includes the packed fast-path word
+  (§8 Q4). Measure it against §5.2's budget.
 - [ ] **H2 — the hand-written-code layer.** Pick the mechanism (§3),
   wire field offsets from `@offsetOf` (§4.1), and build the differential
   test harness (§6).
@@ -119,9 +120,14 @@ for any of them.
   test checks against the structs.
 - The build-system call for assembly files is churny build API (Z-1).
 
-**M3 — emitted at VM init with our own encoder** (`x64.zig`, golden-byte
-tested, already used for the trace trampoline). This is LuaJIT's model:
-DynASM generates its VM.
+**M3 — emitted at VM init with our own encoder.** In effect a small
+runtime assembler: the entry is written as a sequence of Zig calls into
+the encoder (one per instruction), which run once at VM creation and
+write machine code into executable memory. Unlike DynASM there is no
+asm-syntax preprocessing step; the source *is* the encoder calls. The
+encoder is `x64.zig` (golden-byte tested, already used for the trace
+trampoline). Generating the VM's hand-written parts at start-up is
+LuaJIT's model too: DynASM generates its VM.
 - One encoder serves both the JIT and the hand-written runtime.
 - Per-VM constants (the `Vm` address, offsets) can be baked in as
   immediates.
@@ -195,7 +201,7 @@ LuaJIT's C-frame chain.
 | bind args + nil-fill | loops | straight-line for small counts, loop beyond | |
 | `CallFrame` write | 8 fields | 8 fields | unavoidable; stored, not vector-copied |
 | `call_seq`, region context | yes | yes | determinism |
-| `runFastPath` (9 loads) | yes | 1 load | needs a packed flag word (TODO item f); until then 9 loads |
+| `runFastPath` (9 loads) | yes | 1 load | the packed `u16` flag word (§8 Q4, in H1) |
 | enter chain / return | via `execWithEntry` | §4.2 seam | |
 | copy results out, word-wise | yes | yes | |
 | park results | yes | yes | §3.3 contract |
@@ -271,13 +277,28 @@ LuaJIT's DynASM shape.
   every allocation point on that path. If there are none, rooting comes
   from the window and the frame, and the park only does its borrow-window
   job for results.
-- [ ] **Q2 — the seam (§4.2).** Option (a), a C-ABI shim, or option (b),
-  handlers made `callconv(.c)`. Measure (b) on the language suite first,
-  because it touches every handler.
+- [x] **Q2 — the seam (§4.2): (a), a C-ABI shim** (Bart, 2026-10-02).
+  Handlers keep Zig's default convention. The hand-written entry calls one
+  `callconv(.c)` Zig function that starts the chain, at ~5–10 instructions
+  per call (counted in §5.2's "chain entry" row). Switching to (b) later
+  stays local: the `HandlerFn` declaration plus this one seam.
 - [ ] **Q3 — mechanism (§3): M1, M2 or M3.** Bart's call.
-- [ ] **Q4 — the packed fast-path word** (TODO item f). The entry's
-  fast-path check drops from 9 loads to 1 only with it; Bart's call
-  whether that's in scope here.
+- [x] **Q4 — the packed fast-path word is in scope** (Bart, 2026-10-02;
+  TODO item f), as part of H1. The nine conditions `runFastPath` checks
+  become bits of one `u16` on the `Vm`, and the check becomes one load
+  plus a test, the same in Zig and in the hand-written entry. Only one is
+  a boolean (`record_safepoint_lines`). One is the recorder's state
+  (`trace.isRecording()`). Seven are optionals whose non-null-ness the
+  word mirrors: `suspend_ctl` and the six `trace.pending_*` anchors and
+  arms. Every
+  site that sets or clears one of them (~31, in `trace.zig`,
+  `trace_link.zig`, `interp.zig` and the recorder) updates the bit through
+  one helper. **That helper writes the whole `u16`** (read, modify, store
+  the word): a byte-wide bit store read back by a 16-bit load would not
+  store-forward, today's `FrameResult` lesson. A debug-build assertion in
+  `runFastPath` checks the word against the nine underlying conditions, so
+  a missed sync site fails loudly in tests instead of silently taking the
+  wrong path.
 - [ ] **Q5 — prepared calls (H4).** Is a new API worth it once the entry
   itself is ~50 instructions? Decide after H3.
 
