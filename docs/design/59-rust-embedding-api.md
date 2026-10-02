@@ -141,6 +141,31 @@ land; move whole phases to Done once everything inside them is checked.
   copy-in/copy-out loops — candidates: a packed fast-path flag, a
   prepared-call handle (API addition, caches the closure/proto derivation
   for repeated same-callee calls — the game-engine `update()` shape).
+- [x] **Boundary pass vs LuaJIT/mlua (2026-10-02),** driven by a call-only
+  comparison (TODO.md "Embedding call boundary"): LuaJIT 304 instructions /
+  54 cycles per `lua_pcall`, mahina 567 / 119 per `mh_call`, and 0 vs 7.3
+  store→load forwarding stalls per call (AMD `ls_bad_status2.stli_other`).
+  (1) **No compiler-rt bundle** — reverses E3's `bundle_compiler_rt = true`,
+  whose `memset`/`memcpy`/`memmove` replaced the *host process's* libc
+  copies with Zig's byte loops (47% of a Rust call). `capi.zig` now exports
+  a weak `__zig_probe_stack` for library builds on x86_64; the archive
+  imports `mem*`. (2) **Whole-word value writes** — `Value.storeWords`/
+  `loadWords` at every capi out-pointer, the park, and `callValue`'s
+  copy-out, so a host's 8-byte reads forward. (3) **`FrameResult` packed
+  into one `u32`** — `opRet` wrote it as two `u16` halves that `callValue`
+  read back whole; the biggest single stall per call. (4) **`runProtected`
+  inline.** (5) **The Rust crate on mlua's model** — E9's typed conversion
+  traits for calls (`IntoArgs`/`FromResults` over `IntoValue`/`FromValue`:
+  scalars, strings, `Option`, handles, tuples to 8, `&[Value]`/`Vec`), no
+  callee clone, inline arg slots, uninit result buffer, handles cache their
+  raw value (non-moving GC), conversions `#[inline]` and results read as two
+  words (an out-of-line conversion or a whole-struct copy each put one more
+  stall on the path). Now: C `mh_call` 518 instructions / ~82 cycles; Rust
+  typed `i64 -> i64` call 547 / ~94 cycles, **~20 ns** (was 172 ns at the
+  start of the day; mlua+LuaJIT 24–26 ns). Measured and left open (TODO.md,
+  awaiting Bart): GC-time dead-stack clearing (3 instructions; keyframes
+  serialize every register below `stack_top`) and a packed fast-path word
+  (≤15 instructions, ~31 write sites to keep in sync).
 ### Outstanding
 
 - [ ] **E6 — host-call record/replay.** Defer. v1 refuses `.record` AND
@@ -158,7 +183,9 @@ land; move whole phases to Done once everything inside them is checked.
   Defer with intent: host userdata with metatables (the "app data lives in
   Rust" story), an instruction-budget interrupt wired to
   `suspend_ctl.after_safepoints`, `IntoValue`/`FromValue` traits, scoped
-  (non-`'static`) callbacks. Each is additive on this ABI.
+  (non-`'static`) callbacks. Each is additive on this ABI. (2026-10-02: the
+  traits landed for call arguments/results — see the boundary pass above;
+  typed *host-function* signatures, still `&[Value] -> Vec<Value>`, remain.)
 
 ## 1. Why this exists
 

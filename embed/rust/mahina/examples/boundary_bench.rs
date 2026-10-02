@@ -36,8 +36,12 @@ fn main() {
     vm.eval("function id(x) return x end", "bench").unwrap();
     let id = vm.global("id").unwrap();
     let id = id.as_function().unwrap().clone();
-    bench("host->guest call (scalar arg + result)", 100_000, || {
-        let out = id.call(&[Value::Int(7)]).unwrap();
+    bench("host->guest call (typed i64 -> i64)", 100_000, || {
+        let out: i64 = id.call(7).unwrap();
+        assert_eq!(out, 7);
+    });
+    bench("host->guest call (&[Value] -> Vec<Value>)", 100_000, || {
+        let out: Vec<Value> = id.call(&[Value::Int(7)]).unwrap();
         assert_eq!(out[0], Value::Int(7));
     });
 

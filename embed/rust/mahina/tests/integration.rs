@@ -77,8 +77,81 @@ fn call_guest_function() {
     vm.eval("function double(x) return x * 2 end", "t").unwrap();
     let f = vm.global("double").unwrap();
     let f = f.as_function().unwrap();
-    let out = f.call(&[Value::Int(21)]).unwrap();
-    assert_eq!(out[0], Value::Int(42));
+    let out: i64 = f.call(21).unwrap();
+    assert_eq!(out, 42);
+    // The untyped form still works: a slice of Values in, every result out.
+    let out: Vec<Value> = f.call(&[Value::Int(21)]).unwrap();
+    assert_eq!(out, vec![Value::Int(42)]);
+}
+
+#[test]
+fn typed_call_conversions() {
+    let vm = Vm::new().unwrap();
+    vm.eval(
+        "function swap(a, b) return b, a end
+         function none() end
+         function greet(s) return 'hi ' .. s end
+         function count(...) return select('#', ...) end",
+        "t",
+    )
+    .unwrap();
+    let f = |name: &str| vm.global(name).unwrap().as_function().unwrap().clone();
+
+    // Tuples in and out; a missing result reads as nil.
+    let (a, b): (i64, f64) = f("swap").call((1.5, 7)).unwrap();
+    assert_eq!((a, b), (7, 1.5));
+    let (x, missing): (i64, Option<i64>) = f("swap").call((Option::<i64>::None, 3)).unwrap();
+    assert_eq!((x, missing), (3, None));
+    let nothing: Option<i64> = f("none").call(()).unwrap();
+    assert_eq!(nothing, None);
+    f("none").call::<_, ()>(()).unwrap();
+
+    // Strings are interned on the way in and copied out.
+    let s: String = f("greet").call("there").unwrap();
+    assert_eq!(s, "hi there");
+    let owned = String::from("you");
+    let s: mahina::Str = f("greet").call(&owned).unwrap();
+    assert_eq!(s.to_string_lossy(), "hi you");
+
+    // Argument lists longer than the inline buffer spill correctly.
+    let n: i64 = f("count").call((1, 2, 3, 4, 5, 6, 7, 8)).unwrap();
+    assert_eq!(n, 8);
+    let many: Vec<Value> = (0..20).map(Value::Int).collect();
+    let n: i64 = f("count").call(&many).unwrap();
+    assert_eq!(n, 20);
+    let n: i64 = f("count").call(many).unwrap();
+    assert_eq!(n, 20);
+
+    // Handles pass by reference without a new root, and by value.
+    let t = vm.create_table().unwrap();
+    let (zero, back): (i64, mahina::Table) = f("swap").call((&t, 0)).unwrap();
+    assert_eq!(zero, 0);
+    assert_eq!(Value::Table(back), Value::Table(t.clone()));
+    let (_, back): (Value, mahina::Table) = f("swap").call((t.clone(), 0)).unwrap();
+    assert_eq!(Value::Table(back), Value::Table(t));
+
+    // A conversion mismatch is a typed error, not a panic.
+    match f("greet").call::<_, i64>("x") {
+        Err(Error::Type { expected: "int", got: "string" }) => {}
+        other => panic!("expected a type error, got {other:?}"),
+    }
+}
+
+#[test]
+fn typed_call_rejects_foreign_vm_values() {
+    let a = Vm::new().unwrap();
+    let b = Vm::new().unwrap();
+    a.eval("function id(x) return x end", "t").unwrap();
+    let id = a.global("id").unwrap().as_function().unwrap().clone();
+    let foreign = b.create_table().unwrap();
+    match id.call::<_, Value>(&foreign) {
+        Err(Error::ForeignVm) => {}
+        other => panic!("expected ForeignVm, got {other:?}"),
+    }
+    match b.call::<_, Value>(&id, 1) {
+        Err(Error::ForeignVm) => {}
+        other => panic!("expected ForeignVm, got {other:?}"),
+    }
 }
 
 #[test]
@@ -221,7 +294,7 @@ fn callback_can_reenter_the_vm() {
     vm.register_fn("via_host", |vm, args| {
         let f = vm.global("guest_square").map_err(|e| e.to_string())?;
         let f = f.as_function().map_err(|e| e.to_string())?;
-        let out = f.call(&[args[0].clone()]).map_err(|e| e.to_string())?;
+        let out: Vec<Value> = f.call(&args[0]).map_err(|e| e.to_string())?;
         Ok(out)
     })
     .unwrap();

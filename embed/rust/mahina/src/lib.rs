@@ -2,19 +2,26 @@
 //! layer over `mahina-sys`/`libmahina`.
 //!
 //! ```no_run
-//! use mahina::{Vm, Value};
+//! use mahina::{Vm, Value, Function};
 //!
 //! let vm = Vm::new().unwrap();
 //! let out = vm.eval("return 1 + 2", "demo").unwrap();
 //! assert_eq!(out[0], Value::Int(3));
 //!
-//! vm.register_fn("add", |_vm, args| {
+//! // Typed calls: arguments and results convert through `IntoArgs` /
+//! // `FromResults`, so a scalar call touches no heap on the Rust side.
+//! vm.eval("function add(a, b) return a + b end", "demo").unwrap();
+//! let add: Function = vm.global("add").unwrap().as_function().unwrap().clone();
+//! let sum: i64 = add.call((40, 2)).unwrap();
+//! assert_eq!(sum, 42);
+//!
+//! vm.register_fn("hadd", |_vm, args| {
 //!     let (Some(Value::Int(a)), Some(Value::Int(b))) = (args.get(0), args.get(1)) else {
-//!         return Err("add wants two ints".into());
+//!         return Err("hadd wants two ints".into());
 //!     };
 //!     Ok(vec![Value::Int(a + b)])
 //! }).unwrap();
-//! assert_eq!(vm.eval("return add(40, 2)", "demo").unwrap()[0], Value::Int(42));
+//! assert_eq!(vm.eval("return hadd(40, 2)", "demo").unwrap()[0], Value::Int(42));
 //! ```
 //!
 //! Design (doc 59, reviewed):
@@ -34,9 +41,15 @@
 //!   `&Vm` on every call; capturing an owned clone creates an Rc cycle
 //!   (VM → binding → closure → VM) that leaks the VM. (mlua has the same
 //!   rule for similar reasons.)
+//! - **Calls are allocation-free for scalars** (doc 59 tier-0 boundary
+//!   work): arguments are converted into a stack buffer, the callee is
+//!   borrowed (never cloned — a clone is a ref create + free), and results
+//!   land in an uninitialized stack buffer (the C contract defines only the
+//!   reported prefix).
 
 use std::cell::RefCell;
 use std::fmt;
+use std::mem::MaybeUninit;
 use std::os::raw::{c_int, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
@@ -89,7 +102,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 // VM internals
 // ---------------------------------------------------------------------------
 
-struct VmInner {
+/// The shared VM handle every value holds. Public only so the conversion
+/// traits can name it in their (hidden) methods; it has no public surface.
+#[doc(hidden)]
+pub struct VmInner {
     raw: *mut sys::mh_vm,
 }
 
@@ -101,13 +117,22 @@ impl VmInner {
         }
     }
 
+    #[inline]
     fn status(&self, st: sys::mh_status) -> Result<()> {
+        if st == sys::MH_OK {
+            return Ok(());
+        }
+        Err(self.error_for(st))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn error_for(&self, st: sys::mh_status) -> Error {
         match st {
-            sys::MH_OK => Ok(()),
-            sys::MH_ERR_COMPILE => Err(Error::Compile(self.last_error())),
-            sys::MH_ERR_RUNTIME => Err(Error::Runtime(self.last_error())),
-            sys::MH_ERR_OOM => Err(Error::Oom),
-            _ => Err(Error::Api(self.last_error())),
+            sys::MH_ERR_COMPILE => Error::Compile(self.last_error()),
+            sys::MH_ERR_RUNTIME => Error::Runtime(self.last_error()),
+            sys::MH_ERR_OOM => Error::Oom,
+            _ => Error::Api(self.last_error()),
         }
     }
 }
@@ -134,10 +159,15 @@ pub struct Config {
 // ---------------------------------------------------------------------------
 
 /// An owned GC root for one heap value (string/table/function). Cloning
-/// clones the root (cheap); dropping releases it.
+/// creates a second root; dropping releases it.
+///
+/// The raw value is cached at creation instead of being re-read through
+/// `mh_ref_get` on every use: the GC never moves objects and the root keeps
+/// this one alive, so the cached value stays valid for the handle's life.
 pub struct Handle {
     inner: Rc<VmInner>,
     r: sys::mh_ref,
+    raw: sys::mh_value,
 }
 
 impl Handle {
@@ -145,21 +175,27 @@ impl Handle {
         let mut r: sys::mh_ref = 0;
         let st = unsafe { sys::mh_ref_create(inner.raw, raw, &mut r) };
         inner.status(st)?;
-        Ok(Handle { inner: inner.clone(), r })
+        Ok(Handle { inner: inner.clone(), r, raw })
     }
 
+    #[inline]
     fn raw(&self) -> sys::mh_value {
-        let mut v = sys::mh_value::zeroed();
-        // Can only fail for a stale ref; ours is alive by construction.
-        let st = unsafe { sys::mh_ref_get(self.inner.raw, self.r, &mut v) };
-        debug_assert_eq!(st, sys::MH_OK);
-        v
+        self.raw
+    }
+
+    /// The raw value, after checking it belongs to `inner`'s VM.
+    #[inline]
+    fn raw_in(&self, inner: &Rc<VmInner>) -> Result<sys::mh_value> {
+        if !Rc::ptr_eq(&self.inner, inner) {
+            return Err(Error::ForeignVm);
+        }
+        Ok(self.raw)
     }
 }
 
 impl Clone for Handle {
     fn clone(&self) -> Handle {
-        Handle::new(&self.inner, self.raw()).expect("cloning a live ref cannot fail")
+        Handle::new(&self.inner, self.raw).expect("cloning a live ref cannot fail")
     }
 }
 
@@ -283,6 +319,7 @@ impl Value {
         !matches!(self, Value::Nil | Value::Bool(false))
     }
 
+    #[inline]
     fn handle(&self) -> Option<&Handle> {
         match self {
             Value::Str(Str(h)) | Value::Table(Table(h)) | Value::Function(Function(h)) | Value::Other(Opaque(h)) => Some(h),
@@ -291,12 +328,10 @@ impl Value {
     }
 
     /// Raw form + foreign-VM check against `inner`.
+    #[inline]
     fn to_raw(&self, inner: &Rc<VmInner>) -> Result<sys::mh_value> {
         if let Some(h) = self.handle() {
-            if !Rc::ptr_eq(&h.inner, inner) {
-                return Err(Error::ForeignVm);
-            }
-            return Ok(h.raw());
+            return h.raw_in(inner);
         }
         Ok(match self {
             Value::Nil => unsafe { sys::mh_nil() },
@@ -308,6 +343,7 @@ impl Value {
     }
 
     /// Wrap a raw value coming out of the VM, auto-reffing heap types.
+    #[inline]
     fn from_raw(inner: &Rc<VmInner>, raw: sys::mh_value) -> Result<Value> {
         unsafe {
             Ok(match sys::mh_value_type(raw) {
@@ -388,6 +424,454 @@ impl From<()> for Value {
     }
 }
 
+/// The type name of a raw value, for conversion errors.
+fn raw_type_name(raw: sys::mh_value) -> &'static str {
+    match unsafe { sys::mh_value_type(raw) } {
+        sys::MH_NIL => "nil",
+        sys::MH_BOOL => "boolean",
+        sys::MH_INT | sys::MH_FLOAT => "number",
+        sys::MH_STRING => "string",
+        sys::MH_TABLE => "table",
+        sys::MH_FUNCTION => "function",
+        _ => "value",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// typed conversion (the mlua-shaped call surface)
+// ---------------------------------------------------------------------------
+
+/// Temporaries an argument conversion created (a guest string interned from
+/// a `&str`, an owned `Value` moved in) — rooted here until the call returns.
+/// Scalars and borrowed handles never touch it, so on the common path it is
+/// an empty, never-allocated `Vec`.
+#[doc(hidden)]
+pub struct Keep(Vec<Value>);
+
+const INLINE_ARGS: usize = 8;
+
+/// Raw argument scratch: up to `INLINE_ARGS` values on the stack, spilling
+/// to a `Vec` only for longer argument lists.
+#[doc(hidden)]
+pub struct ArgBuf {
+    inline: [MaybeUninit<sys::mh_value>; INLINE_ARGS],
+    len: usize,
+    spill: Vec<sys::mh_value>,
+}
+
+impl ArgBuf {
+    #[inline]
+    fn new() -> ArgBuf {
+        ArgBuf { inline: [const { MaybeUninit::uninit() }; INLINE_ARGS], len: 0, spill: Vec::new() }
+    }
+
+    #[inline]
+    fn push(&mut self, v: sys::mh_value) {
+        if self.spill.is_empty() && self.len < INLINE_ARGS {
+            self.inline[self.len] = MaybeUninit::new(v);
+            self.len += 1;
+            return;
+        }
+        self.push_spill(v);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn push_spill(&mut self, v: sys::mh_value) {
+        if self.spill.is_empty() {
+            self.spill.reserve(INLINE_ARGS * 2);
+            // SAFETY: `inline[..len]` was written by the branch above.
+            self.spill.extend(self.inline[..self.len].iter().map(|s| unsafe { s.assume_init() }));
+        }
+        self.spill.push(v);
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[sys::mh_value] {
+        if self.spill.is_empty() {
+            // SAFETY: `inline[..len]` is initialized (see `push`).
+            unsafe { std::slice::from_raw_parts(self.inline.as_ptr().cast(), self.len) }
+        } else {
+            &self.spill
+        }
+    }
+}
+
+/// Converts a Rust value into a guest value — a call argument, typically.
+/// Implemented for the integer/float/bool scalars, strings (interned on the
+/// way in), `Option` (`None` is nil), and the safe layer's own value types,
+/// owned or borrowed. Borrowing a handle never creates a new GC ref.
+pub trait IntoValue {
+    #[doc(hidden)]
+    fn into_raw(self, inner: &Rc<VmInner>, keep: &mut Keep) -> Result<sys::mh_value>;
+}
+
+macro_rules! scalar_into_value {
+    ($($t:ty => |$v:ident| $e:expr;)*) => {$(
+        impl IntoValue for $t {
+            #[inline]
+            fn into_raw(self, _: &Rc<VmInner>, _: &mut Keep) -> Result<sys::mh_value> {
+                let $v = self;
+                Ok(unsafe { $e })
+            }
+        }
+    )*};
+}
+
+scalar_into_value! {
+    i64 => |v| sys::mh_int(v);
+    i32 => |v| sys::mh_int(v as i64);
+    u32 => |v| sys::mh_int(v as i64);
+    f64 => |v| sys::mh_float(v);
+    f32 => |v| sys::mh_float(v as f64);
+    bool => |v| sys::mh_bool(v as c_int);
+}
+
+impl IntoValue for &Value {
+    #[inline]
+    fn into_raw(self, inner: &Rc<VmInner>, _: &mut Keep) -> Result<sys::mh_value> {
+        self.to_raw(inner)
+    }
+}
+
+impl IntoValue for Value {
+    #[inline]
+    fn into_raw(self, inner: &Rc<VmInner>, keep: &mut Keep) -> Result<sys::mh_value> {
+        let raw = self.to_raw(inner)?;
+        if self.handle().is_some() {
+            keep.0.push(self);
+        }
+        Ok(raw)
+    }
+}
+
+impl IntoValue for &str {
+    fn into_raw(self, inner: &Rc<VmInner>, keep: &mut Keep) -> Result<sys::mh_value> {
+        let mut out = sys::mh_value::zeroed();
+        let st = unsafe { sys::mh_string_new(inner.raw, sys::mh_str::from_slice(self.as_bytes()), &mut out) };
+        inner.status(st)?;
+        // Root it now: the next argument's conversion may be another idle
+        // entry that clears the park this string sits in.
+        keep.0.push(Value::from_raw(inner, out)?);
+        Ok(out)
+    }
+}
+
+impl IntoValue for &String {
+    fn into_raw(self, inner: &Rc<VmInner>, keep: &mut Keep) -> Result<sys::mh_value> {
+        self.as_str().into_raw(inner, keep)
+    }
+}
+
+impl IntoValue for String {
+    fn into_raw(self, inner: &Rc<VmInner>, keep: &mut Keep) -> Result<sys::mh_value> {
+        self.as_str().into_raw(inner, keep)
+    }
+}
+
+macro_rules! handle_into_value {
+    ($($t:ident => $variant:ident),*) => {$(
+        impl IntoValue for &$t {
+            #[inline]
+            fn into_raw(self, inner: &Rc<VmInner>, _: &mut Keep) -> Result<sys::mh_value> {
+                self.0.raw_in(inner)
+            }
+        }
+        impl IntoValue for $t {
+            fn into_raw(self, inner: &Rc<VmInner>, keep: &mut Keep) -> Result<sys::mh_value> {
+                let raw = self.0.raw_in(inner)?;
+                keep.0.push(Value::$variant(self));
+                Ok(raw)
+            }
+        }
+    )*};
+}
+
+handle_into_value!(Str => Str, Table => Table, Function => Function);
+
+impl<T: IntoValue> IntoValue for Option<T> {
+    #[inline]
+    fn into_raw(self, inner: &Rc<VmInner>, keep: &mut Keep) -> Result<sys::mh_value> {
+        match self {
+            Some(v) => v.into_raw(inner, keep),
+            None => Ok(unsafe { sys::mh_nil() }),
+        }
+    }
+}
+
+/// The argument list of a guest call: `()`, any single [`IntoValue`], a tuple
+/// of them (up to 8), or a slice / array / `Vec` of [`Value`]s.
+pub trait IntoArgs {
+    #[doc(hidden)]
+    fn push_args(self, inner: &Rc<VmInner>, keep: &mut Keep, buf: &mut ArgBuf) -> Result<()>;
+}
+
+impl<T: IntoValue> IntoArgs for T {
+    fn push_args(self, inner: &Rc<VmInner>, keep: &mut Keep, buf: &mut ArgBuf) -> Result<()> {
+        buf.push(self.into_raw(inner, keep)?);
+        Ok(())
+    }
+}
+
+impl IntoArgs for () {
+    fn push_args(self, _: &Rc<VmInner>, _: &mut Keep, _: &mut ArgBuf) -> Result<()> {
+        Ok(())
+    }
+}
+
+macro_rules! tuple_into_args {
+    ($($name:ident)+) => {
+        impl<$($name: IntoValue),+> IntoArgs for ($($name,)+) {
+            #[allow(non_snake_case)]
+            fn push_args(self, inner: &Rc<VmInner>, keep: &mut Keep, buf: &mut ArgBuf) -> Result<()> {
+                let ($($name,)+) = self;
+                $( buf.push($name.into_raw(inner, keep)?); )+
+                Ok(())
+            }
+        }
+    };
+}
+
+tuple_into_args!(A);
+tuple_into_args!(A B);
+tuple_into_args!(A B C);
+tuple_into_args!(A B C D);
+tuple_into_args!(A B C D E);
+tuple_into_args!(A B C D E F);
+tuple_into_args!(A B C D E F G);
+tuple_into_args!(A B C D E F G H);
+
+impl IntoArgs for &[Value] {
+    #[inline]
+    fn push_args(self, inner: &Rc<VmInner>, _: &mut Keep, buf: &mut ArgBuf) -> Result<()> {
+        for v in self {
+            buf.push(v.to_raw(inner)?);
+        }
+        Ok(())
+    }
+}
+
+impl<const N: usize> IntoArgs for &[Value; N] {
+    fn push_args(self, inner: &Rc<VmInner>, keep: &mut Keep, buf: &mut ArgBuf) -> Result<()> {
+        self.as_slice().push_args(inner, keep, buf)
+    }
+}
+
+impl IntoArgs for &Vec<Value> {
+    #[inline]
+    fn push_args(self, inner: &Rc<VmInner>, keep: &mut Keep, buf: &mut ArgBuf) -> Result<()> {
+        self.as_slice().push_args(inner, keep, buf)
+    }
+}
+
+impl IntoArgs for Vec<Value> {
+    #[inline]
+    fn push_args(self, inner: &Rc<VmInner>, keep: &mut Keep, buf: &mut ArgBuf) -> Result<()> {
+        self.as_slice().push_args(inner, keep, buf)?;
+        keep.0.extend(self);
+        Ok(())
+    }
+}
+
+/// Converts a guest value into a Rust value — a call result, typically.
+/// Scalars are checked (`i64` wants an integer; `f64` accepts any number);
+/// `Option<T>` maps nil to `None`; [`Value`] takes anything.
+pub trait FromValue: Sized {
+    #[doc(hidden)]
+    fn from_raw_value(inner: &Rc<VmInner>, raw: sys::mh_value) -> Result<Self>;
+}
+
+impl FromValue for Value {
+    #[inline]
+    fn from_raw_value(inner: &Rc<VmInner>, raw: sys::mh_value) -> Result<Self> {
+        Value::from_raw(inner, raw)
+    }
+}
+
+impl FromValue for i64 {
+    #[inline]
+    fn from_raw_value(_: &Rc<VmInner>, raw: sys::mh_value) -> Result<Self> {
+        let mut i = 0i64;
+        if unsafe { sys::mh_value_int(raw, &mut i) } != sys::MH_OK {
+            return Err(Error::Type { expected: "int", got: raw_type_name(raw) });
+        }
+        Ok(i)
+    }
+}
+
+impl FromValue for f64 {
+    #[inline]
+    fn from_raw_value(_: &Rc<VmInner>, raw: sys::mh_value) -> Result<Self> {
+        let mut f = 0f64;
+        if unsafe { sys::mh_value_float(raw, &mut f) } != sys::MH_OK {
+            return Err(Error::Type { expected: "number", got: raw_type_name(raw) });
+        }
+        Ok(f)
+    }
+}
+
+impl FromValue for bool {
+    #[inline]
+    fn from_raw_value(_: &Rc<VmInner>, raw: sys::mh_value) -> Result<Self> {
+        if unsafe { sys::mh_value_type(raw) } != sys::MH_BOOL {
+            return Err(Error::Type { expected: "boolean", got: raw_type_name(raw) });
+        }
+        Ok(unsafe { sys::mh_value_truthy(raw) } != 0)
+    }
+}
+
+impl FromValue for String {
+    fn from_raw_value(inner: &Rc<VmInner>, raw: sys::mh_value) -> Result<Self> {
+        let mut s = sys::mh_str::empty();
+        if unsafe { sys::mh_value_str(inner.raw, raw, &mut s) } != sys::MH_OK {
+            return Err(Error::Type { expected: "string", got: raw_type_name(raw) });
+        }
+        // SAFETY: the bytes are borrowed from the parked result, valid until
+        // the next idle entry — copied out here before any.
+        let bytes = unsafe { s.as_slice() };
+        String::from_utf8(bytes.to_vec()).map_err(|_| Error::Type { expected: "utf-8 string", got: "string" })
+    }
+}
+
+macro_rules! handle_from_value {
+    ($($t:ident => $variant:ident, $name:literal);*) => {$(
+        impl FromValue for $t {
+            fn from_raw_value(inner: &Rc<VmInner>, raw: sys::mh_value) -> Result<Self> {
+                match Value::from_raw(inner, raw)? {
+                    Value::$variant(v) => Ok(v),
+                    other => Err(Error::Type { expected: $name, got: other.type_name() }),
+                }
+            }
+        }
+    )*};
+}
+
+handle_from_value!(Str => Str, "string"; Table => Table, "table"; Function => Function, "function");
+
+impl<T: FromValue> FromValue for Option<T> {
+    fn from_raw_value(inner: &Rc<VmInner>, raw: sys::mh_value) -> Result<Self> {
+        if unsafe { sys::mh_value_type(raw) } == sys::MH_NIL {
+            return Ok(None);
+        }
+        T::from_raw_value(inner, raw).map(Some)
+    }
+}
+
+/// The result list of a guest call: `()` (discard), any single [`FromValue`]
+/// (the first result; a missing one reads as nil), a tuple of them (up to
+/// 8), or `Vec<Value>` (all of them, up to [`MAX_RESULTS`]).
+pub trait FromResults: Sized {
+    /// How many results to ask the VM for.
+    #[doc(hidden)]
+    const WANT: usize;
+    #[doc(hidden)]
+    fn from_results(inner: &Rc<VmInner>, raw: &[sys::mh_value]) -> Result<Self>;
+}
+
+/// Read a VM-written value as two 8-byte loads. The VM writes results word
+/// by word (`Value.storeWords` on the Zig side); copying an `mh_value` whole
+/// compiles to one 16-byte load, which the CPU cannot forward from two
+/// 8-byte stores — a ~20-cycle stall on every result read. The value is
+/// rebuilt from the two words as-is (not field by field: a tag byte plus
+/// zeroed pad bytes is again several narrow stores under one 8-byte reload).
+#[inline]
+fn load_words(v: &sys::mh_value) -> sys::mh_value {
+    let w = (v as *const sys::mh_value).cast::<u64>();
+    // SAFETY: `mh_value` is 16 bytes, 8-aligned, plain integers with no
+    // invalid bit patterns (layout-asserted in mahina-sys); both words are
+    // in bounds of the borrowed value.
+    unsafe { std::mem::transmute::<[u64; 2], sys::mh_value>([w.read(), w.add(1).read()]) }
+}
+
+#[inline]
+fn nth_or_nil(raw: &[sys::mh_value], i: usize) -> sys::mh_value {
+    match raw.get(i) {
+        Some(v) => load_words(v),
+        None => unsafe { sys::mh_nil() },
+    }
+}
+
+impl FromResults for () {
+    const WANT: usize = 0;
+    #[inline]
+    fn from_results(_: &Rc<VmInner>, _: &[sys::mh_value]) -> Result<Self> {
+        Ok(())
+    }
+}
+
+impl<T: FromValue> FromResults for T {
+    const WANT: usize = 1;
+    fn from_results(inner: &Rc<VmInner>, raw: &[sys::mh_value]) -> Result<Self> {
+        T::from_raw_value(inner, nth_or_nil(raw, 0))
+    }
+}
+
+impl FromResults for Vec<Value> {
+    const WANT: usize = MAX_RESULTS;
+    #[inline]
+    fn from_results(inner: &Rc<VmInner>, raw: &[sys::mh_value]) -> Result<Self> {
+        raw.iter().map(|r| Value::from_raw(inner, load_words(r))).collect()
+    }
+}
+
+macro_rules! tuple_from_results {
+    ($n:literal; $($name:ident $idx:tt)+) => {
+        impl<$($name: FromValue),+> FromResults for ($($name,)+) {
+            const WANT: usize = $n;
+            fn from_results(inner: &Rc<VmInner>, raw: &[sys::mh_value]) -> Result<Self> {
+                Ok(($($name::from_raw_value(inner, nth_or_nil(raw, $idx))?,)+))
+            }
+        }
+    };
+}
+
+tuple_from_results!(1; A 0);
+tuple_from_results!(2; A 0 B 1);
+tuple_from_results!(3; A 0 B 1 C 2);
+tuple_from_results!(4; A 0 B 1 C 2 D 3);
+tuple_from_results!(5; A 0 B 1 C 2 D 3 E 4);
+tuple_from_results!(6; A 0 B 1 C 2 D 3 E 4 F 5);
+tuple_from_results!(7; A 0 B 1 C 2 D 3 E 4 F 5 G 6);
+tuple_from_results!(8; A 0 B 1 C 2 D 3 E 4 F 5 G 6 H 7);
+
+/// A results buffer the VM writes into. Left uninitialized: `mahina.h`
+/// defines only `results[0..*nresults]`, and only that prefix is read.
+#[inline]
+fn result_buf() -> [MaybeUninit<sys::mh_value>; MAX_RESULTS] {
+    [const { MaybeUninit::uninit() }; MAX_RESULTS]
+}
+
+/// # Safety
+/// `buf[..n]` must have been written by the VM (an `mh_*` call reporting `n`).
+#[inline]
+unsafe fn written(buf: &[MaybeUninit<sys::mh_value>; MAX_RESULTS], n: usize) -> &[sys::mh_value] {
+    std::slice::from_raw_parts(buf.as_ptr().cast(), n.min(MAX_RESULTS))
+}
+
+/// The one call funnel behind [`Vm::call`] and [`Function::call`].
+fn call_raw<A: IntoArgs, R: FromResults>(inner: &Rc<VmInner>, callee: sys::mh_value, args: A) -> Result<R> {
+    let mut keep = Keep(Vec::new());
+    let mut buf = ArgBuf::new();
+    args.push_args(inner, &mut keep, &mut buf)?;
+    let a = buf.as_slice();
+    let mut out = result_buf();
+    let mut n: usize = 0;
+    let st = unsafe {
+        sys::mh_call(
+            inner.raw,
+            callee,
+            if a.is_empty() { std::ptr::null() } else { a.as_ptr() },
+            a.len(),
+            out.as_mut_ptr().cast(),
+            R::WANT.min(MAX_RESULTS),
+            &mut n,
+        )
+    };
+    inner.status(st)?;
+    // `keep` (argument temporaries) is dropped after the results are wrapped.
+    R::from_results(inner, unsafe { written(&out, n) })
+}
+
 // ---------------------------------------------------------------------------
 // the VM
 // ---------------------------------------------------------------------------
@@ -427,20 +911,20 @@ impl Vm {
     /// Compile + run `src` (chunk-named `name` in error messages), returning
     /// the script's results (up to [`MAX_RESULTS`]).
     pub fn eval(&self, src: &str, name: &str) -> Result<Vec<Value>> {
-        let mut out = [sys::mh_value::zeroed(); MAX_RESULTS];
+        let mut out = result_buf();
         let mut n: usize = 0;
         let st = unsafe {
             sys::mh_eval(
                 self.inner.raw,
                 sys::mh_str::from_slice(src.as_bytes()),
                 sys::mh_str::from_slice(name.as_bytes()),
-                out.as_mut_ptr(),
+                out.as_mut_ptr().cast(),
                 MAX_RESULTS,
                 &mut n,
             )
         };
         self.inner.status(st)?;
-        self.wrap_results(&out[..n])
+        self.wrap_results(unsafe { written(&out, n) })
     }
 
     /// Compile without running; run later (any number of times) with
@@ -459,29 +943,12 @@ impl Vm {
         Ok(Script { inner: self.inner.clone(), raw })
     }
 
-    /// Call a guest function with `args`, returning its results (up to
-    /// [`MAX_RESULTS`]).
-    pub fn call(&self, f: &Function, args: &[Value]) -> Result<Vec<Value>> {
-        let callee = Value::Function(f.clone()).to_raw(&self.inner)?;
-        let mut raw_args = Vec::with_capacity(args.len());
-        for a in args {
-            raw_args.push(a.to_raw(&self.inner)?);
-        }
-        let mut out = [sys::mh_value::zeroed(); MAX_RESULTS];
-        let mut n: usize = 0;
-        let st = unsafe {
-            sys::mh_call(
-                self.inner.raw,
-                callee,
-                if raw_args.is_empty() { std::ptr::null() } else { raw_args.as_ptr() },
-                raw_args.len(),
-                out.as_mut_ptr(),
-                MAX_RESULTS,
-                &mut n,
-            )
-        };
-        self.inner.status(st)?;
-        self.wrap_results(&out[..n])
+    /// Call a guest function. `args` is anything [`IntoArgs`] (`()`, a value,
+    /// a tuple, a slice of [`Value`]s); the result type picks how many
+    /// results are read and how they convert ([`FromResults`]).
+    pub fn call<A: IntoArgs, R: FromResults>(&self, f: &Function, args: A) -> Result<R> {
+        let callee = f.0.raw_in(&self.inner)?;
+        call_raw(&self.inner, callee, args)
     }
 
     pub fn global(&self, name: &str) -> Result<Value> {
@@ -565,8 +1032,8 @@ impl Vm {
 
     fn wrap_results(&self, raw: &[sys::mh_value]) -> Result<Vec<Value>> {
         let mut vals = Vec::with_capacity(raw.len());
-        for &r in raw {
-            vals.push(Value::from_raw(&self.inner, r)?);
+        for r in raw {
+            vals.push(Value::from_raw(&self.inner, load_words(r))?);
         }
         Ok(vals)
     }
@@ -585,12 +1052,12 @@ pub struct Script {
 
 impl Script {
     pub fn run(&self) -> Result<Vec<Value>> {
-        let mut out = [sys::mh_value::zeroed(); MAX_RESULTS];
+        let mut out = result_buf();
         let mut n: usize = 0;
-        let st = unsafe { sys::mh_run(self.inner.raw, self.raw, out.as_mut_ptr(), MAX_RESULTS, &mut n) };
+        let st = unsafe { sys::mh_run(self.inner.raw, self.raw, out.as_mut_ptr().cast(), MAX_RESULTS, &mut n) };
         self.inner.status(st)?;
         let vm = Vm { inner: self.inner.clone() };
-        vm.wrap_results(&out[..n])
+        vm.wrap_results(unsafe { written(&out, n) })
     }
 }
 
@@ -665,7 +1132,7 @@ impl Table {
     pub fn set_metatable(&self, mt: Option<&Table>) -> Result<()> {
         let inner = &self.0.inner;
         let raw = match mt {
-            Some(t) => Value::Table(t.clone()).to_raw(inner)?,
+            Some(t) => t.0.raw_in(inner)?,
             None => unsafe { sys::mh_nil() },
         };
         let st = unsafe { sys::mh_table_metatable_set(inner.raw, self.0.raw(), raw) };
@@ -726,8 +1193,10 @@ impl Drop for TableIter {
 // ---------------------------------------------------------------------------
 
 impl Function {
-    pub fn call(&self, args: &[Value]) -> Result<Vec<Value>> {
-        Vm { inner: self.0.inner.clone() }.call(self, args)
+    /// Call this function — see [`Vm::call`]. Borrows the function; no GC
+    /// ref is created for the call.
+    pub fn call<A: IntoArgs, R: FromResults>(&self, args: A) -> Result<R> {
+        call_raw(&self.0.inner, self.0.raw, args)
     }
 }
 

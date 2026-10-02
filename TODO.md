@@ -4,7 +4,7 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 
 ## libmahina.a replaces the host's memset/memcpy with byte loops (noted 2026-10-02)
 
-- [ ] **`capi_lib.bundle_compiler_rt = true` (build.zig, doc 59 E3) exports
+- [x] **`capi_lib.bundle_compiler_rt = true` (build.zig, doc 59 E3) exports
       Zig compiler-rt's `memset`/`memcpy`/`memmove` from the static lib, and
       the host linker prefers them to glibc's.** Every mem* call in the whole
       host process (a Rust game engine, say) becomes Zig's generic loop:
@@ -17,6 +17,10 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       (big frames lose their probes); (2) keep the bundle and
       strip or weaken the mem* symbols from the archive; (3) ship only the
       stack-probe routine. Also check `tests/capi_smoke.c` still links.
+      **Done (2026-10-02), option 3:** no bundle; `capi.zig` exports a weak
+      `__zig_probe_stack` (the pinned compiler-rt routine) for library
+      builds on x86_64, and helpers like `__divti3` come from the host's
+      libgcc/compiler_builtins. The archive now has `U memset/memcpy/memmove`.
 
 ## Embedding call boundary vs LuaJIT/mlua (noted 2026-10-02)
 
@@ -25,21 +29,51 @@ cycles per `lua_pcall`, mahina 567 / 119 per `mh_call`; mlua 24–26 ns vs
 our Rust crate 172 ns. Store→load forwarding stalls per call: LuaJIT 0,
 mahina C API 7.3, Rust crate 26.8. Items, each measured on its own:
 
-- [ ] **Rust crate on mlua's model.** No `Function` clone per call (it
+- [x] **Rust crate on mlua's model.** No `Function` clone per call (it
       creates and frees a GC ref), no `Vec`s, no 1 KB zeroed results
       buffer; typed argument/result conversion through traits (E9's
       `IntoValue`/`FromValue`) so `f.call::<i64>(x)` touches no heap.
-- [ ] **Whole-word value stores at the boundary.** `mh_value` is written
+      **Done (2026-10-02):** `IntoArgs`/`FromResults` (scalars, strings,
+      `Option`, handles, tuples up to 8, `&[Value]`/`Vec<Value>`), 8 inline
+      arg slots, uninit result buffer, handles cache their raw value,
+      `#[inline]` on the conversions (out of line, each `Result<mh_value>`
+      went through memory and stalled on the reload), results read as two
+      words. Typed `i64 -> i64` call: 76 → ~20 ns (575 → 547 instructions,
+      ~94 cycles); mlua+LuaJIT is 24–26 ns. The untyped `&[Value] ->
+      Vec<Value>` form is ~36 ns (the `Vec` alloc/free).
+- [x] **Whole-word value stores at the boundary.** `mh_value` is written
       as a tag byte plus payload and read back as two 8-byte loads, which
       cannot store-forward. Write the tag as a zero-extended 8-byte word.
-- [ ] **Build calls in place.** Today args are validated, parked, copied
+      **Done (2026-10-02):** `Value.storeWords`/`loadWords`, used by every
+      capi out-pointer, the park, and `callValue`'s copy-out. Same session:
+      `FrameResult` became `packed struct(u32)` — `opRet` wrote it as two
+      `u16` halves and `callValue` read it whole, the largest single stall
+      per call (Rust call 123 → 105 cycles).
+- [x] **Build calls in place.** Today args are validated, parked, copied
       into the callee window, and results copied out and parked again.
       LuaJIT's host pushes straight into the callee's frame slots.
+      **Reframed and done (2026-10-02):** a push API saves nothing here —
+      LuaJIT's glue around `lua_pcall` is ~143 instructions, ours ~53 — so
+      the work was cheapening the existing path: `runProtected` is `inline`
+      (C call 540 → 518 instructions, ~86 → ~82 cycles). Tried and
+      reverted: binding/copying through one `RegWindow` (lanes loaded once)
+      — LLVM then unrolls the 1-element loops by 4 and it nets +8
+      instructions.
 - [ ] **Clear the dead stack at GC time instead of nil-filling every
       callee register per call** (LuaJIT `gc_traverse_thread`). Must keep
-      keyframes and cross-tier output byte-identical.
+      keyframes and cross-tier output byte-identical. **Measured
+      (2026-10-02), not done:** dropping the nil-fill saves 3 instructions
+      per call, cycles within noise. And `keyframeser.zig` serializes every
+      register below `stack_top` mid-run, so stale, tier-dependent data
+      would land in keyframes unless the serializer clears dead slots
+      itself. Needs Bart's call on whether 3 instructions justify that.
 - [ ] **One packed fast-path word.** `runFastPath` reads nine scattered
-      flags on every entry; keep them as bits in one word.
+      flags on every entry; keep them as bits in one word. **Measured
+      (2026-10-02), not done:** removing the check outright saves 15
+      instructions and 2–6 cycles per call (the ceiling). The flags have
+      ~31 production write sites (trace.zig, trace_link.zig, interp.zig,
+      the recorder's `active`), each of which would have to keep the
+      word in sync. Needs Bart's call.
 
 ## `hashgate.py --generate --filter X` wipes every other program's refs (noted 2026-10-01)
 
