@@ -18,6 +18,29 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       strip or weaken the mem* symbols from the archive; (3) ship only the
       stack-probe routine. Also check `tests/capi_smoke.c` still links.
 
+## Embedding call boundary vs LuaJIT/mlua (noted 2026-10-02)
+
+Measured with call-only probes, JIT off: LuaJIT 304 instructions / 54
+cycles per `lua_pcall`, mahina 567 / 119 per `mh_call`; mlua 24–26 ns vs
+our Rust crate 172 ns. Store→load forwarding stalls per call: LuaJIT 0,
+mahina C API 7.3, Rust crate 26.8. Items, each measured on its own:
+
+- [ ] **Rust crate on mlua's model.** No `Function` clone per call (it
+      creates and frees a GC ref), no `Vec`s, no 1 KB zeroed results
+      buffer; typed argument/result conversion through traits (E9's
+      `IntoValue`/`FromValue`) so `f.call::<i64>(x)` touches no heap.
+- [ ] **Whole-word value stores at the boundary.** `mh_value` is written
+      as a tag byte plus payload and read back as two 8-byte loads, which
+      cannot store-forward. Write the tag as a zero-extended 8-byte word.
+- [ ] **Build calls in place.** Today args are validated, parked, copied
+      into the callee window, and results copied out and parked again.
+      LuaJIT's host pushes straight into the callee's frame slots.
+- [ ] **Clear the dead stack at GC time instead of nil-filling every
+      callee register per call** (LuaJIT `gc_traverse_thread`). Must keep
+      keyframes and cross-tier output byte-identical.
+- [ ] **One packed fast-path word.** `runFastPath` reads nine scattered
+      flags on every entry; keep them as bits in one word.
+
 ## `hashgate.py --generate --filter X` wipes every other program's refs (noted 2026-10-01)
 
 - [ ] `write_refs` writes only the observed (filtered) rows, so a filtered
