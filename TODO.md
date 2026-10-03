@@ -73,7 +73,13 @@ mahina C API 7.3, Rust crate 26.8. Items, each measured on its own:
       instructions and 2–6 cycles per call (the ceiling). The flags have
       ~31 production write sites (trace.zig, trace_link.zig, interp.zig,
       the recorder's `active`), each of which would have to keep the
-      word in sync. Needs Bart's call.
+      word in sync. Needs Bart's call. **Folded into doc 60 H1
+      (2026-10-03):** a `u16` on `TraceState`; the six pending fields
+      coexist, so no single union (doc 60 §5.4).
+- [ ] **Windows x64 host-call entry (doc 60).** The `.S` entry targets the
+      SysV ABI only (Linux, macOS); Windows x64 uses its own calling
+      convention and runs the Zig H1 path. Write `hostcall_win64.S` (or
+      equivalent) only if a Windows embedder's profile asks for it.
 
 ## `hashgate.py --generate --filter X` wipes every other program's refs (noted 2026-10-01)
 
