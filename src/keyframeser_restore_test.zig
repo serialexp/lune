@@ -854,7 +854,7 @@ test "doc 19 §T3: restored load-driven program resumes with the JIT and traces 
     try testing.expect(!diags.hasErrors());
 
     // Cut mid-way: after the chunk is loaded and warm, inside the repeat loop.
-    vm.suspend_ctl = .{ .min_depth = 1, .after_safepoints = ref.total_safepoints / 4 };
+    vm.setSuspendCtl(.{ .min_depth = 1, .after_safepoints = ref.total_safepoints / 4 });
     try testing.expect((try vm.start(chunk.proto)) == .suspended);
     const out_before = try gpa.dupe(u8, sink.buffered());
     defer gpa.free(out_before);
@@ -878,7 +878,7 @@ test "doc 19 §T3: restored load-driven program resumes with the JIT and traces 
     var buf_r: [64]u8 = undefined;
     var sink_r = io.Writer.fixed(&buf_r);
     vm_r.out = &sink_r;
-    vm_r.suspend_ctl = null;
+    vm_r.setSuspendCtl(null);
     try testing.expect((try vm_r.exec()) == .finished);
 
     // (a) output equivalence vs the uninterrupted tier-0 reference.
@@ -1414,7 +1414,7 @@ test "doc 32: a heterogeneous `.value` array survives round-trip and still recor
 
     // Cut a quarter of the way in: the array is fully built and already
     // erased to `.value`, and the accumulation loop is mid-flight.
-    vm.suspend_ctl = .{ .min_depth = 0, .after_safepoints = ref.total_safepoints / 4 };
+    vm.setSuspendCtl(.{ .min_depth = 0, .after_safepoints = ref.total_safepoints / 4 });
     try testing.expect((try vm.start(chunk.proto)) == .suspended);
     const out_before = try gpa.dupe(u8, sink.buffered());
     defer gpa.free(out_before);
@@ -1437,7 +1437,7 @@ test "doc 32: a heterogeneous `.value` array survives round-trip and still recor
     var buf_r: [64]u8 = undefined;
     var sink_r = io.Writer.fixed(&buf_r);
     vm_r.out = &sink_r;
-    vm_r.suspend_ctl = null;
+    vm_r.setSuspendCtl(null);
     try testing.expect((try vm_r.exec()) == .finished);
 
     var combined: [128]u8 = undefined;

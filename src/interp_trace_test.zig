@@ -541,7 +541,7 @@ test "doc 24 c4: observation blackout — an armed safepoint recorder keeps allo
 
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    vm.record_safepoint_lines = true;
+    vm.setRecordSafepointLines(true);
     vm.source = source;
     vm.trace.config.enabled = true;
     vm.trace.config.execute = true;
@@ -1697,7 +1697,7 @@ test "doc 27 §3a: the multret shadow never survives reset or an abort" {
         try testing.expect(!diags.hasErrors());
         _ = try vm.run(chunk.proto);
         vm.trace.rec.multret_top = 7; // plant a stale shadow
-        try vm.trace.rec.reset(gpa, .{ .proto = chunk.proto, .pc = 0 }, 4);
+        try vm.trace.startRecordingForTest(gpa, .{ .proto = chunk.proto, .pc = 0 }, 4);
         try testing.expectEqual(@as(?u32, null), vm.trace.rec.multret_top);
     }
     {

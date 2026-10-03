@@ -1,8 +1,9 @@
 # 60 — Hand-written machine code: where we stop trusting the compiler (first user: the host-call entry)
 
-**Status:** rev 5, **approved by codex and antigravity**, not yet
-implemented. Revs 1–4 came back CHANGES REQUESTED; rev 5 was approved by
-both, with nits only, which are folded in
+**Status:** partial. **H1 landed** (2026-10-03; as built and measured in
+§5.5). H1→H3 admission, H2, H3 and H4 are outstanding. The design is rev 5,
+**approved by codex and antigravity**. Revs 1–4 came back CHANGES
+REQUESTED; rev 5 was approved by both, with nits only, which are folded in
 (`docs/reviews/doc60/*-rev{1..5}.md`, per-finding status in §10).
 
 Bart's decisions so far:
@@ -13,14 +14,13 @@ Bart's decisions so far:
 - an inspectable, checked-in offsets file (Q7);
 - the Zig `mh_call` wrapper, which tail-calls a hidden entry (Q9);
 - park-then-helper for results (Q10);
-- Q6 audited (§5.4).
-
+- Q6 audited (§5.4);
 - Q12, the register file and overflow park: (a), the assembly reads the
   slices directly under a stated exception (§3.2).
 
-No design questions block H1. Nothing hand-written ships yet beyond what
-already existed: the `__zig_probe_stack` copy in `capi.zig` and the
-runtime-emitted trace trampoline in `nativegen_mcode.zig`.
+Nothing hand-written ships yet beyond what already existed: the
+`__zig_probe_stack` copy in `capi.zig` and the runtime-emitted trace
+trampoline in `nativegen_mcode.zig`. H1 is Zig.
 **Owner:** claude
 **Last updated:** 2026-10-03
 
@@ -43,22 +43,75 @@ land; move whole phases to Done once everything inside them is checked.
 - [x] **Q12 decided** (Bart, 2026-10-03): option (a). The assembly reads
   the register-file and overflow-park slices directly, under a stated
   exception to the representation rule (§3.2).
-
-### Outstanding
-
-- [ ] **H1 — the minimal-work host call, in Zig.** This is the dedicated
-  entry path of §5. It bypasses `callValue`'s generic dispatch for closure
-  callees.
-  - It stays forever. It is the reference, the fallback target, and the
-    path for every target without a `.S` entry (macOS, Windows, aarch64,
-    wasm).
-  - It includes the packed fast-path word (§5.4) and the VM-side runner
-    split (§4.1).
-  - Gated by the stage-1 differential tests against today's path (§6.1).
-  - Measured with §5.3's ledger.
+- [x] **H1 — the minimal-work host call, in Zig** (2026-10-03). This is
+  the dedicated entry path of §5: closure callees skip `callValue`'s
+  generic dispatch. Where it deviates from the plan, and why, is in §5.5.
+  - [x] **The Zig `mh_call` → H1 split** (§4.1). `mh_call` does the
+    public checks and `max_results` normalization, then
+    `@call(.always_tail, hostcallSlow, …)` (`capi.zig`). H1 stays forever
+    as the reference, the fallback target, and the whole path for every
+    target without a `.S` entry.
+  - [x] **The VM-side runner split** (§4.1): `Vm.pushHostCall` and
+    `Vm.runPushedFrame` (`interp.zig`), plus `bindAndPushClosure`, now
+    shared with `callValue`'s closure arm.
+  - [x] **The packed fast-path word** (§5.4): `TraceState.fast_block: u16`,
+    with setters owning every write. `fastBlockReference()` is the
+    nine-bit reference, debug-asserted in `runFastPath` and on every H1
+    entry.
+  - [x] **Stage-1 differential tests** (§6.1).
+    - `capi_hostcall_test.zig` has 18 scenario tests, plus a snapshot
+      self-test proving the dump tells apart what it claims to compare
+      (closures by proto identity, recording constants by value, grid
+      cells and row views). Each scenario runs on three
+      tiers, in Debug and in ReleaseFast, against
+      `capi.hostcallReference`, the pre-H1 `mh_call` kept verbatim.
+    - The reference VM dispatches on the original predicate
+      (`Vm.reference_dispatch`).
+    - Since the H1 review, the snapshot is deep and alias-aware, and
+      host-side `peek()`s compare mid-call state.
+    - Positive fixtures show matching anchors and live-parent arm requests
+      actually activate through H1.
+    - **Not run:** the record/replay legs of the §6.1 matrix. The
+      embedding has no record or replay mode yet (`createVm` keeps effects
+      `.off`, doc 59 §3.7), so there's nothing to run them on. That's
+      outstanding.
+    - ReleaseFast: `zig build test -Doptimize=ReleaseFast` also runs
+      `capi-smoke`, which hangs under `NDEBUG` (TODO.md). So the ReleaseFast
+      leg runs the built test binary directly.
+  - [x] **Fast-word mutation and lifecycle tests.**
+    `interp_fastblock_test.zig` has 7 tests:
+    - the four §6.1 mutation tests;
+    - start OOM;
+    - a committing recording and a self-aborting one, with unrelated bits
+      held set;
+    - a 143-allocation OOM sweep over a recording run.
+    
+    `TraceState.assertTraceBitsInSync` also checks the trace bits in Debug
+    at every recorder start, recorded instruction, close and abort, across
+    the whole suite.
+  - [x] **Measured with §5.3's ledger** (§5.5): **−39…−43 instructions
+    on every shape**, and cycles −9…−15% on most shapes. `wide` is +1.3%
+    in cycles; the suspected cause is code placement (§5.5). The suite's
+    instruction counts are flat.
+- [ ] **Record/replay legs of the stage-1 matrix** (§6.1). They wait on an
+  embedding record/replay mode (doc 59 §3.7). Run them when that mode
+  exists, and before H3 lands.
+- [ ] **`next_call_seq` exhaustion test** (§6.1 call shapes). Both legs
+  panic in the same `pushFrameTrusted`, so it needs a subprocess harness,
+  which the test suite doesn't have yet. Not covered by H1's tests.
+- [ ] **H3: a dedicated frame-slot-reuse test.** After a code-image
+  change, a new frame in a reused slot must carry the
+  `CODE_CACHE_GEN_INVALID` sentinel. H1 shares `pushFrameTrusted` with
+  `callValue`, and the snapshot already compares `frame0`'s
+  `code_cache_gen` across tier-ups (the "hot callees" test). H3 writes the
+  frame itself: one `-1` store into `code_cache_gen`, leaving the stale
+  `code_cache` slice in place (§3.2). So stage 2 needs a test aimed at
+  exactly that store.
 - [ ] **H1→H3 admission decision.** Write the assembly only if H1's
   measured *cycle* gap to LuaJIT justifies it (§7). Instruction counts
-  alone don't decide it.
+  alone don't decide it. The input, from §5.5: on the doc-59 `id(1)`
+  probe, H1 costs **477 instructions / ~75 cycles** per public crossing,
+  against 518 / ~83 before H1 and LuaJIT `lua_pcall`'s 304 / 54.
 - [ ] **H2 — the `.S` layer.**
   - Build wiring (§3.1).
   - `src/asm/offsets_x64.inc` and its comptime check (§3.2).
@@ -854,6 +907,152 @@ which changes tiering decisions. §2 rules that out.
   strand execution in `.full` or wrongly reject admission. Either one
   trips an assertion in tests.
 
+### 5.5 H1 as built, and measured (2026-10-03)
+
+This section records how H1 actually landed. Where it departs from
+§4.1/§5.4 the plan text above is left as written, and the reason is
+given here.
+
+**Layering.**
+- `mh_call` (`capi.zig`) does the §4.1 public checks, then
+  `@call(.always_tail, hostcallSlow, …)`. There's no `.S` entry yet, so
+  every target tail-calls H1. Q11's `always_tail` question is half
+  answered: with the seven-parameter C signature it **compiles** on the
+  pinned toolchain. In ReleaseFast, LLVM inlines `hostcallSlow` into
+  `mh_call` outright. Whether it stays a plain `jmp` once the target is an
+  external hidden symbol is still for H2 to check.
+- `hostcallSlow` is the planned `mahina_hostcall_slow`, under a Zig name
+  and not exported. The hidden `@export` arrives with H2, its first
+  outside caller.
+- Closure callees go through `callClosure`: `Vm.pushHostCall`, then
+  `Vm.runPushedFrame`, then the copy-out, `stack_top` restore and result
+  parks. Natives, `__call` targets and type errors keep the `runProtected`
+  → `callValue` path, as planned.
+- `Vm.bindAndPushClosure` is `callValue`'s closure arm (depth and capacity
+  checks, both bind layouts, `pushFrameTrusted`), moved out verbatim.
+  `callValue` and `pushHostCall` both call it, so H1 cannot drift from
+  today's binding.
+
+**Deviations from the plan, and why.**
+- **`runPushedFrame` reuses `execWithEntry`**, rather than rebuilding
+  `ExecState`, `cachedCodeFor`, the region context and the mode pick
+  itself. `execWithEntry` already does exactly §4.1's list, including the
+  two errdefers in the right order. Check site 2 of §5.4 is therefore
+  `runFastPath`'s assertion, which every run through
+  `execWithEntry` passes.
+- **Three functions became `inline`**: `pushHostCall`, `runPushedFrame`,
+  and `execWithEntry`, which was out of line before H1.
+  - An out-of-line `Error!T` comes back through memory as a 2-byte error
+    store plus an 8-byte payload store, and the caller reads it back as
+    one 16-byte load. That's a store-forwarding stall on every call.
+  - The first H1 build measured **548 instructions / ~105 cycles** on the
+    `id` probe, *worse* than the 518 / ~83 baseline. Inlining
+    `pushHostCall` and `runPushedFrame` removed the stall. Inlining
+    `execWithEntry` then gave the final 477 / ~75.
+- **Flat setters on `TraceState`, not a nested `pending` struct.**
+  - Methods on a nested struct can't reach `fast_block` without
+    `@fieldParentPtr`. So the six fields stay where they were, and six
+    setters (`setPendingExitAnchor` … `setPendingCallHeadArm`) write the
+    payload and the bit together.
+  - Every production and test write now goes through them. A grep for a
+    direct `pending_* =`, `suspend_ctl =` or `record_safepoint_lines =`
+    finds only the setters. That grep, together with the Debug assertion,
+    is the enforcement.
+- **A recording funnel.** Every production `rec.start` goes through
+  `TraceState.startRecording(key, nreg)`, which syncs the bit even when it
+  declines on OOM. Three call sites become one.
+  - `syncRecordingBit` also runs after `recordInstr`, inside `abort` (so
+    `abortRaised` and every abort reason are covered), after `rec.close`,
+    and around `finalize` in `commit`.
+  - Those are all the production `rec.active` mutators. `consumeRecordingAbort`
+    only reads the abort notice the recorder already acted on, so it needs
+    no sync of its own.
+  - Tests use `startRecordingForTest` and `stopRecordingForTest`, as
+    planned.
+- **Bit writes are a skip-if-unchanged volatile whole-word store**
+  (`setFastBit`).
+  - A plain read-modify-write wasn't enough. LLVM narrowed it to a
+    byte-wide `andb`/`orb` on `fast_block`, and the next 16-bit `cmpw`
+    then couldn't store-forward: the doc-59 `FrameResult` lesson again,
+    this time introduced by the optimizer.
+  - The volatile `u16` store pins the width. The skip keeps the common
+    "already in that state" setter call from storing at all.
+- **No `Vm.recomputeFastBlock()`.**
+  - VM init and keyframe restore (`initBare`) write none of the nine
+    source fields. The word starts at 0 with every field in its zero
+    state, and restore never changes a field behind a setter. So there's
+    nothing to recompute.
+  - The cache clear resets only the trace bits, through the setters, so
+    the VM bits survive (tested).
+  - If a future restore path does write a source field, the Debug
+    assertion trips on the next dispatch.
+- **The reference leg** is a test-only `Vm.reference_dispatch: bool`.
+  Under it, `runFastPath` returns `fastBlockReference() == 0` instead of
+  testing the word. The field is `void` outside tests.
+
+**Ledger (§5.3), measured.** These are numbers per `mh_call`, from
+`bench/embed/hostcall_probe.c` under `perf stat`:
+- the median of 5 interleaved runs at 2M iterations, minus a 0-iteration
+  run;
+- JIT off;
+- ReleaseFast;
+- `libmahina` built at HEAD (the baseline) and with H1.
+
+Each figure is the whole public crossing, including the trivial guest
+body.
+
+| shape | instr before → H1 | Δ | cycles Δ |
+|---|---|---|---|
+| a0 (0 args, 1 result) | 443 → 403 | −40 | −14.7% |
+| a1 | 491 → 452 | −39 | −11.7% |
+| a4 | 554 → 515 | −39 | −8.6% |
+| a8 | 628 → 588 | −40 | −11.1% |
+| a9 (past `ARGS_MAX`) | 655 → 614 | −41 | −9.5% |
+| r0 (0 results) | 367 → 326 | −41 | −14.0% |
+| r1 | 443 → 403 | −40 | −13.9% |
+| r4 | 596 → 556 | −40 | −1.7% |
+| heap (string in and out) | 509 → 470 | −39 | −15.2% |
+| vararg (3 into `f(a, ...)`) | 565 → 522 | −43 | −13.6% |
+| wide (40-register window) | 1895 → 1856 | −39 | **+1.3%** |
+| overflow (8 string results) | 1023 → 982 | −41 | −5.6% |
+
+With the JIT on, the shape of the results is the same: −7…−14%, and
+`wide` at +2.6%.
+
+The `wide` regression is real; codex's independent re-run measured it at
+about +1.7%. The evidence on its cause:
+- over 15 reps, the median went from 318.6 to 324.6 cycles;
+- perf annotation puts the boundary itself about 18 cycles *cheaper*;
+- the guest `opLoad` handler costs about 21 cycles more, with
+  byte-identical code at a different address.
+
+That points to code placement, or indirect-branch aliasing, in the
+interpreter, which H1 shifts without touching the handler. It's the same
+class of effect as doc 59's "fewer instructions, more cycles" placement
+result. It's **suspected, not isolated**: nothing here pins the handler's
+address to test it.
+
+On the doc-59 `id(1)` probe (`call` op), the crossing went from 518 / ~83
+to **477 / ~75** (LuaJIT `lua_pcall`: 304 / 54).
+
+**The language suite.** `just bench`, both binaries, 5 reps:
+- geomean t0 ×1.003, jit ×0.995, on a machine at load 2–5;
+- under `perf stat`, **every benchmark's instruction count is unchanged**:
+  t0 within ±0.02%, jit within ±0.3%, except scimark-sparse jit at
+  −0.96%.
+
+What that shows:
+- The fast-word test runs where the dispatch mode is picked (every
+  `execWithEntry` and every mode switch), not per bytecode. It is now one
+  load and a compare.
+- The setter writes add no measurable instructions to any benchmark.
+- **No aggregate timing regression was resolved**: the geomeans sit
+  inside the run-to-run spread.
+
+Five reps on a loaded machine can't classify single-row ±2–4% wall-clock
+deltas. With the instruction counts flat, noise or placement are the
+likely explanations, but neither is established.
+
 ## 6. Testing
 
 ### 6.1 Differential tests: two stages, normalized comparison
@@ -895,9 +1094,10 @@ after every call:
   snapshot equality can't stand in for this check;
 - serialized keyframes, byte for byte.
 
-The tests run in Debug and ReleaseFast, across the supported
-tier/record/replay matrix: JIT off, the tier-1 interpreter, native, and
-the embedding's record and replay modes.
+The tests run in Debug and ReleaseFast, across the three tiers: JIT
+off, the tier-1 interpreter, and native. Record and replay legs are not
+run: the embedding has no record or replay mode yet (doc 59), so they
+wait on that capability and stay on the Outstanding list.
 
 Call shapes:
 - **Argument counts:** 0..8 arguments, and 9 (the fallback); more and
@@ -952,7 +1152,9 @@ it is **not** coverage for this work. Embedding-level determinism tests
 are added instead:
 - capture keyframes around host calls, and require byte-identical
   serialized artifacts between the fast entry and the reference path;
-- run the record and replay modes the embedding supports today.
+- run record and replay legs once the embedding supports those modes.
+  It doesn't today, so these legs are outstanding; the three tiers are
+  what runs.
 
 Callback replay, and keyframes taken while host functions are registered,
 remain excluded, as in doc 59 (E6/E8). The exclusions are written out in
@@ -1067,7 +1269,10 @@ its own doc, built on this one's `.S` and offsets machinery.
 - [ ] **Q11: verify at H2 against the pinned toolchain:**
   - `.S` preprocessing, or the `.assembly_with_preprocessor` fallback;
   - hidden `@export`;
-  - `always_tail` compiling to a plain `jmp` with this signature;
+  - `always_tail` compiling to a plain `jmp` with this signature. H1
+    shows it **compiles** with the seven-parameter C signature when the
+    target is the Zig `hostcallSlow`, which LLVM then inlines (§5.5). The
+    `jmp` to an external hidden `.S` symbol is still unverified;
   - the §6.3 checks.
 - [x] **Q12: the register file and overflow park: (a)**, a stated slice
   exception (Bart, 2026-10-03; §3.2). The slice layout is checked by an
@@ -1099,8 +1304,9 @@ its own doc, built on this one's `.S` and offsets machinery.
 
 ## 10. Review disposition
 
-"Addressed" means specified by the design. Nothing here is implemented
-or tested.
+In the design-review tables (rev 1 → rev 5), "addressed" means specified
+by the design, not implemented. The H1 implementation review, at the end,
+is about code in the tree.
 
 ### Rev 1 → rev 2, and rev 2 → rev 3
 
@@ -1157,3 +1363,46 @@ Antigravity numbers its rev-4 findings B1–B2, S1–S4 and N1–N3.
 | antigravity N1: errdefer LIFO order | addressed | §4.1 |
 | antigravity N2: `safepoint_seq` line | addressed (`:2789`) | §4.3 step 6 |
 | antigravity N3: Q12 options sound | superseded by codex S1: (a)'s comptime check was not sound and is replaced | §3.2 |
+
+### H1 implementation review (2026-10-03)
+
+The reviews are `codex-h1.md` (CHANGES REQUESTED) and `antigravity-h1.md`
+(APPROVE). Neither found a production regression or a missed setter.
+Every finding was about tests or the doc.
+
+| finding | status | where |
+|---|---|---|
+| codex 1: snapshot too shallow (tables/closures opaque; regions by count; upvalues by slot; recording by anchor) | fixed: alias-aware deep rendering of tables (entries, metatable), closures (proto, upvalue cells), natives; every region activation's key and accumulator; open cells by identity, slot and value; in-flight recording's kind and IR. New fixtures return fresh tables and capturing closures; a host `peek()` snapshots mid-call, including inside a nested reentry, and asserts the deep state was seen | `capi_hostcall_test.zig` |
+| codex 2: lifecycle boundaries unchecked; fixtures never activate | fixed: `assertTraceBitsInSync` at every start, recorded instruction, close and abort (Debug, whole suite); explicit start-OOM, commit, self-abort (`too_long`) and 143-allocation OOM-sweep tests; positive fixtures where exit, replay and call anchors match the H1-entered callee and must start a recording (checked to fail when the call anchor is off by one); live-parent ret-cont and call-head arms through host-entered recursion; `safepoint_lines` compared | `trace.zig`, `interp_fastblock_test.zig`, `capi_hostcall_test.zig` |
+| codex 3: suspend precondition checked after the push | fixed: `pushHostCall` asserts `suspend_ctl == null` before mutating, as `callValue` does; `runPushedFrame` keeps its copy for H3 | `interp.zig` |
+| codex 4: artifacts compared by hash | fixed: effect log, committed traces and keyframe compared byte for byte | `capi_hostcall_test.zig` |
+| codex 5: measurement conclusions overstated | fixed: fast-word test placement corrected (mode pick, not per bytecode); `wide` cause marked suspected; single-row timing deltas left unclassified | §5.5 |
+| codex 6 / antigravity 1: test count; record/replay matrix claimed | fixed: counts corrected; record/replay legs moved to Outstanding | Implementation status |
+| antigravity 2: why `suspend_ctl` isn't a fixture | fixed: comment in the test | `capi_hostcall_test.zig` |
+| antigravity 3: `FastBit.trace_owned` unused | fixed: now used by `assertTraceBitsInSync`; its doc comment corrected | `trace.zig` |
+| antigravity 4: ReleaseFast test run vs `capi-smoke` hang | documented in the status; the hang itself is in TODO.md | Implementation status |
+
+### H1 implementation review, round 2 (2026-10-03)
+
+The reviews are `codex-h1-r2.md` (CHANGES REQUESTED) and
+`antigravity-h1-r2.md` (APPROVE). Codex confirmed round-1 findings 2–5
+resolved; antigravity confirmed all round-1 findings resolved.
+
+| finding | status | where |
+|---|---|---|
+| codex 1: closures and anchors identified by proto name only | fixed: protos render by a first-seen ordinal shared across the snapshot (`Proto.id` is unique only per chunk, so it can't serve), with name and id on first sight; closures, anchors and `frame0` all go through it. The self-test swaps two anonymous closures sharing an upvalue and requires the text to change | `capi_hostcall_test.zig` |
+| codex 2: recording constants counted, not compared | fixed: every constant renders through `Dump.val`. The self-test opens a real recording, requires a nonempty pool, changes one constant and requires the text to change | `capi_hostcall_test.zig` |
+| codex 3: grids rendered from `0..asize`; row views lose their parent | fixed: grid-aware rendering of every logical row `1..rows` and every cell, without mutating; row views render as their parent grid plus row number. The self-test builds a grid with `fusedStore`, requires a cell change to change the text, and renders a row view; the fresh-tables scenario requires its first `gridpeek` to observe the grid mid-call | `capi_hostcall_test.zig` |
+| codex 4: §6.1/§6.2 still claim record/replay legs run | fixed: both say the three tiers run and the record/replay legs wait on the embedding | §6.1, §6.2 |
+| antigravity 1 (nit): parenthesise the mask in `assertTraceBitsInSync` | fixed | `trace.zig` |
+
+Met while fixing codex 3: by doc 14's gate (`Vm.indexGet`), any bare
+outer `g[i]` on a grid deflates it back into row tables first, and does
+so identically on both legs. The `gridpeek` fixture therefore peeks
+before any such read; the later peeks compare the deflated tables.
+
+### H1 implementation review, round 3 (2026-10-03)
+
+`codex-h1-r3.md` and `antigravity-h1-r3.md`: both **APPROVE**, no
+findings. Each verified every round-2 finding resolved in the code and
+reran the filtered gate and `just test`.

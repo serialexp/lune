@@ -89,7 +89,7 @@ fn replayProbe(gpa: std.mem.Allocator, source: [:0]const u8, stop_after: u64) !R
     var sink_buf: [1024]u8 = undefined;
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
-    vm.suspend_ctl = .{ .after_safepoints = stop_after };
+    vm.setSuspendCtl(.{ .after_safepoints = stop_after });
 
     var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
@@ -134,7 +134,7 @@ fn recordSafepointLines(gpa: std.mem.Allocator, source: [:0]const u8) ![]u32 {
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
     vm.source = source;
-    vm.record_safepoint_lines = true;
+    vm.setRecordSafepointLines(true);
 
     var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
@@ -250,7 +250,7 @@ test "replay: backtraceFrames reports a deepest-first chain at a suspend inside 
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
     // Suspend the first time we are at least 3 frames deep (main → outer → inner).
-    vm.suspend_ctl = .{ .min_depth = 3, .after_safepoints = 0 };
+    vm.setSuspendCtl(.{ .min_depth = 3, .after_safepoints = 0 });
 
     var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
@@ -291,7 +291,7 @@ test "top-level re-entry on a suspended (dirty) VM fails closed (doc 17 H-3 / 9-
     var sink_buf: [256]u8 = undefined;
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
-    vm.suspend_ctl = .{ .min_depth = 3, .after_safepoints = 0 };
+    vm.setSuspendCtl(.{ .min_depth = 3, .after_safepoints = 0 });
 
     var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
@@ -320,7 +320,7 @@ test "top-level re-entry on a suspended (dirty) VM fails closed (doc 17 H-3 / 9-
 
     // The suspended epoch is still intact and resumes normally to completion
     // (clear the trigger first, else it re-suspends at the same depth).
-    vm.suspend_ctl = null;
+    vm.setSuspendCtl(null);
     switch (try vm.exec()) {
         .finished => {},
         .suspended => return error.TestUnexpectedResult,

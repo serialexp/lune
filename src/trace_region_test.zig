@@ -148,7 +148,7 @@ test "A-ii.3 rec_path: recordInstr captures {proto_id, pc−1}; reset clears (re
     const proto = Proto{ .code = &code, .id = 42, .name = "t", .num_registers = 2 };
     var regs = [_]Value{ Value.int(0), Value.int(0) };
 
-    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
     // Two safe guest ops (load_int: define a reg from an immediate, no guard, no abort)
     // recorded at post-increment pcs 3 and 4 → source_pc 2 and 3.
     state.recordInstr(Instr.opAx(.load_int, 0, 1), winRO(&regs), &proto, 3, Value.nil());
@@ -159,7 +159,7 @@ test "A-ii.3 rec_path: recordInstr captures {proto_id, pc−1}; reset clears (re
     try testing.expectEqual(ProgramPoint{ .proto_id = 42, .source_pc = 3 }, state.rec.rec_path.items[1]);
 
     // Re-record stability: a fresh reset clears the path and re-arms availability.
-    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
     try testing.expectEqual(@as(usize, 0), state.rec.rec_path.items.len);
     try testing.expect(state.rec.rec_path_ok);
 }
@@ -194,7 +194,7 @@ test "A-ii.3 rec_path: a committed trace carries its recorded path (freed on des
     };
     try state.registry.cache.append(gpa, &inner);
 
-    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 2 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 2 }, proto.num_registers);
     state.rec.kind = .continuation;
     var regs = [_]Value{ Value.int(1), Value.int(10), Value.int(1), Value.nil() };
     state.recordInstr(Instr.opAx(.for_prep, 0, 2), winRO(&regs), &proto, 5, Value.nil());

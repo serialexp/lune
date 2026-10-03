@@ -181,7 +181,7 @@ pub fn maybeArmContinuation(self: *TraceState, failed: *const Trace, exit_instr:
         return;
     }
     self.dbg("cont-arm: pending at pc={d} (inner anchor {d})", .{ cont_pc, failed.code.anchor.pc });
-    self.pending_exit_anchor = key;
+    self.setPendingExitAnchor(key);
 }
 
 /// Doc 56 §4.3 moved this gate to `trace_exit_attach`, which exit
@@ -199,12 +199,12 @@ pub fn maybeStartContinuation(self: *TraceState, proto: *const Proto, cur_pc: u3
     if (self.rec.active) return; // never clobber an in-flight recording
     if (key.proto != proto or key.pc != cur_pc) return;
     const src = self.pending_exit_src;
-    self.pending_exit_anchor = null;
+    self.setPendingExitAnchor(null);
     self.pending_exit_src = null;
     // Doc 31 D1 (review B3): final eligibility check at the actual start —
     // the request may have been gated between creation and activation.
     if (self.recordingBarred(key)) return;
-    self.rec.start(self.gpa, key, proto.num_registers, self.config.debug_log) catch return;
+    if (!self.startRecording(key, proto.num_registers)) return;
     // Doc 43 P0a: seed the anchor's absolute slab base (same as armWithPolicy).
     // Missing this left `anchor_abs_base = 0`, making the open-upvalue aliasing
     // guard fire on ALL open upvalues regardless of frame depth.
@@ -244,7 +244,7 @@ pub fn maybeArmExitSide(self: *TraceState, parent: *const Trace, exit_instr: u32
         self.dbg("exit-side: trace={d} exit={d} record at pc={d} refused: {s}", .{ parent.id, exit_instr, p, why });
         return false;
     }
-    self.pending_exit_anchor = key;
+    self.setPendingExitAnchor(key);
     self.pending_exit_src = .{ .trace_id = parent.id, .exit_instr = exit_instr };
     // Doc 56 round 5: hand the recorder the exit frame's slab base here, at
     // the arm, rather than trusting the back-edge stash. Today they agree
@@ -294,12 +294,12 @@ pub fn maybeStartReplaySide(self: *TraceState, proto: *const Proto, cur_pc: u32)
     if (self.rec.active) return; // never clobber an in-flight recording
     if (key.proto != proto or key.pc != cur_pc) return;
     const src = self.pending_replay_src;
-    self.pending_replay_anchor = null;
+    self.setPendingReplayAnchor(null);
     self.pending_replay_src = null;
     // Doc 31 D1 (review B3): final eligibility check at the actual start —
     // the request may have been gated between creation and activation.
     if (self.recordingBarred(key)) return;
-    self.rec.start(self.gpa, key, proto.num_registers, self.config.debug_log) catch return;
+    if (!self.startRecording(key, proto.num_registers)) return;
     // Doc 43 P0a: seed the anchor's absolute slab base (same as armWithPolicy).
     self.rec.anchor_abs_base = self.pending_anchor_base;
     self.rec.kind = .side;
@@ -311,9 +311,9 @@ pub fn maybeStartReplaySide(self: *TraceState, proto: *const Proto, cur_pc: u32)
 /// can consume them (error, suspension, or frame unwind), so the VM cannot stay
 /// pinned in `.full` mode behind a stale pending anchor.
 pub fn clearPendingExitAnchor(self: *TraceState) void {
-    self.pending_exit_anchor = null;
+    self.setPendingExitAnchor(null);
     self.pending_exit_src = null;
-    self.pending_replay_anchor = null;
+    self.setPendingReplayAnchor(null);
     self.pending_replay_src = null;
 }
 
@@ -2640,15 +2640,17 @@ pub fn clearCache(self: *TraceState) void {
     self.head_want_src = null;
     self.wants_prime_side = null;
     self.prime_want_src = null;
-    self.pending_exit_anchor = null;
+    // Through the setters: the trace-owned `fast_block` bits follow their
+    // fields, and the VM bits (`FastBit.vm_*`) are left as they are.
+    self.setPendingExitAnchor(null);
     self.pending_exit_src = null;
-    self.pending_replay_anchor = null;
+    self.setPendingReplayAnchor(null);
     self.pending_replay_src = null;
     // B1' (task 27): frame-link arm requests are trace-id-keyed; ids are
     // monotonic across epochs (so a stale key can only resolve to null), but
     // a cleared cache must not carry cross-epoch arm policy either way.
-    self.pending_ret_cont_arm = null;
-    self.pending_call_head_arm = null;
+    self.setPendingRetContArm(null);
+    self.setPendingCallHeadArm(null);
 
     // Trace-index-keyed and `*Proto`-borrowing diagnostic state — unsafe to retain
     // across the boundary (docs/design/17 H-2 part 3):

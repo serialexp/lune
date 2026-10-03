@@ -2,6 +2,15 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## `capi-smoke` hangs under `zig build test -Doptimize=ReleaseFast` (noted 2026-10-03)
+
+- [ ] **`tests/capi_smoke.c` puts every API call inside `assert(...)`** (30
+      sites). Zig compiles C with `-DNDEBUG` in release modes, so the calls
+      vanish: the `mh_table_iter_next` loop never advances and spins
+      forever (found while running doc 60 H1's tests in ReleaseFast; the
+      Debug gate never sees it). Fix: a `CHECK(expr)` macro that always
+      evaluates, or `-UNDEBUG` on the smoke module in `build.zig:147`.
+
 ## libmahina.a replaces the host's memset/memcpy with byte loops (noted 2026-10-02)
 
 - [x] **`capi_lib.bundle_compiler_rt = true` (build.zig, doc 59 E3) exports

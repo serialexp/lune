@@ -103,7 +103,7 @@ test "S-C: unicode_version survives a snapshot cut with no double-consume" {
 
     vm2.effect_mode = .replay;
     try vm2.effect_log.appendSlice(gpa, ref.log);
-    vm2.suspend_ctl = .{ .min_depth = 2, .after_safepoints = ref.safepoints / 2 };
+    vm2.setSuspendCtl(.{ .min_depth = 2, .after_safepoints = ref.safepoints / 2 });
     try testing.expect((try vm2.start(chunk2.proto)) == .suspended);
 
     const out_before = try gpa.dupe(u8, sink2.buffered());
@@ -131,7 +131,7 @@ test "S-C: unicode_version survives a snapshot cut with no double-consume" {
     vm_r.effect_mode = .replay;
     try vm_r.effect_log.appendSlice(gpa, ref.log);
     vm_r.effect_cursor = cursor_at_cut;
-    vm_r.suspend_ctl = null;
+    vm_r.setSuspendCtl(null);
     // If the derivation were wrong, the post-cut upper() would try to consume a
     // second effect and fault (log exhausted); instead it finishes cleanly.
     try testing.expect((try vm_r.exec()) == .finished);

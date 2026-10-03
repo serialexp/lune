@@ -449,7 +449,7 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
     vm.source = src0;
     // Pure tier-0: trace recording/execution stays off (the default), so each
     // instruction is one safepoint — matching `Result.safepoint_count`.
-    vm.suspend_ctl = .{ .after_safepoints = @min(@as(u64, stop_after), safepoint_cap) };
+    vm.setSuspendCtl(.{ .after_safepoints = @min(@as(u64, stop_after), safepoint_cap) });
 
     var chunk = mahina.compiler.compileWithOptions(gpa, vm.heap, src0, tree.root, &diags, .{
         .known_globals = &mahina.interp.builtin_global_names,
@@ -708,10 +708,10 @@ fn buildReplayIndexInner(res: *Result, proto: *const mahina.bytecode.Proto, src0
     vm.effect_mode = .replay;
     try vm.effect_log.appendSlice(gpa, effects);
     vm.source = src0;
-    vm.record_safepoint_lines = true;
+    vm.setRecordSafepointLines(true);
     // Arm a suspend at the cap: if the program needs more safepoints than the cap,
     // we stop there (capped) instead of building an unbounded index.
-    vm.suspend_ctl = .{ .after_safepoints = safepoint_cap };
+    vm.setSuspendCtl(.{ .after_safepoints = safepoint_cap });
 
     const outcome = try vm.start(proto);
     res.safepoint_capped = if (outcome == .suspended) 1 else 0;

@@ -49,6 +49,26 @@ Fairness choices mirror each other: both hosts keep the callee/table/key
 rooted and reused (no per-iteration global lookup or string re-intern), both
 use the protected call path, both use metamethod-aware table access.
 
+## Per-shape host-call probe (`hostcall_probe.c`)
+
+The `call` row above is one shape, `id(1)`. `hostcall_probe.c` measures
+`mh_call` per **call shape** (0/1/4/8/9 arguments, 0/1/4 results, heap
+values, varargs, a 40-register window, result-park overflow; the list is
+in the file header). It is the doc 60 §5.3 ledger instrument, run under
+`perf stat`. It is not part of `run.py`. Build it against the same
+ReleaseFast prefix:
+
+```sh
+python3 bench/embed/run.py --reps 1 --no-lua54 --no-luajit   # builds .cache/mahina-prefix
+P=bench/embed/.cache/mahina-prefix
+cc -O2 bench/embed/hostcall_probe.c -I$P/include $P/lib/libmahina.a -lm -o /tmp/hostcall_probe
+MH_NOJIT=1 perf stat -e instructions:u,cycles:u /tmp/hostcall_probe a1 2000000
+MH_NOJIT=1 perf stat -e instructions:u,cycles:u /tmp/hostcall_probe a1 0   # setup, to subtract
+```
+
+Per-call cost is the difference between the two runs, divided by the
+iteration count. Numbers are informational, never a gate.
+
 ## Reading the numbers (snapshot, 2026-10-01, Bart's home machine)
 
 ```

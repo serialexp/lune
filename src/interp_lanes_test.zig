@@ -251,7 +251,7 @@ fn runOuterCycle(gpa: std.mem.Allocator, window_open: bool) !OuterCycleRun {
     vm.trace.config.native_codegen = true;
     vm.trace.config.hotloop = 4;
     vm.trace.config.hotguard = 3; // close the cross-anchor cycle inside a short run
-    vm.record_safepoint_lines = window_open;
+    vm.setRecordSafepointLines(window_open);
 
     var chunk = try compiler.compile(gpa, vm.heap, aviii_outer_cycle_source, tree.root, &diags);
     defer chunk.deinit();
@@ -366,7 +366,7 @@ fn aviiiProbe(ctx: *anyopaque, args: []const Value) anyerror!Value {
         m.native_entries_at_open = vm.trace.native_entries;
         m.opened = true;
         // THE EVENT: open the observation window over a live armed registry.
-        vm.record_safepoint_lines = true;
+        vm.setRecordSafepointLines(true);
         return Value.nil();
     }
     m.post_calls += 1;

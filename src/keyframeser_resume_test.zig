@@ -82,7 +82,7 @@ fn expectResume(gpa: std.mem.Allocator, source: [:0]const u8, ctl: SuspendCtl, r
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
-    vm.suspend_ctl = ctl;
+    vm.setSuspendCtl(ctl);
     try testing.expect((try vm.start(chunk.proto)) == .suspended); // (a)
     const out_before = try gpa.dupe(u8, sink.buffered());
     defer gpa.free(out_before);
@@ -117,7 +117,7 @@ fn expectResume(gpa: std.mem.Allocator, source: [:0]const u8, ctl: SuspendCtl, r
     var buf_r: [512]u8 = undefined;
     var sink_r = io.Writer.fixed(&buf_r);
     vm_r.out = &sink_r;
-    vm_r.suspend_ctl = null;
+    vm_r.setSuspendCtl(null);
     try testing.expect((try vm_r.exec()) == .finished);
 
     // (c) output equivalence: out_before ++ out_after == F.
@@ -358,7 +358,7 @@ test "§R3: capture→restore→resume with tracing+opt+native — restored narr
 
     // Cut mid-way through the hot array loop: well after `a` and `m` exist,
     // well before the grid store loop (builds are ~75 of ~27k safepoints).
-    vm.suspend_ctl = .{ .min_depth = 1, .after_safepoints = ref.total_safepoints / 4 };
+    vm.setSuspendCtl(.{ .min_depth = 1, .after_safepoints = ref.total_safepoints / 4 });
     try testing.expect((try vm.start(chunk.proto)) == .suspended);
     const out_before = try gpa.dupe(u8, sink.buffered());
     defer gpa.free(out_before);
@@ -382,7 +382,7 @@ test "§R3: capture→restore→resume with tracing+opt+native — restored narr
     var buf_r: [64]u8 = undefined;
     var sink_r = io.Writer.fixed(&buf_r);
     vm_r.out = &sink_r;
-    vm_r.suspend_ctl = null;
+    vm_r.setSuspendCtl(null);
     try testing.expect((try vm_r.exec()) == .finished);
 
     // (a) output equivalence vs the uninterrupted tier-0 reference.
@@ -529,7 +529,7 @@ test "A-iii: recursive live frames re-key deterministically across keyframe rest
     const prior_next = vm.next_call_seq;
     try testing.expect(prior_next > 0);
 
-    vm.suspend_ctl = .{ .min_depth = 5, .after_safepoints = 0 };
+    vm.setSuspendCtl(.{ .min_depth = 5, .after_safepoints = 0 });
     try testing.expect((try vm.start(chunk.proto)) == .suspended);
     try testing.expect(vm.depth >= 5);
     try testing.expectEqual(prior_next + vm.depth, vm.next_call_seq);

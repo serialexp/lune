@@ -133,7 +133,7 @@ test "F2d: restore a mid-run keyframe + replay its effect log → identical forw
 
     vm2.effect_mode = .replay;
     try vm2.effect_log.appendSlice(gpa, ref.log);
-    vm2.suspend_ctl = .{ .min_depth = 2, .after_safepoints = ref.safepoints / 2 };
+    vm2.setSuspendCtl(.{ .min_depth = 2, .after_safepoints = ref.safepoints / 2 });
     try testing.expect((try vm2.start(chunk2.proto)) == .suspended);
 
     const out_before = try gpa.dupe(u8, sink2.buffered());
@@ -157,7 +157,7 @@ test "F2d: restore a mid-run keyframe + replay its effect log → identical forw
     vm_r.effect_mode = .replay;
     try vm_r.effect_log.appendSlice(gpa, ref.log);
     vm_r.effect_cursor = cursor_at_cut;
-    vm_r.suspend_ctl = null;
+    vm_r.setSuspendCtl(null);
     try testing.expect((try vm_r.exec()) == .finished);
 
     // out_before ++ out_after == F: the restored run consumed the tail of L from the
@@ -212,11 +212,11 @@ fn captureNativeF2cCut(gpa: std.mem.Allocator, source: [:0]const u8, native: boo
     vm.trace.config.native_codegen = native;
     vm.trace.config.coverage = native;
     vm.trace.config.hotloop = 4;
-    vm.suspend_ctl = .{
+    vm.setSuspendCtl(.{
         .min_depth = 2,
         .after_safepoints = 0,
         .after_committed_effects = 1,
-    };
+    });
 
     var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
@@ -302,7 +302,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
     cut_vm.trace.config.native_codegen = true;
     cut_vm.trace.config.coverage = true;
     cut_vm.trace.config.hotloop = 4;
-    cut_vm.suspend_ctl = .{ .min_depth = 2, .after_committed_effects = 1 };
+    cut_vm.setSuspendCtl(.{ .min_depth = 2, .after_committed_effects = 1 });
     var chunk = try mahina_compiler.compile(gpa, cut_vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
@@ -334,7 +334,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
     var resumed_out_buf: [512]u8 = undefined;
     var resumed_sink = io.Writer.fixed(&resumed_out_buf);
     resumed.out = &resumed_sink;
-    resumed.suspend_ctl = null;
+    resumed.setSuspendCtl(null);
     try testing.expect((try resumed.exec()) == .finished);
 
     // Uninterrupted tier-0 reference with the same deterministic clock.

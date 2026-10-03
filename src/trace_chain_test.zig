@@ -1028,7 +1028,7 @@ test "noteRetContTransition (B1', task 27): a hot owner displaces a stale reques
     };
     // A stale request from another (retired/unsatisfiable) parent occupies
     // the single slot. Pre-B1' the early `!= null` return froze it forever.
-    state.pending_ret_cont_arm = .{ .trace_id = 99, .exit_instr = 3 };
+    state.setPendingRetContArm(.{ .trace_id = 99, .exit_instr = 3 });
 
     // The owner's per-pc watch accumulates INDEPENDENTLY of the slot...
     state.noteRetContTransition(&owner, 5);
@@ -1050,8 +1050,8 @@ test "clearCache (B1', task 27): pending frame-link arm requests do not survive 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    state.pending_ret_cont_arm = .{ .trace_id = 1, .exit_instr = 2 };
-    state.pending_call_head_arm = .{ .trace_id = 3, .exit_instr = 4 };
+    state.setPendingRetContArm(.{ .trace_id = 1, .exit_instr = 2 });
+    state.setPendingCallHeadArm(.{ .trace_id = 3, .exit_instr = 4 });
     state.clearCache();
     try testing.expectEqual(@as(?ExitKey, null), state.pending_ret_cont_arm);
     try testing.expectEqual(@as(?ExitKey, null), state.pending_call_head_arm);

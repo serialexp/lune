@@ -1064,7 +1064,7 @@ test "doc 31: an aborted root recording retries after the record cooldown despit
 
     // Simulate the abort's observable effect: the recording dies and the
     // anchor is record-gated (`abort()` → `gateRecordAnchor(.record_abort)`).
-    state.rec.active = false;
+    state.stopRecordingForTest();
     state.gateRecordAnchor(key, .record_abort);
 
     // While the record cooldown runs, back-edges do NOT re-arm...
@@ -1092,7 +1092,7 @@ test "doc 31: a pending continuation/replay-side request gated after creation is
     // Continuation request created, then the anchor is gated before tier-0
     // reaches it: the request is consumed but no recording starts (doc 31
     // §3, review B3 — final eligibility check at `rec.reset` time).
-    state.pending_exit_anchor = key;
+    state.setPendingExitAnchor(key);
     state.gateAnchor(key, .legacy_thrash);
     state.maybeStartContinuation(&proto, 4);
     try testing.expect(!state.isRecording());
@@ -1101,7 +1101,7 @@ test "doc 31: a pending continuation/replay-side request gated after creation is
     // Same for the replay-side path, with a RECORD gate this time — both
     // maps bar recording starts.
     _ = state.gate.remove(key);
-    state.pending_replay_anchor = key;
+    state.setPendingReplayAnchor(key);
     state.gateRecordAnchor(key, .record_abort);
     state.maybeStartReplaySide(&proto, 4);
     try testing.expect(!state.isRecording());
@@ -1110,7 +1110,7 @@ test "doc 31: a pending continuation/replay-side request gated after creation is
     // Control: with both gates clear the same request DOES start a recording
     // — the decline above was the gate, not the plumbing.
     _ = state.record_gate.remove(key);
-    state.pending_exit_anchor = key;
+    state.setPendingExitAnchor(key);
     state.maybeStartContinuation(&proto, 4);
     try testing.expect(state.isRecording());
 }

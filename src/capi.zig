@@ -689,7 +689,78 @@ fn resultsSlice(results: ?[*]mh_value, max: usize) []Value {
 // call-in
 // ---------------------------------------------------------------------------
 
+/// Doc 60 §4.1 layer 1: the public checks, then a tail call into the entry
+/// with the identical signature — H1 (`hostcallSlow`) today; on targets
+/// with a hand-written entry (H3) that entry, which falls back to H1 itself.
+/// `always_tail` is deliberate: if the toolchain cannot tail-call this
+/// seven-parameter C-ABI shape it is a compile error, never a silent extra
+/// frame (doc 60 Q11).
 pub export fn mh_call(vm: ?*VmBox, callee: mh_value, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: ?*usize) mh_status {
+    const box = vm orelse return .err_api;
+    const nres = nresults orelse return .err_api;
+    nres.* = 0;
+    if (checkFatal(box)) |s| return s;
+    // A null buffer already meant "no results" (`resultsSlice`); normalizing
+    // here means no inner layer sees a null `results` with a nonzero length.
+    const max = if (results == null) 0 else max_results;
+    return @call(.always_tail, hostcallSlow, .{ box, callee, args, nargs, results, max, nres });
+}
+
+/// Doc 60 H1: the minimal-work host call, in Zig — the reference entry, the
+/// fallback for every pre-commit rejection of a hand-written entry, and the
+/// whole path on targets without one. Narrow contract (established by
+/// `mh_call`): `vm`/`nresults` non-null, VM not fatal, `*nresults == 0`,
+/// `results` non-null whenever `max_results > 0`. Closure callees take the
+/// dedicated push + `runPushedFrame` path; natives, `__call` targets and
+/// type errors keep going through `callValue` (`runProtected`) unchanged.
+fn hostcallSlow(vm: ?*VmBox, callee: mh_value, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: ?*usize) callconv(.c) mh_status {
+    const box = vm.?;
+    const nres = nresults.?;
+    // Doc 60 §5.4 check site 3: every H1 entry, whatever routed it here.
+    if (std.debug.runtime_safety) std.debug.assert(box.vm.trace.fast_block == box.vm.fastBlockReference());
+    std.debug.assert(nres.* == 0 and !box.fatal and (max_results == 0 or results != null));
+    const cv = fromC(callee) orelse return badValue(box);
+    const cargs = argsSlice(box, args, nargs) orelse return badValue(box);
+    // Doc 59 §3.3: clear-then-re-park — the incoming values may live only in
+    // the (just-cleared) park, so root them again before anything collects.
+    parkClearIfIdle(box);
+    if (park(box, cv) != .ok) return .err_oom;
+    for (cargs) |*a| if (park(box, Value.loadWords(a)) != .ok) return .err_oom;
+    const out = resultsSlice(results, max_results);
+    if (cv.isHeap() and cv.heapType() == .function)
+        return callClosure(box, function.Closure.fromHeader(cv.asHeap()), cargs, out, nres);
+    return runProtected(box, cv, cargs, out, nres);
+}
+
+/// Doc 60 H1 closure path: `callValue`'s closure arm without its generic
+/// dispatch, wrapped like `runProtected` — push, run, copy out, restore,
+/// park results. The observable contract (results, parks, errors, VM state)
+/// is `runProtected`'s; the stage-1 differential tests hold it to that.
+inline fn callClosure(box: *VmBox, cl: *const function.Closure, args: []const Value, results: []Value, nres: *usize) mh_status {
+    const vm = &box.vm;
+    const entry_depth = vm.depth;
+    const entry_top = vm.stack_top;
+    const base = vm.pushHostCall(cl, args) catch |e| return guestFault(box, entry_depth, entry_top, e);
+    const fr = vm.runPushedFrame(entry_depth, base) catch |e| return guestFault(box, entry_depth, entry_top, e);
+    std.debug.assert(vm.pending_error == null);
+    // The boundary frame is popped but `stack_top` still covers its window,
+    // so the result registers are live and rooted: copy out, then shrink.
+    const src = base + fr.reg;
+    const produced = @min(@as(usize, fr.count), results.len);
+    // Whole-word stores: the C side reads `results` as 8-byte words.
+    for (results[0..produced], 0..) |*r, k| Value.storeWords(r, vm.regGet(src + k));
+    vm.stack_top = entry_top;
+    for (results[0..produced]) |*r| {
+        if (park(box, Value.loadWords(r)) != .ok) return .err_oom;
+    }
+    nres.* = produced;
+    return .ok;
+}
+
+/// Doc 60 §6.1 stage 1: the pre-H1 `mh_call`, kept verbatim as the
+/// differential tests' reference leg (`mh_call` → `callValue` for every
+/// callee). Not exported and not called by the library.
+pub fn hostcallReference(vm: ?*VmBox, callee: mh_value, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: ?*usize) mh_status {
     const box = vm orelse return .err_api;
     const nres = nresults orelse return .err_api;
     nres.* = 0;
@@ -1268,4 +1339,5 @@ pub export fn mh_table_iter_free(vm: ?*VmBox, iter: ?*IterBox) mh_status {
 
 test {
     _ = @import("capi_test.zig");
+    _ = @import("capi_hostcall_test.zig");
 }

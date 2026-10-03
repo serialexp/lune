@@ -1630,6 +1630,17 @@ pub const TraceState = struct {
     /// as `pending_call_anchor` above, with the same self-cleaning consumer
     /// (`maybeStartCont` clears on the FIRST prologue, match or mismatch).
     pending_ret_anchor: ?PendingRetAnchor = null,
+    /// **Doc 60 §5.4 — the packed fast-path word.** One bit per condition that
+    /// keeps tier-0 out of `.fast` dispatch (`FastBit`); zero means fast
+    /// dispatch is allowed, so `Vm.runFastPath` and the host-call entry test
+    /// one `u16` instead of nine scattered fields. Seven bits mirror state this
+    /// struct owns (`isRecording()` + the six pending fields above) and are
+    /// written only by the `setPending*` setters and `syncRecordingBit`; the
+    /// two VM bits are written by `Vm`'s setters and survive `clearCache`.
+    /// Always updated as a whole-word read-modify-write: a byte store followed
+    /// by this 16-bit load would not store-forward (doc 59). Debug builds check
+    /// it bit-for-bit against `Vm.fastBlockReference()`.
+    fast_block: u16 = 0,
     /// Per-trace execution logs for the visualizer (`execlog.zig`), populated only
     /// when `config.record_exec_log`. Keyed by `trace_id` (cache index). Empty and
     /// untouched on the normal JIT path.
@@ -1894,11 +1905,11 @@ pub const TraceState = struct {
         const req: ExitKey = .{ .trace_id = owner.id, .exit_instr = resume_pc };
         if (self.pending_ret_cont_arm) |cur| {
             if (cur.trace_id != req.trace_id or cur.exit_instr != req.exit_instr) {
-                self.pending_ret_cont_arm = req;
+                self.setPendingRetContArm(req);
                 self.dbg("ret-cont arm request DISPLACED: old t={d} ei={d} -> parent t={d} resume={d}", .{ cur.trace_id, cur.exit_instr, owner.id, resume_pc });
             }
         } else {
-            self.pending_ret_cont_arm = req;
+            self.setPendingRetContArm(req);
             self.dbg("ret-cont arm request: parent t={d} resume={d}", .{ owner.id, resume_pc });
         }
     }
@@ -1910,21 +1921,21 @@ pub const TraceState = struct {
                 if (child.code.anchor.proto == parent.code.anchor.proto and
                     child.code.anchor.pc == contAnchorPc(key.exit_instr))
                 {
-                    self.pending_ret_cont_arm = null;
+                    self.setPendingRetContArm(null);
                     if (self.armNativeLink(parent, key.exit_instr, child, .ret_cont) catch false)
                         self.ret_cont_link_arms +|= 1;
                 }
-            } else self.pending_ret_cont_arm = null;
+            } else self.setPendingRetContArm(null);
         }
         if (self.pending_call_head_arm) |key| {
             if (self.traceById(key.trace_id)) |parent| {
                 if (child.code.anchor.proto == parent.code.anchor.proto and anchorKind(child.code.anchor.pc) == .head) {
-                    self.pending_call_head_arm = null;
+                    self.setPendingCallHeadArm(null);
                     if (self.armNativeLink(parent, key.exit_instr, child, .call_head) catch false) {
                         self.call_head_link_arms +|= 1;
                     } else self.dbg("call-head arm FAILED: parent t={d} exit={d} child t={d}", .{ parent.id, key.exit_instr, child.id });
                 }
-            } else self.pending_call_head_arm = null;
+            } else self.setPendingCallHeadArm(null);
         }
     }
 
@@ -3004,6 +3015,124 @@ pub const TraceState = struct {
         return self.rec.active;
     }
 
+    /// Bit assignment of `fast_block` (doc 60 §5.4).
+    pub const FastBit = struct {
+        pub const recording: u16 = 1 << 0;
+        pub const exit_anchor: u16 = 1 << 1;
+        pub const replay_anchor: u16 = 1 << 2;
+        pub const call_anchor: u16 = 1 << 3;
+        pub const ret_anchor: u16 = 1 << 4;
+        pub const ret_cont_arm: u16 = 1 << 5;
+        pub const call_head_arm: u16 = 1 << 6;
+        /// The seven bits `TraceState` owns (the rest are `Vm`'s), as
+        /// `assertTraceBitsInSync` compares them against `traceFastBits()`.
+        pub const trace_owned: u16 = (1 << 7) - 1;
+        pub const vm_suspend: u16 = 1 << 7;
+        pub const vm_safepoint_lines: u16 = 1 << 8;
+    };
+
+    /// Set or clear one `fast_block` bit as a whole-word read-modify-write.
+    /// The store goes through a `volatile` pointer because a plain one is not
+    /// enough: LLVM narrows `w & ~bit` / `w | bit` on memory to a byte-wide
+    /// `andb`/`orb`, and the next entry's 16-bit load of the word then fails
+    /// store-forwarding (measured on the host-call path, doc 60 H1: the
+    /// per-call `clearPendingExitAnchor` byte store stalled the following
+    /// call's `runFastPath`). A volatile store is emitted at its declared
+    /// width; the load stays ordinary. An unchanged word is not stored at
+    /// all: most writes are clears of an already-clear bit (every finished
+    /// exec runs `clearPendingExitAnchor`), and skipping them keeps the next
+    /// entry's load off a store-to-load dependency.
+    pub inline fn setFastBit(self: *TraceState, bit: u16, on: bool) void {
+        const w = self.fast_block;
+        const nw = if (on) w | bit else w & ~bit;
+        if (nw == w) return;
+        const word: *volatile u16 = &self.fast_block;
+        word.* = nw;
+    }
+
+    /// The trace-owned bits recomputed from the fields they mirror.
+    pub fn traceFastBits(self: *const TraceState) u16 {
+        var w: u16 = 0;
+        if (self.rec.active) w |= FastBit.recording;
+        if (self.pending_exit_anchor != null) w |= FastBit.exit_anchor;
+        if (self.pending_replay_anchor != null) w |= FastBit.replay_anchor;
+        if (self.pending_call_anchor != null) w |= FastBit.call_anchor;
+        if (self.pending_ret_anchor != null) w |= FastBit.ret_anchor;
+        if (self.pending_ret_cont_arm != null) w |= FastBit.ret_cont_arm;
+        if (self.pending_call_head_arm != null) w |= FastBit.call_head_arm;
+        return w;
+    }
+
+    /// Re-read `rec.active` into its bit. Called after every `TraceState` call
+    /// into the recorder that can start or stop a recording (start, record,
+    /// close, finalize, abort) — `RecordingSession` itself stays unaware of
+    /// `fast_block`, so its standalone tests are untouched.
+    pub inline fn syncRecordingBit(self: *TraceState) void {
+        self.setFastBit(FastBit.recording, self.rec.active);
+    }
+
+    /// Debug: the trace-owned bits of `fast_block` equal the fields they
+    /// mirror. Checked at the recorder's lifecycle boundaries (start, every
+    /// recorded instruction, close, abort), so a missed sync trips at the
+    /// transition that caused it rather than at the next dispatch-mode pick,
+    /// which `runFastPath`'s whole-word check covers.
+    pub inline fn assertTraceBitsInSync(self: *const TraceState) void {
+        if (std.debug.runtime_safety) std.debug.assert((self.fast_block & FastBit.trace_owned) == self.traceFastBits());
+    }
+
+    // The six pending-field setters: payload and bit always written together.
+    pub inline fn setPendingExitAnchor(self: *TraceState, v: ?AnchorKey) void {
+        self.pending_exit_anchor = v;
+        self.setFastBit(FastBit.exit_anchor, v != null);
+    }
+    pub inline fn setPendingReplayAnchor(self: *TraceState, v: ?AnchorKey) void {
+        self.pending_replay_anchor = v;
+        self.setFastBit(FastBit.replay_anchor, v != null);
+    }
+    pub inline fn setPendingCallAnchor(self: *TraceState, v: ?PendingCallAnchor) void {
+        self.pending_call_anchor = v;
+        self.setFastBit(FastBit.call_anchor, v != null);
+    }
+    pub inline fn setPendingRetAnchor(self: *TraceState, v: ?PendingRetAnchor) void {
+        self.pending_ret_anchor = v;
+        self.setFastBit(FastBit.ret_anchor, v != null);
+    }
+    pub inline fn setPendingRetContArm(self: *TraceState, v: ?ExitKey) void {
+        self.pending_ret_cont_arm = v;
+        self.setFastBit(FastBit.ret_cont_arm, v != null);
+    }
+    pub inline fn setPendingCallHeadArm(self: *TraceState, v: ?ExitKey) void {
+        self.pending_call_head_arm = v;
+        self.setFastBit(FastBit.call_head_arm, v != null);
+    }
+
+    /// The single funnel for arming a recording from `TraceState` (root arm,
+    /// continuation, prime side): starts the session and syncs the recording
+    /// bit on both outcomes. False when the allocator declined the reset.
+    pub fn startRecording(self: *TraceState, key: AnchorKey, num_registers: u16) bool {
+        defer {
+            self.syncRecordingBit();
+            self.assertTraceBitsInSync();
+        }
+        self.rec.start(self.gpa, key, num_registers, self.config.debug_log) catch return false;
+        return true;
+    }
+
+    /// Test-only: start an owned recording directly (bypassing the arming
+    /// policy) and keep `fast_block` in sync — the replacement for poking
+    /// `rec.reset` from a test.
+    pub fn startRecordingForTest(self: *TraceState, gpa: std.mem.Allocator, anchor: AnchorKey, num_registers: u16) !void {
+        defer self.syncRecordingBit();
+        try self.rec.reset(gpa, anchor, num_registers);
+    }
+
+    /// Test-only: stop an owned recording directly (simulating an abort's
+    /// effect without its side effects) and keep `fast_block` in sync.
+    pub fn stopRecordingForTest(self: *TraceState) void {
+        self.rec.active = false;
+        self.syncRecordingBit();
+    }
+
     /// Doc 26 D1a: kill an active recording because an error is unwinding
     /// through the dispatch loop. Called from `Vm.execWith`'s errdefer — the
     /// raise is not part of the recorded IR, so a surviving recording would
@@ -3200,7 +3329,7 @@ pub const TraceState = struct {
         if (self.isRecording() or self.pending_replay_anchor != null or self.recordingBarred(key))
             return false;
         self.dbg("side-want-at-resume: arming replay-side recording at pc={d}", .{resume_pc});
-        self.pending_replay_anchor = key;
+        self.setPendingReplayAnchor(key);
         self.pending_replay_src = src;
         self.clearGuardFailures(key);
         return true;
@@ -3332,6 +3461,10 @@ pub const TraceState = struct {
         self.rec.options = .{ .maxrecord = self.config.maxrecord, .peel = self.config.peel, .instunroll = self.config.instunroll, .loopunroll = self.config.loopunroll, .optimize = self.config.optimize, .snapshot_budget = self.config.snapshot_budget };
     }
     pub fn recordInstr(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, resolved: Value) void {
+        // In sync on the way in (nothing between two recorded instructions
+        // may leave the word stale) and on the way out (self-abort, close).
+        self.assertTraceBitsInSync();
+        defer self.assertTraceBitsInSync();
         self.configureRecording();
         const target_i: i64 = @as(i64, pc) + instr.aux;
         // The loop header this instruction leads into, when it is one a
@@ -3358,6 +3491,7 @@ pub const TraceState = struct {
             self.rec.context.unroll_while = leaves >= self.config.lleave_fast_retries or fails < self.config.unroll_fail_flip;
         }
         self.rec.recordInstr(instr, regs, proto, pc, resolved);
+        self.syncRecordingBit();
         self.consumeRecordingAbort();
         if (self.rec.close_requested) self.closeTrace(regs);
     }
@@ -3413,7 +3547,7 @@ pub const TraceState = struct {
         gop.value_ptr.* +|= 1;
         if (gop.value_ptr.* < self.config.hotcall) return;
         gop.value_ptr.* = 0; // reset so a declined/aborted arm re-warms, the loop discipline
-        self.pending_call_anchor = .{ .proto = proto, .base = base, .call_seq = call_seq };
+        self.setPendingCallAnchor(.{ .proto = proto, .base = base, .call_seq = call_seq });
     }
 
     /// Doc 44 D8: deterministic head entry-patch recovery (see the call site
@@ -3470,7 +3604,7 @@ pub const TraceState = struct {
         gop.value_ptr.* +|= 1;
         if (gop.value_ptr.* < self.config.hotcall) return;
         gop.value_ptr.* = 0; // reset so a declined/aborted arm re-warms
-        self.pending_ret_anchor = .{ .proto = proto, .resume_pc = resume_pc, .base = base, .call_seq = call_seq };
+        self.setPendingRetAnchor(.{ .proto = proto, .resume_pc = resume_pc, .base = base, .call_seq = call_seq });
     }
 
     /// Doc 44 D12b: deterministic cont entry-patch recovery (`maybeRepatchHead`
@@ -3492,7 +3626,7 @@ pub const TraceState = struct {
     /// self-cleaning as the head consumer.
     pub fn maybeStartCont(self: *TraceState, proto: *const Proto, pc: u32, base: usize, call_seq: u64) bool {
         const pending = self.pending_ret_anchor orelse return false;
-        self.pending_ret_anchor = null; // consume-or-discard, never linger
+        self.setPendingRetAnchor(null); // consume-or-discard, never linger
         if (pending.proto != proto or pending.resume_pc != pc or pending.call_seq != call_seq or pending.base != base) return false;
         if (self.rec.active) return false;
         self.armWithPolicy(proto, contAnchorPc(pc), pending.force_ordinary);
@@ -3509,7 +3643,7 @@ pub const TraceState = struct {
     /// consume), and `call_seq` makes reuse impossible by construction.
     pub fn maybeStartHead(self: *TraceState, proto: *const Proto, pc: u32, base: usize, call_seq: u64) bool {
         const pending = self.pending_call_anchor orelse return false;
-        self.pending_call_anchor = null; // consume-or-discard, never linger
+        self.setPendingCallAnchor(null); // consume-or-discard, never linger
         if (pc != 0 or pending.proto != proto or pending.call_seq != call_seq or pending.base != base) return false;
         if (self.rec.active) return false;
         self.armWithPolicy(proto, FUNC_HEAD_PC, pending.force_ordinary);
@@ -3524,7 +3658,7 @@ pub const TraceState = struct {
     }
 
     fn armWithPolicy(self: *TraceState, proto: *const Proto, target_pc: u32, force_ordinary: bool) void {
-        self.rec.start(self.gpa, .{ .proto = proto, .pc = target_pc }, proto.num_registers, self.config.debug_log) catch return;
+        if (!self.startRecording(.{ .proto = proto, .pc = target_pc }, proto.num_registers)) return;
         self.dbg("rec-arm: pc={d} force_ordinary={}", .{ target_pc, force_ordinary });
         // Doc 43 §3.1 (P0a): seed the anchor's absolute slab base for the open-cell
         // aliasing check. `reset` zeroes it; the dispatch loop stashed `st.base`
@@ -3558,7 +3692,9 @@ pub const TraceState = struct {
     // pub for trace_recorder.zig (file-split pass)
     pub fn abort(self: *TraceState, reason: AbortReason) void {
         self.rec.abort(reason);
+        self.syncRecordingBit();
         self.consumeRecordingAbort();
+        self.assertTraceBitsInSync();
     }
     fn consumeRecordingAbort(self: *TraceState) void {
         const notice = self.rec.takeAbortNotice() orelse return;
@@ -3698,8 +3834,10 @@ pub const TraceState = struct {
     /// forward-flow arrival calls only `maybeCloseAtAnchor`).
     // pub for trace_recorder.zig (file-split pass)
     pub fn closeTrace(self: *TraceState, regs: RegWindow) void {
+        defer self.assertTraceBitsInSync(); // success, failed close, failed commit
         self.configureRecording();
         const ready = self.rec.close(regs);
+        self.syncRecordingBit();
         if (self.rec.takePeelNotice()) |notice| switch (notice) {
             .enter => |n| self.dbg("peel: enter anchor pc={d} marker ir={d}", .{ n.anchor_pc, n.marker }),
             .close => |n| self.dbg("peel: close anchor pc={d} body ir={d}..{d}", .{ n.anchor_pc, n.begin, n.end }),
@@ -3797,7 +3935,10 @@ pub const TraceState = struct {
     }
 
     fn commit(self: *TraceState) !void {
-        var candidate = try self.rec.finalize();
+        var candidate = r: {
+            defer self.syncRecordingBit();
+            break :r try self.rec.finalize();
+        };
         defer candidate.deinit(self.gpa);
         const t = try self.registry.allocate();
         errdefer self.registry.discardAllocation(t);

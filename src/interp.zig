@@ -17,6 +17,7 @@
 //! silently misbehaving.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const bytecode = @import("bytecode.zig");
 const arith = @import("arith.zig");
 const value = @import("value.zig");
@@ -339,7 +340,7 @@ pub const builtin_global_names = blk: {
 /// as two `u16` fields it was written half by half and then read back whole
 /// by the boundary (`callValue`'s `st.step` switch), a load that cannot be
 /// store-forwarded — the single biggest stall of an embedder call.
-const FrameResult = packed struct(u32) { reg: u16, count: u16 };
+pub const FrameResult = packed struct(u32) { reg: u16, count: u16 };
 
 /// Doc 21 Phase A: the top-level result span published at a genuine finish.
 /// `stack_top` is the (possibly B-6-raised) value the description is valid
@@ -661,6 +662,7 @@ pub const Vm = struct {
     safepoint_seq: u64 = 0,
     /// Mid-execution suspend trigger, or null (never suspend — the normal path).
     /// Armed by a test / future debugger to capture a resumable keyframe.
+    /// Write through `setSuspendCtl` only (it owns a `trace.fast_block` bit).
     suspend_ctl: ?SuspendCtl = null,
     /// Doc 21 Phase A (the H-5(i) fix): absolute description of the only live
     /// stack content after a genuine top-level finish — the returned result
@@ -728,6 +730,7 @@ pub const Vm = struct {
     /// When true, append the 1-based source line of each safepoint's pending
     /// instruction to `safepoint_lines` (the replay driver's line-grain index).
     /// Off by default so tier-0 pays nothing — the normal run path is untouched.
+    /// Write through `setRecordSafepointLines` only (it owns a `trace.fast_block` bit).
     record_safepoint_lines: bool = false,
     /// Line-per-safepoint index built when `record_safepoint_lines` is on:
     /// `safepoint_lines[k-1]` is the source line of the instruction pending at
@@ -803,6 +806,11 @@ pub const Vm = struct {
     parked_results: std.ArrayList(Value) = .empty,
     parked_inline: [6]Value = @splat(Value.nil()),
     parked_inline_len: u32 = 0,
+    /// Test builds only (doc 60 §6.1): when set, `runFastPath` decides from
+    /// the nine fields directly (`fastBlockReference`) instead of the packed
+    /// `trace.fast_block`, so a differential test's reference leg cannot share
+    /// a mask bug with the leg under test. `void` outside tests.
+    reference_dispatch: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
 
     /// A runtime-compiled chunk owned by the VM: the `Chunk` (whose arena owns the
     /// proto tree) and the NUL-terminated source the protos borrow.
@@ -2052,6 +2060,108 @@ pub const Vm = struct {
             self.trace.setRegionContext(new_depth, self.frames[new_depth - 1].call_seq);
     }
 
+    /// Lay out a host-entered closure's window at `stack_top`, bind `args`
+    /// exactly like the `.call` arm, and push its frame; returns the callee
+    /// base. Shared by `callValue`'s closure arm and the doc 60 H1 host-call
+    /// entry (`pushHostCall`). Fails, with nothing mutated, on the depth limit
+    /// or register capacity (`StackOverflow`).
+    /// Straight-line and allocation-free through the push (which raises
+    /// `stack_top`): no safepoint may intervene, so the args written above
+    /// `stack_top` are never seen unrooted by the collector.
+    inline fn bindAndPushClosure(self: *Vm, cl: *const Closure, args: []const Value) Error!usize {
+        const cp = cl.proto;
+        if (self.depth >= max_call_depth) return Error.StackOverflow;
+        if (!cp.is_vararg or args.len <= cp.num_params) {
+            // No surplus varargs ⇒ the separate arg region below the
+            // window is redundant: bind params straight into the callee
+            // window (one copy, not two — this is the common boundary
+            // crossing, and the double copy was ~30 instructions/call
+            // in the embedding callgrind profile). Surplus args to a
+            // non-vararg callee are simply dropped, exactly what the
+            // two-region layout did by never reading them.
+            const cb = self.stack_top;
+            if (cb + cp.num_registers > self.regCapacity()) return Error.StackOverflow;
+            const np = @min(cp.num_params, args.len);
+            for (args[0..np], 0..) |v, i| self.regSet(cb + i, v);
+            var i: usize = np;
+            while (i < cp.num_registers) : (i += 1) self.regSet(cb + i, Value.nil());
+            self.pushFrameTrusted(cl, cp.num_registers, cb, 0, 0, 0, 0);
+            return cb;
+        }
+        // Surplus varargs: args land in a region at `arg_base`; the callee
+        // window sits directly above. The surplus stays in the arg region
+        // (below the callee base), stable and — once the push raises
+        // `stack_top` — GC-rooted, exactly as the `.call` arm leaves them in
+        // the caller's window. Reserves `args.len + num_registers` slots.
+        const arg_base = self.stack_top;
+        const cb = arg_base + args.len;
+        if (cb + cp.num_registers > self.regCapacity()) return Error.StackOverflow;
+        for (args, 0..) |v, i| self.regSet(arg_base + i, v);
+        var i: usize = 0;
+        while (i < cp.num_registers) : (i += 1) {
+            self.regSet(cb + i, if (i < cp.num_params)
+                self.regGet(arg_base + i)
+            else
+                Value.nil());
+        }
+        const va_count: usize = args.len - cp.num_params;
+        const va_base: usize = arg_base + cp.num_params;
+        self.pushFrameTrusted(cl, cp.num_registers, cb, 0, 0, va_base, va_count);
+        return cb;
+    }
+
+    /// Doc 60 H1: the push half of a host call into a closure — everything
+    /// `callValue` does before it runs the frame, minus the generic callee
+    /// dispatch and the reentry increment (which `runPushedFrame` owns).
+    /// Same checks in the same order as `callValue` (the no-suspend
+    /// precondition, the `final_cut` clear, then the reentry limit, then depth
+    /// and capacity), so a rejection leaves the VM exactly as `callValue`
+    /// would. Returns the callee base.
+    /// `inline`: an out-of-line `Error!usize` comes back through memory as a
+    /// 2-byte error store plus an 8-byte payload store that the caller reads
+    /// as one 16-byte load — a store-forwarding stall on every call
+    /// (measured, doc 60 H1).
+    pub inline fn pushHostCall(self: *Vm, cl: *const Closure, args: []const Value) Error!usize {
+        std.debug.assert(!self.reg_top_pending);
+        // Before anything mutates, as in `callValue` (`runPushedFrame` keeps
+        // its own copy for the H3 entry, which pushes without this function).
+        std.debug.assert(self.suspend_ctl == null);
+        self.final_cut = null; // doc 21: host reentry reuses the stack
+        if (self.native_reentry_depth >= max_native_reentry) return Error.StackOverflow;
+        return self.bindAndPushClosure(cl, args);
+    }
+
+    /// Doc 60 §4.1: run the frame a host entry just pushed at
+    /// `frames[entry_depth]` (callee window at `base`) to its boundary return.
+    /// VM-owned, no C-API dependency: H1 calls it after `pushHostCall`, and
+    /// the H3 `.S` entry reaches it through `capi.mahina_hostcall_chain` after
+    /// its own push. It owns `native_reentry_depth` on both edges (the same
+    /// `defer` `callValue` uses), so callbacks during the run see the raised
+    /// count and the decrement lands before the caller's fault handling or
+    /// result parking. Dispatch is `execWithEntry`'s: `.fast` iff
+    /// `runFastPath()`, else `.full` through `execWith`, with its errdefers
+    /// (`abortRaised`, then `clearPendingExitAnchor`). On an error the frames
+    /// stay live for the caller's `describeFault`, as in `callValue`.
+    /// On success `depth == entry_depth` and `stack_top` is still raised over
+    /// the popped window, so the `FrameResult` registers are readable; the
+    /// caller copies them out and restores `stack_top`.
+    /// `inline` for the same reason as `pushHostCall`: its callers (H1's
+    /// `callClosure`, H3's chain function) each want it flattened, not an
+    /// extra frame passing an error union through memory.
+    pub inline fn runPushedFrame(self: *Vm, entry_depth: u32, base: usize) Error!FrameResult {
+        std.debug.assert(self.suspend_ctl == null);
+        std.debug.assert(self.depth == entry_depth + 1);
+        self.native_reentry_depth += 1;
+        defer self.native_reentry_depth -= 1;
+        self.final_cut = null;
+        const cl = self.frames[entry_depth].closure;
+        return switch (try self.execWithEntry(cl, cl.proto, base, entry_depth + 1)) {
+            .finished => |fr| fr,
+            // `suspend_ctl == null` (asserted above) ⇒ exec never suspends.
+            .suspended => unreachable,
+        };
+    }
+
     /// Call a mahina callable from native (host) code, run it to completion, write up
     /// to `results_out.len` results into `results_out`, and return the count
     /// actually written. `callee` must be a closure or native `Value` (else
@@ -2142,53 +2252,7 @@ pub const Vm = struct {
                 const cp = cl.proto;
                 const entry_depth = self.depth;
                 const saved_top = self.stack_top;
-                if (self.depth >= max_call_depth) return Error.StackOverflow;
-                // Args land in a fresh region at `arg_base`; the callee window sits
-                // directly above them. Surplus varargs stay in the arg region (below
-                // `callee_base`), stable and — once `pushFrame` raises `stack_top` —
-                // GC-rooted, exactly as the `.call` arm leaves them in the caller's
-                // window. Reserve `args.len + num_registers` slots.
-                // Straight-line, allocation-free up to `pushFrameVararg` (which
-                // raises `stack_top`): no safepoint may intervene, so the args we
-                // park above `stack_top` are never seen unrooted by the collector.
-                const callee_base = if (!cp.is_vararg or args.len <= cp.num_params) blk: {
-                    // No surplus varargs ⇒ the separate arg region below the
-                    // window is redundant: bind params straight into the callee
-                    // window (one copy, not two — this is the common boundary
-                    // crossing, and the double copy was ~30 instructions/call
-                    // in the embedding callgrind profile). Surplus args to a
-                    // non-vararg callee are simply dropped, exactly what the
-                    // two-region layout did by never reading them.
-                    const cb = self.stack_top;
-                    if (cb + cp.num_registers > self.regCapacity()) return Error.StackOverflow;
-                    const np = @min(cp.num_params, args.len);
-                    for (args[0..np], 0..) |v, i| self.regSet(cb + i, v);
-                    var i: usize = np;
-                    while (i < cp.num_registers) : (i += 1) self.regSet(cb + i, Value.nil());
-                    self.pushFrameTrusted(cl, cp.num_registers, cb, 0, 0, 0, 0);
-                    break :blk cb;
-                } else blk: {
-                    // Surplus varargs: args land in a region at `arg_base`; the
-                    // callee window sits directly above. The surplus stays in
-                    // the arg region (below `callee_base`), stable and — once
-                    // `pushFrameVararg` raises `stack_top` — GC-rooted, exactly
-                    // as the `.call` arm leaves them in the caller's window.
-                    const arg_base = self.stack_top;
-                    const cb = arg_base + args.len;
-                    if (cb + cp.num_registers > self.regCapacity()) return Error.StackOverflow;
-                    for (args, 0..) |v, i| self.regSet(arg_base + i, v);
-                    var i: usize = 0;
-                    while (i < cp.num_registers) : (i += 1) {
-                        self.regSet(cb + i, if (i < cp.num_params)
-                            self.regGet(arg_base + i)
-                        else
-                            Value.nil());
-                    }
-                    const va_count: usize = args.len - cp.num_params;
-                    const va_base: usize = arg_base + cp.num_params;
-                    self.pushFrameTrusted(cl, cp.num_registers, cb, 0, 0, va_base, va_count);
-                    break :blk cb;
-                };
+                const callee_base = try self.bindAndPushClosure(cl, args);
 
                 // No `errdefer` restore: a runtime error must leave `self.frames`
                 // live (depth raised) so the catching `pcall` can synthesize the
@@ -2472,7 +2536,7 @@ pub const Vm = struct {
     /// boundary crossing pays on every entry; nothing else differs — same
     /// errdefers, same exit handling, and a `.switch_mode` (or a non-fast VM
     /// state) falls through to the general `execWith` loop.
-    fn execWithEntry(self: *Vm, cl: *const Closure, cp: *const Proto, base: usize, stop_depth: u32) Error!ExecOutcome {
+    inline fn execWithEntry(self: *Vm, cl: *const Closure, cp: *const Proto, base: usize, stop_depth: u32) Error!ExecOutcome {
         errdefer self.trace.clearPendingExitAnchor();
         errdefer self.trace.abortRaised(); // guarded no-op when idle (doc 26 D1a)
         if (self.runFastPath()) {
@@ -2552,14 +2616,36 @@ pub const Vm = struct {
     /// final-iteration deopt-replay reaches the non-header anchor pc. The window is
     /// short — the hook consumes the pending anchor at the very next reach of that
     /// pc — after which `.fast` resumes.
+    ///
+    /// Doc 60 §5.4: the nine conditions are packed into `trace.fast_block`, so
+    /// this is one 16-bit load and compare. Debug builds check the word
+    /// bit-for-bit against `fastBlockReference` on every call.
     inline fn runFastPath(self: *const Vm) bool {
-        return !(self.suspend_ctl != null or self.record_safepoint_lines or
-            self.trace.isRecording() or self.trace.pending_exit_anchor != null or
-            self.trace.pending_replay_anchor != null or
-            self.trace.pending_call_anchor != null or
-            self.trace.pending_ret_anchor != null or
-            self.trace.pending_ret_cont_arm != null or
-            self.trace.pending_call_head_arm != null);
+        if (builtin.is_test and self.reference_dispatch) return self.fastBlockReference() == 0;
+        if (std.debug.runtime_safety) std.debug.assert(self.trace.fast_block == self.fastBlockReference());
+        return self.trace.fast_block == 0;
+    }
+
+    /// Doc 60 §5.4: the `fast_block` word recomputed from the nine fields it
+    /// mirrors — the reference the packed word is asserted against.
+    pub fn fastBlockReference(self: *const Vm) u16 {
+        const FastBit = trace.TraceState.FastBit;
+        var w = self.trace.traceFastBits();
+        if (self.suspend_ctl != null) w |= FastBit.vm_suspend;
+        if (self.record_safepoint_lines) w |= FastBit.vm_safepoint_lines;
+        return w;
+    }
+
+    /// Arm (or, with null, disarm) the mid-execution suspend trigger.
+    pub fn setSuspendCtl(self: *Vm, ctl: ?SuspendCtl) void {
+        self.suspend_ctl = ctl;
+        self.trace.setFastBit(trace.TraceState.FastBit.vm_suspend, ctl != null);
+    }
+
+    /// Turn the replay driver's per-safepoint line index on or off.
+    pub fn setRecordSafepointLines(self: *Vm, on: bool) void {
+        self.record_safepoint_lines = on;
+        self.trace.setFastBit(trace.TraceState.FastBit.vm_safepoint_lines, on);
     }
 
     // ------------------------------------------------------------------------
@@ -3492,12 +3578,12 @@ pub const Vm = struct {
                             const req: trace.ExitKey = .{ .trace_id = owner.id, .exit_instr = row.exit };
                             if (ts.pending_call_head_arm) |cur| {
                                 if (cur.trace_id != req.trace_id or cur.exit_instr != req.exit_instr) {
-                                    ts.pending_call_head_arm = req;
+                                    ts.setPendingCallHeadArm(req);
                                     ts.dbg("call-head arm request DISPLACED: old t={d} ei={d} -> parent t={d} anchor={d} exit={d}", .{ cur.trace_id, cur.exit_instr, owner.id, owner.code.anchor.pc, row.exit });
                                 }
                                 // Same key re-crossing: request already filed.
                             } else {
-                                ts.pending_call_head_arm = req;
+                                ts.setPendingCallHeadArm(req);
                                 ts.dbg("call-head arm request: parent t={d} anchor={d} exit={d}", .{ owner.id, owner.code.anchor.pc, row.exit });
                             }
                         }
@@ -4713,7 +4799,7 @@ pub const Vm = struct {
                         self.trace.pending_replay_anchor == null and
                         !self.trace.isGated(final.code.anchor))
                     {
-                        self.trace.pending_replay_anchor = final.code.anchor;
+                        self.trace.setPendingReplayAnchor(final.code.anchor);
                         // Hotexit provenance rides into the replay
                         // recording for the commit's DONE latch.
                         self.trace.pending_replay_src = self.trace.prime_want_src;
@@ -4987,20 +5073,20 @@ pub const Vm = struct {
                 // safe (§R6-1 order untouched).
                 self.trace.dbg("ordinary-probe transfer: arming forced-ordinary recording at anchor pc={d}", .{anchor_pc});
                 if (is_head) {
-                    self.trace.pending_call_anchor = .{
+                    self.trace.setPendingCallAnchor(.{
                         .proto = proto,
                         .base = base,
                         .call_seq = self.frames[self.depth - 1].call_seq,
                         .force_ordinary = true,
-                    };
+                    });
                 } else {
-                    self.trace.pending_ret_anchor = .{
+                    self.trace.setPendingRetAnchor(.{
                         .proto = proto,
                         .resume_pc = trace.entryPc(anchor_pc),
                         .base = base,
                         .call_seq = self.frames[self.depth - 1].call_seq,
                         .force_ordinary = true,
-                    };
+                    });
                 }
                 return .{ .switch_mode_at = pc };
             }
@@ -5107,18 +5193,18 @@ pub const Vm = struct {
                         self.trace.head_want_src = null;
                         self.trace.dbg("head-want transfer: arming sibling recording on current activation (src t={?})", .{if (src) |s| s.trace_id else null});
                         if (is_head) {
-                            self.trace.pending_call_anchor = .{
+                            self.trace.setPendingCallAnchor(.{
                                 .proto = proto,
                                 .base = base,
                                 .call_seq = self.frames[self.depth - 1].call_seq,
-                            };
+                            });
                         } else {
-                            self.trace.pending_ret_anchor = .{
+                            self.trace.setPendingRetAnchor(.{
                                 .proto = proto,
                                 .resume_pc = trace.entryPc(anchor_pc),
                                 .base = base,
                                 .call_seq = self.frames[self.depth - 1].call_seq,
-                            };
+                            });
                         }
                         directive = .{ .switch_mode_at = pc };
                     }
@@ -8194,6 +8280,7 @@ test {
     _ = @import("interp_dispatch_test.zig");
     _ = @import("interp_gc_test.zig");
     _ = @import("interp_trace_test.zig");
+    _ = @import("interp_fastblock_test.zig");
     _ = @import("interp_tier1a_test.zig");
     _ = @import("interp_native_test.zig");
     _ = @import("interp_lanes_test.zig");

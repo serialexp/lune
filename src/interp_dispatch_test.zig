@@ -47,7 +47,7 @@ fn probeAt(gpa: std.mem.Allocator, source: [:0]const u8, stop_after: u64) !Probe
     var sink_buf: [4096]u8 = undefined;
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
-    vm.suspend_ctl = .{ .after_safepoints = stop_after };
+    vm.setSuspendCtl(.{ .after_safepoints = stop_after });
 
     var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
