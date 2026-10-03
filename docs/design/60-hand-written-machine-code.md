@@ -15,10 +15,10 @@ Bart's decisions so far:
 - park-then-helper for results (Q10);
 - Q6 audited (§5.4).
 
-One question is open: **Q12, how the assembly reaches the register file
-and the overflow park.** Both options are written out in §3.2.
+- Q12, the register file and overflow park: (a), the assembly reads the
+  slices directly under a stated exception (§3.2).
 
-Q12 is the only thing between this doc and H1. Nothing hand-written ships yet beyond what
+No design questions block H1. Nothing hand-written ships yet beyond what
 already existed: the `__zig_probe_stack` copy in `capi.zig` and the
 runtime-emitted trace trampoline in `nativegen_mcode.zig`.
 **Owner:** claude
@@ -40,11 +40,12 @@ land; move whole phases to Done once everything inside them is checked.
 - [x] **Q6 audit** (2026-10-03; corrected in rev 4 after codex's rev-3
   review). The six pending fields can be set at the same time. So the flag
   word is a bitmask, and no union replaces them (§5.4).
+- [x] **Q12 decided** (Bart, 2026-10-03): option (a). The assembly reads
+  the register-file and overflow-park slices directly, under a stated
+  exception to the representation rule (§3.2).
 
 ### Outstanding
 
-- [ ] **Q12 — the register-file and overflow-park representation** (§3.2).
-  Bart's call.
 - [ ] **H1 — the minimal-work host call, in Zig.** This is the dedicated
   entry path of §5. It bypasses `callValue`'s generic dispatch for closure
   callees.
@@ -260,7 +261,7 @@ of these:
 - an optional;
 - an error union;
 - a tagged union;
-- a slice;
+- a slice, except the three named in Q12 below;
 - a packed struct, other than reading the fast word as a `u16` and the
   checked bit offsets of `FrameResult`.
 
@@ -281,8 +282,14 @@ The resulting placements:
   that refuses both hits and fills applies when the **registry**
   generation itself equals the sentinel, `interp.zig:2652`.)
 
-**Q12 — the register file and the overflow park. Open, Bart's call.** The
-entry must reach five things:
+**Q12 — the register file and the overflow park. Decided: (a)** (Bart,
+2026-10-03). Zig's internals change only when the pinned toolchain
+(`.zig-version`) changes, so a toolchain bump is the known, deliberate
+point at which this layout could move. Then the executable checks below
+run as part of the bump, along with the comptime offsets check. Option
+(b) is kept below for the record.
+
+The entry must reach five things:
 - the register file's tag and payload base pointers (`Vm.tags`,
   `Vm.payloads`, both slices, `interp.zig:573–574`);
 - its capacity (`regCapacity()` is `payloads.len`, `interp.zig:1080`);
@@ -293,9 +300,12 @@ The register file is fixed-size and never reallocated
 (`interp.zig:570–572`). Today's idle clear empties `parked_results` with
 `clearRetainingCapacity()` (`capi.zig:313–318`).
 
-- **(a) A stated slice exception.** The representation rule allows
-  reading the pointer and length of exactly these slices, plus writing
-  `parked_results.items.len = 0`.
+- **(a) A stated slice exception (chosen).** The representation rule
+  allows exactly this, and nothing more:
+  - reading the pointer and length of `Vm.tags` and `Vm.payloads`;
+  - reading `parked_results.items.len`;
+  - writing `parked_results.items.len = 0`, which is what
+    `clearRetainingCapacity()` does.
   - **The checker can't verify this at comptime.** `@offsetOf` can't
     look inside a slice: `@offsetOf([]u8, "ptr")` is a compile error. The
     pinned compiler also rejects `@bitCast` from a slice (codex rev-4
@@ -321,7 +331,12 @@ The register file is fixed-size and never reallocated
     `ArrayList`'s field names, both of which can churn (Z-2). The checks
     catch a change; they don't make one free, and the slice-order check
     runs at test time and VM creation, not at compile time.
-- **(b) Plain fields on `Vm`.** Add `reg_tags: [*]u8`, `reg_payloads:
+  - **Where that cost lands.** Those internals move only with a
+    toolchain bump. The bump's checklist therefore includes the gated
+    `zig build test` run, which covers the slice-layout unit test and the
+    offsets check. It also reviews `ArrayList`'s `items`/`clearRetainingCapacity`
+    for semantic changes, which no layout check can see.
+- **(b) Plain fields on `Vm` (not chosen).** Add `reg_tags: [*]u8`, `reg_payloads:
   [*]u64` and `reg_capacity: usize`. They are set once where the register
   file is allocated; they never change, since the file is never
   reallocated. Add `parked_overflow_len: usize`, the same width as the
@@ -425,7 +440,6 @@ From the host inward:
      (`interp.zig:2025`), which H1 reproduces;
    - input park capacity: the inline slots free after the idle clear must
      hold the callee and every heap argument;
-   - under Q12 (b), an empty overflow park when idle.
    
    Any failure is a `jmp` to `mahina_hostcall_slow`, which has the same
    signature and does every rejection and diagnostic exactly as today.
@@ -565,7 +579,8 @@ compared. "Equivalent" means:
 **Entry**, in order, after the pre-commit checks pass (`.S`):
 1. **Clear the park if the VM is idle**, meaning `depth == 0` and
    `native_reentry_depth == 0` (doc 59 §3.3). That zeroes
-   `parked_inline_len`, plus the overflow park under Q12 (a).
+   `parked_inline_len` and `parked_results.items.len`, matching
+   `parkClearIfIdle` (Q12 (a)).
 2. **Park the callee and each heap-typed argument, in argument order,**
    into the inline slots. Capacity was checked before step 1.
    - This is required by the header contract: arguments "remain valid
@@ -916,7 +931,9 @@ Call shapes:
   - on results, which goes to the helper;
   - a host callback that uses up the inline park before the outer call
     returns heap results;
-  - under Q12 (b), an idle call with a non-empty overflow park.
+  - an idle call with a non-empty overflow park, which the `.S` entry
+    empties itself (Q12 (a)). The parked lists must then match H1's
+    exactly.
 - **Helper OOM:** an OOM in the result-park helper. `*nresults` must stay
   0, the VM must not be fatal, and the next call must work.
 - **`final_cut`:** a call after a genuine top-level finish, so the
@@ -1052,13 +1069,12 @@ its own doc, built on this one's `.S` and offsets machinery.
   - hidden `@export`;
   - `always_tail` compiling to a plain `jmp` with this signature;
   - the §6.3 checks.
-- [ ] **Q12: the register file and overflow park.** See §3.2. Bart's
-  call.
-  - **Option (a)** is a stated slice exception. The slice layout is
-    checked by an executable test and a check at VM creation, because
-    comptime can't inspect a slice.
-  - **Option (b)** is plain mirror fields on `Vm`. Clearing the overflow
-    park is left to H1.
+- [x] **Q12: the register file and overflow park: (a)**, a stated slice
+  exception (Bart, 2026-10-03; §3.2). The slice layout is checked by an
+  executable test and a check at VM creation, because comptime can't
+  inspect a slice. Zig internals move only with a toolchain bump, which
+  is when those checks are re-run deliberately. Option (b), plain mirror
+  fields on `Vm`, was not chosen.
 
 ## 9. References
 
@@ -1099,7 +1115,7 @@ Antigravity numbers its rev-3 findings B1–B2, S1–S4 and N1–N3.
 | finding | status in rev 4 | where |
 |---|---|---|
 | codex B1 / antigravity B1, S4: null `results`/`args` | addressed: `mh_call` normalizes `max_results`; `args` null check before any load; tests with zero and nonzero lengths | §4.1, §6.1 |
-| codex B2 / antigravity B2: slice representation | **open**: two specified options, awaiting Bart (Q12) | §3.2 |
+| codex B2 / antigravity B2: slice representation | specified as two options in rev 4; decided (a) by Bart after rev 5 | §3.2, Q12 |
 | codex S1: audit lifecycle claims, missing producer, coexistence cases | addressed: full producer/consumer table, three reachable coexistences, mutation tests | §5.4, §6.1 |
 | codex S2: owned-recorder test starts; boolean validation | addressed: 58 sites → `startRecordingForTest`; bit-exact `fastBlockReference()` | §5.4 |
 | codex S3 / antigravity N1: module placement, linkage, fourth symbol | addressed: `runPushedFrame` (VM) + `mahina_hostcall_chain` (C API); hidden `@export`; all symbols declared | §4.1, §4.2 |
@@ -1127,7 +1143,7 @@ Antigravity numbers its rev-4 findings B1–B2, S1–S4 and N1–N3.
 | codex B1: shared runner must keep the initial mode check | addressed: `runPushedFrame` picks `.fast` or `execWith`/`.full` as `execWithEntry` does; nonzero-fast-word tests added | §4.1, §6.1 |
 | antigravity B1: asymmetric reentry decrement | addressed: `runPushedFrame` owns increment + `defer` decrement; `.S` and H1 only read it | §4.1, §4.3 steps 3, 6, 7, 9, 13 |
 | codex S2 / antigravity B2: unwind frames per path; FP/DWARF build settings | addressed: per-path frame table and walks; unwind tables, frame-pointer settings for Zig and host | §3.3, §6.3 |
-| codex S1: Q12(a) comptime verification doesn't work; overflow length width | addressed: executable verification (test + `mh_vm_new` check); `usize` mirror updated after successful append. Q12 itself still open | §3.2 |
+| codex S1: Q12(a) comptime verification doesn't work; overflow length width | addressed: executable verification (test + `mh_vm_new` check); `usize` mirror updated after successful append. Q12 was then decided (a) | §3.2 |
 | codex S3: archive extraction; hidden undefined references | addressed: `--whole-archive` / a consumer of `mh_call`; entry presence checked; `.hidden` on references | §4.2, §6.3 |
 | codex S4: direct `rec.active = false` in a test | addressed: `stopRecordingForTest()` | §5.4 |
 | codex S5: compare `native_reentry_depth` | addressed | §6.1 |
