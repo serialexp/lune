@@ -76,9 +76,15 @@ mahina C API 7.3, Rust crate 26.8. Items, each measured on its own:
       word in sync. Needs Bart's call. **Folded into doc 60 H1
       (2026-10-03):** a `u16` on `TraceState`; the six pending fields
       coexist, so no single union (doc 60 §5.4).
+- [ ] **macOS x86-64 host-call entry (doc 60).** The `.S` entry is Linux
+      only for now (Bart, 2026-10-03). Prerequisite: `libmahina` itself
+      doesn't build for macOS — `mh_new` installs Linux-only clock/entropy
+      sources (`capi.zig:414`, `std.os.linux`). Make the C API portable,
+      then add the Mach-O macros (symbol prefix, sections,
+      `.private_extern`) and a macOS build/link acceptance case.
 - [ ] **Windows x64 host-call entry (doc 60).** The `.S` entry targets the
-      SysV ABI only (Linux, macOS); Windows x64 uses its own calling
-      convention and runs the Zig H1 path. Write `hostcall_win64.S` (or
+      SysV ABI only; Windows x64 uses its own calling convention and runs
+      the Zig H1 path. Write `hostcall_win64.S` (or
       equivalent) only if a Windows embedder's profile asks for it.
 
 ## `hashgate.py --generate --filter X` wipes every other program's refs (noted 2026-10-01)
