@@ -1,9 +1,9 @@
 # 60 — Hand-written machine code: where we stop trusting the compiler (first user: the host-call entry)
 
-**Status:** rev 4, not yet implemented. Revs 1–3 were reviewed by codex and
-antigravity, and every round came back CHANGES REQUESTED
-(`docs/reviews/doc60/*-rev{1,2,3}.md`). Rev-3 findings are folded in, with
-an honest per-finding status in §10.
+**Status:** rev 5, **approved by codex and antigravity**, not yet
+implemented. Revs 1–4 came back CHANGES REQUESTED; rev 5 was approved by
+both, with nits only, which are folded in
+(`docs/reviews/doc60/*-rev{1..5}.md`, per-finding status in §10).
 
 Bart's decisions so far:
 - a C-ABI shim seam (Q2);
@@ -18,7 +18,7 @@ Bart's decisions so far:
 One question is open: **Q12, how the assembly reaches the register file
 and the overflow park.** Both options are written out in §3.2.
 
-Re-review of rev 4 pending. Nothing hand-written ships yet beyond what
+Q12 is the only thing between this doc and H1. Nothing hand-written ships yet beyond what
 already existed: the `__zig_probe_stack` copy in `capi.zig` and the
 runtime-emitted trace trampoline in `nativegen_mcode.zig`.
 **Owner:** claude
@@ -35,15 +35,14 @@ land; move whole phases to Done once everything inside them is checked.
   Four boundary fixes took a C `mh_call` from 567 to 518 instructions and
   from 119 to ~82 cycles. LuaJIT's `lua_pcall` does the same job in 304 and
   54. §1 explains why more shaving in Zig won't close that gap.
-- [x] **H0, rev-1, rev-2 and rev-3 reviews** (codex + antigravity). Folded
-  into revs 2–4 (§10).
+- [x] **H0, design review** (codex + antigravity, five rounds). Rev 5
+  was approved by both on 2026-10-03 (§10).
 - [x] **Q6 audit** (2026-10-03; corrected in rev 4 after codex's rev-3
   review). The six pending fields can be set at the same time. So the flag
   word is a bitmask, and no union replaces them (§5.4).
 
 ### Outstanding
 
-- [ ] **H0 — re-review of rev 4** (codex + antigravity).
 - [ ] **Q12 — the register-file and overflow-park representation** (§3.2).
   Bart's call.
 - [ ] **H1 — the minimal-work host call, in Zig.** This is the dedicated
@@ -75,7 +74,7 @@ land; move whole phases to Done once everything inside them is checked.
   the closure/proto lookup and validation for repeated same-callee calls,
   like a per-frame `update()`. Decide after H3 (Q5).
 - [ ] **Defer: macOS x86-64 entry.** `libmahina` doesn't build for macOS
-  today. `mh_new` installs Linux-only clock and entropy sources
+  today. `mh_vm_new` installs Linux-only clock and entropy sources
   (`capi.zig:414`, `:450`, `std.os.linux`). A portable C API comes first.
   Then the same SysV entry needs Mach-O macros (symbol prefix, sections,
   `.private_extern`) and a macOS build/link acceptance case (TODO.md).
@@ -275,9 +274,12 @@ The resulting placements:
 - **`CallFrame.code_cache`** (a slice) is **not written**. Only
   `code_cache_gen`, a plain `u64`, gets the sentinel, as one store of `-1`.
   This is exactly how the JIT's inline native push invalidates a reused
-  frame slot today (`interp.zig:402–408`, doc 54 P0). While the
-  generation is the sentinel, `cachedCodeFor` refuses both to hit and to
-  fill, so a stale `code_cache` slice in a reused slot is never used.
+  frame slot today (`interp.zig:402–408`, doc 54 P0). A frame whose
+  `code_cache_gen` is the sentinel never matches the registry's live
+  generation, so `cachedCodeFor` misses and refills: a stale
+  `code_cache` slice in a reused slot is never used. (The separate rule
+  that refuses both hits and fills applies when the **registry**
+  generation itself equals the sentinel, `interp.zig:2652`.)
 
 **Q12 — the register file and the overflow park. Open, Bart's call.** The
 entry must reach five things:
@@ -294,21 +296,37 @@ The register file is fixed-size and never reallocated
 - **(a) A stated slice exception.** The representation rule allows
   reading the pointer and length of exactly these slices, plus writing
   `parked_results.items.len = 0`.
-  - `@offsetOf` can't look inside a slice: `@offsetOf([]u8, "ptr")` is a
-    compile error. So the checker asserts the slice layout indirectly:
-    - `@sizeOf([]u8) == 16`;
-    - the pointer and length offsets, recovered through an `extern
-      struct` built from `@typeInfo(...).pointer`;
-    - a comptime round-trip through `@bitCast` to `[2]usize`, which
-      demonstrates the order.
-  - The assembly then depends on Zig's slice layout and on
-    `ArrayList`'s field names, both of which can churn (Z-2). The checker
-    catches a change; it does not make one free.
+  - **The checker can't verify this at comptime.** `@offsetOf` can't
+    look inside a slice: `@offsetOf([]u8, "ptr")` is a compile error. The
+    pinned compiler also rejects `@bitCast` from a slice (codex rev-4
+    probe), and pointer type info carries no physical component offsets
+    (`lib/std/lang.zig:597`).
+  - **So the verification is executable instead:**
+    - a unit test in `zig build test` on the gated target reads the
+      memory of a known `[]u8`, `[]u64` and `[]Value`, and of an
+      `ArrayList(Value)`'s `items`, through `@as(*const [2]usize,
+      @ptrCast(&s))`. It asserts that the pointer is word 0 and the
+      length word 1;
+    - the slice must be a runtime value (`var s`, or its address
+      escaped). The pinned compiler refuses that pointer cast at
+      comptime, because a slice has no well-defined layout (antigravity
+      rev-5 probe);
+    - the same check runs once in `mh_vm_new` on the gated target, Debug
+      and ReleaseFast. A mismatch is a hard panic, not a silent
+      miscompute.
+    
+    The offsets file records only the outer field offsets and
+    `@sizeOf([]T) == 16`, which comptime *can* check.
+  - **The cost.** The assembly then depends on Zig's slice layout and on
+    `ArrayList`'s field names, both of which can churn (Z-2). The checks
+    catch a change; they don't make one free, and the slice-order check
+    runs at test time and VM creation, not at compile time.
 - **(b) Plain fields on `Vm`.** Add `reg_tags: [*]u8`, `reg_payloads:
   [*]u64` and `reg_capacity: usize`. They are set once where the register
   file is allocated; they never change, since the file is never
-  reallocated. Add `parked_overflow_len: u32`, which only `park` and
-  `parkClearIfIdle` write.
+  reallocated. Add `parked_overflow_len: usize`, the same width as the
+  `ArrayList` length it mirrors. `park` updates it only after a
+  successful append, and `parkClearIfIdle` zeroes it.
   - The assembly reads only plain pointers and integers. Its idle clear
     zeroes `parked_inline_len`. When `parked_overflow_len != 0` it falls
     back to H1 instead, so emptying the `ArrayList` stays in Zig.
@@ -332,19 +350,29 @@ argument registers and the caller-saved scratch registers (`rax`, `r10`,
 argument registers and both stack arguments are untouched. That stretch
 of code is described by the entry-state CFI.
 
-**The resulting stack.** The Zig `mh_call` *tail-calls* the entry, so it
-leaves no frame. The physical stack during a call is:
+**The resulting stacks.** The Zig `mh_call` *tail-calls* the entry, so
+it leaves no frame. The fallback is a pre-prologue `jmp`, so the entry
+leaves no frame on that path either. The physical stack on each path:
 
-    host → entry → shim → (guest handlers) → host callback
+| path | frames, outermost first |
+|---|---|
+| normal, inside guest code | `host → mahina_hostcall_entry → mahina_hostcall_chain → runPushedFrame (if not inlined) → handlers` |
+| normal, inside a host callback | the same `→ … → host callback` |
+| pre-commit fallback | `host → mahina_hostcall_slow → …` |
+| result-park overflow | `host → mahina_hostcall_entry → mahina_hostcall_park_rest` (the chain has returned) |
 
-**Unwinding is tested on what can be retained** (§6.3):
-- DWARF unwinding (`perf record --call-graph dwarf`, gdb) across `entry`
-  and `shim`, on the normal return, the fallback and the park-helper
-  call;
-- frame-pointer unwinding only in a build with
-  `-fno-omit-frame-pointer` for the Zig modules. Keeping `rbp` in the
-  assembly alone doesn't make Zig frames walkable, so the frame-pointer
-  test states that build setting explicitly.
+**Unwinding is tested per path, against exactly those frames** (§6.3):
+- **DWARF unwinding** (`perf record --call-graph dwarf`, gdb). The Zig
+  modules are built with `unwind_tables = .async`
+  (`Build/Module.zig:214`). The `.S` file carries its CFI, and the host
+  fixture is compiled with `-funwind-tables`.
+- **Frame-pointer unwinding** is tested only in a build where everything
+  on the stack keeps `rbp`:
+  - the Zig modules (`omit_frame_pointer = false`, `Module.zig:229`);
+  - the host fixture and its callbacks (`-fno-omit-frame-pointer`).
+  
+  Keeping `rbp` in the assembly alone doesn't make the other frames
+  walkable, so the test states those build settings explicitly.
 
 ## 4. The seam and the state contract
 
@@ -405,9 +433,24 @@ From the host inward:
    `cachedCodeFor`, `execWith` and `chainEntry` are private to
    `interp.zig`. `VmBox`, `guestFault` and the C types are private to
    `capi.zig`. So the shim is two functions:
-   - **`Vm.runPushedFrame(entry_depth) Error!FrameResult`** (Zig,
+   - **`Vm.runPushedFrame(entry_depth, base) Error!FrameResult`** (Zig,
      `interp.zig`, `pub`, ordinary Zig convention). It is VM-owned and has
-     no C-API dependency. In order, it:
+     no C-API dependency. `base` is passed in, as `execWithEntry` takes it
+     today (`interp.zig:2475`), so `ExecState` is built without a
+     dependent load through `frame.base`.
+     
+     **It owns `native_reentry_depth` on both edges:**
+     `native_reentry_depth += 1` with a paired `defer … -= 1`, the same
+     `defer` (not `errdefer`) that `callValue` uses
+     (`interp.zig:2101–2103`). Neither the `.S` entry nor H1 touches the
+     counter; the entry only *reads* it for the pre-commit limit check. Two
+     things therefore match today:
+     - nested API calls made from host callbacks during the run see the
+       incremented value, so they don't clear the park;
+     - the decrement happens before `guestFault` (error) or before result
+       parking (success).
+     
+     In order, it:
      - clears `final_cut`;
      - builds `ExecState`, which it owns on its own stack;
      - resolves the image through `cachedCodeFor`;
@@ -415,7 +458,16 @@ From the host inward:
        frame's cache, `interp.zig:2486`, `:2652`);
      - sets `err = null`;
      - sets the region context;
-     - calls `chainEntry(.fast)`.
+     - **picks the dispatch mode exactly as `execWithEntry` does**
+       (`interp.zig:2478`):
+       - if `runFastPath()`, it calls `chainEntry(.fast)`;
+       - otherwise it runs `execWith(stop_depth)`, which dispatches
+         `.full`, so the recording and anchor hooks guarded by `.full`
+         (`interp.zig:2880`) fire.
+       
+       Calls admitted by the `.S` entry always take the first branch,
+       since the fast word was zero at admission. H1 receives the
+       fast-word rejections and takes the second.
      
      It handles the outcomes like this:
      - **`.finished`** → `clearPendingExitAnchor()`, then return the
@@ -424,21 +476,25 @@ From the host inward:
        pc with the original stop depth** through `execWith(stop_depth)`,
        as `execWithEntry` does (`interp.zig:2506`). It never re-runs the
        entry.
-     - **Errors** go through today's errdefers, in order:
-       `abortRaised()`, then `clearPendingExitAnchor()`
-       (`interp.zig:2476–2477`). Then it decrements
-       `native_reentry_depth`, matching `callValue`'s errdefer, and
-       returns the error.
-     - **`.suspended` cannot happen.** The entry runs only with
-       `suspend_ctl == null` (a fast-word bit), and `callValue` treats
-       suspension as unreachable (`interp.zig:2099`, `:2201`).
+     - **Errors** run today's two errdefers, which execute as
+       `abortRaised()` then `clearPendingExitAnchor()`
+       (`interp.zig:2476–2477`). Zig runs errdefers in reverse
+       declaration order, so they are declared in that reverse order, as
+       today. The reentry `defer` runs too, and the error is returned.
+     - **`.suspended` cannot happen.** Both branches run only with
+       `suspend_ctl == null`. For the `.S` entry that is a fast-word bit.
+       For H1, `callValue`'s assertion (`interp.zig:2099`) moves into
+       `runPushedFrame`. `callValue` treats suspension as unreachable
+       (`interp.zig:2201`).
      
-     H1 uses this same function after its own Zig push. So H1 and H3
-     differ only in the push and copy-out, not in the run.
+     **H1 uses this same function for closure callees**, after its own
+     Zig push. So H1 and H3 differ only in the push and copy-out, not in
+     the run. Natives and `__call` keep going through `callValue`
+     unchanged.
    - **`mahina_hostcall_chain`** (Zig, `capi.zig`, `callconv(.c)`, hidden
-     export). It calls `box.vm.runPushedFrame(entry_depth)`. On an error
-     it calls `guestFault(box, entry_depth, entry_top, err)` (§4.3 step
-     14) and returns that status.
+     export). It calls `box.vm.runPushedFrame(entry_depth, base)`. On an
+     error it calls `guestFault(box, entry_depth, entry_top, err)` (§4.3
+     step 14) and returns that status.
 4. **`mahina_hostcall_park_rest`** (Zig, `capi.zig`, `callconv(.c)`,
    hidden export). The entry calls it only when result parking runs out of
    inline slots (§4.3 step 10).
@@ -458,7 +514,7 @@ extern fn mahina_hostcall_entry(vm: ?*VmBox, callee: mh_value, args: ?[*]const m
 // capi.zig, all three @export-ed with .visibility = .hidden (the .S references them).
 fn mahina_hostcall_slow(/* same seven parameters as mh_call */) callconv(.c) mh_status;
 
-const ChainResult = extern struct { frame_result: u32, status: u32 }; // returned whole in rax
+const ChainResult = extern struct { status: u32, frame_result: u32 }; // whole in rax: status = eax
 fn mahina_hostcall_chain(box: *VmBox, base: usize, entry_top: usize,
                          entry_depth: u32) callconv(.c) ChainResult;
 
@@ -466,10 +522,20 @@ fn mahina_hostcall_park_rest(box: *VmBox, results: ?[*]const mh_value,
                              from: usize, produced: usize) callconv(.c) mh_status;
 ```
 
-**Linkage.** `callconv(.c)` alone creates no linkable symbol. The three
-Zig functions the assembly calls are emitted with `@export(&f, .{ .name =
-"…", .visibility = .hidden })`. The `.S` file marks its own entry
-`.hidden`. `mh_call` stays the only default-visibility symbol.
+**Linkage.** `callconv(.c)` alone creates no linkable symbol.
+- The three Zig functions the assembly calls are emitted with
+  `@export(&f, .{ .name = "…", .visibility = .hidden })`.
+- The `.S` file marks its own entry `.hidden`. It also declares
+  `.hidden` on each of its three **undefined references**, so the
+  hidden-visibility check in §6.3 holds per object for references as
+  well as definitions.
+- All references are RIP-relative or direct `call`/`jmp`; the `.S` file
+  takes no absolute addresses.
+- `mh_call` stays the only default-visibility symbol.
+
+**`ChainResult` field order.** `status` comes first, so on an error the
+status is already in `eax` and the entry only restores and returns; on
+success the entry reads `frame_result` from the upper half of `rax`.
 
 **`ChainResult` encoding.** `status` is authoritative on every return:
 - **`MH_OK`**: `frame_result` holds the packed `FrameResult`, with `reg`
@@ -507,7 +573,9 @@ compared. "Equivalent" means:
    - Nothing else gives that lifetime. Parameter registers can be
      overwritten, surplus non-vararg arguments are discarded, and the
      frame is popped (Q1).
-3. **`native_reentry_depth += 1`.**
+3. **Capture `entry_top = stack_top` and `entry_depth = depth`** into
+   callee-saved registers, before anything below changes them. The
+   reentry increment is not done here: `runPushedFrame` owns it (§4.1).
 4. **Bind the parameters** into the window at `stack_top`, and nil-fill
    the rest of the callee's registers. Vararg callees with surplus
    arguments use the two-region layout (`interp.zig:2166–2187`).
@@ -520,19 +588,27 @@ compared. "Equivalent" means:
    - `code_cache_gen = -1` (§3.2).
    
    Then `depth += 1` and `stack_top = base + num_registers`.
-6. **Call `mahina_hostcall_chain`.** The first dispatch prologue stays
-   inside the unchanged chain, in its prescribed order (`interp.zig:2741`,
-   `:2784`, `:2864`): GC safepoint, `safepoint_seq`, region observation,
-   fault pc, anchor activation, recording mirror.
+6. **Call `mahina_hostcall_chain(box, base, entry_top, entry_depth)`.**
+   Inside it, `runPushedFrame`:
+   - increments `native_reentry_depth`;
+   - clears `final_cut`;
+   - builds `ExecState`;
+   - picks the dispatch mode (§4.1).
+   
+   The first dispatch prologue stays inside the unchanged chain, in its
+   prescribed order (`interp.zig:2741`, `:2789`, `:2864`): GC safepoint,
+   `safepoint_seq`, region observation, fault pc, anchor activation,
+   recording mirror.
 
 **Success exit** (`status == MH_OK`). This is straight-line in the `.S`
 entry, except for the overflow call, and it mirrors today's
 `runProtected` (`capi.zig:392–407`):
-7. The anchor clear has already run, in `runPushedFrame`.
+7. The anchor clear and the reentry decrement have already run, in
+   `runPushedFrame`.
 8. **Copy the results out:** `produced = min(count, max_results)` results,
    word-wise (`storeWords`). `produced` is this value everywhere below,
    never the callee's raw `count`.
-9. **Restore:** `stack_top = entry_top` and `native_reentry_depth -= 1`.
+9. **Restore:** `stack_top = entry_top`.
 10. **Park each heap result among `results[0..produced]`, in order,**
     while inline slots remain. The first time a slot is missing, call
     `mahina_hostcall_park_rest(box, results, i, produced)`. It parks the
@@ -551,7 +627,7 @@ entry, except for the overflow call, and it mirrors today's
 12. **`abortRaised()` and `clearPendingExitAnchor()`** (in
     `runPushedFrame`). Doc 26 D1a: a recording must not survive the
     raise.
-13. **`native_reentry_depth -= 1`** (in `runPushedFrame`).
+13. **`native_reentry_depth -= 1`**, the `defer` in `runPushedFrame`.
 14. **`guestFault(box, entry_depth, entry_top, err)`, unchanged** (in
     `mahina_hostcall_chain`, `capi.zig:345–359`). It renders the located
     message **while the faulting frames are live**. Then:
@@ -610,18 +686,18 @@ helper is counted inclusively.
 | pre-commit: fast word, dependent closure→proto loads, tag/heap-type/closure tests, `args`/count, per-arg tag tests, depth/reentry/capacity/call_seq, park capacity | 22–30 |
 | `.S` prologue/epilogue, callee-saved saves/restores, frame pointer, alignment, values kept live across the chain call | 12–16 |
 | park-clear + park callee/args (1 heap value) | 8–12 |
-| reentry, bind 1 arg + nil-fill | 5–9 |
+| capture `entry_top`/`entry_depth`, bind 1 arg + nil-fill | 5–9 |
 | frame write (9 stores) + depth/stack_top | 13–16 |
-| `mahina_hostcall_chain` + `runPushedFrame`: two prologues, `final_cut`, `ExecState` (11 fields), image resolve, `code_gen`, region context, call into the chain, outcome switch, anchor clear | 40–55 |
+| `mahina_hostcall_chain` + `runPushedFrame`: two prologues, reentry increment/decrement, `final_cut`, fast-path mode check, `ExecState` (11 fields), image resolve, `code_gen`, region context, call into the chain, outcome switch, anchor clear | 44–60 |
 | success exit: copy-out, restore, park results, `*nresults` | 12–18 |
-| **total** | **~120–170** |
+| **total** | **~125–175** |
 
 If LLVM inlines `runPushedFrame` into `mahina_hostcall_chain`, the second
 prologue disappears.
 
 **Full public crossing** = the internal entry, plus guest code and
 handlers (~60 for `id`), plus the host's own call and result read. That's
-roughly **~210–260 per `mh_call`**, against LuaJIT's 304 and today's 518.
+roughly **~215–265 per `mh_call`**, against LuaJIT's 304 and today's 518.
 
 Both ledgers are reported per shape, not just for `id(1)`:
 - 0, 1, 4 and 8 arguments, and 9 (the fallback cost);
@@ -649,7 +725,12 @@ Nine conditions gate the fast dispatch today (`runFastPath`,
 
 **Q6 audit (2026-10-03, corrected in rev 4): the six pending fields are
 not mutually exclusive, so a single union cannot replace them.** The
-producers and consumers of each field:
+producers and consumers of each field are below. The guards listed are
+the ones that bear on coexistence: the recording state and the other
+pending fields. Every producer has further guards (config, varargs,
+bounds, patch collisions, existing traces, barred anchors, hotness,
+allocation), which are omitted because they don't affect which fields
+can be set together.
 
 | field | producers (guards) | consumers / clearers |
 |---|---|---|
@@ -663,8 +744,9 @@ producers and consumers of each field:
 Reachable coexistences:
 - **An exit anchor plus a ret anchor.** While a `pending_exit_anchor`
   waits for its pc, tier-0 runs in `.full`. A **non-boundary** `ret`
-  calls `onRetResume` (`interp.zig:6560`). That checks only `rec.active`
-  and can file a `pending_ret_anchor`. (Boundary returns exit before this
+  calls `onRetResume` (`interp.zig:6560`). Among the pending fields and
+  recording state, that checks only `rec.active`, so it can file a
+  `pending_ret_anchor`. (Boundary returns exit before this
   producer.)
 - **An exit anchor plus a replay anchor.** Through
   `consumeSideTraceWantAtResume`, which doesn't check the exit anchor.
@@ -722,6 +804,13 @@ which changes tiering decisions. §2 rules that out.
     They move to a `TraceState.startRecordingForTest(…)` wrapper that
     syncs the bit. A test that does run the VM afterwards would otherwise
     trip the debug check.
+    
+    One test also **stops** an owned recording directly:
+    `trace_gate_test.zig:1067` writes `state.rec.active = false` to
+    simulate an abort's effect, then gates the anchor. It moves to a
+    `TraceState.stopRecordingForTest()` that clears `active` and syncs the
+    bit. The test's following `gateRecordAnchor` call is unchanged, so
+    its abort/gate behaviour is preserved.
 - **`Vm` owns its two bits** (`suspend_ctl`, `record_safepoint_lines`) and
   writes them into `vm.trace.fast_block` through `Vm` setters. That
   includes the production writes in `wasm_entry.zig:711`.
@@ -775,7 +864,9 @@ after every call:
 - results, normalized: heap values by identity class and content, not by
   address;
 - `*nresults` and the returned status, plus `last_error` and `fatal`;
-- `depth`, `stack_top`, and register contents below `stack_top`;
+- `depth`, `stack_top`, `native_reentry_depth`, and register contents
+  below `stack_top`. Reentry depth is checked especially after catchable
+  and fatal errors, nested calls, and result-park OOM;
 - `next_call_seq` and `safepoint_seq`;
 - the effect counters **and the serialized effect log**;
 - the region context and region activations;
@@ -799,9 +890,16 @@ Call shapes:
 - **Varargs:** vararg callees with and without surplus arguments.
 - **Results:** multiple results; result truncation, including zero
   capacity.
-- **Null buffers:** `results == NULL` with `max_results` both 0 and > 0
-  (an empty buffer, as today), and `args == NULL` with `nargs` both 0 and
-  > 0 (`.err_api`, as today).
+- **Null buffers:**
+  - `results == NULL` with `max_results` 0 and > 0: an empty buffer in
+    both cases, as today;
+  - `args == NULL` with `nargs == 0`: valid, the call runs;
+  - `args == NULL` with `nargs > 0`: `.err_api`, as today
+    (`capi.zig:708`).
+- **Fast word nonzero at entry:** a call while a recording is active,
+  and while each kind of pending anchor or arm request is set. The `.S`
+  entry falls back, and H1's `runPushedFrame` must take the `.full`
+  branch, so the hooks fire exactly as in the reference.
 - **Fallback callees:** natives and `__call`.
 - **Errors:** guest errors, catchable and non-catchable; fatal refusal.
 - **Reentry:** re-entrant calls, up to the reentry limit and past it.
@@ -846,21 +944,42 @@ Rust crate tests) run unchanged.
 
 ### 6.3 Build acceptance (H2)
 
-- **Visibility and relocations.** For each object in `libmahina.a`,
-  `readelf -s --wide` shows every `mahina_hostcall_*` symbol as `HIDDEN`
-  and `mh_call` as `DEFAULT`. A test then links the archive into a
-  **shared library and into a PIE executable**, built with
-  `-Wl,-z,text`, which makes any text relocation a link error. It checks
-  the result with `readelf --dyn-syms` (no internal symbols) and
-  `readelf -d` (no `TEXTREL`). (`nm -D` on a static archive says nothing
-  about hidden symbols, and a relocation listing on the `.o` alone
-  doesn't rule out dynamic text relocations.)
-- **Unwinding.**
-  - **DWARF:** a test makes gdb (or `perf --call-graph dwarf`) walk
-    `host → entry → shim → handler` and back. It covers the normal path,
-    a pre-commit fallback, and a stop inside the park helper.
-  - **Frame pointers:** tested only in a `-fno-omit-frame-pointer`
-    build, with that setting stated.
+- **Visibility.** For each object in `libmahina.a`, `readelf -s --wide`
+  shows:
+  - every **defined** `mahina_hostcall_*` symbol as `HIDDEN`;
+  - every **undefined reference** to one, in the `.S` object, as
+    `HIDDEN` too (§4.2 linkage);
+  - `mh_call` as `DEFAULT`.
+- **Relocations, in a real link.** The acceptance build compiles the
+  library modules with `.pic = true` (`Build/Module.zig:225`); today's
+  `capi_mod` doesn't set it (`build.zig:106`). It then links the archive
+  into a **shared library and into a PIE executable**, built with
+  `-Wl,-z,text` so that any text relocation is a link error.
+  - **The archive members must actually be pulled in.** The shared
+    library is linked with `--whole-archive`, and the PIE executable
+    calls `mh_call`. An unused archive would otherwise produce an empty
+    library that passes every check.
+  - The test then checks that `mahina_hostcall_entry` is present in both
+    outputs (`readelf -s`). It also checks that no internal symbol is
+    dynamically exported (`readelf --dyn-syms`), and that there's no
+    `TEXTREL` (`readelf -d`).
+  - (`nm -D` on a static archive says nothing about hidden symbols, and a
+    relocation listing on the `.o` alone doesn't rule out dynamic text
+    relocations.)
+- **Unwinding**, per path against the expected frames in §3.3's table:
+  - **DWARF**, with gdb or `perf --call-graph dwarf` in the build
+    settings §3.3 states:
+    - a stop in a guest handler walks
+      `entry → chain → runPushedFrame (if not inlined) → handler`;
+    - a stop in a host callback walks the same plus the callback;
+    - a forced pre-commit fallback walks `host → mahina_hostcall_slow`;
+    - a stop in the park helper walks
+      `host → mahina_hostcall_entry → mahina_hostcall_park_rest`.
+    
+    Each unwinds back to the host's `main`.
+  - **Frame pointers:** the same four walks, run only in the build where
+    the Zig modules, the host fixture and its callbacks all keep `rbp`
+    (§3.3).
 - **Tail call.** `objdump` of the Zig `mh_call` shows a `jmp` to
   `mahina_hostcall_entry` with no frame left behind (Q11).
 
@@ -933,10 +1052,13 @@ its own doc, built on this one's `.S` and offsets machinery.
   - hidden `@export`;
   - `always_tail` compiling to a plain `jmp` with this signature;
   - the §6.3 checks.
-- [ ] **Q12: the register file and overflow park.** Option (a) is a
-  stated slice exception with an indirectly checked slice layout. Option
-  (b) is plain mirror fields on `Vm`, with the overflow-park clear left
-  to H1. See §3.2. Bart's call.
+- [ ] **Q12: the register file and overflow park.** See §3.2. Bart's
+  call.
+  - **Option (a)** is a stated slice exception. The slice layout is
+    checked by an executable test and a check at VM creation, because
+    comptime can't inspect a slice.
+  - **Option (b)** is plain mirror fields on `Vm`. Clearing the overflow
+    park is left to H1.
 
 ## 9. References
 
@@ -992,3 +1114,30 @@ Antigravity numbers its rev-3 findings B1–B2, S1–S4 and N1–N3.
 | codex N3: test count, line 1262, Z-6 vs §2 | addressed | §5.4, §2 |
 | antigravity N2: debug rejection field lifecycle | addressed by removal: `mahina_hostcall_slow` asserts on every entry | §5.4 |
 | antigravity N3: `max_native_reentry` name | addressed | §3.2 |
+
+Codex's rev-4 review scores the table above. It rates codex S1, S2 and S4
+(and so S7) as partial. Those items are carried into the next table.
+
+### Rev 4 → rev 5
+
+Antigravity numbers its rev-4 findings B1–B2, S1–S4 and N1–N3.
+
+| finding | status in rev 5 | where |
+|---|---|---|
+| codex B1: shared runner must keep the initial mode check | addressed: `runPushedFrame` picks `.fast` or `execWith`/`.full` as `execWithEntry` does; nonzero-fast-word tests added | §4.1, §6.1 |
+| antigravity B1: asymmetric reentry decrement | addressed: `runPushedFrame` owns increment + `defer` decrement; `.S` and H1 only read it | §4.1, §4.3 steps 3, 6, 7, 9, 13 |
+| codex S2 / antigravity B2: unwind frames per path; FP/DWARF build settings | addressed: per-path frame table and walks; unwind tables, frame-pointer settings for Zig and host | §3.3, §6.3 |
+| codex S1: Q12(a) comptime verification doesn't work; overflow length width | addressed: executable verification (test + `mh_vm_new` check); `usize` mirror updated after successful append. Q12 itself still open | §3.2 |
+| codex S3: archive extraction; hidden undefined references | addressed: `--whole-archive` / a consumer of `mh_call`; entry presence checked; `.hidden` on references | §4.2, §6.3 |
+| codex S4: direct `rec.active = false` in a test | addressed: `stopRecordingForTest()` | §5.4 |
+| codex S5: compare `native_reentry_depth` | addressed | §6.1 |
+| antigravity S1: dead `base` parameter | addressed: passed to `runPushedFrame` | §4.1, §4.3 step 6 |
+| antigravity S2: `final_cut` and `entry_top`/`entry_depth` capture in §4.3 | addressed | §4.3 steps 3, 6 |
+| antigravity S3: PIC for the shared-library check | addressed: `.pic = true` in the acceptance build; RIP-relative references | §4.2, §6.3 |
+| antigravity S4: `ChainResult` field order | addressed: `status` first | §4.2 |
+| codex N1: "checks only `rec.active`" | addressed: the table is labelled as coexistence-relevant guards | §5.4 |
+| codex N2: `args == NULL, nargs == 0` is valid | addressed | §6.1 |
+| codex N3: `defer` not `errdefer`; frame vs registry sentinel | addressed | §3.2, §4.1 |
+| antigravity N1: errdefer LIFO order | addressed | §4.1 |
+| antigravity N2: `safepoint_seq` line | addressed (`:2789`) | §4.3 step 6 |
+| antigravity N3: Q12 options sound | superseded by codex S1: (a)'s comptime check was not sound and is replaced | §3.2 |

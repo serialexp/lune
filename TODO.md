@@ -78,7 +78,7 @@ mahina C API 7.3, Rust crate 26.8. Items, each measured on its own:
       coexist, so no single union (doc 60 §5.4).
 - [ ] **macOS x86-64 host-call entry (doc 60).** The `.S` entry is Linux
       only for now (Bart, 2026-10-03). Prerequisite: `libmahina` itself
-      doesn't build for macOS — `mh_new` installs Linux-only clock/entropy
+      doesn't build for macOS — `mh_vm_new` installs Linux-only clock/entropy
       sources (`capi.zig:414`, `std.os.linux`). Make the C API portable,
       then add the Mach-O macros (symbol prefix, sections,
       `.private_extern`) and a macOS build/link acceptance case.
