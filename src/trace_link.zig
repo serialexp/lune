@@ -311,6 +311,15 @@ pub fn maybeStartReplaySide(self: *TraceState, proto: *const Proto, cur_pc: u32)
 /// can consume them (error, suspension, or frame unwind), so the VM cannot stay
 /// pinned in `.full` mode behind a stale pending anchor.
 pub fn clearPendingExitAnchor(self: *TraceState) void {
+    // Every finished exec calls this, and almost always nothing is pending.
+    // Each `*_src` is set only right after its anchor and cleared with it, so
+    // both bits clear means all four fields are already null: skip the
+    // stores (~20 instructions per call, doc 60 §5.6).
+    const FastBit = TraceState.FastBit;
+    if ((self.fast_block & (FastBit.exit_anchor | FastBit.replay_anchor)) == 0) {
+        std.debug.assert(self.pending_exit_src == null and self.pending_replay_src == null);
+        return;
+    }
     self.setPendingExitAnchor(null);
     self.pending_exit_src = null;
     self.setPendingReplayAnchor(null);

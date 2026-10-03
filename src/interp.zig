@@ -2080,11 +2080,17 @@ pub const Vm = struct {
             // non-vararg callee are simply dropped, exactly what the
             // two-region layout did by never reading them.
             const cb = self.stack_top;
-            if (cb + cp.num_registers > self.regCapacity()) return Error.StackOverflow;
+            const nreg: usize = cp.num_registers;
+            if (cb + nreg > self.regCapacity()) return Error.StackOverflow;
             const np = @min(cp.num_params, args.len);
-            for (args[0..np], 0..) |v, i| self.regSet(cb + i, v);
+            // The window, lane bases and register count are taken once:
+            // through `self`/`cp` every lane store may alias them, so LLVM
+            // reloaded both bases and `num_registers` on every iteration
+            // (doc 60 §5.6).
+            const w = self.frameWindow(cb, nreg);
+            for (args[0..np], 0..) |v, i| w.set(i, v);
             var i: usize = np;
-            while (i < cp.num_registers) : (i += 1) self.regSet(cb + i, Value.nil());
+            while (i < nreg) : (i += 1) w.setNil(i);
             self.pushFrameTrusted(cl, cp.num_registers, cb, 0, 0, 0, 0);
             return cb;
         }

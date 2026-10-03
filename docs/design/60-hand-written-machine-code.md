@@ -1,7 +1,8 @@
 # 60 — Hand-written machine code: where we stop trusting the compiler (first user: the host-call entry)
 
 **Status:** partial. **H1 landed** (2026-10-03; as built and measured in
-§5.5). H1→H3 admission, H2, H3 and H4 are outstanding. The design is rev 5,
+§5.5), and an H1.5 Zig pass on top of it (§5.6). H1→H3 admission, H2, H3
+and H4 are outstanding. The design is rev 5,
 **approved by codex and antigravity**. Revs 1–4 came back CHANGES
 REQUESTED; rev 5 was approved by both, with nits only, which are folded in
 (`docs/reviews/doc60/*-rev{1..5}.md`, per-finding status in §10).
@@ -93,6 +94,15 @@ land; move whole phases to Done once everything inside them is checked.
     on every shape**, and cycles −9…−15% on most shapes. `wide` is +1.3%
     in cycles; the suspected cause is code placement (§5.5). The suite's
     instruction counts are flat.
+- [x] **H1.5 — a Zig pass on H1's own code shape** (2026-10-03),
+  extended beyond the original plan. The §5.6 breakdown showed part of
+  H1's cost was our code, not the compiler's. The register window is
+  taken once in `bindAndPushClosure`; `callClosure` copies out and parks
+  results in one pass; `clearPendingExitAnchor` skips when nothing is
+  pending.
+  - Results: −303 instructions on `wide`, −32 on r4, −82 on overflow,
+    −2…−3 on the smallest shapes, and +6 on r0.
+  - The language suite is flat (§5.6).
 - [ ] **Record/replay legs of the stage-1 matrix** (§6.1). They wait on an
   embedding record/replay mode (doc 59 §3.7). Run them when that mode
   exists, and before H3 lands.
@@ -112,6 +122,10 @@ land; move whole phases to Done once everything inside them is checked.
   alone don't decide it. The input, from §5.5: on the doc-59 `id(1)`
   probe, H1 costs **477 instructions / ~75 cycles** per public crossing,
   against 518 / ~83 before H1 and LuaJIT `lua_pcall`'s 304 / 54.
+  Where those instructions go, and how much of it is compiler artifact
+  versus our own code's shape: §5.6. After H1.5, `id`-shaped `a1` is
+  449 instructions; the small shapes are now dominated by register
+  allocation over the single inlined body.
 - [ ] **H2 — the `.S` layer.**
   - Build wiring (§3.1).
   - `src/asm/offsets_x64.inc` and its comptime check (§3.2).
@@ -1053,6 +1067,145 @@ Five reps on a loaded machine can't classify single-row ±2–4% wall-clock
 deltas. With the instruction counts flat, noise or placement are the
 likely explanations, but neither is established.
 
+### 5.6 H1→H3 admission evidence: where H1's instructions go (2026-10-03)
+
+This is §7 criterion 2: is what's left compiler artifact? It is the input
+to the admission decision, not the decision.
+
+**Method.**
+- The native ReleaseFast build uses AVX-512, which valgrind can't run.
+  So `libmahina` was rebuilt with `-Dcpu=x86_64_v3` (AVX2) into a
+  scratch prefix, and the probe was linked against it.
+- `callgrind --dump-instr=yes` ran on `hostcall_probe a1` at 0 and 200k
+  iterations, JIT off. Its per-instruction self counts were joined with
+  `objdump` and `addr2line`.
+- On this build the crossing is **461 instructions per call**
+  (native: 452):
+  - `mh_call`, with everything inlined into it, is 341;
+  - the guest's `chainEntry`, `opLoad` and `opRet` are ~103;
+  - the probe loop is 17.
+
+`mh_call`'s 341 are **341 distinct instruction sites, each executed
+exactly once per call**: a straight line with no repeated work in the
+one-argument case. By stage:
+
+| stage | instr | of which `rbp` stack traffic |
+|---|---|---|
+| prologue / epilogue (6 callee-saved, frame) | 17 | 12 |
+| public checks (`mh_call`) | 13 | 0 |
+| callee + argument validation | 38 | 4 |
+| parking (callee/args, then results) | 29 (+6 value stores) | 0 |
+| `pushHostCall` checks | 15 | 0 |
+| bind + nil-fill | 37 | 1 |
+| `call_seq` + frame write | 19 (+~8 unattributed) | 0 |
+| copy-out, restore, `*nresults` | 35 | 5 |
+| `runPushedFrame` / `execWithEntry` (ExecState, image, region context, chain call, outcome switch) | 63 | 19 |
+| post-call exit/replay anchor clear | 21 | 2 |
+| unattributed shuffles and spills between the inlined layers | ~37 | 12 |
+
+**Our code's shape, not the compiler.** These are fixable in Zig, and an
+H3 would have to avoid them too:
+- **Arguments are walked twice.** `argsSlice` validates every tag, then
+  the park loop walks them again. The callee's tag is tested three times
+  (`cmp sil,4` at `capi.zig:258/259`).
+- **Results are walked twice.** The copy-out loop, then a separate
+  result-park loop. Each has its own loop setup.
+- **The post-call anchor clear writes unconditionally.** It zeroes the
+  exit/replay anchor payloads (two 24-byte stores and two 12-byte clears)
+  even when their `fast_block` bits are clear. That's ~21 instructions,
+  where a test of the two bits would be ~3.
+- **`cachedCodeFor` runs on a frame that was just pushed.** Its
+  generation is `CODE_CACHE_GEN_INVALID` by construction, so the cache
+  check always fails. Its result is then stored into the frame (~10).
+
+**Compiler artifact.** This is what hand-written code removes:
+- the prologue/epilogue and the spills of the seven C arguments and live
+  locals: ~40;
+- **4×-unrolled loop setup on one-element loops**. Bind and copy-out
+  each pay ~8–10 instructions of `and 3` / `cmp 4` / remainder setup
+  before moving one value: ~16–20;
+- `tags`/`payloads` base pointers reloaded inside every loop iteration,
+  because the stores may alias them: ~6–8. Nil-fill is a scalar loop
+  that also reloads `num_registers` on every iteration (it is not
+  unrolled, and on this shape it runs once);
+- register shuffles between the inlined layers: ~20.
+
+**What H3 would and wouldn't replace.**
+- Under §4.1, the `.S` entry does stages 1–8 and the copy-out/parks
+  (~230 instructions here). It then **calls back into Zig** for
+  `runPushedFrame`, the chain and the anchor clear (~84 plus their own
+  prologue), which stay compiler-generated.
+- §5.3's estimate for the hand-written part is 72–101. So H3's ceiling
+  on this shape is roughly −130…−160 instructions. The Zig-side fixes
+  above are worth an estimated ~50–70 of the same ~230, without assembly.
+- Instruction counts don't decide this (§7 criterion 4); cycles do. The
+  cycle gap to LuaJIT on `id(1)` is ~75 vs 54.
+
+**The H1.5 Zig pass, done (2026-10-03).** Three of the items above were
+taken, each general rather than probe-specific (Z-6):
+- **A: `bindAndPushClosure` takes the register window once.** The lane
+  bases and `num_registers` are taken once instead of being reloaded per
+  iteration through `self`/`cp`. `callValue` shares this code.
+- **B: `callClosure` copies out and parks each result in one pass.** The
+  parks land in the same order; on OOM `*nresults` stays 0 either way.
+- **C: `clearPendingExitAnchor` returns at once when both anchor bits
+  are clear.** This runs on every finished exec. Each `*_src` is only
+  ever set with its anchor, and a Debug assertion checks that.
+
+Not taken:
+- **The double argument walk.** Fusing validation into parking would
+  park before an invalid argument is found. The reference then leaves
+  the previous call's park uncleared, and rolling back past the idle
+  clear isn't possible.
+- **The `cachedCodeFor` miss.** The resolve itself is needed, so only a
+  couple of instructions are avoidable.
+
+Measured with the §5.5 method (native ReleaseFast, JIT off, median of 5
+interleaved runs; the machine was at load 2–5, so the instruction column
+is the trustworthy one):
+
+| shape | instr H1 → H1.5 | Δ |
+|---|---|---|
+| a0 / a1 / r1 / heap | 403 / 452 / 403 / 470 → 401 / 449 / 401 / 467 | −2…−3 |
+| a4 | 515 → 506 | −9 |
+| a8 / a9 | 588 / 614 → 555 / 583 | −33 / −31 |
+| r0 | 326 → 332 | **+6** |
+| r4 | 556 → 524 | −32 |
+| vararg | 522 → 510 | −12 |
+| wide (40 registers) | 1856 → 1553 | **−303** (cycles −12%) |
+| overflow | 982 → 900 | −82 |
+
+Each change was also built and measured on its own:
+- C alone is −5/−6 on every shape.
+- B alone is −4…−15, and r4 −11% in cycles.
+- A alone costs about +8 on the smallest shapes and saves ~−293 on
+  `wide`:
+  - Without the aliasing reloads, LLVM vectorizes the nil-fill 8-wide,
+    which is the `wide` win.
+  - On one-register callees, the hoisted bases instead push other
+    values into stack spills (`rbp-0x30`, `rbp-0x48` in the listing),
+    and the vector loop adds setup.
+  - A real callback with locals looks more like `wide` than like the
+    one-register `id`, so A was kept.
+
+`r0`'s +6 is the same kind of effect: register allocation across the one
+inlined body. The language suite's instruction counts are flat: t0 is
+unchanged and jit is within ±0.25%, apart from `scimark-sparse` at
+−0.96%, which also showed up in H1's A/B.
+
+**What this says about criterion 2.**
+- On the small shapes, the Zig-side fixes are largely eaten by the
+  compiler. The anchor-clear saving is real, but A's spills and loop
+  setup take most of it back, and LLVM's register allocation over the
+  single inlined `mh_call` decides the outcome.
+- That is the "compiler artifact" remainder §7 asks about. **Measured:**
+  for A, B and C, the spill and setup trade-offs above. **Hypothesis,
+  not established:** that further Zig reshaping of the small shapes
+  would mostly move instructions between spill slots rather than remove
+  them. Only the three variants built here were tested.
+- On counted shapes (arguments, results, register windows), Zig does
+  well once the aliasing is out of the way.
+
 ## 6. Testing
 
 ### 6.1 Differential tests: two stages, normalized comparison
@@ -1406,3 +1559,20 @@ before any such read; the later peeks compare the deflated tables.
 `codex-h1-r3.md` and `antigravity-h1-r3.md`: both **APPROVE**, no
 findings. Each verified every round-2 finding resolved in the code and
 reran the filtered gate and `just test`.
+
+### §5.6 admission evidence and H1.5 review (2026-10-04)
+
+`codex-h15.md` (CHANGES REQUESTED, doc-only) and `antigravity-h15.md`
+(APPROVE). Neither found a soundness issue in A, B or C. Both checked
+the src-only-with-anchor invariant at every write site.
+
+| finding | status | where |
+|---|---|---|
+| codex 1: nil-fill isn't 4×-unrolled in the H1 binary (a scalar loop with reloads) | fixed: the attribution now covers bind and copy-out only (~16–20), and nil-fill is described as a scalar reloading loop | §5.6 |
+| codex 2: "further Zig reshaping only moves spills" exceeds the evidence | fixed: split into what was measured (A/B/C) and a labelled hypothesis | §5.6 |
+| antigravity 1 (nit): use `RegWindow.setNil` | fixed; instruction counts identical (a1 449, r0 332, wide 1553) | `interp.zig` |
+| codex r2 1: nil-fill runs once on `a1`, not zero times | fixed | §5.6 |
+
+Round 2 (`codex-h15-r2.md`): codex confirmed both original findings
+resolved, raised the one-word fix above, and found nothing else. Round 3
+(`codex-h15-r3.md`): **APPROVE**, no findings.

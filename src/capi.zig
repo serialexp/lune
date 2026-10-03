@@ -745,14 +745,26 @@ inline fn callClosure(box: *VmBox, cl: *const function.Closure, args: []const Va
     std.debug.assert(vm.pending_error == null);
     // The boundary frame is popped but `stack_top` still covers its window,
     // so the result registers are live and rooted: copy out, then shrink.
-    const src = base + fr.reg;
     const produced = @min(@as(usize, fr.count), results.len);
-    // Whole-word stores: the C side reads `results` as 8-byte words.
-    for (results[0..produced], 0..) |*r, k| Value.storeWords(r, vm.regGet(src + k));
-    vm.stack_top = entry_top;
-    for (results[0..produced]) |*r| {
-        if (park(box, Value.loadWords(r)) != .ok) return .err_oom;
+    // One pass: copy each result out and park it. Parking never collects
+    // (`park`), so the registers stay intact for the rest of the walk. The
+    // parks land in the same order as `runProtected`'s copy-then-park, and
+    // on OOM `*nresults` stays 0, so the copied prefix is undefined either
+    // way (mahina.h). The window is taken once; through `vm` every result
+    // store may alias the lane bases (doc 60 §5.6).
+    const w = vm.frameWindow(base + fr.reg, produced);
+    var status: mh_status = .ok;
+    for (results[0..produced], 0..) |*r, k| {
+        const v = w.get(k);
+        // Whole-word stores: the C side reads `results` as 8-byte words.
+        Value.storeWords(r, v);
+        if (park(box, v) != .ok) {
+            status = .err_oom;
+            break;
+        }
     }
+    vm.stack_top = entry_top;
+    if (status != .ok) return status;
     nres.* = produced;
     return .ok;
 }
