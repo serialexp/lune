@@ -72,15 +72,11 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", prefix.join("lib").display());
     println!("cargo:rustc-link-lib=static=mahina");
 
-    // Rebuild when the Zig surface changes.
-    for f in [
-        "src/capi.zig",
-        "include/mahina.h",
-        "build.zig",
-        ".zig-version",
-        "src/interp.zig",
-        "src/function.zig",
-    ] {
+    // Rebuild when anything the library is built from changes. Cargo scans a
+    // directory recursively, so `src` covers every Zig module and the
+    // hand-written assembly under `src/asm` (doc 60), not just the files
+    // someone remembered to list.
+    for f in ["src", "include", "build.zig", "build.zig.zon", ".zig-version"] {
         println!("cargo:rerun-if-changed={}", repo_root.join(f).display());
     }
     println!("cargo:rerun-if-env-changed=ZIG");

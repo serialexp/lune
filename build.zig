@@ -103,15 +103,42 @@ pub fn build(b: *std.Build) void {
     // surface (`src/capi.zig`) a host (the Rust crates under `embed/rust/`, or
     // any C program) links against. Static first (no soname story); needs libc
     // (the exports allocate through malloc).
+    //
+    // Doc 60 §6.3: the build-acceptance harness (tools/hostcall-acceptance.sh)
+    // links the archive into a shared library and a PIE, so it builds it
+    // position-independent; its frame-pointer unwinding walks also need every
+    // library frame to keep rbp. Unwind tables are always async (§3.3: the
+    // DWARF walks rely on them).
+    const lib_pic = b.option(bool, "lib-pic", "Build libmahina position-independent (doc 60 §6.3 acceptance)");
+    const lib_frame_pointers = b.option(bool, "lib-frame-pointers", "Keep frame pointers in libmahina (doc 60 §6.3 acceptance)") orelse false;
     const capi_mod = b.createModule(.{
         .root_source_file = b.path("src/capi.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .pic = lib_pic,
+        .unwind_tables = .async,
+        .omit_frame_pointer = if (lib_frame_pointers) false else null,
         .imports = &.{
             .{ .name = "mahina", .module = mod },
         },
     });
+    // Doc 60 §3.1: the hand-written host-call entry joins the module on the
+    // targets `src/asm/target.zig` gates in (Linux x86-64 SysV/ELF); every
+    // other target runs H1. `capi.zig` reads the same predicate to decide
+    // whether `mh_call` tail-calls into it.
+    // Its offsets file has a block per runtime-safety mode (std's hash maps
+    // grow under safety), selected by this define; `std.debug.runtime_safety`
+    // is the same function of the optimize mode, and creating a VM
+    // (`capi.createVm`) verifies the two agree.
+    if (@import("src/asm/target.zig").hostcallEntry(&target.result)) {
+        const safety = optimize == .Debug or optimize == .ReleaseSafe;
+        capi_mod.addCSourceFile(.{
+            .file = b.path("src/asm/hostcall_x64.S"),
+            .language = .assembly_with_preprocessor,
+            .flags = &.{if (safety) "-DMAHINA_RUNTIME_SAFETY=1" else "-DMAHINA_RUNTIME_SAFETY=0"},
+        });
+    }
     const capi_lib = b.addLibrary(.{
         .name = "mahina",
         .root_module = capi_mod,

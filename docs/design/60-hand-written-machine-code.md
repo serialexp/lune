@@ -1,8 +1,9 @@
 # 60 — Hand-written machine code: where we stop trusting the compiler (first user: the host-call entry)
 
 **Status:** partial. **H1 landed** (2026-10-03; as built and measured in
-§5.5), and an H1.5 Zig pass on top of it (§5.6). H1→H3 admission, H2, H3
-and H4 are outstanding. The design is rev 5,
+§5.5), and an H1.5 Zig pass on top of it (§5.6). H3 was admitted
+(2026-10-04), and **H2, the `.S` layer, landed** with the entry as its
+fallback edge only (§5.7). H3 and H4 are outstanding. The design is rev 5,
 **approved by codex and antigravity**. Revs 1–4 came back CHANGES
 REQUESTED; rev 5 was approved by both, with nits only, which are folded in
 (`docs/reviews/doc60/*-rev{1..5}.md`, per-finding status in §10).
@@ -19,11 +20,12 @@ Bart's decisions so far:
 - Q12, the register file and overflow park: (a), the assembly reads the
   slices directly under a stated exception (§3.2).
 
-Nothing hand-written ships yet beyond what already existed: the
-`__zig_probe_stack` copy in `capi.zig` and the runtime-emitted trace
-trampoline in `nativegen_mcode.zig`. H1 is Zig.
+What's hand-written so far: the `__zig_probe_stack` copy in `capi.zig`
+and the runtime-emitted trace trampoline in `nativegen_mcode.zig`, both
+older than this doc, and H2's `hostcall_x64.S`, whose entry is one `jmp`
+to H1. H1 is Zig.
 **Owner:** claude
-**Last updated:** 2026-10-03
+**Last updated:** 2026-10-04
 
 ## Implementation status
 
@@ -103,6 +105,42 @@ land; move whole phases to Done once everything inside them is checked.
   - Results: −303 instructions on `wide`, −32 on r4, −82 on overflow,
     −2…−3 on the smallest shapes, and +6 on r0.
   - The language suite is flat (§5.6).
+- [x] **H1→H3 admission decision: build H2/H3 now** (Bart, 2026-10-04).
+  - The input:
+    - On the doc-59 `id(1)` probe, H1 cost **477 instructions / ~75
+      cycles** per public crossing, against 518 / ~83 before H1 and
+      LuaJIT `lua_pcall`'s 304 / 54.
+    - After H1.5, `a1` is 449 instructions.
+    - §5.6 shows the small shapes are now dominated by register
+      allocation over the single inlined body.
+  - The order is the part H3 replaces first. Polishing the Zig parts H3
+    keeps comes after H3, not before.
+  - §7 criterion 4 still applies to H3 itself: it lands on a measured
+    cycle win against H1.5.
+- [x] **H2 — the `.S` layer** (2026-10-04). As built, with its
+  deviations from the plan, in §5.7.
+  - [x] **Build wiring** (§3.1): `src/asm/hostcall_x64.S` joins
+    `libmahina`'s module on the gated target, preprocessed
+    (`.assembly_with_preprocessor`). `src/asm/target.zig` is the one gate
+    predicate, read by both `build.zig` and `capi.zig`.
+  - [x] **`src/asm/offsets_x64.inc` and its comptime check** (§3.2),
+    `src/asm/offsets_x64.zig`. Some `Vm` offsets depend on runtime
+    safety, so the file has a block per safety mode (§3.2 follow-up). The
+    Q12 slice check runs in a unit test and at every VM's creation
+    (`capi.createVm`).
+  - [x] **Hidden linkage** (§4.2) for the symbols H2 has: the entry, the
+    `mahina_hostcall_slow` export of H1, and the `.S`'s safety-mode byte.
+    The references are hidden too, in both objects.
+  - [x] **The entry is the fallback edge only**: `mahina_hostcall_entry`
+    is a bare `jmp mahina_hostcall_slow`, with CFI. `mh_call` tail-calls
+    it.
+  - [x] **The build acceptance checks** (§6.3): `just
+    hostcall-acceptance [optimize]` (`tools/hostcall-acceptance.sh`),
+    passing in ReleaseFast and Debug, with negative controls.
+  - [x] **Q11's toolchain verifications** (§8).
+  - [x] **Measured**: the forwarding entry costs −2…+12 instructions a
+    call against H1.5 (+3…+12 on every shape but `vararg`), with cycles
+    within noise (§5.7).
 - [ ] **Record/replay legs of the stage-1 matrix** (§6.1). They wait on an
   embedding record/replay mode (doc 59 §3.7). Run them when that mode
   exists, and before H3 lands.
@@ -117,27 +155,23 @@ land; move whole phases to Done once everything inside them is checked.
   frame itself: one `-1` store into `code_cache_gen`, leaving the stale
   `code_cache` slice in place (§3.2). So stage 2 needs a test aimed at
   exactly that store.
-- [ ] **H1→H3 admission decision.** Write the assembly only if H1's
-  measured *cycle* gap to LuaJIT justifies it (§7). Instruction counts
-  alone don't decide it. The input, from §5.5: on the doc-59 `id(1)`
-  probe, H1 costs **477 instructions / ~75 cycles** per public crossing,
-  against 518 / ~83 before H1 and LuaJIT `lua_pcall`'s 304 / 54.
-  Where those instructions go, and how much of it is compiler artifact
-  versus our own code's shape: §5.6. After H1.5, `id`-shaped `a1` is
-  449 instructions; the small shapes are now dominated by register
-  allocation over the single inlined body.
-- [ ] **H2 — the `.S` layer.**
-  - Build wiring (§3.1).
-  - `src/asm/offsets_x64.inc` and its comptime check (§3.2).
-  - The CFI and frame-pointer convention (§3.3).
-  - The four internal symbols with hidden linkage (§4.2).
-  - The build acceptance checks (§6.3).
-  - Q11's toolchain verifications.
 - [ ] **H3 — the Linux x86-64 host-call entry** in
   `src/asm/hostcall_x64.S`.
   - Behind the stage-2 differential tests (§6.1).
   - H1 is the fallback.
   - The ledger is recorded in the embed benchmark.
+  - Carried over from H2, because they arrive with their first caller
+    (§5.7): the `mahina_hostcall_chain` and `mahina_hostcall_park_rest`
+    exports, `ChainResult` in the offsets file, the admitted path's CFI
+    and frame-pointer convention (§3.3), and the acceptance walks for
+    the admitted path and the park helper.
+- [ ] **After H3: polish the Zig parts H3 keeps.** These stay
+  compiler-generated under any entry, and work on them benefits H1, H3,
+  `callValue` and guest calls alike (§5.6):
+  - `runPushedFrame` / `execWithEntry`: ~63 instructions, 19 of them
+    stack traffic;
+  - the guest return path: `opRet` is 50, 12 of them pushes and pops;
+  - `chainEntry`.
 - [ ] **H4 — prepared calls (API addition).** `mh_prepare(callee)` caches
   the closure/proto lookup and validation for repeated same-callee calls,
   like a per-frame `update()`. Decide after H3 (Q5).
@@ -271,6 +305,15 @@ changes those: the symbol prefix, sections, and hidden visibility.
 if a `.S` file doesn't go through the preprocessor. The file joins the
 library's and CLI's root module only on the gated target.
 
+**As built (H2, 2026-10-04).** The file uses `addCSourceFile` with
+`.assembly_with_preprocessor`, so the preprocessing doesn't depend on the
+extension. It joins only `libmahina`'s module (`capi_mod`), which the C
+API tests and `capi-smoke` also build from. The CLI has no `mh_call`, so
+it gets no `.S`. One predicate, `src/asm/target.zig`'s `hostcallEntry`,
+gates both the file in `build.zig` and the tail call in `capi.zig`, so
+the entry can't be referenced without being linked, or linked without
+being reachable.
+
 ### 3.2 Layout: an inspectable offsets file, checked by the compiler (Q7, Bart 2026-10-03)
 
 Zig reorders non-`extern` struct fields. `CallFrame`, `Vm` and the rest
@@ -320,6 +363,68 @@ target being compiled:
   in Debug builds, so one set of offsets serves Debug and ReleaseFast. The
   rejection reason in §5.4 lives in a register, not a field. The checker
   runs in both modes, so a mode-dependent layout would fail the build.
+
+**Follow-up (H2, 2026-10-04): the layout *is* mode-dependent, so there
+are two blocks.** The checker did exactly what the last bullet says: the
+ReleaseFast build failed. The cause is no field of ours. Every std hash
+map carries a `pointer_stability` lock (`std.debug.SafetyLock`). Under
+`std.debug.runtime_safety` (Debug, ReleaseSafe) it's a one-byte enum,
+which padding turns into 8 more bytes per map; otherwise it's empty.
+`TraceState` holds enough maps to move
+`TraceState.fast_block` by 232 bytes, and with it every `Vm` field placed
+after `trace`: `depth`, `native_reentry_depth`, `parked_inline_len` and
+`parked_results`. The rest of the file is the same in every mode.
+
+What changed, with Bart's question about it unanswered (I picked this
+option and it's open to revision):
+- `offsets_x64.inc` keeps one shared section, plus `#if
+  MAHINA_RUNTIME_SAFETY` / `#else` / `#endif` blocks holding only the
+  five moved names.
+- `build.zig` passes `-DMAHINA_RUNTIME_SAFETY=1` for Debug and
+  ReleaseSafe and `=0` otherwise. That's the same function of the
+  optimize mode as `std.debug.runtime_safety`, and the `.S` refuses to
+  assemble without it.
+- The checker parses the directives. It validates the shared section
+  and the block for its own mode. It rejects a name in both the shared
+  section and a block, as well as misplaced, unterminated and nested
+  directives.
+- The `.S` records its define in a hidden byte,
+  `mahina_hostcall_offsets_safety`. Creating any VM (`capi.createVm`,
+  under `mh_vm_new` and the tests alike) panics if that byte disagrees
+  with `runtime_safety`, and a unit test asserts it. A build whose define
+  and optimize mode drift apart is caught at run time. Comptime can't see
+  what the assembler was given.
+- **The checker reads the file as cpp and gas do, or rejects it** (from
+  codex's H2 review). The file now goes through the preprocessor, which
+  the checker has to model. Two holes were found:
+  - gas reads `064` as octal (52), while the checker read it as decimal
+    64;
+  - a `//` comment ending in a backslash splices the next line into the
+    comment before cpp drops it. That line could be `#else`, which would
+    silently let the fast block override the safe one, with the safety
+    byte still correct.
+  
+  The grammar is now only blank lines, `//` comments, the three
+  directives, and `.set NAME, N` with N in canonical decimal (an
+  optional `-`, then no leading zero). Only printable ASCII and tabs may
+  appear anywhere. Round 2 found that cpp ends a line at a bare CR, and
+  splices across a backslash followed by a form feed or vertical tab, so
+  a check by whitespace class kept leaking. No line may end in a
+  backslash or hold the `??/` trigraph. The checker returns its problems
+  as a string, and unit tests feed it each rejected form, so a
+  regression in it fails the gate.
+- **The other block is unchecked** in any one build: a Debug build
+  checks only the safety block. Running the gate in both modes (`just
+  test`, plus the ReleaseFast leg) checks both.
+- The alternatives were to make every moved field sit before `trace`,
+  which fights Zig's field reordering, or to read those fields through a
+  Zig-filled pointer table, which adds a load per field. Both were
+  rejected.
+
+Separately, `Vm.reference_dispatch`, the H1 test hook, used to be `void`
+outside test builds, so a test build's `Vm` was laid out differently
+from the library's. It is now a plain `bool` in every build, so no field
+of ours depends on the build.
 
 **Representation rule.** `@offsetOf` gives field *locations*, not
 *representations*. The `.S` code reads and writes only plain integers,
@@ -390,7 +495,9 @@ The register file is fixed-size and never reallocated
       rev-5 probe);
     - the same check runs once in `mh_vm_new` on the gated target, Debug
       and ReleaseFast. A mismatch is a hard panic, not a silent
-      miscompute.
+      miscompute. (As built, it runs in `capi.createVm`, which
+      `mh_vm_new` calls, so the tests' VMs are checked too; see the
+      follow-up above.)
     
     The offsets file records only the outer field offsets and
     `@sizeOf([]T) == 16`, which comptime *can* check.
@@ -1206,6 +1313,138 @@ unchanged and jit is within ±0.25%, apart from `scimark-sparse` at
 - On counted shapes (arguments, results, register windows), Zig does
   well once the aliasing is out of the way.
 
+### 5.7 H2 as built, and measured (2026-10-04)
+
+H2 builds the layer H3 writes into, and changes no behaviour: the entry
+only forwards to H1. Where H2 departs from the plan, the plan text is
+left as written and the reason is given here.
+
+**Layering.** On the gated target, `mh_call` does the §4.1 public checks,
+then `@call(.always_tail, mahina_hostcall_entry, …)`. The entry is
+`jmp mahina_hostcall_slow` under entry-state CFI, before any prologue,
+exactly the pre-commit rejection edge of §3.3. `mahina_hostcall_slow` is
+H1's `hostcallSlow`, `@export`ed hidden. Every other target still
+tail-calls `hostcallSlow` directly.
+
+**Symbols.** H2 has three internal symbols, all hidden, definitions and
+references alike:
+- `mahina_hostcall_entry`, in the `.S`;
+- `mahina_hostcall_slow`, exported from `capi.zig`;
+- `mahina_hostcall_offsets_safety`, a byte in the `.S`'s `.rodata`
+  (§3.2 follow-up). This one is new, not in §4.2.
+
+A plain Zig `extern` declaration references its symbol with default
+visibility. So the Zig side declares the entry and the byte with
+`@extern(…, .{ .visibility = .hidden })`, which makes §6.3's per-object
+check hold in the Zig object as well as in the `.S`.
+
+**Deferred to H3: `mahina_hostcall_chain`, `mahina_hostcall_park_rest`
+and `ChainResult`.** None of them has a caller until the admitted path
+exists. An export with no caller would be untested code, and its
+signature is already fixed in §4.2. They land with H3, with
+`ChainResult`'s size and offsets added to the offsets file and its
+checker then.
+
+**The offsets file** holds everything §3.2 lists except `ChainResult`.
+That covers the `VmBox`/`Vm`/`TraceState`/`CallFrame`/`Closure`/`Proto`
+offsets and widths, the Q12 slice words and outer offsets, `Value`'s
+layout and tags, the limits (`max_call_depth` and `max_native_reentry`
+are now `pub` for it, and `ARGS_MAX` comes from `target.zig`'s
+`args_max`), `FrameResult`'s bit offsets, and the alignments. Some
+offsets depend on the safety mode; that's the follow-up in §3.2.
+
+**Build acceptance** (`just hostcall-acceptance [optimize]`, §6.3) passes
+in ReleaseFast and in Debug. What building it found:
+- **PIC isn't optional on this target.** Zig refuses `-fno-PIC` for the
+  native Linux target ("the selected target requires position
+  independent code"), so the acceptance build's `-Dlib-pic=true` only
+  makes explicit what every build already does. A non-PIC archive can't
+  serve as the negative control. Instead, a hand-made object with a
+  64-bit absolute address in `.text` (`movabs`) links into a shared
+  object with a `TEXTREL` without the flag, and fails with it. A 32-bit
+  absolute address would fail either way and prove nothing about the
+  flag (codex, H2 review).
+- **ReleaseFast already keeps `rbp`** in nearly every function (1305
+  against 1306 `push %rbp` with `-Dlib-frame-pointers=true`). The option
+  states it explicitly for the frame-pointer walks, as §3.3 asks.
+- **gdb's non-DWARF unwinder isn't a frame-pointer walk.** With DWARF
+  unwinding off, it analyses prologues and still unwinds frames that
+  never set `rbp`. So the frame-pointer leg follows the raw `rbp` chain
+  itself, and it must name exactly the frames of the CFI walk. A fixture
+  built with `-fomit-frame-pointer` is the negative control: its
+  callback drops out of the chain and the walk fails.
+- **gdb's walk isn't necessarily a DWARF walk either** (codex, H2
+  review). Its prologue analyser fills in for missing or rejected CFI.
+  A fixture built without unwind tables or debug info still walks from
+  its callback to `main`. gdb 15 can't switch unwinders off; that
+  arrived in gdb 16. So the DWARF leg runs each walk with `set debug
+  frame on`, logged to a file after flushing the frame cache. It
+  requires the log to show every machine frame accepted by the `dwarf2`
+  unwinder.
+  - That is gdb's own verdict, so an FDE gdb rejects also fails the
+    walk. An unsupported CIE version is one example.
+  - An earlier version inferred the same thing from `readelf`'s FDE
+    ranges. Round 2 of codex's review showed that inference is unsound:
+    readelf lists FDEs that gdb rejects.
+  - The no-CFI fixture is the negative control. Its log names `amd64
+    prologue` for `host_cb`.
+- **gdb stops on a function's first instruction** at `-O1`, before
+  `push %rbp`. The frame-pointer walk first single-steps through a
+  standard `[endbr64] push %rbp; mov %rsp,%rbp` prologue.
+- **The walks**, in both legs and both modes:
+  - the entry, DWARF leg only: `mahina_hostcall_entry ← main`. This is
+    the pre-commit stretch, with no frame of its own, which only its
+    entry-state CFI describes (§3.3). It is invisible to an `rbp` walk
+    by construction;
+  - the fallback: `mahina_hostcall_slow ← main`;
+  - the host callback: `host_cb ← capi[cHostCall] ← … ← opCall ←
+    mahina_hostcall_slow ← main`;
+  - the guest handler: `opRet ← mahina_hostcall_slow ← main`
+    (`callClosure`, `runPushedFrame` and `execWithEntry` are inline).
+  
+  Neither `mh_call` nor the entry leaves a frame. The entry/chain and
+  park-helper walks of §3.3's table arrive with H3.
+
+**Tests.**
+- `just test` passes, Debug. It now includes four tests of the offsets
+  checker itself (§3.2 follow-up).
+- The ReleaseFast leg passes: the hostcall diff, snapshot, `mh_call` and
+  offsets tests.
+- The Rust crates' `cargo test` passes in both the debug and release
+  profiles, each linking an archive with the `.S`.
+
+**Measured: the cost of the hop.** The doc-59 embed probe
+(`bench/embed/hostcall_probe.c`), median of 5 interleaved runs of 2M
+calls, JIT off. The baseline is this tree with the gate forced off,
+which is H1.5's `mh_call` exactly: `a1` is 449 instructions in both.
+
+| shape | ins H1.5 | ins H2 | Δins | cycles H1.5 | cycles H2 | Δcyc |
+|---|---:|---:|---:|---:|---:|---:|
+| a0 | 401 | 408 | +7 | 64.9 | 64.8 | −0.2% |
+| a1 | 449 | 453 | +4 | 69.3 | 69.1 | −0.2% |
+| a4 | 506 | 510 | +4 | 79.8 | 76.1 | −4.7% |
+| a8 | 555 | 558 | +3 | 87.7 | 84.5 | −3.6% |
+| a9 | 583 | 586 | +3 | 93.0 | 95.1 | +2.3% |
+| r0 | 332 | 341 | +9 | 54.8 | 57.2 | +4.5% |
+| r1 | 401 | 408 | +7 | 64.1 | 66.9 | +4.4% |
+| r4 | 524 | 531 | +7 | 91.4 | 88.0 | −3.8% |
+| heap | 467 | 472 | +5 | 72.9 | 72.1 | −1.2% |
+| vararg | 510 | 508 | −2 | 78.3 | 77.5 | −1.1% |
+| wide | 1553 | 1556 | +3 | 286.1 | 285.8 | −0.1% |
+| overflow | 900 | 912 | +12 | 165.0 | 159.2 | −3.5% |
+
+- Instructions move by −2…+12; every shape but `vararg` pays +3…+12.
+  Two of those are the `jmp`s. The rest is what LLVM can no longer do
+  once `hostcallSlow` is out of line: in the baseline it's inlined into
+  `mh_call`, an 808-instruction function that shares its argument
+  handling. `vararg`'s −2 is presumably that register allocation going
+  the other way; not investigated.
+- The cycle deltas go both ways, within ±5% on a loaded machine
+  (loadavg ~2.7), so they read as noise.
+- This is a transitional cost. Shipping H2 without H3 would mean paying
+  it for nothing, and H3's A/B (§7 criterion 4) is measured against
+  H1.5, the baseline here, not against H2.
+
 ## 6. Testing
 
 ### 6.1 Differential tests: two stages, normalized comparison
@@ -1355,6 +1594,13 @@ Rust crate tests) run unchanged.
 - **Tail call.** `objdump` of the Zig `mh_call` shows a `jmp` to
   `mahina_hostcall_entry` with no frame left behind (Q11).
 
+**As built (H2, 2026-10-04):** `just hostcall-acceptance [optimize]` runs
+`tools/hostcall-acceptance.sh`. The host fixture is
+`tests/hostcall_accept.c`, and the gdb walks are in
+`tools/hostcall_walk.py`. Each check has a negative control where one is
+possible. The findings, and why the frame-pointer leg walks the `rbp`
+chain itself, are in §5.7.
+
 ### 6.4 Budgets are benchmarks, not tests
 
 The §5.3 ledgers are measured by the embed probe and the embed benchmark,
@@ -1419,14 +1665,19 @@ its own doc, built on this one's `.S` and offsets machinery.
 - [x] **Q10: result parking.** The assembly parks into inline slots and
   calls a Zig helper for the rest on overflow (Bart, 2026-10-03; §4.3
   step 10).
-- [ ] **Q11: verify at H2 against the pinned toolchain:**
-  - `.S` preprocessing, or the `.assembly_with_preprocessor` fallback;
-  - hidden `@export`;
-  - `always_tail` compiling to a plain `jmp` with this signature. H1
-    shows it **compiles** with the seven-parameter C signature when the
-    target is the Zig `hostcallSlow`, which LLVM then inlines (§5.5). The
-    `jmp` to an external hidden `.S` symbol is still unverified;
-  - the §6.3 checks.
+- [x] **Q11: verify at H2 against the pinned toolchain** (2026-10-04,
+  §5.7):
+  - `.S` preprocessing, or the `.assembly_with_preprocessor` fallback:
+    the build uses `addCSourceFile` with `.assembly_with_preprocessor`,
+    and the `.S` relies on `#include`, `#if` and `#define`;
+  - hidden `@export`: `mahina_hostcall_slow` is `GLOBAL HIDDEN`; hidden
+    references need `@extern(…, .{ .visibility = .hidden })`, since a
+    plain `extern` declaration references with default visibility;
+  - `always_tail` compiling to a plain `jmp` with this signature: yes.
+    In ReleaseFast and Debug, `mh_call` pops its frame and ends in `jmp
+    mahina_hostcall_entry` (`R_X86_64_PLT32`, direct once linked), and
+    no walk shows an `mh_call` frame;
+  - the §6.3 checks: all pass (`just hostcall-acceptance`).
 - [x] **Q12: the register file and overflow park: (a)**, a stated slice
   exception (Bart, 2026-10-03; §3.2). The slice layout is checked by an
   executable test and a check at VM creation, because comptime can't
@@ -1576,3 +1827,44 @@ the src-only-with-anchor invariant at every write site.
 Round 2 (`codex-h15-r2.md`): codex confirmed both original findings
 resolved, raised the one-word fix above, and found nothing else. Round 3
 (`codex-h15-r3.md`): **APPROVE**, no findings.
+
+### H2 implementation review (2026-10-04)
+
+`codex-h2.md` (CHANGES REQUESTED, two blocking) and `antigravity-h2.md`
+(APPROVE).
+
+| finding | status | where |
+|---|---|---|
+| codex 1 (blocking): `064` passes the checker as 64; gas reads octal 52 | fixed: canonical decimal only; unit tests over the rejected spellings | `offsets_x64.zig`, §3.2 |
+| codex 2 (blocking): a `//` comment ending in `\` splices `#else` away; the safety byte can't see it | fixed: lines ending in `\` (or holding `??/`) are rejected before comments are skipped; tested | `offsets_x64.zig`, §3.2 |
+| codex 3: cargo doesn't rerun on `.S`/offsets changes | fixed: `mahina-sys` watches `src/` and `include/` recursively, which also closes the older gap for unlisted `.zig` files | `build.rs` |
+| codex 4: the DWARF leg may be prologue analysis; the entry's CFI is never walked | fixed: every frame must lie inside an FDE (gdb tries dwarf2 first); a walk stops in the entry; a no-CFI fixture is the negative control | `hostcall_walk.py`, §5.7 |
+| codex 5: `movl $f` fails without `-z text` too | fixed: a `movabs` control must link without the flag (with `TEXTREL`) and fail with it | `hostcall-acceptance.sh` |
+| codex 6 (nit): the lock is 1 byte; the map grows 8 by padding | fixed | §3.2, `offsets_x64.zig` |
+| codex 7 (nit): "+3…+12" omits `vararg`'s −2 | fixed | §5.7, status |
+| antigravity 1: runtime checks only in `mh_vm_new`, not in tests' `createVm` | fixed: moved into `createVm` | `capi.zig` |
+| antigravity 2: H3 must extend the required-symbol list, the hidden references and the walks | noted: already in the H3 bullet (carried over from H2) | status |
+| antigravity 3: `capi-smoke` asserts vanish under `NDEBUG` (pre-existing, TODO.md) | fixed separately, in its own commit after H2 | `tests/capi_smoke.c` |
+| antigravity 4 (nit): a name missing from the other mode's block prints this mode's number | fixed: prints the name only, and says a build of that kind gives the number | `offsets_x64.zig` |
+
+Round 2 (`codex-h2-r2.md`, CHANGES REQUESTED; `antigravity-h2-r2.md`,
+APPROVE). Both confirmed the round-1 fixes, apart from the two below.
+
+| finding | status | where |
+|---|---|---|
+| codex r2 1 (blocking): a bare CR ends a cpp line inside a `//` comment; a backslash then a form feed still splices (antigravity r2 3: vertical tab, nit) | fixed: only printable ASCII and tabs, anywhere; tests for CR, FF, VT and CRLF | `offsets_x64.zig`, §3.2 |
+| codex r2 2: readelf's FDE ranges aren't gdb's (it rejects e.g. a version-2 CIE) | fixed: the walk reads gdb's own frame-debug log and requires `dwarf2` per frame. No separate rejected-CIE fixture: the check no longer parses CIEs, and the no-CFI control shows the verdict is read | `hostcall_walk.py`, §5.7 |
+| codex r2 3 / antigravity r2 1 (nit): `.inc` still says "8-byte SafetyLock" | fixed | `offsets_x64.inc` |
+| antigravity r2 2 (nit): `mh_vm_new` still named in `build.zig` and §3.2 | fixed (§3.2: an as-built note on the plan text) | `build.zig`, §3.2 |
+
+Round 3 (`codex-h2-r3.md`, `antigravity-h2-r3.md`): both **APPROVE**, no
+findings.
+- Both confirmed the byte check in every optimize mode.
+- Both confirmed that the log's `this_frame` levels and
+  `gdb.Frame.level()` are the same `frame_relative_level`, with gaps
+  for skipped inline frames.
+- codex ran the parser against simulated events: an inline gap passes,
+  while a prologue fallback, a missing event and `dwarf2 signal` all
+  fail.
+- codex agreed that a separate version-2-CIE fixture is no longer
+  needed.

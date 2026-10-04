@@ -66,6 +66,31 @@ const Proto = mahina.bytecode.Proto;
 /// instead, so leaks fail the suite).
 const c_gpa = std.heap.c_allocator;
 
+/// Doc 60 §3.1: whether this target links the hand-written host-call entry
+/// (`src/asm/hostcall_x64.S`). The same predicate gates the file in
+/// `build.zig`, so the entry is linked exactly when `mh_call` refers to it.
+const hostcall_asm = @import("asm/target.zig").hostcallEntry(&builtin.target);
+
+/// The `.S` entry: `mh_call`'s signature, under `mh_call`'s narrow contract
+/// (§4.1). Hidden, the reference included (§6.3 checks it per object); only
+/// `mh_call` calls it, as a tail call.
+const asm_entry = if (hostcall_asm) struct {
+    const mahina_hostcall_entry = @extern(
+        *const fn (vm: ?*VmBox, callee: mh_value, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: ?*usize) callconv(.c) mh_status,
+        .{ .name = "mahina_hostcall_entry", .visibility = .hidden },
+    );
+} else struct {};
+
+comptime {
+    if (hostcall_asm) {
+        // The comptime check of the offsets file the entry is assembled with.
+        _ = @import("asm/offsets_x64.zig");
+        // H1, under the name the entry's fallback edge jumps to. Hidden: the
+        // only default-visibility host-call symbol stays `mh_call` (§4.2).
+        @export(&hostcallSlow, .{ .name = "mahina_hostcall_slow", .visibility = .hidden });
+    }
+}
+
 // The static library is linked by a foreign toolchain (cc, rustc), so it must
 // supply `__zig_probe_stack` — the x86 stack-probe routine LLVM calls for
 // frames larger than a page — itself. It must NOT bundle the rest of Zig's
@@ -430,6 +455,17 @@ fn hostRandomSeed(_: *anyopaque) u64 {
 /// Internal constructor, parameterized on the backing allocator so tests run
 /// on `std.testing.allocator` (leak-checked) while the C export uses malloc.
 pub fn createVm(backing: std.mem.Allocator, config: mh_config) !*VmBox {
+    // Doc 60 §3.2: what comptime can't check about the entry's offsets is a
+    // hard stop here, for every VM (the tests' included), never a silent
+    // miscompute — the slices' {ptr, len} word order (Q12 (a)), and that the
+    // `.S` was assembled with this build's safety-mode offsets block.
+    if (hostcall_asm) {
+        const offsets = @import("asm/offsets_x64.zig");
+        if (!offsets.verifySliceLayout())
+            @panic("mahina: slice layout differs from src/asm/offsets_x64.inc (doc 60 Q12)");
+        if (!offsets.verifyAssembledMode())
+            @panic("mahina: hostcall_x64.S was assembled for the other runtime-safety mode (doc 60 §3.2)");
+    }
     if (config.jit < 0 or config.jit > 2) return error.InvalidConfig;
     const box = try backing.create(VmBox);
     errdefer backing.destroy(box);
@@ -703,6 +739,8 @@ pub export fn mh_call(vm: ?*VmBox, callee: mh_value, args: ?[*]const mh_value, n
     // A null buffer already meant "no results" (`resultsSlice`); normalizing
     // here means no inner layer sees a null `results` with a nonzero length.
     const max = if (results == null) 0 else max_results;
+    if (hostcall_asm)
+        return @call(.always_tail, asm_entry.mahina_hostcall_entry, .{ box, callee, args, nargs, results, max, nres });
     return @call(.always_tail, hostcallSlow, .{ box, callee, args, nargs, results, max, nres });
 }
 
@@ -1352,4 +1390,5 @@ pub export fn mh_table_iter_free(vm: ?*VmBox, iter: ?*IterBox) mh_status {
 test {
     _ = @import("capi_test.zig");
     _ = @import("capi_hostcall_test.zig");
+    if (hostcall_asm) _ = @import("asm/offsets_x64.zig");
 }

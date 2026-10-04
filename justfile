@@ -34,6 +34,12 @@ run *args:
 check-version:
     zig build -Denforce-zig-version=true
 
+# Doc 60 §6.3 build acceptance for the hand-written host-call entry (Linux
+# x86-64): per-object visibility, -z text shared/PIE links, the tail call, and
+# DWARF + frame-pointer unwinding walks in gdb. Needs cc, gdb and binutils.
+hostcall-acceptance optimize="ReleaseFast":
+    bash tools/hostcall-acceptance.sh {{optimize}}
+
 # Args pass through to bench/run.py: just bench --filter str / --reps 7 / --no-luajit
 # Run the benchmark suite (rebuilds ReleaseFast first, so never a stale Debug binary).
 bench *args: release

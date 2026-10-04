@@ -129,7 +129,7 @@ const stack_slots: usize = 1 << 16;
 /// Lua call), so this bounds how deep a Lua program may recurse before we report
 /// `StackOverflow` — `pushFrame` is the single guard. Tier-0 is the correctness
 /// oracle, not the deep-recursion tier.
-const max_call_depth: u32 = 200;
+pub const max_call_depth: u32 = 200;
 
 /// Maximum nesting of native→VM reentry (`callValue`). Each level is a native
 /// (e.g. `pcall`/`table.sort`/`gsub`) that calls back into the dispatch loop on
@@ -137,7 +137,7 @@ const max_call_depth: u32 = 200;
 /// frame stack. A `pcall(pcall(pcall(…)))` chain or a comparator that recurses
 /// through `table.sort` grows this; the cap turns host-stack exhaustion into a
 /// clean `StackOverflow` instead of a crash.
-const max_native_reentry: u16 = 200;
+pub const max_native_reentry: u16 = 200;
 
 /// Which nondeterministic input a native represents (record/replay boundary), or
 /// null for a pure host call. Defined on `function` (the `Native` carrier) to keep
@@ -809,8 +809,11 @@ pub const Vm = struct {
     /// Test builds only (doc 60 §6.1): when set, `runFastPath` decides from
     /// the nine fields directly (`fastBlockReference`) instead of the packed
     /// `trace.fast_block`, so a differential test's reference leg cannot share
-    /// a mask bug with the leg under test. `void` outside tests.
-    reference_dispatch: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+    /// a mask bug with the leg under test. Read only under `builtin.is_test`,
+    /// but a plain `bool` in every build: the hand-written host-call entry's
+    /// offsets file (doc 60 §3.2) must hold for test and library builds
+    /// alike, so no `Vm` field's type may depend on the build.
+    reference_dispatch: bool = false,
 
     /// A runtime-compiled chunk owned by the VM: the `Chunk` (whose arena owns the
     /// proto tree) and the NUL-terminated source the protos borrow.
