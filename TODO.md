@@ -4,12 +4,26 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 
 ## `capi-smoke` hangs under `zig build test -Doptimize=ReleaseFast` (noted 2026-10-03)
 
-- [ ] **`tests/capi_smoke.c` puts every API call inside `assert(...)`** (30
+- [x] **`tests/capi_smoke.c` puts every API call inside `assert(...)`** (30
       sites). Zig compiles C with `-DNDEBUG` in release modes, so the calls
       vanish: the `mh_table_iter_next` loop never advances and spins
       forever (found while running doc 60 H1's tests in ReleaseFast; the
       Debug gate never sees it). Fix: a `CHECK(expr)` macro that always
       evaluates, or `-UNDEBUG` on the smoke module in `build.zig:147`.
+      **Fixed 2026-10-04:** `#undef NDEBUG` before `<assert.h>` in the
+      smoke test; `zig build test -Doptimize=ReleaseFast` now completes.
+
+## `zig build test -Doptimize=ReleaseFast` runs the VM core's tests in Debug (noted 2026-10-04)
+
+- [ ] **`mod_tests` ignore `-Doptimize`.** The `mahina` module
+      (`b.addModule("mahina", …)`, `build.zig:48`) sets no `.optimize`, so
+      its test compile is always Debug (`--summary all` shows
+      `compile test Debug native` under `-Doptimize=ReleaseFast`). Only the
+      capi and CLI test binaries follow the flag, so the ~1600 core tests
+      have never run in ReleaseFast. Giving `mod` `.optimize = optimize`
+      would fix the tests; check first what that changes for the module's
+      other importers (the CLI and `capi_mod` set their own root optimize
+      mode).
 
 ## libmahina.a replaces the host's memset/memcpy with byte loops (noted 2026-10-02)
 

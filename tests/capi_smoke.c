@@ -7,6 +7,11 @@
  * tables, iteration, errors.
  */
 #define _GNU_SOURCE /* memmem */
+/* Every API call below sits inside an assert. Zig compiles C with -DNDEBUG
+ * in release modes, which would delete the calls along with the checks (the
+ * iterator loop then never advances and spins forever), so the asserts stay
+ * live in every mode. */
+#undef NDEBUG
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
