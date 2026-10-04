@@ -1676,13 +1676,18 @@ Three things to remember when reading those boards:
   * a +-2..3% single-row move with UNCHANGED trace structure is binary code layout, not
     behaviour. Diff `--dump-native` (it will differ only in embedded addresses) rather
     than re-timing. Confirmed this way for `str_find_match` and `scimark-lu` in doc 32.
-  * **absolute ms are not comparable across runs either** (discovered 2026-09-03, doc 34
-    board). The autoscale pool picks the cheapest available spot instance type, which can
-    be a different CPU generation: the B2b board ran on a Xeon 6975P-C (Granite Rapids),
-    the doc 34 board on a Xeon Platinum 8375C (Ice Lake) — ~2× absolute difference, same
-    ratios. **Fix (Gothab side):** pin the bench pool's `instance_type_allowlist` to a
-    single instance type or CPU generation. Until then, only jit/lj RATIOS are comparable
-    across runs; absolute wall-clock A/B needs both runs on the same hardware.
+  * ~~absolute ms are not comparable across runs either~~ **FIXED 2026-10-04.** The old
+    unpinned pool picked the cheapest spot type (Granite Rapids one run, Ice Lake the
+    next, ~2× apart). The workflow now targets `runs-on: pt-default`, a pool pinned to
+    c8id.large (2 vCPU). Gothab refuses profile jobs without a pinned label. Two
+    back-to-back runs of identical code (fac4c94) differed by **0.30% mean |Δ| over
+    all 86 wall rows**, max 1.1% outside the 0.7 ms probe. Absolute ms ARE now comparable
+    across pt-default runs (still not to desktop `bench/results/`).
+  * `gt profile` ships committed-but-unpushed + dirty changes as a patch on origin. Two
+    traps: the patch is capped (a 2.9 MB diff got 413), and untracked files are not
+    shipped (another agent's dirty `build.zig` importing its untracked `src/asm/` broke
+    the remote build). For a clean board of committed work, push, then
+    `gt profile --sha $(git rev-parse HEAD)`. It needs the FULL sha; a short one is rejected.
 
 ## Numeric φ widening (next arc after doc 38, 2026-09-04)
 
