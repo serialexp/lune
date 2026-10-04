@@ -110,6 +110,22 @@ mahina C API 7.3, Rust crate 26.8. Items, each measured on its own:
       the Zig H1 path. Write `hostcall_win64.S` (or
       equivalent) only if a Windows embedder's profile asks for it.
 
+## Frame pc conventions: two pre-existing suspects (noted 2026-10-05, doc 61 fact-finding)
+
+- [ ] **`backtraceFrames`/`callSiteAt` (interp.zig ~1719, ~1973) assume every
+      parent frame's pc is one past its call.** A frame re-entered through
+      `callValue` from inside an instruction (metamethods, `pcall`, `sort`,
+      `gsub`, `require`, load, capi) has `frame.pc` = the in-flight
+      instruction itself (dispatch prologue step 6), so its reported call
+      site is one instruction off. Doc 61 Phase 0's in-flight marker gives
+      the fix; land it as its own change.
+- [ ] **Multret arguments may be unrooted across a call.** Once a consumer
+      `call b=all_results` clears `reg_top_pending` (interp.zig ~6378), its
+      arguments above the window sit only in `boundary_scratch`, which is not
+      a GC root; and the `.function` arm lays the callee window at
+      `base+num_registers`, which can overlap them. Unverified: write a
+      `gc_stress` repro before fixing.
+
 ## `hashgate.py --generate --filter X` wipes every other program's refs (noted 2026-10-01)
 
 - [ ] `write_refs` writes only the observed (filtered) rows, so a filtered
