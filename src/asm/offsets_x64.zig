@@ -170,6 +170,12 @@ const expected = [_]Entry{
     .{ .name = "FRAMERESULT_REG_BIT", .value = @bitOffsetOf(interp.FrameResult, "reg") },
     .{ .name = "FRAMERESULT_COUNT_BIT", .value = @bitOffsetOf(interp.FrameResult, "count") },
 
+    // ChainResult (§4.2), returned whole in rax, and the status it carries.
+    .{ .name = "CHAINRESULT_SIZE", .value = @sizeOf(capi.ChainResult) },
+    .{ .name = "CHAINRESULT_STATUS", .value = off(capi.ChainResult, "status") },
+    .{ .name = "CHAINRESULT_FRAME_RESULT", .value = off(capi.ChainResult, "frame_result") },
+    .{ .name = "MH_OK", .value = @intFromEnum(capi.mh_status.ok) },
+
     // Alignments the code relies on.
     .{ .name = "VMBOX_ALIGN", .value = @alignOf(VmBox) },
     .{ .name = "VM_ALIGN", .value = @alignOf(Vm) },

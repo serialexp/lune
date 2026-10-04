@@ -69,7 +69,7 @@ const c_gpa = std.heap.c_allocator;
 /// Doc 60 §3.1: whether this target links the hand-written host-call entry
 /// (`src/asm/hostcall_x64.S`). The same predicate gates the file in
 /// `build.zig`, so the entry is linked exactly when `mh_call` refers to it.
-const hostcall_asm = @import("asm/target.zig").hostcallEntry(&builtin.target);
+pub const hostcall_asm = @import("asm/target.zig").hostcallEntry(&builtin.target);
 
 /// The `.S` entry: `mh_call`'s signature, under `mh_call`'s narrow contract
 /// (§4.1). Hidden, the reference included (§6.3 checks it per object); only
@@ -85,11 +85,23 @@ comptime {
     if (hostcall_asm) {
         // The comptime check of the offsets file the entry is assembled with.
         _ = @import("asm/offsets_x64.zig");
-        // H1, under the name the entry's fallback edge jumps to. Hidden: the
-        // only default-visibility host-call symbol stays `mh_call` (§4.2).
+        // The three Zig functions the entry calls, hidden: the only
+        // default-visibility host-call symbol stays `mh_call` (§4.2). H1,
+        // under the name the entry's fallback edge jumps to; the run of an
+        // admitted call; and the result-park overflow.
         @export(&hostcallSlow, .{ .name = "mahina_hostcall_slow", .visibility = .hidden });
+        @export(&hostcallChain, .{ .name = "mahina_hostcall_chain", .visibility = .hidden });
+        @export(&hostcallParkRest, .{ .name = "mahina_hostcall_park_rest", .visibility = .hidden });
     }
 }
+
+/// Test builds only: how many calls reached H1 and how many the `.S` entry
+/// admitted, so the differential tests can prove which path a call took (a
+/// stage-2 diff in which every call fell back would compare H1 with itself).
+/// A global, not a `Vm` field: the offsets file needs one `Vm` layout for
+/// test and library builds (doc 60 §3.2).
+pub var hostcall_counts: if (builtin.is_test) struct { slow: usize = 0, chain: usize = 0 } else void =
+    if (builtin.is_test) .{} else {};
 
 // The static library is linked by a foreign toolchain (cc, rustc), so it must
 // supply `__zig_probe_stack` — the x86 stack-probe routine LLVM calls for
@@ -744,6 +756,19 @@ pub export fn mh_call(vm: ?*VmBox, callee: mh_value, args: ?[*]const mh_value, n
     return @call(.always_tail, hostcallSlow, .{ box, callee, args, nargs, results, max, nres });
 }
 
+/// Doc 60 §6.1, for the differential tests: `mh_call` with H1 as its target
+/// on every target — stage 1's leg under test, and stage 2's reference for
+/// the `.S` entry. The public checks are `mh_call`'s, line for line; keep
+/// the two in step. Not exported and not called by the library.
+pub fn mhCallViaH1(vm: ?*VmBox, callee: mh_value, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: ?*usize) mh_status {
+    const box = vm orelse return .err_api;
+    const nres = nresults orelse return .err_api;
+    nres.* = 0;
+    if (checkFatal(box)) |s| return s;
+    const max = if (results == null) 0 else max_results;
+    return hostcallSlow(box, callee, args, nargs, results, max, nres);
+}
+
 /// Doc 60 H1: the minimal-work host call, in Zig — the reference entry, the
 /// fallback for every pre-commit rejection of a hand-written entry, and the
 /// whole path on targets without one. Narrow contract (established by
@@ -754,6 +779,7 @@ pub export fn mh_call(vm: ?*VmBox, callee: mh_value, args: ?[*]const mh_value, n
 fn hostcallSlow(vm: ?*VmBox, callee: mh_value, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: ?*usize) callconv(.c) mh_status {
     const box = vm.?;
     const nres = nresults.?;
+    if (builtin.is_test) hostcall_counts.slow += 1;
     // Doc 60 §5.4 check site 3: every H1 entry, whatever routed it here.
     if (std.debug.runtime_safety) std.debug.assert(box.vm.trace.fast_block == box.vm.fastBlockReference());
     std.debug.assert(nres.* == 0 and !box.fatal and (max_results == 0 or results != null));
@@ -804,6 +830,39 @@ inline fn callClosure(box: *VmBox, cl: *const function.Closure, args: []const Va
     vm.stack_top = entry_top;
     if (status != .ok) return status;
     nres.* = produced;
+    return .ok;
+}
+
+/// Doc 60 §4.2: what `mahina_hostcall_chain` returns to the `.S` entry, whole
+/// in `rax`. `status` comes first, so it is already in `eax`; on `MH_OK`
+/// `frame_result` (the upper half) is the packed `FrameResult`. Both offsets
+/// and the size are in the offsets file.
+pub const ChainResult = extern struct { status: u32, frame_result: u32 };
+
+/// Doc 60 §4.1 layer 3: run the frame the `.S` entry just pushed at
+/// `frames[entry_depth]` (callee window at `base`). On an error, the fault
+/// contract runs here, unchanged (§4.3 step 14), while the faulting frames
+/// are live; the entry then only restores its registers and returns.
+fn hostcallChain(box: *VmBox, base: usize, entry_top: usize, entry_depth: u32) callconv(.c) ChainResult {
+    const vm = &box.vm;
+    if (builtin.is_test) hostcall_counts.chain += 1;
+    std.debug.assert(!vm.reg_top_pending);
+    const fr = vm.runPushedFrame(entry_depth, base) catch |e|
+        return .{ .status = @intCast(@intFromEnum(guestFault(box, entry_depth, entry_top, e))), .frame_result = 0 };
+    std.debug.assert(vm.pending_error == null);
+    return .{ .status = @intFromEnum(mh_status.ok), .frame_result = @bitCast(fr) };
+}
+
+/// Doc 60 §4.3 step 10: park the heap values among `results[from..produced]`
+/// once the `.S` entry has run out of inline slots — through the ordinary
+/// `park` (inline, then the overflow list), so the order and the OOM
+/// behaviour are `callClosure`'s. The entry has already copied every result
+/// out and restored `stack_top`; `*nresults` stays 0 on an error.
+fn hostcallParkRest(box: *VmBox, results: ?[*]const mh_value, from: usize, produced: usize) callconv(.c) mh_status {
+    const rs: [*]const Value = @ptrCast(results.?);
+    for (rs[from..produced]) |*r| {
+        if (park(box, Value.loadWords(r)) != .ok) return .err_oom;
+    }
     return .ok;
 }
 

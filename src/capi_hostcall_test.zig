@@ -1,9 +1,14 @@
-//! Doc 60 §6.1 stage 1: the H1 host-call entry (`mh_call` → `hostcallSlow`,
-//! closure callees through `pushHostCall` + `runPushedFrame`) diffed against
-//! the pre-H1 path (`capi.hostcallReference` → `runProtected` → `callValue`).
+//! Doc 60 §6.1, both stages. Stage 1: the H1 host-call entry
+//! (`capi.mhCallViaH1` → `hostcallSlow`, closure callees through
+//! `pushHostCall` + `runPushedFrame`) diffed against the pre-H1 path
+//! (`capi.hostcallReference` → `runProtected` → `callValue`). Stage 2, on
+//! targets with the hand-written entry: `mh_call` (→ `hostcall_x64.S`, which
+//! admits or falls back to H1) diffed against H1. `capi.hostcall_counts`
+//! shows which path a call took; the admission test below pins that stage 2
+//! really exercises the entry's own path.
 //!
 //! Every test runs the same script and the same call sequence on two VMs:
-//! leg 0 is H1, leg 1 the reference. The reference VM dispatches on the
+//! leg 0 is the code under test, leg 1 its reference. The leg-1 VM dispatches on the
 //! original nine-condition predicate (`Vm.reference_dispatch`), so the two
 //! legs cannot share a packed-word bug. After every call both VMs are
 //! rendered into a normalized snapshot (`snap`) and the snapshots must be
@@ -25,11 +30,13 @@
 //! live frames, open cells and nested reentry are compared too.
 //!
 //! Every scenario runs on all three tiers: JIT off, the tier-1 IR
-//! interpreter, and native code (`Tier`). The embedding has no record/replay
-//! mode today (`createVm` keeps effects `.off`, doc 59 §3.7), so there is no
-//! replay leg to run. Not covered here: `next_call_seq` exhaustion, which
-//! panics in both legs through the same `pushFrameTrusted` (needs a
-//! subprocess harness — doc 60 Outstanding).
+//! interpreter, and native code (`Tier`), and in all three effect modes
+//! (`Mode`): off, record, and replay of the record run's log. The public
+//! API keeps effects `.off` (doc 59 §3.7), so the harness sets the mode on
+//! the VM directly. Host callbacks run again on replay instead of being
+//! replayed (doc 59 E6); they are deterministic here. Not covered here:
+//! `next_call_seq` exhaustion, which panics in both legs through the same
+//! `pushFrameTrusted` (needs a subprocess harness — doc 60 Outstanding).
 
 const std = @import("std");
 const testing = std.testing;
@@ -57,13 +64,54 @@ fn detClock(_: *anyopaque) i64 {
 fn detSeed(_: *anyopaque) u64 {
     return 0x5eed_5eed;
 }
+// `getenv` is the effect with a heap (string) result, so the log, and on
+// replay the decoded log, holds heap values.
+fn detGetenv(_: *anyopaque, name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "HOME")) return "/det/home";
+    if (std.mem.startsWith(u8, name, "V")) return name[1..];
+    return null;
+}
+fn detArgCount(_: *anyopaque) i64 {
+    return 0;
+}
+fn detArg(_: *anyopaque, _: i64) ?[]const u8 {
+    return null;
+}
+
+/// The effect-log mode of both legs (doc 60 §6.1's record and replay legs).
+/// The embedding's public API keeps effects `.off` (doc 59 §3.7), so the
+/// harness sets the VM's mode directly, as `wasm_entry.zig` does.
+const Mode = mahina.interp.EffectMode;
+const modes = [_]Mode{ .off, .record, .replay };
+
+/// The two stages of §6.1. Stage 1 diffs H1 against the pre-H1 path, on
+/// every target. Stage 2 diffs the hand-written `.S` entry (`mh_call` on the
+/// gated target) against H1, where that entry exists.
+const Stage = enum {
+    h1,
+    asm_entry,
+
+    fn label(stage: Stage, leg: usize) []const u8 {
+        return switch (stage) {
+            .h1 => if (leg == 0) "H1" else "reference",
+            .asm_entry => if (leg == 0) ".S entry" else "H1",
+        };
+    }
+};
+const stages = if (capi.hostcall_asm) [_]Stage{ .h1, .asm_entry } else [_]Stage{.h1};
 
 /// The two entries under comparison. Leg 0 is the code under test.
-fn entry(leg: usize, vm: ?*capi.VmBox, callee: mh_value, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: ?*usize) Status {
-    return if (leg == 0)
-        capi.mh_call(vm, callee, args, nargs, results, max_results, nresults)
-    else
-        capi.hostcallReference(vm, callee, args, nargs, results, max_results, nresults);
+fn entry(stage: Stage, leg: usize, vm: ?*capi.VmBox, callee: mh_value, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: ?*usize) Status {
+    return switch (stage) {
+        .h1 => if (leg == 0)
+            capi.mhCallViaH1(vm, callee, args, nargs, results, max_results, nresults)
+        else
+            capi.hostcallReference(vm, callee, args, nargs, results, max_results, nresults),
+        .asm_entry => if (leg == 0)
+            capi.mh_call(vm, callee, args, nargs, results, max_results, nresults)
+        else
+            capi.mhCallViaH1(vm, callee, args, nargs, results, max_results, nresults),
+    };
 }
 
 fn lastError(box: *capi.VmBox) []const u8 {
@@ -365,6 +413,10 @@ const Callee = union(enum) {
     /// The first result of evaluating `return <expr>`: rooted only by the
     /// park until the call re-parks it.
     eval: []const u8,
+    /// Result `i` of this leg's previous call. No API call runs in between,
+    /// so the entry's own idle clear is the one that empties the park
+    /// (`.global`/`.eval` go through API entries that clear it first).
+    prev: usize,
 };
 
 const CallSpec = struct {
@@ -388,14 +440,28 @@ const Pair = struct {
     box: [2]*capi.VmBox,
     keyframes: bool,
     tier: Tier,
-    /// Leg 0's status from the last `call` (the legs are equal by then).
+    stage: Stage,
+    mode: Mode,
+    /// Leg 0's status and results from the last `call` (the legs are equal
+    /// by then).
     last_status: Status,
+    last_results: [16]mh_value,
+    last_nres: usize,
+    /// Each leg's results from the last `call`, for `Callee.prev`.
+    prev_results: [2][16]mh_value,
 
-    /// In place: the failing allocators must have stable addresses.
-    fn init(self: *Pair, tier: Tier) !void {
+    /// In place: the failing allocators must have stable addresses. In
+    /// `.replay`, `log` is the serialized effect log both legs replay.
+    fn init(self: *Pair, tier: Tier, stage: Stage, mode: Mode, log: ?[]const u8) !void {
+        std.debug.assert((mode == .replay) == (log != null));
         self.keyframes = true;
         self.tier = tier;
+        self.stage = stage;
+        self.mode = mode;
         self.last_status = .ok;
+        self.last_results = @splat(.{});
+        self.last_nres = 0;
+        self.prev_results = @splat(@splat(.{}));
         for (0..2) |leg| {
             self.fa[leg] = .init(testing.allocator, .{});
             const box = try capi.createVm(self.fa[leg].allocator(), .{ .jit = if (tier == .off) 2 else 0 });
@@ -403,6 +469,13 @@ const Pair = struct {
             const vm = &box.vm;
             vm.clock_source = .{ .ctx = &det_ctx, .nowNs = &detClock };
             vm.random_seed_source = .{ .ctx = &det_ctx, .seed = &detSeed };
+            vm.host_env = .{ .ctx = &det_ctx, .getenv = &detGetenv, .argCount = &detArgCount, .arg = &detArg };
+            vm.effect_mode = mode;
+            if (log) |bytes| {
+                const effects = try mahina.effectser.decodeFile(vm.gpa, vm.heap, bytes);
+                defer vm.gpa.free(effects);
+                try vm.effect_log.appendSlice(vm.gpa, effects);
+            }
             if (tier == .tier1) vm.trace.config.native_codegen = false;
             if (tier != .off) {
                 vm.trace.config.hotloop = 4;
@@ -430,9 +503,10 @@ const Pair = struct {
     }
 
     fn expectSame(self: *Pair, snaps: *const [2]Snap) !void {
-        _ = self;
         testing.expectEqualStrings(snaps[1].text, snaps[0].text) catch |e| {
-            std.debug.print("\n--- H1 (leg 0) ---\n{s}\n--- reference (leg 1) ---\n{s}\n", .{ snaps[0].text, snaps[1].text });
+            std.debug.print("\n--- {s} (leg 0) ---\n{s}\n--- {s} (leg 1) ---\n{s}\n", .{
+                self.stage.label(0), snaps[0].text, self.stage.label(1), snaps[1].text,
+            });
             return e;
         };
         // Equal text ⇒ the same blob labels in the same order.
@@ -459,9 +533,11 @@ const Pair = struct {
         try self.expectSame(&snaps);
     }
 
-    fn makeCallee(box: *capi.VmBox, c: Callee) !mh_value {
+    fn makeCallee(self: *const Pair, leg: usize, c: Callee) !mh_value {
+        const box = self.box[leg];
         return switch (c) {
             .raw => |r| r,
+            .prev => |i| self.prev_results[leg][i],
             .global => |name| blk: {
                 var v: mh_value = .{};
                 try testing.expectEqual(Status.ok, capi.mh_global_get(box, s(name), &v));
@@ -511,7 +587,7 @@ const Pair = struct {
             const box = self.box[leg];
             var refs: std.ArrayList(u64) = .empty;
             defer refs.deinit(testing.allocator);
-            const callee = try makeCallee(box, spec.callee);
+            const callee = try self.makeCallee(leg, spec.callee);
             const argv = try testing.allocator.alloc(mh_value, @max(16, spec.args.len + spec.fill_args));
             defer testing.allocator.free(argv);
             @memset(argv, .{});
@@ -526,6 +602,7 @@ const Pair = struct {
             var results: [16]mh_value = @splat(.{});
             var nres: usize = 0xdead;
             const st = entry(
+                self.stage,
                 leg,
                 if (spec.null_vm) null else box,
                 callee,
@@ -535,7 +612,12 @@ const Pair = struct {
                 spec.max_results,
                 if (spec.null_nresults) null else &nres,
             );
-            if (leg == 0) self.last_status = st;
+            if (leg == 0) {
+                self.last_status = st;
+                self.last_results = results;
+                self.last_nres = nres;
+            }
+            self.prev_results[leg] = results;
             if (spec.collect_after) try testing.expectEqual(Status.ok, capi.mh_collect(box));
             snaps[leg] = try snap(testing.allocator, box, st, &results, nres, self.keyframes);
             done += 1;
@@ -549,17 +631,28 @@ const Pair = struct {
     }
 };
 
-/// Run `body` once per tier on a fresh pair.
+/// Run `body` once per stage, tier and effect mode, each on a fresh pair.
+/// The replay pair replays the log its record pair left: leg 0's, which the
+/// snapshots showed equal to leg 1's after every call. Both replay legs must
+/// then have consumed all of it, so the replay made every recorded effect,
+/// in order, and no more.
 fn eachTier(comptime body: fn (*Pair) anyerror!void) !void {
-    for (tiers) |t| {
-        var pair: Pair = undefined;
-        try pair.init(t);
-        defer pair.deinit();
-        body(&pair) catch |e| {
-            std.debug.print("\n(tier {s})\n", .{@tagName(t)});
-            return e;
-        };
-    }
+    for (stages) |stage| for (tiers) |t| {
+        var log: ?[]u8 = null;
+        defer if (log) |l| testing.allocator.free(l);
+        for (modes) |mode| {
+            var pair: Pair = undefined;
+            try pair.init(t, stage, mode, if (mode == .replay) log.? else null);
+            defer pair.deinit();
+            errdefer std.debug.print("\n(stage {s}, tier {s}, effects {s})\n", .{ @tagName(stage), @tagName(t), @tagName(mode) });
+            try body(&pair);
+            switch (mode) {
+                .off => {},
+                .record => log = try mahina.effectser.encodeFile(testing.allocator, pair.box[0].vm.effect_log.items),
+                .replay => for (pair.box) |b| try testing.expectEqual(b.vm.effect_log.items.len, b.vm.effect_cursor),
+            }
+        }
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -711,6 +804,44 @@ test "hostcall diff: hot callees tier up across repeated calls" {
                 try pr.callGlobal("hot", &.{.{ .int = @intCast(10 + i % 7) }});
                 try pr.callGlobal("p3", &.{ .{ .int = @intCast(i) }, .{ .global = "gs" } });
             }
+        }
+    }.run);
+}
+
+test "hostcall diff: a reused frame slot never runs the previous callee's cached code" {
+    // Doc 60 §3.2: the `.S` entry writes the frame itself and invalidates the
+    // slot's code cache with one store of the sentinel into `code_cache_gen`,
+    // leaving the stale `code_cache` slice in place. Every top-level host
+    // call reuses frame slot 0. Without that store, the next callee's
+    // `cachedCodeFor` would find the previous callee's image under the
+    // current generation and run it. Alternating two callees at one
+    // generation catches that; the loop calls in between move the
+    // generation on the JIT tiers (a patched loop entry is a new image).
+    try eachTier(struct {
+        fn run(pr: *Pair) !void {
+            try pr.eval(shapes_src ++
+                \\function inc(x) return x + 1 end
+                \\function tenx(x) return x * 10 end
+            );
+            for (0..12) |i| {
+                const x: i64 = @intCast(i);
+                try pr.callGlobal("inc", &.{.{ .int = x }});
+                try expectInt(pr, x + 1);
+                try pr.callGlobal("tenx", &.{.{ .int = x }});
+                try expectInt(pr, x * 10);
+                if (i % 3 == 0) {
+                    try pr.callGlobal("hot", &.{.{ .int = 20 }});
+                    try expectInt(pr, 210);
+                }
+            }
+        }
+
+        fn expectInt(pr: *Pair, want: i64) !void {
+            try testing.expectEqual(Status.ok, pr.last_status);
+            try testing.expectEqual(@as(usize, 1), pr.last_nres);
+            var got: i64 = 0;
+            try testing.expectEqual(Status.ok, capi.mh_value_int(pr.last_results[0], &got));
+            try testing.expectEqual(want, got);
         }
     }.run);
 }
@@ -999,7 +1130,13 @@ test "hostcall diff: park overflow on input and on results, and the idle clear o
             for (pr.box) |b| try testing.expectEqual(Status.ok, capi.mh_register_fn(b, s("spend"), &spendFn, null, null));
             try pr.eval(shapes_src ++
                 \\function spendthenmany(n) spend(n) return many() end
+                \\function fnmany() return p0, "s1", "s2", "s3", "s4", "s5", "s6", "s7" end
             );
+            // An idle call straight after an overflow, with no API call in
+            // between to clear the park: the entry's own idle clear must
+            // empty the overflow list (Q12 (a)), exactly as H1's does.
+            try pr.call(.{ .callee = .{ .global = "fnmany" }, .max_results = 8 });
+            try pr.call(.{ .callee = .{ .prev = 0 } });
             // Input: callee + 7 heap arguments overflow the 6 inline slots.
             try pr.callGlobal("vonly", &.{ .{ .str = "i1" }, .{ .str = "i2" }, .{ .str = "i3" }, .{ .str = "i4" }, .{ .str = "i5" }, .{ .str = "i6" }, .{ .str = "i7" } });
             // Results: 8 heap results overflow.
@@ -1044,7 +1181,7 @@ fn errText(box: *capi.VmBox) []const u8 {
     return if (e.ptr) |p| p[0..e.len] else "";
 }
 
-const ReenterCtx = struct { leg: usize };
+const ReenterCtx = struct { stage: Stage, leg: usize };
 
 fn reenterFn(vm: ?*capi.VmBox, ud: ?*anyopaque, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: *usize) callconv(.c) Status {
     // reenter(f, n): call f(n - 1) back through the leg's own entry and
@@ -1057,7 +1194,7 @@ fn reenterFn(vm: ?*capi.VmBox, ud: ?*anyopaque, args: ?[*]const mh_value, nargs:
     const arg = [_]mh_value{capi.mh_int(n - 1)};
     var out: [1]mh_value = .{.{}};
     var got: usize = 0;
-    const st = entry(ctx.leg, vm, a[0], &arg, 1, &out, 1, &got);
+    const st = entry(ctx.stage, ctx.leg, vm, a[0], &arg, 1, &out, 1, &got);
     if (st != .ok) {
         capi.mh_error_set(vm, s("nested call failed"));
         return st;
@@ -1096,7 +1233,7 @@ test "hostcall diff: fresh tables and capturing closures, and mid-call state und
     try eachTier(struct {
         fn run(pr: *Pair) !void {
             pr.keyframes = false; // host functions registered (doc 59 E6/E8)
-            var reent = [2]ReenterCtx{ .{ .leg = 0 }, .{ .leg = 1 } };
+            var reent = [2]ReenterCtx{ .{ .stage = pr.stage, .leg = 0 }, .{ .stage = pr.stage, .leg = 1 } };
             var peeks = [2]PeekCtx{ .{}, .{} };
             defer for (&peeks) |*pk| pk.deinit();
             for (pr.box, &reent, &peeks) |b, *rc, *pk| {
@@ -1174,7 +1311,7 @@ test "hostcall diff: re-entrant calls, up to and past the reentry and depth limi
     try eachTier(struct {
         fn run(pr: *Pair) !void {
             pr.keyframes = false;
-            var ctxs = [2]ReenterCtx{ .{ .leg = 0 }, .{ .leg = 1 } };
+            var ctxs = [2]ReenterCtx{ .{ .stage = pr.stage, .leg = 0 }, .{ .stage = pr.stage, .leg = 1 } };
             for (pr.box, &ctxs) |b, *c| try testing.expectEqual(Status.ok, capi.mh_register_fn(b, s("reenter"), &reenterFn, c, null));
             try pr.eval(
                 \\function chain(n) if n <= 0 then return 0 end return reenter(chain, n) end
@@ -1196,7 +1333,7 @@ test "hostcall diff: register capacity, at the outer entry and at a nested host 
     try eachTier(struct {
         fn run(pr: *Pair) !void {
             pr.keyframes = false;
-            var ctxs = [2]ReenterCtx{ .{ .leg = 0 }, .{ .leg = 1 } };
+            var ctxs = [2]ReenterCtx{ .{ .stage = pr.stage, .leg = 0 }, .{ .stage = pr.stage, .leg = 1 } };
             for (pr.box, &ctxs) |b, *c| try testing.expectEqual(Status.ok, capi.mh_register_fn(b, s("reenter"), &reenterFn, c, null));
             try pr.eval(shapes_src ++
                 \\function w40(a)
@@ -1234,4 +1371,272 @@ test "hostcall diff: register capacity, at the outer entry and at a nested host 
             try pr.callGlobal("p3", &.{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 } });
         }
     }.run);
+}
+
+const effects_src =
+    \\function eff(a) return os.clock(), getenv("HOME"), math.random(1, 1000), a end
+    \\function effn(n) return #getenv("V" .. n) end
+    \\function effnest(n) local h = getenv("HOME") return reenter(effn, n) end
+    \\function effboom(x) local t = os.nsclock() error("after " .. getenv("HOME") .. x) end
+    \\function effmany()
+    \\  return getenv("Va"), getenv("Vb"), getenv("Vc"), getenv("Vd"),
+    \\         getenv("Ve"), getenv("Vf"), getenv("Vg"), getenv("Vh")
+    \\end
+    \\function effva(a, ...) return getenv("V" .. a), ... end
+    \\function effloop(n)
+    \\  local acc = os.nsclock()
+    \\  for i = 1, n do acc = acc + i end
+    \\  return acc + os.nsclock()
+    \\end
+    \\function effupper(s) return string.upper(s) end
+;
+
+/// Leg 0's result `i` from the pair's last call, as a string.
+fn lastStr(pr: *Pair, i: usize) ![]const u8 {
+    var str: mh_str = undefined;
+    try testing.expectEqual(Status.ok, capi.mh_value_str(pr.box[0], pr.last_results[i], &str));
+    return str.ptr.?[0..str.len];
+}
+
+test "hostcall diff: effects through every path of the entry, recorded and replayed" {
+    // The record and replay legs of §6.1 only test something if the calls
+    // make effects. These callees do, on each path the `.S` entry has:
+    // plain results, a nested host callback, a guest error, the result-park
+    // overflow, surplus varargs, a loop that tiers up, and the once-per-
+    // session effects (the random seed, the Unicode version). `getenv`
+    // results are heap strings, so under GC stress the log's own values,
+    // decoded into the heap on replay, must stay rooted. Host callbacks run
+    // again on replay rather than being replayed (doc 59 E6).
+    try eachTier(struct {
+        fn run(pr: *Pair) !void {
+            pr.keyframes = false; // a host function is registered (doc 59 E8)
+            var ctxs = [2]ReenterCtx{ .{ .stage = pr.stage, .leg = 0 }, .{ .stage = pr.stage, .leg = 1 } };
+            for (pr.box, &ctxs) |b, *c| try testing.expectEqual(Status.ok, capi.mh_register_fn(b, s("reenter"), &reenterFn, c, null));
+            try pr.eval(effects_src);
+            const chain_before = if (capi.hostcall_asm) capi.hostcall_counts.chain else 0;
+            for (0..2) |_| {
+                try pr.callGlobal("eff", &.{.{ .int = 1 }});
+                try testing.expectEqual(@as(usize, 4), pr.last_nres);
+                var clock: f64 = 0;
+                try testing.expectEqual(Status.ok, capi.mh_value_float(pr.last_results[0], &clock));
+                try testing.expectEqual(@as(f64, 0.001), clock);
+                try testing.expectEqualStrings("/det/home", try lastStr(pr, 1));
+            }
+            try pr.callGlobal("effnest", &.{.{ .int = 5 }});
+            try pr.callGlobal("effboom", &.{.{ .str = "!" }});
+            try testing.expectEqual(Status.err_runtime, pr.last_status);
+            pr.setGcStress(true);
+            try pr.call(.{ .callee = .{ .global = "effmany" }, .max_results = 8, .collect_after = true });
+            try testing.expectEqual(@as(usize, 8), pr.last_nres);
+            try testing.expectEqualStrings("h", try lastStr(pr, 7));
+            try pr.call(.{ .callee = .{ .global = "eff" }, .args = &.{.{ .int = 2 }}, .collect_after = true });
+            pr.setGcStress(false);
+            try pr.call(.{ .callee = .{ .global = "effva" }, .args = &.{ .{ .str = "a" }, .{ .int = 1 }, .{ .fresh = "b" } } });
+            try testing.expectEqualStrings("a", try lastStr(pr, 0));
+            // An effect on each side of a loop that compiles: the effect
+            // natives abort a recording, the loop between them doesn't.
+            const traces_before = pr.box[0].vm.trace.registry.cache.items.len;
+            for (0..12) |_| try pr.callGlobal("effloop", &.{.{ .int = 10 }});
+            if (pr.tier != .off) try testing.expect(pr.box[0].vm.trace.registry.cache.items.len > traces_before);
+            try pr.callGlobal("effupper", &.{.{ .str = "abc" }});
+            try testing.expectEqualStrings("ABC", try lastStr(pr, 0));
+            // Effects were made: the log isn't empty in record or replay.
+            if (pr.mode != .off) try testing.expect(pr.box[0].vm.effect_log.items.len > 20);
+            // In stage 2 the `.S` entry admitted all 21 calls: the 20 above
+            // and the nested one inside `effnest`, so it ran them under each
+            // mode.
+            if (capi.hostcall_asm and pr.stage == .asm_entry)
+                try testing.expectEqual(@as(usize, 21), capi.hostcall_counts.chain - chain_before);
+        }
+    }.run);
+}
+
+test "hostcall diff: a replay that runs out of log fails identically" {
+    // Record two effectful calls, then replay with the first call's
+    // effects only: the second call's first effect finds the log empty,
+    // inside a call the `.S` entry admitted.
+    for (stages) |stage| for (tiers) |t| {
+        errdefer std.debug.print("\n(stage {s}, tier {s})\n", .{ @tagName(stage), @tagName(t) });
+        var rec: Pair = undefined;
+        try rec.init(t, stage, .record, null);
+        defer rec.deinit();
+        try rec.eval(effects_src);
+        try rec.callGlobal("eff", &.{.{ .int = 1 }});
+        const first = rec.box[0].vm.effect_log.items.len;
+        try rec.callGlobal("eff", &.{.{ .int = 2 }});
+        try testing.expect(rec.box[0].vm.effect_log.items.len > first);
+        const log = try mahina.effectser.encodeFile(testing.allocator, rec.box[0].vm.effect_log.items[0..first]);
+        defer testing.allocator.free(log);
+
+        var rp: Pair = undefined;
+        try rp.init(t, stage, .replay, log);
+        defer rp.deinit();
+        try rp.eval(effects_src);
+        try rp.callGlobal("eff", &.{.{ .int = 1 }});
+        try testing.expectEqual(Status.ok, rp.last_status);
+        try rp.callGlobal("eff", &.{.{ .int = 2 }});
+        // A replay-integrity error is fatal (doc 59 §3.5); the snapshot has
+        // already compared the rest of the state.
+        try testing.expectEqual(Status.err_runtime, rp.last_status);
+        for (rp.box) |b| try testing.expect(b.fatal);
+    };
+}
+
+/// One `mh_call`, and which path it took: true when the `.S` entry admitted
+/// it, false when it fell back to H1. Exactly one of the two must happen.
+fn admits(box: *capi.VmBox, callee: mh_value, args: ?[*]const mh_value, nargs: usize, results: []mh_value, nres: *usize) !bool {
+    const before = capi.hostcall_counts;
+    _ = capi.mh_call(box, callee, args, nargs, results.ptr, results.len, nres);
+    const chain = capi.hostcall_counts.chain - before.chain;
+    const slow = capi.hostcall_counts.slow - before.slow;
+    try testing.expectEqual(@as(usize, 1), chain + slow);
+    return chain == 1;
+}
+
+test "the .S entry admits closure calls within its limits and falls back on everything else" {
+    // Stage 2 compares the entry with H1; this pins that the comparison is
+    // not H1 against itself. Each shape below is admitted or rejected by
+    // exactly one pre-commit check (doc 60 §4.1), and admitted calls must
+    // also produce the right results.
+    if (!capi.hostcall_asm) return error.SkipZigTest;
+    const box = try capi.createVm(testing.allocator, .{ .jit = 2 });
+    defer capi.destroyVm(box);
+    var out: [16]mh_value = @splat(.{});
+    var n: usize = 0;
+    try testing.expectEqual(Status.ok, capi.mh_eval(box, s(shapes_src ++
+        \\function call_me() return 5 end
+        \\callable = setmetatable({}, {__call = function() return 1 end})
+    ), s("admit"), &out, 0, &n));
+    const G = struct {
+        fn get(b: *capi.VmBox, name: []const u8) !mh_value {
+            var v: mh_value = .{};
+            try testing.expectEqual(Status.ok, capi.mh_global_get(b, s(name), &v));
+            return v;
+        }
+    };
+    const ints = [_]mh_value{ capi.mh_int(1), capi.mh_int(2), capi.mh_int(3), capi.mh_int(4), capi.mh_int(5), capi.mh_int(6), capi.mh_int(7), capi.mh_int(8), capi.mh_int(9) };
+
+    // Admitted: zero arguments, fewer/more than the parameters, up to
+    // ARGS_MAX, a vararg callee with and without surplus, heap arguments,
+    // and results past the inline park (the overflow helper).
+    try testing.expect(try admits(box, try G.get(box, "p0"), null, 0, &out, &n));
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expect(try admits(box, try G.get(box, "p3"), &ints, 2, &out, &n));
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqual(capi.mh_type.nil, capi.mh_value_type(out[2]));
+    try testing.expect(try admits(box, try G.get(box, "p3"), &ints, 8, &out, &n));
+    try testing.expect(try admits(box, try G.get(box, "wide"), &ints, 8, &out, &n));
+    try testing.expect(try admits(box, try G.get(box, "va"), &ints, 5, &out, &n));
+    try testing.expectEqual(@as(usize, 6), n); // #t, a, then the four varargs
+    var k: i64 = 0;
+    try testing.expectEqual(Status.ok, capi.mh_value_int(out[5], &k));
+    try testing.expectEqual(@as(i64, 5), k);
+    try testing.expect(try admits(box, try G.get(box, "vonly"), null, 0, &out, &n));
+    try testing.expectEqual(@as(usize, 0), n);
+    var strs: [2]mh_value = undefined;
+    try testing.expectEqual(Status.ok, capi.mh_string_new(box, s("ab"), &strs[0]));
+    try testing.expectEqual(Status.ok, capi.mh_string_new(box, s("cd"), &strs[1]));
+    try testing.expect(try admits(box, try G.get(box, "cat"), &strs, 2, &out, &n));
+    var str: capi.mh_str = undefined;
+    try testing.expectEqual(Status.ok, capi.mh_value_str(box, out[0], &str));
+    try testing.expectEqualStrings("abcd", str.ptr.?[0..str.len]);
+    try testing.expect(try admits(box, try G.get(box, "many"), null, 0, &out, &n));
+    try testing.expectEqual(@as(usize, 8), n);
+    // The callee and five results inline, the last three through the helper.
+    try testing.expectEqual(@as(usize, 6), box.vm.parked_inline_len);
+    try testing.expectEqual(@as(usize, 3), box.vm.parked_results.items.len);
+
+    // Fallbacks: one failed check each.
+    try testing.expect(!try admits(box, try G.get(box, "p3"), &ints, 9, &out, &n)); // > ARGS_MAX
+    try testing.expect(!try admits(box, try G.get(box, "tostring"), &ints, 1, &out, &n)); // a native
+    try testing.expect(!try admits(box, try G.get(box, "callable"), null, 0, &out, &n)); // __call
+    try testing.expect(!try admits(box, capi.mh_int(3), null, 0, &out, &n)); // not callable
+    try testing.expect(!try admits(box, try G.get(box, "p3"), null, 1, &out, &n)); // null args
+    var bad = [_]mh_value{ capi.mh_int(1), .{ .tag = 0xFF } };
+    try testing.expect(!try admits(box, try G.get(box, "p3"), &bad, 2, &out, &n)); // a bad tag
+    var six: [6]mh_value = undefined;
+    for (&six) |*v| try testing.expectEqual(Status.ok, capi.mh_string_new(box, s("x"), v));
+    try testing.expect(!try admits(box, try G.get(box, "p3"), &six, 6, &out, &n)); // 7 parks
+    try testing.expect(try admits(box, try G.get(box, "p3"), &six, 5, &out, &n)); // 6 fit
+    box.vm.setRecordSafepointLines(true);
+    try testing.expect(!try admits(box, try G.get(box, "p0"), null, 0, &out, &n)); // the fast word
+    box.vm.setRecordSafepointLines(false);
+    try testing.expect(try admits(box, try G.get(box, "call_me"), null, 0, &out, &n));
+    try testing.expectEqual(Status.ok, capi.mh_value_int(out[0], &k));
+    try testing.expectEqual(@as(i64, 5), k);
+}
+
+const CapCtx = struct {
+    callee: ?mh_value = null,
+    nargs: usize = 0,
+    free: usize = 0,
+    admitted: ?bool = null,
+};
+
+fn capFn(vm: ?*capi.VmBox, ud: ?*anyopaque, _: ?[*]const mh_value, _: usize, _: ?[*]mh_value, _: usize, nresults: *usize) callconv(.c) Status {
+    // capprobe(): measure the register slots free above the callback, then,
+    // when a callee is set, make one nested `mh_call` there and record which
+    // path took it (null: neither or both, which the test fails on).
+    const ctx: *CapCtx = @ptrCast(@alignCast(ud.?));
+    const box = vm.?;
+    ctx.free = box.vm.regCapacity() - box.vm.stack_top;
+    nresults.* = 0;
+    const callee = ctx.callee orelse return .ok;
+    const ints = [_]mh_value{ capi.mh_int(1), capi.mh_int(2), capi.mh_int(3), capi.mh_int(4), capi.mh_int(5), capi.mh_int(6), capi.mh_int(7), capi.mh_int(8) };
+    var out: [1]mh_value = .{.{}};
+    var got: usize = 0;
+    const before = capi.hostcall_counts;
+    _ = capi.mh_call(box, callee, &ints, ctx.nargs, &out, 1, &got);
+    const chain = capi.hostcall_counts.chain - before.chain;
+    const slow = capi.hostcall_counts.slow - before.slow;
+    ctx.admitted = if (chain + slow == 1) chain == 1 else null;
+    return .ok;
+}
+
+test "the .S entry's register-capacity check is exact, with and without surplus varargs" {
+    // The capacity sweep in the diff tests reaches the `.S` only through a
+    // nested non-vararg call, in steps of two. This pins the check itself
+    // (doc 60 §4.1): a nested call whose window ends exactly at the end of
+    // the register file is admitted, and one slot short falls back, for
+    // both bind layouts. With surplus varargs the window sits above an arg
+    // region of `nargs` slots, so the requirement is `nreg + nargs`.
+    if (!capi.hostcall_asm) return error.SkipZigTest;
+    const box = try capi.createVm(testing.allocator, .{ .jit = 0 });
+    defer capi.destroyVm(box);
+    var ctx: CapCtx = .{};
+    try testing.expectEqual(Status.ok, capi.mh_register_fn(box, s("capprobe"), &capFn, &ctx, null));
+    var out: [1]mh_value = .{.{}};
+    var n: usize = 0;
+    try testing.expectEqual(Status.ok, capi.mh_eval(box, s(shapes_src ++
+        \\function outer(...) capprobe() end
+    ), s("cap"), &out, 0, &n));
+    var outer: mh_value = .{};
+    try testing.expectEqual(Status.ok, capi.mh_global_get(box, s("outer"), &outer));
+    // `outer`'s arguments (past ARGS_MAX, so H1 runs it) raise the stack
+    // top under the callback one slot each: measure once, then pick the
+    // count that leaves exactly the free slots wanted.
+    const argv = try testing.allocator.alloc(mh_value, box.vm.regCapacity());
+    defer testing.allocator.free(argv);
+    @memset(argv, capi.mh_int(0));
+    const f0: usize = 1000;
+    try testing.expectEqual(Status.ok, capi.mh_call(box, outer, argv.ptr, f0, &out, 0, &n));
+    const free0 = ctx.free;
+    const Case = struct { name: []const u8, nargs: usize, surplus: bool };
+    for ([_]Case{
+        .{ .name = "p3", .nargs = 3, .surplus = false },
+        .{ .name = "vonly", .nargs = 3, .surplus = true },
+    }) |c| {
+        var callee: mh_value = .{};
+        try testing.expectEqual(Status.ok, capi.mh_global_get(box, s(c.name), &callee));
+        const proto = mahina.function.Closure.fromHeader(asValue(&callee).asHeap()).proto;
+        try testing.expectEqual(c.surplus, proto.is_vararg and c.nargs > proto.num_params);
+        const need = @as(usize, proto.num_registers) + (if (c.surplus) c.nargs else 0);
+        for ([_]bool{ true, false }) |fits| {
+            const free = if (fits) need else need - 1;
+            ctx = .{ .callee = callee, .nargs = c.nargs };
+            try testing.expectEqual(Status.ok, capi.mh_call(box, outer, argv.ptr, f0 + free0 - free, &out, 0, &n));
+            try testing.expectEqual(free, ctx.free);
+            try testing.expectEqual(@as(?bool, fits), ctx.admitted);
+        }
+    }
 }

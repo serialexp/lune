@@ -17,12 +17,12 @@
 #   - unwinding, per path, in gdb (tools/hostcall_walk.py), once with DWARF
 #     CFI (gdb's frame-debug log must show every frame accepted by its
 #     dwarf2 unwinder, the entry's pre-commit stretch included) and once
-#     along the raw rbp chain, each walk back to main.
+#     along the raw rbp chain, each walk back to main. The walks follow
+#     §3.3's table: the admitted path (a guest handler and a host callback
+#     under the entry and mahina_hostcall_chain), the result-park helper,
+#     and the fallback.
 # Negative controls show the visibility, -z text, DWARF and frame-pointer
 # checks each catch a failure.
-#
-# The walks follow §3.3's table for the paths this revision of the entry
-# has; H3 adds the admitted path's and the park helper's.
 set -euo pipefail
 
 optimize=${1:-ReleaseFast}
@@ -38,7 +38,7 @@ fail() {
 pass() { echo "ok: $*"; }
 
 # Every mahina_hostcall_* symbol is HIDDEN; with require=1, also: mh_call is
-# defined GLOBAL DEFAULT, and the three internal symbols are defined.
+# defined GLOBAL DEFAULT, and the five internal symbols are defined.
 check_visibility() {
     readelf -sW "$1" | awk -v require="$2" '
         /^File: / { file = $2 }
@@ -56,7 +56,7 @@ check_visibility() {
         END {
             if (require) {
                 if (!mh_call) { print "  mh_call is not defined"; bad = 1 }
-                n = split("mahina_hostcall_entry mahina_hostcall_slow mahina_hostcall_offsets_safety", want, " ")
+                n = split("mahina_hostcall_entry mahina_hostcall_slow mahina_hostcall_chain mahina_hostcall_park_rest mahina_hostcall_offsets_safety", want, " ")
                 for (i = 1; i <= n; i++)
                     if (!(want[i] in defined)) { printf "  %s is not defined\n", want[i]; bad = 1 }
             }
@@ -85,27 +85,39 @@ check_linked() {
 
 # Run the walks in gdb against a fixture binary, with `expect-walk` (DWARF,
 # every frame unwound by gdb's dwarf2 unwinder) or `expect-fp-walk` (the raw rbp chain, which
-# must match gdb's walk). The DWARF leg also stops in the entry itself, on
-# its pre-commit `jmp`: that stretch has no frame of its own and is described
-# by the entry-state CFI alone (§3.3), so only the DWARF leg can walk it.
+# must match gdb's walk). The fixture's first three calls take the three
+# paths of §3.3's table in order; each stop's breakpoints are deleted before the
+# next, so every walk is taken in the call it is meant for. The DWARF leg
+# also stops in the entry itself, on its first instruction: the pre-commit
+# stretch has no frame of its own and is described by the entry-state CFI
+# alone (§3.3), so only the DWARF leg can walk it. The DWARF leg then
+# single-steps the entry through the fixture's last four calls, walking at
+# every instruction (`expect-walk-steps`).
 check_walks() {
     local what=$1 exe=$2 walk=$3
-    local log="$out/walks-$what.log" entry=() want=3
+    local log="$out/walks-$what.log" entry=() steps=() want=4
     if [ "$walk" = expect-walk ]; then
-        entry=(-ex "break mahina_hostcall_entry" -ex run -ex "$walk entry mahina_hostcall_entry main")
-        want=4
+        entry=(-ex "break mahina_hostcall_entry" -ex run -ex "$walk entry mahina_hostcall_entry main" -ex delete)
+        steps=(-ex delete -ex "break mahina_hostcall_entry")
+        for path in overflow error success fallback; do
+            steps+=(-ex continue -ex "expect-walk-steps steps-$path mahina_hostcall_entry main")
+        done
+        want=9
     fi
     gdb --batch -nx \
         -ex "set pagination off" -ex "set confirm off" -ex "set breakpoint pending off" \
         -ex "source $root/tools/hostcall_walk.py" \
         "${entry[@]}" \
-        -ex "break mahina_hostcall_slow" -ex "break host_cb" \
+        -ex "break host_cb" \
         -ex "$([ ${#entry[@]} -eq 0 ] && echo run || echo continue)" \
-        -ex "$walk fallback mahina_hostcall_slow main" \
-        -ex continue \
-        -ex "$walk callback host_cb ... mahina_hostcall_slow main" \
+        -ex "$walk callback host_cb ... mahina_hostcall_chain mahina_hostcall_entry main" \
         -ex "rbreak ^interp\\.Vm\\.opRet" -ex continue \
-        -ex "$walk guest-handler interp.Vm.opRet* ... mahina_hostcall_slow main" \
+        -ex "$walk guest-handler interp.Vm.opRet* ... mahina_hostcall_chain mahina_hostcall_entry main" \
+        -ex delete -ex "break mahina_hostcall_park_rest" -ex continue \
+        -ex "$walk park-helper mahina_hostcall_park_rest mahina_hostcall_entry main" \
+        -ex delete -ex "break mahina_hostcall_slow" -ex continue \
+        -ex "$walk fallback mahina_hostcall_slow main" \
+        "${steps[@]}" \
         -ex kill \
         "$exe" >"$log" 2>&1 || true
     local ok
@@ -189,7 +201,7 @@ fi
     tests/hostcall_accept.c -pie -Wl,-z,text -o "$out/neg/accept-pie-nocfi" "$lib" -lm
 gdb --batch -nx -ex "set pagination off" -ex "set confirm off" \
     -ex "source $root/tools/hostcall_walk.py" -ex "break host_cb" -ex run \
-    -ex "expect-walk callback host_cb ... mahina_hostcall_slow main" -ex kill \
+    -ex "expect-walk callback host_cb ... mahina_hostcall_chain mahina_hostcall_entry main" -ex kill \
     "$out/neg/accept-pie-nocfi" >"$out/neg/walk-nocfi.log" 2>&1 || true
 if grep -q '^walk FAILED: callback: not unwound from CFI: host_cb by ' "$out/neg/walk-nocfi.log"; then
     pass "the DWARF walk rejects a frame without CFI"
@@ -202,7 +214,7 @@ fi
     -o "$out/neg/accept-pie-nofp" "$out/fp/lib/libmahina.a" -lm
 gdb --batch -nx -ex "set pagination off" -ex "set confirm off" \
     -ex "source $root/tools/hostcall_walk.py" -ex "break host_cb" -ex run \
-    -ex "expect-fp-walk callback host_cb ... mahina_hostcall_slow main" -ex kill \
+    -ex "expect-fp-walk callback host_cb ... mahina_hostcall_chain mahina_hostcall_entry main" -ex kill \
     "$out/neg/accept-pie-nofp" >"$out/neg/walk.log" 2>&1 || true
 if grep -q '^walk FAILED: callback: the rbp chain differs' "$out/neg/walk.log"; then
     pass "the frame-pointer walk rejects a frame without rbp"

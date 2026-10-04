@@ -105,6 +105,12 @@
 .set FRAMERESULT_REG_BIT, 0
 .set FRAMERESULT_COUNT_BIT, 16
 
+// ChainResult: status, then the FrameResult, returned whole in rax.
+.set CHAINRESULT_SIZE, 8
+.set CHAINRESULT_STATUS, 0
+.set CHAINRESULT_FRAME_RESULT, 4
+.set MH_OK, 0
+
 // Alignments the code relies on.
 .set VMBOX_ALIGN, 8
 .set VM_ALIGN, 8

@@ -1,4 +1,35 @@
-IN PROGRESS (2026-10-01) — the sieve switch-on regression is FIXED and
+DOC 60 H3 (2026-10-05, separate track from the campaign below):
+- **H3 landed:** the admitted path in `src/asm/hostcall_x64.S`, together
+  with the §6.1 record/replay legs (Bart: run them before landing).
+  Codex and antigravity approved four rounds
+  (`docs/reviews/doc60/*-h3*.md`).
+- **Next, on doc 60's Outstanding list:** H3's own redundant loads, and
+  the Zig parts H3 keeps (chain ~96, opRet ~50 instructions per call).
+  The measurements are in §5.8.
+
+IN PROGRESS (2026-10-05, amber-badger) — general codegen quality, first lever:
+dead φ writebacks. Native loops store every defined slot to regs[] each
+iteration (pi_leibniz: 8 tag + 8 value stores per iteration, dead temps
+included; it runs at 99.5% native and is still 8.9× LuaJIT).
+- **Uncommitted, NOT landable as-is:** `phiLiveRow`/`phiWritebackKept`
+  (trace_recorder, trace_finalize(+test), interp_trace_test). It drops a φ
+  dead at the close's resume pc AND at every numeric-for loop-done pc. Gates
+  green, hashgate 87/87, pi_leibniz −30% instructions.
+- **Codex found a determinism hole:** GC roots every register below
+  `stack_top`, so a dropped φ that leaves a stale heap ref changes what
+  survives collection, and so the printed object ids. Repro
+  `/tmp/gcphi_new.lua`: tier-0 prints 0x178f, trace/native print 0x1790;
+  HEAD prints 0x178f in all modes.
+- **Bart chose GC liveness masking:** the `.gc` root walk skips registers
+  dead at each frame's pc in every tier. Design doc first, then review, then
+  code. The root walk is in interp.zig (coral-marten's area); I've told them.
+- Cycles: pi_leibniz cycles did NOT move. The loop is latency-bound on
+  `movsd xmm,xmm` / `cvtsi2sd` false dependencies through scratch
+  xmm0/xmm1; LuaJIT uses movaps + `xorps` before cvtsi2sd. A separate, independent fix
+  (x64.zig / nativegen_emit.zig), queued.
+- Board: `gt profile` on pinned pt-default (0.30% noise); see TODO.md.
+
+(prior) IN PROGRESS (2026-10-01) — the sieve switch-on regression is FIXED and
 committed on top of B2 (doc 56 §4.8.5: G6-Q1(a) side link close, G6-Q1(d)
 `loopunroll` incl. inlined markers and the root `innerloopleft` escape, the
 region bridge's ledger-cap yield + detector evidence). Codex re-reviewed B2 +

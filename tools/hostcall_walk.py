@@ -21,6 +21,17 @@
 # accepted by `dwarf2`. That is gdb's own verdict, so an FDE gdb rejects (an
 # unsupported CIE version, say) fails the walk too.
 #
+#   expect-walk-steps <label> <pattern> [<pattern> ...]
+#
+# From a stop on a function's first instruction, single-steps it until
+# control leaves it (stepping over its calls), and does the DWARF walk at
+# every instruction. A function's CFI changes at each push and pop, which a
+# walk from one of its callees never sees; a sampling profiler can stop on
+# any instruction. Beyond the names, the caller's stack pointer and
+# callee-saved registers must unwind to their values at the first
+# instruction, so a wrong CFA or save slot fails even where the names would
+# still match.
+#
 #   expect-fp-walk <label> <pattern> [<pattern> ...]
 #
 # The same names, but the walk follows the raw rbp chain (saved rbp at [rbp],
@@ -147,6 +158,29 @@ def _matches(names, patterns):
     return bool(names) and fnmatch.fnmatchcase(names[0], patterns[0]) and _matches(names[1:], patterns[1:])
 
 
+def _dwarf_problem(frames, unwinders, patterns):
+    # What is wrong with a logged DWARF walk, or None.
+    names = [name for name, _ in frames]
+    if not names or names[-1] != "main":
+        return "the walk does not reach main"
+    if not _matches(names, patterns):
+        return "the frames don't match"
+    # main's own unwinder is never needed (the walk ends there).
+    others = ["%s by %s" % (name, unwinders.get(level, "an unlogged unwinder"))
+              for name, level in frames[:-1] if unwinders.get(level) != "dwarf2"]
+    if others:
+        return "not unwound from CFI: %s" % ", ".join(others)
+    return None
+
+
+def _fail(label, problem, patterns, names):
+    print("walk FAILED: %s: %s" % (label, problem))
+    print("  expected: %s" % " <- ".join(patterns))
+    print("  got:      %s" % " <- ".join(names))
+    gdb.execute("kill")
+    gdb.execute("quit 1")
+
+
 class ExpectWalk(gdb.Command):
     def __init__(self, name, frame_pointers):
         super().__init__(name, gdb.COMMAND_USER)
@@ -157,31 +191,61 @@ class ExpectWalk(gdb.Command):
         label, patterns = words[0], words[1:]
         frames, unwinders = _logged_walk()
         names = [name for name, _ in frames]
-        problem = None
-        if not names or names[-1] != "main":
-            problem = "the walk does not reach main"
-        elif not _matches(names, patterns):
-            problem = "the frames don't match"
-        elif self.frame_pointers:
+        problem = _dwarf_problem(frames, unwinders, patterns)
+        if self.frame_pointers and problem is None:
             cfi = names
             names = _fp_walk()
             if names != cfi:
                 problem = "the rbp chain differs from gdb's walk (%s)" % " <- ".join(cfi)
-        else:
-            # main's own unwinder is never needed (the walk ends there).
-            others = ["%s by %s" % (name, unwinders.get(level, "an unlogged unwinder"))
-                      for name, level in frames[:-1] if unwinders.get(level) != "dwarf2"]
-            if others:
-                problem = "not unwound from CFI: %s" % ", ".join(others)
         if problem is None:
             print("walk ok: %s: %s" % (label, " <- ".join(names)))
             return
-        print("walk FAILED: %s: %s" % (label, problem))
-        print("  expected: %s" % " <- ".join(patterns))
-        print("  got:      %s" % " <- ".join(names))
-        gdb.execute("kill")
-        gdb.execute("quit 1")
+        _fail(label, problem, patterns, names)
+
+
+# The caller's registers that must unwind to their values at the first
+# instruction: the stack pointer (the CFA) and the SysV callee-saved ones.
+_UNWOUND = ("rsp", "rbx", "rbp", "r12", "r13", "r14", "r15")
+
+
+class ExpectWalkSteps(gdb.Command):
+    def __init__(self):
+        super().__init__("expect-walk-steps", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        words = gdb.string_to_argv(arg)
+        label, patterns = words[0], words[1:]
+        frame = gdb.newest_frame()
+        start = frame.pc()
+        func = _symbol(start)
+        # At the first instruction the caller's rsp is one return address
+        # above ours, and every callee-saved register still holds its value.
+        want = {r: int(frame.read_register(r)) for r in _UNWOUND}
+        want["rsp"] += 8
+        arch = frame.architecture()
+        steps = 0
+        while True:
+            frames, unwinders = _logged_walk()
+            names = [name for name, _ in frames]
+            pc = int(gdb.parse_and_eval("$pc"))
+            insn = " ".join(arch.disassemble(pc)[0]["asm"].split())
+            problem = _dwarf_problem(frames, unwinders, patterns)
+            if problem is None:
+                caller = gdb.newest_frame().older()
+                wrong = ["%s=0x%x (want 0x%x)" % (r, int(caller.read_register(r)), want[r])
+                         for r in _UNWOUND if int(caller.read_register(r)) != want[r]]
+                if wrong:
+                    problem = "the caller's registers unwind wrong: %s" % ", ".join(wrong)
+            if problem is not None:
+                _fail(label, "at %s+0x%x (%s): %s" % (func, pc - start, insn, problem), patterns, names)
+                return
+            steps += 1
+            gdb.execute("nexti" if insn.startswith("call") else "stepi", to_string=True)
+            if _symbol(int(gdb.parse_and_eval("$pc"))) != func:
+                break
+        print("walk ok: %s: %s, at each of %d instructions" % (label, " <- ".join(patterns), steps))
 
 
 ExpectWalk("expect-walk", frame_pointers=False)
 ExpectWalk("expect-fp-walk", frame_pointers=True)
+ExpectWalkSteps()

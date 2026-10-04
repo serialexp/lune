@@ -3,7 +3,10 @@
 **Status:** partial. **H1 landed** (2026-10-03; as built and measured in
 §5.5), and an H1.5 Zig pass on top of it (§5.6). H3 was admitted
 (2026-10-04), and **H2, the `.S` layer, landed** with the entry as its
-fallback edge only (§5.7). H3 and H4 are outstanding. The design is rev 5,
+fallback edge only (§5.7). **H3, the admitted path, landed** (§5.8),
+after §6.1's record and replay legs were added and run (Bart, 2026-10-05:
+"do the replay and record tests before landing it"). H4 is outstanding.
+The design is rev 5,
 **approved by codex and antigravity**. Revs 1–4 came back CHANGES
 REQUESTED; rev 5 was approved by both, with nits only, which are folded in
 (`docs/reviews/doc60/*-rev{1..5}.md`, per-finding status in §10).
@@ -22,10 +25,11 @@ Bart's decisions so far:
 
 What's hand-written so far: the `__zig_probe_stack` copy in `capi.zig`
 and the runtime-emitted trace trampoline in `nativegen_mcode.zig`, both
-older than this doc, and H2's `hostcall_x64.S`, whose entry is one `jmp`
-to H1. H1 is Zig.
+older than this doc, and `hostcall_x64.S`. Its entry runs admitted
+closure calls itself (H3) and jumps to H1, which is Zig, for everything
+else.
 **Owner:** claude
-**Last updated:** 2026-10-04
+**Last updated:** 2026-10-05
 
 ## Implementation status
 
@@ -77,7 +81,8 @@ land; move whole phases to Done once everything inside them is checked.
     - **Not run:** the record/replay legs of the §6.1 matrix. The
       embedding has no record or replay mode yet (`createVm` keeps effects
       `.off`, doc 59 §3.7), so there's nothing to run them on. That's
-      outstanding.
+      outstanding. (Since run, for both stages, without an embedding
+      mode: the record/replay bullet below.)
     - ReleaseFast: `zig build test -Doptimize=ReleaseFast` also runs
       `capi-smoke`, which hangs under `NDEBUG` (TODO.md). So the ReleaseFast
       leg runs the built test binary directly.
@@ -141,30 +146,61 @@ land; move whole phases to Done once everything inside them is checked.
   - [x] **Measured**: the forwarding entry costs −2…+12 instructions a
     call against H1.5 (+3…+12 on every shape but `vararg`), with cycles
     within noise (§5.7).
-- [ ] **Record/replay legs of the stage-1 matrix** (§6.1). They wait on an
-  embedding record/replay mode (doc 59 §3.7). Run them when that mode
-  exists, and before H3 lands.
+- [x] **H3 — the Linux x86-64 host-call entry** in
+  `src/asm/hostcall_x64.S` (built 2026-10-04, landed 2026-10-05 with the
+  record/replay legs below). As built, with its deviations, in §5.8.
+  - [x] **The admitted path**: pre-commit checks in `rax`/`r10`/`r11`
+    only, then park, frame write, bind (with and without surplus
+    varargs), nil-fill, the chain call, and one copy-out-and-park pass.
+    Park overflow goes to the helper. Everything else is the pre-commit
+    `jmp` to H1.
+  - [x] **The H2 carry-overs**: `mahina_hostcall_chain` and
+    `mahina_hostcall_park_rest` exported hidden from `capi.zig`,
+    `ChainResult` in the offsets file, the rbp frame and its CFI (§3.3),
+    and the acceptance walks for the entry/chain and park-helper paths.
+  - [x] **Stage-2 differential tests** (§6.1): every scenario test runs
+    `mh_call` (the `.S`) against `mhCallViaH1`, on the three tiers, in
+    Debug and ReleaseFast. The diff itself doesn't check which path ran.
+    Two dedicated tests do, through a test-only counter: one asserts
+    which calls the entry admits and which it hands to H1, shape by
+    shape; the other pins the register-capacity check at its exact
+    boundary, for both bind layouts.
+  - [x] **The frame-slot-reuse test.** After a code-image change, a new
+    frame in a reused slot must carry the `CODE_CACHE_GEN_INVALID`
+    sentinel. H3 writes the frame itself: one `-1` store into
+    `code_cache_gen`, leaving the stale `code_cache` slice in place
+    (§3.2). The test alternates two callees in the same slot with a
+    tier-up between them; removing the store fails it.
+  - [x] **Measured against H1.5** (§5.8): −4…−11.5% cycles on the
+    admitted shapes with arguments or heap values, −2% on the smallest,
+    +1% on the 9-argument fallback. The embed benchmark's `call` row is
+    14 → 13–14 ns (LuaJIT 13).
+- [x] **Record and replay legs of the §6.1 matrix, both stages**
+  (2026-10-05, Bart: before H3 lands). They needed no embedding mode.
+  The harness sets the VM's effect mode directly, as `wasm_entry.zig`
+  does, and the public API still keeps effects `.off` (doc 59 §3.7).
+  - Every scenario runs in three modes: effects off; record; and replay
+    of the record run's serialized log, decoded into fresh VMs. Both
+    replay legs must consume the whole log.
+  - A new scenario makes effects on every path of the entry. `getenv`
+    gives the log heap values, and a GC-stress stretch keeps them under
+    pressure.
+  - A truncated-log replay must fail fatally, identically, inside an
+    admitted call.
+  - Host callbacks run again on replay instead of being replayed (doc 59
+    E6). Details in §6.1's as-built note.
+
+### Outstanding
+
 - [ ] **`next_call_seq` exhaustion test** (§6.1 call shapes). Both legs
   panic in the same `pushFrameTrusted`, so it needs a subprocess harness,
-  which the test suite doesn't have yet. Not covered by H1's tests.
-- [ ] **H3: a dedicated frame-slot-reuse test.** After a code-image
-  change, a new frame in a reused slot must carry the
-  `CODE_CACHE_GEN_INVALID` sentinel. H1 shares `pushFrameTrusted` with
-  `callValue`, and the snapshot already compares `frame0`'s
-  `code_cache_gen` across tier-ups (the "hot callees" test). H3 writes the
-  frame itself: one `-1` store into `code_cache_gen`, leaving the stale
-  `code_cache` slice in place (§3.2). So stage 2 needs a test aimed at
-  exactly that store.
-- [ ] **H3 — the Linux x86-64 host-call entry** in
-  `src/asm/hostcall_x64.S`.
-  - Behind the stage-2 differential tests (§6.1).
-  - H1 is the fallback.
-  - The ledger is recorded in the embed benchmark.
-  - Carried over from H2, because they arrive with their first caller
-    (§5.7): the `mahina_hostcall_chain` and `mahina_hostcall_park_rest`
-    exports, `ChainResult` in the offsets file, the admitted path's CFI
-    and frame-pointer convention (§3.3), and the acceptance walks for
-    the admitted path and the park helper.
+  which the test suite doesn't have yet. Not covered by H1's or H3's
+  tests. The `.S` checks `next_call_seq != -1` pre-commit and falls back,
+  so H1's panic is still the behaviour.
+- [ ] **H3's own redundant loads** (§5.8): the proto's fields are read
+  pre-commit and again for the bind, and depth/reentry are read twice.
+  About 8–12 of the entry's 171 instructions on `a1`. Also find out why
+  `r0` (+11) and `overflow` (+25) run more instructions than H1.5.
 - [ ] **After H3: polish the Zig parts H3 keeps.** These stay
   compiler-generated under any entry, and work on them benefits H1, H3,
   `callValue` and guest calls alike (§5.6):
@@ -172,6 +208,11 @@ land; move whole phases to Done once everything inside them is checked.
     stack traffic;
   - the guest return path: `opRet` is 50, 12 of them pushes and pops;
   - `chainEntry`.
+  
+  Under H3, on `a1` (§5.8), as self costs per call:
+  `mahina_hostcall_chain` is ~96 instructions with `runPushedFrame` and
+  `execWithEntry` inlined into it, `opRet` ~50 and `chainEntry` ~25. The
+  `.S` entry is 171.
 - [ ] **H4 — prepared calls (API addition).** `mh_prepare(callee)` caches
   the closure/proto lookup and validation for repeated same-callee calls,
   like a per-frame `update()`. Decide after H3 (Q5).
@@ -1445,6 +1486,181 @@ which is H1.5's `mh_call` exactly: `a1` is 449 instructions in both.
   it for nothing, and H3's A/B (§7 criterion 4) is measured against
   H1.5, the baseline here, not against H2.
 
+### 5.8 H3 as built, and measured (2026-10-04)
+
+H3 fills in the entry H2 left as a `jmp`. The plan text in §4 is left as
+written; where H3 departs from it, the reason is given here.
+
+**The pre-commit checks** run in the order of §4.1, in `rax`, `r10` and
+`r11` only, with the argument registers and both stack arguments
+untouched. Any failure is a `jmp`/`jcc` to `mahina_hostcall_slow`. Two
+details are not in the plan:
+- **One pass over the arguments** checks each tag (below `row_view`) and
+  each heap pointer (non-null), and counts the heap values the entry
+  will park. That count, plus one for the callee, is the park-capacity
+  check.
+- **The idle flag is computed once.** `r10d = depth | native_reentry_depth`
+  is zero exactly when the VM is idle (§4.3 step 1). Pre-commit it
+  decides whether `parked_inline_len` counts against the capacity;
+  post-commit it decides the idle clear. It survives the prologue
+  because nothing in between writes `r10`.
+
+**Commit, in the order the code runs.** §4.3 lists steps 3–5 as capture,
+bind, push. The entry captures `entry_top`, writes the frame's fixed
+fields, then binds and nil-fills, then publishes `stack_top` and
+`depth += 1` last. Nothing runs between those stores that could observe
+the order: no call, no allocation, no other thread. The fields both bind
+shapes share are written first. Each shape then writes its own `base`,
+`varargs_base` and `varargs_count`.
+- **The bind** has two shapes, and both park every heap argument, in
+  order (§4.3 step 2). Without surplus varargs it binds the first
+  `min(np, nargs)` arguments at `entry_top`, parks the remaining ones
+  without binding them, and nil-fills the rest of `num_registers`. With
+  surplus varargs it uses the two-region layout
+  (`interp.zig`'s `bindAndPushClosure`): every argument at `entry_top`,
+  `base = entry_top + nargs`, `varargs_base = entry_top + np` and
+  `varargs_count = nargs − np`, and the parameters copied a second time
+  into the window at `base`.
+- **Nil-fill** stores 8 registers at a time with SSE, then a scalar tail
+  loop.
+- **Every width the entry assumes is asserted at assembly time.**
+  `EXPECT(cond, msg)`, a cpp macro (`.if !(cond); .error msg; .endif`),
+  ties each instruction's operand width to the size the offsets file
+  checks. A gas `.macro` didn't work: gas splits macro arguments on
+  spaces.
+
+**After the chain** (`ChainResult` as §4.2 has it, verified whole in
+`rax` in the disassembly): `produced = min(count, max_results)`, then
+`stack_top = entry_top`, then **one pass** that copies each result out
+and parks each heap result inline. At the first missing slot it
+publishes the park length, copies the remaining results out, and calls
+`mahina_hostcall_park_rest(box, results, from, produced)`. §4.3 puts
+copy-out (8) before restore (9); restoring first is unobservable for the
+same reason as above, and it means the park helper runs with the window
+already restored, as step 10 requires. The overflow block sits after
+the success epilogue, bracketed by `.cfi_remember_state` /
+`.cfi_restore_state`.
+
+**The frames, as built.** LLVM inlines `runPushedFrame` and
+`execWithEntry` into `mahina_hostcall_chain`, so §3.3's "if not inlined"
+resolves to inlined: the guest handler walks `opRet ← chain ← entry ←
+main`.
+
+**Tests.** Stage 2 (§6.1) needed five things the plan didn't name:
+- **`capi.mhCallViaH1`**, `mh_call`'s public checks then `hostcallSlow`:
+  the stage-2 reference, reaching H1 directly on the gated target. Stage
+  1 now diffs it against `hostcallReference`.
+- **`capi.hostcall_counts`**, test builds only: how often H1 ran and how
+  often the chain ran. A differential test passes vacuously if the `.S`
+  falls back on everything. A dedicated test asserts which calls the
+  entry admits and which it hands to H1, shape by shape.
+- **A previous-call result per scenario** (`Callee.prev`). Every
+  `mh_global_get` clears the park, so with one global lookup per call
+  the idle clear of a non-empty park never ran. Removing the clear went
+  unnoticed until a scenario reused the previous call's result as the
+  callee, with no API call in between.
+- **The frame-slot-reuse test** (status section).
+- **An exact register-capacity test** (codex, H3 review). The diff
+  tests' capacity sweep reaches the `.S` only through a nested
+  non-vararg call, in steps of two, so dropping the `+ nargs` term of
+  the surplus-vararg layout passed every test. The new test measures
+  the free slots from inside a host callback and sizes an outer H1
+  call so that a nested call through the entry fits exactly, then
+  misses by one. It does that for both bind layouts.
+
+Each of these was checked by mutation: removing the sentinel store, the
+inline or overflow clear, the surplus-argument park, the wide nil-fill,
+or the capacity check's `+ nargs` term; making `varargs_count` off by
+one; or turning the capacity check's `ja` into `jae`. Each mutation
+fails at least one test. The sentinel store and both capacity mutations
+were each checked against the specific test written for them.
+
+**Build acceptance** (§6.3) passes in ReleaseFast and in Debug. Its new
+walks:
+- DWARF: the callback (`host_cb ← … ← opCall ← chain ← entry ← main`),
+  the guest handler, and the park helper (`park_rest ← entry ← main`).
+- Frame pointers: the same three, plus the fallback.
+- **Instruction by instruction** (`expect-walk-steps`, new): gdb steps
+  the entry through four calls, stepping over calls, and at every
+  instruction runs the logged DWARF walk. It requires `rbx`, `rbp` and
+  `r12`–`r15` to unwind to their values at the first instruction, and
+  the caller's `rsp` to unwind to that `rsp + 8`.
+  - The four calls are result overflow (275 instructions), a guest error
+    (122), success with a callback (189) and the fallback (10).
+    Between them they reach every CFI region: pre-commit, prologue,
+    body, both epilogue exits, and the overflow block.
+  - A per-frame walk at a few stops doesn't check CFI between them. A
+    wrong `rbx` offset, and a missing `.cfi_def_cfa %rsp, 8` before
+    `ret`, each passed every other check; this one catches both.
+
+**Measured against H1.5.** The doc-59 probe, median of 7 interleaved
+runs of 2M calls, JIT off, loadavg ~2.3. The baseline is a shadow tree
+with the gate forced off, which is H1.5 exactly.
+
+| shape | ins H1.5 | ins H3 | Δins | cycles H1.5 | cycles H3 | Δcyc |
+|---|---:|---:|---:|---:|---:|---:|
+| a0 | 401 | 386 | −15 | 63.2 | 62.0 | −1.9% |
+| a1 | 449 | 410 | −39 | 69.6 | 66.4 | −4.6% |
+| a4 | 506 | 464 | −42 | 77.5 | 70.5 | −9.0% |
+| a8 | 555 | 536 | −19 | 89.6 | 79.3 | −11.5% |
+| a9 | 583 | 595 | +12 | 91.8 | 92.8 | +1.0% |
+| r0 | 332 | 343 | +11 | 56.0 | 54.8 | −2.1% |
+| r1 | 401 | 386 | −15 | 64.2 | 62.7 | −2.2% |
+| r4 | 524 | 515 | −9 | 87.6 | 84.6 | −3.5% |
+| heap | 467 | 423 | −44 | 73.2 | 67.1 | −8.3% |
+| vararg | 510 | 463 | −47 | 78.4 | 70.5 | −10.1% |
+| wide | 1553 | 1469 | −84 | 283.6 | 259.3 | −8.6% |
+| overflow | 900 | 925 | +25 | 164.5 | 157.8 | −4.1% |
+
+- **§7 criterion 4** (a measured cycle win against H1.5) holds in cycles
+  on every admitted shape. On nine of them the instruction count drops
+  as well. The wins grow with the work the entry does straight-line:
+  arguments, heap values, varargs, the 40-register window. The
+  exceptions are `r0` and `overflow`, below.
+- **`a9`, the fallback, pays +12 instructions**: the ten pre-commit
+  instructions it runs before `nargs > 8` rejects it, plus H2's two
+  `jmp`s. Its +1% cycles is within the noise of this machine.
+- **`r0` (+11) and `overflow` (+25) run more instructions**, while
+  their cycles read 2–4% lower. More instructions can still run in fewer
+  cycles, so the instruction count doesn't settle it either way. But a
+  2–4% difference is within this machine's noise, so whether these two
+  are wins is uncertain. Why they run more instructions is open, in the
+  H3 redundant-loads bullet.
+- **The embed benchmark** (`just embed-bench`, best of 7, three runs
+  interleaved with the same baseline): the `call` row is 14 ns for H1.5
+  and 13–14 ns for H3, against LuaJIT's 13. The `callback` row moves
+  32 → 31 ns. The row's ns resolution can't show more.
+
+**Where `a1`'s 410 instructions go** (callgrind, self cost per call, on
+an `x86_64_v3` build of the same tree): the `.S` entry 171,
+`mahina_hostcall_chain` ~96 (with `runPushedFrame` and `execWithEntry`
+inlined), `opRet` ~50, `opLoad` ~28, `chainEntry` ~25, the Zig `mh_call`
+21, the probe's loop 17. gdb, stepping the entry, confirms the 171 and
+shows it is straight-line code, with no instruction executed twice:
+
+| part of the entry | instructions |
+|---|---:|
+| pre-commit, with one argument | 43 |
+| prologue | 8 |
+| idle clear, park the callee | 12 |
+| frame fields | 13 |
+| bind setup | 21 |
+| bind one argument | 11 |
+| nil-fill one register | 13 |
+| `stack_top`, `depth`, the chain call | 9 |
+| unpack `ChainResult`, restore | 20 |
+| copy out and park one result | 11 |
+| epilogue | 10 |
+
+§5.3 estimated 72–101 for the entry's share and 44–60 for the chain. The
+measured 171 and ~96 are well above both: the estimate is the one §5.3
+already called unsubstantiated. Some of the 171 is redundant loads,
+which are on the Outstanding list: the proto's fields are read pre-commit
+and again for the bind, and depth and reentry are read twice. The rest
+is the work itself, spread evenly over the steps in the table. The chain
+and the guest handlers are now more than half of the call. That is the
+"polish the Zig parts H3 keeps" bullet, which comes next.
+
 ## 6. Testing
 
 ### 6.1 Differential tests: two stages, normalized comparison
@@ -1464,6 +1680,9 @@ which is H1.5's `mh_call` exactly: `a1` is 449 instructions in both.
     - stale-parent drops;
     - a cache clear with VM bits set, which must survive it.
 - **Stage 2 (H3).** The `.S` entry is diffed against H1.
+  - As built (§5.8): on the gated target every scenario test runs both
+    stages, with the `.S` diffed against `capi.mhCallViaH1`. A
+    test-only counter proves which calls the entry admits.
 
 Each test runs the same script and call sequence on two VMs and compares
 after every call:
@@ -1490,6 +1709,40 @@ The tests run in Debug and ReleaseFast, across the three tiers: JIT
 off, the tier-1 interpreter, and native. Record and replay legs are not
 run: the embedding has no record or replay mode yet (doc 59), so they
 wait on that capability and stay on the Outstanding list.
+
+**As built (2026-10-05): the record and replay legs**, for both stages
+(`capi_hostcall_test.zig`, `eachTier`):
+- **Every scenario runs three times per stage and tier:** effects off,
+  record, and replay. The harness sets `Vm.effect_mode` directly,
+  as `wasm_entry.zig` does; the public API is unchanged (doc 59 §3.7).
+- **The replay pair replays its record pair's log.** That's leg 0's log,
+  serialized with `effectser.encodeFile` and decoded into each replay
+  VM's heap. Leg 0's log equals leg 1's: the snapshot compared them
+  after every call.
+- **Both replay legs must end with `effect_cursor` at the end of the
+  log:** the replay made every recorded effect, in order, and no more.
+  The snapshot compares the log, the cursor and `committed_effect_seq`
+  after every call in every mode.
+- **Host callbacks run again on replay** instead of being replayed. The
+  test callbacks are deterministic, so that is sound here. It is not
+  host-call replay, which stays doc 59's E6.
+- **The VMs get a deterministic `host_env`**, so `getenv` works and its
+  heap-string results reach the log.
+- **Two new tests:**
+  - **A scenario that makes effects on every path of the entry:** plain
+    results, a nested host callback, a guest error, result-park overflow
+    under GC stress, surplus varargs, a loop that tiers up, and the
+    once-per-session seed and Unicode-version effects. It checks the
+    results' values in every mode. In record and replay it requires a
+    non-empty log, and in stage 2 that the `.S` admitted every call.
+  - **A replay whose log runs out inside an admitted call.** Both legs
+    must fail with `.err_runtime` and leave the VM fatal, identically.
+- **What these legs can catch.** The `.S` never reads effect state, so
+  no H3 code path depends on the mode. The legs show that H3 leaves
+  effect order, counts, the log's GC rooting and a fatal replay error
+  exactly as H1 does. They are confirmation, not a new detector: no
+  `.S` mutation is expected to fail only in these modes, and none was
+  looked for.
 
 Call shapes:
 - **Argument counts:** 0..8 arguments, and 9 (the fallback); more and
@@ -1548,6 +1801,9 @@ are added instead:
   It doesn't today, so these legs are outstanding; the three tiers are
   what runs.
 
+  As built (2026-10-05): the legs run without an embedding mode, with
+  the harness setting the VM's effect mode (§6.1's as-built note).
+
 Callback replay, and keyframes taken while host functions are registered,
 remain excluded, as in doc 59 (E6/E8). The exclusions are written out in
 the tests. The existing gates (`zig build test`, `just hashgate`, the
@@ -1600,6 +1856,12 @@ Rust crate tests) run unchanged.
 `tools/hostcall_walk.py`. Each check has a negative control where one is
 possible. The findings, and why the frame-pointer leg walks the `rbp`
 chain itself, are in §5.7.
+
+**As built (H3, 2026-10-04):** all four walks of the list above, in both
+legs, plus the DWARF leg's entry walk. The DWARF leg also steps the
+entry instruction by instruction through four calls and walks at every
+step (`expect-walk-steps`, §5.8). The fixture makes seven calls; the
+last four are for the stepping.
 
 ### 6.4 Budgets are benchmarks, not tests
 
@@ -1868,3 +2130,46 @@ findings.
   fail.
 - codex agreed that a separate version-2-CIE fixture is no longer
   needed.
+
+### H3 implementation review (2026-10-04)
+
+`codex-h3.md` (CHANGES REQUESTED, one blocking) and `antigravity-h3.md`
+(APPROVE). Neither found a defect in the assembly. Both found no
+H3-specific soundness reason to wait for the record/replay legs; the
+landing decision stays Bart's (status section).
+
+| finding | status | where |
+|---|---|---|
+| codex 1 (blocking): dropping the surplus-vararg capacity term (`add %r8, %rax`) passes every test | fixed: an exact-boundary test for both bind layouts; that mutation and `ja`→`jae` each fail it | `capi_hostcall_test.zig`, §5.8 |
+| codex 2 / antigravity 2 (nit): the checklist says the counter proves every scenario's path; only the dedicated test checks it | fixed: the claim now names the two tests that do | status |
+| codex 3: more instructions don't make `r0`/`overflow`'s lower cycles unreal | fixed: described as uncertain, within noise | §5.8 |
+| antigravity 1: `ecx` (the chain's fourth argument) is set only as a side effect of the depth increment | fixed with comments at both places, which costs no instructions; an explicit reload was the other option | `hostcall_x64.S` |
+| antigravity 3: the `next_call_seq` fallback is the one untested pre-commit check | noted: already Outstanding (subprocess harness) | status |
+
+Round 2 (`codex-h3-r2.md`, `antigravity-h3-r2.md`): both **APPROVE**.
+- Both found the new test's linearity assumption sound. The outer
+  vararg call's arg region grows one slot per argument, a host native
+  pushes no frame, and the test asserts the measured free count before
+  it asserts admission.
+- Both reproduced the two capacity mutations failing it in Debug and in
+  ReleaseFast. In ReleaseFast, the dropped `+ nargs` term fails the
+  admission assertion, and allocator corruption is detected at cleanup.
+- Antigravity's only remaining finding is the already-tracked
+  `next_call_seq` test.
+
+Round 3 (`codex-h3-r3.md`, `antigravity-h3-r3.md`), on the record and
+replay legs: both **APPROVE**. Both found the harness sound: reusing leg
+0's log, decoding before any safepoint, deterministic callbacks that run
+again, and the fatal `.err_runtime` on an exhausted log, which isn't
+catchable.
+
+| finding | status | where |
+|---|---|---|
+| codex 1: `effloop` never tiers up; `os.nsclock` aborts the recording | fixed: the effects now sit on each side of a plain loop, and the test asserts a new committed trace on both JIT tiers | `capi_hostcall_test.zig` |
+| codex 2: the effects scenario registers `reenter` but leaves keyframes on | fixed: `keyframes = false`, as in the other callback scenarios | `capi_hostcall_test.zig` |
+| antigravity 1 (nit): assert exactly 21 admitted calls, not ≥ 21 (measured 21 in all nine tier × mode runs) | fixed | `capi_hostcall_test.zig` |
+| antigravity 2 (nit): the 21-call comment reads as 21 plus the nested one | fixed: 20 plus the nested one | `capi_hostcall_test.zig` |
+
+Round 4 (`codex-h3-r4.md`, `antigravity-h3-r4.md`): both **APPROVE**, no
+findings. Codex restored the old `effloop` in a copy and confirmed that
+the new trace assertion fails on it.
