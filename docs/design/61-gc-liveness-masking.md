@@ -1,6 +1,6 @@
 # mahina — GC liveness masking — Design
 
-Status: draft rev 4, not yet implemented (awaiting codex + antigravity review)
+Status: draft rev 5, not yet implemented (awaiting codex + antigravity review)
 Owner: Bart + agents (amber-badger)
 Last updated: 2026-10-05
 
@@ -17,10 +17,12 @@ as they land; move bullets to Done once everything inside them is checked.
       blocker is folded into rev 3; see "Revision history".
 - [x] **Rev 3 review** (codex REVISE, antigravity REVISE, 2026-10-05). Every
       blocker is folded into rev 4.
+- [x] **Rev 4 review** (codex REVISE, antigravity APPROVE, 2026-10-05).
+      Codex's blockers and both reviewers' should-fixes are folded into rev 5.
 
 ### Outstanding
 
-- [ ] **Review rev 4.** codex + antigravity; fold findings, re-review until
+- [ ] **Review rev 5.** codex + antigravity; fold findings, re-review until
       both approve.
 - [ ] **Q1 — trace-constant roots (§7).** Bart picks (a) or (b) before
       Phase 1.
@@ -36,13 +38,22 @@ as they land; move bullets to Done once everything inside them is checked.
 - [ ] **Phase 0 — frame state made exact.** Behaviour-neutral on its own;
       pinned by the frame-shape tests (§8).
   - [ ] `gcTrampoline` publishes the innermost pc before `collect()`.
-  - [ ] `CallFrame.in_flight` follows the save/restore discipline (§4.2).
+  - [ ] `CallFrame.in_flight`: set on entry, restored on success, left set on
+        error. Catchers restore `frames[entry_depth − 1]` (§4.2).
   - [ ] `protectedCall` marks the topmost faulting frame in flight while an
-        `xpcall` handler runs (§4.4).
+        `xpcall` handler runs, when one exists (§4.4).
+  - [ ] Fault-pc invariant: a rejected Lua push re-stores the call pc before
+        raising (§4.4).
+  - [ ] Backtraces use the in-flight marker. `backtraceFrames`/`callSiteAt`
+        assume pc + 1 for every parent (`interp.zig:1975`). Moved here from a
+        separate change (codex rev 4 should-fix).
+  - [ ] Audit of the JIT store-elision sites (§2).
   - [ ] `Proto.maskable` is computed at compile time (§5).
 - [ ] **Phase 1 — the masked `.gc` root walk + scrub (§6).**
   - [ ] Masking driven by the shared `maskable` predicate, with an alias
         bitset and dead slots set to nil before sweep.
+  - [ ] Exit-snapshot sparsity and the watermark both gated on `maskable`
+        (watermark: also not captured) (§5).
   - [ ] Gates, hashgate (§9 regeneration procedure), the §8 tests and
         mutations, the boundary benchmark, and a pt-default board.
 - [ ] **Phase 2 — land the dead-φ writeback filter on top.**
@@ -54,8 +65,6 @@ as they land; move bullets to Done once everything inside them is checked.
 - [ ] **Phase 3 — relax doc 24 D3's full-write-set flush.** Today
       `alloc_count != 0` keeps every φ only because the collector roots every
       register. Re-derive it under masking. Separate review.
-- [ ] **Backtraces use the in-flight marker.** `backtraceFrames`/`callSiteAt`
-      assume pc+1 for every parent. Pre-existing; its own change.
 - [ ] **Defer — `.snapshot` walk masking (doc 21 Phase B).**
 
 ## Why this exists
@@ -156,13 +165,38 @@ Verified against the tree at `b4abe70` (rev 3 reviews).
 ## 2. Where stale values come from, and the theorem
 
 A register slot can differ between tiers only if the JIT elided a store to it.
-Today that is the numeric-for watermark; after Phase 2 it is the dead-φ filter
-**alone**. The lemma's premise is that a φ of slot `s`, in a trace anchored in
-proto `F`, is dropped only when `s` is dead at every pc `R` where tier-0 or a
-linked trace consumes the φ set.
+The lemma's premise is that **every** elided store to slot `s` in proto `F`'s
+window is to a slot dead at every pc `R` where tier-0 or a linked trace
+resumes. There are three elision sites (codex rev 4 blocker 2 found the third):
 
-The dead-φ filter satisfies that premise by construction. The watermark does
-not. It drops every defined slot `>= base+4` of the anchoring numeric `for`,
+1. **Loop-close φ writeback, numeric-for watermark** (today; retired in
+   Phase 2, see below).
+2. **Loop-close φ writeback, dead-φ filter** (Phase 2). `R` is the close's
+   resume pc and each `loop_done` source pc.
+3. **Side-exit snapshots** (today, doc 56 §4.2). `commitExitSnap`
+   (`trace_recorder.zig:1433`) records only `.def` slots live at the exit's
+   resume pc. Materialisation writes only the recorded ones
+   (`irinterp.zig:214`, and the native exit path). A dead definition is left
+   holding an earlier value, while tier-0 holds the newer one. `R` is the
+   exit's resume pc.
+
+Snapshot materialisation applies only to attachable exits: an exit handed
+straight to a side trace or sibling. An ordinary failing guard takes the
+coarse deopt, where tier-0 re-runs the iteration and writes the slot itself.
+So today's all-live root walk is **potentially** tier-dependent after an
+attached exit that leaves a heap value in a dead slot. That would be a
+pre-existing hole that masking closes, not one Phase 2 creates. It is
+unconfirmed: a first attempt through an ordinary guard
+(`/tmp/exitsnap_gc.lua`) agreed in all three modes, as the coarse deopt
+predicts. The §8 test builds the attached-exit case.
+
+Phase 0 audits every native and IR exit/close writer, and lists every other
+store the JIT omits relative to tier-0, against this premise. A site that
+cannot state its `R` keeps every slot. Sites 2 and 3 satisfy the premise by
+construction: they filter on `live_in[R]`. Both are gated on `maskable(F)`
+(§5).
+
+The watermark (site 1) does not satisfy the premise. It drops every defined slot `>= base+4` of the anchoring numeric `for`,
 by lexical position and not by liveness. That includes a register a later
 captured local reuses: captured bits are permanent across the proto
 (`bc_liveness.zig:254`), so such a register is live everywhere. Rev 4
@@ -186,11 +220,11 @@ subset) roots no stale slot. Goal 1 needs two things:
 - every frame shape gets a mask that is a subset of `live_in` at its true pc
   (§4);
 - every case where the collector must root more (an unknown shape, or a proto
-  without usable liveness) is a case where the JIT dropped no φ, via the shared
-  predicate of §5.
+  without usable liveness) is a case where the JIT elided no store at any of
+  the three sites, via the shared predicate of §5.
 
-**Captured registers** are live at every pc, so the φ filter, which reads the
-same `live_in`, keeps their φ. They are never stale. This covers
+**Captured registers** are live at every pc. The φ filter and exit snapshots
+read the same `live_in`, so they keep these slots. They are never stale. This covers
 captured-before-definition and captured-after-close slots (rev 2 review,
 codex blocker 5).
 
@@ -245,17 +279,26 @@ argument span. The span then sits in a gap (§6.1) and is rooted. Rev 2's
 
 **Who restores `stack_top`** (codex rev 3 blocker 4). This is deliberately not
 a Zig `defer`:
-- **On success,** the call restores it after copying the results, exactly
-  where today's code re-lowers `stack_top` after a call.
+- **On success,** the call's native branch lowers it back to its saved value
+  once the results are written. This is a **new** lowering site: today the
+  native branch of the `.call` opcode (`interp.zig:6447` on) never touches
+  `stack_top` (codex rev 4 should-fix). The same applies to the native inline
+  push's host-call path, if it consumes `all_results` arguments.
 - **On failure,** it is left raised. A failed call deliberately leaves the
   faulting frames and `stack_top` in place for diagnosis
-  (`interp.zig:2187`), and the raised span is part of that state. The catcher
-  restores `stack_top` when it discards the frames: `protectedCall` already
-  resets `stack_top = entry_top` after diagnostics and upvalue closing
-  (`stdlib/errors.zig:110-114`), and so do capi `runProtected` and the
-  top-level `exec` unwind.
+  (`interp.zig:2187`), and the raised span is part of that state. The owner of
+  the reset is the catcher that discards those frames:
+  - `protectedCall` resets `stack_top = entry_top` after diagnostics and
+    upvalue closing (`stdlib/errors.zig:103/113/124`);
+  - capi `guestFault` does the same (`capi.zig:393`), and every capi entry
+    funnels into it (§4.2).
+- **Top-level `exec` failure** does not unwind (`interp.zig:2511`). The frames
+  and the raised `stack_top` are kept for the CLI reporter (`main.zig:459`),
+  and that VM is not resumed. A capi host never reaches this state, because
+  its entries go through `guestFault`.
 - **Rejected pushes and non-catchable errors** propagate the same way: the
-  state stays raised until the outermost catcher or the VM reset discards it.
+  state stays raised until one of those catchers discards it, or until the VM
+  is deinitialised.
 
 ### P3 — Zig-held transient values across re-entry
 
@@ -309,37 +352,62 @@ The frame is inside instruction `P = frame.pc`, which is running other code.
 Mask: `live_in[P]`, which contains every operand of `P`. The destination is
 correctly left out.
 
-`CallFrame.in_flight: bool` follows a **save/restore** discipline at every
-site that runs code inside an instruction:
+`CallFrame.in_flight: bool` is **set on entry, restored on success, and left
+set on error**, at every site that runs code inside an instruction:
 
 ```zig
 const prev = frame.in_flight;
 frame.in_flight = true;
-defer frame.in_flight = prev;
+const r = try runOtherCode(...); // error: flag stays set, frame is retained
+frame.in_flight = prev;
 ```
+
+Not a Zig `defer` (codex rev 4 blocker 1). On error, `callValue`
+deliberately leaves the faulting frames in `frames[0..depth]`
+(`interp.zig:2266`). Each of those frames is frozen inside its instruction, so
+"in flight" stays true for it. A `defer` would reset it while the frame is
+still there, and a parent whose `frame.pc` names a non-call instruction (a
+protected function inside `.add`, faulting in its Lua `__add`) would fall out
+of every shape. This is the same ownership rule as P2's `stack_top` (§3).
+
+**Catcher restore.** The flag is restored on error by whoever discards the
+retained frames. Every catcher (`protectedCall`'s three discard sites
+`stdlib/errors.zig:103/113/124`, and capi `guestFault` `capi.zig:393`, which
+every capi entry funnels into: `runProtected`, H1, the `.S` fault return and
+index get/set at `:438`, `:807-808`, `:851`, `:1262`, `:1280`) already saves
+`entry_depth` and `entry_top`. It also saves `frames[entry_depth − 1].in_flight` when
+`entry_depth > 0`, and restores that flag when it resets `depth`/`stack_top`.
+The frames above `entry_depth` are discarded, and their next push
+re-initialises them. The top-level `exec` failure path keeps everything for
+the CLI reporter; that VM is not resumed.
 
 - **Sites.**
   - The `call` opcode's native/host-function path, for the native's whole
     duration (not per `callValue`).
   - `callValue` on the current frame (for metamethods, and natives that
-    re-enter).
+    re-enter), when `depth > 0`. A host `mh_call` into a VM suspended between
+    instructions marks the top frame as well. Its pc is then the next
+    instruction, so its mask `live_in[pc]` is the §4.1 mask.
   - `pushHostCall`/`runPushedFrame`. Only the **caller** is marked. The callee
     frame it pushes starts `in_flight = false` like every push (antigravity
     rev 3 SF1).
   - The `.S` entry wherever it suspends a Lua frame.
   - `protectedCall`, around an `xpcall` handler: the topmost faulting frame
     (§4.4).
-- **Nesting.** The `defer` restores the outer state, so an inner return never
-  clears an outer native's protection. This was the shared rev 2 blocker.
-- **Unwinds.** Zig error propagation runs the `defer`s, so `pcall`, `xpcall`,
-  capi error unwinds and rejected pushes restore the flag.
+- **Nesting.** Each successful exit restores the outer state, so an inner
+  return never clears an outer native's protection. This was the shared rev 2
+  blocker.
+- **Unwinds.** An error leaves every flag between the raise and the catcher
+  set, which is exactly the retained frames' state. The catcher restores the
+  one surviving frame, `frames[entry_depth − 1]`. A frame below that is
+  either still inside its own instruction (its flag is right) or untouched.
 - **Initialisation.** Every push initialises it false: the Zig struct literal
   (`interp.zig:2038`), the native emitted push (`nativegen_emit.zig:998-1020`,
   one more immediate store) and the `.S` frame write
   (`hostcall_x64.S:248-257`, new `CF_IN_FLIGHT` offset, coordinated with
   coral-marten). Frame-slot reuse goes through those pushes.
 
-### 4.3 Suspended at a Lua call (`in_flight == false`, not innermost, not faulting)
+### 4.3 Suspended at a Lua call (`in_flight == false`, not innermost)
 
 `frame.pc = p ≥ 1` is one past `C = code[p − 1]`, a call-like opcode with base
 `a`. Mask: `live_in[p] ∩ [0, a)`.
@@ -356,7 +424,11 @@ If `p == 0`, or `code[p − 1]` is not call-like, the shape is unknown (§4.5).
 The call-like set is the `.call` opcode and the native inline push of a
 `.call`. Method calls and the generic-for iterator call both compile to
 `.call` (antigravity rev 3 SF2, confirmed against `compiler.zig`). Phase 0
-asserts at every frame push that the suspended pc's predecessor is a `.call`.
+asserts, at each **Lua-callee push from a `.call`** (the opcode path and the
+native inline push), that the caller's stored `p` has `code[p − 1] == .call`.
+Other pushes (`callValue` re-entry, metamethods, `pushHostCall`) leave the
+caller in flight at its own instruction, so they are not covered by that
+assertion (codex rev 4 should-fix).
 This fixes antigravity's rev 2 blocker 1: no `p − 1` read happens for a frame
 classified by another shape, and `p == 0` cannot underflow.
 
@@ -371,29 +443,53 @@ still live, to capi `guestFault → renderFault` (`capi.zig:384`, `:405`) or to
 the CLI reporter. That makes rev 3's ∅ mask unsafe (codex rev 3 blocker 3): a
 collection in the handler would sweep an operand the reporter then reads.
 
-**Rev 4.** No Vm range, no ∅ mask. While the handler runs, `protectedCall`
-marks the **topmost faulting frame** `frames[faulting_depth − 1]` in flight,
-with the §4.2 save/restore:
+**No Vm range, no ∅ mask.** Before running the handler, `protectedCall` marks
+the **topmost faulting frame** in flight, if there is one:
 
 ```zig
-const top = &vm.frames[vm.depth - 1];
-const prev = top.in_flight;
-top.in_flight = true;
-defer top.in_flight = prev;
+if (vm.depth > entry_depth) vm.frames[vm.depth - 1].in_flight = true;
 const hn = vm.callValue(h, &.{errval}, results) catch |herr| { ... };
 ```
 
-- **Top faulting frame.** It is innermost at the fault, and its `frame.pc` is
-  the faulting instruction: `describeFault` already relies on that. As an
-  in-flight frame its mask is `live_in[fault pc]`. That contains every operand
-  `describeFault` reads, and by the lemma it is stale-free. Its pc is reached
-  in tier-0, so the lemma needs no resumption.
+The mark needs no restore. Like every retained frame's flag (§4.2), it goes
+away with the frame when `protectedCall` discards down to `entry_depth`. That
+discard happens on every handler outcome: return, catchable fault, and (via
+the outer catcher) non-catchable fault.
+
+- **No frame to mark.** `callValue` can fail before pushing anything: an
+  uncallable value, a native callee that raises, a rejected push at the
+  re-entry cap (`interp.zig:2139`, `:2216`). Then `vm.depth == entry_depth`,
+  and nothing is marked. That includes `entry_depth == 0` from a host-called
+  `xpcall` (codex rev 4 blocker 3). The retained frames below are in their own
+  shapes.
+- **Fault-pc invariant** (Phase 0). A frame left as the topmost faulting frame
+  has `frame.pc` naming the faulting instruction:
+  - tier-0 raises: already true (step 6 stores it; `describeFault` relies on
+    it);
+  - a native raised: true, because the frame is in flight at its `.call`;
+  - **a rejected Lua push**: not true today. The opcode path stores `pc + 1`
+    before `pushFrameVararg` (`interp.zig:6410`). The native inline push is
+    not affected: it checks its walls before freezing the caller's pc
+    (`nativegen_emit.zig` step 3 before step 4), and declines to tier-0, which
+    re-runs the call. Phase 0 makes the opcode path's rejection re-store the
+    call pc before raising. That also fixes `describeFault`/backtraces for a stack
+    overflow.
+
+  Without this, the mark would give the frame `live_in[call pc + 1]`, which
+  can root a stale temporary in an unwritten result slot.
+- **Top faulting frame mask.** With the invariant, the mask is
+  `live_in[fault pc]`. That contains every operand `describeFault` reads, and
+  by the lemma it is stale-free. Its pc is reached in tier-0, so the lemma
+  needs no resumption.
 - **Faulting frames below it** are each in an ordinary shape already:
-  suspended at a `.call` (§4.3), or in flight because a native they called is
-  the thing that faulted (§4.2).
-- **Nesting.** A handler that itself runs a protected call whose handler runs
-  (nested `xpcall`) marks its own topmost faulting frame. The save/restore
-  restores each level on return and on unwind, so no single Vm range has to
+  - suspended at a Lua `.call` (§4.3, flag false, pc + 1);
+  - in flight inside the instruction that called the code which faulted: a
+    native, a metamethod, or `callValue` re-entry. The flag is left set on
+    error, and `frame.pc` is that instruction (§4.2). Codex's
+    `.add` → `__add` example is this case.
+- **Nesting.** A handler that runs its own `xpcall` whose handler runs marks
+  its own topmost faulting frame. That frame sits above the outer one, and each
+  level's frames are discarded by their own catcher. No single Vm range has to
   describe several fault regions (codex rev 3 blocker 2, antigravity rev 3
   blocker).
 - **Faulting at `pc == 0`** needs no special case: the frame is in flight, so
@@ -404,21 +500,23 @@ An all-live mask would be safe, but it would root stale slots and break Goal 1
 
 ### 4.5 Unknown shape
 
-Mask: all live. Goal 1 still holds only if the JIT dropped no φ that could
-leave a stale value in such a frame. Unknown shapes arise from protos without
+Mask: all live. Goal 1 still holds only if the JIT elided no store that could
+leave a stale value in such a frame (§2, all three sites). Unknown shapes arise from protos without
 liveness or protos failing the layout check, and both are covered by §5.
 Phase 0's audit must leave no other source: every frame lands in 4.1–4.4. A
 debug assert fires on any unknown classification of a `maskable` proto.
 
 ## 5. One predicate: `Proto.maskable`
 
-Computed once at compile time, stored on the proto, and read by both the
-collector and the φ filter:
+Computed once at compile time and stored on the proto. It is read by the
+collector and by **every JIT store-elision site** (§2):
 
 `maskable(F)` ⇔ `F.reg_live.available()` ∧ `F` passes the **call-layout
 check**.
 
-**Call-layout check.** For every call-like instruction `(a, b, c)` in `F`:
+**Call-layout check.** For every `.call` instruction `(a, b, c)` in
+`F.code`. That is the only frame-pushing opcode; the native inline push is a
+JIT artifact of a `.call`, so it adds no instruction of its own:
 ∀ `r ≥ a`: `r ∈ live_out(call)` ∧ `r ∉ captured` ⇒ `r` is a result slot.
 For fixed `c`, the result slots are `a ≤ r < a + c`. For `c = all_results`,
 every `r ≥ a` is a result slot. That handles the "multret kills nothing" case
@@ -436,6 +534,12 @@ Captured slots need no closure proof here:
   **liveness only**: `phiWritebackKept` loses its `locals_watermark` clause,
   and the recorder stops dropping temporaries by watermark (§2). The
   `readSlot` and resume-pc/`loop_done` rows of `phiLiveRow` stay as they are.
+- **Exit snapshots (Phase 1).** `commitExitSnap` intersects with
+  `live_in[rpc]` only when `maskable(F)`. Otherwise it records every `.def`
+  slot. Today `available()` already gates snapshot creation
+  (`trace_recorder.zig:1371`). The only new case is a liveness-carrying proto
+  that fails the layout check. The compiler is not expected to emit one, so
+  the cost is nil on real code, and a test pins the fallback.
 - **Watermark (Phase 1 → Phase 2).** Until Phase 2 removes it, it drops a slot
   only if `maskable(F)` ∧ the slot is not captured in `F` (§2). Gating on
   `maskable` alone is not enough: it would still drop a captured slot that a
@@ -604,6 +708,17 @@ sound under the conditions stated. Bart decides.
     then raises non-catchably; capi `renderFault` reports the operand's type
     correctly (and, in debug, the use-after-free net stays quiet);
   - `pushHostCall`: the caller is in flight and the pushed callee is not;
+  - **retained in-flight parent**: protected function → `.add` → Lua `__add`
+    faults → a collecting `xpcall` handler. The parent is in flight at `.add`,
+    its operands survive, and a slot dead at `.add` is scrubbed. Also with a
+    `.call` placed just before the `.add`, so a misclassification would show;
+  - **nothing to mark**: a host-called `xpcall` (`entry_depth == 0`) of an
+    uncallable value and of a native that raises, with a collecting handler;
+  - **rejected push**: stack overflow under a collecting `xpcall` handler. The
+    top frame's pc names the `.call`, and `describeFault` reports it;
+  - **catcher restore**: a host `mh_call` into a VM suspended between
+    instructions faults. Afterwards the top frame's flag is back to its entry
+    value, and a later collection classifies it as §4.1;
   - `.S` and native frame reuse (fields initialised);
   - `mh_collect` from a host callback (`callHostNative`, `interp.zig:2208`);
   - a host-entered callee with an argument region;
@@ -625,6 +740,13 @@ sound under the conditions stated. Bart decides.
   - a `while` temporary;
   - a generic-for body;
   - a slot holding a table before the loop and a number inside it;
+  - **attached exit with a dead heap definition**: a loop body defines a
+    fresh heap value in a temporary, then exits at an **attached** guard
+    (side trace or sibling, so the snapshot is materialised) where the
+    temporary is dead, then collects and re-interns that value. This is the
+    site-3 hole (§2). Run it on HEAD first, and record whether it diverges. It
+    must agree after Phase 1. Also run it against a non-`maskable` proto
+    (test-constructed), where the snapshot keeps the slot;
   - collections from a metamethod and from `mh_collect`;
   - collect → snapshot → restore → linked execution.
   coral-marten's hostcall differential tests (every register dumped, under GC
@@ -645,7 +767,14 @@ sound under the conditions stated. Bart decides.
   - faulting frames all-live (the determinism test must catch it);
   - faulting frames classified as call-suspended;
   - top faulting frame not marked in flight (handler-side reporting test);
-  - `protectedCall`'s flag cleared instead of restored (nested `xpcall` test);
+  - `in_flight` restored by `defer` on error (retained in-flight parent
+    test);
+  - catcher not restoring `frames[entry_depth − 1]` (catcher restore test);
+  - `protectedCall` marking without the `depth > entry_depth` check (nothing
+    to mark test);
+  - rejected push without the pc re-store (rejected push test);
+  - exit-snapshot sparsity not gated on `maskable` (side-exit test, non-maskable
+    variant);
   - `pushHostCall` marking the callee in flight;
   - `maskable` ignored by the φ filter;
   - watermark ignoring captured slots (Phase 1);
@@ -705,7 +834,7 @@ sound under the conditions stated. Bart decides.
   - **Q1 options specified** with their full lifetime/cost conditions.
   - **Keyframe interaction stated.**
   - **Tests and mutations broadened** per both reviews.
-- **Rev 4** (this). Folds the rev 3 reviews (codex REVISE, antigravity
+- **Rev 4** (`ede6e83`). Folds the rev 3 reviews (codex REVISE, antigravity
   REVISE):
   - **Watermark retired** in Phase 2. In the meantime it is gated on
     `maskable` ∧ not captured. Gating on `maskable` alone still dropped a
@@ -724,6 +853,24 @@ sound under the conditions stated. Bart decides.
   - **Call-like set** reduced to `.call`; `pushHostCall`'s callee starts not
     in flight.
   - **Tests and mutations** added for each of the above.
+- **Rev 5** (this). Folds the rev 4 reviews (codex REVISE, antigravity
+  APPROVE):
+  - **`in_flight` is left set on error**, not restored by `defer`, because
+    retained frames are frozen mid-instruction. The catcher restores the one
+    surviving frame (§4.2). This fixes the `.add` → `__add` retained parent.
+  - **Exit snapshots are the third elision site** (§2). Their sparsity is
+    gated on `maskable` (§5), and the premise and audit now cover every elided
+    store.
+  - **`protectedCall` marks only when `depth > entry_depth`.** The mark needs
+    no restore, and a rejected Lua push re-stores the call pc (fault-pc
+    invariant, §4.4).
+  - **P2:** the new success-side lowering site and the actual reset owners
+    are named.
+  - **Smaller fixes:** the push assertion is scoped to Lua-callee `.call`
+    pushes; backtrace correction moved into Phase 0; `callValue` marks only
+    when `depth > 0`; the call-layout check reads `.call` in `F.code`; the
+    stale "not faulting" is gone from the §4.3 heading.
+  - **Tests and mutations** added for each of the above.
 
 ## References
 
@@ -734,6 +881,8 @@ sound under the conditions stated. Bart decides.
 - Antigravity: rev 2 review (REVISE), 2026-10-05.
 - Codex: rev 3 review, 01a1096c-37fe-77f0-8e3f-441ba5942d46.
 - Antigravity: rev 3 review (REVISE), 2026-10-05.
+- Codex: rev 4 review, 01a10978-f8f4-7670-8baf-b5a666842ac2.
+- Antigravity: rev 4 review (APPROVE), 2026-10-05.
 - Review receipts: `docs/reviews/doc61/`.
 - Doc 21 (canonical snapshot liveness; Phase B deferred).
 - Doc 24 D3/D8 (full-write-set flush).
