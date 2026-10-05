@@ -1,6 +1,7 @@
 # mahina — GC liveness masking — Design
 
-Status: draft rev 7, not yet implemented (awaiting codex + antigravity review)
+Status: rev 7, approved by codex + antigravity; not yet implemented
+(awaiting Bart's Q1/Q2 decisions)
 Owner: Bart + agents (amber-badger)
 Last updated: 2026-10-05
 
@@ -23,11 +24,11 @@ as they land; move bullets to Done once everything inside them is checked.
       Folded into rev 6.
 - [x] **Rev 6 review** (codex REVISE, antigravity APPROVE, 2026-10-05).
       Folded into rev 7.
+- [x] **Rev 7 review: codex APPROVE, antigravity APPROVE** (2026-10-05). Each
+      left one non-blocking should-fix, folded in place.
 
 ### Outstanding
 
-- [ ] **Review rev 7.** codex + antigravity; fold findings, re-review until
-      both approve.
 - [ ] **Q1 — trace-constant roots (§7).** Bart picks (a) or (b) before
       Phase 1.
 - [ ] **Q2 — visualiser display of scrubbed dead locals** (§10). Bart.
@@ -214,7 +215,10 @@ fifth in its rev 4, rev 5 and rev 6 reviews:
        before the `for_loop`, on the `loop_done` guard, and the completion
        flushes that;
      - (ii) the exit declines linked completion and takes the coarse deopt,
-       so tier-0 replays the final iteration.
+       so tier-0 replays the final iteration. Its natural hook is
+       `TraceCode.loopDoneSnapshotSupported` (`trace_code.zig:613`). Native
+       codegen (`nativegen.zig:2610`) and tier-1a (`irinterp.zig:98`) both
+       consult that one predicate already (antigravity rev 7 tip).
 
 Site 3 materialises for every **wanted or attached** exit, the resume-coherent
 `exit_side` contract (`trace_exec.zig:69-76`, `irinterp.zig:1419-1428`). That
@@ -841,7 +845,11 @@ sound under the conditions stated. Bart decides.
   - **linked numeric-for completion with a heap loop variable**: a linked
     `for i = 1, n do ... i = tostring(i) end`, run in three variants:
     - plain, where `a+3` is dead after the loop;
-    - with `i` captured by a closure created in the body;
+    - with `a+3` captured, via a **constructed** captured-slot proto/trace.
+      Closure creation aborts recording today (`trace_recorder.zig:1704`), so
+      a Lua-level closure in the body would make the case vacuous. The test
+      asserts that the completion actually links, or deliberately declines
+      under option (ii), so the gate is exercised (codex rev 7 should-fix);
     - in a non-`maskable` proto.
 
     In each, collect after the loop and re-intern the string. All modes must
@@ -959,8 +967,9 @@ sound under the conditions stated. Bart decides.
   - **Call-like set** reduced to `.call`; `pushHostCall`'s callee starts not
     in flight.
   - **Tests and mutations** added for each of the above.
-- **Rev 7** (this). Folds the rev 6 reviews (codex REVISE, antigravity
-  APPROVE):
+- **Rev 7** (this; approved by both). Folds the rev 6 reviews (codex REVISE,
+  antigravity APPROVE). The rev 7 reviews' should-fixes (a non-vacuous
+  captured-slot test, and the option (ii) hook) are folded in place:
   - **Linked numeric-for completion is the fifth elision site** (§2). Its
     `a+3` skip is gated on `maskable` and on a dead `a+3`. Otherwise it writes
     the pre-test value or declines to the coarse deopt (§5).
@@ -1015,6 +1024,8 @@ sound under the conditions stated. Bart decides.
 - Antigravity: rev 5 review (APPROVE), 2026-10-05.
 - Codex: rev 6 review, 01a10990-6d32-7713-a99e-9edfaa912e5a.
 - Antigravity: rev 6 review (APPROVE), 2026-10-05.
+- Codex: rev 7 review (APPROVE), 01a1099b-a20b-7f43-b7be-307bb52247c5.
+- Antigravity: rev 7 review (APPROVE), 2026-10-05.
 - Review receipts: `docs/reviews/doc61/`.
 - Doc 21 (canonical snapshot liveness; Phase B deferred).
 - Doc 24 D3/D8 (full-write-set flush).

@@ -23,6 +23,28 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
 - **Bart chose GC liveness masking:** the `.gc` root walk skips registers
   dead at each frame's pc in every tier. Design doc first, then review, then
   code. The root walk is in interp.zig (coral-marten's area); I've told them.
+- **Doc 61 rev 7 is APPROVED by codex and antigravity** (`248777a` plus a
+  should-fix fold; receipts in `docs/reviews/doc61/`). Revs 4–7 found and
+  closed:
+  - in-flight flags are left set on error, and the catcher restores them;
+  - the topmost faulting frame is marked under an `xpcall` handler;
+  - five JIT store-elision sites are all gated on `Proto.maskable`: the
+    watermark, the dead-φ filter, exit snapshots, composite bridges, and the
+    linked numeric-for `a+3` skip.
+- **Blocked on Bart:**
+  - Q1, trace constants (§7): (a) weak pool plus invalidate, or (b) pool only
+    pinned values (antigravity recommends (b));
+  - Q2, the visualiser shows nil for dead locals.
+- **Then, in order:**
+  - Phase P: P1 vararg clobber (confirmed), P2 dynamic arg spans, P3
+    transient roots, P4 release keyframe guard;
+  - Phase 0;
+  - Phase 1;
+  - Phase 2: land the uncommitted dead-φ filter and retire the watermark.
+
+  Each touches interp.zig/capi.zig/CallFrame, so coordinate with
+  coral-marten: `.S` offsets for `CF_IN_FLIGHT`, and the `guestFault`
+  signature.
 - Cycles: pi_leibniz cycles did NOT move. The loop is latency-bound on
   `movsd xmm,xmm` / `cvtsi2sd` false dependencies through scratch
   xmm0/xmm1; LuaJIT uses movaps + `xorps` before cvtsi2sd. A separate, independent fix
