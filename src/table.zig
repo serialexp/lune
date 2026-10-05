@@ -132,6 +132,36 @@ pub const Table = struct {
         return self.hash.get(nk) orelse Value.nil();
     }
 
+    /// The inline, call-free hit of `getHinted` for a heap key
+    /// (`HashPart.heapHintHit`): the value, or null for "take `getHinted`".
+    /// A heap key is never normalized and only ever lives in the hash part.
+    pub inline fn heapHintHit(self: *const Table, key: Value, hint: u32) ?Value {
+        return self.hash.heapHintHit(key, hint);
+    }
+
+    /// `get` through a per-site slot hint (`HashPart.getHinted`). Same result
+    /// as `get`; only hash-part keys use the hint.
+    pub fn getHinted(self: *const Table, key: Value, hint: *u32) Value {
+        const nk = normalizeKey(key);
+        if (nk.isInt() or nk.isNil()) return self.get(nk);
+        return self.hash.getHinted(nk, hint) orelse Value.nil();
+    }
+
+    /// `set` through a per-site slot hint: a store to a key already live at
+    /// the hinted hash slot overwrites the value in place
+    /// (`HashPart.setExistingHinted`), which is what `set` does for a live
+    /// non-integer key. Anything else takes `set`, then moves the hint to
+    /// where a stored hash-part key now lives.
+    pub fn setHinted(self: *Table, gpa: std.mem.Allocator, key: Value, val: Value, hint: *u32) Error!void {
+        const nk = normalizeKey(key);
+        const hashed = !nk.isInt() and !nk.isNil();
+        if (hashed and !self.array.isGrid() and self.hash.setExistingHinted(nk, val, hint.*)) return;
+        try self.set(gpa, key, val);
+        if (hashed and !val.isNil()) {
+            if (self.hash.liveSlotOf(nk)) |slot| hint.* = slot;
+        }
+    }
+
     /// `t[i]` for an integer key (array part fast path).
     pub fn getInt(self: *const Table, i: i64) Value {
         if (self.array.isGrid()) {
@@ -498,7 +528,7 @@ pub const Table = struct {
 
         var it = self.hash.iterator();
         while (it.next()) |e| {
-            if (e.key_ptr.isInt() and countKey(e.key_ptr.asInt(), &nums)) na_total += 1;
+            if (e.key.isInt() and countKey(e.key.asInt(), &nums)) na_total += 1;
         }
 
         var idx: usize = 0;

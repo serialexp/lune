@@ -60,6 +60,11 @@ pub const Payload = extern union {
 /// The 16-byte tagged value. `extern struct` pins `tag` at offset 0 and the
 /// 8-byte payload at offset 8 (7 bytes padding between — the deliberate cost of
 /// a self-describing slot).
+///
+/// A boolean's payload is 0 or 1, always. Build values through the
+/// constructors below; code that fills `tag`/`payload` by hand must keep that,
+/// because table keys hash and match by raw payload bits (doc 62 §3.5). The C
+/// API enforces it at the boundary (`capi.fromC`).
 pub const Value = extern struct {
     tag: Tag,
     payload: Payload,

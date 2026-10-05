@@ -152,9 +152,9 @@ FUNC_BEGIN(mahina_hostcall_entry)
     cmpq $-1, VM(VM_NEXT_CALL_SEQ)(%rdi)
     je SYM(mahina_hostcall_slow)
 
-    /* Every argument valid (`fromC`): a known tag that isn't row_view, and a
-     * non-null heap pointer. r11 counts the values to park: the callee, and
-     * each heap argument. */
+    /* Every argument valid (`fromC`): a known tag that isn't row_view, a
+     * boolean payload of 0 or 1, and a non-null heap pointer. r11 counts the
+     * values to park: the callee, and each heap argument. */
     mov $1, %r11d
     test %r8, %r8
     jz 2f
@@ -164,7 +164,11 @@ FUNC_BEGIN(mahina_hostcall_entry)
     mov %r8, %rax
 1:  cmpb $TAG_ROW_VIEW, VALUE_TAG(%r10)
     jae SYM(mahina_hostcall_slow)
-    cmpb $TAG_HEAP_REF, VALUE_TAG(%r10)
+    cmpb $TAG_BOOLEAN, VALUE_TAG(%r10)
+    jne 7f
+    cmpq $1, VALUE_PAYLOAD(%r10)
+    ja SYM(mahina_hostcall_slow)
+7:  cmpb $TAG_HEAP_REF, VALUE_TAG(%r10)
     jne 3f
     cmpq $0, VALUE_PAYLOAD(%r10)
     je SYM(mahina_hostcall_slow)

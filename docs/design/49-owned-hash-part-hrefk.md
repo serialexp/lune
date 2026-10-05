@@ -222,6 +222,17 @@ Two representation-contract details (codex round-2 item 2):
   "row views never escape" invariant; persistent tables never hold
   row-view keys.
 
+**Follow-up (2026-10-05, doc 62 §3).** The node now stores the key as
+`key_tag` / `key_id` / `key_payload`. It keeps a heap key's `GcHeader.id` in
+`key_id` (bytes 4–7, formerly `Value` padding) for live and dead nodes
+alike. Probes match by tag + id (heap) or tag + raw bits (scalar) without
+loading the key's header. A dead heap key's payload is now zeroed instead of
+rewritten to the id. The hrefk key guard compares `[node + NODE_KEY_ID_OFF]`
+directly. The table above and the matching rule just above it describe the
+original layout. Doc 62 §3.2 has the current node states. The invariants
+are unchanged: dead nodes hold no pointer, the publication order holds, and
+the layout is a pure function of the operation history.
+
 ### Two API layers (codex round-1 item 3)
 
 - **Logical layer** (the drop-in `std.HashMapUnmanaged` mirror that

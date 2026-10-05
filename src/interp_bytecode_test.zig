@@ -420,6 +420,25 @@ test "print is installed as a native global; output goes through the sink" {
     try testing.expectEqualStrings("ok\n", sink.buffered());
 }
 
+test "set_global and get_global on a hand-built proto (no slot hints)" {
+    // Hand-built protos leave `global_slot_hints` empty (doc 62 §4.1): both
+    // global opcodes then take the plain table lookup.
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    const consts = [_]Value{try vm.heap.internValue("g")};
+    const code = [_]Instr{
+        Instr.opAx(.load_int, 0, 7),
+        Instr.opAB(.set_global, 0, 0), // g = 7
+        Instr.opAx(.load_int, 0, 0),
+        Instr.opAB(.get_global, 1, 0), // R1 = g
+        Instr.opAB(.ret, 1, 1),
+    };
+    const proto = Proto{ .code = &code, .constants = &consts, .num_registers = 2, .name = "t" };
+    try testing.expectEqual(@as(usize, 0), proto.global_slot_hints.len);
+    try testing.expectEqual(@as(i64, 7), (try vm.run(&proto)).asInt());
+    try testing.expectEqual(@as(i64, 7), vm.globals.get(try vm.heap.internValue("g")).asInt());
+}
+
 test "concat joins strings and coerces numbers; result is interned" {
     var vm = try Vm.init(testing.allocator);
     defer vm.deinit();

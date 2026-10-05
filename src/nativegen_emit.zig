@@ -2188,11 +2188,12 @@ pub fn emitHrefCallout(
 ///      chain could write through a DEAD node (delete + unrelated insert
 ///      restores the aggregate count) without bumping `live` — diverging from
 ///      the tier-1a `fieldPtr` oracle, which rejects dead nodes. Ordered
-///      BEFORE any key deref: a dead heap key holds id bits, not a pointer.
+///      BEFORE the key guards: a dead heap key keeps its id in `key_id` but
+///      its payload is zero, not a pointer.
 ///   3. Key tag == the konst's tag (heap_ref for the v1 string keys).
-///   4. Key IDENTITY by stable `GcHeader.id` — NEVER payload bits: keyframe
-///      restore gives interned strings new addresses; ids survive (the same
-///      reason `guard_func` pins `proto.id`).
+///   4. Key IDENTITY by stable `GcHeader.id`, read from the node's `key_id`
+///      — NEVER payload bits: keyframe restore gives interned strings new
+///      addresses; ids survive (the same reason `guard_func` pins `proto.id`).
 /// Any failure side-exits at this instruction — the same exit the callout's
 /// miss path uses, so provenance/ledger semantics are unchanged.
 pub fn emitHrefK(
@@ -2226,10 +2227,9 @@ pub fn emitHrefK(
     // 3. key tag guard.
     try a.cmpByteMemImm(.rax, node_off + layout.NODE_KEY_TAG_OFF, @intFromEnum(key.tag));
     try jccNativeExit(a, exit_labels, i, .ne);
-    // 4. key identity guard by stable id: rcx = node key's *GcHeader (a LIVE
-    //    node's key holds a valid pointer — guard 2 established liveness).
-    try a.movRegMem(.rcx, .rax, node_off + layout.NODE_KEY_PAYLOAD_OFF);
-    try a.cmpDwordMemImm(.rcx, layout.GCHEADER_ID_OFF, key_id);
+    // 4. key identity guard by stable id, read from the node's own copy of
+    //    the key's id (no load through the key pointer).
+    try a.cmpDwordMemImm(.rax, node_off + layout.NODE_KEY_ID_OFF, key_id);
     try jccNativeExit(a, exit_labels, i, .ne);
     // Cell pointer: &node.value.
     try a.addRegImm32(.rax, node_off + layout.NODE_VALUE_OFF);

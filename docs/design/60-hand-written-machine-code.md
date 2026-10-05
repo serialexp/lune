@@ -1498,7 +1498,10 @@ details are not in the plan:
 - **One pass over the arguments** checks each tag (below `row_view`) and
   each heap pointer (non-null), and counts the heap values the entry
   will park. That count, plus one for the callee, is the park-capacity
-  check.
+  check. *Follow-up (2026-10-05, doc 62 §3.5):* the pass also rejects a
+  boolean whose payload isn't 0 or 1, as `fromC` now does. That adds
+  `TAG_BOOLEAN` to `offsets_x64.inc`, and per argument two instructions
+  for a non-boolean, four for a boolean.
 - **The idle flag is computed once.** `r10d = depth | native_reentry_depth`
   is zero exactly when the VM is idle (§4.3 step 1). Pre-commit it
   decides whether `parked_inline_len` counts against the capacity;
@@ -1784,8 +1787,8 @@ Call shapes:
 - **`final_cut`:** a call after a genuine top-level finish, so the
   previous `final_cut` is non-null on entry.
 - **Bad inputs:** an invalid tag (`0xFF`), `row_view`, a null heap
-  pointer, null `vm`/`nresults`, the depth limit, register capacity, and
-  OOM.
+  pointer, a boolean with payload 11 (added with doc 62), null
+  `vm`/`nresults`, the depth limit, register capacity, and OOM.
 - **Frame-slot reuse** after a code-image change (the sentinel
   invalidation).
 - **JIT modes:** on, off, and recording (the mode-switch path).

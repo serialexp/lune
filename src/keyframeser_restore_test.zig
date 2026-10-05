@@ -317,6 +317,73 @@ test "doc 49 P2b: hash-part physical layout diverges across restore; snapshot ar
     }
 }
 
+test "doc 62: a restored VM shares its protos' global slot hints with the original, and both read their own globals" {
+    // Restore runs the original chunk's protos, so both VMs' `rd`/`wr` use
+    // the same `Proto.global_slot_hints`. Their globals tables then diverge
+    // (growth, deletion), and calls alternate between the VMs, so each
+    // VM's first access sees a hint the other VM just moved.
+    const gpa = testing.allocator;
+    const source =
+        \\x = 1
+        \\function rd() return x end
+        \\function wr(v) x = v end
+        \\function grow(p, n) for i = 1, n do _G[p .. i] = i end end
+        \\function shrink(p, n) for i = 1, n do _G[p .. i] = nil end end
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try mahina_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    _ = try vm.run(chunk.proto);
+
+    const b0 = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(b0);
+    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    defer {
+        vm2.deinit();
+        gpa.destroy(vm2);
+    }
+
+    const Side = struct {
+        fn call(v: *Vm, name: []const u8, args: []const Value) !Value {
+            const f = v.globals.get(try v.heap.internValue(name));
+            var out: [1]Value = .{Value.nil()};
+            _ = try v.callValue(f, args, out[0..]);
+            return out[0];
+        }
+        fn expectX(v: *Vm, want: i64) !void {
+            try testing.expectEqual(want, (try call(v, "rd", &.{})).asInt());
+        }
+    };
+    const vms = [_]*Vm{ &vm, vm2 };
+
+    try Side.expectX(&vm, 1);
+    try Side.expectX(vm2, 1);
+    for (0..6) |round| {
+        // Diverge the layouts: one VM grows, the other grows then deletes.
+        const grower = vms[round % 2];
+        const other = vms[(round + 1) % 2];
+        const p = try grower.heap.internValue(if (round % 2 == 0) "a" else "b");
+        _ = try Side.call(grower, "grow", &.{ p, Value.int(@intCast(40 * (round + 1))) });
+        const q = try other.heap.internValue("c");
+        _ = try Side.call(other, "grow", &.{ q, Value.int(30) });
+        _ = try Side.call(other, "shrink", &.{ q, Value.int(30) });
+
+        const base: i64 = @intCast(100 * round);
+        _ = try Side.call(&vm, "wr", &.{Value.int(base + 1)});
+        _ = try Side.call(vm2, "wr", &.{Value.int(base + 2)});
+        for (0..3) |_| {
+            try Side.expectX(&vm, base + 1);
+            try Side.expectX(vm2, base + 2);
+        }
+    }
+}
+
 test "restore reanimates a live load closure that runs with the same result (L-2)" {
     const gpa = testing.allocator;
     const source =

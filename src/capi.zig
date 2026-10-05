@@ -287,13 +287,17 @@ inline fn putC(o: *mh_value, v: Value) void {
 }
 
 /// Validate a value arriving from C. Rejects unknown tag bytes, `row_view`
-/// (never handed out, so receiving one is API misuse), and a null heap
-/// pointer. Garbage *non-null* heap pointers are undetectable — the usual
+/// (never handed out, so receiving one is API misuse), a null heap pointer,
+/// and a boolean whose payload isn't 0 or 1. The VM relies on booleans being
+/// canonical: table keys hash and match by raw payload bits (doc 62 §3.5), so
+/// a `true` with payload 11 would be a different key from `mh_bool(1)`.
+/// Garbage *non-null* heap pointers are undetectable — the usual
 /// Lua-C-API-grade unsafety, documented in the header.
 fn fromC(cv: mh_value) ?Value {
     const max_tag = @intFromEnum(value.Tag.row_view);
     if (cv.tag >= max_tag) return null; // unknown tags AND row_view
     if (cv.tag == @intFromEnum(value.Tag.heap_ref) and cv.payload == 0) return null;
+    if (cv.tag == @intFromEnum(value.Tag.boolean) and cv.payload > 1) return null;
     return .{ .tag = @enumFromInt(cv.tag), .payload = .{ .bits = cv.payload } };
 }
 
@@ -899,7 +903,7 @@ fn argsSlice(box: *VmBox, args: ?[*]const mh_value, nargs: usize) ?[]const Value
 }
 
 fn badValue(box: *VmBox) mh_status {
-    setLastError(box, "invalid mh_value (bad tag or null heap pointer)");
+    setLastError(box, "invalid mh_value (bad tag, null heap pointer or non-0/1 boolean)");
     return .err_api;
 }
 
@@ -1372,7 +1376,7 @@ pub export fn mh_table_iter_new(vm: ?*VmBox, tbl: mh_value, out: ?**IterBox) mh_
         defer gpa.free(keys);
         var it = t.hash.iterator();
         var i: usize = 0;
-        while (it.next()) |e| : (i += 1) keys[i] = e.key_ptr.*;
+        while (it.next()) |e| : (i += 1) keys[i] = e.key;
         std.mem.sort(Value, keys, {}, key_order.less);
         for (keys) |k| {
             kt.set(gpa, Value.int(@intCast(count + 1)), k) catch return iterOom(box, kt_ref);

@@ -132,7 +132,7 @@ fn sortedHashEntries(a: std.mem.Allocator, t: *const table.Table) ![]HashKV {
     const kvs = try a.alloc(HashKV, t.hash.count());
     var it = t.hash.iterator();
     var i: usize = 0;
-    while (it.next()) |e| : (i += 1) kvs[i] = .{ .key = e.key_ptr.*, .val = e.value_ptr.* };
+    while (it.next()) |e| : (i += 1) kvs[i] = .{ .key = e.key, .val = e.value_ptr.* };
     std.mem.sort(HashKV, kvs, {}, HashKV.lessThan);
     return kvs;
 }

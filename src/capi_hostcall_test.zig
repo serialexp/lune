@@ -211,7 +211,7 @@ const Dump = struct {
                 try self.p("|", .{});
                 var it = t.hash.iterator();
                 while (it.next()) |e| {
-                    try self.val(e.key_ptr.*);
+                    try self.val(e.key);
                     try self.p("= ", .{});
                     try self.val(e.value_ptr.*);
                 }
@@ -753,6 +753,9 @@ test "hostcall diff: invalid values are rejected identically" {
             try pr.call(.{ .callee = .{ .raw = .{ .tag = 4, .payload = 0 } } }); // null heap pointer
             try pr.call(.{ .callee = .{ .global = "p3" }, .args = &.{ .{ .int = 1 }, .{ .raw = .{ .tag = 0xFF } } } });
             try pr.call(.{ .callee = .{ .global = "p3" }, .args = &.{.{ .raw = .{ .tag = 4, .payload = 0 } }} });
+            try pr.call(.{ .callee = .{ .global = "p3" }, .args = &.{.{ .raw = .{ .tag = 1, .payload = 11 } }} }); // non-0/1 boolean
+            try pr.call(.{ .callee = .{ .global = "p3" }, .args = &.{.{ .raw = .{ .tag = 1, .payload = 1 << 63 } }} }); // the .S check compares unsigned
+            try pr.call(.{ .callee = .{ .global = "p3" }, .args = &.{.{ .raw = .{ .tag = 1, .payload = 1 } }} });
             try pr.callGlobal("p3", &.{.{ .int = 1 }});
         }
     }.run);

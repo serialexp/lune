@@ -99,7 +99,7 @@ fn sortedHashKeys(gpa: std.mem.Allocator, t: *const Table) ![]Value {
     const keys = try gpa.alloc(Value, t.hash.count());
     var it = t.hash.iterator();
     var i: usize = 0;
-    while (it.next()) |e| : (i += 1) keys[i] = e.key_ptr.*;
+    while (it.next()) |e| : (i += 1) keys[i] = e.key;
     std.mem.sort(Value, keys, {}, key_order.less);
     return keys;
 }

@@ -140,6 +140,7 @@ pub fn compileWithOptions(
         .constants = c.constants.items,
         .num_registers = c.max_reg,
         .protos = c.protos.items,
+        .global_slot_hints = try zeroedHints(c.arena, c.constants.items.len),
         .name = "main",
         .is_vararg = c.is_vararg,
         // Doc 56 §4.2: per-pc register liveness, from the finished code.
@@ -161,6 +162,14 @@ pub fn compileWithOptions(
     // not in the struct, so the pointers stay valid; only the `c.arena` handle
     // goes stale and we no longer use it.
     return .{ .arena = arena, .proto = proto, .proto_count = next_id - opts.id_base };
+}
+
+/// `Proto.global_slot_hints` for a proto with `n` constants: all slot 0,
+/// which every lookup re-checks like any other hint.
+fn zeroedHints(arena: std.mem.Allocator, n: usize) std.mem.Allocator.Error![]u32 {
+    const hints = try arena.alloc(u32, n);
+    @memset(hints, 0);
+    return hints;
 }
 
 /// Pre-order walk assigning each proto a unique id. `@constCast` is sound: the
@@ -1235,6 +1244,7 @@ const Compiler = struct {
             .is_vararg = child.is_vararg,
             .protos = child.protos.items,
             .upvalues = child.upvalues.items,
+            .global_slot_hints = try zeroedHints(self.arena, child.constants.items.len),
             .name = name,
             // Doc 56 §4.2: per-pc register liveness, from the finished code.
             .reg_live = try bc_liveness.compute(self.arena, self.scratch, child.code.items, child.max_reg, child.protos.items),

@@ -154,6 +154,7 @@ const expected = [_]Entry{
     .{ .name = "VALUE_TAG", .value = off(Value, "tag") },
     .{ .name = "VALUE_PAYLOAD", .value = off(Value, "payload") },
     .{ .name = "TAG_NIL", .value = @intFromEnum(value.Tag.nil) },
+    .{ .name = "TAG_BOOLEAN", .value = @intFromEnum(value.Tag.boolean) },
     .{ .name = "TAG_HEAP_REF", .value = @intFromEnum(value.Tag.heap_ref) },
     .{ .name = "TAG_ROW_VIEW", .value = @intFromEnum(value.Tag.row_view) },
     .{ .name = "OBJ_FUNCTION", .value = @intFromEnum(object.ObjectType.function) },

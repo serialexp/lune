@@ -6273,11 +6273,47 @@ pub const Vm = struct {
     fn opGetGlobal(comptime mode: ExecMode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
-                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                regs.set(instr.a, vm.globals.get(st.proto.constants[instr.b]));
-                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+                // Fast path: the global is where this name's slot hint says.
+                // It calls nothing, so the handler needs no saved registers;
+                // everything else tail-calls the slow handler.
+                const hints = st.proto.global_slot_hints;
+                const hit: ?Value = if (instr.b < hints.len)
+                    vm.globals.heapHintHit(st.proto.constants[instr.b], hints[instr.b])
+                else
+                    null;
+                if (hit) |v| {
+                    const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                    regs.set(instr.a, v);
+                    return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+                } else {
+                    @branchHint(.cold);
+                    // Through a volatile load: called directly, LLVM inlines
+                    // the slow handler here, and its calls make every hit
+                    // save and restore five registers.
+                    const slow: *volatile const *const HandlerFn = &GetGlobalSlow(mode).handler;
+                    return @call(.always_tail, slow.*, .{ st, pc, instr, vm, tags, payloads });
+                }
             }
         }.h;
+    }
+
+    /// `get_global` when the slot hint misses (or the proto has none): the
+    /// full lookup, which also moves the hint to where the global was found.
+    fn GetGlobalSlow(comptime mode: ExecMode) type {
+        return struct {
+            /// Never written. A `var` so the volatile load in `opGetGlobal`
+            /// is a real load; Zig folds a load from a `const` at compile time.
+            var handler: *const HandlerFn = &h;
+
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const key = st.proto.constants[instr.b];
+                const hints = st.proto.global_slot_hints;
+                const v = if (instr.b < hints.len) vm.globals.getHinted(key, &hints[instr.b]) else vm.globals.get(key);
+                regs.set(instr.a, v);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        };
     }
 
     fn opSetGlobal(comptime mode: ExecMode) *const HandlerFn {
@@ -6286,7 +6322,13 @@ pub const Vm = struct {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
                 const self = vm;
                 const v = regs.get(instr.a);
-                self.globals.set(self.gpa, st.proto.constants[instr.b], v) catch |e| return parkErr(st, e);
+                const key = st.proto.constants[instr.b];
+                const hints = st.proto.global_slot_hints;
+                const stored = if (instr.b < hints.len)
+                    self.globals.setHinted(self.gpa, key, v, &hints[instr.b])
+                else
+                    self.globals.set(self.gpa, key, v);
+                stored catch |e| return parkErr(st, e);
                 self.heap.writeBarrier(&self.globals.header, v); // no-op until Phase 4
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }

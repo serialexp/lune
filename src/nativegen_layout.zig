@@ -104,16 +104,19 @@ pub const PROTO_ID_OFF: i32 = @offsetOf(bytecode.Proto, "id");
 /// offsets, like `HASH_SIZE_FROM_HEADER` (header is `Table`'s first field).
 pub const HASH_MASK_FROM_HEADER: i32 = table.Table.hash_off + @offsetOf(table.Table.Map, "mask") - @as(i32, @intCast(@offsetOf(table.Table, "header")));
 pub const HASH_NODES_FROM_HEADER: i32 = table.Table.hash_off + @offsetOf(table.Table.Map, "nodes") - @as(i32, @intCast(@offsetOf(table.Table, "header")));
-/// Node geometry: `hash_part.Node` is `extern { key: Value, value: Value }`,
-/// 32 bytes. Comptime-pinned so a Node change recomputes the JIT's address
-/// math or fails the build, never miscompiles.
+/// Node geometry: `hash_part.Node` is `extern { key_tag, _pad, key_id,
+/// key_payload, value }`, 32 bytes. Comptime-pinned so a Node change
+/// recomputes the JIT's address math or fails the build, never miscompiles.
 pub const NODE_SIZE: i32 = @sizeOf(hash_part.Node);
-pub const NODE_KEY_TAG_OFF: i32 = @offsetOf(hash_part.Node, "key") + @offsetOf(value.Value, "tag");
-pub const NODE_KEY_PAYLOAD_OFF: i32 = @offsetOf(hash_part.Node, "key") + @offsetOf(value.Value, "payload");
+pub const NODE_KEY_TAG_OFF: i32 = @offsetOf(hash_part.Node, "key_tag");
+/// The node's copy of a heap key's stable `GcHeader.id`. The hrefk key guard
+/// compares the recorded interned-key id against `[node + NODE_KEY_ID_OFF]`,
+/// with no load through the key's pointer.
+pub const NODE_KEY_ID_OFF: i32 = @offsetOf(hash_part.Node, "key_id");
+pub const NODE_KEY_PAYLOAD_OFF: i32 = @offsetOf(hash_part.Node, "key_payload");
 pub const NODE_VALUE_OFF: i32 = @offsetOf(hash_part.Node, "value");
 /// Offset of `GcHeader.id` (the stable `u32` object identity — NOT an address,
-/// survives keyframe restore) from a `*GcHeader`. The hrefk key guard compares
-/// the recorded interned-key id against `[node.key.payload + GCHEADER_ID_OFF]`.
+/// survives keyframe restore) from a `*GcHeader`.
 pub const GCHEADER_ID_OFF: i32 = @offsetOf(object.GcHeader, "id");
 comptime {
     std.debug.assert(NODE_SIZE == 32);

@@ -693,7 +693,7 @@ pub const Heap = struct {
                 }
                 var it = t.hash.iterator();
                 while (it.next()) |entry| {
-                    self.markValue(entry.key_ptr.*);
+                    self.markValue(entry.key);
                     self.markValue(entry.value_ptr.*);
                 }
                 // The metatable (chunk 2a) is a heap edge: keep it alive while

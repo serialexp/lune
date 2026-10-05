@@ -624,6 +624,17 @@ pub const Proto = struct {
     /// Upvalue capture plan: how a `closure` of this proto fills its cells from
     /// the enclosing frame. Empty for functions that capture nothing.
     upvalues: []const UpvalDesc = &.{},
+    /// Global-access cache: one hash-slot hint per constant, used by
+    /// `get_global`/`set_global` for the global named by `constants[i]`
+    /// (`Table.getHinted`). A hint only: every use re-checks it, so it never
+    /// changes a result, and it is never serialized. Mutable through a
+    /// `*const Proto` (the slice's elements are). Allocated zeroed by the
+    /// compiler; empty on hand-built protos, whose global accesses then take
+    /// the plain lookup. Every VM running this proto reads and writes these
+    /// words, so running one proto on two threads at once is a data race even
+    /// when each VM is used by one thread only. The embedding API shares
+    /// nothing between VMs (doc 59), so that can't happen today (doc 62 §4.4).
+    global_slot_hints: []u32 = &.{},
     /// Doc 56 §4.2: per-pc register liveness (see `RegLiveness`). Filled by
     /// the compiler; empty (unavailable) on hand-built protos.
     reg_live: RegLiveness = .{},

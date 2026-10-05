@@ -134,6 +134,38 @@ test "cross-frame: a callee reached through a global inlines and stays byte-iden
     );
 }
 
+test "global-access cache: removal, redefinition, rehash and _G writes are all seen" {
+    // `get_global`/`set_global` keep a per-name hash-slot hint
+    // (`Proto.global_slot_hints`). Every way the globals table can change
+    // under a warm hint must still read the current value: a removal leaves
+    // a dead slot, growth moves every key, `_G` and `rawset` write without
+    // `set_global`, and mass deletion followed by an insert rehashes.
+    try expectProgram(
+        \\x = 1
+        \\local function rd() return x end
+        \\local function sum(n) local s = 0 for i = 1, n do s = s + x end return s end
+        \\print(rd(), sum(10))
+        \\x = nil
+        \\print(rd())
+        \\x = 2
+        \\print(rd(), sum(10))
+        \\for i = 1, 200 do _G["g" .. i] = i end
+        \\print(rd(), g7, g200, sum(10))
+        \\x = 3
+        \\print(rd())
+        \\_G.x = 4
+        \\print(rd())
+        \\rawset(_G, "x", 5)
+        \\print(rd(), sum(10))
+        \\for i = 1, 200 do _G["g" .. i] = nil end
+        \\for i = 1, 300 do _G["h" .. i] = i end
+        \\print(rd(), g7, h300, sum(10))
+        \\
+    ,
+        "1\t10\nnil\n2\t20\n2\t7\t200\t20\n3\n4\n5\t50\n5\tnil\t300\t50\n",
+    );
+}
+
 test "cross-frame: a changed upvalue callee deopts the snapshot and replays byte-identically" {
     // The snapshot's load-bearing guard. The first `inner()` records a trace whose
     // `guard_func` pins proto X (the first `A`). Reassigning the captured upvalue `A`

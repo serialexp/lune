@@ -2,6 +2,29 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Global-read slow path leaves via a volatile `var` pointer (noted 2026-10-05)
+
+- [ ] **`opGetGlobal` (src/interp.zig) tail-calls `GetGlobalSlow(mode).handler`
+      through a volatile load of a never-written `var`.** It keeps LLVM from
+      inlining the slow handler, which would make every hint hit save and
+      restore five callee-saved registers (global read 73 → 61 instructions).
+      `noinline` changes the fn type and breaks `.always_tail`; a volatile
+      load of a `const` is folded. Accepted for now (Bart, 2026-10-05); look
+      for a less tricky shape (e.g. a slow-handler table the dispatcher
+      already owns, or a future Zig attribute) and apply it to other
+      handlers with cold slow paths.
+
+## JIT-on callback loop runs ~95 extra instructions per iteration (noted 2026-10-05)
+
+- [ ] **`s = s + host_id(i)` costs ~984 instructions per iteration with the
+      JIT on vs ~880 with it off** (AVX2 build, HEAD before the global
+      slot-hint work, callback probe `/tmp/cbprobe.c` shape `host`). Host
+      natives are recorder-opaque (doc 59 §3.5), so the loop never compiles,
+      but something still charges per iteration. Suspect: repeated recording
+      attempts/aborts or hotcount bookkeeping on the uncompilable loop. Check
+      with `--jit-stats` / `--dump-aborts` before the option-3 (compiled code
+      calls host natives directly) design doc.
+
 ## `capi-smoke` hangs under `zig build test -Doptimize=ReleaseFast` (noted 2026-10-03)
 
 - [x] **`tests/capi_smoke.c` puts every API call inside `assert(...)`** (30

@@ -136,7 +136,9 @@ pub const Closure = struct {
 /// A native (host/builtin) function. Type-erased on purpose (see module docs):
 /// the context is the running VM passed as `*anyopaque`, and the error is
 /// `anyerror` — a superset of the interpreter's error set, so a native's errors
-/// coerce back through the boundary.
+/// coerce back through the boundary. The result is trusted, not validated:
+/// it must be a well-formed `Value` (e.g. a boolean's payload is 0 or 1; see
+/// `Value`).
 pub const NativeFn = *const fn (ctx: *anyopaque, args: []const Value) anyerror!Value;
 
 /// A **multi-result** native. Writes up to `out.len` results into `out` (in
@@ -161,7 +163,9 @@ pub const NativeMultiFn = *const fn (ctx: *anyopaque, args: []const Value, out: 
 /// `interp`). Writes up to `out.len` results and returns the count produced;
 /// the VM nil-pads the rest. Unlike `NativeMultiFn`, `out` NEVER aliases `args`
 /// (the invocation funnel guarantees disjoint buffers), so a host fn may write
-/// results before it finishes reading args.
+/// results before it finishes reading args. Results are trusted as well-formed
+/// `Value`s (a boolean's payload is 0 or 1); the C adapter validates its host's
+/// results with `capi.fromC` before they get here.
 pub const HostFn = *const fn (ctx: ?*anyopaque, vm: *anyopaque, args: []const Value, out: []Value) anyerror!usize;
 
 /// Embedding (doc 59 §3.5): the per-registration state a host `Native` carries.

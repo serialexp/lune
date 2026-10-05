@@ -19,8 +19,8 @@
 //!   slot, which is what keeps HREFK slot pins stable through
 //!   `t.x = nil; t.x = 1.5` churn.
 //! - **Dead heap keys hold no pointer**: on removal the key payload is
-//!   rewritten from the object pointer to the stable `GcHeader.id` (tag
-//!   preserved). GC marks live nodes only; a deleted key's object graph is
+//!   zeroed; the stable `GcHeader.id` stays in `key_id` and the tag is
+//!   preserved (doc 62 §3.2). GC marks live nodes only; a deleted key's object graph is
 //!   collectable immediately and a later probe can never dereference a stale
 //!   pointer. Dead-node key storage is internal — it is never exposed through
 //!   the logical API as a `Value`.
@@ -50,10 +50,14 @@ const Value = value.Value;
 /// NOT `payload.bits` (an ASLR-dependent address) — consistent with
 /// `Value.eql`: equal heap keys are the same interned object, same id.
 /// Distribution quality is a performance concern only, never correctness
-/// (`eql` still does the full comparison).
+/// (the probe still compares the full identity: `Ident.matches`).
 pub fn keyHash(v: Value) u64 {
     const payload: u64 = if (v.isHeap()) v.asHeap().id else v.payload.bits;
-    var x = payload ^ (@as(u64, @intFromEnum(v.tag)) *% 0x9E3779B97F4A7C15);
+    return mixHash(v.tag, payload);
+}
+
+fn mixHash(tag: value.Tag, payload: u64) u64 {
+    var x = payload ^ (@as(u64, @intFromEnum(tag)) *% 0x9E3779B97F4A7C15);
     x = (x ^ (x >> 30)) *% 0xBF58476D1CE4E5B9;
     x = (x ^ (x >> 27)) *% 0x94D049BB133111EB;
     return x ^ (x >> 31);
@@ -62,18 +66,84 @@ pub fn keyHash(v: Value) u64 {
 /// One slot: key + value, interleaved so a field access reads one cacheline.
 /// All-zero bytes are a FREE node (`Tag.nil == 0`, zero payload, zero pad), so
 /// a fresh array is a single `@memset`.
+///
+/// The key is stored as a `Value`'s tag and payload, with the key's identity
+/// in the bytes a `Value` leaves as padding. A heap key's identity is its
+/// `GcHeader.id`, the same identity `Value.eql` compares. Keeping it in the
+/// node lets a probe match keys without loading the key object's header:
+/// one header load per lookup (the key being looked up) instead of two per
+/// probed slot.
 pub const Node = extern struct {
-    key: Value,
+    key_tag: value.Tag,
+    _pad: [3]u8 = .{ 0, 0, 0 },
+    /// Heap keys: `GcHeader.id`, live or dead. Scalar keys: 0.
+    key_id: u32,
+    /// Live heap keys: the object pointer (GC marks through it). Dead heap
+    /// keys: 0, so a dead node holds no pointer. Scalar keys: the raw bits.
+    key_payload: value.Payload,
     value: Value,
+
+    /// The key as a `Value`. Live nodes only: a dead heap key has no pointer.
+    pub fn key(n: *const Node) Value {
+        return .{ .tag = n.key_tag, .payload = n.key_payload };
+    }
+
+    fn isFree(n: *const Node) bool {
+        return n.key_tag == .nil;
+    }
+
+    fn setKey(n: *Node, k: Value, ident: Ident) void {
+        n.key_tag = k.tag;
+        n._pad = .{ 0, 0, 0 };
+        n.key_id = ident.id;
+        n.key_payload = k.payload;
+    }
+
+    /// The `keyHash` of this node's key, from the stored identity (no header
+    /// load).
+    fn hash(n: *const Node) u64 {
+        const payload: u64 = if (n.key_tag == .heap_ref) n.key_id else n.key_payload.bits;
+        return mixHash(n.key_tag, payload);
+    }
 };
 
 comptime {
     std.debug.assert(@sizeOf(Node) == 32);
-    std.debug.assert(@offsetOf(Node, "key") == 0);
+    std.debug.assert(@offsetOf(Node, "key_tag") == @offsetOf(Value, "tag"));
+    std.debug.assert(@offsetOf(Node, "key_id") == 4);
+    std.debug.assert(@offsetOf(Node, "key_payload") == @offsetOf(Value, "payload"));
     std.debug.assert(@offsetOf(Node, "value") == 16);
     // The all-zero-bytes-is-free invariant: nil is tag ordinal 0.
     std.debug.assert(@intFromEnum(value.Tag.nil) == 0);
 }
+
+/// A key's identity as a probe compares it, computed once per lookup: the
+/// tag plus the stable id (heap keys) or the raw payload bits (scalars).
+/// Equal identity is exactly `Value.eql` for the keys a hash part holds:
+/// heap keys compare by id in both; integral floats are normalized to ints
+/// and NaN is never a key (`Table.set` / `normalizeKey`), so equal numbers
+/// have equal bits.
+const Ident = struct {
+    tag: value.Tag,
+    id: u32,
+    bits: u64,
+
+    fn of(k: Value) Ident {
+        std.debug.assert(k.tag != .row_view);
+        if (k.isHeap()) return .{ .tag = k.tag, .id = k.asHeap().id, .bits = 0 };
+        return .{ .tag = k.tag, .id = 0, .bits = k.payload.bits };
+    }
+
+    /// Does the (non-free) node's key have this identity? Live or dead.
+    inline fn matches(self: Ident, n: *const Node) bool {
+        if (n.key_tag != self.tag) return false;
+        return if (self.tag == .heap_ref) n.key_id == self.id else n.key_payload.bits == self.bits;
+    }
+
+    fn hash(self: Ident) u64 {
+        return mixHash(self.tag, if (self.tag == .heap_ref) self.id else self.bits);
+    }
+};
 
 /// The alignment of the node array: 32, so a 32-byte node never straddles a
 /// 64-byte cacheline.
@@ -96,7 +166,7 @@ pub const HashPart = extern struct {
     pub const empty: HashPart = .{};
     pub const min_capacity: u32 = 4;
 
-    pub const Entry = struct { key_ptr: *Value, value_ptr: *Value };
+    pub const Entry = struct { key: Value, value_ptr: *Value };
 
     // ------------------------------------------------------------------
     // Logical layer — the std-map-shaped contract `table.zig` and the
@@ -130,6 +200,58 @@ pub const HashPart = extern struct {
         return self.liveSlotOf(key) != null;
     }
 
+    /// `get` through a slot hint the caller keeps per lookup site (the
+    /// interpreter's global-access cache). The hinted slot is used only if it
+    /// holds `key`'s identity with a live value; otherwise the normal probe
+    /// runs and the hint is moved to where `key` was found. Always the same
+    /// result as `get`: the hint can be stale, out of range, or from another
+    /// table, and only the cost changes.
+    pub fn getHinted(self: *const HashPart, key: Value, hint: *u32) ?Value {
+        const ident = Ident.of(key);
+        if (self.hintedNode(hint.*)) |n| {
+            if (ident.matches(n) and !n.value.isNil()) return n.value;
+        }
+        const idx = self.liveSlotOfIdent(ident, key) orelse return null;
+        hint.* = idx;
+        return self.nodes.?[idx].value;
+    }
+
+    /// The hit half of `getHinted` for a heap key, inlined into the caller and
+    /// calling nothing: the value if the hinted slot holds `key` live, else
+    /// null, which means "not known here", not "absent" (the caller then
+    /// takes `getHinted`). For the interpreter's global access, where a
+    /// global's name is an interned string.
+    pub inline fn heapHintHit(self: *const HashPart, key: Value, hint: u32) ?Value {
+        if (!key.isHeap()) return null;
+        const n = self.hintedNode(hint) orelse return null;
+        if (n.key_tag != .heap_ref or n.key_id != key.asHeap().id or n.value.isNil()) return null;
+        return n.value;
+    }
+
+    /// The node a hint names, or null when the map has no nodes or the hint
+    /// is out of range (a hint can come from an earlier, larger layout, or
+    /// from another table). Indexes through a slice so a safe build would
+    /// catch an out-of-range read if the range test ever went wrong.
+    inline fn hintedNode(self: *const HashPart, hint: u32) ?*Node {
+        const nodes = self.nodes orelse return null;
+        const all = nodes[0 .. @as(usize, self.mask) + 1];
+        if (hint >= all.len) return null;
+        return &all[hint];
+    }
+
+    /// Overwrite the value of a key already live at the hinted slot. Returns
+    /// false (and changes nothing) when the hint misses or `val` is nil; the
+    /// caller then takes the full store path. When it returns true the map is
+    /// exactly as `put` would have left it: `put` on a live key only
+    /// overwrites the value.
+    pub fn setExistingHinted(self: *HashPart, key: Value, val: Value, hint: u32) bool {
+        if (val.isNil()) return false;
+        const n = self.hintedNode(hint) orelse return false;
+        if (!Ident.of(key).matches(n) or n.value.isNil()) return false;
+        n.value = val;
+        return true;
+    }
+
     /// Insert or overwrite. `val` must be non-nil (deletion goes through
     /// `remove` — a nil put would silently mint a dead entry and corrupt the
     /// live/used invariants); `key` must be non-nil, non-NaN-float (callers
@@ -142,8 +264,9 @@ pub const HashPart = extern struct {
         std.debug.assert(!key.isNil());
         std.debug.assert(key.tag != .row_view);
         if (self.nodes == null) try self.rehashTo(gpa, min_capacity);
+        const ident = Ident.of(key);
         while (true) {
-            switch (self.probeForPut(key)) {
+            switch (self.probeForPut(ident)) {
                 .live => |idx| {
                     self.nodes.?[idx].value = val;
                     return;
@@ -155,7 +278,7 @@ pub const HashPart = extern struct {
                     // test — occupancy does not grow, and slot stability
                     // through delete/reinsert is the point (doc 49).
                     const n = &self.nodes.?[idx];
-                    n.key = key;
+                    n.setKey(key, ident);
                     n.value = val;
                     self.live += 1;
                     return;
@@ -165,7 +288,7 @@ pub const HashPart = extern struct {
                     // the chain's free end first, so no duplicate exists).
                     // Occupancy does not grow → no load test.
                     const n = &self.nodes.?[idx];
-                    n.key = key;
+                    n.setKey(key, ident);
                     n.value = val;
                     self.live += 1;
                     return;
@@ -180,7 +303,7 @@ pub const HashPart = extern struct {
                         continue; // fresh layout — re-probe
                     }
                     const n = &self.nodes.?[idx];
-                    n.key = key;
+                    n.setKey(key, ident);
                     n.value = val;
                     self.live += 1;
                     self.used += 1;
@@ -191,22 +314,25 @@ pub const HashPart = extern struct {
     }
 
     /// Remove a key. Lua-style: the node stays (dead) until the next rehash;
-    /// a heap key's payload is rewritten pointer → stable id so dead nodes
-    /// hold no pointers. Returns true iff a live entry was removed.
+    /// a heap key's pointer is cleared (its id stays in `key_id`, which is
+    /// what probes match on) so dead nodes hold no pointers. Returns true iff
+    /// a live entry was removed.
     pub fn remove(self: *HashPart, key: Value) bool {
         const idx = self.liveSlotOf(key) orelse return false;
         const n = &self.nodes.?[idx];
         // Publication order (doc 49): value goes nil BEFORE the key loses its
         // pointer, so "non-nil value ⇒ valid live key" holds at every point.
         n.value = Value.nil();
-        if (n.key.isHeap()) n.key.payload = .{ .bits = @as(u64, n.key.asHeap().id) };
+        if (n.key_tag == .heap_ref) n.key_payload = .{ .bits = 0 };
         self.live -= 1;
         return true;
     }
 
     /// Iterate LIVE entries (dead and free nodes are skipped), in slot order.
-    /// Mutable pointers, like the std map's iterator; mutating the map while
-    /// iterating invalidates the iterator (also like the std map).
+    /// The key comes by value (a node stores it as tag, id and payload, not
+    /// as a `Value`); the value by mutable pointer, like the std map's
+    /// iterator. Mutating the map while iterating invalidates the iterator
+    /// (also like the std map).
     pub const Iterator = struct {
         nodes: [*]Node,
         remaining: u32,
@@ -216,8 +342,8 @@ pub const HashPart = extern struct {
                 const n = &it.nodes[0];
                 it.nodes += 1;
                 it.remaining -= 1;
-                if (!n.key.isNil() and !n.value.isNil())
-                    return .{ .key_ptr = &n.key, .value_ptr = &n.value };
+                if (!n.isFree() and !n.value.isNil())
+                    return .{ .key = n.key(), .value_ptr = &n.value };
             }
             return null;
         }
@@ -241,21 +367,21 @@ pub const HashPart = extern struct {
     /// most one node, live or dead). This is the recorder's `hashSlotOf`
     /// backing: hrefk pins live slots only.
     pub fn liveSlotOf(self: *const HashPart, key: Value) ?u32 {
-        std.debug.assert(key.tag != .row_view);
+        return self.liveSlotOfIdent(Ident.of(key), key);
+    }
+
+    fn liveSlotOfIdent(self: *const HashPart, ident: Ident, key: Value) ?u32 {
         const nodes = self.nodes orelse return null;
         const mask = self.mask;
-        var idx: u32 = @truncate(keyHash(key) & mask);
+        var idx: u32 = @truncate(ident.hash() & mask);
         var limit: u64 = @as(u64, mask) + 1;
-        const dead_bits = deadBitsOf(key);
         while (limit != 0) : (limit -= 1) {
             const n = &nodes[idx];
-            if (n.key.isNil()) return null; // free — chain ends
-            if (n.value.isNil()) {
-                // Dead node: internal key encoding — match by (tag, id-or-raw
-                // bits), never by dereferencing (`Value.eql` would chase a
-                // heap pointer the node no longer holds).
-                if (n.key.tag == key.tag and n.key.payload.bits == dead_bits) return null;
-            } else if (n.key.eql(key)) {
+            if (n.isFree()) return null; // chain ends
+            if (ident.matches(n)) {
+                // A dead match proves logical absence.
+                if (n.value.isNil()) return null;
+                if (std.debug.runtime_safety) std.debug.assert(n.key().eql(key));
                 return idx;
             }
             idx = (idx + 1) & mask;
@@ -274,34 +400,21 @@ pub const HashPart = extern struct {
     /// match anywhere on it is found before any insertion decision), tracking
     /// the first dead slot for reuse. The chain always ends: `used` is capped
     /// strictly below capacity by the load test, so a free slot exists.
-    fn probeForPut(self: *const HashPart, key: Value) PutSlot {
+    fn probeForPut(self: *const HashPart, ident: Ident) PutSlot {
         const nodes = self.nodes.?;
         const mask = self.mask;
-        var idx: u32 = @truncate(keyHash(key) & mask);
-        const dead_bits = deadBitsOf(key);
+        var idx: u32 = @truncate(ident.hash() & mask);
         var first_dead: ?u32 = null;
         while (true) {
             const n = &nodes[idx];
-            if (n.key.isNil()) {
+            if (n.isFree()) {
                 return if (first_dead) |d| .{ .reuse_dead = d } else .{ .free = idx };
             }
-            if (n.value.isNil()) {
-                if (n.key.tag == key.tag and n.key.payload.bits == dead_bits)
-                    return .{ .resurrect = idx };
-                if (first_dead == null) first_dead = idx;
-            } else if (n.key.eql(key)) {
-                return .{ .live = idx };
-            }
+            const dead = n.value.isNil();
+            if (ident.matches(n)) return if (dead) .{ .resurrect = idx } else .{ .live = idx };
+            if (dead and first_dead == null) first_dead = idx;
             idx = (idx + 1) & mask;
         }
-    }
-
-    /// The internal identity bits a DEAD node stores for this key: the stable
-    /// `GcHeader.id` for heap keys (pointer-free), the raw payload for
-    /// scalars. Tags are compared first, and ids are globally unique within
-    /// the allocation timeline, so there is no cross-kind collision.
-    fn deadBitsOf(v: Value) u64 {
-        return if (v.isHeap()) @as(u64, v.asHeap().id) else v.payload.bits;
     }
 
     /// Max occupied slots (live + dead) for a capacity: 75% load.
@@ -329,11 +442,11 @@ pub const HashPart = extern struct {
         const new_mask: u32 = new_cap - 1;
         if (self.nodes) |old| {
             for (old[0 .. self.mask + 1]) |*n| {
-                if (n.key.isNil() or n.value.isNil()) continue; // free/dead
+                if (n.isFree() or n.value.isNil()) continue; // free/dead
                 // Fresh array has no dead nodes and no duplicates: plain
                 // probe to the first free slot.
-                var idx: u32 = @truncate(keyHash(n.key) & new_mask);
-                while (!new_nodes[idx].key.isNil()) idx = (idx + 1) & new_mask;
+                var idx: u32 = @truncate(n.hash() & new_mask);
+                while (!new_nodes[idx].isFree()) idx = (idx + 1) & new_mask;
                 new_nodes[idx] = n.*;
             }
             gpa.free(old[0 .. self.mask + 1]);
@@ -450,7 +563,7 @@ test "iterator yields live entries only, in slot order" {
     while (it.next()) |e| {
         seen += 1;
         try testing.expect(!e.value_ptr.isNil());
-        sum += e.key_ptr.asInt();
+        sum += e.key.asInt();
     }
     try testing.expectEqual(m.count(), seen);
     try testing.expectEqual(@as(i64, 45 - 4 - 7), sum);
@@ -492,8 +605,9 @@ test "layout is a deterministic pure function of the operation history" {
     try testing.expectEqual(a.used, b.used);
     var s: u32 = 0;
     while (s <= a.mask) : (s += 1) {
-        try testing.expectEqual(a.nodes.?[s].key.tag, b.nodes.?[s].key.tag);
-        try testing.expectEqual(a.nodes.?[s].key.payload.bits, b.nodes.?[s].key.payload.bits);
+        try testing.expectEqual(a.nodes.?[s].key_tag, b.nodes.?[s].key_tag);
+        try testing.expectEqual(a.nodes.?[s].key_id, b.nodes.?[s].key_id);
+        try testing.expectEqual(a.nodes.?[s].key_payload.bits, b.nodes.?[s].key_payload.bits);
         try testing.expectEqual(a.nodes.?[s].value.tag, b.nodes.?[s].value.tag);
     }
 }
@@ -561,4 +675,186 @@ test "keyHash is pure and distributes distinct scalar keys" {
     }
     try testing.expect(keyHash(Value.int(1)) != keyHash(Value.float(1.5)));
     try testing.expect(keyHash(Value.boolean(true)) != keyHash(Value.int(1)));
+}
+
+const GcHeader = @import("object.zig").GcHeader;
+
+test "heap keys match by id, so a different object with the same id is the same key" {
+    // A restored VM can run a program compiled in another heap: its global
+    // names are other objects with the same ids (keyframe restore keeps ids).
+    const gpa = testing.allocator;
+    var m: HashPart = .empty;
+    defer m.deinit(gpa);
+    var a: GcHeader = .{ .type = .string, .id = 10 };
+    var a_other: GcHeader = .{ .type = .string, .id = 10 };
+    var b: GcHeader = .{ .type = .string, .id = 11 };
+
+    try m.put(gpa, Value.heap(&a), Value.int(1));
+    try testing.expectEqual(@as(i64, 1), m.get(Value.heap(&a_other)).?.asInt());
+    try testing.expect(m.get(Value.heap(&b)) == null);
+    // Storing under the other object overwrites; it doesn't add a key.
+    try m.put(gpa, Value.heap(&a_other), Value.int(2));
+    try testing.expectEqual(@as(u32, 1), m.count());
+    try testing.expectEqual(@as(i64, 2), m.get(Value.heap(&a)).?.asInt());
+
+    // Removal leaves a dead node that holds the id but no pointer.
+    const slot = m.liveSlotOf(Value.heap(&a)).?;
+    try testing.expect(m.remove(Value.heap(&a_other)));
+    const n = &m.nodes.?[slot];
+    try testing.expectEqual(@as(u32, 10), n.key_id);
+    try testing.expectEqual(@as(u64, 0), n.key_payload.bits);
+    try testing.expect(m.get(Value.heap(&a)) == null);
+    // Reinserting resurrects the same slot with the new pointer.
+    try m.put(gpa, Value.heap(&a), Value.int(3));
+    try testing.expectEqual(slot, m.liveSlotOf(Value.heap(&a_other)).?);
+    try testing.expectEqual(@intFromPtr(&a), @intFromPtr(n.key().asHeap()));
+
+    var it = m.iterator();
+    const e = it.next().?;
+    try testing.expectEqual(@as(u32, 10), e.key.asHeap().id);
+    try testing.expect(it.next() == null);
+}
+
+test "slot hints: stale, out-of-range, foreign and dead hints give the plain lookup's answer" {
+    const gpa = testing.allocator;
+    var m: HashPart = .empty;
+    defer m.deinit(gpa);
+    var hs: [40]GcHeader = undefined;
+    for (&hs, 0..) |*h, i| h.* = .{ .type = .string, .id = @intCast(100 + i) };
+    for (hs[0..8], 0..) |*h, i| try m.put(gpa, Value.heap(h), Value.int(@intCast(i)));
+    const k = Value.heap(&hs[3]);
+
+    // A cold hint (slot 0) misses, then points at the key.
+    var hint: u32 = 0;
+    try testing.expectEqual(@as(i64, 3), m.getHinted(k, &hint).?.asInt());
+    try testing.expectEqual(m.liveSlotOf(k).?, hint);
+    try testing.expectEqual(@as(i64, 3), m.heapHintHit(k, hint).?.asInt());
+    // Out of range.
+    hint = m.mask + 100;
+    try testing.expect(m.heapHintHit(k, hint) == null);
+    try testing.expectEqual(@as(i64, 3), m.getHinted(k, &hint).?.asInt());
+    // Another key's slot.
+    hint = m.liveSlotOf(Value.heap(&hs[5])).?;
+    try testing.expect(m.heapHintHit(k, hint) == null);
+    try testing.expect(!m.setExistingHinted(k, Value.int(99), hint));
+    try testing.expectEqual(@as(i64, 5), m.get(Value.heap(&hs[5])).?.asInt());
+    try testing.expectEqual(@as(i64, 3), m.getHinted(k, &hint).?.asInt());
+
+    // An in-place store through a good hint; a nil store never takes it.
+    try testing.expect(m.setExistingHinted(k, Value.int(30), hint));
+    try testing.expectEqual(@as(i64, 30), m.get(k).?.asInt());
+    try testing.expect(!m.setExistingHinted(k, Value.nil(), hint));
+
+    // A removed key: the hint still names its (now dead) slot.
+    try testing.expect(m.remove(k));
+    try testing.expect(m.heapHintHit(k, hint) == null);
+    try testing.expect(!m.setExistingHinted(k, Value.int(1), hint));
+    try testing.expect(m.getHinted(k, &hint) == null);
+    try m.put(gpa, k, Value.int(4));
+
+    // Growth moves keys: the old hint is just stale.
+    const mask_before = m.mask;
+    for (hs[8..], 0..) |*h, i| try m.put(gpa, Value.heap(h), Value.int(@intCast(8 + i)));
+    try testing.expect(m.mask != mask_before);
+    for (&hs, 0..) |*h, i| {
+        var hh = hint;
+        const want: i64 = if (i == 3) 4 else @intCast(i);
+        try testing.expectEqual(want, m.getHinted(Value.heap(h), &hh).?.asInt());
+        try testing.expectEqual(m.liveSlotOf(Value.heap(h)).?, hh);
+    }
+
+    // A hint from another table is only a hint.
+    var other: HashPart = .empty;
+    defer other.deinit(gpa);
+    try other.put(gpa, Value.heap(&hs[0]), Value.int(-1));
+    var foreign = m.liveSlotOf(k).?;
+    try testing.expect(other.getHinted(k, &foreign) == null);
+    try testing.expectEqual(@as(i64, -1), other.getHinted(Value.heap(&hs[0]), &foreign).?.asInt());
+
+    // Scalar keys never take the heap hit path.
+    try m.put(gpa, Value.int(7), Value.int(70));
+    var ih = m.liveSlotOf(Value.int(7)).?;
+    try testing.expect(m.heapHintHit(Value.int(7), ih) == null);
+    try testing.expectEqual(@as(i64, 70), m.getHinted(Value.int(7), &ih).?.asInt());
+}
+
+test "slot hints across shrink, same-capacity rebuild and dead-slot reuse" {
+    const gpa = testing.allocator;
+    var m: HashPart = .empty;
+    defer m.deinit(gpa);
+    var hs: [64]GcHeader = undefined;
+    for (&hs, 0..) |*h, i| h.* = .{ .type = .string, .id = @intCast(200 + i) };
+    for (hs[0..40], 0..) |*h, i| try m.put(gpa, Value.heap(h), Value.int(@intCast(i)));
+
+    // Every key's hint before the rebuilds.
+    var hints: [40]u32 = undefined;
+    for (hs[0..40], &hints) |*h, *hint| hint.* = m.liveSlotOf(Value.heap(h)).?;
+
+    // Same-capacity rebuild: dead nodes squeezed out, keys may move.
+    for (hs[0..30]) |*h| try testing.expect(m.remove(Value.heap(h)));
+    const cap = m.mask + 1;
+    try testing.expect(cap > 16); // so `cap - 1` is out of range after the shrink
+    try m.rehashTo(gpa, cap);
+    try testing.expectEqual(cap, m.mask + 1);
+    for (hs[0..40], &hints, 0..) |*h, *hint, i| {
+        const k = Value.heap(h);
+        if (i < 30) {
+            try testing.expect(m.heapHintHit(k, hint.*) == null);
+            try testing.expect(m.getHinted(k, hint) == null);
+        } else {
+            if (m.heapHintHit(k, hint.*)) |v| try testing.expectEqual(@as(i64, @intCast(i)), v.asInt());
+            try testing.expectEqual(@as(i64, @intCast(i)), m.getHinted(k, hint).?.asInt());
+            try testing.expectEqual(m.liveSlotOf(k).?, hint.*);
+        }
+    }
+
+    // Shrink: hints from the bigger layout. Half of them are the key's slot
+    // there, half are past the small layout's end.
+    for (hs[30..40], hints[0..10], 0..) |*h, *hint, i| {
+        hint.* = if (i % 2 == 0) m.liveSlotOf(Value.heap(h)).? else cap - 1;
+    }
+    try m.rehashTo(gpa, 16);
+    try testing.expectEqual(@as(u32, 15), m.mask);
+    for (hs[30..40], hints[0..10], 30..) |*h, *hint, i| {
+        const k = Value.heap(h);
+        if (m.heapHintHit(k, hint.*)) |v| try testing.expectEqual(@as(i64, @intCast(i)), v.asInt());
+        try testing.expectEqual(@as(i64, @intCast(i)), m.getHinted(k, hint).?.asInt());
+    }
+
+    // Dead-slot reuse: another key takes the removed key's slot, and the
+    // removed key's hint then names a live node that isn't it.
+    const gone = Value.heap(&hs[35]);
+    const gone_slot = m.liveSlotOf(gone).?;
+    try testing.expect(m.remove(gone));
+    var reused = false;
+    for (hs[40..]) |*h| {
+        try m.put(gpa, Value.heap(h), Value.int(1000));
+        if (m.liveSlotOf(Value.heap(h)) == gone_slot) {
+            reused = true;
+            break;
+        }
+    }
+    try testing.expect(reused);
+    var gone_hint = gone_slot;
+    try testing.expect(m.heapHintHit(gone, gone_hint) == null);
+    try testing.expect(!m.setExistingHinted(gone, Value.int(5), gone_hint));
+    try testing.expect(m.getHinted(gone, &gone_hint) == null);
+}
+
+test "slot hints hit through another object with the same id" {
+    const gpa = testing.allocator;
+    var m: HashPart = .empty;
+    defer m.deinit(gpa);
+    var a: GcHeader = .{ .type = .string, .id = 10 };
+    var a_other: GcHeader = .{ .type = .string, .id = 10 };
+    try m.put(gpa, Value.heap(&a), Value.int(1));
+    const slot = m.liveSlotOf(Value.heap(&a)).?;
+
+    try testing.expectEqual(@as(i64, 1), m.heapHintHit(Value.heap(&a_other), slot).?.asInt());
+    var hint = slot;
+    try testing.expectEqual(@as(i64, 1), m.getHinted(Value.heap(&a_other), &hint).?.asInt());
+    try testing.expectEqual(slot, hint);
+    try testing.expect(m.setExistingHinted(Value.heap(&a_other), Value.int(2), slot));
+    try testing.expectEqual(@as(i64, 2), m.get(Value.heap(&a)).?.asInt());
+    try testing.expectEqual(@as(u32, 1), m.count());
 }

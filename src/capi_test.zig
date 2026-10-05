@@ -435,6 +435,31 @@ test "host fn: failure surfaces as a catchable located guest error" {
     try testing.expect(std.mem.indexOf(u8, lastError(box), "host says no") != null);
 }
 
+fn hostWideTrue(vm: ?*capi.VmBox, userdata: ?*anyopaque, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: *usize) callconv(.c) capi.mh_status {
+    _ = vm;
+    _ = userdata;
+    _ = args;
+    _ = nargs;
+    if (max_results < 1) return .err_api;
+    results.?[0] = .{ .tag = 1, .payload = 11 }; // a boolean that isn't 0 or 1
+    nresults.* = 1;
+    return .ok;
+}
+
+test "host fn: returning a boolean that isn't 0 or 1 is a catchable error, and the VM stays usable" {
+    // Doc 62 §3.5: host results pass `fromC`, so a hand-filled boolean never
+    // becomes guest state (table keys hash and match by raw bits).
+    const box = try newVm();
+    defer freeVm(box);
+    try testing.expectEqual(capi.mh_status.ok, capi.mh_register_fn(box, s("wide"), &hostWideTrue, null, null));
+    var results: [1]mh_value = undefined;
+    var n: usize = 0;
+    try testing.expectEqual(capi.mh_status.ok, capi.mh_eval(box, s("return (pcall(wide))"), s("p"), &results, 1, &n));
+    try testing.expectEqual(@as(c_int, 0), capi.mh_value_truthy(results[0]));
+    try testing.expect(capi.mh_eval(box, s("return wide()"), s("p2"), &results, 1, &n) != .ok);
+    try expectInt(try evalOne(box, "local t = {[true] = 5} return t[true]"), 5);
+}
+
 const ReentryCtx = struct {
     vm_free_status: capi.mh_status = .ok,
 };
@@ -475,6 +500,14 @@ test "bad values from C are rejected, not trusted" {
     // heap_ref with a null pointer.
     const nullref: mh_value = .{ .tag = 4, .payload = 0 };
     try testing.expectEqual(capi.mh_status.err_api, capi.mh_global_set(box, s("g"), nullref));
+    // A boolean whose payload isn't 0 or 1: the VM hashes table keys by raw
+    // bits, so it would be a different key from `mh_bool(1)` (doc 62 §3.3).
+    const wide_true: mh_value = .{ .tag = 1, .payload = 11 };
+    try testing.expectEqual(capi.mh_status.err_api, capi.mh_global_set(box, s("g"), wide_true));
+    try testing.expectEqual(capi.mh_status.ok, capi.mh_global_set(box, s("g"), capi.mh_bool(7)));
+    var b: c_int = 0;
+    try testing.expectEqual(capi.mh_status.ok, capi.mh_value_bool(try evalOne(box, "return g"), &b));
+    try testing.expectEqual(@as(c_int, 1), b);
     // Wrong-type accessors.
     var i: i64 = 0;
     try testing.expectEqual(capi.mh_status.err_api, capi.mh_value_int(capi.mh_float(1.5), &i));
