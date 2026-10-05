@@ -1,6 +1,6 @@
 # mahina — GC liveness masking — Design
 
-Status: draft rev 5, not yet implemented (awaiting codex + antigravity review)
+Status: draft rev 6, not yet implemented (awaiting codex + antigravity review)
 Owner: Bart + agents (amber-badger)
 Last updated: 2026-10-05
 
@@ -19,10 +19,12 @@ as they land; move bullets to Done once everything inside them is checked.
       blocker is folded into rev 4.
 - [x] **Rev 4 review** (codex REVISE, antigravity APPROVE, 2026-10-05).
       Codex's blockers and both reviewers' should-fixes are folded into rev 5.
+- [x] **Rev 5 review** (codex REVISE, antigravity APPROVE, 2026-10-05).
+      Folded into rev 6.
 
 ### Outstanding
 
-- [ ] **Review rev 5.** codex + antigravity; fold findings, re-review until
+- [ ] **Review rev 6.** codex + antigravity; fold findings, re-review until
       both approve.
 - [ ] **Q1 — trace-constant roots (§7).** Bart picks (a) or (b) before
       Phase 1.
@@ -52,8 +54,8 @@ as they land; move bullets to Done once everything inside them is checked.
 - [ ] **Phase 1 — the masked `.gc` root walk + scrub (§6).**
   - [ ] Masking driven by the shared `maskable` predicate, with an alias
         bitset and dead slots set to nil before sweep.
-  - [ ] Exit-snapshot sparsity and the watermark both gated on `maskable`
-        (watermark: also not captured) (§5).
+  - [ ] Exit-snapshot sparsity, composite-bridge admission and the watermark
+        all gated on `maskable` (watermark: also not captured) (§5).
   - [ ] Gates, hashgate (§9 regeneration procedure), the §8 tests and
         mutations, the boundary benchmark, and a pt-default board.
 - [ ] **Phase 2 — land the dead-φ writeback filter on top.**
@@ -167,7 +169,8 @@ Verified against the tree at `b4abe70` (rev 3 reviews).
 A register slot can differ between tiers only if the JIT elided a store to it.
 The lemma's premise is that **every** elided store to slot `s` in proto `F`'s
 window is to a slot dead at every pc `R` where tier-0 or a linked trace
-resumes. There are three elision sites (codex rev 4 blocker 2 found the third):
+resumes. There are four elision sites. Codex found the third in its rev 4
+review (blocker 2) and the fourth in its rev 5 review:
 
 1. **Loop-close φ writeback, numeric-for watermark** (today; retired in
    Phase 2, see below).
@@ -179,22 +182,32 @@ resumes. There are three elision sites (codex rev 4 blocker 2 found the third):
    (`irinterp.zig:214`, and the native exit path). A dead definition is left
    holding an earlier value, while tier-0 holds the newer one. `R` is the
    exit's resume pc.
+4. **Composite bridge exits** (doc 17). `bridgeMatchesExitSnapshot`
+   (`trace_code.zig:781-805`) admits a bridge only if its φ emission set
+   agrees with the exit snapshot **on slots live at the landing pc**.
+   `emitCompositeBridgeSnapshot` (`nativegen_emit.zig:2519-2531`) then writes
+   only that emission set. A slot dead at the landing pc can be left
+   unwritten, or written with a different terminal φ value than tier-0's.
+   `R` is the landing pc.
 
-Snapshot materialisation applies only to attachable exits: an exit handed
-straight to a side trace or sibling. An ordinary failing guard takes the
-coarse deopt, where tier-0 re-runs the iteration and writes the slot itself.
-So today's all-live root walk is **potentially** tier-dependent after an
-attached exit that leaves a heap value in a dead slot. That would be a
+Site 3 materialises for every **wanted or attached** exit, the resume-coherent
+`exit_side` contract (`trace_exec.zig:69-76`, `irinterp.zig:1419-1428`). That
+includes an exit that resumes into tier-0 at `P` with no child trace. An
+exit that is neither wanted nor attached takes the coarse deopt, where tier-0
+re-runs the iteration and writes the slot itself.
+
+So today's all-live root walk is **potentially** tier-dependent after a
+site-3 or site-4 exit that leaves a heap value in a dead slot. That would be a
 pre-existing hole that masking closes, not one Phase 2 creates. It is
 unconfirmed: a first attempt through an ordinary guard
 (`/tmp/exitsnap_gc.lua`) agreed in all three modes, as the coarse deopt
-predicts. The §8 test builds the attached-exit case.
+predicts. The §8 tests build the wanted, attached and bridge cases.
 
-Phase 0 audits every native and IR exit/close writer, and lists every other
-store the JIT omits relative to tier-0, against this premise. A site that
-cannot state its `R` keeps every slot. Sites 2 and 3 satisfy the premise by
-construction: they filter on `live_in[R]`. Both are gated on `maskable(F)`
-(§5).
+Phase 0 audits every native and IR exit/close/bridge writer, and lists every
+other store the JIT omits relative to tier-0, against this premise. A site that
+cannot state its `R` keeps every slot. Sites 2–4 satisfy the premise by
+construction, because each filters on `live_in[R]`. All three are gated on
+`maskable(F)` (§5).
 
 The watermark (site 1) does not satisfy the premise. It drops every defined slot `>= base+4` of the anchoring numeric `for`,
 by lexical position and not by liveness. That includes a register a later
@@ -221,7 +234,7 @@ subset) roots no stale slot. Goal 1 needs two things:
   (§4);
 - every case where the collector must root more (an unknown shape, or a proto
   without usable liveness) is a case where the JIT elided no store at any of
-  the three sites, via the shared predicate of §5.
+  the four sites, via the shared predicate of §5.
 
 **Captured registers** are live at every pc. The φ filter and exit snapshots
 read the same `live_in`, so they keep these slots. They are never stale. This covers
@@ -375,8 +388,17 @@ retained frames. Every catcher (`protectedCall`'s three discard sites
 `stdlib/errors.zig:103/113/124`, and capi `guestFault` `capi.zig:393`, which
 every capi entry funnels into: `runProtected`, H1, the `.S` fault return and
 index get/set at `:438`, `:807-808`, `:851`, `:1262`, `:1280`) already saves
-`entry_depth` and `entry_top`. It also saves `frames[entry_depth − 1].in_flight` when
-`entry_depth > 0`, and restores that flag when it resets `depth`/`stack_top`.
+`entry_depth` and `entry_top`. It also saves `frames[entry_depth − 1].in_flight`
+when `entry_depth > 0`, and restores that flag when it resets
+`depth`/`stack_top`.
+
+**Where the flag is captured** (codex and antigravity, rev 5). It is read at
+the same point as `entry_depth`/`entry_top`, **before** any marking or
+re-entry. It is never read inside `guestFault`, which runs after the failure,
+when the flag has already been changed. capi carries it as a third entry value
+into `guestFault`, whose signature grows by one parameter. That applies to
+every caller, including the `.S` fault return (`capi.zig:851`), which gets the
+value from its own entry capture.
 The frames above `entry_depth` are discarded, and their next push
 re-initialises them. The top-level `exec` failure path keeps everything for
 the CLI reporter; that VM is not resumed.
@@ -471,8 +493,12 @@ the outer catcher) non-catchable fault.
     before `pushFrameVararg` (`interp.zig:6410`). The native inline push is
     not affected: it checks its walls before freezing the caller's pc
     (`nativegen_emit.zig` step 3 before step 4), and declines to tier-0, which
-    re-runs the call. Phase 0 makes the opcode path's rejection re-store the
-    call pc before raising. That also fixes `describeFault`/backtraces for a stack
+    re-runs the call. The opcode path's early depth/capacity checks
+    (`interp.zig:6383-6384`) already raise with `frame.pc` unchanged. Only a
+    `pushFrameVararg` failure after the freeze is affected. Phase 0 either
+    re-stores the call pc on that failure, or freezes `pc + 1` only once the
+    push has succeeded (antigravity rev 5 SF2). Which of the two is an
+    implementation choice. That also fixes `describeFault`/backtraces for a stack
     overflow.
 
   Without this, the mark would give the frame `live_in[call pc + 1]`, which
@@ -501,7 +527,7 @@ An all-live mask would be safe, but it would root stale slots and break Goal 1
 ### 4.5 Unknown shape
 
 Mask: all live. Goal 1 still holds only if the JIT elided no store that could
-leave a stale value in such a frame (§2, all three sites). Unknown shapes arise from protos without
+leave a stale value in such a frame (§2, all four sites). Unknown shapes arise from protos without
 liveness or protos failing the layout check, and both are covered by §5.
 Phase 0's audit must leave no other source: every frame lands in 4.1–4.4. A
 debug assert fires on any unknown classification of a `maskable` proto.
@@ -539,7 +565,15 @@ Captured slots need no closure proof here:
   slot. Today `available()` already gates snapshot creation
   (`trace_recorder.zig:1371`). The only new case is a liveness-carrying proto
   that fails the layout check. The compiler is not expected to emit one, so
-  the cost is nil on real code, and a test pins the fallback.
+  the cost is nil on real code, and a test pins the fallback. Every consumer
+  reads the committed snapshot, the native exit adapter included
+  (`nativegen_adapter.zig:280`), so gating at commit covers them all.
+- **Composite bridges (Phase 1).** `bridgeMatchesExitSnapshot` takes its
+  `live_row` from `row(landing)` only when `maskable(F)`. Otherwise it uses
+  the empty row, its existing "no liveness" path, where every slot counts as
+  observable. So the emission set must agree with the snapshot on every slot.
+  Since the snapshot of a non-`maskable` proto is full (above), the bridge
+  then writes the tier-0 state exactly, or is not admitted.
 - **Watermark (Phase 1 → Phase 2).** Until Phase 2 removes it, it drops a slot
   only if `maskable(F)` ∧ the slot is not captured in `F` (§2). Gating on
   `maskable` alone is not enough: it would still drop a captured slot that a
@@ -740,13 +774,19 @@ sound under the conditions stated. Bart decides.
   - a `while` temporary;
   - a generic-for body;
   - a slot holding a table before the loop and a number inside it;
-  - **attached exit with a dead heap definition**: a loop body defines a
-    fresh heap value in a temporary, then exits at an **attached** guard
-    (side trace or sibling, so the snapshot is materialised) where the
-    temporary is dead, then collects and re-interns that value. This is the
-    site-3 hole (§2). Run it on HEAD first, and record whether it diverges. It
-    must agree after Phase 1. Also run it against a non-`maskable` proto
-    (test-constructed), where the snapshot keeps the slot;
+  - **materialised exit with a dead heap definition**: a loop body defines a
+    fresh heap value in a temporary, then exits at a guard where the
+    temporary is dead, then collects and re-interns that value. Run three
+    variants:
+    - a **wanted** exit resuming into tier-0 without a child;
+    - an **attached** exit (side trace or sibling);
+    - a **composite bridge** whose emission set differs from the snapshot on
+      the dead slot (the shapes of `trace_fingerprint_test.zig:493-513`).
+
+    These are the site-3/site-4 holes (§2). Run each on HEAD first and record
+    whether it diverges; each must agree after Phase 1. Also run each against
+    a non-`maskable` proto (test-constructed): there the snapshot keeps the
+    slot, and the mismatching bridge is not admitted;
   - collections from a metamethod and from `mh_collect`;
   - collect → snapshot → restore → linked execution.
   coral-marten's hostcall differential tests (every register dumped, under GC
@@ -773,8 +813,11 @@ sound under the conditions stated. Bart decides.
   - `protectedCall` marking without the `depth > entry_depth` check (nothing
     to mark test);
   - rejected push without the pc re-store (rejected push test);
-  - exit-snapshot sparsity not gated on `maskable` (side-exit test, non-maskable
-    variant);
+  - exit-snapshot sparsity not gated on `maskable` (materialised-exit test,
+    non-maskable variant);
+  - bridge admission not gated on `maskable` (bridge variant, non-maskable);
+  - the capi entry flag captured inside `guestFault` instead of at entry
+    (catcher restore test, via `mh_call`);
   - `pushHostCall` marking the callee in flight;
   - `maskable` ignored by the φ filter;
   - watermark ignoring captured slots (Phase 1);
@@ -853,7 +896,21 @@ sound under the conditions stated. Bart decides.
   - **Call-like set** reduced to `.call`; `pushHostCall`'s callee starts not
     in flight.
   - **Tests and mutations** added for each of the above.
-- **Rev 5** (this). Folds the rev 4 reviews (codex REVISE, antigravity
+- **Rev 6** (this). Folds the rev 5 reviews (codex REVISE, antigravity
+  APPROVE):
+  - **Composite bridges are the fourth elision site** (§2). Admission is
+    gated on `maskable`; the "no liveness" all-slots path is used otherwise
+    (§5).
+  - **Materialisation corrected:** snapshots are materialised for wanted
+    exits as well as attached ones (§2).
+  - **Catchers capture the `in_flight` flag at entry**, and capi passes it
+    into `guestFault` (§4.2).
+  - **Fault-pc fix options named;** the early depth/capacity checks are
+    already correct (§4.4).
+  - **The native adapter's snapshot consumer** is covered by gating at commit
+    (§5).
+  - **Tests and mutations** added for each of the above.
+- **Rev 5** (`3181db2`). Folds the rev 4 reviews (codex REVISE, antigravity
   APPROVE):
   - **`in_flight` is left set on error**, not restored by `defer`, because
     retained frames are frozen mid-instruction. The catcher restores the one
@@ -883,6 +940,8 @@ sound under the conditions stated. Bart decides.
 - Antigravity: rev 3 review (REVISE), 2026-10-05.
 - Codex: rev 4 review, 01a10978-f8f4-7670-8baf-b5a666842ac2.
 - Antigravity: rev 4 review (APPROVE), 2026-10-05.
+- Codex: rev 5 review, 01a10986-6a30-78a0-89ac-947d9635c5c3.
+- Antigravity: rev 5 review (APPROVE), 2026-10-05.
 - Review receipts: `docs/reviews/doc61/`.
 - Doc 21 (canonical snapshot liveness; Phase B deferred).
 - Doc 24 D3/D8 (full-write-set flush).
