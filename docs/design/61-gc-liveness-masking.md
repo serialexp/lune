@@ -1,6 +1,6 @@
 # mahina — GC liveness masking — Design
 
-Status: draft rev 3, not yet implemented (awaiting codex + antigravity review)
+Status: draft rev 4, not yet implemented (awaiting codex + antigravity review)
 Owner: Bart + agents (amber-badger)
 Last updated: 2026-10-05
 
@@ -15,10 +15,12 @@ as they land; move bullets to Done once everything inside them is checked.
       with an alternative draft; rev 2 is the merge it recommended.
 - [x] **Rev 2 review** (codex REVISE, antigravity REVISE, 2026-10-05). Every
       blocker is folded into rev 3; see "Revision history".
+- [x] **Rev 3 review** (codex REVISE, antigravity REVISE, 2026-10-05). Every
+      blocker is folded into rev 4.
 
 ### Outstanding
 
-- [ ] **Review rev 3.** codex + antigravity; fold findings, re-review until
+- [ ] **Review rev 4.** codex + antigravity; fold findings, re-review until
       both approve.
 - [ ] **Q1 — trace-constant roots (§7).** Bart picks (a) or (b) before
       Phase 1.
@@ -28,13 +30,15 @@ as they land; move bullets to Done once everything inside them is checked.
   - [ ] **P1:** surplus varargs past the caller window are clobbered by the
         callee window (confirmed in every tier).
   - [ ] **P2:** dynamic argument spans above `stack_top` during re-entry.
-  - [ ] **P3:** native-held transient values across `callValue`.
+  - [ ] **P3:** native-held transient values across every re-entry boundary.
+  - [ ] **P4:** keyframe capture rejected, in release builds too, while any
+        frame is in flight (§6.4).
 - [ ] **Phase 0 — frame state made exact.** Behaviour-neutral on its own;
       pinned by the frame-shape tests (§8).
   - [ ] `gcTrampoline` publishes the innermost pc before `collect()`.
   - [ ] `CallFrame.in_flight` follows the save/restore discipline (§4.2).
-  - [ ] The Vm records the faulting-frame range while an `xpcall` handler runs
-        (§4.4).
+  - [ ] `protectedCall` marks the topmost faulting frame in flight while an
+        `xpcall` handler runs (§4.4).
   - [ ] `Proto.maskable` is computed at compile time (§5).
 - [ ] **Phase 1 — the masked `.gc` root walk + scrub (§6).**
   - [ ] Masking driven by the shared `maskable` predicate, with an alias
@@ -43,6 +47,8 @@ as they land; move bullets to Done once everything inside them is checked.
         mutations, the boundary benchmark, and a pt-default board.
 - [ ] **Phase 2 — land the dead-φ writeback filter on top.**
   - [ ] Re-base `phiLiveRow`/`phiWritebackKept` on `Proto.maskable` (§5).
+  - [ ] Retire the numeric-for `locals_watermark` drop rule. Liveness
+        subsumes it, and it can drop a captured slot (§5).
   - [ ] `/tmp/gcphi_new.lua` as a doc test, printing the same id in every
         mode.
 - [ ] **Phase 3 — relax doc 24 D3's full-write-set flush.** Today
@@ -101,7 +107,7 @@ sooner.
 
 ## 1. Facts the design rests on
 
-Verified against the tree at `2235f3d` (rev 2 reviews).
+Verified against the tree at `b4abe70` (rev 3 reviews).
 
 - **Where collections happen.** Only at the tier-0 dispatch prologue
   (`interp.zig:2852 → gcTrampoline`) and via `mh_collect` (`capi.zig:584`),
@@ -150,9 +156,22 @@ Verified against the tree at `2235f3d` (rev 2 reviews).
 ## 2. Where stale values come from, and the theorem
 
 A register slot can differ between tiers only if the JIT elided a store to it.
-Today that is the numeric-for watermark; after Phase 2 it is the dead-φ
-filter. Both drop the φ of slot `s` in a trace anchored in proto `F` only when
-`s` is dead at every pc `R` where tier-0 or a linked trace consumes the φ set.
+Today that is the numeric-for watermark; after Phase 2 it is the dead-φ filter
+**alone**. The lemma's premise is that a φ of slot `s`, in a trace anchored in
+proto `F`, is dropped only when `s` is dead at every pc `R` where tier-0 or a
+linked trace consumes the φ set.
+
+The dead-φ filter satisfies that premise by construction. The watermark does
+not. It drops every defined slot `>= base+4` of the anchoring numeric `for`,
+by lexical position and not by liveness. That includes a register a later
+captured local reuses: captured bits are permanent across the proto
+(`bc_liveness.zig:254`), so such a register is live everywhere. Rev 4
+therefore **retires the watermark** in Phase 2 (codex rev 3 blocker 1). Over a
+`maskable` proto, liveness subsumes it. Masking itself (Phase 1) lands before
+that, so in between the watermark still exists. Phase 1 therefore gates it:
+the watermark drops a slot only if `s ∉ captured(F)` and `maskable(F)`. That
+makes it satisfy the premise, because a non-captured slot `>= base+4` is dead
+at the body start and after the loop (`compiler.zig` `freeTo(base)`).
 
 **Lemma (path).** Take a stale slot `s` and a later collection where `F`'s
 frame sits at pc `Y`, with `Y` reached from such an `R` in tier-0 execution.
@@ -203,21 +222,42 @@ Fix, LuaJIT's layout (`lj_func.c`/`BC_IFUNCV` vararg frames sit above their
 arguments): when the argument span ends past the caller window, lay the callee
 at `max(base + nreg, base + a + 1 + nargs)`. The fixed parameters are still
 copied up, the surplus varargs stay where they are, and `stack_top` covers the
-arguments for the callee's lifetime. The same rule applies to the native
-inline push, `callValue`, and the `.S` entry. Windows are then no longer
-always contiguous, so keyframe restore (`keyframeser.zig:811`, "frame windows
-stack contiguously") must accept a recorded gap.
+arguments for the callee's lifetime.
+
+**Scope** (codex rev 3 should-fix): the `.call` opcode path and the native
+inline push. `callValue` (`interp.zig:2105`) and the `.S` entry
+(`hostcall_x64.S:300`) already place surplus arguments below the callee window
+and are unaffected.
+
+**Keyframe restore** already records each frame's `base`. Its contiguity check
+(`keyframeser.zig:811`) becomes "windows ordered, non-overlapping and in
+bounds". No new gap field is needed.
 
 ### P2 — dynamic argument spans above `stack_top`
 
 A native callee consuming `all_results` arguments past the window has them
 above `stack_top`. A re-entry lays its window at `stack_top` over them, and an
-`mh_collect` does not scan them. Fix: a call consuming `all_results` raises
-`stack_top` to cover its argument span for the call's duration, restored on
-return and unwind. The span then sits in a gap (§6.1) and is rooted. Rev 2's
+`mh_collect` does not scan them.
+
+**Fix:** a call consuming `all_results` raises `stack_top` to cover its
+argument span. The span then sits in a gap (§6.1) and is rooted. Rev 2's
 `dyn_hi` alias is withdrawn: it covered only slots below `stack_top`.
 
-### P3 — native-held transient values across `callValue`
+**Who restores `stack_top`** (codex rev 3 blocker 4). This is deliberately not
+a Zig `defer`:
+- **On success,** the call restores it after copying the results, exactly
+  where today's code re-lowers `stack_top` after a call.
+- **On failure,** it is left raised. A failed call deliberately leaves the
+  faulting frames and `stack_top` in place for diagnosis
+  (`interp.zig:2187`), and the raised span is part of that state. The catcher
+  restores `stack_top` when it discards the frames: `protectedCall` already
+  resets `stack_top = entry_top` after diagnostics and upvalue closing
+  (`stdlib/errors.zig:110-114`), and so do capi `runProtected` and the
+  top-level `exec` unwind.
+- **Rejected pushes and non-catchable errors** propagate the same way: the
+  state stays raised until the outermost catcher or the VM reset discards it.
+
+### P3 — Zig-held transient values across re-entry
 
 Two cases:
 - `gsub` builds capture strings in a Zig array and passes them to a native
@@ -230,10 +270,26 @@ Two cases:
 
 Fix: a Vm transient-root stack (`transient_roots`, a `.gc` root, bounded,
 allocated at init). `callValue` pushes a native callee's argument slice for the
-call's duration. A native that holds a heap `Value` in a Zig local across
-`callValue` pushes it too. Phase P3 audits every `callValue` caller in
-`src/stdlib/` and `src/capi.zig`. Release builds overflow to an error, never to
-an unrooted value.
+call's duration. Any Zig code that holds a heap `Value` across arbitrary code
+pushes it too. Every push is paired with a pop on every exit
+(`defer vm.popTransient(mark)` to a saved mark), so the stack stays balanced
+across errors. Release builds overflow to an error, never to an unrooted
+value.
+
+**Audit scope** (codex rev 3 blocker 5): every boundary where Zig code can run
+arbitrary guest or host code, or reach `mh_collect`. That is every
+`callValue`/`callMeta`/host-call caller, including the interpreter's own
+metamethod paths (`callMeta` `interp.zig:7104` and its callers, the
+`__index`/`__newindex` chains `:7436`, `:7504`, `:7515`, the `__call` path
+`:6548`, `:6555`), `src/stdlib/`
+and `src/capi.zig`. For each, list what it holds across the boundary:
+- saved callees;
+- argument slices;
+- heap-backed pointers or slices into tables or strings;
+- partially filled result buffers.
+
+Then root each one, or show it is already reachable from a rooted register. The
+audit's table goes in the P3 change.
 
 ## 4. Frame shapes and their masks
 
@@ -262,10 +318,17 @@ frame.in_flight = true;
 defer frame.in_flight = prev;
 ```
 
-- **Sites.** The `call` opcode's native/host-function path, for the native's
-  whole duration (not per `callValue`). `callValue` on the current frame (for
-  metamethods, and natives that re-enter). `pushHostCall`/`runPushedFrame`.
-  The `.S` entry wherever it suspends a Lua frame.
+- **Sites.**
+  - The `call` opcode's native/host-function path, for the native's whole
+    duration (not per `callValue`).
+  - `callValue` on the current frame (for metamethods, and natives that
+    re-enter).
+  - `pushHostCall`/`runPushedFrame`. Only the **caller** is marked. The callee
+    frame it pushes starts `in_flight = false` like every push (antigravity
+    rev 3 SF1).
+  - The `.S` entry wherever it suspends a Lua frame.
+  - `protectedCall`, around an `xpcall` handler: the topmost faulting frame
+    (§4.4).
 - **Nesting.** The `defer` restores the outer state, so an inner return never
   clears an outer native's protection. This was the shared rev 2 blocker.
 - **Unwinds.** Zig error propagation runs the `defer`s, so `pcall`, `xpcall`,
@@ -290,21 +353,51 @@ yet the caller's values. Those are stale results that tier-0 itself would not
 read, and that can differ between tiers.
 
 If `p == 0`, or `code[p − 1]` is not call-like, the shape is unknown (§4.5).
-The call-like set is enumerated in Phase 0 from the push sites: `call`, the
-self/method call forms, the `tfor_loop` call, and the native inline push. This
-fixes antigravity's blocker 1: no `p − 1` read happens for a frame classified
-by another shape, and `p == 0` cannot underflow.
+The call-like set is the `.call` opcode and the native inline push of a
+`.call`. Method calls and the generic-for iterator call both compile to
+`.call` (antigravity rev 3 SF2, confirmed against `compiler.zig`). Phase 0
+asserts at every frame push that the suspended pc's predecessor is a `.call`.
+This fixes antigravity's rev 2 blocker 1: no `p − 1` read happens for a frame
+classified by another shape, and `p == 0` cannot underflow.
 
 ### 4.4 Faulting frames under an `xpcall` handler
 
-While a handler runs, `protectedCall` records the faulting frame range
-`[entry_depth, faulting_depth)` on the Vm (`fault_lo`, `fault_hi`; empty
-otherwise; restored on handler return and on every unwind).
+While a handler runs, the frames `frames[entry_depth .. faulting_depth)` stay
+live underneath it. They never resume, but they are **read**:
+`describeFault` reads the top faulting frame's instruction operands
+(`interp.zig:1905-1930`, e.g. `regs.get(instr.b)` for an arithmetic fault).
+A non-catchable fault raised inside the handler propagates with these frames
+still live, to capi `guestFault → renderFault` (`capi.zig:384`, `:405`) or to
+the CLI reporter. That makes rev 3's ∅ mask unsafe (codex rev 3 blocker 3): a
+collection in the handler would sweep an operand the reporter then reads.
 
-Those frames never resume: after the handler returns they are discarded. The
-handler can see them only through `debug.traceback`-style walks, which read
-pcs and closures. Closures are rooted per frame. Mask: **∅**. All their window
-slots are dead to the program, and alias spans (§6.1) still apply.
+**Rev 4.** No Vm range, no ∅ mask. While the handler runs, `protectedCall`
+marks the **topmost faulting frame** `frames[faulting_depth − 1]` in flight,
+with the §4.2 save/restore:
+
+```zig
+const top = &vm.frames[vm.depth - 1];
+const prev = top.in_flight;
+top.in_flight = true;
+defer top.in_flight = prev;
+const hn = vm.callValue(h, &.{errval}, results) catch |herr| { ... };
+```
+
+- **Top faulting frame.** It is innermost at the fault, and its `frame.pc` is
+  the faulting instruction: `describeFault` already relies on that. As an
+  in-flight frame its mask is `live_in[fault pc]`. That contains every operand
+  `describeFault` reads, and by the lemma it is stale-free. Its pc is reached
+  in tier-0, so the lemma needs no resumption.
+- **Faulting frames below it** are each in an ordinary shape already:
+  suspended at a `.call` (§4.3), or in flight because a native they called is
+  the thing that faulted (§4.2).
+- **Nesting.** A handler that itself runs a protected call whose handler runs
+  (nested `xpcall`) marks its own topmost faulting frame. The save/restore
+  restores each level on return and on unwind, so no single Vm range has to
+  describe several fault regions (codex rev 3 blocker 2, antigravity rev 3
+  blocker).
+- **Faulting at `pc == 0`** needs no special case: the frame is in flight, so
+  no `code[p − 1]` read happens.
 
 An all-live mask would be safe, but it would root stale slots and break Goal 1
 (rev 2 review: codex 5, antigravity 1).
@@ -339,8 +432,14 @@ Captured slots need no closure proof here:
 **Uses.**
 - **Collector.** A frame of a non-`maskable` proto is all live.
 - **φ filter (Phase 2).** A trace anchored in a non-`maskable` proto keeps
-  every φ (today's behaviour). The numeric-for watermark rule is also gated on
-  `maskable`, which closes the latent version of the same hazard in HEAD.
+  every φ (today's behaviour). Over a `maskable` proto the filter is
+  **liveness only**: `phiWritebackKept` loses its `locals_watermark` clause,
+  and the recorder stops dropping temporaries by watermark (§2). The
+  `readSlot` and resume-pc/`loop_done` rows of `phiLiveRow` stay as they are.
+- **Watermark (Phase 1 → Phase 2).** Until Phase 2 removes it, it drops a slot
+  only if `maskable(F)` ∧ the slot is not captured in `F` (§2). Gating on
+  `maskable` alone is not enough: it would still drop a captured slot that a
+  later local reuses (codex rev 3 blocker 1).
 
 So every all-live frame belongs to a proto whose traces leave no stale slots.
 That is Goal 1 for §4.5.
@@ -418,10 +517,16 @@ A dead window slot is set to nil before the sweep.
 - The visualiser shows registers (`viz/src/snapshot.ts:130`), so a dead local
   reads nil after a collection (Q2).
 
-**Keyframes.** Capture never happens with an in-flight frame. Capture points
-are suspend boundaries, not re-entries; Phase 0 asserts this. So the new
-frame fields are not serialized, and restore initialises them to
-false/empty. P1 adds the window gap to the frame record.
+**Keyframes (P4).** Capture never happens with an in-flight frame or a live
+native activation. Capture points are suspend boundaries, not re-entries.
+This is **enforced, not just asserted** (codex rev 3 blocker 6):
+`encodeSnapshot` (`keyframeser.zig:279`) returns an error, in every build
+mode, if any frame in `frames[0..depth]` has `in_flight` set, or if
+`native_reentry_depth != 0`. A host that calls the capture API from inside a
+callback gets that error instead of a keyframe whose frames cannot be resumed.
+So `in_flight` is not serialized, and restore initialises it to false. P1 adds
+no field: restore validates ordered, non-overlapping, in-bounds windows from
+the recorded bases (§3).
 
 ## 7. Q1 — trace constants (pre-existing hazard, decide before Phase 1)
 
@@ -460,8 +565,8 @@ retained chunk (`interp.zig:2423`). What counts is an actual pin.
   - Simple and sound. Loses folding for unpinned values. The runtime-path cost
     is measured on `str_*` rows.
 
-Reviewers split on this: antigravity recommends (b), and codex judged both
-sound with the conditions stated. Bart decides.
+Antigravity recommends (b) in both rev 2 and rev 3 reviews. Codex judged both
+sound under the conditions stated. Bart decides.
 
 ## 8. Tests (pinned before the code they cover lands)
 
@@ -471,8 +576,16 @@ sound with the conditions stated. Bart decides.
   - Keyframe capture/restore across a P1 gap.
   - P2: a native consuming an `all_results` span past the window calls
     `mh_collect`, then re-enters.
+  - P2 failure path: the same native raises after its re-entry; `pcall`
+    catches; `stack_top` is back at the boundary and the span is not rooted
+    afterwards.
   - P3: a native `gsub` replacement calls `mh_collect`; a callback rewrites an
-    operand register through an upvalue while a native holds the old value.
+    operand register through an upvalue while a native holds the old value;
+    a `__index`/`__newindex`/`__eq` metamethod collects while the interpreter
+    holds its key and receiver; `transient_roots` is balanced after an error
+    unwinds through each audited site.
+  - P4: `encodeSnapshot` from inside a host callback (frame in flight) returns
+    the error in a **ReleaseFast** test build too.
 - **Frame shapes** (constructed VMs):
   - innermost at a prologue GC;
   - caller at a fixed-result call, and at a multret call (stale result tail
@@ -483,12 +596,23 @@ sound with the conditions stated. Bart decides.
   - an erroring re-entry unwound by `pcall` (flag restored);
   - an `xpcall` handler collecting over faulting frames, with the fault at
     `pc == 0` and at `pc > 0` where `code[pc − 1]` is a call;
+  - **nested `xpcall`**: a handler runs its own `xpcall` whose handler
+    collects; both levels' faulting operands survive, and both flags are
+    restored afterwards;
+  - **handler-side reporting**: an arithmetic fault whose operand is a fresh
+    heap object only referenced by that register; the handler collects and
+    then raises non-catchably; capi `renderFault` reports the operand's type
+    correctly (and, in debug, the use-after-free net stays quiet);
+  - `pushHostCall`: the caller is in flight and the pushed callee is not;
   - `.S` and native frame reuse (fields initialised);
   - `mh_collect` from a host callback (`callHostNative`, `interp.zig:2208`);
   - a host-entered callee with an argument region;
   - the parked `__call` region;
   - the depth-0 result span;
-  - a non-`maskable` proto (all live, and its traces keep every φ).
+  - a non-`maskable` proto (all live, and its traces keep every φ);
+  - **captured slot above the watermark**: a numeric-for body whose register
+    `>= base+4` is reused by a captured local; the trace keeps its φ, and a
+    collection in every mode roots the same value.
 - **Alias spans.** Surplus varargs survive a collection while the callee runs;
   an open upvalue's slot survives.
 - **Behaviour.**
@@ -520,9 +644,17 @@ sound with the conditions stated. Bart decides.
   - not initialised by the `.S`;
   - faulting frames all-live (the determinism test must catch it);
   - faulting frames classified as call-suspended;
+  - top faulting frame not marked in flight (handler-side reporting test);
+  - `protectedCall`'s flag cleared instead of restored (nested `xpcall` test);
+  - `pushHostCall` marking the callee in flight;
   - `maskable` ignored by the φ filter;
+  - watermark ignoring captured slots (Phase 1);
   - P2's `stack_top` raise dropped;
-  - P3's transient push dropped.
+  - P2's raise restored by `defer` (the failure-path test sees the span
+    unrooted while frames are still live);
+  - P3's transient push dropped;
+  - P3's pop skipped on the error path;
+  - P4's check compiled only in debug.
 
 ## 9. Observable changes
 
@@ -553,7 +685,8 @@ sound with the conditions stated. Bart decides.
 - **Rev 2** (`2235f3d`). Disjoint windows, alias spans (varargs, open
   upvalues, `dyn_hi`), a set/clear `in_flight` flag, a static layout check,
   and the trace-const hazard raised.
-- **Rev 3** (this). Folds the rev 2 reviews (codex REVISE, antigravity REVISE):
+- **Rev 3** (`b4abe70`). Folds the rev 2 reviews (codex REVISE, antigravity
+  REVISE):
   - **Stale-value theorem** (§2, path lemma). Rooting must be tier-identical,
     not just conservative.
   - **`Proto.maskable` shared by collector and φ filter**, so every all-live
@@ -572,6 +705,25 @@ sound with the conditions stated. Bart decides.
   - **Q1 options specified** with their full lifetime/cost conditions.
   - **Keyframe interaction stated.**
   - **Tests and mutations broadened** per both reviews.
+- **Rev 4** (this). Folds the rev 3 reviews (codex REVISE, antigravity
+  REVISE):
+  - **Watermark retired** in Phase 2. In the meantime it is gated on
+    `maskable` ∧ not captured. Gating on `maskable` alone still dropped a
+    captured slot (§2, §5).
+  - **Faulting frames:** the ∅ mask and the Vm fault range are withdrawn.
+    `protectedCall` marks the topmost faulting frame in flight with
+    save/restore. That keeps `describeFault`'s operands and nests across
+    `xpcall` levels (§4.4).
+  - **P2:** who restores `stack_top` on success, failure, rejected push and
+    non-catchable propagation is now spelled out.
+  - **P3:** the audit covers every re-entry boundary, the interpreter's
+    metamethod paths included, with a balanced pop on every exit.
+  - **P4 added:** keyframe capture is rejected in release builds too.
+  - **P1 scoped** to the `.call` path and the native push. Restore validates
+    windows from the recorded bases.
+  - **Call-like set** reduced to `.call`; `pushHostCall`'s callee starts not
+    in flight.
+  - **Tests and mutations** added for each of the above.
 
 ## References
 
@@ -580,6 +732,9 @@ sound with the conditions stated. Bart decides.
 - Codex: rev 1 tradeoff, 01a1094b-d759-7ab2-b076-f51a6be6f10c.
 - Codex: rev 2 review, 01a1095f-23da-71a1-8b68-36b2e40d2012.
 - Antigravity: rev 2 review (REVISE), 2026-10-05.
+- Codex: rev 3 review, 01a1096c-37fe-77f0-8e3f-441ba5942d46.
+- Antigravity: rev 3 review (REVISE), 2026-10-05.
+- Review receipts: `docs/reviews/doc61/`.
 - Doc 21 (canonical snapshot liveness; Phase B deferred).
 - Doc 24 D3/D8 (full-write-set flush).
 - Doc 03 (root set).
