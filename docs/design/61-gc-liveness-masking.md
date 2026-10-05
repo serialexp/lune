@@ -1,6 +1,6 @@
 # mahina — GC liveness masking — Design
 
-Status: draft rev 6, not yet implemented (awaiting codex + antigravity review)
+Status: draft rev 7, not yet implemented (awaiting codex + antigravity review)
 Owner: Bart + agents (amber-badger)
 Last updated: 2026-10-05
 
@@ -21,10 +21,12 @@ as they land; move bullets to Done once everything inside them is checked.
       Codex's blockers and both reviewers' should-fixes are folded into rev 5.
 - [x] **Rev 5 review** (codex REVISE, antigravity APPROVE, 2026-10-05).
       Folded into rev 6.
+- [x] **Rev 6 review** (codex REVISE, antigravity APPROVE, 2026-10-05).
+      Folded into rev 7.
 
 ### Outstanding
 
-- [ ] **Review rev 6.** codex + antigravity; fold findings, re-review until
+- [ ] **Review rev 7.** codex + antigravity; fold findings, re-review until
       both approve.
 - [ ] **Q1 — trace-constant roots (§7).** Bart picks (a) or (b) before
       Phase 1.
@@ -54,8 +56,10 @@ as they land; move bullets to Done once everything inside them is checked.
 - [ ] **Phase 1 — the masked `.gc` root walk + scrub (§6).**
   - [ ] Masking driven by the shared `maskable` predicate, with an alias
         bitset and dead slots set to nil before sweep.
-  - [ ] Exit-snapshot sparsity, composite-bridge admission and the watermark
-        all gated on `maskable` (watermark: also not captured) (§5).
+  - [ ] Exit-snapshot sparsity, composite-bridge admission, the linked
+        numeric-for `a+3` skip and the watermark all gated on `maskable`
+        (watermark: also not captured; `a+3` skip: also dead at the
+        fall-through) (§5).
   - [ ] Gates, hashgate (§9 regeneration procedure), the §8 tests and
         mutations, the boundary benchmark, and a pt-default board.
 - [ ] **Phase 2 — land the dead-φ writeback filter on top.**
@@ -169,8 +173,8 @@ Verified against the tree at `b4abe70` (rev 3 reviews).
 A register slot can differ between tiers only if the JIT elided a store to it.
 The lemma's premise is that **every** elided store to slot `s` in proto `F`'s
 window is to a slot dead at every pc `R` where tier-0 or a linked trace
-resumes. There are four elision sites. Codex found the third in its rev 4
-review (blocker 2) and the fourth in its rev 5 review:
+resumes. There are five elision sites. Codex found the third, fourth and
+fifth in its rev 4, rev 5 and rev 6 reviews:
 
 1. **Loop-close φ writeback, numeric-for watermark** (today; retired in
    Phase 2, see below).
@@ -189,6 +193,28 @@ review (blocker 2) and the fourth in its rev 5 review:
    only that emission set. A slot dead at the landing pc can be left
    unwritten, or written with a different terminal φ value than tier-0's.
    `R` is the landing pc.
+5. **Linked numeric-for completion** (the linked `loop_done` exit).
+   - **What it does.** It flushes the loop-close φs except the visible loop
+     variable `a+3` (`nativegen_emit.zig:2504-2508`, `irinterp.zig:125-133`).
+     That φ holds the **next** index (`trace_recorder.zig:3563`), which tier-0
+     never writes on completion. Tier-0's `for_loop` leaves `a+3` with
+     whatever the final iteration's body left there (`interp.zig:5683`).
+     After linked execution, `a+3` holds whatever an earlier flush or tier-0
+     iteration left there.
+   - **Why it matters.** The two differ whenever the body assigns the loop
+     variable (`i = tostring(i)`), so it can be a heap value. `R` is the
+     `for_loop`'s fall-through pc, where `a+3` is normally dead. A
+     **captured** loop variable is the exception: its captured bit makes it
+     live everywhere (§2, captured registers).
+   - **Gate (Phase 1).** The skip is allowed only when `maskable(F)` ∧
+     `a+3 ∉ live_in[R]`. Otherwise the completion must not leave `a+3`
+     stale. Flushing the terminal φ would write the wrong value, the next
+     index. There are two options, and which one is an implementation choice:
+     - (i) the recorder names the **pre-test** ref of `a+3`, its binding
+       before the `for_loop`, on the `loop_done` guard, and the completion
+       flushes that;
+     - (ii) the exit declines linked completion and takes the coarse deopt,
+       so tier-0 replays the final iteration.
 
 Site 3 materialises for every **wanted or attached** exit, the resume-coherent
 `exit_side` contract (`trace_exec.zig:69-76`, `irinterp.zig:1419-1428`). That
@@ -206,8 +232,26 @@ predicts. The §8 tests build the wanted, attached and bridge cases.
 Phase 0 audits every native and IR exit/close/bridge writer, and lists every
 other store the JIT omits relative to tier-0, against this premise. A site that
 cannot state its `R` keeps every slot. Sites 2–4 satisfy the premise by
-construction, because each filters on `live_in[R]`. All three are gated on
-`maskable(F)` (§5).
+construction, because each filters on `live_in[R]`. Site 5 satisfies it under
+its gate. Sites 2–5 are all gated on `maskable(F)` (§5).
+
+**Audited non-sites** (rev 6 reviews; codex should-fix: these omissions are
+harmless, not missing gates):
+- **Sunk stores** write heap cells only (`.astore`, `.hstore`, `.ustore`,
+  `.gstore`, `.sgm_setpos`), never register slots
+  (`nativegen_exitloc.zig:112-117`, `irinterp.zig:190-200`).
+- **`ret_cont`** copies results verbatim and nil-fills, as `opRet` does
+  (`nativegen_emit.zig:1116-1250`).
+- **Sibling handoff and the coarse deopt** flush every carried home and replay
+  the iteration from the anchor in tier-0 or the sibling.
+- **Precise exits** flush a full-window snapshot
+  (`trace_recorder.zig:1493-1510`). Slots a precise snapshot skips are already
+  coherent in the slab.
+- **Inlined-callee frames** are omitted outside the surviving frame window
+  (`trace_finalize.zig:59`). A guard failing at `inline_depth > 0` refuses
+  snapshots and linking and coarse-deopts (`trace_exit_attach.zig:343`), so
+  tier-0 pushes the callee frame itself.
+- **`link_terminal`** is the loop-close φ writeback: sites 1 and 2.
 
 The watermark (site 1) does not satisfy the premise. It drops every defined slot `>= base+4` of the anchoring numeric `for`,
 by lexical position and not by liveness. That includes a register a later
@@ -234,7 +278,7 @@ subset) roots no stale slot. Goal 1 needs two things:
   (§4);
 - every case where the collector must root more (an unknown shape, or a proto
   without usable liveness) is a case where the JIT elided no store at any of
-  the four sites, via the shared predicate of §5.
+  the five sites, via the shared predicate of §5.
 
 **Captured registers** are live at every pc. The φ filter and exit snapshots
 read the same `live_in`, so they keep these slots. They are never stale. This covers
@@ -527,7 +571,7 @@ An all-live mask would be safe, but it would root stale slots and break Goal 1
 ### 4.5 Unknown shape
 
 Mask: all live. Goal 1 still holds only if the JIT elided no store that could
-leave a stale value in such a frame (§2, all four sites). Unknown shapes arise from protos without
+leave a stale value in such a frame (§2, all five sites). Unknown shapes arise from protos without
 liveness or protos failing the layout check, and both are covered by §5.
 Phase 0's audit must leave no other source: every frame lands in 4.1–4.4. A
 debug assert fires on any unknown classification of a `maskable` proto.
@@ -574,6 +618,11 @@ Captured slots need no closure proof here:
   observable. So the emission set must agree with the snapshot on every slot.
   Since the snapshot of a non-`maskable` proto is full (above), the bridge
   then writes the tier-0 state exactly, or is not admitted.
+- **Linked numeric-for completion (Phase 1).** It skips `a+3` only when
+  `maskable(F)` ∧ `a+3 ∉ live_in[fall-through pc]`. Otherwise it writes the
+  pre-test value, or declines to the coarse deopt (§2 site 5). A for-loop
+  whose control variable is captured is the case this affects on real code,
+  and only when such a loop is linked.
 - **Watermark (Phase 1 → Phase 2).** Until Phase 2 removes it, it drops a slot
   only if `maskable(F)` ∧ the slot is not captured in `F` (§2). Gating on
   `maskable` alone is not enough: it would still drop a captured slot that a
@@ -647,8 +696,10 @@ A dead window slot is set to nil before the sweep.
    every path from its frame's pc. Faulting frames never resume.
 
 **Other readers.**
-- `matchesFingerprint` probes only slots live at the anchor.
-- `bridgeMatchesExitSnapshot` gates on liveness (`trace_code.zig:548, 794`).
+- `matchesFingerprint` probes only slots live at the anchor
+  (`trace_code.zig:548`).
+- `bridgeMatchesExitSnapshot` gates on liveness (`trace_code.zig:781-805`),
+  and on `maskable` from Phase 1 (§5).
 - Exit-side snapshots materialise resume-pc liveness.
 - `ret_cont` receives copied results.
 - Backtraces read pcs.
@@ -787,6 +838,14 @@ sound under the conditions stated. Bart decides.
     whether it diverges; each must agree after Phase 1. Also run each against
     a non-`maskable` proto (test-constructed): there the snapshot keeps the
     slot, and the mismatching bridge is not admitted;
+  - **linked numeric-for completion with a heap loop variable**: a linked
+    `for i = 1, n do ... i = tostring(i) end`, run in three variants:
+    - plain, where `a+3` is dead after the loop;
+    - with `i` captured by a closure created in the body;
+    - in a non-`maskable` proto.
+
+    In each, collect after the loop and re-intern the string. All modes must
+    agree, and the HEAD result is recorded first;
   - collections from a metamethod and from `mh_collect`;
   - collect → snapshot → restore → linked execution.
   coral-marten's hostcall differential tests (every register dumped, under GC
@@ -816,6 +875,10 @@ sound under the conditions stated. Bart decides.
   - exit-snapshot sparsity not gated on `maskable` (materialised-exit test,
     non-maskable variant);
   - bridge admission not gated on `maskable` (bridge variant, non-maskable);
+  - `a+3` skipped unconditionally (linked completion test, captured and
+    non-maskable variants);
+  - `a+3` flushed from the terminal φ instead of the pre-test value (same
+    test: it would expose the next index);
   - the capi entry flag captured inside `guestFault` instead of at entry
     (catcher restore test, via `mh_call`);
   - `pushHostCall` marking the callee in flight;
@@ -896,7 +959,15 @@ sound under the conditions stated. Bart decides.
   - **Call-like set** reduced to `.call`; `pushHostCall`'s callee starts not
     in flight.
   - **Tests and mutations** added for each of the above.
-- **Rev 6** (this). Folds the rev 5 reviews (codex REVISE, antigravity
+- **Rev 7** (this). Folds the rev 6 reviews (codex REVISE, antigravity
+  APPROVE):
+  - **Linked numeric-for completion is the fifth elision site** (§2). Its
+    `a+3` skip is gated on `maskable` and on a dead `a+3`. Otherwise it writes
+    the pre-test value or declines to the coarse deopt (§5).
+  - **The audited non-sites are listed** with their reasons (§2).
+  - **§6.4 line references corrected.**
+  - **Tests and mutations** added.
+- **Rev 6** (`c3940ed`). Folds the rev 5 reviews (codex REVISE, antigravity
   APPROVE):
   - **Composite bridges are the fourth elision site** (§2). Admission is
     gated on `maskable`; the "no liveness" all-slots path is used otherwise
@@ -942,6 +1013,8 @@ sound under the conditions stated. Bart decides.
 - Antigravity: rev 4 review (APPROVE), 2026-10-05.
 - Codex: rev 5 review, 01a10986-6a30-78a0-89ac-947d9635c5c3.
 - Antigravity: rev 5 review (APPROVE), 2026-10-05.
+- Codex: rev 6 review, 01a10990-6d32-7713-a99e-9edfaa912e5a.
+- Antigravity: rev 6 review (APPROVE), 2026-10-05.
 - Review receipts: `docs/reviews/doc61/`.
 - Doc 21 (canonical snapshot liveness; Phase B deferred).
 - Doc 24 D3/D8 (full-write-set flush).
