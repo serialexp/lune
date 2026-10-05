@@ -124,7 +124,25 @@ mahina C API 7.3, Rust crate 26.8. Items, each measured on its own:
       arguments above the window sit only in `boundary_scratch`, which is not
       a GC root; and the `.function` arm lays the callee window at
       `base+num_registers`, which can overlap them. Unverified: write a
-      `gc_stress` repro before fixing.
+      `gc_stress` repro before fixing. **Overlap half CONFIRMED (2026-10-05)
+      — see doc 61 P1 below.**
+- [ ] **Doc 61 P1 — surplus varargs past the caller window are CLOBBERED
+      (confirmed, every tier).** `g(table.unpack(t))` with 40 values into a
+      vararg `g` with 10 locals: `g` reads its own locals as varargs
+      ("attempt to perform arithmetic on a function value",
+      `/tmp/varargs_tail.lua`, program in doc 61 §3). The callee window is
+      laid at `base + caller.num_registers` over the argument tail. Fix per
+      doc 61 §3 P1 (LuaJIT vararg-frame layout: callee above the args; also
+      native push, `callValue`, `.S`, keyframe restore gap).
+- [ ] **Doc 61 P2 — dynamic argument spans above `stack_top` during
+      re-entry / `mh_collect`** (codex, doc 61 rev 2 review). Fix: raise
+      `stack_top` over an `all_results` argument span for the call's
+      duration.
+- [ ] **Doc 61 P3 — native-held transient values across `callValue`**
+      (codex): native `gsub` replacement args are never parked; operand
+      copies lose their root when a callback rewrites the register via an
+      upvalue. Fix: a Vm `transient_roots` stack + an audit of `callValue`
+      callers.
 
 ## `hashgate.py --generate --filter X` wipes every other program's refs (noted 2026-10-01)
 

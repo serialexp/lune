@@ -1,6 +1,6 @@
 # mahina — GC liveness masking — Design
 
-Status: draft rev 2, not yet implemented (awaiting codex + antigravity review)
+Status: draft rev 3, not yet implemented (awaiting codex + antigravity review)
 Owner: Bart + agents (amber-badger)
 Last updated: 2026-10-05
 
@@ -12,45 +12,45 @@ as they land; move bullets to Done once everything inside them is checked.
 ### Done
 
 - [x] **Rev 1 → rev 2 tradeoff review** (codex, 2026-10-05). It compared rev 1
-      with an alternative draft; rev 2 is the merge it recommended, with its
-      corrections (see "Revision history").
+      with an alternative draft; rev 2 is the merge it recommended.
+- [x] **Rev 2 review** (codex REVISE, antigravity REVISE, 2026-10-05). Every
+      blocker is folded into rev 3; see "Revision history".
 
 ### Outstanding
 
-- [ ] **Review rev 2.** codex + antigravity; fold findings, re-review until
+- [ ] **Review rev 3.** codex + antigravity; fold findings, re-review until
       both approve.
-- [ ] **Q1 — trace-constant roots (§6).** Pick an option before Phase 1: masking
-      makes the hazard easier to reach.
-- [ ] **Q2 — visualiser display of scrubbed dead locals** (§9).
-- [ ] **Phase 0 — frame state made exact.**
-      - `gcTrampoline` publishes the innermost pc before `collect()` (§3.1).
-      - `CallFrame.in_flight` is set and cleared on every path that runs code
-        inside a frame's instruction, including the dynamic-argument span end
-        (§3.2, §3.5).
-      - Every frame push initialises it: the Zig literal, the native emitted
-        push and the `.S` host entry, with offsets bumped for coral-marten.
-      - The static call-layout check runs over the corpus (§3.3).
-      - Behaviour-neutral on its own; pinned by the frame-shape tests (§7).
-- [ ] **Phase 1 — the masked `.gc` root walk + scrub (§4).**
-      - Frame windows root `liveRoots(f)`.
-      - Alias spans and gaps are always rooted.
-      - Dead window slots are set to nil before sweep.
-      - Gates, hashgate (reference regeneration only where all modes agree,
-        §8), the §7 tests and mutations, the boundary benchmark, and a
-        pt-default board.
-- [ ] **Phase 2 — land the dead-φ writeback filter on top.** The uncommitted
-      `phiLiveRow`/`phiWritebackKept` change, plus `/tmp/gcphi_new.lua` as a
-      doc test that prints the same id in every mode.
+- [ ] **Q1 — trace-constant roots (§7).** Bart picks (a) or (b) before
+      Phase 1.
+- [ ] **Q2 — visualiser display of scrubbed dead locals** (§10). Bart.
+- [ ] **Phase P — pre-existing rooting bugs (§3), each its own change, before
+      Phase 1.**
+  - [ ] **P1:** surplus varargs past the caller window are clobbered by the
+        callee window (confirmed in every tier).
+  - [ ] **P2:** dynamic argument spans above `stack_top` during re-entry.
+  - [ ] **P3:** native-held transient values across `callValue`.
+- [ ] **Phase 0 — frame state made exact.** Behaviour-neutral on its own;
+      pinned by the frame-shape tests (§8).
+  - [ ] `gcTrampoline` publishes the innermost pc before `collect()`.
+  - [ ] `CallFrame.in_flight` follows the save/restore discipline (§4.2).
+  - [ ] The Vm records the faulting-frame range while an `xpcall` handler runs
+        (§4.4).
+  - [ ] `Proto.maskable` is computed at compile time (§5).
+- [ ] **Phase 1 — the masked `.gc` root walk + scrub (§6).**
+  - [ ] Masking driven by the shared `maskable` predicate, with an alias
+        bitset and dead slots set to nil before sweep.
+  - [ ] Gates, hashgate (§9 regeneration procedure), the §8 tests and
+        mutations, the boundary benchmark, and a pt-default board.
+- [ ] **Phase 2 — land the dead-φ writeback filter on top.**
+  - [ ] Re-base `phiLiveRow`/`phiWritebackKept` on `Proto.maskable` (§5).
+  - [ ] `/tmp/gcphi_new.lua` as a doc test, printing the same id in every
+        mode.
 - [ ] **Phase 3 — relax doc 24 D3's full-write-set flush.** Today
       `alloc_count != 0` keeps every φ only because the collector roots every
       register. Re-derive it under masking. Separate review.
 - [ ] **Backtraces use the in-flight marker.** `backtraceFrames`/`callSiteAt`
-      assume pc+1 for every parent and so misreport in-flight frames. This is a
-      pre-existing bug and its own change; adding the marker alone fixes
-      nothing.
-- [ ] **Defer — `.snapshot` walk masking (doc 21 Phase B).** The scrub makes
-      dead slots canonical after each collection; byte identity between
-      collections is still not promised and no pin needs it.
+      assume pc+1 for every parent. Pre-existing; its own change.
+- [ ] **Defer — `.snapshot` walk masking (doc 21 Phase B).**
 
 ## Why this exists
 
@@ -70,436 +70,519 @@ replaces one, the JIT run keeps a different set of objects alive than tier-0.
 It then re-interns a swept string with a fresh id, and the printed table ids
 diverge. Codex's counterexample does exactly this: tier-0 prints
 `table: 0x178f`, the traced modes print `0x1790`. Object ids are deterministic
-program output in mahina, so this is a determinism bug, not a GC-quality nit.
+program output, so this is a determinism bug.
 
-LuaJIT roots the whole stack too (`gc_traverse_thread`). It gets away with
-that because nothing about its addresses is part of a contract. Our contract
-is stronger. Per CLAUDE.md, "replay forbids it" only justifies *adapting* the
-mechanism, so we adapt: make the collector's view of the stack a pure function
-of the program's **logical** state, i.e. its live registers. Then what a dead
-slot happens to hold is unobservable in every tier, every JIT may elide dead
-stores freely, and dead objects are freed sooner.
+LuaJIT roots the whole stack too (`gc_traverse_thread`), and gets away with it
+because its addresses are not part of a contract. We adapt instead of
+copying: the collector's view of the stack becomes a pure function of the
+program's logical state. Then what a dead slot holds is unobservable in every
+tier, every JIT may elide dead stores freely, and dead objects are freed
+sooner.
 
 ## Goals
 
-1. **Determinism theorem.** At every collection, the rooted set is a function
-   of the heap, the live register values, the explicitly-aliased spans and the
-   non-register roots. Every tier agrees on all of those at a tier-0
-   instruction boundary, and collections happen at identical points in every
-   tier. So every tier marks and sweeps the identical set.
-2. **No dangling reads.** No later reader of a dead slot ever sees a pointer
-   to a swept object. That covers mid-flight `encodeSnapshot`, the `.snapshot`
-   walk and a trace's entry fingerprint read.
-3. **Sound by default.** Anything the masking cannot classify is rooted
-   conservatively (today's behaviour), never masked.
-4. **Linear cost, no allocation per collection** (§5).
+1. **Determinism theorem.** At every collection, every rooted register slot
+   holds a value that is identical in every tier, and the rooted set is a
+   function of tier-identical data only.
+2. **No dangling reads.** No later reader of a register slot ever sees a
+   pointer to a swept object.
+3. **Sound by default.** Anything the collector cannot classify is rooted.
+   Goal 1 is then kept by making the JIT keep every φ in exactly those cases:
+   **one predicate shared by the collector and the φ filter** (§5).
+4. **Linear cost, no allocation per collection** (§6.3).
 
 ## Non-goals (v1)
 
-- Masking the `.snapshot` walk or the verbatim stack serialization (doc 21
-  Phase B).
+- Masking the `.snapshot` walk or verbatim stack serialization (doc 21 Phase B).
 - Weak tables / finalizers (none exist, `src/gc.zig:7`).
-- Keeping collection *timing* as it is today. Fewer roots means a smaller
-  surviving population and a lower `next_gc` (`gc.zig:776`). Collections
-  therefore move, identically in every tier (§8).
+- Keeping collection timing as it is today. Fewer roots means a lower
+  `next_gc` (`gc.zig:776`), so collections move, identically in every tier
+  (§9).
 
 ## 1. Facts the design rests on
 
-Verified against the tree at `93da3a3` (codex tradeoff review, 2026-10-05).
+Verified against the tree at `2235f3d` (rev 2 reviews).
 
-- **Collections happen only at the tier-0 dispatch prologue**
-  (`interp.zig:2852 → gcTrampoline`) and via `mh_collect` (`capi.zig:584`).
-  - Allocation only bumps `object_count`. The trigger is
-    `gc_stress or object_count >= next_gc`.
-  - Traces never collect: `guard_gc` refuses entry unless the trace's
-    allocations fit under the threshold (doc 24 D3), and callouts are audited
-    `may_collect = false`.
-  - So at every collection, every frame is at a tier-0 instruction boundary
-    or inside one instruction's re-entry, in every tier, after any trace has
-    exited and flushed.
-- **Lua call windows are disjoint.** Rev 1 got this wrong.
-  - A Lua call lays the callee at the end of the caller's window,
-    `callee_base = base + caller.num_registers` (`interp.zig:6382`). It copies
-    the fixed parameters into it and nil-fills the rest. The native inline
+- **Where collections happen.** Only at the tier-0 dispatch prologue
+  (`interp.zig:2852 → gcTrampoline`) and via `mh_collect` (`capi.zig:584`),
+  which a host callback can call. No collection runs on trace: `guard_gc`
+  refuses entry unless the trace's allocations fit under the threshold
+  (doc 24 D3), and callouts are audited `may_collect = false`.
+- **Lua call windows.**
+  - An opcode call lays the callee at `base + caller.num_registers`
+    (`interp.zig:6382`) and copies the fixed parameters. The native inline
     push does the same (`nativegen_emit.zig:979`).
-  - The caller's call slots `a, a+1..` stay in the caller's window.
-  - **Surplus varargs are not copied.** They stay in the caller's window at
-    `va_base = base + a + 1 + num_params` and are read through the callee's
-    `varargs_base`/`varargs_count` (`interp.zig:6406`).
-  - Host entry (`bindAndPushClosure`, and the hand-written `.S` path in
-    `src/asm/hostcall_x64.S`) and `callValue` put an argument region below the
-    callee base. That region is not any frame's window.
-- **pc conventions differ by frame state.**
-  - **Innermost frame at a prologue collection:** `frame.pc` is stale. It is
-    written at prologue step 6 (`:2965`), after the GC check at step 1. The
-    true next pc is the trampoline's `pc` argument.
-  - **A caller suspended at a Lua call:** `frame.pc` is the call pc + 1
-    (`:6410`; the native push uses `term_aux + 1`).
-  - **A frame whose instruction is running other code:** `frame.pc` is the
-    in-flight instruction itself (step 6). This covers metamethods,
-    `pcall`/`xpcall`, `sort`, `gsub`, `require`, `load`, a native called from
-    `call`, host callbacks and capi `runProtected`.
-  - **Nothing in the frame says which.**
-- **Open upvalues are not marked through their stack location.** `gc.zig:703`
-  marks only closed upvalues. An open upvalue's value is kept alive solely by
-  the stack scan.
+  - Re-entry (`callValue`) lays the callee at `stack_top` (`interp.zig:2085`).
+  - Host entry and the `.S` path bind arguments into an argument region below
+    the callee base.
+  - Surplus varargs are not copied. They stay where the arguments were
+    (`va_base = base + a + 1 + num_params`).
+- **pc conventions.**
+  - The innermost frame's `frame.pc` is stale at a prologue collection
+    (written at step 6, `:2965`); the trampoline's `pc` argument is the true
+    next pc.
+  - A caller suspended at a Lua call holds call pc + 1 (`:6410`; native push:
+    `term_aux + 1`).
+  - A frame whose instruction is running other code holds the instruction
+    itself (step 6).
+  - **The frame does not record which.**
+- **Same-frame nesting.** One instruction can re-enter many times. An opcode
+  calls a native, and the native calls `callValue`, possibly repeatedly and
+  recursively, without pushing a frame (`interp.zig:2228`). `table.sort`'s
+  comparator loop and `require`'s post-call `loaded.set` keep relying on the
+  frame's operands between and after re-entries (`stdlib/package.zig:300-363`,
+  `stdlib/table.zig:264`).
+- **xpcall handlers run on top of live faulting frames.** `protectedCall` keeps
+  `depth`/`stack_top` raised and lays the handler at the raised `stack_top`
+  (`stdlib/errors.zig:79-104`). The faulting frames stay in
+  `frames[0..depth]`. They are frames, not gaps.
+- **Open upvalues.** `gc.zig:703` marks only closed upvalues. An open
+  upvalue's value is kept alive by the stack scan alone.
 - **`reg_top_pending` is not a lifetime.** A `call` consuming `all_results`
-  clears it before pushing or invoking the callee (`interp.zig:6374`). An
-  argument span that runs past the caller window is therefore unprotected
-  during re-entry and `mh_collect`. This is a pre-existing gap (§3.5).
-- **`Proto.reg_live`:** `live_in[pc] = use ∪ (live_out − kill) ∪ captured`.
-  - It is conservative: captured registers are live at every pc, multret
-    consumers read to the window top, dynamic or conditional writes kill
-    nothing, and the patched `j*` opcodes mark everything live.
+  clears it before invoking the callee (`interp.zig:6374`). Dynamic producers
+  write beyond `stack_top` (`interp.zig:6708`).
+- **`Proto.reg_live`.**
+  - `live_in = use ∪ (live_out − kill) ∪ captured`.
+  - Captured registers are live at every pc.
+  - `call c=all` kills nothing (`bc_liveness.zig:202`).
   - `words == 0` means "unknown".
 
-## 2. The rule
+## 2. Where stale values come from, and the theorem
 
-A slot `i < stack_top` is rooted iff any of these holds:
+A register slot can differ between tiers only if the JIT elided a store to it.
+Today that is the numeric-for watermark; after Phase 2 it is the dead-φ
+filter. Both drop the φ of slot `s` in a trace anchored in proto `F` only when
+`s` is dead at every pc `R` where tier-0 or a linked trace consumes the φ set.
 
-- **Gap.** No frame window contains it. It is rooted conservatively.
-- **Alias.** It lies in an explicit alias span (§3.5), whatever its window
-  says.
-- **Live.** It lies in frame `f`'s window and `liveRoots(f)` contains
-  `i − f.base`.
+**Lemma (path).** Take a stale slot `s` and a later collection where `F`'s
+frame sits at pc `Y`, with `Y` reached from such an `R` in tier-0 execution.
+If `s ∈ live_in[Y]`, then on the path `R → Y` tier-0 wrote `s`, with the same
+value in every tier, so `s` is no longer stale. Proof: `s` is dead at `R`, so
+every path from `R` writes `s` before reading it. If `s` is read after `Y`
+before a write, the write must lie on `R → Y`.
 
-Frame windows `[f.base, f.base + nreg(f))` are disjoint, so a slot has at
-most one owning frame. Every window slot that is in no alias span and not live
-is **dead**: it is not rooted, and it is scrubbed (§4.3).
+So a frame whose mask is `live_in[Y]` for its true current pc `Y` (or a
+subset) roots no stale slot. Goal 1 needs two things:
 
-`liveRoots(f)` is "all live" whenever it cannot be computed: no liveness table,
-a pc out of range, or an unrecognised suspension shape. That is today's
-behaviour for that frame.
+- every frame shape gets a mask that is a subset of `live_in` at its true pc
+  (§4);
+- every case where the collector must root more (an unknown shape, or a proto
+  without usable liveness) is a case where the JIT dropped no φ, via the shared
+  predicate of §5.
 
-## 3. Per-frame live rows and alias spans
+**Captured registers** are live at every pc, so the φ filter, which reads the
+same `live_in`, keeps their φ. They are never stale. This covers
+captured-before-definition and captured-after-close slots (rev 2 review,
+codex blocker 5).
 
-### 3.1 Innermost frame, between instructions
+## 3. Phase P — pre-existing rooting bugs
 
-`liveRoots = live_in[pc]`, where `pc` is the next instruction to execute.
-Phase 0 makes `gcTrampoline` store `st.frame.pc = pc` before `collect()`. Step
-6 performs the same store anyway; doing it earlier on the cold path is
-behaviour-neutral. An `mh_collect` from a host with the VM suspended between
-instructions is the same shape: `frame.pc` already holds the next pc.
+These are wrong today, independently of masking. Masking's guarantees assume
+correct rooting, so they land first, each as its own reviewed change with a
+TODO entry.
 
-### 3.2 In-flight frame (`in_flight == true`)
+### P1 — surplus varargs beyond the caller window are clobbered (CONFIRMED)
+
+```lua
+local function g(...)
+  local a, b, c, d, e, f, h, i, j, k = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+  local n, s = select('#', ...), 0
+  for x = 1, n do s = s + select(x, ...) end
+  return n, s
+end
+local t = {} for i = 1, 40 do t[i] = i end
+print(g(table.unpack(t)))
+```
+
+In every tier this fails with "attempt to perform arithmetic on a function
+value" at the `s + select(...)` line (`/tmp/varargs_tail.lua`). The 40
+arguments extend past `base + caller.num_registers`. The callee window is laid
+there, and the callee's locals overwrite the surplus varargs it then reads.
+
+Fix, LuaJIT's layout (`lj_func.c`/`BC_IFUNCV` vararg frames sit above their
+arguments): when the argument span ends past the caller window, lay the callee
+at `max(base + nreg, base + a + 1 + nargs)`. The fixed parameters are still
+copied up, the surplus varargs stay where they are, and `stack_top` covers the
+arguments for the callee's lifetime. The same rule applies to the native
+inline push, `callValue`, and the `.S` entry. Windows are then no longer
+always contiguous, so keyframe restore (`keyframeser.zig:811`, "frame windows
+stack contiguously") must accept a recorded gap.
+
+### P2 — dynamic argument spans above `stack_top`
+
+A native callee consuming `all_results` arguments past the window has them
+above `stack_top`. A re-entry lays its window at `stack_top` over them, and an
+`mh_collect` does not scan them. Fix: a call consuming `all_results` raises
+`stack_top` to cover its argument span for the call's duration, restored on
+return and unwind. The span then sits in a gap (§6.1) and is rooted. Rev 2's
+`dyn_hi` alias is withdrawn: it covered only slots below `stack_top`.
+
+### P3 — native-held transient values across `callValue`
+
+Two cases:
+- `gsub` builds capture strings in a Zig array and passes them to a native
+  replacement. `callValue` neither pushes nor parks a native callee's
+  arguments, and the C adapter forwards them directly
+  (`stdlib/string.zig:1473`, `capi.zig:1109`). A replacement that calls
+  `mh_collect` sweeps them.
+- A native holding a copy of an operand register loses its root if a callback
+  rewrites that register through an open upvalue (`interp.zig:7574`).
+
+Fix: a Vm transient-root stack (`transient_roots`, a `.gc` root, bounded,
+allocated at init). `callValue` pushes a native callee's argument slice for the
+call's duration. A native that holds a heap `Value` in a Zig local across
+`callValue` pushes it too. Phase P3 audits every `callValue` caller in
+`src/stdlib/` and `src/capi.zig`. Release builds overflow to an error, never to
+an unrooted value.
+
+## 4. Frame shapes and their masks
+
+Every frame in `frames[0..depth]` is in exactly one shape. Shapes are
+classified from recorded state, never guessed.
+
+### 4.1 Innermost, between instructions
+
+Mask: `live_in[pc]`, with `pc` the next instruction. Phase 0 makes
+`gcTrampoline` store `st.frame.pc = pc` before `collect()`. Step 6 does the
+same store anyway, so this is behaviour-neutral. An `mh_collect` from a host
+with the VM suspended between instructions is this shape too.
+
+### 4.2 In flight
 
 The frame is inside instruction `P = frame.pc`, which is running other code.
-Its operands may still be read when that returns. Natives also keep `Value`s
-in Zig locals and rely on the operand registers staying rooted (e.g.
-`require`'s `name_val`, `stdlib/package.zig:299`). `live_in[P]` contains every
-operand of `P` (uses are added after kills). So:
+Mask: `live_in[P]`, which contains every operand of `P`. The destination is
+correctly left out.
 
-`liveRoots = live_in[P]`.
+`CallFrame.in_flight: bool` follows a **save/restore** discipline at every
+site that runs code inside an instruction:
 
-The destination is killed at `P` and holds a stale value, which is correctly
-left unrooted. A native called from `call` is in flight: its arguments are
-uses of `P`, so they stay rooted.
+```zig
+const prev = frame.in_flight;
+frame.in_flight = true;
+defer frame.in_flight = prev;
+```
 
-**The marker is `CallFrame.in_flight: bool`** (rev 1's Q1, now decided). A Vm
-depth stack would duplicate the unwind bookkeeping, and a union of the rows on
-both sides of `pc` would root stale values, which breaks Goal 1.
+- **Sites.** The `call` opcode's native/host-function path, for the native's
+  whole duration (not per `callValue`). `callValue` on the current frame (for
+  metamethods, and natives that re-enter). `pushHostCall`/`runPushedFrame`.
+  The `.S` entry wherever it suspends a Lua frame.
+- **Nesting.** The `defer` restores the outer state, so an inner return never
+  clears an outer native's protection. This was the shared rev 2 blocker.
+- **Unwinds.** Zig error propagation runs the `defer`s, so `pcall`, `xpcall`,
+  capi error unwinds and rejected pushes restore the flag.
+- **Initialisation.** Every push initialises it false: the Zig struct literal
+  (`interp.zig:2038`), the native emitted push (`nativegen_emit.zig:998-1020`,
+  one more immediate store) and the `.S` frame write
+  (`hostcall_x64.S:248-257`, new `CF_IN_FLIGHT` offset, coordinated with
+  coral-marten). Frame-slot reuse goes through those pushes.
 
-The marker's lifecycle is part of the contract:
+### 4.3 Suspended at a Lua call (`in_flight == false`, not innermost, not faulting)
 
-- **Set** on the frame whose instruction re-enters, before the callee runs:
-  - `callValue` (every caller: metamethods, `pcall`/`xpcall`, `sort`, `gsub`,
-    `require`, `load`, capi `runProtected`);
-  - the `call` opcode's native/host-function path;
-  - `pushHostCall`/`runPushedFrame`;
-  - the `.S` entry, wherever it suspends a Lua frame.
-- **Cleared** on the normal return to that frame, on every
-  `protectedCall`/`xpcall` unwind that lands in it, and on error paths that
-  pop past it.
-- **Initialised false** by every push: the Zig struct literal, the native
-  emitted inline push and the `.S` frame write. Frame-slot reuse goes through
-  those pushes, so a stale `true` cannot survive.
-- **Nesting:** each frame carries its own flag, so nested re-entry is just
-  more flagged frames.
-- **Unknown sites:** any site the Phase 0 audit cannot classify leaves the
-  frame "all live", which is the fail-safe direction.
+`frame.pc = p ≥ 1` is one past `C = code[p − 1]`, a call-like opcode with base
+`a`. Mask: `live_in[p] ∩ [0, a)`.
 
-### 3.3 Caller suspended at a Lua call (`in_flight == false`, not innermost)
+Every caller slot at or above `a` is one of: the callee, a fixed argument
+(copied), a surplus vararg (alias, §6.1), a result slot (overwritten by the
+result copy before any read, with no safepoint between pop and copy), or a
+free temporary above the call window. By the lemma, `live_in[p]` is already
+stale-free. `∩ [0, a)` additionally drops slots whose current contents are not
+yet the caller's values. Those are stale results that tier-0 itself would not
+read, and that can differ between tiers.
 
-`frame.pc = p` is one past the call `C = code[p − 1]`, with call base `a`.
+If `p == 0`, or `code[p − 1]` is not call-like, the shape is unknown (§4.5).
+The call-like set is enumerated in Phase 0 from the push sites: `call`, the
+self/method call forms, the `tfor_loop` call, and the native inline push. This
+fixes antigravity's blocker 1: no `p − 1` read happens for a frame classified
+by another shape, and `p == 0` cannot underflow.
 
-`liveRoots = live_in[p] ∩ [0, a)`.
+### 4.4 Faulting frames under an `xpcall` handler
 
-Every caller slot at or above `a` is one of these:
+While a handler runs, `protectedCall` records the faulting frame range
+`[entry_depth, faulting_depth)` on the Vm (`fault_lo`, `fault_hi`; empty
+otherwise; restored on handler return and on every unwind).
 
-- the callee (`a`), consumed by the push and rooted through the callee
-  frame's `closure`;
-- a fixed argument, copied into the callee window;
-- a surplus vararg, rooted by the alias span in §3.5;
-- a result slot (`a..a+c−1`), overwritten by the result copy before the
-  caller can read it, with no safepoint between the pop and the copy;
-- a free temporary above the call window, dead by register discipline.
+Those frames never resume: after the handler returns they are discarded. The
+handler can see them only through `debug.traceback`-style walks, which read
+pcs and closures. Closures are rooted per frame. Mask: **∅**. All their window
+slots are dead to the program, and alias spans (§6.1) still apply.
 
-None of them holds a value the caller reads after the return, so masking them
-is sound. It is also necessary for Goal 1: the stale results and temporaries
-there can differ between tiers. For `c = all_results`, `live_in[p]` includes
-the window top only because the consumer reads it, and those slots are
-results.
+An all-live mask would be safe, but it would root stale slots and break Goal 1
+(rev 2 review: codex 5, antigravity 1).
 
-**Rev 1's assertion is withdrawn.** It checked for a liveness bit at or above
-`a`, which confuses conservative captured and multret bits with preserved
-values. In its place, Phase 0 adds a **static call-layout check**, run in
-debug builds over every compiled proto (corpus and tests):
+### 4.5 Unknown shape
 
-- for every Lua call instruction `(a, b, c)`, every slot `r >= a` that is in
-  `live_out(call)` must be in `kill(call)` or `captured`;
-- every captured slot at or above `a` must be closed before the call. The
-  compiler's per-iteration `close` for generic-for loop variables, which reuse
-  `base+3..` as the call window (`compiler.zig:1004`), is exactly the case
-  this pins.
+Mask: all live. Goal 1 still holds only if the JIT dropped no φ that could
+leave a stale value in such a frame. Unknown shapes arise from protos without
+liveness or protos failing the layout check, and both are covered by §5.
+Phase 0's audit must leave no other source: every frame lands in 4.1–4.4. A
+debug assert fires on any unknown classification of a `maskable` proto.
 
-A proto that fails is compiled with liveness, but its suspended frames fall
-back to "all live". So a compiler change can cost memory, never soundness.
+## 5. One predicate: `Proto.maskable`
 
-### 3.4 Unknown shape
+Computed once at compile time, stored on the proto, and read by both the
+collector and the φ filter:
 
-If `code[p − 1]` is not a call-like opcode that suspends a frame at pc+1, the
-frame is "all live". The call-like opcodes, enumerated in Phase 0 from the
-push sites, are `call`, the self/method call forms, the `tfor_loop` call and
-the native inline push.
+`maskable(F)` ⇔ `F.reg_live.available()` ∧ `F` passes the **call-layout
+check**.
 
-### 3.5 Alias spans: rooted regardless of window liveness
+**Call-layout check.** For every call-like instruction `(a, b, c)` in `F`:
+∀ `r ≥ a`: `r ∈ live_out(call)` ∧ `r ∉ captured` ⇒ `r` is a result slot.
+For fixed `c`, the result slots are `a ≤ r < a + c`. For `c = all_results`,
+every `r ≥ a` is a result slot. That handles the "multret kills nothing" case
+from codex blocker 4.
 
-These are computed per collection from frame and Vm state, without
-allocation:
+Captured slots need no closure proof here:
+- an **open** captured slot is rooted by the open-upvalue alias (§6.1);
+- a **closed** one is not read through the stack, and its φ is always kept
+  (§2).
 
-- **Varargs.** `[f.varargs_base, f.varargs_base + f.varargs_count)` of every
-  frame, wherever it lies (caller window or host argument region).
-- **Open upvalues.** The stack location of every open upvalue on
-  `open_upvalues`. Liveness's `captured` rule already makes these live in the
-  owning frame. The alias rule makes rooting independent of that rule and of
-  §3.3's `∩ [0, a)`.
-- **Dynamic argument spans.** When an in-flight instruction consumed
-  `all_results`, the span `[base + a + 1, reg_top_at_call)`, recorded on the
-  in-flight frame when the flag is set (`CallFrame.dyn_hi`, 0 = none). This
-  closes the gap in §1, which exists today too.
-- **Gaps** need no rule. Host argument regions, the parked `__call` region,
-  returned spans still covered before the copy, the depth-0 B-6 result span,
-  and frames left raised during an `xpcall` handler or a `protectedCall`
-  unwind are all outside every window, so §2 roots them.
+**Uses.**
+- **Collector.** A frame of a non-`maskable` proto is all live.
+- **φ filter (Phase 2).** A trace anchored in a non-`maskable` proto keeps
+  every φ (today's behaviour). The numeric-for watermark rule is also gated on
+  `maskable`, which closes the latent version of the same hazard in HEAD.
 
-## 4. The walk
+So every all-live frame belongs to a proto whose traces leave no stale slots.
+That is Goal 1 for §4.5.
 
-### 4.1 Shape
+## 6. The walk
 
-The walk streams. It does not build a whole-stack mask.
+### 6.1 Alias bitset
+
+At collection start, a Vm-owned bitset over `[0, stack_top)` is cleared and
+filled with:
+- each frame's varargs span;
+- each open upvalue's stack slot;
+- `transient_roots` (P3) need no bits: they are `.gc` roots in their own
+  right.
+
+Its size is the stack slab: 65,536 bits = 8 KiB, allocated at VM init. Filling
+it is O(Σ spans + open upvalues), with no sorting. That fixes the
+membership-algorithm should-fix.
+
+### 6.2 Walk
 
 ```
-for each frame f (any order; windows are disjoint):
-    row = liveRoots(f)                  // or ALL
+for each frame f in frames[0..depth]:
+    mask = mask(f)                       // §4; ALL if !maskable(proto)
     for i in [f.base, f.base + nreg(f)):
-        if row[i - f.base] or inAlias(i): root(slot i)
-        else: scrub(slot i)
-root every slot in [0, stack_top) outside all windows
+        if mask[i - f.base] or alias[i]: root(i)
+        else: scrub(i)                   // §6.4
+root every slot in [0, stack_top) outside all windows   // gaps
 ```
 
-`inAlias` checks a small sorted list built once per collection in a Vm-owned
-scratch buffer:
+Gaps include host argument regions, the parked `__call` region, P1's raised
+argument tails, P2's spans, returned spans before their copy, and the depth-0
+B-6 result span. Only the `.gc` kind is masked. The `.snapshot` walk keeps doc
+21 Phase A's seeding.
 
-- one varargs span per frame;
-- one dynamic span per in-flight frame;
-- one slot per open upvalue.
+### 6.3 Budget (Rule #20)
 
-The buffer is sized at VM init: frames are bounded by `max_call_depth` and
-open upvalues by the stack slab. Gaps fall out of walking frames in base
-order.
+Per collection the walk costs:
+- one bitset clear, O(stack_top / 64);
+- span fills;
+- one liveness row per frame;
+- one or two bit tests per window slot.
 
-### 4.2 Only the `.gc` kind
+That is linear, with no allocation. The new memory is the 8 KiB bitset plus
+the bounded `transient_roots` stack, both fixed at init.
 
-The `.snapshot` walk keeps its current seeding: doc 21 Phase A's final-cut
-mask, otherwise every slot. That is safe after Phase 1 because of §4.3.
-
-### 4.3 Scrub: dead slots become nil
-
-A dead slot is written to nil during the `.gc` walk, before the sweep.
-
-1. **No dangling pointer survives.** A dead slot whose object is swept would
-   otherwise be dereferenced by the next mid-flight `encodeSnapshot` (verbatim
-   `stack[0..stack_top]`, `keyframeser.zig:315`) or `.snapshot` walk. Between
-   collections, a dead slot can only acquire a pointer to an object that is
-   live at that moment, and the next collection scrubs it before sweeping.
-   Invariant: *after any collection, no register slot points to a swept
-   object.*
-2. **Canonical dead state.** Collections happen at identical points in every
-   tier, so after each one the dead slots are identical (nil) in every tier.
-3. **Never observable to the program.** By `reg_live`'s definition, a dead
-   slot is written before any read on every path from its frame's pc.
-
-**Readers outside tier-0 bytecode,** checked in the tradeoff review:
-
-- `matchesFingerprint`/entry guards read only slots a trace reads before
-  writing on its recorded path from the anchor, and those are live at the
-  anchor.
-- Doc 56 exit-side snapshots and region bridges' `bridgeMatchesExitSnapshot`
-  already materialise or check against resume-pc liveness.
-- `ret_cont` receives copied results.
-- Backtraces read pcs, not registers.
-- The **visualiser** shows registers directly (`viz/src/snapshot.ts:130`), so
-  a dead local reads nil after a collection (Q2).
-
-## 5. Performance budget (Rule #20)
-
-Per collection:
-
-- one liveness-row lookup per frame;
-- one bit test plus one alias check per window slot;
-- building the alias list, linear in frames + open upvalues.
-
-That is linear work on a walk that already touches every slot, with no
-allocation (the Vm-owned scratch is sized at init).
-
-**Boundary benchmark,** run deliberately, never a timing assertion in a test:
-
+**Boundary benchmark**, run deliberately with no timing assertion in a test:
 - a full 65,536-slot stack;
 - 200 frames;
-- large vararg and alias spans;
-- a small heap, so the root walk dominates the collection.
+- maximally fragmented vararg/alias spans;
+- a small heap, so the root walk dominates.
 
-The target is a root-walk cost within noise of today's unmasked walk at that
-size. Board: pinned pt-default (0.30% noise), with no row regressing beyond
-noise. `binary-trees` is the allocation-heavy row to watch. Memory can only go
-down.
+Target: within noise of today's unmasked walk at that size. Board: pinned
+pt-default, with no row regressing beyond noise (`binary-trees` to watch).
 
-## 6. Q1 — trace constants are not always redundant (pre-existing hazard)
+### 6.4 Scrub
 
-Rev 1 claimed trace consts "stay redundant with pinned proto constants". That
-is false. A folded `tostring` result (`trace_recorder.zig:4518`) and a runtime
-pattern string (`:4735`) are interned into the trace pool. The pool is a `.gc`
-root only when a trace exists (`interp.zig:2451`). If such a string's last
-ordinary reference dies:
+A dead window slot is set to nil before the sweep.
 
+1. **No dangling pointer survives.** A dead slot whose object is swept would
+   otherwise be dereferenced by the next mid-flight `encodeSnapshot`
+   (`keyframeser.zig:315-332`) or `.snapshot` walk. Invariant: *after any
+   collection, no register slot points to a swept object.*
+2. **Canonical dead state.** After each collection the dead slots are nil in
+   every tier.
+3. **Unobservable to the program.** A dead slot is written before any read on
+   every path from its frame's pc. Faulting frames never resume.
+
+**Other readers.**
+- `matchesFingerprint` probes only slots live at the anchor.
+- `bridgeMatchesExitSnapshot` gates on liveness (`trace_code.zig:548, 794`).
+- Exit-side snapshots materialise resume-pc liveness.
+- `ret_cont` receives copied results.
+- Backtraces read pcs.
+- The visualiser shows registers (`viz/src/snapshot.ts:130`), so a dead local
+  reads nil after a collection (Q2).
+
+**Keyframes.** Capture never happens with an in-flight frame. Capture points
+are suspend boundaries, not re-entries; Phase 0 asserts this. So the new
+frame fields are not serialized, and restore initialises them to
+false/empty. P1 adds the window gap to the frame record.
+
+## 7. Q1 — trace constants (pre-existing hazard, decide before Phase 1)
+
+A folded `tostring` result (`trace_recorder.zig:4518`) and a runtime pattern
+string (`:4735`) are interned into a trace's constant pool. The pool is a
+`.gc` root only when a trace exists (`interp.zig:2451`). Once such a string's
+last ordinary reference dies:
 - the JIT run keeps it alive;
 - tier-0 sweeps it;
-- a later re-intern allocates a new object in tier-0 only, and `next_obj_id`
-  diverges.
+- re-interning it allocates in tier-0 only, so `next_obj_id` diverges.
 
-Masking removes more ordinary roots, so it makes this easier to reach. One
-attempt to reproduce it on HEAD did not diverge (`/tmp/tconst.lua`). Whatever
-it was, it is recorded as a hazard, not a demonstrated bug. Options:
+Masking removes more ordinary roots, which makes this easier to reach. One
+attempt to reproduce it on HEAD did not diverge (`/tmp/tconst.lua`).
 
-- **(a) Weak trace-pool references.** Trace consts stop being `.gc` roots for
-  runtime-created heap values. A sweep that frees a pooled object retires
-  every trace naming it (cache eviction plus native slot disarm, through the
-  existing retire path) before its memory is reused. Deterministic: the sweep
-  set no longer depends on the JIT. Retiring is behaviour, not output.
-  Cost: a pooled-object → traces index, and a retire on sweep.
-- **(b) Fold only already-pinned values.** The recorder folds a heap value
-  into the pool only if it is otherwise permanently rooted (proto constants,
-  pinned loaded-chunk constants, interned metamethod names). Anything else
-  takes the runtime path: `tostring` called on trace, the pattern guarded by
-  content rather than pool id. Simple, but it loses folding for those cases.
-- **(c) Root pooled values in every tier.** Not implementable: tier-0 never
-  records a trace.
+Proto constants are not automatically permanent either. A host can release a
+retained chunk (`interp.zig:2423`). What counts is an actual pin.
 
-Recommendation for review: (a). It keeps folding, and it matches the general
-principle that the JIT must not change the heap's liveness. Bart decides.
+- **(a) Weak trace-pool references + invalidate on sweep.**
+  - Pooled runtime heap values stop being `.gc` roots.
+  - A sweep that would free one first invalidates every trace naming it,
+    including the active recorder, dispatch/link references, native slots and
+    the dependency index. Native code bakes these pointers
+    (`nativegen_emit.zig:1975`), so this must finish **before** the memory is
+    freed.
+  - Needs batched invalidation, because per-trace retire rebuilds graph caches
+    (`trace_link.zig:2379`), and a mass-retirement benchmark.
+  - Keeps folding. Costs the most machinery.
+- **(b) Pool only pinned values.**
+  - **Every** heap-constant insertion into a trace pool requires the value's
+    pin bit: folding, pattern pins, `konst` of heap values, and any other
+    insertion site.
+  - Unpinned values take the runtime path: `tostring` on trace, the pattern
+    guarded by content instead of pool id.
+  - Trace-const roots then only ever re-root pinned objects, so they become
+    redundant and stop being tier-dependent.
+  - Simple and sound. Loses folding for unpinned values. The runtime-path cost
+    is measured on `str_*` rows.
 
-## 7. Tests (pinned before the code they cover lands)
+Reviewers split on this: antigravity recommends (b), and codex judged both
+sound with the conditions stated. Bart decides.
 
-- **Frame shapes** (unit, constructed VMs):
-  - innermost frame at a prologue GC;
+## 8. Tests (pinned before the code they cover lands)
+
+- **Phase P.**
+  - P1's program, as a three-mode differential, including a native-pushed
+    variant and a `callValue` variant.
+  - Keyframe capture/restore across a P1 gap.
+  - P2: a native consuming an `all_results` span past the window calls
+    `mh_collect`, then re-enters.
+  - P3: a native `gsub` replacement calls `mh_collect`; a callback rewrites an
+    operand register through an upvalue while a native holds the old value.
+- **Frame shapes** (constructed VMs):
+  - innermost at a prologue GC;
   - caller at a fixed-result call, and at a multret call (stale result tail
     masked);
-  - in-flight frame under a metamethod, `pcall`, an `xpcall` handler, a native
-    called from `call`, and nested re-entry;
-  - an erroring re-entry unwound by `pcall` (flag cleared);
-  - `.S`/native frame reuse (flag initialised false);
+  - in flight under a metamethod, `pcall`, a native from `call`, and
+    same-frame nesting, including a GC **between** two `callValue`s of one
+    `table.sort` and after `require`'s loader returns;
+  - an erroring re-entry unwound by `pcall` (flag restored);
+  - an `xpcall` handler collecting over faulting frames, with the fault at
+    `pc == 0` and at `pc > 0` where `code[pc − 1]` is a call;
+  - `.S` and native frame reuse (fields initialised);
+  - `mh_collect` from a host callback (`callHostNative`, `interp.zig:2208`);
   - a host-entered callee with an argument region;
   - the parked `__call` region;
   - the depth-0 result span;
-  - `words == 0`;
-  - a proto failing the static call-layout check (all live).
-- **Alias spans:**
-  - surplus varargs in a caller window survive a collection while the callee
-    runs;
-  - an open upvalue's slot survives;
-  - an `all_results` argument span past the window survives a re-entrant
-    collection.
-- **Captured-before-definition:** a captured slot holding a stale temp before
-  its definition, compared across tiers.
-- **Behaviour:** an object whose only reference is a dead register is freed at
-  the next collection (`gc_stress`), and the slot reads nil afterwards. Objects
-  in a live register, an alias span and an in-flight operand survive.
-- **Determinism (differential, all three modes, also under `gc_stress`):**
-  - `/tmp/gcphi_new.lua` as a doc test;
-  - a heap value in a `while` temporary;
+  - a non-`maskable` proto (all live, and its traces keep every φ).
+- **Alias spans.** Surplus varargs survive a collection while the callee runs;
+  an open upvalue's slot survives.
+- **Behaviour.**
+  - An object whose only reference is a dead register is freed at the next
+    collection (`gc_stress`), and the slot reads nil afterwards.
+  - Objects in live registers, alias spans, transient roots and in-flight
+    operands survive.
+- **Determinism** (three modes, also under `gc_stress`):
+  - `/tmp/gcphi_new.lua`;
+  - a `while` temporary;
   - a generic-for body;
   - a slot holding a table before the loop and a number inside it;
-  - a collection from a metamethod;
-  - a collection from `mh_collect` inside a host callback;
+  - collections from a metamethod and from `mh_collect`;
   - collect → snapshot → restore → linked execution.
-  coral-marten's hostcall differential tests, which dump every register under
-  GC stress in off/record/replay, cover the host-entry layouts.
+  coral-marten's hostcall differential tests (every register dumped, under GC
+  stress, off/record/replay) cover the host-entry layouts.
 - **Use-after-free net.** Under `gc_stress` in debug, the sweep records freed
-  addresses in a set. After each collection, a walk checks that no slot below
-  `stack_top` holds one of them. It never dereferences a freed header.
+  addresses in a set. After each collection a walk checks that no register
+  slot holds one, without dereferencing a freed header.
 - **Mutations** (each must fail a test):
-  - mask with the stale `frame.pc`;
-  - drop `∩ [0, a)` at a call;
-  - drop the varargs alias;
-  - drop the open-upvalue alias;
-  - skip the scrub;
-  - never set `in_flight`;
-  - never clear it on a `pcall` unwind;
-  - use `live_in[p]` ∪ `live_in[p − 1]` for in-flight frames.
+  - stale `frame.pc` for the innermost frame;
+  - no `∩ [0, a)`;
+  - no varargs alias;
+  - no open-upvalue alias;
+  - no scrub;
+  - `in_flight` never set;
+  - unconditional clear instead of restore;
+  - `in_flight` not initialised by the native push;
+  - not initialised by the `.S`;
+  - faulting frames all-live (the determinism test must catch it);
+  - faulting frames classified as call-suspended;
+  - `maskable` ignored by the φ filter;
+  - P2's `stack_top` raise dropped;
+  - P3's transient push dropped.
 
-## 8. Observable changes
+## 9. Observable changes
 
-- **Collection timing changes.** Fewer dead objects survive, so collections
-  happen at different allocation counts than HEAD. That shifts
-  `next_obj_id`, printed table ids, and string-keyed `pairs` order after a
-  re-intern, identically in all tiers.
-- **hashgate.** Each affected program is first checked to agree across all
-  three modes on both builds. Only then are its references regenerated, in
-  Phase 1. `hashgate.py --generate --filter` rewrites the whole refs file, so
-  generate into a scratch `--refs` and merge rows by hand.
-- **Memory.** `mh_mem_stats` live bytes drop (host-visible, not
-  program-visible).
+- **Collection timing.** Collections move: fewer dead objects survive. That
+  shifts `next_obj_id`, printed ids and post-re-intern `pairs` order,
+  identically in all tiers.
+- **hashgate.** Each affected program is first confirmed to agree across all
+  three modes on both builds. Then its references are regenerated, into a
+  scratch `--refs` and merged by hand, because `--generate --filter` rewrites
+  the whole file.
+- **Memory.** `mh_mem_stats` live bytes drop, minus the fixed 8 KiB bitset and
+  the transient-root stack per VM.
 
-## 9. Open questions for review
+## 10. Open questions
 
-- **Q1** — trace-constant roots (§6): (a) weak pool + retire on sweep,
-  (b) fold only pinned values, or something else.
-- **Q2** — the time-travel visualiser shows register contents. After this
-  change, a dead local reads nil after a collection (identically in every
-  tier), where today it shows its last value. Accept that, or have the viewer
-  label dead slots? (Bart.)
-- **Q3** — completeness: reviewers, please try to find a slot holding a live
-  value that no frame row, alias span or gap covers. Also check whether any
-  `in_flight` set/clear site is missing.
+- **Q1.** Trace constants (§7): (a) or (b). Bart.
+- **Q2.** The visualiser shows dead locals as nil after a collection. Accept,
+  or label dead slots? Antigravity: accept. Bart.
+- **Q3.** Completeness, for reviewers:
+  - a live value outside every frame mask, alias span, gap and transient root;
+  - a stale value inside a mask;
+  - a missing `in_flight` site;
+  - a frame that lands in no §4 shape.
 
 ## Revision history
 
-- **Rev 1** (`93da3a3`). It modelled a callee window as overlapping the
-  caller's call slots, with innermost ownership.
-- **Rev 2** (this; codex tradeoff review against an alternative draft):
-  - **Disjoint windows.** Lua callee windows are disjoint (`interp.zig:6382`),
-    so the overlap model is gone. Under it, rev 1 would have scrubbed a
-    callee's live surplus varargs.
-  - **Alias spans added:** varargs, open-upvalue slots and dynamic argument
-    spans.
-  - **In-flight marker decided:** a `CallFrame.in_flight` flag, taken from
-    the alternative draft, with its full lifecycle.
-  - **Call-layout check replaced.** Rev 1's liveness-bit assertion becomes a
-    static call-layout check.
-  - **Trace-const hazard raised** as Q1.
-  - **Tests broadened** (the alternative draft's variants plus codex's), with
-    a use-after-free net that never dereferences freed memory.
-  - **Boundary benchmark specified.**
-  - **Reference-output regeneration procedure stated.**
+- **Rev 1** (`93da3a3`). Overlapping call windows with innermost ownership.
+- **Rev 2** (`2235f3d`). Disjoint windows, alias spans (varargs, open
+  upvalues, `dyn_hi`), a set/clear `in_flight` flag, a static layout check,
+  and the trace-const hazard raised.
+- **Rev 3** (this). Folds the rev 2 reviews (codex REVISE, antigravity REVISE):
+  - **Stale-value theorem** (§2, path lemma). Rooting must be tier-identical,
+    not just conservative.
+  - **`Proto.maskable` shared by collector and φ filter**, so every all-live
+    fallback coincides with a no-dropped-φ proto. It also gates the existing
+    watermark.
+  - **Faulting frames** get their own shape with an empty mask, instead of
+    being misclassified as gaps or calls (`p == 0` underflow fixed).
+  - **`in_flight` uses save/restore**, held for a native's whole duration.
+  - **`dyn_hi` withdrawn.** It is replaced by P2's `stack_top` raise.
+  - **Pre-existing rooting bugs separated out as Phase P:**
+    - P1 vararg clobber, confirmed in every tier;
+    - P2 dynamic spans above `stack_top`;
+    - P3 native-held transients.
+  - **Layout check redefined** for multret and captured slots.
+  - **Alias membership** becomes a linear bitset.
+  - **Q1 options specified** with their full lifetime/cost conditions.
+  - **Keyframe interaction stated.**
+  - **Tests and mutations broadened** per both reviews.
 
 ## References
 
-- Codex review of the Phase 2 filter (GC counterexample): thread
+- Codex: Phase 2 filter review (GC counterexample),
   01a10917-bc12-70f1-a55e-d09ea59b082c.
-- Codex tradeoff review, rev 1 vs the alternative draft: thread
-  01a1094b-d759-7ab2-b076-f51a6be6f10c.
+- Codex: rev 1 tradeoff, 01a1094b-d759-7ab2-b076-f51a6be6f10c.
+- Codex: rev 2 review, 01a1095f-23da-71a1-8b68-36b2e40d2012.
+- Antigravity: rev 2 review (REVISE), 2026-10-05.
 - Doc 21 (canonical snapshot liveness; Phase B deferred).
 - Doc 24 D3/D8 (full-write-set flush).
-- Doc 03 (root set; "must coordinate with liveness").
+- Doc 03 (root set).
 - Doc 56 §4.2 (`Proto.reg_live`).
-- LuaJIT: `snap_usedef` (lj_snap.c:208), `gc_traverse_thread` (lj_gc.c).
+- LuaJIT: `snap_usedef` (lj_snap.c:208), `gc_traverse_thread` (lj_gc.c),
+  vararg frame layout (`BC_IFUNCV`).
