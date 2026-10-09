@@ -31,16 +31,18 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
   - five JIT store-elision sites are all gated on `Proto.maskable`: the
     watermark, the dead-φ filter, exit snapshots, composite bridges, and the
     linked numeric-for `a+3` skip.
-- **Blocked on Bart:**
-  - Q1, trace constants (§7): (a) weak pool plus invalidate, or (b) pool only
-    pinned values (antigravity recommends (b));
-  - Q2, the visualiser shows nil for dead locals.
+- **Bart decided (2026-10-09):**
+  - Q1 = (a): weak trace pools plus invalidate-on-sweep, landing as Phase Q
+    before Phase 1 with its own design section and review;
+  - Q2 = label dead slots in the visualiser, as Phase V.
 - **Then, in order:**
   - Phase P: P1 vararg clobber (confirmed), P2 dynamic arg spans, P3
     transient roots, P4 release keyframe guard;
   - Phase 0;
+  - Phase Q;
   - Phase 1;
-  - Phase 2: land the uncommitted dead-φ filter and retire the watermark.
+  - Phase 2: land the uncommitted dead-φ filter and retire the watermark;
+  - Phase V.
 
   Each touches interp.zig/capi.zig/CallFrame, so coordinate with
   coral-marten: `.S` offsets for `CF_IN_FLIGHT`, and the `guestFault`

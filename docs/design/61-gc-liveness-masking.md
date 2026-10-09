@@ -1,7 +1,7 @@
 # mahina — GC liveness masking — Design
 
-Status: rev 7, approved by codex + antigravity; not yet implemented
-(awaiting Bart's Q1/Q2 decisions)
+Status: rev 7, approved by codex + antigravity; Q1 = (a), Q2 = label dead
+slots (Bart, 2026-10-09); not yet implemented
 Owner: Bart + agents (amber-badger)
 Last updated: 2026-10-05
 
@@ -29,9 +29,21 @@ as they land; move bullets to Done once everything inside them is checked.
 
 ### Outstanding
 
-- [ ] **Q1 — trace-constant roots (§7).** Bart picks (a) or (b) before
-      Phase 1.
-- [ ] **Q2 — visualiser display of scrubbed dead locals** (§10). Bart.
+- [x] **Q1 decided (Bart, 2026-10-09): (a) weak trace pools plus
+      invalidate-on-sweep** (§7).
+- [x] **Q2 decided (Bart, 2026-10-09): label dead slots** in the visualiser
+      (§10).
+- [ ] **Phase Q — Q1(a) lands before Phase 1** (codex rev 2: land Q1 before
+      masking). It needs its own design section and review covering:
+  - the weak pool;
+  - the sweep-time invalidation set (recorder, dispatch/link references,
+    native slots, dependency index), finished before the memory is freed;
+  - batched retirement;
+  - a mass-retirement benchmark.
+- [ ] **Phase V — visualiser labels dead slots.** Its liveness source must be
+      tier-identical data. Options are an exported per-frame live mask in the
+      snapshot, or `reg_live` re-derived from the proto and the frame
+      shape (§4).
 - [ ] **Phase P — pre-existing rooting bugs (§3), each its own change, before
       Phase 1.**
   - [ ] **P1:** surplus varargs past the caller window are clobbered by the
@@ -759,7 +771,11 @@ retained chunk (`interp.zig:2423`). What counts is an actual pin.
     is measured on `str_*` rows.
 
 Antigravity recommends (b) in both rev 2 and rev 3 reviews. Codex judged both
-sound under the conditions stated. Bart decides.
+sound under the conditions stated.
+
+**Decision (Bart, 2026-10-09): (a).** It lands as Phase Q, before Phase 1,
+with its own design section and review. (a)'s conditions above are its
+acceptance criteria.
 
 ## 8. Tests (pinned before the code they cover lands)
 
@@ -913,9 +929,9 @@ sound under the conditions stated. Bart decides.
 
 ## 10. Open questions
 
-- **Q1.** Trace constants (§7): (a) or (b). Bart.
-- **Q2.** The visualiser shows dead locals as nil after a collection. Accept,
-  or label dead slots? Antigravity: accept. Bart.
+- **Q1.** Trace constants (§7). **Decided: (a)** (Bart, 2026-10-09).
+- **Q2.** The visualiser shows dead locals as nil after a collection.
+  **Decided: label dead slots** (Bart, 2026-10-09), as Phase V.
 - **Q3.** Completeness, for reviewers:
   - a live value outside every frame mask, alias span, gap and transient root;
   - a stale value inside a mask;
