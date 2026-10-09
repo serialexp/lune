@@ -580,10 +580,89 @@ test "A-iii: recursive live frames re-key deterministically across keyframe rest
     try testing.expectEqual(@as(u64, @intCast(old_depth + 1)), restored.next_call_seq);
 }
 
+/// Two single-register closures sharing one proto, restored with the given
+/// second-frame base over `stack`.
+fn expectTwoFrameWindowError(second_base: u32, stack: []const schema.SnapValue) !void {
+    const code = [_]bytecode.Instr{bytecode.Instr.opAB(.halt, 0, 0)};
+    const consts = [_]value.Value{};
+    const rootp = Proto{
+        .code = &code,
+        .constants = &consts,
+        .num_registers = 1,
+        .name = "f",
+    };
+    const bad: schema.SnapshotFile = .{
+        .version = snapshot_format_version,
+        .keyframe = .{
+            .globals_id = 9,
+            .string_metatable_id = 0,
+            .next_obj_id = 10,
+            .objects = &.{
+                .{ .id = 9, .obj_type = 1, .body = .{ .HeapTable = .{ .array = &.{}, .entries = &.{}, .metatable_id = 0 } } },
+                .{ .id = 0, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = rootp.id, .upvalue_ids = &.{} } } },
+                .{ .id = 1, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = rootp.id, .upvalue_ids = &.{} } } },
+            },
+            .stack = stack,
+            .frames = &.{
+                .{ .closure_id = 0, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 },
+                .{ .closure_id = 1, .pc = 0, .base = second_base, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 },
+            },
+            .open_upvalues = &.{},
+            .loaded_chunks = &.{},
+        },
+    };
+    try expectRestoreError(bad, &rootp, error.FrameWindowMismatch);
+}
+
+test "doc 61 P1: an overlapping frame window is rejected (FrameWindowMismatch)" {
+    // The second window starts inside the first: resume would read the wrong
+    // registers. (A gap is legal since doc 61 P1: a callee whose dynamic
+    // argument span ran past its caller's window sits above that span.)
+    try expectTwoFrameWindowError(0, &.{ sNil(), sNil(), sNil() });
+}
+
+test "doc 61 P1: a frame window past the captured stack is rejected (FrameWindowMismatch)" {
+    try expectTwoFrameWindowError(3, &.{ sNil(), sNil(), sNil() });
+}
+
+test "doc 61 P1: a callee laid above a dynamic argument span round-trips through a keyframe" {
+    // 30 arguments from a multret producer run past the main chunk's window,
+    // so the vararg callee's window sits above them, with a gap holding the
+    // span. Suspend inside the callee, restore, resume: same output.
+    const gpa = testing.allocator;
+    const source =
+        \\local function g(...)
+        \\  local n = 0
+        \\  while n < 20 do n = n + 1 end
+        \\  local s = 0
+        \\  for i = 1, select('#', ...) do s = s + select(i, ...) end
+        \\  return n, s
+        \\end
+        \\local t = {}
+        \\for i = 1, 30 do t[i] = i end
+        \\print(g(table.unpack(t)))
+    ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+
+    const mid = try expectResume(gpa, source, .{
+        .min_depth = 2,
+        .after_safepoints = 1,
+    }, ref);
+    defer gpa.free(mid);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const decoded = try schema.SnapshotFile.decode(arena.allocator(), mid);
+    const frames = decoded.keyframe.frames;
+    try testing.expect(frames.len >= 2);
+    const live = frames[frames.len - 1];
+    try testing.expectEqual(@as(u32, 30), live.varargs_count);
+    try testing.expectEqual(live.varargs_base + live.varargs_count, live.base);
+}
+
 test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMismatch)" {
-    // Two single-register closures sharing a proto. A faithful capture tiles the
-    // windows 0,1; a base of 2 for the second frame leaves a one-slot gap → the
-    // restore contiguity guard must reject it rather than read the wrong registers.
+    // Two single-register closures sharing a proto, the first not at base 0.
     const code = [_]bytecode.Instr{bytecode.Instr.opAB(.halt, 0, 0)};
     const consts = [_]value.Value{};
     const rootp = Proto{
@@ -605,8 +684,8 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
             },
             .stack = &.{ sNil(), sNil(), sNil() },
             .frames = &.{
-                .{ .closure_id = 0, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 },
-                .{ .closure_id = 1, .pc = 0, .base = 2, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 }, // gap: expected base 1
+                .{ .closure_id = 0, .pc = 0, .base = 1, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 }, // must be 0
+                .{ .closure_id = 1, .pc = 0, .base = 2, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 },
             },
             .open_upvalues = &.{},
             .loaded_chunks = &.{},

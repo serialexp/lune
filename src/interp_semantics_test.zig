@@ -1698,3 +1698,274 @@ test "strings: comparing a string with a number is a catchable type error" {
         "false\tanonymous:1: attempt to compare string with number\n",
     );
 }
+
+test "doc 61 P1: surplus varargs past the caller window survive the callee's locals" {
+    // 40 arguments from a multret producer run far past the main chunk's
+    // window. The callee used to be laid at the window end, over the surplus
+    // varargs, so its locals clobbered what `select` then read.
+    try expectProgram(
+        \\local function g(...)
+        \\  local a, b, c, d, e, f, h, i, j, k = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+        \\  local n = select('#', ...)
+        \\  local s = 0
+        \\  for x = 1, n do s = s + select(x, ...) end
+        \\  return n, s, a + b + c + d + e + f + h + i + j + k
+        \\end
+        \\local t = {}
+        \\for i = 1, 40 do t[i] = i end
+        \\print(g(table.unpack(t)))
+        \\
+    ,
+        "40\t820\t55\n",
+    );
+}
+
+test "doc 61 P1: fixed params from a dynamic span past the caller window copy without overlap" {
+    // A small caller window and a twelve-parameter callee: the argument span
+    // ends past the window, so copying the params up to the window end
+    // overwrote later params before they were read (a silently wrong sum).
+    // The call site is hot, so the recorder's refusal of this shape is
+    // exercised in the traced legs too.
+    try expectProgram(
+        \\local function h(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12)
+        \\  return p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9 + p10 + p11 + p12
+        \\end
+        \\local function call(t) return h(table.unpack(t)) end
+        \\local t = {}
+        \\for i = 1, 12 do t[i] = i * 100 + i end
+        \\local s = 0
+        \\for k = 1, 50 do s = s + call(t) end
+        \\print(s)
+        \\
+    ,
+        "393900\n",
+    );
+}
+
+test "doc 61 P2: a native's dynamic argument span past the window stays rooted across a re-entry" {
+    // `print` gets six fresh objects whose only references are its arguments;
+    // arguments 3..6 sit past `run`'s window, above `stack_top`. Each
+    // `__tostring` allocates (the stress legs collect on it). Before P2 the
+    // tail was neither rooted nor safe from the re-entry's window: a collection
+    // swept it and `print` read freed objects (a panic, or wrong output).
+    try expectProgram(
+        \\local mt = {__tostring = function(t)
+        \\  local g = {}
+        \\  for i = 1, 300 do g[i] = {i} end
+        \\  return "T" .. t.n
+        \\end}
+        \\local function fresh()
+        \\  local r = {}
+        \\  for i = 1, 6 do r[i] = setmetatable({n = i}, mt) end
+        \\  return r
+        \\end
+        \\local function run() print(table.unpack(fresh())) end
+        \\for k = 1, 3 do run() end
+        \\
+    ,
+        "T1\tT2\tT3\tT4\tT5\tT6\n" ++
+            "T1\tT2\tT3\tT4\tT5\tT6\n" ++
+            "T1\tT2\tT3\tT4\tT5\tT6\n",
+    );
+}
+
+test "doc 61 P2: a __call handler's dynamic argument span past the window stays rooted" {
+    try expectProgram(
+        \\local mt = {__tostring = function(t)
+        \\  local g = {}
+        \\  for i = 1, 300 do g[i] = {i} end
+        \\  return "T" .. t.n
+        \\end}
+        \\local callable = setmetatable({}, {__call = function(self, ...)
+        \\  local g = {}
+        \\  for i = 1, 300 do g[i] = {i} end
+        \\  print(...)
+        \\end})
+        \\local function fresh()
+        \\  local r = {}
+        \\  for i = 1, 6 do r[i] = setmetatable({n = i}, mt) end
+        \\  return r
+        \\end
+        \\local function run() callable(table.unpack(fresh())) end
+        \\for k = 1, 2 do run() end
+        \\
+    ,
+        "T1\tT2\tT3\tT4\tT5\tT6\n" ++
+            "T1\tT2\tT3\tT4\tT5\tT6\n",
+    );
+}
+
+test "doc 61 P2: an error inside a native with a raised span unwinds to the protected boundary" {
+    // The span stays raised while the error propagates; `pcall` discards the
+    // frames and resets `stack_top`. Later calls and collections must see a
+    // normal stack.
+    try expectProgram(
+        \\local mt = {__tostring = function(t)
+        \\  if t.n == 2 then error("bad " .. t.n) end
+        \\  return "T" .. t.n
+        \\end}
+        \\local function fresh()
+        \\  local r = {}
+        \\  for i = 1, 6 do r[i] = setmetatable({n = i}, mt) end
+        \\  return r
+        \\end
+        \\local function run() print(table.unpack(fresh())) end
+        \\for k = 1, 3 do
+        \\  local ok, e = pcall(run)
+        \\  local g = {}
+        \\  for i = 1, 300 do g[i] = {i} end
+        \\  print(ok, e)
+        \\end
+        \\
+    ,
+        // `print` streams: "T1\t" is out before argument 2's `__tostring` raises.
+        "T1\tfalse\tanonymous:2: bad 2\n" ++
+            "T1\tfalse\tanonymous:2: bad 2\n" ++
+            "T1\tfalse\tanonymous:2: bad 2\n",
+    );
+}
+
+test "doc 61 P3: a native __index handler on the fused a[i][j] path keeps its intermediate rooted" {
+    // `outer[1]` yields a fresh table held only in a Zig local by the fused
+    // get; its `__index` is `table.sort`, which keeps that table across every
+    // comparator call. The comparator allocates (the stress legs collect), and
+    // before P3 the table was swept mid-sort (a panic, or "compare nil with nil").
+    try expectProgram(
+        \\local outer = setmetatable({}, {__index = function()
+        \\  return setmetatable({5, 3, 4, 1, 2}, {__index = table.sort})
+        \\end})
+        \\local calls = 0
+        \\local cmp = function(a, b)
+        \\  local g = {}
+        \\  for i = 1, 300 do g[i] = {i} end
+        \\  calls = calls + 1
+        \\  return a < b
+        \\end
+        \\local _ = outer[1][cmp]
+        \\print(calls > 0)
+        \\
+    ,
+        "true\n",
+    );
+}
+
+test "doc 61 P3: a native __newindex handler on the fused a[i][j] = v path keeps its intermediate rooted" {
+    try expectProgram(
+        \\local outer = setmetatable({}, {__index = function()
+        \\  return setmetatable({5, 3, 4, 1, 2}, {__newindex = table.sort})
+        \\end})
+        \\local calls = 0
+        \\local cmp = function(a, b)
+        \\  local g = {}
+        \\  for i = 1, 300 do g[i] = {i} end
+        \\  calls = calls + 1
+        \\  return a < b
+        \\end
+        \\outer[1][cmp] = 0
+        \\print(calls > 0)
+        \\
+    ,
+        "true\n",
+    );
+}
+
+test "doc 61 P3: an error inside a parked native call unwinds to the protected boundary" {
+    try expectProgram(
+        \\local outer = setmetatable({}, {__index = function()
+        \\  return setmetatable({5, 3, 4, 1, 2}, {__index = table.sort})
+        \\end})
+        \\local cmp = function(a, b)
+        \\  local g = {}
+        \\  for i = 1, 300 do g[i] = {i} end
+        \\  error("stop")
+        \\end
+        \\for k = 1, 3 do
+        \\  local ok, e = pcall(function() return outer[1][cmp] end)
+        \\  local g = {}
+        \\  for i = 1, 300 do g[i] = {i} end
+        \\  print(ok, e)
+        \\end
+        \\
+    ,
+        "false\tanonymous:7: stop\n" ++
+            "false\tanonymous:7: stop\n" ++
+            "false\tanonymous:7: stop\n",
+    );
+}
+
+/// A host `__index` that removes the only reference to itself (its table's
+/// metatable) and collects mid-call. Its binding's destroy hook records
+/// whether the Native was swept while it was still running.
+const SelfDrop = struct {
+    var destroyed: bool = false;
+    var destroyed_mid_call: bool = false;
+
+    fn call(_: ?*anyopaque, vmp: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+        const vm: *interp.Vm = @ptrCast(@alignCast(vmp));
+        table.Table.fromHeader(args[0].asHeap()).metatable = null;
+        vm.collect();
+        destroyed_mid_call = destroyed;
+        if (out.len == 0) return 0;
+        out[0] = Value.int(7);
+        return 1;
+    }
+
+    fn destroy(_: ?*anyopaque) void {
+        destroyed = true;
+    }
+
+    // Never called: a host Native dispatches through its binding.
+    fn call_stub(_: *anyopaque, _: []const Value) anyerror!Value {
+        return error.TypeError;
+    }
+};
+
+test "doc 61 P3: a native callee reached through a metamethod stays rooted while it runs" {
+    const gpa = testing.allocator;
+    SelfDrop.destroyed = false;
+    SelfDrop.destroyed_mid_call = false;
+    var vm = try interp.Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+
+    const binding = try gpa.create(function.HostBinding);
+    binding.* = .{ .call = &SelfDrop.call, .destroy = &SelfDrop.destroy, .name = try gpa.dupe(u8, "selfdrop") };
+    const native = try vm.heap.newNative(&SelfDrop.call_stub, binding.name);
+    native.host = binding;
+    try vm.globals.set(gpa, try vm.heap.internValue("selfdrop"), Value.heap(&native.header));
+
+    // `make` builds the metatable in its own frame, so no stale register of
+    // the main chunk still holds `selfdrop` when `t.x` runs: the metatable is
+    // its only reference.
+    try util.compileRun(gpa, &vm,
+        \\local function make()
+        \\  local t = setmetatable({}, {__index = selfdrop})
+        \\  selfdrop = nil
+        \\  return t
+        \\end
+        \\local t = make()
+        \\print(t.x)
+    );
+    try testing.expectEqualStrings("7\n", sink.buffered());
+    try testing.expect(!SelfDrop.destroyed_mid_call);
+}
+
+test "doc 61 P1: a hot vararg call with a surplus span past the window" {
+    try expectProgram(
+        \\local function sum(...)
+        \\  local s = 0
+        \\  for i = 1, select('#', ...) do s = s + select(i, ...) end
+        \\  return s
+        \\end
+        \\local t = {}
+        \\for i = 1, 20 do t[i] = i end
+        \\local acc = 0
+        \\for k = 1, 30 do acc = acc + sum(table.unpack(t)) end
+        \\print(acc)
+        \\
+    ,
+        "6300\n",
+    );
+}

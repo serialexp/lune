@@ -3259,6 +3259,21 @@ pub const TraceState = struct {
         return false;
     }
 
+    /// `skipBackEdge`'s skip outcome alone, for the interpreter's loop handlers
+    /// to test inline before calling into the back-edge epilogue. When it
+    /// returns true it has done exactly what `skipBackEdge` does on a skip
+    /// (advance `tick`, decrement the slot); when it returns false it has
+    /// changed nothing, so the epilogue's own `skipBackEdge` still counts this
+    /// back-edge once. Never skips during a recording, like `skipBackEdge`.
+    pub inline fn skipGatedBackEdge(self: *TraceState, proto: *const Proto, pc: u32) bool {
+        if (self.rec.active) return false;
+        const slot = &self.hotcount[hotIndex(proto, pc)];
+        if (slot.* == 0) return false;
+        slot.* -= 1;
+        self.tick +%= 1;
+        return true;
+    }
+
     /// Called after a back-edge took the slow path *without* entering a trace (the
     /// dispatch loop skips this when a trace entry succeeded). If the anchor is
     /// gated, arm its hot-count slot with a `GATE_SKIP` window so the next batch of

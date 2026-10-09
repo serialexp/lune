@@ -46,12 +46,26 @@ as they land; move bullets to Done once everything inside them is checked.
       shape (§4).
 - [ ] **Phase P — pre-existing rooting bugs (§3), each its own change, before
       Phase 1.**
-  - [ ] **P1:** surplus varargs past the caller window are clobbered by the
-        callee window (confirmed in every tier).
-  - [ ] **P2:** dynamic argument spans above `stack_top` during re-entry.
-  - [ ] **P3:** native-held transient values across every re-entry boundary.
-  - [ ] **P4:** keyframe capture rejected, in release builds too, while any
-        frame is in flight (§6.4).
+  - [x] **P1:** surplus varargs past the caller window are clobbered by the
+        callee window (confirmed in every tier). Fixed: the callee window
+        sits above the argument span, the recorder refuses the shape, and
+        keyframe restore accepts ordered windows with a gap (§3).
+  - [x] **P2:** dynamic argument spans above `stack_top` during re-entry.
+        CONFIRMED as a use-after-free reachable from plain Lua: `print`
+        with `__tostring` arguments 3+ past the window panicked in every
+        tier, and gave silently wrong output on older builds. Fixed in the
+        `.call` native and `__call` arms (§3).
+  - [x] **P3:** native-held transient values across every re-entry boundary.
+        CONFIRMED use-after-free from plain Lua (a fused `a[i][j]` with a
+        native `__index`). Fixed by parking a native callee and its arguments
+        in `callValue`. Two capi-side items are still open (§3 P3 table,
+        rows 7–8).
+  - [x] **P4:** keyframe capture rejected, in release builds too, inside any
+        re-entered native activation (`native_reentry_depth != 0`, i.e.
+        under `callValue`). A native called directly from bytecode doesn't
+        count as re-entry, so capture inside one is still accepted. That is
+        mid-instruction too, and closing it is the `in_flight` half, which
+        joins this check in Phase 0 (§6.4; codex Phase P review).
 - [ ] **Phase 0 — frame state made exact.** Behaviour-neutral on its own;
       pinned by the frame-shape tests (§8).
   - [ ] `gcTrampoline` publishes the innermost pc before `collect()`.
@@ -66,6 +80,11 @@ as they land; move bullets to Done once everything inside them is checked.
         separate change (codex rev 4 should-fix).
   - [ ] Audit of the JIT store-elision sites (§2).
   - [ ] `Proto.maskable` is computed at compile time (§5).
+  - [ ] P4's keyframe-capture refusal also covers any frame with `in_flight`
+        set (§6.4), which includes a native called directly from bytecode.
+        Flip `keyframeser_capture_test`'s top-level `capture_probe()` from
+        accepted to refused, unless a legitimate capture-from-native caller
+        turns up (check `main.zig`/`wasm_entry.zig`).
 - [ ] **Phase 1 — the masked `.gc` root walk + scrub (§6).**
   - [ ] Masking driven by the shared `maskable` predicate, with an alias
         bitset and dead slots set to nil before sweep.
@@ -331,10 +350,20 @@ at `max(base + nreg, base + a + 1 + nargs)`. The fixed parameters are still
 copied up, the surplus varargs stay where they are, and `stack_top` covers the
 arguments for the callee's lifetime.
 
-**Scope** (codex rev 3 should-fix): the `.call` opcode path and the native
-inline push. `callValue` (`interp.zig:2105`) and the `.S` entry
-(`hostcall_x64.S:300`) already place surplus arguments below the callee window
-and are unaffected.
+**Scope** (codex rev 3 should-fix): the `.call` opcode path. `callValue`
+(`interp.zig:2105`) and the `.S` entry (`hostcall_x64.S:300`) already place
+surplus arguments below the callee window and are unaffected.
+
+**As implemented:**
+- **The native inline push is unaffected.** It handles only static argument
+  counts and writes `varargs_count = 0`.
+- **The recorder refuses the shape.** When a dynamic span ends past the caller
+  window, it aborts `.frame_bounds` instead of inlining the call: its inline
+  window and the native push both assume `base + nreg`. Tier-0 runs that call.
+- **A second symptom surfaced: a silently wrong result.** The same bug hit a
+  non-vararg callee. With the span past the window, copying fixed params up
+  to the window end overlapped the later params: a twelve-parameter sum came
+  out 121200 instead of 393900. `@max(window end, span end)` fixes both.
 
 **Keyframe restore** already records each frame's `base`. Its contiguity check
 (`keyframeser.zig:811`) becomes "windows ordered, non-overlapping and in
@@ -346,8 +375,32 @@ A native callee consuming `all_results` arguments past the window has them
 above `stack_top`. A re-entry lays its window at `stack_top` over them, and an
 `mh_collect` does not scan them.
 
+**Confirmed (2026-10-09).** Here is the program:
+
+```lua
+local mt = {__tostring = function(t)
+  local g = {} for i = 1, 3000 do g[i] = {i} end
+  return "T" .. t.n
+end}
+local function fresh()
+  local r = {}
+  for i = 1, 6 do r[i] = setmetatable({n = i}, mt) end
+  return r
+end
+local function run() print(table.unpack(fresh())) end
+```
+
+It panicked ("invalid enum value" in `writeValue`) in every tier, and
+printed `table: 0x…` for arguments 4–6 on older builds. The span is worse
+than unrooted, because natives read their arguments from `boundary_scratch`,
+which is indexed by absolute slot and is not a GC root. A re-entry laid at
+`stack_top` gathers its own natives' arguments into the same absolute
+indices.
+
 **Fix:** a call consuming `all_results` raises `stack_top` to cover its
-argument span. The span then sits in a gap (§6.1) and is rooted. Rev 2's
+argument span. As implemented, this is in the native and `__call` arms of
+`.call`. It also restores the invariant behind the scratch's "a deeper call
+parks its args at higher absolute indices". The span then sits in a gap (§6.1) and is rooted. Rev 2's
 `dyn_hi` alias is withdrawn: it covered only slots below `stack_top`.
 
 **Who restores `stack_top`** (codex rev 3 blocker 4). This is deliberately not
@@ -406,6 +459,42 @@ and `src/capi.zig`. For each, list what it holds across the boundary:
 
 Then root each one, or show it is already reachable from a rooted register. The
 audit's table goes in the P3 change.
+
+**As implemented (2026-10-09).** The audit found a simpler mechanism than a
+separate transient stack. `callValue`'s `.native` arm parks the callee and the
+argument slice into registers at `stack_top`, the shape of a Lua call's
+function slot plus arguments. It raises `stack_top` over them for the call
+and restores it on success. Parking the callee came from the codex Phase P
+review: a metamethod native whose callback drops the last reference to it and
+collects was freed while it ran, along with a host fn's ctx. Registers below `stack_top` are already a `.gc` root.
+The error path needs no pop, because it inherits the P2 discipline: every
+catcher resets `stack_top` to its entry value. Overflow is
+`error.StackOverflow`, never an unrooted value. The native still receives the
+caller's slice (the parked copy only exists to root it), so aliasing and the
+host contract are unchanged. A native that re-enters lays its windows at or
+above the raised `stack_top`, so it cannot overwrite the parked copy.
+
+CONFIRMED use-after-free from plain Lua: a fused `a[i][j]` get whose middle
+table has `__index = table.sort` gets `mid` passed as the native's first
+argument from a Zig local. The sort comparator collects, `mid` is swept, and
+`table.sort` writes into freed memory. The fused `__newindex` set is the same.
+Tests: "doc 61 P3" in `interp_semantics_test.zig` (get, set and error path,
+across all 10 legs; plus the host self-drop test).
+
+| # | Site | Held across the boundary | Disposition |
+|---|------|--------------------------|-------------|
+| 1 | fused `get_index2` (interp.zig) | `mid`, a Zig local, passed to a native `__index` | **UAF, confirmed.** Fixed by parking in `callValue` |
+| 1b | fused `set_index2` | `mid` and the value, passed to a native `__newindex` | **UAF, confirmed.** Fixed by parking |
+| 2 | `__index`/`__newindex` chain walk | `cur`, the current table in the chain | Latent. Fixed by parking: every native hop goes through `callValue` |
+| 3 | `gsub` with a native replacement | capture strings in a Zig array | Latent. Fixed by parking |
+| 4 | `xpcall` with a native handler | `errval` | Latent. Fixed by parking |
+| 5 | `require` | `loader_data` passed to a native loader | Latent. Fixed by parking |
+| 6 | the executing native itself; capi `cHostCall` reads `h.box` after the callback | the callee Native and its host ctx | **UAF, confirmed** (host test). Fixed by parking the callee in `callValue`. The bytecode arm already keeps it in `R[a]`, a fresh temp the compiler never aliases to a local, so no upvalue can clear it |
+| 7 | dispatch `__call` arm; `pcall`/`xpcall` from bytecode | host `args` and `out` alias each other in `boundary_scratch` | **Open.** Breaks the host no-alias contract. capi area, see TODO.md |
+| 8 | dispatch native arm, host branch | results already written to `boundary_scratch[out_lo..]` | **Open.** A nested `mh_call` can overwrite them when the range reaches past `stack_top`. capi area, see TODO.md |
+
+The other `callValue`/`callMeta` callers keep everything they hold in a
+register below `stack_top`, or in a table reachable from one.
 
 ## 4. Frame shapes and their masks
 
@@ -655,8 +744,8 @@ At collection start, a Vm-owned bitset over `[0, stack_top)` is cleared and
 filled with:
 - each frame's varargs span;
 - each open upvalue's stack slot;
-- `transient_roots` (P3) need no bits: they are `.gc` roots in their own
-  right.
+- P3's parked native callees and arguments need no bits. They sit at or above
+  the innermost window's end, in a gap the walk roots whole (§6.2).
 
 Its size is the stack slab: 65,536 bits = 8 KiB, allocated at VM init. Filling
 it is O(Σ spans + open upvalues), with no sorting. That fixes the
@@ -673,7 +762,8 @@ for each frame f in frames[0..depth]:
 root every slot in [0, stack_top) outside all windows   // gaps
 ```
 
-Gaps include host argument regions, the parked `__call` region, P1's raised
+Gaps include host argument regions, the parked `__call` region, P3's parked
+native callees and arguments, P1's raised
 argument tails, P2's spans, returned spans before their copy, and the depth-0
 B-6 result span. Only the `.gc` kind is masked. The `.snapshot` walk keeps doc
 21 Phase A's seeding.
@@ -686,8 +776,8 @@ Per collection the walk costs:
 - one liveness row per frame;
 - one or two bit tests per window slot.
 
-That is linear, with no allocation. The new memory is the 8 KiB bitset plus
-the bounded `transient_roots` stack, both fixed at init.
+That is linear, with no allocation. The new memory is the 8 KiB bitset,
+fixed at init. P3's parking uses the register stack itself.
 
 **Boundary benchmark**, run deliberately with no timing assertion in a test:
 - a full 65,536-slot stack;
@@ -791,8 +881,11 @@ acceptance criteria.
   - P3: a native `gsub` replacement calls `mh_collect`; a callback rewrites an
     operand register through an upvalue while a native holds the old value;
     a `__index`/`__newindex`/`__eq` metamethod collects while the interpreter
-    holds its key and receiver; `transient_roots` is balanced after an error
-    unwinds through each audited site.
+    holds its key and receiver; `stack_top` is back at the boundary after an
+    error unwinds through a parked call. As implemented: the fused
+    `a[i][j]` get and set with a native `__index`/`__newindex`, their error
+    path, and a host `__index` that drops the last reference to itself and
+    collects mid-call.
   - P4: `encodeSnapshot` from inside a host callback (frame in flight) returns
     the error in a **ReleaseFast** test build too.
 - **Frame shapes** (constructed VMs):
@@ -911,8 +1004,10 @@ acceptance criteria.
   - P2's `stack_top` raise dropped;
   - P2's raise restored by `defer` (the failure-path test sees the span
     unrooted while frames are still live);
-  - P3's transient push dropped;
-  - P3's pop skipped on the error path;
+  - P3's parking dropped. Run: without the args park the fused repros panic
+    (a pre-P3 build); without the callee park the self-drop test fails;
+  - P3's restore moved into a `defer` (the error-path test then sees the
+    parked region unrooted while frames are still live);
   - P4's check compiled only in debug.
 
 ## 9. Observable changes
@@ -924,8 +1019,8 @@ acceptance criteria.
   three modes on both builds. Then its references are regenerated, into a
   scratch `--refs` and merged by hand, because `--generate --filter` rewrites
   the whole file.
-- **Memory.** `mh_mem_stats` live bytes drop, minus the fixed 8 KiB bitset and
-  the transient-root stack per VM.
+- **Memory.** `mh_mem_stats` live bytes drop, minus the fixed 8 KiB bitset
+  per VM.
 
 ## 10. Open questions
 

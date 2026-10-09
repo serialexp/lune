@@ -4162,6 +4162,11 @@ pub const RecordingSession = struct {
         const callee_base_off: u32 = self.base_off + proto.num_registers;
         if (@as(usize, callee_base_off) + cp.num_registers > self.reg_map.len)
             return self.abort(.frame_bounds);
+        // Doc 61 P1: a dynamic argument span past the caller window makes
+        // tier-0 lay the callee above the span instead, and the native inline
+        // push hard-codes `base + nreg`. Leave that rare shape to tier-0.
+        if (@as(u32, instr.a) + 1 + nargs > proto.num_registers)
+            return self.abort(.frame_bounds);
 
         // (1) guard_func: pin the runtime callee to this proto's stable id. `aux`
         // carries `Proto.id` (a `u32`, NOT a pointer — pointers change across a

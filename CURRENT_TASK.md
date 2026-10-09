@@ -11,10 +11,15 @@ IN PROGRESS (2026-10-05, amber-badger) — general codegen quality, first lever:
 dead φ writebacks. Native loops store every defined slot to regs[] each
 iteration (pi_leibniz: 8 tag + 8 value stores per iteration, dead temps
 included; it runs at 99.5% native and is still 8.9× LuaJIT).
-- **Uncommitted, NOT landable as-is:** `phiLiveRow`/`phiWritebackKept`
-  (trace_recorder, trace_finalize(+test), interp_trace_test). It drops a φ
-  dead at the close's resume pc AND at every numeric-for loop-done pc. Gates
-  green, hashgate 87/87, pi_leibniz −30% instructions.
+- **The dead-φ filter is PARKED OUT OF THE TREE** (2026-10-09), so Phase P
+  can be committed whole-file. `phiLiveRow`/`phiWritebackKept` are in
+  trace_recorder, trace_finalize(+test) and interp_trace_test. Backups of
+  the full files and diffs vs `e7604d0` are in `/tmp/deadphi/` (`*.zig`,
+  `*.diff`). **The `/tmp` copies may not survive.** The diffs are the
+  record; if they're lost, re-derive from the doc 61 §5 description. They
+  get re-applied in Phase 2. The filter drops a φ dead at the close's
+  resume pc AND at every numeric-for loop-done pc. Gates were green,
+  hashgate 87/87, pi_leibniz −30% instructions.
 - **Codex found a determinism hole:** GC roots every register below
   `stack_top`, so a dropped φ that leaves a stale heap ref changes what
   survives collection, and so the printed object ids. Repro
@@ -35,10 +40,23 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
   - Q1 = (a): weak trace pools plus invalidate-on-sweep, landing as Phase Q
     before Phase 1 with its own design section and review;
   - Q2 = label dead slots in the visualiser, as Phase V.
+- **Phase P is implemented (2026-10-09).** All three bugs were confirmed as
+  real from plain Lua:
+  - P1: varargs/params clobbered;
+  - P2: the `print`+`__tostring` use-after-free;
+  - P3: the fused `a[i][j]` with a native `__index` use-after-free, plus the
+    native callee itself unrooted.
+  
+  P3 roots by parking `[callee, args]` at `stack_top` in `callValue`, not
+  with a transient stack. P4 refuses capture when
+  `native_reentry_depth != 0`. Codex reviewed it
+  (`docs/reviews/doc61/codex-phaseP.md`); its callee-rooting blocker is
+  fixed. Audit rows 7–8 (host args/out aliasing, the host results scratch)
+  are open in coral-marten's area. Next: gates, hashgate, commit (interp.zig
+  is shared with coral's gated-back-edge hunks, so whoever commits first
+  takes the whole file), push, pt-default board for P1/P2's hot-path cost.
 - **Then, in order:**
-  - Phase P: P1 vararg clobber (confirmed), P2 dynamic arg spans, P3
-    transient roots, P4 release keyframe guard;
-  - Phase 0;
+  - Phase 0 (it also covers P4's `in_flight` half);
   - Phase Q;
   - Phase 1;
   - Phase 2: land the uncommitted dead-φ filter and retire the watermark;

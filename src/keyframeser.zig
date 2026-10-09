@@ -277,6 +277,11 @@ const Walk = struct {
 /// the stack/frames/open-upvalues are empty — but globals and everything it
 /// reaches (tables, closures, upvalues, natives, their strings) are captured.
 pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
+    // Doc 61 P4: capture happens at suspend boundaries only, never inside a
+    // native activation that re-entered the VM. Such a frame is mid-instruction
+    // and Zig code above it holds state no keyframe can carry, so its frames
+    // cannot be resumed. A real error, not an assert: release builds refuse it.
+    if (vm.native_reentry_depth != 0) return error.CaptureInsideNativeActivation;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -805,10 +810,15 @@ pub fn restoreSnapshot(
         const fh = idmap.get(fr.closure_id) orelse return error.UnresolvedHeapRef;
         if (fh.type != .function) return error.FrameNotAClosure;
         const cl = function.Closure.fromHeader(fh);
-        // Frame windows stack contiguously from 0; a base that doesn't match the
-        // running sum of prior frames' register counts is a corrupt/incompatible
-        // snapshot (and would make resume read the wrong registers).
-        if (fr.base != expected_base) return error.FrameWindowMismatch;
+        // Frame windows are ordered, non-overlapping and in bounds, starting
+        // at 0. Usually they are contiguous, but a callee whose dynamic
+        // argument span ran past its caller's window sits above that span
+        // (doc 61 P1), leaving a gap that holds the span. Anything else is a
+        // corrupt/incompatible snapshot (and would make resume read the wrong
+        // registers).
+        if (i == 0 and fr.base != 0) return error.FrameWindowMismatch;
+        if (fr.base < expected_base) return error.FrameWindowMismatch;
+        if (@as(usize, fr.base) + cl.proto.num_registers > kf.stack.len) return error.FrameWindowMismatch;
         if (fr.varargs_count == 0) {
             if (fr.varargs_base != 0) return error.InvalidFrameVarargs;
         } else {
@@ -831,7 +841,7 @@ pub fn restoreSnapshot(
             fr.varargs_count,
         ) catch return error.TooManyFrames;
         vm.frames[i].pc = fr.pc;
-        expected_base += cl.proto.num_registers;
+        expected_base = @as(usize, fr.base) + cl.proto.num_registers;
     }
     // `pushFrameVararg` raises this to each physical window end. The serialized
     // live prefix may additionally contain caller-owned argument/vararg slots

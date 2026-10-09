@@ -243,6 +243,56 @@ test "T-6: multi-million-dispatch chain runs in O(1) stack (real handlers)" {
 // must survive the nested run. Pinned at output + safepoint granularity so
 // a conversion that corrupts the outer ExecState across the nested execWith
 // (doc 42 §4.1 ownership) fails loudly here, not just in program output.
+// A loop the JIT gives up on (here: `pcall`, a host barrier the recorder
+// aborts on) is gated, and its back-edges are skipped by the hot-count slot.
+// In `.fast` mode the loop handlers take that skip themselves
+// (`gatedBackEdgeHandler`) instead of calling the back-edge epilogue. Either
+// way each back-edge must advance `tick` (the gate cooldown clock) exactly
+// once. No loop here ever runs a trace, so every back-edge is interpreted:
+// 3000 iterations each of a numeric for, a while and a generic for are
+// exactly 9000 ticks, and the skip windows prove the loops were gated.
+test "gated back-edges skipped by the loop handlers advance tick exactly once each" {
+    const gpa = testing.allocator;
+    const src: [:0]const u8 =
+        \\local function f(x) return x end
+        \\local s = 0
+        \\local t = {}
+        \\for i = 1, 3000 do
+        \\  local ok, v = pcall(f, i)
+        \\  t[i] = v
+        \\  s = s + v
+        \\end
+        \\local j = 0
+        \\while j < 3000 do
+        \\  local ok, v = pcall(f, j)
+        \\  s = s + v
+        \\  j = j + 1
+        \\end
+        \\for _, x in ipairs(t) do
+        \\  local ok, v = pcall(f, x)
+        \\  s = s + v
+        \\end
+        \\print(s)
+        \\
+    ;
+    const Hook = struct {
+        var tick: u64 = 0;
+        var gated_slots: usize = 0;
+        fn grab(vm: *Vm, mode: testutil.TraceMode) anyerror!void {
+            _ = mode;
+            tick = vm.trace.tick;
+            gated_slots = 0;
+            for (vm.trace.hotcount) |slot| gated_slots += @intFromBool(slot != 0);
+        }
+    };
+    var sink_buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    try testutil.runCapturedTuned(gpa, src, &sink, false, .record_execute_native, .{ .inspect = Hook.grab });
+    try testing.expectEqualStrings("13501500\n", sink.buffered());
+    try testing.expectEqual(@as(u64, 9000), Hook.tick);
+    try testing.expect(Hook.gated_slots != 0);
+}
+
 test "T-5: reentrant callValue via __index preserves outer execution state" {
     const gpa = testing.allocator;
     const src: [:0]const u8 =

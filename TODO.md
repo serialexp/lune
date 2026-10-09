@@ -24,6 +24,45 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       attempts/aborts or hotcount bookkeeping on the uncompilable loop. Check
       with `--jit-stats` / `--dump-aborts` before the option-3 (compiled code
       calls host natives directly) design doc.
+      **Fixed 2026-10-09:** it was neither host calls nor recording retries
+      (6 aborts, then gated). Every back-edge of *any* gated loop reached
+      the hot-count skip through the `noinline` back-edge epilogue and the
+      full `dispatchTail` (~95 instructions). `gatedBackEdgeHandler`
+      (interp.zig) now takes the skip without a call: the callback loop went
+      from 758 to 704 instructions per iteration (JIT off: 664); with the
+      JIT on, `tbl_ops` −3.1%, `euler14-bit` −1.2%, `nsieve-bit-fp` −1.0%;
+      tier-0 is unchanged. The remaining ~40 are the skip's hash (~20) and
+      the slow path every 64th back-edge (~14), which the blacklisting item
+      below would remove.
+
+## Blacklist gated loops by patching their back-edge (noted 2026-10-09)
+
+- [ ] **Design doc first: LuaJIT-style blacklisting** (`blacklist_pc`,
+      `lj_trace.c:380`: after `PENALTY_MAX`, `FORL` becomes `IFORL`, which
+      never counts again). For mahina: when a gated anchor's backoff is
+      exhausted, patch its back-edge instruction to a variant that never
+      enters the JIT path. The doc 42 patched-arm machinery already exists.
+      Questions for the doc:
+      - The patch must be recorded so replay and keyframes reproduce it
+        (Bart, 2026-10-09: "we can record a patch").
+      - Today gates retry forever with exponential backoff; blacklisting
+        makes it permanent until a flush.
+      - A patched loop stops advancing `tick`, which other gates' cooldowns
+        are measured in.
+      - Removes the last ~40 instructions per gated back-edge.
+
+## Coverage mode changes `tick` (noted 2026-10-09)
+
+- [ ] **`config.coverage` is documented as never affecting tiering, but a
+      coverage run ends at a different `trace.tick` than a normal run.** In
+      three 3000-iteration `pcall` loops (the gated-back-edge test in
+      `interp_dispatch_test.zig`), a coverage run ends at 9019 and a normal
+      run at 9012. The gap was already there before the gated-skip handler:
+      it is unchanged with the skip disabled. Gate cooldowns are measured in
+      `tick`, so a coverage run can gate and retry at different points than
+      the run it is meant to describe. Find where the epilogue's coverage
+      path counts extra back-edges, and either make it tick-neutral or
+      correct the doc comment.
 
 ## `capi-smoke` hangs under `zig build test -Doptimize=ReleaseFast` (noted 2026-10-03)
 
@@ -142,30 +181,30 @@ mahina C API 7.3, Rust crate 26.8. Items, each measured on its own:
       instruction itself (dispatch prologue step 6), so its reported call
       site is one instruction off. Doc 61 Phase 0's in-flight marker gives
       the fix; land it as its own change.
-- [ ] **Multret arguments may be unrooted across a call.** Once a consumer
-      `call b=all_results` clears `reg_top_pending` (interp.zig ~6378), its
-      arguments above the window sit only in `boundary_scratch`, which is not
-      a GC root; and the `.function` arm lays the callee window at
-      `base+num_registers`, which can overlap them. Unverified: write a
-      `gc_stress` repro before fixing. **Overlap half CONFIRMED (2026-10-05)
-      — see doc 61 P1 below.**
-- [ ] **Doc 61 P1 — surplus varargs past the caller window are CLOBBERED
-      (confirmed, every tier).** `g(table.unpack(t))` with 40 values into a
-      vararg `g` with 10 locals: `g` reads its own locals as varargs
-      ("attempt to perform arithmetic on a function value",
-      `/tmp/varargs_tail.lua`, program in doc 61 §3). The callee window is
-      laid at `base + caller.num_registers` over the argument tail. Fix per
-      doc 61 §3 P1 (LuaJIT vararg-frame layout: callee above the args; also
-      native push, `callValue`, `.S`, keyframe restore gap).
-- [ ] **Doc 61 P2 — dynamic argument spans above `stack_top` during
-      re-entry / `mh_collect`** (codex, doc 61 rev 2 review). Fix: raise
-      `stack_top` over an `all_results` argument span for the call's
-      duration.
-- [ ] **Doc 61 P3 — native-held transient values across `callValue`**
-      (codex): native `gsub` replacement args are never parked; operand
-      copies lose their root when a callback rewrites the register via an
-      upvalue. Fix: a Vm `transient_roots` stack + an audit of `callValue`
-      callers.
+- [x] **Multret arguments may be unrooted across a call.** Both halves
+      CONFIRMED and fixed by doc 61 P1 (overlap) and P2 (unrooted), 2026-10-09.
+- [x] **Doc 61 P1 — surplus varargs past the caller window are CLOBBERED**
+      (and the non-vararg overlap variant silently summed wrong). Fixed
+      2026-10-09: the callee window sits above the argument span, the
+      recorder refuses the shape, and keyframe restore accepts gaps.
+- [x] **Doc 61 P2 — dynamic argument spans above `stack_top`.** CONFIRMED
+      use-after-free from plain Lua (`print` + `__tostring`). Fixed
+      2026-10-09: the `.call` native and `__call` arms raise `stack_top` over
+      the span.
+- [x] **Doc 61 P3 — Zig-held transient values across re-entry.** The audit
+      is in doc 61 §3 P3. CONFIRMED use-after-free from plain Lua (the fused
+      `a[i][j]` with a native `__index`/`__newindex` such as `table.sort`).
+      Fixed 2026-10-09: `callValue`'s native arm parks `args` at `stack_top`.
+- [ ] **capi host-call bugs from the doc 61 P3 audit** (coral-marten's
+      area, reported to them 2026-10-09). The third, `cHostCall` reading
+      `h.box` after a callback that freed its own Native, is fixed by P3's
+      callee parking.
+  - The dispatch `__call` arm and `pcall`/`xpcall` from bytecode hand a host
+    fn `args` and `out` slices that alias in `boundary_scratch`, which
+    breaks the host no-alias contract (capi.zig:207).
+  - The dispatch native arm's host branch fills `boundary_scratch[out_lo..]`.
+    A nested `mh_call` from the host can overwrite slots it already filled
+    when the result range reaches past `stack_top`, before the copy-down.
 
 ## `hashgate.py --generate --filter X` wipes every other program's refs (noted 2026-10-01)
 

@@ -262,3 +262,58 @@ test "snapshot wire enum ordinals (HeapObject.obj_type) are a pinned contract" {
     try testing.expectEqual(@as(u8, 5), @intFromEnum(ObjectType.typed_array));
     try testing.expectEqual(@as(u8, 6), @intFromEnum(ObjectType.host));
 }
+
+/// Doc 61 P4 probe: tries a capture from wherever it is called and records
+/// whether it was refused (inside a re-entered native activation) or taken.
+const P4Probe = struct {
+    var refused: u32 = 0;
+    var taken: u32 = 0;
+    fn capture(ctx: *anyopaque, args: []const Value) anyerror!Value {
+        _ = args;
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        if (encodeSnapshot(testing.allocator, vm)) |bytes| {
+            testing.allocator.free(bytes);
+            taken += 1;
+        } else |err| {
+            try testing.expectEqual(error.CaptureInsideNativeActivation, err);
+            refused += 1;
+        }
+        return Value.nil();
+    }
+};
+
+test "doc 61 P4: capture inside a re-entered native activation is refused, in every build mode" {
+    // `table.sort` re-enters the VM for its comparator, so the probe called
+    // from the comparator runs with `native_reentry_depth != 0`: refused. The
+    // probe called from plain code is not inside a re-entry: taken for now.
+    // That capture is mid-instruction as well; doc 61 Phase 0's `in_flight`
+    // check refuses it and flips this expectation. The check is an error
+    // return, not a debug assert, so it holds in release too.
+    const gpa = testing.allocator;
+    const source: [:0]const u8 =
+        \\capture_probe()
+        \\local t = {3, 1, 2}
+        \\table.sort(t, function(a, b) capture_probe() return a < b end)
+        \\print(t[1], t[2], t[3])
+    ;
+    P4Probe.refused = 0;
+    P4Probe.taken = 0;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try mahina_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    const native = try vm.heap.newNative(P4Probe.capture, "capture_probe");
+    try vm.globals.set(gpa, try vm.heap.internValue("capture_probe"), Value.heap(&native.header));
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings("1\t2\t3\n", sink.buffered());
+    try testing.expectEqual(@as(u32, 1), P4Probe.taken);
+    try testing.expect(P4Probe.refused >= 1);
+}

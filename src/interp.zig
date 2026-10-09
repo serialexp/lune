@@ -2212,6 +2212,38 @@ pub const Vm = struct {
         return @min(produced, out.len);
     }
 
+    /// `callValue`'s native dispatch once `args` are rooted (the caller parked
+    /// them). Results go straight into `results_out` (a concrete count is always
+    /// wanted here; the `all_results` stamping path is dispatch-only).
+    fn callNativeUnparked(self: *Vm, nat: *const function.Native, args: []const Value, results_out: []Value) Error!usize {
+        if (nat.host != null) {
+            // Embedder host fn (doc 59 §3.5): the single invocation
+            // funnel. `results_out` never aliases `args` here (direct
+            // call: two caller buffers; `__call` redirect: parked window
+            // above vs caller buffer below — see the multi note).
+            return self.callHostNative(nat, args, results_out);
+        }
+        if (nat.effect) |kind| {
+            const r = try performEffect(self, kind, nat, args);
+            if (results_out.len == 0) return 0;
+            results_out[0] = r;
+            return 1;
+        } else if (nat.multi != null and results_out.len >= 2) {
+            // `out` does not overlap `args`: for a direct call they are the
+            // caller's two distinct buffers; for a `__call` redirect `args`
+            // is the parked window at/above `pbase` while `results_out` is
+            // the original caller's buffer below it. Either way a
+            // strictly-safer case of the NativeMultiFn alias contract.
+            const produced = nat.multi.?(@ptrCast(self), args, results_out) catch |e| return narrowError(e);
+            return @min(produced, results_out.len);
+        } else {
+            const r = nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
+            if (results_out.len == 0) return 0;
+            results_out[0] = r;
+            return 1;
+        }
+    }
+
     pub fn callValue(self: *Vm, callee: Value, args: []const Value, results_out: []Value) Error!usize {
         if (!callee.isHeap()) return Error.TypeError;
         std.debug.assert(!self.reg_top_pending);
@@ -2227,32 +2259,31 @@ pub const Vm = struct {
             // wanted here; the `all_results` stamping path is dispatch-only).
             .native => {
                 const nat = function.Native.fromHeader(callee.asHeap());
-                if (nat.host != null) {
-                    // Embedder host fn (doc 59 §3.5): the single invocation
-                    // funnel. `results_out` never aliases `args` here (direct
-                    // call: two caller buffers; `__call` redirect: parked window
-                    // above vs caller buffer below — see the multi note).
-                    return self.callHostNative(nat, args, results_out);
-                }
-                if (nat.effect) |kind| {
-                    const r = try performEffect(self, kind, nat, args);
-                    if (results_out.len == 0) return 0;
-                    results_out[0] = r;
-                    return 1;
-                } else if (nat.multi != null and results_out.len >= 2) {
-                    // `out` does not overlap `args`: for a direct call they are the
-                    // caller's two distinct buffers; for a `__call` redirect `args`
-                    // is the parked window at/above `pbase` while `results_out` is
-                    // the original caller's buffer below it. Either way a
-                    // strictly-safer case of the NativeMultiFn alias contract.
-                    const produced = nat.multi.?(@ptrCast(self), args, results_out) catch |e| return narrowError(e);
-                    return @min(produced, results_out.len);
-                } else {
-                    const r = nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
-                    if (results_out.len == 0) return 0;
-                    results_out[0] = r;
-                    return 1;
-                }
+                // Doc 61 P3: a native callee gets `args` straight from the
+                // caller, often Zig locals (the fused `a[i][j]` intermediate,
+                // gsub captures, a synthesized error value, a searcher's loader
+                // data) that nothing roots. A native that re-enters the VM
+                // (`table.sort`'s comparator, `print`'s `__tostring`, a host
+                // fn calling `mh_collect`) could then have them swept while it
+                // still holds them. The callee itself is no better off: a
+                // metamethod native whose callback drops the last reference to
+                // it (and collects) would be freed while it runs, along with a
+                // host fn's ctx. Park the callee and a copy of `args` at
+                // `stack_top`, the shape of a Lua call's function slot plus its
+                // arguments, and raise `stack_top` over them, so they stay
+                // rooted for the call and every re-entry lays its window (and
+                // scratch) above them. The native still reads the caller's
+                // `args`, so the alias relationships between `args` and
+                // `results_out` are unchanged. Restored on success; an error
+                // leaves it raised for the catcher (as the `__call` arm).
+                const pbase = self.stack_top;
+                if (pbase + 1 + args.len > self.regCapacity()) return Error.StackOverflow;
+                self.regSet(pbase, callee);
+                for (args, 0..) |v, i| self.regSet(pbase + 1 + i, v);
+                self.stack_top = pbase + 1 + args.len;
+                const n = try self.callNativeUnparked(nat, args, results_out);
+                self.stack_top = pbase;
+                return n;
             },
             // Closure callee: lay out a fresh window at `stack_top`, bind params
             // exactly like the `.call` arm, push, and run a bounded nested exec.
@@ -3111,6 +3142,29 @@ pub const Vm = struct {
     /// the epilogue must never write the jump target into `frame.pc` (§4.4
     /// invariant: `frame.pc` stays at the executed back-edge until the next
     /// prologue, except an explicit mode-switch park).
+    /// The loop handlers' back-edge entry while tracing is enabled, in front of
+    /// `backEdgeHandler`. A loop the JIT has given up on is gated, and its
+    /// hot-count slot skips its next back-edges (`afterBackEdge`). Reaching
+    /// that test through the out-of-line epilogue cost ~95 instructions per
+    /// iteration, on every iteration of every untraceable loop; this handler
+    /// makes the test call-free and continues at the anchor exactly as the
+    /// epilogue's `.dispatch_at` would. Its own handler rather than inlined
+    /// into the loop handlers, so their tracing-off paths keep their code.
+    /// `.fast` only: in `.full` the epilogue also decides the switch back to
+    /// `.fast`. Coverage runs need the epilogue's per-iteration attribution.
+    fn gatedBackEdgeHandler(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                if (mode == .fast and !vm.trace.config.coverage and
+                    vm.trace.skipGatedBackEdge(st.proto, @intCast(pc)))
+                {
+                    return dispatchTail(mode, st, pc, vm);
+                }
+                return @call(.always_tail, backEdgeHandler(mode), .{ st, pc, instr, vm, tags, payloads });
+            }
+        }.h;
+    }
+
     fn backEdgeHandler(comptime mode: ExecMode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
@@ -5685,7 +5739,7 @@ pub const Vm = struct {
                     npc = applyJump(pc, instr.aux);
                 }
                 if (vm.trace.config.enabled and npc <= cur_pc)
-                    return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
+                    return @call(.always_tail, gatedBackEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
                 return dispatchTail(mode, st, npc, vm);
             }
         }.h;
@@ -6129,7 +6183,7 @@ pub const Vm = struct {
                     npc = applyJump(pc, instr.aux);
                 }
                 if (vm.trace.config.enabled and npc <= cur_pc)
-                    return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
+                    return @call(.always_tail, gatedBackEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
                 return dispatchTail(mode, st, npc, vm);
             }
         }.h;
@@ -6383,7 +6437,7 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 if (vm.trace.config.enabled)
-                    return @call(.always_tail, backEdgeHandler(mode), .{ st, pc, instr, vm, tags, payloads });
+                    return @call(.always_tail, gatedBackEdgeHandler(mode), .{ st, pc, instr, vm, tags, payloads });
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -6421,7 +6475,14 @@ pub const Vm = struct {
                     .function => {
                         const cl = Closure.fromHeader(callee.asHeap());
                         const cp = cl.proto;
-                        const callee_base = base + st.proto.num_registers;
+                        // The callee window sits above the caller's window AND
+                        // above the argument span (doc 61 P1, LuaJIT's vararg
+                        // frame layout). A dynamic (`all_results`) span can end
+                        // past the caller window; laying the callee at the
+                        // window end would overwrite the surplus varargs it
+                        // then reads, and make the param copy below overlap.
+                        // A fixed span always fits, so this is the window end.
+                        const callee_base = @max(base + st.proto.num_registers, base + a + 1 + nargs);
                         if (self.depth >= max_call_depth) return parkErr(st, Error.StackOverflow);
                         if (callee_base + cp.num_registers > self.regCapacity()) return parkErr(st, Error.StackOverflow);
                         // Lay out the callee window: bind fixed params
@@ -6439,8 +6500,8 @@ pub const Vm = struct {
                         }
                         // Varargs cursor: a vararg callee handed more args
                         // than it has fixed params keeps the surplus where
-                        // they already sit — in the caller's window, below
-                        // `callee_base`. They stay valid (the stack slab never
+                        // they already sit — below `callee_base`, in the
+                        // caller's window or in the span above it. They stay valid (the stack slab never
                         // moves) and GC-rooted (`forEachRootHeader` scans the
                         // whole live prefix) for the callee's lifetime.
                         // Recorded per-callee so a non-vararg or no-surplus
@@ -6480,6 +6541,15 @@ pub const Vm = struct {
                     .native => {
                         const nat = function.Native.fromHeader(callee.asHeap());
                         const nwanted: usize = instr.c;
+                        // Doc 61 P2: a dynamic argument span can end past the
+                        // window, above `stack_top`. Cover it for the call:
+                        // the GC roots it, and a re-entry lays its window (and
+                        // gathers its natives' scratch) above it. Restored on
+                        // success; an error leaves it raised for the catcher,
+                        // which resets `stack_top` when it discards frames.
+                        const entry_top = self.stack_top;
+                        const args_end = base + a + 1 + nargs;
+                        if (args_end > entry_top) self.stack_top = args_end;
                         // Materialize the args into the absolute-indexed
                         // boundary scratch so the native ABI keeps speaking
                         // `[]Value` after the register file split (SoA). The
@@ -6562,6 +6632,7 @@ pub const Vm = struct {
                             const result = nat.func(@ptrCast(self), args) catch |e| return parkErr(st, narrowError(e));
                             if (all) self.stampSingleResult(base, a, result) else writeSingleResult(st.regs, a, nwanted, result);
                         }
+                        self.stack_top = entry_top;
                     },
                     // `__call`: a non-callable heap value (typically a table)
                     // with a `__call` metamethod is invoked as
@@ -6580,6 +6651,11 @@ pub const Vm = struct {
                         const handler = self.metamethod(callee, self.mm.call);
                         if (handler.isNil()) return parkErr(st, Error.TypeError);
                         const nwanted: usize = instr.c;
+                        // Doc 61 P2, as in the native arm: cover a dynamic
+                        // argument span past the window while the handler runs.
+                        const entry_top = self.stack_top;
+                        const args_end = base + a + 1 + nargs;
+                        if (args_end > entry_top) self.stack_top = args_end;
                         // `[callee, args...]` is exactly the handler's
                         // argument list — gather it into the absolute-indexed
                         // scratch (the result `out` aliases it, same overlap
@@ -6599,6 +6675,7 @@ pub const Vm = struct {
                             while (k < nwanted) : (k += 1) out[k] = Value.nil();
                             self.scatterScratch(base + a, base + a + nwanted);
                         }
+                        self.stack_top = entry_top;
                     },
                 }
                 // The native and `__call` arms run inline (no frame push) and
