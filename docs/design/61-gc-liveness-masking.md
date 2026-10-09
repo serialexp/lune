@@ -68,24 +68,78 @@ as they land; move bullets to Done once everything inside them is checked.
         joins this check in Phase 0 (§6.4; codex Phase P review).
 - [ ] **Phase 0 — frame state made exact.** Behaviour-neutral on its own;
       pinned by the frame-shape tests (§8).
-  - [ ] `gcTrampoline` publishes the innermost pc before `collect()`.
-  - [ ] `CallFrame.in_flight`: set on entry, restored on success, left set on
+  - [x] `gcTrampoline` publishes the innermost pc before `collect()`.
+  - [x] `CallFrame.in_flight`: set on entry, restored on success, left set on
         error. Catchers restore `frames[entry_depth − 1]` (§4.2).
-  - [ ] `protectedCall` marks the topmost faulting frame in flight while an
+  - [x] `protectedCall` marks the topmost faulting frame in flight while an
         `xpcall` handler runs, when one exists (§4.4).
-  - [ ] Fault-pc invariant: a rejected Lua push re-stores the call pc before
+  - [x] Fault-pc invariant: a rejected Lua push re-stores the call pc before
         raising (§4.4).
-  - [ ] Backtraces use the in-flight marker. `backtraceFrames`/`callSiteAt`
+  - [x] Backtraces use the in-flight marker. `backtraceFrames`/`callSiteAt`
         assume pc + 1 for every parent (`interp.zig:1975`). Moved here from a
         separate change (codex rev 4 should-fix).
-  - [ ] Audit of the JIT store-elision sites (§2).
-  - [ ] `Proto.maskable` is computed at compile time (§5).
-  - [ ] P4's keyframe-capture refusal also covers any frame with `in_flight`
+  - [x] Audit of the JIT store-elision sites (§2, "Phase 0 audit"). One
+        pre-existing open question (bridge carried homes) went to TODO.md;
+        the keyframe-bytes question goes to Phase 1.
+  - [x] `Proto.maskable` is computed at compile time (§5).
+  - [x] P4's keyframe-capture refusal also covers any frame with `in_flight`
         set (§6.4), which includes a native called directly from bytecode.
         Flip `keyframeser_capture_test`'s top-level `capture_probe()` from
         accepted to refused, unless a legitimate capture-from-native caller
         turns up (check `main.zig`/`wasm_entry.zig`).
+  - **As implemented** (differences from the text below, each simpler):
+    - **Marking sites.** The dispatch `.native` arm marks every native
+      (builtin or host) for its whole duration, and `callValue` marks the
+      current frame when `depth > 0`. Host entries (H1 `pushHostCall`/
+      `runPushedFrame`, the `.S` entry) mark nothing themselves. At
+      `depth > 0` a host entry only ever runs inside a host fn, whose caller
+      the native arm or `callValue` has already marked. `runPushedFrame`
+      asserts that in debug builds. At depth 0 there is no caller frame.
+    - **capi catcher.** For the same reason `guestFault` neither captures nor
+      restores the flag, and its signature is unchanged. Its entry frame,
+      when there is one, is in flight before the entry and stays so; it only
+      asserts that. `protectedCall` does capture and restore as specified.
+    - **Initialisation.** The Zig literal default, the native inline push
+      (`movByteMemImm`), and the `.S` frame write (`CF_IN_FLIGHT`, with an
+      `EXPECT` on its size) all initialise the flag false. The `.call`
+      opcode path asserts the caller's flag is clear before any push, which
+      caught a stale `.S`-pushed slot during development.
+    - **Fault-pc invariant.** The opcode path re-stores `pc − 1` on a
+      `pushFrameVararg` failure (the first of the two options). That failure
+      cannot happen today: `pushFrameVararg`'s two checks (depth, register
+      capacity) repeat the opcode path's early checks exactly, and those
+      raise with `frame.pc` already naming the `.call`. The re-store keeps
+      the invariant if the two ever diverge. The stack-overflow test pins
+      the early-check path, so the mutation "no re-store" survives it.
+    - **`xpcall` handler mark.** `protectedCall` needs no explicit mark. It
+      runs the handler through `callValue`, which marks `frames[depth − 1]`:
+      the topmost faulting frame when the fault left one, or the entry frame
+      when it didn't. That mark stays for the handler's whole run and is left
+      set on a fatal handler fault, which is exactly §4.4. An explicit mark
+      survived its mutation for this reason and was removed.
+    - **Untestable mutations.** "Catcher not restoring
+      `frames[entry_depth − 1]`" and "marking without the
+      `depth > entry_depth` check" leave no observable difference. Every
+      catcher's entry frame is already in flight (a native's caller, or a
+      `callValue` re-entry), and every path that touches its flag restores
+      the same value. The restores stay as specified.
+    - **P4.** `encodeSnapshot` refuses when any frame in `frames[0..depth]`
+      is in flight. The keyframe capture test now expects every capture from
+      a native to be refused, and a capture after the run to succeed.
+    - **Debug net.** Every collection in a safety build classifies every
+      frame of a maskable proto and panics on `unknown` or on a mask pc
+      outside the code (`assertFrameShapesKnown`). The gc-stress test legs
+      collect at every safepoint, so the whole suite exercises it. The
+      compiler asserts that every proto with liveness is maskable.
+    - **Liveness precision (§5).** The call-layout check failed on ordinary
+      compiled code until `bc_liveness` stopped treating a multret
+      consumer's whole-window read as live back past its producer; see §5,
+      "As implemented".
 - [ ] **Phase 1 — the masked `.gc` root walk + scrub (§6).**
+  - [ ] Close the conservative multret-consumer row first (§5, "Phase 1
+        prerequisite", options A / A′ / B; codex Phase 0 blocker 2).
+  - [ ] Decide whether keyframe capture masks dead slots too (§2, "Phase 0
+        audit").
   - [ ] Masking driven by the shared `maskable` predicate, with an alias
         bitset and dead slots set to nil before sweep.
   - [ ] Exit-snapshot sparsity, composite-bridge admission, the linked
@@ -298,6 +352,61 @@ that, so in between the watermark still exists. Phase 1 therefore gates it:
 the watermark drops a slot only if `s ∉ captured(F)` and `maskable(F)`. That
 makes it satisfy the premise, because a non-captured slot `>= base+4` is dead
 at the body start and after the loop (`compiler.zig` `freeTo(base)`).
+
+**Phase 0 audit (2026-10-09).** Every reference above was re-checked against
+the tree. Each still describes the code, at these locations:
+- site 1: the drop is at `trace_finalize.zig:64-65`; the watermark is set at
+  `trace_recorder.zig:3497-3498`, reset at `:6143`, and mirrored in
+  `loopCloseDefeat` at `:6012-6013`;
+- site 3: `commitExitSnap` is at `trace_recorder.zig:1440`; materialisation is
+  `materializeExitSide` (`irinterp.zig:209-220`) and the native exit adapter
+  (`nativegen_adapter.zig:263-306`);
+- site 4: `bridgeMatchesExitSnapshot` is at `trace_code.zig:784-806`, and
+  `emitCompositeBridgeSnapshot` at `nativegen_emit.zig:2522-2533`;
+- site 5: `emitLinkedLoopDoneSnapshot` is at `nativegen_emit.zig:2508-2512`;
+  tier-1a's `flushNumericForLoopDone` also has callers at
+  `trace_chain.zig:504` and `:2961`; tier-0's `a+3` writes are `opForLoop`
+  (`interp.zig:5876`) and `opJForLoop` (`:5947`);
+- `loopDoneSnapshotSupported` is at `trace_code.zig:616`;
+- `ret_cont` is `emitInlineSelfRetPop` (`nativegen_emit.zig:1119-1268`);
+- the precise snapshot is `snapBoundary` (`trace_recorder.zig:1493-1505`).
+
+Findings:
+- **Site 1 is narrower than stated.** The watermark drops a slot only when
+  the trace has no terminal close (head traces are exempt), no allocation
+  (`alloc_count == 0`), and the slot is not an entry slot. The Phase 1 gate
+  applies unchanged.
+- **Site 3's live row is the guard's own pc, not the resume pc.** For a
+  branch guard tier-0 resumes at the untaken successor. A `jmp_if*` kills
+  nothing, so that row is a subset of the guard's row, and the premise
+  holds.
+- **Trace input seeding** (`seedTraceInputs`, `nativeSeedFn`) writes heap
+  values above the window, at or past `stack_top`. Tier-0 never writes
+  those slots and the walk never scans them; trace code consumes them with
+  no collection in between. Not a site.
+- **No JIT path runs other code inside an instruction.** Native and tier-1a
+  trace code never calls `callValue`, a native through the dispatch arm, a
+  metamethod, or `collect`. Its callouts are allocation shims, raw lookups
+  gated on `metatable == null`, and the seed function. A trace collects only
+  by exiting at `guard_gc`. So `in_flight` has no JIT-side marking site, and
+  native self-push/ret-pop frames match `opCall`/`opRet` (the self-push
+  initialises the flag, pinned by a test).
+- **Open question (not a Phase 0 blocker): the armed native bridge flushes
+  only E.** It never reaches `deopt_exit`'s carried-home flush. A carried
+  slot updated after the guard is in neither E nor the snapshot, so
+  `bridgeMatchesExitSnapshot` never looks at it. The comment at
+  `trace_code.zig:775` assumes that flush runs. A targeted repro (the A-viii
+  sieve plus an accumulator updated after the guard, with 2,287 fused bridge
+  hops) gives the right answer. So either something else keeps the slab
+  coherent there or that guard is not the case; it is in TODO.md for
+  verification. Either way it is a pre-existing correctness question, not a
+  GC one.
+- **Keyframes serialise the whole window** (`keyframeser.zig:337`), so a
+  stale dead slot left by sites 3–5 reaches keyframe bytes on JIT runs.
+  Masking scrubs dead slots only at collections. Phase 1 must decide whether
+  capture also masks dead slots, which is cheap and uses the same rows, or
+  whether keyframe byte identity across tiers was never claimed. Recorded
+  for the Phase 1 review.
 
 **Lemma (path).** Take a stale slot `s` and a later collection where `F`'s
 frame sits at pc `Y`, with `Y` reached from such an `R` in tier-0 execution.
@@ -548,6 +657,11 @@ when the flag has already been changed. capi carries it as a third entry value
 into `guestFault`, whose signature grows by one parameter. That applies to
 every caller, including the `.S` fault return (`capi.zig:851`), which gets the
 value from its own entry capture.
+*Superseded in Phase 0* (see "As implemented" in the status list): a capi
+entry at `entry_depth > 0` always runs inside a host fn, so its entry frame
+is in flight before the entry and stays so whatever the callee does. There
+is nothing to capture, and `guestFault` only asserts the invariant; its
+signature is unchanged.
 The frames above `entry_depth` are discarded, and their next push
 re-initialises them. The top-level `exec` failure path keeps everything for
 the CLI reporter; that VM is not resumed.
@@ -701,6 +815,103 @@ Captured slots need no closure proof here:
 - an **open** captured slot is rooted by the open-upvalue alias (§6.1);
 - a **closed** one is not read through the stack, and its φ is always kept
   (§2).
+
+**As implemented (Phase 0): a precision fix in `bc_liveness`.** As first
+computed, the check failed on almost every compiled main chunk. A multret
+consumer (`call`/`ret` with `b = all_results`) is modelled as reading
+`R[a..num_registers)`, because its real extent, the producer's dynamic top,
+is unknown at compile time. A dynamic producer (`call` with
+`c = all_results`, `vararg_spread`) killed nothing. So every consumer kept
+every register above its base live all the way back through the code, and
+the row after an earlier fixed-`c` call carried registers above its results.
+Those registers were not really live: the check was right to reject the
+liveness, not the layout.
+
+The fix uses the one shape the compiler emits: a producer is always
+immediately followed by its consumer. The pair writes `R[p..top)` and then
+reads `R[a'..top)`, so a register `r ≥ p` is dead before the producer
+unless it survives the consumer: `r ∈ live_out(consumer) − kill(consumer)`.
+A `ret` consumer has no survivors. A fixed-`c` consumer kills its results.
+A consumer that is itself a producer (`f(g(h()))`) passes on what survives
+its own consumer, so the computation follows the chain. The producer kills
+`R[p..)` except those survivors; captured registers stay live as before.
+This is exact, not a heuristic. A survivor above the dynamic top keeps its
+value, and the consumer row itself still covers the whole window, so a
+prologue collection there roots every result.
+
+The producer's row reads a row past its consumer, which is not a CFG
+successor. So when a row changes, the worklist also requeues the producer
+two pcs before it. A producer's survivors extend those of the chained
+producer above it, which is cached, so a chain costs `O(L · words)` (codex
+Phase 0 should-fix). `bench/compile_multret_chain.lua` holds that: 200
+compiles of a 2,000-deep chain take 0.33 s, where a per-producer chain walk
+spent 0.09 s in liveness for a single 2,800-deep chain. Tests pin the
+back-edge requeue and a five-deep chain. Exit snapshots (§2 site 3) read
+the same rows, so they now omit these dead registers too. That is sound for
+guest reads: tier-0, resuming at or before the producer, writes them or
+never reads them.
+
+**Phase 1 prerequisite: the conservative consumer row (codex Phase 0
+blocker 2).** The kill above is a model kill, not a must-write. A register
+`r` in `[top, num_registers)` (above the producer's actual dynamic top) is
+dead before the producer but **not written** by it. It still appears in the
+consumer's own row, which covers the whole window. So the path lemma's step
+"`s ∈ live_in[Y]` ⇒ tier-0 wrote `s` on the way to `Y`" fails for
+`Y` = a multret consumer pc. A JIT exit that elided `r` (it is dead at its
+resume pc) leaves `r` stale, and a collection with the frame in flight at the
+consumer roots that stale value. That happens when a native callee or a
+`__call` handler of a `b = all_results` call collects. Before this change,
+`r` was live back past the producer, so no site elided it.
+
+Shapes at a consumer pc:
+- innermost before the consumer runs: no collection (`reg_top_pending`
+  suppresses that safepoint);
+- a Lua callee pushed by the consumer: the caller is suspended at `pc + 1`,
+  masked `∩ [0, a)`, so it is not affected;
+- **in flight at the consumer** (native or `__call` callee): affected;
+- **faulting at the consumer under `xpcall`**: affected. The call can fail
+  before it enters any callee, for example on a rejected Lua push. The
+  handler's `callValue` then marks the retained frame in flight at the
+  consumer pc, and the handler can collect (codex Phase 0 re-review).
+
+This is a **potential determinism divergence**, and it is unresolved. mahina
+has no weak tables, `__gc` or `collectgarbage`, but object survival is still
+observable. A string that survives in one tier and is freed in another
+changes later re-interning allocations, and printed object ids follow from
+those. Phase 0's liveness already reaches exit snapshots (above), so the
+stale value can arise today under the all-live walk, the same class as the
+pre-existing site-3 hole (§2). It is accepted at the Phase 0 boundary and
+**must be closed in Phase 1, before masking relies on the lemma.** Options,
+for decision in the Phase 1 review:
+- **(A) The producer makes the kill real.** Every dynamic producer nil-fills
+  `[top, base + num_registers)` after placing its results: tier-0's `.call`
+  with `c = all_results`, `vararg_spread`, the return into such a caller,
+  and any JIT path that completes one. Rows become exact and the lemma holds
+  unchanged. The compiler would assert that no survivor `≥ p` exists, since a
+  fill would clobber one; none can under stack-discipline allocation.
+  Cost: up to a window of nil stores per multret call, at several sites.
+- **(A′) The consumer canonicalises its stale tail.** The `.call` opcode,
+  with `b = all_results`, nil-fills `[top, base + num_registers)` before
+  anything that can collect or fail: before it runs a native or a `__call`
+  handler, and before any check that can raise (a rejected push), so the
+  faulting-consumer shape is covered too. Then the in-flight frame's rooted
+  tail is nil in every tier: the consumer wrote it on the path to the
+  collection, so the lemma holds with `Y` inside the consumer. This is one
+  opcode, and traces never run natives or metamethods (§2 audit), so tier-0's
+  opcode path is the only executor. Cost: up to a window of nil stores per
+  multret call; measure it.
+- **(B) The collector uses the dynamic top.** A frame in flight at a
+  multret consumer is masked with `live_in[pc] ∩ ([0, top) ∪ survivors)`.
+  That needs the consumer's `top` at collection time. `vm.reg_top` is
+  overwritten by re-entered code, so the frame would have to record it, in
+  a new `CallFrame` field or the spare bytes after `in_flight`. It must be
+  recorded before anything that can fail, so the faulting-consumer shape
+  keeps it. This is Lua 5.4's shape: `traversethread` marks only below
+  `L->top` and clears the slice above it. No stores on the call path beyond
+  the bound; one more frame field and a special case in the walk, whose
+  review must cover captured aliases, survivors, nesting and retained
+  faulting frames. Codex (Phase 0 re-review) recommends B for that reason:
+  it records the real bound instead of clearing a window per call.
 
 **Uses.**
 - **Collector.** A frame of a non-`maskable` proto is all live.

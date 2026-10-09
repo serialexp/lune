@@ -491,6 +491,97 @@ test "host fn: reentrant mh_call from inside a callback; vm_free refused" {
     try testing.expectEqual(capi.mh_status.err_api, ctx.vm_free_status);
 }
 
+/// Writes its arguments back reversed, one result at a time, reading each
+/// argument only when it is needed. A host is entitled to do that: `args`
+/// and `results` never alias (mahina.h), so a write to `results[i]` must not
+/// change any `args[j]`.
+fn hostReverse(vm: ?*capi.VmBox, userdata: ?*anyopaque, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: *usize) callconv(.c) capi.mh_status {
+    _ = vm;
+    _ = userdata;
+    const n = @min(nargs, max_results);
+    var i: usize = 0;
+    while (i < n) : (i += 1) results.?[i] = args.?[nargs - 1 - i];
+    nresults.* = n;
+    return .ok;
+}
+
+test "host fn: args and results don't alias when called through pcall, xpcall or __call" {
+    const box = try newVm();
+    defer freeVm(box);
+    try testing.expectEqual(capi.mh_status.ok, capi.mh_register_fn(box, s("rev"), &hostReverse, null, null));
+    try expectInt(try evalOne(box,
+        \\local function same(a, b, c, d, e, f)
+        \\  return a == b and c == d and e == f
+        \\end
+        \\local bad = 0
+        \\local ok, x, y, z = pcall(rev, 1, 2, 3)
+        \\if not (ok and same(x, 3, y, 2, z, 1)) then bad = bad + 1 end
+        \\ok, x, y, z = xpcall(rev, print, 1, 2, 3)
+        \\if not (ok and same(x, 3, y, 2, z, 1)) then bad = bad + 10 end
+        \\local obj = setmetatable({}, {__call = rev})
+        \\local p, q, r, o = obj(1, 2, 3)
+        \\if not (same(p, 3, q, 2, r, 1) and o == obj) then bad = bad + 100 end
+        \\-- Every result wanted: the results go on as call arguments.
+        \\local function all4(a, b, c, d, n) return n == 4 and same(a, 3, b, 2, c, 1) and d end
+        \\local function count(...) return select('#', ...), ... end
+        \\local function chk(n, a, b, c, d) return all4(a, b, c, d, n) end
+        \\if chk(count(obj(1, 2, 3))) ~= obj then bad = bad + 1000 end
+        \\local function chkp(n, ok2, a, b, c) return n == 4 and ok2 and same(a, 3, b, 2, c, 1) end
+        \\if not chkp(count(pcall(rev, 1, 2, 3))) then bad = bad + 10000 end
+        \\return bad
+    ), 0);
+}
+
+const fill_count = 64;
+
+/// Writes `fill_count` results, then calls back into the guest (`args[0]`),
+/// and only then reports them. Nothing the nested call does may change a
+/// result the host already wrote.
+fn hostFillThenCall(vm: ?*capi.VmBox, userdata: ?*anyopaque, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: *usize) callconv(.c) capi.mh_status {
+    _ = userdata;
+    if (nargs < 1 or max_results < fill_count) {
+        capi.mh_error_set(vm, s("fillcall: too few results allowed"));
+        return .err_api;
+    }
+    var i: usize = 0;
+    while (i < fill_count) : (i += 1) results.?[i] = capi.mh_int(@intCast(1000 + i));
+    var inner: [1]mh_value = undefined;
+    var n: usize = 0;
+    if (capi.mh_call(vm, args.?[0], null, 0, &inner, 1, &n) != .ok) {
+        capi.mh_error_set(vm, s("fillcall: nested mh_call failed"));
+        return .err_runtime;
+    }
+    nresults.* = fill_count;
+    return .ok;
+}
+
+test "host fn: results already written survive a nested mh_call" {
+    const box = try newVm();
+    defer freeVm(box);
+    try testing.expectEqual(capi.mh_status.ok, capi.mh_register_fn(box, s("fillcall"), &hostFillThenCall, null, null));
+    // `check(fillcall(g))` wants every result, so the host's buffer reaches
+    // past the caller's window, where `g`'s frame and its native calls land.
+    try expectInt(try evalOne(box,
+        \\local function g()
+        \\  local s = 0
+        \\  for i = 1, 20 do
+        \\    s = s + select('#', i, i, i, i, i, i, i, i) + #tostring(i)
+        \\    s = s + #string.format("%d %d %d %d", i, i, i, i)
+        \\  end
+        \\  return s
+        \\end
+        \\local function check(...)
+        \\  local bad = 0
+        \\  if select('#', ...) ~= 64 then bad = 1000 end
+        \\  for i = 1, 64 do
+        \\    if select(i, ...) ~= 999 + i then bad = bad + 1 end
+        \\  end
+        \\  return bad
+        \\end
+        \\return check(fillcall(g))
+    ), 0);
+}
+
 test "bad values from C are rejected, not trusted" {
     const box = try newVm();
     defer freeVm(box);

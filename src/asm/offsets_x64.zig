@@ -117,7 +117,7 @@ const expected = [_]Entry{
     .{ .name = "SLICE_PTR", .value = slice_ptr_word * @sizeOf(usize) },
     .{ .name = "SLICE_LEN", .value = slice_len_word * @sizeOf(usize) },
 
-    // CallFrame: the frame-array stride and all nine plain fields.
+    // CallFrame: the frame-array stride and all ten plain fields.
     .{ .name = "CF_SIZE", .value = @sizeOf(CallFrame) },
     .{ .name = "CF_CLOSURE", .value = off(CallFrame, "closure") },
     .{ .name = "CF_CLOSURE_SIZE", .value = width(CallFrame, "closure") },
@@ -137,6 +137,8 @@ const expected = [_]Entry{
     .{ .name = "CF_VARARGS_COUNT_SIZE", .value = width(CallFrame, "varargs_count") },
     .{ .name = "CF_CODE_CACHE_GEN", .value = off(CallFrame, "code_cache_gen") },
     .{ .name = "CF_CODE_CACHE_GEN_SIZE", .value = width(CallFrame, "code_cache_gen") },
+    .{ .name = "CF_IN_FLIGHT", .value = off(CallFrame, "in_flight") },
+    .{ .name = "CF_IN_FLIGHT_SIZE", .value = width(CallFrame, "in_flight") },
 
     // Closure, Proto, and the heap object header's type byte.
     .{ .name = "CLOSURE_PROTO", .value = off(Closure, "proto") },
@@ -403,10 +405,15 @@ test "offsets_x64: the checker rejects misplaced mode blocks, duplicates and unk
     try std.testing.expect(reports("#ifdef MAHINA_RUNTIME_SAFETY\n", "line 1: not a `.set NAME, N` line"));
     try std.testing.expect(reports(".set VM_TAGS, 64\n.set VM_TAGS, 64\n", "line 2: duplicate VM_TAGS"));
     try std.testing.expect(reports(".set VM_BOGUS, 1\n", "line 1: unknown name VM_BOGUS"));
-    try std.testing.expect(reports(".set VM_TAGS, 63\n", "line 1: VM_TAGS is 63; expected  .set VM_TAGS, 64"));
+    // The real offset, not a literal: adding a `Vm` field reorders the layout.
+    const tags = comptime off(Vm, "tags");
+    try std.testing.expect(reports(
+        std.fmt.comptimePrint(".set VM_TAGS, {d}\n", .{tags + 1}),
+        std.fmt.comptimePrint("line 1: VM_TAGS is {d}; expected  .set VM_TAGS, {d}", .{ tags + 1, tags }),
+    ));
     try std.testing.expect(reports(
         ".set VM_DEPTH, 1\n#if MAHINA_RUNTIME_SAFETY\n.set VM_DEPTH, 1\n#else\n.set VM_DEPTH, 1\n#endif\n",
         "VM_DEPTH is in the shared section and a mode block",
     ));
-    try std.testing.expect(reports("", "missing:  .set VM_TAGS, 64"));
+    try std.testing.expect(reports("", std.fmt.comptimePrint("missing:  .set VM_TAGS, {d}", .{tags})));
 }

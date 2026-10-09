@@ -25,7 +25,11 @@
 //!     `R[a..num_registers)`;
 //!   * writes whose extent is dynamic (`call` with `c == all_results`,
 //!     `vararg_spread`) or conditional (`for_loop`'s `R[a+3]`,
-//!     `tfor_loop`'s `R[a+2]`) kill nothing;
+//!     `tfor_loop`'s `R[a+2]`) kill nothing — with one exact exception: a
+//!     dynamic producer immediately followed by its multret consumer (the
+//!     only shape the compiler emits) kills every register at or above its
+//!     base that does not survive the consumer, because the consumer's
+//!     "whole window" read really stops at the producer's top (doc 61 §5);
 //!   * the patched-image opcodes (`jfor_loop`, `jloop`, `jfunc_head`,
 //!     `jcont`), which canonical `Proto.code` never contains, make every
 //!     register live at that pc.
@@ -239,12 +243,14 @@ pub fn compute(
     errdefer alloc.free(bits);
     @memset(bits, 0);
 
-    // Scratch: the captured mask, the valid-register mask, and one row.
-    const tmp = try scratch.alloc(u64, words * 3);
+    // Scratch: the captured mask, the valid-register mask, one row, and a
+    // producer's survivor set.
+    const tmp = try scratch.alloc(u64, words * 4);
     defer scratch.free(tmp);
     const captured = tmp[0..words];
     const valid = tmp[words .. 2 * words];
     const row = tmp[2 * words .. 3 * words];
+    var keep: KeepCache = .{ .row = tmp[3 * words .. 4 * words] };
     @memset(captured, 0);
     @memset(valid, 0);
     {
@@ -312,14 +318,26 @@ pub fn compute(
                 const b: u6 = @intCast(63 - @clz(queued[w]));
                 queued[w] &= ~(@as(u64, 1) << b);
                 const i: usize = w * 64 + b;
-                if (visit(i, code, bits, words, row, valid, captured, num_registers)) {
+                if (visit(i, code, bits, words, row, &keep, valid, captured, num_registers)) {
                     for (preds[pred_off[i]..pred_off[i + 1]]) |p| {
                         queued[p / 64] |= @as(u64, 1) << @intCast(p % 64);
                         // A higher pc in an already-drained word waits for
                         // the next round.
                         if (p / 64 > w) pending = true;
                     }
+                    // A dynamic producer also reads the row just past its
+                    // consumer (`producerSurvivors`), which is not a CFG
+                    // edge.
+                    if (i >= 2 and dynamicProducerBase(code, i - 2) != null)
+                        queued[(i - 2) / 64] |= @as(u64, 1) << @intCast((i - 2) % 64);
                 }
+                // A producer's survivors extend those of the producer it
+                // feeds, so revisit the one below after every visit, changed
+                // row or not (the shared row hides survivor changes).
+                // Lower pcs: this round still drains them, top-down, so the
+                // cache in `producerSurvivors` hits.
+                if (i >= 1 and dynamicProducerBase(code, i - 1) != null and dynamicProducerBase(code, i) != null)
+                    queued[(i - 1) / 64] |= @as(u64, 1) << @intCast((i - 1) % 64);
             }
         }
     }
@@ -333,6 +351,7 @@ fn visit(
     bits: []u64,
     words: usize,
     row: []u64,
+    keep: *KeepCache,
     valid: []const u64,
     captured: []const u64,
     num_registers: u16,
@@ -356,6 +375,20 @@ fn visit(
         }
         var k: u32 = e.kill_lo;
         while (k < e.kill_hi and k < num_registers) : (k += 1) clearBit(row, k);
+        // A dynamic producer handing its results to the adjacent multret
+        // consumer (the only shape the compiler emits) writes `R[p..top)`,
+        // and the consumer reads `R[a'..top)` and nothing above. So a
+        // register `r ≥ p` is dead here unless it survives the consumer:
+        // `top` is dynamic, so `r` may lie above it, unwritten, and be read
+        // later. Kill `R[p..)` except those survivors (captured registers
+        // are re-added below). Without this, the consumer's whole-window
+        // read keeps `R[p..)` live back through the code, and a caller
+        // suspended at any earlier call would look as if it held values
+        // above its call base (doc 61 §5).
+        if (dynamicProducerBase(code, i)) |p| {
+            producerSurvivors(code, bits, words, i, keep);
+            for (row, keep.row, 0..) |*d, kp, wi| d.* &= belowMask(p, wi) | kp;
+        }
         for (e.uses[0..e.n_uses]) |u| {
             if (u < num_registers) setBit(row, u);
         }
@@ -367,6 +400,137 @@ fn visit(
     if (std.mem.eql(u64, dst, row)) return false;
     @memcpy(dst, row);
     return true;
+}
+
+/// Doc 61 §5: whether the GC may mask a frame of this proto by liveness, and
+/// so whether every JIT store-elision site may filter its slots by it. Two
+/// conditions:
+///  * `live` is available;
+///  * the **call-layout check**: after every `.call (a, b, c)`, a register
+///    at or above `a` that is live and not captured is one of the call's
+///    result slots (`a ≤ r < a + c`; every `r ≥ a` for `c = all_results`).
+/// The second is what lets the collector mask a caller suspended at a call
+/// with `live_in[p] ∩ [0, a)` (§4.3). The compiler allocates a call at the
+/// first free register, so it always holds on compiled code; a proto that
+/// fails it (hand-built) is scanned whole and keeps every JIT store.
+/// Captured registers are exempt: an open one is rooted by its upvalue
+/// alias, and a closed one is never read through the stack.
+/// O(calls × words), no allocation beyond `words` scratch words.
+pub fn maskable(
+    scratch: std.mem.Allocator,
+    code: []const Instr,
+    live: RegLiveness,
+    num_registers: u16,
+    children: []const *const Proto,
+) std.mem.Allocator.Error!bool {
+    if (!live.available()) return false;
+    const words: usize = live.words;
+    const captured = try scratch.alloc(u64, words);
+    defer scratch.free(captured);
+    @memset(captured, 0);
+    for (children) |child| {
+        for (child.upvalues) |uv| {
+            if (uv.in_stack and uv.index < num_registers) setBit(captured, uv.index);
+        }
+    }
+    for (code, 0..) |ins, pc| {
+        if (ins.op != .call or ins.c == bytecode.all_results) continue;
+        // A trailing call has no successor, so nothing is live after it.
+        if (pc + 1 >= code.len) continue;
+        const first_free: u32 = @as(u32, ins.a) + ins.c;
+        const after = live.row(@intCast(pc + 1));
+        for (after, captured, 0..) |l, c, wi| {
+            const lo: u32 = @intCast(wi * 64);
+            if (first_free >= lo + 64) continue;
+            const at_or_above: u64 = if (first_free <= lo) ~@as(u64, 0) else ~@as(u64, 0) << @intCast(first_free - lo);
+            if (l & ~c & at_or_above != 0) return false;
+        }
+    }
+    return true;
+}
+
+/// The base `p` of a dynamic producer at `i` (`call` with `c = all_results`,
+/// or `vararg_spread`) whose next instruction is the multret consumer of its
+/// results (`call`/`ret` with `b = all_results`). Null for anything else,
+/// which keeps the conservative "kills nothing".
+fn dynamicProducerBase(code: []const Instr, i: usize) ?u32 {
+    if (i + 1 >= code.len) return null;
+    const ins = code[i];
+    const produces = switch (ins.op) {
+        .call => ins.c == bytecode.all_results,
+        .vararg_spread => true,
+        else => false,
+    };
+    if (!produces) return null;
+    const next = code[i + 1];
+    const consumes = (next.op == .call or next.op == .ret) and next.b == bytecode.all_results;
+    return if (consumes) ins.a else null;
+}
+
+/// The last survivor set `producerSurvivors` computed, and the producer pc
+/// it belongs to.
+const KeepCache = struct {
+    row: []u64,
+    pc: usize = std.math.maxInt(usize),
+};
+
+/// Into `cache.row`: what survives the consumer of the producer at `i`
+/// (`survivorsOfConsumer(i + 1)`). When that consumer is itself a producer
+/// whose set is still cached, this is one step:
+///     survivors(i) = (live_in[i + 2] ∩ [0, a_{i+1})) ∪ survivors(i + 1)
+/// The worklist drains a chain top-down, so the cache nearly always hits,
+/// and a chain of length L costs O(L · words), not O(L² · words). The
+/// fallback walks the chain.
+fn producerSurvivors(code: []const Instr, bits: []const u64, words: usize, i: usize, cache: *KeepCache) void {
+    const j = i + 1;
+    hit: {
+        if (cache.pc != j) break :hit;
+        const a = dynamicProducerBase(code, j) orelse break :hit;
+        const after = bits[(j + 1) * words ..][0..words];
+        for (cache.row, after, 0..) |*d, v, wi| d.* |= v & belowMask(a, wi);
+        cache.pc = i;
+        return;
+    }
+    survivorsOfConsumer(code, bits, words, j, cache.row);
+    cache.pc = i;
+}
+
+/// Into `out`: the registers live after the multret consumer at `j` and not
+/// written by it — `live_out[j] − kill[j]`, read from the rows already in
+/// `bits`. A `ret` leaves nothing live. A fixed-`c` call writes exactly
+/// `R[a..a+c)`. A consumer that is itself a dynamic producer (`f(g(h()))`)
+/// writes nothing below its own base and, above it, passes on what survives
+/// ITS consumer — so the walk follows the chain. Only the bits the caller
+/// tests (`≥` the producer's base) need be exact; the rest are harmless.
+fn survivorsOfConsumer(code: []const Instr, bits: []const u64, words: usize, consumer: usize, out: []u64) void {
+    @memset(out, 0);
+    var j = consumer;
+    while (true) {
+        const ins = code[j];
+        if (ins.op == .ret or j + 1 >= code.len) return;
+        const after = bits[(j + 1) * words ..][0..words];
+        if (dynamicProducerBase(code, j)) |a| {
+            // Survives below `a` (untouched); above, whatever survives
+            // the next consumer — the next iteration ORs that in.
+            for (out, after, 0..) |*d, v, wi| d.* |= v & belowMask(a, wi);
+            j += 1;
+            continue;
+        }
+        for (out, after) |*d, v| d.* |= v;
+        if (ins.c != bytecode.all_results) {
+            var k: u32 = ins.a;
+            while (k < @as(u32, ins.a) + ins.c and k / 64 < words) : (k += 1) clearBit(out, k);
+        }
+        return;
+    }
+}
+
+/// Word `wi` of the mask of registers `< a`.
+fn belowMask(a: u32, wi: usize) u64 {
+    const lo: usize = wi * 64;
+    if (a >= lo + 64) return ~@as(u64, 0);
+    if (a <= lo) return 0;
+    return (@as(u64, 1) << @intCast(a - lo)) - 1;
 }
 
 fn setBit(ws: []u64, r: u32) void {
@@ -487,20 +651,119 @@ test "a register captured by a child closure is live at every pc" {
     try testing.expect(l.liveIn(2, 1));
 }
 
-test "multret consumers read to the window top; dynamic producers kill nothing" {
+test "multret consumers read to the window top; a producer kills only what its consumer cannot read" {
     const code = [_]Instr{
         Instr.opAx(.load_int, 4, 7), // 0 r4 = 7
-        Instr.opABC(.call, 1, 0, bytecode.all_results), // 1 producer: kills nothing
+        Instr.opABC(.call, 1, 0, bytecode.all_results), // 1 producer
         Instr.opABC(.call, 0, bytecode.all_results, 1), // 2 consumer: reads r0..
         Instr.opAB(.ret, 0, 1), // 3
     };
     const l = try computeT(&code, 5, &.{});
     defer freeT(l);
+    // The consumer row keeps the whole window: a GC in its prologue still
+    // roots every result, wherever the dynamic top landed.
     try testing.expectEqual(@as(u64, 0b11111), liveSet(l, 2, 5));
-    // The producer reads r1 (callee) only, yet r4 survives it: its write
-    // extent is dynamic, so it cannot be proven to overwrite r4.
+    // r4 is dead before the producer: below the producer's top it is
+    // overwritten, above it the consumer never reads it, and nothing reads
+    // it after the consumer.
+    try testing.expectEqual(@as(u64, 0b00011), liveSet(l, 1, 5));
+}
+
+test "a register that survives the multret consumer stays live across its producer" {
+    // r4 is read after the consumer: if the producer's top lands at or
+    // below r4 the consumer leaves it untouched, so it is live throughout.
+    const code = [_]Instr{
+        Instr.opAx(.load_int, 4, 7), // 0 r4 = 7
+        Instr.opABC(.call, 1, 0, bytecode.all_results), // 1 producer
+        Instr.opABC(.call, 0, bytecode.all_results, 1), // 2 consumer: writes r0
+        Instr.opABC(.add, 0, 0, 4), // 3 reads r4
+        Instr.opAB(.ret, 0, 1), // 4
+    };
+    const l = try computeT(&code, 6, &.{});
+    defer freeT(l);
     try testing.expect(l.liveIn(1, 4));
-    try testing.expect(l.liveIn(1, 0));
+    try testing.expect(l.liveIn(2, 4));
+    try testing.expect(!l.liveIn(1, 5));
+    // r0 (the outer callee) and r1 (the producer's callee) are read; the
+    // rest of the producer's span dies.
+    try testing.expectEqual(@as(u64, 0b010011), liveSet(l, 1, 6));
+}
+
+test "a chained producer (f(g(h()))) passes on what survives the outer consumer" {
+    const code = [_]Instr{
+        Instr.opAx(.load_int, 5, 1), // 0 r5 = 1
+        Instr.opAx(.load_int, 6, 2), // 1 r6 = 2 (dead: nothing reads it)
+        Instr.opABC(.call, 2, 0, bytecode.all_results), // 2 h(): producer at r2
+        Instr.opABC(.call, 1, bytecode.all_results, bytecode.all_results), // 3 g(...): consumer AND producer at r1
+        Instr.opABC(.call, 0, bytecode.all_results, 1), // 4 f(...): outer consumer
+        Instr.opABC(.add, 0, 0, 5), // 5 reads r5
+        Instr.opAB(.ret, 0, 1), // 6
+    };
+    const l = try computeT(&code, 8, &.{});
+    defer freeT(l);
+    // Before h(): r0 (f), r1 (g), r2 (h) and the survivor r5; r6/r7 dead.
+    try testing.expectEqual(@as(u64, 0b00100111), liveSet(l, 2, 8));
+    // Before g(...): its window from r1 up is read (dynamic top), all of it.
+    try testing.expectEqual(@as(u64, 0b11111111), liveSet(l, 3, 8));
+    try testing.expect(!l.liveIn(1, 6));
+}
+
+test "a long producer chain: the cached survivor sets match the chain walk" {
+    // f1(f2(f3(f4(f5(h()))))) with r11 read after the outer call. Each
+    // producer from pc 5 down extends the cached set of the one above it.
+    const all = bytecode.all_results;
+    const code = [_]Instr{
+        Instr.opAx(.load_int, 11, 1), // 0 r11 survives the whole chain
+        Instr.opABC(.call, 6, 0, all), // 1 h()
+        Instr.opABC(.call, 5, all, all), // 2 f5(...)
+        Instr.opABC(.call, 4, all, all), // 3 f4(...)
+        Instr.opABC(.call, 3, all, all), // 4 f3(...)
+        Instr.opABC(.call, 2, all, all), // 5 f2(...)
+        Instr.opABC(.call, 1, all, 1), // 6 f1(...): writes r1
+        Instr.opABC(.add, 0, 1, 11), // 7
+        Instr.opAB(.ret, 0, 1), // 8
+    };
+    const l = try computeT(&code, 12, &.{});
+    defer freeT(l);
+    // Before h(): the callees r1..r6 and the survivor r11; r7..r10 are dead.
+    try testing.expectEqual(@as(u64, 0b1000_0111_1110), liveSet(l, 1, 12));
+    // Each chained producer reads its whole window (it is a consumer too),
+    // plus the outer callee r1 below it.
+    try testing.expectEqual(@as(u64, 0b1111_1111_1110), liveSet(l, 5, 12));
+}
+
+test "a multret return consumer leaves no survivors" {
+    const code = [_]Instr{
+        Instr.opAx(.load_int, 3, 7), // 0 r3 = 7
+        Instr.opAB(.vararg_spread, 1, 0), // 1 producer at r1
+        Instr.opAB(.ret, 0, bytecode.all_results), // 2 return r0, ...
+    };
+    const l = try computeT(&code, 4, &.{});
+    defer freeT(l);
+    try testing.expectEqual(@as(u64, 0b0001), liveSet(l, 1, 4));
+    try testing.expectEqual(@as(u64, 0b1111), liveSet(l, 2, 4));
+}
+
+test "a survivor that becomes live only through a back-edge reaches the producer" {
+    // r5 is read only at the loop head (pc 1), so the row after the
+    // consumer (pc 4) gains it only once the back-edge from pc 5 is
+    // followed — in a later round, by which time the consumer's own row
+    // (the whole window) no longer changes. The producer at pc 2 is not a
+    // CFG predecessor of pc 4, so it must be requeued explicitly.
+    const code = [_]Instr{
+        Instr.opAx(.load_int, 5, 1), // 0 r5 = 1
+        Instr.opABC(.add, 0, 0, 5), // 1 loop head: reads r5
+        Instr.opABC(.call, 2, 0, bytecode.all_results), // 2 producer at r2
+        Instr.opABC(.call, 1, bytecode.all_results, 1), // 3 consumer: writes r1
+        Instr.opAx(.jmp_if_false, 1, 1), // 4 r1 falsy → pc 6
+        Instr.opJ(.jmp, -5), // 5 → 1
+        Instr.opAB(.ret, 0, 1), // 6
+    };
+    const l = try computeT(&code, 7, &.{});
+    defer freeT(l);
+    try testing.expect(l.liveIn(4, 5));
+    try testing.expect(l.liveIn(2, 5));
+    try testing.expect(!l.liveIn(2, 6));
 }
 
 test "fixed-arity call reads callee + args and kills exactly its results" {
@@ -607,4 +870,78 @@ test "wide windows span several words; an over-budget proto gets no table" {
     const none = try computeT(big, std.math.maxInt(u16), &.{});
     try testing.expect(!none.available());
     try testing.expect(!(try computeT(&code, 0, &.{})).available());
+}
+
+fn maskableT(code: []const Instr, n: u16, children: []const *const Proto) !bool {
+    const l = try computeT(code, n, children);
+    defer freeT(l);
+    return maskable(testing.allocator, code, l, n, children);
+}
+
+test "doc 61: a register live across a call above its results fails the call-layout check" {
+    // r4 holds a value across the call based at r1 (results r1..r1), which
+    // the compiler never emits: a caller mask `∩ [0, a)` would drop it.
+    const above = [_]Instr{
+        Instr.opAx(.load_int, 4, 7), // 0
+        Instr.opABC(.call, 1, 0, 1), // 1 r1 = r1()
+        Instr.opABC(.add, 0, 1, 4), // 2 reads r4
+        Instr.opAB(.ret, 0, 1), // 3
+    };
+    try testing.expect(!try maskableT(&above, 5, &.{}));
+    // The compiler's shape: the live value sits below the call base.
+    const below = [_]Instr{
+        Instr.opAx(.load_int, 0, 7), // 0
+        Instr.opABC(.call, 1, 0, 1), // 1 r1 = r1()
+        Instr.opABC(.add, 0, 1, 0), // 2
+        Instr.opAB(.ret, 0, 1), // 3
+    };
+    try testing.expect(try maskableT(&below, 2, &.{}));
+    // A result slot read after the call is fine at any width.
+    const results = [_]Instr{
+        Instr.opABC(.call, 0, 0, 3), // 0 r0, r1, r2 = r0()
+        Instr.opABC(.add, 0, 1, 2), // 1
+        Instr.opAB(.ret, 0, 1), // 2
+    };
+    try testing.expect(try maskableT(&results, 3, &.{}));
+}
+
+test "doc 61: captured registers and multret producers pass the call-layout check" {
+    // r4 is captured: an open upvalue aliases it, so it is exempt.
+    const child = Proto{ .code = &.{}, .upvalues = &.{.{ .in_stack = true, .index = 4 }} };
+    const children = [_]*const Proto{&child};
+    const captured = [_]Instr{
+        Instr.opAx(.load_int, 4, 7), // 0
+        Instr.opAB(.closure, 0, 0), // 1
+        Instr.opABC(.call, 1, 0, 1), // 2 r1 = r1()
+        Instr.opABC(.add, 0, 1, 4), // 3 reads r4
+        Instr.opAB(.ret, 0, 1), // 4
+    };
+    try testing.expect(try maskableT(&captured, 5, &children));
+    // `c = all_results`: every register at or above the base is a result.
+    const multret = [_]Instr{
+        Instr.opABC(.call, 1, 0, bytecode.all_results), // 0
+        Instr.opABC(.call, 0, bytecode.all_results, 1), // 1 reads r0..
+        Instr.opAB(.ret, 0, 1), // 2
+    };
+    try testing.expect(try maskableT(&multret, 5, &.{}));
+}
+
+test "doc 61: a proto without liveness is not maskable; the check spans words" {
+    try testing.expect(!try maskable(testing.allocator, &.{}, .{}, 0, &.{}));
+    // r130 live across a call based at r70, two words up.
+    const wide = [_]Instr{
+        Instr.opAx(.load_int, 130, 1), // 0
+        Instr.opABC(.call, 70, 0, 1), // 1
+        Instr.opAB(.move, 0, 130), // 2
+        Instr.opAB(.ret, 0, 1), // 3
+    };
+    try testing.expect(!try maskableT(&wide, 200, &.{}));
+    // r69, one below the call base, is not a layout violation.
+    const below = [_]Instr{
+        Instr.opAx(.load_int, 69, 1), // 0
+        Instr.opABC(.call, 70, 0, 1), // 1
+        Instr.opAB(.move, 0, 69), // 2
+        Instr.opAB(.ret, 0, 1), // 3
+    };
+    try testing.expect(try maskableT(&below, 200, &.{}));
 }

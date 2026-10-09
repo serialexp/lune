@@ -4,7 +4,7 @@
 tests), E3/E4 (the Rust crates + `just embed-test` gate) and E5 (boundary
 benchmark) landed; E6–E9 deferred by design.
 **Owner:** claude (fable)
-**Last updated:** 2026-10-02
+**Last updated:** 2026-10-09
 
 ## Implementation status
 
@@ -166,6 +166,18 @@ land; move whole phases to Done once everything inside them is checked.
   awaiting Bart): GC-time dead-stack clearing (3 instructions; keyframes
   serialize every register below `stack_top`) and a packed fast-path word
   (≤15 instructions, ~31 write sites to keep in sync).
+- [x] **Host results get a private buffer** (2026-10-09, extended beyond the
+  original plan; found by the doc 61 P3 audit). §3.5 had the host write
+  straight into the call site's result window. That broke the no-alias
+  promise: through `pcall`/`xpcall` (results one slot below the args) and
+  `__call` (same slot), `results` overlapped `args`. A window past
+  `stack_top` was also overwritten by frames a nested `mh_call` laid out.
+  Now `Vm.callHostNative` hands every host call its own range of a VM-owned
+  stack (`host_out`; nested host calls go above) and copies the results out
+  after the host returns. `max_results` is capped at 256
+  (`max_host_results`), also when the caller wants every result, so the
+  stack is sized for the deepest nesting `max_native_reentry` allows.
+  Regression tests are in `capi_test.zig`.
 ### Outstanding
 
 - [ ] **E6 — host-call record/replay.** Defer. v1 refuses `.record` AND

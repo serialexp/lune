@@ -139,6 +139,14 @@ pub const max_call_depth: u32 = 200;
 /// clean `StackOverflow` instead of a crash.
 pub const max_native_reentry: u16 = 200;
 
+/// Most results one host fn call may return (its `max_results`), also when the
+/// caller wants all of them (`return host()`). Bounding it lets each active
+/// host call hold a private range of `Vm.host_out`. Host calls nest at most
+/// `max_native_reentry + 1` deep (each nested one runs under a `callValue`), so
+/// `host_out_slots` is enough for the deepest possible nesting.
+pub const max_host_results: usize = 256;
+const host_out_slots: usize = (@as(usize, max_native_reentry) + 1) * max_host_results;
+
 /// Which nondeterministic input a native represents (record/replay boundary), or
 /// null for a pure host call. Defined on `function` (the `Native` carrier) to keep
 /// it cycle-free; re-exported here because effects are an interpreter concept.
@@ -409,6 +417,17 @@ pub const CallFrame = struct {
     /// sentinel-gen frame can never false-hit — fail closed, no panic needed.
     code_cache: []const Instr = &.{},
     code_cache_gen: u64 = CODE_CACHE_GEN_INVALID,
+    /// Doc 61 §4.2: this frame is inside instruction `pc`, which is running
+    /// other code: a native it called, or a re-entry (`callValue`) for a
+    /// metamethod or a native's callback. Without it a non-innermost frame
+    /// is suspended at a Lua `.call`, with `pc` one past it. Set on entry,
+    /// restored to the previous value on success, and left set on error,
+    /// where the frame is retained until a catcher discards it (it restores
+    /// the one surviving frame, `frames[entry_depth - 1]`). Every push
+    /// initialises it false: this default, the native inline push and the
+    /// `.S` host-call frame write. Transient: keyframes refuse capture while
+    /// any frame has it set, so it is never serialized.
+    in_flight: bool = false,
 };
 
 /// Doc 54 P0: `CallFrame.code_cache_gen`'s "no cached image" sentinel. All-ones
@@ -581,6 +600,16 @@ pub const Vm = struct {
     /// absolute indices, so a nested native's scratch region is disjoint from its
     /// caller's — the same disjointness the SoA register file itself relies on.
     boundary_scratch: []Value,
+    /// Every host fn writes its results here (`callHostNative`), never into
+    /// its caller's `out`. The caller's `out` can alias the host's `args`
+    /// (`pcall`, `__call`), and it can reach past `stack_top`, where a nested
+    /// `mh_call` from the host would overwrite results the host already
+    /// wrote. A stack: each active host call holds `[lo, lo + want)` and
+    /// nested ones go above it. Allocated on the first host call, so a VM
+    /// with no host fns doesn't pay for it. Not a GC root, as `out` never was:
+    /// the host keeps what it returns alive until it returns.
+    host_out: []Value = &.{},
+    host_out_top: usize = 0,
     /// Current call depth (number of active frames; guarded by `max_call_depth`).
     depth: u32 = 0,
     /// High-water mark of live register slots across all active frames:
@@ -998,6 +1027,7 @@ pub const Vm = struct {
             .frame_varargs_base_off = @offsetOf(CallFrame, "varargs_base"),
             .frame_varargs_count_off = @offsetOf(CallFrame, "varargs_count"),
             .frame_code_cache_gen_off = @offsetOf(CallFrame, "code_cache_gen"),
+            .frame_in_flight_off = @offsetOf(CallFrame, "in_flight"),
             .max_call_depth = max_call_depth,
         };
     };
@@ -1065,6 +1095,7 @@ pub const Vm = struct {
         self.gpa.free(self.tags);
         self.gpa.free(self.payloads);
         self.gpa.free(self.boundary_scratch);
+        self.gpa.free(self.host_out);
     }
 
     // ---- register-file storage seam (SoA flip, docs/design/09) --------------
@@ -1714,7 +1745,9 @@ pub const Vm = struct {
     /// (a native runs inline, so when it faults the topmost frame is its caller and
     /// that pc is the `.call`). Deeper levels are *parent* frames whose pc is the
     /// resume cursor (one past their outgoing call), so the call-site instruction is
-    /// `pc -| 1` — the same leaf-vs-parent rule as `backtraceFrames`. Returns
+    /// `pc -| 1`, unless the parent is in flight (doc 61 §4.2: it re-entered from
+    /// inside its own instruction, which `pc` names) — the same leaf-vs-parent rule
+    /// as `backtraceFrames`. Returns
     /// `null` for `level == 0`, `level > depth` (past the stack — Lua suppresses
     /// the location prefix in that case), or an empty stack.
     pub fn callSiteAt(self: *Vm, level: usize) ?CallSite {
@@ -1723,7 +1756,9 @@ pub const Vm = struct {
         const f = &self.frames[idx];
         const proto = f.closure.proto;
         const is_top = idx == self.depth - 1;
-        const pc: usize = if (is_top) f.pc else f.pc -| 1;
+        // Doc 61 §4.2: a parent in flight is inside its own instruction (a
+        // metamethod's `.add`, a native's `.call`), not one past a call.
+        const pc: usize = if (is_top or f.in_flight) f.pc else f.pc -| 1;
         const span: bytecode.Span = if (pc < proto.spans.len) proto.spans[pc] else .{};
         // Resolve the line against the proto's *own* source when it has one (a
         // runtime-`load`ed chunk), falling back to the VM's main source for
@@ -1962,7 +1997,9 @@ pub const Vm = struct {
     /// live frame is intact when this is called. The leaf's pc is its pending /
     /// faulting instruction; a parent's pc is the *resume cursor* — one past its
     /// outgoing `call` (set at the call site before pushing the child) — so its
-    /// call-site instruction is `pc -| 1`. Shared by `describeFault` (runtime
+    /// call-site instruction is `pc -| 1` — unless it is in flight (doc 61 §4.2:
+    /// a metamethod or a native's callback re-entered from inside its own
+    /// instruction, which `pc` names). Shared by `describeFault` (runtime
     /// errors) and the replay driver (per-step backtrace), so the leaf-vs-call-site
     /// logic can never drift. `arena` owns the returned slice.
     pub fn backtraceFrames(self: *Vm, source: []const u8, arena: std.mem.Allocator) std.mem.Allocator.Error![]FaultFrame {
@@ -1972,7 +2009,7 @@ pub const Vm = struct {
             i -= 1;
             const f = &self.frames[i];
             const fp = f.closure.proto;
-            const fpc: usize = if (i == self.depth - 1) f.pc else f.pc -| 1;
+            const fpc: usize = if (i == self.depth - 1 or f.in_flight) f.pc else f.pc -| 1;
             const fspan: bytecode.Span = if (fpc < fp.spans.len) fp.spans[fpc] else .{};
             // Per-proto source (a `load`ed chunk reports its own lines), falling
             // back to the passed source for statically-compiled protos.
@@ -2160,6 +2197,10 @@ pub const Vm = struct {
     pub inline fn runPushedFrame(self: *Vm, entry_depth: u32, base: usize) Error!FrameResult {
         std.debug.assert(self.suspend_ctl == null);
         std.debug.assert(self.depth == entry_depth + 1);
+        // Doc 61 §4.2: a host entry needs no marking of its own. At depth > 0
+        // it runs inside a host fn, whose caller frame the dispatch native
+        // arm or `callValue` already marked in flight.
+        std.debug.assert(entry_depth == 0 or self.frames[entry_depth - 1].in_flight);
         self.native_reentry_depth += 1;
         defer self.native_reentry_depth -= 1;
         self.final_cut = null;
@@ -2200,16 +2241,33 @@ pub const Vm = struct {
     /// Embedding (doc 59 §3.5): invoke an embedder-registered host function —
     /// the SINGLE funnel for every host-native invocation (the dispatch `.call`
     /// native arm and `callValue`'s `.native` arm both route here, so a future
-    /// effect-recording chunk cannot miss a path). Contract differences from
-    /// builtin natives: `out` must be DISJOINT from `args` (host callbacks are
-    /// arbitrary embedder code — the NativeMultiFn read-args-first alias
-    /// discipline cannot be imposed on them), and the binding owns its own
+    /// effect-recording chunk cannot miss a path). The binding owns its own
     /// result protocol (`host != null ⇒ effect/multi/recorded all null`).
-    fn callHostNative(self: *Vm, nat: *const function.Native, args: []const Value, out: []Value) Error!usize {
+    ///
+    /// The host never writes its caller's destination. Host callbacks are
+    /// arbitrary embedder code, so the NativeMultiFn read-args-first
+    /// discipline can't be imposed on them, and the destination may alias
+    /// `args` (`pcall`'s results sit one slot below its args, a `__call`
+    /// redirect's at the same slot). It may also reach past `stack_top`,
+    /// where a nested `mh_call` from the host lays out its frames. So the host
+    /// writes a private range of `host_out` (at most `max_host_results` of the
+    /// `want` asked for), and the returned slice of it holds the results. The
+    /// range is free again once this returns: the caller copies the slice out
+    /// before anything else can run a host fn. Inline, because both callers
+    /// are on the host-call path and a call here costs more than the work.
+    inline fn callHostNative(self: *Vm, nat: *const function.Native, args: []const Value, want: usize) Error![]const Value {
         const hb = nat.host.?;
         std.debug.assert(nat.effect == null and nat.multi == null and nat.recorded == null);
-        const produced = hb.call(hb.ctx, @ptrCast(self), args, out) catch |e| return narrowError(e);
-        return @min(produced, out.len);
+        if (self.host_out.len == 0) self.host_out = try self.gpa.alloc(Value, host_out_slots);
+        const n = @min(want, max_host_results);
+        const lo = self.host_out_top;
+        if (lo + n > self.host_out.len) return Error.StackOverflow;
+        self.host_out_top = lo + n;
+        // Error or not, the host has returned and its range is free again.
+        defer self.host_out_top = lo;
+        const buf = self.host_out[lo .. lo + n];
+        const produced = hb.call(hb.ctx, @ptrCast(self), args, buf) catch |e| return narrowError(e);
+        return buf[0..@min(produced, n)];
     }
 
     /// `callValue`'s native dispatch once `args` are rooted (the caller parked
@@ -2218,10 +2276,14 @@ pub const Vm = struct {
     fn callNativeUnparked(self: *Vm, nat: *const function.Native, args: []const Value, results_out: []Value) Error!usize {
         if (nat.host != null) {
             // Embedder host fn (doc 59 §3.5): the single invocation
-            // funnel. `results_out` never aliases `args` here (direct
-            // call: two caller buffers; `__call` redirect: parked window
-            // above vs caller buffer below — see the multi note).
-            return self.callHostNative(nat, args, results_out);
+            // funnel. `results_out` may alias `args` (`pcall` passes slices
+            // of its own args and out); the funnel's private buffer makes
+            // that safe.
+            const res = try self.callHostNative(nat, args, results_out.len);
+            // Whole-word stores: `results_out` is often a host buffer the C
+            // side reads as 8-byte words (`Value.storeWords`).
+            for (res, 0..) |v, k| Value.storeWords(&results_out[k], v);
+            return res.len;
         }
         if (nat.effect) |kind| {
             const r = try performEffect(self, kind, nat, args);
@@ -2253,6 +2315,25 @@ pub const Vm = struct {
         self.native_reentry_depth += 1;
         defer self.native_reentry_depth -= 1;
 
+        // Doc 61 §4.2: the current frame is in flight inside its instruction
+        // while the re-entered code runs (a metamethod, a native's callback,
+        // a host `mh_call`), whether that pushes a frame above it or runs a
+        // native that might. Restored on success only: an error leaves it set
+        // with the retained faulting frames, for the catcher. For an `xpcall`
+        // handler the current frame is the topmost faulting one, so this is
+        // also §4.4's mark.
+        if (self.depth == 0) return self.callValueIn(callee, args, results_out);
+        const fr = &self.frames[self.depth - 1];
+        const prev_in_flight = fr.in_flight;
+        fr.in_flight = true;
+        const n = try self.callValueIn(callee, args, results_out);
+        fr.in_flight = prev_in_flight;
+        return n;
+    }
+
+    /// `callValue`'s dispatch on the callee kind, once the re-entry is
+    /// counted and the current frame marked in flight.
+    inline fn callValueIn(self: *Vm, callee: Value, args: []const Value, results_out: []Value) Error!usize {
         switch (callee.heapType()) {
             // Native callee: no frame — mirror the `.call` `.native` dispatch arm.
             // Results go straight into `results_out` (a concrete count is always
@@ -2300,16 +2381,17 @@ pub const Vm = struct {
                 // "errors don't unwind frames" invariant. Success falls through to
                 // the explicit `stack_top` restore below.
                 const outcome = try self.execWithEntry(cl, cp, callee_base, entry_depth + 1);
-                const fr = switch (outcome) {
+                const res = switch (outcome) {
                     .finished => |f| f,
-                    // `suspend_ctl == null` (asserted above) ⇒ exec never suspends.
+                    // `suspend_ctl == null` (asserted in `callValue`) ⇒ exec
+                    // never suspends.
                     .suspended => unreachable,
                 };
                 // The boundary frame is popped (`depth == entry_depth`) but
                 // `stack_top` is still raised over its window, so its result
                 // registers are live and rooted. Copy them out before shrinking.
-                const src = callee_base + fr.reg;
-                const n = @min(@as(usize, fr.count), results_out.len);
+                const src = callee_base + res.reg;
+                const n = @min(@as(usize, res.count), results_out.len);
                 var k: usize = 0;
                 // Whole-word stores: `results_out` is often a host buffer the
                 // C side reads as 8-byte words (`Value.storeWords`).
@@ -2379,12 +2461,77 @@ pub const Vm = struct {
     /// is untouched, and the program continues (the triggering allocation may
     /// still OOM on its own, which is reported normally).
     pub fn collect(self: *Vm) void {
+        if (std.debug.runtime_safety) self.assertFrameShapesKnown();
+        if (builtin.is_test) if (test_collect_probe) |probe| probe(self);
         self.heap.beginCollect() catch return;
         // The root set is defined once in `forEachRootHeader`; marking is just
         // "call `markHeader` on each root".
         self.forEachRootHeader(.gc, null, self.heap, gc.Heap.markHeader);
         self.heap.traceAll();
         self.heap.sweep();
+    }
+
+    /// Test builds only: called at the start of every `collect` on this
+    /// thread, to observe the frame state a collection sees (doc 61 §4.1's
+    /// innermost pc). Thread-local, so VMs on other threads are unaffected;
+    /// `collect` never reads it outside test builds.
+    pub threadlocal var test_collect_probe: ?*const fn (*Vm) void = null;
+
+    /// Doc 61 §4: the shape of a live frame at a collection, read from
+    /// recorded state (`in_flight`, `pc`, the opcode before `pc`), never
+    /// guessed. It names the pc whose `Proto.reg_live` row is the frame's
+    /// mask.
+    pub const FrameShape = struct {
+        kind: Kind,
+        /// The mask row: `live_in[pc]` (§4.1, §4.2), intersected with
+        /// `[0, call_a)` for `.suspended_call` (§4.3).
+        pc: usize,
+        /// `.suspended_call` only: the base `a` of the `.call` at `pc - 1`.
+        call_a: u16 = 0,
+
+        pub const Kind = enum {
+            /// §4.1: the top frame, between instructions (`pc` is the next
+            /// one) or inside one that runs no other code.
+            innermost,
+            /// §4.2: inside instruction `pc`, which is running other code.
+            in_flight,
+            /// §4.3: below the top, one past the `.call` that pushed the frame
+            /// above it.
+            suspended_call,
+            /// §4.5: none of the above; the frame is scanned whole.
+            unknown,
+        };
+    };
+
+    pub fn frameShape(self: *const Vm, i: usize) FrameShape {
+        std.debug.assert(i < self.depth);
+        const f = &self.frames[i];
+        if (f.in_flight) return .{ .kind = .in_flight, .pc = f.pc };
+        if (i == self.depth - 1) return .{ .kind = .innermost, .pc = f.pc };
+        const code = f.closure.proto.code;
+        // `pc == 0` would read before the code; no `.call` can precede it.
+        if (f.pc == 0 or f.pc > code.len) return .{ .kind = .unknown, .pc = f.pc };
+        const call = code[f.pc - 1];
+        if (call.op != .call) return .{ .kind = .unknown, .pc = f.pc };
+        return .{ .kind = .suspended_call, .pc = f.pc, .call_a = call.a };
+    }
+
+    /// Doc 61 §4.5: every frame of a maskable proto lands in a known shape,
+    /// with its mask pc inside the code. Checked at every collection in
+    /// safety builds (the gc-stress test legs collect at every safepoint).
+    fn assertFrameShapesKnown(self: *const Vm) void {
+        for (0..self.depth) |i| {
+            const proto = self.frames[i].closure.proto;
+            if (!proto.maskable) continue;
+            const shape = self.frameShape(i);
+            // The mask row `live_in[pc]` must exist (a `.call` is never a
+            // proto's last instruction: the compiler ends every body in
+            // `ret`/`halt`).
+            const in_code = shape.kind != .unknown and shape.pc < proto.code.len;
+            if (!in_code) std.debug.panic("doc 61: frame {d}/{d} ({s}) has no known shape: {s} at pc {d} of {d}", .{
+                i, self.depth, proto.name, @tagName(shape.kind), shape.pc, proto.code.len,
+            });
+        }
     }
 
     /// Visit every GC root that is a heap object, invoking `cb(ctx, header)` once
@@ -2899,6 +3046,10 @@ pub const Vm = struct {
                 // `instr` carries the fetch pointer (`&st.code[pc]`) through
                 // the trampoline. It survives `collect()`: the collector is
                 // non-moving and never swaps the cached code image.
+                // Doc 61 §4.1: publish the innermost frame's true next pc
+                // before collecting (step 6 would store the same value just
+                // after), so the collector reads `frame.pc` for every frame.
+                st.frame.pc = pc;
                 vm.collect();
                 return dispatchPostGc(mode, st, pc, instr, vm, tags, payloads);
             }
@@ -6510,8 +6661,17 @@ pub const Vm = struct {
                         const va_base: usize = if (va_count > 0) base + a + 1 + cp.num_params else 0;
                         // Freeze the caller's resume cursor (already one past
                         // this call), push the callee, and reload onto it.
+                        // Doc 61 §4.3: a caller suspended at a Lua call is
+                        // out of flight with `pc` one past a `.call`.
+                        std.debug.assert(!st.frame.in_flight);
                         st.frame.pc = pc;
-                        self.pushFrameVararg(cl, callee_base, instr.a, instr.c, va_base, va_count) catch |e| return parkErr(st, e);
+                        self.pushFrameVararg(cl, callee_base, instr.a, instr.c, va_base, va_count) catch |e| {
+                            // Doc 61 §4.4 fault-pc invariant: a frame left
+                            // faulting names its faulting instruction, the
+                            // `.call` (as the early checks above leave it).
+                            st.frame.pc = pc - 1;
+                            return parkErr(st, e);
+                        };
                         reloadTopFrame(st);
                         // Doc 44: count this SUCCESSFUL Lua-callee entry
                         // toward the callee's function-head anchor (after the
@@ -6550,6 +6710,13 @@ pub const Vm = struct {
                         const entry_top = self.stack_top;
                         const args_end = base + a + 1 + nargs;
                         if (args_end > entry_top) self.stack_top = args_end;
+                        // Doc 61 §4.2: the frame is in flight at this `.call`
+                        // for the native's whole duration, so every frame a
+                        // callback or a host entry pushes above it finds its
+                        // caller marked. Cleared on success; an error leaves it
+                        // set for the catcher, like `stack_top`.
+                        std.debug.assert(!st.frame.in_flight);
+                        st.frame.in_flight = true;
                         // Materialize the args into the absolute-indexed
                         // boundary scratch so the native ABI keeps speaking
                         // `[]Value` after the register file split (SoA). The
@@ -6583,24 +6750,21 @@ pub const Vm = struct {
                         // at it), so none of this touches the JIT.
                         const all = nwanted == bytecode.all_results;
                         if (nat.host != null) {
-                            // Embedder host fn (doc 59 §3.5): results must NOT
-                            // alias the args (arbitrary embedder code — no
-                            // read-args-first discipline), so park them in the
-                            // boundary scratch ABOVE the args and copy down to
-                            // the destination afterwards. Host calls are trace
-                            // barriers and cross the C boundary anyway — the
-                            // extra copy is noise there.
-                            const out_lo = base + a + 1 + nargs;
+                            // Embedder host fn (doc 59 §3.5): the results land
+                            // in the destination slots from `regs[a]`. The
+                            // host wrote them to a private buffer
+                            // (`callHostNative`), so they never aliased
+                            // `args` or anything a nested call wrote.
+                            const out_lo = base + a;
                             const want: usize = if (all) self.regCapacity() -| out_lo else nwanted;
                             if (out_lo + want > self.regCapacity()) return parkErr(st, Error.StackOverflow);
-                            const out = self.scratchOut(out_lo, out_lo + want);
-                            const produced = self.callHostNative(nat, args, out) catch |e| return parkErr(st, e);
+                            const res = self.callHostNative(nat, args, want) catch |e| return parkErr(st, e);
+                            const produced = res.len;
                             // Straight-line from here to the register writes —
-                            // no allocation, so the scratch results (rooted
-                            // only via the host's park/refs) can't be swept
-                            // mid-copy.
+                            // no allocation, so the results (rooted only via
+                            // the host's park/refs) can't be swept mid-copy.
                             var k: usize = 0;
-                            while (k < produced) : (k += 1) self.regSet(base + a + k, self.boundary_scratch[out_lo + k]);
+                            while (k < produced) : (k += 1) self.regSet(out_lo + k, res[k]);
                             if (all) {
                                 std.debug.assert(!self.reg_top_pending);
                                 self.reg_top = base + a + produced;
@@ -6632,6 +6796,7 @@ pub const Vm = struct {
                             const result = nat.func(@ptrCast(self), args) catch |e| return parkErr(st, narrowError(e));
                             if (all) self.stampSingleResult(base, a, result) else writeSingleResult(st.regs, a, nwanted, result);
                         }
+                        st.frame.in_flight = false;
                         self.stack_top = entry_top;
                     },
                     // `__call`: a non-callable heap value (typically a table)

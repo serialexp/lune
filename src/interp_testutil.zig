@@ -93,6 +93,9 @@ pub const CapturedOpts = struct {
     /// Override `Config.silent_promotion_enabled` (doc 56 Phase 6's rowed
     /// vs silent comparisons); null keeps the default.
     silent_promotion: ?bool = null,
+    /// Runs on each leg's configured VM before the program: install
+    /// test-only natives or globals.
+    setup: ?*const fn (*Vm) anyerror!void = null,
     inspect: ?*const fn (*Vm, TraceMode) anyerror!void = null,
 };
 
@@ -131,6 +134,7 @@ pub fn runCapturedTuned(
     if (opts.hotguard) |hg| vm.trace.config.hotguard = hg;
     if (opts.instunroll) |n| vm.trace.config.instunroll = n;
     if (opts.silent_promotion) |on| vm.trace.config.silent_promotion_enabled = on;
+    if (opts.setup) |setup| try setup(&vm);
 
     var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();

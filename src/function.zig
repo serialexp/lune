@@ -160,10 +160,13 @@ pub const NativeMultiFn = *const fn (ctx: *anyopaque, args: []const Value, out: 
 /// no C types here (the C adaptation lives entirely in `capi.zig`, per the
 /// wrapper-boundary rule). `ctx` is the binding's own userdata (NOT the VM; the
 /// VM arrives as the opaque second parameter so this module needn't import
-/// `interp`). Writes up to `out.len` results and returns the count produced;
-/// the VM nil-pads the rest. Unlike `NativeMultiFn`, `out` NEVER aliases `args`
-/// (the invocation funnel guarantees disjoint buffers), so a host fn may write
-/// results before it finishes reading args. Results are trusted as well-formed
+/// `interp`). Writes up to `out.len` results (at most `interp.max_host_results`)
+/// and returns the count produced; the VM nil-pads the rest. Unlike
+/// `NativeMultiFn`, `out` NEVER aliases `args` and nothing else writes it
+/// while the host fn runs, nested VM calls included: the invocation funnel
+/// (`Vm.callHostNative`) hands it a private buffer and copies the results out
+/// afterwards. So a host fn may write results before it finishes reading args,
+/// or before it calls back into the VM. Results are trusted as well-formed
 /// `Value`s (a boolean's payload is 0 or 1); the C adapter validates its host's
 /// results with `capi.fromC` before they get here.
 pub const HostFn = *const fn (ctx: ?*anyopaque, vm: *anyopaque, args: []const Value, out: []Value) anyerror!usize;

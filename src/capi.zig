@@ -204,8 +204,10 @@ pub const mh_mem_stats = extern struct {
 /// A registered host function (doc 59 §3.5). Multi-result from day one: write
 /// up to `max_results` values into `results`, set `*nresults`, return
 /// `MH_OK`. Any other status raises a guest error (catchable by `pcall`)
-/// carrying the message last set with `mh_error_set`. `args` and `results`
-/// never alias. The `vm` handle may be used reentrantly (call back into the
+/// carrying the message last set with `mh_error_set`. `max_results` is at most
+/// `interp.max_host_results`. `args` and `results` never alias, and nothing
+/// else writes `results` while the callback runs (`Vm.callHostNative` hands
+/// it a private buffer). The `vm` handle may be used reentrantly (call back into the
 /// guest) — but never `mh_vm_free`d from inside the callback.
 pub const mh_host_fn = *const fn (
     vm: ?*VmBox,
@@ -395,6 +397,10 @@ fn guestFault(box: *VmBox, entry_depth: u32, entry_top: usize, err: interp.Error
     vm.dropRegionActivationsFromDepth(entry_depth);
     vm.depth = entry_depth;
     vm.stack_top = entry_top;
+    // Doc 61 §4.2: nothing to restore. A capi entry at depth > 0 runs inside
+    // a host fn, so the surviving frame was in flight at entry, and an error
+    // only ever leaves flags set.
+    std.debug.assert(entry_depth == 0 or vm.frames[entry_depth - 1].in_flight);
     vm.final_cut = null;
     return .err_runtime;
 }

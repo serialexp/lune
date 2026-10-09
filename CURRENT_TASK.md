@@ -52,12 +52,23 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
   `native_reentry_depth != 0`. Codex reviewed it
   (`docs/reviews/doc61/codex-phaseP.md`); its callee-rooting blocker is
   fixed. Audit rows 7–8 (host args/out aliasing, the host results scratch)
-  are open in coral-marten's area. Next: gates, hashgate, commit (interp.zig
-  is shared with coral's gated-back-edge hunks, so whoever commits first
-  takes the whole file), push, pt-default board for P1/P2's hot-path cost.
+  are open in coral-marten's area. Committed and pushed as `ba6ce32`.
+- **Phase 0 is done (2026-10-09)** and bundled into one commit with two
+  other changes: coral's capi host results fix (audit rows 7–8, closed),
+  and the armed bridge carried-home fix (codex Phase 0 blocker 1).
+  - Phase 0 adds `CallFrame.in_flight` and its marking, FrameShape and
+    `assertFrameShapesKnown`. It also tightens bc_liveness producer/consumer
+    precision, made linear via KeepCache (`bench/compile_multret_chain.lua`).
+  - Codex approved it (`docs/reviews/doc61/codex-phase0.md`, with the
+    bridge follow-up).
+  - The bridge fix: `emitCompositeBridgeSnapshot` flushes the carried homes
+    before E.
+  - **Phase 1 prerequisite (open):** conservative multret consumer rows can
+    root the stale tail `[top, nreg)`. Options A/A′/B are in doc 61 §5;
+    codex recommends B (record the dynamic top and mask with it). Decide
+    this in Phase 1's review.
 - **Then, in order:**
-  - Phase 0 (it also covers P4's `in_flight` half);
-  - Phase Q;
+  - Phase Q (design section + review first);
   - Phase 1;
   - Phase 2: land the uncommitted dead-φ filter and retire the watermark;
   - Phase V.

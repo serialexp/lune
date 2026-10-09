@@ -404,6 +404,9 @@ pub const FrameMotionAbi = struct {
     /// doc-20 fetch-image cache, replicating the push struct-literal's
     /// default).
     frame_code_cache_gen_off: i32,
+    /// `CallFrame.in_flight` (bool; the push writes 0, replicating the
+    /// struct-literal default — doc 61 §4.2).
+    frame_in_flight_off: i32,
     /// `interp.max_call_depth` — the depth wall immediate.
     max_call_depth: u32,
 };
@@ -726,7 +729,8 @@ pub const TraceCode = struct {
         // Doc 43 P0c (fail-closed): an ARMED composite bridge hands off directly to
         // the successor (`nativegen` edge-4 stub: snapshot φ slots, then `jmpMem`
         // to `exit_target` — NO tier-0 replay) and its snapshot
-        // (`emitCompositeBridgeSnapshot`) flushes ONLY slot-bound φs. A SUNK heap
+        // (`emitCompositeBridgeSnapshot`) flushes ONLY the carried homes and the
+        // slot-bound φs of E. A SUNK heap
         // store (RMW `astore`/`hstore`/`gstore`, or the deferred gmatch
         // `sgm_setpos`) is deopt-deferred to the trace tail — below every body
         // guard — on the promise that any side-exit re-runs the iteration in tier-0
@@ -770,8 +774,10 @@ pub const TraceCode = struct {
     /// state on the edge out of it). E is admitted only when it agrees with
     /// that state on every slot live at `landing`, the pc the bridge lands on:
     /// a live E member must be in the snapshot with the SAME ref, and a live
-    /// snapshot write must be in E (or re-store the slot's own entry value,
-    /// which the carried flush already leaves in place). Liveness is taken at
+    /// snapshot write must be in E (or re-store the slot's own current value,
+    /// which the bridge's carried-home flush, `emitCarriedHomesFlush`, writes
+    /// before E). Every slot outside E is coherent at the hand-off: carried
+    /// homes are flushed, invariant slots never changed. Liveness is taken at
     /// `landing`, not at the guard: the branch's own condition temp is read by
     /// the branch and dead past it (nsieve's `if flags[i]`). Anything the
     /// bridge successor reads is live at `landing` — the overlay walks only

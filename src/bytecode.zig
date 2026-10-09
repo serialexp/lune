@@ -638,6 +638,12 @@ pub const Proto = struct {
     /// Doc 56 §4.2: per-pc register liveness (see `RegLiveness`). Filled by
     /// the compiler; empty (unavailable) on hand-built protos.
     reg_live: RegLiveness = .{},
+    /// Doc 61 §5: `reg_live` is available AND the code passes the call-layout
+    /// check (`bc_liveness.maskable`). The one predicate the GC root walk and
+    /// every JIT store-elision site read: a frame of a non-maskable proto is
+    /// scanned whole, and its traces keep every store. Filled by the compiler;
+    /// false on hand-built protos.
+    maskable: bool = false,
     /// Doc 58 §4.8: the CFG's dominator tree (see `DomTree`). Filled by the
     /// compiler; empty (unavailable) on hand-built protos.
     dom: DomTree = .{},

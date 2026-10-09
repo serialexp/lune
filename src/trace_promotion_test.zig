@@ -2965,3 +2965,100 @@ test "doc 52 P1: demotion funnels — activation close skips residents; deferred
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.resident_set_count);
     try testing.expectEqual(@as(u8, 0), state.region_policy.region_defs.get(key.region_id).?.recurrence_streak);
 }
+
+test "an armed bridge out of a `.loop` source commits the carried homes its local iterations advanced" {
+    // A `.loop`-closed bridge source keeps its carried slots in registers
+    // across local iterations; only an exit writes them back to the slab. Slot
+    // 2 (an accumulator) is updated AFTER the composite guard, so it is
+    // neither in E nor in the exit snapshot. Four local iterations advance it
+    // from 100 to 104 before the fifth fails the guard and the armed bridge
+    // hands off with no tier-0 replay: the slab must hold 104, exactly what
+    // the ordinary deopt's carried flush would leave.
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [32]Instr = @splat(Instr.op0(.halt));
+    code[5] = Instr.opAx(.jmp_if_true, 0, 10);
+    const proto = Proto{ .id = 1719, .code = &code, .name = "bridge-carried-loop", .num_registers = 4 };
+
+    const bridge = try gpa.create(Trace);
+    {
+        errdefer gpa.destroy(bridge);
+        const instrs = try gpa.dupe(IrInstr, &.{
+            .{ .op = .slot_load, .aux = 0 }, // 0: i
+            .{ .op = .slot_load, .aux = 1 }, // 1: limit
+            .{ .op = .slot_load, .aux = 2 }, // 2: acc
+            .{ .op = .konst, .aux = 0 }, // 3: 1
+            .{ .op = .guard_int, .a = 0 },
+            .{ .op = .guard_int, .a = 1 },
+            .{ .op = .guard_int, .a = 2 },
+            .{ .op = .add, .a = 0, .b = 3, .ty = .int }, // 7: i + 1
+            .{ .op = .lt, .a = 7, .b = 1 }, // 8: outer re-test
+            .{ .op = .guard_true, .a = 8, .aux = 6 }, // 9: composite guard
+            .{ .op = .add, .a = 2, .b = 3, .ty = .int }, // 10: acc + 1, after the guard
+            .{ .op = .phi, .b = 7, .aux = 0 },
+            .{ .op = .phi, .b = 10, .aux = 2 },
+            .{ .op = .loop },
+        });
+        errdefer gpa.free(instrs);
+        const consts = try gpa.dupe(Value, &.{Value.int(1)});
+        errdefer gpa.free(consts);
+        const entry_slots = try gpa.alloc(u16, 0);
+        errdefer gpa.free(entry_slots);
+        const entry_guards = try gpa.alloc(EntryGuard, 0);
+        errdefer gpa.free(entry_guards);
+        const exit_prov = try gpa.dupe(ExitProvEntry, &.{
+            .{ .index = 9, .prov = .{ .guard = .{ .source_proto_id = proto.id, .source_pc = 5, .role = .branch_cond, .operand = .a, .polarity = .taken } } },
+        });
+        errdefer gpa.free(exit_prov);
+        bridge.* = .{
+            .code = .{
+                .anchor = .{ .proto = &proto, .pc = 20 },
+                .instrs = instrs,
+                .consts = consts,
+                .entry_slots = entry_slots,
+                .entry_guards = entry_guards,
+                .exit_prov = exit_prov,
+            },
+            .id = 61,
+        };
+        try @import("trace_testutil.zig").snapshotBranchGuardsFromPhis(gpa, &bridge.code);
+        try testing.expect(nativegen.isCompositeBridgeCandidate(&bridge.code, 9));
+        bridge.native = .{ .compiled = nativegen.compileInto(gpa, &state.registry.mcode_arena, &bridge.code, bridge.id, null, null) orelse
+            return error.NativeBailedUnexpectedly };
+        errdefer bridge.native.deinit();
+        try state.registry.cache.append(gpa, bridge);
+    }
+    const succ = try makeB3LinkTrace(gpa, &state, &proto, 62, 9, 20);
+    const rid: RegionId = @enumFromInt(1719);
+    try state.region_policy.region_defs.put(gpa, rid, .{
+        .members = try gpa.dupe(StructuralEdgeId, &.{.{
+            .anchor_proto_id = proto.id,
+            .anchor_pc = bridge.code.anchor.pc,
+            .exit = bridge.code.exit_prov[0].prov,
+            .succ_anchor_proto_id = proto.id,
+            .succ_anchor_pc = succ.code.anchor.pc,
+        }}),
+        .member_points = try gpa.dupe(ProgramPoint, &.{
+            .{ .proto_id = proto.id, .source_pc = bridge.code.anchor.pc },
+            .{ .proto_id = proto.id, .source_pc = succ.code.anchor.pc },
+        }),
+        .owner = bridge.code.anchor,
+        .classifier = .{ .kind = .cross_trace_cycle, .member_count = 2 },
+        .armable = true,
+        .bridges = try gpa.alloc(RegionBridgeDef, 0),
+    });
+    try testing.expect(try state.armNativeLink(bridge, 9, succ, .region_bridge));
+
+    var tags: [4]u8 = @splat(@intFromEnum(value.Tag.int));
+    var payloads = [4]u64{ @bitCast(@as(i64, 0)), @bitCast(@as(i64, 5)), @bitCast(@as(i64, 100)), 0 };
+    var ledger: [trace_exec.LEDGER_CAP]trace_exec.LedgerEntry = undefined;
+    const res = bridge.native.compiled.runCapturingLedger(RegWindow.of(&tags, &payloads), &ledger, .{});
+    try testing.expectEqual(@as(usize, 2), res.ledger_len);
+    try testing.expectEqual(trace_exec.LedgerKind.region_bridge, ledger[0].kind);
+    try testing.expectEqual(bridge.id, ledger[0].id);
+    try testing.expectEqual(succ.id, ledger[1].id); // the successor ran
+    try testing.expectEqual(@as(i64, 5), @as(i64, @bitCast(payloads[0]))); // E: the stepped i
+    try testing.expectEqual(@as(i64, 104), @as(i64, @bitCast(payloads[2]))); // the carried acc
+}

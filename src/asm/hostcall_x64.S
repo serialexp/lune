@@ -64,6 +64,7 @@
     EXPECT(CF_CLOSURE_SIZE == 8 && CF_CALL_SEQ_SIZE == 8 && CF_BASE_SIZE == 8 && CF_PC_SIZE == 8, "the entry assumes 64-bit CallFrame closure, call_seq, base and pc")
     EXPECT(CF_VARARGS_BASE_SIZE == 8 && CF_VARARGS_COUNT_SIZE == 8 && CF_CODE_CACHE_GEN_SIZE == 8, "the entry assumes 64-bit CallFrame varargs and code_cache_gen")
     EXPECT(CF_RET_DEST_SIZE == 2 && CF_RET_COUNT_SIZE == 2, "the entry assumes 16-bit CallFrame ret_dest and ret_count")
+    EXPECT(CF_IN_FLIGHT_SIZE == 1, "the entry assumes a byte-wide CallFrame.in_flight")
     EXPECT(PROTO_NUM_PARAMS_SIZE == 1 && PROTO_IS_VARARG_SIZE == 1, "the entry assumes byte-wide Proto.num_params and is_vararg")
     EXPECT(PROTO_NUM_REGISTERS_SIZE == 2, "the entry assumes a 16-bit Proto.num_registers")
     EXPECT(GCHEADER_TYPE_SIZE == 1, "the entry assumes a byte-wide heap type")
@@ -243,8 +244,10 @@ FUNC_BEGIN(mahina_hostcall_entry)
 
     /* 3. Capture the entry state; 5 (first half). Take a call_seq and write
      * the frame's fixed fields into frames[entry_depth]: closure, call_seq,
-     * pc, ret_dest, ret_count, and the code-cache sentinel (section 3.2:
-     * `code_cache` itself is not written, the generation invalidates it). */
+     * pc, ret_dest, ret_count, the code-cache sentinel (section 3.2:
+     * `code_cache` itself is not written, the generation invalidates it),
+     * and in_flight = 0 (doc 61 section 4.2: the slot may hold a retained
+     * faulting frame's set flag). */
     mov VM(VM_STACK_TOP)(%rbx), %r13
     mov VM(VM_DEPTH)(%rbx), %eax
     imul $CF_SIZE, %rax, %r9
@@ -258,6 +261,7 @@ FUNC_BEGIN(mahina_hostcall_entry)
     movw $0, CF_RET_DEST(%r9)
     movw $0, CF_RET_COUNT(%r9)
     movq $CODE_CACHE_GEN_INVALID, CF_CODE_CACHE_GEN(%r9)
+    movb $0, CF_IN_FLIGHT(%r9)
 
     /* 4. Bind, as `bindAndPushClosure`. rdi/rsi walk the tag and payload
      * lanes from entry_top; they stay contiguous through the arg region (if

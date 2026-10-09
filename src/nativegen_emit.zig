@@ -1018,6 +1018,9 @@ pub fn emitInlineSelfPush(
     // Doc-20 fetch-image cache invalidation (the struct-literal default):
     // qword -1 == CODE_CACHE_GEN_INVALID.
     try a.movMemImm32(.rax, abi.frame_code_cache_gen_off, -1);
+    // Doc 61 §4.2: a pushed frame starts out of flight (the struct-literal
+    // default); the slot may hold a retained faulting frame's set flag.
+    try a.movByteMemImm(.rax, abi.frame_in_flight_off, 0);
     // ctx.base refresh now, while rcx still holds callee_base (step 8's
     // base half, hoisted — nothing observes ctx mid-sequence).
     try a.movMemReg(.r9, @offsetOf(Ctx, "base"), .rcx);
@@ -2510,12 +2513,42 @@ pub fn emitLinkedLoopDoneSnapshot(
     }
 }
 
-/// Part A-v (doc 17 §A2.1): materialize the bridge's compile-time set E.
-/// Slot-bound phis are the trace successor's live VM-slot writebacks, restricted
-/// to updates defined before `exit_instr`. Candidacy already proved this set
-/// equals the exit snapshot's state on every live slot, so flushing it commits
-/// exactly the guest state at the guard. Post-guard phis and internal optimizer
-/// phis are deliberately excluded.
+/// The carried-home write-back a coarse exit owes the slab. A `.loop` trace
+/// keeps each carried slot in its home across local iterations, so until an
+/// exit re-boxes it the slab still holds the trace-entry value. `bridge_exit`
+/// names an armed composite bridge's guard: the slots its set E commits are
+/// skipped, since E overwrites them anyway.
+pub fn emitCarriedHomesFlush(a: *x64.Assembler, t: *const Trace, alloc: *const Alloc, bridge_exit: ?usize) !void {
+    for (alloc.slots) |s| {
+        if (s.class != .carried) continue;
+        // Boxed pass-through traces are one-shot. Before their terminal commit the
+        // VM slot is still the entry Value byte-for-byte, so a guard exit must not
+        // flush a typed approximation (or write anything at all).
+        if (s.kind == .boxed) continue;
+        if (bridge_exit) |ei| if (t.bridgeEmitsSlot(ei, s.slot)) continue;
+        // Re-box the carried home with its kind's tag: int homes write TAG_INT from a
+        // GP reg / spill cell; a float home writes TAG_FLOAT + `movsd` from its XMM
+        // (a register-homed float can't go through `movMemReg`). flushSlot dispatches.
+        // Doc 39: a steady-φ slot re-boxes from the internal φ's computed home with
+        // the STEADY kind — the entry home is stale after the run-once region.
+        if (s.steady_phi >= 0) {
+            try flushSlot(a, @as(i32, s.slot), s.steady_kind, placeOfRef(alloc, @intCast(s.steady_phi)));
+        } else {
+            try flushSlot(a, @as(i32, s.slot), s.kind, slotHomePlace(s));
+        }
+    }
+}
+
+/// Part A-v (doc 17 §A2.1): materialize the guest state at the bridge's guard.
+/// The carried homes go first, exactly as the ordinary deopt's flush writes
+/// them: a carried slot whose update follows the guard is in neither E nor the
+/// exit snapshot, and after local iterations of a `.loop` source the slab
+/// holds only its entry value (codex doc 61 Phase 0 review, blocker 1). Then
+/// the compile-time set E: slot-bound phis are the trace successor's live
+/// VM-slot writebacks, restricted to updates defined before `exit_instr`.
+/// Candidacy already proved this set equals the exit snapshot's state on every
+/// live slot, so the two together commit exactly the guest state at the guard.
+/// Post-guard phis and internal optimizer phis are deliberately excluded.
 pub fn emitCompositeBridgeSnapshot(
     a: *x64.Assembler,
     t: *const Trace,
@@ -2523,6 +2556,7 @@ pub fn emitCompositeBridgeSnapshot(
     alloc: *const Alloc,
     exit_instr: usize,
 ) !void {
+    try emitCarriedHomesFlush(a, t, alloc, exit_instr);
     var emitted = t.bridgeEmissions(exit_instr);
     while (emitted.next()) |p| {
         try emitPhiValueFlush(a, t, kinds, alloc, p);

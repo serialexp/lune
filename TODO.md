@@ -51,6 +51,60 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
         are measured in.
       - Removes the last ~40 instructions per gated back-edge.
 
+## Repeated `load` grows memory without bound (noted 2026-10-09)
+
+- [ ] **`bench/compile_multret_chain.lua` peaks at 31 MB with 20 loads and
+      530 MB with 400 loads** of the same 2000-deep chunk (ReleaseFast). Each
+      chunk is garbage after its one call, so its proto (code, liveness
+      table, dominator data) appears never to be freed. Check whether
+      `load`ed protos are deliberately immortal (trace caches can outlive
+      proto reachability, doc 03) or just never released. A long-running
+      host that `load`s generated code would leak either way.
+
+## Armed composite bridge may skip the carried-home flush (noted 2026-10-09)
+
+- [x] **Fixed 2026-10-09.** Confirmed by the test "an armed bridge out of a
+      `.loop` source commits the carried homes its local iterations advanced"
+      (`trace_promotion_test.zig`): before the fix it read acc 100, not 104.
+      `emitCompositeBridgeSnapshot` now runs `emitCarriedHomesFlush` (skipping
+      E's slots) before E. The ordinary and silent deopt flushes share the
+      same helper. Codex approved it (Phase 0 thread, follow-up). No natural
+      Lua repro was found: today's recorder links a continuation into the
+      outer header's trace, so bridge sources close with `.link`. The
+      original note follows.
+- [x] **Verify or refute: the armed native bridge stub flushes only its
+      emitted set E, then jumps to the successor** (`nativegen.zig:2641-2650`).
+      It never reaches `deopt_exit`, where carried homes are flushed
+      (`nativegen.zig:2771-2783`). A carried slot updated after the guard is
+      in neither E nor the exit snapshot, so `bridgeMatchesExitSnapshot`
+      never checks it. The comment at `trace_code.zig:775` ("which the
+      carried flush already leaves in place") assumes a flush that doesn't run
+      on this path. Found by doc 61's Phase 0 audit (§2); **codex's Phase 0
+      review calls it a real admitted hole** (`docs/reviews/doc61/codex-phase0.md`
+      blocker 1): a `.loop`-closed source rotates its carried homes, so a
+      slot updated after the guard is stale in the slab at the bridge, and
+      the region check (`trace_region_topology_build.zig:352`) labels a
+      required non-E slot "invariant" without proving it coherent. `.link`
+      sources keep immutable entry homes (`nativegen_alloc.zig:439`), which
+      makes them safe. Repro attempt `/tmp/bridge_carried2.lua` (the A-viii
+      sieve plus `acc = acc + i` after the `if`) gives the right answer
+      because its bridge source (trace 2, `main:43`) closes with
+      `link_terminal`. **Next:** build a repro whose armed bridge source is
+      `.loop`-closed and runs local iterations before the bridge fires. Then
+      flush the carried homes before overlaying E (the exit adapter's order:
+      sunk stores, carried homes, snapshot), or refuse such sources, and pin
+      it with a test. Queued right after doc 61 Phase 0 lands.
+
+## `{f()}` keeps only the first result (noted 2026-10-09)
+
+- [ ] **A call as the last item of a table constructor is truncated to
+      one value.** `local function f() return 1,2,3 end print(#{f()})`
+      prints 1 (Lua: 3). Doc 27 §7 says the compiler has no
+      `all_results` bytecode shape for constructors. Decide whether this
+      is intended for mahina or a gap. If it's a gap, add the shape
+      (Lua: `SETLIST` with `C=0` after a multret call; `{...}` is the
+      same case) along with the recorder/JIT side.
+
 ## Coverage mode changes `tick` (noted 2026-10-09)
 
 - [ ] **`config.coverage` is documented as never affecting tiering, but a
@@ -195,7 +249,7 @@ mahina C API 7.3, Rust crate 26.8. Items, each measured on its own:
       is in doc 61 §3 P3. CONFIRMED use-after-free from plain Lua (the fused
       `a[i][j]` with a native `__index`/`__newindex` such as `table.sort`).
       Fixed 2026-10-09: `callValue`'s native arm parks `args` at `stack_top`.
-- [ ] **capi host-call bugs from the doc 61 P3 audit** (coral-marten's
+- [x] **capi host-call bugs from the doc 61 P3 audit** (coral-marten's
       area, reported to them 2026-10-09). The third, `cHostCall` reading
       `h.box` after a callback that freed its own Native, is fixed by P3's
       callee parking.
@@ -205,6 +259,12 @@ mahina C API 7.3, Rust crate 26.8. Items, each measured on its own:
   - The dispatch native arm's host branch fills `boundary_scratch[out_lo..]`.
     A nested `mh_call` from the host can overwrite slots it already filled
     when the result range reaches past `stack_top`, before the copy-down.
+  - **Fixed 2026-10-09** (both, one cause). `Vm.callHostNative` gives every
+    host call a private range of a VM-owned stack (`host_out`), and the
+    caller copies the results out once the host returns. `max_results` is
+    now capped at 256 (`max_host_results`), also when the caller wants all
+    results. Cost: +13 instructions per host call (727 → 740 per iteration
+    of a pure callback loop). Tests in `capi_test.zig`; doc 59 updated.
 
 ## `hashgate.py --generate --filter X` wipes every other program's refs (noted 2026-10-01)
 

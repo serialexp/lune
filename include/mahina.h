@@ -179,9 +179,11 @@ mh_status mh_ref_free(mh_vm *vm, mh_ref ref);
 
 /* ---- host functions ------------------------------------------------------
  * Called from guest code. Write up to max_results into results, set
- * *nresults, return MH_OK. Any other return raises a (pcall-catchable)
+ * *nresults, return MH_OK. max_results is at most 256, also when the caller
+ * wants every result. Any other return raises a (pcall-catchable)
  * guest error carrying the message last staged with mh_error_set. args and
- * results never alias. Reentrancy: you may call back into the VM through
+ * results never alias, and results is yours alone until you return: calls
+ * back into the VM never write it. Reentrancy: you may call back into the VM through
  * the vm handle; you may NOT mh_vm_free it here. A registered name must not
  * collide with a builtin ("print", "string.format", "string", ...); shape
  * is "name" or "module.field". userdata is released by destroy (if given)

@@ -278,10 +278,16 @@ const Walk = struct {
 /// reaches (tables, closures, upvalues, natives, their strings) are captured.
 pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
     // Doc 61 P4: capture happens at suspend boundaries only, never inside a
-    // native activation that re-entered the VM. Such a frame is mid-instruction
-    // and Zig code above it holds state no keyframe can carry, so its frames
-    // cannot be resumed. A real error, not an assert: release builds refuse it.
+    // native activation, whether called from bytecode or re-entered through
+    // `callValue`. Its frame is mid-instruction (in flight, §4.2) and Zig code
+    // above it holds state no keyframe can carry, so its frames cannot be
+    // resumed. That also keeps `in_flight` out of the format: restore starts
+    // every frame out of flight. A real error, not an assert: release builds
+    // refuse it.
     if (vm.native_reentry_depth != 0) return error.CaptureInsideNativeActivation;
+    for (vm.frames[0..vm.depth]) |*fr| {
+        if (fr.in_flight) return error.CaptureInsideNativeActivation;
+    }
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();

@@ -659,6 +659,7 @@ const emitGStore = emit.emitGStore;
 const emitPhiValueFlush = emit.emitPhiValueFlush;
 const emitLinkedLoopDoneSnapshot = emit.emitLinkedLoopDoneSnapshot;
 const emitCompositeBridgeSnapshot = emit.emitCompositeBridgeSnapshot;
+const emitCarriedHomesFlush = emit.emitCarriedHomesFlush;
 
 /// Byte offsets (from `page.code.ptr`) of the two frameless secondary entry stubs a
 /// production body emits after its exit tables. Both `null` on the self-framed test
@@ -2765,23 +2766,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
         try a.jcc(.e, l);
         skip_flush = l;
     }
-    for (alloc.slots) |s| {
-        if (s.class != .carried) continue;
-        // Boxed pass-through traces are one-shot. Before their terminal commit the
-        // VM slot is still the entry Value byte-for-byte, so a guard exit must not
-        // flush a typed approximation (or write anything at all).
-        if (s.kind == .boxed) continue;
-        // Re-box the carried home with its kind's tag: int homes write TAG_INT from a
-        // GP reg / spill cell; a float home writes TAG_FLOAT + `movsd` from its XMM
-        // (a register-homed float can't go through `movMemReg`). flushSlot dispatches.
-        // Doc 39: a steady-φ slot re-boxes from the internal φ's computed home with
-        // the STEADY kind — the entry home is stale after the run-once region.
-        if (s.steady_phi >= 0) {
-            try flushSlot(a, @as(i32, s.slot), s.steady_kind, placeOfRef(alloc, @intCast(s.steady_phi)));
-        } else {
-            try flushSlot(a, @as(i32, s.slot), s.kind, slotHomePlace(s));
-        }
-    }
+    try emitCarriedHomesFlush(a, t, alloc, null);
     if (skip_flush) |l| a.bind(l);
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
     // 2.3c-2a: record this ordinary / loop-done-ordinary transition. The mini-stub wrote
@@ -2950,15 +2935,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     try a.jcc(.e, l);
                     silent_skip = l;
                 }
-                for (alloc.slots) |s| {
-                    if (s.class != .carried) continue;
-                    if (s.kind == .boxed) continue;
-                    if (s.steady_phi >= 0) {
-                        try flushSlot(a, @as(i32, s.slot), s.steady_kind, placeOfRef(alloc, @intCast(s.steady_phi)));
-                    } else {
-                        try flushSlot(a, @as(i32, s.slot), s.kind, slotHomePlace(s));
-                    }
-                }
+                try emitCarriedHomesFlush(a, t, alloc, null);
                 if (silent_skip) |l| a.bind(l);
                 try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
             }

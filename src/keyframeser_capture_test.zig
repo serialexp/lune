@@ -282,13 +282,13 @@ const P4Probe = struct {
     }
 };
 
-test "doc 61 P4: capture inside a re-entered native activation is refused, in every build mode" {
+test "doc 61 P4: capture inside a native activation is refused, in every build mode" {
     // `table.sort` re-enters the VM for its comparator, so the probe called
     // from the comparator runs with `native_reentry_depth != 0`: refused. The
-    // probe called from plain code is not inside a re-entry: taken for now.
-    // That capture is mid-instruction as well; doc 61 Phase 0's `in_flight`
-    // check refuses it and flips this expectation. The check is an error
-    // return, not a debug assert, so it holds in release too.
+    // probe called straight from bytecode is no re-entry, but its frame is in
+    // flight at the `.call` (doc 61 §4.2): refused too. A capture after `run`
+    // returns is at a real boundary: taken. The check is an error return, not
+    // a debug assert, so it holds in release too.
     const gpa = testing.allocator;
     const source: [:0]const u8 =
         \\capture_probe()
@@ -314,6 +314,9 @@ test "doc 61 P4: capture inside a re-entered native activation is refused, in ev
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
     try testing.expectEqualStrings("1\t2\t3\n", sink.buffered());
-    try testing.expectEqual(@as(u32, 1), P4Probe.taken);
-    try testing.expect(P4Probe.refused >= 1);
+    try testing.expectEqual(@as(u32, 0), P4Probe.taken);
+    // The top-level probe plus at least one comparator call.
+    try testing.expect(P4Probe.refused >= 2);
+    const bytes = try encodeSnapshot(gpa, &vm);
+    gpa.free(bytes);
 }

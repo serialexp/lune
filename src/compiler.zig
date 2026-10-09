@@ -148,6 +148,11 @@ pub fn compileWithOptions(
         // Doc 58 §4.8: the CFG's dominator tree, from the finished code.
         .dom = try bc_dom.compute(c.arena, c.scratch, c.code.items),
     };
+    // Doc 61 §5: from the finished code and its liveness. The compiler's
+    // register allocation guarantees the call layout, so only a proto too
+    // large for a liveness table may come out unmaskable.
+    proto.maskable = try bc_liveness.maskable(c.scratch, proto.code, proto.reg_live, proto.num_registers, proto.protos);
+    std.debug.assert(proto.maskable or !proto.reg_live.available());
     // Assign every proto a stable, unique id (pre-order over the proto tree,
     // root = `id_base`). This is the proto's serialization identity — a trace's
     // anchor and a serialized closure name their proto by this id, not by the
@@ -1251,6 +1256,10 @@ const Compiler = struct {
             // Doc 58 §4.8: the CFG's dominator tree, from the finished code.
             .dom = try bc_dom.compute(self.arena, self.scratch, child.code.items),
         };
+        // Doc 61 §5: from the finished code and its liveness (see the
+        // main chunk for why this holds).
+        proto.maskable = try bc_liveness.maskable(self.scratch, proto.code, proto.reg_live, proto.num_registers, proto.protos);
+        std.debug.assert(proto.maskable or !proto.reg_live.available());
 
         if (self.protos.items.len > std.math.maxInt(u16)) return self.fail(body.span, "too many nested functions");
         const idx: u16 = @intCast(self.protos.items.len);
@@ -1648,6 +1657,41 @@ fn runScalar(src: [:0]const u8) !Value {
     var r = try run(src);
     defer r.deinit();
     return r.value;
+}
+
+fn expectAllMaskable(p: *const Proto) !void {
+    try testing.expect(p.reg_live.available());
+    try testing.expect(p.maskable);
+    for (p.protos) |child| try expectAllMaskable(child);
+}
+
+test "doc 61: every compiled proto passes the call-layout check" {
+    // Calls at every position the compiler allocates them: statements,
+    // nested in expressions and argument lists, method calls, multret
+    // producers and consumers, varargs, generic-for iterators, closures
+    // capturing locals above later call bases, and calls inside loops.
+    const src: [:0]const u8 =
+        \\local function sum(...)
+        \\  local s = 0
+        \\  for _, v in ipairs({...}) do s = s + v end
+        \\  return s, select('#', ...)
+        \\end
+        \\local obj = {n = 1}
+        \\function obj:inc(k) self.n = self.n + k return self end
+        \\local fs = {}
+        \\for i = 1, 4 do
+        \\  local x = i * 2
+        \\  fs[i] = function() return x + i end
+        \\  obj:inc(sum(i, x, fs[i]())):inc(1)
+        \\end
+        \\local t = {sum(1, 2, 3), math.max(sum(4, 5)), tostring(sum(6))}
+        \\local ok, a, b = pcall(sum, table.unpack(t))
+        \\local s = tostring(ok) .. a .. b .. obj.n .. #t .. string.format("%d", sum(7, 8))
+        \\return sum(sum(1), sum(2, 3)), s
+    ;
+    var r = try run(src);
+    defer r.deinit();
+    try expectAllMaskable(r.chunk.proto);
 }
 
 test "arithmetic and operator precedence" {

@@ -60,10 +60,19 @@ inline fn vmOf(ctx: *anyopaque) *Vm {
 /// MUST be called from a native (it reenters the VM). The boundary it restores is
 /// `(vm.depth, vm.stack_top)` captured at entry — `callValue` leaves the faulting
 /// frames live on error so `synthErrorValue` can read them here first.
+/// Doc 61 §4.2: a catcher discarding retained frames restores the one
+/// surviving frame's in-flight flag to its value at the catcher's entry.
+fn restoreInFlight(vm: *Vm, entry_depth: u32, entry_in_flight: bool) void {
+    if (entry_depth > 0) vm.frames[entry_depth - 1].in_flight = entry_in_flight;
+}
+
 fn protectedCall(vm: *Vm, f: Value, call_args: []const Value, out: []Value, handler: ?Value) anyerror!usize {
     std.debug.assert(out.len >= 1);
     const entry_depth = vm.depth;
     const entry_top = vm.stack_top;
+    // Doc 61 §4.2: the surviving frame's in-flight flag, captured before any
+    // re-entry; an error leaves it set, and each discard below restores it.
+    const entry_in_flight = entry_depth > 0 and vm.frames[entry_depth - 1].in_flight;
     const results = if (out.len > 1) out[1..] else out[0..0];
 
     const produced = vm.callValue(f, call_args, results) catch |err| {
@@ -85,6 +94,13 @@ fn protectedCall(vm: *Vm, f: Value, call_args: []const Value, out: []Value, hand
             // runs it bounded at the faulting depth, so the faulting frames stay
             // intact underneath for the handler to walk. The boundary is restored
             // only AFTER the handler returns.
+            //
+            // Doc 61 §4.4: the topmost faulting frame, if the fault left one,
+            // must be in flight at its faulting instruction while the handler
+            // runs (`describeFault` and a fatal report read its operands).
+            // `callValue` marks exactly that frame, `frames[depth - 1]`, for
+            // the handler's whole run and leaves it set on a fatal fault; it
+            // is discarded below on every other outcome.
             const hn = vm.callValue(h, &.{errval}, results) catch |herr| {
                 // A non-catchable handler fault (OOM, effect-log integrity, a
                 // replay divergence) must propagate unchanged — swallowing it as
@@ -101,6 +117,7 @@ fn protectedCall(vm: *Vm, f: Value, call_args: []const Value, out: []Value, hand
                 vm.dropRegionActivationsFromDepth(entry_depth);
                 vm.depth = entry_depth;
                 vm.stack_top = entry_top;
+                restoreInFlight(vm, entry_depth, entry_in_flight);
                 vm.final_cut = null; // doc 21: manual unwind reuses the stack
                 if (out.len > 1) out[1] = try vm.heap.internValue("error in error handling");
                 return @min(out.len, @as(usize, 2));
@@ -111,6 +128,7 @@ fn protectedCall(vm: *Vm, f: Value, call_args: []const Value, out: []Value, hand
             vm.dropRegionActivationsFromDepth(entry_depth);
             vm.depth = entry_depth;
             vm.stack_top = entry_top;
+            restoreInFlight(vm, entry_depth, entry_in_flight);
             vm.final_cut = null; // doc 21: manual unwind reuses the stack
             return @min(out.len, 1 + hn);
         }
@@ -122,6 +140,7 @@ fn protectedCall(vm: *Vm, f: Value, call_args: []const Value, out: []Value, hand
         vm.dropRegionActivationsFromDepth(entry_depth);
         vm.depth = entry_depth;
         vm.stack_top = entry_top;
+        restoreInFlight(vm, entry_depth, entry_in_flight);
         vm.final_cut = null; // doc 21: manual unwind reuses the stack
         if (out.len > 1) out[1] = errval;
         return @min(out.len, @as(usize, 2));

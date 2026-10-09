@@ -16,34 +16,33 @@
 
 // VmBox and the Vm fields the entry reads or writes.
 .set VMBOX_VM, 80
-.set VM_TAGS, 64
-.set VM_PAYLOADS, 80
+.set VM_TAGS, 24
+.set VM_PAYLOADS, 40
 .set VM_DEPTH_SIZE, 4
-.set VM_STACK_TOP, 136
+.set VM_STACK_TOP, 16368
 .set VM_STACK_TOP_SIZE, 8
-.set VM_NEXT_CALL_SEQ, 16176
+.set VM_NEXT_CALL_SEQ, 16248
 .set VM_NEXT_CALL_SEQ_SIZE, 8
 .set VM_NATIVE_REENTRY_DEPTH_SIZE, 2
-.set VM_FRAMES, 176
+.set VM_FRAMES, 248
 .set VM_TRACE, 16376
 .set TRACE_FAST_BLOCK_SIZE, 2
-.set VM_PARKED_INLINE, 16280
+.set VM_PARKED_INLINE, 96
 .set VM_PARKED_INLINE_LEN_SIZE, 4
+.set VM_PARKED_RESULTS, 224
 .set PARKLIST_ITEMS, 0
 
 // The safety-dependent offsets.
 #if MAHINA_RUNTIME_SAFETY
-.set VM_DEPTH, 27520
-.set VM_NATIVE_REENTRY_DEPTH, 27524
+.set VM_DEPTH, 27540
+.set VM_NATIVE_REENTRY_DEPTH, 27548
 .set TRACE_FAST_BLOCK, 10408
-.set VM_PARKED_INLINE_LEN, 27516
-.set VM_PARKED_RESULTS, 26800
+.set VM_PARKED_INLINE_LEN, 27544
 #else
-.set VM_DEPTH, 27288
-.set VM_NATIVE_REENTRY_DEPTH, 27292
+.set VM_DEPTH, 27308
+.set VM_NATIVE_REENTRY_DEPTH, 27316
 .set TRACE_FAST_BLOCK, 10176
-.set VM_PARKED_INLINE_LEN, 27284
-.set VM_PARKED_RESULTS, 26568
+.set VM_PARKED_INLINE_LEN, 27312
 #endif
 
 // Slices (Q12 (a)): {ptr, len} words. The order is checked at run time
@@ -52,7 +51,7 @@
 .set SLICE_PTR, 0
 .set SLICE_LEN, 8
 
-// CallFrame: the frame-array stride and the nine plain fields.
+// CallFrame: the frame-array stride and the ten plain fields.
 .set CF_SIZE, 80
 .set CF_CLOSURE, 0
 .set CF_CLOSURE_SIZE, 8
@@ -72,6 +71,8 @@
 .set CF_VARARGS_COUNT_SIZE, 8
 .set CF_CODE_CACHE_GEN, 64
 .set CF_CODE_CACHE_GEN_SIZE, 8
+.set CF_IN_FLIGHT, 76
+.set CF_IN_FLIGHT_SIZE, 1
 
 // Closure, Proto, and the heap object header's type byte.
 .set CLOSURE_PROTO, 16

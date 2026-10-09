@@ -346,6 +346,11 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
 
             const required = try gpa.dupe(u16, live_in[e.to].items);
             errdefer gpa.free(required);
+            // A required slot outside E is "invariant" across the bridge in the
+            // sense that the stub leaves its slab value as the guest's: the
+            // stub flushes every carried home before E
+            // (`emitCompositeBridgeSnapshot`), and non-carried slots are
+            // unchanged or already written back.
             var inv_list: std.ArrayListUnmanaged(u16) = .empty;
             defer inv_list.deinit(gpa);
             for (required) |slot| {

@@ -1893,6 +1893,303 @@ test "doc 61 P3: an error inside a parked native call unwinds to the protected b
     );
 }
 
+test "doc 61: a multret result span past the window survives collections inside its consumer" {
+    // `mk` returns 40 fresh tables held only by its result span, which ends
+    // past the caller's window. No collection runs between the producer and
+    // the consumer `g(...)` (`reg_top_pending` suppresses that safepoint);
+    // the span becomes `g`'s varargs, and the stress legs collect at every
+    // instruction of `g` while it reads them.
+    try expectProgram(
+        \\local function mk(n)
+        \\  local r = {}
+        \\  for i = 1, n do r[i] = {i} end
+        \\  return table.unpack(r)
+        \\end
+        \\local function g(...)
+        \\  local s = 0
+        \\  for i = 1, select('#', ...) do s = s + (select(i, ...))[1] end
+        \\  return s
+        \\end
+        \\for k = 1, 3 do print(g(mk(40))) end
+        \\
+    , "820\n820\n820\n");
+}
+
+/// Doc 61 Phase 0 frame-shape probes: what a collection would see right
+/// now. `shapes()` describes every live frame, bottom first; `topshape()`
+/// only the top one, so it can be an `xpcall` handler at the depth cap,
+/// where no Lua handler frame fits. Per frame: `F:<op>` (in flight, with
+/// the opcode its mask row names), `I:<op>` (innermost), `S` (suspended
+/// at a `.call`), `U` (unknown).
+const ShapeProbe = struct {
+    fn shapes(ctx: *anyopaque, _: []const Value) anyerror!Value {
+        const vm: *interp.Vm = @ptrCast(@alignCast(ctx));
+        return describe(vm, 0);
+    }
+
+    fn topshape(ctx: *anyopaque, _: []const Value) anyerror!Value {
+        const vm: *interp.Vm = @ptrCast(@alignCast(ctx));
+        return describe(vm, vm.depth - 1);
+    }
+
+    /// `after(f)`: re-enters `f` twice, then reports the shapes from inside
+    /// this same native activation — the moment a collection between two
+    /// `callValue`s of one native (`table.sort`'s comparisons) would see.
+    fn after(ctx: *anyopaque, args: []const Value) anyerror!Value {
+        const vm: *interp.Vm = @ptrCast(@alignCast(ctx));
+        var res: [1]Value = undefined;
+        _ = try vm.callValue(args[0], &.{}, &res);
+        _ = try vm.callValue(args[0], &.{}, &res);
+        return describe(vm, 0);
+    }
+
+    fn describe(vm: *interp.Vm, from: usize) !Value {
+        var buf: [256]u8 = undefined;
+        var len: usize = 0;
+        for (from..vm.depth) |i| {
+            const shape = vm.frameShape(i);
+            const code = vm.frames[i].closure.proto.code;
+            const sep: []const u8 = if (len == 0) "" else " ";
+            const part = switch (shape.kind) {
+                .in_flight, .innermost => try std.fmt.bufPrint(buf[len..], "{s}{s}:{s}", .{
+                    sep,
+                    if (shape.kind == .in_flight) "F" else "I",
+                    if (shape.pc < code.len) @tagName(code[shape.pc].op) else "?",
+                }),
+                .suspended_call => try std.fmt.bufPrint(buf[len..], "{s}S", .{sep}),
+                .unknown => try std.fmt.bufPrint(buf[len..], "{s}U", .{sep}),
+            };
+            len += part.len;
+        }
+        return vm.heap.internValue(buf[0..len]);
+    }
+
+    fn install(vm: *interp.Vm) !void {
+        const gpa = vm.heap.gpa;
+        inline for (.{ .{ "shapes", &shapes }, .{ "topshape", &topshape }, .{ "after", &after } }) |n| {
+            const native = try vm.heap.newNative(n[1], n[0]);
+            try vm.globals.set(gpa, try vm.heap.internValue(n[0]), Value.heap(&native.header));
+        }
+    }
+};
+
+fn expectShapes(source: [:0]const u8, expected: []const u8) !void {
+    return util.expectProgramTuned(source, expected, .{ .setup = &ShapeProbe.install });
+}
+
+test "doc 61 Phase 0: a native's caller is in flight at its .call; Lua callers below are suspended" {
+    try expectShapes(
+        \\local function f() return shapes() end
+        \\local a, b
+        \\for i = 1, 10 do a = shapes(); b = f() end
+        \\print(a)
+        \\print(b)
+        \\
+    , "F:call\nS F:call\n");
+}
+
+test "doc 61 Phase 0: a metamethod's caller is in flight at the instruction that invoked it" {
+    try expectShapes(
+        \\local mt = {__add = function(x, y) return shapes() end,
+        \\            __index = function(t, k) return shapes() end}
+        \\local t = setmetatable({}, mt)
+        \\local a, b
+        \\for i = 1, 10 do a = t + i; b = t.x end
+        \\print(a)
+        \\print(b)
+        \\
+    , "F:add F:call\nF:get_index F:call\n");
+}
+
+test "doc 61 Phase 0: a native stays in flight between and after its re-entries" {
+    // `after` re-enters twice and then looks: a callValue that cleared the
+    // flag instead of restoring it would leave its caller innermost. Under
+    // `pcall` the same holds one frame up, and a metamethod re-entry inside
+    // the callback restores its own frame's flag.
+    try expectShapes(
+        \\local mt = {__add = function(x, y) return 1 end}
+        \\local t = setmetatable({}, mt)
+        \\local function f() local v = t + 1; return v end
+        \\local a, b
+        \\for i = 1, 10 do
+        \\  a = after(f)
+        \\  b = select(2, pcall(after, f))
+        \\end
+        \\print(a)
+        \\print(b)
+        \\
+    , "F:call\nF:call\n");
+}
+
+test "doc 61 Phase 0: pcall, table.sort and a require loader keep their caller in flight across every re-entry" {
+    // The comparator runs once per comparison: each sees the same shapes.
+    try expectShapes(
+        \\local seen = {}
+        \\local t = {5, 3, 8, 1, 9, 2}
+        \\table.sort(t, function(x, y) seen[shapes()] = true; return x < y end)
+        \\for k in pairs(seen) do print(k) end
+        \\local ok, s = pcall(function() return shapes() end)
+        \\print(s)
+        \\package.preload.m = function() return shapes() end
+        \\print(require('m'))
+        \\print(shapes())
+        \\
+    , "F:call F:call\nF:call F:call\nF:call F:call\nF:call\n");
+}
+
+test "doc 61 Phase 0: an xpcall handler sees the faulting frame in flight at its fault" {
+    // Faults at pc 0, and right after a `.call` (where the call-suspended
+    // classification would wrongly apply).
+    try expectShapes(
+        \\local function g() return 1 end
+        \\local function h(e) return shapes() end
+        \\local function at0(t) return t.x end
+        \\local function aftercall(z) return g() + z end
+        \\local a, b
+        \\for i = 1, 10 do
+        \\  a = select(2, xpcall(at0, h, nil))
+        \\  b = select(2, xpcall(aftercall, h, nil))
+        \\end
+        \\print(a)
+        \\print(b)
+        \\
+    , "F:call F:get_index F:call\nF:call F:add F:call\n");
+}
+
+test "doc 61 Phase 0: a retained in-flight parent stays in flight under its faulting metamethod" {
+    // protected fn → `.add` → Lua `__add` faults → the handler runs over
+    // both: the parent is in flight at `.add`, the metamethod at its fault.
+    // The `g()` before the `.add` puts a `.call` at `pc − 1`.
+    try expectShapes(
+        \\local function g() return 1 end
+        \\local mt = {__add = function(x, y) return y.z end}
+        \\local t = setmetatable({}, mt)
+        \\local function f() local q = g(); return t + q end
+        \\local r
+        \\for i = 1, 10 do r = select(2, xpcall(f, function(e) return shapes() end)) end
+        \\print(r)
+        \\
+    , "F:call F:add F:get_index F:call\n");
+}
+
+test "doc 61 Phase 0: nested xpcall marks each level's own faulting frame" {
+    try expectShapes(
+        \\local function bad(t) return t.x end
+        \\local function inner(e) return shapes() end
+        \\local function outer(e) return select(2, xpcall(bad, inner, nil)) end
+        \\local r
+        \\for i = 1, 10 do r = select(2, xpcall(bad, outer, nil)) end
+        \\print(r)
+        \\print(shapes())
+        \\
+    , "F:call F:get_index F:call F:get_index F:call\nF:call\n");
+}
+
+test "doc 61 Phase 0: a rejected push leaves the faulting frame's pc at its .call" {
+    // Stack overflow: the deepest `r` fails to push its callee. The handler
+    // is a native (no Lua frame fits at the cap). Without the pc re-store
+    // the frame would name the `.add` after the call.
+    try expectShapes(
+        \\local function r(n) return r(n + 1) + 1 end
+        \\print(select(2, xpcall(r, topshape, 1)))
+        \\print(shapes())
+        \\
+    , "F:call\nF:call\n");
+}
+
+/// Records the innermost frame's pc at every collection while `f` is on top.
+const InnermostProbe = struct {
+    var pcs: [32]usize = undefined;
+    var n: usize = 0;
+
+    fn probe(vm: *interp.Vm) void {
+        if (vm.depth == 0) return;
+        const top = vm.depth - 1;
+        if (!std.mem.eql(u8, vm.frames[top].closure.proto.name, "f")) return;
+        std.debug.assert(vm.frameShape(top).kind == .innermost);
+        if (n < pcs.len) pcs[n] = vm.frameShape(top).pc;
+        n += 1;
+    }
+};
+
+test "doc 61 Phase 0: a collection between instructions sees the innermost frame's next pc" {
+    // Under gc_stress every prologue collects, so a straight-line `f`
+    // collects once before each of its instructions, in order: the mask
+    // row is the instruction about to run (§4.1). A frame pc left at the
+    // previous instruction would repeat a pc and lag one behind.
+    const gpa = testing.allocator;
+    var vm = try interp.Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    vm.heap.gc_stress = true;
+    InnermostProbe.n = 0;
+    interp.Vm.test_collect_probe = &InnermostProbe.probe;
+    defer interp.Vm.test_collect_probe = null;
+    try util.compileRun(gpa, &vm,
+        \\local function f(x)
+        \\  local y = x + 1
+        \\  local z = y * x
+        \\  return z - y
+        \\end
+        \\print(f(3))
+    );
+    try testing.expectEqualStrings("8\n", sink.buffered());
+    const len = InnermostProbe.n;
+    try testing.expect(len >= 3 and len <= InnermostProbe.pcs.len);
+    for (InnermostProbe.pcs[0..len], 0..) |pc, i| try testing.expectEqual(i, pc);
+}
+
+test "doc 61 Phase 0: a reused frame slot starts out of flight" {
+    // `pcall(bad, 10)` faults ten metamethod levels deep and leaves every
+    // other frame slot's flag set when its frames are discarded. `rec` then
+    // reuses those slots: tier-0 pushes, the native self-push once `rec` is
+    // hot (the native leg asserts it ran). A push that kept a stale flag
+    // would show `F` where `S` belongs, and trip the `.call` arm's assert.
+    const check = struct {
+        fn pushed(vm: *interp.Vm, mode: util.TraceMode) anyerror!void {
+            if (mode == .record_execute_native) try testing.expect(vm.trace.self_call_pushes > 0);
+        }
+    };
+    try util.expectProgramTuned(
+        \\local mt = {}
+        \\local t = setmetatable({}, mt)
+        \\local function bad(n) local v = t + n; return v end
+        \\mt.__add = function(x, y) if y == 0 then error("e") end return bad(y - 1) end
+        \\local function rec(n)
+        \\  if n == 0 then return shapes() end
+        \\  local s = rec(n - 1)
+        \\  return s
+        \\end
+        \\local r
+        \\for i = 1, 400 do pcall(bad, 10); r = rec(6) end
+        \\print(r)
+        \\
+    , "S S S S S S S F:call\n", .{ .setup = &ShapeProbe.install, .inspect = &check.pushed });
+}
+
+test "doc 61 Phase 0: a backtrace names an in-flight parent's own instruction line" {
+    // `f` is in flight at the `.add`, whose span starts on line 3; the
+    // instruction before it, the call to its right operand, is on line 4.
+    // The old `pc − 1` rule for every parent reported line 4. Both the
+    // traceback (`backtraceFrames`) and `error`'s level-2 location prefix
+    // (`callSiteAt`) name the caller.
+    try expectProgram(
+        \\local mt = {__add = function(x, y) error("boom", tonumber(y)) end}
+        \\local function f(t, q)
+        \\  local s = t +
+        \\    tostring(q)
+        \\  return s
+        \\end
+        \\local ok, tb = xpcall(f, debug.traceback, setmetatable({}, mt), 1)
+        \\print(string.find(tb, "f:3:", 1, true) ~= nil, string.find(tb, "f:4:", 1, true) ~= nil)
+        \\local ok2, msg = pcall(f, setmetatable({}, mt), 2)
+        \\print(msg)
+        \\
+    , "true\tfalse\nf:3: boom\n");
+}
+
 /// A host `__index` that removes the only reference to itself (its table's
 /// metatable) and collects mid-call. Its binding's destroy hook records
 /// whether the Native was swept while it was still running.
