@@ -67,8 +67,24 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
     root the stale tail `[top, nreg)`. Options A/A′/B are in doc 61 §5;
     codex recommends B (record the dynamic top and mask with it). Decide
     this in Phase 1's review.
+- Committed and pushed as `4fed40b`. Board `028da24e`, against ba6ce32's
+  `5790b75d`: flat. Every row is within ±2% except tbl_ops −3% and
+  str_gmatch −4.4%. `compile_multret_chain` peaks at 257 MB RSS, which is
+  the TODO "repeated `load` grows memory" issue.
+- **Phase Q design APPROVED (2026-10-10, `c408b95`).** It is doc 61 §7.1
+  rev 3. Codex and antigravity reviewed it; receipts are in
+  `docs/reviews/doc61/phaseQ-rev1.md`. The hazard is live on HEAD from
+  plain Lua (the §7.1 program prints `0x146e` on tier-0 and `0x146d` on the
+  JIT legs). **Next: implement Phase Q** in the §7.1 order:
+  - recorder hardening: `cancel`, owned contract via
+    `clearPendingLinkClose`, recorder id keys, `PendingStore.tab_obj`;
+  - `heap_consts` + `willFree` + `invalidateDeadTraceConsts`;
+  - bulk `removeTraces` (with the bulk drain and teardown, reserved
+    scratch, and cleared wants);
+  - exec logs (owned bytes, wire `id`, drop on retire);
+  - remove the pool roots;
+  - the tests, then the release benchmark.
 - **Then, in order:**
-  - Phase Q (design section + review first);
   - Phase 1;
   - Phase 2: land the uncommitted dead-φ filter and retire the watermark;
   - Phase V.
