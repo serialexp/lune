@@ -71,8 +71,9 @@ hashgate *args: release
 # <new-symbol>` must come up empty. The caches are never copied at all (the
 # local .zig-cache runs to tens of GB; copy-then-delete once filled /tmp).
 shadow dest:
-    rm -rf {{dest}}
-    rsync -a --exclude /.zig-cache --exclude /zig-out ./ {{dest}}/
+    @case "{{dest}}" in ""|/|.|./|..|../|"$HOME"|"$HOME"/) echo "shadow: refusing destination '{{dest}}'" >&2; exit 1;; esac
+    rm -rf "{{dest}}"
+    rsync -a --exclude /.zig-cache --exclude /zig-out ./ "{{dest}}"/
 
 # Build the embedding static library + header (doc 59): libmahina.a + mahina.h
 # into zig-out/lib + zig-out/include.
