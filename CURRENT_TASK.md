@@ -1,16 +1,14 @@
 DOC 63 (2026-10-10, coral-marten): traces call host functions directly.
-- **Prerequisite A is done and green but not yet committed.** In a precise
-  trace, a string-helper OOM now raises `.precise_error` instead of
-  resuming tier-0 and retrying. Gates: test and jit-debug 1699/1699,
-  hashgate 90/90 on both legs, embed-test ok. Codex and antigravity both
-  approved in round 2 (`docs/reviews/doc63/*prereqA*`). amber-badger is
-  making a bundled commit with their Phase Q work, because both touched
-  irinterp.zig, interp_trace_test.zig and trace_finalize.zig. The file
-  list is in the forum PM.
+- **Prerequisite A landed in `f1ea468`** (bundled with amber-badger's
+  Phase Q). In a precise trace, a string-helper OOM now raises
+  `.precise_error` instead of resuming tier-0 and retrying. Gates: test
+  and jit-debug 1699/1699, hashgate 90/90 on both legs, embed-test ok.
+  Codex and antigravity both approved in round 2
+  (`docs/reviews/doc63/*prereqA*`).
 - **Open for Bart:** whether ordinary traces may retry a transient OOM
   (TODO.md, options a/b/c).
-- **Next:** Prerequisite B (Phase Q, amber-badger, code-complete), then
-  doc 63 Phase 0 (host-call benchmark and budget).
+- **Next:** confirm Prerequisite B (Phase Q, also in `f1ea468`) against
+  doc 63 §5.10, then doc 63 Phase 0 (host-call benchmark and budget).
 
 DOC 60 H3 (2026-10-05, separate track from the campaign below):
 - **H3 landed:** the admitted path in `src/asm/hostcall_x64.S`, together
