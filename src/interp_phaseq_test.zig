@@ -14,6 +14,7 @@ const io = @import("io.zig");
 const execlog = @import("execlog.zig");
 const function = @import("function.zig");
 const trace_recorder = @import("trace_recorder.zig");
+const RegWindow = @import("regwindow.zig").RegWindow;
 const testing = std.testing;
 
 const Vm = interp.Vm;
@@ -637,6 +638,280 @@ test "phase Q: a cancel mid-peel frees the owned link contract and never closes 
     try testing.expect(!vm.trace.rec.close_requested);
     try testing.expect(vm.trace.rec.link_target == null);
     try testing.expectEqual(trace.AbortReason.const_swept, vm.trace.rec.abort_reason.?);
+    try testing.expectEqual(@as(u64, 1), vm.trace.rec.link_peel_ends.get(.cancelled));
+}
+
+// ---------------------------------------------------------------------------
+// The link peel (doc 47 increment A) under doc 61 §7.1 item 4: the session
+// owns the contract copy, and every path that drops a peel frees it through
+// `clearPendingLinkClose` (the leak checker is the assertion; the per-path
+// counters prove each path ran).
+// ---------------------------------------------------------------------------
+
+const LinkPeelEnd = trace_recorder.LinkPeelEnd;
+
+/// Link peels summed over every leg of one differential.
+var peel_setups: u64 = 0;
+var peel_ends: std.EnumArray(LinkPeelEnd, u64) = .initFill(0);
+
+fn sumLinkPeels(vm: *Vm, mode: TraceMode) anyerror!void {
+    _ = mode;
+    peel_setups += vm.trace.rec.link_peel_setups;
+    for (std.enums.values(LinkPeelEnd)) |e| peel_ends.getPtr(e).* += vm.trace.rec.link_peel_ends.get(e);
+}
+
+test "phase Q: link peels end linked, one-trip, type-mismatched and rewound in every leg, freeing their contracts" {
+    // Four shapes, each in its own function so its traces are its own. The
+    // stress legs collect at every safepoint, mid-peel included. The CLI's
+    // own hotloop gives the tiering order these shapes were tuned under.
+    peel_setups = 0;
+    peel_ends = .initFill(0);
+    try expectProgramTuned(
+        \\local function build(nrow, len, xv, vv)
+        \\  local x, v, col, row = {}, {}, {}, {}
+        \\  row[1] = 1
+        \\  for r = 1, nrow do
+        \\    local n = len(r)
+        \\    row[r+1] = row[r] + n
+        \\    for i = 0, n - 1 do local k = row[r] + i; col[k] = k; x[k] = xv(k, r); v[k] = vv(r) end
+        \\  end
+        \\  return x, v, col, row
+        \\end
+        \\local function f1(nn, cycles, out, v, row, col, x)
+        \\  for p = 1, cycles do
+        \\    for r = 1, nn do
+        \\      local sum = 0
+        \\      for i = row[r], row[r+1]-1 do sum = sum + x[col[i]] * v[i] end
+        \\      out[r] = sum
+        \\    end
+        \\  end
+        \\end
+        \\local function f2(nn, cycles, out, v, row, col, x)
+        \\  for p = 1, cycles do
+        \\    for r = 1, nn do
+        \\      local sum = 0
+        \\      for i = row[r], row[r+1]-1 do sum = sum + x[col[i]] * v[i] end
+        \\      out[r] = sum
+        \\    end
+        \\  end
+        \\end
+        \\local function f3(nn, cycles, out, v, row, col, x)
+        \\  for p = 1, cycles do
+        \\    for r = 1, nn do
+        \\      local sum = 0
+        \\      for i = row[r], row[r+1]-1 do sum = sum + x[col[i]] * v[i] end
+        \\      out[r] = sum
+        \\    end
+        \\  end
+        \\end
+        \\local function run(f, len, xv, vv)
+        \\  local x, v, col, row = build(60, len, xv, vv)
+        \\  local out = {}
+        \\  f(60, 6, out, v, row, col, x)
+        \\  print(out[1] + out[2] + out[60])
+        \\end
+        \\local function fx(k) return k * 0.5 end
+        \\local function quarter() return 0.25 end
+        \\-- linked: every row has five float terms.
+        \\run(f1, function() return 5 end, fx, quarter)
+        \\-- one_trip: every other row has a single term.
+        \\run(f2, function(r) return (r % 2 == 1) and 5 or 1 end, fx, quarter)
+        \\-- type_mismatch: every seventh row stays integer through its first term.
+        \\run(f3, function() return 5 end,
+        \\  function(k, r) return (r % 7 == 0) and k or k * 0.5 end,
+        \\  function(r) return (r % 7 == 0) and 2 or 0.25 end)
+        \\-- rewound: the peeled body calls an upvalue function (spectral-norm).
+        \\local function A(i, j)
+        \\  local ij = i+j-1
+        \\  return 1.0 / (ij * (ij-1) * 0.5 + i)
+        \\end
+        \\local function Av(x, y, N)
+        \\  for i=1,N do
+        \\    local a = 0
+        \\    for j=1,N do a = a + x[j] * A(i, j) end
+        \\    y[i] = a
+        \\  end
+        \\end
+        \\local u, w = {}, {}
+        \\for i=1,12 do u[i] = 1 end
+        \\for i=1,4 do Av(u, w, 12) Av(w, u, 12) end
+        \\print(string.format("%0.6f", u[1]))
+    , "193.125\n25.125\n193.125\n11.822977\n", .{ .inspect = sumLinkPeels, .hotloop = (trace.TraceConfig{}).hotloop });
+    inline for (.{ .linked, .one_trip, .type_mismatch, .rewound }) |e|
+        try testing.expect(peel_ends.get(e) >= 1);
+    // Every peel set up ended on one of the paths.
+    var ended: u64 = 0;
+    for (peel_ends.values) |n| ended += n;
+    try testing.expectEqual(peel_setups, ended);
+}
+
+/// `for_prep r0` at pc 0 jumps to the `for_loop r0` at pc 2, whose back-edge
+/// is the inner loop header at pc 1: the link target.
+const peel_code = [_]Instr{
+    Instr.opAx(.for_prep, 0, 1),
+    Instr.op0(.ret),
+    Instr.opAx(.for_loop, 0, -2),
+    Instr.op0(.ret),
+};
+
+/// The registers the peel tests drive the recorder with: r0..r2 are the
+/// loop's init/limit/step (1, 3, 1), r4 the integer accumulator the inner
+/// root wants as a float.
+const PeelRegs = struct {
+    tags: [8]u8 = @splat(0),
+    pays: [8]u64 = @splat(0),
+
+    fn window(self: *PeelRegs) RegWindow {
+        const regs = RegWindow.of(&self.tags, &self.pays);
+        regs.setInt(0, 1);
+        regs.setInt(1, 3);
+        regs.setInt(2, 1);
+        regs.setInt(4, 0);
+        return regs;
+    }
+};
+
+/// Publish an inner root at pc 1 that names `dying` and wants r4 as a float,
+/// then start a side recording that reaches its `for_prep` (what
+/// `TraceState.recordStep` sets up before the call).
+fn startPeelRecording(vm: *Vm, proto: *const Proto, dying: Value) !*trace.Trace {
+    const inner = try publishFake(vm, proto, 1, &.{dying});
+    vm.trace.gpa.free(inner.code.entry_guards);
+    inner.code.entry_guards = &.{}; // what the trace frees if the dupe fails
+    inner.code.entry_guards = try vm.trace.gpa.dupe(trace.EntryGuard, &.{.{ .slot = 4, .ty = .float }});
+    try armPeelRecording(vm, proto, inner);
+    return inner;
+}
+
+fn armPeelRecording(vm: *Vm, proto: *const Proto, inner: *const trace.Trace) !void {
+    try vm.trace.rec.reset(vm.trace.gpa, .{ .proto = proto, .pc = 0 }, 8);
+    vm.trace.rec.kind = .side;
+    vm.trace.syncRecordingBit();
+    vm.trace.rec.context.inner_root = true;
+    vm.trace.rec.context.inner_root_guards = inner.code.entry_guards;
+}
+
+test "phase Q: an inner root retired mid-peel leaves the peel valid, and it closes .link from its own contract" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var code = peel_code;
+    const proto = Proto{ .code = &code, .id = 9020, .name = "phaseq-peel-doom", .num_registers = 8 };
+    const inner = try startPeelRecording(&vm, &proto, try vm.heap.internValue("phaseq-peel-inner-dead"));
+    const inner_id = inner.id;
+    var rs: PeelRegs = .{};
+    const regs = rs.window();
+
+    try vm.trace.rec.recForPrepLink(code[0], regs, &proto, 1);
+    try testing.expectEqual(@as(u64, 1), vm.trace.rec.link_peel_setups);
+    try testing.expect(vm.trace.rec.pending_link_close.?.contract.ptr != inner.code.entry_guards.ptr);
+
+    // Only the inner root names the string: the collection retires it and
+    // leaves the recording, and its peel, alone.
+    vm.collect();
+    try testing.expect(vm.trace.traceById(inner_id) == null);
+    try testing.expect(vm.trace.isRecording());
+    try testing.expectEqualSlices(trace.EntryGuard, &.{.{ .slot = 4, .ty = .float }}, vm.trace.rec.pending_link_close.?.contract);
+
+    // Tier-0's `for_prep` left r0 = init - step; the first `for_loop` visit
+    // is the entry bounds check.
+    regs.setInt(0, 0);
+    try vm.trace.rec.recForLoop(code[2], regs, 3);
+    try testing.expectEqual(trace_recorder.PendingLinkClose.Phase.peeling, vm.trace.rec.pending_link_close.?.phase);
+    // The body made r4 a float; the post-body `for_loop` closes `.link`.
+    regs.setInt(0, 1);
+    regs.setFloat(4, 0.5);
+    try vm.trace.rec.recForLoop(code[2], regs, 3);
+    try testing.expect(vm.trace.rec.pending_link_close == null);
+    try testing.expectEqual(@as(u64, 1), vm.trace.rec.link_peel_ends.get(.linked));
+    try testing.expect(vm.trace.rec.close_requested);
+    try testing.expectEqual(@as(?u32, 1), vm.trace.rec.link_target);
+    vm.trace.abort(.nyi_opcode);
+}
+
+test "phase Q: a peel whose first for_loop visit leaves the loop frees its contract (zero-trip)" {
+    // Unreachable from a program today: the peel is only set up when the
+    // loop runs, and nothing runs between `for_prep` and that visit. The
+    // branch stays as a fail-safe; this drives it directly.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var code = peel_code;
+    const proto = Proto{ .code = &code, .id = 9021, .name = "phaseq-peel-zero", .num_registers = 8 };
+    const kept = try vm.heap.internValue("phaseq-peel-zero-kept");
+    try vm.globals.set(vm.gpa, try vm.heap.internValue("phaseq_peel_zero_keep"), kept);
+    _ = try startPeelRecording(&vm, &proto, kept);
+    var rs: PeelRegs = .{};
+    const regs = rs.window();
+    try vm.trace.rec.recForPrepLink(code[0], regs, &proto, 1);
+    regs.setInt(0, 0);
+    regs.setInt(1, 0);
+    try vm.trace.rec.recForLoop(code[2], regs, 3);
+    try testing.expect(vm.trace.rec.pending_link_close == null);
+    try testing.expectEqual(@as(u64, 1), vm.trace.rec.link_peel_ends.get(.zero_trip));
+    try testing.expect(vm.trace.isRecording());
+    vm.trace.abort(.nyi_opcode);
+}
+
+test "phase Q: reset over a pending peel, and session teardown with one, free the contract" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var code = peel_code;
+    const proto = Proto{ .code = &code, .id = 9022, .name = "phaseq-peel-reset", .num_registers = 8 };
+    const kept = try vm.heap.internValue("phaseq-peel-reset-kept");
+    try vm.globals.set(vm.gpa, try vm.heap.internValue("phaseq_peel_reset_keep"), kept);
+    const inner = try startPeelRecording(&vm, &proto, kept);
+    var rs: PeelRegs = .{};
+    const regs = rs.window();
+    try vm.trace.rec.recForPrepLink(code[0], regs, &proto, 1);
+    try armPeelRecording(&vm, &proto, inner);
+    try testing.expect(vm.trace.rec.pending_link_close == null);
+    try testing.expectEqual(@as(u64, 1), vm.trace.rec.link_peel_ends.get(.reset));
+
+    // A second peel is left pending: `vm.deinit` must free it.
+    _ = rs.window();
+    try vm.trace.rec.recForPrepLink(code[0], regs, &proto, 1);
+    try testing.expect(vm.trace.rec.pending_link_close != null);
+    try testing.expectEqual(@as(u64, 2), vm.trace.rec.link_peel_setups);
+}
+
+test "phase Q: a peel setup that runs out of memory at any allocation or resize leaves no peel and leaks nothing" {
+    var points: usize = 0;
+    for ([_]bool{ false, true }) |fail_resize| {
+        var k: usize = 0;
+        while (true) : (k += 1) {
+            try testing.expect(k < 1000);
+            var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+            var vm = try Vm.init(fa.allocator());
+            defer vm.deinit();
+            var code = peel_code;
+            const proto = Proto{ .code = &code, .id = 9023, .name = "phaseq-peel-oom", .num_registers = 8 };
+            const kept = try vm.heap.internValue("phaseq-peel-oom-kept");
+            try vm.globals.set(vm.gpa, try vm.heap.internValue("phaseq_peel_oom_keep"), kept);
+            _ = try startPeelRecording(&vm, &proto, kept);
+            var rs: PeelRegs = .{};
+            const regs = rs.window();
+            if (fail_resize) fa.resize_fail_index = fa.resize_index + k else fa.fail_index = fa.alloc_index + k;
+            const result = vm.trace.rec.recForPrepLink(code[0], regs, &proto, 1);
+            fa.fail_index = std.math.maxInt(usize);
+            fa.resize_fail_index = std.math.maxInt(usize);
+            if (!fa.has_induced_failure) {
+                try result;
+                try testing.expectEqual(@as(u64, 1), vm.trace.rec.link_peel_setups);
+                vm.trace.rec.cancel(.nyi_opcode);
+                vm.trace.syncRecordingBit();
+                break;
+            }
+            try testing.expectError(error.OutOfMemory, result);
+            try testing.expect(vm.trace.rec.pending_link_close == null);
+            try testing.expectEqual(@as(u64, 0), vm.trace.rec.link_peel_setups);
+            vm.trace.abort(.alloc);
+            points += 1;
+        }
+    }
+    // At least the contract copy and the saved register map.
+    try testing.expect(points >= 2);
 }
 
 test "phase Q: the recorder's constant dedup keys on object identity, not address" {

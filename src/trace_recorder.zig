@@ -303,6 +303,26 @@ pub const PeelSlot = struct {
 ///    not a post-body back-edge). Transition to `.peeling` on continue.
 /// - `.peeling`: one body iteration is being recorded. The next `for_loop`
 ///    continue-direction visit closes `.link` if compatible, else aborts.
+/// Why a pending link peel was dropped (`clearPendingLinkClose`'s argument).
+pub const LinkPeelEnd = enum {
+    /// Types matched after one body iteration: `.link` closes.
+    linked,
+    /// The inner loop ran no iteration.
+    zero_trip,
+    /// The body ran once and the loop ended.
+    one_trip,
+    /// Types still mismatched after one iteration: the recording aborts.
+    type_mismatch,
+    /// The body aborted: rewind and close `.link` without the peel.
+    rewound,
+    /// `cancel` (a collection swept one of the recording's constants).
+    cancelled,
+    /// `reset` armed a new recording over a stale peel.
+    reset,
+    /// The session was torn down.
+    deinit,
+};
+
 pub const PendingLinkClose = struct {
     inner_anchor_pc: u32,
     for_loop_pc: u32,
@@ -720,6 +740,10 @@ pub const RecordingSession = struct {
     /// promoted state. Set by `recForPrepLink`; consumed by `recForLoop`.
     /// Cleared in `reset()` and `abort()`; asserted null in `finalize()`.
     pending_link_close: ?PendingLinkClose = null,
+    /// Link peels set up, and how each one ended, over the session's whole
+    /// life (`reset` keeps them). Diagnostics and tests.
+    link_peel_setups: u64 = 0,
+    link_peel_ends: std.EnumArray(LinkPeelEnd, u64) = .initFill(0),
     /// Doc 44 P0: a `.head` recording's one-shot close. Set by the depth-0
     /// `ret` arm (`.return_interp`) or `recCall`'s depth-0 self-call arm
     /// (`.self_call_interp`) — always BEFORE tier-0 executes that
@@ -1095,7 +1119,7 @@ pub const RecordingSession = struct {
             }
         }
         self.lane_pins.items.len = np;
-        self.clearPendingLinkClose();
+        self.clearPendingLinkClose(.rewound);
 
         // --- Re-emit the immediate `.link` close (same logic as the
         //     non-peel path in recForPrepLink lines 3062-3124). ---
@@ -1178,11 +1202,13 @@ pub const RecordingSession = struct {
     /// The single release point for `pending_link_close` and the two
     /// buffers it owns (the rewind `saved_reg_map` and the `contract` copy).
     /// Every path that drops a pending peel comes through here.
-    fn clearPendingLinkClose(self: *RecordingSession) void {
+    fn clearPendingLinkClose(self: *RecordingSession, end: LinkPeelEnd) void {
         const plc = self.pending_link_close orelse return;
         self.gpa.free(plc.saved_reg_map);
         self.gpa.free(plc.contract);
         self.pending_link_close = null;
+        self.link_peel_ends.getPtr(end).* +|= 1;
+        self.dbg("link-peel end: {s} inner pc={d}", .{ @tagName(end), plc.inner_anchor_pc });
     }
 
     /// Kill the recording unconditionally, with no peel-rewind fallback.
@@ -1191,7 +1217,7 @@ pub const RecordingSession = struct {
     /// (doc 61 §7.1 item 2) must not let that happen.
     pub fn cancel(self: *RecordingSession, reason: AbortReason) void {
         if (!self.active) return;
-        self.clearPendingLinkClose();
+        self.clearPendingLinkClose(.cancelled);
         self.realAbort(reason);
     }
 
@@ -3681,7 +3707,7 @@ pub const RecordingSession = struct {
                         if (within) {
                             plc.phase = .peeling;
                         } else {
-                            self.clearPendingLinkClose();
+                            self.clearPendingLinkClose(.zero_trip);
                             // Continue recording — the guard_false exit direction
                             // was already recorded above.
                         }
@@ -3707,7 +3733,7 @@ pub const RecordingSession = struct {
                                     },
                                 };
                                 self.close_requested = true;
-                                self.clearPendingLinkClose();
+                                self.clearPendingLinkClose(.linked);
                             } else {
                                 // Still mismatched after one iteration — abort.
                                 // The peel can't help; fall back to today's
@@ -3715,7 +3741,7 @@ pub const RecordingSession = struct {
                                 // rewind state and clear BEFORE abort so the
                                 // abort-rewind catch doesn't fire (the peel
                                 // completed; rewind would be wrong).
-                                self.clearPendingLinkClose();
+                                self.clearPendingLinkClose(.type_mismatch);
                                 return self.abort(.type_instability);
                             }
                         } else {
@@ -3723,7 +3749,7 @@ pub const RecordingSession = struct {
                             // iteration 2 exists. Clear the peel and continue
                             // recording past the loop — may produce a useful
                             // one-trip-specialized continuation trace.
-                            self.clearPendingLinkClose();
+                            self.clearPendingLinkClose(.one_trip);
                         }
                     },
                 }
@@ -3911,6 +3937,7 @@ pub const RecordingSession = struct {
                     .saved_snap_exhausted = self.exit_snap_exhausted,
                     .saved_by_ord_len = @intCast(self.exit_snap_by_ord.items.len),
                 };
+                self.link_peel_setups +|= 1;
                 return;
             }
         }
@@ -6088,10 +6115,8 @@ pub const RecordingSession = struct {
     }
 
     pub fn deinit(self: *RecordingSession, gpa: std.mem.Allocator) void {
-        if (self.pending_link_close) |plc| {
-            gpa.free(plc.saved_reg_map);
-            gpa.free(plc.contract);
-        }
+        // A pending peel exists only after `reset`, which set `self.gpa`.
+        self.clearPendingLinkClose(.deinit);
         if (self.peel) |p| gpa.free(p.slots);
         self.pending_stores.deinit(gpa);
         self.input_seeds.deinit(gpa);
@@ -6143,7 +6168,7 @@ pub const RecordingSession = struct {
         self.link_kind = .inner_root;
         self.terminal_close = null;
         self.pending_link_provenance = null;
-        self.clearPendingLinkClose();
+        self.clearPendingLinkClose(.reset);
         self.inline_depth = 0;
         if (self.peel) |p| gpa.free(p.slots);
         self.peel = null;

@@ -144,12 +144,23 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
     retired (interp_phaseq_test program differential). New counter
     `side_commits_orphaned`, which the test asserts is ≥ 1 across the legs.
     `invalidateDeadTraceConsts` has a permanent `const-swept:` jit-debug
-    probe. Two recorder `bad_type` aborts found on the way are in TODO.
+    probe. Two recorder `bad_type` aborts found on the way are in TODO;
+  - region rebuild OOM: a sweep over every allocation and resize of a
+    rebuild (topology view indices, build scratch, reservation). Each
+    point fails closed, keeps the logical def, leaks nothing and recovers
+    (mutation-checked);
+  - the link peel: `clearPendingLinkClose(end)` now takes a `LinkPeelEnd`.
+    The session counts setups and each end (`link_peel_setups` /
+    `link_peel_ends`), with a `link-peel end:` jit-debug probe, and `deinit`
+    goes through the funnel too. A 10-leg differential reaches linked,
+    one_trip, type_mismatch and rewound, and asserts setups = ends.
+    Recorder-level tests cover an inner root retired mid-peel (it still
+    closes `.link` from the owned contract), zero-trip, reset and deinit,
+    plus an OOM sweep over the setup. Both mutations were caught. The
+    zero-trip branch cannot be reached from a program, because a peel is
+    only set up when the loop runs.
 
   Still open:
-  - region index OOM;
-  - a mid-peel inner-root retirement, and peel-setup OOM;
-  - every `clearPendingLinkClose` path, leak-checked;
   - per-step counters (needs counting instrumentation in the retirement
     steps; doc 61 says to assert counts, not time).
 

@@ -809,6 +809,66 @@ test "A-ii.4 finding-5: a boundary edge added on rebind flips both_count 1→2, 
     try testing.expectEqual(@as(u32, 2), state.region_policy.region_defs.get(rid).?.owner.pc); // placeholder = smallest anchor (ramp@2)
 }
 
+/// The finding-6 graph: five traces over one proto whose rebuild mints one
+/// armed region. `inner@7` and `skip@14` have inner-root shape, so the
+/// topology view's `inner_roots` index is populated too. Initialise in place
+/// (the traces point into the struct).
+const Finding6Graph = struct {
+    code: [41]Instr,
+    proto: Proto,
+    skip_i: [2]IrInstr,
+    skip_p: [1]ExitProvEntry,
+    ramp_i: [1]IrInstr,
+    ramp_p: [1]ExitProvEntry,
+    inner_i: [2]IrInstr,
+    inner_p: [1]ExitProvEntry,
+    cont_i: [1]IrInstr,
+    cont_p: [1]ExitProvEntry,
+    ext_i: [1]IrInstr,
+    ext_p: [1]ExitProvEntry,
+    traces: [5]Trace,
+
+    fn init(g: *Finding6Graph) void {
+        loopDoneCode(&g.code);
+        g.proto = .{ .code = &g.code, .id = 7, .name = "t", .num_registers = 1 };
+        g.skip_i = .{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
+        g.skip_p = .{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
+        g.ramp_i = .{.{ .op = .link, .aux = 7 }};
+        g.ramp_p = .{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
+        g.inner_i = .{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
+        g.inner_p = .{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
+        g.cont_i = .{.{ .op = .guard_true, .a = 0, .aux = 14 }};
+        g.cont_p = .{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
+        g.ext_i = .{.{ .op = .guard_true, .a = 0, .aux = 14 }};
+        g.ext_p = .{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
+        g.traces = .{
+            g.trace(1, 14, &g.skip_i, &g.skip_p),
+            g.trace(2, 2, &g.ramp_i, &g.ramp_p),
+            g.trace(3, 7, &g.inner_i, &g.inner_p),
+            g.trace(4, 20, &g.cont_i, &g.cont_p),
+            g.trace(5, 30, &g.ext_i, &g.ext_p),
+        };
+    }
+
+    fn trace(g: *const Finding6Graph, id: u32, pc: u32, instrs: []IrInstr, prov: []ExitProvEntry) Trace {
+        return .{
+            .code = .{
+                .anchor = .{ .proto = &g.proto, .pc = pc },
+                .instrs = instrs,
+                .consts = &.{},
+                .entry_slots = &.{},
+                .entry_guards = &.{},
+                .exit_prov = prov,
+            },
+            .id = id,
+        };
+    }
+
+    fn attachAll(g: *Finding6Graph, state: *TraceState) !void {
+        for (&g.traces) |*t| try state.registry.attach(t);
+    }
+};
+
 test "A-ii.4 finding-6: a region-rebuild OOM fails CLOSED — physical indices emptied, logical defs retained" {
     // A `FailingAllocator` forces `rebuildRegionsFallible` to OOM on a SECOND pass after a
     // good first pass armed a region. The disposition must NOT retain the prior physical
@@ -823,77 +883,9 @@ test "A-ii.4 finding-6: a region-rebuild OOM fails CLOSED — physical indices e
     }
     defer state.registry.detachAll();
 
-    const P_ID: u32 = 7;
-    var code: [41]Instr = undefined;
-    loopDoneCode(&code);
-    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
-
-    var skip_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
-    var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
-    var skip: Trace = .{
-        .code = .{
-            .anchor = .{ .proto = &proto, .pc = 14 },
-            .instrs = &skip_i,
-            .consts = &.{},
-            .entry_slots = &.{},
-            .entry_guards = &.{},
-            .exit_prov = &skip_p,
-        },
-        .id = 1,
-    };
-    var ramp_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
-    var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
-    var ramp: Trace = .{
-        .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
-            .instrs = &ramp_i,
-            .consts = &.{},
-            .entry_slots = &.{},
-            .entry_guards = &.{},
-            .exit_prov = &ramp_p,
-        },
-        .id = 2,
-    };
-    var inner_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
-    var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
-    var inner: Trace = .{
-        .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
-            .instrs = &inner_i,
-            .consts = &.{},
-            .entry_slots = &.{},
-            .entry_guards = &.{},
-            .exit_prov = &inner_p,
-        },
-        .id = 3,
-    };
-    var cont_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
-    var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
-    var cont: Trace = .{
-        .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 },
-            .instrs = &cont_i,
-            .consts = &.{},
-            .entry_slots = &.{},
-            .entry_guards = &.{},
-            .exit_prov = &cont_p,
-        },
-        .id = 4,
-    };
-    var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
-    var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
-    var ext: Trace = .{
-        .code = .{
-            .anchor = .{ .proto = &proto, .pc = 30 },
-            .instrs = &ext_i,
-            .consts = &.{},
-            .entry_slots = &.{},
-            .entry_guards = &.{},
-            .exit_prov = &ext_p,
-        },
-        .id = 5,
-    };
-    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.registry.attach(t);
+    var g: Finding6Graph = undefined;
+    g.init();
+    try g.attachAll(&state);
 
     // Phase 1 — good pass: region armed, physical indices populated.
     state.rebuildEdgeCache();
@@ -918,6 +910,64 @@ test "A-ii.4 finding-6: a region-rebuild OOM fails CLOSED — physical indices e
     try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
     var kit2 = state.region_policy.region_defs.keyIterator();
     try testing.expectEqual(rid, kit2.next().?.*);
+}
+
+/// One step of the region-rebuild OOM sweep: a good pass, then a second pass
+/// whose allocations (or resizes) fail from the `k`th on. Returns false once
+/// the second pass no longer reaches a `k`th one, i.e. the sweep is done.
+fn regionRebuildFailsClosedAt(k: usize, fail_resize: bool) !bool {
+    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var state = TraceState.init(fa.allocator());
+    defer state.deinit();
+    defer state.registry.detachAll();
+    var g: Finding6Graph = undefined;
+    g.init();
+    try g.attachAll(&state);
+
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    var kit = state.region_policy.region_defs.keyIterator();
+    const rid = kit.next().?.*;
+
+    if (fail_resize) fa.resize_fail_index = fa.resize_index + k else fa.fail_index = fa.alloc_index + k;
+    state.rebuildRegions();
+    fa.fail_index = std.math.maxInt(usize);
+    fa.resize_fail_index = std.math.maxInt(usize);
+    if (!fa.has_induced_failure) return false;
+
+    // Failed closed: no physical index survives, the logical def does.
+    try testing.expectEqual(@as(u32, 0), state.region_policy.source_exit_regions.count());
+    try testing.expectEqual(@as(u32, 0), state.region_policy.dest_entry_regions.count());
+    try testing.expectEqual(@as(u32, 0), state.region_policy.arrival_entry_regions.count());
+    try testing.expectEqual(@as(usize, 0), state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len);
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    try testing.expect(state.region_policy.region_defs.contains(rid));
+
+    // The next clean pass restores the same region.
+    state.rebuildRegions();
+    try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
+    try testing.expect(state.region_policy.region_defs.contains(rid));
+    try testing.expectEqual(@as(usize, 1), state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len);
+    return true;
+}
+
+test "phase Q: a region rebuild fails closed and leaks nothing at every allocation and resize" {
+    // Covers the indexed topology view (`by_id`, `inner_roots`), the build's
+    // scratch, and the reservation before publish: each failure point must
+    // leave empty physical indices, keep the logical def, free everything
+    // (std.testing.allocator checks), and recover on the next pass.
+    var points: usize = 0;
+    for ([_]bool{ false, true }) |fail_resize| {
+        var k: usize = 0;
+        while (try regionRebuildFailsClosedAt(k, fail_resize)) : (k += 1) {
+            points += 1;
+            try testing.expect(k < 10_000);
+        }
+        // Allocations at least: the view's arena, the build scratch, the reservation.
+        if (!fail_resize) try testing.expect(k >= 3);
+    }
+    try testing.expect(points >= 3);
 }
 
 test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) re-interns to the SAME RegionId" {
