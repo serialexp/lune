@@ -3,8 +3,9 @@
 Status: draft, not yet implemented. Revision 6, approved by Codex and
 Antigravity (confirmation round 6, receipts `docs/reviews/doc63/*-rev6.md`).
 Q1–Q5 decided by Bart (2026-10-10; §9). Review history in §11–§15.
+Prerequisites A and B landed; implementation phases not started.
 Owner: Bart
-Last updated: 2026-10-10
+Last updated: 2026-10-11
 
 ## Implementation status
 
@@ -41,11 +42,13 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   helper exit could flush a recycled register. It now follows
   `opMayExitInBody`, and `requiresPreciseSnapshot` covers every
   exit-capable body op.
+- [x] **Prerequisite B — doc 61 Phase Q (weak trace pools, invalidate on
+  sweep) lands.** Landed in `f1ea468` with follow-ups through `b462369`;
+  doc 61 Phase 1 (the masked root walk) followed in `0225b4d`. §5.10.1
+  records what the landed code changes for this design.
 
 ### Outstanding
 
-- [ ] **Prerequisite B — doc 61 Phase Q (weak trace pools, invalidate on
-  sweep) lands.** §5.10 extends it and cannot start before it.
 - [ ] **Phase 0 — benchmark and budget.** A host-call benchmark through the
   C API, exact instruction counts, today's numbers, and the shapes in §8.
   Fix the budget.
@@ -819,6 +822,79 @@ trace breaks F3. Phase 2b amends Phase Q:
   a pooled constant afterwards is on the stack. `invalidateDeadTraceConsts`
   asserts it: a doomed trace is either not executing or is
   `suspended_trace`.
+
+### 5.10.1 As landed: doc 61 Phase Q and Phase 1 (2026-10-11)
+
+§5.10 was written against Phase Q's design. Phase Q (`f1ea468`, follow-ups
+through `b462369`) and Phase 1 (`0225b4d`) have since landed. The design
+above stands; these are the facts about the landed code that it now
+rests on, and what each changes for the phases.
+
+- **F1 needs no new code.** Finalize indexes every heap value in the
+  pool into `heap_consts` (`trace_finalize.zig`), not only strings, and
+  `Native` is a heap object, so `guard_native`'s constant is scanned by
+  `invalidateDeadTraceConsts` as soon as it is in the pool. The F1 item
+  becomes a test (a native that is replaced and collected retires every
+  trace that guards it) plus the audit entry. `guard_native` is recorded
+  only from Phase 2c, so the test lands there, or earlier on a hand-built
+  trace whose pool holds a `Native`.
+- **What is already split, and what is not.** `removeTraces`
+  (`trace_link.zig`) runs Phase Q's steps 2–7 as one transaction: the
+  `doomed` bit, the relation and want drops, unpublishing (cache
+  compaction, `trace_by_id`, the anchor index, entry patches marked
+  non-live and pending), anchor reopening, `destroyDoomed`, and the
+  graph rebuilds. Step 8, the entry-patch drain, already runs at the
+  next safe point rather than inside the collection, and a non-live
+  patch dispatched before it takes the §R6-1 recovery arm (doc 61 §7.1,
+  "As built"). Unpublishing is not purely logical today:
+  `unpublishDoomed` (`trace_registry.zig`) also calls
+  `resetLinksTouchingDoomed`, which demotes promoted sets and rewrites
+  surviving parents' slots. A callback's collection can doom any trace,
+  ordinary ones included, not only the suspended one. So Phase 2b
+  extracts the logical part of unpublishing (the doomed bit, cache
+  compaction, `trace_by_id`, the anchor index, entry patches non-live)
+  and defers everything else with the physical batch until both
+  counters are zero, as §5.10 requires: link teardown and slot rewrites,
+  promoted-state teardown, `destroyDoomed`, and the graph rebuilds. The
+  existing deferred step 8 drain runs after that batch.
+- **A collection inside a recording-time callback can cancel the
+  recording.** `invalidateDeadTraceConsts` cancels an active recording
+  that names a constant the sweep will free (`cancelRecording(.const_swept)`).
+  During a recording-time host call (§5.3, §5.9) that is the recording
+  the call belongs to. The epoch has moved in that case, so §5.3 would
+  abort the recording at the next instruction anyway; the difference is
+  that it is already gone. Phase 2c therefore keeps every piece of
+  pending host-call state (the post-call epoch check, the result typing
+  at the next prologue) inside the `RecordingSession`, so the cancel
+  discards it, and the next-instruction hook does nothing when no
+  recording is active. Test: a recording-time callback that drops and
+  collects a constant the recording holds.
+- **Collections now scrub dead registers.** `collect` nils every register
+  below `stack_top` that the masked walk did not keep
+  (`scrubDeadRegisters`), after invalidation and before the sweep. For
+  this design:
+  - the trace's anchor frame is `in_flight` at `B` (§5.5), so it is
+    masked with `live_in[B]` up to `num_registers` (a fixed-count v1 call
+    never takes the multret limit `CallFrame.multret_top`; lifting Q5
+    must set it as tier-0 does);
+  - seeds the callback did not overwrite lie above `stack_top`, so they
+    are neither walked nor scrubbed. A nested guest frame can be laid
+    out over part of the seed span (`bindAndPushClosure`, then
+    `pushFrameTrusted` raising `stack_top`); those slots then hold that
+    frame's values and may be walked or scrubbed. Either way the epoch
+    has moved, so the trace never reads a seed again (§5.5);
+  - a scrub implies a collection, which moves the epoch, so the trace
+    takes a coherent exit that writes nothing, and tier-0 resumes on the
+    same scrubbed registers it would have had without the trace. §5.7's
+    proof is unchanged: a pre-call value is read only when no collection,
+    and so no scrub, ran.
+- **F3's assertion has a home.** `invalidateDeadTraceConsts` documents
+  "no trace code is on the stack here". Phase 2b replaces that comment
+  with the restated F3 assertion (a doomed trace is not executing, or is
+  `suspended_trace`).
+
+The line numbers cited elsewhere in this document are from revision 6
+and have drifted; the named functions are the reference.
 
 ### 5.11 Tier-1a
 
