@@ -208,7 +208,14 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
       across tiers);
     - (b) declare that keyframe byte identity across tiers was never
       claimed.
-  - **Still to do:** a pt-default board for the Phase 1 commit.
+  - Committed as `0225b4d`. Board on pinned pt-default (run `abf291bd`)
+    against dc3340f's:
+    - suite jit total 3638 → 3624 ms; every tier-0 row 0–5% faster;
+    - the worst row is binary-trees jit +1.4% (t0 +0.6%). Local A/B
+      against abc0e00 shows no change: tier-0 −0.1% instructions; on the
+      JIT leg the best runs are equal (+0.01%) and the cycle medians
+      slightly lower. Its JIT instruction count varies about 1% run to
+      run on both binaries.
 - **Then, in order:**
   - Phase 2: land the uncommitted dead-φ filter and retire the watermark
     (and `watermarkMayDrop` with it);
