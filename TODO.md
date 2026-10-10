@@ -166,6 +166,33 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       publish and the replay-stable id assignment. Profile a large real
       program before designing it.
 
+## Native bookkeeping found by bench-retire's native table (noted 2026-10-10)
+
+- [ ] **Arming a link scans every armed link.** `publishValidatedLink`
+      (`trace_native_registry.zig`) finds the existing (parent, physical
+      slot) record with a linear walk over `armed_links`. So each arm is
+      O(L) and arming L links is O(L²): 15% of the bench's setup at
+      N=16000. Fix it with an index keyed by (parent, physical slot) that
+      every add, remove, compaction and reset keeps in step.
+- [ ] **Retirement time per trace grows with heap size.** The batch's work
+      and instructions are linear (≈1.2k instructions per retired native
+      trace at both N=4000 and N=16000). Its time per trace still rises,
+      from ≈225 ns to ≈520 ns, because dTLB misses grow ×9 per ×4 N. A
+      trace is a dozen separate heap allocations: the record, the IR,
+      compiled state, slots, exit tables and so on. Carving them from one
+      per-trace block (or a size-classed trace arena) would put them on one
+      or two pages. Measure with `zig build bench-retire` before and after.
+- [ ] **`McodeArena.alloc` reuses with a first-fit walk of the free list.**
+      It is O(free slots) per compile, and adjacent freed slots never
+      coalesce. After a large retirement, every compile walks the whole
+      list. LuaJIT's `lj_mcode` uses areas plus a trace-ordered bump. Use a
+      size-bucketed free list, or coalesce on free.
+- [ ] **`resolvePatchPc` scans the whole proto** for a loop anchor's back
+      edge, once per trace (the result is cached on the trace). That is
+      O(function length) per installed patch. It only shows up in
+      bench-retire's single giant proto (65% of setup), but the recorder
+      already knows the back-edge pc and could hand it over.
+
 ## viz tests crash under bun 1.3.0 (noted 2026-10-10)
 
 - [ ] `bun test` in `viz/` segfaults loading the wasm module under bun

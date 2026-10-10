@@ -165,8 +165,14 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
     asserts every step stays within what it scans. A mutation that re-ran
     the proof pass per link was caught. `destroyDoomed` is now a method.
 
-  Still open: bench-retire covers no compiled pages, links or entry patches.
-  `releaseChunk` options for Bart are in TODO.
+  - bench-retire has a `native` table: compiled pages, root → cont → next
+    links and entry patches on every root, plus a `work` column from
+    `retire_work`. Work and instructions are linear. Time per trace rises
+    at large N because of dTLB misses (perf: ×9 per ×4 N), which is
+    locality, not a pass. The setup exposed four native bookkeeping items,
+    now in TODO. The O(L) armed-link lookup is next.
+
+  Phase Q is done. `releaseChunk` options for Bart are in TODO.
 - **Then, in order:**
   - Phase 1;
   - Phase 2: land the uncommitted dead-φ filter and retire the watermark;
