@@ -139,11 +139,15 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
   - a lazy compile after a sweep;
   - `mh_collect` from a nested run: the in-language form,
     `pcall(function() collect() end)`, is in the host-call collection
-    test. The C-API form is coral's area.
+    test. The C-API form is coral's area;
+  - a side recording commits through the real finalize after its parent
+    retired (interp_phaseq_test program differential). New counter
+    `side_commits_orphaned`, which the test asserts is ≥ 1 across the legs.
+    `invalidateDeadTraceConsts` has a permanent `const-swept:` jit-debug
+    probe. Two recorder `bad_type` aborts found on the way are in TODO.
 
   Still open:
   - region index OOM;
-  - real finalize/commit of a side recording after its parent retires;
   - a mid-peel inner-root retirement, and peel-setup OOM;
   - every `clearPendingLinkClose` path, leak-checked;
   - per-step counters (needs counting instrumentation in the retirement

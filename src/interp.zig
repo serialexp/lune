@@ -2502,6 +2502,9 @@ pub const Vm = struct {
         for (ts.registry.cache.items) |t| {
             for (t.code.heap_consts) |i| {
                 if (gc.Heap.willFree(t.code.consts[i].asHeap())) {
+                    const dying = t.code.consts[i];
+                    const bytes: []const u8 = if (dying.heapType() == .string) string.String.fromHeader(dying.asHeap()).bytes() else "";
+                    ts.dbg("const-swept: t={d} const={d} type={s} bytes=\"{s}\"", .{ t.id, i, @tagName(dying.heapType()), bytes });
                     doomed.appendAssumeCapacity(t);
                     break;
                 }

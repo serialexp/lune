@@ -68,6 +68,9 @@ pub fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Write
 /// (region discovery, window flushes) that does not survive `deinit`.
 pub const CapturedOpts = struct {
     hotguard: ?u32 = null,
+    /// Override `Config.hotexit` (taken exits before a side trace is
+    /// wanted); null keeps the default.
+    hotexit: ?u8 = null,
     /// The loop-recording threshold. The harness default (4) records short
     /// test loops; pass `trace.Config`'s own default to reproduce the CLI's
     /// tiering order (arms land at different moments, which exercises
@@ -132,6 +135,7 @@ pub fn runCapturedTuned(
     if (opts.exit_side_native) |on| vm.trace.config.exit_side_native = on;
     vm.trace.config.record_aborts = opts.record_aborts;
     if (opts.hotguard) |hg| vm.trace.config.hotguard = hg;
+    if (opts.hotexit) |he| vm.trace.config.hotexit = he;
     if (opts.instunroll) |n| vm.trace.config.instunroll = n;
     if (opts.silent_promotion) |on| vm.trace.config.silent_promotion_enabled = on;
     if (opts.setup) |setup| try setup(&vm);

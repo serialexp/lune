@@ -533,6 +533,44 @@ test "phase Q: a side recording whose parent retires mid-recording commits witho
     try testing.expect(!vm.trace.provenance_arms_pending);
 }
 
+/// Orphaned side commits summed over every leg of one differential.
+var orphaned_side_commits: u64 = 0;
+
+fn sumOrphanedSideCommits(vm: *Vm, mode: TraceMode) anyerror!void {
+    _ = mode;
+    orphaned_side_commits += vm.trace.side_commits_orphaned;
+}
+
+test "phase Q: a side recording over a retired parent finalizes for real (program differential)" {
+    // At i == 150 `p` moves to "%l": the parent's pinned-pattern guard side
+    // exits, and with both side thresholds at 1 the next back-edge arms a
+    // side recording of iteration 151. `hold` keeps "%d+" alive until the
+    // program drops it at i == 152 (iteration 151 finishes in tier-0 before
+    // the recording starts, so a drop there would be too early), after which only the parent's pool names it.
+    // The stress legs collect at every safepoint, so the parent retires while
+    // the recording is in flight, and the recording then commits through the
+    // real finalize with a source naming a retired trace. All ten legs must
+    // agree, and at least one must really have hit that interleaving.
+    orphaned_side_commits = 0;
+    try expectProgramTuned(
+        \\local find = string.find
+        \\local function f(class)
+        \\  local p = class .. "+"
+        \\  local hold = { p }
+        \\  local n = 0
+        \\  for i = 1, 300 do
+        \\    if i == 150 then p = "%l" end
+        \\    if find("ab12", p) then n = n + 1 end
+        \\    if i == 152 then hold = nil end
+        \\  end
+        \\  return n
+        \\end
+        \\print(f("%d"))
+        \\print(f("%a"))
+    , "300\n300\n", .{ .inspect = sumOrphanedSideCommits, .hotguard = 1, .hotexit = 1 });
+    try testing.expect(orphaned_side_commits >= 1);
+}
+
 // ---------------------------------------------------------------------------
 // The recorder.
 // ---------------------------------------------------------------------------

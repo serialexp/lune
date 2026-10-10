@@ -1662,6 +1662,9 @@ pub const TraceState = struct {
     retire_batches: u64 = 0,
     /// Full `rebuildRegions` runs (commit, retirement, deferred request).
     region_rebuilds: u64 = 0,
+    /// Side traces that committed after their source parent retired (doc 61
+    /// §7.1 item 4): no provenance edge is recorded for them.
+    side_commits_orphaned: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator) TraceState {
         return .{ .gpa = gpa, .registry = @import("trace_registry.zig").TraceRegistry.init(gpa) };
@@ -3899,7 +3902,10 @@ pub const TraceState = struct {
     pub fn finishSideTraceProvenance(self: *TraceState, child: *Trace, source: ?ExitKey) void {
         const src = source orelse return;
         if (self.traceById(child.id) != child) return;
-        const parent = self.traceById(src.trace_id) orelse return;
+        const parent = self.traceById(src.trace_id) orelse {
+            self.side_commits_orphaned +|= 1;
+            return;
+        };
         var may_latch_done = true;
         if (parent.code.anchor.proto == child.code.anchor.proto and parent.code.anchor.pc == child.code.anchor.pc and
             src.exit_instr < parent.code.instrs.len)

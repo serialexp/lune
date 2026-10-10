@@ -2425,3 +2425,18 @@ nothing at all.
 - [ ] **Measure R3 on the two-level branch probe** (Phase 5 finding: 65%
       traced with the switch off, 13% on). R3 now lets a child's exits
       become wanted; the probe program is not in the tree yet.
+
+## Recorder `bad_type` aborts found by the Phase Q side differential (noted 2026-10-10)
+
+Both showed up while building the "side recording over a retired parent"
+test in `src/interp_phaseq_test.zig` and were dodged there, not fixed.
+
+- [ ] **`string.find(s, "z")` (a pattern with no specials) aborts recording
+      with `bad_type` at the `call` (op 49).** The same call with `"%l"` or
+      `"%d+"` records fine (`smatch` + `guard_sid`), so the plain-pattern
+      fast path probably has no recorder lowering. Check the abort site
+      with `--dump-aborts` and give it one.
+- [ ] **`t[1] = nil` on a small array table aborts recording with
+      `bad_type` at the `set_index` (op 40).** Seen as `hold[1] = nil` on a
+      one-element `{ p }`, in a side recording. Storing nil (an array
+      shrink / hole) seems to have no recorded store shape.
