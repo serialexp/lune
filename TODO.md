@@ -150,6 +150,20 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       (Lua: `SETLIST` with `C=0` after a multret call; `{...}` is the
       same case) along with the recorder/JIT side.
 
+## Precise traces retry a failed string-helper allocation (noted 2026-10-10)
+
+- [ ] **Doc 45 D5 says a precise trace never retries an OOM, but string
+      helpers do.** `tostr_int`/`tostr_num` (and the other stralloc
+      producers) side-exit on a null return without setting
+      `runtime_error` (`irinterp.zig:845`). Every precise body op carries
+      its boundary snapshot (`trace_recorder.zig:1741`), so the exit is
+      `.precise_resume` and tier-0 runs the allocation again. Under a
+      one-shot injected OOM the traced run succeeds where tier-0 raises.
+      Fix: in precise traces, helper allocation failures set
+      `out_of_memory` and exit `.precise_error`, in tier-1a and native,
+      with an injected-OOM test per helper. Found by Codex in the doc 63
+      round-2 review; doc 63 Prerequisite A.
+
 ## Coverage mode changes `tick` (noted 2026-10-09)
 
 - [ ] **`config.coverage` is documented as never affecting tiering, but a
