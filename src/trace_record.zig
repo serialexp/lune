@@ -58,6 +58,16 @@ pub const TraceRecord = struct {
     /// slot index of the live incumbent that blocked this trace's install.
     /// Its tombstone (and only its) wakes this trace back to `.eligible`.
     entry_patch_incumbent: u16 = 0,
+    /// Doc 61 §7.1 item 5: set by `TraceState.removeTraces` on every member
+    /// of the batch being retired, so each teardown pass can test membership
+    /// with one load. Never set on a published, surviving trace.
+    doomed: bool = false,
+    /// Memo of `EntryRegistry.resolvePatchPc` for this trace's anchor: a pure
+    /// function of immutable bytecode, so a re-install after an unpatch (or a
+    /// bulk entry-patch drain) does no bytecode scan. `patch_pc_known` false =
+    /// not resolved yet; `patch_pc` null = unresolvable (permanent).
+    patch_pc_known: bool = false,
+    patch_pc: ?u32 = null,
     /// Immutable, owned payload consumed by execution, serialization, and lowering.
     code: TraceCode,
     /// Tier-1b native-codegen cache (Phase 8): lazily compiled machine code for
@@ -88,11 +98,11 @@ pub const TraceRecord = struct {
     /// `region_context.call_seq` the memo was stamped under.
     bridge_decline_seq: u64 = 0,
 
-    /// Memo for `TraceState.anchorPopulation`: the `countTracesAt(anchor)` result as
-    /// of `TraceState.registry.cache_gen == anchor_pop_gen`. Gen 0 = never computed (state
-    /// gens start at 1). Pure accelerator — recomputed on any cache mutation.
-    anchor_pop_gen: u32 = 0,
-    anchor_pop: u32 = 0,
+    /// The registry's per-anchor list (`TraceRegistry.by_anchor`): the
+    /// neighbouring published traces at this record's anchor, in cache order.
+    /// Owned by the registry; null while unpublished.
+    anchor_prev: ?*TraceRecord = null,
+    anchor_next: ?*TraceRecord = null,
 
     /// Memo for `TraceState.hasNativeLoopDoneLink` — a pure function of this
     /// trace's instrs (fixed after commit), its dispatch proto (fixed: the

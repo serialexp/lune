@@ -264,6 +264,7 @@ pub const IrInstr = struct {
 };
 
 pub const Trace = struct {
+    id: u32,
     anchor_proto_id: u32,
     anchor_pc: u32,
     peeled: u8,
@@ -281,6 +282,7 @@ pub const Trace = struct {
     }
 
     pub fn encodeInto(self: Trace, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint32(self.id, .little_endian);
         try enc.writeUint32(self.anchor_proto_id, .little_endian);
         try enc.writeUint32(self.anchor_pc, .little_endian);
         try enc.writeUint8(self.peeled);
@@ -305,6 +307,7 @@ pub const Trace = struct {
 
     pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!Trace {
         var result: Trace = undefined;
+        result.id = try dec.readUint32(.little_endian);
         result.anchor_proto_id = try dec.readUint32(.little_endian);
         result.anchor_pc = try dec.readUint32(.little_endian);
         result.peeled = try dec.readUint8();

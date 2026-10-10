@@ -497,6 +497,22 @@ pub const NativePhysicalRegistry = struct {
             }
         }
     }
+    /// Batch form of `dropParkedProofsTouching` (doc 61 §7.1 item 5 step 3):
+    /// one pass over the parked proofs, testing each edge's endpoints
+    /// against the `Trace.doomed` bit.
+    pub fn dropParkedProofsTouchingDoomed(self: *NativePhysicalRegistry) void {
+        var i = self.parked_proofs.items.len;
+        while (i > 0) {
+            i -= 1;
+            for (self.parked_proofs.items[i].edges) |edge| {
+                if (edge.parent.doomed or edge.child.doomed) {
+                    self.gpa.free(self.parked_proofs.items[i].edges);
+                    _ = self.parked_proofs.swapRemove(i);
+                    break;
+                }
+            }
+        }
+    }
     pub fn demoteSet(self: *NativePhysicalRegistry, idx: usize) void {
         self.demoteSetReason(idx, .trace_invalidation);
     }
@@ -578,6 +594,22 @@ pub const NativePhysicalRegistry = struct {
             var touches = false;
             for (self.promoted_sets.items[i].edges) |edge| {
                 if (edge.parent == trace or edge.child == trace) {
+                    touches = true;
+                    break;
+                }
+            }
+            if (touches) self.demoteSetReason(i, .trace_invalidation);
+        }
+    }
+    /// Batch form of `demoteSetsTouchingTrace` over every `doomed` trace.
+    pub fn demoteSetsTouchingDoomed(self: *NativePhysicalRegistry) void {
+        self.resetPromotionCandidate();
+        var i = self.promoted_sets.items.len;
+        while (i > 0) {
+            i -= 1;
+            var touches = false;
+            for (self.promoted_sets.items[i].edges) |edge| {
+                if (edge.parent.doomed or edge.child.doomed) {
                     touches = true;
                     break;
                 }
@@ -691,6 +723,58 @@ pub const NativePhysicalRegistry = struct {
             // edge — let the drain re-evaluate at the next safe point.
             self.provenance_invalidated = true;
         }
+    }
+    /// Batch form of `resetLinksTouching` over every `doomed` trace (doc 61
+    /// §7.1 item 5 step 3): one pass each over parked proofs, promoted sets
+    /// and armed links. A surviving parent's slot into a doomed child is
+    /// rewritten to `shared_exit` through `commitSlotMutation`, prepared by
+    /// `prepareSlotMutationNoProofScan` because the proof pass has already
+    /// dropped every proof that names a doomed endpoint, and only such a
+    /// proof can name these cells. Armed links are compacted in order.
+    pub fn resetLinksTouchingDoomed(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena) void {
+        if (self.replay_walk_depth != 0) @panic("resetLinksTouchingDoomed during replay");
+        self.dropParkedProofsTouchingDoomed();
+        self.demoteSetsTouchingDoomed();
+        const shared_exit = arena.*.trampoline_exit orelse 0;
+        var w: usize = 0;
+        for (self.armed_links.items) |link| {
+            if (!link.child.doomed and !link.parent.doomed) {
+                self.armed_links.items[w] = link;
+                w += 1;
+                continue;
+            }
+            self.dbg("retire-reset: link parent id={d} slot={d} child id={d}", .{ link.parent.id, link.slot_index, link.child.id });
+            clearSiblingLatch(link);
+            if (!link.parent.doomed) {
+                const p = physicalSlot(link);
+                switch (link.parent.native) {
+                    .compiled => |*c| if (p < c.slots.len) {
+                        const prepared = self.prepareSlotMutationNoProofScan(link.parent, p) catch
+                            @panic("resetLinksTouchingDoomed: invalid native slot mutation");
+                        self.commitSlotMutation(prepared, shared_exit, false);
+                    },
+                    else => {},
+                }
+            }
+            // A removed arm may be re-publishable from a surviving provenance
+            // edge — let the drain re-evaluate at the next safe point.
+            self.provenance_invalidated = true;
+        }
+        self.armed_links.shrinkRetainingCapacity(w);
+    }
+    /// `prepareSlotMutation(.retire)` minus its parked-proof rescan, for the
+    /// batch teardown only (see `resetLinksTouchingDoomed`).
+    fn prepareSlotMutationNoProofScan(self: *NativePhysicalRegistry, parent: *Trace, exit: u32) !PreparedSlotMutation {
+        self.resetPromotionCandidate();
+        const compiled = switch (parent.native) {
+            .compiled => |*c| c,
+            else => return error.NativeTraceUnavailable,
+        };
+        if (exit >= compiled.slots.len) return error.InvalidNativeSlot;
+        self.demoteSetsTouching(parent, exit);
+        if (self.promoted_cell_owners.contains(.{ .trace_id = parent.id, .cell = exit }))
+            return error.DemotionDeferred;
+        return .{ .compiled = compiled, .exit = exit };
     }
     pub fn disarmAllLinks(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena) void {
         // Parked proofs drop FIRST, unconditionally — before the deferred

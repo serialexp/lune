@@ -670,10 +670,7 @@ fn emitCoverage(gpa: std.mem.Allocator, io: mahina.io.Io, path: []const u8, vm: 
 
 /// Serialize the recorded trace cache to `path` (binschema wire format).
 fn emitTraces(gpa: std.mem.Allocator, io: mahina.io.Io, path: []const u8, vm: *mahina.interp.Vm) !void {
-    const codes = try gpa.alloc(*const mahina.trace.TraceCode, vm.trace.registry.cache.items.len);
-    defer gpa.free(codes);
-    for (vm.trace.registry.cache.items, codes) |record, *code| code.* = &record.code;
-    const bytes = try mahina.traceser.encodeFile(gpa, codes);
+    const bytes = try vm.trace.encodeTraceFile(gpa);
     defer gpa.free(bytes);
     try mahina.io.writeFile(io, path, bytes);
     mahina.io.eprint("mahina: wrote {d} trace(s), {d} bytes → {s}\n", .{ vm.trace.registry.cache.items.len, bytes.len, path });

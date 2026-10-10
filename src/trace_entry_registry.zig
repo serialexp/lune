@@ -28,6 +28,11 @@ pub const EntryPatch = struct {
     live: bool = true,
     pending_unpatch: bool = false,
     tombstone: bool = false,
+    /// The owner was retired (doc 61 Phase Q batch): `trace` is poisoned and
+    /// `trace_id` resolves to nothing, so the drain restores the slot without
+    /// an owner lookup — a by-id miss falls back to a cache scan, which made
+    /// a mass retirement's drain O(D·T) (codex Phase Q review).
+    owner_retired: bool = false,
     strikes: u8 = 0,
     seed_count: u32,
     /// Doc 45 D6.1 (native safety net, one-shot flavor): the `cache_gen` at
@@ -129,7 +134,11 @@ pub const EntryRegistry = struct {
     /// Fully initializes a stable slot before publishing its index in the image.
     pub fn installEntryPatch(self: *EntryRegistry, t: *Trace) InstallResult {
         std.debug.assert(t.entry_slot == null);
-        const patch_pc = resolvePatchPc(t.code.anchor.proto, t.code.anchor.pc) orelse return .no_patch_pc;
+        if (!t.patch_pc_known) {
+            t.patch_pc = resolvePatchPc(t.code.anchor.proto, t.code.anchor.pc);
+            t.patch_pc_known = true;
+        }
+        const patch_pc = t.patch_pc orelse return .no_patch_pc;
         const img = self.ensureImage(t.code.anchor.proto) catch return .oom;
         const orig = t.code.anchor.proto.code[patch_pc];
         const patched_op: OpCode = switch (trace_code.anchorKind(t.code.anchor.pc)) {
@@ -200,30 +209,57 @@ pub const EntryRegistry = struct {
     /// Physical restore and retirement. `live_records` is explicit so this owner
     /// can resolve identity and wake waiters without depending on a coordinator.
     pub fn unpatchSlot(self: *EntryRegistry, idx: u16, live_records: []const *Trace) void {
+        const owner_id = self.restoreSlot(idx);
+        for (live_records) |t| {
+            if (t.id == owner_id) {
+                unbindOwner(t);
+                break;
+            }
+        }
+        for (live_records) |t| wakeWaiter(self, t);
+    }
+
+    /// The physical half of an unpatch: restore the canonical instruction in
+    /// the image, tombstone the slot and return it to the free list. Returns
+    /// the id of the trace the slot was bound to; the caller resolves it
+    /// (`unbindOwner`) and wakes waiters (`wakeWaiter`). Split out so a drain
+    /// that unpatches many slots wakes waiters in one pass over the cache
+    /// (doc 61 §7.1 item 5 step 8).
+    pub fn restoreSlot(self: *EntryRegistry, idx: u16) u32 {
         const p = self.entry_patches.items[idx];
         if (self.code_images.get(p.proto)) |img| {
             std.debug.assert(img[p.patch_pc].op == p.patched_op and img[p.patch_pc].b == idx);
             std.debug.assert(std.meta.eql(p.orig, p.proto.code[p.patch_pc]));
             img[p.patch_pc] = p.orig;
         }
-        for (live_records) |t| {
-            if (t.id == p.trace_id) {
-                t.entry_slot = null;
-                if (t.entry_patch == .bound) t.entry_patch = .eligible;
-                break;
-            }
-        }
         p.live = false;
         p.pending_unpatch = false;
         p.tombstone = true;
-        for (live_records) |t| switch (t.entry_patch) {
+        self.entry_patch_free.append(self.gpa, idx) catch {};
+        return p.trace_id;
+    }
+
+    /// The surviving trace a restored slot was bound to goes back to
+    /// `.eligible` (if it was `.bound`).
+    pub fn unbindOwner(t: *Trace) void {
+        t.entry_slot = null;
+        if (t.entry_patch == .bound) t.entry_patch = .eligible;
+    }
+
+    /// Wake `t` if a restored slot was what suppressed it: any freed slot
+    /// lifts capacity suppression, and an incumbent-suppressed trace wakes
+    /// once its incumbent slot is a tombstone. A tombstone at wake time was
+    /// restored since the suppression was recorded (suppression needs a live
+    /// incumbent), so checking the flag after a batch of restores is the
+    /// same as waking after each one.
+    pub fn wakeWaiter(self: *const EntryRegistry, t: *Trace) void {
+        switch (t.entry_patch) {
             .suppressed_capacity => t.entry_patch = .eligible,
-            .suppressed_incumbent => if (t.entry_patch_incumbent == idx) {
+            .suppressed_incumbent => if (self.entry_patches.items[t.entry_patch_incumbent].tombstone) {
                 t.entry_patch = .eligible;
             },
             else => {},
-        };
-        self.entry_patch_free.append(self.gpa, idx) catch {};
+        }
     }
 
     pub fn dropEntryPatchState(self: *EntryRegistry) void {

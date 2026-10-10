@@ -37,6 +37,39 @@ const expectMatch = util.expectMatch;
 // Tests
 // ---------------------------------------------------------------------------
 
+test "McodeArena: freeing every live page never allocates; stale and repeated frees are ignored" {
+    // Doc 61 §7.1: a collection retiring a batch of compiled traces frees
+    // their pages on the collection path, so `free` must not allocate —
+    // `alloc` reserves the free-list room up front. Arm the allocator to fail
+    // after the pages exist: every free must still land on the free list.
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var arena = McodeArena.init(failing.allocator());
+    defer arena.deinit();
+    const code: [40]u8 = @splat(0xc3); // `ret` padding
+    var pages: [32]nativegen.ExecPage = undefined;
+    for (&pages) |*p| p.* = try arena.alloc(&code);
+    try testing.expectEqual(@as(u32, pages.len), arena.live_pages.count());
+
+    failing.fail_index = failing.alloc_index; // the next allocation fails
+    const stale = pages[3].owner.arena;
+    for (&pages) |*p| p.deinit();
+    try testing.expect(!failing.has_induced_failure);
+    try testing.expectEqual(@as(u32, 0), arena.live_pages.count());
+    try testing.expectEqual(pages.len, arena.free_list.items.len);
+
+    // A repeated free of an already-freed generation is a no-op.
+    arena.free(stale.region, stale.offset, stale.cap, stale.generation);
+    try testing.expectEqual(pages.len, arena.free_list.items.len);
+
+    // Reuse takes a free slot and keeps the reservation invariant.
+    failing.fail_index = std.math.maxInt(usize);
+    var again = try arena.alloc(&code);
+    try testing.expectEqual(pages.len - 1, arena.free_list.items.len);
+    try testing.expect(arena.free_list.capacity >= arena.free_list.items.len + arena.live_pages.count());
+    again.deinit();
+}
+
 test "nativegen B-3a: NativeResult silent ABI tail preserves every ledger offset" {
     try testing.expectEqual(@offsetOf(NativeResultLedgerLayout, "ledger_len"), @offsetOf(NativeResult, "ledger_len"));
     try testing.expectEqual(@offsetOf(NativeResultLedgerLayout, "ledger_cum"), @offsetOf(NativeResult, "ledger_cum"));

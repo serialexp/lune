@@ -115,8 +115,24 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 
 ## Region graph rebuild R(T) is superlinear in traces and exits (noted 2026-10-10)
 
-- [ ] Every trace commit (`trace.zig:4028`) runs `rebuildEdgeCache` plus
-      `rebuildRegions`. Codex's doc 61 Phase Q rev 2 review found
+- [x] **Fixed 2026-10-10.** The registry now keeps a per-anchor index
+      (`TraceRegistry.by_anchor`: an intrusive cache-order list per anchor,
+      with its trace count and inner-root count), so `countTracesAt`,
+      `hasInnerRootAt` and every per-anchor lookup (`findTrace`,
+      `findLoopTrace`, `findLinkTrace`, `nextTraceExcluding`,
+      `resolveLoopDoneCont`, `resolveRegionBridgeChild`) cost O(traces at
+      that anchor), not O(cache). The topology view is indexed (id → record,
+      inner-root anchors), `buildEdges` pairs exits by position, and `build`
+      works per component on CSR node/edge lists, with an O(1) owner test,
+      a dominance envelope for the fallback tie-break and a BFS sibling
+      closure. Results: `bench-retire` R(T) at N=4000 went from 92 ms to
+      3.0 ms, and retiring 10% of it from 45.8 ms to 1.25 ms.
+      `bench-topology` now scales n log n up to k=2048 (2.97 ms). Tests
+      install records through `TraceRegistry.attach`/`detach`/`detachAll`,
+      never by writing `registry.cache` directly.
+
+      The original finding: every trace commit (`trace.zig:4028`) runs
+      `rebuildEdgeCache` plus `rebuildRegions`. Codex's doc 61 Phase Q rev 2 review found
       superlinear work inside:
       - `topologyView` → `hasInnerRootAt`, a cache scan per trace
         (`trace_link.zig:832`);
@@ -130,6 +146,32 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       Fix with indexed trace/anchor lookup, direct exit-fact matching and
       component-local adjacency. Measure with `zig build bench-topology` and
       Phase Q's retirement benchmark, which reports R(T) on its own.
+
+      Measured with `zig build bench-retire` (2026-10-10, load average about
+      16, so absolute numbers are noisy): on one closed cycle of N/2 linked
+      roots, R(T) took 0.25 ms at N=250, 4.0 ms at N=1000 and 85 ms at
+      N=4000. That is roughly quadratic. A Phase Q batch pays exactly one
+      R(T): retiring 10% of N=4000 costs 41 ms, against 18.6 s for the old
+      per-trace removal. So R(T) is now the whole retirement cost.
+
+## Every commit still pays a whole-graph rebuild (noted 2026-10-10)
+
+- [ ] R(T) is now near-linear, but each commit (and each retirement batch)
+      still rebuilds the edge cache and every region from scratch. That is
+      O(T) per commit, so O(T²) over a run that commits T traces: about
+      3 ms per commit at T=4000. Most commits touch one anchor's
+      neighbourhood. An incremental rebuild (re-derive only the components
+      reachable from the changed anchors) would make a commit
+      O(neighbourhood). It has to keep the transactional, fail-closed
+      publish and the replay-stable id assignment. Profile a large real
+      program before designing it.
+
+## viz tests crash under bun 1.3.0 (noted 2026-10-10)
+
+- [ ] `bun test` in `viz/` segfaults loading the wasm module under bun
+      1.3.0 (the `bun` on PATH). `~/.bun/bin/bun` 1.3.14 passes all 70.
+      Either pin the bun version (`packageManager`/engines, or the justfile
+      recipe calls `~/.bun/bin/bun`) or upgrade the system bun.
 
 ## `releaseChunk` leaves traces over released protos (noted 2026-10-10)
 
@@ -152,7 +194,7 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 
 ## Precise traces retry a failed string-helper allocation (noted 2026-10-10)
 
-- [ ] **Doc 45 D5 says a precise trace never retries an OOM, but string
+- [x] **Doc 45 D5 says a precise trace never retries an OOM, but string
       helpers do.** `tostr_int`/`tostr_num` (and the other stralloc
       producers) side-exit on a null return without setting
       `runtime_error` (`irinterp.zig:845`). Every precise body op carries
@@ -163,6 +205,34 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       `out_of_memory` and exit `.precise_error`, in tier-1a and native,
       with an injected-OOM test per helper. Found by Codex in the doc 63
       round-2 review; doc 63 Prerequisite A.
+      **Fixed 2026-10-10.** The allocating shims return a one-word
+      `stralloc.StrResult`: the `*GcHeader`, the OOM `Status` ordinal, or
+      0 for a decline (out-of-range `string.char`, stale match scratch).
+      Precise traces raise the OOM through `.precise_error` in tier-1a and
+      native; a decline still resumes. Tests: "pipeline (string helper
+      OOM…)" (tostr plus all seven snew/scap helpers, both tiers) and
+      "pipeline (string helper decline…)", mutation-checked per tier.
+
+## Ordinary traces retry a transient string-helper OOM (noted 2026-10-10)
+
+- [ ] **Decide whether ordinary (non-precise) traces may retry an OOM.**
+      An ordinary trace still side-exits on a string-helper OOM, and
+      tier-0 replays the whole iteration, running the allocation again.
+      Doc 24 D5 assumes the replay "re-raises the same OOM", which holds
+      for a persistent failure (a full heap, a budget allocator) but not
+      for a transient one: under a one-shot injected failure the traced
+      run survives where tier-0 raised. Doc 45 D5's never-retry rule was
+      written for precise traces only. Ordinary traces do carry some
+      bytecode-boundary state (doc 56's exit-side materialization rebuilds
+      the registers at a resume pc), but only for attachable side-exit
+      guards; a helper exit carries no snapshot and its raise has nowhere
+      to park. The options: (a) accept the retry (it is invisible unless
+      allocation failures are transient); (b) route allocating loops
+      through precise recording; (c) extend the helper-error integration
+      to ordinary traces — give allocating helpers a boundary snapshot
+      and a precise-error-style consumer, at the cost of keeping those
+      refs live (and blocking LICM across them) in optimized traces.
+      Needs Bart's call.
 
 ## Traced host calls: multret arguments and results (deferred 2026-10-10)
 

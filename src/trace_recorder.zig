@@ -180,6 +180,11 @@ pub const AbortReason = enum {
     /// strike semantics; the loop warms its own root meanwhile, and a later
     /// recording links to it.
     loop_unroll,
+    /// Doc 61 §7.1 (Phase Q): a collection is about to sweep a heap constant
+    /// in the recording's pool (`rec.consts`). The pool is not a root, so the
+    /// recording is cancelled (`RecordingSession.cancel`, never `abort`'s
+    /// peel rewind) before the sweep frees it. Ordinary strike semantics.
+    const_swept,
 };
 const ExitProvenance = @import("trace_types.zig").ExitProvenance;
 const ProgramPoint = @import("trace_types.zig").ProgramPoint;
@@ -301,9 +306,10 @@ pub const PeelSlot = struct {
 pub const PendingLinkClose = struct {
     inner_anchor_pc: u32,
     for_loop_pc: u32,
-    /// Snapshot of the inner root's numeric entry guards. Borrowed from the
-    /// live `Trace.code.entry_guards` — stable while the trace is cached (no
-    /// eviction runs during recording).
+    /// Copy of the inner root's numeric entry guards, owned by the session
+    /// and freed through `clearPendingLinkClose`. It is not borrowed from
+    /// the inner root's `Trace.code.entry_guards`: a collection between the
+    /// peel's instructions can retire that trace (doc 61 §7.1 item 4).
     contract: []const trace_code.EntryGuard,
     phase: Phase,
 
@@ -360,6 +366,28 @@ pub const PeelState = struct {
 pub const KonstKey = trace_ir.KonstKey;
 pub const konstKey = trace_ir.konstKey;
 
+/// A heap object's identity for the recorder's dedup maps and observed-truth
+/// fields, taken when the entry is recorded and never by dereferencing a
+/// header later. The address alone is not enough: a collection between
+/// recorded instructions can free an object and hand its address to a new one
+/// (doc 61 §7.1 item 4). The new object gets a fresh `GcHeader.id`, so the pair
+/// differs. The id alone is not enough either: raw test-created objects all
+/// carry id 0, and they differ only by address.
+pub const ObjIdentity = struct { id: u32, addr: usize };
+
+pub fn objIdentity(h: *const object.GcHeader) ObjIdentity {
+    return .{ .id = h.id, .addr = @intFromPtr(h) };
+}
+
+/// `konst_map`'s key: the pool identity plus, for a heap constant, its
+/// `GcHeader.id` (same reasoning as `ObjIdentity`). The optimizer keeps the
+/// plain `konstKey`: tropt runs with no collection inside it.
+pub const RecKonstKey = struct { key: KonstKey, id: u32 };
+
+pub fn recKonstKey(v: Value) RecKonstKey {
+    return .{ .key = konstKey(v), .id = if (v.isHeap()) v.asHeap().id else 0 };
+}
+
 /// The in-progress recording buffer. `TraceState` owns it and drives every
 /// mutation through its own methods (`emit`/`refOf`/`recordInstr`/…); this struct
 /// is just storage + cleanup. While `active` is false the interpreter never calls
@@ -377,15 +405,15 @@ pub const PendingStore = struct {
     op: IrOp = .astore,
     /// Record-time identity of the stored-to table (doc 51 Fix A): the
     /// observed truth that decides which DIRECTION the alias-disambiguation
-    /// guard specializes to. Object identity (the header pointer), NOT
-    /// `GcHeader.id` — raw test-created tables share id 0, which would make
-    /// distinct tables falsely compare equal and forward wrongly. The
-    /// pointer never enters the trace IR; it only picks between two guard
-    /// emissions, and that choice is deterministic because object identity
-    /// is replay-stable (same precedent as `konstKey`'s heap lookup). Null
-    /// for non-table stores (`ustore`/`sgm_setpos`), which never reach the
+    /// guard specializes to. An `ObjIdentity`, captured at store time: the
+    /// address alone could be reused by a new table after a collection
+    /// between the store and a later load. The id alone would make raw test
+    /// tables (all id 0) compare equal. The identity never enters the trace
+    /// IR; it only picks between two guard emissions, and that choice is
+    /// deterministic because object identity is replay-stable. Null for
+    /// non-table stores (`ustore`/`sgm_setpos`), which never reach the
     /// identity arms.
-    tab_obj: ?*const object.GcHeader = null,
+    tab_obj: ?ObjIdentity = null,
     /// Record-time integer index of an `astore` (doc 51 Fix A) — the
     /// observed truth for the loop-varying (`.may`) key arm. Unused for
     /// other store ops.
@@ -396,6 +424,11 @@ pub const PendingStore = struct {
     /// which bytecode the store belongs to, or a resume-coherent exit would
     /// apply it at the wrong program point.
     ord: u16,
+
+    fn storedTo(self: PendingStore, tab: *const object.GcHeader) bool {
+        const id = self.tab_obj orelse return false;
+        return std.meta.eql(id, objIdentity(tab));
+    }
 };
 
 pub const AliasClass = enum { must, no, may };
@@ -640,7 +673,7 @@ pub const RecordingSession = struct {
     /// ref (and pool slot) instead of emitting a fresh one, so identical
     /// subexpressions get identical operand refs and the optimizer's CSE can
     /// merge them. See `TraceState.konst`.
-    konst_map: std.AutoHashMapUnmanaged(KonstKey, Ref) = .empty,
+    konst_map: std.AutoHashMapUnmanaged(RecKonstKey, Ref) = .empty,
     /// Current SSA ref + state for each tier-0 register, sized to the recording
     /// frame's `num_registers`.
     reg_map: []RegSlot = &.{},
@@ -848,10 +881,10 @@ pub const RecordingSession = struct {
     /// the `MAX_TRACE_INPUTS` budget. Separate from `input_dedup` because the value
     /// is a raw slot (no `slot_load` ref — `href` is the consumer via its `aux`).
     hash_cell_dedup: std.AutoHashMapUnmanaged(u64, u16) = .empty,
-    /// Dedup for `callee_global` seeds (doc 43 P4): interned name address →
+    /// Dedup for `callee_global` seeds (doc 43 P4): interned name identity →
     /// the seeding `slot_load` ref. Interned strings are VM-deduped, so two
-    /// callee protos naming one global share the address (and the seed).
-    callee_global_dedup: std.AutoHashMapUnmanaged(u64, Ref) = .empty,
+    /// callee protos naming one global share the identity (and the seed).
+    callee_global_dedup: std.AutoHashMapUnmanaged(ObjIdentity, Ref) = .empty,
     /// Next synthetic input slab slot to hand out. Initialised to
     /// `anchor_num_registers` in `reset` (inputs live *above* the anchor window);
     /// bumped once per unique input. The slot is only ever a `slot_load` `aux` and
@@ -860,14 +893,14 @@ pub const RecordingSession = struct {
     next_input_slot: u16 = 0,
 
     // --- closed-cell upvalue stores (doc 43 P5) -----------------------------
-    /// Alias classes keyed on the OBSERVED `*Upvalue` address at record time
-    /// (`@intFromPtr(cell)`): aliasing is a property of the physical cell, not
+    /// Alias classes keyed on the OBSERVED `*Upvalue` cell's identity at record
+    /// time (`objIdentity`): aliasing is a property of the physical cell, not
     /// of the `(callee_slot, upvalue_index)` access path — different slots,
     /// closures and indices can reach one shared cell. Value = the class's
     /// `uref` token; two paths resolving to the same cell share it
     /// (MUST-alias), distinct observed cells are distinct classes (NO-alias),
     /// and the entry seeder re-proves the whole relation (verifier seeds).
-    upvalue_cell_classes: std.AutoHashMapUnmanaged(u64, Ref) = .empty,
+    upvalue_cell_classes: std.AutoHashMapUnmanaged(ObjIdentity, Ref) = .empty,
     /// Per-class access-path dedup: `(callee_slot_or_anchor_sentinel << 16 |
     /// upvalue_index)` → seen. A path already seeded (as writer or verifier)
     /// appends no further seed.
@@ -877,7 +910,7 @@ pub const RecordingSession = struct {
     /// to such a cell would leave the baked read stale for the rest of the
     /// episode — abort `.upvalue_mutable`, which memoizes the anchor so the
     /// retry routes its scalar reads through `uload` from the start.
-    snapshot_read_cells: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    snapshot_read_cells: std.AutoHashMapUnmanaged(ObjIdentity, void) = .empty,
     /// Doc 43 P5 read routing (the abort-once-and-memo retry): set at arm time
     /// from the anchor's `upvalue_mutable_memo`. When true, SCALAR-observed
     /// closed-cell upvalue reads route through per-iteration `uload`s instead
@@ -1018,7 +1051,6 @@ pub const RecordingSession = struct {
         // etc.); those refs now point into the truncated range and would
         // produce garbage in the exit snapshot if left.
         @memcpy(self.reg_map[0..plc.saved_reg_map.len], plc.saved_reg_map);
-        self.gpa.free(plc.saved_reg_map);
         // Restore side-effect flags that body recording may have set.
         self.recorded_global_seed = plc.saved_global_seed;
         self.recorded_global_store = plc.saved_global_store;
@@ -1063,7 +1095,7 @@ pub const RecordingSession = struct {
             }
         }
         self.lane_pins.items.len = np;
-        self.pending_link_close = null;
+        self.clearPendingLinkClose();
 
         // --- Re-emit the immediate `.link` close (same logic as the
         //     non-peel path in recForPrepLink lines 3062-3124). ---
@@ -1141,6 +1173,26 @@ pub const RecordingSession = struct {
             .source_pc = plc.for_prep_pc -| 1,
         } };
         self.close_requested = true;
+    }
+
+    /// The single release point for `pending_link_close` and the two
+    /// buffers it owns (the rewind `saved_reg_map` and the `contract` copy).
+    /// Every path that drops a pending peel comes through here.
+    fn clearPendingLinkClose(self: *RecordingSession) void {
+        const plc = self.pending_link_close orelse return;
+        self.gpa.free(plc.saved_reg_map);
+        self.gpa.free(plc.contract);
+        self.pending_link_close = null;
+    }
+
+    /// Kill the recording unconditionally, with no peel-rewind fallback.
+    /// `abort` can turn an in-flight peel into a `.link` close that keeps the
+    /// pool. A collection about to sweep one of the recording's constants
+    /// (doc 61 §7.1 item 2) must not let that happen.
+    pub fn cancel(self: *RecordingSession, reason: AbortReason) void {
+        if (!self.active) return;
+        self.clearPendingLinkClose();
+        self.realAbort(reason);
     }
 
     /// The real abort — unconditionally kills the recording. Called when
@@ -1781,7 +1833,7 @@ pub const RecordingSession = struct {
     /// `(i + 7) * (i + 7)`) end up with identical operand refs, so the
     /// optimizer's CSE can collapse them (see docs / TODO.md).
     pub fn konst(self: *RecordingSession, v: Value) !Ref {
-        const key = konstKey(v);
+        const key = recKonstKey(v);
         if (self.konst_map.get(key)) |existing| return existing;
         const idx: i32 = @intCast(self.consts.items.len);
         try self.consts.append(self.gpa, v);
@@ -2333,7 +2385,7 @@ pub const RecordingSession = struct {
             const addr = self.instrs.items[ps.aref];
             std.debug.assert(addr.op == .aref);
             const same_ref = addr.a == rtab;
-            const tables_observed_equal = same_ref or load_tab == ps.tab_obj;
+            const tables_observed_equal = same_ref or ps.storedTo(load_tab);
             if (!tables_observed_equal) {
                 // Observed-distinct tables: the honest specialization is
                 // "they differ" — guard it and ignore the keys entirely. If
@@ -2426,7 +2478,7 @@ pub const RecordingSession = struct {
             // Same key, different table SSA refs — the record-time identity
             // decides the specialization direction (doc 51 Fix A; guarding
             // contrary to the observed state minted DOA turnstile traces).
-            if (load_tab == ps.tab_obj) {
+            if (ps.storedTo(load_tab)) {
                 // Observed the SAME table: the sunk store aliases this cell.
                 // Pin the identity (`ne` observed FALSE → guard_false) and
                 // forward the newest pending value — at record time tier-0
@@ -2707,7 +2759,7 @@ pub const RecordingSession = struct {
                 .aref = ref,
                 .value = rval,
                 .lane_ord = lane_ord,
-                .tab_obj = vtab.asHeap(),
+                .tab_obj = objIdentity(vtab.asHeap()),
                 .key_idx = idx,
                 .ord = self.cur_ord,
             });
@@ -3218,7 +3270,7 @@ pub const RecordingSession = struct {
                 .value = rval,
                 .lane_ord = 0,
                 .op = .hstore,
-                .tab_obj = vtab.asHeap(),
+                .tab_obj = objIdentity(vtab.asHeap()),
                 .ord = self.cur_ord,
             });
         } else {
@@ -3629,8 +3681,7 @@ pub const RecordingSession = struct {
                         if (within) {
                             plc.phase = .peeling;
                         } else {
-                            self.gpa.free(plc.saved_reg_map);
-                            self.pending_link_close = null;
+                            self.clearPendingLinkClose();
                             // Continue recording — the guard_false exit direction
                             // was already recorded above.
                         }
@@ -3656,8 +3707,7 @@ pub const RecordingSession = struct {
                                     },
                                 };
                                 self.close_requested = true;
-                                self.gpa.free(plc.saved_reg_map);
-                                self.pending_link_close = null;
+                                self.clearPendingLinkClose();
                             } else {
                                 // Still mismatched after one iteration — abort.
                                 // The peel can't help; fall back to today's
@@ -3665,8 +3715,7 @@ pub const RecordingSession = struct {
                                 // rewind state and clear BEFORE abort so the
                                 // abort-rewind catch doesn't fire (the peel
                                 // completed; rewind would be wrong).
-                                self.gpa.free(plc.saved_reg_map);
-                                self.pending_link_close = null;
+                                self.clearPendingLinkClose();
                                 return self.abort(.type_instability);
                             }
                         } else {
@@ -3674,8 +3723,7 @@ pub const RecordingSession = struct {
                             // iteration 2 exists. Clear the peel and continue
                             // recording past the loop — may produce a useful
                             // one-trip-specialized continuation trace.
-                            self.gpa.free(plc.saved_reg_map);
-                            self.pending_link_close = null;
+                            self.clearPendingLinkClose();
                         }
                     },
                 }
@@ -3823,8 +3871,14 @@ pub const RecordingSession = struct {
                 // the scratch is overwritten by the peel's bytecodes, and a
                 // rewind re-emits this bytecode's guards, which resume here.
                 try self.commitExitSnap();
-                const saved_regs = self.gpa.dupe(RegSlot, self.reg_map[0..n_regs]) catch
-                    return; // OOM → fall through to the normal `.link` close below
+                // OOM propagates: `record` aborts the recording (`.alloc`).
+                // Returning quietly instead would skip recording this
+                // `for_prep` entirely while the recording stays active (codex
+                // Phase Q review) — no peel state exists yet to unwind.
+                const contract = try self.gpa.dupe(trace_code.EntryGuard, inner_guards);
+                errdefer self.gpa.free(contract);
+                const saved_regs = try self.gpa.dupe(RegSlot, self.reg_map[0..n_regs]);
+                errdefer self.gpa.free(saved_regs);
                 const rewind_ir = @as(u32, @intCast(self.instrs.items.len));
                 const rewind_es = @as(u32, @intCast(self.entry_slots.items.len));
                 const rinit0 = try self.refOf(a);
@@ -3838,7 +3892,7 @@ pub const RecordingSession = struct {
                 self.pending_link_close = .{
                     .inner_anchor_pc = inner_anchor,
                     .for_loop_pc = fl_pc,
-                    .contract = inner_guards,
+                    .contract = contract,
                     .phase = .await_initial_entry,
                     .ir_rewind_len = rewind_ir,
                     .entry_slots_rewind_len = rewind_es,
@@ -5322,7 +5376,7 @@ pub const RecordingSession = struct {
         if (kind == .upvalue) {
             if (self.context.upval_cell) |cell| {
                 const scalar = resolved.isInt() or resolved.isFloat() or resolved.isBool();
-                if (self.upvalue_cell_classes.contains(@intFromPtr(cell)) or
+                if (self.upvalue_cell_classes.contains(objIdentity(&cell.header)) or
                     (self.route_upvalue_reads and scalar and !cell.isOpen()))
                     return self.recUpvalLoad(dest, source, cell, resolved);
             }
@@ -5392,7 +5446,7 @@ pub const RecordingSession = struct {
         // instead of silently staling the read.
         if (kind == .upvalue) {
             if (self.context.upval_cell) |cell|
-                try self.snapshot_read_cells.put(self.gpa, @intFromPtr(cell), {});
+                try self.snapshot_read_cells.put(self.gpa, objIdentity(&cell.header), {});
         }
         // Pin a *function* callee's identity so a different proto — or a value that
         // is no longer a function — side-exits. A non-function heap invariant (e.g.
@@ -5537,7 +5591,7 @@ pub const RecordingSession = struct {
         // `recInputGet`'s depth-0 arm — the context cell is the CALLEE's here
         // (tier-0 executes the callee, so `st.closure` is its closure).
         if (self.context.upval_cell) |cell|
-            try self.snapshot_read_cells.put(self.gpa, @intFromPtr(cell), {});
+            try self.snapshot_read_cells.put(self.gpa, objIdentity(&cell.header), {});
 
         // Pin a function callee's identity, or an observed scalar's type (the
         // typed-SLOAD discipline — see recInputGet; pass-through reads feeding
@@ -5567,7 +5621,7 @@ pub const RecordingSession = struct {
     /// strings are VM-deduped, so two protos naming one global share it).
     pub fn recCalleeGlobal(self: *RecordingSession, dest: u16, key: Value, resolved: Value) !void {
         if (!key.isHeap() or key.heapType() != .string) return self.abort(.bad_type);
-        const dkey = @intFromPtr(key.asHeap());
+        const dkey = objIdentity(key.asHeap());
         if (self.callee_global_dedup.get(dkey)) |ref| {
             self.setReg(dest, ref);
             return;
@@ -5633,7 +5687,7 @@ pub const RecordingSession = struct {
     /// and an already-seen path appends nothing. Returns null after aborting
     /// (budget exhaustion, or the defensive same-path/different-cell case).
     fn ensureUpvalClass(self: *RecordingSession, cell: *function.Upvalue, path_slot: u16, source: u16) !?Ref {
-        const addr: u64 = @intFromPtr(cell);
+        const addr = objIdentity(&cell.header);
         const existing = self.upvalue_cell_classes.get(addr);
         const pkey = (@as(u64, path_slot) << 16) | source;
         if (self.upvalue_path_dedup.contains(pkey)) {
@@ -5749,7 +5803,7 @@ pub const RecordingSession = struct {
         const vval = regs.get(instr.a);
         if (!(vval.isInt() or vval.isFloat() or vval.isBool())) return self.abort(.bad_type);
         if (cell.isOpen()) return self.abort(.nyi_opcode);
-        if (self.snapshot_read_cells.contains(@intFromPtr(cell))) return self.abort(.upvalue_mutable);
+        if (self.snapshot_read_cells.contains(objIdentity(&cell.header))) return self.abort(.upvalue_mutable);
         const path_slot = self.upvalAccessPathSlot() orelse return self.abort(.cross_frame);
         var rval = try self.refOf(instr.a);
         if (vval.isBool()) {
@@ -6034,7 +6088,10 @@ pub const RecordingSession = struct {
     }
 
     pub fn deinit(self: *RecordingSession, gpa: std.mem.Allocator) void {
-        if (self.pending_link_close) |plc| gpa.free(plc.saved_reg_map);
+        if (self.pending_link_close) |plc| {
+            gpa.free(plc.saved_reg_map);
+            gpa.free(plc.contract);
+        }
         if (self.peel) |p| gpa.free(p.slots);
         self.pending_stores.deinit(gpa);
         self.input_seeds.deinit(gpa);
@@ -6086,8 +6143,7 @@ pub const RecordingSession = struct {
         self.link_kind = .inner_root;
         self.terminal_close = null;
         self.pending_link_provenance = null;
-        if (self.pending_link_close) |plc| self.gpa.free(plc.saved_reg_map);
-        self.pending_link_close = null;
+        self.clearPendingLinkClose();
         self.inline_depth = 0;
         if (self.peel) |p| gpa.free(p.slots);
         self.peel = null;

@@ -2303,11 +2303,11 @@ test "exec log captures a hot loop's iterations and its exit ramp" {
     var chunk = try runForExecLog(&vm, gpa, source, &sink, true);
     defer chunk.deinit();
 
-    // One cached trace → one exec log keyed by its cache index (0).
+    // One cached trace → one exec log keyed by its stable Trace.id.
     try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
     try testing.expectEqual(@as(usize, 1), vm.trace.exec_logs.items.len);
     const log = vm.trace.exec_logs.items[0];
-    try testing.expectEqual(@as(u32, 0), log.trace_id);
+    try testing.expectEqual(vm.trace.registry.cache.items[0].id, log.trace_id);
     try testing.expect(!log.entries_capped);
     try testing.expect(log.entries.items.len >= 1);
 
@@ -2334,6 +2334,57 @@ test "exec log captures a hot loop's iterations and its exit ramp" {
     try testing.expect(last.ref < vm.trace.registry.cache.items[0].code.instrs.len);
     try testing.expectEqual(execlog.ExitKind.guard, entry.exit_kind);
     try testing.expectEqual(@as(u32, last.ref), entry.exit_ref);
+}
+
+test "exec-log string values are owned bytes: a sweep of the strings leaves the log serializable (doc 61 §7.1 item 7)" {
+    // The traced loop loads a runtime-built heap string from a slot and guards
+    // it (`value` + `guard_pass` events carrying the string). The string then
+    // becomes garbage and a collection sweeps it — the trace pool no longer
+    // roots it, and neither may the log. The log must still encode and
+    // round-trip with the original bytes.
+    const gpa = testing.allocator;
+    const source =
+        \\local function f(s) local n = 0 for i = 1, 40 do n = n + #s end return n end
+        \\local t = 0
+        \\for k = 1, 3 do t = t + f(string.format("word-%d", k)) end
+        \\print(t)
+    ;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runForExecLog(&vm, gpa, source, &sink, true);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("720\n", sink.buffered());
+    try testing.expect(vm.trace.exec_logs.items.len >= 1);
+
+    // "word-1" was overwritten in its register by the later calls (the last
+    // one, "word-3", still sits in main's scanned window), so it is garbage.
+    vm.collect();
+    try testing.expect(vm.heap.internedLookup("word-1") == null); // really swept
+
+    const execlogser = @import("execlogser.zig");
+    const bytes = try execlogser.encodeFile(gpa, vm.trace.exec_logs.items);
+    defer gpa.free(bytes);
+    const back = try execlogser.decodeFile(gpa, bytes);
+    defer execlogser.freeLogs(gpa, back);
+
+    var strings: usize = 0;
+    var swept_seen = false;
+    for (back) |log| {
+        // Every surviving log joins to a live trace by id.
+        try testing.expect(vm.trace.traceById(log.trace_id) != null);
+        for (log.entries.items) |e| for (e.events) |ev| switch (ev.value) {
+            .string => |s| {
+                try testing.expect(std.mem.startsWith(u8, s, "word-"));
+                swept_seen = swept_seen or std.mem.eql(u8, s, "word-1");
+                strings += 1;
+            },
+            else => {},
+        };
+    }
+    try testing.expect(strings > 0);
+    try testing.expect(swept_seen); // the swept string's bytes survived in the log
 }
 
 test "exec-log detail cap truncates iterations but keeps the count and exit" {
@@ -6615,6 +6666,454 @@ test "pipeline (tnew OOM, doc 45 D5): a mid-execution heap OOM raises identicall
     try testing.expectEqual(@as(u64, 1), vm.trace.precise_errors);
 }
 
+/// Doc 45 D5 for the string helpers (doc 63 Prerequisite A): a precise trace
+/// whose allocating string helper (`tostr_*`, the snew class, `scap_str`)
+/// fails must surface the one-shot allocation failure exactly like tier-0 —
+/// through `.precise_error`, never by resuming tier-0 at the bytecode to
+/// retry the allocation (the retry succeeds under a one-shot failure, so the
+/// traced run would outlive tier-0). The `{}` in each loop makes the
+/// recording precise.
+const PreciseStrOom = struct {
+    const tostr_source: [:0]const u8 =
+        \\local n = 0
+        \\for i = 1, 400 do
+        \\  local t = {}
+        \\  local s = tostring(i)
+        \\  n = n + #s
+        \\end
+        \\print(n)
+    ;
+
+    /// One loop per helper; each iteration makes a string not seen before,
+    /// so the helper allocates (an intern hit would not). The library
+    /// functions are hoisted into locals: a `string.x` lookup in the body is
+    /// a `get_index`, which precise recording does not support. Likewise a
+    /// call nested as another call's last argument is a multret feed, so each
+    /// result gets its own local.
+    const Case = struct {
+        name: []const u8,
+        op: @import("trace_ir.zig").IrOp,
+        source: [:0]const u8,
+        /// The traced helper and tier-0's native make the same allocator
+        /// calls (the ONE shared core), so the K-th call is the same logical
+        /// allocation in both and the outcomes must match exactly. False when
+        /// tier-0 reaches the result by another allocation path.
+        same_schedule: bool,
+    };
+    const cases = [_]Case{
+        .{ .name = "tostr_num", .op = .tostr_num, .same_schedule = true, .source =
+        \\local tostr = tostring
+        \\local n = 0
+        \\for i = 1, 400 do
+        \\  local t = {}
+        \\  local s = tostr(i + 0.5)
+        \\  n = n + #s
+        \\end
+        \\print(n)
+        },
+        .{ .name = "ssub", .op = .ssub, .same_schedule = true, .source =
+        \\local sub = string.sub
+        \\local big = string.rep("AbCdEfGhIj", 50)
+        \\local n = 0
+        \\for i = 1, 400 do
+        \\  local t = {}
+        \\  local s = sub(big, 1, i)
+        \\  n = n + #s
+        \\end
+        \\print(n)
+        },
+        .{ .name = "srev", .op = .srev, .same_schedule = true, .source =
+        \\local sub, rev = string.sub, string.reverse
+        \\local big = string.rep("AbCdEfGhIj", 50)
+        \\local n = 0
+        \\for i = 1, 400 do
+        \\  local t = {}
+        \\  local p = sub(big, 1, i)
+        \\  local s = rev(p)
+        \\  n = n + #s
+        \\end
+        \\print(n)
+        },
+        .{ .name = "srep2", .op = .srep2, .same_schedule = true, .source =
+        \\local rep = string.rep
+        \\local n = 0
+        \\for i = 1, 400 do
+        \\  local t = {}
+        \\  local s = rep("ab", i)
+        \\  n = n + #s
+        \\end
+        \\print(n)
+        },
+        .{ .name = "supper", .op = .supper, .same_schedule = true, .source =
+        \\local sub, upper = string.sub, string.upper
+        \\local big = string.rep("AbCdEfGhIj", 50)
+        \\local n = 0
+        \\for i = 1, 400 do
+        \\  local t = {}
+        \\  local p = sub(big, 1, i)
+        \\  local s = upper(p)
+        \\  n = n + #s
+        \\end
+        \\print(n)
+        },
+        .{ .name = "slower", .op = .slower, .same_schedule = true, .source =
+        \\local sub, lower = string.sub, string.lower
+        \\local big = string.rep("AbCdEfGhIj", 50)
+        \\local n = 0
+        \\for i = 1, 400 do
+        \\  local t = {}
+        \\  local p = sub(big, 1, i)
+        \\  local s = lower(p)
+        \\  n = n + #s
+        \\end
+        \\print(n)
+        },
+        .{ .name = "schar1", .op = .schar1, .same_schedule = false, .source =
+        \\local char = string.char
+        \\local n = 0
+        \\for i = 1, 400 do
+        \\  local t = {}
+        \\  local s = char(0x4E00 + i)
+        \\  n = n + #s
+        \\end
+        \\print(n)
+        },
+        .{ .name = "scap_str", .op = .scap_str, .same_schedule = false, .source =
+        \\local sub, match = string.sub, string.match
+        \\local big = string.rep("AbCdEfGhIj", 50)
+        \\local n = 0
+        \\for i = 1, 400 do
+        \\  local t = {}
+        \\  local p = sub(big, 1, i)
+        \\  local s = match(p, "%a(%a*)")
+        \\  n = n + #s
+        \\end
+        \\print(n)
+        },
+    };
+
+    const FailNth = struct {
+        inner: std.mem.Allocator,
+        fail_at: usize,
+        count: usize = 0,
+        const VT = std.mem.Allocator.VTable{ .alloc = allocFn, .resize = resizeFn, .remap = remapFn, .free = freeFn };
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &VT };
+        }
+        fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            if (self.count == self.fail_at) return null;
+            return self.inner.vtable.alloc(self.inner.ptr, len, alignment, ret_addr);
+        }
+        fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.inner.vtable.resize(self.inner.ptr, memory, alignment, new_len, ret_addr);
+        }
+        fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.inner.vtable.remap(self.inner.ptr, memory, alignment, new_len, ret_addr);
+        }
+        fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.inner.vtable.free(self.inner.ptr, memory, alignment, ret_addr);
+        }
+    };
+
+    const Outcome = struct {
+        oom: bool,
+        /// The injected failure was reached (the run made ≥ `fail_at`
+        /// allocator calls). Nothing in the VM retries an allocation, so a
+        /// fired failure must end the run in OOM — in every tier.
+        fired: bool,
+        next_id: u32,
+        obj_count: usize,
+        parked_pc: usize,
+        /// The run raised at the call to the helper under test — the
+        /// source's last call before `print(n)` — not at the loop's
+        /// `new_table` or an earlier feeding call.
+        at_helper: bool,
+        precise_errors: u64,
+        native_entries: u64,
+        /// Some committed trace contains the op under test.
+        has_op: bool,
+    };
+
+    /// Pc of the call to the helper under test: every source ends with the
+    /// loop then `print(n)`, so it is the second-to-last `call`.
+    fn helperCallPc(code: []const @import("bytecode.zig").Instr) usize {
+        var last: ?usize = null;
+        var prev: ?usize = null;
+        for (code, 0..) |ins, pc| {
+            if (ins.op == .call) {
+                prev = last;
+                last = pc;
+            }
+        }
+        return prev.?;
+    }
+
+    const Tier = enum { tier0, tier1a, native };
+
+    fn run(gpa: std.mem.Allocator, source: [:0]const u8, op: @import("trace_ir.zig").IrOp, fail_at: usize, tier: Tier) !Outcome {
+        const parser = @import("parser.zig");
+        const diag = @import("diag.zig");
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        if (tier != .tier0) {
+            vm.trace.config.enabled = true;
+            vm.trace.config.execute = true;
+            vm.trace.config.optimize = false;
+            vm.trace.config.native_codegen = tier == .native;
+            vm.trace.config.hotloop = 4;
+        }
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        var failing = FailNth{ .inner = vm.heap.gpa, .fail_at = fail_at };
+        vm.heap.gpa = failing.allocator();
+        const res = vm.run(chunk.proto);
+        vm.heap.gpa = failing.inner;
+        const oom = if (res) |_| false else |e| blk: {
+            try testing.expectEqual(interp.Error.OutOfMemory, e);
+            break :blk true;
+        };
+        var has_op = false;
+        for (vm.trace.registry.cache.items) |t| {
+            for (t.code.instrs) |ins| {
+                if (ins.op == op) has_op = true;
+            }
+        }
+        return .{
+            .oom = oom,
+            .fired = failing.count >= fail_at,
+            .next_id = vm.heap.next_obj_id,
+            .obj_count = vm.heap.object_count,
+            .parked_pc = vm.frames[0].pc,
+            .at_helper = oom and vm.frames[0].pc == helperCallPc(chunk.proto.code),
+            .precise_errors = vm.trace.precise_errors,
+            .native_entries = vm.trace.native_entries,
+            .has_op = has_op,
+        };
+    }
+
+    /// Sweep the failure point across `window` consecutive mid-loop
+    /// allocations from `lo` (after the precise trace commits), so it lands on
+    /// both `tnew` and the string helper. A fired failure is never survived;
+    /// with a shared allocation schedule every point also matches tier-0.
+    /// Counts the runs raised through the precise_error consumer, and of
+    /// those the ones whose failure was the helper under test itself.
+    const Raised = struct { through_precise: usize = 0, at_helper: usize = 0 };
+
+    fn sweep(source: [:0]const u8, op: @import("trace_ir.zig").IrOp, tier: Tier, same_schedule: bool, lo: usize, window: usize) !Raised {
+        const gpa = testing.allocator;
+        var raised: Raised = .{};
+        for (lo..lo + window) |k| {
+            const truth = try run(gpa, source, op, k, .tier0);
+            const got = try run(gpa, source, op, k, tier);
+            try testing.expect(truth.fired and truth.oom);
+            try testing.expect(got.fired and got.oom);
+            try testing.expect(got.has_op);
+            if (same_schedule) {
+                try testing.expectEqual(truth.next_id, got.next_id);
+                try testing.expectEqual(truth.obj_count, got.obj_count);
+                try testing.expectEqual(truth.parked_pc, got.parked_pc);
+            }
+            raised.through_precise += got.precise_errors;
+            if (got.precise_errors != 0 and got.at_helper) raised.at_helper += 1;
+            if (tier == .native and @import("nativegen.zig").is_x64_linux)
+                try testing.expect(got.native_entries >= 1);
+        }
+        return raised;
+    }
+
+    fn checkTostr(tier: Tier) !void {
+        // Every allocation in this window is a `tnew` or a `tostr_int`
+        // intern, each raised through the precise_error consumer (never a
+        // tier-0 retry).
+        const raised = try sweep(tostr_source, .tostr_int, tier, true, 150, 20);
+        try testing.expectEqual(@as(usize, 20), raised.through_precise);
+        try testing.expect(raised.at_helper >= 1);
+    }
+
+    fn checkCase(c: Case, tier: Tier) !void {
+        const raised = try sweep(c.source, c.op, tier, c.same_schedule, 150, 40);
+        try testing.expect(raised.at_helper >= 1);
+    }
+
+    /// The native exit materializer flushes a helper's snapshot from the
+    /// allocator's register/spill homes, which `operandReads` cannot see: the
+    /// allocator must keep every captured ref live up to the helper, or the
+    /// flush reads a recycled register. Checks the allocator's own
+    /// `last_use` on each precise trace the source commits, and that the
+    /// helper is one finalize and native admission require a snapshot for.
+    /// Returns how many helper exits were checked.
+    fn checkSnapshotLiveness(source: [:0]const u8) !usize {
+        const gpa = testing.allocator;
+        const parser = @import("parser.zig");
+        const diag = @import("diag.zig");
+        const nativegen = @import("nativegen.zig");
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        vm.trace.config.enabled = true;
+        vm.trace.config.execute = true;
+        vm.trace.config.optimize = false;
+        vm.trace.config.native_codegen = true;
+        vm.trace.config.hotloop = 4;
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        var checked: usize = 0;
+        for (vm.trace.registry.cache.items) |tr| {
+            const t = &tr.code;
+            if (t.deopt_mode != .precise) continue;
+            const kinds = try gpa.alloc(nativegen.Kind, t.instrs.len);
+            defer gpa.free(kinds);
+            const slot_of = try gpa.alloc(i32, t.instrs.len);
+            defer gpa.free(slot_of);
+            try testing.expect(nativegen.proveKinds(gpa, t, kinds, slot_of));
+            var alloc = nativegen.analyze(gpa, t, kinds, slot_of) orelse return error.AnalyzeBailed;
+            defer alloc.deinit(gpa);
+            for (t.instrs, 0..) |ins, i| {
+                if (!@import("nativegen_emit.zig").isStrAllocOp(ins.op)) continue;
+                try testing.expect(trace_ir.requiresPreciseSnapshot(ins.op));
+                try testing.expect(ins.snap != 0);
+                const rec = t.snapshots[ins.snap - 1];
+                for (t.snapshot_slots[rec.slots_begin..][0..rec.slots_len]) |ss| {
+                    try testing.expect(alloc.last_use[ss.ref] >= i);
+                }
+                checked += 1;
+            }
+        }
+        return checked;
+    }
+
+    /// Runs every case and names each failing one, so a regression shows
+    /// its full extent rather than stopping at the first helper.
+    fn checkCases(tier: Tier) !void {
+        var failed = false;
+        for (cases) |c| {
+            checkCase(c, tier) catch |e| {
+                std.debug.print("string helper OOM case {s}: {s}\n", .{ c.name, @errorName(e) });
+                failed = true;
+            };
+        }
+        try testing.expect(!failed);
+    }
+};
+
+test "pipeline (string helper OOM, doc 45 D5): a precise trace's tostring allocation failure raises like tier-0, never retried (tier-1a)" {
+    try PreciseStrOom.checkTostr(.tier1a);
+}
+
+test "pipeline (string helper OOM native, doc 45 D5): a precise trace's tostring allocation failure raises like tier-0, never retried (native)" {
+    try PreciseStrOom.checkTostr(.native);
+}
+
+test "pipeline (string helper OOM, doc 45 D5): every allocating snew/scap helper's failure in a precise trace raises, never retried (tier-1a)" {
+    try PreciseStrOom.checkCases(.tier1a);
+}
+
+test "pipeline (string helper OOM native, doc 45 D5): every allocating snew/scap helper's failure in a precise trace raises, never retried (native)" {
+    try PreciseStrOom.checkCases(.native);
+}
+
+test "nativegen (precise string helper exits, doc 45 D6): the allocator keeps every snapshot-captured ref live up to the helper" {
+    if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    try testing.expect(try PreciseStrOom.checkSnapshotLiveness(PreciseStrOom.tostr_source) >= 1);
+    for (PreciseStrOom.cases) |c| {
+        const checked = PreciseStrOom.checkSnapshotLiveness(c.source) catch |e| {
+            std.debug.print("string helper liveness case {s}: {s}\n", .{ c.name, @errorName(e) });
+            return e;
+        };
+        try testing.expect(checked >= 1);
+    }
+}
+
+test "pipeline (string helper decline, doc 45 D5): an out-of-range string.char in a precise trace resumes tier-0, which raises the catchable located error" {
+    // The decline arm of the `StrResult` protocol: `schar1` fails on a
+    // codepoint past 0x10FFFF WITHOUT an OOM, so the precise exit must be
+    // `.precise_resume` — tier-0 re-executes the call and raises `bad
+    // argument`, which pcall catches. Treating the decline as an OOM would
+    // raise an uncatchable OOM instead. The codepoint crosses the range at
+    // i = 256 with no branch in the body, so the failing op is `schar1`
+    // itself, not a guard before it.
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local char = string.char
+        \\local function f()
+        \\  local n = 0
+        \\  for i = 1, 400 do
+        \\    local t = {}
+        \\    local s = char(0x10FF00 + i)
+        \\    n = n + #s
+        \\  end
+        \\  return n
+        \\end
+        \\print(pcall(f))
+    ;
+    var t0_buf: [256]u8 = undefined;
+    var t0_len: usize = 0;
+    for ([_]PreciseStrOom.Tier{ .tier0, .tier1a, .native }) |tier| {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        if (tier != .tier0) {
+            vm.trace.config.enabled = true;
+            vm.trace.config.execute = true;
+            vm.trace.config.optimize = false;
+            vm.trace.config.native_codegen = tier == .native;
+            vm.trace.config.hotloop = 4;
+        }
+        var buf: [256]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        const out = sink.buffered();
+        if (tier == .tier0) {
+            try testing.expect(std.mem.startsWith(u8, out, "false\t"));
+            try testing.expect(std.mem.indexOf(u8, out, "bad argument") != null);
+            @memcpy(t0_buf[0..out.len], out);
+            t0_len = out.len;
+            continue;
+        }
+        try testing.expectEqualStrings(t0_buf[0..t0_len], out);
+        var has_schar1 = false;
+        for (vm.trace.registry.cache.items) |t| {
+            for (t.code.instrs) |ins| {
+                if (ins.op == .schar1) has_schar1 = true;
+            }
+        }
+        try testing.expect(has_schar1);
+        try testing.expectEqual(@as(u64, 0), vm.trace.precise_errors);
+        if (tier == .native and @import("nativegen.zig").is_x64_linux)
+            try testing.expect(vm.trace.native_entries >= 1);
+    }
+}
+
 test "executor (tnew mixed body, doc 45 D3): an immediate store rides a precise construction trace and neither effect repeats across a mid-loop resume" {
     const gpa = testing.allocator;
     const parser = @import("parser.zig");
@@ -6712,9 +7211,7 @@ test "recorder (precise deopt, doc 45 D8 interim): an exec-log session never pro
     // The increment-2 constructing loop: under an exec-log session the
     // `needs_precise` cancel must fall through to an ORDINARY strike — no
     // memo, no precise retry, no precise commit — because the wire format
-    // cannot carry a precise trace until the D8 bump, and filtering one out
-    // of `encodeFile` would desynchronize `TraceExecLog.trace_id` (a cache
-    // index) for every later trace.
+    // cannot carry a precise trace until the D8 bump.
     var chunk = try runForTrace(&vm, gpa,
         \\local s = 0
         \\for i = 1, 400 do
@@ -6731,10 +7228,7 @@ test "recorder (precise deopt, doc 45 D8 interim): an exec-log session never pro
         try testing.expect(ct.code.deopt_mode != .precise);
     }
     // The whole cache serializes (would hard-error on any precise trace).
-    const codes = try gpa.alloc(*const trace.TraceCode, vm.trace.registry.cache.items.len);
-    defer gpa.free(codes);
-    for (vm.trace.registry.cache.items, codes) |record, *code| code.* = &record.code;
-    const bytes = try traceser.encodeFile(gpa, codes);
+    const bytes = try vm.trace.encodeTraceFile(gpa);
     gpa.free(bytes);
 }
 

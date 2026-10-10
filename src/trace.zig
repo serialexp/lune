@@ -67,6 +67,7 @@ const trace_chain_mod = @import("trace_chain.zig");
 const trace_recorder_mod = @import("trace_recorder.zig");
 const trace_code = @import("trace_code.zig");
 const trace_record = @import("trace_record.zig");
+const traceser = @import("traceser.zig");
 const exit_attach = @import("trace_exit_attach.zig");
 pub const trace_entry_registry = @import("trace_entry_registry.zig");
 
@@ -1642,8 +1643,9 @@ pub const TraceState = struct {
     /// it bit-for-bit against `Vm.fastBlockReference()`.
     fast_block: u16 = 0,
     /// Per-trace execution logs for the visualizer (`execlog.zig`), populated only
-    /// when `config.record_exec_log`. Keyed by `trace_id` (cache index). Empty and
-    /// untouched on the normal JIT path.
+    /// when `config.record_exec_log`. Keyed by the stable `Trace.id` (doc 61 §7.1
+    /// item 7; never the cache index, which retirement compacts); a retired
+    /// trace's log is dropped with it. Empty and untouched on the normal JIT path.
     exec_logs: std.ArrayListUnmanaged(execlog.TraceExecLog) = .empty,
     /// The recorder driving `exec_logs`, lazily created on first use so the off path
     /// allocates nothing. Reused (per-entry scratch retained) across every entry.
@@ -1652,6 +1654,13 @@ pub const TraceState = struct {
     /// (the `--dump-aborts` CLI flag). Deduped by `(anchor, reason, op)`; see
     /// `AbortRecord` and `logAbort`. Empty and untouched on the normal path.
     abort_log: std.ArrayListUnmanaged(AbortRecord) = .empty,
+    /// Doc 61 §7.1: traces retired through `removeTraces`, and the number of
+    /// non-empty batches (each pays exactly one graph rebuild). Structural
+    /// counts for tests; never steer anything.
+    retired_traces: u64 = 0,
+    retire_batches: u64 = 0,
+    /// Full `rebuildRegions` runs (commit, retirement, deferred request).
+    region_rebuilds: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator) TraceState {
         return .{ .gpa = gpa, .registry = @import("trace_registry.zig").TraceRegistry.init(gpa) };
@@ -2287,7 +2296,7 @@ pub const TraceState = struct {
     }
 
     /// The `ExecLogRecorder` re-targeted at the execution log for `trace_id` (the
-    /// trace's cache index), creating the recorder (lazily) and the per-trace log on
+    /// trace's stable `Trace.id`), creating the recorder (lazily) and the per-trace log on
     /// first use. Returns null on OOM (the caller then runs the uninstrumented
     /// `execute`). Only called when `config.record_exec_log`.
     pub fn execRecorderFor(self: *TraceState, trace_id: u32) ?*execlog.ExecLogRecorder {
@@ -2317,18 +2326,17 @@ pub const TraceState = struct {
     pub fn findTrace(self: *const TraceState, proto: *const Proto, pc: u32) ?*Trace {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
-        for (self.registry.cache.items) |t| {
+        var it = self.registry.tracesAt(.{ .proto = proto, .pc = pc });
+        while (it.next()) |t| {
             // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
             // selection. Suppression deadlocks: a skipped trace can never be
             // entered, so the counter can never reset. The refusal is already
             // free (no anchor penalty), so the cost of a futile prologue
             // attempt is one native call + ledger row per dispatch — bounded
             // by the caller's own iteration count, not by the counter.
-            if (t.code.anchor.proto == proto and t.code.anchor.pc == pc) {
-                if (best == null or t.hit_count > best_hits) {
-                    best = t;
-                    best_hits = t.hit_count;
-                }
+            if (best == null or t.hit_count > best_hits) {
+                best = t;
+                best_hits = t.hit_count;
             }
         }
         return best;
@@ -2357,14 +2365,14 @@ pub const TraceState = struct {
     pub fn findLoopTrace(self: *const TraceState, proto: *const Proto, pc: u32) ?*Trace {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
-        for (self.registry.cache.items) |t| {
+        var it = self.registry.tracesAt(.{ .proto = proto, .pc = pc });
+        while (it.next()) |t| {
             // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
             // selection. Suppression deadlocks: a skipped trace can never be
             // entered, so the counter can never reset. The refusal is already
             // free (no anchor penalty), so the cost of a futile prologue
             // attempt is one native call + ledger row per dispatch — bounded
             // by the caller's own iteration count, not by the counter.
-            if (t.code.anchor.proto != proto or t.code.anchor.pc != pc) continue;
             if (t.code.instrs.len == 0 or t.code.instrs[t.code.instrs.len - 1].op != .loop) continue;
             if (best == null or t.hit_count > best_hits) {
                 best = t;
@@ -2383,14 +2391,14 @@ pub const TraceState = struct {
     pub fn findLinkTrace(self: *const TraceState, proto: *const Proto, pc: u32) ?*Trace {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
-        for (self.registry.cache.items) |t| {
+        var it = self.registry.tracesAt(.{ .proto = proto, .pc = pc });
+        while (it.next()) |t| {
             // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
             // selection. Suppression deadlocks: a skipped trace can never be
             // entered, so the counter can never reset. The refusal is already
             // free (no anchor penalty), so the cost of a futile prologue
             // attempt is one native call + ledger row per dispatch — bounded
             // by the caller's own iteration count, not by the counter.
-            if (t.code.anchor.proto != proto or t.code.anchor.pc != pc) continue;
             if (t.code.instrs.len == 0 or t.code.instrs[t.code.instrs.len - 1].op != .link) continue;
             // Doc 45 D6 (P2): no links INTO a precise page. Structurally
             // unreachable — the recorder refuses link closes on precise
@@ -2429,14 +2437,14 @@ pub const TraceState = struct {
         // `max_traces_per_anchor` by 2× — unreachable today, bounded anyway).
         var buf: [8]*Trace = undefined;
         var n: usize = 0;
-        for (self.registry.cache.items) |t| {
+        var it = self.registry.tracesAt(.{ .proto = proto, .pc = post_pc });
+        while (it.next()) |t| {
             // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
             // selection. Suppression deadlocks: a skipped trace can never be
             // entered, so the counter can never reset. The refusal is already
             // free (no anchor penalty), so the cost of a futile prologue
             // attempt is one native call + ledger row per dispatch — bounded
             // by the caller's own iteration count, not by the counter.
-            if (t.code.anchor.proto != proto or t.code.anchor.pc != post_pc) continue;
             if (t.code.instrs.len == 0 or t.code.instrs[t.code.instrs.len - 1].op != .link) continue;
             // Doc 45 D6 (P2): no links INTO a precise page (see findLinkTrace).
             if (t.code.deopt_mode == .precise) continue;
@@ -2495,21 +2503,20 @@ pub const TraceState = struct {
     pub fn nextTraceExcluding(self: *const TraceState, proto: *const Proto, pc: u32, visited: []const *Trace) ?*Trace {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
-        outer: for (self.registry.cache.items) |t| {
+        var it = self.registry.tracesAt(.{ .proto = proto, .pc = pc });
+        outer: while (it.next()) |t| {
             // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
             // selection. Suppression deadlocks: a skipped trace can never be
             // entered, so the counter can never reset. The refusal is already
             // free (no anchor penalty), so the cost of a futile prologue
             // attempt is one native call + ledger row per dispatch — bounded
             // by the caller's own iteration count, not by the counter.
-            if (t.code.anchor.proto != proto or t.code.anchor.pc != pc) continue;
             for (visited) |v| {
                 if (v == t) continue :outer;
             }
             // Ties go to the lowest id, like `resolveLoopDoneCont` (doc 56
             // §4.8.3 review 5), so a chain's first candidate at a pc is the
-            // canonical pick there. Cache order equals id order until a
-            // retire's `swapRemove`, which is the only case this changes.
+            // canonical pick there whatever the cache order.
             if (best == null or t.hit_count > best_hits or (t.hit_count == best_hits and t.id < best.?.id)) {
                 best = t;
                 best_hits = t.hit_count;
@@ -2523,20 +2530,6 @@ pub const TraceState = struct {
         return self.findTrace(anchor.proto, anchor.pc) != null;
     }
 
-    /// The cache index (`trace_id`) of a cached trace, or null if not present. This
-    /// id is the exec-log key and the viz's trace-selection key. Linear scan (the
-    /// cache is small; only the instrumented path calls this).
-    pub fn traceIndex(self: *const TraceState, t: *const Trace) ?u32 {
-        for (self.registry.cache.items, 0..) |c, i| {
-            if (c == t) return @intCast(i);
-        }
-        return null;
-    }
-
-    /// Resolve a stable `Trace.id` (P-B, doc 17 — baked into native exit code as
-    /// `final_trace_id`) to its live `*Trace`, or null if no cached trace carries it
-    /// (the trace retired, or the id is the `NO_TRACE_ID` sentinel). Linear scan,
-    /// mirroring `traceIndex`; ids are unique, so at most one match.
     /// Bump a memo-invalidation generation, skipping the reserved 0 ("never
     /// computed") on u32 wrap — otherwise, ~2^32 mutations in, a freshly
     /// initialized memo (gen 0) would be trusted without ever computing (codex
@@ -2548,8 +2541,23 @@ pub const TraceState = struct {
         if (gen.* == 0) gen.* = 1;
     }
 
+    /// Resolve a stable `Trace.id` (P-B, doc 17 — baked into native exit code as
+    /// `final_trace_id`; the exec-log key) to its live `*Trace`, or null if no
+    /// cached trace carries it (the trace retired, or the id is the
+    /// `NO_TRACE_ID` sentinel).
     pub fn traceById(self: *const TraceState, id: u32) ?*Trace {
         return self.registry.traceById(id);
+    }
+
+    /// Serialize the trace cache (cache order) to a versioned trace file, each
+    /// trace paired with its stable id (wire v5). Owned by `gpa`. The
+    /// serializer sees only `{id, code}` — never the lifecycle record.
+    pub fn encodeTraceFile(self: *const TraceState, gpa: std.mem.Allocator) ![]u8 {
+        const cache = self.registry.cache.items;
+        const wire = try gpa.alloc(traceser.WireTrace, cache.len);
+        defer gpa.free(wire);
+        for (cache, wire) |t, *w| w.* = .{ .id = t.id, .code = &t.code };
+        return traceser.encodeFile(gpa, wire);
     }
 
     /// A frame of the executor value scratch: where `valuesRelease` must rewind
@@ -2864,7 +2872,6 @@ pub const TraceState = struct {
     pub const isSourceBranchGuardExit = trace_link_mod.isSourceBranchGuardExit;
     pub const hasArmedSourceBranchLinkAt = trace_link_mod.hasArmedSourceBranchLinkAt;
     pub const countTracesAt = trace_link_mod.countTracesAt;
-    pub const anchorPopulation = trace_link_mod.anchorPopulation;
     pub const hasInnerRootAt = trace_link_mod.hasInnerRootAt;
     pub const SuccAnchor = trace_link_mod.SuccAnchor;
     pub const resolveSuccessorAnchor = trace_link_mod.resolveSuccessorAnchor;
@@ -2990,6 +2997,7 @@ pub const TraceState = struct {
     pub const disarmLinkAt = trace_link_mod.disarmLinkAt;
     pub const disarmStaleRegionBridgeLinks = trace_link_mod.disarmStaleRegionBridgeLinks;
     pub const removeTrace = trace_link_mod.removeTrace;
+    pub const removeTraces = trace_link_mod.removeTraces;
     pub const codeFor = trace_link_mod.codeFor;
     pub const ensureImage = trace_link_mod.ensureImage;
     pub const patchedEntryOp = trace_link_mod.patchedEntryOp;
@@ -3711,6 +3719,15 @@ pub const TraceState = struct {
         self.consumeRecordingAbort();
         self.assertTraceBitsInSync();
     }
+    /// Kill the in-flight recording with `RecordingSession.cancel` semantics:
+    /// no peel rewind into a `.link` close (doc 61 §7.1 item 2). Otherwise the
+    /// same bookkeeping as `abort`.
+    pub fn cancelRecording(self: *TraceState, reason: AbortReason) void {
+        self.rec.cancel(reason);
+        self.syncRecordingBit();
+        self.consumeRecordingAbort();
+        self.assertTraceBitsInSync();
+    }
     fn consumeRecordingAbort(self: *TraceState) void {
         const notice = self.rec.takeAbortNotice() orelse return;
         const reason = notice.reason;
@@ -3939,12 +3956,11 @@ pub const TraceState = struct {
         self.dbg("ordinary-probe cleared: anchor pc={d}", .{anchor.pc});
     }
 
-    /// Does the anchor already hold a non-precise (ordinary) trace? Same scan
-    /// as `countTracesAt`, filtered on deopt mode.
+    /// Does the anchor already hold a non-precise (ordinary) trace?
     fn hasOrdinaryTraceAt(self: *const TraceState, anchor: AnchorKey) bool {
-        for (self.registry.cache.items) |t| {
-            if (t.code.anchor.proto == anchor.proto and t.code.anchor.pc == anchor.pc and
-                t.code.deopt_mode != .precise) return true;
+        var it = self.registry.tracesAt(anchor);
+        while (it.next()) |t| {
+            if (t.code.deopt_mode != .precise) return true;
         }
         return false;
     }

@@ -39,6 +39,8 @@ export interface ConstRow {
 }
 
 export interface TraceView {
+  /** Stable `Trace.id` (wire v5) — the key exec logs join on; not a cache position. */
+  id: number;
   anchorProtoId: number;
   anchorPc: number;
   /** Non-zero when the trace starts with a type-stabilizing peeled iteration. */
@@ -127,6 +129,7 @@ export function traceToView(t: TraceOutput): TraceView {
   const consts: ConstRow[] = t.consts.map((c, i) => constToRow(i, c.body));
 
   return {
+    id: t.id,
     anchorProtoId: t.anchor_proto_id,
     anchorPc: t.anchor_pc,
     peeled: t.peeled,

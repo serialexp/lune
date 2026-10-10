@@ -30,17 +30,33 @@ pub const TraceRecord = struct {
 /// dropped): `child` was recorded off one of `parent`'s exits at the same anchor.
 pub const SiblingLink = struct { parent_id: u32, child_id: u32 };
 
+/// The build's read-only input. Build it with `init`, which indexes it so
+/// both lookups are O(1); the indices live in the caller's scratch allocator.
 pub const View = struct {
     traces: []const TraceRecord,
     /// Doc 55 §2: closes `arrival_entry_regions` over same-anchor sibling groups.
     sibling_links: []const SiblingLink = &.{},
+    /// Trace id → index into `traces` (the first record carrying the id).
+    by_id: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// Anchors where some record has `inner_root`.
+    inner_roots: std.AutoHashMapUnmanaged(AnchorKey, void) = .empty,
+
+    pub fn init(scratch: std.mem.Allocator, traces: []const TraceRecord, sibling_links: []const SiblingLink) !View {
+        var v: View = .{ .traces = traces, .sibling_links = sibling_links };
+        try v.by_id.ensureTotalCapacity(scratch, @intCast(traces.len));
+        for (traces, 0..) |t, i| {
+            const gop = v.by_id.getOrPutAssumeCapacity(t.id);
+            if (!gop.found_existing) gop.value_ptr.* = @intCast(i);
+            if (t.inner_root) try v.inner_roots.put(scratch, t.code.anchor, {});
+        }
+        return v;
+    }
     pub fn traceById(self: View, id: u32) ?TraceRecord {
-        for (self.traces) |t| if (t.id == id) return t;
-        return null;
+        const i = self.by_id.get(id) orelse return null;
+        return self.traces[i];
     }
     pub fn hasInnerRootAt(self: View, proto: *const Proto, pc: u32) bool {
-        for (self.traces) |t| if (t.inner_root and t.code.anchor.proto == proto and t.code.anchor.pc == pc) return true;
-        return false;
+        return self.inner_roots.contains(.{ .proto = proto, .pc = pc });
     }
 };
 pub const Previous = struct {
@@ -56,19 +72,17 @@ pub fn buildEdges(gpa: std.mem.Allocator, view: View) !EdgeMap {
     for (view.traces) |t| upper = std.math.add(usize, upper, t.code.exit_prov.len) catch return error.OutOfMemory;
     if (upper > 1 << 30) return error.OutOfMemory;
     try out.ensureTotalCapacity(gpa, @intCast(upper));
-    for (view.traces) |t| for (t.code.exit_prov) |e| {
-        for (t.exits) |fact| {
-            if (fact.index != e.index) continue;
-            const succ = fact.successor orelse break;
-            out.putAssumeCapacity(.{ .trace_id = t.id, .exit_instr = e.index }, .{
-                .anchor_proto_id = t.code.anchor.proto.id,
-                .anchor_pc = t.code.anchor.pc,
-                .exit = e.prov,
-                .succ_anchor_proto_id = succ.proto_id,
-                .succ_anchor_pc = succ.pc,
-            });
-            break;
-        }
+    // `exits[i]` is the fact for `exit_prov[i]` (the view is built that way).
+    for (view.traces) |t| for (t.code.exit_prov, t.exits) |e, fact| {
+        std.debug.assert(fact.index == e.index);
+        const succ = fact.successor orelse continue;
+        out.putAssumeCapacity(.{ .trace_id = t.id, .exit_instr = e.index }, .{
+            .anchor_proto_id = t.code.anchor.proto.id,
+            .anchor_pc = t.code.anchor.pc,
+            .exit = e.prov,
+            .succ_anchor_proto_id = succ.proto_id,
+            .succ_anchor_pc = succ.pc,
+        });
     };
     return out;
 }

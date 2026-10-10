@@ -29,6 +29,7 @@
 
 const std = @import("std");
 const value = @import("value.zig");
+const string = @import("string.zig");
 const Value = value.Value;
 
 /// The kind of an `ExecEvent`. A guard *failure* is folded into `exit` (a failing
@@ -59,13 +60,56 @@ pub const ExitKind = enum(u8) {
     clean = 2,
 };
 
+/// A recorded event value, detached from the VM heap (doc 61 §7.1 item 7). Trace
+/// pools are not GC roots, so a string the log merely *referenced* could be swept
+/// while the log still describes it; the log therefore copies string bytes at log
+/// time and owns them. `string` is owned by whoever owns the enclosing `ExecEvent`
+/// (the recorder's scratch, then the completed `TraceEntry`).
+pub const LogValue = union(enum) {
+    nil,
+    boolean: bool,
+    int: i64,
+    float: f64,
+    string: []u8,
+
+    /// Detach `v` from the heap: scalars copy, a heap string dupes its bytes.
+    /// Returns null for a value the log cannot represent (a non-string heap object
+    /// or a grid row handle — intermediate IR artifacts the viz doesn't need) and
+    /// for a failed byte copy; either way the caller drops the event.
+    pub fn of(gpa: std.mem.Allocator, v: Value) ?LogValue {
+        return switch (v.tag) {
+            .nil => .nil,
+            .boolean => .{ .boolean = v.asBool() },
+            .int => .{ .int = v.asInt() },
+            .float => .{ .float = v.asFloat() },
+            .heap_ref => if (v.heapType() == .string)
+                .{ .string = gpa.dupe(u8, string.String.fromHeader(v.asHeap()).bytes()) catch return null }
+            else
+                null,
+            .row_view => null,
+        };
+    }
+
+    pub fn deinit(self: LogValue, gpa: std.mem.Allocator) void {
+        switch (self) {
+            .string => |s| gpa.free(s),
+            else => {},
+        }
+    }
+};
+
 /// One recorded execution event (in-memory; serialized to `schema.ExecEvent`, its
-/// `value` mapped to an `EffectResult`).
+/// `value` mapped to an `EffectResult`). Owns `value`'s string bytes.
 pub const ExecEvent = struct {
     kind: ExecEventKind,
     ref: u32 = 0,
-    value: Value = Value.nil(),
+    value: LogValue = .nil,
 };
+
+/// Free the events' owned string bytes (not the slice itself).
+pub fn freeEventValues(gpa: std.mem.Allocator, events: []const ExecEvent) void {
+    for (events) |ev| ev.value.deinit(gpa);
+}
 
 /// One trace entry = one `irinterp.execute` call: the iterations it spun and the
 /// exit ramp that ended it. `events` is owned (freed by `TraceExecLog.deinit`).
@@ -82,8 +126,9 @@ pub const TraceEntry = struct {
     events: []ExecEvent = &.{},
 };
 
-/// All recorded entries for one cached trace, keyed by `trace_id` (the trace's index
-/// in `TraceState.registry.cache`, which is also the viz's selection key).
+/// All recorded entries for one cached trace, keyed by `trace_id` — the trace's
+/// stable `Trace.id`, which the trace wire file also carries so the viz joins logs
+/// to trace records by id (doc 61 §7.1 item 7; cache positions reshuffle on retire).
 pub const TraceExecLog = struct {
     trace_id: u32,
     /// `max_entries` was reached; further entries for this trace were not recorded.
@@ -91,7 +136,10 @@ pub const TraceExecLog = struct {
     entries: std.ArrayListUnmanaged(TraceEntry) = .empty,
 
     pub fn deinit(self: *TraceExecLog, gpa: std.mem.Allocator) void {
-        for (self.entries.items) |*e| gpa.free(e.events);
+        for (self.entries.items) |*e| {
+            freeEventValues(gpa, e.events);
+            gpa.free(e.events);
+        }
         self.entries.deinit(gpa);
     }
 };
@@ -127,7 +175,23 @@ pub const ExecLogRecorder = struct {
     }
 
     pub fn deinit(self: *ExecLogRecorder) void {
+        freeEventValues(self.gpa, self.scratch.items);
         self.scratch.deinit(self.gpa);
+    }
+
+    /// Drop the scratch events, freeing their owned bytes (an abandoned entry —
+    /// one whose log was unpublished mid-entry, or whose finalize failed).
+    fn discardScratch(self: *ExecLogRecorder) void {
+        freeEventValues(self.gpa, self.scratch.items);
+        self.scratch.clearRetainingCapacity();
+    }
+
+    /// Append one event whose value is detached from the heap. A value the log
+    /// cannot represent, a failed byte copy, or a failed append drops the event
+    /// without leaking (doc 61 §7.1 item 7).
+    fn push(self: *ExecLogRecorder, kind: ExecEventKind, ref: usize, v: Value) void {
+        const lv = LogValue.of(self.gpa, v) orelse return;
+        self.scratch.append(self.gpa, .{ .kind = kind, .ref = @intCast(ref), .value = lv }) catch lv.deinit(self.gpa);
     }
 
     /// Point the recorder at `log` for the next entry.
@@ -149,26 +213,24 @@ pub const ExecLogRecorder = struct {
         self.detail_done = false;
         self.exit_ref = 0;
         self.exit_kind = .clean;
-        self.scratch.clearRetainingCapacity();
+        self.discardScratch();
     }
 
     /// Record a non-guard instruction's result. Inert past the detail cap.
-    /// Non-string heap values (tables, closures, …) are silently dropped: the
-    /// wire encoder (`effectser.toEffectResult`) can only represent scalars and
-    /// strings, so recording a heap ref would poison the entire log at
-    /// serialization time. The viz doesn't need intermediate pointers anyway.
+    /// Non-string heap values (tables, closures, …) and row handles are silently
+    /// dropped (`LogValue.of`): the log can only represent scalars and strings,
+    /// and the viz doesn't need intermediate pointers anyway. String bytes are
+    /// copied — the log never borrows heap memory.
     pub fn value(self: *ExecLogRecorder, ref: usize, v: Value) void {
         if (!self.active or self.detail_done) return;
-        if (isUnencodable(v)) return;
-        self.scratch.append(self.gpa, .{ .kind = .value, .ref = @intCast(ref), .value = v }) catch {};
+        self.push(.value, ref, v);
     }
 
     /// Record a surviving guard (its checked operand). Inert past the detail cap.
-    /// Non-string heap operands are dropped (same reasoning as `value`).
+    /// Unrepresentable operands are dropped (same reasoning as `value`).
     pub fn guardPass(self: *ExecLogRecorder, ref: usize, operand: Value) void {
         if (!self.active or self.detail_done) return;
-        if (isUnencodable(operand)) return;
-        self.scratch.append(self.gpa, .{ .kind = .guard_pass, .ref = @intCast(ref), .value = operand }) catch {};
+        self.push(.guard_pass, ref, operand);
     }
 
     /// Record a loop close (one iteration committed). Counts toward the detail cap;
@@ -182,32 +244,36 @@ pub const ExecLogRecorder = struct {
     }
 
     /// Record the terminal side-exit. Always appended (even past the detail cap), so
-    /// the exit ramp is never lost. Non-string heap operands are replaced with nil
-    /// (the exit event itself must survive — only the unserializable operand is lost).
+    /// the exit ramp is never lost. Unrepresentable operands are replaced with nil
+    /// (the exit event itself must survive — only the unserializable operand is
+    /// lost); only an allocation failure (byte copy or append) drops it, and the
+    /// entry's `exit_ref`/`exit_kind` still record the ramp.
     pub fn exit(self: *ExecLogRecorder, ref: usize, kind: ExitKind, operand: Value) void {
         if (!self.active) return;
         self.exit_ref = @intCast(ref);
         self.exit_kind = kind;
-        const safe = if (isUnencodable(operand)) Value.nil() else operand;
-        self.scratch.append(self.gpa, .{ .kind = .exit, .ref = @intCast(ref), .value = safe }) catch {};
+        const safe = if (isUnrepresentable(operand)) Value.nil() else operand;
+        self.push(.exit, ref, safe);
     }
 
-    /// A non-string heap value cannot survive `effectser.toEffectResult` (the wire
-    /// encoder for exec-log values). Tables, closures, and other non-string heap
-    /// objects are intermediate IR artifacts (container refs, function guards) that
-    /// the viz doesn't need — filter them here so individual call sites don't have to.
-    fn isUnencodable(v: Value) bool {
-        return v.tag == .heap_ref and v.heapType() != .string;
+    fn isUnrepresentable(v: Value) bool {
+        return switch (v.tag) {
+            .heap_ref => v.heapType() != .string,
+            .row_view => true,
+            else => false,
+        };
     }
 
     /// Finalize the entry with the executor's `completed` yield, copying the scratch
-    /// events into an owned slice appended to the log. A no-op if the entry was not
-    /// recorded (entry cap) or there is no target log.
+    /// events into an owned slice appended to the log. The events' string bytes
+    /// transfer to the log on success; if the entry was not recorded (entry cap),
+    /// the target log is gone (its trace retired mid-entry), or finalizing fails,
+    /// the scratch bytes are freed instead.
     pub fn end(self: *ExecLogRecorder, completed: usize) void {
         if (!self.active) return;
         self.active = false;
-        const log = self.log orelse return;
-        const events = self.gpa.dupe(ExecEvent, self.scratch.items) catch return;
+        const log = self.log orelse return self.discardScratch();
+        const events = self.gpa.dupe(ExecEvent, self.scratch.items) catch return self.discardScratch();
         log.entries.append(self.gpa, .{
             .iterations = @intCast(completed),
             .exit_ref = self.exit_ref,
@@ -216,7 +282,10 @@ pub const ExecLogRecorder = struct {
             .events = events,
         }) catch {
             self.gpa.free(events);
+            return self.discardScratch();
         };
+        // Ownership moved into `events`; forget the scratch copies.
+        self.scratch.clearRetainingCapacity();
     }
 };
 
@@ -277,11 +346,11 @@ test "recorder drops non-string heap values from value/guardPass and nil-substit
 
     try testing.expectEqual(ExecEventKind.value, events[0].kind);
     try testing.expectEqual(@as(u32, 0), events[0].ref);
-    try testing.expect(events[0].value.isInt());
+    try testing.expectEqual(LogValue{ .int = 42 }, events[0].value);
 
     try testing.expectEqual(ExecEventKind.guard_pass, events[1].kind);
     try testing.expectEqual(@as(u32, 2), events[1].ref);
-    try testing.expect(events[1].value.isFloat());
+    try testing.expectEqual(LogValue{ .float = 3.14 }, events[1].value);
 
     try testing.expectEqual(ExecEventKind.commit, events[2].kind);
 
@@ -289,5 +358,93 @@ test "recorder drops non-string heap values from value/guardPass and nil-substit
     try testing.expectEqual(@as(u32, 4), events[3].ref);
     // Heap operand replaced with nil — the exit event survives but the
     // unserializable operand doesn't.
-    try testing.expect(events[3].value.isNil());
+    try testing.expectEqual(LogValue.nil, events[3].value);
+}
+
+test "recorded string values own their bytes and outlive the heap string (doc 61 §7.1 item 7)" {
+    const gpa = testing.allocator;
+
+    var log = TraceExecLog{ .trace_id = 3 };
+    defer log.deinit(gpa);
+    var rec = ExecLogRecorder.init(gpa, 100, 100);
+    defer rec.deinit();
+    rec.retarget(&log);
+
+    {
+        // The heap — and with it the interned strings — dies before the log is read:
+        // the shape of a sweep freeing a string a (non-rooting) trace still names.
+        var heap = gc.Heap.init(gpa);
+        defer heap.deinit();
+        const s = try heap.internValue("hello");
+        const g = try heap.internValue("guard");
+        const x = try heap.internValue("exit");
+        rec.begin();
+        rec.value(0, s);
+        rec.guardPass(1, g);
+        rec.commit();
+        rec.exit(2, .guard, x);
+        rec.end(1);
+    }
+
+    const events = log.entries.items[0].events;
+    try testing.expectEqual(@as(usize, 4), events.len);
+    try testing.expectEqualStrings("hello", events[0].value.string);
+    try testing.expectEqualStrings("guard", events[1].value.string);
+    try testing.expectEqualStrings("exit", events[3].value.string);
+}
+
+test "an abandoned entry frees its scratch strings (log retired mid-entry, re-begin, deinit)" {
+    const gpa = testing.allocator;
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    const s = try heap.internValue("scratch");
+
+    var log = TraceExecLog{ .trace_id = 0 };
+    defer log.deinit(gpa);
+    var rec = ExecLogRecorder.init(gpa, 100, 100);
+    defer rec.deinit();
+
+    // 1. The log is unpublished mid-entry (a retire nulls `rec.log`): `end` frees.
+    rec.retarget(&log);
+    rec.begin();
+    rec.value(0, s);
+    rec.log = null;
+    rec.end(0);
+    try testing.expectEqual(@as(usize, 0), rec.scratch.items.len);
+
+    // 2. An entry that never reaches `end` (unwound executor): the next `begin` frees.
+    rec.retarget(&log);
+    rec.begin();
+    rec.value(0, s);
+    rec.begin();
+    try testing.expectEqual(@as(usize, 0), rec.scratch.items.len);
+
+    // 3. Still pending at teardown: `deinit` frees (leak-checked by testing.allocator).
+    rec.value(0, s);
+    try testing.expectEqual(@as(usize, 1), rec.scratch.items.len);
+}
+
+fn recordStringEntry(gpa: std.mem.Allocator, s: Value) !void {
+    var log = TraceExecLog{ .trace_id = 0 };
+    defer log.deinit(gpa);
+    var rec = ExecLogRecorder.init(gpa, 100, 100);
+    defer rec.deinit();
+    rec.retarget(&log);
+    rec.begin();
+    rec.value(0, s);
+    rec.guardPass(1, s);
+    rec.commit();
+    rec.exit(2, .guard, s);
+    rec.end(1);
+    // The recorder swallows allocation failure by design (events/entries drop);
+    // this harness only needs *some* allocation to fail at each index, which the
+    // dropped-event paths guarantee, so force the checker to see an error.
+    if (log.entries.items.len == 0 or log.entries.items[0].events.len != 4) return error.OutOfMemory;
+}
+
+test "every allocation failure while logging strings drops cleanly with no leak" {
+    var heap = gc.Heap.init(testing.allocator);
+    defer heap.deinit();
+    const s = try heap.internValue("payload");
+    try testing.checkAllAllocationFailures(testing.allocator, recordStringEntry, .{s});
 }

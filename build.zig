@@ -216,6 +216,25 @@ pub fn build(b: *std.Build) void {
     const bench_topo_step = b.step("bench-topology", "Run the region-topology rebuild benchmark (ReleaseFast)");
     bench_topo_step.dependOn(&run_bench_topo.step);
 
+    // `zig build bench-retire` — doc 61 Phase Q: trace retirement at a
+    // collection (one batch, one structural rebuild) as the cache grows.
+    // ReleaseFast, informational, not a test (global Rule #22).
+    const bench_retire_exe = b.addExecutable(.{
+        .name = "bench-retire",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_retire.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "mahina", .module = mod },
+            },
+        }),
+    });
+    bench_retire_exe.use_llvm = true;
+    const run_bench_retire = b.addRunArtifact(bench_retire_exe);
+    const bench_retire_step = b.step("bench-retire", "Run the Phase Q trace-retirement benchmark (ReleaseFast)");
+    bench_retire_step.dependOn(&run_bench_retire.step);
+
     // --- wasm32-freestanding browser target ---------------------------------
     //
     // `zig build wasm` compiles the VM core to a reactor-style wasm module that

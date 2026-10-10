@@ -675,6 +675,14 @@ pub const Heap = struct {
         }
     }
 
+    /// Whether the next `sweep` frees `h`: the sweep's own predicate, so a
+    /// caller between `traceAll` and `sweep` gets an exact answer (doc 61
+    /// §7.1). White alone is not enough: pinned objects (loaded-chunk
+    /// constants) are never marked and never freed.
+    pub inline fn willFree(h: *const GcHeader) bool {
+        return h.color == .white and !h.flags.pinned;
+    }
+
     /// Scan one object's outgoing references, marking each. Type-dispatched on
     /// the header so the collector knows where the child pointers live.
     fn blacken(self: *Heap, h: *GcHeader) void {
@@ -754,7 +762,7 @@ pub const Heap = struct {
         var slot: *?*GcHeader = &self.objects;
         var live: usize = 0;
         while (slot.*) |h| {
-            if (h.color == .white and !h.flags.pinned) {
+            if (willFree(h)) {
                 // Unreachable: unlink (leaving `slot` pointing at the successor)
                 // and free. Dead strings simply never re-enter the chains.
                 slot.* = h.next;

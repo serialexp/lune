@@ -219,6 +219,15 @@ fn materializeExitSide(t: *const Trace, regs: RegWindow, values: []const Value, 
     }
 }
 
+/// Doc 45 D5: the `runtime_error` a failed allocating string shim hands the
+/// exit tail. A precise trace raises the shim's OOM in place
+/// (`.precise_error`, never retried); an ordinary trace's exits carry no error
+/// — it side-exits and tier-0 replays the iteration (doc 24 D5). A decline
+/// (`runtime_error` 0) is a plain side-exit in both.
+inline fn strFailure(t: *const Trace, r: stralloc.StrResult) u32 {
+    return if (t.deopt_mode == .precise) r.runtimeError() else 0;
+}
+
 /// Execute trace `t` from the current frame's register window `regs`, using the
 /// caller-owned `values` scratch (indexed by SSA `Ref`; must be at least
 /// `t.instrs.len` long — the caller grows/reuses it). Returns `ExecResult` with
@@ -846,26 +855,28 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                 // shared `stralloc` body (render via `io.writeValue` + intern)
                 // every tier runs — tier-0's `bToString` composes the same two
                 // primitives, so the result is byte-identical by construction.
-                // A null return is OOM with a clean id stream (no `link`
-                // preceded the fallible step — see stralloc.zig): side-exit at
-                // the header and let tier-0's replay re-raise the same OOM at
-                // the same logical point. Defensive type side-exit like
-                // `.fsqrt` (a dominating `guard_int`/`guard_float` pinned the
-                // operand). No-heap (bare harness) fails closed the same way.
+                // A failure is OOM with a clean id stream (no `link` preceded
+                // the fallible step — see stralloc.zig): an ordinary trace
+                // side-exits at the header and tier-0's replay re-raises the
+                // OOM; a precise trace raises it here (`strFailure`). Defensive
+                // type side-exit like `.fsqrt` (a dominating
+                // `guard_int`/`guard_float` pinned the operand). No-heap (bare
+                // harness) fails closed as a plain side-exit.
                 .tostr_int, .tostr_num => {
                     const v = values[ins.a];
                     const type_ok = if (ins.op == .tostr_int) v.isInt() else v.isFloat();
                     if (type_ok) {
                         if (ctx.heap) |heap| {
-                            const hdr = if (ins.op == .tostr_int)
+                            const r = if (ins.op == .tostr_int)
                                 stralloc.tostrIntRuntime(heap, v.asInt())
                             else
                                 stralloc.tostrNumRuntime(heap, v.asFloat());
-                            if (hdr) |h| {
+                            if (r.hdr()) |h| {
                                 values[i] = Value.heap(h);
                                 if (record) rec.value(i, values[i]);
                                 continue;
                             }
+                            runtime_error = strFailure(t, r);
                         }
                     }
                     if (record) rec.exit(i, .guard, v);
@@ -889,20 +900,24 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                 // Doc 24 c3: the snew class — allocating string transforms,
                 // each through the ONE stralloc shim over the shared
                 // `stdlib/string.zig` core tier-0 wraps. Operand types are
-                // producer-proven or guard-pinned; any mismatch (or a null
-                // return: OOM / out-of-range char, both link-free) is a
-                // defensive side-exit and tier-0 replays the iteration.
+                // producer-proven or guard-pinned; any mismatch (or a
+                // decline: out-of-range char) is a defensive side-exit and
+                // tier-0 replays the iteration. A shim OOM (link-free) is the
+                // same side-exit in an ordinary trace and a raise in a precise
+                // one (`strFailure`).
                 .ssub => {
                     const sv = values[ins.a];
                     const iv = values[ins.b];
                     const jv = values[@intCast(ins.aux)];
                     if (sv.isHeap() and sv.heapType() == .string and iv.isInt() and jv.isInt()) {
                         if (ctx.heap) |heap| {
-                            if (stralloc.ssubRuntime(heap, sv.asHeap(), iv.asInt(), jv.asInt())) |h| {
+                            const r = stralloc.ssubRuntime(heap, sv.asHeap(), iv.asInt(), jv.asInt());
+                            if (r.hdr()) |h| {
                                 values[i] = Value.heap(h);
                                 if (record) rec.value(i, values[i]);
                                 continue;
                             }
+                            runtime_error = strFailure(t, r);
                         }
                     }
                     if (record) rec.exit(i, .guard, sv);
@@ -912,11 +927,13 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     const sv = values[ins.a];
                     if (sv.isHeap() and sv.heapType() == .string) {
                         if (ctx.heap) |heap| {
-                            if (stralloc.srevRuntime(heap, sv.asHeap())) |h| {
+                            const r = stralloc.srevRuntime(heap, sv.asHeap());
+                            if (r.hdr()) |h| {
                                 values[i] = Value.heap(h);
                                 if (record) rec.value(i, values[i]);
                                 continue;
                             }
+                            runtime_error = strFailure(t, r);
                         }
                     }
                     if (record) rec.exit(i, .guard, sv);
@@ -926,11 +943,13 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     const cv = values[ins.a];
                     if (cv.isInt()) {
                         if (ctx.heap) |heap| {
-                            if (stralloc.schar1Runtime(heap, cv.asInt())) |h| {
+                            const r = stralloc.schar1Runtime(heap, cv.asInt());
+                            if (r.hdr()) |h| {
                                 values[i] = Value.heap(h);
                                 if (record) rec.value(i, values[i]);
                                 continue;
                             }
+                            runtime_error = strFailure(t, r);
                         }
                     }
                     if (record) rec.exit(i, .guard, cv);
@@ -941,11 +960,13 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     const nv = values[ins.b];
                     if (sv.isHeap() and sv.heapType() == .string and nv.isInt()) {
                         if (ctx.heap) |heap| {
-                            if (stralloc.srep2Runtime(heap, sv.asHeap(), nv.asInt())) |h| {
+                            const r = stralloc.srep2Runtime(heap, sv.asHeap(), nv.asInt());
+                            if (r.hdr()) |h| {
                                 values[i] = Value.heap(h);
                                 if (record) rec.value(i, values[i]);
                                 continue;
                             }
+                            runtime_error = strFailure(t, r);
                         }
                     }
                     if (record) rec.exit(i, .guard, sv);
@@ -954,21 +975,23 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                 // Doc 26 D2: the case-mapping pair — heap-only by the
                 // committed-trace pin invariant (D1); the session's Unicode
                 // version was pinned before this trace could commit, so the
-                // shared caseCore needs no VM. Null (scratch OOM, no link
-                // performed) is a defensive side-exit; tier-0 replays.
+                // shared caseCore needs no VM. A failure (OOM, no link
+                // performed) side-exits and tier-0 replays — or, in a precise
+                // trace, raises here (`strFailure`).
                 .supper, .slower => {
                     const sv = values[ins.a];
                     if (sv.isHeap() and sv.heapType() == .string) {
                         if (ctx.heap) |heap| {
-                            const h = if (ins.op == .supper)
+                            const r = if (ins.op == .supper)
                                 stralloc.supperRuntime(heap, sv.asHeap())
                             else
                                 stralloc.slowerRuntime(heap, sv.asHeap());
-                            if (h) |hdr| {
+                            if (r.hdr()) |hdr| {
                                 values[i] = Value.heap(hdr);
                                 if (record) rec.value(i, values[i]);
                                 continue;
                             }
+                            runtime_error = strFailure(t, r);
                         }
                     }
                     if (record) rec.exit(i, .guard, sv);
@@ -1049,11 +1072,13 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                 },
                 .scap_str => {
                     if (ctx.heap) |heap| {
-                        if (stralloc.scapStrRuntime(heap, @as(i64, ins.b))) |hdr| {
+                        const r = stralloc.scapStrRuntime(heap, @as(i64, ins.b));
+                        if (r.hdr()) |hdr| {
                             values[i] = Value.heap(hdr);
                             if (record) rec.value(i, values[i]);
                             continue;
                         }
+                        runtime_error = strFailure(t, r);
                     }
                     if (record) rec.exit(i, .guard, values[ins.a]);
                     break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
@@ -1391,6 +1416,9 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
             .terminal, .link, .loop => std.debug.assert(runtime_error == 0),
             else => if (ins.snap > 0) {
                 std.debug.assert(ins.snap <= t.snapshots.len); // finalize-validated
+                // Every op that can exit here is one finalize demands a
+                // snapshot for — keeps that inventory honest.
+                std.debug.assert(trace_ir.requiresPreciseSnapshot(ins.op));
                 const s = t.snapshots[ins.snap - 1];
                 for (t.snapshot_slots[s.slots_begin..][0 .. s.slots_len]) |ss| {
                     // Every captured ref precedes the failing op (validated at
@@ -1427,8 +1455,10 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
         materializeExitSide(t, regs, values, out.exit_instr);
         out.exit_reason = .exit_side;
     }
-    // `tnew` only exists in precise traces (finalize-asserted), so a shim
-    // failure is always folded above — it can never leak out as `.normal`.
+    // A nonzero `runtime_error` is only ever set in a precise trace: `tnew`
+    // exists only there (finalize-asserted), and the string helpers report
+    // a failure through `strFailure`, which is 0 outside precise mode. So a
+    // shim failure is always folded above — it never leaks out as `.normal`.
     std.debug.assert(runtime_error == 0 or out.exit_reason == .precise_error);
     if (record) rec.end(out.completed);
     return out;
@@ -1581,10 +1611,11 @@ test "E0 review: a slot-bound φ carrying a HEAP value emits no exec-log value e
     try testing.expectEqual(@as(usize, 1), completed);
     try testing.expectEqual(@as(i64, 5), regs[0].asInt()); // carry flushed r0 ← 5
 
-    // The crux: NO recorded event carries a heap value, so serialization can't hit
-    // `UnsupportedEffectResult`. (The φ at %5 read the heap table but logged nothing.)
+    // The crux: the heap table never reaches the log — `LogValue` can only hold
+    // scalars and owned string bytes, and this trace produces no strings. (The φ
+    // at %5 read the heap table but logged nothing.)
     try testing.expectEqual(@as(usize, 1), log.entries.items.len);
-    for (log.entries.items[0].events) |ev| try testing.expect(!ev.value.isHeap());
+    for (log.entries.items[0].events) |ev| try testing.expect(ev.value != .string);
 }
 
 test "B2 read path: guard_table side-exits when the slot is not a table" {

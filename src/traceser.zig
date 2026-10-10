@@ -44,7 +44,11 @@ pub const schema = @import("gen/trace_schema.zig");
 /// stream, and a head trace's `anchor.pc` is the `FUNC_HEAD_PC` sentinel
 /// (`maxInt(u32)`) — a v3 reader would misdecode op 86 and misread the
 /// sentinel as a bytecode pc. No layout change; the bump is semantic.
-pub const format_version: u32 = 4;
+///
+/// v5 (doc 61 §7.1): each Trace record leads with its stable `id`, the key
+/// execution logs join on (they no longer key on the cache index, which
+/// retirement compacts).
+pub const format_version: u32 = 5;
 
 /// Map one trace constant. A `heap_ref` const is always a string — the only
 /// heap value a trace constant can be (tables/closures are never compile-time
@@ -70,11 +74,21 @@ pub fn toSchemaConst(v: Value) error{UnsupportedConst}!schema.ConstValue {
     };
 }
 
-/// Map a committed `TraceCode` to its schema struct. Allocates the mapped
-/// arrays from `a` (use a scratch arena; the result borrows from it and from the
+/// One trace as the serializer sees it: its immutable code plus the stable
+/// `Trace.id` the wire carries (v5 — exec logs join on it). Serialization
+/// consumes code, never lifecycle records (`tools/check-jit-boundaries.py`),
+/// so the id travels beside the code rather than via the record.
+pub const WireTrace = struct {
+    id: u32,
+    code: *const TraceCode,
+};
+
+/// Map a committed trace to its schema struct. Allocates the mapped arrays
+/// from `a` (use a scratch arena; the result borrows from it and from the
 /// trace's live string consts). The anchor is the proto's *id*, never its
-/// pointer.
-pub fn toSchemaTrace(a: std.mem.Allocator, t: *const TraceCode) !schema.Trace {
+/// pointer; the stable trace `id` leads (wire v5).
+pub fn toSchemaTrace(a: std.mem.Allocator, wt: WireTrace) !schema.Trace {
+    const t = wt.code;
     // Doc 45 D8 (fail-closed until it lands): the schema has no
     // snapshots/deopt_mode fields yet, so serializing a PRECISE trace would
     // silently strip its correctness metadata — the decoded trace would carry
@@ -95,6 +109,7 @@ pub fn toSchemaTrace(a: std.mem.Allocator, t: *const TraceCode) !schema.Trace {
     for (t.consts, 0..) |c, i| consts[i] = try toSchemaConst(c);
 
     return .{
+        .id = wt.id,
         .anchor_proto_id = t.anchor.proto.id,
         .anchor_pc = t.anchor.pc,
         .peeled = @intFromBool(t.peeled),
@@ -108,14 +123,12 @@ pub fn toSchemaTrace(a: std.mem.Allocator, t: *const TraceCode) !schema.Trace {
 /// Serialize a whole trace cache to bytes (a versioned `TraceFile`). The
 /// returned slice is owned by `gpa` (caller frees). Intermediate schema structs
 /// live in a scratch arena freed before return.
-pub fn encodeFile(gpa: std.mem.Allocator, traces: []const *const TraceCode) ![]u8 {
+pub fn encodeFile(gpa: std.mem.Allocator, traces: []const WireTrace) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Doc 45 D8 interim: no filtering here — `TraceExecLog.trace_id` is a
-    // cache INDEX, so omitting a trace would silently desynchronize every
-    // later trace from its exec log. Instead, an exec-log session never
+    // Doc 45 D8 interim: no filtering here. An exec-log session never
     // PRODUCES a precise trace at all: `consumeRecordingAbort` treats
     // `needs_precise` as an ordinary strike under `record_exec_log` (no memo,
     // no precise retry), so this hard error stays what it is — an invariant

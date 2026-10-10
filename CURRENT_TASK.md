@@ -1,3 +1,17 @@
+DOC 63 (2026-10-10, coral-marten): traces call host functions directly.
+- **Prerequisite A is done and green but not yet committed.** In a precise
+  trace, a string-helper OOM now raises `.precise_error` instead of
+  resuming tier-0 and retrying. Gates: test and jit-debug 1699/1699,
+  hashgate 90/90 on both legs, embed-test ok. Codex and antigravity both
+  approved in round 2 (`docs/reviews/doc63/*prereqA*`). amber-badger is
+  making a bundled commit with their Phase Q work, because both touched
+  irinterp.zig, interp_trace_test.zig and trace_finalize.zig. The file
+  list is in the forum PM.
+- **Open for Bart:** whether ordinary traces may retry a transient OOM
+  (TODO.md, options a/b/c).
+- **Next:** Prerequisite B (Phase Q, amber-badger, code-complete), then
+  doc 63 Phase 0 (host-call benchmark and budget).
+
 DOC 60 H3 (2026-10-05, separate track from the campaign below):
 - **H3 landed:** the admitted path in `src/asm/hostcall_x64.S`, together
   with the §6.1 record/replay legs (Bart: run them before landing).
@@ -71,19 +85,46 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
   `5790b75d`: flat. Every row is within ±2% except tbl_ops −3% and
   str_gmatch −4.4%. `compile_multret_chain` peaks at 257 MB RSS, which is
   the TODO "repeated `load` grows memory" issue.
-- **Phase Q design APPROVED (2026-10-10, `c408b95`).** It is doc 61 §7.1
-  rev 3. Codex and antigravity reviewed it; receipts are in
-  `docs/reviews/doc61/phaseQ-rev1.md`. The hazard is live on HEAD from
-  plain Lua (the §7.1 program prints `0x146e` on tier-0 and `0x146d` on the
-  JIT legs). **Next: implement Phase Q** in the §7.1 order:
-  - recorder hardening: `cancel`, owned contract via
-    `clearPendingLinkClose`, recorder id keys, `PendingStore.tab_obj`;
-  - `heap_consts` + `willFree` + `invalidateDeadTraceConsts`;
-  - bulk `removeTraces` (with the bulk drain and teardown, reserved
-    scratch, and cleared wants);
-  - exec logs (owned bytes, wire `id`, drop on retire);
-  - remove the pool roots;
-  - the tests, then the release benchmark.
+- **Phase Q is IMPLEMENTED and committed (2026-10-10)**, bundled with the
+  R(T) fix and coral's doc 63 Prerequisite A. It follows doc 61 §7.1 rev 3:
+  - trace pools are not roots; `heap_consts` + `willFree` +
+    `invalidateDeadTraceConsts` run between mark and sweep;
+  - bulk `removeTraces` (`Vm.WalkDead` makes the widen-eviction list
+    retire once);
+  - exec logs carry owned bytes (`LogValue`) and are keyed by
+    `Trace.id`; trace wire v5 carries `id`, and viz joins logs by id;
+  - recorder hardening; `McodeArena.free` is O(1) and allocation-free.
+  - The step-8 entry-patch drain stays at the next safe point; doc 61
+    step 8 now says why.
+  Gates: test and jit-debug green, release lib (offsets), wasm, hashgate
+  90/90 on both legs, viz 70/70 (with `~/.bun/bin/bun`; see TODO).
+  `zig build bench-retire`: retiring 10% of 4000 traces costs 1.25 ms,
+  of which R(survivors) is 1.1 ms.
+- **R(T) is fixed in the same commit.** `TraceRegistry.by_anchor` is a
+  per-anchor index, the topology view is indexed, and `build` is
+  per-component (TODO "Region graph rebuild R(T)", marked done). R(T) at
+  N=4000 went from 92 ms to 3.0 ms. Tests now install records via
+  `registry.attach`/`detach`/`detachAll`, never `registry.cache` directly.
+- **Phase Q follow-ups still open.** Codex and antigravity listed missing
+  tests in the impl review (codex thread
+  01a124f3-15b9-7e53-9154-758a8bd976b2):
+  - parked proofs intact before R and dropped after R;
+  - promoted sets demoted;
+  - the drain: restore before install, id order, several traces per
+    anchor, both wake kinds;
+  - region index OOM;
+  - real finalize/commit of a side recording after its parent retires;
+  - identity maps under address reuse;
+  - a mid-peel inner-root retirement, and peel-setup OOM;
+  - every `clearPendingLinkClose` path, leak-checked;
+  - a `callee_global` non-konst dependency;
+  - `mh_collect` from a host callback's nested run;
+  - exec logs after retire + re-record;
+  - a lazy compile after a sweep;
+  - per-step counters.
+
+  Also: bench-retire covers no compiled pages, links or entry patches.
+  `releaseChunk` options for Bart are in TODO.
 - **Then, in order:**
   - Phase 1;
   - Phase 2: land the uncommitted dead-φ filter and retire the watermark;

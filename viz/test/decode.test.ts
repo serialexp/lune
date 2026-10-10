@@ -19,8 +19,9 @@ const bytes = new Uint8Array(readFileSync(fixturePath));
 
 test("decodes the fixture header + trace count", () => {
   const file = decodeTraceFile(bytes);
-  expect(file.version).toBe(3); // v3: traces record whether numeric φ stabilization used a peel
+  expect(file.version).toBe(5); // v5: traces carry their stable Trace.id (exec logs join on it)
   expect(file.traces.length).toBe(1);
+  expect(file.traces[0].id).toBe(0); // the first trace minted in the run
 });
 
 test("trace anchor + array shapes match the recorded counting loop", () => {

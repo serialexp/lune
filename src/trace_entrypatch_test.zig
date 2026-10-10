@@ -96,7 +96,7 @@ test "doc 20 Phase 3: resolve and lifecycle cover compiler while/repeat closers 
     const while_proto = Proto{ .code = &while_code, .id = 8, .name = "while", .num_registers = 8 };
     try testing.expectEqual(@as(?u32, 1), TraceState.resolvePatchPc(&while_proto, 2));
     const wt = try entryPatchTestTrace(gpa, 10, &while_proto, 2);
-    try state.registry.cache.append(gpa, wt);
+    try state.registry.attach(wt);
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(wt));
     try testing.expectEqual(OpCode.jloop, state.codeFor(&while_proto)[1].op);
     try testing.expectEqual(OpCode.loop, while_proto.code[1].op); // canonical stays virgin
@@ -118,7 +118,7 @@ test "doc 20 Phase 3: resolve and lifecycle cover compiler while/repeat closers 
     const repeat_proto = Proto{ .code = &repeat_code, .id = 9, .name = "repeat", .num_registers = 8 };
     try testing.expectEqual(@as(?u32, 1), TraceState.resolvePatchPc(&repeat_proto, 2));
     const rt = try entryPatchTestTrace(gpa, 11, &repeat_proto, 2);
-    try state.registry.cache.append(gpa, rt);
+    try state.registry.attach(rt);
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(rt));
     try testing.expectEqual(OpCode.jloop, state.codeFor(&repeat_proto)[1].op);
     try testing.expectEqual(@as(i32, 6), state.codeFor(&repeat_proto)[1].aux);
@@ -154,7 +154,7 @@ test "doc 20 Phase 3: jloop strike exhaustion policy restores canonical and cool
     code[1] = .{ .op = .loop, .b = @intFromEnum(bytecode.LoopKind.while_loop), .aux = 6 };
     const proto = Proto{ .code = &code, .id = 11, .name = "strike", .num_registers = 8 };
     const t = try entryPatchTestTrace(gpa, 12, &proto, 2);
-    try state.registry.cache.append(gpa, t);
+    try state.registry.attach(t);
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
     t.entry_patch = .bound;
 
@@ -178,9 +178,9 @@ test "doc 20 Phase 0b: install publishes a .jfor_loop image; canonical untouched
     var code = entryPatchTestCode();
     const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
     const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
-    try state.registry.cache.append(gpa, t);
+    try state.registry.attach(t);
     const sibling = try entryPatchTestTrace(gpa, 2, &proto, 2);
-    try state.registry.cache.append(gpa, sibling);
+    try state.registry.attach(sibling);
 
     const gen0 = state.registry.entry_registry.image_gen;
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
@@ -228,7 +228,7 @@ test "doc 20 §R7-2: removeTrace marks the slot pre-destroy; drain survives the 
     var code = entryPatchTestCode();
     const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
     const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
-    try state.registry.cache.append(gpa, t);
+    try state.registry.attach(t);
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
 
     // removeTrace destroys `t`; the hook must have marked slot 0 first.
@@ -250,7 +250,7 @@ test "doc 20 §R2-2: clearCache drops images + registry wholesale (epoch boundar
     var code = entryPatchTestCode();
     const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
     const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
-    try state.registry.cache.append(gpa, t);
+    try state.registry.attach(t);
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
     try testing.expect(state.registry.entry_registry.code_images.count() == 1);
 
@@ -273,7 +273,7 @@ test "doc 20 triggers: anchor gate and side-arm want both mark the patch pending
     const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
     const anchor = AnchorKey{ .proto = &proto, .pc = 2 };
     const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
-    try state.registry.cache.append(gpa, t);
+    try state.registry.attach(t);
 
     // Gate trigger: gating the anchor marks its live slot pending.
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
@@ -312,7 +312,7 @@ test "doc 31 D1: a record gate leaves the entry patch live and blocks want produ
     const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
     const anchor = AnchorKey{ .proto = &proto, .pc = 2 };
     const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
-    try state.registry.cache.append(gpa, t);
+    try state.registry.attach(t);
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
 
     // Recording failures land in `record_gate`: dispatch stays open
@@ -368,7 +368,7 @@ test "doc 31 D1 amendment: record-gated anchor arms GATE_SKIP only when no trace
     // slots cannot collide): the slow path is exactly what enters the trace —
     // must NOT skip (dispatch starvation, review B3).
     const t = try entryPatchTestTrace(gpa, 1, &proto2, 2);
-    try state.registry.cache.append(gpa, t);
+    try state.registry.attach(t);
     state.gateRecordAnchor(t.code.anchor, .record_abort);
     state.afterBackEdge(&proto2, 2);
     try testing.expect(!state.skipBackEdge(&proto2, 2));

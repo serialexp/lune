@@ -94,10 +94,10 @@ test "nextTraceExcluding: visits each anchor trace once, highest-hit first, then
             .hit_count = spec.hits,
         };
         slot.* = tr;
-        try state.registry.cache.append(gpa, tr);
+        try state.registry.attach(tr);
     }
     defer {
-        state.registry.cache.clearRetainingCapacity();
+        state.registry.detachAll();
         for (traces) |tr| gpa.destroy(tr);
     }
 
@@ -139,10 +139,10 @@ test "nextTraceExcluding: equal hit counts go to the lowest id, whatever the cac
             .hit_count = 4,
         };
         slot.* = tr;
-        try state.registry.cache.append(gpa, tr);
+        try state.registry.attach(tr);
     }
     defer {
-        state.registry.cache.clearRetainingCapacity();
+        state.registry.detachAll();
         for (traces) |tr| gpa.destroy(tr);
     }
     var visited: [8]*Trace = undefined;
@@ -651,7 +651,7 @@ test "A-i.4 transport: recForPrepLink commits a .link trace carrying .link_termi
     defer state.deinit();
     defer {
         if (committed) |ct| ct.destroy(gpa);
-        state.registry.cache.clearRetainingCapacity();
+        state.registry.detachAll();
     }
 
     // Bytecode shape: `for_prep` recorded at post-increment pc 5 (its guest opcode is
@@ -674,7 +674,7 @@ test "A-i.4 transport: recForPrepLink commits a .link trace carrying .link_termi
         },
         .id = 900,
     };
-    try state.registry.cache.append(gpa, &inner);
+    try state.registry.attach(&inner);
 
     // Arm a *continuation* recording (a `.root` recording aborts LINNER at for_prep).
     try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 2 }, proto.num_registers);

@@ -877,15 +877,29 @@ pub fn isStateEffectOp(op: IrOp) bool {
 }
 
 /// Doc 45 D3: every op a PRECISE trace must carry a snapshot for, because its
-/// runtime failure exits mid-iteration. The side-exit guards (shape/type
-/// misses → `.precise_resume`) PLUS the fallible effect ops (`tnew`/`tset`
-/// OOM/type errors → `.precise_error` — never an ordinary deopt, D5).
-/// Finalize enforces this fail-closed (`error.InvalidSnapshotMetadata` on a
-/// snap-less match past `guard_gc`), and the tier-1a exit tail asserts it:
-/// a precise runtime error with `snap == 0` is a bug, never degraded to
-/// `.normal`.
+/// runtime failure can exit mid-iteration in EITHER executor: the guards
+/// (shape/type misses → `.precise_resume`), the fallible helpers (a callout
+/// sentinel, a typed load's tag check, tier-1a's defensive operand checks on
+/// arithmetic → `.precise_resume`; an allocating string helper's OOM →
+/// `.precise_error`) and the fallible effect ops (`tnew`/`tset` →
+/// `.precise_error` — never an ordinary deopt, D5). Not the side-trace notion
+/// of `isSideExitGuardOp`: a helper exit is no side-trace evidence, but it
+/// still materializes the snapshot. `guard_gc` is absent: it is the eager
+/// prologue guard, snap-less by design, whose exit is iteration-entry
+/// coherent (`.normal`). Finalize enforces this fail-closed
+/// (`error.InvalidSnapshotMetadata` on a snap-less match past `guard_gc`),
+/// and both exit tails assert it: tier-1a's on every precise exit, native's
+/// through `nativegen_alloc.opMayExitInBody` (a subset). A precise runtime
+/// error with `snap == 0` is a bug, never degraded to `.normal`.
 pub fn requiresPreciseSnapshot(op: IrOp) bool {
     return isSideExitGuardOp(op) or switch (op) {
+        .guard_string, .guard_sid => true,
+        .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .sar => true,
+        .neg, .not, .bnot, .eq, .ne, .lt, .le => true,
+        .fsqrt, .fsin, .fcos, .ffloor, .fceil => true,
+        .aload, .href, .hload, .uload => true,
+        .tostr_int, .tostr_num, .slen, .ssub, .srev, .schar1, .srep2, .supper, .slower => true,
+        .scp, .sfindp, .smatch, .sgmatch, .scap_int, .scap_str, .str2num_i, .str2num_f, .sgm_setpos => true,
         .tnew, .tset => true,
         else => false,
     };

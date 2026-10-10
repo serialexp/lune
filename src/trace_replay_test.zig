@@ -170,7 +170,7 @@ test "replayLedger M1 sub-case (c): fused [skip.deopt, ramp.prologue_fail] repla
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity(); // stack-backed traces: never destroy()
+    defer state.registry.detachAll(); // stack-backed traces: never destroy()
 
     // proto.code[1] is NOT a for_loop, so skip's guard_true (exit_pc 2) classifies as
     // a source-branch guard, never a loop-done guard.
@@ -214,8 +214,8 @@ test "replayLedger M1 sub-case (c): fused [skip.deopt, ramp.prologue_fail] repla
         .id = 102,
         .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .ordinary_entry = 0xBEEF } },
     };
-    try state.registry.cache.append(gpa, &skip);
-    try state.registry.cache.append(gpa, &ramp);
+    try state.registry.attach(&skip);
+    try state.registry.attach(&ramp);
 
     // Establish the M1 armed-edge provenance the fused `.deopt` validation demands.
     try testing.expect(try state.armNativeLink(&skip, 0, &ramp, .ordinary_guard));
@@ -254,7 +254,7 @@ test "replayLedger dispatcher grammar: [I.loop_done_linked, C.prologue_fail] com
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     // code[1] IS a for_loop: the inner's guard_true (exit_pc 2) is a loop-done guard.
     const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
@@ -288,8 +288,8 @@ test "replayLedger dispatcher grammar: [I.loop_done_linked, C.prologue_fail] com
         },
         .id = 202,
     };
-    try state.registry.cache.append(gpa, &inner);
-    try state.registry.cache.append(gpa, &cont);
+    try state.registry.attach(&inner);
+    try state.registry.attach(&cont);
 
     // One committed enclosing iteration (cum 0→1), then the fused continuation's
     // prologue failed pre-commit (cum unchanged).
@@ -326,7 +326,7 @@ test "replayLedger M1 sub-case (d): fused [skip.deopt, ramp.seed_capacity_declin
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity(); // stack-backed traces: never destroy()
+    defer state.registry.detachAll(); // stack-backed traces: never destroy()
 
     // proto.code[1] is NOT a for_loop → skip's guard_true (exit_pc 2) is a
     // source-branch guard.
@@ -365,8 +365,8 @@ test "replayLedger M1 sub-case (d): fused [skip.deopt, ramp.seed_capacity_declin
         .id = 112,
         .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .ordinary_entry = 0xBEEF } },
     };
-    try state.registry.cache.append(gpa, &skip);
-    try state.registry.cache.append(gpa, &ramp);
+    try state.registry.attach(&skip);
+    try state.registry.attach(&ramp);
 
     try testing.expect(try state.armNativeLink(&skip, 0, &ramp, .ordinary_guard));
 
@@ -405,7 +405,7 @@ test "replayLedger dispatcher grammar: [I.loop_done_linked, C.seed_hash_decline]
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     // code[1] IS a for_loop: the inner's guard_true (exit_pc 2) is a loop-done guard.
     const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
@@ -437,8 +437,8 @@ test "replayLedger dispatcher grammar: [I.loop_done_linked, C.seed_hash_decline]
         },
         .id = 212,
     };
-    try state.registry.cache.append(gpa, &inner);
-    try state.registry.cache.append(gpa, &cont);
+    try state.registry.attach(&inner);
+    try state.registry.attach(&cont);
 
     // One committed enclosing iteration (cum 0→1), then the fused continuation's
     // seeded entry declined pre-commit (cum unchanged).
@@ -482,7 +482,7 @@ test "B-iii: a tier-1a seed decline ends the burst chargeless (no strike on the 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     // `code[1]` is the `for_loop`; the inner root is anchored at pc 7.
     const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
@@ -519,8 +519,8 @@ test "B-iii: a tier-1a seed decline ends the burst chargeless (no strike on the 
         .id = 232,
     };
     inner.code.inputs = @constCast(&[_]trace.InputSeed{undefined});
-    try state.registry.cache.append(gpa, &seed_trace);
-    try state.registry.cache.append(gpa, &inner);
+    try state.registry.attach(&seed_trace);
+    try state.registry.attach(&inner);
     try testing.expect(state.registry.native_seed_ctx == null);
 
     var regs = [_]Value{Value.int(0)};
@@ -567,7 +567,7 @@ test "replayLedger terminal seed-decline: a CONTINUATION decline is a chargeless
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
 
@@ -598,8 +598,8 @@ test "replayLedger terminal seed-decline: a CONTINUATION decline is a chargeless
         },
         .id = 222,
     };
-    try state.registry.cache.append(gpa, &inner);
-    try state.registry.cache.append(gpa, &cont);
+    try state.registry.attach(&inner);
+    try state.registry.attach(&cont);
 
     // One committed enclosing iteration, then the fused continuation's seeded
     // entry declined pre-commit (cum unchanged → local == 0, `ends_link`).
@@ -644,7 +644,7 @@ test "replayLedger terminal seed-decline: [C.link_terminal, I.seed_hash_decline]
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
 
@@ -678,8 +678,8 @@ test "replayLedger terminal seed-decline: [C.link_terminal, I.seed_hash_decline]
         },
         .id = 312,
     };
-    try state.registry.cache.append(gpa, &cont);
-    try state.registry.cache.append(gpa, &inner);
+    try state.registry.attach(&cont);
+    try state.registry.attach(&inner);
 
     // C's `.link` fused into I (cum 0), whose seeded entry then declined
     // pre-commit (cum unchanged).
@@ -731,7 +731,7 @@ test "replayLedger A-vii-c.1: rows a live region CONSUMES take no legacy strike 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const proto = Proto{ .id = 77, .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
     const inner_instrs = [_]IrInstr{
@@ -762,8 +762,8 @@ test "replayLedger A-vii-c.1: rows a live region CONSUMES take no legacy strike 
         },
         .id = 202,
     };
-    try state.registry.cache.append(gpa, &inner);
-    try state.registry.cache.append(gpa, &cont);
+    try state.registry.attach(&inner);
+    try state.registry.attach(&cont);
 
     // A live ARMABLE region owning both anchors' exits. Both rows must classify to
     // the SAME region (a different one would close the active accumulator), and the
@@ -820,7 +820,7 @@ test "driveSeedLedger: a deep hop-0 ledger [C.link, I.done, C.deopt] charges eac
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     // code[1] IS a for_loop: the inner's guard_true (exit_pc 2) is a loop-done guard.
     const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
@@ -856,8 +856,8 @@ test "driveSeedLedger: a deep hop-0 ledger [C.link, I.done, C.deopt] charges eac
         },
         .id = 302,
     };
-    try state.registry.cache.append(gpa, &cont);
-    try state.registry.cache.append(gpa, &inner);
+    try state.registry.attach(&cont);
+    try state.registry.attach(&inner);
 
     // C reached `.link` (cum 0), the fused inner committed one enclosing iteration
     // (cum 1), the re-entered C advanced twice more then deopted at its own guard
@@ -982,7 +982,7 @@ test "driveBurstCore start_at_continuation: a run_continuation handover does not
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     // code[1] IS a for_loop: the inner's guard_true (exit_pc 2) is a loop-done guard.
     const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
@@ -1028,8 +1028,8 @@ test "driveBurstCore start_at_continuation: a run_continuation handover does not
         .id = 402,
     };
     defer cont.native.deinit(); // lazily compiled below; free before the arena dies
-    try state.registry.cache.append(gpa, &inner);
-    try state.registry.cache.append(gpa, &cont);
+    try state.registry.attach(&inner);
+    try state.registry.attach(&cont);
 
     // A dispatcher-rooted span ending in a committed-but-unfused inner loop-done:
     // [I.done, C.link, I.done] → replay returns run_continuation(C) with hops=2 and
@@ -1073,7 +1073,7 @@ test "replayLedger A-vii-a: region_bridge validates registered cross-anchor edge
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity(); // traces are stack-owned
+    defer state.registry.detachAll(); // traces are stack-owned
     state.config.min_useful = 3;
 
     // The composite guard names bytecode exit PC 14, deliberately distinct from
@@ -1128,8 +1128,8 @@ test "replayLedger A-vii-a: region_bridge validates registered cross-anchor edge
     defer snap_arena.deinit();
     try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &cont.code);
     try testing.expect(nativegen.isCompositeBridgeCandidate(&cont.code, 3));
-    try state.registry.cache.append(gpa, &cont);
-    try state.registry.cache.append(gpa, &skip);
+    try state.registry.attach(&cont);
+    try state.registry.attach(&skip);
 
     // Synthesize the otherwise-unreachable A-vii-a inputs directly: the physical
     // backlink and the persistent registered edge. Missing, duplicate, tombstoned,
@@ -1192,7 +1192,7 @@ test "A-vii-d.1 overlay: composite guard resolves the opposite-polarity CFG succ
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     // Static CFG: jmp_if_true at 5 (jump target 6+4=10); fallthrough pc 6 is an
     // unconditional jmp to 8. A recorded-`.taken` composite guard therefore fails
@@ -1257,7 +1257,7 @@ test "A-vii-d.1 overlay: composite guard resolves the opposite-polarity CFG succ
         },
         .id = 702,
     };
-    try state.registry.cache.append(gpa, &skip);
+    try state.registry.attach(&skip);
     const succ_taken = state.resolveSuccessorAnchor(&cont, cont.code.exit_prov[0]) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u32, 51), succ_taken.proto_id);
     try testing.expectEqual(@as(u32, 8), succ_taken.pc);
@@ -1274,7 +1274,7 @@ test "A-vii-d.1 overlay: composite guard resolves the opposite-polarity CFG succ
         },
         .id = 703,
     };
-    try state.registry.cache.append(gpa, &other);
+    try state.registry.attach(&other);
     cont.code.exit_prov = &ft_prov;
     const succ_ft = state.resolveSuccessorAnchor(&cont, cont.code.exit_prov[0]) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u32, 10), succ_ft.pc);
@@ -1301,7 +1301,7 @@ test "A-vii-d.1 overlay: a crossed for_loop is published ONLY under the exact-da
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     // jmp_if_true at 5; the fallthrough pc 6 is a numeric for_loop whose
     // continue edge lands at 6+1+2 = 9, where the successor trace is bound.
@@ -1371,7 +1371,7 @@ test "A-vii-d.1 overlay: a crossed for_loop is published ONLY under the exact-da
         },
         .id = 712,
     };
-    try state.registry.cache.append(gpa, &skip);
+    try state.registry.attach(&skip);
 
     const succ = state.resolveSuccessorAnchor(&good, good.code.exit_prov[1]) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u32, 9), succ.pc);
@@ -1419,7 +1419,7 @@ test "A-vii-d.1 bridged successor terminal: a loop-body successor deopt resumes 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
     state.config.min_useful = 3;
 
     // Same wiring as the A-vii-a replay test, but the bridged successor ends
@@ -1478,8 +1478,8 @@ test "A-vii-d.1 bridged successor terminal: a loop-body successor deopt resumes 
     try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &cont.code);
     try testing.expect(nativegen.isCompositeBridgeCandidate(&cont.code, 3));
     try testing.expect(isLoopDoneGuardIndex(&skip, 0));
-    try state.registry.cache.append(gpa, &cont);
-    try state.registry.cache.append(gpa, &skip);
+    try state.registry.attach(&cont);
+    try state.registry.attach(&skip);
 
     const rid: RegionId = @enumFromInt(92);
     try state.registry.native_physical.armed_links.append(gpa, .{ .parent = &cont, .slot_index = 3, .child = &skip, .kind = .region_bridge, .region_id = rid });
@@ -1526,7 +1526,7 @@ test "A-vii-d.1 bridged .link successor (codex blocker): zero-progress deopt and
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
     state.config.min_useful = 3;
 
     var code: [30]Instr = undefined;
@@ -1574,8 +1574,8 @@ test "A-vii-d.1 bridged .link successor (codex blocker): zero-progress deopt and
     var snap_arena = std.heap.ArenaAllocator.init(gpa);
     defer snap_arena.deinit();
     try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &cont.code);
-    try state.registry.cache.append(gpa, &cont);
-    try state.registry.cache.append(gpa, &skip);
+    try state.registry.attach(&cont);
+    try state.registry.attach(&skip);
     const rid: RegionId = @enumFromInt(93);
     try state.registry.native_physical.armed_links.append(gpa, .{ .parent = &cont, .slot_index = 3, .child = &skip, .kind = .region_bridge, .region_id = rid });
     try state.region_policy.region_defs.put(gpa, rid, .{
@@ -1636,7 +1636,7 @@ test "A-vii-d.1 disarm deferral: disarmAllLinks defers mid-replay-walk; applyPen
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "t", .num_registers = 1 };
     var p_i = [_]IrInstr{.{ .op = .loop }};
@@ -1691,7 +1691,7 @@ test "A-vii-d.1 stale-region lifecycle: a rebuild disarms region_bridge links wh
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "t", .num_registers = 1 };
     var p_i = [_]IrInstr{.{ .op = .loop }};
@@ -1733,7 +1733,7 @@ test "A-vii-d.1 two-phase arming: a terminal composite deopt records ONE pending
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     var code: [32]Instr = undefined;
     @memset(code[0..], Instr.op0(.halt));
@@ -1770,7 +1770,7 @@ test "A-vii-d.1 two-phase arming: a terminal composite deopt records ONE pending
     defer snap_arena.deinit();
     try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &cont.code);
     try testing.expect(nativegen.isCompositeBridgeCandidate(&cont.code, 3));
-    try state.registry.cache.append(gpa, &cont);
+    try state.registry.attach(&cont);
 
     // A terminal composite `.deopt` (the seed's OWN guard) must record the
     // pending request and change nothing else — the armed-link registry stays
@@ -1802,7 +1802,7 @@ test "A-vii-d.1 two-phase arming: a terminal composite deopt records ONE pending
         },
         .id = 822,
     };
-    try state.registry.cache.append(gpa, &plain);
+    try state.registry.attach(&plain);
     const entries2 = [_]trace_exec.LedgerEntry{
         .{ .cum = 1, .id = plain.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
     };
@@ -1814,7 +1814,7 @@ test "replayLedgerSuffix honors the silent cumulative baseline and off-cycle fir
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
     // Put the accounting threshold between the true suffix-local delta (2) and
     // the incorrect zero-based value (7), so a lost baseline changes hit_count.
     state.config.min_useful = 5;
@@ -1849,8 +1849,8 @@ test "replayLedgerSuffix honors the silent cumulative baseline and off-cycle fir
         },
         .id = 902,
     };
-    try state.registry.cache.append(gpa, &inner);
-    try state.registry.cache.append(gpa, &cont);
+    try state.registry.attach(&inner);
+    try state.registry.attach(&cont);
 
     // The fresh walk starts from rbx=0. Its first, nonterminal row advances by 2.
     const fresh_entries = [_]trace_exec.LedgerEntry{
@@ -1924,7 +1924,7 @@ test "replayLedger forced yield (2c-B/2c-E): a CAP-length ledger ending .yielded
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
     const inner_instrs = [_]IrInstr{
@@ -1954,8 +1954,8 @@ test "replayLedger forced yield (2c-B/2c-E): a CAP-length ledger ending .yielded
         },
         .id = 502,
     };
-    try state.registry.cache.append(gpa, &inner);
-    try state.registry.cache.append(gpa, &cont);
+    try state.registry.attach(&inner);
+    try state.registry.attach(&cont);
 
     // Build the CAP-length alternating ledger. Even index = I.loop_done_linked
     // (fused into the next C), odd = C.link_terminal (fused back into the next I),
@@ -2024,7 +2024,7 @@ test "replayLedger convergence (2c-E site 3): a TERMINAL loop_done_linked arms t
     // Drop the hand-built stubs from the cache before deinit: their `page` is
     // undefined, so `destroy`→`native.deinit`→`page.deinit` would fault. We free
     // the two `slots` arrays ourselves below.
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     // code[1] is a for_loop, so the inner's guard_true (exit_pc 2) is a loop-done.
     const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
@@ -2070,8 +2070,8 @@ test "replayLedger convergence (2c-E site 3): a TERMINAL loop_done_linked arms t
         .id = 302,
         .native = .{ .compiled = .{ .page = undefined, .slots = cont_slots, .gpa = gpa, .ordinary_entry = CONT_ORDINARY_ENTRY } },
     };
-    try state.registry.cache.append(gpa, &inner);
-    try state.registry.cache.append(gpa, &cont);
+    try state.registry.attach(&inner);
+    try state.registry.attach(&cont);
 
     // [I.done(fused) → C.link → I.done(terminal)]: the first loop-done fuses into
     // C, C links back to the inner root, and the second loop-done is TERMINAL (no
@@ -2130,7 +2130,7 @@ test "B-4: terminal loop-done resolves positionally — unsupported never shadow
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     // code[1] is a for_loop, so the inner's guard_true (exit_pc 2) is a loop-done.
     const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
@@ -2205,10 +2205,10 @@ test "B-4: terminal loop-done resolves positionally — unsupported never shadow
         .native = .{ .compiled = .{ .page = undefined, .slots = b_slots, .gpa = gpa, .ordinary_entry = B_ENTRY } },
         .hit_count = 5,
     };
-    try state.registry.cache.append(gpa, &inner);
-    try state.registry.cache.append(gpa, &cont_unsup);
-    try state.registry.cache.append(gpa, &cont_a);
-    try state.registry.cache.append(gpa, &cont_b);
+    try state.registry.attach(&inner);
+    try state.registry.attach(&cont_unsup);
+    try state.registry.attach(&cont_a);
+    try state.registry.attach(&cont_b);
 
     var tags: [4]u8 = @splat(0);
     var pays: [4]u64 = @splat(0);
@@ -2259,8 +2259,8 @@ test "B-4: terminal loop-done resolves positionally — unsupported never shadow
     // armed record must be cleared with them (it references stack stubs).
     state.registry.native_physical.armed_links.clearRetainingCapacity();
     inner_slots[0] = 0;
-    state.registry.cache.clearRetainingCapacity();
-    try state.registry.cache.append(gpa, &inner);
+    state.registry.detachAll();
+    try state.registry.attach(&inner);
     linked_completed = 0;
     resume_pc = 0;
     hops = 0;
@@ -2329,8 +2329,8 @@ test "driveChain ordinary_header: chains at the anchor, not a guard's lane ordin
         },
     };
 
-    try state.registry.cache.append(gpa, trace_a);
-    try state.registry.cache.append(gpa, trace_b);
+    try state.registry.attach(trace_a);
+    try state.registry.attach(trace_b);
 
     var regs = [_]Value{ Value.int(0), Value.int(4) };
     // Exclude A (the dispatcher's `visited` set). The driver walks A's anchor
@@ -2341,7 +2341,7 @@ test "driveChain ordinary_header: chains at the anchor, not a guard's lane ordin
     try testing.expect(chained == null);
     try testing.expectEqual(@as(i64, 0), regs[0].asInt()); // r0 untouched — no decoy ran
 
-    state.registry.cache.clearRetainingCapacity();
+    state.registry.detachAll();
     gpa.destroy(trace_a);
     gpa.destroy(trace_b);
 }
@@ -2377,7 +2377,7 @@ test "B-iv.3 (doc 22 §B.5): [I.loop_done_linked, C.prologue_fail] with a SEEDED
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
 
@@ -2417,8 +2417,8 @@ test "B-iv.3 (doc 22 §B.5): [I.loop_done_linked, C.prologue_fail] with a SEEDED
             .seed_prologue = true,
         } },
     };
-    try state.registry.cache.append(gpa, &inner);
-    try state.registry.cache.append(gpa, &cont);
+    try state.registry.attach(&inner);
+    try state.registry.attach(&cont);
 
     // Fresh episode ctx: the fused span just dispatched into the continuation's
     // self-seeding entry within this frame, so drain-time freshness holds.
@@ -2460,7 +2460,7 @@ test "B-iv.3 (doc 22 §B.5): [C.link_terminal, I.seed_hash_decline] with a SEEDE
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
 
@@ -2501,8 +2501,8 @@ test "B-iv.3 (doc 22 §B.5): [C.link_terminal, I.seed_hash_decline] with a SEEDE
             .seed_prologue = true,
         } },
     };
-    try state.registry.cache.append(gpa, &cont);
-    try state.registry.cache.append(gpa, &inner);
+    try state.registry.attach(&cont);
+    try state.registry.attach(&inner);
 
     const ctx = try gpa.create(trace.NativeSeedCtx);
     ctx.* = .{ .seed_fn = seededReplayDummySeed };
@@ -2564,7 +2564,7 @@ test "B-v (doc 22 §B.6): terminal seed-decline placement pin — a fused declin
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
 
@@ -2605,8 +2605,8 @@ test "B-v (doc 22 §B.6): terminal seed-decline placement pin — a fused declin
         },
         .id = 422,
     };
-    try state.registry.cache.append(gpa, &inner);
-    try state.registry.cache.append(gpa, &cont);
+    try state.registry.attach(&inner);
+    try state.registry.attach(&cont);
 
     const ctx = try gpa.create(trace.NativeSeedCtx);
     ctx.* = .{ .seed_fn = seededReplayDummySeed };

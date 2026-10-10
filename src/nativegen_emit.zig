@@ -1746,12 +1746,12 @@ pub fn emitIntDivMod(
 /// (`tostr_int`/`tostr_num` — doc 24 D5). Same shape as `emitHrefCallout`:
 /// save, SysV args (rdi = the baked `*Heap`; the guarded scalar in rsi for the
 /// int body, xmm0 for the float body), call the shared noinline `stralloc`
-/// body through an absolute pointer, stash the result across the restore, then
-/// test-and-exit. A null return is OOM with a CLEAN id stream (no `Heap.link`
-/// preceded the fallible step — stralloc.zig's audit): the ordinary deopt exit
-/// resumes tier-0 at the header and the replay re-raises the same OOM at the
-/// same logical point. On success the `*GcHeader` (kind `.heap`) lands in the
-/// op's home; the restore leaves rcx/rax/xmm0 untouched so it rides through.
+/// body through an absolute pointer, stash the `StrResult` across the
+/// restore, then test-and-exit (`emitStrResultCheck`). A failure word is OOM
+/// with a CLEAN id stream (no `Heap.link` preceded the fallible step —
+/// stralloc.zig's audit): the ordinary deopt exit resumes tier-0 at the
+/// header and the replay re-raises the OOM; a precise trace's stub raises it
+/// in place. On success the `*GcHeader` (kind `.heap`) lands in the op's home.
 pub fn emitTostrCallout(
     a: *x64.Assembler,
     alloc: *const Alloc,
@@ -1785,13 +1785,38 @@ pub fn emitTostrCallout(
     try a.callReg(.rax);
     try a.addRegImm32(.rsp, 8);
 
-    // rax = the interned *GcHeader, or 0 on OOM. The result check must come
-    // AFTER the restore (the deopt flush relies on slot homes being correct),
-    // so stash it in rcx — scratch, never a home, untouched by the restore.
+    try emitStrResultCheck(a, alloc, i, exit_labels);
+}
+
+/// The ops whose callout ends in `emitStrResultCheck` — the allocating
+/// stralloc shims returning a `StrResult`. The precise exit stub keys its
+/// decline/OOM split on this set, so it must match the emitters exactly.
+pub fn isStrAllocOp(op: trace.IrOp) bool {
+    return switch (op) {
+        .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower, .scap_str => true,
+        else => false,
+    };
+}
+
+/// The shared post-call tail of every allocating stralloc callout (doc 45
+/// D5): the shim returned a `StrResult` word in rax. The result check must
+/// come AFTER the restore (the deopt flush relies on slot homes being
+/// correct), so stash it in rcx — scratch, never a home, untouched by the
+/// restore. A word below `StrResult.fail_limit` (unsigned) is a failure →
+/// this instruction's exit. An ordinary stub ignores rcx (tier-0 replays the
+/// iteration); a PRECISE stub is entered straight from the `jcc` with rcx
+/// intact and splits on it: 0 (a decline) resumes, nonzero is the Status it
+/// raises (`.precise_error`). Otherwise rcx is the `*GcHeader`.
+pub fn emitStrResultCheck(
+    a: *x64.Assembler,
+    alloc: *const Alloc,
+    i: usize,
+    exit_labels: []?x64.Label,
+) !void {
     try a.movRegReg(.rcx, .rax);
     try emitCalloutRestore(a, alloc);
-    try a.cmpRegImm32(.rcx, 0);
-    try jccNativeExit(a, exit_labels, i, .e); // 0 → OOM → side-exit
+    try a.cmpRegImm32(.rcx, @intCast(stralloc.StrResult.fail_limit));
+    try jccNativeExit(a, exit_labels, i, .b); // failure word → side-exit / raise
     try regToPlace(a, placeOfRef(alloc, i), .rcx);
 }
 
@@ -1801,20 +1826,20 @@ pub fn emitTostrCallout(
 /// `emitTostrCallout`: save,
 /// SysV args (rdi = the baked `*Heap`, then the op's operands), call the
 /// shared noinline `stralloc` shim — which calls THE SAME core tier-0 runs —
-/// through an absolute pointer, stash the result across the restore, then
-/// test-and-exit. A null return collapses BOTH D5 failure arms (OOM, or the
-/// tier-0 raise: invalid codepoint / negative count) with a CLEAN id stream
+/// through an absolute pointer, stash the `StrResult` across the restore,
+/// then test-and-exit (`emitStrResultCheck`). Both D5 failure arms (OOM, or
+/// the tier-0 raise: invalid codepoint — a decline) leave a CLEAN id stream
 /// (no `Heap.link` preceded the fallible step — stralloc.zig's audit): the
 /// ordinary deopt exit resumes tier-0 at the header and the replay re-raises
-/// the identical error (or re-hits the OOM) at the same logical point. On
-/// success the fresh-or-interned `*GcHeader` (kind `.heap`) lands in the op's
-/// home.
+/// the identical error (or re-hits the OOM) at the same logical point; a
+/// precise stub raises the OOM in place and resumes the decline. On success
+/// the fresh-or-interned `*GcHeader` (kind `.heap`) lands in the op's home.
 ///
 /// Operand staging is hazard-free in any order: homes are r8–r11 / rbp /
 /// r12–r15 / rsp-relative spills — never rsi/rdx/rcx (reserved) — and the
 /// save wrote rdi/rsi/rdx to the frame already. rcx doubles as ssub's fourth
-/// arg AND the post-call result stash; the call consumes the arg before the
-/// stash is written, so there is no conflict.
+/// arg AND the post-call `runtime_error` stash; the call consumes the arg
+/// before the stash is written, so there is no conflict.
 pub fn emitSnewCallout(
     a: *x64.Assembler,
     alloc: *const Alloc,
@@ -1859,15 +1884,7 @@ pub fn emitSnewCallout(
     try a.callReg(.rax);
     try a.addRegImm32(.rsp, 8);
 
-    // rax = the result *GcHeader, or 0 (OOM / tier-0-raise, collapsed). The
-    // result check must come AFTER the restore (the deopt flush relies on
-    // slot homes being correct), so stash it in rcx — scratch, never a home,
-    // untouched by the restore.
-    try a.movRegReg(.rcx, .rax);
-    try emitCalloutRestore(a, alloc);
-    try a.cmpRegImm32(.rcx, 0);
-    try jccNativeExit(a, exit_labels, i, .e); // 0 → side-exit, tier-0 replays
-    try regToPlace(a, placeOfRef(alloc, i), .rcx);
+    try emitStrResultCheck(a, alloc, i, exit_labels);
 }
 
 /// Emit the mid-body callout for `scp` (`string.codepoint`, single result —
@@ -2007,11 +2024,11 @@ pub fn emitMatchCallout(
 
 /// Emit the mid-body callout for `scap_str` (doc 30): intern the span in
 /// scratch slot `ins.b`. The snew protocol verbatim — save, args (rdi = the
-/// baked `*Heap`, rsi = the slot IMMEDIATE), call `scapStrRuntime`, stash the
-/// `*GcHeader` across the restore, null → side-exit (OOM; no `Heap.link`
-/// preceded the failure, so the id stream is clean and tier-0 re-hits the
-/// same OOM on replay). Emitted even when the capture is dead (B02: `.alloc`
-/// ops execute for id-stream fidelity — tropt never DCEs it).
+/// baked `*Heap`, rsi = the slot IMMEDIATE), call `scapStrRuntime`, then the
+/// shared `emitStrResultCheck` tail (a failure word → this op's exit: an OOM or a
+/// stale-scratch decline, neither preceded by a `Heap.link`, so the id stream
+/// is clean). Emitted even when the capture is dead (B02: `.alloc` ops
+/// execute for id-stream fidelity — tropt never DCEs it).
 pub fn emitScapStrCallout(
     a: *x64.Assembler,
     alloc: *const Alloc,
@@ -2030,11 +2047,7 @@ pub fn emitScapStrCallout(
     try a.callReg(.rax);
     try a.addRegImm32(.rsp, 8);
 
-    try a.movRegReg(.rcx, .rax);
-    try emitCalloutRestore(a, alloc);
-    try a.cmpRegImm32(.rcx, 0);
-    try jccNativeExit(a, exit_labels, i, .e); // null → side-exit (OOM)
-    try regToPlace(a, placeOfRef(alloc, i), .rcx);
+    try emitStrResultCheck(a, alloc, i, exit_labels);
 }
 
 /// Emit the mid-body callout for `str2num_i`/`str2num_f` (doc 30): the ONE

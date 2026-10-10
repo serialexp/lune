@@ -559,15 +559,14 @@ pub fn resolveRegionBridgeChild(
 ) ?*Trace {
     var best: ?*Trace = null;
     var best_hits: u64 = 0;
-    for (self.registry.cache.items) |t| {
+    var it = self.registry.tracesAt(bridge.successor);
+    while (it.next()) |t| {
         // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
         // selection. Suppression deadlocks: a skipped trace can never be
         // entered, so the counter can never reset. The refusal is already
         // free (no anchor penalty), so the cost of a futile prologue
         // attempt is one native call + ledger row per dispatch — bounded
         // by the caller's own iteration count, not by the counter.
-        if (t.code.anchor.proto != bridge.successor.proto or t.code.anchor.pc != bridge.successor.pc)
-            continue;
         if (!self.traceInRegion(t.id, id)) continue;
         if (best == null or t.hit_count > best_hits) {
             best = t;
@@ -1648,9 +1647,9 @@ pub fn gateNativeUnsupported(self: *TraceState, anchor: AnchorKey) void {
     // sibling proveKinds-bailed; 176 native entries in 101M passes). A
     // rare cold scan (this path runs only on unproductive walk ends), and
     // an anchor whose traces are ALL unsupported still gates as before.
-    for (self.registry.cache.items) |t| {
-        if (t.code.anchor.proto == anchor.proto and t.code.anchor.pc == anchor.pc and
-            t.native == .compiled) return;
+    var it = self.registry.tracesAt(anchor);
+    while (it.next()) |t| {
+        if (t.native == .compiled) return;
     }
     self.gateAnchor(anchor, .native_unsupported);
 }
@@ -1706,7 +1705,7 @@ fn topologyView(self: *TraceState, scratch: std.mem.Allocator) !topology.View {
         if (p.code.anchor.proto.id != c.code.anchor.proto.id or p.code.anchor.pc != c.code.anchor.pc) continue;
         try links.append(scratch, .{ .parent_id = edge.parent_id, .child_id = edge.child_id });
     }
-    return .{ .traces = records, .sibling_links = links.items };
+    return topology.View.init(scratch, records, links.items);
 }
 
 pub fn rebuildEdgeCacheFallible(self: *TraceState) !void {
@@ -1740,6 +1739,7 @@ pub fn rebuildRegions(self: *TraceState) void {
     // flag so a normal (commit/removal-driven) rebuild isn't followed by a
     // redundant deferred one.
     self.pending_region_rebuild = false;
+    self.region_rebuilds +|= 1;
     self.rebuildRegionsFallible() catch {
         self.clearPhysicalRegionIndices();
         // A-vii-d.1 (review blocker 3): the physical indices failed closed

@@ -278,8 +278,8 @@ test "gate-fix consumption boundary: qualified activations own member barren rec
         },
         .id = 9,
     };
-    try state.registry.cache.append(gpa, &member); // traceById must resolve it (membership test)
-    defer state.registry.cache.clearRetainingCapacity(); // stack-backed traces: never destroy()
+    try state.registry.attach(&member); // traceById must resolve it (membership test)
+    defer state.registry.detachAll(); // stack-backed traces: never destroy()
     var nonmember: Trace = .{
         .code = .{
             .anchor = .{ .proto = &proto, .pc = 5 },
@@ -865,8 +865,8 @@ test "doc 33: max consecutive refusals are tracked but do not suppress selection
         .entry_slots = &.{},
         .entry_guards = &.{},
     }, .id = 1, .hit_count = 10 };
-    try state.registry.cache.append(gpa, &refused);
-    defer state.registry.cache.clearRetainingCapacity();
+    try state.registry.attach(&refused);
+    defer state.registry.detachAll();
 
     var i: u32 = 0;
     while (i < state.config.max_entry_refusals) : (i += 1)
@@ -930,9 +930,9 @@ test "doc 33: a maxed refusal counter does not suppress the candidate from selec
         .entry_slots = &.{},
         .entry_guards = &.{},
     }, .id = 2, .hit_count = 1 };
-    try state.registry.cache.append(gpa, &refused);
-    try state.registry.cache.append(gpa, &sibling);
-    defer state.registry.cache.clearRetainingCapacity();
+    try state.registry.attach(&refused);
+    try state.registry.attach(&sibling);
+    defer state.registry.detachAll();
 
     // findTrace returns the highest-hit candidate; the maxed counter does not
     // exclude it. Both candidates remain eligible, and the anchor is not gated.

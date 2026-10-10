@@ -427,8 +427,14 @@ pub const TraceCode = struct {
     instunrolled: u8 = 0,
     /// Owned SSA instruction array. Frozen after publication.
     instrs: []IrInstr,
-    /// Owned constants, including heap values rooted by the runtime while live.
+    /// Owned constants. Heap values here are NOT rooted (doc 61 §7.1): a
+    /// collection that is about to sweep one retires the trace first
+    /// (`heap_consts`, `Vm.invalidateDeadTraceConsts`).
     consts: []Value,
+    /// Doc 61 §7.1 item 3: the indices into `consts` that hold heap values,
+    /// built from the full final pool at finalize. The collector scans these
+    /// between mark and sweep. Owned; freed in `deinit`.
+    heap_consts: []u32 = &.{},
     entry_slots: []u16,
     /// Immutable entry contract; runtime-only means nonserialized, not mutable.
     inputs: []InputSeed = &.{},
@@ -496,6 +502,7 @@ pub const TraceCode = struct {
     pub fn deinit(self: *TraceCode, gpa: std.mem.Allocator) void {
         gpa.free(self.instrs);
         gpa.free(self.consts);
+        if (self.heap_consts.len != 0) gpa.free(self.heap_consts);
         gpa.free(self.entry_slots);
         gpa.free(self.entry_guards);
         if (self.inputs.len != 0) gpa.free(self.inputs);

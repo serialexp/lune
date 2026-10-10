@@ -72,7 +72,7 @@ fn makeB3LinkTrace(
     t.native = .{ .compiled = nativegen.compileInto(gpa, &state.registry.mcode_arena, &(t).code, (t).id, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
-    try state.registry.cache.append(gpa, t);
+    try state.registry.attach(t);
     return t;
 }
 
@@ -113,7 +113,7 @@ fn makeB3GuardTrace(
     t.native = .{ .compiled = nativegen.compileInto(gpa, &state.registry.mcode_arena, &(t).code, (t).id, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
-    try state.registry.cache.append(gpa, t);
+    try state.registry.attach(t);
     return t;
 }
 
@@ -154,7 +154,7 @@ fn makeB3LoopDoneTrace(
     t.native = .{ .compiled = nativegen.compileInto(gpa, &state.registry.mcode_arena, &(t).code, (t).id, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
-    try state.registry.cache.append(gpa, t);
+    try state.registry.attach(t);
     return t;
 }
 
@@ -210,7 +210,7 @@ fn makeB3BridgeTrace(
     t.native = .{ .compiled = nativegen.compileInto(gpa, &state.registry.mcode_arena, &(t).code, (t).id, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
-    try state.registry.cache.append(gpa, t);
+    try state.registry.attach(t);
     return t;
 }
 
@@ -255,7 +255,7 @@ fn makeB3BridgeSuccessorTrace(
     t.native = .{ .compiled = nativegen.compileInto(gpa, &state.registry.mcode_arena, &(t).code, (t).id, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
-    try state.registry.cache.append(gpa, t);
+    try state.registry.attach(t);
     return t;
 }
 
@@ -297,7 +297,7 @@ fn makeB3M1RampTrace(
     t.native = .{ .compiled = nativegen.compileInto(gpa, &state.registry.mcode_arena, &(t).code, (t).id, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
-    try state.registry.cache.append(gpa, t);
+    try state.registry.attach(t);
     return t;
 }
 
@@ -3028,7 +3028,7 @@ test "an armed bridge out of a `.loop` source commits the carried homes its loca
         bridge.native = .{ .compiled = nativegen.compileInto(gpa, &state.registry.mcode_arena, &bridge.code, bridge.id, null, null) orelse
             return error.NativeBailedUnexpectedly };
         errdefer bridge.native.deinit();
-        try state.registry.cache.append(gpa, bridge);
+        try state.registry.attach(bridge);
     }
     const succ = try makeB3LinkTrace(gpa, &state, &proto, 62, 9, 20);
     const rid: RegionId = @enumFromInt(1719);

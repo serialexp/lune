@@ -43,7 +43,15 @@ as they land; move bullets to Done once everything inside them is checked.
 
   **The design (§7.1 rev 3) is approved by codex and antigravity**
   (2026-10-10; receipts in `docs/reviews/doc61/phaseQ-rev1.md`). Codex's
-  rev 3 should-fixes are folded in. Implementation is next.
+  rev 3 should-fixes are folded in.
+
+  **Implemented (2026-10-10).** The implementation review's blockers are
+  fixed (the widen-eviction double retire, recorder OOM on prep-link,
+  `McodeArena.free` allocating on the collection path). Step 8's drain
+  stays at the safe point (see step 8). R(T)'s superlinearity is fixed in
+  the same change (registry anchor index, indexed per-component topology
+  build). Open before ticking: the implementation review's missing tests
+  (CURRENT_TASK.md lists them).
 - [ ] **Phase V — visualiser labels dead slots.** Its liveness source must be
       tier-identical data. Options are an exported per-frame live mask in the
       snapshot, or `reg_live` re-derived from the proto and the frame
@@ -1287,6 +1295,22 @@ tier roots today. That is why it did not diverge.) This is the Phase Q test.
       scans proto bytecode for loop anchors, so its result is cached on the
       entry patch when the patch is created. The drain then does no bytecode
       work.
+
+      **As built: the drain runs at the next safe point, not inside the
+      collection.** Step 4 leaves the doomed traces' patches non-live and
+      pending; `removeTraces` does not call `drainEntryPatchWork`. An
+      install moves `image_gen`, and a collection can run under a frame
+      that holds a cached image pointer it cannot re-resolve there (the
+      reason recorder-abort marks are already deferred). A non-live patch
+      dispatched before the drain takes the §R6-1 recovery arm, which
+      restores the slot synchronously and runs the original instruction, so
+      the deferred state is sound. The drain itself is one pass over the
+      entry patches and one over the cache: restores first, owners unbound
+      by id (`EntryPatch.owner_retired` skips retired owners), waiters
+      woken in the same cache pass, installs sorted by id from
+      `batch_scratch`. It needs no anchor index, because each install
+      touches only its own trace and the image check for an incumbent is
+      O(1).
 
    **Budget.** Steps 1–6 and 8 are O(T + L + P + E + D + X), where T is
    surviving traces, L armed links, P parked proofs and promoted-set

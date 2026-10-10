@@ -64,7 +64,6 @@ const runCaptured = util.runCaptured;
 fn recordRun(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer) ![]u8 {
     const parser = @import("parser.zig");
     const diag = @import("diag.zig");
-    const traceser = @import("traceser.zig");
 
     var diags = diag.Diagnostics.init(gpa);
     defer diags.deinit();
@@ -84,10 +83,7 @@ fn recordRun(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer) ![]
 
     _ = try vm.run(chunk.proto);
     // Self-contained wire bytes (copied out of the cache), safe past `vm.deinit`.
-    const codes = try gpa.alloc(*const trace.TraceCode, vm.trace.registry.cache.items.len);
-    defer gpa.free(codes);
-    for (vm.trace.registry.cache.items, codes) |record, *code| code.* = &record.code;
-    return traceser.encodeFile(gpa, codes);
+    return vm.trace.encodeTraceFile(gpa);
 }
 
 /// Run `source` (no tracing — a keyframe is a heap artifact, independent of the

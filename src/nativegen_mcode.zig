@@ -153,12 +153,18 @@ pub const McodeArena = struct {
 
     /// A returned slot available for reuse. `cap` is the slot's 16-aligned capacity.
     const FreeBlock = struct { region: u32, offset: usize, cap: usize };
-    const LivePage = struct { region: u32, offset: usize, generation: u64 };
+    const LivePage = struct { region: u32, offset: usize };
 
     gpa: std.mem.Allocator,
     regions: std.ArrayListUnmanaged(Region) = .empty,
+    /// Invariant: `capacity >= len + live_pages.count()`, reserved by `alloc`,
+    /// so `free` never allocates — a collection retiring a batch of compiled
+    /// traces frees their pages without touching the allocator (doc 61 §7.1).
     free_list: std.ArrayListUnmanaged(FreeBlock) = .empty,
-    live_pages: std.ArrayListUnmanaged(LivePage) = .empty,
+    /// Pages handed out and not yet freed, keyed by their unique generation:
+    /// `free` validates and removes in O(1) (a linear scan made a batch
+    /// retirement of D pages O(D·P) — codex Phase Q review).
+    live_pages: std.AutoHashMapUnmanaged(u64, LivePage) = .empty,
     next_page_generation: u64 = 1,
     /// The shared frameless trampoline (P-A / doc 17 Increment 2), emitted lazily on
     /// the first `compileInto`. Absolute addresses into a permanent arena slot that is
@@ -288,6 +294,11 @@ pub const McodeArena = struct {
         if (comptime !is_x64_linux) return error.UnsupportedTarget;
         std.debug.assert(code.len > 0);
         const cap = std.mem.alignForward(usize, code.len, ENTRY_ALIGN);
+        // Reserve before any mutation: the new live entry, and free-list room
+        // for every live page (including this one) to come back without
+        // allocating (see `free_list`).
+        try self.live_pages.ensureUnusedCapacity(self.gpa, 1);
+        try self.free_list.ensureTotalCapacity(self.gpa, self.free_list.items.len + self.live_pages.count() + 1);
 
         // 1. First-fit reuse of a retired slot.
         for (self.free_list.items, 0..) |fb, i| {
@@ -297,7 +308,7 @@ pub const McodeArena = struct {
                 @memcpy(region_mem[fb.offset..][0..code.len], code);
                 try protectWindow(region_mem, fb.offset, code.len, true);
                 const generation = self.takePageGeneration();
-                try self.live_pages.append(self.gpa, .{ .region = fb.region, .offset = fb.offset, .generation = generation });
+                self.live_pages.putAssumeCapacityNoClobber(generation, .{ .region = fb.region, .offset = fb.offset });
                 _ = self.free_list.swapRemove(i);
                 return .{
                     .code = region_mem[fb.offset..][0..code.len],
@@ -325,7 +336,7 @@ pub const McodeArena = struct {
         @memcpy(region.mem[off..][0..code.len], code);
         try protectWindow(region.mem, off, code.len, true);
         const generation = self.takePageGeneration();
-        try self.live_pages.append(self.gpa, .{ .region = region_idx, .offset = off, .generation = generation });
+        self.live_pages.putAssumeCapacityNoClobber(generation, .{ .region = region_idx, .offset = off });
         region.used += cap;
         return .{
             .code = region.mem[off..][0..code.len],
@@ -340,21 +351,13 @@ pub const McodeArena = struct {
         return generation;
     }
 
-    /// Return a slot to the free-list. Best-effort: on OOM the slot is simply leaked
-    /// back into the region (dead space until arena deinit) — never fatal.
+    /// Return a slot to the free-list. O(1) and allocation-free (the free-list
+    /// room was reserved when the page was handed out). A stale or repeated
+    /// free (generation not live, or naming a different slot) is ignored.
     pub fn free(self: *McodeArena, region: u32, offset: usize, cap: usize, generation: u64) void {
-        var i: usize = self.live_pages.items.len;
-        var removed = false;
-        while (i > 0) {
-            i -= 1;
-            const live = self.live_pages.items[i];
-            if (live.region == region and live.offset == offset and live.generation == generation) {
-                _ = self.live_pages.swapRemove(i);
-                removed = true;
-                break;
-            }
-        }
-        if (!removed) return;
-        self.free_list.append(self.gpa, .{ .region = region, .offset = offset, .cap = cap }) catch {};
+        const live = self.live_pages.get(generation) orelse return;
+        if (live.region != region or live.offset != offset) return;
+        _ = self.live_pages.remove(generation);
+        self.free_list.appendAssumeCapacity(.{ .region = region, .offset = offset, .cap = cap });
     }
 };

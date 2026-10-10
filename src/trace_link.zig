@@ -36,6 +36,8 @@ const PromotedEdge = trace_mod.PromotedEdge;
 const ArmKind = trace_mod.ArmKind;
 const EntryPatch = trace_mod.EntryPatch;
 const EntryPatchState = trace_mod.EntryPatchState;
+const EntryRegistryT = trace_mod.trace_entry_registry.EntryRegistry;
+const TraceRegistry = @import("trace_registry.zig").TraceRegistry;
 const Gate = trace_mod.Gate;
 const GateReason = trace_mod.GateReason;
 const AnchorKey = trace_mod.AnchorKey;
@@ -427,7 +429,7 @@ pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: u
     // after the whole sibling walk declines.
     if (trace_mod.anchorKind(t.code.anchor.pc) != .loop) {
         if (self.wants_head_sibling != null) return;
-        if (self.anchorPopulation(t) >= self.config.max_traces_per_anchor) return;
+        if (self.countTracesAt(t.code.anchor) >= self.config.max_traces_per_anchor) return;
         self.dbg("hotexit: trace id={d} exit={d} count={d} -> want HEAD sibling", .{ t.id, exit_instr, c.* });
         self.wants_head_sibling = t.code.anchor;
         self.head_want_src = .{ .trace_id = t.id, .exit_instr = exit_instr };
@@ -443,7 +445,7 @@ pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: u
     };
     if (branch) {
         if (self.wants_prime_side != null) return;
-        if (self.anchorPopulation(t) >= 2) return;
+        if (self.countTracesAt(t.code.anchor) >= 2) return;
         self.dbg("hotexit: trace id={d} exit={d} count={d} -> want PRIME side at pc={d}", .{ t.id, exit_instr, c.*, t.code.anchor.pc });
         self.wants_prime_side = t.code.anchor;
         self.prime_want_src = .{ .trace_id = t.id, .exit_instr = exit_instr };
@@ -452,7 +454,7 @@ pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: u
         self.markEntryPatchesAt(t.code.anchor);
     } else if (completed == 0) {
         if (self.wants_side_trace != null) return;
-        if (self.anchorPopulation(t) >= self.config.max_traces_per_anchor) return;
+        if (self.countTracesAt(t.code.anchor) >= self.config.max_traces_per_anchor) return;
         self.dbg("hotexit: trace id={d} exit={d} count={d} -> want side at pc={d}", .{ t.id, exit_instr, c.*, t.code.anchor.pc });
         self.wants_side_trace = t.code.anchor;
         self.side_want_src = .{ .trace_id = t.id, .exit_instr = exit_instr };
@@ -805,35 +807,17 @@ pub fn hasArmedSourceBranchLinkAt(self: *const TraceState, parent: *Trace, slot:
 
 /// How many cached traces are at this anchor? `pub` so the dispatcher's M1 fused
 /// consumer (interp.zig) can assert the skip+prime-side pair coexist (≥ 2).
+/// O(1): the registry's anchor index keeps the count.
 pub fn countTracesAt(self: *const TraceState, anchor: AnchorKey) usize {
-    var n: usize = 0;
-    for (self.registry.cache.items) |t| {
-        if (t.code.anchor.proto == anchor.proto and t.code.anchor.pc == anchor.pc) n += 1;
-    }
-    return n;
-}
-
-/// Memoized `countTracesAt(t.code.anchor)` for per-receipt hot paths
-/// (`noteTakenExit`): one gen compare in steady state, full scan only after a
-/// cache mutation (`cache_gen` bump). Results are identical to the scan by
-/// construction.
-pub fn anchorPopulation(self: *const TraceState, t: *Trace) usize {
-    if (t.anchor_pop_gen != self.registry.cache_gen) {
-        t.anchor_pop = @intCast(self.countTracesAt(t.code.anchor));
-        t.anchor_pop_gen = self.registry.cache_gen;
-    }
-    return t.anchor_pop;
+    return self.registry.countAt(anchor);
 }
 
 /// True iff some cached trace at `(proto, pc)` has inner-loop-root shape. Used by
 /// `.link_terminal` successor resolution (A-ii.2) to confirm the named inner root
 /// is bound — the `isInnerLoopRoot` shape (`inputs.len == 0` + `.loop` terminal)
-/// that `findLoopTrace` omits.
+/// that `findLoopTrace` omits. O(1) through the registry's anchor index.
 pub fn hasInnerRootAt(self: *const TraceState, proto: *const Proto, pc: u32) bool {
-    for (self.registry.cache.items) |t| {
-        if (isInnerLoopRoot(t, proto, pc)) return true;
-    }
-    return false;
+    return self.registry.innerRootAt(.{ .proto = proto, .pc = pc });
 }
 
 pub const SuccAnchor = struct { proto_id: u32, pc: u32 };
@@ -2377,63 +2361,125 @@ pub fn disarmStaleRegionBridgeLinks(self: *TraceState, live_armable: []const Reg
 /// mid-iteration over the cache through this trace (see the dispatch loop,
 /// which defers eviction until after its same-anchor walk completes).
 pub fn removeTrace(self: *TraceState, t: *Trace) void {
-    for (self.registry.cache.items) |c| {
-        if (c == t) {
-            const anchor = t.code.anchor;
-            if (comptime jitdbg.enabled) if (self.config.debug_log) {
-                // Same lane summary as the commit probe: correlating WHICH
-                // sibling was removed is the point of this line (doc 48
-                // alternating-lane churn diagnosis; codex round-2).
-                var lanes: [4]i32 = .{ -1, -1, -1, -1 };
-                var nl: usize = 0;
-                for (t.code.instrs) |ins| {
-                    if (ins.op == .guard_lane and nl < lanes.len) {
-                        lanes[nl] = ins.aux;
-                        nl += 1;
-                    }
-                }
-                self.dbg("trace-retire: t={d} anchor pc={d} proto={s} lanes={any}", .{ t.id, anchor.pc, anchor.proto.name, lanes[0..nl] });
-            };
-            // B-2a / §B.6: logical relation deletion is immediate at the
-            // retirement source; physical link teardown remains P-E's job.
-            self.retireProvenanceEdgesTouching(t.id);
-            self.registry.native_physical.debug_log = self.config.debug_log;
-            _ = self.registry.retire(t);
-            self.syncNativeInvalidation();
-            // Reopen the anchor for re-recording. `onBackEdge` only arms when
-            // its hot-counter *crosses* `hotloop` (a one-shot `==`), so an
-            // anchor whose counter is already past that point would never
-            // re-record after losing its trace — the loop would run the rest
-            // fully tier-0. Resetting the counter lets the next `hotloop`
-            // back-edges re-arm a recording, which now observes the
-            // stabilised wider lane. Only do this once the anchor has no
-            // traces left (a still-populated anchor re-records via its own
-            // side-trace path and `hasTrace` would block re-arming anyway).
-            // Bounded by the lattice depth: an anchor widens at most
-            // value←i64←i32←i16←i8 / boolean / f64 times before it stabilises.
-            if (self.countTracesAt(anchor) == 0) {
-                if (self.counters.getPtr(anchor)) |cnt| cnt.* = 0;
-                // Coverage (gated): the anchor no longer has a trace, so tier-0
-                // back-edges taken during the re-recording window must classify
-                // as *uncovered* again, not "fallback despite a trace". Clear the
-                // flag; `markAnchorTraced`/`noteTraceIters` re-set it if a fresh
-                // trace commits here. (Total iteration count is unaffected either
-                // way — only the covered/uncovered split.)
-                if (self.config.coverage) {
-                    if (self.coverage.getPtr(anchor)) |cov| cov.has_trace = false;
+    if (self.traceById(t.id) != t) return;
+    const one = [_]*Trace{t};
+    self.removeTraces(&one);
+}
+
+/// Retire a batch of published traces at once (doc 61 §7.1 item 5): the
+/// collector's dead-constant invalidation and widen-eviction both land here,
+/// and `removeTrace` is the one-element case. `doomed` holds distinct cached
+/// traces. No guest or trace code runs inside, so nothing observes a
+/// half-torn graph. Allocation-free apart from the graph rebuilds, which keep
+/// their fail-closed OOM rule.
+///
+/// Cost: O(T + L + P + E + D) for the teardown, where T is the cache,
+/// L armed links, P parked proofs and promoted-set edges, E provenance edges,
+/// D doomed traces; plus ONE `rebuildEdgeCache` + `rebuildRegions`, the same
+/// R(T) every commit already pays, whatever D is.
+pub fn removeTraces(self: *TraceState, doomed: []const *Trace) void {
+    if (doomed.len == 0) return;
+    // Step 2: mark the batch. Records stay allocated until step 6, so the
+    // anchors stay readable after the cache is compacted.
+    for (doomed) |t| {
+        // Every member must be a live, published trace: a batch submitted
+        // twice would hand us destroyed records (see `Vm.WalkDead`).
+        std.debug.assert(self.traceById(t.id) == t);
+        std.debug.assert(!t.doomed);
+        t.doomed = true;
+        if (comptime jitdbg.enabled) if (self.config.debug_log) {
+            // Same lane summary as the commit probe: correlating WHICH
+            // sibling was removed is the point of this line (doc 48
+            // alternating-lane churn diagnosis; codex round-2).
+            var lanes: [4]i32 = .{ -1, -1, -1, -1 };
+            var nl: usize = 0;
+            for (t.code.instrs) |ins| {
+                if (ins.op == .guard_lane and nl < lanes.len) {
+                    lanes[nl] = ins.aux;
+                    nl += 1;
                 }
             }
-            // A-ii.2: a retired trace changes which edges remain resolvable for
-            // SURVIVING traces (not just its own), so rebuild the whole edge cache
-            // from the surviving cache — never a surgical key delete. Any OOM fails
-            // closed to EMPTY (region-neutral).
-            self.rebuildEdgeCache();
-            // A-ii.4: rebuild the physical region indices from the surviving graph
-            // (region_defs persists; the physical indices fail closed to EMPTY on OOM).
-            self.rebuildRegions();
-            return;
+            self.dbg("trace-retire: t={d} anchor pc={d} proto={s} lanes={any}", .{ t.id, t.code.anchor.pc, t.code.anchor.proto.name, lanes[0..nl] });
+        };
+    }
+    // Step 3, logical: B-2a / §B.6 relation deletion is immediate at the
+    // retirement source, and wants/requests sourced from a doomed exit are
+    // dropped (they are carried into recordings without resolving).
+    retireProvenanceEdgesTouchingDoomed(self);
+    dropWantsFromDoomed(self);
+    dropExecLogsOfDoomed(self);
+    // Steps 3 (physical) and 4.
+    self.registry.native_physical.debug_log = self.config.debug_log;
+    self.registry.unpublishDoomed(doomed);
+    self.retired_traces +|= doomed.len;
+    self.retire_batches +|= 1;
+    // Step 5: reopen anchors left with no trace. `onBackEdge` only arms when
+    // its hot-counter *crosses* `hotloop` (a one-shot `==`), so an anchor
+    // whose counter is already past that point would never re-record after
+    // losing its trace — the loop would run the rest fully tier-0. Resetting
+    // the counter lets the next `hotloop` back-edges re-arm a recording
+    // (which, for widen-eviction, observes the stabilised wider lane). Only
+    // once the anchor has no traces left (a still-populated anchor
+    // re-records via its own side-trace path and `hasTrace` would block
+    // re-arming anyway). The registry's anchor index already counts the
+    // survivors, so each doomed anchor is one O(1) lookup; repeating the
+    // reset for a second doomed trace at the same anchor is idempotent.
+    for (doomed) |t| {
+        const anchor = t.code.anchor;
+        if (self.registry.countAt(anchor) != 0) continue;
+        if (self.counters.getPtr(anchor)) |cnt| cnt.* = 0;
+        // Coverage (gated): the anchor no longer has a trace, so tier-0
+        // back-edges taken during the re-recording window must classify as
+        // *uncovered* again, not "fallback despite a trace". Clear the flag;
+        // `markAnchorTraced`/`noteTraceIters` re-set it if a fresh trace
+        // commits here.
+        if (self.config.coverage) {
+            if (self.coverage.getPtr(anchor)) |cov| cov.has_trace = false;
         }
     }
+    // Step 6.
+    TraceRegistry.destroyDoomed(self.gpa, doomed);
+    // Step 7. A-ii.2: a retired trace changes which edges remain resolvable
+    // for SURVIVING traces, so rebuild the whole edge cache from the
+    // surviving cache — never a surgical key delete. A-ii.4: then the
+    // physical region indices. Either fails closed to EMPTY on OOM.
+    self.syncNativeInvalidation();
+    self.rebuildEdgeCache();
+    self.rebuildRegions();
+}
+
+/// Doc 61 §7.1 item 4: a want or recording request whose source exit is on
+/// a doomed trace is dropped with its source, so no recording starts from a
+/// retired exit. The anchor half goes too: a null source means something
+/// else for these requests (a loop-done continuation, a fingerprint-miss
+/// side want), so keeping the anchor would change what gets recorded.
+fn dropWantsFromDoomed(self: *TraceState) void {
+    if (srcDoomed(self, self.side_want_src)) {
+        self.wants_side_trace = null;
+        self.side_want_src = null;
+    }
+    if (srcDoomed(self, self.head_want_src)) {
+        self.wants_head_sibling = null;
+        self.head_want_src = null;
+    }
+    if (srcDoomed(self, self.prime_want_src)) {
+        self.wants_prime_side = null;
+        self.prime_want_src = null;
+    }
+    if (srcDoomed(self, self.pending_exit_src)) {
+        self.setPendingExitAnchor(null);
+        self.pending_exit_src = null;
+    }
+    if (srcDoomed(self, self.pending_replay_src)) {
+        self.setPendingReplayAnchor(null);
+        self.pending_replay_src = null;
+    }
+}
+
+fn srcDoomed(self: *const TraceState, src: ?ExitKey) bool {
+    const k = src orelse return false;
+    const t = self.traceById(k.trace_id) orelse return false;
+    return t.doomed;
 }
 
 /// Retire the entire trace cache mid-VM-life, freeing every trace and resetting
@@ -2541,21 +2587,39 @@ pub fn markEntryPatchesAt(self: *TraceState, anchor: AnchorKey) void {
 /// Early-outs on the dirty counter, so a quiet turn costs one load.
 pub fn drainEntryPatchWork(self: *TraceState) void {
     if (!self.registry.entry_registry.takeDirty()) return;
-    for (self.registry.entry_registry.entry_patches.items, 0..) |p, i| {
+    const er = &self.registry.entry_registry;
+    // Unpatch pass: restore every pending slot, then unbind owners by id and
+    // wake waiters in ONE cache pass (doc 61 §7.1 item 5 step 8 — per-slot
+    // waiter scans made a mass retirement O(D·T)). `wakeWaiter` reads the
+    // tombstones, so waking after the batch equals waking after each.
+    var restored = false;
+    for (er.entry_patches.items, 0..) |p, i| {
         if (p.tombstone or !p.pending_unpatch) continue;
-        self.unpatchSlot(@intCast(i));
+        const owner_retired = p.owner_retired;
+        const owner_id = er.restoreSlot(@intCast(i));
+        self.dbg("entry-patch unpatch: patch_pc={d} slot={d} trace={d}", .{ p.patch_pc, i, owner_id });
+        // A retired owner has nothing to unbind (and no by-id entry to find).
+        if (!owner_retired) if (self.traceById(owner_id)) |owner| EntryRegistryT.unbindOwner(owner);
+        restored = true;
     }
-    // Install pass: pending marks live on traces, found by cache scan
-    // (drains are rare — only a dirty turn pays this). Ascending-id
-    // selection keeps sibling ties deterministic without allocating.
-    while (true) {
-        var best: ?*Trace = null;
-        for (self.registry.cache.items) |t| {
-            if (t.entry_patch != .pending) continue;
-            if (best == null or t.id < best.?.id) best = t;
-        }
-        self.installPending(best orelse break);
+    // Install pass: pending marks live on traces. Collect them in one cache
+    // pass and install in ascending id order (§R3-1 rule 3 deterministic
+    // sibling ties). `batch_scratch` has capacity ≥ the cache, reserved at
+    // publish. `installPending` touches only its own trace, so a sorted
+    // batch equals repeated min-selection.
+    const pending = &self.registry.batch_scratch;
+    pending.clearRetainingCapacity();
+    for (self.registry.cache.items) |t| {
+        if (restored) er.wakeWaiter(t);
+        if (t.entry_patch == .pending) pending.appendAssumeCapacity(t);
     }
+    std.sort.pdq(*Trace, pending.items, {}, traceIdLess);
+    for (pending.items) |t| self.installPending(t);
+    pending.clearRetainingCapacity();
+}
+
+fn traceIdLess(_: void, a: *Trace, b: *Trace) bool {
+    return a.id < b.id;
 }
 
 /// §R4-1 revalidate-then-install for one `.pending` trace. `.pending` is
@@ -2663,11 +2727,9 @@ pub fn clearCache(self: *TraceState) void {
 
     // Trace-index-keyed and `*Proto`-borrowing diagnostic state — unsafe to retain
     // across the boundary (docs/design/17 H-2 part 3):
-    //  * `exec_logs` are keyed by `trace_id` == cache index, so a cleared cache
-    //    would alias epoch N's log at index 0; and log events can hold string
-    //    `Value`s that are NOT in the GC root walk, so a later sweep would dangle
-    //    them once the trace-const root is gone. Free them and drop the recorder's
-    //    current log target.
+    //  * `exec_logs` describe traces this clear destroys (keyed by `Trace.id`,
+    //    and WASM emits only surviving trace records). Free them and drop the
+    //    recorder's current log target.
     for (self.exec_logs.items) |*l| l.deinit(self.gpa);
     self.exec_logs.clearRetainingCapacity();
     if (self.exec_recorder) |*r| r.log = null;
@@ -2710,6 +2772,46 @@ pub fn retireProvenanceEdgesTouching(self: *TraceState, trace_id: u32) void {
         if (edge.parent_id == trace_id or edge.child_id == trace_id)
             _ = self.provenance_edges.swapRemove(i);
     }
+}
+
+/// Batch form of `retireProvenanceEdgesTouching` (doc 61 §7.1 item 5 step
+/// 3): one order-preserving pass, endpoints resolved by id. Runs before the
+/// cache is compacted, so a doomed endpoint still resolves.
+fn retireProvenanceEdgesTouchingDoomed(self: *TraceState) void {
+    var w: usize = 0;
+    for (self.provenance_edges.items) |edge| {
+        if (idDoomed(self, edge.parent_id) or idDoomed(self, edge.child_id)) continue;
+        self.provenance_edges.items[w] = edge;
+        w += 1;
+    }
+    self.provenance_edges.shrinkRetainingCapacity(w);
+}
+
+fn idDoomed(self: *const TraceState, id: u32) bool {
+    const t = self.traceById(id) orelse return false;
+    return t.doomed;
+}
+
+/// Doc 61 §7.1 item 7: a retired trace's execution log is dropped with it.
+/// WASM emits only surviving trace records, so an orphaned log could never
+/// be shown. Runs before the cache is compacted (ids still resolve).
+fn dropExecLogsOfDoomed(self: *TraceState) void {
+    if (self.exec_logs.items.len == 0) return;
+    var w: usize = 0;
+    for (self.exec_logs.items) |log| {
+        if (idDoomed(self, log.trace_id)) {
+            var dead = log;
+            dead.deinit(self.gpa);
+            continue;
+        }
+        self.exec_logs.items[w] = log;
+        w += 1;
+    }
+    self.exec_logs.shrinkRetainingCapacity(w);
+    // Compaction moved the survivors, so the recorder's target pointer is
+    // stale. No entry is in flight here (retirement never runs inside a
+    // trace execution), and `execRecorderFor` retargets before the next one.
+    if (self.exec_recorder) |*r| r.log = null;
 }
 
 /// Part B-2a / §B.6: delete relations owned by parent traces at `anchor`.

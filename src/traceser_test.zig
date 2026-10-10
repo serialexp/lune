@@ -25,10 +25,7 @@ const Diagnostics = @import("diag.zig").Diagnostics;
 const io = @import("io.zig");
 
 fn encodeVmTraces(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
-    const codes = try gpa.alloc(*const TraceCode, vm.trace.registry.cache.items.len);
-    defer gpa.free(codes);
-    for (vm.trace.registry.cache.items, 0..) |record, i| codes[i] = &record.code;
-    return encodeFile(gpa, codes);
+    return vm.trace.encodeTraceFile(gpa);
 }
 
 /// Compile + run `source` with tracing on, then hand the populated VM to `check`
@@ -73,6 +70,8 @@ test "real recorded numeric loop round-trips struct-exact (incl. proto id)" {
             try testing.expectEqual(vm.trace.registry.cache.items.len, file.traces.len);
             const dec = file.traces[0];
 
+            // Wire v5: the stable Trace.id rides the wire (exec logs join on it).
+            try testing.expectEqual(vm.trace.registry.cache.items[0].id, dec.id);
             // Anchor: the in-memory pointer became a stable id.
             try testing.expectEqual(orig.anchor.proto.id, dec.anchor_proto_id);
             try testing.expectEqual(orig.anchor.pc, dec.anchor_pc);
@@ -152,6 +151,7 @@ test "hand-built schema edge corpus round-trips byte-exact" {
         .version = format_version,
         .traces = &.{
             .{
+                .id = std.math.maxInt(u32),
                 .anchor_proto_id = 0xDEAD_BEEF,
                 .anchor_pc = 0,
                 .peeled = 1, // doc 39 wire v3: the semantic peel byte
@@ -177,6 +177,7 @@ test "hand-built schema edge corpus round-trips byte-exact" {
                 .entry_slots = &.{ 0, 1, 2, 3 },
             },
             .{
+                .id = 7,
                 .anchor_proto_id = 1,
                 .anchor_pc = 12345,
                 .peeled = 0,
@@ -194,6 +195,8 @@ test "hand-built schema edge corpus round-trips byte-exact" {
     try testing.expectEqual(@as(usize, 2), got.traces.len);
 
     const t0 = got.traces[0];
+    try testing.expectEqual(std.math.maxInt(u32), t0.id);
+    try testing.expectEqual(@as(u32, 7), got.traces[1].id);
     try testing.expectEqual(@as(u32, 0xDEAD_BEEF), t0.anchor_proto_id);
     try testing.expectEqual(@as(u8, 1), t0.peeled); // doc 39 wire v3
     try testing.expectEqual(std.math.minInt(i32), t0.instrs[0].aux);

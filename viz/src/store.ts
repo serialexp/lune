@@ -91,9 +91,10 @@ interface VizState {
   disasm: ProtoDisasm[];
 
   // --- JIT-trace iteration animation (fourth record family) ---
-  /** Decoded per-trace execution logs from the last wasm run, in cache order.
-   *  Each `trace_id` is the index into `traces` (the trace-cache index), so the
-   *  selected trace maps to its log directly. Empty when nothing ran hot. */
+  /** Decoded per-trace execution logs from the last wasm run. Each `trace_id` is
+   *  the stable `Trace.id` the trace records also carry (`TraceView.id`), so a log
+   *  joins to its trace by id — cache positions reshuffle when traces retire.
+   *  Empty when nothing ran hot. */
   execLogs: TraceExecLogOutput[];
   /** Animation slider position: an index into the selected trace's flattened
    *  event stream (`traceExecSteps()`). Reset to 0 on run / trace change. */
@@ -511,12 +512,20 @@ export function selectedTrace(): TraceView | null {
   return state.selected >= 0 ? state.traces[state.selected] ?? null : null;
 }
 
-/** The execution log for the currently-selected trace, or null. `trace_id` is
- *  the trace-cache index, which equals `state.selected` (both index the cache in
- *  order). Null when the selected trace never executed (not hot enough). */
+/** The execution log for the currently-selected trace, or null. Joined by the
+ *  stable trace id (`trace_id` === `TraceView.id`), never by list position.
+ *  Null when the selected trace never executed (not hot enough). */
 export function selectedTraceExec(): TraceExecLogOutput | null {
-  if (state.selected < 0) return null;
-  return state.execLogs.find((l) => l.trace_id === state.selected) ?? null;
+  return execLogFor(selectedTrace(), state.execLogs);
+}
+
+/** Pure join behind `selectedTraceExec`: the log whose `trace_id` is `t.id`. */
+export function execLogFor(
+  t: Pick<TraceView, "id"> | null,
+  logs: readonly TraceExecLogOutput[],
+): TraceExecLogOutput | null {
+  if (!t) return null;
+  return logs.find((l) => l.trace_id === t.id) ?? null;
 }
 
 /** The selected trace's exec log flattened into one linear event stream the

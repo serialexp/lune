@@ -649,6 +649,7 @@ const emitSnewCallout = emit.emitSnewCallout;
 const emitScpCallout = emit.emitScpCallout;
 const emitMatchCallout = emit.emitMatchCallout;
 const emitScapStrCallout = emit.emitScapStrCallout;
+const isStrAllocOp = emit.isStrAllocOp;
 const emitStr2NumCallout = emit.emitStr2NumCallout;
 const emitSgmSetposCallout = emit.emitSgmSetposCallout;
 const emitHrefCallout = emit.emitHrefCallout;
@@ -793,23 +794,22 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     @memset(linked_loop_done_labels, null);
 
     // Doc 45 D6: PRECISE exit machinery — one SHARED materializer per
-    // (snapshot, exit class) pair, created lazily by the per-instruction
-    // stubs (codex point 9). The resume family serves every guard exit whose
-    // snap names the record; the error family serves tnew failures (same
-    // flush, different terminal tail — the ledger kind is a per-site baked
-    // constant, so the tails cannot be merged behind a runtime branch).
+    // snapshot, created lazily by the per-instruction stubs (codex point 9).
+    // Every exit whose snap names the record flushes through it; the stub
+    // has already stored `runtime_error` (0 for a resume — a guard miss or a
+    // helper decline; the Status for a tnew / string-helper OOM), and the
+    // materializer picks its terminal tail on that word. The TAILS stay two
+    // (the ledger kind is a per-site baked constant); the flush is emitted
+    // once per snapshot, so an op that can exit both ways costs no second
+    // flush against the store budget.
     const precise = t.deopt_mode == .precise;
-    var mat_resume: []?x64.Label = &.{};
-    var mat_err: []?x64.Label = &.{};
-    defer if (mat_resume.len > 0) gpa.free(mat_resume);
-    defer if (mat_err.len > 0) gpa.free(mat_err);
+    var mat: []?x64.Label = &.{};
+    defer if (mat.len > 0) gpa.free(mat);
     var precise_tail_resume: ?x64.Label = null;
     var precise_tail_err: ?x64.Label = null;
     if (precise) {
-        mat_resume = try gpa.alloc(?x64.Label, t.snapshots.len);
-        @memset(mat_resume, null);
-        mat_err = try gpa.alloc(?x64.Label, t.snapshots.len);
-        @memset(mat_err, null);
+        mat = try gpa.alloc(?x64.Label, t.snapshots.len);
+        @memset(mat, null);
         precise_tail_resume = try a.label();
         precise_tail_err = try a.label();
     }
@@ -2514,23 +2514,29 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(ei));
             // Doc 45 D6: PRECISE exits never stage slot dispatch, never open
             // a patch window, never take the linked loop-done branch (codex
-            // points 6/7) — a precise exit is always terminal. Three shapes:
+            // points 6/7) — a precise exit is always terminal. Two shapes:
             //   snap == 0  → the eager guard_gc's iteration-entry exit: the
             //                ordinary carried-home flush (`deopt_exit`) with
             //                reason `.normal` is exactly its contract — the
             //                dispatcher's precise `.normal` prologue path
             //                consumes it. Stage `shared_exit` DIRECTLY
             //                (bypass slot[ei]; precise is never armed).
-            //   tnew       → stamp the snapshot id, then store the Status
-            //                (still stashed in rcx — the stub is entered
-            //                straight from the body's `jcc`) into
-            //                `runtime_error` (32-bit store: the adjacent
-            //                `activation_base` stays 0), enter the ERROR
-            //                materializer.
-            //   guard      → stamp the snapshot id, enter the RESUME
-            //                materializer.
+            //   snap  > 0  → stamp the snapshot id (a QWORD store whose upper
+            //                half zeroes `runtime_error`), then, for an op
+            //                that can raise, store its failure word over it:
+            //                tnew's non-`.ok` Status, or an allocating
+            //                string helper's `StrResult` word (doc 45 D5;
+            //                `emitStrResultCheck` — 0 for a decline, the
+            //                Status for an OOM). Both stay stashed in rcx:
+            //                the stub is entered straight from the body's
+            //                `jcc`. Enter the snapshot's materializer, which
+            //                picks its tail on `runtime_error`.
             if (precise) {
                 const pins = t.instrs[ei];
+                // Every exit that materializes a snapshot must be in the
+                // inventory the allocator extended snapshot-ref liveness for
+                // (`analyzeInner`), or the flush reads recycled homes.
+                std.debug.assert(pins.snap == 0 or opMayExitInBody(t, kinds, alloc.slots, alloc.slot_id_of_ref, ei));
                 if (pins.snap == 0) {
                     std.debug.assert(pins.op == .guard_gc);
                     if (shared_exit) |se| {
@@ -2538,24 +2544,15 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         try a.movMemReg(.rdx, @offsetOf(NativeResult, "exit_target"), .rax);
                     }
                     try a.jmp(deopt_exit);
-                } else if (pins.op == .tnew) {
-                    // ORDER MATTERS: `movMemImm32` is a QWORD store (C7 REX.W,
-                    // sign-extended) — its upper 4 bytes land on the adjacent
-                    // `runtime_error` dword. Stamp the snapshot id FIRST, then
-                    // overwrite the zeroed `runtime_error` with the Status.
-                    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "snapshot_id"), @intCast(pins.snap));
-                    try a.movMemReg32(.rdx, @offsetOf(NativeResult, "runtime_error"), .rcx);
-                    const ml = mat_err[pins.snap - 1] orelse blk: {
-                        const nl = try a.label();
-                        mat_err[pins.snap - 1] = nl;
-                        break :blk nl;
-                    };
-                    try a.jmp(ml);
                 } else {
+                    // ORDER MATTERS: the snapshot id FIRST (it zeroes the
+                    // adjacent `runtime_error` dword), then the failure word.
                     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "snapshot_id"), @intCast(pins.snap));
-                    const ml = mat_resume[pins.snap - 1] orelse blk: {
+                    if (pins.op == .tnew or isStrAllocOp(pins.op))
+                        try a.movMemReg32(.rdx, @offsetOf(NativeResult, "runtime_error"), .rcx);
+                    const ml = mat[pins.snap - 1] orelse blk: {
                         const nl = try a.label();
-                        mat_resume[pins.snap - 1] = nl;
+                        mat[pins.snap - 1] = nl;
                         break :blk nl;
                     };
                     try a.jmp(ml);
@@ -2712,24 +2709,23 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     // Doc 45 D6: PRECISE per-snapshot materializers + the two terminal tails.
     // Each materializer flushes its snapshot's captured window into the SoA
     // register file (skipping proven invariant-own-entry and dead `.none`
-    // slots — the slab is already current for those) and falls into its
-    // family's tail: completed = rbx, the reason stamp, the terminal ledger
-    // row, and a DIRECT return to shared_exit (no slot indirection — a
-    // precise exit is never a chain source). The store budget is checked
-    // against the emitted total: over budget → compile bail → tier-1a (the
-    // selection walk runs precise pages there since increment 4).
+    // slots — the slab is already current for those), then picks its tail on
+    // the `runtime_error` its stub stored (nonzero → error, 0 → resume; the
+    // flush touches only rax/rcx and the slab, never rdx or the result):
+    // completed = rbx, the reason stamp, the terminal ledger row, and a
+    // DIRECT return to shared_exit (no slot indirection — a precise exit is
+    // never a chain source). The store budget is checked against the emitted
+    // total: over budget → compile bail → tier-1a (the selection walk runs
+    // precise pages there since increment 4).
     if (precise) {
         var flush_stores: u32 = 0;
         for (0..t.snapshots.len) |si| {
-            if (mat_resume[si]) |ml| {
+            if (mat[si]) |ml| {
                 a.bind(ml);
                 flush_stores += try emitPreciseSnapshotFlush(a, t, kinds, alloc, @intCast(si + 1));
+                try a.cmpDwordMemImm(.rdx, @offsetOf(NativeResult, "runtime_error"), 0);
+                try a.jcc(.ne, precise_tail_err.?);
                 try a.jmp(precise_tail_resume.?);
-            }
-            if (mat_err[si]) |ml| {
-                a.bind(ml);
-                flush_stores += try emitPreciseSnapshotFlush(a, t, kinds, alloc, @intCast(si + 1));
-                try a.jmp(precise_tail_err.?);
             }
         }
         if (flush_stores > PRECISE_FLUSH_STORE_MAX) return error.PreciseFlushBudget;

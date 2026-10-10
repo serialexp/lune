@@ -982,26 +982,31 @@ pub const Vm = struct {
         const TraceState = trace.TraceState;
         const RegionPolicy = @FieldType(TraceState, "region_policy");
         const RegionContext = trace.RegionContext;
-        // Pinned widths (one per emitted access form).
-        std.debug.assert(@sizeOf(@FieldType(Vm, "depth")) == 4); // dword load/store + dword wall cmp
-        std.debug.assert(@sizeOf(@FieldType(Vm, "stack_top")) == 8);
-        std.debug.assert(@sizeOf(@FieldType(Vm, "next_call_seq")) == 8); // qword cmp -1 wall
-        std.debug.assert(@sizeOf(@FieldType(RegionContext, "depth")) == 4);
-        std.debug.assert(@sizeOf(@FieldType(RegionContext, "call_seq")) == 8);
-        std.debug.assert(@sizeOf(@FieldType(RegionPolicy, "region_context_valid")) == 1);
-        std.debug.assert(@sizeOf(@FieldType(TraceState, "tick")) == 8);
-        std.debug.assert(@sizeOf(@FieldType(TraceState, "self_call_pushes")) == 8);
-        std.debug.assert(@sizeOf(@FieldType(TraceState, "self_ret_pops")) == 8);
-        std.debug.assert(@sizeOf(@FieldType(Vm, "open_upvalue_ceiling")) == 8); // qword cmp vs popped base
-        std.debug.assert(@sizeOf(@FieldType(CallFrame, "closure")) == 8);
-        std.debug.assert(@sizeOf(@FieldType(CallFrame, "call_seq")) == 8);
-        std.debug.assert(@sizeOf(@FieldType(CallFrame, "base")) == 8);
-        std.debug.assert(@sizeOf(@FieldType(CallFrame, "pc")) == 8); // qword imm32 store (pc always < 2³¹)
-        std.debug.assert(@sizeOf(@FieldType(CallFrame, "ret_dest")) == 2); // word store
-        std.debug.assert(@sizeOf(@FieldType(CallFrame, "ret_count")) == 2);
-        std.debug.assert(@sizeOf(@FieldType(CallFrame, "varargs_base")) == 8);
-        std.debug.assert(@sizeOf(@FieldType(CallFrame, "varargs_count")) == 8);
-        std.debug.assert(@sizeOf(@FieldType(CallFrame, "code_cache_gen")) == 8); // qword -1 = CODE_CACHE_GEN_INVALID
+        // Pinned widths (one per emitted access form). Only the x86-64 emitter
+        // consumes this descriptor; on any other target (wasm32, where pointers
+        // and usizes are 4 bytes) native codegen is `UnsupportedTarget`, so the
+        // widths are pinned only where they are load-bearing.
+        if (nativegen.is_x64_linux) {
+            std.debug.assert(@sizeOf(@FieldType(Vm, "depth")) == 4); // dword load/store + dword wall cmp
+            std.debug.assert(@sizeOf(@FieldType(Vm, "stack_top")) == 8);
+            std.debug.assert(@sizeOf(@FieldType(Vm, "next_call_seq")) == 8); // qword cmp -1 wall
+            std.debug.assert(@sizeOf(@FieldType(RegionContext, "depth")) == 4);
+            std.debug.assert(@sizeOf(@FieldType(RegionContext, "call_seq")) == 8);
+            std.debug.assert(@sizeOf(@FieldType(RegionPolicy, "region_context_valid")) == 1);
+            std.debug.assert(@sizeOf(@FieldType(TraceState, "tick")) == 8);
+            std.debug.assert(@sizeOf(@FieldType(TraceState, "self_call_pushes")) == 8);
+            std.debug.assert(@sizeOf(@FieldType(TraceState, "self_ret_pops")) == 8);
+            std.debug.assert(@sizeOf(@FieldType(Vm, "open_upvalue_ceiling")) == 8); // qword cmp vs popped base
+            std.debug.assert(@sizeOf(@FieldType(CallFrame, "closure")) == 8);
+            std.debug.assert(@sizeOf(@FieldType(CallFrame, "call_seq")) == 8);
+            std.debug.assert(@sizeOf(@FieldType(CallFrame, "base")) == 8);
+            std.debug.assert(@sizeOf(@FieldType(CallFrame, "pc")) == 8); // qword imm32 store (pc always < 2³¹)
+            std.debug.assert(@sizeOf(@FieldType(CallFrame, "ret_dest")) == 2); // word store
+            std.debug.assert(@sizeOf(@FieldType(CallFrame, "ret_count")) == 2);
+            std.debug.assert(@sizeOf(@FieldType(CallFrame, "varargs_base")) == 8);
+            std.debug.assert(@sizeOf(@FieldType(CallFrame, "varargs_count")) == 8);
+            std.debug.assert(@sizeOf(@FieldType(CallFrame, "code_cache_gen")) == 8); // qword -1 = CODE_CACHE_GEN_INVALID
+        }
         const trace_off = @offsetOf(Vm, "trace");
         const policy_off = trace_off + @offsetOf(TraceState, "region_policy");
         const rctx_off = policy_off + @offsetOf(RegionPolicy, "region_context");
@@ -2468,7 +2473,42 @@ pub const Vm = struct {
         // "call `markHeader` on each root".
         self.forEachRootHeader(.gc, null, self.heap, gc.Heap.markHeader);
         self.heap.traceAll();
+        self.invalidateDeadTraceConsts();
         self.heap.sweep();
+    }
+
+    /// Doc 61 §7.1 item 2: trace constant pools are not roots, so between
+    /// mark and sweep every trace, and the in-flight recording, that names a
+    /// constant the sweep will free goes first. A trace is retired through
+    /// the batch path; the recording is cancelled without `abort`'s peel
+    /// rewind (which could close a `.link` that keeps the pool). No trace
+    /// code is on the stack here (collection runs only at the tier-0
+    /// safepoint or from `mh_collect`), so nothing observes the retirement
+    /// mid-flight. One colour read per heap constant; the doomed list was
+    /// reserved at publish, so nothing here allocates for it.
+    fn invalidateDeadTraceConsts(self: *Vm) void {
+        const ts = &self.trace;
+        std.debug.assert(!ts.registry.native_physical.inReplayWalk());
+        if (ts.isRecording()) {
+            for (ts.rec.consts.items) |v| {
+                if (v.isHeap() and gc.Heap.willFree(v.asHeap())) {
+                    ts.cancelRecording(.const_swept);
+                    break;
+                }
+            }
+        }
+        const doomed = &ts.registry.batch_scratch;
+        doomed.clearRetainingCapacity();
+        for (ts.registry.cache.items) |t| {
+            for (t.code.heap_consts) |i| {
+                if (gc.Heap.willFree(t.code.consts[i].asHeap())) {
+                    doomed.appendAssumeCapacity(t);
+                    break;
+                }
+            }
+        }
+        ts.removeTraces(doomed.items);
+        doomed.clearRetainingCapacity();
     }
 
     /// Test builds only: called at the start of every `collect` on this
@@ -2549,30 +2589,25 @@ pub const Vm = struct {
     ///   3. the closures executing in each active frame (`frames[0..depth]` —
     ///      keeps their proto constants reachable).
     ///   4. open upvalue cells (live by construction — about to be closed).
-    ///   5. trace constants (**`.gc` kind ONLY** — see `RootKind`) — a cached trace
-    ///      (or the in-progress recording) may hold heap values in its const pool
-    ///      (e.g. a string `load_const`). A cached trace can outlive its proto's
-    ///      reachability, so its consts must be GC-liveness roots in their own right
-    ///      (docs/design/03-gc-memory.md). They are DELIBERATELY excluded from the
-    ///      `.snapshot` walk (doc 17, H-2 / G-2): a heap object reachable *only* via
-    ///      a trace const is (a) unnamable by the restored guest (no other
-    ///      reference), and (b) tiering-dependent — a `.off`/tier-0 run never
-    ///      records the trace, so the object is collected there. Serializing it
-    ///      would make snapshot bytes differ by JIT mode. Excluding it makes the
-    ///      snapshot JIT-independent by construction and cannot dangle (a sole-root
-    ///      object has no other pointer in the serialized graph).
+    ///   5. (none — trace constants are NOT roots in either walk; doc 61 §7.1.)
+    ///      Rooting a trace's const pool made liveness tier-dependent: a string
+    ///      only a trace names survived in the JIT legs and was swept in tier-0,
+    ///      so a later re-intern took a different object id. Instead `collect`
+    ///      retires every trace (and cancels the recording) that names a
+    ///      constant the sweep will free (`invalidateDeadTraceConsts`), so
+    ///      liveness is identical in every tier and no trace keeps a dangling
+    ///      constant.
     ///   6. effect-log heap results — a string-valued effect (`getenv`/`argv`)
     ///      parked in `effect_log` must outlive collection until it is serialized
     ///      (record) or fed back to the program (replay). Without this root, the
     ///      sweep would de-intern and free an otherwise-unreferenced result string.
     pub const RootKind = enum {
-        /// The collector's root set: every live pointer, including trace-const
-        /// GC-liveness roots (a cached trace's const must not be swept while the
-        /// trace can still execute).
+        /// The collector's root set: every live pointer, including host-held
+        /// refs and parked C-boundary results.
         gc,
         /// The snapshot's *semantic* root set: what the restored guest can name.
-        /// Excludes trace consts (transient JIT state; see item 5) so snapshot
-        /// bytes are identical whether or not the JIT recorded anything.
+        /// Excludes host state so snapshot bytes are identical whatever the
+        /// host holds.
         snapshot,
     };
     pub fn forEachRootHeader(
@@ -2602,8 +2637,7 @@ pub const Vm = struct {
         for (self.open_upvalues.items) |ou| cb(ctx, &ou.cell.header);
         // Host-retained chunks (docs/design/03 §"Chunk-constant rooting"): keep a
         // compiled-but-not-yet-run chunk's interned constants alive across the
-        // compile→run window. Rooted in BOTH walks (unlike trace consts, item 5):
-        // membership is a mode-invariant host action, so serializing their ids in the
+        // compile→run window. Rooted in BOTH walks (unlike host refs): membership is a mode-invariant host action, so serializing their ids in the
         // `.snapshot` walk is byte-identical across all modes and lets a snapshot
         // straddle preserve constant-id continuity (the host re-supplies + re-retains
         // on restore, like the main `root`). Discovery order = retain order.
@@ -2618,21 +2652,12 @@ pub const Vm = struct {
         // deterministic guest behaviour, hence mode-invariant, so the snapshot
         // stays byte-identical across modes and restore preserves constant-id
         // continuity (keyframe v8's zero-allocation recompile invariant). Their
-        // guaranteed liveness (now via the pin) is what makes a trace const
-        // over a loaded proto ALWAYS redundant, which is what licenses tracing
-        // the loaded tree (doc 17's H-2 dynamic-proto gate, lifted by doc 19).
+        // guaranteed liveness (via the pin) means a trace const over a loaded
+        // proto never dooms its trace (`Heap.willFree` excludes pinned).
         if (kind == .snapshot) {
             for (self.loaded_chunks.items) |lc| rootProtoConsts(lc.chunk.proto, ctx, cb);
         }
-        // Trace consts are GC-liveness roots ONLY — never snapshot semantic roots
-        // (doc 17 H-2/G-2). See the item-5 note above.
         if (kind == .gc) {
-            for (self.trace.registry.cache.items) |t| {
-                for (t.code.consts) |v| if (v.isHeap()) cb(ctx, v.asHeap());
-            }
-            if (self.trace.isRecording()) {
-                for (self.trace.rec.consts.items) |v| if (v.isHeap()) cb(ctx, v.asHeap());
-            }
             // Embedding (doc 59 §3.3): host-held refs and parked C-boundary
             // results are GC-liveness roots ONLY — host state must never leak
             // into snapshot bytes (freed ref slots hold nil, so no stale marks).
@@ -3379,8 +3404,36 @@ pub const Vm = struct {
     /// invariant is `ct ∈ visited` — and an empty dead list.
     const TrialWalkCtx = struct {
         visited: []const *trace.Trace,
-        dead: *[trial_visited_cap]*trace.Trace,
-        ndead: *usize,
+        dead: *WalkDead,
+    };
+
+    /// The trial walk's widen-eviction dead list (`dead ⊆ visited`, capped
+    /// alike). `retire` submits the batch and EMPTIES the list, so the entry
+    /// routine's early-return retire and the walk owner's post-walk retire
+    /// can never both submit it: `removeTraces` destroys the records, and a
+    /// second submission would dereference freed traces (doc 61 Phase Q
+    /// review — the old per-trace `removeTrace` searched the cache first, so
+    /// a repeat was a silent no-op).
+    pub const WalkDead = struct {
+        items: [trial_visited_cap]*trace.Trace = undefined,
+        len: usize = 0,
+
+        pub fn full(self: *const WalkDead) bool {
+            return self.len == self.items.len;
+        }
+
+        pub fn add(self: *WalkDead, t: *trace.Trace) void {
+            std.debug.assert(!self.full());
+            self.items[self.len] = t;
+            self.len += 1;
+        }
+
+        pub fn retire(self: *WalkDead, ts: *trace.TraceState) void {
+            if (self.len == 0) return;
+            const batch = self.items[0..self.len];
+            self.len = 0;
+            ts.removeTraces(batch);
+        }
     };
 
     /// Phase 0a (doc 20 §R1-4/§R3-3): the single factored per-candidate entry +
@@ -4342,8 +4395,7 @@ pub const Vm = struct {
             // state; a wanted/attached exit comes back `.exit_side`.
             const ir_ctx: irinterp.ExecCtx = .{ .heap = self.heap, .exit_side = ct.exit_side };
             var result = if (self.trace.config.record_exec_log) blk: {
-                const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.executeCtx(ir_ctx, &ct.code, trace_regs, buf);
-                const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.executeCtx(ir_ctx, &ct.code, trace_regs, buf);
+                const rec = self.trace.execRecorderFor(ct.id) orelse break :blk irinterp.executeCtx(ir_ctx, &ct.code, trace_regs, buf);
                 break :blk irinterp.executeTracedCtx(ir_ctx, rec, &ct.code, trace_regs, buf);
             } else blk: {
                 // Doc 22 §B.2: `native_page` was resolved above (before VM-side
@@ -4382,7 +4434,7 @@ pub const Vm = struct {
             if (ran_native and result.pushed_frames > 0) {
                 self.trace.last_exit_instr = result.exit_instr;
                 const d = self.consumePushedDescent(ct, result, proto);
-                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                wctx.dead.retire(&self.trace);
                 return d;
             }
             if (ran_native) {
@@ -4395,11 +4447,11 @@ pub const Vm = struct {
                     // resume pc; route it exactly as the ledger branch does.
                     if (chain.exit_side) |es| {
                         const d = self.consumeExitSideTerminal(mode, es, proto, regs, base, safe_to_arm);
-                        for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                        wctx.dead.retire(&self.trace);
                         return d;
                     }
                     const armed_side = self.trace.consumeSideTraceWantAtResume(proto, @intCast(pc));
-                    for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                    wctx.dead.retire(&self.trace);
                     if (armed_side and mode == .fast) {
                         return .{ .switch_mode_at = pc };
                     }
@@ -4538,7 +4590,7 @@ pub const Vm = struct {
                 trace.anchorKind(ct.code.anchor.pc) != .loop)
             {
                 const d = self.consumeHeadBurst(ct, self.trace.ledger_scratch[0..result.ledger_len], proto);
-                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                wctx.dead.retire(&self.trace);
                 return d;
             }
 
@@ -4611,7 +4663,7 @@ pub const Vm = struct {
                 // Doc 44 D10: earlier walk failer + this completion = one
                 // handoff observation on the failer's exit.
                 self.consumeHeadWalkFail(final.id);
-                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                wctx.dead.retire(&self.trace);
                 return .{ .resume_tier0 = @intCast(term.aux) };
             }
             // Doc 45 D6: tier-1a PRECISE deopt. The executor already
@@ -4675,7 +4727,7 @@ pub const Vm = struct {
                 };
                 self.trace.dbg("precise-error: trace={d} exit={d} snap={d} raise_pc={d} status={d}", .{ ct.id, result.exit_instr, result.snapshot_id, snap.resume_pc, result.runtime_error });
                 self.trace.precise_errors +|= 1;
-                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                wctx.dead.retire(&self.trace);
                 return .{ .raise_at = .{ .pc = @intCast(snap.resume_pc), .err = err } };
             }
             if (result.exit_reason == .precise_resume) {
@@ -4703,7 +4755,7 @@ pub const Vm = struct {
                 self.trace.dbg("precise-resume: trace={d} exit={d} snap={d} resume_pc={d} completed={d}", .{ ct.id, result.exit_instr, result.snapshot_id, snap.resume_pc, done });
                 self.trace.precise_resumes +|= 1;
                 self.trace.onSideExitReceipt(ct, done, result.exit_instr, done, .deferred, .entered);
-                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                wctx.dead.retire(&self.trace);
                 if (mode == .full and self.runFastPath()) {
                     return .{ .switch_mode_at = @intCast(snap.resume_pc) };
                 }
@@ -4728,7 +4780,7 @@ pub const Vm = struct {
                     self.consumeExitSide(mode, .native_only, ct, result, proto, trace_regs, base, safe_to_arm)
                 else
                     self.consumeExitSide(mode, .ir, ct, result, proto, trace_regs, base, safe_to_arm);
-                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                wctx.dead.retire(&self.trace);
                 return d;
             }
             // Doc 44 P0/D12b: a one-shot trace's (head or cont) guard-fail
@@ -4764,7 +4816,7 @@ pub const Vm = struct {
                     .deferred,
                     if (result.exit_reason == .prologue_fail) .entry_refusal else .entered,
                 );
-                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                wctx.dead.retire(&self.trace);
                 return .next_candidate;
             }
             // Doc 45 D6: a PRECISE loop trace's remaining `.normal` exits are
@@ -4797,7 +4849,7 @@ pub const Vm = struct {
                 }
                 self.trace.dbg("precise prologue-exit: trace={d} exit={d} completed={d}", .{ ct.id, result.exit_instr, local_done });
                 self.trace.onSideExitReceipt(ct, local_done, result.exit_instr, local_done, .deferred, .entered);
-                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                wctx.dead.retire(&self.trace);
                 if (local_done > 0) {
                     if (mode == .full and self.runFastPath()) {
                         return .{ .switch_mode_at = pc };
@@ -4876,7 +4928,7 @@ pub const Vm = struct {
                 // adapter; the slab is coherent at `pc` (its resume pc).
                 if (chain.exit_side) |es| {
                     const d = self.consumeExitSideTerminal(mode, es, proto, regs, base, safe_to_arm);
-                    for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                    wctx.dead.retire(&self.trace);
                     return d;
                 }
                 // Side-trace precision: if this burst's terminal
@@ -4890,7 +4942,7 @@ pub const Vm = struct {
                 // dispatch must switch up, exactly as the
                 // `wants_prime_side` consumption below does.
                 const armed_side = self.trace.consumeSideTraceWantAtResume(proto, @intCast(pc));
-                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                wctx.dead.retire(&self.trace);
                 if (armed_side and mode == .fast) {
                     return .{ .switch_mode_at = pc }; // → .full
                 }
@@ -4978,7 +5030,7 @@ pub const Vm = struct {
                 // in a slot just because a later trace succeeded.
                 // Safe: `continue :outer` abandons the walk, so the
                 // freed `*Trace`s are never revisited.
-                for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                wctx.dead.retire(&self.trace);
                 // Nested-loop linking (Phase 1): a continuation
                 // recording just armed (pending at the post-loop
                 // pc). Its dispatch-prologue activation hook is
@@ -5020,7 +5072,7 @@ pub const Vm = struct {
                         self.trace.prime_want_src = null;
                         self.trace.wants_prime_side = null;
                         self.trace.prime_side_arms +|= 1;
-                        for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                        wctx.dead.retire(&self.trace);
                         if (mode == .fast) {
                             return .{ .switch_mode_at = pc }; // → .full
                         }
@@ -5041,13 +5093,13 @@ pub const Vm = struct {
                 if (ran_native and ran_native_link_mode) {
                     if (self.trace.driveChain(final, result, proto, trace_regs, .native_only, .native_numeric_for_done, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
                         if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                        for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                        wctx.dead.retire(&self.trace);
                         return .{ .resume_tier0 = pc };
                     }
                 } else if (!ran_native) {
                     if (self.trace.driveChain(final, result, proto, trace_regs, .ir, .{ .ir_numeric_for_done = buf }, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
                         if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                        for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                        wctx.dead.retire(&self.trace);
                         return .{ .resume_tier0 = pc };
                     }
                 }
@@ -5097,13 +5149,13 @@ pub const Vm = struct {
                     if (ran_native) {
                         if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl[0..nexcl], safe_to_arm, self.unicode_version_pinned)) |chain| {
                             if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                            for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                            wctx.dead.retire(&self.trace);
                             return .{ .resume_tier0 = pc };
                         }
                     } else {
                         if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, excl[0..nexcl], safe_to_arm, self.unicode_version_pinned)) |chain| {
                             if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                            for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                            wctx.dead.retire(&self.trace);
                             return .{ .resume_tier0 = pc };
                         }
                     }
@@ -5151,9 +5203,8 @@ pub const Vm = struct {
             // is a `final` fact; gate on `final == ct` to keep a fused
             // child out of this anchor's `dead` list. Byte-identical now
             // (`final == ct` always).
-            if (final == ct and wctx.ndead.* < wctx.dead.len and self.trace.laneWidenedPast(ct, regs)) {
-                wctx.dead[wctx.ndead.*] = ct;
-                wctx.ndead.* += 1;
+            if (final == ct and !wctx.dead.full() and self.trace.laneWidenedPast(ct, regs)) {
+                wctx.dead.add(ct);
             }
 
             // --- coherent-anchor chaining (doc 16) ---
@@ -5182,13 +5233,13 @@ pub const Vm = struct {
             if (ran_native) {
                 if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl[0..nexcl], safe_to_arm, self.unicode_version_pinned)) |chain| {
                     if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                    for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                    wctx.dead.retire(&self.trace);
                     return .{ .resume_tier0 = pc };
                 }
             } else {
                 if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, excl[0..nexcl], safe_to_arm, self.unicode_version_pinned)) |chain| {
                     if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                    for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
+                    wctx.dead.retire(&self.trace);
                     return .{ .resume_tier0 = pc };
                 }
             }
@@ -5220,8 +5271,7 @@ pub const Vm = struct {
         const anchor_pc = ct.code.anchor.pc;
         const is_head = trace.anchorKind(anchor_pc) == .head;
         const one_shot = trace.anchorKind(anchor_pc) != .loop;
-        var dead: [trial_visited_cap]*trace.Trace = undefined;
-        var ndead: usize = 0;
+        var dead: WalkDead = .{};
         // The walk marks each candidate visited before entering. Seed the
         // exclusion set with the incumbent; the head sibling walk below grows it.
         var visited: [trial_visited_cap]*trace.Trace = undefined;
@@ -5230,7 +5280,6 @@ pub const Vm = struct {
         var wctx: TrialWalkCtx = .{
             .visited = visited[0..1],
             .dead = &dead,
-            .ndead = &ndead,
         };
         // Doc 44 D10: fresh evidence channel per walk — a failer recorded by
         // a PREVIOUS activation's walk must never pair with this walk's
@@ -5479,7 +5528,7 @@ pub const Vm = struct {
                 patch.strikes = 0;
             }
         }
-        for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+        dead.retire(&self.trace);
         self.trace.drainEntryPatchWork();
         return directive;
     }
@@ -7132,8 +7181,7 @@ pub const Vm = struct {
                 // we must not do it while the walk could still revisit the
                 // cache. `dead` is a subset of `visited`, so it never
                 // overflows past the visited cap.
-                var dead: [trial_visited_cap]*trace.Trace = undefined;
-                var ndead: usize = 0;
+                var dead: WalkDead = .{};
                 var t: ?*trace.Trace = self.trace.nextTraceExcluding(proto, @intCast(pc), visited[0..0]);
                 while (t) |ct| : (t = if (nvisited < visited.len)
                     self.trace.nextTraceExcluding(proto, @intCast(pc), visited[0..nvisited])
@@ -7219,7 +7267,6 @@ pub const Vm = struct {
                     var wctx: TrialWalkCtx = .{
                         .visited = visited[0..nvisited],
                         .dead = &dead,
-                        .ndead = &ndead,
                     };
                     const directive = self.enterSelectedTrace(mode, ct, st.closure, proto, regs, st.base, pc, &wctx);
                     // Doc 20 safe-point drain: runs BEFORE acting on any
@@ -7248,7 +7295,7 @@ pub const Vm = struct {
                 // past their guard). Safe now that the same-anchor walk is
                 // complete — removing frees the `*Trace` and would otherwise
                 // dangle the iterator cursor.
-                for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+                dead.retire(&self.trace);
                 // All traces at this anchor failed, OOM'd, or didn't match the
                 // fingerprint.  If at least one trace exists but none matched,
                 // count it for side-trace recording.
@@ -8572,6 +8619,7 @@ test {
     _ = @import("interp_replay_test.zig");
     _ = @import("interp_dispatch_test.zig");
     _ = @import("interp_gc_test.zig");
+    _ = @import("interp_phaseq_test.zig");
     _ = @import("interp_trace_test.zig");
     _ = @import("interp_fastblock_test.zig");
     _ = @import("interp_tier1a_test.zig");

@@ -223,6 +223,23 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
     }
     errdefer if (pins_owned.len != 0) gpa.free(pins_owned);
 
+    // Doc 61 §7.1 item 3: every heap value in the FINAL pool, not just the
+    // live `konst` users — serializers and non-`konst` readers (`guard_sid`,
+    // `sgmatch`, `callee_global` keys) see the whole pool. Correctness
+    // metadata: OOM fails the commit.
+    var n_heap: usize = 0;
+    for (fields.consts) |v| n_heap += @intFromBool(v.isHeap());
+    const heap_consts_owned: []u32 = if (n_heap == 0) &.{} else try gpa.alloc(u32, n_heap);
+    errdefer if (heap_consts_owned.len != 0) gpa.free(heap_consts_owned);
+    {
+        var k: usize = 0;
+        for (fields.consts, 0..) |v, i| {
+            if (!v.isHeap()) continue;
+            heap_consts_owned[k] = @intCast(i);
+            k += 1;
+        }
+    }
+
     var requires_unicode_pin = false;
     for (fields.instrs) |ins| {
         if (ins.op == .supper or ins.op == .slower) requires_unicode_pin = true;
@@ -256,10 +273,11 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
             } else if (ir.requiresPreciseSnapshot(ins.op) and i > @as(usize, @intCast(gr))) {
                 // A potentially failing BODY op without a snapshot: only the
                 // prologue (entry loads + the eager `guard_gc`) may fail
-                // pre-body with entry-replay semantics. Covers side-exit
-                // guards AND the fallible effect ops (`tnew`/`tset`, doc 45
-                // D3) — an OOM at a snap-less `tnew` would have nowhere to
-                // resume.
+                // pre-body with entry-replay semantics. Covers every
+                // exit-capable body op: the side-exit guards, the fallible
+                // helpers, and the fallible effect ops (`tnew`/`tset`, doc
+                // 45 D3) — an OOM at a snap-less `tnew` or string helper
+                // would have nowhere to raise.
                 return error.InvalidSnapshotMetadata;
             }
         }
@@ -303,6 +321,7 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
         .anchor = rec.anchor,
         .instrs = fields.instrs,
         .consts = fields.consts,
+        .heap_consts = heap_consts_owned,
         .entry_slots = fields.entry_slots,
         .entry_guards = guards_owned,
         .inputs = inputs_owned,

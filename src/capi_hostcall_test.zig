@@ -360,11 +360,8 @@ fn snap(gpa: std.mem.Allocator, box: *capi.VmBox, status: Status, results: []con
     try d.p("ret_cont={any} call_head={any}\n", .{ ts.pending_ret_cont_arm, ts.pending_call_head_arm });
     {
         const recs = ts.registry.cache.items;
-        const codes = try gpa.alloc(*const mahina.trace.TraceCode, recs.len);
-        defer gpa.free(codes);
-        for (recs, codes) |r, *c| c.* = &r.code;
         try d.p("traces={d} ", .{recs.len});
-        try d.blob(&blobs, "committed", try mahina.traceser.encodeFile(gpa, codes));
+        try d.blob(&blobs, "committed", try ts.encodeTraceFile(gpa));
     }
     try d.p("heap: objects={d} next_id={d}\n", .{ vm.heap.object_count, vm.heap.next_obj_id });
     if (vm.next_call_seq > 0) {

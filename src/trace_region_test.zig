@@ -57,7 +57,7 @@ test "A-ii.2 edge_cache: a 2-anchor cont↔inner cycle resolves both structural 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity(); // traces are stack-allocated; drop pointers pre-deinit
+    defer state.registry.detachAll(); // traces are stack-allocated; drop pointers pre-deinit
 
     var code: [8]Instr = undefined;
     loopDoneCode(&code);
@@ -93,8 +93,8 @@ test "A-ii.2 edge_cache: a 2-anchor cont↔inner cycle resolves both structural 
         .id = 302,
     };
 
-    try state.registry.cache.append(gpa, &cont);
-    try state.registry.cache.append(gpa, &inner);
+    try state.registry.attach(&cont);
+    try state.registry.attach(&inner);
     state.rebuildEdgeCache();
 
     // Both structural edges present: cont --link--> inner(pc7), inner --loop_done--> cont(pc2).
@@ -111,7 +111,7 @@ test "A-ii.2 edge_cache: a 2-anchor cont↔inner cycle resolves both structural 
     // Wholesale rebuild from the SURVIVING cache after inner leaves: cont's `.link` now
     // has no inner root bound, and inner's own edge is gone → empty. (Simulate the
     // retirement rebuild path without `destroy` on a stack trace.)
-    _ = state.registry.cache.swapRemove(1); // drop &inner
+    try testing.expect(state.registry.detach(state.registry.cache.items[1])); // drop &inner
     state.rebuildEdgeCache();
     try testing.expectEqual(@as(usize, 0), state.region_policy.edge_cache.count());
 }
@@ -171,7 +171,7 @@ test "A-ii.3 rec_path: a committed trace carries its recorded path (freed on des
     defer state.deinit();
     defer {
         if (committed) |ct| ct.destroy(gpa);
-        state.registry.cache.clearRetainingCapacity();
+        state.registry.detachAll();
     }
 
     // Same recForPrepLink→commit harness as the A-i.4 test: a continuation that
@@ -192,7 +192,7 @@ test "A-ii.3 rec_path: a committed trace carries its recorded path (freed on des
         },
         .id = 900,
     };
-    try state.registry.cache.append(gpa, &inner);
+    try state.registry.attach(&inner);
 
     try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 2 }, proto.num_registers);
     state.rec.kind = .continuation;
@@ -211,7 +211,7 @@ test "A-ii.3 rec_path: a committed trace carries its recorded path (freed on des
 //
 // Helpers build a synthetic trace graph over one proto with stack-allocated `Trace`s,
 // then call `rebuildEdgeCache` + `rebuildRegions` directly (as the commit/retire path
-// does) and assert on the discovered regions. `defer state.registry.cache.clearRetainingCapacity`
+// does) and assert on the discovered regions. `defer state.registry.detachAll`
 // drops the (stack) cache pointers before `deinit`, exactly as the A-ii.2 test does; the
 // region maps own HEAP copies independent of the stack traces, so `deinit` frees them
 // cleanly.
@@ -224,7 +224,7 @@ test "A-ii.4 discovery: skip→ramp→inner→cont→skip cycle — owner==skip@
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const P_ID: u32 = 7;
     var code: [41]Instr = undefined;
@@ -304,7 +304,7 @@ test "A-ii.4 discovery: skip→ramp→inner→cont→skip cycle — owner==skip@
         .id = 5,
     };
 
-    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.registry.cache.append(gpa, t);
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.registry.attach(t);
     state.rebuildEdgeCache();
     state.rebuildRegions();
 
@@ -344,7 +344,7 @@ test "A-vii-d.0 armability recovery: first-sight unarmable arms on the rebind th
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const P_ID: u32 = 8;
     var code: [41]Instr = undefined;
@@ -409,7 +409,7 @@ test "A-vii-d.0 armability recovery: first-sight unarmable arms on the rebind th
         .id = 4,
     };
 
-    for ([_]*Trace{ &skip, &ramp, &inner, &cont }) |t| try state.registry.cache.append(gpa, t);
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont }) |t| try state.registry.attach(t);
     state.rebuildEdgeCache();
     state.rebuildRegions();
 
@@ -438,7 +438,7 @@ test "A-vii-d.0 armability recovery: first-sight unarmable arms on the rebind th
         },
         .id = 5,
     };
-    try state.registry.cache.append(gpa, &ext);
+    try state.registry.attach(&ext);
     state.rebuildEdgeCache();
     state.rebuildRegions();
     try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count()); // same logical region
@@ -462,7 +462,7 @@ test "A-ii.4 finding-3: a member with an incomplete recorded path mints the regi
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     // Same owner-bearing 5-trace graph as the armable test above, but one physical member
     // (`skip`) carries a TRUNCATED recorded path (rec_path_complete=false, as a recorder-
@@ -545,7 +545,7 @@ test "A-ii.4 finding-3: a member with an incomplete recorded path mints the regi
         .id = 5,
     };
 
-    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.registry.cache.append(gpa, t);
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.registry.attach(t);
     state.rebuildEdgeCache();
     state.rebuildRegions();
 
@@ -565,7 +565,7 @@ test "A-ii.4 exit_prov fail-soft: an incomplete-exit_prov trace disarms the whol
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     // The armable 5-trace graph again. Phase 1: fully complete → region armed. Phase 2:
     // taint the graph by marking one cached trace's `exit_prov` INCOMPLETE (as a
@@ -648,7 +648,7 @@ test "A-ii.4 exit_prov fail-soft: an incomplete-exit_prov trace disarms the whol
         .id = 5,
     };
 
-    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.registry.cache.append(gpa, t);
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.registry.attach(t);
 
     // Phase 1 — complete graph: region armed.
     state.rebuildEdgeCache();
@@ -685,7 +685,7 @@ test "A-ii.4 finding-5: a boundary edge added on rebind flips both_count 1→2, 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     // Phase 1: the armable skip→ramp→inner→cont→skip cycle with ONE incoming boundary
     // (ext→skip@14) → skip is the unique external-entry ∧ loop-root → both_count==1, armed.
@@ -769,7 +769,7 @@ test "A-ii.4 finding-5: a boundary edge added on rebind flips both_count 1→2, 
         .id = 5,
     };
 
-    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.registry.cache.append(gpa, t);
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.registry.attach(t);
     state.rebuildEdgeCache();
     state.rebuildRegions();
     try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
@@ -793,7 +793,7 @@ test "A-ii.4 finding-5: a boundary edge added on rebind flips both_count 1→2, 
         },
         .id = 6,
     };
-    try state.registry.cache.append(gpa, &ext2);
+    try state.registry.attach(&ext2);
     state.rebuildEdgeCache();
     state.rebuildRegions();
 
@@ -821,7 +821,7 @@ test "A-ii.4 finding-6: a region-rebuild OOM fails CLOSED — physical indices e
         fa.fail_index = std.math.maxInt(usize); // let teardown allocate freely
         state.deinit();
     }
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const P_ID: u32 = 7;
     var code: [41]Instr = undefined;
@@ -893,7 +893,7 @@ test "A-ii.4 finding-6: a region-rebuild OOM fails CLOSED — physical indices e
         },
         .id = 5,
     };
-    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.registry.cache.append(gpa, t);
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.registry.attach(t);
 
     // Phase 1 — good pass: region armed, physical indices populated.
     state.rebuildEdgeCache();
@@ -963,8 +963,8 @@ test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) r
                 },
                 .id = id_b,
             };
-            try st.registry.cache.append(g, a);
-            try st.registry.cache.append(g, b);
+            try st.registry.attach(a);
+            try st.registry.attach(b);
         }
     }.go;
 
@@ -1005,7 +1005,7 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     var code: [41]Instr = undefined;
     loopDoneCode(&code);
@@ -1110,7 +1110,7 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     var snap_arena = std.heap.ArenaAllocator.init(gpa);
     defer snap_arena.deinit();
     try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &cont.code);
-    for ([_]*Trace{ &cont, &skip, &sibling, &ext }) |t| try state.registry.cache.append(gpa, t);
+    for ([_]*Trace{ &cont, &skip, &sibling, &ext }) |t| try state.registry.attach(t);
     state.rebuildEdgeCache();
     state.rebuildRegions();
 
@@ -1279,7 +1279,7 @@ test "A-ii.4 sibling boundary edge: only the physical MEMBER's exits are credite
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const P_ID: u32 = 7;
     var code: [41]Instr = undefined;
@@ -1359,7 +1359,7 @@ test "A-ii.4 sibling boundary edge: only the physical MEMBER's exits are credite
         .id = 5,
     };
 
-    for ([_]*Trace{ &ta, &tb, &tas, &tc, &tx }) |t| try state.registry.cache.append(gpa, t);
+    for ([_]*Trace{ &ta, &tb, &tas, &tc, &tx }) |t| try state.registry.attach(t);
     state.rebuildEdgeCache();
     state.rebuildRegions();
 
@@ -1461,7 +1461,7 @@ test "A-ii.4 rebind tombstone: same edge set, incompatible member_points → arm
                 },
                 .id = ids[2],
             };
-            for ([_]*Trace{ a, b, x }) |t| try st.registry.cache.append(g, t);
+            for ([_]*Trace{ a, b, x }) |t| try st.registry.attach(t);
         }
     }.go;
 
@@ -1525,8 +1525,8 @@ test "A-ii.4 lifetime: removeTrace preserves region_defs (logical); clearCache e
         },
         .id = 2,
     };
-    try state.registry.cache.append(gpa, a);
-    try state.registry.cache.append(gpa, b);
+    try state.registry.attach(a);
+    try state.registry.attach(b);
     state.rebuildEdgeCache();
     state.rebuildRegions();
     try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
@@ -1557,7 +1557,7 @@ test "inc-B closed SCC: link-fed root elected + armable; boundary edge hands ele
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const P_ID: u32 = 21;
     var code: [41]Instr = undefined;
@@ -1591,7 +1591,7 @@ test "inc-B closed SCC: link-fed root elected + armable; boundary edge hands ele
         },
         .id = 2,
     };
-    for ([_]*Trace{ &root, &cont }) |t| try state.registry.cache.append(gpa, t);
+    for ([_]*Trace{ &root, &cont }) |t| try state.registry.attach(t);
     state.rebuildEdgeCache();
     state.rebuildRegions();
 
@@ -1626,7 +1626,7 @@ test "inc-B closed SCC: link-fed root elected + armable; boundary edge hands ele
         },
         .id = 3,
     };
-    try state.registry.cache.append(gpa, &ext);
+    try state.registry.attach(&ext);
     state.rebuildEdgeCache();
     state.rebuildRegions();
     try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
@@ -1639,7 +1639,7 @@ test "inc-B closed SCC: link-fed root elected + armable; boundary edge hands ele
     // (3) The boundary edge retires again (codex rebind nuance): the region
     // stays armable through the fallback — owner/armability are recomputed per
     // rebuild and the closed-SCC proof still holds. Same RegionId throughout.
-    _ = state.registry.cache.swapRemove(2); // drop &ext
+    try testing.expect(state.registry.detach(state.registry.cache.items[2])); // drop &ext
     state.rebuildEdgeCache();
     state.rebuildRegions();
     try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
@@ -1666,7 +1666,7 @@ test "inc-B negatives: guard-fed root, foreign-proto link, and inlined link all 
     {
         var state = TraceState.init(gpa);
         defer state.deinit();
-        defer state.registry.cache.clearRetainingCapacity();
+        defer state.registry.detachAll();
         var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
         var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
         var root: Trace = .{
@@ -1679,7 +1679,7 @@ test "inc-B negatives: guard-fed root, foreign-proto link, and inlined link all 
             .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
             .id = 2,
         };
-        for ([_]*Trace{ &root, &cont }) |t| try state.registry.cache.append(gpa, t);
+        for ([_]*Trace{ &root, &cont }) |t| try state.registry.attach(t);
         state.rebuildEdgeCache();
         state.rebuildRegions();
         try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
@@ -1694,7 +1694,7 @@ test "inc-B negatives: guard-fed root, foreign-proto link, and inlined link all 
     {
         var state = TraceState.init(gpa);
         defer state.deinit();
-        defer state.registry.cache.clearRetainingCapacity();
+        defer state.registry.detachAll();
         var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
         var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
         var root: Trace = .{
@@ -1707,7 +1707,7 @@ test "inc-B negatives: guard-fed root, foreign-proto link, and inlined link all 
             .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
             .id = 2,
         };
-        for ([_]*Trace{ &root, &cont }) |t| try state.registry.cache.append(gpa, t);
+        for ([_]*Trace{ &root, &cont }) |t| try state.registry.attach(t);
         state.rebuildEdgeCache();
         state.rebuildRegions();
         try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
@@ -1719,7 +1719,7 @@ test "inc-B negatives: guard-fed root, foreign-proto link, and inlined link all 
     {
         var state = TraceState.init(gpa);
         defer state.deinit();
-        defer state.registry.cache.clearRetainingCapacity();
+        defer state.registry.detachAll();
         var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
         var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
         var root: Trace = .{
@@ -1732,7 +1732,7 @@ test "inc-B negatives: guard-fed root, foreign-proto link, and inlined link all 
             .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
             .id = 2,
         };
-        for ([_]*Trace{ &root, &cont }) |t| try state.registry.cache.append(gpa, t);
+        for ([_]*Trace{ &root, &cont }) |t| try state.registry.attach(t);
         state.rebuildEdgeCache();
         state.rebuildRegions();
         try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
@@ -1758,7 +1758,7 @@ test "inc-B ambiguity + node-counting: two link-fed roots stay unarmable; two li
     {
         var state = TraceState.init(gpa);
         defer state.deinit();
-        defer state.registry.cache.clearRetainingCapacity();
+        defer state.registry.detachAll();
         var ra_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 10 }, .{ .op = .loop } };
         var ra_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
         var ra: Trace = .{
@@ -1783,7 +1783,7 @@ test "inc-B ambiguity + node-counting: two link-fed roots stay unarmable; two li
             .code = .{ .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &cb_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cb_p },
             .id = 4,
         };
-        for ([_]*Trace{ &ra, &ca, &rb, &cb }) |t| try state.registry.cache.append(gpa, t);
+        for ([_]*Trace{ &ra, &ca, &rb, &cb }) |t| try state.registry.attach(t);
         state.rebuildEdgeCache();
         state.rebuildRegions();
         try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
@@ -1796,7 +1796,7 @@ test "inc-B ambiguity + node-counting: two link-fed roots stay unarmable; two li
     {
         var state = TraceState.init(gpa);
         defer state.deinit();
-        defer state.registry.cache.clearRetainingCapacity();
+        defer state.registry.detachAll();
         var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .guard_true, .a = 0, .aux = 10 }, .{ .op = .loop } };
         var root_p = [_]ExitProvEntry{
             .{ .index = 0, .prov = guardProv(6, .loop_done) },
@@ -1818,7 +1818,7 @@ test "inc-B ambiguity + node-counting: two link-fed roots stay unarmable; two li
             .code = .{ .anchor = .{ .proto = &proto, .pc = 10 }, .instrs = &cbb_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cbb_p },
             .id = 3,
         };
-        for ([_]*Trace{ &root, &ca, &cbb }) |t| try state.registry.cache.append(gpa, t);
+        for ([_]*Trace{ &root, &ca, &cbb }) |t| try state.registry.attach(t);
         state.rebuildEdgeCache();
         state.rebuildRegions();
         try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
@@ -1942,8 +1942,8 @@ test "doc 58 §4.8: sequential loop roots in a closed cycle elect the root whose
     for (orders) |order| {
         var state = TraceState.init(gpa);
         defer state.deinit();
-        defer state.registry.cache.clearRetainingCapacity();
-        for (order) |i| try state.registry.cache.append(gpa, all[i]);
+        defer state.registry.detachAll();
+        for (order) |i| try state.registry.attach(all[i]);
         state.rebuildEdgeCache();
         state.rebuildRegions();
 
@@ -1980,7 +1980,7 @@ test "doc 58 §4.8: sequential loop roots in a closed cycle elect the root whose
             .code = .{ .anchor = .{ .proto = proto, .pc = hr }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p },
             .id = 9,
         };
-        try state.registry.cache.append(gpa, &ext);
+        try state.registry.attach(&ext);
         state.rebuildEdgeCache();
         state.rebuildRegions();
         try testing.expectEqual(rid, try onlyRegion(&state));
@@ -1992,9 +1992,9 @@ test "doc 58 §4.8: sequential loop roots in a closed cycle elect the root whose
         }
 
         // (4) The external entry retires: back to the fallback tier's election.
-        for (state.registry.cache.items, 0..) |t, i| {
+        for (state.registry.cache.items) |t| {
             if (t.id == 9) {
-                _ = state.registry.cache.swapRemove(i);
+                _ = state.registry.detach(t);
                 break;
             }
         }
@@ -2049,8 +2049,8 @@ test "doc 58 §4.8: loop roots in sibling branches of a closed cycle stay unarma
 
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
-    for ([_]*Trace{ &a.root, &a.cont, &b.root, &b.cont }) |t| try state.registry.cache.append(gpa, t);
+    defer state.registry.detachAll();
+    for ([_]*Trace{ &a.root, &a.cont, &b.root, &b.cont }) |t| try state.registry.attach(t);
     state.rebuildEdgeCache();
     state.rebuildRegions();
     const def = state.region_policy.region_defs.get(try onlyRegion(&state)).?;
@@ -2063,7 +2063,7 @@ test "inc-B open SCC: an incoming boundary edge into a NON-root member disables 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const P_ID: u32 = 24;
     var code: [41]Instr = undefined;
@@ -2093,7 +2093,7 @@ test "inc-B open SCC: an incoming boundary edge into a NON-root member disables 
         .code = .{ .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p },
         .id = 3,
     };
-    for ([_]*Trace{ &root, &cont, &ext }) |t| try state.registry.cache.append(gpa, t);
+    for ([_]*Trace{ &root, &cont, &ext }) |t| try state.registry.attach(t);
     state.rebuildEdgeCache();
     state.rebuildRegions();
     try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
@@ -2105,7 +2105,7 @@ test "inc-B fallback_owner flag: set on fallback mint, cleared when the primary 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const P_ID: u32 = 25;
     var code: [41]Instr = undefined;
@@ -2125,8 +2125,8 @@ test "inc-B fallback_owner flag: set on fallback mint, cleared when the primary 
         .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
         .id = 2,
     };
-    try state.registry.cache.append(gpa, &root);
-    try state.registry.cache.append(gpa, &cont);
+    try state.registry.attach(&root);
+    try state.registry.attach(&cont);
     state.rebuildEdgeCache();
     state.rebuildRegions();
     try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
@@ -2148,7 +2148,7 @@ test "inc-B fallback_owner flag: set on fallback mint, cleared when the primary 
         .code = .{ .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p },
         .id = 3,
     };
-    try state.registry.cache.append(gpa, &ext);
+    try state.registry.attach(&ext);
     state.rebuildEdgeCache();
     state.rebuildRegions();
     {
@@ -2159,9 +2159,9 @@ test "inc-B fallback_owner flag: set on fallback mint, cleared when the primary 
 
     // Remove the external entry again: the fallback re-elects and the flag
     // comes back — strike-out policy tracks the CURRENT election tier.
-    for (state.registry.cache.items, 0..) |t, i| {
+    for (state.registry.cache.items) |t| {
         if (t.id == 3) {
-            _ = state.registry.cache.swapRemove(i);
+            _ = state.registry.detach(t);
             break;
         }
     }
@@ -2261,7 +2261,7 @@ test "inc-B dormancy: fallback mint is dormant + excluded from receipt maps; tie
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const P_ID: u32 = 27;
     var code: [41]Instr = undefined;
@@ -2281,8 +2281,8 @@ test "inc-B dormancy: fallback mint is dormant + excluded from receipt maps; tie
         .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
         .id = 2,
     };
-    try state.registry.cache.append(gpa, &root);
-    try state.registry.cache.append(gpa, &cont);
+    try state.registry.attach(&root);
+    try state.registry.attach(&cont);
     state.rebuildEdgeCache();
     state.rebuildRegions();
     try testing.expectEqual(@as(usize, 1), state.region_policy.region_defs.count());
@@ -2319,7 +2319,7 @@ test "inc-B dormancy: fallback mint is dormant + excluded from receipt maps; tie
         .code = .{ .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p },
         .id = 3,
     };
-    try state.registry.cache.append(gpa, &ext);
+    try state.registry.attach(&ext);
     state.rebuildEdgeCache();
     state.rebuildRegions();
     {
@@ -2342,9 +2342,9 @@ test "inc-B dormancy: fallback mint is dormant + excluded from receipt maps; tie
         d.instability = 7;
         d.receipts_debit = 9999;
     }
-    for (state.registry.cache.items, 0..) |t, i| {
+    for (state.registry.cache.items) |t| {
         if (t.id == 3) {
-            _ = state.registry.cache.swapRemove(i);
+            _ = state.registry.detach(t);
             break;
         }
     }

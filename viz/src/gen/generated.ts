@@ -625,9 +625,14 @@ export class IrInstrDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized. `peeled` (doc 39, wire v3): 1 when the trace was committed from a type-stabilizing peel — its preheader run-once region is a REAL tier-0 iteration, so the first back-edge completes two iterations and a zero-completion deopt replays from the entry state. Semantic, not inferable from the marker (an LICM preheader completes zero iterations).
+ * A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized. `peeled` (doc 39, wire v3): 1 when the trace was committed from a type-stabilizing peel — its preheader run-once region is a REAL tier-0 iteration, so the first back-edge completes two iterations and a zero-completion deopt replays from the entry state. Semantic, not inferable from the marker (an LICM preheader completes zero iterations). `id` (doc 61 §7.1, wire v5): the trace's stable `Trace.id`, never reused; execution logs join to their trace by it.
  */
 export interface TraceInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  id: number;
   /**
    * 32-bit Unsigned Integer
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
@@ -676,9 +681,14 @@ export interface TraceInput {
 }
 
 /**
- * A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized. `peeled` (doc 39, wire v3): 1 when the trace was committed from a type-stabilizing peel — its preheader run-once region is a REAL tier-0 iteration, so the first back-edge completes two iterations and a zero-completion deopt replays from the entry state. Semantic, not inferable from the marker (an LICM preheader completes zero iterations).
+ * A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized. `peeled` (doc 39, wire v3): 1 when the trace was committed from a type-stabilizing peel — its preheader run-once region is a REAL tier-0 iteration, so the first back-edge completes two iterations and a zero-completion deopt replays from the entry state. Semantic, not inferable from the marker (an LICM preheader completes zero iterations). `id` (doc 61 §7.1, wire v5): the trace's stable `Trace.id`, never reused; execution logs join to their trace by it.
  */
 export interface TraceOutput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  id: number;
   /**
    * 32-bit Unsigned Integer
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
@@ -739,6 +749,7 @@ export class TraceEncoder extends BitStreamEncoder {
     // Reset compression dictionary for each encode
     this.compressionDict.clear();
 
+    this.writeUint32(value.id, "little_endian");
     this.writeUint32(value.anchor_proto_id, "little_endian");
     this.writeUint32(value.anchor_pc, "little_endian");
     this.writeUint8(value.peeled);
@@ -774,7 +785,7 @@ export class TraceEncoder extends BitStreamEncoder {
    */
   calculateSize(value: Trace): number {
     let size = 0;
-    size += 9; // anchor_proto_id + anchor_pc + peeled
+    size += 13; // id + anchor_proto_id + anchor_pc + peeled
     // instrs: array (kind: length_prefixed)
     for (const item of value.instrs) {
       const instrs_itemEncoder = new IrInstrEncoder();
@@ -805,6 +816,7 @@ export class TraceDecoder extends SeekableBitStreamDecoder {
   decode(): TraceOutput {
     const value: any = {};
 
+    value.id = this.readUint32("little_endian");
     value.anchor_proto_id = this.readUint32("little_endian");
     value.anchor_pc = this.readUint32("little_endian");
     value.peeled = this.readUint8();
@@ -972,6 +984,7 @@ export class TraceFileDecoder extends SeekableBitStreamDecoder {
     for (let i = 0; i < traces_length; i++) {
       let traces__iter: any;
       traces__iter = {};
+      traces__iter.id = this.readUint32("little_endian");
       traces__iter.anchor_proto_id = this.readUint32("little_endian");
       traces__iter.anchor_pc = this.readUint32("little_endian");
       traces__iter.peeled = this.readUint8();
@@ -3938,7 +3951,7 @@ export class TraceEntryDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * All recorded entries (exit ramps) for one cached trace, keyed by `trace_id` — the trace's index in the cache, which is also the viz's trace-selection key. `entries_capped` = the entry cap was hit and further entries were not recorded.
+ * All recorded entries (exit ramps) for one cached trace, keyed by `trace_id` — the trace's stable `Trace.id`, matching `Trace.id` in the trace file (a retired trace's log is dropped with it). `entries_capped` = the entry cap was hit and further entries were not recorded.
  */
 export interface TraceExecLogInput {
   /**
@@ -3964,7 +3977,7 @@ export interface TraceExecLogInput {
 }
 
 /**
- * All recorded entries (exit ramps) for one cached trace, keyed by `trace_id` — the trace's index in the cache, which is also the viz's trace-selection key. `entries_capped` = the entry cap was hit and further entries were not recorded.
+ * All recorded entries (exit ramps) for one cached trace, keyed by `trace_id` — the trace's stable `Trace.id`, matching `Trace.id` in the trace file (a retired trace's log is dropped with it). `entries_capped` = the entry cap was hit and further entries were not recorded.
  */
 export interface TraceExecLogOutput {
   /**

@@ -1384,9 +1384,11 @@ pub fn sgmatchCore(heap: *gc.Heap, state: *Table, expected_pat: *const String) i
 }
 
 /// Doc 30 `scap_str` core: intern the byte span in scratch slot `slot`.
-/// ≤1 `Heap.link` (intern hit: 0, miss: 1); null = OOM — the snew side-exit
-/// protocol (no link preceded the failure; the id stream stays clean).
-pub fn scapStrCore(heap: *gc.Heap, slot: usize) ?*String {
+/// ≤1 `Heap.link` (intern hit: 0, miss: 1). Fails link-free either way (the
+/// id stream stays clean): `error.OutOfMemory` from the intern, or
+/// `error.StaleScratch` from the defense-in-depth checks below — the stralloc
+/// shim's OOM and decline arms respectively.
+pub fn scapStrCore(heap: *gc.Heap, slot: usize) (error{StaleScratch} || std.mem.Allocator.Error)!*String {
     std.debug.assert(slot < gc.MatchScratch.n_slots);
     const sc = &heap.match_scratch;
     // Defense in depth (doc 30 c3): a legitimately recorded trace's scap
@@ -1394,16 +1396,16 @@ pub fn scapStrCore(heap: *gc.Heap, slot: usize) ?*String {
     // so the scratch is this fill's. But "never trust the IR" — a hand-built
     // or corrupted trace could project from virgin scratch (subj == 0) or a
     // slot the latest fill didn't touch (a stale span against a shorter
-    // subject). Both collapse to the null side-exit arm: no link happened,
+    // subject). Both collapse to the decline side-exit arm: no link happened,
     // the id stream is clean, tier-0 replays the iteration and produces the
     // real value (or raise) itself.
-    if (sc.subj == 0) return null;
+    if (sc.subj == 0) return error.StaleScratch;
     const sobj: *const String = @ptrFromInt(sc.subj);
     const init: usize = @intCast(sc.words[2 * slot]);
     const len: usize = @intCast(sc.words[2 * slot + 1]);
     const b = sobj.bytes();
-    if (init > b.len or len > b.len - init) return null;
-    return heap.intern(b[init .. init + len]) catch null;
+    if (init > b.len or len > b.len - init) return error.StaleScratch;
+    return heap.intern(b[init .. init + len]);
 }
 
 // -- gsub -------------------------------------------------------------------
@@ -2269,9 +2271,9 @@ test "doc 30: scapStrCore interns the span (identity with the intern table)" {
     defer heap.deinit();
     const subj = try heap.intern("key=val");
     try t30.expectEqual(MatchStatus.ok, smatchCore(&heap, subj, 1, "(%a+)=(%a+)"));
-    const c0 = scapStrCore(&heap, gc.MatchScratch.slot_cap0 + 0).?;
-    const c1 = scapStrCore(&heap, gc.MatchScratch.slot_cap0 + 1).?;
-    const whole = scapStrCore(&heap, gc.MatchScratch.slot_whole).?;
+    const c0 = try scapStrCore(&heap, gc.MatchScratch.slot_cap0 + 0);
+    const c1 = try scapStrCore(&heap, gc.MatchScratch.slot_cap0 + 1);
+    const whole = try scapStrCore(&heap, gc.MatchScratch.slot_whole);
     // Interning: the projections ARE the canonical objects for those bytes.
     try t30.expectEqual(try heap.intern("key"), c0);
     try t30.expectEqual(try heap.intern("val"), c1);

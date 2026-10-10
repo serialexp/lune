@@ -170,6 +170,70 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
         if (e.from == e.to) has_self[comp[e.from]] = true;
     }
 
+    // Per-component node and internal-edge lists (CSR, each in ascending
+    // node / edge order) and the per-node facts the candidate loop reads, so
+    // one candidate costs O(its own nodes + edges), never O(graph): the
+    // whole build stays linear in the graph however many cycles it holds.
+    const comp_node_off = try gpa.alloc(u32, ncomp + 1);
+    defer gpa.free(comp_node_off);
+    @memset(comp_node_off, 0);
+    for (0..nnodes) |n| comp_node_off[comp[n] + 1] += 1;
+    for (1..ncomp + 1) |i| comp_node_off[i] += comp_node_off[i - 1];
+    const comp_nodes = try gpa.alloc(u32, nnodes);
+    defer gpa.free(comp_nodes);
+    // `local_of[n]`: n's position in its component's node list.
+    const local_of = try gpa.alloc(u32, nnodes);
+    defer gpa.free(local_of);
+    const comp_edge_off = try gpa.alloc(u32, ncomp + 1);
+    defer gpa.free(comp_edge_off);
+    @memset(comp_edge_off, 0);
+    for (edges.items) |e| {
+        if (comp[e.from] == comp[e.to]) comp_edge_off[comp[e.from] + 1] += 1;
+    }
+    for (1..ncomp + 1) |i| comp_edge_off[i] += comp_edge_off[i - 1];
+    const comp_edges = try gpa.alloc(u32, comp_edge_off[ncomp]);
+    defer gpa.free(comp_edges);
+    {
+        const cursor = try gpa.alloc(u32, ncomp);
+        defer gpa.free(cursor);
+        @memcpy(cursor, comp_node_off[0..ncomp]);
+        for (0..nnodes) |n| {
+            const c = comp[n];
+            comp_nodes[cursor[c]] = @intCast(n);
+            local_of[n] = cursor[c] - comp_node_off[c];
+            cursor[c] += 1;
+        }
+        @memcpy(cursor, comp_edge_off[0..ncomp]);
+        for (edges.items, 0..) |e, ei| {
+            const c = comp[e.from];
+            if (c != comp[e.to]) continue;
+            comp_edges[cursor[c]] = @intCast(ei);
+            cursor[c] += 1;
+        }
+    }
+    // `ext_dest[n]`: n is the destination of a boundary (cross-component) edge.
+    const ext_dest = try gpa.alloc(bool, nnodes);
+    defer gpa.free(ext_dest);
+    @memset(ext_dest, false);
+    for (edges.items) |e| {
+        if (comp[e.from] != comp[e.to]) ext_dest[e.to] = true;
+    }
+    // `inner_root[n]`: a trace of inner-loop-root shape is bound at n. A node
+    // whose proto is unknown reads false here; the candidate loop still
+    // fails closed on it before reading this.
+    const inner_root = try gpa.alloc(bool, nnodes);
+    defer gpa.free(inner_root);
+    for (nodes.items, inner_root) |a, *r| {
+        r.* = if (proto_by_id.get(a.proto_id)) |p| view.hasInnerRootAt(p, a.pc) else false;
+    }
+    // Per-candidate scratch, reused across candidates.
+    var comp_pcs: std.ArrayListUnmanaged(u32) = .empty;
+    defer comp_pcs.deinit(gpa);
+    var qualifies_local: std.ArrayListUnmanaged(bool) = .empty;
+    defer qualifies_local.deinit(gpa);
+    var bridge_edges: std.ArrayListUnmanaged(u32) = .empty;
+    defer bridge_edges.deinit(gpa);
+
     // 3. Gather one Candidate per cycle-bearing SCC (all scratch, fallible).
     const Candidate = struct {
         comp: u32,
@@ -213,17 +277,18 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
     for (0..ncomp) |cc| {
         const c: u32 = @intCast(cc);
         if (!(comp_size[c] >= 2 or has_self[c])) continue;
+        const c_nodes = comp_nodes[comp_node_off[c]..comp_node_off[c + 1]];
+        const c_edges = comp_edges[comp_edge_off[c]..comp_edge_off[c + 1]];
 
         // 3a. Internal edges (both endpoints in c), sorted + deduped → identity set.
         var internal_list: std.ArrayListUnmanaged(StructuralEdgeId) = .empty;
         defer internal_list.deinit(gpa);
         var mt_list: std.ArrayListUnmanaged(u32) = .empty;
         defer mt_list.deinit(gpa);
-        for (edges.items) |e| {
-            if (comp[e.from] == c and comp[e.to] == c) {
-                try internal_list.append(gpa, e.eid);
-                try mt_list.append(gpa, e.key.trace_id);
-            }
+        for (c_edges) |ei| {
+            const e = edges.items[ei];
+            try internal_list.append(gpa, e.eid);
+            try mt_list.append(gpa, e.key.trace_id);
         }
         std.mem.sort(StructuralEdgeId, internal_list.items, {}, StructuralEdgeId.lessThan);
         var uniq_internal: std.ArrayListUnmanaged(StructuralEdgeId) = .empty;
@@ -282,7 +347,8 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
         // slot-bound phi defines (kills) that slot on the edge; the shared A-v E
         // query is the one definition of that dominance fact. Thus live_in[to] is
         // exactly successor entry_slots union values live through later cycle edges.
-        const live_in = try gpa.alloc(std.ArrayListUnmanaged(u16), nnodes);
+        // Indexed by component-local node (`local_of`).
+        const live_in = try gpa.alloc(std.ArrayListUnmanaged(u16), c_nodes.len);
         defer {
             for (live_in) |*set| set.deinit(gpa);
             gpa.free(live_in);
@@ -292,17 +358,19 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
             const t = view.traceById(tid) orelse continue;
             const ni = node_index.get(.{ .proto_id = t.code.anchor.proto.id, .pc = t.code.anchor.pc }) orelse
                 return error.RegionGraphInconsistent;
-            for (t.code.entry_slots) |slot| _ = try appendUniqueSlot(&live_in[ni], gpa, slot);
+            // A realizer of an internal edge anchors at that edge's source.
+            std.debug.assert(comp[ni] == c);
+            for (t.code.entry_slots) |slot| _ = try appendUniqueSlot(&live_in[local_of[ni]], gpa, slot);
         }
         var changed = true;
         while (changed) {
             changed = false;
-            for (edges.items) |e| {
-                if (comp[e.from] != c or comp[e.to] != c) continue;
+            for (c_edges) |ei| {
+                const e = edges.items[ei];
                 const parent = view.traceById(e.key.trace_id) orelse continue;
-                for (live_in[e.to].items) |slot| {
+                for (live_in[local_of[e.to]].items) |slot| {
                     if (parent.code.bridgeEmitsSlot(e.key.exit_instr, slot)) continue;
-                    if (try appendUniqueSlot(&live_in[e.from], gpa, slot)) changed = true;
+                    if (try appendUniqueSlot(&live_in[local_of[e.from]], gpa, slot)) changed = true;
                 }
             }
         }
@@ -317,18 +385,30 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
             gpa.free(b.required_slots);
             gpa.free(b.invariant_slots);
         };
-        for (edges.items) |e| {
-            if (comp[e.from] != c or comp[e.to] != c) continue;
+        // Bridge-capable internal edges in `StructuralEdgeId` order: the
+        // realizations of one logical edge are then adjacent, so a repeat can
+        // only match the last descriptor, and `bridge_list` comes out sorted.
+        bridge_edges.clearRetainingCapacity();
+        for (c_edges) |ei| {
+            const e = edges.items[ei];
             const parent = view.traceById(e.key.trace_id) orelse continue;
             if (!parent.code.isBridgeCandidate(e.key.exit_instr)) continue;
-
-            var existing: ?*RegionBridgeDef = null;
-            for (bridge_list.items) |*b| {
-                if (b.edge.eql(e.eid)) {
-                    existing = b;
-                    break;
-                }
+            try bridge_edges.append(gpa, ei);
+        }
+        std.mem.sort(u32, bridge_edges.items, edges.items, struct {
+            fn less(es: []const Edge, a: u32, b: u32) bool {
+                return es[a].eid.order(es[b].eid) == .lt;
             }
+        }.less);
+        for (bridge_edges.items) |ei| {
+            const e = edges.items[ei];
+            const parent = view.traceById(e.key.trace_id).?;
+
+            const existing: ?*RegionBridgeDef = if (bridge_list.items.len != 0 and
+                bridge_list.items[bridge_list.items.len - 1].edge.eql(e.eid))
+                &bridge_list.items[bridge_list.items.len - 1]
+            else
+                null;
             if (existing) |b| {
                 // Multiple physical realizations of one logical edge: retain only
                 // invariants proven unchanged by every realization.
@@ -344,7 +424,7 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
                 continue;
             }
 
-            const required = try gpa.dupe(u16, live_in[e.to].items);
+            const required = try gpa.dupe(u16, live_in[local_of[e.to]].items);
             errdefer gpa.free(required);
             // A required slot outside E is "invariant" across the bridge in the
             // sense that the stub leaves its slab value as the guest's: the
@@ -369,11 +449,6 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
                 .invariant_slots = invariants,
             });
         }
-        std.mem.sort(RegionBridgeDef, bridge_list.items, {}, struct {
-            fn less(_: void, a: RegionBridgeDef, b: RegionBridgeDef) bool {
-                return a.edge.order(b.edge) == .lt;
-            }
-        }.less);
         const bridges = try gpa.dupe(RegionBridgeDef, bridge_list.items);
         bridge_list.clearRetainingCapacity();
         errdefer freeRegionBridges(gpa, bridges);
@@ -385,20 +460,28 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
         var both_count: usize = 0;
         var owner_node: u32 = 0;
         var smallest: ?AnchorId = null;
-        for (0..nnodes) |n| {
-            if (comp[n] != c) continue;
+        // The component's proto (when it has one) and its sorted member pcs:
+        // the `enclosing` test below is then two binary searches per node.
+        var single_proto: ?u32 = null;
+        var multi_proto = false;
+        var open = false; // some member is the destination of a boundary edge
+        comp_pcs.clearRetainingCapacity();
+        for (c_nodes) |n| {
+            const a = nodes.items[n];
+            try comp_pcs.append(gpa, a.pc);
+            if (single_proto) |p| {
+                if (p != a.proto_id) multi_proto = true;
+            } else single_proto = a.proto_id;
+            if (ext_dest[n]) open = true;
+        }
+        std.mem.sort(u32, comp_pcs.items, {}, std.sort.asc(u32));
+        for (c_nodes) |n| {
             const a = nodes.items[n];
             if (smallest == null or a.proto_id < smallest.?.proto_id or (a.proto_id == smallest.?.proto_id and a.pc < smallest.?.pc))
                 smallest = a;
-            var is_ext = false;
-            for (edges.items) |e| {
-                if (e.to == @as(u32, @intCast(n)) and comp[e.from] != c) {
-                    is_ext = true;
-                    break;
-                }
-            }
+            const is_ext = ext_dest[n];
             const proto = proto_by_id.get(a.proto_id) orelse return error.RegionGraphInconsistent;
-            const has_root = view.hasInnerRootAt(proto, a.pc);
+            const has_root = inner_root[n];
             // A-vii-d.1: a fully-CLOSED cycle (the whole traced kernel is one
             // SCC — exactly what closing edge 4 produces) has NO incoming
             // boundary edge at all: the region is entered by the DISPATCHER,
@@ -415,15 +498,18 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
             // has `pc < anchor` and is still inside the loop, which is why the
             // member test below compares against both ends of the extent rather
             // than ordering against the anchor (review r2 finding 8).
+            //
+            // Every OTHER member must share the proto and lie in
+            // [ext.start, ext.end]. Same-proto members are distinct anchors,
+            // so their pcs differ from `a.pc`; count the members in range and
+            // discount `a` itself.
             const enclosing = !is_ext and blk: {
                 const ext = bytecode.loopExtentFor(proto, a.pc) orelse break :blk false;
-                for (0..nnodes) |m| {
-                    if (comp[m] != c or m == n) continue;
-                    const b = nodes.items[m];
-                    if (b.proto_id != a.proto_id) break :blk false;
-                    if (b.pc == a.pc or b.pc < ext.start or b.pc > ext.end) break :blk false;
-                }
-                break :blk true;
+                if (multi_proto) break :blk false;
+                const pcs = comp_pcs.items;
+                const in_range = lowerBound(pcs, ext.end +| 1) - lowerBound(pcs, ext.start);
+                const self_in = @intFromBool(a.pc >= ext.start and a.pc <= ext.end);
+                break :blk in_range - self_in == pcs.len - 1;
             };
             if ((is_ext or enclosing) and has_root) {
                 both_count += 1;
@@ -463,40 +549,31 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
         // or several, stays unarmable (sibling-branch loops).
         const primary_count = both_count;
         if (both_count == 0) closed: {
-            for (edges.items) |e| {
-                if (comp[e.to] == c and comp[e.from] != c) break :closed; // open SCC: incoming boundary edge
-            }
-            var scc_proto_id: ?u32 = null;
-            for (0..nnodes) |n| {
-                if (comp[n] != c) continue;
-                const pid = nodes.items[n].proto_id;
-                if (scc_proto_id) |p| {
-                    if (p != pid) break :closed; // cross-proto: out of v1 scope
-                } else scc_proto_id = pid;
-            }
-            const pid = scc_proto_id orelse break :closed;
+            if (open) break :closed; // open SCC: incoming boundary edge
+            if (multi_proto) break :closed; // cross-proto: out of v1 scope
+            const pid = single_proto orelse break :closed;
             const proto = proto_by_id.get(pid) orelse return error.RegionGraphInconsistent;
+            // One pass over the internal edges marks the qualifying
+            // destinations; collecting them in node order keeps the
+            // qualifier list in the same (ascending) order as before.
+            try qualifies_local.resize(gpa, c_nodes.len);
+            @memset(qualifies_local.items, false);
+            for (c_edges) |ei| {
+                const e = edges.items[ei];
+                if (e.from == e.to) continue;
+                if (!inner_root[e.to] or inner_root[e.from]) continue;
+                switch (e.eid.exit) {
+                    .link_terminal => |lt| {
+                        if (lt.inline_depth != 0) continue;
+                        if (lt.source_proto_id != pid) continue;
+                        qualifies_local.items[local_of[e.to]] = true;
+                    },
+                    .guard => continue,
+                }
+            }
             fallback_qualifiers.clearRetainingCapacity();
-            for (0..nnodes) |n| {
-                if (comp[n] != c) continue;
-                if (!view.hasInnerRootAt(proto, nodes.items[n].pc)) continue;
-                const qualifies = blk: {
-                    for (edges.items) |e| {
-                        if (e.to != @as(u32, @intCast(n)) or e.from == e.to) continue;
-                        if (comp[e.from] != c) continue;
-                        if (view.hasInnerRootAt(proto, nodes.items[e.from].pc)) continue;
-                        switch (e.eid.exit) {
-                            .link_terminal => |lt| {
-                                if (lt.inline_depth != 0) continue;
-                                if (lt.source_proto_id != pid) continue;
-                                break :blk true;
-                            },
-                            .guard => continue,
-                        }
-                    }
-                    break :blk false;
-                };
-                if (qualifies) try fallback_qualifiers.append(gpa, @intCast(n));
+            for (c_nodes) |n| {
+                if (qualifies_local.items[local_of[n]]) try fallback_qualifiers.append(gpa, n);
             }
             const qualifiers = fallback_qualifiers.items;
             both_count = qualifiers.len;
@@ -505,14 +582,17 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
             } else if (qualifiers.len >= 2) {
                 // No tree (a hand-built proto): nothing dominates — fail closed.
                 const dom = proto.dom;
+                // Dominance is DFS-interval containment, so "the gate
+                // dominates every other member" is "the gate's interval holds
+                // the others' envelope, and none is unreachable". The two
+                // extremes per side give the envelope without any one member
+                // in O(1), so this is O(members + qualifiers).
+                var env: DomEnvelope = .{};
+                for (c_nodes) |m| env.add(dom, nodes.items[m].pc, m);
                 var dominant: usize = 0;
                 for (qualifiers) |q| {
                     const gate = bytecode.loopGateOf(proto, nodes.items[q].pc) orelse continue;
-                    const gates_all = for (0..nnodes) |m| {
-                        if (comp[m] != c or m == q) continue;
-                        if (!dom.dominates(gate, nodes.items[m].pc)) break false;
-                    } else true;
-                    if (!gates_all) continue;
+                    if (!env.gatesAllBut(dom, gate, q, nodes.items[q].pc)) continue;
                     dominant += 1;
                     owner_node = q;
                 }
@@ -692,30 +772,28 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
     var dst_builder = RegionSetBuilder(u32){};
     defer dst_builder.deinit(gpa);
 
+    // Component → its active region (each component yields at most one
+    // candidate, hence at most one region).
+    const no_region = std.math.maxInt(u32);
+    const comp_region = try gpa.alloc(u32, ncomp);
+    defer gpa.free(comp_region);
+    @memset(comp_region, no_region);
+    for (active_regions.items, 0..) |a, i| comp_region[a.comp] = @intCast(i);
+
     // source_exit: every RESOLVED exit of a physical member of an armable region —
     // internal edges AND boundary exits that leave the region from a member anchor.
     for (edges.items) |e| {
-        const c = comp[e.from];
-        var ar: ?ActiveRegion = null;
-        for (active_regions.items) |a| {
-            if (a.comp == c) {
-                ar = a;
-                break;
-            }
-        }
-        const R = ar orelse continue;
+        const ri = comp_region[comp[e.from]];
+        if (ri == no_region) continue;
+        const R = active_regions.items[ri];
         // Dormant fallback regions stay OUT of the receipt maps — the whole
         // point of demand admission is that `receiptsInert()` keeps
         // short-circuiting until a ledger proves the region can pay for the
         // per-receipt accounting this map entry would enable.
         if (!R.armable or R.dormant) continue;
-        var is_member = false;
-        for (R.member_trace_ids) |tid| {
-            if (tid == e.key.trace_id) {
-                is_member = true;
-                break;
-            }
-        }
+        // `member_trace_ids` is sorted ascending (3b).
+        const mi = lowerBound(R.member_trace_ids, e.key.trace_id);
+        const is_member = mi < R.member_trace_ids.len and R.member_trace_ids[mi] == e.key.trace_id;
         if (!is_member) continue; // sibling non-member exit at a member anchor
         try src_builder.add(gpa, e.key, R.id);
     }
@@ -744,26 +822,49 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
     // trace entries, seam 8.7% → 45.8%).
     var arr_builder = RegionSetBuilder(u32){};
     defer arr_builder.deinit(gpa);
+    // The sibling links as an undirected adjacency over trace ids: two
+    // half-links per link, chained per id from `sib_first`. Each region's
+    // closure is then a BFS over its own group's links — the same fixpoint as
+    // sweeping every link until nothing grows, at O(group + its links).
+    const no_link = std.math.maxInt(u32);
+    var sib_first: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    defer sib_first.deinit(gpa);
+    const sib_next = try gpa.alloc(u32, 2 * view.sibling_links.len);
+    defer gpa.free(sib_next);
+    const sib_other = try gpa.alloc(u32, 2 * view.sibling_links.len);
+    defer gpa.free(sib_other);
+    for (view.sibling_links, 0..) |l, li| {
+        const halves = [2][2]u32{ .{ l.parent_id, l.child_id }, .{ l.child_id, l.parent_id } };
+        for (halves, 0..) |half, k| {
+            const h: u32 = @intCast(2 * li + k);
+            const gop = try sib_first.getOrPut(gpa, half[0]);
+            sib_next[h] = if (gop.found_existing) gop.value_ptr.* else no_link;
+            gop.value_ptr.* = h;
+            sib_other[h] = half[1];
+        }
+    }
     var group: std.ArrayListUnmanaged(u32) = .empty;
     defer group.deinit(gpa);
+    var in_group: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer in_group.deinit(gpa);
     for (active_regions.items) |a| {
         if (!a.armable or a.dormant) continue;
         for (a.member_trace_ids) |tid| try dst_builder.add(gpa, tid, a.id);
         group.clearRetainingCapacity();
+        in_group.clearRetainingCapacity();
         try group.appendSlice(gpa, a.member_trace_ids);
-        var grew = true;
-        while (grew) {
-            grew = false;
-            for (view.sibling_links) |l| {
-                const has_p = std.mem.indexOfScalar(u32, group.items, l.parent_id) != null;
-                const has_c = std.mem.indexOfScalar(u32, group.items, l.child_id) != null;
-                if (has_p == has_c) continue;
-                const add = if (has_p) l.child_id else l.parent_id;
+        for (a.member_trace_ids) |tid| try in_group.put(gpa, tid, {});
+        var qi: usize = 0;
+        while (qi < group.items.len) : (qi += 1) {
+            var h = sib_first.get(group.items[qi]) orelse continue;
+            while (h != no_link) : (h = sib_next[h]) {
+                const add = sib_other[h];
+                if (in_group.contains(add)) continue;
                 const t = view.traceById(add) orelse continue;
                 const ni = node_index.get(.{ .proto_id = t.code.anchor.proto.id, .pc = t.code.anchor.pc }) orelse continue;
                 if (comp[ni] != a.comp) continue;
+                try in_group.put(gpa, add, {});
                 try group.append(gpa, add);
-                grew = true;
             }
         }
         for (group.items) |tid| try arr_builder.add(gpa, tid, a.id);
@@ -801,4 +902,57 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
         .arrival = new_arrival,
         .next_id = new_id_counter,
     };
+}
+
+/// The DFS-interval envelope of a set of pcs in one proto's dominator tree,
+/// keeping the two most extreme values per side so the envelope without any
+/// single member is O(1). Pre values are distinct per pc, so the extremes
+/// have one owner each.
+const DomEnvelope = struct {
+    const none = bytecode.DomTree.none;
+    unreachable_count: u32 = 0,
+    /// The two smallest `pre` values, ascending; `min_node` owns `min_pre[0]`.
+    min_pre: [2]u32 = .{ none, none },
+    min_node: u32 = none,
+    /// The two largest `post` values, descending; `max_node` owns `max_post[0]`.
+    max_post: [2]u32 = .{ 0, 0 },
+    max_node: u32 = none,
+
+    fn add(self: *DomEnvelope, dom: bytecode.DomTree, pc: u32, node: u32) void {
+        if (!dom.reachable(pc)) {
+            self.unreachable_count += 1;
+            return;
+        }
+        const pre = dom.pre[pc];
+        if (pre < self.min_pre[0]) {
+            self.min_pre = .{ pre, self.min_pre[0] };
+            self.min_node = node;
+        } else if (pre < self.min_pre[1]) self.min_pre[1] = pre;
+        const post = dom.post[pc];
+        if (post > self.max_post[0]) {
+            self.max_post = .{ post, self.max_post[0] };
+            self.max_node = node;
+        } else if (post > self.max_post[1]) self.max_post[1] = post;
+    }
+
+    /// Does `gate` dominate every member except `q` (at `q_pc`)? Exactly
+    /// `dominates(gate, m)` for each other member `m`, over a non-empty rest.
+    fn gatesAllBut(self: DomEnvelope, dom: bytecode.DomTree, gate: u32, q: u32, q_pc: u32) bool {
+        if (!dom.reachable(gate)) return false;
+        if (self.unreachable_count - @intFromBool(!dom.reachable(q_pc)) != 0) return false;
+        const lo = if (self.min_node == q) self.min_pre[1] else self.min_pre[0];
+        const hi = if (self.max_node == q) self.max_post[1] else self.max_post[0];
+        return dom.pre[gate] <= lo and hi <= dom.post[gate];
+    }
+};
+
+/// Index of the first element of ascending `xs` that is ≥ `x` (`xs.len` if none).
+fn lowerBound(xs: []const u32, x: u32) usize {
+    var lo: usize = 0;
+    var hi: usize = xs.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (xs[mid] < x) lo = mid + 1 else hi = mid;
+    }
+    return lo;
 }

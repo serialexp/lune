@@ -108,3 +108,22 @@ test "gc: per-iteration garbage is reclaimed (heap stays bounded)" {
     // below the ~200 a missing collector would leave.
     try testing.expect(vm.heap.object_count < base_objects + 24);
 }
+
+test "gc: a string only a trace's constant pool names is swept as in tier-0 (doc 61 Phase Q)" {
+    // `tostring(7)` inside a hot loop folds to an interned "7" in the trace's
+    // constant pool. Once `f` returns nothing else names it, so tier-0 sweeps it
+    // and the later `tostring(7)` re-interns, taking an object id. A pool that
+    // roots its constants keeps "7" alive in the JIT legs only, so they skip
+    // that allocation and print the table one id lower.
+    try expectProgram(
+        \\local function f()
+        \\  local n = 0
+        \\  for i = 1, 2000 do local s = tostring(7) n = n + #s end
+        \\  return n
+        \\end
+        \\print(f())
+        \\for k = 1, 5000 do local junk = {} end
+        \\local again = tostring(7)
+        \\print({})
+    , "2000\ntable: 0x146d\n");
+}

@@ -88,14 +88,13 @@ test "driveChain ordinary_header: chains to a same-anchor sibling" {
         },
     };
 
-    // Put both traces in the cache.
-    try state.registry.cache.append(gpa, trace_a);
-    try state.registry.cache.append(gpa, trace_b);
-
-    // Set proto on anchors (needed for findTrace lookup).
+    // Set proto on anchors (needed for findTrace lookup), then put both
+    // traces in the cache — the anchor index keys on the published anchor.
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 2 };
     trace_a.code.anchor.proto = &proto;
     trace_b.code.anchor.proto = &proto;
+    try state.registry.attach(trace_a);
+    try state.registry.attach(trace_b);
 
     // Regs: r0=0, r1=4 → Trace B should run 3 iterations (0,1,2;
     // iteration 3 computes 3<4 which is true, runs, then 4<4 fails).
@@ -113,7 +112,7 @@ test "driveChain ordinary_header: chains to a same-anchor sibling" {
 
     // Remove traces from cache before deinit — they have stack-allocated
     // arrays that must not be freed by destroy().
-    state.registry.cache.clearRetainingCapacity();
+    state.registry.detachAll();
     // Free the Trace heap allocations ourselves (instrs/consts/entry_slots
     // are stack memory, so skip those fields by not calling destroy).
     gpa.destroy(trace_a);
@@ -156,8 +155,8 @@ test "driveChain (doc 44 D1): a head-anchored trace never chains — kind check 
             .entry_guards = &.{},
         },
     };
-    try state.registry.cache.append(gpa, trace_a);
-    try state.registry.cache.append(gpa, trace_b);
+    try state.registry.attach(trace_a);
+    try state.registry.attach(trace_b);
     const proto = Proto{ .code = &.{}, .name = "head", .num_registers = 1 };
     trace_a.code.anchor.proto = &proto;
     trace_b.code.anchor.proto = &proto;
@@ -169,7 +168,7 @@ test "driveChain (doc 44 D1): a head-anchored trace never chains — kind check 
     const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a}, false, false);
     try testing.expect(chained == null);
 
-    state.registry.cache.clearRetainingCapacity();
+    state.registry.detachAll();
     gpa.destroy(trace_a);
     gpa.destroy(trace_b);
 }
@@ -178,7 +177,7 @@ test "tryArmSiblingHandoff publishes complete Part-S bookkeeping" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity(); // stack-backed traces
+    defer state.registry.detachAll(); // stack-backed traces
 
     const proto = Proto{
         .code = &.{Instr.op0(.ret)},
@@ -222,8 +221,8 @@ test "tryArmSiblingHandoff publishes complete Part-S bookkeeping" {
             .ordinary_entry = 0xCAFE,
         } },
     };
-    try state.registry.cache.append(gpa, &parent);
-    try state.registry.cache.append(gpa, &child);
+    try state.registry.attach(&parent);
+    try state.registry.attach(&child);
     state.pending_sibling_arm = .{ .trace_id = parent.id, .exit_instr = 0 };
 
     state.tryArmSiblingHandoff(&child, true);
@@ -253,7 +252,7 @@ test "arm validator (doc 44 D10): head-anchored parents carry ONLY .sibling_hand
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity(); // stack-backed traces
+    defer state.registry.detachAll(); // stack-backed traces
 
     const proto = Proto{
         .code = &.{Instr.op0(.ret)},
@@ -295,8 +294,8 @@ test "arm validator (doc 44 D10): head-anchored parents carry ONLY .sibling_hand
             .ordinary_entry = 0xBEEF,
         } },
     };
-    try state.registry.cache.append(gpa, &parent);
-    try state.registry.cache.append(gpa, &child);
+    try state.registry.attach(&parent);
+    try state.registry.attach(&child);
 
     // Every non-handoff kind is refused on a head parent. (`.loop_done_linked`
     // is untestable here: its shape assert fires first in debug — a head
@@ -359,7 +358,7 @@ test "B-iii chained hash-drift (doc 22 §B.6): SEED_HASH_DECLINE still chains on
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity(); // stack/hand-owned traces
+    defer state.registry.detachAll(); // stack/hand-owned traces
     SeedStub.calls = 0;
     SeedStub.rc = trace.NativeSeedCtx.SEED_HASH_DECLINE;
 
@@ -418,8 +417,8 @@ test "B-iii chained hash-drift (doc 22 §B.6): SEED_HASH_DECLINE still chains on
         },
     };
 
-    try state.registry.cache.append(gpa, trace_a);
-    try state.registry.cache.append(gpa, trace_b);
+    try state.registry.attach(trace_a);
+    try state.registry.attach(trace_b);
 
     // --- 1. Fail closed: no ctx installed (hand-built TraceState) → the walk
     // must skip the seeded candidate WITHOUT consulting any twin, exactly the
@@ -474,7 +473,7 @@ test "in-place re-arm releases the displaced sibling latch (sibling -> ordinary 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity(); // stack-backed traces
+    defer state.registry.detachAll(); // stack-backed traces
 
     const proto = Proto{
         .code = &.{Instr.op0(.ret)},
@@ -511,8 +510,8 @@ test "in-place re-arm releases the displaced sibling latch (sibling -> ordinary 
         .id = 46,
         .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .ordinary_entry = 0xD00D } },
     };
-    try state.registry.cache.append(gpa, &parent);
-    try state.registry.cache.append(gpa, &child);
+    try state.registry.attach(&parent);
+    try state.registry.attach(&child);
 
     // sibling: latch counts 1.
     try testing.expect(state.publishSiblingArm(&parent, 0, &child));
@@ -674,7 +673,7 @@ test "B-iv.3 (doc 22 §B.5): findLinkTrace + resolveLoopDoneCont admit a seeded 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity(); // stack-backed traces
+    defer state.registry.detachAll(); // stack-backed traces
 
     const proto = Proto{
         .code = &.{Instr.op0(.ret)},
@@ -706,7 +705,7 @@ test "B-iv.3 (doc 22 §B.5): findLinkTrace + resolveLoopDoneCont admit a seeded 
             .seed_prologue = true,
         } },
     };
-    try state.registry.cache.append(gpa, &cont);
+    try state.registry.attach(&cont);
 
     // Pure selection: seeded is selectable, no episode ctx required.
     try testing.expect(state.findLinkTrace(&proto, 2) == &cont);
@@ -723,7 +722,7 @@ test "B-iv.3 (doc 22 §B.5): armNativeLink .sibling_handoff arms a seeded child 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity(); // stack-backed traces
+    defer state.registry.detachAll(); // stack-backed traces
 
     const proto = Proto{
         .code = &.{Instr.op0(.ret)},
@@ -770,8 +769,8 @@ test "B-iv.3 (doc 22 §B.5): armNativeLink .sibling_handoff arms a seeded child 
             .seed_prologue = true,
         } },
     };
-    try state.registry.cache.append(gpa, &parent);
-    try state.registry.cache.append(gpa, &child);
+    try state.registry.attach(&parent);
+    try state.registry.attach(&child);
 
     // (1) No episode ctx at all → stubEnterable fail-closed → arm refused,
     // slot untouched (the pre-B-iv disposition).
@@ -965,8 +964,8 @@ test "driveChain ir_numeric_for_done: a longer candidate cannot invalidate the c
     };
     try testing.expect(cont.code.instrs.len > failed.code.instrs.len);
 
-    try state.registry.cache.append(gpa, &failed);
-    try state.registry.cache.append(gpa, &cont);
+    try state.registry.attach(&failed);
+    try state.registry.attach(&cont);
 
     // The caller's frame, exactly as `enterSelectedTrace` takes it: sized for
     // the trace that ran, and still live while the chain drive runs beneath it.
@@ -1002,7 +1001,7 @@ test "driveChain ir_numeric_for_done: a longer candidate cannot invalidate the c
     // And the caller's frame is still its own memory afterwards.
     for (vals) |v| try testing.expectEqual(sentinel, v.asInt());
 
-    state.registry.cache.clearRetainingCapacity();
+    state.registry.detachAll();
 }
 
 test "noteRetContTransition (B1', task 27): a hot owner displaces a stale request under a different key" {

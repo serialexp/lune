@@ -104,10 +104,10 @@ fn measure(gpa: std.mem.Allocator, io: std.Io, pad: usize, k: usize) !Row {
 
     var state = trace.TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
     for (rcs) |*rc| {
-        try state.registry.cache.append(gpa, &rc.root);
-        try state.registry.cache.append(gpa, &rc.cont);
+        try state.registry.attach(&rc.root);
+        try state.registry.attach(&rc.cont);
     }
     state.rebuildEdgeCache();
     state.rebuildRegions(); // first sight: mint
@@ -144,7 +144,7 @@ pub fn main(init: std.process.Init) u8 {
         \\
     , .{ reps, "pad", "k", "n", "dom (us)", "rebuild best", "rebuild mean", "elected" });
     const pads = [_]usize{ 0, 20_000 };
-    const ks = [_]usize{ 1, 2, 16, 128, 512 };
+    const ks = [_]usize{ 1, 2, 16, 128, 512, 2048 };
     for (pads) |pad| for (ks) |k| {
         const row = measure(gpa, io, pad, k) catch |e| {
             mahina.io.eprint("bench-topology: error: {s}\n", .{@errorName(e)});

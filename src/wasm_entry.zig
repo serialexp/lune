@@ -655,10 +655,7 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8) !void {
     res.stdout = bufFromSlice(try gpa.dupe(u8, sink.buffered()));
     res.keyframe = bufFromSlice(try mahina.keyframeser.encodeSnapshot(gpa, &vm));
     res.effects = bufFromSlice(try mahina.effectser.encodeFile(gpa, vm.effect_log.items));
-    const codes = try gpa.alloc(*const mahina.trace.TraceCode, vm.trace.registry.cache.items.len);
-    defer gpa.free(codes);
-    for (vm.trace.registry.cache.items, codes) |record, *code| code.* = &record.code;
-    res.trace = bufFromSlice(try mahina.traceser.encodeFile(gpa, codes));
+    res.trace = bufFromSlice(try vm.trace.encodeTraceFile(gpa));
     res.exec_log = bufFromSlice(try mahina.execlogser.encodeFile(gpa, vm.trace.exec_logs.items));
     res.coverage = bufFromSlice(try mahina.coverageser.encodeState(gpa, &vm.trace));
     res.status = 0;

@@ -49,7 +49,7 @@ test "B-2a provenance edge storage retires endpoints, condemns parents, and clea
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity(); // stack-backed traces
+    defer state.registry.detachAll(); // stack-backed traces
 
     try state.provenance_edges.append(gpa, .{ .parent_id = 1, .exit_instr = 10, .child_id = 2 });
     try state.provenance_edges.append(gpa, .{ .parent_id = 3, .exit_instr = 11, .child_id = 1, .strikes = 2 });
@@ -84,8 +84,8 @@ test "B-2a provenance edge storage retires endpoints, condemns parents, and clea
         },
         .id = 9,
     };
-    try state.registry.cache.append(gpa, &condemned_parent);
-    try state.registry.cache.append(gpa, &surviving_parent);
+    try state.registry.attach(&condemned_parent);
+    try state.registry.attach(&surviving_parent);
     try state.provenance_edges.append(gpa, .{ .parent_id = 7, .exit_instr = 14, .child_id = 8 });
     try state.provenance_edges.append(gpa, .{ .parent_id = 9, .exit_instr = 15, .child_id = 10 });
 
@@ -101,7 +101,7 @@ test "B-2b commit provenance creates same-anchor edge, skips null/cross-anchor, 
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "commit-provenance", .num_registers = 1 };
     var parent_instrs = [_]IrInstr{ .{ .op = .guard_true, .aux = 1 }, .{ .op = .loop } };
@@ -137,7 +137,7 @@ test "B-2b commit provenance creates same-anchor edge, skips null/cross-anchor, 
         },
         .id = 53,
     };
-    for ([_]*Trace{ &parent, &child, &cross }) |t| try state.registry.cache.append(gpa, t);
+    for ([_]*Trace{ &parent, &child, &cross }) |t| try state.registry.attach(t);
 
     state.finishSideTraceProvenance(&child, .{ .trace_id = parent.id, .exit_instr = 0 });
     try testing.expectEqual(@as(usize, 1), state.provenance_edges.items.len);
@@ -164,7 +164,7 @@ test "B-2b commit provenance OOM does not latch DONE" {
     defer {
         fa.fail_index = std.math.maxInt(usize);
         fa.resize_fail_index = std.math.maxInt(usize);
-        state.registry.cache.clearRetainingCapacity();
+        state.registry.detachAll();
         state.deinit();
     }
 
@@ -188,8 +188,8 @@ test "B-2b commit provenance OOM does not latch DONE" {
         },
         .id = 62,
     };
-    try state.registry.cache.append(gpa, &parent);
-    try state.registry.cache.append(gpa, &child);
+    try state.registry.attach(&parent);
+    try state.registry.attach(&child);
     fa.fail_index = fa.alloc_index;
     fa.resize_fail_index = fa.resize_index;
 
@@ -203,7 +203,7 @@ test "B-2b provenance drain arms compiled children, deletes unsupported edges, p
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "provenance-drain", .num_registers = 1 };
     var parent_instrs = [_]IrInstr{ .{ .op = .guard_true, .aux = 1 }, .{ .op = .loop } };
@@ -243,9 +243,9 @@ test "B-2b provenance drain arms compiled children, deletes unsupported edges, p
         .entry_slots = &.{},
         .entry_guards = &.{},
     }, .id = 73, .native = .unsupported };
-    try state.registry.cache.append(gpa, &parent);
-    try state.registry.cache.append(gpa, &child);
-    try state.registry.cache.append(gpa, &child_bad);
+    try state.registry.attach(&parent);
+    try state.registry.attach(&child);
+    try state.registry.attach(&child_bad);
     try state.provenance_edges.append(gpa, .{ .parent_id = parent.id, .exit_instr = 0, .child_id = child.id });
     try state.provenance_edges.append(gpa, .{ .parent_id = parent.id, .exit_instr = 0, .child_id = child_bad.id });
     state.provenance_arms_pending = true; // finishSideTraceProvenance sets this on append
@@ -288,7 +288,7 @@ test "provenance drain (task #28): a precise endpoint deletes the edge permanent
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "provenance-precise", .num_registers = 1 };
     var precise_parent: Trace = .{
@@ -327,10 +327,10 @@ test "provenance drain (task #28): a precise endpoint deletes the edge permanent
         .entry_guards = &.{},
         .deopt_mode = .precise,
     }, .id = 104 };
-    try state.registry.cache.append(gpa, &precise_parent);
-    try state.registry.cache.append(gpa, &ordinary_child);
-    try state.registry.cache.append(gpa, &ordinary_parent);
-    try state.registry.cache.append(gpa, &precise_child);
+    try state.registry.attach(&precise_parent);
+    try state.registry.attach(&ordinary_child);
+    try state.registry.attach(&ordinary_parent);
+    try state.registry.attach(&precise_child);
     try state.provenance_edges.append(gpa, .{ .parent_id = precise_parent.id, .exit_instr = 0, .child_id = ordinary_child.id });
     try state.provenance_edges.append(gpa, .{ .parent_id = ordinary_parent.id, .exit_instr = 0, .child_id = precise_child.id });
     state.provenance_arms_pending = true; // finishSideTraceProvenance sets this on append
@@ -354,7 +354,7 @@ test "B-2b region low-yield condemnation deletes only the owner provenance" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
     state.config.max_penalty = 1;
 
     const proto = Proto{ .code = &.{}, .name = "provenance-condemn", .num_registers = 0 };
@@ -379,8 +379,8 @@ test "B-2b region low-yield condemnation deletes only the owner provenance" {
         },
         .id = 82,
     };
-    try state.registry.cache.append(gpa, &p1);
-    try state.registry.cache.append(gpa, &p2);
+    try state.registry.attach(&p1);
+    try state.registry.attach(&p2);
     try state.provenance_edges.append(gpa, .{ .parent_id = p1.id, .exit_instr = 0, .child_id = 91 });
     try state.provenance_edges.append(gpa, .{ .parent_id = p2.id, .exit_instr = 0, .child_id = 92 });
 
@@ -402,7 +402,7 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "provenance-cycle", .num_registers = 1 };
     var p_instrs = [_]IrInstr{ .{ .op = .guard_true, .aux = 1 }, .{ .op = .loop } };
@@ -437,8 +437,8 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
         .id = 102,
         .native = .{ .compiled = .{ .page = undefined, .slots = c_slots, .gpa = gpa, .ordinary_entry = 0xA102 } },
     };
-    try state.registry.cache.append(gpa, &parent);
-    try state.registry.cache.append(gpa, &child);
+    try state.registry.attach(&parent);
+    try state.registry.attach(&child);
     try state.provenance_edges.append(gpa, .{ .parent_id = parent.id, .exit_instr = 0, .child_id = child.id, .strikes = 1 });
     try testing.expect(state.publishSiblingArm(&parent, 0, &child));
     try testing.expect(state.publishSiblingArm(&child, 0, &parent));
@@ -813,7 +813,7 @@ test "B-2b local-positive provenance handoff replays child-only cursor and charg
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
     state.config.min_useful = 5;
 
     const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "provenance-local", .num_registers = 1 };
@@ -837,8 +837,8 @@ test "B-2b local-positive provenance handoff replays child-only cursor and charg
         .entry_slots = &.{},
         .entry_guards = &.{},
     }, .id = 112, .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .ordinary_entry = 0xB112 } } };
-    try state.registry.cache.append(gpa, &parent);
-    try state.registry.cache.append(gpa, &child);
+    try state.registry.attach(&parent);
+    try state.registry.attach(&child);
     try state.provenance_edges.append(gpa, .{ .parent_id = parent.id, .exit_instr = 0, .child_id = child.id });
     try testing.expect(state.publishSiblingArm(&parent, 0, &child));
     var regs_buf = [_]Value{Value.int(0)};
@@ -1365,7 +1365,7 @@ test "B-2b: a seeded child needing another episode defers WITHOUT latching the d
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
-    defer state.registry.cache.clearRetainingCapacity();
+    defer state.registry.detachAll();
 
     // Two protos: the live episode runs `a`, the parent/child pair lives in `b`.
     const proto_a = Proto{ .code = &.{Instr.op0(.ret)}, .id = 1, .name = "episode-a", .num_registers = 1 };
@@ -1409,8 +1409,8 @@ test "B-2b: a seeded child needing another episode defers WITHOUT latching the d
         } },
     };
     child.code.inputs = @constCast(&[_]trace.InputSeed{undefined});
-    try state.registry.cache.append(gpa, &parent);
-    try state.registry.cache.append(gpa, &child);
+    try state.registry.attach(&parent);
+    try state.registry.attach(&child);
     try state.provenance_edges.append(gpa, .{ .parent_id = parent.id, .exit_instr = 0, .child_id = child.id });
 
     // Live episode = proto_a, so the child's proto_b page is not enterable.

@@ -875,14 +875,18 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     // per-snapshot exit materializers, which `operandReads` cannot see.
     // Extend every captured ref's liveness to each exit that can materialize
     // it — BEFORE any allocation decision — or the flush would read a
-    // recycled register/spill. Only ops that can actually take a precise exit
-    // (`requiresPreciseSnapshot`: side-exit guards + tnew) extend; the snap a
-    // pure arithmetic op carries can never be materialized, so extending for
-    // it would only waste registers. Runs only on precise traces (no snap
+    // recycled register/spill. Exactly the instructions whose lowering can
+    // take an exit extend (`opMayExitInBody`, the closed inventory of body
+    // exits: the guards, the fallible callouts and typed loads, tnew). It
+    // used to be `requiresPreciseSnapshot`, which then covered only guards +
+    // tnew, so a precise string-helper / match / href / typed-load exit
+    // flushed refs whose registers could already be recycled. The snap an
+    // exit-free op carries can never be materialized, so extending for it
+    // would only waste registers. Runs only on precise traces (no snap
     // anywhere otherwise); refs were range-validated by compileImpl.
     if (t.deopt_mode == .precise) {
         for (t.instrs, 0..) |ins, i| {
-            if (ins.snap == 0 or !trace_ir.requiresPreciseSnapshot(ins.op)) continue;
+            if (ins.snap == 0 or !opMayExitInBody(t, kinds, slots.items, slot_id_of_ref, i)) continue;
             const rec = t.snapshots[ins.snap - 1];
             for (t.snapshot_slots[rec.slots_begin..][0..rec.slots_len]) |ss| {
                 if (last_use[ss.ref] < i) last_use[ss.ref] = @intCast(i);

@@ -27,14 +27,23 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   (Bart, 2026-10-10).
 - [x] **Decision Q5 — multret host calls.** Deferred past v1; tracked in
   TODO.md (Bart, 2026-10-10).
+- [x] **Prerequisite A — precise allocation-helper failures retry
+  (pre-existing bug).** In a precise trace a failing string helper exited
+  `.precise_resume` and tier-0 retried the allocation, against doc 45
+  D5's "never an OOM retry" (§5.4). Fixed 2026-10-10: the allocating
+  stralloc shims return a one-word `StrResult` (pointer, OOM `Status`, or
+  decline), and precise traces raise the OOM as `.precise_error` in tier-1a
+  (`irinterp.zig` `strFailure`) and native (the precise exit stub's
+  `isStrAllocOp` split). Injected-OOM tests per helper in both tiers, plus
+  a decline test. The reviews found a second pre-existing bug on the way,
+  also fixed: native register liveness kept a precise snapshot's refs
+  alive only to guards and `tnew`, not to every op that can exit, so a
+  helper exit could flush a recycled register. It now follows
+  `opMayExitInBody`, and `requiresPreciseSnapshot` covers every
+  exit-capable body op.
 
 ### Outstanding
 
-- [ ] **Prerequisite A — precise allocation-helper failures retry
-  (pre-existing bug).** In a precise trace a failing string helper exits
-  `.precise_resume` and tier-0 retries the allocation, against doc 45
-  D5's "never an OOM retry" (§5.4). Fix before Phase 2; tracked in
-  TODO.md.
 - [ ] **Prerequisite B — doc 61 Phase Q (weak trace pools, invalidate on
   sweep) lands.** §5.10 extends it and cannot start before it.
 - [ ] **Phase 0 — benchmark and budget.** A host-call benchmark through the
@@ -417,13 +426,21 @@ Each route the reviews raised:
   Phase 2c adds a finalize check that no exit-capable op after
   `call_host` has `snap == 0`.
 - **Allocation-helper failures** are a separate, pre-existing problem
-  (Prerequisite A). A string helper's null return leaves
-  `runtime_error` at zero (`irinterp.zig:845`), so a precise trace exits
-  `.precise_resume` and tier-0 retries the allocation, where doc 45 D5
-  promises `.precise_error` and no retry. It does not replay the host
-  call, but it is a precise-mode bug and is fixed first: helper
-  allocation failures set `out_of_memory` and exit `.precise_error`, in
-  both executors, with an injected-OOM test.
+  (Prerequisite A). When this section was written, a string helper's
+  null return left `runtime_error` at zero (`irinterp.zig:845` at the
+  time), so a precise trace exited `.precise_resume` and tier-0 retried
+  the allocation, where doc 45 D5 promises `.precise_error` and no retry.
+  It does not replay the host call, but it is a precise-mode bug and is
+  fixed first: helper allocation failures set `out_of_memory` and exit
+  `.precise_error`, in both executors, with an injected-OOM test.
+
+  *Landed 2026-10-10.* A helper failure that is not an OOM is a
+  *decline* and still exits `.precise_resume`; tier-0 re-executes the
+  bytecode and decides the outcome itself. For an out-of-range
+  `string.char` codepoint that is its located `bad argument` raise. For
+  a stale match scratch (a defense-in-depth check that a legitimately
+  recorded trace never trips) tier-0's replay produces the real value,
+  or the real error, from scratch.
 - **The loop-done exit** uses the resume materializer and resumes at the
   `for_loop` bytecode, never replaying the body (doc 45 native money
   identity test).
