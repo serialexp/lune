@@ -65,19 +65,7 @@ test "phase Q: a runtime-built gmatch pattern only a trace pins is swept as in t
     , "1800\ntable: 0x15a0\n");
 }
 
-/// A test-only native that runs a full collection from inside a host call,
-/// the in-run shape of `mh_collect` (doc 61 F3).
-fn collectNative(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    _ = args;
-    const vm: *Vm = @ptrCast(@alignCast(ctx));
-    vm.collect();
-    return Value.nil();
-}
-
-fn installCollect(vm: *Vm) anyerror!void {
-    const native = try vm.heap.newNative(collectNative, "collect");
-    try vm.globals.set(vm.gpa, try vm.heap.internValue("collect"), Value.heap(&native.header));
-}
+const installCollect = util.installCollect;
 
 fn expectRetiredInJitLegs(vm: *Vm, mode: TraceMode) anyerror!void {
     switch (mode) {
@@ -199,6 +187,35 @@ test "phase Q: a trace over a loaded chunk's pinned string constant survives eve
     , "16000\ndone\n", .{ .inspect = expectNoRetirement });
 }
 
+/// Every committed trace's `callee_global` key is a `heap_consts` entry,
+/// though no `konst` reads it: a collection that frees the key must doom the
+/// trace (doc 61 §7.1 item 3, the whole-pool rule).
+fn expectCalleeGlobalKeysAreDependencies(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (mode == .off) return;
+    var seen: usize = 0;
+    for (vm.trace.registry.cache.items) |t| for (t.code.inputs) |seed| {
+        if (seed.kind != .callee_global) continue;
+        seen += 1;
+        try testing.expect(t.code.consts[seed.source].isHeap());
+        try testing.expect(std.mem.indexOfScalar(u32, t.code.heap_consts, seed.source) != null);
+        for (t.code.instrs) |ins| try testing.expect(!(ins.op == .konst and ins.aux == @as(i32, @intCast(seed.source))));
+    };
+    try testing.expect(seen >= 1);
+}
+
+test "phase Q: an inlined callee's global key is a trace dependency though no konst reads it" {
+    try expectProgramTuned(
+        \\bias = 1
+        \\local function step(x) return x + bias end
+        \\local function f()
+        \\  local n = 0
+        \\  for i = 1, 2000 do n = n + step(i) end
+        \\  return n
+        \\end
+        \\print(f())
+    , "2003000\n", .{ .inspect = expectCalleeGlobalKeysAreDependencies });
+}
+
 // ---------------------------------------------------------------------------
 // Batch retirement at a collection, over hand-built traces.
 // ---------------------------------------------------------------------------
@@ -300,6 +317,71 @@ test "phase Q: a collection retires exactly the traces naming a dying constant, 
     try testing.expectEqual(@as(u64, 1), vm.trace.retire_batches);
     try testing.expectEqual(rebuilds0 + 1, vm.trace.region_rebuilds);
     vm.trace.setPendingExitAnchor(null);
+}
+
+test "phase Q: an uncompiled trace whose constant dies retires before a lazy compile can see it" {
+    // Native compilation is lazy (`nativeFor` on first native entry) and
+    // bakes heap constants as raw pointers. Retirement runs inside the
+    // collection, so by the time any dispatcher looks the anchor up again
+    // the uncompiled trace is gone and only its survivor sibling remains.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var code = [_]Instr{Instr.op0(.ret)};
+    const proto = Proto{ .code = &code, .id = 9009, .name = "phaseq-lazy", .num_registers = 1 };
+    const dead = try vm.heap.internValue("phaseq-lazy-dead");
+    const doomed = try publishFake(&vm, &proto, 0, &.{dead});
+    doomed.hit_count = 100; // the walk's first choice while it lives
+    const survivor = try publishFake(&vm, &proto, 0, &.{Value.int(7)});
+    const doomed_id = doomed.id;
+    try testing.expect(doomed.native == .unattempted);
+    try testing.expectEqual(doomed, vm.trace.findTrace(&proto, 0).?);
+
+    vm.collect();
+
+    try testing.expect(vm.heap.internedLookup("phaseq-lazy-dead") == null);
+    try testing.expect(vm.trace.traceById(doomed_id) == null);
+    try testing.expectEqual(survivor, vm.trace.findTrace(&proto, 0).?);
+    try testing.expectEqual(@as(usize, 1), vm.trace.countTracesAt(.{ .proto = &proto, .pc = 0 }));
+    try testing.expect(survivor.native == .unattempted);
+}
+
+test "phase Q: the bulk teardown keeps surviving parked proofs; the region rebuild then drops them all" {
+    // Doc 61 §7.1 step 3: a parked proof naming a doomed trace would hand a
+    // dangling pointer to the next re-validation, so the physical teardown
+    // drops exactly those; a proof over survivors is intact until R, whose
+    // existing rebuild behaviour (region defs change) drops every proof.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var code = [_]Instr{ Instr.op0(.ret), Instr.op0(.ret) };
+    const proto = Proto{ .code = &code, .id = 9010, .name = "phaseq-park", .num_registers = 1 };
+    const s1 = try publishFake(&vm, &proto, 0, &.{Value.int(1)});
+    const s2 = try publishFake(&vm, &proto, 1, &.{Value.int(2)});
+    const d = try publishFake(&vm, &proto, 1, &.{Value.int(3)});
+    const native_registry = @import("trace_native_registry.zig");
+    const np = &vm.trace.registry.native_physical;
+    const edge = native_registry.PromotedEdge{ .parent = s1, .exit = 0, .kind = .link_terminal, .child = s2, .arm_kind = .link_terminal, .resume_pc = 1, .cell = 0 };
+    var doomed_edge = edge;
+    doomed_edge.child = d;
+    np.parkPromotionProof(@enumFromInt(1), &.{edge});
+    np.parkPromotionProof(@enumFromInt(2), &.{ edge, doomed_edge });
+    try testing.expectEqual(@as(usize, 2), np.parked_proofs.items.len);
+
+    // Steps 3–4 (the registry's physical half), as `removeTraces` runs them.
+    d.doomed = true;
+    vm.trace.registry.unpublishDoomed(&.{d});
+    try testing.expectEqual(@as(usize, 1), np.parked_proofs.items.len);
+    const kept = np.parked_proofs.items[0];
+    try testing.expectEqual(@as(trace.RegionId, @enumFromInt(1)), kept.region_id);
+    try testing.expectEqual(@as(usize, 1), kept.edges.len);
+    try testing.expect(kept.edges[0].parent == s1 and kept.edges[0].child == s2);
+    @import("trace_registry.zig").TraceRegistry.destroyDoomed(gpa, &.{d});
+
+    // Step 7: R.
+    vm.trace.rebuildEdgeCache();
+    vm.trace.rebuildRegions();
+    try testing.expectEqual(@as(usize, 0), np.parked_proofs.items.len);
 }
 
 test "phase Q: removeTrace is the one-element batch" {
@@ -539,4 +621,38 @@ test "phase Q: the recorder's constant dedup keys on object identity, not addres
     h.id = old_id;
     try testing.expect(r1 != r2);
     vm.trace.abort(.nyi_opcode);
+}
+
+test "phase Q: the callee_global dedup keys on object identity, not address" {
+    // Same simulation as the konst dedup: one key header, reused for a new
+    // object (new id) within the recording, must mint a second seed.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var code = [_]Instr{Instr.op0(.ret)};
+    const proto = Proto{ .code = &code, .id = 9011, .name = "phaseq-cg", .num_registers = 1 };
+    try startFakeRecording(&vm, &proto);
+    const key = try vm.heap.internValue("phaseq-cg-key");
+    try vm.trace.rec.recCalleeGlobal(0, key, Value.int(1));
+    try vm.trace.rec.recCalleeGlobal(0, key, Value.int(1));
+    try testing.expectEqual(@as(usize, 1), vm.trace.rec.input_seeds.items.len);
+    const h = key.asHeap();
+    const old_id = h.id;
+    h.id = old_id + 100_000;
+    try vm.trace.rec.recCalleeGlobal(0, key, Value.int(1));
+    h.id = old_id;
+    try testing.expectEqual(@as(usize, 2), vm.trace.rec.input_seeds.items.len);
+    vm.trace.abort(.nyi_opcode);
+}
+
+test "phase Q: every recorder identity map keys on ObjIdentity, never a bare address" {
+    // Doc 61 §7.1: a sweep inside one recording can hand a freed object's
+    // address to a new one, so these keys carry the header id as well.
+    const Session = trace_recorder.RecordingSession;
+    const ObjIdentity = trace_recorder.ObjIdentity;
+    inline for (.{ "callee_global_dedup", "upvalue_cell_classes", "snapshot_read_cells" }) |name| {
+        const Map = @FieldType(Session, name);
+        try testing.expect(@FieldType(Map.KV, "key") == ObjIdentity);
+    }
+    try testing.expect(@FieldType(trace_recorder.PendingStore, "tab_obj") == ?ObjIdentity);
 }

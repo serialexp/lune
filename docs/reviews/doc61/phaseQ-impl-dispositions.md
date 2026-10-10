@@ -46,28 +46,32 @@ conversational, and only their findings are kept here.
 
 ## Missing tests
 
-Written: the drain order after a batch retirement (restore before install,
-id order, several traces per anchor, both wake kinds), in
-`trace_entrypatch_test.zig`.
+Written:
+- the drain order after a batch retirement (restore before install, id
+  order, several traces per anchor, both wake kinds), in
+  `trace_entrypatch_test.zig`;
+- parked proofs intact through the teardown and dropped by R;
+- promoted-set demotion, for a retired member (at the teardown) and for a
+  bystander (by R);
+- the callee_global dedup under address reuse, plus a comptime check that
+  every identity map keys on `ObjIdentity`;
+- a `callee_global` key as a dependency through a real finalize;
+- exec logs after retire + re-record;
+- a lazy compile after a sweep.
 
 Writing it turned up that the drain's `batch_scratch` capacity was
 reserved only by `publish`. `attach` now owns every cache invariant (id
 index, batch scratch, anchor list) all-or-nothing, and `traceById` lost
 its linear fallback.
 
+`mh_collect` from a nested Lua run is covered in-language by
+`pcall(function() collect() end)` in the host-call collection test.
+
 Still open (tracked in CURRENT_TASK.md):
-- parked proofs intact before R, dropped after R;
-- promoted sets demoted;
 - region index OOM;
 - real finalize/commit of a side recording after its parent retires;
-- identity maps (`PendingStore.tab_obj`, `callee_global_dedup`,
-  `upvalue_cell_classes`, `snapshot_read_cells`) under address reuse;
 - a mid-peel inner-root retirement, and peel-setup OOM;
 - each `clearPendingLinkClose` path, leak-checked;
-- a `callee_global` non-konst dependency dooming its trace;
-- `mh_collect` from a host callback's nested Lua run;
-- exec logs after retire + re-record;
-- a lazy compile after a sweep;
 - per-step counters.
 
 ## Nits

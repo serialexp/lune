@@ -606,6 +606,85 @@ test "B-3b.2 promotion publishes mixed deopt/link/loop-done cells; demotion zero
     try testing.expectEqual(@as(u64, 1), state.registry.native_physical.silent_demotions);
 }
 
+/// The B-3b.2 guard → loop-done → link cycle, promoted. Caller frees `edges`.
+const PromotedB3Cycle = struct { guard: *Trace, done: *Trace, link: *Trace, edges: []PromotedEdge };
+
+fn promoteB3Cycle(state: *TraceState, proto: *const Proto) !PromotedB3Cycle {
+    const gpa = state.gpa;
+    const guard = try makeB3GuardTrace(gpa, state, proto, 2, 0);
+    const done = try makeB3LoopDoneTrace(gpa, state, proto, 3, 1);
+    const link = try makeB3LinkTrace(gpa, state, proto, 1, 2, 0);
+    try testing.expect(try state.armNativeLink(guard, 5, done, .ordinary_guard));
+    try testing.expect(try state.armNativeLink(done, 5, link, .loop_done_linked));
+    try testing.expect(try state.armNativeLink(link, 0, guard, .link_terminal));
+    const observed = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(guard, 5, .deopt),
+        b3ObservedRow(done, 5, .loop_done_linked),
+        b3ObservedRow(link, 0, .link_terminal),
+        b3ObservedRow(guard, 5, .deopt),
+    };
+    const key: RegionKey = .{ .region_id = @enumFromInt(2), .activation = 11 };
+    try installB3PromotionRegion(state, key, &.{ guard, done, link });
+    const edges = state.detectPromotableSet(&observed, key).?;
+    errdefer gpa.free(edges);
+    try state.promoteSet(edges, key);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
+    for (edges) |edge| try expectB3Promoted(edge, true);
+    return .{ .guard = guard, .done = done, .link = link, .edges = edges };
+}
+
+test "doc 61 Phase Q: retiring a promoted set's member demotes it in the teardown; survivors' cells read zero" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [4]Instr = @splat(Instr.op0(.halt));
+    code[1] = Instr.op0(.for_loop);
+    const proto = Proto{ .id = 1715, .code = &code, .name = "q-demote-member", .num_registers = 2 };
+    const cyc = try promoteB3Cycle(&state, &proto);
+    defer gpa.free(cyc.edges);
+    const demotions0 = state.registry.native_physical.silent_demotions;
+
+    // Steps 3–4 (the registry's physical half), as `removeTraces` runs them:
+    // the set names a doomed trace, so it must be gone before R, which
+    // would otherwise demote it too late (its edges dangle once step 6 frees
+    // the record). Two teardown paths reach it: `demoteSetsTouchingDoomed`,
+    // and, because a promoted set is a cycle (every member is some edge's
+    // child), the reset of the surviving predecessor's slot.
+    cyc.done.doomed = true;
+    state.registry.unpublishDoomed(&.{cyc.done});
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
+    try testing.expectEqual(demotions0 + 1, state.registry.native_physical.silent_demotions);
+    // Every cell on a surviving parent is back to the reporting path.
+    for (cyc.edges) |edge| {
+        if (edge.parent == cyc.done) continue;
+        try expectB3Promoted(edge, false);
+    }
+    @import("trace_registry.zig").TraceRegistry.destroyDoomed(gpa, &.{cyc.done});
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+    try testing.expectEqual(demotions0 + 1, state.registry.native_physical.silent_demotions);
+}
+
+test "doc 61 Phase Q: retiring a bystander leaves the promoted set to the region rebuild, which demotes it" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [4]Instr = @splat(Instr.op0(.halt));
+    code[1] = Instr.op0(.for_loop);
+    const proto = Proto{ .id = 1716, .code = &code, .name = "q-demote-bystander", .num_registers = 2 };
+    const cyc = try promoteB3Cycle(&state, &proto);
+    defer gpa.free(cyc.edges);
+    const bystander = try makeB3LinkTrace(gpa, &state, &proto, 9, 3, 0);
+    const demotions0 = state.registry.native_physical.silent_demotions;
+
+    state.removeTraces(&.{bystander});
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
+    try testing.expectEqual(demotions0 + 1, state.registry.native_physical.silent_demotions);
+    for (cyc.edges) |edge| try expectB3Promoted(edge, false);
+}
+
 test "B-3b.4 region bridge promotes with frozen structural resume and rebuild demotes" {
     if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;

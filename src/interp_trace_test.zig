@@ -2387,6 +2387,54 @@ test "exec-log string values are owned bytes: a sweep of the strings leaves the 
     try testing.expect(swept_seen); // the swept string's bytes survived in the log
 }
 
+test "exec logs after a retire and re-record: the retired trace's log is dropped, the new one joins by id (doc 61 §7.1 item 7)" {
+    // `f`'s loop is traced over the pattern "%d+", which only the trace's
+    // pool names once the call returns. `collect()` sweeps it, retiring the
+    // trace and its log; the second call re-records the loop under a new
+    // id over "%a+". The serialized logs must name only live traces, carry
+    // no event from the retired trace, and carry the re-recorded one's.
+    const gpa = testing.allocator;
+    const source =
+        \\local find = string.find
+        \\local function f(p) local n = 0 for i = 1, 40 do if find("ab12", p) then n = n + 1 end end return n end
+        \\local function g(class) return f(class .. "+") end
+        \\print(g("%d"))
+        \\collect()
+        \\print(g("%a"))
+    ;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    try util.installCollect(&vm);
+    vm.trace.config.optimize = true; // the pattern pin makes "%d+" a pool constant
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runForExecLog(&vm, gpa, source, &sink, true);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("40\n40\n", sink.buffered());
+    try testing.expect(vm.trace.retired_traces >= 1);
+    try testing.expect(vm.trace.registry.cache.items.len >= 1); // the re-record
+    try testing.expect(vm.heap.internedLookup("%d+") == null);
+
+    const execlogser = @import("execlogser.zig");
+    const bytes = try execlogser.encodeFile(gpa, vm.trace.exec_logs.items);
+    defer gpa.free(bytes);
+    const back = try execlogser.decodeFile(gpa, bytes);
+    defer execlogser.freeLogs(gpa, back);
+
+    var new_pattern_seen = false;
+    for (back) |log| {
+        try testing.expect(vm.trace.traceById(log.trace_id) != null);
+        for (log.entries.items) |e| for (e.events) |ev| switch (ev.value) {
+            .string => |s| {
+                try testing.expect(!std.mem.eql(u8, s, "%d+"));
+                new_pattern_seen = new_pattern_seen or std.mem.eql(u8, s, "%a+");
+            },
+            else => {},
+        };
+    }
+    try testing.expect(new_pattern_seen);
+}
+
 test "exec-log detail cap truncates iterations but keeps the count and exit" {
     const gpa = testing.allocator;
     const source =

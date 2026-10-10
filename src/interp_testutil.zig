@@ -260,3 +260,18 @@ pub fn runNativeForTrace(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8, 
     _ = try vm.run(chunk.proto);
     return chunk;
 }
+
+/// A test-only native that runs a full collection from inside a host call,
+/// the in-run shape of `mh_collect` (doc 61 F3).
+fn collectNative(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    _ = args;
+    const vm: *Vm = @ptrCast(@alignCast(ctx));
+    vm.collect();
+    return Value.nil();
+}
+
+/// Install `collect()` (see `collectNative`) as a global.
+pub fn installCollect(vm: *Vm) anyerror!void {
+    const native = try vm.heap.newNative(collectNative, "collect");
+    try vm.globals.set(vm.gpa, try vm.heap.internValue("collect"), Value.heap(&native.header));
+}

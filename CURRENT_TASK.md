@@ -119,24 +119,35 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
   reserved in `attach` as well (the drain relied on `publish` reserving it).
   `traceById` is O(1). Test records need unique ids, and must not change
   their id or anchor while attached.
-- **Phase Q follow-ups still open.** Codex and antigravity listed missing
-  tests in the impl review (codex thread
-  01a124f3-15b9-7e53-9154-758a8bd976b2):
-  - parked proofs intact before R and dropped after R;
-  - promoted sets demoted;
-  - ~~the drain: restore before install, id order, several traces per
-    anchor, both wake kinds~~ — done (trace_entrypatch_test, "doc 61 §7.1
-    step 8");
+- **dc3340f board (pinned) against 4fed40b:** no row worse than +0.3%.
+  scimark-fft −8.1%, euler14-bit −7.4%, nsieve −7.2%, binary-trees −6.5%,
+  scimark-sparse −4.9%, spectral-norm −4.5%, nsieve-bit-fp −4.1%.
+- **Phase Q follow-up tests.** Codex and antigravity listed missing tests
+  in the impl review (codex thread 01a124f3-15b9-7e53-9154-758a8bd976b2).
+  Done:
+  - the drain (trace_entrypatch_test, "doc 61 §7.1 step 8");
+  - parked proofs: intact through the teardown, dropped by R;
+  - promoted sets: a retired member demotes in the teardown, a bystander
+    via R (trace_promotion_test). A set is a cycle, so the predecessor
+    slot reset also demotes it; `demoteSetsTouchingDoomed` is the second
+    path to the same outcome;
+  - identity maps: the callee_global dedup under address reuse, plus a
+    comptime check that every identity map keys on `ObjIdentity`;
+  - the `callee_global` non-konst dependency, through a real finalize
+    (mutation-checked);
+  - exec logs after retire + re-record (mutation-checked);
+  - a lazy compile after a sweep;
+  - `mh_collect` from a nested run: the in-language form,
+    `pcall(function() collect() end)`, is in the host-call collection
+    test. The C-API form is coral's area.
+
+  Still open:
   - region index OOM;
   - real finalize/commit of a side recording after its parent retires;
-  - identity maps under address reuse;
   - a mid-peel inner-root retirement, and peel-setup OOM;
   - every `clearPendingLinkClose` path, leak-checked;
-  - a `callee_global` non-konst dependency;
-  - `mh_collect` from a host callback's nested run;
-  - exec logs after retire + re-record;
-  - a lazy compile after a sweep;
-  - per-step counters.
+  - per-step counters (needs counting instrumentation in the retirement
+    steps; doc 61 says to assert counts, not time).
 
   Also: bench-retire covers no compiled pages, links or entry patches.
   `releaseChunk` options for Bart are in TODO.
