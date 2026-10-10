@@ -158,13 +158,14 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
     closes `.link` from the owned contract), zero-trip, reset and deinit,
     plus an OOM sweep over the setup. Both mutations were caught. The
     zero-trip branch cannot be reached from a program, because a peel is
-    only set up when the loop runs.
+    only set up when the loop runs;
+  - per-step counters: `TraceRegistry.retire_work` (a `RetireWork`
+    EnumArray over `RetireStep`) counts the items each step visits. A test
+    at 4 and 16 promoted cycles, with parked proofs and provenance edges,
+    asserts every step stays within what it scans. A mutation that re-ran
+    the proof pass per link was caught. `destroyDoomed` is now a method.
 
-  Still open:
-  - per-step counters (needs counting instrumentation in the retirement
-    steps; doc 61 says to assert counts, not time).
-
-  Also: bench-retire covers no compiled pages, links or entry patches.
+  Still open: bench-retire covers no compiled pages, links or entry patches.
   `releaseChunk` options for Bart are in TODO.
 - **Then, in order:**
   - Phase 1;

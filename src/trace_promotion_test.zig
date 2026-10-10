@@ -609,11 +609,14 @@ test "B-3b.2 promotion publishes mixed deopt/link/loop-done cells; demotion zero
 /// The B-3b.2 guard → loop-done → link cycle, promoted. Caller frees `edges`.
 const PromotedB3Cycle = struct { guard: *Trace, done: *Trace, link: *Trace, edges: []PromotedEdge };
 
-fn promoteB3Cycle(state: *TraceState, proto: *const Proto) !PromotedB3Cycle {
+const b3_cycle_key: RegionKey = .{ .region_id = @enumFromInt(2), .activation = 11 };
+
+/// Its traces take ids `first_id..first_id + 2` and anchor in `proto`.
+fn promoteB3Cycle(state: *TraceState, proto: *const Proto, first_id: u32, key: RegionKey) !PromotedB3Cycle {
     const gpa = state.gpa;
-    const guard = try makeB3GuardTrace(gpa, state, proto, 2, 0);
-    const done = try makeB3LoopDoneTrace(gpa, state, proto, 3, 1);
-    const link = try makeB3LinkTrace(gpa, state, proto, 1, 2, 0);
+    const guard = try makeB3GuardTrace(gpa, state, proto, first_id + 1, 0);
+    const done = try makeB3LoopDoneTrace(gpa, state, proto, first_id + 2, 1);
+    const link = try makeB3LinkTrace(gpa, state, proto, first_id, 2, 0);
     try testing.expect(try state.armNativeLink(guard, 5, done, .ordinary_guard));
     try testing.expect(try state.armNativeLink(done, 5, link, .loop_done_linked));
     try testing.expect(try state.armNativeLink(link, 0, guard, .link_terminal));
@@ -623,12 +626,12 @@ fn promoteB3Cycle(state: *TraceState, proto: *const Proto) !PromotedB3Cycle {
         b3ObservedRow(link, 0, .link_terminal),
         b3ObservedRow(guard, 5, .deopt),
     };
-    const key: RegionKey = .{ .region_id = @enumFromInt(2), .activation = 11 };
     try installB3PromotionRegion(state, key, &.{ guard, done, link });
     const edges = state.detectPromotableSet(&observed, key).?;
     errdefer gpa.free(edges);
+    const sets0 = state.registry.native_physical.promoted_sets.items.len;
     try state.promoteSet(edges, key);
-    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
+    try testing.expectEqual(sets0 + 1, state.registry.native_physical.promoted_sets.items.len);
     for (edges) |edge| try expectB3Promoted(edge, true);
     return .{ .guard = guard, .done = done, .link = link, .edges = edges };
 }
@@ -641,7 +644,7 @@ test "doc 61 Phase Q: retiring a promoted set's member demotes it in the teardow
     var code: [4]Instr = @splat(Instr.op0(.halt));
     code[1] = Instr.op0(.for_loop);
     const proto = Proto{ .id = 1715, .code = &code, .name = "q-demote-member", .num_registers = 2 };
-    const cyc = try promoteB3Cycle(&state, &proto);
+    const cyc = try promoteB3Cycle(&state, &proto, 1, b3_cycle_key);
     defer gpa.free(cyc.edges);
     const demotions0 = state.registry.native_physical.silent_demotions;
 
@@ -660,7 +663,7 @@ test "doc 61 Phase Q: retiring a promoted set's member demotes it in the teardow
         if (edge.parent == cyc.done) continue;
         try expectB3Promoted(edge, false);
     }
-    @import("trace_registry.zig").TraceRegistry.destroyDoomed(gpa, &.{cyc.done});
+    state.registry.destroyDoomed(&.{cyc.done});
     state.rebuildEdgeCache();
     state.rebuildRegions();
     try testing.expectEqual(demotions0 + 1, state.registry.native_physical.silent_demotions);
@@ -674,7 +677,7 @@ test "doc 61 Phase Q: retiring a bystander leaves the promoted set to the region
     var code: [4]Instr = @splat(Instr.op0(.halt));
     code[1] = Instr.op0(.for_loop);
     const proto = Proto{ .id = 1716, .code = &code, .name = "q-demote-bystander", .num_registers = 2 };
-    const cyc = try promoteB3Cycle(&state, &proto);
+    const cyc = try promoteB3Cycle(&state, &proto, 1, b3_cycle_key);
     defer gpa.free(cyc.edges);
     const bystander = try makeB3LinkTrace(gpa, &state, &proto, 9, 3, 0);
     const demotions0 = state.registry.native_physical.silent_demotions;
@@ -683,6 +686,88 @@ test "doc 61 Phase Q: retiring a bystander leaves the promoted set to the region
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
     try testing.expectEqual(demotions0 + 1, state.registry.native_physical.silent_demotions);
     for (cyc.edges) |edge| try expectB3Promoted(edge, false);
+}
+
+/// `n` promoted B-3 cycles, each in its own proto with a parked proof and a
+/// provenance edge; the loop-done member of every other cycle is retired in
+/// one batch. Every teardown step must visit at most a small multiple of
+/// what it scans (doc 61 §7.1: counts, not times).
+fn expectLinearTeardown(n: usize) !void {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const codes = try gpa.alloc([4]Instr, n);
+    defer gpa.free(codes);
+    const protos = try gpa.alloc(Proto, n);
+    defer gpa.free(protos);
+    const cycles = try gpa.alloc(PromotedB3Cycle, n);
+    var made: usize = 0;
+    defer {
+        for (cycles[0..made]) |c| gpa.free(c.edges);
+        gpa.free(cycles);
+    }
+    for (codes, protos, cycles, 0..) |*code, *proto, *cyc, i| {
+        code.* = @splat(Instr.op0(.halt));
+        code[1] = Instr.op0(.for_loop);
+        proto.* = .{ .id = @intCast(2000 + i), .code = code, .name = "q-linear", .num_registers = 2 };
+        const key: RegionKey = .{ .region_id = @enumFromInt(100 + i), .activation = 11 };
+        cyc.* = try promoteB3Cycle(&state, proto, @intCast(1 + 3 * i), key);
+        made += 1;
+        state.registry.native_physical.parkPromotionProof(key.region_id, cyc.edges);
+        try state.provenance_edges.append(gpa, .{ .parent_id = cyc.guard.id, .exit_instr = 5, .child_id = cyc.done.id });
+    }
+    const np = &state.registry.native_physical;
+    try testing.expectEqual(n, np.promoted_sets.items.len);
+    try testing.expectEqual(n, np.parked_proofs.items.len);
+
+    var doomed: std.ArrayListUnmanaged(*Trace) = .empty;
+    defer doomed.deinit(gpa);
+    for (cycles, 0..) |c, i| if (i % 2 == 0) try doomed.append(gpa, c.done);
+    const d = doomed.items.len;
+    const t = state.registry.cache.items.len;
+    const l = np.armed_links.items.len;
+    var p: usize = 0;
+    for (np.parked_proofs.items) |proof| p += proof.edges.len;
+    var s: usize = 0;
+    for (np.promoted_sets.items) |set| s += set.edges.len;
+    const e = state.provenance_edges.items.len;
+
+    const before = state.registry.retire_work;
+    state.removeTraces(doomed.items);
+    const after = state.registry.retire_work;
+    const W = struct {
+        b: trace.RetireWork,
+        a: trace.RetireWork,
+        fn of(w: @This(), step: trace.RetireStep) u64 {
+            return w.a.get(step) - w.b.get(step);
+        }
+    };
+    const w: W = .{ .b = before, .a = after };
+    try testing.expectEqual(@as(u64, d), w.of(.mark));
+    try testing.expectEqual(@as(u64, e), w.of(.provenance_edges));
+    try testing.expectEqual(@as(u64, 0), w.of(.exec_logs));
+    try testing.expect(w.of(.parked_proofs) <= p);
+    try testing.expect(w.of(.promoted_sets) <= 3 * s);
+    try testing.expectEqual(@as(u64, l), w.of(.armed_links));
+    // One ownership lookup per reset slot, never a scan of the sets.
+    try testing.expect(w.of(.set_lookups) <= l);
+    try testing.expectEqual(@as(u64, d), w.of(.unpublish));
+    try testing.expectEqual(@as(u64, t), w.of(.compact));
+    try testing.expectEqual(@as(u64, d), w.of(.reopen));
+    try testing.expectEqual(@as(u64, d), w.of(.destroy));
+    // The batch did its job: exactly the doomed traces left the cache.
+    try testing.expectEqual(t - d, state.registry.cache.items.len);
+    for (cycles, 0..) |c, i| {
+        try testing.expect(state.traceById(c.guard.id) == c.guard);
+        try testing.expect(state.traceById(c.link.id) == c.link);
+        if (i % 2 == 1) try testing.expect(state.traceById(c.done.id) == c.done);
+    }
+}
+
+test "doc 61 Phase Q: every retirement step visits a linear amount of work, at two sizes" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    try expectLinearTeardown(4);
+    try expectLinearTeardown(16);
 }
 
 test "B-3b.4 region bridge promotes with frozen structural resume and rebuild demotes" {

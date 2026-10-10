@@ -8,6 +8,7 @@ const EntryRegistry = @import("trace_entry_registry.zig").EntryRegistry;
 const NativePhysicalRegistry = @import("trace_native_registry.zig").NativePhysicalRegistry;
 const AnchorKey = @import("trace_types.zig").AnchorKey;
 const AnchorMap = @import("trace_types.zig").AnchorMap;
+const RetireWork = @import("trace_types.zig").RetireWork;
 
 /// One anchor's published traces: an intrusive doubly-linked list through
 /// `TraceRecord.anchor_prev`/`anchor_next`, in cache order, plus its counts.
@@ -55,6 +56,9 @@ pub const TraceRegistry = struct {
     /// reserved by `attach` so a collection's doomed set and the entry-patch
     /// drain's install list never allocate. Contents live for one operation.
     batch_scratch: std.ArrayListUnmanaged(*Trace) = .empty,
+    /// Items each retirement step visited, over every batch. The
+    /// coordinator's steps in `TraceState.removeTraces` add theirs here too.
+    retire_work: RetireWork = .initFill(0),
 
     pub fn init(gpa: std.mem.Allocator) TraceRegistry {
         return .{ .gpa = gpa, .entry_registry = EntryRegistry.init(gpa), .native_physical = NativePhysicalRegistry.init(gpa), .mcode_arena = nativegen.McodeArena.init(gpa) };
@@ -177,7 +181,7 @@ pub const TraceRegistry = struct {
         t.doomed = true;
         const one = [_]*Trace{t};
         self.unpublishDoomed(&one);
-        destroyDoomed(self.gpa, &one);
+        self.destroyDoomed(&one);
         return true;
     }
     /// The physical half of a batch retirement (doc 61 §7.1 item 5 steps 3–4).
@@ -190,7 +194,9 @@ pub const TraceRegistry = struct {
     /// compacted in order.
     pub fn unpublishDoomed(self: *TraceRegistry, doomed: []const *Trace) void {
         if (self.native_physical.inReplayWalk()) @panic("trace retirement during replay");
-        self.native_physical.resetLinksTouchingDoomed(&self.mcode_arena);
+        self.native_physical.resetLinksTouchingDoomed(&self.mcode_arena, &self.retire_work);
+        self.retire_work.getPtr(.unpublish).* += doomed.len;
+        self.retire_work.getPtr(.compact).* += self.cache.items.len;
         for (doomed) |t| {
             std.debug.assert(t.doomed);
             if (t.entry_slot) |slot| {
@@ -212,8 +218,9 @@ pub const TraceRegistry = struct {
         self.cache.shrinkRetainingCapacity(w);
         self.changed();
     }
-    pub fn destroyDoomed(gpa: std.mem.Allocator, doomed: []const *Trace) void {
-        for (doomed) |t| t.destroy(gpa);
+    pub fn destroyDoomed(self: *TraceRegistry, doomed: []const *Trace) void {
+        self.retire_work.getPtr(.destroy).* += doomed.len;
+        for (doomed) |t| t.destroy(self.gpa);
     }
     /// Self-contained epoch safety; never relies on coordinator pre-disarm.
     pub fn clear(self: *TraceRegistry) void {
@@ -370,7 +377,7 @@ test "registry anchor index: per-anchor lists stay in cache order through publis
     b1.doomed = true;
     const batch = [_]*Trace{ a3, b1 };
     registry.unpublishDoomed(&batch);
-    TraceRegistry.destroyDoomed(registry.gpa, &batch);
+    registry.destroyDoomed(&batch);
     try testing.expectEqual(@as(usize, 0), registry.countAt(a));
     try testing.expectEqual(@as(usize, 0), registry.countAt(b));
     try testing.expect(!registry.innerRootAt(b));

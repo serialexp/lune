@@ -377,7 +377,7 @@ test "phase Q: the bulk teardown keeps surviving parked proofs; the region rebui
     try testing.expectEqual(@as(trace.RegionId, @enumFromInt(1)), kept.region_id);
     try testing.expectEqual(@as(usize, 1), kept.edges.len);
     try testing.expect(kept.edges[0].parent == s1 and kept.edges[0].child == s2);
-    @import("trace_registry.zig").TraceRegistry.destroyDoomed(gpa, &.{d});
+    vm.trace.registry.destroyDoomed(&.{d});
 
     // Step 7: R.
     vm.trace.rebuildEdgeCache();
@@ -482,7 +482,7 @@ test "phase Q: the bulk link teardown resets surviving parents to shared_exit an
     native.provenance_invalidated = false;
 
     d.doomed = true;
-    native.resetLinksTouchingDoomed(&state.registry.mcode_arena);
+    native.resetLinksTouchingDoomed(&state.registry.mcode_arena, &state.registry.retire_work);
 
     try testing.expectEqual(SHARED_EXIT, p_slots[0]);
     try testing.expectEqual(S_BODY, p_slots[1]);

@@ -354,6 +354,37 @@ pub fn AnchorMap(comptime V: type) type {
     return std.HashMapUnmanaged(AnchorKey, V, AnchorKeyContext, std.hash_map.default_max_load_percentage);
 }
 
+/// The steps of a batch retirement (doc 61 §7.1 item 5, `removeTraces`).
+pub const RetireStep = enum {
+    /// Doomed traces marked.
+    mark,
+    /// Provenance edges scanned.
+    provenance_edges,
+    /// Execution logs scanned.
+    exec_logs,
+    /// Parked-proof edges scanned.
+    parked_proofs,
+    /// Promoted-set edges scanned or torn down.
+    promoted_sets,
+    /// Armed links scanned.
+    armed_links,
+    /// Promoted-set lookups for a surviving parent's reset slot.
+    set_lookups,
+    /// Doomed traces unpublished (entry patch, id index, anchor list).
+    unpublish,
+    /// Cache entries compacted.
+    compact,
+    /// Doomed anchors checked for reopening.
+    reopen,
+    /// Doomed records destroyed.
+    destroy,
+};
+
+/// Items each retirement step visited, summed over every batch. Doc 61 asks
+/// for counts, not times: each step must stay linear in what it scans.
+/// Tests read it; nothing steers on it.
+pub const RetireWork = std.EnumArray(RetireStep, u64);
+
 /// Maximum nesting of inlined Lua calls a single trace may carry (cross-frame
 /// tracing). Bounds the recorder's grown `reg_map` window and the depth of leaf
 /// inlining. Down-recursion (the same proto re-inlined) is Phase 3; until then a

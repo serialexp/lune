@@ -159,6 +159,8 @@ pub const ProgramPoint = trace_types.ProgramPoint;
 pub const StructuralEdgeId = trace_types.StructuralEdgeId;
 pub const AnchorKey = trace_types.AnchorKey;
 pub const AnchorMap = trace_types.AnchorMap;
+pub const RetireStep = trace_types.RetireStep;
+pub const RetireWork = trace_types.RetireWork;
 pub const exitOrder = trace_types.exitOrder;
 
 pub const RegionId = trace_region.RegionId;

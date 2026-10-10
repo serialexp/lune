@@ -37,7 +37,6 @@ const ArmKind = trace_mod.ArmKind;
 const EntryPatch = trace_mod.EntryPatch;
 const EntryPatchState = trace_mod.EntryPatchState;
 const EntryRegistryT = trace_mod.trace_entry_registry.EntryRegistry;
-const TraceRegistry = @import("trace_registry.zig").TraceRegistry;
 const Gate = trace_mod.Gate;
 const GateReason = trace_mod.GateReason;
 const AnchorKey = trace_mod.AnchorKey;
@@ -2379,8 +2378,10 @@ pub fn removeTrace(self: *TraceState, t: *Trace) void {
 /// R(T) every commit already pays, whatever D is.
 pub fn removeTraces(self: *TraceState, doomed: []const *Trace) void {
     if (doomed.len == 0) return;
+    const work = &self.registry.retire_work;
     // Step 2: mark the batch. Records stay allocated until step 6, so the
     // anchors stay readable after the cache is compacted.
+    work.getPtr(.mark).* += doomed.len;
     for (doomed) |t| {
         // Every member must be a live, published trace: a batch submitted
         // twice would hand us destroyed records (see `Vm.WalkDead`).
@@ -2424,6 +2425,7 @@ pub fn removeTraces(self: *TraceState, doomed: []const *Trace) void {
     // re-arming anyway). The registry's anchor index already counts the
     // survivors, so each doomed anchor is one O(1) lookup; repeating the
     // reset for a second doomed trace at the same anchor is idempotent.
+    work.getPtr(.reopen).* += doomed.len;
     for (doomed) |t| {
         const anchor = t.code.anchor;
         if (self.registry.countAt(anchor) != 0) continue;
@@ -2438,7 +2440,7 @@ pub fn removeTraces(self: *TraceState, doomed: []const *Trace) void {
         }
     }
     // Step 6.
-    TraceRegistry.destroyDoomed(self.gpa, doomed);
+    self.registry.destroyDoomed(doomed);
     // Step 7. A-ii.2: a retired trace changes which edges remain resolvable
     // for SURVIVING traces, so rebuild the whole edge cache from the
     // surviving cache — never a surgical key delete. A-ii.4: then the
@@ -2778,6 +2780,7 @@ pub fn retireProvenanceEdgesTouching(self: *TraceState, trace_id: u32) void {
 /// 3): one order-preserving pass, endpoints resolved by id. Runs before the
 /// cache is compacted, so a doomed endpoint still resolves.
 fn retireProvenanceEdgesTouchingDoomed(self: *TraceState) void {
+    self.registry.retire_work.getPtr(.provenance_edges).* += self.provenance_edges.items.len;
     var w: usize = 0;
     for (self.provenance_edges.items) |edge| {
         if (idDoomed(self, edge.parent_id) or idDoomed(self, edge.child_id)) continue;
@@ -2797,6 +2800,7 @@ fn idDoomed(self: *const TraceState, id: u32) bool {
 /// be shown. Runs before the cache is compacted (ids still resolve).
 fn dropExecLogsOfDoomed(self: *TraceState) void {
     if (self.exec_logs.items.len == 0) return;
+    self.registry.retire_work.getPtr(.exec_logs).* += self.exec_logs.items.len;
     var w: usize = 0;
     for (self.exec_logs.items) |log| {
         if (idDoomed(self, log.trace_id)) {
