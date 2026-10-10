@@ -245,7 +245,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
     if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     const effectser = @import("effectser.zig");
-    // The expression creates numeric-for temporaries above the locals watermark.
+    // The expression creates numeric-for temporaries dead at the loop header.
     // They used to be omitted from the exit snapshot, leaving stale physical
     // registers after native execution; byte-identical keyframes make that bug
     // observable at the post-native-burst effect cut.

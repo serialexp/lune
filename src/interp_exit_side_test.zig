@@ -20,6 +20,7 @@ const trace_exec = @import("trace_exec.zig");
 const value = @import("value.zig");
 const table = @import("table.zig");
 const RegWindow = @import("regwindow.zig").RegWindow;
+const CompositeWalk = @import("trace_code.zig").CompositeWalk;
 
 const util = @import("interp_testutil.zig");
 const expectProgramTuned = util.expectProgramTuned;
@@ -1709,6 +1710,43 @@ test "doc 56 G6 follow-up: a cycle whose ledger cap lands on its region bridge y
             // Detection half: no such yield is rejected as a kind mismatch.
             try testing.expectEqual(@as(u64, 0), ts.silent_rejects.no_silent_site);
             try testing.expect(ts.registry.native_physical.silent_promotions > 0);
+        }
+    };
+    try expectProgramTuned(nsieve_src, "4160\n", .{
+        .hotloop = (@import("trace.zig").TraceConfig{}).hotloop,
+        .inspect = Inspect.run,
+    });
+}
+
+test "doc 61 §5 site 2: the dead-φ filter keeps the φs a composite bridge's continue proof needs" {
+    // The sieve's `if p[i]` exit, recorded on the prime path, bridges across
+    // the outer `for_loop` to the outer loop's body. The bridge stands in for
+    // that `for_loop`, so the continue proof demands φs for the index AND
+    // the loop variable `i`, which is dead where the trace closes (the inner
+    // loop reads its own copy of the step). A filter that dropped `i` failed
+    // the proof closed: no edge, and the exit grew an exit-side child instead.
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode != .record_execute_native) return;
+            const link = @import("trace_link.zig");
+            var crossing: usize = 0;
+            for (vm.trace.registry.cache.items) |t| {
+                for (t.code.exit_prov) |e| {
+                    if (!t.code.isBridgeCandidate(e.index)) continue;
+                    const gp = switch (e.prov) {
+                        .guard => |g| g,
+                        .link_terminal => continue,
+                    };
+                    var walk = CompositeWalk.init(t.code.anchor.proto.code, gp.source_pc, gp.polarity) orelse continue;
+                    while (walk.current()) |pc| {
+                        if (pc == t.code.anchor.pc or !walk.step()) break;
+                    }
+                    const flp = walk.crossed_for_loop orelse continue;
+                    crossing += 1;
+                    try testing.expect(link.compositeContinueProof(t, e.index, flp));
+                }
+            }
+            try testing.expect(crossing > 0);
         }
     };
     try expectProgramTuned(nsieve_src, "4160\n", .{

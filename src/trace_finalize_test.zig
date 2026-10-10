@@ -4,6 +4,8 @@ const ir = @import("trace_ir.zig");
 const types = @import("trace_types.zig");
 const code = @import("trace_code.zig");
 
+const scratch_proto: bytecode.Proto = .{ .code = &.{}, .name = "scratch" };
+
 // A scratch-only fixture deliberately proves finalize needs no Recorder import.
 const Scratch = struct {
     instrs: std.ArrayListUnmanaged(ir.IrInstr) = .empty,
@@ -19,13 +21,14 @@ const Scratch = struct {
     guard_gc_ref: ?ir.Ref = null,
     alloc_count: u32 = 0,
     anchor_num_registers: u16 = 1,
-    locals_watermark: u16 = 1,
     link_target: ?u32 = null,
     link_kind: ir.LinkKind = .inner_root,
     terminal_close: ?struct { kind: ir.TerminalKind, resume_pc: u32 } = null,
     pending_link_provenance: ?types.ExitProvenance = null,
     rec_path_ok: bool = true,
-    anchor: types.AnchorKey = undefined,
+    // Not maskable, so the dead-φ filter keeps every φ unless a test says
+    // otherwise.
+    anchor: types.AnchorKey = .{ .proto = &scratch_proto, .pc = 0 },
     unrolled_while: bool = false,
     unroll_used: u8 = 0,
     side_src: ?types.ExitKey = .{ .trace_id = 12, .exit_instr = 2 },
@@ -323,20 +326,112 @@ test "doc 56 exitSnapshotsValid rejects each malformed shape" {
     try std.testing.expect(!finalizer.exitSnapshotsValid(&instrs, .{ .snapshots = &.{}, .snapshot_slots = &.{} }, &.{}, 4, 3));
 }
 
-test "doc 61 §5 site 1: the watermark drops a slot only on a maskable proto where it is dead at the anchor" {
-    // Anchor pc 0. R0 is live there (a captured register is live at every
-    // pc), R1 dead.
-    const bits = [_]u64{ 0b01, 0b01, 0b01 }; // one row per pc of `exitProto`
-    var proto = exitProto();
-    proto.num_registers = 2;
-    proto.reg_live = .{ .words = 1, .bits = &bits };
-    proto.maskable = true;
-    const anchor: types.AnchorKey = .{ .proto = &proto, .pc = 0 };
-    try std.testing.expect(finalizer.watermarkMayDrop(anchor, 1));
-    try std.testing.expect(!finalizer.watermarkMayDrop(anchor, 0));
-    // Outside the proto's window: nothing to judge by, keep it.
-    try std.testing.expect(!finalizer.watermarkMayDrop(anchor, 2));
-    // Not maskable: the collector roots the frame whole, so keep every slot.
+/// Which of `slots` the dead-φ filter keeps for `scratch`, as a bitmask.
+fn keptPhis(scratch: *const Scratch, slots: u16) u64 {
+    var buf: [finalizer.PHI_LIVE_WORDS]u64 = undefined;
+    const live = finalizer.phiLiveRow(scratch, &buf);
+    var kept: u64 = 0;
+    for (0..slots) |s| {
+        if (finalizer.phiWritebackKept(scratch, @intCast(s), live)) kept |= @as(u64, 1) << @intCast(s);
+    }
+    return kept;
+}
+
+test "doc 61 §5 site 2: the dead-φ filter keeps what some resume pc reads, only on a maskable proto" {
+    const gpa = std.testing.allocator;
+    // pc 0 is the anchor, pc 1 a numeric `for_loop` whose loop-done exit
+    // the trace records, pc 2 the post-loop pc, pc 3 a `.link` target. R0
+    // is read at entry; R1 is live at the anchor, R5 only at the `for_loop`
+    // (its operands and the body), R2 only after the loop, R3 only at the
+    // link target, R4 nowhere.
+    var bc = [_]bytecode.Instr{ bytecode.Instr.op0(.halt), bytecode.Instr.opAx(.for_loop, 0, 0), bytecode.Instr.op0(.halt), bytecode.Instr.op0(.halt) };
+    const bits = [_]u64{ 0b000010, 0b100000, 0b000100, 0b001000 };
+    var proto: bytecode.Proto = .{ .code = &bc, .name = "phi-live", .id = 61, .num_registers = 6, .reg_live = .{ .words = 1, .bits = &bits }, .maskable = true };
+    var scratch: Scratch = .{ .anchor = .{ .proto = &proto, .pc = 0 } };
+    defer scratch.deinit(gpa);
+    try scratch.entry_slots.append(gpa, 0);
+    try std.testing.expectEqual(@as(u64, 0b000011), keptPhis(&scratch, 6));
+
+    // A loop-done `guard_true` adds its exit pc's row: the linked flush
+    // writes the φ set and resumes after the loop.
+    const loop_done: types.ExitProvenance = .{ .guard = .{ .source_proto_id = proto.id, .source_pc = 1, .role = .loop_done, .operand = .a, .polarity = .taken } };
+    try scratch.instrs.append(gpa, .{ .op = .guard_true, .aux = 2 });
+    try scratch.exit_prov.append(gpa, loop_done);
+    try std.testing.expectEqual(@as(u64, 0b000111), keptPhis(&scratch, 6));
+    // An inlined callee's loop-done does not resume in this frame.
+    scratch.exit_prov.items[0].?.guard.inline_depth = 1;
+    try std.testing.expectEqual(@as(u64, 0b000011), keptPhis(&scratch, 6));
+    scratch.exit_prov.items[0] = loop_done;
+    // A zero-trip skip (`guard_false`) fails into the loop, a coarse exit.
+    scratch.instrs.items[0].op = .guard_false;
+    try std.testing.expectEqual(@as(u64, 0b000011), keptPhis(&scratch, 6));
+    scratch.instrs.items[0].op = .guard_true;
+
+    // A `.link` close resumes at its target instead of the anchor.
+    scratch.link_target = 3;
+    try std.testing.expectEqual(@as(u64, 0b001101), keptPhis(&scratch, 6));
+    scratch.link_target = null;
+
+    // Every φ stays when the frame is rooted whole, the trace allocates
+    // (doc 24 D3) or it is a one-shot head (doc 44).
     proto.maskable = false;
-    try std.testing.expect(!finalizer.watermarkMayDrop(anchor, 1));
+    try std.testing.expectEqual(@as(u64, 0b111111), keptPhis(&scratch, 6));
+    proto.maskable = true;
+    scratch.alloc_count = 1;
+    try std.testing.expectEqual(@as(u64, 0b111111), keptPhis(&scratch, 6));
+    scratch.alloc_count = 0;
+    scratch.terminal_close = .{ .kind = .return_interp, .resume_pc = 0 };
+    try std.testing.expectEqual(@as(u64, 0b111111), keptPhis(&scratch, 6));
+}
+
+test "doc 61 §5 site 2: a branch whose deopt crosses a for_loop keeps the slots a composite bridge takes from E" {
+    const gpa = std.testing.allocator;
+    // pc 1's `jmp_if_false` falls through to pc 2 or jumps to the
+    // `for_loop` at pc 3 (base R2), whose continue edge returns to pc 1. No
+    // register is live anywhere; R0 is read at entry.
+    var bc = [_]bytecode.Instr{
+        bytecode.Instr.op0(.halt),
+        bytecode.Instr.opAx(.jmp_if_false, 0, 1),
+        bytecode.Instr.op0(.halt),
+        bytecode.Instr.opAx(.for_loop, 2, -3),
+    };
+    const bits = [_]u64{ 0, 0, 0, 0 };
+    var proto: bytecode.Proto = .{ .code = &bc, .name = "phi-bridge", .id = 63, .num_registers = 6, .reg_live = .{ .words = 1, .bits = &bits }, .maskable = true };
+    var scratch: Scratch = .{ .anchor = .{ .proto = &proto, .pc = 0 } };
+    defer scratch.deinit(gpa);
+    try scratch.entry_slots.append(gpa, 0);
+    const branch: types.ExitProvenance = .{ .guard = .{ .source_proto_id = proto.id, .source_pc = 1, .role = .branch_cond, .operand = .a, .polarity = .fallthrough } };
+    try scratch.instrs.append(gpa, .{ .op = .guard_false, .aux = 2 });
+    try scratch.exit_prov.append(gpa, branch);
+
+    // Recorded falling through, the guard fails onto the jump edge, across
+    // the `for_loop`: R2 (index) and R5 (loop variable) are kept.
+    try std.testing.expectEqual(@as(u64, 0b100101), keptPhis(&scratch, 6));
+    // Recorded jumping, it fails onto pc 2, which crosses nothing.
+    scratch.exit_prov.items[0].?.guard.polarity = .taken;
+    try std.testing.expectEqual(@as(u64, 0b000001), keptPhis(&scratch, 6));
+    scratch.exit_prov.items[0] = branch;
+    // The walk declines at the trace's own anchor before reaching the loop.
+    scratch.anchor.pc = 3;
+    try std.testing.expectEqual(@as(u64, 0b000001), keptPhis(&scratch, 6));
+    scratch.anchor.pc = 0;
+    // An inlined callee's branch does not walk this frame's code.
+    scratch.exit_prov.items[0].?.guard.inline_depth = 1;
+    try std.testing.expectEqual(@as(u64, 0b000001), keptPhis(&scratch, 6));
+}
+
+test "doc 61 §5 site 2: the dead-φ filter has no width cap" {
+    // A 300-register frame (five row words): R299 dead at the anchor is
+    // dropped, R0 live is kept.
+    const gpa = std.testing.allocator;
+    var bc = [_]bytecode.Instr{bytecode.Instr.op0(.halt)};
+    var bits: [5]u64 = @splat(0);
+    bits[0] = 1;
+    const proto: bytecode.Proto = .{ .code = &bc, .name = "wide", .id = 62, .num_registers = 300, .reg_live = .{ .words = 5, .bits = &bits }, .maskable = true };
+    var scratch: Scratch = .{ .anchor = .{ .proto = &proto, .pc = 0 } };
+    defer scratch.deinit(gpa);
+    var buf: [finalizer.PHI_LIVE_WORDS]u64 = undefined;
+    const live = finalizer.phiLiveRow(&scratch, &buf);
+    try std.testing.expect(finalizer.phiWritebackKept(&scratch, 0, live));
+    try std.testing.expect(!finalizer.phiWritebackKept(&scratch, 299, live));
 }

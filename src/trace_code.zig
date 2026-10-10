@@ -788,12 +788,10 @@ pub const TraceCode = struct {
             if (trace_ir.isStateEffectOp(self.instrs[si].op)) return false;
         }
         // The pc the bridge lands on first: the branch edge the recording did
-        // NOT take (`resolveCompositeBridgeSuccessor` starts its walk here).
-        if (gp.polarity == .neutral) return false;
-        const fallthrough: i64 = @as(i64, source_pc) + 1;
-        const landing: i64 = if (gp.polarity == .fallthrough) fallthrough + self.anchor.proto.code[source_pc].aux else fallthrough;
-        if (landing < 0 or landing >= self.anchor.proto.code.len) return false;
-        return self.bridgeMatchesExitSnapshot(instr_idx, @intCast(landing));
+        // NOT take, where `CompositeWalk` starts.
+        const walk = CompositeWalk.init(self.anchor.proto.code, source_pc, gp.polarity) orelse return false;
+        const landing = walk.current() orelse return false;
+        return self.bridgeMatchesExitSnapshot(instr_idx, landing);
     }
 
     /// Doc 58 B2 review, blocker 1: an armed composite bridge hands off with
@@ -897,6 +895,66 @@ pub const BridgeEmissionIterator = struct {
                 return p;
         }
         return null;
+    }
+};
+
+/// Doc 17 A-vii-d.1: the static-CFG path a failing branch guard's deopt
+/// takes, which a composite bridge follows to its successor. It starts on the
+/// edge of the source `jmp_if_*` the recording did NOT take (post-fetch jump
+/// convention: offsets apply to `source_pc + 1`), then crosses only `jmp`,
+/// `loop` markers and at most ONE numeric `for_loop`, along its continue
+/// edge, for at most `MAX_STEPS` pcs. `resolveCompositeBridgeSuccessor` stops
+/// it at the first pc with a bound trace. `trace_finalize.phiLiveRow` walks
+/// it to the end, because the recording cannot know where traces will bind.
+pub const CompositeWalk = struct {
+    code: []const bytecode.Instr,
+    pc_i: i64,
+    steps: u8 = 0,
+    /// The `for_loop` the walk crossed, whose written slots `{a, a+3}` the
+    /// bridge takes from E (`compositeContinueProof`).
+    crossed_for_loop: ?u32 = null,
+
+    pub const MAX_STEPS = 16;
+
+    /// The walk for a guard sourced at `source_pc` whose recorded branch
+    /// direction is `polarity`; null when the source is not a conditional
+    /// jump or the guard carries no direction.
+    pub fn init(code: []const bytecode.Instr, source_pc: u32, polarity: trace_types.Polarity) ?CompositeWalk {
+        if (polarity == .neutral or source_pc >= code.len) return null;
+        const bop = code[source_pc];
+        switch (bop.op) {
+            .jmp_if_true, .jmp_if_false => {},
+            else => return null,
+        }
+        const fallthrough: i64 = @as(i64, source_pc) + 1;
+        return .{ .code = code, .pc_i = if (polarity == .fallthrough) fallthrough + bop.aux else fallthrough };
+    }
+
+    /// The pc the walk stands on, or null once it has left the code or run
+    /// out of steps.
+    pub fn current(self: *const CompositeWalk) ?u32 {
+        if (self.steps >= MAX_STEPS or self.pc_i < 0 or self.pc_i >= self.code.len) return null;
+        return @intCast(self.pc_i);
+    }
+
+    /// Step past `current()`. False when that op ends the walk: anything but
+    /// `jmp`, `loop` (a marker always falls through; its `aux` is the loop's
+    /// exit offset, doc 58) or a first `for_loop`.
+    pub fn step(self: *CompositeWalk) bool {
+        const pc = self.current() orelse return false;
+        const ins = self.code[pc];
+        switch (ins.op) {
+            .jmp => self.pc_i += 1 + ins.aux,
+            .loop => self.pc_i += 1,
+            .for_loop => {
+                if (self.crossed_for_loop != null) return false;
+                self.crossed_for_loop = pc;
+                self.pc_i += 1 + ins.aux;
+            },
+            else => return false,
+        }
+        self.steps += 1;
+        return true;
     }
 };
 

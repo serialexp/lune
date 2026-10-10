@@ -25,19 +25,96 @@ pub const Options = struct {
     optimize: bool = true,
 };
 
-/// Doc 61 §5 (site 1): whether the locals watermark may leave anchor-window
-/// `slot` without a φ, so its slab copy stays stale past the trace. Only a
-/// maskable proto may: the collector masks its frames, so a dead stale slot
-/// is not rooted. A captured slot never may, since an open upvalue reads it
-/// through the stack. Liveness counts a captured register live at every pc,
-/// so "dead at the anchor pc" excludes it in O(1). It also keeps a slot the
-/// loop header reads, which a temporary above the watermark never is. The
-/// recorder's `loopCloseDefeat` mirrors finalize's filter through this
-/// predicate too. Phase 2 retires the watermark and this with it.
-pub fn watermarkMayDrop(anchor: types.AnchorKey, slot: usize) bool {
-    const proto = anchor.proto;
-    if (!proto.maskable or slot >= proto.num_registers or anchor.pc >= proto.code.len) return false;
-    return !proto.reg_live.liveIn(anchor.pc, @intCast(slot));
+/// Words in the widest liveness row: `Proto.num_registers` is a `u16`.
+pub const PHI_LIVE_WORDS = (std.math.maxInt(u16) + 64) / 64;
+
+/// Doc 61 §5 (site 2, the dead-φ filter): the registers the loop-close φ set
+/// must deliver, as the union of `Proto.reg_live` at every pc where tier-0
+/// or a linked trace reads the φ-written register file. Null = keep every φ.
+///
+/// The φ set is consumed in three places:
+///  - the close's resume pc: the anchor for a `.loop` close (the next
+///    iteration, and every coarse deopt re-run from the loop header) or the
+///    `.link` target;
+///  - each numeric-`for` loop-done exit's resume pc. The linked loop-done
+///    flush (`irinterp.flushNumericForLoopDone`, nativegen's
+///    `emitLinkedLoopDoneSnapshot`) writes the φ set and resumes after the
+///    loop. Its guards are exactly the depth-0 `.loop_done` `guard_true`s
+///    sourced at a `for_loop` (unrolled mid-trip copies are
+///    `.loop_test_copy`; a zero-trip skip is a `guard_false` whose failure
+///    enters the loop, an ordinary coarse exit). Taken as live-in at the
+///    guard's exit pc, the post-loop pc the flush resumes at. Live-in at the
+///    `for_loop` would also keep the loop body's registers, which the flush
+///    never hands to;
+///  - a composite bridge (doc 17 A-vii-d.1) out of a branch guard whose
+///    `CompositeWalk` crosses a `for_loop`. The bridge stands in for that
+///    `for_loop`, so `compositeContinueProof` demands φs for the slots it
+///    writes, `a` and `a+3`, whether or not they are live; without them the
+///    proof fails closed and the edge is lost. Every slot the bridge's
+///    successor reads besides those is live at the walk's landing pc, which
+///    the exit snapshot covers (`bridgeMatchesExitSnapshot`). Where traces
+///    will bind is unknown here, so the walk runs to its end.
+///
+/// A register dead at all of them is rewritten by tier-0 before any read,
+/// so writing it back each iteration is a store nothing observes. Leaving
+/// its slab copy stale is sound only where the collector masks the frame
+/// (`maskable`); a captured register is live at every pc, so it is kept.
+/// Every φ stays when the trace allocates (doc 24 D3, until Phase 3) or is a
+/// one-shot head (its φ rows are the terminal writeback set, doc 44).
+/// `rec` is the recorder or a finalize fixture; `loopCloseDefeat` mirrors
+/// finalize's filter through this and `phiWritebackKept`.
+pub fn phiLiveRow(rec: anytype, buf: *[PHI_LIVE_WORDS]u64) ?[]const u64 {
+    if (rec.terminal_close != null or rec.alloc_count != 0) return null;
+    const proto = rec.anchor.proto;
+    if (!proto.maskable) return null;
+    const live = &proto.reg_live;
+    std.debug.assert(live.available());
+    const resume_pc = rec.link_target orelse rec.anchor.pc;
+    if (resume_pc >= proto.code.len) return null;
+    const row = buf[0..live.words];
+    @memcpy(row, live.row(resume_pc));
+    for (rec.exit_prov.items, 0..) |maybe, idx| {
+        const gp = switch (maybe orelse continue) {
+            .guard => |g| g,
+            .link_terminal => continue,
+        };
+        if (gp.inline_depth != 0 or gp.source_proto_id != proto.id) continue;
+        if (gp.source_pc >= proto.code.len) return null;
+        const guard = rec.instrs.items[idx];
+        switch (gp.role) {
+            .loop_done => {
+                if (guard.op != .guard_true) continue;
+                if (proto.code[gp.source_pc].op != .for_loop) continue;
+                const exit_pc = ir.guardExitPc(guard) orelse return null;
+                if (exit_pc >= proto.code.len) return null;
+                for (row, live.row(exit_pc)) |*w, l| w.* |= l;
+            },
+            .branch_cond => {
+                if (guard.op != .guard_true and guard.op != .guard_false) continue;
+                var walk = code_mod.CompositeWalk.init(proto.code, gp.source_pc, gp.polarity) orelse continue;
+                while (walk.current()) |pc| {
+                    if (pc == rec.anchor.pc or !walk.step()) break;
+                }
+                const flp = walk.crossed_for_loop orelse continue;
+                const a = proto.code[flp].a;
+                for ([_]usize{ a, @as(usize, a) + 3 }) |slot| {
+                    if (slot / 64 < row.len) row[slot / 64] |= @as(u64, 1) << @intCast(slot % 64);
+                }
+            },
+            else => {},
+        }
+    }
+    return row;
+}
+
+/// Whether anchor-window slot `slot`, defined by the recording, gets a φ
+/// writeback at the close. `live` is `phiLiveRow`'s answer. A slot the trace
+/// read at entry is always kept.
+pub fn phiWritebackKept(rec: anytype, slot: u16, live: ?[]const u64) bool {
+    if (std.mem.indexOfScalar(u16, rec.entry_slots.items, slot) != null) return true;
+    const row = live orelse return true;
+    if (slot / 64 >= row.len) return true;
+    return (row[slot / 64] >> @intCast(slot % 64)) & 1 != 0;
 }
 
 /// `rec` is a mutable scratch pointer whose type is inferred at comptime.
@@ -69,16 +146,13 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
             .ord = ps.ord,
         });
     }
+    // Dead-at-every-resume slots get no φ (doc 61 §5, `phiLiveRow`).
+    var live_buf: [PHI_LIVE_WORDS]u64 = undefined;
+    const live = phiLiveRow(rec, &live_buf);
     for (rec.reg_map, 0..) |s, slot| {
         if (s.state != .def) continue;
         if (slot >= rec.anchor_num_registers) continue;
-        // Doc 44: a `.head` trace's φ rows are its TERMINAL writeback set —
-        // tier-0 resumes at the ret/self-call, which may read temps above the
-        // locals watermark (e.g. the summed result a `ret` returns) — so the
-        // watermark filter below must not drop any defined slot.
-        if (rec.terminal_close == null and rec.alloc_count == 0 and
-            slot >= rec.locals_watermark and std.mem.indexOfScalar(u16, rec.entry_slots.items, @intCast(slot)) == null and
-            watermarkMayDrop(rec.anchor, slot)) continue;
+        if (!phiWritebackKept(rec, @intCast(slot), live)) continue;
         const steady_phi: Ref = if (rec.peel) |p| blk: {
             if (slot < p.slots.len) {
                 if (p.slots[slot].phi_ref) |pr| break :blk pr;
@@ -490,7 +564,7 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
             .slot_load => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < input_limit),
             // Doc 43 P5: `uref`'s aux is a synthetic seed slot — same bound as
             // a slot_load (and always >= num_registers, but the tighter check
-            // needs the recorder's watermark, which finalize doesn't carry).
+            // needs the recorder's seed layout, which finalize doesn't carry).
             .uref => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < input_limit),
             // `uload` reads its uref; `ustore` reads uref + value.
             .uload => std.debug.assert(ins.a < i),

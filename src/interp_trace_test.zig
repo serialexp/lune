@@ -2756,7 +2756,7 @@ test "recorder: dead expression temporaries are dropped from the exit snapshot (
     // `(i + 7) * (i + 7)` computes through expression-stack temporaries at slots
     // >= base+4. They are written and re-read within the iteration (never
     // slot_loaded → write-only), and dead at the loop header / after the loop, so
-    // the recorder's watermark filter drops them from the exit snapshot.
+    // the dead-φ filter (doc 61 §5) gives them no φ.
     var chunk = try runForTrace(&vm, gpa,
         \\local acc = 0
         \\for i = 1, 50 do acc = acc + (i + 7) * (i + 7) end
@@ -2769,7 +2769,7 @@ test "recorder: dead expression temporaries are dropped from the exit snapshot (
 
     // Recover the numeric-for base from the bytecode so the assertion does not
     // hard-code the compiler's register allocation. Control regs are base..base+3;
-    // base+4 is the first temporary slot (the watermark).
+    // base+4 is the first temporary slot.
     var base: ?u16 = null;
     for (chunk.proto.code) |ins| {
         if (ins.op == .for_loop) {
@@ -2777,37 +2777,41 @@ test "recorder: dead expression temporaries are dropped from the exit snapshot (
             break;
         }
     }
-    const watermark: usize = @as(usize, base.?) + 4;
+    const first_temp: usize = @as(usize, base.?) + 4;
 
-    // Every surviving slot-bound φ is either below the watermark (a real local /
-    // loop control) or a slot the trace actually read — never a dead temporary.
+    // Every surviving slot-bound φ is either a real local / loop control or a
+    // slot the trace actually read — never a dead temporary.
     var saw_acc = false;
     for (t.code.instrs) |ins| {
         if (ins.op != .phi or ins.aux < 0) continue;
         const slot: u16 = @intCast(ins.aux);
         const was_read = std.mem.indexOfScalar(u16, t.code.entry_slots, slot) != null;
-        try testing.expect(@as(usize, slot) < watermark or was_read);
+        try testing.expect(@as(usize, slot) < first_temp or was_read);
         if (slot == 0) saw_acc = true; // `acc` is the first local → slot 0
     }
     // The loop-carried accumulator is still committed.
     try testing.expect(saw_acc);
-    // And no high write-only temporary leaked through.
+}
+
+/// The write-only φ slots of the first cached trace: written back at the
+/// close but never read by the trace at entry.
+fn writeOnlyPhiSlots(t: *const trace.Trace, out: *std.ArrayList(u16), gpa: std.mem.Allocator) !void {
     for (t.code.instrs) |ins| {
-        if (ins.op != .phi or ins.aux < 0) continue;
+        if (ins.op != .phi or ins.aux == trace_ir.PHI_INTERNAL) continue;
         const slot: u16 = @intCast(ins.aux);
-        if (@as(usize, slot) >= watermark)
-            try testing.expect(std.mem.indexOfScalar(u16, t.code.entry_slots, slot) != null);
+        if (std.mem.indexOfScalar(u16, t.code.entry_slots, slot) == null) try out.append(gpa, slot);
     }
 }
 
-test "recorder: a while loop keeps its write-only temporaries (no for_loop watermark)" {
+test "recorder: a while loop writes back no temporary dead at its header" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    // A while loop has no `for_loop`, so the watermark stays at its `maxInt`
-    // sentinel and nothing is filtered. The `i <= 50` condition computes into a
-    // write-only temporary (defined, never slot_loaded), which must survive in the
-    // exit snapshot — proving the filter is inert without an anchoring for_loop.
+    // The `i <= 50` condition computes into a write-only temporary that is
+    // dead at the loop header (the only pc tier-0 resumes at after a
+    // back-edge commit), so liveness drops its φ: nothing stores it every
+    // iteration. (The numeric-for watermark this replaced never filtered a
+    // while loop.)
     var chunk = try runForTrace(&vm, gpa,
         \\local i = 1
         \\local acc = 0
@@ -2816,16 +2820,62 @@ test "recorder: a while loop keeps its write-only temporaries (no for_loop water
     , true);
     defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
 
-    const t = vm.trace.registry.cache.items[0];
-    // There must be at least one defined-but-never-read (write-only) slot still in
-    // the snapshot — exactly what the for-loop filter would have removed.
-    var saw_write_only = false;
-    for (t.code.instrs) |ins| {
-        if (ins.op != .phi or ins.aux < 0) continue;
-        const slot: u16 = @intCast(ins.aux);
-        if (std.mem.indexOfScalar(u16, t.code.entry_slots, slot) == null) saw_write_only = true;
-    }
-    try testing.expect(saw_write_only);
+    var slots: std.ArrayList(u16) = .empty;
+    defer slots.deinit(gpa);
+    try writeOnlyPhiSlots(vm.trace.registry.cache.items[0], &slots, gpa);
+    try testing.expectEqual(@as(usize, 0), slots.items.len);
+}
+
+const live_on_untaken_branch =
+    \\local i, last, s = 1, 0, 0
+    \\while i <= 50 do
+    \\  if i == 40 then s = s + last end
+    \\  last = i * 2
+    \\  i = i + 1
+    \\end
+    \\print(s, last)
+;
+
+test "recorder: a write-only slot live at the anchor keeps its φ" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // The trace takes the `i ~= 40` direction, so it never reads `last`
+    // (slot 1, locals allocate in order) and only writes it. But the other
+    // direction reads it before the write, so it is live at the anchor and
+    // its writeback stays.
+    var chunk = try runForTrace(&vm, gpa, live_on_untaken_branch, true);
+    defer chunk.deinit();
+
+    var slots: std.ArrayList(u16) = .empty;
+    defer slots.deinit(gpa);
+    try writeOnlyPhiSlots(vm.trace.registry.cache.items[0], &slots, gpa);
+    try testing.expect(std.mem.indexOfScalar(u16, slots.items, 1) != null);
+}
+
+test "recorder: a deopt onto a branch that reads a write-only slot sees its last write" {
+    // At i == 40 the branch guard deopts to the anchor with the committed
+    // registers; tier-0 then reads `last`, which must be i == 39's write.
+    try expectProgram(live_on_untaken_branch, "78\t100\n");
+}
+
+test "recorder: φ liveness covers a loop-done exit's post-loop pc" {
+    // `k` is dead at the inner loop's body start (`k = i` writes it first),
+    // which is both the inner root's anchor and the continuation's `.link`
+    // target. It is live after the inner loop, where a loop-done exit resumes
+    // with the φ-written registers: the final `for_loop` test for the root,
+    // and the `for_prep` first-trip test for the continuation (`n == 0`
+    // skips the loop and must read the `k = 0` the continuation wrote).
+    try expectProgram(
+        \\local total = 0
+        \\for j = 1, 400 do
+        \\  local k = 0
+        \\  local n = j % 7
+        \\  for i = 1, n do k = i end
+        \\  total = total + k * 10 + n
+        \\end
+        \\print(total)
+    , "13178\n");
 }
 
 test "recorder: a recurring literal is interned to one const-pool entry" {

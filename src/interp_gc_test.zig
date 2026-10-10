@@ -215,6 +215,36 @@ test "doc 61 §5 site 5: a chain burst over an inner loop whose flush declines r
     , "105500\t8\n", .{ .hotloop = cli_hotloop, .inspect = &followedInner });
 }
 
+// Doc 61 Phase 2, codex's dead-φ counterexample (the reason doc 61 exists):
+// the inner loop's register for `s` is dead at the inner header and after
+// the loop, so the dead-φ filter gives it no writeback and the slab keeps
+// an earlier table, whose string the unmasked walk kept alive past the
+// re-intern of "x" — tier-0 printed 0x178f and the traced tiers 0x1790.
+// Under the masked walk every tier roots the same registers.
+test "doc 61 §8: a φ the dead-φ filter drops leaves the same heap in every tier" {
+    try expectProgramByGc(
+        \\local function fill()
+        \\  local t = {}
+        \\  for j = 1, 400 do
+        \\    t[j] = {v = string.char(1000 + j)}
+        \\  end
+        \\  return t
+        \\end
+        \\local function clear(...) end
+        \\
+        \\local t = fill()
+        \\local s = nil
+        \\for j = 1, 400 do
+        \\  for i = 1, 100 do s = t[j] end
+        \\end
+        \\t = nil
+        \\clear(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+        \\for k = 1, 5000 do local junk = {} end
+        \\local x = string.char(1400)
+        \\print({})
+    , "table: 0x178f\n", "table: 0x178f\n", .{});
+}
+
 // Site 3's exit-snapshot programs live with the register probe
 // (interp_semantics_test.zig, "doc 61 §2 site 3"): an object id printed
 // after `f` returns cannot see a stale register in `f`'s window.

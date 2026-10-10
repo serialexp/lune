@@ -728,8 +728,8 @@ fn jitFinalSnapshot(gpa: std.mem.Allocator, source: [:0]const u8, ref: RefRun) !
 test "doc 21 §T-A.2: cross-tier final snapshots byte-identical (the minimized H-5(i) g-loop shape)" {
     // The exact divergence channel from the §R3 bisect, minimized: tier-0
     // leaves the g-loop's final-iteration temps in dead slots; the native exit
-    // flush freezes pre-burst values there (the recorder's locals_watermark φ
-    // filter prunes never-read temps). The doc-21 final-cut mask must
+    // flush freezes pre-burst values there (the recorder's dead-φ filter
+    // prunes never-read temps). The doc-21 final-cut mask must
     // canonicalize both to nil, making the snapshots byte-compare.
     const gpa = testing.allocator;
     const source =

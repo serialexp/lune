@@ -2251,11 +2251,25 @@ const RegProbe = struct {
         return vm.regGet(vm.frames[vm.depth - 1].base + k);
     }
 
+    /// `peek()`: `reg(k)` for the register just above the call's own base,
+    /// which a call with no arguments leaves untouched. The calling frame is
+    /// in flight, so its `pc` is the `.call` itself.
+    fn peek(ctx: *anyopaque, _: []const Value) anyerror!Value {
+        const vm: *interp.Vm = @ptrCast(@alignCast(ctx));
+        const f = vm.frames[vm.depth - 1];
+        std.debug.assert(f.in_flight);
+        const call = f.closure.proto.code[f.pc];
+        std.debug.assert(call.op == .call);
+        return reg(ctx, &.{Value.int(@as(i64, call.a) + 1)});
+    }
+
     fn install(vm: *interp.Vm) !void {
         const native = try vm.heap.newNative(&regs, "regs");
         try vm.globals.set(vm.heap.gpa, try vm.heap.internValue("regs"), Value.heap(&native.header));
         const reg_native = try vm.heap.newNative(&reg, "reg");
         try vm.globals.set(vm.heap.gpa, try vm.heap.internValue("reg"), Value.heap(&reg_native.header));
+        const peek_native = try vm.heap.newNative(&peek, "peek");
+        try vm.globals.set(vm.heap.gpa, try vm.heap.internValue("peek"), Value.heap(&peek_native.header));
         try util.installUnmask(vm);
     }
 };
@@ -2413,6 +2427,47 @@ test "doc 61 §2 site 3: an attached exit over a maskable proto leaves its dead 
 
 test "doc 61 §2 site 3: an attached exit over a non-maskable proto materialises its dead temporary" {
     try util.expectProgramTuned(hotExitSource(true, "unmask(f)\n"), "1192\t25\t0\n", .{ .setup = &RegProbe.install, .inspect = &ExitSide.attached });
+}
+
+/// Doc 61 §5 site 2 (the dead-φ filter): `s` is dead at the loop header, so
+/// over a maskable `f` the loop-close φ set leaves it out and its slab copy
+/// stays stale. On every 50th trip `hit` sends tier-0 back to the header
+/// with the committed registers (the `if hit` guard fails), and `peek`
+/// collects and reads `s`'s register before this trip writes it. The `if`
+/// holds its condition in the register `x` takes, the call's base is `y`'s
+/// and `s` is the one above it. A maskable `f` has `s` scrubbed in every
+/// tier; a non-maskable one keeps the φ, so every tier holds the previous
+/// trip's value. `s` is a number: an allocating trace keeps every φ (doc 24
+/// D3), so a string would never reach the filter. `PRE` runs before `f`.
+fn deadPhiProbeSource(comptime pre: []const u8) [:0]const u8 {
+    return
+    \\local function f(n)
+    \\  local c, same, nils, hit = 0, 0, 0, false
+    \\  for i = 1, n do
+    \\    if hit then
+    \\      local v = peek()
+    \\      if v == (i - 1) * 3 then same = same + 1 elseif v == nil then nils = nils + 1 end
+    \\    end
+    \\    local x, y = 0, 0
+    \\    local s = i * 3
+    \\    c = c + s
+    \\    hit = i % 50 == 0
+    \\  end
+    \\  return c, same, nils
+    \\end
+    \\
+    ++ pre ++
+        \\print(f(400))
+        \\
+    ;
+}
+
+test "doc 61 §5 site 2: a φ the dead-φ filter drops over a maskable proto is left to the scrub" {
+    try util.expectProgramTuned(deadPhiProbeSource(""), "240600\t0\t7\n", .{ .setup = &RegProbe.install });
+}
+
+test "doc 61 §5 site 2: a non-maskable proto keeps every φ" {
+    try util.expectProgramTuned(deadPhiProbeSource("unmask(f)\n"), "240600\t7\t0\n", .{ .setup = &RegProbe.install });
 }
 
 /// Doc 61 §5 site 5: the inner loop's control variable `i` (r12, `R[a+3]`)

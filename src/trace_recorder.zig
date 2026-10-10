@@ -719,17 +719,6 @@ pub const RecordingSession = struct {
     /// Current SSA ref + state for each tier-0 register, sized to the recording
     /// frame's `num_registers`.
     reg_map: []RegSlot = &.{},
-    /// Lowest register slot that is a *compiler temporary* at this trace's loop
-    /// header — the live-locals watermark. Set only by the `for_loop` whose
-    /// back-edge targets this trace's anchor (so it describes the loop the trace
-    /// actually re-enters): for a numeric-`for` the control regs occupy
-    /// `base..base+3`, so every slot `>= base+4` is an expression temporary, dead
-    /// at every statement boundary (`compiler.zig:8-9`) and after the loop
-    /// (`freeTo(base)`). `commit()` drops such slots from the exit snapshot — they
-    /// are recomputed by tier-0 on deopt and never read post-loop. The `maxInt`
-    /// sentinel means "unknown" (while / generic-`for` / a passed-through `for`),
-    /// so nothing is filtered and behavior is unchanged.
-    locals_watermark: u32 = std.math.maxInt(u32),
     /// Nested-loop trace linking (doc 15, Phase 2): when set, this recording is a
     /// *continuation* that re-reached an inner numeric-`for`'s `for_prep` whose loop
     /// header already has a root trace. The value is the inner root's anchor pc (a
@@ -773,8 +762,8 @@ pub const RecordingSession = struct {
     /// tier-0 resumes after a successful terminal exit and executes it
     /// exactly once. `finalize` appends `.terminal{a=kind, aux=resume_pc}`
     /// instead of `.loop`/`.link`, keeps EVERY defined depth-0 register in
-    /// the writeback φ rows (a ret/call may read temps above the locals
-    /// watermark), and caches the trace unoptimized (the link-trace
+    /// the writeback φ rows (a ret/call may read temporaries the dead-φ
+    /// filter would drop), and caches the trace unoptimized (the link-trace
     /// precedent). Reset to `null` by `reset`.
     terminal_close: ?struct { kind: trace_ir.TerminalKind, resume_pc: u32 } = null,
     /// Nested-loop trace linking (doc 15, Phase 2): true iff this recording is a
@@ -3497,9 +3486,7 @@ pub const RecordingSession = struct {
     /// composite step's negative status) and tier-0 replays the call,
     /// produces the nil, and ends the loop itself. A BOOLEAN v1 aborts
     /// fail-closed: `false` is non-nil (the loop continues) but no guard op
-    /// expresses "non-nil" without also pinning truthiness. No
-    /// `locals_watermark` here: generic-for keeps the maxInt sentinel (the
-    /// loop variables live below the call window and stay in the snapshot).
+    /// expresses "non-nil" without also pinning truthiness.
     /// Doc 56 G6-Q1(d), LuaJIT `rec_loop_interp`'s side-trace arm ("side
     /// trace enters an inner loop": `--J->loopunroll < 0` → `LJ_TRERR_LUNROLL`).
     /// Called where a side or continuation recording goes round a loop
@@ -3583,23 +3570,9 @@ pub const RecordingSession = struct {
 
     pub fn recForLoop(self: *RecordingSession, instr: Instr, regs: RegWindow, pc: u32) !void {
         const a = instr.a;
-
-        // If *this* `for_loop` is the one whose back-edge defines the trace
-        // anchor (its target == anchor.pc, computed exactly as the interpreter's
-        // `applyJump`), then the trace re-enters / resumes at this numeric-`for`'s
-        // body start. Its four control regs occupy `a..a+3` (idx, limit, step,
-        // var), so every slot `>= a+4` is a compiler temporary — dead at the body
-        // start on every resume path and after the loop. Record the watermark so
-        // `commit()` can drop those slots from the exit snapshot. A `for_loop` the
-        // trace merely passes through (different target) is ignored.
-        //
-        // Guard with `inline_depth == 0`: at depth > 0 the `target` pc is in the
-        // callee's proto, so `target == anchor.pc` is a cross-proto coincidence —
-        // the watermark would corrupt the anchor frame's phi writeback. The callee's
-        // locals are already excluded by `slot >= anchor_num_registers` in commit.
+        // The back-edge target, computed exactly as the interpreter's
+        // `applyJump`.
         const target: u32 = @intCast(@as(i64, pc) + instr.aux);
-        if (self.inline_depth == 0 and target == self.anchor.pc)
-            self.locals_watermark = @as(u32, a) + 4;
         const vidx = regs.get(a);
         const vlimit = regs.get(a + 1);
         const vstep = regs.get(a + 2);
@@ -6109,6 +6082,9 @@ pub const RecordingSession = struct {
         // the window belongs to a callee. Depth-0 covers every channel the
         // reset-to-int shape records through (glue side / continuation).
         if (self.inline_depth != 0) return .none;
+        const finalizer = @import("trace_finalize.zig");
+        var live_buf: [finalizer.PHI_LIVE_WORDS]u64 = undefined;
+        const live = finalizer.phiLiveRow(self, &live_buf);
         var found: CloseDefeat = .none;
         const instrs = self.instrs.items;
         for (instrs, 0..) |ins, i| {
@@ -6122,9 +6098,7 @@ pub const RecordingSession = struct {
             if (slot >= self.anchor_num_registers) continue;
             const s = self.reg_map[slot];
             if (s.state != .def) continue; // read-only slot: no φ, no back-edge write
-            if (self.alloc_count == 0 and
-                slot >= self.locals_watermark and !self.readSlot(@intCast(slot)) and
-                @import("trace_finalize.zig").watermarkMayDrop(self.anchor, slot)) continue;
+            if (!finalizer.phiWritebackKept(self, @intCast(slot), live)) continue;
             // STORE side: the LIVE value at this anchor return. Recording is
             // concrete execution, so this is exactly what the φ delivers on
             // the recorded path. (The IR `ty` is useless here: an unguarded
@@ -6254,7 +6228,6 @@ pub const RecordingSession = struct {
         @memset(self.reg_map, .{});
         self.anchor = anchor;
         self.abort_reason = null;
-        self.locals_watermark = std.math.maxInt(u32);
         self.kind = .root;
         self.anchor_num_registers = num_registers;
         self.base_off = 0;

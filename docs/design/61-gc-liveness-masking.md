@@ -1,9 +1,10 @@
 # mahina — GC liveness masking — Design
 
 Status: rev 7, approved by codex + antigravity; Q1 = (a), Q2 = label dead
-slots (Bart, 2026-10-09); Phases P, 0 and Q landed, Phase 1 implemented
+slots (Bart, 2026-10-09); Phases P, 0, Q and 1 landed (keyframe masking
+open for Bart), Phase 2 implemented
 Owner: Bart + agents (amber-badger)
-Last updated: 2026-10-10
+Last updated: 2026-10-11
 
 ## Implementation status
 
@@ -196,9 +197,11 @@ as they land; move bullets to Done once everything inside them is checked.
   - [x] The recorder's `for` link checks no longer read the dead `R[a+3]`
         (`ForEntryView` substitutes the value tier-0 is about to write).
         The scrub made that read see nil and refuse the link.
-  - [ ] Gates, hashgate (§9 regeneration procedure), the §8 tests and
+  - [x] Gates, hashgate (§9 regeneration procedure), the §8 tests and
         mutations, the boundary benchmark, and a pt-default board.
-        **Done except the board.** Hashgate needed no regeneration (90
+        Committed as `0225b4d`; the board (run `abf291bd`) is flat against
+        dc3340f, worst row binary-trees jit +1.4%, which a local
+        instruction A/B does not reproduce. Hashgate needed no regeneration (90
         digests match). Each site has a test that fails when its
         `maskable` gate is removed: site 1 (`trace_finalize_test`), site 3
         (`interp_semantics_test`, wanted and attached exits, which a
@@ -209,11 +212,42 @@ as they land; move bullets to Done once everything inside them is checked.
         stale register in its window, so the §8 id programs are not the
         site oracles.
 - [ ] **Phase 2 — land the dead-φ writeback filter on top.**
-  - [ ] Re-base `phiLiveRow`/`phiWritebackKept` on `Proto.maskable` (§5).
-  - [ ] Retire the numeric-for `locals_watermark` drop rule. Liveness
-        subsumes it, and it can drop a captured slot (§5).
-  - [ ] `/tmp/gcphi_new.lua` as a doc test, printing the same id in every
-        mode.
+  - [x] Re-base `phiLiveRow`/`phiWritebackKept` on `Proto.maskable` (§5).
+        **As implemented:** both are free functions in `trace_finalize.zig`
+        over `rec: anytype`, so finalize and the recorder's
+        `loopCloseDefeat` share one predicate and the finalize fixture needs
+        no copy. The row buffer is sized from `num_registers`' type (1024
+        words), so no frame width falls back to keeping every φ. The parked
+        version capped it at 4 words, which real frames exceed.
+        Two consumers were narrowed or added in review of the instruction
+        A/B (nsieve +1.1% at first):
+        - A loop-done row is live-in at the guard's **exit pc**, and only for
+          the `guard_true` continue tests the linked flush resumes from. The
+          parked code took live-in at the `for_loop` itself, which also keeps
+          the loop body's registers. It also took it for the zero-trip
+          `guard_false`, whose failure enters the loop.
+        - A branch guard whose deopt walk (`trace_code.CompositeWalk`, now
+          shared with `resolveCompositeBridgeSuccessor` and bridge
+          candidacy) crosses a `for_loop` keeps that loop's `a` and `a+3`.
+          `compositeContinueProof` demands both φs. Without them, nsieve's
+          `if p[i]` bridge failed closed, and the exit grew an exit-side
+          child instead (`interp_exit_side_test`, "site 2").
+        Against HEAD, the suite moves in instructions: pi_leibniz −29.5%,
+        field_hash −7.4%, array3d −3.3%, scimark-sparse −2.1%, nsieve
+        −0.16%, scimark-fft +0.47% (same topology, fewer φs; cycles −1.1%),
+        and the rest within ±0.5%.
+  - [x] Retire the numeric-for `locals_watermark` drop rule. Liveness
+        subsumes it, and it can drop a captured slot (§5). The field, its
+        `recForLoop` set and `watermarkMayDrop` are gone.
+  - [x] `/tmp/gcphi_new.lua` as a doc test, printing the same id in every
+        mode (`interp_gc_test`; with the collector's mask disabled, tier-0
+        prints 0x178f and the traced tiers 0x1790 again).
+  - [x] A register probe test per gate: a coarse deopt to the loop header
+        reads a dead number temporary before tier-0 rewrites it
+        (`interp_semantics_test`, "site 2"). It fails when `phiLiveRow`
+        ignores `maskable`. A string temporary would not do: an allocating
+        trace keeps every φ.
+  - [ ] Gates, hashgate, a pt-default board.
 - [ ] **Phase 3 — relax doc 24 D3's full-write-set flush.** Today
       `alloc_count != 0` keeps every φ only because the collector roots every
       register. Re-derive it under masking. Separate review.
@@ -325,7 +359,9 @@ fifth in its rev 4, rev 5 and rev 6 reviews:
 1. **Loop-close φ writeback, numeric-for watermark** (today; retired in
    Phase 2, see below).
 2. **Loop-close φ writeback, dead-φ filter** (Phase 2). `R` is the close's
-   resume pc and each `loop_done` source pc.
+   resume pc and each linked loop-done exit's post-loop pc. A composite bridge
+   (site 4) that crosses a `for_loop` also needs that loop's `a` and `a+3`
+   φs, live or not: its continue proof demands both.
 3. **Side-exit snapshots** (today, doc 56 §4.2). `commitExitSnap`
    (`trace_recorder.zig:1433`) records only `.def` slots live at the exit's
    resume pc. Materialisation writes only the recorded ones
@@ -980,6 +1016,9 @@ for decision in the Phase 1 review:
   **liveness only**: `phiWritebackKept` loses its `locals_watermark` clause,
   and the recorder stops dropping temporaries by watermark (§2). The
   `readSlot` and resume-pc/`loop_done` rows of `phiLiveRow` stay as they are.
+  (As implemented, the loop-done row is taken at the exit pc, and a
+  composite bridge's crossed `for_loop` keeps its `a` and `a+3`; see the
+  Phase 2 status.)
 - **Exit snapshots (Phase 1).** `commitExitSnap` intersects with
   `live_in[rpc]` only when `maskable(F)`. Otherwise it records every `.def`
   slot. Today `available()` already gates snapshot creation

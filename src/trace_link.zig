@@ -24,6 +24,7 @@ const jitdbg = @import("jitdbg.zig");
 const table_mod = @import("table.zig");
 const arr = @import("array.zig");
 const function = @import("function.zig");
+const CompositeWalk = @import("trace_code.zig").CompositeWalk;
 const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
@@ -925,47 +926,19 @@ pub fn resolveCompositeBridgeSuccessor(self: *const TraceState, t: *const Trace,
     const proto = t.code.anchor.proto;
     if (g.source_proto_id != proto.id) return null;
     if (!t.code.isBridgeCandidate(e.index)) return null;
-    if (g.source_pc >= proto.code.len) return null;
-    const bop = proto.code[g.source_pc];
-    switch (bop.op) {
-        .jmp_if_true, .jmp_if_false => {},
-        else => return null,
-    }
-    // Post-fetch jump convention (`applyJump(source_pc + 1, aux)`): the
-    // interpreter applies branch offsets to the already-incremented pc.
-    const fallthrough_pc: i64 = @as(i64, g.source_pc) + 1;
-    const jump_pc: i64 = fallthrough_pc + bop.aux;
-    // The guard fails ⇒ the deopt takes the CFG edge the recording did NOT:
-    // recorded `.fallthrough` fails onto the jump edge and vice versa.
-    var pc_i: i64 = if (g.polarity == .fallthrough) jump_pc else fallthrough_pc;
-
-    var crossed_for_loop: ?u32 = null;
-    var steps: usize = 0;
-    while (steps < 16) : (steps += 1) {
-        if (pc_i < 0 or pc_i >= proto.code.len) return null;
-        const pc: u32 = @intCast(pc_i);
+    // The guard fails ⇒ the deopt takes the CFG edge the recording did NOT.
+    var walk = CompositeWalk.init(proto.code, g.source_pc, g.polarity) orelse return null;
+    while (walk.current()) |pc| {
         // Landing back on the source's own anchor is a self-edge, not a
         // cross-anchor handoff — decline (same rule as the ordinary arm).
         if (pc == t.code.anchor.pc) return null;
         if (self.countTracesAt(.{ .proto = proto, .pc = pc }) != 0) {
-            if (crossed_for_loop) |flp| {
+            if (walk.crossed_for_loop) |flp| {
                 if (!compositeContinueProof(t, e.index, flp)) return null;
             }
             return .{ .proto_id = proto.id, .pc = pc };
         }
-        const ins = proto.code[pc];
-        switch (ins.op) {
-            .jmp => pc_i = pc_i + 1 + ins.aux,
-            // Doc 58: a loop marker always falls through (its `aux` is the
-            // loop's exit offset, not a jump).
-            .loop => pc_i = pc_i + 1,
-            .for_loop => {
-                if (crossed_for_loop != null) return null; // at most one
-                crossed_for_loop = pc;
-                pc_i = pc_i + 1 + ins.aux; // continue edge = the back-edge target
-            },
-            else => return null,
-        }
+        if (!walk.step()) return null;
     }
     return null;
 }

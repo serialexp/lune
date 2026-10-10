@@ -1740,7 +1740,8 @@ pub fn rebuildRegions(self: *TraceState) void {
     // redundant deferred one.
     self.pending_region_rebuild = false;
     self.region_rebuilds +|= 1;
-    self.rebuildRegionsFallible() catch {
+    self.rebuildRegionsFallible() catch |err| {
+        self.dbg("region: rebuild failed ({s})", .{@errorName(err)});
         self.clearPhysicalRegionIndices();
         // A-vii-d.1 (review blocker 3): the physical indices failed closed
         // to empty, so no region is live-armable — every armed bridge
@@ -1759,6 +1760,7 @@ pub fn rebuildRegionsFallible(self: *TraceState) !void {
     const view = try topologyView(self, arena.allocator());
     var staged = topology.build(self.gpa, view, self.region_policy.previousTopology(), &self.region_policy.edge_cache) catch |err| {
         if (err == error.IncompleteRegionGraph) {
+            self.dbg("region: rebuild skipped (incomplete graph)", .{});
             self.clearPhysicalRegionIndices();
             self.disarmStaleRegionBridgeLinks(&.{});
             return;

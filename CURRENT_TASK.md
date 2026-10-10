@@ -216,9 +216,30 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
       JIT leg the best runs are equal (+0.01%) and the cycle medians
       slightly lower. Its JIT instruction count varies about 1% run to
       run on both binaries.
+- **Phase 2 is implemented (2026-10-11).** The dead-φ filter
+  (`trace_finalize.phiLiveRow`/`phiWritebackKept`) is gated on `maskable`,
+  and the numeric-for watermark is gone. Doc 61's Phase 2 list has the
+  details. Two consumers were fixed while chasing an nsieve +1.1%
+  instruction regression:
+  - the loop-done row is taken at the guard's exit pc, and only for
+    `guard_true`;
+  - a branch whose deopt walk crosses a `for_loop` keeps that loop's `a`
+    and `a+3`, which the composite bridge's continue proof needs.
+    `trace_code.CompositeWalk` is now the one walk.
+  - Gates green (test, jit-debug, release lib, wasm); hashgate 90/90 on
+    both legs.
+  - Instructions against Phase 1: pi_leibniz −29.5%, field_hash −7.4%,
+    array3d −3.3%, scimark-sparse −2.1%, nsieve −0.16%, scimark-fft
+    +0.47% (cycles −1.1%), the rest within ±0.5%.
+  - Codex reviewed it (thread above) and found no Phase 2 issue. It found
+    a pre-existing native miscompile, which is next.
 - **Then, in order:**
-  - Phase 2: land the uncommitted dead-φ filter and retire the watermark
-    (and `watermarkMayDrop` with it);
+  - Fix the loop-test-copy miscompile (codex, 2026-10-11). The dispatcher
+    chains `.native_numeric_for_done` whenever `ran_native_link_mode` is
+    set (interp.zig ~5273), so an ordinary deopt from an unrolled
+    `.loop_test_copy` resumes at the post-loop pc and skips the owed
+    iteration. Repro `/tmp/p1blk/ltc/repro.lua`: tier-0 prints -80, native
+    412 (Phase 1 too).
   - Phase V.
 
   Each touches interp.zig/capi.zig/CallFrame, so coordinate with
