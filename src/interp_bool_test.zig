@@ -289,6 +289,34 @@ test "doc 57 P3: a nested unrolled for whose loop ends mid-trip chains correctly
     , "15600\n", .{ .hotloop = 56, .inspect = Inspect.run });
 }
 
+test "doc 57 P3: a loop-test copy's exit in link mode resumes the owed trip, not the post-loop pc" {
+    // The inner loop unrolls its alternating `b`, so its `for_loop` test has
+    // a mid-trip copy. When the trip count is odd that copy fails, an
+    // ordinary deopt that still owes the trip's last iteration. The run is
+    // in link mode (the inner loop has a continuation), and the chain used
+    // to take any such exit as a committed loop-done: it ran the
+    // continuation at the post-loop pc and dropped the iteration.
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (!executes(mode)) return;
+            try testing.expect(mostUnrolled(vm) != null);
+        }
+    };
+    try expectProgramTuned(
+        \\local total = 0
+        \\for j = 1, 10 do
+        \\  local b = false
+        \\  local n = j % 5 + 80
+        \\  for i = 1, n do
+        \\    b = not b
+        \\    if b then total = total + i
+        \\    else total = total - i end
+        \\  end
+        \\end
+        \\print(total)
+    , "-80\n", .{ .inspect = Inspect.run });
+}
+
 test "doc 57 P3: a period-3 nil/false/true cycle unrolls twice" {
     const Inspect = struct {
         fn run(vm: *Vm, mode: TraceMode) !void {

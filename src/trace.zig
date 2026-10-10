@@ -337,6 +337,8 @@ pub const ChainTier = enum { ir, native_only };
 ///   * `.native_numeric_for_done` — a native numeric-`for` loop-done exit; the root
 ///                                was entered with `runLinkedLoopDone`, so the final
 ///                                iteration is already materialized — no flush owed.
+///                                `driveChain` declines any exit whose guard does
+///                                not emit the linked flush (`linkedLoopDoneEmitted`).
 pub const ExitMaterialization = union(enum) {
     ordinary_header,
     ir_numeric_for_done: []Value,

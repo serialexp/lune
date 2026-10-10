@@ -248,6 +248,13 @@ pub fn driveChain(
     // out as a walk pc — explicit kind check, fail-closed, so a future
     // caller can't reintroduce that by accident.
     if (trace_mod.anchorKind(failed.code.anchor.pc) != .loop) return null;
+    // The native loop-done materialization claims the final iteration is
+    // already committed. That holds only at a guard whose linked flush the
+    // page emits; tier-1a's twin is `flushNumericForLoopDone`'s refusal. Any
+    // other exit of a run in link mode is an ordinary deopt, coherent at the
+    // anchor: an unrolled `.loop_test_copy` owes the rest of its trip, and
+    // chaining at its post-loop pc would skip it.
+    if (materialization == .native_numeric_for_done and !failed.code.linkedLoopDoneEmitted(exit_instr)) return null;
     // A-vii-d (doc 17 §A-vii.2): region-bridge arm site — beside the M1
     // `.ordinary_guard` arms below, never inside them. Native path only,
     // observation-blackout gated (`safe_to_arm`, same rule as every other

@@ -233,14 +233,23 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
     +0.47% (cycles −1.1%), the rest within ±0.5%.
   - Codex reviewed it (thread above) and found no Phase 2 issue. It found
     a pre-existing native miscompile, which is next.
-- **Then, in order:**
-  - Fix the loop-test-copy miscompile (codex, 2026-10-11). The dispatcher
-    chains `.native_numeric_for_done` whenever `ran_native_link_mode` is
-    set (interp.zig ~5273), so an ordinary deopt from an unrolled
-    `.loop_test_copy` resumes at the post-loop pc and skips the owed
-    iteration. Repro `/tmp/p1blk/ltc/repro.lua`: tier-0 prints -80, native
-    412 (Phase 1 too).
-  - Phase V.
+  - Committed as `dfc523c`. Board on pinned pt-default (run `ac023608`)
+    against Phase 1's `abf291bd`: suite jit total 3624 → 3613 ms. Best:
+    field_hash −4.9%, array3d −2.4%, binary-trees −2.0%. Worst:
+    str_gmatch +2.1%, str_format +1.8%, str_gsub +1.4%. Those three have
+    identical instruction counts and identical traces, and str_format and
+    str_gsub move the same in tier-0. A local swapped-order A/B on
+    str_gmatch flips sign, so it's noise.
+- **Loop-test-copy miscompile fixed (2026-10-11, codex's find).** The
+  dispatcher chained `.native_numeric_for_done` for any productive exit of
+  a link-mode run. An unrolled `.loop_test_copy` exit then ran the
+  continuation at the post-loop pc and dropped the trip's last iteration
+  (tier-0 -80, native 412). `driveChain` now declines that materialization
+  unless the exit's guard emits the linked flush (`linkedLoopDoneEmitted`),
+  the native twin of `flushNumericForLoopDone`'s refusal. Regression test in
+  interp_bool_test (mutation-checked). Gates green, hashgate 90/90 on both
+  legs; instructions neutral.
+- **Then:** Phase V.
 
   Each touches interp.zig/capi.zig/CallFrame, so coordinate with
   coral-marten: `.S` offsets for `CF_IN_FLIGHT`, and the `guestFault`
