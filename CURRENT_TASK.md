@@ -170,7 +170,8 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
     `retire_work`. Work and instructions are linear. Time per trace rises
     at large N because of dTLB misses (perf: ×9 per ×4 N), which is
     locality, not a pass. The setup exposed four native bookkeeping items,
-    now in TODO. The O(L) armed-link lookup is next.
+    now in TODO. The O(L) armed-link lookup was checked: the bench peak is
+    13 simultaneous arms, so it waits in TODO with its index design.
 
   Phase Q is done. `releaseChunk` options for Bart are in TODO.
 - **Then, in order:**

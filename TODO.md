@@ -172,8 +172,18 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       (`trace_native_registry.zig`) finds the existing (parent, physical
       slot) record with a linear walk over `armed_links`. So each arm is
       O(L) and arming L links is O(L²): 15% of the bench's setup at
-      N=16000. Fix it with an index keyed by (parent, physical slot) that
-      every add, remove, compaction and reset keeps in step.
+      N=16000. The same walk appears at about 20 consumers (`trace.zig`
+      `hasArmedFrameLink`, `armedEdgeInBridgeFreeCycle`, `trace_link.zig`,
+      `trace_regionops.zig`, `trace_chain.zig`, `memoizeBridgeEdge`). Almost
+      all of them filter by `parent`.
+
+      Scale today: peak simultaneous arms across the LuaJIT bench set is
+      13 (nsieve-bit-fp), and arms are compile-time events, so this is not
+      hot yet. The general fix is a per-parent index: each trace's armed
+      links (bounded by its exits), kept in step by every append,
+      swap-remove, compaction and reset. Consumers that look up by parent
+      then cost O(that trace's links). Do it before programs with
+      thousands of live links exist.
 - [ ] **Retirement time per trace grows with heap size.** The batch's work
       and instructions are linear (≈1.2k instructions per retired native
       trace at both N=4000 and N=16000). Its time per trace still rises,
