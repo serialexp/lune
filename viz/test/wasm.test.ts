@@ -268,6 +268,43 @@ test("replay: stepping advances the line and grows stdout; the full replay match
   expect(view!.globals.some((g) => g.label === "print")).toBe(true);
 });
 
+test("doc 61 Phase V: a replay step marks the locals no path reads again as dead", () => {
+  // `a` (r0) is read once, by `b = a * 2`; from then on it is dead, while
+  // `b` (r1) stays live until `print(b)` reads it.
+  const src = "local a = 10\nlocal b = a * 2\nprint(b)\nprint(1)\n";
+  const run = mod.runSource(src);
+  expect(run.status).toBe(0);
+
+  let sawLive = false;
+  let sawDead = false;
+  for (let k = 1; k <= run.safepointCount; k++) {
+    const step = mod.replay(src, run.effects, k);
+    expect(step.status).toBe(0);
+    if (step.finished) break;
+    // The top-level chunk is maskable, so every suspended step has a mask
+    // covering the whole window.
+    const disasm = run.disasm.find((p) => p.id === step.protoId)!;
+    expect(step.live.length).toBe(disasm.numRegisters);
+    if (step.live[0] === 1) {
+      expect(sawDead).toBe(false); // once dead, `a` is never read again
+      sawLive = true;
+    } else if (sawLive) {
+      sawDead = true;
+      const view = decodeSnapshot(step.keyframe, step.live)!;
+      expect(view.locals[0]).toMatchObject({ label: "r0", dead: true });
+      // The view marks exactly the zero bytes.
+      for (const [reg, local] of view.locals.entries()) {
+        expect(local.dead === true).toBe(reg < step.live.length && step.live[reg] === 0);
+      }
+    }
+  }
+  expect(sawLive).toBe(true);
+  expect(sawDead).toBe(true);
+
+  // Past the end there is no frame, so no mask.
+  expect(mod.replay(src, run.effects, run.safepointCount + 1).live.length).toBe(0);
+});
+
 test("a run disassembles the proto tree and the replay cursor indexes it", () => {
   const src = "local s = 0\nfor i = 1, 3 do\n  s = s + i\n  print(s)\nend\nprint(\"done\")\n";
   const run = mod.runSource(src);

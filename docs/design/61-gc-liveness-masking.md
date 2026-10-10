@@ -1,8 +1,8 @@
 # mahina — GC liveness masking — Design
 
 Status: rev 7, approved by codex + antigravity; Q1 = (a), Q2 = label dead
-slots (Bart, 2026-10-09); Phases P, 0, Q and 1 landed (keyframe masking
-open for Bart), Phase 2 implemented
+slots (Bart, 2026-10-09); Phases P, 0, Q, 1, 2 and V landed (keyframe
+masking open for Bart); Phase 3 next
 Owner: Bart + agents (amber-badger)
 Last updated: 2026-10-11
 
@@ -53,10 +53,24 @@ as they land; move bullets to Done once everything inside them is checked.
   the same change (registry anchor index, indexed per-component topology
   build). The implementation review's missing tests landed with
   `bench-retire`'s native table (2026-10-10); Phase Q is done.
-- [ ] **Phase V — visualiser labels dead slots.** Its liveness source must be
+- [x] **Phase V — visualiser labels dead slots.** Its liveness source must be
       tier-identical data. Options are an exported per-frame live mask in the
       snapshot, or `reg_live` re-derived from the proto and the frame
       shape (§4).
+      **As implemented (2026-10-11):** the exported mask, computed by the
+      collector's own `Vm.frameMask` (now public, with
+      `FrameMask.keeps`). So a register is labelled dead exactly when a
+      collection at that step may scrub it. It does not ride in the keyframe:
+      `mahina_replay`'s `ReplayResult` gains a `live` buffer, appended last
+      (one byte per innermost-window register, empty when finished or when
+      the frame is rooted whole). The viz shows only the innermost frame, so
+      only its mask is exported; the replay is tier-0, and `frameMask` is a
+      function of the proto and the frame's shape, not the tier.
+      `decodeSnapshot` marks those locals `dead`, and the replay panel
+      mutes them with a "dead" tag. Re-deriving in the viz would have meant
+      exporting raw operands (for `call_a`) and re-implementing §4's shapes
+      in TypeScript. Test: `viz/test/wasm.test.ts` "doc 61 Phase V"
+      (mutation-checked on both sides).
 - [ ] **Phase P — pre-existing rooting bugs (§3), each its own change, before
       Phase 1.**
   - [x] **P1:** surplus varargs past the caller window are clobbered by the
@@ -211,7 +225,7 @@ as they land; move bullets to Done once everything inside them is checked.
         loop). An object id printed after the function returns cannot see a
         stale register in its window, so the §8 id programs are not the
         site oracles.
-- [ ] **Phase 2 — land the dead-φ writeback filter on top.**
+- [x] **Phase 2 — land the dead-φ writeback filter on top.**
   - [x] Re-base `phiLiveRow`/`phiWritebackKept` on `Proto.maskable` (§5).
         **As implemented:** both are free functions in `trace_finalize.zig`
         over `rec: anytype`, so finalize and the recorder's
@@ -247,7 +261,12 @@ as they land; move bullets to Done once everything inside them is checked.
         (`interp_semantics_test`, "site 2"). It fails when `phiLiveRow`
         ignores `maskable`. A string temporary would not do: an allocating
         trace keeps every φ.
-  - [ ] Gates, hashgate, a pt-default board.
+  - [x] Gates, hashgate, a pt-default board. Landed as `dfc523c`; gates
+        green, hashgate 90/90 on both legs. Board `ac023608` against Phase
+        1's `abf291bd`: suite jit total 3624 → 3613 ms; field_hash −4.9%,
+        array3d −2.4%, binary-trees −2.0%. The worst rows (str_gmatch +2.1%,
+        str_format +1.8%, str_gsub +1.4%) have unchanged traces and
+        instruction counts, and str_format/str_gsub move the same in tier-0.
 - [ ] **Phase 3 — relax doc 24 D3's full-write-set flush.** Today
       `alloc_count != 0` keeps every φ only because the collector roots every
       register. Re-derive it under masking. Separate review.

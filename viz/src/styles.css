@@ -670,6 +670,22 @@ table.replay-vars td {
   color: var(--fg);
 }
 
+/* A register no path reads before overwriting it (doc 61 Phase V): its value
+   is stale, or nil once a collection has scrubbed it. */
+.replay-var-dead .replay-var-name,
+.replay-var-dead .replay-var-val {
+  color: var(--muted);
+}
+
+.replay-var-tag {
+  margin-left: 0.5rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+  border: 1px solid var(--muted);
+  border-radius: 3px;
+  padding: 0 0.25rem;
+}
+
 /* Current-line highlight while step-replay is paused (its own decoration
    channel, distinct from the compile lint + runtime-error squiggle). */
 .cm-replay-line {

@@ -226,6 +226,12 @@ const ReplayResult = extern struct {
     /// Appended last so prior JS field offsets stay stable.
     proto_id: u32 = 0,
     pc: u32 = 0,
+    /// Doc 61 Phase V: one byte per register of the innermost frame's window,
+    /// 1 when a collection at this step roots it (`Vm.frameMask`), 0 when the
+    /// register is dead: no path from `pc` reads it before writing it, and a
+    /// collection may already have set it to nil. Empty when finished, or
+    /// when the frame is rooted whole (a non-maskable proto).
+    live: Buf = .{},
 };
 
 /// Wrap an owned byte slice as a `Buf` (transfers ownership to JS; freed by
@@ -406,6 +412,7 @@ export fn mahina_free_replay_result(res: ?*ReplayResult) void {
     freeBuf(r.keyframe);
     freeBuf(r.diag);
     freeBuf(r.backtrace);
+    freeBuf(r.live);
     gpa.destroy(r);
 }
 
@@ -500,6 +507,11 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
             defer arena.deinit();
             const frames = try vm.backtraceFrames(src0, arena.allocator());
             res.backtrace = bufFromSlice(try encodeBacktrace(frames));
+            if (vm.frameMask(vm.depth - 1)) |mask| {
+                const live = try gpa.alloc(u8, proto.num_registers);
+                for (live, 0..) |*b, reg| b.* = @intFromBool(mask.keeps(reg));
+                res.live = bufFromSlice(live);
+            }
         },
         .finished => {
             // Ran to completion before `stop_after`: final state, no pending line.

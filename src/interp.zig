@@ -2647,10 +2647,25 @@ pub const Vm = struct {
     /// Doc 61 §4: the masked part of frame `i`'s window: `live_in` at the
     /// frame's shape pc, cut at `limit` window-relative registers. Null when
     /// the frame is kept whole (§4.5: a non-maskable proto or an unknown
-    /// shape).
-    const FrameMask = struct { row: []const u64, limit: usize };
+    /// shape). Public for debuggers (doc 61 Phase V). `buildGcKeep` adds
+    /// varargs spans and open upvalues on top, so in general this
+    /// under-approximates what a collection keeps. For the innermost frame
+    /// at a suspend point the two agree on its window (captured registers
+    /// are live everywhere; varargs sit below their own frame's base), so
+    /// the visualiser labels a register dead exactly when a collection there
+    /// may scrub it.
+    pub const FrameMask = struct {
+        row: []const u64,
+        limit: usize,
 
-    fn frameMask(self: *const Vm, i: usize) ?FrameMask {
+        /// Whether the frame's bytecode mask keeps window register `reg`.
+        pub fn keeps(self: FrameMask, reg: usize) bool {
+            if (reg >= self.limit) return false;
+            return (self.row[reg / 64] >> @intCast(reg % 64)) & 1 != 0;
+        }
+    };
+
+    pub fn frameMask(self: *const Vm, i: usize) ?FrameMask {
         const f = &self.frames[i];
         const proto = f.closure.proto;
         if (!proto.maskable) return null;

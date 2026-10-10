@@ -24,6 +24,9 @@ export interface NamedValue {
   label: string;
   /** Formatted value (`42`, `"hi"`, `true`, `table#7`, …). */
   value: string;
+  /** A local register no path from the pending instruction reads before
+   *  writing it. Its value is stale, or nil if a collection scrubbed it. */
+  dead?: boolean;
 }
 
 /** The projected state at one replay step. */
@@ -104,8 +107,10 @@ function keyDisplay(k: SnapValueOutput, objects: Map<number, HeapObjectOutput>):
 /**
  * Decode a keyframe blob and project the globals + deepest-frame locals. Returns
  * null if the blob is empty or fails to decode (the caller then shows nothing).
+ * `live` is the replay step's per-register root mask (`MahinaReplayResult.live`);
+ * a local whose byte is 0 is marked `dead`. Empty marks nothing.
  */
-export function decodeSnapshot(blob: Uint8Array): SnapshotView | null {
+export function decodeSnapshot(blob: Uint8Array, live: Uint8Array = new Uint8Array(0)): SnapshotView | null {
   if (blob.length === 0) return null;
   let kf;
   try {
@@ -134,7 +139,10 @@ export function decodeSnapshot(blob: Uint8Array): SnapshotView | null {
   if (kf.frames.length > 0) {
     const base = kf.frames[kf.frames.length - 1].base;
     for (let i = base; i < kf.stack.length; i++) {
-      locals.push({ label: `r${i - base}`, value: valueDisplay(kf.stack[i], objects) });
+      const reg = i - base;
+      const local: NamedValue = { label: `r${reg}`, value: valueDisplay(kf.stack[i], objects) };
+      if (reg < live.length && live[reg] === 0) local.dead = true;
+      locals.push(local);
     }
   }
 

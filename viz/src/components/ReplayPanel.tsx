@@ -180,9 +180,17 @@ export default function ReplayPanel() {
               <tbody>
                 <For each={state.replayView!.locals}>
                   {(v) => (
-                    <tr>
+                    <tr
+                      classList={{ "replay-var-dead": v.dead === true }}
+                      title={v.dead ? "dead: not read again before it is overwritten" : undefined}
+                    >
                       <td class="replay-var-name">{v.label}</td>
-                      <td class="replay-var-val">{v.value}</td>
+                      <td class="replay-var-val">
+                        {v.value}
+                        <Show when={v.dead}>
+                          <span class="replay-var-tag">dead</span>
+                        </Show>
+                      </td>
                     </tr>
                   )}
                 </For>

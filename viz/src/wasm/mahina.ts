@@ -130,6 +130,11 @@ export interface MahinaReplayResult {
   /** Index of the pending instruction within that proto's `instrs`. 0 when
    *  finished/unavailable. */
   pc: number;
+  /** One byte per register of the innermost frame's window: 1 when a
+   *  collection at this step roots it, 0 when it is dead (no path reads it
+   *  before writing it, so a collection may already have set it to nil).
+   *  Empty when finished or when the frame is rooted whole. */
+  live: Uint8Array;
 }
 
 /** One row of a runtime-error backtrace. `start`/`end` are UTF-8 byte offsets. */
@@ -191,9 +196,9 @@ const RESULT_BYTES = 4 + 5 * 8 + 3 * 4 + 8 + 8 + 4 + 4 + 8 + 8 + 8 + 8;
 // ReplayResult struct layout (extern struct), little-endian:
 //   u32 status; { u32 ptr; u32 len } stdout/keyframe/diag; u32 current_line (@28),
 //   current_start (@32), current_end (@36), depth (@40), finished (@44);
-//   { u32 ptr; u32 len } backtrace (@48); u32 proto_id (@56), u32 pc (@60).
-//   Total 64 bytes.
-const REPLAY_RESULT_BYTES = 4 + 3 * 8 + 5 * 4 + 8 + 4 + 4;
+//   { u32 ptr; u32 len } backtrace (@48); u32 proto_id (@56), u32 pc (@60);
+//   { u32 ptr; u32 len } live (@64). Total 72 bytes.
+const REPLAY_RESULT_BYTES = 4 + 3 * 8 + 5 * 4 + 8 + 4 + 4 + 8;
 
 // CheckResult layout: u32 status; { u32 ptr; u32 len } diags (len = record count).
 const CHECK_RESULT_BYTES = 4 + 8;
@@ -420,6 +425,7 @@ function wrap(exports: MahinaExports): MahinaModule {
     const backtrace = decodeBacktrace(readBuf(exports.memory, dv, 48));
     const protoId = dv.getUint32(56, true);
     const pc = dv.getUint32(60, true);
+    const live = readBuf(exports.memory, dv, 64);
 
     exports.mahina_free_replay_result(resPtr);
 
@@ -436,6 +442,7 @@ function wrap(exports: MahinaExports): MahinaModule {
       backtrace,
       protoId,
       pc,
+      live,
     };
   };
 

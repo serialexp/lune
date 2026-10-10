@@ -249,7 +249,17 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
   the native twin of `flushNumericForLoopDone`'s refusal. Regression test in
   interp_bool_test (mutation-checked). Gates green, hashgate 90/90 on both
   legs; instructions neutral.
-- **Then:** Phase V.
+- **Phase V is implemented (2026-10-11).** The replay panel mutes the
+  innermost frame's dead registers and tags them "dead". The source is the
+  collector's own `Vm.frameMask` (now public), exported as
+  `ReplayResult.live`, one byte per register. Doc 61's Phase V entry says
+  why this was chosen over re-deriving in the viz. Codex: no blocker or
+  should-fix; its NIT, about `FrameMask.keeps`'s doc, is folded in. Codex
+  also saw the full bun suite crash on nsieve in its own sandbox; here it
+  passes 71/71 (bun 1.3.14).
+- **Then:** doc 61 Phase 3 (relax doc 24 D3's full-write-set flush under
+  masking; it needs its own design section and review). The keyframe
+  masking decision is still open for Bart.
 
   Each touches interp.zig/capi.zig/CallFrame, so coordinate with
   coral-marten: `.S` offsets for `CF_IN_FLIGHT`, and the `guestFault`
