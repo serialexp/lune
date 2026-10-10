@@ -113,6 +113,21 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 
       Needs a repro test first, then a decision from Bart.
 
+## Keyframe capture serialises dead slots the JIT left stale (noted 2026-10-11)
+
+- [ ] **Open for Bart (doc 61 Phase 1, §2 "Phase 0 audit"; codex Phase 1
+      review should-fix).** Masking scrubs dead slots only at collections.
+      Mid-execution capture (`keyframeser.zig:341`) serialises every
+      register of every window, and the `.snapshot` root walk roots them
+      all. A dead slot that sites 3–5 left stale on a JIT run therefore
+      differs from tier-0's in capture bytes and in the reachable set, until
+      the next collection scrubs it. Options:
+      - (a) capture masks dead slots with the same rows the collector uses:
+        serialise nil for them and do not root them. Keyframe bytes are then
+        identical across tiers. Same `frameMask`, so no new analysis;
+      - (b) declare that keyframe byte identity across tiers was never
+        claimed, and leave capture as it is.
+
 ## Region graph rebuild R(T) is superlinear in traces and exits (noted 2026-10-10)
 
 - [x] **Fixed 2026-10-10.** The registry now keeps a per-anchor index

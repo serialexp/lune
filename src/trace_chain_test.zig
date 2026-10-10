@@ -925,7 +925,10 @@ test "driveChain ir_numeric_for_done: a longer candidate cannot invalidate the c
         .{ .op = .for_loop, .a = 0, .b = 0, .c = 0 },
         .{ .op = .ret, .a = 0, .b = 0, .c = 0 },
     };
-    const proto = Proto{ .code = @constCast(&code), .name = "t", .num_registers = 4 };
+    // Doc 61 §5 site 5: maskable, with `R[3]` dead after the loop, so the
+    // flush may skip the control variable.
+    const live: [2]u64 = @splat(0);
+    const proto = Proto{ .code = @constCast(&code), .name = "t", .num_registers = 4, .reg_live = .{ .words = 1, .bits = &live }, .maskable = true };
 
     // The trace that side-exited: anchored away from the exit PC so the walk
     // looks at pc 1, with a loop-done `guard_true` at index 1 and a φ that

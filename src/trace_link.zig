@@ -2011,11 +2011,23 @@ pub fn arm(self: *TraceState, request: ArmRequest) !bool {
             std.debug.assert(is_loopdone);
             if (!is_loopdone) return false;
             if (head_parent) return false;
+            // A page with a loop-done guard that declined the linked flush
+            // never runs in link mode (the dispatcher and the `.link_terminal`
+            // case below), so no loop-done exit of it ever fires linked: an
+            // arm would be dead.
+            if (!c.linked_loop_done_ok) return false;
         },
         .link_terminal => {
             std.debug.assert(!is_loopdone);
             if (is_loopdone) return false;
             if (head_parent) return false;
+            // The child runs in linked mode from `linked_entry`; a loop-done
+            // guard of it that declines the flush would end the loop in an
+            // ordinary deopt mid-fusion, which `replayLedger` does not model.
+            switch (child.native) {
+                .compiled => |*cc| if (!cc.linked_loop_done_ok) return false,
+                else => {},
+            }
         },
         .ordinary_guard => {
             std.debug.assert(!is_loopdone);

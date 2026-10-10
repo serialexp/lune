@@ -174,9 +174,44 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
     13 simultaneous arms, so it waits in TODO with its index design.
 
   Phase Q is done. `releaseChunk` options for Bart are in TODO.
+- **Phase 1 is implemented (2026-10-11).** Doc 61's Phase 1 list says what
+  landed and why. In short:
+  - option B (`CallFrame.multret_top`);
+  - a vectorised keep-bitset walk plus a scrub in `collect`;
+  - the four JIT elision sites gated on `maskable`;
+  - `ForEntryView` for the recorder's for-link checks;
+  - `opCall` resolves nargs before its callee check, which fixes a debug
+    panic.
+
+  Two latent holes were fixed. In both, a page that declines its linked
+  loop-done flush was still run in linked mode and chained as if the
+  flush had committed:
+  - from the dispatcher and through `.link_terminal`
+    (`CompiledTrace.linked_loop_done_ok`);
+  - from the chain's call A. Codex's review blocker; the fix is the
+    per-guard `TraceCode.linkedLoopDoneEmitted`.
+
+  Each site's gate has a mutation-checked test. Most use a `reg(k)` probe
+  that reads the slab right after the materialisation. The §8 programs
+  that print object ids cannot see a stale register in a returned
+  function's window.
+  - Gates green (test, jit-debug, release lib, wasm); hashgate 90/90 on
+    both legs with no regeneration.
+  - `zig build bench-gcwalk` (200 frames, 52k slots): masked 5.9 µs per
+    collection against HEAD's 9.2 µs, after vectorising (the first cut was
+    23 µs).
+  - Codex review thread `01a12673-8066-7d93-92e0-e5595383e033`.
+  - **Open for Bart:** whether keyframe capture masks dead slots (doc 61
+    §2 "Phase 0 audit"). Keyframes serialise whole windows, so a stale dead
+    slot left by sites 3–5 reaches keyframe bytes on JIT runs. Options:
+    - (a) capture masks dead slots with the same rows (byte-identical
+      across tiers);
+    - (b) declare that keyframe byte identity across tiers was never
+      claimed.
+  - **Still to do:** a pt-default board for the Phase 1 commit.
 - **Then, in order:**
-  - Phase 1;
-  - Phase 2: land the uncommitted dead-φ filter and retire the watermark;
+  - Phase 2: land the uncommitted dead-φ filter and retire the watermark
+    (and `watermarkMayDrop` with it);
   - Phase V.
 
   Each touches interp.zig/capi.zig/CallFrame, so coordinate with

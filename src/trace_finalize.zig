@@ -25,6 +25,21 @@ pub const Options = struct {
     optimize: bool = true,
 };
 
+/// Doc 61 §5 (site 1): whether the locals watermark may leave anchor-window
+/// `slot` without a φ, so its slab copy stays stale past the trace. Only a
+/// maskable proto may: the collector masks its frames, so a dead stale slot
+/// is not rooted. A captured slot never may, since an open upvalue reads it
+/// through the stack. Liveness counts a captured register live at every pc,
+/// so "dead at the anchor pc" excludes it in O(1). It also keeps a slot the
+/// loop header reads, which a temporary above the watermark never is. The
+/// recorder's `loopCloseDefeat` mirrors finalize's filter through this
+/// predicate too. Phase 2 retires the watermark and this with it.
+pub fn watermarkMayDrop(anchor: types.AnchorKey, slot: usize) bool {
+    const proto = anchor.proto;
+    if (!proto.maskable or slot >= proto.num_registers or anchor.pc >= proto.code.len) return false;
+    return !proto.reg_live.liveIn(anchor.pc, @intCast(slot));
+}
+
 /// `rec` is a mutable scratch pointer whose type is inferred at comptime.
 /// Structural typing avoids importing the legacy Recorder/coordinator cycle.
 /// No pointer into scratch survives. Appends sunk stores, phis and terminal:
@@ -62,7 +77,8 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
         // locals watermark (e.g. the summed result a `ret` returns) — so the
         // watermark filter below must not drop any defined slot.
         if (rec.terminal_close == null and rec.alloc_count == 0 and
-            slot >= rec.locals_watermark and std.mem.indexOfScalar(u16, rec.entry_slots.items, @intCast(slot)) == null) continue;
+            slot >= rec.locals_watermark and std.mem.indexOfScalar(u16, rec.entry_slots.items, @intCast(slot)) == null and
+            watermarkMayDrop(rec.anchor, slot)) continue;
         const steady_phi: Ref = if (rec.peel) |p| blk: {
             if (slot < p.slots.len) {
                 if (p.slots[slot].phi_ref) |pr| break :blk pr;

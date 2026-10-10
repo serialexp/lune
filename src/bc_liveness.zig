@@ -410,7 +410,8 @@ fn visit(
 ///    at or above `a` that is live and not captured is one of the call's
 ///    result slots (`a ≤ r < a + c`; every `r ≥ a` for `c = all_results`).
 /// The second is what lets the collector mask a caller suspended at a call
-/// with `live_in[p] ∩ [0, a)` (§4.3). The compiler allocates a call at the
+/// with `live_in[p] ∩ [0, a)` (§4.3), and a frame in flight at a multret
+/// consumer with `live_in[p] ∩ [0, top)` (§5 (B), see the loop). The compiler allocates a call at the
 /// first free register, so it always holds on compiled code; a proto that
 /// fails it (hand-built) is scanned whole and keeps every JIT store.
 /// Captured registers are exempt: an open one is rooted by its upvalue
@@ -434,7 +435,24 @@ pub fn maskable(
         }
     }
     for (code, 0..) |ins, pc| {
-        if (ins.op != .call or ins.c == bytecode.all_results) continue;
+        if (ins.op != .call) continue;
+        if (ins.c == bytecode.all_results) {
+            // §5 (B): a frame in flight at a multret consumer is masked to
+            // its dynamic span, so nothing at or above the consumer's base
+            // may survive it except that span. A fixed-`c` consumer meets
+            // this through the layout check below. A consumer that is
+            // itself a producer passes on what survives the next consumer,
+            // so that one must sit adjacent at the same or a lower base:
+            // then the chain inherits the property down to a fixed-`c`
+            // call or a `ret`.
+            if (ins.b == bytecode.all_results) {
+                if (pc + 1 >= code.len) return false;
+                const next = code[pc + 1];
+                const consumes = (next.op == .call or next.op == .ret) and next.b == bytecode.all_results;
+                if (!consumes or next.a > ins.a) return false;
+            }
+            continue;
+        }
         // A trailing call has no successor, so nothing is live after it.
         if (pc + 1 >= code.len) continue;
         const first_free: u32 = @as(u32, ins.a) + ins.c;
@@ -924,6 +942,42 @@ test "doc 61: captured registers and multret producers pass the call-layout chec
         Instr.opAB(.ret, 0, 1), // 2
     };
     try testing.expect(try maskableT(&multret, 5, &.{}));
+}
+
+test "doc 61 §5 (B): a consumer that is also a producer must feed an adjacent consumer at or below its base" {
+    // `return f(g(h()))`: each consumer-producer hands its results to the
+    // next consumer down, ending at a `ret`. The compiler's shape.
+    const chain = [_]Instr{
+        Instr.opABC(.call, 2, 0, bytecode.all_results), // 0 h()
+        Instr.opABC(.call, 1, bytecode.all_results, bytecode.all_results), // 1 g(...)
+        Instr.opABC(.call, 0, bytecode.all_results, bytecode.all_results), // 2 f(...)
+        Instr.opAB(.ret, 0, bytecode.all_results), // 3
+    };
+    try testing.expect(try maskableT(&chain, 4, &.{}));
+    // Ending at a fixed-`c` call instead of a `ret`.
+    const fixed = [_]Instr{
+        Instr.opABC(.call, 1, 0, bytecode.all_results), // 0
+        Instr.opABC(.call, 1, bytecode.all_results, bytecode.all_results), // 1
+        Instr.opABC(.call, 0, bytecode.all_results, 1), // 2
+        Instr.opAB(.ret, 0, 1), // 3
+    };
+    try testing.expect(try maskableT(&fixed, 3, &.{}));
+    // The next consumer sits ABOVE the consumer-producer's base: a register
+    // between the two bases could survive the inner consumer unwritten.
+    const above = [_]Instr{
+        Instr.opABC(.call, 1, 0, bytecode.all_results), // 0
+        Instr.opABC(.call, 1, bytecode.all_results, bytecode.all_results), // 1
+        Instr.opABC(.call, 2, bytecode.all_results, 1), // 2
+        Instr.opAB(.ret, 0, 1), // 3
+    };
+    try testing.expect(!try maskableT(&above, 4, &.{}));
+    // No adjacent consumer at all.
+    const dangling = [_]Instr{
+        Instr.opABC(.call, 1, 0, bytecode.all_results), // 0
+        Instr.opABC(.call, 1, bytecode.all_results, bytecode.all_results), // 1
+        Instr.opAB(.ret, 0, 1), // 2
+    };
+    try testing.expect(!try maskableT(&dangling, 3, &.{}));
 }
 
 test "doc 61: a proto without liveness is not maskable; the check spans words" {

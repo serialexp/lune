@@ -145,6 +145,10 @@ fn installCollectChecked(vm: *Vm) anyerror!void {
 }
 
 test "phase Q: a mid-run collection over linked nested-loop traces leaves no link or edge naming a retired trace" {
+    // `keep` holds "%d+" in a live local, so the traces naming it survive
+    // every collection with their links armed. "%a+" is named by no live
+    // register once `f` returns (doc 61's masked walk), so the second
+    // collection retires the traces naming it, beside the survivors.
     checked_links_seen = 0;
     try expectProgramTuned(
         \\local find = string.find
@@ -156,11 +160,12 @@ test "phase Q: a mid-run collection over linked nested-loop traces leaves no lin
         \\  end
         \\  return n
         \\end
-        \\print(f("%d" .. "+"))
+        \\local keep = "%d" .. "+"
+        \\print(f(keep))
         \\collect()
         \\print(f("%a" .. "+"))
         \\collect()
-        \\print(f("%d" .. "+"))
+        \\print(f(keep))
         \\collect()
     , "4230\n4230\n4230\n", .{ .setup = installCollectChecked, .inspect = expectRetiredInJitLegs });
     try testing.expect(checked_links_seen > 0);
@@ -548,6 +553,9 @@ test "phase Q: a side recording over a retired parent finalizes for real (progra
     // side recording of iteration 151. `hold` keeps "%d+" alive until the
     // program drops it at i == 152 (iteration 151 finishes in tier-0 before
     // the recording starts, so a drop there would be too early), after which only the parent's pool names it.
+    // The read of `hold` after the loop keeps it live until then: a local
+    // that is only ever written is dead, and doc 61's collector would free
+    // its table, and "%d+" with it, as soon as `p` moves at i == 150.
     // The stress legs collect at every safepoint, so the parent retires while
     // the recording is in flight, and the recording then commits through the
     // real finalize with a source naming a retired trace. All ten legs must
@@ -564,6 +572,7 @@ test "phase Q: a side recording over a retired parent finalizes for real (progra
         \\    if find("ab12", p) then n = n + 1 end
         \\    if i == 152 then hold = nil end
         \\  end
+        \\  if hold then n = n + 1 end
         \\  return n
         \\end
         \\print(f("%d"))

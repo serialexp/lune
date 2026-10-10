@@ -518,6 +518,63 @@ test "§T.9c doc 58 B2 blocker 1: a bridge whose φs contradict the exit snapsho
     try testing.expect(!cont.code.isBridgeCandidate(3));
 }
 
+test "doc 61 §5 site 4: a bridge may leave a slot stale only on a maskable proto where it is dead at the landing" {
+    // §T.9c's shape and its variant (c): the snapshot writes slot 1 before
+    // the guard and no emitted φ carries it, so the bridge leaves slot 1
+    // stale. Slot 0 is live at every pc and slot 1 at none. Dead at the
+    // landing, the stale slot is unobservable and the collector's mask
+    // covers it — but only on a maskable proto; otherwise every slot counts.
+    const gpa = testing.allocator;
+    var code: [30]Instr = undefined;
+    @memset(code[0..], Instr.op0(.halt));
+    code[13] = Instr.opAx(.jmp_if_true, 0, 0);
+    const slot0_live: [30]u64 = @splat(0b01);
+    var proto = Proto{ .id = 42, .code = &code, .name = "site4", .num_registers = 2, .reg_live = .{ .words = 1, .bits = &slot0_live }, .maskable = true };
+    var cont_prov = [_]ExitProvEntry{.{ .index = 3, .prov = .{ .guard = .{
+        .source_proto_id = proto.id,
+        .source_pc = 13,
+        .role = .branch_cond,
+        .operand = .a,
+        .polarity = .taken,
+    } } }};
+    var cont_instrs = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .add, .a = 0, .b = 1, .ty = .int },
+        .{ .op = .guard_true, .a = 0, .aux = 14 },
+        .{ .op = .phi, .b = 2, .aux = 0 },
+        .{ .op = .link, .aux = 7 },
+    };
+    var cont: Trace = .{
+        .code = .{
+            .anchor = .{ .proto = &proto, .pc = 29 },
+            .instrs = &cont_instrs,
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .exit_prov = &cont_prov,
+        },
+        .id = 905,
+    };
+    var snap_arena = std.heap.ArenaAllocator.init(gpa);
+    defer snap_arena.deinit();
+    try util.snapshotBranchGuardsFromPhis(snap_arena.allocator(), &cont.code);
+    const extra = try snap_arena.allocator().alloc(@TypeOf(cont.code.exit_snapshot_slots[0]), 2);
+    extra[0] = cont.code.exit_snapshot_slots[0];
+    extra[1] = .{ .slot = 1, .ref = 1 };
+    cont.code.exit_snapshot_slots = extra;
+    cont.code.exit_snapshots[0].slots_len = 2;
+
+    try testing.expect(cont.code.isBridgeCandidate(3));
+    proto.maskable = false;
+    try testing.expect(!cont.code.isBridgeCandidate(3));
+
+    // A disagreement on the live slot 0 refuses even a maskable proto.
+    proto.maskable = true;
+    extra[0].ref = 1;
+    try testing.expect(!cont.code.isBridgeCandidate(3));
+}
+
 test "pathFromFrames: f(a);f(b) at distinct call sites give distinct inline paths (A-i.2)" {
     // Same callee proto inlined at two different `.call` PCs must yield distinct
     // provenance — the collision H-1a fixes. `pathFromFrames` distinguishes them by

@@ -226,7 +226,8 @@ pub fn obsTypeOf(v: Value) ObsType {
 /// Doc 47 increment A: check whether all entry guards match the current regs.
 /// This mirrors `TraceCode.matchesFingerprint` but operates on the borrowed
 /// `entry_guards` slice without needing a full `TraceCode`.
-pub fn entryGuardsMatch(guards: []const trace_code.EntryGuard, regs: RegWindow) bool {
+/// `regs` is a `RegWindow` or a `ForEntryView`.
+pub fn entryGuardsMatch(guards: []const trace_code.EntryGuard, regs: anytype) bool {
     for (guards) |g| {
         if (g.slot >= regs.len()) return false;
         if (!g.ty.accepts(regs.get(g.slot))) return false;
@@ -234,11 +235,32 @@ pub fn entryGuardsMatch(guards: []const trace_code.EntryGuard, regs: RegWindow) 
     return true;
 }
 
+/// The registers a loop body's root sees at entry, read at a numeric-`for`
+/// hand-off tier-0 has not executed yet (`for_loop`, or `for_prep` plus its
+/// first `for_loop`): `regs`, except that the index `R[a]` and the visible
+/// variable `R[a+3]` both hold `next`, the value that `for_loop` publishes.
+/// `R[a+3]` is write-only there, so its current contents are dead and not
+/// program state: doc 61's collector scrubs such a slot to nil, and any
+/// other tier may leave it stale.
+pub const ForEntryView = struct {
+    regs: RegWindow,
+    a: usize,
+    next: Value,
+
+    pub fn get(self: ForEntryView, slot: usize) Value {
+        return if (slot == self.a or slot == self.a + 3) self.next else self.regs.get(slot);
+    }
+
+    pub fn len(self: ForEntryView) usize {
+        return self.regs.len();
+    }
+};
+
 /// Doc 47 increment A: check whether every mismatching entry guard is a `.float`
 /// guard on a slot currently holding int. Only such mismatches can be resolved
 /// by peeling one inner iteration (arithmetic promotes int→float). Any other
 /// kind of mismatch (float→int, table mismatch, etc.) is not fixable by peeling.
-pub fn entryGuardsMismatchPromotable(guards: []const trace_code.EntryGuard, regs: RegWindow) bool {
+pub fn entryGuardsMismatchPromotable(guards: []const trace_code.EntryGuard, regs: anytype) bool {
     var has_mismatch = false;
     for (guards) |g| {
         if (g.slot >= regs.len()) return false;
@@ -1520,14 +1542,18 @@ pub const RecordingSession = struct {
         self.exit_snap_pending = false;
         const rpc = self.exit_resume_pc;
         const n = self.anchor_num_registers;
-        const live_row = self.anchor.proto.reg_live.row(rpc);
+        // Doc 61 §5 (site 3): only a maskable proto may leave dead slots
+        // stale, since only its frames are masked by the collector. Any
+        // other proto records every `.def` slot.
+        const proto = self.anchor.proto;
+        const live_row: ?[]const u64 = if (proto.maskable) proto.reg_live.row(rpc) else null;
         // Candidates: slots `.def` NOW and live at the resume pc, ascending.
         // A slot this bytecode rebound reads its saved BOUNDARY binding; one
         // that was not `.def` at the boundary is skipped (writes only ever
         // make a slot `.def`, so every boundary-`.def` slot is `.def` now).
         var len: u16 = 0;
-        for (self.exit_def_bits, live_row, 0..) |d, l, wi| {
-            var m = d & l;
+        for (self.exit_def_bits, 0..) |d, wi| {
+            var m = d & if (live_row) |row| row[wi] else ~@as(u64, 0);
             while (m != 0) : (m &= m - 1) {
                 const slot: usize = wi * 64 + @ctz(m);
                 const s = if (self.exit_undo_stamp[slot] == self.exit_seq) self.exit_undo_prev[slot] else self.reg_map[slot];
@@ -3668,10 +3694,11 @@ pub const RecordingSession = struct {
         // entry guards the live registers already satisfy; otherwise keep
         // recording as before. Skipped while a doc 47 peel is pending (that
         // close owns this back-edge).
+        const entry: ForEntryView = .{ .regs = regs, .a = a, .next = vnext };
         if (within and self.pending_link_close == null and (self.kind == .continuation or self.kind == .side) and
             self.inline_depth == 0 and !self.precise and target != self.anchor.pc and
             self.context.inner_root and !self.context.inner_root_peeled and
-            entryGuardsMatch(self.context.inner_root_guards, regs))
+            entryGuardsMatch(self.context.inner_root_guards, entry))
         {
             self.link_target = target;
             self.link_kind = self.linkKindAt(self.anchor.proto, target);
@@ -3717,8 +3744,9 @@ pub const RecordingSession = struct {
                         if (within) {
                             // Check compatibility against the inner root's entry
                             // guards using the CURRENT register state (types have
-                            // been promoted by the inner body).
-                            if (entryGuardsMatch(plc.contract, regs)) {
+                            // been promoted by the inner body), as this
+                            // `for_loop` leaves it.
+                            if (entryGuardsMatch(plc.contract, entry)) {
                                 // Types now match. Close `.link` with the
                                 // promoted state. The for_loop's `guard_true`
                                 // (continue test) was already emitted above, and
@@ -3884,10 +3912,14 @@ pub const RecordingSession = struct {
         // inner root's entry guards. If it does, use the existing immediate `.link`
         // close. If not — and the mismatch is int→float promotable — take the
         // record-through path and peel one inner iteration to promote types.
+        // The inner root's entry state is the P2 hand-off above: `R[a]` and
+        // `R[a+3]` both hold `(init − step) + step`.
         const inner_guards = self.context.inner_root_guards;
         if (!self.precise and self.pending_link_close == null and inner_guards.len > 0) {
-            const compatible = entryGuardsMatch(inner_guards, regs);
-            if (!compatible and entryGuardsMismatchPromotable(inner_guards, regs)) {
+            const vfirst = arith.add(arith.sub(vinit, vstep) catch return self.abort(.bad_type), vstep) catch return self.abort(.bad_type);
+            const entry: ForEntryView = .{ .regs = regs, .a = a, .next = vfirst };
+            const compatible = entryGuardsMatch(inner_guards, entry);
+            if (!compatible and entryGuardsMismatchPromotable(inner_guards, entry)) {
                 // Promotable int→float mismatch: record `for_prep` as arithmetic
                 // (like zero-trip / inline_depth>0) and peel one inner iteration.
                 // Save rewind state BEFORE emitting any IR so that a mid-body
@@ -6091,7 +6123,8 @@ pub const RecordingSession = struct {
             const s = self.reg_map[slot];
             if (s.state != .def) continue; // read-only slot: no φ, no back-edge write
             if (self.alloc_count == 0 and
-                slot >= self.locals_watermark and !self.readSlot(@intCast(slot))) continue;
+                slot >= self.locals_watermark and !self.readSlot(@intCast(slot)) and
+                @import("trace_finalize.zig").watermarkMayDrop(self.anchor, slot)) continue;
             // STORE side: the LIVE value at this anchor return. Recording is
             // concrete execution, so this is exactly what the φ delivers on
             // the recorded path. (The IR `ty` is useless here: an unguarded
@@ -6306,6 +6339,7 @@ test "doc 56 §4.2: a dead slot stays out of the snapshot; no liveness table mea
         .name = "dead",
         .num_registers = 2,
         .reg_live = .{ .words = 1, .bits = &bits },
+        .maskable = true,
     };
     var rec: RecordingSession = .{};
     defer rec.deinit(gpa);
@@ -6320,6 +6354,23 @@ test "doc 56 §4.2: a dead slot stays out of the snapshot; no liveness table mea
     try testing.expectEqual(@as(usize, 1), recs.len);
     try testing.expectEqual(@as(u32, 1), recs[0].slots_len);
     try testing.expectEqual(@as(u16, 0), rec.snap_builder.slots.items[recs[0].slots_begin].slot);
+
+    // Doc 61 §5 (site 3): the same table on a proto that is not maskable.
+    // The collector roots its frames whole, so the snapshot must keep the
+    // dead `.def` slot r1 too.
+    var unmasked = proto;
+    unmasked.maskable = false;
+    try rec.reset(gpa, .{ .proto = &unmasked, .pc = 0 }, 2);
+    try rec.exitBoundary(&unmasked, 1);
+    const w = try rec.emit(.{ .op = .slot_load, .aux = 0 });
+    rec.defineSlotAbs(0, w);
+    rec.defineSlotAbs(1, w);
+    try rec.exitBoundary(&unmasked, 2);
+    _ = try rec.emit(.{ .op = .guard_int, .a = w });
+    const all = rec.snap_builder.records.items;
+    try testing.expectEqual(@as(usize, 1), all.len);
+    try testing.expectEqual(@as(u32, 2), all[0].slots_len);
+    try testing.expectEqual(@as(u16, 1), rec.snap_builder.slots.items[all[0].slots_begin + 1].slot);
 
     // A budget-refused commit latches: later guarded bytecodes skip capture.
     try rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, 2);

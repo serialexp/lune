@@ -71,7 +71,8 @@ const ExecResult = trace_exec.ExecResult;
 // [doc 30 §6 named coupling] The tier-1a flush below and nativegen's
 // `emitLinkedLoopDoneSnapshot` enumerate the same closed sunk-store inventory.
 // The shared eligibility gate is owned by
-// `TraceCode.loopDoneSnapshotSupported`; both tiers must consult it.
+// `TraceCode.loopDoneFlushSupported` (the store inventory plus the doc 61
+// `R[a+3]` skip); both tiers must consult it.
 
 /// Commit the final numeric-`for` iteration at a loop-done side exit so a linked
 /// continuation can start at the post-loop PC without tier-0 replaying that
@@ -95,7 +96,7 @@ pub fn flushNumericForLoopDone(t: *const Trace, regs: RegWindow, values: []Value
     // Doc 57 P3: a non-final iteration's `for_loop` test sits mid-trip; the
     // φ values below are the END of the trip, not this iteration's.
     if (t.isLoopTestCopy(exit_instr)) return false;
-    if (!t.loopDoneSnapshotSupported(exit_instr)) return false;
+    if (!t.loopDoneFlushSupported(exit_instr)) return false;
 
     var si: usize = @intCast(exit_instr + 1);
     const direct: DirectRefs = .{ .values = values };

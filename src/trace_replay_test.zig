@@ -2027,7 +2027,10 @@ test "replayLedger convergence (2c-E site 3): a TERMINAL loop_done_linked arms t
     defer state.registry.detachAll();
 
     // code[1] is a for_loop, so the inner's guard_true (exit_pc 2) is a loop-done.
-    const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
+    // Doc 61 §5 site 5: maskable, with the for-loop's `R[a+3]` in the window,
+    // so the loop-done may take the linked flush and its slot may arm.
+    const live: [2]u64 = @splat(0);
+    const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 4, .reg_live = .{ .words = 1, .bits = &live }, .maskable = true };
 
     const inner_instrs = [_]IrInstr{
         .{ .op = .guard_true, .a = 0, .aux = 2 }, // instr 0: loop-done guard, post-loop pc 2
@@ -2133,7 +2136,10 @@ test "B-4: terminal loop-done resolves positionally — unsupported never shadow
     defer state.registry.detachAll();
 
     // code[1] is a for_loop, so the inner's guard_true (exit_pc 2) is a loop-done.
-    const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
+    // Doc 61 §5 site 5: maskable, with the for-loop's `R[a+3]` in the window,
+    // so the loop-done may take the linked flush and its slot may arm.
+    const live: [2]u64 = @splat(0);
+    const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 4, .reg_live = .{ .words = 1, .bits = &live }, .maskable = true };
 
     const inner_instrs = [_]IrInstr{
         .{ .op = .guard_true, .a = 0, .aux = 2 }, // loop-done guard, post-loop pc 2

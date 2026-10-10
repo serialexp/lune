@@ -818,6 +818,31 @@ test "doc 30 c5: loopDoneSnapshotSupported — a sunk sgm_setpos below the loop-
     try std.testing.expect(t.loopDoneSnapshotSupported(1));
 }
 
+test "doc 61 §5 site 5: the linked loop-done flush skips R[a+3] only on a maskable proto where it is dead after the loop" {
+    const I = trace.IrInstr;
+    // pc 0: `for_loop a=0`; pc 1, its fall-through. The guard exits to pc 1,
+    // so its source is the `for_loop` at pc 0.
+    const code = [_]Instr{ Instr.opA(.for_loop, 0), Instr.op0(.halt) };
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_true, .a = 0, .aux = 1 },
+        .{ .op = .phi, .b = 0, .aux = 0 },
+        .{ .op = .loop },
+    };
+    const dead = [_]u64{ 0b1111, 0b0000 };
+    const live = [_]u64{ 0b1111, 0b1000 }; // R[3] read after the loop (captured, say)
+    var proto = Proto{ .code = &code, .name = "for", .num_registers = 4, .reg_live = .{ .words = 1, .bits = &dead }, .maskable = true };
+    const t = trace.TraceCode{ .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try std.testing.expect(t.loopDoneFlushSupported(1));
+    // Read after the loop: the skipped write would be observable.
+    proto.reg_live.bits = &live;
+    try std.testing.expect(!t.loopDoneFlushSupported(1));
+    // Dead, but the collector scans the frame whole and would root the stale value.
+    proto.reg_live.bits = &dead;
+    proto.maskable = false;
+    try std.testing.expect(!t.loopDoneFlushSupported(1));
+}
+
 // ---------------------------------------------------------------------------
 // Doc 38: while-inner nested-loop linking. The doc 15/16 continuation/link
 // machinery extended to `while` inners: the while-body root's loop-done exit

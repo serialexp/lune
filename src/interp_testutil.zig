@@ -172,6 +172,43 @@ pub fn expectProgramTuned(source: [:0]const u8, expected: []const u8, opts: Capt
         }
     }
 }
+
+/// Doc 61 test setup: installs `unmask(fn)`, which marks a function's proto
+/// non-maskable, as a proto failing the call-layout check would be
+/// (`bc_liveness.maskable`). The collector then roots its frames whole and
+/// its traces keep every store. Call it before the function first runs.
+pub fn installUnmask(vm: *Vm) !void {
+    const unmask = struct {
+        fn call(_: *anyopaque, args: []const Value) anyerror!Value {
+            const closure = Closure.fromHeader(args[0].asHeap());
+            @constCast(closure.proto).maskable = false;
+            return Value.nil();
+        }
+    }.call;
+    const native = try vm.heap.newNative(&unmask, "unmask");
+    try vm.globals.set(vm.heap.gpa, try vm.heap.internValue("unmask"), Value.heap(&native.header));
+}
+
+/// `expectProgram` for output that depends on when collections run, such as
+/// an object id printed after a dead string was re-interned. Doc 61's masked
+/// walk frees an object as soon as only dead registers name it, so the stress
+/// legs (a collection at every safepoint) free more often and may print other
+/// ids than the normal legs (§9). Every trace mode must still print exactly
+/// its GC discipline's expected output.
+pub fn expectProgramByGc(source: [:0]const u8, normal: []const u8, stress_expected: []const u8, opts: CapturedOpts) !void {
+    inline for (.{ false, true }) |stress| {
+        inline for (.{ .off, .record_only, .record_execute_noopt, .record_execute, .record_execute_native }) |mode| {
+            var buf: [256]u8 = undefined;
+            var sink = io.Writer.fixed(&buf);
+            try runCapturedTuned(testing.allocator, source, &sink, stress, mode, opts);
+            testing.expectEqualStrings(if (stress) stress_expected else normal, sink.buffered()) catch |e| {
+                std.debug.print("leg: stress={} mode={s}\n", .{ stress, @tagName(mode) });
+                return e;
+            };
+        }
+    }
+}
+
 /// Compile + run `source` on an already-configured `vm` (out sink, effect mode,
 /// and any injected sources set by the caller). Kept separate from `effectRun` so
 /// env tests can inspect `vm.effect_log` (whose string results live in `vm.heap`)

@@ -471,6 +471,24 @@ test "foundations: pcall catches a bare runtime fault (synthesized message)" {
     );
 }
 
+test "a multret consumer that faults on a non-callable value consumes its producer's span" {
+    // `f(g())` with `f == nil`: `g()` leaves `reg_top_pending` set for the
+    // adjacent consumer. The consumer used to fault before taking it, so the
+    // flag leaked past the catcher: the next dynamic producer (`pcall`
+    // under `print`) tripped its assert, and release builds suppressed
+    // every GC safepoint until some later consumer cleared it.
+    try expectProgram(
+        \\local f = nil
+        \\local function g() return 1, 2 end
+        \\print(pcall(function() f(g()) end))
+        \\print(pcall(function() return f(g()) end))
+        \\print("after")
+        \\
+    ,
+        "false\tanonymous:3: attempt to call a nil value\nfalse\tanonymous:4: attempt to call a nil value\nafter\n",
+    );
+}
+
 test "pcall unwind closes the faulting frame's escaped upvalue" {
     // A closure captures a local inside the protected function and escapes (stored
     // in an outer variable) before the call errors. On unwind the faulting frame's
@@ -2188,6 +2206,262 @@ test "doc 61 Phase 0: a backtrace names an in-flight parent's own instruction li
         \\print(msg)
         \\
     , "true\tfalse\nf:3: boom\n");
+}
+
+/// Doc 61 Phase 1 probe. `regs()` collects, then reports every frame's
+/// registers by type, outermost first, frames separated by `|`: `t` table,
+/// `s` string, `#` number, `f` function, `b` boolean, `.` nil. A register
+/// the mask did not keep reads `.` after the scrub. Also installs `unmask`
+/// (`util.installUnmask`).
+const RegProbe = struct {
+    fn regs(ctx: *anyopaque, _: []const Value) anyerror!Value {
+        const vm: *interp.Vm = @ptrCast(@alignCast(ctx));
+        vm.collect();
+        return describe(vm);
+    }
+
+    fn describe(vm: *interp.Vm) !Value {
+        var buf: [256]u8 = undefined;
+        var len: usize = 0;
+        for (0..vm.depth) |i| {
+            const f = vm.frames[i];
+            if (i != 0) {
+                buf[len] = '|';
+                len += 1;
+            }
+            for (0..f.closure.proto.num_registers) |r| {
+                const v = vm.regGet(f.base + r);
+                buf[len] = if (v.isNil()) '.' else switch (v.typeName()[0]) {
+                    'n' => '#',
+                    else => |c| c,
+                };
+                len += 1;
+            }
+        }
+        return vm.heap.internValue(buf[0..len]);
+    }
+
+    /// `reg(k)`: collect, then return register `k` of the calling frame —
+    /// the slab value itself, so a test can compare it with the value
+    /// tier-0 holds there.
+    fn reg(ctx: *anyopaque, args: []const Value) anyerror!Value {
+        const vm: *interp.Vm = @ptrCast(@alignCast(ctx));
+        vm.collect();
+        const k: usize = @intCast(args[0].asInt());
+        return vm.regGet(vm.frames[vm.depth - 1].base + k);
+    }
+
+    fn install(vm: *interp.Vm) !void {
+        const native = try vm.heap.newNative(&regs, "regs");
+        try vm.globals.set(vm.heap.gpa, try vm.heap.internValue("regs"), Value.heap(&native.header));
+        const reg_native = try vm.heap.newNative(&reg, "reg");
+        try vm.globals.set(vm.heap.gpa, try vm.heap.internValue("reg"), Value.heap(&reg_native.header));
+        try util.installUnmask(vm);
+    }
+};
+
+fn expectRegs(source: [:0]const u8, expected: []const u8) !void {
+    return util.expectProgramTuned(source, expected, .{ .setup = &RegProbe.install });
+}
+
+test "doc 61 Phase 1: a dead register of the in-flight frame is scrubbed; live ones survive" {
+    // At the `.call` of `regs`, `t` (r0) is dead: `#t` was its last read.
+    // `n` and `u` are read after the call, and r4 holds the callee. The
+    // suspended main chunk keeps `print` below its call; `f` itself is dead.
+    try expectRegs(
+        \\local function f()
+        \\  local t = {}
+        \\  local n = #t
+        \\  local u = {}
+        \\  local s = regs()
+        \\  return s, n, #u
+        \\end
+        \\print(f())
+        \\
+    , ".f.|.#t.f...\t0\t0\n");
+}
+
+test "doc 61 Phase 1: a suspended caller keeps only the registers below its call" {
+    // `a1..a3` are dead stale tables in r1..r3 once their block ends; `g`
+    // is called at r1, so the suspended `f` keeps r0 alone. `keep` is read
+    // after the call.
+    try expectRegs(
+        \\local function g() return regs() end
+        \\local function f()
+        \\  local keep = {}
+        \\  do local a1, a2, a3 = {}, {}, {} end
+        \\  local s = g()
+        \\  return s, #keep
+        \\end
+        \\print(f())
+        \\
+    , "f.f.|t....|f\t0\n");
+}
+
+test "doc 61 Phase 1: a frame in flight at a multret consumer keeps its dynamic span only" {
+    // `regs` sits at r1 and `h()` leaves its two results at r2, r3, so the
+    // consumer's top is r4. The dead table `a5` left in r4 lies above it:
+    // masked to the span it is scrubbed, though the consumer's row covers
+    // every register from its base up.
+    try expectRegs(
+        \\local function h() return {}, {} end
+        \\local function f()
+        \\  do local a1, a2, a3, a4, a5 = {}, {}, {}, {}, {} end
+        \\  local s = regs(h())
+        \\  return s
+        \\end
+        \\print(f())
+        \\
+    , "f.f.|.ftt.\n");
+}
+
+test "doc 61 Phase 1: a frame of a non-maskable proto is kept whole" {
+    // The first test's program over a non-maskable `f`: `t` survives every
+    // collection, the stress legs' safepoint collections included.
+    try expectRegs(
+        \\local function f()
+        \\  local t = {}
+        \\  local n = #t
+        \\  local u = {}
+        \\  local s = regs()
+        \\  return s, n, #u
+        \\end
+        \\unmask(f)
+        \\print(f())
+        \\
+    , ".f.|t#t.f...\t0\t0\n");
+}
+
+/// The traced legs materialised exits at their resume pcs (doc 56): the
+/// path site 3's snapshot serves. (The stress legs collect at every
+/// safepoint and never get that far.)
+const ExitSide = struct {
+    fn materialised(vm: *interp.Vm, mode: util.TraceMode) !void {
+        if (vm.heap.gc_stress) return;
+        switch (mode) {
+            .record_execute_noopt, .record_execute => try std.testing.expect(vm.trace.exit_side_hops > 0),
+            .record_execute_native => try std.testing.expect(vm.trace.exit_side_native_hops > 0),
+            .off, .record_only => {},
+        }
+    }
+
+    /// Wanted: the exit materialises at its resume pc with no child there.
+    fn wanted(vm: *interp.Vm, mode: util.TraceMode) anyerror!void {
+        try materialised(vm, mode);
+    }
+
+    /// Attached: a child trace at the resume pc bound the exit.
+    fn attached(vm: *interp.Vm, mode: util.TraceMode) anyerror!void {
+        try materialised(vm, mode);
+        if (!vm.heap.gc_stress and mode != .off and mode != .record_only)
+            try std.testing.expect(vm.trace.exit_side_binds > 0);
+    }
+};
+
+/// Doc 61 §2 site 3 (codex review of Phase 1): `s` (r8) is dead from the
+/// `i % 4 == 0` branch on. That exit turns hot, so the traced tiers
+/// materialise it at the arm through its exit snapshot, and `reg` collects
+/// and reads r8 before tier-0 writes it again. Wanted: the arm's own `reg`
+/// call keeps a child from recording there. Attached: `reg` sits in a rarer
+/// branch of the arm, so a child records the arm and binds the exit; the
+/// child's own exit to `reg` resumes from the slab the parent's
+/// materialisation left. `PRE` runs before `f`.
+fn hotExitSource(comptime attach: bool, comptime pre: []const u8) [:0]const u8 {
+    const arm = if (attach)
+        \\      c = c + 1
+        \\      if i % 16 == 0 then
+        \\        local v = reg(8)
+        \\        if v == tostring(i) then same = same + 1 elseif v == nil then nils = nils + 1 end
+        \\      end
+        \\
+    else
+        \\      local v = reg(8)
+        \\      if v == tostring(i) then same = same + 1 elseif v == nil then nils = nils + 1 end
+        \\
+        ;
+    return
+    \\local function f(n)
+    \\  local c, same, nils = 0, 0, 0
+    \\  for i = 1, n do
+    \\    local s = tostring(i)
+    \\    c = c + #s
+    \\    if i % 4 == 0 then
+    \\
+    ++ arm ++
+        \\    end
+        \\  end
+        \\  return c, same, nils
+        \\end
+        \\
+    ++ pre ++
+        \\print(f(400))
+        \\
+    ;
+}
+
+test "doc 61 §2 site 3: a wanted exit over a maskable proto leaves its dead temporary to the scrub" {
+    try util.expectProgramTuned(hotExitSource(false, ""), "1092\t0\t100\n", .{ .setup = &RegProbe.install, .inspect = &ExitSide.wanted });
+}
+
+test "doc 61 §2 site 3: a wanted exit over a non-maskable proto materialises its dead temporary" {
+    try util.expectProgramTuned(hotExitSource(false, "unmask(f)\n"), "1092\t100\t0\n", .{ .setup = &RegProbe.install, .inspect = &ExitSide.wanted });
+}
+
+test "doc 61 §2 site 3: an attached exit over a maskable proto leaves its dead temporary to the scrub" {
+    try util.expectProgramTuned(hotExitSource(true, ""), "1192\t0\t25\n", .{ .setup = &RegProbe.install, .inspect = &ExitSide.attached });
+}
+
+test "doc 61 §2 site 3: an attached exit over a non-maskable proto materialises its dead temporary" {
+    try util.expectProgramTuned(hotExitSource(true, "unmask(f)\n"), "1192\t25\t0\n", .{ .setup = &RegProbe.install, .inspect = &ExitSide.attached });
+}
+
+/// Doc 61 §5 site 5: the inner loop's control variable `i` (r12, `R[a+3]`)
+/// holds a string at its last iteration and is dead after the loop, so the
+/// linked loop-done flush may skip it. Every eighth outer trip, `reg`
+/// collects and reads r12 after the loop; the probe's condition is computed
+/// before the loop and the call sits at r9, so nothing after the loop
+/// writes r12 first. A maskable `f` has it scrubbed in every tier, a
+/// non-maskable one has the final iteration's "30" in every tier. `PRE`
+/// runs before `f`.
+fn linkedForProbeSource(comptime pre: []const u8) [:0]const u8 {
+    return
+    \\local function f(n)
+    \\  local c, same, nils = 0, 0, 0
+    \\  for j = 1, 40 do
+    \\    local probe = j % 8 == 0
+    \\    for i = 1, n do i = tostring(i) c = c + #i end
+    \\    if probe then
+    \\      local v = reg(12)
+    \\      if v == tostring(n) then same = same + 1 elseif v == nil then nils = nils + 1 end
+    \\    end
+    \\  end
+    \\  return c, same, nils
+    \\end
+    \\
+    ++ pre ++
+        \\print(f(30))
+        \\
+    ;
+}
+
+const LinkedFor = struct {
+    /// The native leg linked the inner loop's completion, so the flush ran.
+    fn linked(vm: *interp.Vm, mode: util.TraceMode) anyerror!void {
+        if (mode == .record_execute_native and !vm.heap.gc_stress) try std.testing.expect(vm.trace.native_loopdone_link_arms > 0);
+    }
+
+    /// A non-maskable proto declines the flush: no completion fuses.
+    fn declined(vm: *interp.Vm, mode: util.TraceMode) anyerror!void {
+        if (mode == .record_execute_native) try std.testing.expectEqual(@as(u64, 0), vm.trace.native_loopdone_link_fused);
+    }
+};
+
+test "doc 61 §5 site 5: a linked loop-done over a maskable proto leaves R[a+3] to the scrub" {
+    try util.expectProgramTuned(linkedForProbeSource(""), "2040\t0\t5\n", .{ .hotloop = (trace.TraceConfig{}).hotloop, .setup = &RegProbe.install, .inspect = &LinkedFor.linked });
+}
+
+test "doc 61 §5 site 5: a loop-done over a non-maskable proto declines the flush and keeps R[a+3]" {
+    try util.expectProgramTuned(linkedForProbeSource("unmask(f)\n"), "2040\t5\t0\n", .{ .hotloop = (trace.TraceConfig{}).hotloop, .setup = &RegProbe.install, .inspect = &LinkedFor.declined });
 }
 
 /// A host `__index` that removes the only reference to itself (its table's

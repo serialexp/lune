@@ -1,9 +1,9 @@
 # mahina — GC liveness masking — Design
 
 Status: rev 7, approved by codex + antigravity; Q1 = (a), Q2 = label dead
-slots (Bart, 2026-10-09); not yet implemented
+slots (Bart, 2026-10-09); Phases P, 0 and Q landed, Phase 1 implemented
 Owner: Bart + agents (amber-badger)
-Last updated: 2026-10-05
+Last updated: 2026-10-10
 
 ## Implementation status
 
@@ -50,8 +50,8 @@ as they land; move bullets to Done once everything inside them is checked.
   `McodeArena.free` allocating on the collection path). Step 8's drain
   stays at the safe point (see step 8). R(T)'s superlinearity is fixed in
   the same change (registry anchor index, indexed per-component topology
-  build). Open before ticking: the implementation review's missing tests
-  (CURRENT_TASK.md lists them).
+  build). The implementation review's missing tests landed with
+  `bench-retire`'s native table (2026-10-10); Phase Q is done.
 - [ ] **Phase V — visualiser labels dead slots.** Its liveness source must be
       tier-identical data. Options are an exported per-frame live mask in the
       snapshot, or `reg_live` re-derived from the proto and the frame
@@ -148,18 +148,66 @@ as they land; move bullets to Done once everything inside them is checked.
       consumer's whole-window read as live back past its producer; see §5,
       "As implemented".
 - [ ] **Phase 1 — the masked `.gc` root walk + scrub (§6).**
-  - [ ] Close the conservative multret-consumer row first (§5, "Phase 1
+  - [x] Close the conservative multret-consumer row first (§5, "Phase 1
         prerequisite", options A / A′ / B; codex Phase 0 blocker 2).
+        **Chose B.** `.call` with `b = all_results` records
+        `CallFrame.multret_top` (the dynamic top, relative to the base)
+        before anything can fail, so a faulting consumer keeps it. A frame
+        in flight at such a call is masked `∩ [0, multret_top)`. The
+        call-layout check gains one clause: a consumer that is itself a
+        producer must be followed by its own consumer at the same or a
+        lower base, so nothing at or above the base survives the chain.
   - [ ] Decide whether keyframe capture masks dead slots too (§2, "Phase 0
-        audit").
-  - [ ] Masking driven by the shared `maskable` predicate, with an alias
-        bitset and dead slots set to nil before sweep.
-  - [ ] Exit-snapshot sparsity, composite-bridge admission, the linked
+        audit"). **Open for Bart** (options in CURRENT_TASK.md).
+  - [x] Masking driven by the shared `maskable` predicate, with an alias
+        bitset and dead slots set to nil before sweep. **As implemented:**
+        one keep bitset (`Vm.gc_keep`, `stack_slots / 64` words). It starts
+        all ones, so gaps between windows and unknown frames are rooted
+        whole. Every masked window is cleared, then each frame's row, its
+        varargs span and the open-upvalue slots are ORed back in. The walk
+        roots the kept heap slots; `collect` nils the rest below
+        `stack_top` between `invalidateDeadTraceConsts` and the sweep. Cost
+        is O(stack_top / 64 + frames × words), no allocation.
+  - [x] Exit-snapshot sparsity, composite-bridge admission, the linked
         numeric-for `a+3` skip and the watermark all gated on `maskable`
         (watermark: also not captured; `a+3` skip: also dead at the
-        fall-through) (§5).
+        fall-through) (§5). **As implemented:**
+    - Exit snapshots record every `.def` slot of a non-maskable proto.
+    - The bridge uses the empty row there.
+    - `TraceCode.loopDoneFlushSupported` is the one gate both tiers
+      consult (the store inventory plus `maskable` ∧ `R[a+3]` dead at the
+      fall-through); otherwise the guard takes the ordinary deopt
+      (option ii). A page records whether every loop-done guard emitted
+      its linked branch (`CompiledTrace.linked_loop_done_ok`). Without it
+      the dispatcher runs the page in ordinary mode and `arm` refuses a
+      `.link_terminal` into it: a link-mode run that ended in an ordinary
+      loop-done deopt was chained as if the flush had committed, losing
+      the final iteration (found by the §8 non-maskable variant; the
+      `sgm_setpos` decline had the same latent hole). The chain's call A
+      runs an inner root in linked mode too; there the per-guard
+      `TraceCode.linkedLoopDoneEmitted` (the predicate emission itself
+      consults) ends the burst at the inner header exactly as tier-1a's
+      declined flush does (codex Phase 1 review blocker: a captured
+      register after a loop nest made the inner page decline, and the
+      burst dropped the last `c = c + 20` of every followed trip).
+    - The watermark drops a slot only when `trace_finalize.watermarkMayDrop`
+      holds: maskable and dead at the anchor pc. A captured register is
+      live at every pc, so this also excludes captured slots, in O(1).
+  - [x] The recorder's `for` link checks no longer read the dead `R[a+3]`
+        (`ForEntryView` substitutes the value tier-0 is about to write).
+        The scrub made that read see nil and refuse the link.
   - [ ] Gates, hashgate (§9 regeneration procedure), the §8 tests and
         mutations, the boundary benchmark, and a pt-default board.
+        **Done except the board.** Hashgate needed no regeneration (90
+        digests match). Each site has a test that fails when its
+        `maskable` gate is removed: site 1 (`trace_finalize_test`), site 3
+        (`interp_semantics_test`, wanted and attached exits, which a
+        `reg(k)` probe reads right after the materialisation, asserting
+        the exit-side hops ran), site 4 (`trace_fingerprint_test`), site 5
+        (`interp_tier1a_test`, and the `reg(k)` probe after a linked inner
+        loop). An object id printed after the function returns cannot see a
+        stale register in its window, so the §8 id programs are not the
+        site oracles.
 - [ ] **Phase 2 — land the dead-φ writeback filter on top.**
   - [ ] Re-base `phiLiveRow`/`phiWritebackKept` on `Proto.maskable` (§5).
   - [ ] Retire the numeric-for `locals_watermark` drop rule. Liveness
@@ -1010,6 +1058,29 @@ fixed at init. P3's parking uses the register stack itself.
 
 Target: within noise of today's unmasked walk at that size. Board: pinned
 pt-default, with no row regressing beyond noise (`binary-trees` to watch).
+
+**As implemented (Phase 1): `zig build bench-gcwalk`.** 200 frames
+(`max_call_depth`), `stack_top` 51,942. Each frame has 170 locals, half
+dead across its call, and passes 70 surplus varargs; every register holds an
+integer. It times `collect` with every proto maskable and again with every
+proto non-maskable (each frame whole, through the same code). A/B against
+HEAD in a `just shadow` tree, interleaved, three runs each:
+
+| build | per collection |
+|---|---|
+| HEAD (unmasked walk) | 8.7–9.5 µs |
+| first cut, masked | 22.7–23.2 µs |
+| vectorized, masked | 5.9–6.0 µs |
+| vectorized, every frame whole | 3.4–3.6 µs |
+
+The first cut walked the keep bitset one set bit at a time (`ctz`, then a
+register read and a heap test) and scrubbed every dead slot on every
+collection. It was 2.5× HEAD, which a register-heavy program would pay at
+each collection. The fix compares each 64-register block of tag bytes at
+once (`Vm.tagMask`): the walk visits only `keep ∩ heap_ref` slots, and the
+scrub stores only to `dead ∩ ¬nil` slots, so a steady state scrubs almost
+nothing. The masked walk is now faster than HEAD's. What remains over the
+whole-frame variant is building the mask, about 12 ns per frame.
 
 ### 6.4 Scrub
 

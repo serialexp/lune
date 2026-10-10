@@ -630,6 +630,39 @@ pub const TraceCode = struct {
         return true;
     }
 
+    /// The single gate both tiers consult before taking the linked loop-done
+    /// flush at numeric-for loop-done guard `exit_instr`: the closed store
+    /// inventory above, and doc 61 §5 (site 5). The flush skips the visible
+    /// control variable `R[a+3]`, whose slab copy then holds the value of an
+    /// earlier iteration. That is sound only when nothing reads it from the
+    /// fall-through pc on, and when the collector's mask covers that
+    /// staleness (`maskable`). Otherwise decline: the guard takes the
+    /// ordinary deopt and tier-0 replays the final iteration, which writes
+    /// `R[a+3]` itself.
+    pub fn loopDoneFlushSupported(self: *const TraceCode, exit_instr: usize) bool {
+        if (!self.loopDoneSnapshotSupported(exit_instr)) return false;
+        const proto = self.anchor.proto;
+        if (!proto.maskable) return false;
+        const guard = self.instrs[exit_instr];
+        const exit_pc = trace_ir.guardExitPc(guard) orelse return false;
+        const slot = proto.code[trace_ir.guardSourcePc(guard).?].a + 3;
+        if (slot >= proto.num_registers) return false; // not a real for-loop window
+        // Falling off the end of the code reads nothing.
+        if (exit_pc >= proto.code.len) return true;
+        return !proto.reg_live.liveIn(exit_pc, slot);
+    }
+
+    /// Does the native page emit the linked loop-done branch at guard
+    /// `instr_idx`? Emission consults exactly this, and so does every reader
+    /// that must know whether a linked-mode run committed the final
+    /// iteration there (the chain's call A): where it is false the guard is
+    /// mode-0-always and its exit is an ordinary deopt at the loop header.
+    /// A peeled trace never takes the linked path (doc 39).
+    pub fn linkedLoopDoneEmitted(self: *const TraceCode, instr_idx: usize) bool {
+        return self.isNumericForLoopDoneGuard(instr_idx) and !self.peeled and
+            self.loopDoneFlushSupported(instr_idx);
+    }
+
     pub fn isNumericForLoopDoneGuard(self: *const TraceCode, instr_idx: usize) bool {
         if (instr_idx >= self.instrs.len) return false;
         // Doc 44 D1/D12b: a one-shot trace (head or cont) has no loop-done
@@ -795,9 +828,10 @@ pub const TraceCode = struct {
         const si = self.exitSnapIdx(instr_idx) orelse return false;
         const s = self.exit_snapshots[si - 1];
         const proto = self.anchor.proto;
-        // No liveness (a hand-built proto): every slot counts as observable,
-        // which only makes the agreement check stricter.
-        const live_row: []const u64 = if (proto.reg_live.available()) proto.reg_live.row(landing) else &.{};
+        // Not maskable (no liveness, or a call layout the collector cannot
+        // mask, doc 61 §5): every slot counts as observable, which only makes
+        // the agreement check stricter.
+        const live_row: []const u64 = if (proto.maskable) proto.reg_live.row(landing) else &.{};
         const snap = self.exit_snapshot_slots[s.slots_begin..][0..s.slots_len];
         var any = false;
         var emitted = self.bridgeEmissions(instr_idx);

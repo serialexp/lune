@@ -1080,7 +1080,10 @@ test "A-viii (doc 17 §A8 step 8): one disarm tears down the whole OUTER cycle �
     @memset(code[0..], Instr.op0(.halt));
     code[5] = Instr.opAx(.jmp_if_true, 0, 10);
     code[6] = Instr.opAx(.for_loop, 0, 2);
-    const proto = Proto{ .id = 88, .code = &code, .name = "aviii-outer", .num_registers = 8 };
+    // Doc 61 §5 site 5: maskable, with every register dead, so the inner's
+    // loop-done takes the linked flush and its page may run in link mode.
+    const live: [32]u64 = @splat(0);
+    const proto = Proto{ .id = 88, .code = &code, .name = "aviii-outer", .num_registers = 8, .reg_live = .{ .words = 1, .bits = &live }, .maskable = true };
 
     const branch_prov: ExitProvenance = .{ .guard = .{
         .source_proto_id = 88,

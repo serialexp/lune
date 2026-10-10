@@ -235,6 +235,25 @@ pub fn build(b: *std.Build) void {
     const bench_retire_step = b.step("bench-retire", "Run the Phase Q trace-retirement benchmark (ReleaseFast)");
     bench_retire_step.dependOn(&run_bench_retire.step);
 
+    // `zig build bench-gcwalk` — doc 61 §6.3: the masked `.gc` root walk on a
+    // near-full register stack, against the same walk with every frame kept
+    // whole. ReleaseFast, informational, not a test (global Rule #22).
+    const bench_gcwalk_exe = b.addExecutable(.{
+        .name = "bench-gcwalk",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_gcwalk.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "mahina", .module = mod },
+            },
+        }),
+    });
+    bench_gcwalk_exe.use_llvm = true;
+    const run_bench_gcwalk = b.addRunArtifact(bench_gcwalk_exe);
+    const bench_gcwalk_step = b.step("bench-gcwalk", "Run the doc 61 masked GC root-walk benchmark (ReleaseFast)");
+    bench_gcwalk_step.dependOn(&run_bench_gcwalk.step);
+
     // --- wasm32-freestanding browser target ---------------------------------
     //
     // `zig build wasm` compiles the VM core to a reactor-style wasm module that

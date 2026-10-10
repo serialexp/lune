@@ -41,6 +41,7 @@ const Vm = interp.Vm;
 
 const util = @import("interp_testutil.zig");
 const expectProgram = util.expectProgram;
+const expectProgramByGc = util.expectProgramByGc;
 
 // ---------------------------------------------------------------------------
 // GC-specific behaviour (Phase 4). The stress mode above already proves
@@ -115,7 +116,11 @@ test "gc: a string only a trace's constant pool names is swept as in tier-0 (doc
     // and the later `tostring(7)` re-interns, taking an object id. A pool that
     // roots its constants keeps "7" alive in the JIT legs only, so they skip
     // that allocation and print the table one id lower.
-    try expectProgram(
+    //
+    // Doc 61 §6: `s` is dead after `#s`, so a collection frees "7" even
+    // inside the loop. The stress legs collect at every safepoint and so
+    // re-intern it on every iteration, 1999 ids more.
+    try expectProgramByGc(
         \\local function f()
         \\  local n = 0
         \\  for i = 1, 2000 do local s = tostring(7) n = n + #s end
@@ -125,5 +130,91 @@ test "gc: a string only a trace's constant pool names is swept as in tier-0 (doc
         \\for k = 1, 5000 do local junk = {} end
         \\local again = tostring(7)
         \\print({})
-    , "2000\ntable: 0x146d\n");
+    , "2000\ntable: 0x146d\n", "2000\ntable: 0x1c3c\n", .{});
 }
+
+// Doc 61 §8 determinism. Each program leaves a heap value in a register
+// that is dead from some exit on, collects, then re-interns that value and
+// prints a fresh table's id: a tier whose slab still holds the stale value
+// keeps it alive across the collection, skips the re-intern allocation and
+// prints a lower id. Every trace mode must print its GC discipline's id.
+
+/// The inner loop's `i` (R[a+3]) holds a string at its last iteration. It
+/// is dead after the loop, so the linked loop-done flush may leave the slab
+/// copy stale; the masked walk does not root it. `PRE` runs before `f`.
+fn linkedForSource(comptime pre: []const u8) [:0]const u8 {
+    return
+    \\local function f(n)
+    \\  local c = 0
+    \\  for j = 1, 40 do
+    \\    for i = 1, n do i = tostring(i) c = c + #i end
+    \\  end
+    \\  return c
+    \\end
+    \\
+    ++ pre ++
+        \\print(f(30))
+        \\for k = 1, 5000 do local junk = {} end
+        \\local again = tostring(30)
+        \\print({})
+    ;
+}
+
+const LoopDone = struct {
+    /// The native leg linked the inner loop's completion, so the flush ran.
+    /// (Under `gc_stress` the native body defers to the safepoint
+    /// collections and never links.)
+    fn linked(vm: *Vm, mode: util.TraceMode) anyerror!void {
+        if (mode == .record_execute_native and !vm.heap.gc_stress) try testing.expect(vm.trace.native_loopdone_link_arms > 0);
+    }
+
+    /// A non-maskable proto declines the flush: no completion fuses.
+    fn declined(vm: *Vm, mode: util.TraceMode) anyerror!void {
+        if (mode == .record_execute_native) try testing.expectEqual(@as(u64, 0), vm.trace.native_loopdone_link_fused);
+    }
+};
+
+// The CLI's recording threshold: at the harness default the inner loop's
+// completion is never linked.
+const cli_hotloop = (trace.TraceConfig{}).hotloop;
+
+test "doc 61 §8: a linked numeric-for whose control variable holds a string agrees in every tier" {
+    try expectProgramByGc(linkedForSource(""), "2040\ntable: 0x148a\n", "2040\ntable: 0x191c\n", .{ .hotloop = cli_hotloop, .inspect = &LoopDone.linked });
+}
+
+test "doc 61 §8: the same linked numeric-for over a non-maskable proto declines the flush and agrees" {
+    try expectProgramByGc(linkedForSource("unmask(f)\n"), "2040\ntable: 0x148c\n", "2040\ntable: 0x191e\n", .{ .hotloop = cli_hotloop, .setup = &util.installUnmask, .inspect = &LoopDone.declined });
+}
+
+/// The native leg reached the chain's call A: a linked burst ran the inner
+/// root in linked mode.
+fn followedInner(vm: *Vm, mode: util.TraceMode) anyerror!void {
+    if (mode == .record_execute_native and !vm.heap.gc_stress) try testing.expect(vm.trace.native_link_follow_count > 0);
+}
+
+// Codex review of Phase 1: the capture of `k` after the loop nest makes the
+// inner loop's control register live past it (captured registers are live at
+// every pc), so the inner page declines its linked loop-done flush (site 5).
+// The burst's call A still runs that page in linked mode; its loop-done is
+// then an ordinary deopt at the header, and advancing past the loop as if it
+// had committed dropped the final `c = c + 20` of every followed trip
+// (98460).
+test "doc 61 §5 site 5: a chain burst over an inner loop whose flush declines resumes at its header" {
+    try util.expectProgramTuned(
+        \\local c = 0
+        \\for j = 1, 1000 do
+        \\  if j % 2 == 0 then
+        \\    for i = 1, 20 do c = c + i end
+        \\  else
+        \\    c = c + 1
+        \\  end
+        \\end
+        \\local a,b,d,e,f,g,h,k,l = 1,2,3,4,5,6,7,8,9
+        \\local function z() return k end
+        \\print(c, z())
+    , "105500\t8\n", .{ .hotloop = cli_hotloop, .inspect = &followedInner });
+}
+
+// Site 3's exit-snapshot programs live with the register probe
+// (interp_semantics_test.zig, "doc 61 §2 site 3"): an object id printed
+// after `f` returns cannot see a stale register in `f`'s window.

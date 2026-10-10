@@ -533,6 +533,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
         .metadata_cells = metadata_cells,
         .seed_plan = seed_plan,
         .seed_prologue = entry_stubs.seed_prologue,
+        .linked_loop_done_ok = entry_stubs.linked_loop_done_ok,
         .has_hash_seed = hhs: {
             for (t.inputs, 0..) |seed, i| {
                 if (seed_plan.isActive(i) and seed.kind == .hash_cell) break :hhs true;
@@ -674,6 +675,9 @@ const EntryStubs = struct {
     /// NOT recomputed from the plan, so `stubEnterable`'s release-assert
     /// `seed_plan.nonEmpty() == seed_prologue` checks two independent facts.
     seed_prologue: bool = false,
+    /// Whether every numeric-for loop-done guard got its linked branch
+    /// (`TraceCode.loopDoneFlushSupported`). Recorded from emission itself.
+    linked_loop_done_ok: bool = true,
 };
 
 /// Doc 55 §2d: one promotable exit's permanent silent check (`emitSilentCheck`):
@@ -2508,6 +2512,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     // materialized stub (mode 1); the ORDINARY fallthrough (mode 0) must bypass `slot[ei]`
     // — that slot is EXCLUSIVELY the linked exit (P-C option (b) invariant) — so it
     // resolves directly to `shared_exit`.
+    var linked_loop_done_ok = true;
     for (exit_labels, 0..) |maybe_l, ei| {
         if (maybe_l) |l| {
             a.bind(l);
@@ -2599,16 +2604,18 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 // does not commit) must never take the linked path. With the branch
                 // unemitted this guard is mode-0-always: ordinary deopt, tier-0
                 // replays the final iteration (replay-idempotent, sound). Tier-1a
-                // declines through the same predicate in flushNumericForLoopDone.
+                // declines through the same predicate in flushNumericForLoopDone,
+                // which also declines when the skipped `R[a+3]` may be read
+                // after the loop (doc 61 §5 site 5).
                 // Doc 39: a peeled trace never takes the linked-materialized path —
                 // its snapshot walk has no notion of the run-once/steady split
                 // (the φ snapshot would commit entry-class state). Mode-0-always:
                 // ordinary deopt through `deopt_exit`, which carries the peeled
                 // flush semantics.
-                if (!t.peeled and t.loopDoneSnapshotSupported(ei)) {
+                if (t.linkedLoopDoneEmitted(ei)) {
                     try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 0);
                     try a.jcc(.ne, try nativeLinkedLoopDoneLabel(a, linked_loop_done_labels, ei));
-                }
+                } else linked_loop_done_ok = false;
                 // mode 0 (ordinary loop-done deopt): bypass slot[ei] → `shared_exit`.
                 if (shared_exit) |se| {
                     try a.movRegImm64(.rax, @bitCast(@as(u64, se)));
@@ -2955,6 +2962,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     // secondary entries below `jmp body_entry`, so a seeded page seeds on EVERY
     // entry kind — this bit is entry-kind-independent by construction.
     stubs.seed_prologue = seed_hash_exit != null;
+    stubs.linked_loop_done_ok = linked_loop_done_ok;
     if (shared_exit != null) {
         const linked_entry = try a.label();
         a.bind(linked_entry);

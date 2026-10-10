@@ -2955,11 +2955,19 @@ pub fn driveBurstCore(
                 self.onSideExitReceipt(inner, 0, iresult.exit_instr, 0, .deferred, .entered);
                 break;
             }
-            // Native committed the loop-done inside `runLinkedLoopDone`; the
-            // tier-1a path still owes the final-iteration flush.
+            // Native committed the loop-done inside `runLinkedLoopDone` — but
+            // only where the page emitted the linked branch. Where it did not
+            // (`linkedLoopDoneEmitted`: the closed store inventory, doc 39's
+            // peel, doc 61 §5 site 5's live `R[a+3]`) the guard is
+            // mode-0-always: an ordinary deopt at the loop header, with the
+            // final iteration still owed to tier-0. Advancing past the loop
+            // as if it had committed drops that iteration. The tier-1a path
+            // owes the flush itself, and declines through the same gate.
+            // Either decline ends the burst at the inner header, where
+            // `resume_pc` stands on every hop.
             if (tier == .ir) {
                 if (!irinterp.flushNumericForLoopDone(&inner.code, regs, ibuf, iresult.exit_instr)) break;
-            }
+            } else if (!inner.code.linkedLoopDoneEmitted(iresult.exit_instr)) break;
             // Hole B (doc 16, Phase 3): hand the ping-pong to the continuation
             // anchored at the inner's post-loop PC. When the burst was seeded
             // by a prime-side entry ramp (anchored at the outer header), swap

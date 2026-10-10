@@ -322,3 +322,21 @@ test "doc 56 exitSnapshotsValid rejects each malformed shape" {
     // An empty ordinal table is invalid (it always holds ordinal 0).
     try std.testing.expect(!finalizer.exitSnapshotsValid(&instrs, .{ .snapshots = &.{}, .snapshot_slots = &.{} }, &.{}, 4, 3));
 }
+
+test "doc 61 §5 site 1: the watermark drops a slot only on a maskable proto where it is dead at the anchor" {
+    // Anchor pc 0. R0 is live there (a captured register is live at every
+    // pc), R1 dead.
+    const bits = [_]u64{ 0b01, 0b01, 0b01 }; // one row per pc of `exitProto`
+    var proto = exitProto();
+    proto.num_registers = 2;
+    proto.reg_live = .{ .words = 1, .bits = &bits };
+    proto.maskable = true;
+    const anchor: types.AnchorKey = .{ .proto = &proto, .pc = 0 };
+    try std.testing.expect(finalizer.watermarkMayDrop(anchor, 1));
+    try std.testing.expect(!finalizer.watermarkMayDrop(anchor, 0));
+    // Outside the proto's window: nothing to judge by, keep it.
+    try std.testing.expect(!finalizer.watermarkMayDrop(anchor, 2));
+    // Not maskable: the collector roots the frame whole, so keep every slot.
+    proto.maskable = false;
+    try std.testing.expect(!finalizer.watermarkMayDrop(anchor, 1));
+}

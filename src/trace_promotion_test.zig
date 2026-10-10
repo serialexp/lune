@@ -40,6 +40,12 @@ const StructuralEdgeId = trace.StructuralEdgeId;
 const Trace = trace.Trace;
 const TraceState = trace.TraceState;
 
+/// Liveness for a hand-built loop-done fixture: every register dead at every
+/// pc (up to 32 pcs). With `maskable` and a window that holds `R[a+3]`, the
+/// linked loop-done flush may skip that slot (doc 61 §5 site 5), so the
+/// fixture keeps its linked loop-done exit.
+const all_dead_rows: [32]u64 = @splat(0);
+
 fn makeB3LinkTrace(
     gpa: std.mem.Allocator,
     state: *TraceState,
@@ -574,7 +580,7 @@ test "B-3b.2 promotion publishes mixed deopt/link/loop-done cells; demotion zero
     defer state.deinit();
     var code: [4]Instr = @splat(Instr.op0(.halt));
     code[1] = Instr.op0(.for_loop);
-    const proto = Proto{ .id = 1703, .code = &code, .name = "b3-silent-site", .num_registers = 2 };
+    const proto = Proto{ .id = 1703, .code = &code, .name = "b3-silent-site", .num_registers = 4, .reg_live = .{ .words = 1, .bits = &all_dead_rows }, .maskable = true };
     const guard = try makeB3GuardTrace(gpa, &state, &proto, 2, 0);
     const done = try makeB3LoopDoneTrace(gpa, &state, &proto, 3, 1);
     const link = try makeB3LinkTrace(gpa, &state, &proto, 1, 2, 0);
@@ -643,7 +649,7 @@ test "doc 61 Phase Q: retiring a promoted set's member demotes it in the teardow
     defer state.deinit();
     var code: [4]Instr = @splat(Instr.op0(.halt));
     code[1] = Instr.op0(.for_loop);
-    const proto = Proto{ .id = 1715, .code = &code, .name = "q-demote-member", .num_registers = 2 };
+    const proto = Proto{ .id = 1715, .code = &code, .name = "q-demote-member", .num_registers = 4, .reg_live = .{ .words = 1, .bits = &all_dead_rows }, .maskable = true };
     const cyc = try promoteB3Cycle(&state, &proto, 1, b3_cycle_key);
     defer gpa.free(cyc.edges);
     const demotions0 = state.registry.native_physical.silent_demotions;
@@ -676,7 +682,7 @@ test "doc 61 Phase Q: retiring a bystander leaves the promoted set to the region
     defer state.deinit();
     var code: [4]Instr = @splat(Instr.op0(.halt));
     code[1] = Instr.op0(.for_loop);
-    const proto = Proto{ .id = 1716, .code = &code, .name = "q-demote-bystander", .num_registers = 2 };
+    const proto = Proto{ .id = 1716, .code = &code, .name = "q-demote-bystander", .num_registers = 4, .reg_live = .{ .words = 1, .bits = &all_dead_rows }, .maskable = true };
     const cyc = try promoteB3Cycle(&state, &proto, 1, b3_cycle_key);
     defer gpa.free(cyc.edges);
     const bystander = try makeB3LinkTrace(gpa, &state, &proto, 9, 3, 0);
@@ -709,7 +715,7 @@ fn expectLinearTeardown(n: usize) !void {
     for (codes, protos, cycles, 0..) |*code, *proto, *cyc, i| {
         code.* = @splat(Instr.op0(.halt));
         code[1] = Instr.op0(.for_loop);
-        proto.* = .{ .id = @intCast(2000 + i), .code = code, .name = "q-linear", .num_registers = 2 };
+        proto.* = .{ .id = @intCast(2000 + i), .code = code, .name = "q-linear", .num_registers = 4, .reg_live = .{ .words = 1, .bits = &all_dead_rows }, .maskable = true };
         const key: RegionKey = .{ .region_id = @enumFromInt(100 + i), .activation = 11 };
         cyc.* = try promoteB3Cycle(&state, proto, @intCast(1 + 3 * i), key);
         made += 1;
@@ -778,7 +784,7 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
     var code: [32]Instr = @splat(Instr.op0(.halt));
     code[5] = Instr.opAx(.jmp_if_true, 0, 10);
     code[6] = Instr.opAx(.for_loop, 0, 2);
-    const proto = Proto{ .id = 1714, .code = &code, .name = "b3-bridge", .num_registers = 4 };
+    const proto = Proto{ .id = 1714, .code = &code, .name = "b3-bridge", .num_registers = 4, .reg_live = .{ .words = 1, .bits = &all_dead_rows }, .maskable = true };
     const bridge = try makeB3BridgeTrace(gpa, &state, &proto, 41, 20, 9);
     const succ = try makeB3LinkTrace(gpa, &state, &proto, 42, 9, 20);
     try testing.expect(nativegen.isCompositeBridgeCandidate(&bridge.code, 11));
@@ -936,7 +942,7 @@ test "doc 56 G6 follow-up: a cap-yielded deopt at an armed bridge exit is that b
     var code: [32]Instr = @splat(Instr.op0(.halt));
     code[5] = Instr.opAx(.jmp_if_true, 0, 10);
     code[6] = Instr.opAx(.for_loop, 0, 2);
-    const proto = Proto{ .id = 1715, .code = &code, .name = "b3-bridge-cap", .num_registers = 4 };
+    const proto = Proto{ .id = 1715, .code = &code, .name = "b3-bridge-cap", .num_registers = 4, .reg_live = .{ .words = 1, .bits = &all_dead_rows }, .maskable = true };
     const bridge = try makeB3BridgeTrace(gpa, &state, &proto, 43, 20, 9);
     const succ = try makeB3LinkTrace(gpa, &state, &proto, 44, 9, 20);
     const rid: RegionId = @enumFromInt(1715);
@@ -1057,7 +1063,7 @@ test "doc 56 G6 follow-up: the native bridge stub fires at CAP-2 and at CAP-1 yi
     var code: [32]Instr = @splat(Instr.op0(.halt));
     code[5] = Instr.opAx(.jmp_if_true, 0, 10);
     code[6] = Instr.opAx(.for_loop, 0, 2);
-    const proto = Proto{ .id = 1717, .code = &code, .name = "b3-bridge-cap-native", .num_registers = 4 };
+    const proto = Proto{ .id = 1717, .code = &code, .name = "b3-bridge-cap-native", .num_registers = 4, .reg_live = .{ .words = 1, .bits = &all_dead_rows }, .maskable = true };
     const bridge = try makeB3BridgeTrace(gpa, &state, &proto, 45, 20, 9);
     const succ = try makeB3LinkTrace(gpa, &state, &proto, 46, 9, 20);
     // The oracle: the same bridge shape with its exit left unarmed.
@@ -1821,7 +1827,7 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
 
     var code: [4]Instr = @splat(Instr.op0(.halt));
     code[1] = Instr.op0(.for_loop);
-    const proto = Proto{ .id = 1710, .code = &code, .name = "b3-silent-e2e", .num_registers = 2 };
+    const proto = Proto{ .id = 1710, .code = &code, .name = "b3-silent-e2e", .num_registers = 4, .reg_live = .{ .words = 1, .bits = &all_dead_rows }, .maskable = true };
     const cont = try makeB3LinkTrace(gpa, &state, &proto, 1, 2, 1);
     const inner = try makeB3LoopDoneTrace(gpa, &state, &proto, 2, 1);
     try testing.expect(try state.armNativeLink(cont, 0, inner, .link_terminal));

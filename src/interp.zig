@@ -365,6 +365,48 @@ pub const ResultSpan = struct { base: u32, len: u32 };
 /// the keyframe restorer (`keyframeser.zig`) can rebuild the open-upvalue list.
 pub const OpenUpvalue = struct { index: usize, cell: *function.Upvalue };
 
+// Doc 61 §6: word-level helpers over the collector's keep-set (`Vm.gc_keep`).
+comptime {
+    std.debug.assert(stack_slots % 64 == 0);
+}
+
+/// The low `n` bits of a word (all of it for `n >= 64`).
+fn lowBits(n: usize) u64 {
+    return if (n >= 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(n)) - 1;
+}
+
+/// Bits `[lo, hi)` within word `wi`.
+fn rangeWord(wi: usize, lo: usize, hi: usize) u64 {
+    const w_lo = wi * 64;
+    return lowBits(hi -| w_lo) & ~lowBits(lo -| w_lo);
+}
+
+fn setBitRange(bits: []u64, lo: usize, hi: usize) void {
+    if (lo >= hi) return;
+    for (lo / 64..(hi - 1) / 64 + 1) |wi| bits[wi] |= rangeWord(wi, lo, hi);
+}
+
+fn clearBitRange(bits: []u64, lo: usize, hi: usize) void {
+    if (lo >= hi) return;
+    for (lo / 64..(hi - 1) / 64 + 1) |wi| bits[wi] &= ~rangeWord(wi, lo, hi);
+}
+
+/// OR the first `n` bits of `row` into `bits`, starting at bit `at`.
+fn orBitsAt(bits: []u64, at: usize, row: []const u64, n: usize) void {
+    var wi: usize = 0;
+    while (wi * 64 < n) : (wi += 1) {
+        const w = row[wi] & lowBits(n - wi * 64);
+        if (w == 0) continue;
+        const bit = at + wi * 64;
+        const sh: u6 = @intCast(bit % 64);
+        bits[bit / 64] |= w << sh;
+        if (sh != 0) {
+            const spill = w >> @intCast(@as(u7, 64) - sh);
+            if (spill != 0) bits[bit / 64 + 1] |= spill;
+        }
+    }
+}
+
 /// One active call frame in the **explicit** VM call stack. Tier-0 no longer
 /// recurses on the host stack; instead `exec` runs an iterative loop over a
 /// `frames[0..depth]` array, each entry carrying everything needed to (a) run the
@@ -428,6 +470,14 @@ pub const CallFrame = struct {
     /// `.S` host-call frame write. Transient: keyframes refuse capture while
     /// any frame has it set, so it is never serialized.
     in_flight: bool = false,
+    /// Doc 61 §5 (B): the dynamic end of a multret consumer's argument span,
+    /// window-relative and clamped to `num_registers`. Written by the `.call`
+    /// opcode with `b = all_results` before anything in it can fail, and read
+    /// only while the frame is in flight at that `.call`, so no push needs to
+    /// initialise it. The registers in `[multret_top, num_registers)` were
+    /// not written by the producer and are masked out. Transient, like
+    /// `in_flight`.
+    multret_top: u16 = 0,
 };
 
 /// Doc 54 P0: `CallFrame.code_cache_gen`'s "no cached image" sentinel. All-ones
@@ -600,6 +650,12 @@ pub const Vm = struct {
     /// absolute indices, so a nested native's scratch region is disjoint from its
     /// caller's — the same disjointness the SoA register file itself relies on.
     boundary_scratch: []Value,
+    /// Doc 61 §6.1: the collector's register keep-set, one bit per stack slot
+    /// (`stack_slots` bits, 8 KiB), rebuilt by every `.gc` root walk
+    /// (`buildGcKeep`) over `[0, stack_top)`. A set bit is rooted; a clear
+    /// bit is a dead window slot that `collect` scrubs to nil before the
+    /// sweep. Allocated once at init, so a collection allocates nothing.
+    gc_keep: []u64,
     /// Every host fn writes its results here (`callHostNative`), never into
     /// its caller's `out`. The caller's `out` can alias the host's `args`
     /// (`pcall`, `__call`), and it can reach past `stack_top`, where a nested
@@ -1044,6 +1100,8 @@ pub const Vm = struct {
         errdefer gpa.free(payloads);
         const boundary_scratch = try gpa.alloc(Value, stack_slots);
         errdefer gpa.free(boundary_scratch);
+        const gc_keep = try gpa.alloc(u64, stack_slots / 64);
+        errdefer gpa.free(gc_keep);
         // Stable-address heap (see the `heap` field doc): native pages bake
         // pointers to its collection counters, so it cannot live inside the
         // movable `Vm` by value.
@@ -1057,6 +1115,7 @@ pub const Vm = struct {
             .tags = tags,
             .payloads = payloads,
             .boundary_scratch = boundary_scratch,
+            .gc_keep = gc_keep,
             .trace = trace.TraceState.init(gpa),
         };
         // Registry allocates a stable context; no pointer into movable Vm storage.
@@ -1100,6 +1159,7 @@ pub const Vm = struct {
         self.gpa.free(self.tags);
         self.gpa.free(self.payloads);
         self.gpa.free(self.boundary_scratch);
+        self.gpa.free(self.gc_keep);
         self.gpa.free(self.host_out);
     }
 
@@ -2474,6 +2534,7 @@ pub const Vm = struct {
         self.forEachRootHeader(.gc, null, self.heap, gc.Heap.markHeader);
         self.heap.traceAll();
         self.invalidateDeadTraceConsts();
+        self.scrubDeadRegisters();
         self.heap.sweep();
     }
 
@@ -2575,6 +2636,111 @@ pub const Vm = struct {
                 i, self.depth, proto.name, @tagName(shape.kind), shape.pc, proto.code.len,
             });
         }
+        // §6.2: every window lies below `stack_top`, so whatever is parked at
+        // `stack_top` (P3) or above it sits in a gap, never in a masked window.
+        if (self.depth > 0) {
+            const f = &self.frames[self.depth - 1];
+            std.debug.assert(f.base + f.closure.proto.num_registers <= self.stack_top);
+        }
+    }
+
+    /// Doc 61 §4: the masked part of frame `i`'s window: `live_in` at the
+    /// frame's shape pc, cut at `limit` window-relative registers. Null when
+    /// the frame is kept whole (§4.5: a non-maskable proto or an unknown
+    /// shape).
+    const FrameMask = struct { row: []const u64, limit: usize };
+
+    fn frameMask(self: *const Vm, i: usize) ?FrameMask {
+        const f = &self.frames[i];
+        const proto = f.closure.proto;
+        if (!proto.maskable) return null;
+        const shape = self.frameShape(i);
+        if (shape.kind == .unknown or shape.pc >= proto.code.len) return null;
+        const nreg: usize = proto.num_registers;
+        const limit: usize = switch (shape.kind) {
+            // §4.3: slots at or above the call base are not yet the caller's.
+            .suspended_call => shape.call_a,
+            // §5 (B): inside a multret consumer, only its dynamic span was
+            // written. The opcode recorded its end before anything in it can
+            // fail. A frame in flight at a consumer is always inside it: no
+            // suspend point or host entry sits between a producer and its
+            // consumer (`reg_top_pending`), so `pc` never names one that has
+            // not started.
+            .in_flight => blk: {
+                const ins = proto.code[shape.pc];
+                break :blk if (ins.op == .call and ins.b == bytecode.all_results) f.multret_top else nreg;
+            },
+            .innermost, .unknown => nreg,
+        };
+        return .{ .row = proto.reg_live.row(@intCast(shape.pc)), .limit = @min(limit, nreg) };
+    }
+
+    /// Doc 61 §6.1/§6.2: fill `gc_keep` over `[0, stack_top)`. Gaps between
+    /// windows (host argument regions, parked callees, dynamic spans, the
+    /// depth-0 result span) and unmasked windows are kept whole. A masked
+    /// window keeps its frame's mask, every frame's varargs span and every
+    /// open upvalue's slot. All windows are cleared before any mask is ORed
+    /// in, so even overlapping windows could only keep more, never drop a
+    /// slot another frame needs. O(stack_top / 64 + Σ window words + aliases),
+    /// no allocation.
+    fn buildGcKeep(self: *Vm) void {
+        const top = self.stack_top;
+        const keep = self.gc_keep[0 .. (top + 63) / 64];
+        @memset(keep, ~@as(u64, 0));
+        for (0..self.depth) |i| {
+            if (self.frameMask(i) == null) continue;
+            const f = &self.frames[i];
+            const hi = @min(f.base + f.closure.proto.num_registers, top);
+            if (f.base < hi) clearBitRange(keep, f.base, hi);
+        }
+        for (0..self.depth) |i| {
+            const f = &self.frames[i];
+            if (self.frameMask(i)) |m| {
+                if (f.base < top) orBitsAt(keep, f.base, m.row, @min(m.limit, top - f.base));
+            }
+            if (f.varargs_count > 0 and f.varargs_base < top)
+                setBitRange(keep, f.varargs_base, @min(f.varargs_base + f.varargs_count, top));
+        }
+        for (self.open_upvalues.items) |ou| {
+            if (ou.index < top) keep[ou.index / 64] |= @as(u64, 1) << @intCast(ou.index % 64);
+        }
+    }
+
+    /// Bit `i` is set when register `at + i` has tag `tag`. `at` is a
+    /// multiple of 64 below `stack_slots` (itself a multiple of 64), so the
+    /// 64-tag block is in bounds. One vector compare per 64 registers keeps
+    /// both register passes of a collection a linear scan of the tag bytes.
+    inline fn tagMask(self: *const Vm, at: usize, tag: value.Tag) u64 {
+        const block: @Vector(64, u8) = self.tags[at..][0..64].*;
+        return @bitCast(block == @as(@Vector(64, u8), @splat(@intFromEnum(tag))));
+    }
+
+    /// `cb` on every kept register holding a heap value, in stack order.
+    fn forEachKeptRegister(self: *Vm, ctx: anytype, comptime cb: fn (@TypeOf(ctx), *object.GcHeader) void) void {
+        const top = self.stack_top;
+        for (self.gc_keep[0 .. (top + 63) / 64], 0..) |word, wi| {
+            const at = wi * 64;
+            var w = word & lowBits(top - at) & self.tagMask(at, .heap_ref);
+            while (w != 0) : (w &= w - 1) cb(ctx, self.regGet(at + @ctz(w)).asHeap());
+        }
+    }
+
+    /// Doc 61 §6.4: nil every register below `stack_top` that the last
+    /// `.gc` walk did not keep. Each is a window slot dead at its frame's
+    /// pc, written before any read on every path from there, so the program
+    /// cannot see the nil; afterwards no register points to a swept object,
+    /// and every tier holds the same nil.
+    fn scrubDeadRegisters(self: *Vm) void {
+        const top = self.stack_top;
+        const nil = Value.nil();
+        for (self.gc_keep[0 .. (top + 63) / 64], 0..) |word, wi| {
+            const at = wi * 64;
+            // A dead slot already nil (every one scrubbed before and not
+            // written since) needs no store, so a steady state stores
+            // almost nothing.
+            var dead = ~word & lowBits(top - at) & ~self.tagMask(at, .nil);
+            while (dead != 0) : (dead &= dead - 1) self.regSet(at + @ctz(dead), nil);
+        }
     }
 
     /// Visit every GC root that is a heap object, invoking `cb(ctx, header)` once
@@ -2624,11 +2790,17 @@ pub const Vm = struct {
         // walk seeds ONLY from the top-level result span — a heap object whose
         // only reference is a dead slot is semantic garbage, and excluding it
         // makes the reachable SET (not just the stack bytes) a pure function
-        // of the program's logical state. The `.gc` walk never masks: the
-        // collector's view of liveness is not the snapshot's business.
+        // of the program's logical state. The `.gc` walk never takes this
+        // result-span mask: it masks each frame by bytecode liveness instead
+        // (doc 61), which is not the snapshot's business.
         if (kind == .gc) std.debug.assert(snapshot_mask == null);
         cb(ctx, &self.globals.header);
-        {
+        if (kind == .gc) {
+            // Doc 61 §6: only the registers the keep-set names. `collect`
+            // scrubs the rest before the sweep.
+            self.buildGcKeep();
+            self.forEachKeptRegister(ctx, cb);
+        } else {
             var i: usize = if (snapshot_mask) |m| m.base else 0;
             const hi: usize = if (snapshot_mask) |m| @as(usize, m.base) + m.len else self.stack_top;
             while (i < hi) : (i += 1) {
@@ -4406,7 +4578,12 @@ pub const Vm = struct {
                 if (native_page) |nt| {
                     ran_native = true;
                     self.trace.native_entries +%= 1;
-                    ran_native_link_mode = self.trace.hasNativeLoopDoneLink(ct, proto);
+                    // A page whose loop-done guard declined the linked flush
+                    // (`CompiledTrace.linked_loop_done_ok`) ends that loop in
+                    // an ordinary deopt even in link mode, and the chain
+                    // below would then resume past the uncommitted final
+                    // iteration: run it in ordinary mode.
+                    ran_native_link_mode = nt.linked_loop_done_ok and self.trace.hasNativeLoopDoneLink(ct, proto);
                     // 2.3c-2d (D2a): capture the per-transition
                     // ledger, preserving the materialization mode
                     // (linked → `runLinkedLoopDoneCapturing`,
@@ -6663,17 +6840,23 @@ pub const Vm = struct {
                 const self = vm;
                 const a: usize = instr.a;
                 const base = st.base;
-                const callee = st.regs.get(a);
-                if (!callee.isHeap()) return parkErr(st, Error.TypeError);
-                // Resolve the argument count. `all_results` (the consumer half
-                // of dynamic multret, e.g. the outer `print` in
-                // `print(unpack(t))`) takes every value the
-                // immediately-preceding producer left, from the first argument
-                // slot up to `reg_top`.
+                // Resolve the argument count first: nothing before it may
+                // fail. `all_results` (the consumer half of dynamic multret,
+                // e.g. the outer `print` in `print(unpack(t))`) takes every
+                // value the immediately-preceding producer left, from the
+                // first argument slot up to `reg_top`. Taking it clears
+                // `reg_top_pending`, which must not outlive a fault here.
+                // Doc 61 §5 (B): the frame keeps the span's end, so a
+                // collection while it is in flight here (a native or
+                // `__call` callee, or a fault under `xpcall`) masks the
+                // unwritten window above it.
                 const nargs: usize = if (instr.b == bytecode.all_results) blk: {
                     self.reg_top_pending = false;
+                    st.frame.multret_top = @intCast(@min(self.reg_top - base, st.proto.num_registers));
                     break :blk self.reg_top - (base + a + 1);
                 } else instr.b;
+                const callee = st.regs.get(a);
+                if (!callee.isHeap()) return parkErr(st, Error.TypeError);
                 switch (callee.heapType()) {
                     .function => {
                         const cl = Closure.fromHeader(callee.asHeap());

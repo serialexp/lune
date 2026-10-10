@@ -607,6 +607,12 @@ pub const CompiledTrace = struct {
     /// self-framed test pages (never chained) and non-frameless builds. Points into
     /// the same owned `page`, so it needs no separate free.
     linked_entry: ?usize = null,
+    /// Whether every numeric-for loop-done guard of this page took its linked
+    /// branch (`TraceCode.loopDoneFlushSupported`). When one declines, a run
+    /// entered at `linked_entry` ends that loop in an ordinary deopt, which a
+    /// linked fusion does not model, so nothing arms a `.link_terminal` into
+    /// this page (`trace_link.arm`). Recorded from emission itself.
+    linked_loop_done_ok: bool = true,
     /// Secondary entry point (doc 17 Increment 2.3c-0): the dual of `linked_entry`.
     /// Presets `NativeResult.linked_loop_done = 0` then falls through to `body_entry`.
     /// A FUSED handoff inherits whatever `linked_loop_done` sits in the shared

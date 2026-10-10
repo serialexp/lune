@@ -109,7 +109,10 @@ test "nativegen doc 55 §2d: link, linked-loop-done, and deopt exits carry a dat
     try testing.expectEqual(@as(u64, 0), unpromoted.silent_cum);
 
     var loop_code = [_]bytecode.Instr{ bytecode.Instr.op0(.halt), bytecode.Instr.opAx(.for_loop, 0, 0), bytecode.Instr.op0(.halt) };
-    var loop_proto = bytecode.Proto{ .code = &loop_code, .name = "b3-loopdone", .id = 502 };
+    // Doc 61 §5 site 5: the linked loop-done exit needs a maskable proto with
+    // `R[a+3]` in the window and dead after the loop.
+    const loop_live: [3]u64 = @splat(0);
+    var loop_proto = bytecode.Proto{ .code = &loop_code, .name = "b3-loopdone", .id = 502, .num_registers = 4, .reg_live = .{ .words = 1, .bits = &loop_live }, .maskable = true };
     var loop_instrs = [_]I{
         .{ .op = .slot_load, .aux = 0 },
         .{ .op = .slot_load, .aux = 1 },
