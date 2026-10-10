@@ -164,6 +164,15 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       with an injected-OOM test per helper. Found by Codex in the doc 63
       round-2 review; doc 63 Prerequisite A.
 
+## Traced host calls: multret arguments and results (deferred 2026-10-10)
+
+- [ ] **Doc 63 v1 records host calls only with a fixed argument count
+      and a fixed wanted-result count.** A call with `c == all_results`
+      or with arguments fed by a multret producer stays a
+      `host_barrier`. Lifting it needs doc 27's multret shapes in
+      precise traces (variable window tail, result count as a value).
+      Deferred past doc 63 v1 by Bart (Q5).
+
 ## Coverage mode changes `tick` (noted 2026-10-09)
 
 - [ ] **`config.coverage` is documented as never affecting tiering, but a

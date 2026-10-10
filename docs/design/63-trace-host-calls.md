@@ -2,7 +2,7 @@
 
 Status: draft, not yet implemented. Revision 6, approved by Codex and
 Antigravity (confirmation round 6, receipts `docs/reviews/doc63/*-rev6.md`).
-Open decisions Q1–Q4 await Bart. Review history in §11–§15.
+Q1–Q5 decided by Bart (2026-10-10; §9). Review history in §11–§15.
 Owner: Bart
 Last updated: 2026-10-10
 
@@ -15,19 +15,21 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
 
 ### Done
 
-_(nothing yet)_
+- [x] **Decision Q1 — amend the "a host call is a trace barrier"
+  commitment.** Yes (Bart, 2026-10-10). The doc 00/02 amendments land
+  with Phase 2c (Docs item).
+- [x] **Decision Q2 — callbacks from a trace-called or recorded host call
+  run with the JIT suspended** in v1. Yes (Bart, 2026-10-10).
+- [x] **Decision Q3 — leaf host functions.** Part of this plan, as Phase
+  4 (Bart, 2026-10-10).
+- [x] **Decision Q4 — disturbance threshold.** Like LuaJIT: a native
+  stops being traced after its first disturbing call; threshold 1
+  (Bart, 2026-10-10).
+- [x] **Decision Q5 — multret host calls.** Deferred past v1; tracked in
+  TODO.md (Bart, 2026-10-10).
 
 ### Outstanding
 
-- [ ] **Decision Q1 — amend the "a host call is a trace barrier"
-  commitment** (doc 00 §Embedding, doc 02 §host-effect boundary). This
-  design cannot land without it (§6).
-- [ ] **Decision Q2 — callbacks from a trace-called or recorded host call
-  run with the JIT suspended** (tier-0 only) in v1 (§5.9)?
-- [ ] **Decision Q3 — leaf host functions in v1, later, or never** (§5.12).
-- [ ] **Decision Q4 — when a host function stops being traceable** after
-  it disturbs the VM: on the first disturbance, or after a threshold
-  (§5.9)?
 - [ ] **Prerequisite A — precise allocation-helper failures retry
   (pre-existing bug).** In a precise trace a failing string helper exits
   `.precise_resume` and tier-0 retries the allocation, against doc 45
@@ -65,7 +67,7 @@ _(nothing yet)_
   shim as a body callout, the post-call epoch and budget checks, the
   `host_result` tag checks and loads, the coherent exits, the call-site
   rooting rule in `nativegen_alloc` (§5.7). Budget met (§8).
-- [ ] **Phase 4 — leaf host functions** (only if Q3 says so; §5.12).
+- [ ] **Phase 4 — leaf host functions** (§5.12; Q3: part of this plan).
 - [ ] **Docs.** Amend doc 00, doc 02 and doc 59 (§3.5, E6) with Phase 2c;
   doc 45's error contract (the host statuses, the coherent snapshot);
   doc 61 §1 ("trace code never calls `callValue`") and Phase Q's F1/F3
@@ -809,7 +811,7 @@ the seed-span handling are shared code, so the root set and the
 execute-once behaviour are identical between tiers. §5.7's proof covers
 its unrooted `values` scratch.
 
-### 5.12 Leaf host functions (optional, Q3)
+### 5.12 Leaf host functions (Phase 4, Q3)
 
 A host function registered as **leaf** (a new `mh_register_fn` flag)
 promises no C API call other than reading its arguments and
@@ -889,7 +891,7 @@ drift after several iterations with changing carried locals.
   suspension depends on that). With this design a host call is an
   execute-once effect a precise trace may contain. Host-mediated
   suspension is not built; when it is, a suspending host call still ends
-  the trace (a new status). Bart decides (Q1).
+  the trace (a new status). Approved by Bart (Q1: yes).
 
 ## 7. Alternatives considered
 
@@ -980,20 +982,21 @@ registers host functions. The coherent-exit ABI, the statuses and the
 GC lifetime protocol (Phases 2a and 2b) land before any trace executes a
 callback (Phase 2c).
 
-## 9. Open questions for review
+## 9. Open questions for review (decided 2026-10-10)
 
 - **Q1.** Amend doc 00 and doc 02 so a host call is an execute-once
-  effect a precise trace may contain (§6)?
+  effect a precise trace may contain (§6)? **Bart: yes.**
 - **Q2.** Callbacks from a trace-called or recorded host call run with
-  the JIT suspended in v1 (§5.9)?
+  the JIT suspended in v1 (§5.9)? **Bart: yes.**
 - **Q3.** Leaf host functions (§5.12): in v1, as a later phase, or never?
+  **Bart: part of this plan, as Phase 4.**
 - **Q4.** A native stops being traced after its first disturbing call
   (LuaJIT's rule), or after a threshold (§5.9)? Threshold 1 bounds the
   suspended-callback cost; a higher one keeps tracing hosts that rarely
   disturb, at the price of more suspended calls and retire/re-record
-  churn.
+  churn. **Bart: like LuaJIT, threshold 1.**
 - **Q5.** `nwanted == all_results` and multret arguments (doc 27):
-  deferred past v1?
+  deferred past v1? **Bart: deferred; tracked in TODO.md.**
 
 Revision 2's Q4 (count trace-initiated calls against
 `max_native_reentry`) is withdrawn: it would make the recursion limit
