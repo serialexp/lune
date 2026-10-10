@@ -1,9 +1,10 @@
 # 63 — Traces call host functions directly — Design
 
-Status: draft, not yet implemented. Revision 6, approved by Codex and
+Status: partial — prerequisites and Phase 0 (benchmark and budget)
+landed; no host call is traced yet. Revision 6, approved by Codex and
 Antigravity (confirmation round 6, receipts `docs/reviews/doc63/*-rev6.md`).
 Q1–Q5 decided by Bart (2026-10-10; §9). Review history in §11–§15.
-Prerequisites A and B landed; implementation phases not started.
+Prerequisites A and B and Phase 0 done; Phases 1–4 not started.
 Owner: Bart
 Last updated: 2026-10-11
 
@@ -46,17 +47,23 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   sweep) lands.** Landed in `f1ea468` with follow-ups through `b462369`;
   doc 61 Phase 1 (the masked root walk) followed in `0225b4d`. §5.10.1
   records what the landed code changes for this design.
+- [x] **Phase 0 — benchmark and budget.** A host-call benchmark through the
+  C API, exact instruction counts, today's numbers, and the shapes in §8.
+  Fix the budget. Done 2026-10-11: `bench/embed/tracecall_probe.c` and
+  `tracecall.py`; numbers, the call-cost split and the fixed budget in
+  §8.1. The tier-0 overhead A/Bs move to the phases whose code they
+  measure: the epoch and suspension checks to Phase 1, the entry lease
+  to Phase 2b.
 
 ### Outstanding
 
-- [ ] **Phase 0 — benchmark and budget.** A host-call benchmark through the
-  C API, exact instruction counts, today's numbers, and the shapes in §8.
-  Fix the budget.
 - [ ] **Phase 1 — epoch, disturbance and suspension (inert).**
   `Heap.host_epoch` bumped at every §5.6 site; `Native.disturbs`
   maintained by `callHostNative` on success and failure (§5.9);
   `TraceState.suspend_depth` honoured by every §5.9 gate. No reader of
-  any of them outside tests yet. A test per site and per gate.
+  any of them outside tests yet. A test per site and per gate. The
+  instruction-count A/B of the epoch compare and the `suspend_depth`
+  checks on `bench/` and the §8.1 probe (§8).
 - [ ] **Phase 2a — slab-coherent snapshots and the host statuses (inert).**
   The snapshot form, its validation, finalize placement rules, admission,
   both executors and both dispatcher consumers (§5.2); the status
@@ -69,7 +76,8 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   recording-time host call; the published `executing` borrow; precise
   results consumed through it (§5.8, §5.10). Seeds are left above
   `stack_top` with a debug check that they survive an epoch-clean call
-  (§5.5).
+  (§5.5). The instruction-count A/B of the entry lease on `bench/` and
+  the §8.1 probe (§8).
 - [ ] **Phase 2c — recording and tier-1a.** `guard_native`, `call_host`,
   `guard_host_epoch`, `host_result` (§5.1); host calls force precise
   recording (§5.3); the tier-1a arms; exactly-once tests across the ten
@@ -1063,8 +1071,9 @@ ordinary trace's.
   every tier), the `suspend_depth` check at the top of every patched
   handler (every patched back-edge) and in the cached-entry predicate,
   and the entry lease (every trace entry) are measured by the usual instruction-count A/B on
-  `bench/` and the host-call benchmark. Neither may cost more than noise
-  on `bench/`.
+  `bench/` and the host-call benchmark, each in the phase that adds it
+  (Phase 1 for the epoch and suspension checks, Phase 2b for the lease).
+  None may cost more than noise on `bench/`.
 - **No regression** in `bench/` (none of them call host functions): the
   usual A/B, tier-0 and JIT-on, plus native residency (`--jit-stats`) on
   the new benchmark.
@@ -1074,6 +1083,144 @@ The benchmark runs through the C API (a C runner like the one used for
 registers host functions. The coherent-exit ABI, the statuses and the
 GC lifetime protocol (Phases 2a and 2b) land before any trace executes a
 callback (Phase 2c).
+
+### 8.1 Phase 0 measurements (2026-10-11)
+
+The instrument is `bench/embed/tracecall_probe.c`, driven by
+`bench/embed/tracecall.py`: one guest loop shape per run, user-space
+instructions from `perf stat` at 0 and N = 1,000,000 iterations, tier-0
+(`MH_NOJIT`) and JIT on, ReleaseFast, HEAD `ee13835`. Both modes print
+the same checksum for every shape. Instructions per iteration (for `two`,
+per host call; the `nest` row is a total):
+
+| Shape | What it is | JIT off | JIT on | Budget |
+|---|---|---:|---:|---:|
+| `min` | §1's loop, `host_id` a global | 690 | 721 | ≤ 250 |
+| `minl` | the same, `host_id` in a local | 657 | 688 | |
+| `gid` | control: a guest function | 875 | 14 | |
+| `a0` / `a4` / `a8` | 0 / 4 / 8 arguments | 694 / 778 / 938 | 725 / 809 / 969 | |
+| `w4` / `w8` / `w16` | 4 / 8 / 16 carried locals | 825 / 1049 / 1497 | 856 / 1080 / 1528 | |
+| `s1` / `s4` | 1 / 4 globals read | 768 / 1101 | 799 / 1132 | |
+| `wide` | §8's shape: 8 carried locals, a global, a table store | 1540 | 1571 | ≤ 320 |
+| `cb` | the host calls back every call | 1254 | 1285 | = today |
+| `tw` | the host writes a guest table every call | 1025 | 1056 | = today |
+| `two` | two loops calling one host, which starts calling back after 1,000 calls | 1373 | 1405 | = today |
+| `fail` | the host's callback fails every call, `pcall` catches | 29,097 | 29,128 | = today |
+| `nestq` | control for `nest`: a two-argument host, never disturbing | 759 | 790 | |
+| `nest` | `nestq` plus one call, the 1,000th, that runs a 100,000-iteration guest loop: that call's total (both runs end right after it) | 33.8 M | 1.6 M | |
+
+What the numbers say:
+
+- **Today the JIT costs host-call loops about 31 instructions per
+  iteration** and wins nothing: the loop never compiles, and the gated
+  anchor is still paid on every back-edge.
+- **The call itself is about 115 instructions; the rest is tier-0.** A
+  callgrind run of `minl` (tier-0, a baseline-CPU build so valgrind
+  runs, about 650 per iteration) splits the host-call funnel into
+  `callHostNative` about 35, `cHostCall` 68 and the C function 12. The
+  §8 estimate of 80 for `cHostCall` plus the C function holds. `opCall`'s
+  host arm adds about 60 (frame bookkeeping and the result copy). The
+  remaining ~475 is the dispatch around the call (register loads, the
+  loop, the arithmetic), which a trace removes.
+- **The targets stay, and the projection is at or over them.** A
+  precise snapshot is full: it names every register of the anchor
+  window, dead temporaries included (`trace_snapshot.zig`'s contract).
+  The flush (`emitPreciseSnapshotFlush`, `nativegen.zig:723`) skips a
+  slot only when its value is its own invariant load, which in these
+  loops means a register the body never writes. A register written
+  later in the iteration still holds the previous iteration's value at
+  the call, in its home, and is flushed from there. A slot costs two
+  instructions from a register home and three for a constant, a pinned
+  value or a spilled payload. The bytecode (`compileNumericFor` lays out
+  `idx, limit, step, var` contiguously; the expression temporaries sit
+  above the locals) gives, at the call:
+  - `minl`, 12 registers: `n h s idx limit step i`, then `r7` (the sum),
+    `r8` (the copy of `s`), `r9` (the result), `r10` (the callee) and
+    `r11` (the argument). Never written in the body, so skipped: `n`,
+    `h`, `limit`, `step`. Flushed: the other 8. About 16–24
+    instructions.
+  - `wide`, 28 registers: `n h t a…k idx limit step i`, then `r15…r21`
+    (the multiple assignment's `b…k`), `r22` (the new `k`), `r23`
+    (`a + h(i)`), `r24` (the copy of `a`, then `G1`), `r25` (the
+    result), `r26` (the callee) and `r27` (the argument). Skipped: `n`,
+    `h`, `t`, `limit`, `step`. Flushed: the other 23. About 46–69
+    instructions.
+
+  Argument gathering stays in the shim (§5.8): `gatherScratch`
+  rebuilds each argument's `Value` from the slab's two lanes and copies
+  it into contiguous scratch. `cHostCall` passes that buffer to the C
+  function as is (`mh_value` has `Value`'s layout), so there is no
+  per-argument conversion. The gather for one argument is inside the
+  shim row below. Projected per traced iteration:
+
+  | Cost | `minl` | `wide` |
+  |---|---:|---:|
+  | Funnel: `callHostNative`, `cHostCall`, the C function | 115 | 115 |
+  | Callout save and restore (21 lanes) | 42 | 42 |
+  | Call setup and the shim, gathering included | ~45 | ~45 |
+  | Epoch and budget checks | ~6 | ~6 |
+  | Flush | 16–24 | 46–69 |
+  | Result tag check and load | ~3 | ~3 |
+  | Loop body (`wide`: shuffle, global, `%`, table store) | ~15 | ~50 |
+  | **Total** | **~242–250** | **~307–330** |
+  | Budget | ≤ 250 | ≤ 320 |
+
+  `minl` meets its target across the range, with no margin at the top;
+  `wide` may miss by up to ten. This is a projection from component
+  costs, not a measurement. Phase 3 re-runs the probe, and a shape over
+  budget is a Phase 3 failure to fix, not a number to revise. The flush
+  is the term that grows with the window, and it flushes slots no one
+  reads. Two ways to shrink it, for Phase 3 to choose between if the
+  probe misses:
+  - **Skip slots dead at the resume pc.** Tier-0 writes a dead register
+    before it reads it, and doc 61 Phase 1's masked root walk already
+    ignores and scrubs dead registers, so a dead slot's stale slab value
+    is never observed. Any other reader of the slab (a debugger view,
+    replay's keyframes) would have to accept the same rule. At the call,
+    `minl` has 4 live flushed slots of 8 (`idx` and the call's three
+    operands), for ~234–238 in total, and `wide` has 12 of 23 (`idx`,
+    `i`, `r15…r21`, the copy of `a`, the callee and the argument), for
+    ~285–297.
+  - **A sparse snapshot form.** It records only the live slots, so the
+    flush loop never sees the dead ones. `SnapshotSlot.slot` exists for
+    this (the contract calls it a validation change, not a schema
+    change). It saves the same instructions, and it also makes snapshot
+    vectors smaller.
+- **Scaling, today, in tier-0:** about 20–40 instructions per argument,
+  56 per carried local and 110 per global read, mostly dispatch (each
+  argument's `move` and the reads around it). Under a trace a carried
+  local costs its flush (2–3). An argument also keeps its gather (the
+  lane loads and the copy into scratch) and whatever the host does with
+  it, provisionally 10–25 more. Phase 3 reports the measured slopes.
+- **Disturbing hosts set the regression baseline.** `cb`, `tw`, `two`
+  and `fail` must stay at today's JIT-on numbers within noise once
+  Phase 2c lands (§5.9's exits and retirements are one-off).
+- **The cost of threshold 1 (Q4), for this workload.** `nest`'s
+  disturbing call comes after 999 quiet calls, so under this design the
+  loop is a trace by then and the call is made from it, suspended: its
+  100,000-iteration guest loop runs on tier-0. Today the same call runs
+  with the JIT on inside the callback. Measured against `nestq`, with
+  both runs ending right after that call, it costs 33.8 M instructions
+  on tier-0 and 1.6 M with the JIT on. The projected price of suspension
+  is the difference: about 32 M, or about 320 per callback-loop
+  iteration, once per native (the native is then blacklisted, §5.9). It
+  is a projection. The suspended call cannot be measured before
+  Phase 2c, and the per-iteration figure is this loop's tier-0 to JIT
+  ratio, not a constant: a callback loop with more work per iteration
+  costs more. (Run on to N = 1,000,000 with the JIT on, `nest` costs
+  another 1.4–2.6 M over `nestq` beyond the call itself, and the figure
+  varies between identical runs. That is how the call changes the rest
+  of today's loop, not the cost of the call; TODO.md, "A guest callback
+  slows the host-calling loop that follows it".)
+- **`fail` is dominated by a pre-existing bug**, not by the call:
+  `compiler.lineFromOffset` rescans the source from byte 0 for every
+  located error and backtrace frame, so each lookup is linear in the
+  prefix it scans; about 76% of the 29,100 (TODO.md, "Every located
+  runtime error rescans the source for its line").
+- **Tier-0 overhead of the new machinery** cannot be measured before it
+  exists. Phase 1 runs the A/B of the epoch compare and the
+  `suspend_depth` checks, and Phase 2b the A/B of the entry lease, on
+  `bench/` and this probe, against the numbers above.
 
 ## 9. Open questions for review (decided 2026-10-10)
 

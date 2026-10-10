@@ -2,6 +2,44 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## A guest callback slows the host-calling loop that follows it (noted 2026-10-11)
+
+- [ ] **After one host call that runs a long guest loop, the calling loop
+      runs more instructions for the rest of the run, and how many more
+      varies between identical runs.** Doc 63 Phase 0's `nest` and `nestq`
+      shapes (`bench/embed/tracecall_probe.c`) are the same loop except
+      that `nest`'s 1,000th host call runs `work(100000)`. With the JIT
+      on, ending both runs right after that call, the difference is
+      1.60 M instructions (the call). At N = 1,000,000 it is 3.0 M or
+      4.2 M: three back-to-back runs of `nest 1000000` gave 795.10 M,
+      795.10 M and 796.23 M user instructions, while `nestq 1000000` gave
+      792.07 M every time. So something after the callback costs ~1.4–2.6 M
+      over the next ~1 M iterations (anchor or gate state left behind by
+      the nested trace activity?), and it is bimodal between runs. The
+      bimodality matters more than the size: the VM is meant to be
+      deterministic, so an instruction count that varies between identical
+      runs points at address-dependent behaviour (hashing, allocator
+      layout) somewhere on this path. Diagnose with `--jit-stats` and
+      `-Djit-debug` on both shapes.
+
+## Every located runtime error rescans the source for its line (noted 2026-10-11)
+
+- [ ] **`compiler.lineFromOffset` counts newlines from byte 0 up to the
+      offset, and the runtime error path calls it once for the error and
+      once per backtrace frame** (`interp.zig` `raiseLocatedError`,
+      `backtraceFrames`, `describeFault`; also `wasm_entry.zig`). Each
+      lookup is linear in the source prefix it scans (up to the frame's
+      offset), so a raised error costs the sum of those prefixes over the
+      error and its frames, whether or not anyone reads the message. Found
+      by doc 63 Phase 0's `fail` shape (`bench/embed/tracecall_probe.c`):
+      a host callback that fails every call, caught by `pcall`, costs
+      ~29,100 instructions per iteration, ~76% of it in this scan, on a
+      ~3 KB script. The same error raised deep in a 100 KB script would
+      scan ~30× more. Rule #20. Options: a per-chunk line-start
+      table built once (binary search per lookup), or the line stored in
+      the span at compile time; and/or render the location lazily, only
+      when the message is read.
+
 ## Global-read slow path leaves via a volatile `var` pointer (noted 2026-10-05)
 
 - [ ] **`opGetGlobal` (src/interp.zig) tail-calls `GetGlobalSlow(mode).handler`

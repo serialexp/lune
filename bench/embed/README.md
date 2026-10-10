@@ -69,6 +69,29 @@ MH_NOJIT=1 perf stat -e instructions:u,cycles:u /tmp/hostcall_probe a1 0   # set
 Per-call cost is the difference between the two runs, divided by the
 iteration count. Numbers are informational, never a gate.
 
+## Guest->host loop probe (`tracecall_probe.c`, doc 63 Phase 0)
+
+The other direction: a guest loop calling host functions, one loop shape
+per run (the §1 callback loop, 0/4/8 arguments, 4/8/16 carried locals,
+1/4 globals read, doc 63 §8's `wide` shape, hosts that call back, write a
+table, fail under `pcall`, start calling back only after a warm-up, or run
+one long guest loop after 999 quiet calls; the list is in the file
+header). `tracecall.py` builds it against the same ReleaseFast prefix,
+counts instructions with `perf stat` at 0 and N iterations with the JIT on
+and off, prints instructions per iteration (`nest`: the one disturbing
+call's total, measured against its `nestq` control with both runs ending
+right after that call), and exits non-zero if
+the two modes' checksums differ. N must be a multiple of 100 and at least
+2000:
+
+```sh
+python3 bench/embed/tracecall.py               # every shape
+python3 bench/embed/tracecall.py --iters 200000 min wide
+```
+
+The numbers are doc 63's baseline and budget (§8.1). Informational, never
+a gate.
+
 ## Reading the numbers (snapshot, 2026-10-01, Bart's home machine)
 
 ```
