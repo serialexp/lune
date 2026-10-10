@@ -31,6 +31,7 @@ const ExitProvEntry = trace.ExitProvEntry;
 const IrInstr = trace.IrInstr;
 const Trace = trace.Trace;
 const TraceState = trace.TraceState;
+const EntryPatchState = trace.EntryPatchState;
 
 // ---- doc 20 Phase 0b: entry-patch substrate (inert) -------------------------
 
@@ -240,6 +241,74 @@ test "doc 20 §R7-2: removeTrace marks the slot pre-destroy; drain survives the 
     state.drainEntryPatchWork();
     try testing.expect(p.tombstone);
     try testing.expectEqual(OpCode.for_loop, state.codeFor(&proto)[5].op);
+}
+
+test "doc 61 §7.1 step 8: the drain after a batch retirement restores first, wakes both waiter kinds, installs in id order" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = entryPatchTestCode();
+    const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
+    // Five traces share anchor pc 2. Cache order (1, 4, 3, 5, 2, 6) is
+    // deliberately not id order.
+    var ts: [6]*Trace = undefined;
+    for ([_]u32{ 1, 4, 3, 5, 2, 6 }, 0..) |id, i| {
+        ts[i] = try entryPatchTestTrace(gpa, id, &proto, 2);
+        try state.registry.attach(ts[i]);
+    }
+    const owner = ts[0];
+    const t4 = ts[1];
+    const t3 = ts[2];
+    const t5 = ts[3];
+    const t2 = ts[4];
+    const t6 = ts[5];
+    // A loop-anchored `.pending` trace installs only when compiled; the
+    // fake pages must not reach `CompiledTrace.deinit` at teardown.
+    for ([_]*Trace{ t4, t2 }) |t| t.native = .{ .compiled = .{ .page = undefined, .gpa = gpa } };
+    defer for ([_]*Trace{ t4, t2 }) |t| {
+        t.native = .unattempted;
+    };
+
+    try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(owner));
+    owner.entry_patch = .bound;
+    // Waiters on the owner's slot, one of each kind, plus one that retires
+    // with the owner.
+    t3.entry_patch = .suppressed_incumbent;
+    t3.entry_patch_incumbent = 0;
+    t5.entry_patch = .suppressed_capacity;
+    t6.entry_patch = .suppressed_incumbent;
+    t6.entry_patch_incumbent = 0;
+    // Two survivors marked by this receipt, in reverse id order in the cache.
+    state.registry.entry_registry.markInstallPending(t4);
+    state.registry.entry_registry.markInstallPending(t2);
+
+    state.removeTraces(&.{ owner, t6 });
+    const p = state.registry.entry_registry.entry_patches.items[0];
+    try testing.expect(!p.live and p.pending_unpatch and p.owner_retired);
+    // Nothing is restored or installed until the safe point.
+    try testing.expectEqual(OpCode.jfor_loop, state.codeFor(&proto)[5].op);
+    try testing.expectEqual(EntryPatchState.pending, t2.entry_patch);
+
+    state.drainEntryPatchWork();
+    // Restore ran before install: t2 (lowest pending id) took the freed
+    // slot instead of meeting the retired owner as incumbent.
+    try testing.expectEqual(EntryPatchState.bound, t2.entry_patch);
+    try testing.expectEqual(@as(?u16, 0), t2.entry_slot);
+    try testing.expectEqual(@as(u32, 2), p.trace_id);
+    try testing.expect(p.live and !p.tombstone);
+    const img = state.codeFor(&proto);
+    try testing.expectEqual(OpCode.jfor_loop, img[5].op);
+    try testing.expectEqual(@as(u16, 0), img[5].b);
+    // t4 installed after t2 and lost to it.
+    try testing.expectEqual(EntryPatchState.suppressed_incumbent, t4.entry_patch);
+    try testing.expectEqual(@as(u16, 0), t4.entry_patch_incumbent);
+    try testing.expectEqual(@as(?u16, null), t4.entry_slot);
+    // Both waiter kinds woke on the restore, before t2 reused the slot.
+    try testing.expectEqual(EntryPatchState.eligible, t3.entry_patch);
+    try testing.expectEqual(EntryPatchState.eligible, t5.entry_patch);
+    try testing.expectEqual(@as(usize, 1), state.registry.entry_registry.entry_patches.items.len);
+    try testing.expectEqual(@as(usize, 0), state.registry.entry_registry.entry_patch_free.items.len);
 }
 
 test "doc 20 §R2-2: clearCache drops images + registry wholesale (epoch boundary)" {

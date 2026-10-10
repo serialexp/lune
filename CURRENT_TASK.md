@@ -103,13 +103,30 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
   per-component (TODO "Region graph rebuild R(T)", marked done). R(T) at
   N=4000 went from 92 ms to 3.0 ms. Tests now install records via
   `registry.attach`/`detach`/`detachAll`, never `registry.cache` directly.
+- **f1ea468's board regressed, and the follow-up fixes it.** On
+  pt-default, euler14-bit was +6%, binary-trees +4%, str_gmatch +3.5% and
+  spectral-norm +3% against 4fed40b. Two boards agreed, and the
+  instruction counts reproduced it locally. Cause: the anchor index turned
+  `findTrace` (`hasTrace` on every tier-0 back-edge and return) from a scan
+  of a handful of traces into a Wyhash of `AnchorKey`. Fix:
+  `AnchorKeyContext` (a two-multiply mix) via `AnchorMap(V)` for all twelve
+  `AnchorKey` maps. Instruction A/B against 4fed40b over all 30 benches:
+  none up more than 0.4%; scimark-fft −8%, nsieve −7%, scimark-sparse −7%,
+  binary-trees −5%, spectral-norm −5%, euler14-bit −5%.
+- **The registry's cache invariants are now all-or-nothing in `attach`.**
+  The id index is mandatory: `publish` used to swallow its OOM, and
+  `traceById` had a linear fallback. `batch_scratch` capacity is now
+  reserved in `attach` as well (the drain relied on `publish` reserving it).
+  `traceById` is O(1). Test records need unique ids, and must not change
+  their id or anchor while attached.
 - **Phase Q follow-ups still open.** Codex and antigravity listed missing
   tests in the impl review (codex thread
   01a124f3-15b9-7e53-9154-758a8bd976b2):
   - parked proofs intact before R and dropped after R;
   - promoted sets demoted;
-  - the drain: restore before install, id order, several traces per
-    anchor, both wake kinds;
+  - ~~the drain: restore before install, id order, several traces per
+    anchor, both wake kinds~~ — done (trace_entrypatch_test, "doc 61 §7.1
+    step 8");
   - region index OOM;
   - real finalize/commit of a side recording after its parent retires;
   - identity maps under address reuse;

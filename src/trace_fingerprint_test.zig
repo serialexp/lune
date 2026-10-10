@@ -81,7 +81,7 @@ test "nextTraceExcluding: visits each anchor trace once, highest-hit first, then
         .{ .pc = 10, .hits = 3 },
         .{ .pc = 99, .hits = 100 },
     };
-    for (&traces, specs) |*slot, spec| {
+    for (&traces, specs, 0..) |*slot, spec, i| {
         const tr = try gpa.create(Trace);
         tr.* = .{
             .code = .{
@@ -91,6 +91,7 @@ test "nextTraceExcluding: visits each anchor trace once, highest-hit first, then
                 .entry_slots = &.{},
                 .entry_guards = &.{},
             },
+            .id = @intCast(i),
             .hit_count = spec.hits,
         };
         slot.* = tr;

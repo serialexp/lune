@@ -59,6 +59,7 @@ test "driveChain ordinary_header: chains to a same-anchor sibling" {
             .entry_slots = &entry_a,
             .entry_guards = &.{},
         },
+        .id = 1,
     };
 
     // Trace B: a sibling at the SAME anchor (pc 10) — a simple counting loop
@@ -86,6 +87,7 @@ test "driveChain ordinary_header: chains to a same-anchor sibling" {
             .entry_slots = &entry_b,
             .entry_guards = &.{},
         },
+        .id = 2,
     };
 
     // Set proto on anchors (needed for findTrace lookup), then put both
@@ -144,6 +146,7 @@ test "driveChain (doc 44 D1): a head-anchored trace never chains — kind check 
             .entry_slots = &entry_a,
             .entry_guards = &.{},
         },
+        .id = 1,
     };
     var trace_b = try gpa.create(Trace);
     trace_b.* = .{
@@ -154,12 +157,13 @@ test "driveChain (doc 44 D1): a head-anchored trace never chains — kind check 
             .entry_slots = &entry_a,
             .entry_guards = &.{},
         },
+        .id = 2,
     };
-    try state.registry.attach(trace_a);
-    try state.registry.attach(trace_b);
     const proto = Proto{ .code = &.{}, .name = "head", .num_registers = 1 };
     trace_a.code.anchor.proto = &proto;
     trace_b.code.anchor.proto = &proto;
+    try state.registry.attach(trace_a);
+    try state.registry.attach(trace_b);
 
     var regs = [_]Value{Value.int(0)};
     var tr_regs = TestRegs{ .regs = &regs };
@@ -382,6 +386,7 @@ test "B-iii chained hash-drift (doc 22 §B.6): SEED_HASH_DECLINE still chains on
             .entry_slots = &entry_a,
             .entry_guards = &.{},
         },
+        .id = 1,
     };
 
     // Trace B: a SEEDED same-anchor sibling — the counting loop's increment is
@@ -415,6 +420,7 @@ test "B-iii chained hash-drift (doc 22 §B.6): SEED_HASH_DECLINE still chains on
             .entry_guards = &.{},
             .inputs = &inputs_b,
         },
+        .id = 2,
     };
 
     try state.registry.attach(trace_a);
@@ -941,6 +947,7 @@ test "driveChain ir_numeric_for_done: a longer candidate cannot invalidate the c
             .entry_slots = &entry_f,
             .entry_guards = &.{},
         },
+        .id = 1,
     };
 
     // The continuation at pc 1: `.link`-terminated (the only shape a loop-done
@@ -961,6 +968,7 @@ test "driveChain ir_numeric_for_done: a longer candidate cannot invalidate the c
             .entry_slots = &entry_c,
             .entry_guards = &.{},
         },
+        .id = 2,
     };
     try testing.expect(cont.code.instrs.len > failed.code.instrs.len);
 

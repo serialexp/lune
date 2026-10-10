@@ -7,6 +7,7 @@ const nativegen = @import("nativegen.zig");
 const EntryRegistry = @import("trace_entry_registry.zig").EntryRegistry;
 const NativePhysicalRegistry = @import("trace_native_registry.zig").NativePhysicalRegistry;
 const AnchorKey = @import("trace_types.zig").AnchorKey;
+const AnchorMap = @import("trace_types.zig").AnchorMap;
 
 /// One anchor's published traces: an intrusive doubly-linked list through
 /// `TraceRecord.anchor_prev`/`anchor_next`, in cache order, plus its counts.
@@ -42,7 +43,7 @@ pub const TraceRegistry = struct {
     cache: std.ArrayListUnmanaged(*Trace) = .empty,
     /// Anchor → its published traces (cache order) and counts, so every
     /// per-anchor lookup is O(traces at that anchor), never O(cache).
-    by_anchor: std.AutoHashMapUnmanaged(AnchorKey, AnchorList) = .empty,
+    by_anchor: AnchorMap(AnchorList) = .empty,
     trace_by_id: std.ArrayListUnmanaged(?*Trace) = .empty,
     next_trace_id: u32 = 0,
     cache_gen: u32 = 1,
@@ -51,7 +52,7 @@ pub const TraceRegistry = struct {
     mcode_arena: nativegen.McodeArena,
     native_seed_ctx: ?*NativeSeedCtx = null,
     /// Doc 61 §7.1 item 6: one `*Trace` list with capacity ≥ the cache,
-    /// reserved at publish so a collection's doomed set and the entry-patch
+    /// reserved by `attach` so a collection's doomed set and the entry-patch
     /// drain's install list never allocate. Contents live for one operation.
     batch_scratch: std.ArrayListUnmanaged(*Trace) = .empty,
 
@@ -72,27 +73,29 @@ pub const TraceRegistry = struct {
     pub fn discardAllocation(self: *TraceRegistry, t: *Trace) void {
         self.gpa.destroy(t);
     }
-    /// Ownership transfers only on success. Index allocation is an optional acceleration.
+    /// Ownership of `t` (from `allocate`) transfers only on success.
     pub fn publish(self: *TraceRegistry, t: *Trace) !void {
-        try self.batch_scratch.ensureTotalCapacity(self.gpa, self.cache.items.len + 1);
         try self.attach(t);
+    }
+    /// Append `t` to the cache, its anchor list and the id index, and keep
+    /// `batch_scratch` at cache capacity: `publish`'s core, and the way
+    /// tests install caller-owned (often stack) records. Such records must
+    /// leave through `detach`/`detachAll` before `clear`/`deinit`, which
+    /// destroy the cache. All-or-nothing: every reservation happens before
+    /// any visible mutation (growing the id index only adds null rows).
+    pub fn attach(self: *TraceRegistry, t: *Trace) !void {
         if (t.id >= self.trace_by_id.items.len) {
             const old_len = self.trace_by_id.items.len;
-            self.trace_by_id.resize(self.gpa, @as(usize, t.id) + 1) catch return;
+            try self.trace_by_id.resize(self.gpa, @as(usize, t.id) + 1);
             @memset(self.trace_by_id.items[old_len..], null);
         }
-        self.trace_by_id.items[t.id] = t;
-    }
-    /// Append `t` to the cache and its anchor list, without the id index or
-    /// the batch reservation: `publish`'s core, and the way tests install
-    /// caller-owned (often stack) records. Such records must leave through
-    /// `detach`/`detachAll` before `clear`/`deinit`, which destroy the cache.
-    /// All-or-nothing: both reservations happen before any mutation.
-    pub fn attach(self: *TraceRegistry, t: *Trace) !void {
+        std.debug.assert(self.trace_by_id.items[t.id] == null); // ids are unique among published traces
+        try self.batch_scratch.ensureTotalCapacity(self.gpa, self.cache.items.len + 1);
         try self.by_anchor.ensureUnusedCapacity(self.gpa, 1);
         try self.cache.ensureUnusedCapacity(self.gpa, 1);
         self.cache.appendAssumeCapacity(t);
         self.linkAnchor(t);
+        self.trace_by_id.items[t.id] = t;
         self.changed();
     }
     /// Remove one attached record (order-preserving), without destroying it.
@@ -101,7 +104,7 @@ pub const TraceRegistry = struct {
         const i = std.mem.indexOfScalar(*Trace, self.cache.items, t) orelse return false;
         _ = self.cache.orderedRemove(i);
         self.unlinkAnchor(t);
-        if (t.id < self.trace_by_id.items.len and self.trace_by_id.items[t.id] == t) self.trace_by_id.items[t.id] = null;
+        self.trace_by_id.items[t.id] = null;
         self.changed();
         return true;
     }
@@ -161,24 +164,21 @@ pub const TraceRegistry = struct {
         const l = self.by_anchor.get(anchor) orelse return false;
         return l.inner_roots != 0;
     }
+    /// O(1): every cached trace is in the id index (`attach`).
     pub fn traceById(self: *const TraceRegistry, id: u32) ?*Trace {
-        if (id < self.trace_by_id.items.len) if (self.trace_by_id.items[id]) |t| return t;
-        for (self.cache.items) |t| if (t.id == id) return t;
-        return null;
+        if (id >= self.trace_by_id.items.len) return null;
+        return self.trace_by_id.items[id];
     }
     /// Retirement is forbidden during replay: deferred disarm cannot protect freed pages.
     /// Retire one published trace: the one-element case of `unpublishDoomed`
     /// + `destroyDoomed`. False when `t` is not in the cache.
     pub fn retire(self: *TraceRegistry, t: *Trace) bool {
-        for (self.cache.items) |live| {
-            if (live != t) continue;
-            t.doomed = true;
-            const one = [_]*Trace{t};
-            self.unpublishDoomed(&one);
-            destroyDoomed(self.gpa, &one);
-            return true;
-        }
-        return false;
+        if (self.traceById(t.id) != t) return false;
+        t.doomed = true;
+        const one = [_]*Trace{t};
+        self.unpublishDoomed(&one);
+        destroyDoomed(self.gpa, &one);
+        return true;
     }
     /// The physical half of a batch retirement (doc 61 §7.1 item 5 steps 3–4).
     /// Every member of `doomed` is published and has `Trace.doomed` set; the
@@ -199,7 +199,7 @@ pub const TraceRegistry = struct {
                 patch.trace = undefined;
                 patch.owner_retired = true;
             }
-            if (t.id < self.trace_by_id.items.len) self.trace_by_id.items[t.id] = null;
+            self.trace_by_id.items[t.id] = null;
             self.unlinkAnchor(t);
         }
         var w: usize = 0;
@@ -309,29 +309,142 @@ test "registry clear drops candidate references even without armed links" {
     try testing.expectEqual(@as(usize, 0), registry.native_physical.promotionCandidate().len);
 }
 
-test "registry optional index OOM preserves successful publication and swap order" {
+/// A candidate at `(proto, pc)`, `.loop`-terminated (inner-root shape) or
+/// empty. Owned instrs, so `destroy` frees them.
+fn anchoredCandidate(registry: *TraceRegistry, proto: *const @import("bytecode.zig").Proto, pc: u32, root: bool) !*Trace {
+    const IrInstr = @import("trace_ir.zig").IrInstr;
+    const t = try registry.allocate();
+    const instrs = try registry.gpa.dupe(IrInstr, if (root) &.{.{ .op = .loop }} else &.{});
+    t.code = .{ .anchor = .{ .proto = proto, .pc = pc }, .instrs = instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    return t;
+}
+
+fn expectAnchorList(registry: *const TraceRegistry, anchor: AnchorKey, want: []const *Trace) !void {
+    const testing = std.testing;
+    var it = registry.tracesAt(anchor);
+    for (want) |w| try testing.expectEqual(w, it.next().?);
+    try testing.expect(it.next() == null);
+    try testing.expectEqual(want.len, registry.countAt(anchor));
+    if (registry.by_anchor.get(anchor)) |l| {
+        try testing.expectEqual(want[want.len - 1], l.tail);
+        try testing.expect(l.head.anchor_prev == null and l.tail.anchor_next == null);
+    }
+}
+
+test "registry anchor index: per-anchor lists stay in cache order through publish, retire, detach and clear" {
+    const testing = std.testing;
+    const Proto = @import("bytecode.zig").Proto;
+    var registry = TraceRegistry.init(testing.allocator);
+    defer registry.deinit();
+    const p1 = Proto{ .code = &.{}, .name = "a", .id = 1 };
+    const p2 = Proto{ .code = &.{}, .name = "b", .id = 2 };
+    const a: AnchorKey = .{ .proto = &p1, .pc = 3 };
+    const b: AnchorKey = .{ .proto = &p1, .pc = 4 }; // same proto, other pc
+    const c: AnchorKey = .{ .proto = &p2, .pc = 3 }; // same pc, other proto
+
+    const a1 = try anchoredCandidate(&registry, a.proto, a.pc, false);
+    try registry.publish(a1);
+    const b1 = try anchoredCandidate(&registry, b.proto, b.pc, true);
+    try registry.publish(b1);
+    const a2 = try anchoredCandidate(&registry, a.proto, a.pc, true);
+    try registry.publish(a2);
+    const a3 = try anchoredCandidate(&registry, a.proto, a.pc, false);
+    try registry.publish(a3);
+    const c1 = try anchoredCandidate(&registry, c.proto, c.pc, false);
+    try registry.publish(c1);
+
+    try expectAnchorList(&registry, a, &.{ a1, a2, a3 });
+    try expectAnchorList(&registry, b, &.{b1});
+    try expectAnchorList(&registry, c, &.{c1});
+    try testing.expect(registry.innerRootAt(a) and registry.innerRootAt(b) and !registry.innerRootAt(c));
+    try testing.expectEqual(@as(usize, 0), registry.countAt(.{ .proto = &p2, .pc = 4 }));
+
+    // Middle, head and tail removal; the root count follows the shape.
+    try testing.expect(registry.retire(a2));
+    try expectAnchorList(&registry, a, &.{ a1, a3 });
+    try testing.expect(!registry.innerRootAt(a));
+    try testing.expect(registry.retire(a1));
+    try expectAnchorList(&registry, a, &.{a3});
+    // A batch spanning anchors, emptying two of them (the entries go).
+    a3.doomed = true;
+    b1.doomed = true;
+    const batch = [_]*Trace{ a3, b1 };
+    registry.unpublishDoomed(&batch);
+    TraceRegistry.destroyDoomed(registry.gpa, &batch);
+    try testing.expectEqual(@as(usize, 0), registry.countAt(a));
+    try testing.expectEqual(@as(usize, 0), registry.countAt(b));
+    try testing.expect(!registry.innerRootAt(b));
+    try testing.expectEqual(@as(u32, 1), registry.by_anchor.count());
+    // A later publish at an emptied anchor starts a fresh list.
+    const a4 = try anchoredCandidate(&registry, a.proto, a.pc, true);
+    try registry.publish(a4);
+    try expectAnchorList(&registry, a, &.{a4});
+    try testing.expect(registry.innerRootAt(a));
+
+    // Detach is the non-destroying removal; re-attach appends at the tail.
+    try testing.expect(registry.detach(a4));
+    try testing.expect(!registry.detach(a4));
+    try testing.expectEqual(@as(usize, 0), registry.countAt(a));
+    try registry.attach(a4);
+    try expectAnchorList(&registry, a, &.{a4});
+    try testing.expectEqual(c1, registry.cache.items[0]);
+    try testing.expectEqual(a4, registry.cache.items[1]);
+
+    registry.clear();
+    try testing.expectEqual(@as(u32, 0), registry.by_anchor.count());
+    var it = registry.tracesAt(c);
+    try testing.expect(it.next() == null);
+}
+
+test "registry anchor index: a failed attach changes nothing" {
+    const testing = std.testing;
+    const Proto = @import("bytecode.zig").Proto;
+    const p = Proto{ .code = &.{}, .name = "a", .id = 1 };
+    const anchor: AnchorKey = .{ .proto = &p, .pc = 3 };
+    // A fresh registry has no capacity anywhere, so attach allocates the id
+    // index, the batch scratch, the anchor map and the cache, in that order.
+    // Fail each in turn.
+    for (0..4) |fail_index| {
+        var registry = TraceRegistry.init(testing.allocator);
+        defer registry.deinit();
+        const t = try anchoredCandidate(&registry, &p, anchor.pc, true);
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        registry.gpa = failing.allocator();
+        const gen = registry.cache_gen;
+        try testing.expectError(error.OutOfMemory, registry.attach(t));
+        try testing.expect(failing.has_induced_failure);
+        registry.gpa = testing.allocator;
+        try testing.expectEqual(gen, registry.cache_gen);
+        try testing.expectEqual(@as(usize, 0), registry.cache.items.len);
+        try testing.expectEqual(@as(usize, 0), registry.countAt(anchor));
+        try testing.expectEqual(@as(u32, 0), registry.by_anchor.count());
+        try testing.expectEqual(@as(?*Trace, null), registry.traceById(t.id));
+        // Nothing was half-applied: a retry succeeds and the registry owns t.
+        try registry.attach(t);
+        try expectAnchorList(&registry, anchor, &.{t});
+        try testing.expect(registry.innerRootAt(anchor));
+        try testing.expectEqual(t, registry.traceById(t.id).?);
+        try testing.expect(registry.batch_scratch.capacity >= registry.cache.items.len);
+    }
+}
+
+test "registry: every cached trace is in the id index and batch scratch covers the cache" {
     const testing = std.testing;
     var registry = TraceRegistry.init(testing.allocator);
     defer registry.deinit();
-    try registry.cache.ensureTotalCapacity(testing.allocator, 3);
-    try registry.batch_scratch.ensureTotalCapacity(testing.allocator, 3);
-    try registry.by_anchor.ensureTotalCapacity(testing.allocator, 3);
     const first = try emptyCandidate(&registry);
     const middle = try emptyCandidate(&registry);
     const last = try emptyCandidate(&registry);
-    var storage: [0]u8 = .{};
-    var failing = std.heap.FixedBufferAllocator.init(&storage);
-    registry.gpa = failing.allocator();
-    // Cache, anchor index and batch scratch have capacity; only the optional
-    // identity index needs allocation.
-    registry.publish(first) catch unreachable;
-    registry.publish(middle) catch unreachable;
-    registry.publish(last) catch unreachable;
-    registry.gpa = testing.allocator;
-    try testing.expectEqual(@as(usize, 0), registry.trace_by_id.items.len);
+    for ([_]*Trace{ first, middle, last }) |t| {
+        try registry.publish(t);
+        try testing.expect(registry.batch_scratch.capacity >= registry.cache.items.len);
+    }
     try testing.expectEqual(first, registry.traceById(first.id).?);
+    const middle_id = middle.id;
     try testing.expect(registry.retire(middle));
     try testing.expectEqual(first, registry.cache.items[0]);
     try testing.expectEqual(last, registry.cache.items[1]);
+    try testing.expectEqual(@as(?*Trace, null), registry.traceById(middle_id));
     try testing.expectEqual(last, registry.traceById(last.id).?);
+    try testing.expectEqual(@as(?*Trace, null), registry.traceById(last.id + 100));
 }

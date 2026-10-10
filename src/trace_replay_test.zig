@@ -2302,6 +2302,7 @@ test "driveChain ordinary_header: chains at the anchor, not a guard's lane ordin
             .entry_slots = &entry_a,
             .entry_guards = &.{},
         },
+        .id = 1,
     };
 
     // Decoy trace anchored at pc 2 — a plain counting loop that, if (wrongly)
@@ -2327,6 +2328,7 @@ test "driveChain ordinary_header: chains at the anchor, not a guard's lane ordin
             .entry_slots = &entry_b,
             .entry_guards = &.{},
         },
+        .id = 2,
     };
 
     try state.registry.attach(trace_a);

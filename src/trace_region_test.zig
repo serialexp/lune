@@ -1134,11 +1134,14 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
 
     // Re-discovery with fresh physical ids must replace, not retain, descriptor
     // storage. Corrupt the old proof first; the rebuilt same logical RegionId restores it.
+    // Ids are indexed at attach, so the records re-attach under the new ids.
     def.bridges[0].invariant_slots[1] = 99;
+    state.registry.detachAll();
     cont.id = 11;
     skip.id = 12;
     sibling.id = 13;
     ext.id = 14;
+    for ([_]*Trace{ &cont, &skip, &sibling, &ext }) |t| try state.registry.attach(t);
     state.rebuildEdgeCache();
     state.rebuildRegions();
     def = state.region_policy.region_defs.getPtr(rid).?;

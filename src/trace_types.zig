@@ -329,6 +329,31 @@ fn hashExit(h: *std.hash.Wyhash, exit: ExitProvenance) void {
 /// down properly.
 pub const AnchorKey = struct { proto: *const Proto, pc: u32 };
 
+/// Hash context for `AnchorKey` maps. These are probed on every tier-0
+/// back-edge and return (`hasTrace`, the gate map), so the key gets a
+/// two-multiply mix rather than `AutoContext`'s Wyhash pass over its bytes.
+/// Pointer-based like `AutoContext` and `hotIndex`: the maps are
+/// runtime-only state and traces are output-transparent, so the address
+/// dependence changes timing, never results. The final xor-shift spreads the
+/// product's high bits into the low bits the table indexes with; the high 7
+/// bits stay strong for the metadata fingerprint.
+pub const AnchorKeyContext = struct {
+    pub fn hash(_: AnchorKeyContext, k: AnchorKey) u64 {
+        var h: u64 = @intFromPtr(k.proto);
+        h ^= @as(u64, k.pc) *% 0x9E3779B97F4A7C15;
+        h *%= 0xD6E8FEB86659FD93;
+        return h ^ (h >> 32);
+    }
+    pub fn eql(_: AnchorKeyContext, a: AnchorKey, b: AnchorKey) bool {
+        return a.proto == b.proto and a.pc == b.pc;
+    }
+};
+
+/// An unmanaged hash map keyed by `AnchorKey` (see `AnchorKeyContext`).
+pub fn AnchorMap(comptime V: type) type {
+    return std.HashMapUnmanaged(AnchorKey, V, AnchorKeyContext, std.hash_map.default_max_load_percentage);
+}
+
 /// Maximum nesting of inlined Lua calls a single trace may carry (cross-frame
 /// tracing). Bounds the recorder's grown `reg_map` window and the depth of leaf
 /// inlining. Down-recursion (the same proto re-inlined) is Phase 3; until then a

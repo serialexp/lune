@@ -39,7 +39,7 @@ pub const View = struct {
     /// Trace id → index into `traces` (the first record carrying the id).
     by_id: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     /// Anchors where some record has `inner_root`.
-    inner_roots: std.AutoHashMapUnmanaged(AnchorKey, void) = .empty,
+    inner_roots: types.AnchorMap(void) = .empty,
 
     pub fn init(scratch: std.mem.Allocator, traces: []const TraceRecord, sibling_links: []const SiblingLink) !View {
         var v: View = .{ .traces = traces, .sibling_links = sibling_links };

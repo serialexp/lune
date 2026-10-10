@@ -44,13 +44,20 @@ conversational, and only their findings are kept here.
    and `build` is per-component with an O(1) enclosing test, a dominance
    envelope and a BFS closure. R(T) at N=4000 went from 92 ms to 3.0 ms.
 
-## Missing tests — open (tracked in CURRENT_TASK.md)
+## Missing tests
 
-The following are not yet written:
+Written: the drain order after a batch retirement (restore before install,
+id order, several traces per anchor, both wake kinds), in
+`trace_entrypatch_test.zig`.
+
+Writing it turned up that the drain's `batch_scratch` capacity was
+reserved only by `publish`. `attach` now owns every cache invariant (id
+index, batch scratch, anchor list) all-or-nothing, and `traceById` lost
+its linear fallback.
+
+Still open (tracked in CURRENT_TASK.md):
 - parked proofs intact before R, dropped after R;
 - promoted sets demoted;
-- drain order (restore before install, id order, several traces per
-  anchor, both wake kinds);
 - region index OOM;
 - real finalize/commit of a side recording after its parent retires;
 - identity maps (`PendingStore.tab_obj`, `callee_global_dedup`,

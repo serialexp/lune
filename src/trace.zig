@@ -158,6 +158,7 @@ const DescentFailCarry = trace_types.DescentFailCarry;
 pub const ProgramPoint = trace_types.ProgramPoint;
 pub const StructuralEdgeId = trace_types.StructuralEdgeId;
 pub const AnchorKey = trace_types.AnchorKey;
+pub const AnchorMap = trace_types.AnchorMap;
 pub const exitOrder = trace_types.exitOrder;
 
 pub const RegionId = trace_region.RegionId;
@@ -721,7 +722,7 @@ const HOTCOUNT_SIZE = 1 << HOTCOUNT_BITS;
 const GATE_SKIP: u16 = 64;
 
 /// Hash `(proto, pc)` into a hot-count slot. Pointer-based, like the existing
-/// `AutoHashMap(AnchorKey, …)` keys — trace timing already varies across runs by
+/// `AnchorMap` keys (`AnchorKeyContext`) — trace timing already varies across runs by
 /// address, which is sound because the trace cache is runtime-only state (never
 /// serialized) and traces are output-transparent (== tier-0). A collision only
 /// changes *which* back-edges take the slow path, never the result.
@@ -938,7 +939,7 @@ pub const TraceState = struct {
     /// preserving the arm-at-`hotloop` timing exactly. A gated anchor's count is
     /// coarse (the pre-filter skips most of its back-edges), which is fine — the
     /// gate's own cooldown is driven by `tick`, not this.
-    counters: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
+    counters: AnchorMap(u32) = .empty,
     /// Monotonic global back-edge tick. Incremented on *every* back-edge in the
     /// dispatch loop — including ones the hot-count pre-filter skips — so it is the
     /// one clock that never freezes. The gate's `retry_at` cooldown is measured in
@@ -1063,7 +1064,7 @@ pub const TraceState = struct {
     /// window, and after `config.max_strikes` escalations it is abandoned for
     /// good. A loop that was only *temporarily* unstable (type-unstable early,
     /// then settled) recovers; see `isGated` / `gateAnchor`.
-    gate: std.AutoHashMapUnmanaged(AnchorKey, Gate) = .empty,
+    gate: AnchorMap(Gate) = .empty,
     /// Doc 31 D1: anchors currently held off *recording* (never dispatch) with
     /// the same doubling cooldown. Set on recording aborts and commit
     /// failures — LuaJIT's `penalty_pc` analog: a failed recording backs off
@@ -1072,7 +1073,7 @@ pub const TraceState = struct {
     /// (`recordingBarred`); dispatch consults only `gate`. At `max_strikes`
     /// the anchor is permanently record-blacklisted (survives trace
     /// retirement — accepted `penalty_pc` blacklist semantics, doc 31 §3).
-    record_gate: std.AutoHashMapUnmanaged(AnchorKey, Gate) = .empty,
+    record_gate: AnchorMap(Gate) = .empty,
     /// Doc 38: per-anchor count of `loop_leave` aborts (a while/repeat root
     /// recording that observed its own loop's exit direction). Below
     /// `config.lleave_fast_retries` the abort is a silent retry (no record-gate
@@ -1080,7 +1081,7 @@ pub const TraceState = struct {
     /// gate strikes resume AND `recWhileLink`'s innerloopleft check lets an
     /// enclosing root unroll it. Reset wholesale with the gates (epoch
     /// boundary) so a freed proto's key never lingers.
-    lleave_count: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
+    lleave_count: AnchorMap(u32) = .empty,
     /// Doc 38 unroll-first policy: per-OUTER-anchor count of proven unroll
     /// failures — a root recording that unrolled an inner while and then
     /// aborted, or a committed unrolled root whose anchor got gated for
@@ -1094,7 +1095,7 @@ pub const TraceState = struct {
     /// the escape for trip variance unrolling cannot cover (nsieve-bit-fp:
     /// decomposition 4x faster than failed unrolling). Reset wholesale with
     /// the gates (epoch boundary).
-    unroll_fail: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
+    unroll_fail: AnchorMap(u32) = .empty,
     /// Doc 43 P5 (the read-routing memo): anchors where a recording aborted
     /// `.upvalue_mutable` — a `set_upval` hit a cell whose value the same
     /// recording had already baked into the per-entry snapshot. The gated
@@ -1104,7 +1105,7 @@ pub const TraceState = struct {
     /// the LuaJIT-flavoured penalty/retry answer to doc 43 §8's open question.
     /// Grows monotonically (an anchor set is never cleared: the loop's shape
     /// is lexical); bounded by the number of distinct upvalue-mutating loops.
-    upvalue_mutable_memo: std.AutoHashMapUnmanaged(AnchorKey, void) = .empty,
+    upvalue_mutable_memo: AnchorMap(void) = .empty,
     /// Doc 45 D2 (deterministic re-recording): anchors whose recording met a
     /// bytecode that needs per-instruction precise deopt (`new_table` today).
     /// The `.needs_precise` cancel memoizes here without a gate strike and
@@ -1114,7 +1115,7 @@ pub const TraceState = struct {
     /// never keyed by addresses, so it replays byte-identically. Grows
     /// monotonically like `upvalue_mutable_memo` (lexical loop shape),
     /// bounded by the number of distinct constructing anchors.
-    precise_anchor_memo: std.AutoHashMapUnmanaged(AnchorKey, PreciseAnchorMemo) = .empty,
+    precise_anchor_memo: AnchorMap(PreciseAnchorMemo) = .empty,
     /// A1' (task 27): number of anchors whose memo currently has
     /// `ordinary_probe` set. Steady-state fast reject for the patched-entry
     /// probe check (`ordinaryProbeNeeded`): one branch on this counter
@@ -1124,7 +1125,7 @@ pub const TraceState = struct {
     /// Re-entry penalty per anchor: a low-yield trace entry bumps it, a
     /// productive one clears it (doc 31 D2); at `config.max_penalty` the anchor
     /// is gated off with a doubling cooldown (`onSideExit` → `gateAnchor`).
-    penalty: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
+    penalty: AnchorMap(u32) = .empty,
     region_policy: @import("trace_region_policy.zig").RegionPolicy = .{},
     /// Total trace entries executed (incremented in the dispatch loop before each
     /// `irinterp.execute`/native run). Diagnostic only — used to confirm the gate
@@ -1456,7 +1457,7 @@ pub const TraceState = struct {
     /// to a specific source region. Populated only when `config.coverage`; freed in
     /// `deinit`. `AnchorCoverage` fields mirror the aggregates above, partitioned by
     /// anchor.
-    coverage: std.AutoHashMapUnmanaged(AnchorKey, AnchorCoverage) = .empty,
+    coverage: AnchorMap(AnchorCoverage) = .empty,
     /// The in-progress recording (at most one at a time).
     rec: RecordingSession = .{},
     /// Reusable SSA-value scratch for the tier-1a executor (`irinterp.execute`),
@@ -3202,7 +3203,7 @@ pub const TraceState = struct {
     /// (capped at `backoff_max`), and after `max_strikes` the anchor is
     /// abandoned for good. Deterministic — keyed only on the monotonic
     /// back-edge tick. Returns null on OOM (gate simply not escalated).
-    fn bumpGateEntry(self: *TraceState, map: *std.AutoHashMapUnmanaged(AnchorKey, Gate), anchor: AnchorKey, reason: GateReason) ?*Gate {
+    fn bumpGateEntry(self: *TraceState, map: *AnchorMap(Gate), anchor: AnchorKey, reason: GateReason) ?*Gate {
         const gop = map.getOrPut(self.gpa, anchor) catch return null;
         if (!gop.found_existing) {
             gop.value_ptr.* = .{ .retry_at = 0, .window = self.config.backoff_base, .strikes = 0, .reason = reason };
