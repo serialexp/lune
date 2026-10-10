@@ -40,6 +40,10 @@ as they land; move bullets to Done once everything inside them is checked.
     native slots, dependency index), finished before the memory is freed;
   - batched retirement;
   - a mass-retirement benchmark.
+
+  **The design (§7.1 rev 3) is approved by codex and antigravity**
+  (2026-10-10; receipts in `docs/reviews/doc61/phaseQ-rev1.md`). Codex's
+  rev 3 should-fixes are folded in. Implementation is next.
 - [ ] **Phase V — visualiser labels dead slots.** Its liveness source must be
       tier-identical data. Options are an exported per-frame live mask in the
       snapshot, or `reg_live` re-derived from the proto and the frame
@@ -1077,6 +1081,394 @@ sound under the conditions stated.
 **Decision (Bart, 2026-10-09): (a).** It lands as Phase Q, before Phase 1,
 with its own design section and review. (a)'s conditions above are its
 acceptance criteria.
+
+### 7.1 Phase Q design (rev 3, 2026-10-10)
+
+Rev 2 was approved by antigravity; codex returned REVISE. Rev 3 makes
+these changes:
+- the retirement budget is now stated as O(T + L + P + E + D) plus one
+  commit-equivalent R(T); R's own superlinearity goes to TODO.md;
+- the bulk entry-patch drain and slot teardown are now specified;
+- the recorder's id keys are separate from tropt's pointer key, and
+  `PendingStore.tab_obj` is covered;
+- the exec-log history policy is new, along with a wire `id`;
+- wants are cleared;
+- the contract-ownership funnel is new;
+- all scratch is reserved at commit.
+
+Rev 1 was reviewed by codex and antigravity (both REVISE,
+`docs/reviews/doc61/phaseQ-rev1.md`). Rev 2 makes these changes:
+- the sweep predicate is now exact;
+- the recording cancel no longer goes through `abort()`;
+- the borrowed contract is now an owned copy;
+- the recorder's dedup maps are keyed by id;
+- retirement is done in one bulk pass;
+- the exec-log policy is new;
+- the determinism claim is narrowed to tier identity;
+- the tests and benchmarks are wider.
+
+**The hazard is live on HEAD, from plain Lua, without masking.**
+
+```lua
+local function f()
+  local n = 0
+  for i = 1, 2000 do local s = tostring(7) n = n + #s end
+  return n
+end
+print(f())
+for k = 1, 5000 do local junk = {} end
+local again = tostring(7)
+print({})
+```
+
+Tier-0 prints `table: 0x146e`; `--trace` and `--jit-native` print `0x146d`.
+After `f` returns, `"7"` is reachable only from the trace pool, which the root
+walk (item 5) marks, so the JIT legs never re-intern it. (The earlier
+`/tmp/tconst.lua` kept the string in a dead main-frame register, which every
+tier roots today. That is why it did not diverge.) This is the Phase Q test.
+
+**Facts the design rests on.** Each was audited with file:line in the
+2026-10-09 code map.
+
+- **F1. Heap constants in trace pools are interned strings only.** They are
+  appended in two places: `konst()` (`trace_recorder.zig:1783`) and
+  `recCalleeGlobal` (`:5582`). The kinds are:
+  - proto string literals (`load_const`);
+  - read-only `internedLookup` folds: `math.type`, `type`, scalar `tostring`;
+  - runtime pattern pins (`patternArgPin`, the gmatch step);
+  - callee global names.
+
+  Function identity is pinned by proto id, builtins by tag, and lanes by
+  `GcHeader.id`. Optimizer folds produce only numbers and bools. Pools are
+  never compacted, so a dead `konst` can leave a heap constant in the pool.
+- **F2. Every heap pointer a trace bakes into native code or reads at run
+  time comes from its pool,** or from a VM-permanent root (globals,
+  metamethod names). Native code bakes these pointers at a lazy compile: the
+  `sgmatch` pattern, the `guard_sid` expected pointer, `konst` imm64 values,
+  snapshot/adapter immediates, and `resolveHashCell` keys. Tier-1a and entry
+  seeding read `consts[i]` at run time. Entry seeding also reads proto
+  constants, closures, upvalues and table cells (`interp.zig:1198`). Those
+  are reached through the activation being entered and re-seeded on every
+  entry, so nothing about them is persisted past it.
+- **F3. Collection runs only at the tier-0 dispatch safepoint
+  (`gcTrampoline`) or from `mh_collect`.** `mh_collect` can be called by the
+  host outside any run, or by a host function called from tier-0. Neither
+  path runs while a trace is on the native stack, inside tier-1a `execute`,
+  or inside a replay walk:
+  - traces never call host code or metamethods;
+  - callouts allocate but never collect;
+  - replay walks run no tier-0.
+- **F4. Interned strings are already weak.** The intern table is not a root,
+  and `sweep` unlinks dead strings. A string that is unreachable but not yet
+  swept is still found by `internedLookup`. So a trace that hands a pooled
+  string back to the guest between collections does exactly what tier-0's
+  re-intern would: return the same object.
+
+**Design.**
+
+1. **The pools stop being `.gc` roots.** Item 5 drops the
+   `registry.cache[*].code.consts` and `rec.consts` loops. The `.snapshot`
+   walk already excludes them.
+2. **Invalidate between mark and sweep.** `Vm.collect` becomes
+   `beginCollect → roots → traceAll → invalidateDeadTraceConsts → sweep`.
+   - **The predicate is the sweep's own:** `Heap.willFree(h)` =
+     `h.color == .white and !h.flags.pinned` (`gc.zig:757`). That makes the
+     check exact. White alone is not enough: loaded-chunk constants are
+     pinned but never marked (`interp.zig:896`), so a plain white test would
+     retire every trace over a `load`ed chunk on every cycle (both reviewers,
+     rev 1).
+   - Each cached trace whose `heap_consts` names a header that `willFree`
+     accepts is marked doomed.
+   - **An active recording is cancelled when either holds:**
+     - `rec.consts` names a header that `willFree` accepts;
+     - its `pending_link_close` borrows from a doomed trace (but see item 4:
+       the borrow is removed).
+
+     Cancellation is a new `RecordingSession.cancel(reason)` with `realAbort`
+     semantics (`trace_recorder.zig:1148`). It deactivates unconditionally,
+     resets the scratch and syncs `TraceState`'s recording bit. It does
+     **not** go through `abort()`, because `abort()` (`:982`) can rewind an
+     in-progress link peel into a `.link` close that keeps the pool (codex
+     rev 1 blocker 1). The reason is `const_swept`.
+
+   No trace or recorder pointer to a swept string survives into the sweep.
+   By F2 nothing else in a trace can dangle.
+3. **`heap_consts` is built from the final, complete pool.** At finalize,
+   after tropt, every pool index holding a heap value goes into
+   `TraceCode.heap_consts: []u32`, freed in `TraceCode.deinit`. That covers
+   `konst` users, `guard_sid`/`sgmatch` operands, and `callee_global` keys,
+   which have no `konst` instruction. The index type is `u32` because
+   `maxrecord` is a `u32`. A "live `konst` users only" refinement is
+   rejected: serializers and non-`konst` consumers read the whole pool
+   (codex rev 1). The scan costs O(traces + heap constants), one colour read
+   each, and replaces item 5's marking of the same headers.
+4. **Remove the recorder's lifetime borrows.**
+   - **`PendingLinkClose.contract` becomes an owned copy** of the inner
+     root's `entry_guards` (a few entries), freed with the session. Today it
+     borrows `Trace.code.entry_guards` on the premise that nothing evicts
+     during recording (`trace_recorder.zig:304`), and a collection mid-peel
+     now can (codex rev 1 blocker 2). With the copy, a doomed inner root
+     needs no recorder action at all.
+   - **The recorder's identity keys use `GcHeader.id`, not the address.**
+     These are `konst_map`'s heap keys, `callee_global_dedup`,
+     `upvalue_cell_classes`, `snapshot_read_cells`, and
+     `PendingStore.tab_obj` (`trace_recorder.zig:378`), which is compared at
+     array and hash forwarding (`:2336`, `:2429`). Codex checked each one:
+     none of them needs the address to get a pointer back. The pool keeps
+     the value, and the access paths re-resolve cells. Ids are monotonic and
+     never reused, so address reuse after any sweep cannot alias two
+     identities within one recording. Each id is captured when the entry is
+     recorded, never by dereferencing a header later.
+   - **The recorder gets its own id-based key; the optimizer keeps its
+     pointer key.** The shared `konstKey` (`trace_ir.zig:33`) also serves
+     tropt, whose test passes two distinct raw headers with id 0
+     (`tropt.zig:1361`). tropt runs synchronously, with no collection inside
+     it, so pointer identity stays sound there.
+   - **Ownership of the contract copy** goes through a single
+     `clearPendingLinkClose()` funnel, which frees the copy. Every path that
+     clears `pending_link_close` today (`trace_recorder.zig:3632` and the
+     others) uses it: peel close, zero-trip, rewind, cancel, reset, deinit,
+     and setup failure. A leak-checked test drives each path.
+   - **A side recording whose parent retires mid-recording keeps going.**
+     `side_src` is an `ExitKey`, and `finishSideTraceProvenance`
+     (`trace.zig:3881`) already tolerates a missing parent: the child
+     commits without the provenance edge. This is a valid child, not an
+     orphan hazard.
+   - **Pending wants and recording requests sourced from a doomed trace are
+     cleared in the bulk pass (item 5, step 3).** `side_want_src`,
+     `head_want_src`, `prime_want_src`, `pending_exit_src` and
+     `pending_replay_src` are carried into recordings without resolving
+     their source (`trace.zig:3337`, `trace_link.zig:292`). Clearing them
+     means no recording is started from a retired exit.
+5. **Bulk retirement: `TraceState.removeTraces(doomed)`.** Calling
+   `removeTrace` once per trace is Θ(N²) even with one graph rebuild: each
+   call repeats the cache searches, `countTracesAt` and the link and
+   provenance scans (codex rev 1 blocker 4). The bulk path instead:
+   1. returns early on an empty set; most collections doom nothing;
+   2. writes the doomed `*Trace`s into the reserved scratch list (item 6),
+      sets a `doomed` bit on each, and records each anchor. The list keeps
+      the pointers alive until step 6, even after the cache is compacted;
+   3. **the teardown pass:**
+      - one pass each over armed links (`resetLinksTouchingSet`), parked
+        proofs, promoted sets and `provenance_edges` drops everything that
+        touches a doomed trace;
+      - one pass over the want/request maps clears the entries whose source
+        is doomed (item 4);
+      - slots on surviving parents are rewritten to `shared_exit` through
+        the existing `commitSlotMutation` funnel, after the proofs are
+        dropped, using a bulk variant of `prepareSlotMutation` that skips
+        its per-mutation parked-proof rescan (`trace_native_registry.zig:610`):
+        the proof pass already established that no proof touches these
+        slots;
+
+      physical teardown completes before any endpoint is freed;
+   4. compacts `registry.cache` once (an order-preserving filter, not
+      `swapRemove`), nulls `trace_by_id`, and marks entry patches non-live
+      and pending;
+   5. reopens anchors: one pass over the survivors counts traces per
+      recorded doomed anchor (a hash map with reserved capacity), then the
+      zero-count anchors reset their counter and coverage flag;
+   6. destroys the doomed records;
+   7. runs `syncNativeInvalidation` once, then `rebuildEdgeCache` and
+      `rebuildRegions` once each (fail-closed to empty on OOM, as today);
+   8. **a bulk entry-patch drain.** Today `drainEntryPatchWork`
+      (`trace_link.zig:2534`) scans the surviving cache for every
+      `unpatchSlot` and every pending install. The bulk drain keeps the
+      current semantics exactly:
+      - it restores every pending unpatch before any installation;
+      - it installs in ascending trace-id order;
+      - owner lookup goes by trace id;
+      - waiter wakeup covers both capacity suppression and incumbent-slot
+        suppression (`trace_entry_registry.zig:202`).
+
+      Only the lookups change. It builds one anchor → id-sorted list of
+      surviving traces (several traces can share an anchor) and an id →
+      trace index, once each. `resolvePatchPc` (`trace_entry_registry.zig:105`)
+      scans proto bytecode for loop anchors, so its result is cached on the
+      entry patch when the patch is created. The drain then does no bytecode
+      work.
+
+   **Budget.** Steps 1–6 and 8 are O(T + L + P + E + D + X), where T is
+   surviving traces, L armed links, P parked proofs and promoted-set
+   members, E provenance edges and wants, D doomed traces, and X entry-patch
+   records plus the dropped logs' events and string bytes. Step 7 is
+   **one** run of the existing graph rebuild, R(T). Today every trace commit
+   already pays R(T) (`trace.zig:4028`). So a non-empty collection costs at
+   most one commit-equivalent rebuild, whatever D is, and an empty one costs
+   nothing.
+
+   R(T) itself is superlinear (codex rev 2):
+   - `topologyView` calls `hasInnerRootAt` per trace, which is a cache scan
+     (`trace_link.zig:832`), and successor resolution scans again (`:889`);
+   - `buildEdges` matches exit facts pairwise (`trace_region_topology.zig:59`);
+   - region construction rescans edges per component and in its liveness
+     propagation (`trace_region_topology_build.zig:213`, `:297`, `:755`).
+
+   That cost is a pre-existing property of the commit path. Phase Q reuses
+   the existing rebuild algorithm once per non-empty batch: a new call site,
+   but without the per-doomed-trace multiplier. Usable performance is still
+   established by measurement before landing (Rule #20): total collection
+   latency, and repeated retirement/re-recording churn. An unacceptable
+   result means more work before Phase Q lands. It is tracked as its own item
+   (TODO.md: indexed trace/anchor lookup, direct exit-fact matching,
+   component-local adjacency). The benchmark reports R separately, so its
+   scaling stays visible.
+
+   No guest or trace code runs inside the transaction (F3), so nothing reads
+   a half-torn graph. `removeTrace(t)` becomes the one-element case. The
+   widen-eviction loops (`interp.zig` ~4385/5191/5482) move to the bulk call.
+
+   `registry.retire` already panics inside a replay walk. By F3 that cannot
+   happen at a collection, and `invalidateDeadTraceConsts` asserts it
+   anyway. The pending arm requests resolve through `traceById` and drop
+   themselves when it returns null (`trace.zig:1917`,
+   `trace_regionops.zig:824`). Wants and recording requests are cleared in
+   step 3, because they don't resolve. Active side recordings continue
+   (item 4). Entry patches
+   clear `live` before destruction, and the patched handlers recover through
+   the non-live path (`trace_entry_registry.zig:180`). `EntryPatch.trace` is
+   poisoned on retire.
+6. **Collection never allocates for the doomed set.** All bulk scratch is
+   reserved at commit time, which already allocates: the doomed-pointer
+   list, the anchor list, and the anchor-count map, with capacity ≥
+   `registry.cache.len`. That includes the bulk drain's anchor index. A
+   commit that cannot reserve fails like any other commit OOM, before the
+   trace is published.
+   Graph rebuilds keep their existing fail-closed OOM behaviour. The OOM rule
+   is unchanged: `beginCollect` can still skip a cycle before anything is
+   coloured.
+7. **Execution logs stop borrowing and stop using cache indices.** Today
+   `ExecLogRecorder.value()` keeps raw string `Value`s
+   (`execlog.zig:160`), which `execlogser` dereferences later (the WASM
+   visualiser path, `wasm_entry.zig:662`). The logs are also keyed by cache
+   index (`traceIndex`, `trace.zig:2529`), which any `swapRemove` reshuffles.
+   Both are pre-existing, since widen-eviction already retires, but pool
+   weakness makes the first one reachable for previously protected
+   constants (codex rev 1 blocker 3). The policy:
+   - **Owned bytes.** Every string a log keeps copies its bytes at log time:
+     `value`, `guardPass` and `exit` events (`execlog.zig:160`). A
+     successful append transfers the bytes into the completed log, whose
+     deinit and reset free them. Abandoned scratch and events free their
+     own bytes. On either failure, the byte copy or the event-array append,
+     the event is dropped and nothing leaks. The logs are only on when
+     instrumented.
+   - **Stable identity.** Logs key on `Trace.id`. The trace wire schema
+     (`schema/trace.json`, `traceser.encodeFile`) gains an `id` field, and
+     the visualiser joins logs to trace records by id instead of by
+     position.
+   - **History.** A retired trace's log is dropped in the bulk pass (step
+     3). WASM emits only surviving trace records (`wasm_entry.zig:658`), so
+     an orphaned log could never be shown, and keeping a retired trace's
+     artifact would need owned pool bytes for no consumer today. Archiving
+     retired traces is a possible visualiser feature for later, not a
+     Phase Q requirement.
+   - Re-rooting log strings is rejected, because it would bring back
+     tier-dependent liveness.
+8. **Determinism.** Collection points and colours are tier-identical, because
+   guest allocation is. So the set of objects freed is now identical in every
+   tier, which is the point. Invalidation affects only JIT state (which
+   traces exist and which anchors re-record), which is outside every
+   determinism contract. Retiring a trace is a cache decision like the
+   existing widen-eviction. **The claim is tier identity only.** Replay
+   across a keyframe cut taken between "a string became unreachable" and
+   "the sweep freed it" is not established. The snapshot omits the
+   unreachable-but-unswept string, so after restore a re-intern allocates
+   where the uninterrupted run gets an intern hit (codex rev 1 blocker 5).
+   That happens in tier-0 alone and predates Phase Q. It is tracked
+   separately (TODO.md, with options) and is not a Phase Q acceptance
+   criterion.
+
+**Costs.**
+- One colour read per heap constant per collection, replacing the marks.
+- Retirement churn when a pooled string dies. A pattern string rebuilt per
+  outer iteration retires and re-records its loop's trace. Tier-0 pays the
+  same re-intern, so this is a tiering cost, not a semantic one.
+- A heap constant left in the pool by a dead `konst` still dooms its trace.
+  That is conservative, not unsound (item 3).
+
+**Benchmarks (Rule #20).** `collectgarbage` is not implemented, so the
+mass-retirement benchmark is a release-only Zig benchmark driven through
+`mh_collect`/`Vm.collect`, following the `bench_topology.zig` pattern and
+run deliberately, never in the gate. It builds the traces through the
+embedding API, then times only the collection. It covers:
+- N ∈ {250, 1000, 4000} traces, each over its own runtime-built pattern;
+- all doomed, versus 10% doomed with 90% surviving. The 10% case keeps the
+  large surviving cache that exposes R(T);
+- plain caches, versus caches with armed links, promoted sets and parked
+  proofs;
+- many distinct anchors, many small cyclic components, many exits per
+  trace, long sibling chains, and many entry patches.
+
+It reports total collection latency, plus the retirement steps (1–6 and 8)
+and R(T) each timed separately. A repeated sparse retirement against a large
+surviving cache measures churn. R is compared with a commit's rebuild on an
+equivalent graph: the same traces, exits, cyclic components, sibling
+relations and persistent region state, not merely the same T.
+
+Structural counts are asserted in tests, not timed: retirements = doomed,
+graph rebuilds = 1 per non-empty collection, 0 per empty one, and per-step
+scan and lookup counters stay ≤ c·(T + L + P + E + D). Budgets:
+- the retirement steps grow linearly: a 4× size step stays within 4× ±25%
+  time;
+- a non-empty collection's R(T) is within noise of one commit's rebuild at
+  the same T.
+
+The `str_*` board rows must not regress beyond noise (pins and folds still
+apply while their strings live).
+
+**Tests.**
+- The program above, as a 10-leg `expectProgram` differential (identical
+  printed ids). It is mutation-checked: re-adding the item-5 pool roots must
+  fail it.
+- A pattern-pin variant (`string.find` with a pattern built per call that
+  dies between calls), and a gmatch variant.
+- **Pinned survival:** a trace over a `load`ed chunk's string constant
+  survives many collections. Mutation: a white-only predicate must fail it.
+- A shared constant across two traces dooms both. A non-`konst` dependency
+  (a `callee_global` key) dooms its trace. With partial retirement, the
+  survivors are untouched.
+- **Recorder:**
+  - a collection that sweeps a recording's const cancels it with
+    `const_swept`, including with `pending_link_close` active mid-peel;
+  - a collection mid-peel that dooms the inner root leaves the peel valid,
+    because the contract is owned;
+  - id-keyed dedup maps and `PendingStore.tab_obj`: a sweep followed by
+    address reuse within one recording does not merge identities;
+  - tropt's pointer `konstKey` still keeps equal-id distinct headers apart
+    (`tropt.zig:1361`);
+  - every `clearPendingLinkClose` path frees the owned contract (the leak
+    checker).
+- **Side recording:** the parent retires mid-recording, the child commits
+  without its provenance edge, and pending arms or wants naming the parent
+  drop cleanly.
+- **`mh_collect`** from a host callback, and from a callback's nested Lua
+  run, dooms a patched trace. Re-entry through the patched loop recovers via
+  the non-live path.
+- **Bulk retirement:** after a mass invalidation, every surviving trace's
+  slot that targeted a doomed trace points at `shared_exit`, `trace_by_id`
+  is null, and the graph caches equal a fresh rebuild. An OOM injected into
+  the rebuild fails closed to empty.
+- **Exec logs:** serialization after a sweep, after retirement, and after a
+  re-record reads owned bytes for all three string-bearing event kinds. It
+  joins logs to records by `Trace.id`, and drops a retired trace's log.
+- **Bulk drain and teardown:** with partial retirement over many entry
+  patches and many surviving parked proofs, the per-step counters stay
+  linear. Surviving proofs are intact right after the bulk teardown,
+  before R runs. After R, the existing rebuild behaviour holds: R drops all
+  parked proofs and demotes promoted sets (`trace_native_registry.zig:595`).
+  The drain restores every unpatch before installing, installs in id order,
+  and handles several traces per anchor.
+- **Retired wants:** a want or recording request whose source exit was
+  retired is cleared, and no recording starts from it.
+- **Lazy compile after a sweep:** a committed but uncompiled trace whose
+  constant died is retired before `nativeFor` can bake the pointer.
+
+**Out of scope, noted (TODO.md).**
+- `releaseChunk` (`interp.zig:871`) leaves traces anchored in the released
+  protos, with raw `anchor.proto` pointers, until the next epoch. This is a
+  separate dangling hazard, with no production caller of `retainChunk`
+  today. It can use `removeTraces`.
+- The keyframe/unswept-intern replay gap (item 8).
 
 ## 8. Tests (pinned before the code they cover lands)
 

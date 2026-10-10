@@ -95,6 +95,51 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       sunk stores, carried homes, snapshot), or refuse such sources, and pin
       it with a test. Queued right after doc 61 Phase 0 lands.
 
+## Keyframe cut before a sweep loses an intern hit on restore (noted 2026-10-10)
+
+- [ ] **Pre-existing, tier-0 alone (codex, doc 61 Phase Q rev 1 blocker
+      5).** A string can be unreachable but not yet swept, and
+      `internedLookup` still finds it (`gc.zig:567`). `encodeSnapshot`
+      (`keyframeser.zig:322`) serializes only reachable objects. So a cut in
+      that window, followed by a re-intern, gets a hit in the uninterrupted
+      run but allocates a new id after restore (`next_obj_id` is preserved,
+      `:636`). Options:
+      - (a) serialize the intern table's unswept strings too. GC timing is
+        tier-identical, so the bytes stay mode-invariant;
+      - (b) collect at every capture, in record and in normal runs alike.
+        This changes GC timing whenever capture is on;
+      - (c) make interning never hit a white string. That needs a mark-state
+        query between collections, so it is likely infeasible.
+
+      Needs a repro test first, then a decision from Bart.
+
+## Region graph rebuild R(T) is superlinear in traces and exits (noted 2026-10-10)
+
+- [ ] Every trace commit (`trace.zig:4028`) runs `rebuildEdgeCache` plus
+      `rebuildRegions`. Codex's doc 61 Phase Q rev 2 review found
+      superlinear work inside:
+      - `topologyView` → `hasInnerRootAt`, a cache scan per trace
+        (`trace_link.zig:832`);
+      - successor resolution scans (`:889`);
+      - the topology view's linear `traceById` (`trace_region_topology.zig:37`);
+      - `buildEdges`' pairwise exit-fact match (`:59`);
+      - per-component edge rescans and liveness propagation
+        (`trace_region_topology_build.zig:213`, `:297`);
+      - the sibling closure (`:755`).
+
+      Fix with indexed trace/anchor lookup, direct exit-fact matching and
+      component-local adjacency. Measure with `zig build bench-topology` and
+      Phase Q's retirement benchmark, which reports R(T) on its own.
+
+## `releaseChunk` leaves traces over released protos (noted 2026-10-10)
+
+- [ ] `releaseChunk` (`interp.zig:871`) only drops the proto from
+      `retained_chunks`. Cached traces keep raw `anchor.proto` pointers, and
+      `.global` seeds read `proto.constants` at entry, until the next epoch
+      clears the cache. There is no production caller of `retainChunk`
+      today. Fix with doc 61 Phase Q's `removeTraces`, retiring every trace
+      anchored in the released proto tree.
+
 ## `{f()}` keeps only the first result (noted 2026-10-09)
 
 - [ ] **A call as the last item of a table constructor is truncated to
