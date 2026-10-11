@@ -39,8 +39,9 @@ pub const Table = struct {
     /// mapping, doc 18; for a grid the extent field counts ROWS), stored in the
     /// narrowest **lane** the contents fit (a boolean bitmap, packed ints, packed
     /// floats, or full `Value`s) — see `array.zig`. The lane is an in-memory
-    /// optimisation only: every reader goes through `array.get`/`set` and sees
-    /// logical `Value`s, and the lane is never serialised.
+    /// optimisation: every reader goes through `array.get`/`set` and sees
+    /// logical `Value`s. Keyframes still carry it (doc 61 Phase K), because
+    /// the lane decides later grid inflation and so later allocations.
     array: ArrayPart = .empty,
     /// Hash part: every key not in the array part.
     hash: Map = .empty,
@@ -55,8 +56,9 @@ pub const Table = struct {
     /// rehash — instead we recompute the array/hash split when the hash-part
     /// population crosses this threshold, doubling it each time (`rehash`).
     /// This keeps the O(n) rehash work amortised O(1) per insert.
-    /// Default-initialised, so `create`/`initBare`/restore need no extra
-    /// wiring; it only gates an optimisation, never correctness.
+    /// Default-initialised, so `create`/`initBare` need no extra wiring. It is
+    /// observable, though: it decides where a later integer key lands, and so
+    /// `#t` and `next` order. Keyframes carry it (doc 61 Phase K).
     rehash_threshold: usize = 4,
     /// Grid hysteresis (doc 14, Phase 4b). `true` once this table has been ruled
     /// out as a flattened grid — either a `Heap.inflateToGrid` scan found it
@@ -64,10 +66,10 @@ pub const Table = struct {
     /// structural store, or a type-changing cell store). The fused `set_index2`
     /// store path skips the (potentially O(cells)) inflation scan while this is set,
     /// so each table is scanned at most once and a just-deflated grid is never
-    /// immediately re-inflated (no inflate/deflate thrash). Never serialised: it
-    /// only gates an in-memory optimisation, and grid vs. nested are byte-identical
-    /// in logical values, so a restored table re-deciding from `false` is sound
-    /// (doc 14 §Determinism gate). Default `false`; `create`/restore need no wiring.
+    /// immediately re-inflated (no inflate/deflate thrash). Keyframes carry it
+    /// (`HeapTable.flags` bit 1, doc 61 Phase K): it decides later inflation, and
+    /// inflation allocates, so a restored table re-deciding from `false` would
+    /// shift later object ids. Default `false`; `create` needs no wiring.
     no_grid: bool = false,
 
     /// The hash part's concrete type — mahina's OWN extern-layout map
@@ -360,8 +362,8 @@ pub const Table = struct {
                 // unwind the seed with `resize(0)` (a shrink: allocation-free,
                 // punches the tail back to holes) so the untouched hash entries
                 // remain the table's truth; the lane commit may survive the
-                // unwind, but lane state is never serialized and the part stays
-                // retryable.
+                // unwind (it holds every value, and a keyframe carries it as
+                // it is) and the part stays retryable.
                 const absorb0: ?Value = if (self.hash.count() != 0) self.hash.get(Value.int(0)) else null;
                 try self.array.seedAt(gpa, i, val);
                 if (absorb0) |v0| {
@@ -587,7 +589,8 @@ pub const Table = struct {
         // fresh table could otherwise be milked for. `repack` is OOM-safe and
         // leaves `self` untouched on failure, so `frozen` is set only after it
         // succeeds (a retried rehash re-attempts the commit). A pure in-memory
-        // change — invisible to `get`/keyframes (see `array.zig`).
+        // change, invisible to `get` (see `array.zig`). Keyframes carry the
+        // lane and the commitment (doc 61 Phase K).
         //
         // Freeze **only** when we actually commit to a narrow lane. If `optimalLane`
         // returns `.value` (the array is empty, heterogeneous, or heap-bearing at

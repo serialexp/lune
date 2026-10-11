@@ -103,7 +103,7 @@ fn replayProbe(gpa: std.mem.Allocator, source: [:0]const u8, stop_after: u64) !R
             const frame = &vm.frames[vm.depth - 1];
             const proto = frame.closure.proto;
             if (frame.pc < proto.spans.len) {
-                line = compiler.lineFromOffset(source, proto.spans[frame.pc].start);
+                line = proto.spans[frame.pc].line;
             }
         },
         .finished => finished = true,
@@ -133,7 +133,6 @@ fn recordSafepointLines(gpa: std.mem.Allocator, source: [:0]const u8) ![]u32 {
     var sink_buf: [1024]u8 = undefined;
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
-    vm.source = source;
     vm.setRecordSafepointLines(true);
 
     var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
@@ -262,7 +261,7 @@ test "replay: backtraceFrames reports a deepest-first chain at a suspend inside 
 
     var arena_inst = std.heap.ArenaAllocator.init(gpa);
     defer arena_inst.deinit();
-    const frames = try vm.backtraceFrames(source, arena_inst.allocator());
+    const frames = try vm.backtraceFrames(arena_inst.allocator());
     // Deepest-first: inner (leaf), outer, main.
     try testing.expectEqual(@as(usize, 3), frames.len);
     try testing.expectEqualStrings("inner", frames[0].name);

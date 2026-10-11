@@ -859,6 +859,15 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             },
             else => {},
         }
+        // A grid gstore raises its row's logical length as `gridSet` does
+        // (`row_len[row0] = max(row_len[row0], col)`), so it reads the garow
+        // token (row0) and the column ref through its gcell, neither of which
+        // `operandReads` sees. Keep both live to the store.
+        if (ins.op == .gstore) {
+            const gcell_ins = t.instrs[ins.a];
+            if (last_use[gcell_ins.a] < i) last_use[gcell_ins.a] = @intCast(i);
+            if (last_use[gcell_ins.b] < i) last_use[gcell_ins.b] = @intCast(i);
+        }
         // ssub (doc 24 c3) and scp (doc 26) read a THIRD operand — the
         // end-index ref in `aux` — which `operandReads`' two-field shape
         // cannot express. Extend its liveness here, exactly as the dyn-href

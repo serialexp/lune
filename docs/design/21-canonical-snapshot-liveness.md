@@ -2,9 +2,9 @@
 
 Status: design APPROVED (codex gpt-5.6-sol round 3, 2026-08-15, after REVISE
 rounds folding B-1..B-6 + M-1..M-4); Phase A LANDED — §R3 green with the full
-JIT; Phase B (mid-flight masking) deliberately deferred
+JIT; Phase B (mid-flight masking) subsumed by doc 61 Phase K (2026-10-11)
 Owner: Bart + agents
-Last updated: 2026-08-15
+Last updated: 2026-10-11
 
 ## Implementation status
 
@@ -39,10 +39,14 @@ as they land; move bullets to Done once everything inside them is checked.
 
 ### Outstanding
 
-- [ ] **Phase B — mid-flight statement-frontier masking (enhancement,
-      separately gated).** `Proto.stmt_frontier` with max-merge collision
-      rule + CFG-edge verification + release-mode fail-safe; only lands with
-      its own §T-B matrix. Not needed for §R3; do not bundle with Phase A.
+- [x] **Phase B — mid-flight masking. Subsumed by doc 61 Phase K
+      (2026-10-11):** a mid-flight keyframe tombstones every register
+      outside the collector's keep set (bytecode liveness per frame shape,
+      doc 61 §4), and `objects` is the whole heap, so nothing is walked from
+      the registers. The statement-frontier design below is not built.
+      (Original: `Proto.stmt_frontier` with max-merge collision rule +
+      CFG-edge verification + release-mode fail-safe; only lands with its own
+      §T-B matrix.)
 
 ## Why this exists
 

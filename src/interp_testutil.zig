@@ -123,7 +123,6 @@ pub fn runCapturedTuned(
     var vm = try Vm.init(gpa);
     defer vm.deinit();
     vm.out = sink;
-    vm.source = source; // back located error messages (error level prefix, faults)
     vm.heap.gc_stress = stress;
     vm.trace.config.enabled = mode != .off;
     vm.trace.config.execute = mode == .record_execute or mode == .record_execute_noopt or mode == .record_execute_native;

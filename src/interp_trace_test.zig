@@ -542,7 +542,6 @@ test "doc 24 c4: observation blackout — an armed safepoint recorder keeps allo
     var vm = try Vm.init(gpa);
     defer vm.deinit();
     vm.setRecordSafepointLines(true);
-    vm.source = source;
     vm.trace.config.enabled = true;
     vm.trace.config.execute = true;
     vm.trace.config.optimize = true;
@@ -1979,7 +1978,8 @@ test "chunk rooting: appendLoadedChunk pins constants (survive GC without per-cy
     _ = try vm.run(cc.proto); // stress GC — survives via the pin alone
     try testing.expect(vm.heap.internedLookup("pinnedlit") != null);
 
-    // The .gc walk must NOT enumerate the pinned constant; .snapshot must.
+    // The root walk must NOT enumerate the pinned constant: the pin alone keeps
+    // it. (A keyframe carries it because it carries every unswept object.)
     const Counter = struct {
         target: *object.GcHeader,
         hits: usize = 0,
@@ -1988,17 +1988,16 @@ test "chunk rooting: appendLoadedChunk pins constants (survive GC without per-cy
         }
     };
     var gc_count: Counter = .{ .target = &lit.header };
-    vm.forEachRootHeader(.gc, null, &gc_count, Counter.cb);
+    vm.forEachRootHeader(&gc_count, Counter.cb);
     try testing.expectEqual(@as(usize, 0), gc_count.hits);
-    var snap_count: Counter = .{ .target = &lit.header };
-    vm.forEachRootHeader(.snapshot, null, &snap_count, Counter.cb);
-    try testing.expect(snap_count.hits > 0);
 }
 
 test "chunk rooting: releaseChunk preserves survivor order (orderedRemove, not swapRemove)" {
     // Root-discovery order = retain order (docs/design/03), so releasing a NON-last
     // borrow must keep the survivors' relative order: releasing X from [X,Y,Z] leaves
-    // [Y,Z]. A `swapRemove` would leave [Z,Y] and shift snapshot bytes.
+    // [Y,Z]. A `swapRemove` would leave [Z,Y]. (Keyframes no longer depend on root
+    // order — they serialize the whole heap by id, doc 61 Phase K — but the
+    // retain list stays ordered so mark order stays a function of host actions.)
     const gpa = testing.allocator;
     const parser = @import("parser.zig");
     const diag = @import("diag.zig");
@@ -5758,10 +5757,10 @@ test "descent gate publication (doc 54 P0): prepareNativeEpisode computes descen
     try testing.expectEqual(@as(u8, 1), ctx.descent_ok);
 
     // Published final cut → closed; nulled → open.
-    vm.final_cut = .{ .result_base = 0, .result_count = 0, .stack_top = 0 };
+    vm.setFinalCut(.{ .result_base = 0, .result_count = 0, .stack_top = 0 });
     vm.prepareNativeEpisode(cl, &proto, 0);
     try testing.expectEqual(@as(u8, 0), ctx.descent_ok);
-    vm.final_cut = null;
+    vm.setFinalCut(null);
     vm.prepareNativeEpisode(cl, &proto, 0);
     try testing.expectEqual(@as(u8, 1), ctx.descent_ok);
 }

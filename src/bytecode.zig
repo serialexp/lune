@@ -592,14 +592,18 @@ pub const RegLiveness = struct {
     }
 };
 
+/// A half-open `[start, end)` byte range into the original source, plus the
+/// 1-based source line containing `start` (0 = unknown, e.g. a default span).
+/// The compiler stamps `line` once, so every runtime reader (errors,
+/// backtraces, the replay line index, the disassembly export) is O(1) instead
+/// of rescanning the source. Mirrors `ast.Span`'s range, redeclared here so
+/// bytecode does not depend on `ast`.
+pub const Span = struct { start: u32 = 0, end: u32 = 0, line: u32 = 0 };
+
 /// A function prototype: the immutable compiled form of one function body (the
 /// main chunk is just the top-level prototype). A runtime *closure* (Increment D)
 /// pairs a `Proto` with captured upvalues; the `Proto` itself is shared and
 /// constant.
-/// A half-open `[start, end)` byte range into the original source. Mirrors
-/// `ast.Span`'s shape, redeclared here so bytecode does not depend on `ast`.
-pub const Span = struct { start: u32 = 0, end: u32 = 0 };
-
 pub const Proto = struct {
     /// Instruction stream.
     code: []const Instr,
@@ -656,14 +660,6 @@ pub const Proto = struct {
     /// uses it to correlate a trace with its proto's disassembly. Defaults to 0
     /// so hand-built test protos compile; the compiler overwrites it.
     id: u32 = 0,
-    /// Source text this proto was compiled from, used by the runtime-error path
-    /// (`callSiteAt`/`describeFault`/`backtraceFrames`) to turn a span offset into
-    /// a line number. The whole proto tree of one chunk shares one source slice.
-    /// Defaults empty (hand-built protos / IR paths); the error path falls back to
-    /// `vm.source` when empty. For a runtime-`load`ed chunk this points at the
-    /// VM-owned source copy, so loaded code reports its *own* line numbers rather
-    /// than the main chunk's. Borrows the buffer (which outlives the proto).
-    source: []const u8 = "",
 };
 
 // ---------------------------------------------------------------------------

@@ -401,7 +401,7 @@ fn guestFault(box: *VmBox, entry_depth: u32, entry_top: usize, err: interp.Error
     // a host fn, so the surviving frame was in flight at entry, and an error
     // only ever leaves flags set.
     std.debug.assert(entry_depth == 0 or vm.frames[entry_depth - 1].in_flight);
-    vm.final_cut = null;
+    vm.retireFinalCut();
     return .err_runtime;
 }
 
@@ -412,7 +412,7 @@ fn renderFault(box: *VmBox, err: interp.Error) void {
     const vm = &box.vm;
     var arena = std.heap.ArenaAllocator.init(box.backing);
     defer arena.deinit();
-    const fault = vm.describeFault("", err, arena.allocator()) catch {
+    const fault = vm.describeFault(err, arena.allocator()) catch {
         setLastError(box, @errorName(err));
         return;
     };

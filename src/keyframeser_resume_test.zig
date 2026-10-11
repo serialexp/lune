@@ -128,9 +128,9 @@ fn expectResume(gpa: std.mem.Allocator, source: [:0]const u8, ctl: SuspendCtl, r
 
     // (d) state equivalence: the resumed VM's final snapshot matches the
     // uninterrupted run's. Identical because ids are assigned deterministically
-    // and these corpus programs leak no pre-suspend garbage (no heap object is
-    // created then dropped before the cut), so the restored id counter resumes
-    // exactly where the reference run's did.
+    // and the keyframe carries the whole unswept heap, the id counter and the
+    // collection threshold (doc 61 Phase K), so the resumed run allocates,
+    // collects and interns exactly as the reference run did from the cut on.
     const final_snap_r = try encodeSnapshot(gpa, vm_r);
     defer gpa.free(final_snap_r);
     try testing.expectEqualSlices(u8, ref.final_snap, final_snap_r);
@@ -225,11 +225,9 @@ const f2c_corpus = [_][:0]const u8{
     ,
     // A homogeneous-numeric matrix that inflates to a **grid** (doc 14) and stays
     // live across both loops, so a mid-run cut almost always lands while `m` is a
-    // grid. Capture deflates the grid to logical nested rows with reserved-space
-    // ids (Phase 7); this case is the proof that those ids are a pure function of
-    // logical state — the resumed run re-inflates and re-captures to a
-    // BYTE-IDENTICAL final snapshot (invariant (d)) despite the phantom rows. All
-    // arithmetic is numeric, so nothing heap is created-then-dropped before a cut.
+    // grid. The keyframe carries the grid physically (doc 61 Phase K) and capture
+    // leaves it untouched; the resumed run continues on the restored grid and
+    // re-captures to a BYTE-IDENTICAL final snapshot (invariant (d)).
     \\local function grid()
     \\  local m = {{1,2,3,4},{5,6,7,8},{9,10,11,12},{13,14,15,16}}
     \\  for i = 1, 4 do
@@ -410,15 +408,20 @@ test "§R3: capture→restore→resume with tracing+opt+native — restored narr
     try testing.expectEqualSlices(u8, ref.final_snap, final_snap_r);
 }
 
-test "§R3: failing-allocator restore during the bulk lane repack leaks nothing" {
-    // Doc 18 §T (§R3 additions): a mid-repack OOM must leak neither the original
-    // `.value` buffer nor the partial narrow buffers (the `errdefer` chain in
-    // the restore path). `checkAllAllocationFailures` fails every allocation in
-    // turn; `std.testing.allocator` then asserts no leak and no invalid free.
+test "§R3: failing-allocator restore during the array-part lane and grid rebuild leaks nothing" {
+    // Doc 18 §T (§R3 additions): a mid-conversion OOM must leak neither the
+    // appended buffer nor the partial target-lane buffers (the `errdefer`
+    // chain in the restore path), and a mid-grid OOM nothing of the grid's
+    // three buffers (doc 61 Phase K). `checkAllAllocationFailures` fails every
+    // allocation in turn; `std.testing.allocator` then asserts no leak and no
+    // invalid free.
     const gpa = testing.allocator;
     const source =
         \\t = {}
         \\for i = 1, 64 do t[i] = i end
+        \\t[3] = 1000
+        \\m = {{1, 2}, {3, 4}}
+        \\m[1][1] = 5
         \\print(#t)
     ;
     var diags = Diagnostics.init(gpa);
@@ -434,8 +437,10 @@ test "§R3: failing-allocator restore during the bulk lane repack leaks nothing"
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
-    // The snapshot's `t` restores via the bulk narrow-lane rebuild (append as
-    // `.value`, then `optimalLane` → `repack` → frozen).
+    // `t` restores by append, then a conversion to its widened captured lane;
+    // `m` restores as a grid.
+    const m_val = vm.globals.get(try vm.heap.internValue("m"));
+    try testing.expect(table.Table.fromHeader(m_val.asHeap()).array.isGrid());
     const snap = try encodeSnapshot(gpa, &vm);
     defer gpa.free(snap);
 
@@ -582,7 +587,9 @@ test "A-iii: recursive live frames re-key deterministically across keyframe rest
 
 /// Two single-register closures sharing one proto, restored with the given
 /// second-frame base over `stack`.
-fn expectTwoFrameWindowError(second_base: u32, stack: []const schema.SnapValue) !void {
+const nil_reg = util.reg(sNil());
+
+fn expectTwoFrameWindowError(second_base: u32, stack: []const schema.StackValue) !void {
     const code = [_]bytecode.Instr{bytecode.Instr.opAB(.halt, 0, 0)};
     const consts = [_]value.Value{};
     const rootp = Proto{
@@ -597,8 +604,9 @@ fn expectTwoFrameWindowError(second_base: u32, stack: []const schema.SnapValue) 
             .globals_id = 9,
             .string_metatable_id = 0,
             .next_obj_id = 10,
+            .next_gc = 1024,
             .objects = &.{
-                .{ .id = 9, .obj_type = 1, .body = .{ .HeapTable = .{ .array = &.{}, .entries = &.{}, .metatable_id = 0 } } },
+                .{ .id = 9, .obj_type = 1, .body = .{ .HeapTable = .{ .array = &.{}, .entries = &.{}, .metatable_id = 0, .lane = 0, .flags = 0, .rehash_threshold = 4, .grid = &.{} } } },
                 .{ .id = 0, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = rootp.id, .upvalue_ids = &.{} } } },
                 .{ .id = 1, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = rootp.id, .upvalue_ids = &.{} } } },
             },
@@ -618,11 +626,11 @@ test "doc 61 P1: an overlapping frame window is rejected (FrameWindowMismatch)" 
     // The second window starts inside the first: resume would read the wrong
     // registers. (A gap is legal since doc 61 P1: a callee whose dynamic
     // argument span ran past its caller's window sits above that span.)
-    try expectTwoFrameWindowError(0, &.{ sNil(), sNil(), sNil() });
+    try expectTwoFrameWindowError(0, &.{ nil_reg, nil_reg, nil_reg });
 }
 
 test "doc 61 P1: a frame window past the captured stack is rejected (FrameWindowMismatch)" {
-    try expectTwoFrameWindowError(3, &.{ sNil(), sNil(), sNil() });
+    try expectTwoFrameWindowError(3, &.{ nil_reg, nil_reg, nil_reg });
 }
 
 test "doc 61 P1: a callee laid above a dynamic argument span round-trips through a keyframe" {
@@ -677,12 +685,13 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
             .globals_id = 9,
             .string_metatable_id = 0,
             .next_obj_id = 10,
+            .next_gc = 1024,
             .objects = &.{
-                .{ .id = 9, .obj_type = 1, .body = .{ .HeapTable = .{ .array = &.{}, .entries = &.{}, .metatable_id = 0 } } },
+                .{ .id = 9, .obj_type = 1, .body = .{ .HeapTable = .{ .array = &.{}, .entries = &.{}, .metatable_id = 0, .lane = 0, .flags = 0, .rehash_threshold = 4, .grid = &.{} } } },
                 .{ .id = 0, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = rootp.id, .upvalue_ids = &.{} } } },
                 .{ .id = 1, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = rootp.id, .upvalue_ids = &.{} } } },
             },
-            .stack = &.{ sNil(), sNil(), sNil() },
+            .stack = &.{ nil_reg, nil_reg, nil_reg },
             .frames = &.{
                 .{ .closure_id = 0, .pc = 0, .base = 1, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 }, // must be 0
                 .{ .closure_id = 1, .pc = 0, .base = 2, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 },
@@ -804,10 +813,11 @@ test "doc 24 c4 (arc-B acceptance): allocating snew/tostr loop — cross-tier fi
     try testing.expect(ref_file.keyframe.next_obj_id > 1000);
 }
 
-test "doc 21 §T-A.3: result span preserved; dead-slot-only garbage excluded from the snapshot walk" {
+test "doc 21 §T-A.3: result span preserved; dead slots tombstoned, their garbage still carried" {
     const gpa = testing.allocator;
-    // `hidden`'s only reference is a dead local at the final state — semantic
-    // garbage; the returned table rides the result span and must survive.
+    // `hidden`'s only reference is a dead local at the final state: its slot
+    // is a tombstone, but the table is unswept, so the keyframe carries it
+    // (doc 61 Phase K: the whole heap). The returned table rides the span.
     const source =
         \\local hidden = {11, 22}
         \\return {1, 2}
@@ -833,26 +843,158 @@ test "doc 21 §T-A.3: result span preserved; dead-slot-only garbage excluded fro
     const file = try schema.SnapshotFile.decode(arena.allocator(), snap);
     const kf = file.keyframe;
 
-    // The span slot is a heap ref; every other stack slot is canonical nil.
+    // The span slot is a heap ref; every other stack slot is a tombstone.
     for (kf.stack, 0..) |sv, idx| {
         if (idx == fc.result_base) {
             try testing.expect(sv.body == .HeapRef);
         } else {
-            try testing.expectEqual(@as(u8, 0), sv.tag); // nil
+            try testing.expect(sv.body == .DeadSlot);
         }
     }
-    // The returned {1,2} is in the walk; hidden {11,22} is not.
+    // Both tables are carried: {1,2} through the span, {11,22} as garbage.
     var saw_returned = false;
+    var saw_hidden = false;
     for (kf.objects) |obj| {
         if (obj.body != .HeapTable) continue;
         const t = obj.body.HeapTable;
         for (t.array) |av| {
             if (av.body != .ConstInt) continue;
             if (av.body.ConstInt.v == 1) saw_returned = true;
-            try testing.expect(av.body.ConstInt.v != 11); // hidden excluded
+            if (av.body.ConstInt.v == 11) saw_hidden = true;
         }
     }
     try testing.expect(saw_returned);
+    try testing.expect(saw_hidden);
+
+    // Restore re-derives the cut from the tombstones, so recapture is the
+    // identity and the slots come back nil.
+    const vm_r = try restore(gpa, snap, chunk.proto, NativeRegistry.base());
+    defer {
+        vm_r.deinit();
+        gpa.destroy(vm_r);
+    }
+    const fc_r = vm_r.final_cut orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(fc.result_base, fc_r.result_base);
+    try testing.expectEqual(fc.result_count, fc_r.result_count);
+    for (0..vm_r.stack_top) |idx| {
+        if (idx != fc.result_base) try testing.expect(vm_r.regGet(idx).isNil());
+    }
+    const snap_r = try encodeSnapshot(gpa, vm_r);
+    defer gpa.free(snap_r);
+    try testing.expectEqualSlices(u8, snap, snap_r);
+
+    // A later collection roots the same slots in both VMs (`Vm.fillKeep`
+    // honours the cut), so `hidden` is swept in each and the heaps stay
+    // identical (Codex review of doc 61 Phase K).
+    const before = vm.heap.object_count;
+    vm.collect();
+    vm_r.collect();
+    try testing.expect(vm.heap.object_count < before);
+    try testing.expectEqual(vm.heap.object_count, vm_r.heap.object_count);
+    const snap_gc = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(snap_gc);
+    const snap_gc_r = try encodeSnapshot(gpa, vm_r);
+    defer gpa.free(snap_gc_r);
+    try testing.expectEqualSlices(u8, snap_gc, snap_gc_r);
+}
+
+test "doc 61 Phase K: a host call after a final cut leaves the source and a restored VM identical" {
+    // A host reentry retires the cut and reuses the stack. If it only dropped
+    // the cut, the collector would root the whole old prefix again: the
+    // source still holds `hidden` there, the restored VM nil (Codex
+    // re-review). Retiring nils the dead slots first.
+    const gpa = testing.allocator;
+    const source =
+        \\local hidden = {11, 22}
+        \\return {1, 2}
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try mahina_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expect(vm.final_cut != null);
+
+    const snap = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(snap);
+    const vm_r = try restore(gpa, snap, chunk.proto, NativeRegistry.base());
+    defer {
+        vm_r.deinit();
+        gpa.destroy(vm_r);
+    }
+
+    for ([_]*Vm{ &vm, vm_r }) |v| {
+        const type_fn = v.globals.get(try v.heap.internValue("type"));
+        var out: [1]Value = undefined;
+        _ = try v.callValue(type_fn, &.{Value.int(1)}, &out);
+        try testing.expect(v.final_cut == null);
+        v.collect();
+    }
+    try testing.expectEqual(vm.heap.object_count, vm_r.heap.object_count);
+    const after = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(after);
+    const after_r = try encodeSnapshot(gpa, vm_r);
+    defer gpa.free(after_r);
+    try testing.expectEqualSlices(u8, after, after_r);
+}
+
+test "doc 61 Phase K: restore rejects a tombstone in any slot the restored keep set requires" {
+    // Every slot a mid-flight capture did not tombstone is in its keep set:
+    // a live operand, a varargs slot, an open upvalue's slot. Forging any one
+    // of them into a tombstone would restore it as nil (Codex review).
+    const gpa = testing.allocator;
+    const source =
+        \\local function f(...)
+        \\  local a = {...}
+        \\  local n = 0
+        \\  local function g() return n end
+        \\  for i = 1, 20 do n = n + i end
+        \\  return g() + #a
+        \\end
+        \\print(f(1, 2, 3))
+    ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try mahina_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    vm.setSuspendCtl(.{ .after_safepoints = ref.total_safepoints / 2 });
+    try testing.expect((try vm.start(chunk.proto)) == .suspended);
+    try testing.expectEqual(@as(usize, 1), vm.open_upvalues.items.len); // g's `n`
+    const mid = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(mid);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const file = try schema.SnapshotFile.decode(arena.allocator(), mid);
+    try testing.expect(file.keyframe.frames.len >= 2);
+    const stack = try arena.allocator().dupe(schema.StackValue, file.keyframe.stack);
+    var forged: usize = 0;
+    for (stack, 0..) |orig, i| {
+        if (orig.body == .DeadSlot) continue;
+        stack[i] = keyframeser.dead_slot;
+        var f = file;
+        f.keyframe.stack = stack;
+        try expectRestoreError(f, chunk.proto, error.InvalidTombstones);
+        stack[i] = orig;
+        forged += 1;
+    }
+    try testing.expect(forged > 0);
 }
 
 test "doc 21 §T-A.4: all_results finish — dynamic span past the static window is raised, rooted, captured (B-6)" {
@@ -893,7 +1035,7 @@ test "doc 21 §T-A.4: all_results finish — dynamic span past the static window
     }
     for (kf.stack, 0..) |sv, idx| {
         if (idx >= fc.result_base and idx < fc.result_base + fc.result_count) continue;
-        try testing.expectEqual(@as(u8, 0), sv.tag); // nil outside the span
+        try testing.expect(sv.body == .DeadSlot); // tombstone outside the span
     }
 }
 
@@ -950,4 +1092,104 @@ test "doc 21 §T-A.6: pcall/xpcall unwind then finish — the cut reflects the f
     try testing.expectEqual(@as(u32, @intCast(vm.stack_top)), fc.stack_top);
     const snap = try encodeSnapshot(gpa, &vm);
     gpa.free(snap);
+}
+
+test "keyframe cut before a sweep: a re-interned unreachable string keeps its id across restore" {
+    // TODO.md "Keyframe cut before a sweep loses an intern hit on restore".
+    // `mk`'s string is unreachable once its frame returns and the print
+    // arguments overwrite its slots, but no collection runs before the cut,
+    // so the intern table still holds it. The uninterrupted run's re-intern
+    // hits that object; the restored VM must hit the same id, or the final
+    // snapshot (string ids, `next_obj_id`) diverges.
+    const gpa = testing.allocator;
+    const source =
+        \\local function mk() local x = "k" .. 7 return #x end
+        \\local n = mk()
+        \\print(n, n, n, n, n, n)
+        \\local t = {}
+        \\t["k" .. 7] = n
+        \\for k, v in pairs(t) do print(k, v) end
+    ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+    // Every cut: the ones between `mk`'s return and the re-intern are the
+    // window this pins.
+    var cut: u64 = 1;
+    while (cut < ref.total_safepoints) : (cut += 1) {
+        gpa.free(try expectResume(gpa, source, .{ .after_safepoints = cut }, ref));
+    }
+}
+
+test "keyframe cut after hash deletions: pairs order and later inserts match after restore" {
+    // Restore rebuilds a hash part by insertion, without the dead nodes the
+    // uninterrupted run's deletions left (doc 49 P2b), so its physical layout
+    // differs. Iteration order and the next rehash must not.
+    const gpa = testing.allocator;
+    const source =
+        \\local t = {}
+        \\for i = 1, 24 do t["k" .. i] = i end
+        \\for i = 1, 24, 3 do t["k" .. i] = nil end
+        \\local parts = {}
+        \\for k, v in pairs(t) do parts[#parts + 1] = k end
+        \\print(table.concat(parts, " "))
+        \\for i = 25, 40 do t["k" .. i] = i end
+        \\parts = {}
+        \\for k, v in pairs(t) do parts[#parts + 1] = k end
+        \\print(table.concat(parts, " "))
+    ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+    var cut: u64 = 1;
+    while (cut < ref.total_safepoints) : (cut += 1) {
+        gpa.free(try expectResume(gpa, source, .{ .after_safepoints = cut }, ref));
+    }
+}
+
+test "keyframe cut between rehashes: later integer keys land where the uninterrupted run puts them" {
+    // Twenty sparse keys leave the rehash trigger at 34 (Table.rehash doubles
+    // it). A restore that reset it to the default 4 would rehash on `t[1]`
+    // and pull 1..3 into the array part, which reorders `pairs`. Doc 61
+    // Phase K carries the trigger (Codex review).
+    const gpa = testing.allocator;
+    const source =
+        \\local t = {}
+        \\for i = 1, 20 do t[i * 100] = i end
+        \\for i = 1, 3 do t[i] = i end
+        \\local parts = {}
+        \\for k in pairs(t) do parts[#parts + 1] = k end
+        \\print(table.concat(parts, " "), #t)
+    ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+    var cut: u64 = 1;
+    while (cut < ref.total_safepoints) : (cut += 1) {
+        gpa.free(try expectResume(gpa, source, .{ .after_safepoints = cut }, ref));
+    }
+}
+
+test "keyframe cut while a grid is live: a later deflation allocates the same ids after restore" {
+    // A fused store inflates `m` into a grid (doc 14). A cut while it is a
+    // grid must restore a grid: the uninterrupted run's later bare `m[2]`
+    // deflates it, allocating genuine row tables, so a restore that already
+    // holds nested rows would skip those allocations and shift every id after
+    // them (the printed table id shows it). Doc 61 Phase K carries the grid
+    // physically, and capture never mutates the VM.
+    const gpa = testing.allocator;
+    const source =
+        \\local m = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}}
+        \\m[1][1] = 10
+        \\local s = 0
+        \\for k = 1, 4 do s = s + m[k % 3 + 1][2] end
+        \\local r = m[2]
+        \\print(s, r[2], tostring({}))
+        \\m[3][3] = 1
+        \\m[2][2] = "x"
+        \\print(m[2][2], tostring({}))
+    ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+    var cut: u64 = 1;
+    while (cut < ref.total_safepoints) : (cut += 1) {
+        gpa.free(try expectResume(gpa, source, .{ .after_safepoints = cut }, ref));
+    }
 }

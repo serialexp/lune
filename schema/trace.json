@@ -91,6 +91,31 @@
       ]
     },
 
+    "DeadSlot": {
+      "description": "A register tombstone (doc 61 Phase K): the slot was dead at capture, so its contents are not part of the program's state. Restore writes nil.",
+      "sequence": [ { "name": "pad", "type": "uint8" } ]
+    },
+
+    "StackValue": {
+      "description": "One register in Keyframe.stack: a SnapValue (same tags and ordinals) or, at tag 255 (outside the Value.Tag space), a DeadSlot tombstone. Only the stack can hold a tombstone; heap edges are SnapValue.",
+      "sequence": [
+        { "name": "tag", "type": "uint8" },
+        {
+          "name": "body",
+          "type": "discriminated_union",
+          "discriminator": { "field": "tag" },
+          "variants": [
+            { "type": "ConstNil",   "when": "value === 0" },
+            { "type": "ConstBool",  "when": "value === 1" },
+            { "type": "ConstInt",   "when": "value === 2" },
+            { "type": "ConstFloat", "when": "value === 3" },
+            { "type": "HeapRef",    "when": "value === 4" },
+            { "type": "DeadSlot",   "when": "value === 255" }
+          ]
+        }
+      ]
+    },
+
     "TableEntry": {
       "description": "One key/value pair from a table's hash part. Array-part entries are stored positionally in HeapTable.array; everything else lands here.",
       "sequence": [
@@ -104,12 +129,26 @@
       "sequence": [ { "name": "bytes", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" } ]
     },
 
+    "GridPart": {
+      "description": "A flattened grid array part (doc 14), carried as a grid (doc 61 Phase K) so restore rebuilds the same representation. `elem` is the cell lane (array.Lane ordinal, a fixed-width bitmap lane), `stride` the cells per row, `row_len[r]` row r's logical length, and `cells` the rows*stride cells row-major, nil for a hole.",
+      "sequence": [
+        { "name": "elem",    "type": "uint8" },
+        { "name": "stride",  "type": "uint32" },
+        { "name": "row_len", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "uint32" } },
+        { "name": "cells",   "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "SnapValue" } }
+      ]
+    },
+
     "HeapTable": {
-      "description": "A table object: the dense array part (keys 0..asize-1, positionally — entry i IS logical key i, slot-0 hole included in-band; doc 18) plus the hash part (every other key; an array-covered integer key in the hash is invalid and rejected at restore). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel.",
+      "description": "A table object: the dense array part (keys 0..asize-1, positionally — entry i IS logical key i, slot-0 hole included in-band; doc 18) plus the hash part (every other key; an array-covered integer key in the hash is invalid and rejected at restore). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel. The array part's representation rides along (doc 61 Phase K), because it decides later grid inflation and so later allocations: `lane` is its array.Lane ordinal, `flags` bit 0 is `frozen` and bit 1 the table's `no_grid`. A grid (lane = grid) has an empty `array` and exactly one `grid` entry; any other lane has none. `rehash_threshold` is the hash population at which the next new integer key re-splits array and hash (Table.rehash). It depends on the table's history and decides where later keys land, which `#t` and `next` can observe, so it is carried rather than recomputed; it is always at least 4.",
       "sequence": [
         { "name": "array",        "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "SnapValue" } },
         { "name": "entries",      "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "TableEntry" } },
-        { "name": "metatable_id", "type": "uint32" }
+        { "name": "metatable_id", "type": "uint32" },
+        { "name": "lane",         "type": "uint8" },
+        { "name": "flags",        "type": "uint8" },
+        { "name": "rehash_threshold", "type": "uint64" },
+        { "name": "grid",        "type": "array", "kind": "length_prefixed", "length_type": "uint8", "items": { "type": "GridPart" } }
       ]
     },
 
@@ -184,13 +223,14 @@
     },
 
     "Keyframe": {
-      "description": "A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated-then-dropped before the cut (pre-cut garbage bumps the counter but leaves no object in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.",
+      "description": "A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.",
       "sequence": [
         { "name": "globals_id",    "type": "uint32" },
         { "name": "string_metatable_id", "type": "uint32" },
         { "name": "next_obj_id",   "type": "uint32" },
+        { "name": "next_gc",       "type": "uint64" },
         { "name": "objects",       "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "HeapObject" } },
-        { "name": "stack",         "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "SnapValue" } },
+        { "name": "stack",         "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "StackValue" } },
         { "name": "frames",        "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "FrameRef" } },
         { "name": "open_upvalues", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "OpenUpvalueRef" } },
         { "name": "loaded_chunks", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "LoadedChunk" } }

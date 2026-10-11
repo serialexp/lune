@@ -1314,6 +1314,285 @@ export class SnapValueDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
+ * A register tombstone (doc 61 Phase K): the slot was dead at capture, so its contents are not part of the program's state. Restore writes nil.
+ */
+export interface DeadSlotInput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  pad: number;
+}
+
+/**
+ * A register tombstone (doc 61 Phase K): the slot was dead at capture, so its contents are not part of the program's state. Restore writes nil.
+ */
+export interface DeadSlotOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  pad: number;
+}
+
+export type DeadSlot = DeadSlotOutput;
+
+export class DeadSlotEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: DeadSlotInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(value.pad);
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a DeadSlot value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: DeadSlot): number {
+    return 1; // pad
+  }
+}
+
+export class DeadSlotDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): DeadSlotOutput {
+    const value: any = {};
+
+    value.pad = this.readUint8();
+    return value;
+  }
+}
+
+/**
+ * One register in Keyframe.stack: a SnapValue (same tags and ordinals) or, at tag 255 (outside the Value.Tag space), a DeadSlot tombstone. Only the stack can hold a tombstone; heap edges are SnapValue.
+ */
+export interface StackValueInput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * Discriminated Union
+   * Type that can be one of several variants, chosen based on a discriminator value. Supports peek-based (read ahead) or field-based (reference earlier field) discrimination.
+   *
+   * @remarks
+   *
+   * Discriminator: field 'tag'
+   * Variants: 6
+   * - ConstNil (when value === 0)
+   * - ConstBool (when value === 1)
+   * - ConstInt (when value === 2)
+   * - ConstFloat (when value === 3)
+   * - HeapRef (when value === 4)
+   * - DeadSlot (when value === 255)
+   */
+  body: { type: 'ConstNil'; value: ConstNilInput } | { type: 'ConstBool'; value: ConstBoolInput } | { type: 'ConstInt'; value: ConstIntInput } | { type: 'ConstFloat'; value: ConstFloatInput } | { type: 'HeapRef'; value: HeapRefInput } | { type: 'DeadSlot'; value: DeadSlotInput };
+}
+
+/**
+ * One register in Keyframe.stack: a SnapValue (same tags and ordinals) or, at tag 255 (outside the Value.Tag space), a DeadSlot tombstone. Only the stack can hold a tombstone; heap edges are SnapValue.
+ */
+export interface StackValueOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * Discriminated Union
+   * Type that can be one of several variants, chosen based on a discriminator value. Supports peek-based (read ahead) or field-based (reference earlier field) discrimination.
+   *
+   * @remarks
+   *
+   * Discriminator: field 'tag'
+   * Variants: 6
+   * - ConstNil (when value === 0)
+   * - ConstBool (when value === 1)
+   * - ConstInt (when value === 2)
+   * - ConstFloat (when value === 3)
+   * - HeapRef (when value === 4)
+   * - DeadSlot (when value === 255)
+   */
+  body: { type: 'ConstNil'; value: ConstNilOutput } | { type: 'ConstBool'; value: ConstBoolOutput } | { type: 'ConstInt'; value: ConstIntOutput } | { type: 'ConstFloat'; value: ConstFloatOutput } | { type: 'HeapRef'; value: HeapRefOutput } | { type: 'DeadSlot'; value: DeadSlotOutput };
+}
+
+export type StackValue = StackValueOutput;
+
+/**
+ * Variant tags for StackValue.body
+ */
+export const enum StackValueBodyVariant {
+  ConstNil = 'ConstNil',
+  ConstBool = 'ConstBool',
+  ConstInt = 'ConstInt',
+  ConstFloat = 'ConstFloat',
+  HeapRef = 'HeapRef',
+  DeadSlot = 'DeadSlot',
+}
+
+export class StackValueEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: StackValueInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(value.tag);
+    if (value.body.type === 'ConstNil') {
+      const encoder_value = new ConstNilEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'ConstBool') {
+      const encoder_value = new ConstBoolEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'ConstInt') {
+      const encoder_value = new ConstIntEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'ConstFloat') {
+      const encoder_value = new ConstFloatEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'HeapRef') {
+      const encoder_value = new HeapRefEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'DeadSlot') {
+      const encoder_value = new DeadSlotEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type: ${(value.body as any).type}`);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a StackValue value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: StackValue): number {
+    let size = 0;
+    size += 1; // tag
+    if (value.body.type === 'ConstNil') {
+      const _enc = new ConstNilEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'ConstBool') {
+      const _enc = new ConstBoolEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'ConstInt') {
+      const _enc = new ConstIntEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'ConstFloat') {
+      const _enc = new ConstFloatEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'HeapRef') {
+      const _enc = new HeapRefEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'DeadSlot') {
+      const _enc = new DeadSlotEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type for body: ${(value.body as any).type}`);
+    }
+    return size;
+  }
+}
+
+export class StackValueDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): StackValueOutput {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    if (value.tag === 0) {
+      const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'ConstNil', value: payload };
+    }
+    else if (value.tag === 1) {
+      const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'ConstBool', value: payload };
+    }
+    else if (value.tag === 2) {
+      const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'ConstInt', value: payload };
+    }
+    else if (value.tag === 3) {
+      const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'ConstFloat', value: payload };
+    }
+    else if (value.tag === 4) {
+      const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'HeapRef', value: payload };
+    }
+    else if (value.tag === 255) {
+      const decoder = new DeadSlotDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'DeadSlot', value: payload };
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.tag}`);
+    }
+    return value;
+  }
+}
+
+/**
  * One key/value pair from a table's hash part. Array-part entries are stored positionally in HeapTable.array; everything else lands here.
  */
 export interface TableEntryInput {
@@ -1541,7 +1820,195 @@ export class HeapStringDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A table object: the dense array part (keys 0..asize-1, positionally — entry i IS logical key i, slot-0 hole included in-band; doc 18) plus the hash part (every other key; an array-covered integer key in the hash is invalid and rejected at restore). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel.
+ * A flattened grid array part (doc 14), carried as a grid (doc 61 Phase K) so restore rebuilds the same representation. `elem` is the cell lane (array.Lane ordinal, a fixed-width bitmap lane), `stride` the cells per row, `row_len[r]` row r's logical length, and `cells` the rows*stride cells row-major, nil for a hole.
+ */
+export interface GridPartInput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  elem: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  stride: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  row_len: number[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  cells: SnapValueInput[];
+}
+
+/**
+ * A flattened grid array part (doc 14), carried as a grid (doc 61 Phase K) so restore rebuilds the same representation. `elem` is the cell lane (array.Lane ordinal, a fixed-width bitmap lane), `stride` the cells per row, `row_len[r]` row r's logical length, and `cells` the rows*stride cells row-major, nil for a hole.
+ */
+export interface GridPartOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  elem: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  stride: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  row_len: number[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  cells: SnapValueOutput[];
+}
+
+export type GridPart = GridPartOutput;
+
+export class GridPartEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: GridPartInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(value.elem);
+    this.writeUint32(value.stride, "little_endian");
+    this.writeUint32(value.row_len.length, "little_endian");
+    for (let value_row_len__iter_index = 0; value_row_len__iter_index < value.row_len.length; value_row_len__iter_index++) {
+      const value_row_len__iter = value.row_len[value_row_len__iter_index];
+      this.writeUint32(value_row_len__iter, "little_endian");
+    }
+    this.writeUint32(value.cells.length, "little_endian");
+    for (let value_cells__iter_index = 0; value_cells__iter_index < value.cells.length; value_cells__iter_index++) {
+      const value_cells__iter = value.cells[value_cells__iter_index];
+      const encoder_value_cells__iter = new SnapValueEncoder();
+      const encoded_value_cells__iter = encoder_value_cells__iter.encode(value_cells__iter);
+      for (const byte of encoded_value_cells__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a GridPart value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: GridPart): number {
+    let size = 0;
+    size += 5; // elem + stride
+    // row_len: array (kind: length_prefixed)
+    for (const item of value.row_len) {
+      size += 4;
+    }
+    size += 4; // length prefix (uint32)
+    // cells: array (kind: length_prefixed)
+    for (const item of value.cells) {
+      const cells_itemEncoder = new SnapValueEncoder();
+      size += cells_itemEncoder.calculateSize(item);
+    }
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class GridPartDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): GridPartOutput {
+    const value: any = {};
+
+    value.elem = this.readUint8();
+    value.stride = this.readUint32("little_endian");
+    value.row_len = [];
+    const row_len_length = this.readUint32("little_endian");
+    for (let i = 0; i < row_len_length; i++) {
+      let row_len__iter: any;
+      row_len__iter = this.readUint32("little_endian");
+      value.row_len.push(row_len__iter);
+    }
+    value.cells = [];
+    const cells_length = this.readUint32("little_endian");
+    for (let i = 0; i < cells_length; i++) {
+      let cells__iter: any;
+      cells__iter = {};
+      cells__iter.tag = this.readUint8();
+      if (cells__iter.tag === 0) {
+        const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), cells__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        cells__iter.body = { type: 'ConstNil', value: payload };
+      }
+      else if (cells__iter.tag === 1) {
+        const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), cells__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        cells__iter.body = { type: 'ConstBool', value: payload };
+      }
+      else if (cells__iter.tag === 2) {
+        const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), cells__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        cells__iter.body = { type: 'ConstInt', value: payload };
+      }
+      else if (cells__iter.tag === 3) {
+        const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), cells__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        cells__iter.body = { type: 'ConstFloat', value: payload };
+      }
+      else if (cells__iter.tag === 4) {
+        const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), cells__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        cells__iter.body = { type: 'HeapRef', value: payload };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${cells__iter.tag}`);
+      }
+      value.cells.push(cells__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * A table object: the dense array part (keys 0..asize-1, positionally — entry i IS logical key i, slot-0 hole included in-band; doc 18) plus the hash part (every other key; an array-covered integer key in the hash is invalid and rejected at restore). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel. The array part's representation rides along (doc 61 Phase K), because it decides later grid inflation and so later allocations: `lane` is its array.Lane ordinal, `flags` bit 0 is `frozen` and bit 1 the table's `no_grid`. A grid (lane = grid) has an empty `array` and exactly one `grid` entry; any other lane has none. `rehash_threshold` is the hash population at which the next new integer key re-splits array and hash (Table.rehash). It depends on the table's history and decides where later keys land, which `#t` and `next` can observe, so it is carried rather than recomputed; it is always at least 4.
  */
 export interface HeapTableInput {
   /**
@@ -1569,10 +2036,35 @@ export interface HeapTableInput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   metatable_id: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  lane: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  flags: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  rehash_threshold: bigint;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint8
+   */
+  grid: GridPartInput[];
 }
 
 /**
- * A table object: the dense array part (keys 0..asize-1, positionally — entry i IS logical key i, slot-0 hole included in-band; doc 18) plus the hash part (every other key; an array-covered integer key in the hash is invalid and rejected at restore). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel.
+ * A table object: the dense array part (keys 0..asize-1, positionally — entry i IS logical key i, slot-0 hole included in-band; doc 18) plus the hash part (every other key; an array-covered integer key in the hash is invalid and rejected at restore). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel. The array part's representation rides along (doc 61 Phase K), because it decides later grid inflation and so later allocations: `lane` is its array.Lane ordinal, `flags` bit 0 is `frozen` and bit 1 the table's `no_grid`. A grid (lane = grid) has an empty `array` and exactly one `grid` entry; any other lane has none. `rehash_threshold` is the hash population at which the next new integer key re-splits array and hash (Table.rehash). It depends on the table's history and decides where later keys land, which `#t` and `next` can observe, so it is carried rather than recomputed; it is always at least 4.
  */
 export interface HeapTableOutput {
   /**
@@ -1600,6 +2092,31 @@ export interface HeapTableOutput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   metatable_id: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  lane: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  flags: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  rehash_threshold: bigint;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint8
+   */
+  grid: GridPartOutput[];
 }
 
 export type HeapTable = HeapTableOutput;
@@ -1634,6 +2151,18 @@ export class HeapTableEncoder extends BitStreamEncoder {
       }
     }
     this.writeUint32(value.metatable_id, "little_endian");
+    this.writeUint8(value.lane);
+    this.writeUint8(value.flags);
+    this.writeUint64(value.rehash_threshold, "little_endian");
+    this.writeUint8(value.grid.length);
+    for (let value_grid__iter_index = 0; value_grid__iter_index < value.grid.length; value_grid__iter_index++) {
+      const value_grid__iter = value.grid[value_grid__iter_index];
+      const encoder_value_grid__iter = new GridPartEncoder();
+      const encoded_value_grid__iter = encoder_value_grid__iter.encode(value_grid__iter);
+      for (const byte of encoded_value_grid__iter) {
+        this.writeUint8(byte);
+      }
+    }
     return this.finish();
   }
 
@@ -1654,7 +2183,13 @@ export class HeapTableEncoder extends BitStreamEncoder {
       const entries_itemEncoder = new TableEntryEncoder();
       size += entries_itemEncoder.calculateSize(item);
     }
-    size += 8; // length prefix (uint32) + metatable_id
+    size += 18; // length prefix (uint32) + metatable_id + lane + flags + rehash_threshold
+    // grid: array (kind: length_prefixed)
+    for (const item of value.grid) {
+      const grid_itemEncoder = new GridPartEncoder();
+      size += grid_itemEncoder.calculateSize(item);
+    }
+    size += 1; // length prefix (uint8)
     return size;
   }
 }
@@ -1784,6 +2319,65 @@ export class HeapTableDecoder extends SeekableBitStreamDecoder {
       value.entries.push(entries__iter);
     }
     value.metatable_id = this.readUint32("little_endian");
+    value.lane = this.readUint8();
+    value.flags = this.readUint8();
+    value.rehash_threshold = this.readUint64("little_endian");
+    value.grid = [];
+    const grid_length = this.readUint8();
+    for (let i = 0; i < grid_length; i++) {
+      let grid__iter: any;
+      grid__iter = {};
+      grid__iter.elem = this.readUint8();
+      grid__iter.stride = this.readUint32("little_endian");
+      grid__iter.row_len = [];
+      const grid__iter_row_len_length = this.readUint32("little_endian");
+      for (let i = 0; i < grid__iter_row_len_length; i++) {
+        let grid__iter_row_len__iter: any;
+        grid__iter_row_len__iter = this.readUint32("little_endian");
+        grid__iter.row_len.push(grid__iter_row_len__iter);
+      }
+      grid__iter.cells = [];
+      const grid__iter_cells_length = this.readUint32("little_endian");
+      for (let i = 0; i < grid__iter_cells_length; i++) {
+        let grid__iter_cells__iter: any;
+        grid__iter_cells__iter = {};
+        grid__iter_cells__iter.tag = this.readUint8();
+        if (grid__iter_cells__iter.tag === 0) {
+          const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), grid__iter_cells__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          grid__iter_cells__iter.body = { type: 'ConstNil', value: payload };
+        }
+        else if (grid__iter_cells__iter.tag === 1) {
+          const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), grid__iter_cells__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          grid__iter_cells__iter.body = { type: 'ConstBool', value: payload };
+        }
+        else if (grid__iter_cells__iter.tag === 2) {
+          const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), grid__iter_cells__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          grid__iter_cells__iter.body = { type: 'ConstInt', value: payload };
+        }
+        else if (grid__iter_cells__iter.tag === 3) {
+          const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), grid__iter_cells__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          grid__iter_cells__iter.body = { type: 'ConstFloat', value: payload };
+        }
+        else if (grid__iter_cells__iter.tag === 4) {
+          const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), grid__iter_cells__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          grid__iter_cells__iter.body = { type: 'HeapRef', value: payload };
+        } else {
+          throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${grid__iter_cells__iter.tag}`);
+        }
+        grid__iter.cells.push(grid__iter_cells__iter);
+      }
+      value.grid.push(grid__iter);
+    }
     return value;
   }
 }
@@ -2598,7 +3192,7 @@ export class LoadedChunkDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated-then-dropped before the cut (pre-cut garbage bumps the counter but leaves no object in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
  */
 export interface KeyframeInput {
   /**
@@ -2616,6 +3210,11 @@ export interface KeyframeInput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   next_obj_id: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  next_gc: bigint;
   /**
    * Array
    * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
@@ -2635,7 +3234,7 @@ export interface KeyframeInput {
    * Array kind: length_prefixed
    * Length prefix type: uint32
    */
-  stack: SnapValueInput[];
+  stack: StackValueInput[];
   /**
    * Array
    * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
@@ -2669,7 +3268,7 @@ export interface KeyframeInput {
 }
 
 /**
- * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated-then-dropped before the cut (pre-cut garbage bumps the counter but leaves no object in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
  */
 export interface KeyframeOutput {
   /**
@@ -2687,6 +3286,11 @@ export interface KeyframeOutput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   next_obj_id: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  next_gc: bigint;
   /**
    * Array
    * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
@@ -2706,7 +3310,7 @@ export interface KeyframeOutput {
    * Array kind: length_prefixed
    * Length prefix type: uint32
    */
-  stack: SnapValueOutput[];
+  stack: StackValueOutput[];
   /**
    * Array
    * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
@@ -2755,6 +3359,7 @@ export class KeyframeEncoder extends BitStreamEncoder {
     this.writeUint32(value.globals_id, "little_endian");
     this.writeUint32(value.string_metatable_id, "little_endian");
     this.writeUint32(value.next_obj_id, "little_endian");
+    this.writeUint64(value.next_gc, "little_endian");
     this.writeUint32(value.objects.length, "little_endian");
     for (let value_objects__iter_index = 0; value_objects__iter_index < value.objects.length; value_objects__iter_index++) {
       const value_objects__iter = value.objects[value_objects__iter_index];
@@ -2767,7 +3372,7 @@ export class KeyframeEncoder extends BitStreamEncoder {
     this.writeUint32(value.stack.length, "little_endian");
     for (let value_stack__iter_index = 0; value_stack__iter_index < value.stack.length; value_stack__iter_index++) {
       const value_stack__iter = value.stack[value_stack__iter_index];
-      const encoder_value_stack__iter = new SnapValueEncoder();
+      const encoder_value_stack__iter = new StackValueEncoder();
       const encoded_value_stack__iter = encoder_value_stack__iter.encode(value_stack__iter);
       for (const byte of encoded_value_stack__iter) {
         this.writeUint8(byte);
@@ -2809,7 +3414,7 @@ export class KeyframeEncoder extends BitStreamEncoder {
    */
   calculateSize(value: Keyframe): number {
     let size = 0;
-    size += 12; // globals_id + string_metatable_id + next_obj_id
+    size += 20; // globals_id + string_metatable_id + next_obj_id + next_gc
     // objects: array (kind: length_prefixed)
     for (const item of value.objects) {
       const objects_itemEncoder = new HeapObjectEncoder();
@@ -2818,7 +3423,7 @@ export class KeyframeEncoder extends BitStreamEncoder {
     size += 4; // length prefix (uint32)
     // stack: array (kind: length_prefixed)
     for (const item of value.stack) {
-      const stack_itemEncoder = new SnapValueEncoder();
+      const stack_itemEncoder = new StackValueEncoder();
       size += stack_itemEncoder.calculateSize(item);
     }
     size += 4; // length prefix (uint32)
@@ -2856,6 +3461,7 @@ export class KeyframeDecoder extends SeekableBitStreamDecoder {
     value.globals_id = this.readUint32("little_endian");
     value.string_metatable_id = this.readUint32("little_endian");
     value.next_obj_id = this.readUint32("little_endian");
+    value.next_gc = this.readUint64("little_endian");
     value.objects = [];
     const objects_length = this.readUint32("little_endian");
     for (let i = 0; i < objects_length; i++) {
@@ -2932,6 +3538,12 @@ export class KeyframeDecoder extends SeekableBitStreamDecoder {
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         stack__iter.body = { type: 'HeapRef', value: payload };
+      }
+      else if (stack__iter.tag === 255) {
+        const decoder = new DeadSlotDecoder(this.bytes.slice(this.byteOffset), stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        stack__iter.body = { type: 'DeadSlot', value: payload };
       } else {
         throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${stack__iter.tag}`);
       }
@@ -2995,7 +3607,7 @@ export interface SnapshotFileInput {
    */
   version: number;
   /**
-   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated-then-dropped before the cut (pre-cut garbage bumps the counter but leaves no object in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
    */
   keyframe: KeyframeInput;
 }
@@ -3010,7 +3622,7 @@ export interface SnapshotFileOutput {
    */
   version: number;
   /**
-   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated-then-dropped before the cut (pre-cut garbage bumps the counter but leaves no object in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
    */
   keyframe: KeyframeOutput;
 }
@@ -3065,6 +3677,7 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
     value.keyframe.globals_id = this.readUint32("little_endian");
     value.keyframe.string_metatable_id = this.readUint32("little_endian");
     value.keyframe.next_obj_id = this.readUint32("little_endian");
+    value.keyframe.next_gc = this.readUint64("little_endian");
     value.keyframe.objects = [];
     const keyframe_objects_length = this.readUint32("little_endian");
     for (let i = 0; i < keyframe_objects_length; i++) {
@@ -3141,6 +3754,12 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         keyframe_stack__iter.body = { type: 'HeapRef', value: payload };
+      }
+      else if (keyframe_stack__iter.tag === 255) {
+        const decoder = new DeadSlotDecoder(this.bytes.slice(this.byteOffset), keyframe_stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        keyframe_stack__iter.body = { type: 'DeadSlot', value: payload };
       } else {
         throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${keyframe_stack__iter.tag}`);
       }

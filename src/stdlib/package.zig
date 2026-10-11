@@ -80,7 +80,11 @@ fn requirePackageSubTable(vm: *Vm, field: []const u8, field_name: []const u8) an
         defer vm.gpa.free(msg);
         return vm.raiseLocatedError(msg, 0);
     }
-    return Table.fromHeader(sub.asHeap());
+    const t = Table.fromHeader(sub.asHeap());
+    // Gate (doc 14): `require` stores into `package.loaded` raw, and a grid
+    // takes no raw store, so a bare stdlib access deflates it first.
+    if (t.array.isGrid()) try vm.heap.deflateGrid(t);
+    return t;
 }
 
 // ---------------------------------------------------------------------------

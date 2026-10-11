@@ -282,7 +282,6 @@ fn runOutErr(gpa: std.mem.Allocator, source: [:0]const u8, out_buf: []u8, err_bu
     defer vm.deinit();
     vm.out = &out;
     vm.err = &err;
-    vm.source = source;
     try compileRun(gpa, &vm, source);
     return .{ .out = out.buffered(), .err = err.buffered() };
 }

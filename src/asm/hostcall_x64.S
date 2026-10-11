@@ -133,7 +133,8 @@ FUNC_BEGIN(mahina_hostcall_entry)
     /* ---- Pre-commit: rax, r10, r11 only; any failure is H1's call. ---- */
 
     /* The fast word (section 5.4): no recording, pending anchor or arm
-     * request, suspend cut or line index. */
+     * request, suspend cut, line index or final cut (H1 retires a final
+     * cut, nilling its dead registers, before anything pushes over them). */
     cmpw $0, VM(VM_TRACE + TRACE_FAST_BLOCK)(%rdi)
     jne SYM(mahina_hostcall_slow)
     /* A closure callee. Only the tag byte of the first word is defined. */

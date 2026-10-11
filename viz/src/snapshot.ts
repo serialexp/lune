@@ -1,7 +1,7 @@
 // Keyframe-snapshot → human-readable view, for the step-debugger's state panels.
 //
-// A replay step (`mahina_replay`) returns a whole-VM keyframe blob: the reachable
-// heap graph (id-keyed objects), the live register window, and the active frames
+// A replay step (`mahina_replay`) returns a whole-VM keyframe blob: every unswept
+// heap object (id-keyed), the live register window, and the active frames
 // (src/keyframeser.zig). This module decodes that blob with the generated
 // `SnapshotFileDecoder` and projects out the two things the UI shows directly —
 // the global environment and the deepest frame's locals — formatting each Value
@@ -25,7 +25,8 @@ export interface NamedValue {
   /** Formatted value (`42`, `"hi"`, `true`, `table#7`, …). */
   value: string;
   /** A local register no path from the pending instruction reads before
-   *  writing it. Its value is stale, or nil if a collection scrubbed it. */
+   *  writing it. The keyframe carries a tombstone for it, not a value
+   *  (doc 61 Phase K), so `value` is a placeholder. */
   dead?: boolean;
 }
 
@@ -107,10 +108,9 @@ function keyDisplay(k: SnapValueOutput, objects: Map<number, HeapObjectOutput>):
 /**
  * Decode a keyframe blob and project the globals + deepest-frame locals. Returns
  * null if the blob is empty or fails to decode (the caller then shows nothing).
- * `live` is the replay step's per-register root mask (`MahinaReplayResult.live`);
- * a local whose byte is 0 is marked `dead`. Empty marks nothing.
+ * A local whose slot is a `DeadSlot` tombstone is marked `dead`.
  */
-export function decodeSnapshot(blob: Uint8Array, live: Uint8Array = new Uint8Array(0)): SnapshotView | null {
+export function decodeSnapshot(blob: Uint8Array): SnapshotView | null {
   if (blob.length === 0) return null;
   let kf;
   try {
@@ -139,10 +139,13 @@ export function decodeSnapshot(blob: Uint8Array, live: Uint8Array = new Uint8Arr
   if (kf.frames.length > 0) {
     const base = kf.frames[kf.frames.length - 1].base;
     for (let i = base; i < kf.stack.length; i++) {
-      const reg = i - base;
-      const local: NamedValue = { label: `r${reg}`, value: valueDisplay(kf.stack[i], objects) };
-      if (reg < live.length && live[reg] === 0) local.dead = true;
-      locals.push(local);
+      const label = `r${i - base}`;
+      const sv = kf.stack[i];
+      if (sv.body.type === "DeadSlot") {
+        locals.push({ label, value: "—", dead: true });
+      } else {
+        locals.push({ label, value: valueDisplay(sv as SnapValueOutput, objects) });
+      }
     }
   }
 

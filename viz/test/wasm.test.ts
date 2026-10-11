@@ -268,7 +268,7 @@ test("replay: stepping advances the line and grows stdout; the full replay match
   expect(view!.globals.some((g) => g.label === "print")).toBe(true);
 });
 
-test("doc 61 Phase V: a replay step marks the locals no path reads again as dead", () => {
+test("doc 61 Phase K: a replay step's keyframe tombstones the locals no path reads again", () => {
   // `a` (r0) is read once, by `b = a * 2`; from then on it is dead, while
   // `b` (r1) stays live until `print(b)` reads it.
   const src = "local a = 10\nlocal b = a * 2\nprint(b)\nprint(1)\n";
@@ -281,28 +281,19 @@ test("doc 61 Phase V: a replay step marks the locals no path reads again as dead
     const step = mod.replay(src, run.effects, k);
     expect(step.status).toBe(0);
     if (step.finished) break;
-    // The top-level chunk is maskable, so every suspended step has a mask
-    // covering the whole window.
-    const disasm = run.disasm.find((p) => p.id === step.protoId)!;
-    expect(step.live.length).toBe(disasm.numRegisters);
-    if (step.live[0] === 1) {
-      expect(sawDead).toBe(false); // once dead, `a` is never read again
-      sawLive = true;
-    } else if (sawLive) {
-      sawDead = true;
-      const view = decodeSnapshot(step.keyframe, step.live)!;
-      expect(view.locals[0]).toMatchObject({ label: "r0", dead: true });
-      // The view marks exactly the zero bytes.
-      for (const [reg, local] of view.locals.entries()) {
-        expect(local.dead === true).toBe(reg < step.live.length && step.live[reg] === 0);
-      }
+    const view = decodeSnapshot(step.keyframe)!;
+    const r0 = view.locals[0];
+    if (r0.dead !== true) {
+      expect(sawDead).toBe(false); // once dead after its read, `a` stays dead
+      if (r0.value === "10") sawLive = true;
+    } else {
+      // Before `a` is assigned, r0 is dead too (written before any read).
+      if (sawLive) sawDead = true;
+      expect(r0).toMatchObject({ label: "r0", value: "—", dead: true });
     }
   }
   expect(sawLive).toBe(true);
   expect(sawDead).toBe(true);
-
-  // Past the end there is no frame, so no mask.
-  expect(mod.replay(src, run.effects, run.safepointCount + 1).live.length).toBe(0);
 });
 
 test("a run disassembles the proto tree and the replay cursor indexes it", () => {

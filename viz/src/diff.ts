@@ -164,6 +164,18 @@ export function keyframeSansArg(bytes: Uint8Array): string {
           array: t.array.map(canonSv),
           entries: t.entries.map((e: any) => ({ key: canonSv(e.key), val: canonSv(e.val) })),
           metatable: Number(t.metatable_id) > 0 ? visit(Number(t.metatable_id) - 1) : -1,
+          // The physical array part (doc 61 Phase K): lane, commitment and a
+          // live grid are state, since they decide later inflation. So is the
+          // rehash trigger, which decides where later integer keys land.
+          lane: t.lane,
+          flags: t.flags,
+          rehash_threshold: String(t.rehash_threshold),
+          grid: t.grid.map((g: any) => ({
+            elem: g.elem,
+            stride: g.stride,
+            row_len: Array.from(g.row_len),
+            cells: g.cells.map(canonSv),
+          })),
         };
         break;
       }

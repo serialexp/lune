@@ -64,6 +64,7 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
             .globals_id = 2,
             .string_metatable_id = 0,
             .next_obj_id = 8,
+            .next_gc = 1024,
             .objects = &.{
                 .{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "a\x00b\xff\xfe" } } },
                 .{ .id = 1, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "" } } },
@@ -79,6 +80,10 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
                                 .{ .key = sInt(7), .val = sRef(2) },
                             },
                             .metatable_id = 0,
+                            .lane = 0,
+                            .flags = 0,
+                            .rehash_threshold = 4,
+                            .grid = &.{},
                         },
                     },
                 },
@@ -88,7 +93,7 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
                 .{ .id = 5, .obj_type = 4, .body = .{ .HeapUpvalue = .{ .closed = 0, .value = sRef(2) } } },
                 .{ .id = 7, .obj_type = 3, .body = .{ .HeapNative = .{ .name = "print" } } },
             },
-            .stack = &.{ sRef(2), sInt(-1) },
+            .stack = &.{ util.reg(sRef(2)), util.reg(sInt(-1)), util.regDead },
             .frames = &.{
                 .{ .closure_id = 3, .pc = 7, .base = 0, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 },
                 .{ .closure_id = 6, .pc = 2, .base = 5, .ret_dest = 1, .ret_count = 1, .varargs_base = 0, .varargs_count = 0 },
@@ -134,8 +139,10 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
     try testing.expectEqualStrings("print", kf.objects[7].body.HeapNative.name);
 
     // Non-empty roots survive.
-    try testing.expectEqual(@as(usize, 2), kf.stack.len);
+    try testing.expectEqual(@as(usize, 3), kf.stack.len);
     try testing.expectEqual(@as(u32, 2), kf.stack[0].body.HeapRef.id);
+    try testing.expectEqual(keyframeser.dead_slot_tag, kf.stack[2].tag); // tombstone
+    try testing.expect(kf.stack[2].body == .DeadSlot);
     try testing.expectEqual(@as(usize, 2), kf.frames.len);
     try testing.expectEqual(@as(u32, 6), kf.frames[1].closure_id);
     try testing.expectEqual(@as(u32, 2), kf.frames[1].pc);
@@ -213,8 +220,11 @@ test "VM-driven snapshot captures a complete, non-dangling heap graph" {
                 .HeapClosure => |c| for (c.upvalue_ids) |id| try refs.append(a, id),
                 .HeapUpvalue => |u| if (refId(u.value)) |id| try refs.append(a, id),
             };
-            for (kf.stack) |v| if (refId(v)) |id| try refs.append(a, id);
+            for (kf.stack) |v| if (v.body == .HeapRef) try refs.append(a, v.body.HeapRef.id);
             for (refs.items) |id| try testing.expect(ids.contains(id));
+            // Doc 61 Phase K: every unswept object, in ascending id order.
+            for (kf.objects[1..], kf.objects[0 .. kf.objects.len - 1]) |o, prev|
+                try testing.expect(prev.id < o.id);
 
             // Graph completeness: the program leaves a table, a closure with an
             // upvalue, a native, and strings reachable from globals.

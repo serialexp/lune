@@ -41,6 +41,8 @@ pub const ArrLayout = struct {
     /// width. `@offsetOf` makes a layout churn a compile error (Z-1/Z-2).
     pub const grid_elem = arr.ArrayPart.Layout.grid_elem;
     pub const stride = arr.ArrayPart.Layout.stride;
+    /// The grid's `[*]u32` per-row logical lengths; a `gstore` raises its row's.
+    pub const row_len = arr.ArrayPart.Layout.row_len;
     /// `*Table` → embedded hash part's `size` (live entry count, u32). The grow
     /// store's `guard_append` reads this to prove the hash is empty (so tier-0's
     /// `migrateFromHash` would be a no-op). `@offsetOf` on the std map field makes a

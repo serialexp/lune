@@ -82,7 +82,7 @@ fn nTraceback(ctx: *anyopaque, args: []const Value) anyerror!Value {
     // backtraceFrames allocates the frame slice; an arena keeps it scratch.
     var arena_inst = std.heap.ArenaAllocator.init(vm.gpa);
     defer arena_inst.deinit();
-    const frames = try vm.backtraceFrames(vm.source, arena_inst.allocator());
+    const frames = try vm.backtraceFrames(arena_inst.allocator());
 
     // Skip the first `level-1` leaf frames, clamped to the frame count. Computed
     // in i64 and narrowed only once it is known to be `< frames.len`

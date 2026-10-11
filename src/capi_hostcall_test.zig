@@ -1493,6 +1493,51 @@ fn admits(box: *capi.VmBox, callee: mh_value, args: ?[*]const mh_value, nargs: u
     return chain == 1;
 }
 
+test "the .S entry defers to H1 while a run's final cut is published, and H1 nils the dead registers" {
+    // A Zig-API `run` publishes a final cut (C-API entries never do). Its
+    // dead registers still hold `hidden`. The entry would push over them
+    // and drop the cut without nilling them, so the collector would root
+    // what a restored VM holds as nil (doc 61 Phase K). The fast word's
+    // `vm_final_cut` bit sends that first call to H1, which retires the cut.
+    if (!capi.hostcall_asm) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const box = try capi.createVm(gpa, .{ .jit = 2 });
+    const src = "function p0() return 7 end\nlocal hidden = {11, 22}\nreturn 1";
+    var diags = mahina.diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try mahina.parser.parse(gpa, src, &diags);
+    defer tree.deinit();
+    var chunk = try mahina.compiler.compile(gpa, box.vm.heap, src, tree.root, &diags);
+    // The VM goes first: its closures borrow the chunk's protos.
+    defer {
+        capi.destroyVm(box);
+        chunk.deinit();
+    }
+    try testing.expect(!diags.hasErrors());
+    const vm = &box.vm;
+    _ = try vm.run(chunk.proto);
+    const fc = vm.final_cut orelse return error.TestUnexpectedResult;
+    const top = vm.stack_top;
+    var dead_refs: usize = 0;
+    for (0..top) |i| {
+        if (i != fc.result_base and vm.regGet(i).isHeap()) dead_refs += 1;
+    }
+    try testing.expect(dead_refs > 0);
+
+    var p0: mh_value = .{};
+    try testing.expectEqual(Status.ok, capi.mh_global_get(box, s("p0"), &p0));
+    var out: [1]mh_value = @splat(.{});
+    var n: usize = 0;
+    try testing.expect(!try admits(box, p0, null, 0, &out, &n));
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expect(vm.final_cut == null);
+    for (0..top) |i| {
+        if (i != fc.result_base) try testing.expect(vm.regGet(i).isNil());
+    }
+    // With the cut retired, the entry admits again.
+    try testing.expect(try admits(box, p0, null, 0, &out, &n));
+}
+
 test "the .S entry admits closure calls within its limits and falls back on everything else" {
     // Stage 2 compares the entry with H1; this pins that the comparison is
     // not H1 against itself. Each shape below is admitted or rejected by

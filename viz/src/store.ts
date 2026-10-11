@@ -376,7 +376,7 @@ export function setReplayPos(pos: number): void {
   void (async () => {
     try {
       const rs = await mahinaWorker().replay(state.replaySource, state.replayEffects!, k);
-      setState({ replayPos: clamped, replayState: rs, replayView: decodeSnapshot(rs.keyframe, rs.live) });
+      setState({ replayPos: clamped, replayState: rs, replayView: decodeSnapshot(rs.keyframe) });
     } catch (e) {
       setState({
         replayPos: clamped,

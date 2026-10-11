@@ -2,6 +2,60 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Keyframes dereference garbage closures' protos (noted 2026-10-11, needs Bart)
+
+- [ ] **Doc 61 Phase K's whole heap reaches closures whose proto may be
+      gone.** Codex review, BLOCKER 3. `toSchemaHeapObject` reads
+      `closure.proto.id` for every unswept closure. `Vm.run` documents that
+      the main closure's `proto` is only dereferenced during the call, yet
+      that closure stays on the heap until the next sweep. A host that runs
+      a chunk, frees it and then captures reads freed memory. A garbage
+      closure from another host chunk also fails restore (`UnknownProto`),
+      or binds to the root tree's proto with the same id (ids are per tree).
+      The CLI, the C API (`mh_eval` chunks are VM-owned) and the wasm entry
+      keep their chunks alive, so today this needs a Zig embedder. Options:
+      (a) the closure stores its proto id at creation, so capture never
+      dereferences, and restore binds an unresolvable closure to a detached
+      sentinel proto (garbage cannot be called, but a reachable one from an
+      unsupported chunk would no longer fail loudly); (b) tighten the
+      contract: every chunk run on a VM stays alive while the VM can capture,
+      and a keyframe covers one root tree plus loaded chunks, checked at
+      capture; (c) capture marks reachability once more, carrying garbage
+      closures without their proto. Not chosen; Bart's call.
+
+## Restore drops the PRNG state (noted 2026-10-11)
+
+- [ ] **A keyframe carries no `rng`.** Codex review of doc 61 Phase K. After
+      `math.randomseed(7)` and a draw, a cut restores with `rng == null`, so
+      the next draw asks for a fresh seed (an effect) instead of continuing
+      the seeded stream. That diverges in every mode, not only the
+      record-mode resume noted under S-C below. Fix at the keyframe layer:
+      carry the generator state (and with it the once-per-session guards),
+      with a format bump. Pre-existing.
+
+## Restored closures borrow the original proto's heap constants (noted 2026-10-11)
+
+- [ ] **Constants cross heap boundaries.** Codex review of doc 61 Phase K.
+      Restore binds closures to the supplied root tree, whose heap constants
+      (interned strings) point into the ORIGINAL VM's heap.
+      `gc.markProtoConstants` then marks those foreign headers, not their
+      restored twins, so a twin referenced only by a proto constant can be
+      swept, and the root tree's constants dangle once the original VM dies.
+      Loaded chunks avoid it by recompiling into the restored heap. Options:
+      recompile the root too, or rebind the root tree's constants to the
+      restored twins by id. Pre-existing.
+
+## Object ids wrap silently at 2³² in release builds (noted 2026-10-11)
+
+- [ ] **`Heap.link` does `next_obj_id += 1` on a `u32`.** A safety build
+      panics at 2³² allocations; ReleaseFast wraps, and the next object
+      reuses id 0, which collides with live objects (ids key table hashing
+      and keyframes). Doc 14 Phase 7's reserved-id scheme claimed an
+      assertion that the counter stays below 2³¹; with that scheme gone
+      (doc 61 Phase K) nothing guards the counter. Options: a release-mode
+      check that raises a fatal error, or a `u64` id (wire format change).
+      Pre-existing in spirit: the old bound was also only a debug assertion.
+
 ## A guest callback slows the host-calling loop that follows it (noted 2026-10-11)
 
 - [ ] **After one host call that runs a long guest loop, the calling loop
@@ -20,25 +74,11 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       deterministic, so an instruction count that varies between identical
       runs points at address-dependent behaviour (hashing, allocator
       layout) somewhere on this path. Diagnose with `--jit-stats` and
-      `-Djit-debug` on both shapes.
-
-## Every located runtime error rescans the source for its line (noted 2026-10-11)
-
-- [ ] **`compiler.lineFromOffset` counts newlines from byte 0 up to the
-      offset, and the runtime error path calls it once for the error and
-      once per backtrace frame** (`interp.zig` `raiseLocatedError`,
-      `backtraceFrames`, `describeFault`; also `wasm_entry.zig`). Each
-      lookup is linear in the source prefix it scans (up to the frame's
-      offset), so a raised error costs the sum of those prefixes over the
-      error and its frames, whether or not anyone reads the message. Found
-      by doc 63 Phase 0's `fail` shape (`bench/embed/tracecall_probe.c`):
-      a host callback that fails every call, caught by `pcall`, costs
-      ~29,100 instructions per iteration, ~76% of it in this scan, on a
-      ~3 KB script. The same error raised deep in a 100 KB script would
-      scan ~30× more. Rule #20. Options: a per-chunk line-start
-      table built once (binary search per lookup), or the line stored in
-      the span at compile time; and/or render the location lazily, only
-      when the message is read.
+      `-Djit-debug` on both shapes. It may not be callback-specific: on
+      2026-10-11 the JIT-on runs of `bench/luajit/spectral-norm.lua 200`
+      and `binary-trees.lua 12` also varied by about ±1% in user
+      instructions between identical runs of one binary (e.g. 256.3 M to
+      258.6 M), while tier-0 runs were stable to a few hundred.
 
 ## Global-read slow path leaves via a volatile `var` pointer (noted 2026-10-05)
 
@@ -135,7 +175,14 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 
 ## Keyframe cut before a sweep loses an intern hit on restore (noted 2026-10-10)
 
-- [ ] **Pre-existing, tier-0 alone (codex, doc 61 Phase Q rev 1 blocker
+- [x] **Fixed by doc 61 Phase K (2026-10-11):** a keyframe now carries the
+      whole unswept heap plus `next_gc` (option (a), widened to every object).
+      Repro: `keyframeser_resume_test`, "keyframe cut before a sweep", swept
+      over every cut. A sibling found on the way, also fixed there: a cut
+      while a grid was live restored nested rows, so the later genuine
+      deflation's allocations never happened (keyframes now carry the
+      physical array part).
+      **Original note (codex, doc 61 Phase Q rev 1 blocker
       5).** A string can be unreachable but not yet swept, and
       `internedLookup` still finds it (`gc.zig:567`). `encodeSnapshot`
       (`keyframeser.zig:322`) serializes only reachable objects. So a cut in
@@ -153,7 +200,16 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 
 ## Keyframe capture serialises dead slots the JIT left stale (noted 2026-10-11)
 
-- [ ] **Open for Bart (doc 61 Phase 1, §2 "Phase 0 audit"; codex Phase 1
+- [x] **Decided (Bart, 2026-10-11): (a′) a tombstone.** Implemented as doc
+      61 Phase K (§9a); pinned by `keyframeser_replay_test`, "a register the
+      dead-φ filter left stale". Capture writes a
+      dedicated "dead" marker for each dead slot (a new value tag in the
+      keyframe schema); restore turns it back into nil, so it never enters
+      a running VM. Keyframes are then byte-identical across tiers, and a
+      keyframe tells a blanked slot from a genuine nil. The visualiser reads
+      its dead labels from the marker, and `ReplayResult.live` (Phase V)
+      is removed.
+      **Background (doc 61 Phase 1, §2 "Phase 0 audit"; codex Phase 1
       review should-fix).** Masking scrubs dead slots only at collections.
       Mid-execution capture (`keyframeser.zig:341`) serialises every
       register of every window, and the `.snapshot` root walk roots them
@@ -262,6 +318,11 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       1.3.0 (the `bun` on PATH). `~/.bun/bin/bun` 1.3.14 passes all 70.
       Either pin the bun version (`packageManager`/engines, or the justfile
       recipe calls `~/.bun/bin/bun`) or upgrade the system bun.
+      **Diagnosed 2026-10-11:** a JSC wasm-JIT bug, not ours. A plain
+      4000-iteration array append in the wasm VM is enough (it crashes
+      once JSC tiers the code up, not at load). Node 24 (V8) runs the same
+      `mahina.wasm` cleanly. Bun 1.3.0 passes with `BUN_JSC_useOMGJIT=0` or
+      `BUN_JSC_useBBQJIT=0`, and Bun 1.4.3 passes the whole suite (72/72).
 
 ## `releaseChunk` leaves traces over released protos (noted 2026-10-10)
 

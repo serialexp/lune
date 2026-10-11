@@ -1,4 +1,39 @@
+LINE LOOKUP FIX (2026-10-11, coral-marten, uncommitted, waiting on amber-badger):
+- Bug from TODO.md "Every located runtime error rescans the source for
+  its line": `compiler.lineFromOffset` scanned from byte 0 per error,
+  per backtrace frame, per safepoint when replay line recording is on
+  (`interp.zig` recorder), and per instruction in the wasm disassembly
+  export. Bart chose "both": `bytecode.Span` gains `line` (stamped by
+  the compiler from a per-compile `LineTable`, binary search, memoized
+  per span start); compiler diagnostics use the same table.
+  `lineFromOffset`, `Vm.source` and `Proto.source` are gone, and so are
+  the `source` params of `describeFault`/`backtraceFrames`.
+- Dropping `Vm.source` made Zig reorder `Vm`: `offsets_x64.inc` updated
+  (VM_TRACE 8; tags/payloads/stack_top/frames/next_call_seq now
+  safety-dependent, moved into the #if blocks; PROTO_* −16). Needs a
+  tier-0 bench A/B for the reorder before landing.
+- Native + wasm build. Gate not yet clean: amber-badger's in-flight doc
+  61 keyframe work (keyframeser*, schema, viz, wasm_entry `live`,
+  interp.zig root walk) fails keyframe tests. interp.zig and
+  wasm_entry.zig hold both agents' hunks (Rule #13): coordinating
+  commit order over the forum.
+- amber-badger ran the gates on the combined tree: `just test`, jit-debug,
+  ReleaseFast lib and wasm are all green. Instruction-count A/B against HEAD
+  (`/tmp/lf-ab.sh`, every `@bench` program, tier-0 and JIT): tier-0 is flat,
+  within +0.02%. compile_multret_chain is +0.37% in both tiers, the
+  per-compile line table (about 40 instructions per compile). The JIT rows
+  are within the ±1% run-to-run variance (see TODO.md). amber-badger lands it
+  in one bundled commit with their doc 61 keyframe work.
+- Later: the TODO.md "A guest callback slows the host-calling loop"
+  entry (bimodal instruction counts, a determinism smell), then doc 63
+  Phase 1.
+
 DOC 63 (2026-10-10, coral-marten): traces call host functions directly.
+- **Phase 0 landed in `092b117`**: `bench/embed/tracecall_probe.c` +
+  `tracecall.py`, doc 63 §8.1 (numbers, call-cost split, full-window
+  budget projection: minl ~242–250/250, wide ~307–330/320, two
+  flush-shrinking options for Phase 3). Reviews: four rounds,
+  `docs/reviews/doc63/*phase0*`.
 - **Prerequisite A landed in `f1ea468`** (bundled with amber-badger's
   Phase Q). In a precise trace, a string-helper OOM now raises
   `.precise_error` instead of resuming tier-0 and retrying. Gates: test
@@ -7,8 +42,9 @@ DOC 63 (2026-10-10, coral-marten): traces call host functions directly.
   (`docs/reviews/doc63/*prereqA*`).
 - **Open for Bart:** whether ordinary traces may retry a transient OOM
   (TODO.md, options a/b/c).
-- **Next:** confirm Prerequisite B (Phase Q, also in `f1ea468`) against
-  doc 63 §5.10, then doc 63 Phase 0 (host-call benchmark and budget).
+- Prerequisite B confirmed (§5.10.1, `ee13835`). **Next:** Phase 1
+  (epoch, disturbance, suspension; inert), after the line lookup fix
+  above lands.
 
 DOC 60 H3 (2026-10-05, separate track from the campaign below):
 - **H3 landed:** the admitted path in `src/asm/hostcall_x64.S`, together
@@ -201,13 +237,8 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
     collection against HEAD's 9.2 µs, after vectorising (the first cut was
     23 µs).
   - Codex review thread `01a12673-8066-7d93-92e0-e5595383e033`.
-  - **Open for Bart:** whether keyframe capture masks dead slots (doc 61
-    §2 "Phase 0 audit"). Keyframes serialise whole windows, so a stale dead
-    slot left by sites 3–5 reaches keyframe bytes on JIT runs. Options:
-    - (a) capture masks dead slots with the same rows (byte-identical
-      across tiers);
-    - (b) declare that keyframe byte identity across tiers was never
-      claimed.
+  - Keyframe masking of dead slots: decided by Bart (a tombstone), see
+    Phase K below.
   - Committed as `0225b4d`. Board on pinned pt-default (run `abf291bd`)
     against dc3340f's:
     - suite jit total 3638 → 3624 ms; every tier-0 row 0–5% faster;
@@ -257,9 +288,49 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
   should-fix; its NIT, about `FrameMask.keeps`'s doc, is folded in. Codex
   also saw the full bun suite crash on nsieve in its own sandbox; here it
   passes 71/71 (bun 1.3.14).
+- **Phase K is implemented, uncommitted (2026-10-11).** Doc 61 §9a has the
+  design. Bart decided K1 (dead registers become `DeadSlot` tombstones, and
+  the viz reads them; `ReplayResult.live` is gone) and K2 (the whole unswept
+  heap plus `next_gc`). K3, physical array parts (lane, frozen/no_grid
+  flags, a live grid as a `GridPart`), was **my call** after the grid
+  question went unanswered for 15 minutes. It supersedes doc 14 Phase 7's
+  reserved-space row ids (Bart's earlier call) and makes capture read-only.
+  Bart may overrule it. Format version 10.
+  - Fixes two pre-existing replay bugs, each with a repro swept over every
+    cut: the intern gap (TODO "Keyframe cut before a sweep") and the
+    grid-cut id shift.
+  - Cross-tier test with teeth: `keyframeser_replay_test`, "a register the
+    dead-φ filter left stale". With tombstones off, tier-0 and native bytes
+    differ. Site 5 cannot happen at a suspend cut: an armed suspend blacks
+    out loop-done linking.
+  - Hash deletions before a cut: also swept, and pairs order agrees.
+  - Gates green on the combined tree (coral-marten's line-lookup hunks
+    included): `just test`, jit-debug, release lib, wasm; viz 72/72 under
+    Bun 1.4.3 (the system Bun 1.3.0 crash is TODO, a JSC bug).
+  - Codex review (thread 01a12895-259c-7d21-a16b-c685f320e882): REVISE,
+    five blockers. Fixed, each with a mutation-checked test (doc 61 §9a
+    "Review fixes"): the rehash trigger is now carried (`HeapTable.
+    rehash_threshold`, uint64); native `gstore` raises `row_len`
+    (pre-existing miscompile); `_G` never inflates and restore rejects a
+    grid globals table (pre-existing assert/UB); `require` deflates a grid
+    `package.loaded`; `fillKeep` honours the final cut, so the collector
+    and capture agree; restore rejects tombstones inside the keep set;
+    `zig build bench-keyframe` with a budget (unstable sorts, hash capture
+    385 → 203 ns/entry); stale comments and doc 04's version line.
+    Re-review (same thread): REVISE. One new blocker, fixed: a host
+    reentry dropped the cut without nilling the dead final registers
+    (`Vm.retireFinalCut` at every site; a `vm_final_cut` fast-word bit
+    keeps the H3 entry off a published cut).
+  - **Open for Bart:** BLOCKER 3, garbage closures over released protos
+    (TODO.md, options a/b/c). Pre-existing, noted in TODO.md: the PRNG is
+    not carried; restored closures borrow the original heap's constants.
+  - Round 3: APPROVE (finding 3 excluded as Bart's open decision). Gates
+    on the final tree: `just test`, jit-debug, release lib, wasm,
+    `just embed-test`, viz 72/72 (Bun 1.4.3) + tsc, hashgate 90/90 on both
+    legs. **Landed** in one bundled commit with coral-marten's line-lookup
+    fix (agreed on the forum).
 - **Then:** doc 61 Phase 3 (relax doc 24 D3's full-write-set flush under
-  masking; it needs its own design section and review). The keyframe
-  masking decision is still open for Bart.
+  masking; it needs its own design section and review).
 
   Each touches interp.zig/capi.zig/CallFrame, so coordinate with
   coral-marten: `.S` offsets for `CF_IN_FLIGHT`, and the `guestFault`

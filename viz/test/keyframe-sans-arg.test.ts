@@ -9,7 +9,14 @@
 // arg[0]. Keyframes are built with the generated encoder — no VM run needed.
 
 import { test, expect } from "bun:test";
-import { SnapshotFileEncoder, type SnapValueInput, type HeapObjectInput, type TableEntryInput } from "../src/gen/generated";
+import {
+  SnapshotFileEncoder,
+  type SnapValueInput,
+  type HeapObjectInput,
+  type HeapTableInput,
+  type GridPartInput,
+  type TableEntryInput,
+} from "../src/gen/generated";
 import { keyframeSansArg } from "../src/diff";
 
 const enc = (s: string): number[] => Array.from(new TextEncoder().encode(s));
@@ -27,9 +34,13 @@ class Kf {
     this.objs.push({ id: i, obj_type: 0, body: { type: "HeapString", value: { bytes: enc(s) } } });
     return i;
   }
-  tbl(array: SnapValueInput[], entries: TableEntryInput[]): number {
+  tbl(array: SnapValueInput[], entries: TableEntryInput[], phys: Partial<Pick<HeapTableInput, "lane" | "flags" | "rehash_threshold" | "grid">> = {}): number {
     const i = this.id++;
-    this.objs.push({ id: i, obj_type: 1, body: { type: "HeapTable", value: { array, entries, metatable_id: 0 } } });
+    this.objs.push({
+      id: i,
+      obj_type: 1,
+      body: { type: "HeapTable", value: { array, entries, metatable_id: 0, lane: 0, flags: 0, rehash_threshold: 4n, grid: [], ...phys } },
+    });
     return i;
   }
   encode(globalsId: number, loaded: { source: string; name: string }[] = []): Uint8Array {
@@ -38,6 +49,8 @@ class Kf {
       keyframe: {
         globals_id: globalsId,
         string_metatable_id: 0,
+        next_obj_id: this.id,
+        next_gc: 1024n,
         objects: this.objs,
         stack: [],
         frames: [],
@@ -90,6 +103,29 @@ test("loaded_chunks differences are not masked", () => {
   expect(keyframeSansArg(base)).not.toBe(keyframeSansArg(diffName));
   expect(keyframeSansArg(base)).not.toBe(keyframeSansArg(none));
   expect(keyframeSansArg(base)).toBe(keyframeSansArg(scalarGlobal("n", sInt(1n), [{ source: "return 1", name: "=c" }])));
+});
+
+/** globals = { m = <table with the given physical array part> }. */
+function physGlobal(phys: Partial<Pick<HeapTableInput, "lane" | "flags" | "rehash_threshold" | "grid">>, array: SnapValueInput[] = []): Uint8Array {
+  const kf = new Kf();
+  const mId = kf.tbl(array, [], phys);
+  const keyId = kf.str("m");
+  const gid = kf.tbl([], [{ key: sRef(keyId), val: sRef(mId) }]);
+  return kf.encode(gid);
+}
+
+test("the physical array part (lane, flags, rehash trigger, grid) is not masked (doc 61 Phase K)", () => {
+  const nil: SnapValueInput = { tag: 0, body: { type: "ConstNil", value: { pad: 0 } } };
+  const grid = (cell: bigint): GridPartInput => ({ elem: 7, stride: 2, row_len: [2], cells: [sInt(1n), sInt(cell)] });
+  const ints = [nil, sInt(1n), sInt(2n)];
+  // Same logical values, different lane / commitment.
+  expect(keyframeSansArg(physGlobal({ lane: 0 }, ints))).not.toBe(keyframeSansArg(physGlobal({ lane: 7 }, ints)));
+  expect(keyframeSansArg(physGlobal({ lane: 7, flags: 1 }, ints))).not.toBe(keyframeSansArg(physGlobal({ lane: 7, flags: 0 }, ints)));
+  expect(keyframeSansArg(physGlobal({ rehash_threshold: 34n }, ints))).not.toBe(keyframeSansArg(physGlobal({ rehash_threshold: 4n }, ints)));
+  // Grid cells are compared.
+  const g = (cell: bigint) => keyframeSansArg(physGlobal({ lane: 8, flags: 1, grid: [grid(cell)] }));
+  expect(g(2n)).not.toBe(g(3n));
+  expect(g(2n)).toBe(g(2n));
 });
 
 // Build globals = { arg = {0=path, [extra…]} }. arg[0] is the host-injected slot.

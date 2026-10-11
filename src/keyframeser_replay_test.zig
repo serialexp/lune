@@ -190,8 +190,9 @@ const NativeF2cCut = struct {
 /// Capture the first snapshot-eligible tier-0 boundary at/after the first
 /// committed effect. With `native=true`, the numeric-for immediately before the
 /// effect must have executed as native code; the effect is a host barrier, so the
-/// cut itself remains a coherent tier-0 boundary.
-fn captureNativeF2cCut(gpa: std.mem.Allocator, source: [:0]const u8, native: bool) !NativeF2cCut {
+/// cut itself remains a coherent tier-0 boundary. `hotloop` is the recording
+/// threshold.
+fn captureNativeF2cCut(gpa: std.mem.Allocator, source: [:0]const u8, native: bool, hotloop: u32) !NativeF2cCut {
     const effectser = @import("effectser.zig");
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
@@ -211,7 +212,7 @@ fn captureNativeF2cCut(gpa: std.mem.Allocator, source: [:0]const u8, native: boo
     vm.trace.config.optimize = native;
     vm.trace.config.native_codegen = native;
     vm.trace.config.coverage = native;
-    vm.trace.config.hotloop = 4;
+    vm.trace.config.hotloop = hotloop;
     vm.setSuspendCtl(.{
         .min_depth = 2,
         .after_safepoints = 0,
@@ -241,6 +242,49 @@ fn captureNativeF2cCut(gpa: std.mem.Allocator, source: [:0]const u8, native: boo
     };
 }
 
+test "doc 61 Phase K: a register the dead-φ filter left stale is a tombstone at a mid-flight cut, identical across tiers" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // Doc 61 §2 site 2: `s` is a φ of the inner loop that nothing reads at
+    // the header or after the loop, so native exits give it no writeback and
+    // its register keeps an earlier table while tier-0 holds `t[400]`. `s`
+    // stays in scope, so the register is not reused before the cut (the clock
+    // read in the same frame). The keyframe must tombstone it rather than
+    // serialize either. (Doc 61 §2 site 5 cannot arise at a suspend cut: an
+    // armed suspend blacks out loop-done linking, `armLoopDoneLink`.)
+    const source: [:0]const u8 =
+        \\local function f()
+        \\  math.randomseed(7)
+        \\  local t = {}
+        \\  for j = 1, 400 do t[j] = {v = j} end
+        \\  local s = nil
+        \\  for j = 1, 400 do
+        \\    for i = 1, 100 do s = t[j] end
+        \\  end
+        \\  local tm = os.clock()
+        \\  return tm
+        \\end
+        \\print(f())
+    ;
+    const hotloop = (trace.TraceConfig{}).hotloop;
+    const tier0 = try captureNativeF2cCut(gpa, source, false, hotloop);
+    defer tier0.deinit(gpa);
+    const native = try captureNativeF2cCut(gpa, source, true, hotloop);
+    defer native.deinit(gpa);
+    try testing.expect(native.traced_iters > 0);
+    try testing.expect(native.compiled_native_traces > 0);
+    try testing.expectEqualSlices(u8, tier0.keyframe, native.keyframe);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const kf = (try schema.SnapshotFile.decode(arena.allocator(), native.keyframe)).keyframe;
+    var dead: usize = 0;
+    for (kf.stack) |sv| {
+        if (sv.body == .DeadSlot) dead += 1;
+    }
+    try testing.expect(dead >= 1); // at least `s`
+}
+
 test "A-vi F-5: native post-burst effect cut has full-state identity and resumes from an empty trace cache" {
     if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -265,9 +309,9 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
         \\work()
     ;
 
-    const tier0 = try captureNativeF2cCut(gpa, source, false);
+    const tier0 = try captureNativeF2cCut(gpa, source, false, 4);
     defer tier0.deinit(gpa);
-    const native = try captureNativeF2cCut(gpa, source, true);
+    const native = try captureNativeF2cCut(gpa, source, true, 4);
     defer native.deinit(gpa);
     try testing.expect(native.traced_iters > 0); // genuine native burst before cut
     try testing.expect(native.compiled_native_traces > 0);

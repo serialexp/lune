@@ -14,9 +14,11 @@ produced at runtime: a homogeneous-numeric nested table inflates on its first
 fused `a[i][j]=v`, grows by **reshape-on-overflow** (stride / cell-lane), and
 deflates only on a genuine type change or any *bare* access — the **gate behind
 fused indexing** (2026-06-26, Bart; see §Escape detection). Grids survive GC
-stress live, and determinism/replay is closed: a grid is never serialised
-(deflated to logical nested rows at capture, with **deterministic reserved-space
-row ids** so a mid-execution cut resumes byte-identically — Phase 7). **Phase 8
+stress live, and determinism/replay is closed: since doc 61 Phase K a keyframe
+carries a live grid physically (`HeapTable.grid`), so capture never mutates and
+a mid-execution cut resumes byte-identically. (Phase 7's deflate-at-capture with
+reserved-space row ids is superseded: it skipped the genuine deflation's
+allocations after restore.) **Phase 8
 is fully landed**: the trace recorder lowers `get_index2`/`set_index2` to a grid
 address chain behind grid guards (Stage A), and `nativegen` now lowers that chain
 to grid-relative address arithmetic — `flat = row0*stride + (col-1)` with the
@@ -127,8 +129,13 @@ land; move whole sections to Done once everything inside is checked.
   Verified live: the eight Phase 5 e2e tests run with `gc_stress=true` (collect at
   *every* safepoint) while grids are live and inflate/deflate mid-program — green,
   so a live grid is neither wrongly collected nor leaks its row tables on deflate.
-- [x] **Phase 7 — Determinism + keyframe.** A grid is in-memory only: never on the
-  wire. `keyframeser.encodeSnapshot` calls `Heap.deflateAllGrids` up front, so the
+- [x] **Phase 7 — Determinism + keyframe.** *Superseded by doc 61 Phase K
+  (2026-10-11): keyframes now carry a grid physically and capture never deflates;
+  `deflateAllGrids` and `reserved_grid_id_base` are gone. A cut while a grid was
+  live restored nested rows, so the later genuine deflation's allocations never
+  happened and every later id shifted (repro: `keyframeser_resume_test`, "keyframe
+  cut while a grid is live").* The original text follows. A grid is in-memory
+  only: never on the wire. `keyframeser.encodeSnapshot` calls `Heap.deflateAllGrids` up front, so the
   walk only ever sees logical nested rows; `toSchemaValue` keeps `.row_view =>
   unreachable` (the gate guarantees no bare row_view escapes). Identity stays
   `parent.id`-based throughout. **Cross-resume byte-identity (the subtle part):** a
@@ -509,6 +516,11 @@ Per `00-architecture.md`, the only legitimate reason a representation trick is
 off-limits is that it breaks byte-identical 8-mode equivalence or keyframe
 replay. Grid flattening clears this:
 
+- *Superseded by doc 61 Phase K (2026-10-11), for the two bullets below: a
+  keyframe carries the grid, the lane and the commitment flags physically, because
+  they decide later inflation and deflation, and so later allocations and ids. A
+  restore onto a different representation is **not** observably identical once
+  ids are printed. Capture never deflates.*
 - **The grid is never serialised.** Like `lane`, it is an in-memory
   optimisation; keyframes persist *logical* values (`array.get(i)` round-trips on
   any representation), so a restore that lands on a different grid/nested state is

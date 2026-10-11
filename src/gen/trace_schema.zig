@@ -4,6 +4,7 @@ const binschema = @import("binschema");
 
 pub const BsUnion_ConstNil_ConstBool_ConstInt_ConstFloat_ConstString = union(enum) { ConstNil: ConstNil, ConstBool: ConstBool, ConstInt: ConstInt, ConstFloat: ConstFloat, ConstString: ConstString };
 pub const BsUnion_ConstNil_ConstBool_ConstInt_ConstFloat_HeapRef = union(enum) { ConstNil: ConstNil, ConstBool: ConstBool, ConstInt: ConstInt, ConstFloat: ConstFloat, HeapRef: HeapRef };
+pub const BsUnion_ConstNil_ConstBool_ConstInt_ConstFloat_HeapRef_DeadSlot = union(enum) { ConstNil: ConstNil, ConstBool: ConstBool, ConstInt: ConstInt, ConstFloat: ConstFloat, HeapRef: HeapRef, DeadSlot: DeadSlot };
 pub const BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue = union(enum) { HeapString: HeapString, HeapTable: HeapTable, HeapClosure: HeapClosure, HeapNative: HeapNative, HeapUpvalue: HeapUpvalue };
 
 pub const ConstInt = struct {
@@ -461,6 +462,95 @@ pub const SnapValue = struct {
     }
 };
 
+pub const DeadSlot = struct {
+    pad: u8,
+
+    pub fn encode(self: DeadSlot, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: DeadSlot, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        _ = ctx;
+        try enc.writeUint8(self.pad);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!DeadSlot {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!DeadSlot {
+        _ = allocator;
+        _ = root;
+        var result: DeadSlot = undefined;
+        result.pad = try dec.readUint8();
+        return result;
+    }
+};
+
+pub const StackValue = struct {
+    tag: u8,
+    body: BsUnion_ConstNil_ConstBool_ConstInt_ConstFloat_HeapRef_DeadSlot,
+
+    pub fn encode(self: StackValue, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: StackValue, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint8(self.tag);
+        switch (self.body) {
+            .ConstNil => |_uv_0| try _uv_0.encodeInto(enc, ctx),
+            .ConstBool => |_uv_1| try _uv_1.encodeInto(enc, ctx),
+            .ConstInt => |_uv_2| try _uv_2.encodeInto(enc, ctx),
+            .ConstFloat => |_uv_3| try _uv_3.encodeInto(enc, ctx),
+            .HeapRef => |_uv_4| try _uv_4.encodeInto(enc, ctx),
+            .DeadSlot => |_uv_5| try _uv_5.encodeInto(enc, ctx),
+        }
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!StackValue {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!StackValue {
+        var result: StackValue = undefined;
+        result.tag = try dec.readUint8();
+        if (result.tag == 0) {
+            result.body = .{ .ConstNil = try ConstNil.decodeWith(allocator, dec, root) };
+        }
+        else if (result.tag == 1) {
+            result.body = .{ .ConstBool = try ConstBool.decodeWith(allocator, dec, root) };
+        }
+        else if (result.tag == 2) {
+            result.body = .{ .ConstInt = try ConstInt.decodeWith(allocator, dec, root) };
+        }
+        else if (result.tag == 3) {
+            result.body = .{ .ConstFloat = try ConstFloat.decodeWith(allocator, dec, root) };
+        }
+        else if (result.tag == 4) {
+            result.body = .{ .HeapRef = try HeapRef.decodeWith(allocator, dec, root) };
+        }
+        else if (result.tag == 255) {
+            result.body = .{ .DeadSlot = try DeadSlot.decodeWith(allocator, dec, root) };
+        }
+        else {
+            return error.InvalidVariant;
+        }
+        return result;
+    }
+};
+
 pub const TableEntry = struct {
     key: SnapValue,
     val: SnapValue,
@@ -525,10 +615,69 @@ pub const HeapString = struct {
     }
 };
 
+pub const GridPart = struct {
+    elem: u8,
+    stride: u32,
+    row_len: []const u32,
+    cells: []const SnapValue,
+
+    pub fn encode(self: GridPart, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: GridPart, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint8(self.elem);
+        try enc.writeUint32(self.stride, .little_endian);
+        try enc.writeUint32(@intCast(self.row_len.len), .little_endian);
+        for (self.row_len) |_item_0| {
+            try enc.writeUint32(_item_0, .little_endian);
+        }
+        try enc.writeUint32(@intCast(self.cells.len), .little_endian);
+        for (self.cells) |_item_1| {
+            try _item_1.encodeInto(enc, ctx);
+        }
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!GridPart {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!GridPart {
+        var result: GridPart = undefined;
+        result.elem = try dec.readUint8();
+        result.stride = try dec.readUint32(.little_endian);
+        const _len_5 = try dec.readUint32(.little_endian);
+        const _buf_6 = try allocator.alloc(u32, @as(usize, _len_5));
+        errdefer allocator.free(_buf_6);
+        for (0.._buf_6.len) |_i_3| {
+            _buf_6[_i_3] = try dec.readUint32(.little_endian);
+        }
+        result.row_len = _buf_6;
+        const _len_10 = try dec.readUint32(.little_endian);
+        const _buf_11 = try allocator.alloc(SnapValue, @as(usize, _len_10));
+        errdefer allocator.free(_buf_11);
+        for (0.._buf_11.len) |_i_8| {
+            _buf_11[_i_8] = try SnapValue.decodeWith(allocator, dec, root);
+        }
+        result.cells = _buf_11;
+        return result;
+    }
+};
+
 pub const HeapTable = struct {
     array: []const SnapValue,
     entries: []const TableEntry,
     metatable_id: u32,
+    lane: u8,
+    flags: u8,
+    rehash_threshold: u64,
+    grid: []const GridPart,
 
     pub fn encode(self: HeapTable, allocator: std.mem.Allocator) binschema.Error![]u8 {
         var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
@@ -549,6 +698,13 @@ pub const HeapTable = struct {
             try _item_1.encodeInto(enc, ctx);
         }
         try enc.writeUint32(self.metatable_id, .little_endian);
+        try enc.writeUint8(self.lane);
+        try enc.writeUint8(self.flags);
+        try enc.writeUint64(self.rehash_threshold, .little_endian);
+        try enc.writeUint8(@intCast(self.grid.len));
+        for (self.grid) |_item_2| {
+            try _item_2.encodeInto(enc, ctx);
+        }
     }
 
     pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!HeapTable {
@@ -558,21 +714,31 @@ pub const HeapTable = struct {
 
     pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!HeapTable {
         var result: HeapTable = undefined;
-        const _len_5 = try dec.readUint32(.little_endian);
-        const _buf_6 = try allocator.alloc(SnapValue, @as(usize, _len_5));
-        errdefer allocator.free(_buf_6);
-        for (0.._buf_6.len) |_i_3| {
-            _buf_6[_i_3] = try SnapValue.decodeWith(allocator, dec, root);
+        const _len_6 = try dec.readUint32(.little_endian);
+        const _buf_7 = try allocator.alloc(SnapValue, @as(usize, _len_6));
+        errdefer allocator.free(_buf_7);
+        for (0.._buf_7.len) |_i_4| {
+            _buf_7[_i_4] = try SnapValue.decodeWith(allocator, dec, root);
         }
-        result.array = _buf_6;
-        const _len_10 = try dec.readUint32(.little_endian);
-        const _buf_11 = try allocator.alloc(TableEntry, @as(usize, _len_10));
-        errdefer allocator.free(_buf_11);
-        for (0.._buf_11.len) |_i_8| {
-            _buf_11[_i_8] = try TableEntry.decodeWith(allocator, dec, root);
+        result.array = _buf_7;
+        const _len_11 = try dec.readUint32(.little_endian);
+        const _buf_12 = try allocator.alloc(TableEntry, @as(usize, _len_11));
+        errdefer allocator.free(_buf_12);
+        for (0.._buf_12.len) |_i_9| {
+            _buf_12[_i_9] = try TableEntry.decodeWith(allocator, dec, root);
         }
-        result.entries = _buf_11;
+        result.entries = _buf_12;
         result.metatable_id = try dec.readUint32(.little_endian);
+        result.lane = try dec.readUint8();
+        result.flags = try dec.readUint8();
+        result.rehash_threshold = try dec.readUint64(.little_endian);
+        const _len_16 = try dec.readUint8();
+        const _buf_17 = try allocator.alloc(GridPart, @as(usize, _len_16));
+        errdefer allocator.free(_buf_17);
+        for (0.._buf_17.len) |_i_14| {
+            _buf_17[_i_14] = try GridPart.decodeWith(allocator, dec, root);
+        }
+        result.grid = _buf_17;
         return result;
     }
 };
@@ -865,8 +1031,9 @@ pub const Keyframe = struct {
     globals_id: u32,
     string_metatable_id: u32,
     next_obj_id: u32,
+    next_gc: u64,
     objects: []const HeapObject,
-    stack: []const SnapValue,
+    stack: []const StackValue,
     frames: []const FrameRef,
     open_upvalues: []const OpenUpvalueRef,
     loaded_chunks: []const LoadedChunk,
@@ -884,6 +1051,7 @@ pub const Keyframe = struct {
         try enc.writeUint32(self.globals_id, .little_endian);
         try enc.writeUint32(self.string_metatable_id, .little_endian);
         try enc.writeUint32(self.next_obj_id, .little_endian);
+        try enc.writeUint64(self.next_gc, .little_endian);
         try enc.writeUint32(@intCast(self.objects.len), .little_endian);
         for (self.objects) |_item_0| {
             try _item_0.encodeInto(enc, ctx);
@@ -916,6 +1084,7 @@ pub const Keyframe = struct {
         result.globals_id = try dec.readUint32(.little_endian);
         result.string_metatable_id = try dec.readUint32(.little_endian);
         result.next_obj_id = try dec.readUint32(.little_endian);
+        result.next_gc = try dec.readUint64(.little_endian);
         const _len_8 = try dec.readUint32(.little_endian);
         const _buf_9 = try allocator.alloc(HeapObject, @as(usize, _len_8));
         errdefer allocator.free(_buf_9);
@@ -924,10 +1093,10 @@ pub const Keyframe = struct {
         }
         result.objects = _buf_9;
         const _len_13 = try dec.readUint32(.little_endian);
-        const _buf_14 = try allocator.alloc(SnapValue, @as(usize, _len_13));
+        const _buf_14 = try allocator.alloc(StackValue, @as(usize, _len_13));
         errdefer allocator.free(_buf_14);
         for (0.._buf_14.len) |_i_11| {
-            _buf_14[_i_11] = try SnapValue.decodeWith(allocator, dec, root);
+            _buf_14[_i_11] = try StackValue.decodeWith(allocator, dec, root);
         }
         result.stack = _buf_14;
         const _len_18 = try dec.readUint16(.little_endian);

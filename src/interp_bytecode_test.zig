@@ -91,7 +91,7 @@ test "describeFault: arithmetic on a nil value names the op, type, line, and spa
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const fault = try vm.describeFault(src, Error.TypeError, arena.allocator());
+    const fault = try vm.describeFault(Error.TypeError, arena.allocator());
     try testing.expectEqual(@as(u32, 2), fault.line);
     try testing.expect(std.mem.indexOf(u8, fault.message, "arithmetic") != null);
     try testing.expect(std.mem.indexOf(u8, fault.message, "nil") != null);
@@ -119,7 +119,7 @@ test "describeFault: calling a nil value names the call and the type" {
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const fault = try vm.describeFault(src, Error.TypeError, arena.allocator());
+    const fault = try vm.describeFault(Error.TypeError, arena.allocator());
     try testing.expectEqual(@as(u32, 2), fault.line);
     try testing.expect(std.mem.indexOf(u8, fault.message, "call") != null);
     try testing.expect(std.mem.indexOf(u8, fault.message, "nil") != null);
@@ -149,7 +149,7 @@ test "describeFault: a nested fault yields a deepest-first backtrace (leaf + cal
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const fault = try vm.describeFault(src, Error.TypeError, arena.allocator());
+    const fault = try vm.describeFault(Error.TypeError, arena.allocator());
 
     // Two live frames at the fault: f (leaf) called from main.
     try testing.expectEqual(@as(usize, 2), fault.frames.len);

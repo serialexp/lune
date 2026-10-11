@@ -21,8 +21,9 @@
 //! `dofile` ARE effectful, but only via the `file_read` boundary; the compile that
 //! follows is pure.) The proto tree it produces is owned by the VM
 //! (`Vm.loaded_chunks`) because a loaded closure can outlive the call that created
-//! it; the source is duplicated and kept alongside the `Chunk` so `Proto.source`
-//! (error line numbers) stays valid and the keyframe can recompile it on restore.
+//! it; the source is duplicated and kept alongside the `Chunk` so the keyframe
+//! can recompile it on restore. (Error line numbers need no source: every span
+//! carries its line in its own chunk.)
 //!
 //! Contract (Lua-shaped subset): on success `load`/`loadfile` return the closure;
 //! on a **syntax error** they return `nil, message` (never raised). A non-string

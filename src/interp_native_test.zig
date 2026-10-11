@@ -1393,6 +1393,60 @@ test "grid e2e: a fused store past the stride grows the grid (reshape-on-overflo
     );
 }
 
+test "grid e2e: a native fused store within the stride raises the row length" {
+    // Row 101 is 200 wide, so the stride covers column 100 and every store in
+    // the loop lands in-capacity — on the native path, too. Each one-cell row
+    // must still grow to length 100, or `m[80][100]` reads past the row's end
+    // as nil (Codex review of doc 61 Phase K).
+    try expectProgram(
+        \\local b = {}
+        \\for j = 1, 200 do b[j] = j end
+        \\local m = {}
+        \\for i = 1, 100 do m[i] = {1} end
+        \\m[101] = b
+        \\m[1][1] = 1
+        \\for i = 1, 100 do m[i][100] = i end
+        \\local r = m[80]
+        \\print(r[100], r[99], r[1])
+        \\
+    ,
+        "80\tnil\t1\n",
+    );
+}
+
+test "grid e2e: an emptied _G never inflates, so a later global store still lands" {
+    // Global stores write `_G` raw, which a grid cannot take: the fused store
+    // below must leave `_G` nested (Codex review of doc 61 Phase K).
+    try expectProgram(
+        \\local g = _G
+        \\local p = print
+        \\local keys = {}
+        \\for k in pairs(g) do keys[#keys + 1] = k end
+        \\for i = 1, #keys do g[keys[i]] = nil end
+        \\g[1] = {1, 2}
+        \\g[2] = {3, 4}
+        \\g[1][1] = 5
+        \\newglobal = 7
+        \\p(newglobal, g[1][1], g[2][2])
+        \\
+    ,
+        "7\t5\t4\n",
+    );
+}
+
+test "grid e2e: require into a grid package.loaded deflates it first" {
+    try expectProgram(
+        \\local m = { {1,2}, {3,4} }
+        \\m[1][1] = 5
+        \\package.loaded = m
+        \\package.preload.foo = function() return 42 end
+        \\print(require("foo"), m[1][1], m.foo)
+        \\
+    ,
+        "42\t5\t42\n",
+    );
+}
+
 test "grid e2e: a wider int store climbs the cell lane in place" {
     try expectProgram(
         \\local m = { {1,2}, {3,4} }

@@ -1,8 +1,10 @@
 # mahina — GC liveness masking — Design
 
 Status: rev 7, approved by codex + antigravity; Q1 = (a), Q2 = label dead
-slots (Bart, 2026-10-09); Phases P, 0, Q, 1, 2 and V landed (keyframe
-masking open for Bart); Phase 3 next
+slots (Bart, 2026-10-09); Phases P, 0, Q, 1, 2, V and K (keyframes:
+tombstones, whole heap, physical arrays, §9a; Codex APPROVE in round 3)
+landed; open for Bart: keyframes and garbage closures (TODO.md); Phase 3
+next
 Owner: Bart + agents (amber-badger)
 Last updated: 2026-10-11
 
@@ -68,6 +70,8 @@ as they land; move bullets to Done once everything inside them is checked.
       exporting raw operands (for `call_a`) and re-implementing §4's shapes
       in TypeScript. Test: `viz/test/wasm.test.ts` "doc 61 Phase V"
       (mutation-checked on both sides).
+      **Replaced by Phase K (§9a):** the viz now reads dead slots from the
+      keyframe's tombstones, and `ReplayResult.live` is gone.
 - [x] **Phase P — pre-existing rooting bugs (§3), each its own change, before
       Phase 1.**
   - [x] **P1:** surplus varargs past the caller window are clobbered by the
@@ -215,8 +219,9 @@ as they land; move bullets to Done once everything inside them is checked.
         call-layout check gains one clause: a consumer that is itself a
         producer must be followed by its own consumer at the same or a
         lower base, so nothing at or above the base survives the chain.
-  - [ ] Decide whether keyframe capture masks dead slots too (§2, "Phase 0
-        audit"). **Open for Bart** (options in CURRENT_TASK.md).
+  - [x] Decide whether keyframe capture masks dead slots too (§2, "Phase 0
+        audit"). **Decided (Bart, 2026-10-11):** a tombstone, with the
+        whole heap. Implemented as Phase K (§9a).
   - [x] Masking driven by the shared `maskable` predicate, with an alias
         bitset and dead slots set to nil before sweep. **As implemented:**
         one keep bitset (`Vm.gc_keep`, `stack_slots / 64` words). It starts
@@ -271,7 +276,15 @@ as they land; move bullets to Done once everything inside them is checked.
 - [ ] **Phase 3 — relax doc 24 D3's full-write-set flush.** Today
       `alloc_count != 0` keeps every φ only because the collector roots every
       register. Re-derive it under masking. Separate review.
-- [ ] **Defer — `.snapshot` walk masking (doc 21 Phase B).**
+- [x] **Phase K — keyframes (§9a).** Landed: K1 tombstones, K2 whole
+      heap, K3 physical array parts; format version 10. Codex: REVISE,
+      REVISE, then APPROVE in round 3, after the rehash trigger, native
+      grid row lengths, grid globals, the final-state keep set, retiring
+      the cut, tombstone validation, a capture benchmark and stale comments
+      (§9a "Review fixes"). Open for Bart: garbage closures over released
+      protos (TODO.md, "Keyframes dereference garbage closures' protos").
+- [x] **`.snapshot` walk masking (doc 21 Phase B).** Subsumed by Phase K:
+      the `.snapshot` walk is deleted.
 
 ## Why this exists
 
@@ -1779,6 +1792,223 @@ apply while their strings live).
 - **Memory.** `mh_mem_stats` live bytes drop, minus the fixed 8 KiB bitset
   per VM.
 
+## 9a. Phase K — keyframes: tombstones and the whole heap
+
+**Decisions (Bart, 2026-10-11).**
+- A dead slot is captured as a **tombstone**, not as nil and not verbatim.
+- The visualiser reads its dead labels from the tombstone. Phase V's
+  `ReplayResult.live` is removed.
+- A keyframe carries the **whole heap**, not the reachable set.
+
+**The problem.** Masking scrubs dead slots only at collections (§2, "Phase 0
+audit"). Between collections a JIT run can hold a different value than
+tier-0 in a dead slot. Capture serialised every window slot verbatim and the
+`.snapshot` walk rooted them, so the stale value reached both the stack bytes
+and the object set. Masking the walk would fix the object set but widen a
+pre-existing replay bug (TODO.md, "Keyframe cut before a sweep"). That bug
+has a repro: `keyframeser_resume_test`, "a re-interned unreachable string
+keeps its id across restore". A string that is unreachable but not yet swept
+is left out of the keyframe. The uninterrupted run's re-intern hits it, while
+the restored VM allocates a fresh id (`next_obj_id` 0xE6 vs 0xE7). Its
+sibling: `next_gc` is not serialised, and `object_count` counts only what was
+captured. So after a restore, collections fire at different points, which
+sweeps different strings and diverges later intern hits.
+
+**K1 — stack tombstones.**
+- Schema: a new `DeadSlot` record and a `StackValue` union. It has
+  `SnapValue`'s five variants plus `DeadSlot` at tag 255, outside the
+  `Value.Tag` space. `Keyframe.stack` holds `StackValue`. Heap edges stay
+  `SnapValue`, so the schema itself rules out a tombstone in a table, an
+  upvalue or a hash entry.
+- The keep set is one bitset over `[0, stack_top)`, in the capture arena.
+  It is the collector's own keep set, `Vm.fillKeep`:
+  - at a validated final state (`Vm.validFinalCut`, doc 21 Phase A), the
+    result span only. The collector roots the same span, so a collection
+    after the run and one after a restore free the same objects;
+  - otherwise masked windows keep their `frameMask` rows, every varargs span
+    and every open-upvalue slot. Gaps and unmasked windows are kept whole.
+
+  Every slot outside the keep set is written as `DeadSlot`.
+- Restore writes nil for a tombstone, so a tombstone never enters a running
+  VM. Once frames, pcs, open upvalues and the cut are rebuilt, restore fills
+  the keep set again and rejects a tombstone inside it
+  (`InvalidTombstones`): no capture writes one there.
+- Restore followed by recapture is still the identity. Restored frames keep
+  their pc, are out of flight and have the same rows, so the same slots are
+  tombstoned again.
+
+**K2 — the whole heap.**
+- `objects` is every object on the heap's sweep list, in ascending id order.
+  Capture sorts by id rather than trusting list order, because restore links
+  closures in a second pass.
+- The `.snapshot` root kind, the keyframe `Walk` and doc 21 Phase A's
+  reachable-set seeding are deleted. Doc 21 Phase B (mid-flight masking) is
+  subsumed: K1 masks the registers, and the heap needs no masking.
+- **Why that is tier-identical.** Allocation points and collection points are
+  tier-identical (§7.1 item 8). So is every object's content: only registers
+  can be stale, and K1 masks those.
+- **GC pacing.** `Keyframe.next_gc` is new, and restore sets it.
+  `object_count` after restore equals `objects.len`, which equals the
+  source's count because nothing is left out.
+- **The intern bug is fixed.** Unswept strings are carried and re-interned at
+  restore, so the restored run gets the same intern hits.
+- **Host refs.** An object a host holds is on the heap, so it is carried, but
+  the hold itself is not. As with the program root, the host re-establishes
+  its holds after a restore. A hold can already change what the guest sees
+  (an intern hit on a held string), so the bytes reflecting it is honest. Host
+  state that the guest cannot observe still stays out.
+- **Cost (Rule #20).** Capture is O(H log H + E log E + C + B) for H heap
+  objects, E hash entries (each table's are sorted by key), C array or grid
+  cells and B string and loaded-source bytes; the keyframe's size is linear
+  in the same. The extra over the reachable set is the unswept garbage,
+  which the collection pacing bounds: a collection runs once the object
+  count passes `next_gc` (`max(1024, live × growth)`), so garbage is at most
+  about the live set times the growth factor. It is a pacing bound, not a
+  hard cap on heap size. No new state on the VM. Both sorts are unstable
+  (pdq): ids and keys are unique, so the order is exact. Budget: capture
+  under 250 ns and restore under 1 µs per object, entry or cell at a million
+  of them. `zig build bench-keyframe`, Oct 2026, best of 5:
+
+  | scenario | units | bytes/unit | capture ns/unit | restore ns/unit |
+  |---|---|---|---|---|
+  | 1M small tables | 1,000,000 | 44.0 | 216 | 273 |
+  | one table, 1M string keys | 1,000,000 | 29.9 | 203 | 434 |
+  | 4M-int array + 1000×1000 grid | 5,000,000 | 9.0 | 28 | 25 |
+  | 1M tables dropped before the cut | 1,000,000 | 44.0 | 214 | 270 |
+
+  The hash row was 385 ns/unit with the stable block sort.
+- Format version 10.
+
+**K3 — physical array parts.** *Decided by judgement, not by Bart: the
+question (physical arrays / invisible deflation / defer grids) went
+unanswered for 15 minutes, and this was the recommended option. It
+supersedes doc 14 Phase 7's reserved-space row ids, which were Bart's call.*
+- **The problem.** Whole heap is exact only if restore rebuilds each object
+  in the representation that decides its future allocations. Two things did
+  not:
+  - **Grids.** Capture deflated every live grid to nested rows, with ids in a
+    reserved high range. The uninterrupted run later deflates for real (a bare
+    `m[2]`) and allocates the rows. The restored run already holds nested rows,
+    skips those allocations, and every later id shifts. Repro:
+    `keyframeser_resume_test`, "keyframe cut while a grid is live" (printed
+    `table: 0xe7` vs `0xea`). The phantom rows were also extra garbage, so
+    they changed collection timing.
+  - **Lane and commitment.** Restore recomputed the lane (`optimalLane`) and
+    froze any narrow result. Inflation needs a `.value`, non-`no_grid` parent
+    with packed numeric rows, so a recomputed lane or a lost `no_grid` flag
+    could inflate a matrix the uninterrupted run never inflates, or the
+    reverse.
+- **Schema.** `HeapTable` gains:
+  - `lane`, the `array.Lane` ordinal;
+  - `flags`: bit 0 frozen, bit 1 `no_grid`;
+  - `grid`: zero or one `GridPart` (`elem`, `stride`, `row_len`, and
+    `rows × stride` cells as scalar `SnapValue`s, holes as nil).
+  A grid table's `array` is empty: a grid owns the whole table, with no hash
+  part and no metatable (the inflation gate).
+- **Capture is read-only.** `deflateAllGrids` and `reserved_grid_id_base` are
+  gone. `deflateGrid` is the genuine deflation only.
+- **Restore** appends the values, then `ArrayPart.restoreLane` converts to the
+  captured lane, failing `InvalidTableLane` if a value does not fit. A grid is
+  rebuilt with `initGrid` and `gridSet`, with each row's length taken from the
+  wire (a nil store never shrinks a row). The flags are applied as captured.
+  Validation rejects an unknown lane, a grid alongside array values, hash
+  entries or a metatable, an unfrozen grid, a non-bitmap cell lane, a cell
+  count other than `rows × stride`, a cell past its row's length and a cell
+  that does not fit the cell lane.
+- **Why that is tier-identical.** Lane, commitment and grid shape change only
+  on tier-0 paths: fresh commit, widening, rehash, inflation, deflation and
+  reshape. Native stores and appends stay in lane and in capacity
+  (`guard_fits`), and the JIT records grid stores only into an existing
+  grid. Capacity is not carried: it decides no allocation of a heap object.
+- **Hash geometry stays logical.** The hash part (doc 49 P2b) is still rebuilt
+  by insertion, without the dead nodes that deletions left, so it can rehash
+  at a different point after restore. A rehash allocates no heap object, and
+  iteration order does not follow the layout:
+  `keyframeser_resume_test`, "keyframe cut after hash deletions", sweeps
+  every cut of a delete-then-`pairs`-then-insert program and agrees.
+- **The rehash trigger is carried.** `Table.rehash_threshold` is not
+  geometry: it depends on history and decides when the next new integer key
+  re-splits array and hash, which `#t` and `next` order observe (Codex: a
+  cut after deletions changed `#t` from 0 to 5). `HeapTable.rehash_threshold`
+  is a `uint64`; restore rejects one below 4 or past `usize`.
+
+**Review fixes (Codex, 2026-10-11).**
+- **Native grid stores raise the row length.** Pre-existing: `emitGStore`
+  wrote the cell and its presence bit but not `row_len`, so native code left
+  a row shorter than its cells (tier-0 printed 80, native nil). That also
+  broke the wire invariant restore checks. It now raises
+  `row_len[row]` to `col` when it is below; the allocator keeps the cell's
+  row and column live to the store. Test: `interp_native_test`, "a native
+  fused store within the stride raises the row length".
+- **Globals never inflate.** Pre-existing: a program that empties `_G` and
+  fuses a store into it inflated `_G` to a grid. The next global store then
+  reached `Table.set` on a grid, an assert in Debug and undefined in
+  release. `Vm.fusedStore` treats the globals table as never qualifying
+  (`no_grid`, the flag a failed scan sets), and restore rejects a grid
+  globals table. `require` deflates a grid `package.loaded` before storing
+  into it, like every other bare stdlib access. A grid may still be a
+  metatable: metamethod lookup only reads it.
+- **Restore validates tombstones** against the restored keep set (K1).
+- **The final-state keep set is shared** with the collector (K1).
+- **Retiring the cut nils the dead final registers** (re-review). Anything
+  that reuses the stack after a run drops the cut: `callValue`,
+  `pushHostCall`, `runPushedFrame`, a fresh run, the C-API fault path and
+  `pcall`'s manual unwinds. Dropping it alone made `fillKeep` keep the old
+  prefix whole again, so the source rooted values the restored VM holds as
+  nil. Every site now calls `Vm.retireFinalCut`, which nils the slots
+  outside the result span first (O(stack_top), once per finished run).
+  The hand-written host-call entry (doc 60 H3) pushes before any Zig runs,
+  so a published cut sets a fast-word bit (`FastBit.vm_final_cut`, through
+  `Vm.setFinalCut`). That sends the first call after a run to H1, which
+  retires the cut; later calls are admitted again. C-API evaluations never
+  publish a cut (`callValue` does not stamp one), so only a Zig-API `run`
+  on an embedded VM reaches this. Tests: `keyframeser_resume_test`, "a host
+  call after a final cut leaves the source and a restored VM identical";
+  `capi_hostcall_test`, "the .S entry defers to H1 while a run's final cut
+  is published"; `interp_fastblock_test` covers the bit.
+
+**Visualiser.**
+- `decodeSnapshot` marks a local dead when its slot is `DeadSlot` and shows
+  no value for it.
+- `ReplayResult` drops `live`, back to 64 bytes.
+- `diff.ts` canonicalises from the roots, so the extra unreachable objects
+  drop out of it. A tombstone passes through as its tag.
+
+- `diff.ts` also compares `lane`, `flags` and grid cells.
+
+**Tests.**
+- The intern repro above, swept over every cut.
+- The grid repro above, swept over every cut.
+- Hash deletions before a cut, swept over every cut.
+- Mid-flight byte identity across tiers (`keyframeser_replay_test`, "a
+  register the dead-φ filter left stale"). Capture at the same effect cut in
+  tier-0 and native, after a nested loop whose inner φ `s` is dead (site 2).
+  With tombstones disabled the bytes differ. Site 5 cannot arise at a
+  suspend cut: an armed suspend blacks out loop-done linking.
+- Restore of a tombstone gives nil; at depth 0 restore re-derives
+  `final_cut` from the tombstones, so recapture is the identity.
+- Exact lane and flag restore, including lanes `optimalLane` would not pick,
+  and the validation errors (`keyframeser_restore_test`).
+- A grid round-trip of cells, holes and row lengths, recapture identity, and
+  each malformed-grid rejection.
+- A failing-allocator restore through the lane conversion and the grid
+  rebuild (`keyframeser_resume_test`, "§R3").
+- `keyframeSansArg` tells lanes, flags, rehash triggers and grid cells apart
+  (`viz/test/keyframe-sans-arg.test.ts`).
+- A cut between rehashes, swept over every cut: later integer keys land
+  where the uninterrupted run puts them (`pairs` order and `#t`).
+- The rehash trigger round-trips, and one below 4 is rejected.
+- A forged tombstone in any slot a mid-flight capture kept (operands,
+  varargs, an open upvalue's slot) is rejected.
+- After a final-state restore, a collection in both VMs frees the same
+  objects and recaptures identically (doc 21 §T-A.3).
+- A grid globals table is rejected; a grid elsewhere round-trips.
+- The emptied-`_G`, grid-`package.loaded` and native row-length programs, in
+  every GC discipline and trace mode.
+- The schema keeps a tombstone out of heap edges; that is structural, so
+  there is no runtime test for it.
+- The viz test from Phase V, now reading the tombstone.
+
 ## 10. Open questions
 
 - **Q1.** Trace constants (§7). **Decided: (a)** (Bart, 2026-10-09).
@@ -1835,6 +2065,11 @@ apply while their strings live).
   - **Call-like set** reduced to `.call`; `pushHostCall`'s callee starts not
     in flight.
   - **Tests and mutations** added for each of the above.
+- **Phase K** (2026-10-11, §9a). Keyframes: dead registers become
+  tombstones, `objects` is the whole unswept heap with `next_gc`, and tables
+  carry their physical array part. Decided by Bart except K3 (physical
+  arrays), which was decided by judgement after an unanswered question and
+  supersedes doc 14 Phase 7.
 - **Rev 7** (this; approved by both). Folds the rev 6 reviews (codex REVISE,
   antigravity APPROVE). The rev 7 reviews' should-fixes (a non-vacuous
   captured-slot test, and the option (ii) hook) are folded in place:

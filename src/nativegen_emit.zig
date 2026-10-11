@@ -2473,6 +2473,23 @@ pub fn emitGStore(a: *x64.Assembler, t: *const Trace, alloc: *const Alloc, ins: 
     const preg = try arrayFieldReg(a, alloc, garow_ins.a, .present, .rax);
     const pflat = try refBaseReg(a, alloc, ins.a, .rcx);
     try a.btsMemReg(preg, 0, pflat);
+
+    // Raise the row's logical length as `gridSet` does:
+    // `row_len[row0] = max(row_len[row0], col)`, `col` 1-based. The guards prove
+    // only `col <= stride`, so a store past the row's length is legitimate, and
+    // without this a later deflation would drop the cell (native printed nil where
+    // tier-0 printed the value). The allocator keeps the garow token and the
+    // column live to here. A grid with a row to store into has a `row_len`.
+    const tb = try refBaseReg(a, alloc, garow_ins.a, .rax);
+    try a.movRegMem(.rax, tb, ArrLayout.array_base + ArrLayout.row_len);
+    try placeToReg(a, .rcx, placeOfRef(alloc, gcell_ins.a)); // rcx = row0
+    try a.leaRegMemSib(.rax, .rax, .rcx, 4, 0); // rax = &row_len[row0]
+    try placeToReg(a, .rcx, placeOfRef(alloc, gcell_ins.b)); // rcx = col
+    const done = try a.label();
+    try a.cmpMem32Reg(.rax, 0, .rcx);
+    try a.jcc(.ae, done); // row_len >= col: already covers the cell
+    try a.storeMemReg(.rax, 4, 0, .rcx);
+    a.bind(done);
 }
 
 pub fn emitPhiValueFlush(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, p: trace.IrInstr) !void {

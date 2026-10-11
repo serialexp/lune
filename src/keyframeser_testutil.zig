@@ -50,6 +50,10 @@ pub fn sFloat(v: f64) schema.SnapValue {
 pub fn sRef(id: u32) schema.SnapValue {
     return .{ .tag = 4, .body = .{ .HeapRef = .{ .id = id } } };
 }
+/// A register (`Keyframe.stack` entry) holding `sv`.
+pub const reg = keyframeser.stackValueOf;
+/// A register tombstone (doc 61 Phase K).
+pub const regDead = keyframeser.dead_slot;
 /// Restore the given file and assert it fails with exactly `want`.
 pub fn expectRestoreError(file: schema.SnapshotFile, root: *const Proto, want: RestoreError) !void {
     const gpa = testing.allocator;

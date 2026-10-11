@@ -355,10 +355,6 @@ pub const FrameResult = packed struct(u32) { reg: u16, count: u16 };
 /// for — capture rejects the cut if the live `stack_top` no longer matches.
 pub const FinalCut = struct { result_base: u32, result_count: u32, stack_top: u32 };
 
-/// Doc 21 Phase A: the capture-policy mask handed to the `.snapshot` root
-/// walk — only stack slots inside `[base, base+len)` seed the walk.
-pub const ResultSpan = struct { base: u32, len: u32 };
-
 /// An open upvalue: a cell still pointing at the live stack slot `index`. Tracked
 /// so that two closures capturing the same variable share one cell, and so the
 /// cell can be *closed* (detached) when its slot is about to be freed. Public so
@@ -651,8 +647,8 @@ pub const Vm = struct {
     /// caller's — the same disjointness the SoA register file itself relies on.
     boundary_scratch: []Value,
     /// Doc 61 §6.1: the collector's register keep-set, one bit per stack slot
-    /// (`stack_slots` bits, 8 KiB), rebuilt by every `.gc` root walk
-    /// (`buildGcKeep`) over `[0, stack_top)`. A set bit is rooted; a clear
+    /// (`stack_slots` bits, 8 KiB), rebuilt by every root walk
+    /// (`fillKeep`) over `[0, stack_top)`. A set bit is rooted; a clear
     /// bit is a dead window slot that `collect` scrubs to nil before the
     /// sweep. Allocated once at init, so a collection allocates nothing.
     gc_keep: []u64,
@@ -756,10 +752,10 @@ pub const Vm = struct {
     /// VALIDATED — not trusted — by snapshot capture (`depth == 0`, matching
     /// `stack_top`, in-bounds span), and invalidated by anything that reuses
     /// the stack (`pushFrameVararg`, `beginTopLevelEpoch`, `callValue` entry,
-    /// the `protectedCall` manual unwind). Capture canonicalizes every final
-    /// stack slot OUTSIDE the span to nil in the `.snapshot` walk + stack
-    /// serialization, making the final snapshot a pure function of the
-    /// program's logical result regardless of which tier produced the state.
+    /// the `protectedCall` manual unwind). Through `fillKeep`, the collector
+    /// roots only the span and capture tombstones every slot outside it, so
+    /// the final snapshot is a pure function of the program's logical result
+    /// regardless of which tier produced the state.
     final_cut: ?FinalCut = null,
     /// Effect-log mode (F2d): `off` (default — natives run normally, nothing
     /// logged), `record` (run effects + append each result to `effect_log`), or
@@ -807,11 +803,6 @@ pub const Vm = struct {
     /// the draw stream is a stable part of the language: a given seed reproduces
     /// the same sequence across runs and across the native/wasm engines.
     rng: ?std.Random.Xoshiro256 = null,
-    /// Source text, set only when `record_safepoint_lines` is on (the replay
-    /// driver needs it to map each safepoint's pending instruction span to a
-    /// 1-based line). Empty otherwise; the hot path never reads it unless
-    /// recording is enabled.
-    source: []const u8 = "",
     /// When true, append the 1-based source line of each safepoint's pending
     /// instruction to `safepoint_lines` (the replay driver's line-grain index).
     /// Off by default so tier-0 pays nothing — the normal run path is untouched.
@@ -837,8 +828,8 @@ pub const Vm = struct {
     /// Chunks compiled at runtime by `load`/`loadfile`/`dofile`. A `load` closure
     /// can outlive the call that created it, so the VM owns each compiled `Chunk`
     /// (its arena holds the proto tree) plus a NUL-terminated copy of the source
-    /// the protos point at (`Proto.source`, used for error line numbers and, in
-    /// L-2, recompile-on-restore). Freed in `deinit` in append order.
+    /// it was compiled from (the keyframe recompiles it on restore, L-2). Freed
+    /// in `deinit` in append order.
     loaded_chunks: std.ArrayList(LoadedChunk) = .empty,
     /// Next proto id to hand out. Seeded to the static chunk's proto count in
     /// `run`/`start` so every dynamically-`load`ed proto gets a globally-unique id
@@ -854,9 +845,10 @@ pub const Vm = struct {
     /// compiles chunk B, then runs chunk A (which GCs), then runs B would have B's
     /// literals swept before B ever runs, dangling its `load_const`s. `retainChunk`
     /// adds B's root proto here; `forEachRootHeader` roots its whole tree's heap
-    /// constants in BOTH the `.gc` and `.snapshot` walks (the latter so their ids
-    /// survive a snapshot straddle — retained chunks are host-authored program
-    /// image, re-supplied on restore like the main `root`).
+    /// constants, so a keyframe (which carries every unswept object, doc 61
+    /// Phase K) keeps their ids across a snapshot straddle — retained chunks
+    /// are host-authored program image, re-supplied on restore like the main
+    /// `root`.
     ///
     /// **Borrows only** (non-owning): the host still owns each `Chunk` and frees it.
     /// Contract: `releaseChunk(proto)` BEFORE the host `Chunk.deinit()`s the tree,
@@ -869,9 +861,9 @@ pub const Vm = struct {
     /// long as the ref lives. Slots are generational (a freed-and-reused index
     /// bumps `generation`, so a stale ref is a deterministic API error, never a
     /// dangling read); freed slots hold nil so the root walk cannot mark stale
-    /// pointers. Rooted in the **`.gc` walk only** (`forEachRootHeader`): host
-    /// refs are host state, not guest-deterministic state, so they must not
-    /// perturb `.snapshot` bytes (same split as trace consts).
+    /// pointers. Rooted by the collector (`forEachRootHeader`). Host refs are
+    /// host state, not guest-deterministic state, and keyframes do not carry
+    /// them.
     host_refs: std.ArrayList(HostRefSlot) = .empty,
     /// Free slot indices for `host_refs` (LIFO reuse).
     host_ref_free_list: std.ArrayList(u32) = .empty,
@@ -892,7 +884,7 @@ pub const Vm = struct {
     parked_inline: [6]Value = @splat(Value.nil()),
     parked_inline_len: u32 = 0,
     /// Test builds only (doc 60 §6.1): when set, `runFastPath` decides from
-    /// the nine fields directly (`fastBlockReference`) instead of the packed
+    /// the ten fields directly (`fastBlockReference`) instead of the packed
     /// `trace.fast_block`, so a differential test's reference leg cannot share
     /// a mask bug with the leg under test. Read only under `builtin.is_test`,
     /// but a plain `bool` in every build: the hand-written host-call entry's
@@ -935,7 +927,7 @@ pub const Vm = struct {
 
     /// Root every heap constant in a proto tree through `cb` (mirrors
     /// `gc.markProtoConstants`, but emits headers so it serves both the collector and
-    /// the snapshot walk). Compiler-produced protos only (the `retainChunk` contract):
+    /// the loaded-chunk pin). Compiler-produced protos only (the `retainChunk` contract):
     /// the compiler emits exactly interned-string and scalar constants, never a
     /// `row_view` fat value — so `isHeap → asHeap` is complete, matching the item-5
     /// trace-const loop.
@@ -962,9 +954,9 @@ pub const Vm = struct {
     /// that compiles in a loop. Pinned objects survive sweep unmarked
     /// (`gc.Heap.sweep`) and are freed at heap teardown like everything else;
     /// liveness is unchanged (these constants were unconditionally rooted
-    /// before), so determinism and heap ids are untouched. The `.snapshot`
-    /// walk still enumerates them (`forEachRootHeader`) — snapshot semantics
-    /// know nothing of pinning. On append failure the caller still owns
+    /// before), so determinism and heap ids are untouched. Keyframes carry
+    /// them like every other unswept object (doc 61 Phase K) and know nothing
+    /// of pinning. On append failure the caller still owns
     /// chunk + source (the append-first OOM contracts at the call sites hold).
     pub fn appendLoadedChunk(self: *Vm, lc: LoadedChunk) !void {
         try self.loaded_chunks.append(self.gpa, lc);
@@ -1754,7 +1746,7 @@ pub const Vm = struct {
     /// `clearRetainingCapacity()` goes here too, after this same guard.
     fn beginTopLevelEpoch(self: *Vm) Error!void {
         if (self.depth != 0) return error.DirtyTopLevelEntry;
-        self.final_cut = null; // doc 21: the previous run's cut is stale now
+        self.retireFinalCut(); // doc 21: the previous run's cut is stale now
         self.trace.disarmAllLinks();
         // Retire the whole trace cache at the epoch boundary (doc 17 H-2 part 3): a
         // trace's proto-literal string konsts must not root interned strings across a
@@ -1824,18 +1816,15 @@ pub const Vm = struct {
         // Doc 61 §4.2: a parent in flight is inside its own instruction (a
         // metamethod's `.add`, a native's `.call`), not one past a call.
         const pc: usize = if (is_top or f.in_flight) f.pc else f.pc -| 1;
+        // The compiler stamped the span with its line in the proto's own chunk,
+        // so a runtime-`load`ed chunk reports its own lines.
         const span: bytecode.Span = if (pc < proto.spans.len) proto.spans[pc] else .{};
-        // Resolve the line against the proto's *own* source when it has one (a
-        // runtime-`load`ed chunk), falling back to the VM's main source for
-        // statically-compiled / hand-built protos. Without this, errors raised
-        // inside loaded code would report line numbers against the main chunk.
-        const src = if (proto.source.len > 0) proto.source else self.source;
         return .{
             .proto = proto,
             .base = f.base,
             .pc = pc,
             .span = span,
-            .line = compiler.lineFromOffset(src, span.start),
+            .line = span.line,
         };
     }
 
@@ -1978,7 +1967,7 @@ pub const Vm = struct {
     /// Call only immediately after `run`/`exec` returned `err`: it inspects live
     /// registers, so nothing must have executed since. `arena` owns the returned
     /// message.
-    pub fn describeFault(self: *Vm, source: []const u8, err: Error, arena: std.mem.Allocator) std.mem.Allocator.Error!Fault {
+    pub fn describeFault(self: *Vm, err: Error, arena: std.mem.Allocator) std.mem.Allocator.Error!Fault {
         // No frame (e.g. main chunk too big for the stack) → just the error name.
         if (self.depth == 0) return .{ .message = try arena.dupe(u8, @errorName(err)) };
 
@@ -1997,7 +1986,7 @@ pub const Vm = struct {
                 .line = if (cs) |c| c.line else 0,
                 .start = if (cs) |c| c.span.start else 0,
                 .end = if (cs) |c| c.span.end else 0,
-                .frames = try self.backtraceFrames(source, arena),
+                .frames = try self.backtraceFrames(arena),
                 .self_located = true,
             };
         }
@@ -2010,9 +1999,7 @@ pub const Vm = struct {
         const instr = proto.code[pc];
         const regs = self.frameWindow(frame.base, proto.num_registers);
         const span: bytecode.Span = if (pc < proto.spans.len) proto.spans[pc] else .{};
-        // Per-proto source so a fault inside a `load`ed chunk reports its own line.
-        const leaf_src = if (proto.source.len > 0) proto.source else source;
-        const line = compiler.lineFromOffset(leaf_src, span.start);
+        const line = span.line;
 
         const message: []const u8 = switch (err) {
             Error.StackOverflow => try arena.dupe(u8, "stack overflow"),
@@ -2053,7 +2040,7 @@ pub const Vm = struct {
             },
         };
 
-        const frames = try self.backtraceFrames(source, arena);
+        const frames = try self.backtraceFrames(arena);
         return .{ .message = message, .line = line, .start = span.start, .end = span.end, .frames = frames };
     }
 
@@ -2067,7 +2054,7 @@ pub const Vm = struct {
     /// instruction, which `pc` names). Shared by `describeFault` (runtime
     /// errors) and the replay driver (per-step backtrace), so the leaf-vs-call-site
     /// logic can never drift. `arena` owns the returned slice.
-    pub fn backtraceFrames(self: *Vm, source: []const u8, arena: std.mem.Allocator) std.mem.Allocator.Error![]FaultFrame {
+    pub fn backtraceFrames(self: *Vm, arena: std.mem.Allocator) std.mem.Allocator.Error![]FaultFrame {
         const frames = try arena.alloc(FaultFrame, self.depth);
         var i: usize = self.depth;
         while (i > 0) {
@@ -2076,12 +2063,9 @@ pub const Vm = struct {
             const fp = f.closure.proto;
             const fpc: usize = if (i == self.depth - 1 or f.in_flight) f.pc else f.pc -| 1;
             const fspan: bytecode.Span = if (fpc < fp.spans.len) fp.spans[fpc] else .{};
-            // Per-proto source (a `load`ed chunk reports its own lines), falling
-            // back to the passed source for statically-compiled protos.
-            const fsrc = if (fp.source.len > 0) fp.source else source;
             frames[self.depth - 1 - i] = .{
                 .name = fp.name,
-                .line = compiler.lineFromOffset(fsrc, fspan.start),
+                .line = fspan.line,
                 .start = fspan.start,
                 .end = fspan.end,
             };
@@ -2237,7 +2221,7 @@ pub const Vm = struct {
         // Before anything mutates, as in `callValue` (`runPushedFrame` keeps
         // its own copy for the H3 entry, which pushes without this function).
         std.debug.assert(self.suspend_ctl == null);
-        self.final_cut = null; // doc 21: host reentry reuses the stack
+        if (self.final_cut != null) self.retireFinalCut(); // doc 21: host reentry reuses the stack
         if (self.native_reentry_depth >= max_native_reentry) return Error.StackOverflow;
         return self.bindAndPushClosure(cl, args);
     }
@@ -2268,7 +2252,7 @@ pub const Vm = struct {
         std.debug.assert(entry_depth == 0 or self.frames[entry_depth - 1].in_flight);
         self.native_reentry_depth += 1;
         defer self.native_reentry_depth -= 1;
-        self.final_cut = null;
+        if (self.final_cut != null) self.retireFinalCut();
         const cl = self.frames[entry_depth].closure;
         return switch (try self.execWithEntry(cl, cl.proto, base, entry_depth + 1)) {
             .finished => |fr| fr,
@@ -2375,7 +2359,7 @@ pub const Vm = struct {
         if (!callee.isHeap()) return Error.TypeError;
         std.debug.assert(!self.reg_top_pending);
         std.debug.assert(self.suspend_ctl == null);
-        self.final_cut = null; // doc 21: host reentry reuses the stack
+        if (self.final_cut != null) self.retireFinalCut(); // doc 21: host reentry reuses the stack
         if (self.native_reentry_depth >= max_native_reentry) return Error.StackOverflow;
         self.native_reentry_depth += 1;
         defer self.native_reentry_depth -= 1;
@@ -2503,7 +2487,7 @@ pub const Vm = struct {
         var arena_inst = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_inst.deinit();
         const a = arena_inst.allocator();
-        const fault = try self.describeFault(self.source, e, a);
+        const fault = try self.describeFault(e, a);
         // A raised value (`error`/`assert`/`badArg`) already carries its own
         // `chunk:line:`; intern it verbatim. A bare runtime fault (`nil + 1`,
         // indexing nil, a native's generic bad-argument) is reported by Lua with a
@@ -2531,7 +2515,7 @@ pub const Vm = struct {
         self.heap.beginCollect() catch return;
         // The root set is defined once in `forEachRootHeader`; marking is just
         // "call `markHeader` on each root".
-        self.forEachRootHeader(.gc, null, self.heap, gc.Heap.markHeader);
+        self.forEachRootHeader(self.heap, gc.Heap.markHeader);
         self.heap.traceAll();
         self.invalidateDeadTraceConsts();
         self.scrubDeadRegisters();
@@ -2647,25 +2631,10 @@ pub const Vm = struct {
     /// Doc 61 §4: the masked part of frame `i`'s window: `live_in` at the
     /// frame's shape pc, cut at `limit` window-relative registers. Null when
     /// the frame is kept whole (§4.5: a non-maskable proto or an unknown
-    /// shape). Public for debuggers (doc 61 Phase V). `buildGcKeep` adds
-    /// varargs spans and open upvalues on top, so in general this
-    /// under-approximates what a collection keeps. For the innermost frame
-    /// at a suspend point the two agree on its window (captured registers
-    /// are live everywhere; varargs sit below their own frame's base), so
-    /// the visualiser labels a register dead exactly when a collection there
-    /// may scrub it.
-    pub const FrameMask = struct {
-        row: []const u64,
-        limit: usize,
+    /// shape). `fillKeep` adds varargs spans and open upvalues on top.
+    const FrameMask = struct { row: []const u64, limit: usize };
 
-        /// Whether the frame's bytecode mask keeps window register `reg`.
-        pub fn keeps(self: FrameMask, reg: usize) bool {
-            if (reg >= self.limit) return false;
-            return (self.row[reg / 64] >> @intCast(reg % 64)) & 1 != 0;
-        }
-    };
-
-    pub fn frameMask(self: *const Vm, i: usize) ?FrameMask {
+    fn frameMask(self: *const Vm, i: usize) ?FrameMask {
         const f = &self.frames[i];
         const proto = f.closure.proto;
         if (!proto.maskable) return null;
@@ -2690,17 +2659,57 @@ pub const Vm = struct {
         return .{ .row = proto.reg_live.row(@intCast(shape.pc)), .limit = @min(limit, nreg) };
     }
 
-    /// Doc 61 §6.1/§6.2: fill `gc_keep` over `[0, stack_top)`. Gaps between
-    /// windows (host argument regions, parked callees, dynamic spans, the
-    /// depth-0 result span) and unmasked windows are kept whole. A masked
-    /// window keeps its frame's mask, every frame's varargs span and every
-    /// open upvalue's slot. All windows are cleared before any mask is ORed
-    /// in, so even overlapping windows could only keep more, never drop a
-    /// slot another frame needs. O(stack_top / 64 + Σ window words + aliases),
-    /// no allocation.
-    fn buildGcKeep(self: *Vm) void {
+    /// Doc 21 Phase A: the published final cut, if it still describes this VM.
+    /// All upvalues are closed before every pop, so open ones mean invalid
+    /// metadata. Any miss returns null, and `fillKeep` then keeps the whole
+    /// depth-0 stack, the fail-safe.
+    pub fn validFinalCut(self: *const Vm) ?FinalCut {
+        if (self.depth != 0) return null;
+        const fc = self.final_cut orelse return null;
+        if (fc.stack_top != self.stack_top) return null;
+        if (@as(usize, fc.result_base) + fc.result_count > self.stack_top) return null;
+        if (self.open_upvalues.items.len != 0) return null;
+        return fc;
+    }
+
+    /// Invalidate the final cut before anything reuses the stack (a host
+    /// reentry, a fresh run, a C-API fault). At a validated cut every slot
+    /// outside the result span is dead: capture tombstoned it, and a restored
+    /// VM holds nil there. Nil it here as well. Otherwise, once the cut is
+    /// gone, `fillKeep` keeps the old prefix whole and roots the stale values
+    /// the restored VM never had (Codex review of doc 61 Phase K). O(stack_top)
+    /// once per finished run; later clears find no cut.
+    pub fn retireFinalCut(self: *Vm) void {
+        if (self.validFinalCut()) |fc| {
+            const end = @as(usize, fc.result_base) + fc.result_count;
+            self.fillNil(0, fc.result_base);
+            self.fillNil(end, self.stack_top - end);
+        }
+        self.setFinalCut(null);
+    }
+
+    /// Doc 61 §6.1/§6.2: fill `keep` (at least `stack_top / 64` rounded up
+    /// words) over `[0, stack_top)`. At a validated final state
+    /// (`validFinalCut`) only the top-level result span is kept: nothing
+    /// reads the rest before the stack is reused, which clears the cut.
+    /// Otherwise gaps between windows (host argument regions, parked callees,
+    /// dynamic spans) and unmasked windows are kept whole. A masked window
+    /// keeps its frame's mask, every frame's varargs span and every open
+    /// upvalue's slot. All windows are cleared before any mask is ORed in, so
+    /// even overlapping windows could only keep more, never drop a slot
+    /// another frame needs. O(stack_top / 64 + Σ window words + aliases), no
+    /// allocation. The collector fills `gc_keep`; keyframe capture fills its
+    /// own buffer and tombstones the rest (Phase K), so both drop exactly the
+    /// same slots, and a restored VM, which re-derives the cut, keeps the
+    /// same ones.
+    pub fn fillKeep(self: *const Vm, keep_buf: []u64) void {
         const top = self.stack_top;
-        const keep = self.gc_keep[0 .. (top + 63) / 64];
+        const keep = keep_buf[0 .. (top + 63) / 64];
+        if (self.validFinalCut()) |fc| {
+            @memset(keep, 0);
+            setBitRange(keep, fc.result_base, @as(usize, fc.result_base) + fc.result_count);
+            return;
+        }
         @memset(keep, ~@as(u64, 0));
         for (0..self.depth) |i| {
             if (self.frameMask(i) == null) continue;
@@ -2760,16 +2769,16 @@ pub const Vm = struct {
 
     /// Visit every GC root that is a heap object, invoking `cb(ctx, header)` once
     /// per root edge. This is the **single source of truth** for "what is live
-    /// from outside the heap." Both consumers drive it, so they can never drift:
-    /// the collector (`collect`, with `cb = markHeader`) and the keyframe
-    /// serializer (`keyframeser.encodeSnapshot`, which seeds its reachable-set
-    /// walk). A non-heap root `Value` (a scalar register/const) is skipped here —
-    /// `cb` only ever sees heap headers.
+    /// from outside the heap", driven by the collector (`collect`, with
+    /// `cb = markHeader`). Keyframe capture does not walk roots: it serializes
+    /// every unswept object (doc 61 Phase K). A non-heap root `Value` (a scalar
+    /// register/const) is skipped here — `cb` only ever sees heap headers.
     ///
-    /// Roots, in a fixed order (so a snapshot's object ordering is deterministic):
+    /// Roots, in a fixed order:
     ///   1. globals — user globals and the installed natives (e.g. `print`),
     ///      plus their interned name keys.
-    ///   2. live registers across every active frame.
+    ///   2. the registers the doc 61 keep-set names (`fillKeep`); `collect`
+    ///      scrubs the rest before the sweep.
     ///   3. the closures executing in each active frame (`frames[0..depth]` —
     ///      keeps their proto constants reachable).
     ///   4. open upvalue cells (live by construction — about to be closed).
@@ -2785,76 +2794,33 @@ pub const Vm = struct {
     ///      parked in `effect_log` must outlive collection until it is serialized
     ///      (record) or fed back to the program (replay). Without this root, the
     ///      sweep would de-intern and free an otherwise-unreferenced result string.
-    pub const RootKind = enum {
-        /// The collector's root set: every live pointer, including host-held
-        /// refs and parked C-boundary results.
-        gc,
-        /// The snapshot's *semantic* root set: what the restored guest can name.
-        /// Excludes host state so snapshot bytes are identical whatever the
-        /// host holds.
-        snapshot,
-    };
     pub fn forEachRootHeader(
         self: *Vm,
-        comptime kind: RootKind,
-        snapshot_mask: ?ResultSpan,
         ctx: anytype,
         comptime cb: fn (@TypeOf(ctx), *object.GcHeader) void,
     ) void {
-        // Doc 21 Phase A: at a validated final-state capture the `.snapshot`
-        // walk seeds ONLY from the top-level result span — a heap object whose
-        // only reference is a dead slot is semantic garbage, and excluding it
-        // makes the reachable SET (not just the stack bytes) a pure function
-        // of the program's logical state. The `.gc` walk never takes this
-        // result-span mask: it masks each frame by bytecode liveness instead
-        // (doc 61), which is not the snapshot's business.
-        if (kind == .gc) std.debug.assert(snapshot_mask == null);
         cb(ctx, &self.globals.header);
-        if (kind == .gc) {
-            // Doc 61 §6: only the registers the keep-set names. `collect`
-            // scrubs the rest before the sweep.
-            self.buildGcKeep();
-            self.forEachKeptRegister(ctx, cb);
-        } else {
-            var i: usize = if (snapshot_mask) |m| m.base else 0;
-            const hi: usize = if (snapshot_mask) |m| @as(usize, m.base) + m.len else self.stack_top;
-            while (i < hi) : (i += 1) {
-                const v = self.regGet(i);
-                if (v.isHeap()) cb(ctx, v.asHeap());
-            }
-        }
+        self.fillKeep(self.gc_keep);
+        self.forEachKeptRegister(ctx, cb);
         for (self.frames[0..self.depth]) |f| cb(ctx, @constCast(&f.closure.header));
         for (self.open_upvalues.items) |ou| cb(ctx, &ou.cell.header);
         // Host-retained chunks (docs/design/03 §"Chunk-constant rooting"): keep a
         // compiled-but-not-yet-run chunk's interned constants alive across the
-        // compile→run window. Rooted in BOTH walks (unlike host refs): membership is a mode-invariant host action, so serializing their ids in the
-        // `.snapshot` walk is byte-identical across all modes and lets a snapshot
-        // straddle preserve constant-id continuity (the host re-supplies + re-retains
-        // on restore, like the main `root`). Discovery order = retain order.
+        // compile→run window.
         for (self.retained_chunks.items) |proto| rootProtoConsts(proto, ctx, cb);
-        // Loaded chunks (docs/design/19): a `load`/`loadfile`/`dofile`/`require`
-        // chunk's protos are VM-owned until deinit (`loaded_chunks` never shrinks),
-        // so their interned constants live for the VM's lifetime too. In the
-        // `.gc` walk they are NOT re-rooted here: `appendLoadedChunk` pinned
-        // them once (sweep never frees a pinned object), and walking every
-        // loaded tree every cycle made GC cost grow with every `load`/`mh_eval`.
-        // The `.snapshot` walk still enumerates them: membership is
-        // deterministic guest behaviour, hence mode-invariant, so the snapshot
-        // stays byte-identical across modes and restore preserves constant-id
-        // continuity (keyframe v8's zero-allocation recompile invariant). Their
-        // guaranteed liveness (via the pin) means a trace const over a loaded
-        // proto never dooms its trace (`Heap.willFree` excludes pinned).
-        if (kind == .snapshot) {
-            for (self.loaded_chunks.items) |lc| rootProtoConsts(lc.chunk.proto, ctx, cb);
-        }
-        if (kind == .gc) {
-            // Embedding (doc 59 §3.3): host-held refs and parked C-boundary
-            // results are GC-liveness roots ONLY — host state must never leak
-            // into snapshot bytes (freed ref slots hold nil, so no stale marks).
-            for (self.host_refs.items) |slot| if (slot.value.isHeap()) cb(ctx, slot.value.asHeap());
-            for (self.parked_inline[0..self.parked_inline_len]) |v| if (v.isHeap()) cb(ctx, v.asHeap());
-            for (self.parked_results.items) |v| if (v.isHeap()) cb(ctx, v.asHeap());
-        }
+        // Loaded chunks (docs/design/19) are NOT re-rooted here: a
+        // `load`/`loadfile`/`dofile`/`require` chunk's protos are VM-owned until
+        // deinit, and `appendLoadedChunk` pinned their interned constants once
+        // (sweep never frees a pinned object). Walking every loaded tree every
+        // cycle made GC cost grow with every `load`/`mh_eval`. The pin also means
+        // a trace const over a loaded proto never dooms its trace
+        // (`Heap.willFree` excludes pinned).
+        //
+        // Embedding (doc 59 §3.3): host-held refs and parked C-boundary results
+        // (freed ref slots hold nil, so no stale marks).
+        for (self.host_refs.items) |slot| if (slot.value.isHeap()) cb(ctx, slot.value.asHeap());
+        for (self.parked_inline[0..self.parked_inline_len]) |v| if (v.isHeap()) cb(ctx, v.asHeap());
+        for (self.parked_results.items) |v| if (v.isHeap()) cb(ctx, v.asHeap());
         for (self.effect_log.items) |e| if (e.result.isHeap()) cb(ctx, e.result.asHeap());
         // 7. the in-flight Lua error value — rooted while parked between a raise and
         //    its catch. Load-bearing for the `xpcall` handler path, which allocates
@@ -2915,11 +2881,11 @@ pub const Vm = struct {
             const result_end = @as(usize, fr.reg) + fr.count;
             if (result_end <= self.regCapacity()) {
                 if (result_end > self.stack_top) self.stack_top = result_end;
-                self.final_cut = .{
+                self.setFinalCut(.{
                     .result_base = fr.reg,
                     .result_count = fr.count,
                     .stack_top = @intCast(self.stack_top),
-                };
+                });
             }
         }
         return outcome;
@@ -3019,7 +2985,7 @@ pub const Vm = struct {
     /// short — the hook consumes the pending anchor at the very next reach of that
     /// pc — after which `.fast` resumes.
     ///
-    /// Doc 60 §5.4: the nine conditions are packed into `trace.fast_block`, so
+    /// Doc 60 §5.4: the ten conditions are packed into `trace.fast_block`, so
     /// this is one 16-bit load and compare. Debug builds check the word
     /// bit-for-bit against `fastBlockReference` on every call.
     inline fn runFastPath(self: *const Vm) bool {
@@ -3028,14 +2994,22 @@ pub const Vm = struct {
         return self.trace.fast_block == 0;
     }
 
-    /// Doc 60 §5.4: the `fast_block` word recomputed from the nine fields it
+    /// Doc 60 §5.4: the `fast_block` word recomputed from the ten fields it
     /// mirrors — the reference the packed word is asserted against.
     pub fn fastBlockReference(self: *const Vm) u16 {
         const FastBit = trace.TraceState.FastBit;
         var w = self.trace.traceFastBits();
         if (self.suspend_ctl != null) w |= FastBit.vm_suspend;
         if (self.record_safepoint_lines) w |= FastBit.vm_safepoint_lines;
+        if (self.final_cut != null) w |= FastBit.vm_final_cut;
         return w;
+    }
+
+    /// Publish (or, with null, drop) the final cut. Use `retireFinalCut` to
+    /// drop it before reusing the stack.
+    pub fn setFinalCut(self: *Vm, fc: ?FinalCut) void {
+        self.final_cut = fc;
+        self.trace.setFastBit(trace.TraceState.FastBit.vm_final_cut, fc != null);
     }
 
     /// Arm (or, with null, disarm) the mid-execution suspend trigger.
@@ -3286,11 +3260,7 @@ pub const Vm = struct {
         // incremented, nothing after this step run (§4.2).
         if (mode == .full and self.record_safepoint_lines) {
             const proto = st.proto;
-            const sp_src = if (proto.source.len > 0) proto.source else self.source;
-            const sp_line: u32 = if (pc < proto.spans.len)
-                compiler.lineFromOffset(sp_src, proto.spans[pc].start)
-            else
-                0;
+            const sp_line: u32 = if (pc < proto.spans.len) proto.spans[pc].line else 0;
             self.safepoint_lines.append(self.gpa, sp_line) catch |e| return parkErr(st, e);
         }
 
@@ -7872,9 +7842,11 @@ pub const Vm = struct {
             const t = table.Table.fromHeader(container.asHeap());
             // Inflation trigger (Phase 4b): a homogeneous-numeric nested table
             // becomes a grid on the first fused store; `no_grid` makes the (≤ O(cells))
-            // scan fire at most once per table.
+            // scan fire at most once per table. The globals table never
+            // qualifies: global stores (`set_global`, the C API) write it raw,
+            // and a grid takes no raw store (Table.set).
             if (!t.array.isGrid() and !t.no_grid) {
-                if (!self.heap.inflateToGrid(t)) t.no_grid = true;
+                if (t == self.globals or !self.heap.inflateToGrid(t)) t.no_grid = true;
             }
             if (t.array.isGrid()) {
                 if (try self.gridCellStore(t, key1, key2, val)) return;

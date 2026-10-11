@@ -670,8 +670,8 @@ table.replay-vars td {
   color: var(--fg);
 }
 
-/* A register no path reads before overwriting it (doc 61 Phase V): its value
-   is stale, or nil once a collection has scrubbed it. */
+/* A register no path reads before overwriting it (doc 61 Phases V and K): the
+   keyframe carries a tombstone for it, not a value. */
 .replay-var-dead .replay-var-name,
 .replay-var-dead .replay-var-val {
   color: var(--muted);

@@ -226,12 +226,6 @@ const ReplayResult = extern struct {
     /// Appended last so prior JS field offsets stay stable.
     proto_id: u32 = 0,
     pc: u32 = 0,
-    /// Doc 61 Phase V: one byte per register of the innermost frame's window,
-    /// 1 when a collection at this step roots it (`Vm.frameMask`), 0 when the
-    /// register is dead: no path from `pc` reads it before writing it, and a
-    /// collection may already have set it to nil. Empty when finished, or
-    /// when the frame is rooted whole (a non-maskable proto).
-    live: Buf = .{},
 };
 
 /// Wrap an owned byte slice as a `Buf` (transfers ownership to JS; freed by
@@ -412,7 +406,6 @@ export fn mahina_free_replay_result(res: ?*ReplayResult) void {
     freeBuf(r.keyframe);
     freeBuf(r.diag);
     freeBuf(r.backtrace);
-    freeBuf(r.live);
     gpa.destroy(r);
 }
 
@@ -453,7 +446,6 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
         defer gpa.free(effects);
         try vm.effect_log.appendSlice(gpa, effects);
     }
-    vm.source = src0;
     // Pure tier-0: trace recording/execution stays off (the default), so each
     // instruction is one safepoint — matching `Result.safepoint_count`.
     vm.setSuspendCtl(.{ .after_safepoints = @min(@as(u64, stop_after), safepoint_cap) });
@@ -476,7 +468,7 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
         // A runtime fault during replay: surface it the same way the live run does
         // (located message + backtrace), plus whatever printed before it.
         res.status = 1;
-        const fault = try vm.describeFault(src0, err, gpa);
+        const fault = try vm.describeFault(err, gpa);
         res.diag = bufFromSlice(@constCast(fault.message));
         res.current_line = fault.line;
         res.current_start = fault.start;
@@ -498,20 +490,15 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
             res.pc = @intCast(frame.pc);
             if (frame.pc < proto.spans.len) {
                 const span = proto.spans[frame.pc];
-                res.current_line = mahina.compiler.lineFromOffset(src0, span.start);
+                res.current_line = span.line;
                 res.current_start = span.start;
                 res.current_end = span.end;
             }
             // Deepest-first call chain at this step (same encoding as a fault's).
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            const frames = try vm.backtraceFrames(src0, arena.allocator());
+            const frames = try vm.backtraceFrames(arena.allocator());
             res.backtrace = bufFromSlice(try encodeBacktrace(frames));
-            if (vm.frameMask(vm.depth - 1)) |mask| {
-                const live = try gpa.alloc(u8, proto.num_registers);
-                for (live, 0..) |*b, reg| b.* = @intFromBool(mask.keeps(reg));
-                res.live = bufFromSlice(live);
-            }
         },
         .finished => {
             // Ran to completion before `stop_after`: final state, no pending line.
@@ -648,7 +635,7 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8) !void {
         // Located, Lua-style message from the un-popped faulting frame. The
         // message is freshly `gpa`-allocated by `describeFault`, so hand its
         // ownership straight to the Result (freed by `mahina_free_result`).
-        const fault = try vm.describeFault(src0, err, gpa);
+        const fault = try vm.describeFault(err, gpa);
         res.diag = bufFromSlice(@constCast(fault.message));
         res.error_line = fault.line;
         res.error_start = fault.start;
@@ -679,13 +666,13 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8) !void {
     // failure here just leaves `safepoint_count == 0` (no replay offered); the
     // run itself already succeeded. The proto is immutable, so re-running it on a
     // fresh VM is sound; `vm` is still alive (its `effect_log` is the input).
-    buildReplayIndex(res, chunk.proto, src0, vm.effect_log.items);
+    buildReplayIndex(res, chunk.proto, vm.effect_log.items);
 
     // Disassemble every proto once for the step-replay bytecode view. The proto
     // tree is static and its ids are stable across compiles (deterministic
     // `assignProtoIds`), so the disassembly the record run emits here aligns with
     // the cursor (`proto_id`/`pc`) a replay step reports. Best-effort.
-    buildDisasm(res, chunk.proto, src0);
+    buildDisasm(res, chunk.proto);
 }
 
 /// The maximum number of safepoints the replay index records (and the ceiling
@@ -700,11 +687,11 @@ const safepoint_cap: u64 = 1_000_000;
 /// replaying `effects` through a fresh pure-tier-0 VM with the safepoint-line
 /// recorder on. Best-effort — swallows errors (the replay affordance is simply
 /// absent on failure).
-fn buildReplayIndex(res: *Result, proto: *const mahina.bytecode.Proto, src0: [:0]const u8, effects: []const mahina.interp.Effect) void {
-    buildReplayIndexInner(res, proto, src0, effects) catch {};
+fn buildReplayIndex(res: *Result, proto: *const mahina.bytecode.Proto, effects: []const mahina.interp.Effect) void {
+    buildReplayIndexInner(res, proto, effects) catch {};
 }
 
-fn buildReplayIndexInner(res: *Result, proto: *const mahina.bytecode.Proto, src0: [:0]const u8, effects: []const mahina.interp.Effect) !void {
+fn buildReplayIndexInner(res: *Result, proto: *const mahina.bytecode.Proto, effects: []const mahina.interp.Effect) !void {
     var vm = try mahina.interp.Vm.init(gpa);
     defer vm.deinit();
 
@@ -716,7 +703,6 @@ fn buildReplayIndexInner(res: *Result, proto: *const mahina.bytecode.Proto, src0
 
     vm.effect_mode = .replay;
     try vm.effect_log.appendSlice(gpa, effects);
-    vm.source = src0;
     vm.setRecordSafepointLines(true);
     // Arm a suspend at the cap: if the program needs more safepoints than the cap,
     // we stop there (capped) instead of building an unbounded index.
@@ -740,8 +726,8 @@ fn encodeU32Array(values: []const u32) ![]u8 {
 /// Populate `res.disasm` with a static disassembly of the whole proto tree (the
 /// bytecode the step-replay panel renders). Best-effort — swallows errors (the
 /// bytecode view is simply absent on failure; the run already succeeded).
-fn buildDisasm(res: *Result, root: *const mahina.bytecode.Proto, src0: [:0]const u8) void {
-    res.disasm = bufFromSlice(buildDisasmBlob(root, src0) catch return);
+fn buildDisasm(res: *Result, root: *const mahina.bytecode.Proto) void {
+    res.disasm = bufFromSlice(buildDisasmBlob(root) catch return);
 }
 
 /// Encode the proto tree as a self-describing little-endian blob:
@@ -756,7 +742,7 @@ fn buildDisasm(res: *Result, root: *const mahina.bytecode.Proto, src0: [:0]const
 ///       u32 text_len, [text_len]u8 text   (rendered via bytecode.writeInstr)
 /// Protos are emitted in pre-order (root first, then children), matching the id
 /// assignment order — but consumers index by `id`, not position.
-fn buildDisasmBlob(root: *const mahina.bytecode.Proto, src0: [:0]const u8) ![]u8 {
+fn buildDisasmBlob(root: *const mahina.bytecode.Proto) ![]u8 {
     var protos: std.ArrayList(*const mahina.bytecode.Proto) = .empty;
     defer protos.deinit(gpa);
     try collectProtos(&protos, root);
@@ -773,10 +759,7 @@ fn buildDisasmBlob(root: *const mahina.bytecode.Proto, src0: [:0]const u8) ![]u8
         try appendU16(&buf, proto.num_registers);
         try appendU32(&buf, @intCast(proto.code.len));
         for (proto.code, 0..) |instr, i| {
-            const line: u32 = if (i < proto.spans.len)
-                mahina.compiler.lineFromOffset(src0, proto.spans[i].start)
-            else
-                0;
+            const line: u32 = if (i < proto.spans.len) proto.spans[i].line else 0;
             try appendU32(&buf, line);
 
             // Render this one instruction into a scratch buffer (instructions are

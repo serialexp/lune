@@ -193,17 +193,16 @@ test "restore is the exact inverse of capture (byte-identical re-snapshot)" {
     );
 }
 
-test "keyframe: a live grid deflates at capture and round-trips byte-identically (doc 14)" {
-    // A matrix left *flattened* at final state must serialize as its logical nested
-    // form — a grid is an in-memory optimisation, never written to the wire — and
-    // re-snapshot byte-identically. `encodeSnapshot` deflates all grids up front;
-    // restore only ever builds nested tables, so the re-capture matches.
+test "keyframe: a live grid round-trips physically and byte-identically (doc 14, doc 61 Phase K)" {
+    // A matrix left *flattened* at final state serializes as a grid — whether a
+    // table is a grid decides its later deflation allocations, so it is state —
+    // and restore rebuilds the grid, so the re-capture matches.
     try expectRoundTrip(
         \\m = { {1,2,3}, {4,5,6} }
         \\m[1][1] = 10            -- inflate to a grid; still reachable from globals
     );
-    // Reshaped (grown stride) + lane-widened, still a grid at capture; deflation
-    // must reproduce the grown box and the widened cells as plain row tables.
+    // Reshaped (grown stride) + lane-widened, still a grid at capture: the grown
+    // stride and the widened cell lane come back as they were.
     try expectRoundTrip(
         \\m = { {1,2}, {3,4} }
         \\m[1][1] = 9
@@ -212,7 +211,7 @@ test "keyframe: a live grid deflates at capture and round-trips byte-identically
         \\result = m
     );
     // A self-referential outer table that *also* holds a flattened matrix: the
-    // matrix deflates, the cycle and the sibling string key round-trip unchanged.
+    // matrix stays a grid, the cycle and the sibling string key round-trip unchanged.
     try expectRoundTrip(
         \\g = {}
         \\g.grid = { {1,2}, {3,4} }
@@ -564,17 +563,14 @@ test "H-2: next_obj_id survives pre-cut garbage (restored verbatim, not reconstr
     try testing.expectEqualSlices(u8, sf, sf2);
 }
 
-test "chunk rooting: retained-chunk constants survive a snapshot straddle iff the host re-retains in the same order" {
+test "chunk rooting: retained-chunk constants survive a snapshot straddle in any re-retain order" {
     const gpa = testing.allocator;
     // docs/design/03 §"Chunk-constant rooting", restore path A. Three host chunks
     // X/Y/Z are compiled and RETAINED but never run — their only reachability is the
-    // borrow list, so their distinctive literals "olx"/"oly"/"olz" enter the snapshot
-    // via the .snapshot root walk (rooting retained chunks in BOTH walks is what makes
-    // the ids survive). Because the snapshot serializes in root-DISCOVERY order and
-    // that order is the retain order, byte-identity across the straddle requires the
-    // host to re-compile + re-retain in the SAME order on restore. Re-retaining in a
-    // different order re-serializes the same objects in different positions → the
-    // bytes differ, which is exactly why `releaseChunk` uses `orderedRemove`.
+    // borrow list, so their distinctive literals "olx"/"oly"/"olz" are kept alive by
+    // the collector's root walk and enter the snapshot as unswept objects. The host
+    // re-compiles + re-retains on restore; the bytes are identical whatever the
+    // order, because a keyframe serializes objects by id (doc 61 Phase K).
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
 
@@ -639,8 +635,9 @@ test "chunk rooting: retained-chunk constants survive a snapshot straddle iff th
         try testing.expectEqualSlices(u8, b0, b1);
     }
 
-    // Re-retaining in REVERSED order re-serializes the same constants in different
-    // discovery positions → the bytes must differ (guards the ordering contract).
+    // Re-retaining in REVERSED order gives the same bytes too: a keyframe
+    // carries every unswept object in id order (doc 61 Phase K), so the retain
+    // order no longer shows (it used to set the walk's discovery order).
     {
         const vm3 = try restore(gpa, b0, cm.proto, NativeRegistry.base());
         defer {
@@ -662,7 +659,7 @@ test "chunk rooting: retained-chunk constants survive a snapshot straddle iff th
 
         const b2 = try encodeSnapshot(gpa, vm3);
         defer gpa.free(b2);
-        try testing.expect(!std.mem.eql(u8, b0, b2));
+        try testing.expectEqualSlices(u8, b0, b2);
     }
 }
 
@@ -1096,6 +1093,7 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
             .globals_id = 2,
             .string_metatable_id = 0,
             .next_obj_id = 8,
+            .next_gc = 1024,
             .objects = &.{
                 .{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "a\x00b\xff\xfe" } } },
                 .{ .id = 1, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "" } } },
@@ -1110,6 +1108,10 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
                                 .{ .key = sInt(7), .val = sRef(2) }, // self-ref
                             },
                             .metatable_id = 0,
+                            .lane = 0,
+                            .flags = 0,
+                            .rehash_threshold = 4,
+                            .grid = &.{},
                         },
                     },
                 },
@@ -1119,7 +1121,7 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
                 .{ .id = 5, .obj_type = 4, .body = .{ .HeapUpvalue = .{ .closed = 0, .value = sRef(2) } } },
                 .{ .id = 7, .obj_type = 3, .body = .{ .HeapNative = .{ .name = "print" } } },
             },
-            .stack = &.{ sRef(2), sInt(-1) },
+            .stack = &.{ util.reg(sRef(2)), util.reg(sInt(-1)) },
             // Both stub protos have num_registers == 0, so contiguity wants base 0
             // for both frames (this corpus exercises structural restore, not resume).
             .frames = &.{
@@ -1184,10 +1186,15 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
         .globals_id = 0,
         .string_metatable_id = 0,
         .next_obj_id = 1,
+        .next_gc = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
             .array = &.{ sInt(10), sInt(11) },
             .entries = &.{.{ .key = sInt(0), .val = sInt(99) }},
             .metatable_id = 0,
+            .lane = 0,
+            .flags = 0,
+            .rehash_threshold = 4,
+            .grid = &.{},
         } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1200,10 +1207,15 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
         .globals_id = 0,
         .string_metatable_id = 0,
         .next_obj_id = 1,
+        .next_gc = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
             .array = &.{sInt(10)},
             .entries = &.{.{ .key = sFloat(0.0), .val = sInt(99) }},
             .metatable_id = 0,
+            .lane = 0,
+            .flags = 0,
+            .rehash_threshold = 4,
+            .grid = &.{},
         } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1218,10 +1230,15 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
             .globals_id = 0,
             .string_metatable_id = 0,
             .next_obj_id = 1,
+            .next_gc = 1024,
             .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
                 .array = &.{sInt(10)},
                 .entries = &.{.{ .key = sInt(1), .val = sInt(99) }},
                 .metatable_id = 0,
+                .lane = 0,
+                .flags = 0,
+                .rehash_threshold = 4,
+                .grid = &.{},
             } } }},
             .stack = &.{},
             .frames = &.{},
@@ -1238,65 +1255,171 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
     }
 }
 
-test "restore: bulk lane rebuild — a slot-0-hole narrow run repacks + freezes; heap-bearing stays .value" {
+/// A keyframe whose only object is the globals table `ht` (doc 61 Phase K
+/// array-part tests). `obj` is the caller's storage for the objects slice.
+fn oneTableFile(obj: *[1]schema.HeapObject, ht: schema.HeapTable) schema.SnapshotFile {
+    obj.* = .{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = ht } }};
+    return .{ .version = snapshot_format_version, .keyframe = .{
+        .globals_id = 0,
+        .string_metatable_id = 0,
+        .next_obj_id = 1,
+        .next_gc = 1024,
+        .objects = obj,
+        .stack = &.{},
+        .frames = &.{},
+        .open_upvalues = &.{},
+        .loaded_chunks = &.{},
+    } };
+}
+
+/// The globals array of `tableInGlobalsFile`. File scope, so the slice it
+/// hands out outlives the call.
+const globals_holding_id1 = [_]schema.SnapValue{ sNil(), sRef(1) };
+
+/// A keyframe whose globals table (id 0) holds the table `ht` (id 1) at key
+/// 1 — for a table globals may not be, such as a grid.
+fn tableInGlobalsFile(obj: *[2]schema.HeapObject, ht: schema.HeapTable) schema.SnapshotFile {
+    obj.* = .{
+        .{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{ .array = &globals_holding_id1, .entries = &.{}, .metatable_id = 0, .lane = 0, .flags = 0, .rehash_threshold = 4, .grid = &.{} } } },
+        .{ .id = 1, .obj_type = 1, .body = .{ .HeapTable = ht } },
+    };
+    return .{ .version = snapshot_format_version, .keyframe = .{
+        .globals_id = 0,
+        .string_metatable_id = 0,
+        .next_obj_id = 2,
+        .next_gc = 1024,
+        .objects = obj,
+        .stack = &.{},
+        .frames = &.{},
+        .open_upvalues = &.{},
+        .loaded_chunks = &.{},
+    } };
+}
+
+test "restore: the array part comes back in its captured lane, commitment and rehash trigger, not recomputed ones" {
     const gpa = testing.allocator;
+    const Lane = @import("array.zig").Lane;
+    var rootp = Proto{ .code = &.{}, .name = "root", .id = 0 };
+    const frozen: u8 = 1;
+    const no_grid: u8 = 2;
+    var obj: [1]schema.HeapObject = undefined;
+
+    // Each case is a lane the values do not dictate: a frozen boolean run
+    // behind a slot-0 hole, an unfrozen `.value` part holding only small
+    // ints (optimalLane would say u8), and a frozen i32 part whose values
+    // now fit i8 (the lane only ever widened). Each carries its own rehash
+    // trigger, which no table contents determine either.
+    const Case = struct { array: []const schema.SnapValue, lane: Lane, flags: u8, rehash: u64 };
+    const cases = [_]Case{
+        .{ .array = &.{ sNil(), sBool(true), sBool(false), sBool(true) }, .lane = .boolean, .flags = frozen, .rehash = 4 },
+        .{ .array = &.{ sNil(), sInt(1), sInt(2) }, .lane = .value, .flags = no_grid, .rehash = 34 },
+        .{ .array = &.{ sNil(), sInt(1), sInt(-2) }, .lane = .i32, .flags = frozen | no_grid, .rehash = 10 },
+    };
+    for (cases) |c| {
+        const vm = try restoreSnapshot(gpa, oneTableFile(&obj, .{
+            .array = c.array,
+            .entries = &.{},
+            .metatable_id = 0,
+            .lane = @intFromEnum(c.lane),
+            .flags = c.flags,
+            .rehash_threshold = c.rehash,
+            .grid = &.{},
+        }), &rootp, NativeRegistry.base());
+        defer {
+            vm.deinit();
+            gpa.destroy(vm);
+        }
+        const t = vm.globals;
+        try testing.expectEqual(c.lane, t.array.lane);
+        try testing.expectEqual(c.flags & frozen != 0, t.array.frozen);
+        try testing.expectEqual(c.flags & no_grid != 0, t.no_grid);
+        try testing.expectEqual(c.rehash, t.rehash_threshold);
+        try testing.expectEqual(c.array.len, t.array.asize);
+        try testing.expect(t.array.get(0).isNil()); // the slot-0 hole survived
+    }
+
+    // A trigger below 4 is one no capture produces.
+    try expectRestoreError(oneTableFile(&obj, .{ .array = &.{}, .entries = &.{}, .metatable_id = 0, .lane = 0, .flags = 0, .rehash_threshold = 3, .grid = &.{} }), &rootp, error.InvalidRehashThreshold);
+
+    // A value that does not fit the serialized lane, an unknown lane, and a
+    // grid lane with no grid are all corrupt.
+    try expectRestoreError(oneTableFile(&obj, .{ .array = &.{ sNil(), sInt(300) }, .entries = &.{}, .metatable_id = 0, .lane = @intFromEnum(Lane.i8), .flags = 0, .rehash_threshold = 4, .grid = &.{} }), &rootp, error.InvalidTableLane);
+    try expectRestoreError(oneTableFile(&obj, .{ .array = &.{}, .entries = &.{}, .metatable_id = 0, .lane = 200, .flags = 0, .rehash_threshold = 4, .grid = &.{} }), &rootp, error.InvalidTableLane);
+    try expectRestoreError(oneTableFile(&obj, .{ .array = &.{}, .entries = &.{}, .metatable_id = 0, .lane = @intFromEnum(Lane.grid), .flags = frozen, .rehash_threshold = 4, .grid = &.{} }), &rootp, error.InvalidTableLane);
+}
+
+test "restore: a grid array part round-trips cells, holes and row lengths" {
+    const gpa = testing.allocator;
+    const Lane = @import("array.zig").Lane;
     var rootp = Proto{ .code = &.{}, .name = "root", .id = 0 };
 
-    // [nil, true, false, true]: a leading hole would defeat append's eager
-    // commit, so without the bulk rebuild this stays `.value` — untraceable.
+    var obj: [2]schema.HeapObject = undefined;
+    // 2 rows × stride 3, u8 cells. Row 0 = {5, hole, 7}; row 1 = {9} but with
+    // row_len 2 (a later nil store never shrinks a row).
+    const good: schema.GridPart = .{
+        .elem = @intFromEnum(Lane.u8),
+        .stride = 3,
+        .row_len = &.{ 3, 2 },
+        .cells = &.{ sInt(5), sNil(), sInt(7), sInt(9), sNil(), sNil() },
+    };
+    const good_table: schema.HeapTable = .{
+        .array = &.{},
+        .entries = &.{},
+        .metatable_id = 0,
+        .lane = @intFromEnum(Lane.grid),
+        .flags = 1,
+        .rehash_threshold = 4,
+        .grid = &.{good},
+    };
     {
-        const vm = try restoreSnapshot(gpa, .{ .version = snapshot_format_version, .keyframe = .{
-            .globals_id = 0,
-            .string_metatable_id = 0,
-            .next_obj_id = 1,
-            .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
-                .array = &.{ sNil(), sBool(true), sBool(false), sBool(true) },
-                .entries = &.{},
-                .metatable_id = 0,
-            } } }},
-            .stack = &.{},
-            .frames = &.{},
-            .open_upvalues = &.{},
-            .loaded_chunks = &.{},
-        } }, &rootp, NativeRegistry.base());
+        const vm = try restoreSnapshot(gpa, tableInGlobalsFile(&obj, good_table), &rootp, NativeRegistry.base());
         defer {
             vm.deinit();
             gpa.destroy(vm);
         }
-        const arrp = &vm.globals.array;
-        try testing.expectEqual(@import("array.zig").Lane.boolean, arrp.lane);
-        try testing.expect(arrp.frozen); // monotonic from here (widen-only)
-        try testing.expect(arrp.get(0).isNil()); // the hole survived the repack
-        try testing.expectEqual(true, arrp.get(1).asBool());
-        try testing.expectEqual(false, arrp.get(2).asBool());
+        const g = &table.Table.fromHeader(vm.globals.get(Value.int(1)).asHeap()).array;
+        try testing.expect(g.isGrid());
+        try testing.expectEqual(Lane.u8, g.grid_elem);
+        try testing.expectEqual(@as(usize, 2), g.gridRows());
+        try testing.expectEqual(@as(usize, 3), g.stride);
+        try testing.expectEqual(@as(usize, 3), g.gridRowLen(0));
+        try testing.expectEqual(@as(usize, 2), g.gridRowLen(1));
+        try testing.expectEqual(@as(i64, 5), g.gridGet(0, 0).asInt());
+        try testing.expect(g.gridGet(0, 1).isNil());
+        try testing.expectEqual(@as(i64, 7), g.gridGet(0, 2).asInt());
+        try testing.expectEqual(@as(i64, 9), g.gridGet(1, 0).asInt());
+        try testing.expect(g.gridGet(1, 1).isNil());
+
+        // Recapture is the identity on the grid.
+        const bytes = try keyframeser.encodeSnapshot(gpa, vm);
+        defer gpa.free(bytes);
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const back = try schema.SnapshotFile.decode(arena.allocator(), bytes);
+        const ht = back.keyframe.objects[1].body.HeapTable;
+        try testing.expectEqual(@as(usize, 1), ht.grid.len);
+        try testing.expectEqualSlices(u32, good.row_len, ht.grid[0].row_len);
+        try testing.expectEqual(good.cells.len, ht.grid[0].cells.len);
     }
-    // A heap-bearing array must stay `.value` and unfrozen (a later rehash may
-    // still narrow if the contents settle).
-    {
-        const vm = try restoreSnapshot(gpa, .{ .version = snapshot_format_version, .keyframe = .{
-            .globals_id = 0,
-            .string_metatable_id = 0,
-            .next_obj_id = 2,
-            .objects = &.{
-                .{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
-                    .array = &.{ sNil(), sRef(1) },
-                    .entries = &.{},
-                    .metatable_id = 0,
-                } } },
-                .{ .id = 1, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "s" } } },
-            },
-            .stack = &.{},
-            .frames = &.{},
-            .open_upvalues = &.{},
-            .loaded_chunks = &.{},
-        } }, &rootp, NativeRegistry.base());
-        defer {
-            vm.deinit();
-            gpa.destroy(vm);
-        }
-        try testing.expectEqual(@import("array.zig").Lane.value, vm.globals.array.lane);
-        try testing.expect(!vm.globals.array.frozen);
+
+    // Malformed grids: a cell past its row length, a cell that does not fit
+    // the cell lane, a cell count that is not rows × stride, a non-bitmap cell
+    // lane, and a grid alongside array values.
+    const bad_grids = [_]schema.GridPart{
+        .{ .elem = good.elem, .stride = 3, .row_len = &.{ 1, 2 }, .cells = good.cells },
+        .{ .elem = good.elem, .stride = 3, .row_len = good.row_len, .cells = &.{ sInt(500), sNil(), sInt(7), sInt(9), sNil(), sNil() } },
+        .{ .elem = good.elem, .stride = 3, .row_len = good.row_len, .cells = good.cells[0..5] },
+        .{ .elem = @intFromEnum(Lane.boolean), .stride = 3, .row_len = good.row_len, .cells = good.cells },
+    };
+    for (bad_grids) |bg| {
+        try expectRestoreError(tableInGlobalsFile(&obj, .{ .array = &.{}, .entries = &.{}, .metatable_id = 0, .lane = @intFromEnum(Lane.grid), .flags = 1, .rehash_threshold = 4, .grid = &.{bg} }), &rootp, error.InvalidTableLane);
     }
+    try expectRestoreError(tableInGlobalsFile(&obj, .{ .array = &.{sInt(1)}, .entries = &.{}, .metatable_id = 0, .lane = @intFromEnum(Lane.grid), .flags = 1, .rehash_threshold = 4, .grid = &.{good} }), &rootp, error.InvalidTableLane);
+
+    // Globals never inflate (global stores write them raw), so a grid there is
+    // corrupt.
+    var one: [1]schema.HeapObject = undefined;
+    try expectRestoreError(oneTableFile(&one, good_table), &rootp, error.GlobalsNotATable);
 }
 
 test "restore surfaces specific errors for malformed snapshots" {
@@ -1307,10 +1430,15 @@ test "restore surfaces specific errors for malformed snapshots" {
         .globals_id = 0,
         .string_metatable_id = 0,
         .next_obj_id = 1,
+        .next_gc = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
             .array = &.{},
             .entries = &.{.{ .key = sInt(1), .val = sRef(77) }},
             .metatable_id = 0,
+            .lane = 0,
+            .flags = 0,
+            .rehash_threshold = 4,
+            .grid = &.{},
         } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1323,6 +1451,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .globals_id = 0,
         .string_metatable_id = 0,
         .next_obj_id = 1,
+        .next_gc = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = 99, .upvalue_ids = &.{} } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1335,6 +1464,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .globals_id = 0,
         .string_metatable_id = 0,
         .next_obj_id = 1,
+        .next_gc = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 3, .body = .{ .HeapNative = .{ .name = "nope" } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1347,6 +1477,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .globals_id = 0,
         .string_metatable_id = 0,
         .next_obj_id = 1,
+        .next_gc = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "x" } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1359,6 +1490,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .globals_id = 5,
         .string_metatable_id = 0,
         .next_obj_id = 6,
+        .next_gc = 1024,
         .objects = &.{
             .{ .id = 5, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "a" } } },
             .{ .id = 5, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "b" } } },
@@ -1374,6 +1506,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .globals_id = 0,
         .string_metatable_id = 0,
         .next_obj_id = 1,
+        .next_gc = 1024,
         .objects = &.{},
         .stack = &.{},
         .frames = &.{},
@@ -1388,6 +1521,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .globals_id = 0,
         .string_metatable_id = 0,
         .next_obj_id = 2,
+        .next_gc = 1024,
         .objects = &.{
             .{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "dup" } } },
             .{ .id = 1, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "dup" } } },
@@ -1398,18 +1532,23 @@ test "restore surfaces specific errors for malformed snapshots" {
         .loaded_chunks = &.{},
     } }, &rootp, error.DuplicateInternedString);
 
-    // L-2: the restored id space is exhausted (an object names the top *genuine*
-    // id — the reserved high half is for phantom grid rows, doc 14 Phase 7) AND the
-    // snapshot carries a loaded chunk to recompile — recompiling would allocate
-    // fresh interned strings that wrap the counter into the restored range. Reject.
+    // L-2: the restored id space is exhausted (an object names the top id) AND
+    // the snapshot carries a loaded chunk to recompile — recompiling would
+    // allocate fresh interned strings that wrap the counter into the restored
+    // range. Reject.
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
-        .globals_id = 0,
+        .globals_id = std.math.maxInt(u32),
         .string_metatable_id = 0,
-        .next_obj_id = gc.reserved_grid_id_base,
-        .objects = &.{.{ .id = gc.reserved_grid_id_base - 1, .obj_type = 1, .body = .{ .HeapTable = .{
+        .next_obj_id = std.math.maxInt(u32),
+        .next_gc = 1024,
+        .objects = &.{.{ .id = std.math.maxInt(u32), .obj_type = 1, .body = .{ .HeapTable = .{
             .array = &.{},
             .entries = &.{},
             .metatable_id = 0,
+            .lane = 0,
+            .flags = 0,
+            .rehash_threshold = 4,
+            .grid = &.{},
         } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1425,10 +1564,15 @@ test "restore surfaces specific errors for malformed snapshots" {
         .globals_id = 5,
         .string_metatable_id = 0,
         .next_obj_id = 3,
+        .next_gc = 1024,
         .objects = &.{.{ .id = 5, .obj_type = 1, .body = .{ .HeapTable = .{
             .array = &.{},
             .entries = &.{},
             .metatable_id = 0,
+            .lane = 0,
+            .flags = 0,
+            .rehash_threshold = 4,
+            .grid = &.{},
         } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1438,13 +1582,10 @@ test "restore surfaces specific errors for malformed snapshots" {
 }
 
 test "doc 32: a heterogeneous `.value` array survives round-trip and still records post-restore" {
-    // Doc 32's snapshot constraint, pinned. `keyframeser.zig` repacks a
-    // `.value` array back down to a narrow lane on restore when its elements
-    // are homogeneous, so a test that seeded an all-int array would silently
-    // stop testing `.value` the moment it crossed the boundary. `a` is
-    // deliberately HETEROGENEOUS (199 ints and one float), which is exactly
-    // the case the repack must decline — so the restored VM really is reading
-    // a `.value` lane.
+    // Doc 32's snapshot constraint, pinned. `a` is HETEROGENEOUS (199 ints
+    // and one float), so it sits in the `.value` lane before the cut, and
+    // since doc 61 Phase K restore brings the array back in that captured lane
+    // — the restored VM really is reading a `.value` lane.
     //
     // Pins (a) resumed output == uninterrupted tier-0 output, and (b) the
     // restored VM commits a trace at all. (b) matters because restore builds a

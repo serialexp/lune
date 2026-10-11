@@ -48,7 +48,7 @@ function runTransferables(r: MahinaRunResult): Transferable[] {
 }
 
 function replayTransferables(r: MahinaReplayResult): Transferable[] {
-  return [r.keyframe.buffer, r.live.buffer] as Transferable[];
+  return [r.keyframe.buffer] as Transferable[];
 }
 
 self.onmessage = async (ev: MessageEvent<Req>) => {

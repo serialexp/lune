@@ -1,5 +1,5 @@
 //! Doc 60 §5.4 / §6.1: the packed fast-path word. `trace.fast_block` must
-//! equal `Vm.fastBlockReference()` (the nine-condition predicate, rebuilt
+//! equal `Vm.fastBlockReference()` (the ten-condition predicate, rebuilt
 //! from the fields) bit for bit after EVERY transition — not just agree on
 //! "zero or not", which could hide a missing or extra bit while another
 //! condition is set. Each test drives the real mutation methods (setters and
@@ -28,7 +28,7 @@ const proto = Proto{ .code = &.{}, .name = "fb", .num_registers = 2 };
 const key_a: AnchorKey = .{ .proto = &proto, .pc = 4 };
 const key_b: AnchorKey = .{ .proto = &proto, .pc = 7 };
 
-test "fast_block: each of the nine conditions owns exactly its bit" {
+test "fast_block: each of the ten conditions owns exactly its bit" {
     var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
     try expectWord(&vm, 0);
@@ -41,6 +41,11 @@ test "fast_block: each of the nine conditions owns exactly its bit" {
     vm.setRecordSafepointLines(true);
     try expectWord(&vm, Bit.vm_safepoint_lines);
     vm.setRecordSafepointLines(false);
+    try expectWord(&vm, 0);
+
+    vm.setFinalCut(.{ .result_base = 0, .result_count = 0, .stack_top = 0 });
+    try expectWord(&vm, Bit.vm_final_cut);
+    vm.retireFinalCut();
     try expectWord(&vm, 0);
 
     const ts = &vm.trace;
@@ -249,7 +254,8 @@ test "fast_block: a recording that commits and one that aborts itself mid-record
         vm.setRecordSafepointLines(true);
         try util.compileRun(testing.allocator, &vm, lifecycle_src);
         try testing.expect(vm.trace.registry.cache.items.len > 0);
-        try expectWord(&vm, Bit.vm_safepoint_lines);
+        // The finished run published its final cut.
+        try expectWord(&vm, Bit.vm_safepoint_lines | Bit.vm_final_cut);
     }
     // Self-abort: an 8-instruction budget kills each recording inside
     // `rec.recordInstr` (`too_long`), the path with no `TraceState.abort`.
@@ -262,7 +268,7 @@ test "fast_block: a recording that commits and one that aborts itself mid-record
         var too_long = false;
         for (vm.trace.abort_log.items) |r| too_long = too_long or r.reason == .too_long;
         try testing.expect(too_long);
-        try expectWord(&vm, Bit.vm_safepoint_lines);
+        try expectWord(&vm, Bit.vm_safepoint_lines | Bit.vm_final_cut);
     }
 }
 

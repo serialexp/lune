@@ -1,5 +1,5 @@
 //! Keyframe snapshot serialization (Phase 7 v2 — F2a) — the bridge between a
-//! live VM's reachable heap graph + roots and its on-disk snapshot form.
+//! live VM's heap + roots and its on-disk snapshot form.
 //!
 //! Mirrors `traceser.zig`: the wire format is defined once, declaratively, in
 //! `schema/trace.json` (binschema); `tools/regen-trace-schema.sh` generates the
@@ -8,7 +8,7 @@
 //! onto the generated schema structs.
 //!
 //! A keyframe is "the whole VM state at a moment": a flat array of every
-//! reachable heap object (keyed by its stable `GcHeader.id`, never an address)
+//! unswept heap object (keyed by its stable `GcHeader.id`, never an address)
 //! plus the roots (the globals table, the live register window, the active frame
 //! closures, and the open upvalues). Every inter-object edge is an id, so the
 //! object graph is reproducible and address-independent — the property
@@ -85,7 +85,15 @@ pub const schema = @import("gen/trace_schema.zig");
 /// native exit flush's frozen pre-burst values) into the bytes or the reachable
 /// set. No structural schema change; the bump exists because two encoders must
 /// never emit different bytes for one logical state under one version number.
-pub const snapshot_format_version: u32 = 9;
+///
+/// v10 (doc 61 Phase K): `objects` is every unswept object in ascending id
+/// order, not the reachable set; `next_gc` is new; `stack` is `StackValue`,
+/// where a slot dead at capture (outside the collector's keep set, or outside
+/// the v9 result span at a final state) is a `DeadSlot` tombstone, not nil.
+/// `HeapTable` carries its array part physically — `lane`, `flags` (frozen,
+/// no_grid) and a live grid as `grid` — so capture no longer deflates grids and
+/// restore reproduces the representation that decides later inflation.
+pub const snapshot_format_version: u32 = 10;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -101,11 +109,57 @@ pub fn toSchemaValue(v: Value) schema.SnapValue {
         // view is produced only transiently by a fused `a[i][j]` and consumed
         // within that one opcode — it never persists in a register across a
         // safepoint, and any *bare* access deflates the grid first. Snapshots fall
-        // on opcode boundaries (safepoints), and `encodeSnapshot` additionally
-        // deflates all grids up front, so neither a register nor a table array can
-        // hand us one here.
+        // on opcode boundaries (safepoints), and a grid's cells are scalars read
+        // through `gridGet` (`toSchemaGrid`), so nothing can hand us one here.
         .row_view => unreachable,
     };
+}
+
+/// `HeapTable.flags` bits.
+const table_flag_frozen: u8 = 1 << 0;
+const table_flag_no_grid: u8 = 1 << 1;
+
+/// A grid array part on the wire: every `rows × stride` cell, row-major.
+fn toSchemaGrid(a: std.mem.Allocator, ap: *const arr.ArrayPart) !schema.GridPart {
+    const rows = ap.gridRows();
+    const row_len = try a.alloc(u32, rows);
+    for (row_len, 0..) |*rl, r| rl.* = @intCast(ap.gridRowLen(r));
+    const cells = try a.alloc(schema.SnapValue, rows * ap.stride);
+    for (0..rows) |r| {
+        for (0..ap.stride) |c| cells[r * ap.stride + c] = toSchemaValue(ap.gridGet(r, c));
+    }
+    return .{ .elem = @intFromEnum(ap.grid_elem), .stride = @intCast(ap.stride), .row_len = row_len, .cells = cells };
+}
+
+/// Rebuild a grid array part from the wire (doc 61 Phase K). Every cell must
+/// fit the cell lane and lie within its row's logical length; the grid's
+/// rows own keys `1..rows`, with no slot 0 (doc 18 D6).
+fn fromSchemaGrid(gpa: std.mem.Allocator, g: schema.GridPart) RestoreError!arr.ArrayPart {
+    const elem = std.enums.fromInt(arr.Lane, g.elem) orelse return error.InvalidTableLane;
+    if (elem == .grid or !elem.usesPresenceBitmap()) return error.InvalidTableLane;
+    const rows = g.row_len.len;
+    if (g.stride == 0) return error.InvalidTableLane;
+    const ncells = std.math.mul(usize, rows, g.stride) catch return error.InvalidTableLane;
+    if (g.cells.len != ncells) return error.InvalidTableLane;
+    var ap = try arr.ArrayPart.initGrid(gpa, rows, g.stride, elem);
+    errdefer ap.deinit(gpa);
+    for (g.row_len, 0..) |rl, r| {
+        if (rl > g.stride) return error.InvalidTableLane;
+        for (0..g.stride) |c| {
+            const v: Value = switch (g.cells[r * g.stride + c].body) {
+                .ConstNil => continue,
+                .ConstInt => |x| Value.int(x.v),
+                .ConstFloat => |x| Value.float(x.v),
+                .ConstBool, .HeapRef => return error.InvalidTableLane,
+            };
+            if (c >= rl or !arr.ArrayPart.laneFits(elem, v)) return error.InvalidTableLane;
+            ap.gridSet(r, c, v);
+        }
+        // A nil store never shrinks a row, so its length can exceed its last
+        // present cell; carry it verbatim.
+        ap.row_len.?[r] = rl;
+    }
+    return ap;
 }
 
 /// A table hash-part (key, value) pair, used to serialize in a canonical order.
@@ -133,7 +187,8 @@ fn sortedHashEntries(a: std.mem.Allocator, t: *const table.Table) ![]HashKV {
     var it = t.hash.iterator();
     var i: usize = 0;
     while (it.next()) |e| : (i += 1) kvs[i] = .{ .key = e.key, .val = e.value_ptr.* };
-    std.mem.sort(HashKV, kvs, {}, HashKV.lessThan);
+    // Keys are distinct, so the order is total and an unstable sort is exact.
+    std.mem.sortUnstable(HashKV, kvs, {}, HashKV.lessThan);
     return kvs;
 }
 
@@ -151,12 +206,22 @@ pub fn toSchemaHeapObject(a: std.mem.Allocator, vm: *Vm, h: *GcHeader) !schema.H
         .string => .{ .HeapString = .{ .bytes = string.String.fromHeader(h).bytes() } },
         .table => blk: {
             const t = table.Table.fromHeader(h);
-            const array = try a.alloc(schema.SnapValue, t.array.asize);
-            // Capture emits *logical* Values via `array.get`, so the snapshot bytes
-            // are independent of the in-memory lane (a packed bool/int array and an
-            // unpacked `.value` array with the same logical contents serialize
-            // identically). `get` is 1-based.
-            for (0..t.array.asize) |i| array[i] = toSchemaValue(t.array.get(i));
+            // Values are logical (`array.get`), and the lane rides beside them
+            // (doc 61 Phase K): it decides later grid inflation, hence later
+            // allocations, so restore must reproduce it. A grid is carried as
+            // a grid, with an empty `array`.
+            var array: []schema.SnapValue = &.{};
+            var grid: []schema.GridPart = &.{};
+            if (t.array.isGrid()) {
+                grid = try a.alloc(schema.GridPart, 1);
+                grid[0] = try toSchemaGrid(a, &t.array);
+            } else {
+                array = try a.alloc(schema.SnapValue, t.array.asize);
+                for (0..t.array.asize) |i| array[i] = toSchemaValue(t.array.get(i));
+            }
+            var flags: u8 = 0;
+            if (t.array.frozen) flags |= table_flag_frozen;
+            if (t.no_grid) flags |= table_flag_no_grid;
             const kvs = try sortedHashEntries(a, t);
             const entries = try a.alloc(schema.TableEntry, kvs.len);
             for (kvs, 0..) |kv, i| {
@@ -168,7 +233,15 @@ pub fn toSchemaHeapObject(a: std.mem.Allocator, vm: *Vm, h: *GcHeader) !schema.H
             // bare id cannot serve as the "none" sentinel: `setmetatable(t, _G)`
             // would round-trip as no-metatable and silently drop the edge.
             const mt_id: u32 = if (t.metatable) |m| m.header.id + 1 else 0;
-            break :blk .{ .HeapTable = .{ .array = array, .entries = entries, .metatable_id = mt_id } };
+            break :blk .{ .HeapTable = .{
+                .array = array,
+                .entries = entries,
+                .metatable_id = mt_id,
+                .lane = @intFromEnum(t.array.lane),
+                .flags = flags,
+                .rehash_threshold = t.rehash_threshold,
+                .grid = grid,
+            } };
         },
         .function => blk: {
             const cl = function.Closure.fromHeader(h);
@@ -191,91 +264,56 @@ pub fn toSchemaHeapObject(a: std.mem.Allocator, vm: *Vm, h: *GcHeader) !schema.H
     return .{ .id = h.id, .obj_type = @intFromEnum(h.type), .body = body };
 }
 
-/// The reachable-set walk: a read-only mirror of `gc`'s mark phase that collects
-/// every reachable header into an ordered list, **without** touching GC colour
-/// state or freeing anything. Seeded from the VM's roots via
-/// `Vm.forEachRootHeader` (the single root definition the collector also uses),
-/// then drained, enumerating each object's children exactly as `gc.blacken` does.
-/// All allocation is arena scratch; an OOM is stashed in `err` and surfaced after
-/// the walk (the void root-callback can't return one).
-const Walk = struct {
-    a: std.mem.Allocator,
-    /// Reachable objects in discovery order — the order they serialize in.
-    order: std.ArrayListUnmanaged(*GcHeader) = .empty,
-    /// Dedup set, keyed by stable id (an object is enqueued at most once).
-    seen: std.AutoHashMapUnmanaged(u32, void) = .empty,
-    err: ?std.mem.Allocator.Error = null,
+fn idLessThan(_: void, x: *GcHeader, y: *GcHeader) bool {
+    return x.id < y.id;
+}
 
-    fn push(self: *Walk, h: *GcHeader) void {
-        if (self.err != null) return;
-        const gop = self.seen.getOrPut(self.a, h.id) catch |e| {
-            self.err = e;
-            return;
-        };
-        if (gop.found_existing) return;
-        self.order.append(self.a, h) catch |e| {
-            self.err = e;
-        };
+/// Every unswept object on the heap, in ascending id order (doc 61 Phase K).
+/// Sorted rather than read off the sweep list, because restore links objects
+/// in its own pass order, so list order is not a function of the state.
+fn heapObjectsById(a: std.mem.Allocator, heap: *const gc.Heap) ![]*GcHeader {
+    const all = try a.alloc(*GcHeader, heap.object_count);
+    var n: usize = 0;
+    var it = heap.objects;
+    while (it) |h| : (it = h.next) {
+        all[n] = h;
+        n += 1;
     }
+    std.debug.assert(n == all.len);
+    // Ids are unique, so an unstable sort is exact. The sweep list is close
+    // to reverse allocation order, a run pdq detects in linear time.
+    std.mem.sortUnstable(*GcHeader, all, {}, idLessThan);
+    return all;
+}
 
-    fn pushValue(self: *Walk, v: Value) void {
-        if (v.isHeap()) self.push(v.asHeap());
-    }
+/// A register's wire form: its value, or a tombstone when capture dropped it.
+fn toStackValue(v: Value, kept: bool) schema.StackValue {
+    return if (kept) stackValueOf(toSchemaValue(v)) else dead_slot;
+}
 
-    /// Walk a prototype's constant pool (recursing nested protos) — the same
-    /// heap constants `gc.markProtoConstants` keeps alive from a live closure.
-    fn pushProtoConstants(self: *Walk, proto: *const Proto) void {
-        for (proto.constants) |c| self.pushValue(c);
-        for (proto.protos) |child| self.pushProtoConstants(child);
-    }
+/// A `DeadSlot` register tombstone.
+pub const dead_slot: schema.StackValue = .{ .tag = dead_slot_tag, .body = .{ .DeadSlot = .{ .pad = 0 } } };
 
-    fn enumerateChildren(self: *Walk, h: *GcHeader) void {
-        switch (h.type) {
-            .string, .native => {},
-            .table => {
-                const t = table.Table.fromHeader(h);
-                for (0..t.array.asize) |i| self.pushValue(t.array.get(i));
-                // Enumerate hash children in the same canonical key order the
-                // serializer uses, so BFS object-discovery order (and thus the
-                // `objects[]` array layout) is insertion-order-independent too.
-                const kvs = sortedHashEntries(self.a, t) catch |e| {
-                    self.err = e;
-                    return;
-                };
-                for (kvs) |kv| {
-                    self.pushValue(kv.key);
-                    self.pushValue(kv.val);
-                }
-                // The metatable edge (chunk 2a) — the same child `gc.blacken`
-                // marks. Without this, a metatable reachable ONLY via this edge
-                // (the common `setmetatable(t, {…})` with an anonymous metatable)
-                // is omitted from `objects[]`, yet the serializer still writes its
-                // id, so restore fails with `UnresolvedHeapRef`. The serializer and
-                // the GC must enumerate the identical child set.
-                if (t.metatable) |m| self.push(&m.header);
-            },
-            .upvalue => switch (function.Upvalue.fromHeader(h).loc) {
-                // Open ⇒ the value rides a live stack slot already seeded as a root.
-                .open => {},
-                .closed => |v| self.pushValue(v),
-            },
-            .function => {
-                const cl = function.Closure.fromHeader(h);
-                for (cl.upvalues) |uv| self.push(&uv.header);
-                self.pushProtoConstants(cl.proto);
-            },
-            else => {},
-        }
-    }
-};
+/// A `SnapValue` as a register: the same tag and body.
+pub fn stackValueOf(sv: schema.SnapValue) schema.StackValue {
+    return .{ .tag = sv.tag, .body = switch (sv.body) {
+        .ConstNil => |x| .{ .ConstNil = x },
+        .ConstBool => |x| .{ .ConstBool = x },
+        .ConstInt => |x| .{ .ConstInt = x },
+        .ConstFloat => |x| .{ .ConstFloat = x },
+        .HeapRef => |x| .{ .HeapRef = x },
+    } };
+}
+
+/// `StackValue.tag` of a `DeadSlot` tombstone, outside the `Value.Tag` space.
+pub const dead_slot_tag: u8 = 255;
 
 /// Serialize the whole live VM to a keyframe snapshot (a versioned
 /// `SnapshotFile`). The returned slice is owned by `gpa` (caller frees);
-/// intermediate schema structs and the reachable-set scratch live in an arena
-/// freed before return. The VM must be alive (the mapping borrows live string
-/// bytes). For F2a this is taken at the *final* state after `vm.run` returns, so
-/// the stack/frames/open-upvalues are empty — but globals and everything it
-/// reaches (tables, closures, upvalues, natives, their strings) are captured.
+/// intermediate schema structs live in an arena freed before return. The VM
+/// must be alive (the mapping borrows live string bytes). Carries every
+/// unswept heap object and the live register window with dead slots
+/// tombstoned (doc 61 Phase K).
 pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
     // Doc 61 P4: capture happens at suspend boundaries only, never inside a
     // native activation, whether called from bytecode or re-entered through
@@ -292,54 +330,31 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // 0. Deflate every live grid back to nested row Tables (doc 14, Phase 7). A
-    //    grid is an in-memory-only optimisation never written to the wire; capture
-    //    persists the logical nested form, so the snapshot is identical whether or
-    //    not a matrix happened to be flattened at this instant. After this no
-    //    `t.array.get` below can hit a grid (which would assert) and no `row_view`
-    //    can be produced.
-    try vm.heap.deflateAllGrids();
+    // Capture reads the VM and never mutates it (doc 61 Phase K: grids are
+    // carried as grids, so nothing deflates).
+    //
+    // 1. Every unswept object, garbage included (doc 61 Phase K). Allocation
+    //    and collection points are tier-identical, and only registers can be
+    //    stale, so this set is too. Carrying the garbage is what lets a
+    //    restored VM get the same intern hits and collect at the same points
+    //    (with `next_gc`) as the uninterrupted run.
+    const all = try heapObjectsById(a, vm.heap);
+    const objects = try a.alloc(schema.HeapObject, all.len);
+    for (all, 0..) |h, idx| objects[idx] = try toSchemaHeapObject(a, vm, h);
 
-    // 0b. Doc 21 Phase A capture policy, computed ONCE and passed to both
-    //     consumers (root walk + stack serialization) — neither re-derives VM
-    //     state. At a VALIDATED final state (depth 0, a published `final_cut`
-    //     whose `stack_top` still matches, in-bounds span, no open upvalues)
-    //     the only live stack content is the top-level result span; every
-    //     other slot is semantic garbage whose bytes are tier-dependent (the
-    //     H-5(i) divergence: tier-0's last-iteration temps vs the native exit
-    //     flush's frozen pre-burst values). Any validation miss → null → mask
-    //     nothing (fail-safe: exactly the pre-doc-21 capture).
-    const mask: ?interp.ResultSpan = blk: {
-        if (vm.depth != 0) break :blk null;
-        const fc = vm.final_cut orelse break :blk null;
-        if (fc.stack_top != vm.stack_top) break :blk null;
-        if (@as(usize, fc.result_base) + fc.result_count > vm.stack_top) break :blk null;
-        // All upvalues are closed before every pop, so this is empty at any
-        // genuine final state — treat a violation as invalid metadata (mask
-        // nothing) rather than risk serializing an open cell's slot as nil.
-        if (vm.open_upvalues.items.len != 0) break :blk null;
-        break :blk .{ .base = fc.result_base, .len = fc.result_count };
-    };
-
-    // 1. Enumerate the reachable heap graph from the VM roots.
-    var walk = Walk{ .a = a };
-    vm.forEachRootHeader(.snapshot, mask, &walk, Walk.push);
-    var i: usize = 0;
-    while (i < walk.order.items.len) : (i += 1) walk.enumerateChildren(walk.order.items[i]);
-    if (walk.err) |e| return e;
-
-    // 2. Map each object to its wire form.
-    const objects = try a.alloc(schema.HeapObject, walk.order.items.len);
-    for (walk.order.items, 0..) |h, idx| objects[idx] = try toSchemaHeapObject(a, vm, h);
-
-    // 3. Capture the roots verbatim (the live register window, active frames, and
-    //    open upvalues — empty at final-state capture; load-bearing in F2b).
-    const stack = try a.alloc(schema.SnapValue, vm.stack_top);
+    // 2. The registers capture keeps (doc 61 Phase K); every other slot is a
+    //    tombstone. Dead slots are where a JIT run can differ from tier-0
+    //    between collections, so dropping them makes the bytes tier-identical.
+    //    This is the collector's own keep set (`Vm.fillKeep`): at a validated
+    //    final state (doc 21 Phase A) the top-level result span, otherwise
+    //    frame masks, varargs spans, open-upvalue slots, and every gap and
+    //    unmasked window whole.
+    const keep = try a.alloc(u64, (vm.stack_top + 63) / 64);
+    vm.fillKeep(keep);
+    const stack = try a.alloc(schema.StackValue, vm.stack_top);
     for (stack, 0..) |*sv, idx| {
-        // Doc 21: outside the validated final-state result span, serialize
-        // canonical nil — the slot is dead and its bytes are tier noise.
-        const live = if (mask) |m| (idx >= m.base and idx < @as(usize, m.base) + m.len) else true;
-        sv.* = toSchemaValue(if (live) vm.regGet(idx) else Value.nil());
+        const kept = (keep[idx / 64] >> @intCast(idx % 64)) & 1 != 0;
+        sv.* = toStackValue(vm.regGet(idx), kept);
     }
 
     // Capture each frame's resumable cursor (pc/base/return-wiring), not just the
@@ -391,6 +406,9 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
             // this but left no `objects` entry, so reconstructing it as max(id)+1
             // would drift it low and diverge every post-restore id.
             .next_obj_id = vm.heap.next_obj_id,
+            // Doc 61 Phase K: the collection threshold, so a restored VM
+            // collects at the same allocation as the uninterrupted run.
+            .next_gc = vm.heap.next_gc,
             .objects = objects,
             .stack = stack,
             .frames = frames,
@@ -438,6 +456,9 @@ pub const RestoreError = error{
     StackTooLarge, // the snapshot stack exceeds the VM's register window
     TooManyFrames, // the snapshot frame count exceeds max_call_depth
     StackIndexOutOfRange, // an open upvalue points past the live stack window
+    InvalidTombstones, // a tombstone in a slot the restored keep set requires, or a depth-0 stack whose kept registers are not one contiguous result span
+    InvalidTableLane, // a table's lane/grid does not describe its values (unknown lane, a value that does not fit, a malformed grid)
+    InvalidRehashThreshold, // a table's rehash trigger is below 4 or past usize
 } || std.mem.Allocator.Error || SchemaDecodeError // + the codec's own decode errors
 || table.Table.Error; // a corrupt snapshot could carry a nil/NaN table key
 
@@ -475,6 +496,40 @@ pub const NativeRegistry = struct {
 fn fromSchemaValue(sv: schema.SnapValue, idmap: *const IdMap) RestoreError!Value {
     return switch (sv.body) {
         .ConstNil => Value.nil(),
+        .ConstBool => |b| Value.boolean(b.v != 0),
+        .ConstInt => |x| Value.int(x.v),
+        .ConstFloat => |x| Value.float(x.v),
+        .HeapRef => |r| Value.heap(idmap.get(r.id) orelse return error.UnresolvedHeapRef),
+    };
+}
+
+/// The depth-0 final cut a tombstoned stack describes: the one contiguous run
+/// of kept registers (the result span). Null when nothing is tombstoned (no
+/// cut was captured). Kept registers split by a tombstone cannot come from a
+/// capture. An all-tombstone stack had an empty span, whose base is not in
+/// the bytes; 0 recaptures identically.
+fn finalCutFromStack(stack: []const schema.StackValue) RestoreError!?interp.FinalCut {
+    var lo: ?usize = null;
+    var hi: usize = 0;
+    var any_dead = false;
+    for (stack, 0..) |sv, i| {
+        if (sv.body == .DeadSlot) {
+            any_dead = true;
+            continue;
+        }
+        if (lo == null) lo = i else if (hi != i) return error.InvalidTombstones;
+        hi = i + 1;
+    }
+    if (!any_dead) return null;
+    const base = lo orelse 0;
+    return .{ .result_base = @intCast(base), .result_count = @intCast(hi -| base), .stack_top = @intCast(stack.len) };
+}
+
+/// A register on restore. A tombstone becomes nil, so it never enters a
+/// running VM: the slot is dead, written before any read on every path.
+fn fromStackValue(sv: schema.StackValue, idmap: *const IdMap) RestoreError!Value {
+    return switch (sv.body) {
+        .ConstNil, .DeadSlot => Value.nil(),
         .ConstBool => |b| Value.boolean(b.v != 0),
         .ConstInt => |x| Value.int(x.v),
         .ConstFloat => |x| Value.float(x.v),
@@ -601,38 +656,35 @@ pub fn restoreSnapshot(
     try idmap.ensureTotalCapacity(@intCast(kf.objects.len));
 
     // Advance the id counter past every restored id BEFORE recompiling loaded
-    // chunks (L-2). Under v8 (doc 19) every loaded chunk's string literals are
-    // rooted in the `.snapshot` walk, so a valid snapshot ALWAYS carries them and
+    // chunks (L-2). Every loaded chunk's string literals are pinned (doc 19), so
+    // they are unswept and a valid snapshot ALWAYS carries them (v10), and
     // recompile re-interns to the restored objects, allocating nothing — enforced
     // below (`LoadedChunkRecompileAllocated`). Advancing first still matters: it
     // is what makes a corrupt snapshot's illegitimate recompile allocation land
     // ABOVE the restored range (detectable) instead of colliding with it.
-    // Phantom grid rows (doc 14, Phase 7) carry ids in the reserved high half
-    // (`gc.reserved_grid_id_base`+) so capture timing can't shift them. They are
-    // NOT genuine allocations and must not advance the counter — a post-restore
-    // allocation belongs in the normal low space, right above the real objects.
-    // So compute the high-water from non-reserved ids only.
     var max_id: u32 = 0;
-    for (kf.objects) |o| {
-        if (o.id >= gc.reserved_grid_id_base) continue;
-        max_id = @max(max_id, o.id);
-    }
-    // If the restored ids already fill the (non-reserved) id space, recompiling a
-    // loaded chunk (which allocates fresh interned strings via `link`) would wrap
-    // the counter and collide with a restored id. Reject rather than silently
-    // alias. (The engine assumes < 2³¹ live objects everywhere; this only bites if
-    // a snapshot both names the top id AND carries loaded chunks to recompile.)
-    if (max_id == gc.reserved_grid_id_base - 1 and kf.loaded_chunks.len > 0)
+    for (kf.objects) |o| max_id = @max(max_id, o.id);
+    // If the restored ids already fill the id space, recompiling a loaded chunk
+    // (which allocates fresh interned strings via `link`) would wrap the counter
+    // and collide with a restored id. Reject rather than silently alias. (This
+    // only bites if a snapshot both names the top id AND carries loaded chunks
+    // to recompile.)
+    if (max_id == std.math.maxInt(u32) and kf.loaded_chunks.len > 0)
         return error.IdSpaceExhausted;
     // Restore the counter from the serialized `next_obj_id` (v5, H-2), NOT from
     // `max_id + 1`: the two are equal only when no object was allocated-then-dropped
-    // before the cut. Pre-cut garbage bumps `next_obj_id` but leaves no `objects`
+    // before the cut. A swept object bumped `next_obj_id` but leaves no `objects`
     // entry, so `max_id + 1` would drift the counter LOW and every post-restore id
     // would diverge (ids are observable via table/pairs order). The serialized
-    // counter must sit strictly above every restored non-reserved id — a live
-    // object with `id >= next_obj_id` is impossible, so reject it as corrupt.
+    // counter must sit strictly above every restored id — a live object with
+    // `id >= next_obj_id` is impossible, so reject it as corrupt.
     if (kf.next_obj_id < max_id +| 1) return error.NextObjIdBelowObjects;
     vm.heap.adoptNextId(kf.next_obj_id);
+    // Doc 61 Phase K: the source's collection threshold. With every unswept
+    // object restored, `object_count` matches the source's too, so the next
+    // collection fires at the same allocation. (On a 32-bit host a threshold
+    // past usize can never be reached either way.)
+    vm.heap.next_gc = std.math.cast(usize, kf.next_gc) orelse std.math.maxInt(usize);
 
     // --- Pass 1a: create every object shell EXCEPT closures, stamped with its
     // original id. Strings are interned first so the recompile below reuses them
@@ -700,8 +752,8 @@ pub fn restoreSnapshot(
     // 1b. Deterministic recompile reproduces the same protos/ids the live VM had;
     // string literals resolve to the already-interned snapshot strings above.
     try recompileLoadedChunks(vm, root, kf.loaded_chunks);
-    // v8 integrity check (doc 19): the encoder roots every loaded proto's string
-    // constants in the `.snapshot` walk, and Pass 1a interned every restored
+    // v8 integrity check (doc 19): the encoder carries every loaded proto's
+    // (pinned, so unswept) string constants, and Pass 1a interned every restored
     // string (byte-keyed) before the recompile — so a valid v8 recompile resolves
     // every literal to a restored object and allocates NOTHING. A moved counter
     // means the snapshot is missing a loaded-proto literal: its allocation
@@ -736,29 +788,34 @@ pub fn restoreSnapshot(
                 // holes ride in-band as nils (the ubiquitous slot-0 hole
                 // included). Append starts at key 0 under identity mapping, so a
                 // plain in-order append reproduces the split exactly.
-                for (ht.array) |sv| try t.array.append(gpa, try fromSchemaValue(sv, &idmap));
-                // Bulk lane rebuild (doc 18 D5): the appends above leave the part
-                // `.value`/unfrozen even for a homogeneous narrow run — a leading
-                // nil (e.g. the slot-0 hole) defeats append's eager first-value
-                // lane commit. Left that way, a restored sieve loses its narrow
-                // lane's density and per-element codegen (doc 32 made `.value`
-                // int/float scalars recordable, so it is no longer *untraceable*
-                // — but a `.value` element still costs a tag check per access
-                // and a whole 16-byte cell per slot), and a restored deflated
-                // grid can never re-inflate (inflation requires packed numeric
-                // rows).
-                // Recompute the optimal lane over the present values exactly as
-                // rehash's one-shot commit does: narrow → repack + freeze
-                // (monotonic from here); `.value` → stay unfrozen so a later
-                // rehash may still narrow. In-memory only: invisible to logical
-                // values and to a re-capture, so determinism is untouched.
-                if (t.array.asize > 0 and !t.array.frozen) {
-                    const lane = t.array.optimalLane();
-                    if (lane.isNarrow()) {
-                        try t.array.repack(gpa, lane);
-                        t.array.frozen = true;
-                    }
+                // The array part comes back in exactly its captured
+                // representation (doc 61 Phase K): lane and commitment decide
+                // later grid inflation, so later allocations and ids.
+                const lane = std.enums.fromInt(arr.Lane, ht.lane) orelse return error.InvalidTableLane;
+                if (lane == .grid) {
+                    if (ht.grid.len != 1 or ht.array.len != 0) return error.InvalidTableLane;
+                    // A grid owns the whole table (no hash, no metatable — the
+                    // inflation gate, gc.zig) and is always committed.
+                    if (ht.entries.len != 0 or ht.metatable_id != 0) return error.InvalidTableLane;
+                    if (ht.flags & table_flag_frozen == 0) return error.InvalidTableLane;
+                    const g = try fromSchemaGrid(gpa, ht.grid[0]);
+                    t.array.deinit(gpa); // the fresh table's empty part
+                    t.array = g;
+                } else {
+                    if (ht.grid.len != 0) return error.InvalidTableLane;
+                    for (ht.array) |sv| try t.array.append(gpa, try fromSchemaValue(sv, &idmap));
+                    t.array.restoreLane(gpa, lane) catch |e| switch (e) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.LaneMismatch => return error.InvalidTableLane,
+                    };
                 }
+                t.array.frozen = ht.flags & table_flag_frozen != 0;
+                t.no_grid = ht.flags & table_flag_no_grid != 0;
+                // The rehash trigger depends on history and decides where later
+                // integer keys land, so `#t` and `next` order (Table.rehash).
+                // Below 4 no capture can produce it.
+                if (ht.rehash_threshold < 4) return error.InvalidRehashThreshold;
+                t.rehash_threshold = std.math.cast(usize, ht.rehash_threshold) orelse return error.InvalidRehashThreshold;
                 // Hash part: straight into the hash, preserving the recorded
                 // split — but never an array-covered key (v7 validation): such an
                 // entry would be permanently shadowed by the array slot on every
@@ -800,6 +857,9 @@ pub fn restoreSnapshot(
     // --- Roots ---
     const gh = idmap.get(kf.globals_id) orelse return error.UnresolvedHeapRef;
     if (gh.type != .table) return error.GlobalsNotATable;
+    // Globals never inflate (`Vm.fusedStore`): global stores write the table
+    // raw, and a grid takes no raw store.
+    if (table.Table.fromHeader(gh).array.isGrid()) return error.GlobalsNotATable;
     vm.globals = table.Table.fromHeader(gh);
     // Doc 43 §3.2 (P0b): restore reseats the globals table at a new address, so
     // refresh the recorder's globals-header channel to match (a trace recorded
@@ -807,7 +867,7 @@ pub fn restoreSnapshot(
     vm.trace.rec_globals_header = &vm.globals.header;
 
     if (kf.stack.len > vm.regCapacity()) return error.StackTooLarge;
-    for (kf.stack, 0..) |sv, i| vm.regSet(i, try fromSchemaValue(sv, &idmap));
+    for (kf.stack, 0..) |sv, i| vm.regSet(i, try fromStackValue(sv, &idmap));
     vm.stack_top = kf.stack.len;
 
     if (kf.frames.len > vm.frames.len) return error.TooManyFrames;
@@ -854,6 +914,11 @@ pub fn restoreSnapshot(
     // (and structural test snapshots can use zero-register frames), so restore
     // the authoritative captured top after all frame pushes.
     vm.stack_top = kf.stack.len;
+    // Doc 61 Phase K: frames re-derive their tombstones at recapture, but at
+    // depth 0 the only capture that tombstones is a validated final cut,
+    // keeping exactly the result span. Re-derive that cut so recapture is
+    // the identity.
+    if (kf.frames.len == 0) vm.setFinalCut(try finalCutFromStack(kf.stack));
 
     for (kf.open_upvalues) |ou| {
         const uh = idmap.get(ou.upvalue_id) orelse return error.UnresolvedHeapRef;
@@ -866,6 +931,16 @@ pub fn restoreSnapshot(
         // republishes `open_upvalue_ceiling` as it grows (round-1 blocker 5:
         // a restore that bypassed the ceiling would leave it stale-LOW).
         try vm.appendOpenUpvalue(ou.stack_index, cell);
+    }
+
+    // Doc 61 Phase K: with frames, pcs, open upvalues and the cut in place,
+    // `fillKeep` is the keep set capture used. A tombstone inside it would
+    // turn a live operand, vararg or upvalue slot into nil, so it cannot
+    // come from a capture.
+    vm.fillKeep(vm.gc_keep);
+    for (kf.stack, 0..) |sv, i| {
+        if (sv.body == .DeadSlot and (vm.gc_keep[i / 64] >> @intCast(i % 64)) & 1 != 0)
+            return error.InvalidTombstones;
     }
 
     // VM-level metatable support (chunk 2a). A non-zero `string_metatable_id`

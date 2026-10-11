@@ -1,8 +1,8 @@
 # mahina — Snapshot & Replay Schema
 
-Status: partial — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d: clock, F2e: random seed) + in-browser replay-to-k driver (Phase 7 v8) landed; keyframe now **v9** (v5 = H-2 `next_obj_id`; v7 = doc 18 slot-0 array part; v8 = doc 19 loaded-chunk constants in the `.snapshot` walk + zero-allocation recompile check; v9 = doc 21 canonical final-state capture — dead slots outside the top-level result span nil'd in walk + stack); guard-snapshots outstanding
+Status: partial — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d: clock, F2e: random seed) + in-browser replay-to-k driver (Phase 7 v8) landed; keyframe now **v10** (v5 = H-2 `next_obj_id`; v7 = doc 18 slot-0 array part; v8 = doc 19 loaded-chunk constants in the `.snapshot` walk + zero-allocation recompile check; v9 = doc 21 canonical final-state capture — dead slots outside the top-level result span nil'd in walk + stack; v10 = doc 61 Phase K — every unswept object instead of the `.snapshot` walk, `next_gc`, `DeadSlot` register tombstones, and each table's physical array part and rehash trigger; `schema/trace.json` is the field-level source of truth); guard-snapshots outstanding
 Owner: Bart
-Last updated: 2026-08-14
+Last updated: 2026-10-11
 
 Prerequisite for **Phase 5b** (trace serialization format) and **Phase 7** (the
 visualiser). This doc owns the *concrete wire format* — the binschema schema that

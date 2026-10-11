@@ -254,6 +254,25 @@ pub fn build(b: *std.Build) void {
     const bench_gcwalk_step = b.step("bench-gcwalk", "Run the doc 61 masked GC root-walk benchmark (ReleaseFast)");
     bench_gcwalk_step.dependOn(&run_bench_gcwalk.step);
 
+    // `zig build bench-keyframe` — doc 61 Phase K: keyframe capture and
+    // restore over a million objects, hash entries or cells. ReleaseFast,
+    // informational, not a test (global Rule #22).
+    const bench_keyframe_exe = b.addExecutable(.{
+        .name = "bench-keyframe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_keyframe.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "mahina", .module = mod },
+            },
+        }),
+    });
+    bench_keyframe_exe.use_llvm = true;
+    const run_bench_keyframe = b.addRunArtifact(bench_keyframe_exe);
+    const bench_keyframe_step = b.step("bench-keyframe", "Run the doc 61 Phase K keyframe capture/restore benchmark (ReleaseFast)");
+    bench_keyframe_step.dependOn(&run_bench_keyframe.step);
+
     // --- wasm32-freestanding browser target ---------------------------------
     //
     // `zig build wasm` compiles the VM core to a reactor-style wasm module that

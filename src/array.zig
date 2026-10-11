@@ -51,8 +51,10 @@ const object = @import("object.zig");
 const value = @import("value.zig");
 const Value = value.Value;
 
-/// The storage lane of an array part. The ordinal is irrelevant to correctness
-/// (the lane is never serialised); `get`/`set` switch on it.
+/// The storage lane of an array part; `get`/`set` switch on it. The ordinal is
+/// wire format: trace IR embeds it (`guard_lane.aux`) and keyframes carry it
+/// (`HeapTable.lane`, `GridPart.elem`, doc 61 Phase K), so existing ordinals
+/// never move.
 pub const Lane = enum(u8) {
     /// Full 16-byte `Value`s, `nil` in-band. The fallback / heterogeneous case.
     value,
@@ -378,9 +380,9 @@ pub const ArrayPart = extern struct {
     /// empty), so without this a homogeneous bool/int/float fill would stay on
     /// `.value` and the JIT recorder would abort on a `.value` lane
     /// (`recArraySet` in trace.zig). Commit once, then `frozen` makes the lane
-    /// monotonic — it only ever widens after, via the `widenFor` path. Pure
-    /// in-memory: the lane is never serialised, so it is invisible to keyframe
-    /// snapshots and to `get()` (which round-trips logical Values on any lane).
+    /// monotonic — it only ever widens after, via the `widenFor` path. Invisible
+    /// to `get()` (which round-trips logical Values on any lane), but keyframes
+    /// carry it (doc 61 Phase K), since it decides later grid inflation.
     /// A from-scratch run evolves the lane purely as a function of the write
     /// sequence, so all 8 execution modes agree. No-op unless the part is truly
     /// fresh (`.value`, unfrozen, `asize == 0`) and `val` is non-nil narrow.
@@ -530,6 +532,22 @@ pub const ArrayPart = extern struct {
         // type boundary rather than relying solely on the caller's `!frozen` guard.
         std.debug.assert(!self.frozen);
         try self.convert(gpa, target);
+    }
+
+    /// Put a freshly rebuilt scalar array part into exactly `target`, the lane it
+    /// was captured in (keyframe restore, doc 61 Phase K). Unlike `repack` this
+    /// is not a commitment step: it may move to a lane `optimalLane` would not
+    /// pick (a `.value` part holding only ints, an `i32` part whose values now
+    /// fit `i8`), because the captured lane is history, not a function of the
+    /// values. `error.LaneMismatch` when a present value does not fit `target`.
+    pub fn restoreLane(self: *ArrayPart, gpa: std.mem.Allocator, target: Lane) (std.mem.Allocator.Error || error{LaneMismatch})!void {
+        std.debug.assert(self.lane != .grid);
+        if (target == .grid) return error.LaneMismatch;
+        var i: usize = 0;
+        while (i < self.asize) : (i += 1) {
+            if (!laneFits(target, self.decode(i))) return error.LaneMismatch;
+        }
+        if (target != self.lane) try self.convert(gpa, target);
     }
 
     // ===================================================================

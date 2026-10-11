@@ -1639,10 +1639,10 @@ pub const TraceState = struct {
     /// **Doc 60 §5.4 — the packed fast-path word.** One bit per condition that
     /// keeps tier-0 out of `.fast` dispatch (`FastBit`); zero means fast
     /// dispatch is allowed, so `Vm.runFastPath` and the host-call entry test
-    /// one `u16` instead of nine scattered fields. Seven bits mirror state this
+    /// one `u16` instead of ten scattered fields. Seven bits mirror state this
     /// struct owns (`isRecording()` + the six pending fields above) and are
     /// written only by the `setPending*` setters and `syncRecordingBit`; the
-    /// two VM bits are written by `Vm`'s setters and survive `clearCache`.
+    /// three VM bits are written by `Vm`'s setters and survive `clearCache`.
     /// Always updated as a whole-word read-modify-write: a byte store followed
     /// by this 16-bit load would not store-forward (doc 59). Debug builds check
     /// it bit-for-bit against `Vm.fastBlockReference()`.
@@ -3045,6 +3045,12 @@ pub const TraceState = struct {
         pub const trace_owned: u16 = (1 << 7) - 1;
         pub const vm_suspend: u16 = 1 << 7;
         pub const vm_safepoint_lines: u16 = 1 << 8;
+        /// A published `Vm.final_cut`. Not a dispatch condition: nothing
+        /// executes at depth 0 before the cut is retired. It sends the host
+        /// call entry's first call after a run down H1, whose
+        /// `pushHostCall` nils the dead final registers before the H3 entry
+        /// would push over them (`Vm.retireFinalCut`).
+        pub const vm_final_cut: u16 = 1 << 9;
     };
 
     /// Set or clear one `fast_block` bit as a whole-word read-modify-write.

@@ -550,6 +550,15 @@ pub const Assembler = struct {
         try self.aluRegMem(0x3B, dst, base, disp);
     }
 
+    /// `cmp dword [base + disp], src` — 39 /r with REX.W=0: flags from the 32-bit
+    /// `[mem] - src` (operands kept). For `u32` fields such as a grid's `row_len`
+    /// entries, where the 64-bit `cmpRegMem` would read the neighbouring entry.
+    pub fn cmpMem32Reg(self: *Assembler, base: Reg, disp: i32, src: Reg) !void {
+        try self.rex(false, src.hi(), false, base.hi());
+        try self.b(0x39);
+        try self.modrmMem(src.lo(), base, disp);
+    }
+
     /// `imul dst, [base + disp]` — REX.W 0F AF /r with rm = mem → dst *= [mem]. imul
     /// has only this load form (no `imul [mem], reg`).
     pub fn imulRegMem(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
@@ -1227,6 +1236,21 @@ test "enc: non-SIB width store mov [base+disp], reg" {
     try expectEnc(&.{ 0x89, 0x4D, 0x08 }, struct {
         fn f(a: *Assembler) !void {
             try a.storeMemReg(.rbp, 4, 8, .rcx);
+        }
+    }.f);
+}
+
+test "enc: cmp dword [base+disp], reg" {
+    // cmp dword [rax], ecx — 39 /r, REX.W=0, no REX byte
+    try expectEnc(&.{ 0x39, 0x08 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.cmpMem32Reg(.rax, 0, .rcx);
+        }
+    }.f);
+    // cmp dword [r9 + 8], r10d — REX.R (r10) + REX.B (r9), disp8
+    try expectEnc(&.{ 0x45, 0x39, 0x51, 0x08 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.cmpMem32Reg(.r9, 8, .r10);
         }
     }.f);
 }

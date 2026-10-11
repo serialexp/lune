@@ -378,10 +378,6 @@ fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source:
     if (topts.hotguard) |v| vm.trace.config.hotguard = v;
     if (topts.silent_budget) |v| vm.trace.config.silent_budget = v;
     vm.trace.config.exit_side_native = topts.exit_side_native;
-    // The source backs located error messages: `error(msg, level)` prefixes
-    // `chunk:line:` and `synthErrorValue`/`describeFault` read spans against it.
-    // Set unconditionally so a fault anywhere has a real location, not `""`.
-    vm.source = source;
     // Inject the native clock. The interpreter holds no platform clock of its own
     // (so the VM core stays portable, incl. wasm); the host that builds the VM —
     // here, the CLI — supplies one. This is the single place the OS clock syscall
@@ -456,7 +452,7 @@ fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source:
         // Located, Lua-style message + call chain from the un-popped frame stack.
         var fault_arena = std.heap.ArenaAllocator.init(gpa);
         defer fault_arena.deinit();
-        if (vm.describeFault(source, err, fault_arena.allocator())) |fault| {
+        if (vm.describeFault(err, fault_arena.allocator())) |fault| {
             // A self-located message (a raised Lua value) already carries its
             // `chunk:line:` prefix — print it verbatim, Lua-style. The type-name
             // faults are not self-located and get the " at chunk:line" suffix.

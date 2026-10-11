@@ -244,7 +244,6 @@ fn runOuterCycle(gpa: std.mem.Allocator, window_open: bool) !OuterCycleRun {
     var buf: [16]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    vm.source = aviii_outer_cycle_source;
     vm.trace.config.enabled = true;
     vm.trace.config.execute = true;
     vm.trace.config.optimize = true;
@@ -430,7 +429,6 @@ test "A-viii (doc 17 §A8 step 8): opening the window MID-EPOCH over a live arme
     var buf: [16]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    vm.source = aviii_mid_epoch_source;
     vm.trace.config.enabled = true;
     vm.trace.config.execute = true;
     vm.trace.config.optimize = true;

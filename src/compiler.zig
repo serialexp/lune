@@ -108,12 +108,15 @@ pub fn compileWithOptions(
 
     var usage = GlobalUsage{ .writes = std.StringHashMap(void).init(gpa), .known = opts.known_globals };
     defer usage.deinit(gpa);
+    const lines = try LineTable.build(gpa, source);
+    defer lines.deinit(gpa);
 
     var c = Compiler{
         .arena = arena.allocator(),
         .scratch = gpa,
         .heap = heap,
         .source = source,
+        .lines = &lines,
         .diags = diags,
         .globals_usage = &usage,
         .is_vararg = opts.vararg_root,
@@ -157,11 +160,10 @@ pub fn compileWithOptions(
     // root = `id_base`). This is the proto's serialization identity — a trace's
     // anchor and a serialized closure name their proto by this id, not by the
     // in-memory pointer. Order is irrelevant; only uniqueness and stability-
-    // within-a-compile matter. The same pass records `source` on every proto so
-    // the runtime-error path can resolve span offsets to lines against the chunk
-    // this proto actually came from (load support).
+    // within-a-compile matter. (Source lines need no pass: every span already
+    // carries its line in this chunk.)
     var next_id: u32 = opts.id_base;
-    assignProtoIds(proto, &next_id, source);
+    assignProtoIds(proto, &next_id);
 
     // Moving `arena` is safe: code/constants/proto live in arena *heap* buffers,
     // not in the struct, so the pointers stay valid; only the `c.arena` handle
@@ -177,27 +179,50 @@ fn zeroedHints(arena: std.mem.Allocator, n: usize) std.mem.Allocator.Error![]u32
     return hints;
 }
 
+/// The byte offset at which each line of one chunk's source begins, built once
+/// per compile so a span's line is a binary search, never a rescan from byte 0.
+/// The compiler stamps every `Span.line` and every diagnostic's line from it.
+const LineTable = struct {
+    /// `starts[0] == 0`; `starts[k]` is one past the k-th `'\n'`.
+    starts: []u32,
+
+    fn build(gpa: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error!LineTable {
+        const starts = try gpa.alloc(u32, std.mem.count(u8, source, "\n") + 1);
+        starts[0] = 0;
+        var n: usize = 1;
+        for (source, 0..) |ch, i| {
+            if (ch != '\n') continue;
+            starts[n] = @intCast(i + 1);
+            n += 1;
+        }
+        return .{ .starts = starts };
+    }
+
+    fn deinit(self: LineTable, gpa: std.mem.Allocator) void {
+        gpa.free(self.starts);
+    }
+
+    /// 1-based line containing byte `offset`: the number of line starts at or
+    /// before it (an offset past the end lands on the last line).
+    fn lineOf(self: LineTable, offset: u32) u32 {
+        var lo: usize = 0;
+        var hi: usize = self.starts.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.starts[mid] <= offset) lo = mid + 1 else hi = mid;
+        }
+        return @intCast(lo);
+    }
+};
+
 /// Pre-order walk assigning each proto a unique id. `@constCast` is sound: the
 /// children were created as mutable `*Proto` in the compile arena (see
 /// `compileFunction`); the `[]const *const Proto` field type is only a
 /// downstream immutability contract, not the original allocation's constness.
-/// 1-based source line containing byte `offset` (counts newlines before it).
-/// Shared by the compiler's diagnostics and the runtime-error path in `interp`.
-pub fn lineFromOffset(source: []const u8, offset: u32) u32 {
-    var line: u32 = 1;
-    var i: usize = 0;
-    const end = @min(offset, source.len);
-    while (i < end) : (i += 1) {
-        if (source[i] == '\n') line += 1;
-    }
-    return line;
-}
-
-fn assignProtoIds(proto: *Proto, next: *u32, source: []const u8) void {
+fn assignProtoIds(proto: *Proto, next: *u32) void {
     proto.id = next.*;
-    proto.source = source;
     next.* += 1;
-    for (proto.protos) |child| assignProtoIds(@constCast(child), next, source);
+    for (proto.protos) |child| assignProtoIds(@constCast(child), next);
 }
 
 /// One `get_global` site recorded during compilation, for the unknown-global
@@ -262,6 +287,9 @@ const Compiler = struct {
     scratch: std.mem.Allocator,
     heap: *gc.Heap,
     source: [:0]const u8,
+    /// The chunk's line starts, shared by every nested compiler (owned by
+    /// `compileWithOptions`).
+    lines: *const LineTable,
     diags: *Diagnostics,
     /// Chunk-wide global bookkeeping for the unknown-global lint. Shared: the
     /// root owns it (in `compileWithOptions`); nested functions inherit the same
@@ -283,6 +311,10 @@ const Compiler = struct {
     /// boundaries (`compileStmt`/`compileExprTo`). Whatever `emit` runs under
     /// gets stamped with this. Defaults to the start of source.
     cur_span: ast.Span = .{ .start = 0, .end = 0 },
+    /// `emit`'s memo of the last span start it resolved to a line, and that
+    /// line: consecutive instructions mostly share `cur_span`.
+    line_memo_start: u32 = std.math.maxInt(u32),
+    line_memo: u32 = 0,
     constants: std.ArrayList(Value) = .empty,
     locals: std.ArrayList(Local) = .empty,
     loops: std.ArrayList(Loop) = .empty,
@@ -320,7 +352,11 @@ const Compiler = struct {
         if (self.code.items.len >= 1 << 31)
             return self.fail(self.cur_span, "function too large (2^31 instruction limit)");
         try self.code.append(self.arena, instr);
-        try self.spans.append(self.arena, .{ .start = self.cur_span.start, .end = self.cur_span.end });
+        if (self.cur_span.start != self.line_memo_start) {
+            self.line_memo_start = self.cur_span.start;
+            self.line_memo = self.lineOf(self.cur_span.start);
+        }
+        try self.spans.append(self.arena, .{ .start = self.cur_span.start, .end = self.cur_span.end, .line = self.line_memo });
         return self.code.items.len - 1;
     }
 
@@ -1219,6 +1255,7 @@ const Compiler = struct {
             .scratch = self.scratch,
             .heap = self.heap,
             .source = self.source,
+            .lines = self.lines,
             .diags = self.diags,
             .globals_usage = self.globals_usage,
             .parent = self,
@@ -1549,7 +1586,7 @@ const Compiler = struct {
     }
 
     fn lineOf(self: *const Compiler, offset: u32) u32 {
-        return lineFromOffset(self.source, offset);
+        return self.lines.lineOf(offset);
     }
 
     fn fail(self: *Compiler, span: ast.Span, comptime message: []const u8) Error {
@@ -2228,10 +2265,38 @@ test "per-instruction spans: parallel to code and map to source lines" {
     for (proto.code, proto.spans) |instr, span| {
         if (instr.op == .add) {
             saw_add = true;
-            try testing.expectEqual(@as(u32, 3), lineFromOffset(src, span.start));
+            try testing.expectEqual(@as(u32, 3), span.line);
         }
     }
     try testing.expect(saw_add);
+    // Every compiled instruction carries a resolved line.
+    for (proto.spans) |span| try testing.expect(span.line >= 1 and span.line <= 3);
+}
+
+test "LineTable: line of an offset, newline by newline" {
+    // "a\nbc\n\nd": lines start at 0, 2, 5, 6.
+    const t = try LineTable.build(testing.allocator, "a\nbc\n\nd");
+    defer t.deinit(testing.allocator);
+    try testing.expectEqualSlices(u32, &.{ 0, 2, 5, 6 }, t.starts);
+    try testing.expectEqual(@as(u32, 1), t.lineOf(0));
+    try testing.expectEqual(@as(u32, 1), t.lineOf(1)); // the '\n' itself
+    try testing.expectEqual(@as(u32, 2), t.lineOf(2));
+    try testing.expectEqual(@as(u32, 2), t.lineOf(4));
+    try testing.expectEqual(@as(u32, 3), t.lineOf(5)); // the empty line
+    try testing.expectEqual(@as(u32, 4), t.lineOf(6));
+    try testing.expectEqual(@as(u32, 4), t.lineOf(1000)); // past the end
+}
+
+test "LineTable: empty source and a trailing newline" {
+    const empty = try LineTable.build(testing.allocator, "");
+    defer empty.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 1), empty.lineOf(0));
+    try testing.expectEqual(@as(u32, 1), empty.lineOf(7));
+
+    const trailing = try LineTable.build(testing.allocator, "x\n");
+    defer trailing.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 1), trailing.lineOf(1));
+    try testing.expectEqual(@as(u32, 2), trailing.lineOf(2)); // EOF after the newline
 }
 
 /// Compile `src` with an explicit known-globals set and run `check` against the
