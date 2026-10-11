@@ -245,6 +245,42 @@ test "doc 61 §8: a φ the dead-φ filter drops leaves the same heap in every ti
     , "table: 0x178f\n", "table: 0x178f\n", .{});
 }
 
+/// Doc 61 §9b witness: an ordinary (non-precise) allocating trace ran, and
+/// natively its linked loop-done exit was followed.
+fn ranAllocatingTrace(vm: *Vm, mode: util.TraceMode) anyerror!void {
+    if (vm.heap.gc_stress) return; // allocating traces never enter under stress
+    if (mode != .record_execute_noopt and mode != .record_execute and mode != .record_execute_native) return;
+    var allocating = false;
+    for (vm.trace.registry.cache.items) |t| {
+        if (t.code.alloc_bound > 0 and t.code.deopt_mode == .entry_replay) allocating = true;
+    }
+    try testing.expect(allocating);
+    try testing.expect(vm.trace.entries > 0);
+    if (mode == .record_execute_native) {
+        try testing.expect(vm.trace.native_entries > 0);
+        try testing.expect(vm.trace.native_link_follow_count > 0);
+    }
+}
+
+// Doc 61 Phase 3 (§9b): the same counterexample with the dead temp
+// allocated on trace. `tostring` interns a string into `s` every inner
+// iteration (`string.char` would abort on the `string` lookup); `s` is
+// dead at the inner header and after the nest, so the allocating trace
+// gives it no φ (doc 24 D3 kept it). Tier-0 leaves "1400" in the slot, the
+// traced tiers an earlier string. Neither is rooted, so the re-intern of
+// "1400" allocates in every tier.
+test "doc 61 §9b: an allocating trace's dropped φ leaves the same heap in every tier" {
+    try expectProgramByGc(
+        \\local s = nil
+        \\for j = 1, 400 do
+        \\  for i = 1, 100 do s = tostring(1000 + j) end
+        \\end
+        \\for k = 1, 5000 do local junk = {} end
+        \\local x = tostring(1400)
+        \\print({})
+    , "table: 0x15fb\n", "table: 0xb0ab\n", .{ .inspect = &ranAllocatingTrace });
+}
+
 // Site 3's exit-snapshot programs live with the register probe
 // (interp_semantics_test.zig, "doc 61 §2 site 3"): an object id printed
 // after `f` returns cannot see a stale register in `f`'s window.

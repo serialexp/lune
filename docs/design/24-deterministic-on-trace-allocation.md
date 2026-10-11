@@ -203,6 +203,12 @@ are trivially equal. Root-set equivalence at every subsequent tier-0 dispatch
 follows. (Gate: compare the *marked object set* after a post-burst collection
 across modes, not just reg values — D9.)
 
+> **Superseded by doc 61 §9b (Phase 3, 2026-10-11).** The collector no
+> longer roots every physical register: it roots the live set (doc 61's
+> masking), and the scrub nils every slot it does not keep. An allocating
+> trace now takes the same dead-φ filter as any other. Root-set equality
+> follows from doc 61 §2's theorem, not from this flush.
+
 **Chaining/entry discipline (codex #5, reduced).** The budget guard is an
 **entry invariant**: it sits at the top of every allocating body, so any path
 that enters one — root entry, side-trace chain, armed native link — re-checks
@@ -343,7 +349,8 @@ Optimizer classification (`tropt.kindOf`):
   ordinary exit stub; plus a byte test of the baked `gc_stress` flag address.
 - **Loop-close flush:** extended per D3's full-write-set rule (recorder
   already knows the written-slot set; the extra stores ride the existing
-  `exit_stores`/phi machinery).
+  `exit_stores`/phi machinery). Retired by doc 61 §9b: allocating traces
+  now take the dead-φ filter.
 
 ## D6. Exec-log oracle
 
@@ -377,7 +384,8 @@ allocation-boundary flush rule belongs to v2's continuation exits.)
   impossible during any traced iteration, in every mode; collections happen
   only while tier-0 executes, at its single prologue site, with regs made
   identical by the full-write-set flush ⇒ same collection points, same root
-  sets, same de-intern sets.
+  sets, same de-intern sets. (Since doc 61 §9b: rooted regs made identical
+  by liveness masking, not by the flush.)
 - **Partial-iteration replay:** id-neutral by the D2 corollary; premise
   (no intervening collection) guaranteed by the budget arithmetic rather
   than by scheduling.

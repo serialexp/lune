@@ -59,12 +59,15 @@ pub const PHI_LIVE_WORDS = (std.math.maxInt(u16) + 64) / 64;
 /// so writing it back each iteration is a store nothing observes. Leaving
 /// its slab copy stale is sound only where the collector masks the frame
 /// (`maskable`); a captured register is live at every pc, so it is kept.
-/// Every φ stays when the trace allocates (doc 24 D3, until Phase 3) or is a
-/// one-shot head (its φ rows are the terminal writeback set, doc 44).
+/// An allocating trace filters the same way: masking, not doc 24 D3's
+/// full-write-set flush, keeps its roots tier-identical (doc 61 §9b). A
+/// precise one keeps every φ anyway, since each slot is an entry slot.
+/// Every φ stays when the trace is a one-shot head (its φ rows are the
+/// terminal writeback set, doc 44).
 /// `rec` is the recorder or a finalize fixture; `loopCloseDefeat` mirrors
 /// finalize's filter through this and `phiWritebackKept`.
 pub fn phiLiveRow(rec: anytype, buf: *[PHI_LIVE_WORDS]u64) ?[]const u64 {
-    if (rec.terminal_close != null or rec.alloc_count != 0) return null;
+    if (rec.terminal_close != null) return null;
     const proto = rec.anchor.proto;
     if (!proto.maskable) return null;
     const live = &proto.reg_live;

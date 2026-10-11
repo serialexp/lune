@@ -2825,6 +2825,38 @@ test "recorder: a while loop writes back no temporary dead at its header" {
     try testing.expectEqual(@as(usize, 0), slots.items.len);
 }
 
+test "recorder: an allocating loop writes back no string temporary dead at its header (doc 61 §9b)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `s` holds a fresh string every iteration (`tostring` allocates on
+    // trace; `..` is not recorded) and is dead at the header, as are the
+    // call's temporaries. Doc 24 D3 used to write back every slot an
+    // allocating body wrote, because the collector rooted every register;
+    // under masking they get no φ, as in a non-allocating loop.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local i, n = 1, 0
+        \\while i <= 50 do
+        \\  local s = tostring(i)
+        \\  n = n + #s
+        \\  i = i + 1
+        \\end
+        \\print(n)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
+    // An ordinary allocating trace, not a precise one (which keeps every φ
+    // because it loads every slot at entry).
+    try testing.expect(t.code.alloc_bound > 0);
+    try testing.expectEqual(trace_snapshot.DeoptMode.entry_replay, t.code.deopt_mode);
+    var slots: std.ArrayList(u16) = .empty;
+    defer slots.deinit(gpa);
+    try writeOnlyPhiSlots(t, &slots, gpa);
+    try testing.expectEqual(@as(usize, 0), slots.items.len);
+}
+
 const live_on_untaken_branch =
     \\local i, last, s = 1, 0, 0
     \\while i <= 50 do

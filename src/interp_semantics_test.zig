@@ -2437,8 +2437,8 @@ test "doc 61 §2 site 3: an attached exit over a non-maskable proto materialises
 /// holds its condition in the register `x` takes, the call's base is `y`'s
 /// and `s` is the one above it. A maskable `f` has `s` scrubbed in every
 /// tier; a non-maskable one keeps the φ, so every tier holds the previous
-/// trip's value. `s` is a number: an allocating trace keeps every φ (doc 24
-/// D3), so a string would never reach the filter. `PRE` runs before `f`.
+/// trip's value. `s` is a number, which keeps the trace non-allocating; an
+/// allocating one filters the same way (doc 61 §9b). `PRE` runs before `f`.
 fn deadPhiProbeSource(comptime pre: []const u8) [:0]const u8 {
     return
     \\local function f(n)

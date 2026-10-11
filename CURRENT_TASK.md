@@ -329,8 +329,27 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
     `just embed-test`, viz 72/72 (Bun 1.4.3) + tsc, hashgate 90/90 on both
     legs. **Landed** in one bundled commit with coral-marten's line-lookup
     fix (agreed on the forum).
-- **Then:** doc 61 Phase 3 (relax doc 24 D3's full-write-set flush under
-  masking; it needs its own design section and review).
+- **Doc 61 Phase 3 (§9b), implemented (2026-10-11).** Allocating traces
+  take the dead-φ filter: `phiLiveRow` no longer bails on
+  `alloc_count != 0`. Doc 24 D3's full-write-set flush existed only
+  because the collector rooted every register; masking replaces it. Codex
+  design review (thread 01a12987-155a-7e01-8792-b57edab01b68): APPROVE,
+  two test should-fixes folded in. A table temp cannot exercise the filter:
+  `new_table` records precise, and precise keeps every φ. Behaviour probes
+  that collect first cannot tell kept from dropped.
+  - Tests, each mutation-checked:
+    - `trace_finalize_test` (allocating filters like non-allocating;
+      precise keeps all);
+    - `interp_trace_test`, the φ pin on a `tostring` loop;
+    - `interp_gc_test` "doc 61 §9b", an id program with a witness that
+      the allocating trace ran and natively a linked loop-done was
+      followed. With the collector rooting every register, tier-0 prints
+      0x15fa and the traced tiers 0x15fb.
+  - Finding: `..` and `string.char` (the `string` lookup) do not record;
+    `tostring` does.
+  - Gates green: `just test`, jit-debug, `just embed-test`, hashgate
+    90/90 on both legs, wasm, lib, viz 72/72.
+  - Board: pending.
 
   Each touches interp.zig/capi.zig/CallFrame, so coordinate with
   coral-marten: `.S` offsets for `CF_IN_FLIGHT`, and the `guestFault`

@@ -372,14 +372,23 @@ test "doc 61 §5 site 2: the dead-φ filter keeps what some resume pc reads, onl
     try std.testing.expectEqual(@as(u64, 0b001101), keptPhis(&scratch, 6));
     scratch.link_target = null;
 
-    // Every φ stays when the frame is rooted whole, the trace allocates
-    // (doc 24 D3) or it is a one-shot head (doc 44).
+    // An allocating trace filters exactly like this one: masking keeps its
+    // roots tier-identical (doc 61 §9b, retiring doc 24 D3's full flush).
+    scratch.alloc_count = 1;
+    try std.testing.expectEqual(@as(u64, 0b000111), keptPhis(&scratch, 6));
+    // A precise recording loads every window slot at entry, so every φ is
+    // an entry slot and stays.
+    const before = scratch.entry_slots.items.len;
+    for (1..6) |slot| try scratch.entry_slots.append(gpa, @intCast(slot));
+    try std.testing.expectEqual(@as(u64, 0b111111), keptPhis(&scratch, 6));
+    scratch.entry_slots.shrinkRetainingCapacity(before);
+    scratch.alloc_count = 0;
+
+    // Every φ stays when the frame is rooted whole or the trace is a
+    // one-shot head (doc 44).
     proto.maskable = false;
     try std.testing.expectEqual(@as(u64, 0b111111), keptPhis(&scratch, 6));
     proto.maskable = true;
-    scratch.alloc_count = 1;
-    try std.testing.expectEqual(@as(u64, 0b111111), keptPhis(&scratch, 6));
-    scratch.alloc_count = 0;
     scratch.terminal_close = .{ .kind = .return_interp, .resume_pc = 0 };
     try std.testing.expectEqual(@as(u64, 0b111111), keptPhis(&scratch, 6));
 }

@@ -273,9 +273,12 @@ as they land; move bullets to Done once everything inside them is checked.
         loop). An object id printed after the function returns cannot see a
         stale register in its window, so the §8 id programs are not the
         site oracles.
-- [ ] **Phase 3 — relax doc 24 D3's full-write-set flush.** Today
-      `alloc_count != 0` keeps every φ only because the collector roots every
-      register. Re-derive it under masking. Separate review.
+- [ ] **Phase 3 — relax doc 24 D3's full-write-set flush (§9b).** Design
+      approved by codex (2026-10-11, should-fixes on the tests folded in).
+      Implemented: `phiLiveRow` drops the `alloc_count` conjunct; the
+      finalize test, a φ-set pin on an allocating `tostring` loop and an
+      id-determinism program with a linked loop-done witness, each checked
+      against a mutation. Gates and the board pending.
 - [x] **Phase K — keyframes (§9a).** Landed: K1 tombstones, K2 whole
       heap, K3 physical array parts; format version 10. Codex: REVISE,
       REVISE, then APPROVE in round 3, after the rehash trigger, native
@@ -2008,6 +2011,102 @@ supersedes doc 14 Phase 7's reserved-space row ids, which were Bart's call.*
 - The schema keeps a tombstone out of heap edges; that is structural, so
   there is no runtime test for it.
 - The viz test from Phase V, now reading the tombstone.
+
+## 9b. Phase 3 — allocating traces join the dead-φ filter
+
+**The change.** `trace_finalize.phiLiveRow` returns null, and so keeps every
+φ, when the recording has a terminal close, **allocates**
+(`alloc_count != 0`), or anchors in a non-maskable proto. Phase 3 drops the
+allocation conjunct. The other two stay: the terminal-close exemption is
+doc 44's one-shot heads, which has nothing to do with rooting, and the
+`maskable` gate is §5's shared predicate.
+
+**Why the conjunct exists.** Doc 24 D3's full-write-set flush rule makes an
+allocating trace's loop close write every slot the body writes. Its stated
+reason is physical rooting: "The collector roots every physical register
+below `stack_top`, not the live set." A dead temp left holding its pre-burst
+value instead of the last iteration's value meant divergent roots, divergent
+sweeps and divergent de-intern sets. D3 drew the line at allocation only
+because before arc B a traceable loop could not create per-iteration heap
+temps. Doc 61 then applied the same filter to non-allocating traces, which
+can leave a loaded heap reference (a table field, an upvalue) in a dead
+slot. So the hazard D3 named was never about allocation. It was about any
+heap value in an unrooted-in-principle slot, and §2's theorem is what closes
+it.
+
+**D3's three obligations, re-derived under masking.**
+
+1. **Same roots at every collection.** §2's premise is a property of the set
+   of elided stores: each is to a slot dead at every pc where tier-0 or a
+   linked trace resumes. `phiLiveRow` builds that set from `reg_live` at the
+   close's resume pc and at every linked loop-done exit's pc. For a branch
+   whose deopt crosses a `for_loop` it adds that loop's two control slots
+   (`a`, `a+3`). A composite bridge's landing state is checked separately,
+   by the liveness-aware snapshot agreement in
+   `bridgeMatchesExitSnapshot` (§2 site 4). Nothing in that construction, or in the theorem's proof, depends on where
+   the stale or the elided value came from. An object allocated on trace is
+   just another heap value. With the premise met, every rooted slot holds
+   the same value in every tier, so the marked sets are equal.
+2. **Same collection points.** A collection runs at the tier-0 prologue when
+   `object_count >= next_gc`. `object_count` is the allocation stream, which
+   D8 already makes tier-identical (same callouts, same order, no DCE).
+   `next_gc` is set from the marked count, equal by (1). D3's budget guard
+   is unchanged: no collection runs during a burst, in any mode.
+3. **No dangling reads.** After a burst the JIT run's dead slot holds its
+   pre-burst value. That value was valid at entry: the last collection
+   before it scrubbed every slot it did not keep (§6.4), and a kept slot's
+   object survived. No collection runs inside the burst. At the next
+   collection the slot is still dead (a dead slot stays dead until written,
+   §2), so it is not kept, and the scrub nils it. In tier-0 the same slot
+   holds the last iteration's temp, also unkept, also nilled. After that
+   collection both tiers hold nil.
+
+**Who else reads a dead slot.** Each one already handles the non-allocating
+case, and none of them distinguishes allocation:
+- keyframe capture: tombstones from `fillKeep` (§9a);
+- the visualiser: labels from the tombstone (Phase V/K);
+- the final cut: it keeps the result span only;
+- the debug register probe (`RegProbe`): a test instrument, not program
+  output.
+
+**What does not change.**
+- **Precise recordings (doc 45).** `beginPrecise` loads every anchor-window
+  slot at entry, and `phiWritebackKept` keeps every entry slot. A precise
+  trace still writes its whole window at the close. Its full-window exit
+  snapshots are unaffected.
+- **Peeling.** `maybeEnterPeel` and `finishPeel` still refuse allocating
+  recordings. That gate is about duplicating effects in the peeled
+  iteration, not about rooting.
+- **The budget guard and D3's chaining/entry discipline.**
+
+**Tests.**
+- `trace_finalize_test`: an allocating scratch recording filters exactly as
+  a non-allocating one. A precise one (every slot an entry slot) keeps
+  every φ.
+- **A countable store pin, the only test that sees the change.** A committed
+  ordinary (non-precise) allocating trace with a dead string temp has no φ
+  writeback for that slot. The pin also checks that the trace committed, is
+  not precise, and allocates. Mutation: restore the conjunct, and the pin
+  fails. Behaviour probes cannot see the change: `RegProbe.reg` collects
+  before it reads, and the scrub nils a kept dead φ and a dropped one alike
+  (codex Phase 3 review #2).
+- Determinism programs, run through every mode by `expectProgram`, each
+  with a non-stress witness that the path it names actually ran:
+  - a dead per-iteration **string** temp on an ordinary allocating trace,
+    then collections, a re-intern of a possibly swept string, and a printed
+    table id (doc 61's original counterexample, `interp_gc_test`, now with
+    on-trace allocation). Its inner loop's loop-done exit is linked
+    natively, so the same program covers that path. The witness asserts the
+    allocating trace ran and, natively, that the link was followed.
+  A table temp would not exercise the filter: `new_table` forces a precise
+  recording (`trace_recorder.zig` ~1780), which keeps every φ (codex
+  Phase 3 review #1). A table-temp program stays only as a precise-mode
+  preservation test.
+- hashgate on both legs, and the viz suite.
+
+**Benchmark (Rule #20).** This change only removes stores. It is measured on
+the pinned board (`gt profile`), to confirm the allocating rows are flat or
+better.
 
 ## 10. Open questions
 
