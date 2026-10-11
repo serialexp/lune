@@ -135,6 +135,13 @@ pub const Heap = struct {
     gray: std.ArrayListUnmanaged(*GcHeader) = .empty,
     /// Live-count threshold at which the next collection triggers.
     next_gc: usize = initial_gc_threshold,
+    /// Doc 63 §5.6: moves whenever something a trace may rely on can have
+    /// changed across a host call: guest execution, a collection, a host's
+    /// structural change, or any C API entry not on the §5.6 exemption
+    /// list. Lives here, not on `Vm`, because native pages bake only stable
+    /// addresses and `Vm` may move. Only equality across one call is ever
+    /// read, so it wraps. Bump through `bumpHostEpoch`.
+    host_epoch: u64 = 0,
     /// Test/diagnostic knob: when set, `shouldCollect` is always true, so the
     /// collector runs at *every* safepoint. Surfaces use-after-free and missing
     /// roots immediately (a wrongly-freed live object breaks the very next op).
@@ -371,6 +378,9 @@ pub const Heap = struct {
 
         parent.array.deinit(gpa);
         parent.array = outer;
+        // Doc 63 §5.6: the array storage a trace may have hoisted is gone. A
+        // C API read can get here without guest reentry (`mh_table_get`).
+        self.bumpHostEpoch();
         // Hysteresis (doc 14, Phase 4b): a table that just deflated is not
         // re-inflated by a following fused store — that would thrash. It stays
         // nested for the rest of its life (keyframes carry the flag).
@@ -561,6 +571,12 @@ pub const Heap = struct {
     // the VM owns the root set (it alone knows what is live). Splitting it this
     // way keeps `gc.zig` free of any interpreter dependency.
     // -----------------------------------------------------------------------
+
+    /// Doc 63 §5.6: record that something a trace may rely on can have
+    /// changed (see `host_epoch`).
+    pub inline fn bumpHostEpoch(self: *Heap) void {
+        self.host_epoch +%= 1;
+    }
 
     /// Whether a collection should run at the next safepoint.
     pub fn shouldCollect(self: *const Heap) bool {

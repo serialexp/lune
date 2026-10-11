@@ -2304,7 +2304,7 @@ pub const Vm = struct {
     /// range is free again once this returns: the caller copies the slice out
     /// before anything else can run a host fn. Inline, because both callers
     /// are on the host-call path and a call here costs more than the work.
-    inline fn callHostNative(self: *Vm, nat: *const function.Native, args: []const Value, want: usize) Error![]const Value {
+    inline fn callHostNative(self: *Vm, nat: *function.Native, args: []const Value, want: usize) Error![]const Value {
         const hb = nat.host.?;
         std.debug.assert(nat.effect == null and nat.multi == null and nat.recorded == null);
         if (self.host_out.len == 0) self.host_out = try self.gpa.alloc(Value, host_out_slots);
@@ -2314,6 +2314,12 @@ pub const Vm = struct {
         self.host_out_top = lo + n;
         // Error or not, the host has returned and its range is free again.
         defer self.host_out_top = lo;
+        // Doc 63 §5.9: a call during which the epoch moved disturbs. Counted
+        // in a `defer` so a failing call counts the same as a successful one.
+        const epoch = self.heap.host_epoch;
+        defer if (self.heap.host_epoch != epoch) {
+            nat.disturbs +|= 1;
+        };
         const buf = self.host_out[lo .. lo + n];
         const produced = hb.call(hb.ctx, @ptrCast(self), args, buf) catch |e| return narrowError(e);
         return buf[0..@min(produced, n)];
@@ -2322,7 +2328,7 @@ pub const Vm = struct {
     /// `callValue`'s native dispatch once `args` are rooted (the caller parked
     /// them). Results go straight into `results_out` (a concrete count is always
     /// wanted here; the `all_results` stamping path is dispatch-only).
-    fn callNativeUnparked(self: *Vm, nat: *const function.Native, args: []const Value, results_out: []Value) Error!usize {
+    fn callNativeUnparked(self: *Vm, nat: *function.Native, args: []const Value, results_out: []Value) Error!usize {
         if (nat.host != null) {
             // Embedder host fn (doc 59 §3.5): the single invocation
             // funnel. `results_out` may alias `args` (`pcall` passes slices
@@ -2363,6 +2369,10 @@ pub const Vm = struct {
         if (self.native_reentry_depth >= max_native_reentry) return Error.StackOverflow;
         self.native_reentry_depth += 1;
         defer self.native_reentry_depth -= 1;
+        // Doc 63 §5.6: re-entry, including metamethod dispatch (`indexGet`'s
+        // `__index`), can change anything a trace relies on. A closure
+        // callee bumps again in `execWithEntry`; a native callee only here.
+        self.heap.bumpHostEpoch();
 
         // Doc 61 §4.2: the current frame is in flight inside its instruction
         // while the re-entered code runs (a metamethod, a native's callback,
@@ -2513,6 +2523,9 @@ pub const Vm = struct {
         if (std.debug.runtime_safety) self.assertFrameShapesKnown();
         if (builtin.is_test) if (test_collect_probe) |probe| probe(self);
         self.heap.beginCollect() catch return;
+        // Doc 63 §5.6/§5.7: every collection moves the epoch. A skipped cycle
+        // (above) changed nothing, so it doesn't.
+        self.heap.bumpHostEpoch();
         // The root set is defined once in `forEachRootHeader`; marking is just
         // "call `markHeader` on each root".
         self.forEachRootHeader(self.heap, gc.Heap.markHeader);
@@ -2867,6 +2880,9 @@ pub const Vm = struct {
         // it here rather than trusting it, and never read the popped frame's
         // stale storage afterwards.
         const root_base_ok = self.depth >= 1 and self.frames[0].base == 0;
+        // Doc 63 §5.6: every guest execution moves the epoch. `run`, `start`
+        // and a resume reach the dispatch loop here, not via `execWithEntry`.
+        self.heap.bumpHostEpoch();
         const outcome = try self.execWith(1);
         if (outcome == .finished and self.depth == 0 and root_base_ok) {
             const fr = outcome.finished;
@@ -2905,6 +2921,10 @@ pub const Vm = struct {
     /// errdefers, same exit handling, and a `.switch_mode` (or a non-fast VM
     /// state) falls through to the general `execWith` loop.
     inline fn execWithEntry(self: *Vm, cl: *const Closure, cp: *const Proto, base: usize, stop_depth: u32) Error!ExecOutcome {
+        // Doc 63 §5.6: guest execution entered from native code (`callValue`,
+        // H1's `runPushedFrame`, H3's chain) can change anything a trace
+        // relies on.
+        self.heap.bumpHostEpoch();
         errdefer self.trace.clearPendingExitAnchor();
         errdefer self.trace.abortRaised(); // guarded no-op when idle (doc 26 D1a)
         if (self.runFastPath()) {
@@ -2985,7 +3005,7 @@ pub const Vm = struct {
     /// short — the hook consumes the pending anchor at the very next reach of that
     /// pc — after which `.fast` resumes.
     ///
-    /// Doc 60 §5.4: the ten conditions are packed into `trace.fast_block`, so
+    /// Doc 60 §5.4: the eleven conditions are packed into `trace.fast_block`, so
     /// this is one 16-bit load and compare. Debug builds check the word
     /// bit-for-bit against `fastBlockReference` on every call.
     inline fn runFastPath(self: *const Vm) bool {
@@ -2994,7 +3014,19 @@ pub const Vm = struct {
         return self.trace.fast_block == 0;
     }
 
-    /// Doc 60 §5.4: the `fast_block` word recomputed from the ten fields it
+    /// Doc 63 §5.9: the JIT is suspended, as the dispatch handlers see it.
+    /// Suspension is a `fast_block` bit, so a suspended VM always dispatches
+    /// `.full`, and in `.fast` this is comptime false: the gates cost the hot
+    /// path nothing.
+    inline fn jitSuspended(self: *const Vm, comptime mode: ExecMode) bool {
+        if (mode == .fast) {
+            std.debug.assert(!self.trace.suspended());
+            return false;
+        }
+        return self.trace.suspended();
+    }
+
+    /// Doc 60 §5.4: the `fast_block` word recomputed from the eleven fields it
     /// mirrors — the reference the packed word is asserted against.
     pub fn fastBlockReference(self: *const Vm) u16 {
         const FastBit = trace.TraceState.FastBit;
@@ -3333,13 +3365,17 @@ pub const Vm = struct {
         // (7) Fetch. The handler receives `cur + 1` as its `pc` (one
         // past itself — `cur_pc` is derivable as `pc - 1`).
         const i = iptr.*;
+        // Doc 63 §5.9: while the JIT is suspended, steps (8)–(11) neither
+        // close, start nor feed a recording, and leave every pending anchor
+        // for the code that set it.
+        const jit_live = mode == .full and !self.jitSuspended(mode);
 
         // (8) A recording is one CFG cycle, not necessarily one
         // syntactic back-edge. Close before mirroring when forward
         // flow re-enters its anchor (nested loops can do this after an
         // enclosing back-edge). The ordinary matching back-edge
         // already closed in `onBackEdge`, making this a cheap no-op.
-        if (mode == .full and self.trace.isRecording())
+        if (jit_live and self.trace.isRecording())
             self.trace.maybeCloseAtAnchor(st.proto, @intCast(cur), st.regs);
         // (9) Nested-loop continuation (Phase 1): a continuation
         // recording armed by a hot inner loop-done exit, or (doc 56) by
@@ -3348,7 +3384,7 @@ pub const Vm = struct {
         // the mirror below, so the anchor instruction is recorded as
         // the trace's first op (exactly as a root trace's anchor is).
         // A cheap optional-null read when nothing is pending.
-        if (mode == .full and self.trace.pending_exit_anchor != null) {
+        if (jit_live and self.trace.pending_exit_anchor != null) {
             self.trace.maybeStartContinuation(st.proto, @intCast(cur));
         }
         // (10) Coherent-state chaining (doc 16, Phase 2): a prime
@@ -3358,7 +3394,7 @@ pub const Vm = struct {
         // no deopt-replay needed. Same `.full`-only, before-the-mirror
         // placement so the anchor instruction is the recording's
         // first op.
-        if (mode == .full and self.trace.pending_replay_anchor != null) {
+        if (jit_live and self.trace.pending_replay_anchor != null) {
             self.trace.maybeStartReplaySide(st.proto, @intCast(cur));
         }
         // (10b) Function-head anchor (doc 44 P0): a hot call flagged in
@@ -3367,7 +3403,7 @@ pub const Vm = struct {
         // as (9)/(10) so pc 0's instruction is the recording's first op.
         // `maybeStartHead` consumes-or-discards the pending unconditionally
         // (`call_seq`-pinned), so a stale pending self-cleans right here.
-        if (mode == .full and self.trace.pending_call_anchor != null) {
+        if (jit_live and self.trace.pending_call_anchor != null) {
             _ = self.trace.maybeStartHead(st.proto, @intCast(cur), st.base, st.frame.call_seq);
         }
         // (10c) Continuation anchor (doc 44 D12b): a hot post-call resume pc
@@ -3375,13 +3411,13 @@ pub const Vm = struct {
         // reaches the caller's frozen cursor. Same `.full`-only,
         // before-the-mirror placement and consume-or-discard self-cleaning
         // as (10b).
-        if (mode == .full and self.trace.pending_ret_anchor != null) {
+        if (jit_live and self.trace.pending_ret_anchor != null) {
             _ = self.trace.maybeStartCont(st.proto, @intCast(cur), st.base, st.frame.call_seq);
         }
         // (11) Recording mirror — `.full` only. Mirrors this
         // instruction (and its observed operand types) into the trace
         // IR *before* tier-0 executes it.
-        if (mode == .full and self.trace.isRecording()) {
+        if (jit_live and self.trace.isRecording()) {
             // Doc 20 §R1-3: the mirror always records the CANONICAL
             // instruction. `i` came from the fetch `code` slice, which
             // may be a patched image — a recording crossing a patched
@@ -6125,7 +6161,12 @@ pub const Vm = struct {
                 const slot: u16 = instr_in.b;
                 const patch = self.trace.registry.entry_registry.entry_patches.items[slot];
                 const live = patch.live;
-                if (!live) {
+                // Doc 63 §5.9: a suspended handler neither recovers nor enters;
+                // it runs the step and takes the virgin path below, whose
+                // epilogue is gated too. `patch.orig` stays readable: nothing
+                // drains while suspended.
+                const suspended = self.jitSuspended(mode);
+                if (!live and !suspended) {
                     // §R6-1 pre-step recovery — a LEGITIMATE deferred-unpatch
                     // state, not a defensive-unreachable one (codex
                     // post-landing review of 7fa7e1a): marks can originate
@@ -6183,8 +6224,9 @@ pub const Vm = struct {
                 }
                 // Defensive-unpatched: virgin cascade (cold path IS the
                 // existing cascade, reached by unpatching BEFORE the step ran
-                // above — §R2-3's double-increment hazard avoided).
-                if (!live) return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
+                // above — §R2-3's double-increment hazard avoided). Also the
+                // suspended path (doc 63 §5.9).
+                if (!live or suspended) return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
                 // §R1-5 bypass set — live authoritative fields, no maintained
                 // flag: the `runFastPath` `.full` set plus exec-log and
                 // coverage. Take the back-edge through the ordinary epilogue
@@ -6252,7 +6294,9 @@ pub const Vm = struct {
                 const slot: u16 = instr_in.b;
                 const patch = self.trace.registry.entry_registry.entry_patches.items[slot];
                 const live = patch.live;
-                if (!live) {
+                // Doc 63 §5.9: as the numeric-for arm.
+                const suspended = self.jitSuspended(mode);
+                if (!live and !suspended) {
                     // Same deferred-unpatch recovery as the numeric-for arm:
                     // complete the transaction before executing the canonical
                     // instruction once.
@@ -6291,7 +6335,7 @@ pub const Vm = struct {
                 if (!took) {
                     return dispatchTail(mode, st, npc, vm);
                 }
-                if (!live) return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads }); // restored virgin cascade
+                if (!live or suspended) return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads }); // restored virgin cascade
                 if (self.trace.isRecording() or self.suspend_ctl != null or
                     self.record_safepoint_lines or self.trace.config.record_exec_log or
                     self.trace.pending_exit_anchor != null or
@@ -6353,6 +6397,12 @@ pub const Vm = struct {
                 // `proto.code` is sound (virgin ops, canonical semantics);
                 // the next jump/call re-derives from `st.code` and re-sees
                 // any patched pcs.
+                //
+                // Doc 63 §5.9: suspended, run the canonical instruction
+                // before the non-live recovery, without touching the patch.
+                if (self.jitSuspended(mode)) {
+                    return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
+                }
                 if (!patch.live) {
                     // §R6-1 deferred-unpatch recovery, exactly the loop arms'
                     // discipline: complete the transaction, then run the
@@ -6461,6 +6511,11 @@ pub const Vm = struct {
                 // (canonical-identical to `patch.orig` by the install
                 // invariant) — never `&patch.orig` (no successor instruction
                 // behind a detached struct pointer; the jfunc_head note).
+                //
+                // Doc 63 §5.9: as jfunc_head.
+                if (self.jitSuspended(mode)) {
+                    return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
+                }
                 if (!patch.live) {
                     // §R6-1 deferred-unpatch recovery.
                     self.trace.unpatchSlot(slot);
@@ -7279,7 +7334,11 @@ pub const Vm = struct {
         // keeps elapsing across the skip. Hot traced loops and warming loops
         // keep a 0 slot and always take the slow path below, so their
         // behaviour is unchanged.
-        if (!self.trace.skipBackEdge(proto, anchor_pc)) {
+        // Doc 63 §5.9: a suspended JIT still counts (`skipBackEdge` advances
+        // the hot slot and `tick`), but everything past it is a JIT decision
+        // or JIT-state write — the recorder's slab base, selection, cached
+        // entry, the skip windows — so the whole slow path is skipped.
+        if (!self.trace.skipBackEdge(proto, anchor_pc) and !self.jitSuspended(mode)) {
             // Doc 43 §3.1 (P0a): hand the recorder this frame's absolute slab base
             // so a fresh arming can decide open-upvalue aliasing. Any arm inside
             // `onBackEdge` reads it immediately; a stale value between arms is

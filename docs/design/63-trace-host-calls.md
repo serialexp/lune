@@ -1,10 +1,12 @@
 # 63 — Traces call host functions directly — Design
 
-Status: partial — prerequisites and Phase 0 (benchmark and budget)
-landed; no host call is traced yet. Revision 6, approved by Codex and
-Antigravity (confirmation round 6, receipts `docs/reviews/doc63/*-rev6.md`).
+Status: partial — prerequisites, Phase 0 (benchmark and budget) and
+Phase 1 (epoch, disturbance and suspension, inert) landed; no host call
+is traced yet. Revision 6, approved by Codex and Antigravity
+(confirmation round 6, receipts `docs/reviews/doc63/*-rev6.md`).
 Q1–Q5 decided by Bart (2026-10-10; §9). Review history in §11–§15.
-Prerequisites A and B and Phase 0 done; Phases 1–4 not started.
+Prerequisites A and B, Phase 0 and Phase 1 done. Before Phase 2c: the
+§5.9 region-accounting amendment. Phases 2–4 not started.
 Owner: Bart
 Last updated: 2026-10-11
 
@@ -54,16 +56,48 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   §8.1. The tier-0 overhead A/Bs move to the phases whose code they
   measure: the epoch and suspension checks to Phase 1, the entry lease
   to Phase 2b.
-
-### Outstanding
-
-- [ ] **Phase 1 — epoch, disturbance and suspension (inert).**
+- [x] **Phase 1 — epoch, disturbance and suspension (inert).**
   `Heap.host_epoch` bumped at every §5.6 site; `Native.disturbs`
   maintained by `callHostNative` on success and failure (§5.9);
   `TraceState.suspend_depth` honoured by every §5.9 gate. No reader of
   any of them outside tests yet. A test per site and per gate. The
   instruction-count A/B of the epoch compare and the `suspend_depth`
-  checks on `bench/` and the §8.1 probe (§8).
+  checks on `bench/` and the §8.1 probe (§8). Done 2026-10-11; see
+  §5.9.1. Tests are in `capi_epoch_test.zig` and `capi_suspend_test.zig`.
+  - "No reader" means no guard or admission reader. `callHostNative`
+    itself reads the epoch to maintain `disturbs`, in every build.
+  - Six box-side readers, `mh_script_free` and VM lifecycle are now
+    exempt, each argued.
+  - Suspension is a `fast_block` bit, so the gates cost the `.fast` hot
+    path nothing.
+  - Three ungated paths the doc missed were found and gated.
+  - Physical teardown waits for Phase 2b, as planned.
+  - Region accounting is not gated yet (Outstanding).
+  - Reviewed by Codex and Antigravity (`docs/reviews/doc63/*-phase1.md`,
+    dispositions in `phase1-dispositions.md`).
+  - Measured cost (Outstanding decision):
+    - +11 instructions per pure host call;
+    - +19–23 per call for hosts that call back or write;
+    - up to +0.18% on stdlib-heavy tier-0 `bench/` rows.
+
+### Outstanding
+
+- [ ] **§5.9 amendment — region accounting under suspension.** Tier-0
+  region observation and activation drops still run inside a suspended
+  callback. Through `closeRegion` they can gate anchors, disarm links
+  and demote promoted sets (§5.9.1). Choose a rule, review it, then gate
+  and test it, all before Phase 2c raises the depth.
+- [ ] **Decision — the residual cost of `disturbs` counting** (§5.9.1).
+  The cost:
+  - +11 instructions per pure host call, about 5 of them the compare
+    itself;
+  - +19–23 for disturbing hosts, whose callbacks also pass through more
+    bumping entries;
+  - +0.06–0.18% on stdlib-heavy tier-0 `bench/` rows.
+
+  Both come from the inlined funnel's extra live state changing register
+  allocation for all of `opCall`. `noinline` is worse. Bart decides
+  whether to accept this or have another mechanism found.
 - [ ] **Phase 2a — slab-coherent snapshots and the host statuses (inert).**
   The snapshot form, its validation, finalize placement rules, admission,
   both executors and both dispatcher consumers (§5.2); the status
@@ -558,6 +592,9 @@ Everything else bumps, including `mh_global_get` (it interns the name,
 which is harmless, but the list stays short until Phase 0 shows a
 reason) and `mh_ref_create`/`mh_ref_free` (they change the root set).
 
+Phase 1 extended the list with the box-side readers, `mh_script_free`
+and VM lifecycle. Each has its argument and test in §5.9.1.
+
 `guard_host_epoch` passes when both hold:
 
 - `heap.host_epoch` equals its value before the call. Native code loads
@@ -758,6 +795,205 @@ win.
 
 Lifting suspension (episode-owned accounting) is a later design, in
 Outstanding.
+
+### 5.9.1 As landed: Phase 1 (2026-10-11)
+
+All three are inert. Only tests raise `suspend_depth`. `callHostNative`
+maintains `host_epoch` and `disturbs` in every build, but nothing acts on
+them yet: Phase 2c adds the guard and admission readers.
+
+**The epoch.** `Heap.host_epoch` (`gc.zig`) is bumped by
+`Heap.bumpHostEpoch` in the following places:
+
+- `Vm.exec`, the public entry `run`, `start` and a resume use (the CLI
+  and replay).
+- `Vm.callValue`, after the reentry count. Metamethod dispatch and
+  `pcall` go through it.
+- `Vm.execWithEntry`, at its top. Every closure `callValue` runs reaches
+  it, including the C API's chunk runs (`mh_run` and `mh_eval` run the
+  chunk as a closure).
+- `Vm.collect`, once `beginCollect` succeeds.
+- `Heap.deflateGrid`, after the swap.
+- `capi.bumpEpoch`, first thing in every non-exempt C API entry:
+  `mh_collect`, `mh_compile`, `mh_run`, `mh_eval`, `mh_call` and its
+  doc 60 hand-written path (`mhCallViaH1`), `mh_global_get`,
+  `mh_global_set`, `mh_ref_create`, `mh_ref_free`, `mh_register_fn`,
+  `mh_table_get`, `mh_table_set`, `mh_table_len`,
+  `mh_table_metatable_get`, `mh_table_metatable_set`,
+  `mh_table_iter_new`, `mh_table_iter_next` and `mh_table_iter_free`.
+  Each exempt entry says why in a comment next to it. The differential
+  tests' `mh_call` reference leg (`hostcallReference`) bumps the same
+  way.
+
+Table and global writes from the guest don't bump it: guest execution
+already did. A host write goes through a bumping C API entry.
+
+Each site is pinned by a test that fails without it.
+
+- **C API entries.** Each entry is called with an argument it rejects
+  right after its bump. The rejection path reaches no other site, so a
+  delta of exactly 1 can come only from that entry's own bump.
+  `mh_collect` has no rejecting argument; it is pinned at exactly 2, its
+  own bump plus the collection's.
+- **Core sites.** Each is pinned by its exact delta:
+  - `Vm.run` of a call-free chunk: 1 (`exec`);
+  - `callValue` on a native: 1;
+  - `callValue` on a closure: 2 (`callValue`, then `execWithEntry`);
+  - `mh_run` of a call-free chunk: 3;
+  - `collect`: 1;
+  - `deflateGrid`: 1.
+
+  Removing any one of the five core bumps fails its test (checked by
+  hand, one at a time).
+
+**Exemptions added beyond §5.6's table.** Each has its argument in code
+and a test (`capi_epoch_test.zig`):
+
+| Function | Why it is exempt |
+|---|---|
+| `mh_last_error`, `mh_output`, `mh_output_clear`, `mh_warnings`, `mh_warnings_clear`, `mh_mem_stats_get` | They read or clear box-side buffers and counters: `last_error`, the output and warning sinks, the tracking allocator's statistics. These sit on the box's allocator, never on the VM or the GC heap, so nothing a trace relies on changes. |
+| `mh_script_free` | It frees only the box-side handle. The program image stays VM-owned (`compileImage`), so no VM state changes. |
+| `mh_vm_new`, `mh_vm_free` | They create or destroy the VM. No trace of that VM is running or can run across them. `mh_vm_free` refuses while the VM is executing. The tests check two things: another VM's creation and destruction leave this VM's epoch alone, and a refused free from inside a host call leaves it alone too. |
+
+**`disturbs`.** `callHostNative` takes `*Native` and reads
+`host_epoch` after reserving its `host_out` range. A `defer`
+increments `nat.disturbs` (saturating at 255) if the epoch moved. The
+`defer` runs on every return, so a failing call counts the same as a
+successful one. Both funnels are tested: the dispatch `.call` arm and
+`callValue`'s native arm (`pcall`, `mh_call`). The tests cover:
+
+- a pure host and a host that only allocates through exempt entries;
+- a host that calls back, then succeeds or fails;
+- saturation;
+- an error staged with `mh_error_set`, then a successful return.
+
+**Suspension is a `fast_block` bit.** `TraceState.raiseSuspend` and
+`lowerSuspend` are the only writers of `suspend_depth`. They keep
+`FastBit.jit_suspended` set while the depth is non-zero. The trace-owned
+bits are now 0–7 and the VM bits 8–10; `runFastPath` and the hand-written
+entry test only the whole word.
+
+A set bit makes `runFastPath` false, so a suspended VM always dispatches
+in `.full`. `Vm.jitSuspended(mode)` is therefore comptime false in
+`.fast`, where it asserts in debug builds. Every dispatch-handler gate
+uses it, so the gates add nothing to the `.fast` hot path.
+
+`onCallEntry`/`onRetResume` test the recording and suspension bits in
+one `fast_block` load. The first cut tested `suspend_depth` directly in
+every patched handler, which cost euler14-bit (JIT) +0.22%, about 8
+instructions per patched back-edge. With the bit, that row is −0.01%.
+
+**The gates** (`capi_suspend_test.zig`). Most tests use a host that
+raises suspension around an `mh_call`. Every test pairs the suspended
+run with an unsuspended control that does reach the gate.
+
+| Gate | Where it is | What the test shows |
+|---|---|---|
+| Recording feed | `dispatchPostObserve` computes `jit_live = mode == .full and !jitSuspended(mode)` and uses it for steps 8–11: closing at an anchor, continuation and replay-side starts, head and continuation starts, and the recording mirror. The region observer (step 5) runs before it and is not gated (see below). `onBackEdge` and `startRecording` assert they are not suspended. | A for loop, a while loop and recursive `fib` record nothing; the unsuspended control records all three. |
+| Back-edge slow path | `backEdgeEpilogue` skips everything after `skipBackEdge`'s counting while suspended: the recorder's slab base (`pending_anchor_base`), `onBackEdge`, cached entry, `armShortLoopSkip` and `afterBackEdge`'s skip window. Hot counters still count, as §5.9 allows. | With native codegen off, a cached trace with no entry patch is not entered, and `pending_anchor_base` is unchanged; the control enters it. |
+| Patched entries | `opJForLoop`/`opJLoop` skip their non-live `unpatchSlot` and take the virgin path. `opJFuncHead`/`opJCont` dispatch `&st.proto.code[cur_pc]` before their non-live recovery. | All four patched kinds are installed. For each of `work`, `wloop` and `fib`, a suspended call enters nothing and changes no image op, and the unsuspended control enters. Every patch, of all four kinds, is then marked pending. Suspended visits leave each one pending and patched; the next unsuspended visit settles each one. |
+| Head and continuation hooks | `onCallEntry` and `onRetResume` return early. They also reach `maybeRepatchHead`/`maybeRepatchCont`, which drain. | Covered by the `fib` entry and image checks above. |
+| Unwind hooks | `clearPendingExitAnchor` returns before clearing. `abortRaised` skips an active recording. | A pending exit anchor survives a suspended raising call and starts no recording; the control clears it. On a real recording, `abortRaised` is a no-op while suspended and aborts in the control. |
+| An active outer recording | All of the above. | A run is stepped one safepoint at a time with `suspend_ctl` until its loop is recording. A suspended callback then runs a loop, a recursive call tree and `abortRaised`. The recording, its IR, path and constants, `pending_anchor_base`, the pending exit anchor and the trace count are all unchanged, and the outer run resumes to the right answer. |
+| Arming, linking, draining | Their callers are gated as above. `arm` and `drainEntryPatchWork` assert they are not suspended. | The asserts run in every test above whose suspended callback reaches those paths: loops, calls and returns. |
+| Physical teardown | Phase 2b, as planned (§5.10). A callback's collection can still run Phase Q's sweep invalidation today. | — |
+
+Removing the back-edge gate trips `onBackEdge`'s assert in every
+suspended test.
+
+**Three paths the §5.9 gate list did not name.** Implementation found
+all three, and Phase 1 gates all three:
+
+1. `onCallEntry`/`onRetResume` reach `maybeRepatchHead`/`maybeRepatchCont`,
+   which drain the entry-patch work. Gated with the head and
+   continuation hooks.
+2. An active outer recording would otherwise react to the callback.
+   `onBackEdge` can close or abort it, and `maybeCloseAtAnchor` can
+   close it. Gated with the recording feed and the back-edge slow path.
+   This can only arise once Phase 2c raises the depth during recording;
+   Phase 1 gates it now.
+3. `execWith`/`execWithEntry` call `clearPendingExitAnchor` on exit and
+   `abortRaised` from an `errdefer`. Both are gated inside those two
+   functions, as the unwind hooks.
+
+`execWithEntry`'s `setRegionContext` is region accounting, covered by
+the next item.
+
+**Not gated yet: region accounting.** Tier-0 departure observation
+(`observeRegionProgramPoint`, through the region trampoline),
+`opRet`'s `dropRegionActivation`, and `dropRegionActivationsFromDepth`
+on a caught unwind can all reach `closeRegion`, and they run inside a
+suspended callback. `closeRegion` → `applyWindowDecision` can then:
+
+- gate the owner anchor (`gateAnchor(.region_decay)`);
+- disarm every link (`disarmAllLinks`);
+- demote promoted sets (`demotePromotionsForRegion`).
+
+All three are JIT-state mutations that §5.9's rule forbids while
+suspended. Closing these paths needs a written amendment, because each
+choice changes region profit accounting:
+
+- skip the observation entirely while suspended;
+- defer the closes to the release point;
+- treat a suspended callback as opaque to the enclosing activation.
+
+The amendment goes to review before Phase 2c raises the depth for real.
+It is in Outstanding.
+
+**Cost** (§8). This is a ReleaseFast instruction-count A/B against HEAD
+`81d6f24`, over every `bench/` program, tier-0 and JIT on.
+
+The counts are deterministic: the min-to-max spread over repeated runs
+is 0.00% on every row, for both binaries. So every delta below is a real
+cost, not noise, and §8's "no more than noise" rule cannot be read as a
+tolerance.
+
+- **JIT on.** Every row is within ±0.06% except tbl_ops at +0.15%.
+- **Tier-0.** The largest rows:
+  - str_manip +0.18%;
+  - tbl_ops +0.16%;
+  - scalar +0.15%;
+  - array3d +0.07%;
+  - nsieve-bit-fp, partialsums, lua54 and str_gmatch +0.06%.
+
+  Everything else is within ±0.01%.
+
+None of these programs calls an embedder host, and `callHostNative`
+serves only embedder hosts.
+
+A callgrind line diff of tbl_ops (tier-0) puts all of its +0.8M
+instructions in `opCall`, about 2–3 per stdlib native call. The new code
+on the host arm adds live state across the C call: the epoch snapshot,
+and `nat` as a mutable pointer. The added instructions fall on lines
+that are shared, such as the argument copy, frame restore and lines
+callgrind cannot attribute. So inlining the host arm changes register
+allocation for the whole `opCall` handler, and stdlib calls pay for it.
+
+On the §8.1 probe, every pure host call costs **11 instructions more**
+in both modes. For example, `min` goes from 690 to 701 with the JIT
+off, and from 723.2 to 734.2 with it on. The disturbing shapes pay
+more, because their callbacks now pass through more bumping entries:
+
+| Shape | Extra instructions |
+|---|---:|
+| `cb` | 19 |
+| `two` | 19 |
+| `fail` | 21 |
+| `tw` | 23 |
+
+A callgrind run of `minl` (tier-0, on a baseline-CPU build, +16 per call
+there) splits the per-call cost:
+
+- **About 5 are the compare itself**: the load before the call, and the
+  load, compare and branch in the `defer`. This matches §5.9's "one load
+  and compare".
+- **About 11 are the same register-allocation effect in `opCall`.**
+
+Making `callHostNative` `noinline` was measured and rejected: `min` rose
+to 736, against 690 at base and 701 inlined.
+
+Both residual costs have one cause, the inlined funnel's extra live
+state. They are recorded for Bart's decision, in Outstanding.
 
 ### 5.10 GC lifetime across a callback (H3)
 

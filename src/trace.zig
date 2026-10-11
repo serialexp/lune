@@ -949,6 +949,13 @@ pub const TraceState = struct {
     /// these ticks, which is why a transiently-gated loop's cooldown keeps elapsing
     /// while the pre-filter is cheaply skipping its back-edges. Deterministic.
     tick: u64 = 0,
+    /// Doc 63 §5.9: while non-zero, guest code runs on tier-0 only. Nothing
+    /// records, enters, arms, links, drains or repatches; hot counters still
+    /// count. Exactly one party raises and lowers it per host call (the
+    /// traced-call shim, or `callHostNative` for a call made while
+    /// recording). Changed only through `raiseSuspend`/`lowerSuspend`, which
+    /// keep `FastBit.jit_suspended` in step; read through `suspended`.
+    suspend_depth: u32 = 0,
     /// Direct-mapped hot-count pre-filter (see `hotIndex`/`HOTCOUNT_SIZE`). A slot
     /// holds the number of back-edges to skip cheaply before re-consulting the slow
     /// path for the anchor(s) that hash there. Zero ⇒ take the slow path now. Set
@@ -3030,6 +3037,28 @@ pub const TraceState = struct {
         return self.rec.active;
     }
 
+    /// Doc 63 §5.9: the JIT is suspended (see `suspend_depth`). Every gate
+    /// tests this before any JIT decision or JIT-state mutation on its path.
+    /// Suspension sets a `fast_block` bit, so a suspended VM never dispatches
+    /// in `.fast`: the dispatch handlers' gates fold to false there
+    /// (`Vm.jitSuspended`) and cost the hot path nothing.
+    pub inline fn suspended(self: *const TraceState) bool {
+        return self.suspend_depth != 0;
+    }
+
+    /// Doc 63 §5.9: suspend the JIT for the guest code a host call runs. Pair
+    /// with `lowerSuspend` around the call.
+    pub inline fn raiseSuspend(self: *TraceState) void {
+        self.suspend_depth += 1;
+        self.setFastBit(FastBit.jit_suspended, true);
+    }
+
+    pub inline fn lowerSuspend(self: *TraceState) void {
+        std.debug.assert(self.suspend_depth != 0);
+        self.suspend_depth -= 1;
+        self.setFastBit(FastBit.jit_suspended, self.suspend_depth != 0);
+    }
+
     /// Bit assignment of `fast_block` (doc 60 §5.4).
     pub const FastBit = struct {
         pub const recording: u16 = 1 << 0;
@@ -3039,17 +3068,20 @@ pub const TraceState = struct {
         pub const ret_anchor: u16 = 1 << 4;
         pub const ret_cont_arm: u16 = 1 << 5;
         pub const call_head_arm: u16 = 1 << 6;
-        /// The seven bits `TraceState` owns (the rest are `Vm`'s), as
+        /// Doc 63 §5.9: `suspend_depth != 0`. Holding `.full` while suspended
+        /// is what lets every `.fast` handler drop its suspension check.
+        pub const jit_suspended: u16 = 1 << 7;
+        /// The eight bits `TraceState` owns (the rest are `Vm`'s), as
         /// `assertTraceBitsInSync` compares them against `traceFastBits()`.
-        pub const trace_owned: u16 = (1 << 7) - 1;
-        pub const vm_suspend: u16 = 1 << 7;
-        pub const vm_safepoint_lines: u16 = 1 << 8;
+        pub const trace_owned: u16 = (1 << 8) - 1;
+        pub const vm_suspend: u16 = 1 << 8;
+        pub const vm_safepoint_lines: u16 = 1 << 9;
         /// A published `Vm.final_cut`. Not a dispatch condition: nothing
         /// executes at depth 0 before the cut is retired. It sends the host
         /// call entry's first call after a run down H1, whose
         /// `pushHostCall` nils the dead final registers before the H3 entry
         /// would push over them (`Vm.retireFinalCut`).
-        pub const vm_final_cut: u16 = 1 << 9;
+        pub const vm_final_cut: u16 = 1 << 10;
     };
 
     /// Set or clear one `fast_block` bit as a whole-word read-modify-write.
@@ -3081,6 +3113,7 @@ pub const TraceState = struct {
         if (self.pending_ret_anchor != null) w |= FastBit.ret_anchor;
         if (self.pending_ret_cont_arm != null) w |= FastBit.ret_cont_arm;
         if (self.pending_call_head_arm != null) w |= FastBit.call_head_arm;
+        if (self.suspend_depth != 0) w |= FastBit.jit_suspended;
         return w;
     }
 
@@ -3131,6 +3164,9 @@ pub const TraceState = struct {
     /// continuation, prime side): starts the session and syncs the recording
     /// bit on both outcomes. False when the allocator declined the reset.
     pub fn startRecording(self: *TraceState, key: AnchorKey, num_registers: u16) bool {
+        // Doc 63 §5.9: every start path (`onBackEdge`, the prologue's
+        // continuation and replay-side starts) is gated on suspension.
+        std.debug.assert(!self.suspended());
         defer {
             self.syncRecordingBit();
             self.assertTraceBitsInSync();
@@ -3162,8 +3198,14 @@ pub const TraceState = struct {
     /// reach. Guarded (no-op when idle) so nested `execWith` unwind levels
     /// stay idempotent: the innermost aborts, outer levels see an inactive
     /// recording.
+    ///
+    /// Doc 63 §5.9: not while suspended. A callback's raise is not the outer
+    /// recording's; if it escapes the host call, the outer `execWith`'s own
+    /// errdefer aborts after suspension is lowered; if the host catches it,
+    /// §5.3's epoch check (Phase 2c) aborts the recording at the next
+    /// instruction.
     pub fn abortRaised(self: *TraceState) void {
-        if (self.rec.active) self.abort(.raised);
+        if (self.rec.active and !self.suspended()) self.abort(.raised);
     }
 
     /// Is this anchor currently gated off tier-1? True while a cooldown window is
@@ -3394,6 +3436,10 @@ pub const TraceState = struct {
     ///    if the anchor is neither already traced nor blacklisted), arm a fresh
     ///    recording that begins on the next loop iteration (at the anchor).
     pub fn onBackEdge(self: *TraceState, proto: *const Proto, target_pc: u32, regs: RegWindow) void {
+        // Doc 63 §5.9: no selection, no recording start, and a suspended
+        // callback's back-edges neither close nor abort the outer recording.
+        // The caller (`backEdgeEpilogue`) skips the whole slow path.
+        std.debug.assert(!self.suspended());
         if (self.rec.active) {
             // Doc 44 D12b: a `.cont` recording is straight-line-to-terminal —
             // ANY executed loop back-edge (while jmp, repeat closer, numeric/
@@ -3553,7 +3599,10 @@ pub const TraceState = struct {
     pub fn onCallEntry(self: *TraceState, proto: *const Proto, base: usize, call_seq: u64, img: []const Instr) void {
         self.tickCallEntry();
         if (!self.config.enabled) return;
-        if (self.rec.active) return; // a recording owns the stream; don't compete
+        // A recording owns the stream; don't compete. Suspended (doc 63
+        // §5.9): no repatch (it drains) and no pending call anchor. Both
+        // conditions are `fast_block` bits: one load and test.
+        if ((self.fast_block & (FastBit.recording | FastBit.jit_suspended)) != 0) return;
         if (proto.is_vararg) return;
         // Doc 44 D9 (S1): the caller passes the callee's freshly-reloaded
         // image, so the patched steady state is one bounds-checked opcode
@@ -3617,7 +3666,9 @@ pub const TraceState = struct {
     ///   `stop_depth` path exits `execImpl` before it).
     pub fn onRetResume(self: *TraceState, proto: *const Proto, resume_pc: u32, base: usize, call_seq: u64, img: []const Instr) void {
         if (!self.config.enabled) return;
-        if (self.rec.active) return; // a recording owns the stream; don't compete
+        // A recording owns the stream; don't compete. Suspended (doc 63
+        // §5.9): as `onCallEntry`, one `fast_block` test for both.
+        if ((self.fast_block & (FastBit.recording | FastBit.jit_suspended)) != 0) return;
         if (proto.is_vararg) return;
         if (resume_pc >= img.len) return; // resume at end-of-code (no instruction to anchor)
         // Patched steady state: one bounds-checked opcode compare (D9 S1).

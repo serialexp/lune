@@ -1,5 +1,5 @@
 //! Doc 60 §5.4 / §6.1: the packed fast-path word. `trace.fast_block` must
-//! equal `Vm.fastBlockReference()` (the ten-condition predicate, rebuilt
+//! equal `Vm.fastBlockReference()` (the eleven-condition predicate, rebuilt
 //! from the fields) bit for bit after EVERY transition — not just agree on
 //! "zero or not", which could hide a missing or extra bit while another
 //! condition is set. Each test drives the real mutation methods (setters and
@@ -28,7 +28,7 @@ const proto = Proto{ .code = &.{}, .name = "fb", .num_registers = 2 };
 const key_a: AnchorKey = .{ .proto = &proto, .pc = 4, .proto_id = proto.id };
 const key_b: AnchorKey = .{ .proto = &proto, .pc = 7, .proto_id = proto.id };
 
-test "fast_block: each of the ten conditions owns exactly its bit" {
+test "fast_block: each of the eleven conditions owns exactly its bit" {
     var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
     try expectWord(&vm, 0);
@@ -67,6 +67,16 @@ test "fast_block: each of the ten conditions owns exactly its bit" {
     ts.setPendingCallHeadArm(.{ .trace_id = 1, .exit_instr = 2 });
     try expectWord(&vm, Bit.call_head_arm);
     ts.setPendingCallHeadArm(null);
+    try expectWord(&vm, 0);
+
+    // Doc 63 §5.9 suspension: held through nesting, cleared by the last
+    // lower.
+    ts.raiseSuspend();
+    try expectWord(&vm, Bit.jit_suspended);
+    ts.raiseSuspend();
+    ts.lowerSuspend();
+    try expectWord(&vm, Bit.jit_suspended);
+    ts.lowerSuspend();
     try expectWord(&vm, 0);
 
     // Recording: set by the start funnel, cleared by the raise abort.

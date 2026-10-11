@@ -423,6 +423,14 @@ fn renderFault(box: *VmBox, err: interp.Error) void {
     }
 }
 
+/// Doc 63 §5.6: every C API entry moves `host_epoch`, first thing after the
+/// box is known, except the exempt ones. Each exempt function says why next
+/// to its definition, and `capi_epoch_test.zig` checks it leaves the epoch
+/// alone; growing the list needs both.
+inline fn bumpEpoch(box: *VmBox) void {
+    box.vm.heap.bumpHostEpoch();
+}
+
 /// Refuse entry when a prior non-catchable fault poisoned the VM.
 fn checkFatal(box: *VmBox) ?mh_status {
     if (box.fatal) {
@@ -530,6 +538,7 @@ pub fn destroyVm(box: *VmBox) void {
     backing.destroy(box);
 }
 
+/// Doc 63 §5.6 exempt: creates a VM; no existing VM's state changes.
 pub export fn mh_vm_new(config: ?*const mh_config, out: ?**VmBox) mh_status {
     const o = out orelse return .err_api;
     const cfg: mh_config = if (config) |c| c.* else .{};
@@ -540,6 +549,8 @@ pub export fn mh_vm_new(config: ?*const mh_config, out: ?**VmBox) mh_status {
     return .ok;
 }
 
+/// Doc 63 §5.6 exempt: refuses while the VM is executing, so no trace can be
+/// suspended across it; otherwise the VM is gone.
 pub export fn mh_vm_free(vm: ?*VmBox) mh_status {
     const box = vm orelse return .ok;
     // Freeing mid-callback (or with guest frames live) would free the stack
@@ -551,6 +562,11 @@ pub export fn mh_vm_free(vm: ?*VmBox) mh_status {
     destroyVm(box);
     return .ok;
 }
+
+// Doc 63 §5.6 exempt (this block, through `mh_mem_stats_get`): they read or
+// clear box-side buffers and counters (`last_error`, the output and warning
+// sinks, the tracking allocator's stats), never the VM or the GC heap, so
+// nothing a trace relies on can change.
 
 pub export fn mh_last_error(vm: ?*VmBox) mh_str {
     const box = vm orelse return .{};
@@ -593,6 +609,7 @@ pub export fn mh_mem_stats_get(vm: ?*VmBox, out: ?*mh_mem_stats) mh_status {
 /// survive an explicit collect — that is the park's whole purpose).
 pub export fn mh_collect(vm: ?*VmBox) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     if (checkFatal(box)) |s| return s;
     box.vm.collect();
     return .ok;
@@ -681,6 +698,7 @@ fn runProto(box: *VmBox, proto: *const Proto, results: []Value, nresults: *usize
 
 pub export fn mh_compile(vm: ?*VmBox, src: mh_str, name: mh_str, out: ?**ScriptBox) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     const o = out orelse return .err_api;
     if (checkFatal(box)) |s| return s;
     const src_bytes = strSlice(src) orelse return badStr(box);
@@ -696,6 +714,8 @@ pub export fn mh_compile(vm: ?*VmBox, src: mh_str, name: mh_str, out: ?**ScriptB
     return .ok;
 }
 
+/// Doc 63 §5.6 exempt: frees only the box-side handle; the program image
+/// stays VM-owned (`compileImage`), so no VM state changes.
 pub export fn mh_script_free(script: ?*ScriptBox) void {
     const sb = script orelse return;
     sb.owner.backing.destroy(sb);
@@ -703,6 +723,7 @@ pub export fn mh_script_free(script: ?*ScriptBox) void {
 
 pub export fn mh_run(vm: ?*VmBox, script: ?*ScriptBox, results: ?[*]mh_value, max_results: usize, nresults: ?*usize) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     const sb = script orelse return .err_api;
     const nres = nresults orelse return .err_api;
     nres.* = 0;
@@ -717,6 +738,7 @@ pub export fn mh_run(vm: ?*VmBox, script: ?*ScriptBox, results: ?[*]mh_value, ma
 
 pub export fn mh_eval(vm: ?*VmBox, src: mh_str, name: mh_str, results: ?[*]mh_value, max_results: usize, nresults: ?*usize) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     const nres = nresults orelse return .err_api;
     nres.* = 0;
     if (checkFatal(box)) |s| return s;
@@ -755,6 +777,8 @@ fn resultsSlice(results: ?[*]mh_value, max: usize) []Value {
 /// frame (doc 60 Q11).
 pub export fn mh_call(vm: ?*VmBox, callee: mh_value, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: ?*usize) mh_status {
     const box = vm orelse return .err_api;
+    // Also covers the hand-written entry (doc 60), which this tail-calls.
+    bumpEpoch(box);
     const nres = nresults orelse return .err_api;
     nres.* = 0;
     if (checkFatal(box)) |s| return s;
@@ -772,6 +796,7 @@ pub export fn mh_call(vm: ?*VmBox, callee: mh_value, args: ?[*]const mh_value, n
 /// the two in step. Not exported and not called by the library.
 pub fn mhCallViaH1(vm: ?*VmBox, callee: mh_value, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: ?*usize) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     const nres = nresults orelse return .err_api;
     nres.* = 0;
     if (checkFatal(box)) |s| return s;
@@ -881,6 +906,7 @@ fn hostcallParkRest(box: *VmBox, results: ?[*]const mh_value, from: usize, produ
 /// callee). Not exported and not called by the library.
 pub fn hostcallReference(vm: ?*VmBox, callee: mh_value, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: ?*usize) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box); // the boundary bump `mh_call` carries (doc 63 §5.6)
     const nres = nresults orelse return .err_api;
     nres.* = 0;
     if (checkFatal(box)) |s| return s;
@@ -916,6 +942,9 @@ fn badValue(box: *VmBox) mh_status {
 // ---------------------------------------------------------------------------
 // values
 // ---------------------------------------------------------------------------
+
+// Doc 63 §5.6 exempt (`mh_nil` through `mh_value_bool`): they build a value
+// or read the value passed in, take no VM, and touch no heap object.
 
 pub export fn mh_nil() mh_value {
     return toC(Value.nil());
@@ -974,6 +1003,7 @@ pub export fn mh_value_bool(v: mh_value, out: ?*c_int) mh_status {
 
 /// Borrowed string bytes — stable while the value stays rooted (non-moving
 /// GC): hold the park (until the next idle entry) or a ref.
+/// Doc 63 §5.6 exempt: reads the value passed in.
 pub export fn mh_value_str(vm: ?*VmBox, v: mh_value, out: ?*mh_str) mh_status {
     const box = vm orelse return .err_api;
     const o = out orelse return .err_api;
@@ -987,6 +1017,9 @@ pub export fn mh_value_str(vm: ?*VmBox, v: mh_value, out: ?*mh_str) mh_status {
 }
 
 /// Intern host bytes as a guest string (parked).
+///
+/// Doc 63 §5.6 exempt: an allocation (counted by `guard_host_epoch`'s budget
+/// check), with no reentry, no collection and no change to an existing object.
 pub export fn mh_string_new(vm: ?*VmBox, bytes: mh_str, out: ?*mh_value) mh_status {
     const box = vm orelse return .err_api;
     const o = out orelse return .err_api;
@@ -1005,6 +1038,7 @@ pub export fn mh_string_new(vm: ?*VmBox, bytes: mh_str, out: ?*mh_value) mh_stat
 
 pub export fn mh_global_get(vm: ?*VmBox, name: mh_str, out: ?*mh_value) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     const o = out orelse return .err_api;
     if (checkFatal(box)) |s| return s;
     const n = strSlice(name) orelse return badStr(box);
@@ -1018,6 +1052,7 @@ pub export fn mh_global_get(vm: ?*VmBox, name: mh_str, out: ?*mh_value) mh_statu
 
 pub export fn mh_global_set(vm: ?*VmBox, name: mh_str, val: mh_value) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     if (checkFatal(box)) |s| return s;
     const n = strSlice(name) orelse return badStr(box);
     const v = fromC(val) orelse return badValue(box);
@@ -1038,6 +1073,7 @@ inline fn refPack(idx: u32, gen: u32) u64 {
 
 pub export fn mh_ref_create(vm: ?*VmBox, v: mh_value, out: ?*u64) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     const o = out orelse return .err_api;
     const val = fromC(v) orelse return badValue(box);
     const vmi = &box.vm;
@@ -1062,6 +1098,7 @@ fn refSlot(box: *VmBox, ref: u64) ?*Vm.HostRefSlot {
     return slot;
 }
 
+/// Doc 63 §5.6 exempt: reads a host ref slot.
 pub export fn mh_ref_get(vm: ?*VmBox, ref: u64, out: ?*mh_value) mh_status {
     const box = vm orelse return .err_api;
     const o = out orelse return .err_api;
@@ -1072,6 +1109,7 @@ pub export fn mh_ref_get(vm: ?*VmBox, ref: u64, out: ?*mh_value) mh_status {
 
 pub export fn mh_ref_free(vm: ?*VmBox, ref: u64) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     const slot = refSlot(box, ref) orelse return staleRef(box);
     slot.value = Value.nil(); // freed slots hold nil — no stale marks
     slot.generation +%= 1; // stale refs now miss deterministically
@@ -1150,6 +1188,10 @@ fn hostFnStub(ctx: *anyopaque, args: []const Value) anyerror!Value {
 }
 
 /// Stage the message for the next failing return from a host callback.
+///
+/// Doc 63 §5.6 exempt: stages text in the box's `host_error` buffer (the
+/// box's backing allocator, not the GC heap). Only a failing return raises,
+/// so it changes no guest state and nothing a trace relies on.
 pub export fn mh_error_set(vm: ?*VmBox, msg: mh_str) void {
     const box = vm orelse return;
     const m = strSlice(msg) orelse return;
@@ -1159,6 +1201,7 @@ pub export fn mh_error_set(vm: ?*VmBox, msg: mh_str) void {
 
 pub export fn mh_register_fn(vm: ?*VmBox, name: mh_str, cfn: ?mh_host_fn, userdata: ?*anyopaque, destroy: ?mh_host_fn_destroy) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     if (checkFatal(box)) |s| return s;
     const f = cfn orelse return .err_api;
     const n = strSlice(name) orelse return badStr(box);
@@ -1244,6 +1287,8 @@ fn tableOf(box: *VmBox, v: Value) ?*Table {
     return t;
 }
 
+/// Doc 63 §5.6 exempt: allocates an empty table (counted by the budget
+/// check), with no reentry, no collection and no change to an existing object.
 pub export fn mh_table_new(vm: ?*VmBox, out: ?*mh_value) mh_status {
     const box = vm orelse return .err_api;
     const o = out orelse return .err_api;
@@ -1258,6 +1303,7 @@ pub export fn mh_table_new(vm: ?*VmBox, out: ?*mh_value) mh_status {
 
 pub export fn mh_table_get(vm: ?*VmBox, tbl: mh_value, key: mh_value, out: ?*mh_value) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     const o = out orelse return .err_api;
     if (checkFatal(box)) |s| return s;
     const tv = fromC(tbl) orelse return badValue(box);
@@ -1277,6 +1323,7 @@ pub export fn mh_table_get(vm: ?*VmBox, tbl: mh_value, key: mh_value, out: ?*mh_
 
 pub export fn mh_table_set(vm: ?*VmBox, tbl: mh_value, key: mh_value, val: mh_value) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     if (checkFatal(box)) |s| return s;
     const tv = fromC(tbl) orelse return badValue(box);
     const kv = fromC(key) orelse return badValue(box);
@@ -1294,6 +1341,7 @@ pub export fn mh_table_set(vm: ?*VmBox, tbl: mh_value, key: mh_value, val: mh_va
 /// Raw length (the `#` border for tables). No `__len` dispatch in v1.
 pub export fn mh_table_len(vm: ?*VmBox, tbl: mh_value, out: ?*i64) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     const o = out orelse return .err_api;
     const tv = fromC(tbl) orelse return badValue(box);
     const t = tableOf(box, tv) orelse {
@@ -1306,6 +1354,7 @@ pub export fn mh_table_len(vm: ?*VmBox, tbl: mh_value, out: ?*i64) mh_status {
 
 pub export fn mh_table_metatable_get(vm: ?*VmBox, tbl: mh_value, out: ?*mh_value) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     const o = out orelse return .err_api;
     const tv = fromC(tbl) orelse return badValue(box);
     const t = tableOf(box, tv) orelse {
@@ -1322,6 +1371,7 @@ pub export fn mh_table_metatable_get(vm: ?*VmBox, tbl: mh_value, out: ?*mh_value
 /// protection in v1 (the host is trusted — it owns the VM).
 pub export fn mh_table_metatable_set(vm: ?*VmBox, tbl: mh_value, mt: mh_value) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     if (checkFatal(box)) |s| return s;
     const tv = fromC(tbl) orelse return badValue(box);
     const mv = fromC(mt) orelse return badValue(box);
@@ -1347,6 +1397,7 @@ pub export fn mh_table_metatable_set(vm: ?*VmBox, tbl: mh_value, mt: mh_value) m
 
 pub export fn mh_table_iter_new(vm: ?*VmBox, tbl: mh_value, out: ?**IterBox) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     const o = out orelse return .err_api;
     if (checkFatal(box)) |s| return s;
     const tv = fromC(tbl) orelse return badValue(box);
@@ -1412,6 +1463,7 @@ fn iterOom(box: *VmBox, kt_ref: u64) mh_status {
 /// `iter_new` are skipped. Both outputs are parked.
 pub export fn mh_table_iter_next(vm: ?*VmBox, iter: ?*IterBox, key: ?*mh_value, val: ?*mh_value, done: ?*c_int) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     const ib = iter orelse return .err_api;
     const ko = key orelse return .err_api;
     const vo = val orelse return .err_api;
@@ -1445,6 +1497,7 @@ pub export fn mh_table_iter_next(vm: ?*VmBox, iter: ?*IterBox, key: ?*mh_value, 
 
 pub export fn mh_table_iter_free(vm: ?*VmBox, iter: ?*IterBox) mh_status {
     const box = vm orelse return .err_api;
+    bumpEpoch(box);
     const ib = iter orelse return .ok;
     if (ib.owner != box) {
         setLastError(box, "iterator belongs to a different VM");
@@ -1459,5 +1512,7 @@ pub export fn mh_table_iter_free(vm: ?*VmBox, iter: ?*IterBox) mh_status {
 test {
     _ = @import("capi_test.zig");
     _ = @import("capi_hostcall_test.zig");
+    _ = @import("capi_epoch_test.zig");
+    _ = @import("capi_suspend_test.zig");
     if (hostcall_asm) _ = @import("asm/offsets_x64.zig");
 }

@@ -997,6 +997,18 @@ which changes tiering decisions. §2 rules that out.
   (`trace_gate_test.zig`, `trace_replay_test.zig`), so the trace side
   never reaches into the VM.
 
+**Later bits (as landed, 2026-10-11).** Two more conditions have since
+joined the word, which now holds eleven:
+
+- `vm_final_cut`, for H1's final-cut handling (§4);
+- `jit_suspended`, a trace-owned bit for doc 63 §5.9's suspension.
+  Holding `.full` while suspended lets every `.fast` handler drop its
+  suspension check.
+
+The layout is `TraceState.FastBit`: trace-owned bits 0–7, VM bits 8–10.
+`runFastPath` and the `.S` entry test only the whole word, so renumbering
+the bits needs no assembly change.
+
 **Mutation ownership:**
 - **`TraceState` owns its seven bits.**
   - The six pending fields move into a nested `pending` struct. Its

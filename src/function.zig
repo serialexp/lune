@@ -366,6 +366,14 @@ pub const Native = struct {
     /// (host fns are recorder-opaque — automatic trace barrier — and own their
     /// whole result protocol); asserted at creation in `capi`.
     host: ?*HostBinding = null,
+    /// Doc 63 §5.9: how many calls of this host function moved
+    /// `Heap.host_epoch` (a callback, a table write, a collection…),
+    /// saturating. Maintained by `Vm.callHostNative` in every tier, on
+    /// success and on failure. JIT-only state: the recorder and
+    /// `guard_native` refuse a native once it reaches the threshold, which
+    /// changes which tier runs a call, never its result. 0 for non-host
+    /// natives.
+    disturbs: u8 = 0,
 
     pub fn create(
         gpa: std.mem.Allocator,

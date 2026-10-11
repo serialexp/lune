@@ -322,6 +322,9 @@ pub fn clearPendingExitAnchor(self: *TraceState) void {
         std.debug.assert(self.pending_exit_src == null and self.pending_replay_src == null);
         return;
     }
+    // Doc 63 §5.9: a suspended callback's exec leaves the anchors to the code
+    // that set them, which consumes or clears them once the call returns.
+    if (self.suspended()) return;
     self.setPendingExitAnchor(null);
     self.pending_exit_src = null;
     self.setPendingReplayAnchor(null);
@@ -1930,6 +1933,9 @@ pub fn armNativeLink(self: *TraceState, parent: *Trace, slot_index: u32, child: 
 /// Publish the complete relation before its executable slot. Region policy must
 /// supply its proof here, never amend an already-published registry row.
 pub fn arm(self: *TraceState, request: ArmRequest) !bool {
+    // Doc 63 §5.9: every arming path runs inside a trace-entry receipt, and
+    // no entry happens while suspended.
+    std.debug.assert(!self.suspended());
     const parent = request.parent;
     const slot_index = request.slot_index;
     const child = request.child;
@@ -2573,6 +2579,10 @@ pub fn markEntryPatchesAt(self: *TraceState, anchor: AnchorKey) void {
 /// ascending trace-id order (§R3-1 rule 3 deterministic sibling ties).
 /// Early-outs on the dirty counter, so a quiet turn costs one load.
 pub fn drainEntryPatchWork(self: *TraceState) void {
+    // Doc 63 §5.9: every drain site is behind a suspension gate (the
+    // back-edge entry predicate, the patched handlers, the call and return
+    // hooks, the recording close). Checked before `takeDirty` consumes work.
+    std.debug.assert(!self.suspended());
     if (!self.registry.entry_registry.takeDirty()) return;
     const er = &self.registry.entry_registry;
     // Unpatch pass: restore every pending slot, then unbind owners by id and
