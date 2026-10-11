@@ -1,4 +1,4 @@
-LINE LOOKUP FIX (2026-10-11, coral-marten, uncommitted, waiting on amber-badger):
+LINE LOOKUP FIX (2026-10-11, coral-marten): LANDED in `49fd572`, bundled with amber-badger's doc 61 Phase K.
 - Bug from TODO.md "Every located runtime error rescans the source for
   its line": `compiler.lineFromOffset` scanned from byte 0 per error,
   per backtrace frame, per safepoint when replay line recording is on
