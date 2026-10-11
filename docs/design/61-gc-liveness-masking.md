@@ -3,8 +3,8 @@
 Status: rev 7, approved by codex + antigravity; Q1 = (a), Q2 = label dead
 slots (Bart, 2026-10-09); Phases P, 0, Q, 1, 2, V and K (keyframes:
 tombstones, whole heap, physical arrays, §9a; Codex APPROVE in round 3)
-landed; open for Bart: keyframes and garbage closures (TODO.md); Phase 3
-next
+landed, then Phase 3 (allocating traces take the dead-φ filter, §9b);
+open for Bart: keyframes and garbage closures (TODO.md)
 Owner: Bart + agents (amber-badger)
 Last updated: 2026-10-11
 
@@ -206,10 +206,8 @@ as they land; move bullets to Done once everything inside them is checked.
         str_format +1.8%, str_gsub +1.4%) have unchanged traces and
         instruction counts, and str_format/str_gsub move the same in tier-0.
 
-### Outstanding
-
-- [ ] **Phase 1 — the masked `.gc` root walk + scrub (§6).** Landed as
-      `0225b4d`; only the keyframe decision below is open.
+- [x] **Phase 1 — the masked `.gc` root walk + scrub (§6).** Landed as
+      `0225b4d`; the keyframe decision below was Phase K.
   - [x] Close the conservative multret-consumer row first (§5, "Phase 1
         prerequisite", options A / A′ / B; codex Phase 0 blocker 2).
         **Chose B.** `.call` with `b = all_results` records
@@ -273,12 +271,18 @@ as they land; move bullets to Done once everything inside them is checked.
         loop). An object id printed after the function returns cannot see a
         stale register in its window, so the §8 id programs are not the
         site oracles.
-- [ ] **Phase 3 — relax doc 24 D3's full-write-set flush (§9b).** Design
+- [x] **Phase 3 — relax doc 24 D3's full-write-set flush (§9b).** Design
       approved by codex (2026-10-11, should-fixes on the tests folded in).
-      Implemented: `phiLiveRow` drops the `alloc_count` conjunct; the
-      finalize test, a φ-set pin on an allocating `tostring` loop and an
-      id-determinism program with a linked loop-done witness, each checked
-      against a mutation. Gates and the board pending.
+      Landed in `00c0525`: `phiLiveRow` drops the `alloc_count` conjunct.
+      The tests are the finalize test, a φ-set pin on an allocating
+      `tostring` loop, and an id-determinism program with a linked
+      loop-done witness, each checked against a mutation. Gates green;
+      hashgate needed no regeneration.
+      Board (pt-default, reps 5, against `96c7140`): scalar −4.9%,
+      str_manip −2.9%, binary-trees −1.9%, everything else within ±1%
+      except str_gsub +1.7% and str_format +0.9%. Both of those run 0%
+      native, and their tier-0 columns moved by the same amount (tier-0
+      mean |Δ| 0.59%), so that is noise.
 - [x] **Phase K — keyframes (§9a).** Landed: K1 tombstones, K2 whole
       heap, K3 physical array parts; format version 10. Codex: REVISE,
       REVISE, then APPROVE in round 3, after the rehash trigger, native
@@ -288,6 +292,12 @@ as they land; move bullets to Done once everything inside them is checked.
       protos (TODO.md, "Keyframes dereference garbage closures' protos").
 - [x] **`.snapshot` walk masking (doc 21 Phase B).** Subsumed by Phase K:
       the `.snapshot` walk is deleted.
+
+### Outstanding
+
+- None in this design. Bart's decision on keyframes and garbage closures
+  over released protos is tracked in TODO.md ("Keyframes dereference
+  garbage closures' protos").
 
 ## Why this exists
 

@@ -329,7 +329,7 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
     `just embed-test`, viz 72/72 (Bun 1.4.3) + tsc, hashgate 90/90 on both
     legs. **Landed** in one bundled commit with coral-marten's line-lookup
     fix (agreed on the forum).
-- **Doc 61 Phase 3 (§9b), implemented (2026-10-11).** Allocating traces
+- **Doc 61 Phase 3 (§9b), landed in `00c0525` (2026-10-11).** Allocating traces
   take the dead-φ filter: `phiLiveRow` no longer bails on
   `alloc_count != 0`. Doc 24 D3's full-write-set flush existed only
   because the collector rooted every register; masking replaces it. Codex
@@ -349,7 +349,12 @@ included; it runs at 99.5% native and is still 8.9× LuaJIT).
     `tostring` does.
   - Gates green: `just test`, jit-debug, `just embed-test`, hashgate
     90/90 on both legs, wasm, lib, viz 72/72.
-  - Board: pending.
+  - Board (pt-default, reps 5, against 96c7140): scalar −4.9%, str_manip
+    −2.9%, binary-trees −1.9%; the rest within ±1% except str_gsub +1.7%
+    and str_format +0.9%. Both run 0% native, and their tier-0 columns
+    moved the same, so that is noise.
+  - Doc 61 is now complete apart from Bart's open garbage-closure decision
+    (TODO.md).
 
   Each touches interp.zig/capi.zig/CallFrame, so coordinate with
   coral-marten: `.S` offsets for `CF_IN_FLIGHT`, and the `guestFault`
