@@ -79,6 +79,32 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       and `binary-trees.lua 12` also varied by about ±1% in user
       instructions between identical runs of one binary (e.g. 256.3 M to
       258.6 M), while tier-0 runs were stable to a few hundred.
+      **Diagnosed (2026-10-11):** the run-to-run variation is ASLR.
+      `setarch -R` makes every count stable, and the count-based
+      `--jit-stats` output (trace entries, iterations, arms) is identical
+      across runs, so no JIT decision changed in these benchmarks. Three
+      runtime structures hash the raw proto address: `AnchorKeyContext`
+      (`trace_types.zig`, the hasTrace/gate maps), `hotIndex` (`trace.zig`,
+      the direct-mapped hot counter) and `EntryRegistry.code_images`
+      (`trace_entry_registry.zig`, wyhash of the pointer, on a hot path).
+      An experiment that hashed through `k.proto.id` was reverted: it
+      crashes tests whose keys carry `undefined` protos, and it makes every
+      map touch require a live proto. No design doc had considered and
+      rejected id hashing; the pointer hash was `AutoContext`'s default,
+      kept by `hotIndex` (cf4e43c) and `AnchorKeyContext` (dc3340f) under
+      the "output identity, not trace-selection identity" contract (doc 17,
+      P-EBP). **Fixed (Bart chose the id-in-key form):** `AnchorKey`
+      carries `proto_id` (copied at construction, required field, 439
+      literals rewritten by a reviewed dry-run script), `AnchorKeyContext`
+      and `hotIndex` hash the id, and `code_images` keys on an `ImageKey`
+      that stores the id. Equality stays on the pointer. Counts are now
+      identical run to run with ASLR on (binary-trees 7,646 M ×3). Cost:
+      one `proto.id` load per key construction; an instruction A/B over
+      all 30 benches against best-of-3 ASLR layouts of HEAD runs −0.08% to
+      +0.53% (euler14-bit; callgrind on an x86_64_v3 build puts it at
+      +0.14%, ~1 instruction per probe). Still open: `nest` − `nestq` at
+      N = 1,000,000 is a stable 3.19 M: the call (1.60 M) plus a
+      deterministic 1.59 M residue, unexplained.
 
 ## Global-read slow path leaves via a volatile `var` pointer (noted 2026-10-05)
 

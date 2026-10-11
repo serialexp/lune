@@ -57,9 +57,32 @@ pub const InstallResult = union(enum) {
     oom,
 };
 
+/// `code_images` key: the proto plus a copy of its id. The hash reads only
+/// the id, so bucket layout doesn't vary with ASLR from run to run (see
+/// `AnchorKeyContext`) and a rehash never dereferences a stored proto.
+/// Equality stays on the pointer.
+const ImageKey = struct {
+    proto: *const Proto,
+    id: u32,
+
+    fn of(proto: *const Proto) ImageKey {
+        return .{ .proto = proto, .id = proto.id };
+    }
+};
+
+const ImageKeyContext = struct {
+    pub fn hash(_: ImageKeyContext, k: ImageKey) u64 {
+        const h: u64 = @as(u64, k.id) *% 0x9E3779B97F4A7C15;
+        return h ^ (h >> 32);
+    }
+    pub fn eql(_: ImageKeyContext, a: ImageKey, b: ImageKey) bool {
+        return a.proto == b.proto;
+    }
+};
+
 pub const EntryRegistry = struct {
     gpa: std.mem.Allocator,
-    code_images: std.AutoHashMapUnmanaged(*const Proto, []Instr) = .empty,
+    code_images: std.HashMapUnmanaged(ImageKey, []Instr, ImageKeyContext, std.hash_map.default_max_load_percentage) = .empty,
     image_gen: u64 = 0,
     entry_patches: std.ArrayListUnmanaged(*EntryPatch) = .empty,
     entry_patch_free: std.ArrayListUnmanaged(u16) = .empty,
@@ -80,11 +103,11 @@ pub const EntryRegistry = struct {
 
     pub inline fn codeFor(self: *const EntryRegistry, proto: *const Proto) []const Instr {
         if (self.code_images.count() == 0) return proto.code;
-        return self.code_images.get(proto) orelse proto.code;
+        return self.code_images.get(.of(proto)) orelse proto.code;
     }
 
     pub fn ensureImage(self: *EntryRegistry, proto: *const Proto) ![]Instr {
-        const gop = try self.code_images.getOrPut(self.gpa, proto);
+        const gop = try self.code_images.getOrPut(self.gpa, .of(proto));
         if (!gop.found_existing) {
             gop.value_ptr.* = self.gpa.dupe(Instr, proto.code) catch |err| {
                 self.code_images.removeByPtr(gop.key_ptr);
@@ -227,7 +250,7 @@ pub const EntryRegistry = struct {
     /// (doc 61 §7.1 item 5 step 8).
     pub fn restoreSlot(self: *EntryRegistry, idx: u16) u32 {
         const p = self.entry_patches.items[idx];
-        if (self.code_images.get(p.proto)) |img| {
+        if (self.code_images.get(.of(p.proto))) |img| {
             std.debug.assert(img[p.patch_pc].op == p.patched_op and img[p.patch_pc].b == idx);
             std.debug.assert(std.meta.eql(p.orig, p.proto.code[p.patch_pc]));
             img[p.patch_pc] = p.orig;
@@ -281,7 +304,7 @@ test "entry owner publishes metadata before dispatch and retires without dead re
     var code = [_]Instr{ Instr.op0(.ret), .{ .op = .for_loop, .aux = -2 } };
     const proto = Proto{ .code = &code, .id = 1, .name = "owner", .num_registers = 4 };
     var record = Trace{ .id = 17, .code = undefined };
-    record.code.anchor = .{ .proto = &proto, .pc = 0 };
+    record.code.anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id };
     record.code.inputs = &.{};
     try testing.expectEqual(InstallResult.installed, registry.installEntryPatch(&record));
     const slot = record.entry_slot.?;
@@ -314,7 +337,7 @@ test "entry owner allocation refusal leaves canonical dispatch and no binding" {
     var code = [_]Instr{ Instr.op0(.ret), .{ .op = .for_loop, .aux = -2 } };
     const proto = Proto{ .code = &code, .id = 1, .name = "oom", .num_registers = 4 };
     var record = Trace{ .code = undefined };
-    record.code.anchor = .{ .proto = &proto, .pc = 0 };
+    record.code.anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id };
     record.code.inputs = &.{};
     try testing.expectEqual(InstallResult.oom, registry.installEntryPatch(&record));
     try testing.expectEqual(@as(?u16, null), record.entry_slot);
@@ -329,7 +352,7 @@ test "cont entry patch (doc 44 D12b): install writes .jcont at the resume pc, un
     var code = [_]Instr{ Instr.op0(.ret), .{ .op = .add, .a = 1 }, Instr.op0(.ret) };
     const proto = Proto{ .code = &code, .id = 1, .name = "cont", .num_registers = 4 };
     var record = Trace{ .id = 21, .code = undefined };
-    record.code.anchor = .{ .proto = &proto, .pc = trace_code.contAnchorPc(1) };
+    record.code.anchor = .{ .proto = &proto, .pc = trace_code.contAnchorPc(1), .proto_id = proto.id };
     record.code.inputs = &.{};
     try testing.expectEqual(InstallResult.installed, registry.installEntryPatch(&record));
     const slot = record.entry_slot.?;
@@ -343,7 +366,7 @@ test "cont entry patch (doc 44 D12b): install writes .jcont at the resume pc, un
     // One patch per physical pc: a second cont trace at the SAME resume pc is
     // an incumbent, not a second install.
     var record2 = Trace{ .id = 22, .code = undefined };
-    record2.code.anchor = .{ .proto = &proto, .pc = trace_code.contAnchorPc(1) };
+    record2.code.anchor = .{ .proto = &proto, .pc = trace_code.contAnchorPc(1), .proto_id = proto.id };
     record2.code.inputs = &.{};
     try testing.expectEqual(InstallResult{ .incumbent = slot }, registry.installEntryPatch(&record2));
     // Unpatch restores the canonical instruction in the image.
@@ -352,7 +375,7 @@ test "cont entry patch (doc 44 D12b): install writes .jcont at the resume pc, un
     try testing.expectEqual(OpCode.add, registry.codeFor(&proto)[1].op);
     // An out-of-bounds cont resume pc refuses cleanly.
     var record3 = Trace{ .id = 23, .code = undefined };
-    record3.code.anchor = .{ .proto = &proto, .pc = trace_code.contAnchorPc(99) };
+    record3.code.anchor = .{ .proto = &proto, .pc = trace_code.contAnchorPc(99), .proto_id = proto.id };
     record3.code.inputs = &.{};
     try testing.expectEqual(InstallResult.no_patch_pc, registry.installEntryPatch(&record3));
 }

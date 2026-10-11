@@ -725,17 +725,16 @@ const HOTCOUNT_SIZE = 1 << HOTCOUNT_BITS;
 /// still cutting the per-back-edge cost of a permanently-dead loop by ~this factor.
 const GATE_SKIP: u16 = 64;
 
-/// Hash `(proto, pc)` into a hot-count slot. Pointer-based, like the existing
-/// `AnchorMap` keys (`AnchorKeyContext`) — trace timing already varies across runs by
-/// address, which is sound because the trace cache is runtime-only state (never
-/// serialized) and traces are output-transparent (== tier-0). A collision only
-/// changes *which* back-edges take the slow path, never the result.
+/// Hash `(proto, pc)` into a hot-count slot, keyed on `proto.id` rather than the
+/// address (like `AnchorKeyContext`): which anchors share a slot is then the same
+/// on every run, so tiering timing and instruction counts don't vary with ASLR.
+/// A collision only changes *which* back-edges take the slow path, never the
+/// result. `proto` must be live; every caller is the dispatch loop running it.
 inline fn hotIndex(proto: *const Proto, pc: u32) usize {
     // Mix in u64 explicitly: the golden-ratio constant is 64-bit, so a `usize`
-    // accumulator overflows on a 32-bit target (wasm32). On a 64-bit target this is
-    // byte-identical to the old `usize` math (usize == u64); the final mask keeps
+    // accumulator overflows on a 32-bit target (wasm32). The final mask keeps
     // the result within `HOTCOUNT_SIZE`, so the `@intCast` back to usize is safe.
-    var h: u64 = @intFromPtr(proto);
+    var h: u64 = proto.id;
     h ^= @as(u64, pc) *% 0x9E3779B97F4A7C15;
     h ^= h >> 29;
     return @intCast(h & (HOTCOUNT_SIZE - 1));
@@ -2245,7 +2244,7 @@ pub const TraceState = struct {
     /// row is lost but the aggregates are still bumped (counted uncovered — no map
     /// entry means no known trace).
     pub fn noteInterpIter(self: *TraceState, proto: *const Proto, pc: u32, cycles: u64) void {
-        const gop = self.coverage.getOrPut(self.gpa, .{ .proto = proto, .pc = pc }) catch {
+        const gop = self.coverage.getOrPut(self.gpa, .{ .proto = proto, .pc = pc, .proto_id = proto.id }) catch {
             self.iters_tier0_uncovered +|= 1;
             self.cycles_tier0_uncovered +|= cycles;
             return;
@@ -2334,7 +2333,7 @@ pub const TraceState = struct {
     pub fn findTrace(self: *const TraceState, proto: *const Proto, pc: u32) ?*Trace {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
-        var it = self.registry.tracesAt(.{ .proto = proto, .pc = pc });
+        var it = self.registry.tracesAt(.{ .proto = proto, .pc = pc, .proto_id = proto.id });
         while (it.next()) |t| {
             // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
             // selection. Suppression deadlocks: a skipped trace can never be
@@ -2373,7 +2372,7 @@ pub const TraceState = struct {
     pub fn findLoopTrace(self: *const TraceState, proto: *const Proto, pc: u32) ?*Trace {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
-        var it = self.registry.tracesAt(.{ .proto = proto, .pc = pc });
+        var it = self.registry.tracesAt(.{ .proto = proto, .pc = pc, .proto_id = proto.id });
         while (it.next()) |t| {
             // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
             // selection. Suppression deadlocks: a skipped trace can never be
@@ -2399,7 +2398,7 @@ pub const TraceState = struct {
     pub fn findLinkTrace(self: *const TraceState, proto: *const Proto, pc: u32) ?*Trace {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
-        var it = self.registry.tracesAt(.{ .proto = proto, .pc = pc });
+        var it = self.registry.tracesAt(.{ .proto = proto, .pc = pc, .proto_id = proto.id });
         while (it.next()) |t| {
             // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
             // selection. Suppression deadlocks: a skipped trace can never be
@@ -2445,7 +2444,7 @@ pub const TraceState = struct {
         // `max_traces_per_anchor` by 2× — unreachable today, bounded anyway).
         var buf: [8]*Trace = undefined;
         var n: usize = 0;
-        var it = self.registry.tracesAt(.{ .proto = proto, .pc = post_pc });
+        var it = self.registry.tracesAt(.{ .proto = proto, .pc = post_pc, .proto_id = proto.id });
         while (it.next()) |t| {
             // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
             // selection. Suppression deadlocks: a skipped trace can never be
@@ -2511,7 +2510,7 @@ pub const TraceState = struct {
     pub fn nextTraceExcluding(self: *const TraceState, proto: *const Proto, pc: u32, visited: []const *Trace) ?*Trace {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
-        var it = self.registry.tracesAt(.{ .proto = proto, .pc = pc });
+        var it = self.registry.tracesAt(.{ .proto = proto, .pc = pc, .proto_id = proto.id });
         outer: while (it.next()) |t| {
             // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
             // selection. Suppression deadlocks: a skipped trace can never be
@@ -3312,7 +3311,7 @@ pub const TraceState = struct {
     /// skipped). A record-gated anchor WITH a trace must NOT skip: the slow path
     /// is exactly what enters its trace (the review-B3 starvation concern).
     pub fn afterBackEdge(self: *TraceState, proto: *const Proto, pc: u32) void {
-        const key: AnchorKey = .{ .proto = proto, .pc = pc };
+        const key: AnchorKey = .{ .proto = proto, .pc = pc, .proto_id = proto.id };
         if (self.isGated(key) or (self.isRecordGated(key) and !self.hasTrace(key))) {
             self.hotcount[hotIndex(proto, pc)] = GATE_SKIP;
         }
@@ -3362,7 +3361,7 @@ pub const TraceState = struct {
         const src = self.side_want_src;
         self.wants_side_trace = null;
         self.side_want_src = null;
-        const key = AnchorKey{ .proto = proto, .pc = resume_pc };
+        const key = AnchorKey{ .proto = proto, .pc = resume_pc, .proto_id = proto.id };
         if (self.isRecording() or self.pending_replay_anchor != null or self.recordingBarred(key))
             return false;
         self.dbg("side-want-at-resume: arming replay-side recording at pc={d}", .{resume_pc});
@@ -3422,7 +3421,7 @@ pub const TraceState = struct {
             }
             return;
         }
-        const key = AnchorKey{ .proto = proto, .pc = target_pc };
+        const key = AnchorKey{ .proto = proto, .pc = target_pc, .proto_id = proto.id };
 
         // Side-trace arming (step 4): a guard inside a trace at this anchor has
         // failed enough times — arm a new recording on the next iteration, even
@@ -3523,7 +3522,7 @@ pub const TraceState = struct {
             self.rec.context.inner_root = inner != null;
             self.rec.context.inner_root_peeled = if (inner) |t| t.code.peeled else false;
             self.rec.context.inner_root_guards = if (inner) |t| t.code.entry_guards else &.{};
-            const leaves = self.lleave_count.get(.{ .proto = proto, .pc = dest }) orelse 0;
+            const leaves = self.lleave_count.get(.{ .proto = proto, .pc = dest, .proto_id = proto.id }) orelse 0;
             const fails = self.unroll_fail.get(self.rec.anchor) orelse 0;
             self.rec.context.unroll_while = leaves >= self.config.lleave_fast_retries or fails < self.config.unroll_fail_flip;
         }
@@ -3563,7 +3562,7 @@ pub const TraceState = struct {
         // `hasTrace` + `codeFor` hashes both fall away here). The unpatched
         // path below keeps `hasTrace` so D8 repatch recovery stays live.
         if (img.len != 0 and img[0].op == .jfunc_head) return;
-        const key = AnchorKey{ .proto = proto, .pc = FUNC_HEAD_PC };
+        const key = AnchorKey{ .proto = proto, .pc = FUNC_HEAD_PC, .proto_id = proto.id };
         if (self.hasTrace(key)) {
             // Doc 44 D8 (review round 2 blocker 4): entry is the patch's job —
             // but every unpatch source outside the head lifecycle (gateAnchor's
@@ -3627,7 +3626,7 @@ pub const TraceState = struct {
         // Collision rule: the pc hosts (or could host) a different patch kind.
         if (resumed_op == .jfor_loop or resumed_op == .jloop or resumed_op == .jfunc_head) return;
         if (trace_entry_registry.EntryRegistry.patchedEntryOp(proto.code[resume_pc].op) != null) return;
-        const key = AnchorKey{ .proto = proto, .pc = contAnchorPc(resume_pc) };
+        const key = AnchorKey{ .proto = proto, .pc = contAnchorPc(resume_pc), .proto_id = proto.id };
         if (self.hasTrace(key)) {
             // D8 recovery, cont flavour: traces exist but the pc is unpatched
             // (gate blast, strike exhaustion) — re-request install for the
@@ -3695,7 +3694,7 @@ pub const TraceState = struct {
     }
 
     fn armWithPolicy(self: *TraceState, proto: *const Proto, target_pc: u32, force_ordinary: bool) void {
-        if (!self.startRecording(.{ .proto = proto, .pc = target_pc }, proto.num_registers)) return;
+        if (!self.startRecording(.{ .proto = proto, .pc = target_pc, .proto_id = proto.id }, proto.num_registers)) return;
         self.dbg("rec-arm: pc={d} force_ordinary={}", .{ target_pc, force_ordinary });
         // Doc 43 §3.1 (P0a): seed the anchor's absolute slab base for the open-cell
         // aliasing check. `reset` zeroes it; the dispatch loop stashed `st.base`
@@ -3704,7 +3703,7 @@ pub const TraceState = struct {
         // Doc 43 P5: arm with the anchor's mutable-upvalue memo, so a retry
         // after an `.upvalue_mutable` abort routes scalar closed-cell reads
         // through `uload` from the first instruction.
-        self.rec.route_upvalue_reads = self.upvalue_mutable_memo.contains(.{ .proto = proto, .pc = target_pc });
+        self.rec.route_upvalue_reads = self.upvalue_mutable_memo.contains(.{ .proto = proto, .pc = target_pc, .proto_id = proto.id });
         // Doc 45 D2: arm with the anchor's precise-mode memo, so a retry after
         // a `.needs_precise` cancel records per-bytecode snapshots from the
         // first instruction (deterministic re-recording, never a retroactive
@@ -3719,7 +3718,7 @@ pub const TraceState = struct {
         // never mutated here.
         self.rec.force_ordinary = force_ordinary;
         self.rec.precise = !force_ordinary and
-            self.precise_anchor_memo.contains(.{ .proto = proto, .pc = target_pc });
+            self.precise_anchor_memo.contains(.{ .proto = proto, .pc = target_pc, .proto_id = proto.id });
     }
 
     /// Abandon the in-flight recording: deactivate, remember why, and gate the

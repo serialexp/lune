@@ -48,7 +48,7 @@ test "recArrayGet: t[k] on a bool lane records the full guarded read sequence" {
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     // r1 = table, r2 = key (3) ; `get_index r0, r1, r2`  →  r0 = t[3]
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3) };
@@ -93,7 +93,7 @@ test "recArrayGet: an integral-FLOAT key narrows via guard_float + int_of_float 
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.float(3.0) };
     state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
@@ -123,7 +123,7 @@ test "recArraySet: an integral-FLOAT key narrows and stores through the narrowed
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     // set_index: a=table b=key c=value
     var regs = [_]Value{ Value.heap(&t.header), Value.float(3.0), Value.boolean(false) };
@@ -151,7 +151,7 @@ test "recCompare narrows an observed integral float in a mixed numeric compariso
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "mixed_compare", .num_registers = 3 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     // r0 = r1 < r2, with the arithmetic-derived operand observed as 3.0.
     // The comparison must consume the int_of_float result, not the float ref.
@@ -185,7 +185,7 @@ test "guardSourcePc: source-opcode PC is exit PC − 1 (H-1b), pinned independen
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     const N: u32 = 5; // chosen known source-opcode index
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3) };
@@ -209,7 +209,7 @@ test "guardSourcePc: source-opcode PC is exit PC − 1 (H-1b), pinned independen
     // exit M+1.
     var st2 = TraceState.init(gpa);
     defer st2.deinit();
-    try st2.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try st2.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
     const M: u32 = 11;
     st2.rec.cur_pc = M + 1;
     inline for (.{ IrOp.guard_number, IrOp.int_of_float }) |op| {
@@ -245,7 +245,7 @@ test "recArrayGet aborts: non-table container, non-int key, hole, and out-of-bou
     for (cases) |c| {
         var state = TraceState.init(gpa);
         defer state.deinit();
-        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
         var regs = [_]Value{ Value.nil(), c.tab, c.key };
         state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(!state.isRecording()); // aborted
@@ -266,7 +266,7 @@ test "recArrayGet records a .value-lane table element (array-of-structs)" {
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
     var state = TraceState.init(gpa);
     defer state.deinit();
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
     var regs = [_]Value{ Value.nil(), Value.heap(&outer.header), Value.int(1) };
     state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
     // Recording should succeed — the .value-lane table path emits IR.
@@ -297,7 +297,7 @@ test "recArrayGet aborts on a .value-lane bool element — nyi scope cut" {
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
     var state = TraceState.init(gpa);
     defer state.deinit();
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
     // Access index 2 (the boolean) — a bool has no *strict* type guard (`guard_true`
     // would wave a truthy heap value through), so it stays out of doc 32's admission.
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(2) };
@@ -328,7 +328,7 @@ test "recArrayGet: doc 32 — a .value-lane int element records with guard_int a
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(2) };
     state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
 
@@ -366,7 +366,7 @@ test "recArrayGet: doc 32 — a .value-lane float element records with guard_flo
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(2) };
     state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
 
@@ -393,7 +393,7 @@ test "recArraySet: doc 32 — a .value-lane numeric store pins the value with gu
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
     // r0 = value (7), r1 = table, r2 = key (2) ; `set_index r1, r2, r0` → t[2] = 7
     var regs = [_]Value{ Value.int(7), Value.heap(&t.header), Value.int(2) };
     state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0, Value.nil());
@@ -442,7 +442,7 @@ test "abort log records (anchor, reason, opcode) and dedups recurrences" {
     // Re-arm and abort the same anchor/op three times: a real loop aborts on every
     // back-edge, and the log must collapse that to one row with count == 3.
     for (0..3) |_| {
-        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 7 }, proto.num_registers);
+        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 7, .proto_id = proto.id }, proto.num_registers);
         state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 9, Value.nil());
     }
 
@@ -460,14 +460,14 @@ test "abort log records (anchor, reason, opcode) and dedups recurrences" {
     try testing.expectEqual(@as(u32, 0), row.ir_len);
 
     // A distinct reason at the same anchor is a separate row.
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 7 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 7, .proto_id = proto.id }, proto.num_registers);
     state.recordInstr(Instr.opAB(.new_table, 0, 0), winRO(&regs), &proto, 3, Value.nil());
     try testing.expectEqual(@as(usize, 2), state.abort_log.items.len);
 
     // With the flag off, nothing is logged.
     var quiet = TraceState.init(gpa);
     defer quiet.deinit();
-    try quiet.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 7 }, proto.num_registers);
+    try quiet.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 7, .proto_id = proto.id }, proto.num_registers);
     quiet.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 9, Value.nil());
     try testing.expectEqual(@as(usize, 0), quiet.abort_log.items.len);
 }
@@ -490,7 +490,7 @@ test "recArrayGet/recArraySet abort on a metatable-bearing table (chunk 2a)" {
     {
         var state = TraceState.init(gpa);
         defer state.deinit();
-        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
         var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3) };
         state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(!state.isRecording());
@@ -500,7 +500,7 @@ test "recArrayGet/recArraySet abort on a metatable-bearing table (chunk 2a)" {
     {
         var state = TraceState.init(gpa);
         defer state.deinit();
-        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
         var regs = [_]Value{ Value.heap(&t.header), Value.int(3), Value.boolean(false) };
         state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(!state.isRecording());
@@ -511,7 +511,7 @@ test "recArrayGet/recArraySet abort on a metatable-bearing table (chunk 2a)" {
     {
         var state = TraceState.init(gpa);
         defer state.deinit();
-        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
         var regs = [_]Value{ Value.heap(&t.header), Value.int(33), Value.boolean(true) };
         state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(!state.isRecording());
@@ -530,7 +530,7 @@ test "recArraySet: t[k]=false on a bool lane records the full guarded write sequ
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     // r1 = table, r2 = key (3), r0 = value (false); `set_index a=1 b=2 c=0` → t[3]=false.
     var regs = [_]Value{ Value.boolean(false), Value.heap(&t.header), Value.int(3) };
@@ -586,7 +586,7 @@ test "recArraySet: a bool-lane append (t[asize]=true) records the guarded grow s
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     // r1 = table, r2 = key (asize), r0 = value (true); `set_index a=1 b=2 c=0`.
     var regs = [_]Value{ Value.boolean(true), Value.heap(&t.header), Value.int(append_key) };
@@ -652,7 +652,7 @@ test "recArraySet aborts: non-table, non-int key, OOB, out-of-lane value, non-nu
     for (cases) |c| {
         var state = TraceState.init(gpa);
         defer state.deinit();
-        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
         var regs = [_]Value{ c.val, c.tab, c.key };
         state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(!state.isRecording());
@@ -675,7 +675,7 @@ test "recArraySet defers an RMW store (store-sinking) instead of aborting" {
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     // r1 = table, r2 = key. First: r0 = t[r2] (a packed read → aload). The recorder's
     // get_index executes against the live table; r0 then logically holds t[3] = true.
@@ -710,7 +710,7 @@ test "post-store array load proves constant non-aliasing without a runtime relat
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.boolean(true) };
     state.recordInstr(.{ .op = .load_int, .a = 2, .aux = 3 }, winRO(&regs), &proto, 0, Value.nil());
@@ -742,7 +742,7 @@ test "post-store array load with ambiguous key emits runtime ne disambiguation g
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "ambiguous_alias", .num_registers = 5 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     // r2 and r3 are unrelated loop inputs. Their observed 3 != 4 relation is not
     // a static proof, so the recorder emits a runtime `ne` guard to disambiguate
@@ -779,7 +779,7 @@ test "doc 51 F1: array load via a second SSA ref to the OBSERVED-SAME table forw
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "same_tab_two_refs", .num_registers = 6 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     // r1 AND r2 hold the same table; r3 = konst key; r4 = value.
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.heap(&t.header), Value.int(3), Value.boolean(true), Value.nil() };
@@ -824,7 +824,7 @@ test "doc 51 F1: array load via a second ref to an OBSERVED-DIFFERENT table guar
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "two_tabs", .num_registers = 6 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     var regs = [_]Value{ Value.nil(), Value.heap(&t1.header), Value.heap(&t2.header), Value.int(3), Value.boolean(true), Value.nil() };
     state.recordInstr(.{ .op = .load_int, .a = 3, .aux = 3 }, winRO(&regs), &proto, 0, Value.nil());
@@ -860,7 +860,7 @@ test "doc 51 F1: loop-varying keys OBSERVED EQUAL on the observed-same table abo
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "collided_keys", .num_registers = 6 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     // r3 and r4 are unrelated loop inputs BOTH holding 3 right now.
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.heap(&t.header), Value.int(3), Value.int(3), Value.boolean(true) };
@@ -885,7 +885,7 @@ test "doc 51 F1: loop-varying keys observed different on the observed-same table
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "varying_keys", .num_registers = 6 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.heap(&t.header), Value.int(3), Value.int(4), Value.boolean(true) };
     state.recordInstr(Instr.opABC(.get_index, 0, 1, 3), winRO(&regs), &proto, 0, Value.nil());
@@ -917,7 +917,7 @@ test "recArraySet sinks a read-steered const store (control channel) instead of 
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     // r1 = table, r2 = key. r0 = t[r2] (a packed read).
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.boolean(false) };
@@ -946,7 +946,7 @@ test "recArraySet sinks multiple RMW stores (Gap C: butterfly shape)" {
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 8 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     // r1 = table, r2 = key 3, r3 = key 4. r0 = t[3], r4 = t[4] (both reads first).
     var regs = [_]Value{
@@ -986,7 +986,7 @@ test "recArraySet virtual store buffer grows past the legacy four-store cap" {
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     // r1 = table, r2 = key, r3 = bool value. One read to arm deferral.
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.boolean(true) };
@@ -1023,7 +1023,7 @@ test "recPureSqrt: sqrt(float) records guard_builtin, guard_float, fsqrt" {
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     // r0 = sqrt (callee + result dest), r1 = arg (a float). `call r0, 1, 1`.
     var regs = [_]Value{ Value.heap(&nat.header), Value.float(2.0), Value.nil() };
@@ -1071,7 +1071,7 @@ test "recPureSqrt aborts: bad arity, non-float arg, and a non-pure native" {
         var state = TraceState.init(gpa);
         defer state.deinit();
         const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
         var regs = [_]Value{ Value.heap(&c.callee.header), c.arg, Value.nil() };
         state.recordInstr(Instr.opABC(.call, 0, c.b, c.c), winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(!state.isRecording());
@@ -1094,7 +1094,7 @@ test "recFloatUnary: sin/cos(float) record guard_builtin, guard_float, fsin/fcos
         var state = TraceState.init(gpa);
         defer state.deinit();
         const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
         // r0 = callee (+ result dest), r1 = arg (a float). `call r0, 1, 1`.
         var regs = [_]Value{ Value.heap(&nat.header), Value.float(0.5), Value.nil() };
@@ -1126,7 +1126,7 @@ test "recFloatUnary: sin(int) records guard_int and promotes" {
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     // sin(k) with an INT k — the partialsums shape (doc 23 D4 note): the
     // observed int is pinned by guard_int and promoted inside the op.
@@ -1160,7 +1160,7 @@ test "recFloatUnary aborts: sin(nil) bad_type, sin(a, b) cross_frame" {
         var state = TraceState.init(gpa);
         defer state.deinit();
         const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
         var regs = [_]Value{ Value.heap(&nat.header), c.arg, Value.nil() };
         state.recordInstr(Instr.opABC(.call, 0, c.b, c.c), winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(!state.isRecording());
@@ -1194,7 +1194,7 @@ const FoldHarness = struct {
     }
 
     fn start(self: *FoldHarness, gpa: std.mem.Allocator) !void {
-        try self.state.startRecordingForTest(gpa, .{ .proto = &self.proto, .pc = 0 }, self.proto.num_registers);
+        try self.state.startRecordingForTest(gpa, .{ .proto = &self.proto, .pc = 0, .proto_id = self.proto.id }, self.proto.num_registers);
         self.state.rec_heap = &self.heap;
     }
 
@@ -1803,7 +1803,7 @@ test "len opcode: #t on a bitmap-lane table records guard_table + alen" {
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.nil() };
     state.recordInstr(.{ .op = .len, .a = 0, .b = 1 }, winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(state.isRecording());
@@ -1829,7 +1829,7 @@ test "len opcode: alen abort matrix — in-band lane, hash border, metatable" {
         var state = TraceState.init(gpa);
         defer state.deinit();
         const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
         var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.nil() };
         state.recordInstr(.{ .op = .len, .a = 0, .b = 1 }, winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(!state.isRecording());
@@ -1847,7 +1847,7 @@ test "len opcode: alen abort matrix — in-band lane, hash border, metatable" {
         var state = TraceState.init(gpa);
         defer state.deinit();
         const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
         var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.nil() };
         state.recordInstr(.{ .op = .len, .a = 0, .b = 1 }, winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(!state.isRecording());
@@ -1866,7 +1866,7 @@ test "len opcode: alen abort matrix — in-band lane, hash border, metatable" {
         var state = TraceState.init(gpa);
         defer state.deinit();
         const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
         var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.nil() };
         state.recordInstr(.{ .op = .len, .a = 0, .b = 1 }, winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(!state.isRecording());
@@ -1887,7 +1887,7 @@ test "alen records past a pending sunk store (doc 24 D7 refinement)" {
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.int(9) };
     // A read arms deferral, then the RMW store sinks into pending_stores.
     state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
@@ -1926,7 +1926,7 @@ test "recBMType: int folds 'integer', float folds 'float', table folds nil" {
         defer st.deinit();
         st.rec_heap = &h.heap;
         const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-        try st.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        try st.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
         var regs = [_]Value{ Value.heap(&h.nat.header), c.arg, Value.nil() };
         const before = h.heap.strtab_count;
         st.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &proto, 0, Value.nil());
@@ -1995,7 +1995,7 @@ test "recEq: konst×konst folds to a bool konst (the type(x)=='number' collapse)
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
     var regs = [_]Value{ Value.nil(), Value.int(5), Value.int(5), Value.nil() };
     state.recordInstr(.{ .op = .load_int, .a = 1, .aux = 5 }, winRO(&regs), &proto, 0, Value.nil());
     state.recordInstr(.{ .op = .load_int, .a = 2, .aux = 5 }, winRO(&regs), &proto, 0, Value.nil());
@@ -2011,7 +2011,7 @@ test "recEq: observed number vs konst nil pins the number and folds false (the `
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
     // r1 = observed int (a loaded slot), r2 = nil via load_nil (a konst).
     var regs = [_]Value{ Value.nil(), Value.int(7), Value.nil(), Value.nil() };
     state.recordInstr(.{ .op = .load_nil, .a = 2 }, winRO(&regs), &proto, 0, Value.nil());
@@ -2035,7 +2035,7 @@ test "recEq: observed float vs konst nil folds under guard_float; ne folds true;
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 6 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
     var regs = [_]Value{ Value.nil(), Value.float(2.5), Value.nil(), Value.int(9), Value.nil(), Value.nil() };
     state.recordInstr(.{ .op = .load_nil, .a = 2 }, winRO(&regs), &proto, 0, Value.nil());
     // r0 = (float r1 ~= nil r2) → guard_float(r1), konst true.
@@ -2059,7 +2059,7 @@ test "recEq: doc 57 — an observed bool input vs konst nil pins the input and f
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
     // r1 = observed bool (an untyped slot_load). Doc 57 value-specializes it
     // (`guard_is_true`), so both sides are konsts and the compare folds away.
     var regs = [_]Value{ Value.nil(), Value.boolean(true), Value.nil(), Value.nil() };
@@ -2084,7 +2084,7 @@ test "recEq: an observed unproven heap value vs konst nil still aborts bad_type"
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
     // r1 = observed table: no pin covers a heap value's type here (only the
     // numeric guards and doc 57's nil/bool pins do), so this stays out of scope.
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.nil(), Value.nil() };
@@ -2100,7 +2100,7 @@ test "per-guard PC recording: guard_int aux carries the bytecode PC" {
 
     // A 3-register frame: r0=r1+r2, both ints, at PC 42.
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     var regs = [_]Value{ Value.nil(), Value.int(10), Value.int(20) };
     state.recordInstr(Instr.opABC(.add, 0, 1, 2), winRO(&regs), &proto, 42, Value.nil());
@@ -2125,7 +2125,7 @@ test "per-guard PC recording: guard_true aux carries the branch PC" {
     defer state.deinit();
 
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 2 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
 
     // r0 is truthy (int 1), so jmp_if_false emits guard_true at PC 7.
     var regs = [_]Value{ Value.int(1), Value.nil() };

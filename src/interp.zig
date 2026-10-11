@@ -3791,7 +3791,7 @@ pub const Vm = struct {
                     // Verbatim the scalar terminal consumer's receipt: one
                     // completed head run, productive (clears penalty/gate).
                     ts.onSideExitReceipt(owner, 1, row.exit, 1, .deferred, .entered);
-                    ts.noteHeadSiblingCompletion(.{ .proto = owner.code.anchor.proto, .pc = owner.code.anchor.pc }, owner.id);
+                    ts.noteHeadSiblingCompletion(.{ .proto = owner.code.anchor.proto, .pc = owner.code.anchor.pc, .proto_id = owner.code.anchor.proto_id }, owner.id);
                     self.consumeHeadWalkFail(owner.id);
                     return .{ .resume_tier0 = @intCast(term.aux) };
                 },
@@ -3901,7 +3901,7 @@ pub const Vm = struct {
         // shapes to the population cap). Runs exactly once, disposition-
         // independent; the genuine `head_terminal` receipt stays separate.
         self.consumeHeadWalkFail(ct.id);
-        ts.noteHeadSiblingCompletion(.{ .proto = ct.code.anchor.proto, .pc = ct.code.anchor.pc }, ct.id);
+        ts.noteHeadSiblingCompletion(.{ .proto = ct.code.anchor.proto, .pc = ct.code.anchor.pc, .proto_id = ct.code.anchor.proto_id }, ct.id);
         var i: usize = 0;
         while (i < ledger.len) : (i += 1) {
             const row = ledger[i];
@@ -4118,7 +4118,7 @@ pub const Vm = struct {
         // Doc 44 D12a (A1) — verbatim the rows path's single evidence
         // funnel, keyed on the ENTERED trace.
         self.consumeHeadWalkFail(ct.id);
-        ts.noteHeadSiblingCompletion(.{ .proto = ct.code.anchor.proto, .pc = ct.code.anchor.pc }, ct.id);
+        ts.noteHeadSiblingCompletion(.{ .proto = ct.code.anchor.proto, .pc = ct.code.anchor.pc, .proto_id = ct.code.anchor.proto_id }, ct.id);
         // Bounded drain: walk the records this episode's row-free hits
         // published — O(distinct slots touched), ≤ `TOUCHED_CAP`, never a
         // registry scan (Rule #20). Per record, the drained count feeds the
@@ -4257,7 +4257,7 @@ pub const Vm = struct {
             trace.TraceState.accountCandidateCharge(ct, .entered);
             // Doc 44 D8: a completion by a NON-source sibling retires a
             // standing head-sibling want.
-            ts.noteHeadSiblingCompletion(.{ .proto = ct.code.anchor.proto, .pc = ct.code.anchor.pc }, ct.id);
+            ts.noteHeadSiblingCompletion(.{ .proto = ct.code.anchor.proto, .pc = ct.code.anchor.pc, .proto_id = ct.code.anchor.proto_id }, ct.id);
             // Doc 44 D10: an earlier walk failer + this completion = one
             // handoff observation. May set `pending_sibling_arm`, which
             // correctly ends quietness for the NEXT entry (the arm needs
@@ -4824,7 +4824,7 @@ pub const Vm = struct {
                 // standing head-sibling want (clear + DONE-latch the raising
                 // exit) — the walk only reached this trace past the source's
                 // zero exit, so the failing path is covered now.
-                self.trace.noteHeadSiblingCompletion(.{ .proto = final.code.anchor.proto, .pc = final.code.anchor.pc }, final.id);
+                self.trace.noteHeadSiblingCompletion(.{ .proto = final.code.anchor.proto, .pc = final.code.anchor.pc, .proto_id = final.code.anchor.proto_id }, final.id);
                 // Doc 44 D10: earlier walk failer + this completion = one
                 // handoff observation on the failer's exit.
                 self.consumeHeadWalkFail(final.id);
@@ -5481,8 +5481,8 @@ pub const Vm = struct {
         // transfer below: never while a recording or another pending is in
         // flight; a gate-barred or population-full anchor resolves the probe
         // as hopeless instead (which re-opens the D6.1 decline memo).
-        if (one_shot and self.trace.ordinaryProbeNeeded(.{ .proto = proto, .pc = anchor_pc })) {
-            const akey = trace.AnchorKey{ .proto = proto, .pc = anchor_pc };
+        if (one_shot and self.trace.ordinaryProbeNeeded(.{ .proto = proto, .pc = anchor_pc, .proto_id = proto.id })) {
+            const akey = trace.AnchorKey{ .proto = proto, .pc = anchor_pc, .proto_id = proto.id };
             if (self.trace.recordingAbandoned(akey) or
                 self.trace.countTracesAt(akey) >= self.trace.config.max_traces_per_anchor)
             {
@@ -5668,7 +5668,7 @@ pub const Vm = struct {
         // (commit / barred / full) in bounded time, re-opening the memo.
         if (patch.live and all_nonnative_declines and !walk_truncated and
             directive == .next_candidate and
-            !self.trace.ordinaryProbeNeeded(.{ .proto = proto, .pc = anchor_pc }))
+            !self.trace.ordinaryProbeNeeded(.{ .proto = proto, .pc = anchor_pc, .proto_id = proto.id }))
         {
             patch.native_decline_gen = self.trace.registry.cache_gen;
             self.trace.dbg("one-shot native-decline memo: anchor pc={d} gen={d}", .{ anchor_pc, patch.native_decline_gen });
@@ -5683,7 +5683,7 @@ pub const Vm = struct {
                 // P0 coverage collapse. At capacity, with every sibling
                 // visited, ordinary strikes resume.
                 const head_retention = one_shot and (walk_truncated or
-                    self.trace.countTracesAt(.{ .proto = proto, .pc = anchor_pc }) < self.trace.config.max_traces_per_anchor);
+                    self.trace.countTracesAt(.{ .proto = proto, .pc = anchor_pc, .proto_id = proto.id }) < self.trace.config.max_traces_per_anchor);
                 if (!head_retention) {
                     patch.strikes +|= 1;
                     if (patch.strikes >= self.trace.config.patch_strikes)
@@ -7306,7 +7306,7 @@ pub const Vm = struct {
             else
                 null;
             const eligible = self.trace.config.execute and !self.trace.isRecording() and
-                !self.trace.isGated(.{ .proto = proto, .pc = anchor_pc });
+                !self.trace.isGated(.{ .proto = proto, .pc = anchor_pc, .proto_id = proto.id });
             const trip_ok = for_trips == null or for_trips.? >= self.trace.config.min_trip_entry;
             if (eligible and trip_ok) {
                 // A gated anchor has proven it thrashes: every entry committed
@@ -7470,8 +7470,8 @@ pub const Vm = struct {
                 // All traces at this anchor failed, OOM'd, or didn't match the
                 // fingerprint.  If at least one trace exists but none matched,
                 // count it for side-trace recording.
-                if (!any_fingerprint_matched and self.trace.hasTrace(.{ .proto = proto, .pc = anchor_pc })) {
-                    self.trace.countFingerprintMiss(.{ .proto = proto, .pc = anchor_pc });
+                if (!any_fingerprint_matched and self.trace.hasTrace(.{ .proto = proto, .pc = anchor_pc, .proto_id = proto.id })) {
+                    self.trace.countFingerprintMiss(.{ .proto = proto, .pc = anchor_pc, .proto_id = proto.id });
                 }
                 // Native safety net (part 2): we reach here only when no trace
                 // ran productively (a productive entry returns a directive).
@@ -7483,7 +7483,7 @@ pub const Vm = struct {
                 // returns `.dispatch_at` and bypasses this). Self-heals via
                 // the gate's backoff + `onSideExit` clear.
                 if (saw_native_unsupported) {
-                    self.trace.gateNativeUnsupported(.{ .proto = proto, .pc = anchor_pc });
+                    self.trace.gateNativeUnsupported(.{ .proto = proto, .pc = anchor_pc, .proto_id = proto.id });
                 }
                 // Doc 20 §R5-1 (codex post-landing blocker on 7fa7e1a): the
                 // three sites above — dead-trace retirement, fingerprint-miss,
@@ -7509,7 +7509,7 @@ pub const Vm = struct {
                 // directive above and never reaches here. Under Phase 2 the
                 // prime path chains instead of dropping here, so this trends
                 // to ~0.
-                if (self.trace.hasTrace(.{ .proto = proto, .pc = anchor_pc })) {
+                if (self.trace.hasTrace(.{ .proto = proto, .pc = anchor_pc, .proto_id = proto.id })) {
                     self.trace.tier0_outer_body_entries +|= 1;
                 }
                 // Fall through to tier-0.

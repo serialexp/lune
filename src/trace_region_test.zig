@@ -68,7 +68,7 @@ test "A-ii.2 edge_cache: a 2-anchor cont↔inner cycle resolves both structural 
     var cont_prov = [_]ExitProvEntry{.{ .index = 1, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = &cont_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -83,7 +83,7 @@ test "A-ii.2 edge_cache: a 2-anchor cont↔inner cycle resolves both structural 
     var inner_prov = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .guard = .{ .source_proto_id = 0, .source_pc = 6, .role = .loop_done, .operand = .none } } }};
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = &inner_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -148,7 +148,7 @@ test "A-ii.3 rec_path: recordInstr captures {proto_id, pc−1}; reset clears (re
     const proto = Proto{ .code = &code, .id = 42, .name = "t", .num_registers = 2 };
     var regs = [_]Value{ Value.int(0), Value.int(0) };
 
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
     // Two safe guest ops (load_int: define a reg from an immediate, no guard, no abort)
     // recorded at post-increment pcs 3 and 4 → source_pc 2 and 3.
     state.recordInstr(Instr.opAx(.load_int, 0, 1), winRO(&regs), &proto, 3, Value.nil());
@@ -159,7 +159,7 @@ test "A-ii.3 rec_path: recordInstr captures {proto_id, pc−1}; reset clears (re
     try testing.expectEqual(ProgramPoint{ .proto_id = 42, .source_pc = 3 }, state.rec.rec_path.items[1]);
 
     // Re-record stability: a fresh reset clears the path and re-arms availability.
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
     try testing.expectEqual(@as(usize, 0), state.rec.rec_path.items.len);
     try testing.expect(state.rec.rec_path_ok);
 }
@@ -184,7 +184,7 @@ test "A-ii.3 rec_path: a committed trace carries its recorded path (freed on des
     const inner_instrs = [_]IrInstr{.{ .op = .loop }};
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 5 },
+            .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
             .instrs = @constCast(&inner_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -194,7 +194,7 @@ test "A-ii.3 rec_path: a committed trace carries its recorded path (freed on des
     };
     try state.registry.attach(&inner);
 
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 2 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 2, .proto_id = proto.id }, proto.num_registers);
     state.rec.kind = .continuation;
     var regs = [_]Value{ Value.int(1), Value.int(10), Value.int(1), Value.nil() };
     state.recordInstr(Instr.opAx(.for_prep, 0, 2), winRO(&regs), &proto, 5, Value.nil());
@@ -238,7 +238,7 @@ test "A-ii.4 discovery: skip→ramp→inner→cont→skip cycle — owner==skip@
     var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
     var skip: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 14 },
+            .anchor = .{ .proto = &proto, .pc = 14, .proto_id = proto.id },
             .instrs = &skip_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -252,7 +252,7 @@ test "A-ii.4 discovery: skip→ramp→inner→cont→skip cycle — owner==skip@
     var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
     var ramp: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = &ramp_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -266,7 +266,7 @@ test "A-ii.4 discovery: skip→ramp→inner→cont→skip cycle — owner==skip@
     var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = &inner_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -280,7 +280,7 @@ test "A-ii.4 discovery: skip→ramp→inner→cont→skip cycle — owner==skip@
     var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 },
+            .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id },
             .instrs = &cont_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -294,7 +294,7 @@ test "A-ii.4 discovery: skip→ramp→inner→cont→skip cycle — owner==skip@
     var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
     var ext: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 30 },
+            .anchor = .{ .proto = &proto, .pc = 30, .proto_id = proto.id },
             .instrs = &ext_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -357,7 +357,7 @@ test "A-vii-d.0 armability recovery: first-sight unarmable arms on the rebind th
     var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
     var skip: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 14 },
+            .anchor = .{ .proto = &proto, .pc = 14, .proto_id = proto.id },
             .instrs = &skip_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -371,7 +371,7 @@ test "A-vii-d.0 armability recovery: first-sight unarmable arms on the rebind th
     var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
     var ramp: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = &ramp_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -385,7 +385,7 @@ test "A-vii-d.0 armability recovery: first-sight unarmable arms on the rebind th
     var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = &inner_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -399,7 +399,7 @@ test "A-vii-d.0 armability recovery: first-sight unarmable arms on the rebind th
     var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 },
+            .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id },
             .instrs = &cont_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -429,7 +429,7 @@ test "A-vii-d.0 armability recovery: first-sight unarmable arms on the rebind th
     var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
     var ext: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 30 },
+            .anchor = .{ .proto = &proto, .pc = 30, .proto_id = proto.id },
             .instrs = &ext_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -478,7 +478,7 @@ test "A-ii.4 finding-3: a member with an incomplete recorded path mints the regi
     var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
     var skip: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 14 },
+            .anchor = .{ .proto = &proto, .pc = 14, .proto_id = proto.id },
             .instrs = &skip_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -493,7 +493,7 @@ test "A-ii.4 finding-3: a member with an incomplete recorded path mints the regi
     var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
     var ramp: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = &ramp_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -507,7 +507,7 @@ test "A-ii.4 finding-3: a member with an incomplete recorded path mints the regi
     var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = &inner_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -521,7 +521,7 @@ test "A-ii.4 finding-3: a member with an incomplete recorded path mints the regi
     var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 },
+            .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id },
             .instrs = &cont_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -535,7 +535,7 @@ test "A-ii.4 finding-3: a member with an incomplete recorded path mints the regi
     var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
     var ext: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 30 },
+            .anchor = .{ .proto = &proto, .pc = 30, .proto_id = proto.id },
             .instrs = &ext_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -582,7 +582,7 @@ test "A-ii.4 exit_prov fail-soft: an incomplete-exit_prov trace disarms the whol
     var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
     var skip: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 14 },
+            .anchor = .{ .proto = &proto, .pc = 14, .proto_id = proto.id },
             .instrs = &skip_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -596,7 +596,7 @@ test "A-ii.4 exit_prov fail-soft: an incomplete-exit_prov trace disarms the whol
     var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
     var ramp: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = &ramp_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -610,7 +610,7 @@ test "A-ii.4 exit_prov fail-soft: an incomplete-exit_prov trace disarms the whol
     var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = &inner_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -624,7 +624,7 @@ test "A-ii.4 exit_prov fail-soft: an incomplete-exit_prov trace disarms the whol
     var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 },
+            .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id },
             .instrs = &cont_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -638,7 +638,7 @@ test "A-ii.4 exit_prov fail-soft: an incomplete-exit_prov trace disarms the whol
     var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
     var ext: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 30 },
+            .anchor = .{ .proto = &proto, .pc = 30, .proto_id = proto.id },
             .instrs = &ext_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -703,7 +703,7 @@ test "A-ii.4 finding-5: a boundary edge added on rebind flips both_count 1→2, 
     var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
     var skip: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 14 },
+            .anchor = .{ .proto = &proto, .pc = 14, .proto_id = proto.id },
             .instrs = &skip_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -717,7 +717,7 @@ test "A-ii.4 finding-5: a boundary edge added on rebind flips both_count 1→2, 
     var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
     var ramp: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = &ramp_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -731,7 +731,7 @@ test "A-ii.4 finding-5: a boundary edge added on rebind flips both_count 1→2, 
     var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = &inner_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -745,7 +745,7 @@ test "A-ii.4 finding-5: a boundary edge added on rebind flips both_count 1→2, 
     var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 },
+            .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id },
             .instrs = &cont_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -759,7 +759,7 @@ test "A-ii.4 finding-5: a boundary edge added on rebind flips both_count 1→2, 
     var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
     var ext: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 30 },
+            .anchor = .{ .proto = &proto, .pc = 30, .proto_id = proto.id },
             .instrs = &ext_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -784,7 +784,7 @@ test "A-ii.4 finding-5: a boundary edge added on rebind flips both_count 1→2, 
     var ext2_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(39, .branch_cond) }};
     var ext2: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 40 },
+            .anchor = .{ .proto = &proto, .pc = 40, .proto_id = proto.id },
             .instrs = &ext2_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -853,7 +853,7 @@ const Finding6Graph = struct {
     fn trace(g: *const Finding6Graph, id: u32, pc: u32, instrs: []IrInstr, prov: []ExitProvEntry) Trace {
         return .{
             .code = .{
-                .anchor = .{ .proto = &g.proto, .pc = pc },
+                .anchor = .{ .proto = &g.proto, .pc = pc, .proto_id = g.proto.id },
                 .instrs = instrs,
                 .consts = &.{},
                 .entry_slots = &.{},
@@ -990,7 +990,7 @@ test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) r
             const a = try g.create(Trace);
             a.* = .{
                 .code = .{
-                    .anchor = .{ .proto = p, .pc = 2 },
+                    .anchor = .{ .proto = p, .pc = 2, .proto_id = p.id },
                     .instrs = a_i,
                     .consts = try g.alloc(Value, 0),
                     .entry_slots = try g.alloc(u16, 0),
@@ -1004,7 +1004,7 @@ test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) r
             const b = try g.create(Trace);
             b.* = .{
                 .code = .{
-                    .anchor = .{ .proto = p, .pc = 7 },
+                    .anchor = .{ .proto = p, .pc = 7, .proto_id = p.id },
                     .instrs = b_i,
                     .consts = try g.alloc(Value, 0),
                     .entry_slots = try g.alloc(u16, 0),
@@ -1090,7 +1090,7 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     @memset(parent_slots, 0); // no trampoline in this unit test: shared_exit == 0
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 29 },
+            .anchor = .{ .proto = &proto, .pc = 29, .proto_id = proto.id },
             .instrs = &cont_i,
             .consts = &.{},
             .entry_slots = @constCast(&[_]u16{2}),
@@ -1116,7 +1116,7 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     } } }};
     var skip: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 14 },
+            .anchor = .{ .proto = &proto, .pc = 14, .proto_id = proto.id },
             .instrs = &skip_i,
             .consts = &.{},
             .entry_slots = @constCast(&[_]u16{ 0, 1 }),
@@ -1148,7 +1148,7 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     } } }};
     var ext: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 40 },
+            .anchor = .{ .proto = &proto, .pc = 40, .proto_id = proto.id },
             .instrs = &ext_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1346,7 +1346,7 @@ test "A-ii.4 sibling boundary edge: only the physical MEMBER's exits are credite
     var a_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(1, .loop_done) }};
     var ta: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = &a_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1360,7 +1360,7 @@ test "A-ii.4 sibling boundary edge: only the physical MEMBER's exits are credite
     var b_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .branch_cond) }};
     var tb: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = &b_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1374,7 +1374,7 @@ test "A-ii.4 sibling boundary edge: only the physical MEMBER's exits are credite
     var as_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(1, .branch_cond) }};
     var tas: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = &as_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1388,7 +1388,7 @@ test "A-ii.4 sibling boundary edge: only the physical MEMBER's exits are credite
     var c_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
     var tc: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 30 },
+            .anchor = .{ .proto = &proto, .pc = 30, .proto_id = proto.id },
             .instrs = &c_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1402,7 +1402,7 @@ test "A-ii.4 sibling boundary edge: only the physical MEMBER's exits are credite
     var x_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(39, .branch_cond) }};
     var tx: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 40 },
+            .anchor = .{ .proto = &proto, .pc = 40, .proto_id = proto.id },
             .instrs = &x_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1476,7 +1476,7 @@ test "A-ii.4 rebind tombstone: same edge set, incompatible member_points → arm
             const a = try g.create(Trace);
             a.* = .{
                 .code = .{
-                    .anchor = .{ .proto = p, .pc = 2 },
+                    .anchor = .{ .proto = p, .pc = 2, .proto_id = p.id },
                     .instrs = a_i,
                     .consts = try g.alloc(Value, 0),
                     .entry_slots = try g.alloc(u16, 0),
@@ -1491,7 +1491,7 @@ test "A-ii.4 rebind tombstone: same edge set, incompatible member_points → arm
             const b = try g.create(Trace);
             b.* = .{
                 .code = .{
-                    .anchor = .{ .proto = p, .pc = 7 },
+                    .anchor = .{ .proto = p, .pc = 7, .proto_id = p.id },
                     .instrs = b_i,
                     .consts = try g.alloc(Value, 0),
                     .entry_slots = try g.alloc(u16, 0),
@@ -1505,7 +1505,7 @@ test "A-ii.4 rebind tombstone: same edge set, incompatible member_points → arm
             const x = try g.create(Trace);
             x.* = .{
                 .code = .{
-                    .anchor = .{ .proto = p, .pc = 40 },
+                    .anchor = .{ .proto = p, .pc = 40, .proto_id = p.id },
                     .instrs = x_i,
                     .consts = try g.alloc(Value, 0),
                     .entry_slots = try g.alloc(u16, 0),
@@ -1556,7 +1556,7 @@ test "A-ii.4 lifetime: removeTrace preserves region_defs (logical); clearCache e
     const a = try gpa.create(Trace);
     a.* = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = a_i,
             .consts = try gpa.alloc(Value, 0),
             .entry_slots = try gpa.alloc(u16, 0),
@@ -1569,7 +1569,7 @@ test "A-ii.4 lifetime: removeTrace preserves region_defs (logical); clearCache e
     const b = try gpa.create(Trace);
     b.* = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = b_i,
             .consts = try gpa.alloc(Value, 0),
             .entry_slots = try gpa.alloc(u16, 0),
@@ -1622,7 +1622,7 @@ test "inc-B closed SCC: link-fed root elected + armable; boundary edge hands ele
     var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
     var root: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = &root_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1635,7 +1635,7 @@ test "inc-B closed SCC: link-fed root elected + armable; boundary edge hands ele
     var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 1, .inline_depth = 0 } } }};
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = &cont_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1670,7 +1670,7 @@ test "inc-B closed SCC: link-fed root elected + armable; boundary edge hands ele
     var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
     var ext: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 30 },
+            .anchor = .{ .proto = &proto, .pc = 30, .proto_id = proto.id },
             .instrs = &ext_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1723,13 +1723,13 @@ test "inc-B negatives: guard-fed root, foreign-proto link, and inlined link all 
         var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
         var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
         var root: Trace = .{
-            .code = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
             .id = 1,
         };
         var cont_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 7 }};
         var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(1, .branch_cond) }};
         var cont: Trace = .{
-            .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
             .id = 2,
         };
         for ([_]*Trace{ &root, &cont }) |t| try state.registry.attach(t);
@@ -1751,13 +1751,13 @@ test "inc-B negatives: guard-fed root, foreign-proto link, and inlined link all 
         var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
         var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
         var root: Trace = .{
-            .code = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
             .id = 1,
         };
         var cont_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
         var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID + 1, .source_pc = 1, .inline_depth = 0 } } }};
         var cont: Trace = .{
-            .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
             .id = 2,
         };
         for ([_]*Trace{ &root, &cont }) |t| try state.registry.attach(t);
@@ -1776,13 +1776,13 @@ test "inc-B negatives: guard-fed root, foreign-proto link, and inlined link all 
         var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
         var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
         var root: Trace = .{
-            .code = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
             .id = 1,
         };
         var cont_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
         var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 1, .inline_depth = 1 } } }};
         var cont: Trace = .{
-            .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
             .id = 2,
         };
         for ([_]*Trace{ &root, &cont }) |t| try state.registry.attach(t);
@@ -1815,25 +1815,25 @@ test "inc-B ambiguity + node-counting: two link-fed roots stay unarmable; two li
         var ra_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 10 }, .{ .op = .loop } };
         var ra_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
         var ra: Trace = .{
-            .code = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &ra_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ra_p },
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id }, .instrs = &ra_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ra_p },
             .id = 1,
         };
         var ca_i = [_]IrInstr{.{ .op = .link, .aux = 20 }};
         var ca_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 9, .inline_depth = 0 } } }};
         var ca: Trace = .{
-            .code = .{ .anchor = .{ .proto = &proto, .pc = 10 }, .instrs = &ca_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ca_p },
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 10, .proto_id = proto.id }, .instrs = &ca_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ca_p },
             .id = 2,
         };
         var rb_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 30 }, .{ .op = .loop } };
         var rb_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .loop_done) }};
         var rb: Trace = .{
-            .code = .{ .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &rb_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &rb_p },
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id }, .instrs = &rb_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &rb_p },
             .id = 3,
         };
         var cb_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
         var cb_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 29, .inline_depth = 0 } } }};
         var cb: Trace = .{
-            .code = .{ .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &cb_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cb_p },
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 30, .proto_id = proto.id }, .instrs = &cb_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cb_p },
             .id = 4,
         };
         for ([_]*Trace{ &ra, &ca, &rb, &cb }) |t| try state.registry.attach(t);
@@ -1856,19 +1856,19 @@ test "inc-B ambiguity + node-counting: two link-fed roots stay unarmable; two li
             .{ .index = 1, .prov = guardProv(5, .branch_cond) },
         };
         var root: Trace = .{
-            .code = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
             .id = 1,
         };
         var ca_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
         var ca_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 1, .inline_depth = 0 } } }};
         var ca: Trace = .{
-            .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &ca_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ca_p },
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id }, .instrs = &ca_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ca_p },
             .id = 2,
         };
         var cbb_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
         var cbb_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 9, .inline_depth = 0 } } }};
         var cbb: Trace = .{
-            .code = .{ .anchor = .{ .proto = &proto, .pc = 10 }, .instrs = &cbb_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cbb_p },
+            .code = .{ .anchor = .{ .proto = &proto, .pc = 10, .proto_id = proto.id }, .instrs = &cbb_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cbb_p },
             .id = 3,
         };
         for ([_]*Trace{ &root, &ca, &cbb }) |t| try state.registry.attach(t);
@@ -1943,13 +1943,13 @@ const RootCont = struct {
         self.root_i = .{ .{ .op = .guard_true, .a = 0, .aux = @intCast(fl + 1) }, .{ .op = .loop } };
         self.root_p = .{.{ .index = 0, .prov = guardProv(fl, .loop_done) }};
         self.root = .{
-            .code = .{ .anchor = .{ .proto = proto, .pc = header }, .instrs = &self.root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &self.root_p },
+            .code = .{ .anchor = .{ .proto = proto, .pc = header, .proto_id = proto.id }, .instrs = &self.root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &self.root_p },
             .id = first_id,
         };
         self.cont_i = .{.{ .op = .link, .aux = @intCast(link_to) }};
         self.cont_p = .{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = proto.id, .source_pc = fl + 1, .inline_depth = 0 } } }};
         self.cont = .{
-            .code = .{ .anchor = .{ .proto = proto, .pc = fl + 1 }, .instrs = &self.cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &self.cont_p },
+            .code = .{ .anchor = .{ .proto = proto, .pc = fl + 1, .proto_id = proto.id }, .instrs = &self.cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &self.cont_p },
             .id = first_id + 1,
         };
     }
@@ -2030,7 +2030,7 @@ test "doc 58 §4.8: sequential loop roots in a closed cycle elect the root whose
         var ext_i = [_]IrInstr{.{ .op = .link, .aux = @intCast(ha) }};
         var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = proto.id, .source_pc = hr, .inline_depth = 0 } } }};
         var ext: Trace = .{
-            .code = .{ .anchor = .{ .proto = proto, .pc = hr }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p },
+            .code = .{ .anchor = .{ .proto = proto, .pc = hr, .proto_id = proto.id }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p },
             .id = 9,
         };
         try state.registry.attach(&ext);
@@ -2131,19 +2131,19 @@ test "inc-B open SCC: an incoming boundary edge into a NON-root member disables 
     var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
     var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
     var root: Trace = .{
-        .code = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
         .id = 1,
     };
     var cont_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
     var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 1, .inline_depth = 0 } } }};
     var cont: Trace = .{
-        .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
         .id = 2,
     };
     var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 2 }};
     var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
     var ext: Trace = .{
-        .code = .{ .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p },
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 30, .proto_id = proto.id }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p },
         .id = 3,
     };
     for ([_]*Trace{ &root, &cont, &ext }) |t| try state.registry.attach(t);
@@ -2169,13 +2169,13 @@ test "inc-B fallback_owner flag: set on fallback mint, cleared when the primary 
     var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
     var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
     var root: Trace = .{
-        .code = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
         .id = 1,
     };
     var cont_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
     var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 1, .inline_depth = 0 } } }};
     var cont: Trace = .{
-        .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
         .id = 2,
     };
     try state.registry.attach(&root);
@@ -2198,7 +2198,7 @@ test "inc-B fallback_owner flag: set on fallback mint, cleared when the primary 
     var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 7 }};
     var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
     var ext: Trace = .{
-        .code = .{ .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p },
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 30, .proto_id = proto.id }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p },
         .id = 3,
     };
     try state.registry.attach(&ext);
@@ -2235,7 +2235,7 @@ test "inc-B strike-out policy: fallback-elected owner tombstones (one-shot); pri
     var code: [8]Instr = undefined;
     for (&code) |*c| c.* = Instr.op0(.ret);
     const proto = Proto{ .code = &code, .id = 26, .name = "t", .num_registers = 1 };
-    const owner: trace.AnchorKey = .{ .proto = &proto, .pc = 7 };
+    const owner: trace.AnchorKey = .{ .proto = &proto, .pc = 7, .proto_id = proto.id };
 
     // Fallback-elected region: strike-out must tombstone the region and eat
     // the penalty — NOT gate the anchor (the gate branch re-fires on every
@@ -2285,7 +2285,7 @@ test "inc-B strike-out policy: fallback-elected owner tombstones (one-shot); pri
     // keep today's behaviour — gate the owner anchor, def NOT tombstoned.
     const rid2: RegionId = @enumFromInt(901);
     const key2: trace.RegionKey = .{ .region_id = rid2, .activation = 2 };
-    const owner2: trace.AnchorKey = .{ .proto = &proto, .pc = 3 };
+    const owner2: trace.AnchorKey = .{ .proto = &proto, .pc = 3, .proto_id = proto.id };
     try state.region_policy.region_defs.put(gpa, rid2, .{
         .members = try gpa.alloc(StructuralEdgeId, 0),
         .member_points = try gpa.alloc(ProgramPoint, 0),
@@ -2325,13 +2325,13 @@ test "inc-B dormancy: fallback mint is dormant + excluded from receipt maps; tie
     var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
     var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
     var root: Trace = .{
-        .code = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
         .id = 1,
     };
     var cont_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
     var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 1, .inline_depth = 0 } } }};
     var cont: Trace = .{
-        .code = .{ .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
         .id = 2,
     };
     try state.registry.attach(&root);
@@ -2369,7 +2369,7 @@ test "inc-B dormancy: fallback mint is dormant + excluded from receipt maps; tie
     var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 7 }};
     var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
     var ext: Trace = .{
-        .code = .{ .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p },
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 30, .proto_id = proto.id }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p },
         .id = 3,
     };
     try state.registry.attach(&ext);
@@ -2425,7 +2425,7 @@ test "inc-B net-work balance: below min sample never evicts; repaid balance surv
     try state.region_policy.region_defs.put(gpa, rid, .{
         .members = try gpa.alloc(StructuralEdgeId, 0),
         .member_points = try gpa.alloc(ProgramPoint, 0),
-        .owner = .{ .proto = &proto, .pc = 7 },
+        .owner = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
         .classifier = .{ .kind = .cross_trace_cycle, .member_count = 2 },
         .armable = true,
         .bridges = try gpa.alloc(trace.RegionBridgeDef, 0),

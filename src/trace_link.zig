@@ -169,7 +169,7 @@ pub fn maybeArmContinuation(self: *TraceState, failed: *const Trace, exit_instr:
         self.dbg("cont-arm refuse: no enclosing back-edge from pc={d} (inner anchor {d})", .{ cont_pc, failed.code.anchor.pc });
         return;
     }
-    const key = AnchorKey{ .proto = proto, .pc = cont_pc };
+    const key = AnchorKey{ .proto = proto, .pc = cont_pc, .proto_id = proto.id };
     // Don't fight the normal machinery: a trace already cached here, or a gated
     // anchor (a prior continuation aborted → back off), is left alone.
     // NB: evaluate the map lookups ONCE into locals — `dbg` is comptime-off
@@ -231,7 +231,7 @@ pub fn maybeStartContinuation(self: *TraceState, proto: *const Proto, cur_pc: u3
 /// `max_traces_per_anchor` traces (a continuation there that did not fit is
 /// why we are recording a sibling). Deterministic.
 pub fn maybeArmExitSide(self: *TraceState, parent: *const Trace, exit_instr: u32, proto: *const Proto, p: u32, base: usize) bool {
-    const key = AnchorKey{ .proto = proto, .pc = p };
+    const key = AnchorKey{ .proto = proto, .pc = p, .proto_id = proto.id };
     const refusal: ?[]const u8 = if (self.rec.active)
         "recording active"
     else if (self.pending_exit_anchor != null or self.pending_replay_anchor != null)
@@ -817,7 +817,7 @@ pub fn countTracesAt(self: *const TraceState, anchor: AnchorKey) usize {
 /// is bound — the `isInnerLoopRoot` shape (`inputs.len == 0` + `.loop` terminal)
 /// that `findLoopTrace` omits. O(1) through the registry's anchor index.
 pub fn hasInnerRootAt(self: *const TraceState, proto: *const Proto, pc: u32) bool {
-    return self.registry.innerRootAt(.{ .proto = proto, .pc = pc });
+    return self.registry.innerRootAt(.{ .proto = proto, .pc = pc, .proto_id = proto.id });
 }
 
 pub const SuccAnchor = struct { proto_id: u32, pc: u32 };
@@ -872,12 +872,12 @@ pub fn resolveSuccessorAnchor(self: *const TraceState, t: *const Trace, e: ExitP
             if (t.code.isNumericForLoopDoneGuard(e.index)) {
                 if (guardExitPc(t.code.instrs[e.index])) |wp| {
                     if (wp != 0 and wp != t.code.anchor.pc and
-                        self.countTracesAt(.{ .proto = proto, .pc = wp }) != 0)
+                        self.countTracesAt(.{ .proto = proto, .pc = wp, .proto_id = proto.id }) != 0)
                         return .{ .proto_id = proto.id, .pc = wp };
                 }
             } else if (self.config.exit_side and t.code.exitAttachable(e.index)) {
                 if (t.code.exitResumePc(e.index)) |p| {
-                    if (p != t.code.anchor.pc and self.countTracesAt(.{ .proto = proto, .pc = p }) != 0)
+                    if (p != t.code.anchor.pc and self.countTracesAt(.{ .proto = proto, .pc = p, .proto_id = proto.id }) != 0)
                         return .{ .proto_id = proto.id, .pc = p };
                 }
             }
@@ -932,7 +932,7 @@ pub fn resolveCompositeBridgeSuccessor(self: *const TraceState, t: *const Trace,
         // Landing back on the source's own anchor is a self-edge, not a
         // cross-anchor handoff — decline (same rule as the ordinary arm).
         if (pc == t.code.anchor.pc) return null;
-        if (self.countTracesAt(.{ .proto = proto, .pc = pc }) != 0) {
+        if (self.countTracesAt(.{ .proto = proto, .pc = pc, .proto_id = proto.id }) != 0) {
             if (walk.crossed_for_loop) |flp| {
                 if (!compositeContinueProof(t, e.index, flp)) return null;
             }

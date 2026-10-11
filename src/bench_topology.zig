@@ -39,13 +39,13 @@ const RootCont = struct {
         self.root_i = .{ .{ .op = .guard_true, .a = 0, .aux = @intCast(fl + 1) }, .{ .op = .loop } };
         self.root_p = .{.{ .index = 0, .prov = .{ .guard = .{ .source_proto_id = 0, .source_pc = fl, .role = .loop_done, .operand = .none } } }};
         self.root = .{
-            .code = .{ .anchor = .{ .proto = proto, .pc = header }, .instrs = &self.root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &self.root_p },
+            .code = .{ .anchor = .{ .proto = proto, .pc = header, .proto_id = proto.id }, .instrs = &self.root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &self.root_p },
             .id = first_id,
         };
         self.cont_i = .{.{ .op = .link, .aux = @intCast(link_to) }};
         self.cont_p = .{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = proto.id, .source_pc = fl + 1, .inline_depth = 0 } } }};
         self.cont = .{
-            .code = .{ .anchor = .{ .proto = proto, .pc = fl + 1 }, .instrs = &self.cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &self.cont_p },
+            .code = .{ .anchor = .{ .proto = proto, .pc = fl + 1, .proto_id = proto.id }, .instrs = &self.cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &self.cont_p },
             .id = first_id + 1,
         };
     }

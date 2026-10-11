@@ -90,7 +90,7 @@ test "nativegen doc 55 §2d: link, linked-loop-done, and deopt exits carry a dat
     var link_code = [_]bytecode.Instr{bytecode.Instr.op0(.halt)};
     var link_proto = bytecode.Proto{ .code = &link_code, .name = "b3-link", .id = 501 };
     var link_instrs = [_]I{.{ .op = .link, .aux = 0 }};
-    var link_trace = Trace{ .anchor = .{ .proto = &link_proto, .pc = 0 }, .instrs = &link_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var link_trace = Trace{ .anchor = .{ .proto = &link_proto, .pc = 0, .proto_id = link_proto.id }, .instrs = &link_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
     var link_ct = compileInto(gpa, &arena, &link_trace, 501, null, null) orelse return error.NativeBailedUnexpectedly;
     defer link_ct.deinit();
     var saw_link = false;
@@ -122,7 +122,7 @@ test "nativegen doc 55 §2d: link, linked-loop-done, and deopt exits carry a dat
         .{ .op = .guard_true, .a = 4, .aux = 2 },
         .{ .op = .loop },
     };
-    var loop_trace = Trace{ .anchor = .{ .proto = &loop_proto, .pc = 1 }, .instrs = &loop_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var loop_trace = Trace{ .anchor = .{ .proto = &loop_proto, .pc = 1, .proto_id = loop_proto.id }, .instrs = &loop_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
     var loop_ct = compileInto(gpa, &arena, &loop_trace, 502, null, null) orelse return error.NativeBailedUnexpectedly;
     defer loop_ct.deinit();
     var saw_loopdone = false;
@@ -136,7 +136,7 @@ test "nativegen doc 55 §2d: link, linked-loop-done, and deopt exits carry a dat
     var deopt_code = [_]bytecode.Instr{ bytecode.Instr.op0(.halt), bytecode.Instr.op0(.halt) };
     var deopt_proto = bytecode.Proto{ .code = &deopt_code, .name = "b3-deopt", .id = 503 };
     loop_instrs[5].aux = 1;
-    var deopt_trace = Trace{ .anchor = .{ .proto = &deopt_proto, .pc = 0 }, .instrs = &loop_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var deopt_trace = Trace{ .anchor = .{ .proto = &deopt_proto, .pc = 0, .proto_id = deopt_proto.id }, .instrs = &loop_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
     var deopt_ct = compileInto(gpa, &arena, &deopt_trace, 503, null, null) orelse return error.NativeBailedUnexpectedly;
     defer deopt_ct.deinit();
     var saw_deopt = false;

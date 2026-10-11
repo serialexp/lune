@@ -444,7 +444,7 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
                 return error.RegionGraphInconsistent;
             try bridge_list.append(gpa, .{
                 .edge = e.eid,
-                .successor = .{ .proto = succ_proto, .pc = succ_node.pc },
+                .successor = .{ .proto = succ_proto, .pc = succ_node.pc, .proto_id = succ_proto.id },
                 .required_slots = required,
                 .invariant_slots = invariants,
             });
@@ -603,7 +603,7 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
         }
         const owner_anchor: AnchorId = if (both_count == 1) nodes.items[owner_node] else (smallest orelse return error.RegionGraphInconsistent);
         const owner_proto = proto_by_id.get(owner_anchor.proto_id) orelse return error.RegionGraphInconsistent;
-        const owner: AnchorKey = .{ .proto = owner_proto, .pc = owner_anchor.pc };
+        const owner: AnchorKey = .{ .proto = owner_proto, .pc = owner_anchor.pc, .proto_id = owner_proto.id };
 
         try candidates.append(gpa, .{
             .comp = c,

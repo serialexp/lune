@@ -28,7 +28,7 @@ const Scratch = struct {
     rec_path_ok: bool = true,
     // Not maskable, so the dead-φ filter keeps every φ unless a test says
     // otherwise.
-    anchor: types.AnchorKey = .{ .proto = &scratch_proto, .pc = 0 },
+    anchor: types.AnchorKey = .{ .proto = &scratch_proto, .pc = 0, .proto_id = scratch_proto.id },
     unrolled_while: bool = false,
     unroll_used: u8 = 0,
     side_src: ?types.ExitKey = .{ .trace_id = 12, .exit_instr = 2 },
@@ -144,7 +144,7 @@ fn exitSnapScratch(gpa: std.mem.Allocator, builder_gpa: std.mem.Allocator, scrat
     });
     try scratch.consts.append(gpa, Value.int(5));
     try scratch.entry_slots.append(gpa, 0);
-    scratch.anchor = .{ .proto = proto, .pc = 0 };
+    scratch.anchor = .{ .proto = proto, .pc = 0, .proto_id = proto.id };
     scratch.anchor_num_registers = 4;
     scratch.snap_builder = trace_snapshot.Builder.init(builder_gpa, .{});
     scratch.snap_builder_init = true;
@@ -347,7 +347,7 @@ test "doc 61 §5 site 2: the dead-φ filter keeps what some resume pc reads, onl
     var bc = [_]bytecode.Instr{ bytecode.Instr.op0(.halt), bytecode.Instr.opAx(.for_loop, 0, 0), bytecode.Instr.op0(.halt), bytecode.Instr.op0(.halt) };
     const bits = [_]u64{ 0b000010, 0b100000, 0b000100, 0b001000 };
     var proto: bytecode.Proto = .{ .code = &bc, .name = "phi-live", .id = 61, .num_registers = 6, .reg_live = .{ .words = 1, .bits = &bits }, .maskable = true };
-    var scratch: Scratch = .{ .anchor = .{ .proto = &proto, .pc = 0 } };
+    var scratch: Scratch = .{ .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id } };
     defer scratch.deinit(gpa);
     try scratch.entry_slots.append(gpa, 0);
     try std.testing.expectEqual(@as(u64, 0b000011), keptPhis(&scratch, 6));
@@ -406,7 +406,7 @@ test "doc 61 §5 site 2: a branch whose deopt crosses a for_loop keeps the slots
     };
     const bits = [_]u64{ 0, 0, 0, 0 };
     var proto: bytecode.Proto = .{ .code = &bc, .name = "phi-bridge", .id = 63, .num_registers = 6, .reg_live = .{ .words = 1, .bits = &bits }, .maskable = true };
-    var scratch: Scratch = .{ .anchor = .{ .proto = &proto, .pc = 0 } };
+    var scratch: Scratch = .{ .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id } };
     defer scratch.deinit(gpa);
     try scratch.entry_slots.append(gpa, 0);
     const branch: types.ExitProvenance = .{ .guard = .{ .source_proto_id = proto.id, .source_pc = 1, .role = .branch_cond, .operand = .a, .polarity = .fallthrough } };
@@ -437,7 +437,7 @@ test "doc 61 §5 site 2: the dead-φ filter has no width cap" {
     var bits: [5]u64 = @splat(0);
     bits[0] = 1;
     const proto: bytecode.Proto = .{ .code = &bc, .name = "wide", .id = 62, .num_registers = 300, .reg_live = .{ .words = 5, .bits = &bits }, .maskable = true };
-    var scratch: Scratch = .{ .anchor = .{ .proto = &proto, .pc = 0 } };
+    var scratch: Scratch = .{ .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id } };
     defer scratch.deinit(gpa);
     var buf: [finalizer.PHI_LIVE_WORDS]u64 = undefined;
     const live = finalizer.phiLiveRow(&scratch, &buf);

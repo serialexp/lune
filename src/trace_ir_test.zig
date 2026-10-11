@@ -63,7 +63,7 @@ test "writeTrace renders a hand-built counting-loop trace" {
     var entry = [_]u16{ 0, 1 };
     const t = Trace{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 5 },
+            .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
             .instrs = &instrs,
             .consts = &.{},
             .entry_slots = &entry,
@@ -94,8 +94,8 @@ test "onBackEdge counts back-edges per anchor" {
     state.config.hotloop = 1000; // high enough that nothing arms — pure counting
 
     const proto = Proto{ .code = &.{}, .name = "t" };
-    const hot = AnchorKey{ .proto = &proto, .pc = 3 };
-    const cold = AnchorKey{ .proto = &proto, .pc = 99 };
+    const hot = AnchorKey{ .proto = &proto, .pc = 3, .proto_id = proto.id };
+    const cold = AnchorKey{ .proto = &proto, .pc = 99, .proto_id = proto.id };
 
     var i: u32 = 0;
     while (i < 10) : (i += 1) state.onBackEdge(&proto, 3, RegWindow.empty);

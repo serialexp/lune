@@ -327,19 +327,25 @@ fn hashExit(h: *std.hash.Wyhash, exit: ExitProvenance) void {
 /// *after* inspecting the cache (see `interp.zig`'s `runForTrace`). When cache
 /// invalidation lands (a later phase) this is where proto liveness gets pinned
 /// down properly.
-pub const AnchorKey = struct { proto: *const Proto, pc: u32 };
+///
+/// `proto_id` is `proto.id`, copied in at construction so hashing never
+/// dereferences `proto` (test keys carry `undefined` protos with id 0). It
+/// must equal `proto.id` whenever `proto` is a real proto.
+pub const AnchorKey = struct { proto: *const Proto, pc: u32, proto_id: u32 };
 
 /// Hash context for `AnchorKey` maps. These are probed on every tier-0
 /// back-edge and return (`hasTrace`, the gate map), so the key gets a
 /// two-multiply mix rather than `AutoContext`'s Wyhash pass over its bytes.
-/// Pointer-based like `AutoContext` and `hotIndex`: the maps are
-/// runtime-only state and traces are output-transparent, so the address
-/// dependence changes timing, never results. The final xor-shift spreads the
+/// The hash reads `proto_id`, never the `proto` address: hashing the address
+/// made bucket layout, probe lengths and so instruction counts vary with
+/// ASLR from run to run, which made benchmark A/Bs noisy. Equality stays on
+/// the pointer, so a shared id (every hand-built test proto has id 0) only
+/// costs probe length, never correctness. The final xor-shift spreads the
 /// product's high bits into the low bits the table indexes with; the high 7
 /// bits stay strong for the metadata fingerprint.
 pub const AnchorKeyContext = struct {
     pub fn hash(_: AnchorKeyContext, k: AnchorKey) u64 {
-        var h: u64 = @intFromPtr(k.proto);
+        var h: u64 = k.proto_id;
         h ^= @as(u64, k.pc) *% 0x9E3779B97F4A7C15;
         h *%= 0xD6E8FEB86659FD93;
         return h ^ (h >> 32);

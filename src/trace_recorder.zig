@@ -644,7 +644,7 @@ pub const RecordingSession = struct {
     abort_notice: ?AbortNotice = null,
     peel_notice: ?PeelNotice = null,
     active: bool = false,
-    anchor: AnchorKey = .{ .proto = undefined, .pc = 0 },
+    anchor: AnchorKey = .{ .proto = undefined, .pc = 0, .proto_id = 0 },
     abort_reason: ?AbortReason = null,
     /// Doc 39: in-flight type-stabilizing peel, or null (the common case — no
     /// peel entered). Set by `maybeEnterPeel` at the first anchor-return of an
@@ -6241,7 +6241,7 @@ test "recorder failed resize stays inactive and retains valid storage" {
     const testing = std.testing;
     var rec: RecordingSession = .{};
     defer rec.deinit(testing.allocator);
-    const anchor: AnchorKey = .{ .proto = undefined, .pc = 0 };
+    const anchor: AnchorKey = .{ .proto = undefined, .pc = 0, .proto_id = 0 };
     try rec.reset(testing.allocator, anchor, 2);
     const old_map = rec.reg_map;
     var storage: [0]u8 = .{};
@@ -6266,7 +6266,7 @@ test "doc 56 §4.2: lazy exit capture snapshots the BOUNDARY binding of a slot r
     };
     var rec: RecordingSession = .{};
     defer rec.deinit(gpa);
-    try rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, 2);
+    try rec.reset(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, 2);
 
     // Bytecode 1 (pc 0): binds r0 = A. No guard, so no snapshot.
     try rec.exitBoundary(&proto, 1);
@@ -6316,7 +6316,7 @@ test "doc 56 §4.2: a dead slot stays out of the snapshot; no liveness table mea
     };
     var rec: RecordingSession = .{};
     defer rec.deinit(gpa);
-    try rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, 2);
+    try rec.reset(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, 2);
     try rec.exitBoundary(&proto, 1);
     const x = try rec.emit(.{ .op = .slot_load, .aux = 0 });
     rec.defineSlotAbs(0, x);
@@ -6333,7 +6333,7 @@ test "doc 56 §4.2: a dead slot stays out of the snapshot; no liveness table mea
     // dead `.def` slot r1 too.
     var unmasked = proto;
     unmasked.maskable = false;
-    try rec.reset(gpa, .{ .proto = &unmasked, .pc = 0 }, 2);
+    try rec.reset(gpa, .{ .proto = &unmasked, .pc = 0, .proto_id = unmasked.id }, 2);
     try rec.exitBoundary(&unmasked, 1);
     const w = try rec.emit(.{ .op = .slot_load, .aux = 0 });
     rec.defineSlotAbs(0, w);
@@ -6346,7 +6346,7 @@ test "doc 56 §4.2: a dead slot stays out of the snapshot; no liveness table mea
     try testing.expectEqual(@as(u16, 1), rec.snap_builder.slots.items[all[0].slots_begin + 1].slot);
 
     // A budget-refused commit latches: later guarded bytecodes skip capture.
-    try rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, 2);
+    try rec.reset(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, 2);
     rec.options.snapshot_budget = .{ .max_records = 1 };
     try rec.exitBoundary(&proto, 1);
     const z = try rec.emit(.{ .op = .slot_load, .aux = 0 });
@@ -6362,7 +6362,7 @@ test "doc 56 §4.2: a dead slot stays out of the snapshot; no liveness table mea
     // The same shape on a proto without a table: ordinals, but no snapshot.
     rec.options.snapshot_budget = .{};
     const bare = Proto{ .code = proto.code, .name = "bare", .num_registers = 2 };
-    try rec.reset(gpa, .{ .proto = &bare, .pc = 0 }, 2);
+    try rec.reset(gpa, .{ .proto = &bare, .pc = 0, .proto_id = bare.id }, 2);
     try rec.exitBoundary(&bare, 1);
     const y = try rec.emit(.{ .op = .slot_load, .aux = 0 });
     rec.defineSlotAbs(0, y);
@@ -6376,7 +6376,7 @@ test "doc 57 P3: enterUnroll spends its budget and refuses precise or inlined re
     var s: RecordingSession = .{};
     defer s.deinit(testing.allocator);
     const proto = Proto{ .code = &.{}, .id = 1, .name = "unroll", .num_registers = 1 };
-    const key: AnchorKey = .{ .proto = &proto, .pc = 0 };
+    const key: AnchorKey = .{ .proto = &proto, .pc = 0, .proto_id = proto.id };
 
     try s.reset(testing.allocator, key, 1);
     s.options.instunroll = 2;
@@ -6416,7 +6416,7 @@ test "session abort snapshot is consumed exactly once" {
     const testing = std.testing;
     var session: RecordingSession = .{};
     defer session.deinit(testing.allocator);
-    try session.reset(testing.allocator, .{ .proto = undefined, .pc = 19 }, 0);
+    try session.reset(testing.allocator, .{ .proto = undefined, .pc = 19, .proto_id = 0 }, 0);
     session.abort(.type_instability);
     session.anchor.pc = 27;
     const notice = session.takeAbortNotice().?;
@@ -6431,12 +6431,12 @@ test "session candidate survives reset and session teardown" {
     const testing = std.testing;
     var session: RecordingSession = .{};
     const proto = Proto{ .code = &.{}, .id = 1, .name = "session", .num_registers = 0 };
-    try session.reset(testing.allocator, .{ .proto = &proto, .pc = 0 }, 0);
+    try session.reset(testing.allocator, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, 0);
     session.options.optimize = false;
     var candidate = try session.finalize();
     defer candidate.deinit(testing.allocator);
     try testing.expectError(error.InactiveRecording, session.finalize());
-    try session.reset(testing.allocator, .{ .proto = &proto, .pc = 0 }, 1);
+    try session.reset(testing.allocator, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, 1);
     session.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), candidate.getCode().?.instrs.len);
 }
@@ -6446,7 +6446,7 @@ test "session failed finalization rejects recording until reset" {
     var session: RecordingSession = .{};
     defer session.deinit(testing.allocator);
     const proto = Proto{ .code = &.{}, .id = 1, .name = "oom", .num_registers = 0 };
-    try session.reset(testing.allocator, .{ .proto = &proto, .pc = 0 }, 0);
+    try session.reset(testing.allocator, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, 0);
     var storage: [0]u8 = .{};
     var failing = std.heap.FixedBufferAllocator.init(&storage);
     session.gpa = failing.allocator();
@@ -6458,7 +6458,7 @@ test "session failed finalization rejects recording until reset" {
     try testing.expectError(error.InactiveRecording, session.finalize());
     session.context.inner_root = true;
     session.context.unroll_while = true;
-    try session.reset(testing.allocator, .{ .proto = &proto, .pc = 0 }, 0);
+    try session.reset(testing.allocator, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, 0);
     try testing.expect(!session.context.inner_root and !session.context.unroll_while);
 }
 
@@ -6495,7 +6495,7 @@ test "doc 58 B2 review: a continuation links into a while root only under its en
         var session: RecordingSession = .{};
         defer session.deinit(testing.allocator);
         // A continuation anchored past the loop (the post-loop pc).
-        try session.reset(testing.allocator, .{ .proto = &proto, .pc = 5 }, 2);
+        try session.reset(testing.allocator, .{ .proto = &proto, .pc = 5, .proto_id = proto.id }, 2);
         session.kind = .continuation;
         session.context.inner_root = true;
         session.context.inner_root_guards = &guards;
@@ -6535,7 +6535,7 @@ test "doc 56 G6-Q1(a): a side recording links into a for root at its back-edge, 
     for ([_]Case{ .{ .kind = .side, .links = true }, .{ .kind = .continuation, .links = true } }) |cs| {
         var session: RecordingSession = .{};
         defer session.deinit(testing.allocator);
-        try session.reset(testing.allocator, .{ .proto = &proto, .pc = 6 }, 5);
+        try session.reset(testing.allocator, .{ .proto = &proto, .pc = 6, .proto_id = proto.id }, 5);
         session.kind = cs.kind;
         session.context.inner_root = true;
         // `pc` is the post-increment cursor, as in `recordInstr`.
@@ -6581,7 +6581,7 @@ test "doc 56 G6-Q1(d): a recording unrolls at most loopunroll iterations of loop
         defer session.deinit(testing.allocator);
         const proto = if (cs.shape == .for_loop) &for_proto else &while_proto;
         const anchor_pc: u32 = if (cs.shape == .inlined) 3 else @intCast(proto.code.len - 1);
-        try session.reset(testing.allocator, .{ .proto = proto, .pc = anchor_pc }, 5);
+        try session.reset(testing.allocator, .{ .proto = proto, .pc = anchor_pc, .proto_id = proto.id }, 5);
         session.kind = cs.kind;
         session.options.loopunroll = 3;
         if (cs.shape == .inlined) session.inline_depth = 1;
@@ -6607,7 +6607,7 @@ test "doc 56 G6-Q1(d): a recording unrolls at most loopunroll iterations of loop
     // A root without the escape still aborts LINNER at the marker, uncounted.
     var linner: RecordingSession = .{};
     defer linner.deinit(testing.allocator);
-    try linner.reset(testing.allocator, .{ .proto = &while_proto, .pc = 5 }, 5);
+    try linner.reset(testing.allocator, .{ .proto = &while_proto, .pc = 5, .proto_id = while_proto.id }, 5);
     linner.kind = .root;
     try linner.recLoopLink(marker, regs, &while_proto, 3);
     try testing.expectEqual(@as(?AbortReason, .nyi_opcode), linner.abort_reason);
@@ -6617,7 +6617,7 @@ test "doc 56 G6-Q1(d): a recording unrolls at most loopunroll iterations of loop
     // unrolled iteration. (A `.side` recording anchored at the loop header.)
     var own: RecordingSession = .{};
     defer own.deinit(testing.allocator);
-    try own.reset(testing.allocator, .{ .proto = &for_proto, .pc = g6_for_header }, 5);
+    try own.reset(testing.allocator, .{ .proto = &for_proto, .pc = g6_for_header, .proto_id = for_proto.id }, 5);
     own.kind = .side;
     own.options.loopunroll = 0;
     try own.recForLoop(g6_for_loop, regs, 6);

@@ -90,7 +90,7 @@ test "doc 56 exit locations: each needed value gets the allocator's place and it
     };
     var by_ord = [_]SnapIdx{ 0, 1, 2, 3 };
     const t = Trace{
-        .anchor = .{ .proto = &proto, .pc = 0 },
+        .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
         .instrs = &instrs,
         .consts = &consts,
         .entry_slots = &.{},
@@ -184,7 +184,7 @@ test "doc 56 exit locations: a value whose register the reader reuses is not hel
     var slots = [_]trace_snapshot.SnapshotSlot{.{ .slot = 3, .ref = 7 }};
     var by_ord = [_]SnapIdx{ 0, 0, 1, 0 };
     const t = Trace{
-        .anchor = .{ .proto = &proto, .pc = 0 },
+        .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
         .instrs = &instrs,
         .consts = &consts,
         .entry_slots = &.{},
@@ -243,7 +243,7 @@ test "doc 56 exit locations: a sunk store's value, token, table and index are ma
     var slots = [_]trace_snapshot.SnapshotSlot{ .{ .slot = 1, .ref = 3 }, .{ .slot = 1, .ref = 9 } };
     var by_ord = [_]SnapIdx{ 0, 1, 2 };
     const t = Trace{
-        .anchor = .{ .proto = &proto, .pc = 0 },
+        .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
         .instrs = &instrs,
         .consts = &consts,
         .entry_slots = &.{},
@@ -278,7 +278,7 @@ test "doc 56 exit locations: no exit snapshots, no map" {
     var proto = bytecode.Proto{ .code = &code, .name = "exitloc-none", .id = 563 };
     var instrs = loopInstrs();
     var consts = [_]Value{ Value.int(1), Value.int(100) };
-    const t = Trace{ .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &instrs, .consts = &consts, .entry_slots = &.{}, .entry_guards = &.{} };
+    const t = Trace{ .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, .instrs = &instrs, .consts = &consts, .entry_slots = &.{}, .entry_guards = &.{} };
     var arena = McodeArena.init(gpa);
     defer arena.deinit();
     var ct = compileInto(gpa, &arena, &t, 563, null, null) orelse return error.NativeBailedUnexpectedly;
@@ -292,7 +292,7 @@ test "doc 56 exit locations: no exit snapshots, no map" {
 /// `by_ord`. The anchor is a one-`halt` proto (no loop-done guards).
 fn snapTrace(proto: *bytecode.Proto, instrs: []I, consts: []Value, snaps: []trace_snapshot.Snapshot, slots: []trace_snapshot.SnapshotSlot, by_ord: []SnapIdx) Trace {
     return .{
-        .anchor = .{ .proto = proto, .pc = 0 },
+        .anchor = .{ .proto = proto, .pc = 0, .proto_id = proto.id },
         .instrs = instrs,
         .consts = consts,
         .entry_slots = &.{},

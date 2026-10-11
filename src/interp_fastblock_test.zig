@@ -25,8 +25,8 @@ fn expectWord(vm: *const Vm, want: u16) !void {
 }
 
 const proto = Proto{ .code = &.{}, .name = "fb", .num_registers = 2 };
-const key_a: AnchorKey = .{ .proto = &proto, .pc = 4 };
-const key_b: AnchorKey = .{ .proto = &proto, .pc = 7 };
+const key_a: AnchorKey = .{ .proto = &proto, .pc = 4, .proto_id = proto.id };
+const key_b: AnchorKey = .{ .proto = &proto, .pc = 7, .proto_id = proto.id };
 
 test "fast_block: each of the ten conditions owns exactly its bit" {
     var vm = try Vm.init(testing.allocator);
@@ -145,7 +145,7 @@ test "fast_block: arm-request displacement keeps the bit; stale-parent drops cle
     const cont_proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "fb-displace", .num_registers = 1 };
     var owner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &cont_proto, .pc = trace.contAnchorPc(0) },
+            .anchor = .{ .proto = &cont_proto, .pc = trace.contAnchorPc(0), .proto_id = cont_proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},

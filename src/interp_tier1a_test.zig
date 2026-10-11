@@ -832,7 +832,7 @@ test "doc 61 §5 site 5: the linked loop-done flush skips R[a+3] only on a maska
     const dead = [_]u64{ 0b1111, 0b0000 };
     const live = [_]u64{ 0b1111, 0b1000 }; // R[3] read after the loop (captured, say)
     var proto = Proto{ .code = &code, .name = "for", .num_registers = 4, .reg_live = .{ .words = 1, .bits = &dead }, .maskable = true };
-    const t = trace.TraceCode{ .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    const t = trace.TraceCode{ .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
     try std.testing.expect(t.loopDoneFlushSupported(1));
     // Read after the loop: the skipped write would be observable.
     proto.reg_live.bits = &live;
@@ -1199,7 +1199,7 @@ fn checkWhileOwnTestBound(vm: *Vm) !void {
         // bound a continuation at the post-loop pc.
         try testing.expect(idx < t.exit_side.len);
         try testing.expectEqual(exit_attach.ExitSide.attached, t.exit_side[idx]);
-        try testing.expect(vm.trace.countTracesAt(.{ .proto = t.code.anchor.proto, .pc = @intCast(post) }) >= 1);
+        try testing.expect(vm.trace.countTracesAt(.{ .proto = t.code.anchor.proto, .pc = @intCast(post), .proto_id = t.code.anchor.proto_id }) >= 1);
     }
     try testing.expect(checked >= 1);
     try testing.expect(vm.trace.exit_side_binds >= 1);
@@ -1248,7 +1248,7 @@ test "doc 58 §4.5: a while root's zero-completion own-test exits are exempt onl
         const header: u32 = for (chunk.proto.code, 0..) |ins, pc| {
             if (ins.op == .loop) break @intCast(pc + 1);
         } else return error.TestUnexpectedResult;
-        const key: @import("trace.zig").AnchorKey = .{ .proto = chunk.proto, .pc = header };
+        const key: @import("trace.zig").AnchorKey = .{ .proto = chunk.proto, .pc = header, .proto_id = chunk.proto.id };
         if (served) {
             try testing.expect(vm.trace.exit_side_binds >= 1);
             try testing.expect(!vm.trace.gate.contains(key));

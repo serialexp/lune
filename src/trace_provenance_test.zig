@@ -66,7 +66,7 @@ test "B-2a provenance edge storage retires endpoints, condemns parents, and clea
     const proto = Proto{ .code = &.{}, .name = "provenance-lifecycle", .num_registers = 0 };
     var condemned_parent: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 },
+            .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -76,7 +76,7 @@ test "B-2a provenance edge storage retires endpoints, condemns parents, and clea
     };
     var surviving_parent: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 30 },
+            .anchor = .{ .proto = &proto, .pc = 30, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -108,7 +108,7 @@ test "B-2b commit provenance creates same-anchor edge, skips null/cross-anchor, 
     var counts = [_]u8{ 7, 0 };
     var parent: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 4 },
+            .anchor = .{ .proto = &proto, .pc = 4, .proto_id = proto.id },
             .instrs = &parent_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -129,7 +129,7 @@ test "B-2b commit provenance creates same-anchor edge, skips null/cross-anchor, 
     };
     var cross: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 9 },
+            .anchor = .{ .proto = &proto, .pc = 9, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -172,7 +172,7 @@ test "B-2b commit provenance OOM does not latch DONE" {
     var parent_instrs = [_]IrInstr{ .{ .op = .guard_true, .aux = 1 }, .{ .op = .loop } };
     var counts = [_]u8{ 9, 0 };
     var parent: Trace = .{ .code = .{
-        .anchor = .{ .proto = &proto, .pc = 4 },
+        .anchor = .{ .proto = &proto, .pc = 4, .proto_id = proto.id },
         .instrs = &parent_instrs,
         .consts = &.{},
         .entry_slots = &.{},
@@ -213,7 +213,7 @@ test "B-2b provenance drain arms compiled children, deletes unsupported edges, p
     @memset(slots, 0);
     var parent: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 4 },
+            .anchor = .{ .proto = &proto, .pc = 4, .proto_id = proto.id },
             .instrs = &parent_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -293,7 +293,7 @@ test "provenance drain (task #28): a precise endpoint deletes the edge permanent
     const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "provenance-precise", .num_registers = 1 };
     var precise_parent: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 4 },
+            .anchor = .{ .proto = &proto, .pc = 4, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -311,7 +311,7 @@ test "provenance drain (task #28): a precise endpoint deletes the edge permanent
     }, .id = 102 };
     var ordinary_parent: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 8 },
+            .anchor = .{ .proto = &proto, .pc = 8, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -358,7 +358,7 @@ test "B-2b region low-yield condemnation deletes only the owner provenance" {
     state.config.max_penalty = 1;
 
     const proto = Proto{ .code = &.{}, .name = "provenance-condemn", .num_registers = 0 };
-    const owner = AnchorKey{ .proto = &proto, .pc = 10 };
+    const owner = AnchorKey{ .proto = &proto, .pc = 10, .proto_id = proto.id };
     var p1: Trace = .{
         .code = .{
             .anchor = owner,
@@ -371,7 +371,7 @@ test "B-2b region low-yield condemnation deletes only the owner provenance" {
     };
     var p2: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 },
+            .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -417,7 +417,7 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     @memset(c_slots, 0);
     var parent: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 4 },
+            .anchor = .{ .proto = &proto, .pc = 4, .proto_id = proto.id },
             .instrs = &p_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -641,7 +641,7 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     // distance must reproduce that weaker trace-id return condition.
     var x: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 8 },
+            .anchor = .{ .proto = &proto, .pc = 8, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -824,7 +824,7 @@ test "B-2b local-positive provenance handoff replays child-only cursor and charg
     defer state.disarmAllLinks(); // registry borrows fixture slot storage
     @memset(p_slots, 0);
     var parent: Trace = .{ .code = .{
-        .anchor = .{ .proto = &proto, .pc = 4 },
+        .anchor = .{ .proto = &proto, .pc = 4, .proto_id = proto.id },
         .instrs = &p_instrs,
         .consts = &.{},
         .entry_slots = &.{},
@@ -886,7 +886,7 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
 
     var parent: Trace = .{
         .code = .{
-            .anchor = .{ .proto = undefined, .pc = 7 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
+            .anchor = .{ .proto = undefined, .pc = 7, .proto_id = 0 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -896,7 +896,7 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
     };
     var child: Trace = .{
         .code = .{
-            .anchor = .{ .proto = undefined, .pc = 7 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
+            .anchor = .{ .proto = undefined, .pc = 7, .proto_id = 0 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -908,7 +908,7 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
     const CHILD_BODY2: usize = 0xF00D;
     var child2: Trace = .{
         .code = .{
-            .anchor = .{ .proto = undefined, .pc = 7 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
+            .anchor = .{ .proto = undefined, .pc = 7, .proto_id = 0 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -944,7 +944,7 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
     // A non-compiled parent is a no-op â†’ returns false.
     var unsup: Trace = .{
         .code = .{
-            .anchor = .{ .proto = undefined, .pc = 7 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
+            .anchor = .{ .proto = undefined, .pc = 7, .proto_id = 0 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -993,7 +993,7 @@ test "disarmAllLinks (2c-E / 2.3c-0e): resets EVERY armed slot on entering the o
 
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = undefined, .pc = 7 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
+            .anchor = .{ .proto = undefined, .pc = 7, .proto_id = 0 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -1003,7 +1003,7 @@ test "disarmAllLinks (2c-E / 2.3c-0e): resets EVERY armed slot on entering the o
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = undefined, .pc = 7 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
+            .anchor = .{ .proto = undefined, .pc = 7, .proto_id = 0 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -1140,7 +1140,7 @@ test "A-viii (doc 17 Â§A8 step 8): one disarm tears down the whole OUTER cycle â
 
     var skip: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 9 },
+            .anchor = .{ .proto = &proto, .pc = 9, .proto_id = proto.id },
             .instrs = &skip_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1151,7 +1151,7 @@ test "A-viii (doc 17 Â§A8 step 8): one disarm tears down the whole OUTER cycle â
     };
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 },
+            .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id },
             .instrs = &inner_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1163,7 +1163,7 @@ test "A-viii (doc 17 Â§A8 step 8): one disarm tears down the whole OUTER cycle â
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 },
+            .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id },
             .instrs = &cont_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1381,7 +1381,7 @@ test "B-2b: a seeded child needing another episode defers WITHOUT latching the d
     @memset(slots, 0);
     var parent: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto_b, .pc = 4 },
+            .anchor = .{ .proto = &proto_b, .pc = 4, .proto_id = proto_b.id },
             .instrs = &parent_instrs,
             .consts = &.{},
             .entry_slots = &.{},

@@ -67,7 +67,7 @@ fn makeB3LinkTrace(
     errdefer gpa.free(entry_guards);
     t.* = .{
         .code = .{
-            .anchor = .{ .proto = proto, .pc = pc },
+            .anchor = .{ .proto = proto, .pc = pc, .proto_id = proto.id },
             .instrs = instrs,
             .consts = consts,
             .entry_slots = entry_slots,
@@ -108,7 +108,7 @@ fn makeB3GuardTrace(
     errdefer gpa.free(entry_guards);
     t.* = .{
         .code = .{
-            .anchor = .{ .proto = proto, .pc = pc },
+            .anchor = .{ .proto = proto, .pc = pc, .proto_id = proto.id },
             .instrs = instrs,
             .consts = consts,
             .entry_slots = entry_slots,
@@ -149,7 +149,7 @@ fn makeB3LoopDoneTrace(
     errdefer gpa.free(entry_guards);
     t.* = .{
         .code = .{
-            .anchor = .{ .proto = proto, .pc = pc },
+            .anchor = .{ .proto = proto, .pc = pc, .proto_id = proto.id },
             .instrs = instrs,
             .consts = consts,
             .entry_slots = entry_slots,
@@ -203,7 +203,7 @@ fn makeB3BridgeTrace(
     errdefer gpa.free(exit_prov);
     t.* = .{
         .code = .{
-            .anchor = .{ .proto = proto, .pc = pc },
+            .anchor = .{ .proto = proto, .pc = pc, .proto_id = proto.id },
             .instrs = instrs,
             .consts = consts,
             .entry_slots = entry_slots,
@@ -250,7 +250,7 @@ fn makeB3BridgeSuccessorTrace(
     errdefer gpa.free(entry_guards);
     t.* = .{
         .code = .{
-            .anchor = .{ .proto = proto, .pc = pc },
+            .anchor = .{ .proto = proto, .pc = pc, .proto_id = proto.id },
             .instrs = instrs,
             .consts = consts,
             .entry_slots = entry_slots,
@@ -292,7 +292,7 @@ fn makeB3M1RampTrace(
     errdefer gpa.free(entry_guards);
     t.* = .{
         .code = .{
-            .anchor = .{ .proto = proto, .pc = pc },
+            .anchor = .{ .proto = proto, .pc = pc, .proto_id = proto.id },
             .instrs = instrs,
             .consts = consts,
             .entry_slots = entry_slots,
@@ -2384,7 +2384,7 @@ test "inc-B dormant admission: min-RegionId of the matching dormant regions admi
     try state.region_policy.region_defs.put(gpa, rid22, .{
         .members = try gpa.alloc(StructuralEdgeId, 0),
         .member_points = try gpa.alloc(ProgramPoint, 0),
-        .owner = .{ .proto = &proto, .pc = 3 },
+        .owner = .{ .proto = &proto, .pc = 3, .proto_id = proto.id },
         .classifier = .{ .kind = .cross_trace_cycle, .member_count = 0 },
         .armable = true,
         .bridges = try gpa.alloc(RegionBridgeDef, 0),
@@ -3184,7 +3184,7 @@ test "an armed bridge out of a `.loop` source commits the carried homes its loca
         errdefer gpa.free(exit_prov);
         bridge.* = .{
             .code = .{
-                .anchor = .{ .proto = &proto, .pc = 20 },
+                .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id },
                 .instrs = instrs,
                 .consts = consts,
                 .entry_slots = entry_slots,

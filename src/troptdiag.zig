@@ -567,7 +567,7 @@ test "troptdiag: dead carry — a phi with no slot_load and not in entry_slots i
     });
     var entry = [_]u16{0}; // only r0 is live-in
     const t = TraceCode{
-        .anchor = .{ .proto = &proto, .pc = 5 },
+        .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
         .instrs = &instrs,
         .consts = &.{},
         .entry_slots = &entry, .entry_guards = &.{},
@@ -619,7 +619,7 @@ test "troptdiag: dead carry — exclusive dependency chain is included" {
     var entry = [_]u16{0};
     var consts = [_]value.Value{value.Value.int(1)};
     const t = TraceCode{
-        .anchor = .{ .proto = &proto, .pc = 5 },
+        .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
         .instrs = &instrs,
         .consts = &consts,
         .entry_slots = &entry, .entry_guards = &.{},
@@ -671,7 +671,7 @@ test "troptdiag: live carry — a phi whose slot is read is NOT flagged" {
     });
     var entry = [_]u16{0};
     const t = TraceCode{
-        .anchor = .{ .proto = &proto, .pc = 5 },
+        .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
         .instrs = &instrs,
         .consts = &.{},
         .entry_slots = &entry, .entry_guards = &.{},
@@ -702,7 +702,7 @@ test "troptdiag: live carry — a phi whose slot is in entry_slots is NOT flagge
     var entry = [_]u16{ 0, 4 }; // r4 is live-in at the anchor → NOT dead
     var consts = [_]value.Value{value.Value.int(1)};
     const t = TraceCode{
-        .anchor = .{ .proto = &proto, .pc = 5 },
+        .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
         .instrs = &instrs,
         .consts = &consts,
         .entry_slots = &entry, .entry_guards = &.{},
@@ -731,7 +731,7 @@ test "troptdiag: duplicate carry — two phis sharing an update are flagged" {
     });
     var entry = [_]u16{0};
     const t = TraceCode{
-        .anchor = .{ .proto = &proto, .pc = 5 },
+        .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
         .instrs = &instrs,
         .consts = &.{},
         .entry_slots = &entry, .entry_guards = &.{},
@@ -771,7 +771,7 @@ test "troptdiag: no waste on a clean trace" {
     });
     var entry = [_]u16{0};
     const t = TraceCode{
-        .anchor = .{ .proto = &proto, .pc = 5 },
+        .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
         .instrs = &instrs,
         .consts = &.{},
         .entry_slots = &entry, .entry_guards = &.{},
@@ -804,7 +804,7 @@ test "troptdiag: unhoisted invariant — a pure op over invariants in the body i
     var entry = [_]u16{0};
     var consts = [_]value.Value{ value.Value.int(2), value.Value.int(3) };
     const t = TraceCode{
-        .anchor = .{ .proto = &proto, .pc = 5 },
+        .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
         .instrs = &instrs,
         .consts = &consts,
         .entry_slots = &entry, .entry_guards = &.{},
@@ -847,7 +847,7 @@ test "troptdiag: unhoisted invariant — idiv/mod over invariants is flagged as 
     var entry = [_]u16{0};
     var consts = [_]value.Value{ value.Value.int(10), value.Value.int(2) };
     const t = TraceCode{
-        .anchor = .{ .proto = &proto, .pc = 5 },
+        .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
         .instrs = &instrs,
         .consts = &consts,
         .entry_slots = &entry, .entry_guards = &.{},
@@ -888,7 +888,7 @@ test "troptdiag: unhoisted invariant — a preheader-marker trace has no unhoist
     var entry = [_]u16{0};
     var consts = [_]value.Value{value.Value.int(2)};
     const t = TraceCode{
-        .anchor = .{ .proto = &bytecode.Proto{ .code = &.{}, .name = "t" }, .pc = 5 },
+        .anchor = .{ .proto = &bytecode.Proto{ .code = &.{}, .name = "t" }, .pc = 5, .proto_id = 0 },
         .instrs = &instrs,
         .consts = &consts,
         .entry_slots = &entry, .entry_guards = &.{},
@@ -918,7 +918,7 @@ test "troptdiag: redundant guard — a duplicate type guard on the same operand 
     });
     var entry = [_]u16{0};
     const t = TraceCode{
-        .anchor = .{ .proto = &proto, .pc = 5 },
+        .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
         .instrs = &instrs,
         .consts = &.{},
         .entry_slots = &entry, .entry_guards = &.{},
@@ -957,7 +957,7 @@ test "troptdiag: redundant guard — different opcodes on the same operand are N
     });
     var entry = [_]u16{0};
     const t = TraceCode{
-        .anchor = .{ .proto = &proto, .pc = 5 },
+        .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
         .instrs = &instrs,
         .consts = &.{},
         .entry_slots = &entry, .entry_guards = &.{},
@@ -997,7 +997,7 @@ test "troptdiag: writeFindings renders waste to a writer" {
     // header (we're not printing the header here — just the findings body).
     const proto = bytecode.Proto{ .code = &.{}, .name = "t" };
     const dummy_trace = TraceCode{
-        .anchor = .{ .proto = &proto, .pc = 5 },
+        .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
         .instrs = &.{},
         .consts = &.{},
         .entry_slots = &.{},

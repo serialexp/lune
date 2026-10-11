@@ -85,7 +85,7 @@ test "nextTraceExcluding: visits each anchor trace once, highest-hit first, then
         const tr = try gpa.create(Trace);
         tr.* = .{
             .code = .{
-                .anchor = .{ .proto = &proto, .pc = spec.pc },
+                .anchor = .{ .proto = &proto, .pc = spec.pc, .proto_id = proto.id },
                 .instrs = @constCast(&loop_only),
                 .consts = &.{},
                 .entry_slots = &.{},
@@ -131,7 +131,7 @@ test "nextTraceExcluding: equal hit counts go to the lowest id, whatever the cac
         tr.* = .{
             .id = id,
             .code = .{
-                .anchor = .{ .proto = &proto, .pc = 10 },
+                .anchor = .{ .proto = &proto, .pc = 10, .proto_id = proto.id },
                 .instrs = @constCast(&loop_only),
                 .consts = &.{},
                 .entry_slots = &.{},
@@ -325,7 +325,7 @@ test "§T.9 bridge-candidate memo: bit-identical to the oracle at every index, u
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 29 },
+            .anchor = .{ .proto = &proto, .pc = 29, .proto_id = proto.id },
             .instrs = &cont_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -357,7 +357,7 @@ test "§T.9 bridge-candidate memo: bit-identical to the oracle at every index, u
     var skip_instrs = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
     var skip: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 25 },
+            .anchor = .{ .proto = &proto, .pc = 25, .proto_id = proto.id },
             .instrs = &skip_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -376,7 +376,7 @@ test "§T.9 bridge-candidate memo: bit-identical to the oracle at every index, u
     // (d) Empty trace: marked built, allocates nothing, every index false.
     var empty: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 0 },
+            .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -424,7 +424,7 @@ test "§T.9b P0c: a sunk store below a branch guard refuses bridge candidacy" {
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 29 },
+            .anchor = .{ .proto = &proto, .pc = 29, .proto_id = proto.id },
             .instrs = &cont_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -475,7 +475,7 @@ test "§T.9c doc 58 B2 blocker 1: a bridge whose φs contradict the exit snapsho
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 29 },
+            .anchor = .{ .proto = &proto, .pc = 29, .proto_id = proto.id },
             .instrs = &cont_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -547,7 +547,7 @@ test "doc 61 §5 site 4: a bridge may leave a slot stale only on a maskable prot
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 29 },
+            .anchor = .{ .proto = &proto, .pc = 29, .proto_id = proto.id },
             .instrs = &cont_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -607,7 +607,7 @@ test "A-i.3 stamp: arith operand guards carry (operand_type, b/c) and source_pc 
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
     var regs = [_]Value{ Value.nil(), Value.int(10), Value.int(20) };
     // add r0,r1,r2 at guest PC 42 → post-increment cur_pc, so source_pc == 41.
     state.recordInstr(Instr.opABC(.add, 0, 1, 2), winRO(&regs), &proto, 42, Value.nil());
@@ -637,7 +637,7 @@ test "A-i.3 stamp: int↔float re-record keeps guard identity (only the IR op di
         var state = TraceState.init(gpa);
         defer state.deinit();
         const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
         var regs = [_]Value{ Value.nil(), c[0], c[1] };
         state.recordInstr(Instr.opABC(.add, 0, 1, 2), winRO(&regs), &proto, 42, Value.nil());
         try testing.expectEqual(c[2], state.rec.instrs.items[2].op); // op differs by type
@@ -667,7 +667,7 @@ test "A-i.3 stamp: branch polarity keys on the guest jump-taken edge, not raw tr
         var state = TraceState.init(gpa);
         defer state.deinit();
         const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
-        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
         var regs = [_]Value{ c[1], Value.int(2), Value.int(1) };
         if (c[1].isBool()) state.recordInstr(Instr.opABC(.lt, 0, 1, 2), winRO(&regs), &proto, 6, Value.nil());
         state.recordInstr(Instr.opABC(c[0], 0, 0, 0), winRO(&regs), &proto, 7, Value.nil());
@@ -724,7 +724,7 @@ test "A-i.4 transport: recForPrepLink commits a .link trace carrying .link_termi
     const inner_instrs = [_]IrInstr{.{ .op = .loop }};
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 5 },
+            .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
             .instrs = @constCast(&inner_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -735,7 +735,7 @@ test "A-i.4 transport: recForPrepLink commits a .link trace carrying .link_termi
     try state.registry.attach(&inner);
 
     // Arm a *continuation* recording (a `.root` recording aborts LINNER at for_prep).
-    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 2 }, proto.num_registers);
+    try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 2, .proto_id = proto.id }, proto.num_registers);
     state.rec.kind = .continuation;
 
     // for_prep a=0 aux=+2, control regs R[0..2] = init/limit/step (all int).

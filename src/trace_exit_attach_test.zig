@@ -116,7 +116,7 @@ const Fixture = struct {
 
     fn code(self: *Fixture) TraceCode {
         return .{
-            .anchor = .{ .proto = &self.proto, .pc = 1 },
+            .anchor = .{ .proto = &self.proto, .pc = 1, .proto_id = self.proto.id },
             .instrs = &self.instrs,
             .consts = &self.consts,
             .entry_slots = &.{},

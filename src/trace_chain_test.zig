@@ -53,7 +53,7 @@ test "driveChain ordinary_header: chains to a same-anchor sibling" {
     var trace_a = try gpa.create(Trace);
     trace_a.* = .{
         .code = .{
-            .anchor = .{ .proto = undefined, .pc = 10 },
+            .anchor = .{ .proto = undefined, .pc = 10, .proto_id = 0 },
             .instrs = @constCast(&instrs_a),
             .consts = @constCast(&consts_a),
             .entry_slots = &entry_a,
@@ -81,7 +81,7 @@ test "driveChain ordinary_header: chains to a same-anchor sibling" {
     var trace_b = try gpa.create(Trace);
     trace_b.* = .{
         .code = .{
-            .anchor = .{ .proto = undefined, .pc = 10 }, // same anchor as A
+            .anchor = .{ .proto = undefined, .pc = 10, .proto_id = 0 }, // same anchor as A
             .instrs = @constCast(&instrs_b),
             .consts = @constCast(&consts_b),
             .entry_slots = &entry_b,
@@ -140,7 +140,7 @@ test "driveChain (doc 44 D1): a head-anchored trace never chains — kind check 
     var trace_a = try gpa.create(Trace);
     trace_a.* = .{
         .code = .{
-            .anchor = .{ .proto = undefined, .pc = trace.FUNC_HEAD_PC },
+            .anchor = .{ .proto = undefined, .pc = trace.FUNC_HEAD_PC, .proto_id = 0 },
             .instrs = @constCast(&instrs_a),
             .consts = @constCast(&consts_a),
             .entry_slots = &entry_a,
@@ -151,7 +151,7 @@ test "driveChain (doc 44 D1): a head-anchored trace never chains — kind check 
     var trace_b = try gpa.create(Trace);
     trace_b.* = .{
         .code = .{
-            .anchor = .{ .proto = undefined, .pc = trace.FUNC_HEAD_PC },
+            .anchor = .{ .proto = undefined, .pc = trace.FUNC_HEAD_PC, .proto_id = 0 },
             .instrs = @constCast(&instrs_a),
             .consts = @constCast(&consts_a),
             .entry_slots = &entry_a,
@@ -199,7 +199,7 @@ test "tryArmSiblingHandoff publishes complete Part-S bookkeeping" {
 
     var parent: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = @constCast(&parent_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -274,7 +274,7 @@ test "arm validator (doc 44 D10): head-anchored parents carry ONLY .sibling_hand
 
     var parent: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = trace.FUNC_HEAD_PC },
+            .anchor = .{ .proto = &proto, .pc = trace.FUNC_HEAD_PC, .proto_id = proto.id },
             .instrs = @constCast(&parent_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -380,7 +380,7 @@ test "B-iii chained hash-drift (doc 22 §B.6): SEED_HASH_DECLINE still chains on
     defer gpa.destroy(trace_a);
     trace_a.* = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 10 },
+            .anchor = .{ .proto = &proto, .pc = 10, .proto_id = proto.id },
             .instrs = @constCast(&instrs_a),
             .consts = &.{},
             .entry_slots = &entry_a,
@@ -413,7 +413,7 @@ test "B-iii chained hash-drift (doc 22 §B.6): SEED_HASH_DECLINE still chains on
     defer gpa.destroy(trace_b);
     trace_b.* = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 10 }, // same anchor as A
+            .anchor = .{ .proto = &proto, .pc = 10, .proto_id = proto.id }, // same anchor as A
             .instrs = @constCast(&instrs_b),
             .consts = &.{},
             .entry_slots = &entry_b,
@@ -496,7 +496,7 @@ test "in-place re-arm releases the displaced sibling latch (sibling -> ordinary 
     @memset(parent_slots, 0);
     var parent: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = @constCast(&parent_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -583,7 +583,7 @@ test "B-iv.1 stubEnterable (doc 22 §B.4): entry presence, unseeded pass, seeded
     // (1) Not compiled → false for both kinds (never compiles lazily).
     var uncompiled: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 1 },
+            .anchor = .{ .proto = &proto, .pc = 1, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -598,7 +598,7 @@ test "B-iv.1 stubEnterable (doc 22 §B.4): entry presence, unseeded pass, seeded
     // plan (default) → ordinary passes with NO episode ctx; linked has no stub.
     var ordinary_only: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 1 },
+            .anchor = .{ .proto = &proto, .pc = 1, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -614,7 +614,7 @@ test "B-iv.1 stubEnterable (doc 22 §B.4): entry presence, unseeded pass, seeded
     // holding): fail-closed freshness ladder.
     var seeded: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 1 },
+            .anchor = .{ .proto = &proto, .pc = 1, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -695,7 +695,7 @@ test "B-iv.3 (doc 22 §B.5): findLinkTrace + resolveLoopDoneCont admit a seeded 
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = @constCast(&cont_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -745,7 +745,7 @@ test "B-iv.3 (doc 22 §B.5): armNativeLink .sibling_handoff arms a seeded child 
     @memset(parent_slots, 0);
     var parent: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = @constCast(&parent_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -944,7 +944,7 @@ test "driveChain ir_numeric_for_done: a longer candidate cannot invalidate the c
     };
     var failed = Trace{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 10 },
+            .anchor = .{ .proto = &proto, .pc = 10, .proto_id = proto.id },
             .instrs = @constCast(&instrs_f),
             .consts = &.{},
             .entry_slots = &entry_f,
@@ -965,7 +965,7 @@ test "driveChain ir_numeric_for_done: a longer candidate cannot invalidate the c
     instrs_c[instrs_c.len - 1] = .{ .op = .link, .aux = 1 };
     var cont = Trace{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 1 },
+            .anchor = .{ .proto = &proto, .pc = 1, .proto_id = proto.id },
             .instrs = &instrs_c,
             .consts = &.{},
             .entry_slots = &entry_c,
@@ -1028,7 +1028,7 @@ test "noteRetContTransition (B1', task 27): a hot owner displaces a stale reques
     };
     var owner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = trace.contAnchorPc(0) },
+            .anchor = .{ .proto = &proto, .pc = trace.contAnchorPc(0), .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},

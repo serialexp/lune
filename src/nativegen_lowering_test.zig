@@ -172,7 +172,7 @@ test "one-shot terminal separates incoming and outgoing register kinds" {
         .{ .op = .phi, .b = 0, .aux = 1 },
         .{ .op = .terminal, .a = 0, .aux = 0 },
     };
-    var t = Trace{ .anchor = .{ .proto = &proto, .pc = trace.FUNC_HEAD_PC }, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var t = Trace{ .anchor = .{ .proto = &proto, .pc = trace.FUNC_HEAD_PC, .proto_id = proto.id }, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
     var regs = [_]Value{ Value.int(17), Value.float(2.5) };
     try expectMatch(&t, &regs);
     // Prologue refusal must not publish either outgoing snapshot value.
@@ -232,7 +232,7 @@ fn expectBoxedParallel(terminal: trace.IrOp) !void {
         .{ .op = .phi, .b = 2, .aux = 3 }, // write-only destination
         .{ .op = terminal, .a = 0, .aux = 0 },
     };
-    var t = Trace{ .anchor = .{ .proto = &proto, .pc = trace.FUNC_HEAD_PC }, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var t = Trace{ .anchor = .{ .proto = &proto, .pc = trace.FUNC_HEAD_PC, .proto_id = proto.id }, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
     var regs = [_]Value{ Value.int(11), Value.boolean(true), Value.float(3.25), Value.nil() };
     // Distinct payload bits make tag-only and payload-only copy bugs visible.
     regs[0].payload.bits = 0x1111_2222_3333_4444;
@@ -1081,7 +1081,7 @@ test "nativegen A-v: composite bridge prefix emits but unarmed exit takes ordina
     }};
     var es = [_]u16{};
     var t = Trace{
-        .anchor = .{ .proto = &proto, .pc = 29 },
+        .anchor = .{ .proto = &proto, .pc = 29, .proto_id = proto.id },
         .instrs = &instrs,
         .consts = &consts,
         .entry_slots = &es,

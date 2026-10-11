@@ -623,7 +623,7 @@ test "doc 47 convergence: grow-then-reuse commits an append continuation, then t
     try testing.expect(vm.trace.native_loopdone_link_fused > 0);
     // The pre-doc-47 failure mode (append aborts → record blacklist) is gone:
     // the continuation anchor never took a record_gate strike…
-    const key = trace.AnchorKey{ .proto = ap.code.anchor.proto, .pc = ap.code.anchor.pc };
+    const key = trace.AnchorKey{ .proto = ap.code.anchor.proto, .pc = ap.code.anchor.pc, .proto_id = ap.code.anchor.proto_id };
     try testing.expect(vm.trace.record_gate.get(key) == null);
     // …and convergence needed no retirement: the stale append trace is still
     // cached (found above), the sibling simply took over.

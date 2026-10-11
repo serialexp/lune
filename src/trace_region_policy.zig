@@ -619,8 +619,8 @@ test "policy source and destination request close before replacement opens" {
     var proto: @import("bytecode.zig").Proto = undefined; // identity only; never dereferenced
     const first: RegionId = @enumFromInt(1);
     const second: RegionId = @enumFromInt(2);
-    try policy.region_defs.put(gpa, first, testDefinition(.{ .proto = &proto, .pc = 0 }));
-    try policy.region_defs.put(gpa, second, testDefinition(.{ .proto = &proto, .pc = 0 }));
+    try policy.region_defs.put(gpa, first, testDefinition(.{ .proto = &proto, .pc = 0, .proto_id = proto.id }));
+    try policy.region_defs.put(gpa, second, testDefinition(.{ .proto = &proto, .pc = 0, .proto_id = proto.id }));
     const ctx: RegionContext = .{ .depth = 1, .call_seq = 7 };
     const initial = policy.openRegion(gpa, first, ctx).?;
     var cursor: RegionPolicy.SelectionCursor = .{};
@@ -653,7 +653,7 @@ test "policy open OOM invalidates cached accumulator before attempted map growth
     defer policy.deinit(gpa);
     var proto: @import("bytecode.zig").Proto = undefined;
     const id: RegionId = @enumFromInt(1);
-    try policy.region_defs.put(gpa, id, testDefinition(.{ .proto = &proto, .pc = 0 }));
+    try policy.region_defs.put(gpa, id, testDefinition(.{ .proto = &proto, .pc = 0, .proto_id = proto.id }));
     const initial = policy.openRegion(gpa, id, .{ .depth = 1, .call_seq = 1 }).?;
     policy.region_profit.getPtr(initial).?.useful_window_seen = true;
     // Fill existing capacity without allocating, until the next open must grow.

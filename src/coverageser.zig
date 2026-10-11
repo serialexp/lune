@@ -151,13 +151,13 @@ fn seedState(ts: *trace.TraceState, gpa: std.mem.Allocator, pa: *const bytecode.
     ts.prime_side_chain_follows = 40_291;
     ts.tier0_outer_body_entries = 9;
 
-    try ts.coverage.put(gpa, .{ .proto = pb, .pc = 24 }, .{
+    try ts.coverage.put(gpa, .{ .proto = pb, .pc = 24, .proto_id = pb.id }, .{
         .traced = 111, .interp = 0, .traced_cycles = 900, .interp_cycles = 10, .has_trace = true,
     });
-    try ts.coverage.put(gpa, .{ .proto = pa, .pc = 14 }, .{
+    try ts.coverage.put(gpa, .{ .proto = pa, .pc = 14, .proto_id = pa.id }, .{
         .traced = 0, .interp = 222, .traced_cycles = 0, .interp_cycles = 5_000, .has_trace = true,
     });
-    try ts.coverage.put(gpa, .{ .proto = pa, .pc = 3 }, .{
+    try ts.coverage.put(gpa, .{ .proto = pa, .pc = 3, .proto_id = pa.id }, .{
         .traced = 5, .interp = 6, .traced_cycles = 7, .interp_cycles = 8, .has_trace = false,
     });
 }

@@ -72,7 +72,7 @@ test "armNativeLink: P-C option (b) invariant — arm kind matches slot guard sh
     @memset(parent_slots, 0);
     var parent: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 0 },
+            .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
             .instrs = pinstrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -189,7 +189,7 @@ test "replayLedger M1 sub-case (c): fused [skip.deopt, ramp.prologue_fail] repla
     @memset(skip_slots, 0);
     var skip: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 10 },
+            .anchor = .{ .proto = &proto, .pc = 10, .proto_id = proto.id },
             .instrs = @constCast(&skip_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -205,7 +205,7 @@ test "replayLedger M1 sub-case (c): fused [skip.deopt, ramp.prologue_fail] repla
     };
     var ramp: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 10 },
+            .anchor = .{ .proto = &proto, .pc = 10, .proto_id = proto.id },
             .instrs = @constCast(&ramp_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -237,7 +237,7 @@ test "replayLedger M1 sub-case (c): fused [skip.deopt, ramp.prologue_fail] repla
     try testing.expectEqual(@as(u64, 1), skip.hit_count);
     // The ramp refused before entering its body: candidate-local evidence only,
     // so the shared outer-header anchor remains unpenalized.
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 10 }));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 10, .proto_id = proto.id }));
     try testing.expectEqual(@as(u32, 1), ramp.consec_refusals);
     // The fused M1 recognition fired exactly once; no `.link` marker was replayed.
     try testing.expectEqual(@as(u64, 1), state.native_source_link_fused);
@@ -266,7 +266,7 @@ test "replayLedger dispatcher grammar: [I.loop_done_linked, C.prologue_fail] com
     };
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 5 },
+            .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
             .instrs = @constCast(&inner_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -280,7 +280,7 @@ test "replayLedger dispatcher grammar: [I.loop_done_linked, C.prologue_fail] com
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = @constCast(&cont_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -308,9 +308,9 @@ test "replayLedger dispatcher grammar: [I.loop_done_linked, C.prologue_fail] com
     // onSideExit(inner, 1): PRODUCTIVE (completed=1) — under the Pall hotexit
     // model a productive segment is never a strike, however short (only
     // zero-progress entries strike; hot exits spawn side traces instead).
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 5 }));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 5, .proto_id = proto.id }));
     // The continuation's pre-commit fail takes NO onSideExit (break_burst tail).
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2 }));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2, .proto_id = proto.id }));
     // No `.link` marker in this grammar.
     try testing.expectEqual(@as(u64, 0), state.native_link_exits);
 }
@@ -342,7 +342,7 @@ test "replayLedger M1 sub-case (d): fused [skip.deopt, ramp.seed_capacity_declin
     @memset(skip_slots, 0);
     var skip: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 10 },
+            .anchor = .{ .proto = &proto, .pc = 10, .proto_id = proto.id },
             .instrs = @constCast(&skip_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -356,7 +356,7 @@ test "replayLedger M1 sub-case (d): fused [skip.deopt, ramp.seed_capacity_declin
     };
     var ramp: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 10 },
+            .anchor = .{ .proto = &proto, .pc = 10, .proto_id = proto.id },
             .instrs = @constCast(&ramp_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -387,7 +387,7 @@ test "replayLedger M1 sub-case (d): fused [skip.deopt, ramp.seed_capacity_declin
     // 9 >= min_useful(8) → useful entry, hit_count bumped.
     try testing.expectEqual(@as(u64, 1), skip.hit_count);
     // NO strike anywhere: the decline suppresses (c)'s `onSideExit(ramp, 0)`.
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 10 }));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 10, .proto_id = proto.id }));
     try testing.expectEqual(@as(usize, 0), state.penalty.count());
     // The fused M1 recognition fired exactly once; no `.link` marker replayed.
     try testing.expectEqual(@as(u64, 1), state.native_source_link_fused);
@@ -416,7 +416,7 @@ test "replayLedger dispatcher grammar: [I.loop_done_linked, C.seed_hash_decline]
     };
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 5 },
+            .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
             .instrs = @constCast(&inner_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -429,7 +429,7 @@ test "replayLedger dispatcher grammar: [I.loop_done_linked, C.seed_hash_decline]
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = @constCast(&cont_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -454,8 +454,8 @@ test "replayLedger dispatcher grammar: [I.loop_done_linked, C.seed_hash_decline]
     try testing.expectEqual(@as(usize, 1), r.completed);
     try testing.expectEqual(@as(?u32, 2), r.resume_pc);
     // Chargeless end to end: no strike on either anchor.
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 5 }));
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2 }));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 5, .proto_id = proto.id }));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2, .proto_id = proto.id }));
     try testing.expectEqual(@as(usize, 0), state.penalty.count());
     // The fused `I.loopdone → C` edge still drained through the non-last arm.
     try testing.expectEqual(@as(u64, 1), state.native_loopdone_link_fused);
@@ -494,7 +494,7 @@ test "B-iii: a tier-1a seed decline ends the burst chargeless (no strike on the 
     };
     var seed_trace: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = @constCast(&seed_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -510,7 +510,7 @@ test "B-iii: a tier-1a seed decline ends the burst chargeless (no strike on the 
     };
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = @constCast(&inner_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -547,7 +547,7 @@ test "B-iii: a tier-1a seed decline ends the burst chargeless (no strike on the 
     try testing.expectEqual(@as(?u32, 7), r.resume_pc);
     // The whole point: NO strike anywhere. Pre-fix this was one strike on the
     // seed's anchor at pc 2.
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2 }));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2, .proto_id = proto.id }));
     try testing.expectEqual(@as(usize, 0), state.penalty.count());
 }
 
@@ -577,7 +577,7 @@ test "replayLedger terminal seed-decline: a CONTINUATION decline is a chargeless
     };
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 5 },
+            .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
             .instrs = @constCast(&inner_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -590,7 +590,7 @@ test "replayLedger terminal seed-decline: a CONTINUATION decline is a chargeless
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = @constCast(&cont_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -655,7 +655,7 @@ test "replayLedger terminal seed-decline: [C.link_terminal, I.seed_hash_decline]
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = @constCast(&cont_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -670,7 +670,7 @@ test "replayLedger terminal seed-decline: [C.link_terminal, I.seed_hash_decline]
     };
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = @constCast(&inner_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -740,7 +740,7 @@ test "replayLedger A-vii-c.1: rows a live region CONSUMES take no legacy strike 
     };
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 5 },
+            .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
             .instrs = @constCast(&inner_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -754,7 +754,7 @@ test "replayLedger A-vii-c.1: rows a live region CONSUMES take no legacy strike 
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = @constCast(&cont_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -769,7 +769,7 @@ test "replayLedger A-vii-c.1: rows a live region CONSUMES take no legacy strike 
     // the SAME region (a different one would close the active accumulator), and the
     // first row's destination (202) must be indexed too or `applyDestination` closes
     // the region as a departure.
-    const owner: AnchorKey = .{ .proto = &proto, .pc = 5 };
+    const owner: AnchorKey = .{ .proto = &proto, .pc = 5, .proto_id = proto.id };
     const rid: RegionId = @enumFromInt(11);
     try state.region_policy.region_defs.put(gpa, rid, .{
         .members = try gpa.dupe(StructuralEdgeId, &.{}),
@@ -799,7 +799,7 @@ test "replayLedger A-vii-c.1: rows a live region CONSUMES take no legacy strike 
     // Both rows were consumed by the region window machine, so NEITHER anchor took a
     // legacy strike — the double-charge the re-review caught.
     try testing.expectEqual(@as(?u32, null), state.penalty.get(owner));
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2 }));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2, .proto_id = proto.id }));
     try testing.expectEqual(@as(usize, 0), state.penalty.count());
     // ...and the work really landed on the region: 1 + 3 traversals, still short of
     // the N=8 window, so no flush yet.
@@ -833,7 +833,7 @@ test "driveSeedLedger: a deep hop-0 ledger [C.link, I.done, C.deopt] charges eac
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = @constCast(&cont_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -848,7 +848,7 @@ test "driveSeedLedger: a deep hop-0 ledger [C.link, I.done, C.deopt] charges eac
     };
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = @constCast(&inner_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -882,8 +882,8 @@ test "driveSeedLedger: a deep hop-0 ledger [C.link, I.done, C.deopt] charges eac
     try testing.expectEqual(@as(u64, 0), state.prime_side_chain_follows);
     // onSideExit(inner, 1) and onSideExit(cont, 2): both PRODUCTIVE — under the
     // Pall hotexit model neither strikes (only zero-progress entries do).
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 7 }));
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2 }));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 7, .proto_id = proto.id }));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2, .proto_id = proto.id }));
 }
 
 test "jit coverage: per-hop cycles bill each hop's own anchor, never the entry anchor" {
@@ -910,7 +910,7 @@ test "jit coverage: per-hop cycles bill each hop's own anchor, never the entry a
     defer gpa.destroy(trace_a);
     trace_a.* = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 10 },
+            .anchor = .{ .proto = &proto, .pc = 10, .proto_id = proto.id },
             .instrs = @constCast(&instrs),
             .consts = @constCast(&consts),
             .entry_slots = &entry,
@@ -921,7 +921,7 @@ test "jit coverage: per-hop cycles bill each hop's own anchor, never the entry a
     defer gpa.destroy(trace_b);
     trace_b.* = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 }, // DISTINCT anchor
+            .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id }, // DISTINCT anchor
             .instrs = @constCast(&instrs),
             .consts = @constCast(&consts),
             .entry_slots = &entry,
@@ -948,8 +948,8 @@ test "jit coverage: per-hop cycles bill each hop's own anchor, never the entry a
     spin(4000);
     state.onSideExit(trace_b, 3, .entered);
 
-    const cov_a = state.coverage.get(.{ .proto = &proto, .pc = 10 }).?;
-    const cov_b = state.coverage.get(.{ .proto = &proto, .pc = 20 }).?;
+    const cov_a = state.coverage.get(.{ .proto = &proto, .pc = 10, .proto_id = proto.id }).?;
+    const cov_b = state.coverage.get(.{ .proto = &proto, .pc = 20, .proto_id = proto.id }).?;
 
     // Iterations: each hop bills its OWN committed count to its OWN anchor.
     try testing.expectEqual(@as(u64, 5), cov_a.traced);
@@ -998,7 +998,7 @@ test "driveBurstCore start_at_continuation: a run_continuation handover does not
     };
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = @constCast(&inner_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -1019,7 +1019,7 @@ test "driveBurstCore start_at_continuation: a run_continuation handover does not
     const cont_consts = [_]Value{Value.int(1)};
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = @constCast(&cont_instrs),
             .consts = @constCast(&cont_consts),
             .entry_slots = &.{},
@@ -1066,7 +1066,7 @@ test "driveBurstCore start_at_continuation: a run_continuation handover does not
     try testing.expect(inner.native == .unsupported);
     // Both inner loop-dones were PRODUCTIVE receipts — under the Pall hotexit
     // model neither strikes the inner anchor.
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 7 }));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 7, .proto_id = proto.id }));
 }
 
 test "replayLedger A-vii-a: region_bridge validates registered cross-anchor edge and accounts selection" {
@@ -1101,7 +1101,7 @@ test "replayLedger A-vii-a: region_bridge validates registered cross-anchor edge
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 29 },
+            .anchor = .{ .proto = &proto, .pc = 29, .proto_id = proto.id },
             .instrs = &cont_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1116,7 +1116,7 @@ test "replayLedger A-vii-a: region_bridge validates registered cross-anchor edge
     };
     var skip: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 },
+            .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id },
             .instrs = &skip_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1228,7 +1228,7 @@ test "A-vii-d.1 overlay: composite guard resolves the opposite-polarity CFG succ
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 },
+            .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id },
             .instrs = &cont_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1249,7 +1249,7 @@ test "A-vii-d.1 overlay: composite guard resolves the opposite-polarity CFG succ
     var skip_instrs = [_]IrInstr{ .{ .op = .guard_int, .a = 0 }, .{ .op = .loop } };
     var skip: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 8 },
+            .anchor = .{ .proto = &proto, .pc = 8, .proto_id = proto.id },
             .instrs = &skip_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1266,7 +1266,7 @@ test "A-vii-d.1 overlay: composite guard resolves the opposite-polarity CFG succ
     var other_instrs = [_]IrInstr{ .{ .op = .guard_int, .a = 0 }, .{ .op = .loop } };
     var other: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 10 },
+            .anchor = .{ .proto = &proto, .pc = 10, .proto_id = proto.id },
             .instrs = &other_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1283,7 +1283,7 @@ test "A-vii-d.1 overlay: composite guard resolves the opposite-polarity CFG succ
     // own anchor — never a cross-anchor handoff.
     var selfy: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 8 },
+            .anchor = .{ .proto = &proto, .pc = 8, .proto_id = proto.id },
             .instrs = &cont_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1346,7 +1346,7 @@ test "A-vii-d.1 overlay: a crossed for_loop is published ONLY under the exact-da
     };
     var good: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 },
+            .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id },
             .instrs = &good_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1363,7 +1363,7 @@ test "A-vii-d.1 overlay: a crossed for_loop is published ONLY under the exact-da
     var skip_instrs = [_]IrInstr{ .{ .op = .guard_int, .a = 0 }, .{ .op = .loop } };
     var skip: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 9 },
+            .anchor = .{ .proto = &proto, .pc = 9, .proto_id = proto.id },
             .instrs = &skip_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1382,7 +1382,7 @@ test "A-vii-d.1 overlay: a crossed for_loop is published ONLY under the exact-da
     noval_instrs[6] = .{ .op = .phi, .b = 2, .aux = 4 }; // not base+3
     var noval: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 },
+            .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id },
             .instrs = &noval_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1401,7 +1401,7 @@ test "A-vii-d.1 overlay: a crossed for_loop is published ONLY under the exact-da
     nocmp_instrs[3] = .{ .op = .le, .a = 0, .b = 1 }; // consumes %0, not R
     var nocmp: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 },
+            .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id },
             .instrs = &nocmp_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1451,7 +1451,7 @@ test "A-vii-d.1 bridged successor terminal: a loop-body successor deopt resumes 
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 29 },
+            .anchor = .{ .proto = &proto, .pc = 29, .proto_id = proto.id },
             .instrs = &cont_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1465,7 +1465,7 @@ test "A-vii-d.1 bridged successor terminal: a loop-body successor deopt resumes 
     var skip_instrs = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
     var skip: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 25 },
+            .anchor = .{ .proto = &proto, .pc = 25, .proto_id = proto.id },
             .instrs = &skip_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1551,7 +1551,7 @@ test "A-vii-d.1 bridged .link successor (codex blocker): zero-progress deopt and
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 29 },
+            .anchor = .{ .proto = &proto, .pc = 29, .proto_id = proto.id },
             .instrs = &cont_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1563,7 +1563,7 @@ test "A-vii-d.1 bridged .link successor (codex blocker): zero-progress deopt and
     var skip_instrs = [_]IrInstr{ .{ .op = .guard_int, .a = 0 }, .{ .op = .link, .aux = 7 } };
     var skip: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 },
+            .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id },
             .instrs = &skip_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1642,7 +1642,7 @@ test "A-vii-d.1 disarm deferral: disarmAllLinks defers mid-replay-walk; applyPen
     var p_i = [_]IrInstr{.{ .op = .loop }};
     var parent: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 0 },
+            .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
             .instrs = &p_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1653,7 +1653,7 @@ test "A-vii-d.1 disarm deferral: disarmAllLinks defers mid-replay-walk; applyPen
     var c_i = [_]IrInstr{.{ .op = .loop }};
     var child: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 0 },
+            .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
             .instrs = &c_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1697,7 +1697,7 @@ test "A-vii-d.1 stale-region lifecycle: a rebuild disarms region_bridge links wh
     var p_i = [_]IrInstr{.{ .op = .loop }};
     var parent: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 0 },
+            .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
             .instrs = &p_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1708,7 +1708,7 @@ test "A-vii-d.1 stale-region lifecycle: a rebuild disarms region_bridge links wh
     var c_i = [_]IrInstr{.{ .op = .loop }};
     var child: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 0 },
+            .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
             .instrs = &c_i,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1757,7 +1757,7 @@ test "A-vii-d.1 two-phase arming: a terminal composite deopt records ONE pending
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 20 },
+            .anchor = .{ .proto = &proto, .pc = 20, .proto_id = proto.id },
             .instrs = &cont_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1793,7 +1793,7 @@ test "A-vii-d.1 two-phase arming: a terminal composite deopt records ONE pending
     var plain_instrs = [_]IrInstr{ .{ .op = .guard_int, .a = 0 }, .{ .op = .link, .aux = 7 } };
     var plain: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 21 },
+            .anchor = .{ .proto = &proto, .pc = 21, .proto_id = proto.id },
             .instrs = &plain_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1830,7 +1830,7 @@ test "replayLedgerSuffix honors the silent cumulative baseline and off-cycle fir
     };
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 5 },
+            .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
             .instrs = &inner_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1841,7 +1841,7 @@ test "replayLedgerSuffix honors the silent cumulative baseline and off-cycle fir
     var cont_instrs = [_]IrInstr{.{ .op = .link, .aux = 5 }};
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = &cont_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -1933,7 +1933,7 @@ test "replayLedger forced yield (2c-B/2c-E): a CAP-length ledger ending .yielded
     };
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 5 },
+            .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
             .instrs = @constCast(&inner_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -1946,7 +1946,7 @@ test "replayLedger forced yield (2c-B/2c-E): a CAP-length ledger ending .yielded
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = @constCast(&cont_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -2042,7 +2042,7 @@ test "replayLedger convergence (2c-E site 3): a TERMINAL loop_done_linked arms t
     @memset(inner_slots, 0); // 0 == "unarmed" (no trampoline in this unit test)
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 5 },
+            .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
             .instrs = @constCast(&inner_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -2064,7 +2064,7 @@ test "replayLedger convergence (2c-E site 3): a TERMINAL loop_done_linked arms t
     @memset(cont_slots, 0);
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = @constCast(&cont_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -2151,7 +2151,7 @@ test "B-4: terminal loop-done resolves positionally — unsupported never shadow
     @memset(inner_slots, 0);
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 5 },
+            .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
             .instrs = @constCast(&inner_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -2166,7 +2166,7 @@ test "B-4: terminal loop-done resolves positionally — unsupported never shadow
     // Highest-hit candidate at pc 2, but not native-runnable.
     var cont_unsup: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = @constCast(&link_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -2184,7 +2184,7 @@ test "B-4: terminal loop-done resolves positionally — unsupported never shadow
     const a_guards = [_]EntryGuard{.{ .slot = 0, .ty = .int }};
     var cont_a: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = @constCast(&link_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -2201,7 +2201,7 @@ test "B-4: terminal loop-done resolves positionally — unsupported never shadow
     @memset(b_slots, 0);
     var cont_b: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = @constCast(&link_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -2302,7 +2302,7 @@ test "driveChain ordinary_header: chains at the anchor, not a guard's lane ordin
     const trace_a = try gpa.create(Trace);
     trace_a.* = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 10 },
+            .anchor = .{ .proto = &proto, .pc = 10, .proto_id = proto.id },
             .instrs = @constCast(&instrs_a),
             .consts = @constCast(&consts_a),
             .entry_slots = &entry_a,
@@ -2328,7 +2328,7 @@ test "driveChain ordinary_header: chains at the anchor, not a guard's lane ordin
     const trace_b = try gpa.create(Trace);
     trace_b.* = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 }, // collides with the lane ordinal
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id }, // collides with the lane ordinal
             .instrs = @constCast(&instrs_b),
             .consts = @constCast(&consts_b),
             .entry_slots = &entry_b,
@@ -2395,7 +2395,7 @@ test "B-iv.3 (doc 22 §B.5): [I.loop_done_linked, C.prologue_fail] with a SEEDED
     };
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 5 },
+            .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
             .instrs = @constCast(&inner_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -2409,7 +2409,7 @@ test "B-iv.3 (doc 22 §B.5): [I.loop_done_linked, C.prologue_fail] with a SEEDED
     var seed_inputs = [_]trace.InputSeed{undefined};
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = @constCast(&cont_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -2449,8 +2449,8 @@ test "B-iv.3 (doc 22 §B.5): [I.loop_done_linked, C.prologue_fail] with a SEEDED
     // coherent at the continuation anchor, and nothing charges.
     try testing.expectEqual(@as(usize, 1), r.completed);
     try testing.expectEqual(@as(?u32, 2), r.resume_pc);
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 5 }));
-    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2 }));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 5, .proto_id = proto.id }));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2, .proto_id = proto.id }));
     try testing.expectEqual(@as(u64, 0), state.native_link_exits);
     // Nothing declined on this path — the B-v diagnostic counters stay zero.
     try testing.expectEqual(@as(u64, 0), state.seed_hash_declines);
@@ -2477,7 +2477,7 @@ test "B-iv.3 (doc 22 §B.5): [C.link_terminal, I.seed_hash_decline] with a SEEDE
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = @constCast(&cont_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -2492,7 +2492,7 @@ test "B-iv.3 (doc 22 §B.5): [C.link_terminal, I.seed_hash_decline] with a SEEDE
     var seed_inputs = [_]trace.InputSeed{undefined};
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = @constCast(&inner_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -2583,7 +2583,7 @@ test "B-v (doc 22 §B.6): terminal seed-decline placement pin — a fused declin
     var seed_inputs = [_]trace.InputSeed{undefined};
     var inner: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 7 },
+            .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id },
             .instrs = @constCast(&inner_instrs),
             .consts = &.{},
             .entry_slots = &.{},
@@ -2605,7 +2605,7 @@ test "B-v (doc 22 §B.6): terminal seed-decline placement pin — a fused declin
     };
     var cont: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 2 },
+            .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .instrs = @constCast(&cont_instrs),
             .consts = &.{},
             .entry_slots = &.{},

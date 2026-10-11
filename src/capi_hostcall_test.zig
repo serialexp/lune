@@ -881,7 +881,7 @@ test "hostcall diff: fast word nonzero at entry (each anchor kind, arm requests,
                     const ts = &vm.trace;
                     // An anchor at a pc the callee never reaches, so it waits.
                     const proto = vm.frames[0].closure.proto;
-                    const key: mahina.trace.AnchorKey = .{ .proto = proto, .pc = 9999 };
+                    const key: mahina.trace.AnchorKey = .{ .proto = proto, .pc = 9999, .proto_id = proto.id };
                     switch (what) {
                         .exit_anchor => ts.setPendingExitAnchor(key),
                         .replay_anchor => ts.setPendingReplayAnchor(key),
@@ -950,7 +950,7 @@ test "snapshot self-test: closures by proto identity, recording constants by val
     {
         const ts = &vm.trace;
         // The VM's own (tracking) allocator: the recorder frees with it.
-        try ts.startRecordingForTest(ts.gpa, .{ .proto = vm.frames[0].closure.proto, .pc = 1 }, 4);
+        try ts.startRecordingForTest(ts.gpa, .{ .proto = vm.frames[0].closure.proto, .pc = 1, .proto_id = vm.frames[0].closure.proto.id }, 4);
         defer ts.stopRecordingForTest();
         try ts.rec.consts.append(ts.gpa, Value.int(5));
         const before = try renderResults(box, &.{});
@@ -1032,12 +1032,12 @@ test "hostcall diff: anchors that match the entered callee start their recording
                     switch (kind) {
                         // At the callee's first instruction.
                         .exit_anchor, .replay_anchor => {
-                            key.* = .{ .proto = callee_proto, .pc = 0 };
+                            key.* = .{ .proto = callee_proto, .pc = 0, .proto_id = callee_proto.id };
                             if (kind == .exit_anchor) ts.setPendingExitAnchor(key.*) else ts.setPendingReplayAnchor(key.*);
                         },
                         // The very activation H1 pushes: base and call_seq.
                         .call_anchor => {
-                            key.* = .{ .proto = callee_proto, .pc = mahina.trace.FUNC_HEAD_PC };
+                            key.* = .{ .proto = callee_proto, .pc = mahina.trace.FUNC_HEAD_PC, .proto_id = callee_proto.id };
                             ts.setPendingCallAnchor(.{ .proto = callee_proto, .base = vm.stack_top, .call_seq = vm.next_call_seq });
                         },
                     }

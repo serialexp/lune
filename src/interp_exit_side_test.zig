@@ -93,7 +93,7 @@ test "doc 58: fft bit-reverse runs mostly traced at both hot anchors (doc 56 §9
                 else => {},
             };
             for ([_]?u32{ for_header, while_header }) |h| {
-                const cov = vm.trace.coverage.get(.{ .proto = p, .pc = h.? }) orelse
+                const cov = vm.trace.coverage.get(.{ .proto = p, .pc = h.?, .proto_id = p.id }) orelse
                     return error.TestUnexpectedResult;
                 const total = cov.traced + cov.interp;
                 try testing.expect(total >= 1000); // genuinely hot

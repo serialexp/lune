@@ -155,7 +155,7 @@ fn measureOnce(gpa: std.mem.Allocator, io: std.Io, k: usize, doom_every: usize, 
             if (dies) doomed += 1 else try vm.globals.set(vm.gpa, konst, Value.boolean(true));
             const root_prov: ExitProvEntry = .{ .index = if (shape == .native) native_root_exit else 0, .prov = .{ .guard = .{ .source_proto_id = 0, .source_pc = fl, .role = .loop_done, .operand = .none } } };
             const code = if (half == 0)
-                try ownedCode(gpa, .{ .proto = proto, .pc = header }, switch (shape) {
+                try ownedCode(gpa, .{ .proto = proto, .pc = header, .proto_id = proto.id }, switch (shape) {
                     .plain => &.{
                         .{ .op = .guard_true, .a = 0, .aux = @intCast(fl + 1) },
                         .{ .op = .loop },
@@ -163,7 +163,7 @@ fn measureOnce(gpa: std.mem.Allocator, io: std.Io, k: usize, doom_every: usize, 
                     .native => &native_root,
                 }, root_prov, konst)
             else
-                try ownedCode(gpa, .{ .proto = proto, .pc = fl + 1 }, &.{
+                try ownedCode(gpa, .{ .proto = proto, .pc = fl + 1, .proto_id = proto.id }, &.{
                     .{ .op = .link, .aux = @intCast(next_header) },
                 }, .{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = proto.id, .source_pc = fl + 1, .inline_depth = 0 } } }, konst);
             traces[idx] = try publish(&vm, code, shape);

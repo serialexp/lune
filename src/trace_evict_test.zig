@@ -52,7 +52,7 @@ fn laneGuardTrace(gpa: std.mem.Allocator, lane: arr.Lane, pin_table_id: ?u32) !*
     }
     t.* = .{
         .code = .{
-            .anchor = .{ .proto = undefined, .pc = 0 },
+            .anchor = .{ .proto = undefined, .pc = 0, .proto_id = 0 },
             .instrs = instrs,
             .consts = try gpa.alloc(Value, 0),
             .entry_slots = try gpa.alloc(u16, 0),

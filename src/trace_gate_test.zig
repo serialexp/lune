@@ -49,7 +49,7 @@ test "A-vii-c split: regionless onSideExit keeps the legacy gate; bare accountTr
     const proto = Proto{ .code = &code, .name = "t", .num_registers = 1 };
     var t_wrap: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 0 },
+            .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -59,7 +59,7 @@ test "A-vii-c split: regionless onSideExit keeps the legacy gate; bare accountTr
     };
     var t_bare: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 1 },
+            .anchor = .{ .proto = &proto, .pc = 1, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -107,12 +107,12 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     try state.region_policy.region_defs.put(gpa, rid, .{
         .members = try gpa.dupe(StructuralEdgeId, &.{}),
         .member_points = try gpa.dupe(ProgramPoint, &.{.{ .proto_id = 61, .source_pc = 0 }}),
-        .owner = .{ .proto = &proto, .pc = 0 },
+        .owner = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
         .classifier = .{ .kind = .self_loop, .member_count = 1 },
         .armable = true,
     });
     try state.region_policy.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
-    const owner: AnchorKey = .{ .proto = &proto, .pc = 0 };
+    const owner: AnchorKey = .{ .proto = &proto, .pc = 0, .proto_id = proto.id };
     const exit: ExitKey = .{ .trace_id = 9, .exit_instr = 0 };
     const key: RegionKey = .{ .region_id = rid, .activation = 5 };
     // This test pins the design constant N = min_useful = 8 (doc 17 §A8-iii test 4).
@@ -154,7 +154,7 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     @memset(parent_slots, SHARED_EXIT);
     var link_parent: Trace = .{
         .code = .{
-            .anchor = .{ .proto = undefined, .pc = 7 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
+            .anchor = .{ .proto = undefined, .pc = 7, .proto_id = 0 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -165,7 +165,7 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     };
     var link_child: Trace = .{
         .code = .{
-            .anchor = .{ .proto = undefined, .pc = 7 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
+            .anchor = .{ .proto = undefined, .pc = 7, .proto_id = 0 }, // loop-kind pc: anchorKind() is read by the arm funnel (doc 44 D12b)
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -198,7 +198,7 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     var member_instrs = [_]IrInstr{ .{ .op = .slot_load, .aux = 0 }, .{ .op = .loop } };
     var member: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 1 },
+            .anchor = .{ .proto = &proto, .pc = 1, .proto_id = proto.id },
             .instrs = &member_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -262,7 +262,7 @@ test "gate-fix consumption boundary: qualified activations own member barren rec
             .{ .proto_id = 62, .source_pc = 0 },
             .{ .proto_id = 62, .source_pc = 1 },
         }),
-        .owner = .{ .proto = &proto, .pc = 0 },
+        .owner = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
         .classifier = .{ .kind = .self_loop, .member_count = 1 },
         .armable = true,
     });
@@ -270,7 +270,7 @@ test "gate-fix consumption boundary: qualified activations own member barren rec
     var member_instrs = [_]IrInstr{ .{ .op = .slot_load, .aux = 0 }, .{ .op = .loop } };
     var member: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 1 },
+            .anchor = .{ .proto = &proto, .pc = 1, .proto_id = proto.id },
             .instrs = &member_instrs,
             .consts = &.{},
             .entry_slots = &.{},
@@ -282,7 +282,7 @@ test "gate-fix consumption boundary: qualified activations own member barren rec
     defer state.registry.detachAll(); // stack-backed traces: never destroy()
     var nonmember: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 5 },
+            .anchor = .{ .proto = &proto, .pc = 5, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -338,7 +338,7 @@ test "gate-fix consumption boundary: qualified activations own member barren rec
     // far is 3 — (d), (d'), (e) — and a sustained barren-only run flushes one
     // synthetic low-yield strike at max_barren_run, restarting the streak.
     try testing.expectEqual(@as(u32, 3), state.region_policy.region_profit.get(key).?.barren_run);
-    const owner: AnchorKey = .{ .proto = &proto, .pc = 0 };
+    const owner: AnchorKey = .{ .proto = &proto, .pc = 0, .proto_id = proto.id };
     var spins: u32 = 0;
     while (spins < state.config.max_barren_run - 3) : (spins += 1) state.onSideExit(&member, 0, .entered);
     try testing.expectEqual(@as(u32, 0), state.region_policy.region_profit.get(key).?.barren_run);
@@ -393,7 +393,7 @@ test "A-vii-e.1 observer fast path: built on open, survive verdicts match the sl
             .{ .proto_id = 83, .source_pc = 2 },
             .{ .proto_id = 83, .source_pc = 5 },
         }),
-        .owner = .{ .proto = &proto, .pc = 2 },
+        .owner = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
         .classifier = .{ .kind = .self_loop, .member_count = 1 },
         .armable = true,
     });
@@ -492,7 +492,7 @@ test "A-vii-e.2 observer inline cache: only survive verdicts answer inline, and 
             .{ .proto_id = 83, .source_pc = 2 },
             .{ .proto_id = 83, .source_pc = 5 },
         }),
-        .owner = .{ .proto = &proto, .pc = 2 },
+        .owner = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
         .classifier = .{ .kind = .self_loop, .member_count = 1 },
         .armable = true,
     });
@@ -611,7 +611,7 @@ test "A-vii-e.2 observer inline cache: differential — the accelerated call sit
                 .{ .proto_id = 83, .source_pc = 2 },
                 .{ .proto_id = 83, .source_pc = 5 },
             }),
-            .owner = .{ .proto = &proto, .pc = 2 },
+            .owner = .{ .proto = &proto, .pc = 2, .proto_id = proto.id },
             .classifier = .{ .kind = .self_loop, .member_count = 1 },
             .armable = true,
         });
@@ -663,7 +663,7 @@ test "A-vii-e.1 observer fast path: an over-cap pc range declines the cache; the
             .{ .proto_id = 84, .source_pc = 0 },
             .{ .proto_id = 84, .source_pc = (1 << 22) + 1 },
         }),
-        .owner = .{ .proto = &proto, .pc = 0 },
+        .owner = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
         .classifier = .{ .kind = .self_loop, .member_count = 1 },
         .armable = true,
     });
@@ -696,7 +696,7 @@ test "A-iv region_profit: windows persist across physical re-entry and observer 
     try state.region_policy.region_defs.put(gpa, rid, .{
         .members = members,
         .member_points = points,
-        .owner = .{ .proto = &proto, .pc = 0 },
+        .owner = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
         .classifier = .{ .kind = .self_loop, .member_count = 1 },
         .armable = true,
     });
@@ -749,7 +749,7 @@ test "A-iv region_profit: same-activation owner collision flushes old before rep
         try state.region_policy.region_defs.put(gpa, rid, .{
             .members = try gpa.dupe(StructuralEdgeId, &.{}),
             .member_points = try gpa.dupe(ProgramPoint, &.{.{ .proto_id = 55, .source_pc = 0 }}),
-            .owner = .{ .proto = &proto, .pc = 0 },
+            .owner = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
             .classifier = .{ .kind = .self_loop, .member_count = 1 },
             .armable = true,
         });
@@ -777,7 +777,7 @@ test "doc 33: entry refusals neither strike nor gate the anchor" {
     const proto = Proto{ .code = &code, .name = "refusal", .num_registers = 1 };
     var t: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 0 },
+            .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -804,7 +804,7 @@ test "doc 33: an entry refusal does not clear an existing strike" {
     const proto = Proto{ .code = &code, .name = "no-clear", .num_registers = 1 };
     var t: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 0 },
+            .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -832,7 +832,7 @@ test "doc 33: alternating deopts and refusals gate on deopts alone" {
     const proto = Proto{ .code = &code, .name = "alternate", .num_registers = 1 };
     var t: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 0 },
+            .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -859,7 +859,7 @@ test "doc 33: max consecutive refusals are tracked but do not suppress selection
     var code = [_]Instr{Instr.op0(.load_nil)};
     const proto = Proto{ .code = &code, .name = "suppress", .num_registers = 1 };
     var refused: Trace = .{ .code = .{
-        .anchor = .{ .proto = &proto, .pc = 0 },
+        .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
         .instrs = &.{},
         .consts = &.{},
         .entry_slots = &.{},
@@ -888,7 +888,7 @@ test "doc 33: a body entry resets the refusal streak" {
     const proto = Proto{ .code = &code, .name = "reset", .num_registers = 1 };
     var t: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 0 },
+            .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -912,7 +912,7 @@ test "doc 33: a maxed refusal counter does not suppress the candidate from selec
 
     var code = [_]Instr{Instr.op0(.load_nil)};
     const proto = Proto{ .code = &code, .name = "siblings", .num_registers = 1 };
-    const anchor: AnchorKey = .{ .proto = &proto, .pc = 0 };
+    const anchor: AnchorKey = .{ .proto = &proto, .pc = 0, .proto_id = proto.id };
     // A trace with a maxed refusal counter is still selectable — suppression
     // deadlocks (a skipped trace can never be entered, so the counter can
     // never reset). The counter is observational, not a gate.
@@ -956,7 +956,7 @@ test "doc 31 D2: any productive receipt clears the strike; only consecutive zero
     const proto = Proto{ .code = &code, .name = "t", .num_registers = 1 };
     var t: Trace = .{
         .code = .{
-            .anchor = .{ .proto = &proto, .pc = 0 },
+            .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -1008,7 +1008,7 @@ test "doc 31 D1: record and dispatch gates escalate and expire independently" {
 
     var code = [_]Instr{ Instr.op0(.load_nil), Instr.op0(.load_nil) };
     const proto = Proto{ .code = &code, .name = "t", .num_registers = 1 };
-    const key: AnchorKey = .{ .proto = &proto, .pc = 0 };
+    const key: AnchorKey = .{ .proto = &proto, .pc = 0, .proto_id = proto.id };
 
     // One record strike: recording is barred through the cooldown; dispatch
     // never is.
@@ -1036,7 +1036,7 @@ test "doc 31 D1: record and dispatch gates escalate and expire independently" {
     // Dispatch-map permanence bars BOTH (recordingBarred consults both
     // maps), and `gateNativeUnsupported` still writes the dispatch map —
     // the tier-1a-slower protection is intact.
-    const key2: AnchorKey = .{ .proto = &proto, .pc = 1 };
+    const key2: AnchorKey = .{ .proto = &proto, .pc = 1, .proto_id = proto.id };
     state.gateNativeUnsupported(key2);
     try testing.expect(state.gate.contains(key2));
     var k: u32 = 0;
@@ -1053,7 +1053,7 @@ test "doc 31: an aborted root recording retries after the record cooldown despit
     state.config.hotloop = 3;
 
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 2 };
-    const key: AnchorKey = .{ .proto = &proto, .pc = 7 };
+    const key: AnchorKey = .{ .proto = &proto, .pc = 7, .proto_id = proto.id };
 
     // Warm to hot: the third back-edge arms (the one-shot `== hotloop`
     // crossing).
@@ -1087,7 +1087,7 @@ test "doc 31: a pending continuation/replay-side request gated after creation is
     defer state.deinit();
 
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 2 };
-    const key: AnchorKey = .{ .proto = &proto, .pc = 4 };
+    const key: AnchorKey = .{ .proto = &proto, .pc = 4, .proto_id = proto.id };
 
     // Continuation request created, then the anchor is gated before tier-0
     // reaches it: the request is consumed but no recording starts (doc 31
@@ -1121,8 +1121,8 @@ test "doc 31 D1: clearCache drops the record gate (epoch boundary, leak-checked)
     defer state.deinit();
 
     const proto = Proto{ .code = &.{}, .name = "t" };
-    state.gateRecordAnchor(.{ .proto = &proto, .pc = 0 }, .record_abort);
-    state.gateRecordAnchor(.{ .proto = &proto, .pc = 1 }, .commit_failure);
+    state.gateRecordAnchor(.{ .proto = &proto, .pc = 0, .proto_id = proto.id }, .record_abort);
+    state.gateRecordAnchor(.{ .proto = &proto, .pc = 1, .proto_id = proto.id }, .commit_failure);
     try testing.expectEqual(@as(usize, 2), state.record_gate.count());
     state.clearCache();
     try testing.expectEqual(@as(usize, 0), state.record_gate.count());

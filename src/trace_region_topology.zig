@@ -56,7 +56,7 @@ pub const View = struct {
         return self.traces[i];
     }
     pub fn hasInnerRootAt(self: View, proto: *const Proto, pc: u32) bool {
-        return self.inner_roots.contains(.{ .proto = proto, .pc = pc });
+        return self.inner_roots.contains(.{ .proto = proto, .pc = pc, .proto_id = proto.id });
     }
 };
 pub const Previous = struct {

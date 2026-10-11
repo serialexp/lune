@@ -1696,7 +1696,7 @@ test "doc 27 §3a: the multret shadow never survives reset or an abort" {
         try testing.expect(!diags.hasErrors());
         _ = try vm.run(chunk.proto);
         vm.trace.rec.multret_top = 7; // plant a stale shadow
-        try vm.trace.startRecordingForTest(gpa, .{ .proto = chunk.proto, .pc = 0 }, 4);
+        try vm.trace.startRecordingForTest(gpa, .{ .proto = chunk.proto, .pc = 0, .proto_id = chunk.proto.id }, 4);
         try testing.expectEqual(@as(?u32, null), vm.trace.rec.multret_top);
     }
     {
@@ -6174,7 +6174,7 @@ test "recorder (precise deopt, doc 45 D2): new_table cancels needs_precise ONCE,
     // Policy state: the anchor is memoized for precise mode, and the nyi
     // retry struck the record gate normally (ordinary strikes resumed — the
     // cancel is non-penalizing, not ungated-forever).
-    const anchor = trace.AnchorKey{ .proto = cancel_row.?.proto, .pc = cancel_row.?.anchor_pc };
+    const anchor = trace.AnchorKey{ .proto = cancel_row.?.proto, .pc = cancel_row.?.anchor_pc, .proto_id = cancel_row.?.proto.id };
     try testing.expect(vm.trace.precise_anchor_memo.contains(anchor));
     try testing.expect(vm.trace.record_gate.count() >= 1);
     try testing.expect(!vm.trace.isRecording());
@@ -6217,7 +6217,7 @@ test "recorder (precise deopt, doc 45 D2): a pre-seeded precise loop commits a f
     // loop precise. (Robust against the exact back-edge-target pc encoding.)
     var pc: u32 = 0;
     while (pc < chunk.proto.code.len) : (pc += 1)
-        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pc }, .{});
+        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pc, .proto_id = chunk.proto.id }, .{});
 
     _ = try vm.run(chunk.proto);
 
@@ -6324,7 +6324,7 @@ test "executor (precise deopt, doc 45 D6): a mid-body guard failure precise-resu
     try testing.expect(!diags.hasErrors());
     var pc: u32 = 0;
     while (pc < chunk.proto.code.len) : (pc += 1)
-        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pc }, .{});
+        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pc, .proto_id = chunk.proto.id }, .{});
 
     _ = try vm.run(chunk.proto);
 
@@ -6378,7 +6378,7 @@ test "executor (precise deopt, doc 45 D6): the snapshot restore writes mid-itera
     try testing.expect(!diags.hasErrors());
     var pc: u32 = 0;
     while (pc < chunk.proto.code.len) : (pc += 1)
-        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pc }, .{});
+        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pc, .proto_id = chunk.proto.id }, .{});
     _ = try vm.run(chunk.proto);
 
     try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
@@ -6589,7 +6589,7 @@ test "executor (tnew OOM, doc 45 D5): a one-shot allocation failure exits precis
     try testing.expect(!diags.hasErrors());
     var pcs: u32 = 0;
     while (pcs < chunk.proto.code.len) : (pcs += 1)
-        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pcs }, .{});
+        try vm.trace.precise_anchor_memo.put(gpa, .{ .proto = chunk.proto, .pc = pcs, .proto_id = chunk.proto.id }, .{});
     _ = try vm.run(chunk.proto);
 
     try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);

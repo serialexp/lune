@@ -1150,7 +1150,7 @@ test "frame link physical cells disarm without recycling the first four return k
     var keys = [_]u32{ unset, unset, unset, unset };
     var parent: Trace = .{
         .id = 100,
-        .code = .{ .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} },
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} },
         .native = .{ .compiled = .{ .page = undefined, .gpa = std.testing.allocator, .slots = &slots, .ret_cont_keys = &keys } },
     };
     var child: Trace = .{
@@ -1194,10 +1194,10 @@ test "doc 56 Phase 5: an exit-side arm owns its own cell and lives beside a sibl
     var cells: [n]usize = @splat(0);
     var parent: Trace = .{
         .id = 100,
-        .code = .{ .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} },
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, .instrs = &instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} },
         .native = .{ .compiled = .{ .page = undefined, .gpa = std.testing.allocator, .slots = &slots, .exit_side_cells = &cells } },
     };
-    const side_code: @import("trace_code.zig").TraceCode = .{ .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    const side_code: @import("trace_code.zig").TraceCode = .{ .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
     var side: Trace = .{ .id = 101, .code = side_code, .native = .{ .compiled = .{ .page = undefined, .gpa = std.testing.allocator, .ordinary_entry = 0xCAFE } } };
     var other: Trace = .{ .id = 102, .code = side_code, .native = .{ .compiled = .{ .page = undefined, .gpa = std.testing.allocator, .ordinary_entry = 0xF00D } } };
     var sibling: Trace = .{

@@ -322,7 +322,7 @@ fn anchoredCandidate(registry: *TraceRegistry, proto: *const @import("bytecode.z
     const IrInstr = @import("trace_ir.zig").IrInstr;
     const t = try registry.allocate();
     const instrs = try registry.gpa.dupe(IrInstr, if (root) &.{.{ .op = .loop }} else &.{});
-    t.code = .{ .anchor = .{ .proto = proto, .pc = pc }, .instrs = instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    t.code = .{ .anchor = .{ .proto = proto, .pc = pc, .proto_id = proto.id }, .instrs = instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
     return t;
 }
 
@@ -345,9 +345,9 @@ test "registry anchor index: per-anchor lists stay in cache order through publis
     defer registry.deinit();
     const p1 = Proto{ .code = &.{}, .name = "a", .id = 1 };
     const p2 = Proto{ .code = &.{}, .name = "b", .id = 2 };
-    const a: AnchorKey = .{ .proto = &p1, .pc = 3 };
-    const b: AnchorKey = .{ .proto = &p1, .pc = 4 }; // same proto, other pc
-    const c: AnchorKey = .{ .proto = &p2, .pc = 3 }; // same pc, other proto
+    const a: AnchorKey = .{ .proto = &p1, .pc = 3, .proto_id = p1.id };
+    const b: AnchorKey = .{ .proto = &p1, .pc = 4, .proto_id = p1.id }; // same proto, other pc
+    const c: AnchorKey = .{ .proto = &p2, .pc = 3, .proto_id = p2.id }; // same pc, other proto
 
     const a1 = try anchoredCandidate(&registry, a.proto, a.pc, false);
     try registry.publish(a1);
@@ -364,7 +364,7 @@ test "registry anchor index: per-anchor lists stay in cache order through publis
     try expectAnchorList(&registry, b, &.{b1});
     try expectAnchorList(&registry, c, &.{c1});
     try testing.expect(registry.innerRootAt(a) and registry.innerRootAt(b) and !registry.innerRootAt(c));
-    try testing.expectEqual(@as(usize, 0), registry.countAt(.{ .proto = &p2, .pc = 4 }));
+    try testing.expectEqual(@as(usize, 0), registry.countAt(.{ .proto = &p2, .pc = 4, .proto_id = p2.id }));
 
     // Middle, head and tail removal; the root count follows the shape.
     try testing.expect(registry.retire(a2));
@@ -407,7 +407,7 @@ test "registry anchor index: a failed attach changes nothing" {
     const testing = std.testing;
     const Proto = @import("bytecode.zig").Proto;
     const p = Proto{ .code = &.{}, .name = "a", .id = 1 };
-    const anchor: AnchorKey = .{ .proto = &p, .pc = 3 };
+    const anchor: AnchorKey = .{ .proto = &p, .pc = 3, .proto_id = p.id };
     // A fresh registry has no capacity anywhere, so attach allocates the id
     // index, the batch scratch, the anchor map and the cache, in that order.
     // Fail each in turn.

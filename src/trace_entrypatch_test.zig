@@ -50,7 +50,7 @@ fn entryPatchTestTrace(gpa: std.mem.Allocator, id: u32, proto: *const Proto, pc:
     const t = try gpa.create(Trace);
     t.* = .{
         .code = .{
-            .anchor = .{ .proto = proto, .pc = pc },
+            .anchor = .{ .proto = proto, .pc = pc, .proto_id = proto.id },
             .instrs = try gpa.alloc(IrInstr, 0),
             .consts = try gpa.alloc(Value, 0),
             .entry_slots = try gpa.alloc(u16, 0),
@@ -340,7 +340,7 @@ test "doc 20 triggers: anchor gate and side-arm want both mark the patch pending
 
     var code = entryPatchTestCode();
     const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
-    const anchor = AnchorKey{ .proto = &proto, .pc = 2 };
+    const anchor = AnchorKey{ .proto = &proto, .pc = 2, .proto_id = proto.id };
     const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
     try state.registry.attach(t);
 
@@ -379,7 +379,7 @@ test "doc 31 D1: a record gate leaves the entry patch live and blocks want produ
 
     var code = entryPatchTestCode();
     const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
-    const anchor = AnchorKey{ .proto = &proto, .pc = 2 };
+    const anchor = AnchorKey{ .proto = &proto, .pc = 2, .proto_id = proto.id };
     const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
     try state.registry.attach(t);
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
@@ -429,7 +429,7 @@ test "doc 31 D1 amendment: record-gated anchor arms GATE_SKIP only when no trace
     // back-edge of an abort-blacklisted hot loop pays full `onBackEdge`
     // bookkeeping forever (measured on the first post-split board: tbl_ops
     // +40%, euler14-bit +55%, nsieve-bit-fp +57% jit-vs-t0 drag).
-    state.gateRecordAnchor(.{ .proto = &proto, .pc = 2 }, .record_abort);
+    state.gateRecordAnchor(.{ .proto = &proto, .pc = 2, .proto_id = proto.id }, .record_abort);
     state.afterBackEdge(&proto, 2);
     try testing.expect(state.skipBackEdge(&proto, 2));
 

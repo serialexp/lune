@@ -239,7 +239,7 @@ fn publishFake(vm: *Vm, proto: *const Proto, pc: u32, consts: []const Value) !*t
         k += 1;
     }
     t.code = .{
-        .anchor = .{ .proto = proto, .pc = pc },
+        .anchor = .{ .proto = proto, .pc = pc, .proto_id = proto.id },
         .instrs = try gpa.alloc(trace.IrInstr, 0),
         .consts = try gpa.dupe(Value, consts),
         .heap_consts = heap_consts,
@@ -272,8 +272,8 @@ test "phase Q: a collection retires exactly the traces naming a dying constant, 
     const id3 = t3.id;
     const id4 = t4.id;
 
-    const a0: trace.AnchorKey = .{ .proto = &proto, .pc = 0 };
-    const a1: trace.AnchorKey = .{ .proto = &proto, .pc = 1 };
+    const a0: trace.AnchorKey = .{ .proto = &proto, .pc = 0, .proto_id = proto.id };
+    const a1: trace.AnchorKey = .{ .proto = &proto, .pc = 1, .proto_id = proto.id };
     try vm.trace.counters.put(gpa, a0, 99);
     try vm.trace.counters.put(gpa, a1, 99);
 
@@ -348,7 +348,7 @@ test "phase Q: an uncompiled trace whose constant dies retires before a lazy com
     try testing.expect(vm.heap.internedLookup("phaseq-lazy-dead") == null);
     try testing.expect(vm.trace.traceById(doomed_id) == null);
     try testing.expectEqual(survivor, vm.trace.findTrace(&proto, 0).?);
-    try testing.expectEqual(@as(usize, 1), vm.trace.countTracesAt(.{ .proto = &proto, .pc = 0 }));
+    try testing.expectEqual(@as(usize, 1), vm.trace.countTracesAt(.{ .proto = &proto, .pc = 0, .proto_id = proto.id }));
     try testing.expect(survivor.native == .unattempted);
 }
 
@@ -437,7 +437,7 @@ test "phase Q: the trial walk's dead list retires once — a second retire is a 
 fn stubTrace(slots: []usize, linked_entry: usize) trace.Trace {
     return .{
         .code = .{
-            .anchor = .{ .proto = undefined, .pc = 7 }, // loop-kind pc: the arm funnel reads anchorKind()
+            .anchor = .{ .proto = undefined, .pc = 7, .proto_id = 0 }, // loop-kind pc: the arm funnel reads anchorKind()
             .instrs = &.{},
             .consts = &.{},
             .entry_slots = &.{},
@@ -518,7 +518,7 @@ test "phase Q: a side recording whose parent retires mid-recording commits witho
     try startFakeRecording(&vm, &proto);
     vm.trace.rec.side_src = src;
     _ = try vm.trace.rec.konst(Value.int(5));
-    vm.trace.wants_side_trace = .{ .proto = &proto, .pc = 0 };
+    vm.trace.wants_side_trace = .{ .proto = &proto, .pc = 0, .proto_id = proto.id };
     vm.trace.side_want_src = src;
 
     vm.collect();
@@ -586,7 +586,7 @@ test "phase Q: a side recording over a retired parent finalizes for real (progra
 // ---------------------------------------------------------------------------
 
 fn startFakeRecording(vm: *Vm, proto: *const Proto) !void {
-    try vm.trace.rec.reset(vm.trace.gpa, .{ .proto = proto, .pc = 0 }, 1);
+    try vm.trace.rec.reset(vm.trace.gpa, .{ .proto = proto, .pc = 0, .proto_id = proto.id }, 1);
     vm.trace.syncRecordingBit();
 }
 
@@ -793,7 +793,7 @@ fn startPeelRecording(vm: *Vm, proto: *const Proto, dying: Value) !*trace.Trace 
 }
 
 fn armPeelRecording(vm: *Vm, proto: *const Proto, inner: *const trace.Trace) !void {
-    try vm.trace.rec.reset(vm.trace.gpa, .{ .proto = proto, .pc = 0 }, 8);
+    try vm.trace.rec.reset(vm.trace.gpa, .{ .proto = proto, .pc = 0, .proto_id = proto.id }, 8);
     vm.trace.rec.kind = .side;
     vm.trace.syncRecordingBit();
     vm.trace.rec.context.inner_root = true;
