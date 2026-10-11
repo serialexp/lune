@@ -58,7 +58,7 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 
 ## A guest callback slows the host-calling loop that follows it (noted 2026-10-11)
 
-- [ ] **After one host call that runs a long guest loop, the calling loop
+- [x] **After one host call that runs a long guest loop, the calling loop
       runs more instructions for the rest of the run, and how many more
       varies between identical runs.** Doc 63 Phase 0's `nest` and `nestq`
       shapes (`bench/embed/tracecall_probe.c`) are the same loop except
@@ -102,9 +102,18 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       one `proto.id` load per key construction; an instruction A/B over
       all 30 benches against best-of-3 ASLR layouts of HEAD runs −0.08% to
       +0.53% (euler14-bit; callgrind on an x86_64_v3 build puts it at
-      +0.14%, ~1 instruction per probe). Still open: `nest` − `nestq` at
-      N = 1,000,000 is a stable 3.19 M: the call (1.60 M) plus a
-      deterministic 1.59 M residue, unexplained.
+      +0.14%, ~1 instruction per probe). **Residue explained (2026-10-11),
+      not a callback effect:** `nest` − `nestq` grows ~1.49 instructions
+      per iteration after the call (3.10 M at N = 1 M, 4.59 M at 2 M).
+      callgrind: both shapes take the gated loop's slow path equally often
+      (~15.5 k times, once per `GATE_SKIP` + 1 back-edges), but in `nest`
+      each visit costs ~110 more instructions in the hash probes of
+      `backEdgeEpilogue`, `onBackEdge` and `afterBackEdge`. `nestq`'s VM
+      never holds a trace, so its tiering maps stay empty and hit their
+      `count() == 0` early outs; after `work(100000)` is traced they don't.
+      That's the normal state of any program with a trace, so `nestq` is
+      the unrealistically cheap baseline. The loop is gated only because
+      it can't trace a host call yet (doc 63).
 
 ## Global-read slow path leaves via a volatile `var` pointer (noted 2026-10-05)
 
