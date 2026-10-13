@@ -2,6 +2,26 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Vendor bundle leftovers (noted 2026-10-13)
+
+- [ ] **`mahina-sys`'s zig fallback ignores cargo's `TARGET`.** Without
+      `MAHINA_PREBUILT_ROOT`/`MAHINA_LIB_DIR`, `build.rs` runs `zig build lib`
+      with no `-Dtarget`. A `cargo build --target <other>` inside lune links
+      a host-arch archive and fails at the link. The Rust→zig triple map
+      already exists in `tools/mahina-bundle.sh` (`TARGETS`), so the fallback
+      could pass the mapped `-Dtarget`. Pre-existing; the bundle path is
+      unaffected.
+- [ ] **`just bundle-smoke` legs that this machine SKIPs.** aarch64 Linux
+      links but can't run without `qemu-aarch64` (`qemu-user-static`).
+      Windows needs `cargo-xwin` (it downloads the MSVC CRT + SDK under
+      Microsoft's licence) plus `rustup target add aarch64-pc-windows-msvc`,
+      and wine for the x86-64 run. Darwin needs an Apple SDK (osxcross).
+      Each needs Bart's go-ahead: a sudo install, a licence acceptance, or
+      an SDK he supplies.
+- [ ] **aarch64-windows `SelfInfo` opt-out in `capi.zig`.** Drop it once the
+      pinned Zig's `std/debug/SelfInfo/Windows.zig` compiles for aarch64.
+      Until then a panic there prints unsymbolised addresses.
+
 ## Keyframes dereference garbage closures' protos (noted 2026-10-11, needs Bart)
 
 - [ ] **Doc 61 Phase K's whole heap reaches closures whose proto may be

@@ -1,35 +1,92 @@
-//! Build libmahina via the repo's `zig build lib` (doc 59 §3.8).
+//! Link libmahina (doc 59 §3.8). Three sources, checked in this order:
 //!
-//! - `MAHINA_LIB_DIR=<dir>`: skip the zig build and link a prebuilt
-//!   `libmahina.a` from that directory.
-//! - `ZIG=<path>`: which zig to invoke (default: `zig` from PATH). Its
-//!   version is checked against the repo's `.zig-version` and a mismatch
-//!   fails loudly (the stdlib is a moving target — a stray toolchain would
-//!   produce mystery miscompiles, Rule Z-1).
-//! - Cargo `PROFILE` maps to the zig optimize mode (`debug` → `Debug`,
-//!   everything else → `ReleaseFast`).
-//! - The zig local cache and install prefix live under `OUT_DIR`, so cargo
-//!   builds never fight a developer's `zig build` in the repo (and vice
-//!   versa).
+//! - `MAHINA_PREBUILT_ROOT=<dir>`: link the prebuilt archive for cargo's
+//!   `TARGET` from `<dir>/<TARGET>/` (`libmahina.a`, or `mahina.lib` on MSVC)
+//!   — the layout of the vendor bundle's `lib/` (tools/mahina-bundle.sh).
+//!   Never invokes zig; a target without an archive is a hard error, not a
+//!   fallback to building one.
+//! - `MAHINA_LIB_DIR=<dir>`: link the archive in that single directory.
+//! - Neither: build it with the repo's `zig build lib`. Needs this crate to
+//!   sit in a lune checkout (`<repo>/embed/rust/mahina-sys`); a bundled copy
+//!   must use one of the variables above.
+//!   - `ZIG=<path>`: which zig to invoke (default: `zig` from PATH). Its
+//!     version is checked against the repo's `.zig-version` and a mismatch
+//!     fails loudly (the stdlib is a moving target — a stray toolchain would
+//!     produce mystery miscompiles, Rule Z-1).
+//!   - Cargo `PROFILE` maps to the zig optimize mode (`debug` → `Debug`,
+//!     everything else → `ReleaseFast`).
+//!   - The zig local cache and install prefix live under `OUT_DIR`, so cargo
+//!     builds never fight a developer's `zig build` in the repo (and vice
+//!     versa).
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    // Prebuilt override: trust the directory, link, done.
-    if let Ok(dir) = env::var("MAHINA_LIB_DIR") {
-        println!("cargo:rustc-link-search=native={dir}");
-        println!("cargo:rustc-link-lib=static=mahina");
-        println!("cargo:rerun-if-env-changed=MAHINA_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=MAHINA_PREBUILT_ROOT");
+    println!("cargo:rerun-if-env-changed=MAHINA_LIB_DIR");
+
+    let target = env::var("TARGET").unwrap();
+    let archive_name = if target.ends_with("-msvc") { "mahina.lib" } else { "libmahina.a" };
+
+    // Prebuilt bundle: one directory per Rust target triple.
+    if let Some(root) = env::var_os("MAHINA_PREBUILT_ROOT") {
+        let dir = PathBuf::from(&root).join(&target);
+        let archive = dir.join(archive_name);
+        if !archive.is_file() {
+            panic!(
+                "no prebuilt libmahina for this target: {target} \
+                 (expected {} under MAHINA_PREBUILT_ROOT={})",
+                archive.display(),
+                Path::new(&root).display(),
+            );
+        }
+        link_prebuilt(&dir, &archive);
         return;
     }
 
+    // Prebuilt single directory: trust it, link, done.
+    if let Some(dir) = env::var_os("MAHINA_LIB_DIR") {
+        let dir = PathBuf::from(dir);
+        let archive = dir.join(archive_name);
+        if !archive.is_file() {
+            panic!(
+                "MAHINA_LIB_DIR={} has no {archive_name} for target {target}",
+                dir.display()
+            );
+        }
+        link_prebuilt(&dir, &archive);
+        return;
+    }
+
+    build_with_zig();
+}
+
+/// Link a prebuilt archive, and rebuild whenever the archive itself changes
+/// (a refreshed bundle under an unchanged variable must still relink).
+fn link_prebuilt(dir: &Path, archive: &Path) {
+    println!("cargo:rustc-link-search=native={}", dir.display());
+    println!("cargo:rustc-link-lib=static=mahina");
+    println!("cargo:rerun-if-changed={}", archive.display());
+}
+
+fn build_with_zig() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    // mahina-sys -> rust -> embed -> repo root. Verified, not assumed: a copy
+    // of this crate outside lune (the vendor bundle) has no repo above it.
     let repo_root = manifest
         .ancestors()
-        .nth(3) // mahina-sys -> rust -> embed -> repo root
-        .expect("mahina-sys must live at <repo>/embed/rust/mahina-sys")
+        .nth(3)
+        .filter(|root| root.join("build.zig").is_file() && root.join(".zig-version").is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "mahina-sys at {} is not inside a lune checkout (<repo>/embed/rust/mahina-sys), \
+                 so it cannot build libmahina with zig. Set MAHINA_PREBUILT_ROOT=<bundle>/lib \
+                 (one <rust-target-triple>/ directory per target) or MAHINA_LIB_DIR=<dir>.",
+                manifest.display()
+            )
+        })
         .to_path_buf();
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
@@ -80,5 +137,4 @@ fn main() {
         println!("cargo:rerun-if-changed={}", repo_root.join(f).display());
     }
     println!("cargo:rerun-if-env-changed=ZIG");
-    println!("cargo:rerun-if-env-changed=MAHINA_LIB_DIR");
 }

@@ -63,7 +63,7 @@ pub const ExecPage = struct {
     /// Reinterpret the code base as a C-ABI function pointer of type `Fn`.
     /// Caller guarantees the emitted code matches `Fn`'s signature.
     pub fn entry(self: ExecPage, comptime Fn: type) *const Fn {
-        return @ptrCast(self.code.ptr);
+        return @ptrCast(@alignCast(self.code.ptr));
     }
 
     pub fn deinit(self: *ExecPage) void {

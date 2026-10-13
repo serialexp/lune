@@ -80,6 +80,21 @@ shadow dest:
 lib:
     zig build lib
 
+# The vendor bundle (tools/mahina-bundle.sh): stripped, PIC libmahina archives
+# for every supported Rust target, keyed by Rust triple, plus mahina.h, the
+# Rust binding crates, LUNE_COMMIT/ZIG_VERSION and SHA256SUMS. Downstream
+# links it with MAHINA_PREBUILT_ROOT=<out>/lib and needs no zig.
+bundle out="zig-out/mahina-bundle":
+    bash tools/mahina-bundle.sh "{{out}}"
+
+# Smoke-check a bundle the way a consumer uses it (tools/bundle-smoke.sh): a
+# minimal Rust crate on its rust/mahina, MAHINA_PREBUILT_ROOT, no zig on PATH,
+# one VM lifecycle per target (native, qemu-aarch64, wine), plus the
+# musl-archive-in-gnu-binary and PIC relocation checks. Deliberate, not part
+# of `just test`: it needs cross linkers and runners (missing ones are SKIPs).
+bundle-smoke bundle="zig-out/mahina-bundle" *targets:
+    bash tools/bundle-smoke.sh "{{bundle}}" {{targets}}
+
 # The embedding gate (doc 59 E4): the Zig test gate plus the Rust workspace
 # under embed/rust (whose build.rs runs `zig build lib` itself, so this also
 # proves the cargo→zig build path end to end).

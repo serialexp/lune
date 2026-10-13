@@ -104,12 +104,19 @@ pub fn build(b: *std.Build) void {
     // any C program) links against. Static first (no soname story); needs libc
     // (the exports allocate through malloc).
     //
-    // Doc 60 §6.3: the build-acceptance harness (tools/hostcall-acceptance.sh)
-    // links the archive into a shared library and a PIE, so it builds it
-    // position-independent; its frame-pointer unwinding walks also need every
+    // Position-independent by default on every target: the archive's consumers
+    // link it into PIEs (rustc's default) and shared libraries (doc 60 §6.3's
+    // acceptance harness), and zig's static-musl default is non-PIC, whose
+    // R_X86_64_32 relocations a PIE link rejects. `-Dlib-pic=false` opts out.
+    // The pic and strip settings set here on the root module govern the whole
+    // compilation unit, the imported `mahina` module included.
+    // The acceptance harness's frame-pointer unwinding walks also need every
     // library frame to keep rbp. Unwind tables are always async (§3.3: the
     // DWARF walks rely on them).
-    const lib_pic = b.option(bool, "lib-pic", "Build libmahina position-independent (doc 60 §6.3 acceptance)");
+    // `-Dlib-strip=true` drops debug info: the vendor bundle
+    // (tools/mahina-bundle.sh) ships stripped archives.
+    const lib_pic = b.option(bool, "lib-pic", "Build libmahina position-independent (default true)") orelse true;
+    const lib_strip = b.option(bool, "lib-strip", "Build libmahina without debug info (the vendor bundle does)");
     const lib_frame_pointers = b.option(bool, "lib-frame-pointers", "Keep frame pointers in libmahina (doc 60 §6.3 acceptance)") orelse false;
     const capi_mod = b.createModule(.{
         .root_source_file = b.path("src/capi.zig"),
@@ -117,6 +124,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
         .pic = lib_pic,
+        .strip = lib_strip,
         .unwind_tables = .async,
         .omit_frame_pointer = if (lib_frame_pointers) false else null,
         .imports = &.{

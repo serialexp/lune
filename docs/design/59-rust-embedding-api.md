@@ -178,6 +178,34 @@ land; move whole phases to Done once everything inside them is checked.
   (`max_host_results`), also when the caller wants every result, so the
   stack is sized for the deepest nesting `max_native_reentry` allows.
   Regression tests are in `capi_test.zig`.
+- [x] **Vendor bundle** (2026-10-13, at gothab's request: link mahina into
+  `gt` on every release target, with no zig in the consumer's build).
+  `just bundle [out]` (`tools/mahina-bundle.sh`) writes `LUNE_COMMIT`
+  (`-dirty` when the tree isn't clean), `ZIG_VERSION`, `include/mahina.h`,
+  `rust/{mahina,mahina-sys}` and `SHA256SUMS`, plus one archive per Rust
+  target triple under `lib/<triple>/`: x86-64 and aarch64 for linux-musl,
+  linux-gnu (glibc 2.17), apple-darwin (macOS 10.12 / 11.0) and
+  pc-windows-msvc. These floors are the Rust targets' own. Every archive is
+  ReleaseFast, PIC and stripped, 1.7–2.5 MB. Linux ships both gnu and
+  musl archives because a musl archive is not libc-agnostic: aarch64
+  `pthread_attr_t` is 56 bytes in musl and 64 in glibc, and the musl build
+  calls glibc ≥2.28 symbols. Builds are byte-reproducible across checkout
+  paths: each archive is re-packed with plain member names. `mahina-sys`
+  gained `MAHINA_PREBUILT_ROOT=<dir>`, which links
+  `<dir>/$TARGET/libmahina.a` (`mahina.lib` on MSVC) and never invokes zig.
+  A missing target is a hard error. The crate reruns when the archive
+  changes, and outside a lune checkout without either variable it fails
+  with a clear message. The build changes behind it: `zig build lib` is now
+  PIC by default (`-Dlib-pic`; zig's static-musl default was non-PIC), a
+  new `-Dlib-strip` option, aarch64 compiles (an `@alignCast` in
+  `nativegen_mcode.zig`), and aarch64-windows opts out of `std.debug.SelfInfo`
+  (the pinned std's Windows module doesn't compile there; see `capi.zig`).
+  `just bundle-smoke` (`tools/bundle-smoke.sh`) builds a minimal consumer
+  crate per target with no zig reachable and runs one VM lifecycle. It also
+  links the x86-64 musl archive into a gnu binary and checks for absolute
+  32-bit relocations. On a host without the cross runners, aarch64
+  (qemu-aarch64), Windows (cargo-xwin, wine) and macOS (SDK) are reported
+  as SKIPs.
 ### Outstanding
 
 - [ ] **E6 — host-call record/replay.** Defer. v1 refuses `.record` AND
@@ -535,7 +563,8 @@ degrades to a static message, never to a dirty VM. Structured diagnostics
 - **`embed/rust/`** — a cargo workspace (in-repo; a separate repo can come
   with publishing, not before):
   - `mahina-sys`: hand-written extern decls. `build.rs`: honour
-    `MAHINA_LIB_DIR` (prebuilt) else invoke zig at the repo root — the zig
+    `MAHINA_PREBUILT_ROOT` (the vendor bundle's per-Rust-triple `lib/`) or
+    `MAHINA_LIB_DIR` (one prebuilt directory) else invoke zig at the repo root — the zig
     binary from `$ZIG` if set, else `zig` from PATH with its version checked
     against `.zig-version` (fail loudly on drift, Rule Z-1 / antigravity
     #7); map Cargo `PROFILE` → `-Doptimize=` (`debug`→`Debug`,

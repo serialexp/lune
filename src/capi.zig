@@ -103,6 +103,17 @@ comptime {
 pub var hostcall_counts: if (builtin.is_test) struct { slow: usize = 0, chain: usize = 0 } else void =
     if (builtin.is_test) .{} else {};
 
+/// Root override of `std.debug.SelfInfo`. On aarch64-windows the pinned
+/// toolchain's `std/debug/SelfInfo/Windows.zig` does not compile (a `@ptrCast`
+/// of a `*anyopaque` to a 4-aligned fn pointer without `@alignCast`), so that
+/// one target opts out of self-symbolisation: a panic there prints raw return
+/// addresses instead of symbolised frames. Every other target keeps std's
+/// default (std only consults `root.debug.SelfInfo` when the decl exists).
+/// Drop this once the pinned Zig carries the upstream fix.
+pub const debug = if (builtin.os.tag == .windows and builtin.cpu.arch == .aarch64) struct {
+    pub const SelfInfo = void;
+} else struct {};
+
 // The static library is linked by a foreign toolchain (cc, rustc), so it must
 // supply `__zig_probe_stack` — the x86 stack-probe routine LLVM calls for
 // frames larger than a page — itself. It must NOT bundle the rest of Zig's
