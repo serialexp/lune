@@ -14,7 +14,7 @@ your training data about it is stale — function names, signatures, the whole
 `std.Io` writer/reader model, build-system APIs, and `std.fmt` have all churned
 and will keep churning. **Before you call or depend on any stdlib API, confirm
 what it actually is in the pinned toolchain.** Read the source under
-`$(dirname $(readlink -f $(which zig)))/../lib/std/` (or wherever `.zig-version`
+`$(dirname $(readlink -f $(which zig)))/lib/std/` (or wherever `.zig-version`
 resolves to) and check the real signature, fields, and behaviour. `zig init` is
 the source of truth for current `build.zig`/`build.zig.zon` shape.
 
