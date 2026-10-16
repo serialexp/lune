@@ -178,8 +178,8 @@ land; move whole phases to Done once everything inside them is checked.
   (`max_host_results`), also when the caller wants every result, so the
   stack is sized for the deepest nesting `max_native_reentry` allows.
   Regression tests are in `capi_test.zig`.
-- [x] **Vendor bundle** (2026-10-13, at gothab's request: link mahina into
-  `gt` on every release target, with no zig in the consumer's build).
+- [x] **Vendor bundle** (2026-10-13: lets a downstream Rust project vendor
+  prebuilt libmahina for every release target, with no zig in its build).
   `just bundle [out]` (`tools/mahina-bundle.sh`) writes `LUNE_COMMIT`
   (`-dirty` when the tree isn't clean), `ZIG_VERSION`, `include/mahina.h`,
   `rust/{mahina,mahina-sys}` and `SHA256SUMS`, plus one archive per Rust
