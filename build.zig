@@ -2,9 +2,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 // The toolchain we pin to. Mirrors `.minimum_zig_version` in build.zig.zon and
-// the `.zig-version` file. Architecture principle #4/#5: we ride a `-dev` Zig
+// the `.zig-version` file. Architecture principle #4/#5: we pin one exact Zig
 // and must catch drift loudly rather than discover it as a mystery miscompile.
-const pinned_zig_version = "0.17.0-dev.813+2153f8143";
+const pinned_zig_version = "0.17.0";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -44,6 +44,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // Keeps std's stack unwinder out of JIT code (src/jit_unwind.zig): the
+    // registry `nativegen_mcode.zig` records executable mappings in, and the
+    // `debug.SelfInfo` every root we own installs. Its own module, so the
+    // test runner (tests/test_runner.zig) reaches the same registry.
+    const jit_unwind_mod = b.createModule(.{
+        .root_source_file = b.path("src/jit_unwind.zig"),
+        .target = target,
+    });
+
     // The library module: the VM core, importable by consumers and by tests.
     const mod = b.addModule("mahina", .{
         .root_source_file = b.path("src/root.zig"),
@@ -51,6 +60,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "binschema", .module = binschema_mod },
             .{ .name = "build_options", .module = build_opts_mod },
+            .{ .name = "jit_unwind", .module = jit_unwind_mod },
         },
     });
 
@@ -85,17 +95,36 @@ pub fn build(b: *std.Build) void {
     // `zig build test` — run unit tests from both the library and the CLI module.
     // `-Dtest-filter=<substr>` narrows to matching test names (repeatable).
     const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose names match the filter") orelse &.{};
-    const mod_tests = b.addTest(.{ .root_module = mod, .filters = test_filters });
+    // Every test binary runs tests/test_runner.zig: std's runner plus the
+    // jit_unwind `debug.SelfInfo`. A runner sees only the imports of the
+    // module under test, hence `runner.addImports`.
+    const runner: MahinaTestRunner = .{
+        .path = b.path("tests/test_runner.zig"),
+        .std_runner = b.createModule(.{
+            .root_source_file = b.graph.path(.zig_lib, "compiler/test_runner.zig"),
+            .target = target,
+        }),
+        .jit_unwind = jit_unwind_mod,
+    };
+    runner.addImports(mod);
+    const mod_tests = b.addTest(.{ .root_module = mod, .filters = test_filters, .test_runner = runner.config() });
     mod_tests.use_llvm = true; // tail-call smoke test needs LLVM (see above)
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
-    const exe_tests = b.addTest(.{ .root_module = exe.root_module, .filters = test_filters });
+    runner.addImports(exe.root_module);
+    const exe_tests = b.addTest(.{ .root_module = exe.root_module, .filters = test_filters, .test_runner = runner.config() });
     exe_tests.use_llvm = true; // ditto
     const run_exe_tests = b.addRunArtifact(exe_tests);
+
+    // jit_unwind's own tests (registry + wrapper): std's plain runner, since
+    // they exercise the wrapper directly rather than through std.debug.
+    const jit_unwind_tests = b.addTest(.{ .root_module = jit_unwind_mod, .filters = test_filters });
+    const run_jit_unwind_tests = b.addRunArtifact(jit_unwind_tests);
 
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_jit_unwind_tests.step);
 
     // --- embedding C ABI (doc 59) -------------------------------------------
     //
@@ -140,7 +169,7 @@ pub fn build(b: *std.Build) void {
     // is the same function of the optimize mode, and creating a VM
     // (`capi.createVm`) verifies the two agree.
     if (@import("src/asm/target.zig").hostcallEntry(&target.result)) {
-        const safety = optimize == .Debug or optimize == .ReleaseSafe;
+        const safety = optimize == .debug or optimize == .safe;
         capi_mod.addCSourceFile(.{
             .file = b.path("src/asm/hostcall_x64.S"),
             .language = .assembly_with_preprocessor,
@@ -165,7 +194,8 @@ pub fn build(b: *std.Build) void {
     lib_step.dependOn(&install_capi_lib.step);
 
     // capi unit tests (src/capi_test.zig) ride the normal test gate.
-    const capi_tests = b.addTest(.{ .root_module = capi_mod, .filters = test_filters });
+    runner.addImports(capi_mod);
+    const capi_tests = b.addTest(.{ .root_module = capi_mod, .filters = test_filters, .test_runner = runner.config() });
     capi_tests.use_llvm = true;
     const run_capi_tests = b.addRunArtifact(capi_tests);
     test_step.dependOn(&run_capi_tests.step);
@@ -194,7 +224,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{
                 .{ .name = "mahina", .module = mod },
             },
@@ -213,7 +243,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench_topology.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{
                 .{ .name = "mahina", .module = mod },
             },
@@ -232,7 +262,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench_retire.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{
                 .{ .name = "mahina", .module = mod },
             },
@@ -251,7 +281,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench_gcwalk.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{
                 .{ .name = "mahina", .module = mod },
             },
@@ -270,7 +300,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench_keyframe.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{
                 .{ .name = "mahina", .module = mod },
             },
@@ -345,6 +375,24 @@ pub fn build(b: *std.Build) void {
     //      execute freestanding-wasm tests without a WASI shim + runtime.
 }
 
+/// tests/test_runner.zig and the two modules it imports from the module under
+/// test.
+const MahinaTestRunner = struct {
+    path: std.Build.LazyPath,
+    std_runner: *std.Build.Module,
+    jit_unwind: *std.Build.Module,
+
+    fn config(r: MahinaTestRunner) std.Build.Step.Compile.TestRunner {
+        return .{ .path = r.path, .mode = .server };
+    }
+
+    /// A tested module must import what the runner imports.
+    fn addImports(r: MahinaTestRunner, m: *std.Build.Module) void {
+        m.addImport("std_test_runner", r.std_runner);
+        if (m.import_table.get("jit_unwind") == null) m.addImport("jit_unwind", r.jit_unwind);
+    }
+};
+
 /// Compare the compiler driving this build script against the pinned toolchain.
 /// Warns by default; hard-fails when `enforce` is set.
 fn checkZigVersion(enforce: bool) void {
@@ -355,7 +403,7 @@ fn checkZigVersion(enforce: bool) void {
     if (enforce) {
         std.debug.panic(
             "mahina pins Zig {s} but the active toolchain is {f}. " ++
-                "Install the pinned `-dev` build (see .zig-version) or drop -Denforce-zig-version.",
+                "Install the pinned build (see .zig-version) or drop -Denforce-zig-version.",
             .{ pinned_zig_version, active },
         );
     } else {

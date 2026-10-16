@@ -540,8 +540,9 @@ retrofitting it later means redoing the hardest part of the system.
    uses threaded dispatch. This is a real constraint, not a footnote: dropping
    to the self-hosted backend (faster Debug builds) is blocked until it learns
    tail calls. Re-check on each toolchain bump.
-5. **Keep a clean C-ABI escape hatch.** Zig is pre-1.0 and we're pinning a
-   `-dev` build. The hedge: Zig speaks and compiles C natively, so a clean
+5. **Keep a clean C-ABI escape hatch.** Zig is pre-1.0 and we pin one exact
+   build (a `-dev` snapshot until 2026-10, the 0.17.0 release since). The
+   hedge: Zig speaks and compiles C natively, so a clean
    C-ABI surface means worst-case we retreat toward C incrementally rather than
    rewrite. **Vendor** the exact toolchain (not just `.zig-version`) and enforce
    it in CI; keep compiler upgrades in a separate CI lane; treat them as

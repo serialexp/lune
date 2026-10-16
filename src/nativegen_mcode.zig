@@ -11,6 +11,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const x64 = @import("x64.zig");
+/// Every executable mapping is registered there while it is mapped, so std's
+/// stack unwinder never searches its modules for a JIT PC.
+const jit_unwind = @import("jit_unwind");
 
 /// True only where we can actually emit and run native code.
 pub const is_x64_linux = builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux;
@@ -68,7 +71,10 @@ pub const ExecPage = struct {
 
     pub fn deinit(self: *ExecPage) void {
         switch (self.owner) {
-            .owned => |mem| if (comptime is_x64_linux) std.posix.munmap(mem),
+            .owned => |mem| if (comptime is_x64_linux) {
+                jit_unwind.unregister(mem);
+                std.posix.munmap(mem);
+            },
             .arena => |slot| slot.arena.free(slot.region, slot.offset, slot.cap, slot.generation),
         }
         self.* = undefined;
@@ -108,6 +114,7 @@ pub fn mapExecutable(code: []const u8) MapError!ExecPage {
         else => return error.MprotectFailed,
     }
 
+    jit_unwind.register(mem);
     return .{ .code = mem[0..code.len], .owner = .{ .owned = mem } };
 }
 
@@ -229,7 +236,10 @@ pub const McodeArena = struct {
 
     pub fn deinit(self: *McodeArena) void {
         if (comptime is_x64_linux) {
-            for (self.regions.items) |r| std.posix.munmap(r.mem);
+            for (self.regions.items) |r| {
+                jit_unwind.unregister(r.mem);
+                std.posix.munmap(r.mem);
+            }
         }
         self.regions.deinit(self.gpa);
         self.free_list.deinit(self.gpa);
@@ -284,6 +294,7 @@ pub const McodeArena = struct {
         ) catch return error.MmapFailed;
         errdefer std.posix.munmap(mem);
         try self.regions.append(self.gpa, .{ .mem = mem, .used = 0 });
+        jit_unwind.register(mem);
         return &self.regions.items[self.regions.items.len - 1];
     }
 

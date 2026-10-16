@@ -23,13 +23,12 @@
 //! Compiled only on targets that build the entry (`target.hostcallEntry`),
 //! imported from `capi.zig`, in every optimize mode.
 //!
-//! **Safety-dependent layout.** `std`'s hash maps carry a `SafetyLock`, one
-//! byte when `std.debug.runtime_safety` is on (Debug, ReleaseSafe) and empty
-//! otherwise, which padding turns into 8 more bytes per map. `TraceState`
-//! holds dozens of them, so `fast_block` and
-//! the `Vm` fields Zig places after `trace` sit at different offsets in the
-//! two kinds of build. The file therefore has a shared section plus two
-//! blocks:
+//! **Safety-dependent layout.** `std`'s hash maps and array lists carry a
+//! `SafetyLock`, a word when `std.debug.runtime_safety` is on (Debug,
+//! ReleaseSafe) and empty otherwise. `Vm` and `TraceState` hold dozens of
+//! them, so `trace`, `fast_block` and most `Vm` fields sit at different
+//! offsets in the two kinds of build. The file therefore has a shared
+//! section plus two blocks:
 //!
 //!     #if MAHINA_RUNTIME_SAFETY
 //!     .set NAME, N      // Debug and ReleaseSafe
@@ -329,7 +328,7 @@ pub fn verifySliceLayout() bool {
     var a: []u8 = bytes[0..3];
     var b: []u64 = words[0..2];
     var c: []Value = vals[0..4];
-    var list: ParkList = .{ .items = vals[1..3], .capacity = 3 };
+    var list: ParkList = .{ .items = vals[1..3], .capacity = 3, .pointer_stability = .{} };
     _ = .{ &a, &b, &c, &list };
     return sliceWordsMatch(&a) and sliceWordsMatch(&b) and sliceWordsMatch(&c) and sliceWordsMatch(&list.items);
 }

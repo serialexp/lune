@@ -13,7 +13,7 @@
 
     // The exact toolchain we pin to. `.zig-version` mirrors this for the
     // version-manager / CI guard in build.zig. Keep the two in sync.
-    .minimum_zig_version = "0.17.0-dev.813+2153f8143",
+    .minimum_zig_version = "0.17.0",
 
     // No third-party dependencies yet. A VM core deliberately writes its own
     // allocator and data structures (architecture principle #4).

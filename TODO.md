@@ -16,39 +16,29 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       GitHub mirror (2026-10-16): every target builds and runs natively there
       under `--strict`. Locally they stay SKIPs unless qemu-user-static,
       cargo-xwin + wine, or an Apple SDK are installed.
-- [ ] **aarch64-windows `SelfInfo` opt-out in `capi.zig`.** Drop it once the
-      pinned Zig's `std/debug/SelfInfo/Windows.zig` compiles for aarch64.
-      Until then a panic there prints unsymbolised addresses. Still broken in
-      the 0.17.0 release (the file is identical).
+- [ ] **aarch64-windows `SelfInfo` opt-out** (`TargetSelfInfo` in
+      `src/jit_unwind.zig`). Drop it once the pinned Zig's
+      `std/debug/SelfInfo/Windows.zig` compiles for aarch64. Until then a
+      panic there prints unsymbolised addresses. Still broken in the 0.17.0
+      release (the file is identical).
 
-## Switch to the Zig 0.17.0 release (noted 2026-10-16, needs Bart)
+## Zig std unwinder vs JIT code (noted 2026-10-16, needs Bart)
 
-- [ ] **Blocked on a std unwinder trap, decision pending.** The port is done
-      and saved as `~/.cache/lune/zig-0.17.0-port.patch` (`git apply`):
-      - the pin, in `.zig-version`, `build.zig`, `build.zig.zon` and both
-        workflows (official sha256 `1cbe9df9…2026`);
-      - `std.lang.Optimize`'s new `.debug/.safe/.fast` fields;
-      - `ArrayList`'s new `pointer_stability` field;
-      - the regenerated `offsets_x64.inc`: `SafetyLock` is now a word and
-        array lists carry one, so `VM_TRACE` moved into the per-mode blocks.
-      With it, lib, capi and smoke pass, and 1698/1700 tests pass. The 2
-      SIGKILLs are the OOM killer: `string helper OOM native` alone went
-      from 0.97s / 11 MB on dev.813 to 1m44 / 5.6 GB.
-      **Cause.** `SafeAllocator`, which is both `testing.allocator` and the
-      CLI's Debug/ReleaseSafe `init.gpa`, captures a trace per allocation.
-      At a JIT PC, `SelfInfo/Elf.zig` `findModule` misses and now
-      `@memset`s the unwind cache (new since dev.813, still on Codeberg
-      master). So every allocation from a JIT helper re-parses and sorts
-      the binary's whole `.eh_frame`.
-      **Options (Bart to pick).**
-      1. Wrap std's ELF SelfInfo at our roots (CLI, `capi.zig`, a custom
-         test runner): answer `MissingDebugInfo` for PCs in the JIT's
-         code ranges, which all come from `nativegen_mcode.zig`'s `mmap`.
-         JIT frames have no rbp chain (rbp is an allocatable home), so the
-         trace ends there, as it effectively did before.
-      2. `stack_trace_frames = 0` allocators for native-running tests.
-      3. Stay on dev.813 and report the regression upstream.
-      4. Carry a patched std.
+- [ ] **Upstream report, if wanted (outward-facing, so Bart's call).** A
+      stack-trace walk that reaches a PC outside every loaded module (any
+      JIT) makes std's ELF `SelfInfo.findModule` rebuild its module list.
+      0.17.0 (and Codeberg master) also `@memset`s the unwind cache, so
+      every such walk re-parses the binary's `.eh_frame`: 1m44 / 5.6 GB for
+      a test that `SafeAllocator`-traces each allocation. dev.813 didn't
+      clear the cache, but its traces came back empty for the rest of the
+      process after the first such PC. mahina no longer depends on either:
+      `src/jit_unwind.zig` answers JIT PCs before std sees them.
+- [ ] **`zig fmt` builtin migration (needs Bart: 73-file mechanical
+      rename, global Rule #6).** 0.17's `zig fmt` rewrites `@intFromEnum`
+      → `@backingInt` and `@enumFromInt(x)` → `@fromBackingInt(@intCast(x))`
+      (641 uses in 73 files), so `zig fmt --check src tests` fails on the
+      pre-existing tree. Nothing gates on fmt yet and the old builtins still
+      compile; new code from the 0.17 switch is fmt-clean.
 
 ## Keyframes dereference garbage closures' protos (noted 2026-10-11, needs Bart)
 

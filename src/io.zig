@@ -1,7 +1,7 @@
 //! The one place that touches `std.Io`'s writer API.
 //!
 //! `std.Io` is the churning frontier of the toolchain (architecture principle
-//! #4), and we pin a `-dev` build — so the *shape* of "get a stdout writer and
+//! #4), and Zig is pre-1.0 — so the *shape* of "get a stdout writer and
 //! print to it" is expected to move under us. Everything that depends on that
 //! shape, plus the `Value` → text rendering, is funnelled through this module.
 //! If a toolchain bump changes the writer API (or we change how a value prints),
@@ -149,6 +149,31 @@ pub fn readFileZ(gpa: std.mem.Allocator, io: Io, path: []const u8) ![:0]u8 {
 /// module. Used by the CLI's `--emit-traces` to drop a serialized trace cache.
 pub fn writeFile(io: Io, path: []const u8, data: []const u8) !void {
     return std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data });
+}
+
+/// The `Io` behind the host primitives below: std's prebuilt single-threaded
+/// instance. Unlike `Io.Threaded.init` it installs no signal handlers, which
+/// matters in libmahina, where the process belongs to the host. Its clock is
+/// stateless and its entropy calls lock internally, so any thread may call
+/// these.
+fn hostIo() Io {
+    if (is_freestanding) @compileError("no host clock or entropy on freestanding");
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+/// The host's monotonic clock in nanoseconds from an unspecified start
+/// (`CLOCK_MONOTONIC` on Linux, `CLOCK_UPTIME_RAW` on macOS, QPC on Windows):
+/// what the CLI and libmahina inject as `Vm.clock_source`.
+pub fn monotonicNs() i64 {
+    return @intCast(std.Io.Clock.awake.now(hostIo()).nanoseconds);
+}
+
+/// Fill `buf` with fresh OS entropy (`getrandom` on Linux), falling back to
+/// std's process CSPRNG if the OS has none to give: what the CLI and
+/// libmahina inject as `Vm.random_seed_source`.
+pub fn hostEntropy(buf: []u8) void {
+    const io = hostIo();
+    std.Io.randomSecure(io, buf) catch std.Io.random(io, buf);
 }
 
 /// Render a `Value` to `w` in a human-readable, debugger-friendly form. The

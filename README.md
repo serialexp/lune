@@ -73,7 +73,7 @@ source. See `bench/README.md` for how to read the board and
 
 ## Build
 
-The Zig toolchain is pinned in `.zig-version` (a `-dev` snapshot; the build
+The Zig toolchain is pinned in `.zig-version` (an exact release; the build
 warns on drift, `just check-version` makes it fatal). `just` recipes are the
 canonical entry points:
 

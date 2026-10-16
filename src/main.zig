@@ -24,6 +24,10 @@
 const std = @import("std");
 const mahina = @import("mahina");
 
+/// std's `SelfInfo` with JIT code kept out of its unwinder: in Debug and
+/// ReleaseSafe `init.gpa` traces every allocation (see `src/jit_unwind.zig`).
+pub const debug = mahina.jit_unwind.debug;
+
 const Diagnostics = mahina.diag.Diagnostics;
 
 const usage =
@@ -555,15 +559,12 @@ fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source:
 }
 
 /// The native monotonic clock backing `clock()`, injected as `Vm.clock_source`.
-/// Linux-only, which is fine here: this is the CLI, the one place a host clock is
-/// chosen. The VM core stays platform-agnostic (it only sees the function pointer).
+/// The VM core stays platform-agnostic (it only sees the function pointer).
 /// `ctx` is unused — the OS clock needs no state — so it points at a throwaway byte.
 var clock_ctx: u8 = 0;
 
 fn nativeClockNs(_: *anyopaque) i64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
+    return mahina.io.monotonicNs();
 }
 
 /// The native seed source backing `random()`, injected as `Vm.random_seed_source`.
@@ -574,9 +575,7 @@ var rng_ctx: u8 = 0;
 
 fn nativeRandomSeed(_: *anyopaque) u64 {
     var bytes: [8]u8 = undefined;
-    // Linux `getrandom(2)` — matches the Linux-only `clock_gettime` above. Blocking
-    // read of 8 bytes of kernel entropy; flags = 0.
-    _ = std.os.linux.getrandom(&bytes, bytes.len, 0);
+    mahina.io.hostEntropy(&bytes);
     return std.mem.readInt(u64, &bytes, .little);
 }
 

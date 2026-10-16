@@ -70,6 +70,11 @@ pub const trace = @import("trace.zig");
 /// Compile-gated live JIT debug logging (`-Djit-debug` + `--jit-debug`).
 pub const jitdbg = @import("jitdbg.zig");
 
+/// Keeps std's stack unwinder out of JIT code: the executable-range registry
+/// and the `debug.SelfInfo` a root installs (`pub const debug =
+/// mahina.jit_unwind.debug;`). Its own module; see `src/jit_unwind.zig`.
+pub const jit_unwind = @import("jit_unwind");
+
 /// Phase 6 — tier-1a trace IR-interpreter (executes recorded traces; deopts to
 /// tier-0 on a guard failure).
 pub const irinterp = @import("irinterp.zig");

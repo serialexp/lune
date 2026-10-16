@@ -9,7 +9,8 @@ lifecycle, determinism, GC/memory, and the snapshot/replay schema.
 
 ### Rule Z-1: Verify the Zig stdlib before relying on it — do not trust memory.
 
-We pin a `-dev` Zig toolchain (`.zig-version`). The stdlib is a moving target and
+We pin an exact Zig toolchain (`.zig-version`, currently the 0.17.0 release).
+Zig is pre-1.0: between pins the stdlib is a moving target and
 your training data about it is stale — function names, signatures, the whole
 `std.Io` writer/reader model, build-system APIs, and `std.fmt` have all churned
 and will keep churning. **Before you call or depend on any stdlib API, confirm
@@ -27,7 +28,18 @@ Concretely:
 - Things already verified the hard way (see `00-architecture.md`): guaranteed
   tail calls are **LLVM-backend only** (`use_llvm = true`); `refAllDeclsRecursive`
   is gone; `**`/array-repeat wants symmetric whitespace; the stdout writer needs
-  an `Io` instance and a stably-addressed `File.Writer`.
+  an `Io` instance and a stably-addressed `File.Writer`; `std.lang.Optimize`'s
+  fields are `.debug`/`.safe`/`.fast`/`.small` (the `.ReleaseFast`-style names
+  are deprecated decls that `==` can't compare against; the `-Doptimize=`
+  strings are unchanged).
+- std's stack unwinder must never see a JIT PC (`src/jit_unwind.zig`: since
+  0.17.0 each one costs a full `.eh_frame` re-parse, and `SafeAllocator`
+  traces every allocation in Debug). Every root we own installs
+  `pub const debug = mahina.jit_unwind.debug;` (`main.zig`, `capi.zig`), and
+  test binaries get it from `tests/test_runner.zig` via `MahinaTestRunner` in
+  `build.zig`. A new executable or test root that can run native code must
+  do the same; executable memory must be mapped through `nativegen_mcode.zig`
+  so it is registered.
 
 ### Rule Z-2: Confine the churning frontier to wrappers.
 

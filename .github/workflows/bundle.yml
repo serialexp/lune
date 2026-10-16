@@ -52,11 +52,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Pinned by .zig-version. ziglang.org garbage-collects old -dev builds, so we
-  # fetch from the community mirror list at a pinned digest rather than trusting
-  # whichever mirror answers first (the same pin as the profile workflow).
-  ZIG_VERSION: 0.17.0-dev.813+2153f8143
-  ZIG_SHA256: b0d46ffc4587b9e8dd0b524ee5bc4da1e67f28bba55e7c534cec64af2f2d7a74
+  # Pinned by .zig-version. We fetch from the community mirror list (as
+  # ziglang.org asks CI to) at a pinned digest rather than trusting whichever
+  # mirror answers first (the same pin as the profile workflow). The digest is
+  # ziglang.org/download/index.json's shasum for the x86_64-linux tarball.
+  ZIG_VERSION: 0.17.0
+  ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
 
 jobs:
   bundle:

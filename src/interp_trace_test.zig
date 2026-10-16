@@ -7174,6 +7174,35 @@ test "nativegen (precise string helper exits, doc 45 D6): the allocator keeps ev
     }
 }
 
+noinline fn stackDepthHere() usize {
+    var buf: [64]usize = undefined;
+    return std.debug.captureCurrentStackTrace(.{}, &buf).return_addresses.len;
+}
+
+test "jit_unwind: std's unwinder never searches its modules for a JIT frame, and still works after one" {
+    // testing.allocator traces every allocation; one made by a helper the
+    // native trace calls walks into the trace's frame. The installed
+    // SelfInfo (tests/test_runner.zig) must answer that PC itself: std's
+    // own answer to a PC outside every module is a full rebuild of its
+    // unwind state, per allocation. Before the wrapper, the dev.813 std
+    // instead broke for good at the first such PC: every later trace in
+    // the process came back empty.
+    const jit_unwind = @import("jit_unwind");
+    try testing.expect(std.debug.SelfInfo == jit_unwind.TargetSelfInfo);
+    if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const depth_before = stackDepthHere();
+    const before = jit_unwind.interceptCount();
+    const got = try PreciseStrOom.run(testing.allocator, PreciseStrOom.tostr_source, .tostr_int, std.math.maxInt(usize), .native);
+    try testing.expect(!got.oom);
+    try testing.expect(got.native_entries >= 1);
+    try testing.expectEqual(depth_before, stackDepthHere());
+    // SafeAllocator captures allocation traces only in Debug builds.
+    if (@import("builtin").mode == .debug) {
+        try testing.expect(depth_before > 0);
+        try testing.expect(jit_unwind.interceptCount() > before);
+    }
+}
+
 test "pipeline (string helper decline, doc 45 D5): an out-of-range string.char in a precise trace resumes tier-0, which raises the catchable located error" {
     // The decline arm of the `StrResult` protocol: `schar1` fails on a
     // codepoint past 0x10FFFF WITHOUT an OOM, so the precise exit must be

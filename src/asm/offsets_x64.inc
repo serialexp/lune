@@ -8,11 +8,11 @@
 // decimal, in printable ASCII, with no line ending in a backslash.
 //
 // Test and library builds share one layout. Runtime safety does not: std's
-// hash maps carry a one-byte SafetyLock under Debug/ReleaseSafe, which
-// padding makes 8 more bytes per map, and that moves
-// TraceState.fast_block and the Vm fields placed after `trace`. Those names
-// live in the #if MAHINA_RUNTIME_SAFETY blocks below; the build defines it
-// from the optimize mode, and a build checks its own block.
+// hash maps and array lists carry a word-sized SafetyLock under
+// Debug/ReleaseSafe (empty otherwise), and that moves `trace`,
+// TraceState.fast_block and most Vm fields. Those names live in the
+// #if MAHINA_RUNTIME_SAFETY blocks below; the build defines it from the
+// optimize mode, and a build checks its own block.
 
 // VmBox and the Vm fields the entry reads or writes.
 .set VMBOX_VM, 80
@@ -20,30 +20,31 @@
 .set VM_STACK_TOP_SIZE, 8
 .set VM_NEXT_CALL_SEQ_SIZE, 8
 .set VM_NATIVE_REENTRY_DEPTH_SIZE, 2
-.set VM_TRACE, 8
 .set TRACE_FAST_BLOCK_SIZE, 2
 .set VM_PARKED_INLINE_LEN_SIZE, 4
 .set PARKLIST_ITEMS, 0
 
 // The safety-dependent offsets.
 #if MAHINA_RUNTIME_SAFETY
-.set VM_TAGS, 10680
-.set VM_PAYLOADS, 10696
-.set VM_STACK_TOP, 10792
-.set VM_NEXT_CALL_SEQ, 26848
-.set VM_FRAMES, 10848
-.set VM_DEPTH, 27792
-.set VM_NATIVE_REENTRY_DEPTH, 27796
-.set TRACE_FAST_BLOCK, 6556
-.set VM_PARKED_INLINE, 27032
-.set VM_PARKED_INLINE_LEN, 27784
-.set VM_PARKED_RESULTS, 27168
+.set VM_TRACE, 32
+.set VM_TAGS, 10936
+.set VM_PAYLOADS, 10952
+.set VM_STACK_TOP, 11056
+.set VM_NEXT_CALL_SEQ, 27112
+.set VM_FRAMES, 11112
+.set VM_DEPTH, 28088
+.set VM_NATIVE_REENTRY_DEPTH, 28092
+.set TRACE_FAST_BLOCK, 6788
+.set VM_PARKED_INLINE, 27304
+.set VM_PARKED_INLINE_LEN, 28080
+.set VM_PARKED_RESULTS, 27448
 #else
-.set VM_TAGS, 10432
-.set VM_PAYLOADS, 10448
-.set VM_STACK_TOP, 10544
-.set VM_NEXT_CALL_SEQ, 26600
-.set VM_FRAMES, 10600
+.set VM_TRACE, 24
+.set VM_TAGS, 10448
+.set VM_PAYLOADS, 10464
+.set VM_STACK_TOP, 10560
+.set VM_NEXT_CALL_SEQ, 26616
+.set VM_FRAMES, 10616
 .set VM_DEPTH, 27544
 .set VM_NATIVE_REENTRY_DEPTH, 27548
 .set TRACE_FAST_BLOCK, 6308

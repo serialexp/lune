@@ -103,16 +103,9 @@ comptime {
 pub var hostcall_counts: if (builtin.is_test) struct { slow: usize = 0, chain: usize = 0 } else void =
     if (builtin.is_test) .{} else {};
 
-/// Root override of `std.debug.SelfInfo`. On aarch64-windows the pinned
-/// toolchain's `std/debug/SelfInfo/Windows.zig` does not compile (a `@ptrCast`
-/// of a `*anyopaque` to a 4-aligned fn pointer without `@alignCast`), so that
-/// one target opts out of self-symbolisation: a panic there prints raw return
-/// addresses instead of symbolised frames. Every other target keeps std's
-/// default (std only consults `root.debug.SelfInfo` when the decl exists).
-/// Drop this once the pinned Zig carries the upstream fix.
-pub const debug = if (builtin.os.tag == .windows and builtin.cpu.arch == .aarch64) struct {
-    pub const SelfInfo = void;
-} else struct {};
+/// Root override of `std.debug.SelfInfo`: std's default with JIT code kept out
+/// of its unwinder (and the aarch64-windows opt-out); see `src/jit_unwind.zig`.
+pub const debug = @import("jit_unwind").debug;
 
 // The static library is linked by a foreign toolchain (cc, rustc), so it must
 // supply `__zig_probe_stack` — the x86 stack-probe routine LLVM calls for
@@ -477,19 +470,17 @@ inline fn runProtected(box: *VmBox, callee: Value, args: []const Value, results:
 // VM lifecycle
 // ---------------------------------------------------------------------------
 
-/// Host clock/seed sources — the CLI's real ones (`main.zig`), Linux-only
-/// like the CLI; the VM core never sees a syscall.
+/// Host clock/seed sources — the same ones as the CLI (`main.zig`), portable
+/// through `io.zig`; the VM core never sees a syscall.
 var host_src_ctx: u8 = 0;
 
 fn hostClockNs(_: *anyopaque) i64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
+    return io.monotonicNs();
 }
 
 fn hostRandomSeed(_: *anyopaque) u64 {
     var bytes: [8]u8 = undefined;
-    _ = std.os.linux.getrandom(&bytes, bytes.len, 0);
+    io.hostEntropy(&bytes);
     return std.mem.readInt(u64, &bytes, .little);
 }
 
