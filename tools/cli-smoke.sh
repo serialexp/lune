@@ -37,7 +37,12 @@ host_platform() {
     case $(uname -s) in
         Linux) os=linux ;;
         Darwin) os=macos ;;
-        MINGW* | MSYS* | CYGWIN*) os=windows ;;
+        MINGW* | MSYS* | CYGWIN*)
+            os=windows
+            # Git Bash on Windows on Arm is an emulated x64 build, so uname
+            # says x86_64; PROCESSOR_IDENTIFIER is the machine's own.
+            if [[ ${PROCESSOR_IDENTIFIER:-} == ARM* ]]; then arch=aarch64; fi
+            ;;
         *) os=$(uname -s) ;;
     esac
     echo "$arch-$os"
