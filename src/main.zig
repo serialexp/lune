@@ -23,6 +23,8 @@
 
 const std = @import("std");
 const mahina = @import("mahina");
+const viz_assets = @import("viz_assets");
+const viz_server = @import("viz_server.zig");
 
 /// std's `SelfInfo` with JIT code kept out of its unwinder: in Debug and
 /// ReleaseSafe `init.gpa` traces every allocation (see `src/jit_unwind.zig`).
@@ -36,6 +38,10 @@ const usage =
     \\usage:
     \\  mahina [options] <script.lua>   run a script file
     \\  mahina [options] -e <chunk>     run a chunk given inline
+    \\  mahina viz [viz options] [trace.mahinatrace]
+    \\                                  serve the trace visualiser on localhost
+    \\                                  (`mahina viz --help`; a script named
+    \\                                  `viz` runs as `./viz`)
     \\
     \\options:
     \\  --trace              enable the tracing JIT: detect hot loops, record them
@@ -204,14 +210,24 @@ pub fn main(init: std.process.Init) u8 {
         );
     };
 
-    var it = init.minimal.args.iterate();
+    // Windows and WASI must decode the command line into memory; the process
+    // arena owns it (the args live as long as `main`).
+    var it = init.minimal.args.iterateAllocator(init.arena.allocator()) catch {
+        mahina.io.eprint("mahina: out of memory reading the command line\n", .{});
+        return 1;
+    };
     defer it.deinit(); // no-op on Linux; correct on Windows/WASI
     _ = it.skip(); // skip argv[0]
+
+    // `mahina viz …` is a subcommand. Its first argument is read ahead, so the
+    // flag loop below starts from `pending` before pulling from `it`.
+    var pending = it.next();
+    if (pending) |arg| if (std.mem.eql(u8, arg, "viz")) return vizMain(init, &it);
 
     // Leading options precede the script / `-e`; the first non-option argument
     // ends flag parsing.
     var topts: TraceOpts = .{};
-    const first = while (it.next()) |arg| {
+    const first = while (pending orelse it.next()) |arg| : (pending = null) {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             mahina.io.print("{s}", .{usage});
             return 0;
@@ -341,6 +357,62 @@ pub fn main(init: std.process.Init) u8 {
     prog_argv.append(gpa, first) catch return 1;
     while (it.next()) |a| prog_argv.append(gpa, a) catch return 1;
     return runSource(gpa, init.io, first, source, topts, init.environ_map, prog_argv.items);
+}
+
+const viz_usage =
+    \\usage: mahina viz [options] [trace.mahinatrace]
+    \\
+    \\Serve the trace visualiser on http://127.0.0.1 and open it in a browser.
+    \\The visualiser runs programs in-browser (wasm); its differential validator
+    \\also runs them through this binary. With a .mahinatrace (from
+    \\`mahina --emit-traces <file> <script>`), the page opens on it; it is
+    \\re-read on every page load.
+    \\
+    \\options:
+    \\  --port <N>   listen on port N (default: any free port)
+    \\  --no-open    print the URL but don't open a browser
+    \\  -h, --help   show this help
+    \\
+;
+
+/// `mahina viz`: parse its options and serve until interrupted.
+fn vizMain(init: std.process.Init, it: *std.process.Args.Iterator) u8 {
+    var opts: viz_server.Options = .{};
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            mahina.io.print("{s}", .{viz_usage});
+            return 0;
+        } else if (std.mem.eql(u8, arg, "--port")) {
+            const text = it.next() orelse {
+                mahina.io.eprint("mahina viz: error: --port requires a number\n", .{});
+                return 2;
+            };
+            opts.port = std.fmt.parseInt(u16, text, 10) catch {
+                mahina.io.eprint("mahina viz: error: bad port '{s}'\n", .{text});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, arg, "--no-open")) {
+            opts.open_browser = false;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            mahina.io.eprint("mahina viz: error: unknown option '{s}'\n{s}", .{ arg, viz_usage });
+            return 2;
+        } else if (opts.trace_path != null) {
+            mahina.io.eprint("mahina viz: error: one trace file at most\n{s}", .{viz_usage});
+            return 2;
+        } else {
+            opts.trace_path = arg;
+        }
+    }
+    if (!viz_assets.embedded) {
+        mahina.io.eprint("mahina viz: error: this build has no web UI; build with `just cli` " ++
+            "(or `zig build -Dviz-dist=<built viz/dist>`)\n", .{});
+        return 1;
+    }
+    viz_server.serve(init.gpa, init.io, &viz_assets.files, init.environ_map, opts) catch |err| {
+        mahina.io.eprint("mahina viz: error: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    return 0;
 }
 
 /// Parse, compile, and run one source chunk. Returns the process exit code.
@@ -781,4 +853,8 @@ test "cli smoke" {
     // The end-to-end run path is covered by the interp/compiler test suites,
     // which exercise parse → compile → run against an in-memory output sink.
     try std.testing.expectEqual(@as(u64, 5), mahina.dispatch.run(5));
+}
+
+test {
+    _ = viz_server;
 }

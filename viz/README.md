@@ -25,6 +25,10 @@ bun run build      # tsc --noEmit && vite build  → dist/
 bun test           # cross-language decode + disasm + store tests
 ```
 
+`mahina viz [trace.mahinatrace]` serves a built copy of this app from the CLI
+itself, `POST /run` included (`just cli` builds CLIs with it embedded; see
+`src/viz_server.zig`).
+
 Load a trace via the “Open .mahinatrace…” button, drag-and-drop, or a `?src=<url>`
 deep link (e.g. `…/?src=/my-trace.mahinatrace`) that auto-loads on open. Generate
 one:

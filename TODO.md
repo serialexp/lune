@@ -22,6 +22,21 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       panic there prints unsymbolised addresses. Still broken in the 0.17.0
       release (the file is identical).
 
+## CLI release leftovers (noted 2026-10-16)
+
+- [ ] **`viz/bun.lock` is stale; `viz/README.md` still says `bun install`.**
+      `pnpm-lock.yaml` (2026-09-10) is the lockfile `just cli` and CI use;
+      `bun.lock` stopped at 2026-08-31. `bun install` over the pnpm
+      `node_modules` lays a second copy of `@codemirror/*` beside `.pnpm/`
+      and `tsc` fails on the duplicate types. Drop `bun.lock` and point the
+      README at pnpm (Bart's call: bun may be wanted for `bun test`).
+- [ ] **This machine has no Node >= 22.13**, which the installed pnpm 11
+      needs (only Zed's bundled 22.5.1). `just cli` ran locally through a
+      `pnpm` shim of `bun x pnpm@10`.
+- [ ] **The CLI has no `--version`.** A release binary can't say which tag
+      or commit it is; `build.zig` could pass the version (and LUNE_COMMIT)
+      in through `build_options`.
+
 ## Zig std unwinder vs JIT code (noted 2026-10-16, needs Bart)
 
 - [ ] **Upstream report, if wanted (outward-facing, so Bart's call).** A

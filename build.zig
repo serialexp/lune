@@ -64,6 +64,41 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // The web UI `mahina viz` serves (src/viz_server.zig). `-Dviz-dist=<dir>`
+    // embeds a built `viz/dist` (`just cli` builds one): tools/embed_assets.zig
+    // packs it into one blob plus an index module. It reads a WriteFile copy of
+    // the tree, whose content-hashed path re-runs the generator whenever an
+    // asset changes. Without the option the CLI gets a stub with no files, and
+    // `mahina viz` says the UI wasn't built in.
+    const viz_dist = b.option(std.Build.LazyPath, "viz-dist", "Embed this built viz/dist in the CLI for `mahina viz`");
+    const viz_assets_root = if (viz_dist) |dist| blk: {
+        const copy = b.addWriteFiles();
+        const tree = copy.addCopyDirectory(dist, "dist", .{});
+        const embed_tool = b.addExecutable(.{
+            .name = "embed_assets",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/embed_assets.zig"),
+                .target = b.graph.host,
+            }),
+        });
+        const gen = b.addRunArtifact(embed_tool);
+        gen.addDirectoryArg2(tree, .{});
+        break :blk gen.addOutputDirectoryArg2("viz_assets", .{}).path(b, "assets.zig");
+    } else b.addWriteFiles().add("assets.zig",
+        \\//! The CLI was built without `-Dviz-dist`: no web UI to serve.
+        \\
+        \\pub const File = struct { path: []const u8, data: []const u8 };
+        \\
+        \\pub const embedded = false;
+        \\
+        \\pub const files = [_]File{};
+        \\
+    );
+    const viz_assets_mod = b.createModule(.{ .root_source_file = viz_assets_root });
+
+    // `-Dcli-strip=true` drops the CLI's debug info (the release binaries do).
+    const cli_strip = b.option(bool, "cli-strip", "Build the CLI without debug info (the release binaries do)");
+
     // The CLI executable. Thin shell over the library module for now.
     const exe = b.addExecutable(.{
         .name = "mahina",
@@ -71,8 +106,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = cli_strip,
             .imports = &.{
                 .{ .name = "mahina", .module = mod },
+                .{ .name = "viz_assets", .module = viz_assets_mod },
             },
         }),
     });
@@ -343,12 +380,16 @@ pub fn build(b: *std.Build) void {
             .{ .name = "build_options", .module = build_opts_mod },
         },
     });
+    // `-Dwasm-strip=true` drops its debug info: the CLI's embedded web UI
+    // (`just cli`) ships a stripped ReleaseFast module.
+    const wasm_strip = b.option(bool, "wasm-strip", "Build the wasm VM without debug info (the CLI's embedded UI does)");
     const wasm_exe = b.addExecutable(.{
         .name = "mahina",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/wasm_entry.zig"),
             .target = wasm_target,
             .optimize = optimize,
+            .strip = wasm_strip,
             .imports = &.{
                 .{ .name = "mahina", .module = wasm_mahina_mod },
             },

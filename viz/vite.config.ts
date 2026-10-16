@@ -9,12 +9,14 @@ import { join } from "node:path";
 // The in-browser VM artifact, built by `zig build wasm` at the repo root. It
 // lives outside viz/ (it is not a source asset), so this plugin bridges it into
 // the app: served at `/mahina.wasm` in dev, copied into `dist/` at build time.
-const wasmPath = fileURLToPath(new URL("../zig-out/bin/mahina.wasm", import.meta.url));
+// `MAHINA_WASM` overrides the path (tools/mahina-cli.sh builds its own).
+const wasmPath =
+  process.env.MAHINA_WASM ?? fileURLToPath(new URL("../zig-out/bin/mahina.wasm", import.meta.url));
 
 // The native CLI, built by `zig build` at the repo root. The differential
 // validator (Phase 7 v3) runs it as a dev-server subprocess to compare its
-// artifacts against the in-browser wasm VM. Dev/CI tool only — not a production
-// feature (there is no production backend).
+// artifacts against the in-browser wasm VM. Outside `vite dev`, `mahina viz`
+// (src/viz_server.zig) answers the same `/run` contract from the CLI itself.
 const nativeBin = fileURLToPath(new URL("../zig-out/bin/mahina", import.meta.url));
 
 // Read a small request body to a string (the source chunk).

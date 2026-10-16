@@ -95,6 +95,19 @@ bundle out="zig-out/mahina-bundle":
 bundle-smoke bundle="zig-out/mahina-bundle" *targets:
     bash tools/bundle-smoke.sh "{{bundle}}" {{targets}}
 
+# The CLI release (tools/mahina-cli.sh): a stripped ReleaseFast `mahina` per
+# platform (Linux, macOS, Windows; x86-64 and arm64) with the trace visualiser
+# embedded for `mahina viz`, as tar.gz/zip archives plus SHA256SUMS. Needs
+# node and pnpm for the web UI.
+cli out="zig-out/mahina-cli":
+    bash tools/mahina-cli.sh "{{out}}"
+
+# Smoke-check CLI archives the way a user runs them (tools/cli-smoke.sh):
+# scripts, `mahina viz` serving the page, wasm and a trace, and POST /run.
+# Platforms other than the host's are SKIPs.
+cli-smoke cli="zig-out/mahina-cli" *platforms:
+    bash tools/cli-smoke.sh "{{cli}}" {{platforms}}
+
 # The embedding gate (doc 59 E4): the Zig test gate plus the Rust workspace
 # under embed/rust (whose build.rs runs `zig build lib` itself, so this also
 # proves the cargo→zig build path end to end).

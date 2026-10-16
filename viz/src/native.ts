@@ -1,8 +1,9 @@
-// Client for the dev-server `POST /run` middleware (vite.config.ts), which runs
-// the source through the *native* mahina binary and returns its artifacts. Used
+// Client for `POST /run`, which runs the source through the *native* mahina
+// binary and returns its artifacts: the dev-server middleware (vite.config.ts)
+// or `mahina viz` (src/viz_server.zig), which answer the same contract. Used
 // only by the differential validator — the native engine is the second opinion
-// the in-browser wasm VM is checked against. There is no production backend;
-// this works only under `vite dev`.
+// the in-browser wasm VM is checked against. A plain static host of `dist/` has
+// no `/run`.
 
 import type { RunArtifacts } from "./diff";
 
@@ -26,8 +27,8 @@ function fromBase64(b64: string): Uint8Array {
 }
 
 /** Run `source` (with optional script `args` → `arg[1..]`) through the native
- *  binary via the dev server. Throws if the endpoint is unavailable (e.g. running
- *  against a static build, not `vite dev`). */
+ *  binary via `vite dev` or `mahina viz`. Throws if the endpoint is unavailable
+ *  (a static host of `dist/`). */
 export async function runNative(source: string, args: string[] = []): Promise<RunArtifacts & { diagnostics: string; coverage: Uint8Array }> {
   const resp = await fetch("/run", {
     method: "POST",
@@ -35,7 +36,7 @@ export async function runNative(source: string, args: string[] = []): Promise<Ru
     body: JSON.stringify({ source, args }),
   });
   if (!resp.ok) {
-    throw new Error(`POST /run: ${resp.status} ${resp.statusText} (is the dev server running?)`);
+    throw new Error(`POST /run: ${resp.status} ${resp.statusText} (needs \`vite dev\` or \`mahina viz\`)`);
   }
   const data = (await resp.json()) as NativeRunResponse;
   if (data.error) throw new Error(`native run failed: ${data.error}`);

@@ -1,0 +1,61 @@
+name: install zig
+description: >
+  Install the Zig toolchain .zig-version pins, from the community mirror list
+  (as ziglang.org asks CI to) at a pinned digest rather than trusting whichever
+  mirror answers first. Fails if .zig-version and the given version disagree.
+  x86_64 Linux runners only.
+
+inputs:
+  version:
+    description: The Zig version; must equal .zig-version.
+    required: true
+  sha256:
+    description: ziglang.org/download/index.json's shasum for the x86_64-linux tarball.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Verify the toolchain pin matches .zig-version
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ inputs.version }}
+      run: |
+        set -eu
+        pinned=$(tr -d '[:space:]' < .zig-version)
+        if [ "$pinned" != "$ZIG_VERSION" ]; then
+          echo "::error::.zig-version says '$pinned' but this workflow pins '$ZIG_VERSION'"
+          echo "Update ZIG_VERSION *and* ZIG_SHA256 together."
+          exit 1
+        fi
+
+    - name: Install Zig
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ inputs.version }}
+        ZIG_SHA256: ${{ inputs.sha256 }}
+      run: |
+        set -eu
+        tarball="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+        curl -fsSL -o /tmp/mirrors.txt https://ziglang.org/download/community-mirrors.txt
+        ok=
+        while read -r mirror; do
+          [ -n "$mirror" ] || continue
+          echo "trying $mirror"
+          if curl -fsSL --max-time 180 -o /tmp/zig.tar.xz "$mirror/$tarball"; then
+            if echo "$ZIG_SHA256  /tmp/zig.tar.xz" | sha256sum -c -; then
+              ok=1
+              break
+            fi
+            echo "digest mismatch from $mirror - discarding"
+            rm -f /tmp/zig.tar.xz
+          fi
+        done < /tmp/mirrors.txt
+        if [ -z "$ok" ]; then
+          echo "::error::no mirror served $tarball at the pinned digest"
+          exit 1
+        fi
+        mkdir -p "$RUNNER_TEMP/zig"
+        tar -xJf /tmp/zig.tar.xz -C "$RUNNER_TEMP/zig" --strip-components=1
+        test "$("$RUNNER_TEMP/zig/zig" version)" = "$ZIG_VERSION"
+        echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"

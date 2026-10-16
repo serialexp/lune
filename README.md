@@ -85,7 +85,28 @@ just run -- x.lua   # run a script
 just bench          # benchmark suite vs LuaJIT (rebuilds ReleaseFast first)
 just hashgate       # frozen-output gate: 28 programs x 3 modes,
                     #   ReleaseFast + safety-checked Debug legs
+just cli            # release CLIs for Linux/macOS/Windows (x86-64 + arm64)
+                    #   with the trace visualiser embedded (needs node + pnpm)
 ```
+
+## CLI releases and `mahina viz`
+
+Each `vX.Y.Z` GitHub Release carries a `mahina` binary per platform
+(`mahina-vX.Y.Z-<arch>-<os>.tar.gz`/`.zip`) next to the vendor bundle. The
+binary runs scripts (`mahina script.mahina`, `mahina --help`) and serves the
+trace visualiser (`viz/`) from inside itself:
+
+```sh
+mahina --emit-traces run.mahinatrace script.mahina
+mahina viz run.mahinatrace     # opens http://127.0.0.1:<port>/ on the trace
+mahina viz --no-open --port 8080
+```
+
+The visualiser runs programs in-browser (wasm); its differential validator
+runs them through the same binary (`POST /run`, localhost and same-origin
+only). The native JIT (`--jit-native`) is x86-64 Linux only; on the other
+platforms it falls back to the interpreter tiers. A plain `zig build` CLI has
+no UI embedded; `zig build -Dviz-dist=<built viz/dist>` adds one.
 
 ## Documentation
 

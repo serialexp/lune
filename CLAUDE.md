@@ -209,6 +209,12 @@ the `zig build` invocations and, for benchmarks, guarantee the right binary.
   `.zig-cache`/`zig-out` so that can't happen; after restoring the baseline
   sources in the copy (`git show HEAD:<file> > <file>`) and building, verify
   with `nm <bin> | grep <new-symbol>` (must be empty) before trusting any A/B.
+- `just cli [out]` / `just cli-smoke [out] [platforms]` — the release CLIs
+  (`tools/mahina-cli.sh`: six platforms, stripped ReleaseFast, the `viz/` UI
+  embedded via `-Dviz-dist` for `mahina viz`) and their smoke test. Needs node
+  + pnpm (`viz/pnpm-lock.yaml` is the lockfile — never `bun install` there).
+  `mahina viz`'s server, `src/viz_server.zig`, is the CLI's only `std.Io.net`/
+  `std.http` user (Rule Z-2) and stays out of the VM core.
 
 **Live JIT debugging — never hand-add `std.debug.print` scaffolding.** The
 permanent facility is `src/jitdbg.zig`: build with `zig build -Djit-debug=true`
