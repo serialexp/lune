@@ -205,7 +205,12 @@ land; move whole phases to Done once everything inside them is checked.
   links the x86-64 musl archive into a gnu binary and checks for absolute
   32-bit relocations. On a host without the cross runners, aarch64
   (qemu-aarch64), Windows (cargo-xwin, wine) and macOS (SDK) are reported
-  as SKIPs.
+  as SKIPs. CI covers all of them: `.github/workflows/bundle.yml` on the
+  GitHub mirror builds the bundle once on Linux and checks a cold rebuild
+  from another path is byte-identical. It then runs
+  `bundle-smoke.sh --strict`, where a SKIP fails, natively on six runners
+  (x86-64/arm64 Linux, Intel/arm64 macOS, x64/arm64 Windows) with no zig
+  installed.
 ### Outstanding
 
 - [ ] **E6 — host-call record/replay.** Defer. v1 refuses `.record` AND

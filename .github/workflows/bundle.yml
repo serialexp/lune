@@ -1,0 +1,177 @@
+name: vendor bundle
+
+# Builds the vendor bundle (tools/mahina-bundle.sh: stripped, PIC libmahina
+# archives for every supported Rust target, plus mahina.h and the Rust
+# binding crates) once, on Linux — zig cross-compiles every target, so CI and
+# a local `just bundle` produce the same bytes — and proves it twice over:
+#   - reproducible: a second build from another path, with a cold cache, must
+#     give byte-identical archives;
+#   - consumable: on a native runner per target, a minimal Rust crate built
+#     against the bundle with NO zig installed links and runs one VM lifecycle
+#     (tools/bundle-smoke.sh --strict: nothing may be skipped).
+# The bundle is uploaded as the `mahina-bundle` artifact.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - src/**
+      - include/**
+      - embed/**
+      - build.zig
+      - build.zig.zon
+      - .zig-version
+      - tools/mahina-bundle.sh
+      - tools/bundle-smoke.sh
+      - tests/bundle_smoke/**
+      - .github/workflows/bundle.yml
+  pull_request:
+    paths:
+      - src/**
+      - include/**
+      - embed/**
+      - build.zig
+      - build.zig.zon
+      - .zig-version
+      - tools/mahina-bundle.sh
+      - tools/bundle-smoke.sh
+      - tests/bundle_smoke/**
+      - .github/workflows/bundle.yml
+  workflow_dispatch:
+
+concurrency:
+  group: bundle-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned by .zig-version. ziglang.org garbage-collects old -dev builds, so we
+  # fetch from the community mirror list at a pinned digest rather than trusting
+  # whichever mirror answers first (the same pin as the profile workflow).
+  ZIG_VERSION: 0.17.0-dev.813+2153f8143
+  ZIG_SHA256: b0d46ffc4587b9e8dd0b524ee5bc4da1e67f28bba55e7c534cec64af2f2d7a74
+
+jobs:
+  bundle:
+    name: build the bundle
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Verify the toolchain pin matches .zig-version
+        run: |
+          set -eu
+          pinned=$(tr -d '[:space:]' < .zig-version)
+          if [ "$pinned" != "$ZIG_VERSION" ]; then
+            echo "::error::.zig-version says '$pinned' but this workflow pins '$ZIG_VERSION'"
+            echo "Update ZIG_VERSION *and* ZIG_SHA256 together."
+            exit 1
+          fi
+
+      - name: Install Zig
+        run: |
+          set -eu
+          tarball="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -fsSL -o /tmp/mirrors.txt https://ziglang.org/download/community-mirrors.txt
+          ok=
+          while read -r mirror; do
+            [ -n "$mirror" ] || continue
+            echo "trying $mirror"
+            if curl -fsSL --max-time 180 -o /tmp/zig.tar.xz "$mirror/$tarball"; then
+              if echo "$ZIG_SHA256  /tmp/zig.tar.xz" | sha256sum -c -; then
+                ok=1
+                break
+              fi
+              echo "digest mismatch from $mirror - discarding"
+              rm -f /tmp/zig.tar.xz
+            fi
+          done < /tmp/mirrors.txt
+          if [ -z "$ok" ]; then
+            echo "::error::no mirror served $tarball at the pinned digest"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf /tmp/zig.tar.xz -C "$RUNNER_TEMP/zig" --strip-components=1
+          test "$("$RUNNER_TEMP/zig/zig" version)" = "$ZIG_VERSION"
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Build the bundle
+        run: bash tools/mahina-bundle.sh "$RUNNER_TEMP/mahina-bundle"
+
+      - name: Rebuild from another path with a cold cache, and compare
+        run: |
+          set -eu
+          rsync -a --exclude /.zig-cache --exclude /zig-out ./ "$RUNNER_TEMP/repro/"
+          (cd "$RUNNER_TEMP/repro" && bash tools/mahina-bundle.sh "$RUNNER_TEMP/mahina-bundle-repro")
+          diff "$RUNNER_TEMP/mahina-bundle/SHA256SUMS" "$RUNNER_TEMP/mahina-bundle-repro/SHA256SUMS"
+          cat "$RUNNER_TEMP/mahina-bundle/SHA256SUMS"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mahina-bundle
+          path: ${{ runner.temp }}/mahina-bundle
+          if-no-files-found: error
+
+  smoke:
+    name: smoke ${{ matrix.runner }}
+    needs: bundle
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            targets: x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            targets: aarch64-unknown-linux-gnu aarch64-unknown-linux-musl
+          - runner: macos-15-intel
+            targets: x86_64-apple-darwin
+          - runner: macos-15
+            targets: aarch64-apple-darwin
+          - runner: windows-latest
+            targets: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            targets: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: mahina-bundle
+          path: mahina-bundle
+
+      - name: Install Rust
+        run: |
+          set -eu
+          if ! command -v rustup >/dev/null; then
+            case "$RUNNER_OS" in
+              Windows)
+                case "$RUNNER_ARCH" in
+                  ARM64) arch=aarch64 ;;
+                  *) arch=x86_64 ;;
+                esac
+                curl -fsSL -o "$RUNNER_TEMP/rustup-init.exe" "https://win.rustup.rs/$arch"
+                "$RUNNER_TEMP/rustup-init.exe" -y --profile minimal
+                cygpath -w "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+                ;;
+              *)
+                curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+                echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+                ;;
+            esac
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.targets }}
+          rustc -vV
+
+      - name: Smoke-test the bundle (no zig installed)
+        run: |
+          set -eu
+          if command -v zig >/dev/null; then
+            echo "::warning::this runner has a zig on PATH; the smoke script hides it"
+          fi
+          bash tools/bundle-smoke.sh --strict mahina-bundle ${{ matrix.targets }}
