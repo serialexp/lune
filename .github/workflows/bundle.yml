@@ -10,10 +10,18 @@ name: vendor bundle
 #     against the bundle with NO zig installed links and runs one VM lifecycle
 #     (tools/bundle-smoke.sh --strict: nothing may be skipped).
 # The bundle is uploaded as the `mahina-bundle` artifact.
+#
+# Releases: pushing a tag `vX.Y.Z` runs the same build + proofs and then
+# publishes the bundle as a GitHub Release (`release` job below). The tag must
+# equal the version of both Rust crates (embed/rust/*/Cargo.toml), so a
+# release, the crates inside it and a downstream lock file all name one
+# version. Downstream projects pin a release's tarball by URL + sha256.
 
 on:
   push:
     branches: [master]
+    # Tag pushes ignore the paths filter: every version tag builds.
+    tags: ['v*']
     paths:
       - src/**
       - include/**
@@ -175,3 +183,73 @@ jobs:
             echo "::warning::this runner has a zig on PATH; the smoke script hides it"
           fi
           bash tools/bundle-smoke.sh --strict mahina-bundle ${{ matrix.targets }}
+
+  release:
+    name: publish the release
+    # Only for version tags, and only once every target's smoke passed.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [bundle, smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: mahina-bundle
+          path: mahina-bundle
+
+      - name: Check the tag, the crates and the bundle agree
+        run: |
+          set -eu
+          tag=${GITHUB_REF_NAME}
+          for crate in mahina mahina-sys; do
+            v=$(sed -n 's/^version = "\(.*\)"$/\1/p' "embed/rust/$crate/Cargo.toml" | head -1)
+            if [ "v$v" != "$tag" ]; then
+              echo "::error::tag $tag but embed/rust/$crate is version $v; bump the crates first"
+              exit 1
+            fi
+          done
+          commit=$(cat mahina-bundle/LUNE_COMMIT)
+          if [ "$commit" != "$GITHUB_SHA" ]; then
+            echo "::error::bundle LUNE_COMMIT is '$commit', want the tagged commit $GITHUB_SHA"
+            exit 1
+          fi
+          (cd mahina-bundle && sha256sum -c SHA256SUMS)
+
+      - name: Pack the release tarball
+        # Reproducible: sorted names, zeroed mtimes/owners, normalised modes,
+        # and gzip without a timestamp, so the same bundle gives the same
+        # tarball (and sha256) every time.
+        run: |
+          set -eu
+          name=mahina-bundle-${GITHUB_REF_NAME}
+          mv mahina-bundle "$name"
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+            --mode='u+rwX,go+rX,go-w' --format=gnu -cf - "$name" | gzip -9 -n > "$name.tar.gz"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          {
+            echo "mahina ${GITHUB_REF_NAME}: the vendor bundle, prebuilt libmahina for every supported Rust target."
+            echo
+            echo "- lune commit: \`$(cat "$name/LUNE_COMMIT")\`"
+            echo "- zig: \`$(cat "$name/ZIG_VERSION")\`"
+            echo "- tarball sha256: \`$(cut -d' ' -f1 "$name.tar.gz.sha256")\`"
+            echo
+            echo "Unpack, then build with \`MAHINA_PREBUILT_ROOT=<dir>/lib\` against \`<dir>/rust/mahina\`; no zig needed."
+            echo
+            echo "Archives:"
+            echo '```'
+            cat "$name/SHA256SUMS"
+            echo '```'
+          } > notes.md
+          cat notes.md
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          name=mahina-bundle-${GITHUB_REF_NAME}
+          gh release create "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256" \
+            --verify-tag --title "mahina ${GITHUB_REF_NAME}" --notes-file notes.md
