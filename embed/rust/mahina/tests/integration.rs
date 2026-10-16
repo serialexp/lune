@@ -234,6 +234,26 @@ fn register_fn_stateful_closure() {
     assert_eq!(*count.borrow(), 3);
 }
 
+/// A call statement discards the results, so the VM asks the host for none
+/// (and may hand the trampoline a null result buffer). Both a host fn that
+/// returns values and one that returns none must be callable that way; the
+/// debug build's slice preconditions catch a slice built from the null.
+#[test]
+fn register_fn_called_as_a_statement() {
+    let vm = Vm::new().unwrap();
+    let count = shared(0i64);
+    let c = count.clone();
+    vm.register_fn("bump", move |_vm, _args| {
+        *c.borrow_mut() += 1;
+        Ok(vec![Value::Int(*c.borrow())])
+    })
+    .unwrap();
+    vm.register_fn("noop", |_vm, _args| Ok(vec![])).unwrap();
+    let out = vm.eval("bump() noop() bump() noop() return bump()", "t").unwrap();
+    assert_eq!(out[0], Value::Int(3));
+    assert_eq!(*count.borrow(), 3);
+}
+
 #[test]
 fn register_fn_module_field() {
     let vm = Vm::new().unwrap();

@@ -1243,7 +1243,14 @@ unsafe extern "C" fn host_trampoline(
     match outcome {
         Ok(Ok(vals)) => {
             let n = vals.len().min(max_results);
-            let out = std::slice::from_raw_parts_mut(results, max_results);
+            // A call whose results are discarded (a call statement) wants
+            // none and may pass a null `results`; a slice must never be
+            // built from it, empty or not.
+            let out: &mut [sys::mh_value] = if max_results == 0 {
+                &mut []
+            } else {
+                std::slice::from_raw_parts_mut(results, max_results)
+            };
             for (i, v) in vals.iter().take(n).enumerate() {
                 match v.to_raw(&vm.inner) {
                     Ok(raw) => out[i] = raw,
