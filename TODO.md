@@ -11,13 +11,11 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       already exists in `tools/mahina-bundle.sh` (`TARGETS`), so the fallback
       could pass the mapped `-Dtarget`. Pre-existing; the bundle path is
       unaffected.
-- [ ] **`just bundle-smoke` legs that this machine SKIPs.** aarch64 Linux
-      links but can't run without `qemu-aarch64` (`qemu-user-static`).
-      Windows needs `cargo-xwin` (it downloads the MSVC CRT + SDK under
-      Microsoft's licence) plus `rustup target add aarch64-pc-windows-msvc`,
-      and wine for the x86-64 run. Darwin needs an Apple SDK (osxcross).
-      Each needs Bart's go-ahead: a sudo install, a licence acceptance, or
-      an SDK he supplies.
+- [x] **`just bundle-smoke` legs that this machine SKIPs** (aarch64 runs,
+      Windows, darwin). Covered by `.github/workflows/bundle.yml` on the
+      GitHub mirror (2026-10-16): every target builds and runs natively there
+      under `--strict`. Locally they stay SKIPs unless qemu-user-static,
+      cargo-xwin + wine, or an Apple SDK are installed.
 - [ ] **aarch64-windows `SelfInfo` opt-out in `capi.zig`.** Drop it once the
       pinned Zig's `std/debug/SelfInfo/Windows.zig` compiles for aarch64.
       Until then a panic there prints unsymbolised addresses.
