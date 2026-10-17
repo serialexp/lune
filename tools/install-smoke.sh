@@ -70,9 +70,11 @@ s.serve_forever()
 EOF
 server_pid=$!
 port=
-for _ in $(seq 1 100); do
+# A cold python3 on the macOS runners can take well over 10s to start.
+for _ in $(seq 1 600); do
     port=$(sed -n 's/^port //p' "$work/server.log")
     [[ -n $port ]] && break
+    kill -0 "$server_pid" 2>/dev/null || fail "the server exited: $(cat "$work/server.log")"
     sleep 0.1
 done
 [[ -n $port ]] || fail "the server didn't start: $(cat "$work/server.log")"
