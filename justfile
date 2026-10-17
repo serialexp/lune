@@ -104,9 +104,11 @@ cli out="zig-out/mahina-cli":
 
 # Smoke-check CLI archives the way a user runs them (tools/cli-smoke.sh):
 # scripts, `mahina viz` serving the page, wasm and a trace, and POST /run.
-# Platforms other than the host's are SKIPs.
+# Platforms other than the host's are SKIPs. Then install.sh against the same
+# archives, served like a release (tools/install-smoke.sh).
 cli-smoke cli="zig-out/mahina-cli" *platforms:
     bash tools/cli-smoke.sh "{{cli}}" {{platforms}}
+    bash tools/install-smoke.sh "{{cli}}"
 
 # The embedding gate (doc 59 E4): the Zig test gate plus the Rust workspace
 # under embed/rust (whose build.rs runs `zig build lib` itself, so this also

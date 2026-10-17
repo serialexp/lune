@@ -40,6 +40,8 @@ on:
       - tools/mahina-cli.sh
       - tools/cli-smoke.sh
       - tools/embed_assets.zig
+      - tools/install-smoke.sh
+      - install.sh
       - tests/bundle_smoke/**
       - .github/workflows/bundle.yml
       - .github/actions/install-zig/**
@@ -57,6 +59,8 @@ on:
       - tools/mahina-cli.sh
       - tools/cli-smoke.sh
       - tools/embed_assets.zig
+      - tools/install-smoke.sh
+      - install.sh
       - tests/bundle_smoke/**
       - .github/workflows/bundle.yml
       - .github/actions/install-zig/**
@@ -237,6 +241,12 @@ jobs:
       - name: Smoke-test the CLI
         run: bash tools/cli-smoke.sh --strict mahina-cli ${{ matrix.platform }}
 
+      # install.sh against these archives, served like a release (no
+      # publishing needed). Linux and macOS only, as install.sh is.
+      - name: Smoke-test install.sh
+        if: runner.os != 'Windows'
+        run: bash tools/install-smoke.sh mahina-cli
+
   release:
     name: publish the release
     # Only for version tags, and only once every target's smoke passed.
@@ -317,6 +327,8 @@ jobs:
             echo "Run scripts with \`mahina script.mahina\`; \`mahina viz [trace.mahinatrace]\` serves the visualiser on localhost."
             echo "The native JIT (\`--jit-native\`) is x86-64 Linux only; elsewhere it falls back to the interpreter tiers."
             echo
+            echo "Linux/macOS: \`curl -fsSL https://raw.githubusercontent.com/serialexp/lune/master/install.sh | MAHINA_VERSION=${GITHUB_REF_NAME} sh\` (into \`~/.local/bin\`)."
+            echo
             echo '```'
             cat "cli-assets/mahina-${GITHUB_REF_NAME}-SHA256SUMS"
             echo '```'
@@ -341,3 +353,31 @@ jobs:
           name=mahina-bundle-${GITHUB_REF_NAME}
           gh release create "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256" cli-assets/* \
             --verify-tag --title "mahina ${GITHUB_REF_NAME}" --notes-file notes.md
+
+  install:
+    name: install ${{ matrix.runner }} from the release
+    # The published release, through the real GitHub URLs: pinned to this
+    # tag, and as the latest release (which it just became).
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the tagged release and the latest one
+        run: |
+          set -eu
+          for pin in "$GITHUB_REF_NAME" ""; do
+            dir=$RUNNER_TEMP/install-${pin:-latest}
+            MAHINA_VERSION=$pin MAHINA_INSTALL_DIR=$dir sh install.sh
+            v=$("$dir/mahina" --version)
+            echo "$v"
+            case $v in
+              "mahina ${GITHUB_REF_NAME#v}"*"commit: $GITHUB_SHA"*) ;;
+              *) echo "::error::install ${pin:-latest} gave the wrong build"; exit 1 ;;
+            esac
+            test "$("$dir/mahina" -e 'print(6 * 7)')" = 42
+          done

@@ -91,6 +91,16 @@ just cli            # release CLIs for Linux/macOS/Windows (x86-64 + arm64)
 
 ## CLI releases and `mahina viz`
 
+On Linux or macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/serialexp/lune/master/install.sh | sh
+```
+
+installs the latest release's `mahina` into `~/.local/bin`, checked against
+the release's SHA256SUMS (`MAHINA_VERSION=vX.Y.Z` pins one,
+`MAHINA_INSTALL_DIR` moves it). On Windows, take the `.zip` from the release.
+
 Each `vX.Y.Z` GitHub Release carries a `mahina` binary per platform
 (`mahina-vX.Y.Z-<arch>-<os>.tar.gz`/`.zip`) next to the vendor bundle. The
 binary runs scripts (`mahina script.mahina`, `mahina --help`) and serves the
