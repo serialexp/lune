@@ -75,7 +75,7 @@ for entry in "${TARGETS[@]}"; do
     read -r platform zig_target <<<"$entry"
     echo "mahina-cli: $platform (zig $zig_target)"
     (cd "$root" && zig build -Dtarget="$zig_target" -Doptimize=ReleaseFast -Dcli-strip=true \
-        -Dviz-dist="$work/dist" --prefix "$work/build/$platform")
+        -Dviz-dist="$work/dist" -Dversion-commit="$commit" --prefix "$work/build/$platform")
     pkg=$work/pkg/mahina-$platform
     mkdir -p "$pkg"
     case $platform in

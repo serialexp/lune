@@ -262,6 +262,11 @@ jobs:
         run: |
           set -eu
           tag=${GITHUB_REF_NAME}
+          v=$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' build.zig.zon)
+          if [ "v$v" != "$tag" ]; then
+            echo "::error::tag $tag but build.zig.zon is version $v (what mahina --version says); bump it first"
+            exit 1
+          fi
           for crate in mahina mahina-sys; do
             v=$(sed -n 's/^version = "\(.*\)"$/\1/p' "embed/rust/$crate/Cargo.toml" | head -1)
             if [ "v$v" != "$tag" ]; then

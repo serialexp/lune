@@ -2,8 +2,10 @@
     // Package identity. The name is a Zig enum literal (no leading "zig").
     .name = .mahina,
 
-    // Semantic version of the project itself.
-    .version = "0.0.0",
+    // Semantic version of the project itself: what `mahina --version` and
+    // `mahina.version` report. A release tag `vX.Y.Z` must equal it (and the
+    // Rust crates' versions); .github/workflows/bundle.yml checks.
+    .version = "0.1.1",
 
     // Globally unique. The low half is a checksum of `.name`, so renaming the
     // package forces this to be re-derived — `zig build` refuses the stale value

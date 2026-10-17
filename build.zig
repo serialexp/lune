@@ -31,8 +31,14 @@ pub fn build(b: *std.Build) void {
         "jit-debug",
         "Compile in live JIT debug logging (src/jitdbg.zig); enable at runtime with --jit-debug.",
     ) orelse false;
+    // `mahina --version`: the version is build.zig.zon's; the commit is only
+    // known when the builder says (tools/mahina-cli.sh passes LUNE_COMMIT), so
+    // a plain build reads no git state and stays reproducible.
+    const version_commit = b.option([]const u8, "version-commit", "The commit this is built from, for `mahina --version` (the release CLIs pass it)");
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "jit_debug", jit_debug);
+    build_opts.addOption([]const u8, "version", @import("build.zig.zon").version);
+    build_opts.addOption(?[]const u8, "version_commit", version_commit);
     const build_opts_mod = build_opts.createModule();
 
     // The vendored binschema runtime (src/gen/binschema/). The generated trace

@@ -112,6 +112,13 @@ smoke() {
     esac
     cd "$dir"
 
+    # --version names the commit the archive was built from, and the UI.
+    local version
+    version=$("$exe" --version | tr -d '\r') || fail "--version exited $?"
+    [[ $version == "mahina "* ]] || fail "--version: $version"
+    [[ $version == *"commit: $(cat "$cli/LUNE_COMMIT")"* ]] || fail "--version lacks the commit: $version"
+    [[ $version == *"web UI (\`mahina viz\`): built in"* ]] || fail "--version says no web UI: $version"
+
     expect_eq "-e" "$("$exe" -e 'print(1 + 2)' | tr -d '\r')" 3
     cat >loop.mahina <<'EOF'
 local s = 0
@@ -119,7 +126,14 @@ for i = 1, 100000 do s = s + i end
 print(s)
 EOF
     expect_eq "script" "$("$exe" loop.mahina | tr -d '\r')" 5000050000
-    expect_eq "--jit-native" "$("$exe" --jit-native loop.mahina | tr -d '\r')" 5000050000
+    expect_eq "--jit-native" "$("$exe" --jit-native loop.mahina 2>jit.err | tr -d '\r')" 5000050000
+    # Native code is x86-64 Linux only; everywhere else --jit-native warns.
+    if [[ $platform == x86_64-linux ]]; then
+        [[ ! -s jit.err ]] || fail "--jit-native warned on x86-64 Linux: $(cat jit.err)"
+    else
+        grep -q 'warning: --jit-native: native code is x86-64 Linux only' jit.err ||
+            fail "--jit-native did not warn: $(cat jit.err)"
+    fi
     "$exe" viz --help >/dev/null || fail "mahina viz --help exited $?"
 
     "$exe" --emit-traces t.mahinatrace loop.mahina >/dev/null

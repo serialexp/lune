@@ -212,7 +212,9 @@ land; move whole phases to Done once everything inside them is checked.
   (x86-64/arm64 Linux, Intel/arm64 macOS, x64/arm64 Windows) with no zig
   installed. **Releases:** pushing a tag `vX.Y.Z` runs the same jobs and then
   publishes `mahina-bundle-vX.Y.Z.tar.gz` (+ `.sha256`, a reproducible pack)
-  as a GitHub Release. The tag must equal both crates' version. Consumers pin
+  as a GitHub Release, beside the CLI archives (`tools/mahina-cli.sh`). The
+  tag must equal both crates' version and `build.zig.zon`'s (what
+  `mahina --version` reports). Consumers pin
   the tarball by URL + sha256, and take the crates as a cargo git dependency
   on the same tag. First releases: v0.1.0, and v0.1.1, which fixes the
   trampoline building a slice from the null result buffer of a host fn called

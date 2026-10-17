@@ -22,6 +22,7 @@
 //! program's output — only whether, and how, hot loops are traced.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mahina = @import("mahina");
 const viz_assets = @import("viz_assets");
 const viz_server = @import("viz_server.zig");
@@ -56,8 +57,8 @@ const usage =
     \\  --jit-native         imply --trace and run hot traces as native x86-64
     \\                       machine code (tier-1b) when they fall in the proven
     \\                       integer/boolean subset; others stay on tier-1a. Output
-    \\                       is identical to a plain run. x86-64/Linux only (a no-op
-    \\                       fallback elsewhere).
+    \\                       is identical to a plain run. x86-64/Linux only;
+    \\                       elsewhere it warns and stays on tier-1a.
     \\  --dump-native        imply --jit-native and print each trace's compiled
     \\                       machine code (or "unsupported") to stderr after the run.
     \\  --dump-traces        imply --trace and print every recorded trace's IR to
@@ -120,6 +121,7 @@ const usage =
     \\                       run (the run alone, excluding parse/compile/emit). Kept
     \\                       free of JIT coverage accounting so the timing is clean;
     \\                       add --jit-coverage explicitly if you also want the split.
+    \\  --version            print the version, commit, toolchain and target
     \\  -h, --help           show this help
     \\
 ;
@@ -231,6 +233,9 @@ pub fn main(init: std.process.Init) u8 {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             mahina.io.print("{s}", .{usage});
             return 0;
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            printVersion();
+            return 0;
         } else if (std.mem.eql(u8, arg, "--trace")) {
             topts.enabled = true;
         } else if (std.mem.eql(u8, arg, "--trace-record-only")) {
@@ -327,6 +332,13 @@ pub fn main(init: std.process.Init) u8 {
         return 2;
     };
 
+    // Native codegen exists for one target; elsewhere the flag would silently
+    // measure tier-1a, so say so (stderr: program output stays identical).
+    if (topts.native_codegen and !mahina.nativegen.is_x64_linux) {
+        mahina.io.eprint("mahina: warning: --jit-native: native code is x86-64 Linux only; " ++
+            "hot traces run on the tier-1a interpreter on {s}-{s}\n", .{ @tagName(builtin.cpu.arch), @tagName(builtin.os.tag) });
+    }
+
     // Everything below allocates, so the gpa choice happens exactly here: after
     // flag parsing (which only compares argv strings), before first use.
     const gpa = if (mem_stats) mem_tracker.allocator() else init.gpa;
@@ -357,6 +369,26 @@ pub fn main(init: std.process.Init) u8 {
     prog_argv.append(gpa, first) catch return 1;
     while (it.next()) |a| prog_argv.append(gpa, a) catch return 1;
     return runSource(gpa, init.io, first, source, topts, init.environ_map, prog_argv.items);
+}
+
+/// `mahina --version`: what this binary is and what it can do here.
+fn printVersion() void {
+    mahina.io.print(
+        \\mahina {s}
+        \\commit: {s}
+        \\zig: {s}
+        \\target: {s}-{s} (native JIT: {s})
+        \\web UI (`mahina viz`): {s}
+        \\
+    , .{
+        mahina.version,
+        mahina.version_commit orelse "unknown (built without -Dversion-commit)",
+        builtin.zig_version_string,
+        @tagName(builtin.cpu.arch),
+        @tagName(builtin.os.tag),
+        if (mahina.nativegen.is_x64_linux) "yes" else "no, x86-64 Linux only",
+        if (viz_assets.embedded) "built in" else "not built in",
+    });
 }
 
 const viz_usage =

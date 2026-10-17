@@ -7,8 +7,11 @@
 
 const std = @import("std");
 
-/// Project version. Kept in step with build.zig.zon's `.version`.
-pub const version = "0.0.0";
+/// Project version: build.zig.zon's `.version`.
+pub const version: []const u8 = @import("build_options").version;
+/// The commit the build is from, when the builder passed `-Dversion-commit`
+/// (the release CLIs do); null for a plain local build.
+pub const version_commit: ?[]const u8 = @import("build_options").version_commit;
 
 /// Phase 0 dispatch smoke test (threaded `@call(.always_tail)`).
 pub const dispatch = @import("dispatch.zig");

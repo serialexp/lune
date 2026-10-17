@@ -33,9 +33,8 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 - [ ] **This machine has no Node >= 22.13**, which the installed pnpm 11
       needs (only Zed's bundled 22.5.1). `just cli` ran locally through a
       `pnpm` shim of `bun x pnpm@10`.
-- [ ] **The CLI has no `--version`.** A release binary can't say which tag
-      or commit it is; `build.zig` could pass the version (and LUNE_COMMIT)
-      in through `build_options`.
+- [x] **The CLI has no `--version`.** Done 2026-10-17: build.zig.zon's
+      version plus `-Dversion-commit` (the release CLIs pass LUNE_COMMIT).
 
 ## Zig std unwinder vs JIT code (noted 2026-10-16, needs Bart)
 
