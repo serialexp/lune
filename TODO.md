@@ -15,7 +15,9 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
       exit gave up after `hotexit + tryside` firings and deopted coarsely
       for the rest of the run (t2 exit 31: 98k burst ends). Fixed
       2026-10-19 (test "doc 56 Phase 3: a wanted exit binds to a
-      continuation whose .link runs silent"); 320 → ~300 ms locally.
+      continuation whose .link runs silent"); `397831e`. Board against
+      1b60a01: nsieve-bit-fp 393.9 → 350.9 ms (−10.9%), scimark-fft
+      276.6 → 219.9 ms (−20.5%), the rest within noise.
 - [ ] **The `while` inside `for k` has no looping root trace.** Every
       trace anchored at the `while` body (pc 53) is a `link -> 45`
       composite that runs it once (t2) or twice (t6). Once `i > 2·cm` it
@@ -25,6 +27,18 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
       as its own root at its `BC_LOOP` and the `for k` side trace links to
       it. Doc 38/56/58 territory (G6, nest formation); diagnose before
       designing (Z-8).
+- [ ] **Measured P6-Q3(b), bursts take exit adapters (experiment,
+      reverted 2026-10-19).** The cause of the `for k` root's give-up
+      above: inside `driveChain` the native call runs with
+      `exit_side_ok = 0`, so t6's own adapter, which loops the `while`
+      natively, is skipped and every chain "misses". Flipping both
+      burst-origin wrappers (`runCapturingLedger`,
+      `runLinkedLoopDoneCapturing`) to `true` is NOT one flag: nsieve-bit-fp
+      then dies at line 22 ("arithmetic on a nil value"), so some burst
+      consumer mis-resumes an `.exit_side` terminal. The other seam-heavy
+      benches kept their output and did not speed up (best of 3,
+      `--time`): fft 125 → 147 ms, lu 138 → 138, sparse 108 → 109,
+      nsieve 12.4 → 12.0, sieve_int 5.25 → 5.17.
 - [ ] **Exit-side give-ups are permanent.** `.gave_up` "returns to
       today's routes for good", so a program whose shape changes phase
       (above) keeps the coarse deopt after the phase that defeated it.

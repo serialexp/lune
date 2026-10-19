@@ -6,10 +6,21 @@ WORST BOARD ROW (2026-10-19, amber-badger): nsieve-bit-fp.
 - Diagnosis and the open items are in TODO.md "nsieve-bit-fp, the board's
   worst row". The time goes to the steering seam (35% by TSC, ~65% by perf),
   not to native code.
-- Fixed: a wanted exit never bound to a continuation whose `.link` was
-  silent (`driveSeedSilentResult` dropped `linked_trace`). Regression test
-  in interp_exit_side_test.zig, mutation-checked. Gates green.
-- Next: the missing `while` root (TODO), after the board confirms the fix.
+- Fixed in `397831e`: a wanted exit never bound to a continuation whose
+  `.link` was silent (`driveSeedSilentResult` dropped `linked_trace`).
+  Regression test in interp_exit_side_test.zig, mutation-checked. Gates
+  green (test, jit-debug, hashgate 90/90 both legs, embed-test, wasm,
+  lib).
+- Board on 397831e (pt-default) against 1b60a01: scimark-fft −20.5%
+  (276.6 → 219.9 ms, 12.1× → 9.6×), nsieve-bit-fp −10.9% (393.9 → 350.9,
+  18.6× → 16.4×, now faster than tier-0). Every other row within ±1.3%,
+  except str_gmatch +1.9%. Instruction counts with and without the fix are
+  identical on str_gmatch, binary-trees and lua54, so that's noise.
+- Measured and reverted P6-Q3(b) (bursts take exit adapters): wrong output
+  on nsieve-bit-fp, no win elsewhere. Details in TODO.
+- Next candidates (TODO "nsieve-bit-fp, the board's worst row"): the
+  `while` that has no looping root, permanent exit-side give-ups, the
+  per-row replay re-deriving static exit facts.
 
 LINE LOOKUP FIX (2026-10-11, coral-marten): LANDED in `49fd572`, bundled with amber-badger's doc 61 Phase K.
 - Bug from TODO.md "Every located runtime error rescans the source for
