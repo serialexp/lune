@@ -2,6 +2,49 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## nsieve-bit-fp, the board's worst row (noted 2026-10-19)
+
+18.6× LuaJIT on the 1b60a01 board, and JIT (394 ms) slower than tier-0
+(371 ms). `--jit-stats`: native 26.5% of cycles, steering seam 35%
+(251k ledger walks at ~2k cycles each); perf puts the seam (replay,
+`accountRegionProfit`, region observers, trampoline) at ~65% of cycles.
+Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
+
+- [x] **A wanted exit never bound to a continuation whose `.link` was
+      silent.** `driveSeedSilentResult` dropped `linked_trace`, so the
+      exit gave up after `hotexit + tryside` firings and deopted coarsely
+      for the rest of the run (t2 exit 31: 98k burst ends). Fixed
+      2026-10-19 (test "doc 56 Phase 3: a wanted exit binds to a
+      continuation whose .link runs silent"); 320 → ~300 ms locally.
+- [ ] **The `while` inside `for k` has no looping root trace.** Every
+      trace anchored at the `while` body (pc 53) is a `link -> 45`
+      composite that runs it once (t2) or twice (t6). Once `i > 2·cm` it
+      runs three or more times, both composites deopt at their `while`
+      test, and the `for k` root's `while` exit gives up after 4 unlinked
+      chains (`noteExitSideChain`), for good. LuaJIT records the `while`
+      as its own root at its `BC_LOOP` and the `for k` side trace links to
+      it. Doc 38/56/58 territory (G6, nest formation); diagnose before
+      designing (Z-8).
+- [ ] **Exit-side give-ups are permanent.** `.gave_up` "returns to
+      today's routes for good", so a program whose shape changes phase
+      (above) keeps the coarse deopt after the phase that defeated it.
+      LuaJIT has no such latch on a parent exit; its blacklisting is on
+      recording failures.
+- [ ] **A chain that hands off to a same-anchor sibling which then links
+      is not counted as linked** (`routeExitSide` reads `linked_trace`,
+      set only when the entered candidate's own `.link` row heads the
+      span). Sound to count it: a coarse deopt of a trace anchored at the
+      resume pc leaves the slab coherent there. Not observed on the bench
+      or the m=5000 kernel (a prototype changed no counter), so no test
+      can pin it yet; revisit if a give-up shows `[A.deopt, B.link]` rows
+      with A and B at the same anchor.
+- [ ] **Per-row replay re-derives static exit facts.** `resumeOf`,
+      `isNumericForLoopDoneGuard`, `guardExitPc`/`guardSourcePc` and
+      `isOwnLoopTest` decode IR and provenance for every replayed row
+      (~12% of nsieve-bit-fp's cycles together). They are pure functions
+      of the immutable `TraceCode` and could be one per-exit table built
+      at commit.
+
 ## Vendor bundle leftovers (noted 2026-10-13)
 
 - [ ] **`mahina-sys`'s zig fallback ignores cargo's `TARGET`.** Without

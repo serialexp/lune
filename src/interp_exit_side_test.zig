@@ -1718,6 +1718,63 @@ test "doc 56 G6 follow-up: a cycle whose ledger cap lands on its region bridge y
     });
 }
 
+/// The nsieve-bit-fp kernel (`bench/luajit/nsieve-bit-fp.lua`) at m = 5000.
+/// The `while` inside the `for k` loop makes the sieve's clear-a-bit branch
+/// exit twice: from the `for k` root and from the side trace that ran the
+/// `while` once. Both resume at the `for_loop` continuation, whose `.link`
+/// is silent-promoted by the time the second exit goes wanted.
+const nsieve_bit_fp_src =
+    \\local floor, ceil = math.floor, math.ceil
+    \\local onebits = (2^50)-1
+    \\local function nsieve(p, m)
+    \\  local cm = ceil(m/50)
+    \\  do local onebits = onebits; for i=0,cm do p[i] = onebits end end
+    \\  local count, idx, bit = 0, 2, 2
+    \\  for i=2,m do
+    \\    local r = p[idx] / bit
+    \\    if r - floor(r) >= 0.5 then
+    \\      local kidx, kbit = idx, bit
+    \\      for k=i+i,m,i do
+    \\        kidx = kidx + i
+    \\        while kidx >= cm do kidx = kidx - cm; kbit = kbit + kbit end
+    \\        local x = p[kidx]
+    \\        local r = x / kbit
+    \\        if r - floor(r) >= 0.5 then p[kidx] = x - kbit*0.5 end
+    \\      end
+    \\      count = count + 1
+    \\    end
+    \\    idx = idx + 1
+    \\    if idx >= cm then idx = 0; bit = bit + bit end
+    \\  end
+    \\  return count
+    \\end
+    \\print(nsieve({}, 5000))
+;
+
+test "doc 56 Phase 3: a wanted exit binds to a continuation whose .link runs silent" {
+    // A wanted exit binds to the continuation at its resume pc once a chain
+    // into it runs to the `.link`. When that `.link` is a promoted silent
+    // edge the chain returns through `driveSeedSilentResult`, which used to
+    // drop the fact: every firing counted as a miss, and the exit gave up
+    // after `hotexit + tryside` firings, deopting coarsely for the rest of the
+    // run (98k burst ends on nsieve-bit-fp at the bench size). An attached
+    // exit that keeps missing gives up through its own counter
+    // (`exit_side_miss_giveups`), so every give-up here must be one of those.
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode != .record_execute_native or vm.heap.gc_stress) return;
+            const ts = &vm.trace;
+            try testing.expect(ts.registry.native_physical.silent_promotions > 0);
+            try testing.expectEqual(ts.exit_side_miss_giveups, ts.exit_side_giveups);
+            try testing.expect(ts.exit_side_chain_binds >= 2);
+        }
+    };
+    try expectProgramTuned(nsieve_bit_fp_src, "669\n", .{
+        .hotloop = (@import("trace.zig").TraceConfig{}).hotloop,
+        .inspect = Inspect.run,
+    });
+}
+
 test "doc 61 §5 site 2: the dead-φ filter keeps the φs a composite bridge's continue proof needs" {
     // The sieve's `if p[i]` exit, recorded on the prime path, bridges across
     // the outer `for_loop` to the outer loop's body. The bridge stands in for

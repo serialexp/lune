@@ -386,6 +386,18 @@ pub fn driveChain(
             // at `sct`'s own exit and describes the whole fused span.
             self.prepareNativeEntry(); // B-3a global sweep hook: driveChain seed
             sresult = snt.runCapturingLedger(regs, &self.ledger_scratch, self.silentStaging());
+            self.dbg("chain-candidate: failed={d} ei={d} walk_pc={d} mat={s} cand={d} exit={d} completed={d} ledger_len={d} final={d} reason={s}", .{
+                failed.id,
+                exit_instr,
+                walk_pc,
+                @tagName(materialization),
+                sct.id,
+                sresult.exit_instr,
+                sresult.completed,
+                sresult.ledger_len,
+                sresult.final_trace_id,
+                @tagName(sresult.exit_reason),
+            });
             if (self.driveSeedSilentResult(sct, sresult, proto, regs, safe_to_arm, materialization)) |silent|
                 return silent;
             // A ledger deeper than the ONE fused hop the scalar `fused_inner`
@@ -639,6 +651,16 @@ pub fn driveSeedSilentResult(
         seed.code.anchor.pc;
     var resume_pc: u32 = seed_inner_pc;
     var hops: usize = 0;
+    // Doc 56 Phase 3's `linked_trace`, silent half. Silence starts only on an
+    // empty ledger (`emitSilentEpilogue`), so the first promoted edge that
+    // fired (`silent_cell`) is the seed's own first transition: the seed ran
+    // to its `.link` exactly when that edge is its `.link` terminal. Read
+    // before the drain, which may queue demotions of the promotion storage.
+    const seed_linked = result.silent_active != 0 and blk: {
+        const owner = self.silentCellOwner(result.silent_cell) orelse break :blk false;
+        const edge = owner.set.edges[owner.phase];
+        break :blk edge.parent == seed and edge.kind == .link_terminal;
+    };
     const directive = self.drainSilentResult(
         result,
         .continuation_call,
@@ -660,7 +682,7 @@ pub fn driveSeedSilentResult(
     );
     if (materialization == .ordinary_header) self.prime_side_chain_follows +|= 1;
     self.settleNativeCallProvenance(&provenance, safe_to_arm);
-    return switch (directive) {
+    var r: ChainResult = switch (directive) {
         .run_continuation => |c| blk: {
             const snt = self.nativeFor(c) orelse
                 @panic("driveSeedSilentResult: run_continuation target has no native code");
@@ -690,6 +712,8 @@ pub fn driveSeedSilentResult(
             break :blk .{ .completed = 0, .resume_pc = resume_pc };
         },
     };
+    if (seed_linked and r.linked_trace == null) r.linked_trace = seed;
+    return r;
 }
 
 /// The linked ping-pong burst (doc 15/16), extracted from `driveChain` (2.3c-1) so

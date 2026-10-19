@@ -1,3 +1,16 @@
+WORST BOARD ROW (2026-10-19, amber-badger): nsieve-bit-fp.
+- Board on 1b60a01 (gothab run e3763f2b): nsieve-bit-fp 18.6× LuaJIT, its
+  JIT run slower than tier-0. Next worst: fft 12.1×, recursive-fib 10.4×,
+  spectral-norm 9.8×, euler14-bit 9.0×, pi_leibniz 8.9×, binary-trees
+  8.0× (JIT also slower than tier-0).
+- Diagnosis and the open items are in TODO.md "nsieve-bit-fp, the board's
+  worst row". The time goes to the steering seam (35% by TSC, ~65% by perf),
+  not to native code.
+- Fixed: a wanted exit never bound to a continuation whose `.link` was
+  silent (`driveSeedSilentResult` dropped `linked_trace`). Regression test
+  in interp_exit_side_test.zig, mutation-checked. Gates green.
+- Next: the missing `while` root (TODO), after the board confirms the fix.
+
 LINE LOOKUP FIX (2026-10-11, coral-marten): LANDED in `49fd572`, bundled with amber-badger's doc 61 Phase K.
 - Bug from TODO.md "Every located runtime error rescans the source for
   its line": `compiler.lineFromOffset` scanned from byte 0 per error,
