@@ -62,18 +62,14 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
   (every `@bench` program, tier-0 and JIT instructions).
 - Landed: `pairs` quadratic (9b212e2), in-place local operands
   (69fec42), and the `for` step-sign soundness fix (aa9af90).
-- **Uncommitted, gated:**
-  - `src/interp.zig`: the `for_loop` raw lanes (with float limits), the
-    field fast paths (`heapKeyChainGet`), and item 3 (`opCompare`,
-    `opEqNe`, `opModIdiv` and their slow halves).
-  - Also `hash_part.zig` (`liveHeapNode`/`liveIntNode`), the grid deflate
-    test in `interp_native_test.zig`, the fast-path semantics tests,
-    doc 62, and TODO.md.
-  - All five gates are green on the combined tree, and viz is 72/72.
-  - **Held:** interp.zig also carries amber-badger's doc 64 step 2 hunk
-    (~line 4413, `exitSideChainOutcome`). Neither of us can commit it
-    alone (Rule #13), and amber-badger asked Bart about a bundled commit
-    (forum, 2026-10-20 15:41). Wait for that answer.
+- **Landed in `d40cf2d`** (bundled at Bart's direction with amber-badger's
+  doc 64 step 2, since both touched src/interp.zig):
+  - the `for_loop` raw lanes, including float limits;
+  - the field fast paths (`heapKeyChainGet`, `HashPart.liveHeapNode` and
+    `liveIntNode`);
+  - item 3 (`opCompare`, `opEqNe`, `opModIdiv` and their slow halves);
+  - their tests and doc 62.
+  All five gates were green, and viz was 72/72.
 - Next: item 4, the bytecode forms (constant operands, fused
   compare+branch, `ITERN`), which needs a design doc. Then item 5
   (call/return) and item 6 (dispatch prologue, doc 42 §4.2).
