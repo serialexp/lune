@@ -2,7 +2,8 @@
 # The CLI release: a `mahina` binary per platform with the trace visualiser
 # (viz/) embedded, so `mahina viz` serves it with nothing else installed.
 # Run it via `just cli [out]` (default zig-out/mahina-cli). Needs zig (the
-# pinned one), node and pnpm (viz/pnpm-lock.yaml is the UI's lockfile).
+# pinned one), Node >= 22.13 and pnpm (the version viz/package.json pins;
+# viz/pnpm-lock.yaml is the UI's lockfile).
 #
 #   <out>/
 #     LUNE_COMMIT                       full sha of HEAD, "-dirty" if the tree wasn't clean

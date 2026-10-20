@@ -182,13 +182,14 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
           sha256: ${{ env.ZIG_SHA256 }}
 
-      # The web UI's toolchain: viz/pnpm-lock.yaml is lockfile v9.
-      - uses: pnpm/action-setup@v4
+      # The web UI's toolchain: the pnpm viz/package.json pins
+      # (`packageManager`), on the Node it needs (>= 22.13).
+      - uses: pnpm/action-setup@v6
         with:
-          version: 10
+          package_json_file: viz/package.json
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Build the CLI
         run: bash tools/mahina-cli.sh "$RUNNER_TEMP/mahina-cli"

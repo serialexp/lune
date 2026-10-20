@@ -81,15 +81,17 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
 
 ## CLI release leftovers (noted 2026-10-16)
 
-- [ ] **`viz/bun.lock` is stale; `viz/README.md` still says `bun install`.**
-      `pnpm-lock.yaml` (2026-09-10) is the lockfile `just cli` and CI use;
-      `bun.lock` stopped at 2026-08-31. `bun install` over the pnpm
-      `node_modules` lays a second copy of `@codemirror/*` beside `.pnpm/`
-      and `tsc` fails on the duplicate types. Drop `bun.lock` and point the
-      README at pnpm (Bart's call: bun may be wanted for `bun test`).
-- [ ] **This machine has no Node >= 22.13**, which the installed pnpm 11
-      needs (only Zed's bundled 22.5.1). `just cli` ran locally through a
-      `pnpm` shim of `bun x pnpm@10`.
+- [x] **`viz/bun.lock` is stale; `viz/README.md` still says `bun install`.**
+      Done 2026-10-20: `bun.lock` dropped, pnpm only (`packageManager`
+      pins pnpm 11.28.6, CI's action-setup reads it), bun stays the
+      `pnpm test` runner.
+- [x] **This machine has no Node >= 22.13.** Wrong: nvm had 24.13 all
+      along, just not on the tool shell's PATH. nvm default is now 24.22.0.
+- [ ] **A stale global bun 1.2.2 in `~/.local/share/pnpm`** (a pnpm-10
+      global; crashes the viz wasm tests). Shadowed by `~/.bun/bin` in
+      interactive zsh, so harmless there. pnpm 11 globals live in
+      `$PNPM_HOME/bin`, which isn't on PATH, so `pnpm add -g` refuses until
+      `pnpm setup` edits `.zshrc` (Bart's call), or remove it.
 - [x] **The CLI has no `--version`.** Done 2026-10-17: build.zig.zon's
       version plus `-Dversion-commit` (the release CLIs pass LUNE_COMMIT).
 
@@ -458,7 +460,9 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
 
 ## viz tests crash under bun 1.3.0 (noted 2026-10-10)
 
-- [ ] `bun test` in `viz/` segfaults loading the wasm module under bun
+- [x] **Fixed 2026-10-20 by upgrading:** `/usr/local/bin/bun` and
+      `~/.bun/bin/bun` are both 1.4.3 now, and `pnpm test` passes 72/72.
+      `bun test` in `viz/` segfaults loading the wasm module under bun
       1.3.0 (the `bun` on PATH). `~/.bun/bin/bun` 1.3.14 passes all 70.
       Either pin the bun version (`packageManager`/engines, or the justfile
       recipe calls `~/.bun/bin/bun`) or upgrade the system bun.

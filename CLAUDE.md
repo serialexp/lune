@@ -213,8 +213,9 @@ the `zig build` invocations and, for benchmarks, guarantee the right binary.
   (`tools/mahina-cli.sh`: six platforms, stripped ReleaseFast, the `viz/` UI
   embedded via `-Dviz-dist` for `mahina viz`) and their smoke test, which
   also runs `install.sh` (the Linux/macOS `curl | sh` installer) against
-  them via `tools/install-smoke.sh`. Needs node
-  + pnpm (`viz/pnpm-lock.yaml` is the lockfile — never `bun install` there).
+  them via `tools/install-smoke.sh`. Needs Node >= 22.13 + pnpm (the
+  version `viz/package.json` pins; `viz/pnpm-lock.yaml` is the only lockfile —
+  never `bun install` there; bun is only the `pnpm test` runner).
   `mahina viz`'s server, `src/viz_server.zig`, is the CLI's only `std.Io.net`/
   `std.http` user (Rule Z-2) and stays out of the VM core.
 

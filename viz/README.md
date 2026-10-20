@@ -12,17 +12,20 @@ time-stepping. Time-travel stepping waits on the effect-log / keyframe work (see
 
 ## Stack
 
-Bun + Vite + SolidJS. The binary decoder is **generated** from
+Vite + SolidJS, installed with pnpm (the version `package.json`'s
+`packageManager` pins; Node >= 22.13). Bun is the test runner only; never
+`bun install` here, which lays a second dependency tree beside pnpm's. The binary
+decoder is **generated** from
 `../schema/trace.json` by binschema and **vendored** under `src/gen/` (committed
 output — no build-time dependency on the binschema repo).
 
 ## Develop
 
 ```sh
-bun install
-bun run dev        # vite dev server; open the printed URL
-bun run build      # tsc --noEmit && vite build  → dist/
-bun test           # cross-language decode + disasm + store tests
+pnpm install
+pnpm dev           # vite dev server; open the printed URL
+pnpm build         # tsc --noEmit && vite build  → dist/
+pnpm test          # `bun test`: cross-language decode + disasm + store tests
 ```
 
 `mahina viz [trace.mahinatrace]` serves a built copy of this app from the CLI
