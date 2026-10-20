@@ -287,6 +287,41 @@ pub const HashPart = extern struct {
         return n.value;
     }
 
+    /// The node holding heap key `key` live, or null when `key` is absent
+    /// (no node, or only a dead one). The probe of `liveSlotOf`, specialised
+    /// to a heap key and inlined into the interpreter's `get_index` and
+    /// `set_index`, where it calls nothing. A heap key matches by id alone.
+    pub inline fn liveHeapNode(self: *const HashPart, key: Value) ?*Node {
+        std.debug.assert(key.isHeap());
+        return self.liveNodeInline(.heap_ref, key.asHeap().id);
+    }
+
+    /// `liveHeapNode` for an integer key (one outside the array part).
+    pub inline fn liveIntNode(self: *const HashPart, i: i64) ?*Node {
+        return self.liveNodeInline(.int, @bitCast(i));
+    }
+
+    /// The inline probe behind `liveHeapNode` / `liveIntNode`: a key whose
+    /// tag is known at compile time, identified by its heap id or its
+    /// payload bits (`Ident`).
+    inline fn liveNodeInline(self: *const HashPart, comptime tag: value.Tag, payload: u64) ?*Node {
+        const nodes = self.nodes orelse return null;
+        const mask = self.mask;
+        var idx: u32 = @truncate(mixHash(tag, payload) & mask);
+        var limit: u64 = @as(u64, mask) + 1;
+        while (limit != 0) : (limit -= 1) {
+            const n = &nodes[idx];
+            if (n.isFree()) return null; // chain ends
+            const same = n.key_tag == tag and if (tag == .heap_ref) n.key_id == payload else n.key_payload.bits == payload;
+            if (same) {
+                // A dead match proves logical absence.
+                return if (n.value.isNil()) null else n;
+            }
+            idx = (idx + 1) & mask;
+        }
+        return null;
+    }
+
     /// The node a hint names, or null when the map has no nodes or the hint
     /// is out of range (a hint can come from an earlier, larger layout, or
     /// from another table). Indexes through a slice so a safe build would

@@ -279,6 +279,7 @@ pub fn noteExitSideCommit(self: *TraceState, parent: *Trace, exit_instr: u32, ch
         unpublishExitAdapter(parent, exit_instr);
         self.exit_side_giveups +|= 1;
         self.dbg("exit-side: trace={d} exit={d} gave up (child t={d} is not a .link continuation)", .{ parent.id, exit_instr, child.id });
+        awaitExitSideRevival(self, parent, exit_instr);
     }
 }
 
@@ -556,6 +557,7 @@ fn routeExitSide(self: *TraceState, t: *Trace, exit_instr: u32, count: u8) bool 
                 unpublishExitAdapter(t, exit_instr);
                 self.exit_side_giveups +|= 1;
                 self.dbg("exit-side: trace={d} exit={d} gave up after {d} firings", .{ t.id, exit_instr, count });
+                awaitExitSideRevival(self, t, exit_instr);
             }
             return true;
         },
@@ -635,23 +637,102 @@ pub fn armExitSide(self: *TraceState, parent: *Trace, exit_instr: u32, child: *T
     self.dbg("exit-side: trace={d} exit={d} arm -> child={d} at pc={d}: {s}", .{ parent.id, exit_instr, child.id, child.code.anchor.pc, if (armed) "armed" else "refused" });
 }
 
-/// Doc 56 §4.8.3 R4 (G4): account one routed firing of exit `exit_instr`
-/// whose chain at the resume pc did (`linked`) or did not reach a
-/// continuation's `.link`. Only ATTACHED exits count (a wanted exit has its
-/// own `hotexit + tryside` bound). `tryside` consecutive misses mean no
+/// Doc 64 §10 step 2: how an exit-side chain at `P` ended.
+pub const ChainOutcome = enum {
+    /// A continuation ran to its `.link` (`ChainResult.linked_trace`).
+    served,
+    /// The chain's last candidate deopted at the exit of a loop that
+    /// encloses `P` (`chainEndsEnclosingLoop`): the guest left that loop.
+    /// Not proof the continuation fits (its iteration is replayed by
+    /// tier-0), and not evidence that it does not.
+    natural_stop,
+    /// Anything else: no candidate, a refusal, or a deopt that is not a
+    /// loop exit.
+    misfit,
+};
+
+/// Doc 64 §10 step 2: classify the chain `driveChain` ran for exit
+/// `exit_instr` of `parent` (null when no candidate ran).
+pub fn exitSideChainOutcome(self: *const TraceState, parent: *const Trace, exit_instr: u32, chained: ?trace_mod.ChainResult) ChainOutcome {
+    const c = chained orelse return .misfit;
+    if (c.linked_trace != null) return .served;
+    const term = c.terminal orelse {
+        self.dbg("exit-side outcome: trace={d} exit={d} misfit (no single-candidate terminal)", .{ parent.id, exit_instr });
+        return .misfit;
+    };
+    const t = self.traceById(term.trace_id) orelse return .misfit;
+    const natural = chainEndsEnclosingLoop(parent, exit_instr, t, term.exit_instr);
+    self.dbg("exit-side outcome: trace={d} exit={d} terminal t={d} e={d} for_done={} own_test={} -> {s}", .{
+        parent.id,                               exit_instr,                        t.id, term.exit_instr,
+        t.code.isNumericForLoopDoneGuard(term.exit_instr), t.code.isOwnLoopTest(term.exit_instr),
+        if (natural) "natural_stop" else "misfit",
+    });
+    return if (natural) .natural_stop else .misfit;
+}
+
+/// Doc 64 §10 step 2: does exit `e` of `t` leave a loop that encloses the
+/// resume pc `P` of `parent`'s exit `exit_instr`? Two exits qualify, both at
+/// inline depth 0 in `parent`'s own proto:
+///  - a numeric-`for` loop-done guard (`isNumericForLoopDoneGuard`: a
+///    `guard_true` on the `for_loop` test, which fails exactly when the
+///    loop ends), for the loop whose back-edge is that `for_loop`;
+///  - the test of `t`'s own loop (`isOwnLoopTest`) when the direction it
+///    fails into, `resumeOf`, lies outside that loop. An unrolled copy and
+///    a recorded loop exit (whose failure STAYS in the loop) do not.
+/// `P` must lie inside the loop's static extent (`loopExtentFor`). A
+/// guard of any other loop, or of an inlined callee's, is a misfit.
+pub fn chainEndsEnclosingLoop(parent: *const Trace, exit_instr: u32, t: *const Trace, e: u32) bool {
+    const proto = parent.code.anchor.proto;
+    if (t.code.anchor.proto != proto) return false;
+    const p = parent.code.exitResumePc(exit_instr) orelse return false;
+    if (e >= t.code.instrs.len) return false;
+    const header: u32 = blk: {
+        if (t.code.isNumericForLoopDoneGuard(e)) {
+            const src = guardSourcePc(t.code.instrs[e]) orelse return false;
+            break :blk bytecode.loopHeaderOf(proto.code[src], src) orelse return false;
+        }
+        if (t.code.isOwnLoopTest(e)) {
+            const h = t.code.anchor.pc;
+            const ext = bytecode.loopExtentFor(proto, h) orelse return false;
+            const q = switch (@import("trace_exit_attach.zig").resumeOf(&t.code, e)) {
+                .pc => |q| q,
+                .refused => return false,
+            };
+            if (q >= ext.start and q <= ext.end) return false; // fails back into the loop
+            break :blk h;
+        }
+        return false;
+    };
+    const ext = bytecode.loopExtentFor(proto, header) orelse return false;
+    return p >= ext.start and p <= ext.end;
+}
+
+/// Doc 56 §4.8.3 R4 (G4), doc 64 §10 step 2: account one routed firing of
+/// exit `exit_instr` by how its chain at the resume pc ended. Only ATTACHED
+/// exits count (a wanted exit has its own `hotexit + tryside` bound). A
+/// served chain resets the miss count; a natural stop leaves it alone (2b:
+/// the guest left an enclosing loop, which says nothing either way about
+/// the fit); a misfit counts. `tryside` consecutive misfits mean no
 /// continuation at `P` fits what this exit brings — nsieve's init-loop exit
 /// bound a child recorded while the array grew, whose own `guard_append`
 /// then fails at its first instruction on every later call — so the exit
 /// gives up: its exit-side arm is disarmed, the adapter unpublished, the
 /// state set to `.gave_up`, and its DONE latch cleared so today's routes see
 /// it again once it re-heats. Deterministic: a pure function of receipts.
-pub fn noteExitSideChain(self: *TraceState, parent: *Trace, exit_instr: u32, linked: bool) void {
+pub fn noteExitSideChain(self: *TraceState, parent: *Trace, exit_instr: u32, outcome: ChainOutcome) void {
     if (parent.exitSideAt(exit_instr) != .attached) return;
     if (exit_instr >= parent.exit_side_misses.len) return;
     const m = &parent.exit_side_misses[exit_instr];
-    if (linked) {
-        m.* = 0;
-        return;
+    switch (outcome) {
+        .served => {
+            m.* = 0;
+            return;
+        },
+        .natural_stop => {
+            self.exit_side_natural_stops +|= 1;
+            return;
+        },
+        .misfit => {},
     }
     m.* +|= 1;
     if (m.* < self.config.tryside) return;
@@ -668,6 +749,54 @@ pub fn noteExitSideChain(self: *TraceState, parent: *Trace, exit_instr: u32, lin
     self.exit_side_giveups +|= 1;
     self.exit_side_miss_giveups +|= 1;
     self.dbg("exit-side: trace={d} exit={d} gave up after {d} unlinked chains", .{ parent.id, exit_instr, self.config.tryside });
+    awaitExitSideRevival(self, parent, exit_instr);
+}
+
+/// Doc 64 §10 step 2 (2d): file given-up exit `exit_instr` of `parent` under
+/// its resume point, so the next continuation committed there gets one more
+/// chance (`reviveExitSideAt`). Fail-soft: on OOM the give-up is final, as
+/// before 2d.
+fn awaitExitSideRevival(self: *TraceState, parent: *const Trace, exit_instr: u32) void {
+    const p = parent.code.exitResumePc(exit_instr) orelse return;
+    self.exit_side_waiting.append(self.gpa, .{
+        .proto_id = parent.code.anchor.proto.id,
+        .pc = p,
+        .exit = .{ .trace_id = parent.id, .exit_instr = exit_instr },
+    }) catch {};
+}
+
+/// Doc 64 §10 step 2 (2d, Codex's form): a `.link` continuation `t` just
+/// committed. Every given-up exit whose resume point is `t`'s anchor returns
+/// to `.none` — new evidence that a child can now serve it — and re-heats
+/// through `hotexit` like a fresh exit. Each waiting entry is consumed here,
+/// so a revived exit that gives up again waits for the NEXT commit at its
+/// `P`: revivals are bounded by commits, never periodic. Entries whose trace
+/// is gone are dropped on the way. Deterministic: commit order and receipt
+/// contents only.
+pub fn reviveExitSideAt(self: *TraceState, t: *const Trace) void {
+    const n = t.code.instrs.len;
+    if (n == 0 or t.code.instrs[n - 1].op != .link) return;
+    const proto_id = t.code.anchor.proto.id;
+    const pc = t.code.anchor.pc;
+    var i: usize = 0;
+    while (i < self.exit_side_waiting.items.len) {
+        const w = self.exit_side_waiting.items[i];
+        const parent = self.traceById(w.exit.trace_id);
+        const here = w.proto_id == proto_id and w.pc == pc;
+        if (parent != null and !here) {
+            i += 1;
+            continue;
+        }
+        _ = self.exit_side_waiting.swapRemove(i);
+        const par = parent orelse continue;
+        const e = w.exit.exit_instr;
+        if (par.exitSideAt(e) != .gave_up) continue;
+        par.exit_side[e] = .none;
+        if (e < par.exit_side_misses.len) par.exit_side_misses[e] = 0;
+        if (e < par.exit_counts.len and par.exit_counts[e] != Trace.EXIT_COUNT_DONE) par.exit_counts[e] = 0;
+        self.exit_side_revivals +|= 1;
+        self.dbg("exit-side: trace={d} exit={d} revived by t={d} at pc={d}", .{ par.id, e, t.id, pc });
+    }
 }
 
 /// Doc 56 Phase 5: apply the disarm a replayed child prologue failure
@@ -2689,6 +2818,7 @@ pub fn dropEntryPatchState(self: *TraceState) void {
 
 pub fn clearCache(self: *TraceState) void {
     self.clearProvenanceEdges();
+    self.exit_side_waiting.clearRetainingCapacity();
     self.registry.native_physical.debug_log = self.config.debug_log;
     self.registry.clear();
     self.syncNativeInvalidation();

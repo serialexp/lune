@@ -1,7 +1,8 @@
 # 64 — Heavy-iteration loop nests: region decay, exit-side give-ups, the marker root
 
 Status: **reviewed (round 1, §9), decided (§10); step 1 (diagnosis)
-done (§11), which corrects §3 P1. No policy change built yet.**
+done (§11), which corrects §3 P1; step 2 (typed chain outcome, 2b, 2d)
+built (§12). Next: step 3 (3b).**
 Bart asked for this doc and for Codex's and Antigravity's opinions
 before picking options. Corrections from the reviews are applied in
 place and listed in §9. Where the reviewers disagreed, Bart asked me to
@@ -581,4 +582,87 @@ m = 160000 (smaller m does not saturate the penalty). It asserts that the
 `for k` header ends permanently gated, that at least 500 `region_decay`
 gates fire (755 today), and that departure closes (10,862) outnumber
 `source_outside` closes (753) more than four to one. Step 4 flips the
-gate assertions.
+gate assertions. (Step 2 flipped them first, §12.)
+
+## 12. Step 2 result: natural stops and revival (2026-10-21)
+
+**What was built.**
+- `ChainResult.terminal` carries the deopt that ended an unlinked chain
+  when it is one candidate's own exit. The R2 retry path keeps it too:
+  t7 e10's chains ended there, so the first build saw no terminal at all.
+- `exitSideChainOutcome` (`trace_link.zig`) classifies each routed chain
+  as `served`, `natural_stop` or `misfit`. A natural stop is a numeric-for
+  loop-done guard, or an own-loop test that fails out of its loop, of a
+  loop whose static extent contains `P` (`chainEndsEnclosingLoop`).
+- `noteExitSideChain` takes the outcome. Served resets the misses, a
+  natural stop is neutral (counted in `exit_side_natural_stops`), and a
+  misfit counts toward `tryside`.
+- 2d: every give-up except "no native adapter" files the exit under its
+  `P` (`exit_side_waiting`). A committed `.link` continuation anchored at
+  `P` consumes those entries and returns their exits to `.none`
+  (`reviveExitSideAt`, `exit_side_revivals`). Each commit allows one
+  revival per waiting exit, and nothing revives without a commit.
+- The 3b half of 2d (a root at `loopHeaderOf(P)` also revives) lands with
+  step 3.
+
+**Kernel, m = 160000** (the step 1 witness, without coverage), against
+the same tree with step 2 switched off:
+
+| | before | after |
+|---|---|---|
+| natural stops | 0 | 770 |
+| exit-side give-ups | 3 | 1 (t1 e15, no single-candidate terminal: P3) |
+| `region_decay` gates on the `for k` header | 754 | 0 |
+| `legacy_thrash` gates | 1,500 | 0 |
+| region closes: departure / source_outside | 10,862 / 753 | 11,617 / 2 |
+
+t7 e10 now stays attached, so the `for k` cycle keeps its exit-side arm
+and the activations stop striking the owner. Step 1's gate finding
+was a consequence of P2, not a separate fault: §11's strikes came
+from activations that had lost the `while` arm.
+
+**Full bench (`nsieve-bit-fp.lua 6`, sizes 640000/320000/160000 in one
+process)**:
+
+| | before | after |
+|---|---|---|
+| natural stops | 0 | 5,814 |
+| `region_decay` gates on pc 45 | 5,801 | 3 |
+| `legacy_thrash` gates on pc 45 / 54 / 37 | 5,796 / 6 / 5,798 | 22,015 / 509 / 0 |
+| region closes: departure / destination_outside / source_outside | 31,064 / 0 / 5,800 | 59,226 / 21,953 / 29 |
+| revivals | — | 0 |
+
+Here two exits still give up. Both give-ups come late (log lines 1.37M
+and 1.52M of 2.04M), and the old turnstile then returns as
+`legacy_thrash` gates instead of `region_decay` gates.
+- **t1 e15** gives up after 4 chains with no single-candidate terminal.
+  Its chains run through the t2/t6 composites at the `.loop` marker and
+  end deep in them. This is P3: step 3 offers the loop root first.
+- **t7 e10** gives up after 4 misfits at t8 e23, the `if r - floor(r) >=
+  0.5` branch in the post-`while` body. They come in a burst right after
+  trace 11 commits at pc 14, the start of the next `nsieve` call. The
+  freshly initialised array flips that branch's direction, and t8 was
+  recorded on the other one. These are real misfits by §10's definition.
+  Nothing commits at pc 63 after that, so 2d has nothing to revive on.
+  This is what §10 called 2c territory: a sibling at 63 would both serve
+  the new direction and revive the exit.
+
+Neither give-up is a classification error, so step 2 stops here. Steps 3
+and 4 re-measure the remaining thrash.
+
+**Cost.** Instructions (`perf stat`, the shadow A/B of §11's method):
+nsieve-bit-fp −11.70%, every other board bench within ±0.2%, with
+identical outputs. Cycles on nsieve-bit-fp: 1.290G → 1.164G (−9.8%;
+three interleaved `perf stat` pairs, loadavg ~1.8, spread under 1%).
+
+**Witnesses** (`src/interp_nest_test.zig`; all three fail with step 2
+switched off):
+- "doc 64 steps 1-2" (was "step 1"): the `for k` header is never struck,
+  `region_decay` gates ≤ 1, no `legacy_thrash` gates, and departures still
+  dominate.
+- "doc 64 step 2: … natural stop": at least 500 natural stops on the
+  kernel.
+- "doc 64 step 2: … revives it": white-box test on a real attached exit
+  (doc 64's `while`-in-`for` nest). It checks that natural stops never
+  give the exit up, that `tryside` misfits do and file it, and that a
+  `.link` commit at `P` revives it exactly once.

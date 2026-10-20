@@ -1,8 +1,9 @@
 //! Doc 64 (heavy-iteration loop nests): end-to-end shape tests.
 //!
-//! Step 1 of doc 64 §10 pins TODAY's behaviour on the nsieve-bit-fp kernel,
-//! so each later step has a before/after. The assertions below state the
-//! current (bad) reading on purpose; the step that changes it flips them.
+//! Step 1 of doc 64 §10 pinned the behaviour on the nsieve-bit-fp kernel,
+//! so each later step has a before/after: the assertions state the current
+//! reading, and the step that changes it flips them (step 2 flipped the
+//! gate).
 //! Shared harness lives in `interp_testutil.zig`.
 
 const std = @import("std");
@@ -45,16 +46,16 @@ const nsieve_bit_fp_src =
     \\print(count)
 ;
 
-test "doc 64 step 1: the `for k` region closes when its loop ends and region decay gates its owner" {
+test "doc 64 steps 1-2: the `for k` region closes when its loop ends, and since step 2 its owner is never gated" {
     // Doc 64 §11's finding. The `for k` loop's cross-trace cycle is a region
     // owned by its header. Each activation is one whole `for k` loop, and it
     // closes when tier-0 reaches the code after the loop (a `departure`
-    // close): the loop finished. For every prime above m/8 the loop has
-    // fewer than `min_useful` steps, so the activation never fills a window
-    // and the close strikes the owner. Once the penalty saturates, every
-    // further strike gates the owner again and runs `disarmAllLinks`; the
-    // gate reaches `max_strikes` early and the anchor stays gated for the
-    // rest of the run.
+    // close): the loop finished. Before step 2, the `while` exit's chains
+    // that ended at the `for k` loop-done guard counted as misses, the exit
+    // gave up and lost its arm, the activations stopped filling a window,
+    // and region decay gated the owner for good (754 gates, `max_strikes`
+    // reached early). Step 2 (doc 64 §12) makes those chains natural stops;
+    // the exit stays attached and the owner is never struck.
     //
     // This is the production machine: no coverage, so entry patches are on
     // (`--jit-stats` runs the unpatched machine, doc 20 §R1-9, and does not
@@ -83,10 +84,10 @@ test "doc 64 step 1: the `for k` region closes when its loop ends and region dec
                 if (a != b and o[0] < r[0] and r[1] < o[1]) inner = r[0];
             };
             const k_header = inner orelse return error.TestUnexpectedResult;
-            const g = ts.gate.get(.{ .proto = proto, .pc = k_header, .proto_id = proto.id }) orelse
-                return error.TestUnexpectedResult;
-            try testing.expect(g.strikes >= ts.config.max_strikes); // gated for good
-            try testing.expect(ts.dispatch_gates.get(.region_decay) >= 500);
+            if (ts.gate.get(.{ .proto = proto, .pc = k_header, .proto_id = proto.id })) |g|
+                try testing.expectEqual(@as(@TypeOf(g.strikes), 0), g.strikes);
+            try testing.expect(ts.dispatch_gates.get(.region_decay) <= 1);
+            try testing.expectEqual(@as(u64, 0), ts.dispatch_gates.get(.legacy_thrash));
             // Region activations end because a loop finished, not because a
             // receipt left the region.
             const closes = ts.region_closes;
@@ -99,4 +100,92 @@ test "doc 64 step 1: the `for k` region closes when its loop ends and region dec
         .inspect = Inspect.run,
     });
     try testing.expectEqualStrings("14683\n", sink.buffered());
+}
+
+test "doc 64 step 2: an exit-side chain that ends by leaving its enclosing loop is a natural stop, not a misfit" {
+    // Doc 64 §12. The `while`'s exit resumes at `P` in the `for k` body; the
+    // continuation there runs to the `for k` loop-done guard whenever the
+    // loop finishes — for most primes, within a few steps. Before step 2
+    // each of those chains counted as a miss, and after `tryside` of them
+    // the exit gave up for good. Now they are natural stops: neutral.
+    const gpa = testing.allocator;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            _ = mode;
+            try testing.expect(vm.trace.exit_side_natural_stops >= 500);
+        }
+    };
+    try util.runCapturedTuned(gpa, nsieve_bit_fp_src, &sink, false, .record_execute_native, .{
+        .hotloop = (trace.TraceConfig{}).hotloop,
+        .inspect = Inspect.run,
+    });
+    try testing.expectEqualStrings("14683\n", sink.buffered());
+}
+
+test "doc 64 step 2: natural stops never give an exit up; misfits do, and the next .link commit at P revives it" {
+    // White-box: take a real attached exit and the `.link` continuation at
+    // its resume point, then drive the outcome accounting directly.
+    const gpa = testing.allocator;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            _ = mode;
+            const ts = &vm.trace;
+            const Found = struct { parent: *trace.Trace, exit: u32, child: *trace.Trace };
+            const found: Found = blk: for (ts.registry.cache.items) |parent| {
+                for (parent.exit_side, 0..) |s, e| {
+                    if (s != .attached) continue;
+                    const p = parent.code.exitResumePc(@intCast(e)) orelse continue;
+                    for (ts.registry.cache.items) |c| {
+                        const n = c.code.instrs.len;
+                        if (c.code.anchor.proto != parent.code.anchor.proto or c.code.anchor.pc != p) continue;
+                        if (n == 0 or c.code.instrs[n - 1].op != .link) continue;
+                        break :blk .{ .parent = parent, .exit = @intCast(e), .child = c };
+                    }
+                }
+            } else return error.TestUnexpectedResult;
+            const parent = found.parent;
+            const e = found.exit;
+            const tryside = ts.config.tryside;
+
+            // Natural stops are neutral, however many.
+            const stops0 = ts.exit_side_natural_stops;
+            for (0..2 * @as(usize, tryside)) |_| ts.noteExitSideChain(parent, e, .natural_stop);
+            try testing.expect(parent.exitSideAt(e) == .attached);
+            try testing.expectEqual(stops0 + 2 * @as(u64, tryside), ts.exit_side_natural_stops);
+
+            // `tryside` misfits give it up and file it under `P`.
+            const waiting0 = ts.exit_side_waiting.items.len;
+            for (0..tryside) |_| ts.noteExitSideChain(parent, e, .misfit);
+            try testing.expect(parent.exitSideAt(e) == .gave_up);
+            try testing.expectEqual(waiting0 + 1, ts.exit_side_waiting.items.len);
+
+            // A `.link` commit at `P` revives it, once: the entry is consumed.
+            const revivals0 = ts.exit_side_revivals;
+            ts.reviveExitSideAt(found.child);
+            try testing.expect(parent.exitSideAt(e) == .none);
+            try testing.expectEqual(revivals0 + 1, ts.exit_side_revivals);
+            try testing.expectEqual(waiting0, ts.exit_side_waiting.items.len);
+            ts.reviveExitSideAt(found.child);
+            try testing.expectEqual(revivals0 + 1, ts.exit_side_revivals);
+        }
+    };
+    // Doc 64's `while` inside a `for`: the while's exit attaches to the
+    // post-while continuation.
+    try util.runCapturedTuned(gpa,
+        \\local s = 0
+        \\for i = 1, 3000 do
+        \\  local j = i * 13
+        \\  for k = 1, 2 do
+        \\    while j >= 7 do j = j - 7 end
+        \\    s = s + j
+        \\    j = j + i
+        \\  end
+        \\end
+        \\print(s)
+    , &sink, false, .record_execute, .{ .inspect = Inspect.run });
+    try testing.expectEqualStrings("9006\n", sink.buffered());
 }

@@ -42,8 +42,44 @@ WORST BOARD ROW (2026-10-19, amber-badger): nsieve-bit-fp.
   "dispatch gates:" counters added; witness test in
   src/interp_nest_test.zig. Also found: `--jit-stats` (coverage) runs
   the unpatched machine and makes different tiering decisions on this
-  bench (TODO). Next: step 2, the typed chain outcome (2b) with
-  commit-triggered 2d.
+  bench (TODO). Step 2 done (doc 64 §12): typed chain outcome
+  (`exitSideChainOutcome`: served / natural stop / misfit), natural stops
+  neutral, and 2d revival on a `.link` commit at `P`. nsieve-bit-fp
+  instructions −11.70%, cycles −9.8%; other benches ±0.2%. That also
+  removed step 1's `region_decay` gates (5,801 → 3), so the step 1
+  witness was flipped. Left on the bench: t1 e15 gives up (P3, step 3),
+  and t7 e10 gives up late on real misfits at t8 e23. After those
+  give-ups, 22,015 `legacy_thrash` gates on pc 45. Next: step 3 (3b,
+  bind the exit to the loop root behind the `.loop` marker, root offered
+  before the composites, one resolved-target description, plus 2d's
+  loop-root revival).
+
+TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff per effort".
+- The plan and every item's numbers are in TODO.md "Tier-0 interpreter
+  cost survey". Measurement: `/tmp/t0micro/opsmeasure.sh` (perf
+  two-point instructions per op vs LuaJIT `-joff`; `ops.lua`, and
+  `ops2.lua` for mahina-only syntax) and `/tmp/t0micro/abench.sh BASE NEW`
+  (every `@bench` program, tier-0 and JIT instructions).
+- Landed: `pairs` quadratic (9b212e2), in-place local operands
+  (69fec42), and the `for` step-sign soundness fix (aa9af90).
+- **Uncommitted, gated:**
+  - `src/interp.zig`: the `for_loop` raw lanes (with float limits), the
+    field fast paths (`heapKeyChainGet`), and item 3 (`opCompare`,
+    `opEqNe`, `opModIdiv` and their slow halves).
+  - Also `hash_part.zig` (`liveHeapNode`/`liveIntNode`), the grid deflate
+    test in `interp_native_test.zig`, the fast-path semantics tests,
+    doc 62, and TODO.md.
+  - All five gates are green on the combined tree, and viz is 72/72.
+  - **Held:** interp.zig also carries amber-badger's doc 64 step 2 hunk
+    (~line 4413, `exitSideChainOutcome`). Neither of us can commit it
+    alone (Rule #13), and amber-badger asked Bart about a bundled commit
+    (forum, 2026-10-20 15:41). Wait for that answer.
+- Next: item 4, the bytecode forms (constant operands, fused
+  compare+branch, `ITERN`), which needs a design doc. Then item 5
+  (call/return) and item 6 (dispatch prologue, doc 42 §4.2).
+- For Bart, still open: the integer `for` overflow wrap, `next`'s zero
+  results, the zero `for` step, and continuation step-constant
+  inheritance (all in TODO).
 
 LINE LOOKUP FIX (2026-10-11, coral-marten): LANDED in `49fd572`, bundled with amber-badger's doc 61 Phase K.
 - Bug from TODO.md "Every located runtime error rescans the source for

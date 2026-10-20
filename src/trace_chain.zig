@@ -305,6 +305,9 @@ pub fn driveChain(
         nvisited += 1;
     }
 
+    // Doc 64 §10 step 2: the exit of the last exit-side candidate retried
+    // past (see the walk's tail).
+    var retry_terminal: ?ExitKey = null;
     var st: ?*Trace = self.nextTraceExcluding(proto, walk_pc, visited[0..nvisited]);
     while (st) |sct| : (st = if (nvisited < visited.len)
         self.nextTraceExcluding(proto, walk_pc, visited[0..nvisited])
@@ -599,11 +602,15 @@ pub fn driveChain(
             // that left the slab exactly as it found it (coherent at `P`)
             // does not end the walk — the next continuation at `P` may be
             // the one whose entry types fit this exit.
+            const own_exit = sresult.exit_reason == .normal and
+                (tier == .ir or (sresult.final_trace_id == sct.id and sresult.ledger_len <= 1));
+            const terminal: ?ExitKey = if (own_exit) .{ .trace_id = sct.id, .exit_instr = sresult.exit_instr } else null;
             if (materialization == .exit_side and candidateLeftEntryState(sct, sresult, tier)) {
                 self.exit_side_retries +|= 1;
+                retry_terminal = terminal;
                 continue;
             }
-            return .{ .completed = 0, .resume_pc = target_pc };
+            return .{ .completed = 0, .resume_pc = target_pc, .terminal = terminal };
         }
         if (sresult.completed > 0) {
             self.onSideExitReceipt(sct, sresult.completed, sresult.exit_instr, sresult.completed, .deferred, .entered);
@@ -611,6 +618,13 @@ pub fn driveChain(
         }
         self.onSideExitReceipt(sct, 0, sresult.exit_instr, 0, .deferred, if (sresult.exit_reason == .prologue_fail) .entry_refusal else .entered);
         // Zero iterations, no flush owed (ordinary path): try the next candidate.
+    }
+    // Doc 64 §10 step 2: an exit-side walk whose every candidate left the
+    // slab as it found it (R2 retries) still reports the last one's exit, so
+    // the router can tell a loop that ended from a misfit. It routes exactly
+    // like `null`: coherent at `P`, nothing linked.
+    if (materialization == .exit_side) {
+        if (retry_terminal) |term| return .{ .completed = 0, .resume_pc = walk_pc, .terminal = term };
     }
     return null;
 }

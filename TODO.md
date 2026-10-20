@@ -111,6 +111,31 @@ because AMD skid misattributes across tail jumps). Against LuaJIT
       unsigned iteration count in `forprep`. Every tier's `for_loop`
       (tier-0, `irinterp`, recorder, native loop-done guards) changes
       together, so it needs a decision on the shape first.
+- [x] **Compare, `eq` and `mod`/`idiv` had no fast path.** Every `<` went
+      through `compareMeta`, every `==` through `valuesEqual`, and `%`/`//`
+      through `opArithMeta`, all out of line. Fixed 2026-10-21 in tier-0:
+      `opCompare` decides two ints or two floats on the raw lanes (`gt`/`ge`
+      swap operands); `opEqNe` decides same-tag numbers, nil, booleans and
+      heap identity, and false for any non-number tag mix; `opModIdiv`
+      handles two ints with a nonzero divisor (`y == -1` special-cased, so
+      `mininteger // -1` wraps the way `arith` does). Everything else, plus
+      two floats for `%`/`//` (through `fmath`), goes to the slow half via
+      `slowTail`: mixed pairs, strings, two distinct tables (`__eq`),
+      metamethods, zero divisors. Marginal instructions over the `s = s + i` loop
+      (before → after, LuaJIT `-joff` in brackets): `<`/`<=` 117 → 39 (32),
+      `==` 127 → 43 (38), `~=` 128 → 44 (33), float `<` 210 → 118 (63),
+      string `==` 205 → 124 (67), int `%` 110 → 83 (39), `//` 103 → 78,
+      float `%` 164 → 153 (52), `if i < 0` 178 → 98 (32). Over every `@bench`
+      program: tier-0 0 to −16.7% (nsieve-bit-fp −16.7%, while_shortcircuit
+      −10.8%, pi_leibniz −10.1%, array3d −9.8%, recursive-fib −8.9%), JIT 0
+      to −5.6% (lua54 −5.6%, euler14-bit −2.2%, nsieve-bit-fp −2.1%), no
+      row above +0.00%. Tests: three "fast paths: every operand mix" semantics
+      tests (ten legs each), mutation-checked on the table-identity, strict,
+      `y == -1` and float-lane branches. Strings are interned, so string
+      `==` is decided by id on the fast lane; the float-`<`, string-`==` and
+      float-`%` probes read their operands from upvalues, so most of what
+      remains there is the upvalue loads. Float `%` also pays for `slowTail`
+      and the out-of-line `fmath` call.
 - [ ] **No constant-operand or fused forms in the bytecode.** `t.x` is
       `load_const` + `get_index`; `i - 7` is `load_int` + `sub`; `if a < b`
       is `lt` into a register + `jmp_if_false`. Each extra op pays the
@@ -177,14 +202,18 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
          `region_decay` gates are on pc 45, each also running
          `disarmAllLinks`. Short is not low-yield here. LuaJIT has no such
          gate. Candidate fix "1e" (a close at the owner loop's own exit is
-         neutral) is for doc 64 step 4.
-      2. **A chain that ends at the enclosing loop's own loop-done counts
-         as a miss.** t7's `while` exit (resume 63) chains to t8, which
-         runs the post-`while` body and exits at exit 33, the `for k`
-         loop-done (`completed=0`, ledger 1). `noteExitSideChain` counts
-         that as unlinked and gives up after 4 (`tryside`). The chain ran
-         to the natural end of the loop natively; doc 56 meant a give-up
-         as "no continuation at P fits".
+         neutral) is for doc 64 step 4. **2026-10-21: step 2 removed these
+         gates (5,801 → 3, doc 64 §12)**; the strikes came from activations
+         that had lost t7's `while` arm. After the two late give-ups below,
+         the turnstile returns as 22,015 `legacy_thrash` gates on pc 45.
+      2. [x] **A chain that ends at the enclosing loop's own loop-done
+         counted as a miss.** Fixed 2026-10-21 (doc 64 step 2, §12):
+         chains are classified served / natural stop / misfit, and a
+         natural stop is neutral. 5,814 natural stops on the bench;
+         instructions −11.70%, cycles −9.8%. t7 e10 still gives up late on
+         4 real misfits at t8 e23 (the post-`while` branch flips direction
+         when the next `nsieve` call re-initialises the array; a sibling at
+         pc 63 would serve it and revive the exit).
       3. **The exit-side chain at a `.loop` marker never tries the root
          at its header.** t1's `while` exit resumes at pc 53, the
          `.loop` marker whose header is 54 (rule 8 refuses a header as
@@ -210,11 +239,14 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
       benches kept their output and did not speed up (best of 3,
       `--time`): fft 125 → 147 ms, lu 138 → 138, sparse 108 → 109,
       nsieve 12.4 → 12.0, sieve_int 5.25 → 5.17.
-- [ ] **Exit-side give-ups are permanent.** `.gave_up` "returns to
+- [x] **Exit-side give-ups are permanent.** `.gave_up` "returns to
       today's routes for good", so a program whose shape changes phase
       (above) keeps the coarse deopt after the phase that defeated it.
       LuaJIT has no such latch on a parent exit; its blacklisting is on
-      recording failures.
+      recording failures. Fixed 2026-10-21 (doc 64 step 2, 2d): a given-up
+      exit waits under its resume pc, and the next `.link` continuation
+      committed there returns it to `.none`, once per commit. The
+      loop-root half (a root at `loopHeaderOf(P)`) comes with step 3.
 - [ ] **A chain that hands off to a same-anchor sibling which then links
       is not counted as linked** (`routeExitSide` reads `linked_trace`,
       set only when the entered candidate's own `.link` row heads the

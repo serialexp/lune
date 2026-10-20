@@ -1,8 +1,8 @@
 # 62 — Global-access slot hints and id-keyed hash nodes
 
-Status: complete. Rev 2 approved by codex and antigravity; their should-fix items are folded in (§8). Two items are deferred (below).
+Status: complete. Rev 2 approved by codex and antigravity; their should-fix items are folded in (§8). One item is deferred (below).
 Owner: claude
-Last updated: 2026-10-05
+Last updated: 2026-10-20
 
 ## Implementation status
 
@@ -40,11 +40,13 @@ land; move whole phases to Done once everything inside them is checked.
 
 - [x] **Rev 2 review** (2026-10-05). Both reviewers approved; codex's
   should-fix items and nits are folded in (§8).
+- [x] **A less tricky shape for the cold-path tail call** (§4.3,
+  follow-up, 2026-10-20). The volatile-`var` indirection is replaced by a
+  per-mode slow-handler table indexed by the instruction's opcode
+  (`Vm.slowTail`). `get_index` and `set_index` use it too.
 
 ### Outstanding
 
-- [ ] **Defer: a less tricky shape for the cold-path tail call** (§4.3,
-  TODO.md). Bart accepted the volatile-`var` indirection for now (2026-10-05).
 - [ ] **Defer: compiled code calls host natives directly** (option 3 of the
   callback discussion; Bart's stated end goal). This needs its own design
   doc. This doc only makes the lookup in front of a host call cheap.
@@ -274,6 +276,21 @@ reuse it for other handlers with cold slow paths.
 
 `set_global` was not split. It calls `setHinted` either way, and the write
 barrier follows it.
+
+**Follow-up (2026-10-20): the slow-handler table.** The volatile load is
+gone. `interp.zig` now builds a second per-mode table beside the dispatch
+table, `slow_table_fast` / `slow_table_full`: for each op with a split, its
+slow handler; for the rest, `noSlowPath`, which panics. A fast handler
+leaves through `slowTail`, a tail jump through that table indexed by
+`instr.op`. The index is loaded from the instruction at run time, so LLVM
+cannot turn the jump into a direct call and inline the slow handler. The
+cost is the same as before: one load of the opcode, one of the table
+entry, one indirect jump. The global-read probe loop measures the same
+per-iteration instruction count as with the volatile load, and the
+handler's prologue is identical. The same split now also serves `get_index`
+and `set_index`, whose fast paths (array part, and a heap key probed
+inline, `__index` chains of plain tables included) call nothing. Any
+other handler with a cold slow path can join by adding one table entry.
 
 ### 4.4 Sharing and threads
 

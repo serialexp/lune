@@ -281,6 +281,13 @@ pub const ChainResult = struct {
     /// `P` when an earlier candidate refused its entry. Null when no
     /// candidate reached its `.link`.
     linked_trace: ?*Trace = null,
+    /// Doc 64 §10 step 2: the deopt that ended a chain that did not link,
+    /// when it is one candidate's own exit (a scalar run whose ledger never
+    /// left the candidate, `exit_reason == .normal`). The exit-side router
+    /// reads it to tell a chain that ran into the end of an enclosing loop
+    /// from a misfit (`exitSideChainOutcome`). Null for every other shape,
+    /// which the router counts as a misfit, as before.
+    terminal: ?ExitKey = null,
     /// Doc 56 Phase 5: a ledger replay ended on an UNARMED exit adapter's
     /// row (the exit is wanted, or attached but not armed): the slab is
     /// coherent at `resume_pc` (the exit's resume pc) and the row's receipt
@@ -288,6 +295,10 @@ pub const ChainResult = struct {
     /// exit-side consumer for it (chain, bind, arm, or ask for a recording).
     exit_side: ?ExitSideTerminal = null,
 };
+
+/// Doc 64 §10 step 2 (2d): a given-up exit waiting for a trace to commit at
+/// its resume point `{proto_id, pc}`.
+pub const ExitSideWaiter = struct { proto_id: u32, pc: u32, exit: ExitKey };
 
 /// Doc 56 Phase 5: the exit whose adapter ended a replayed ledger, and the
 /// work its row committed (the parent's laps plus the interrupted
@@ -1216,6 +1227,19 @@ pub const TraceState = struct {
     /// consecutive chains at `P` that did not link (also counted in
     /// `exit_side_giveups`).
     exit_side_miss_giveups: u64 = 0,
+    /// Doc 64 §10 step 2: attached-exit chains that ended at the exit of a
+    /// loop enclosing the resume pc (neither a link nor a miss).
+    exit_side_natural_stops: u64 = 0,
+    /// Doc 64 §10 step 2 (2d): given-up exits returned to `.none` because a
+    /// trace committed at their resume pc.
+    exit_side_revivals: u64 = 0,
+    /// Doc 64 §10 step 2 (2d): every given-up exit that a later commit could
+    /// serve, keyed by its resume point. `reviveExitSideAt` consumes the
+    /// entries at a commit's anchor (and drops entries whose trace is gone),
+    /// so each give-up is revived at most once per commit at its `P`. A flat
+    /// list: commits are rare and the list holds at most one entry per
+    /// given-up exit of a live trace.
+    exit_side_waiting: std.ArrayListUnmanaged(ExitSideWaiter) = .empty,
     /// Doc 56 §4.8.2 item 10 (P6-Q3): native calls from a burst origin
     /// (`exit_side_ok = 0`) that ended on an ordinary deopt at an exit whose
     /// adapter is published and whose ordinary cell is unarmed — exits the
@@ -2215,6 +2239,7 @@ pub const TraceState = struct {
         self.abort_log.deinit(self.gpa);
         if (self.exec_recorder) |*r| r.deinit();
         self.provenance_edges.deinit(self.gpa);
+        self.exit_side_waiting.deinit(self.gpa);
 
         self.coverage.deinit(self.gpa);
         self.region_policy.deinit(self.gpa);
@@ -2862,6 +2887,8 @@ pub const TraceState = struct {
     pub const armExitSide = trace_link_mod.armExitSide;
     pub const ordinaryArmLive = trace_link_mod.ordinaryArmLive;
     pub const noteExitSideChain = trace_link_mod.noteExitSideChain;
+    pub const exitSideChainOutcome = trace_link_mod.exitSideChainOutcome;
+    pub const reviveExitSideAt = trace_link_mod.reviveExitSideAt;
     pub const drainPendingExitSideDisarm = trace_link_mod.drainPendingExitSideDisarm;
     pub const maybeArmExitSide = trace_link_mod.maybeArmExitSide;
     pub const noteExitSideCommit = trace_link_mod.noteExitSideCommit;
@@ -4086,6 +4113,9 @@ pub const TraceState = struct {
             ew.flush() catch {};
         };
         self.finishSideTraceProvenance(t, candidate.side_src);
+        // Doc 64 §10 step 2 (2d): a continuation at a given-up exit's resume
+        // point is the new evidence that revives it.
+        self.reviveExitSideAt(t);
         // Coverage (gated): a trace now exists at this anchor, so subsequent
         // interpreted back-edges here are "fallback despite a trace."
         if (self.config.coverage) self.markAnchorTraced(t.code.anchor);
@@ -4407,6 +4437,7 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
         try w.writeAll(if (any_refused) "\n" else " none\n");
         // Doc 56 Phase 3: the tier-1a exit-side path.
         try w.print("    exit side:            wants={d} records={d} binds={d} (by chain {d}) giveups={d} hops={d} chained={d} retries={d} miss-giveups={d}\n", .{ ts.exit_side_wants, ts.exit_side_records, ts.exit_side_binds, ts.exit_side_chain_binds, ts.exit_side_giveups, ts.exit_side_hops, ts.exit_side_chains, ts.exit_side_retries, ts.exit_side_miss_giveups });
+        try w.print("    exit-side chain ends: natural stops={d} revivals={d}\n", .{ ts.exit_side_natural_stops, ts.exit_side_revivals });
         // Doc 56 Phase 4: native exit adapters.
         try w.print("    exit adapters:        built={d} native hops={d}; refused:", .{ ts.exit_adapter_builds, ts.exit_side_native_hops });
         var any_adapter_refused = false;

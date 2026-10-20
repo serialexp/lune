@@ -20,6 +20,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const bytecode = @import("bytecode.zig");
 const arith = @import("arith.zig");
+const fmath = @import("fmath.zig");
 const value = @import("value.zig");
 const regwindow = @import("regwindow.zig");
 const gc = @import("gc.zig");
@@ -3193,6 +3194,42 @@ pub const Vm = struct {
         return if (mode == .fast) &handler_table_fast else &handler_table_full;
     }
 
+    /// The per-mode slow-handler tables (doc 62 §4.3, follow-up): for an op
+    /// whose fast path calls nothing, the handler that does the rest. A
+    /// fast handler leaves through `slowTail`, a tail jump through this
+    /// table indexed by the instruction's own opcode. That index is a
+    /// runtime value, so LLVM cannot fold the jump into a direct call and
+    /// inline the slow handler back, whose calls would make every fast hit
+    /// save and restore five callee-saved registers. Ops without a split
+    /// map to `noSlowPath`.
+    const slow_table_fast = buildSlowTable(.fast);
+    const slow_table_full = buildSlowTable(.full);
+
+    fn buildSlowTable(comptime mode: ExecMode) [op_count]*const HandlerFn {
+        var t: [op_count]*const HandlerFn = undefined;
+        for (&t) |*h| h.* = noSlowPath;
+        t[@intFromEnum(bytecode.OpCode.get_global)] = opGetGlobalSlow(mode);
+        t[@intFromEnum(bytecode.OpCode.get_index)] = opGetIndexSlow(mode);
+        t[@intFromEnum(bytecode.OpCode.set_index)] = opSetIndexSlow(mode);
+        t[@intFromEnum(bytecode.OpCode.idiv)] = opModIdivSlow(mode, .idiv);
+        t[@intFromEnum(bytecode.OpCode.mod)] = opModIdivSlow(mode, .mod);
+        inline for (.{ .eq, .ne }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opEqNeSlow(mode, op);
+        inline for (.{ .lt, .le, .gt, .ge }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opCompareSlow(mode, op);
+        return t;
+    }
+
+    fn noSlowPath(_: *ExecState, _: usize, instr: *const Instr, _: *Vm, _: [*]u8, _: [*]u64) HandlerResult {
+        std.debug.panic("no slow handler for {s}", .{@tagName(instr.op)});
+    }
+
+    /// Leave a fast handler for its op's slow handler (`buildSlowTable`),
+    /// with the handler's own arguments: the slow handler runs the
+    /// instruction from the start.
+    inline fn slowTail(comptime mode: ExecMode, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+        const table_ = if (mode == .fast) &slow_table_fast else &slow_table_full;
+        return @call(.always_tail, table_[@intFromEnum(instr.op)], .{ st, pc, instr, vm, tags, payloads });
+    }
+
     /// Doc 42 §4.2: the dispatch tail — the complete per-instruction prologue
     /// followed by the table jump, `inline` so it expands INTO every handler
     /// tail and the `@call(.always_tail)` at its end jumps handler→handler
@@ -4413,8 +4450,10 @@ pub const Vm = struct {
         const p = ct.code.exitResumePc(ei).?;
         const anchor_pc: usize = ct.code.anchor.pc;
         const chained = ts.driveChain(ct, result, proto, regs, tier, .{ .exit_side = p }, &.{}, safe_to_arm, self.unicode_version_pinned);
-        // §4.8.3 R4: an attached exit whose chain keeps missing gives up.
-        ts.noteExitSideChain(ct, ei, if (chained) |c| c.linked_trace != null else false);
+        // §4.8.3 R4: an attached exit whose chain keeps missing gives up;
+        // doc 64 §10 step 2: a chain that ran into the end of an enclosing
+        // loop is no miss.
+        ts.noteExitSideChain(ct, ei, ts.exitSideChainOutcome(ct, ei, chained));
         if (chained) |chain| {
             if (chain.linked_trace) |child| {
                 ts.exit_side_chains +|= 1;
@@ -5776,7 +5815,8 @@ pub const Vm = struct {
             .load_nil, .load_bool, .load_int, .load_const, .move => opLoad(mode, op),
             .add, .sub, .mul => opBinNum(mode, op),
             .div => opDiv(mode),
-            .idiv, .mod, .pow, .shl, .shr, .sar => opArithMeta(mode, op),
+            .idiv, .mod => opModIdiv(mode, op),
+            .pow, .shl, .shr, .sar => opArithMeta(mode, op),
             .band, .bor, .bxor => opBinBit(mode, op),
             .neg => opNeg(mode),
             .not => opNot(mode),
@@ -5913,6 +5953,56 @@ pub const Vm = struct {
         }.h;
     }
 
+    /// `%` and `//` on two ints, on the raw lanes, with `arith.mod`'s and
+    /// `arith.floorDiv`'s exact `-1` cases (`minInt // -1` wraps to
+    /// `minInt`; neither reaches the trapping `idiv`). A zero divisor (which
+    /// raises), floats and everything else leave for `opModIdivSlow`. The
+    /// float lane lives there because its kernel call cost the int lane
+    /// 8 instructions when it sat here.
+    fn opModIdiv(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                if (regs.tagAt(instr.b) == .int and regs.tagAt(instr.c) == .int) {
+                    const x: i64 = @bitCast(regs.bitsAt(instr.b));
+                    const y: i64 = @bitCast(regs.bitsAt(instr.c));
+                    if (y != 0) {
+                        regs.setInt(instr.a, switch (op) {
+                            .mod => if (y == -1) 0 else @mod(x, y),
+                            .idiv => if (y == -1) 0 -% x else @divFloor(x, y),
+                            else => unreachable,
+                        });
+                        return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+                    }
+                }
+                return slowTail(mode, st, pc, instr, vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// `opModIdiv`'s slow half: two floats through the same `fmath` kernels
+    /// `arith.mod`/`arith.floorDiv` use, everything else through
+    /// `opArithMeta` (mixed promotion, the zero-divisor error, `__mod`/
+    /// `__idiv`).
+    fn opModIdivSlow(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                if (regs.tagAt(instr.b) == .float and regs.tagAt(instr.c) == .float) {
+                    const x: f64 = @bitCast(regs.bitsAt(instr.b));
+                    const y: f64 = @bitCast(regs.bitsAt(instr.c));
+                    regs.setFloat(instr.a, switch (op) {
+                        .mod => fmath.fmodRuntime(x, y),
+                        .idiv => fmath.floordivRuntime(x, y),
+                        else => unreachable,
+                    });
+                    return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+                }
+                return @call(.always_tail, opArithMeta(mode, op), .{ st, pc, instr, vm, tags, payloads });
+            }
+        }.h;
+    }
+
     // ---- bitwise ---- (both-int fast lane; else `arith.*` + meta)
     fn opBinBit(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
         return struct {
@@ -6022,8 +6112,47 @@ pub const Vm = struct {
     }
 
     // ---- comparisons → boolean register ----
-    // `eq`/`ne` consult `__eq` only for two raw-unequal tables.
+    // `eq`/`ne` decide two same-tag primitives, or two heap values that are
+    // the same object or not both tables, on the raw lanes (`Value.eql`:
+    // strings are interned, so identity is equality). Mixed numbers, two
+    // distinct tables (`__eq`) and row views leave for `opEqNeSlow`.
     fn opEqNe(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const tb = regs.tagAt(instr.b);
+                const tc = regs.tagAt(instr.c);
+                const pb = regs.bitsAt(instr.b);
+                const pc_ = regs.bitsAt(instr.c);
+                const eqv: bool = if (tb == tc) switch (tb) {
+                    .int => pb == pc_,
+                    .float => blk: {
+                        @setFloatMode(.strict);
+                        break :blk @as(f64, @bitCast(pb)) == @as(f64, @bitCast(pc_));
+                    },
+                    .nil => true,
+                    .boolean => (pb != 0) == (pc_ != 0),
+                    .heap_ref => blk: {
+                        // Through the payload union, not `@ptrFromInt`: a
+                        // pointer is narrower than the 64-bit word on wasm32.
+                        const x = (Value{ .tag = .heap_ref, .payload = .{ .bits = pb } }).asHeap();
+                        const y = (Value{ .tag = .heap_ref, .payload = .{ .bits = pc_ } }).asHeap();
+                        if (x.id == y.id) break :blk true;
+                        if (x.type == .table and y.type == .table) return slowTail(mode, st, pc, instr, vm, tags, payloads);
+                        break :blk false;
+                    },
+                    .row_view => return slowTail(mode, st, pc, instr, vm, tags, payloads),
+                } else if ((tb == .int or tb == .float) and (tc == .int or tc == .float))
+                    return slowTail(mode, st, pc, instr, vm, tags, payloads)
+                else
+                    false;
+                regs.setBool(instr.a, if (op == .eq) eqv else !eqv);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    fn opEqNeSlow(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
@@ -6034,9 +6163,37 @@ pub const Vm = struct {
         }.h;
     }
 
-    // `gt`/`ge` reuse `lt`/`le` with operands swapped (a>b ≡ b<a); `lt`/`le`
-    // consult `__lt`/`__le` when not raw-comparable.
+    // `gt`/`ge` reuse `lt`/`le` with operands swapped (a>b ≡ b<a). Two ints
+    // or two floats compare on the raw lanes (`value.compareNumeric` is
+    // exactly IEEE order there); a mixed pair, strings and `__lt`/`__le`
+    // leave for `opCompareSlow`.
     fn opCompare(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const swapped = op == .gt or op == .ge;
+                const strict = op == .lt or op == .gt;
+                const x: usize = if (swapped) instr.c else instr.b;
+                const y: usize = if (swapped) instr.b else instr.c;
+                const tx = regs.tagAt(x);
+                const ty = regs.tagAt(y);
+                const r: bool = if (tx == .int and ty == .int) blk: {
+                    const p: i64 = @bitCast(regs.bitsAt(x));
+                    const q: i64 = @bitCast(regs.bitsAt(y));
+                    break :blk if (strict) p < q else p <= q;
+                } else if (tx == .float and ty == .float) blk: {
+                    @setFloatMode(.strict);
+                    const p: f64 = @bitCast(regs.bitsAt(x));
+                    const q: f64 = @bitCast(regs.bitsAt(y));
+                    break :blk if (strict) p < q else p <= q;
+                } else return slowTail(mode, st, pc, instr, vm, tags, payloads);
+                regs.setBool(instr.a, r);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    fn opCompareSlow(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const self = vm;
@@ -6120,19 +6277,11 @@ pub const Vm = struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
                 const a: usize = instr.a;
-                regs.set(a, arith.add(regs.get(a), regs.get(a + 2)) catch |e| return parkErr(st, e));
-                const idx = regs.get(a);
-                const limit = regs.get(a + 1);
-                const step = regs.get(a + 2);
-                const ascending = !(arith.lt(step, Value.int(0)) catch |e| return parkErr(st, e));
-                const within = if (ascending)
-                    arith.le(idx, limit) catch |e| return parkErr(st, e)
-                else
-                    arith.le(limit, idx) catch |e| return parkErr(st, e);
+                const within = forLoopStep(regs, a) catch |e| return parkErr(st, e);
                 const cur_pc = pc - 1;
                 var npc = pc;
                 if (within) {
-                    regs.set(a + 3, idx);
+                    regs.copy(a + 3, a);
                     npc = applyJump(pc, instr.aux);
                 }
                 if (vm.trace.config.enabled and npc <= cur_pc)
@@ -6196,19 +6345,11 @@ pub const Vm = struct {
                 // internal-index increment, the `.for_loop` arm's first line
                 // (omitting it re-takes the back-edge with a stale index: the
                 // §R2-3 hazard, caught as +strikes×n guest corruption in the
-                // T3 e2e test).
-                regs.set(a, arith.add(regs.get(a), regs.get(a + 2)) catch |e| return parkErr(st, e));
-                const idx = regs.get(a);
-                const limit = regs.get(a + 1);
-                const step = regs.get(a + 2);
-                const ascending = !(arith.lt(step, Value.int(0)) catch |e| return parkErr(st, e));
-                const within = if (ascending)
-                    arith.le(idx, limit) catch |e| return parkErr(st, e)
-                else
-                    arith.le(limit, idx) catch |e| return parkErr(st, e);
+                // T3 e2e test). `forLoopStep` does the increment.
+                const within = forLoopStep(regs, a) catch |e| return parkErr(st, e);
                 var npc = pc;
                 if (within) {
-                    regs.set(a + 3, idx);
+                    regs.copy(a + 3, a);
                     npc = applyJump(pc, instr.aux);
                 }
                 // Loop exit → thread exactly as `.for_loop` (the back-edge
@@ -6630,28 +6771,62 @@ pub const Vm = struct {
                 // key, out-of-range, hash-resident, non-table — falls through
                 // to the unchanged helper, so semantics and determinism are
                 // identical (no allocation on either branch).
+                //
+                // Both fast paths call nothing; everything else leaves for
+                // `opGetIndexSlow`, so a hit saves no registers.
                 const self = vm;
                 const container = regs.get(instr.b);
                 const key = regs.get(instr.c);
-                regs.set(instr.a, blk: {
+                const hit: ?Value = blk: {
                     if (container.isHeap() and container.heapType() == .table and key.isInt()) {
                         const tbl = table.Table.fromHeader(container.asHeap());
                         const i = key.asInt();
                         // A grid table's `t[i]` is a transient `row_view`, not
                         // a raw slot — skip the fast path and let `indexGet →
                         // Table.getInt` mint the handle. (Phase 3, doc 14.)
-                        if (!tbl.array.isGrid() and array.ArrayPart.inArray(i, tbl.array.asize)) {
-                            // A *present* (non-nil) in-bounds slot is a raw
-                            // read regardless of any metatable — Lua only
-                            // consults `__index` for an absent key. A hole
-                            // (nil) falls through to `indexGet`, which checks
-                            // `__index`.
-                            const v = tbl.array.get(@intCast(i));
-                            if (!v.isNil()) break :blk v;
+                        if (!tbl.array.isGrid()) {
+                            if (array.ArrayPart.inArray(i, tbl.array.asize)) {
+                                // A *present* (non-nil) in-bounds slot is a raw
+                                // read regardless of any metatable — Lua only
+                                // consults `__index` for an absent key.
+                                const v = tbl.array.get(@intCast(i));
+                                if (!v.isNil()) break :blk v;
+                            } else if (tbl.hash.liveIntNode(i)) |n| {
+                                // Past the array part only the hash part can
+                                // hold the key (`Table.getInt`).
+                                break :blk n.value;
+                            }
+                            // Absent (a hole, or past the end: `tree[2]` on a
+                            // leaf): nil, unless an `__index` must be asked.
+                            if (tbl.metatable == null) break :blk Value.nil();
                         }
                     }
-                    break :blk self.indexGet(container, key) catch |e| return parkErr(st, e);
-                });
+                    // Heap-key fast path (`t.name`, `o:method`): the lookup
+                    // and any `__index` chain of plain tables, inline.
+                    if (container.isHeap() and container.heapType() == .table and key.isHeap()) {
+                        break :blk self.heapKeyChainGet(table.Table.fromHeader(container.asHeap()), key);
+                    }
+                    break :blk null;
+                };
+                if (hit) |v| {
+                    regs.set(instr.a, v);
+                    return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+                } else {
+                    @branchHint(.cold);
+                    return slowTail(mode, st, pc, instr, vm, tags, payloads);
+                }
+            }
+        }.h;
+    }
+
+    /// `get_index` off its fast paths: `indexGet`, with its metamethods,
+    /// grid deflation and errors.
+    fn opGetIndexSlow(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const v = vm.indexGet(regs.get(instr.b), regs.get(instr.c)) catch |e| return parkErr(st, e);
+                regs.set(instr.a, v);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -6670,6 +6845,9 @@ pub const Vm = struct {
                 // lane-missing value, append (`i == len+1`), out-of-range,
                 // float/nil/NaN key, or non-table all fall through to the
                 // unchanged `indexSet`, which owns widen/append/hash/delete.
+                //
+                // Both fast paths call nothing; everything else leaves for
+                // `opSetIndexSlow`, so a fast store saves no registers.
                 const self = vm;
                 const container = regs.get(instr.a);
                 const key = regs.get(instr.b);
@@ -6697,8 +6875,36 @@ pub const Vm = struct {
                             }
                         }
                     }
-                    self.indexSet(container, key, val) catch |e| return parkErr(st, e);
+                    // Heap-key mirror (`t.name = v`): a key live in the hash
+                    // part takes a non-nil value in place, which is what
+                    // `Table.set` does for it (`HashPart.put`'s live arm: no
+                    // rehash, no new key), and `__newindex` never fires for a
+                    // present key. A deletion, a new key, and a grid take
+                    // `indexSet`.
+                    if (container.isHeap() and container.heapType() == .table and key.isHeap() and !val.isNil()) {
+                        const tbl = table.Table.fromHeader(container.asHeap());
+                        if (!tbl.array.isGrid()) {
+                            if (tbl.hash.liveHeapNode(key)) |n| {
+                                n.value = val;
+                                self.heap.writeBarrier(&tbl.header, val); // no-op until Phase 4
+                                break :fast;
+                            }
+                        }
+                    }
+                    return slowTail(mode, st, pc, instr, vm, tags, payloads);
                 }
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// `set_index` off its fast paths: `indexSet`, with `__newindex`,
+    /// appends, deletions, grid deflation and errors.
+    fn opSetIndexSlow(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                vm.indexSet(regs.get(instr.a), regs.get(instr.b), regs.get(instr.c)) catch |e| return parkErr(st, e);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -6757,11 +6963,7 @@ pub const Vm = struct {
                     return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
                 } else {
                     @branchHint(.cold);
-                    // Through a volatile load: called directly, LLVM inlines
-                    // the slow handler here, and its calls make every hit
-                    // save and restore five registers.
-                    const slow: *volatile const *const HandlerFn = &GetGlobalSlow(mode).handler;
-                    return @call(.always_tail, slow.*, .{ st, pc, instr, vm, tags, payloads });
+                    return slowTail(mode, st, pc, instr, vm, tags, payloads);
                 }
             }
         }.h;
@@ -6769,12 +6971,8 @@ pub const Vm = struct {
 
     /// `get_global` when the slot hint misses (or the proto has none): the
     /// full lookup, which also moves the hint to where the global was found.
-    fn GetGlobalSlow(comptime mode: ExecMode) type {
+    fn opGetGlobalSlow(comptime mode: ExecMode) *const HandlerFn {
         return struct {
-            /// Never written. A `var` so the volatile load in `opGetGlobal`
-            /// is a real load; Zig folds a load from a `const` at compile time.
-            var handler: *const HandlerFn = &h;
-
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
                 const key = st.proto.constants[instr.b];
@@ -6783,7 +6981,7 @@ pub const Vm = struct {
                 regs.set(instr.a, v);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
-        };
+        }.h;
     }
 
     fn opSetGlobal(comptime mode: ExecMode) *const HandlerFn {
@@ -7724,6 +7922,57 @@ pub const Vm = struct {
         }
     }
 
+    /// The numeric-`for` step shared by `for_loop` and `jfor_loop`, over
+    /// `R[a..a+3) = (idx, limit, step)`: `idx += step`, written back, then the
+    /// limit test in the step's direction. Returns whether the loop goes on.
+    /// An int index with an int step, or a float index with a float step,
+    /// computes on the raw lanes with exactly `arith`'s semantics: the int
+    /// add wraps, the float add is strict, a limit of the other number type
+    /// compares exactly (`compareNumeric`, as `arith.le` does), and a NaN
+    /// fails the test (`.unordered`). Any other mix takes `arith`, which
+    /// also raises for a non-number.
+    inline fn forLoopStep(regs: RegWindow, a: usize) Error!bool {
+        const ti = regs.tagAt(a);
+        const tl = regs.tagAt(a + 1);
+        const ts = regs.tagAt(a + 2);
+        if (ti == .int and ts == .int and (tl == .int or tl == .float)) {
+            const step: i64 = @bitCast(regs.bitsAt(a + 2));
+            const idx: i64 = @as(i64, @bitCast(regs.bitsAt(a))) +% step;
+            regs.setInt(a, idx);
+            if (tl == .int) {
+                const limit: i64 = @bitCast(regs.bitsAt(a + 1));
+                return if (step >= 0) idx <= limit else limit <= idx;
+            }
+            // `for i = 1, n / 2`: an int loop with a float limit.
+            const o = value.compareNumeric(Value.int(idx), Value.float(@bitCast(regs.bitsAt(a + 1))));
+            return if (step >= 0) o == .lt or o == .eq else o == .gt or o == .eq;
+        }
+        if (ti == .float and ts == .float and (tl == .float or tl == .int)) {
+            @setFloatMode(.strict);
+            const step: f64 = @bitCast(regs.bitsAt(a + 2));
+            const idx: f64 = @as(f64, @bitCast(regs.bitsAt(a))) + step;
+            regs.setFloat(a, idx);
+            if (tl == .float) {
+                const limit: f64 = @bitCast(regs.bitsAt(a + 1));
+                return if (!(step < 0)) idx <= limit else limit <= idx;
+            }
+            const o = value.compareNumeric(Value.float(idx), Value.int(@bitCast(regs.bitsAt(a + 1))));
+            return if (!(step < 0)) o == .lt or o == .eq else o == .gt or o == .eq;
+        }
+        return forLoopStepMixed(regs, a);
+    }
+
+    /// `forLoopStep`'s mixed-type remainder, kept out of line so the raw
+    /// lanes above don't share a frame with the `arith` calls.
+    noinline fn forLoopStepMixed(regs: RegWindow, a: usize) Error!bool {
+        regs.set(a, try arith.add(regs.get(a), regs.get(a + 2)));
+        const idx = regs.get(a);
+        const limit = regs.get(a + 1);
+        const step = regs.get(a + 2);
+        const ascending = !(try arith.lt(step, Value.int(0)));
+        return if (ascending) try arith.le(idx, limit) else try arith.le(limit, idx);
+    }
+
     /// `R[a] = R[b] <op> R[c]` for band/bor/bxor. Bitwise ops require integer
     /// operands, so the only fast lane is both-int (computed directly); anything
     /// else (a float, a non-number) routes through `arith.*` which raises
@@ -7952,6 +8201,27 @@ pub const Vm = struct {
         }
         try self.heap.deflateGrid(t);
         return false;
+    }
+
+    /// `indexGet` of heap key `key` on table `first`, for as long as every
+    /// step is a raw probe: the value along the `__index` chain of tables,
+    /// or null when the chain reaches what only `indexGet` handles (a grid,
+    /// which it deflates; a functional `__index`; a chain of
+    /// `max_metatable_chain` hops, where it raises). A heap key lives only in
+    /// a hash part, and a metatable's `__index` is a raw read, so the answer
+    /// is `indexGet`'s. Calls nothing, so `get_index` keeps it inline.
+    inline fn heapKeyChainGet(self: *Vm, first: *table.Table, key: Value) ?Value {
+        var t = first;
+        var hops: usize = 0;
+        while (hops < max_metatable_chain) : (hops += 1) {
+            if (t.array.isGrid()) return null;
+            if (t.hash.liveHeapNode(key)) |n| return n.value;
+            const mt = t.metatable orelse return Value.nil();
+            const handler = (mt.hash.liveHeapNode(self.mm.index) orelse return Value.nil()).value;
+            if (!(handler.isHeap() and handler.heapType() == .table)) return null;
+            t = table.Table.fromHeader(handler.asHeap());
+        }
+        return null;
     }
 
     pub fn indexGet(self: *Vm, container: Value, key: Value) Error!Value {

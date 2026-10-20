@@ -1056,6 +1056,65 @@ test "heap-key fast paths: field reads and stores match the full lookup" {
     );
 }
 
+test "compare fast paths: every operand mix matches the full op" {
+    // `lt`/`le`/`gt`/`ge` decide two ints or two floats on the raw lanes; a
+    // mixed pair, strings and `__lt`/`__le` leave for the full op. Each line
+    // pins one edge of that split.
+    try expectProgram(
+        \\local nan, big = 0 / 0, 2 ^ 53
+        \\print(1 < 2, 2 <= 2, 3 > 2, 2 >= 3, -0.0 < 0.0, -0.0 <= 0.0, nan < 1.0, nan >= nan)
+        \\print(9007199254740993 > big, big < 9007199254740993, 1 <= 1.0, 2.5 > 2, "a" < "b", "b" <= "a")
+        \\print(2 < 2, 2 > 2, 2 >= 2, 1 > 2, 2.5 < 2.5, 2.5 > 2.5, 2.5 >= 2.5, 1.5 >= 2.5, nan > nan, -0.0 >= 0.0)
+        \\local V = {}; V.__lt = function(a, b) return a.v < b.v end; V.__le = function(a, b) return a.v <= b.v end
+        \\local x, y = setmetatable({ v = 1 }, V), setmetatable({ v = 2 }, V)
+        \\print(x < y, x > y, x <= y, y >= x, (pcall(function() return 1 < "x" end)))
+        \\
+    ,
+        "true\ttrue\ttrue\tfalse\tfalse\ttrue\tfalse\tfalse\n" ++
+            "true\ttrue\ttrue\ttrue\ttrue\tfalse\n" ++
+            "false\tfalse\ttrue\tfalse\tfalse\tfalse\ttrue\tfalse\tfalse\ttrue\n" ++
+            "true\tfalse\ttrue\ttrue\tfalse\n",
+    );
+}
+
+test "eq fast paths: every operand mix matches the full op" {
+    // `eq`/`ne` decide same-typed numbers, primitives and heap identity on
+    // the raw lanes; two distinct tables (`__eq`), strings by content and a
+    // mixed number pair leave for the full op.
+    try expectProgram(
+        \\local nan = 0 / 0
+        \\local E = { __eq = function() return true end }
+        \\local p, q, t = setmetatable({}, E), setmetatable({}, E), {}
+        \\print(1 == 1, 1 == 2, 1 == 1.0, 1.5 ~= 1.5, nan == nan, nan ~= nan, -0.0 == 0.0, nil == nil, nil == false)
+        \\print(true == true, true ~= false, t == t, t == {}, p == q, p ~= q, "ab" == "a" .. "b", "ab" == "ac", print == print, 1 == "1")
+        \\
+    ,
+        "true\tfalse\ttrue\tfalse\tfalse\ttrue\ttrue\ttrue\tfalse\n" ++
+            "true\ttrue\ttrue\tfalse\ttrue\tfalse\ttrue\tfalse\ttrue\tfalse\n",
+    );
+}
+
+test "mod and idiv fast paths: every operand mix matches the full op" {
+    // Two ints with a nonzero divisor run on the raw lanes, two floats on
+    // the slow half's `fmath` lane; a zero divisor, a mixed pair and
+    // `__mod`/`__idiv` take the full op.
+    try expectProgram(
+        \\local mi = math.mininteger
+        \\print(7 % 3, -7 % 3, 7 % -3, mi % -1, 7 // 2, -7 // 2, 7 // -2, mi // -1, mi // 1)
+        \\print(7.5 % 2, -7.5 % 2, 5.5 % -2, 7.5 // 2, -7.5 // 2, 1.0 % 0.0 ~= 1.0 % 0.0, 1.0 // 0.0, 7 % 2.5, 7.5 // 2)
+        \\print(-7.5 % 2.0, 7.5 // -2.0, (pcall(function() return 1 % 0 end)), (pcall(function() return 1 // 0 end)))
+        \\local M = { __mod = function() return "m" end, __idiv = function() return "i" end }
+        \\local m = setmetatable({}, M)
+        \\print(m % 2, 2 // m)
+        \\
+    ,
+        "1\t2\t-2\t0\t3\t-4\t-4\t-9223372036854775808\t-9223372036854775808\n" ++
+            "1.5\t0.5\t-0.5\t3\t-4\ttrue\tinf\t2\t3\n" ++
+            "0.5\t-4\tfalse\tfalse\n" ++
+            "m\ti\n",
+    );
+}
+
 test "numeric for: every index/limit/step type mix counts the same iterations" {
     // `forLoopStep` has an int lane and a float lane, each taking either a
     // same-typed or an other-typed limit; the rest goes out of line. Each

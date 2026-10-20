@@ -1287,6 +1287,27 @@ test "fused store: a homogeneous-numeric matrix inflates, reshapes, then deflate
     try testing.expectEqual(@as(i64, 8), (try vm.fusedGet(av, Value.int(2), Value.int(2))).asInt());
 }
 
+test "a string-key read or store on a grid deflates it, as indexGet/indexSet do" {
+    // `get_index`/`set_index`'s heap-key fast paths skip a grid, so the full
+    // lookup still deflates it before touching the hash part (doc 14 gate).
+    const gpa = testing.allocator;
+    inline for (.{ "local _ = G.name", "G.name = 1" }) |src| {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        const a = try vm.heap.newTable();
+        const r0 = try vm.heap.newTable();
+        try r0.set(gpa, Value.int(1), Value.int(1));
+        try a.set(gpa, Value.int(1), Value.heap(&r0.header));
+        const av = Value.heap(&a.header);
+        try vm.fusedStore(av, Value.int(1), Value.int(1), Value.int(9));
+        try testing.expect(a.array.isGrid());
+        try vm.globals.set(gpa, try vm.heap.internValue("G"), av);
+        try util.compileRun(gpa, &vm, src);
+        try testing.expect(!a.array.isGrid());
+        try testing.expectEqual(@as(i64, 9), (try vm.fusedGet(av, Value.int(1), Value.int(1))).asInt());
+    }
+}
+
 // --- Phase 4a: fused two-level index (get_index2 / set_index2) ---------------
 
 test "fused index: chained get/set on nested tables is byte-identical across 8 modes" {
