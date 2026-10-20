@@ -1315,6 +1315,27 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 try jccNativeExit(a, exit_labels, i, .p); // unordered (NaN) → side-exit
                 try regToPlace(a, placeOfRef(alloc, i), .rax);
             },
+            // The numeric-for step-direction guards (`trace_ir.stepGuardPasses`):
+            // side-exit when the step's sign is not the recorded direction. An
+            // int compares with 0 signed. A float runs `ucomisd 0, step`, whose
+            // `a` (CF=0, ZF=0) is exactly an ordered `step < 0`, so a NaN step
+            // counts upward as in tier-0.
+            .guard_step_up, .guard_step_down => {
+                const up = ins.op == .guard_step_up;
+                if (kinds[ins.a] == .int) {
+                    switch (placeOfRef(alloc, ins.a)) {
+                        .reg => |r| try a.cmpRegImm32(r, 0),
+                        .mem => |d| try a.cmpQwordMemImm8(.rsp, d, 0),
+                        .xmm => unreachable, // an int is never homed in an XMM
+                    }
+                    try jccNativeExit(a, exit_labels, i, if (up) .l else .ge);
+                } else {
+                    try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.a), .float);
+                    try a.xorpdRegReg(XMM_SCRATCH1, XMM_SCRATCH1);
+                    try a.ucomisdRegReg(XMM_SCRATCH1, XMM_SCRATCH0);
+                    try jccNativeExit(a, exit_labels, i, if (up) .a else .be);
+                }
+            },
             // fsqrt: the inlined pure builtin. `@sqrt` ≡ `sqrtsd` bit-for-bit under the
             // default MXCSR (round-to-nearest-even, which mahina never changes) — including
             // `sqrt(-0.0) = -0.0`, `sqrt(x<0) = qNaN`, `sqrt(+inf) = +inf` — so this one

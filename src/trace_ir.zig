@@ -760,6 +760,24 @@ pub const IrOp = enum(u8) {
     /// `a` = site index, `aux` = result index; `ty` is the observed type.
     /// Checks the result's tag, then loads it. `snap` = C_B1, coherent.
     host_result,
+
+    // ---- numeric-for step direction (LuaJIT `rec_for_check`) ----
+    //
+    // `a` = the step ref (a guarded int or float). Produces nothing.
+    // `guard_step_up` passes iff `!(step < 0)`, the direction tier-0's
+    // `for_loop` counts upward in (a NaN step included); `guard_step_down`
+    // passes iff `step < 0`. The recorder bakes the loop test's direction
+    // (`le(next, limit)` or `le(limit, next)`) into the trace, so a
+    // non-constant step needs its sign pinned: a later entry whose step
+    // has the other sign side-exits instead of running the wrong test.
+    // Deliberately not `lt` + `guard_true`/`guard_false`: every loop-test
+    // classifier reads a truthiness guard sourced at the anchor's
+    // `for_loop` as the loop test, whose exit resumes after the loop.
+    // Like `int_of_float` it stamps its recording pc in `aux` and is a
+    // hoistable side exit (`tropt` kind `.cvt`), so it runs once per entry.
+    // Wire ordinals 97–98.
+    guard_step_up,
+    guard_step_down,
 };
 
 /// Doc 63 §5.1: one host call site of a precise trace, indexed by
@@ -809,6 +827,30 @@ pub fn primPinPasses(op: IrOp, v: value_mod.Value) bool {
         .guard_is_nil => v.isNil(),
         .guard_is_false => v.isBool() and !v.asBool(),
         .guard_is_true => v.isBool() and v.asBool(),
+        else => unreachable,
+    };
+}
+
+/// tier-0 `for_loop` counts upward iff `!(step < 0)` (`Vm.forLoopStep`), so a
+/// NaN step counts upward. `step` is an int or a float.
+pub fn forStepAscending(step: value_mod.Value) bool {
+    return if (step.isInt()) step.asInt() >= 0 else !(step.asFloat() < 0);
+}
+
+/// The `guard_step_*` that pins `step`'s direction.
+pub fn stepGuardOp(step: value_mod.Value) IrOp {
+    return if (forStepAscending(step)) .guard_step_up else .guard_step_down;
+}
+
+/// `step` has the direction `op` pins. The one predicate every tier's
+/// `guard_step_*` check implements. LICM hoists the guard above the step's
+/// own type guard, so a non-number (which tier-0's `for_prep` never lets
+/// through) fails rather than being read as a float.
+pub fn stepGuardPasses(op: IrOp, step: value_mod.Value) bool {
+    if (!step.isNumber()) return false;
+    return switch (op) {
+        .guard_step_up => forStepAscending(step),
+        .guard_step_down => !forStepAscending(step),
         else => unreachable,
     };
 }
@@ -886,6 +928,7 @@ pub fn guardExitPc(ins: IrInstr) ?u32 {
     return switch (ins.op) {
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .alen => @intCast(ins.aux),
         .guard_is_nil, .guard_is_false, .guard_is_true => @intCast(ins.aux),
+        .guard_step_up, .guard_step_down => @intCast(ins.aux),
         else => null,
     };
 }
@@ -898,6 +941,7 @@ pub fn isSideExitGuardOp(op: IrOp) bool {
     return switch (op) {
         .guard_absent => true,
         .guard_is_nil, .guard_is_false, .guard_is_true => true,
+        .guard_step_up, .guard_step_down => true,
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent, .alen => true,
         else => false,
     };
@@ -999,6 +1043,8 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .guard_present,
         .guard_fits,
         .int_of_float,
+        .guard_step_up,
+        .guard_step_down,
         .guard_func,
         .fsqrt,
         .alen,

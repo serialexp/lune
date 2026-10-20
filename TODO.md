@@ -24,20 +24,115 @@ because AMD skid misattributes across tail jumps). Against LuaJIT
       LuaJIT walks `next` with a dedicated bytecode (`ITERN`, after
       `ISNEXT` checks the iterator is the real `next`) and no call. Belongs
       with the bytecode-forms item below.
-- [ ] **`for_loop` has no integer fast path.** An empty `for` loop costs
+- [x] **`for_loop` has no integer fast path.** An empty `for` loop costs
       206 instructions per iteration (LuaJIT 18). Every iteration calls
       `arith.add`, `arith.lt(step, 0)` and `arith.le` out of line, with
       Values spilled through memory, and pushes five callee-saved
-      registers. `jfor_loop` shares the same step.
+      registers. `jfor_loop` shares the same step. Fixed 2026-10-20:
+      `Vm.forLoopStep` computes all-int and all-float loops on the raw
+      lanes, and the mixed remainder (`forLoopStepMixed`) is out of line.
+      Per iteration: empty loop 206 → 72, `s = s + i` 335 → 201, float
+      add 343 → 209, a Lua call 917 → 783, an array read 624 → 490. The
+      five register pushes stay; they come from the dispatch prologue
+      (item below), not the step.
+- [x] **The compiler copied every local operand into a temporary.**
+      `s = s + i` was `move t1, s; move t2, i; add t3, t1, t2; move s, t3`,
+      ~25 instructions per `move`. Found 2026-10-20 while profiling `t.x`
+      (most of its "load" cost was moves). Fixed: operands, `if`/`while`
+      conditions, field/index objects and keys are read from the local's
+      register in place (Lua's `exp2anyreg`), `x = e` compiles `e` into `x`
+      when `e` writes its destination last, and `s += i` is one `add`.
+      An operand evaluated before code that could write it (a call, an
+      `__index`, anything not `isInert`) is still copied first, so results
+      are unchanged; `compiler.zig` tests pin both. Instruction counts over
+      every `@bench` program (HEAD vs HEAD + the change): tier-0 −1% to −27%
+      (scimark-fft −26.6%, nsieve-bit-fp −19.8%, pi_leibniz −19.7%, nbody
+      −17.7%), JIT 0 to −12.8% (nsieve-bit-fp −12.8%, euler14-bit −10.7%),
+      compile_multret_chain +0.01%.
+- [x] **An int-index `for` with a float limit takes the generic step.**
+      `for i = 1, n / 2` has a float `R[a+1]`, so it missed both raw lanes
+      of `forLoopStep`. Fixed 2026-10-21 in tier-0 alone, without
+      converting the limit at `for_prep`: each raw lane also takes the
+      other number type as its limit and compares it exactly with
+      `value.compareNumeric`, so no other tier changes. nsieve (whose
+      limit is float) went from +9% to −40.6% tier-0 instructions.
+- [x] **Bug: a trace baked in its `for` loop's direction without guarding
+      the step's sign** (found 2026-10-21). `recForLoop`,
+      `recForPrepLink` and the peel-rewind re-close picked
+      `le(next, limit)` or `le(limit, next)` from the observed step and
+      guarded only its type. So a trace recorded on `run(2000, 1, -1)` ran
+      a later `run(1, 3, 1)` with the descending test, and under `--trace`
+      and `--jit-native` that call never ended; nested loops printed wrong
+      totals. Fixed 2026-10-21 the LuaJIT way (`rec_for_check`): a
+      non-constant step gets `guard_step_up` (`!(step < 0)`) or
+      `guard_step_down` (wire ordinals 97–98). These are new ops rather than
+      `lt` + `guard_true`/`guard_false`, because every loop-test
+      classifier reads a truthiness guard sourced at the anchor's
+      `for_loop` as the loop test, whose exit resumes after the loop. They
+      are `.cvt`-kind in `tropt`, so LICM hoists them to once per entry.
+      They are lowered in tier-1a and native (int `cmp 0`; float
+      `ucomisd 0, step`) and listed in `viz/src/enums.ts`. Tests: three
+      `numeric for:` semantics tests (ten legs each) and a native-vs-tier-1a
+      op test over ints, ±0.0, NaN and ±inf, all mutation-checked.
+      `recForPrepLink`'s own guard is not pinned by any test: removing only
+      that one changes no output found so far. Cost over every `@bench`
+      program: tier-0 0%, JIT 0 to +0.57% instructions (scimark-sparse
+      +0.57%, nsieve-bit-fp +0.55%, scimark-fft +0.55%, sieve_int +0.53%,
+      nsieve +0.47%).
+- [ ] **Continuation traces re-check a `for` step every run.** Most of the
+      step guard's +0.5% JIT cost (above) comes from one-shot traces
+      (`link -> N (iteration)` continuations) that cross an enclosing
+      `for_loop`. They have no preheader, so the guard runs on every
+      execution. LuaJIT pays the same `rec_for_check` in its side traces,
+      but a side trace inherits constants from its parent's snapshot, so the
+      step is usually a constant there and needs no guard. Mahina's
+      continuations read the step as a `slot_load`. The lever is
+      parent-constant inheritance for continuation inputs (or an entry-time
+      pin, like doc 57's prologue-checked value pins).
+- [ ] **A zero `for` step loops forever instead of raising** (noted
+      2026-10-21). `for i = 1, 3, 0` and `for i = 1, 3, 0.0` never end;
+      Lua 5.4's `forprep` raises `'for' step is zero`. Pre-existing. The
+      fix is a check in tier-0's `for_prep`, plus `recForPrepLink`, which
+      records inner `for_prep`s, aborting on a zero step.
+- [ ] **`next` returns no values at the end of a traversal** (noted
+      2026-10-20). `select("#", next({}))` is 0; Lua 5.4 returns one `nil`
+      (1). `stdlib/base.zig` `nNextN`: `if (!step.found) return 0;`. A
+      generic `for` doesn't notice (a missing result reads as nil), but
+      `print(next(t))` prints nothing instead of `nil`. Decide whether this
+      is a deliberate divergence; if not, return one nil.
+- [ ] **Bug: an integer `for` that reaches `math.maxinteger` /
+      `math.mininteger` never ends.** `for i = math.maxinteger - 1,
+      math.maxinteger do … end` wraps `idx` to `mininteger` and keeps
+      going (Lua 5.4: 2 iterations). Same in tier-0, `--trace` and
+      `--jit-native`; the baseline before the fast path did it too (Lua
+      5.3 had the same bug). A plain overflow check on the add is wrong:
+      `for_prep` pre-subtracts the step, so `for i = math.mininteger, 0`
+      legitimately wraps on the first add. Lua 5.4 precomputes an
+      unsigned iteration count in `forprep`. Every tier's `for_loop`
+      (tier-0, `irinterp`, recorder, native loop-done guards) changes
+      together, so it needs a decision on the shape first.
 - [ ] **No constant-operand or fused forms in the bytecode.** `t.x` is
       `load_const` + `get_index`; `i - 7` is `load_int` + `sub`; `if a < b`
       is `lt` into a register + `jmp_if_false`. Each extra op pays the
       ~18-instruction dispatch prologue plus a register round trip.
       Marginal costs (mahina vs LuaJIT): `<` 171/32, `==` 181/38,
       `- k` 100/15, `if a < b` 205/32.
-- [ ] **Constant-key field access has no per-site hint.** `t.x` read
+- [x] **Constant-key field access has no per-site hint.** `t.x` read
       272/42, `t.x = v` 328/45, a method call `o:get()` ~1250 total.
       Globals already have doc 62's slot hints and are at parity (32/30).
+      Fixed 2026-10-20 without hints: `get_index` / `set_index` probe a
+      heap key inline (`HashPart.liveHeapNode`, call-free linear probe),
+      reads walk `__index` chains of plain tables inline
+      (`Vm.heapKeyChainGet`), a live key's store overwrites in place, and
+      everything else leaves through `slowTail`. That covers dynamic keys
+      (`t[k]`, table keys) too, and nothing ping-pongs between tables of
+      different layouts. Marginal instructions over the `s = s + i` loop
+      (`/tmp/t0micro/fields.lua`; LuaJIT `-joff` in brackets): `t.x` 233 →
+      126 (29), `t.x = v` 262 → 125 (32), method lookup through `__index`
+      427 → 210 (203), method call 925 → 708 (284); the first column is
+      after the in-place-operand compiler change. The rest of `t.x` is the
+      `load_const` of the key (constant-operand forms, below) and five
+      register pushes from handler register pressure.
 - [ ] **Lua call + return.** 0-arg call 461/63, 1-arg 611/74. The callee
       window is filled by a generic per-register loop, then
       `pushFrameVararg`, `reloadTopFrame` and `onCallEntry`.
@@ -337,8 +432,10 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
 
 ## Global-read slow path leaves via a volatile `var` pointer (noted 2026-10-05)
 
-- [ ] **`opGetGlobal` (src/interp.zig) tail-calls `GetGlobalSlow(mode).handler`
-      through a volatile load of a never-written `var`.** It keeps LLVM from
+- [x] **`opGetGlobal` (src/interp.zig) tail-calls `GetGlobalSlow(mode).handler`
+      through a volatile load of a never-written `var`.** Fixed 2026-10-20:
+      a per-mode slow-handler table indexed by `instr.op` (`Vm.slowTail`,
+      doc 62 §4.3 follow-up), also used by `get_index` / `set_index`. It keeps LLVM from
       inlining the slow handler, which would make every hint hit save and
       restore five callee-saved registers (global read 73 → 61 instructions).
       `noinline` changes the fn type and breaks `.always_tail`; a volatile

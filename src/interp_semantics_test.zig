@@ -1024,6 +1024,127 @@ test "metatable: a self-referential __index chain raises rather than hanging" {
     );
 }
 
+test "heap-key fast paths: field reads and stores match the full lookup" {
+    // `get_index`/`set_index` probe a heap key inline and walk `__index`
+    // chains of plain tables; everything else leaves for `indexGet` /
+    // `indexSet`. Each line pins one edge of that split.
+    try expectProgram(
+        \\local Base = {}; Base.__index = function(_, k) return k .. "!" end
+        \\local C = setmetatable({ m = "Cm" }, Base); C.__index = C
+        \\local o = setmetatable({ own = 1 }, C)
+        \\print(o.own, o.m, o.miss)
+        \\local log = {}
+        \\local w = setmetatable({ x = 1 }, { __newindex = function(t, k, v) log[#log + 1] = k end })
+        \\w.x = 2; w.y = 3
+        \\print(w.x, rawget(w, "y"), log[1], #log)
+        \\local d = { k = 1 }
+        \\d.k = nil
+        \\print(d.k, next(d) == nil)
+        \\d.k = 5
+        \\print(d.k, next(d))
+        \\local key = {}
+        \\local tk = { [key] = "t" }
+        \\tk[key] = "u"
+        \\print(tk[key], tk[{}])
+        \\local arr = { 10, nil, 30 }
+        \\arr[100] = "s"
+        \\local ix = setmetatable({ 1 }, { __index = function(_, k) return k * 2 end })
+        \\print(arr[1], arr[2], arr[4], arr[100], ix[1], ix[3], ix[0])
+        \\
+    ,
+        "1\tCm\tmiss!\n2\tnil\ty\t1\nnil\ttrue\n5\tk\t5\nu\tnil\n10\tnil\tnil\ts\t1\t6\t0\n",
+    );
+}
+
+test "numeric for: every index/limit/step type mix counts the same iterations" {
+    // `forLoopStep` has an int lane and a float lane, each taking either a
+    // same-typed or an other-typed limit; the rest goes out of line. Each
+    // case pins the iteration count and the last index for one shape. One
+    // `run` sees every step sign, so it also leans on the step guard below.
+    try expectProgram(
+        \\local function run(a, b, c)
+        \\  local n, last = 0, nil
+        \\  for i = a, b, c do
+        \\    n = n + 1; last = i
+        \\    if n > 50 then break end
+        \\  end
+        \\  return n .. ":" .. tostring(last)
+        \\end
+        \\local nan = 0 / 0
+        \\local cases = {
+        \\  { 1, 10.0, 1 }, { 1, 10.5, 1 }, { 1, 9.99, 2 }, { 10, 1.5, -1 }, { 10, 1.0, -3 },
+        \\  { 1, nan, 1 }, { 1, -nan, -1 }, { 1, -1 / 0, -1 }, { 1, 0.5, 1 }, { 1, 1.0, 1 },
+        \\  { -3, -2.5, 1 }, { 0.5, 3, 0.5 }, { 3.5, 1, -0.5 }, { 0.5, 0, 0.25 }, { 0.0, 2, 1.0 },
+        \\  { 0.5, nan, 0.5 }, { 1, 3, 1.0 }, { 1.0, 3, 1 },
+        \\}
+        \\local out = {}
+        \\for _, c in ipairs(cases) do out[#out + 1] = run(c[1], c[2], c[3]) end
+        \\print(table.concat(out, " "))
+        \\
+    ,
+        "10:10 10:10 5:9 9:2 4:1 0:nil 0:nil 51:-49 0:nil 1:1 1:-3 6:3 6:1 0:nil 3:2 0:nil 3:3 3:3\n",
+    );
+}
+
+test "numeric for: a trace recorded on one step sign never runs the other" {
+    // The recorder bakes the loop test's direction in from the observed
+    // step, so a trace entered with a step of the other sign must side-exit
+    // (`guard_step_up`/`guard_step_down`). Without the guard the second
+    // `run` counted upward under the descending test until the `break`.
+    // The `break` caps keep a regression a wrong answer, not a hang.
+    try expectProgram(
+        \\local function run(a, b, c)
+        \\  local s, n = 0, 0
+        \\  for i = a, b, c do
+        \\    s = s + i
+        \\    n = n + 1
+        \\    if n > 500 then break end
+        \\  end
+        \\  return s
+        \\end
+        \\print(run(200, 1, -1), run(1, 3, 1), run(200, 1, -1))
+        \\print(run(200.5, 1.5, -1.0), run(1.5, 3.5, 1.0), run(0.5, 2.5, 0 / 0), run(2.5, 0.5, -0.0))
+        \\
+    ,
+        "20100\t6\t20100\n20200\t7.5\t0\t0\n",
+    );
+}
+
+test "numeric for: an inner loop linked from an outer trace keeps its step sign" {
+    // An inner root plus the outer continuation that links into it, with
+    // the inner step flipping sign between outer iterations. Before the
+    // step guard, `--trace` and `--jit-native` printed wrong totals here.
+    // (This does not pin `recForPrepLink`'s own guard: removing only that
+    // one leaves the output unchanged, as no flipped step reaches the link
+    // test here.)
+    try expectProgram(
+        \\local total, n = 0, 0
+        \\for k = 1, 300 do
+        \\  local a, b, c = 1, 6, 1
+        \\  if k > 150 and k % 3 == 0 then a, b, c = 6, 1, -1 end
+        \\  for i = a, b, c do
+        \\    total = total + i * k
+        \\    n = n + 1
+        \\    if n > 100000 then break end
+        \\  end
+        \\end
+        \\local ftotal, fn = 0, 0
+        \\for k = 1, 300 do
+        \\  local a, b, c = 0.5, 3.5, 0.5
+        \\  if k > 150 and k % 3 == 0 then a, b, c = 3.5, 0.5, -0.5 end
+        \\  for i = a, b, c do
+        \\    ftotal = ftotal + i
+        \\    fn = fn + 1
+        \\    if fn > 100000 then break end
+        \\  end
+        \\end
+        \\print(total, n, ftotal, fn)
+        \\
+    ,
+        "948150\t1800\t4200\t2100\n",
+    );
+}
+
 test "metatable: setmetatable rejects a non-table/non-nil metatable argument" {
     try expectProgram(
         \\print(pcall(function() return setmetatable({}, 5) end))

@@ -116,6 +116,8 @@ export const IR_OP_NAMES = [
   "call_host", // 94  host call (doc 63, precise traces only) — a=site
   "guard_host_epoch", // 95  epoch and GC budget unchanged (doc 63) — a=site, aux=A_rem
   "host_result", // 96  typed host result (doc 63) — a=site, aux=result index
+  "guard_step_up", // 97  numeric-for step counts upward, !(a < 0) — aux=pc
+  "guard_step_down", // 98  numeric-for step counts downward, a < 0 — aux=pc
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
@@ -186,6 +188,8 @@ export const UNARY_OR_GUARD_OPS: ReadonlySet<IrOpName> = new Set([
   "guard_present",
   "guard_fits",
   "int_of_float",
+  "guard_step_up",
+  "guard_step_down",
   "guard_append",
   "hload",
   "guard_hash",

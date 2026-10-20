@@ -481,6 +481,14 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
 
+                // ---- numeric-for step direction ----
+                .guard_step_up, .guard_step_down => if (trace_ir.stepGuardPasses(ins.op, values[ins.a])) {
+                    if (record) rec.guardPass(i, values[ins.a]);
+                } else {
+                    if (record) rec.exit(i, .guard, values[ins.a]);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+
                 // ---- `#t` fast-case border (doc 23 D3) ----
                 // Produce `max(asize−1, 0)` when the exact fast case holds (hash
                 // empty ∧ presence-bitmap lane ∧ (asize ≤ 1 ∨ present(asize−1))) —

@@ -671,6 +671,8 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
             },
             // Doc 57: the primitive pins read `a` only.
             .guard_is_nil, .guard_is_false, .guard_is_true => std.debug.assert(ins.a < i),
+            // The step-direction guards read the step `a` only.
+            .guard_step_up, .guard_step_down => std.debug.assert(ins.a < i),
             // `int_of_float` reads its sole float operand `a` (a prior node).
             .int_of_float => std.debug.assert(ins.a < i),
             // `alen` reads its sole table operand `a` (a prior node).

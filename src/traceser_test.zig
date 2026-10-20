@@ -347,9 +347,12 @@ test "wire enum ordinals are a pinned contract (mirrored by viz/src/enums.ts)" {
     try testing.expectEqual(@as(u8, 94), @intFromEnum(IrOp.call_host));
     try testing.expectEqual(@as(u8, 95), @intFromEnum(IrOp.guard_host_epoch));
     try testing.expectEqual(@as(u8, 96), @intFromEnum(IrOp.host_result));
+    // Numeric-for step-direction guards (LuaJIT `rec_for_check`).
+    try testing.expectEqual(@as(u8, 97), @intFromEnum(IrOp.guard_step_up));
+    try testing.expectEqual(@as(u8, 98), @intFromEnum(IrOp.guard_step_down));
     // Exhaustiveness: if a member is added/removed, this count changes and forces
     // both this test and enums.ts to be revisited.
-    try testing.expectEqual(@as(usize, 97), @typeInfo(IrOp).@"enum".field_names.len);
+    try testing.expectEqual(@as(usize, 99), @typeInfo(IrOp).@"enum".field_names.len);
 
     const ObsType = trace_ir.ObsType;
     try testing.expectEqual(@as(u8, 0), @intFromEnum(ObsType.unknown));

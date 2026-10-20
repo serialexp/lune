@@ -273,9 +273,12 @@ const PinEntry = struct { pc: u32, lane: i32, table_id: u32, guard_ref: u32 };
 /// The doc 48 pin-shift source: a fill loop (append-path guard_lane) and a
 /// read loop with a hoistable invariant (`q * q`) ahead of the array access,
 /// so tropt's preheader insertion moves the read trace's guard_lane index.
+// The fill loop's repeated `i * 0.5` (CSE'd to one) gives tropt drops before
+// the lane guard that outweigh the hoisted step guard's preheader, so its
+// guard index still moves down; each `a[i]` is still `i * 0.5`.
 const pin_shift_source =
     \\local a = {}
-    \\for i = 1, 60 do a[i] = i * 0.5 end
+    \\for i = 1, 60 do a[i] = i * 0.5 + i * 0.5 + i * 0.5 - i * 0.5 - i * 0.5 end
     \\local q = 2.5
     \\local s = 0
     \\for i = 1, 60 do

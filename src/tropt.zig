@@ -89,6 +89,11 @@ fn kindOf(op: IrOp) OpKind {
         // a value (the int limit) the body's compare consumes — and is invariant-
         // hoistable (its result depends only on the loop-invariant float limit).
         .int_of_float => .cvt,
+        // The numeric-for step-direction guards: no value, but `.cvt` for the
+        // same reason — a side-exiting root whose outcome depends only on the
+        // step, so LICM hoists it to run once per entry (LuaJIT hoists its
+        // `rec_for_check` guard the same way). See the `.cvt` LICM note.
+        .guard_step_up, .guard_step_down => .cvt,
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => .guard,
         // Doc 57: the primitive pins are ordinary one-operand type guards.
         .guard_is_nil, .guard_is_false, .guard_is_true => .guard,

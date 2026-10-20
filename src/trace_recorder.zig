@@ -1165,6 +1165,10 @@ pub const RecordingSession = struct {
             self.realAbort(.nyi_opcode);
             return;
         };
+        const ascending = self.guardForStep(rstep, vstep) catch {
+            self.realAbort(.nyi_opcode);
+            return;
+        };
         const all_int = vinit.isInt() and vstep.isInt();
         const vpre = arith.sub(vinit, vstep) catch {
             self.realAbort(.bad_type);
@@ -1186,7 +1190,6 @@ pub const RecordingSession = struct {
             self.stampProv(iof, .limit_int, .a1, .neutral);
             break :blk iof;
         } else rlimit;
-        const ascending = vstep.toFloat() >= 0;
         const cmp = if (ascending)
             self.emit(.{ .op = .le, .a = rfirst, .b = rlimit_cmp, .ty = .boolean }) catch {
                 self.realAbort(.nyi_opcode);
@@ -1828,6 +1831,7 @@ pub const RecordingSession = struct {
             .guard_is_nil, .guard_is_false, .guard_is_true => {
                 ins_mut.aux = @intCast(self.cur_pc);
             },
+            .guard_step_up, .guard_step_down => ins_mut.aux = @intCast(self.cur_pc),
             else => {},
         }
         // Doc 45 D2: on a precise recording every BODY op carries the current
@@ -2122,6 +2126,20 @@ pub const RecordingSession = struct {
 
     pub fn guardNum(self: *RecordingSession, ref: Ref, v: Value, role: GuardRole, operand: OperandDesig) !void {
         try self.guard(ref, if (v.isInt()) IrOp.guard_int else IrOp.guard_float, role, operand);
+    }
+
+    /// Pin a numeric `for`'s step direction (LuaJIT `rec_for_check`). The
+    /// caller bakes the loop test's direction into the trace from the
+    /// observed step, so a later entry with a step of the other sign must
+    /// side-exit rather than run the wrong test. A constant step can't
+    /// change sign and needs no guard. Returns whether the loop counts up.
+    fn guardForStep(self: *RecordingSession, rstep: Ref, vstep: Value) !bool {
+        const ascending = trace_ir.forStepAscending(vstep);
+        if (self.instrs.items[rstep].op != .konst) {
+            const g = try self.emit(.{ .op = trace_ir.stepGuardOp(vstep), .a = rstep });
+            self.stampProv(g, .step_sign, .a2, .neutral);
+        }
+        return ascending;
     }
 
     /// Record-time view of an array get/set KEY: the integer index tier-0's
@@ -3587,6 +3605,7 @@ pub const RecordingSession = struct {
         try self.guardNum(ridx, vidx, .operand_type, .a);
         try self.guardNum(rlimit, vlimit, .operand_type, .a1);
         try self.guardNum(rstep, vstep, .operand_type, .a2);
+        const ascending = try self.guardForStep(rstep, vstep);
 
         // idx_next = idx + step
         const all_int = vidx.isInt() and vstep.isInt();
@@ -3611,7 +3630,6 @@ pub const RecordingSession = struct {
         } else rlimit;
 
         // loop continues while (ascending) idx_next <= limit, else limit <= idx_next.
-        const ascending = vstep.toFloat() >= 0;
         const cmp = if (ascending)
             try self.emit(.{ .op = .le, .a = rnext, .b = rlimit_cmp, .ty = .boolean })
         else
@@ -3627,8 +3645,7 @@ pub const RecordingSession = struct {
         // a pure function of deterministic register values, identical in every
         // record/exec mode.
         const vnext = arith.add(vidx, vstep) catch return self.abort(.bad_type);
-        const o_ascending = !(arith.lt(vstep, Value.int(0)) catch return self.abort(.bad_type));
-        const within = if (o_ascending)
+        const within = if (ascending)
             arith.le(vnext, vlimit) catch return self.abort(.bad_type)
         else
             arith.le(vlimit, vnext) catch return self.abort(.bad_type);
@@ -3961,6 +3978,7 @@ pub const RecordingSession = struct {
         try self.guardNum(rinit, vinit, .operand_type, .a);
         try self.guardNum(rlimit, vlimit, .operand_type, .a1);
         try self.guardNum(rstep, vstep, .operand_type, .a2);
+        const ascending = try self.guardForStep(rstep, vstep);
 
         // First-iteration bounds test, mirroring `recForLoop`'s compare (incl. the
         // float-limit → int specialization so a mixed int/float compare stays lowerable
@@ -3982,7 +4000,6 @@ pub const RecordingSession = struct {
             self.stampProv(iof, .limit_int, .a1, .neutral);
             break :blk iof;
         } else rlimit;
-        const ascending = vstep.toFloat() >= 0;
         const cmp = if (ascending)
             try self.emit(.{ .op = .le, .a = rfirst, .b = rlimit_cmp, .ty = .boolean })
         else

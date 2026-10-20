@@ -551,6 +551,12 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (kinds[ins.a] != .float) return false;
                 kinds[i] = .int;
             },
+            // The numeric-for step-direction guards: a proven int or float step,
+            // compared with zero; no value.
+            .guard_step_up, .guard_step_down => {
+                if (!isNumKind(kinds[ins.a])) return false;
+                kinds[i] = .none;
+            },
             // alen (doc 23 D3): the `#t` fast-case border. The operand is a
             // loop-invariant table home (`.ptr`, guard_table-covered slot_load) or
             // a per-iteration element table (`.heap`, .value-lane aload). The
@@ -1578,6 +1584,8 @@ pub fn operandReads(ins: trace_ir.IrInstr) struct { a: bool, b: bool } {
         // int_of_float reads its sole float operand (a); alen its sole table
         // operand (a).
         .int_of_float, .alen => .{ .a = true, .b = false },
+        // The step-direction guards read the step (a).
+        .guard_step_up, .guard_step_down => .{ .a = true, .b = false },
         // aref reads table (a, an invariant home) + index (b). aload/guards reach the
         // table through aref.a, so they read only the aref token (a). astore reads
         // the aref token (a) plus the value to write (b). astore_append is the grow

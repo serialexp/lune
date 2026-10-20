@@ -80,6 +80,7 @@ pub const GuardRole = enum(u8) {
     /// condition. It is an ordinary coarse exit: no loop-done classifier,
     /// no branch consumer, no exit attach (`TraceCode.isLoopTestCopy`).
     loop_test_copy,
+    step_sign, // numeric-for step direction (guard_step_up / guard_step_down)
 };
 
 /// Static register designator for the guarded operand (H-1c). Covers `a`/`b`/`c`,

@@ -448,3 +448,47 @@ test "nativegen: guard_false on an integer side-exits immediately" {
     const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try expectMatch(&t, &.{Value.int(5)}); // completed==0, regs unchanged
 }
+
+test "nativegen: guard_step_up/down pass exactly when tier-0 counts that way" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // tier-0 counts upward iff !(step < 0): a NaN or -0.0 step counts up.
+    const nan = std.math.nan(f64);
+    const inf = std.math.inf(f64);
+    const Case = struct { step: Value, up: bool };
+    const cases = [_]Case{
+        .{ .step = Value.int(1), .up = true },          .{ .step = Value.int(0), .up = true },
+        .{ .step = Value.int(-1), .up = false },        .{ .step = Value.int(std.math.minInt(i64)), .up = false },
+        .{ .step = Value.int(std.math.maxInt(i64)), .up = true }, .{ .step = Value.float(0.5), .up = true },
+        .{ .step = Value.float(-0.5), .up = false },    .{ .step = Value.float(0.0), .up = true },
+        .{ .step = Value.float(-0.0), .up = true },     .{ .step = Value.float(nan), .up = true },
+        .{ .step = Value.float(inf), .up = true },      .{ .step = Value.float(-inf), .up = false },
+    };
+    for (cases) |c| {
+        for ([_]trace.IrOp{ .guard_step_up, .guard_step_down }) |op| {
+            var instrs = [_]I{
+                .{ .op = .slot_load, .aux = 0 }, // 0: i (starts at 0)
+                .{ .op = .guard_int, .a = 0 }, // 1
+                .{ .op = .slot_load, .aux = 1 }, // 2: step
+                .{ .op = if (c.step.isInt()) .guard_int else .guard_float, .a = 2 }, // 3
+                .{ .op = op, .a = 2 }, // 4
+                .{ .op = .konst, .aux = 0 }, // 5: 3
+                .{ .op = .lt, .a = 0, .b = 5 }, // 6: i < 3
+                .{ .op = .guard_true, .a = 6 }, // 7
+                .{ .op = .konst, .aux = 1 }, // 8: 1
+                .{ .op = .add, .a = 0, .b = 8 }, // 9: i + 1
+                .{ .op = .phi, .b = 9, .aux = 0 },
+                .{ .op = .loop },
+            };
+            var consts = [_]Value{ Value.int(3), Value.int(1) };
+            var es = [_]u16{};
+            const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+            // A passing guard lets all three iterations commit; a failing one
+            // exits before the first.
+            var regs = [_]Value{ Value.int(0), c.step };
+            var values: [instrs.len]Value = undefined;
+            const passes = c.up == (op == .guard_step_up);
+            try testing.expectEqual(@as(usize, if (passes) 3 else 0), irinterp.executeValues(&t, &regs, &values).completed);
+            try expectMatch(&t, &.{ Value.int(0), c.step });
+        }
+    }
+}
