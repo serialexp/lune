@@ -29,9 +29,12 @@ WORST BOARD ROW (2026-10-19, amber-badger): nsieve-bit-fp.
   board size. The four causes (region decay gating the outer `for i`, a
   loop-done chain end counted as a miss, the marker-pc chain never
   trying the header root, one ledger row per `while` trip) are in TODO
-  "The `while` inside `for k` and the outer `for i`". Waiting on Bart for
-  which to take on. After that, region accounting is the seam's biggest
-  slice (TODO).
+  "The `while` inside `for k` and the outer `for i`". Written up as doc
+  64 (`docs/design/64-heavy-iteration-nests.md`) and reviewed by Codex
+  and Antigravity (`docs/reviews/doc64/*-r1.md`, summary and
+  disagreements in doc 64 §9). Waiting on Bart's choices listed at the
+  end of §9. After that, region accounting is the seam's biggest slice
+  (TODO).
 
 LINE LOOKUP FIX (2026-10-11, coral-marten): LANDED in `49fd572`, bundled with amber-badger's doc 61 Phase K.
 - Bug from TODO.md "Every located runtime error rescans the source for

@@ -19,7 +19,8 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
       1b60a01: nsieve-bit-fp 393.9 → 350.9 ms (−10.9%), scimark-fft
       276.6 → 219.9 ms (−20.5%), the rest within noise.
 - [ ] **The `while` inside `for k` and the outer `for i` (diagnosed
-      2026-10-20 at the board size, `nsieve-bit-fp.lua 6`).** The earlier
+      2026-10-20 at the board size, `nsieve-bit-fp.lua 6`; design doc 64,
+      reviewed round 1, which corrects some details below).** The earlier
       "no looping root" reading was the m=5000 kernel: at board size the
       `while` root exists (t7, anchor 54, after 5 recording aborts). Where
       the time goes (`--jit-stats`): native 27%, seam 37%, tier-0 with a
