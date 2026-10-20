@@ -376,6 +376,11 @@ fn applyWindowDecision(self: *TraceState, key: RegionKey, work: u64, decision: @
 }
 
 pub fn closeRegion(self: *TraceState, key: RegionKey) void {
+    // Doc 63 §5.9.2: unreachable while suspended. A callback's frames lie
+    // deeper than every open accumulator's root and carry fresh `call_seq`s,
+    // so neither the observer nor an activation drop can pick one; every
+    // other caller starts from a trace run, a commit or the ledger.
+    std.debug.assert(!self.suspended());
     const close = self.region_policy.beginClose(key, self.config.min_useful) orelse return;
     self.dbg("region: close rid={d} activation={d} work={d}", .{ @intFromEnum(key.region_id), key.activation, close.work });
     applyWindowDecision(self, key, close.work, close.window);
@@ -497,11 +502,17 @@ pub fn activeRegionFor(self: *const TraceState, activation: u64) ?RegionKey {
 }
 
 pub fn openRegion(self: *TraceState, id: RegionId, ctx: RegionContext) ?RegionKey {
+    // Doc 63 §5.9.2: regions open only from trace receipts, and no trace
+    // runs while suspended.
+    std.debug.assert(!self.suspended());
     while (self.region_policy.openCollision(id, ctx)) |old| self.closeRegion(old);
     return self.region_policy.openRegion(self.gpa, id, ctx);
 }
 
 pub fn invalidateRegion(self: *TraceState, id: RegionId) void {
+    // Doc 63 §5.9.2: every caller is a trace run, an arm, a commit or a
+    // window strike, none of which happen while suspended.
+    std.debug.assert(!self.suspended());
     self.resetPromotionCandidate();
     if (self.region_policy.invalidateRegion(id)) self.demoteSetsForRegionDefsMutation();
     while (self.region_policy.nextInvalidated(id)) |key| self.closeRegion(key);

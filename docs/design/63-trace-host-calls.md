@@ -5,10 +5,10 @@ Phase 1 (epoch, disturbance and suspension, inert) landed; no host call
 is traced yet. Revision 6, approved by Codex and Antigravity
 (confirmation round 6, receipts `docs/reviews/doc63/*-rev6.md`).
 Q1–Q5 decided by Bart (2026-10-10; §9). Review history in §11–§15.
-Prerequisites A and B, Phase 0 and Phase 1 done. Before Phase 2c: the
-§5.9 region-accounting amendment. Phases 2–4 not started.
+Prerequisites A and B, Phase 0 and Phase 1 done, with the §5.9.2
+region-accounting amendment. Phases 2–4 not started.
 Owner: Bart
-Last updated: 2026-10-11
+Last updated: 2026-10-20
 
 ## Implementation status
 
@@ -72,32 +72,29 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
     path nothing.
   - Three ungated paths the doc missed were found and gated.
   - Physical teardown waits for Phase 2b, as planned.
-  - Region accounting is not gated yet (Outstanding).
+  - Region accounting was left ungated; the §5.9.2 amendment below
+    settles it.
   - Reviewed by Codex and Antigravity (`docs/reviews/doc63/*-phase1.md`,
     dispositions in `phase1-dispositions.md`).
-  - Measured cost (Outstanding decision):
+  - Measured cost (the `disturbs` decision below):
     - +11 instructions per pure host call;
     - +19–23 per call for hosts that call back or write;
     - up to +0.18% on stdlib-heavy tier-0 `bench/` rows.
+- [x] **§5.9.2 amendment — region accounting under suspension.** No
+  gate (Bart, 2026-10-20). Every path that can open, close or invalidate
+  a region is unreachable while suspended, so `openRegion`, `closeRegion`
+  and `invalidateRegion` assert that instead. Tested with a real open
+  accumulator around a suspended loop, deep recursion and a raising
+  callback, with an unsuspended control. Mutation-checked: removing the
+  observer's depth rule trips the assert. If the assert ever fires, the
+  fallback is to skip the observation while suspended (§5.9.2).
+- [x] **Decision — the residual cost of `disturbs` counting.** Accepted
+  for now (Bart, 2026-10-20). Phase 2c adds suspension to the same
+  funnel and changes `opCall`'s register allocation again, so the cost
+  is measured again there (Phase 2c item).
 
 ### Outstanding
 
-- [ ] **§5.9 amendment — region accounting under suspension.** Tier-0
-  region observation and activation drops still run inside a suspended
-  callback. Through `closeRegion` they can gate anchors, disarm links
-  and demote promoted sets (§5.9.1). Choose a rule, review it, then gate
-  and test it, all before Phase 2c raises the depth.
-- [ ] **Decision — the residual cost of `disturbs` counting** (§5.9.1).
-  The cost:
-  - +11 instructions per pure host call, about 5 of them the compare
-    itself;
-  - +19–23 for disturbing hosts, whose callbacks also pass through more
-    bumping entries;
-  - +0.06–0.18% on stdlib-heavy tier-0 `bench/` rows.
-
-  Both come from the inlined funnel's extra live state changing register
-  allocation for all of `opCall`. `noinline` is worse. Bart decides
-  whether to accept this or have another mechanism found.
 - [ ] **Phase 2a — slab-coherent snapshots and the host statuses (inert).**
   The snapshot form, its validation, finalize placement rules, admission,
   both executors and both dispatcher consumers (§5.2); the status
@@ -116,6 +113,11 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   `guard_host_epoch`, `host_result` (§5.1); host calls force precise
   recording (§5.3); the tier-1a arms; exactly-once tests across the ten
   equivalence legs and every route in §5.4.
+  - Measure `callHostNative`'s `disturbs` cost again on `bench/` and the
+    §8.1 probe once the funnel raises and lowers suspension. With
+    threshold 1, `disturbs` is a sticky bit; try folding its check into
+    the suspension epilogue so the pure path keeps one value live
+    across the call, not two.
 - [ ] **Phase 3 — native lowering.** The same four ops in nativegen: inline
   pre-call materialization reusing the precise materializer, the C-ABI
   shim as a body callout, the post-call epoch and budget checks, the
@@ -940,6 +942,10 @@ choice changes region profit accounting:
 The amendment goes to review before Phase 2c raises the depth for real.
 It is in Outstanding.
 
+*Follow-up (2026-10-20):* §5.9.2 shows these paths cannot reach
+`closeRegion` while suspended, and none of the three options is needed.
+The paragraph above overstated the hazard. It stays as written.
+
 **Cost** (§8). This is a ReleaseFast instruction-count A/B against HEAD
 `81d6f24`, over every `bench/` program, tier-0 and JIT on.
 
@@ -994,6 +1000,70 @@ to 736, against 690 at base and 701 inlined.
 
 Both residual costs have one cause, the inlined funnel's extra live
 state. They are recorded for Bart's decision, in Outstanding.
+
+*Follow-up (2026-10-20):* accepted for now. Phase 2c measures the cost
+again, after adding suspension to the same funnel.
+
+### 5.9.2 Amendment: region accounting while suspended (2026-10-20)
+
+**Rule.** Region accounting runs unchanged inside a suspended callback.
+No gate is needed, because nothing it does there can open, close or
+invalidate a region. `openRegion`, `closeRegion` and `invalidateRegion`
+assert that they are not suspended.
+
+**Why it cannot happen.** Take a host call made from a guest frame at
+depth `d`. Suspension is raised for the host call, and lowered after it.
+
+- **Open accumulators are rooted at `d` or shallower.** An accumulator
+  opens only through a trace receipt (`applyDestination` →
+  `openRegion`). No trace runs while suspended, so every open
+  accumulator was opened before the host call, on a frame that was live
+  then.
+- **The observer cannot close one.** Every callback frame is deeper than
+  `d`. `nextDeparture` lets a point deeper than an accumulator's root
+  survive, on both paths: the fast path returns null on
+  `depth > root_frame_depth`, and the slow path skips the accumulator.
+- **Activation drops cannot close one.** `opRet` drops by the popped
+  frame's `call_seq`. A callback frame's `call_seq` was minted after the
+  host call began, so no accumulator is keyed on it.
+  `dropRegionActivationsFromDepth`, on the C API's caught-unwind path,
+  drops only frames above the callback's entry depth.
+- **Every other caller is already gated.** `invalidateRegion`,
+  `considerSilentPromotion`, `tryArmRegionBridge`, `chargePayoffReceipt`
+  and the topology rebuild's `closeNonArmableAccumulators` all start
+  from a trace run, the ledger, an arm or a commit. `clearCache` runs
+  only at depth 0.
+
+The premise this rests on is that every popped frame drops its
+activations. Tier-0 `opRet` does. The native inline self-pop runs only
+under the descent gate, where the map is empty, and asserts that. If a
+future pop path skipped the drop, an accumulator would outlive its frame
+at a depth a callback can reach. The asserts catch exactly that.
+
+**What still runs.** `setContext` moves `region_context` onto the
+callback's frames, and the pops move it back or clear it. The same
+happens for unsuspended callbacks today. The caller's next observation
+sets it again, before any receipt can read it.
+
+**Why not the three options.** Each one changes the profit accounting to
+guard against something that cannot happen:
+
+- skipping the observation costs a check on the region trampoline;
+- deferring the closes adds a queue and a drain at the release point;
+- treating the callback as opaque is what the depth rule already does.
+
+**Fallback.** If an assert ever fires, skip the observation while
+suspended. A callback's points cannot be members of an enclosing
+activation's region, so that is the opaque rule made explicit.
+
+**Tests and evidence.** `capi_suspend_test.zig` opens a real accumulator
+on the caller's activation, then makes suspended callbacks: a loop,
+recursion 15 deep, and a callback that raises. In each case the
+accumulator is unchanged after the callback. Control: once suspension is
+lowered, the caller's next instruction is at the root's depth but
+outside the region, and the observer closes the accumulator.
+Mutation-checked: removing the fast path's depth rule trips
+`closeRegion`'s assert from `observeRegionProgramPoint`.
 
 ### 5.10 GC lifetime across a callback (H3)
 

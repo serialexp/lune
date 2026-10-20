@@ -347,6 +347,96 @@ test "doc 63 suspend: a suspended callback leaves an active outer recording unto
     try testing.expectEqual(@as(i64, 6000), vm.regGet(out.finished.reg).asInt());
 }
 
+/// What `hostRegion` saw around its suspended callback.
+const RegionProbe = struct {
+    key: ?mahina.trace.RegionKey = null,
+    before: ?mahina.trace.RegionAccum = null,
+    after: ?mahina.trace.RegionAccum = null,
+    open_after: usize = 0,
+    status: Status = .ok,
+};
+var region_probe: RegionProbe = .{};
+
+/// Opens a region accumulator on its caller's activation, then calls the
+/// global `args[0]` with `args[1]` while suspended, as `hostSusp` does. A
+/// failing callback is recorded and swallowed. The region's only member point
+/// is in no real proto, so any observation at the root's depth would close it.
+fn hostRegion(vm: ?*capi.VmBox, userdata: ?*anyopaque, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: *usize) callconv(.c) Status {
+    _ = .{ userdata, max_results };
+    if (nargs != 2) return .err_api;
+    const box = vm.?;
+    const v = &box.vm;
+    var name: mh_str = .{};
+    if (capi.mh_value_str(box, args.?[0], &name) != .ok) return .err_api;
+    var f: mh_value = .{};
+    if (capi.mh_global_get(box, name, &f) != .ok) return .err_api;
+
+    const caller = v.frames[v.depth - 1];
+    const rid: mahina.trace.RegionId = @enumFromInt(1000);
+    const pol = &v.trace.region_policy;
+    if (!pol.region_defs.contains(rid)) {
+        const gpa = v.trace.gpa;
+        const members = gpa.dupe(mahina.trace.StructuralEdgeId, &.{}) catch return .err_oom;
+        const points = gpa.dupe(mahina.trace.ProgramPoint, &.{.{ .proto_id = 0xFFFF_FFF0, .source_pc = 0 }}) catch return .err_oom;
+        pol.region_defs.put(gpa, rid, .{
+            .members = members,
+            .member_points = points,
+            .owner = .{ .proto = caller.closure.proto, .pc = 0, .proto_id = caller.closure.proto.id },
+            .classifier = .{ .kind = .self_loop, .member_count = 1 },
+            .armable = true,
+        }) catch return .err_oom;
+    }
+    const ctx: mahina.trace.RegionContext = .{ .depth = v.depth, .call_seq = caller.call_seq };
+    const key = v.trace.openRegion(rid, ctx) orelse return .err_api;
+    region_probe = .{ .key = key, .before = pol.region_profit.get(key) };
+
+    v.trace.raiseSuspend();
+    var r: [1]mh_value = undefined;
+    var n: usize = 0;
+    region_probe.status = capi.mh_call(box, f, args.? + 1, 1, &r, 1, &n);
+    v.trace.lowerSuspend();
+
+    region_probe.after = pol.region_profit.get(key);
+    region_probe.open_after = pol.region_profit.count();
+    results.?[0] = if (region_probe.status != .ok or n == 0) capi.mh_int(0) else r[0];
+    nresults.* = 1;
+    return .ok;
+}
+
+test "doc 63 suspend: a suspended callback leaves an open region accumulator alone" {
+    const box = try newVm();
+    defer freeVm(box);
+    try testing.expectEqual(Status.ok, capi.mh_register_fn(box, s("region"), &hostRegion, null, null));
+    var n: usize = 0;
+    try testing.expectEqual(Status.ok, capi.mh_eval(box, s(
+        \\function rout(name, k) local r = region(name, k) return r + 0 end
+    ), s("rout"), null, 0, &n));
+    const pol = &box.vm.trace.region_policy;
+
+    // A loop, deep recursion, and a callback that raises (its frames are
+    // dropped by the C API's caught-unwind path).
+    const cases = [_]struct { src: []const u8, want: i64, status: Status }{
+        .{ .src = "return rout('work', 2000)", .want = 6000, .status = .ok },
+        .{ .src = "return rout('fib', 15)", .want = 610, .status = .ok },
+        .{ .src = "return rout('boom', 1)", .want = 0, .status = .err_runtime },
+    };
+    for (cases) |c| {
+        try testing.expectEqual(c.want, try evalInt(box, c.src));
+        try testing.expectEqual(c.status, region_probe.status);
+        // The callback ran with the accumulator open, so every instruction
+        // went through the region observer and every return through the
+        // activation drop, and it left the accumulator exactly as it was.
+        try testing.expect(region_probe.before != null);
+        try testing.expectEqual(region_probe.before, region_probe.after);
+        try testing.expectEqual(@as(usize, 1), region_probe.open_after);
+        // Control: once unsuspended, the caller's own next instruction is at
+        // the root's depth and activation but outside the region, and the
+        // observer closes the accumulator.
+        try testing.expectEqual(@as(?mahina.trace.RegionAccum, null), pol.region_profit.get(region_probe.key.?));
+        try testing.expectEqual(@as(usize, 0), pol.region_profit.count());
+    }
+}
+
 test "doc 63 suspend: abortRaised leaves an active recording to its owner only while suspended" {
     const box = try newVm();
     defer freeVm(box);
