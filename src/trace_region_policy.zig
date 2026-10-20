@@ -173,21 +173,22 @@ pub const RegionPolicy = struct {
         return self.flushWindow(key, 1, min_useful);
     }
 
-    pub const Selection = union(enum) { done: ?RegionKey, close: RegionKey, invalidate: RegionId };
+    pub const Selection = union(enum) { done: ?RegionKey, close: SelectionClose, invalidate: RegionId };
+    pub const SelectionClose = struct { key: RegionKey, why: region.CloseReason };
     pub const SelectionCursor = struct { invalidation_index: usize = 0 };
     pub fn chooseSource(self: *RegionPolicy, gpa: std.mem.Allocator, candidates: []const RegionId, ctx: RegionContext, cursor: *SelectionCursor) Selection {
         if (self.activeRegionFor(ctx.call_seq)) |active| {
             const live = if (self.region_defs.get(active.region_id)) |d| d.armable else false;
-            if (!live) return .{ .close = active };
+            if (!live) return .{ .close = .{ .key = active, .why = .source_not_armable } };
             for (candidates) |id| if (id == active.region_id) return .{ .done = active };
             if (candidates.len == 0) return .{ .done = null };
-            return .{ .close = active };
+            return .{ .close = .{ .key = active, .why = .source_outside } };
         }
         return self.selectCandidates(gpa, candidates, ctx, cursor);
     }
     fn selectCandidates(self: *RegionPolicy, gpa: std.mem.Allocator, candidates: []const RegionId, ctx: RegionContext, cursor: *SelectionCursor) Selection {
         if (candidates.len == 1) {
-            if (self.openCollision(candidates[0], ctx)) |key| return .{ .close = key };
+            if (self.openCollision(candidates[0], ctx)) |key| return .{ .close = .{ .key = key, .why = .collision } };
             return .{ .done = self.openRegion(gpa, candidates[0], ctx) };
         }
         if (cursor.invalidation_index < candidates.len) {
@@ -202,7 +203,7 @@ pub const RegionPolicy = struct {
         if (selected.*) |source| {
             for (candidates) |id| if (id == source.region_id) return .{ .done = source };
             selected.* = null;
-            return .{ .close = source };
+            return .{ .close = .{ .key = source, .why = .destination_outside } };
         }
         return self.selectCandidates(gpa, candidates, ctx, cursor);
     }
@@ -625,7 +626,7 @@ test "policy source and destination request close before replacement opens" {
     const initial = policy.openRegion(gpa, first, ctx).?;
     var cursor: RegionPolicy.SelectionCursor = .{};
     try std.testing.expect(policy.chooseSource(gpa, &.{}, ctx, &cursor).done == null);
-    try std.testing.expectEqual(initial, policy.chooseSource(gpa, &.{second}, ctx, &cursor).close);
+    try std.testing.expectEqual(initial, policy.chooseSource(gpa, &.{second}, ctx, &cursor).close.key);
     try std.testing.expectEqual(initial, policy.activeRegionFor(ctx.call_seq).?);
     try std.testing.expectEqual(@as(u32, 1), policy.region_profit.count());
     _ = policy.beginClose(initial, 4).?;
@@ -635,7 +636,7 @@ test "policy source and destination request close before replacement opens" {
     var selected: ?RegionKey = replacement;
     try std.testing.expect(policy.applyDestination(gpa, &selected, &.{first}, true, ctx, &cursor).done == null);
     try std.testing.expectEqual(replacement, selected.?); // deferred destination preserves source
-    try std.testing.expectEqual(replacement, policy.applyDestination(gpa, &selected, &.{first}, false, ctx, &cursor).close);
+    try std.testing.expectEqual(replacement, policy.applyDestination(gpa, &selected, &.{first}, false, ctx, &cursor).close.key);
     try std.testing.expect(selected == null);
     try std.testing.expectEqual(replacement, policy.activeRegionFor(ctx.call_seq).?);
     policy.finishClose(gpa, replacement);

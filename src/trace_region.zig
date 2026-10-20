@@ -88,6 +88,29 @@ pub const RegionContext = struct {
     call_seq: u64,
 };
 
+/// Why an accumulator closed. Diagnostic only: `closeRegion` logs it under
+/// `-Djit-debug` and no policy reads it (doc 64 §10 step 1).
+pub const CloseReason = enum {
+    /// A caller outside the receipt pipeline (tests, teardown).
+    direct,
+    /// Another region with the same owner opened in this activation.
+    collision,
+    /// The region was invalidated or tombstoned.
+    invalidated,
+    /// The active source region is no longer armable.
+    source_not_armable,
+    /// A receipt's source trace is not a member of the active region.
+    source_outside,
+    /// A receipt's destination is not a member of the selected region.
+    destination_outside,
+    /// Tier-0 reached a program point outside the region's membership.
+    departure,
+    /// The activation's frame returned.
+    activation_drop,
+    /// A physical rebuild left the region non-armable.
+    non_armable,
+};
+
 /// A-vii-e.1: one proto's membership bitset for the observer fast path. Bit
 /// `pc - base_pc` of `words` is set iff `{proto_id, pc}` is a member point of
 /// the cached region. `words` is owned by TraceState (copied out of the def's

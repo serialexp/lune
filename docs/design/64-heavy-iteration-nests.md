@@ -1,6 +1,7 @@
 # 64 — Heavy-iteration loop nests: region decay, exit-side give-ups, the marker root
 
-Status: **reviewed (round 1, §9), decided (§10), nothing built yet.**
+Status: **reviewed (round 1, §9), decided (§10); step 1 (diagnosis)
+done (§11), which corrects §3 P1. No policy change built yet.**
 Bart asked for this doc and for Codex's and Antigravity's opinions
 before picking options. Corrections from the reviews are applied in
 place and listed in §9. Where the reviewers disagreed, Bart asked me to
@@ -77,6 +78,10 @@ Traces (ids from a `-Djit-debug` run):
 ## 3. The four problems
 
 ### P1. Region decay gates the outer `for i`
+
+> **Corrected by §11:** the gated owner is the `for k` header (pc 45), not
+> the outer `for i`, and its activations close because the `for k` loop
+> finished. The text below is the round-0 reading.
 
 Region rid=2 is minted as a `cross_trace_cycle` with owner anchor 23.
 `beginCredit` adds each row's credited work to `outer_traversals`
@@ -502,3 +507,78 @@ re-profile shows a productive self-cycle.
 
 Each step gets a small test program of its own (§4), not
 nsieve-bit-fp as the only witness, and a board run.
+
+## 11. Step 1 result: what closes the activations (2026-10-20)
+
+Measured with a close-reason probe (`CloseReason`, logged by
+`closeRegionBecause` under `-Djit-debug` and counted in
+`TraceState.region_closes`, the `--jit-stats` "region closes:" line) on
+`nsieve-bit-fp.lua 6`, without coverage. No policy changed.
+
+**§3 P1 named the wrong region.** The regions on this run:
+
+| rid | owner | edges (anchor pc → successor pc) | what it is |
+|---|---|---|---|
+| 1 | 45 (`for k`) | 45→53, 53→45, 45→87, 53→87, 87→45 | the `for k` cycle |
+| 2 | 23 (`for i`) | 23→101, 101→23 | the outer loop, composite-`i` path |
+| 3 | 23 | 23→101, 23→93, 93→101, 93→23, 101→23 | the outer loop, prime path |
+
+Of the 5,808 `region_decay` gates, **5,801 are on pc 45**, the `for k`
+owner; 7 are on pc 23. The outer loop's regions take 3,555 window
+strikes but almost never reach the gate, because runs of composite `i`
+fill windows and recover the penalty.
+
+**rid=1 closes because the `for k` loop finished.** All 27,602 of its
+closes are departures at pc 88, which is tier-0 running the code after the
+`for k` loop. Each activation is one whole `for k` loop, and for every
+prime above m/8 that loop has fewer than `min_useful` (8) steps. Such an
+activation fills no window, so its close is a strike (work 0–7 in the
+log). The close itself is correct, and the activation was fully
+productive; the strike rule calls it low-yield only because it was short.
+
+**rid=2 closes when the outer iteration enters the inner loop.** 5,800
+closes are `source_outside` (t1's e15 receipt classifies to rid=1 while
+rid=2 is the active region in the same frame), and 3,426 are departures at
+pc 53 (tier-0 at the `while` marker, outside rid=2's membership). One
+activation per frame means a nested region displaces the enclosing one.
+This costs strikes but almost no gates, so it is not the expensive part.
+
+**The gate is effectively permanent, and each strike still tears down.**
+The `for k` anchor's gate reaches `max_strikes` (6) at the sixth gate and
+is never cleared afterwards (its strike count climbs to 11,597 with no
+reset), so `isGated` holds for the rest of the run. Every later strike
+still runs `gateAnchor` → `condemnProvenanceEdgesAt` → `disarmAllLinks`.
+The legacy machine also gates the same anchor: 5,796 `legacy_thrash` gates
+on pc 45 and 5,798 on pc 37.
+
+**What lifting the gate buys on its own** (throwaway build with
+`max_penalty` = 10⁹, then reverted): output identical; instructions
+−7.6%; tier-0-with-a-trace 17.2% → 7.3% of cycles; ledger walks 115,763
+→ 135,113; seam 42.2% → 47.6%; cycles +1–2% (perf stat -r 7, loadavg
+~3.7). The tier-0 time moves into the seam, so on its own the gate fix
+is not a win. This supports the §10 order: P2 and P3 change what runs
+inside the `for k` region first, then P1 is re-measured.
+
+**What this means for step 4.** Option 1a (count member iterations)
+cannot fix this: a `for k` loop of three steps is three iterations under
+any count. The evidence the strike rule lacks is *why* the activation
+ended. A close at the owner loop's own exit is the region analogue of
+P2's natural stop, and the same rule fits it: a natural stop is neutral,
+neither strike nor recover. Call this **1e**. Step 4 decides between 1e
+and the alternatives on the re-measured shape; nothing is decided here.
+
+**Measurement caveat for §2.** `--jit-stats` implies coverage, and
+coverage turns entry patching off (doc 20 §R1-9: "coverage measures the
+unpatched machine"). On this bench that changes tiering decisions, not
+just timing. With coverage there are 7 `region_decay` gates (all on pc
+23) and 5,794 `legacy_thrash` gates on pc 45, against 5,808 and 11,600
+without. §2's time split therefore describes the unpatched machine, while
+the board times the patched one. The findings above come from runs
+without coverage.
+
+**Witness.** `src/interp_nest_test.zig` "doc 64 step 1" runs the kernel at
+m = 160000 (smaller m does not saturate the penalty). It asserts that the
+`for k` header ends permanently gated, that at least 500 `region_decay`
+gates fire (755 today), and that departure closes (10,862) outnumber
+`source_outside` closes (753) more than four to one. Step 4 flips the
+gate assertions.

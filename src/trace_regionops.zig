@@ -38,6 +38,7 @@ const RegionBridgeDef = trace_mod.RegionBridgeDef;
 const RegionContext = trace_mod.RegionContext;
 const RegionDestination = trace_mod.RegionDestination;
 const RegionAccum = trace_mod.RegionAccum;
+const CloseReason = trace_mod.CloseReason;
 const ChargeKind = trace_mod.ChargeKind;
 const IrOp = trace_mod.IrOp;
 const IrInstr = trace_mod.IrInstr;
@@ -376,13 +377,18 @@ fn applyWindowDecision(self: *TraceState, key: RegionKey, work: u64, decision: @
 }
 
 pub fn closeRegion(self: *TraceState, key: RegionKey) void {
+    closeRegionBecause(self, key, .direct);
+}
+
+pub fn closeRegionBecause(self: *TraceState, key: RegionKey, why: CloseReason) void {
     // Doc 63 §5.9.2: unreachable while suspended. A callback's frames lie
     // deeper than every open accumulator's root and carry fresh `call_seq`s,
     // so neither the observer nor an activation drop can pick one; every
     // other caller starts from a trace run, a commit or the ledger.
     std.debug.assert(!self.suspended());
     const close = self.region_policy.beginClose(key, self.config.min_useful) orelse return;
-    self.dbg("region: close rid={d} activation={d} work={d}", .{ @intFromEnum(key.region_id), key.activation, close.work });
+    self.region_closes.getPtr(why).* +|= 1;
+    self.dbg("region: close rid={d} activation={d} work={d} why={t}", .{ @intFromEnum(key.region_id), key.activation, close.work, why });
     applyWindowDecision(self, key, close.work, close.window);
     const survived = self.demotePromotionsForRegion(key);
     // Instability recovery: a promotion that lived until the activation's own
@@ -505,7 +511,7 @@ pub fn openRegion(self: *TraceState, id: RegionId, ctx: RegionContext) ?RegionKe
     // Doc 63 §5.9.2: regions open only from trace receipts, and no trace
     // runs while suspended.
     std.debug.assert(!self.suspended());
-    while (self.region_policy.openCollision(id, ctx)) |old| self.closeRegion(old);
+    while (self.region_policy.openCollision(id, ctx)) |old| closeRegionBecause(self, old, .collision);
     return self.region_policy.openRegion(self.gpa, id, ctx);
 }
 
@@ -515,7 +521,7 @@ pub fn invalidateRegion(self: *TraceState, id: RegionId) void {
     std.debug.assert(!self.suspended());
     self.resetPromotionCandidate();
     if (self.region_policy.invalidateRegion(id)) self.demoteSetsForRegionDefsMutation();
-    while (self.region_policy.nextInvalidated(id)) |key| self.closeRegion(key);
+    while (self.region_policy.nextInvalidated(id)) |key| closeRegionBecause(self, key, .invalidated);
     self.disarmAllLinks();
     // Doc 47 Increment B follow-up: the tombstone alone leaves the region's
     // stale entries in the source/dest receipt maps, so `receiptsInert()`
@@ -1234,7 +1240,7 @@ pub fn chooseSource(self: *TraceState, candidates: []const RegionId, ctx: Region
     var cursor: @import("trace_region_policy.zig").RegionPolicy.SelectionCursor = .{};
     while (true) switch (self.region_policy.chooseSource(self.gpa, candidates, ctx, &cursor)) {
         .done => |key| return key,
-        .close => |key| self.closeRegion(key),
+        .close => |c| closeRegionBecause(self, c.key, c.why),
         .invalidate => |id| self.invalidateRegion(id),
     };
 }
@@ -1260,7 +1266,7 @@ pub fn applyDestination(self: *TraceState, selected: ?RegionKey, dest: RegionDes
             }
             return;
         },
-        .close => |key| self.closeRegion(key),
+        .close => |c| closeRegionBecause(self, c.key, c.why),
         .invalidate => |id| self.invalidateRegion(id),
     };
 }
@@ -1354,6 +1360,14 @@ pub fn accountRegionProfit(self: *TraceState, key: ?ExitKey, work: usize, dest: 
     const ctx = self.region_policy.regionContext() orelse return false;
     if (self.region_policy.receiptsInert()) return false;
     const candidates = self.classifyExit(exit_key);
+    if (comptime @import("jitdbg.zig").enabled) {
+        if (self.activeRegionFor(ctx.call_seq)) |active| {
+            if (candidates.len > 0 and std.mem.indexOfScalar(RegionId, candidates, active.region_id) == null)
+                self.dbg("close-reason: source_outside rid={d} trace={d} exit={d} work={d} candidate rid={d}", .{
+                    @intFromEnum(active.region_id), exit_key.trace_id, exit_key.exit_instr, work, @intFromEnum(candidates[0]),
+                });
+        }
+    }
     const selected = self.chooseSource(candidates, ctx);
     var member: ?RegionKey = null;
     if (selected == null and candidates.len == 0) {
@@ -1553,7 +1567,10 @@ pub inline fn observeFast(self: *TraceState, proto_id: u32, pc: u32, depth: u32,
 /// membership no longer contains this tier-0 departure point. No allocation;
 /// the common empty-map path is one count test.
 pub fn observeRegionProgramPoint(self: *TraceState, proto_id: u32, pc: u32, depth: u32, call_seq: u64) void {
-    while (self.region_policy.nextDeparture(.{ .proto_id = proto_id, .source_pc = pc }, .{ .depth = depth, .call_seq = call_seq })) |key| self.closeRegion(key);
+    while (self.region_policy.nextDeparture(.{ .proto_id = proto_id, .source_pc = pc }, .{ .depth = depth, .call_seq = call_seq })) |key| {
+        self.dbg("close-reason: departure rid={d} pc={d} depth={d}", .{ @intFromEnum(key.region_id), pc, depth });
+        closeRegionBecause(self, key, .departure);
+    }
 }
 
 pub fn dropRegionActivation(self: *TraceState, call_seq: u64) void {
@@ -1570,7 +1587,7 @@ pub fn dropRegionActivation(self: *TraceState, call_seq: u64) void {
             pol.region_context_valid = false;
         return;
     }
-    while (self.region_policy.nextActivation(call_seq)) |key| self.closeRegion(key);
+    while (self.region_policy.nextActivation(call_seq)) |key| closeRegionBecause(self, key, .activation_drop);
 }
 
 pub fn resetRegionProfit(self: *TraceState) void {
@@ -1782,9 +1799,14 @@ pub fn rebuildRegionsFallible(self: *TraceState) !void {
     try self.region_policy.reserveTopology(self.gpa, &staged);
     // Demotion sees OLD definitions; everything after reservation is infallible.
     self.demoteSetsForRegionDefsMutation();
-    for (staged.staged_defs.items) |s| self.dbg("region: mint id={d} kind={s} members={d} armable={}", .{
-        @intFromEnum(s.id), @tagName(s.def.classifier.kind), s.def.classifier.member_count, s.def.armable,
-    });
+    for (staged.staged_defs.items) |s| {
+        self.dbg("region: mint id={d} kind={s} members={d} armable={} owner pc={d}", .{
+            @intFromEnum(s.id), @tagName(s.def.classifier.kind), s.def.classifier.member_count, s.def.armable, s.def.owner.pc,
+        });
+        for (s.def.members) |e| self.dbg("region:   edge id={d} anchor pc={d} -> succ pc={d}", .{
+            @intFromEnum(s.id), e.anchor_pc, e.succ_anchor_pc,
+        });
+    }
     for (staged.staged_tombstones.items) |id|
         self.dbg("region: tombstone id={d} at physical rebuild", .{@intFromEnum(id)});
     self.region_policy.publishTopology(self.gpa, &staged);
@@ -1808,7 +1830,7 @@ pub fn closeNonArmableAccumulators(self: *TraceState) void {
         }
         const v = victim orelse return;
         self.dbg("close-reason: rebuild left rid={d} non-armable", .{@intFromEnum(v.region_id)});
-        self.closeRegion(v);
+        closeRegionBecause(self, v, .non_armable);
     }
 }
 

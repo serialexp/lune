@@ -168,6 +168,7 @@ pub const RegionKey = trace_region.RegionKey;
 pub const RegionAccum = trace_region.RegionAccum;
 pub const RegionDestination = trace_region.RegionDestination;
 pub const RegionContext = trace_region.RegionContext;
+pub const CloseReason = trace_region.CloseReason;
 pub const RegionClassifier = trace_region.RegionClassifier;
 pub const RegionBridgeDef = trace_region.RegionBridgeDef;
 pub const RegionDef = trace_region.RegionDef;
@@ -1168,6 +1169,11 @@ pub const TraceState = struct {
     /// entry replay is observationally equivalent) — the executor tests
     /// assert on this witness. No tiering path reads it.
     precise_resumes: u64 = 0,
+    /// Doc 64 §11 diagnostics (`--jit-stats` "region closes:" and "dispatch
+    /// gates:" lines): region accumulator closes by `CloseReason`, and
+    /// `gateAnchor` escalations by `GateReason`. No tiering path reads them.
+    region_closes: std.EnumArray(CloseReason, u64) = .initFill(0),
+    dispatch_gates: std.EnumArray(GateReason, u64) = .initFill(0),
     /// Doc 56 Phase 3 diagnostics (`--jit-stats` "exit side:" line). No
     /// tiering path reads them.
     /// Exits that became wanted (`noteTakenExit`'s tier-1a route).
@@ -3255,6 +3261,7 @@ pub const TraceState = struct {
     /// failures (those go to `gateRecordAnchor`).
     pub fn gateAnchor(self: *TraceState, anchor: AnchorKey, reason: GateReason) void {
         const g = self.bumpGateEntry(&self.gate, anchor, reason) orelse return;
+        self.dispatch_gates.getPtr(reason).* +|= 1;
         // Doc 20 unpatch trigger: a dispatch-gated anchor must not keep a
         // patched entry — mark pending; the caller-owned safe-point drain
         // restores same-turn and warming re-decides after the cooldown. A
@@ -4296,6 +4303,11 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
     try w.print("    link arms:            native={d} source={d} loopdone={d} bridge={d}\n", .{ ts.native_link_arms, ts.native_source_link_arms, ts.native_loopdone_link_arms, ts.native_region_bridge_arms });
     try w.print("    bridge arm attempts:  {d} (pipeline runs; vs {d} arms)\n", .{ ts.native_region_bridge_arm_attempts, ts.native_region_bridge_arms });
     try w.print("    link fused:           source={d} loopdone={d} bridge={d} (bridge cap yields={d})\n", .{ ts.native_source_link_fused, ts.native_loopdone_link_fused, ts.native_region_bridge_fused, ts.native_region_bridge_cap_yields });
+    try w.writeAll("    region closes:       ");
+    for (std.enums.values(CloseReason)) |why| try w.print(" {s}={d}", .{ @tagName(why), ts.region_closes.get(why) });
+    try w.writeAll("\n    dispatch gates:      ");
+    for (std.enums.values(GateReason)) |why| try w.print(" {s}={d}", .{ @tagName(why), ts.dispatch_gates.get(why) });
+    try w.writeAll("\n");
     try w.print("    link disarms:         {d} (peak simultaneous arms: {d})\n", .{ ts.registry.native_physical.native_link_disarms, ts.registry.native_physical.native_link_peak });
     try w.print("    native link exits:    {d} (follows={d})\n", .{ ts.native_link_exits, ts.native_link_follow_count });
     try w.print("    ir link exits:        {d} (follows={d})\n", .{ ts.link_ir_exits, ts.link_follow_count });

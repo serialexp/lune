@@ -35,8 +35,15 @@ WORST BOARD ROW (2026-10-19, amber-badger): nsieve-bit-fp.
   disagreements in doc 64 §9). Bart had me break the reviewers' ties:
   doc 64 §10 records the decisions and the six-step order (P1 close
   cause first, then P2 typed outcome with 2b and evidence-triggered 2d,
-  then 3b, then a re-profile). Next: step 1, find what closes rid=2's
-  activations.
+  then 3b, then a re-profile). Step 1 done (doc 64 §11): the gated
+  owner is the `for k` header (pc 45), not the outer loop; its region's
+  activations close because the `for k` loop finished, and short loops
+  strike. Close-reason probe and `--jit-stats` "region closes:" /
+  "dispatch gates:" counters added; witness test in
+  src/interp_nest_test.zig. Also found: `--jit-stats` (coverage) runs
+  the unpatched machine and makes different tiering decisions on this
+  bench (TODO). Next: step 2, the typed chain outcome (2b) with
+  commit-triggered 2d.
 
 LINE LOOKUP FIX (2026-10-11, coral-marten): LANDED in `49fd572`, bundled with amber-badger's doc 61 Phase K.
 - Bug from TODO.md "Every located runtime error rescans the source for

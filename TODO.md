@@ -2,6 +2,53 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Tier-0 interpreter cost survey (noted 2026-10-20)
+
+Measured at HEAD 1806b9b, ReleaseFast, `perf stat -e instructions:u`,
+two-point difference per iteration (exact; per-symbol sampling is not,
+because AMD skid misattributes across tail jumps). Against LuaJIT
+`-joff`. Probes in `/tmp/t0micro/` (`probes.lua`, `ops.lua`).
+
+- [x] **Bug: `next`/`pairs` re-sorts every hash key on every `next`
+      call** (`stdlib/base.zig` `sortedHashKeys`), so one traversal of k
+      hash keys is O(k² log k). 16,000 string keys took 17.9 s (LuaJIT
+      0.00 s); ×4 keys cost ×30 time. Fixed 2026-10-20:
+      `HashPart.nextLive` keeps a sorted view of the live keys' identities
+      and slots, rebuilt only when a key becomes live and dropped by a
+      collection. `bench/stdlib/pairs_hash.lua 2` went from 25.5 s to
+      0.02 s; at 2000 reps it runs 0.42 s (LuaJIT 0.04 s). A step is now a
+      constant ~670 instructions at any size (LuaJIT `-joff` 54).
+- [ ] **`pairs` steps go through the generic native-call path.** Of the
+      ~670 instructions per step, ~173 are `opCall`'s native path and ~160
+      register moves of the generic-`for` protocol; `next` itself is ~216.
+      LuaJIT walks `next` with a dedicated bytecode (`ITERN`, after
+      `ISNEXT` checks the iterator is the real `next`) and no call. Belongs
+      with the bytecode-forms item below.
+- [ ] **`for_loop` has no integer fast path.** An empty `for` loop costs
+      206 instructions per iteration (LuaJIT 18). Every iteration calls
+      `arith.add`, `arith.lt(step, 0)` and `arith.le` out of line, with
+      Values spilled through memory, and pushes five callee-saved
+      registers. `jfor_loop` shares the same step.
+- [ ] **No constant-operand or fused forms in the bytecode.** `t.x` is
+      `load_const` + `get_index`; `i - 7` is `load_int` + `sub`; `if a < b`
+      is `lt` into a register + `jmp_if_false`. Each extra op pays the
+      ~18-instruction dispatch prologue plus a register round trip.
+      Marginal costs (mahina vs LuaJIT): `<` 171/32, `==` 181/38,
+      `- k` 100/15, `if a < b` 205/32.
+- [ ] **Constant-key field access has no per-site hint.** `t.x` read
+      272/42, `t.x = v` 328/45, a method call `o:get()` ~1250 total.
+      Globals already have doc 62's slot hints and are at parity (32/30).
+- [ ] **Lua call + return.** 0-arg call 461/63, 1-arg 611/74. The callee
+      window is filled by a generic per-register loop, then
+      `pushFrameVararg`, `reloadTopFrame` and `onCallEntry`.
+- [ ] **Dispatch prologue, ~18 instructions per op** (doc 42 §4.2): GC
+      check (two dependent loads), `safepoint_seq` bump, region count
+      test, `frame.pc` store, fetch, jump. LuaJIT's is ~5. Each step is
+      part of the determinism contract, so changing one needs a design
+      argument.
+- [ ] **`#t` on a table is ~177 instructions** (string `#` ~48): the
+      `__len` metatable probe plus `Table.length`'s border scan.
+
 ## nsieve-bit-fp, the board's worst row (noted 2026-10-19)
 
 18.6× LuaJIT on the 1b60a01 board, and JIT (394 ms) slower than tier-0
@@ -27,14 +74,15 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
       trace 21% (almost all anchor 23, the outer `for i`: 532k iterations
       at ~800 c/it against ~280 traced), tier-0 without a trace 5% (the
       `while` header at 54). Four separate causes:
-      1. **Region decay gates the outer `for i`.** Region rid=2 (owner
-         pc 23) closes at each burst's end with work = 3–6 outer
-         traversals, below `min_useful` (8), so every close strikes. At
-         `max_penalty` `applyWindowDecision` gates anchor 23
-         (`region_decay`, backoff 256 → 8192 ticks) and runs
-         `disarmAllLinks` (14 links). "Work" counts outer traversals, and
-         one traversal here holds a whole `for k` loop, so a short count
-         is no evidence of low yield. LuaJIT has no such gate.
+      1. **Region decay gates the `for k` owner** (corrected by doc 64
+         §11; the round-0 text blamed the outer `for i`). Region rid=1
+         (owner pc 45) closes each time the `for k` loop finishes (tier-0
+         departure at pc 88). For primes above m/8 the loop has fewer than
+         `min_useful` (8) steps, so the close strikes; 5,801 of the 5,808
+         `region_decay` gates are on pc 45, each also running
+         `disarmAllLinks`. Short is not low-yield here. LuaJIT has no such
+         gate. Candidate fix "1e" (a close at the owner loop's own exit is
+         neutral) is for doc 64 step 4.
       2. **A chain that ends at the enclosing loop's own loop-done counts
          as a miss.** t7's `while` exit (resume 63) chains to t8, which
          runs the post-`while` body and exits at exit 33, the `for k`
@@ -104,6 +152,23 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
       `flushWindow` 1.3%. That is per-receipt region bookkeeping
       (`classifyExit` → `chooseSource` → credit) and the per-instruction
       region observer, not static facts. Diagnose before designing.
+- [ ] **`--jit-stats` runs a different machine from the board.**
+      Coverage turns entry patching off (doc 20 §R1-9), and on
+      nsieve-bit-fp that changes tiering decisions, not just timing: 7
+      `region_decay` gates with coverage, 5,808 without; `legacy_thrash`
+      5,794 against 11,600. The CLAUDE.md standing rule ("a `--jit-stats`
+      run BEFORE any verdict") and the board's `res%` column both read
+      the unpatched machine. Options to weigh: attribute coverage on the
+      patched path too, or at least print a warning when patches would
+      have been installed. Found in doc 64 §11.
+- [ ] **A permanently gated anchor keeps paying for each new strike.**
+      Once a dispatch gate reaches `max_strikes`, `isGated` holds for
+      good, yet every further region-decay strike on that owner still runs
+      `gateAnchor`, `condemnProvenanceEdgesAt` and `disarmAllLinks`
+      (nsieve-bit-fp: the `for k` gate's strike count reaches 11,597 with
+      no reset). Doc 64 step 4 may remove the strikes on this shape; the
+      repeated teardown of an already-abandoned owner is a separate
+      question.
 
 ## Vendor bundle leftovers (noted 2026-10-13)
 
