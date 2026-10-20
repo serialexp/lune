@@ -654,6 +654,10 @@ and 4 re-measure the remaining thrash.
 nsieve-bit-fp −11.70%, every other board bench within ±0.2%, with
 identical outputs. Cycles on nsieve-bit-fp: 1.290G → 1.164G (−9.8%;
 three interleaved `perf stat` pairs, loadavg ~1.8, spread under 1%).
+Board (pt-default, reps=5) on d40cf2d: nsieve-bit-fp JIT 270.4 ms
+(342.4 ms on the 2752e6c board, but d40cf2d also carries coral-marten's
+tier-0 fast paths), tier-0 214.2 ms, LuaJIT 21.2 ms (12.8×), native
+residency 74.6%. The JIT is still slower than tier-0 on this row.
 
 **Witnesses** (`src/interp_nest_test.zig`; all three fail with step 2
 switched off):
