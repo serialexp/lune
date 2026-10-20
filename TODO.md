@@ -133,11 +133,9 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
       `pnpm test` runner.
 - [x] **This machine has no Node >= 22.13.** Wrong: nvm had 24.13 all
       along, just not on the tool shell's PATH. nvm default is now 24.22.0.
-- [ ] **A stale global bun 1.2.2 in `~/.local/share/pnpm`** (a pnpm-10
-      global; crashes the viz wasm tests). Shadowed by `~/.bun/bin` in
-      interactive zsh, so harmless there. pnpm 11 globals live in
-      `$PNPM_HOME/bin`, which isn't on PATH, so `pnpm add -g` refuses until
-      `pnpm setup` edits `.zshrc` (Bart's call), or remove it.
+- [x] **A stale global bun 1.2.2 in `~/.local/share/pnpm`** (a pnpm-10
+      global; crashes the viz wasm tests). Removed 2026-10-20 with
+      `pnpm@10 rm -g bun`; the only buns left are the two 1.4.3s.
 - [x] **The CLI has no `--version`.** Done 2026-10-17: build.zig.zon's
       version plus `-Dversion-commit` (the release CLIs pass LUNE_COMMIT).
 
