@@ -1,9 +1,10 @@
 # 64 — Heavy-iteration loop nests: region decay, exit-side give-ups, the marker root
 
-Status: **problem statement and options, reviewed (round 1, §9).**
-Nothing here is decided or built. Bart asked for this doc, and for
-Codex's and Antigravity's opinions, before any of the options is picked.
-Corrections from the reviews are applied in place and listed in §9.
+Status: **reviewed (round 1, §9), decided (§10), nothing built yet.**
+Bart asked for this doc and for Codex's and Antigravity's opinions
+before picking options. Corrections from the reviews are applied in
+place and listed in §9. Where the reviewers disagreed, Bart asked me to
+break the tie; §10 records the choices and the reasons.
 
 ## 1. Why this doc
 
@@ -418,3 +419,86 @@ re-profile. Antigravity: (1) P2 2a + 2d, (2) P3 3b + 3d, (3) P1 1a + 1c,
 Open for Bart: which P2 variant (2a or 2b; 2d now or later), whether 3d
 is in, and the P1 order (diagnose the close cause first, or 1a + 1c
 now).
+
+## 10. Decision (2026-10-20)
+
+Bart asked me to break the tie where the reviewers disagree, and to
+write the reasons down. The agreed points stand as in §9 (3b with the
+root offered before the marker composites, 4a first, 1d, P2 with or
+before P3). The choices on the disputed ones:
+
+**P2: 2b (neutral), with an explicit chain outcome.** A chain's result
+becomes a typed outcome instead of being read off `linked_trace`:
+*served* (the candidate reached its `.link`), *natural stop* (it ended
+at a loop-done or own-loop-test exit of a loop that encloses the
+parent's exit, as resolved through the facts table), *misfit* (it
+deopted anywhere else, or its entry refused). Served resets the miss
+counter, natural stop neither resets nor counts, misfit counts.
+
+Why not 2a: Codex's counterexamples are concrete, and Antigravity's
+answer ("reaching the done guard proves the body ran") does not hold
+here. t8's e33 is an ordinary deopt, so tier-0 replays the interrupted
+iteration; nothing the candidate did is proven committed. A copy whose
+loop continues past the guard, another loop's guard, or an inlined
+frame's guard all look the same at that exit. 2b still fixes P2, since
+t7 e10's chains stop counting, and it only loses the reset. A
+child that alternates natural stops with real misfits still gives up,
+which is what the turnstile is for. Splitting the outcome from
+`linked_trace` also removes the overload Codex pointed out:
+`linked_trace` also chooses the child to arm.
+
+**2d: now, but triggered by evidence, not a timer (Codex's form).** A
+`.gave_up` exit returns to `.none` when a new trace that could serve it
+commits: a trace anchored at `P`, or (with 3b) a loop root at
+`loopHeaderOf(P)`. Each commit allows at most one revival, so the
+backoff stays bounded. It has to come now, not later. t1 e15 can give
+up on the t2/t6 composites before t7 commits, and a permanent give-up
+would then hide the root that 3b binds. A cooldown (Antigravity's
+form) would also revive exits where nothing has changed, and it would
+need a clock-like counter in a tiering decision for no gain over the
+commit event, which is already deterministic.
+
+**3d: out.** Attachability and resume pc are commit-time facts of the
+parent: `ExitFacts` memoises them, and replay and the viz read them
+as fixed. 3d would make them depend on whether some other trace
+exists, which is dynamic. 3b gets the same binding while keeping that
+split: the parent's facts stay the same, and target resolution
+(marker → header root) happens at route time, in the one
+resolved-target description that §9 says arming, replay, promotion
+and topology all use.
+
+**P1: find the close cause first.** Two reasons. First, the doc
+cannot yet say what closes these activations (§3 P1), and Z-8's ladder
+says to find the layer before changing the policy: if a classification
+or membership gap closes them early, 1a would hide that bug behind a
+larger count. Second, 1a + 1c change the protections doc 17 and doc 55
+were tuned on (cold-region retirement, ping-pong, fft's phase-variant
+butterfly), and P2/P3 change what runs inside this region. Once 3b
+binds t7, the activations look different, so tuning 1a now would tune
+it against a shape that is about to disappear. After that, 1a (in
+Codex's corrected form: work by materialization kind, applied the same
+way in rowed, scalar and silent accounting) comes only if productive
+short activations remain. 1c, if still wanted, comes later as its own
+explicit policy change. 1d does not depend on either and can land
+whenever.
+
+**P4: 4a, then re-profile; 4c before 4b if a self-cycle remains.** With
+3b, the `while` runs on t7's back-edge. 4b needs a real loop contract
+for exit-side self-links, which is new machinery, so it needs its own
+doc (Z-8). 4c reuses existing machinery and comes first if the
+re-profile shows a productive self-cycle.
+
+**Order:**
+
+1. P1 diagnosis: find what closes rid=2's activations and pin the
+   finding with a test. No policy change in this step.
+2. P2: the typed chain outcome, 2b, and evidence-triggered 2d.
+3. P3: 3b, with 3a's runtime path, root before composites, one
+   resolved-target description.
+4. Re-profile. Corrected 1a only if short productive activations
+   remain.
+5. 1d.
+6. P4: re-profile; 4c if needed.
+
+Each step gets a small test program of its own (§4), not
+nsieve-bit-fp as the only witness, and a board run.

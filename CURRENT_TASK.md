@@ -32,9 +32,11 @@ WORST BOARD ROW (2026-10-19, amber-badger): nsieve-bit-fp.
   "The `while` inside `for k` and the outer `for i`". Written up as doc
   64 (`docs/design/64-heavy-iteration-nests.md`) and reviewed by Codex
   and Antigravity (`docs/reviews/doc64/*-r1.md`, summary and
-  disagreements in doc 64 §9). Waiting on Bart's choices listed at the
-  end of §9. After that, region accounting is the seam's biggest slice
-  (TODO).
+  disagreements in doc 64 §9). Bart had me break the reviewers' ties:
+  doc 64 §10 records the decisions and the six-step order (P1 close
+  cause first, then P2 typed outcome with 2b and evidence-triggered 2d,
+  then 3b, then a re-profile). Next: step 1, find what closes rid=2's
+  activations.
 
 LINE LOOKUP FIX (2026-10-11, coral-marten): LANDED in `49fd572`, bundled with amber-badger's doc 61 Phase K.
 - Bug from TODO.md "Every located runtime error rescans the source for
