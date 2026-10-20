@@ -52,12 +52,26 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
       or the m=5000 kernel (a prototype changed no counter), so no test
       can pin it yet; revisit if a give-up shows `[A.deopt, B.link]` rows
       with A and B at the same anchor.
-- [ ] **Per-row replay re-derives static exit facts.** `resumeOf`,
+- [x] **Per-row replay re-derives static exit facts.** `resumeOf`,
       `isNumericForLoopDoneGuard`, `guardExitPc`/`guardSourcePc` and
-      `isOwnLoopTest` decode IR and provenance for every replayed row
-      (~12% of nsieve-bit-fp's cycles together). They are pure functions
-      of the immutable `TraceCode` and could be one per-exit table built
-      at commit.
+      `isOwnLoopTest` decoded IR and provenance for every replayed row
+      (~8% of nsieve-bit-fp's cycles inclusive, through `exitResumePc` in
+      the `.exit_side` replay arm and `promotedEdgeFromLink`). Done
+      2026-10-20: `TraceCode.exit_facts`, one `ExitFacts` per instruction
+      (attachable, resume pc, numeric-for loop-done, own loop test) built
+      at finalize, replacing the `exit_attach` bitset; `isLoopDoneGuardIndex`
+      (a line-for-line copy) now delegates. The four functions are gone from
+      the profile. Instructions (`--jit-native`, every @bench program,
+      outputs identical): nsieve-bit-fp −4.85%, fft −1.49%, euler14-bit
+      −1.27%, spectral-norm −1.08%, array3d −1.03%, none worse.
+- [ ] **Region accounting is now the seam's biggest slice.** On
+      nsieve-bit-fp after the facts table (frame-pointer profile,
+      `-Dcli-frame-pointers=true`): `accountRegionProfit` 10.9% self,
+      the region trampoline 8.3%, `refreshObserverFast` 4.1%,
+      `regionMemberPoint` 2.4%, the `RegionKey` map `get` 1.8%,
+      `flushWindow` 1.3%. That is per-receipt region bookkeeping
+      (`classifyExit` → `chooseSource` → credit) and the per-instruction
+      region observer, not static facts. Diagnose before designing.
 
 ## Vendor bundle leftovers (noted 2026-10-13)
 

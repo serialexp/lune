@@ -411,6 +411,21 @@ pub const FrameMotionAbi = struct {
     max_call_depth: u32,
 };
 
+/// The static facts of one instruction as an exit (`TraceCode.exit_facts`).
+/// Every field is its oracle's answer for the committed code.
+pub const ExitFacts = packed struct(u64) {
+    /// `trace_exit_attach.classify` says `.attachable`.
+    attachable: bool = false,
+    /// `TraceCode.isNumericForLoopDoneGuard`.
+    numeric_for_done: bool = false,
+    /// `TraceCode.isOwnLoopTest`.
+    own_loop_test: bool = false,
+    _pad: u29 = 0,
+    /// The resume pc `P` (`trace_exit_attach.resumeOf`) when `attachable`;
+    /// 0 otherwise.
+    resume_pc: u32 = 0,
+};
+
 pub const TraceCode = struct {
     /// Borrowed proto identity; its program image must outlive this artifact.
     anchor: AnchorKey,
@@ -479,14 +494,15 @@ pub const TraceCode = struct {
     exit_snapshots: []trace_snapshot.Snapshot = &.{},
     exit_snapshot_slots: []trace_snapshot.SnapshotSlot = &.{},
     exit_snap_by_ord: []trace_ir.SnapIdx = &.{},
-    /// Doc 56 §4.3: the per-exit attachability verdict (one bit per
-    /// instruction, LSB-first), computed once at commit by
-    /// `trace_exit_attach.buildMemo` — a pure function of this immutable
-    /// code. Same fail-soft contract as `bridge_cand`: an OOM leaves it
-    /// unbuilt and `exitAttachable` asks the identical oracle. Built but
-    /// empty when the trace has no exit snapshots. Owned; freed in `deinit`.
-    exit_attach: []const u8 = &.{},
-    exit_attach_built: bool = false,
+    /// The static facts of every instruction as an exit (`ExitFacts`, one
+    /// entry per instruction), computed once at commit by `buildExitFacts` —
+    /// pure functions of this immutable code that the dispatcher's ledger
+    /// replay otherwise re-derived on every row. Same fail-soft contract as
+    /// `bridge_cand`: an OOM leaves it unbuilt and every reader asks the
+    /// identical oracle. Built but empty when the trace has no instructions.
+    /// Owned; freed in `deinit`.
+    exit_facts: []const ExitFacts = &.{},
+    exit_facts_built: bool = false,
     /// Doc 48: eviction metadata ONLY — the record-time table identity behind
     /// each `guard_lane` on a slot_load-covered root, so widen-eviction
     /// (`laneWidenedPast`) fires only against the very table whose monotonic
@@ -514,7 +530,7 @@ pub const TraceCode = struct {
         if (self.exit_snapshots.len != 0) gpa.free(self.exit_snapshots);
         if (self.exit_snapshot_slots.len != 0) gpa.free(self.exit_snapshot_slots);
         if (self.exit_snap_by_ord.len != 0) gpa.free(self.exit_snap_by_ord);
-        if (self.exit_attach.len != 0) gpa.free(self.exit_attach);
+        if (self.exit_facts.len != 0) gpa.free(self.exit_facts);
         if (self.lane_pins.len != 0) gpa.free(self.lane_pins);
         self.* = undefined;
     }
@@ -577,21 +593,44 @@ pub const TraceCode = struct {
         return si;
     }
 
+    /// Compute `exit_facts` once, at commit, from the final code: each
+    /// fact's oracle below, the attachability and resume pc through
+    /// `trace_exit_attach.fillFacts`. FAIL-SOFT: on OOM the table stays
+    /// unbuilt, never partial, and every reader asks its oracle.
+    pub fn buildExitFacts(self: *TraceCode, gpa: std.mem.Allocator) void {
+        std.debug.assert(!self.exit_facts_built and self.exit_facts.len == 0);
+        if (self.instrs.len == 0) {
+            self.exit_facts_built = true;
+            return;
+        }
+        const facts = gpa.alloc(ExitFacts, self.instrs.len) catch return;
+        for (facts, 0..) |*f, i| f.* = .{
+            .numeric_for_done = self.computeNumericForLoopDoneGuard(i),
+            .own_loop_test = self.computeOwnLoopTest(i),
+        };
+        if (!exit_attach.fillFacts(gpa, self, facts)) {
+            gpa.free(facts);
+            return;
+        }
+        self.exit_facts = facts;
+        self.exit_facts_built = true;
+    }
+
     /// Doc 56 §4.3: whether exit `instr_idx` may take the resume-coherent
     /// path (materialize at its resume pc, then continue there). Reads the
     /// commit-time memo; see `trace_exit_attach` for the rules.
     pub fn exitAttachable(self: *const TraceCode, instr_idx: usize) bool {
-        if (!self.exit_attach_built) return exit_attach.classify(self, instr_idx) == .attachable;
-        if (instr_idx >> 3 >= self.exit_attach.len) return false;
-        return (self.exit_attach[instr_idx >> 3] >> @intCast(instr_idx & 7)) & 1 != 0;
+        if (!self.exit_facts_built) return exit_attach.classify(self, instr_idx) == .attachable;
+        if (instr_idx >= self.exit_facts.len) return false;
+        return self.exit_facts[instr_idx].attachable;
     }
 
     /// Doc 56 Phase 3: whether the commit-time memo marks any exit
     /// attachable. An unbuilt memo (OOM) answers false: the trace then gets
     /// no exit-side state, which costs coverage, never correctness.
     pub fn anyExitAttachable(self: *const TraceCode) bool {
-        if (!self.exit_attach_built) return false;
-        for (self.exit_attach) |b| if (b != 0) return true;
+        if (!self.exit_facts_built) return false;
+        for (self.exit_facts) |f| if (f.attachable) return true;
         return false;
     }
 
@@ -607,7 +646,10 @@ pub const TraceCode = struct {
     /// Doc 56 §4.3: the resume pc `P` of an attachable exit (the branch
     /// fix-up applied), or null when the exit is not attachable.
     pub fn exitResumePc(self: *const TraceCode, instr_idx: usize) ?u32 {
-        return exit_attach.resumePc(self, instr_idx);
+        if (!self.exit_facts_built) return exit_attach.resumePc(self, instr_idx);
+        if (instr_idx >= self.exit_facts.len) return null;
+        const f = self.exit_facts[instr_idx];
+        return if (f.attachable) f.resume_pc else null;
     }
 
     /// Doc 43 P5 (the sgm_setpos precedent, generalized): the eligibility gate
@@ -663,7 +705,16 @@ pub const TraceCode = struct {
             self.loopDoneFlushSupported(instr_idx);
     }
 
+    /// Is guard `instr_idx` a numeric-`for` loop-done guard: a `guard_true`
+    /// at inline depth 0, not a mid-trip copy, whose exit pc follows a
+    /// `for_loop` of a loop-anchored trace? Reads the commit-time memo.
     pub fn isNumericForLoopDoneGuard(self: *const TraceCode, instr_idx: usize) bool {
+        if (!self.exit_facts_built) return self.computeNumericForLoopDoneGuard(instr_idx);
+        return instr_idx < self.exit_facts.len and self.exit_facts[instr_idx].numeric_for_done;
+    }
+
+    /// The oracle behind `isNumericForLoopDoneGuard`.
+    fn computeNumericForLoopDoneGuard(self: *const TraceCode, instr_idx: usize) bool {
         if (instr_idx >= self.instrs.len) return false;
         // Doc 44 D1/D12b: a one-shot trace (head or cont) has no loop-done
         // exits — a zero-iteration `for` recorded through the body would
@@ -678,6 +729,10 @@ pub const TraceCode = struct {
         if (self.anchor.proto.code[trace_ir.guardSourcePc(guard).?].op != .for_loop) return false;
         // Doc 57 P3: a non-final iteration's `for_loop` test sits mid-trip.
         if (self.isLoopTestCopy(instr_idx)) return false;
+        // Inlined-callee corner: a callee-internal `for_loop` guard at
+        // `inline_depth > 0` has its `guardSourcePc` in the callee's proto,
+        // which may coincidentally name a `for_loop` in the anchor proto.
+        // A link terminal is never a loop-done guard.
         if (self.provAt(@intCast(instr_idx))) |prov| switch (prov) {
             .guard => |gp| if (gp.inline_depth > 0) return false,
             .link_terminal => return false,
@@ -700,8 +755,15 @@ pub const TraceCode = struct {
     /// `wants_prime_side` (which would unpatch the entry and chain same-anchor
     /// siblings on every loop completion). Its hotness feeds exit-side only
     /// (review r3 finding 1; the dispatcher counts it — B2 review blocker 2 —
-    /// and `noteTakenExit` stops it before every legacy route).
+    /// and `noteTakenExit` stops it before every legacy route). Reads the
+    /// commit-time memo.
     pub fn isOwnLoopTest(self: *const TraceCode, idx: usize) bool {
+        if (!self.exit_facts_built) return self.computeOwnLoopTest(idx);
+        return idx < self.exit_facts.len and self.exit_facts[idx].own_loop_test;
+    }
+
+    /// The oracle behind `isOwnLoopTest`.
+    fn computeOwnLoopTest(self: *const TraceCode, idx: usize) bool {
         if (idx >= self.instrs.len) return false;
         if (anchorKind(self.anchor.pc) != .loop) return false;
         const g = self.instrs[idx];

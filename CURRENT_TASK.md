@@ -18,9 +18,15 @@ WORST BOARD ROW (2026-10-19, amber-badger): nsieve-bit-fp.
   identical on str_gmatch, binary-trees and lua54, so that's noise.
 - Measured and reverted P6-Q3(b) (bursts take exit adapters): wrong output
   on nsieve-bit-fp, no win elsewhere. Details in TODO.
-- Next candidates (TODO "nsieve-bit-fp, the board's worst row"): the
-  `while` that has no looping root, permanent exit-side give-ups, the
-  per-row replay re-deriving static exit facts.
+- Bart picked (c) first, then (a). (c) done 2026-10-20: the per-exit
+  static facts table (`TraceCode.exit_facts`, built at finalize). Gates
+  green (test, jit-debug, hashgate 90/90 both legs, embed-test, wasm,
+  lib). Instructions: nsieve-bit-fp −4.85%, fft −1.49%, the rest ≤ ~1%
+  better, none worse, outputs identical. New `-Dcli-frame-pointers=true`
+  gives perf call graphs on a ReleaseFast CLI (the DWARF unwinder loses
+  them). Board numbers: see TODO "nsieve-bit-fp, the board's worst row".
+- Next: (a) the `while` that has no looping root. After that, region
+  accounting is the seam's biggest slice (TODO).
 
 LINE LOOKUP FIX (2026-10-11, coral-marten): LANDED in `49fd572`, bundled with amber-badger's doc 61 Phase K.
 - Bug from TODO.md "Every located runtime error rescans the source for

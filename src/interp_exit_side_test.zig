@@ -288,12 +288,24 @@ test "doc 56 Phase 2: bit-reverse's while-exit is attachable and resumes after t
 
     var attachable: usize = 0;
     var after_while: usize = 0;
+    var loop_done: usize = 0;
+    var own_test: usize = 0;
     for (vm.trace.registry.cache.items) |t| {
         const c = &t.code;
         const proto = c.anchor.proto;
+        // The same code with the commit-time memo unbuilt asks the oracles.
+        var oracle = t.code;
+        oracle.exit_facts = &.{};
+        oracle.exit_facts_built = false;
+        try testing.expect(c.exit_facts_built);
         for (0..c.instrs.len) |e| {
-            // The commit-time memo is the oracle's answer.
+            // The commit-time memo is the oracle's answer, fact by fact.
             try testing.expectEqual(exit_attach.classify(c, e) == .attachable, c.exitAttachable(e));
+            try testing.expectEqual(oracle.exitResumePc(e), c.exitResumePc(e));
+            try testing.expectEqual(oracle.isNumericForLoopDoneGuard(e), c.isNumericForLoopDoneGuard(e));
+            try testing.expectEqual(oracle.isOwnLoopTest(e), c.isOwnLoopTest(e));
+            loop_done += @intFromBool(c.isNumericForLoopDoneGuard(e));
+            own_test += @intFromBool(c.isOwnLoopTest(e));
             const p = c.exitResumePc(e) orelse continue;
             attachable += 1;
             try testing.expect(p < proto.code.len);
@@ -331,6 +343,9 @@ test "doc 56 Phase 2: bit-reverse's while-exit is attachable and resumes after t
     }
     try testing.expect(attachable > 0);
     try testing.expect(after_while > 0);
+    // The memo comparison above saw both shape facts set somewhere.
+    try testing.expect(loop_done > 0);
+    try testing.expect(own_test > 0);
 }
 
 fn isExecuteMode(mode: TraceMode) bool {

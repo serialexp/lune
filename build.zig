@@ -104,6 +104,10 @@ pub fn build(b: *std.Build) void {
 
     // `-Dcli-strip=true` drops the CLI's debug info (the release binaries do).
     const cli_strip = b.option(bool, "cli-strip", "Build the CLI without debug info (the release binaries do)");
+    // `-Dcli-frame-pointers=true` keeps rbp in every CLI frame, so
+    // `perf record -g` unwinds the runtime's call chains (the DWARF unwinder
+    // drops them on a ReleaseFast build).
+    const cli_frame_pointers = b.option(bool, "cli-frame-pointers", "Keep frame pointers in the CLI (for perf call graphs)") orelse false;
 
     // The CLI executable. Thin shell over the library module for now.
     const exe = b.addExecutable(.{
@@ -113,6 +117,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .strip = cli_strip,
+            .omit_frame_pointer = if (cli_frame_pointers) false else null,
             .imports = &.{
                 .{ .name = "mahina", .module = mod },
                 .{ .name = "viz_assets", .module = viz_assets_mod },

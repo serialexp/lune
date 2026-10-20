@@ -184,33 +184,12 @@ pub const programPointLess = trace_region.programPointLess;
 
 /// Whether IR instruction `idx` of `t` is a numeric-for loop-done guard: a
 /// `guard_true` whose deopt PC lands immediately after a `for_loop` bytecode op.
-/// Mirrors nativegen's `isNumericForLoopDoneGuard`, kept here so the arming side can
-/// enforce the P-C option (b) invariant (2.3c-0a) without reaching into codegen.
-/// Returns before touching `t.code.anchor` when `idx` is out of range, so it is safe on
-/// synthetic traces with an undefined anchor and empty `instrs`.
+/// The arming side's name for `TraceCode.isNumericForLoopDoneGuard` (the P-C
+/// option (b) invariant, 2.3c-0a), which reads the commit-time memo. Safe on
+/// synthetic traces with an undefined anchor and empty `instrs`: both the memo and
+/// its oracle refuse an out-of-range `idx` before touching the anchor.
 pub fn isLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
-    if (idx >= t.code.instrs.len) return false;
-    // Doc 44 D1/D12b: a one-shot trace (head or cont) has no loop back-edge —
-    // none of its guards can be a loop-done guard. Explicit kind check,
-    // fail-closed (its guard_true pcs must never be interpreted against the
-    // anchor proto's loop CFG).
-    if (anchorKind(t.code.anchor.pc) != .loop) return false;
-    const g = t.code.instrs[idx];
-    if (g.op != .guard_true) return false;
-    const exit_pc = guardExitPc(g) orelse return false;
-    if (exit_pc == 0 or exit_pc > t.code.anchor.proto.code.len) return false;
-    if (t.code.anchor.proto.code[guardSourcePc(g).?].op != .for_loop) return false;
-    // Inlined-callee corner: a callee-internal `for_loop` guard at `inline_depth > 0` has its
-    // `guardSourcePc` in the callee's proto, not the anchor's. If the callee's pc
-    // coincidentally maps to a `for_loop` in the anchor proto, this would falsely
-    // match. Reject inlined-callee guards via the exit provenance table.
-    if (t.code.provAt(@intCast(idx))) |prov| switch (prov) {
-        .guard => |gp| if (gp.inline_depth > 0) return false,
-        .link_terminal => return false, // a link terminal is never a loop-done guard
-    };
-    // Doc 57 P3: a non-final iteration's `for_loop` test sits mid-trip.
-    if (t.code.isLoopTestCopy(idx)) return false;
-    return true;
+    return t.code.isNumericForLoopDoneGuard(idx);
 }
 
 /// Doc 58: the test of the loop this trace is anchored at, for ALL three loop

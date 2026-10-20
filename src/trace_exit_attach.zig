@@ -9,7 +9,8 @@
 //!
 //! Both are pure functions of the immutable `TraceCode` (IR, ordinals,
 //! exit snapshots, provenance) and its anchor proto's bytecode, so the
-//! verdict is computed once at commit (`buildMemo`) and read by later
+//! verdict is computed once at commit (`fillFacts`, through
+//! `TraceCode.buildExitFacts`) and read by later
 //! phases; nothing here can drift after commit. The module is inert: no
 //! runtime path consults it yet.
 //!
@@ -287,7 +288,7 @@ pub const Resolved = union(enum) {
     refused: Verdict,
 };
 
-/// Precomputed per-trace indexes that make `buildMemo` linear-ish. The
+/// Precomputed per-trace indexes that make `fillFacts` linear-ish. The
 /// oracle (`classify`) passes none and scans instead; the verdicts are
 /// identical (pinned by a test).
 const Ctx = struct {
@@ -312,20 +313,29 @@ pub fn resumePc(code: *const TraceCode, idx: usize) ?u32 {
 }
 
 fn classifyWith(code: *const TraceCode, idx: usize, ctx: Ctx) Verdict {
+    return switch (attachWith(code, idx, ctx)) {
+        .pc => .attachable,
+        .refused => |v| v,
+    };
+}
+
+/// The verdict and the resume pc in one pass: `.pc` exactly when the exit
+/// is attachable, its refusal otherwise.
+fn attachWith(code: *const TraceCode, idx: usize, ctx: Ctx) Resolved {
     if (code.deopt_mode == .precise or code.peeled or trace_code.anchorKind(code.anchor.pc) != .loop)
-        return .trace_shape;
-    if (code.exitSnapIdx(idx) == null) return .no_snapshot;
+        return .{ .refused = .trace_shape };
+    if (code.exitSnapIdx(idx) == null) return .{ .refused = .no_snapshot };
     const p = switch (resumeOf(code, idx)) {
         .pc => |p| p,
-        .refused => |v| return v,
+        .refused => |v| return .{ .refused = v },
     };
-    if (ownEffect(code, idx, ctx)) return .own_effect;
-    if (storeVerdict(code, idx, ctx)) |v| return v;
+    if (ownEffect(code, idx, ctx)) return .{ .refused = .own_effect };
+    if (storeVerdict(code, idx, ctx)) |v| return .{ .refused = v };
     const proto = code.anchor.proto;
-    if (isMultretConsumer(proto.code[p])) return .multret_consumer;
-    if (isLoopHeader(proto, p, ctx.headers)) return .resume_header;
-    if (!continuationReachesEnclosingBackEdge(proto, p, code.anchor.pc)) return .no_back_edge;
-    return .attachable;
+    if (isMultretConsumer(proto.code[p])) return .{ .refused = .multret_consumer };
+    if (isLoopHeader(proto, p, ctx.headers)) return .{ .refused = .resume_header };
+    if (!continuationReachesEnclosingBackEdge(proto, p, code.anchor.pc)) return .{ .refused = .no_back_edge };
+    return .{ .pc = p };
 }
 
 /// Rules 3–5: the guard's bytecode `B` and its resume pc `P` — `B` itself
@@ -498,25 +508,22 @@ pub fn continuationReachesEnclosingBackEdge(proto: *const Proto, start_pc: u32, 
     return false;
 }
 
-/// Compute every exit's verdict once, at commit, into `code.exit_attach`
-/// (one bit per instruction). Cost: O(n + proto code + g·s) for n
-/// instructions, g side-exit guards and s non-neutral instructions (the
-/// stores, a handful per trace), against O(n·g) for the scanning oracle.
+/// Fill every exit's verdict and resume pc into `facts` (one entry per
+/// instruction), once, at commit, for `TraceCode.buildExitFacts`. Cost:
+/// O(n + proto code + g·s) for n instructions, g side-exit guards and s
+/// non-neutral instructions (the stores, a handful per trace), against
+/// O(n·g) for the scanning oracle.
 ///
-/// FAIL-SOFT, like `buildBridgeCandMemo`: on OOM the memo stays unbuilt and
-/// `TraceCode.exitAttachable` falls back to the oracle, never a partial
-/// bitset. A trace with no exit snapshots has no attachable exit and needs
-/// no bits.
-pub fn buildMemo(gpa: std.mem.Allocator, code: *TraceCode) void {
-    std.debug.assert(!code.exit_attach_built and code.exit_attach.len == 0);
-    if (code.exit_snapshots.len == 0 or code.instrs.len == 0) {
-        code.exit_attach_built = true;
-        return;
-    }
-    const n = code.instrs.len;
+/// FAIL-SOFT, like `buildBridgeCandMemo`: false on OOM, and the caller then
+/// leaves the whole table unbuilt (every reader falls back to the oracle),
+/// never a partial one. A trace with no exit snapshots has no attachable
+/// exit and allocates nothing.
+pub fn fillFacts(gpa: std.mem.Allocator, code: *const TraceCode, facts: []trace_code.ExitFacts) bool {
+    std.debug.assert(facts.len == code.instrs.len);
+    if (code.exit_snapshots.len == 0) return true;
     var n_eff: usize = 0;
     for (code.instrs) |ins| n_eff += @intFromBool(resumeClass(ins.op) != .neutral);
-    const effects = gpa.alloc(u32, n_eff) catch return;
+    const effects = gpa.alloc(u32, n_eff) catch return false;
     defer gpa.free(effects);
     var k: usize = 0;
     for (code.instrs, 0..) |ins, i| {
@@ -525,22 +532,22 @@ pub fn buildMemo(gpa: std.mem.Allocator, code: *TraceCode) void {
         k += 1;
     }
     const proto = code.anchor.proto;
-    const headers = gpa.alloc(u8, (proto.code.len + 7) / 8) catch return;
+    const headers = gpa.alloc(u8, (proto.code.len + 7) / 8) catch return false;
     defer gpa.free(headers);
     @memset(headers, 0);
     for (proto.code, 0..) |ins, pc| {
         const t = bytecode.loopHeaderOf(ins, pc) orelse continue;
         headers[t >> 3] |= @as(u8, 1) << @intCast(t & 7);
     }
-    const bits = gpa.alloc(u8, (n + 7) / 8) catch return;
-    @memset(bits, 0);
     const ctx: Ctx = .{ .effects = effects, .headers = headers };
-    for (0..n) |i| {
-        if (classifyWith(code, i, ctx) == .attachable)
-            bits[i >> 3] |= @as(u8, 1) << @intCast(i & 7);
-    }
-    code.exit_attach = bits;
-    code.exit_attach_built = true;
+    for (facts, 0..) |*f, i| switch (attachWith(code, i, ctx)) {
+        .pc => |p| {
+            f.attachable = true;
+            f.resume_pc = p;
+        },
+        .refused => {},
+    };
+    return true;
 }
 
 test {

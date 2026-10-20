@@ -57,7 +57,7 @@ fn emptyCode() TraceCode {
 fn ownedCode(gpa: std.mem.Allocator) !TraceCode {
     var code = emptyCode();
     errdefer code.deinit(gpa);
-    inline for (.{ "instrs", "consts", "entry_slots", "entry_guards", "inputs", "exit_prov", "rec_path", "bridge_cand", "exit_attach" }) |field| {
+    inline for (.{ "instrs", "consts", "entry_slots", "entry_guards", "inputs", "exit_prov", "rec_path", "bridge_cand", "exit_facts" }) |field| {
         const Element = std.meta.Child(@TypeOf(@field(code, field)));
         @field(code, field) = try gpa.alloc(Element, 1);
     }

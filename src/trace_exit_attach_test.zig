@@ -136,27 +136,35 @@ const Fixture = struct {
     }
 };
 
+/// Every `exit_facts` reader of `memo` answers `idx` as the oracle does. An
+/// unbuilt `oracle` (`exit_facts_built` false) asks each fact's oracle.
+fn expectFactsAgree(oracle: *const TraceCode, memo: *const TraceCode, idx: usize) !void {
+    try testing.expect(!oracle.exit_facts_built);
+    try testing.expectEqual(attach.classify(oracle, idx) == .attachable, memo.exitAttachable(idx));
+    try testing.expectEqual(oracle.exitResumePc(idx), memo.exitResumePc(idx));
+    try testing.expectEqual(oracle.isNumericForLoopDoneGuard(idx), memo.isNumericForLoopDoneGuard(idx));
+    try testing.expectEqual(oracle.isOwnLoopTest(idx), memo.isOwnLoopTest(idx));
+}
+
 /// The verdict for `idx`, asserting the memo (built on a copy) agrees with
 /// the oracle — every test below therefore also pins memo equivalence.
 fn verdict(f: *Fixture, idx: usize) !Verdict {
     const c = f.code();
     const v = attach.classify(&c, idx);
     var memo = f.code();
-    attach.buildMemo(testing.allocator, &memo);
-    defer if (memo.exit_attach.len != 0) testing.allocator.free(memo.exit_attach);
-    try testing.expect(memo.exit_attach_built);
-    try testing.expectEqual(v == .attachable, memo.exitAttachable(idx));
+    memo.buildExitFacts(testing.allocator);
+    defer if (memo.exit_facts.len != 0) testing.allocator.free(memo.exit_facts);
+    try testing.expect(memo.exit_facts_built);
+    try expectFactsAgree(&c, &memo, idx);
     return v;
 }
 
 fn expectAllMemoEqual(f: *Fixture) !void {
     const c = f.code();
     var memo = f.code();
-    attach.buildMemo(testing.allocator, &memo);
-    defer if (memo.exit_attach.len != 0) testing.allocator.free(memo.exit_attach);
-    for (0..c.instrs.len + 9) |i| {
-        try testing.expectEqual(attach.classify(&c, i) == .attachable, memo.exitAttachable(i));
-    }
+    memo.buildExitFacts(testing.allocator);
+    defer if (memo.exit_facts.len != 0) testing.allocator.free(memo.exit_facts);
+    for (0..c.instrs.len + 9) |i| try expectFactsAgree(&c, &memo, i);
 }
 
 test "doc 56 attach: every exit of the base fixture is attachable, with its resume pc" {
@@ -441,21 +449,25 @@ test "doc 56 attach: the memo build is fail-soft under allocation failure" {
     var fail_index: usize = 0;
     while (fail_index < 8) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const o = f.code();
         var c = f.code();
-        attach.buildMemo(failing.allocator(), &c);
-        defer if (c.exit_attach.len != 0) failing.allocator().free(c.exit_attach);
-        if (!c.exit_attach_built) try testing.expectEqual(@as(usize, 0), c.exit_attach.len);
+        c.buildExitFacts(failing.allocator());
+        defer if (c.exit_facts.len != 0) failing.allocator().free(c.exit_facts);
+        if (!c.exit_facts_built) try testing.expectEqual(@as(usize, 0), c.exit_facts.len);
         // Built or not, the answers are the oracle's.
-        for (0..c.instrs.len) |i|
-            try testing.expectEqual(attach.classify(&c, i) == .attachable, c.exitAttachable(i));
+        for (0..c.instrs.len) |i| try expectFactsAgree(&o, &c, i);
     }
-    // A trace with no exit snapshots is built with no bits at all.
-    var c = f.code();
-    c.exit_snapshots = &.{};
-    attach.buildMemo(testing.allocator, &c);
-    try testing.expect(c.exit_attach_built);
-    try testing.expectEqual(@as(usize, 0), c.exit_attach.len);
+    // A trace with no exit snapshots has no attachable exit, but its other
+    // facts are still built, one entry per instruction.
+    var o = f.code();
+    o.exit_snapshots = &.{};
+    var c = o;
+    c.buildExitFacts(testing.allocator);
+    defer testing.allocator.free(c.exit_facts);
+    try testing.expect(c.exit_facts_built);
+    try testing.expectEqual(c.instrs.len, c.exit_facts.len);
     try testing.expect(!c.exitAttachable(E_ADD));
+    for (0..c.instrs.len + 9) |i| try expectFactsAgree(&o, &c, i);
 }
 
 test "doc 56 attach: the resume classes of the ops the rules lean on" {
