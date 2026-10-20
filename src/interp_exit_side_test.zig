@@ -13,6 +13,7 @@ const testing = std.testing;
 const Vm = interp.Vm;
 const trace_ir = @import("trace_ir.zig");
 const compiler = @import("compiler.zig");
+const bytecode = @import("bytecode.zig");
 const io = @import("io.zig");
 const exit_attach = @import("trace_exit_attach.zig");
 const nativegen = @import("nativegen.zig");
@@ -309,14 +310,11 @@ test "doc 56 Phase 2: bit-reverse's while-exit is attachable and resumes after t
             const p = c.exitResumePc(e) orelse continue;
             attachable += 1;
             try testing.expect(p < proto.code.len);
-            // No backward jump lands on `P`: it is not a loop header.
-            for (proto.code, 0..) |ins, pc| switch (ins.op) {
-                .jmp, .jmp_if_true, .jmp_if_false, .jmp_if_not_nil, .for_loop, .tfor_loop => {
-                    const target: i64 = @as(i64, @intCast(pc)) + 1 + ins.aux;
-                    try testing.expect(!(target <= pc and target == p));
-                },
-                else => {},
-            };
+            // `P` is not a loop header (doc 58: a back-edge's header, as
+            // `loopHeaderOf` defines it). A `while`'s condition can be: its
+            // backward `jmp` is only the loop's closer.
+            for (proto.code, 0..) |ins, pc|
+                try testing.expect(bytecode.loopHeaderOf(ins, pc) != p);
             const snap = c.exit_snapshots[c.exitSnapIdx(e).? - 1];
             const b = snap.resume_pc;
             switch (proto.code[b].op) {

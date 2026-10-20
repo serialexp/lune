@@ -2292,7 +2292,7 @@ test "doc 61 Phase 1: a dead register of the in-flight frame is scrubbed; live o
         \\end
         \\print(f())
         \\
-    , ".f.|.#t.f...\t0\t0\n");
+    , ".f.|.#t.f..\t0\t0\n");
 }
 
 test "doc 61 Phase 1: a suspended caller keeps only the registers below its call" {
@@ -2309,7 +2309,7 @@ test "doc 61 Phase 1: a suspended caller keeps only the registers below its call
         \\end
         \\print(f())
         \\
-    , "f.f.|t....|f\t0\n");
+    , "f.f.|t...|f\t0\n");
 }
 
 test "doc 61 Phase 1: a frame in flight at a multret consumer keeps its dynamic span only" {
@@ -2343,7 +2343,7 @@ test "doc 61 Phase 1: a frame of a non-maskable proto is kept whole" {
         \\unmask(f)
         \\print(f())
         \\
-    , ".f.|t#t.f...\t0\t0\n");
+    , ".f.|t#t.f..\t0\t0\n");
 }
 
 /// The traced legs materialised exits at their resume pcs (doc 56): the

@@ -514,6 +514,80 @@ const Compiler = struct {
         }
     }
 
+    /// The register of the local `e` names, looking through parentheses, or
+    /// null when `e` is anything else (an upvalue and a global are not in a
+    /// register of this frame).
+    fn localRegOf(self: *Compiler, e: *const ast.Expr) ?u16 {
+        var cur = e;
+        while (cur.data == .paren) cur = cur.data.paren;
+        return switch (cur.data) {
+            .name => |nm| self.resolveLocal(nm),
+            else => null,
+        };
+    }
+
+    /// The register an operand is read from. A local is read in place from
+    /// its own register, with no `move` into a temporary (Lua's
+    /// `exp2anyreg`); anything else is compiled into a fresh temporary,
+    /// which the caller frees as usual. Reading in place is only right when
+    /// nothing evaluated between this call and the consuming instruction can
+    /// write the local: an inner function may, through its open upvalue, so
+    /// every caller reads an earlier operand in place only when the later
+    /// ones are `isInert`. The last operand evaluated can always be read in
+    /// place.
+    fn operandReg(self: *Compiler, e: *const ast.Expr) Error!u16 {
+        if (self.localRegOf(e)) |r| {
+            // The span `compileExprTo` would have left current, so a fault
+            // in the consuming instruction underlines the same text.
+            var cur = e;
+            while (cur.data == .paren) cur = cur.data.paren;
+            self.cur_span = cur.span;
+            return r;
+        }
+        const t = try self.alloc1();
+        try self.compileExprTo(e, t);
+        return t;
+    }
+
+    /// `operandReg` for an operand that is evaluated before `later`: in place
+    /// only when evaluating `later` cannot write a local, else a temporary
+    /// copy, so the operand keeps the value it had when it was evaluated.
+    fn operandRegBefore(self: *Compiler, e: *const ast.Expr, later: *const ast.Expr) Error!u16 {
+        if (isInert(later)) return self.operandReg(e);
+        const t = try self.alloc1();
+        try self.compileExprTo(e, t);
+        return t;
+    }
+
+    /// Whether evaluating `e` runs no guest code, so no local can change
+    /// while it runs: a literal, or a name (a local `move`, an upvalue read,
+    /// or a `get_global`, which reads the globals table raw and never
+    /// consults a metatable).
+    fn isInert(e: *const ast.Expr) bool {
+        return switch (e.data) {
+            .nil, .bool, .int, .float, .string_raw, .name => true,
+            .paren => |inner| isInert(inner),
+            else => false,
+        };
+    }
+
+    /// Whether `compileExprTo(e, dest)` writes `dest` only with its last
+    /// instruction, reading every operand before that. Then `e` can be
+    /// compiled straight into a local it reads, as in `x = x + 1`. A table
+    /// constructor writes `dest` first and fills it after, and `and`/`or`/`??`
+    /// write their left value into `dest` before evaluating the right.
+    fn writesDestLast(e: *const ast.Expr) bool {
+        return switch (e.data) {
+            .table => false,
+            .binary => |b| switch (b.op) {
+                .and_, .or_, .coalesce => false,
+                else => true,
+            },
+            .paren => |inner| writesDestLast(inner),
+            else => true,
+        };
+    }
+
     /// Store register `src` into `name`: a local move, an upvalue write, or a
     /// global write.
     fn storeName(self: *Compiler, name: []const u8, src: u16, span: ast.Span) Error!void {
@@ -597,6 +671,9 @@ const Compiler = struct {
     }
 
     fn compileAssign(self: *Compiler, a: anytype) Error!void {
+        if (a.targets.len == 1 and a.values.len == 1) {
+            if (try self.compileSingleAssign(a.targets[0], a.values[0])) return;
+        }
         const mark = self.next_reg;
         const val_base = self.next_reg;
         const n_targets: u16 = @intCast(a.targets.len);
@@ -605,6 +682,38 @@ const Compiler = struct {
             try self.compileStore(tgt, @intCast(val_base + j));
         }
         self.freeTo(mark);
+    }
+
+    /// `target = value` without the temporary the general path stores from,
+    /// when that is equivalent; returns false (nothing emitted) otherwise.
+    /// A local target takes the value directly when `value` writes its
+    /// destination only last (`x = x + 1` is one `add`). A field or index
+    /// target stores a local value from its own register when evaluating the
+    /// target's prefix can't write that local (`t.x = v` needs no `move`).
+    fn compileSingleAssign(self: *Compiler, tgt: *const ast.Expr, val: *const ast.Expr) Error!bool {
+        switch (tgt.data) {
+            .name => |nm| {
+                const r = self.resolveLocal(nm) orelse return false;
+                if (!writesDestLast(val)) return false;
+                try self.compileExprTo(val, r);
+                return true;
+            },
+            .field => |f| {
+                const src = self.localRegOf(val) orelse return false;
+                if (!isInert(f.obj)) return false;
+                try self.compileStore(tgt, src);
+                return true;
+            },
+            .index => |ix| {
+                const src = self.localRegOf(val) orelse return false;
+                // Also rules out the fused `obj[i][j] = v`: `obj[i]` is no
+                // inert prefix.
+                if (!isInert(ix.obj) or !isInert(ix.key)) return false;
+                try self.compileStore(tgt, src);
+                return true;
+            },
+            else => return false,
+        }
     }
 
     /// `target OP= value`. Desugars to `target = target OP value` while evaluating
@@ -616,6 +725,18 @@ const Compiler = struct {
         const op_span = ast.Span{ .start = tgt.span.start, .end = ca.value.span.end };
         switch (tgt.data) {
             .name => |nm| {
+                if (self.resolveLocal(nm)) |r| {
+                    // A local combines in place: `s += i` is `add s, s, i`.
+                    // `s` is read where the value was before `value` ran
+                    // unless `value` is inert.
+                    const m = self.next_reg;
+                    const lhs = try self.operandRegBefore(tgt, ca.value);
+                    const rhs = try self.operandReg(ca.value);
+                    self.cur_span = op_span;
+                    _ = try self.emit(Instr.opABC(binOpCode(ca.op), r, lhs, rhs));
+                    self.freeTo(m);
+                    return;
+                }
                 // No side-effecting prefix: load current, combine, store back.
                 const m = self.next_reg;
                 const acc = try self.alloc1();
@@ -801,8 +922,7 @@ const Compiler = struct {
             .name => |nm| try self.storeName(nm, src, tgt.span),
             .field => |f| {
                 const m = self.next_reg;
-                const obj = try self.alloc1();
-                try self.compileExprTo(f.obj, obj);
+                const obj = try self.operandReg(f.obj);
                 const key = try self.alloc1();
                 const k = try self.stringConstant(f.name);
                 _ = try self.emit(Instr.opAB(.load_const, key, k));
@@ -828,10 +948,8 @@ const Compiler = struct {
                     self.freeTo(m);
                 } else {
                     const m = self.next_reg;
-                    const obj = try self.alloc1();
-                    try self.compileExprTo(ix.obj, obj);
-                    const key = try self.alloc1();
-                    try self.compileExprTo(ix.key, key);
+                    const obj = try self.operandRegBefore(ix.obj, ix.key);
+                    const key = try self.operandReg(ix.key);
                     _ = try self.emit(Instr.opABC(.set_index, obj, key, src));
                     self.freeTo(m);
                 }
@@ -883,8 +1001,7 @@ const Compiler = struct {
 
         for (f.branches) |br| {
             const mark = self.next_reg;
-            const cr = try self.alloc1();
-            try self.compileExprTo(br.cond, cr);
+            const cr = try self.operandReg(br.cond);
             const skip = try self.emitJump(.jmp_if_false, cr);
             self.freeTo(mark); // condition temp is dead after the test
 
@@ -909,8 +1026,7 @@ const Compiler = struct {
         const loop_top = self.code.items.len;
 
         const mark = self.next_reg;
-        const cr = try self.alloc1();
-        try self.compileExprTo(w.cond, cr);
+        const cr = try self.operandReg(w.cond);
         const exit = try self.emitJump(.jmp_if_false, cr);
         self.freeTo(mark);
         // Doc 58: the loop marker (LuaJIT `BC_LOOP`) sits right after the
@@ -1108,8 +1224,8 @@ const Compiler = struct {
             .binary => |b| try self.compileBinary(b.op, b.lhs, b.rhs, dest),
             .field => |f| {
                 const m = self.next_reg;
-                const obj = try self.alloc1();
-                try self.compileExprTo(f.obj, obj);
+                // The key is a constant load, so `obj` can be read in place.
+                const obj = try self.operandReg(f.obj);
                 const key = try self.alloc1();
                 const k = try self.stringConstant(f.name);
                 _ = try self.emit(Instr.opAB(.load_const, key, k));
@@ -1136,10 +1252,8 @@ const Compiler = struct {
                     self.freeTo(m);
                 } else {
                     const m = self.next_reg;
-                    const obj = try self.alloc1();
-                    try self.compileExprTo(ix.obj, obj);
-                    const key = try self.alloc1();
-                    try self.compileExprTo(ix.key, key);
+                    const obj = try self.operandRegBefore(ix.obj, ix.key);
+                    const key = try self.operandReg(ix.key);
                     _ = try self.emit(Instr.opABC(.get_index, dest, obj, key));
                     self.freeTo(m);
                 }
@@ -1160,8 +1274,7 @@ const Compiler = struct {
 
     fn compileUnary(self: *Compiler, op: ast.UnaryOp, operand: *const ast.Expr, dest: u16) Error!void {
         const m = self.next_reg;
-        const t = try self.alloc1();
-        try self.compileExprTo(operand, t);
+        const t = try self.operandReg(operand);
         const oc: OpCode = switch (op) {
             .neg => .neg,
             .not => .not,
@@ -1202,10 +1315,8 @@ const Compiler = struct {
         }
 
         const m = self.next_reg;
-        const t1 = try self.alloc1();
-        try self.compileExprTo(lhs, t1);
-        const t2 = try self.alloc1();
-        try self.compileExprTo(rhs, t2);
+        const t1 = try self.operandRegBefore(lhs, rhs);
+        const t2 = try self.operandReg(rhs);
         // Compiling the operands reset `cur_span`; re-stamp the binop with the
         // whole `lhs op rhs` span so a runtime fault here underlines the
         // operation (which always contains the offending operand).
@@ -1787,6 +1898,67 @@ test "while loop accumulates" {
         \\  i = i + 1
         \\end
         \\return sum
+    )).asInt());
+}
+
+test "locals are read in place: no operand or result moves" {
+    var r = try run(
+        \\local s, i, t = 0, 3, {x = 1}
+        \\s = s + i
+        \\s += i
+        \\local y = -s
+        \\t.x = s
+        \\local z = t.x
+        \\if s then z = z + y end
+        \\while z > 100 do z = z - 1 end
+        \\return s * 10 + z
+    );
+    defer r.deinit();
+    try testing.expectEqual(@as(i64, 60), r.value.asInt());
+    const code = r.chunk.proto.code;
+    for (code) |ins| try testing.expect(ins.op != .move);
+    // `s = s + i` and `s += i` both combine into `s` (r0) itself.
+    var in_place: usize = 0;
+    for (code) |ins| {
+        if (ins.op == .add and ins.a == 0 and ins.b == 0 and ins.c == 1) in_place += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), in_place);
+}
+
+test "an operand read before code that can write it keeps its value" {
+    // `bump` writes `a` through its open upvalue. An operand evaluated
+    // before the call is copied first, so it is the value before the call.
+    const prelude =
+        \\local a = 1
+        \\local function bump() a = 10 return 0 end
+        \\
+    ;
+    try testing.expectEqual(@as(i64, 1), (try runScalar(prelude ++ "return a + bump()")).asInt());
+    try testing.expectEqual(@as(i64, 10), (try runScalar(prelude ++ "return bump() + a")).asInt());
+    try testing.expectEqual(@as(i64, 1), (try runScalar(prelude ++ "a = a + bump() return a")).asInt());
+    try testing.expectEqual(@as(i64, 1), (try runScalar(prelude ++ "a += bump() return a")).asInt());
+    // The value is evaluated before the target's key, so the key is `a`
+    // after the call.
+    try testing.expectEqual(@as(i64, 0), (try runScalar(prelude ++ "local t = {} t[a] = bump() return t[10]")).asInt());
+    // A store's value is copied before a target prefix that runs code.
+    try testing.expectEqual(@as(i64, 2), (try runScalar(
+        \\local t = {}
+        \\local v = 2
+        \\local function get() v = 99 return t end
+        \\get().k = v
+        \\return t.k
+    )).asInt());
+    // A value that writes its destination before reading the local's old
+    // value goes through a temporary.
+    try testing.expectEqual(@as(i64, 5), (try runScalar("local x = 5 x = {x} return x[1]")).asInt());
+    try testing.expect(!(try runScalar("local y, z = false, 7 z = y and z return z")).asBool());
+    try testing.expectEqual(@as(i64, 7), (try runScalar("local z = 7 z = nil or z return z")).asInt());
+    // An `__index` function that writes the local runs after the in-place
+    // read of an earlier operand only when that operand was copied.
+    try testing.expectEqual(@as(i64, 1), (try runScalar(
+        \\local a = 1
+        \\local mt = setmetatable({}, {__index = function() a = 42 return 0 end})
+        \\return a + mt.x
     )).asInt());
 }
 
