@@ -1340,6 +1340,18 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
 
+                // ---- doc 63 §5.1: host calls (semantics land in Phase 2c) ----
+                // Until then `guard_native` always fails, through its full
+                // snapshot S_B: tier-0 resumes at B and makes the call itself,
+                // exactly once. Finalize places `guard_native` immediately
+                // before every `call_host`, so the other three are never
+                // reached.
+                .guard_native => {
+                    if (record) rec.exit(i, .guard, values[ins.a]);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                .call_host, .guard_host_epoch, .host_result => unreachable,
+
                 // ---- close: commit the loop-carried writes, then iterate ----
                 .loop => {
                     // φ writeback: a slot-bound φ flushes its update to the register
@@ -1421,6 +1433,10 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                 // snapshot for — keeps that inventory honest.
                 std.debug.assert(trace_ir.requiresPreciseSnapshot(ins.op));
                 const s = t.snapshots[ins.snap - 1];
+                // Doc 63 §5.2: a coherent snapshot (a host op's, by finalize's
+                // placement rule) has no vector: the slab is already the
+                // truth, and this loop writes nothing.
+                std.debug.assert(!s.coherent or (trace_ir.isHostCoherentOp(ins.op) and s.slots_len == 0));
                 for (t.snapshot_slots[s.slots_begin..][0 .. s.slots_len]) |ss| {
                     // Every captured ref precedes the failing op (validated at
                     // finalize), so `values[ref]` is this iteration's value.

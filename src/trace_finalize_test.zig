@@ -36,6 +36,8 @@ const Scratch = struct {
     // builder's snapshot arrays to the code. The fixture stays entry-replay.
     precise: bool = false,
     snap_builder: @import("trace_snapshot.zig").Builder = .{ .gpa = undefined, .budget = .{} },
+    // Doc 63 §5.1: the precise recording's host call sites.
+    host_sites: std.ArrayListUnmanaged(ir.HostCallSite) = .empty,
     // Doc 56 §4.2: the ordinary recording's exit-snapshot state. The
     // default fixture has no body bytecodes (`cur_ord == 0`), so finalize
     // attaches no exit snapshots.
@@ -45,7 +47,7 @@ const Scratch = struct {
     exit_snap_by_ord: std.ArrayListUnmanaged(ir.SnapIdx) = .empty,
 
     fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
-        inline for (.{ "instrs", "consts", "entry_slots", "input_seeds", "exit_prov", "rec_path", "pending_stores", "lane_pins", "exit_snap_by_ord" }) |field|
+        inline for (.{ "instrs", "consts", "entry_slots", "input_seeds", "exit_prov", "rec_path", "pending_stores", "lane_pins", "exit_snap_by_ord", "host_sites" }) |field|
             @field(self, field).deinit(gpa);
     }
 };
@@ -443,4 +445,210 @@ test "doc 61 §5 site 2: the dead-φ filter has no width cap" {
     const live = finalizer.phiLiveRow(&scratch, &buf);
     try std.testing.expect(finalizer.phiWritebackKept(&scratch, 0, live));
     try std.testing.expect(!finalizer.phiWritebackKept(&scratch, 299, live));
+}
+
+// ---------------------------------------------------------------------------
+// Doc 63 §5.2: host calls and coherent snapshots through finalize
+// ---------------------------------------------------------------------------
+
+/// A three-register window and a call at B = 1: `r0 = r0(r1)`.
+const host_b: u32 = 1;
+const host_site: ir.HostCallSite = .{ .a = 0, .nargs = 1, .nwanted = 1, .b_pc = host_b, .preflush_snap = 1 };
+
+/// The well-formed run, snapshots S_B = 1 (full; it restores r2 from %0, so
+/// a restore is visible), C_B = 2, C_B1 = 3:
+///   %0..%2 slot_load r0..r2, %3 guard_gc,
+///   %4 guard_native %0 k0 (S_B), %5 call_host site 0 (C_B),
+///   %6 guard_host_epoch site 0 (C_B1), %7 host_result site 0 [0] (C_B1).
+const host_instrs = [_]ir.IrInstr{
+    .{ .op = .slot_load, .aux = 0 },
+    .{ .op = .slot_load, .aux = 1 },
+    .{ .op = .slot_load, .aux = 2 },
+    .{ .op = .guard_gc },
+    .{ .op = .guard_native, .a = 0, .aux = 0, .snap = 1 },
+    .{ .op = .call_host, .a = 0, .snap = 2 },
+    .{ .op = .guard_host_epoch, .a = 0, .snap = 3 },
+    .{ .op = .host_result, .a = 0, .aux = 0, .ty = .int, .snap = 3 },
+};
+
+const host_snaps = [_]trace_snapshot.Snapshot{
+    .{ .resume_pc = host_b, .slots_begin = 0, .slots_len = 3, .register_count = 3 },
+    .{ .resume_pc = host_b, .slots_begin = 0, .slots_len = 0, .register_count = 3, .coherent = true },
+    .{ .resume_pc = host_b + 1, .slots_begin = 0, .slots_len = 0, .register_count = 3, .coherent = true },
+};
+
+fn hostScratch(gpa: std.mem.Allocator, scratch: *Scratch, proto: *const bytecode.Proto) !void {
+    try scratch.instrs.appendSlice(gpa, &host_instrs);
+    try scratch.consts.append(gpa, Value.int(0));
+    try scratch.host_sites.append(gpa, host_site);
+    scratch.anchor = .{ .proto = proto, .pc = 0, .proto_id = proto.id };
+    scratch.anchor_num_registers = 3;
+    scratch.precise = true;
+    scratch.guard_gc_ref = 3;
+    scratch.snap_builder = trace_snapshot.Builder.init(gpa, .{});
+    scratch.snap_builder_init = true;
+    try std.testing.expectEqual(@as(ir.SnapIdx, 1), try scratch.snap_builder.add(host_b, 3, &.{
+        .{ .slot = 0, .ref = 0 }, .{ .slot = 1, .ref = 1 }, .{ .slot = 2, .ref = 0 },
+    }));
+    try std.testing.expectEqual(@as(ir.SnapIdx, 2), try scratch.snap_builder.addCoherent(host_b, 3));
+    try std.testing.expectEqual(@as(ir.SnapIdx, 3), try scratch.snap_builder.addCoherent(host_b + 1, 3));
+}
+
+fn hostProto() bytecode.Proto {
+    return .{ .code = &exit_proto_code, .name = "host-finalize", .id = 63, .num_registers = 3 };
+}
+
+test "doc 63 finalize: a well-formed host run commits with its sites and coherent snapshots" {
+    const gpa = std.testing.allocator;
+    const proto = hostProto();
+    var scratch: Scratch = .{};
+    defer scratch.deinit(gpa);
+    try hostScratch(gpa, &scratch, &proto);
+    defer scratch.snap_builder.deinit();
+    var candidate = try finalizer.finalize(gpa, &scratch, .{ .optimize = false });
+    defer candidate.deinit(gpa);
+    const c = candidate.getCode().?;
+    try std.testing.expectEqual(@import("trace_snapshot.zig").DeoptMode.precise, c.deopt_mode);
+    try std.testing.expectEqualSlices(ir.HostCallSite, &.{host_site}, c.host_sites);
+    try std.testing.expectEqual(@as(usize, 3), c.snapshots.len);
+    try std.testing.expect(!c.snapshots[0].coherent);
+    try std.testing.expect(c.snapshots[1].coherent and c.snapshots[2].coherent);
+    // The code owns its copy of the sites.
+    scratch.host_sites.items[0].b_pc = 99;
+    try std.testing.expectEqual(host_b, c.host_sites[0].b_pc);
+}
+
+test "doc 63 finalize: the placement rule rejects each malformed host run" {
+    // The well-formed run passes; each case breaks exactly one clause.
+    try std.testing.expect(finalizer.hostPlacementValid(&host_instrs, &host_snaps, &.{host_site}));
+
+    const Case = struct { name: []const u8, at: ?usize = null, ins: ir.IrInstr = undefined, site: ir.HostCallSite = host_site, extra_site: bool = false, snap_at: ?usize = null, snap: trace_snapshot.Snapshot = undefined };
+    const cases = [_]Case{
+        .{ .name = "coherent snapshot on a non-host op", .at = 4, .ins = .{ .op = .guard_native, .a = 0, .aux = 0, .snap = 2 } },
+        .{ .name = "call_host without guard_native", .at = 4, .ins = .{ .op = .guard_int, .a = 0, .snap = 1 } },
+        .{ .name = "call_host through a full snapshot", .at = 5, .ins = .{ .op = .call_host, .a = 0, .snap = 1 } },
+        .{ .name = "call_host's coherent snapshot resumes at B + 1", .at = 5, .ins = .{ .op = .call_host, .a = 0, .snap = 3 } },
+        .{ .name = "epoch guard resumes at B", .at = 6, .ins = .{ .op = .guard_host_epoch, .a = 0, .snap = 2 } },
+        .{ .name = "epoch guard missing", .at = 6, .ins = .{ .op = .host_result, .a = 0, .aux = 0, .ty = .int, .snap = 3 } },
+        .{ .name = "result of unknown type", .at = 7, .ins = .{ .op = .host_result, .a = 0, .aux = 0, .ty = .unknown, .snap = 3 } },
+        .{ .name = "result out of order", .at = 7, .ins = .{ .op = .host_result, .a = 0, .aux = 1, .ty = .int, .snap = 3 } },
+        .{ .name = "result names another site", .at = 7, .ins = .{ .op = .host_result, .a = 1, .aux = 0, .ty = .int, .snap = 3 } },
+        .{ .name = "call names a site out of order", .at = 5, .ins = .{ .op = .call_host, .a = 1, .snap = 2 } },
+        .{ .name = "fewer results than wanted", .site = .{ .a = 0, .nargs = 1, .nwanted = 2, .b_pc = host_b, .preflush_snap = 1 } },
+        .{ .name = "preflush is not guard_native's snapshot", .site = .{ .a = 0, .nargs = 1, .nwanted = 1, .b_pc = host_b, .preflush_snap = 2 } },
+        .{ .name = "S_B does not resume at B", .site = .{ .a = 0, .nargs = 1, .nwanted = 1, .b_pc = 0, .preflush_snap = 1 } },
+        .{ .name = "arguments overrun the window", .site = .{ .a = 1, .nargs = 2, .nwanted = 1, .b_pc = host_b, .preflush_snap = 1 } },
+        .{ .name = "results overrun the window", .site = .{ .a = 2, .nargs = 0, .nwanted = 2, .b_pc = host_b, .preflush_snap = 1 } },
+        .{ .name = "a site no call names", .extra_site = true },
+        .{ .name = "guard_native's snapshot is coherent", .snap_at = 0, .snap = .{ .resume_pc = host_b, .slots_begin = 0, .slots_len = 0, .register_count = 3, .coherent = true } },
+    };
+    for (cases) |c| {
+        var instrs = host_instrs;
+        if (c.at) |at| instrs[at] = c.ins;
+        var snaps = host_snaps;
+        if (c.snap_at) |at| snaps[at] = c.snap;
+        const sites = [_]ir.HostCallSite{ c.site, host_site };
+        const n_sites: usize = if (c.extra_site) 2 else 1;
+        if (finalizer.hostPlacementValid(&instrs, &snaps, sites[0..n_sites])) {
+            std.debug.print("accepted: {s}\n", .{c.name});
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // A stray coherent exit after the run: an ordinary guard through C_B1.
+    var tail: [host_instrs.len + 1]ir.IrInstr = undefined;
+    @memcpy(tail[0..host_instrs.len], &host_instrs);
+    tail[host_instrs.len] = .{ .op = .guard_int, .a = 7, .snap = 3 };
+    try std.testing.expect(!finalizer.hostPlacementValid(&tail, &host_snaps, &.{host_site}));
+}
+
+test "doc 63 tier-1a: until Phase 2c a host run fails closed at guard_native, through S_B" {
+    const gpa = std.testing.allocator;
+    const proto = hostProto();
+    var scratch: Scratch = .{};
+    defer scratch.deinit(gpa);
+    try hostScratch(gpa, &scratch, &proto);
+    defer scratch.snap_builder.deinit();
+    var candidate = try finalizer.finalize(gpa, &scratch, .{ .optimize = false });
+    defer candidate.deinit(gpa);
+    const c = candidate.getCode().?;
+
+    // A heap, so the prologue's `guard_gc` passes.
+    var heap = @import("gc.zig").Heap.init(gpa);
+    defer heap.deinit();
+    var regs = [_]Value{ Value.int(10), Value.int(20), Value.int(30) };
+    var values: [16]Value = undefined;
+    const r = @import("irinterp.zig").executeValuesCtx(.{ .heap = &heap }, c, &regs, values[0..c.instrs.len]);
+    // The exit is the guard, before the call: a full precise resume at B,
+    // so tier-0 makes the call itself, once.
+    try std.testing.expectEqual(@import("trace_exec.zig").ExitReason.precise_resume, r.exit_reason);
+    try std.testing.expectEqual(@as(u32, 4), r.exit_instr);
+    try std.testing.expectEqual(@as(u32, 1), r.snapshot_id);
+    try std.testing.expectEqual(@as(u32, 0), r.runtime_error);
+    try std.testing.expectEqual(host_b, c.snapshots[r.snapshot_id - 1].resume_pc);
+    // S_B was restored: r2 now holds %0's value.
+    try std.testing.expectEqual(@as(i64, 10), regs[2].asInt());
+    try std.testing.expectEqual(@as(i64, 20), regs[1].asInt());
+}
+
+test "doc 63 native admission: host runs stay on tier-1a, and only host ops take coherent snapshots" {
+    const nativegen = @import("nativegen.zig");
+    if (!nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const proto = hostProto();
+    var scratch: Scratch = .{};
+    defer scratch.deinit(gpa);
+    try hostScratch(gpa, &scratch, &proto);
+    defer scratch.snap_builder.deinit();
+    var candidate = try finalizer.finalize(gpa, &scratch, .{ .optimize = false });
+    defer candidate.deinit(gpa);
+    const c = candidate.getCode().?;
+    // Host ops are lowered from Phase 3. (The control at the end shows the
+    // same trace shape compiles without them.)
+    // A precise body's `guard_gc` needs a heap to compile at all.
+    var heap = @import("gc.zig").Heap.init(gpa);
+    defer heap.deinit();
+    try std.testing.expect(nativegen.compileWithHeap(gpa, c, 0, &heap) == null);
+
+    // A coherent snapshot on any other op is refused even without host ops
+    // (a hand-built trace that skipped finalize): `guard_int %0` through C_B1.
+    var instrs = [_]ir.IrInstr{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .slot_load, .aux = 2 },
+        .{ .op = .guard_gc },
+        .{ .op = .guard_int, .a = 0, .snap = 3 },
+        .{ .op = .loop },
+    };
+    var stray = c.*;
+    stray.instrs = &instrs;
+    stray.host_sites = &.{};
+    try std.testing.expect(nativegen.compileWithHeap(gpa, &stray, 0, &heap) == null);
+    // Control: the same guard through the full S_B compiles. Its r1 and r2
+    // are snapshot-only (dead) loads, so this also pins the allocator's
+    // debug check skipping their undefined homes.
+    instrs[4].snap = 1;
+    var ct = nativegen.compileWithHeap(gpa, &stray, 0, &heap) orelse return error.NativeBailedUnexpectedly;
+    ct.deinit();
+}
+
+test "doc 63 finalize: placement and site-ownership failures refuse the candidate" {
+    const gpa = std.testing.allocator;
+    const proto = hostProto();
+    {
+        // A precise recording whose run breaks the rule.
+        var scratch: Scratch = .{};
+        defer scratch.deinit(gpa);
+        try hostScratch(gpa, &scratch, &proto);
+        defer scratch.snap_builder.deinit();
+        scratch.instrs.items[6].snap = 2; // the epoch guard resumes at B
+        try std.testing.expectError(error.InvalidSnapshotMetadata, finalizer.finalize(gpa, &scratch, .{ .optimize = false }));
+    }
+    {
+        // Host sites on an ordinary recording.
+        var scratch: Scratch = .{};
+        defer scratch.deinit(gpa);
+        try scratch.host_sites.append(gpa, host_site);
+        try std.testing.expectError(error.InvalidSnapshotMetadata, finalizer.finalize(gpa, &scratch, .{ .optimize = false }));
+    }
 }

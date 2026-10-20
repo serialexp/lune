@@ -45,11 +45,9 @@ pub fn konstKey(v: value_mod.Value) KonstKey {
     };
 }
 
-/// Index into the (future) per-guard snapshot table. Still a RESERVED
-/// placeholder (checked 2026-09: no producer writes a non-default value and no
-/// consumer reads it) — kept deliberately so per-guard snapshot deopt can land
-/// as a body to fill in, not a trace-schema change. Serialized as-is by
-/// traceser. See docs/design/01-trace-lifecycle.md.
+/// One-based index into a precise trace's `TraceCode.snapshots` (doc 45 D2);
+/// 0 = none. Ordinary traces keep it 0 and find their sparse exit snapshots
+/// through `ord` instead (doc 56). Serialized as-is by traceser.
 pub const SnapIdx = u32;
 
 /// The type the recorder *observed* for a value, and therefore the type a guard
@@ -738,7 +736,52 @@ pub const IrOp = enum(u8) {
     guard_is_nil,
     guard_is_false,
     guard_is_true,
+
+    // ---- doc 63 §5.1: host calls from a precise trace ----
+    //
+    // For a call at bytecode B the recorder emits exactly
+    // `guard_native, call_host, guard_host_epoch, host_result × nwanted`,
+    // nothing in between. Precise traces only. Declared in Phase 2a so
+    // finalize can check the coherent-snapshot placement rule (§5.2);
+    // nothing records them yet, and both executors refuse them until
+    // Phase 2c (tier-1a) and Phase 3 (native). Wire ordinals 93–96.
+
+    /// `a` = callee ref, `aux` = const index of the `Native`. Passes when the
+    /// callee is exactly that native and its `disturbs` count is below the
+    /// threshold. `snap` = S_B, the full snapshot at B.
+    guard_native,
+    /// `a` = index into `TraceCode.host_sites`. Calls the host function once.
+    /// An ordered effect root. `snap` = C_B, the coherent failure snapshot;
+    /// the preflush materializes `host_sites[a].preflush_snap` (S_B).
+    call_host,
+    /// `a` = site index, `aux` = A_rem. Exits when the epoch moved or the
+    /// remaining allocation budget is spent. `snap` = C_B1, coherent.
+    guard_host_epoch,
+    /// `a` = site index, `aux` = result index; `ty` is the observed type.
+    /// Checks the result's tag, then loads it. `snap` = C_B1, coherent.
+    host_result,
 };
+
+/// Doc 63 §5.1: one host call site of a precise trace, indexed by
+/// `call_host`/`guard_host_epoch`/`host_result`'s `a`. Read-only at run time.
+pub const HostCallSite = struct {
+    /// Callee register; results land at `a ..`.
+    a: u16,
+    nargs: u16,
+    nwanted: u16,
+    /// The call's bytecode, B.
+    b_pc: u32,
+    /// S_B, materialized before the call (§5.5).
+    preflush_snap: SnapIdx,
+};
+
+/// Doc 63 §5.2: the ops that may reference a coherent snapshot.
+pub fn isHostCoherentOp(op: IrOp) bool {
+    return switch (op) {
+        .call_host, .guard_host_epoch, .host_result => true,
+        else => false,
+    };
+}
 
 /// Doc 57: the primitive a `guard_is_*` pins, or null for any other op.
 pub fn primPinValue(op: IrOp) ?value_mod.Value {
@@ -862,8 +905,9 @@ pub fn isSideExitGuardOp(op: IrOp) bool {
 
 /// Every IR op that changes guest-visible state: the heap stores (`astore`,
 /// `astore_append`, `hstore`, `gstore`), the closed-cell store (`ustore`),
-/// the deferred gmatch position store (`sgm_setpos`) and the precise-only
-/// table effects (`tnew`, `tset`). An exit with none of these before it can
+/// the deferred gmatch position store (`sgm_setpos`), the precise-only
+/// table effects (`tnew`, `tset`) and the host call (`call_host`, doc 63
+/// §5.1). An exit with none of these before it can
 /// be re-run from the trace's entry state without doing anything twice
 /// (`exitIsPreEffect`); a bridge exit with one after it would drop a sunk
 /// store (`TraceCode.classifyBridgeCandidate`). The same set as
@@ -872,6 +916,7 @@ pub fn isSideExitGuardOp(op: IrOp) bool {
 pub fn isStateEffectOp(op: IrOp) bool {
     return switch (op) {
         .astore, .astore_append, .hstore, .gstore, .ustore, .sgm_setpos, .tnew, .tset => true,
+        .call_host => true,
         else => false,
     };
 }
@@ -901,6 +946,7 @@ pub fn requiresPreciseSnapshot(op: IrOp) bool {
         .tostr_int, .tostr_num, .slen, .ssub, .srev, .schar1, .srep2, .supper, .slower => true,
         .scp, .sfindp, .smatch, .sgmatch, .scap_int, .scap_str, .str2num_i, .str2num_f, .sgm_setpos => true,
         .tnew, .tset => true,
+        .guard_native, .call_host, .guard_host_epoch, .host_result => true,
         else => false,
     };
 }
@@ -975,6 +1021,12 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .guard_lane => try w.print("%{d}  lane={d}", .{ ins.a, ins.aux }),
         // guard_gc's aux is the allocation bound, not an operand.
         .guard_gc => try w.print("A={d}", .{ins.aux}),
+        // Doc 63 §5.1: the callee ref and the native's constant; the host
+        // site ops carry a site index in `a`, not a ref.
+        .guard_native => try w.print("%{d}  k{d}", .{ ins.a, ins.aux }),
+        .call_host => try w.print("site={d}", .{ins.a}),
+        .guard_host_epoch => try w.print("site={d}  A={d}", .{ ins.a, ins.aux }),
+        .host_result => try w.print("site={d}  [{d}]", .{ ins.a, ins.aux }),
         // ssub's third operand rides aux as a ref (codex #4); scp shares the
         // encoding (doc 26 D3), as do doc 30's sfindp/smatch.
         .ssub, .scp, .sfindp, .smatch => try w.print("%{d}  %{d}  %{d}", .{ ins.a, ins.b, ins.aux }),

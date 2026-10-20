@@ -22,6 +22,12 @@
 //!
 //! `IrInstr.snap` uses 0 for entry replay; POSITIVE values are one-based
 //! indexes into `TraceCode.snapshots` (doc 45 D2).
+//!
+//! Doc 63 §5.2 adds a second precise form, COHERENT: an empty vector that
+//! means "the slab is already the truth". A host call's exits use it after
+//! the call, when the callback may have changed the window; restoring the
+//! pre-call values would overwrite those changes. Executors write nothing for
+//! a coherent record, and finalize confines it to the host-call ops.
 
 const std = @import("std");
 const trace_ir = @import("trace_ir.zig");
@@ -50,6 +56,10 @@ pub const Snapshot = struct {
     slots_len: u32,
     /// The anchor window width this vector covers (`proto.num_registers`).
     register_count: u16,
+    /// Doc 63 §5.2: the slab already holds the state to resume with, so the
+    /// record has no vector (`slots_len == 0`) and executors write nothing.
+    /// `register_count` is still the window width.
+    coherent: bool = false,
 };
 
 /// One captured register: physical `slot` (activation-relative) → the IR ref
@@ -150,6 +160,20 @@ pub const Builder = struct {
         return @intCast(self.records.items.len); // one-based
     }
 
+    /// Doc 63 §5.2: append one COHERENT record. It has no vector, so it
+    /// counts only against `max_records`. Returns the one-based index.
+    pub fn addCoherent(self: *Builder, resume_pc: u32, register_count: u16) Error!SnapIdx {
+        if (self.records.items.len >= self.budget.max_records) return error.SnapshotLimit;
+        try self.records.append(self.gpa, .{
+            .resume_pc = resume_pc,
+            .slots_begin = 0,
+            .slots_len = 0,
+            .register_count = register_count,
+            .coherent = true,
+        });
+        return @intCast(self.records.items.len); // one-based
+    }
+
     /// Doc 56 §4.2: append one SPARSE exit snapshot (only the slots the
     /// recording has written, ascending). Unlike `add`, interning compares
     /// against the MOST RECENT vector only: consecutive guard-bearing
@@ -230,11 +254,13 @@ pub const Builder = struct {
 /// Structural validation shared by finalization and deserialization (doc 45
 /// D2/D8): every record's vector must lie inside the flat array; a precise
 /// (full-window) vector covers every physical register exactly once in
-/// ascending order; `resume_pc` must be inside the anchor proto's code.
+/// ascending order; a coherent record (doc 63 §5.2) has no vector at all;
+/// `resume_pc` must be inside the anchor proto's code.
 /// Returns false rather than an error — callers translate into their own
 /// abort/reject path (finalization aborts recording, the decoder rejects the
 /// file). Ref-definedness at each USE site needs the instruction index and is
-/// checked separately by `refsDefinedAt`.
+/// checked separately by `refsDefinedAt`; where a coherent record may be used
+/// is finalize's placement rule.
 pub fn validate(
     snapshots: []const Snapshot,
     snapshot_slots: []const SnapshotSlot,
@@ -242,9 +268,13 @@ pub fn validate(
 ) bool {
     for (snapshots) |s| {
         if (s.resume_pc >= code_len) return false;
+        if (s.coherent) {
+            if (s.slots_len != 0) return false;
+            continue;
+        }
         if (s.slots_begin > snapshot_slots.len) return false;
         if (snapshot_slots.len - s.slots_begin < s.slots_len) return false;
-        if (s.slots_len != s.register_count) return false; // v1: full window only
+        if (s.slots_len != s.register_count) return false; // full window
         const vec = snapshot_slots[s.slots_begin..][0..s.slots_len];
         for (vec, 0..) |slot, k| {
             // Full window, ascending, exactly once → slot k names register k.
@@ -267,6 +297,7 @@ pub fn validateSparse(
 ) bool {
     for (snapshots) |s| {
         if (s.resume_pc >= code_len) return false;
+        if (s.coherent) return false; // doc 63: a precise-only form
         if (s.slots_begin > snapshot_slots.len) return false;
         if (snapshot_slots.len - s.slots_begin < s.slots_len) return false;
         const vec = snapshot_slots[s.slots_begin..][0..s.slots_len];
@@ -477,6 +508,31 @@ test "validate enforces bounds, full ascending window and resume pc" {
     const dup_slots = [_]SnapshotSlot{ .{ .slot = 1, .ref = 3 }, .{ .slot = 1, .ref = 4 } };
     const dup = [_]Snapshot{.{ .resume_pc = 0, .slots_begin = 0, .slots_len = 2, .register_count = 2 }};
     try testing.expect(!validate(&dup, &dup_slots, 10));
+}
+
+test "doc 63: a coherent record has no vector, keeps its window width, and is precise-only" {
+    var b = Builder.init(testing.allocator, .{ .max_records = 3 });
+    defer b.deinit();
+    const full = [_]SnapshotSlot{ .{ .slot = 0, .ref = 3 }, .{ .slot = 1, .ref = 4 } };
+    try testing.expectEqual(@as(SnapIdx, 1), try b.add(5, 2, &full));
+    try testing.expectEqual(@as(SnapIdx, 2), try b.addCoherent(5, 2));
+    try testing.expectEqual(@as(SnapIdx, 3), try b.addCoherent(6, 2));
+    // It counts against max_records like any record, and adds no slots.
+    try testing.expectError(error.SnapshotLimit, b.addCoherent(7, 2));
+    try testing.expectEqual(@as(usize, 2), b.slots.items.len);
+    const c = b.records.items[1];
+    try testing.expect(c.coherent and c.slots_len == 0 and c.register_count == 2 and c.resume_pc == 5);
+    try testing.expect(validate(b.records.items, b.slots.items, 10));
+    // A coherent record that carries a vector is malformed.
+    const with_vec = [_]Snapshot{.{ .resume_pc = 5, .slots_begin = 0, .slots_len = 2, .register_count = 2, .coherent = true }};
+    try testing.expect(!validate(&with_vec, &full, 10));
+    // Its resume pc is checked as for any record.
+    const bad_pc = [_]Snapshot{.{ .resume_pc = 10, .slots_begin = 0, .slots_len = 0, .register_count = 2, .coherent = true }};
+    try testing.expect(!validate(&bad_pc, &full, 10));
+    // Never a sparse exit snapshot.
+    try testing.expect(!validateSparse(b.records.items[1..2], b.slots.items, 10));
+    // refsDefinedAt has nothing to check.
+    try testing.expect(refsDefinedAt(2, 0, b.records.items, b.slots.items));
 }
 
 test "refsDefinedAt rejects forward refs and out-of-range snap indexes" {

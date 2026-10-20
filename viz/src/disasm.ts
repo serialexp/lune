@@ -62,6 +62,11 @@ function operandsOf(opName: string, a: number, b: number, aux: number): string {
   // Doc 44: terminal prints its kind tag + resume pc (`writeIrInstr` parity).
   if (opName === "terminal") return `${TERMINAL_KIND_NAMES[a] ?? `kind:${a}`} @ ${aux}`;
   if (opName === "konst") return `k${aux}`;
+  // Doc 63: `writeIrInstr` parity — the host site ops carry a site index in a.
+  if (opName === "guard_native") return `%${a}  k${aux}`;
+  if (opName === "call_host") return `site=${a}`;
+  if (opName === "guard_host_epoch") return `site=${a}  A=${aux}`;
+  if (opName === "host_result") return `site=${a}  [${aux}]`;
   // φ: slot-bound prints `update=%b -> r{slot}`; internal prints
   // `init=%a update=%b -> internal` (the loop-carried writeback rides the stream).
   if (opName === "phi") {

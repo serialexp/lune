@@ -344,6 +344,10 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
     // one-based `snap` values and captured refs are final as-is.
     var snap_owned: ?trace_snapshot.Builder.Owned = null;
     errdefer if (snap_owned) |o| o.deinit(gpa);
+    // Doc 63 §5.1: host call sites exist only in a precise recording.
+    var sites_owned: []ir.HostCallSite = &.{};
+    errdefer if (sites_owned.len != 0) gpa.free(sites_owned);
+    if (!rec.precise and rec.host_sites.items.len != 0) return error.InvalidSnapshotMetadata;
     if (rec.precise) {
         // Doc 45 D6 (P2): a precise page never closes `.link` (the recorder
         // refuses both link-close paths) and never peels (`maybeEnterPeel`
@@ -373,6 +377,9 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
                 return error.InvalidSnapshotMetadata;
             }
         }
+        if (!hostPlacementValid(fields.instrs, owned.snapshots, rec.host_sites.items))
+            return error.InvalidSnapshotMetadata;
+        if (rec.host_sites.items.len != 0) sites_owned = try gpa.dupe(ir.HostCallSite, rec.host_sites.items);
     }
 
     // Doc 56 §4.2: tropt zeroed every ordinal whose exits it all removed
@@ -433,6 +440,7 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
         .snapshots = if (snap_owned) |o| o.snapshots else &.{},
         .snapshot_slots = if (snap_owned) |o| o.snapshot_slots else &.{},
         .deopt_mode = if (rec.precise) .precise else .entry_replay,
+        .host_sites = sites_owned,
         .exit_snapshots = if (exit_owned) |o| o.snapshots else &.{},
         .exit_snapshot_slots = if (exit_owned) |o| o.snapshot_slots else &.{},
         .exit_snap_by_ord = exit_by_ord,
@@ -553,6 +561,76 @@ pub fn buildExitProv(
     // future LICM change.
     std.mem.sort(ExitProvEntry, out, {}, exitProvEntryLess);
     return out;
+}
+
+/// Doc 63 §5.2: the placement rule for host calls and coherent snapshots.
+/// Each site's ops form one contiguous run,
+/// `guard_native, call_host, guard_host_epoch, host_result × nwanted`, and:
+///
+/// - the k-th `call_host` names site k, and every site is named once;
+/// - `guard_native` exits through the full snapshot S_B, which is the site's
+///   `preflush_snap` and resumes at B;
+/// - `call_host` exits through a coherent snapshot resuming at B, the
+///   guard and the results through coherent snapshots resuming at B + 1;
+/// - result k has `aux == k` and a concrete observed type;
+/// - the callee, argument and result registers lie inside the window;
+/// - no other op references a coherent snapshot.
+///
+/// So between the call and every coherent exit only loads and compares run,
+/// and the slab is exactly tier-0's state there. Assumes `validate` passed
+/// and every `snap` is in range (the caller's loop checks both).
+pub fn hostPlacementValid(instrs: []const IrInstr, snapshots: []const trace_snapshot.Snapshot, sites: []const ir.HostCallSite) bool {
+    var calls: usize = 0;
+    var i: usize = 0;
+    while (i < instrs.len) : (i += 1) {
+        const ins = instrs[i];
+        if (ins.snap != 0 and snapshots[ins.snap - 1].coherent and !ir.isHostCoherentOp(ins.op)) return false;
+        switch (ins.op) {
+            .guard_native => if (i + 1 >= instrs.len or instrs[i + 1].op != .call_host) return false,
+            .call_host => {
+                const run = hostRunLen(instrs, snapshots, sites, i, calls) orelse return false;
+                calls += 1;
+                i += run - 1;
+            },
+            // Only reachable outside a run: a run is skipped whole.
+            .guard_host_epoch, .host_result => return false,
+            else => {},
+        }
+    }
+    return calls == sites.len;
+}
+
+/// The length of the host run whose `call_host` is at `at` (from the
+/// `call_host` on), or null when it breaks `hostPlacementValid`'s rule.
+fn hostRunLen(instrs: []const IrInstr, snapshots: []const trace_snapshot.Snapshot, sites: []const ir.HostCallSite, at: usize, nth: usize) ?usize {
+    const call = instrs[at];
+    if (call.a != nth or nth >= sites.len) return null;
+    const site = sites[nth];
+    if (at == 0) return null;
+    const guard = instrs[at - 1];
+    if (guard.op != .guard_native or guard.snap == 0 or guard.snap != site.preflush_snap) return null;
+    const s_b = snapshots[guard.snap - 1];
+    if (s_b.coherent or s_b.resume_pc != site.b_pc) return null;
+    const window: u32 = s_b.register_count;
+    if (@as(u32, site.a) + 1 + site.nargs > window or @as(u32, site.a) + site.nwanted > window) return null;
+    if (!coherentAt(snapshots, call.snap, site.b_pc)) return null;
+
+    const run: usize = 2 + @as(usize, site.nwanted);
+    if (at + run > instrs.len) return null;
+    const epoch = instrs[at + 1];
+    if (epoch.op != .guard_host_epoch or epoch.a != nth or !coherentAt(snapshots, epoch.snap, site.b_pc + 1)) return null;
+    for (0..site.nwanted) |k| {
+        const r = instrs[at + 2 + k];
+        if (r.op != .host_result or r.a != nth or r.aux != @as(i32, @intCast(k))) return null;
+        if (r.ty == .unknown or !coherentAt(snapshots, r.snap, site.b_pc + 1)) return null;
+    }
+    return run;
+}
+
+fn coherentAt(snapshots: []const trace_snapshot.Snapshot, snap: ir.SnapIdx, resume_pc: u32) bool {
+    if (snap == 0) return false;
+    const s = snapshots[snap - 1];
+    return s.coherent and s.resume_pc == resume_pc;
 }
 
 fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: usize, input_limit: usize, precise: bool) void {
@@ -703,6 +781,11 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
             // Doc 45 D3 `tset`: reserved — nothing may emit it until the
             // effect-ordering increment lands.
             .tset => unreachable,
+            // Doc 63 §5.1: precise-only. `guard_native` reads the callee ref
+            // and names a constant; the rest carry a site index, which the
+            // placement check bounds (an error there, not an assert).
+            .guard_native => std.debug.assert(precise and ins.a < i and ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < consts_len),
+            .call_host, .guard_host_epoch, .host_result => std.debug.assert(precise),
             // Preheader region boundary (Phase E1): a pure marker, no operands.
             // Structural invariants (at most one; before any φ) are asserted in
             // the global pass below.

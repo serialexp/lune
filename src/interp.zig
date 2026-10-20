@@ -4918,14 +4918,10 @@ pub const Vm = struct {
                 std.debug.assert(snap.register_count == proto.num_registers);
                 std.debug.assert(snap.resume_pc < proto.code.len);
                 self.trace.dbg("precise-error raw: trace={d} native={} exit={d} snap={d} status={d}", .{ ct.id, ran_native, result.exit_instr, result.snapshot_id, result.runtime_error });
-                const err: Error = switch (@as(table_runtime.Status, @enumFromInt(result.runtime_error))) {
-                    .out_of_memory => Error.OutOfMemory,
-                    // `.ok` cannot reach here (the executor only sets
-                    // `runtime_error` on failure); `.type_error` is
-                    // unrepresentable this slice (`tnew` never returns it —
-                    // it arrives with `tset`).
-                    .ok, .type_error => unreachable,
-                };
+                // `.ok` cannot reach here: the executor sets `runtime_error`
+                // only on failure. Today only `tnew` and the string helpers
+                // fail (`out_of_memory`); doc 63's host call adds the rest.
+                const err: Error = table_runtime.toError(@enumFromInt(result.runtime_error));
                 self.trace.dbg("precise-error: trace={d} exit={d} snap={d} raise_pc={d} status={d}", .{ ct.id, result.exit_instr, result.snapshot_id, snap.resume_pc, result.runtime_error });
                 self.trace.precise_errors +|= 1;
                 wctx.dead.retire(&self.trace);

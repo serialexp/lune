@@ -196,6 +196,11 @@ pub fn resumeClass(op: IrOp) ResumeClass {
         .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower, .scap_str => .neutral,
         .astore, .hstore, .gstore, .ustore => .flush_store,
         .astore_append, .sgm_setpos, .tnew, .tset => .effect,
+        // Doc 63 §5.1: the host call is an effect. The checks around it
+        // change nothing themselves; the call before them is what makes its
+        // bytecode unsafe to re-run.
+        .call_host => .effect,
+        .guard_native, .guard_host_epoch, .host_result => .neutral,
         .loop, .phi, .preheader, .link, .terminal => .structural,
     };
 }

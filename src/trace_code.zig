@@ -481,6 +481,10 @@ pub const TraceCode = struct {
     /// entry replay (the historical contract) or per-bytecode precise deopt
     /// via `snapshots`. Arm/dispatch validation must check this, not infer it.
     deopt_mode: trace_snapshot.DeoptMode = .entry_replay,
+    /// Doc 63 §5.1: the host call sites of a precise trace, indexed by the
+    /// host ops' `a`. Empty on every other trace. Read-only at run time.
+    /// Owned; freed in `deinit`.
+    host_sites: []trace_ir.HostCallSite = &.{},
     /// Doc 56 §4.2: the SPARSE exit snapshots of an ordinary (`entry_replay`)
     /// trace — per guard-bearing bytecode, the `.def` anchor-window slots
     /// mapped to committed IR refs, resuming at that bytecode. Kept apart
@@ -527,6 +531,7 @@ pub const TraceCode = struct {
         if (self.bridge_cand.len != 0) gpa.free(self.bridge_cand);
         if (self.snapshots.len != 0) gpa.free(self.snapshots);
         if (self.snapshot_slots.len != 0) gpa.free(self.snapshot_slots);
+        if (self.host_sites.len != 0) gpa.free(self.host_sites);
         if (self.exit_snapshots.len != 0) gpa.free(self.exit_snapshots);
         if (self.exit_snapshot_slots.len != 0) gpa.free(self.exit_snapshot_slots);
         if (self.exit_snap_by_ord.len != 0) gpa.free(self.exit_snap_by_ord);

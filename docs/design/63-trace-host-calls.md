@@ -1,12 +1,13 @@
 # 63 — Traces call host functions directly — Design
 
-Status: partial — prerequisites, Phase 0 (benchmark and budget) and
-Phase 1 (epoch, disturbance and suspension, inert) landed; no host call
-is traced yet. Revision 6, approved by Codex and Antigravity
+Status: partial — prerequisites, Phase 0 (benchmark and budget),
+Phase 1 (epoch, disturbance and suspension, inert) and Phase 2a
+(coherent snapshots, the host ops and statuses, inert) landed; no host
+call is traced yet. Revision 6, approved by Codex and Antigravity
 (confirmation round 6, receipts `docs/reviews/doc63/*-rev6.md`).
 Q1–Q5 decided by Bart (2026-10-10; §9). Review history in §11–§15.
-Prerequisites A and B, Phase 0 and Phase 1 done, with the §5.9.2
-region-accounting amendment. Phases 2–4 not started.
+Prerequisites A and B, Phase 0, Phase 1 (with the §5.9.2
+region-accounting amendment) and Phase 2a done. Phases 2b–4 not started.
 Owner: Bart
 Last updated: 2026-10-20
 
@@ -92,14 +93,22 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   for now (Bart, 2026-10-20). Phase 2c adds suspension to the same
   funnel and changes `opCall`'s register allocation again, so the cost
   is measured again there (Phase 2c item).
-
-### Outstanding
-
-- [ ] **Phase 2a — slab-coherent snapshots and the host statuses (inert).**
+- [x] **Phase 2a — slab-coherent snapshots and the host statuses (inert).**
   The snapshot form, its validation, finalize placement rules, admission,
   both executors and both dispatcher consumers (§5.2); the status
   ordinals (§5.8). Tested with hand-built IR before any recording emits
-  them.
+  them. Done 2026-10-20; see §5.2.1.
+  - The four §5.1 ops are declared in 2a, so the placement rule has
+    something to name (Bart, 2026-10-20). Wire ordinals 93–96, mirrored
+    in viz. Nothing records them.
+  - They execute from Phase 2c (tier-1a) and Phase 3 (native). Until
+    then tier-1a's `guard_native` always fails through S_B, and native
+    admission refuses any trace containing one.
+  - So the coherent-exit paths are asserted but first exercised end to
+    end in 2c and 3.
+  - Fixed on the way: a pre-existing bug in `nativegen_alloc`'s debug
+    check, which read the undefined home of every snapshot-only slot.
+
 - [ ] **Phase 2b — GC lifetime across a callback.** Native constants in
   the weak pools; Phase Q's transaction split into logical invalidation
   and deferred physical work, released only when no suspension and no
@@ -113,6 +122,11 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   `guard_host_epoch`, `host_result` (§5.1); host calls force precise
   recording (§5.3); the tier-1a arms; exactly-once tests across the ten
   equivalence legs and every route in §5.4.
+  - Replace tier-1a's fail-closed `guard_native` arm and the
+    `unreachable` arms for the other three ops (§5.2.1).
+  - Exercise the coherent exits end to end in tier-1a: the epoch, result
+    tag and failure exits write nothing and resume or raise where §5.4
+    says.
   - Measure `callHostNative`'s `disturbs` cost again on `bench/` and the
     §8.1 probe once the funnel raises and lowers suspension. With
     threshold 1, `disturbs` is a sticky bit; try folding its check into
@@ -123,6 +137,10 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   shim as a body callout, the post-call epoch and budget checks, the
   `host_result` tag checks and loads, the coherent exits, the call-site
   rooting rule in `nativegen_alloc` (§5.7). Budget met (§8).
+  - Lift admission's refusal of the four ops (§5.2.1), keeping its rule
+    that only they may take coherent snapshots.
+  - Exercise the coherent materializer end to end: it stores nothing and
+    falls through to the family tail.
 - [ ] **Phase 4 — leaf host functions** (§5.12; Q3: part of this plan).
 - [ ] **Docs.** Amend doc 00, doc 02 and doc 59 (§3.5, E6) with Phase 2c;
   doc 45's error contract (the host statuses, the coherent snapshot);
@@ -426,6 +444,96 @@ A new snapshot form, **coherent**:
 
 Doc 56's sparse exit snapshots are a different thing (ordinary traces,
 exit adapters) and stay separate; precise consumers never see them.
+
+### 5.2.1 As landed: Phase 2a (2026-10-20)
+
+Inert: nothing records a host op, so no committed trace contains one.
+
+**The ops.** The four §5.1 ops are appended at wire ordinals 93–96
+(`trace_ir.zig`, `traceser_test.zig`, `viz/src/enums.ts`), with
+`HostCallSite` and `TraceCode.host_sites` (owned, copied by finalize
+from the recorder's `host_sites`).
+
+- `call_host` is in `isStateEffectOp`.
+- All four are in `requiresPreciseSnapshot`, and none is in
+  `isSideExitGuardOp`, because their exits are not side-trace evidence.
+- `tropt` treats them like `tnew`: precise-only, so unreachable.
+
+Declaring the ops in 2a was Bart's choice (2026-10-20). The placement
+rule has nothing to name otherwise.
+
+**Snapshots** (`trace_snapshot.zig`):
+
+- `Snapshot.coherent`, set only by `Builder.addCoherent`, which adds no
+  slots and counts against `max_records`.
+- `validate` requires `slots_len == 0` for a coherent record.
+- `validateSparse` rejects coherent records, since they are precise-only.
+
+**Placement** (`trace_finalize.hostPlacementValid`) is §5.2's rule made
+exact. Each site is one contiguous run, `guard_native, call_host,
+guard_host_epoch, host_result × nwanted`, and:
+
+- the k-th `call_host` names site k, and every site is named once;
+- `guard_native`'s full snapshot is the site's `preflush_snap` and
+  resumes at B;
+- `call_host` exits through a coherent snapshot resuming at B;
+- the guard and the results exit through coherent snapshots resuming at
+  B + 1;
+- result k has `aux == k` and a concrete type;
+- the callee, argument and result registers fit the window;
+- no other op uses a coherent snapshot.
+
+Host sites on an ordinary recording also refuse the candidate.
+
+**Executors.**
+
+- Tier-1a's restore tail and native's `emitPreciseSnapshotFlush` write
+  nothing for a coherent snapshot. Both assert the placement rule.
+- Native admission accepts a coherent snapshot only on a host op, and
+  for now refuses every trace containing a host op (Phase 3 lowers
+  them).
+- Tier-1a's `guard_native` arm fails closed through S_B. Tier-0 then
+  resumes at B and makes the call once.
+- The other three tier-1a arms are `unreachable`, because finalize
+  places `guard_native` immediately before every `call_host`. Phase 2c
+  replaces all four.
+
+**Statuses.** `table_runtime.Status` gains `lua_error = 3` and
+`stack_overflow = 4`. The ordinal test pins all five. `toError` decodes
+them to tier-0's errors, and the dispatcher's `.precise_error` consumer
+uses it. The resume consumer needed no change: it checks only
+`register_count`, which a coherent record keeps.
+
+`stralloc.StrResult`'s comptime check used to require every `Status`
+ordinal to sit below `fail_limit` (`@alignOf(GcHeader)`, which is 4 on
+wasm32). `stack_overflow = 4` broke the wasm build. The check now covers
+only the words a string shim returns (decline and OOM), which is the
+invariant it states.
+
+**Schema.** Snapshot records are not serialized. `traceser` refuses
+precise traces (doc 45 D8's interim), so there is no doc 04 change yet.
+
+**Tests.**
+
+- `trace_snapshot.zig`: the coherent form, its budget and validation.
+- `trace_finalize_test.zig`:
+  - a well-formed run commits with its sites and coherent snapshots;
+  - a table of 17 malformed runs is each rejected (mutation-checked),
+    plus a stray coherent guard after the run;
+  - finalize refuses a broken run, and host sites on an ordinary
+    recording;
+  - tier-1a's fail-closed exit restores S_B;
+  - native refuses a host run and a stray coherent snapshot, with a
+    control.
+- `table_runtime.zig`: ordinals and decoding.
+
+**Found on the way: a pre-existing bug.** `nativegen_alloc`'s debug
+invariant check that slot homes are register-disjoint did not skip
+snapshot-only (`.none`) slots. Their `home` is `undefined`, so the check
+read undefined memory, and two dead window slots could "collide" and
+abort a Debug build. Release builds were unaffected; the check is
+compiled out there. It now skips them, as the allocation loop does. The
+native test's control (two dead slots) pins it.
 
 ### 5.3 Recording: host calls make the trace precise
 

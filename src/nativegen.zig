@@ -219,10 +219,22 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
         if (terminal != .loop) return null;
         if (t.peeled) return null;
         for (t.instrs, 0..) |ins, idx| {
+            // Doc 63 §5.1: host calls are lowered from Phase 3. Until then a
+            // trace containing one stays on tier-1a.
+            switch (ins.op) {
+                .guard_native, .call_host, .guard_host_epoch, .host_result => return null,
+                else => {},
+            }
             if (ins.snap != 0) {
                 if (ins.snap > t.snapshots.len) return null;
                 const rec = t.snapshots[ins.snap - 1];
-                if (rec.slots_len != rec.register_count) return null; // v1: full window
+                // Doc 63 §5.2: a coherent record has no vector and belongs to
+                // a host op only.
+                if (rec.coherent) {
+                    if (!trace_ir.isHostCoherentOp(ins.op) or rec.slots_len != 0) return null;
+                    continue;
+                }
+                if (rec.slots_len != rec.register_count) return null; // full window
                 if (@as(usize, rec.slots_begin) + rec.slots_len > t.snapshot_slots.len) return null;
                 for (t.snapshot_slots[rec.slots_begin..][0..rec.slots_len]) |ss| {
                     if (ss.ref >= idx) return null; // refs strictly precede the exit
@@ -723,6 +735,13 @@ const PRECISE_FLUSH_STORE_MAX: u32 = 1024;
 fn emitPreciseSnapshotFlush(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, snap: u32) !u32 {
     var stores: u32 = 0;
     const rec = t.snapshots[snap - 1];
+    // Doc 63 §5.2: a coherent snapshot writes nothing — the slab already holds
+    // the state to resume with — so its materializer falls straight through
+    // to the family tail.
+    if (rec.coherent) {
+        std.debug.assert(rec.slots_len == 0);
+        return 0;
+    }
     for (t.snapshot_slots[rec.slots_begin..][0..rec.slots_len]) |ss| {
         const ref: usize = ss.ref;
         const rins = t.instrs[ref];
@@ -1432,8 +1451,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 // unspecified for a u32 return, and Status ordinals are
                 // pinned tiny (see the comptime assert below), so the byte
                 // zero-extend is exact where a 64-bit copy would not be.
-                comptime std.debug.assert(@intFromEnum(table_runtime.Status.ok) == 0 and
-                    @intFromEnum(table_runtime.Status.type_error) < 256);
+                comptime {
+                    std.debug.assert(@intFromEnum(table_runtime.Status.ok) == 0);
+                    for (std.enums.values(table_runtime.Status)) |s| std.debug.assert(@intFromEnum(s) < 256);
+                }
                 try a.movzxRegReg8(.rcx, .rax);
                 try emitCalloutRestore(a, alloc);
                 try a.cmpRegImm32(.rcx, 0);
@@ -2553,6 +2574,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     // ORDER MATTERS: the snapshot id FIRST (it zeroes the
                     // adjacent `runtime_error` dword), then the failure word.
                     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "snapshot_id"), @intCast(pins.snap));
+                    // Doc 63 §5.2: only a host op exits through a coherent
+                    // snapshot (finalize's placement rule; admission refuses
+                    // the rest).
+                    std.debug.assert(!t.snapshots[pins.snap - 1].coherent or trace_ir.isHostCoherentOp(pins.op));
                     if (pins.op == .tnew or isStrAllocOp(pins.op))
                         try a.movMemReg32(.rdx, @offsetOf(NativeResult, "runtime_error"), .rcx);
                     const ml = mat[pins.snap - 1] orelse blk: {

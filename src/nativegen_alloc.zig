@@ -1322,7 +1322,9 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         var seen: u16 = 0;
         var seen_xmm: u16 = 0;
         for (slots.items) |s| {
-            if (s.class == .write_only or s.pin_only) continue;
+            // A `.none` (snapshot-only) slot has no home: its `home` is
+            // undefined, exactly as the allocation loop above leaves it.
+            if (s.class == .write_only or s.pin_only or s.kind == .none) continue;
             switch (s.home) {
                 .reg => |r| {
                     const b = regBit(r);

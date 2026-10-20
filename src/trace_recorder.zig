@@ -988,6 +988,10 @@ pub const RecordingSession = struct {
     snap_builder_init: bool = false,
     snap_scratch: []trace_snapshot.SnapshotSlot = &.{},
     cur_snap: trace_ir.SnapIdx = 0,
+    /// Doc 63 §5.1: the precise recording's host call sites, indexed by the
+    /// host ops' `a`. Nothing appends to it until Phase 2c; finalize copies
+    /// it into `TraceCode.host_sites`.
+    host_sites: std.ArrayListUnmanaged(trace_ir.HostCallSite) = .empty,
     /// Doc 45 D2: whether the precise entry prologue (full slot_load map +
     /// eager guard_gc) has been emitted yet this recording. Deferred to the
     /// first body `recordInstr`; cleared in `reset`.
@@ -6144,6 +6148,7 @@ pub const RecordingSession = struct {
         if (self.reg_map.len != 0) gpa.free(self.reg_map);
         if (self.snap_scratch.len != 0) gpa.free(self.snap_scratch);
         if (self.snap_builder_init) self.snap_builder.deinit();
+        self.host_sites.deinit(gpa);
         self.exit_snap_by_ord.deinit(gpa);
         if (self.exit_undo_prev.len != 0) gpa.free(self.exit_undo_prev);
         if (self.exit_undo_stamp.len != 0) gpa.free(self.exit_undo_stamp);
@@ -6202,6 +6207,7 @@ pub const RecordingSession = struct {
         self.precise = false; // doc 45 D2: arm() seeds the anchor memo after reset
         self.force_ordinary = false; // A1' (task 27): arm() sets it from the pending's policy
         self.cur_snap = 0; // doc 45 D2: no boundary exists until the first precise bytecode
+        self.host_sites.clearRetainingCapacity(); // doc 63 §5.1
         self.precise_prologue_done = false; // doc 45 D2: prologue emitted at first body instr
         self.cur_ord = 0; // doc 56 §4.2: first body bytecode opens ordinal 1
         self.exit_ord_overflow = false;

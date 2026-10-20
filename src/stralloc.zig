@@ -72,7 +72,10 @@ pub const StrResult = enum(usize) {
     pub const fail_limit: usize = @alignOf(object.GcHeader);
     comptime {
         // Every Status a shim can report must sit below the pointer range.
-        for (std.enums.values(Status)) |s| std.debug.assert(@intFromEnum(s) < fail_limit);
+        // The shims report only OOM. The other statuses (doc 63's host
+        // statuses among them) never travel in a StrResult, and on wasm32
+        // (`fail_limit` 4) `stack_overflow` would not fit.
+        for ([_]StrResult{ .decline, .oom }) |r| std.debug.assert(@intFromEnum(r) < fail_limit);
     }
 
     pub inline fn ok(h: *object.GcHeader) StrResult {

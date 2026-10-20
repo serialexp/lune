@@ -192,8 +192,10 @@ fn kindOf(op: IrOp) OpKind {
         // around `optimize`, so this pass can never see them. Fail closed
         // rather than invent an optimization class for ops whose entire
         // contract (ordered effect roots, no CSE/DCE/hoist/sink) is "the
-        // optimizer must not touch me".
+        // optimizer must not touch me". Doc 63's host-call ops are
+        // precise-only for the same reason.
         .tnew, .tset => unreachable,
+        .guard_native, .call_host, .guard_host_epoch, .host_result => unreachable,
         // Doc 24 D4: allocating interned-string producers. `.alloc` is a
         // side-effecting VALUE-PRODUCING root class: allocation events are
         // effects on the serialized id stream (`next_obj_id` is byte-compared),

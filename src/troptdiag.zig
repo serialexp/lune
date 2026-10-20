@@ -208,6 +208,10 @@ fn detectDeadCarries(
                 uses[ins.b] += 1;
                 uses[@intCast(ins.aux)] += 1;
             },
+            // Doc 63 §5.1: `guard_native` reads the callee ref `a`; the other
+            // three carry a host-site index in `a`, not a ref.
+            .guard_native => uses[ins.a] += 1,
+            .call_host, .guard_host_epoch, .host_result => {},
         }
     }
 
@@ -336,6 +340,9 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
             // `uref` (doc 43 P5) likewise reads nothing (`aux` = seed slot).
             // `tnew` (doc 45 D3) is operand-free too.
             .slot_load, .konst, .loop, .preheader, .link, .guard_gc, .uref, .terminal, .tnew => false,
+            // Doc 63 §5.1: only `guard_native` reads a ref (the callee).
+            .guard_native => ins.a == idx,
+            .call_host, .guard_host_epoch, .host_result => false,
         };
         if (consumes) {
             found_consumer = true;
