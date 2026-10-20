@@ -145,6 +145,48 @@ const Ident = struct {
     }
 };
 
+/// One key of `next`'s sorted view: its identity (as `Ident`) and its slot.
+/// Ordered exactly as `key_order.keyLessThan` orders keys (tag ordinal, then
+/// heap id, else payload bits), from the stored identity, so a dead heap key
+/// needs no pointer.
+const IterKey = extern struct {
+    tag: value.Tag,
+    _pad: [3]u8 = .{ 0, 0, 0 },
+    id: u32,
+    bits: u64,
+    /// The key's node; valid while the view is (`HashPart.nextLive`).
+    /// Unused (0) for a control value built by `of`.
+    slot: u32 = 0,
+
+    /// Any value, including one no table can hold as a key (a `row_view`
+    /// passed to `next` as the control): it still orders as `keyLessThan`
+    /// orders it.
+    fn of(k: Value) IterKey {
+        if (k.isHeap()) return .{ .tag = k.tag, .id = k.asHeap().id, .bits = 0 };
+        return .{ .tag = k.tag, .id = 0, .bits = k.payload.bits };
+    }
+
+    /// Does node `n` (live or dead) hold this key? The stable-slot invariant.
+    fn names(k: IterKey, n: *const Node) bool {
+        if (n.key_tag != k.tag) return false;
+        return if (k.tag == .heap_ref) n.key_id == k.id else n.key_payload.bits == k.bits;
+    }
+
+    /// Same key: the slot is not part of the identity.
+    fn eql(a: IterKey, b: IterKey) bool {
+        return a.tag == b.tag and a.id == b.id and a.bits == b.bits;
+    }
+
+    fn lessThan(a: IterKey, b: IterKey) bool {
+        if (a.tag != b.tag) return @intFromEnum(a.tag) < @intFromEnum(b.tag);
+        return if (a.tag == .heap_ref) a.id < b.id else a.bits < b.bits;
+    }
+
+    fn less(_: void, a: IterKey, b: IterKey) bool {
+        return a.lessThan(b);
+    }
+};
+
 /// The alignment of the node array: 32, so a 32-byte node never straddles a
 /// 64-byte cacheline.
 pub const node_align: std.mem.Alignment = .@"32";
@@ -162,6 +204,22 @@ pub const HashPart = extern struct {
     live: u32 = 0,
     /// Occupied slots: live + dead. Drives the load test.
     used: u32 = 0,
+    /// `next`'s view of the keys (`nextLive`): the identities and slots of
+    /// the live keys, sorted into the canonical order. Built on the first
+    /// step of a traversal, kept for later traversals of the unchanged
+    /// table, and dropped by a collection. No pointers, so the GC never
+    /// needs to mark it.
+    iter_keys: ?[*]IterKey = null,
+    iter_len: u32 = 0,
+    iter_cap: u32 = 0,
+    /// Index in the view of the key `nextLive` returned last.
+    iter_pos: u32 = 0,
+    /// Cleared when a key becomes live. Removal leaves it set: a removed
+    /// key's node stays (dead) until a rehash, and a rehash only follows an
+    /// insertion, so `nextLive` skips it by its identity.
+    iter_valid: bool = false,
+    /// Sorts performed, so tests can count them.
+    iter_builds: u32 = 0,
 
     pub const empty: HashPart = .{};
     pub const min_capacity: u32 = 4;
@@ -183,6 +241,7 @@ pub const HashPart = extern struct {
 
     pub fn deinit(self: *HashPart, gpa: std.mem.Allocator) void {
         if (self.nodes) |n| gpa.free(n[0 .. self.mask + 1]);
+        self.dropIterCache(gpa);
         self.* = .empty;
     }
 
@@ -281,6 +340,7 @@ pub const HashPart = extern struct {
                     n.setKey(key, ident);
                     n.value = val;
                     self.live += 1;
+                    self.iter_valid = false;
                     return;
                 },
                 .reuse_dead => |idx| {
@@ -291,6 +351,7 @@ pub const HashPart = extern struct {
                     n.setKey(key, ident);
                     n.value = val;
                     self.live += 1;
+                    self.iter_valid = false;
                     return;
                 },
                 .free => |idx| {
@@ -307,6 +368,7 @@ pub const HashPart = extern struct {
                     n.value = val;
                     self.live += 1;
                     self.used += 1;
+                    self.iter_valid = false;
                     return;
                 },
             }
@@ -355,6 +417,106 @@ pub const HashPart = extern struct {
         // yields mutable entry pointers; the table object is genuinely
         // heap-mutable and `*const` is only this accessor's view.
         return .{ .nodes = @constCast(nodes), .remaining = self.mask + 1 };
+    }
+
+    /// The live entry after `ctrl` in the canonical key order (`key_order`:
+    /// tag, then heap id, then payload bits), or the first live entry when
+    /// `ctrl` is null; null past the last. This is `next`'s hash-part step.
+    /// The successor is the first key strictly greater than `ctrl`, so `ctrl`
+    /// need not be present: Lua lets a traversal delete the current key.
+    ///
+    /// Cost: one sort per key-set change (`buildIterCache`; also after a
+    /// collection dropped the view), then one node read
+    /// per step, plus a binary search when `ctrl` is not the key returned
+    /// last (`iter_pos`). Sorting on every step made a traversal
+    /// O(k² log k). The result never depends on the cache: it holds every
+    /// live key (it is rebuilt when one is added), and a key removed since
+    /// the build is skipped because its node is dead.
+    ///
+    /// The view records each key's slot. Slots don't move while the view is
+    /// valid: only an insertion can rehash, and every insertion of a key
+    /// invalidates the view (an overwrite neither rehashes nor invalidates).
+    pub fn nextLive(self: *HashPart, gpa: std.mem.Allocator, ctrl: ?Value) std.mem.Allocator.Error!?Entry {
+        if (self.live == 0) {
+            self.dropIterCache(gpa);
+            return null;
+        }
+        if (!self.iter_valid) try self.buildIterCache(gpa);
+        const keys = self.iter_keys.?[0..self.iter_len];
+        const nodes = self.nodes.?;
+        var lo: usize = 0;
+        if (ctrl) |c| {
+            if (self.iter_pos < keys.len and self.isKeyAt(keys[self.iter_pos], c)) {
+                // The usual step: `ctrl` is the key returned last.
+                lo = self.iter_pos + 1;
+            } else {
+                const ck = IterKey.of(c);
+                var hi: usize = keys.len;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    if (ck.lessThan(keys[mid])) hi = mid else lo = mid + 1;
+                }
+            }
+        }
+        while (lo < keys.len) : (lo += 1) {
+            const n = &nodes[keys[lo].slot];
+            std.debug.assert(keys[lo].names(n));
+            if (n.value.isNil()) continue; // removed since the build
+            self.iter_pos = @intCast(lo);
+            return .{ .key = n.key(), .value_ptr = &n.value };
+        }
+        // Past the last key. The view stays for the next traversal; a
+        // collection drops it (`gc.zig`, `blacken`).
+        return null;
+    }
+
+    /// Is `c` the key of view entry `k`? First by the node's raw key bits,
+    /// which needs no load of `c`'s object header (for a heap key the bits
+    /// are its pointer). Then by identity, which also matches a dead node's
+    /// key, or another object with the same id.
+    inline fn isKeyAt(self: *const HashPart, k: IterKey, c: Value) bool {
+        const n = &self.nodes.?[k.slot];
+        if (n.key_tag == c.tag and n.key_payload.bits == c.payload.bits and !n.value.isNil()) return true;
+        return IterKey.of(c).eql(k);
+    }
+
+    fn buildIterCache(self: *HashPart, gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
+        if (self.iter_cap < self.live) {
+            const keys = try gpa.alloc(IterKey, self.live);
+            if (self.iter_keys) |old| gpa.free(old[0..self.iter_cap]);
+            self.iter_keys = keys.ptr;
+            self.iter_cap = self.live;
+        }
+        const keys = self.iter_keys.?[0..self.live];
+        var i: usize = 0;
+        for (self.nodes.?[0 .. self.mask + 1], 0..) |*n, slot| {
+            if (n.isFree() or n.value.isNil()) continue;
+            keys[i] = .{
+                .tag = n.key_tag,
+                .id = n.key_id,
+                .bits = if (n.key_tag == .heap_ref) 0 else n.key_payload.bits,
+                .slot = @intCast(slot),
+            };
+            i += 1;
+        }
+        std.debug.assert(i == self.live);
+        // Keys are unique, so stability buys nothing (and the block sort
+        // was the walk's largest cost).
+        std.mem.sortUnstable(IterKey, keys, {}, IterKey.less);
+        self.iter_len = self.live;
+        self.iter_pos = 0;
+        self.iter_valid = true;
+        self.iter_builds +%= 1;
+    }
+
+    /// Free `next`'s view. Only the cost of the next traversal changes.
+    pub fn dropIterCache(self: *HashPart, gpa: std.mem.Allocator) void {
+        if (self.iter_keys) |keys| gpa.free(keys[0..self.iter_cap]);
+        self.iter_keys = null;
+        self.iter_len = 0;
+        self.iter_cap = 0;
+        self.iter_pos = 0;
+        self.iter_valid = false;
     }
 
     // ------------------------------------------------------------------
@@ -857,4 +1019,220 @@ test "slot hints hit through another object with the same id" {
     try testing.expect(m.setExistingHinted(Value.heap(&a_other), Value.int(2), slot));
     try testing.expectEqual(@as(i64, 2), m.get(Value.heap(&a)).?.asInt());
     try testing.expectEqual(@as(u32, 1), m.count());
+}
+
+// --- nextLive: `next`'s canonical-order traversal ---------------------------
+
+const key_order = @import("key_order.zig");
+
+/// The live keys sorted by `key_order`: what a walk must visit. Caller frees.
+fn canonicalKeys(gpa: std.mem.Allocator, m: *const HashPart) ![]Value {
+    const keys = try gpa.alloc(Value, m.count());
+    var it = m.iterator();
+    var i: usize = 0;
+    while (it.next()) |e| : (i += 1) keys[i] = e.key;
+    std.mem.sort(Value, keys, {}, key_order.less);
+    return keys;
+}
+
+fn expectSameKeys(want: []const Value, got: []const Value) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try testing.expect(w.eql(g));
+}
+
+/// Mixed scalar and heap keys, so every ordering arm is exercised.
+fn putMixed(gpa: std.mem.Allocator, m: *HashPart, hs: []GcHeader) !void {
+    for (hs, 0..) |*h, i| {
+        // Ids out of insertion order, so slot order isn't already sorted.
+        h.* = .{ .type = .string, .id = @intCast(1000 - 7 * i) };
+        try m.put(gpa, Value.heap(h), Value.int(@intCast(i)));
+    }
+    const scalars = [_]Value{
+        Value.int(5),       Value.int(-3),     Value.int(1 << 40), Value.float(2.5),
+        Value.float(-0.5),  Value.boolean(true), Value.boolean(false), Value.int(0),
+    };
+    for (scalars) |k| try m.put(gpa, k, Value.int(1));
+}
+
+test "nextLive walks the live keys in key_order and sorts once" {
+    const gpa = testing.allocator;
+    var m: HashPart = .empty;
+    defer m.deinit(gpa);
+    var hs: [12]GcHeader = undefined;
+    try putMixed(gpa, &m, &hs);
+
+    const want = try canonicalKeys(gpa, &m);
+    defer gpa.free(want);
+    var got: std.ArrayList(Value) = .empty;
+    defer got.deinit(gpa);
+    var ctrl: ?Value = null;
+    while (try m.nextLive(gpa, ctrl)) |e| {
+        try got.append(gpa, e.key);
+        ctrl = e.key;
+    }
+    try expectSameKeys(want, got.items);
+    try testing.expectEqual(@as(u32, 1), m.iter_builds);
+
+    // A second walk of the unchanged map reuses the view: no sort.
+    got.clearRetainingCapacity();
+    ctrl = null;
+    while (try m.nextLive(gpa, ctrl)) |e| {
+        try got.append(gpa, e.key);
+        ctrl = e.key;
+    }
+    try expectSameKeys(want, got.items);
+    try testing.expectEqual(@as(u32, 1), m.iter_builds);
+
+    // Dropping the view (as a collection does) costs one more sort only.
+    m.dropIterCache(gpa);
+    try testing.expect(m.iter_keys == null);
+    try testing.expect((try m.nextLive(gpa, null)).?.key.eql(want[0]));
+    try testing.expectEqual(@as(u32, 2), m.iter_builds);
+}
+
+test "nextLive: deleting each key as it is visited sees every key once, with one sort" {
+    const gpa = testing.allocator;
+    var m: HashPart = .empty;
+    defer m.deinit(gpa);
+    var i: i64 = 0;
+    while (i < 5000) : (i += 1) try m.put(gpa, Value.int(@mod(i * 7919, 100003)), Value.int(i));
+
+    const want = try canonicalKeys(gpa, &m);
+    defer gpa.free(want);
+    var got: std.ArrayList(Value) = .empty;
+    defer got.deinit(gpa);
+    var ctrl: ?Value = null;
+    while (try m.nextLive(gpa, ctrl)) |e| {
+        const k = e.key;
+        try got.append(gpa, k);
+        try testing.expect(m.remove(k));
+        ctrl = k;
+    }
+    try expectSameKeys(want, got.items);
+    try testing.expectEqual(@as(u32, 0), m.count());
+    try testing.expectEqual(@as(u32, 1), m.iter_builds);
+}
+
+test "nextLive: a key added mid-walk rebuilds, and the walk resumes after ctrl" {
+    const gpa = testing.allocator;
+    var m: HashPart = .empty;
+    defer m.deinit(gpa);
+    var i: i64 = 0;
+    while (i < 20) : (i += 1) try m.put(gpa, Value.int(i * 10), Value.int(i));
+
+    // Walk to key 90, then add one key before it and two after.
+    var ctrl: ?Value = null;
+    while (try m.nextLive(gpa, ctrl)) |e| {
+        ctrl = e.key;
+        if (e.key.asInt() == 90) break;
+    }
+    try m.put(gpa, Value.int(45), Value.int(0));
+    try m.put(gpa, Value.int(95), Value.int(0));
+    try m.put(gpa, Value.int(1000), Value.int(0));
+    // An overwrite adds no key, so it does not invalidate.
+    try m.put(gpa, Value.int(100), Value.int(-1));
+
+    var rest: std.ArrayList(i64) = .empty;
+    defer rest.deinit(gpa);
+    while (try m.nextLive(gpa, ctrl)) |e| {
+        try rest.append(gpa, e.key.asInt());
+        ctrl = e.key;
+    }
+    // Every key strictly greater than 90, among the keys live now.
+    const want = [_]i64{ 95, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 1000 };
+    try testing.expectEqualSlices(i64, &want, rest.items);
+    try testing.expectEqual(@as(u32, 2), m.iter_builds);
+}
+
+test "nextLive: a key removed and re-added mid-walk is visited" {
+    const gpa = testing.allocator;
+    var m: HashPart = .empty;
+    defer m.deinit(gpa);
+    var hs: [12]GcHeader = undefined;
+    try putMixed(gpa, &m, &hs);
+    const want = try canonicalKeys(gpa, &m);
+    defer gpa.free(want);
+
+    // The last key in the order is dead when the view is built (first step)
+    // and resurrected after it, so the view must not be trusted.
+    const last = want[want.len - 1];
+    try testing.expect(m.remove(last));
+    const first = (try m.nextLive(gpa, null)).?.key;
+    try m.put(gpa, last, Value.int(7));
+
+    var got: std.ArrayList(Value) = .empty;
+    defer got.deinit(gpa);
+    try got.append(gpa, first);
+    var ctrl: ?Value = first;
+    while (try m.nextLive(gpa, ctrl)) |e| {
+        try got.append(gpa, e.key);
+        ctrl = e.key;
+    }
+    try expectSameKeys(want, got.items);
+    try testing.expectEqual(@as(u32, 2), m.iter_builds);
+}
+
+test "nextLive: a new key landing in a dead slot mid-walk is visited" {
+    const gpa = testing.allocator;
+    var m: HashPart = .empty;
+    defer m.deinit(gpa);
+    var i: i64 = 0;
+    while (i < 40) : (i += 1) try m.put(gpa, Value.int(i), Value.int(i));
+    i = 0;
+    while (i < 40) : (i += 2) try testing.expect(m.remove(Value.int(i)));
+
+    const first = (try m.nextLive(gpa, null)).?.key;
+    // One new key that takes a dead slot. Only that kind of insertion, since
+    // a free-slot one would invalidate the view by itself.
+    i = 100;
+    while (m.probeForPut(Ident.of(Value.int(i))) != .reuse_dead) i += 1;
+    try m.put(gpa, Value.int(i), Value.int(i));
+
+    var got: std.ArrayList(Value) = .empty;
+    defer got.deinit(gpa);
+    var ctrl: ?Value = first;
+    while (try m.nextLive(gpa, ctrl)) |e| {
+        try got.append(gpa, e.key);
+        ctrl = e.key;
+    }
+    // Every live key after the first.
+    const all = try canonicalKeys(gpa, &m);
+    defer gpa.free(all);
+    try testing.expect(all[0].eql(first));
+    try expectSameKeys(all[1..], got.items);
+}
+
+test "nextLive: a control that is not a key resumes at the next greater key" {
+    const gpa = testing.allocator;
+    var m: HashPart = .empty;
+    defer m.deinit(gpa);
+    try m.put(gpa, Value.int(10), Value.int(1));
+    try m.put(gpa, Value.int(30), Value.int(3));
+    try m.put(gpa, Value.boolean(true), Value.int(2));
+
+    try testing.expectEqual(@as(i64, 30), (try m.nextLive(gpa, Value.int(20))).?.key.asInt());
+    // Tag order: booleans sort before ints, so the first int follows `true`,
+    // and `true` follows `false`.
+    try testing.expect((try m.nextLive(gpa, Value.boolean(false))).?.key.eql(Value.boolean(true)));
+    try testing.expectEqual(@as(i64, 10), (try m.nextLive(gpa, Value.boolean(true))).?.key.asInt());
+    // Past every int key: nothing of a later tag is present.
+    try testing.expect((try m.nextLive(gpa, Value.int(31))) == null);
+    try testing.expectEqual(@as(u32, 1), m.iter_builds);
+    // Empty map: no view is built.
+    var e: HashPart = .empty;
+    try testing.expect((try e.nextLive(gpa, null)) == null);
+    try testing.expectEqual(@as(u32, 0), e.iter_builds);
+}
+
+test "nextLive under allocator failure leaves the map unchanged and retryable" {
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var m: HashPart = .empty;
+    defer m.deinit(testing.allocator);
+    try m.put(testing.allocator, Value.int(1), Value.int(1));
+    try m.put(testing.allocator, Value.int(2), Value.int(2));
+    // The view's allocation is the failing allocator's first.
+    try testing.expectError(error.OutOfMemory, m.nextLive(fa.allocator(), null));
+    try testing.expectEqual(@as(u32, 2), m.count());
+    try testing.expect(!m.iter_valid);
+    try testing.expectEqual(@as(i64, 1), (try m.nextLive(testing.allocator, null)).?.key.asInt());
 }

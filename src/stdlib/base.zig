@@ -11,10 +11,12 @@
 //! heap `GcHeader.id` → payload bits) — the exact order the keyframe serializer
 //! uses. That makes iteration address-independent and stable across runs and
 //! across snapshot/restore (docs/design/02-determinism.md): the rule the design
-//! doc says "lands fully with that iterator" lands here. This first cut builds the
-//! sorted hash-key view **on each `next` call** (correct and trivially
-//! snapshot-safe — nothing derived is cached); a per-table sorted-key cache is a
-//! pure-perf follow-up behind the same tests.
+//! doc says "lands fully with that iterator" lands here. The sorted hash-key
+//! view is built once per traversal and kept in the hash part
+//! (`HashPart.nextLive`). It is derived state only: a keyframe never carries
+//! it, and a traversal resumed after restore rebuilds it and visits the same
+//! keys. The first cut sorted on every `next` call, which made a traversal
+//! O(k² log k).
 //!
 //! ## Generic-for protocol & the multi ABI
 //!
@@ -37,7 +39,6 @@ const value = @import("../value.zig");
 const function = @import("../function.zig");
 const table_mod = @import("../table.zig");
 const interp = @import("../interp.zig");
-const key_order = @import("../key_order.zig");
 
 const Value = value.Value;
 const Table = table_mod.Table;
@@ -94,46 +95,18 @@ fn globalNative(vm: *Vm, name: []const u8) anyerror!Value {
 /// A located key/value pair, or `found == false` at the end of traversal.
 const Step = struct { found: bool, key: Value = undefined, val: Value = undefined };
 
-/// Collect the hash-part keys, sorted into the canonical order. Caller frees.
-fn sortedHashKeys(gpa: std.mem.Allocator, t: *const Table) ![]Value {
-    const keys = try gpa.alloc(Value, t.hash.count());
-    var it = t.hash.iterator();
-    var i: usize = 0;
-    while (it.next()) |e| : (i += 1) keys[i] = e.key;
-    std.mem.sort(Value, keys, {}, key_order.less);
-    return keys;
-}
-
-/// First hash key in canonical order (and its value), or not-found if empty.
-fn firstHashStep(gpa: std.mem.Allocator, t: *const Table) !Step {
-    const keys = try sortedHashKeys(gpa, t);
-    defer gpa.free(keys);
-    if (keys.len == 0) return .{ .found = false };
-    return .{ .found = true, .key = keys[0], .val = t.hash.get(keys[0]).? };
-}
-
-/// The hash key/value strictly after `ctrl` in canonical order. Uses a
-/// strictly-greater search (NOT "find ctrl then +1"), so it stays correct when
-/// the current key was just deleted (Lua permits deleting the current key during
-/// traversal) — the rebuilt list simply excludes it and we land on the next one.
-fn hashSuccessorStep(gpa: std.mem.Allocator, t: *const Table, ctrl: Value) !Step {
-    const keys = try sortedHashKeys(gpa, t);
-    defer gpa.free(keys);
-    // First index where ctrl < keys[idx]; sorted ascending, so this is the
-    // successor whether ctrl is present or absent.
-    var lo: usize = 0;
-    var hi: usize = keys.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        if (key_order.keyLessThan(ctrl, keys[mid])) hi = mid else lo = mid + 1;
-    }
-    if (lo >= keys.len) return .{ .found = false };
-    return .{ .found = true, .key = keys[lo], .val = t.hash.get(keys[lo]).? };
+/// The hash key/value after `ctrl` in canonical order (the first one when
+/// `ctrl` is null). Strictly greater, not "find ctrl, then +1", so it stays
+/// correct when the current key was just deleted (Lua permits that during a
+/// traversal). `HashPart.nextLive` keeps the sorted view across the steps.
+fn hashStep(gpa: std.mem.Allocator, t: *Table, ctrl: ?Value) !Step {
+    const e = try t.hash.nextLive(gpa, ctrl) orelse return .{ .found = false };
+    return .{ .found = true, .key = e.key, .val = e.value_ptr.* };
 }
 
 /// The core of `next(t, ctrl)`: array part (ascending index, skipping nil holes)
 /// then hash part (canonical order).
-fn nextStep(gpa: std.mem.Allocator, t: *const Table, ctrl: Value) !Step {
+fn nextStep(gpa: std.mem.Allocator, t: *Table, ctrl: Value) !Step {
     const n: i64 = @intCast(t.array.asize);
 
     // Table keys are identity-normalized (float-spelled integers and -0.0 fold
@@ -161,9 +134,9 @@ fn nextStep(gpa: std.mem.Allocator, t: *const Table, ctrl: Value) !Step {
             if (!v.isNil()) return .{ .found = true, .key = Value.int(i), .val = v };
         }
         // Array part exhausted → first hash key.
-        return firstHashStep(gpa, t);
+        return hashStep(gpa, t, null);
     }
-    return hashSuccessorStep(gpa, t, nctrl);
+    return hashStep(gpa, t, nctrl);
 }
 
 /// `next` over a `row_view` (doc 14): ascending columns `1..stride`, skipping
@@ -300,10 +273,56 @@ pub const natives = [_]function.BaseNative{
     .{ .name = ipairs_iter_name, .func = &nInext1, .multi = &nInextN },
 };
 
+test "next keeps its sorted view across traversals, and a collection mid-walk drops it" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    const ctx: *anyopaque = @ptrCast(&vm);
+
+    // A global table, so the collection keeps it.
+    const t = try vm.heap.newTable();
+    const tv = Value.heap(&t.header);
+    try vm.globals.set(gpa, try vm.heap.internValue("t"), tv);
+    var buf: [16]u8 = undefined;
+    for (0..300) |i| {
+        const name = try std.fmt.bufPrint(&buf, "k{d}", .{i});
+        try t.set(gpa, try vm.heap.internValue(name), Value.int(@intCast(i)));
+    }
+
+    // One walk, recording the keys; a collection runs halfway through.
+    var keys: [300]Value = undefined;
+    var n: usize = 0;
+    var out: [2]Value = undefined;
+    var ctrl = Value.nil();
+    while (try nNextN(ctx, &.{ tv, ctrl }, &out) == 2) : (n += 1) {
+        keys[n] = out[0];
+        ctrl = out[0];
+        if (n == 150) {
+            vm.collect();
+            try testing.expect(t.hash.iter_keys == null);
+        }
+    }
+    try testing.expectEqual(@as(usize, 300), n);
+    for (keys[0 .. n - 1], keys[1..n]) |a, b| try testing.expect(key_order.keyLessThan(a, b));
+    // Sorted once at the start and once after the collection.
+    try testing.expectEqual(@as(u32, 2), t.hash.iter_builds);
+
+    // A second walk of the unchanged table sorts nothing.
+    ctrl = Value.nil();
+    n = 0;
+    while (try nNextN(ctx, &.{ tv, ctrl }, &out) == 2) : (n += 1) {
+        try testing.expect(out[0].eql(keys[n]));
+        ctrl = out[0];
+    }
+    try testing.expectEqual(@as(usize, 300), n);
+    try testing.expectEqual(@as(u32, 2), t.hash.iter_builds);
+}
+
 // --- grid row iteration (Phase 3, doc 14) ------------------------------------
 
 const testing = std.testing;
 const arr = @import("../array.zig");
+const key_order = @import("../key_order.zig");
 
 test "next/ipairs traverse a grid row_view as a length-#row array" {
     const gpa = testing.allocator;

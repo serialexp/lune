@@ -652,6 +652,10 @@ pub const Heap = struct {
                     self.markValue(entry.key);
                     self.markValue(entry.value_ptr.*);
                 }
+                // `next`'s sorted view is derived and kept between traversals;
+                // a collection drops it, so the views alive are only those of
+                // tables walked since the last one. Freeing allocates nothing.
+                t.hash.dropIterCache(self.gpa);
                 // The metatable (chunk 2a) is a heap edge: keep it alive while
                 // any table references it.
                 if (t.metatable) |m| self.markHeader(&m.header);

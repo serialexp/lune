@@ -1,5 +1,5 @@
 # mahina frozen benchmark output digests — see tools/hashgate.py
-# generated from zig-out/bin/mahina at rev e97f6c0
+# generated from zig-out/bin/mahina at rev 9906fa5
 # name	mode	argv	rc	sha256(stdout)
 array3d	jit	80	0	48752ee828b38c1ad373f80e83f62bc9394a1f02665eccff98db8159e39e4d54
 array3d	t0	80	0	48752ee828b38c1ad373f80e83f62bc9394a1f02665eccff98db8159e39e4d54
@@ -37,6 +37,9 @@ nsieve-bit	trace	6	0	49601107e4d950351260d76ccdfc2506ca84646061d68fda23b451b2c3f
 nsieve-bit-fp	jit	6	0	49601107e4d950351260d76ccdfc2506ca84646061d68fda23b451b2c3f52bf6
 nsieve-bit-fp	t0	6	0	49601107e4d950351260d76ccdfc2506ca84646061d68fda23b451b2c3f52bf6
 nsieve-bit-fp	trace	6	0	49601107e4d950351260d76ccdfc2506ca84646061d68fda23b451b2c3f52bf6
+pairs_hash	jit	200	0	f717a14cdcc02f2551eb9cc58343312796f8d5be05303ad7b3d0d6e9dcb53068
+pairs_hash	t0	200	0	f717a14cdcc02f2551eb9cc58343312796f8d5be05303ad7b3d0d6e9dcb53068
+pairs_hash	trace	200	0	f717a14cdcc02f2551eb9cc58343312796f8d5be05303ad7b3d0d6e9dcb53068
 partialsums	jit	1000000	0	c21bad99f03cb8f45f8db5107e46ed2286cc9addd80b2574b2ae57c92fbac1d0
 partialsums	t0	1000000	0	c21bad99f03cb8f45f8db5107e46ed2286cc9addd80b2574b2ae57c92fbac1d0
 partialsums	trace	1000000	0	c21bad99f03cb8f45f8db5107e46ed2286cc9addd80b2574b2ae57c92fbac1d0
