@@ -18,15 +18,42 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
       continuation whose .link runs silent"); `397831e`. Board against
       1b60a01: nsieve-bit-fp 393.9 → 350.9 ms (−10.9%), scimark-fft
       276.6 → 219.9 ms (−20.5%), the rest within noise.
-- [ ] **The `while` inside `for k` has no looping root trace.** Every
-      trace anchored at the `while` body (pc 53) is a `link -> 45`
-      composite that runs it once (t2) or twice (t6). Once `i > 2·cm` it
-      runs three or more times, both composites deopt at their `while`
-      test, and the `for k` root's `while` exit gives up after 4 unlinked
-      chains (`noteExitSideChain`), for good. LuaJIT records the `while`
-      as its own root at its `BC_LOOP` and the `for k` side trace links to
-      it. Doc 38/56/58 territory (G6, nest formation); diagnose before
-      designing (Z-8).
+- [ ] **The `while` inside `for k` and the outer `for i` (diagnosed
+      2026-10-20 at the board size, `nsieve-bit-fp.lua 6`).** The earlier
+      "no looping root" reading was the m=5000 kernel: at board size the
+      `while` root exists (t7, anchor 54, after 5 recording aborts). Where
+      the time goes (`--jit-stats`): native 27%, seam 37%, tier-0 with a
+      trace 21% (almost all anchor 23, the outer `for i`: 532k iterations
+      at ~800 c/it against ~280 traced), tier-0 without a trace 5% (the
+      `while` header at 54). Four separate causes:
+      1. **Region decay gates the outer `for i`.** Region rid=2 (owner
+         pc 23) closes at each burst's end with work = 3–6 outer
+         traversals, below `min_useful` (8), so every close strikes. At
+         `max_penalty` `applyWindowDecision` gates anchor 23
+         (`region_decay`, backoff 256 → 8192 ticks) and runs
+         `disarmAllLinks` (14 links). "Work" counts outer traversals, and
+         one traversal here holds a whole `for k` loop, so a short count
+         is no evidence of low yield. LuaJIT has no such gate.
+      2. **A chain that ends at the enclosing loop's own loop-done counts
+         as a miss.** t7's `while` exit (resume 63) chains to t8, which
+         runs the post-`while` body and exits at exit 33, the `for k`
+         loop-done (`completed=0`, ledger 1). `noteExitSideChain` counts
+         that as unlinked and gives up after 4 (`tryside`). The chain ran
+         to the natural end of the loop natively; doc 56 meant a give-up
+         as "no continuation at P fits".
+      3. **The exit-side chain at a `.loop` marker never tries the root
+         at its header.** t1's `while` exit resumes at pc 53, the
+         `.loop` marker whose header is 54 (rule 8 refuses a header as
+         `P`). `driveChain` offers only traces anchored at 53, the
+         composites t2/t6 (one and two trips, `link -> 45`), never t7,
+         though tier-0's entry patch for t7 sits on that marker. Once the
+         `while` needs 3+ trips both composites deopt and t1 e15 gives up
+         after 4 chains. LuaJIT's side trace links into the inner loop's
+         root when it reaches its `BC_LOOP` (`rec_loop_jit`).
+      4. **One ledger row per `while` trip.** t6's `while` exit is
+         exit-side-armed to t6 itself (resume 53), so a 20-trip `while`
+         writes ~20 `.exit_side` rows; bursts reach 23 rows and the seam
+         replays each (~7k cycles per walk).
 - [ ] **Measured P6-Q3(b), bursts take exit adapters (experiment,
       reverted 2026-10-19).** The cause of the `for k` root's give-up
       above: inside `driveChain` the native call runs with
@@ -63,7 +90,11 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
       (a line-for-line copy) now delegates. The four functions are gone from
       the profile. Instructions (`--jit-native`, every @bench program,
       outputs identical): nsieve-bit-fp −4.85%, fft −1.49%, euler14-bit
-      −1.27%, spectral-norm −1.08%, array3d −1.03%, none worse.
+      −1.27%, spectral-norm −1.08%, array3d −1.03%, none worse. `2752e6c`;
+      board (pt-default) against 397831e: nsieve-bit-fp 350.9 → 342.4 ms
+      (−2.4%), fft 219.9 → 215.7 (−1.9%), spectral-norm and euler14-bit
+      −1.1%, every other row within ±1% except tbl_ops +2.0% (20 ms, its
+      instruction count unchanged: noise).
 - [ ] **Region accounting is now the seam's biggest slice.** On
       nsieve-bit-fp after the facts table (frame-pointer profile,
       `-Dcli-frame-pointers=true`): `accountRegionProfit` 10.9% self,

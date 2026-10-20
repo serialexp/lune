@@ -25,8 +25,13 @@ WORST BOARD ROW (2026-10-19, amber-badger): nsieve-bit-fp.
   better, none worse, outputs identical. New `-Dcli-frame-pointers=true`
   gives perf call graphs on a ReleaseFast CLI (the DWARF unwinder loses
   them). Board numbers: see TODO "nsieve-bit-fp, the board's worst row".
-- Next: (a) the `while` that has no looping root. After that, region
-  accounting is the seam's biggest slice (TODO).
+- (a) diagnosed 2026-10-20, not yet changed: the `while` root exists at
+  board size. The four causes (region decay gating the outer `for i`, a
+  loop-done chain end counted as a miss, the marker-pc chain never
+  trying the header root, one ledger row per `while` trip) are in TODO
+  "The `while` inside `for k` and the outer `for i`". Waiting on Bart for
+  which to take on. After that, region accounting is the seam's biggest
+  slice (TODO).
 
 LINE LOOKUP FIX (2026-10-11, coral-marten): LANDED in `49fd572`, bundled with amber-badger's doc 61 Phase K.
 - Bug from TODO.md "Every located runtime error rescans the source for
