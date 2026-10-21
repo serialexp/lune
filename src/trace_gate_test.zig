@@ -106,7 +106,8 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     const rid: RegionId = @enumFromInt(3);
     try state.region_policy.region_defs.put(gpa, rid, .{
         .members = try gpa.dupe(StructuralEdgeId, &.{}),
-        .member_points = try gpa.dupe(ProgramPoint, &.{.{ .proto_id = 61, .source_pc = 0 }}),
+        // pc 5 and 6 are member points only for the (4) teardown below.
+        .member_points = try gpa.dupe(ProgramPoint, &.{ .{ .proto_id = 61, .source_pc = 0 }, .{ .proto_id = 61, .source_pc = 5 }, .{ .proto_id = 61, .source_pc = 6 } }),
         .owner = .{ .proto = &proto, .pc = 0, .proto_id = proto.id },
         .classifier = .{ .kind = .self_loop, .member_count = 1 },
         .armable = true,
@@ -145,10 +146,45 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     try testing.expectEqual(@as(u64, 1), state.region_policy.region_profit_flushes);
     try testing.expectEqual(@as(?u32, null), state.penalty.get(owner));
 
-    // (4) Arm a link, then repeated 1-traversal open/exit cycles each flush an
+    // (4) Arm links, then repeated 1-traversal open/exit cycles each flush an
     // r=1 low-yield remainder striking the OWNER; at max_penalty the owner gates
-    // and the gate install conservatively disarms EVERY armed link.
+    // and the gate install tears down the REGION's links (doc 64 §15, 1d): a
+    // member-to-member link, a link into the gated owner, and a bridge stamped
+    // with the region — each failing the other two tests — while an unrelated
+    // link (another nest's) stays armed.
     const SHARED_EXIT: usize = 0;
+    const own_slots = try gpa.alloc(usize, 3);
+    defer gpa.free(own_slots);
+    @memset(own_slots, 0xCCCC);
+    const Fixture = struct {
+        fn at(id: u32, p: *const Proto, proto_id: u32, pc: u32, slots: []usize, g: std.mem.Allocator) Trace {
+            return .{
+                .code = .{
+                    .anchor = .{ .proto = p, .pc = pc, .proto_id = proto_id },
+                    .instrs = &.{},
+                    .consts = &.{},
+                    .entry_slots = &.{},
+                    .entry_guards = &.{},
+                },
+                .id = id,
+                .native = .{ .compiled = .{ .page = undefined, .slots = slots, .gpa = g, .linked_entry = 0xDDDD } },
+            };
+        }
+    };
+    const other = Proto{ .id = 0, .code = &code, .name = "other", .num_registers = 1 };
+    var m_parent = Fixture.at(73, &proto, 61, 5, own_slots[0..1], gpa); // member → member
+    var m_child = Fixture.at(74, &proto, 61, 6, &.{}, gpa);
+    var o_parent = Fixture.at(75, &other, 0, 8, own_slots[1..2], gpa); // outside → the owner
+    var o_child = Fixture.at(76, &proto, 61, 0, &.{}, gpa);
+    var b_parent = Fixture.at(77, &other, 0, 9, own_slots[2..3], gpa); // a bridge armed on rid
+    var b_child = Fixture.at(78, &other, 0, 10, &.{}, gpa);
+    const phys = &state.registry.native_physical;
+    // On a failed expectation, never let `state.deinit` reset slots the
+    // defers above already freed.
+    defer phys.armed_links.clearRetainingCapacity();
+    try phys.armed_links.append(gpa, .{ .parent = &m_parent, .slot_index = 0, .physical_slot = 0, .child = &m_child, .kind = .link_terminal });
+    try phys.armed_links.append(gpa, .{ .parent = &o_parent, .slot_index = 0, .physical_slot = 0, .child = &o_child, .kind = .link_terminal });
+    try phys.armed_links.append(gpa, .{ .parent = &b_parent, .slot_index = 0, .physical_slot = 0, .child = &b_child, .kind = .region_bridge, .region_id = rid });
     const parent_slots = try gpa.alloc(usize, 1);
     defer gpa.free(parent_slots);
     @memset(parent_slots, SHARED_EXIT);
@@ -175,7 +211,7 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
         .native = .{ .compiled = .{ .page = undefined, .slots = &.{}, .gpa = gpa, .linked_entry = 0xBBBB } },
     };
     try testing.expect(try state.armNativeLink(&link_parent, 0, &link_child, .link_terminal));
-    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 4), phys.armed_links.items.len);
 
     var j: u32 = 0;
     while (j < state.config.max_penalty) : (j += 1) {
@@ -185,8 +221,12 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     }
     try testing.expectEqual(@as(u32, state.config.max_penalty), state.penalty.get(owner).?);
     try testing.expect(state.isGated(owner));
-    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
-    try testing.expectEqual(SHARED_EXIT, parent_slots[0]);
+    try testing.expectEqual(@as(usize, 1), phys.armed_links.items.len);
+    try testing.expectEqual(&link_parent, phys.armed_links.items[0].parent);
+    try testing.expectEqual(@as(usize, 0xBBBB), parent_slots[0]);
+    for (own_slots) |s| try testing.expectEqual(SHARED_EXIT, s);
+    try testing.expectEqual(@as(u64, 3), phys.native_link_disarms);
+    phys.armed_links.clearRetainingCapacity();
 
     // (5) A-vii-c.1: the accounting boundary is CONSUMPTION, not membership. This
     // is the contract the A-vii-c review blocker turned on — physical membership

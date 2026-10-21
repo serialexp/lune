@@ -681,6 +681,38 @@ test "doc 20 Phase 3: while/repeat jloop patches bind and stay byte-identical ac
     , "45150\t45150\n", .{ .inspect = Inspect.run });
 }
 
+test "doc 20: a for_prep entering a patched loop takes its patched entry (LuaJIT JFORI)" {
+    // The inner loop roots and patches its `for_loop` early; from then on
+    // every outer iteration's `for_prep` runs the inner loop's first trip.
+    // (The closure keeps the outer body on tier-0: `closure` aborts its
+    // continuation, so tier-0 runs every `for_prep`.)
+    // It must hand that trip to the live slot, as `.jfor_loop` hands every
+    // later one. Through the discovery walk instead, a first-trip
+    // zero-progress exit left a hot side want to the next back-edge, one
+    // iteration late, which re-recorded the parent's own shape as a sibling
+    // and thrashed (euler14-bit, +65% instructions).
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode != .record_execute_native or !@import("nativegen.zig").is_x64_linux) {
+                try testing.expectEqual(@as(u64, 0), vm.trace.for_prep_patched);
+                return;
+            }
+            // Most of the 400 outer iterations: all but those before the
+            // patch was installed.
+            try testing.expect(vm.trace.for_prep_patched > 300);
+        }
+    };
+    try expectProgramTuned(
+        \\local s = 0
+        \\for r = 1, 400 do
+        \\  local f = function() return r end
+        \\  for i = 1, 50 do s = s + i end
+        \\  s = s + f() - r
+        \\end
+        \\print(s)
+    , "510000\n", .{ .inspect = Inspect.run });
+}
+
 test "doc 20 Phase 3: a recording crossing a jloop pc mirrors the canonical jump" {
     var code: [4]Instr = @splat(Instr.op0(.ret));
     code[2] = .{ .op = .jmp_if_false, .a = 7, .aux = -3 };

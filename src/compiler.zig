@@ -1112,7 +1112,8 @@ const Compiler = struct {
         try self.compileBlock(nf.body);
         try self.endScope();
 
-        // for_loop tests + back-edges to the body; for_prep jumps here.
+        // for_loop tests + back-edges to the body; for_prep's `aux` targets it
+        // (a loop that never runs skips to just past it).
         try self.emitJumpTo(.for_loop, base, body_start);
         self.code.items[prep].aux = blk: {
             const target: i64 = @intCast(self.code.items.len - 1); // the for_loop index

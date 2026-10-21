@@ -111,6 +111,10 @@ pub const Error = error{
     /// — almost certainly a metatable cycle (`setmetatable(t, {__index=t})` and
     /// kin). Surfaced as a located runtime fault rather than hanging the VM.
     MetatableChainLoop,
+    /// A numeric `for` whose step is zero (`0` or `±0.0`). Raised by
+    /// `for_prep` before the loop runs, as Lua 5.4's `forprep` does; without
+    /// it the loop never ends.
+    ForStepZero,
     /// Replay's recorded `unicode_version` effect (S-C) names a Unicode version
     /// that differs from the one this binary's case table was compiled against.
     /// `upper`/`lower` would map differently, breaking byte-identical replay, so
@@ -298,6 +302,7 @@ const core_natives = [_]BaseNative{
     // table. (`tonumber` and `string.format` moved to `stdlib/basic.zig` and
     // `stdlib/string.zig` respectively, keeping their serialized names.)
     .{ .name = "io.write", .func = &nativeIoWrite, .module = "io", .field = "write" },
+    .{ .name = "io.flush", .func = &nativeIoFlush, .module = "io", .field = "flush" },
 };
 
 /// Built-in module constants (non-heap `Value` fields like `math.pi`). Like
@@ -2006,6 +2011,7 @@ pub const Vm = struct {
             Error.StackOverflow => try arena.dupe(u8, "stack overflow"),
             Error.DivisionByZero => try arena.dupe(u8, "attempt to perform integer division or modulo by zero"),
             Error.MetatableChainLoop => try arena.dupe(u8, "'__index' chain too long; possible loop"),
+            Error.ForStepZero => try arena.dupe(u8, "'for' step is zero"),
             else => switch (instr.op) {
                 .add, .sub, .mul, .div, .idiv, .mod, .pow => try std.fmt.allocPrint(
                     arena,
@@ -2020,6 +2026,13 @@ pub const Vm = struct {
                 .len => try std.fmt.allocPrint(arena, "attempt to get length of a {s} value", .{regs.get(instr.b).typeName()}),
                 .concat => try std.fmt.allocPrint(arena, "attempt to concatenate a {s} value", .{firstNonConcatable(regs.get(instr.b), regs.get(instr.c)).typeName()}),
                 .lt, .le, .gt, .ge => try std.fmt.allocPrint(arena, "attempt to compare {s} with {s}", .{ regs.get(instr.b).typeName(), regs.get(instr.c).typeName() }),
+                // Lua 5.4's `forprep` wording, first non-number in operand order.
+                .for_prep => try arena.dupe(u8, if (!regs.get(instr.a).isNumber())
+                    "'for' initial value must be a number"
+                else if (!regs.get(instr.a + 1).isNumber())
+                    "'for' limit must be a number"
+                else
+                    "'for' step must be a number"),
                 .get_index => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs.get(instr.b).typeName()}),
                 .set_index => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs.get(instr.a).typeName()}),
                 .call => blk: {
@@ -3700,7 +3713,7 @@ pub const Vm = struct {
         // closes a Z-6 generality gap: v1's global `armedLinks` check made
         // the quiet path dead in any program with armed LOOP links.
         // `applyPendingDisarms`/`drainBarrier`/`syncNativeInvalidation` no-op.
-        if (phys.pending_demote.items.len != 0 or phys.pending_disarm_all) return null;
+        if (phys.pending_demote.items.len != 0 or phys.pending_teardown != .none) return null;
         if (phys.provenance_invalidated) return null;
         // `applyPendingDisarms` also syncs this field unconditionally; a
         // mismatch takes one full entry to synchronize (round 3).
@@ -6264,31 +6277,50 @@ pub const Vm = struct {
     }
 
     // ---- numeric for ----
-    // R[a..a+3) = (idx, limit, step). Validate numbers, pre-subtract step from
-    // idx (so the first for_loop re-adds it), then jump to the matching
-    // for_loop test.
+    // R[a..a+3) = (init, limit, step), as Lua 5.4's `forprep`: validate them,
+    // raise on a zero step, and test the first index (`arith.forFirstIndex`,
+    // a float unless init and step are both ints) against the limit. If the
+    // loop runs, publish it to R[a] and the loop variable R[a+3] and enter the
+    // body at `pc`; else jump past the `for_loop` (`aux` targets the
+    // `for_loop`). No pre-subtracted index: `init - step` can wrap, which made
+    // a real overflow in `for_loop` indistinguishable from the first add
+    // undoing it, and is inexact for floats. Entering the body takes the
+    // back-edge path the first `for_loop` used to: the header's hot count,
+    // trip gate and trace entry see the first iteration, as before — through
+    // the patched entry when the `for_loop` is patched (`patchedForEntry`).
     fn opForPrep(comptime mode: ExecMode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
                 const a: usize = instr.a;
-                if (!regs.get(a).isNumber() or !regs.get(a + 1).isNumber() or !regs.get(a + 2).isNumber()) {
+                const limit = regs.get(a + 1);
+                const step = regs.get(a + 2);
+                if (!regs.get(a).isNumber() or !limit.isNumber() or !step.isNumber()) {
                     return parkErr(st, Error.TypeError);
                 }
-                regs.set(a, arith.sub(regs.get(a), regs.get(a + 2)) catch |e| return parkErr(st, e));
-                const cur_pc = pc - 1;
-                const npc = applyJump(pc, instr.aux);
-                // `for_prep` always jumps forward to the matching `for_loop`,
-                // so this never back-edges; kept uniform with the other jumps.
-                if (vm.trace.config.enabled and npc <= cur_pc)
-                    return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
-                return dispatchTail(mode, st, npc, vm);
+                if (arith.forStepIsZero(step)) return parkErr(st, Error.ForStepZero);
+                const first = arith.forFirstIndex(regs.get(a), step);
+                if (!arith.forWithin(first, limit, step))
+                    return dispatchTail(mode, st, applyJump(pc, instr.aux) + 1, vm);
+                regs.set(a, first);
+                regs.set(a + 3, first);
+                if (!vm.trace.config.enabled) return dispatchTail(mode, st, pc, vm);
+                const fl = &st.code[applyJump(pc, instr.aux)];
+                if (fl.op == .jfor_loop) {
+                    const slot: u16 = fl.b;
+                    const patch = vm.trace.registry.entry_registry.entry_patches.items[slot];
+                    const enter = patch.live and !vm.jitSuspended(mode);
+                    if (enter) vm.trace.for_prep_patched +|= 1;
+                    return patchedForEntry(mode, st, pc, instr, patch, slot, enter, vm, tags, payloads);
+                }
+                return @call(.always_tail, gatedBackEdgeHandler(mode), .{ st, pc, instr, vm, tags, payloads });
             }
         }.h;
     }
 
-    // idx += step; if still within limit (direction by step sign), publish idx
-    // to the loop var R[a+3] and take the back-edge.
+    // idx += step; if still within limit (direction by step sign) and the int
+    // add didn't overflow, publish idx to the loop var R[a+3] and take the
+    // back-edge.
     fn opForLoop(comptime mode: ExecMode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
@@ -6380,59 +6412,87 @@ pub const Vm = struct {
                 // existing cascade, reached by unpatching BEFORE the step ran
                 // above — §R2-3's double-increment hazard avoided). Also the
                 // suspended path (doc 63 §5.9).
-                if (!live or suspended) return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
-                // §R1-5 bypass set — live authoritative fields, no maintained
-                // flag: the `runFastPath` `.full` set plus exec-log and
-                // coverage. Take the back-edge through the ordinary epilogue
-                // with `patch.orig` presented, so recording, coverage
-                // attribution, `onBackEdge`, and trace closure all see virgin
-                // `.for_loop` behaviour.
-                if (self.trace.isRecording() or self.suspend_ctl != null or
-                    self.record_safepoint_lines or self.trace.config.record_exec_log or
-                    self.trace.pending_exit_anchor != null or
-                    self.trace.pending_replay_anchor != null or
-                    self.trace.config.coverage)
-                {
-                    return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
-                }
-                // Patched entry: skip exactly the discovery/selection prefix
-                // (hot-count probe, counters hashmap, trip computation,
-                // isGated, walk, fingerprint — the native prologue's
-                // fail-closed type check subsumes the fingerprint at entry,
-                // per the B-4 discipline) and run the identical entry/receipt
-                // routine the walk uses.
-                const directive = self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, npc);
-                if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
-                    st.code = self.cachedCodeFor(st.frame, st.proto);
-                    st.code_gen = self.trace.registry.entry_registry.image_gen;
-                }
-                switch (directive) {
-                    .next_candidate => {
-                        // Fall through to the tier-0 body. Mirror the walk's
-                        // T3 invariant: a recording must never run under
-                        // `.fast` (its prologue elides the mirror).
-                        if (mode == .fast and self.trace.isRecording()) {
-                            st.frame.pc = npc;
-                            return .switch_mode;
-                        }
-                        return dispatchTail(mode, st, npc, vm);
-                    },
-                    .resume_tier0 => |rpc| return dispatchTail(mode, st, rpc, vm),
-                    .switch_mode_at => |rpc| {
-                        st.frame.pc = rpc;
-                        return .switch_mode;
-                    },
-                    // Doc 44 D11: only head pages emit the push epilogue.
-                    .resume_frame_motion => @panic("native frame motion from a loop-anchor entry"),
-                    // Doc 45 D5: park the precise effect error at its
-                    // bytecode — registers already snapshot-restored.
-                    .raise_at => |r| {
-                        st.frame.pc = r.pc;
-                        return parkErr(st, r.err);
-                    },
-                }
+                return patchedForEntry(mode, st, npc, instr, patch, slot, live and !suspended, vm, tags, payloads);
             }
         }.h;
+    }
+
+    /// The patched numeric-`for` entry (doc 20) at the loop header `npc`,
+    /// with the iteration's index already published. Shared by `.jfor_loop`
+    /// after its step and by a `for_prep` entering the body of a loop whose
+    /// `for_loop` is patched: LuaJIT patches FORI to JFORI alongside JFORL
+    /// (`lj_trace.c` `trace_stop`), so a loop's first trip enters its trace
+    /// the way every later trip does. Through the discovery walk instead, a
+    /// first-trip zero-progress exit left a hot side want to the next
+    /// `onBackEdge`, one iteration late — recording the parent's own shape
+    /// again as a duplicate sibling (euler14-bit). `instr` is the canonical
+    /// instruction a bypass presents (`patch.orig`, or the `for_prep`);
+    /// `enter` is false when the slot is dead or the JIT suspended.
+    inline fn patchedForEntry(
+        comptime mode: ExecMode,
+        st: *ExecState,
+        npc: usize,
+        instr: *const Instr,
+        patch: *trace.EntryPatch,
+        slot: u16,
+        enter: bool,
+        vm: *Vm,
+        tags: [*]u8,
+        payloads: [*]u64,
+    ) HandlerResult {
+        const self = vm;
+        const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+        if (!enter) return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
+        // §R1-5 bypass set — live authoritative fields, no maintained
+        // flag: the `runFastPath` `.full` set plus exec-log and
+        // coverage. Take the back-edge through the ordinary epilogue
+        // with the canonical instruction presented, so recording, coverage
+        // attribution, `onBackEdge`, and trace closure all see virgin
+        // behaviour.
+        if (self.trace.isRecording() or self.suspend_ctl != null or
+            self.record_safepoint_lines or self.trace.config.record_exec_log or
+            self.trace.pending_exit_anchor != null or
+            self.trace.pending_replay_anchor != null or
+            self.trace.config.coverage)
+        {
+            return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
+        }
+        // Patched entry: skip exactly the discovery/selection prefix
+        // (hot-count probe, counters hashmap, trip computation,
+        // isGated, walk, fingerprint — the native prologue's
+        // fail-closed type check subsumes the fingerprint at entry,
+        // per the B-4 discipline) and run the identical entry/receipt
+        // routine the walk uses.
+        const directive = self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, npc);
+        if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
+            st.code = self.cachedCodeFor(st.frame, st.proto);
+            st.code_gen = self.trace.registry.entry_registry.image_gen;
+        }
+        switch (directive) {
+            .next_candidate => {
+                // Fall through to the tier-0 body. Mirror the walk's
+                // T3 invariant: a recording must never run under
+                // `.fast` (its prologue elides the mirror).
+                if (mode == .fast and self.trace.isRecording()) {
+                    st.frame.pc = npc;
+                    return .switch_mode;
+                }
+                return dispatchTail(mode, st, npc, vm);
+            },
+            .resume_tier0 => |rpc| return dispatchTail(mode, st, rpc, vm),
+            .switch_mode_at => |rpc| {
+                st.frame.pc = rpc;
+                return .switch_mode;
+            },
+            // Doc 44 D11: only head pages emit the push epilogue.
+            .resume_frame_motion => @panic("native frame motion from a loop-anchor entry"),
+            // Doc 45 D5: park the precise effect error at its
+            // bytecode — registers already snapshot-restored.
+            .raise_at => |r| {
+                st.frame.pc = r.pc;
+                return parkErr(st, r.err);
+            },
+        }
     }
 
     // Doc 20 Phase 3: patched entry for the loop-closing jumps the compiler
@@ -7569,9 +7629,11 @@ pub const Vm = struct {
             // `min_trip_entry` — tier-0 runs the short loop and we skip the
             // `onSideExit` penalty, so the inner loop's trivial large-stride
             // runs never gate its profitable long runs. `null` for any
-            // non-`for_loop` back-edge (while/repeat) ⇒ always eligible.
+            // non-`for_loop` back-edge (while/repeat) ⇒ always eligible. A
+            // `for_prep` entering its body arrives here too, with the first
+            // index already in `R[a]`, exactly as a `for_loop` back-edge leaves it.
             const a: usize = inst.a;
-            const for_trips: ?u64 = if (inst.op == .for_loop)
+            const for_trips: ?u64 = if (inst.op == .for_loop or inst.op == .for_prep)
                 forRemainingTrips(regs.get(a), regs.get(a + 1), regs.get(a + 2))
             else
                 null;
@@ -7943,26 +8005,30 @@ pub const Vm = struct {
     /// `R[a..a+3) = (idx, limit, step)`: `idx += step`, written back, then the
     /// limit test in the step's direction. Returns whether the loop goes on.
     /// An int index with an int step, or a float index with a float step,
-    /// computes on the raw lanes with exactly `arith`'s semantics: the int
-    /// add wraps, the float add is strict, a limit of the other number type
-    /// compares exactly (`compareNumeric`, as `arith.le` does), and a NaN
-    /// fails the test (`.unordered`). Any other mix takes `arith`, which
-    /// also raises for a non-number.
+    /// computes on the raw lanes with exactly `arith`'s semantics: the float
+    /// add is strict, a limit of the other number type compares exactly
+    /// (`compareNumeric`, as `arith.forWithin` does), and a NaN fails the test
+    /// (`.unordered`). An int add that overflows ends the loop, as in Lua 5.4:
+    /// the true sum is past every int, so past an int limit and past the int
+    /// Lua 5.4 clips a float limit to (the wrapped sum is written back,
+    /// unread). Any other mix takes `arith`.
     inline fn forLoopStep(regs: RegWindow, a: usize) Error!bool {
         const ti = regs.tagAt(a);
         const tl = regs.tagAt(a + 1);
         const ts = regs.tagAt(a + 2);
         if (ti == .int and ts == .int and (tl == .int or tl == .float)) {
             const step: i64 = @bitCast(regs.bitsAt(a + 2));
-            const idx: i64 = @as(i64, @bitCast(regs.bitsAt(a))) +% step;
+            const sum = @addWithOverflow(@as(i64, @bitCast(regs.bitsAt(a))), step);
+            const idx: i64 = sum[0];
             regs.setInt(a, idx);
+            if (sum[1] != 0) return false;
             if (tl == .int) {
                 const limit: i64 = @bitCast(regs.bitsAt(a + 1));
-                return if (step >= 0) idx <= limit else limit <= idx;
+                return if (step > 0) idx <= limit else limit <= idx;
             }
             // `for i = 1, n / 2`: an int loop with a float limit.
             const o = value.compareNumeric(Value.int(idx), Value.float(@bitCast(regs.bitsAt(a + 1))));
-            return if (step >= 0) o == .lt or o == .eq else o == .gt or o == .eq;
+            return if (step > 0) o == .lt or o == .eq else o == .gt or o == .eq;
         }
         if (ti == .float and ts == .float and (tl == .float or tl == .int)) {
             @setFloatMode(.strict);
@@ -7971,23 +8037,23 @@ pub const Vm = struct {
             regs.setFloat(a, idx);
             if (tl == .float) {
                 const limit: f64 = @bitCast(regs.bitsAt(a + 1));
-                return if (!(step < 0)) idx <= limit else limit <= idx;
+                return if (step > 0) idx <= limit else limit <= idx;
             }
             const o = value.compareNumeric(Value.float(idx), Value.int(@bitCast(regs.bitsAt(a + 1))));
-            return if (!(step < 0)) o == .lt or o == .eq else o == .gt or o == .eq;
+            return if (step > 0) o == .lt or o == .eq else o == .gt or o == .eq;
         }
         return forLoopStepMixed(regs, a);
     }
 
-    /// `forLoopStep`'s mixed-type remainder, kept out of line so the raw
-    /// lanes above don't share a frame with the `arith` calls.
+    /// `forLoopStep`'s mixed-type remainder (a float index with an int step:
+    /// `for_prep` makes the index a float whenever the step is one), kept out
+    /// of line so the raw lanes above don't share a frame with the `arith`
+    /// calls. The add can't overflow, as its result is a float.
     noinline fn forLoopStepMixed(regs: RegWindow, a: usize) Error!bool {
         regs.set(a, try arith.add(regs.get(a), regs.get(a + 2)));
-        const idx = regs.get(a);
         const limit = regs.get(a + 1);
-        const step = regs.get(a + 2);
-        const ascending = !(try arith.lt(step, Value.int(0)));
-        return if (ascending) try arith.le(idx, limit) else try arith.le(limit, idx);
+        if (!limit.isNumber()) return Error.TypeError;
+        return arith.forWithin(regs.get(a), limit, regs.get(a + 2));
     }
 
     /// `R[a] = R[b] <op> R[c]` for band/bor/bxor. Bitwise ops require integer
@@ -8554,6 +8620,7 @@ pub fn catchable(e: Error) bool {
         Error.HostError,
         Error.Unimplemented,
         Error.MetatableChainLoop,
+        Error.ForStepZero,
         => true,
         Error.OutOfMemory,
         Error.EffectLogExhausted,
@@ -8985,7 +9052,7 @@ fn nativePrint(ctx: *anyopaque, args: []const Value) anyerror!Value {
         }
     }
     try w.writeAll("\n");
-    if (to_stdout) io.flush();
+    if (to_stdout) io.stdoutWrote(true);
     return Value.nil();
 }
 
@@ -9064,12 +9131,27 @@ fn nativeIoWrite(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const to_stdout = vm.out == null;
     const w = vm.out orelse io.stdout();
     var buf: [64]u8 = undefined;
+    var newline = false;
     for (args) |a| {
         const bytes = try coerceConcat(a, &buf);
         try w.writeAll(bytes);
+        if (to_stdout and !newline) newline = std.mem.indexOfScalar(u8, bytes, '\n') != null;
     }
-    if (to_stdout) io.flush();
+    if (to_stdout) io.stdoutWrote(newline);
     return Value.nil();
+}
+
+/// `io.flush()`: push buffered output out now. stdout is fully buffered when
+/// it is not a terminal (doc 65 §6), so a script that wants a progress line
+/// seen before a long computation flushes it. Flushes the VM's output seam
+/// (`Vm.out`) when one is set, else the process stdout. Returns `true`, as
+/// Lua's does; a failed flush raises (doc 65 §4.4).
+fn nativeIoFlush(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    _ = args;
+    const vm: *Vm = @ptrCast(@alignCast(ctx));
+    const w = vm.out orelse io.stdout();
+    try w.flush();
+    return Value.boolean(true);
 }
 
 /// Coerce a concat operand to bytes: a string's own bytes, or a number formatted

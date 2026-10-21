@@ -2577,6 +2577,57 @@ pub fn disarmAllLinks(self: *TraceState) void {
     self.registry.native_physical.disarmAllLinks(&self.registry.mcode_arena);
 }
 
+/// Doc 64 §15 (1d): does `link` depend on region `id`, whose def has
+/// `member_points`? A `.region_bridge` armed on `id`'s proof; a link whose
+/// parent and child anchors are both member points (one of the edges the
+/// region's window judged — `edgeMemberOfRegion`'s test, read raw so a
+/// tombstoned def still answers); and, for a gate, a link into the gated
+/// owner, which would otherwise jump past the dispatch gate. Everything else
+/// was armed on per-trace evidence the region never authorized.
+pub fn linkDependsOnRegion(link: NativeLink, id: RegionId, member_points: []const ProgramPoint, gated: ?AnchorKey) bool {
+    if (link.kind == .region_bridge and link.region_id != null and link.region_id.? == id) return true;
+    if (gated) |g| {
+        const c = link.child.code.anchor;
+        if (c.proto == g.proto and c.pc == g.pc) return true;
+    }
+    return hasMemberPoint(member_points, link.parent.code.anchor) and
+        hasMemberPoint(member_points, link.child.code.anchor);
+}
+
+fn hasMemberPoint(member_points: []const ProgramPoint, a: AnchorKey) bool {
+    for (member_points) |p| {
+        if (p.proto_id == a.proto_id and p.source_pc == a.pc) return true;
+    }
+    return false;
+}
+
+/// Doc 64 §15 (1d): tear down region `id`'s own links instead of the whole
+/// registry — the links `linkDependsOnRegion` names, with `gated` the owner a
+/// window gate just struck (null for `invalidateRegion`). Sets and parked
+/// proofs that share a removed cell go with it through `prepareSlotMutation`;
+/// the region's own parked proof is dropped here. Marks first and sweeps
+/// through `disarmCondemned`, so a request mid-replay-walk defers to
+/// `applyPendingDisarms` with its answer already fixed. A def that is gone
+/// fails closed to `disarmAllLinks`.
+pub fn disarmRegionLinks(self: *TraceState, id: RegionId, gated: ?AnchorKey) void {
+    defer self.syncNativeInvalidation();
+    const phys = &self.registry.native_physical;
+    phys.debug_log = self.config.debug_log;
+    const def = self.region_policy.region_defs.get(id) orelse {
+        phys.disarmAllLinks(&self.registry.mcode_arena);
+        return;
+    };
+    phys.dropParkedProof(id);
+    var marked: usize = 0;
+    for (phys.armed_links.items) |*link| {
+        if (!linkDependsOnRegion(link.*, id, def.member_points, gated)) continue;
+        link.condemned = true;
+        marked += 1;
+    }
+    self.dbg("disarmRegionLinks: rid={d} resetting {d} of {d} armed links", .{ @intFromEnum(id), marked, phys.armed_links.items.len });
+    if (marked != 0) phys.disarmCondemned(&self.registry.mcode_arena);
+}
+
 /// Part S: drop a `.sibling_handoff` link's parent-side latch. EVERY path that
 /// removes an armed link must call this, or `hasArmedSiblingHandoff`'s fast reject
 /// stops being an exact necessary condition (it would keep saying "maybe" for a

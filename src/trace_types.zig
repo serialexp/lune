@@ -50,7 +50,7 @@ pub const GuardRole = enum(u8) {
     operand_type, // arith/compare/eq/bitwise/neg/bnot operand; numeric-for control reg
     branch_cond, // jmp_if_true/false condition
     limit_int, // for_loop/for_prep float-limit → int specialization (int_of_float)
-    loop_done, // for_loop / for_prep-first-iter continuation test (guard_true)
+    loop_done, // for_loop continuation test (guard_true)
     container_type, // get/set_index container tag (guard_table)
     container_lane, // array element-lane (guard_lane)
     key_type, // array/grid index type (guard_int / guard_float on the key)
@@ -81,6 +81,12 @@ pub const GuardRole = enum(u8) {
     /// no branch consumer, no exit attach (`TraceCode.isLoopTestCopy`).
     loop_test_copy,
     step_sign, // numeric-for step direction (guard_step_up / guard_step_down)
+    step_overflow, // numeric-for int step can't overflow (guard_for_nov)
+    /// A `for_prep`'s first-trip test (`guard_true` when the loop ran,
+    /// `guard_false` when it was skipped). An ordinary exit that resumes at
+    /// the `for_prep`, which re-runs the test — so it attaches like any
+    /// other: its child is the LuaJIT side trace off a FORI exit.
+    for_entry,
 };
 
 /// Static register designator for the guarded operand (H-1c). Covers `a`/`b`/`c`,

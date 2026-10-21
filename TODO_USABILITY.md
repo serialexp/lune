@@ -21,13 +21,13 @@ effect log so runs stay replayable (doc 02).
       `io.stdout`, `io.stderr`; `file:read/write/lines/seek/flush/setvbuf/close`.
 - [ ] `os.exit`, `os.getenv`, `os.time`, `os.date`, `os.remove`,
       `os.rename`, `os.tmpname`.
-- [ ] The inventory says `io.write` is `not-started`, but it works: fix the
-      row (Rule Z-5).
+- [x] The inventory says `io.write` is `not-started`, but it works: fix the
+      row (Rule Z-5). Doc 65 Phase 0; `io.flush` added too.
 - [ ] `collectgarbage` is `core` + `not-started` (not excluded); at least
       `"count"` and `"collect"` are used by ordinary code.
-- [ ] `prog > log 2>&1` mangles stdout: stderr overwrites the start of the
-      shared file (looks like positional writes, or stdout buffered past
-      stderr). Pipes, `>>` and separate files are fine.
+- [x] `prog > log 2>&1` mangles stdout: stderr overwrites the start of the
+      shared file. Positional writes; doc 65 Phase 0 made stdout/stderr
+      streaming writers, with C-stdio buffering.
 - [ ] `os.clock()` returns an absolute value (~4.5e6); Lua's is CPU time
       since start. Deltas work.
 
@@ -147,29 +147,37 @@ effect log so runs stay replayable (doc 02).
       format (`schema/trace.json`) has no line info. Clicking a trace or IR
       row highlights nothing.
 - [ ] No IR vocabulary: no op tooltips/legend (`slot_load`, `phi`, `snap`,
-      `entry`); `%3` doesn't jump to its definition; registers never show
-      variable names (IR or replay LOCALS).
+      `entry`); registers never show variable names (IR or replay LOCALS).
+      (Op tooltips wait on the in-flight `viz/src/enums.ts` edit landing.)
+  - [x] `%3` links to its definition (hover marks the row, click scrolls
+        and flashes it) — 9fbbffd.
 - [ ] Side traces shown as unrelated flat rows (no parent/exit/link tree).
-- [ ] "Recorded but never executed" shown for traces that ran — always, for
-      CLI-produced `.mahinatrace` (no execution log in CLI artifacts).
+- [x] "Recorded but never executed" shown for traces that ran — a
+      `.mahinatrace` now says it holds no execution log and points at
+      Run (wasm) to animate.
 - [ ] Abort reasons (`--dump-aborts`) never reach the UI; a program whose
       loops all abort gets "A program with a hot loop records a trace."
 - [ ] `mahina viz x.mahinatrace` shows the trace under the default
       playground source; keyframe/effects/coverage files can't be loaded.
       Consider `mahina viz prog.lua`, or embed the source in the trace.
-- [ ] Wrong file types load as garbage source / sticky decode error; sniff
-      magic bytes.
-- [ ] Loading new source during replay leaves stale state, then a
-      CodeMirror `Position … out of range` crash on Run.
-- [ ] No Stop for a runaway wasm run; disabled buttons look enabled; muted
-      text contrast ~2.5:1 at 9–10px; icon buttons lack `aria-label`; no
-      keyboard shortcuts; fixed panes; GLOBALS wraps per character at
-      1024px and lists ~40 builtins.
-- [ ] Editor stripes have no legend and classify by majority, so a loop
-      that went native shows red when warm-up iterations outnumber native
-      ones (`classifyLine`, `viz/src/store.ts`).
-- [ ] `viz/README.md` is stale (says "not yet time-stepping"; no mention of
-      the editor, replay, coverage or diff).
+- [x] Wrong file types load as garbage source / sticky decode error. The
+      artifacts have no magic bytes, so: a strict trace decode (version
+      word + exact length, with a reason), and binary/non-UTF-8 files are
+      refused as source with a visible error.
+- [x] Loading new source during replay leaves stale state, then a
+      CodeMirror `Position … out of range` crash on Run. Fixed (replay
+      closes, highlight clears on doc change); the browser smoke covers it.
+- [x] Stop for a runaway wasm run; disabled buttons look disabled; muted
+      text 4.5:1+ at 0.75rem; `aria-label`s; Ctrl/⌘+Enter, Shift+…, Esc and
+      replay transport keys; GLOBALS no longer wraps and hides builtins
+      behind a toggle.
+  - [ ] Panes are still fixed (no resize).
+- [~] Editor stripes now have a legend and per-line tooltips. Still open:
+      they classify by majority, so a loop that went native shows amber
+      when warm-up iterations outnumber native ones (`classifyLine`,
+      `viz/src/store.ts`). A correct split needs a per-anchor post-trace
+      tier-0 counter from `src/trace.zig` in the coverage artifact.
+- [x] `viz/README.md` rewritten for the current features.
 
 ## 7. Embedding (C API + Rust crates)
 

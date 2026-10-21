@@ -87,14 +87,19 @@ pub const OpCode = enum(u8) {
     ///             falsy value (`false`, `0`) keeps the lhs rather than falling
     ///             through to the rhs.
     jmp_if_not_nil,
-    /// `a, aux`    numeric-for setup. R[a..a+3) = (idx, limit, step); validates
-    ///             they are numbers, pre-subtracts step from idx, then `pc += aux`
-    ///             to the matching `for_loop`.
+    /// `a, aux`    numeric-for setup (Lua 5.4's FORPREP). R[a..a+3) = (init, limit,
+    ///             step); validates they are numbers and the step nonzero. The
+    ///             first index is init, a float unless init and step are both
+    ///             ints. If it is within the limit, it goes to R[a] and the loop
+    ///             variable R[a+3] and the body (the next pc) runs; otherwise
+    ///             `pc += aux + 1`, past the matching `for_loop` that `aux`
+    ///             targets.
     for_prep,
     /// `a, aux`    numeric-for step+test. idx (R[a]) += step (R[a+2]); if still
-    ///             within limit (R[a+1], direction from step's sign), copy idx to
-    ///             the loop variable R[a+3] and `pc += aux` (back-edge to the
-    ///             body). Otherwise fall through (loop done).
+    ///             within limit (R[a+1], direction from step's sign) and an int
+    ///             add didn't overflow, copy idx to the loop variable R[a+3] and
+    ///             `pc += aux` (back-edge to the body). Otherwise fall through
+    ///             (loop done).
     for_loop,
     /// `a, aux, b` patched trace entry (doc 20, the LuaJIT `BC_JFORL`
     ///             analogue). Written ONLY into a per-VM copy-on-patch code
@@ -270,8 +275,8 @@ pub const LoopExtent = struct {
 /// every topology rebuild, so a whole-proto scan made the rebuild
 /// O(members × code)). Every loop shape the compiler emits pins its own
 /// back-edge from the instruction right above its header:
-///  - numeric `for`: `for_prep` at `header − 1` jumps to its `for_loop`, whose
-///    taken edge returns to `header` (`compileNumericFor`);
+///  - numeric `for`: `for_prep` at `header − 1` names its `for_loop` in `aux`;
+///    the `for_loop`'s taken edge returns to `header` (`compileNumericFor`);
 ///  - generic `for`: a forward `jmp` at `header − 1` enters the test block
 ///    (`move`s and the iterator `call`) that ends in the `tfor_loop` returning
 ///    to `header` (`compileGenericFor`);
@@ -361,16 +366,16 @@ pub fn loopExtentFor(proto: *const Proto, header: u32) ?LoopExtent {
 /// instruction every entry into its body passes through, first entry and
 /// repetition alike — or null when the loop's shape is not recognised (fail
 /// closed). For a `while`/`repeat` loop it is the `loop` marker at
-/// `header − 1`. For a numeric or generic `for` it is the back-edge op
-/// (`for_loop`/`tfor_loop`): `for_prep` never falls through into the body but
-/// jumps to the `for_loop`, which performs the first test, and a generic
-/// `for` enters through the iterator call block that ends at its
-/// `tfor_loop`. The header itself is NOT a gate: a zero-trip loop reaches the
-/// code after it without passing the header.
+/// `header − 1`; for a numeric `for`, likewise the `for_prep` at `header − 1`,
+/// which performs the first test and either enters the body or skips the
+/// loop. A generic `for` enters through the iterator call block that ends at
+/// its `tfor_loop`, which is its gate. The header itself is NOT a gate: a
+/// zero-trip loop reaches the code after it without passing the header.
 pub fn loopGateOf(proto: *const Proto, header: u32) ?u32 {
     const ext = loopExtentFor(proto, header) orelse return null;
     return switch (ext.back_edge_op) {
-        .loop, .for_loop, .tfor_loop => ext.back_edge_pc,
+        .loop, .tfor_loop => ext.back_edge_pc,
+        .for_loop => header - 1,
         else => null,
     };
 }
@@ -789,11 +794,12 @@ test "doc 58 §4.8: loopExtentFor and loopGateOf on every compiler loop shape" {
     const rp = Proto{ .code = &repeat_code };
     try testing.expectEqual(LoopExtent{ .start = 0, .end = 3, .back_edge_pc = 0, .back_edge_op = .loop }, loopExtentFor(&rp, 1).?);
     try testing.expectEqual(@as(?u32, 0), loopGateOf(&rp, 1));
-    // Numeric `for`: for_prep → for_loop; body (header 1); for_loop → header.
+    // Numeric `for`: for_prep (names the for_loop); body (header 1); for_loop
+    // → header. The for_prep is the gate.
     const for_code = [_]Instr{ Instr.opAx(.for_prep, 0, 1), Instr.opAx(.load_int, 4, 0), Instr.opAx(.for_loop, 0, -2), Instr.op0(.ret) };
     const fp = Proto{ .code = &for_code };
     try testing.expectEqual(LoopExtent{ .start = 1, .end = 2, .back_edge_pc = 2, .back_edge_op = .for_loop }, loopExtentFor(&fp, 1).?);
-    try testing.expectEqual(@as(?u32, 2), loopGateOf(&fp, 1));
+    try testing.expectEqual(@as(?u32, 0), loopGateOf(&fp, 1));
     // Generic `for`: jmp → test block; body (header 1); move×3; call; tfor_loop → header.
     const gen_code = [_]Instr{
         Instr.opAx(.jmp, 0, 1),      Instr.opAx(.load_int, 6, 0),

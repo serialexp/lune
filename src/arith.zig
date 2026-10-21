@@ -243,6 +243,40 @@ pub fn sar(a: Value, b: Value) Error!Value {
     return Value.int(shiftRightArith(a.asInt(), b.asInt()));
 }
 
+// ---- numeric `for` ----
+// Shared by tier-0 (`for_prep`, `for_loop`), the recorder and the trace IR's
+// `for` guards, so every tier decides a loop identically. `idx`, `limit` and
+// `step` are numbers: `for_prep` type-checks them first.
+
+/// Whether a numeric `for` step is zero: int `0`, or a float equal to `0.0`
+/// (so `-0.0` too; NaN is not zero). `for_prep` raises `ForStepZero` on it, as
+/// Lua 5.4's `forprep` does, and the recorder aborts on it.
+pub fn forStepIsZero(step: Value) bool {
+    return if (step.isInt()) step.asInt() == 0 else step.asFloat() == 0.0;
+}
+
+/// Whether a numeric `for` counts upward: `0 < step`, as Lua 5.4 tests it, so
+/// a NaN step counts downward (`for i = 10, 1, 0/0` runs once, with 10).
+pub fn forStepAscending(step: Value) bool {
+    return if (step.isInt()) step.asInt() > 0 else step.asFloat() > 0;
+}
+
+/// The first index of a numeric `for`: `init` itself, made a float unless
+/// `init` and `step` are both ints. A loop is an int loop exactly when both
+/// are (Lua 5.4's `forprep`); the limit's type doesn't matter.
+pub fn forFirstIndex(init: Value, step: Value) Value {
+    if (init.isInt() and !step.isInt()) return Value.float(@floatFromInt(init.asInt()));
+    return init;
+}
+
+/// The numeric-`for` limit test: `idx <= limit` when counting upward, else
+/// `limit <= idx`. Exact across int and float (`compareNumeric`); a NaN
+/// fails it.
+pub fn forWithin(idx: Value, limit: Value, step: Value) bool {
+    const o = if (forStepAscending(step)) value.compareNumeric(idx, limit) else value.compareNumeric(limit, idx);
+    return o == .lt or o == .eq;
+}
+
 // ---- comparisons ----
 
 /// `a < b`. Numbers compare by value (a `NaN` operand makes this false); two

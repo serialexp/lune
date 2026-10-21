@@ -65,8 +65,9 @@ earlier in `/tmp/t0micro/`).
       a later `run(1, 3, 1)` with the descending test, and under `--trace`
       and `--jit-native` that call never ended; nested loops printed wrong
       totals. Fixed 2026-10-21 the LuaJIT way (`rec_for_check`): a
-      non-constant step gets `guard_step_up` (`!(step < 0)`) or
-      `guard_step_down` (wire ordinals 97–98). These are new ops rather than
+      non-constant step gets `guard_step_up` (`0 < step`, Lua 5.4's
+      rule, so a NaN step counts down) or `guard_step_down` (wire ordinals
+      97–98). These are new ops rather than
       `lt` + `guard_true`/`guard_false`, because every loop-test
       classifier reads a truthiness guard sourced at the anchor's
       `for_loop` as the loop test, whose exit resumes after the loop. They
@@ -90,28 +91,62 @@ earlier in `/tmp/t0micro/`).
       continuations read the step as a `slot_load`. The lever is
       parent-constant inheritance for continuation inputs (or an entry-time
       pin, like doc 57's prologue-checked value pins).
-- [ ] **A zero `for` step loops forever instead of raising** (noted
-      2026-10-21). `for i = 1, 3, 0` and `for i = 1, 3, 0.0` never end;
-      Lua 5.4's `forprep` raises `'for' step is zero`. Pre-existing. The
-      fix is a check in tier-0's `for_prep`, plus `recForPrepLink`, which
-      records inner `for_prep`s, aborting on a zero step.
-- [ ] **`next` returns no values at the end of a traversal** (noted
+- [x] **A zero `for` step looped forever instead of raising** (noted
+      2026-10-21). `for i = 1, 3, 0` and `for i = 1, 3, 0.0` never ended;
+      Lua 5.4's `forprep` raises `'for' step is zero`. Fixed 2026-10-21:
+      tier-0 `for_prep` raises the new catchable `Error.ForStepZero` for
+      int `0` and `±0.0` (`arith.forStepIsZero`; NaN is not zero), and
+      `recForPrepLink` aborts on it. A `for` type error now names the
+      control value, as Lua 5.4 does (`'for' limit must be a number`),
+      where it used to print a bare `TypeError`. Tests: three `for:`
+      semantics tests (ten legs each), one of them a hot loop whose inner
+      step turns zero.
+- [x] **`next` returns no values at the end of a traversal** (noted
       2026-10-20). `select("#", next({}))` is 0; Lua 5.4 returns one `nil`
-      (1). `stdlib/base.zig` `nNextN`: `if (!step.found) return 0;`. A
-      generic `for` doesn't notice (a missing result reads as nil), but
-      `print(next(t))` prints nothing instead of `nil`. Decide whether this
-      is a deliberate divergence; if not, return one nil.
-- [ ] **Bug: an integer `for` that reaches `math.maxinteger` /
+      (1). Decided 2026-10-21 (Bart): deliberate, keep it. A generic `for`
+      reads a missing result as nil.
+- [x] **Bug: an integer `for` that reaches `math.maxinteger` /
       `math.mininteger` never ends.** `for i = math.maxinteger - 1,
-      math.maxinteger do … end` wraps `idx` to `mininteger` and keeps
+      math.maxinteger do … end` wrapped `idx` to `mininteger` and kept
       going (Lua 5.4: 2 iterations). Same in tier-0, `--trace` and
-      `--jit-native`; the baseline before the fast path did it too (Lua
-      5.3 had the same bug). A plain overflow check on the add is wrong:
-      `for_prep` pre-subtracts the step, so `for i = math.mininteger, 0`
-      legitimately wraps on the first add. Lua 5.4 precomputes an
-      unsigned iteration count in `forprep`. Every tier's `for_loop`
-      (tier-0, `irinterp`, recorder, native loop-done guards) changes
-      together, so it needs a decision on the shape first.
+      `--jit-native`. Fixed 2026-10-21 in Lua 5.4's `forprep` shape:
+      `for_prep` no longer pre-subtracts the step. It validates, raises on
+      a zero step, takes the first index as `init` itself
+      (`arith.forFirstIndex`), runs the first trip test, and enters the
+      header with `R[a]`/`R[a+3]` published. The int lane of
+      `forLoopStep` then stops when `idx + step` overflows. Traces guard
+      that with the new op `guard_for_nov` (wire ordinal 99; LICM hoists
+      it when the limit is invariant), lowered in tier-1a and native.
+      Moving the first trip into `for_prep` broke two link paths, both
+      fixed in the same change. First, a `for_prep` whose loop is patched
+      to `.jfor_loop` now takes that patched entry, as LuaJIT patches FORI
+      to JFORI (`TraceState.for_prep_patched` counts it; euler14-bit had
+      recorded a duplicate sibling and thrashed, +65%). Second, the
+      `for_prep` first-trip test is a `.for_entry` guard, an attachable
+      exit: an exit-side child records at the `for_prep`, and
+      `recForPrepLink` records through a header with no root only when
+      the recording starts at that `for_prep` (scimark-fft's region had
+      split, +33%). The exit adapter also copies an invariant slot's raw
+      value into another slot now (nsieve-bit-fp's `refused: kind`).
+      Board, instructions vs HEAD: scimark-fft −1.4%, euler14-bit −1.6%,
+      scimark-lu +0.1%, every other row flat. Tests: two `for:` semantics
+      tests (the integer edge, and `init` as the first value with a NaN
+      step counting down), a native-vs-tier-1a `guard_for_nov` op test,
+      a patched-entry test, the fft region test (five members) and an
+      LU test that no continuation records into a rootless loop. All
+      mutation-checked.
+- [ ] **A continuation cannot record through a rootless loop's
+      `for_prep`.** `recForPrepLink` aborts a recording that reaches a
+      `for_prep` whose header has no root unless the recording started at
+      that `for_prep`. Allowing it everywhere made scimark-lu +13% (noted
+      2026-10-21). The continuation after `lu_factor`'s scaling loop then
+      recorded into the elimination nest, which entered the inner
+      `for k` ↔ `for i` cycle from outside, and silent promotion of that
+      cycle collapsed. The general fix is region-prefix support: a region
+      admits a straight-line prefix trace that enters the cycle at one
+      member without counting it as an outside entry. The test
+      `for_prep: a continuation that reaches a rootless loop's for_prep
+      ends there` pins today's behaviour and flips when that lands.
 - [x] **Compare, `eq` and `mod`/`idiv` had no fast path.** Every `<` went
       through `compareMeta`, every `==` through `valuesEqual`, and `%`/`//`
       through `opArithMeta`, all out of line. Fixed 2026-10-21 in tier-0:
@@ -251,9 +286,11 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
          580 replayed rows per activation; the seam is still 50.9% of the
          run. Parked-proof reuse never fires (`fallback_owner`-only).
          Parking for every armable region was measured: fft −6.43%
-         instructions, nsieve-bit-fp +35.21% (a parked pre-t7 set is
-         reused 16,357 times, detection never runs again, and the t6
-         self-row comes back at 1.03M). Options (a)–(d) in §16, waiting on
+         instructions, nsieve-bit-fp +35.21%. The gate widening is sound
+         (Codex + Antigravity). The regression is discovery starvation:
+         the `while` root at pc 40 is never recorded (its sixth
+         loop-leave abort is its last try), because the `while` runs on
+         t2 → t6 → t6 natively. Options (a), (e)–(g) in §16, waiting on
          Bart.
 - [ ] **Measured P6-Q3(b), bursts take exit adapters (experiment,
       reverted 2026-10-19).** The cause of the `for k` root's give-up

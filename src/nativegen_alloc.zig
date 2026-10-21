@@ -1657,6 +1657,7 @@ pub fn opMayExitInBody(
         .int_of_float,
         .guard_step_up,
         .guard_step_down,
+        .guard_for_nov,
         .ffloor,
         .fceil,
         .hload,

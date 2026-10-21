@@ -1,8 +1,8 @@
 # 65 — The `io` and `os` host library — Design
 
-Status: draft, not yet implemented. Ground rules D1–D4 (2026-10-20) and
-all ten design questions Q1–Q10 (2026-10-21) decided by Bart; the
-design below reflects the answers. Phase 0 is ready to start.
+Status: Phase 0 implemented; Phases 1–6 not started. Ground rules D1–D4
+(2026-10-20) and all ten design questions Q1–Q10 (2026-10-21) decided by
+Bart; the design below reflects the answers.
 Owner: Bart
 Last updated: 2026-10-21
 
@@ -29,18 +29,24 @@ checked. Every phase lands behind `just test`, `just hashgate` and
 - [x] **Decision D4 — embedding gets no system interfaces by default**,
   but enabling all of them must be one switch. Bart, 2026-10-20.
 - [x] **Decisions Q1–Q10** (§10). Bart, 2026-10-21.
+- [x] **Phase 0 — stdout/stderr correctness and buffering.** 2026-10-21.
+  - [x] Streaming writers for stdout/stderr (`src/io.zig`,
+    `writerStreaming`). `File.writer()` was std's *positional* writer, so
+    `prog > f 2>&1` made stdout and stderr each write from their own
+    offset 0 and overwrite each other (usability study §1).
+  - [x] The C-stdio buffering policy (§6, Q9), replacing the flush on
+    every `io.write` and `print`: line-buffered on a terminal
+    (`File.isTty`), fully buffered otherwise (4 KiB, sized by the sweep
+    in §9); stdout flushed before every stderr write (`stderrWriter`,
+    jitdbg probes), on `io.flush` (new) and when `main` returns. The
+    stdin-read and `os.exit` flush points arrive with those functions
+    (Phases 3 and 4); `setvbuf` with file handles (Phase 3).
+  - [x] Benchmarks `bench/stdlib/io_print.lua` and `io_write.lua` (§9).
+  - [x] Inventory rows for `io.write` and `io.flush` (`base-host`,
+    `partial`: both act on stdout only until Phase 3 adds handles).
 
 ### Outstanding
 
-- [ ] **Phase 0 — stdout/stderr correctness and buffering.**
-  - [ ] Streaming writers for stdout/stderr (`src/io.zig`). Today
-    `File.writer()` is std's *positional* writer, so `prog > f 2>&1`
-    makes stdout and stderr each write from their own offset 0 and
-    overwrite each other (usability study §1).
-  - [ ] The C-stdio buffering policy (§6, Q9) with its benchmark,
-    replacing the flush on every `io.write` and `print`.
-  - [ ] Fix the inventory row for `io.write` (says `not-started`; it
-    works).
 - [ ] **Phase 1 — one host seam and the system switch.**
   - [ ] `HostSystem` (§5) replaces `FsSource` and `HostEnv` and adds
     files, stdio, wall time and the local time zone.
@@ -403,6 +409,23 @@ same files:
 | Record-mode line loop, cap raised | log ≈ the bytes read, no superlinear growth |
 
 The budgets are a proposal for Bart to adjust.
+
+**Phase 0 measurements** (2026-10-21; best of 7 to 11 runs, Linux x86-64,
+ReleaseFast; "before" is master with a flush per call):
+
+| Benchmark | before | after | `lua5.4` | LuaJIT |
+|---|---|---|---|---|
+| `io_print` 1 M lines → file | 0.227 s | 0.038 s | 0.400 s | 0.054 s |
+| `io_print` 1 M lines → pipe | 0.208 s | 0.033 s | — | — |
+| `io_write` 100 MB in 4 KiB → file | 0.052–0.057 s | 0.050–0.055 s | 0.055 s | 0.051 s |
+| `io_write` 100 MB in 4 KiB → pipe | 0.0077–0.0083 s | 0.0071 s | 0.007 s | — |
+
+Both are inside the 1.5× budget. A million `print`s went from 1 M
+`pwritev` calls to 443 `writev` calls. Sweeping the stdout buffer:
+16 KiB and 32 KiB cut `print` to a file by a further 1–2 ms, but they
+copy each 4 KiB `io.write` into the buffer instead of passing it
+straight to the kernel, so 100 MB to a pipe took 9–13 ms instead of
+7 ms. We use 4 KiB.
 
 ## 10. Design questions (all decided 2026-10-21)
 

@@ -45,7 +45,7 @@ test "phase Q: a runtime-built find pattern only a trace pins is swept as in tie
         \\for k = 1, 5000 do local junk = {} end
         \\local again = "%d" .. "+"
         \\print({})
-    , "2000\ntable: 0x1471\n");
+    , "2000\ntable: 0x1473\n");
 }
 
 test "phase Q: a runtime-built gmatch pattern only a trace pins is swept as in tier-0" {
@@ -63,7 +63,7 @@ test "phase Q: a runtime-built gmatch pattern only a trace pins is swept as in t
         \\for k = 1, 5000 do local junk = {} end
         \\local again = "%d" .. "+"
         \\print({})
-    , "1800\ntable: 0x15a0\n");
+    , "1800\ntable: 0x15a2\n");
 }
 
 const installCollect = util.installCollect;
@@ -93,7 +93,7 @@ test "phase Q: a collection from a host call retires a patched trace and re-entr
         \\pcall(function() collect() end)
         \\print(f("%d" .. "+"))
         \\print({})
-    , "2000\n2000\n2000\ntable: 0xee\n", .{ .setup = installCollect, .inspect = expectRetiredInJitLegs });
+    , "2000\n2000\n2000\ntable: 0xf0\n", .{ .setup = installCollect, .inspect = expectRetiredInJitLegs });
 }
 
 /// How many armed links the checking collector has seen survive a teardown,
@@ -639,7 +639,6 @@ test "phase Q: a cancel mid-peel frees the owned link contract and never closes 
     var plc: trace_recorder.PendingLinkClose = undefined;
     plc.contract = contract;
     plc.saved_reg_map = saved;
-    plc.phase = .peeling;
     vm.trace.rec.pending_link_close = plc;
     vm.collect();
     try testing.expect(!vm.trace.isRecording());
@@ -754,8 +753,8 @@ test "phase Q: link peels end linked, one-trip, type-mismatched and rewound in e
     try testing.expectEqual(peel_setups, ended);
 }
 
-/// `for_prep r0` at pc 0 jumps to the `for_loop r0` at pc 2, whose back-edge
-/// is the inner loop header at pc 1: the link target.
+/// `for_prep r0` at pc 0 names the `for_loop r0` at pc 2, whose back-edge is
+/// the inner loop header at pc 1: the link target.
 const peel_code = [_]Instr{
     Instr.opAx(.for_prep, 0, 1),
     Instr.op0(.ret),
@@ -822,43 +821,15 @@ test "phase Q: an inner root retired mid-peel leaves the peel valid, and it clos
     try testing.expect(vm.trace.isRecording());
     try testing.expectEqualSlices(trace.EntryGuard, &.{.{ .slot = 4, .ty = .float }}, vm.trace.rec.pending_link_close.?.contract);
 
-    // Tier-0's `for_prep` left r0 = init - step; the first `for_loop` visit
-    // is the entry bounds check.
-    regs.setInt(0, 0);
-    try vm.trace.rec.recForLoop(code[2], regs, 3);
-    try testing.expectEqual(trace_recorder.PendingLinkClose.Phase.peeling, vm.trace.rec.pending_link_close.?.phase);
-    // The body made r4 a float; the post-body `for_loop` closes `.link`.
-    regs.setInt(0, 1);
+    // Tier-0's `for_prep` entered the body with r0 = r3 = 1. The body made
+    // r4 a float; the post-body `for_loop` closes `.link`.
+    regs.setInt(3, 1);
     regs.setFloat(4, 0.5);
     try vm.trace.rec.recForLoop(code[2], regs, 3);
     try testing.expect(vm.trace.rec.pending_link_close == null);
     try testing.expectEqual(@as(u64, 1), vm.trace.rec.link_peel_ends.get(.linked));
     try testing.expect(vm.trace.rec.close_requested);
     try testing.expectEqual(@as(?u32, 1), vm.trace.rec.link_target);
-    vm.trace.abort(.nyi_opcode);
-}
-
-test "phase Q: a peel whose first for_loop visit leaves the loop frees its contract (zero-trip)" {
-    // Unreachable from a program today: the peel is only set up when the
-    // loop runs, and nothing runs between `for_prep` and that visit. The
-    // branch stays as a fail-safe; this drives it directly.
-    const gpa = testing.allocator;
-    var vm = try Vm.init(gpa);
-    defer vm.deinit();
-    var code = peel_code;
-    const proto = Proto{ .code = &code, .id = 9021, .name = "phaseq-peel-zero", .num_registers = 8 };
-    const kept = try vm.heap.internValue("phaseq-peel-zero-kept");
-    try vm.globals.set(vm.gpa, try vm.heap.internValue("phaseq_peel_zero_keep"), kept);
-    _ = try startPeelRecording(&vm, &proto, kept);
-    var rs: PeelRegs = .{};
-    const regs = rs.window();
-    try vm.trace.rec.recForPrepLink(code[0], regs, &proto, 1);
-    regs.setInt(0, 0);
-    regs.setInt(1, 0);
-    try vm.trace.rec.recForLoop(code[2], regs, 3);
-    try testing.expect(vm.trace.rec.pending_link_close == null);
-    try testing.expectEqual(@as(u64, 1), vm.trace.rec.link_peel_ends.get(.zero_trip));
-    try testing.expect(vm.trace.isRecording());
     vm.trace.abort(.nyi_opcode);
 }
 

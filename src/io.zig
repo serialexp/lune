@@ -7,9 +7,10 @@
 //! If a toolchain bump changes the writer API (or we change how a value prints),
 //! this is the only file to touch — not a thousand call sites.
 //!
-//! This is convenience/diagnostic I/O for the CLI and tests. It is emphatically
-//! not on any hot path; the VM core does its own buffered serialization for
-//! traces (binschema, Phase 5b).
+//! It also carries the CLI's process stdout — what `print`/`io.write` reach
+//! when no `Vm.out` seam is set — buffered C-stdio style (doc 65 §6), since a
+//! script printing in a loop makes that path hot. The VM core does its own
+//! buffered serialization for traces (binschema, Phase 5b).
 
 const std = @import("std");
 const value = @import("value.zig");
@@ -47,7 +48,20 @@ fn fsWriter() *Writer {
     return &fs_discarding.writer;
 }
 
+/// The stdout and stderr buffer size. With stdout fully buffered
+/// (`Buffering.full`) this is how much output one `write` syscall drains.
+/// Measured (doc 65 Phase 0; `bench/stdlib/io_print.lua`, `io_write.lua`):
+/// 4 KiB already batches a million short `print`s into a few thousand
+/// syscalls, and a bigger buffer makes 4 KiB `io.write` chunks get copied in
+/// instead of going straight to the kernel — 32 KiB was ~1.7× slower than
+/// 4 KiB writing 100 MB to a pipe.
 const buffer_len = 4096;
+
+/// How stdout is buffered (doc 65 §6) — C stdio's policy, which Lua inherits:
+/// line-buffered on a terminal, so an interactive user sees each line as it is
+/// printed, and fully buffered otherwise, so a program printing a million lines
+/// into a pipe or file makes a few hundred syscalls, not a million.
+pub const Buffering = enum { none, line, full };
 
 // Process-global, lazily initialised stdout plumbing. A global (stable address)
 // is required because the writer's vtable recovers the `File.Writer` from the
@@ -56,12 +70,21 @@ const buffer_len = 4096;
 var threaded: std.Io.Threaded = undefined;
 var file_writer: std.Io.File.Writer = undefined;
 var stdout_buffer: [buffer_len]u8 = undefined;
+var stdout_buffering: Buffering = .full;
 var initialized = false;
 
+// stdout and stderr are *streaming* writers, not std's default positional ones.
+// A positional writer tracks its own file offset and writes at it (`pwritev`),
+// so when both streams are the same file (`prog > log 2>&1`) each one starts at
+// offset 0 and they overwrite each other. Streaming writes append at the
+// file's shared position, like `write(2)` and C stdio.
 fn ensureInit() void {
     if (initialized) return;
     threaded = .init(std.heap.page_allocator, .{});
-    file_writer = std.Io.File.stdout().writer(threaded.io(), &stdout_buffer);
+    const file = std.Io.File.stdout();
+    file_writer = file.writerStreaming(threaded.io(), &stdout_buffer);
+    const tty = file.isTty(threaded.io()) catch false;
+    stdout_buffering = if (tty) .line else .full;
     initialized = true;
 }
 
@@ -74,12 +97,13 @@ var stderr_initialized = false;
 fn ensureStderr() void {
     if (stderr_initialized) return;
     ensureInit(); // shares the threaded io context
-    stderr_writer = std.Io.File.stderr().writer(threaded.io(), &stderr_buffer);
+    stderr_writer = std.Io.File.stderr().writerStreaming(threaded.io(), &stderr_buffer);
     stderr_initialized = true;
 }
 
 /// The buffered stdout writer. Output is not guaranteed visible until `flush()`
-/// (or use `print`, which flushes for you).
+/// (or use `print`, which flushes for you). A program-output write through it
+/// ends with `stdoutWrote`, which applies the buffering policy.
 pub fn stdout() *Writer {
     if (is_freestanding) {
         return fsWriter();
@@ -99,6 +123,33 @@ pub fn flush() void {
     }
 }
 
+/// Set by the first `flushForPanic`, so a panic raised *inside* that flush
+/// (stdout writer state the panic itself corrupted) doesn't try again.
+var panic_flushed = false;
+
+/// `flush()` for a panic handler (the CLI's `panic` in `main.zig`): push out
+/// what the program printed before the crash, at most once per process. A
+/// segfault in native code still loses the buffer; there is no safe point to
+/// flush from there.
+pub fn flushForPanic() void {
+    if (panic_flushed) return;
+    panic_flushed = true;
+    flush();
+}
+
+/// End of one program-output write to `stdout()` (`print`, `io.write`): flush
+/// it if the buffering policy says so. `newline` is whether the write
+/// contained a `\n`, which is what flushes a line-buffered stdout. A fully
+/// buffered stdout drains only when its buffer fills, on `flush()` (`io.flush`,
+/// CLI teardown), or before anything is written to stderr (`stderrWriter`).
+pub fn stdoutWrote(newline: bool) void {
+    switch (stdout_buffering) {
+        .none => flush(),
+        .line => if (newline) flush(),
+        .full => {},
+    }
+}
+
 /// printf-style line to stdout, flushed immediately. Swallows I/O errors —
 /// failing to print a banner is not the VM's problem. For explicit error
 /// handling, use `stdout()` directly.
@@ -109,11 +160,14 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
 }
 
 /// The buffered stderr writer. Diagnostics and CLI error messages go here so
-/// they don't interleave with a program's stdout.
+/// they don't interleave with a program's stdout. Getting it flushes stdout
+/// first, so when both go to one place (`2>&1`, a terminal) what the program
+/// printed before an error or warning appears before it, buffered or not.
 pub fn stderrWriter() *Writer {
     if (is_freestanding) {
         return fsWriter();
     } else {
+        flush();
         ensureStderr();
         return &stderr_writer.interface;
     }

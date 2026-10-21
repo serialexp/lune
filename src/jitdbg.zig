@@ -21,13 +21,19 @@
 //! and never touches program stdout, so byte-identity gates are unaffected.
 
 const std = @import("std");
+const io = @import("io.zig");
 
 /// Comptime master switch — `zig build -Djit-debug=true`.
 pub const enabled: bool = @import("build_options").jit_debug;
 
 /// Print one debug line to stderr (with a `[jit]` prefix). Compiled out
 /// entirely unless the build sets `-Djit-debug=true`. Callers are responsible
-/// for the runtime gate (`TraceState.config.debug_log`).
+/// for the runtime gate (`TraceState.config.debug_log`). Flushes the buffered
+/// process stdout first (doc 65 §6), so under `2>&1` each probe lands between
+/// the program lines it actually ran between.
 pub inline fn log(comptime fmt: []const u8, args: anytype) void {
-    if (comptime enabled) std.debug.print("[jit] " ++ fmt ++ "\n", args);
+    if (comptime enabled) {
+        io.flush();
+        std.debug.print("[jit] " ++ fmt ++ "\n", args);
+    }
 }

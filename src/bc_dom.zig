@@ -315,15 +315,16 @@ test "sequential loops in a repeat: the first loop's gate dominates the second; 
     var buf: [8]u32 = undefined;
     const hs = loopHeaders(proto.code, &buf);
     try testing.expectEqual(@as(usize, 3), hs.len); // repeat, for A, for B
-    // In pc order: the repeat's marker opens the loop, then the two
-    // `for_loop`s (the repeat's closer is a `jmp_if_false`, not a back-edge).
+    // In pc order: the repeat's marker opens the loop, then the two numeric
+    // `for`s (the repeat's closer is a `jmp_if_false`, not a back-edge).
     const rep = hs[0];
     const a = hs[1];
     const b = hs[2];
     try testing.expectEqual(bytecode.OpCode.loop, proto.code[rep - 1].op);
     const gate_a = bytecode.loopGateOf(proto, a).?;
     const gate_b = bytecode.loopGateOf(proto, b).?;
-    try testing.expectEqual(bytecode.OpCode.for_loop, proto.code[gate_a].op);
+    try testing.expectEqual(bytecode.OpCode.for_prep, proto.code[gate_a].op);
+    try testing.expectEqual(a - 1, gate_a);
     try testing.expect(d.dominates(gate_a, b));
     try testing.expect(d.dominates(gate_a, gate_b));
     try testing.expect(!d.dominates(gate_b, a));

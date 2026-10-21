@@ -295,15 +295,15 @@ pub fn sameAnchor(a: AnchorKey, b: AnchorKey) bool {
 ///   • `work >= N` (a full window) — the region recovered: remove the owner's
 ///     penalty and gate.
 ///   • `0 < work < N` (a remainder) — a low-yield strike: bump the owner's
-///     penalty; at `max_penalty`, gate the owner AND conservatively
-///     `disarmAllLinks()` (deliberate whole-registry blast radius, same
-///     fail-closed choice as `invalidateRegion`; A-vii-d.1 gave
-///     `NativeLink` a `region_id`, but only `.region_bridge` links carry
-///     it — M1/loop-done links still have no region identity, so targeted
-///     teardown remains unsound here). NB: this can fire MID-`replayLedger`
-///     walk (the accounting runs per ledger row) — `disarmAllLinks` defers
-///     under `replay_walk_depth` so the walk's own armed-edge validations
-///     stay sound, and the ledger driver applies it right after.
+///     penalty; at `max_penalty`, gate the owner AND tear down the region's
+///     own links (`disarmRegionLinks`, doc 64 §15: its bridges, its
+///     member-to-member links, and links into the gated owner — read off
+///     the def's member points, since only `.region_bridge` links carry a
+///     `region_id`). NB: this can fire MID-`replayLedger` walk (the
+///     accounting runs per ledger row) — the teardown marks its links and
+///     defers the sweep under `replay_walk_depth` so the walk's own
+///     armed-edge validations stay sound, and the ledger driver applies it
+///     right after.
 ///   • `work == 0` — no-op (R2-1: a zero-work flush must never strike).
 /// A region whose def has vanished (observer-closed after a logical-map wipe)
 /// has no owner anchor to gate; its work still counts in the diagnostics.
@@ -351,10 +351,10 @@ fn applyWindowDecision(self: *TraceState, key: RegionKey, work: u64, decision: @
         // strikes out is tombstoned — one-shot `invalidateRegion`, returning
         // that region to its pre-Increment-B unarmable status quo — instead of
         // the primary-tier gate below. The gate branch re-fires on EVERY strike
-        // once penalty saturates, and each firing tears down every armed link
-        // registry-wide (`disarmAllLinks`); on a phase-variant closed cycle
-        // (fft's butterfly: work=1 early stages, work=512 late) that repeated
-        // global teardown cost ~2× wall-clock. Re-entry via invalidateRegion →
+        // once penalty saturates, and each firing tore down every armed link
+        // registry-wide (`disarmAllLinks`, before doc 64 §15); on a
+        // phase-variant closed cycle (fft's butterfly: work=1 early stages,
+        // work=512 late) that repeated global teardown cost ~2× wall-clock. Re-entry via invalidateRegion →
         // closeRegion → applyWindowDecision is bounded: the def is tombstoned
         // by then, so the lookup below takes the remove-and-return path.
         if (self.region_policy.region_defs.get(key.region_id)) |def| {
@@ -370,7 +370,8 @@ fn applyWindowDecision(self: *TraceState, key: RegionKey, work: u64, decision: @
         // B-2b / §B.6: only this explicit region-owner condemnation event
         // deletes logical provenance. Ordinary temporary gates preserve it.
         self.condemnProvenanceEdgesAt(owner);
-        self.disarmAllLinks();
+        // Doc 64 §15 (1d): the region's own links, not the registry.
+        self.disarmRegionLinks(key.region_id, owner);
     } else {
         self.dbg("window-strike: owner pc={d} work={d} penalty={d}/{d}", .{ owner.pc, work, gop.value_ptr.*, self.config.max_penalty });
     }
@@ -522,7 +523,9 @@ pub fn invalidateRegion(self: *TraceState, id: RegionId) void {
     self.resetPromotionCandidate();
     if (self.region_policy.invalidateRegion(id)) self.demoteSetsForRegionDefsMutation();
     while (self.region_policy.nextInvalidated(id)) |key| closeRegionBecause(self, key, .invalidated);
-    self.disarmAllLinks();
+    // Doc 64 §15 (1d): the tombstoned def keeps its member points, so this
+    // still names exactly the region's own links.
+    self.disarmRegionLinks(id, null);
     // Doc 47 Increment B follow-up: the tombstone alone leaves the region's
     // stale entries in the source/dest receipt maps, so `receiptsInert()`
     // stays false and every receipt program-wide keeps paying the region
@@ -824,7 +827,7 @@ pub fn maybeArmCompositeExit(self: *TraceState, t: *Trace, exit_instr: u32, safe
 
 /// A-vii-d.1 (review blocker 5): drain the at-most-one pending bridge-arm
 /// request `replayLedger` recorded for a terminal composite `.deopt` row.
-/// Arming (and its failure path, `invalidateRegion → disarmAllLinks`) must
+/// Arming (and its failure path, `invalidateRegion → disarmRegionLinks`) must
 /// never run MID-ledger — it could erase the armed provenance later
 /// `.region_bridge` rows validate against — so the ledger drivers call this
 /// immediately after `replayLedger` returns, before acting on its directive.
@@ -1221,8 +1224,9 @@ pub fn stageSilentSuffixProvenance(
     }
 }
 
-/// A-vii-d.1: apply a `disarmAllLinks` that was deferred because it fired
-/// mid-`replayLedger` walk (see `replay_walk_depth`). Every ledger DRIVER
+/// A-vii-d.1: apply a `disarmAllLinks` — or, doc 64 §15, a region teardown's
+/// marked links — deferred because it fired mid-`replayLedger` walk (see
+/// `replay_walk_depth`). Every ledger DRIVER
 /// calls this immediately after the walk returns, BEFORE the pending
 /// bridge-arm drain (a disarm-then-re-arm re-validates all its gates;
 /// arm-then-disarm would silently erase the fresh arm) and before acting

@@ -1664,7 +1664,11 @@ test "doc 58 B2: a composite bridge never commits a φ the exit snapshot contrad
 /// to the first root — with two link-fed loop roots. Increment B refused
 /// that tie, the cycle minted `armable=false`, and every burst drained at
 /// the ledger cap (fft +50% with the switch on). Gate dominance elects the
-/// first loop's root, and the region is admitted and promotes.
+/// first loop's root, and the region is admitted and promotes. The fifth
+/// member is the side trace off the first continuation's `for a` entry test
+/// (`.for_entry`), anchored at that `for_prep`, which runs `for a`'s first
+/// trip into the inner root: without it the two halves never joined, and
+/// every repeat pass closed the region `destination_outside`.
 const fft_transform_src =
     \\local sin, pi = math.sin, math.pi
     \\local function transform(v, n, dir)
@@ -1715,7 +1719,7 @@ test "doc 58 §4.8: fft_transform's multi-root repeat cycle elects its first loo
             var found = false;
             var it = ts.region_policy.region_defs.valueIterator();
             while (it.next()) |def| {
-                if (def.classifier.kind != .cross_trace_cycle or def.classifier.member_count != 4) continue;
+                if (def.classifier.kind != .cross_trace_cycle or def.classifier.member_count != 5) continue;
                 found = true;
                 try testing.expect(def.armable);
                 try testing.expect(def.fallback_owner);
@@ -1733,6 +1737,95 @@ test "doc 58 §4.8: fft_transform's multi-root repeat cycle elects its first loo
     };
     try expectProgramTuned(fft_transform_src, "0.2500000000000003\t0.5998951286759093\n", .{
         .exit_side_native = true,
+        .hotloop = (@import("trace.zig").TraceConfig{}).hotloop,
+        .inspect = Inspect.run,
+    });
+}
+
+/// scimark's `lu_factor` (`bench/luajit/scimark_lib.lua:329`) at n = 16. The
+/// scaling `for k` loop's exit resumes at its continuation, which runs into
+/// the elimination `for i`'s `for_prep`. That loop's header has no root of its
+/// own (the nest's root is the inner `for k`), so a continuation that recorded
+/// through the `for_prep` would enter the inner `for k` ↔ `for i` cycle from
+/// outside it, and the cycle's silent promotion would collapse (scimark-lu
+/// +13%). Only a recording that starts at the `for_prep` may record through
+/// it; this one ends there instead.
+const lu_factor_src =
+    \\local abs, floor = math.abs, math.floor
+    \\local function lu_factor(a, pivot, m, n)
+    \\  local min_m_n = m < n and m or n
+    \\  for j = 1, min_m_n do
+    \\    local jp, t = j, abs(a[j][j])
+    \\    for i = j + 1, m do
+    \\      local ab = abs(a[i][j])
+    \\      if ab > t then jp, t = i, ab end
+    \\    end
+    \\    pivot[j] = jp
+    \\    if jp ~= j then a[j], a[jp] = a[jp], a[j] end
+    \\    if j < m then
+    \\      local recp = 1.0 / a[j][j]
+    \\      for k = j + 1, m do
+    \\        local v = a[k]
+    \\        v[j] = v[j] * recp
+    \\      end
+    \\    end
+    \\    if j < min_m_n then
+    \\      for i = j + 1, m do
+    \\        local vi, vj = a[i], a[j]
+    \\        local eij = vi[j]
+    \\        for k = j + 1, n do vi[k] = vi[k] - eij * vj[k] end
+    \\      end
+    \\    end
+    \\  end
+    \\end
+    \\local n = 16
+    \\local mat, tmp, pivot = {}, {}, {}
+    \\for y = 1, n do
+    \\  mat[y], tmp[y] = {}, {}
+    \\  for x = 1, n do mat[y][x] = ((y * 31 + x * 17) % 101) / 101 + (x == y and 1 or 0) end
+    \\end
+    \\for c = 1, 30 do
+    \\  for y = 1, n do
+    \\    local vd, vs = tmp[y], mat[y]
+    \\    for x = 1, n do vd[x] = vs[x] end
+    \\  end
+    \\  lu_factor(tmp, pivot, n, n)
+    \\end
+    \\local s = 0
+    \\for y = 1, n do for x = 1, n do s = s + tmp[y][x] end end
+    \\print(floor(s * 1e6), pivot[1], pivot[n])
+;
+
+test "for_prep: a continuation that reaches a rootless loop's for_prep ends there instead of recording into it" {
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode != .record_execute_native) return;
+            const bc = @import("bytecode.zig");
+            var proto: ?*const bc.Proto = null;
+            var it = vm.trace.coverage.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.proto.name, "lu_factor")) proto = entry.key_ptr.proto;
+            }
+            const p = proto orelse return error.TestUnexpectedResult;
+            // The `for_loop`s in pc order: pivot search, scaling, inner `for
+            // k`, elimination `for i`, outer `for j`.
+            var loops: [5]u32 = undefined;
+            var count: usize = 0;
+            for (p.code, 0..) |ins, pc| if (ins.op == .for_loop) {
+                try testing.expect(count < loops.len);
+                loops[count] = @intCast(pc);
+                count += 1;
+            };
+            try testing.expectEqual(loops.len, count);
+            const scaling = loops[1];
+            // The scaling loop traces, so its exit reaches the continuation...
+            try testing.expect(vm.trace.findTrace(p, bc.loopHeaderOf(p.code[scaling], scaling).?) != null);
+            // ...and nothing is recorded there.
+            try testing.expect(vm.trace.findTrace(p, scaling + 1) == null);
+        }
+    };
+    try expectProgramTuned(lu_factor_src, "63388806\t1\t16\n", .{
+        .coverage = true,
         .hotloop = (@import("trace.zig").TraceConfig{}).hotloop,
         .inspect = Inspect.run,
     });

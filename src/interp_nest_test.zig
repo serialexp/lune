@@ -12,6 +12,7 @@ const testing = std.testing;
 const trace = @import("trace.zig");
 const io = @import("io.zig");
 const bytecode = @import("bytecode.zig");
+const trace_link = @import("trace_link.zig");
 
 const Vm = interp.Vm;
 const util = @import("interp_testutil.zig");
@@ -104,19 +105,23 @@ test "doc 64 steps 1-2: the `for k` region closes when its loop ends, and since 
     try testing.expectEqualStrings("14683\n", sink.buffered());
 }
 
-test "doc 64 step 2: an exit-side chain that ends by leaving its enclosing loop is a natural stop, not a misfit" {
+test "doc 64 steps 2 and 5: the `while` exit of nsieve-bit-fp's `for k` stays attached" {
     // Doc 64 §12. The `while`'s exit resumes at `P` in the `for k` body; the
     // continuation there runs to the `for k` loop-done guard whenever the
     // loop finishes — for most primes, within a few steps. Before step 2
     // each of those chains counted as a miss, and after `tryside` of them
-    // the exit gave up for good. Now they are natural stops: neutral.
+    // the exit gave up for good. Step 2 made them natural stops (this test
+    // asserted at least 500). Since step 5 (1d, §15) the outer loop's gates no longer
+    // disarm this exit, so it fires through its arm and almost never chains
+    // at all; the classification has its own white-box test above.
     const gpa = testing.allocator;
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     const Inspect = struct {
         fn run(vm: *Vm, mode: TraceMode) !void {
             _ = mode;
-            try testing.expect(vm.trace.exit_side_natural_stops >= 500);
+            try testing.expectEqual(@as(u64, 0), vm.trace.exit_side_giveups);
+            try testing.expectEqual(@as(u64, 0), vm.trace.exit_side_miss_giveups);
         }
     };
     try util.runCapturedTuned(gpa, nsieve_bit_fp_src, &sink, false, .record_execute_native, .{
@@ -224,7 +229,9 @@ test "doc 64 step 4: a `for k` activation that ends because its loop finished ne
         fn run(vm: *Vm, mode: TraceMode) !void {
             _ = mode;
             const ts = &vm.trace;
-            try testing.expect(ts.exit_side_giveups >= 1); // the arm is lost, as before
+            // Since 1d (doc 64 §15) the outer region's gates no longer tear
+            // the `for k` nest down, so the `while` exit keeps its arm.
+            try testing.expectEqual(@as(u64, 0), ts.exit_side_giveups);
             try testing.expect(ts.region_closes.get(.loop_exit) >= 1000);
             // Not every departure: one inside the loop (tier-0 at the
             // post-`while` body, a coverage gap) stays a `.departure`.
@@ -305,6 +312,55 @@ test "doc 64 step 2: natural stops never give an exit up; misfits do, and the ne
     };
     // Doc 64's `while` inside a `for`: the while's exit attaches to the
     // post-while continuation.
+    try util.runCapturedTuned(gpa,
+        \\local s = 0
+        \\for i = 1, 3000 do
+        \\  local j = i * 13
+        \\  for k = 1, 2 do
+        \\    while j >= 7 do j = j - 7 end
+        \\    s = s + j
+        \\    j = j + i
+        \\  end
+        \\end
+        \\print(s)
+    , &sink, false, .record_execute, .{ .inspect = Inspect.run });
+    try testing.expectEqualStrings("9006\n", sink.buffered());
+}
+
+test "doc 64 step 2: a chain ending at an enclosing `for`'s loop-done is a natural stop; the `while` exit itself is not" {
+    // White-box classification (`chainEndsEnclosingLoop`). It had an
+    // integration witness in nsieve-bit-fp's dispatcher chains until 1d
+    // (doc 64 §15) kept the exit armed and those chains stopped happening.
+    // The `while` exit resumes at `P` inside both `for` bodies, so every
+    // numeric-`for` loop-done guard in the chunk leaves a loop enclosing `P`.
+    // The `while` exit's own guard leaves only the `while`, which does not
+    // enclose `P`: neither a loop-done guard nor its trace's loop test.
+    const gpa = testing.allocator;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            _ = mode;
+            const ts = &vm.trace;
+            const Found = struct { parent: *trace.Trace, exit: u32 };
+            const found: Found = blk: for (ts.registry.cache.items) |parent| {
+                for (parent.exit_side, 0..) |s, e| {
+                    if (s != .attached) continue;
+                    break :blk .{ .parent = parent, .exit = @intCast(e) };
+                }
+            } else return error.TestUnexpectedResult;
+            try testing.expect(!trace_link.chainEndsEnclosingLoop(found.parent, found.exit, found.parent, found.exit));
+            var for_done: usize = 0;
+            for (ts.registry.cache.items) |t| {
+                for (0..t.code.instrs.len) |g| {
+                    if (!t.code.isNumericForLoopDoneGuard(g)) continue;
+                    try testing.expect(trace_link.chainEndsEnclosingLoop(found.parent, found.exit, t, @intCast(g)));
+                    for_done += 1;
+                }
+            }
+            try testing.expect(for_done >= 1);
+        }
+    };
     try util.runCapturedTuned(gpa,
         \\local s = 0
         \\for i = 1, 3000 do

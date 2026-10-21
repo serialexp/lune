@@ -31,6 +31,18 @@ const viz_server = @import("viz_server.zig");
 /// ReleaseSafe `init.gpa` traces every allocation (see `src/jit_unwind.zig`).
 pub const debug = mahina.jit_unwind.debug;
 
+/// std's panic handler, preceded by a flush of the buffered stdout (doc 65
+/// §6): when mahina itself panics, the program's output up to the crash still
+/// reaches the file or pipe, ahead of the panic message on stderr.
+pub const panic = std.debug.FullPanic(panicFlushingStdout);
+
+fn panicFlushingStdout(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    @branchHint(.cold);
+    mahina.io.flushForPanic();
+    // Start the trace at the panic site, not in this wrapper.
+    std.debug.defaultPanic(msg, first_trace_addr orelse @returnAddress());
+}
+
 const Diagnostics = mahina.diag.Diagnostics;
 
 const usage =
@@ -193,6 +205,10 @@ const TraceOpts = struct {
 };
 
 pub fn main(init: std.process.Init) u8 {
+    // A program's stdout is buffered (fully, unless it is a terminal; doc 65
+    // §6), so whatever is still in the buffer goes out here, on every return
+    // path. Declared first, so it runs after every other deferred report.
+    defer mahina.io.flush();
     // `--mem-stats` swaps `gpa` for a TrackingAllocator wrapper over the process
     // allocator (Rule Z-4: account at the boundary). The tracker must be declared
     // here — stable address for the vtable handle, and alive past `runSource` so
@@ -453,7 +469,6 @@ fn vizMain(init: std.process.Init, it: *std.process.Args.Iterator) u8 {
 fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source: [:0]const u8, topts: TraceOpts, env_map: *std.process.Environ.Map, argv: []const []const u8) u8 {
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-
     // --- parse ---
     var tree = mahina.parser.parse(gpa, source, &diags) catch |err| {
         reportDiagnostics(name, &diags);

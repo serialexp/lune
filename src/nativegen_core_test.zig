@@ -451,17 +451,19 @@ test "nativegen: guard_false on an integer side-exits immediately" {
 
 test "nativegen: guard_step_up/down pass exactly when tier-0 counts that way" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
-    // tier-0 counts upward iff !(step < 0): a NaN or -0.0 step counts up.
+    // tier-0 counts upward iff 0 < step (Lua 5.4): a NaN or ±0 step counts
+    // down. (A zero step raises in `for_prep`, but the guard is still exact.)
     const nan = std.math.nan(f64);
     const inf = std.math.inf(f64);
     const Case = struct { step: Value, up: bool };
     const cases = [_]Case{
-        .{ .step = Value.int(1), .up = true },          .{ .step = Value.int(0), .up = true },
+        .{ .step = Value.int(1), .up = true },          .{ .step = Value.int(0), .up = false },
         .{ .step = Value.int(-1), .up = false },        .{ .step = Value.int(std.math.minInt(i64)), .up = false },
         .{ .step = Value.int(std.math.maxInt(i64)), .up = true }, .{ .step = Value.float(0.5), .up = true },
-        .{ .step = Value.float(-0.5), .up = false },    .{ .step = Value.float(0.0), .up = true },
-        .{ .step = Value.float(-0.0), .up = true },     .{ .step = Value.float(nan), .up = true },
+        .{ .step = Value.float(-0.5), .up = false },    .{ .step = Value.float(0.0), .up = false },
+        .{ .step = Value.float(-0.0), .up = false },    .{ .step = Value.float(nan), .up = false },
         .{ .step = Value.float(inf), .up = true },      .{ .step = Value.float(-inf), .up = false },
+        .{ .step = Value.float(std.math.floatTrueMin(f64)), .up = true },
     };
     for (cases) |c| {
         for ([_]trace.IrOp{ .guard_step_up, .guard_step_down }) |op| {
@@ -490,5 +492,46 @@ test "nativegen: guard_step_up/down pass exactly when tier-0 counts that way" {
             try testing.expectEqual(@as(usize, if (passes) 3 else 0), irinterp.executeValues(&t, &regs, &values).completed);
             try expectMatch(&t, &.{ Value.int(0), c.step });
         }
+    }
+}
+
+test "nativegen: guard_for_nov passes exactly when bound + step does not overflow" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const max = std.math.maxInt(i64);
+    const min = std.math.minInt(i64);
+    const Case = struct { bound: i64, step: i64, passes: bool };
+    const cases = [_]Case{
+        .{ .bound = max - 1, .step = 1, .passes = true }, .{ .bound = max, .step = 1, .passes = false },
+        .{ .bound = min + 1, .step = -1, .passes = true }, .{ .bound = min, .step = -1, .passes = false },
+        .{ .bound = 0, .step = max, .passes = true },      .{ .bound = 1, .step = max, .passes = false },
+        .{ .bound = 0, .step = min, .passes = true },      .{ .bound = -1, .step = min, .passes = false },
+        .{ .bound = max, .step = -1, .passes = true },     .{ .bound = min, .step = 1, .passes = true },
+    };
+    for (cases) |c| {
+        var instrs = [_]I{
+            .{ .op = .slot_load, .aux = 0 }, // 0: i (starts at 0)
+            .{ .op = .guard_int, .a = 0 }, // 1
+            .{ .op = .slot_load, .aux = 1 }, // 2: bound
+            .{ .op = .guard_int, .a = 2 }, // 3
+            .{ .op = .slot_load, .aux = 2 }, // 4: step
+            .{ .op = .guard_int, .a = 4 }, // 5
+            .{ .op = .guard_for_nov, .a = 2, .b = 4 }, // 6
+            .{ .op = .konst, .aux = 0 }, // 7: 3
+            .{ .op = .lt, .a = 0, .b = 7 }, // 8: i < 3
+            .{ .op = .guard_true, .a = 8 }, // 9
+            .{ .op = .konst, .aux = 1 }, // 10: 1
+            .{ .op = .add, .a = 0, .b = 10 }, // 11: i + 1
+            .{ .op = .phi, .b = 11, .aux = 0 },
+            .{ .op = .loop },
+        };
+        var consts = [_]Value{ Value.int(3), Value.int(1) };
+        var es = [_]u16{};
+        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+        // A passing guard lets all three iterations commit; a failing one
+        // exits before the first.
+        var regs = [_]Value{ Value.int(0), Value.int(c.bound), Value.int(c.step) };
+        var values: [instrs.len]Value = undefined;
+        try testing.expectEqual(@as(usize, if (c.passes) 3 else 0), irinterp.executeValues(&t, &regs, &values).completed);
+        try expectMatch(&t, &.{ Value.int(0), Value.int(c.bound), Value.int(c.step) });
     }
 }

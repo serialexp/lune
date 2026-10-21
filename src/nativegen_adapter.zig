@@ -47,6 +47,7 @@ const Trace = trace_code.TraceCode;
 const Kind = artifact.Kind;
 const ExitLoc = artifact.ExitLoc;
 const ExitLocMap = artifact.ExitLocMap;
+const SnapshotSlot = @import("trace_snapshot.zig").SnapshotSlot;
 const ExitAdapter = artifact.ExitAdapter;
 const CompiledTrace = artifact.CompiledTrace;
 const NativeResult = artifact.NativeResult;
@@ -278,9 +279,20 @@ fn emitAdapter(
 
     // 3. The exit snapshot's slots, which override step 2.
     const s = t.exit_snapshots[si - 1];
-    for (t.exit_snapshot_slots[s.slots_begin..][0..s.slots_len]) |ss| {
+    const snap_slots = t.exit_snapshot_slots[s.slots_begin..][0..s.slots_len];
+    // 3a. An untyped load of a slot the body never writes, restoring ANOTHER
+    // slot: a pass-through `move` the trace never typed (`local kidx = idx`
+    // in nsieve-bit-fp's `for k` link trace). The source's slab is its entry
+    // value, so copy its tag and payload as they are — first, before 3b can
+    // write the source slot.
+    for (snap_slots) |ss| {
+        if (copySource(t, map, ss)) |src| try copySlot(a, src, ss.slot);
+    }
+    // 3b. Every other slot.
+    for (snap_slots) |ss| {
         const ref: usize = ss.ref;
         const rins = t.instrs[ref];
+        if (copySource(t, map, ss) != null) continue;
         if (rins.op == .konst) {
             // The compile-time Value, as the precise materializer writes it
             // (heap constants are trace-rooted and never move).
@@ -370,6 +382,25 @@ fn placeOf(r: ExitLoc) ?Loc {
 /// The kind a slot flush boxes a value with, or null when it cannot. The
 /// precise materializer's set: `.native` is a raw `*GcHeader` like `.func`
 /// and boxes as a heap ref.
+/// Step 3a: the slot whose tag and payload `ss` restores as they are — when
+/// its value is a load of an invariant slot (never written by the body)
+/// other than `ss.slot`, of a kind no flush can box. Null otherwise.
+fn copySource(t: *const Trace, map: *const ExitLocMap, ss: SnapshotSlot) ?u16 {
+    if (t.instrs[ss.ref].op != .slot_load) return null;
+    const r = map.find(ss.ref) orelse return null;
+    if (r.invariant_slot == ExitLoc.NO_SLOT or r.invariant_slot == ss.slot) return null;
+    if (flushKind(r.kind) != null) return null;
+    return r.invariant_slot;
+}
+
+/// Copy slot `src`'s tag and payload into slot `dst` (rax, rcx).
+fn copySlot(a: *x64.Assembler, src: u16, dst: u16) !void {
+    try a.movzxRegMem8(.rcx, .rdi, src);
+    try a.movByteMemReg(.rdi, dst, .rcx);
+    try a.movRegMem(.rax, .rsi, @as(i32, src) * 8);
+    try a.movMemReg(.rsi, @as(i32, dst) * 8, .rax);
+}
+
 fn flushKind(k: Kind) ?Kind {
     return switch (k) {
         .int, .bool, .float, .ptr, .heap, .func => k,

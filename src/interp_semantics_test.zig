@@ -216,18 +216,17 @@ test "nested-loop: a linked 2-deep numeric-for nest is byte-identical across all
     );
 }
 
-test "nested-loop link: a float for_prep hand-off uses (init−step)+step, not init" {
-    // Regression for the codex-flagged BLOCKER in `recForPrepLink`: the link
-    // hand-off's first-iteration bounds test and published entry state must be
-    // `(init−step)+step` — computed with the SAME float rounding tier-0's
-    // `for_prep` + `for_loop` pair applies — not `init` (the "(init−step)+step =
-    // init" shortcut only holds for ints). The inner loop gets hot with a benign
-    // float step (1.0), so the continuation records a link with float-typed
-    // control guards; the LAST outer iteration re-enters that link with
-    // `step = 1e16`, where `(1.0 − 1e16) + 1e16 = 0.0 ≠ 1.0`. tier-0 runs that
-    // inner loop once with `j = 0.0`; the pre-fix trace handed the inner root
-    // `j = 1.0` and printed 18136 instead of 18135. The step comes from an array
-    // (not a branch) so no branch guard side-exits before the link is reached.
+test "nested-loop link: a float for_prep hand-off publishes init exactly" {
+    // The link hand-off's entry test and published entry state must be the
+    // first index tier-0's `for_prep` publishes: `init` itself (Lua 5.4), not a
+    // re-derived value. The inner loop gets hot with a benign float step (1.0),
+    // so the continuation records a link with float-typed control guards; the
+    // LAST outer iteration re-enters that link with `step = 1e16`, which runs
+    // the inner loop once with `j = 1.0`. When `for_prep` pre-subtracted the
+    // step, tier-0 computed `(1.0 − 1e16) + 1e16 = 0.0` there and printed
+    // 18135 (and a trace that shortcut to `init` disagreed with it). The step
+    // comes from an array (not a branch) so no branch guard side-exits before
+    // the link is reached.
     try expectProgram(
         \\local steps = {}
         \\for i = 1, 40 do steps[i] = 1.0 end
@@ -241,7 +240,7 @@ test "nested-loop link: a float for_prep hand-off uses (init−step)+step, not i
         \\print(s)
         \\
     ,
-        "18135\n",
+        "18136\n",
     );
 }
 
@@ -1150,7 +1149,8 @@ test "numeric for: a trace recorded on one step sign never runs the other" {
     // step, so a trace entered with a step of the other sign must side-exit
     // (`guard_step_up`/`guard_step_down`). Without the guard the second
     // `run` counted upward under the descending test until the `break`.
-    // The `break` caps keep a regression a wrong answer, not a hang.
+    // The `break` caps keep a regression a wrong answer, not a hang. A `-0.0`
+    // step raises (`'for' step is zero`) even when `run` is already hot.
     try expectProgram(
         \\local function run(a, b, c)
         \\  local s, n = 0, 0
@@ -1162,10 +1162,10 @@ test "numeric for: a trace recorded on one step sign never runs the other" {
         \\  return s
         \\end
         \\print(run(200, 1, -1), run(1, 3, 1), run(200, 1, -1))
-        \\print(run(200.5, 1.5, -1.0), run(1.5, 3.5, 1.0), run(0.5, 2.5, 0 / 0), run(2.5, 0.5, -0.0))
+        \\print(run(200.5, 1.5, -1.0), run(1.5, 3.5, 1.0), run(0.5, 2.5, 0 / 0), select(2, pcall(run, 2.5, 0.5, -0.0)))
         \\
     ,
-        "20100\t6\t20100\n20200\t7.5\t0\t0\n",
+        "20100\t6\t20100\n20200\t7.5\t0\trun:3: 'for' step is zero\n",
     );
 }
 
@@ -1894,6 +1894,106 @@ test "strings: comparing a string with a number is a catchable type error" {
     try expectProgram(
         "print(pcall(function() return \"a\" < 1 end))\n",
         "false\tanonymous:1: attempt to compare string with number\n",
+    );
+}
+
+test "for: a zero step raises before the loop runs, as Lua 5.4 does" {
+    // Int `0`, `0.0` and `-0.0` all raise; NaN is not zero (its loop runs no
+    // times, since every compare with NaN is false).
+    try expectProgram(
+        \\local n = 0
+        \\print(pcall(function() for i = 1, 10, 0 do n = n + 1 end end))
+        \\print(pcall(function() for i = 1, 10, 0.0 do n = n + 1 end end))
+        \\print(pcall(function() for i = 10, 1, -0.0 do n = n + 1 end end))
+        \\for i = 1, 10, 0/0 do n = n + 1 end
+        \\print(n)
+        \\
+    ,
+        "false\tanonymous:2: 'for' step is zero\n" ++
+            "false\tanonymous:3: 'for' step is zero\n" ++
+            "false\tanonymous:4: 'for' step is zero\n" ++
+            "0\n",
+    );
+}
+
+test "for: a hot loop whose inner step turns zero raises on that run" {
+    // The inner loop runs hot with step 1, then its step becomes 0: every
+    // trace mode must raise at the same run, after the same sum.
+    try expectProgram(
+        \\local s = 0
+        \\local ok, e = pcall(function()
+        \\  for k = 1, 40 do
+        \\    local step = k < 30 and 1 or 0
+        \\    for i = 1, 3, step do s = s + i end
+        \\  end
+        \\end)
+        \\print(ok, e, s)
+        \\
+    ,
+        "false\tanonymous:5: 'for' step is zero\t174\n",
+    );
+}
+
+test "for: a non-number control value names which one, as Lua 5.4 does" {
+    try expectProgram(
+        \\print(pcall(function() for i = "a", 2 do end end))
+        \\print(pcall(function() for i = 1, {} do end end))
+        \\print(pcall(function() for i = 1, 2, nil do end end))
+        \\
+    ,
+        "false\tanonymous:1: 'for' initial value must be a number\n" ++
+            "false\tanonymous:2: 'for' limit must be a number\n" ++
+            "false\tanonymous:3: 'for' step must be a number\n",
+    );
+}
+
+test "for: an int loop stops at the integer edge instead of wrapping" {
+    // Lua 5.4's counts, all checked against lua5.4. Each loop ends where the
+    // next step would overflow; wrapping round never ends, which `count`
+    // reports as -1. The second line runs the loop hot with a varying limit
+    // until it reaches maxinteger (a hoisted overflow guard failing); the
+    // third runs hot loops whose limit is at the edge when they record.
+    try expectProgram(
+        \\local function count(a, b, c)
+        \\  local n = 0
+        \\  for i = a, b, c do
+        \\    n = n + 1
+        \\    if n > 1000 then return -1 end
+        \\  end
+        \\  return n
+        \\end
+        \\print(count(math.maxinteger - 1, math.maxinteger, 1),
+        \\  count(math.mininteger + 1, math.mininteger, -1),
+        \\  count(1, math.maxinteger, math.maxinteger // 2 + 1))
+        \\local n = 0
+        \\for k = 1, 60 do
+        \\  local hi = k < 50 and 100 or math.maxinteger
+        \\  n = n + count(hi - 3, hi, 1)
+        \\end
+        \\print(n)
+        \\print(count(math.maxinteger - 300, math.maxinteger, 1),
+        \\  count(math.mininteger + 300, math.mininteger, -1),
+        \\  count(math.maxinteger - 300, 2^63, 1))
+        \\
+    ,
+        "2\t2\t2\n240\n301\t301\t301\n",
+    );
+}
+
+test "for: the first value is init itself, and a NaN step counts down" {
+    // No `init - step + step` round trip: 1e-20 + 1 - 1 is 0. A NaN step is
+    // not zero and not `0 < step`, so the loop counts down, like Lua 5.4:
+    // 1 <= 10 runs the first trip, and the NaN index ends it.
+    try expectProgram(
+        \\local x0
+        \\for x = 1e-20, 1, 1 do x0 = x0 or x end
+        \\print(x0 == 1e-20)
+        \\local n, last = 0, nil
+        \\for i = 10, 1, 0/0 do n = n + 1; last = math.type(i) end
+        \\print(n, last)
+        \\
+    ,
+        "true\n1\tfloat\n",
     );
 }
 

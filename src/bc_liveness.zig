@@ -179,15 +179,21 @@ fn effectOf(ins: Instr, pc: u32, code_len: usize) Effect {
             e.succ = .{ next, jumpTarget(pc, ins.aux, code_len) };
         },
         .for_prep => {
-            // Reads idx/limit/step, rewrites idx (a use too, so no kill
-            // matters). ALWAYS jumps to its `for_loop` (`opForPrep` never
-            // falls through): a fall-through edge would leak the body's
-            // upward-exposed uses — e.g. an inner loop's variable — into
-            // the enclosing loop as spuriously live.
+            // Reads init/limit/step, rewrites idx (a use too, so no kill
+            // matters). Falls through into the body when the loop runs,
+            // writing the loop variable `R[a+3]` on that edge only — the
+            // kill keeps the body's read of it from leaking into the
+            // enclosing loop as spuriously live. Otherwise it skips the
+            // loop: `aux` targets the `for_loop`, so one past it.
             e.use(a);
             e.use(a + 1);
             e.use(a + 2);
-            e.succ[0] = jumpTarget(pc, ins.aux, code_len);
+            const skip: ?u32 = if (jumpTarget(pc, ins.aux, code_len)) |fl|
+                (if (fl + 1 < code_len) fl + 1 else null)
+            else
+                null;
+            e.succ = .{ next, skip };
+            e.edge_kill[0] = @intCast(@min(a + 3, std.math.maxInt(u16)));
         },
         .for_loop => {
             // `R[a+3]` (the loop variable) is written only on the taken edge.
@@ -649,8 +655,8 @@ test "nested loops: outer control slots live through the inner nest; the inner l
     try testing.expectEqual(@as(u64, 0x1EF), liveSet(l, 10, 9)); // no r4
     try testing.expectEqual(@as(u64, 0x0EF), liveSet(l, 11, 9)); // r8 edge-killed
     try testing.expectEqual(@as(u64, 0x00F), liveSet(l, 12, 9));
-    // The inner loop var r8 never leaks into the outer body (no for_prep
-    // fall-through edge).
+    // The inner loop var r8 never leaks into the outer body (the for_prep
+    // fall-through edge kills it).
     try testing.expectEqual(@as(u64, 0x01F), liveSet(l, 5, 9));
     try testing.expectEqual(@as(u64, 0x00F), liveSet(l, 6, 9));
 }

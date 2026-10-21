@@ -319,18 +319,14 @@ pub const PeelSlot = struct {
 /// When a `.continuation`/`.side` recording reaches an inner `for_prep` and the
 /// inner root's entry guards mismatch the current register types, the recording
 /// continues through the inner body to promote accumulator types before closing
-/// `.link`. The two-phase state machine tracks progress:
-/// - `.await_initial_entry`: waiting for the first `for_loop` visit (tier-0
-///    jumped from `for_prep` to `for_loop`; this is the initial bounds check,
-///    not a post-body back-edge). Transition to `.peeling` on continue.
-/// - `.peeling`: one body iteration is being recorded. The next `for_loop`
-///    continue-direction visit closes `.link` if compatible, else aborts.
+/// `.link`. `for_prep` has already recorded the entry test (the peel is only
+/// set up when the loop runs), so the peel starts `.peeling`: one body
+/// iteration is being recorded, and the next `for_loop` continue-direction
+/// visit closes `.link` if compatible, else aborts.
 /// Why a pending link peel was dropped (`clearPendingLinkClose`'s argument).
 pub const LinkPeelEnd = enum {
     /// Types matched after one body iteration: `.link` closes.
     linked,
-    /// The inner loop ran no iteration.
-    zero_trip,
     /// The body ran once and the loop ended.
     one_trip,
     /// Types still mismatched after one iteration: the recording aborts.
@@ -353,7 +349,6 @@ pub const PendingLinkClose = struct {
     /// the inner root's `Trace.code.entry_guards`: a collection between the
     /// peel's instructions can retire that trace (doc 61 §7.1 item 4).
     contract: []const trace_code.EntryGuard,
-    phase: Phase,
 
     // --- Rewind state: saved at peel entry so that a mid-body abort can
     //     truncate back and emit the immediate `.link` close instead. ---
@@ -378,11 +373,6 @@ pub const PendingLinkClose = struct {
     saved_ord_overflow: bool,
     saved_snap_exhausted: bool,
     saved_by_ord_len: u32,
-
-    pub const Phase = enum {
-        await_initial_entry,
-        peeling,
-    };
 };
 
 /// Doc 39: in-flight type-stabilizing peel. Entered at the first anchor-return
@@ -1136,75 +1126,12 @@ pub const RecordingSession = struct {
         self.lane_pins.items.len = np;
         self.clearPendingLinkClose(.rewound);
 
-        // --- Re-emit the immediate `.link` close (same logic as the
-        //     non-peel path in recForPrepLink lines 3062-3124). ---
-        const vinit = plc.vinit;
-        const vlimit = plc.vlimit;
-        const vstep = plc.vstep;
-        const rinit = self.refOf(a) catch {
+        // --- Re-emit the immediate `.link` close (the non-peel path of
+        //     `recForPrepLink`). ---
+        const rfirst = self.recForEntryTest(a, plc.vinit, plc.vlimit, plc.vstep, true) catch {
             self.realAbort(.nyi_opcode);
             return;
         };
-        const rlimit = self.refOf(a + 1) catch {
-            self.realAbort(.nyi_opcode);
-            return;
-        };
-        const rstep = self.refOf(a + 2) catch {
-            self.realAbort(.nyi_opcode);
-            return;
-        };
-        self.guardNum(rinit, vinit, .operand_type, .a) catch {
-            self.realAbort(.nyi_opcode);
-            return;
-        };
-        self.guardNum(rlimit, vlimit, .operand_type, .a1) catch {
-            self.realAbort(.nyi_opcode);
-            return;
-        };
-        self.guardNum(rstep, vstep, .operand_type, .a2) catch {
-            self.realAbort(.nyi_opcode);
-            return;
-        };
-        const ascending = self.guardForStep(rstep, vstep) catch {
-            self.realAbort(.nyi_opcode);
-            return;
-        };
-        const all_int = vinit.isInt() and vstep.isInt();
-        const vpre = arith.sub(vinit, vstep) catch {
-            self.realAbort(.bad_type);
-            return;
-        };
-        const rpre = self.emit(.{ .op = .sub, .a = rinit, .b = rstep, .ty = arithResultType(.sub, vinit, vstep) }) catch {
-            self.realAbort(.nyi_opcode);
-            return;
-        };
-        const rfirst = self.emit(.{ .op = .add, .a = rpre, .b = rstep, .ty = arithResultType(.add, vpre, vstep) }) catch {
-            self.realAbort(.nyi_opcode);
-            return;
-        };
-        const rlimit_cmp = if (all_int and vlimit.isFloat() and value.floatAsExactInt(vlimit.asFloat()) != null) blk: {
-            const iof = self.emit(.{ .op = .int_of_float, .a = rlimit, .ty = .int }) catch {
-                self.realAbort(.nyi_opcode);
-                return;
-            };
-            self.stampProv(iof, .limit_int, .a1, .neutral);
-            break :blk iof;
-        } else rlimit;
-        const cmp = if (ascending)
-            self.emit(.{ .op = .le, .a = rfirst, .b = rlimit_cmp, .ty = .boolean }) catch {
-                self.realAbort(.nyi_opcode);
-                return;
-            }
-        else
-            self.emit(.{ .op = .le, .a = rlimit_cmp, .b = rfirst, .ty = .boolean }) catch {
-                self.realAbort(.nyi_opcode);
-                return;
-            };
-        const guard_ref = self.emit(.{ .op = .guard_true, .a = cmp }) catch {
-            self.realAbort(.nyi_opcode);
-            return;
-        };
-        self.stampProv(guard_ref, .loop_done, .none, .neutral);
         self.setReg(a, rfirst);
         self.setReg(a + 3, rfirst);
         self.link_target = plc.inner_anchor_pc;
@@ -1831,7 +1758,7 @@ pub const RecordingSession = struct {
             .guard_is_nil, .guard_is_false, .guard_is_true => {
                 ins_mut.aux = @intCast(self.cur_pc);
             },
-            .guard_step_up, .guard_step_down => ins_mut.aux = @intCast(self.cur_pc),
+            .guard_step_up, .guard_step_down, .guard_for_nov => ins_mut.aux = @intCast(self.cur_pc),
             else => {},
         }
         // Doc 45 D2: on a precise recording every BODY op carries the current
@@ -2134,7 +2061,7 @@ pub const RecordingSession = struct {
     /// side-exit rather than run the wrong test. A constant step can't
     /// change sign and needs no guard. Returns whether the loop counts up.
     fn guardForStep(self: *RecordingSession, rstep: Ref, vstep: Value) !bool {
-        const ascending = trace_ir.forStepAscending(vstep);
+        const ascending = arith.forStepAscending(vstep);
         if (self.instrs.items[rstep].op != .konst) {
             const g = try self.emit(.{ .op = trace_ir.stepGuardOp(vstep), .a = rstep });
             self.stampProv(g, .step_sign, .a2, .neutral);
@@ -3590,6 +3517,60 @@ pub const RecordingSession = struct {
         if (target != self.anchor.pc) self.noteLoopIteration();
     }
 
+    /// The limit ref a numeric `for`'s test compares against. Float loop-limit
+    /// specialization: when the index and step are ints but the limit is a
+    /// **float** whose observed value is an exact integer, convert the
+    /// (loop-invariant) limit to an int once via `int_of_float`, so the compare
+    /// is int-vs-int. tier-0 compares int-vs-float EXACTLY, and for an integral
+    /// limit `L` in i64 range `idx <= L ⟺ idx <= (i64)L` — so the trip count
+    /// and registers are byte-identical, while the native backend (which bails
+    /// on a mixed compare) can lower it. A later non-integral limit side-exits
+    /// the op → tier-0 resumes the exact mixed compare. The `guard_float`
+    /// already emitted on the limit pins the trace to float-limit entries. The
+    /// limit is never written by the loop, so the exit snapshot is unchanged.
+    /// Only for an integral, in-range limit (else stays mixed, which bails to
+    /// tier-1a).
+    fn forLimitRef(self: *RecordingSession, rlimit: Ref, vlimit: Value, all_int: bool) !Ref {
+        if (!(all_int and vlimit.isFloat() and value.floatAsExactInt(vlimit.asFloat()) != null)) return rlimit;
+        const iof = try self.emit(.{ .op = .int_of_float, .a = rlimit, .ty = .int });
+        self.stampProv(iof, .limit_int, .a1, .neutral); // float-limit → int side-exit
+        return iof;
+    }
+
+    /// The entry test tier-0's `for_prep` runs, mirrored into the trace:
+    /// type-guard init/limit/step, pin the step's direction, form the first
+    /// index (`arith.forFirstIndex`: `init`, or `init + 0.0` — exactly its
+    /// float — unless init and step are both ints), and guard the limit test
+    /// in the direction tier-0 took (`within`, from `arith.forWithin`):
+    /// `guard_true` when the loop runs, `guard_false` when it is skipped. These
+    /// are ordinary guards (role `.for_entry`): the loop-done machinery keys on
+    /// a guard sourced at a `for_loop`, and a failure here deopts to tier-0,
+    /// which re-runs the `for_prep` — so the exit attaches a child there, the
+    /// side trace LuaJIT grows off a FORI exit. Returns the first index's ref;
+    /// the caller publishes it.
+    fn recForEntryTest(self: *RecordingSession, a: u16, vinit: Value, vlimit: Value, vstep: Value, within: bool) !Ref {
+        const rinit = try self.refOf(a);
+        const rlimit = try self.refOf(a + 1);
+        const rstep = try self.refOf(a + 2);
+        try self.guardNum(rinit, vinit, .operand_type, .a);
+        try self.guardNum(rlimit, vlimit, .operand_type, .a1);
+        try self.guardNum(rstep, vstep, .operand_type, .a2);
+        const ascending = try self.guardForStep(rstep, vstep);
+        const all_int = vinit.isInt() and vstep.isInt();
+        const rfirst = if (vinit.isInt() and !vstep.isInt())
+            try self.emit(.{ .op = .add, .a = rinit, .b = try self.konst(Value.float(0.0)), .ty = .float })
+        else
+            rinit;
+        const rlimit_cmp = try self.forLimitRef(rlimit, vlimit, all_int);
+        const cmp = if (ascending)
+            try self.emit(.{ .op = .le, .a = rfirst, .b = rlimit_cmp, .ty = .boolean })
+        else
+            try self.emit(.{ .op = .le, .a = rlimit_cmp, .b = rfirst, .ty = .boolean });
+        const g = try self.emit(.{ .op = if (within) .guard_true else .guard_false, .a = cmp });
+        self.stampProv(g, .for_entry, .none, .neutral);
+        return rfirst;
+    }
+
     pub fn recForLoop(self: *RecordingSession, instr: Instr, regs: RegWindow, pc: u32) !void {
         const a = instr.a;
         // The back-edge target, computed exactly as the interpreter's
@@ -3606,28 +3587,32 @@ pub const RecordingSession = struct {
         try self.guardNum(rlimit, vlimit, .operand_type, .a1);
         try self.guardNum(rstep, vstep, .operand_type, .a2);
         const ascending = try self.guardForStep(rstep, vstep);
+        const all_int = vidx.isInt() and vstep.isInt();
+        const rlimit_cmp = try self.forLimitRef(rlimit, vlimit, all_int);
+
+        // tier-0 ends an int loop whose add overflows; the trace's `add` wraps.
+        // So an int loop guards that the add can't overflow: on the limit when
+        // that holds for every index the test admits — loop-invariant, so LICM
+        // hoists it to once per entry (LuaJIT's ADDOV in `rec_for_check`) —
+        // else per iteration on the index. An add that overflows right now is
+        // the rare loop end at the int range's edge: not modelled, abort. A
+        // constant limit and step need no guard: it would always pass. The
+        // limit is the compare's (`int_of_float`'d when integral, so native
+        // code keeps an int bound).
+        if (all_int) {
+            if (trace_ir.forNoOverflow(vlimit, vstep)) {
+                if (self.konstValueOf(rlimit_cmp) == null or self.konstValueOf(rstep) == null) {
+                    const nov = try self.emit(.{ .op = .guard_for_nov, .a = rlimit_cmp, .b = rstep });
+                    self.stampProv(nov, .step_overflow, .a1, .neutral);
+                }
+            } else if (trace_ir.forNoOverflow(vidx, vstep)) {
+                const nov = try self.emit(.{ .op = .guard_for_nov, .a = ridx, .b = rstep });
+                self.stampProv(nov, .step_overflow, .a, .neutral);
+            } else return self.abort(.bad_type);
+        }
 
         // idx_next = idx + step
-        const all_int = vidx.isInt() and vstep.isInt();
         const rnext = try self.emit(.{ .op = .add, .a = ridx, .b = rstep, .ty = if (all_int) .int else .float });
-
-        // Float loop-limit specialization: when the index+step are int but the limit
-        // is a **float** whose observed value is an exact integer, convert the
-        // (loop-invariant) limit to an int once via `int_of_float`, so the body
-        // compare is int-vs-int. tier-0 compares int-vs-float EXACTLY, and for an
-        // integral limit `L` in i64 range `idx <= L ⟺ idx <= (i64)L` — so the trip
-        // count and registers are byte-identical, while the native backend (which
-        // bails on a mixed compare) can now lower it. A later non-integral limit
-        // side-exits the op → tier-0 resumes the exact mixed compare. The `guard_float`
-        // already emitted by `guardNum(rlimit, vlimit)` pins this trace to float-limit
-        // entries. The limit is never written by the loop, so the exit snapshot is
-        // unchanged. Only fires for an integral, in-range limit (else stays mixed,
-        // bails to tier-1a as before).
-        const rlimit_cmp = if (all_int and vlimit.isFloat() and value.floatAsExactInt(vlimit.asFloat()) != null) blk: {
-            const iof = try self.emit(.{ .op = .int_of_float, .a = rlimit, .ty = .int });
-            self.stampProv(iof, .limit_int, .a1, .neutral); // float-limit → int side-exit
-            break :blk iof;
-        } else rlimit;
 
         // loop continues while (ascending) idx_next <= limit, else limit <= idx_next.
         const cmp = if (ascending)
@@ -3640,15 +3625,12 @@ pub const RecordingSession = struct {
         // which contradicts the observed execution whenever tier-0 falls OUT of the
         // loop here, e.g. a `.side` recording of a skip-shaped iteration whose inner
         // loop zero-trips). Compute the observed decision with the SAME value-level
-        // ops tier-0 uses (`arith.add`/`lt`/`le` on the runtime values), so the
-        // recorded direction is byte-identical to the path tier-0 actually took —
-        // a pure function of deterministic register values, identical in every
-        // record/exec mode.
+        // ops tier-0 uses (`arith.add`, `arith.forWithin`), so the recorded
+        // direction is byte-identical to the path tier-0 actually took — a pure
+        // function of deterministic register values, identical in every
+        // record/exec mode. (The add can't overflow here: that aborted above.)
         const vnext = arith.add(vidx, vstep) catch return self.abort(.bad_type);
-        const within = if (ascending)
-            arith.le(vnext, vlimit) catch return self.abort(.bad_type)
-        else
-            arith.le(vlimit, vnext) catch return self.abort(.bad_type);
+        const within = arith.forWithin(vnext, vlimit, vstep);
 
         if (within) {
             // Loop-taken direction (the historical shape): assert the continue test,
@@ -3715,65 +3697,46 @@ pub const RecordingSession = struct {
 
         // Doc 47 increment A: consume a pending link close from a continuation
         // that recorded through an inner `for_prep` to promote accumulator types.
+        // The peel's first `for_loop` visit is post-body: `for_prep` recorded
+        // the entry test and entered the body directly.
         if (self.pending_link_close) |*plc| {
             if (self.inline_depth == 0 and target == plc.inner_anchor_pc) {
-                switch (plc.phase) {
-                    .await_initial_entry => {
-                        // First `for_loop` visit: tier-0 jumped here from
-                        // `for_prep`. The bounds check just ran above. If the
-                        // loop continues (`within`), transition to `.peeling` —
-                        // the body will run next, promoting types. If the loop
-                        // exits, this is a one-trip-loop: clear the peel and
-                        // continue recording past the loop normally.
-                        if (within) {
-                            plc.phase = .peeling;
-                        } else {
-                            self.clearPendingLinkClose(.zero_trip);
-                            // Continue recording — the guard_false exit direction
-                            // was already recorded above.
-                        }
-                    },
-                    .peeling => {
-                        // Post-body `for_loop`: one inner iteration completed.
-                        if (within) {
-                            // Check compatibility against the inner root's entry
-                            // guards using the CURRENT register state (types have
-                            // been promoted by the inner body), as this
-                            // `for_loop` leaves it.
-                            if (entryGuardsMatch(plc.contract, entry)) {
-                                // Types now match. Close `.link` with the
-                                // promoted state. The for_loop's `guard_true`
-                                // (continue test) was already emitted above, and
-                                // the stepped index/loop-var are published.
-                                self.link_target = plc.inner_anchor_pc;
-                                self.pending_link_provenance = .{
-                                    .link_terminal = .{
-                                        .path = pathFromFrames(&self.frames, self.inline_depth),
-                                        .inline_depth = self.inline_depth,
-                                        .source_proto_id = self.cur_proto_id,
-                                        .source_pc = self.cur_pc -| 1, // the for_loop opcode
-                                    },
-                                };
-                                self.close_requested = true;
-                                self.clearPendingLinkClose(.linked);
-                            } else {
-                                // Still mismatched after one iteration — abort.
-                                // The peel can't help; fall back to today's
-                                // behavior (no link, eventual gate). Free the
-                                // rewind state and clear BEFORE abort so the
-                                // abort-rewind catch doesn't fire (the peel
-                                // completed; rewind would be wrong).
-                                self.clearPendingLinkClose(.type_mismatch);
-                                return self.abort(.type_instability);
-                            }
-                        } else {
-                            // One-trip inner loop: the body ran once but no
-                            // iteration 2 exists. Clear the peel and continue
-                            // recording past the loop — may produce a useful
-                            // one-trip-specialized continuation trace.
-                            self.clearPendingLinkClose(.one_trip);
-                        }
-                    },
+                if (within) {
+                    // Check compatibility against the inner root's entry
+                    // guards using the CURRENT register state (types have
+                    // been promoted by the inner body), as this `for_loop`
+                    // leaves it.
+                    if (entryGuardsMatch(plc.contract, entry)) {
+                        // Types now match. Close `.link` with the promoted
+                        // state. The for_loop's `guard_true` (continue test)
+                        // was already emitted above, and the stepped
+                        // index/loop-var are published.
+                        self.link_target = plc.inner_anchor_pc;
+                        self.pending_link_provenance = .{
+                            .link_terminal = .{
+                                .path = pathFromFrames(&self.frames, self.inline_depth),
+                                .inline_depth = self.inline_depth,
+                                .source_proto_id = self.cur_proto_id,
+                                .source_pc = self.cur_pc -| 1, // the for_loop opcode
+                            },
+                        };
+                        self.close_requested = true;
+                        self.clearPendingLinkClose(.linked);
+                    } else {
+                        // Still mismatched after one iteration — abort. The
+                        // peel can't help; fall back to today's behavior (no
+                        // link, eventual gate). Free the rewind state and
+                        // clear BEFORE abort so the abort-rewind catch doesn't
+                        // fire (the peel completed; rewind would be wrong).
+                        self.clearPendingLinkClose(.type_mismatch);
+                        return self.abort(.type_instability);
+                    }
+                } else {
+                    // One-trip inner loop: the body ran once but no iteration
+                    // 2 exists. Clear the peel and continue recording past the
+                    // loop — may produce a useful one-trip-specialized
+                    // continuation trace.
+                    self.clearPendingLinkClose(.one_trip);
                 }
             }
         }
@@ -3782,34 +3745,31 @@ pub const RecordingSession = struct {
     /// `for_prep` (numeric-for entry): the nested-loop **trace-link** site (doc 15,
     /// Phase 2 — the mahina analogue of LuaJIT's `rec_loop_jit` / `LJ_TRLINK_ROOT`).
     ///
-    /// A `for_prep` pre-decrements its index (`R[a] = init − step`) and jumps forward
-    /// to the matching `for_loop`, whose back-edge target is the loop body start —
-    /// which is exactly `for_prep`'s *post-increment* pc (`pc` here), so the inner
-    /// loop's **root-trace anchor pc == `pc`**. If a root trace is already cached
-    /// there, this recording (a continuation that fell out of the inner loop and
-    /// recorded the outer body forward) records the pre-decrement and **links** to
-    /// the inner root instead of recording the inner `for_loop`/unrolling. Otherwise
-    /// it aborts `.nyi_opcode` (LINNER): let the inner loop spawn its own root first.
-    /// The decision is a pure function of the cache + bytecode (no clock/RNG/address),
+    /// A `for_prep` tests the first index against the limit and either enters the
+    /// loop body — its *post-increment* pc (`pc` here), also the `for_loop`'s
+    /// back-edge target, so the inner loop's **root-trace anchor pc == `pc`** — or
+    /// skips past the `for_loop`. If a root trace is already cached at `pc`, this
+    /// recording (a continuation that fell out of the inner loop and recorded the
+    /// outer body forward) records the entry test and **links** to the inner root
+    /// instead of recording the inner `for_loop`/unrolling. Otherwise it aborts
+    /// `.nyi_opcode` (LINNER): let the inner loop spawn its own root first. The
+    /// decision is a pure function of the cache + bytecode (no clock/RNG/address),
     /// so it is identical across every record/exec mode — P1 carries to P2.
     ///
     /// **P2 (the critical hand-off invariant, doc 15).** The link hand-off must
     /// reproduce the inner root's *entry state* — the tier-0 registers it reads at its
-    /// anchor (`entry_slots`). The inner root anchors at the loop **body start** (the
-    /// `for_loop` back-edge target), which tier-0 first reaches only AFTER `for_prep`
-    /// (`R[a] = init − step`) **and** the first `for_loop` (`R[a] += step → init`,
-    /// publishing the visible loop var `R[a+3] = init`). So the byte-identical hand-off
-    /// is `R[a] = init` **and** `R[a+3] = init` — the body reads the visible var
-    /// `R[a+3]` at the trace top, and the `for_loop` at the trace bottom reads `R[a]`
-    /// to step it, so BOTH are live entry inputs. (An earlier draft recorded only
-    /// `R[a] = init − step` and left `R[a+3]` stale — verified wrong by dumping the
-    /// inner root's `entry_slots`, which include the visible-var slot; the inner root
-    /// would then re-run the first iteration and read a stale loop var.) `R[a+1]`
-    /// (limit) / `R[a+2]` (step) are untouched by the loop and flow straight through.
-    /// A first-iteration bounds guard (`init` within `limit`) gates the link: a
-    /// zero-trip inner loop fails it and falls back to tier-0 rather than entering the
-    /// inner root, which assumes ≥1 iteration. Phase 3 consumes this snapshot to follow
-    /// the link through `driveChain`.
+    /// anchor (`entry_slots`). tier-0's `for_prep` enters the body with the first
+    /// index (`arith.forFirstIndex`) in BOTH `R[a]` and the visible loop var `R[a+3]`
+    /// — the body reads `R[a+3]` at the trace top, and the `for_loop` at the trace
+    /// bottom reads `R[a]` to step it, so both are live entry inputs. (An earlier
+    /// draft left `R[a+3]` stale — verified wrong by dumping the inner root's
+    /// `entry_slots`, which include the visible-var slot; the inner root would then
+    /// re-run the first iteration and read a stale loop var.) `R[a+1]` (limit) /
+    /// `R[a+2]` (step) are untouched by the loop and flow straight through. The
+    /// entry test's `guard_true` gates the link: a zero-trip inner loop fails it and
+    /// falls back to tier-0 rather than entering the inner root, which assumes ≥1
+    /// iteration. Phase 3 consumes this snapshot to follow the link through
+    /// `driveChain`.
     pub fn recForPrepLink(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32) !void {
         // Doc 47 increment A: a pending link peel forbids nested inner for-loops
         // (a nested for_prep inside the peeled body is too complex for v1).
@@ -3823,52 +3783,42 @@ pub const RecordingSession = struct {
         const vlimit = regs.get(a + 1);
         const vstep = regs.get(a + 2);
         if (!vinit.isNumber() or !vlimit.isNumber() or !vstep.isNumber()) return self.abort(.bad_type);
+        // A zero step raises `ForStepZero` in tier-0 `for_prep`: the error path
+        // is not a loop we model, exactly like the non-number case above.
+        if (arith.forStepIsZero(vstep)) return self.abort(.bad_type);
 
-        // ZERO-TRIP RECORD-THROUGH. Decide which direction tier-0 is about to take,
-        // with the SAME value-level ops it uses: `for_prep` computes `R[a] = init −
-        // step`, jumps to the `for_loop`, which computes `(init − step) + step` and
-        // compares against the limit (direction by step sign). Note `(init−step)+step`
-        // is NOT always `init` for floats — compute it exactly, never shortcut.
-        // The decision is a pure function of deterministic register values, so it is
-        // identical in every record/exec mode.
+        // RECORD-THROUGH. Decide which direction tier-0 is about to take, with
+        // the SAME value-level ops it uses (`arith.forFirstIndex`,
+        // `arith.forWithin`). The decision is a pure function of deterministic
+        // register values, so it is identical in every record/exec mode.
         //
         // If the loop runs AND we are at depth 0, fall through to the `.link`
         // hand-off below. If it ZERO-TRIPS, the link is meaningless (the inner root
         // assumes ≥1 iteration) and force-closing with `.link` recorded the WRONG
         // shape — the duplicate-continuation bug that made the skip direction
-        // unrecordable. Instead, record the `for_prep` as the plain arithmetic it is
-        // (`R[a] = init − step`, operands type-guarded) and keep recording: tier-0
-        // jumps to the `for_loop`, whose recorder mirror (`recForLoop`) now records
-        // the observed loop-EXIT direction (`guard_false` on the continue test) and
-        // continues straight-line past the loop. This is sound for every recording
-        // kind — no link is taken, it is just straight-line code — so a `.root` may
-        // record through a zero-tripping inner `for_prep` too.
+        // unrecordable. Instead, record the entry test in its observed (skip)
+        // direction and keep recording straight-line past the loop, where tier-0
+        // jumps. This is sound for every recording kind — no link is taken, it is
+        // just straight-line code — so a `.root` may record through a
+        // zero-tripping inner `for_prep` too.
         //
         // At `inline_depth > 0` the same record-through path handles BOTH zero-trip
         // AND running loops: the link path cannot work at depth > 0 (`driveChain`
         // resolves `link_target` in the anchor proto, not the callee's), so we record
-        // the `for_prep` arithmetic and let `recForLoop` unroll the inner loop. The
-        // trace specializes to the iteration count observed during recording; a
-        // mismatch on replay deopts via `guard_true`/`guard_false` failure.
-        {
-            const pre = arith.sub(vinit, vstep) catch return self.abort(.bad_type);
-            const vnext = arith.add(pre, vstep) catch return self.abort(.bad_type);
-            const o_ascending = !(arith.lt(vstep, Value.int(0)) catch return self.abort(.bad_type));
-            const within = if (o_ascending)
-                arith.le(vnext, vlimit) catch return self.abort(.bad_type)
-            else
-                arith.le(vlimit, vnext) catch return self.abort(.bad_type);
-            if (!within or self.inline_depth > 0) {
-                const rinit0 = try self.refOf(a);
-                const rlimit0 = try self.refOf(a + 1);
-                const rstep0 = try self.refOf(a + 2);
-                try self.guardNum(rinit0, vinit, .operand_type, .a);
-                try self.guardNum(rlimit0, vlimit, .operand_type, .a1);
-                try self.guardNum(rstep0, vstep, .operand_type, .a2);
-                const rsub = try self.emit(.{ .op = .sub, .a = rinit0, .b = rstep0, .ty = arithResultType(.sub, vinit, vstep) });
-                self.setReg(a, rsub);
-                return;
+        // the entry test, publish the first index, and let `recForLoop` unroll the
+        // inner loop. The trace specializes to the iteration count observed during
+        // recording; a mismatch on replay deopts via `guard_true`/`guard_false`
+        // failure.
+        const within = arith.forWithin(arith.forFirstIndex(vinit, vstep), vlimit, vstep);
+        if (!within or self.inline_depth > 0) {
+            const rfirst = try self.recForEntryTest(a, vinit, vlimit, vstep, within);
+            if (within) {
+                self.setReg(a, rfirst);
+                self.setReg(a + 3, rfirst);
+                // Entering the body is this unrolled loop's first iteration.
+                self.noteLoopIteration();
             }
+            return;
         }
 
         // Only a *side* or *continuation* links (LuaJIT's model). A `.root` recording
@@ -3897,25 +3847,41 @@ pub const RecordingSession = struct {
         if (@as(i64, @intCast(fl_pc)) + 1 + proto.code[fl_pc].aux != @as(i64, @intCast(inner_anchor)))
             return self.abort(.nyi_opcode);
 
-        // LINNER (LuaJIT `rec_loop_jit`): only link if the inner loop header already
-        // has a `.loop` root trace. Otherwise abort — the inner loop must trace as a
-        // root first; once it does, a later continuation links here.
-        if (!self.context.inner_root) return self.abort(.nyi_opcode);
+        // No root at the inner header yet. LINNER (LuaJIT `rec_loop_jit`): abort,
+        // so the inner loop roots first and a later continuation links here —
+        // except for a recording that STARTS at this `for_prep`, the side trace
+        // off a `.for_entry` exit. It has nothing to record but the loop, so
+        // aborting would leave the loop's first trip on tier-0 for good (fft's
+        // `for a`, whose body only reaches the inner root at its own inner
+        // `for_prep`). It enters the loop and unrolls it, bounded by
+        // `loopunroll` — LuaJIT's `rec_loop_interp` side-trace arm. LuaJIT lets
+        // every side trace do this; here a continuation that reaches a rootless
+        // `for_prep` mid-body would grow a prefix chain INTO the inner loop's
+        // region from outside it, and bursts entered there never go silent
+        // (scimark-lu's `for i`: +13% instructions). TODO.md tracks that.
+        if (!self.context.inner_root) {
+            const starts_here = self.inline_depth == 0 and self.anchor.proto == proto and self.anchor.pc + 1 == pc;
+            if (!starts_here) return self.abort(.nyi_opcode);
+            const rfirst = try self.recForEntryTest(a, vinit, vlimit, vstep, true);
+            self.setReg(a, rfirst);
+            self.setReg(a + 3, rfirst);
+            self.noteLoopIteration();
+            return;
+        }
 
         // Doc 47 increment A: check whether the current register state matches the
         // inner root's entry guards. If it does, use the existing immediate `.link`
         // close. If not — and the mismatch is int→float promotable — take the
         // record-through path and peel one inner iteration to promote types.
         // The inner root's entry state is the P2 hand-off above: `R[a]` and
-        // `R[a+3]` both hold `(init − step) + step`.
+        // `R[a+3]` both hold the first index.
         const inner_guards = self.context.inner_root_guards;
         if (!self.precise and self.pending_link_close == null and inner_guards.len > 0) {
-            const vfirst = arith.add(arith.sub(vinit, vstep) catch return self.abort(.bad_type), vstep) catch return self.abort(.bad_type);
-            const entry: ForEntryView = .{ .regs = regs, .a = a, .next = vfirst };
+            const entry: ForEntryView = .{ .regs = regs, .a = a, .next = arith.forFirstIndex(vinit, vstep) };
             const compatible = entryGuardsMatch(inner_guards, entry);
             if (!compatible and entryGuardsMismatchPromotable(inner_guards, entry)) {
-                // Promotable int→float mismatch: record `for_prep` as arithmetic
-                // (like zero-trip / inline_depth>0) and peel one inner iteration.
+                // Promotable int→float mismatch: record the entry test (like
+                // zero-trip / inline_depth>0) and peel one inner iteration.
                 // Save rewind state BEFORE emitting any IR so that a mid-body
                 // abort can truncate back and close `.link` immediately.
                 const n_regs = self.anchor_num_registers;
@@ -3933,19 +3899,13 @@ pub const RecordingSession = struct {
                 errdefer self.gpa.free(saved_regs);
                 const rewind_ir = @as(u32, @intCast(self.instrs.items.len));
                 const rewind_es = @as(u32, @intCast(self.entry_slots.items.len));
-                const rinit0 = try self.refOf(a);
-                const rlimit0 = try self.refOf(a + 1);
-                const rstep0 = try self.refOf(a + 2);
-                try self.guardNum(rinit0, vinit, .operand_type, .a);
-                try self.guardNum(rlimit0, vlimit, .operand_type, .a1);
-                try self.guardNum(rstep0, vstep, .operand_type, .a2);
-                const rsub = try self.emit(.{ .op = .sub, .a = rinit0, .b = rstep0, .ty = arithResultType(.sub, vinit, vstep) });
-                self.setReg(a, rsub);
+                const rfirst = try self.recForEntryTest(a, vinit, vlimit, vstep, true);
+                self.setReg(a, rfirst);
+                self.setReg(a + 3, rfirst);
                 self.pending_link_close = .{
                     .inner_anchor_pc = inner_anchor,
                     .for_loop_pc = fl_pc,
                     .contract = contract,
-                    .phase = .await_initial_entry,
                     .ir_rewind_len = rewind_ir,
                     .entry_slots_rewind_len = rewind_es,
                     .for_prep_slot = a,
@@ -3969,47 +3929,10 @@ pub const RecordingSession = struct {
         }
 
         // Reconstruct the inner root's entry state (discharges P2 — see the doc
-        // comment). Guard init/limit/step are numbers (all three — tier-0 `for_prep`
-        // type-checks `limit` too, so a non-number limit must side-exit here rather
-        // than commit a bogus link); already checked at the top of this fn.
-        const rinit = try self.refOf(a);
-        const rlimit = try self.refOf(a + 1);
-        const rstep = try self.refOf(a + 2);
-        try self.guardNum(rinit, vinit, .operand_type, .a);
-        try self.guardNum(rlimit, vlimit, .operand_type, .a1);
-        try self.guardNum(rstep, vstep, .operand_type, .a2);
-        const ascending = try self.guardForStep(rstep, vstep);
-
-        // First-iteration bounds test, mirroring `recForLoop`'s compare (incl. the
-        // float-limit → int specialization so a mixed int/float compare stays lowerable
-        // and byte-identical to tier-0's `idx <= limit`). tier-0 computes `(init−step)
-        // +step` and compares THAT — which is NOT always `init` for floats (e.g.
-        // `init=1.0, step=1e16` → tier-0's first index is `0.0`, not `1.0`), so the
-        // recorded IR must do the same `sub` then `add` and both compare and publish
-        // the result. (An earlier revision compared/published `init` directly on the
-        // "(init−step)+step = init" shortcut — codex-flagged BLOCKER: a float link
-        // handed the inner root a first index tier-0 never produced. Ints wrap back
-        // exactly, so this only ever differed for floats.) On failure the inner loop
-        // runs zero times → side-exit to tier-0 instead of entering the inner root.
-        const all_int = vinit.isInt() and vstep.isInt();
-        const vpre = arith.sub(vinit, vstep) catch return self.abort(.bad_type);
-        const rpre = try self.emit(.{ .op = .sub, .a = rinit, .b = rstep, .ty = arithResultType(.sub, vinit, vstep) });
-        const rfirst = try self.emit(.{ .op = .add, .a = rpre, .b = rstep, .ty = arithResultType(.add, vpre, vstep) });
-        const rlimit_cmp = if (all_int and vlimit.isFloat() and value.floatAsExactInt(vlimit.asFloat()) != null) blk: {
-            const iof = try self.emit(.{ .op = .int_of_float, .a = rlimit, .ty = .int });
-            self.stampProv(iof, .limit_int, .a1, .neutral);
-            break :blk iof;
-        } else rlimit;
-        const cmp = if (ascending)
-            try self.emit(.{ .op = .le, .a = rfirst, .b = rlimit_cmp, .ty = .boolean })
-        else
-            try self.emit(.{ .op = .le, .a = rlimit_cmp, .b = rfirst, .ty = .boolean });
-        self.stampProv(try self.emit(.{ .op = .guard_true, .a = cmp }), .loop_done, .none, .neutral);
-
-        // Publish the inner root's entry state: the control index `R[a]` and the
-        // visible loop var `R[a+3]` both hold tier-0's first index `(init−step)+step`.
-        // (limit `R[a+1]` / step `R[a+2]` are untouched by the loop and flow through
-        // the exit snapshot.)
+        // comment): the entry test, then the control index `R[a]` and the visible
+        // loop var `R[a+3]` both hold the first index. (limit `R[a+1]` / step
+        // `R[a+2]` are untouched by the loop and flow through the exit snapshot.)
+        const rfirst = try self.recForEntryTest(a, vinit, vlimit, vstep, true);
         self.setReg(a, rfirst);
         self.setReg(a + 3, rfirst);
 

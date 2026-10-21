@@ -1684,12 +1684,168 @@ test "B-3b.2 replay walk queues demotion and applies it before pending disarms" 
     state.disarmAllLinks();
     try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
     try testing.expectEqual(@as(usize, 1), state.registry.native_physical.pending_demote.items.len);
-    try testing.expect(state.registry.native_physical.pending_disarm_all);
+    try testing.expectEqual(.all, state.registry.native_physical.pending_teardown);
     state.registry.native_physical.exitReplayWalk();
     state.applyPendingDisarms();
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
     for (edges) |edge| try expectB3Promoted(edge, false);
+}
+
+/// Doc 64 §15 fixture: two unrelated two-trace cycles, a↔b and c↔d, each
+/// armed both ways; regions are installed by the tests.
+const TwoNests = struct { a: *Trace, b: *Trace, c: *Trace, d: *Trace };
+fn makeTwoNests(gpa: std.mem.Allocator, state: *TraceState, proto: *const Proto, first_id: u32) !TwoNests {
+    const n: TwoNests = .{
+        .a = try makeB3LinkTrace(gpa, state, proto, first_id, 1, 2),
+        .b = try makeB3LinkTrace(gpa, state, proto, first_id + 1, 2, 1),
+        .c = try makeB3LinkTrace(gpa, state, proto, first_id + 2, 3, 4),
+        .d = try makeB3LinkTrace(gpa, state, proto, first_id + 3, 4, 3),
+    };
+    try testing.expect(try state.armNativeLink(n.a, 0, n.b, .link_terminal));
+    try testing.expect(try state.armNativeLink(n.b, 0, n.a, .link_terminal));
+    try testing.expect(try state.armNativeLink(n.c, 0, n.d, .link_terminal));
+    try testing.expect(try state.armNativeLink(n.d, 0, n.c, .link_terminal));
+    return n;
+}
+
+fn expectOnlyLinksOf(state: *TraceState, parents: []const *Trace) !void {
+    const links = state.registry.native_physical.armedLinks();
+    try testing.expectEqual(parents.len, links.len);
+    for (links) |l| {
+        for (parents) |p| {
+            if (l.parent == p) break;
+        } else return error.TestUnexpectedResult;
+    }
+}
+
+test "doc 64 §15 (1d): a region teardown takes its own links; another nest's links and promoted set survive" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [6]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1741, .code = &code, .name = "1d-two-nests", .num_registers = 2 };
+    const n = try makeTwoNests(gpa, &state, &proto, 1);
+    const struck: RegionKey = .{ .region_id = @enumFromInt(7), .activation = 40 };
+    const other: RegionKey = .{ .region_id = @enumFromInt(8), .activation = 41 };
+    try installB3PromotionRegion(&state, struck, &.{ n.a, n.b });
+    try installB3PromotionRegion(&state, other, &.{ n.c, n.d });
+    const observed = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(n.c, 0, .link_terminal),
+        b3ObservedRow(n.d, 0, .link_terminal),
+        b3ObservedRow(n.c, 0, .link_terminal),
+    };
+    const edges = state.detectPromotableSet(&observed, other).?;
+    defer gpa.free(edges);
+    try state.promoteSet(edges, other);
+
+    state.disarmRegionLinks(struck.region_id, null);
+    try expectOnlyLinksOf(&state, &.{ n.c, n.d });
+    try testing.expectEqual(@as(u64, 2), state.registry.native_physical.native_link_disarms);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
+    for (edges) |edge| try expectB3Promoted(edge, true);
+}
+
+test "doc 64 §15 (1d): a link shared by two regions goes with either, demoting the other's promoted set" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [6]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1742, .code = &code, .name = "1d-shared", .num_registers = 2 };
+    const n = try makeTwoNests(gpa, &state, &proto, 1);
+    // `promoted` owns a↔b; `struck` spans both cycles, so a↔b and c↔d are
+    // its member-to-member links too.
+    const promoted: RegionKey = .{ .region_id = @enumFromInt(9), .activation = 42 };
+    const struck: RegionKey = .{ .region_id = @enumFromInt(10), .activation = 43 };
+    try installB3PromotionRegion(&state, promoted, &.{ n.a, n.b });
+    try installB3PromotionRegion(&state, struck, &.{ n.a, n.b, n.c, n.d });
+    const observed = [_]trace_exec.LedgerEntry{
+        b3ObservedRow(n.a, 0, .link_terminal),
+        b3ObservedRow(n.b, 0, .link_terminal),
+        b3ObservedRow(n.a, 0, .link_terminal),
+    };
+    const edges = state.detectPromotableSet(&observed, promoted).?;
+    defer gpa.free(edges);
+    try state.promoteSet(edges, promoted);
+    try testing.expectEqual(@as(usize, 1), state.registry.native_physical.promoted_sets.items.len);
+
+    state.disarmRegionLinks(struck.region_id, null);
+    try expectOnlyLinksOf(&state, &.{});
+    try testing.expectEqual(@as(usize, 0), state.registry.native_physical.promoted_sets.items.len);
+    for (edges) |edge| try expectB3Promoted(edge, false);
+}
+
+test "doc 64 §15 (1d): mid-replay a region teardown marks and defers; the drain sweeps exactly the marked links" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [6]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1743, .code = &code, .name = "1d-deferred", .num_registers = 2 };
+    const n = try makeTwoNests(gpa, &state, &proto, 1);
+    const struck: RegionKey = .{ .region_id = @enumFromInt(11), .activation = 44 };
+    try installB3PromotionRegion(&state, struck, &.{ n.a, n.b });
+    const phys = &state.registry.native_physical;
+
+    phys.enterReplayWalk();
+    state.disarmRegionLinks(struck.region_id, null);
+    // The registry keeps its shape for the rest of the walk.
+    try testing.expectEqual(@as(usize, 4), phys.armed_links.items.len);
+    try testing.expectEqual(.condemned, phys.pending_teardown);
+    try testing.expectEqual(@as(u64, 0), phys.native_link_disarms);
+    var marked: usize = 0;
+    for (phys.armed_links.items) |l| {
+        if (!l.condemned) continue;
+        try testing.expect(l.parent == n.a or l.parent == n.b);
+        marked += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), marked);
+    phys.exitReplayWalk();
+
+    // The drain applies it, and drops a bridge arm queued by the same walk.
+    state.pending_bridge_arm = .{ .trace_id = n.a.id, .exit_instr = 0 };
+    state.applyPendingDisarms();
+    try expectOnlyLinksOf(&state, &.{ n.c, n.d });
+    try testing.expectEqual(.none, phys.pending_teardown);
+    try testing.expectEqual(@as(?trace.ExitKey, null), state.pending_bridge_arm);
+    try testing.expectEqual(@as(u64, 2), phys.native_link_disarms);
+
+    // A global teardown requested in the same walk swallows a targeted one.
+    try testing.expect(try state.armNativeLink(n.a, 0, n.b, .link_terminal));
+    phys.enterReplayWalk();
+    state.disarmRegionLinks(struck.region_id, null);
+    try testing.expectEqual(.condemned, phys.pending_teardown);
+    state.disarmAllLinks();
+    try testing.expectEqual(.all, phys.pending_teardown);
+    try testing.expectEqual(@as(usize, 3), phys.armed_links.items.len);
+    phys.exitReplayWalk();
+    state.applyPendingDisarms();
+    try expectOnlyLinksOf(&state, &.{});
+    try testing.expectEqual(.none, phys.pending_teardown);
+}
+
+test "doc 64 §15 (1d): fallback invalidation takes the tombstoned region's links and bridges, not another nest's" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [8]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1744, .code = &code, .name = "1d-fallback", .num_registers = 2 };
+    const n = try makeTwoNests(gpa, &state, &proto, 1);
+    const fallback: RegionKey = .{ .region_id = @enumFromInt(12), .activation = 45 };
+    try installB3PromotionRegion(&state, fallback, &.{ n.a, n.b });
+    state.region_policy.region_defs.getPtr(fallback.region_id).?.fallback_owner = true;
+    // A bridge armed on the region's proof, between anchors outside it.
+    const e = try makeB3LinkTrace(gpa, &state, &proto, 5, 5, 6);
+    const f = try makeB3LinkTrace(gpa, &state, &proto, 6, 6, 5);
+    try state.registry.native_physical.armed_links.append(gpa, .{ .parent = e, .slot_index = 0, .child = f, .kind = .region_bridge, .region_id = fallback.region_id });
+
+    state.invalidateRegion(fallback.region_id);
+    try testing.expect(state.region_policy.region_defs.get(fallback.region_id).?.tombstoned);
+    try expectOnlyLinksOf(&state, &.{ n.c, n.d });
+    try testing.expectEqual(@as(u64, 3), state.registry.native_physical.native_link_disarms);
 }
 
 test "B-3d.1 low-yield unfreeze demotes the region's promotion in the same act" {

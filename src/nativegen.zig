@@ -1316,10 +1316,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 try regToPlace(a, placeOfRef(alloc, i), .rax);
             },
             // The numeric-for step-direction guards (`trace_ir.stepGuardPasses`):
-            // side-exit when the step's sign is not the recorded direction. An
-            // int compares with 0 signed. A float runs `ucomisd 0, step`, whose
-            // `a` (CF=0, ZF=0) is exactly an ordered `step < 0`, so a NaN step
-            // counts upward as in tier-0.
+            // side-exit when the step's sign is not the recorded direction,
+            // upward iff `0 < step`. An int compares with 0 signed. A float runs
+            // `ucomisd step, 0`, whose `a` (CF=0, ZF=0) is exactly an ordered
+            // `step > 0`, so a NaN step counts downward as in tier-0.
             .guard_step_up, .guard_step_down => {
                 const up = ins.op == .guard_step_up;
                 if (kinds[ins.a] == .int) {
@@ -1328,13 +1328,25 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         .mem => |d| try a.cmpQwordMemImm8(.rsp, d, 0),
                         .xmm => unreachable, // an int is never homed in an XMM
                     }
-                    try jccNativeExit(a, exit_labels, i, if (up) .l else .ge);
+                    try jccNativeExit(a, exit_labels, i, if (up) .le else .g);
                 } else {
                     try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.a), .float);
                     try a.xorpdRegReg(XMM_SCRATCH1, XMM_SCRATCH1);
-                    try a.ucomisdRegReg(XMM_SCRATCH1, XMM_SCRATCH0);
-                    try jccNativeExit(a, exit_labels, i, if (up) .a else .be);
+                    try a.ucomisdRegReg(XMM_SCRATCH0, XMM_SCRATCH1);
+                    try jccNativeExit(a, exit_labels, i, if (up) .be else .a);
                 }
+            },
+            // The numeric-for overflow guard (`trace_ir.forNoOverflow`, int
+            // bound only: `proveKinds` bails a float one): side-exit when
+            // `bound + step` overflows, from the add's own OF flag.
+            .guard_for_nov => {
+                try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
+                switch (placeOfRef(alloc, ins.b)) {
+                    .reg => |r| try a.addRegReg(.rax, r),
+                    .mem => |d| try a.addRegMem(.rax, .rsp, d),
+                    .xmm => unreachable, // an int is never homed in an XMM
+                }
+                try jccNativeExit(a, exit_labels, i, .o);
             },
             // fsqrt: the inlined pure builtin. `@sqrt` ≡ `sqrtsd` bit-for-bit under the
             // default MXCSR (round-to-nearest-even, which mahina never changes) — including

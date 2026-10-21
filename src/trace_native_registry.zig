@@ -74,6 +74,11 @@ pub const NativeLink = struct {
     /// by construction. Gen 0 = never resolved (state gens start at 1).
     bridge_edge: ?StructuralEdgeId = null,
     bridge_edge_gen: u32 = 0,
+    /// Doc 64 §15 (1d): marked by a region teardown (`disarmRegionLinks`) and
+    /// removed by `disarmCondemned` — at once, or at `drainBarrier` when the
+    /// request came mid-replay-walk. Nothing in the walk reads it, so marking
+    /// is safe while the registry must not change shape.
+    condemned: bool = false,
 };
 pub const PromotedEdge = struct {
     parent: *Trace,
@@ -156,6 +161,16 @@ pub const PromotedSet = struct {
 pub const ParkedProof = struct {
     region_id: RegionId,
     edges: []PromotedEdge,
+};
+/// A deferred link teardown, ordered: a global one swallows a targeted one.
+/// One field, so `drainBarrier`'s inline gate and the quiet head path test
+/// "anything pending" with a single load.
+pub const PendingTeardown = enum(u8) {
+    none,
+    /// Doc 64 §15: sweep the links marked `condemned` (`disarmCondemned`).
+    condemned,
+    /// `disarmAllLinks`.
+    all,
 };
 pub const DemotionReason = enum { activation, region_close, slot_mutation, trace_invalidation, teardown, unfreeze, membership_growth };
 pub const PendingDemotion = struct { id: u32, reason: DemotionReason };
@@ -281,7 +296,8 @@ pub const NativePhysicalRegistry = struct {
     /// infallible.
     pending_demote: std.ArrayListUnmanaged(PendingDemotion) = .empty,
     replay_walk_depth: u32 = 0,
-    pending_disarm_all: bool = false,
+    /// A teardown requested mid-replay-walk, applied by `drainBarrier`.
+    pending_teardown: PendingTeardown = .none,
     /// Parked promotion proofs, one at most per RegionId (few regions live at
     /// once — a linear scan; see `ParkedProof`).
     parked_proofs: std.ArrayListUnmanaged(ParkedProof) = .empty,
@@ -802,9 +818,11 @@ pub const NativePhysicalRegistry = struct {
         // rows validate against it (see `replay_walk_depth`). Defer; the ledger
         // driver applies it right after the walk, before any native re-entry.
         if (self.replay_walk_depth > 0) {
-            self.pending_disarm_all = true;
+            self.pending_teardown = .all;
             return;
         }
+        // Whatever was pending (marked links included) goes with the rest.
+        self.pending_teardown = .none;
         if (self.armed_links.items.len == 0) return;
         self.dbg("disarmAllLinks: resetting {d} armed links", .{self.armed_links.items.len});
         self.native_link_disarms +|= @intCast(self.armed_links.items.len);
@@ -824,6 +842,24 @@ pub const NativePhysicalRegistry = struct {
         self.armed_links.clearRetainingCapacity();
         // See resetLinksTouching: removed arms re-open provenance publication.
         self.provenance_invalidated = true;
+    }
+    /// Doc 64 §15 (1d): remove every armed link marked `condemned`. Defers
+    /// mid-replay-walk exactly like `disarmAllLinks` (later rows validate
+    /// against the registry); the marks stay on the links, so the deferred
+    /// sweep needs no region lookup.
+    pub fn disarmCondemned(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena) void {
+        if (self.replay_walk_depth > 0) {
+            if (self.pending_teardown == .none) self.pending_teardown = .condemned;
+            return;
+        }
+        // A global teardown still pending swallows this one.
+        if (self.pending_teardown == .all) return self.disarmAllLinks(arena);
+        self.pending_teardown = .none;
+        var i = self.armed_links.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.armed_links.items[i].condemned) self.disarmLinkAt(arena, i);
+        }
     }
     pub fn disarmLinkAt(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena, idx: usize) void {
         if (self.replay_walk_depth != 0) @panic("disarmLinkAt during replay");
@@ -1108,8 +1144,15 @@ pub const NativePhysicalRegistry = struct {
 
         return .changed;
     }
-    pub fn drainBarrier(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena) bool {
+    /// Runs after every ledger: the gate is inline (three loads), the work
+    /// stays out of line so its growth never drags into the dispatcher path
+    /// (the `drainPendingBridgeArm` split).
+    pub inline fn drainBarrier(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena) bool {
         if (self.replay_walk_depth != 0) @panic("drainBarrier during replay");
+        if (self.pending_demote.items.len == 0 and self.pending_teardown == .none) return false;
+        return self.drainBarrierSlow(arena);
+    }
+    noinline fn drainBarrierSlow(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena) bool {
         while (self.pending_demote.items.len > 0) {
             const pending = self.pending_demote.pop().?;
             for (self.promoted_sets.items, 0..) |set, i| {
@@ -1119,9 +1162,11 @@ pub const NativePhysicalRegistry = struct {
                 }
             }
         }
-        if (!self.pending_disarm_all) return false;
-        self.pending_disarm_all = false;
-        self.disarmAllLinks(arena);
+        switch (self.pending_teardown) {
+            .none => return false,
+            .condemned => self.disarmCondemned(arena),
+            .all => self.disarmAllLinks(arena),
+        }
         return true;
     }
     pub fn deinit(self: *NativePhysicalRegistry, arena: *nativegen.McodeArena) void {
@@ -1265,7 +1310,7 @@ test "native owner barrier cancels policy arm even with no live links" {
     defer registry.deinit(&arena);
     registry.replay_walk_depth = 1;
     registry.disarmAllLinks(&arena);
-    try std.testing.expect(registry.pending_disarm_all);
+    try std.testing.expectEqual(PendingTeardown.all, registry.pending_teardown);
     registry.replay_walk_depth = 0;
     try std.testing.expect(registry.drainBarrier(&arena));
     try std.testing.expect(!registry.drainBarrier(&arena));

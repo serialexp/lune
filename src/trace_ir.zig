@@ -14,6 +14,7 @@ const std = @import("std");
 const io = @import("io.zig");
 const function = @import("function.zig");
 const value_mod = @import("value.zig");
+const arith = @import("arith.zig");
 
 /// An SSA value reference: an index into a trace's `instrs` array. Every IR
 /// instruction defines exactly one value, named by its position.
@@ -764,9 +765,10 @@ pub const IrOp = enum(u8) {
     // ---- numeric-for step direction (LuaJIT `rec_for_check`) ----
     //
     // `a` = the step ref (a guarded int or float). Produces nothing.
-    // `guard_step_up` passes iff `!(step < 0)`, the direction tier-0's
-    // `for_loop` counts upward in (a NaN step included); `guard_step_down`
-    // passes iff `step < 0`. The recorder bakes the loop test's direction
+    // `guard_step_up` passes iff `0 < step`, the direction tier-0's
+    // `for_loop` counts upward in (`arith.forStepAscending`, Lua 5.4's test);
+    // `guard_step_down` passes otherwise (a NaN step included). The
+    // recorder bakes the loop test's direction
     // (`le(next, limit)` or `le(limit, next)`) into the trace, so a
     // non-constant step needs its sign pinned: a later entry whose step
     // has the other sign side-exits instead of running the wrong test.
@@ -778,6 +780,20 @@ pub const IrOp = enum(u8) {
     // Wire ordinals 97–98.
     guard_step_up,
     guard_step_down,
+
+    // ---- numeric-for overflow (LuaJIT `rec_for_check`'s ADDOV) ----
+    //
+    // `a` = a bound ref (int or float), `b` = the int step ref. Produces
+    // nothing. Passes iff `forNoOverflow`: no int index the loop test admits
+    // against `a` overflows when stepped. tier-0's `for_loop` stops an int
+    // loop whose add overflows; a trace's `add` wraps, so an int loop's
+    // `for_loop` carries this guard ahead of its add. The recorder puts the
+    // limit in `a`, which is loop-invariant, so LICM hoists the guard to once
+    // per entry. Only when that fails at record time (a limit within one step
+    // of the int range's end, e.g. `math.maxinteger`) does it guard the index
+    // instead, per iteration. Stamps its recording pc in `aux` and is `tropt`
+    // kind `.cvt`, like `guard_step_*`. Wire ordinal 99.
+    guard_for_nov,
 };
 
 /// Doc 63 §5.1: one host call site of a precise trace, indexed by
@@ -831,15 +847,31 @@ pub fn primPinPasses(op: IrOp, v: value_mod.Value) bool {
     };
 }
 
-/// tier-0 `for_loop` counts upward iff `!(step < 0)` (`Vm.forLoopStep`), so a
-/// NaN step counts upward. `step` is an int or a float.
-pub fn forStepAscending(step: value_mod.Value) bool {
-    return if (step.isInt()) step.asInt() >= 0 else !(step.asFloat() < 0);
-}
-
 /// The `guard_step_*` that pins `step`'s direction.
 pub fn stepGuardOp(step: value_mod.Value) IrOp {
-    return if (forStepAscending(step)) .guard_step_up else .guard_step_down;
+    return if (arith.forStepAscending(step)) .guard_step_up else .guard_step_down;
+}
+
+/// `guard_for_nov`'s predicate, which every tier implements: an int index
+/// that passes the loop test against `bound` can be stepped by `step`
+/// without overflowing. An int `bound` admits indices up to itself (down to
+/// it, counting down), so that is `bound + step` not overflowing. A float
+/// `bound` admits up to `floor(bound)` (down to `ceil(bound)`): past the int
+/// range on the side the loop counts toward, it fails; past the other side,
+/// or NaN, it admits no index and passes. LICM may hoist the guard above its
+/// operands' type guards, so a non-int step or non-number bound fails.
+pub fn forNoOverflow(bound: value_mod.Value, step: value_mod.Value) bool {
+    if (!step.isInt()) return false;
+    const s = step.asInt();
+    if (bound.isInt()) return @addWithOverflow(bound.asInt(), s)[1] == 0;
+    if (!bound.isFloat()) return false;
+    const f = bound.asFloat();
+    if (std.math.isNan(f)) return true;
+    const up = s > 0;
+    const last = if (up) @floor(f) else @ceil(f);
+    if (last >= 0x1p63) return !up;
+    if (last < -0x1p63) return up;
+    return @addWithOverflow(@as(i64, @intFromFloat(last)), s)[1] == 0;
 }
 
 /// `step` has the direction `op` pins. The one predicate every tier's
@@ -849,8 +881,8 @@ pub fn stepGuardOp(step: value_mod.Value) IrOp {
 pub fn stepGuardPasses(op: IrOp, step: value_mod.Value) bool {
     if (!step.isNumber()) return false;
     return switch (op) {
-        .guard_step_up => forStepAscending(step),
-        .guard_step_down => !forStepAscending(step),
+        .guard_step_up => arith.forStepAscending(step),
+        .guard_step_down => !arith.forStepAscending(step),
         else => unreachable,
     };
 }
@@ -928,7 +960,7 @@ pub fn guardExitPc(ins: IrInstr) ?u32 {
     return switch (ins.op) {
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .alen => @intCast(ins.aux),
         .guard_is_nil, .guard_is_false, .guard_is_true => @intCast(ins.aux),
-        .guard_step_up, .guard_step_down => @intCast(ins.aux),
+        .guard_step_up, .guard_step_down, .guard_for_nov => @intCast(ins.aux),
         else => null,
     };
 }
@@ -941,7 +973,7 @@ pub fn isSideExitGuardOp(op: IrOp) bool {
     return switch (op) {
         .guard_absent => true,
         .guard_is_nil, .guard_is_false, .guard_is_true => true,
-        .guard_step_up, .guard_step_down => true,
+        .guard_step_up, .guard_step_down, .guard_for_nov => true,
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent, .alen => true,
         else => false,
     };

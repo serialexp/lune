@@ -64,6 +64,8 @@ pub const Reg = enum(u4) {
 /// Condition codes — the low nibble shared by `setcc` (0x90|cc) and the near
 /// `jcc` (0x0F 0x80|cc). Only the codes the trace compiler emits are listed.
 pub const Cond = enum(u8) {
+    o = 0x0, // OF=1            — signed overflow; the `for` overflow guard (`guard_for_nov`)
+    no = 0x1, // OF=0           — no signed overflow
     b = 0x2, // CF=1            — unsigned <  (below)
     ae = 0x3, // CF=0           — unsigned ≥  (above-or-equal / not-carry)
     e = 0x4, // ZF=1            — equal / zero

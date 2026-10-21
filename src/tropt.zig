@@ -78,6 +78,12 @@ pub const Optimized = struct {
 
 const OpKind = enum { konst, slot_load, binary, unary, cvt, guard, aref, aload, astore, loop, phi, preheader, alloc, gcguard, pure3, scratch3, scratch1k, proj, alloc_proj, parse, setpos };
 
+/// The `.cvt` ops that read `b` as well as `a`. Every `.cvt` arm below
+/// (invariance, liveness, the preheader cone, the remap) consults it.
+fn cvtReadsB(op: IrOp) bool {
+    return op == .guard_for_nov;
+}
+
 fn kindOf(op: IrOp) OpKind {
     return switch (op) {
         .konst => .konst,
@@ -94,6 +100,10 @@ fn kindOf(op: IrOp) OpKind {
         // step, so LICM hoists it to run once per entry (LuaJIT hoists its
         // `rec_for_check` guard the same way). See the `.cvt` LICM note.
         .guard_step_up, .guard_step_down => .cvt,
+        // The numeric-for overflow guard likewise: its outcome depends only on
+        // its bound and step, so on the (invariant) limit it hoists to once
+        // per entry, LuaJIT's hoisted ADDOV. On the index it stays put.
+        .guard_for_nov => .cvt,
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => .guard,
         // Doc 57: the primitive pins are ordinary one-operand type guards.
         .guard_is_nil, .guard_is_false, .guard_is_true => .guard,
@@ -665,7 +675,7 @@ pub fn optimize(
             // outcome, per the LICM soundness note above). Hoisting it (and its operand
             // cone) means one conversion per entry instead of per iteration.
             .cvt => {
-                inv[i] = inv[canon[ins.a]];
+                inv[i] = inv[canon[ins.a]] and (!cvtReadsB(ins.op) or inv[canon[ins.b]]);
                 hoist[i] = inv[i];
             },
             // Guards, memory ops, the loop terminator, φ, `.alloc` (id-stream
@@ -737,7 +747,11 @@ pub fn optimize(
                     live[canon[ins.a]] = true;
                     live[canon[ins.b]] = true;
                 },
-                .unary, .cvt, .guard, .aload => live[canon[ins.a]] = true,
+                .unary, .guard, .aload => live[canon[ins.a]] = true,
+                .cvt => {
+                    live[canon[ins.a]] = true;
+                    if (cvtReadsB(ins.op)) live[canon[ins.b]] = true;
+                },
                 // `.alloc` reads its single guarded operand `a`. `.gcguard`
                 // reads nothing (`a` unused).
                 .alloc => {
@@ -805,7 +819,11 @@ pub fn optimize(
                     in_pre[canon[instrs[i].a]] = true;
                     in_pre[canon[instrs[i].b]] = true;
                 },
-                .unary, .cvt => in_pre[canon[instrs[i].a]] = true,
+                .unary => in_pre[canon[instrs[i].a]] = true,
+                .cvt => {
+                    in_pre[canon[instrs[i].a]] = true;
+                    if (cvtReadsB(instrs[i].op)) in_pre[canon[instrs[i].b]] = true;
+                },
                 else => {}, // konst / invariant slot_load: leaf of the cone
             }
         }
@@ -885,7 +903,11 @@ pub fn optimize(
                 out.a = new_index[canon[ins.a]];
                 out.b = new_index[canon[ins.b]];
             },
-            .unary, .cvt, .guard, .aload => out.a = new_index[canon[ins.a]],
+            .unary, .guard, .aload => out.a = new_index[canon[ins.a]],
+            .cvt => {
+                out.a = new_index[canon[ins.a]];
+                if (cvtReadsB(ins.op)) out.b = new_index[canon[ins.b]];
+            },
             .alloc => {
                 out.a = new_index[canon[ins.a]];
                 if (ins.op == .ssub or ins.op == .srep2) out.b = new_index[canon[ins.b]];

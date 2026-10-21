@@ -1668,7 +1668,7 @@ test "A-vii-d.1 disarm deferral: disarmAllLinks defers mid-replay-walk; applyPen
     state.registry.native_physical.enterReplayWalk();
     state.disarmAllLinks();
     try testing.expectEqual(@as(usize, 1), state.registry.native_physical.armed_links.items.len);
-    try testing.expect(state.registry.native_physical.pending_disarm_all);
+    try testing.expectEqual(.all, state.registry.native_physical.pending_teardown);
     try testing.expectEqual(@as(u64, 0), state.registry.native_physical.native_link_disarms);
 
     // Driver-side application: registry cleared, counter charged, and any
@@ -1678,7 +1678,7 @@ test "A-vii-d.1 disarm deferral: disarmAllLinks defers mid-replay-walk; applyPen
     state.pending_bridge_arm = .{ .trace_id = 801, .exit_instr = 0 };
     state.applyPendingDisarms();
     try testing.expectEqual(@as(usize, 0), state.registry.native_physical.armed_links.items.len);
-    try testing.expect(!state.registry.native_physical.pending_disarm_all);
+    try testing.expectEqual(.none, state.registry.native_physical.pending_teardown);
     try testing.expectEqual(@as(?ExitKey, null), state.pending_bridge_arm);
     try testing.expectEqual(@as(u64, 1), state.registry.native_physical.native_link_disarms);
 

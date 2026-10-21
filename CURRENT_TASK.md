@@ -102,8 +102,10 @@ WORST BOARD ROW (2026-10-19, amber-badger): nsieve-bit-fp.
   silent set being re-earned at every activation (2,448 promote/demote
   pairs, ~580 rows each). Widening parked-proof reuse to elected regions
   was measured in a shadow tree (/tmp/lune-p6): fft −6.43%, nsieve-bit-fp
-  +35.21% (a stale proof freezes the pre-t7 topology). Options (a)–(d) in
-  §16 are waiting on Bart. Steps 5 and 6 are still uncommitted: they will
+  +35.21%. Codex and Antigravity reviewed it: the widening is sound; the
+  regression is the pc 40 `while` root never being recorded (discovery
+  starvation), not a stale proof. Options (a), (e)–(g) in §16 are waiting
+  on Bart. Codex thread: 01a15c52-6bd5-7a73-b2f1-20dc49096c93. Steps 5 and 6 are still uncommitted: they will
   be bundled with coral-raven's doc 65 Phase 0 (io.zig, main.zig,
   interp.zig hunks, stdlib CSV, bench/stdlib/io_*.lua) once that is green.
 
@@ -131,9 +133,87 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     profit map).
   - Waiting on Bart's Q1–Q5. The reviewer split is in doc 66 §10.
   - Then item 5 (call/return) and item 6 (dispatch prologue, doc 42 §4.2).
-- For Bart, still open: the integer `for` overflow wrap, `next`'s zero
-  results, the zero `for` step, and continuation step-constant
-  inheritance (all in TODO).
+- Bart (2026-10-21): wraparound should stop, a zero step should raise,
+  `next`'s zero results are fine, and continuations shouldn't re-check
+  the step sign every run.
+  - Zero step: done and green on all five gates. amber-badger is
+    bundling it into their interp.zig commit.
+  - `next`: closed in TODO as deliberate.
+  - Overflow: in progress. Bart didn't answer the A/B question, so I
+    took A: drop `for_prep`'s pre-subtract.
+    - Why: `init - step` makes a real overflow and the first add undoing
+      a wrapped pre-subtract look the same. It also makes float first
+      values inexact: `for x = 1e-20, 1, 1` printed 0.
+    - Tier-0 `for_prep`: validate, raise on a zero step, convert `init`
+      to float unless init and step are both ints, then run the limit
+      test. If the loop runs: `R[a] = R[a+3] = init`, then
+      `gatedBackEdgeHandler` at the header (keeps the hot count and the
+      first trace entry as before). If not: jump to `for_loop + 1`.
+      `aux` still points at the `for_loop`.
+    - `forLoopStep`'s int lanes: an overflowing add stops the loop.
+    - `backEdgeEpilogue`'s trip gate must accept `for_prep` too.
+    - `bc_liveness`: `for_prep` gets successors `pc + 1` (with
+      `edge_kill[0] = a+3`) and `for_loop + 1`.
+    - Recorder: one shared first-iteration test in place of the three
+      `(init - step) + step` copies (record-through, link path,
+      `rewindPeelAndCloseLink`). The peel's `.await_initial_entry`
+      phase goes away, because `for_prep` itself now decides whether
+      the loop runs.
+    - JIT overflow: a new pure guard `guard_for_nov x, step` (passes iff
+      `x + step` can't overflow; a float `x` uses floor/ceil). It is
+      emitted on the limit, which is loop-invariant, so LICM hoists it,
+      as LuaJIT's ADDOV does. If it fails at record time, it is emitted
+      per iteration on the index instead.
+    - Status: implemented, semantics match Lua 5.4 in all three tiers
+      (`/tmp/forov.lua`). Test suite 1741/1742: the fft multi-root
+      election test fails (`interp_exit_side_test`, doc 58 §4.8).
+    - Board A/B against HEAD (other agents' work is in the tree too;
+      the suspects were checked with instruction counts): scimark-fft
+      +33% (8.26 → 10.9 s at the default argument) and euler14-bit +54%
+      (+65% instructions). nbody, spectral-norm, sieve_int,
+      grid_matmul_f64 and partialsums are flat within 0.5%.
+    - fft, cause: the `for a` zero-trip guard in the continuation at
+      pc 38 used to resume at the `for a` `for_loop` (pc 114). A
+      continuation anchors there, which gave the structural edge
+      38→114 that joined the two 2-cycles into one 4-member region.
+      Now that exit resumes at the `for_prep` (pc 60), where nothing
+      anchors. The first `for a` iteration runs in tier-0, and each pass
+      closes the region `destination_outside` (800k closes). The seam
+      goes from 14.9% to 32.3% of the run.
+    - euler14-bit, cause: `side-want-at-resume` arms a recording at the
+      inner header (pc 25) for the `guard_absent` (cache hit → break)
+      exit. The first-trip arrival from `for_prep` now catches it on the
+      cache-miss path. That commits a sibling identical to the parent;
+      the two ping-pong on the same guard, and legacy-thrash gates the
+      anchor. The baseline only escaped because its recording happened
+      to take the break path and aborted. So this is a latent bug
+      (a replay-side recording can duplicate its parent), exposed here.
+    - Bart didn't answer "fix inside A or go back to B" either, so I
+      fixed both inside A:
+      - `for_prep` takes the patched entry when its `for_loop` is
+        `.jfor_loop` (`patchedForEntry`, shared with `opJForLoop`;
+        LuaJIT FORI → JFORI). Counter `for_prep_patched`. This fixes
+        euler14-bit.
+      - The `for_prep` first-trip test is a new `.for_entry` guard role
+        (was `.loop_done`), so it is attachable and an exit-side child
+        records at the `for_prep`. `recForPrepLink` records through a
+        rootless header only when the recording starts at that
+        `for_prep`. This fixes fft (the region has 5 members).
+        Recording through everywhere made scimark-lu +13%; TODO.md has
+        the region-prefix follow-up.
+      - Exit adapter step 3a: an invariant-slot untyped load is copied
+        raw into the other slot (nsieve-bit-fp `refused: kind`).
+    - Board, instructions vs HEAD: fft −1.4%, euler14 −1.6%, lu +0.1%;
+      nsieve and nsieve-bit-fp +0.5% in cycles (noise); the rest flat.
+    - Mutation-checked: overflow stop, `guard_for_nov` emission, its
+      native condition, the patched branch, `copySource` (null and
+      reversed), `.for_entry` → `.loop_done`, `starts_here` never and
+      always. The last needed a new LU test.
+    - Gates green 2026-10-21: just test, jit-debug test, embed-test,
+      wasm, hashgate 99/99 on both legs, viz bun test (84).
+    - Not committed: the interp.zig hunks interleave with amber-badger's
+      zero-step bundle, so the commit has to be coordinated with them.
+  - Then: continuation step-constant inheritance.
 
 LINE LOOKUP FIX (2026-10-11, coral-marten): LANDED in `49fd572`, bundled with amber-badger's doc 61 Phase K.
 - Bug from TODO.md "Every located runtime error rescans the source for

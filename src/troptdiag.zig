@@ -154,7 +154,7 @@ fn detectDeadCarries(
             // srep2 reads a+b; ssub additionally carries its END ref in `aux`
             // (doc 24 codex #4 — the one three-operand op). guard_absent
             // (doc 45) reads table+key.
-            .srep2, .guard_absent => {
+            .srep2, .guard_absent, .guard_for_nov => {
                 uses[ins.a] += 1;
                 uses[ins.b] += 1;
             },
@@ -321,7 +321,7 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
             .gload, .guard_grid, .guard_stride, .guard_gpresent,
             .alen,
             => ins.a == idx,
-            .srep2, .guard_absent => ins.a == idx or ins.b == idx,
+            .srep2, .guard_absent, .guard_for_nov => ins.a == idx or ins.b == idx,
             // scp shares ssub's three-operand encoding (doc 26 D3); doc 30's
             // sfindp/smatch ditto.
             .ssub, .scp, .sfindp, .smatch => ins.a == idx or ins.b == idx or @as(trace.Ref, @intCast(ins.aux)) == idx,

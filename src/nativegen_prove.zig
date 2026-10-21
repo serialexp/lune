@@ -557,6 +557,13 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (!isNumKind(kinds[ins.a])) return false;
                 kinds[i] = .none;
             },
+            // The numeric-for overflow guard: an int bound and an int step.
+            // A float bound (an int loop with a non-integral float limit)
+            // bails, as that loop's mixed compare does.
+            .guard_for_nov => {
+                if (kinds[ins.a] != .int or kinds[ins.b] != .int) return false;
+                kinds[i] = .none;
+            },
             // alen (doc 23 D3): the `#t` fast-case border. The operand is a
             // loop-invariant table home (`.ptr`, guard_table-covered slot_load) or
             // a per-iteration element table (`.heap`, .value-lane aload). The
@@ -1586,6 +1593,8 @@ pub fn operandReads(ins: trace_ir.IrInstr) struct { a: bool, b: bool } {
         .int_of_float, .alen => .{ .a = true, .b = false },
         // The step-direction guards read the step (a).
         .guard_step_up, .guard_step_down => .{ .a = true, .b = false },
+        // The overflow guard reads its bound (a) and step (b).
+        .guard_for_nov => .{ .a = true, .b = true },
         // aref reads table (a, an invariant home) + index (b). aload/guards reach the
         // table through aref.a, so they read only the aref token (a). astore reads
         // the aref token (a) plus the value to write (b). astore_append is the grow

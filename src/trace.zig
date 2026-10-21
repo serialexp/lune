@@ -1045,8 +1045,10 @@ pub const TraceState = struct {
     head_burst_visited: [8]u32 = @splat(0),
     head_burst_visited_len: usize = 0,
     /// A-vii-d.1: nonzero while a `replayLedger` walk is in progress. While set,
-    /// `disarmAllLinks` DEFERS (records `pending_disarm_all`) instead of
-    /// mutating the armed-link registry: later rows of the very ledger being
+    /// `disarmAllLinks` DEFERS (`pending_teardown = .all`), and a region
+    /// teardown (`disarmRegionLinks`, doc 64 §15) marks its links and defers
+    /// (`.condemned`), instead of mutating the armed-link registry:
+    /// later rows of the very ledger being
     /// walked validate their transitions against that registry (armed-edge
     /// provenance — fused M1 / loop-done / bridge rows all prove "this jump was
     /// armed" by finding the record), and a mid-walk disarm erases the proof of
@@ -1057,7 +1059,6 @@ pub const TraceState = struct {
     /// DRIVERS apply the deferred disarm via `applyPendingDisarms` immediately
     /// after the walk returns, BEFORE acting on the directive — so no native
     /// code ever runs between the deferral and its application.
-    /// The deferred `disarmAllLinks` request (see `replay_walk_depth`).
     /// Anchors currently held off tier-1 with a doubling cooldown (`Gate`). Set
     /// when a recording aborts, a commit fails, or the low-yield re-entry penalty
     /// maxes out. Unlike the old permanent blacklist, an anchor here is *retried*
@@ -1146,6 +1147,10 @@ pub const TraceState = struct {
     /// that says native trace bodies are still being entered *through the
     /// dispatcher*, which is exactly the post-blackout state R2-4 describes.
     native_entries: u64 = 0,
+    /// `for_prep` first trips handed to their loop's live `.jfor_loop` slot
+    /// (`Vm.patchedForEntry`, LuaJIT's JFORI) instead of the discovery walk.
+    /// Diagnostic/test only — no tiering path reads it.
+    for_prep_patched: u64 = 0,
     /// Diagnostic/test counters for nested-loop link execution. `link_ir_exits`
     /// counts continuations that actually reached the irinterp `.link` arm;
     /// `link_follow_count` counts those links being followed into the inner root.
@@ -3029,6 +3034,8 @@ pub const TraceState = struct {
     pub const armLoopDoneLinkTo = trace_link_mod.armLoopDoneLinkTo;
     pub const resetLinksTouching = trace_link_mod.resetLinksTouching;
     pub const disarmAllLinks = trace_link_mod.disarmAllLinks;
+    pub const disarmRegionLinks = trace_link_mod.disarmRegionLinks;
+    pub const linkDependsOnRegion = trace_link_mod.linkDependsOnRegion;
     pub const clearSiblingLatch = trace_link_mod.clearSiblingLatch;
     pub const disarmLinkAt = trace_link_mod.disarmLinkAt;
     pub const disarmStaleRegionBridgeLinks = trace_link_mod.disarmStaleRegionBridgeLinks;
@@ -4347,6 +4354,7 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
     try w.writeAll("mahina: JIT stats\n");
     try w.writeAll("  event counters:\n");
     try w.print("    trace entries:        {d} (native bodies: {d})\n", .{ ts.entries, ts.native_entries });
+    try w.print("    for_prep patched:     {d} (first trips through the loop's patched entry)\n", .{ts.for_prep_patched});
     try w.print("    self-call pushes:     {d} (doc 44 D11 native descents)\n", .{ts.self_call_pushes});
     try w.print("    self-ret pops:        {d} (doc 44 D12c native unwinds)\n", .{ts.self_ret_pops});
     try w.print("    frame links:          ret-cont arms={d} hits={d}; call-head arms={d} hits={d}\n", .{ ts.ret_cont_link_arms, ts.ret_cont_link_hits, ts.call_head_link_arms, ts.call_head_link_hits });

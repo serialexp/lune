@@ -3,7 +3,10 @@
 Status: **reviewed (round 1, §9), decided (§10); step 1 (diagnosis)
 done (§11), which corrects §3 P1; step 2 (typed chain outcome, 2b, 2d)
 built (§12); step 3 (3b, the marker root) built (§13); step 4
-(re-profile, 1e) built (§14). Next: step 5 (1d).**
+(re-profile, 1e) built (§14); step 5 (1d, targeted teardown) built
+(§15); step 6 (P4 re-profile) done (§16): P4 is gone, so 4c is not
+built. §16 lists the open options for the per-activation re-promotion
+seam that remains.**
 Bart asked for this doc and for Codex's and Antigravity's opinions
 before picking options. Corrections from the reviews are applied in
 place and listed in §9. Where the reviewers disagreed, Bart asked me to
@@ -939,6 +942,11 @@ nsieve-bit-fp 837.0M → 821.3M (−1.9%), nsieve 59.58M → 56.81M (−4.6%). M
 of the removed work was gate/disarm/re-arm bookkeeping, which is cheaper
 per instruction than the seam it leaves behind.
 
+Board (483235d vs 10b8d59, pinned pool, jit ms): nsieve-bit-fp 228.2 →
+224.5 (−1.6%; tier-0 214.8, 10.6× LuaJIT), nsieve 18.7 → 18.3 (−2.1%).
+str_find_match −4.2% with unchanged instruction counts is noise; every
+other row is within ±1%.
+
 **What remains, and 1a.** §10 step 4 allows corrected 1a "only if short
 productive activations remain". None strike now, so 1a is not built. Left
 over:
@@ -966,3 +974,290 @@ over:
   (the crude form).
 - "doc 64 steps 1-2" now counts `loop_exit` closes where it counted
   departures.
+
+## 15. Step 5: 1d, a region's teardown takes down its own links (2026-10-21)
+
+**What fires today.** Across every `@bench` (step-4 debug binary), the
+only region-driven global teardowns are nsieve-bit-fp's 15
+`region_decay` gates, all on the outer `for i` owner (pc 19, region 3:
+t4 pc 19 → t9 pc 68 → t4). Every other bench has exactly one
+`disarmAllLinks`, at the epoch boundary. Each nsieve-bit-fp gate resets
+5–13 armed links. Most of them belong to the `for k` nest (regions 1
+and 2: t1↔t3, t2/t6, t7→t8), which the outer region's verdict says
+nothing about. They re-arm within a few dozen log lines, and their
+silent sets are promoted again from scratch.
+
+**What a teardown has to remove.** Doc 17 made both teardowns global
+because a `NativeLink` had no region identity (§A3, round 5). The link
+record still has none except on `.region_bridge` arms, but the region
+does: every def keeps `member_points`, and silent promotion already
+treats "both endpoints are member points" as "this link is the region's"
+(`edgeMemberOfRegion`). Per link, the dependency on region `R` is:
+
+1. a `.region_bridge` link stamped `region_id = R`: armed on `R`'s
+   proof, so it dies with `R`, and `replayLedger` panics on a row whose
+   region no longer validates;
+2. a link whose parent and child anchors are both member points of `R`:
+   one of the edges `R`'s window judged. Today's global teardown removes
+   these, and so does this one;
+3. for a gate only, a link whose child is anchored at the gated owner. A
+   native jump into the owner would skip the dispatch gate. The global
+   teardown cut these too, though arming doesn't check the gate, so they
+   come back (t9 → t4 re-armed about 20k log lines after the first gate).
+
+Everything else was armed on per-trace evidence (receipt watch,
+provenance drain, link terminals, loop-done) that `R` never authorized,
+and it re-arms anyway. Shared dependencies follow from the slot funnel:
+a removed link's cell goes through `prepareSlotMutation`, which demotes
+every promoted set that owns it (whatever its region) and drops every
+parked proof that names it. Beyond that, the gate drops `R`'s own parked
+proof. `invalidateRegion` keeps its existing defs-generation demotion of
+every set and proof (`demoteSetsForRegionDefsMutation`): the generation
+bump falsifies the bridge memos, so that one stays global.
+
+**Membership is read raw.** `regionMemberPoint` answers false for a
+non-armable def, and `invalidateRegion` tombstones before it tears
+down. The teardown reads `def.member_points` directly; a tombstoned def
+keeps them (defs are never deleted). A def that is gone falls back to
+the global teardown (fail closed).
+
+**Mid-replay.** The global form defers through `pending_disarm_all`
+because later ledger rows validate against the registry. The targeted
+form marks its links at request time (`NativeLink.condemned`). That is
+a field write, not a structural change, and nothing in the walk reads
+it. The sweep runs then, or at `drainBarrier` when a walk is open
+(`pending_condemned`), which also blocks the quiet head path the way
+`pending_disarm_all` does. Marking at request time means the drain
+needs no region lookup, so a rebuild between request and drain can't
+change the answer. A pending global teardown swallows the targeted one.
+The pending bridge arm is dropped after a deferred sweep, as it is after
+a deferred global one.
+
+**Unchanged.** The epoch boundary (`beginTopLevelEpoch`) and the
+unsafe-window disarm (`!safe_to_arm`) stay global: neither is about a
+region. `condemnProvenanceEdgesAt(owner)` stays on the gate.
+
+**Tests.**
+- Two unrelated armed nests, a gate strike on one: its links (all three
+  dependency kinds) go and the other nest's links survive.
+- A shared dependency: a link that is a member of both regions is torn
+  down with either, and the other region's promoted set that owns its
+  cell is demoted.
+- Mid-replay: the request marks and defers, nothing moves until
+  `applyPendingDisarms`, the sweep then removes exactly the marked links
+  and drops the pending bridge arm.
+- Fallback invalidation (`invalidateRegion` on a `fallback_owner` def):
+  the bridges and member links go, the other nest survives.
+
+### 15.1 Result
+
+**What changed on nsieve-bit-fp** (production machine, `-Djit-debug`, the
+bench at its `@bench` args; outputs identical). Each of the 15 gates now
+resets 0–3 links, not 5–13. The `for k` nest keeps its arms, so:
+
+| | step 4 | step 5 |
+|---|---:|---:|
+| `arm:` events | 154 | 39 |
+| chain candidates | 5,858 | 25 |
+| exit-side chain outcomes | 5,818 | 1 |
+| exit-side give-ups (`--jit-stats`) | 2 | 0 |
+| silent promotions | 2,461 | 2,448 |
+| `region_decay` gates (pc 19) / window strikes | 15 / 13,390 | 15 / 13,390 |
+| closes: `loop_exit` / `departure` / `source_outside` | 50,131 / 9,241 / 33 | 50,131 / 9,243 / 23 |
+
+The `while` exit's give-up (§12, §14's "t7 e10") is gone: it followed the
+global teardowns, whose re-arm window sent every firing through the
+dispatcher.
+
+**Cost.** Instructions over every `@bench`, vs 483235d: nsieve-bit-fp
++0.57%, every other row within ±0.03%. Cycles on nsieve-bit-fp, median of
+five interleaved pairs (loadavg ~1.0): 830.0M → 819.8M (−1.2%, inside the
+±2% noise). The exit now hops natively about 330k more times (`--jit-stats`
+hops 3.06M → 3.39M) into a continuation that runs a few steps to the
+`for k` loop-done. Before, those firings ran in tier-0 after the give-up.
+That per-hop seam is step 6's re-profile.
+
+The first build cost +0.8% on benches with no region teardown at all
+(binary-trees, euler14-bit, spectral-norm). Callgrind (x86_64_v3 build)
+put it in `drainBarrier`, which runs after every ledger. The new sweep
+branch had pushed it out of line (1.96M self instructions on
+spectral-norm). It now has an inline gate (one `pending_teardown` load and
+the demote count) and a `noinline` slow half, as `drainPendingBridgeArm`
+does. `pending_disarm_all` and the targeted flag became one ordered field,
+so neither gate pays a second load.
+
+**What the earlier witnesses lost.** Two integration tests depended on the
+churn the global teardown caused:
+- step 2's "≥ 500 natural stops" on nsieve-bit-fp: with the exit kept
+  armed it barely chains (0 under `--jit-stats`, 1 in production). The
+  test now asserts that the exit never gives up. A new white-box test
+  witnesses the classification (`chainEndsEnclosingLoop`): every
+  numeric-`for` loop-done enclosing `P` is a natural stop, and the
+  `while` exit's own guard is not. It fails with the function forced
+  true and with it forced false.
+- step 4's "the arm is lost, as before" is now "no give-up". The 1e rule
+  (`beginClose`) no longer has an integration witness: with the arm kept,
+  the `for k` owner is not struck even without it. The pure policy test
+  still fails without the rule. The close-reason counts still catch
+  `exitedAt` forced either way.
+
+**Witnesses** (mutation-checked: the teardown made global, each of the
+three dependency rules removed, the deferred sweep skipped):
+- `src/trace_gate_test.zig` "A-vii-c gate machine …": a strike-out gate
+  takes a member-to-member link, a link into the owner and a bridge
+  stamped with the region (each failing the other two rules) and keeps
+  an unrelated link armed. It fails under every mutation except the
+  skipped sweep.
+- `src/trace_promotion_test.zig` "doc 64 §15 (1d): …" (four tests): two
+  nests, where the other's links and promoted set survive; a shared link
+  that demotes the other region's set; mid-replay marking, the drain, a
+  dropped bridge arm, and a global teardown swallowing a targeted one;
+  fallback invalidation taking the region's bridge and links.
+- `src/interp_nest_test.zig` step 4: "no give-up" fails with the
+  teardown made global again.
+
+## 16. Step 6: P4 re-profile (2026-10-21)
+
+**P4 is gone; 4c is not built.** The step-5 debug run (`-Djit-debug`,
+`nsieve-bit-fp.lua 6`) logs every replayed ledger row. The §3 count, a
+row repeating the previous row's `(trace, exit)`, is 390,454 of
+1,245,483 before step 3 and about 2,100 of 1,425,282 now (1,260 on t1
+e36, 845 on t1 e17, 8 elsewhere; one on t7 e10). t6's self-edge
+(`t6 e10 → t6`) is armed once and writes 2,590 rows in the whole run. 4a
+held: the `while` runs on t7's back-edge (step 3). There is no
+productive self-cycle left for 4c to promote.
+
+**Where the seam is now.** perf on the step-5 release build:
+`replayLedgerFrom` 15.1%, `accountRegionProfit` 14.1%, `nativeSeedFn`
+5.0%, `refreshObserverFast` 4.4%, `detectPromotableSetMembers` 2.6%,
+`exitSideTarget` 2.0%, `promotedEdgeFromLink` 1.9%, JIT code ~29%.
+`--jit-stats`: seam 50.9%, native 31.5%, tier-0 7.6%. The rows by
+`(trace, exit, kind)`:
+
+| row | count | edge |
+|---|---:|---|
+| t1 e17 `exit_side` | 338,532 | `for k` (36) → t7 (`while`, 40) |
+| t7 e10 `exit_side` | 287,829 | t7 → t8 (43) |
+| t8 e36 `link_terminal` | 239,746 | t8 → t1 (36) |
+| t3 e12 `link_terminal` | 153,992 | t3 (60) → t1 (36) |
+| t1 e36 `exit_side` | 102,255 | t1 → t3 (60) |
+| t4 e27 `exit_side` | 93,943 | `for i` (19) → t5 (30) |
+| all others | 208,985 | |
+
+The top five rows are the `for k` region's own cycle. It is promoted
+silent 2,448 times and demoted 2,447 times, every one at a
+`region_close` (one demotion is `growth`). So each `for k` activation
+re-earns its set from scratch: about 580 rows per activation, replayed
+while the observational detection and the `promote_after` streak build
+up again. The debug summary's "bridge-free closed" share is 399,049 of
+those rows.
+
+**Parked-proof reuse never fires here** (`parked-reuses=0`). Doc 47's C′
+parks a set at a clean `region_close` so the next activation can
+re-promote it through `promoteSet` without re-detection. But it parks
+only for `fallback_owner` regions
+(`demotePromotionsForRegionReason`, `trace_regionops.zig`), and every
+region on this bench is elected (`region: mint … armable=true owner
+pc=36`). The restriction dates from doc 47 inc-B (4dddad2), where the
+measured regions were all fallback-owned. Neither the code nor the doc
+argues that it is needed for soundness, and the full fail-closed
+`promoteSet` validation runs either way.
+
+**Experiment: park for every armable region.** In a shadow tree, with
+`d.fallback_owner` dropped from the park condition and nothing else
+changed (instructions over every `@bench`, outputs identical):
+
+| | instructions | cycles (3 pairs, loadavg ~4) |
+|---|---:|---|
+| nsieve-bit-fp | +35.21% | 826M → 1,106M |
+| scimark-fft | −6.43% | 440M → 412–433M |
+| every other row | within ±0.03% | |
+
+**Why nsieve-bit-fp gets worse: the `while` root is never recorded.**
+(A first reading blamed a stale proof that hides the t7 set. Codex and
+Antigravity both showed that this was wrong; the account below is
+checked against the logs.)
+- The first parked set has five edges through t1, t2 and t3 (no t6).
+  Detection does run again: invalidation through `noteMembershipGrowth`
+  (`trace_link.zig` ~2389) drops a proof when a new member edge is armed.
+  A later eight-edge set, re-detected once t6 exists, holds t2's sibling
+  handoff into t6 and t6's self-edge, and that is the set reused from
+  then on. 623,308 of the 1,032,261 t6 self-rows come before it and
+  408,953 after.
+- t7 never exists. The `while` root at pc 40 aborts its recording five
+  times in both runs (window 256 → 4096). In the baseline the sixth try
+  commits t7 (trace=7, `anchor pc=40`), and step 3's retarget binds t1's
+  exit to it. In the widened run the sixth try aborts too (window 8192,
+  `retry_at` 8396 at tick 4300), and pc 40 never appears in the log
+  again. The tick reaches 186,564, so the backoff expires; the anchor
+  just never gets hot in tier-0 again.
+- The likely mechanism (inferred, not traced): with the set re-promoted
+  from the proof at the start of each activation, the `while` runs on
+  t2 → t6 → t6 natively, so tier-0 never takes pc 40's back-edge and
+  never counts it towards a recording. Execution that serves a loop
+  through a composite or sibling trace starves discovery of the loop's
+  own root. The retarget to a root (step 3, `trace_link.zig` ~897) only
+  runs once the root commits.
+
+**Is widening the park gate sound?** Both reviews say yes. Fallback
+election only adds a closed-SCC qualification to the same ownership and
+membership requirements (`trace_region_topology_build.zig` ~516/553/695).
+Reuse re-checks the active frozen accumulator, armability and membership
+(`promotionBelongsToRegion`), physical cell ownership, link identity,
+target address and enterability (`promotedEdgeFromLink`), and the set
+bounds and cross-keying (`checkPromotable`). What fallback regions have
+on top is economic: the instability, failed-candidate and payoff
+backstops (`trace_region.zig` ~285, `trace_link.zig` ~1834,
+`trace_regionops.zig` ~1310). That is profitability policy, not jump
+safety. Option (b)'s invalidation already exists as
+`noteMembershipGrowth`.
+
+**What is left for Bart** (not built; options, not a recommendation):
+**Review of the options (2026-10-21, Codex and Antigravity, from the
+brief at the time).** Neither (b) nor (c) alone gets t7 recorded, because
+both pick among arms that already exist:
+- (b) more invalidation: already built (`noteMembershipGrowth`).
+  Antigravity would widen it: drop a proof on any arm or retarget that
+  touches a member (not just promotable ones), on slot mutation of a
+  member's trace, and on a trace commit at a member anchor. On reuse it
+  would also reject the proof if the triggering ledger holds member
+  rows the proof does not cover. Codex warns that an unchanged arm graph
+  does not mean an unchanged candidate population (enterability and
+  another set's demotion both change it), so arm-based invalidation is
+  not a full freshness argument.
+- (c) detection beside a live set: both say it does not work as stated.
+  A silent set writes no rows for its edges, `promotedEdgeFromLink`
+  rejects published metadata, and candidacy excludes owned cells.
+- (d) promotion that survives a `loop_exit` close: both say it does not
+  fix this regression (a persistent set starves discovery for longer).
+  It would also break today's lifetime assertions (`finishClose` drops
+  the accumulator; `prepareNativeEntry` sweeps; `driveSilentBurst`
+  panics on an activation-scoped set outside an activation). Codex: a
+  region-lifetime authorization is a legitimate foundation question (doc
+  52 has a restricted form), but "skip the demotion" is not it.
+  Antigravity: LuaJIT's lesson is persistent links, which mahina already
+  has; silent promotion is a different layer.
+
+**Open options** (not built; options, not a recommendation):
+- (a) Leave parking fallback-only. fft keeps its seam; nsieve-bit-fp is
+  unchanged.
+- (e) Widen the gate and make recording demand independent of whether
+  execution is reporting, silent or served by a composite (Codex's
+  recommendation). Keep a deterministic count of demand for a hot loop
+  root with no trace across compiled execution, and request a recording
+  through a coherent runtime exit after bounded demand, within the
+  existing backoff rules. Needs a design (where the count lives, what
+  counts as demand, how it reaches a recording) and a progress argument.
+- (f) Widen the gate together with Antigravity's (b) extensions above. Cheap,
+  fail-closed, deterministic. But by the reading above it would not get
+  t7 recorded: no new arm touches the region after the sixth abort.
+- (g) 4b (§5): an exit-side child equal to its parent becomes a real
+  loop (LuaJIT's `LJ_TRLINK_LOOP`), so t6 itself runs the `while` on a
+  native back-edge. It removes the self-row cost whichever root wins,
+  but not the missing root. New machinery: needs its own doc (Z-8).
+- The pc 40 aborts themselves (five in both runs, six in the widened
+  one) are worth a look either way. They are loop-leave aborts (`lleave
+  fast-retry`): the `while` exits during recording, which happens
+  whenever the attempt lands on a short `while`. In the baseline, getting
+  the `while` root at all depends on the sixth attempt landing on a long
+  enough one.
