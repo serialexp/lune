@@ -2,7 +2,8 @@
 
 Status: rev 2; P0 (facts and a dry run) landed 2026-10-21. Its dry run
 found that the static tables prove none of the hot `.link` and loop-done
-arms (§11). P1 waits on Bart's answer to Q5–Q7 (§11.3).
+arms (§11). P1 waits on Bart's answer to Q5–Q7 (§11.3). Codex and
+antigravity both recommend parking P1–P3 (§11.4).
 Owner: claude (coral-marten)
 Last updated: 2026-10-21
 
@@ -612,6 +613,44 @@ budget. On the benches, tables total 1–7 KB per program.
   `step_down` and `nov` (and doc 57 pins) for a write whose ref the parent
   guarded before the exit, in the same activation. Sound for the same
   reason the guard is. Add it?
+
+### 11.4 Reviews of the findings
+
+Bart asked codex and antigravity (2026-10-21; full text in
+`docs/reviews/doc67/codex-p0.md` and `antigravity-p0.md`). Both
+recommend Q5 (d): keep P0, park P1–P3.
+
+- **Q5.** Both: (b) mostly moves a pass-through check one hop earlier
+  rather than removing it, since root → continuation stays checked.
+  Codex adds that (b) does save the checks the two pages share. Both
+  find (c)'s recompiles and set demotions too much churn for the
+  ceiling. (a) is sound but keeps the unproven checks on every hop and
+  adds a third target kind with its own lifecycle. Codex: its stub would
+  have to store `entry_rbx` before any check can fail, and a bounded set
+  of child-owned residual entries, shared by identical residual sets,
+  would beat per-arm stubs.
+- **Q6.** Both confirm the seed writes only active seeded slots.
+  Antigravity: keep the exclusion. A seeded entry still pays the seed
+  callout (~20+ cycles), which dwarfs the checks saved, and the masked
+  misses would mostly fail on Q5 anyway. Codex: liftable, but with a
+  separate seed-first proven prefix rather than reordering the checked
+  entry, because checks before the seed change the failure priority
+  against seed declines, which skip strikes and receipts. Codex also
+  notes that "prologue failure leaves the slab untouched" already isn't
+  strictly true for seeded pages: alias resolution can decline after
+  scratch writes.
+- **Q7.** Both: sound for `.link` writebacks with exact ref
+  correspondence. On loop pages it is delicate: carried flushes write
+  homes, loop-done writes `phi.b`, and the shared carried list can't
+  hold exit-specific facts. Antigravity: on its own it converts 6 misses
+  and none on nsieve.
+- **Probe caveat** (codex): `proven-miss:` calls a slot untouched when
+  the parent's fact list doesn't mention it, which is not the same as
+  the parent's IR never reading or writing it.
+- **Payoff.** Codex estimates under 1% instructions for a bounded
+  combination and 1–2% for broad coverage; antigravity, under 0.5–0.8%.
+  Both are estimates. Codex points out that §1's rows are cumulative, so
+  the step and `nov` savings are already inside the −2.25%/−2.61%.
 
 ## References
 
