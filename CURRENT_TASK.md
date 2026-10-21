@@ -213,7 +213,11 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
       wasm, hashgate 99/99 on both legs, viz bun test (84).
     - Not committed: the interp.zig hunks interleave with amber-badger's
       zero-step bundle, so the commit has to be coordinated with them.
-  - Then: continuation step-constant inheritance.
+  - Landed in 5f5834d (amber-badger's bundle).
+  - Continuation step-sign lever: measured, not built. TODO.md has the
+    numbers and three candidate mechanisms (static literal step,
+    proven-fact link entry, Lua 5.4 iteration count). Waiting on Bart to
+    pick one. Shadow tree `/tmp/stepexp` holds the unsound experiments.
 
 LINE LOOKUP FIX (2026-10-11, coral-marten): LANDED in `49fd572`, bundled with amber-badger's doc 61 Phase K.
 - Bug from TODO.md "Every located runtime error rescans the source for

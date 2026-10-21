@@ -91,6 +91,29 @@ earlier in `/tmp/t0micro/`).
       continuations read the step as a `slot_load`. The lever is
       parent-constant inheritance for continuation inputs (or an entry-time
       pin, like doc 57's prologue-checked value pins).
+      Measured 2026-10-21 (instructions, unsound shadow builds, outputs
+      identical). Dropping the sign guard in `.continuation` recordings:
+      sieve_int −0.36%, nsieve −0.31%, nsieve-bit-fp −0.28%, scimark-fft
+      −0.27%, scimark-sparse −0.24%. Dropping the continuation's
+      `guard_for_nov` as well (it costs more than the sign guard): sparse
+      −1.11%, nsieve-bit-fp −0.78%, fft −0.63%, sieve_int −0.55%, nsieve
+      −0.49%. LuaJIT emits the overflow guards only at loop entry (FORI,
+      or a root started at FORL), never for a FORL crossed in a side trace.
+      Its side traces inherit their parent's snapshot, so the step is
+      usually a constant there and needs no sign guard. Both costs are one
+      case of a wider gap: every native entry runs the whole prologue
+      (`nativegen.zig` ~953), linked hops included, so a continuation
+      re-checks every input tag per hop. Dropping the prologue tag checks
+      too (unsound; fft hangs) gave nsieve −2.25% and nsieve-bit-fp
+      −2.61%. Candidate mechanisms: (a) a static literal step. The step
+      register is a hidden temp written only by the load before
+      `for_prep`, so a literal step is a constant in every trace. That
+      removes the sign guard for literal steps, nothing else. (b) A
+      proven-fact link entry, LuaJIT's inheritance: a second entry past
+      the checks, taken by a link whose parent exit proves the child's
+      entry facts (input tags, the step's sign, no overflow). Needs a
+      design doc. (c) Lua 5.4's iteration count, which removes both guards
+      everywhere but adds a carried count to every root loop.
 - [x] **A zero `for` step looped forever instead of raising** (noted
       2026-10-21). `for i = 1, 3, 0` and `for i = 1, 3, 0.0` never ended;
       Lua 5.4's `forprep` raises `'for' step is zero`. Fixed 2026-10-21:
