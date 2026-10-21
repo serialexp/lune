@@ -117,6 +117,34 @@ try {
     await page.getByRole("button", { name: "Replay" }).click();
     await page.locator(".replay").waitFor({ timeout });
   });
+
+  // A replay paused late in a long program, then a shorter file loaded: the
+  // replay closes and the next Run is clean (it used to throw CodeMirror's
+  // "Position … is out of range" from a stale replay-line decoration).
+  await step("loading a source file mid-replay closes the replay", async () => {
+    const lines = Array.from({ length: 30 }, (_, i) => `local v${i} = ${i}`).join("\n");
+    await page.locator(".cm-content").click();
+    await page.keyboard.press("ControlOrMeta+A");
+    await page.keyboard.insertText(`${lines}\nprint(v29)\n`);
+    await page.getByRole("button", { name: "Run (wasm)" }).click();
+    await page.locator(".run-stdout").filter({ hasText: "29" }).waitFor({ timeout });
+    await page.getByRole("button", { name: "Replay" }).click();
+    const slider = page.locator(".replay input[type=range]");
+    await slider.waitFor({ timeout });
+    await slider.fill(String(Math.max(0, Number(await slider.getAttribute("max")) - 2)));
+    await page.locator(".cm-replay-line").waitFor({ timeout });
+    writeFileSync(join(work, "short.mahina"), "print('short')\n");
+    await page.locator("section.editor input[type=file]").setInputFiles(join(work, "short.mahina"));
+    await page.locator(".replay").waitFor({ state: "detached", timeout });
+    await page.getByRole("button", { name: "Run (wasm)" }).click();
+    await page.locator(".run-stdout").filter({ hasText: "short" }).waitFor({ timeout });
+  });
+
+  await step("a binary file is refused as source", async () => {
+    writeFileSync(join(work, "blob.mahina"), new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0, 1, 2]));
+    await page.locator("section.editor input[type=file]").setInputFiles(join(work, "blob.mahina"));
+    await page.locator(".source-error").filter({ hasText: "not a text file" }).waitFor({ timeout });
+  });
   console.log("browser-smoke: PASS");
 } catch (e) {
   console.error(`browser-smoke: FAIL: ${(e as Error).message}`);

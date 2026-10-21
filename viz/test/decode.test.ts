@@ -24,6 +24,26 @@ test("decodes the fixture header + trace count", () => {
   expect(file.traces[0].id).toBe(0); // the first trace minted in the run
 });
 
+test("a file that isn't a .mahinatrace fails with a reason", () => {
+  const withVersion = (v: number, rest: number[]) => {
+    const b = new Uint8Array(4 + rest.length);
+    new DataView(b.buffer).setUint32(0, v, true);
+    b.set(rest, 4);
+    return b;
+  };
+  expect(() => decodeTraceFile(new Uint8Array([5, 0, 0]))).toThrow("only 3 byte(s)");
+  // A keyframe (snapshot v10) or any other version word.
+  expect(() => decodeTraceFile(withVersion(10, [0, 0, 0, 0]))).toThrow("version word 10, expected 5");
+  // The right version word, then a trace count the bytes can't hold.
+  expect(() => decodeTraceFile(withVersion(5, [9, 0, 0, 0]))).toThrow("not a .mahinatrace");
+  // A whole trace file with something after it.
+  const padded = new Uint8Array(bytes.length + 3);
+  padded.set(bytes);
+  expect(() => decodeTraceFile(padded)).toThrow("3 byte(s) left over");
+  // An empty cache is a valid file.
+  expect(decodeTraceFile(withVersion(5, [0, 0, 0, 0])).traces).toEqual([]);
+});
+
 test("trace anchor + array shapes match the recorded counting loop", () => {
   const file = decodeTraceFile(bytes);
   const t = file.traces[0];

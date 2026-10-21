@@ -58,6 +58,11 @@ const replayLineField = StateField.define<DecorationSet>({
         ]);
       }
     }
+    // The line is the replayed source's, not the edited text's — clear it on
+    // any edit, like the other run-derived fields. (Keeping it unmapped left a
+    // decoration past the end of a shorter document: CodeMirror's "Position …
+    // is out of range" crash after loading a new file mid-replay.)
+    if (tr.docChanged) return Decoration.none;
     return deco;
   },
   provide: (f) => EditorView.decorations.from(f),
@@ -186,11 +191,12 @@ export default function MahinaEditor() {
   });
 
   // Mirror the step-replay current line into the editor. Only highlights while
-  // replay is open and paused on a suspended (not finished) step; cleared
-  // otherwise. `currentLine` is already 1-based, the unit CodeMirror lines use.
+  // replay is open, paused on a suspended (not finished) step, and the editor
+  // still holds the replayed source — after an edit the line numbers are the
+  // old text's. `currentLine` is already 1-based, the unit CodeMirror lines use.
   createEffect(() => {
     if (!view) return;
-    const active = state.replayActive;
+    const active = state.replayActive && state.source === state.replaySource;
     const rs = state.replayState;
     const line = active && rs && !rs.finished && rs.currentLine > 0 ? rs.currentLine : null;
     view.dispatch({ effects: setReplayLine.of(line) });

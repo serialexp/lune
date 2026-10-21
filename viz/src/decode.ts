@@ -26,9 +26,35 @@ export type { CoverageFileOutput, CoverageAnchorOutput, JitCountersOutput };
 /** A single decoded const: a discriminated union tagged by `body.type`. */
 export type DecodedConst = TraceOutput["consts"][number];
 
-/** Decode a `.mahinatrace` byte buffer into its structural form. */
+/** The `.mahinatrace` wire version this viewer reads (`traceser.format_version`).
+ *  The fixture tests decode a CLI-produced trace, so a bump on the Zig side
+ *  that isn't mirrored here fails them. */
+export const TRACE_FORMAT_VERSION = 5;
+
+/** Decode a `.mahinatrace` byte buffer into its structural form. Strict, so a
+ *  file that isn't one fails with a reason instead of decoding into garbage:
+ *  the version word must be this viewer's, and the traces must use up the
+ *  buffer exactly. (The format has no magic bytes, and the other artifact
+ *  families start with small version words too, so the version check alone
+ *  can't tell them apart — the exact-length check does the rest.) */
 export function decodeTraceFile(bytes: Uint8Array): TraceFileOutput {
-  return new TraceFileDecoder(bytes).decode();
+  const notTrace = "not a .mahinatrace";
+  if (bytes.length < 8) throw new Error(`${notTrace}: only ${bytes.length} byte(s)`);
+  const version = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0, true);
+  if (version !== TRACE_FORMAT_VERSION) {
+    throw new Error(`${notTrace} this viewer reads: version word ${version}, expected ${TRACE_FORMAT_VERSION}`);
+  }
+  const decoder = new TraceFileDecoder(bytes);
+  let file: TraceFileOutput;
+  try {
+    file = decoder.decode();
+  } catch (e) {
+    throw new Error(`${notTrace}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (decoder.hasMore()) {
+    throw new Error(`${notTrace}: ${bytes.length - decoder.byteOffset} byte(s) left over after the traces`);
+  }
+  return file;
 }
 
 /** Decode a trace **execution-log** blob (the fourth record family) into its

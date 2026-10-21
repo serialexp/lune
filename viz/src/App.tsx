@@ -1,5 +1,5 @@
 import { For, Show, onMount } from "solid-js";
-import { state, loadBytes, loadFromUrl, runWasm, runBoth, canReplay, openReplay, loadSourceText, setScriptArgs } from "./store";
+import { state, loadBytes, loadFromUrl, runWasm, runBoth, canReplay, openReplay, loadSourceBytes, loadDroppedFile, setScriptArgs } from "./store";
 import MahinaEditor from "./editor/MahinaEditor";
 import TraceList from "./components/TraceList";
 import TraceView from "./components/TraceView";
@@ -12,21 +12,20 @@ function fmtBytes(n: number): string {
   return `${(n / 1024).toFixed(1)} KiB`;
 }
 
-/** Read a picked/dropped File into the store. `.mahinatrace` decodes into the trace
- *  view; any other extension is treated as source text and loaded into the editor
- *  (drag-drop stays convenient for both). */
+/** Read a dropped File into the store by what it is (`loadDroppedFile`): a trace
+ *  into the trace view, source text into the editor. */
 async function ingest(file: File) {
-  if (file.name.endsWith(".mahinatrace")) {
-    const buf = new Uint8Array(await file.arrayBuffer());
-    loadBytes(file.name, buf);
-  } else {
-    loadSourceText(file.name, await file.text());
-  }
+  loadDroppedFile(file.name, new Uint8Array(await file.arrayBuffer()));
+}
+
+/** Read a file from the trace picker. */
+async function ingestTrace(file: File) {
+  loadBytes(file.name, new Uint8Array(await file.arrayBuffer()));
 }
 
 /** Read a picked source File into the editor. */
 async function ingestSource(file: File) {
-  loadSourceText(file.name, await file.text());
+  loadSourceBytes(file.name, new Uint8Array(await file.arrayBuffer()));
 }
 
 export default function App() {
@@ -60,12 +59,16 @@ export default function App() {
             style={{ display: "none" }}
             onChange={(e) => {
               const file = e.currentTarget.files?.[0];
-              if (file) void ingest(file);
+              if (file) void ingestTrace(file);
+              e.currentTarget.value = ""; // allow re-picking the same file
             }}
           />
           <Show when={state.fileName}>
             <span class="filename">
-              {state.fileName} <span class="muted">· v{state.version} · {state.traces.length} trace(s)</span>
+              {state.fileName}{" "}
+              <Show when={state.version !== null}>
+                <span class="muted">· v{state.version} · {state.traces.length} trace(s)</span>
+              </Show>
             </span>
           </Show>
         </div>
@@ -77,6 +80,9 @@ export default function App() {
       <section class="editor">
         <div class="editor-head">
           <span class="muted">Author &amp; run in-browser (wasm) <span class="editor-file">· {state.scriptName}</span></span>
+          <Show when={state.sourceError}>
+            <span class="source-error" role="alert">{state.sourceError}</span>
+          </Show>
           <div class="editor-actions">
             <button
               type="button"

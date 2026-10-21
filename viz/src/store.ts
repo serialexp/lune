@@ -29,6 +29,9 @@ interface VizState {
    *  when a local source file is opened; a plain default otherwise. `arg[0]` is
    *  cancelled by the differential validator, so its exact value is cosmetic. */
   scriptName: string;
+  /** Why the last picked/dropped source file wasn't loaded (not text), or null.
+   *  Shown beside the editor; cleared by the next load. */
+  sourceError: string | null;
   /** Raw script-args string from the args input (whitespace-separated). Fills
    *  `arg[1..]` for the run — e.g. nsieve's workload size. Empty ⇒ no user args. */
   scriptArgs: string;
@@ -184,6 +187,7 @@ const [state, setState] = createStore<VizState>({
   error: null,
   source: DEFAULT_SOURCE,
   scriptName: "playground.mahina",
+  sourceError: null,
   scriptArgs: "",
   running: false,
   stdout: null,
@@ -222,7 +226,60 @@ export function setSource(src: string): void {
  *  script name (used as `arg[0]` and the loaded-file label). Distinct from
  *  `loadBytes`, which decodes a binary `.mahinatrace` artifact into the trace view. */
 export function loadSourceText(name: string, text: string): void {
-  setState({ source: text, scriptName: name });
+  // A different program: an open replay (of the last run's source) no longer
+  // describes what the editor shows, so close it.
+  setState({
+    source: text,
+    scriptName: name,
+    sourceError: null,
+    replayActive: false,
+    replayState: null,
+    replayView: null,
+  });
+}
+
+/** mahina source is UTF-8 text (doc 06): the bytes of a file as source, or
+ *  null when they can't be — invalid UTF-8, or a NUL byte (which no text file
+ *  has, and every binary artifact does). Pure, so it's unit-testable. */
+export function decodeSourceText(bytes: Uint8Array): string | null {
+  if (bytes.includes(0)) return null;
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+/** Load a picked/dropped file's bytes as source, or say why it isn't source. */
+export function loadSourceBytes(name: string, bytes: Uint8Array): void {
+  const text = decodeSourceText(bytes);
+  if (text === null) {
+    setState("sourceError", `${name} is not a text file (binary or not UTF-8); not loaded`);
+    return;
+  }
+  loadSourceText(name, text);
+}
+
+/** Load a dropped file by what it is: a `.mahinatrace` by name, else source
+ *  text when it is text, else a trace by content (a trace saved under another
+ *  name). A file that is neither is reported, never loaded as garbage. */
+export function loadDroppedFile(name: string, bytes: Uint8Array): void {
+  if (name.endsWith(".mahinatrace")) {
+    loadBytes(name, bytes);
+    return;
+  }
+  const text = decodeSourceText(bytes);
+  if (text !== null) {
+    loadSourceText(name, text);
+    return;
+  }
+  try {
+    decodeTraceFile(bytes);
+  } catch {
+    setState("sourceError", `${name} is neither source text nor a .mahinatrace; not loaded`);
+    return;
+  }
+  loadBytes(name, bytes);
 }
 
 /** Update the raw script-args string (does not run). */
@@ -465,6 +522,7 @@ export function loadBytes(name: string, bytes: Uint8Array): void {
       traces,
       selected: traces.length > 0 ? 0 : -1,
       error: null,
+      sourceError: null,
       // A loaded .mahinatrace carries no coverage — drop any stale run panel.
       coverage: null,
       nativeCoverage: null,
