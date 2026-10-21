@@ -85,15 +85,34 @@ WORST BOARD ROW (2026-10-19, amber-badger): nsieve-bit-fp.
   +0.05–0.12% (a per-close verdict cost), the rest ±0.01%. Corrected 1a
   is not needed.
 
-  Next: step 5 (1d, targeted teardown instead of `disarmAllLinks`), then
-  step 6 (P4).
+  Board on 483235d: nsieve-bit-fp 228.2 → 224.5 ms, nsieve 18.7 → 18.3 ms.
+
+  Step 5 done (doc 64 §15): a strike-out gate and `invalidateRegion` tear
+  down only the region's own links (`disarmRegionLinks`): bridges stamped
+  with it, member-to-member links, and links into the gated owner.
+  Mid-replay it marks (`NativeLink.condemned`) and the drain sweeps
+  (`pending_teardown`). On nsieve-bit-fp the `for k` nest keeps its arms
+  and t7 e10 no longer gives up. Instructions are +0.57% there (more
+  native exit hops into a short continuation), cycles −1.2% (noise);
+  every other row is ±0.03%. Step 2's and 1e's integration witnesses
+  relied on the old churn, see §15.1.
+
+  Step 6 done (doc 64 §16): P4 is gone after step 3 (repeated rows
+  390,454 → ~2,100), so 4c was not built. What remains is the `for k`
+  silent set being re-earned at every activation (2,448 promote/demote
+  pairs, ~580 rows each). Widening parked-proof reuse to elected regions
+  was measured in a shadow tree (/tmp/lune-p6): fft −6.43%, nsieve-bit-fp
+  +35.21% (a stale proof freezes the pre-t7 topology). Options (a)–(d) in
+  §16 are waiting on Bart. Steps 5 and 6 are still uncommitted: they will
+  be bundled with coral-raven's doc 65 Phase 0 (io.zig, main.zig,
+  interp.zig hunks, stdlib CSV, bench/stdlib/io_*.lua) once that is green.
 
 TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff per effort".
 - The plan and every item's numbers are in TODO.md "Tier-0 interpreter
-  cost survey". Measurement: `/tmp/t0micro/opsmeasure.sh` (perf
-  two-point instructions per op vs LuaJIT `-joff`; `ops.lua`, and
-  `ops2.lua` for mahina-only syntax) and `/tmp/t0micro/abench.sh BASE NEW`
-  (every `@bench` program, tier-0 and JIT instructions).
+  cost survey". Measurement lives in `bench/opprobe/` (README there):
+  `measure.sh [probe-file] probes…` (perf two-point instructions per op
+  against LuaJIT `-joff`) and `abench.sh BASE NEW` (every `@bench`
+  program, tier-0 and JIT instructions; absolute binary paths).
 - Landed: `pairs` quadratic (9b212e2), in-place local operands
   (69fec42), and the `for` step-sign soundness fix (aa9af90).
 - **Landed in `d40cf2d`** (bundled at Bart's direction with amber-badger's
@@ -104,11 +123,14 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
   - item 3 (`opCompare`, `opEqNe`, `opModIdiv` and their slow halves);
   - their tests and doc 62.
   All five gates were green, and viz was 72/72.
-- Item 4 (bytecode forms) is drafted as doc 66
-  (`docs/design/66-bytecode-forms.md`), waiting on Bart's Q1–Q5. The
-  probes are `/tmp/t0micro/ops3.lua` and `opsmeasure3.sh` (`P=`
-  overridable). Then item 5 (call/return) and item 6 (dispatch
-  prologue, doc 42 §4.2).
+- Item 4 (bytecode forms): doc 66 rev 2
+  (`docs/design/66-bytecode-forms.md`). Round 1 was read-only reviews by
+  codex and antigravity (`docs/reviews/doc66/`).
+  - Rev 2 withdrew `itern` shape (b) for (b2) and corrected Strategy B's
+    GC and region-gate argument (B is off in any program with a region
+    profit map).
+  - Waiting on Bart's Q1–Q5. The reviewer split is in doc 66 §10.
+  - Then item 5 (call/return) and item 6 (dispatch prologue, doc 42 §4.2).
 - For Bart, still open: the integer `for` overflow wrap, `next`'s zero
   results, the zero `for` step, and continuation step-constant
   inheritance (all in TODO).

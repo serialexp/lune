@@ -7,7 +7,8 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 Measured at HEAD 1806b9b, ReleaseFast, `perf stat -e instructions:u`,
 two-point difference per iteration (exact; per-symbol sampling is not,
 because AMD skid misattributes across tail jumps). Against LuaJIT
-`-joff`. Probes in `/tmp/t0micro/` (`probes.lua`, `ops.lua`).
+`-joff`. Probes and scripts are in `bench/opprobe/` (since 2026-10-21;
+earlier in `/tmp/t0micro/`).
 
 - [x] **Bug: `next`/`pairs` re-sorts every hash key on every `next`
       call** (`stdlib/base.zig` `sortedHashKeys`), so one traversal of k
@@ -156,7 +157,7 @@ because AMD skid misattributes across tail jumps). Against LuaJIT
       everything else leaves through `slowTail`. That covers dynamic keys
       (`t[k]`, table keys) too, and nothing ping-pongs between tables of
       different layouts. Marginal instructions over the `s = s + i` loop
-      (`/tmp/t0micro/fields.lua`; LuaJIT `-joff` in brackets): `t.x` 233 →
+      (`bench/opprobe/fields.lua`; LuaJIT `-joff` in brackets): `t.x` 233 →
       126 (29), `t.x = v` 262 → 125 (32), method lookup through `__index`
       427 → 210 (203), method call 925 → 708 (284); the first column is
       after the in-place-operand compiler change. The rest of `t.x` is the
@@ -242,7 +243,18 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
       4. **One ledger row per `while` trip.** t6's `while` exit is
          exit-side-armed to t6 itself (resume 53), so a 20-trip `while`
          writes ~20 `.exit_side` rows; bursts reach 23 rows and the seam
-         replays each (~7k cycles per walk).
+         replays each (~7k cycles per walk). **Gone after step 3 (doc 64
+         step 6, §16):** repeated rows 390,454 → ~2,100, t6 e10 writes
+         2,590 rows. 4c not built.
+      5. **The `for k` silent set is re-earned every activation (doc 64
+         §16).** 2,448 promotions, 2,447 `region_close` demotions, about
+         580 replayed rows per activation; the seam is still 50.9% of the
+         run. Parked-proof reuse never fires (`fallback_owner`-only).
+         Parking for every armable region was measured: fft −6.43%
+         instructions, nsieve-bit-fp +35.21% (a parked pre-t7 set is
+         reused 16,357 times, detection never runs again, and the t6
+         self-row comes back at 1.03M). Options (a)–(d) in §16, waiting on
+         Bart.
 - [ ] **Measured P6-Q3(b), bursts take exit adapters (experiment,
       reverted 2026-10-19).** The cause of the `for k` root's give-up
       above: inside `driveChain` the native call runs with
@@ -331,7 +343,10 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
       is: §10's 2c (count only failed recordings and failed child
       prologues, never run outcomes) needs a repair path for stale children
       first. Diagnose euler14-bit's give-ups (which exits, which misfits)
-      before designing.
+      before designing. Since doc 64 step 5 (1d, §15) nsieve-bit-fp gives up
+      nothing (its give-ups followed the global teardowns); euler14-bit's two
+      give-ups are unchanged: wanted exits that never got a child, not
+      attached exits missing (`miss-giveups=0`).
 - [ ] **No unit test for owner election after an exit-side bind change.**
       Doc 64 step 3's per-exit bound entry exists because a topology that
       disagreed with the arm made fft's region non-armable (+47.6%). Only

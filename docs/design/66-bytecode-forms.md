@@ -1,6 +1,8 @@
 # 66 — Bytecode forms: constant operands, field ops, compare-and-branch, ITERN
 
-Status: draft, not yet implemented. Decisions Q1–Q5 (§9) are open for Bart.
+Status: draft rev 2, not yet implemented. Round-1 review findings
+(codex and antigravity, §10) are folded in. Decisions Q1–Q5 (§9) are open
+for Bart.
 Owner: claude (coral-marten)
 Last updated: 2026-10-21
 
@@ -13,11 +15,26 @@ land; move whole phases to Done once everything inside them is checked.
 
 - [x] **Diagnosis** (2026-10-21, §1). Per-op marginal instructions against
   LuaJIT `-joff`, after the item 1–3 tier-0 fast paths (d40cf2d). The
-  probes are in `/tmp/t0micro/ops3.lua` and `opsmeasure3.sh`.
+  probes are `bench/opprobe/ops3.lua` with `bench/opprobe/measure.sh`.
 - [x] **Consumer inventory** (§4.1). Lists every place that switches on
-  bytecode ops or pattern-matches compiler output.
+  bytecode ops or pattern-matches compiler output. Completed in rev 2 from
+  the review.
+- [x] **Round-1 review** (codex and antigravity,
+  `docs/reviews/doc66/*-r1.md`, summary in §10). Rev 2 fixes these:
+  - Strategy B's GC argument was false;
+  - `itern` shape (b) has three successors and bypasses the loop gate;
+  - commutative swapping reorders metamethod arguments;
+  - `itern` must decline grids;
+  - the recorder's field helpers take a key register;
+  - constant `==` needs numeric semantics.
 
 ### Outstanding
+
+- [x] **P0 — probes into the repo** (2026-10-21). They are now in
+  `bench/opprobe/`: `ops.lua`, `ops2.lua`, `ops3.lua` and `fields.lua`,
+  with `measure.sh` (per-op marginal cost against LuaJIT `-joff`) and
+  `abench.sh` (every `@bench` program, both tiers). They are not
+  `@bench` programs, so `run.py` and hashgate skip them.
 
 - [ ] **Q1 — strategy for the fused forms** (§4): new canonical opcodes,
   handler-level fusion over unchanged bytecode, or a mix per form.
@@ -115,20 +132,45 @@ of consumers that switch on bytecode ops (non-test):
 - **Exhaustive switches; the build fails until an arm is added.**
   `interp.zig` `handlerFor`, and `bc_liveness.zig` `effectOf` (the
   use/kill/successor model that `bc_dom` and GC masking build on).
+- **The CFG model's fixed shape.** `bc_liveness.Effect` holds at most two
+  successors, and `edge_kill` is one register per edge, not a range
+  (`bc_liveness.zig` ~54/68). `bc_liveness.successors` and `bc_dom` store
+  and walk exactly two edges. An op with three destinations, or one that
+  writes a register range on only one edge, needs that model widened
+  first.
+- **Loop contracts.** In `bytecode.zig`:
+  - `loopHeaderOf`: which ops are back-edges.
+  - `loopGateOf` (~360): the gate every body entry passes through. For a
+    generic `for` that is the `tfor_loop`, and region topology elects
+    owners by dominance from it (`trace_region_topology_build.zig` ~596).
+- **Loop entry patching.** `trace_entry_registry.patchedEntryOp`,
+  `resolvePatchPc` and the install checks, and `interp.opJLoop`'s switch on
+  the canonical op. These fix which instructions can host a loop entry.
+  The patched `repeat` entry is its `loop` marker; the backward
+  `jmp_if_false` is not patched.
+- **Call-site consumers.** `interp.nativeSite` (the current call-site
+  instruction), `frameShape` (a suspended Lua caller must sit after a
+  `.call`) and `frameMask` (multret `.call`). An op that can perform a
+  call, such as `itern` shape (b2), must be accepted by all three.
 - **Slow-path table.** `interp.zig` `buildSlowTable`. A fast handler that
   leaves through `slowTail` without an entry lands on `noSlowPath`, which
   panics.
 - **Recorder.** `trace_recorder.zig` `recordOne`, where `else` is
   `abort(.nyi_opcode)`. A missed arm means silent loss of JIT coverage, not
   a build error.
-- **Operand decoding outside the handler.** `interp.zig` ~2009, the
-  error-message operand pick (`firstNonNumber`, the indexed object), which
-  assumes register operands. `bytecode.writeInstr`, the disassembler that
+- **Operand decoding outside the handler.** `interp.zig` ~2009–2023,
+  `describeFault`'s operand pick (`firstNonNumber`, the indexed object),
+  reads `regs.get(instr.b)` and `regs.get(instr.c)`. On a constant form,
+  `c` or `aux` is a K index or an immediate, so it must render the
+  constant instead of reading a register. `bytecode.writeInstr`, the disassembler that
   viz shows through `wasm_entry.buildDisasmBlob`.
 - **Compiler-shape matchers.** These matter only for compare-and-branch,
-  because they name `jmp_if_false`/`jmp_if_true` as "the branch":
-  - `bytecode.loopExtentFor` and `assertLoopClosersWellFormed`, which check
-    the `while` and `repeat` condition branches;
+  because they name `jmp_if_false`/`jmp_if_true` as "the branch". Some
+  also admit `jmp_if_not_nil` and some do not, for example
+  `trace_link.zig` ~443 against `trace_code.zig` ~989:
+  - `bytecode.loopExtentFor` (the `while` branch check ~339 and the
+    `repeat` closer check ~349) and `assertLoopClosersWellFormed`
+    (~393–416);
   - in `trace_code.zig`: `computeOwnLoopTest` (a loop's own test), and the
     branch-source checks in `classifyBridgeCandidate` and
     `CompositeWalk.init`;
@@ -136,8 +178,9 @@ of consumers that switch on bytecode ops (non-test):
     untaken edge (the `rec_comp_fixup` analogue), and
     `continuationReachesEnclosingBackEdge`;
   - the "wants prime side" check in `trace_link.zig` (~446), the sibling
-    handoff branch-op check in `trace.zig` (~1853), and `recBranch`'s
-    LLEAVE detection;
+    handoff branch-op check in `trace.zig` (~1853), and `recBranch`
+    (~3423/3443/3483), which takes its polarity (`jumped`) and the
+    `repeat` LLEAVE from the op;
   - `trace_finalize.phiLiveRow`, through `CompositeWalk`.
 
   Missing one of these does not fail the build. It quietly turns a loop
@@ -146,6 +189,16 @@ of consumers that switch on bytecode ops (non-test):
 - **Generic-`for` shape.** `loopExtentFor`'s `.jmp` arm scans the test
   block for `move`/`call` up to the `tfor_loop`. A new op in that block must
   be accepted there, or region topology and `linkKindAt` fail closed.
+- **Compiler emission sites** for field forms include table constructors'
+  named fields (`compileTable` ~1328–1351), not only `t.x` expressions.
+- **Audited, unchanged.** These are specialised on purpose, and no form
+  here alters what they match:
+  - multret producer and consumer recognition (`bc_liveness` ~437/474,
+    `trace_exit_attach.isMultretConsumer`);
+  - call-layout masking;
+  - numeric-`for` linking;
+  - the recorder driver's inner-root context decoding (`trace.zig`
+    ~3577).
 
 Nothing serializes bytecode ordinals. Keyframes re-compile from source and
 store pcs only, `traceser` writes IR ops, and viz shows disassembly text.
@@ -180,36 +233,57 @@ What B must preserve. The skipped instruction's prologue is part of the
 determinism contract (doc 42 §4.2, normative). For the second instruction
 the fused handler must:
 
-1. **GC check.** It may skip this only because neither instruction
-   allocates: debt does not change between the two checks, so the second
-   cannot collect if the first didn't. Every fused pair must be checked
-   allocation-free. A `get_index` on a grid deflates it (doc 14,
-   `indexGet`), which allocates. So a fused `load_const` + `get_index`
-   fuses only on the allocation-free lane, `heapKeyChainGet`, which
-   declines grids, and otherwise dispatches the `get_index` normally.
+1. **GC check.** ~~It may skip this only because neither instruction
+   allocates.~~ **Rev 2: that argument is false** (codex blocker 1).
+   `shouldCollect()` is `gc_stress or object_count >= next_gc`
+   (`gc.zig` ~583). Under `gc_stress`, which runs in `.fast`, every
+   boundary collects, and a collection that fails its worklist
+   reservation stays due (`interp.zig` ~2524). A collection is
+   observable: it scrubs registers, invalidates dead trace constants,
+   advances the host epoch and drops iterator caches. So the fused handler
+   may skip the second boundary only when collection is **not due there**:
+   it re-tests `shouldCollect()` and dispatches normally if it is true.
+   Allocation-freedom is still required as well. A `get_index` on a grid
+   deflates it (doc 14, `indexGet`), so a fused `load_const` +
+   `get_index` fuses only on the `heapKeyChainGet` lane, which declines
+   grids.
 2. **`safepoint_seq`.** Bump it once more, so step counts are unchanged.
 3. **Replay lines, suspend, recording close, continuation and replay-side
    activation, recording mirror.** These are `.full`-only, so B fuses
-   only in `.fast` mode. Replay runs in `.full` and never sees a fused
-   step.
-4. **Region departure observer.** Fuse only while the region counter is
-   zero. That is the same `cmpl` the prologue already does. With regions
-   live, the handler dispatches normally.
-5. **`frame.pc`.** Stored for the second pc as the prologue would. An
-   error raised by the second instruction must report its own pc.
-6. **Entry patches.** The fused handler reads the next instruction from the
-   running code image. A patched instruction (`jloop` over a `repeat`
-   closer, `jcont`) is not the expected partner, so the pair does not fuse
-   and the patch runs. No extra check is needed.
+   only in `.fast` mode. Each hook that needs them blocks `.fast` (active
+   recording, pending anchors, suspend controls, line recording;
+   `trace.zig` ~3132, `interp.zig` ~3033/3409). Rev 2 correction: "replay
+   runs `.full`" holds because the wasm replay paths enable suspension and
+   line recording (`wasm_entry.zig` ~441/704). Effect replay on its own
+   does not force `.full`. The argument rests on the hooks, not on
+   "replay".
+4. **Region departure observer.** Fuse only while
+   `regionProfitCount() == 0`, the exact prologue gate (`interp.zig`
+   ~3374). Rev 2 correction (antigravity B2): that count is non-zero
+   whenever a region profit map exists, which is the case in effectively
+   every program that tiers up. So B does not "fuse less" in traced
+   programs; it does not fuse in them at all. Its tier-0 exits and
+   fallbacks get nothing.
+5. **`frame.pc` and the counter.** Bump `safepoint_seq` after the first
+   instruction executes, then publish the second pc to `frame.pc` before
+   executing it. That is the prologue's order (`interp.zig` ~3325/3402).
+   An error from the second instruction reports its own pc.
+6. **Entry patches.** The partner must be read from the running image
+   `st.code`, never from `instr + 1`. A handler can be handed a canonical
+   instruction when a head or continuation patch declines
+   (`interp.zig` ~6618/6718), so its neighbour in memory is canonical
+   code, not the image. A patched partner (`jloop`, `jcont`) is not the
+   expected op, so the pair does not fuse and the patch runs.
 
 B's limits:
 
 - It cannot remove the store of the temporary, the constant's
   `load_const`/`load_int` store, or the second fetch.
 - Each first-op handler gains a peek-and-branch even when it doesn't
-  fuse.
-- Rule 4 means regions-live programs, which are most traced programs,
-  fuse less.
+  fuse, plus the `shouldCollect()` re-test from rule 1.
+- By rule 4 it is off in every program with a live region profit map.
+- Tier-0 behaviour then depends on mode, which is exactly what the 8-mode
+  equivalence suite exists to catch.
 
 ### 4.3 Where each fits
 
@@ -217,9 +291,9 @@ B's limits:
 |---|---|---|---|
 | `get_field`/`set_field` | small: recorder takes the key from K; `bc_liveness` arm | allocation caveat (§4.2 rule 1) | one dispatch, not the K store |
 | constant-operand arith | small: recorder emits `konst` | gains little: the constant store stays | almost nothing |
-| compare-and-branch | large: ~12 shape matchers (§4.1) | none in the JIT | one dispatch |
-| `eq` against a constant | as arith if no branch; as compare-and-branch if fused | as compare-and-branch | one or two dispatches |
-| `itern` | moderate (§5.1) | not applicable (no adjacent pair) | — |
+| compare-and-branch | large: ~12 shape matchers (§4.1) | none in the JIT | one dispatch, and only with no live region profit map (§4.2 rule 4) |
+| `eq` against a constant | as arith if no branch; as compare-and-branch if fused | as compare-and-branch | one or two dispatches, same restriction |
+| `itern` | moderate to large, depending on shape (§5.1) | not applicable (no adjacent pair) | — |
 
 ## 5. The forms
 
@@ -241,58 +315,119 @@ that the iterator is the real `next` over a table with a nil control. If
 not, it despecializes the bytecode in place to `JMP` + `ITERC`. `ITERN`
 keeps a slot index in the hidden control variable, so a step never hashes.
 
-Mahina doesn't need the slot index. The hash part's view already resumes
-in O(1) from `iter_pos`, and the array part steps by index. The cost is
-all protocol. Three shapes:
+Mahina doesn't need the slot index. Once its view is built, the hash part
+resumes in O(1) from `iter_pos`, and the array part steps by index. Building
+the view allocates, scans and sorts. An insertion invalidates it, and a
+collection drops it. In the steady state, the cost is all protocol.
+LuaJIT's `ITERN` is more than a shortcut around a call: it owns hot-loop
+accounting, and `rec_itern` does its own loop detection
+(`vm_x64.dasc` ~4185, `lj_record.c` ~675).
 
-- **(a) LuaJIT's.** The compiler predicts by name; an `isnext` op
-  despecializes into the per-VM copy-on-patch image (doc 20). Canonical
-  `Proto.code` is never mutated, so keyframe restore re-compiles to the
-  speculative form, and the first entry despecializes again,
-  deterministically. It needs a new kind of patch, since today's patches
-  are trace entries, and two ops.
-- **(b) A guarded prefix, no prediction and no patching.** Every generic
-  `for` gets one op at the top of its test block:
+The shapes:
+
+- **(a) LuaJIT's.** The compiler predicts by name, and an `isnext` op
+  despecializes into the per-VM copy-on-patch image (doc 20).
+  - Rev 2: the restore argument is **not established** (codex
+    should-fix 6). A keyframe restore re-compiles to the speculative
+    form, but an uninterrupted run that despecialized during an earlier
+    call keeps the generic image.
+  - The two paths would have to be proven equivalent in pcs, safepoints,
+    recording and the control representation. Otherwise the
+    specialization state has to be captured or rebuilt.
+  - It also needs a new kind of patch, since today's patches are trace
+    entries, and two ops.
+- **(b) A guarded prefix (rev 1, superseded by (b2)).** One `itern` at
+  the top of the test block, jumping to the body on a step and falling
+  through to the unchanged `move`/`call` path otherwise. Round 1 found it
+  unsound as specified:
+  - It has **three** destinations: the fallback, the body, and the exit
+    past `tfor_loop`. `bc_liveness.Effect` and `bc_dom` hold two, and an
+    edge kill is one register, not the range the step writes (codex
+    blocker 2, antigravity B1).
+  - Its fast edge bypasses `tfor_loop`. That breaks `loopGateOf`'s
+    contract that every body entry passes the gate, which owner election
+    depends on. It also skips `opTForLoop`'s back-edge accounting and
+    recording activation.
+  - The encoding needs two jump offsets.
+- **(b2) A guarded iterator op that replaces the `move`s and the `call`**
+  (codex's suggestion):
 
   ```
-  test: itern b, n, aux → body
-        move …; move …; move …; call b+3, 2, n; tfor_loop b → body
+  jmp test
+  body: …
+  test: itern b, n            ; was: move b+3,b; move b+4,b+1; move b+5,b+2; call b+3, 2, n
+        tfor_loop b → body
   ```
 
-  `itern` checks that `R[b]` is the `next` builtin and `R[b+1]` is a table
-  or `row_view`. If so it runs the step inline, writes `R[b+2]` (control)
-  and `R[b+3..b+3+n)`, and jumps to the body, or past the `tfor_loop` at
-  the end. Otherwise it falls through to the unchanged generic path. The
-  check is a few instructions per step. Other iterators (`ipairs`,
-  `gmatch`, closures) pay one extra failed check per step.
-- **(c) A fast path in `opCall`** for "callee is `next` and the call is a
-  `tfor` test block call". No bytecode change, but the three `move`s and
-  the dispatches stay, so it saves less than (b).
+  `itern` has one successor, the `tfor_loop` at `pc + 1`, exactly like the
+  `call` it replaces:
+  - **Fast lane.** `R[b]` is the `next` builtin and `R[b+1]` is a
+    non-grid table or a `row_view`. It runs one step of `next(R[b+1],
+    R[b+2])` inline, writes the key and value into `R[b+3]`, `R[b+4]`,
+    and nil-pads `R[b+3..b+3+n)` (key nil when exhausted).
+  - **Fallback.** Anything else. It does exactly the three `move`s and the
+    generic call `call b+3, 2, n`, by tail-calling `opCall`'s logic with
+    those operands. A Lua iterator returns to `pc + 1`, the `tfor_loop`,
+    as today.
 
-What every shape must keep:
+  The gate, `tfor_loop`'s back-edge accounting, recording activation and
+  entry patching are all untouched. Liveness is a single-successor arm:
+  use `b..b+2`, kill `b+3 .. b+3+max(n, 3)`, the union of what the
+  `move`s and the `call` wrote. It saves the three `move`s, the `call`
+  dispatch and the native-call path; the `tfor_loop` dispatch stays.
+  Other iterators (`ipairs`, `gmatch`, closures) take the fallback, which
+  is today's sequence minus three dispatches.
+- **(c) A fast path in `opCall`** for "callee is `next` in a `tfor` test
+  block call". No bytecode change, but the three `move`s and their
+  dispatches stay, so it saves less than (b2).
 
-- **Errors.** `next` on a non-table, or a key that is not in the table,
-  must give today's message. (b) gets this for free: `itern` declines and
-  the generic call raises.
-- **`frameShape`/`nativeSite`.** These require `code[pc-1] == .call` for a
-  native frame. The fast path never pushes a native frame, so they are
-  untouched.
-- **Mutation during traversal.** The fast path calls the same
-  `nextStepAny`, so assigning to existing fields, clearing them, or
-  inserting keys (which invalidates the view) behaves exactly as `next`
-  does.
-- **Liveness.** `effectOf` gains an `itern` arm with two successors. It
-  uses `b..b+2` and kills `b+2..b+3+n` on the taken edge.
-- **`loopExtentFor`.** Its generic-`for` scan accepts `itern` before the
-  `move`s.
-- **Recorder.** When `itern` takes the fast path, the recorder aborts.
-  Today it aborts at the `next` call with `.host_barrier`, so coverage is
-  unchanged; the new abort gets its own reason, so `--dump-aborts` counts
-  it. When `itern` falls through, the recorder records nothing for it, but
-  only if the callee guard on the following `call` implies "not `next`".
-  Otherwise it emits an identity guard. This is the one soundness argument
-  P1 has to pin with a test: a traced `gmatch` loop whose iterator becomes
-  `next` must exit, not run the gmatch path.
+What (b2) must keep (most also apply to (a) and (c)):
+
+- **Grids.** `next` on an outer grid deflates it first (`iterableArg`,
+  `stdlib/base.zig` ~74–84), which allocates. The fast lane declines a
+  grid, and the fallback's real `next` deflates as today (codex blocker 4,
+  antigravity S1).
+- **Allocation and OOM.** `HashPart.nextLive` allocates when the view
+  must be (re)built. Two options:
+  - the fast lane declines whenever `!iter_valid`, so it never allocates
+    and the generic `next` builds the view once;
+  - the fast lane builds it and parks `OutOfMemory`, which must then
+    match the generic path's error outcome exactly.
+
+  The first keeps every error path identical and costs one generic step
+  per view build, which an unchanged table keeps across traversals.
+- **Errors.** In the fast lane `f` is `next` and `s` is a valid table, so
+  the only failure is OOM (above). Every other case goes through the
+  fallback and raises as today.
+- **Absent control key.** Mahina does not raise "invalid key to next": it
+  resumes at the first greater canonical key, including after a deletion
+  (`hash_part.zig` ~460). The fast lane calls the same core, so this is
+  preserved.
+- **Mutation during traversal.** It is the same core (`nextStepAny` after
+  the `iterableArg` checks), so assigning to existing fields, clearing
+  them, or inserting keys behaves exactly as `next` does.
+- **Call-site consumers.** A fallback call through `itern` is a call site:
+  - `nativeSite` decodes the call operands for a native's error location;
+  - `frameShape` classifies a suspended Lua caller by `code[pc-1]`;
+  - `frameMask` handles multret calls.
+
+  All three accept `itern` as `call b+3, 2, n`. A helper,
+  `bytecode.callOperandsOf(ins) ?CallOperands`, keeps that decoding in
+  one place.
+- **`loopExtentFor`.** The generic-`for` scan accepts the
+  `itern` + `tfor_loop` test block.
+- **Recorder.**
+  - Fast lane: the recorder aborts with a new reason (`.itern_next`), so
+    `--dump-aborts` counts it. Today the same loop aborts at the `next`
+    call with `.host_barrier`, so coverage is unchanged.
+  - Fallback: it records exactly today's sequence, the three `setReg`
+    moves then `recCall` with the synthesized call operands.
+  - Soundness: `recCall` pins the callee's identity. That is `guard_func`
+    for an inlined closure (`trace_recorder.zig` ~4278) or the builtin
+    recorder's `guard_builtin` (~4918); an untagged native aborts. So a
+    later `next` in the same slot exits.
+  - The P1 test reuses **one compiled loop function** across calls with
+    different iterators: gmatch, then `pairs`, then gmatch.
 
 `ipairs` can join later through the same op (a second builtin identity,
 an array-only step).
@@ -307,9 +442,15 @@ an array-only step).
 - The handlers reuse the item 2 lanes: `HashPart.liveHeapNode`,
   `heapKeyChainGet`, in-place overwrite. The slow halves call the same
   `opGetIndexSlow`/`opSetIndexSlow` cores with the key taken from K.
-- Recorder: `hashGetShape`/`hashSetShape` need the key as a `konst`.
-  Today that is the `load_const`'s IR ref; with the new forms it is
-  `konst(K[aux])`, which is the same IR.
+- Recorder. The access IR can be identical (`konst`, `guard_table`,
+  `href`, `guard_hash`, `hload`), but the helpers take a key
+  **register**. `GetFrame`/`SetFrame` carry `key: u16`, and
+  `hashGetShape`/`hashSetShape` and the absent-read paths read its
+  observed value and SSA ref (`trace_recorder.zig` ~2281/3106/3128/3263).
+  Rev 2: P2 refactors them to take a resolved key (observed value plus
+  IR ref) from either a register or a constant. It does not fabricate a
+  temporary register. Pcs, ordinals and provenance metadata change; the
+  IR ops do not.
 - The error-message site (`interp.zig` ~2009) learns that the key is a
   constant.
 - Allocation. Any outer read of a grid deflates it (`indexGet`, doc 14),
@@ -332,16 +473,22 @@ plus the op. Options (Q2):
 - **(ii) K index.** `addk`, … with `aux` indexing a number constant, ints
   and floats alike (LuaJIT `ADDVN`). One more load per op than (i), and it
   covers `x * 0.5`.
-- **Constant on the left** (`1 - x`, `2 / x`; LuaJIT `SUBNV`). Commutative
-  ops can swap operands in the compiler. `sub`/`div`/`mod`/`idiv` would
-  need their own forms. LuaJIT has them; whether we need them is a probe
-  question.
+- **Constant on the left** (`1 - x`, `1 + obj`; LuaJIT `ADDNV`/`SUBNV`).
+  ~~Commutative ops can swap operands in the compiler.~~ **Rev 2: they
+  cannot** (codex blocker 3). `1 + obj` and `obj + 1` pass `__add` its
+  arguments in different orders, and mahina calls `handler(a, b)` in
+  source order (`interp.zig` ~7883). LuaJIT keeps orientation with
+  separate `VN` and `NV` forms, `ADDNV` and `MULNV` included
+  (`lj_bc.h` ~102, `lj_parse.c` ~820). There are three options: separate
+  NV forms, an orientation bit in the encoding, or leaving constant-left
+  expressions on the register form.
 
 The fast lanes are item 3's: raw int and float math, with metamethods, a
 zero divisor and mixed types going to the slow half. The recorder emits
-`konst` for the operand, the IR it already gets from `load_int`. That
-gives the same traces, minus one IR `konst` per site, which CSE already
-merges.
+`konst` for the operand, the IR it already gets from `load_int`. The
+traces are the same. Rev 2: no IR `konst` disappears. The recorder's
+`konst` already interns (`trace_recorder.zig` ~1884), so both forms
+produce the one interned constant.
 
 ### 5.4 Compare-and-branch (P4)
 
@@ -358,6 +505,27 @@ a temporary plus `jmp_if_false`/`jmp_if_true`.
   sequence: the compare IR and a `guard_true`/`guard_false` with
   `.branch_cond` provenance on it. `resumeOf` resumes on the untaken edge
   through the same predicate.
+
+  Rev 2 (codex should-fix 5, antigravity S5). The predicate only
+  centralizes **decoding**. Each caller keeps its own restrictions:
+  - own-loop recognition still needs marker adjacency, or a backward edge
+    to its own marker;
+  - bridge and sibling selection still need real branch guards with
+    branch provenance;
+  - `jmp_if_not_nil`'s differing admission (§4.1) is kept per caller,
+    not unified by accident.
+
+  `resumeOf` keeps its exact rule:
+  `recorded_jump = branch_on_true == recorded_result;
+  resume = recorded_jump ? fallthrough : target`. It also keeps the
+  checks that tie provenance and the snapshot pc to the fused
+  instruction: only the `.branch_cond` guard takes the opposite edge, and
+  operand-type guards resume at the fused op itself.
+
+  The recorder needs compare and branch helpers that take an IR ref and
+  an observed result. Today `recCompare` writes a destination register and
+  `recBranch` reads one, and with a fused op `a` becomes the polarity, so
+  neither fits as is.
 - **Strategy B:** the compare handlers fuse with a following
   `jmp_if_*` on their result (§4.2). There is no JIT change at all. Fusion
   happens only in `.fast` with no live regions.
@@ -374,10 +542,14 @@ Which compares (Q3):
 ### 5.5 `eq`/`ne` against a constant (P5)
 
 `x == nil`, `x ~= false`, `s == "str"`, `n == 0`. Today it is `load_nil`
-or `load_const`, then `eq`, then usually a branch. Primitives and
-interned strings compare by tag and bits, so the fast lane is a single
-compare against the constant's bits. Strings are interned, so equal
-contents means the same object. This is P4's branch form with a constant
+or `load_const`, then `eq`, then usually a branch.
+
+- **nil, booleans and interned strings** compare by tag and bits in a
+  single compare. Strings are interned, so equal contents means the same
+  object.
+- **Numbers do not** (rev 2, codex nit): `1 == 1.0`, `-0.0 == 0.0` and
+  NaN need numeric semantics. A number constant uses item 3's `opEqNe`
+  lanes: same-tag raw compare, and the full op for a mixed int and float. This is P4's branch form with a constant
 `c`, or a non-branching `eqk a, b, c=K` when the result is a value.
 
 ## 6. Correctness and determinism
@@ -413,17 +585,24 @@ still `loopExtentFor`'s shape, still its own loop test
 - **Strategy B** keeps step counts and pcs identical by construction
   (§4.2 rules 2–5).
 - **`itern` shape (a)'s despecialization** is a function of execution
-  only (the iterator's identity at loop entry). It lives in the per-VM
-  image, never in canonical code.
+  only (the iterator's identity at loop entry), and lives in the per-VM
+  image. Rev 2: that alone does not make restore equivalent (§5.1 (a)).
+  Shapes (b2) and (c) hold no specialization state, so this question does
+  not arise for them.
 
 ## 7. Phasing (Q5)
 
 Suggested by payoff per effort. Each phase is a slice of the end state
 (Rule Z-7), gated and measured on its own:
 
-1. **P1 `itern`.** Largest per-use gap (459 against 17) and fully
-   localized: compiler generic `for`, one handler, liveness,
-   `loopExtentFor`, recorder abort/fallthrough.
+1. **P1 `itern`.** Largest per-use gap (459 against 17).
+   - Rev 1 called it "fully localized". Round 1 showed that was only true
+     of the withdrawn shape (b).
+   - Shape (b2)'s surface: the compiler's generic `for`, one handler that
+     can call, `effectOf`, `loopExtentFor`, the three call-site consumers
+     (§4.1), and the recorder's abort and fallback.
+   - Codex would move P1 last for that reason, and antigravity would keep
+     it first (§10).
 2. **P2 `get_field`/`set_field`.** The most frequent construct. Small JIT
    surface.
 3. **P3 constant-operand arithmetic.** Frequent and small.
@@ -434,11 +613,11 @@ Suggested by payoff per effort. Each phase is a slice of the end state
 
 ## 8. Measurement
 
-- **Per-op probes.** `/tmp/t0micro/ops3.lua` with `opsmeasure3.sh`
-  (`P=…`, `PROBES=…`, `M=binary`), against LuaJIT `-joff`. The target for
+- **Per-op probes.** `bench/opprobe/measure.sh bench/opprobe/ops3.lua
+  <probes…>` (`M=binary`), against LuaJIT `-joff`. The target for
   each form is its LuaJIT column in §1 plus the remaining dispatch-floor
   difference (≈ 25 − 9 per op until item 6).
-- **Whole programs.** `abench.sh BASE NEW`: tier-0 and JIT instruction
+- **Whole programs.** `bench/opprobe/abench.sh BASE NEW`: tier-0 and JIT instruction
   counts over all 31 `@bench` programs. No row may regress beyond noise
   (±0.05% tier-0). `pairs_hash`, `field_hash` and `tbl_ops` are the P1/P2
   witnesses. They are measurement points, not targets (Rule Z-6).
@@ -464,12 +643,51 @@ Suggested by payoff per effort. Each phase is a slice of the end state
   - plus equality against constants;
   - plus ordered compares against a constant (`jltk`).
 - **Q4 — `itern` shape (§5.1).**
-  - (a) LuaJIT's prediction plus a despecialization patch;
-  - (b) a guarded prefix on every generic `for`;
+  - (a) LuaJIT's prediction plus a despecialization patch; its restore
+    equivalence is open;
+  - (b2) a guarded iterator op that replaces the `move`s and the `call`
+    and converges on `tfor_loop`. Rev 1's shape (b) is withdrawn.
   - (c) an `opCall` fast path with no bytecode change.
+
+  Within (b2): either decline while the hash view needs a build, or build
+  it in the fast lane and park OOM.
 - **Q5 — phase order (§7).** As listed, or something else.
 
-## 10. References
+## 10. Round-1 review (2026-10-21)
+
+Codex (`docs/reviews/doc66/codex-r1.md`) and antigravity
+(`docs/reviews/doc66/antigravity-r1.md`) did read-only reviews of rev 1
+(7d32e84). Rev 2 makes these corrections:
+
+| finding | from | rev 2 |
+|---|---|---|
+| B's GC skip is unsound (`gc_stress`, a failed reservation stays due) | codex B1 | §4.2 rule 1: re-test `shouldCollect()` |
+| B is off whenever a region profit map exists | antigravity B2 | §4.2 rule 4, §4.3 |
+| `itern` (b) has three successors, needs range edge kills, bypasses the gate and `tfor_loop` accounting | codex B2, antigravity B1 | (b) withdrawn; (b2) added |
+| commutative swap reorders metamethod arguments | codex B3 | §5.3 |
+| `itern` must decline grids (or deflate) | codex B4, antigravity S1 | §5.1 |
+| `nextLive` can allocate and fail | antigravity S3 | §5.1, decline-or-park option |
+| field helpers take a key register | codex S4, antigravity S4 | §5.2 |
+| `condBranchOf` decodes, callers keep their restrictions; recorder helpers | codex S5, antigravity S5 | §5.4 |
+| `describeFault` reads `c` as a register | antigravity S6 | §4.1 |
+| inventory gaps: two-edge CFG, `loopGateOf`, entry registry, call-site consumers, table constructors, `jmp_if_not_nil`, loop-check lines | codex S1, antigravity nits | §4.1 |
+| the "replay runs `.full`" claim was too broad; the stale `repeat`-closer patch example | codex S2 | §4.2 rules 3, 6 |
+| shape (a)'s restore equivalence is unproven | codex S6 | §5.1, §6.3 |
+| constant `==` on numbers needs numeric lanes | codex nit | §5.5 |
+| "minus one IR `konst`" was wrong | codex nit | §5.3 |
+| the probes live in `/tmp` | codex nit | P0 |
+
+Where the reviewers agree and disagree on the open questions:
+
+| | codex | antigravity |
+|---|---|---|
+| Q1 | A, `condBranchOf` refactor first | A everywhere, `condBranchOf` first |
+| Q2 | K-index first, keep the constant-left orientation; immediates only if measured | int immediates first; no constant-left in v1 |
+| Q3 | register-register + constant equality + ordered constants | register-register + constant equality |
+| Q4 | revised (b), which is (b2) here | (b), with the grid and encoding fixes |
+| Q5 | P2 → P3 → P5 → `condBranchOf`/P4 → P1 | as proposed: P1 → P2 → P3 → P5 → P4 |
+
+## 11. References
 
 - LuaJIT: `src/lj_bc.h` (op set), `src/lj_parse.c` `predict_next` /
   `parse_for_iter`, `src/vm_x64.dasc` `BC_ISNEXT` / `BC_ITERN`,
