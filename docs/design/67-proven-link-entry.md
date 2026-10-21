@@ -1,7 +1,7 @@
 # 67 — Proven-fact link entry: a linked child skips the checks its parent proved
 
-Status: draft rev 1, not yet implemented. Decisions Q1–Q4 (§9) are open
-for Bart.
+Status: draft rev 1, not yet implemented. Bart answered Q1–Q4 (§9) on
+2026-10-21; round-1 review (codex, antigravity) is next.
 Owner: claude (coral-marten)
 Last updated: 2026-10-21
 
@@ -19,15 +19,17 @@ land; move whole phases to Done once everything inside them is checked.
 - [x] **Model choice** (2026-10-21). Bart picked the proven-fact link
   (option (b) of the TODO entry) over a static literal step and over Lua
   5.4's iteration count.
+- [x] **Q1 — where the step and overflow guards run** (§4.2). Bart,
+  2026-10-21: in the prologue on every trace.
+- [x] **Q2 — v1 exclusions** (§7). Bart, 2026-10-21: as listed.
+- [x] **Q3 — parent fact storage** (§5.2). Bart, 2026-10-21: the
+  compile-time fact table.
+- [x] **Q4 — review rounds.** Bart, 2026-10-21: codex and antigravity
+  before P1.
 
 ### Outstanding
 
-- [ ] **Q1 — where the step and overflow guards run** (§4.2): in the
-  prologue on every trace, or only on one-shot traces.
-- [ ] **Q2 — v1 exclusions** (§7).
-- [ ] **Q3 — parent fact storage** (§5.2): a fact table built at compile
-  time, or `kinds`/`alloc` retained for derivation at arm time.
-- [ ] **Q4 — review rounds** before P1.
+- [ ] **Round-1 review** (codex, antigravity), findings folded into rev 2.
 - [ ] **P0 — dry run** (§8). At every arm, compute whether the parent exit
   proves the child's entry facts, and count it. No behaviour change. This
   says how many arms the mechanism covers before any native code changes.
@@ -262,7 +264,10 @@ P0 reports `proven-eligible arms / arms` per arm kind, and P3 reports
   `math.maxinteger`, in every mode.
 - Silent promotion still promotes a cycle whose links are proven.
 
-## 9. Open questions for Bart
+## 9. Questions for Bart (answered 2026-10-21)
+
+Answers: Q1 every trace; Q2 the exclusions as listed; Q3 the compile-time
+table; Q4 both review rounds before P1.
 
 - **Q1** (§4.2). Check the step and overflow guards in the prologue on
   every trace, or only on one-shot pages?
