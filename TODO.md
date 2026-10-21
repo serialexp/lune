@@ -114,6 +114,8 @@ earlier in `/tmp/t0micro/`).
       entry facts (input tags, the step's sign, no overflow). Needs a
       design doc. (c) Lua 5.4's iteration count, which removes both guards
       everywhere but adds a carried count to every root loop.
+      Bart picked (b) on 2026-10-21. The design is doc 67
+      (`docs/design/67-proven-link-entry.md`); its Q1–Q4 are open.
 - [x] **A zero `for` step looped forever instead of raising** (noted
       2026-10-21). `for i = 1, 3, 0` and `for i = 1, 3, 0.0` never ended;
       Lua 5.4's `forprep` raises `'for' step is zero`. Fixed 2026-10-21:

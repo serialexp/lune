@@ -216,8 +216,9 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
   - Landed in 5f5834d (amber-badger's bundle).
   - Continuation step-sign lever: measured, not built. TODO.md has the
     numbers and three candidate mechanisms (static literal step,
-    proven-fact link entry, Lua 5.4 iteration count). Waiting on Bart to
-    pick one. Shadow tree `/tmp/stepexp` holds the unsound experiments.
+    proven-fact link entry, Lua 5.4 iteration count). Bart picked the
+    proven-fact link entry. Doc 67 rev 1 is written; waiting on its Q1–Q4.
+    Shadow tree `/tmp/stepexp` holds the unsound experiments.
 
 LINE LOOKUP FIX (2026-10-11, coral-marten): LANDED in `49fd572`, bundled with amber-badger's doc 61 Phase K.
 - Bug from TODO.md "Every located runtime error rescans the source for
