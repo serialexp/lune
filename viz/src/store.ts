@@ -10,7 +10,7 @@ import { type MahinaRunResult, type MahinaReplayResult, type MahinaDiagnostic, t
 import { mahinaWorker, StoppedError } from "./wasm/mahina-client";
 import { runNative } from "./native";
 import { diffRuns, type DiffReport } from "./diff";
-import { decodeSnapshot, type SnapshotView } from "./snapshot";
+import { decodeSnapshot, type SnapshotView, type NamedValue } from "./snapshot";
 
 interface VizState {
   fileName: string | null;
@@ -89,6 +89,13 @@ interface VizState {
   replayState: MahinaReplayResult | null;
   /** The decoded globals + locals view of `replayState.keyframe`, or null. */
   replayView: SnapshotView | null;
+  /** The globals as they stood at the first step (before the program ran a
+   *  line), keyed by `globalKey`: the builtins. The globals list hides entries
+   *  still equal to these unless `showBuiltinGlobals`. Null until that step is
+   *  fetched. */
+  replayBaseGlobals: string[] | null;
+  /** Show the builtin globals too (the globals list's toggle). */
+  showBuiltinGlobals: boolean;
   /** Static disassembly of the captured run's proto tree, indexed by `id` (the
    *  replay cursor's `protoId`). Frozen with the run; drives the bytecode view. */
   disasm: ProtoDisasm[];
@@ -232,6 +239,8 @@ const [state, setState] = createStore<VizState>({
   replayPos: 0,
   replayState: null,
   replayView: null,
+  replayBaseGlobals: null,
+  showBuiltinGlobals: false,
   disasm: [],
   execLogs: [],
   execLogsRecorded: false,
@@ -405,6 +414,7 @@ function applyWasmResult(result: MahinaRunResult, fileName: string, source: stri
     replayPos: 0,
     replayState: null,
     replayView: null,
+    replayBaseGlobals: null,
     disasm: result.disasm,
     execLogs,
     execLogsRecorded: true,
@@ -456,19 +466,59 @@ export function setReplayPos(pos: number): void {
   if (stops.length === 0 || state.replayEffects === null) return;
   const clamped = Math.max(0, Math.min(pos, stops.length - 1));
   const k = stops[clamped];
+  // The position moves now, so quick steps (held arrow key, fast clicks) add
+  // up instead of each starting from a position whose replay hasn't returned;
+  // only the newest request's state is applied.
+  setState("replayPos", clamped);
+  const req = ++replayRequest;
   void (async () => {
     try {
       const rs = await mahinaWorker().replay(state.replaySource, state.replayEffects!, k);
-      setState({ replayPos: clamped, replayState: rs, replayView: decodeSnapshot(rs.keyframe) });
+      if (req !== replayRequest) return;
+      const view = decodeSnapshot(rs.keyframe);
+      setState({ replayState: rs, replayView: view });
+      // Step 1 is before the program's first line: its globals are the builtins.
+      if (k === 1 && state.replayBaseGlobals === null && view !== null) {
+        setState("replayBaseGlobals", view.globals.map(globalKey));
+      }
     } catch (e) {
+      if (req !== replayRequest) return;
       setState({
-        replayPos: clamped,
         replayState: null,
         replayView: null,
         runError: e instanceof Error ? e.message : String(e),
       });
     }
   })();
+}
+
+/** Bumped by every `setReplayPos`; a replay result applies only if it is
+ *  still the newest request's. */
+let replayRequest = 0;
+
+/** Identity of a global for the builtin filter: its name and displayed value,
+ *  so a builtin the program reassigns (`print = myPrint`) shows up again. */
+function globalKey(g: NamedValue): string {
+  return `${g.label}\u0000${g.value}`;
+}
+
+/** The globals list to show at the current step and how many builtins it
+ *  hides: every global, or (by default) those that differ from step 1's.
+ *  Pure, so it's unit-testable. */
+export function visibleGlobals(
+  globals: readonly NamedValue[],
+  base: readonly string[] | null,
+  showBuiltins: boolean,
+): { shown: NamedValue[]; hidden: number } {
+  if (showBuiltins || base === null) return { shown: [...globals], hidden: 0 };
+  const builtin = new Set(base);
+  const shown = globals.filter((g) => !builtin.has(globalKey(g)));
+  return { shown, hidden: globals.length - shown.length };
+}
+
+/** Show or hide the builtin globals in the replay panel. */
+export function setShowBuiltinGlobals(show: boolean): void {
+  setState("showBuiltinGlobals", show);
 }
 
 /** Step one stop backward / forward (no wrap). */

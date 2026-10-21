@@ -16,6 +16,7 @@ import {
   loadDroppedFile,
   decodeSourceText,
   coverageLineTitle,
+  visibleGlobals,
   setScriptArgs,
   execLogFor,
 } from "../src/store";
@@ -62,6 +63,18 @@ test("a coverage stripe's tooltip gives the class and the counts behind it", () 
   expect(coverageLineTitle({ cls: "uncovered", native: 0, coveredInterp: 0, uncovered: 12000 })).toBe(
     "no trace, ran tier-0 — loop iterations: 0 native · 12,000 interpreted, no trace",
   );
+});
+
+test("the globals list hides step 1's builtins unless asked, but not reassigned ones", () => {
+  const g = (label: string, value: string) => ({ label, value });
+  const base = [g("print", "native#3"), g("string", "table#9")].map((x) => `${x.label}\u0000${x.value}`);
+  const now = [g("count", "42"), g("print", "function#40"), g("string", "table#9")];
+  const hidden = visibleGlobals(now, base, false);
+  expect(hidden.shown.map((x) => x.label)).toEqual(["count", "print"]); // print was reassigned
+  expect(hidden.hidden).toBe(1);
+  expect(visibleGlobals(now, base, true)).toEqual({ shown: now, hidden: 0 });
+  // Before step 1 is known, nothing is hidden.
+  expect(visibleGlobals(now, null, false)).toEqual({ shown: now, hidden: 0 });
 });
 
 test("decodeSourceText accepts UTF-8 text and refuses binary", () => {

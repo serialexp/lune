@@ -145,24 +145,25 @@ export default function TraceView() {
           >
             <div class="ir-anim">
               <div class="ir-transport">
-                <button type="button" onClick={() => { setPlaying(false); setTraceExecPos(0); }} disabled={pos() === 0} title="Jump to start">
+                <button type="button" onClick={() => { setPlaying(false); setTraceExecPos(0); }} disabled={pos() === 0} title="Jump to start" aria-label="Jump to the first trace event">
                   ⏮
                 </button>
-                <button type="button" onClick={() => { setPlaying(false); stepTraceExec(-1); }} disabled={pos() === 0} title="Step back">
+                <button type="button" onClick={() => { setPlaying(false); stepTraceExec(-1); }} disabled={pos() === 0} title="Step back" aria-label="Previous trace event">
                   ◀
                 </button>
-                <button type="button" onClick={togglePlay} title={playing() ? "Pause" : "Play"}>
+                <button type="button" onClick={togglePlay} title={playing() ? "Pause" : "Play"} aria-label={playing() ? "Pause the trace animation" : "Play the trace animation"}>
                   {playing() ? "⏸ pause" : "▶ play"}
                 </button>
-                <button type="button" onClick={() => { setPlaying(false); stepTraceExec(1); }} disabled={atEnd()} title="Step forward">
+                <button type="button" onClick={() => { setPlaying(false); stepTraceExec(1); }} disabled={atEnd()} title="Step forward" aria-label="Next trace event">
                   ▶
                 </button>
-                <button type="button" onClick={() => { setPlaying(false); setTraceExecPos(lastPos()); }} disabled={atEnd()} title="Jump to end">
+                <button type="button" onClick={() => { setPlaying(false); setTraceExecPos(lastPos()); }} disabled={atEnd()} title="Jump to end" aria-label="Jump to the last trace event">
                   ⏭
                 </button>
                 <input
                   class="ir-slider"
                   type="range"
+                  aria-label="Trace event"
                   min={0}
                   max={lastPos()}
                   step={1}

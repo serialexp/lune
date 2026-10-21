@@ -114,7 +114,8 @@ const mahinaTheme = EditorView.theme(
   {
     "&": { fontSize: "13px", backgroundColor: "transparent", color: "#abb2bf" },
     ".cm-content": { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", caretColor: "#528bff" },
-    ".cm-gutters": { backgroundColor: "transparent", color: "#5c6370", border: "none" },
+    // Line numbers in the same AA-contrast grey as the app's --muted text.
+    ".cm-gutters": { backgroundColor: "transparent", color: "#868fbb", border: "none" },
     ".cm-activeLine": { backgroundColor: "#ffffff0a" },
     ".cm-activeLineGutter": { backgroundColor: "#ffffff0a" },
     "&.cm-focused": { outline: "none" },

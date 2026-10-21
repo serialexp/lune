@@ -1,7 +1,9 @@
 :root {
   --bg: #1a1b26;
   --fg: #c0caf5;
-  --muted: #565f89;
+  /* Secondary text. At least 4.5:1 (WCAG AA) on every background here
+     (--bg 5.4, --panel 4.9, --panel2 4.6); the old #565f89 was 2.4–2.8. */
+  --muted: #868fbb;
   --accent: #7aa2f7;
   --panel: #1f2335;
   --panel2: #24283b;
@@ -119,7 +121,7 @@ code {
   padding: 0.4rem 0.75rem;
   color: var(--muted);
   text-transform: uppercase;
-  font-size: 0.7rem;
+  font-size: 0.75rem;
   letter-spacing: 0.05em;
 }
 
@@ -539,7 +541,7 @@ button.secondary {
 .replay-title {
   color: var(--muted);
   text-transform: uppercase;
-  font-size: 0.7rem;
+  font-size: 0.75rem;
   letter-spacing: 0.05em;
 }
 
@@ -626,9 +628,12 @@ button.secondary {
   word-break: break-word;
 }
 
+/* Output / locals / globals side by side when there is room; each wraps onto
+   its own row before it gets too narrow to read (it used to squeeze values to
+   one character per line at 1024px). */
 .replay-panels {
   display: grid;
-  grid-template-columns: 1.2fr 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
   gap: 0.6rem;
   align-items: start;
 }
@@ -643,7 +648,7 @@ button.secondary {
 .replay-col-title {
   color: var(--muted);
   text-transform: uppercase;
-  font-size: 0.68rem;
+  font-size: 0.75rem;
   letter-spacing: 0.05em;
 }
 
@@ -677,15 +682,29 @@ table.replay-vars td {
   padding: 0.1rem 0.4rem;
   vertical-align: top;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
-.replay-var-name {
+table.replay-vars td.replay-var-name {
   color: var(--accent);
   white-space: nowrap;
-  /* Fixed name column: values line up across rows, labels never get squashed. */
-  width: 15%;
+  overflow-wrap: normal;
+  /* As wide as the longest name, up to a cap: values line up across rows and
+     keep most of the width; an over-long name is cut with an ellipsis (its
+     full text is the cell's tooltip). */
+  width: 1%;
+  max-width: 10rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
   padding-right: 0.6rem;
+}
+
+/* The globals list's "show builtins" toggle, in its column title. */
+.replay-builtins {
+  margin-left: 0.6rem;
+  text-transform: none;
+  letter-spacing: normal;
+  cursor: pointer;
 }
 
 .replay-var-val {

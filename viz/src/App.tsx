@@ -1,4 +1,4 @@
-import { For, Show, onMount } from "solid-js";
+import { For, Show, onMount, onCleanup } from "solid-js";
 import {
   state,
   loadBytes,
@@ -51,6 +51,23 @@ export default function App() {
     const src = new URLSearchParams(window.location.search).get("src");
     if (src) void loadFromUrl(src);
   });
+
+  // Ctrl/⌘+Enter runs (Ctrl/⌘+Shift+Enter: Run both) from anywhere, the editor
+  // included; Escape stops a running program. Capture phase, so it wins over
+  // CodeMirror's own Mod-Enter (insert blank line).
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!state.running) void (e.shiftKey ? runBoth() : runWasm());
+    } else if (e.key === "Escape" && state.running) {
+      e.preventDefault();
+      e.stopPropagation();
+      stopRun();
+    }
+  };
+  window.addEventListener("keydown", onKey, { capture: true });
+  onCleanup(() => window.removeEventListener("keydown", onKey, { capture: true }));
 
   const onDrop = (e: DragEvent) => {
     e.preventDefault();
@@ -126,11 +143,11 @@ export default function App() {
               disabled={state.running}
               onInput={(e) => setScriptArgs(e.currentTarget.value)}
             />
-            <button type="button" disabled={state.running} onClick={() => void runWasm()}>
+            <button type="button" disabled={state.running} title="Run in the browser (Ctrl/⌘+Enter)" onClick={() => void runWasm()}>
               {state.running ? "Running…" : "Run (wasm)"}
             </button>
             <Show when={state.running}>
-              <button type="button" class="stop" title="Stop the running program" onClick={stopRun}>
+              <button type="button" class="stop" title="Stop the running program (Esc)" onClick={stopRun}>
                 Stop
               </button>
             </Show>
@@ -138,7 +155,7 @@ export default function App() {
               type="button"
               class="secondary"
               disabled={state.running}
-              title="Run through both the wasm VM and the native binary, then compare every artifact byte-for-byte"
+              title="Run through both the wasm VM and the native binary, then compare every artifact byte-for-byte (Ctrl/⌘+Shift+Enter)"
               onClick={() => void runBoth()}
             >
               Run both + diff
