@@ -4361,6 +4361,35 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
     try w.print("    rowless sibling hits: {d} (doc 54 P2 amendment hops)\n", .{ts.sibling_link_hits});
     try w.print("    link arms:            native={d} source={d} loopdone={d} bridge={d}\n", .{ ts.native_link_arms, ts.native_source_link_arms, ts.native_loopdone_link_arms, ts.native_region_bridge_arms });
     try w.print("    bridge arm attempts:  {d} (pipeline runs; vs {d} arms)\n", .{ ts.native_region_bridge_arm_attempts, ts.native_region_bridge_arms });
+    {
+        // Doc 67 P0: per arm kind, the arms a proven entry could have taken,
+        // of the arms published, of the funnel runs; then the fact tables.
+        const d = &ts.registry.native_physical.proven_dry_run;
+        try w.writeAll("    proven dry run:      ");
+        for (std.enums.values(native_physical.ArmKind)) |k| {
+            if (k.provenShape() == null) continue;
+            try w.print(" {s}={d}/{d}/{d}", .{ @tagName(k), d.eligible.get(k), d.arms.get(k), d.attempts.get(k) });
+        }
+        try w.writeAll(" (eligible/arms/attempts)\n");
+        var n_pages: usize = 0;
+        var n_tables: usize = 0;
+        var n_entry: usize = 0;
+        var n_exits: usize = 0;
+        var fact_bytes: usize = 0;
+        for (ts.registry.cache.items) |t| {
+            const c = switch (t.native) {
+                .compiled => |*c| c,
+                else => continue,
+            };
+            n_pages += 1;
+            const f = &(c.facts orelse continue);
+            n_tables += 1;
+            n_entry += f.entry_len;
+            n_exits += f.exits.len;
+            fact_bytes += f.bytes();
+        }
+        try w.print("    fact tables:          pages={d} built={d} entry facts={d} exit lists={d} bytes={d}\n", .{ n_pages, n_tables, n_entry, n_exits, fact_bytes });
+    }
     try w.print("    link fused:           source={d} loopdone={d} bridge={d} (bridge cap yields={d})\n", .{ ts.native_source_link_fused, ts.native_loopdone_link_fused, ts.native_region_bridge_fused, ts.native_region_bridge_cap_yields });
     try w.writeAll("    region closes:       ");
     for (std.enums.values(CloseReason)) |why| try w.print(" {s}={d}", .{ @tagName(why), ts.region_closes.get(why) });

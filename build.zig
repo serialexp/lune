@@ -302,6 +302,25 @@ pub fn build(b: *std.Build) void {
     const bench_topo_step = b.step("bench-topology", "Run the region-topology rebuild benchmark (ReleaseFast)");
     bench_topo_step.dependOn(&run_bench_topo.step);
 
+    // `zig build bench-facts` — doc 67 §5.3: building a page's slab fact
+    // tables, and one arm-time `proves`, at the trace size limits.
+    // ReleaseFast, informational, not a test (global Rule #22).
+    const bench_facts_exe = b.addExecutable(.{
+        .name = "bench-facts",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_facts.zig"),
+            .target = target,
+            .optimize = .fast,
+            .imports = &.{
+                .{ .name = "mahina", .module = mod },
+            },
+        }),
+    });
+    bench_facts_exe.use_llvm = true;
+    const run_bench_facts = b.addRunArtifact(bench_facts_exe);
+    const bench_facts_step = b.step("bench-facts", "Run the doc 67 fact-table build benchmark (ReleaseFast)");
+    bench_facts_step.dependOn(&run_bench_facts.step);
+
     // `zig build bench-retire` — doc 61 Phase Q: trace retirement at a
     // collection (one batch, one structural rebuild) as the cache grows.
     // ReleaseFast, informational, not a test (global Rule #22).

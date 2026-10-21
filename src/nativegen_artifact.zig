@@ -9,6 +9,7 @@ const trace_exec = @import("trace_exec.zig");
 const trace_code = @import("trace_code.zig");
 const RegWindow = @import("regwindow.zig").RegWindow;
 const mcode = @import("nativegen_mcode.zig");
+const slab_facts = @import("nativegen_facts.zig");
 const Trace = trace_code.TraceCode;
 const NativeSeedCtx = trace_code.NativeSeedCtx;
 const ExecPage = mcode.ExecPage;
@@ -677,6 +678,14 @@ pub const CompiledTrace = struct {
     /// per exit. An adapter lives until the page dies (a give-up only clears
     /// its cell). Owned; freed in `deinit`.
     exit_adapters: std.ArrayListUnmanaged(ExitAdapter) = .empty,
+    /// Doc 67 §5.3: the slab facts this page's prologue checks, and those
+    /// each armable exit establishes when it jumps (`PageFacts`). Null when
+    /// building them failed: such a page proves nothing and its own
+    /// requirements are unknown. P0 (dry run): the entry list already counts
+    /// the entry-hoisted `for` guards, which the prologue checks only from
+    /// P1, so nothing may target a proven entry from these yet. Owned; freed
+    /// in `deinit`.
+    facts: ?slab_facts.PageFacts = null,
 
     pub const EntryFn = fn ([*]u8, [*]u64, *NativeResult) callconv(.c) void;
     /// The shared frameless trampoline's C-ABI type: SoA lanes + result out-param,
@@ -930,6 +939,7 @@ pub const CompiledTrace = struct {
         if (self.silent_sites.len > 0) self.gpa.free(self.silent_sites);
         if (self.metadata_cells.len > 0) self.gpa.free(self.metadata_cells);
         self.exit_locs.deinit(self.gpa);
+        if (self.facts) |*f| f.deinit(self.gpa);
         if (self.exit_side_cells.len > 0) self.gpa.free(self.exit_side_cells);
         if (self.exit_side_metadata_cells.len > 0) self.gpa.free(self.exit_side_metadata_cells);
         for (self.exit_adapters.items) |*ad| ad.deinit();

@@ -2,6 +2,7 @@
 //! Arena is borrowed per transaction; records and published metadata stay stable.
 const std = @import("std");
 const nativegen = @import("nativegen.zig");
+const slab_facts = @import("nativegen_facts.zig");
 const trace_code = @import("trace_code.zig");
 const Trace = @import("trace_record.zig").TraceRecord;
 const StructuralEdgeId = @import("trace_types.zig").StructuralEdgeId;
@@ -40,7 +41,42 @@ pub const ArmKind = enum {
     /// (`CompiledTrace.exitSideSlot`), never the ordinary cell `slots[ei]`,
     /// which may hold an anchor-coherent arm of the same exit.
     exit_side,
+
+    /// Doc 67 §6: the write contract of the parent exit an arm of this kind
+    /// jumps from, or null for the kinds v1 never targets at a proven entry
+    /// (frame motion and exit adapters, §7).
+    pub fn provenShape(kind: ArmKind) ?slab_facts.ExitShape {
+        return switch (kind) {
+            .link_terminal => .writeback,
+            .ordinary_guard, .sibling_handoff => .carried,
+            .loop_done_linked => .loop_done_linked,
+            .region_bridge => .region_bridge,
+            .ret_cont, .call_head, .exit_side => null,
+        };
+    }
 };
+
+/// Doc 67 P0: the proven-entry dry run. Per arm kind, how often the funnel
+/// ran, how many arms it published, and how many of those a proven entry
+/// could have taken: the parent exit's facts prove the child's entry facts
+/// and the child is unseeded. Nothing targets a proven entry yet.
+pub const ProvenDryRun = struct {
+    attempts: std.EnumArray(ArmKind, u64) = .initFill(0),
+    arms: std.EnumArray(ArmKind, u64) = .initFill(0),
+    eligible: std.EnumArray(ArmKind, u64) = .initFill(0),
+};
+
+/// Doc 67 §6: whether arm `kind` from `parent`'s exit `slot_index` into
+/// `child` may target the child's proven entry. False when either page has
+/// no fact tables, the exit has none, or the child seeds at entry.
+pub fn provenEligible(kind: ArmKind, parent: *const nativegen.CompiledTrace, slot_index: u32, child: *const nativegen.CompiledTrace) bool {
+    const shape = kind.provenShape() orelse return false;
+    if (child.seed_plan.nonEmpty()) return false;
+    const pf = parent.facts orelse return false;
+    const cf = child.facts orelse return false;
+    const have = pf.exitFacts(shape, slot_index) orelse return false;
+    return slab_facts.proves(have, cf.entry());
+}
 pub const NativeLink = struct {
     parent: *Trace,
     /// Logical key: IR exit for ordinary links; resume PC for `.ret_cont`;
@@ -317,6 +353,7 @@ pub const NativePhysicalRegistry = struct {
     /// A single slot suffices: at most one resident set is live (invariant 1).
     resident_demotion_notice: ?RegionId = null,
     silent_promotions: u64 = 0,
+    proven_dry_run: ProvenDryRun = .{},
     silent_demotions: u64 = 0,
     silent_demotion_reasons: PromotionDemotions = .{},
     native_link_disarms: u64 = 0,
@@ -1004,6 +1041,52 @@ pub const NativePhysicalRegistry = struct {
     }
     pub const ArmOutcome = enum { declined, unchanged, changed };
     pub fn publishValidatedLink(self: *NativePhysicalRegistry, request: ArmRequest) !ArmOutcome {
+        const outcome = try self.publishValidatedLinkImpl(request);
+        // Doc 67 P0 dry run. An unchanged republication reuses the decision
+        // made when the relation changed, so `proves` runs only on a change.
+        self.proven_dry_run.attempts.getPtr(request.kind).* +|= 1;
+        if (outcome == .changed) {
+            self.proven_dry_run.arms.getPtr(request.kind).* +|= 1;
+            const parent_c = &request.parent.native.compiled;
+            const child_c = &request.child.native.compiled;
+            if (provenEligible(request.kind, parent_c, request.slot_index, child_c)) {
+                self.proven_dry_run.eligible.getPtr(request.kind).* +|= 1;
+            } else self.dbgProvenMiss(request, parent_c, child_c);
+        }
+        return outcome;
+    }
+    /// Doc 67 P0: why a published arm could not have taken a proven entry.
+    fn dbgProvenMiss(self: *const NativePhysicalRegistry, request: ArmRequest, parent_c: *const nativegen.CompiledTrace, child_c: *const nativegen.CompiledTrace) void {
+        const jitdbg = @import("jitdbg.zig");
+        if (comptime !jitdbg.enabled) return;
+        if (!self.debug_log) return;
+        const shape = request.kind.provenShape() orelse return;
+        const why: []const u8 = if (child_c.seed_plan.nonEmpty()) "child seeds" else if (parent_c.facts == null) "parent has no tables" else if (child_c.facts == null) "child has no tables" else if (parent_c.facts.?.exitFacts(shape, request.slot_index) == null) "exit has no list" else "unproven";
+        const miss: ?slab_facts.Fact = if (parent_c.facts) |pf| if (child_c.facts) |cf| if (pf.exitFacts(shape, request.slot_index)) |have| slab_facts.firstUnproven(have, cf.entry()) else null else null else null;
+        if (miss) |f| {
+            // Of the child's unproven facts, how many are about slots the
+            // parent's exit list does not mention at all (untouched by the
+            // parent page) versus slots it mentions differently.
+            var unproven: usize = 0;
+            var untouched: usize = 0;
+            const have = parent_c.facts.?.exitFacts(shape, request.slot_index).?;
+            for (child_c.facts.?.entry()) |need| {
+                if (slab_facts.proves(have, &.{need})) continue;
+                unproven += 1;
+                var seen = false;
+                for (have) |h| {
+                    if (h.mentions(need.a) or (need.kind == .nov and !need.b_const and h.mentions(need.b))) seen = true;
+                }
+                if (!seen) untouched += 1;
+            }
+            self.dbg("proven-miss: parent id={d} slot={d} kind={s} child id={d}: {s} {s}(a={d} b={d}{s} k={d} byte={d}) unproven={d} untouched={d}", .{
+                request.parent.id, request.slot_index, @tagName(request.kind), request.child.id, why, @tagName(f.kind), f.a, f.b, if (f.b_const) "c" else "", f.k, f.byte, unproven, untouched,
+            });
+        } else self.dbg("proven-miss: parent id={d} slot={d} kind={s} child id={d}: {s}", .{
+            request.parent.id, request.slot_index, @tagName(request.kind), request.child.id, why,
+        });
+    }
+    fn publishValidatedLinkImpl(self: *NativePhysicalRegistry, request: ArmRequest) !ArmOutcome {
         const parent = request.parent;
         const child = request.child;
         const kind = request.kind;

@@ -527,6 +527,9 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     // off the finished allocation, after emission, so it cannot influence
     // the code. Fail-soft: no map on OOM, like the exit snapshots.
     const exit_locs = exitloc.build(gpa, t, kinds, &alloc) catch ExitLocMap{};
+    // Doc 67 §5.3: the slab fact tables, likewise read off the finished
+    // allocation and fail-closed (null proves nothing).
+    const page_facts = factbuild.build(gpa, t, kinds, &alloc);
     keep_exit_side_cells = true;
     keep_ret_cont_keys = true;
     keep_link_hit_counters = true;
@@ -554,6 +557,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
         },
         .peeled = t.peeled,
         .exit_locs = exit_locs,
+        .facts = page_facts,
         .exit_side_cells = exit_side_cells,
         .exit_side_metadata_cells = exit_side_metadata_cells,
     };
@@ -617,6 +621,9 @@ const computeSeedPlan = ngalloc.computeSeedPlan;
 // ---------------------------------------------------------------------------
 
 const emit = @import("nativegen_emit.zig");
+const boundary = @import("nativegen_boundary.zig");
+pub const factbuild = @import("nativegen_factbuild.zig");
+pub const slab_facts = @import("nativegen_facts.zig");
 const placeToReg = emit.placeToReg;
 const regToPlace = emit.regToPlace;
 const refBaseReg = emit.refBaseReg;
@@ -670,7 +677,6 @@ const emitGuardAbsent = emit.emitGuardAbsent;
 const emitHStore = emit.emitHStore;
 const emitAStore = emit.emitAStore;
 const emitGStore = emit.emitGStore;
-const emitPhiValueFlush = emit.emitPhiValueFlush;
 const emitLinkedLoopDoneSnapshot = emit.emitLinkedLoopDoneSnapshot;
 const emitCompositeBridgeSnapshot = emit.emitCompositeBridgeSnapshot;
 const emitCarriedHomesFlush = emit.emitCarriedHomesFlush;
@@ -789,11 +795,8 @@ fn emitPreciseSnapshotFlush(a: *x64.Assembler, t: *const Trace, kinds: []const K
             }
         }
         switch (k) {
-            .int, .bool, .float, .ptr, .heap, .func, .nil => try flushSlot(a, @as(i32, ss.slot), k, placeOfRef(alloc, ref)),
-            // `.native` is a raw *GcHeader exactly like `.func`; flushSlot's
-            // scalar else-arm would mis-tag it TAG_INT, so re-box it through
-            // the `.heap` (TAG_HEAP) path.
-            .native => try flushSlot(a, @as(i32, ss.slot), .heap, placeOfRef(alloc, ref)),
+            // `.native` is a raw *GcHeader exactly like `.func` (TAG_HEAP).
+            .int, .bool, .float, .ptr, .heap, .func, .native, .nil => try flushSlot(a, @as(i32, ss.slot), k, placeOfRef(alloc, ref)),
             // Tokens (`.aref`/`.href`/...), `.boxed` (impossible in a `.loop`
             // precise body) and non-load `.none` refs cannot be materialized.
             else => return error.Unsupported,
@@ -950,36 +953,17 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     // hoisted slot loads. A guard failure here returns 0 without touching regs[].
     // An int slot checks TAG_INT; a `.ptr` (table) slot checks TAG_HEAP (its
     // table-type + lane are verified below, after the pointer is loaded).
+    // Which slots are checked, and against what, is `boundary.entryTag` /
+    // `entryPin` — the entry facts doc 67 publishes come from the same calls.
     for (alloc.slots) |s| {
-        if (s.class == .write_only) continue;
-        if (s.kind == .boxed) continue; // arbitrary tag is copied at terminal
-        // Doc 45 D6: a snapshot-only dead-window load (`.none`) has no home,
-        // no type and no prologue check — the body never reads it and the
-        // exit materializers skip it (its slab slot stays current).
-        if (s.kind == .none) continue;
-        const tag: u8 = switch (s.kind) {
-            .ptr, .func, .native => TAG_HEAP, // all invariant heap pointers
-            // A carried-heap slot enters holding a table (TAG_HEAP). Its table-type/
-            // metatable facts are NOT hoisted here — the dynamic in-body guard_table
-            // re-checks the CURRENT table every iteration (doc 22 §A.1).
-            .heap => TAG_HEAP,
-            .float => TAG_FLOAT,
-            // Doc 57: a pinned bool/nil input.
-            .bool => TAG_BOOL,
-            .nil => TAG_NIL,
-            else => TAG_INT,
-        };
+        const tag = boundary.entryTag(s) orelse continue;
         // tag lane: `tags[slot]` at rdi+slot (scale-1, free).
         try a.cmpByteMemImm(.rdi, @as(i32, s.slot), tag);
         try a.jcc(.ne, prologue_fail);
-        // Doc 57: an INVARIANT bool pin also compares the payload once (the
-        // body pin then emits nothing). `Value.boolean` defines all 8 payload
-        // bytes as canonical 0/1, so a qword compare is exact. A carried
-        // slot's pin stays a body compare (its value changes per iteration).
-        if (s.class == .invariant) if (s.pin) |p| {
+        if (boundary.entryPin(s)) |p| {
             try a.cmpQwordMemImm8(.rsi, @as(i32, s.slot) * 8, @intFromBool(p));
             try a.jcc(.ne, prologue_fail);
-        };
+        }
     }
     // Boxed tags are immutable source state for the whole one-shot body. Taking
     // this snapshot only after every hoisted guard passed preserves the strict
@@ -2236,14 +2220,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 // (loaded float, stored int — e.g. spectral-norm's `a` accumulator
                 // resets to int 0). The receiving trace's prologue re-checks the type,
                 // so flushing with the true store type is correct.
-                for (alloc.slots) |s| {
-                    if (s.store_ref < 0) continue;
-                    const ref: usize = @intCast(s.store_ref);
-                    const flush_kind = kinds[ref];
-                    if (flush_kind == .boxed) {
-                        try flushBoxedSlot(a, @as(i32, s.slot), try boxedTagSpill(t, kinds, alloc, ref), placeOfRef(alloc, ref));
-                    } else try flushSlot(a, @as(i32, s.slot), flush_kind, placeOfRef(alloc, ref));
-                }
+                try emit.emitExitWrites(a, t, kinds, alloc, .writeback, i);
                 try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
                 try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
                 if (shared_exit != null) try emitSilentSite(a, silent_emissions, metadata_cells, i, .link_terminal);
@@ -2265,14 +2242,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // consumer (doc 44) owns resumption at `terminal.aux`.
             .terminal => {
                 std.debug.assert(!t.peeled); // head closes bypass peel
-                for (alloc.slots) |s| {
-                    if (s.store_ref < 0) continue;
-                    const ref: usize = @intCast(s.store_ref);
-                    const flush_kind = kinds[ref];
-                    if (flush_kind == .boxed) {
-                        try flushBoxedSlot(a, @as(i32, s.slot), try boxedTagSpill(t, kinds, alloc, ref), placeOfRef(alloc, ref));
-                    } else try flushSlot(a, @as(i32, s.slot), flush_kind, placeOfRef(alloc, ref));
-                }
+                try emit.emitExitWrites(a, t, kinds, alloc, .writeback, i);
                 // Doc 44 D11 / doc 54: native frame push at the self-call
                 // terminal — a LOWERING decision only (recording and tier-1a
                 // keep the interp terminal; the ten-leg matrix keeps its D10
@@ -2827,7 +2797,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
         try a.jcc(.e, l);
         skip_flush = l;
     }
-    try emitCarriedHomesFlush(a, t, alloc, null);
+    try emitCarriedHomesFlush(a, t, kinds, alloc);
     if (skip_flush) |l| a.bind(l);
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
     // 2.3c-2a: record this ordinary / loop-done-ordinary transition. The mini-stub wrote
@@ -2996,7 +2966,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     try a.jcc(.e, l);
                     silent_skip = l;
                 }
-                try emitCarriedHomesFlush(a, t, alloc, null);
+                try emitCarriedHomesFlush(a, t, kinds, alloc);
                 if (silent_skip) |l| a.bind(l);
                 try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
             }
@@ -3062,5 +3032,7 @@ test {
     _ = @import("nativegen_hrefk_test.zig");
     _ = @import("nativegen_exitloc_test.zig");
     _ = @import("nativegen_bool_test.zig");
+    _ = @import("nativegen_facts_test.zig");
+    _ = @import("nativegen_factbuild_test.zig");
     _ = adapter;
 }

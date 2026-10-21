@@ -1,7 +1,8 @@
 # 67 — Proven-fact link entry: a linked child skips the checks its parent proved
 
-Status: draft rev 2, not yet implemented. Bart answered Q1–Q4 (§9) on
-2026-10-21. Round-1 review (codex, antigravity) is folded in (§10). Next: P0.
+Status: rev 2; P0 (facts and a dry run) landed 2026-10-21. Its dry run
+found that the static tables prove none of the hot `.link` and loop-done
+arms (§11). P1 waits on Bart's answer to Q5–Q7 (§11.3).
 Owner: claude (coral-marten)
 Last updated: 2026-10-21
 
@@ -37,23 +38,60 @@ land; move whole phases to Done once everything inside them is checked.
   - the fact table fails closed and has a budget;
   - proven stubs can be null, and the arm falls back;
   - identical republication reuses the decision.
+- [x] **P0 — facts and a dry run** (2026-10-21, §4.1, §5, §8, §11). No
+  codegen change: `--dump-native` is identical to the previous commit on
+  every `@bench` program once embedded addresses are masked.
+  - [x] The fact type, its normalization and `proves`
+    (`nativegen_facts.zig`), with unit tests.
+  - [x] `exitWrites` (§5.2): `nativegen_boundary.forEachExitWrite`, one
+    write list per `ExitShape`. The carried flush, the `.link` and
+    `.terminal` writebacks, the loop-done φ snapshot and the bridge
+    snapshot all emit through it (`emit.emitExitWrites`), and
+    `flushSlot`'s tag is `boundary.flushTag`.
+  - [x] The entry-check description: `boundary.entryTag`/`entryPin`. The
+    prologue's [RV-1] loop iterates them.
+  - [x] `entryGuardHoisted` (§4.2), used for facts only. It also refuses
+    an all-constant guard, whose outcome no slab fact describes.
+  - [x] The tables (`nativegen_factbuild.zig`): `CompiledTrace.facts`, a
+    `PageFacts` with the canonical entry list and one list per armable
+    exit. One carried list serves every ordinary exit, because the
+    carried write set doesn't depend on the exit. Storage is two
+    allocations: the facts, then a sorted `(shape, exit)` index. Exact
+    pre-counts, checked arithmetic, the 64 KiB budget, fail-closed. Tests
+    in `nativegen_factbuild_test.zig`, including every allocation
+    failure; the `W(e)` kill and the second-operand `nov` kill are
+    mutation-checked.
+  - [x] The dry run: `NativePhysicalRegistry.proven_dry_run`, per arm
+    kind, counts eligible arms, published arms and funnel runs, shown in
+    `--jit-stats` with the table sizes. `proves` runs only on a changed
+    arm. Under `-Djit-debug`, `proven-miss:` names the first unproven
+    child fact and counts the misses on slots the parent never mentions.
+  - [x] `zig build bench-facts` (Rule #20): one-shot pages up to the
+    recorder cap (§11.2).
+  - Adding the counters moved the `Vm` layout, so
+    `src/asm/offsets_x64.inc` was updated with the corrected lines.
 
 ### Outstanding
 
-- [ ] **P0 — dry run** (§8). At every arm, build both fact sets, run the
-  §6 test and count the result per arm kind. No behaviour change. This says
-  how many arms the mechanism covers before any native code changes.
-- [ ] **P1 — child side, proven targeting disabled** (§4). Entry facts on
-  `CompiledTrace`, the `proven` label, the proven stubs, and the step and
-  overflow guards checked in the prologue. No arm targets a proven entry
-  yet. The hoisting already changes behaviour (exit identity and coverage
-  when a step check fails), so P1 gets its own board run.
-- [ ] **P2 — parent side** (§5). The exit write sets, shared with the
-  emitters, and the per-exit fact table.
-- [ ] **P3 — arm funnel** (§6). `arm` picks the proven stub when the parent
+Rev 2 replanned the phases. The fact builders P0 needs are the final
+ones, so P0 builds them for real, not as scaffolding (Rule Z-7).
+
+- [ ] **Q5 — facts about slots the parent never touches** (§11.3). Most
+  misses are of this kind. Blocks P1.
+- [ ] **Q6 — seeded children** (§11.3). The v1 exclusion covers 31 of the
+  66 misses.
+- [ ] **Q7 — facts from the parent's own guards** (§11.3). They would turn
+  20 misses into proofs.
+- [ ] **P1 — child side, proven targeting disabled** (§4). The hoisted
+  checks in the prologue, the body suppression and `opMayExitInBody`, the
+  `proven` label and the proven stubs. No arm targets a proven entry yet.
+  The hoisting already changes behaviour (exit identity and coverage when a
+  step check fails), so P1 gets its own board run. P2 cannot land before
+  P1: until then a hoisted guard's fact is a body check, not a prologue one.
+- [ ] **P2 — arm funnel** (§6). `arm` picks the proven stub when the parent
   exit proves the child's facts. Every consumer listed in §6 agrees with
   that choice. Counters in `--jit-stats`.
-- [ ] **P4 — measurement** (§8). The board, against the §1 bounds.
+- [ ] **P3 — measurement** (§8). The board, against the §1 bounds.
 
 ## 1. Why this exists
 
@@ -222,9 +260,13 @@ materialization writes, and `gen(e)` is the facts those writes establish
 
     F(P, e) = gen(e) ∪ { f ∈ E(P) : no slot f mentions is in W(e) }
 
-This rests on one invariant, which P2 asserts in code and documents at
+This rests on one invariant, which P0 asserts in code and documents at
 the emitter: **a native body writes the slab only in exit
-materialization.** The review traced every path (codex, answer (1)):
+materialization, and at a `.loop` back-edge, where it commits the
+`write_only` slots** (`nativegen.zig` ~2175). A `write_only` slot carries
+no entry fact: [RV-1] skips it, and pins and hoisted guards are
+invariant-only. So those back-edge writes kill nothing. The review traced
+every other path (codex, answer (1)):
 - body ops keep values in homes;
 - sunk `astore`/`hstore`/`ustore`/`gstore` write heap storage (`ustore`
   a verified closed cell);
@@ -278,7 +320,7 @@ allocation on `CompiledTrace`: offsets per exit, then the facts.
 
 The size is computed with checked arithmetic before allocating:
 - **Per exit**, at most `|E(P)| + |W(e)|` facts.
-- **Each fact** is a fixed-size record of at most 32 bytes; P2 pins
+- **Each fact** is a fixed-size record of at most 32 bytes; P0 pins
   the size with a comptime assert.
 - **The page budget** is 64 KiB, at least 2,000 facts. That is far above
   anything the current trace limits produce, so it only matters for an
@@ -286,7 +328,7 @@ The size is computed with checked arithmetic before allocating:
 
 Building fails closed. On overflow, over budget or OOM, the page carries
 no table, proves nothing, and every arm out of it uses the checked stubs.
-P2 adds an allocation-failure test, and a compile-time and memory
+P0 adds an allocation-failure test, and a compile-time and memory
 benchmark at the trace size limits (Rule #20).
 
 ## 6. Arm funnel
@@ -322,7 +364,7 @@ written, not merely whether `proves` passed.
 already recognises an identical republication (`trace_native_registry.zig`
 ~1059, ~1073, ~1099). For the same parent artifact, exit and child
 artifact, it reuses the recorded decision. P0 counts publication attempts
-and changed arms separately, and P3 benchmarks repeated unchanged
+and changed arms separately, and P2 benchmarks repeated unchanged
 publication with large fact lists.
 
 Every consumer of a slot's target must agree with `link.proven`:
@@ -336,7 +378,7 @@ Every consumer of a slot's target must agree with `link.proven`:
 - **The rowless sibling path** (`nativegen.zig` ~2852–2893) jumps to the
   target staged from the slot at exit time and deliberately doesn't
   reread the slot. The staged address is the proven address, so nothing
-  changes; P3 tests it.
+  changes; P2 tests it.
 - **Silent epilogues** continue through the same slot. The `.deopt` one
   duplicates the carried-home flush (`nativegen.zig` ~2985), and the other
   kinds materialize before their check. `exitWrites` describes both
@@ -400,7 +442,7 @@ any proven arm exists.
 
 **Counters** in `--jit-stats`:
 - P0: per arm kind, proven-eligible arms, arms, and publication attempts;
-- P3: per arm kind, proven and checked arms.
+- P2: per arm kind, proven and checked arms.
 
 **Tests.** All fixtures are unseeded, so the seeded exclusion can't mask
 a failure. Each case asserts which child body actually ran, not only the
@@ -469,6 +511,107 @@ Full reviews: `docs/reviews/doc67/codex-r1.md`,
 | A null proven stub must fall back; `proven` means written | antigravity S4 | accepted: §6 |
 | P1 is not inert; `step_down` includes zero and NaN; the rowless path uses the staged target | codex nits | accepted: status list, §4.1, §6 |
 | More target consumers: re-arm and invalidation compare against the target | codex answer (6) | accepted: §6 list |
+
+## 11. P0 findings (2026-10-21)
+
+### 11.1 The dry run
+
+`--jit-stats`, all `@bench` programs, `--trace --jit-native`. Each cell is
+eligible / published arms / funnel runs; rows that arm nothing are left
+out.
+
+| bench | link_terminal | loop_done_linked | region_bridge | sibling_handoff |
+|---|---|---|---|---|
+| nsieve | 0/3/7 | 0/1/1 | 2/2/2 | 1/1/1 |
+| nsieve-bit | 0/3/7 | 0/1/1 | 2/2/2 | – |
+| nsieve-bit-fp | 0/15/11965 | – | – | 1/2/2 |
+| sieve_int | 0/3/3 | 0/1/1 | 1/1/1 | – |
+| scimark-fft | 0/8/1014 | 0/2/3 | – | 0/1/1 |
+| scimark-lu | 0/2/6655 | 0/2/2 | – | – |
+| scimark-sor | 0/2/1015 | 0/2/2 | – | – |
+| scimark-sparse | 0/2/10 | 0/1/1 | – | 1/1/1 |
+| spectral-norm | 0/3/3 | 0/2/2 | – | 0/1/1 |
+| nbody | 0/1/1 | 0/1/1 | – | – |
+| grid_matmul, grid_matmul_f64 | 0/3/222 each | 0/3/3 each | – | – |
+| euler14-bit, recursive-fib | – | – | – | 1/1/1 each |
+| str_gmatch | – | – | – | 3/3/3 |
+| while_shortcircuit_probe | 0/1/5 | – | – | – |
+
+Region bridges (5/5) and sibling handoffs (8/12) prove. Those parents are
+loop pages that load the slots their children check. The hot hops,
+`link_terminal` (0/53) and `loop_done_linked` (0/20), prove nothing.
+
+The `proven-miss:` probe sorts the 66 misses:
+
+| arm kind | child seeds | every unproven fact on a slot the parent never mentions | none on such a slot | both |
+|---|---|---|---|---|
+| link_terminal | 23 | 8 | 6 | 14 |
+| loop_done_linked | 6 | 13 | 0 | 0 |
+| sibling_handoff | 2 | 1 | 0 | 0 |
+
+Two shapes account for the misses:
+- **Pass-through slots.** nsieve's continuation (`count = count + 1`,
+  the outer `for`) links to the inner `for k` root, which checks
+  `tag(0, heap_ref)` for `p`. The continuation never loads `p`, so its
+  entry facts say nothing about slot 0, and it can't pass on what the
+  root proved one hop earlier. The same happens the other way: the root's
+  loop-done exit can't prove `tag(1, float)` for `m`, which only the
+  continuation reads. A page's checked entry is open to the dispatcher,
+  so its only static facts are the ones it checks itself. §5.1's transfer
+  is sound, but on these shapes it has nothing to transfer.
+- **Values the parent computed and guarded.** nsieve's continuation
+  writes the inner loop's step `i` into slot 9; the root checks
+  `step_up(9)`. The continuation's own guards already establish that
+  about the value it writes, but `gen(e)` (§5.2) only yields `tag` and
+  `exact` facts. scimark-sparse's `nov(17, 18)` is the same.
+
+### 11.2 Cost (`zig build bench-facts`)
+
+One-shot pages with S slots, each loaded, checked and written, plus a
+hoisted `nov` per slot pair. Best of 50, ReleaseFast:
+
+| slots | instrs | proveKinds + analyze | build | proves | facts | bytes |
+|---|---|---|---|---|---|---|
+| 8 | 29 | 1.1 µs | 0.6 µs | 0.0 µs | 32 | 544 |
+| 128 | 449 | 27.7 µs | 8.3 µs | 0.5 µs | 512 | 8,224 |
+| 400 | 1,401 | 179.7 µs | 30.9 µs | 1.8 µs | 1,600 | 25,632 |
+| 560 | 1,961 | 310.6 µs | 42.7 µs | 2.6 µs | 2,240 | 35,872 |
+
+Linear in slots; a page at the recorder's 2,000-instruction cap fits the
+budget. On the benches, tables total 1–7 KB per program.
+
+### 11.3 Questions for Bart
+
+- **Q5 — pass-through slots.** Options:
+  - **(a) Residual-check entry.** At arm time, build a small stub per
+    arm, like doc 56's exit adapters. It runs only the child checks the
+    parent exit does not prove, then jumps to `proven`; a failure goes to
+    the child's `prologue_fail`. Covers every arm kind and every miss
+    shape, and still pays the unproven checks on each hop. Costs an arena
+    stub per arm, a third target kind for every consumer in §6, and the
+    stub's lifecycle on disarm and retirement.
+  - **(b) Import the link target's needs.** When a page with a `.link`
+    terminal compiles, it adds its (already compiled) target's entry
+    facts on slots it neither loads nor writes to its own prologue, so
+    they pass through. Static and cheap. It covers `.link` hops only: a
+    loop root compiles before its continuation, so root → continuation
+    stays checked, about half the hops. A dispatcher entry into the page
+    checks a few more slots and refuses where the target would have
+    refused one hop later.
+  - **(c) (b), plus a recompile of the root** with the continuation's
+    needs once the continuation compiles. Covers both hops, at the cost
+    of a recompile per root and the churn that goes with it.
+  - **(d) Stop here.** Keep P0's refactor and counters and park P1–P3,
+    since the static design moves none of the hot hops.
+- **Q6 — seeded children.** Seeds write only seeded slots. A seeded page
+  could check its unseeded slots first, bind `proven`, and then run the
+  seed and check the seeded slots. A proven entry would then skip the
+  unseeded checks and still seed. Lift the exclusion that way, or keep
+  it?
+- **Q7 — guard-derived facts.** Let `gen(e)` also produce `step_up`,
+  `step_down` and `nov` (and doc 57 pins) for a write whose ref the parent
+  guarded before the exit, in the same activation. Sound for the same
+  reason the guard is. Add it?
 
 ## References
 

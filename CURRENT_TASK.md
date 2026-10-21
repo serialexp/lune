@@ -219,6 +219,23 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     proven-fact link entry, Lua 5.4 iteration count). Bart picked the
     proven-fact link entry. Doc 67 rev 1 is written; waiting on its Q1–Q4.
     Shadow tree `/tmp/stepexp` holds the unsound experiments.
+  - Doc 67: Bart answered Q1–Q4. Rev 2 folds in round-1 review (codex,
+    antigravity). P0 landed 2026-10-21, with no codegen change
+    (`--dump-native` matches the previous commit on every `@bench` once
+    addresses are masked; `setarch -R` plus masking `movabs` imm64s).
+    It adds:
+    - `nativegen_boundary.zig`: the slab checks and writes of a page,
+      described once. The prologue and every exit flush emit through it.
+    - `nativegen_facts.zig`: the fact algebra and `PageFacts`.
+    - `nativegen_factbuild.zig`: `CompiledTrace.facts`.
+    - The dry-run counters in `--jit-stats`, the `proven-miss:` probe,
+      and `zig build bench-facts`.
+    Gates green: just test, jit-debug test, wasm, hashgate 99/99 on both
+    legs, embed-test, viz 84.
+  - The dry run's finding (doc 67 §11): the static tables prove 0/53
+    `link_terminal` and 0/20 `loop_done_linked` arms. Most misses are
+    pass-through slots (the parent never touches them) or seeded
+    children. Waiting on Bart's Q5–Q7 (doc 67 §11.3) before P1.
 
 LINE LOOKUP FIX (2026-10-11, coral-marten): LANDED in `49fd572`, bundled with amber-badger's doc 61 Phase K.
 - Bug from TODO.md "Every located runtime error rescans the source for

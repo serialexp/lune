@@ -56,6 +56,7 @@ const isNumKind = prove.isNumKind;
 const operandReads = prove.operandReads;
 
 const ngalloc = @import("nativegen_alloc.zig");
+const boundary = @import("nativegen_boundary.zig");
 const Alloc = ngalloc.Alloc;
 const SlotInfo = ngalloc.SlotInfo;
 const Place = ngalloc.Place;
@@ -506,19 +507,7 @@ pub fn flushBoxedSlot(a: *x64.Assembler, dst_slot: i32, tag_spill: u32, payload:
 }
 
 pub fn flushSlot(a: *x64.Assembler, slot: i32, kind: Kind, payload: Place) !void {
-    std.debug.assert(kind != .boxed);
-    const tag: u8 = switch (kind) {
-        .nil => @intFromEnum(value.Tag.nil),
-        .bool => TAG_BOOL,
-        .float => TAG_FLOAT,
-        // `.ptr` (invariant table), `.heap` (per-iteration table — a carried-heap
-        // slot's current value or a write-only VALUE_LANE aload result), and
-        // `.func` (a guard_func-covered closure, flushed by a head trace's φ
-        // writeback — doc 44) all hold a raw *GcHeader payload and re-box as a
-        // heap ref.
-        .ptr, .heap, .func => TAG_HEAP,
-        else => TAG_INT,
-    };
+    const tag = boundary.flushTag(kind);
     const poff: i32 = slot * 8;
     try a.movByteMemImm(.rdi, slot, tag);
     switch (payload) {
@@ -2492,14 +2481,22 @@ pub fn emitGStore(a: *x64.Assembler, t: *const Trace, alloc: *const Alloc, ins: 
     a.bind(done);
 }
 
-pub fn emitPhiValueFlush(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, p: trace.IrInstr) !void {
-    const ref: usize = @intCast(p.b);
-    const kind = kinds[ref];
-    if (kind == .boxed) {
-        try flushBoxedSlot(a, @as(i32, @intCast(p.aux)), try boxedTagSpill(t, kinds, alloc, ref), placeOfRef(alloc, ref));
-    } else {
-        try flushSlot(a, @as(i32, @intCast(p.aux)), kind, placeOfRef(alloc, ref));
-    }
+/// Doc 67 §5.2: emit the slab writes `boundary.forEachExitWrite` lists for
+/// exit `exit_instr` of shape `shape` — the fact builder reads the same list.
+pub fn emitExitWrites(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, shape: boundary.ExitShape, exit_instr: usize) !void {
+    const Sink = struct {
+        a: *x64.Assembler,
+        t: *const Trace,
+        kinds: []const Kind,
+        alloc: *const Alloc,
+
+        pub fn write(self: @This(), w: boundary.Write) !void {
+            if (w.kind == .boxed) {
+                try flushBoxedSlot(self.a, @as(i32, w.slot), try boxedTagSpill(self.t, self.kinds, self.alloc, w.ref.?), w.place);
+            } else try flushSlot(self.a, @as(i32, w.slot), w.kind, w.place);
+        }
+    };
+    try boundary.forEachExitWrite(t, kinds, alloc, shape, exit_instr, Sink{ .a = a, .t = t, .kinds = kinds, .alloc = alloc });
 }
 
 pub fn emitLinkedLoopDoneSnapshot(
@@ -2533,40 +2530,17 @@ pub fn emitLinkedLoopDoneSnapshot(
         }
     }
 
-    const guard = t.instrs[exit_instr];
-    const for_ins = t.anchor.proto.code[trace.guardSourcePc(guard).?];
-    const visible_var_slot: i32 = @as(i32, @intCast(for_ins.a)) + 3;
-    for (t.instrs) |p| {
-        if (p.op != .phi or p.aux == trace.PHI_INTERNAL) continue;
-        if (p.aux == visible_var_slot) continue;
-        try emitPhiValueFlush(a, t, kinds, alloc, p);
-    }
+    // The visible loop variable is skipped: the loop-done exit resumes past it.
+    try emitExitWrites(a, t, kinds, alloc, .loop_done_linked, exit_instr);
 }
 
-/// The carried-home write-back a coarse exit owes the slab. A `.loop` trace
-/// keeps each carried slot in its home across local iterations, so until an
-/// exit re-boxes it the slab still holds the trace-entry value. `bridge_exit`
-/// names an armed composite bridge's guard: the slots its set E commits are
-/// skipped, since E overwrites them anyway.
-pub fn emitCarriedHomesFlush(a: *x64.Assembler, t: *const Trace, alloc: *const Alloc, bridge_exit: ?usize) !void {
-    for (alloc.slots) |s| {
-        if (s.class != .carried) continue;
-        // Boxed pass-through traces are one-shot. Before their terminal commit the
-        // VM slot is still the entry Value byte-for-byte, so a guard exit must not
-        // flush a typed approximation (or write anything at all).
-        if (s.kind == .boxed) continue;
-        if (bridge_exit) |ei| if (t.bridgeEmitsSlot(ei, s.slot)) continue;
-        // Re-box the carried home with its kind's tag: int homes write TAG_INT from a
-        // GP reg / spill cell; a float home writes TAG_FLOAT + `movsd` from its XMM
-        // (a register-homed float can't go through `movMemReg`). flushSlot dispatches.
-        // Doc 39: a steady-φ slot re-boxes from the internal φ's computed home with
-        // the STEADY kind — the entry home is stale after the run-once region.
-        if (s.steady_phi >= 0) {
-            try flushSlot(a, @as(i32, s.slot), s.steady_kind, placeOfRef(alloc, @intCast(s.steady_phi)));
-        } else {
-            try flushSlot(a, @as(i32, s.slot), s.kind, slotHomePlace(s));
-        }
-    }
+/// The carried-home write-back a coarse exit owes the slab
+/// (`boundary.ExitShape.carried`). Re-boxes each carried home with its
+/// kind's tag: int homes write TAG_INT from a GP reg / spill cell; a float
+/// home writes TAG_FLOAT + `movsd` from its XMM (a register-homed float
+/// can't go through `movMemReg`). flushSlot dispatches.
+pub fn emitCarriedHomesFlush(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc: *const Alloc) !void {
+    try emitExitWrites(a, t, kinds, alloc, .carried, 0);
 }
 
 /// Part A-v (doc 17 §A2.1): materialize the guest state at the bridge's guard.
@@ -2586,9 +2560,5 @@ pub fn emitCompositeBridgeSnapshot(
     alloc: *const Alloc,
     exit_instr: usize,
 ) !void {
-    try emitCarriedHomesFlush(a, t, alloc, exit_instr);
-    var emitted = t.bridgeEmissions(exit_instr);
-    while (emitted.next()) |p| {
-        try emitPhiValueFlush(a, t, kinds, alloc, p);
-    }
+    try emitExitWrites(a, t, kinds, alloc, .region_bridge, exit_instr);
 }
