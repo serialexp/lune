@@ -11,7 +11,7 @@ import { test, expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { decodeTraceFile } from "../src/decode";
-import { traceToView, traceToText } from "../src/disasm";
+import { traceToView, traceToText, operandTokens } from "../src/disasm";
 import { irOpName } from "../src/enums";
 
 const fixturePath = fileURLToPath(new URL("../fixtures/counting-loop.mahinatrace", import.meta.url));
@@ -22,6 +22,19 @@ test("decodes the fixture header + trace count", () => {
   expect(file.version).toBe(5); // v5: traces carry their stable Trace.id (exec logs join on it)
   expect(file.traces.length).toBe(1);
   expect(file.traces[0].id).toBe(0); // the first trace minted in the run
+});
+
+test("operand columns split into text and %N references", () => {
+  expect(operandTokens("%10  %1")).toEqual([{ ref: 10 }, { text: "  " }, { ref: 1 }]);
+  expect(operandTokens("init=%3 update=%12 -> internal")).toEqual([
+    { text: "init=" },
+    { ref: 3 },
+    { text: " update=" },
+    { ref: 12 },
+    { text: " -> internal" },
+  ]);
+  expect(operandTokens("r4")).toEqual([{ text: "r4" }]);
+  expect(operandTokens("")).toEqual([]);
 });
 
 test("a file that isn't a .mahinatrace fails with a reason", () => {

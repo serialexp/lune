@@ -81,6 +81,25 @@ function operandsOf(opName: string, a: number, b: number, aux: number): string {
   return `%${a}  %${b}`;
 }
 
+/** One piece of a rendered operand column: plain text, or an SSA reference
+ *  (`%N`) the IR view links to the row that defines it. */
+export type OperandToken = { text: string } | { ref: number };
+
+/** Split an operand column (`operandsOf`'s text) into text and `%N` refs, in
+ *  order. Pure. */
+export function operandTokens(operands: string): OperandToken[] {
+  const out: OperandToken[] = [];
+  const re = /%(\d+)/g;
+  let last = 0;
+  for (let m = re.exec(operands); m !== null; m = re.exec(operands)) {
+    if (m.index > last) out.push({ text: operands.slice(last, m.index) });
+    out.push({ ref: Number(m[1]) });
+    last = m.index + m[0].length;
+  }
+  if (last < operands.length) out.push({ text: operands.slice(last) });
+  return out;
+}
+
 /** Decode a byte-string const to a printable form (ASCII as-is, else `\xNN`). */
 export function bytesToDisplay(bytes: number[]): string {
   let out = "";

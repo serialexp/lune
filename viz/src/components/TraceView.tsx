@@ -15,6 +15,7 @@ import {
   stepTraceExec,
 } from "../store";
 import { ExecEventKind, formatExecValue, exitKindLabel } from "../exec";
+import { operandTokens } from "../disasm";
 
 /** Milliseconds between auto-advance steps while playing (matches ReplayPanel). */
 const PLAY_INTERVAL_MS = 220;
@@ -22,6 +23,20 @@ const PLAY_INTERVAL_MS = 220;
 export default function TraceView() {
   const trace = selectedTrace;
   const [playing, setPlaying] = createSignal(false);
+
+  // `%N` operand links: hovering one marks the row defining %N, clicking one
+  // scrolls to that row and flashes it. Local view state, like `playing`.
+  const [hoverRef, setHoverRef] = createSignal(-1);
+  const [flashRef, setFlashRef] = createSignal(-1);
+  const rowEls: HTMLTableRowElement[] = [];
+  let flashTimer: ReturnType<typeof setTimeout> | undefined;
+  const goToRef = (ref: number) => {
+    rowEls[ref]?.scrollIntoView({ block: "center", behavior: "smooth" });
+    setFlashRef(ref);
+    clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => setFlashRef(-1), 1200);
+  };
+  onCleanup(() => clearTimeout(flashTimer));
 
   const steps = () => traceExecSteps();
   const hasAnim = () => steps().length > 0;
@@ -209,16 +224,41 @@ export default function TraceView() {
                   const isCurrent = () => hasAnim() && i() === curRef();
                   return (
                     <tr
+                      id={`ir-${i()}`}
                       classList={{
                         guard: ins.op.startsWith("guard"),
                         "ir-current": isCurrent() && !isExit(),
                         "ir-exit": isCurrent() && isExit(),
+                        // A row's position is its SSA number (`ins.index` is the padded text).
+                        "ir-ref-target": hoverRef() === i() || flashRef() === i(),
                       }}
-                      ref={(el) => { if (isCurrent()) currentRow = el; }}
+                      ref={(el) => {
+                        if (isCurrent()) currentRow = el;
+                        rowEls[i()] = el;
+                      }}
                     >
                       <td class="idx">%{ins.index}</td>
                       <td class="op">{ins.op}</td>
-                      <td class="operands">{ins.operands}</td>
+                      <td class="operands">
+                        <For each={operandTokens(ins.operands)}>
+                          {(tok) =>
+                            "ref" in tok ? (
+                              <a
+                                href={`#ir-${tok.ref}`}
+                                class="ir-ref"
+                                title={`go to %${tok.ref}'s definition`}
+                                onMouseEnter={() => setHoverRef(tok.ref)}
+                                onMouseLeave={() => setHoverRef(-1)}
+                                onClick={(e) => { e.preventDefault(); goToRef(tok.ref); }}
+                              >
+                                %{tok.ref}
+                              </a>
+                            ) : (
+                              tok.text
+                            )
+                          }
+                        </For>
+                      </td>
                       <td class="ty">{ins.ty}</td>
                       <td class="snap">{ins.op.startsWith("guard") ? ins.snap : ""}</td>
                     </tr>

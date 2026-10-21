@@ -274,6 +274,20 @@ table.ir tr.ir-current .idx {
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
+/* `%N` operand links, and the row they point at (on hover, and flashed after
+   a click jumps there). */
+table.ir a.ir-ref {
+  color: inherit;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+table.ir a.ir-ref:hover {
+  color: var(--accent);
+}
+table.ir tr.ir-ref-target td {
+  background: #e0af6826;
+}
+
 /* The side-exit ("exit ramp") — the dramatic deopt back to tier-0, in the
    guard amber/red register. */
 table.ir tr.ir-exit td {
