@@ -104,9 +104,11 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
   - item 3 (`opCompare`, `opEqNe`, `opModIdiv` and their slow halves);
   - their tests and doc 62.
   All five gates were green, and viz was 72/72.
-- Next: item 4, the bytecode forms (constant operands, fused
-  compare+branch, `ITERN`), which needs a design doc. Then item 5
-  (call/return) and item 6 (dispatch prologue, doc 42 §4.2).
+- Item 4 (bytecode forms) is drafted as doc 66
+  (`docs/design/66-bytecode-forms.md`), waiting on Bart's Q1–Q5. The
+  probes are `/tmp/t0micro/ops3.lua` and `opsmeasure3.sh` (`P=`
+  overridable). Then item 5 (call/return) and item 6 (dispatch
+  prologue, doc 42 §4.2).
 - For Bart, still open: the integer `for` overflow wrap, `next`'s zero
   results, the zero `for` step, and continuation step-constant
   inheritance (all in TODO).

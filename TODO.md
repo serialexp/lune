@@ -141,7 +141,11 @@ because AMD skid misattributes across tail jumps). Against LuaJIT
       is `lt` into a register + `jmp_if_false`. Each extra op pays the
       ~18-instruction dispatch prologue plus a register round trip.
       Marginal costs (mahina vs LuaJIT): `<` 171/32, `==` 181/38,
-      `- k` 100/15, `if a < b` 205/32.
+      `- k` 100/15, `if a < b` 205/32. Design: doc 66
+      (`docs/design/66-bytecode-forms.md`, draft 2026-10-21). After items
+      1–3 the gap is mostly op count: one op is a ~25-instruction floor,
+      and a `pairs` step is 459 against LuaJIT's 17. Q1–Q5 are open for
+      Bart.
 - [x] **Constant-key field access has no per-site hint.** `t.x` read
       272/42, `t.x = v` 328/45, a method call `o:get()` ~1250 total.
       Globals already have doc 62's slot hints and are at parity (32/30).
