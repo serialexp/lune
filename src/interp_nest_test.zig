@@ -51,7 +51,7 @@ test "doc 64 steps 1-2: the `for k` region closes when its loop ends, and since 
     // Doc 64 §11's finding. The `for k` loop's cross-trace cycle is a region
     // owned by its header. Each activation is one whole `for k` loop, and it
     // closes when tier-0 reaches the code after the loop (a `departure`
-    // close): the loop finished. Before step 2, the `while` exit's chains
+    // close, `loop_exit` since step 4): the loop finished. Before step 2, the `while` exit's chains
     // that ended at the `for k` loop-done guard counted as misses, the exit
     // gave up and lost its arm, the activations stopped filling a window,
     // and region decay gated the owner for good (754 gates, `max_strikes`
@@ -90,10 +90,11 @@ test "doc 64 steps 1-2: the `for k` region closes when its loop ends, and since 
             try testing.expect(ts.dispatch_gates.get(.region_decay) <= 1);
             try testing.expectEqual(@as(u64, 0), ts.dispatch_gates.get(.legacy_thrash));
             // Region activations end because a loop finished, not because a
-            // receipt left the region.
+            // receipt left the region. Since step 4 those closes have their
+            // own reason (`loop_exit`, doc 64 §14).
             const closes = ts.region_closes;
-            try testing.expect(closes.get(.departure) >= 5000);
-            try testing.expect(closes.get(.departure) > 4 * closes.get(.source_outside));
+            try testing.expect(closes.get(.loop_exit) >= 5000);
+            try testing.expect(closes.get(.loop_exit) > 4 * closes.get(.source_outside));
         }
     };
     try util.runCapturedTuned(gpa, nsieve_bit_fp_src, &sink, false, .record_execute_native, .{
@@ -169,6 +170,88 @@ test "doc 64 step 3: a loop root committed behind a marker takes over the exit a
         .inspect = Inspect.run,
     });
     try testing.expectEqualStrings("79980000\n", sink.buffered());
+}
+
+/// The vendored nsieve-bit-fp bench whole, at N = 4 (only the output line is
+/// simplified): three `nsieve` calls (m = 160000, 80000, 40000) sharing one
+/// array. N <= 3 does not lose the `while` exit's arm (doc 64 §14).
+const nsieve_bit_fp_calls_src =
+    \\local floor, ceil = math.floor, math.ceil
+    \\local precision = 50
+    \\local onebits = (2^precision)-1
+    \\local function nsieve(p, m)
+    \\  local cm = ceil(m/precision)
+    \\  do local onebits = onebits; for i=0,cm do p[i] = onebits end end
+    \\  local count, idx, bit = 0, 2, 2
+    \\  for i=2,m do
+    \\    local r = p[idx] / bit
+    \\    if r - floor(r) >= 0.5 then
+    \\      local kidx, kbit = idx, bit
+    \\      for k=i+i,m,i do
+    \\        kidx = kidx + i
+    \\        while kidx >= cm do kidx = kidx - cm; kbit = kbit + kbit end
+    \\        local x = p[kidx]
+    \\        local r = x / kbit
+    \\        if r - floor(r) >= 0.5 then p[kidx] = x - kbit*0.5 end
+    \\      end
+    \\      count = count + 1
+    \\    end
+    \\    idx = idx + 1
+    \\    if idx >= cm then idx = 0; bit = bit + bit end
+    \\  end
+    \\  return count
+    \\end
+    \\local primes = {}
+    \\for i=0,2 do
+    \\  local m = (2^(4-i))*10000
+    \\  print(nsieve(primes, m))
+    \\end
+;
+
+test "doc 64 step 4: a `for k` activation that ends because its loop finished never strikes its owner" {
+    // Doc 64 §14 (1e). In the second call the `while` exit gives up (§12:
+    // the re-initialised array flips the post-`while` branch), the `for k`
+    // cycle loses that arm, and its activations end at the `for k` loop's
+    // own exit after fewer than `min_useful` traversals. Before 1e each such
+    // close struck the owner: 7 strikes saturated the penalty and every
+    // later one gated the `for k` header and tore down all links (3,089
+    // gates). Now a close past the owner loop's static extent, in the
+    // activation's own frame, is a `loop_exit`: neutral when short.
+    const gpa = testing.allocator;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            _ = mode;
+            const ts = &vm.trace;
+            try testing.expect(ts.exit_side_giveups >= 1); // the arm is lost, as before
+            try testing.expect(ts.region_closes.get(.loop_exit) >= 1000);
+            // Not every departure: one inside the loop (tier-0 at the
+            // post-`while` body, a coverage gap) stays a `.departure`.
+            try testing.expect(ts.region_closes.get(.departure) >= 1000);
+            try testing.expectEqual(@as(u64, 0), ts.dispatch_gates.get(.legacy_thrash));
+            // The `for k` header (the numeric `for` nested in another's body)
+            // is never struck.
+            var it = ts.gate.iterator();
+            while (it.next()) |g| {
+                const proto = g.key_ptr.proto;
+                const pc = g.key_ptr.pc;
+                if (pc == 0 or pc > proto.code.len or proto.code[pc - 1].op != .for_prep) continue;
+                const ext = bytecode.loopExtentFor(proto, pc) orelse continue;
+                var nested = false;
+                for (proto.code, 0..) |ins, q| if (ins.op == .for_loop and q > ext.end) {
+                    const h = bytecode.loopHeaderOf(ins, @intCast(q)) orelse continue;
+                    if (h < ext.start) nested = true;
+                };
+                if (nested) try testing.expectEqual(@as(@TypeOf(g.value_ptr.strikes), 0), g.value_ptr.strikes);
+            }
+        }
+    };
+    try util.runCapturedTuned(gpa, nsieve_bit_fp_calls_src, &sink, false, .record_execute_native, .{
+        .hotloop = (trace.TraceConfig{}).hotloop,
+        .inspect = Inspect.run,
+    });
+    try testing.expectEqualStrings("14683\n7837\n4203\n", sink.buffered());
 }
 
 test "doc 64 step 2: natural stops never give an exit up; misfits do, and the next .link commit at P revives it" {

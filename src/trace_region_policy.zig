@@ -22,6 +22,7 @@ pub const RegionPolicy = struct {
     pub const refreshActCache = observer.refreshActCache;
     pub const observeFast = observer.observeFast;
     pub const nextDeparture = observer.nextDeparture;
+    pub const departureIsLoopExit = observer.departureIsLoopExit;
 
     /// Pure ephemeral structural-edge cache (doc 17 §A3.3 / §A8-ii, A-ii.2):
     /// `{Trace.id, exit_instr} → StructuralEdgeId`. Rebuilt WHOLESALE from the current
@@ -235,9 +236,12 @@ pub const RegionPolicy = struct {
         return key;
     }
     pub const Close = struct { work: u64, window: WindowDecision };
-    pub fn beginClose(self: *RegionPolicy, key: RegionKey, min_useful: u64) ?Close {
+    pub fn beginClose(self: *RegionPolicy, key: RegionKey, min_useful: u64, why: region.CloseReason) ?Close {
         const accum = self.region_profit.get(key) orelse return null;
         const work = accum.outer_traversals - accum.window_base;
+        // Doc 64 step 4 (1e): the owner loop finished. A short remainder is
+        // the region analogue of an exit-side natural stop: neutral.
+        if (why == .loop_exit and work < min_useful) return .{ .work = work, .window = .none };
         // Doc 55 §2: a remainder is low-yield evidence only for an activation
         // that never filled a window. After at least one full useful window the
         // remainder is the activation's TAIL: fft's middle loop runs 2^k − 1
@@ -384,7 +388,15 @@ pub const RegionPolicy = struct {
         for (staged.staged_defs.items) |s| self.region_defs.putAssumeCapacity(s.id, s.def);
         staged.staged_defs.clearRetainingCapacity();
         for (staged.staged_owner_updates.items) |u| {
-            if (self.region_defs.getPtr(u.id)) |d| d.owner = u.owner;
+            if (self.region_defs.getPtr(u.id)) |d| {
+                d.owner = u.owner;
+                d.owner_loop = u.owner_loop;
+            }
+            // The observer's copy follows a moved owner (its member spans
+            // cannot change: same id, same edges).
+            if (self.observer_fast) |*f| {
+                if (f.key.region_id == u.id) f.owner_loop = u.owner_loop;
+            }
         }
         for (staged.staged_armable_updates.items) |u| {
             if (self.region_defs.getPtr(u.id)) |d| {
@@ -534,6 +546,7 @@ pub const RegionPolicy = struct {
             .root_frame_depth = entry.value_ptr.root_frame_depth,
             .root_call_seq = entry.value_ptr.root_call_seq,
             .spans = spans,
+            .owner_loop = def.owner_loop,
         };
     }
 
@@ -585,6 +598,33 @@ fn testDefinition(owner: types.AnchorKey) RegionDef {
     return .{ .members = &.{}, .member_points = &.{}, .owner = owner, .classifier = .{ .kind = .self_loop, .member_count = 1 }, .armable = true };
 }
 
+test "policy: a short activation strikes on departure, but its owner loop's exit is neutral (doc 64 step 4, 1e)" {
+    const gpa = std.testing.allocator;
+    var policy: RegionPolicy = .{};
+    defer policy.deinit(gpa);
+    var proto: @import("bytecode.zig").Proto = undefined; // identity only; never dereferenced
+    const owner: types.AnchorKey = .{ .proto = &proto, .pc = 5, .proto_id = proto.id };
+    const id: RegionId = @enumFromInt(1);
+    try policy.region_defs.put(gpa, id, testDefinition(owner));
+    for ([_]region.CloseReason{ .departure, .loop_exit }, 0..) |why, i| {
+        const key = policy.openRegion(gpa, id, .{ .depth = 1, .call_seq = 7 + i }).?;
+        RegionPolicy.beginCredit(policy.region_profit.getPtr(key).?, 3);
+        const close = policy.beginClose(key, 4, why).?;
+        try std.testing.expectEqual(@as(u64, 3), close.work);
+        switch (why) {
+            .departure => try std.testing.expectEqual(RegionPolicy.WindowDecision{ .strike = owner }, close.window),
+            else => try std.testing.expect(close.window == .none),
+        }
+        policy.finishClose(gpa, key);
+    }
+    // A full window still recovers on a loop exit: only the short remainder
+    // changes meaning.
+    const key = policy.openRegion(gpa, id, .{ .depth = 1, .call_seq = 9 }).?;
+    RegionPolicy.beginCredit(policy.region_profit.getPtr(key).?, 6);
+    try std.testing.expectEqual(RegionPolicy.WindowDecision{ .recover = owner }, policy.beginClose(key, 4, .loop_exit).?.window);
+    policy.finishClose(gpa, key);
+}
+
 test "policy receipt consumed bit exclusively selects regional or legacy pricing" {
     var policy: RegionPolicy = .{};
     defer policy.deinit(std.testing.allocator);
@@ -629,7 +669,7 @@ test "policy source and destination request close before replacement opens" {
     try std.testing.expectEqual(initial, policy.chooseSource(gpa, &.{second}, ctx, &cursor).close.key);
     try std.testing.expectEqual(initial, policy.activeRegionFor(ctx.call_seq).?);
     try std.testing.expectEqual(@as(u32, 1), policy.region_profit.count());
-    _ = policy.beginClose(initial, 4).?;
+    _ = policy.beginClose(initial, 4, .direct).?;
     policy.finishClose(gpa, initial);
     const replacement = policy.chooseSource(gpa, &.{second}, ctx, &cursor).done.?;
     try std.testing.expectEqual(second, replacement.region_id);

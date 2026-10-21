@@ -89,7 +89,7 @@ pub fn buildEdges(gpa: std.mem.Allocator, view: View) !EdgeMap {
 pub const StagedIntern = struct { edges: []StructuralEdgeId, id: RegionId };
 pub const StagedDef = struct { id: RegionId, def: RegionDef };
 pub const StagedBridgeUpdate = struct { id: RegionId, bridges: []RegionBridgeDef };
-pub const StagedOwnerUpdate = struct { id: RegionId, owner: AnchorKey };
+pub const StagedOwnerUpdate = struct { id: RegionId, owner: AnchorKey, owner_loop: ?region.OwnerLoop };
 pub const StagedArmableUpdate = struct {
     id: RegionId,
     armable: bool,

@@ -386,7 +386,7 @@ pub fn closeRegionBecause(self: *TraceState, key: RegionKey, why: CloseReason) v
     // so neither the observer nor an activation drop can pick one; every
     // other caller starts from a trace run, a commit or the ledger.
     std.debug.assert(!self.suspended());
-    const close = self.region_policy.beginClose(key, self.config.min_useful) orelse return;
+    const close = self.region_policy.beginClose(key, self.config.min_useful, why) orelse return;
     self.region_closes.getPtr(why).* +|= 1;
     self.dbg("region: close rid={d} activation={d} work={d} why={t}", .{ @intFromEnum(key.region_id), key.activation, close.work, why });
     applyWindowDecision(self, key, close.work, close.window);
@@ -1567,9 +1567,13 @@ pub inline fn observeFast(self: *TraceState, proto_id: u32, pc: u32, depth: u32,
 /// membership no longer contains this tier-0 departure point. No allocation;
 /// the common empty-map path is one count test.
 pub fn observeRegionProgramPoint(self: *TraceState, proto_id: u32, pc: u32, depth: u32, call_seq: u64) void {
-    while (self.region_policy.nextDeparture(.{ .proto_id = proto_id, .source_pc = pc }, .{ .depth = depth, .call_seq = call_seq })) |key| {
-        self.dbg("close-reason: departure rid={d} pc={d} depth={d}", .{ @intFromEnum(key.region_id), pc, depth });
-        closeRegionBecause(self, key, .departure);
+    const point: ProgramPoint = .{ .proto_id = proto_id, .source_pc = pc };
+    const ctx: RegionContext = .{ .depth = depth, .call_seq = call_seq };
+    while (self.region_policy.nextDeparture(point, ctx)) |key| {
+        // Doc 64 step 4 (1e): leaving the owner loop is its own reason.
+        const why: CloseReason = if (self.region_policy.departureIsLoopExit(key, point, ctx)) .loop_exit else .departure;
+        self.dbg("close-reason: {t} rid={d} pc={d} depth={d}", .{ why, @intFromEnum(key.region_id), pc, depth });
+        closeRegionBecause(self, key, why);
     }
 }
 

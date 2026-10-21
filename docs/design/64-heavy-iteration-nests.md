@@ -2,8 +2,8 @@
 
 Status: **reviewed (round 1, §9), decided (§10); step 1 (diagnosis)
 done (§11), which corrects §3 P1; step 2 (typed chain outcome, 2b, 2d)
-built (§12); step 3 (3b, the marker root) built (§13). Next: step 4
-(re-profile; 1e and/or 2c).**
+built (§12); step 3 (3b, the marker root) built (§13); step 4
+(re-profile, 1e) built (§14). Next: step 5 (1d).**
 Bart asked for this doc and for Codex's and Antigravity's opinions
 before picking options. Corrections from the reviews are applied in
 place and listed in §9. Where the reviewers disagreed, Bart asked me to
@@ -795,7 +795,11 @@ program, `--jit-native`, outputs identical):
 
 Cycles (three interleaved `perf stat` pairs, loadavg ~1.1):
 nsieve-bit-fp 995.8M → 832.7M (−16.4%), fft median 603.1M → 449.7M
-(−25.4%).
+(−25.4%). Board (pt-default, reps=5) on `10b8d59` against d40cf2d:
+nsieve-bit-fp JIT 270.4 → 228.2 ms (−15.6%; LuaJIT 21.2 ms, 10.7×; tier-0
+215.1, so the JIT is still slower than tier-0 on this row), fft 205.4 →
+168.6 ms (−17.9%). str_gmatch +2.3%, str_find_match +1.9% and tbl_ops +1.6%
+have unchanged instruction counts (≤ +0.01%), so those are noise.
 
 Two residuals are recorded, not hunted further:
 - **while_shortcircuit_probe's +5.4k.** It is constant across n
@@ -839,3 +843,126 @@ Two residuals are recorded, not hunted further:
   disabled.
 - The tier-1a repeat test and the R2 canonical-pick test now accept a
   root target.
+
+## 14. Step 4 result: the re-profile, and 1e (2026-10-21)
+
+**The re-profile** (`perf record -g`, ReleaseFast, `nsieve-bit-fp.lua 6`,
+patched machine, on `10b8d59`):
+
+| slice | share |
+|---|---|
+| region accounting (`accountRegionProfit` 12.0%, `refreshObserverFast`, the trampolines, `regionMemberPoint`, the `RegionKey` map) | 26.7% |
+| the rest of the seam (`replayLedgerFrom` 8.7%, `nativeSeedFn`, `detectPromotableSetMembers`, `promotedEdgeFromLink`, …) | 27.2% |
+| native `[JIT]` | 24.1% |
+| tier-0 ops | 16.4% |
+| `floor` | 4.2% |
+
+The step-3 debug log splits into three phases:
+
+| phase | receipts | silent sets | gates | arms |
+|---|---|---|---|---|
+| calls 1–2, before t7 e10's give-up | 64,395 | 1,301 | 6 | 20 |
+| call 2, after it | 10,456 | 744 | 4 | 45 |
+| call 3 (m = 160000, about 1/7 of the work) | 26,993 | 2 | 21,464 | 32,369 |
+
+Call 3 is the §13 turnstile. The `for k` cycle has lost the `while`
+arm, its activations end at the `for k` exit with work 6–7, 7 strikes
+saturate the owner's penalty, and from then on every short activation
+gates the owner, disarms every link and re-arms. The kernel alone (m =
+160000, one call) never gets there. It needs the earlier give-up.
+
+**Two throwaway experiments** (a shadow tree, against `10b8d59`, every
+`@bench` program, `--jit-native`, outputs identical):
+
+| | A: never give up (`tryside` = 255) | B: crude 1e (any short departure close is neutral) |
+|---|---|---|
+| nsieve-bit-fp | −7.56% | −7.40% |
+| nsieve | −2.09% | −2.41% |
+| euler14-bit | **−23.47%** | 0.00% |
+| str_manip | −3.24% | 0.00% |
+| repack_adversarial | +1.24% | +0.01% |
+| grid_matmul(_f64) | +0.07% | 0.00% |
+| `for k` gates (bench) | 0 | 0 |
+
+Either one removes the turnstile, from opposite ends: A keeps the arm,
+B stops striking the activations that lost it. A is not 2c (2c still
+counts failed recordings and failed prologues). But A says that exit-side
+give-ups also cost euler14-bit about a quarter of its instructions, an
+independent finding for TODO. Step 4 is 1e (§11). It is general (any
+short loop owner, no benchmark shape), and B shows it is clean on every
+other row.
+
+**1e as built.** B's form is too broad. A departure inside the owner
+loop's extent is a coverage gap (the region's membership missed a path),
+which is exactly what decay is for. So:
+- `CloseReason.loop_exit` is a departure in the activation's own frame
+  (its root depth and call), in the owner's proto, outside the owner
+  loop's static extent (`OwnerLoop.exitedAt`). Every earlier tier-0 point
+  of the activation was a member, or an in-loop departure would have
+  closed it first. So the loop finished, inside the region.
+- `beginClose`: a `loop_exit` close with work below `min_useful` neither
+  strikes nor recovers (the region analogue of step 2's natural stop). A
+  full window still recovers.
+- `RegionDef.owner_loop` is the owner's `loopExtentFor`, computed once
+  at election and moved with every owner update. `ObserverFast` carries
+  a copy (kept in step on an owner update).
+  `RegionPolicy.departureIsLoopExit` reads that copy for the
+  single-accumulator case and looks up the accumulator and def
+  otherwise. It runs once per departure, never on the per-instruction
+  survive path.
+
+**Cost of getting there.** The first build classified with its own
+`region_profit`/`region_defs` lookups plus `loopExtentFor` per close: +0.14%
+on repack_adversarial and +0.02–0.03% on fft, lu, sor, sparse and
+grid_matmul. Folding the verdict into `nextDeparture`'s return widened a
+per-instruction call's return value (still +0.12%). The final form keeps
+`nextDeparture` as it was. What remains is repack_adversarial at +0.05 to
++0.12% (it depends on the environment: the A/B script's bash run and an
+interactive run differ by 34k instructions in the base itself). That is
+about 67–167 instructions per close, against a close that itself flushes
+windows, demotes sets and refreshes the observer.
+
+**Result.** Full bench (`nsieve-bit-fp.lua 6`), step 3 against step 4:
+
+| | step 3 | step 4 |
+|---|---|---|
+| exit-side give-ups | t7 e10, t4 e27 | t7 e10 |
+| gates on pc 36 (`for k`): `region_decay` / `legacy_thrash` | 10,890 / 10,540 | 0 / 0 |
+| other gates | 18 + 15 + 6 | 15 (`region_decay`, pc 19) |
+| closes: `loop_exit` / `departure` / `source_outside` | — / 51,565 / 10,555 | 50,131 / 9,241 / 33 |
+| window strikes on pc 19 (outer loop) | 9,763 | 13,390 |
+
+Instructions (every `@bench`, outputs identical): nsieve-bit-fp −6.98%,
+nsieve −2.41%, repack_adversarial +0.12% (above), every other row within
+±0.01%. Cycles, median of five interleaved pairs (loadavg ~1.0):
+nsieve-bit-fp 837.0M → 821.3M (−1.9%), nsieve 59.58M → 56.81M (−4.6%). Most
+of the removed work was gate/disarm/re-arm bookkeeping, which is cheaper
+per instruction than the seam it leaves behind.
+
+**What remains, and 1a.** §10 step 4 allows corrected 1a "only if short
+productive activations remain". None strike now, so 1a is not built. Left
+over:
+- **The outer region's strikes** (owner 19, 13,390; mostly
+  `destination_outside`, 15 gates). This is §11's displacement: entering
+  the `for k` region closes the `for i` activation. It costs little in
+  gates. Its share of the seam is a question for after 1d.
+- **t7 e10's give-up** (2c territory, §12). A shows that not giving up is
+  worth as much as 1e here and a lot more on euler14-bit. TODO.
+- The seam itself (54%) is still the largest slice. Step 5 (1d) narrows
+  each teardown, and step 6 (P4) re-profiles.
+
+**Witnesses** (mutation-checked):
+- `src/trace_region_policy.zig` "policy: a short activation strikes on
+  departure, but its owner loop's exit is neutral": the pure rule (strike /
+  neutral / a full window still recovers). It fails with the
+  `beginClose` rule removed.
+- `src/interp_nest_test.zig` "doc 64 step 4: a `for k` activation that
+  ends because its loop finished never strikes its owner": the bench at
+  N = 4 (three calls; N ≤ 3 keeps the arm). The give-up still happens,
+  there are at least 1,000 `loop_exit` closes and at least 1,000 in-loop
+  `departure` closes, no `legacy_thrash` gates, and the `for k` header is
+  never struck (3,089 gates before). It fails with the `beginClose` rule
+  removed, with `exitedAt` always false, and with `exitedAt` always true
+  (the crude form).
+- "doc 64 steps 1-2" now counts `loop_exit` closes where it counted
+  departures.

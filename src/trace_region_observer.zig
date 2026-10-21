@@ -116,3 +116,17 @@ pub fn nextDeparture(self: *RegionPolicy, point: ProgramPoint, ctx: RegionContex
         return victim;
     }
 }
+
+/// Doc 64 step 4 (1e): is `point`, where activation `key` departs, its owner
+/// loop's exit (`OwnerLoop.exitedAt`)? Called once per departure, never on
+/// the per-instruction survive path. The single-accumulator case reads the
+/// `ObserverFast` copy; otherwise the accumulator and def are looked up.
+pub fn departureIsLoopExit(self: *const RegionPolicy, key: RegionKey, point: ProgramPoint, ctx: RegionContext) bool {
+    if (self.observer_fast) |f| {
+        if (f.key.region_id == key.region_id and f.key.activation == key.activation)
+            return region.OwnerLoop.exitedAt(f.owner_loop, point, ctx, f.root_frame_depth, f.root_call_seq);
+    }
+    const accum = self.region_profit.get(key) orelse return false;
+    const def = self.region_defs.get(key.region_id) orelse return false;
+    return region.OwnerLoop.exitedAt(def.owner_loop, point, ctx, accum.root_frame_depth, accum.root_call_seq);
+}

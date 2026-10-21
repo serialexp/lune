@@ -105,6 +105,12 @@ pub const CloseReason = enum {
     destination_outside,
     /// Tier-0 reached a program point outside the region's membership.
     departure,
+    /// Doc 64 step 4 (1e): a departure in the activation's own frame, past
+    /// the owner loop's static extent — the owner loop finished. Every
+    /// earlier tier-0 point of the activation was a member (an in-loop
+    /// departure would have closed it first), so a short remainder here is
+    /// a short loop, not low yield: it neither strikes nor recovers.
+    loop_exit,
     /// The activation's frame returned.
     activation_drop,
     /// A physical rebuild left the region non-armable.
@@ -142,6 +148,30 @@ pub const ObserverFast = struct {
     root_frame_depth: u32,
     root_call_seq: u64,
     spans: []ObserverSpan,
+    /// The def's `owner_loop`, for the departure verdict.
+    owner_loop: ?OwnerLoop,
+};
+
+/// Doc 64 step 4 (1e): the static extent of a region owner's loop
+/// (`bytecode.loopExtentFor` of the owner anchor), computed once when the
+/// owner is elected. Null when the owner is no recognised loop header, so
+/// every departure stays a `.departure`.
+pub const OwnerLoop = struct {
+    proto_id: u32,
+    start: u32,
+    end: u32,
+
+    /// Is a tier-0 departure at `point`, in the activation's own frame
+    /// (`depth`/`call_seq` against the accumulator's root), the owner loop's
+    /// exit? It must lie in the owner's proto, outside the loop's extent.
+    /// A departure inside the extent is a coverage gap; one in a callee or
+    /// another call of the same frame depth is not this loop's exit.
+    pub fn exitedAt(ol: ?OwnerLoop, point: ProgramPoint, ctx: RegionContext, root_frame_depth: u32, root_call_seq: u64) bool {
+        const l = ol orelse return false;
+        if (ctx.depth != root_frame_depth or ctx.call_seq != root_call_seq) return false;
+        if (point.proto_id != l.proto_id) return false;
+        return point.source_pc < l.start or point.source_pc > l.end;
+    }
 };
 
 /// A-vii-e.2: the INLINE half of the observer fast path. `ObserverFast` removed
@@ -206,6 +236,9 @@ pub const RegionDef = struct {
     /// (doc 17 §A2.6). Borrows a `*Proto` that outlives the region (proto lifetime ≥
     /// trace lifetime; both bounded by the `clearCache` epoch that frees `region_defs`).
     owner: AnchorKey,
+    /// The owner loop's static extent (doc 64 step 4), kept in step with
+    /// `owner` by every election and owner update.
+    owner_loop: ?OwnerLoop = null,
     classifier: RegionClassifier,
     /// Bridge-capable internal edges and their whole-cycle liveness proofs. Owned;
     /// rebuilt on every successful discovery pass, including a same-id re-record.

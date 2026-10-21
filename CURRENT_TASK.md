@@ -70,7 +70,22 @@ WORST BOARD ROW (2026-10-19, amber-badger): nsieve-bit-fp.
   `legacy_thrash` gates on pc 36, 1e), plus outer-region displacement
   (10,555 `source_outside` closes).
 
-  Next: step 4, re-profile and pick 1e and/or 2c; then step 5 (1d), then
+  Board on 10b8d59: nsieve-bit-fp 270.4 → 228.2 ms, fft 205.4 → 168.6 ms.
+
+  Step 4 done (doc 64 §14): the re-profile showed the remaining turnstile
+  is in the third `nsieve` call, after t7 e10's give-up. Two experiments
+  each removed it:
+  - A: never give up. This also showed euler14-bit −23% (TODO).
+  - B: crude 1e.
+
+  Built 1e properly: `CloseReason.loop_exit`, a departure in the
+  activation's own frame past the owner loop's static extent
+  (`RegionDef.owner_loop`, computed at election), neutral when short.
+  nsieve-bit-fp −6.98% instructions, nsieve −2.41%, repack_adversarial
+  +0.05–0.12% (a per-close verdict cost), the rest ±0.01%. Corrected 1a
+  is not needed.
+
+  Next: step 5 (1d, targeted teardown instead of `disarmAllLinks`), then
   step 6 (P4).
 
 TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff per effort".

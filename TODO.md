@@ -210,6 +210,10 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
          36)** the gates are split 10,890 `region_decay` / 10,540
          `legacy_thrash`, all in the third `nsieve` call, after t7 e10's
          give-up (item 2). Step 4 decides between 1e and 2c.
+         **Fixed 2026-10-21 (doc 64 step 4, 1e, §14):** a close where
+         tier-0 leaves the owner loop in the activation's own frame is a
+         `loop_exit`, neutral when short. 0 gates on the `for k` header;
+         nsieve-bit-fp −6.98% instructions, nsieve −2.41%.
       2. [x] **A chain that ends at the enclosing loop's own loop-done
          counted as a miss.** Fixed 2026-10-21 (doc 64 step 2, §12):
          chains are classified served / natural stop / misfit, and a
@@ -303,7 +307,8 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
       (nsieve-bit-fp: the `for k` gate's strike count reaches 11,597 with
       no reset). Doc 64 step 4 may remove the strikes on this shape; the
       repeated teardown of an already-abandoned owner is a separate
-      question.
+      question. (2026-10-21: step 4's 1e removed them on nsieve-bit-fp;
+      the general question stands, and step 5's 1d narrows each teardown.)
 - [ ] **fft's bit-reverse records duplicate identical `while` roots**
       (t7/t13/t14/t16 at pc 47, same shape). Predates doc 64 step 3, which
       only picks among them (most hits, lowest id). Find why a root
@@ -315,6 +320,14 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
       root and re-arms to its continuation. Bounded by commits. Refinement:
       check the exit snapshot's static types against the root's entry
       guards at commit. Doc 64 §13.
+- [ ] **Exit-side give-ups cost euler14-bit ~23% of its instructions.**
+      Doc 64 §14 experiment A (`tryside` = 255, so no exit ever gives up):
+      euler14-bit −23.47%, nsieve-bit-fp −7.56%, str_manip −3.24%, nsieve
+      −2.09%, repack_adversarial +1.24%, outputs identical. Not a fix as
+      is: §10's 2c (count only failed recordings and failed child
+      prologues, never run outcomes) needs a repair path for stale children
+      first. Diagnose euler14-bit's give-ups (which exits, which misfits)
+      before designing.
 - [ ] **No unit test for owner election after an exit-side bind change.**
       Doc 64 step 3's per-exit bound entry exists because a topology that
       disagreed with the arm made fft's region non-armable (+47.6%). Only

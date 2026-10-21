@@ -13,6 +13,7 @@ const RegionId = region.RegionId;
 const RegionDef = region.RegionDef;
 const RegionBridgeDef = region.RegionBridgeDef;
 const RegionClassifier = region.RegionClassifier;
+const OwnerLoop = region.OwnerLoop;
 const RegionSetBuilder = region.RegionSetBuilder;
 const freeRegionBridges = region.freeRegionBridges;
 const cloneRegionBridges = region.cloneRegionBridges;
@@ -242,6 +243,7 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
         member_trace_ids: []u32,
         bridges: []RegionBridgeDef,
         owner: AnchorKey,
+        owner_loop: ?OwnerLoop,
         classifier: RegionClassifier,
         armable_owner: bool,
         /// Doc 47 Increment B: the owner above was elected by the closed-SCC
@@ -604,6 +606,10 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
         const owner_anchor: AnchorId = if (both_count == 1) nodes.items[owner_node] else (smallest orelse return error.RegionGraphInconsistent);
         const owner_proto = proto_by_id.get(owner_anchor.proto_id) orelse return error.RegionGraphInconsistent;
         const owner: AnchorKey = .{ .proto = owner_proto, .pc = owner_anchor.pc, .proto_id = owner_proto.id };
+        const owner_loop: ?OwnerLoop = if (bytecode.loopExtentFor(owner_proto, owner_anchor.pc)) |ext|
+            .{ .proto_id = owner_proto.id, .start = ext.start, .end = ext.end }
+        else
+            null;
 
         try candidates.append(gpa, .{
             .comp = c,
@@ -612,6 +618,7 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
             .member_trace_ids = member_trace_ids,
             .bridges = bridges,
             .owner = owner,
+            .owner_loop = owner_loop,
             .classifier = .{
                 .kind = if (comp_size[c] == 1) .self_loop else .cross_trace_cycle,
                 .member_count = comp_size[c],
@@ -727,7 +734,7 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
             // Keep the stored owner fresh: the unique external-entry loop-root can MOVE
             // to a different anchor with the internal edge set (hence the id) unchanged,
             // so the arm site must track the current owner, not the first-sight one.
-            staged_owner_updates.appendAssumeCapacity(.{ .id = existing_id, .owner = cand.owner });
+            staged_owner_updates.appendAssumeCapacity(.{ .id = existing_id, .owner = cand.owner, .owner_loop = cand.owner_loop });
             const bridge_copy = try cloneRegionBridges(gpa, cand.bridges);
             staged_bridge_updates.appendAssumeCapacity(.{ .id = existing_id, .bridges = bridge_copy });
             const mt_copy = try gpa.dupe(u32, cand.member_trace_ids);
@@ -752,6 +759,7 @@ pub fn build(gpa: std.mem.Allocator, view: api.View, old: api.Previous, edge_cac
                 .members = members_copy,
                 .member_points = points_copy,
                 .owner = cand.owner,
+                .owner_loop = cand.owner_loop,
                 .classifier = cand.classifier,
                 .bridges = bridge_copy,
                 .armable = first_armable,
