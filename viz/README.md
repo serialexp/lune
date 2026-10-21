@@ -1,14 +1,37 @@
-# mahina — trace inspector (Phase 7, v1)
+# mahina — trace visualiser
 
-A SolidJS app that loads a `.mahinatrace` artifact (emitted by `mahina
---emit-traces`) and renders its trace IR: per-trace anchor, entry slots, the
-straight-line SSA body (mirroring `mahina --dump-traces`), the constant pool, and
-the loop-carried exit stores.
+A SolidJS app for writing a mahina program, running it in the browser, and
+seeing what the tracing JIT made of it. `mahina viz` serves it from the CLI
+(the release CLIs embed it); `pnpm dev` serves it for development.
 
-**Scope (v1):** a *static inspector*. The on-disk artifact contains the committed
-trace IR, not a recorded execution log — so this shows trace *structure*, not yet
-time-stepping. Time-travel stepping waits on the effect-log / keyframe work (see
-`../docs/design/04-snapshot-replay-schema.md`).
+What it does:
+
+- **Edit and run.** A CodeMirror editor with mahina highlighting and live
+  compile diagnostics. Run (wasm) executes the program in a Web Worker on the
+  wasm VM and shows its output; a runtime error is squiggled at its source
+  location with a traceback. Stop ends a runaway program. Script arguments go
+  in the args box (`arg[1..]`).
+- **Step replay.** Replay re-runs the recorded effect log to any instruction
+  (or line) of the last run, deterministically: the current line, the
+  bytecode with the pending pc, output so far, the call chain, locals (dead
+  registers marked) and the globals the program set.
+- **Trace IR.** Every trace the run recorded: anchor, entry slots and the
+  optimised SSA body (as `mahina --dump-traces` prints it), with an animation
+  of each executed trace's per-iteration events (values, guards, commits,
+  exits).
+- **JIT coverage.** How the run's loop iterations split between native code,
+  traced-but-interpreted, and no trace; the editor stripes each loop line the
+  same way (hover for its counts).
+- **Run both + diff.** Runs the program on the wasm VM *and* the native
+  binary (`POST /run`, answered by `mahina viz` or the dev server) and
+  compares every artifact byte for byte — two engines agreeing is the
+  determinism check (`../docs/design/02-determinism.md`). It also gives the
+  native run's time split, which wasm (no cycle counter) can't.
+- **Open a `.mahinatrace`** from `mahina --emit-traces` to inspect its traces
+  (structure only: the file holds no execution log).
+
+Keyboard: Ctrl/⌘+Enter runs (with Shift: Run both), Esc stops a run. With a
+replay open: Space plays, ←/→ step, Home/End jump, Esc closes.
 
 ## Stack
 
@@ -53,11 +76,20 @@ zig build
   Zig and TS codecs from the one schema).
 - `src/enums.ts` — wire-ordinal → name tables for `op`/`ty`/`tag`, mirroring the
   Zig enums. Pinned by the contract test in `../src/traceser.zig`.
-- `src/decode.ts` — thin wrapper over the generated decoder.
+- `src/decode.ts` — strict wrapper over the generated decoders (a file that
+  isn't a `.mahinatrace` fails with a reason).
 - `src/disasm.ts` — decoded trace → view-model + text (mirrors `trace.zig`'s
   `writeTrace`).
-- `src/store.ts` — SolidJS store (loaded file, traces, selection).
-- `src/components/` — `TraceList` (left pane), `TraceView` (right pane).
+- `src/store.ts` — the SolidJS store: every piece of app state and the
+  actions on it (components read `state` and call these; no prop drilling).
+- `src/wasm/` — the wasm VM binding (`mahina.ts`), the Web Worker that hosts
+  it, and the main-thread client (`mahina-client.ts`, which also stops it).
+- `src/native.ts` — the `POST /run` client for Run both.
+- `src/diff.ts`, `src/snapshot.ts`, `src/exec.ts` — the wasm-vs-native
+  comparison, the keyframe → globals/locals view, the trace-animation stream.
+- `src/editor/` — the CodeMirror editor, mahina language mode and linter.
+- `src/components/` — `TraceList`/`TraceView` (the trace panes),
+  `ReplayPanel`, `CoveragePanel`.
 - `fixtures/` — `counting-loop.lua` + the committed `counting-loop.mahinatrace`
   cross-language fixture.
 - `test/` — `bun test` specs.
