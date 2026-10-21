@@ -10,6 +10,15 @@
 
 import type { MahinaRunResult, MahinaReplayResult, MahinaDiagnostic } from "./mahina";
 
+/** The wasm URL: `${base}mahina.wasm` resolved against the *page* URL to an
+ *  absolute URL, so dev and built bases both work. It must be absolute before
+ *  it reaches the worker: the built base is `./`, and the worker would resolve
+ *  a relative URL against its own script (`/assets/…`), where there is no wasm
+ *  — Run 404'd that way in `mahina viz`. */
+export function resolveWasmUrl(base: string, pageUrl: string): string {
+  return new URL(`${base}mahina.wasm`, pageUrl).href;
+}
+
 interface Pending {
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
@@ -25,11 +34,8 @@ class MahinaWorkerClient {
   #nextId = 1;
   #initId: number | null = null;
 
-  /** Resolve the wasm URL the way the old in-store loader did
-   *  (`${BASE_URL}mahina.wasm`), so dev and built bases both work. */
   #wasmUrl(): string {
-    const base = import.meta.env?.BASE_URL ?? "./";
-    return `${base}mahina.wasm`;
+    return resolveWasmUrl(import.meta.env?.BASE_URL ?? "./", document.baseURI);
   }
 
   /** Spawn the worker (once) and kick off instantiation. Idempotent. */

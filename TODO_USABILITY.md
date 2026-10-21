@@ -132,14 +132,16 @@ effect log so runs stay replayable (doc 02).
 
 ## 6. Visualiser (`mahina viz`)
 
-- [ ] **In-browser Run is broken in the release (my bug from the CLI
-      work):** the worker fetches `./mahina.wasm` relative to
-      `/assets/mahina.worker-*.js` → `/assets/mahina.wasm` 404; the server
-      has `/mahina.wasm`. **(verified)** Cause:
-      `viz/src/wasm/mahina-client.ts` passes `BASE_URL` (`./`) unresolved
-      to the worker; resolve against `location.href`. Run, Replay and
-      "Run both + diff" are all dead. `tools/cli-smoke.sh` only checks
-      `/mahina.wasm` exists: add a headless click-Run check.
+- [x] **In-browser Run was broken in v0.1.2:** the worker fetched
+      `./mahina.wasm` relative to its own script → `/assets/mahina.wasm`
+      404. Fixed (2026-10-21): `resolveWasmUrl` in
+      `viz/src/wasm/mahina-client.ts` resolves against `document.baseURI`;
+      `viz/test/wasm-url.test.ts` pins it. Verified by clicking Run in
+      headless Chrome on a `-Dviz-dist` build (v0.1.2 404s, fixed prints
+      `5050`). Needs a v0.1.3 to reach users.
+- [ ] A permanent click-Run smoke test: `tools/cli-smoke.sh` only checks
+      that `/mahina.wasm` is served. Needs a browser in CI (playwright-core
+      + Chrome) — Bart to decide.
 - [ ] No source mapping: traces are `proto 0:6` (bytecode pcs); the trace
       format (`schema/trace.json`) has no line info. Clicking a trace or IR
       row highlights nothing.
