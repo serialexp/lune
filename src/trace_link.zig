@@ -20,6 +20,7 @@ const execlog = @import("execlog.zig");
 const nativegen = @import("nativegen.zig");
 const irinterp = @import("irinterp.zig");
 const trace_exec = @import("trace_exec.zig");
+const trace_recorder = @import("trace_recorder.zig");
 const jitdbg = @import("jitdbg.zig");
 const table_mod = @import("table.zig");
 const arr = @import("array.zig");
@@ -273,7 +274,7 @@ pub fn noteExitSideCommit(self: *TraceState, parent: *Trace, exit_instr: u32, ch
     if (child.code.anchor.proto != parent.code.anchor.proto or child.code.anchor.pc != p) return;
     const n = child.code.instrs.len;
     if (n != 0 and child.code.instrs[n - 1].op == .link) {
-        self.bindExitSide(parent, exit_instr, .commit);
+        self.bindExitSide(parent, exit_instr, .commit, child);
     } else {
         parent.exit_side[exit_instr] = .gave_up;
         unpublishExitAdapter(parent, exit_instr);
@@ -600,8 +601,9 @@ pub fn ordinaryArmLive(self: *const TraceState, t: *const Trace, exit_instr: u32
 /// it (a continuation at its resume pc, found by a chain or just committed
 /// from its recording): mark it attached, DONE-latch its counter (LuaJIT's
 /// `SNAPCOUNT_DONE`) and count the child against `maxside`. A no-op unless
-/// the exit is wanted.
-pub fn bindExitSide(self: *TraceState, parent: *Trace, exit_instr: u32, via: ExitSideBind) void {
+/// the exit is wanted. Records `child`'s entry as the exit's bound target
+/// (doc 64 step 3, `setExitSideEntry`).
+pub fn bindExitSide(self: *TraceState, parent: *Trace, exit_instr: u32, via: ExitSideBind, child: *const Trace) void {
     if (exit_instr >= parent.exit_side.len) return;
     const s = &parent.exit_side[exit_instr];
     if (s.* != .wanted) return;
@@ -611,11 +613,39 @@ pub fn bindExitSide(self: *TraceState, parent: *Trace, exit_instr: u32, via: Exi
     self.exit_side_binds +|= 1;
     if (via == .chain) self.exit_side_chain_binds +|= 1;
     self.dbg("exit-side: trace={d} exit={d} attached by {s} (children={d})", .{ parent.id, exit_instr, @tagName(via), parent.side_children });
+    setExitSideEntry(self, parent, exit_instr, child);
+}
+
+/// Doc 64 §10 step 3: record that attached exit `exit_instr` of `parent` is
+/// now served by `child` (null: by nothing, e.g. it gave up). The region
+/// topology's successor for the exit is this entry
+/// (`resolveSuccessorAnchor`), so a change requests a rebuild at the next
+/// post-walk drain tail (`drainPendingRegionRebuild`) — never mid-walk.
+/// A continuation and a root behind the same marker enter at different
+/// anchors; which one serves an exit depends on its slab types, so only
+/// the binding knows. Deterministic: binding events only.
+pub fn setExitSideEntry(self: *TraceState, parent: *Trace, exit_instr: u32, child: ?*const Trace) void {
+    if (exit_instr >= parent.exit_side_entry.len) return;
+    const entry: u32 = if (child) |c|
+        (exitSideTarget(parent, exit_instr, c) orelse return).entry_pc
+    else
+        Trace.NO_EXIT_SIDE_ENTRY;
+    const slot = &parent.exit_side_entry[exit_instr];
+    if (slot.* == entry) return;
+    self.dbg("exit-side: trace={d} exit={d} bound entry {d} -> {d}", .{ parent.id, exit_instr, slot.*, entry });
+    // Unbound, the topology falls back to `P` itself, so a continuation
+    // binding (entry `P`) or its loss changes no successor: no rebuild.
+    const p = parent.code.exitResumePc(exit_instr) orelse return;
+    const before = if (slot.* == Trace.NO_EXIT_SIDE_ENTRY) p else slot.*;
+    const after = if (entry == Trace.NO_EXIT_SIDE_ENTRY) p else entry;
+    slot.* = entry;
+    if (before != after) self.pending_region_rebuild = true;
 }
 
 /// Doc 56 Phase 3: how a wanted exit found its child — a chain into a
-/// continuation already at `P`, or the commit of the recording it armed.
-pub const ExitSideBind = enum { chain, commit };
+/// continuation already at `P`, the commit of the recording it armed, or
+/// (doc 64 step 3) the loop root behind the `.loop` marker at `P`.
+pub const ExitSideBind = enum { chain, commit, root };
 
 /// Doc 56 Phase 5 (LuaJIT's `lj_asm_patchexit` at side-trace commit): point
 /// attached exit `exit_instr`'s adapter straight at the continuation that
@@ -633,8 +663,84 @@ pub fn armExitSide(self: *TraceState, parent: *Trace, exit_instr: u32, child: *T
     if (!safe_to_arm) return;
     if (parent.exitSideAt(exit_instr) != .attached) return;
     const armed = self.armNativeLink(parent, exit_instr, child, .exit_side) catch false;
-    if (armed) self.exit_side_arms +|= 1;
+    if (armed) {
+        self.exit_side_arms +|= 1;
+        setExitSideEntry(self, parent, exit_instr, child);
+    }
     self.dbg("exit-side: trace={d} exit={d} arm -> child={d} at pc={d}: {s}", .{ parent.id, exit_instr, child.id, child.code.anchor.pc, if (armed) "armed" else "refused" });
+}
+
+/// Doc 64 §10 step 3 (3b): where an exit-side exit enters the child that
+/// serves it. The adapter always leaves the slab coherent at the exit's
+/// resume pc `P` (`resume_pc`); the child is entered at its own anchor
+/// (`entry_pc`). The two differ only for a loop root behind a `.loop`
+/// marker at `P`: the marker writes nothing, so the slab coherent at `P`
+/// is coherent at the header too — the same entry tier-0's patched marker
+/// makes. Arming, replay, promotion and topology all read this one
+/// description.
+pub const ExitSideTarget = struct { resume_pc: u32, entry_pc: u32 };
+
+/// Doc 64 §10 step 3: can `child` serve exit `exit_instr` of `parent`, and
+/// where does it enter? Two shapes:
+///  - a `.link` continuation anchored at `P` (doc 56), entered at `P`;
+///  - a loop root (`.loop` terminal) at the header of the `.loop` marker at
+///    `P`, entered at the header — never `parent`'s own anchor (that is a
+///    sibling, not a child), never peeled (its entry guards are the types
+///    of its run-once iteration, doc 56 review finding 5), never precise.
+/// Null otherwise. Static: the caller checks entry types and enterability.
+pub fn exitSideTarget(parent: *const Trace, exit_instr: u32, child: *const Trace) ?ExitSideTarget {
+    const proto = parent.code.anchor.proto;
+    if (child.code.anchor.proto != proto) return null;
+    const p = parent.code.exitResumePc(exit_instr) orelse return null;
+    const n = child.code.instrs.len;
+    if (n == 0) return null;
+    if (child.code.anchor.pc == p) {
+        if (child.code.instrs[n - 1].op != .link) return null;
+        return .{ .resume_pc = p, .entry_pc = p };
+    }
+    const h = markerHeaderAt(proto, p) orelse return null;
+    if (child.code.anchor.pc != h or h == parent.code.anchor.pc) return null;
+    if (child.code.instrs[n - 1].op != .loop or child.code.peeled or child.code.deopt_mode == .precise) return null;
+    return .{ .resume_pc = p, .entry_pc = h };
+}
+
+/// The header of the `.loop` marker at `pc`, or null when `pc` holds no
+/// marker (doc 58: `while`/`repeat` bodies start behind one).
+fn markerHeaderAt(proto: *const Proto, pc: u32) ?u32 {
+    if (pc >= proto.code.len or proto.code[pc].op != .loop) return null;
+    return bytecode.loopHeaderOf(proto.code[pc], pc);
+}
+
+/// Doc 64 §10 step 3: the loop root that serves exit `exit_instr` of
+/// `parent` behind the `.loop` marker at its resume pc, if any. The same
+/// pick as `nextTraceExcluding`: most hits, then lowest id.
+pub fn exitSideRoot(self: *const TraceState, parent: *const Trace, exit_instr: u32) ?*Trace {
+    const proto = parent.code.anchor.proto;
+    const p = parent.code.exitResumePc(exit_instr) orelse return null;
+    const h = markerHeaderAt(proto, p) orelse return null;
+    var best: ?*Trace = null;
+    var it = self.registry.tracesAt(.{ .proto = proto, .pc = h, .proto_id = proto.id });
+    while (it.next()) |t| {
+        if (exitSideTarget(parent, exit_instr, t) == null) continue;
+        if (best) |b| {
+            if (t.hit_count < b.hit_count or (t.hit_count == b.hit_count and t.id > b.id)) continue;
+        }
+        best = t;
+    }
+    return best;
+}
+
+/// Doc 64 §10 step 3 (3b with 3a's runtime path): a routed firing of exit
+/// `exit_instr` of `parent`, materialized at its resume pc `P`, finds a
+/// loop root behind the marker at `P` whose entry types the slab already
+/// satisfies. The root is offered BEFORE any continuation at `P` (Codex,
+/// doc 64 §9): a composite at `P` can mutate the slab before a later
+/// candidate runs. Null when there is no such root; the caller then walks
+/// the continuations at `P` as before.
+pub fn exitSideRootServes(self: *const TraceState, parent: *const Trace, exit_instr: u32, regs: RegWindow) ?*Trace {
+    const root = self.exitSideRoot(parent, exit_instr) orelse return null;
+    if (!trace_recorder.entryGuardsMatch(root.code.entry_guards, regs)) return null;
+    return root;
 }
 
 /// Doc 64 §10 step 2: how an exit-side chain at `P` ended.
@@ -744,6 +850,7 @@ pub fn noteExitSideChain(self: *TraceState, parent: *Trace, exit_instr: u32, out
     }
     unpublishExitAdapter(parent, exit_instr);
     parent.exit_side[exit_instr] = .gave_up;
+    setExitSideEntry(self, parent, exit_instr, null);
     m.* = 0;
     if (exit_instr < parent.exit_counts.len) parent.exit_counts[exit_instr] = 0;
     self.exit_side_giveups +|= 1;
@@ -765,37 +872,70 @@ fn awaitExitSideRevival(self: *TraceState, parent: *const Trace, exit_instr: u32
     }) catch {};
 }
 
-/// Doc 64 §10 step 2 (2d, Codex's form): a `.link` continuation `t` just
-/// committed. Every given-up exit whose resume point is `t`'s anchor returns
-/// to `.none` — new evidence that a child can now serve it — and re-heats
-/// through `hotexit` like a fresh exit. Each waiting entry is consumed here,
-/// so a revived exit that gives up again waits for the NEXT commit at its
-/// `P`: revivals are bounded by commits, never periodic. Entries whose trace
-/// is gone are dropped on the way. Deterministic: commit order and receipt
-/// contents only.
-pub fn reviveExitSideAt(self: *TraceState, t: *const Trace) void {
+/// The resume pc `P` a just-committed `t` can serve exits at, if any: its
+/// anchor for a `.link` continuation, or (doc 64 step 3) the `.loop` marker
+/// in front of a loop root's header.
+fn servedResumePc(t: *const Trace) ?u32 {
     const n = t.code.instrs.len;
-    if (n == 0 or t.code.instrs[n - 1].op != .link) return;
-    const proto_id = t.code.anchor.proto.id;
+    if (n == 0) return null;
     const pc = t.code.anchor.pc;
+    return switch (t.code.instrs[n - 1].op) {
+        .link => pc,
+        .loop => if (pc != 0 and markerHeaderAt(t.code.anchor.proto, pc - 1) == pc) pc - 1 else null,
+        else => null,
+    };
+}
+
+/// Doc 64 §10 steps 2–3 (2d, Codex's form): `t` just committed and can
+/// serve exits at resume pc `P` (`servedResumePc`).
+///  - Every given-up exit waiting at `P` that `t` fits (`exitSideTarget`)
+///    returns to `.none` — new evidence that a child can now serve it — and
+///    re-heats through `hotexit` like a fresh exit. Each such entry is
+///    consumed, so a revived exit that gives up again waits for the NEXT
+///    commit at its `P`: revivals are bounded by commits, never periodic.
+///    Entries whose trace is gone are dropped on the way.
+///  - When `t` is a loop root (step 3), every attached exit at `P` still
+///    armed to a continuation there (a composite recorded before the root
+///    existed, doc 64 §3 P3) is disarmed, so its next firing routes, finds
+///    the root first (`exitSideRootServes`) and arms to it. The exit stays
+///    attached; only its target changes.
+/// Deterministic: commit order and receipt contents only.
+pub fn reviveExitSideAt(self: *TraceState, t: *const Trace) void {
+    const pc = servedResumePc(t) orelse return;
+    const proto_id = t.code.anchor.proto.id;
     var i: usize = 0;
     while (i < self.exit_side_waiting.items.len) {
         const w = self.exit_side_waiting.items[i];
-        const parent = self.traceById(w.exit.trace_id);
-        const here = w.proto_id == proto_id and w.pc == pc;
-        if (parent != null and !here) {
+        const parent = self.traceById(w.exit.trace_id) orelse {
+            _ = self.exit_side_waiting.swapRemove(i);
+            continue;
+        };
+        const e = w.exit.exit_instr;
+        if (w.proto_id != proto_id or w.pc != pc or exitSideTarget(parent, e, t) == null) {
             i += 1;
             continue;
         }
         _ = self.exit_side_waiting.swapRemove(i);
-        const par = parent orelse continue;
-        const e = w.exit.exit_instr;
-        if (par.exitSideAt(e) != .gave_up) continue;
-        par.exit_side[e] = .none;
-        if (e < par.exit_side_misses.len) par.exit_side_misses[e] = 0;
-        if (e < par.exit_counts.len and par.exit_counts[e] != Trace.EXIT_COUNT_DONE) par.exit_counts[e] = 0;
+        if (parent.exitSideAt(e) != .gave_up) continue;
+        parent.exit_side[e] = .none;
+        if (e < parent.exit_side_misses.len) parent.exit_side_misses[e] = 0;
+        if (e < parent.exit_counts.len and parent.exit_counts[e] != Trace.EXIT_COUNT_DONE) parent.exit_counts[e] = 0;
         self.exit_side_revivals +|= 1;
-        self.dbg("exit-side: trace={d} exit={d} revived by t={d} at pc={d}", .{ par.id, e, t.id, pc });
+        self.dbg("exit-side: trace={d} exit={d} revived by t={d} at pc={d}", .{ parent.id, e, t.id, pc });
+    }
+    if (t.code.anchor.pc == pc) return; // a continuation: nothing to retarget
+    var k: usize = 0;
+    while (k < self.registry.native_physical.armedLinks().len) {
+        const l = self.registry.native_physical.armedLinks()[k];
+        if (l.kind != .exit_side or l.child == t or l.child.code.anchor.pc != pc or
+            exitSideTarget(l.parent, l.slot_index, t) == null)
+        {
+            k += 1;
+            continue;
+        }
+        self.dbg("exit-side: trace={d} exit={d} disarm (child={d}) for root t={d}", .{ l.parent.id, l.slot_index, l.child.id, t.id });
+        self.disarmLinkAt(k); // swapRemove: re-test index k
+        self.exit_side_root_retargets +|= 1;
     }
 }
 
@@ -1008,6 +1148,17 @@ pub fn resolveSuccessorAnchor(self: *const TraceState, t: *const Trace, e: ExitP
                         return .{ .proto_id = proto.id, .pc = wp };
                 }
             } else if (self.config.exit_side and t.code.exitAttachable(e.index)) {
+                // Doc 64 step 3: an attached exit's successor is the child
+                // it is bound to — a continuation at `P` or the loop root
+                // behind the marker there; which one depends on the slab's
+                // types, so only the binding knows (`exit_side_entry`). An
+                // entry at the parent's own anchor is no edge, as below.
+                if (t.exitSideAt(e.index) == .attached and e.index < t.exit_side_entry.len) {
+                    const entry = t.exit_side_entry[e.index];
+                    if (entry != Trace.NO_EXIT_SIDE_ENTRY and entry != t.code.anchor.pc and
+                        self.countTracesAt(.{ .proto = proto, .pc = entry, .proto_id = proto.id }) != 0)
+                        return .{ .proto_id = proto.id, .pc = entry };
+                }
                 if (t.code.exitResumePc(e.index)) |p| {
                     if (p != t.code.anchor.pc and self.countTracesAt(.{ .proto = proto, .pc = p, .proto_id = proto.id }) != 0)
                         return .{ .proto_id = proto.id, .pc = p };
@@ -1250,14 +1401,12 @@ pub fn promotedEdgeFromLink(self: *TraceState, link: NativeLink) ?PromotedEdge {
         .ret_cont, .call_head => return null, // frame-motion links never promote
         .exit_side => blk: {
             // Doc 56 §4.8.2 item 6: the adapter left the slab coherent at
-            // the exit's resume pc `P`; the child is a `.link`-tailed
-            // continuation anchored at `(proto, P)`.
-            const p = link.parent.code.exitResumePc(link.slot_index) orelse return null;
-            const n = link.child.code.instrs.len;
-            if (link.parent.code.anchor.proto != link.child.code.anchor.proto or
-                link.child.code.anchor.pc != p or n == 0 or
-                link.child.code.instrs[n - 1].op != .link) return null;
-            break :blk p;
+            // the exit's resume pc `P`; the child is entered at its own
+            // anchor (`exitSideTarget`: `P` for a continuation, the header
+            // for a root behind the marker at `P`, doc 64 step 3), which is
+            // where the replay cursor resumes.
+            const served = exitSideTarget(link.parent, link.slot_index, link.child) orelse return null;
+            break :blk served.entry_pc;
         },
         .sibling_handoff => blk: {
             if (link.parent.code.anchor.proto != link.child.code.anchor.proto or
@@ -1633,18 +1782,22 @@ pub fn considerSilentPromotion(self: *TraceState, entries: []const trace_exec.Le
     // open for it yet — the ledger itself is its only voice.
     tryDormantAdmission(self, entries);
     const ctx = self.region_policy.regionContext() orelse {
+        self.dbg("silent-consider: no region context (seed t={d})", .{entries[0].id});
         self.resetPromotionCandidate();
         return;
     };
     const key = self.activeRegionFor(ctx.call_seq) orelse {
+        self.dbg("silent-consider: no active region (seed t={d})", .{entries[0].id});
         self.resetPromotionCandidate();
         return;
     };
     const accum = self.region_policy.region_profit.get(key) orelse {
+        self.dbg("silent-consider: no accumulator rid={d}", .{@intFromEnum(key.region_id)});
         self.resetPromotionCandidate();
         return;
     };
     if (!accum.frozen) {
+        self.dbg("silent-consider: accumulator not frozen rid={d}", .{@intFromEnum(key.region_id)});
         self.resetPromotionCandidate();
         return;
     }
@@ -1671,6 +1824,7 @@ pub fn considerSilentPromotion(self: *TraceState, entries: []const trace_exec.Le
         }
     }
     const detected = self.detectPromotableSet(entries, key) orelse {
+        self.dbg("silent-consider: no promotable set rid={d}", .{@intFromEnum(key.region_id)});
         // Failed-opportunity settlement (doc 47 Increment B follow-up): a
         // full-cap yielded ledger for an ACTIVE frozen fallback region that
         // yields no promotable candidate means the region was admitted on
@@ -2197,16 +2351,15 @@ pub fn arm(self: *TraceState, request: ArmRequest) !bool {
         },
         // Doc 56 Phase 5: an attached exit's published adapter jumps into a
         // `.link` continuation anchored at the exit's resume pc `P` (the
-        // adapter left the slab coherent there). The physical cell is the
-        // exit-side cell, resolved by the registry.
+        // adapter left the slab coherent there), or (doc 64 step 3) into the
+        // loop root behind a `.loop` marker at `P` — `exitSideTarget`. The
+        // physical cell is the exit-side cell, resolved by the registry.
         .exit_side => {
             if (head_parent) return false;
             if (!parent.code.exitAttachable(slot_index)) return false;
             if (parent.exitSideAt(slot_index) != .attached) return false;
             if (!c.exitSidePublished(slot_index)) return false;
-            const p = parent.code.exitResumePc(slot_index) orelse return false;
-            if (child.code.anchor.proto != parent.code.anchor.proto or child.code.anchor.pc != p) return false;
-            if (child.code.instrs.len == 0 or child.code.instrs[child.code.instrs.len - 1].op != .link) return false;
+            if (exitSideTarget(parent, slot_index, child) == null) return false;
             if (!self.stubEnterable(child, .ordinary, child.code.anchor.proto)) return false;
         },
     }

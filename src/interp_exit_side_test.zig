@@ -1058,11 +1058,66 @@ test "doc 56 §4.8.3 R2: an exit-side exit arms the continuation that fits, not 
             for (ts.registry.native_physical.armedLinks()) |l| {
                 if (l.kind != .exit_side) continue;
                 const p = l.parent.code.exitResumePc(l.slot_index).?;
-                try testing.expectEqual(p, l.child.code.anchor.pc);
+                // Doc 64 step 3: a continuation at `P` or the loop root
+                // behind the marker there; only continuations have a
+                // canonical pick at `P`.
+                const target = @import("trace.zig").TraceState.exitSideTarget(l.parent, l.slot_index, l.child) orelse
+                    return error.TestUnexpectedResult;
+                if (target.entry_pc != p) continue;
                 const pick = ts.resolveLoopDoneCont(l.parent.code.anchor.proto, p, null).arm orelse continue;
                 if (pick != l.child) off_canonical += 1;
             }
             try testing.expect(off_canonical > 0);
+        }
+    };
+    try expectProgramTuned(bitreverse_src, "0.5\t1024\n", .{
+        .exit_side_native = true,
+        .hotloop = (@import("trace.zig").TraceConfig{}).hotloop,
+        .inspect = Inspect.run,
+    });
+}
+
+test "doc 64 step 3: bit-reverse binds one marker exit to the while root, and one whose types differ to its continuation" {
+    // Both exits resume at the inner `while`'s `.loop` marker. The `for`
+    // root's exit carries a float `j`, which the `while` root (float entry
+    // guards) accepts: it is bound to the root, which existed before the
+    // exit went wanted, ahead of any continuation at the marker. The
+    // `if i < j` side trace's exit carries an int `j`: the root refuses it,
+    // so it stays bound to a continuation at the marker. Every armed
+    // exit-side link agrees with its exit's bound entry, and the region
+    // topology's successor for the exit is that entry. An entry at the
+    // parent's own anchor is never an edge (spectral-norm's `Atv` bound one
+    // and minted a self-loop region the binding never meant).
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode != .record_execute_native) return;
+            const ts = &vm.trace;
+            const TraceState = @import("trace.zig").TraceState;
+            try testing.expect(ts.exit_side_root_routes >= 1);
+            var to_root: usize = 0;
+            var to_cont: usize = 0;
+            for (ts.registry.native_physical.armedLinks()) |l| {
+                if (l.kind != .exit_side) continue;
+                const target = TraceState.exitSideTarget(l.parent, l.slot_index, l.child) orelse
+                    return error.TestUnexpectedResult;
+                const bound = &l.parent.exit_side_entry[l.slot_index];
+                try testing.expectEqual(target.entry_pc, bound.*);
+                const ep = for (l.parent.code.exit_prov) |ep| {
+                    if (ep.index == l.slot_index) break ep;
+                } else return error.TestUnexpectedResult;
+                const succ = ts.resolveSuccessorAnchor(l.parent, ep) orelse return error.TestUnexpectedResult;
+                try testing.expectEqual(target.entry_pc, succ.pc);
+                const saved = bound.*;
+                bound.* = l.parent.code.anchor.pc;
+                const self_succ = ts.resolveSuccessorAnchor(l.parent, ep);
+                bound.* = saved;
+                if (self_succ) |s| try testing.expect(s.pc != l.parent.code.anchor.pc);
+                const proto = l.parent.code.anchor.proto;
+                if (proto.code[target.resume_pc].op != .loop) continue;
+                if (target.entry_pc == target.resume_pc) to_cont += 1 else to_root += 1;
+            }
+            try testing.expect(to_root >= 1);
+            try testing.expect(to_cont >= 1);
         }
     };
     try expectProgramTuned(bitreverse_src, "0.5\t1024\n", .{

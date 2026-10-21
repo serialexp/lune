@@ -1233,6 +1233,12 @@ pub const TraceState = struct {
     /// Doc 64 §10 step 2 (2d): given-up exits returned to `.none` because a
     /// trace committed at their resume pc.
     exit_side_revivals: u64 = 0,
+    /// Doc 64 §10 step 3: routed exit-side firings served by the loop root
+    /// behind the `.loop` marker at their resume pc (`exitSideRootServes`).
+    exit_side_root_routes: u64 = 0,
+    /// Doc 64 §10 step 3: exit-side arms released from a continuation at
+    /// `P` because a loop root committed behind the marker there.
+    exit_side_root_retargets: u64 = 0,
     /// Doc 64 §10 step 2 (2d): every given-up exit that a later commit could
     /// serve, keyed by its resume point. `reviveExitSideAt` consumes the
     /// entries at a commit's anchor (and drops entries whose trace is gone),
@@ -2889,6 +2895,10 @@ pub const TraceState = struct {
     pub const noteExitSideChain = trace_link_mod.noteExitSideChain;
     pub const exitSideChainOutcome = trace_link_mod.exitSideChainOutcome;
     pub const reviveExitSideAt = trace_link_mod.reviveExitSideAt;
+    pub const exitSideTarget = trace_link_mod.exitSideTarget;
+    pub const setExitSideEntry = trace_link_mod.setExitSideEntry;
+    pub const exitSideRoot = trace_link_mod.exitSideRoot;
+    pub const exitSideRootServes = trace_link_mod.exitSideRootServes;
     pub const drainPendingExitSideDisarm = trace_link_mod.drainPendingExitSideDisarm;
     pub const maybeArmExitSide = trace_link_mod.maybeArmExitSide;
     pub const noteExitSideCommit = trace_link_mod.noteExitSideCommit;
@@ -4068,20 +4078,31 @@ pub const TraceState = struct {
         errdefer if (t.exit_counts.len != 0) self.gpa.free(t.exit_counts);
         // Doc 56 Phase 3: the per-exit exit-side state, only for traces that
         // can use it. Fail-soft like `exit_counts`.
-        // §4.8.3 R4: the miss counters come with it (both or neither).
-        if (t.code.anyExitAttachable()) {
-            if (self.gpa.alloc(exit_attach.ExitSide, t.code.instrs.len)) |sides| {
-                if (self.gpa.alloc(u8, t.code.instrs.len)) |misses| {
-                    @memset(sides, .none);
-                    @memset(misses, 0);
-                    t.exit_side = sides;
-                    t.exit_side_misses = misses;
-                } else |_| self.gpa.free(sides);
-            } else |_| {}
+        // §4.8.3 R4: the miss counters come with it, and (doc 64 step 3)
+        // the bound entries (all three or none).
+        if (t.code.anyExitAttachable()) alloc: {
+            const n = t.code.instrs.len;
+            const sides = self.gpa.alloc(exit_attach.ExitSide, n) catch break :alloc;
+            const misses = self.gpa.alloc(u8, n) catch {
+                self.gpa.free(sides);
+                break :alloc;
+            };
+            const entries = self.gpa.alloc(u32, n) catch {
+                self.gpa.free(sides);
+                self.gpa.free(misses);
+                break :alloc;
+            };
+            @memset(sides, .none);
+            @memset(misses, 0);
+            @memset(entries, Trace.NO_EXIT_SIDE_ENTRY);
+            t.exit_side = sides;
+            t.exit_side_misses = misses;
+            t.exit_side_entry = entries;
         }
         errdefer if (t.exit_side.len != 0) {
             self.gpa.free(t.exit_side);
             self.gpa.free(t.exit_side_misses);
+            self.gpa.free(t.exit_side_entry);
         };
         try self.registry.publish(t);
         if (comptime jitdbg.enabled) if (self.config.debug_log) {
@@ -4438,6 +4459,7 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
         // Doc 56 Phase 3: the tier-1a exit-side path.
         try w.print("    exit side:            wants={d} records={d} binds={d} (by chain {d}) giveups={d} hops={d} chained={d} retries={d} miss-giveups={d}\n", .{ ts.exit_side_wants, ts.exit_side_records, ts.exit_side_binds, ts.exit_side_chain_binds, ts.exit_side_giveups, ts.exit_side_hops, ts.exit_side_chains, ts.exit_side_retries, ts.exit_side_miss_giveups });
         try w.print("    exit-side chain ends: natural stops={d} revivals={d}\n", .{ ts.exit_side_natural_stops, ts.exit_side_revivals });
+        try w.print("    exit-side loop roots: routes={d} retargets={d}\n", .{ ts.exit_side_root_routes, ts.exit_side_root_retargets });
         // Doc 56 Phase 4: native exit adapters.
         try w.print("    exit adapters:        built={d} native hops={d}; refused:", .{ ts.exit_adapter_builds, ts.exit_side_native_hops });
         var any_adapter_refused = false;

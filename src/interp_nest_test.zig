@@ -11,6 +11,7 @@ const interp = @import("interp.zig");
 const testing = std.testing;
 const trace = @import("trace.zig");
 const io = @import("io.zig");
+const bytecode = @import("bytecode.zig");
 
 const Vm = interp.Vm;
 const util = @import("interp_testutil.zig");
@@ -122,6 +123,52 @@ test "doc 64 step 2: an exit-side chain that ends by leaving its enclosing loop 
         .inspect = Inspect.run,
     });
     try testing.expectEqualStrings("14683\n", sink.buffered());
+}
+
+test "doc 64 step 3: a loop root committed behind a marker takes over the exit a composite served" {
+    // Doc 64 §13. The `while` needs 0 trips at first, so the `for` root is
+    // recorded without it; its `while` exit resumes at the `.loop` marker.
+    // When trips start, that exit binds to a composite continuation at the
+    // marker (one trip, then `.link`). Only later does the `while` get a
+    // root of its own. Its commit releases the composite's arm, the next
+    // firing routes, finds the root first, and arms the exit straight into
+    // it: the exit's bound entry and the armed child are the root.
+    const gpa = testing.allocator;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            _ = mode;
+            const ts = &vm.trace;
+            try testing.expect(ts.exit_side_root_retargets >= 1);
+            try testing.expect(ts.exit_side_root_routes >= 1);
+            var root_arms: usize = 0;
+            for (ts.registry.native_physical.armedLinks()) |l| {
+                if (l.kind != .exit_side) continue;
+                const n = l.child.code.instrs.len;
+                if (l.child.code.instrs[n - 1].op != .loop) continue;
+                const h = l.child.code.anchor.pc;
+                // The root sits behind a marker, and the topology follows it.
+                try testing.expectEqual(bytecode.OpCode.loop, l.child.code.anchor.proto.code[h - 1].op);
+                try testing.expectEqual(h, l.parent.exit_side_entry[l.slot_index]);
+                root_arms += 1;
+            }
+            try testing.expect(root_arms >= 1);
+        }
+    };
+    try util.runCapturedTuned(gpa,
+        \\local s = 0
+        \\for i = 1, 40000 do
+        \\  local j = i
+        \\  while j >= 4000 do j = j - 4000 end
+        \\  s = s + j
+        \\end
+        \\print(s)
+    , &sink, false, .record_execute_native, .{
+        .hotloop = (trace.TraceConfig{}).hotloop,
+        .inspect = Inspect.run,
+    });
+    try testing.expectEqualStrings("79980000\n", sink.buffered());
 }
 
 test "doc 64 step 2: natural stops never give an exit up; misfits do, and the next .link commit at P revives it" {

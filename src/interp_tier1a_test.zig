@@ -1090,13 +1090,19 @@ test "doc 58: a repeat loop anchors at its marker's header and keeps cross-tier 
     }
     try testing.expectEqual(@as(usize, 1), markers);
 
-    // The repeat loop is a real trace root, and something links INTO it (the
-    // outer body's ramp): a `.link` naming the repeat header resolves to the
-    // repeat's own marker as its back-edge. B2 review should-fix: this used to
-    // skip every link whose target had no extent, so it passed with no link
-    // into the repeat at all.
+    // The repeat loop is a real trace root, and the outer body reaches it
+    // natively: a `.link` naming the repeat header (the outer body's ramp),
+    // which resolves to the repeat's own marker as its back-edge, or (doc 64
+    // step 3) an exit-side exit bound straight to the root behind the marker.
+    // B2 review should-fix: this used to skip every link whose target had no
+    // extent, so it passed with no link into the repeat at all.
     try testing.expect(vm.trace.findLoopTrace(chunk.proto, repeat_header) != null);
     var links_into_repeat: usize = 0;
+    for (vm.trace.registry.cache.items) |t| {
+        for (t.exit_side_entry) |entry| {
+            if (t.code.anchor.proto == chunk.proto and entry == repeat_header) links_into_repeat += 1;
+        }
+    }
     for (vm.trace.registry.cache.items) |t| {
         const last = t.code.instrs[t.code.instrs.len - 1];
         if (last.op != .link) continue;

@@ -138,6 +138,15 @@ pub const TraceRecord = struct {
     /// neither), indexed like it. Owned; freed in `destroy`; never
     /// serialized.
     exit_side_misses: []u8 = &.{},
+    /// Doc 64 §10 step 3: per exit, the entry pc of the child an ATTACHED
+    /// exit is bound to (`exitSideTarget`'s `entry_pc`: `P` for a
+    /// continuation, the header for a loop root behind the marker at `P`),
+    /// or `NO_EXIT_SIDE_ENTRY`. Which of the two serves an exit depends on
+    /// the slab's types at run time, so the region topology reads this
+    /// instead of guessing (`resolveSuccessorAnchor`). Allocated with
+    /// `exit_side` (all three or none), indexed like it. Owned; freed in
+    /// `destroy`; never serialized.
+    exit_side_entry: []u32 = &.{},
     /// Doc 56 (`maxside`, LuaJIT's `J->param[JIT_P_maxside]`): how many
     /// exit-side children this trace has bound. Once it reaches `maxside`
     /// no further exit of this trace becomes wanted.
@@ -209,6 +218,8 @@ pub const TraceRecord = struct {
     /// committed — stop counting it. Saturation caps at `DONE - 1` so an exit can
     /// never drift into DONE by counting alone.
     pub const EXIT_COUNT_DONE: u8 = 255;
+    /// `exit_side_entry` of an exit bound to no child.
+    pub const NO_EXIT_SIDE_ENTRY: u32 = std.math.maxInt(u32);
 
     pub fn destroy(self: *TraceRecord, gpa: std.mem.Allocator) void {
         // Native pages can contain references to code-owned metadata. Tear them
@@ -218,6 +229,7 @@ pub const TraceRecord = struct {
         if (self.exit_counts.len != 0) gpa.free(self.exit_counts); // hotexit counters
         if (self.exit_side.len != 0) gpa.free(self.exit_side);
         if (self.exit_side_misses.len != 0) gpa.free(self.exit_side_misses);
+        if (self.exit_side_entry.len != 0) gpa.free(self.exit_side_entry);
         gpa.destroy(self);
     }
 

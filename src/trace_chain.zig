@@ -1952,11 +1952,13 @@ pub fn replayLedgerFrom(
                     @panic("replayLedger: exit_side successor id did not resolve");
                 if (!self.hasArmedExitSide(owner, e.exit, succ))
                     @panic("replayLedger: exit_side row has no armed exit-side link to its successor");
-                if (!(succ.code.anchor.proto == owner.code.anchor.proto and succ.code.anchor.pc == p and
-                    succ.code.instrs.len != 0 and succ.code.instrs[succ.code.instrs.len - 1].op == .link))
-                    @panic("replayLedger: exit_side successor is not a continuation at the resume pc");
+                // Doc 64 step 3: the successor is a continuation at `P` or
+                // the loop root behind the marker there; the cursor resumes
+                // at its entry, where its deopts publish their resume.
+                const target = TraceState.exitSideTarget(owner, e.exit, succ) orelse
+                    @panic("replayLedger: exit_side successor does not serve the exit");
                 self.exit_side_fused +|= 1;
-                applyEdgeCursorTransition(cursor, .exit_side, owner, succ, e.exit, p, local, resume_pc);
+                applyEdgeCursorTransition(cursor, .exit_side, owner, succ, e.exit, target.entry_pc, local, resume_pc);
             },
             .region_bridge => {
                 // A bridge commits its distinct cross-anchor snapshot before

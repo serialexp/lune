@@ -2,7 +2,8 @@
 
 Status: **reviewed (round 1, §9), decided (§10); step 1 (diagnosis)
 done (§11), which corrects §3 P1; step 2 (typed chain outcome, 2b, 2d)
-built (§12). Next: step 3 (3b).**
+built (§12); step 3 (3b, the marker root) built (§13). Next: step 4
+(re-profile; 1e and/or 2c).**
 Bart asked for this doc and for Codex's and Antigravity's opinions
 before picking options. Corrections from the reviews are applied in
 place and listed in §9. Where the reviewers disagreed, Bart asked me to
@@ -670,3 +671,171 @@ switched off):
   (doc 64's `while`-in-`for` nest). It checks that natural stops never
   give the exit up, that `tryside` misfits do and file it, and that a
   `.link` commit at `P` revives it exactly once.
+
+## 13. Step 3 result: the loop root behind the marker (2026-10-21)
+
+**What was built.**
+- **One resolved-target description** (`ExitSideTarget`, `exitSideTarget`
+  in `trace_link.zig`). A child serves exit `e` of a parent in one of
+  two ways:
+  - a `.link` continuation anchored at `P`, entered at `P`;
+  - a loop root at the header of the `.loop` marker at `P`, entered at the
+    header.
+
+  The root must end in `.loop`, must not be the parent's own anchor, and
+  must be neither peeled nor precise. The marker writes nothing, so a slab
+  that is coherent at `P` is coherent at the header too. That is the same
+  entry tier-0's patched marker makes. Arming (`arm`'s `.exit_side`
+  case), ledger replay (`replayLedger`'s `.exit_side` successor check),
+  silent promotion (`promotedEdgeFromLink`) and the topology all read
+  this one description.
+- **Root first, 3a's runtime path** (`routeExitSide`, step 0). Before
+  any chain, `exitSideRootServes` looks for a root behind the marker
+  (most hits, then lowest id, the `nextTraceExcluding` pick) whose entry
+  guards the materialized slab satisfies. If there is one, the exit is
+  bound to it (`ExitSideBind.root`), armed to it natively, and tier-0
+  resumes at `P`, where the marker's entry patch enters the root. No
+  composite at `P` runs first and mutates the slab.
+- **Bound entry, per exit** (`Trace.exit_side_entry`, set by
+  `setExitSideEntry` on bind, arm and give-up). The topology
+  (`resolveSuccessorAnchor`) takes an attached exit's successor from
+  the bound entry, and falls back to `P` when the exit is unbound.
+  Re-binding requests a region rebuild at the post-walk drain tail only
+  when the effective successor changes.
+- **Retarget on root commit, and 2d's loop-root half**
+  (`reviveExitSideAt`):
+  - A committed root at `loopHeaderOf(P)` revives given-up exits waiting
+    at `P` that it fits.
+  - It also disarms every exit still armed to a continuation at `P` that
+    the root would fit (`exit_side_root_retargets`). The next firing
+    routes, finds the root first, and arms to it.
+
+**Why the bound entry is per exit, not static.** The first build let the
+topology prefer the root whenever one existed at the header. fft got
++47.6% instructions. In bit-reverse, two exits resume at the same
+marker:
+- The `for` root's exit carries a float `j`, which the `while` root
+  accepts.
+- The `if i < j` side trace's exit (t5 e6) carries an int `j`. The root
+  refuses it, so it binds to the continuation at the marker.
+
+The topology then said "root" where the arm said "continuation". The
+region's external entries stopped being unique, owner election failed,
+the region minted non-armable, and silent promotion was lost ("no active
+region"; the new `silent-consider:` probes in `considerSilentPromotion`
+show it). Which child serves an exit depends on its slab types, and only
+the binding knows them, hence `exit_side_entry`. The exit snapshot's
+types are fixed by the parent's IR, so the binding is stable for the
+exit's life.
+
+**An entry at the parent's own anchor is no edge.** The static rule
+already excluded `P == t.anchor` ("every other guard deopts to its own
+anchor and contributes no edge"). The bound-entry branch had dropped
+that exclusion, and it was found in the cost check below. spectral-norm's
+`Atv` t5 e7 resumes at t5's own anchor and binds to a `.link` sibling
+there. That published a 19→19 self-edge and minted a region the base
+never had (spectral-norm +0.04%). On nsieve-bit-fp the same thing minted
+a non-armable `self_loop` region at the `while` marker composite. With
+the exclusion restored, spectral-norm matches the base's topology, and
+nsieve-bit-fp moved from −15.60% to −16.02%.
+
+**Kernel, m = 160000**, base HEAD (`ddfd6b9`, which also carries the
+compiler change `69fec42`, so §12's pcs shifted) against step 3, without
+coverage:
+
+| | base | step 3 |
+|---|---|---|
+| exit-side give-ups | 1 (t1 e15, P3) | 0 |
+| root retargets | — | 2 (t1 e15 and t6 e10 from composites to the root t7) |
+| natural stops / misfits | 770 / 1 | 769 / 1 |
+| `region_decay` gates | 1 | 1 |
+| debug-log lines (a proxy for seam traffic) | 455k | 280k |
+
+**Full bench (`nsieve-bit-fp.lua 6`)**:
+
+| | base | step 3 |
+|---|---|---|
+| exit-side give-ups | t1 e17 (P3), t7 e10 | t7 e10, t4 e27 (teardown, last 700 of 1.5M log lines) |
+| t1 e17 | gave up after 4 composite chains | bound to root t7 (39 → 40) and armed; 6 routed hops in the whole run |
+| t4 e27 (outer prime path) routed hops | 16 | 10,554 (now exit-side armed) |
+| gates on pc 36 (`for k` header): `region_decay` / `legacy_thrash` | 3 / 22,015 | 10,890 / 10,540 |
+| region closes: departure / `source_outside` | 59,224 / 29 | 51,565 / 10,555 |
+| regions minted (non-armable) | 6 (0) | 6 (0) |
+
+What is left is two step-4 inputs, not a step-3 fault:
+- **The `for k` turnstile.** t7 e10 still gives up, at the start of the
+  second `nsieve` call, on §12's real misfits at t8 e23. That is 2c
+  territory: a sibling at pc 63 would serve it and revive the exit.
+  Without that arm, in the third call the `for k` activations close at
+  departure with work 6–7, under `min_useful`. The owner's penalty
+  saturates within 7 strikes, and from then on every short activation
+  gates and tears down (§11's mechanism, strike count up to 21,430). The
+  total gate count barely moved (22,545 → 21,474); it is split between the
+  two machines now. This is 1e's question (is a close at the owner loop's
+  own exit a strike?) and 2c's (who serves the flipped branch), and step
+  4 re-profiles to pick.
+- **Outer-region displacement.** The `source_outside` closes are §11's
+  rid=2 pattern at full strength: the outer `for i` region (owner 19)
+  closes every time t1 e17 enters the `for k` region. Before step 3 that
+  exit had given up, so it hardly happened (29). One activation per frame
+  means the nested region displaces the enclosing one. Step 4 measures
+  what this costs.
+
+**Cost.** Instructions (`perf stat`, the shadow A/B, every `@bench`
+program, `--jit-native`, outputs identical):
+
+| bench | Δ instructions |
+|---|---|
+| nsieve-bit-fp | −16.02% |
+| scimark-fft | −23.67% |
+| repack_adversarial | −0.09% |
+| scimark-lu, spectral-norm | +0.04%, +0.02% |
+| while_shortcircuit_probe | +0.51% (+5.4k) |
+| every other | within ±0.01% |
+
+Cycles (three interleaved `perf stat` pairs, loadavg ~1.1):
+nsieve-bit-fp 995.8M → 832.7M (−16.4%), fft median 603.1M → 449.7M
+(−25.4%).
+
+Two residuals are recorded, not hunted further:
+- **while_shortcircuit_probe's +5.4k.** It is constant across n
+  (120/1,200/12,000), absent on an empty script, and the probe's debug
+  log matches the base's apart from two bind lines that request no
+  rebuild. So it is a fixed per-process cost, about a microsecond.
+- **lu's and spectral-norm's last few hundredths of a percent.** Their
+  debug logs match the base's (lu: only the new probe lines). perf
+  throttles below the resolution that could attribute them, so they read
+  as codegen/layout effects of the larger `Trace`/`TraceState`.
+
+**Known leftovers (TODO).**
+- fft's bit-reverse records duplicate identical roots at its `while`
+  header (t7/t13/t14/t16 at pc 47). This predates step 3, which only
+  picks among them.
+- Each root commit retargets armed exits, including ones whose types
+  the root refuses (t5 e6 on fft). Those re-route, refuse the root and
+  re-arm to the continuation. This is bounded by commits. A static
+  type-fit check from the exit snapshot at commit would skip it.
+- Owner election after a bind change is covered by the fft A/B (+47.6%
+  without the per-exit entry) but not by a unit test.
+
+**Witnesses** (mutation-checked):
+- `src/interp_exit_side_test.zig` "doc 64 step 3: bit-reverse binds one
+  marker exit to the while root, and one whose types differ to its
+  continuation":
+  - every armed exit-side link agrees with its exit's bound entry and with
+    the topology's successor;
+  - at least one is armed to the root and one to a continuation;
+  - roots were routed;
+  - an entry at the parent's own anchor is never a successor.
+
+  It fails with `exitSideRootServes` disabled, and with the own-anchor
+  exclusion removed.
+- `src/interp_nest_test.zig` "doc 64 step 3: a loop root committed behind
+  a marker takes over the exit a composite served" (a `while` that needs
+  0 trips at first, so a composite serves its exit before the root
+  exists): at least one retarget, at least one root route, and the armed
+  `.loop` child sits behind a marker with the bound entry equal to its
+  header. It fails with root routing disabled, and with the retarget
+  disabled.
+- The tier-1a repeat test and the R2 canonical-pick test now accept a
+  root target.

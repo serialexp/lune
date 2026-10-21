@@ -4422,6 +4422,8 @@ pub const Vm = struct {
     /// Doc 56 Phase 5: the routing half of `consumeExitSide` — everything
     /// after the receipt. Also run for an exit whose unarmed adapter ended a
     /// replayed native ledger (`consumeExitSideTerminal`).
+    ///   0. Doc 64 step 3: a loop root behind the `.loop` marker at `P` that
+    ///      fits the slab serves the exit first (bind, arm, resume at `P`).
     ///   1. Chain into a `.link` continuation at `P`. One that runs to its
     ///      `.link` serves the exit: bind a wanted exit to it, and (native)
     ///      arm the adapter to jump straight into it next time.
@@ -4449,6 +4451,20 @@ pub const Vm = struct {
         const ei = result.exit_instr;
         const p = ct.code.exitResumePc(ei).?;
         const anchor_pc: usize = ct.code.anchor.pc;
+        // Doc 64 §10 step 3 (3b): a loop root behind the `.loop` marker at
+        // `P` whose entry types the slab satisfies serves the exit, ahead of
+        // any continuation at `P`. Bind (and natively arm) the exit to it,
+        // then resume tier-0 at `P`: the marker's entry patch enters the
+        // root there, through its ordinary entry and entry checks.
+        if (ts.exitSideRootServes(ct, ei, regs)) |root| {
+            ts.exit_side_root_routes +|= 1;
+            ts.noteExitSideChain(ct, ei, .served);
+            ts.bindExitSide(ct, ei, .root, root);
+            ts.setExitSideEntry(ct, ei, root);
+            if (tier == .native_only) ts.armExitSide(ct, ei, root, safe_to_arm);
+            if (mode == .full and self.runFastPath()) return .{ .switch_mode_at = p };
+            return .{ .resume_tier0 = p };
+        }
         const chained = ts.driveChain(ct, result, proto, regs, tier, .{ .exit_side = p }, &.{}, safe_to_arm, self.unicode_version_pinned);
         // §4.8.3 R4: an attached exit whose chain keeps missing gives up;
         // doc 64 §10 step 2: a chain that ran into the end of an enclosing
@@ -4457,7 +4473,8 @@ pub const Vm = struct {
         if (chained) |chain| {
             if (chain.linked_trace) |child| {
                 ts.exit_side_chains +|= 1;
-                ts.bindExitSide(ct, ei, .chain);
+                ts.bindExitSide(ct, ei, .chain, child);
+                ts.setExitSideEntry(ct, ei, child);
                 if (tier == .native_only) ts.armExitSide(ct, ei, child, safe_to_arm);
                 return .{ .resume_tier0 = chain.resume_pc orelse anchor_pc };
             }

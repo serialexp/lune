@@ -49,10 +49,29 @@ WORST BOARD ROW (2026-10-19, amber-badger): nsieve-bit-fp.
   removed step 1's `region_decay` gates (5,801 → 3), so the step 1
   witness was flipped. Left on the bench: t1 e15 gives up (P3, step 3),
   and t7 e10 gives up late on real misfits at t8 e23. After those
-  give-ups, 22,015 `legacy_thrash` gates on pc 45. Next: step 3 (3b,
-  bind the exit to the loop root behind the `.loop` marker, root offered
-  before the composites, one resolved-target description, plus 2d's
-  loop-root revival).
+  give-ups, 22,015 `legacy_thrash` gates on pc 45. Step 3 done (doc 64
+  §13):
+  - `ExitSideTarget` is the one resolved-target description.
+  - The root behind the marker is offered first in `routeExitSide`.
+  - The binding is per exit (`Trace.exit_side_entry`), and the topology
+    reads it.
+  - A root commit retargets exits armed to composites, and revives
+    given-up exits at that marker.
+
+  Instructions: nsieve-bit-fp −16.02% and fft −23.67%; cycles −16.4% and
+  −25.4%. Everything else is within ±0.05%, except the probe's fixed +5.4k.
+
+  Found on the way and fixed: a bound entry at the parent's own anchor
+  became a self-edge (spectral-norm minted a region, nsieve-bit-fp a
+  non-armable one).
+
+  Left on the bench: t7 e10's give-up (2c) and the `for k` turnstile it
+  triggers in the third call (10,890 `region_decay` + 10,540
+  `legacy_thrash` gates on pc 36, 1e), plus outer-region displacement
+  (10,555 `source_outside` closes).
+
+  Next: step 4, re-profile and pick 1e and/or 2c; then step 5 (1d), then
+  step 6 (P4).
 
 TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff per effort".
 - The plan and every item's numbers are in TODO.md "Tier-0 interpreter

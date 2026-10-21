@@ -206,6 +206,10 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
          gates (5,801 → 3, doc 64 §12)**; the strikes came from activations
          that had lost t7's `while` arm. After the two late give-ups below,
          the turnstile returns as 22,015 `legacy_thrash` gates on pc 45.
+         **After step 3 (doc 64 §13, pcs shifted by 69fec42: header now
+         36)** the gates are split 10,890 `region_decay` / 10,540
+         `legacy_thrash`, all in the third `nsieve` call, after t7 e10's
+         give-up (item 2). Step 4 decides between 1e and 2c.
       2. [x] **A chain that ends at the enclosing loop's own loop-done
          counted as a miss.** Fixed 2026-10-21 (doc 64 step 2, §12):
          chains are classified served / natural stop / misfit, and a
@@ -214,8 +218,12 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
          4 real misfits at t8 e23 (the post-`while` branch flips direction
          when the next `nsieve` call re-initialises the array; a sibling at
          pc 63 would serve it and revive the exit).
-      3. **The exit-side chain at a `.loop` marker never tries the root
-         at its header.** t1's `while` exit resumes at pc 53, the
+      3. [x] **The exit-side chain at a `.loop` marker never tries the root
+         at its header.** Fixed 2026-10-21 (doc 64 step 3, §13): the root
+         is offered first (`exitSideRootServes`), bound per exit
+         (`exit_side_entry`, which the topology reads), and a root commit
+         retargets exits armed to composites. t1's exit now stays bound to
+         the root. Instructions: nsieve-bit-fp −16.02%, fft −23.67%. t1's `while` exit resumes at pc 53, the
          `.loop` marker whose header is 54 (rule 8 refuses a header as
          `P`). `driveChain` offers only traces anchored at 53, the
          composites t2/t6 (one and two trips, `link -> 45`), never t7,
@@ -246,7 +254,7 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
       recording failures. Fixed 2026-10-21 (doc 64 step 2, 2d): a given-up
       exit waits under its resume pc, and the next `.link` continuation
       committed there returns it to `.none`, once per commit. The
-      loop-root half (a root at `loopHeaderOf(P)`) comes with step 3.
+      loop-root half (a root at `loopHeaderOf(P)`) landed with step 3.
 - [ ] **A chain that hands off to a same-anchor sibling which then links
       is not counted as linked** (`routeExitSide` reads `linked_trace`,
       set only when the entered candidate's own `.link` row heads the
@@ -296,6 +304,21 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
       no reset). Doc 64 step 4 may remove the strikes on this shape; the
       repeated teardown of an already-abandoned owner is a separate
       question.
+- [ ] **fft's bit-reverse records duplicate identical `while` roots**
+      (t7/t13/t14/t16 at pc 47, same shape). Predates doc 64 step 3, which
+      only picks among them (most hits, lowest id). Find why a root
+      already present does not stop the re-recording. Doc 64 §13.
+- [ ] **A root commit retargets exits whose types the root refuses.**
+      `reviveExitSideAt` disarms every exit armed to a continuation at
+      `P` that `exitSideTarget` admits, which is a shape check only. On
+      fft, t5 e6 (int `j`) is disarmed, re-routes, is refused by the float
+      root and re-arms to its continuation. Bounded by commits. Refinement:
+      check the exit snapshot's static types against the root's entry
+      guards at commit. Doc 64 §13.
+- [ ] **No unit test for owner election after an exit-side bind change.**
+      Doc 64 step 3's per-exit bound entry exists because a topology that
+      disagreed with the arm made fft's region non-armable (+47.6%). Only
+      the fft A/B covers it. Doc 64 §13.
 
 ## Vendor bundle leftovers (noted 2026-10-13)
 
