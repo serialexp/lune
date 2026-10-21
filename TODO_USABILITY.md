@@ -139,9 +139,10 @@ effect log so runs stay replayable (doc 02).
       `viz/test/wasm-url.test.ts` pins it. Verified by clicking Run in
       headless Chrome on a `-Dviz-dist` build (v0.1.2 404s, fixed prints
       `5050`). Needs a v0.1.3 to reach users.
-- [ ] A permanent click-Run smoke test: `tools/cli-smoke.sh` only checks
-      that `/mahina.wasm` is served. Needs a browser in CI (playwright-core
-      + Chrome) — Bart to decide.
+- [x] A permanent click-Run smoke test (2026-10-21):
+      `viz/e2e/browser-smoke.ts` drives `mahina viz` in headless Chrome
+      (trace load, Run, Run both + diff, Replay); the `viz-browser-smoke`
+      job in `bundle.yml` runs it and gates releases.
 - [ ] No source mapping: traces are `proto 0:6` (bytecode pcs); the trace
       format (`schema/trace.json`) has no line info. Clicking a trace or IR
       row highlights nothing.

@@ -26,7 +26,11 @@ pnpm install
 pnpm dev           # vite dev server; open the printed URL
 pnpm build         # tsc --noEmit && vite build  → dist/
 pnpm test          # `bun test`: cross-language decode + disasm + store tests
+pnpm smoke:browser <mahina>   # drive `mahina viz` in headless Chrome (e2e/)
 ```
+
+`smoke:browser` needs a CLI with the UI embedded (`just cli`) and a system
+Chrome; CI runs it on every CLI build.
 
 `mahina viz [trace.mahinatrace]` serves a built copy of this app from the CLI
 itself, `POST /run` included (`just cli` builds CLIs with it embedded; see
@@ -57,6 +61,7 @@ zig build
 - `fixtures/` — `counting-loop.lua` + the committed `counting-loop.mahinatrace`
   cross-language fixture.
 - `test/` — `bun test` specs.
+- `e2e/browser-smoke.ts` — the headless-Chrome smoke test (`pnpm smoke:browser`).
 
 ## Regenerating the decoder
 

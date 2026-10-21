@@ -9,7 +9,8 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "test": "bun test"
+    "test": "bun test",
+    "smoke:browser": "node e2e/browser-smoke.ts"
   },
   "dependencies": {
     "@codemirror/commands": "^6.10.3",
@@ -23,6 +24,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "playwright-core": "^1.64.1",
     "typescript": "^5.6.3",
     "vite": "^6.0.7",
     "vite-plugin-solid": "^2.11.0"

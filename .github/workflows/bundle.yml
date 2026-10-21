@@ -14,7 +14,8 @@ name: vendor bundle and CLI
 #   - usable on a native runner per target, nothing skipped (--strict): a
 #     minimal Rust crate built against the bundle with NO zig installed links
 #     and runs one VM lifecycle (tools/bundle-smoke.sh); the CLI runs scripts
-#     and serves its UI and POST /run (tools/cli-smoke.sh).
+#     and serves its UI and POST /run (tools/cli-smoke.sh), and that UI works
+#     when driven in headless Chrome (viz/e2e/browser-smoke.ts).
 #
 # Releases: pushing a tag `vX.Y.Z` runs the same builds + proofs and then
 # publishes both as one GitHub Release (`release` job below). The tag must
@@ -248,11 +249,42 @@ jobs:
         if: runner.os != 'Windows'
         run: bash tools/install-smoke.sh mahina-cli
 
+  # The visualiser driven in headless Chrome (viz/e2e/browser-smoke.ts):
+  # load a trace, Run (wasm), Run both + diff, Replay. cli-smoke proves the
+  # page's files are served; this proves the page works. Once, on x86-64
+  # Linux: the page is the same bytes on every platform.
+  viz-browser-smoke:
+    name: visualiser in a browser
+    needs: cli
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: mahina-cli
+          path: mahina-cli
+
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: viz/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Drive mahina viz in Chrome
+        run: |
+          set -eu
+          tar -xzf mahina-cli/mahina-x86_64-linux.tar.gz -C "$RUNNER_TEMP"
+          cd viz
+          pnpm install --frozen-lockfile
+          pnpm run smoke:browser "$RUNNER_TEMP/mahina-x86_64-linux/mahina"
+
   release:
     name: publish the release
     # Only for version tags, and only once every target's smoke passed.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [bundle, smoke, cli, cli-smoke]
+    needs: [bundle, smoke, cli, cli-smoke, viz-browser-smoke]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
