@@ -140,6 +140,20 @@ try {
     await page.locator(".run-stdout").filter({ hasText: "short" }).waitFor({ timeout });
   });
 
+  await step("Stop ends a runaway program, and the next Run works", async () => {
+    await page.locator(".cm-content").click();
+    await page.keyboard.press("ControlOrMeta+A");
+    await page.keyboard.insertText("while true do end\n");
+    await page.getByRole("button", { name: "Run (wasm)" }).click();
+    await page.getByRole("button", { name: "Stop" }).click({ timeout });
+    await page.locator(".run-error").filter({ hasText: "stopped" }).waitFor({ timeout });
+    await page.locator(".cm-content").click();
+    await page.keyboard.press("ControlOrMeta+A");
+    await page.keyboard.insertText("print('after stop')\n");
+    await page.getByRole("button", { name: "Run (wasm)" }).click();
+    await page.locator(".run-stdout").filter({ hasText: "after stop" }).waitFor({ timeout });
+  });
+
   await step("a binary file is refused as source", async () => {
     writeFileSync(join(work, "blob.mahina"), new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0, 1, 2]));
     await page.locator("section.editor input[type=file]").setInputFiles(join(work, "blob.mahina"));

@@ -28,12 +28,18 @@ function fromBase64(b64: string): Uint8Array {
 
 /** Run `source` (with optional script `args` → `arg[1..]`) through the native
  *  binary via `vite dev` or `mahina viz`. Throws if the endpoint is unavailable
- *  (a static host of `dist/`). */
-export async function runNative(source: string, args: string[] = []): Promise<RunArtifacts & { diagnostics: string; coverage: Uint8Array }> {
+ *  (a static host of `dist/`). `signal` abandons the request (Stop); the
+ *  server's own per-run timeout ends the native process. */
+export async function runNative(
+  source: string,
+  args: string[] = [],
+  signal?: AbortSignal,
+): Promise<RunArtifacts & { diagnostics: string; coverage: Uint8Array }> {
   const resp = await fetch("/run", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ source, args }),
+    signal,
   });
   if (!resp.ok) {
     throw new Error(`POST /run: ${resp.status} ${resp.statusText} (needs \`vite dev\` or \`mahina viz\`)`);

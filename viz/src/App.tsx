@@ -10,6 +10,7 @@ import {
   loadSourceBytes,
   loadDroppedFile,
   setScriptArgs,
+  stopRun,
   coverageStripesShown,
   COVERAGE_LABEL,
 } from "./store";
@@ -128,6 +129,11 @@ export default function App() {
             <button type="button" disabled={state.running} onClick={() => void runWasm()}>
               {state.running ? "Running…" : "Run (wasm)"}
             </button>
+            <Show when={state.running}>
+              <button type="button" class="stop" title="Stop the running program" onClick={stopRun}>
+                Stop
+              </button>
+            </Show>
             <button
               type="button"
               class="secondary"

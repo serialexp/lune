@@ -62,6 +62,22 @@ button:hover {
   border-color: var(--accent);
 }
 
+/* Disabled buttons look it (they used to look clickable mid-run). */
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+  border-color: var(--border);
+}
+
+/* Stop, shown beside the run buttons while a program runs. */
+button.stop {
+  color: #f7768e;
+  border-color: #6b3a4f;
+}
+button.stop:hover {
+  border-color: #f7768e;
+}
+
 .filename {
   color: var(--fg);
 }

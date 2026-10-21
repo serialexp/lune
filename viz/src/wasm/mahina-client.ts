@@ -91,6 +91,28 @@ class MahinaWorkerClient {
     // session), so DON'T transfer it — the worker gets a structured-clone copy.
     return this.#call<MahinaReplayResult>({ method: "replay", src, effects, stopAfter });
   }
+
+  /** Stop whatever the worker is doing (a runaway `while true do end`): the VM
+   *  runs synchronously inside the worker and can't be interrupted, so the
+   *  worker is terminated. Every in-flight call rejects with `StoppedError`;
+   *  the next call spawns a fresh worker (the browser has the wasm cached). */
+  stop(): void {
+    if (this.#worker === null) return;
+    this.#worker.terminate();
+    this.#worker = null;
+    this.#initId = null;
+    const err = new StoppedError();
+    for (const [, p] of this.#pending) p.reject(err);
+    this.#pending.clear();
+  }
+}
+
+/** The rejection of a call cut short by `stop()`. */
+export class StoppedError extends Error {
+  constructor() {
+    super("stopped");
+    this.name = "StoppedError";
+  }
 }
 
 /** Lazily-constructed singleton, mirroring the old `mahina()` helper. */

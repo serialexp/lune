@@ -7,7 +7,7 @@ import { decodeTraceFile, decodeExecLogFile, decodeCoverageFile, type TraceExecL
 import { viewsOf, type TraceView } from "./disasm";
 import { flattenExec, type ExecStep } from "./exec";
 import { type MahinaRunResult, type MahinaReplayResult, type MahinaDiagnostic, type BacktraceFrame, type ProtoDisasm } from "./wasm/mahina";
-import { mahinaWorker } from "./wasm/mahina-client";
+import { mahinaWorker, StoppedError } from "./wasm/mahina-client";
 import { runNative } from "./native";
 import { diffRuns, type DiffReport } from "./diff";
 import { decodeSnapshot, type SnapshotView } from "./snapshot";
@@ -483,6 +483,7 @@ export function stepReplay(delta: number): void {
  */
 export async function runWasm(): Promise<void> {
   setState({ running: true, runError: null, runErrorSpan: null, runBacktrace: null, diff: null });
+  runAbort = new AbortController();
   try {
     const src = state.source;
     const result = await mahinaWorker().runSource(src, wasmArgv());
@@ -491,11 +492,30 @@ export async function runWasm(): Promise<void> {
     // the panel's time column reverts to "run native".
     setState({ running: false, nativeCoverage: null });
   } catch (e) {
-    setState({
-      running: false,
-      runError: e instanceof Error ? e.message : String(e),
-    });
+    setState({ running: false, runError: runFailureText(e) });
+  } finally {
+    runAbort = null;
   }
+}
+
+/** Cancels the in-flight run's native request (`runBoth`); null when idle. */
+let runAbort: AbortController | null = null;
+
+/** Stop the in-flight run (the Stop button): terminate the wasm worker, which
+ *  can't otherwise be interrupted mid-program, and abandon the native request.
+ *  The run's own catch then reports it stopped. No-op when idle. */
+export function stopRun(): void {
+  if (!state.running) return;
+  runAbort?.abort();
+  mahinaWorker().stop();
+}
+
+/** The message for a run that threw: a plain "stopped" for Stop, else the error. */
+function runFailureText(e: unknown): string {
+  if (e instanceof StoppedError || (e instanceof DOMException && e.name === "AbortError")) {
+    return "stopped (Stop pressed before the program finished)";
+  }
+  return e instanceof Error ? e.message : String(e);
 }
 
 /**
@@ -507,6 +527,8 @@ export async function runWasm(): Promise<void> {
  */
 export async function runBoth(): Promise<void> {
   setState({ running: true, runError: null, runErrorSpan: null, runBacktrace: null, diff: null });
+  runAbort = new AbortController();
+  const signal = runAbort.signal;
   try {
     const src = state.source;
     // wasm gets `[scriptName, ...userArgs]`; native gets the raw userArgs and
@@ -515,7 +537,7 @@ export async function runBoth(): Promise<void> {
     const userArgs = parseArgsString(state.scriptArgs);
     const [wasm, native] = await Promise.all([
       mahinaWorker().runSource(src, wasmArgv()),
-      runNative(src, userArgs),
+      runNative(src, userArgs, signal),
     ]);
     applyWasmResult(wasm, "(wasm + native diff)", src);
     // The native run carries the honest time-weighted coverage (real TSC cycles).
@@ -530,10 +552,12 @@ export async function runBoth(): Promise<void> {
     }
     setState({ diff: diffRuns(wasm, native), running: false, nativeCoverage });
   } catch (e) {
-    setState({
-      running: false,
-      runError: e instanceof Error ? e.message : String(e),
-    });
+    // One side failing (or Stop) leaves the other running: stop it too, so
+    // a runaway wasm half doesn't keep the worker busy behind a native error.
+    if (state.running) mahinaWorker().stop();
+    setState({ running: false, runError: runFailureText(e) });
+  } finally {
+    runAbort = null;
   }
 }
 
