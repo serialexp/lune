@@ -15,6 +15,7 @@ import {
   loadSourceBytes,
   loadDroppedFile,
   decodeSourceText,
+  coverageLineTitle,
   setScriptArgs,
   execLogFor,
 } from "../src/store";
@@ -44,6 +45,23 @@ test("loadBytes on garbage records an error, not a crash", () => {
   expect(state.version).toBeNull();
   expect(state.traces.length).toBe(0);
   expect(state.selected).toBe(-1);
+});
+
+test("a loaded trace drops the last run's execution logs", () => {
+  // Trace ids restart at 0 in every run, so a stale log would join to (and
+  // animate) a different program's trace.
+  loadBytes("counting-loop.mahinatrace", bytes);
+  expect(state.execLogs).toEqual([]);
+  expect(state.execLogsRecorded).toBe(false);
+});
+
+test("a coverage stripe's tooltip gives the class and the counts behind it", () => {
+  expect(coverageLineTitle({ cls: "native", native: 43, coveredInterp: 57, uncovered: 0 })).toBe(
+    "ran native — loop iterations: 43 native · 57 interpreted (warm-up included)",
+  );
+  expect(coverageLineTitle({ cls: "uncovered", native: 0, coveredInterp: 0, uncovered: 12000 })).toBe(
+    "no trace, ran tier-0 — loop iterations: 0 native · 12,000 interpreted, no trace",
+  );
 });
 
 test("decodeSourceText accepts UTF-8 text and refuses binary", () => {

@@ -9,7 +9,7 @@ import { EditorState, StateField, StateEffect } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { indentOnInput, bracketMatching } from "@codemirror/language";
 import { lintGutter, lintKeymap } from "@codemirror/lint";
-import { state, setSource, checkSource, coverageByLine, type CoverageClass } from "../store";
+import { state, setSource, checkSource, coverageByLine, coverageLineTitle, type CoverageClass } from "../store";
 import { mahinaLanguage, mahinaHighlighting } from "./mahinaLanguage";
 import { mahinaLinter, byteToUtf16 } from "./mahinaLinter";
 
@@ -80,7 +80,7 @@ const COVERAGE_CLASS: Record<CoverageClass, string> = {
   uncovered: "cm-cov-uncovered",
 };
 
-const setCoverage = StateEffect.define<{ line: number; cls: CoverageClass }[] | null>();
+const setCoverage = StateEffect.define<{ line: number; cls: CoverageClass; title: string }[] | null>();
 
 const coverageField = StateField.define<DecorationSet>({
   create: () => Decoration.none,
@@ -94,7 +94,9 @@ const coverageField = StateField.define<DecorationSet>({
           .filter((c) => c.line >= 1 && c.line <= lines)
           .sort((a, b) => a.line - b.line)
           .map((c) =>
-            Decoration.line({ class: COVERAGE_CLASS[c.cls] }).range(tr.state.doc.line(c.line).from),
+            Decoration.line({ class: COVERAGE_CLASS[c.cls], attributes: { title: c.title } }).range(
+              tr.state.doc.line(c.line).from,
+            ),
           );
         return Decoration.set(ranges);
       }
@@ -210,7 +212,7 @@ export default function MahinaEditor() {
   createEffect(() => {
     if (!view) return;
     const byLine = coverageByLine();
-    const entries = Array.from(byLine, ([line, c]) => ({ line, cls: c.cls }));
+    const entries = Array.from(byLine, ([line, c]) => ({ line, cls: c.cls, title: coverageLineTitle(c) }));
     view.dispatch({ effects: setCoverage.of(entries.length > 0 ? entries : null) });
   });
 

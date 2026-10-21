@@ -99,6 +99,10 @@ interface VizState {
    *  joins to its trace by id — cache positions reshuffle when traces retire.
    *  Empty when nothing ran hot. */
   execLogs: TraceExecLogOutput[];
+  /** Whether `execLogs` came from a run (which records them) — false for a
+   *  loaded `.mahinatrace`, which holds the traces only. Tells "this trace never
+   *  executed" apart from "this file has no execution logs to show". */
+  execLogsRecorded: boolean;
   /** Animation slider position: an index into the selected trace's flattened
    *  event stream (`traceExecSteps()`). Reset to 0 on run / trace change. */
   traceExecPos: number;
@@ -146,6 +150,26 @@ function classifyLine(c: LineCoverage): CoverageClass {
   if (c.uncovered > 0) return "uncovered";
   // All-zero anchor (has_trace set but never iterated): treat as the smell.
   return "covered-interpreted";
+}
+
+/** Short labels for the coverage classes, shared by the editor's stripe legend
+ *  and tooltips. */
+export const COVERAGE_LABEL: Record<CoverageClass, string> = {
+  native: "ran native",
+  "covered-interpreted": "traced, but ran tier-0",
+  uncovered: "no trace, ran tier-0",
+};
+
+/** The hover text for a coverage stripe: the line's class and the iteration
+ *  counts behind it. "Interpreted" on a traced line includes the warm-up
+ *  iterations before the trace existed — the per-anchor counts don't separate
+ *  them (only the run's aggregate does). Pure. */
+export function coverageLineTitle(c: LineCoverage): string {
+  const n = (x: number) => x.toLocaleString("en-US");
+  const parts = [`${n(c.native)} native`];
+  if (c.coveredInterp > 0) parts.push(`${n(c.coveredInterp)} interpreted (warm-up included)`);
+  if (c.uncovered > 0) parts.push(`${n(c.uncovered)} interpreted, no trace`);
+  return `${COVERAGE_LABEL[c.cls]} — loop iterations: ${parts.join(" · ")}`;
 }
 
 /** The safepoint indices the slider steps through for a grain. `instr` is every
@@ -210,6 +234,7 @@ const [state, setState] = createStore<VizState>({
   replayView: null,
   disasm: [],
   execLogs: [],
+  execLogsRecorded: false,
   traceExecPos: 0,
   coverage: null,
   nativeCoverage: null,
@@ -382,6 +407,7 @@ function applyWasmResult(result: MahinaRunResult, fileName: string, source: stri
     replayView: null,
     disasm: result.disasm,
     execLogs,
+    execLogsRecorded: true,
     traceExecPos: 0,
     coverage,
   });
@@ -523,9 +549,13 @@ export function loadBytes(name: string, bytes: Uint8Array): void {
       selected: traces.length > 0 ? 0 : -1,
       error: null,
       sourceError: null,
-      // A loaded .mahinatrace carries no coverage — drop any stale run panel.
+      // A loaded .mahinatrace carries no coverage or execution logs — drop the
+      // last run's, which describe other traces.
       coverage: null,
       nativeCoverage: null,
+      execLogs: [],
+      execLogsRecorded: false,
+      traceExecPos: 0,
     });
   } catch (e) {
     setState({
@@ -742,6 +772,13 @@ export function coverageByLine(): Map<number, LineCoverage> {
   const cov = state.coverage;
   if (cov === null) return new Map();
   return resolveCoverageLines(cov.anchors, state.disasm);
+}
+
+/** Whether the editor is showing coverage stripes: the last run produced
+ *  per-line coverage and the editor still holds that run's source (an edit
+ *  clears the stripes). Gates the stripe legend. */
+export function coverageStripesShown(): boolean {
+  return state.coverage !== null && state.source === state.replaySource && coverageByLine().size > 0;
 }
 
 /** The last run's aggregate coverage split (store wrapper over

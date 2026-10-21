@@ -803,6 +803,16 @@ table.replay-vars td {
   font-size: 0.78rem;
 }
 
+/* The legend for the editor's coverage stripes (shown while they are). */
+.cov-legend {
+  font-size: 0.8rem;
+  padding: 0.3rem 0.5rem;
+}
+.cov-legend-item {
+  margin-left: 0.8rem;
+  white-space: nowrap;
+}
+
 .coverage-counters {
   display: flex;
   flex-wrap: wrap;

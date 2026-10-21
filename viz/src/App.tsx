@@ -1,5 +1,18 @@
 import { For, Show, onMount } from "solid-js";
-import { state, loadBytes, loadFromUrl, runWasm, runBoth, canReplay, openReplay, loadSourceBytes, loadDroppedFile, setScriptArgs } from "./store";
+import {
+  state,
+  loadBytes,
+  loadFromUrl,
+  runWasm,
+  runBoth,
+  canReplay,
+  openReplay,
+  loadSourceBytes,
+  loadDroppedFile,
+  setScriptArgs,
+  coverageStripesShown,
+  COVERAGE_LABEL,
+} from "./store";
 import MahinaEditor from "./editor/MahinaEditor";
 import TraceList from "./components/TraceList";
 import TraceView from "./components/TraceView";
@@ -136,6 +149,14 @@ export default function App() {
           </div>
         </div>
         <MahinaEditor />
+        <Show when={coverageStripesShown()}>
+          <div class="cov-legend muted">
+            Loop lines are striped by how their iterations ran (hover one for the counts):
+            <span class="cov-legend-item"><span class="swatch sw-native" />{COVERAGE_LABEL.native}</span>
+            <span class="cov-legend-item"><span class="swatch sw-covered" />{COVERAGE_LABEL["covered-interpreted"]}</span>
+            <span class="cov-legend-item"><span class="swatch sw-uncovered" />{COVERAGE_LABEL.uncovered}</span>
+          </div>
+        </Show>
         <Show when={state.replayActive}>
           <ReplayPanel />
         </Show>

@@ -137,7 +137,9 @@ export default function TraceView() {
             when={hasAnim()}
             fallback={
               <p class="trace-note muted ir-no-anim">
-                This trace was recorded but never executed in this run — nothing to animate.
+                {state.execLogsRecorded
+                  ? "This trace was recorded but never executed in this run — nothing to animate."
+                  : "A .mahinatrace holds the recorded traces only, not how they ran. Open the program and Run (wasm) to animate its traces."}
               </p>
             }
           >
