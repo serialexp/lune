@@ -19,12 +19,14 @@ earlier in `/tmp/t0micro/`).
       collection. `bench/stdlib/pairs_hash.lua 2` went from 25.5 s to
       0.02 s; at 2000 reps it runs 0.42 s (LuaJIT 0.04 s). A step is now a
       constant ~670 instructions at any size (LuaJIT `-joff` 54).
-- [ ] **`pairs` steps go through the generic native-call path.** Of the
+- [x] **`pairs` steps go through the generic native-call path.** Of the
       ~670 instructions per step, ~173 are `opCall`'s native path and ~160
       register moves of the generic-`for` protocol; `next` itself is ~216.
       LuaJIT walks `next` with a dedicated bytecode (`ITERN`, after
-      `ISNEXT` checks the iterator is the real `next`) and no call. Belongs
-      with the bytecode-forms item below.
+      `ISNEXT` checks the iterator is the real `next`) and no call. Fixed
+      2026-10-23 by doc 66 P1 (`itern`, d21a333): a hash step 455 → 256,
+      an array step 394 → 60 (LuaJIT `-joff` 17 and 10). Doc 66's
+      Outstanding list has the hash-part and `ipairs` follow-ups.
 - [x] **`for_loop` has no integer fast path.** An empty `for` loop costs
       206 instructions per iteration (LuaJIT 18). Every iteration calls
       `arith.add`, `arith.lt(step, 0)` and `arith.le` out of line, with
@@ -200,7 +202,7 @@ earlier in `/tmp/t0micro/`).
       float-`%` probes read their operands from upvalues, so most of what
       remains there is the upvalue loads. Float `%` also pays for `slowTail`
       and the out-of-line `fmath` call.
-- [ ] **No constant-operand or fused forms in the bytecode.** `t.x` is
+- [x] **No constant-operand or fused forms in the bytecode.** `t.x` is
       `load_const` + `get_index`; `i - 7` is `load_int` + `sub`; `if a < b`
       is `lt` into a register + `jmp_if_false`. Each extra op pays the
       ~18-instruction dispatch prologue plus a register round trip.
@@ -213,13 +215,24 @@ earlier in `/tmp/t0micro/`).
       `set_field`): `t.x` 128 → 89 (LuaJIT 29), `t.x = v` 125 → 87 (32),
       method lookup 213 → 173, method call 711 → 671; tier-0 field_hash
       −22%, nbody −14%, array3d −6.6%. What `t.x` still pays over LuaJIT is
-      the heap-key probe plus handler register pressure. P3 is next.
+      the heap-key probe plus handler register pressure. All five phases
+      landed by 2026-10-23 (P3, P5, P4, P1 after P2); each one's numbers are
+      in doc 66's checklist.
 - [ ] **`bc_liveness.effectOf` returns a ~48-byte `Effect` by value**
       (~33 instructions a call), but `successors()` and the CFG builders
       only need `.succ`. It dominates compile_multret_chain's compile time
       (P2 cost it +0.07% from a single extra instruction in the return).
       A `successorsOf(instr, pc)` that skips building the use/def lists
-      would cut it.
+      would cut it. Its codegen also swings with its switch arms (doc 66
+      P1, 2026-10-23). Written inline like its neighbours, the `.itern` arm
+      made `effectOf` spill more on every instruction (+0.26%). Moved out
+      of line (`iternEffect`, `return @call(.never_inline, …)`), it made
+      `effectOf` 231 disassembly lines instead of 537, and the bench 4.3%
+      *faster* than before P1. One arm's shape decides how LLVM lowers the
+      whole by-value result, and nothing pins that. Find what changed
+      (result location? the zero-init of `e`?) and write `effectOf` so it
+      holds by construction; `bc_dom`'s `successors` calls it per edge
+      too.
 - [ ] **Native-build JIT rows move ±0.2–0.6% on unrelated changes.**
       euler14-bit, spectral-norm and repack_adversarial moved +0.2–0.6%
       JIT instructions with P2 on the native (AVX-512) ReleaseFast build,
@@ -284,22 +297,22 @@ cost. Repro files: pad `bench/repack_adversarial.lua` after
       A per-proto bit per pc (set on attach, cleared on detach) would
       answer without touching the map at all. Not measured.
 
-## `bc_liveness.effectOf`'s codegen swings with its switch arms (noted 2026-10-23)
-
-- [ ] **Find out why, and make the good shape deliberate.** Doc 66 P1 added
-      an `.itern` arm. Written inline like its neighbours, it made
-      `effectOf` spill more on every instruction (`compile_multret_chain`
-      +0.26% instructions). Moved out of line (`iternEffect`, `return
-      @call(.never_inline, …)`), it made `effectOf` 231 disassembly lines
-      instead of 537, and that bench 4.3% *faster* than before P1. One
-      arm's shape decides how LLVM lowers the whole by-value `Effect` result,
-      and nothing pins that. Find what changed (result location? the
-      zero-init of `e`?), write `effectOf` so it holds by construction, and
-      check `bc_dom`'s `successors`, which calls it per edge too.
-
 ## A `gmatch` loop keeps no trace under GC stress (noted 2026-10-22)
 
-- [ ] **Find out why.** Doc 66 P1's test "one generic `for` traced with
+- [x] **Fixed 2026-10-23.** The recorder pinned a generic `for`'s ctrl
+      (`a+2`) by its observed type at `tfor_loop`, but the register is dead
+      from `itern` (its last read) until `tfor_loop` overwrites it. So a
+      collection in between scrubbed it to nil (doc 61), and the pin aborted
+      every attempt as `bad_type`. Under GC stress that is every attempt;
+      in a normal run it happens whenever a collection lands inside the
+      recorded iteration. `pinIterCtrl` now pins it where `itern` reads it.
+      Test: "generic for: the ctrl pin survives a collection inside the
+      recorded iteration" (`interp_trace_test.zig`, mutation-checked). The
+      `@bench` instruction counts are unchanged.
+- [ ] Drop the stress-leg skip in the doc 66 P1 test (`interp_semantics_test.zig`
+      "… keeps its trace across `pairs`"). It waits on that file being free:
+      doc 68 work is uncommitted in it.
+- [x] **Find out why.** Doc 66 P1's test "one generic `for` traced with
       `gmatch` keeps its trace across `pairs`" (`interp_semantics_test.zig`)
       leaves a compiled trace anchored in `walk` on the normal native leg,
       but none at all on the `gc_stress` native leg, and no abort is logged
@@ -308,14 +321,65 @@ cost. Repro files: pad `bench/repack_adversarial.lua` after
       now. Suspects: a collection cancelling the recording (`const_swept`)
       or retiring the trace over its pattern constant.
 
+## A replay-line OOM is described at the previous instruction (noted 2026-10-23)
+
+- [ ] Prologue step 3 (the `.full` replay-line append in `dispatchPostGc`)
+      parks `OutOfMemory` with `parkErr` before step 6 stores `frame.pc =
+      cur`. So `describeFault`/`backtraceFrames` locate the fault at the
+      previous instruction. The fix is to store `st.frame.pc = pc` before
+      that `parkErr` (`pc` is in scope there). Found by doc 69's lazy-pc
+      audit. The fix and its test ("a replay-line OOM is located at the
+      instruction about to run", `interp_dispatch_test.zig`, mutation-checked)
+      are ready in a shadow and land with doc 69 P0, once interp.zig is free.
+
 ## `pcall(next, 5)` blames `pcall` for `next`'s bad argument (noted 2026-10-22)
 
-- [ ] On 98aef7f, `print(pcall(next, 5))` prints `bad argument #1 to
+- [x] On 98aef7f, `print(pcall(next, 5))` prints `bad argument #1 to
       'pcall' (table expected, got number)`; Lua says `'next'`. `nativeSite`
       names the native at the frame's call site, which is the `pcall` call.
-      A native called by another native needs its own name. Doc 68's
-      resumable `pcall` (coral-raven, in flight) changes this path, so check
-      again once that lands.
+      A native called by another native needs its own name. Fixed with doc
+      68's `pcall` frame tags (2026-10-23): `callNativeUnparked` marks the
+      level, and `nativeSite` names that native with no location, as Lua's C
+      level does.
+
+## Entering a head trace from tier-0 costs more than a small body saves (noted 2026-10-23)
+
+Found while building doc 68's `pcall` frame tags. `/tmp/headprobe/h2.lua`
+calls `local function f(x) return x + 1 end` from a loop that can't trace
+(it calls `string.format`). On 98aef7f it runs 0.42 s with `--trace
+--jit-native` and 0.31 s on tier-0: the head trace on `f` loses 35%. A
+`pcall` body counted toward its head anchor showed the same, so doc 68
+doesn't count it (§7.1, "Tiering parity"). The fixes are general:
+
+- [ ] **(B) Make a head-trace entry from tier-0 cheap.** Find where the
+      entry's cost goes (the dispatcher, the entry snapshot, the
+      `NativeResult` setup; see the memcpy below) and cut it until a
+      one-line body breaks even. Then count `pcall` bodies again.
+- [ ] **(C) Record through `pcall`.** LuaJIT's `recff_pcall` records the
+      call as a frame tag on the trace, so a hot loop that calls `pcall`
+      stays one trace. Mahina's recorder aborts at the native today.
+- [x] **The `NativeResult` literal in `runWithLinkedLoopDone` lowered to a
+      ~1 KB `memcpy` on every trace entry** (its arrays were `undefined`).
+      Assigned field by field (2026-10-23, `nativegen_artifact.zig`).
+
+## A caught error costs ~5% more since `pcall` frame tags (noted 2026-10-23)
+
+Doc 68 §12: success paths got ~5% cheaper, catches ~5% dearer (callgrind,
+100 k catches: a Lua body's 1140 → 1196 instructions, a native target's
+821 → 869). Two levers, neither tried:
+
+- [ ] **Catch without leaving the dispatch.** `catchProtected` runs from
+      `execWith`, after the chain returned `.err` and `execImpl` re-raised
+      it, and the parent then re-enters through `execImpl`'s state setup
+      (~60 instructions). Catching at `execImpl`'s `.err` arm and
+      re-entering the chain there, when the dispatch mode still holds,
+      skips the error-union round trip and the mode reselection.
+- [ ] **A cheaper unparked-native marker.** `callNativeUnparked` saves,
+      sets and restores two `Vm` scalars on every native called by a
+      native (~8 instructions, plus a larger prologue), so error levels
+      see a C caller there. One packed word, or a bit in the in-flight
+      frame's `ctl` with the native read from its parked callee slot,
+      would do.
 
 ## nsieve-bit-fp, the board's worst row (noted 2026-10-19)
 

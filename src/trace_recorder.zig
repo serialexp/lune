@@ -3628,23 +3628,48 @@ pub const RecordingSession = struct {
         const a = instr.a;
         const v1 = regs.get(a + 3);
         if (v1.isNil()) return self.abort(.bad_type); // end direction
-        // Pin the OLD ctrl (`a+2`) by observed type. The test block's
-        // `move base+5 ← base+2` already materialized an UNGUARDED slot_load
-        // of it (the arg-window copy the iterator may ignore), and an
-        // unguarded slot_load has no provable kind — proveKinds would refuse
-        // the whole trace for native. Unlike the v1 pin below this guard has
-        // no loop semantics (any ctrl continues the loop); it exists purely so
-        // the shuttle has a kind, so the policy differs at the edges:
-        //   * nil → abort. Only reachable when recording starts at a loop
-        //     instance's FIRST iteration (ctrl still the initial nil); the
-        //     back-edge hotcount discipline starts recordings via the back
-        //     edge (iteration ≥ 2), so this is a rare race, and a retry lands
-        //     on a pinnable iteration — better than committing a trace that
-        //     can never leave tier-1a.
-        //   * bool / exotic heap → record UNPINNED. No guard op can pin them
-        //     (no non-nil guard exists), the trace stays sound (native
-        //     declines it; tier-1a executes it), and aborting forever would
-        //     be strictly worse than tier-1a.
+        const r1 = try self.refOf(a + 3);
+        if (self.konstValueOf(r1) == null and !self.isProvenStringRef(r1)) {
+            if (v1.isNumber()) {
+                try self.guardNum(r1, v1, .operand_type, .a);
+            } else if (v1.isHeap()) switch (v1.heapType()) {
+                .string => self.stampProv(try self.emit(.{ .op = .guard_string, .a = r1 }), .operand_type, .a, .neutral),
+                .table => {
+                    const tbl = table_mod.Table.fromHeader(v1.asHeap());
+                    if (tbl.metatable != null) return self.abort(.has_metatable);
+                    self.stampProv(try self.emit(.{ .op = .guard_table, .a = r1 }), .operand_type, .a, .neutral);
+                },
+                else => return self.abort(.bad_type),
+            } else return self.abort(.bad_type);
+        }
+        self.setReg(a + 2, r1); // publish ctrl = v1
+        // Going round a generic `for` that is not our own anchor's unrolls it
+        // (G6-Q1(d)); depth is 0 here (inlined back-edges abort above).
+        const target: u32 = @intCast(@as(i64, pc) + instr.aux);
+        if (target != self.anchor.pc) self.noteLoopIteration();
+    }
+
+    /// Pin a generic `for`'s ctrl (`a+2`) by observed type, where `itern`
+    /// reads it. Copying it into the call window materializes an UNGUARDED
+    /// slot_load of it (the arg the iterator may ignore), and an unguarded
+    /// slot_load has no provable kind — proveKinds would refuse the whole
+    /// trace for native. The pin sits at the read because that is the last
+    /// point the register is live: until `tfor_loop` overwrites it, it is
+    /// dead, so a collection in between may scrub it (doc 61), and a pin read
+    /// there saw nil under GC stress. The guard has no loop semantics (any
+    /// ctrl continues the loop); it exists purely so the shuttle has a kind,
+    /// so the policy differs at the edges:
+    ///   * nil → abort. Only reachable when recording starts at a loop
+    ///     instance's FIRST iteration (ctrl still the initial nil); the
+    ///     back-edge hotcount discipline starts recordings via the back
+    ///     edge (iteration ≥ 2), so this is a rare race, and a retry lands
+    ///     on a pinnable iteration — better than committing a trace that
+    ///     can never leave tier-1a.
+    ///   * bool / exotic heap → record UNPINNED. No guard op can pin them
+    ///     (no non-nil guard exists), the trace stays sound (native
+    ///     declines it; tier-1a executes it), and aborting forever would
+    ///     be strictly worse than tier-1a.
+    fn pinIterCtrl(self: *RecordingSession, a: u16, regs: RegWindow) !void {
         const vc = regs.get(a + 2);
         if (vc.isNil()) return self.abort(.bad_type);
         const rc = try self.refOf(a + 2);
@@ -3665,25 +3690,6 @@ pub const RecordingSession = struct {
             }
             // bool ctrl: leave unpinned (tier-1a).
         }
-        const r1 = try self.refOf(a + 3);
-        if (self.konstValueOf(r1) == null and !self.isProvenStringRef(r1)) {
-            if (v1.isNumber()) {
-                try self.guardNum(r1, v1, .operand_type, .a);
-            } else if (v1.isHeap()) switch (v1.heapType()) {
-                .string => self.stampProv(try self.emit(.{ .op = .guard_string, .a = r1 }), .operand_type, .a, .neutral),
-                .table => {
-                    const tbl = table_mod.Table.fromHeader(v1.asHeap());
-                    if (tbl.metatable != null) return self.abort(.has_metatable);
-                    self.stampProv(try self.emit(.{ .op = .guard_table, .a = r1 }), .operand_type, .a, .neutral);
-                },
-                else => return self.abort(.bad_type),
-            } else return self.abort(.bad_type);
-        }
-        self.setReg(a + 2, r1); // publish ctrl = v1
-        // Going round a generic `for` that is not our own anchor's unrolls it
-        // (G6-Q1(d)); depth is 0 here (inlined back-edges abort above).
-        const target: u32 = @intCast(@as(i64, pc) + instr.aux);
-        if (target != self.anchor.pc) self.noteLoopIteration();
     }
 
     /// The limit ref a numeric `for`'s test compares against. Float loop-limit
@@ -4418,6 +4424,7 @@ pub const RecordingSession = struct {
         const f = regs.get(a);
         if (f.isHeap() and f.heapType() == .native and stdbase.isNext(function.Native.fromHeader(f.asHeap())))
             return self.abort(.itern_next);
+        try self.pinIterCtrl(a, regs);
         var k: u16 = 0;
         while (k < 3) : (k += 1) self.setReg(a + 3 + k, try self.refOf(a + k));
         const tags = try self.gpa.alloc(u8, regs.n);

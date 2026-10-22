@@ -8017,3 +8017,40 @@ test "frame-link liveness (B1' task 27): an unsatisfiable call-head request cann
         try testing.expect(vm.trace.call_head_link_arms >= 1);
     }
 }
+
+// A generic `for`'s ctrl register is dead from `itern` (its last read) to
+// `tfor_loop` (which overwrites it), so a collection in between may scrub it
+// to nil (doc 61). The recorder's ctrl type pin used to read it at
+// `tfor_loop`, saw nil under GC stress, and aborted every attempt: the loop
+// kept no trace. It now pins where `itern` reads the register.
+test "generic for: the ctrl pin survives a collection inside the recorded iteration" {
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: util.TraceMode) anyerror!void {
+            _ = mode;
+            for (vm.trace.abort_log.items) |r| {
+                try testing.expect(r.op != .tfor_loop);
+            }
+            var compiled = false;
+            for (vm.trace.registry.cache.items) |t| {
+                if (!std.mem.eql(u8, t.code.anchor.proto.name, "walk")) continue;
+                if (t.native == .compiled) compiled = true;
+            }
+            try testing.expect(compiled);
+        }
+    };
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    try util.runCapturedTuned(testing.allocator,
+        \\local function walk(f, s, c)
+        \\  local n, acc = 0, 0
+        \\  for k in f, s, c do
+        \\    n = n + 1
+        \\    acc = acc + #k
+        \\  end
+        \\  return n, acc
+        \\end
+        \\print(walk(string.gmatch(string.rep("ab cde ", 150), "%a+")))
+        \\
+    , &sink, true, .record_execute_native, .{ .record_aborts = true, .inspect = Inspect.run });
+    try testing.expectEqualStrings("300\t750\n", sink.buffered());
+}
