@@ -1165,6 +1165,46 @@ test "doc 66 P3: every constant arithmetic form is its register form" {
     , "0\t2496\t-2335769007170761397\n");
 }
 
+test "doc 66 P5: equality against a constant is `Value.eql` against it" {
+    // Every value class against nil, the booleans, strings (one built at run
+    // time, so equal by interning) and numbers (`1 == 1.0`, `-0.0 == 0.0`,
+    // NaN, 2^53 against its float and the int past it), the constant on
+    // either side; a table with `__eq` is still unequal to a constant. Then
+    // the same compares as loop conditions, hot enough to record. The digest
+    // was taken on e4ba1e2, where every one of these was a register `eq`.
+    const Inspect = struct {
+        fn run(vm: *interp.Vm, mode: util.TraceMode) anyerror!void {
+            if (mode == .off) return;
+            for (vm.trace.abort_log.items) |r| try testing.expect(bytecode.eqFormOf(r.op) == null);
+            try testing.expect(vm.trace.registry.cache.items.len > 0);
+        }
+    };
+    try util.expectProgramTuned(
+        \\local t = setmetatable({}, { __eq = function() return true end })
+        \\local X = { false, true, 0, 1, -1, 1.0, 0.0, -0.0, 0 / 0, 1 / 0, 2 ^ 53, 9007199254740993, "a", "", "abc", "a" .. "bc", t, {}, print }
+        \\local acc, n = 0, 0
+        \\local function mix(b) n = n + 1; acc = acc * 3 + (b and 1 or 2) end
+        \\for i = 1, 20 do
+        \\  local x = X[i]
+        \\  mix(x == nil) mix(x ~= nil) mix(nil == x) mix(x == false) mix(x ~= false) mix(true == x) mix(x == true) mix(x ~= true)
+        \\  mix(x == "abc") mix(x ~= "abc") mix("abc" == x) mix(x == "") mix(x == "a")
+        \\  mix(x == 0) mix(x ~= 0) mix(0 == x) mix(x == 1) mix(x == 1.0) mix(1.0 == x) mix(x == -0.0) mix(x == 0.0) mix(x ~= 1)
+        \\  mix(x == 9007199254740992) mix(x == 9007199254740993) mix(x == 2 ^ 53) mix((x) == (nil)) mix(x == ("abc")) mix(-1 == x)
+        \\  local c = 0
+        \\  for j = 1, 300 do
+        \\    if x == nil then c = c + 1 end
+        \\    if x ~= false then c = c + 2 end
+        \\    if x == "abc" then c = c + 4 end
+        \\    if x ~= 0 then c = c + 8 end
+        \\    if x == 1.0 then c = c + 16 end
+        \\  end
+        \\  acc = acc * 7 + c
+        \\end
+        \\print(n, acc)
+        \\
+    , "560\t-8917125095649679768\n", .{ .record_aborts = true, .inspect = Inspect.run });
+}
+
 test "float text: print, tostring and .. agree, exponent form at the extremes" {
     // One renderer (`io.formatFloat`) behind all three. Positional text at
     // the extremes ran to 330 bytes and overran the fixed buffers `tostring`

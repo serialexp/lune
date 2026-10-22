@@ -500,6 +500,23 @@ const Compiler = struct {
         return .{ .op = op, .k = try self.addConstant(v) };
     }
 
+    /// Doc 66 P5: the constant form of `eq`/`ne` (`base`) with `e` as its
+    /// constant operand, when `e` is nil, a boolean, a string or a number
+    /// literal; null keeps the register form. Equality is symmetric and
+    /// `__eq` never fires against a constant (it is never a table), so a
+    /// constant on either side takes the same form.
+    fn eqConstantOperand(self: *Compiler, base: OpCode, e: *const ast.Expr) Error!?ConstantOperand {
+        const negate = base == .ne;
+        var cur = e;
+        while (cur.data == .paren) cur = cur.data.paren;
+        return switch (cur.data) {
+            .nil => .{ .op = bytecode.eqOpOf(negate, .prim), .k = @intFromEnum(bytecode.Prim.nil) },
+            .bool => |b| .{ .op = bytecode.eqOpOf(negate, .prim), .k = @intFromEnum(bytecode.Prim.of(Value.boolean(b)).?) },
+            .string_raw => |raw| .{ .op = bytecode.eqOpOf(negate, .str), .k = try self.stringConstant(try self.decodeString(raw, cur.span)) },
+            else => if (numberLiteral(cur)) |v| .{ .op = bytecode.eqOpOf(negate, .num), .k = try self.addConstant(v) } else null,
+        };
+    }
+
     // ---- scopes & locals ----
 
     fn beginScope(self: *Compiler) void {
@@ -1404,8 +1421,22 @@ const Compiler = struct {
         // whole `lhs op rhs` span so a runtime fault here underlines the
         // operation (which always contains the offending operand).
         const op_span: ast.Span = .{ .start = lhs.span.start, .end = rhs.span.end };
-        // Doc 66 P3: a number literal operand rides in the instruction.
-        if (try self.constantOperand(base, .rk, rhs)) |ko| {
+        // Doc 66 P3/P5: a literal operand rides in the instruction.
+        var eq_k: ?ConstantOperand = null;
+        var eq_reg = lhs;
+        if (base == .eq or base == .ne) {
+            if (try self.eqConstantOperand(base, rhs)) |ko| {
+                eq_k = ko;
+            } else if (try self.eqConstantOperand(base, lhs)) |ko| {
+                eq_k = ko;
+                eq_reg = rhs;
+            }
+        }
+        if (eq_k) |ko| {
+            const t = try self.operandReg(eq_reg);
+            self.cur_span = op_span;
+            _ = try self.emit(Instr.opABC(ko.op, dest, t, ko.k));
+        } else if (try self.constantOperand(base, .rk, rhs)) |ko| {
             const t1 = try self.operandReg(lhs);
             self.cur_span = op_span;
             _ = try self.emit(Instr.opABC(ko.op, dest, t1, ko.k));
@@ -2057,6 +2088,49 @@ test "doc 66 P3: a number literal operand compiles to a constant form" {
             try testing.expectEqual(@as(u16, 0), ins.b);
             try testing.expectEqual(@as(i64, 2), k.asInt());
         }
+    }
+}
+
+test "doc 66 P5: equality against a literal compiles to a constant form" {
+    var r = try run(
+        \\local x, s = 7, "k"
+        \\local a = x == nil
+        \\local b = false ~= x
+        \\local c = s == "k"
+        \\local d = ("k") ~= s
+        \\local e = x == -7.0
+        \\local f = 0 == (x)
+        \\local g = x == s
+        \\local h = 1 == 1
+        \\local i = x < 3
+        \\return (not a) and b and c and (not d) and (not e) and (not f) and (not g) and h and (not i)
+    );
+    defer r.deinit();
+    try testing.expect(r.value.isBool() and r.value.asBool());
+    const proto = r.chunk.proto;
+    var count = std.EnumArray(OpCode, usize).initFill(0);
+    for (proto.code) |ins| count.getPtr(ins.op).* += 1;
+    try testing.expectEqual(@as(usize, 1), count.get(.eq_p));
+    // The constant on the left moves to the right: `false ~= x`.
+    try testing.expectEqual(@as(usize, 1), count.get(.ne_p));
+    try testing.expectEqual(@as(usize, 1), count.get(.eq_s));
+    try testing.expectEqual(@as(usize, 1), count.get(.ne_s));
+    // `-7.0` folded through the minus; `0 == (x)` with the literal left;
+    // `1 == 1` keeps its left literal in a register.
+    try testing.expectEqual(@as(usize, 3), count.get(.eq_n));
+    // Two registers, and `<` (P4's business), keep the register forms.
+    try testing.expectEqual(@as(usize, 1), count.get(.eq));
+    try testing.expectEqual(@as(usize, 1), count.get(.lt));
+    for (proto.code) |ins| {
+        const f = bytecode.eqFormOf(ins.op) orelse continue;
+        switch (f.rhs) {
+            .reg => {},
+            .prim => try testing.expect(ins.c <= @intFromEnum(bytecode.Prim.@"true")),
+            .str => try testing.expect(proto.constants[ins.c].isHeap() and proto.constants[ins.c].heapType() == .string),
+            .num => try testing.expect(proto.constants[ins.c].isNumber()),
+        }
+        if (ins.op == .ne_p) try testing.expectEqual(bytecode.Prim.@"false", @as(bytecode.Prim, @enumFromInt(ins.c)));
+        if (ins.op == .eq_n and proto.constants[ins.c].isFloat()) try testing.expectEqual(@as(f64, -7.0), proto.constants[ins.c].asFloat());
     }
 }
 

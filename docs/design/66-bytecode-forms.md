@@ -1,7 +1,7 @@
 # 66 — Bytecode forms: constant operands, field ops, compare-and-branch, ITERN
 
-Status: rev 2, partial. The `condBranchOf` refactor, P2 and P3 landed;
-P5, P4 and P1 are outstanding, in that order. Round-1 review findings
+Status: rev 2, partial. The `condBranchOf` refactor, P2, P3 and P5
+landed; P4 and P1 are outstanding, in that order. Round-1 review findings
 (codex and antigravity, §10) are folded in. Bart answered Q1–Q5 (§9) on
 2026-10-22.
 Owner: claude (coral-marten)
@@ -138,8 +138,12 @@ land; move whole phases to Done once everything inside them is checked.
   scimark-sor −5.4%, recursive-fib −5.1%, repack −4.4%, array3d −3.9%,
   nsieve-bit-fp −3.3%, lua54 −3.1%, io_print −2.9%, nbody −1.7%, the
   rest −0.05 to −2.6%. The one rise, io_write +0.08% in both tiers
-  (+1 instruction per `io.write`), is doc 68 P0's `CF_CTL` store in
-  `mahina_hostcall_entry`, which was in the tree. JIT tier: euler14-bit
+  (+1 instruction per `io.write`), is an LLVM register-allocation shift in
+  `nativeIoWrite` (which inlines `coerceConcat`): one more stack spill in
+  its per-argument loop, same calls and same control flow. An earlier
+  version of this bullet, and the P3 commit message, blamed doc 68 P0's
+  `CF_CTL` store. A d0b815e build with P0 backed out still measures the
+  +1, so P0 is not the cause. JIT tier: euler14-bit
   −5.1%, lua54 −3.1%, io_print −2.8%, while_shortcircuit_probe −1.9%,
   tbl_ops −1.5%, str_format −1.1%, the rest 0 to −0.7%. `--dump-aborts`
   NYI counts are unchanged on all 33 programs; hashgate: 99 digests match
@@ -149,6 +153,48 @@ land; move whole phases to Done once everything inside them is checked.
   e4ba1e2 (before the new lanes). Mutation-checked: the mixed lane, `kr`
   operand order, the shift lane, mod's float lane, pow and div each
   change it.
+- [x] **Q7 — P5 encoding** (§5.5). Asked 2026-10-22; Bart was away, so
+  taken by default and open to reversal: the LuaJIT split
+  (`ISEQP`/`ISEQS`/`ISEQN`), following Q6's precedent of separate
+  opcodes. The alternatives were one `eq_k`/`ne_k` pair over any K, or
+  `eq_n` plus one nil/boolean/string form. Static count over the `@bench`
+  sources: 17 equality sites, 15 against a constant (10 strings, 3 nil,
+  2 numbers), 14 of them conditions (P4's branch form takes those).
+- [x] **P5 — equality against a constant** (2026-10-22, §5.5, Q7). Six
+  opcodes: `eq_p`/`ne_p` (`R[A] = R[B] == P(C)`, `C` a `bytecode.Prim`
+  immediate: nil, false, true), `eq_s`/`ne_s` (an interned-string K),
+  `eq_n`/`ne_n` (a number K). `bytecode.eqFormOf` decodes every equality
+  (`negate`, right operand `reg`/`prim`/`str`/`num`), `eqOpOf` is its
+  inverse and `eqConstant` reads the constant. The compiler emits them
+  for a nil, boolean, string or number literal on either side: `__eq`
+  never fires against a constant, so `nil == x` is `x == nil` with the
+  same evaluation order, and no `_kr` forms exist. No handler can fault:
+  `eq_p` tests the tag (and truth, as `asBool` does), `eq_s` identity
+  (strings are interned), `eq_n` the same number type on the raw lanes
+  and the other one in `opEqNSlow` (`compareNumeric`), which keeps the
+  fast half's frame free of callee-saved registers (45 → 42 on `i == 7`).
+  The recorder's `recEq` takes P3's frame (renamed `BinaryFrame`), so the
+  constant arrives as a `konst` and the IR is the IR `load_*` + `eq`
+  produced. Per op (`ops3.lua`, d0b815e → P5, LuaJIT `-joff` in
+  brackets): `local b = x == nil` 66 → 33 (30), `x ~= false` 70 → 36
+  (25), `x == "x"` 78 → 36 (33), `i == 7` 68 → 42 (32), register `x == y`
+  43 → 43; as conditions, `if x == nil` 100 → 67 (16) and `if x == "x"`
+  112 → 70 (19), the rest of those gaps being P4's. `abench.sh` tier-0:
+  lua54 −2.2%, scalar −2.1%, nsieve-bit −1.35%, str_manip −0.65%,
+  array3d −0.54%, every other row within ±0.04%. JIT: lua54 −2.2%,
+  recursive-fib −0.2%, and repack +0.09%, scimark-lu +0.03%, array3d
+  +0.02%. repack's is pc layout, not P5: its only equalities run once at
+  top level, the trace set and iteration counts are identical, and padding
+  the program with no-op statements moves the same binary by up to 0.15%
+  and flips the P3→P5 delta's sign (TODO.md). `--dump-aborts` NYI counts
+  unchanged on all 33 programs; hashgate 99 digests match on both legs.
+  Tests: "doc 66 P5: equality against a literal compiles to a constant
+  form" (compiler), "doc 66 P5: equality against a constant is
+  `Value.eql` against it" (ten legs, a digest taken on e4ba1e2 over every
+  value class × nil/booleans/strings/numbers on both sides, plus hot loop
+  conditions; no recording aborts at an equality op). Mutation-checked:
+  `eq_p`'s false case, `eq_s` identity, `eq_n`'s float lane and its slow
+  half, and the recorder's immediate decoding each change it.
 - [x] **Float text at the extremes** (found by the P3 test, fixed in the
   same change). `print`, `tostring` and `..` rendered a float
   positionally at any magnitude, so `1e308 / 3` ran to 309 digits and
@@ -169,7 +215,6 @@ land; move whole phases to Done once everything inside them is checked.
   to carry the guard's proto in provenance, so a callee's own loop test
   can still be recognised. Not needed for correctness.
 - [ ] **P4 — compare-and-branch** (§5.4).
-- [ ] **P5 — `eq`/`ne` against a constant** (§5.5).
 - [ ] **Each phase: recorder and JIT parity in the same change** (§6). A
   new op that the recorder aborts on regresses every traced loop that uses
   it.
@@ -671,6 +716,12 @@ or `load_const`, then `eq`, then usually a branch.
   NaN need numeric semantics. A number constant uses item 3's `opEqNe`
   lanes: same-tag raw compare, and the full op for a mixed int and float. This is P4's branch form with a constant
 `c`, or a non-branching `eqk a, b, c=K` when the result is a value.
+
+Follow-up (Q7, 2026-10-22): the value form landed as the LuaJIT split,
+not one `eqk`: `eq_p`/`ne_p` with nil and the booleans as an immediate
+(no K load), `eq_s`/`ne_s` and `eq_n`/`ne_n` over a K index. A constant
+on the left needs no form of its own, since `__eq` cannot fire against
+a constant. P4's constant branch forms will mirror the three kinds.
 
 ## 6. Correctness and determinism
 

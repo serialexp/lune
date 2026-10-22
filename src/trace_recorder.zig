@@ -1580,8 +1580,7 @@ pub const RecordingSession = struct {
             .bnot => try self.recBnot(instr, regs),
 
             // comparisons (gt/ge normalise to lt/le with swapped operands).
-            .eq => try self.recEq(.eq, instr, regs),
-            .ne => try self.recEq(.ne, instr, regs),
+            .eq, .ne, .eq_p, .ne_p, .eq_s, .ne_s, .eq_n, .ne_n => try self.recEq(if (bytecode.eqFormOf(instr.op).?.negate) .ne else .eq, eqFrameOf(instr, proto), regs),
             .lt => try self.recCompare(.lt, false, instr, regs),
             .le => try self.recCompare(.le, false, instr, regs),
             .gt => try self.recCompare(.lt, true, instr, regs),
@@ -2125,11 +2124,11 @@ pub const RecordingSession = struct {
         return iof;
     }
 
-    /// Doc 66 P3: an arithmetic instruction's slot frame. `lhs` and `rhs`
-    /// are the operands in source order, each designated by the instruction
-    /// field it lives in (`.b` for the register of a constant form, `.c` for
-    /// its constant).
-    pub const ArithFrame = struct {
+    /// Doc 66 P3/P5: a binary instruction's slot frame (arithmetic, bitwise
+    /// or equality). `lhs` and `rhs` are the operands in source order, each
+    /// designated by the instruction field it lives in (`.b` for the
+    /// register of a constant form, `.c` for its constant).
+    pub const BinaryFrame = struct {
         dst: u16,
         lhs: Operand,
         rhs: Operand,
@@ -2137,12 +2136,19 @@ pub const RecordingSession = struct {
         rhs_od: OperandDesig,
     };
 
-    pub fn arithFrameOf(instr: Instr, proto: *const Proto, shape: bytecode.ArithShape) ArithFrame {
+    pub fn arithFrameOf(instr: Instr, proto: *const Proto, shape: bytecode.ArithShape) BinaryFrame {
         return switch (shape) {
             .rr => .{ .dst = instr.a, .lhs = .{ .reg = instr.b }, .rhs = .{ .reg = instr.c }, .lhs_od = .b, .rhs_od = .c },
             .rk => .{ .dst = instr.a, .lhs = .{ .reg = instr.b }, .rhs = .{ .konst = proto.constants[instr.c] }, .lhs_od = .b, .rhs_od = .c },
             .kr => .{ .dst = instr.a, .lhs = .{ .konst = proto.constants[instr.c] }, .rhs = .{ .reg = instr.b }, .lhs_od = .c, .rhs_od = .b },
         };
+    }
+
+    /// Doc 66 P5: an equality's frame. A constant form's constant is always
+    /// its right operand (the compiler moves a constant on the left there).
+    pub fn eqFrameOf(instr: Instr, proto: *const Proto) BinaryFrame {
+        const rhs: Operand = if (bytecode.eqConstant(instr, proto)) |k| .{ .konst = k } else .{ .reg = instr.c };
+        return .{ .dst = instr.a, .lhs = .{ .reg = instr.b }, .rhs = rhs, .lhs_od = .b, .rhs_od = .c };
     }
 
     /// Record an arithmetic or bitwise instruction, any shape.
@@ -2167,7 +2173,7 @@ pub const RecordingSession = struct {
         }
     }
 
-    pub fn recArith(self: *RecordingSession, op: IrOp, f: ArithFrame, regs: RegWindow) !void {
+    pub fn recArith(self: *RecordingSession, op: IrOp, f: BinaryFrame, regs: RegWindow) !void {
         const vb = operandValue(regs, f.lhs);
         const vc = operandValue(regs, f.rhs);
         if (!vb.isNumber() or !vc.isNumber()) return self.abort(.bad_type);
@@ -2179,7 +2185,7 @@ pub const RecordingSession = struct {
         self.setReg(f.dst, r);
     }
 
-    pub fn recBitwise(self: *RecordingSession, op: IrOp, f: ArithFrame, regs: RegWindow) !void {
+    pub fn recBitwise(self: *RecordingSession, op: IrOp, f: BinaryFrame, regs: RegWindow) !void {
         const vb = operandValue(regs, f.lhs);
         const vc = operandValue(regs, f.rhs);
         if (!vb.isInt() or !vc.isInt()) return self.abort(.bad_type);
@@ -3361,14 +3367,16 @@ pub const RecordingSession = struct {
 
     /// `eq`/`ne`. First cut: numeric operands only (the common loop-condition
     /// case); other types abort.
-    pub fn recEq(self: *RecordingSession, op: IrOp, instr: Instr, regs: RegWindow) !void {
+    pub fn recEq(self: *RecordingSession, op: IrOp, f: BinaryFrame, regs: RegWindow) !void {
+        const vb = operandValue(regs, f.lhs);
+        const vc = operandValue(regs, f.rhs);
         // Doc 57: value-specialize nil/bool inputs first, so a pinned input
         // takes the konst paths below (LuaJIT `lj_record_objcmp` on typed
-        // primitives).
-        const rb_raw = try self.refOf(instr.b);
-        const rc_raw = try self.refOf(instr.c);
-        const rb = (try self.pinPrim(rb_raw, regs.get(instr.b), .b)) orelse rb_raw;
-        const rc = (try self.pinPrim(rc_raw, regs.get(instr.c), .c)) orelse rc_raw;
+        // primitives). A constant operand (doc 66 P5) is a konst already.
+        const rb_raw = try self.operandRef(f.lhs);
+        const rc_raw = try self.operandRef(f.rhs);
+        const rb = (try self.pinPrim(rb_raw, vb, f.lhs_od)) orelse rb_raw;
+        const rc = (try self.pinPrim(rc_raw, vc, f.rhs_od)) orelse rc_raw;
         // Konst×konst folds to a bool konst with zero runtime work — `Value.eql`
         // at record time is exact for every type (interned strings compare by
         // identity). This is what makes the `type(x) == "number"` idiom (doc 23)
@@ -3377,11 +3385,9 @@ pub const RecordingSession = struct {
         // the whole test — vanishes from the trace body.
         if (self.konstValueOf(rb)) |kb| if (self.konstValueOf(rc)) |kc| {
             const equal = kb.eql(kc);
-            self.setReg(instr.a, try self.konst(Value.boolean(if (op == .eq) equal else !equal)));
+            self.setReg(f.dst, try self.konst(Value.boolean(if (op == .eq) equal else !equal)));
             return;
         };
-        const vb = regs.get(instr.b);
-        const vc = regs.get(instr.c);
         if (!vb.isNumber() or !vc.isNumber()) {
             // Doc 57: two booleans whose types are both proven (a konst, or a
             // typed producer — a compare, `not`, a bool-lane load, a bool
@@ -3390,7 +3396,7 @@ pub const RecordingSession = struct {
             // konsts above, so any other bool ref here is a typed producer.)
             if (vb.isBool() and vc.isBool() and self.boolTyped(rb) and self.boolTyped(rc)) {
                 const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
-                self.setReg(instr.a, r);
+                self.setReg(f.dst, r);
                 return;
             }
             // Cross-type fold — the `x == nil` idiom. Lua equality across
@@ -3408,17 +3414,17 @@ pub const RecordingSession = struct {
             const c_pinned = self.konstValueOf(rc) != null or vc.isNumber() or self.boolTyped(rc);
             const same_class = (vb.isNumber() and vc.isNumber()) or vb.tag == vc.tag;
             if (b_pinned and c_pinned and !same_class) {
-                if (vb.isNumber() and self.konstValueOf(rb) == null) try self.guardNum(rb, vb, .operand_type, .b);
-                if (vc.isNumber() and self.konstValueOf(rc) == null) try self.guardNum(rc, vc, .operand_type, .c);
-                self.setReg(instr.a, try self.konst(Value.boolean(op == .ne)));
+                if (vb.isNumber() and self.konstValueOf(rb) == null) try self.guardNum(rb, vb, .operand_type, f.lhs_od);
+                if (vc.isNumber() and self.konstValueOf(rc) == null) try self.guardNum(rc, vc, .operand_type, f.rhs_od);
+                self.setReg(f.dst, try self.konst(Value.boolean(op == .ne)));
                 return;
             }
             return self.abort(.bad_type);
         }
-        try self.guardNum(rb, vb, .operand_type, .b);
-        try self.guardNum(rc, vc, .operand_type, .c);
+        try self.guardNum(rb, vb, .operand_type, f.lhs_od);
+        try self.guardNum(rc, vc, .operand_type, f.rhs_od);
         const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
-        self.setReg(instr.a, r);
+        self.setReg(f.dst, r);
     }
 
     /// `jmp_if_false`/`jmp_if_true`: pin the *observed* truthiness of the tested

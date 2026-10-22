@@ -405,11 +405,9 @@ pub const FrameMotionAbi = struct {
     /// default).
     frame_code_cache_gen_off: i32,
     /// `CallFrame.in_flight` (bool; the push writes 0, replicating the
-    /// struct-literal default — doc 61 §4.2).
+    /// struct-literal default — doc 61 §4.2). Doc 68's `ctl` byte follows it,
+    /// so the push clears both with one word store here.
     frame_in_flight_off: i32,
-    /// `CallFrame.ctl` (doc 68 `FrameCtl`, one byte; the push writes 0,
-    /// replicating the struct-literal default).
-    frame_ctl_off: i32,
     /// `interp.max_call_depth` — the depth wall immediate.
     max_call_depth: u32,
 };

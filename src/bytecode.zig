@@ -282,7 +282,109 @@ pub const OpCode = enum(u8) {
     shl_rk,
     /// `a, b, c`   R[a] = R[b] >> K[c]
     shr_rk,
+
+    // ---- equality against a constant (doc 66 P5, LuaJIT `ISEQP`/`ISEQS`/
+    // `ISEQN`) ----
+    // `R[a] = R[b] == <constant>` and its negation. A constant is never a
+    // table, so `__eq` cannot fire and none of these can fault; a constant
+    // on the left compiles to the same op. `eqFormOf` decodes them.
+    /// `a, b, c`   R[a] = R[b] == P(c)   (`c` an immediate: `Prim`)
+    eq_p,
+    /// `a, b, c`   R[a] = R[b] ~= P(c)
+    ne_p,
+    /// `a, b, c`   R[a] = R[b] == K[c]   (K[c] an interned string)
+    eq_s,
+    /// `a, b, c`   R[a] = R[b] ~= K[c]
+    ne_s,
+    /// `a, b, c`   R[a] = R[b] == K[c]   (K[c] a number: `1 == 1.0`)
+    eq_n,
+    /// `a, b, c`   R[a] = R[b] ~= K[c]
+    ne_n,
 };
+
+/// Doc 66 P5: the immediate operand of `eq_p`/`ne_p`.
+pub const Prim = enum(u16) {
+    nil = 0,
+    @"false" = 1,
+    @"true" = 2,
+
+    pub fn value(self: Prim) Value {
+        return switch (self) {
+            .nil => Value.nil(),
+            .@"false" => Value.boolean(false),
+            .@"true" => Value.boolean(true),
+        };
+    }
+
+    /// The immediate for a nil or boolean constant, or null for any other.
+    pub fn of(v: Value) ?Prim {
+        return switch (v.tag) {
+            .nil => .nil,
+            .boolean => if (v.asBool()) .@"true" else .@"false",
+            else => null,
+        };
+    }
+};
+
+/// Doc 66 P5: where an equality's right operand comes from.
+pub const EqConst = enum {
+    /// `R[c]`: the register forms `eq` and `ne`.
+    reg,
+    /// `P(c)`: nil, false or true.
+    prim,
+    /// `K[c]`, an interned string.
+    str,
+    /// `K[c]`, a number.
+    num,
+};
+
+/// Doc 66 P5: an equality instruction, decoded. The interpreter's fault
+/// rendering, the recorder and liveness go through `eqFormOf` instead of
+/// naming the constant forms.
+pub const EqForm = struct {
+    /// `~=` rather than `==`.
+    negate: bool,
+    rhs: EqConst,
+};
+
+/// The equality `op` performs, or null when it is not one. Usable at
+/// comptime.
+pub fn eqFormOf(op: OpCode) ?EqForm {
+    const negate: bool, const rhs: EqConst = switch (op) {
+        .eq => .{ false, .reg },
+        .ne => .{ true, .reg },
+        .eq_p => .{ false, .prim },
+        .ne_p => .{ true, .prim },
+        .eq_s => .{ false, .str },
+        .ne_s => .{ true, .str },
+        .eq_n => .{ false, .num },
+        .ne_n => .{ true, .num },
+        else => return null,
+    };
+    return .{ .negate = negate, .rhs = rhs };
+}
+
+/// The equality op for `negate` with its right operand from `rhs`: the
+/// inverse of `eqFormOf`.
+pub fn eqOpOf(negate: bool, rhs: EqConst) OpCode {
+    return switch (rhs) {
+        .reg => if (negate) .ne else .eq,
+        .prim => if (negate) .ne_p else .eq_p,
+        .str => if (negate) .ne_s else .eq_s,
+        .num => if (negate) .ne_n else .eq_n,
+    };
+}
+
+/// An equality instruction's constant right operand, or null for the
+/// register forms.
+pub fn eqConstant(instr: Instr, proto: *const Proto) ?Value {
+    const f = eqFormOf(instr.op).?;
+    return switch (f.rhs) {
+        .reg => null,
+        .prim => @as(Prim, @enumFromInt(instr.c)).value(),
+        .str, .num => proto.constants[instr.c],
+    };
+}
 
 /// Doc 66 P3: where an arithmetic or bitwise instruction's operands come
 /// from.
@@ -895,6 +997,7 @@ pub fn writeInstr(w: *io.Writer, instr: Instr) io.Writer.Error!void {
         .ret,
         .vararg_get,
         => try w.print(" r{d}  {d}", .{ instr.a, instr.b }),
+        .eq_p, .ne_p => try w.print(" r{d}  {d}  {s}", .{ instr.a, instr.b, @tagName(@as(Prim, @enumFromInt(instr.c))) }),
         else => try w.print(" r{d}  {d}  {d}", .{ instr.a, instr.b, instr.c }),
     }
 }
@@ -920,6 +1023,22 @@ pub fn writeProto(w: *io.Writer, proto: *const Proto) io.Writer.Error!void {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "doc 66 P5: eqFormOf and eqOpOf are inverses" {
+    var forms: usize = 0;
+    for (std.enums.values(OpCode)) |op| {
+        const f = eqFormOf(op) orelse continue;
+        try testing.expectEqual(op, eqOpOf(f.negate, f.rhs));
+        forms += 1;
+    }
+    try testing.expectEqual(@as(usize, 8), forms);
+    try testing.expectEqual(@as(?EqForm, null), eqFormOf(.lt));
+    try testing.expect(Prim.nil.value().isNil());
+    try testing.expect(Prim.@"false".value().eql(Value.boolean(false)));
+    try testing.expect(Prim.@"true".value().eql(Value.boolean(true)));
+    for (std.enums.values(Prim)) |p| try testing.expectEqual(p, Prim.of(p.value()).?);
+    try testing.expectEqual(@as(?Prim, null), Prim.of(Value.int(0)));
+}
 
 test "doc 66 P3: arithFormOf and constantFormOf are inverses" {
     var forms: usize = 0;

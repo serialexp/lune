@@ -1008,11 +1008,11 @@ pub fn emitInlineSelfPush(
     // qword -1 == CODE_CACHE_GEN_INVALID.
     try a.movMemImm32(.rax, abi.frame_code_cache_gen_off, -1);
     // Doc 61 §4.2: a pushed frame starts out of flight (the struct-literal
-    // default); the slot may hold a retained faulting frame's set flag.
-    try a.movByteMemImm(.rax, abi.frame_in_flight_off, 0);
-    // Doc 68: an ordinary Lua frame with no continuation; the slot may hold
-    // an old activation's.
-    try a.movByteMemImm(.rax, abi.frame_ctl_off, 0);
+    // default); the slot may hold a retained faulting frame's set flag. Doc
+    // 68: and an ordinary Lua frame with no continuation, where the slot may
+    // hold an old activation's. The two bytes are adjacent (checked at
+    // comptime in `interp.zig`), so one word store clears both.
+    try a.movWordMemImm(.rax, abi.frame_in_flight_off, 0);
     // ctx.base refresh now, while rcx still holds callee_base (step 8's
     // base half, hoisted — nothing observes ctx mid-sequence).
     try a.movMemReg(.r9, @offsetOf(Ctx, "base"), .rcx);

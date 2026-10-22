@@ -310,6 +310,18 @@ pub const Assembler = struct {
         try self.b(v);
     }
 
+    /// `mov word [base + disp], imm16` — 66 C7 /0 iw (the operand-size prefix
+    /// goes before REX). Doc 68: clears `CallFrame.in_flight` and `ctl`, two
+    /// adjacent bytes, in one store.
+    pub fn movWordMemImm(self: *Assembler, base: Reg, disp: i32, v: u16) !void {
+        try self.b(0x66);
+        try self.rex(false, false, false, base.hi());
+        try self.b(0xC7);
+        try self.modrmMem(0, base, disp);
+        try self.b(@truncate(v));
+        try self.b(@truncate(v >> 8));
+    }
+
     /// `movzx dst, byte [base + disp]` — REX.W 0F B6 /r.
     pub fn movzxRegMem8(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
         try self.rex(true, dst.hi(), false, base.hi());
@@ -1059,6 +1071,19 @@ test "enc: mov qword [base+disp], imm32" {
     try expectEnc(&.{ 0x48, 0xC7, 0x07, 0x02, 0, 0, 0 }, struct { // mov qword [rdi], 2
         fn f(a: *Assembler) !void {
             try a.movMemImm32(.rdi, 0, 2);
+        }
+    }.f);
+}
+
+test "enc: mov word [base+disp], imm16" {
+    try expectEnc(&.{ 0x66, 0xC7, 0x40, 0x4E, 0x34, 0x12 }, struct { // mov word [rax+78], 0x1234
+        fn f(a: *Assembler) !void {
+            try a.movWordMemImm(.rax, 78, 0x1234);
+        }
+    }.f);
+    try expectEnc(&.{ 0x66, 0x41, 0xC7, 0x40, 0x4E, 0, 0 }, struct { // mov word [r8+78], 0
+        fn f(a: *Assembler) !void {
+            try a.movWordMemImm(.r8, 78, 0);
         }
     }.f);
 }

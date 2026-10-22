@@ -134,9 +134,10 @@ fn effectOf(ins: Instr, pc: u32, code_len: usize) Effect {
             e.kill(a, a + 1);
             e.succ[0] = next;
         },
-        // `get_field` (doc 66 P2) and the constant-operand arithmetic forms
-        // (P3): their `c` is a constant, not a register.
-        .move, .neg, .not, .bnot, .len, .vararg_get, .get_field, .add_rk, .sub_rk, .mul_rk, .div_rk, .mod_rk, .idiv_rk, .pow_rk, .add_kr, .sub_kr, .mul_kr, .div_kr, .mod_kr, .idiv_kr, .pow_kr, .band_rk, .bor_rk, .bxor_rk, .shl_rk, .shr_rk => {
+        // `get_field` (doc 66 P2), the constant-operand arithmetic forms (P3)
+        // and the constant equalities (P5): their `c` is a constant or an
+        // immediate, not a register.
+        .move, .neg, .not, .bnot, .len, .vararg_get, .get_field, .add_rk, .sub_rk, .mul_rk, .div_rk, .mod_rk, .idiv_rk, .pow_rk, .add_kr, .sub_kr, .mul_kr, .div_kr, .mod_kr, .idiv_kr, .pow_kr, .band_rk, .bor_rk, .bxor_rk, .shl_rk, .shr_rk, .eq_p, .ne_p, .eq_s, .ne_s, .eq_n, .ne_n => {
             e.use(ins.b);
             e.kill(a, a + 1);
             e.succ[0] = next;

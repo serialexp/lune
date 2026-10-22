@@ -255,6 +255,22 @@ earlier in `/tmp/t0micro/`).
 - [ ] **`#t` on a table is ~177 instructions** (string `#` ~48): the
       `__len` metatable probe plus `Table.length`'s border scan.
 
+## JIT instruction counts move with bytecode pc layout (noted 2026-10-22)
+
+Found while measuring doc 66 P5. On one binary, `repack_adversarial`
+(`--trace --jit-native`, `poison 2000 1000`) runs 284.16M–284.59M
+instructions depending only on how many no-op `do local _ = 0 end`
+statements precede its main loop: up to 0.15%, deterministic per layout,
+with an identical trace set and identical iteration counts in
+`--jit-stats`. So any change that adds or removes bytecode shifts JIT
+rows by that much for no reason of its own (P5's +0.09% here flipped
+sign under padding). The likely suspect is something direct-mapped or
+hashed by pc on a hot path (the hotcount, a dispatcher/ledger lookup),
+whose collisions change with layout. Worth finding: it is ±0.15% of
+noise on every A/B that changes code size, and maybe a real collision
+cost. Repro files: pad `bench/repack_adversarial.lua` after
+`local checksum = 0` with 0–4 such statements.
+
 ## nsieve-bit-fp, the board's worst row (noted 2026-10-19)
 
 18.6× LuaJIT on the 1b60a01 board, and JIT (394 ms) slower than tier-0

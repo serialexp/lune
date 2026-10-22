@@ -443,6 +443,13 @@ pub const FrameCtl = packed struct(u8) {
     _pad: u4 = 0,
 };
 
+comptime {
+    // Doc 68: the inline native push and the `.S` host-call frame write clear
+    // `in_flight` and `ctl` with one 16-bit store at `in_flight`.
+    std.debug.assert(@offsetOf(CallFrame, "ctl") == @offsetOf(CallFrame, "in_flight") + 1);
+    std.debug.assert(@sizeOf(bool) == 1 and @sizeOf(FrameCtl) == 1);
+}
+
 pub const CallFrame = struct {
     /// The closure executing in this frame (its proto = code/constants/upvalues).
     closure: *const Closure,
@@ -1142,7 +1149,6 @@ pub const Vm = struct {
             .frame_varargs_count_off = @offsetOf(CallFrame, "varargs_count"),
             .frame_code_cache_gen_off = @offsetOf(CallFrame, "code_cache_gen"),
             .frame_in_flight_off = @offsetOf(CallFrame, "in_flight"),
-            .frame_ctl_off = @offsetOf(CallFrame, "ctl"),
             .max_call_depth = max_call_depth,
         };
     };
@@ -3294,6 +3300,7 @@ pub const Vm = struct {
         t[@intFromEnum(bytecode.OpCode.set_field)] = opSetFieldSlow(mode);
         inline for (.{ .idiv, .mod, .idiv_rk, .mod_rk, .idiv_kr, .mod_kr }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opModIdivSlow(mode, op);
         inline for (.{ .eq, .ne }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opEqNeSlow(mode, op);
+        inline for (.{ .eq_n, .ne_n }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opEqNSlow(mode, op);
         inline for (.{ .lt, .le, .gt, .ge }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opCompareSlow(mode, op);
         return t;
     }
@@ -5921,6 +5928,9 @@ pub const Vm = struct {
             .len => opLen(mode),
             .concat => opConcat(mode),
             .eq, .ne => opEqNe(mode, op),
+            .eq_p, .ne_p => opEqP(mode, op),
+            .eq_s, .ne_s => opEqS(mode, op),
+            .eq_n, .ne_n => opEqN(mode, op),
             .lt, .le, .gt, .ge => opCompare(mode, op),
             .jmp, .jmp_if_false, .jmp_if_true, .jmp_if_not_nil => opJump(mode, op),
             .for_prep => opForPrep(mode),
@@ -6359,6 +6369,85 @@ pub const Vm = struct {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
                 const eqv = vm.valuesEqual(regs.get(instr.b), regs.get(instr.c)) catch |e| return parkErr(st, e);
                 regs.setBool(instr.a, if (op == .eq) eqv else !eqv);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    // Doc 66 P5: equality against a constant (LuaJIT `ISEQP`/`ISEQS`/
+    // `ISEQN`). A constant is never a table, so `__eq` cannot fire and each
+    // handler decides every operand on its own, with no slow half; each is
+    // exactly `Value.eql` against the constant.
+
+    /// `eq_p`/`ne_p`: nil by its tag, a boolean by tag and truth (`asBool`).
+    fn opEqP(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        const negate = comptime bytecode.eqFormOf(op).?.negate;
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const t = regs.tagAt(instr.b);
+                const eqv = switch (@as(bytecode.Prim, @enumFromInt(instr.c))) {
+                    .nil => t == .nil,
+                    .@"false" => t == .boolean and regs.bitsAt(instr.b) == 0,
+                    .@"true" => t == .boolean and regs.bitsAt(instr.b) != 0,
+                };
+                regs.setBool(instr.a, eqv != negate);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// `eq_s`/`ne_s`: strings are interned, so a string equals the constant
+    /// exactly when it is the same object.
+    fn opEqS(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        const negate = comptime bytecode.eqFormOf(op).?.negate;
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                // Through the payload union, not `@ptrFromInt`: a pointer is
+                // narrower than the 64-bit word on wasm32.
+                const eqv = regs.tagAt(instr.b) == .heap_ref and
+                    (Value{ .tag = .heap_ref, .payload = .{ .bits = regs.bitsAt(instr.b) } }).asHeap() == st.proto.constants[instr.c].asHeap();
+                regs.setBool(instr.a, eqv != negate);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// `eq_n`/`ne_n`: the same number type on the raw lanes (a float
+    /// compares as IEEE, so NaN is unequal and `-0.0 == 0.0`), anything but
+    /// a number unequal; the other number type leaves for `opEqNSlow`, so the
+    /// common lanes keep a frame with no callee-saved registers.
+    fn opEqN(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        const negate = comptime bytecode.eqFormOf(op).?.negate;
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const k = &st.proto.constants[instr.c];
+                const t = regs.tagAt(instr.b);
+                const eqv = if (t == k.tag) blk: {
+                    if (t == .int) break :blk regs.bitsAt(instr.b) == k.payload.bits;
+                    @setFloatMode(.strict);
+                    break :blk @as(f64, @bitCast(regs.bitsAt(instr.b))) == @as(f64, @bitCast(k.payload.bits));
+                } else if (t == .int or t == .float)
+                    return slowTail(mode, st, pc, instr, vm, tags, payloads)
+                else
+                    false;
+                regs.setBool(instr.a, eqv != negate);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// `opEqN`'s slow half: an int against a float constant or a float
+    /// against an int one, compared exactly (`compareNumeric`, `1 == 1.0`).
+    fn opEqNSlow(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        const negate = comptime bytecode.eqFormOf(op).?.negate;
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const eqv = value.compareNumeric(regs.get(instr.b), st.proto.constants[instr.c]) == .eq;
+                regs.setBool(instr.a, eqv != negate);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;

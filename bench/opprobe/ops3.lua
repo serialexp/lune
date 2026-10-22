@@ -29,6 +29,13 @@ P.rfmul = function(n) local s, x = 0, 1.5 for i = 1, n do local b = x * x s = s 
 P.rfsub = function(n) local s, x = 0, 1.5 for i = 1, n do local b = x - x s = s + i end return s end
 P.rfdiv = function(n) local s, x = 0, 1.5 for i = 1, n do local b = x / x s = s + i end return s end
 P.rimul = function(n) local s = 0 for i = 1, n do local b = i * i s = s + i end return s end
+-- Doc 66 P5: equality against a constant, as a value and as a condition.
+P.eqvnil = function(n) local s, x = 0, 1 for i = 1, n do local b = x == nil s = s + i end return s end
+P.eqvfalse = function(n) local s, x = 0, 1 for i = 1, n do local b = x ~= false s = s + i end return s end
+P.eqvstr = function(n) local s, x = 0, "y" for i = 1, n do local b = x == "x" s = s + i end return s end
+P.eqvnum = function(n) local s = 0 for i = 1, n do local b = i == 7 s = s + i end return s end
+P.eqvreg = function(n) local s, x, y = 0, 1, 2 for i = 1, n do local b = x == y s = s + i end return s end
+P.eqstr = function(n) local s, x = 0, "y" for i = 1, n do if x == "x" then s = 0 end s = s + i end return s end
 -- One `pairs` step: an n-key hash traversed once per outer iteration.
 P.pairs = function(n)
   local t = {}
