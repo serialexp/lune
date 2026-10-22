@@ -1703,6 +1703,11 @@ pub const RecordingSession = struct {
             else
                 self.abort(.bad_type),
 
+            // Doc 66 P2: the constant-key forms are the string-key shapes with
+            // the key taken from the proto's constants.
+            .get_field => try self.hashGetShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = .{ .konst = proto.constants[instr.c] }, .tab_od = .b, .key_od = .c }),
+            .set_field => try self.hashSetShape(regs, .{ .tab = instr.a, .key = .{ .konst = proto.constants[instr.b] }, .val = instr.c, .tab_od = .a, .key_od = .b, .val_od = .c }),
+
             // Fused two-level access `a[i][j]` / `a[i][j]=v` (doc 14, Phase 8). We
             // record ONLY when the container is already a flattened grid with an
             // int element lane and the access is a present, in-bounds, in-lane cell
@@ -2225,11 +2230,37 @@ pub const RecordingSession = struct {
     // operand is designated in exit provenance (`.b`/`.c` for the opcodes,
     // `.a1`/`.a2`/`.a3` — call args — for the builtins).
 
+    /// Doc 66 P2: where an access's key comes from.
+    pub const KeyOperand = union(enum) {
+        /// A guest register (`get_index`/`set_index`, `rawget`/`rawset`).
+        reg: u16,
+        /// A proto constant (`get_field`/`set_field`), always an interned
+        /// string, so the array shapes never see one.
+        konst: Value,
+    };
+
+    /// The key's observed value.
+    fn keyValue(regs: RegWindow, k: KeyOperand) Value {
+        return switch (k) {
+            .reg => |r| regs.get(r),
+            .konst => |v| v,
+        };
+    }
+
+    /// The key's SSA ref: the register's, or the interned `konst` that a
+    /// `load_const` of the same constant would have produced.
+    fn keyRef(self: *RecordingSession, k: KeyOperand) !Ref {
+        return switch (k) {
+            .reg => |r| self.refOf(r),
+            .konst => |v| self.konst(v),
+        };
+    }
+
     /// Slot frame for the read shapes: `dst` receives the loaded value.
     pub const GetFrame = struct {
         dst: u16,
         tab: u16,
-        key: u16,
+        key: KeyOperand,
         tab_od: OperandDesig,
         key_od: OperandDesig,
     };
@@ -2237,7 +2268,7 @@ pub const RecordingSession = struct {
     /// Slot frame for the write shapes: `val` is the stored value's register.
     pub const SetFrame = struct {
         tab: u16,
-        key: u16,
+        key: KeyOperand,
         val: u16,
         tab_od: OperandDesig,
         key_od: OperandDesig,
@@ -2269,12 +2300,12 @@ pub const RecordingSession = struct {
     ///     (no strict type guard pins those — doc 32 §3);
     ///   * element table has a metatable → `.has_metatable`.
     pub fn recArrayGet(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
-        return self.arrayGetShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = instr.c, .tab_od = .b, .key_od = .c });
+        return self.arrayGetShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = .{ .reg = instr.c }, .tab_od = .b, .key_od = .c });
     }
 
     pub fn arrayGetShape(self: *RecordingSession, regs: RegWindow, f: GetFrame) !void {
         const vtab = regs.get(f.tab);
-        const vkey = regs.get(f.key);
+        const vkey = keyValue(regs, f.key);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         const idx = keyIndexOf(vkey) orelse {
             self.dbg("bad_type arrayGet key: isInt={} isFloat={} pc={d}", .{ vkey.isInt(), vkey.isFloat(), self.cur_pc });
@@ -2321,7 +2352,7 @@ pub const RecordingSession = struct {
             const rtab = try self.refOf(f.tab);
             self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
             try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
-            const rkey = try self.keyRefNarrowed(f.key, f.key_od, vkey);
+            const rkey = try self.keyRefNarrowed(f.key.reg, f.key_od, vkey);
             if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, idx, vtab.asHeap())) return;
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
             self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
@@ -2350,7 +2381,7 @@ pub const RecordingSession = struct {
         const rtab = try self.refOf(f.tab);
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
         try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
-        const rkey = try self.keyRefNarrowed(f.key, f.key_od, vkey);
+        const rkey = try self.keyRefNarrowed(f.key.reg, f.key_od, vkey);
         if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, idx, vtab.asHeap())) return;
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
         self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
@@ -2586,7 +2617,7 @@ pub const RecordingSession = struct {
     ///     control channels with one obviously-sound rule. nsieve's sieve-clearing
     ///     loop is a pure write of `false` (no `aload`), so the rule costs it nothing.
     pub fn recArraySet(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
-        return self.arraySetShape(regs, .{ .tab = instr.a, .key = instr.b, .val = instr.c, .tab_od = .a, .key_od = .b, .val_od = .c });
+        return self.arraySetShape(regs, .{ .tab = instr.a, .key = .{ .reg = instr.b }, .val = instr.c, .tab_od = .a, .key_od = .b, .val_od = .c });
     }
 
     pub fn arraySetShape(self: *RecordingSession, regs: RegWindow, f: SetFrame) !void {
@@ -2598,7 +2629,7 @@ pub const RecordingSession = struct {
         // because we cannot tell append-vs-in-bounds until we know `idx`/`len` below.
         // See `docs/design/08-multi-store-sinking.md`.
         const vtab = regs.get(f.tab);
-        const vkey = regs.get(f.key);
+        const vkey = keyValue(regs, f.key);
         const vval = regs.get(f.val);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         if (self.globalsStoreBars(vtab)) return self.abort(.aliased_input); // doc 43 P0b
@@ -2673,7 +2704,7 @@ pub const RecordingSession = struct {
             if (self.traceHasAlenOf(rtab)) return self.abort(.aliased_input);
             self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
             try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
-            const rkey = try self.keyRefNarrowed(f.key, f.key_od, vkey);
+            const rkey = try self.keyRefNarrowed(f.key.reg, f.key_od, vkey);
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
             // guard_append: hash-empty + `idx==asize` + `asize<cap`. The grow analogue
             // of guard_bounds — side-exits to tier-0 (which reallocs/migrates) when
@@ -2715,7 +2746,7 @@ pub const RecordingSession = struct {
         const rtab = try self.refOf(f.tab);
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
         try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
-        const rkey = try self.keyRefNarrowed(f.key, f.key_od, vkey);
+        const rkey = try self.keyRefNarrowed(f.key.reg, f.key_od, vkey);
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
         self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
         // Pin the stored value's type. Which guard does that depends on the lane, and
@@ -3052,12 +3083,12 @@ pub const RecordingSession = struct {
     /// General absent lookup. Keep the nil constant behind a runtime proof;
     /// never specialize an observed absence into an unconditional result.
     fn recordAbsentGet(self: *RecordingSession, regs: RegWindow, f: GetFrame) !void {
-        const key = regs.get(f.key);
+        const key = keyValue(regs, f.key);
         const rtab = try self.refOf(f.tab);
         const rkey = if (key.isNumber())
-            try self.keyRefNarrowed(f.key, f.key_od, key)
+            try self.keyRefNarrowed(f.key.reg, f.key_od, key)
         else
-            try self.refOf(f.key);
+            try self.keyRef(f.key);
         if (!key.isNumber() and self.konstValueOf(rkey) == null) return self.abort(.bad_type);
         // Pending mutations are not yet in the executor heap. The existing
         // forwarding paths either resolve them or refuse ambiguous aliases.
@@ -3070,12 +3101,12 @@ pub const RecordingSession = struct {
     }
 
     pub fn recHashGet(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
-        return self.hashGetShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = instr.c, .tab_od = .b, .key_od = .c });
+        return self.hashGetShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = .{ .reg = instr.c }, .tab_od = .b, .key_od = .c });
     }
 
     pub fn hashGetShape(self: *RecordingSession, regs: RegWindow, f: GetFrame) !void {
         const vtab = regs.get(f.tab);
-        const vkey = regs.get(f.key);
+        const vkey = keyValue(regs, f.key);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
         if (tbl.metatable != null) return self.abort(.has_metatable);
@@ -3123,7 +3154,7 @@ pub const RecordingSession = struct {
         // `load_const`), so its ref is provably the constant — no runtime key-
         // identity guard is needed and the cell is pinnable. A computed key reaches
         // here as a `slot_load`/arith ref and aborts (v1 scope).
-        const rkey = try self.refOf(f.key);
+        const rkey = try self.keyRef(f.key);
         if (self.instrs.items[@intCast(rkey)].op != .konst) return self.abort(.bad_type);
 
         const rtab = try self.refOf(f.tab);
@@ -3192,7 +3223,7 @@ pub const RecordingSession = struct {
     ///   * computed (non-`konst`) key → `.bad_type`;
     ///   * recorder allocation failure → `.alloc` (ordinary recording abort).
     pub fn recHashSet(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
-        return self.hashSetShape(regs, .{ .tab = instr.a, .key = instr.b, .val = instr.c, .tab_od = .a, .key_od = .b, .val_od = .c });
+        return self.hashSetShape(regs, .{ .tab = instr.a, .key = .{ .reg = instr.b }, .val = instr.c, .tab_od = .a, .key_od = .b, .val_od = .c });
     }
 
     /// Doc 43 §3.2 (P0b): record that a store targets `vtab`; if that is the
@@ -3210,7 +3241,7 @@ pub const RecordingSession = struct {
 
     pub fn hashSetShape(self: *RecordingSession, regs: RegWindow, f: SetFrame) !void {
         const vtab = regs.get(f.tab);
-        const vkey = regs.get(f.key);
+        const vkey = keyValue(regs, f.key);
         const vval = regs.get(f.val);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         if (self.globalsStoreBars(vtab)) return self.abort(.aliased_input);
@@ -3225,7 +3256,7 @@ pub const RecordingSession = struct {
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
         if (tbl.metatable != null) return self.abort(.has_metatable);
         _ = tbl.fieldPtr(vkey) orelse return self.abort(.bad_type); // absent = insert
-        const rkey = try self.refOf(f.key);
+        const rkey = try self.keyRef(f.key);
         if (self.instrs.items[@intCast(rkey)].op != .konst) return self.abort(.bad_type);
 
         // C1 / store-sinking, identical to `recArraySet`: a write following any heap
@@ -5113,9 +5144,9 @@ pub const RecordingSession = struct {
         try self.guardBuiltinCallee(instr.a, .rawget);
         const vkey = regs.get(key_slot);
         if (vkey.isNumber())
-            try self.arrayGetShape(regs, .{ .dst = instr.a, .tab = tab_slot, .key = key_slot, .tab_od = .a1, .key_od = .a2 })
+            try self.arrayGetShape(regs, .{ .dst = instr.a, .tab = tab_slot, .key = .{ .reg = key_slot }, .tab_od = .a1, .key_od = .a2 })
         else if (isStringKey(vkey))
-            try self.hashGetShape(regs, .{ .dst = instr.a, .tab = tab_slot, .key = key_slot, .tab_od = .a1, .key_od = .a2 })
+            try self.hashGetShape(regs, .{ .dst = instr.a, .tab = tab_slot, .key = .{ .reg = key_slot }, .tab_od = .a1, .key_od = .a2 })
         else
             return self.abort(.bad_type);
     }
@@ -5142,9 +5173,9 @@ pub const RecordingSession = struct {
         try self.guardBuiltinCallee(instr.a, .rawset);
         const vkey = regs.get(key_slot);
         if (vkey.isNumber())
-            try self.arraySetShape(regs, .{ .tab = tab_slot, .key = key_slot, .val = val_slot, .tab_od = .a1, .key_od = .a2, .val_od = .a3 })
+            try self.arraySetShape(regs, .{ .tab = tab_slot, .key = .{ .reg = key_slot }, .val = val_slot, .tab_od = .a1, .key_od = .a2, .val_od = .a3 })
         else if (isStringKey(vkey))
-            try self.hashSetShape(regs, .{ .tab = tab_slot, .key = key_slot, .val = val_slot, .tab_od = .a1, .key_od = .a2, .val_od = .a3 })
+            try self.hashSetShape(regs, .{ .tab = tab_slot, .key = .{ .reg = key_slot }, .val = val_slot, .tab_od = .a1, .key_od = .a2, .val_od = .a3 })
         else
             return self.abort(.bad_type);
         if (!self.active) return; // the shape aborted

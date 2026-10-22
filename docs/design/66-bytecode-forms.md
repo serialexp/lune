@@ -1,8 +1,9 @@
 # 66 — Bytecode forms: constant operands, field ops, compare-and-branch, ITERN
 
-Status: rev 2, decided, not yet implemented. Round-1 review findings
+Status: rev 2, partial. The `condBranchOf` refactor and P2 landed; P3,
+P5, P4 and P1 are outstanding, in that order. Round-1 review findings
 (codex and antigravity, §10) are folded in. Bart answered Q1–Q5 (§9) on
-2026-10-22. The `condBranchOf` refactor landed; P2 is next.
+2026-10-22.
 Owner: claude (coral-marten)
 Last updated: 2026-10-22
 
@@ -27,9 +28,6 @@ land; move whole phases to Done once everything inside them is checked.
   - `itern` must decline grids;
   - the recorder's field helpers take a key register;
   - constant `==` needs numeric semantics.
-
-### Outstanding
-
 - [x] **P0 — probes into the repo** (2026-10-21). They are now in
   `bench/opprobe/`: `ops.lua`, `ops2.lua`, `ops3.lua` and `fields.lua`,
   with `measure.sh` (per-op marginal cost against LuaJIT `-joff`) and
@@ -63,10 +61,48 @@ land; move whole phases to Done once everything inside them is checked.
   behaviour change: `--dump-native` and `--jit-stats` counts are
   identical to HEAD on all 33 `@bench` programs with helper addresses
   masked.
+- [x] **P2 — `get_field` / `set_field`** (2026-10-22, §5.2). Ops `get_field A B C`
+  (`R[A] = R[B][K[C]]`) and `set_field A B C` (`R[A][K[B]] = R[C]`), the K
+  operand an interned-string constant. The compiler emits them for
+  `t.name`, `t.name = v`, a literal-string `t["k"]`, method lookups, the
+  `function a.b.c()` path and compound field stores (`IndexKey`,
+  `indexKeyOf`). The handlers share the d40cf2d heap-key fast paths; the
+  recorder takes them through `KeyOperand` (`.reg` | `.konst`) into the
+  existing hash shapes; `bc_liveness`, the disassembler and the replay
+  effect list name them. Per-op probe (`fields.lua`, instructions per op,
+  before → after, LuaJIT `-joff` in brackets): fget 128 → 89 (29), fset
+  125 → 87 (32), mlook 213 → 173, mcall 711 → 671. `abench.sh` tier-0:
+  field_hash −22.3%, nbody −14.2%, array3d −6.6%, io_write −2.9%, lua54
+  −0.7%, everything else within ±0.01% except compile_multret_chain +0.07%
+  (one extra instruction per call in `bc_liveness.effectOf`'s by-value
+  return, LLVM codegen). JIT tier: array3d −0.9%, nbody −0.1%;
+  euler14-bit, spectral-norm, repack and while_shortcircuit_probe
+  +0.2–0.6% on the native (AVX-512) build but within ±0.02% on an
+  x86_64_v3 build except the probe (+0.4%, the accessor below). The
+  pinned board arbitrates. hashgate: 99 digests match on both legs.
+- [x] **Inlined-callee branch guards were decoded against the anchor
+  proto** (found during P2, fixed in the same change). A guard's aux is
+  the recorder's post-increment pc in the proto it was recorded in, but
+  every loop-test, branch and bridge classifier indexed `anchor.proto.code`
+  with it, inlined callee or not. P2 shortened an iterator by one op, so
+  its `jmp_if_false` landed on the same pc as the anchor's own, and
+  array3d paid a "want PRIME side" on every row wrap (+6.3% JIT
+  instructions; the output stayed right). `TraceCode.anchorSourcePc`,
+  `anchorSourceInstr` and `anchorCondBranch` now answer only for
+  anchor-frame guards (`isAnchorFrameGuard`: provenance inline depth 0,
+  not a link terminal), memoised at commit as the `off_frame` bitset;
+  every classifier goes through them. Test: "doc 66 P2: an inlined
+  callee's branch guard is never decoded against the anchor proto"
+  (tier-1a and native, mutation-checked).
+
+### Outstanding
+
 - [ ] **P1 — `itern`** (§5.1): the generic-`for` step for the real `next`
   without a call.
-- [ ] **P2 — `get_field` / `set_field`** (§5.2): a constant string key in
-  the instruction.
+- [ ] **Decode inlined branch guards against their own proto** (follow-up
+  to the fix above). Today they are simply not classified. An option is
+  to carry the guard's proto in provenance, so a callee's own loop test
+  can still be recognised. Not needed for correctness.
 - [ ] **P3 — constant-operand arithmetic** (§5.3).
 - [ ] **P4 — compare-and-branch** (§5.4).
 - [ ] **P5 — `eq`/`ne` against a constant** (§5.5).

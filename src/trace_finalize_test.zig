@@ -75,6 +75,7 @@ test "finalize owns code independently and excludes synthetic fingerprint slots"
     try std.testing.expectEqual(@as(u16, 0), frozen.entry_guards[0].slot);
     try std.testing.expect(!frozen.rec_path_complete);
     try std.testing.expect(frozen.bridge_cand_built);
+    try std.testing.expect(frozen.off_frame_built);
     try std.testing.expectEqual(@as(u64, 12), candidate.side_src.?.trace_id);
     scratch.instrs.items[0].aux = 99;
     scratch.input_seeds.items[0].source = 99;

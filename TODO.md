@@ -206,10 +206,28 @@ earlier in `/tmp/t0micro/`).
       ~18-instruction dispatch prologue plus a register round trip.
       Marginal costs (mahina vs LuaJIT): `<` 171/32, `==` 181/38,
       `- k` 100/15, `if a < b` 205/32. Design: doc 66
-      (`docs/design/66-bytecode-forms.md`, draft 2026-10-21). After items
-      1–3 the gap is mostly op count: one op is a ~25-instruction floor,
-      and a `pairs` step is 459 against LuaJIT's 17. Q1–Q5 are open for
-      Bart.
+      (`docs/design/66-bytecode-forms.md`). After items 1–3 the gap is
+      mostly op count: one op is a ~25-instruction floor, and a `pairs`
+      step is 459 against LuaJIT's 17. Q1–Q5 decided 2026-10-22; order
+      P2 → P3 → P5 → P4 → P1. **P2 landed 2026-10-22** (`get_field` /
+      `set_field`): `t.x` 128 → 89 (LuaJIT 29), `t.x = v` 125 → 87 (32),
+      method lookup 213 → 173, method call 711 → 671; tier-0 field_hash
+      −22%, nbody −14%, array3d −6.6%. What `t.x` still pays over LuaJIT is
+      the heap-key probe plus handler register pressure. P3 is next.
+- [ ] **`bc_liveness.effectOf` returns a ~48-byte `Effect` by value**
+      (~33 instructions a call), but `successors()` and the CFG builders
+      only need `.succ`. It dominates compile_multret_chain's compile time
+      (P2 cost it +0.07% from a single extra instruction in the return).
+      A `successorsOf(instr, pc)` that skips building the use/def lists
+      would cut it.
+- [ ] **Native-build JIT rows move ±0.2–0.6% on unrelated changes.**
+      euler14-bit, spectral-norm and repack_adversarial moved +0.2–0.6%
+      JIT instructions with P2 on the native (AVX-512) ReleaseFast build,
+      but ±0.02% on an `x86_64_v3` build of the same trees. The cost moves
+      between `opForPrep.h` and `enterSelectedTrace` (LLVM inlining
+      decisions), not into trace code. Check on the pinned board; if it
+      shows up there too, look at pinning the inlining (a `noinline` /
+      `inline` on the handler entry) rather than chasing per-change.
 - [x] **Constant-key field access has no per-site hint.** `t.x` read
       272/42, `t.x = v` 328/45, a method call `o:get()` ~1250 total.
       Globals already have doc 62's slot hints and are at parity (32/30).

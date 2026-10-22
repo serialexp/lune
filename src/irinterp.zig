@@ -82,17 +82,10 @@ pub fn flushNumericForLoopDone(t: *const Trace, regs: RegWindow, values: []Value
     if (exit_instr == std.math.maxInt(u32) or exit_instr >= t.instrs.len) return false;
     const guard = t.instrs[exit_instr];
     if (guard.op != .guard_true) return false;
-    const exit_pc = trace_ir.guardExitPc(guard) orelse return false;
-    if (exit_pc == 0 or exit_pc > t.anchor.proto.code.len) return false;
-    const for_ins = t.anchor.proto.code[trace_ir.guardSourcePc(guard).?];
+    // Doc 37: the anchor frame's own `for_loop` only (`anchorSourcePc`) — an
+    // inlined callee's would flush the wrong stores.
+    const for_ins = t.anchorSourceInstr(exit_instr) orelse return false;
     if (for_ins.op != .for_loop) return false;
-    // Doc 37: reject inlined-callee `for_loop` guards — their `guardSourcePc` is
-    // in the callee's proto, not the anchor's. A coincidental pc match would flush
-    // the wrong stores.
-    if (t.provAt(exit_instr)) |prov| switch (prov) {
-        .guard => |gp| if (gp.inline_depth > 0) return false,
-        .link_terminal => return false,
-    };
     // Doc 57 P3: a non-final iteration's `for_loop` test sits mid-trip; the
     // φ values below are the END of the trip, not this iteration's.
     if (t.isLoopTestCopy(exit_instr)) return false;

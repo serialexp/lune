@@ -423,6 +423,50 @@ const Compiler = struct {
         return self.addConstant(v);
     }
 
+    /// Doc 66 P2: a table access's key. A literal string key rides in the
+    /// instruction as a constant index (`get_field`/`set_field`, LuaJIT's
+    /// `TGETS`/`TSETS`); any other key is a register.
+    const IndexKey = union(enum) {
+        reg: u16,
+        konst: u16,
+    };
+
+    /// The constant key of `t[e]` when `e` is a literal string, else null.
+    fn literalKey(self: *Compiler, e: *const ast.Expr) Error!?IndexKey {
+        return switch (e.data) {
+            .string_raw => |raw| .{ .konst = try self.stringConstant(try self.decodeString(raw, e.span)) },
+            else => null,
+        };
+    }
+
+    /// The key of `t[e]` for a single access: its constant when `e` is a
+    /// literal string, otherwise `e` read in place or evaluated into a fresh
+    /// register (`operandReg`). Either way the span `operandReg` would leave
+    /// current is current, so a fault underlines the same text.
+    fn indexKeyOf(self: *Compiler, e: *const ast.Expr) Error!IndexKey {
+        if (try self.literalKey(e)) |k| {
+            self.cur_span = e.span;
+            return k;
+        }
+        return .{ .reg = try self.operandReg(e) };
+    }
+
+    /// `R[dest] = R[obj][key]`.
+    fn emitGetIndex(self: *Compiler, dest: u16, obj: u16, key: IndexKey) Error!void {
+        _ = try self.emit(switch (key) {
+            .reg => |r| Instr.opABC(.get_index, dest, obj, r),
+            .konst => |k| Instr.opABC(.get_field, dest, obj, k),
+        });
+    }
+
+    /// `R[obj][key] = R[src]`.
+    fn emitSetIndex(self: *Compiler, obj: u16, key: IndexKey, src: u16) Error!void {
+        _ = try self.emit(switch (key) {
+            .reg => |r| Instr.opABC(.set_index, obj, r, src),
+            .konst => |k| Instr.opABC(.set_field, obj, k, src),
+        });
+    }
+
     // ---- scopes & locals ----
 
     fn beginScope(self: *Compiler) void {
@@ -750,14 +794,11 @@ const Compiler = struct {
             },
             .field => |f| {
                 // Evaluate `obj` once; the key is a constant string (no eval order
-                // concern), held in a register so the load and store share it.
+                // concern), carried by the load and the store alike.
                 const m = self.next_reg;
                 const obj = try self.alloc1();
                 try self.compileExprTo(f.obj, obj);
-                const key = try self.alloc1();
-                const k = try self.stringConstant(f.name);
-                _ = try self.emit(Instr.opAB(.load_const, key, k));
-                try self.compoundIndexStore(obj, key, ca.op, ca.value, op_span);
+                try self.compoundIndexStore(obj, .{ .konst = try self.stringConstant(f.name) }, ca.op, ca.value, op_span);
                 self.freeTo(m);
             },
             .index => |ix| {
@@ -766,8 +807,14 @@ const Compiler = struct {
                 const m = self.next_reg;
                 const obj = try self.alloc1();
                 try self.compileExprTo(ix.obj, obj);
-                const key = try self.alloc1();
-                try self.compileExprTo(ix.key, key);
+                const key: IndexKey = if (try self.literalKey(ix.key)) |k| blk: {
+                    self.cur_span = ix.key.span;
+                    break :blk k;
+                } else blk: {
+                    const r = try self.alloc1();
+                    try self.compileExprTo(ix.key, r);
+                    break :blk .{ .reg = r };
+                };
                 try self.compoundIndexStore(obj, key, ca.op, ca.value, op_span);
                 self.freeTo(m);
             },
@@ -776,17 +823,17 @@ const Compiler = struct {
     }
 
     /// Shared tail of an indexed compound assignment: `obj[key] = obj[key] OP value`
-    /// reusing the already-evaluated `obj`/`key` registers (single-eval). Allocates
-    /// only scratch above them and frees it before returning.
-    fn compoundIndexStore(self: *Compiler, obj: u16, key: u16, op: ast.BinaryOp, rhs_expr: *const ast.Expr, op_span: ast.Span) Error!void {
+    /// reusing the already-evaluated `obj`/`key` (single-eval). Allocates only
+    /// scratch above them and frees it before returning.
+    fn compoundIndexStore(self: *Compiler, obj: u16, key: IndexKey, op: ast.BinaryOp, rhs_expr: *const ast.Expr, op_span: ast.Span) Error!void {
         const m = self.next_reg;
         const cur = try self.alloc1();
-        _ = try self.emit(Instr.opABC(.get_index, cur, obj, key));
+        try self.emitGetIndex(cur, obj, key);
         const rhs = try self.alloc1();
         try self.compileExprTo(rhs_expr, rhs);
         self.cur_span = op_span;
         _ = try self.emit(Instr.opABC(binOpCode(op), cur, cur, rhs));
-        _ = try self.emit(Instr.opABC(.set_index, obj, key, cur));
+        try self.emitSetIndex(obj, key, cur);
         self.freeTo(m);
     }
 
@@ -878,12 +925,7 @@ const Compiler = struct {
                 _ = try self.alloc1(); // function slot at base
                 const self_reg = try self.alloc1(); // base+1 = self (first argument)
                 try self.compileExprTo(mc.obj, self_reg);
-                const km = self.next_reg;
-                const key = try self.alloc1();
-                const k = try self.stringConstant(mc.name);
-                _ = try self.emit(Instr.opAB(.load_const, key, k));
-                _ = try self.emit(Instr.opABC(.get_index, base, self_reg, key));
-                self.freeTo(km); // free the key temp; fn + self stay
+                try self.emitGetIndex(base, self_reg, .{ .konst = try self.stringConstant(mc.name) });
                 try self.compileMethodArgs(base, mc.args, expr.span, nwanted);
             },
             else => unreachable, // guarded by isCall()
@@ -923,10 +965,7 @@ const Compiler = struct {
             .field => |f| {
                 const m = self.next_reg;
                 const obj = try self.operandReg(f.obj);
-                const key = try self.alloc1();
-                const k = try self.stringConstant(f.name);
-                _ = try self.emit(Instr.opAB(.load_const, key, k));
-                _ = try self.emit(Instr.opABC(.set_index, obj, key, src));
+                try self.emitSetIndex(obj, .{ .konst = try self.stringConstant(f.name) }, src);
                 self.freeTo(m);
             },
             .index => |ix| {
@@ -949,8 +988,7 @@ const Compiler = struct {
                 } else {
                     const m = self.next_reg;
                     const obj = try self.operandRegBefore(ix.obj, ix.key);
-                    const key = try self.operandReg(ix.key);
-                    _ = try self.emit(Instr.opABC(.set_index, obj, key, src));
+                    try self.emitSetIndex(obj, try self.indexKeyOf(ix.key), src);
                     self.freeTo(m);
                 }
             },
@@ -1225,12 +1263,9 @@ const Compiler = struct {
             .binary => |b| try self.compileBinary(b.op, b.lhs, b.rhs, dest),
             .field => |f| {
                 const m = self.next_reg;
-                // The key is a constant load, so `obj` can be read in place.
+                // The key is a constant, so `obj` can be read in place.
                 const obj = try self.operandReg(f.obj);
-                const key = try self.alloc1();
-                const k = try self.stringConstant(f.name);
-                _ = try self.emit(Instr.opAB(.load_const, key, k));
-                _ = try self.emit(Instr.opABC(.get_index, dest, obj, key));
+                try self.emitGetIndex(dest, obj, .{ .konst = try self.stringConstant(f.name) });
                 self.freeTo(m);
             },
             .index => |ix| {
@@ -1254,8 +1289,7 @@ const Compiler = struct {
                 } else {
                     const m = self.next_reg;
                     const obj = try self.operandRegBefore(ix.obj, ix.key);
-                    const key = try self.operandReg(ix.key);
-                    _ = try self.emit(Instr.opABC(.get_index, dest, obj, key));
+                    try self.emitGetIndex(dest, obj, try self.indexKeyOf(ix.key));
                     self.freeTo(m);
                 }
             },
@@ -1331,25 +1365,29 @@ const Compiler = struct {
         var array_index: i32 = 1;
         for (fields) |field| {
             const m = self.next_reg;
-            const key = try self.alloc1();
-            const val = try self.alloc1();
-            switch (field) {
-                .positional => |val_expr| {
-                    _ = try self.emit(Instr.opAx(.load_int, key, array_index));
-                    try self.compileExprTo(val_expr, val);
+            // A named field and a literal string key ride in the store as a
+            // constant (doc 66 P2); every other key takes a register first.
+            const key: IndexKey = switch (field) {
+                .positional => blk: {
+                    const r = try self.alloc1();
+                    _ = try self.emit(Instr.opAx(.load_int, r, array_index));
                     array_index += 1;
+                    break :blk .{ .reg = r };
                 },
-                .named => |nv| {
-                    const k = try self.stringConstant(nv.name);
-                    _ = try self.emit(Instr.opAB(.load_const, key, k));
-                    try self.compileExprTo(nv.value, val);
+                .named => |nv| .{ .konst = try self.stringConstant(nv.name) },
+                .keyed => |kv| try self.literalKey(kv.key) orelse blk: {
+                    const r = try self.alloc1();
+                    try self.compileExprTo(kv.key, r);
+                    break :blk .{ .reg = r };
                 },
-                .keyed => |kv| {
-                    try self.compileExprTo(kv.key, key);
-                    try self.compileExprTo(kv.value, val);
-                },
-            }
-            _ = try self.emit(Instr.opABC(.set_index, dest, key, val));
+            };
+            const val = try self.alloc1();
+            try self.compileExprTo(switch (field) {
+                .positional => |val_expr| val_expr,
+                .named => |nv| nv.value,
+                .keyed => |kv| kv.value,
+            }, val);
+            try self.emitSetIndex(dest, key, val);
             self.freeTo(m);
         }
     }
@@ -1489,12 +1527,7 @@ const Compiler = struct {
         try self.compileExprTo(obj, self_reg);
 
         // fn = self[name]
-        const km = self.next_reg;
-        const key = try self.alloc1();
-        const k = try self.stringConstant(name);
-        _ = try self.emit(Instr.opAB(.load_const, key, k));
-        _ = try self.emit(Instr.opABC(.get_index, base, self_reg, key));
-        self.freeTo(km); // free the key temp; fn + self stay
+        try self.emitGetIndex(base, self_reg, .{ .konst = try self.stringConstant(name) });
 
         // `self` is already at base+1; lay out the explicit arguments after it.
         try self.compileMethodArgs(base, args, obj.span, nwanted);
@@ -1562,21 +1595,14 @@ const Compiler = struct {
         const final_count = if (method != null) path.len else path.len - 1;
         var i: usize = 1;
         while (i < final_count) : (i += 1) {
-            const m2 = self.next_reg;
-            const key = try self.alloc1();
-            const k = try self.stringConstant(path[i]);
-            _ = try self.emit(Instr.opAB(.load_const, key, k));
-            _ = try self.emit(Instr.opABC(.get_index, objr, objr, key));
-            self.freeTo(m2);
+            try self.emitGetIndex(objr, objr, .{ .konst = try self.stringConstant(path[i]) });
         }
 
         const final_key = method orelse path[path.len - 1];
-        const keyr = try self.alloc1();
         const kk = try self.stringConstant(final_key);
-        _ = try self.emit(Instr.opAB(.load_const, keyr, kk));
         const fnr = try self.alloc1();
         try self.compileFunction(fd.body, final_key, fnr);
-        _ = try self.emit(Instr.opABC(.set_index, objr, keyr, fnr));
+        try self.emitSetIndex(objr, .{ .konst = kk }, fnr);
         self.freeTo(mark);
     }
 

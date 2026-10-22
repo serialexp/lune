@@ -512,6 +512,9 @@ const ExecStep = union(enum) { finished: FrameResult, suspended, switch_mode };
 /// the outgoing call site for every parent). `line` is 1-based.
 pub const FaultFrame = struct {
     name: []const u8,
+    /// The frame's `Proto.id`: names the chunk (and so the file) `line` is in,
+    /// via `Vm.loadedChunkIndexOf`.
+    proto_id: u32 = 0,
     line: u32 = 0,
     start: u32 = 0,
     end: u32 = 0,
@@ -524,6 +527,9 @@ pub const FaultFrame = struct {
 /// top-level `message`/`line`/`start`/`end` describe that leaf frame.
 pub const Fault = struct {
     message: []const u8,
+    /// The `Proto.id` the location (`line`/`start`/`end`) is in, which names
+    /// its chunk and so its file (`Vm.loadedChunkIndexOf`).
+    proto_id: u32 = 0,
     line: u32 = 0,
     start: u32 = 0,
     end: u32 = 0,
@@ -809,16 +815,16 @@ pub const Vm = struct {
     /// the draw stream is a stable part of the language: a given seed reproduces
     /// the same sequence across runs and across the native/wasm engines.
     rng: ?std.Random.Xoshiro256 = null,
-    /// When true, append the 1-based source line of each safepoint's pending
+    /// When true, append the source line of each safepoint's pending
     /// instruction to `safepoint_lines` (the replay driver's line-grain index).
     /// Off by default so tier-0 pays nothing — the normal run path is untouched.
     /// Write through `setRecordSafepointLines` only (it owns a `trace.fast_block` bit).
     record_safepoint_lines: bool = false,
     /// Line-per-safepoint index built when `record_safepoint_lines` is on:
-    /// `safepoint_lines[k-1]` is the source line of the instruction pending at
-    /// safepoint k (1-based, matching `safepoint_seq`). Owned by the VM; lets the
+    /// `safepoint_lines[k-1]` is where the instruction pending at safepoint k
+    /// is (1-based, matching `safepoint_seq`). Owned by the VM; lets the
     /// replay UI offer line-grain stepping with no extra wasm round-trips.
-    safepoint_lines: std.ArrayList(u32) = .empty,
+    safepoint_lines: std.ArrayList(SafepointLine) = .empty,
     /// Interned metamethod-name strings (`__index`/`__newindex`/`__metatable`),
     /// built once in `init`. Left all-`nil` in a bare VM (`initBare`); the
     /// keyframe restorer rebuilds them after seeding the heap. GC-rooted via
@@ -898,6 +904,14 @@ pub const Vm = struct {
     /// alike, so no `Vm` field's type may depend on the build.
     reference_dispatch: bool = false,
 
+    /// One `safepoint_lines` entry: the 1-based source line of a safepoint's
+    /// pending instruction (0 = no span) and the `Proto.id` it is in, which
+    /// names its chunk and so its file (`loadedChunkIndexOf`).
+    pub const SafepointLine = struct {
+        proto_id: u32,
+        line: u32,
+    };
+
     /// A runtime-compiled chunk owned by the VM: the `Chunk` (whose arena owns the
     /// proto tree) and the NUL-terminated source the protos borrow.
     pub const LoadedChunk = struct {
@@ -964,6 +978,18 @@ pub const Vm = struct {
     /// them like every other unswept object (doc 61 Phase K) and know nothing
     /// of pinning. On append failure the caller still owns
     /// chunk + source (the append-first OOM contracts at the call sites hold).
+    /// The index into `loaded_chunks` of the chunk that compiled proto `id`, or
+    /// null for the host's static chunk (ids below the first loaded chunk's).
+    /// Each chunk owns the id range `[root.id, root.id + proto_count)`. Cold:
+    /// error reporting and tooling only.
+    pub fn loadedChunkIndexOf(self: *const Vm, id: u32) ?usize {
+        for (self.loaded_chunks.items, 0..) |lc, i| {
+            const first = lc.chunk.proto.id;
+            if (id >= first and id - first < lc.chunk.proto_count) return i;
+        }
+        return null;
+    }
+
     pub fn appendLoadedChunk(self: *Vm, lc: LoadedChunk) !void {
         try self.loaded_chunks.append(self.gpa, lc);
         rootProtoConsts(lc.chunk.proto, {}, pinHeader);
@@ -1989,6 +2015,7 @@ pub const Vm = struct {
             const cs = self.callSiteAt(1);
             return .{
                 .message = message,
+                .proto_id = if (cs) |c| c.proto.id else 0,
                 .line = if (cs) |c| c.line else 0,
                 .start = if (cs) |c| c.span.start else 0,
                 .end = if (cs) |c| c.span.end else 0,
@@ -2033,8 +2060,10 @@ pub const Vm = struct {
                     "'for' limit must be a number"
                 else
                     "'for' step must be a number"),
-                .get_index => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs.get(instr.b).typeName()}),
-                .set_index => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs.get(instr.a).typeName()}),
+                // The container is a register in all four forms; the field
+                // forms' key is a constant, which the message never reads.
+                .get_index, .get_field => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs.get(instr.b).typeName()}),
+                .set_index, .set_field => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs.get(instr.a).typeName()}),
                 .call => blk: {
                     // A native runs inline (no child frame), so when one returns a
                     // bare fault the leaf instruction is the `.call` to it — the
@@ -2055,7 +2084,7 @@ pub const Vm = struct {
         };
 
         const frames = try self.backtraceFrames(arena);
-        return .{ .message = message, .line = line, .start = span.start, .end = span.end, .frames = frames };
+        return .{ .message = message, .proto_id = proto.id, .line = line, .start = span.start, .end = span.end, .frames = frames };
     }
 
     /// Walk the live call stack into `FaultFrame` rows, **deepest-first** (leaf at
@@ -2079,6 +2108,7 @@ pub const Vm = struct {
             const fspan: bytecode.Span = if (fpc < fp.spans.len) fp.spans[fpc] else .{};
             frames[self.depth - 1 - i] = .{
                 .name = fp.name,
+                .proto_id = fp.id,
                 .line = fspan.line,
                 .start = fspan.start,
                 .end = fspan.end,
@@ -3224,6 +3254,8 @@ pub const Vm = struct {
         t[@intFromEnum(bytecode.OpCode.get_global)] = opGetGlobalSlow(mode);
         t[@intFromEnum(bytecode.OpCode.get_index)] = opGetIndexSlow(mode);
         t[@intFromEnum(bytecode.OpCode.set_index)] = opSetIndexSlow(mode);
+        t[@intFromEnum(bytecode.OpCode.get_field)] = opGetFieldSlow(mode);
+        t[@intFromEnum(bytecode.OpCode.set_field)] = opSetFieldSlow(mode);
         t[@intFromEnum(bytecode.OpCode.idiv)] = opModIdivSlow(mode, .idiv);
         t[@intFromEnum(bytecode.OpCode.mod)] = opModIdivSlow(mode, .mod);
         inline for (.{ .eq, .ne }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opEqNeSlow(mode, op);
@@ -3343,7 +3375,7 @@ pub const Vm = struct {
         if (mode == .full and self.record_safepoint_lines) {
             const proto = st.proto;
             const sp_line: u32 = if (pc < proto.spans.len) proto.spans[pc].line else 0;
-            self.safepoint_lines.append(self.gpa, sp_line) catch |e| return parkErr(st, e);
+            self.safepoint_lines.append(self.gpa, .{ .proto_id = proto.id, .line = sp_line }) catch |e| return parkErr(st, e);
         }
 
         // (4) Mid-execution suspend point — an instruction boundary,
@@ -3903,7 +3935,7 @@ pub const Vm = struct {
                     ts.dbg("head zero-exit: trace={d} native={} reason={s} exit={d} completed={d}", .{ owner.id, true, @tagName(row.reason), row.exit, row.cum });
                     if (row.exit != std.math.maxInt(u32))
                         ts.head_walk_fail = .{ .trace_id = owner.id, .exit_instr = row.exit };
-                    ts.noteTakenExit(owner, row.exit, seg_local, proto, .legacy);
+                    ts.noteTakenExit(owner, row.exit, seg_local, .legacy);
                     ts.onSideExitReceipt(owner, seg_local, row.exit, seg_local, .deferred, .entered);
                     return .next_candidate;
                 },
@@ -3912,7 +3944,7 @@ pub const Vm = struct {
                     // scalar semantics (`exit == maxInt` bounds-refuses the
                     // hot-exit charge inside), `.entry_refusal` charge kind.
                     ts.dbg("head zero-exit: trace={d} native={} reason={s} exit={d} completed={d}", .{ owner.id, true, @tagName(row.reason), row.exit, row.cum });
-                    ts.noteTakenExit(owner, row.exit, seg_local, proto, .legacy);
+                    ts.noteTakenExit(owner, row.exit, seg_local, .legacy);
                     ts.onSideExitReceipt(owner, seg_local, row.exit, seg_local, .deferred, .entry_refusal);
                     return .next_candidate;
                 },
@@ -4361,7 +4393,7 @@ pub const Vm = struct {
         // nothing about the branch) records the walk-local handoff evidence.
         if (result.exit_instr != std.math.maxInt(u32))
             ts.head_walk_fail = .{ .trace_id = ct.id, .exit_instr = result.exit_instr };
-        ts.noteTakenExit(ct, result.exit_instr, local_done, proto, .legacy);
+        ts.noteTakenExit(ct, result.exit_instr, local_done, .legacy);
         ts.onSideExitReceipt(
             ct,
             local_done,
@@ -4406,7 +4438,7 @@ pub const Vm = struct {
         if (tier == .native_only) ts.exit_side_native_hops +|= 1;
         const done = result.completed + 1;
         ts.dbg("exit-side hop: trace={d} exit={d} state={s} tier={s} resume pc={d} completed={d}", .{ ct.id, ei, @tagName(ct.exitSideAt(ei)), @tagName(tier), p, result.completed });
-        ts.noteTakenExit(ct, ei, done, proto, if (tier == .native_only) .native_direct else .tier1a_direct);
+        ts.noteTakenExit(ct, ei, done, if (tier == .native_only) .native_direct else .tier1a_direct);
         ts.onSideExitReceipt(ct, done, ei, done, .deferred, .entered);
         return self.routeExitSide(mode, tier, ct, result, proto, regs, base, safe_to_arm);
     }
@@ -4428,7 +4460,7 @@ pub const Vm = struct {
         const ts = &self.trace;
         std.debug.assert(es.trace.exitSideAt(es.exit).materializes());
         ts.dbg("exit-side hop: trace={d} exit={d} state={s} tier=native_ledger resume pc={d} done={d}", .{ es.trace.id, es.exit, @tagName(es.trace.exitSideAt(es.exit)), es.trace.code.exitResumePc(es.exit).?, es.done });
-        ts.noteTakenExit(es.trace, es.exit, es.done, proto, .native_direct);
+        ts.noteTakenExit(es.trace, es.exit, es.done, .native_direct);
         return self.routeExitSide(mode, .native_only, es.trace, .{ .completed = es.done -| 1, .exit_instr = es.exit }, proto, regs, base, safe_to_arm);
     }
 
@@ -5073,7 +5105,7 @@ pub const Vm = struct {
                 // ever unpatching (the pc-0 patch is the sole entry). A
                 // prologue-fail exit (`exit_instr == maxInt`) is bounds-refused
                 // inside, exactly like the loop arms.
-                self.trace.noteTakenExit(final, result.exit_instr, local_done, proto, .legacy);
+                self.trace.noteTakenExit(final, result.exit_instr, local_done, .legacy);
                 self.trace.onSideExitReceipt(
                     final,
                     local_done,
@@ -5260,7 +5292,7 @@ pub const Vm = struct {
                     .native_direct
                 else
                     .legacy;
-                self.trace.noteTakenExit(final, result.exit_instr, local_done, proto, route);
+                self.trace.noteTakenExit(final, result.exit_instr, local_done, route);
             }
 
             if (local_done > 0 or linked_one_trip) {
@@ -5411,7 +5443,7 @@ pub const Vm = struct {
                 // COMPLETION — chaining to a same-anchor sibling could only
                 // re-check a finished loop. `isSourceBranchGuardExit` excludes
                 // it, so no test is needed here.
-                if (self.trace.isSourceBranchGuardExit(final, result.exit_instr, proto)) {
+                if (self.trace.isSourceBranchGuardExit(final, result.exit_instr)) {
                     if (ran_native) {
                         if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl[0..nexcl], safe_to_arm, self.unicode_version_pinned)) |chain| {
                             if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
@@ -5866,6 +5898,8 @@ pub const Vm = struct {
             .new_table => opNewTable(mode),
             .get_index => opGetIndex(mode),
             .set_index => opSetIndex(mode),
+            .get_field => opGetField(mode),
+            .set_field => opSetField(mode),
             .get_index2 => opGetIndex2(mode),
             .set_index2 => opSetIndex2(mode),
             .get_global => opGetGlobal(mode),
@@ -6982,6 +7016,75 @@ pub const Vm = struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
                 vm.indexSet(regs.get(instr.a), regs.get(instr.b), regs.get(instr.c)) catch |e| return parkErr(st, e);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// Doc 66 P2: `get_field a, b, c` is `R[a] = R[b][K[c]]` with `K[c]` an
+    /// interned string, `get_index` without the key's `load_const`. The fast
+    /// lane is `get_index`'s heap-key lane: the lookup and any `__index`
+    /// chain of plain tables, inline. It declines a grid, so it never
+    /// allocates; everything else leaves for `opGetFieldSlow`.
+    fn opGetField(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const container = regs.get(instr.b);
+                if (container.isHeap() and container.heapType() == .table) {
+                    if (vm.heapKeyChainGet(table.Table.fromHeader(container.asHeap()), st.proto.constants[instr.c])) |v| {
+                        regs.set(instr.a, v);
+                        return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+                    }
+                }
+                return slowTail(mode, st, pc, instr, vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// `get_field` off its fast lane: `indexGet`, as `opGetIndexSlow`.
+    fn opGetFieldSlow(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const v = vm.indexGet(regs.get(instr.b), st.proto.constants[instr.c]) catch |e| return parkErr(st, e);
+                regs.set(instr.a, v);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// Doc 66 P2: `set_field a, b, c` is `R[a][K[b]] = R[c]` with `K[b]` an
+    /// interned string. The fast lane is `set_index`'s heap-key lane: a key
+    /// live in the hash part takes a non-nil value in place. A deletion, a
+    /// new key and a grid take `opSetFieldSlow`.
+    fn opSetField(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const container = regs.get(instr.a);
+                const val = regs.get(instr.c);
+                if (container.isHeap() and container.heapType() == .table and !val.isNil()) {
+                    const tbl = table.Table.fromHeader(container.asHeap());
+                    if (!tbl.array.isGrid()) {
+                        if (tbl.hash.liveHeapNode(st.proto.constants[instr.b])) |n| {
+                            n.value = val;
+                            vm.heap.writeBarrier(&tbl.header, val); // no-op until Phase 4
+                            return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+                        }
+                    }
+                }
+                return slowTail(mode, st, pc, instr, vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// `set_field` off its fast lane: `indexSet`, as `opSetIndexSlow`.
+    fn opSetFieldSlow(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                vm.indexSet(regs.get(instr.a), st.proto.constants[instr.b], regs.get(instr.c)) catch |e| return parkErr(st, e);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;

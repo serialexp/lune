@@ -714,12 +714,12 @@ fn buildReplayIndexInner(res: *Result, proto: *const mahina.bytecode.Proto, effe
     res.safepoint_lines = bufFromSlice(try encodeU32Array(vm.safepoint_lines.items));
 }
 
-/// Serialize a `[]u32` as a flat little-endian blob (4 bytes each). Empty → empty.
-fn encodeU32Array(values: []const u32) ![]u8 {
-    if (values.len == 0) return &[_]u8{};
+/// Serialize the safepoint index's lines as a flat little-endian `u32` blob (4 bytes each). Empty → empty.
+fn encodeU32Array(points: []const mahina.interp.Vm.SafepointLine) ![]u8 {
+    if (points.len == 0) return &[_]u8{};
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
-    for (values) |v| try appendU32(&buf, v);
+    for (points) |p| try appendU32(&buf, p.line);
     return buf.toOwnedSlice(gpa);
 }
 

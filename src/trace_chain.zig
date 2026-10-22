@@ -38,7 +38,6 @@ const IrOp = trace_mod.IrOp;
 const IrInstr = trace_mod.IrInstr;
 const Ref = trace_mod.Ref;
 const guardExitPc = trace_mod.guardExitPc;
-const guardSourcePc = trace_mod.guardSourcePc;
 const isSideExitGuardOp = trace_mod.isSideExitGuardOp;
 const isLoopDoneGuardIndex = trace_mod.isLoopDoneGuardIndex;
 const accountCandidateCharge = TraceState.accountCandidateCharge;
@@ -430,7 +429,7 @@ pub fn driveChain(
             if (sresult.ledger_len > 2 or nonlink_headed) {
                 if (safe_to_arm and materialization == .ordinary_header and
                     self.stubEnterable(sct, .ordinary, proto) and
-                    self.isSourceBranchGuardExit(failed, exit_instr, proto))
+                    self.isSourceBranchGuardExit(failed, exit_instr))
                 {
                     if (self.armNativeLink(failed, exit_instr, sct, .ordinary_guard) catch false) {
                         self.native_source_link_arms +|= 1;
@@ -570,7 +569,7 @@ pub fn driveChain(
             // receipt, never skip->ramp->inner (= M2, which needs the deferred ledger).
             if (tier == .native_only and safe_to_arm and materialization == .ordinary_header and
                 self.stubEnterable(sct, .ordinary, proto) and
-                self.isSourceBranchGuardExit(failed, exit_instr, proto))
+                self.isSourceBranchGuardExit(failed, exit_instr))
             {
                 if (self.armNativeLink(failed, exit_instr, sct, .ordinary_guard) catch false) {
                     self.native_source_link_arms +|= 1;
@@ -2269,7 +2268,7 @@ pub fn replayLedgerFrom(
                         @panic("replayLedger: fused M1 .deopt is a forced yield");
                     if (e.exit >= owner.code.instrs.len)
                         @panic("replayLedger: fused M1 .deopt exit index out of range");
-                    if (!self.isSourceBranchGuardExit(owner, e.exit, proto))
+                    if (!self.isSourceBranchGuardExit(owner, e.exit))
                         @panic("replayLedger: fused M1 .deopt exit is not a source-branch guard");
                     const succ = self.traceById(entries[k + 1].id) orelse
                         @panic("replayLedger: fused M1 successor id did not resolve");
@@ -2279,7 +2278,7 @@ pub fn replayLedgerFrom(
                     // own armed link to the same successor, so "the (first)
                     // armed slot for the pair" is not unique and comparing it
                     // to `e.exit` falsely rejected legitimate fused hops.
-                    if (!self.hasArmedSourceBranchLinkAt(owner, e.exit, succ, proto))
+                    if (!self.hasArmedSourceBranchLinkAt(owner, e.exit, succ))
                         @panic("replayLedger: fused M1 transition has no armed source-branch link at the exit guard");
                     std.debug.assert(self.countTracesAt(owner.code.anchor) >= 2);
                     // The ramp commits ZERO of its OWN iterations, so its `cum`
@@ -2987,9 +2986,10 @@ pub fn driveBurstCore(
             // now (its resume pc is the post-loop pc, through the branch
             // fix-up), so it takes the `!loop_done` path below and exit-side
             // serves it — the same route every other ordinary exit takes.
-            const loop_done = inner_exit_pc >= 1 and
-                proto.code[guardSourcePc(inner_guard).?].op == .for_loop and
-                !inner.code.isLoopTestCopy(iresult.exit_instr);
+            const loop_done = if (inner.code.anchorSourceInstr(iresult.exit_instr)) |src|
+                src.op == .for_loop and !inner.code.isLoopTestCopy(iresult.exit_instr)
+            else
+                false;
             const post_pc: u32 = inner_exit_pc;
             if (!loop_done) {
                 if (inner_local > 0) {
@@ -3273,7 +3273,6 @@ pub fn noteDispatcherLedgerTerminal(
     self: *TraceState,
     entries: []const trace_exec.LedgerEntry,
     first_prev_cum: usize,
-    proto: *const Proto,
 ) void {
     self.dbgNoteBurst(entries);
     if (entries.len == 0) return;
@@ -3284,7 +3283,7 @@ pub fn noteDispatcherLedgerTerminal(
     const owner = self.traceById(term.id) orelse return;
     self.noteSiblingTerminal(owner, term.exit);
     if (term.exit < owner.code.instrs.len and !isLoopDoneGuardIndex(owner, term.exit))
-        self.noteTakenExit(owner, term.exit, term_local, proto, dispatcherTerminalRoute(self, owner, term.exit));
+        self.noteTakenExit(owner, term.exit, term_local, dispatcherTerminalRoute(self, owner, term.exit));
 }
 
 /// Doc 56 §4.8.3 R3 (G2): the route a dispatcher-ledger terminal `.deopt`
@@ -3311,7 +3310,7 @@ pub fn driveDispatcherLedger(
     regs: RegWindow,
     safe_to_arm: bool,
 ) ChainResult {
-    self.noteDispatcherLedgerTerminal(entries, 0, proto);
+    self.noteDispatcherLedgerTerminal(entries, 0);
     // Part S: charge the burst's terminal ordinary deopt, exactly once per burst.
     //
     // This has to be the DRIVER, not `replayLedger`: a walk can return a directive
@@ -3453,7 +3452,6 @@ pub fn driveDispatcherSilentResult(
         self.noteDispatcherLedgerTerminal(
             self.ledger_scratch[0..result.ledger_len],
             @intCast(result.silent_cum),
-            proto,
         );
     }
     const directive = self.drainSilentResult(

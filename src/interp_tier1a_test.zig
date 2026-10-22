@@ -947,11 +947,9 @@ test "doc 38: no trace unrolls the variable-trip while (LINNER holds)" {
 
     for (vm.trace.registry.cache.items) |t| {
         var branch_guards: usize = 0;
-        for (t.code.instrs) |ins| {
+        for (t.code.instrs, 0..) |ins, i| {
             if (ins.op != .guard_true and ins.op != .guard_false) continue;
-            const src_pc = trace.guardSourcePc(ins) orelse continue;
-            if (src_pc >= t.code.anchor.proto.code.len) continue;
-            const src_op = t.code.anchor.proto.code[src_pc].op;
+            const src_op = (t.code.anchorSourceInstr(i) orelse continue).op;
             if (src_op == .jmp_if_false or src_op == .jmp_if_true) branch_guards += 1;
         }
         try testing.expect(branch_guards <= 1);
@@ -1189,7 +1187,7 @@ fn checkWhileOwnTestBound(vm: *Vm) !void {
         try testing.expect(!t.code.isNumericForLoopDoneGuard(idx));
         // … a source-branch consumer refuses it (no prime-side want, no
         // same-anchor sibling chase on a finished loop) …
-        try testing.expect(!vm.trace.isSourceBranchGuardExit(t, @intCast(idx), t.code.anchor.proto));
+        try testing.expect(!vm.trace.isSourceBranchGuardExit(t, @intCast(idx)));
         // … it resumes AFTER the loop and is attachable, which is what
         // exit-side needs …
         const post = bc.loopMarkerExit(
@@ -1262,5 +1260,73 @@ test "doc 58 §4.5: a while root's zero-completion own-test exits are exempt onl
         } else {
             try testing.expect(vm.trace.gate.contains(key));
         }
+    }
+}
+
+test "doc 66 P2: an inlined callee's branch guard is never decoded against the anchor proto" {
+    // A guard's source pc lives in the proto it was recorded in: the generic-for
+    // iterator below is inlined into main's loop trace, so its wrap test's guard
+    // names pc 5 of the ITERATOR. main's own pc 5 is also a `jmp_if_false` (the
+    // three-local prefix puts it there), so decoding the callee's pc against the
+    // anchor proto reads a real branch: the wrap exit was routed as a source
+    // branch, raised a prime-side want, and unpatched the loop entry on every
+    // wrap (array3d after the field forms shortened its iterator by one op).
+    // `TraceCode.anchorSourcePc` answers null for any guard at inline depth > 0.
+    const gpa = testing.allocator;
+    const source =
+        \\local u1, u2, u3 = 1, 2, 3
+        \\local n = 40
+        \\local wrap = n and n > 0
+        \\local function points(s)
+        \\  local y = 0
+        \\  return function(s, x)
+        \\    x = x + 1
+        \\    if x >= s.n then
+        \\      x = 0
+        \\      y = y + 1
+        \\      if y >= s.n then return nil end
+        \\    end
+        \\    return x, y
+        \\  end, s, 0
+        \\end
+        \\local s = { n = n, sum = 0 }
+        \\for x, y in points(s) do
+        \\  s.sum = s.sum + x * y
+        \\end
+        \\print(s.sum, wrap, u1 + u2 + u3)
+    ;
+    inline for (.{ false, true }) |native| {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var buf: [64]u8 = undefined;
+        var out = io.Writer.fixed(&buf);
+        var chunk = if (native)
+            try runNativeForTrace(&vm, gpa, source, &out)
+        else
+            try runExecForTrace(&vm, gpa, source, &out);
+        defer chunk.deinit();
+        try testing.expectEqualStrings("608400\ttrue\t6\n", out.buffered());
+
+        // The coincidence this test exists for must still be present: some
+        // inlined branch guard whose raw pc decodes to a conditional branch in
+        // the anchor proto. If a compiler change moves either `jmp_if_false`,
+        // re-align the prefix rather than let the test go vacuous.
+        var coincident: usize = 0;
+        for (vm.trace.registry.cache.items) |t| {
+            for (t.code.instrs, 0..) |ins, i| {
+                if (ins.op != .guard_true and ins.op != .guard_false) continue;
+                const gp = switch (t.code.provAt(@intCast(i)) orelse continue) {
+                    .guard => |g| g,
+                    .link_terminal => continue,
+                };
+                if (gp.inline_depth == 0) continue;
+                try testing.expectEqual(@as(?u32, null), t.code.anchorSourcePc(i));
+                try testing.expect(!vm.trace.isSourceBranchGuardExit(t, @intCast(i)));
+                const raw = trace.guardSourcePc(ins) orelse continue;
+                const code = t.code.anchor.proto.code;
+                if (raw < code.len and bytecode.condBranchOf(code[raw], raw) != null) coincident += 1;
+            }
+        }
+        try testing.expect(coincident > 0);
     }
 }

@@ -134,7 +134,8 @@ fn effectOf(ins: Instr, pc: u32, code_len: usize) Effect {
             e.kill(a, a + 1);
             e.succ[0] = next;
         },
-        .move, .neg, .not, .bnot, .len, .vararg_get => {
+        // `get_field` (doc 66 P2): its key is a constant (`c`), not a register.
+        .move, .neg, .not, .bnot, .len, .vararg_get, .get_field => {
             e.use(ins.b);
             e.kill(a, a + 1);
             e.succ[0] = next;
@@ -163,6 +164,12 @@ fn effectOf(ins: Instr, pc: u32, code_len: usize) Effect {
             e.use(ins.b);
             e.use(ins.c);
             e.useAux(ins.aux);
+            e.succ[0] = next;
+        },
+        // Doc 66 P2: the key is a constant (`b`), not a register.
+        .set_field => {
+            e.use(a);
+            e.use(ins.c);
             e.succ[0] = next;
         },
         .set_global, .set_upval => {

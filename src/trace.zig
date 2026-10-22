@@ -1855,24 +1855,16 @@ pub const TraceState = struct {
         // the anchor branch. Require the POSITIVE property instead: the guard's source
         // opcode is a conditional branch — the one bytecode shape where "this guard
         // failed" and "the sibling's branch was taken" are the same statement.
-        if (!self.isSourceBranchGuardExit(t, exit_instr, t.code.anchor.proto)) return false;
-        const src_pc = guardSourcePc(t.code.instrs[exit_instr]) orelse return false;
-        if (src_pc >= t.code.anchor.proto.code.len) return false;
-        if (bytecode.condBranchOf(t.code.anchor.proto.code[src_pc], src_pc) == null) return false;
+        if (!self.isSourceBranchGuardExit(t, exit_instr)) return false;
+        if (t.code.anchorCondBranch(exit_instr) == null) return false;
         // Doc 44 D10 (round 4) / D12b: one-shot parents (head + cont) demand
         // the POSITIVE provenance proof, not just the source-opcode shape
-        // above. A one-shot trace inlines callees freely, and an inlined
-        // guard's `guardSourcePc` lives in the CALLEE's proto — a
-        // coincidental branch opcode at that pc in the anchor proto would
-        // misclassify it. Require the exit-provenance table to say: a real
-        // guard, role `.branch_cond`, at inline depth 0.
+        // above: a real guard stamped `.branch_cond`. (`anchorSourcePc`
+        // already refused an inlined callee's guard, for every anchor kind.)
         if (anchorKind(t.code.anchor.pc) != .loop) {
             const prov = t.code.provAt(exit_instr) orelse return false;
             switch (prov) {
-                .guard => |gp| {
-                    if (gp.inline_depth != 0) return false;
-                    if (gp.role != .branch_cond) return false;
-                },
+                .guard => |gp| if (gp.role != .branch_cond) return false,
                 .link_terminal => return false,
             }
         }

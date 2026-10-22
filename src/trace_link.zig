@@ -58,7 +58,6 @@ const IrInstr = trace_mod.IrInstr;
 const Ref = trace_mod.Ref;
 const PHI_INTERNAL = trace_mod.PHI_INTERNAL;
 const guardExitPc = trace_mod.guardExitPc;
-const guardSourcePc = trace_mod.guardSourcePc;
 const isSideExitGuardOp = trace_mod.isSideExitGuardOp;
 const isLoopDoneGuardIndex = trace_mod.isLoopDoneGuardIndex;
 const ProvenanceEdge = trace_mod.ProvenanceEdge;
@@ -101,8 +100,9 @@ pub fn computeNativeLoopDoneLink(self: *const TraceState, failed: *const Trace, 
     for (failed.code.instrs, 0..) |ins, ii| {
         if (ins.op != .guard_true) continue;
         const exit_pc = guardExitPc(ins) orelse continue;
-        if (exit_pc == 0 or exit_pc == failed.code.anchor.pc or exit_pc > proto.code.len) continue;
-        if (proto.code[guardSourcePc(ins).?].op != .for_loop) continue;
+        if (exit_pc == failed.code.anchor.pc) continue;
+        const src = failed.code.anchorSourceInstr(ii) orelse continue;
+        if (src.op != .for_loop) continue;
         // Doc 57 P3: a mid-trip loop-test copy never links as a loop-done.
         if (failed.code.isLoopTestCopy(ii)) continue;
 
@@ -164,7 +164,8 @@ pub fn maybeArmContinuation(self: *TraceState, failed: *const Trace, exit_instr:
     // pc is already the post-loop pc, so the EXIT-SIDE route records and arms
     // the continuation there (doc 56) — the same way LuaJIT grows a side trace
     // from the exit.
-    if (proto.code[guardSourcePc(ins).?].op != .for_loop) return;
+    const src = failed.code.anchorSourceInstr(exit_instr) orelse return;
+    if (src.op != .for_loop) return;
     const cont_pc: u32 = exit_pc;
     if (!continuationReachesEnclosingBackEdge(proto, cont_pc, failed.code.anchor.pc)) {
         self.dbg("cont-arm refuse: no enclosing back-edge from pc={d} (inner anchor {d})", .{ cont_pc, failed.code.anchor.pc });
@@ -380,7 +381,7 @@ pub fn clearPendingExitAnchor(self: *TraceState) void {
 /// routes above never see it meanwhile. Every other caller (native bursts
 /// and chains, ledger replay, `driveChain` hops) passes `.legacy` and keeps
 /// today's routes.
-pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: usize, proto: *const Proto, route: ExitRoute) void {
+pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: usize, route: ExitRoute) void {
     if (exit_instr >= t.exit_counts.len) return; // hand-built / fail-soft commit
     const c = &t.exit_counts[exit_instr];
     if (c.* == Trace.EXIT_COUNT_DONE) return;
@@ -440,11 +441,8 @@ pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: u
         self.head_want_src = .{ .trace_id = t.id, .exit_instr = exit_instr };
         return;
     }
-    const branch = self.isSourceBranchGuardExit(t, exit_instr, proto) and blk: {
-        const src_pc = guardSourcePc(t.code.instrs[exit_instr]) orelse break :blk false;
-        if (src_pc >= proto.code.len) break :blk false;
-        break :blk bytecode.condBranchOf(proto.code[src_pc], src_pc) != null;
-    };
+    const branch = self.isSourceBranchGuardExit(t, exit_instr) and
+        t.code.anchorCondBranch(exit_instr) != null;
     if (branch) {
         if (self.wants_prime_side != null) return;
         if (self.countTracesAt(t.code.anchor) >= 2) return;
@@ -791,7 +789,7 @@ pub fn chainEndsEnclosingLoop(parent: *const Trace, exit_instr: u32, t: *const T
     if (e >= t.code.instrs.len) return false;
     const header: u32 = blk: {
         if (t.code.isNumericForLoopDoneGuard(e)) {
-            const src = guardSourcePc(t.code.instrs[e]) orelse return false;
+            const src = t.code.anchorSourcePc(e) orelse return false;
             break :blk bytecode.loopHeaderOf(proto.code[src], src) orelse return false;
         }
         if (t.code.isOwnLoopTest(e)) {
@@ -1035,14 +1033,18 @@ pub fn countFingerprintMiss(self: *TraceState, anchor: AnchorKey) void {
 /// check), never a `guard_true`/`guard_false`. The op check above therefore
 /// already excludes it — there is no false-negative where a real branch
 /// guard is mistaken for a generic-for loop-done one.
-pub fn isSourceBranchGuardExit(self: *const TraceState, failed: *const Trace, exit_instr: u32, proto: *const Proto) bool {
+pub fn isSourceBranchGuardExit(self: *const TraceState, failed: *const Trace, exit_instr: u32) bool {
     _ = self;
     if (exit_instr == std.math.maxInt(u32)) return false;
     const ins = failed.code.instrs[exit_instr];
     if (ins.op != .guard_true and ins.op != .guard_false) return false;
     const exit_pc = guardExitPc(ins) orelse return false;
-    if (exit_pc == 0 or exit_pc == failed.code.anchor.pc) return false;
-    if (exit_pc <= proto.code.len and proto.code[guardSourcePc(ins).?].op == .for_loop) return false;
+    if (exit_pc == failed.code.anchor.pc) return false;
+    // The anchor frame's own branch only (`anchorSourcePc`): an inlined
+    // callee's guard names a pc in the callee's proto, which says nothing
+    // about the anchor's decision.
+    const src = failed.code.anchorSourceInstr(exit_instr) orelse return false;
+    if (src.op == .for_loop) return false;
     // Doc 58 §4.3 (review r2 finding 5): the loop's OWN test is a loop exit,
     // not a branch alternation — for every loop shape, and for every unrolled
     // copy of the test. Treating it as one would raise `wants_prime_side`,
@@ -1062,10 +1064,10 @@ pub fn isSourceBranchGuardExit(self: *const TraceState, failed: *const Trace, ex
 /// its own armed link to the same sibling, so validating by "the first
 /// armed slot for the pair" is ambiguous — the ledger's own exit index is
 /// the key.
-pub fn hasArmedSourceBranchLinkAt(self: *const TraceState, parent: *Trace, slot: u32, child: *Trace, proto: *const Proto) bool {
+pub fn hasArmedSourceBranchLinkAt(self: *const TraceState, parent: *Trace, slot: u32, child: *Trace) bool {
     if (parent == child) return false;
     if (child.code.anchor.proto != parent.code.anchor.proto or child.code.anchor.pc != parent.code.anchor.pc) return false;
-    if (!self.isSourceBranchGuardExit(parent, slot, proto)) return false;
+    if (!self.isSourceBranchGuardExit(parent, slot)) return false;
     for (self.registry.native_physical.armedLinks()) |l| {
         // Doc 56 Phase 5: an exit-side arm of the same exit is a different
         // relation (its own cell, resume-coherent), never the M1 source link.

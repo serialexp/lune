@@ -456,6 +456,8 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
         .exit_snap_by_ord = exit_by_ord,
         .lane_pins = pins_owned,
     };
+    // First: every classifier below asks it per guard.
+    code.buildFrameMemo(gpa);
     buildBridgeCandMemo(gpa, &code);
     // Doc 56 §4.3: each exit's static facts (attachability, resume pc,
     // loop-done and own-loop-test shape), once, from the final code.

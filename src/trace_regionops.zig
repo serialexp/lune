@@ -44,7 +44,6 @@ const IrOp = trace_mod.IrOp;
 const IrInstr = trace_mod.IrInstr;
 const Ref = trace_mod.Ref;
 const guardExitPc = trace_mod.guardExitPc;
-const guardSourcePc = trace_mod.guardSourcePc;
 const isSideExitGuardOp = trace_mod.isSideExitGuardOp;
 const ProvenanceEdge = trace_mod.ProvenanceEdge;
 const ProvenanceAction = trace_mod.ProvenanceAction;

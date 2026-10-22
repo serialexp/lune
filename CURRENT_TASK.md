@@ -16,13 +16,15 @@ MULTI-FILE VIZ + NESTED SUSPENSION (2026-10-22, coral-raven).
   CLI-embedded UI) hits `.suspended => unreachable` = UB. Bart chose "real
   nested suspension": design in `docs/design/68-nested-suspension.md`
   (continuation frames à la LuaJIT FRAME_CONT; pcall as protected frames;
-  resumable natives). Waiting on Q1–Q3 there before P0.
+  resumable natives). Rev 2 folds in the codex + antigravity round-1 review
+  (docs/reviews/doc68/). Waiting on Bart for Q2 (gsub buffer) and Q3
+  (embedder boundary: defer vs refuse; the reviewers split on both). Code
+  waits until coral-marten commits doc 66 P2 (also in interp.zig).
 - Added with it: wasm panics now carry their message to JS
   (`mahina_panic_message_*`, `MahinaTrapError`; the worker reloads the
   module after a trap).
-- Commit caveat: src/interp.zig also holds another agent's uncommitted
-  changes (as do bytecode.zig and trace*.zig) — Rule #13, ask before
-  committing interp.zig.
+- coral-marten's bytecode/trace changes are committed (3b84fc8); the
+  uncommitted interp.zig changes are all mine.
 
 WORST BOARD ROW (2026-10-19, amber-badger): nsieve-bit-fp.
 - Board on 1b60a01 (gothab run e3763f2b): nsieve-bit-fp 18.6× LuaJIT, its
@@ -162,8 +164,16 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     constant equality and ordered constant compares; `itern` (b2)
     declining on a hash-view build; order `condBranchOf` → P2 → P3 → P5
     → P4 → P1.
-  - `condBranchOf` refactor landed (doc 66 checklist). P2
-    (`get_field`/`set_field`) next.
+  - `condBranchOf` refactor landed (3b84fc8). P2 (`get_field`/
+    `set_field`) done with its numbers in doc 66's checklist. It also
+    fixed a JIT classification bug P2 exposed: inlined-callee branch
+    guards were decoded against the anchor proto (`TraceCode.anchorSourcePc`
+    and the `off_frame` memo). P3 (constant-operand arithmetic) next.
+  - The 5 failing viz "multi-file:" wasm tests are not P2's. They trap on
+    `Vm.callValue`'s `suspend_ctl == null` assert via `require` under a
+    suspendable run, which is doc 68's territory. Named wasm frames: bundle
+    the probe for node (`bun build /tmp/mfprobe/probe.ts --target=node`),
+    because bun's JSC drops the wasm name section from stacks.
   - Then item 5 (call/return) and item 6 (dispatch prologue, doc 42 §4.2).
 - Bart (2026-10-21): wraparound should stop, a zero step should raise,
   `next`'s zero results are fine, and continuations shouldn't re-check

@@ -1026,7 +1026,9 @@ test "metatable: a self-referential __index chain raises rather than hanging" {
 test "heap-key fast paths: field reads and stores match the full lookup" {
     // `get_index`/`set_index` probe a heap key inline and walk `__index`
     // chains of plain tables; everything else leaves for `indexGet` /
-    // `indexSet`. Each line pins one edge of that split.
+    // `indexSet`. Each line pins one edge of that split. Doc 66 P2: a
+    // literal key (`o.own`) compiles to `get_field`/`set_field`, whose fast
+    // lanes are these; `tk[key]` keeps a register key.
     try expectProgram(
         \\local Base = {}; Base.__index = function(_, k) return k .. "!" end
         \\local C = setmetatable({ m = "Cm" }, Base); C.__index = C
@@ -1052,6 +1054,64 @@ test "heap-key fast paths: field reads and stores match the full lookup" {
         \\
     ,
         "1\tCm\tmiss!\n2\tnil\ty\t1\nnil\ttrue\n5\tk\t5\nu\tnil\n10\tnil\tnil\ts\t1\t6\t0\n",
+    );
+}
+
+test "doc 66 P2: the constant-key field forms match the register-key access" {
+    // Every site the compiler emits `get_field`/`set_field` from — `t.x`,
+    // `t["x"]`, stores, compound assignment, constructors, method calls,
+    // `function t.f()`/`t:m()` — next to the register-key `t[k]` it
+    // replaces, over the fast lanes (present key, in-place store) and the
+    // slow halves (`__index` function and chains, `__newindex`, deletion,
+    // a string container, and a non-table container's error).
+    try expectProgram(
+        \\local Base = {}; Base.__index = function(_, k) return k .. "!" end
+        \\local C = setmetatable({ m = "Cm" }, Base); C.__index = C
+        \\local o = setmetatable({ own = 1 }, C)
+        \\local k = "own"
+        \\print(o.own, o["own"], o[k], o.m, o.miss, o["miss"])
+        \\local log = {}
+        \\local w = setmetatable({ x = 1 }, { __newindex = function(t, key, v) log[#log + 1] = key .. "=" .. tostring(v) end })
+        \\w.x = 2; w.y = 3; w["z"] = 4
+        \\print(w.x, rawget(w, "y"), log[1], log[2], #log)
+        \\local d = { k = 1, ["j"] = 2 }
+        \\d.k = nil; d["j"] = nil
+        \\print(d.k, d.j, next(d) == nil)
+        \\d.k = 5; d.k = d.k + 1; d.k += 10; d["k"] += 100
+        \\print(d.k)
+        \\local obj = { n = 0 }
+        \\function obj.inc(self, by) self.n = self.n + by; return self.n end
+        \\function obj:dec(by) self.n = self.n - by; return self.n end
+        \\print(obj:inc(3), obj.inc(obj, 4), obj:dec(2), select("#", obj:inc(1)))
+        \\local ns = { a = { b = {} } }
+        \\function ns.a.b.f() return "deep" end
+        \\function ns.a.b:g() return self == ns.a.b end
+        \\print(ns.a.b.f(), ns.a.b:g(), ns["a"]["b"].f())
+        \\local s = "Hello"
+        \\print(s:upper(), ("x"):rep(3))
+        \\local function idx(t) return t.field end
+        \\local function put(t) t.field = 1 end
+        \\print(pcall(idx, nil))
+        \\print(pcall(put, 7))
+        \\print(pcall(function() local n; return n:method() end))
+        \\local mixed = { 1, 2, x = "X", ["y"] = "Y", [3] = 3 }
+        \\print(mixed[1], mixed[3], mixed.x, mixed.y, #mixed)
+        \\local up = setmetatable({}, { __index = { deep = setmetatable({}, { __index = { v = 42 } }) } })
+        \\print(up.deep.v, up.deep.nope)
+        \\
+    ,
+        "1\t1\t1\tCm\tmiss!\tmiss!\n" ++
+            "2\tnil\ty=3\tz=4\t2\n" ++
+            "nil\tnil\ttrue\n" ++
+            "116\n" ++
+            "3\t7\t5\t1\n" ++
+            "deep\ttrue\tdeep\n" ++
+            "HELLO\txxx\n" ++
+            "false\tidx:25: attempt to index a nil value\n" ++
+            "false\tput:26: attempt to index a number value\n" ++
+            "false\tanonymous:29: attempt to index a nil value\n" ++
+            "1\t3\tX\tY\t3\n" ++
+            "42\tnil\n",
     );
 }
 
@@ -2296,7 +2356,7 @@ test "doc 61 Phase 0: a metamethod's caller is in flight at the instruction that
         \\print(a)
         \\print(b)
         \\
-    , "F:add F:call\nF:get_index F:call\n");
+    , "F:add F:call\nF:get_field F:call\n");
 }
 
 test "doc 61 Phase 0: a native stays in flight between and after its re-entries" {
@@ -2351,7 +2411,7 @@ test "doc 61 Phase 0: an xpcall handler sees the faulting frame in flight at its
         \\print(a)
         \\print(b)
         \\
-    , "F:call F:get_index F:call\nF:call F:add F:call\n");
+    , "F:call F:get_field F:call\nF:call F:add F:call\n");
 }
 
 test "doc 61 Phase 0: a retained in-flight parent stays in flight under its faulting metamethod" {
@@ -2367,7 +2427,7 @@ test "doc 61 Phase 0: a retained in-flight parent stays in flight under its faul
         \\for i = 1, 10 do r = select(2, xpcall(f, function(e) return shapes() end)) end
         \\print(r)
         \\
-    , "F:call F:add F:get_index F:call\n");
+    , "F:call F:add F:get_field F:call\n");
 }
 
 test "doc 61 Phase 0: nested xpcall marks each level's own faulting frame" {
@@ -2380,7 +2440,7 @@ test "doc 61 Phase 0: nested xpcall marks each level's own faulting frame" {
         \\print(r)
         \\print(shapes())
         \\
-    , "F:call F:get_index F:call F:get_index F:call\nF:call\n");
+    , "F:call F:get_field F:call F:get_field F:call\nF:call\n");
 }
 
 test "doc 61 Phase 0: a rejected push leaves the faulting frame's pc at its .call" {

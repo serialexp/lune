@@ -169,16 +169,15 @@ const LoopTests = struct { flush: usize = 0, own: usize = 0, copies: usize = 0, 
 
 fn loopTests(vm: *Vm, t: *const @import("trace.zig").Trace, src_op: @import("bytecode.zig").OpCode) LoopTests {
     var out: LoopTests = .{};
-    const code = t.code.anchor.proto.code;
     for (t.code.instrs, 0..) |ins, i| {
         if (ins.op != .guard_true) continue;
-        const sp = trace_ir.guardSourcePc(ins) orelse continue;
-        if (sp >= code.len or code[sp].op != src_op) continue;
+        const src = t.code.anchorSourceInstr(i) orelse continue;
+        if (src.op != src_op) continue;
         if (t.code.isNumericForLoopDoneGuard(i)) out.flush += 1;
         if (t.code.isLoopTestCopy(i)) out.copies += 1;
         if (t.code.isOwnLoopTest(i)) {
             out.own += 1;
-            if (vm.trace.isSourceBranchGuardExit(t, @intCast(i), t.code.anchor.proto)) out.branch += 1;
+            if (vm.trace.isSourceBranchGuardExit(t, @intCast(i))) out.branch += 1;
         }
     }
     return out;

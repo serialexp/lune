@@ -1238,3 +1238,57 @@ test "L-3: a non-string path argument is a bad-argument error" {
     // A numeric path raises `bad argument` (raised, not (nil,msg)) — matching Lua.
     try testing.expectError(error.LuaError, compileRun(gpa, &vm, "loadfile(42)"));
 }
+
+// Multi-file locations: a fault, its backtrace frames and the replay line index
+// each carry the proto id of their line, and `loadedChunkIndexOf` turns that id
+// into the chunk (so the file) it was compiled from — the static chunk's ids map
+// to null.
+test "multi-file: fault, frames and safepoint lines name the chunk their line is in" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source: [:0]const u8 =
+        \\local m = require("mod")
+        \\local t = {}
+        \\m.f(t)
+    ;
+    var ffs = FakeFs{ .entries = &.{
+        .{ .path = "./mod.mah", .content = "local M = {}\nfunction M.f(x)\n  return x.y + 1\nend\nreturn M\n" },
+    } };
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+
+    vm.fs_source = ffs.source();
+    vm.setRecordSafepointLines(true);
+    try testing.expectError(error.TypeError, vm.run(chunk.proto));
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const fault = try vm.describeFault(error.TypeError, arena.allocator());
+    // The leaf is line 3 of mod.mah, the one loaded chunk.
+    try testing.expectEqual(@as(u32, 3), fault.line);
+    try testing.expectEqual(@as(?usize, 0), vm.loadedChunkIndexOf(fault.proto_id));
+    try testing.expectEqualStrings("./mod.mah", vm.loaded_chunks.items[0].chunk.proto.name);
+    // Frames: the leaf in mod.mah, then the call site on line 3 of the script.
+    try testing.expectEqual(@as(usize, 2), fault.frames.len);
+    try testing.expectEqual(fault.proto_id, fault.frames[0].proto_id);
+    try testing.expectEqual(@as(?usize, null), vm.loadedChunkIndexOf(fault.frames[1].proto_id));
+    try testing.expectEqual(@as(u32, 3), fault.frames[1].line);
+
+    // The replay index names the chunk of every line, and both files appear.
+    var saw_static = false;
+    var saw_mod_line3 = false;
+    for (vm.safepoint_lines.items) |sp| {
+        if (vm.loadedChunkIndexOf(sp.proto_id)) |_| {
+            if (sp.line == 3) saw_mod_line3 = true;
+        } else saw_static = true;
+    }
+    try testing.expect(saw_static and saw_mod_line3);
+}

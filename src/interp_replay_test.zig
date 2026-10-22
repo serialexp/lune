@@ -140,7 +140,9 @@ fn recordSafepointLines(gpa: std.mem.Allocator, source: [:0]const u8) ![]u32 {
     try testing.expect(!diags.hasErrors());
 
     _ = try vm.run(chunk.proto);
-    return gpa.dupe(u32, vm.safepoint_lines.items);
+    const lines = try gpa.alloc(u32, vm.safepoint_lines.items.len);
+    for (lines, vm.safepoint_lines.items) |*l, sp| l.* = sp.line;
+    return lines;
 }
 
 test "replay: re-running to the same safepoint k is consistent (line + stdout-so-far)" {

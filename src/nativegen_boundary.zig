@@ -169,8 +169,7 @@ pub fn forEachExitWrite(t: *const Trace, kinds: []const Kind, alloc: *const Allo
             try sink.write(.{ .slot = s.slot, .kind = kinds[ref], .place = ngalloc.placeOfRef(alloc, ref), .ref = @intCast(ref) });
         },
         .loop_done_linked => {
-            const guard = t.instrs[exit_instr];
-            const for_ins = t.anchor.proto.code[trace_ir.guardSourcePc(guard).?];
+            const for_ins = t.anchorSourceInstr(exit_instr).?; // a loop-done guard's own `for_loop`
             const visible_var_slot: i32 = @as(i32, @intCast(for_ins.a)) + 3;
             for (t.instrs) |p| {
                 if (p.op != .phi or p.aux == trace_ir.PHI_INTERNAL) continue;

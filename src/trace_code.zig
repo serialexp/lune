@@ -477,6 +477,14 @@ pub const TraceCode = struct {
     /// OOM leaves it unbuilt and isBridgeCandidate uses the identical oracle.
     bridge_cand: []const u8 = &.{},
     bridge_cand_built: bool = false,
+    /// Owned LSB-first memo of `isAnchorFrameGuard`'s complement: bit `i` set
+    /// when instruction `i` was recorded off the anchor's frame (provenance
+    /// at inline depth > 0, or a link terminal). Built first at commit, by
+    /// one merge over the sorted `exit_prov`, because every later classifier
+    /// asks it per guard (`buildFrameMemo`). Same fail-soft contract as
+    /// `bridge_cand`.
+    off_frame: []const u8 = &.{},
+    off_frame_built: bool = false,
     /// Doc 45 D2: owned precise-deopt snapshot records + their flat slot-vector
     /// store (see `trace_snapshot.zig`). Empty on every `entry_replay` trace;
     /// a `precise` trace's finalization populates both or fails the candidate
@@ -537,6 +545,7 @@ pub const TraceCode = struct {
         if (self.rec_path.len != 0) gpa.free(self.rec_path);
         if (self.src_by_ord.len != 0) gpa.free(self.src_by_ord);
         if (self.bridge_cand.len != 0) gpa.free(self.bridge_cand);
+        if (self.off_frame.len != 0) gpa.free(self.off_frame);
         if (self.snapshots.len != 0) gpa.free(self.snapshots);
         if (self.snapshot_slots.len != 0) gpa.free(self.snapshot_slots);
         if (self.host_sites.len != 0) gpa.free(self.host_sites);
@@ -558,6 +567,81 @@ pub const TraceCode = struct {
             if (e.index < idx) lo = mid + 1 else hi = mid;
         }
         return null;
+    }
+
+    /// The source pc of guard `idx` in the ANCHOR proto (`guardSourcePc`), or
+    /// null when the guard has none or is not the anchor frame's own. An
+    /// inlined callee's guard carries a pc in the CALLEE's proto (`emit`
+    /// stamps the recorder's `cur_pc`), so reading `anchor.proto.code` there
+    /// decodes an unrelated instruction, and a coincidental branch or
+    /// `for_loop` at that pc misroutes the exit (doc 66 P2: array3d's
+    /// iterator `jmp_if_false` at callee pc 5 met main's own `jmp_if_false`
+    /// at pc 5 and raised a prime-side want every row). Every reader of the
+    /// anchor proto at a guard's pc goes through here. A guard with no
+    /// provenance row (a hand-built trace) is taken as depth 0; a link
+    /// terminal never names an anchor source opcode.
+    pub fn anchorSourcePc(self: *const TraceCode, idx: usize) ?u32 {
+        if (idx >= self.instrs.len) return null;
+        const src_pc = trace_ir.guardSourcePc(self.instrs[idx]) orelse return null;
+        if (src_pc >= self.anchor.proto.code.len) return null;
+        if (!self.isAnchorFrameGuard(idx)) return null;
+        return src_pc;
+    }
+
+    /// Was instruction `idx` recorded in the anchor's own frame (inline depth
+    /// 0), so that its pc indexes the anchor proto? Reads the `off_frame`
+    /// memo: the commit-time classifiers (`buildBridgeCandMemo`,
+    /// `buildExitFacts`) ask it for every guard, and a `provAt` search per
+    /// ask measured +1% instructions on the small `while_shortcircuit_probe`.
+    pub fn isAnchorFrameGuard(self: *const TraceCode, idx: usize) bool {
+        if (!self.off_frame_built) return self.computeAnchorFrameGuard(idx);
+        if (idx >= self.instrs.len) return false;
+        return (self.off_frame[idx >> 3] >> @intCast(idx & 7)) & 1 == 0;
+    }
+
+    /// Build the `off_frame` memo: one pass over the sorted provenance table.
+    /// Called at commit before any other classifier memo.
+    pub fn buildFrameMemo(self: *TraceCode, gpa: std.mem.Allocator) void {
+        std.debug.assert(!self.off_frame_built and self.off_frame.len == 0);
+        if (self.instrs.len == 0) {
+            self.off_frame_built = true;
+            return;
+        }
+        const bytes = gpa.alloc(u8, (self.instrs.len + 7) / 8) catch return;
+        @memset(bytes, 0);
+        for (self.exit_prov) |e| {
+            if (e.index >= self.instrs.len) continue;
+            const off = switch (e.prov) {
+                .guard => |gp| gp.inline_depth != 0,
+                .link_terminal => true,
+            };
+            if (off) bytes[e.index >> 3] |= @as(u8, 1) << @intCast(e.index & 7);
+        }
+        self.off_frame = bytes;
+        self.off_frame_built = true;
+    }
+
+    /// The oracle behind `isAnchorFrameGuard` (`noinline`: see
+    /// `computeNumericForLoopDoneGuard`).
+    noinline fn computeAnchorFrameGuard(self: *const TraceCode, idx: usize) bool {
+        if (idx >= self.instrs.len) return false;
+        const prov = self.provAt(@intCast(idx)) orelse return true;
+        return switch (prov) {
+            .guard => |gp| gp.inline_depth == 0,
+            .link_terminal => false,
+        };
+    }
+
+    /// The anchor-proto source instruction of guard `idx` (`anchorSourcePc`).
+    pub fn anchorSourceInstr(self: *const TraceCode, idx: usize) ?bytecode.Instr {
+        return self.anchor.proto.code[self.anchorSourcePc(idx) orelse return null];
+    }
+
+    /// The conditional branch guard `idx` was recorded from, when its source
+    /// opcode (`anchorSourcePc`) is one.
+    pub fn anchorCondBranch(self: *const TraceCode, idx: usize) ?bytecode.CondBranch {
+        const pc = self.anchorSourcePc(idx) orelse return null;
+        return bytecode.condBranchOf(self.anchor.proto.code[pc], pc);
     }
 
     /// Doc 57 P3: is guard `idx` a copy of the loop's own test that an
@@ -698,9 +782,8 @@ pub const TraceCode = struct {
         if (!self.loopDoneSnapshotSupported(exit_instr)) return false;
         const proto = self.anchor.proto;
         if (!proto.maskable) return false;
-        const guard = self.instrs[exit_instr];
-        const exit_pc = trace_ir.guardExitPc(guard) orelse return false;
-        const slot = proto.code[trace_ir.guardSourcePc(guard).?].a + 3;
+        const exit_pc = trace_ir.guardExitPc(self.instrs[exit_instr]) orelse return false;
+        const slot = (self.anchorSourceInstr(exit_instr) orelse return false).a + 3;
         if (slot >= proto.num_registers) return false; // not a real for-loop window
         // Falling off the end of the code reads nothing.
         if (exit_pc >= proto.code.len) return true;
@@ -726,8 +809,13 @@ pub const TraceCode = struct {
         return instr_idx < self.exit_facts.len and self.exit_facts[instr_idx].numeric_for_done;
     }
 
-    /// The oracle behind `isNumericForLoopDoneGuard`.
-    fn computeNumericForLoopDoneGuard(self: *const TraceCode, instr_idx: usize) bool {
+    /// The oracle behind `isNumericForLoopDoneGuard`. `noinline` for every
+    /// memo oracle here: they run only before the commit-time memo exists,
+    /// and inlined they bloat their reader past LLVM's inlining threshold,
+    /// so the reader stops being a one-load read at its callers (measured:
+    /// `ExitIterator.next`'s 264 asks on `while_shortcircuit_probe` became
+    /// calls, +0.5% instructions).
+    noinline fn computeNumericForLoopDoneGuard(self: *const TraceCode, instr_idx: usize) bool {
         if (instr_idx >= self.instrs.len) return false;
         // Doc 44 D1/D12b: a one-shot trace (head or cont) has no loop-done
         // exits — a zero-iteration `for` recorded through the body would
@@ -735,22 +823,12 @@ pub const TraceCode = struct {
         // `for_loop` op) and route into the loop-done slot/snapshot
         // machinery. Kind check, fail-closed.
         if (anchorKind(self.anchor.pc) != .loop) return false;
-        const guard = self.instrs[instr_idx];
-        if (guard.op != .guard_true) return false;
-        const exit_pc = trace_ir.guardExitPc(guard) orelse return false;
-        if (exit_pc == 0 or exit_pc > self.anchor.proto.code.len) return false;
-        if (self.anchor.proto.code[trace_ir.guardSourcePc(guard).?].op != .for_loop) return false;
+        if (self.instrs[instr_idx].op != .guard_true) return false;
+        // Depth 0 only (`anchorSourcePc`): a callee's `for_loop` is not ours.
+        const src = self.anchorSourceInstr(instr_idx) orelse return false;
+        if (src.op != .for_loop) return false;
         // Doc 57 P3: a non-final iteration's `for_loop` test sits mid-trip.
-        if (self.isLoopTestCopy(instr_idx)) return false;
-        // Inlined-callee corner: a callee-internal `for_loop` guard at
-        // `inline_depth > 0` has its `guardSourcePc` in the callee's proto,
-        // which may coincidentally name a `for_loop` in the anchor proto.
-        // A link terminal is never a loop-done guard.
-        if (self.provAt(@intCast(instr_idx))) |prov| switch (prov) {
-            .guard => |gp| if (gp.inline_depth > 0) return false,
-            .link_terminal => return false,
-        };
-        return true;
+        return !self.isLoopTestCopy(instr_idx);
     }
 
     /// Doc 58 §4.3: is guard `idx` the test of the loop this trace is anchored
@@ -776,20 +854,17 @@ pub const TraceCode = struct {
         return idx < self.exit_facts.len and self.exit_facts[idx].own_loop_test;
     }
 
-    /// The oracle behind `isOwnLoopTest`.
-    fn computeOwnLoopTest(self: *const TraceCode, idx: usize) bool {
+    /// The oracle behind `isOwnLoopTest` (`noinline`: see
+    /// `computeNumericForLoopDoneGuard`).
+    noinline fn computeOwnLoopTest(self: *const TraceCode, idx: usize) bool {
         if (idx >= self.instrs.len) return false;
         if (anchorKind(self.anchor.pc) != .loop) return false;
         const g = self.instrs[idx];
         if (g.op != .guard_true and g.op != .guard_false) return false;
-        // Depth 0 only: an inlined callee's loop test is not this loop's.
-        if (self.provAt(@intCast(idx))) |prov| switch (prov) {
-            .guard => |gp| if (gp.inline_depth > 0) return false,
-            .link_terminal => return false,
-        };
-        const src_pc = trace_ir.guardSourcePc(g) orelse return false;
+        // Depth 0 only (`anchorSourcePc`): an inlined callee's loop test is
+        // not this loop's.
+        const src_pc = self.anchorSourcePc(idx) orelse return false;
         const proto = self.anchor.proto;
-        if (src_pc >= proto.code.len) return false;
         const src = proto.code[src_pc];
         // `for_loop` / `tfor_loop`: the back-edge itself is the test.
         if (bytecode.loopHeaderOf(src, src_pc) == self.anchor.pc) return true;
@@ -830,14 +905,14 @@ pub const TraceCode = struct {
         if (guard.op != .guard_true and guard.op != .guard_false) return false;
         if (self.isNumericForLoopDoneGuard(instr_idx)) return false;
         const exit_pc = trace_ir.guardExitPc(guard) orelse return false;
-        const source_pc = trace_ir.guardSourcePc(guard) orelse return false;
-        if (exit_pc >= self.anchor.pc or source_pc >= self.anchor.proto.code.len) return false;
+        const source_pc = self.anchorSourcePc(instr_idx) orelse return false;
+        if (exit_pc >= self.anchor.pc) return false;
         const gp = switch (self.provAt(@intCast(instr_idx)) orelse return false) {
             .guard => |g| g,
             .link_terminal => return false,
         };
         if (gp.role != .branch_cond or gp.source_proto_id != self.anchor.proto.id or gp.source_pc != source_pc) return false;
-        const cb = bytecode.condBranchOf(self.anchor.proto.code[source_pc], source_pc) orelse return false;
+        const cb = self.anchorCondBranch(instr_idx) orelse return false;
         if (!cb.cond.isCondition()) return false;
         // Doc 43 P0c (fail-closed): an ARMED composite bridge hands off directly to
         // the successor (`nativegen` edge-4 stub: snapshot φ slots, then `jmpMem`

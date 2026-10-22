@@ -298,13 +298,18 @@ test "doc 56 Phase 2: bit-reverse's while-exit is attachable and resumes after t
         var oracle = t.code;
         oracle.exit_facts = &.{};
         oracle.exit_facts_built = false;
+        oracle.off_frame = &.{};
+        oracle.off_frame_built = false;
         try testing.expect(c.exit_facts_built);
+        try testing.expect(c.off_frame_built);
         for (0..c.instrs.len) |e| {
             // The commit-time memo is the oracle's answer, fact by fact.
             try testing.expectEqual(exit_attach.classify(c, e) == .attachable, c.exitAttachable(e));
             try testing.expectEqual(oracle.exitResumePc(e), c.exitResumePc(e));
             try testing.expectEqual(oracle.isNumericForLoopDoneGuard(e), c.isNumericForLoopDoneGuard(e));
             try testing.expectEqual(oracle.isOwnLoopTest(e), c.isOwnLoopTest(e));
+            try testing.expectEqual(oracle.isAnchorFrameGuard(e), c.isAnchorFrameGuard(e));
+            try testing.expectEqual(oracle.anchorSourcePc(e), c.anchorSourcePc(e));
             loop_done += @intFromBool(c.isNumericForLoopDoneGuard(e));
             own_test += @intFromBool(c.isOwnLoopTest(e));
             const p = c.exitResumePc(e) orelse continue;

@@ -226,6 +226,17 @@ pub const OpCode = enum(u8) {
     ///             B2 makes it the loop's back-edge, whose header is `pc + 1`.
     ///             Appended LAST to keep the enum dense (doc 42 §4.6).
     loop,
+
+    // ---- constant-key field access (doc 66 P2, LuaJIT `TGETS`/`TSETS`) ----
+    /// `a, b, c`   R[a] = R[b][K[c]]   (K[c] an interned string). Emitted for
+    ///             `t.x`, `t["x"]`, a method lookup and every other read with a
+    ///             literal string key; `get_index` with the key in a register
+    ///             is the same operation.
+    get_field,
+    /// `a, b, c`   R[a][K[b]] = R[c]   (K[b] an interned string). Emitted for
+    ///             `t.x = v`, `t["x"] = v`, `function t.f()` and a constructor's
+    ///             named fields; the constant-key form of `set_index`.
+    set_field,
 };
 
 /// Doc 58: the kind of loop a `loop` marker belongs to, in its `.b` operand.

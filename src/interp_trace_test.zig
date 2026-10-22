@@ -6145,7 +6145,7 @@ test "recorder (precise deopt, doc 45 D2): new_table cancels needs_precise ONCE,
 
     // The abort log carries the transition: one `.needs_precise` row on
     // `new_table`, and at least one retry row at the SAME anchor that aborted
-    // PAST the construction (`set_index`, `.bad_type`) — the retry
+    // PAST the construction (`set_field`, `.bad_type`) — the retry
     // re-recorded from the real loop anchor (not blacklisted) and `tnew`
     // recording carried it through the `new_table` bytecode.
     var cancel_row: ?trace.AbortRecord = null;
@@ -6155,7 +6155,7 @@ test "recorder (precise deopt, doc 45 D2): new_table cancels needs_precise ONCE,
             try testing.expect(cancel_row == null); // deduped: one row
             cancel_row = r;
         }
-        if (r.op == .set_index and r.reason == .bad_type) retry_row = r;
+        if (r.op == .set_field and r.reason == .bad_type) retry_row = r;
         // The old pre-increment-5 outcome must be gone: no precise retry
         // ever aborts ON the construction bytecode again.
         try testing.expect(!(r.op == .new_table and r.reason == .nyi_opcode));
@@ -6935,13 +6935,18 @@ const PreciseStrOom = struct {
             if (self.count == self.fail_at) return null;
             return self.inner.vtable.alloc(self.inner.ptr, len, alignment, ret_addr);
         }
-        fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            return self.inner.vtable.resize(self.inner.ptr, memory, alignment, new_len, ret_addr);
+        // In-place growth is refused, so every growth is a counted `alloc`.
+        // Whether the backing allocator could grow a block in place depends
+        // on its memory layout, which differs between the tier-0 and the
+        // traced VM (the trace's own allocations share it). Counting only
+        // `alloc` while forwarding `remap` made the schedule depend on that
+        // layout, not on the VM: a `string.rep` scratch buffer grew in place
+        // in one run and by a fresh allocation in the other.
+        fn resizeFn(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+            return false;
         }
-        fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            return self.inner.vtable.remap(self.inner.ptr, memory, alignment, new_len, ret_addr);
+        fn remapFn(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
         }
         fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
