@@ -498,7 +498,7 @@ test "restore rebuilds globals, ids, and a reachable value graph" {
     try testing.expect(add_val.isHeap() and add_val.heapType() == .function);
     const add_cl = function.Closure.fromHeader(add_val.asHeap());
     try testing.expectEqual(@as(usize, 1), add_cl.upvalues.len);
-    try testing.expectEqual(@as(i64, 10), vm2.upvalGet(add_cl.upvalues[0]).asInt());
+    try testing.expectEqual(@as(i64, 10), add_cl.upvalues[0].get().asInt());
 
     // print is still a native bound under its name.
     const print_val = vm2.globals.get(try vm2.heap.internValue("print"));
@@ -1160,7 +1160,7 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
     try testing.expectEqual(@as(usize, 2), vm.frames[0].closure.upvalues.len);
     try testing.expectEqual(@as(usize, 0), vm.frames[1].closure.upvalues.len);
     // The two-upvalue closure's closed cell (id 4) holds 99.
-    try testing.expectEqual(@as(i64, 99), vm.upvalGet(vm.frames[0].closure.upvalues[0]).asInt());
+    try testing.expectEqual(@as(i64, 99), vm.frames[0].closure.upvalues[0].get().asInt());
 
     // Closed upvalue id 4 holds 99; open upvalue id 5 was rebound over stack[0]
     // and therefore reads the table ref now living there.
@@ -1171,7 +1171,7 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
     const open_cell = vm.open_upvalues.items[0].cell;
     try testing.expectEqual(@as(u32, 5), open_cell.header.id);
     try testing.expectEqual(@as(usize, 0), open_cell.loc.open);
-    try testing.expect(vm.upvalGet(open_cell).isHeap() and vm.upvalGet(open_cell).asHeap() == &vm.globals.header);
+    try testing.expect(open_cell.get().isHeap() and open_cell.get().asHeap() == &vm.globals.header);
 
     // Stack window restored.
     try testing.expectEqual(@as(usize, 2), vm.stack_top);

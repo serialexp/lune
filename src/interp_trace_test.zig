@@ -5797,6 +5797,11 @@ test "descent gate publication (doc 54 P0): prepareNativeEpisode computes descen
     try testing.expectEqual(@as(u8, 1), ctx.descent_ok);
 }
 
+/// A heap-linked open cell over `vm`'s slot `i`, as `captureUpvalue` makes.
+fn openCell(vm: *Vm, i: usize) !*function.Upvalue {
+    return vm.heap.newUpvalue(i, &vm.tags[i], &vm.payloads[i]);
+}
+
 test "open-upvalue ceiling (doc 54 P1): centralized maintenance keeps the list slot-ordered and the watermark exact" {
     // The inline native pop and `closeUpvaluesFrom` decide "no open cell at
     // or above `from`" with one `ceiling <= from` compare, so the ceiling
@@ -5816,15 +5821,15 @@ test "open-upvalue ceiling (doc 54 P1): centralized maintenance keeps the list s
     vm.regSet(5, Value.int(15));
     vm.regSet(7, Value.int(17));
     vm.stack_top = 8;
-    try vm.appendOpenUpvalue(3, try vm.heap.newUpvalue(3));
+    try vm.appendOpenUpvalue(3, try openCell(&vm, 3));
     try testing.expectEqual(@as(usize, 4), vm.open_upvalue_ceiling);
-    try vm.appendOpenUpvalue(7, try vm.heap.newUpvalue(7));
+    try vm.appendOpenUpvalue(7, try openCell(&vm, 7));
     try testing.expectEqual(@as(usize, 8), vm.open_upvalue_ceiling);
     // A lower open never lowers the watermark, and goes in slot order.
-    const one = try vm.heap.newUpvalue(1);
+    const one = try openCell(&vm, 1);
     try vm.appendOpenUpvalue(1, one);
     try testing.expectEqual(@as(usize, 8), vm.open_upvalue_ceiling);
-    try vm.appendOpenUpvalue(5, try vm.heap.newUpvalue(5));
+    try vm.appendOpenUpvalue(5, try openCell(&vm, 5));
     var slots: [4]usize = undefined;
     for (vm.open_upvalues.items, 0..) |ou, k| slots[k] = ou.index;
     try testing.expectEqualSlices(usize, &.{ 1, 3, 5, 7 }, slots[0..vm.open_upvalues.items.len]);
@@ -5839,11 +5844,17 @@ test "open-upvalue ceiling (doc 54 P1): centralized maintenance keeps the list s
     try testing.expectEqual(@as(usize, 2), vm.open_upvalues.items.len);
     try testing.expect(seven.loc == .closed and seven.loc.closed.asInt() == 17);
     try testing.expect(one.loc == .open);
+    // A closed cell keeps its value when the slot is reused; an open one
+    // reads the slot.
+    vm.regSet(7, Value.int(70));
+    vm.regSet(1, Value.int(10));
+    try testing.expectEqual(@as(i64, 17), seven.get().asInt());
+    try testing.expectEqual(@as(i64, 10), one.get().asInt());
     // Close-all: empty list ⇒ zero.
     vm.closeUpvaluesFrom(0);
     try testing.expectEqual(@as(usize, 0), vm.open_upvalue_ceiling);
     // The wholesale clear resets with the list.
-    try vm.appendOpenUpvalue(5, try vm.heap.newUpvalue(5));
+    try vm.appendOpenUpvalue(5, try openCell(&vm, 5));
     try testing.expectEqual(@as(usize, 6), vm.open_upvalue_ceiling);
     vm.clearOpenUpvalues();
     try testing.expectEqual(@as(usize, 0), vm.open_upvalue_ceiling);

@@ -557,10 +557,11 @@ pub const Heap = struct {
         return n;
     }
 
-    /// Allocate an *open* upvalue over live stack slot `index`, and register it
-    /// with the heap. Closing is the interpreter's job.
-    pub fn newUpvalue(self: *Heap, index: usize) std.mem.Allocator.Error!*Upvalue {
-        const u = try Upvalue.createOpen(self.gpa, index);
+    /// Allocate an *open* upvalue over live stack slot `index`, whose lanes
+    /// are `tag` and `payload`, and register it with the heap. Closing is the
+    /// interpreter's job.
+    pub fn newUpvalue(self: *Heap, index: usize, tag: *u8, payload: *u64) std.mem.Allocator.Error!*Upvalue {
+        const u = try Upvalue.createOpen(self.gpa, index, tag, payload);
         self.link(&u.header);
         return u;
     }

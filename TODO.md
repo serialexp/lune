@@ -296,6 +296,12 @@ earlier in `/tmp/t0micro/`).
       tables' probe chains reshuffle: field_hash −3.2%, array3d +0.47%,
       str_gsub +0.09%, the same numbers with the interning alone and no
       cache. Eight GC tests that pin `table: 0x…` ids moved by +7.
+- [x] **An upvalue read is 33 instructions, a write 52** (LuaJIT `-joff`
+      13/17), 10–17% of tier-0 cycles on recursive-fib, str_find_match,
+      lua54 and scalar. Fixed 2026-10-23, doc 71: the cell carries pointers
+      to its value's two lanes (no open/closed branch), its pointer sits
+      inline in the closure, and `u = v` stores from `v`'s register. Read
+      26, write 28; scalar −2.1%, recursive-fib −1.5% on both tiers.
 - [ ] **Dispatch prologue, ~18 instructions per op** (doc 42 §4.2): GC
       check (two dependent loads), `safepoint_seq` bump, region count
       test, `frame.pc` store, fetch, jump. LuaJIT's is ~5. Each step is

@@ -274,6 +274,11 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     unanswered, defaults recorded in doc 70 §7. The one row above the bar
     is while_shortcircuit_probe +0.10% (≈650 instructions of install).
     Outstanding there: `math.type`, allocating bodies, the generic ABI.
+  - Doc 71, tier-0 upvalue access (`docs/design/71-tier0-upvalue-access.md`):
+    a cell carries pointers to its value's two lanes (LuaJIT's `uv->v`),
+    the cell pointers live inline in the closure, and `u = v` stores from
+    `v`'s register. Read 33 → 26, write 52 → 28 instructions; scalar
+    −2.1%, recursive-fib −1.5% on both tiers.
   - Scratch shadows are under /tmp/p1:
     - `ab2.sh BASE NEW`: instructions:u A/B over every @bench program, both
       tiers;

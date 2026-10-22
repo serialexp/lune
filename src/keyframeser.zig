@@ -206,7 +206,7 @@ fn sortedHashEntries(a: std.mem.Allocator, t: *const table.Table) ![]HashKV {
 ///
 /// `typed_array`/`host` have no wire variant in F2a — a reachable one is a
 /// serializer bug surfaced as `UnsupportedObject`, not a silent drop.
-pub fn toSchemaHeapObject(a: std.mem.Allocator, vm: *Vm, h: *GcHeader) !schema.HeapObject {
+pub fn toSchemaHeapObject(a: std.mem.Allocator, h: *GcHeader) !schema.HeapObject {
     const Body = schema.BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue;
     const body: Body = switch (h.type) {
         .string => .{ .HeapString = .{ .bytes = string.String.fromHeader(h).bytes() } },
@@ -262,7 +262,7 @@ pub fn toSchemaHeapObject(a: std.mem.Allocator, vm: *Vm, h: *GcHeader) !schema.H
             // F2a quiescent capture point every reachable cell is closed; F2b uses
             // `open_upvalues` to re-derive the open slot on restore.)
             const is_closed = !u.isOpen();
-            break :blk .{ .HeapUpvalue = .{ .closed = @intFromBool(is_closed), .value = toSchemaValue(vm.upvalGet(u)) } };
+            break :blk .{ .HeapUpvalue = .{ .closed = @intFromBool(is_closed), .value = toSchemaValue(u.get()) } };
         },
         .native => .{ .HeapNative = .{ .name = function.Native.fromHeader(h).name } },
         else => return error.UnsupportedObject, // typed_array / host: no F2a variant
@@ -346,7 +346,7 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
     //    (with `next_gc`) as the uninterrupted run.
     const all = try heapObjectsById(a, vm.heap);
     const objects = try a.alloc(schema.HeapObject, all.len);
-    for (all, 0..) |h, idx| objects[idx] = try toSchemaHeapObject(a, vm, h);
+    for (all, 0..) |h, idx| objects[idx] = try toSchemaHeapObject(a, h);
 
     // 2. The registers capture keeps (doc 61 Phase K); every other slot is a
     //    tombstone. Dead slots are where a JIT run can differ from tier-0
@@ -858,7 +858,7 @@ pub fn restoreSnapshot(
                 // A closed cell owns its value. An open cell's recorded value is
                 // re-derived from the live stack at the root rebind below, so the
                 // value here is a harmless placeholder until then.
-                u.loc = .{ .closed = try fromSchemaValue(hu.value, &idmap) };
+                u.closeWith(try fromSchemaValue(hu.value, &idmap));
             },
         }
     }
@@ -945,7 +945,7 @@ pub fn restoreSnapshot(
         if (ou.stack_index >= vm.stack_top) return error.StackIndexOutOfRange;
         const cell = function.Upvalue.fromHeader(uh);
         // Switch the cell from its closed placeholder to open over the live slot.
-        cell.loc = .{ .open = ou.stack_index };
+        cell.reopen(ou.stack_index, &vm.tags[ou.stack_index], &vm.payloads[ou.stack_index]);
         // Doc 54 P1: through the centralized method, so the rebuilt list
         // republishes `open_upvalue_ceiling` as it grows (round-1 blocker 5:
         // a restore that bypassed the ceiling would leave it stale-LOW).

@@ -9,19 +9,18 @@
 //! An **upvalue** is a one-slot cell shared between the frame that owns the
 //! variable and every closure that captured it. While the owning frame is live
 //! the cell is *open* — `loc` carries the **slot index** of the live local in
-//! the VM register stack, and reads/writes go through the VM (which owns the
-//! stack). When the frame returns the cell is *closed*: the current value is
-//! copied into the cell's own `loc.closed` and the index is dropped, so the
-//! captured variable outlives the frame (the classic Lua open/closed upvalue
-//! model). The interpreter owns the open/close timing; this module only provides
-//! the cell.
+//! the VM register stack. When the frame returns the cell is *closed*: the
+//! current value is copied into the cell's own `loc.closed` and the index is
+//! dropped, so the captured variable outlives the frame (the classic Lua
+//! open/closed upvalue model). The interpreter owns the open/close timing; this
+//! module only provides the cell.
 //!
-//! An open cell holds an **index**, not a `*Value` into the stack: a raw interior
-//! pointer cannot survive the register stack splitting into parallel tag/payload
-//! arrays (docs/design/09-soa-register-file.md). The slot index was already
-//! tracked by `interp.OpenUpvalue`, so the pointer was redundant. Because an open
-//! cell's value lives in the VM stack, value access is **Vm-mediated**
-//! (`Vm.upvalGet`/`Vm.upvalSet`) rather than a method here.
+//! A single `*Value` can't address an open cell's value, which is split across
+//! the register stack's parallel tag and payload arrays
+//! (docs/design/09-soa-register-file.md). So the cell carries one pointer per
+//! lane (`tag`, `payload`), aimed at the live slot's lanes while open and at
+//! `loc.closed`'s once closed, and `get`/`set` go through them without asking
+//! which (LuaJIT's `uv->v`; docs/design/71-tier0-upvalue-access.md).
 //!
 //! A **native** is a type-erased host function. Its context is passed as
 //! `*anyopaque` and its error as `anyerror` *deliberately*, so this module needs
@@ -40,23 +39,29 @@ const Proto = bytecode.Proto;
 /// A captured-variable cell. See the module docs for the open/closed model.
 pub const Upvalue = struct {
     header: GcHeader,
+    /// The captured value's two lanes, wherever it lives: the open slot's in
+    /// the register stack, or `loc.closed`'s. They change only together with
+    /// `loc` (`reopen`, `closeWith`). The register stack is allocated once
+    /// and never moves, and neither does a cell, so neither pointer dangles.
+    tag: *u8,
+    payload: *u64,
     /// Where the captured value lives — see `Loc`.
     loc: Loc,
 
-    /// Open ⇒ the value is in the VM register stack at slot `open` (the VM owns the
-    /// read/write). Closed ⇒ the value was copied out of the departed slot and is
-    /// owned here. No `*Value` into the stack — that representation cannot survive
-    /// the SoA storage split (module docs / doc 09).
+    /// Open ⇒ the value is in the VM register stack at slot `open`. Closed ⇒
+    /// the value was copied out of the departed slot and is owned here.
     pub const Loc = union(enum) {
         open: usize,
         closed: Value,
     };
 
-    /// Allocate an *open* upvalue over live stack slot `index`. Raw allocation
-    /// only — GC-linking is the heap's job (`gc.zig`).
-    pub fn createOpen(gpa: std.mem.Allocator, index: usize) std.mem.Allocator.Error!*Upvalue {
+    /// Allocate an *open* upvalue over live stack slot `index`, whose lanes
+    /// are `tag` and `payload`. Raw allocation only — GC-linking is the
+    /// heap's job (`gc.zig`).
+    pub fn createOpen(gpa: std.mem.Allocator, index: usize, tag: *u8, payload: *u64) std.mem.Allocator.Error!*Upvalue {
         const self = try gpa.create(Upvalue);
-        self.* = .{ .header = GcHeader.init(.upvalue), .loc = .{ .open = index } };
+        self.* = .{ .header = GcHeader.init(.upvalue), .tag = undefined, .payload = undefined, .loc = undefined };
+        self.reopen(index, tag, payload);
         return self;
     }
 
@@ -64,8 +69,28 @@ pub const Upvalue = struct {
     /// build a non-dangling shell before the value/index is wired.
     pub fn createClosed(gpa: std.mem.Allocator, v: Value) std.mem.Allocator.Error!*Upvalue {
         const self = try gpa.create(Upvalue);
-        self.* = .{ .header = GcHeader.init(.upvalue), .loc = .{ .closed = v } };
+        self.* = .{ .header = GcHeader.init(.upvalue), .tag = undefined, .payload = undefined, .loc = undefined };
+        self.closeWith(v);
         return self;
+    }
+
+    /// Open the cell over live stack slot `index`, whose lanes are `tag` and
+    /// `payload`. The keyframe restorer reopens the closed shells it built.
+    pub fn reopen(self: *Upvalue, index: usize, tag: *u8, payload: *u64) void {
+        self.loc = .{ .open = index };
+        self.tag = tag;
+        self.payload = payload;
+    }
+
+    /// The captured value, wherever it lives.
+    pub inline fn get(self: *const Upvalue) Value {
+        return .{ .tag = @enumFromInt(self.tag.*), .payload = .{ .bits = self.payload.* } };
+    }
+
+    /// Overwrite the captured value, wherever it lives.
+    pub inline fn set(self: *Upvalue, v: Value) void {
+        self.tag.* = @intFromEnum(v.tag);
+        self.payload.* = v.payload.bits;
     }
 
     pub fn fromHeader(h: *GcHeader) *Upvalue {
@@ -86,6 +111,8 @@ pub const Upvalue = struct {
     /// caller, which owns the stack) and drop the open index.
     pub fn closeWith(self: *Upvalue, v: Value) void {
         self.loc = .{ .closed = v };
+        self.tag = @ptrCast(&self.loc.closed.tag);
+        self.payload = &self.loc.closed.payload.bits;
     }
 
     pub fn destroy(self: *Upvalue, gpa: std.mem.Allocator) void {
@@ -100,7 +127,9 @@ pub const Closure = struct {
     header: GcHeader,
     proto: *const Proto,
     /// One cell per `proto.upvalues` descriptor (empty for functions that
-    /// capture nothing). Owned by this closure; freed in `destroy`.
+    /// capture nothing). The pointers live right after the closure, in its
+    /// own allocation (LuaJIT's `GCfuncL.uvptr`), so `upvalue(i)` reaches a
+    /// cell without loading this slice's pointer.
     upvalues: []*Upvalue = &.{},
 
     /// Allocate a closure for `proto` with room for `n_upvalues` cells (the
@@ -110,15 +139,24 @@ pub const Closure = struct {
         proto: *const Proto,
         n_upvalues: usize,
     ) std.mem.Allocator.Error!*Closure {
-        const ups: []*Upvalue = if (n_upvalues == 0)
-            &.{}
-        else
-            try gpa.alloc(*Upvalue, n_upvalues);
-        errdefer if (n_upvalues != 0) gpa.free(ups);
-
-        const self = try gpa.create(Closure);
-        self.* = .{ .header = GcHeader.init(.function), .proto = proto, .upvalues = ups };
+        const bytes = try gpa.alignedAlloc(u8, .of(Closure), allocSize(n_upvalues));
+        const self: *Closure = @ptrCast(bytes.ptr);
+        self.* = .{ .header = GcHeader.init(.function), .proto = proto, .upvalues = self.cells()[0..n_upvalues] };
         return self;
+    }
+
+    fn allocSize(n_upvalues: usize) usize {
+        return @sizeOf(Closure) + n_upvalues * @sizeOf(*Upvalue);
+    }
+
+    inline fn cells(self: *const Closure) [*]*Upvalue {
+        const start: [*]align(@alignOf(Closure)) u8 = @ptrCast(@constCast(self));
+        return @ptrCast(start + @sizeOf(Closure));
+    }
+
+    /// Cell `i`, at a fixed offset from the closure.
+    pub inline fn upvalue(self: *const Closure, i: usize) *Upvalue {
+        return self.cells()[i];
     }
 
     pub fn fromHeader(h: *GcHeader) *Closure {
@@ -128,8 +166,8 @@ pub const Closure = struct {
     }
 
     pub fn destroy(self: *Closure, gpa: std.mem.Allocator) void {
-        if (self.upvalues.len != 0) gpa.free(self.upvalues);
-        gpa.destroy(self);
+        const start: [*]align(@alignOf(Closure)) u8 = @ptrCast(self);
+        gpa.free(start[0..allocSize(self.upvalues.len)]);
     }
 };
 
@@ -547,24 +585,57 @@ test "closure embeds its header at offset 0 and round-trips" {
 }
 
 test "upvalue cell state machine: open index → closed value" {
-    // The cell itself only tracks *where* its value lives — open carries a slot
-    // index, closed owns the `Value`. Reading/writing an open cell against a live
-    // stack is the VM's job (`Vm.upvalGet`/`upvalSet`), exercised e2e elsewhere.
-    const uv = try Upvalue.createOpen(testing.allocator, 3);
-    defer uv.destroy(testing.allocator);
+    // A two-lane stand-in for the register stack.
+    var tags: [4]u8 = @splat(0);
+    var payloads: [4]u64 = @splat(0);
+    const stack_val = Value.int(5);
+    tags[3] = @intFromEnum(stack_val.tag);
+    payloads[3] = stack_val.payload.bits;
 
+    const uv = try Upvalue.createOpen(testing.allocator, 3, &tags[3], &payloads[3]);
+    defer uv.destroy(testing.allocator);
     try testing.expect(uv.isOpen());
     try testing.expectEqual(@as(usize, 3), uv.loc.open);
+    // Open: `get`/`set` reach the slot's lanes.
+    try testing.expectEqual(@as(i64, 5), uv.get().asInt());
+    uv.set(Value.int(6));
+    try testing.expectEqual(Value.int(6).payload.bits, payloads[3]);
 
     uv.closeWith(Value.int(42)); // snapshot the departing slot's value
     try testing.expect(!uv.isOpen());
     try testing.expectEqual(@as(i64, 42), uv.loc.closed.asInt());
+    // Closed: `get`/`set` reach `loc.closed`, and the slot is left alone.
+    try testing.expectEqual(@as(i64, 42), uv.get().asInt());
+    uv.set(Value.float(1.5));
+    try testing.expectEqual(@as(f64, 1.5), uv.loc.closed.asFloat());
+    try testing.expectEqual(Value.int(6).payload.bits, payloads[3]);
+
+    // Reopened (the keyframe restorer), the lanes follow the slot again.
+    uv.reopen(1, &tags[1], &payloads[1]);
+    uv.set(Value.int(9));
+    try testing.expectEqual(Value.int(9).payload.bits, payloads[1]);
+    try testing.expectEqual(@as(i64, 9), uv.get().asInt());
 
     // A directly-closed cell owns its value from birth.
     const c = try Upvalue.createClosed(testing.allocator, Value.int(7));
     defer c.destroy(testing.allocator);
     try testing.expect(!c.isOpen());
     try testing.expectEqual(@as(i64, 7), c.loc.closed.asInt());
+    try testing.expectEqual(@as(i64, 7), c.get().asInt());
+}
+
+test "closure cells live inline: upvalue(i) is upvalues[i]" {
+    var proto = Proto{ .code = &.{}, .name = "p" };
+    const cl = try Closure.create(testing.allocator, &proto, 3);
+    defer cl.destroy(testing.allocator);
+    var cells: [3]*Upvalue = undefined;
+    for (&cells, 0..) |*c, k| {
+        c.* = try Upvalue.createClosed(testing.allocator, Value.int(@intCast(k)));
+        cl.upvalues[k] = c.*;
+    }
+    defer for (cells) |c| c.destroy(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), cl.upvalues.len);
+    for (cells, 0..) |c, k| try testing.expectEqual(c, cl.upvalue(k));
 }
 
 fn dummyNative(ctx: *anyopaque, args: []const Value) anyerror!Value {

@@ -184,6 +184,15 @@ cell }` already tracks the slot index, so the pointer is redundant.
   quiescent capture point; the value still rides the captured `stack[]`).
 - **Green because** it's a pure indirection swap over the still-`[]Value` stack.
 
+**Follow-up (2026-10-23, doc 71).** The cell points at its value again,
+with one pointer per lane (`Upvalue.tag`, `Upvalue.payload`), aimed at
+the open slot's lanes or at `loc.closed`. A single `*Value` was what the
+split ruled out; two lane pointers address a split slot fine. `loc` and
+its index stay for every consumer that asks where the value lives;
+`get_upval`/`set_upval` go through the pointers, and `Vm.upvalGet`/
+`upvalSet` are gone (`Upvalue.get`/`set`). The reasoning above held for
+one pointer and is kept as written.
+
 ### Phase 1 — `RegWindow` abstraction routed through cold consumers
 
 Introduce the access seam **before** flipping storage so the flip is localized. Over

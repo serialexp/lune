@@ -25,6 +25,9 @@ instructions, against LuaJIT `-joff`. These are not `@bench` programs, so
   `rawequal`, `slen` (`string.len`), `tonum` (`tonumber` of a decimal
   string) and `selectn` (`select('#', ...)` in a vararg function).
   LuaJIT-compatible.
+- `upvalues.lua`: doc 71's probes: an upvalue read from a closed cell
+  (`ugetc`) and an open one (`ugeto`), and a write to a closed cell from a
+  local (`usetc`). LuaJIT-compatible.
 
 Usage, from the repo root, with a ReleaseFast build (`just release`):
 

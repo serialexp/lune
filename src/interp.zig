@@ -1409,7 +1409,7 @@ pub const Vm = struct {
             }
             const v = switch (seed.kind) {
                 .upvalue_cell, .upvalue_slot_alias => unreachable, // handled above
-                .upvalue => self.upvalGet(closure.upvalues[seed.source]),
+                .upvalue => closure.upvalues[seed.source].get(),
                 .global => self.globals.get(proto.constants[seed.source]),
                 .hash_cell => blk: {
                     // Resolve the loop-invariant value-cell pointer and stash it raw
@@ -1443,7 +1443,7 @@ pub const Vm = struct {
                     if (!callee_val.isHeap() or callee_val.heapType() != .function) break :blk Value.nil();
                     const callee_cl = function.Closure.fromHeader(callee_val.asHeap());
                     if (seed.source >= callee_cl.upvalues.len) break :blk Value.nil();
-                    break :blk self.upvalGet(callee_cl.upvalues[seed.source]);
+                    break :blk callee_cl.upvalues[seed.source].get();
                 },
                 // Doc 43 P4: a global read inside an inlined callee — the name
                 // was copied into the TRACE's const pool at record time (the
@@ -1573,7 +1573,7 @@ pub const Vm = struct {
             }
             const v = switch (seed.kind) {
                 .upvalue_cell, .upvalue_slot_alias => unreachable, // handled above
-                .upvalue => self.upvalGet(closure.upvalues[seed.source]),
+                .upvalue => closure.upvalues[seed.source].get(),
                 .global => self.globals.get(proto.constants[seed.source]),
                 .hash_cell => blk: {
                     const vtab = self.regGet(ctx.base + seed.table_reg);
@@ -1597,7 +1597,7 @@ pub const Vm = struct {
                     if (!callee_val.isHeap() or callee_val.heapType() != .function) break :blk Value.nil();
                     const callee_cl = function.Closure.fromHeader(callee_val.asHeap());
                     if (seed.source >= callee_cl.upvalues.len) break :blk Value.nil();
-                    break :blk self.upvalGet(callee_cl.upvalues[seed.source]);
+                    break :blk callee_cl.upvalues[seed.source].get();
                 },
                 // Doc 43 P4: same as seedTraceInputs's callee_global arm — the
                 // name lives in the trace const pool, resolution is proto-free.
@@ -3981,7 +3981,7 @@ pub const Vm = struct {
             // canonical by construction (§R1).
             const mi = recordingMirrorInstr(st.proto, cur, i);
             const resolved: Value = switch (mi.op) {
-                .get_upval => self.upvalGet(st.closure.upvalues[mi.b]),
+                .get_upval => st.closure.upvalues[mi.b].get(),
                 .get_global => self.globals.get(st.proto.constants[mi.b]),
                 else => Value.nil(),
             };
@@ -8113,7 +8113,7 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                regs.set(instr.a, vm.upvalGet(st.closure.upvalues[instr.b]));
+                regs.set(instr.a, st.closure.upvalue(instr.b).get());
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -8125,8 +8125,9 @@ pub const Vm = struct {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
                 const self = vm;
                 const v = regs.get(instr.a);
-                self.upvalSet(st.closure.upvalues[instr.b], v);
-                self.heap.writeBarrier(&st.closure.upvalues[instr.b].header, v); // no-op until generational
+                const uv = st.closure.upvalue(instr.b);
+                uv.set(v);
+                self.heap.writeBarrier(&uv.header, v); // no-op until generational
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -9641,7 +9642,7 @@ pub const Vm = struct {
         while (k > 0 and items[k - 1].index >= index) : (k -= 1) {
             if (items[k - 1].index == index) return items[k - 1].cell;
         }
-        const cell = try self.heap.newUpvalue(index);
+        const cell = try self.heap.newUpvalue(index, &self.tags[index], &self.payloads[index]);
         try self.appendOpenUpvalue(index, cell);
         return cell;
     }
@@ -9666,24 +9667,6 @@ pub const Vm = struct {
     pub fn clearOpenUpvalues(self: *Vm) void {
         self.open_upvalues.clearRetainingCapacity();
         self.open_upvalue_ceiling = 0;
-    }
-
-    /// Read an upvalue cell's value. Vm-mediated because an *open* cell's value
-    /// lives in the live register stack (the cell holds only the slot index).
-    pub fn upvalGet(self: *const Vm, uv: *const function.Upvalue) Value {
-        return switch (uv.loc) {
-            .open => |index| self.regGet(index),
-            .closed => |v| v,
-        };
-    }
-
-    /// Write an upvalue cell's value. Open ⇒ write through to the live stack slot;
-    /// closed ⇒ update the owned value.
-    pub fn upvalSet(self: *Vm, uv: *function.Upvalue, v: Value) void {
-        switch (uv.loc) {
-            .open => |index| self.regSet(index, v),
-            .closed => uv.loc = .{ .closed = v },
-        }
     }
 
     /// Close (detach) every open upvalue whose slot index is `>= from`: snapshot
