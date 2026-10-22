@@ -739,6 +739,11 @@ button.secondary {
   font-size: 0.8rem;
 }
 
+.replay-nested {
+  font-size: 0.8rem;
+  cursor: help;
+}
+
 .replay-frames {
   font-size: 0.82rem;
   color: var(--muted);

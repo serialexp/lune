@@ -322,25 +322,27 @@ test "doc 56 Phase 2: bit-reverse's while-exit is attachable and resumes after t
                 try testing.expect(bytecode.loopHeaderOf(ins, pc) != p);
             const snap = c.exit_snapshots[c.exitSnapIdx(e).? - 1];
             const b = snap.resume_pc;
-            switch (proto.code[b].op) {
-                .jmp_if_true, .jmp_if_false => {
-                    // A branch resumes at one of its successors, and every
-                    // slot live there was live at the branch, so the
-                    // branch's snapshot covers it.
-                    const target: i64 = @as(i64, b) + 1 + proto.code[b].aux;
-                    try testing.expect(p == b + 1 or p == target);
-                    for (0..proto.num_registers) |r| {
-                        if (proto.reg_live.liveIn(p, @intCast(r)))
-                            try testing.expect(proto.reg_live.liveIn(b, @intCast(r)));
-                    }
-                    // The while's exit edge: its target follows the
-                    // while's backward `jmp`. That is `j = j + k`.
-                    if (p == target and p >= 1 and proto.code[p - 1].op == .jmp and
-                        @as(i64, p) + proto.code[p - 1].aux < p)
-                        after_while += 1;
-                },
+            // A branch's own guard, not an operand guard of a
+            // compare-and-branch (doc 66 P4), which shares its pc.
+            const branch_guard = c.instrs[e].op == .guard_true or c.instrs[e].op == .guard_false;
+            const cb = if (branch_guard) bytecode.condBranchOf(proto.code[b], b) else null;
+            if (cb) |br| {
+                // A branch resumes at one of its successors, and every
+                // slot live there was live at the branch, so the
+                // branch's snapshot covers it.
+                try testing.expect(p == b + 1 or p == br.target);
+                for (0..proto.num_registers) |r| {
+                    if (proto.reg_live.liveIn(p, @intCast(r)))
+                        try testing.expect(proto.reg_live.liveIn(b, @intCast(r)));
+                }
+                // The while's exit edge: its target follows the
+                // while's backward `jmp`. That is `j = j + k`.
+                if (p == br.target and p >= 1 and proto.code[p - 1].op == .jmp and
+                    @as(i64, p) + proto.code[p - 1].aux < p)
+                    after_while += 1;
+            } else {
                 // Every other exit re-executes its own bytecode.
-                else => try testing.expectEqual(b, p),
+                try testing.expectEqual(b, p);
             }
         }
     }
@@ -1973,6 +1975,59 @@ test "doc 61 §5 site 2: the dead-φ filter keeps the φs a composite bridge's c
         }
     };
     try expectProgramTuned(nsieve_src, "4160\n", .{
+        .hotloop = (@import("trace.zig").TraceConfig{}).hotloop,
+        .inspect = Inspect.run,
+    });
+}
+
+test "doc 66 P4: a compare-and-branch is still a composite bridge candidate" {
+    // The sieve with its test written `p[i] == true`: one `jeq_p`, so the
+    // branch guard's source is a compare-and-branch, and it is the same
+    // bridge candidate the `jmp_if_false` of `if p[i]` is, with the same
+    // continue proof across the outer `for_loop` (§6.2).
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode != .record_execute_native) return;
+            const link = @import("trace_link.zig");
+            var crossing: usize = 0;
+            for (vm.trace.registry.cache.items) |t| {
+                for (t.code.exit_prov) |e| {
+                    if (!t.code.isBridgeCandidate(e.index)) continue;
+                    const gp = switch (e.prov) {
+                        .guard => |g| g,
+                        .link_terminal => continue,
+                    };
+                    const code = t.code.anchor.proto.code;
+                    try testing.expect(bytecode.cmpBranchOf(code[gp.source_pc].op) != null);
+                    var walk = CompositeWalk.init(code, gp.source_pc, gp.polarity) orelse continue;
+                    while (walk.current()) |pc| {
+                        if (pc == t.code.anchor.pc or !walk.step()) break;
+                    }
+                    const flp = walk.crossed_for_loop orelse continue;
+                    crossing += 1;
+                    try testing.expect(link.compositeContinueProof(t, e.index, flp));
+                }
+            }
+            try testing.expect(crossing > 0);
+        }
+    };
+    try expectProgramTuned(
+        \\local function nsieve(p, m)
+        \\  for i=2,m do p[i] = true end
+        \\  local count = 0
+        \\  for i=2,m do
+        \\    if p[i] == true then
+        \\      for k=i+i,m,i do p[k] = false end
+        \\      count = count + 1
+        \\    end
+        \\  end
+        \\  return count
+        \\end
+        \\local primes = {}
+        \\local s = 0
+        \\for i=0,2 do s = s + nsieve(primes, 20000 >> i) end
+        \\print(s)
+    , "4160\n", .{
         .hotloop = (@import("trace.zig").TraceConfig{}).hotloop,
         .inspect = Inspect.run,
     });

@@ -36,6 +36,14 @@ P.eqvstr = function(n) local s, x = 0, "y" for i = 1, n do local b = x == "x" s 
 P.eqvnum = function(n) local s = 0 for i = 1, n do local b = i == 7 s = s + i end return s end
 P.eqvreg = function(n) local s, x, y = 0, 1, 2 for i = 1, n do local b = x == y s = s + i end return s end
 P.eqstr = function(n) local s, x = 0, "y" for i = 1, n do if x == "x" then s = 0 end s = s + i end return s end
+-- Doc 66 P4: compare-and-branch against a number constant, on the right
+-- and on the left, in both polarities, over floats, and two registers
+-- for equality.
+P.ifltk = function(n) local s = 0 for i = 1, n do if i < 0 then s = 0 end s = s + i end return s end
+P.ifkge = function(n) local s = 0 for i = 1, n do if 0 >= i then s = 0 end s = s + i end return s end
+P.ifnot = function(n) local s = 0 for i = 1, n do if not (i <= n) then s = 0 end s = s + i end return s end
+P.ifflt = function(n) local s, x, y = 0, 1.5, 0.5 for i = 1, n do if x < y then s = 0 end s = s + i end return s end
+P.ifeq = function(n) local s, x, y = 0, 1, 2 for i = 1, n do if x == y then s = 0 end s = s + i end return s end
 -- One `pairs` step: an n-key hash traversed once per outer iteration.
 P.pairs = function(n)
   local t = {}

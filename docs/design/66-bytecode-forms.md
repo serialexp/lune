@@ -1,7 +1,7 @@
 # 66 — Bytecode forms: constant operands, field ops, compare-and-branch, ITERN
 
-Status: rev 2, partial. The `condBranchOf` refactor, P2, P3 and P5
-landed; P4 and P1 are outstanding, in that order. Round-1 review findings
+Status: rev 2, partial. The `condBranchOf` refactor, P2, P3, P5 and P4
+landed; P1 is outstanding. Round-1 review findings
 (codex and antigravity, §10) are folded in. Bart answered Q1–Q5 (§9) on
 2026-10-22.
 Owner: claude (coral-marten)
@@ -195,6 +195,60 @@ land; move whole phases to Done once everything inside them is checked.
   conditions; no recording aborts at an equality op). Mutation-checked:
   `eq_p`'s false case, `eq_s` identity, `eq_n`'s float lane and its slow
   half, and the recorder's immediate decoding each change it.
+- [x] **P4 — compare-and-branch** (2026-10-22, §5.4, Q3). Twelve
+  opcodes: `jlt`/`jle`/`jgt`/`jge`/`jeq` over two registers, `jlt_k`/
+  `jle_k`/`jgt_k`/`jge_k` against a number K, and `jeq_p`/`jeq_s`/`jeq_n`
+  against a primitive, string or number constant. `a` carries the polarity
+  (`cmp_on_true`) and `cmp_k_left`, `aux` the offset; `~=` is `jeq` with
+  the polarity flipped, and `not (cmp)` flips it as well. `bytecode.cmpBranchOf`
+  decodes them, `cmpBranchOp` is its inverse, and `condBranchOf` reports
+  them as a `.compare` condition (`CondBranch.onFalseCondition`). `if`,
+  `while` and `repeat … until` emit them through `compareBranch`; any
+  other condition keeps `jmp_if_false`. The handlers share the value
+  forms' lanes (`eqLanes`, `eqNumLane`, `orderLanes`), returning a
+  `Lane` enum: the first cut returned `?bool`, which LLVM spilled through
+  the stack, and the value forms lost 3–5 instructions until the enum.
+  The recorder (`recCmpBranch`) emits the compare IR and a `.branch_cond`
+  guard on it (`branchOn`), so the IR is what compare + `jmp_if_*` gave.
+  Per op (`ops3.lua`, 4f08b76 → P4, LuaJIT `-joff` in brackets):
+  `if i > n` 73 → 43 (23), `if x == nil` 67 → 39 (16), `if x == "x"`
+  70 → 40 (19), `if i < 0` 98 → 49 (32), `if 0 >= i` 98 → 49 (32),
+  `if not (i <= n)` 107 → 43 (23), float `if x < y` 74 → 45 (23),
+  `if x == y` 77 → 44 (24); the value forms are unchanged (`x == nil` 33,
+  `i == 7` 42, `x == y` 43, `lt` 39, `eq` 43). `abench.sh` against
+  4f08b76, on the commit content (which bundles coral-raven's doc 68 P1
+  slice 1), tier-0: nsieve-bit-fp −9.8%, recursive-fib −6.4%, pi_leibniz
+  −6.0%, lua54 −1.7%, nsieve-bit −1.6%, scalar −1.6%, binary-trees −1.5%,
+  array3d −1.0%, scimark-fft −0.9%, str_manip −0.8%, euler14-bit −0.6%,
+  str_format −0.3%, scimark-lu −0.1%; compile_multret_chain +0.04%, the
+  rest within ±0.02%. JIT: pi_leibniz −7.9%, nsieve-bit-fp −2.3%, lua54
+  −1.7%, recursive-fib −1.7%, nsieve-bit −1.3%, scimark-fft −1.1%,
+  euler14-bit −0.9%, scimark-lu −0.6%, str_format −0.3%, str_manip −0.2%,
+  binary-trees −0.2%, scimark-sor −0.1%; while_shortcircuit_probe +0.11%
+  (+1.2k instructions on 1.09M with identical tiering, compile cost),
+  compile_multret_chain +0.03%, repack +0.02%. `--dump-aborts` NYI counts
+  unchanged on all 33 programs. Tests: "doc 66 P4: a comparison test
+  compiles to one compare-and-branch" (compiler), "cmpBranchOf and
+  cmpBranchOp are inverses" (bytecode), "a compare-and-branch is its
+  compare followed by the branch" (a matrix over every relation, operand
+  order, polarity and value class, the digest taken on 8eee20c, LuaJIT
+  agreeing on the numeric line), "a compare-and-branch fault names its
+  operands in source order", and "a compare-and-branch is still a
+  composite bridge candidate" (exit side). Mutation-checked: the float
+  lane's strictness, the `>`/`>=` swap, `eq_n`'s mixed lane and slow half,
+  the table-equality lane, the `cmp_k_left` fault order, the compiler's
+  mirrored relation and the recorder's observed outcome each fail a test.
+- [x] **P4's two JIT prerequisites** (beyond the plan, landed first). The
+  first P4 cut left two JIT rows above noise, neither in P4's own code:
+  - nsieve-bit +0.37%: a fused branch's exit-side snapshot re-executes the
+    compare, so the compared temporary stays live past it, operand
+    coalescing failed and the bool spilled. 4744457 lowers a compare read
+    only by the guard after it to `cmp` + `jcc` (`Loc.flags`), as LuaJIT's
+    comparisons are guards; that alone is −12% to −2% JIT across the
+    numeric rows.
+  - binary-trees +0.46%: `hasTrace` missing-key probing in `AnchorMap`,
+    whose walk length moved with the new pc layout. 4f08b76 runs those
+    maps at 50% load (TODO.md, pc layout).
 - [x] **Float text at the extremes** (found by the P3 test, fixed in the
   same change). `print`, `tostring` and `..` rendered a float
   positionally at any magnitude, so `1e308 / 3` ran to 309 digits and
@@ -214,7 +268,13 @@ land; move whole phases to Done once everything inside them is checked.
   to the fix above). Today they are simply not classified. An option is
   to carry the guard's proto in provenance, so a callee's own loop test
   can still be recognised. Not needed for correctness.
-- [ ] **P4 — compare-and-branch** (§5.4).
+- [ ] **Short-circuit conditions** (follow-up to P4). `if a < b and c < d`
+  still compiles each comparison to a temporary and a `jmp_if_*`: fusing
+  each link needs the compiler to emit `and`/`or` as jump lists, as
+  LuaJIT's `bcemit_branch_t`/`bcemit_branch_f` do.
+- [ ] **`not` on a truthiness test** (follow-up to P4). P4 folds `not` into
+  a comparison's polarity only; `if not x` stays `not` + `jmp_if_false`
+  where `jmp_if_true` alone would do.
 - [ ] **Each phase: recorder and JIT parity in the same change** (§6). A
   new op that the recorder aborts on regresses every traced loop that uses
   it.
@@ -691,6 +751,18 @@ a temporary plus `jmp_if_false`/`jmp_if_true`.
   an observed result. Today `recCompare` writes a destination register and
   `recBranch` reads one, and with a fused op `a` becomes the polarity, so
   neither fits as is.
+  As built (2026-10-22). `a`'s bit 0 is the polarity (`cmp_on_true`) and
+  bit 1 `cmp_k_left`: a constant on the left (`0 < x`) compiles to the
+  mirrored relation with the constant on the right (`x > 0`), and the flag
+  exists only so a fault names the operands in source order. Ordered
+  relations get constant forms for numbers only; a string or primitive
+  on one side of `<` uses the register form, which faults or calls
+  `__lt` as before. In `repeat … until cmp` the operands evaluate in the
+  body's scope, which then closes (its `close_upvalues`), and the fused
+  branch jumps back. Exits from the fused guard re-execute the fused op
+  (the exit-side adapter's rule 6), so its operands stay live in those
+  snapshots; the backend's flags compare (4744457) keeps that from
+  costing a register.
 - **Strategy B:** the compare handlers fuse with a following
   `jmp_if_*` on their result (§4.2). There is no JIT change at all. Fusion
   happens only in `.fast` with no live regions.

@@ -1082,9 +1082,7 @@ test "doc 58: a repeat loop anchors at its marker's header and keeps cross-tier 
         try testing.expectEqual(@as(?u32, @intCast(pc + 1)), bc.loopHeaderOf(ins, pc));
         // The closer sits at `E − 1` and jumps back to the marker.
         const closer_pc = bc.loopMarkerExit(ins, pc) - 1;
-        try testing.expectEqual(bc.OpCode.jmp_if_false, code[closer_pc].op);
-        const t: i64 = @as(i64, @intCast(closer_pc)) + 1 + code[closer_pc].aux;
-        try testing.expectEqual(@as(i64, @intCast(pc)), t);
+        try testing.expectEqual(@as(?i64, @intCast(pc)), bc.falseBranchTargetOf(code[closer_pc], closer_pc));
     }
     try testing.expectEqual(@as(usize, 1), markers);
 
@@ -1267,15 +1265,16 @@ test "doc 66 P2: an inlined callee's branch guard is never decoded against the a
     // A guard's source pc lives in the proto it was recorded in: the generic-for
     // iterator below is inlined into main's loop trace, so its wrap test's guard
     // names a pc of the ITERATOR. main's own instruction at that pc is also a
-    // `jmp_if_false` (the two-local prefix puts it there; P3's `add_rk` moved
-    // the iterator's test up one), so decoding the callee's pc against the
+    // `jmp_if_false` (the one-local prefix puts it there; P3's `add_rk` and
+    // P4's compare-and-branch each moved the iterator's test up one), so
+    // decoding the callee's pc against the
     // anchor proto reads a real branch: the wrap exit was routed as a source
     // branch, raised a prime-side want, and unpatched the loop entry on every
     // wrap (array3d after the field forms shortened its iterator by one op).
     // `TraceCode.anchorSourcePc` answers null for any guard at inline depth > 0.
     const gpa = testing.allocator;
     const source =
-        \\local u1, u2 = 1, 2
+        \\local u = 3
         \\local n = 40
         \\local wrap = n and n > 0
         \\local function points(s)
@@ -1294,7 +1293,7 @@ test "doc 66 P2: an inlined callee's branch guard is never decoded against the a
         \\for x, y in points(s) do
         \\  s.sum = s.sum + x * y
         \\end
-        \\print(s.sum, wrap, u1 + u2)
+        \\print(s.sum, wrap, u)
     ;
     inline for (.{ false, true }) |native| {
         var vm = try Vm.init(gpa);

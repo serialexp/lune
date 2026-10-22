@@ -227,8 +227,9 @@ test "doc 57 P3: an unrolled while's mid-trip condition copies owe no resume" {
             try testing.expectEqual(@as(u8, 1), t.code.instunrolled);
             // Doc 58: a `while` condition owes NO flush on any copy (its exit is
             // ordinary), both copies ARE the loop's own test structurally, and
-            // neither needs the `.loop_test_copy` role any more.
-            const lt = loopTests(vm, t, .jmp_if_false);
+            // neither needs the `.loop_test_copy` role any more. `i < n` is
+            // one compare-and-branch (doc 66 P4).
+            const lt = loopTests(vm, t, .jlt);
             try testing.expectEqual(LoopTests{ .flush = 0, .own = 2, .copies = 0, .branch = 0 }, lt);
             try expectNativeHolds(vm, mode, &pin_ops);
         }

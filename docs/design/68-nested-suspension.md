@@ -46,17 +46,41 @@ land; move whole phases to Done once everything inside them is checked.
   `CallFrame`'s free byte at offset 79, so the 80-byte stride holds;
   written by all three push paths (struct literal, inline native push,
   `hostcall_x64.S`); `CF_CTL` in the checked offsets; `opRet` asserts no
-  continuation yet. As landed it cost one instruction per hostcall entry
-  (io_write +0.08% instructions, measured by coral-marten). The follow-up
-  (in the tree, gated, to be committed with doc 66 P5) clears `in_flight`
-  and `ctl` with one 16-bit store in both the `.S` and the inline push,
-  with `ctl` == `in_flight + 1` asserted at comptime and in the `.S`. Moved to P1, where they are first used: the keyframe
+  continuation yet. The io_write +1 instruction/call first blamed on it is
+  an LLVM spill in `nativeIoWrite`: a d0b815e build with P0 backed out
+  shows it too (coral-marten). Still, the follow-up (committed with doc 66
+  P5) clears `in_flight` and `ctl` with one 16-bit store in both the `.S`
+  and the inline push, so `ctl` costs no store of its own. `ctl` ==
+  `in_flight + 1` is asserted at comptime and in the `.S`. Moved to P1, where they are first used: the keyframe
   `FrameRef` fields and format bump, `host_boundary_depth`, the
   `onRetResume` gating and the walkers' kind branches (§4, §9).
-- [ ] **P1 — the boundary guard and native activations.** Q3's policy
-  replaces the asserts and the `.suspended => unreachable` arms, so the UB is
-  gone before anything else lands. The resumable-native protocol, with
-  `pcall`/`xpcall` as its first users (§5, §7.1, §8).
+- [~] **P1 — the boundary guard and native activations.**
+  - [x] **The boundary guard** (2026-10-22). A due suspend waits while
+    `native_reentry_depth > 0` (`Vm.canSuspendHere`, which also holds the
+    existing `reg_top_pending` gate), so the three asserts are gone and the
+    nested `.suspended` arms are unreachable by construction: the trap and
+    the ReleaseFast UB of §1 are fixed. While every re-entry is still a Zig
+    recursion, `native_reentry_depth` is the boundary. `host_boundary_depth`
+    arrives with the first activation that doesn't recurse, so that a
+    converted site becomes stoppable while host functions stay deferred.
+    Each `SafepointLine` records `stoppable` with the same predicate, the
+    viz slider offers only those steps, and `mahina_replay` reports
+    `stopped_at`. `SuspendCtl.index_limit` bounds the index at the replay
+    driver's cap, because a cap that falls in nested code is deferred too.
+    It sits in `SuspendCtl`'s padding: a new `Vm` field reshuffled the
+    asm-visible `Vm` offsets (trace 32 → 16360). Deviation from §8:
+    `setSuspendCtl` inside a host function is not an error, because
+    deferral already makes it harmless. Found on the way: the wasm index
+    pass fed the run VM's effect values, strings and all, to a fresh VM, and
+    a `require` program got no index. It now decodes the encoded log, as
+    `mahina_replay` does. Tests: `interp_replay_test` "doc 68 defer" (every
+    `k` over pcall/xpcall, sort, gsub, `__index`, `__add`: the stop lands on
+    the next stoppable step, can be captured as a keyframe, and resumes to
+    the full run's output; the index limit), plus the viz wasm and store
+    tests. The five `multi-file:` wasm tests pass again.
+  - [ ] The resumable-native protocol, with `pcall`/`xpcall` as its first
+    users (§5, §7.1). This is where `host_boundary_depth` and the keyframe
+    fields of §4.5 land.
 - [ ] **P2 — metamethods.** The shared callable driver; every metamethod
   site in §3, fused reads and stores included, runs as a continuation frame;
   `__call` chains stay bounded (§6).
@@ -64,9 +88,10 @@ land; move whole phases to Done once everything inside them is checked.
   `table.sort`, `gsub`, one per commit (§7.2–§7.5).
 - [ ] **P4 — gates.** Per site: replay-index and `mahina_replay` stops inside
   it (wasm), capture → restore → recapture identity with the replay
-  envelope (§9), GC stress, 8-mode equivalence, the benchmark in §10. The five
-  `multi-file:` tests in `viz/test/wasm.test.ts` go from `test.todo` back
-  to `test` and pass.
+  envelope (§9), GC stress, 8-mode equivalence, the benchmark in §10. The
+  index's unstoppable steps shrink to embedder host frames only, and
+  the viz "steps inside nested calls skipped" note never shows in the wasm
+  playground, which has no embedder.
 
 ## 1. Why this exists
 

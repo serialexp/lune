@@ -399,12 +399,6 @@ test("env/args reads diff as expected nondeterministic divergence, not a real mi
 // relative to the program), and every location the run reports — the fault,
 // the backtrace, the step index, coverage — names its chunk through a proto id
 // that `chunks` maps to a file.
-//
-// `test.todo` until doc 68 (docs/design/68-nested-suspension.md) lands: a
-// wasm run builds its replay index with a suspension armed, and `require`
-// re-enters the VM through `callValue`, which asserts that no suspension is
-// armed. The Debug wasm traps on it (the bug predates multi-file; any pcall
-// traps the same way). Doc 68 P4 turns these back into `test`.
 const MULTI_MAIN = "local m = require('lib.mod')\nlocal f = load('return 7', '=snippet')\nprint(m.sum(300) + f())\nif arg[1] == 'boom' then print(m.boom()) end\n";
 const MULTI_MOD = "local M = {}\nfunction M.sum(n)\n  local s = 0\n  for i = 1, n do s = s + i end\n  return s\nend\nfunction M.boom()\n  return 1 + nope\nend\nreturn M\n";
 const MULTI_FILES = [
@@ -416,7 +410,7 @@ function chunkOf(result: { chunks: { firstProtoId: number; protoCount: number }[
   return result.chunks.findIndex((c) => protoId >= c.firstProtoId && protoId < c.firstProtoId + c.protoCount);
 }
 
-test.todo("multi-file: require runs a passed file, and chunks name every compiled file", () => {
+test("multi-file: require runs a passed file, and chunks name every compiled file", () => {
   const result = mod.runSource(MULTI_MAIN, ["main.mah"], MULTI_FILES);
   expect(result.status).toBe(0);
   expect(result.stdout).toBe("45157\n");
@@ -435,7 +429,7 @@ test.todo("multi-file: require runs a passed file, and chunks name every compile
   expect(result.disasm.some((p) => p.id === last.firstProtoId)).toBe(true);
 });
 
-test.todo("multi-file: a fault in a required file names that file's proto", () => {
+test("multi-file: a fault in a required file names that file's proto", () => {
   const result = mod.runSource(MULTI_MAIN, ["main.mah", "boom"], MULTI_FILES);
   expect(result.status).toBe(1);
   expect(result.errorLine).toBe(8);
@@ -448,7 +442,7 @@ test.todo("multi-file: a fault in a required file names that file's proto", () =
   ]);
 });
 
-test.todo("multi-file: the step index and coverage say which file each line is in", () => {
+test("multi-file: the step index and coverage say which file each line is in", () => {
   const result = mod.runSource(MULTI_MAIN, ["main.mah"], MULTI_FILES);
   expect(result.safepointProtos.length).toBe(result.safepointLines.length);
   const files = new Set(Array.from(result.safepointProtos, (id) => chunkOf(result, id)));
@@ -464,21 +458,65 @@ test.todo("multi-file: the step index and coverage say which file each line is i
   expect(cov.anchors.every((a) => chunkOf(result, a.proto_id) === 1)).toBe(true);
 });
 
-test.todo("multi-file: a required file that isn't there is an error, not a host read", () => {
+test("multi-file: a required file that isn't there is an error, not a host read", () => {
   const result = mod.runSource("require('missing')\n", ["main.mah"], []);
   expect(result.status).toBe(1);
   expect(result.diagnostics).toContain("missing");
 });
 
-test.todo("multi-file: replay re-reads the required file from the recorded effects", () => {
+test("multi-file: replay re-reads the required file from the recorded effects", () => {
   const run = mod.runSource(MULTI_MAIN, ["main.mah"], MULTI_FILES);
   // No files are passed to replay: the reads come back out of the effect log.
   const whole = mod.replay(MULTI_MAIN, run.effects, run.safepointCount + 1);
   expect(whole.stdout).toBe("45157\n");
-  // A step inside the module reports a proto of the module.
-  const k = Array.from(run.safepointProtos).findIndex((id) => chunkOf(run, id) === 1);
+  // A stoppable step inside the module (in `M.sum`, which main calls)
+  // reports a proto of the module.
+  const k = Array.from(run.safepointProtos).findIndex((id, i) => chunkOf(run, id) === 1 && run.safepointStoppable[i] === 1);
   expect(k).toBeGreaterThanOrEqual(0);
   const step = mod.replay(MULTI_MAIN, run.effects, k + 1);
+  expect(step.stoppedAt).toBe(k + 1);
   expect(chunkOf(run, step.protoId)).toBe(1);
   expect(step.currentLine).toBe(run.safepointLines[k]);
+});
+
+// Doc 68 §8 (defer): the module's top level runs inside `require`, which
+// re-enters the VM from Zig, so a replay cannot stop there yet. The index says
+// so, and a stop asked for there lands on the next stoppable step, back in main.
+test("multi-file: a stop inside require's run of the module is deferred to the next stoppable step", () => {
+  const run = mod.runSource(MULTI_MAIN, ["main.mah"], MULTI_FILES);
+  const stoppable = Array.from(run.safepointStoppable);
+  const k = stoppable.findIndex((f, i) => f === 0 && chunkOf(run, run.safepointProtos[i]) === 1);
+  expect(k).toBeGreaterThanOrEqual(0);
+  const next = stoppable.findIndex((f, i) => i > k && f === 1);
+  expect(next).toBeGreaterThan(k);
+  const step = mod.replay(MULTI_MAIN, run.effects, k + 1);
+  expect(step.status).toBe(0);
+  expect(step.finished).toBe(false);
+  expect(step.stoppedAt).toBe(next + 1);
+  expect(chunkOf(run, step.protoId)).toBe(chunkOf(run, run.safepointProtos[next]));
+  expect(step.currentLine).toBe(run.safepointLines[next]);
+});
+
+// The other re-entry sites the VM owns: Run no longer traps on any of them, and
+// every step the index offers is one a replay stops at exactly.
+test("nested code (pcall, sort, gsub, metamethods): every stoppable step replays to itself", () => {
+  const src = [
+    "print(pcall(function(x) return x * 2 end, 21))",
+    "print(xpcall(function() return nil + 1 end, function(e) return 'handled' end))",
+    "local t = {5, 3, 9, 1}",
+    "table.sort(t, function(a, b) return a > b end)",
+    "print(table.concat(t, ','))",
+    "print((string.gsub('a1b22', '%d+', function(d) return '<' .. #d .. '>' end)))",
+    "local o = setmetatable({}, { __index = function(_, k) return k end, __add = function() return 42 end })",
+    "print(o.hi, o + 1)",
+  ].join("\n") + "\n";
+  const run = mod.runSource(src);
+  expect(run.status).toBe(0);
+  expect(run.stdout).toBe("true\t42\nfalse\thandled\n9,5,3,1\na<1>b<2>\nhi\t42\n");
+  expect(run.safepointStoppable.includes(0)).toBe(true);
+  for (let k = 1; k <= run.safepointCount; k++) {
+    if (run.safepointStoppable[k - 1] !== 1) continue;
+    expect(mod.replay(src, run.effects, k).stoppedAt).toBe(k);
+  }
+  expect(mod.replay(src, run.effects, run.safepointCount + 1).stdout).toBe(run.stdout);
 });

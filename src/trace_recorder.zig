@@ -1599,6 +1599,7 @@ pub const RecordingSession = struct {
             // abort LINNER. Otherwise it records nothing.
             .loop => try self.recLoopLink(instr, regs, proto, pc),
             .jmp_if_false, .jmp_if_true => try self.recBranch(instr, regs, proto, pc),
+            .jlt, .jle, .jgt, .jge, .jeq, .jlt_k, .jle_k, .jgt_k, .jge_k, .jeq_p, .jeq_s, .jeq_n => try self.recCmpBranch(instr, regs, proto, pc),
             .for_loop => try self.recForLoop(instr, regs, pc),
             // Doc 30 c4: the generic-for back-edge — mirrors the CONTINUE
             // direction (first loop var non-nil → publish it as ctrl).
@@ -2232,14 +2233,25 @@ pub const RecordingSession = struct {
         self.setReg(instr.a, r);
     }
 
+    /// `lt`/`le`/`gt`/`ge` into `R[a]`.
     pub fn recCompare(self: *RecordingSession, op: IrOp, swap: bool, instr: Instr, regs: RegWindow) !void {
-        const vb = regs.get(instr.b);
-        const vc = regs.get(instr.c);
-        if (!vb.isNumber() or !vc.isNumber()) return self.abort(.bad_type);
-        var rb = try self.refOf(instr.b);
-        var rc = try self.refOf(instr.c);
-        try self.guardNum(rb, vb, .operand_type, .b);
-        try self.guardNum(rc, vc, .operand_type, .c);
+        const f: BinaryFrame = .{ .dst = instr.a, .lhs = .{ .reg = instr.b }, .rhs = .{ .reg = instr.c }, .lhs_od = .b, .rhs_od = .c };
+        if (try self.compareRef(op, swap, f, regs)) |r| self.setReg(instr.a, r);
+    }
+
+    /// The IR value of `lt`/`le` over `f`'s operands, swapped for `gt`/`ge`
+    /// (`f.dst` unused), or null after an abort. Numbers only.
+    fn compareRef(self: *RecordingSession, op: IrOp, swap: bool, f: BinaryFrame, regs: RegWindow) !?Ref {
+        const vb = operandValue(regs, f.lhs);
+        const vc = operandValue(regs, f.rhs);
+        if (!vb.isNumber() or !vc.isNumber()) {
+            self.abort(.bad_type);
+            return null;
+        }
+        var rb = try self.operandRef(f.lhs);
+        var rc = try self.operandRef(f.rhs);
+        try self.guardNum(rb, vb, .operand_type, f.lhs_od);
+        try self.guardNum(rc, vc, .operand_type, f.rhs_od);
         // Native exact mixed int/float comparison cannot round the int through f64
         // (`compareIntFloat` deliberately does not). When the observed float is
         // integral, narrow only that operand and compare two ints. A later
@@ -2247,18 +2259,48 @@ pub const RecordingSession = struct {
         // and tier-0 replays with the full exact mixed-number semantics.
         if (vb.isInt() and vc.isFloat() and value.floatAsExactInt(vc.asFloat()) != null) {
             rc = try self.emit(.{ .op = .int_of_float, .a = rc, .ty = .int });
-            self.stampProv(rc, .operand_int, .c, .neutral);
+            self.stampProv(rc, .operand_int, f.rhs_od, .neutral);
         } else if (vb.isFloat() and vc.isInt() and value.floatAsExactInt(vb.asFloat()) != null) {
             rb = try self.emit(.{ .op = .int_of_float, .a = rb, .ty = .int });
-            self.stampProv(rb, .operand_int, .b, .neutral);
+            self.stampProv(rb, .operand_int, f.lhs_od, .neutral);
         }
         if (swap) {
             const t = rb;
             rb = rc;
             rc = t;
         }
-        const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
-        self.setReg(instr.a, r);
+        return try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
+    }
+
+    /// Doc 66 P4: a compare-and-branch, recorded as the value form and the
+    /// branch it replaced: the comparison's IR (`compareRef`/`eqRef`), then
+    /// the branch guard on it (`branchOn`), with the outcome the operands
+    /// give now, which is the one tier-0 is about to act on.
+    fn recCmpBranch(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32) !void {
+        const form = bytecode.cmpBranchOf(instr.op).?;
+        const rhs: Operand = if (bytecode.cmpConstant(instr, proto)) |k| .{ .konst = k } else .{ .reg = instr.c };
+        const f: BinaryFrame = .{ .dst = 0, .lhs = .{ .reg = instr.b }, .rhs = rhs, .lhs_od = .b, .rhs_od = .c };
+        const vb = operandValue(regs, f.lhs);
+        const vc = operandValue(regs, f.rhs);
+        const holds: bool, const ref_or_abort: ?Ref = switch (form.rel) {
+            .eq => blk: {
+                // Two distinct tables may have `__eq`, whose answer the
+                // recorder cannot see. `eqRef` aborts them unless both fold
+                // to constants; refuse them here outright.
+                if (vb.isHeap() and vb.heapType() == .table and vc.isHeap() and vc.heapType() == .table and !vb.eql(vc)) {
+                    self.abort(.bad_type);
+                    return;
+                }
+                break :blk .{ vb.eql(vc), try self.eqRef(.eq, f, regs) };
+            },
+            // Numbers only past `compareRef`, which `arith` orders exactly.
+            .lt => .{ arith.lt(vb, vc) catch false, try self.compareRef(.lt, false, f, regs) },
+            .le => .{ arith.le(vb, vc) catch false, try self.compareRef(.le, false, f, regs) },
+            .gt => .{ arith.lt(vc, vb) catch false, try self.compareRef(.lt, true, f, regs) },
+            .ge => .{ arith.le(vc, vb) catch false, try self.compareRef(.le, true, f, regs) },
+        };
+        const r = ref_or_abort orelse return;
+        try self.branchOn(r, holds, bytecode.condBranchOf(instr, pc - 1).?, proto, pc);
     }
 
     // --- index-recording shapes (doc 23 D3) --------------------------------
@@ -3365,9 +3407,15 @@ pub const RecordingSession = struct {
         }
     }
 
-    /// `eq`/`ne`. First cut: numeric operands only (the common loop-condition
-    /// case); other types abort.
+    /// `eq`/`ne` into `f.dst`.
     pub fn recEq(self: *RecordingSession, op: IrOp, f: BinaryFrame, regs: RegWindow) !void {
+        if (try self.eqRef(op, f, regs)) |r| self.setReg(f.dst, r);
+    }
+
+    /// The IR value of `eq`/`ne` over `f`'s operands (`f.dst` unused), or
+    /// null after an abort. Numbers, booleans, and folds of constants and of
+    /// operands of differing types; other types abort.
+    fn eqRef(self: *RecordingSession, op: IrOp, f: BinaryFrame, regs: RegWindow) !?Ref {
         const vb = operandValue(regs, f.lhs);
         const vc = operandValue(regs, f.rhs);
         // Doc 57: value-specialize nil/bool inputs first, so a pinned input
@@ -3385,8 +3433,7 @@ pub const RecordingSession = struct {
         // the whole test — vanishes from the trace body.
         if (self.konstValueOf(rb)) |kb| if (self.konstValueOf(rc)) |kc| {
             const equal = kb.eql(kc);
-            self.setReg(f.dst, try self.konst(Value.boolean(if (op == .eq) equal else !equal)));
-            return;
+            return try self.konst(Value.boolean(if (op == .eq) equal else !equal));
         };
         if (!vb.isNumber() or !vc.isNumber()) {
             // Doc 57: two booleans whose types are both proven (a konst, or a
@@ -3394,11 +3441,8 @@ pub const RecordingSession = struct {
             // field) compare by value on every tier; native lowers it as the
             // int compare of the 0/1 payloads. (Untyped inputs were pinned to
             // konsts above, so any other bool ref here is a typed producer.)
-            if (vb.isBool() and vc.isBool() and self.boolTyped(rb) and self.boolTyped(rc)) {
-                const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
-                self.setReg(f.dst, r);
-                return;
-            }
+            if (vb.isBool() and vc.isBool() and self.boolTyped(rb) and self.boolTyped(rc))
+                return try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
             // Cross-type fold — the `x == nil` idiom. Lua equality across
             // distinct type classes is unconditionally false (`__eq` only fires
             // table×table / userdata×userdata, never number×anything-else), and
@@ -3416,15 +3460,14 @@ pub const RecordingSession = struct {
             if (b_pinned and c_pinned and !same_class) {
                 if (vb.isNumber() and self.konstValueOf(rb) == null) try self.guardNum(rb, vb, .operand_type, f.lhs_od);
                 if (vc.isNumber() and self.konstValueOf(rc) == null) try self.guardNum(rc, vc, .operand_type, f.rhs_od);
-                self.setReg(f.dst, try self.konst(Value.boolean(op == .ne)));
-                return;
+                return try self.konst(Value.boolean(op == .ne));
             }
-            return self.abort(.bad_type);
+            self.abort(.bad_type);
+            return null;
         }
         try self.guardNum(rb, vb, .operand_type, f.lhs_od);
         try self.guardNum(rc, vc, .operand_type, f.rhs_od);
-        const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
-        self.setReg(f.dst, r);
+        return try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
     }
 
     /// `jmp_if_false`/`jmp_if_true`: pin the *observed* truthiness of the tested
@@ -3434,7 +3477,26 @@ pub const RecordingSession = struct {
         // `pc` is the post-increment cursor, as in applyJump.
         const cb = bytecode.condBranchOf(instr, pc - 1).?;
         std.debug.assert(cb.cond == .truthy);
-        const truthy_early = regs.get(instr.a).isTruthy();
+        const v = regs.get(instr.a);
+        if (self.leavesAnchorLoop(cb, v.isTruthy(), proto, pc)) return self.abort(.loop_leave);
+        // Doc 57: a nil/bool input is value-specialized first (its strict pin
+        // is the only guard left), so the konst fold below removes the branch
+        // — LuaJIT's "type specialization suffices" for BC_IST/BC_ISF.
+        const ra_raw = try self.refOf(instr.a);
+        const ra = (try self.pinPrim(ra_raw, v, .a)) orelse ra_raw;
+        try self.branchGuard(ra, v.isTruthy(), cb);
+    }
+
+    /// Doc 66 P4: the branch half of a compare-and-branch, on the
+    /// comparison's IR value `ref`, which the operands' outcome `holds`.
+    fn branchOn(self: *RecordingSession, ref: Ref, holds: bool, cb: bytecode.CondBranch, proto: *const Proto, pc: u32) !void {
+        if (self.leavesAnchorLoop(cb, holds, proto, pc)) return self.abort(.loop_leave);
+        try self.branchGuard(ref, holds, cb);
+    }
+
+    /// Whether the branch `cb` at `pc − 1`, whose test came out `holds`, is
+    /// the anchor loop's own exit taken by a root recording.
+    fn leavesAnchorLoop(self: *const RecordingSession, cb: bytecode.CondBranch, holds: bool, proto: *const Proto, pc: u32) bool {
         // Doc 38 LLEAVE (LuaJIT `rec_loop_interp`): a ROOT trace anchored at a
         // loop header "must loop back to form a root trace". If this branch is
         // the anchor loop's OWN exit edge and tier-0 took the exit direction,
@@ -3447,7 +3509,7 @@ pub const RecordingSession = struct {
         if (self.kind == .root and self.inline_depth == 0 and
             self.anchor.proto == proto)
         {
-            const jumped = cb.jumpsOn(truthy_early);
+            const jumped = cb.jumpsOn(holds);
             const target_i = cb.target;
             if (target_i >= 0 and target_i < @as(i64, @intCast(proto.code.len))) {
                 const target: u32 = @intCast(target_i);
@@ -3465,23 +3527,23 @@ pub const RecordingSession = struct {
                     if (jumped and pc < proto.code.len and
                         bytecode.loopHeaderOf(proto.code[pc], pc) == self.anchor.pc)
                     {
-                        return self.abort(.loop_leave);
+                        return true;
                     }
-                } else if (!cb.on_true and !jumped and
+                } else if (cb.onFalseCondition() and !jumped and
                     bytecode.loopHeaderOf(proto.code[target], target) == self.anchor.pc)
                 {
                     // `repeat`: the backward branch on a false condition
                     // targets our marker, and falling through leaves the loop.
-                    return self.abort(.loop_leave);
+                    return true;
                 }
             }
         }
-        // Doc 57: a nil/bool input is value-specialized first (its strict pin
-        // is the only guard left), so the konst fold below removes the branch
-        // — LuaJIT's "type specialization suffices" for BC_IST/BC_ISF.
-        const ra_raw = try self.refOf(instr.a);
-        const ra = (try self.pinPrim(ra_raw, regs.get(instr.a), .a)) orelse ra_raw;
-        const truthy = truthy_early;
+        return false;
+    }
+
+    /// Guard the branch `cb` on `ra`, whose test came out `truthy` on the
+    /// recorded path, stamped with the CFG edge that path took.
+    fn branchGuard(self: *RecordingSession, ra: Ref, truthy: bool, cb: bytecode.CondBranch) !void {
         // Fold statically-decided branches (doc 30 c5): a konst's truthiness is
         // fixed forever, and a proven-string producer result (`scap_str`,
         // `tostr_*`, the snew class) is ALWAYS truthy — only nil/false are

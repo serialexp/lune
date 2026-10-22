@@ -28,6 +28,7 @@ import {
   closeFile,
   filePathProblem,
   resolveRunFiles,
+  buildStops,
   projectWorkspace,
   DEFAULT_PATH,
   DEFAULT_SOURCE,
@@ -260,4 +261,23 @@ test("setScriptArgs updates the raw args string", () => {
   expect(state.scriptArgs).toBe("9");
   setScriptArgs("");
   expect(state.scriptArgs).toBe("");
+});
+
+test("buildStops offers only stoppable steps, and one per line", () => {
+  // Steps 1..6: line 1 (stoppable), line 5 of another file ×2 (nested, inside
+  // a `require`), line 2 ×2 (the first one still nested), line 3.
+  const index = {
+    count: 6,
+    lines: new Uint32Array([1, 5, 5, 2, 2, 3]),
+    protos: new Uint32Array([0, 9, 9, 0, 0, 0]),
+    stoppable: new Uint8Array([1, 0, 0, 0, 1, 1]),
+  };
+  const fileKey = (id: number) => (id === 9 ? 1 : 0);
+  expect(buildStops("instr", index, fileKey)).toEqual([1, 5, 6, 7]);
+  // Line 5 has no stoppable step, so no stop; line 2 stops at its first
+  // stoppable step (5), not at the nested 4.
+  expect(buildStops("line", index, fileKey)).toEqual([1, 5, 6, 7]);
+  // With every step stoppable, a line stop is the line's first step.
+  expect(buildStops("line", { ...index, stoppable: new Uint8Array(6).fill(1) }, fileKey)).toEqual([1, 2, 4, 6, 7]);
+  expect(buildStops("instr", { ...index, count: 0 }, fileKey)).toEqual([]);
 });

@@ -188,9 +188,10 @@ const Result = extern struct {
     /// silent); 0 otherwise.
     safepoint_capped: u32 = 0,
     /// Line-per-safepoint index for line-grain stepping: a blob of `safepoint_count`
-    /// little-endian `{u32 proto_id, u32 line}` pairs, where entry k is the
-    /// instruction pending at safepoint k+1 (its 1-based source line, and the
-    /// proto that names the file the line is in — see `chunks`). Empty when
+    /// little-endian `{u32 proto_id, u32 line, u32 flags}` triples, where entry k
+    /// is the instruction pending at safepoint k+1 (its 1-based source line, and
+    /// the proto that names the file the line is in — see `chunks`). Flags bit 0:
+    /// a replay can stop there (see `Vm.SafepointLine.stoppable`). Empty when
     /// `safepoint_count == 0`.
     safepoint_lines: Buf = .{},
     /// Static disassembly of every proto in this program (the bytecode view the
@@ -272,6 +273,12 @@ const ReplayResult = extern struct {
     /// Appended last so prior JS field offsets stay stable.
     proto_id: u32 = 0,
     pc: u32 = 0,
+    /// The safepoint the replay actually stopped at (`safepoint_seq`), 0 when
+    /// finished. It equals `stop_after` for a step the index marks
+    /// stoppable. A step inside nested code (a native running mahina code
+    /// through a Zig re-entry) is not, and a stop asked for there lands at
+    /// the first stoppable step after it (doc 68 §8).
+    stopped_at: u32 = 0,
 };
 
 /// Wrap an owned byte slice as a `Buf` (transfers ownership to JS; freed by
@@ -542,6 +549,7 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
             const proto = frame.closure.proto;
             res.proto_id = proto.id;
             res.pc = @intCast(frame.pc);
+            res.stopped_at = @intCast(vm.safepoint_seq);
             if (frame.pc < proto.spans.len) {
                 const span = proto.spans[frame.pc];
                 res.current_line = span.line;
@@ -785,7 +793,8 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8, files_blob: []co
     // --- collect artifacts (all owned []u8, mirroring the emit* helpers) ---
     res.stdout = bufFromSlice(try gpa.dupe(u8, sink.buffered()));
     res.keyframe = bufFromSlice(try mahina.keyframeser.encodeSnapshot(gpa, &vm));
-    res.effects = bufFromSlice(try mahina.effectser.encodeFile(gpa, vm.effect_log.items));
+    const encoded_effects = try mahina.effectser.encodeFile(gpa, vm.effect_log.items);
+    res.effects = bufFromSlice(encoded_effects);
     res.trace = bufFromSlice(try vm.trace.encodeTraceFile(gpa));
     res.exec_log = bufFromSlice(try mahina.execlogser.encodeFile(gpa, vm.trace.exec_logs.items));
     res.coverage = bufFromSlice(try mahina.coverageser.encodeState(gpa, &vm.trace));
@@ -797,8 +806,10 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8, files_blob: []co
     // (a hot-traced run would batch iterations and skip them). Best-effort: a
     // failure here just leaves `safepoint_count == 0` (no replay offered); the
     // run itself already succeeded. The proto is immutable, so re-running it on a
-    // fresh VM is sound; `vm` is still alive (its `effect_log` is the input).
-    buildReplayIndex(res, chunk.proto, vm.effect_log.items);
+    // fresh VM is sound. The input is the encoded effect log, as `mahina_replay`
+    // gets it: decoding re-interns its strings (a `file_read` result, `getenv`)
+    // into the index VM's own heap, where the run VM's values don't belong.
+    buildReplayIndex(res, chunk.proto, encoded_effects);
 
     // Disassemble every proto once for the step-replay bytecode view. The proto
     // tree is static and its ids are stable across compiles (deterministic
@@ -857,14 +868,14 @@ fn buildChunksBlob(root: *const mahina.bytecode.Proto, vm: *const mahina.interp.
 const safepoint_cap: u64 = 1_000_000;
 
 /// Populate `res.safepoint_count` / `safepoint_capped` / `safepoint_lines` by
-/// replaying `effects` through a fresh pure-tier-0 VM with the safepoint-line
-/// recorder on. Best-effort — swallows errors (the replay affordance is simply
-/// absent on failure).
-fn buildReplayIndex(res: *Result, proto: *const mahina.bytecode.Proto, effects: []const mahina.interp.Effect) void {
-    buildReplayIndexInner(res, proto, effects) catch {};
+/// replaying the encoded effect log `eff_bytes` through a fresh pure-tier-0 VM
+/// with the safepoint-line recorder on. Best-effort — swallows errors (the
+/// replay affordance is simply absent on failure).
+fn buildReplayIndex(res: *Result, proto: *const mahina.bytecode.Proto, eff_bytes: []const u8) void {
+    buildReplayIndexInner(res, proto, eff_bytes) catch {};
 }
 
-fn buildReplayIndexInner(res: *Result, proto: *const mahina.bytecode.Proto, effects: []const mahina.interp.Effect) !void {
+fn buildReplayIndexInner(res: *Result, proto: *const mahina.bytecode.Proto, eff_bytes: []const u8) !void {
     var vm = try mahina.interp.Vm.init(gpa);
     defer vm.deinit();
 
@@ -875,11 +886,17 @@ fn buildReplayIndexInner(res: *Result, proto: *const mahina.bytecode.Proto, effe
     vm.out = &sink;
 
     vm.effect_mode = .replay;
-    try vm.effect_log.appendSlice(gpa, effects);
+    if (eff_bytes.len > 0) {
+        const effects = try mahina.effectser.decodeFile(gpa, vm.heap, eff_bytes);
+        defer gpa.free(effects);
+        try vm.effect_log.appendSlice(gpa, effects);
+    }
     vm.setRecordSafepointLines(true);
     // Arm a suspend at the cap: if the program needs more safepoints than the cap,
-    // we stop there (capped) instead of building an unbounded index.
-    vm.setSuspendCtl(.{ .after_safepoints = safepoint_cap });
+    // we stop there (capped) instead of building an unbounded index. A cap that
+    // falls inside nested code is deferred until it returns (doc 68 §8), so the
+    // index itself is limited to the cap as well.
+    vm.setSuspendCtl(.{ .after_safepoints = safepoint_cap, .index_limit = @intCast(safepoint_cap) });
 
     const outcome = try vm.start(proto);
     res.safepoint_capped = if (outcome == .suspended) 1 else 0;
@@ -888,13 +905,14 @@ fn buildReplayIndexInner(res: *Result, proto: *const mahina.bytecode.Proto, effe
 }
 
 /// Serialize the safepoint line index as flat little-endian `{u32 proto_id,
-/// u32 line}` pairs. Empty → empty.
+/// u32 line, u32 flags}` triples; flags bit 0 is `stoppable`. Empty → empty.
 fn encodeSafepointLines(points: []const mahina.interp.Vm.SafepointLine) ![]u8 {
     if (points.len == 0) return &[_]u8{};
-    const bytes = try gpa.alloc(u8, points.len * 8);
+    const bytes = try gpa.alloc(u8, points.len * 12);
     for (points, 0..) |sp, i| {
-        std.mem.writeInt(u32, bytes[i * 8 ..][0..4], sp.proto_id, .little);
-        std.mem.writeInt(u32, bytes[i * 8 + 4 ..][0..4], sp.line, .little);
+        std.mem.writeInt(u32, bytes[i * 12 ..][0..4], sp.proto_id, .little);
+        std.mem.writeInt(u32, bytes[i * 12 + 4 ..][0..4], sp.line, .little);
+        std.mem.writeInt(u32, bytes[i * 12 + 8 ..][0..4], @intFromBool(sp.stoppable), .little);
     }
     return bytes;
 }

@@ -373,6 +373,13 @@ const Compiler = struct {
         self.code.items[jump_index].aux = @intCast(target - after_jump);
     }
 
+    /// Point a previously-emitted jump at the instruction at `target_index`.
+    fn patchJumpTo(self: *Compiler, jump_index: usize, target_index: usize) void {
+        const target: i64 = @intCast(target_index);
+        const after_jump: i64 = @intCast(jump_index + 1);
+        self.code.items[jump_index].aux = @intCast(target - after_jump);
+    }
+
     /// Emit a jump whose target is an already-emitted instruction (back-edge).
     fn emitJumpTo(self: *Compiler, op: OpCode, reg: u16, target_index: usize) Error!void {
         const this_index: i64 = @intCast(self.code.items.len);
@@ -1099,15 +1106,117 @@ const Compiler = struct {
         self.freeTo(mark);
     }
 
+    /// Doc 66 P4: a condition that is a comparison, under any parentheses
+    /// and `not`s; `negated` when an odd number of `not`s wrap it.
+    const Comparison = struct {
+        op: ast.BinaryOp,
+        lhs: *const ast.Expr,
+        rhs: *const ast.Expr,
+        negated: bool,
+    };
+
+    fn comparisonOf(cond: *const ast.Expr) ?Comparison {
+        var e = cond;
+        var negated = false;
+        while (true) switch (e.data) {
+            .paren => |inner| e = inner,
+            .unary => |u| {
+                if (u.op != .not) return null;
+                e = u.operand;
+                negated = !negated;
+            },
+            .binary => |b| return switch (b.op) {
+                .lt, .le, .gt, .ge, .eq, .ne => .{ .op = b.op, .lhs = b.lhs, .rhs = b.rhs, .negated = negated },
+                else => null,
+            },
+            else => return null,
+        };
+    }
+
+    /// Emit the branch an `if` or `while` test compiles to, jumping when
+    /// `cond` is false, and return its index for patching: one
+    /// compare-and-branch for a comparison, else a `jmp_if_false` on the
+    /// condition's value.
+    fn emitFalseBranch(self: *Compiler, cond: *const ast.Expr) Error!usize {
+        const mark = self.next_reg;
+        defer self.freeTo(mark); // condition temps are dead after the test
+        if (try self.compareBranch(cond, false)) |ins| return self.emit(ins);
+        const cr = try self.operandReg(cond);
+        return self.emitJump(.jmp_if_false, cr);
+    }
+
+    /// Doc 66 P4: evaluate a comparison condition's operands, and return the
+    /// compare-and-branch that jumps when the condition's truth is
+    /// `jump_when` (its offset still 0); null, emitting nothing, when `cond`
+    /// is not a comparison. The operands are evaluated as `compileBinary`
+    /// evaluates them, and a literal takes the constant forms the value
+    /// forms take: any literal for `==`/`~=`, a number for an ordered
+    /// relation, on either side. The caller frees the temporaries.
+    fn compareBranch(self: *Compiler, cond: *const ast.Expr, jump_when: bool) Error!?Instr {
+        const cmp = comparisonOf(cond) orelse return null;
+        const holds = jump_when != cmp.negated;
+        const op_span: ast.Span = .{ .start = cmp.lhs.span.start, .end = cmp.rhs.span.end };
+        if (cmp.op == .eq or cmp.op == .ne) {
+            // `~=` is `==` with the opposite polarity.
+            const on_true = holds != (cmp.op == .ne);
+            const a: u16 = if (on_true) bytecode.cmp_on_true else 0;
+            var reg_side = cmp.lhs;
+            const ko = if (try self.eqConstantOperand(.eq, cmp.rhs)) |k| k else if (try self.eqConstantOperand(.eq, cmp.lhs)) |k| blk: {
+                reg_side = cmp.rhs;
+                break :blk k;
+            } else null;
+            if (ko) |k| {
+                const t = try self.operandReg(reg_side);
+                self.cur_span = op_span;
+                const op = bytecode.cmpBranchOp(.eq, bytecode.eqFormOf(k.op).?.rhs).?;
+                return Instr{ .op = op, .a = a, .b = t, .c = k.k };
+            }
+            const t1 = try self.operandRegBefore(cmp.lhs, cmp.rhs);
+            const t2 = try self.operandReg(cmp.rhs);
+            self.cur_span = op_span;
+            return Instr{ .op = .jeq, .a = a, .b = t1, .c = t2 };
+        }
+        const rel: bytecode.CmpRel = switch (cmp.op) {
+            .lt => .lt,
+            .le => .le,
+            .gt => .gt,
+            .ge => .ge,
+            else => unreachable,
+        };
+        const on: u16 = if (holds) bytecode.cmp_on_true else 0;
+        if (numberLiteral(cmp.rhs)) |v| {
+            const k = try self.addConstant(v);
+            const t = try self.operandReg(cmp.lhs);
+            self.cur_span = op_span;
+            return Instr{ .op = bytecode.cmpBranchOp(rel, .num).?, .a = on, .b = t, .c = k };
+        }
+        if (numberLiteral(cmp.lhs)) |v| {
+            // `K < x` is `x > K`: the same comparison of the same operands
+            // (`>` is `<` swapped), so only the fault text needs the order.
+            const mirrored: bytecode.CmpRel = switch (rel) {
+                .lt => .gt,
+                .le => .ge,
+                .gt => .lt,
+                .ge => .le,
+                .eq => unreachable,
+            };
+            const k = try self.addConstant(v);
+            const t = try self.operandReg(cmp.rhs);
+            self.cur_span = op_span;
+            return Instr{ .op = bytecode.cmpBranchOp(mirrored, .num).?, .a = on | bytecode.cmp_k_left, .b = t, .c = k };
+        }
+        const t1 = try self.operandRegBefore(cmp.lhs, cmp.rhs);
+        const t2 = try self.operandReg(cmp.rhs);
+        self.cur_span = op_span;
+        return Instr{ .op = bytecode.cmpBranchOp(rel, .reg).?, .a = on, .b = t1, .c = t2 };
+    }
+
     fn compileIf(self: *Compiler, f: anytype) Error!void {
         var end_jumps: std.ArrayList(usize) = .empty;
         defer end_jumps.deinit(self.scratch);
 
         for (f.branches) |br| {
-            const mark = self.next_reg;
-            const cr = try self.operandReg(br.cond);
-            const skip = try self.emitJump(.jmp_if_false, cr);
-            self.freeTo(mark); // condition temp is dead after the test
+            const skip = try self.emitFalseBranch(br.cond);
 
             self.beginScope();
             try self.compileBlock(br.body);
@@ -1129,10 +1238,7 @@ const Compiler = struct {
     fn compileWhile(self: *Compiler, w: anytype) Error!void {
         const loop_top = self.code.items.len;
 
-        const mark = self.next_reg;
-        const cr = try self.operandReg(w.cond);
-        const exit = try self.emitJump(.jmp_if_false, cr);
-        self.freeTo(mark);
+        const exit = try self.emitFalseBranch(w.cond);
         // Doc 58: the loop marker (LuaJIT `BC_LOOP`) sits right after the
         // condition, so the body starts at `marker + 1`.
         const marker = try self.emit(.{ .op = .loop, .b = @intFromEnum(bytecode.LoopKind.while_loop) });
@@ -1167,21 +1273,40 @@ const Compiler = struct {
         const marker = try self.emit(.{ .op = .loop, .b = @intFromEnum(bytecode.LoopKind.repeat_loop) });
         const loop_top = marker;
 
-        const cr = try self.alloc1(); // condition slot, reserved across the body
+        // Doc 66 P4: a comparison needs no condition slot; any other
+        // condition is written to one reserved below the body.
+        const fused = comparisonOf(r.cond) != null;
+        const cr: u16 = if (fused) 0 else try self.alloc1();
 
-        // Body locals begin at base+1; `break` closes upvalues from there.
-        try self.loops.append(self.scratch, .{ .scope_base = base + 1 });
+        // Body locals begin above the slot; `break` closes upvalues from there.
+        try self.loops.append(self.scratch, .{ .scope_base = self.next_reg });
         const loop_idx = self.loops.items.len - 1;
 
         self.beginScope();
         try self.compileBlock(r.body);
-        // `cond` sees the body's locals (still in scope); write it into `cr`,
-        // which lives below them and so survives `endScope`'s register pop.
-        try self.compileExprTo(r.cond, cr);
-        try self.endScope(); // pops body locals + closes their upvalues if captured
+        if (fused) {
+            // The operands are evaluated in the body's scope. `endScope` then
+            // emits at most a `close_upvalues`, which moves captured values
+            // to their cells without changing a register, so the branch
+            // after it still reads them. Comparing after the close is not
+            // observable: a value written before it is copied, one written
+            // after goes to the cell.
+            const mark = self.next_reg;
+            const ins = (try self.compareBranch(r.cond, false)).?;
+            self.freeTo(mark);
+            try self.endScope();
+            const at = try self.emit(ins);
+            self.patchJumpTo(at, loop_top);
+        } else {
+            // `cond` sees the body's locals (still in scope); write it into
+            // `cr`, which lives below them and so survives `endScope`'s
+            // register pop.
+            try self.compileExprTo(r.cond, cr);
+            try self.endScope(); // pops body locals + closes their upvalues if captured
 
-        // Loop back while the condition is false; fall through (exit) when true.
-        try self.emitJumpTo(.jmp_if_false, cr, loop_top);
+            // Loop back while the condition is false; fall through (exit) when true.
+            try self.emitJumpTo(.jmp_if_false, cr, loop_top);
+        }
 
         self.patchToHere(marker); // the marker's exit offset
         self.freeTo(base); // release the condition slot
@@ -2134,6 +2259,61 @@ test "doc 66 P5: equality against a literal compiles to a constant form" {
     }
 }
 
+test "doc 66 P4: a comparison test compiles to one compare-and-branch" {
+    var r = try run(
+        \\local x, y, s, n = 3, 4, "a", 0
+        \\if x < y then n = n + 1 end
+        \\if not (x <= y) then n = n + 1 end
+        \\if x > 2 then n = n + 1 end
+        \\if 2 < x then n = n + 1 end
+        \\if x == nil then n = n + 1 end
+        \\if s ~= "a" then n = n + 1 end
+        \\if 3.0 == x then n = n + 1 end
+        \\if x ~= y then n = n + 1 end
+        \\while x >= y do x = x - 1 end
+        \\repeat y = y - 1 until y <= 0
+        \\if x then n = n + 1 end
+        \\if not x then n = n + 1 end
+        \\if x < y and y < s then n = n + 1 end
+        \\return n
+    );
+    defer r.deinit();
+    try testing.expectEqual(@as(i64, 6), r.value.asInt());
+    const proto = r.chunk.proto;
+    var count = std.EnumArray(OpCode, usize).initFill(0);
+    for (proto.code) |ins| count.getPtr(ins.op).* += 1;
+    try testing.expectEqual(@as(usize, 1), count.get(.jlt));
+    try testing.expectEqual(@as(usize, 1), count.get(.jle));
+    // `x > 2`, and `2 < x` mirrored with its constant on the right.
+    try testing.expectEqual(@as(usize, 2), count.get(.jgt_k));
+    try testing.expectEqual(@as(usize, 1), count.get(.jeq_p));
+    try testing.expectEqual(@as(usize, 1), count.get(.jeq_s));
+    try testing.expectEqual(@as(usize, 1), count.get(.jeq_n));
+    try testing.expectEqual(@as(usize, 1), count.get(.jeq));
+    try testing.expectEqual(@as(usize, 1), count.get(.jge));
+    try testing.expectEqual(@as(usize, 1), count.get(.jle_k));
+    // Only the value-producing `and` operands keep a compare into a
+    // register; no compare feeds a test.
+    try testing.expectEqual(@as(usize, 2), count.get(.lt));
+    try testing.expectEqual(@as(usize, 0), count.get(.le) + count.get(.gt) + count.get(.ge) + count.get(.eq) + count.get(.ne));
+    // `if x`, `if not x` (a `not` into a register), and the `and`: its
+    // short circuit and the test of its value.
+    try testing.expectEqual(@as(usize, 4), count.get(.jmp_if_false));
+    var mirrored: usize = 0;
+    for (proto.code) |ins| {
+        const f = bytecode.cmpBranchOf(ins.op) orelse continue;
+        // Every test here jumps past its block when the condition is false:
+        // a `not`, and `~=` against `==`, flip the polarity.
+        const negated = ins.op == .jle or ins.op == .jeq_s or ins.op == .jeq;
+        try testing.expectEqual(negated, ins.a & bytecode.cmp_on_true != 0);
+        if (ins.a & bytecode.cmp_k_left != 0) {
+            mirrored += 1;
+            try testing.expectEqual(bytecode.CmpRel.gt, f.rel);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), mirrored);
+}
+
 test "an operand read before code that can write it keeps its value" {
     // `bump` writes `a` through its open upvalue. An operand evaluated
     // before the call is copied first, so it is the value before the call.
@@ -2198,11 +2378,12 @@ test "doc 58: a while loop emits a loop marker right after its condition branch"
     const code = r.chunk.proto.code;
     const m = try onlyLoopMarker(code);
     try testing.expectEqual(@as(u16, @intFromEnum(bytecode.LoopKind.while_loop)), code[m].b);
-    // `cond; jmp_if_false -> E; loop; body; jmp -> C`, E = the marker's exit.
-    try testing.expectEqual(OpCode.jmp_if_false, code[m - 1].op);
+    // `jle_k i 5 -> E; loop; body; jmp -> C`, E = the marker's exit: the
+    // condition is one compare-and-branch (doc 66 P4), jumping when false.
+    try testing.expectEqual(OpCode.jle_k, code[m - 1].op);
+    try testing.expectEqual(@as(u16, 0), code[m - 1].a & bytecode.cmp_on_true);
     const e = bytecode.loopMarkerExit(code[m], m);
-    const branch_target: i64 = @as(i64, @intCast(m)) + code[m - 1].aux;
-    try testing.expectEqual(@as(i64, @intCast(e)), branch_target);
+    try testing.expectEqual(@as(?i64, @intCast(e)), bytecode.falseBranchTargetOf(code[m - 1], m - 1));
     try testing.expectEqual(OpCode.jmp, code[e - 1].op);
     const back: i64 = @as(i64, @intCast(e)) + code[e - 1].aux;
     try testing.expect(back < m - 1 or back == m - 1);
@@ -2243,9 +2424,10 @@ test "doc 58: a repeat loop emits a loop marker at its top" {
     // The closer is the instruction right before the exit. B2: it targets the
     // MARKER (LuaJIT `parse_repeat`), and the marker is the back-edge whose
     // header is the body start.
+    // `until i >= 5` is one compare-and-branch (doc 66 P4).
     const e = bytecode.loopMarkerExit(code[m], m);
-    try testing.expectEqual(OpCode.jmp_if_false, code[e - 1].op);
-    try testing.expectEqual(@as(i64, @intCast(m)), @as(i64, @intCast(e)) + code[e - 1].aux);
+    try testing.expectEqual(OpCode.jge_k, code[e - 1].op);
+    try testing.expectEqual(@as(?i64, @intCast(m)), bytecode.falseBranchTargetOf(code[e - 1], e - 1));
     try testing.expectEqual(@as(?u32, null), bytecode.loopHeaderOf(code[e - 1], e - 1));
     try testing.expectEqual(@as(?u32, @intCast(m + 1)), bytecode.loopHeaderOf(code[m], m));
     // A `repeat` is not a `while` header (the peel's scope is unchanged).

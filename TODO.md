@@ -271,6 +271,19 @@ noise on every A/B that changes code size, and maybe a real collision
 cost. Repro files: pad `bench/repack_adversarial.lua` after
 `local checksum = 0` with 0–4 such statements.
 
+- [x] **One cause found: anchor-map probing** (doc 66 P4, 2026-10-22).
+      P4's layout moved binary-trees' JIT count +0.46%, all of it
+      `hasTrace`/`countTracesAt`/`nextTraceExcluding` missing-key probes
+      in `AnchorMap` at 80% load (callgrind: native code and handlers at
+      parity). 4f08b76 sets these maps to 50% load.
+- [ ] **repack's spread is something else.** Re-run 2026-10-22 on
+      4744457 and 4f08b76: 278.22M–278.84M over 0–4 pads (0.22%), the
+      same with either load factor.
+- [ ] **Option: no hash probe for "is there a trace at this pc".** Every
+      tier-0 back-edge and return asks `hasTrace`, almost always a miss.
+      A per-proto bit per pc (set on attach, cleared on detach) would
+      answer without touching the map at all. Not measured.
+
 ## nsieve-bit-fp, the board's worst row (noted 2026-10-19)
 
 18.6× LuaJIT on the 1b60a01 board, and JIT (394 ms) slower than tier-0

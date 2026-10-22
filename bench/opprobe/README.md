@@ -14,7 +14,10 @@ instructions, against LuaJIT `-joff`. These are not `@bench` programs, so
   `kpow`, `kshl`, `kband`) and the register-form float and int handlers
   they share (`rfmul`, `rfsub`, `rfdiv`, `rimul`), and equality against
   a constant as a value (`eqvnil`, `eqvfalse`, `eqvstr`, `eqvnum`, the
-  register `eqvreg`) and as a condition (`eqnil`, `eqstr`). The bitwise
+  register `eqvreg`) and as a condition (`eqnil`, `eqstr`), and
+  compare-and-branch: against a constant on the right (`ifltk`) and left
+  (`ifkge`), negated (`ifnot`), over floats (`ifflt`) and equality of two
+  registers (`ifeq`). The bitwise
   probes compile through `load`, so the file still parses under LuaJIT.
 - `fields.lua`: field reads, writes and `__index` method lookup (item 2).
 

@@ -1205,6 +1205,147 @@ test "doc 66 P5: equality against a constant is `Value.eql` against it" {
     , "560\t-8917125095649679768\n", .{ .record_aborts = true, .inspect = Inspect.run });
 }
 
+test "doc 66 P4: a compare-and-branch is its compare followed by the branch" {
+    // Every relation as an `if` test in both polarities (`not`, `~=`) over
+    // every value class: ints, floats, the int/float boundary (2^53 against
+    // the int past it), -0.0, NaN, strings (one built at run time, equal by
+    // interning), tables with and without `__lt`/`__le`/`__eq`, booleans and
+    // nil; against registers and against constants on either side. Then a
+    // `repeat` whose condition reads a captured body local, and hot
+    // conditions that record and run natively. The digest was taken on
+    // 8eee20c, where every one of these was a compare into a register and a
+    // `jmp_if_false`.
+    const Inspect = struct {
+        fn run(vm: *interp.Vm, mode: util.TraceMode) anyerror!void {
+            if (mode == .off) return;
+            for (vm.trace.abort_log.items) |r| {
+                if (bytecode.cmpBranchOf(r.op) != null) try testing.expect(r.reason != .nyi_opcode);
+            }
+            try testing.expect(vm.trace.registry.cache.items.len > 0);
+        }
+    };
+    try util.expectProgramTuned(
+        \\local V = {}
+        \\V.__lt = function(a, b) return a.v < b.v end
+        \\V.__le = function(a, b) return a.v <= b.v end
+        \\V.__eq = function(a, b) return a.v == b.v end
+        \\local p, q, r = setmetatable({ v = 1 }, V), setmetatable({ v = 2 }, V), setmetatable({ v = 1 }, V)
+        \\local nan = 0 / 0
+        \\local X = { false, true, 0, 1, -1, 2, 1.0, 0.5, -0.0, 0.0, nan, 1 / 0, 2 ^ 53, 9007199254740993, "a", "b", "", "a" .. "", p, q, r, {} }
+        \\X.n = #X + 1 -- and X[X.n] is nil
+        \\local acc, n = 0, 0
+        \\local function mix(b) n = n + 1; acc = (acc * 3 + (b and 1 or 2)) % 1000000007 end
+        \\local function ordered(x, y)
+        \\  local tx, ty = type(x), type(y)
+        \\  if tx ~= ty then return false end
+        \\  return tx == "number" or tx == "string" or (tx == "table" and getmetatable(x) == V and getmetatable(y) == V)
+        \\end
+        \\for i = 1, X.n do
+        \\  local x = X[i]
+        \\  if x == nil then mix(true) else mix(false) end
+        \\  if x ~= nil then mix(true) else mix(false) end
+        \\  if not (nil == x) then mix(true) else mix(false) end
+        \\  if x == false then mix(true) else mix(false) end
+        \\  if x ~= true then mix(true) else mix(false) end
+        \\  if x == "a" then mix(true) else mix(false) end
+        \\  if not ("b" ~= x) then mix(true) else mix(false) end
+        \\  if x == 1 then mix(true) else mix(false) end
+        \\  if 1.0 == x then mix(true) else mix(false) end
+        \\  if x == -0.0 then mix(true) else mix(false) end
+        \\  if x ~= 9007199254740992 then mix(true) else mix(false) end
+        \\  if type(x) == "number" then
+        \\    if x < 1 then mix(true) else mix(false) end
+        \\    if 1 < x then mix(true) else mix(false) end
+        \\    if x >= 0.5 then mix(true) else mix(false) end
+        \\    if 2 ^ 53 <= x then mix(true) else mix(false) end
+        \\    if x > -1 then mix(true) else mix(false) end
+        \\    if not (x < 0) then mix(true) else mix(false) end
+        \\    if not (0.0 >= x) then mix(true) else mix(false) end
+        \\    if x <= 9007199254740992 then mix(true) else mix(false) end
+        \\    if 0.5 <= x then mix(true) else mix(false) end
+        \\    if -1 >= x then mix(true) else mix(false) end
+        \\    if 2 > x then mix(true) else mix(false) end
+        \\    if not (-0.0 < x) then mix(true) else mix(false) end
+        \\  end
+        \\  for j = 1, X.n do
+        \\    local y = X[j]
+        \\    if x == y then mix(true) else mix(false) end
+        \\    if x ~= y then mix(true) else mix(false) end
+        \\    if not (x == y) then mix(true) else mix(false) end
+        \\    if ordered(x, y) then
+        \\      if x < y then mix(true) else mix(false) end
+        \\      if not (x <= y) then mix(true) else mix(false) end
+        \\      if x > y then mix(true) else mix(false) end
+        \\      if (x >= y) then mix(true) else mix(false) end
+        \\    end
+        \\  end
+        \\end
+        \\print(n, acc)
+        \\-- repeat: the condition sees the body's locals, and each iteration's
+        \\-- captured local is its own
+        \\local fs, k = {}, 0
+        \\repeat
+        \\  local j = k
+        \\  fs[#fs + 1] = function() return j end
+        \\  k = k + 1
+        \\until j >= 5
+        \\local out = {}
+        \\for i = 1, #fs do out[i] = fs[i]() end
+        \\print(table.concat(out, " "))
+        \\k = 0
+        \\repeat local j = k; k = k + 1 until not (j < 3)
+        \\print(k)
+        \\-- hot conditions, recorded and run natively
+        \\local c = 0
+        \\for i = 1, X.n do
+        \\  local x = X[i]
+        \\  if type(x) == "number" then
+        \\    for j = 1, 300 do
+        \\      local y = j % 7 - 3
+        \\      if x < y then c = c + 1 end
+        \\      if not (x >= y) then c = c + 2 end
+        \\      if x <= 1 then c = c + 4 end
+        \\      if 0.5 < x then c = c + 8 end
+        \\      if x == y then c = c + 16 end
+        \\      if y ~= 2 then c = c + 32 end
+        \\      if y + 0.5 > x then c = c + 64 end
+        \\    end
+        \\    c = c % 1000000007
+        \\  end
+        \\end
+        \\local w, z = 0, 0.0
+        \\while w < 3000 do w = w + 3 end
+        \\while not (z >= 1000.5) do z = z + 1.5 end
+        \\local u = 0
+        \\repeat u = u + 2 until u > 4000
+        \\print(c, w, z, u)
+        \\
+    , "2660\t738004662\n0 1 2 3 4 5\n4\n206669\t3000\t1000.5\t4002\n", .{ .record_aborts = true, .inspect = Inspect.run });
+}
+
+test "doc 66 P4: a compare-and-branch fault names its operands in source order" {
+    // `1 < t` compiles to `t > 1` against a constant; the message still reads
+    // "number with table", and each points at its own line.
+    try expectProgram(
+        \\local function err(f) local ok, e = pcall(f); print(ok, e:match(":(%d+): attempt to compare (.*)")) end
+        \\local t, s = {}, "s"
+        \\err(function() if t < 1 then end end)
+        \\err(function() if 1 < t then end end)
+        \\err(function() if t >= 2.5 then end end)
+        \\err(function() if 2.5 > t then end end)
+        \\err(function() if t <= s then end end)
+        \\err(function() if s > t then end end)
+        \\err(function() if not (1 < s) then end end)
+        \\err(function() while t < 1 do end end)
+        \\err(function() repeat until 1 <= t end)
+        \\
+    ,
+        "false\t3\ttable with number\nfalse\t4\tnumber with table\nfalse\t5\ttable with number\n" ++
+            "false\t6\tnumber with table\nfalse\t7\ttable with string\nfalse\t8\tstring with table\n" ++
+            "false\t9\tnumber with string\nfalse\t10\ttable with number\nfalse\t11\tnumber with table\n",
+    );
+}
+
 test "float text: print, tostring and .. agree, exponent form at the extremes" {
     // One renderer (`io.formatFloat`) behind all three. Positional text at
     // the extremes ran to 330 bytes and overran the fixed buffers `tostring`

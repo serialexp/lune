@@ -187,6 +187,17 @@ fn effectOf(ins: Instr, pc: u32, code_len: usize) Effect {
             e.use(a);
             e.succ = .{ next, jumpTarget(pc, ins.aux, code_len) };
         },
+        // Doc 66 P4: `a` is the polarity, not a register, and the constant
+        // forms' `c` is a constant or an immediate. Nothing is written.
+        .jlt, .jle, .jgt, .jge, .jeq => {
+            e.use(ins.b);
+            e.use(ins.c);
+            e.succ = .{ next, jumpTarget(pc, ins.aux, code_len) };
+        },
+        .jlt_k, .jle_k, .jgt_k, .jge_k, .jeq_p, .jeq_s, .jeq_n => {
+            e.use(ins.b);
+            e.succ = .{ next, jumpTarget(pc, ins.aux, code_len) };
+        },
         .for_prep => {
             // Reads init/limit/step, rewrites idx (a use too, so no kill
             // matters). Falls through into the body when the loop runs,

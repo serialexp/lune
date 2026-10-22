@@ -85,6 +85,12 @@ interface VizState {
   safepointLines: Uint32Array;
   /** Parallel to `safepointLines`: the proto each line is in (names its file). */
   safepointProtos: Uint32Array;
+  /** Parallel to `safepointLines`: 1 where a replay can stop. 0 inside code a
+   *  native runs that can't suspend yet (a `pcall` body, a `require`d module, a
+   *  metamethod); the slider skips those steps. */
+  safepointStoppable: Uint8Array;
+  /** How many of the steps are not stoppable (0s in `safepointStoppable`). */
+  safepointNested: number;
   /** Step grain: `instr` = one stop per safepoint; `line` = one stop per source
    *  line change. */
   grain: "instr" | "line";
@@ -230,38 +236,66 @@ export function coverageLineTitle(c: LineCoverage): string {
   return `${COVERAGE_LABEL[c.cls]} — loop iterations: ${parts.join(" · ")}`;
 }
 
+/** A run's step index, as `runSource` returned it: per safepoint k (1-based),
+ *  entry k-1 of each column. */
+export interface StepIndex {
+  count: number;
+  lines: Uint32Array;
+  protos: Uint32Array;
+  stoppable: Uint8Array;
+}
+
 /** The safepoint indices the slider steps through for a grain. `instr` is every
- *  safepoint 1..count; `line` is just the steps where the source line changes.
- *  Both append `count+1` — the terminal "finished" state (replay past the last
- *  safepoint reproduces the uninterrupted run). */
-function buildStops(
-  grain: "instr" | "line",
-  count: number,
-  lines: Uint32Array,
-  fileKeyOf: (protoId: number) => number,
-  protos: Uint32Array,
-): number[] {
+ *  stoppable safepoint in 1..count; `line` is the first stoppable step of each
+ *  run of steps on one line (a line change is a change of file or of line:
+ *  line 3 of another file is a new line), so a line whose steps all ran inside
+ *  nested code gets no stop. Both append `count+1` — the terminal "finished"
+ *  state (replay past the last safepoint reproduces the uninterrupted run).
+ *  Pure. */
+export function buildStops(grain: "instr" | "line", index: StepIndex, fileKeyOf: (protoId: number) => number): number[] {
+  const { count, lines, protos, stoppable } = index;
   if (count <= 0) return [];
   const stops: number[] = [];
+  const canStop = (k: number) => stoppable[k - 1] === 1;
   if (grain === "instr") {
-    for (let k = 1; k <= count; k++) stops.push(k);
+    for (let k = 1; k <= count; k++) if (canStop(k)) stops.push(k);
   } else {
-    // A line change is a change of file or of line: line 3 of another file
-    // is a new line.
     let prevLine = -1;
     let prevFile = -1;
+    let pending = false; // a new line started and has no stop yet
     for (let k = 1; k <= count; k++) {
       const ln = lines[k - 1] ?? 0;
       const file = fileKeyOf(protos[k - 1] ?? 0);
       if (ln !== prevLine || file !== prevFile) {
-        stops.push(k);
+        pending = true;
         prevLine = ln;
         prevFile = file;
+      }
+      if (pending && canStop(k)) {
+        stops.push(k);
+        pending = false;
       }
     }
   }
   stops.push(count + 1); // finished
   return stops;
+}
+
+/** The number of steps a replay cannot stop at. */
+function countUnstoppable(stoppable: Uint8Array): number {
+  let n = 0;
+  for (let i = 0; i < stoppable.length; i++) if (stoppable[i] !== 1) n++;
+  return n;
+}
+
+/** The last run's step index, from the store. */
+function stepIndex(): StepIndex {
+  return {
+    count: state.safepointCount,
+    lines: state.safepointLines,
+    protos: state.safepointProtos,
+    stoppable: state.safepointStoppable,
+  };
 }
 
 export const DEFAULT_PATH = "main.mah";
@@ -300,6 +334,8 @@ const [state, setState] = createStore<VizState>({
   safepointCapped: false,
   safepointLines: new Uint32Array(0),
   safepointProtos: new Uint32Array(0),
+  safepointStoppable: new Uint8Array(0),
+  safepointNested: 0,
   grain: "instr",
   replayStops: [],
   replayPos: 0,
@@ -621,6 +657,8 @@ function applyWasmResult(result: MahinaRunResult, fileName: string, ran: RunInpu
     safepointCapped: result.safepointCapped,
     safepointLines: result.safepointLines,
     safepointProtos: result.safepointProtos,
+    safepointStoppable: result.safepointStoppable,
+    safepointNested: countUnstoppable(result.safepointStoppable),
     replayStops: [],
     replayPos: 0,
     replayState: null,
@@ -709,7 +747,7 @@ export function canReplay(): boolean {
  *  land on the first step. No-op if there's nothing replayable. */
 export function openReplay(): void {
   if (!canReplay()) return;
-  const stops = buildStops(state.grain, state.safepointCount, state.safepointLines, memoFileKey(), state.safepointProtos);
+  const stops = buildStops(state.grain, stepIndex(), memoFileKey());
   setState({ replayActive: true, replayStops: stops, replayPos: 0 });
   setReplayPos(0);
 }
@@ -723,7 +761,7 @@ export function closeReplay(): void {
  *  point: snap to the last stop at or before the current safepoint. */
 export function setGrain(grain: "instr" | "line"): void {
   const curK = state.replayStops[state.replayPos] ?? 1;
-  const stops = buildStops(grain, state.safepointCount, state.safepointLines, memoFileKey(), state.safepointProtos);
+  const stops = buildStops(grain, stepIndex(), memoFileKey());
   let pos = 0;
   for (let i = 0; i < stops.length; i++) {
     if (stops[i] <= curK) pos = i;

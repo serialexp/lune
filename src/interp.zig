@@ -597,11 +597,25 @@ pub const CallSite = struct {
 /// point; the safepoint count lets it capture mid-loop in a single frame.
 pub const SuspendCtl = struct {
     min_depth: u32 = 0,
+    /// With `record_safepoint_lines` on, the most entries `safepoint_lines`
+    /// takes while this is armed; later safepoints still count in
+    /// `safepoint_seq` but are not recorded. A replay driver whose stop is a
+    /// step cap sets it to the cap: a cap that falls inside nested code is
+    /// deferred until the code returns (doc 68 §8), and without the limit the
+    /// index would grow as long as the nested call runs. It lives here, in
+    /// `min_depth`'s padding, because a new `Vm` field reshuffles the
+    /// asm-visible `Vm` offsets.
+    index_limit: u32 = std.math.maxInt(u32),
     after_safepoints: u64 = 0,
     /// Optional tier-independent logical cut: suspend at the first otherwise
     /// eligible tier-0 boundary at or after this many effects have committed.
     after_committed_effects: ?u64 = null,
 };
+
+comptime {
+    // `index_limit` must stay in padding (see its doc).
+    std.debug.assert(@sizeOf(SuspendCtl) == 32);
+}
 
 /// The tier-0 virtual machine. Owns the resources a running program needs that
 /// outlive a single frame: the object heap, the global table, and the shared
@@ -946,6 +960,12 @@ pub const Vm = struct {
     pub const SafepointLine = struct {
         proto_id: u32,
         line: u32,
+        /// Whether a suspend due at this safepoint stops here
+        /// (`canSuspendHere`). False inside a native's Zig re-entry, where a
+        /// suspend is deferred to the first boundary after it returns
+        /// (doc 68 §8), and while a multret result is pending. The replay UI
+        /// offers only stoppable steps.
+        stoppable: bool,
     };
 
     /// A runtime-compiled chunk owned by the VM: the `Chunk` (whose arena owns the
@@ -2094,7 +2114,15 @@ pub const Vm = struct {
                 .bnot => try bitwiseFaultMessage(arena, regs.get(instr.b)),
                 .len => try std.fmt.allocPrint(arena, "attempt to get length of a {s} value", .{regs.get(instr.b).typeName()}),
                 .concat => try std.fmt.allocPrint(arena, "attempt to concatenate a {s} value", .{firstNonConcatable(regs.get(instr.b), regs.get(instr.c)).typeName()}),
-                .lt, .le, .gt, .ge => try std.fmt.allocPrint(arena, "attempt to compare {s} with {s}", .{ regs.get(instr.b).typeName(), regs.get(instr.c).typeName() }),
+                .lt, .le, .gt, .ge, .jlt, .jle, .jgt, .jge => try std.fmt.allocPrint(arena, "attempt to compare {s} with {s}", .{ regs.get(instr.b).typeName(), regs.get(instr.c).typeName() }),
+                // Doc 66 P4: in source order, which put the constant on the
+                // left when `cmp_k_left` is set.
+                .jlt_k, .jle_k, .jgt_k, .jge_k => blk: {
+                    const x = regs.get(instr.b).typeName();
+                    const k = proto.constants[instr.c].typeName();
+                    const k_left = instr.a & bytecode.cmp_k_left != 0;
+                    break :blk try std.fmt.allocPrint(arena, "attempt to compare {s} with {s}", .{ if (k_left) k else x, if (k_left) x else k });
+                },
                 // Lua 5.4's `forprep` wording, first non-number in operand order.
                 .for_prep => try arena.dupe(u8, if (!regs.get(instr.a).isNumber())
                     "'for' initial value must be a number"
@@ -2294,19 +2322,15 @@ pub const Vm = struct {
     /// Doc 60 H1: the push half of a host call into a closure — everything
     /// `callValue` does before it runs the frame, minus the generic callee
     /// dispatch and the reentry increment (which `runPushedFrame` owns).
-    /// Same checks in the same order as `callValue` (the no-suspend
-    /// precondition, the `final_cut` clear, then the reentry limit, then depth
-    /// and capacity), so a rejection leaves the VM exactly as `callValue`
-    /// would. Returns the callee base.
+    /// Same checks in the same order as `callValue` (the `final_cut` clear,
+    /// then the reentry limit, then depth and capacity), so a rejection leaves
+    /// the VM exactly as `callValue` would. Returns the callee base.
     /// `inline`: an out-of-line `Error!usize` comes back through memory as a
     /// 2-byte error store plus an 8-byte payload store that the caller reads
     /// as one 16-byte load — a store-forwarding stall on every call
     /// (measured, doc 60 H1).
     pub inline fn pushHostCall(self: *Vm, cl: *const Closure, args: []const Value) Error!usize {
         std.debug.assert(!self.reg_top_pending);
-        // Before anything mutates, as in `callValue` (`runPushedFrame` keeps
-        // its own copy for the H3 entry, which pushes without this function).
-        std.debug.assert(self.suspend_ctl == null);
         if (self.final_cut != null) self.retireFinalCut(); // doc 21: host reentry reuses the stack
         if (self.native_reentry_depth >= max_native_reentry) return Error.StackOverflow;
         return self.bindAndPushClosure(cl, args);
@@ -2330,7 +2354,6 @@ pub const Vm = struct {
     /// `callClosure`, H3's chain function) each want it flattened, not an
     /// extra frame passing an error union through memory.
     pub inline fn runPushedFrame(self: *Vm, entry_depth: u32, base: usize) Error!FrameResult {
-        std.debug.assert(self.suspend_ctl == null);
         std.debug.assert(self.depth == entry_depth + 1);
         // Doc 61 §4.2: a host entry needs no marking of its own. At depth > 0
         // it runs inside a host fn, whose caller frame the dispatch native
@@ -2342,7 +2365,8 @@ pub const Vm = struct {
         const cl = self.frames[entry_depth].closure;
         return switch (try self.execWithEntry(cl, cl.proto, base, entry_depth + 1)) {
             .finished => |fr| fr,
-            // `suspend_ctl == null` (asserted above) ⇒ exec never suspends.
+            // `native_reentry_depth` is raised above, so a due suspend is
+            // deferred past this run (doc 68 §8): exec never suspends here.
             .suspended => unreachable,
         };
     }
@@ -2365,10 +2389,11 @@ pub const Vm = struct {
     /// it restores `depth`/`stack_top`. This matches the whole-VM invariant that a
     /// runtime error leaves `self.frames` intact for fault description.
     ///
-    /// Preconditions (asserted): no multret pair is pending (`!reg_top_pending`),
-    /// and no suspend is armed (`suspend_ctl == null` — a suspend taken across a
-    /// native's Zig frame would have no resume cursor). Both hold for the chunk-1
-    /// callers; a future host-mediated-suspension chunk revisits the latter.
+    /// Precondition (asserted): no multret pair is pending (`!reg_top_pending`).
+    /// An armed suspend is fine: the raised `native_reentry_depth` defers it
+    /// past the nested run (doc 68 §8), because a suspend taken across this
+    /// Zig frame would have no resume cursor. Doc 68's continuation frames
+    /// retire this function for the VM's own natives and metamethods.
     ///
     /// GC contract for callers: `results_out` heap values are rooted only while the
     /// caller's own register window / scratch holds them; consume them before the
@@ -2450,7 +2475,6 @@ pub const Vm = struct {
     pub fn callValue(self: *Vm, callee: Value, args: []const Value, results_out: []Value) Error!usize {
         if (!callee.isHeap()) return Error.TypeError;
         std.debug.assert(!self.reg_top_pending);
-        std.debug.assert(self.suspend_ctl == null);
         if (self.final_cut != null) self.retireFinalCut(); // doc 21: host reentry reuses the stack
         if (self.native_reentry_depth >= max_native_reentry) return Error.StackOverflow;
         self.native_reentry_depth += 1;
@@ -2528,8 +2552,8 @@ pub const Vm = struct {
                 const outcome = try self.execWithEntry(cl, cp, callee_base, entry_depth + 1);
                 const res = switch (outcome) {
                     .finished => |f| f,
-                    // `suspend_ctl == null` (asserted in `callValue`) ⇒ exec
-                    // never suspends.
+                    // `callValue` raised `native_reentry_depth`, so a due
+                    // suspend is deferred past this run (doc 68 §8).
                     .suspended => unreachable,
                 };
                 // The boundary frame is popped (`depth == entry_depth`) but
@@ -3130,6 +3154,16 @@ pub const Vm = struct {
         self.trace.setFastBit(trace.TraceState.FastBit.vm_final_cut, fc != null);
     }
 
+    /// Whether a due suspend may stop at the current safepoint. Not while a
+    /// native runs code through a Zig re-entry (doc 68 §8, defer: that Zig
+    /// frame could not be resumed), nor while a multret result is pending
+    /// (`reg_top_pending`: its producer and consumer are one step). The
+    /// replay index records the same predicate per safepoint, so the steps
+    /// it offers are exactly the ones a replay stops at.
+    pub inline fn canSuspendHere(self: *const Vm) bool {
+        return self.native_reentry_depth == 0 and !self.reg_top_pending;
+    }
+
     /// Arm (or, with null, disarm) the mid-execution suspend trigger.
     pub fn setSuspendCtl(self: *Vm, ctl: ?SuspendCtl) void {
         self.suspend_ctl = ctl;
@@ -3302,6 +3336,8 @@ pub const Vm = struct {
         inline for (.{ .eq, .ne }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opEqNeSlow(mode, op);
         inline for (.{ .eq_n, .ne_n }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opEqNSlow(mode, op);
         inline for (.{ .lt, .le, .gt, .ge }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opCompareSlow(mode, op);
+        inline for (.{ .jlt, .jle, .jgt, .jge, .jlt_k, .jle_k, .jgt_k, .jge_k }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opJOrderSlow(mode, op);
+        inline for (.{ .jeq, .jeq_n }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opJEqSlow(mode, op);
         return t;
     }
 
@@ -3417,18 +3453,30 @@ pub const Vm = struct {
         if (mode == .full and self.record_safepoint_lines) {
             const proto = st.proto;
             const sp_line: u32 = if (pc < proto.spans.len) proto.spans[pc].line else 0;
-            self.safepoint_lines.append(self.gpa, .{ .proto_id = proto.id, .line = sp_line }) catch |e| return parkErr(st, e);
+            const limit: usize = if (self.suspend_ctl) |sc| sc.index_limit else std.math.maxInt(usize);
+            if (self.safepoint_lines.items.len < limit) {
+                self.safepoint_lines.append(self.gpa, .{
+                    .proto_id = proto.id,
+                    .line = sp_line,
+                    .stoppable = self.canSuspendHere(),
+                }) catch |e| return parkErr(st, e);
+            }
         }
 
         // (4) Mid-execution suspend point — an instruction boundary,
         // BEFORE the fetch and all recording hooks. `.full` only.
+        // Doc 68 §8, defer: while a native runs code through a Zig re-entry
+        // (`callValue`, `runPushedFrame`), that Zig frame could not be
+        // resumed, so a due suspend waits for the first boundary after the
+        // re-entry returns. This is what makes the nested `.suspended`
+        // arms unreachable.
         if (mode == .full) {
             if (self.suspend_ctl) |sc| {
                 const effect_cut_reached = if (sc.after_committed_effects) |n|
                     self.committed_effect_seq >= n
                 else
                     true;
-                if (!self.reg_top_pending and effect_cut_reached and
+                if (self.canSuspendHere() and effect_cut_reached and
                     self.safepoint_seq >= sc.after_safepoints and self.depth >= sc.min_depth)
                 {
                     std.debug.assert(self.pending_error == null);
@@ -5932,6 +5980,8 @@ pub const Vm = struct {
             .eq_s, .ne_s => opEqS(mode, op),
             .eq_n, .ne_n => opEqN(mode, op),
             .lt, .le, .gt, .ge => opCompare(mode, op),
+            .jlt, .jle, .jgt, .jge, .jlt_k, .jle_k, .jgt_k, .jge_k => opJOrder(mode, op),
+            .jeq, .jeq_p, .jeq_s, .jeq_n => opJEq(mode, op),
             .jmp, .jmp_if_false, .jmp_if_true, .jmp_if_not_nil => opJump(mode, op),
             .for_prep => opForPrep(mode),
             .for_loop => opForLoop(mode),
@@ -6042,6 +6092,11 @@ pub const Vm = struct {
 
         inline fn rhsFloat(self: ArithOperands) f64 {
             return laneFloat(self.rt, self.rb());
+        }
+
+        /// The operands the other way round: `x > y` is `y < x`.
+        inline fn swapped(self: ArithOperands) ArithOperands {
+            return .{ .lt = self.rt, .rt = self.lt, .lp = self.rp, .rp = self.lp };
         }
     };
 
@@ -6331,32 +6386,9 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                const tb = regs.tagAt(instr.b);
-                const tc = regs.tagAt(instr.c);
-                const pb = regs.bitsAt(instr.b);
-                const pc_ = regs.bitsAt(instr.c);
-                const eqv: bool = if (tb == tc) switch (tb) {
-                    .int => pb == pc_,
-                    .float => blk: {
-                        @setFloatMode(.strict);
-                        break :blk @as(f64, @bitCast(pb)) == @as(f64, @bitCast(pc_));
-                    },
-                    .nil => true,
-                    .boolean => (pb != 0) == (pc_ != 0),
-                    .heap_ref => blk: {
-                        // Through the payload union, not `@ptrFromInt`: a
-                        // pointer is narrower than the 64-bit word on wasm32.
-                        const x = (Value{ .tag = .heap_ref, .payload = .{ .bits = pb } }).asHeap();
-                        const y = (Value{ .tag = .heap_ref, .payload = .{ .bits = pc_ } }).asHeap();
-                        if (x.id == y.id) break :blk true;
-                        if (x.type == .table and y.type == .table) return slowTail(mode, st, pc, instr, vm, tags, payloads);
-                        break :blk false;
-                    },
-                    .row_view => return slowTail(mode, st, pc, instr, vm, tags, payloads),
-                } else if ((tb == .int or tb == .float) and (tc == .int or tc == .float))
-                    return slowTail(mode, st, pc, instr, vm, tags, payloads)
-                else
-                    false;
+                const l = eqLanes(regs, instr.b, instr.c);
+                if (l == .slow) return slowTail(mode, st, pc, instr, vm, tags, payloads);
+                const eqv = l == .yes;
                 regs.setBool(instr.a, if (op == .eq) eqv else !eqv);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
@@ -6385,12 +6417,7 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                const t = regs.tagAt(instr.b);
-                const eqv = switch (@as(bytecode.Prim, @enumFromInt(instr.c))) {
-                    .nil => t == .nil,
-                    .@"false" => t == .boolean and regs.bitsAt(instr.b) == 0,
-                    .@"true" => t == .boolean and regs.bitsAt(instr.b) != 0,
-                };
+                const eqv = eqPrimLane(regs, instr.b, instr.c);
                 regs.setBool(instr.a, eqv != negate);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
@@ -6404,10 +6431,7 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                // Through the payload union, not `@ptrFromInt`: a pointer is
-                // narrower than the 64-bit word on wasm32.
-                const eqv = regs.tagAt(instr.b) == .heap_ref and
-                    (Value{ .tag = .heap_ref, .payload = .{ .bits = regs.bitsAt(instr.b) } }).asHeap() == st.proto.constants[instr.c].asHeap();
+                const eqv = eqStrLane(regs, instr.b, &st.proto.constants[instr.c]);
                 regs.setBool(instr.a, eqv != negate);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
@@ -6423,17 +6447,9 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                const k = &st.proto.constants[instr.c];
-                const t = regs.tagAt(instr.b);
-                const eqv = if (t == k.tag) blk: {
-                    if (t == .int) break :blk regs.bitsAt(instr.b) == k.payload.bits;
-                    @setFloatMode(.strict);
-                    break :blk @as(f64, @bitCast(regs.bitsAt(instr.b))) == @as(f64, @bitCast(k.payload.bits));
-                } else if (t == .int or t == .float)
-                    return slowTail(mode, st, pc, instr, vm, tags, payloads)
-                else
-                    false;
-                regs.setBool(instr.a, eqv != negate);
+                const l = eqNumLane(regs, instr.b, &st.proto.constants[instr.c]);
+                if (l == .slow) return slowTail(mode, st, pc, instr, vm, tags, payloads);
+                regs.setBool(instr.a, (l == .yes) != negate);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -6461,23 +6477,10 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                const swapped = op == .gt or op == .ge;
-                const strict = op == .lt or op == .gt;
-                const x: usize = if (swapped) instr.c else instr.b;
-                const y: usize = if (swapped) instr.b else instr.c;
-                const tx = regs.tagAt(x);
-                const ty = regs.tagAt(y);
-                const r: bool = if (tx == .int and ty == .int) blk: {
-                    const p: i64 = @bitCast(regs.bitsAt(x));
-                    const q: i64 = @bitCast(regs.bitsAt(y));
-                    break :blk if (strict) p < q else p <= q;
-                } else if (tx == .float and ty == .float) blk: {
-                    @setFloatMode(.strict);
-                    const p: f64 = @bitCast(regs.bitsAt(x));
-                    const q: f64 = @bitCast(regs.bitsAt(y));
-                    break :blk if (strict) p < q else p <= q;
-                } else return slowTail(mode, st, pc, instr, vm, tags, payloads);
-                regs.setBool(instr.a, r);
+                const o = arithOperands(.rr, st, regs, instr);
+                const l = orderLanes(op == .lt or op == .gt, if (op == .gt or op == .ge) o.swapped() else o);
+                if (l == .slow) return slowTail(mode, st, pc, instr, vm, tags, payloads);
+                regs.setBool(instr.a, l == .yes);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -6497,6 +6500,186 @@ pub const Vm = struct {
                 };
                 regs.setBool(instr.a, raw catch |e| return parkErr(st, e));
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    // Doc 66 P4/P5: the raw lanes of `==` and of the order relations, one
+    // definition for the value forms and the compare-and-branch forms.
+
+    /// A lane's verdict: decided, or the operands need the op's slow half.
+    /// An enum, not a `?bool`: LLVM keeps it in a register, where an
+    /// optional result went through the stack and cost the value forms 3–5
+    /// instructions.
+    const Lane = enum(u8) {
+        no = 0,
+        yes = 1,
+        slow = 2,
+
+        inline fn of(b: bool) Lane {
+            return @enumFromInt(@intFromBool(b));
+        }
+    };
+
+    /// `R[b] == R[c]` when both have the same type, and unequal across
+    /// types other than two numbers; slow for an int against a float, two
+    /// distinct tables (`__eq`) and a row view.
+    inline fn eqLanes(regs: RegWindow, b: u16, c: u16) Lane {
+        const tb = regs.tagAt(b);
+        const tc = regs.tagAt(c);
+        const pb = regs.bitsAt(b);
+        const pc_ = regs.bitsAt(c);
+        if (tb == tc) return switch (tb) {
+            .int => Lane.of(pb == pc_),
+            .float => blk: {
+                @setFloatMode(.strict);
+                break :blk Lane.of(@as(f64, @bitCast(pb)) == @as(f64, @bitCast(pc_)));
+            },
+            .nil => .yes,
+            .boolean => Lane.of((pb != 0) == (pc_ != 0)),
+            .heap_ref => blk: {
+                // Through the payload union, not `@ptrFromInt`: a
+                // pointer is narrower than the 64-bit word on wasm32.
+                const x = (Value{ .tag = .heap_ref, .payload = .{ .bits = pb } }).asHeap();
+                const y = (Value{ .tag = .heap_ref, .payload = .{ .bits = pc_ } }).asHeap();
+                if (x.id == y.id) break :blk .yes;
+                if (x.type == .table and y.type == .table) break :blk .slow;
+                break :blk .no;
+            },
+            .row_view => .slow,
+        };
+        if ((tb == .int or tb == .float) and (tc == .int or tc == .float)) return .slow;
+        return .no;
+    }
+
+    /// `R[b]` against the `Prim` immediate `c`: nil by its tag, a boolean by
+    /// tag and truth (`asBool`).
+    inline fn eqPrimLane(regs: RegWindow, b: u16, c: u16) bool {
+        const t = regs.tagAt(b);
+        return switch (@as(bytecode.Prim, @enumFromInt(c))) {
+            .nil => t == .nil,
+            .@"false" => t == .boolean and regs.bitsAt(b) == 0,
+            .@"true" => t == .boolean and regs.bitsAt(b) != 0,
+        };
+    }
+
+    /// `R[b]` against an interned string constant: strings are interned, so
+    /// a string equals it exactly when it is the same object.
+    inline fn eqStrLane(regs: RegWindow, b: u16, k: *const Value) bool {
+        // Through the payload union, not `@ptrFromInt`: a pointer is
+        // narrower than the 64-bit word on wasm32.
+        return regs.tagAt(b) == .heap_ref and
+            (Value{ .tag = .heap_ref, .payload = .{ .bits = regs.bitsAt(b) } }).asHeap() == k.asHeap();
+    }
+
+    /// `R[b]` against a number constant: the same number type on the raw
+    /// lanes (a float compares as IEEE, so NaN is unequal and
+    /// `-0.0 == 0.0`), anything but a number unequal; slow for the other
+    /// number type.
+    inline fn eqNumLane(regs: RegWindow, b: u16, k: *const Value) Lane {
+        const t = regs.tagAt(b);
+        if (t == k.tag) {
+            if (t == .int) return Lane.of(regs.bitsAt(b) == k.payload.bits);
+            @setFloatMode(.strict);
+            return Lane.of(@as(f64, @bitCast(regs.bitsAt(b))) == @as(f64, @bitCast(k.payload.bits)));
+        }
+        if (t == .int or t == .float) return .slow;
+        return .no;
+    }
+
+    /// `lhs < rhs` (`strict`) or `lhs <= rhs` over two ints or two floats
+    /// (`value.compareNumeric` is exactly IEEE order there); slow for a
+    /// mixed pair, strings and `__lt`/`__le`.
+    inline fn orderLanes(comptime strict: bool, o: ArithOperands) Lane {
+        if (o.bothInt()) {
+            const p: i64 = @bitCast(o.lb());
+            const q: i64 = @bitCast(o.rb());
+            return Lane.of(if (strict) p < q else p <= q);
+        }
+        if (o.bothFloat()) {
+            @setFloatMode(.strict);
+            const p: f64 = @bitCast(o.lb());
+            const q: f64 = @bitCast(o.rb());
+            return Lane.of(if (strict) p < q else p <= q);
+        }
+        return .slow;
+    }
+
+    // ---- compare-and-branch (doc 66 P4) ----
+    // Each is its value form's lanes followed by a jump instead of a
+    // register write: `holds` against the polarity in `a`. The slow halves
+    // run the full relation, metamethods included.
+
+    /// Jump when the comparison's outcome is the instruction's polarity.
+    inline fn cmpBranchTail(comptime mode: ExecMode, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, holds: bool) HandlerResult {
+        const npc = if (holds == (instr.a & bytecode.cmp_on_true != 0)) applyJump(pc, instr.aux) else pc;
+        return dispatchTail(mode, st, npc, vm);
+    }
+
+    /// An ordered compare-and-branch's operands in relation order: `R[b]`
+    /// and `R[c]` or `K[c]`, swapped for `>`/`>=`.
+    inline fn orderOperands(comptime f: bytecode.CmpForm, st: *const ExecState, regs: RegWindow, instr: *const Instr) ArithOperands {
+        const o = arithOperands(if (f.rhs == .reg) .rr else .rk, st, regs, instr);
+        return if (f.rel == .gt or f.rel == .ge) o.swapped() else o;
+    }
+
+    fn opJOrder(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        const f = comptime bytecode.cmpBranchOf(op).?;
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const l = orderLanes(f.rel == .lt or f.rel == .gt, orderOperands(f, st, regs, instr));
+                if (l == .slow) return slowTail(mode, st, pc, instr, vm, tags, payloads);
+                return cmpBranchTail(mode, st, pc, instr, vm, l == .yes);
+            }
+        }.h;
+    }
+
+    fn opJOrderSlow(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        const f = comptime bytecode.cmpBranchOf(op).?;
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const o = orderOperands(f, st, regs, instr);
+                const raw = if (f.rel == .lt or f.rel == .gt)
+                    vm.compareMeta(.lt, o.lhs(), o.rhs())
+                else
+                    vm.compareMeta(.le, o.lhs(), o.rhs());
+                return cmpBranchTail(mode, st, pc, instr, vm, raw catch |e| return parkErr(st, e));
+            }
+        }.h;
+    }
+
+    fn opJEq(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        const f = comptime bytecode.cmpBranchOf(op).?;
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const l: Lane = switch (f.rhs) {
+                    .reg => eqLanes(regs, instr.b, instr.c),
+                    .prim => Lane.of(eqPrimLane(regs, instr.b, instr.c)),
+                    .str => Lane.of(eqStrLane(regs, instr.b, &st.proto.constants[instr.c])),
+                    .num => eqNumLane(regs, instr.b, &st.proto.constants[instr.c]),
+                };
+                if (l == .slow) return slowTail(mode, st, pc, instr, vm, tags, payloads);
+                return cmpBranchTail(mode, st, pc, instr, vm, l == .yes);
+            }
+        }.h;
+    }
+
+    /// `jeq`'s and `jeq_n`'s slow halves: `__eq` for two tables, and an
+    /// int against a float compared exactly (`1 == 1.0`).
+    fn opJEqSlow(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        const f = comptime bytecode.cmpBranchOf(op).?;
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const holds = switch (f.rhs) {
+                    .reg => vm.valuesEqual(regs.get(instr.b), regs.get(instr.c)) catch |e| return parkErr(st, e),
+                    .num => value.compareNumeric(regs.get(instr.b), st.proto.constants[instr.c]) == .eq,
+                    .prim, .str => comptime unreachable,
+                };
+                return cmpBranchTail(mode, st, pc, instr, vm, holds);
             }
         }.h;
     }

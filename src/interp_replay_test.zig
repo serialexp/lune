@@ -271,6 +271,136 @@ test "replay: backtraceFrames reports a deepest-first chain at a suspend inside 
     try testing.expectEqualStrings("main", frames[2].name);
 }
 
+/// Doc 68 §8 (defer): one program per Zig re-entry site the VM owns today.
+const nested_reentry_programs = [_][:0]const u8{
+    // pcall / xpcall, including a caught error.
+    \\local ok, v = pcall(function(x) local y = x * 2 return y + 1 end, 20)
+    \\print(ok, v)
+    \\print(pcall(function() error("boom") end))
+    \\print(xpcall(function() return nil + 1 end, function(e) return "handled" end))
+    ,
+    // table.sort comparator.
+    \\local t = {5, 3, 9, 1, 7}
+    \\table.sort(t, function(a, b) return a > b end)
+    \\print(table.concat(t, ","))
+    ,
+    // gsub with a function replacement.
+    \\print((string.gsub("a1b22c333", "%d+", function(d) return "<" .. #d .. ">" end)))
+    ,
+    // __index function and __add metamethod.
+    \\local mt = {}
+    \\mt.__index = function(t, k) return k .. "!" end
+    \\mt.__add = function(a, b) return 42 end
+    \\local o = setmetatable({}, mt)
+    \\print(o.hello, o + 1)
+    ,
+};
+
+/// The program's safepoint index (owned), recorded by a run to completion.
+fn recordSafepointIndex(gpa: std.mem.Allocator, source: [:0]const u8) ![]Vm.SafepointLine {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [1024]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.setRecordSafepointLines(true);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    return gpa.dupe(Vm.SafepointLine, vm.safepoint_lines.items);
+}
+
+test "doc 68 defer: a suspend due inside nested code stops at the next stoppable step, and resumes" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const keyframeser = @import("keyframeser.zig");
+    inline for (nested_reentry_programs) |source| {
+        const index = try recordSafepointIndex(gpa, source);
+        defer gpa.free(index);
+        // The program really runs code through a re-entry, and the index says so.
+        var nested: usize = 0;
+        for (index) |sp| nested += @intFromBool(!sp.stoppable);
+        try testing.expect(nested > 0);
+        try testing.expect(index[0].stoppable);
+
+        var ref_buf: [1024]u8 = undefined;
+        var ref_sink = io.Writer.fixed(&ref_buf);
+        try runCaptured(gpa, source, &ref_sink, false, .off);
+
+        var k: u64 = 1;
+        while (k <= index.len) : (k += 1) {
+            // The stop lands on the first stoppable step at or after k.
+            var want: u64 = k;
+            while (want <= index.len and !index[want - 1].stoppable) want += 1;
+
+            var diags = diag.Diagnostics.init(gpa);
+            defer diags.deinit();
+            var tree = try parser.parse(gpa, source, &diags);
+            defer tree.deinit();
+            var vm = try Vm.init(gpa);
+            defer vm.deinit();
+            var sink_buf: [1024]u8 = undefined;
+            var sink = io.Writer.fixed(&sink_buf);
+            vm.out = &sink;
+            vm.setSuspendCtl(.{ .after_safepoints = k });
+            var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+            defer chunk.deinit();
+
+            const outcome = try vm.start(chunk.proto);
+            if (want > index.len) {
+                try testing.expect(outcome == .finished);
+            } else {
+                try testing.expect(outcome == .suspended);
+                try testing.expectEqual(want, vm.safepoint_seq);
+                try testing.expectEqual(@as(u16, 0), vm.native_reentry_depth);
+                // A deferred stop is an ordinary top-level one: capturable...
+                const snap = try keyframeser.encodeSnapshot(gpa, &vm);
+                gpa.free(snap);
+                // ...and resumable to the uninterrupted run's output.
+                vm.setSuspendCtl(null);
+                try testing.expect((try vm.exec()) == .finished);
+            }
+            try testing.expectEqualStrings(ref_sink.buffered(), sink.buffered());
+        }
+    }
+}
+
+test "doc 68 defer: the safepoint index stops growing at its limit" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source: [:0]const u8 =
+        \\pcall(function() local s = 0 for i = 1, 200 do s = s + i end end)
+        \\print("done")
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.setRecordSafepointLines(true);
+    // The replay driver's cap: due inside the pcall body, so deferred past it.
+    vm.setSuspendCtl(.{ .after_safepoints = 10, .index_limit = 10 });
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect((try vm.start(chunk.proto)) == .suspended);
+    try testing.expect(vm.safepoint_seq > 200);
+    try testing.expectEqual(@as(usize, 10), vm.safepoint_lines.items.len);
+}
+
 test "top-level re-entry on a suspended (dirty) VM fails closed (doc 17 H-3 / 9-A(ii))" {
     const gpa = testing.allocator;
     const parser = @import("parser.zig");

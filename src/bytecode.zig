@@ -300,6 +300,40 @@ pub const OpCode = enum(u8) {
     eq_n,
     /// `a, b, c`   R[a] = R[b] ~= K[c]
     ne_n,
+
+    // ---- compare-and-branch (doc 66 P4, LuaJIT `ISLT`…`ISEQN`) ----
+    // `if (R[b] <rel> <rhs>) == on_true then pc += aux`, where `on_true` is
+    // bit 0 of `a` (`cmp_on_true`). Polarity rides in `a` rather than in a
+    // negated relation: `not (x < y)` is not `x >= y` when either is NaN.
+    // They write no register. The ordered relations against a constant take
+    // a number; `cmp_k_left` in `a` records that the source had the
+    // constant on the left (`0 < x` compiles to `x > 0`), for the fault
+    // text only. `cmpBranchOf` decodes them, and `condBranchOf` names them
+    // a branch.
+    /// `a, b, c, aux`  R[b] < R[c]
+    jlt,
+    /// `a, b, c, aux`  R[b] <= R[c]
+    jle,
+    /// `a, b, c, aux`  R[b] > R[c]
+    jgt,
+    /// `a, b, c, aux`  R[b] >= R[c]
+    jge,
+    /// `a, b, c, aux`  R[b] == R[c]
+    jeq,
+    /// `a, b, c, aux`  R[b] < K[c]   (K[c] a number)
+    jlt_k,
+    /// `a, b, c, aux`  R[b] <= K[c]
+    jle_k,
+    /// `a, b, c, aux`  R[b] > K[c]
+    jgt_k,
+    /// `a, b, c, aux`  R[b] >= K[c]
+    jge_k,
+    /// `a, b, c, aux`  R[b] == P(c)
+    jeq_p,
+    /// `a, b, c, aux`  R[b] == K[c]   (K[c] an interned string)
+    jeq_s,
+    /// `a, b, c, aux`  R[b] == K[c]   (K[c] a number)
+    jeq_n,
 };
 
 /// Doc 66 P5: the immediate operand of `eq_p`/`ne_p`.
@@ -326,9 +360,10 @@ pub const Prim = enum(u16) {
     }
 };
 
-/// Doc 66 P5: where an equality's right operand comes from.
-pub const EqConst = enum {
-    /// `R[c]`: the register forms `eq` and `ne`.
+/// Doc 66 P4/P5: where an equality's or a compare-and-branch's right
+/// operand comes from.
+pub const CmpRhs = enum {
+    /// `R[c]`: the register forms.
     reg,
     /// `P(c)`: nil, false or true.
     prim,
@@ -344,13 +379,13 @@ pub const EqConst = enum {
 pub const EqForm = struct {
     /// `~=` rather than `==`.
     negate: bool,
-    rhs: EqConst,
+    rhs: CmpRhs,
 };
 
 /// The equality `op` performs, or null when it is not one. Usable at
 /// comptime.
 pub fn eqFormOf(op: OpCode) ?EqForm {
-    const negate: bool, const rhs: EqConst = switch (op) {
+    const negate: bool, const rhs: CmpRhs = switch (op) {
         .eq => .{ false, .reg },
         .ne => .{ true, .reg },
         .eq_p => .{ false, .prim },
@@ -366,7 +401,7 @@ pub fn eqFormOf(op: OpCode) ?EqForm {
 
 /// The equality op for `negate` with its right operand from `rhs`: the
 /// inverse of `eqFormOf`.
-pub fn eqOpOf(negate: bool, rhs: EqConst) OpCode {
+pub fn eqOpOf(negate: bool, rhs: CmpRhs) OpCode {
     return switch (rhs) {
         .reg => if (negate) .ne else .eq,
         .prim => if (negate) .ne_p else .eq_p,
@@ -378,12 +413,85 @@ pub fn eqOpOf(negate: bool, rhs: EqConst) OpCode {
 /// An equality instruction's constant right operand, or null for the
 /// register forms.
 pub fn eqConstant(instr: Instr, proto: *const Proto) ?Value {
-    const f = eqFormOf(instr.op).?;
-    return switch (f.rhs) {
+    return rhsConstant(eqFormOf(instr.op).?.rhs, instr, proto);
+}
+
+/// The constant right operand `c` names for an operand of kind `rhs`, or
+/// null for a register.
+fn rhsConstant(rhs: CmpRhs, instr: Instr, proto: *const Proto) ?Value {
+    return switch (rhs) {
         .reg => null,
         .prim => @as(Prim, @enumFromInt(instr.c)).value(),
         .str, .num => proto.constants[instr.c],
     };
+}
+
+/// Doc 66 P4: the relation a compare-and-branch tests. `gt`/`ge` are `lt`/
+/// `le` with the operands swapped, as the value forms are.
+pub const CmpRel = enum { lt, le, gt, ge, eq };
+
+/// Doc 66 P4: a compare-and-branch instruction, decoded.
+pub const CmpForm = struct {
+    rel: CmpRel,
+    rhs: CmpRhs,
+};
+
+/// Bit 0 of a compare-and-branch's `a`: jump when the comparison holds
+/// (set) or when it fails (clear).
+pub const cmp_on_true: u16 = 1;
+/// Bit 1 of an ordered constant compare-and-branch's `a`: the source wrote
+/// the constant on the left, so a fault names the operands in that order.
+pub const cmp_k_left: u16 = 2;
+
+/// The compare-and-branch `op` performs, or null when it is not one.
+/// Usable at comptime.
+pub fn cmpBranchOf(op: OpCode) ?CmpForm {
+    const rel: CmpRel, const rhs: CmpRhs = switch (op) {
+        .jlt => .{ .lt, .reg },
+        .jle => .{ .le, .reg },
+        .jgt => .{ .gt, .reg },
+        .jge => .{ .ge, .reg },
+        .jeq => .{ .eq, .reg },
+        .jlt_k => .{ .lt, .num },
+        .jle_k => .{ .le, .num },
+        .jgt_k => .{ .gt, .num },
+        .jge_k => .{ .ge, .num },
+        .jeq_p => .{ .eq, .prim },
+        .jeq_s => .{ .eq, .str },
+        .jeq_n => .{ .eq, .num },
+        else => return null,
+    };
+    return .{ .rel = rel, .rhs = rhs };
+}
+
+/// The compare-and-branch op for `rel` against an operand of kind `rhs`:
+/// the inverse of `cmpBranchOf`. Null where there is none (an ordered
+/// relation against nil, a boolean or a string constant).
+pub fn cmpBranchOp(rel: CmpRel, rhs: CmpRhs) ?OpCode {
+    return switch (rhs) {
+        .reg => switch (rel) {
+            .lt => .jlt,
+            .le => .jle,
+            .gt => .jgt,
+            .ge => .jge,
+            .eq => .jeq,
+        },
+        .num => switch (rel) {
+            .lt => .jlt_k,
+            .le => .jle_k,
+            .gt => .jgt_k,
+            .ge => .jge_k,
+            .eq => .jeq_n,
+        },
+        .prim => if (rel == .eq) .jeq_p else null,
+        .str => if (rel == .eq) .jeq_s else null,
+    };
+}
+
+/// A compare-and-branch's constant right operand, or null for the
+/// register forms.
+pub fn cmpConstant(instr: Instr, proto: *const Proto) ?Value {
+    return rhsConstant(cmpBranchOf(instr.op).?.rhs, instr, proto);
 }
 
 /// Doc 66 P3: where an arithmetic or bitwise instruction's operands come
@@ -506,12 +614,15 @@ pub const CondTest = enum {
     truthy,
     /// One register is not nil (`jmp_if_not_nil`, the `??` operator).
     not_nil,
+    /// A comparison of two operands (the compare-and-branch forms,
+    /// `cmpBranchOf`).
+    compare,
 
     /// Whether the test is a Lua condition, the kind `if`, `while`,
     /// `repeat`, `and` and `or` compile to. `??`'s nil test is not one.
     pub fn isCondition(self: CondTest) bool {
         return switch (self) {
-            .truthy => true,
+            .truthy, .compare => true,
             .not_nil => false,
         };
     }
@@ -534,6 +645,20 @@ pub const CondBranch = struct {
     pub fn jumpsOn(self: CondBranch, holds: bool) bool {
         return self.on_true == holds;
     }
+
+    /// Whether the branch jumps when the Lua condition it was compiled
+    /// from is false: the shape of every `if`, `while` and `repeat` test.
+    /// A truthiness branch does so only as `jmp_if_false`. A
+    /// compare-and-branch always does, in either polarity: the compiler
+    /// emits one only for those tests, folding a `not` into the polarity
+    /// (`while not (i < n)` jumps when `i < n` holds).
+    pub fn onFalseCondition(self: CondBranch) bool {
+        return switch (self.cond) {
+            .truthy => !self.on_true,
+            .compare => true,
+            .not_nil => false,
+        };
+    }
 };
 
 /// The conditional branch at `pc`, or null when `ins` is not one.
@@ -542,7 +667,10 @@ pub fn condBranchOf(ins: Instr, pc: usize) ?CondBranch {
         .jmp_if_true => .{ .truthy, true },
         .jmp_if_false => .{ .truthy, false },
         .jmp_if_not_nil => .{ .not_nil, true },
-        else => return null,
+        else => if (cmpBranchOf(ins.op) != null)
+            .{ .compare, ins.a & cmp_on_true != 0 }
+        else
+            return null,
     };
     return .{ .cond = cond, .on_true = on_true, .target = jumpTargetOf(ins, pc) };
 }
@@ -552,7 +680,7 @@ pub fn condBranchOf(ins: Instr, pc: usize) ?CondBranch {
 /// other instruction.
 pub fn falseBranchTargetOf(ins: Instr, pc: usize) ?i64 {
     const cb = condBranchOf(ins, pc) orelse return null;
-    if (!cb.cond.isCondition() or cb.on_true) return null;
+    if (!cb.onFalseCondition()) return null;
     return cb.target;
 }
 
@@ -998,6 +1126,16 @@ pub fn writeInstr(w: *io.Writer, instr: Instr) io.Writer.Error!void {
         .vararg_get,
         => try w.print(" r{d}  {d}", .{ instr.a, instr.b }),
         .eq_p, .ne_p => try w.print(" r{d}  {d}  {s}", .{ instr.a, instr.b, @tagName(@as(Prim, @enumFromInt(instr.c))) }),
+        // Doc 66 P4: the polarity, the operands, then the offset.
+        .jlt, .jle, .jgt, .jge, .jeq, .jlt_k, .jle_k, .jgt_k, .jge_k, .jeq_p, .jeq_s, .jeq_n => {
+            try w.print(" {s} r{d}  ", .{ if (instr.a & cmp_on_true != 0) "T" else "F", instr.b });
+            switch (cmpBranchOf(instr.op).?.rhs) {
+                .reg => try w.print("r{d}", .{instr.c}),
+                .prim => try w.print("{s}", .{@tagName(@as(Prim, @enumFromInt(instr.c)))}),
+                .str, .num => try w.print("k{d}", .{instr.c}),
+            }
+            try w.print("  {d:>4}", .{instr.aux});
+        },
         else => try w.print(" r{d}  {d}  {d}", .{ instr.a, instr.b, instr.c }),
     }
 }
@@ -1038,6 +1176,29 @@ test "doc 66 P5: eqFormOf and eqOpOf are inverses" {
     try testing.expect(Prim.@"true".value().eql(Value.boolean(true)));
     for (std.enums.values(Prim)) |p| try testing.expectEqual(p, Prim.of(p.value()).?);
     try testing.expectEqual(@as(?Prim, null), Prim.of(Value.int(0)));
+}
+
+test "doc 66 P4: cmpBranchOf and cmpBranchOp are inverses" {
+    var forms: usize = 0;
+    for (std.enums.values(OpCode)) |op| {
+        const f = cmpBranchOf(op) orelse continue;
+        try testing.expectEqual(@as(?OpCode, op), cmpBranchOp(f.rel, f.rhs));
+        forms += 1;
+    }
+    try testing.expectEqual(@as(usize, 12), forms);
+    for (std.enums.values(CmpRel)) |rel| {
+        for (std.enums.values(CmpRhs)) |rhs| {
+            const op = cmpBranchOp(rel, rhs) orelse {
+                // Only an ordered relation against a non-number constant
+                // has no form.
+                try testing.expect(rel != .eq and (rhs == .prim or rhs == .str));
+                continue;
+            };
+            try testing.expectEqual(CmpForm{ .rel = rel, .rhs = rhs }, cmpBranchOf(op).?);
+        }
+    }
+    try testing.expectEqual(@as(?CmpForm, null), cmpBranchOf(.lt));
+    try testing.expectEqual(@as(?CmpForm, null), cmpBranchOf(.jmp_if_false));
 }
 
 test "doc 66 P3: arithFormOf and constantFormOf are inverses" {
@@ -1099,6 +1260,18 @@ test "doc 66 §5.4: condBranchOf decodes exactly the conditional branches" {
                     try testing.expectEqual(@as(?i64, 7), false_target)
                 else
                     try testing.expectEqual(@as(?i64, null), false_target);
+            },
+            // Doc 66 P4: polarity from bit 0 of `a`, and either polarity is
+            // the false branch of the condition it was compiled from.
+            .jlt, .jle, .jgt, .jge, .jeq, .jlt_k, .jle_k, .jgt_k, .jge_k, .jeq_p, .jeq_s, .jeq_n => {
+                const got = cb.?;
+                try testing.expectEqual(CondTest.compare, got.cond);
+                try testing.expectEqual(@as(i64, 7), got.target);
+                try testing.expect(got.on_true); // a = 3: on_true | k_left
+                try testing.expectEqual(@as(?i64, 7), false_target);
+                const off = condBranchOf(.{ .op = op, .a = cmp_k_left, .aux = -4 }, 10).?;
+                try testing.expect(!off.on_true);
+                try testing.expect(off.onFalseCondition());
             },
             else => {
                 try testing.expectEqual(@as(?CondBranch, null), cb);

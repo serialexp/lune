@@ -45,6 +45,7 @@ function runTransferables(r: MahinaRunResult): Transferable[] {
     r.trace.buffer,
     r.safepointLines.buffer,
     r.safepointProtos.buffer,
+    r.safepointStoppable.buffer,
     r.executionLog.buffer,
     r.coverage.buffer,
   ] as Transferable[];

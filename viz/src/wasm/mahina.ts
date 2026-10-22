@@ -82,6 +82,11 @@ export interface MahinaRunResult {
   /** Parallel to `safepointLines`: the proto each line is in, which names its
    *  file (see `chunks`). */
   safepointProtos: Uint32Array;
+  /** Parallel to `safepointLines`: 1 where a replay can stop, 0 for a step
+   *  inside nested code (a native running mahina code it can't yet suspend,
+   *  e.g. `pcall`'s body, a `require`d module, a metamethod), where a stop
+   *  lands at the next stoppable step instead. */
+  safepointStoppable: Uint8Array;
   /** Every chunk the run compiled: entry 0 is the program, the rest what
    *  `require`/`loadfile`/`dofile`/`load` compiled, in load order. Names the
    *  file of any proto id. Empty when the run never got to execute. */
@@ -171,6 +176,9 @@ export interface MahinaReplayResult {
   /** Index of the pending instruction within that proto's `instrs`. 0 when
    *  finished/unavailable. */
   pc: number;
+  /** The step the replay actually stopped at (0 when finished): `stopAfter`
+   *  for a stoppable step, else the next stoppable one. */
+  stoppedAt: number;
 }
 
 /** One row of a runtime-error backtrace. `start`/`end` are UTF-8 byte offsets. */
@@ -237,9 +245,9 @@ const RESULT_BYTES = 4 + 5 * 8 + 3 * 4 + 8 + 8 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 4;
 // ReplayResult struct layout (extern struct), little-endian:
 //   u32 status; { u32 ptr; u32 len } stdout/keyframe/diag; u32 current_line (@28),
 //   current_start (@32), current_end (@36), depth (@40), finished (@44);
-//   { u32 ptr; u32 len } backtrace (@48); u32 proto_id (@56), u32 pc (@60).
-//   Total 64 bytes.
-const REPLAY_RESULT_BYTES = 4 + 3 * 8 + 5 * 4 + 8 + 4 + 4;
+//   { u32 ptr; u32 len } backtrace (@48); u32 proto_id (@56), u32 pc (@60),
+//   u32 stopped_at (@64). Total 68 bytes.
+const REPLAY_RESULT_BYTES = 4 + 3 * 8 + 5 * 4 + 8 + 4 + 4 + 4;
 
 // CheckResult layout: u32 status; { u32 ptr; u32 len } diags (len = record count).
 const CHECK_RESULT_BYTES = 4 + 8;
@@ -318,18 +326,21 @@ function readU32Array(blob: Uint8Array): Uint32Array {
   return new Uint32Array(blob.buffer, blob.byteOffset, blob.length >>> 2);
 }
 
-/** Split the safepoint index blob (little-endian `{u32 proto_id, u32 line}`
- *  pairs, see `encodeSafepointLines` in wasm_entry.zig) into its two columns. */
-function decodeSafepoints(blob: Uint8Array): { lines: Uint32Array; protos: Uint32Array } {
-  const pairs = readU32Array(blob);
-  const n = pairs.length >>> 1;
+/** Split the safepoint index blob (little-endian `{u32 proto_id, u32 line,
+ *  u32 flags}` triples, see `encodeSafepointLines` in wasm_entry.zig) into its
+ *  columns; flags bit 0 is "a replay can stop here". */
+function decodeSafepoints(blob: Uint8Array): { lines: Uint32Array; protos: Uint32Array; stoppable: Uint8Array } {
+  const words = readU32Array(blob);
+  const n = Math.floor(words.length / 3);
   const lines = new Uint32Array(n);
   const protos = new Uint32Array(n);
+  const stoppable = new Uint8Array(n);
   for (let i = 0; i < n; i++) {
-    protos[i] = pairs[2 * i];
-    lines[i] = pairs[2 * i + 1];
+    protos[i] = words[3 * i];
+    lines[i] = words[3 * i + 1];
+    stoppable[i] = words[3 * i + 2] & 1;
   }
-  return { lines, protos };
+  return { lines, protos, stoppable };
 }
 
 /** Decode the chunk table (see `buildChunksBlob` in wasm_entry.zig): `u32
@@ -506,6 +517,7 @@ function wrap(exports: MahinaExports): MahinaModule {
       safepointCapped,
       safepointLines: safepoints.lines,
       safepointProtos: safepoints.protos,
+      safepointStoppable: safepoints.stoppable,
       chunks,
       disasm,
       executionLog,
@@ -546,6 +558,7 @@ function wrap(exports: MahinaExports): MahinaModule {
     const backtrace = decodeBacktrace(readBuf(exports.memory, dv, 48));
     const protoId = dv.getUint32(56, true);
     const pc = dv.getUint32(60, true);
+    const stoppedAt = dv.getUint32(64, true);
 
     exports.mahina_free_replay_result(resPtr);
 
@@ -562,6 +575,7 @@ function wrap(exports: MahinaExports): MahinaModule {
       backtrace,
       protoId,
       pc,
+      stoppedAt,
     };
   };
 
