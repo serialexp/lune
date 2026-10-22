@@ -289,8 +289,29 @@ earlier in `/tmp/t0micro/`).
       argument. Doc 69 is that argument. Its P0 (the GC countdown gate)
       landed 2026-10-23 at −0.6 to −11.7% tier-0 instructions. The merged
       gate, lazy pc and the frame pointer wait on Bart (doc 69 §7).
-- [ ] **`#t` on a table is ~177 instructions** (string `#` ~48): the
-      `__len` metatable probe plus `Table.length`'s border scan.
+- [x] **`#t` on a table is ~177 instructions** (string `#` ~48): the
+      `__len` metatable probe plus `Table.length`'s border scan. Fixed
+      2026-10-23. opLen keeps only the string arm and tail-calls
+      `opLenSlow` for the rest, where a table with no metatable skips the
+      `__len` probe. `Table.length` has an inline fast case (`alen`'s
+      premises). `#t` 172 → 74, `#s` 45 → 42, a metatabled table 210 →
+      189 (LuaJIT `-joff` 39/16/56); tbl_ops −2.1%, scalar −2.1% tier-0.
+      **Bug found along the way:** the linear trailing-nil trim made a stack
+      popped through `t[#t] = nil` quadratic (80k pops: 57.7G
+      instructions). It is LuaJIT's `lj_tab_len` binary search now, so on an
+      array with holes `#t` can return a lower (still valid) border than
+      before. Bart didn't answer the question within 15 minutes; the other
+      choices were Lua 5.4's hinted `luaH_getn` (O(1) push/pop, a per-table
+      hint field) and keeping "highest present index" exactly (a
+      store-maintained high-water mark, the JIT's native stores included).
+      New bench `bench/stdlib/tbl_stack.lua`: 675G → 593M instructions.
+- [ ] **A popping loop never traces.** `alen` records only `#t`'s exact
+      fast case (empty hash part, last array slot present). Anything else
+      aborts recording with `bad_type`, so every loop doing
+      `t[#t] = nil` stays on tier 0 (tbl_stack: 4 abort sites, 0 trace
+      entries). LuaJIT records `lj_tab_len_hint`, a guarded check that the
+      previous border is still one (`t[h] ~= nil and t[h+1] == nil`),
+      falling back to the full search.
 
 ## JIT instruction counts move with bytecode pc layout (noted 2026-10-22)
 

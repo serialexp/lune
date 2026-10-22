@@ -1,5 +1,5 @@
 # mahina frozen benchmark output digests — see tools/hashgate.py
-# generated from zig-out/bin/mahina at rev 7d32e84
+# generated from zig-out/bin/mahina at rev 11c6287 (+ #t border search)
 # name	mode	argv	rc	sha256(stdout)
 array3d	jit	80	0	48752ee828b38c1ad373f80e83f62bc9394a1f02665eccff98db8159e39e4d54
 array3d	t0	80	0	48752ee828b38c1ad373f80e83f62bc9394a1f02665eccff98db8159e39e4d54
@@ -97,6 +97,9 @@ str_manip	trace	100000	0	2a48b7a9004c8572ebe44751a256b619866af874b4a92233e413d27
 tbl_ops	jit	20000	0	522aa7dc1f45bc1e3903fa61f5ab4289747880865f5d33ae1f73bd19a3b612b1
 tbl_ops	t0	20000	0	522aa7dc1f45bc1e3903fa61f5ab4289747880865f5d33ae1f73bd19a3b612b1
 tbl_ops	trace	20000	0	522aa7dc1f45bc1e3903fa61f5ab4289747880865f5d33ae1f73bd19a3b612b1
+tbl_stack	jit	200000	0	98ee643195739e6efb0ab4d0dc515e303950026e1df1f3a41f8292d806f2e1fb
+tbl_stack	t0	200000	0	98ee643195739e6efb0ab4d0dc515e303950026e1df1f3a41f8292d806f2e1fb
+tbl_stack	trace	200000	0	98ee643195739e6efb0ab4d0dc515e303950026e1df1f3a41f8292d806f2e1fb
 while_shortcircuit_probe	jit	120	0	461144ccfd56ee3cf0f9a9d80e520c5b872166b23092d5fd838ecbdb46d64dab
 while_shortcircuit_probe	t0	120	0	461144ccfd56ee3cf0f9a9d80e520c5b872166b23092d5fd838ecbdb46d64dab
 while_shortcircuit_probe	trace	120	0	461144ccfd56ee3cf0f9a9d80e520c5b872166b23092d5fd838ecbdb46d64dab

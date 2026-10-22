@@ -6680,9 +6680,28 @@ pub const Vm = struct {
                 // (str_gmatch profile, 2026-08-29: 20% of the bench) — is pure
                 // overhead here. Tables (metamethod dispatch), row views, and
                 // error cases keep the slow path.
+                // Everything else is `opLenSlow`, a handler of its own, so
+                // this one makes no call at all.
                 const v = regs.get(instr.b);
-                if (v.isHeap() and v.heapType() == .string) {
-                    regs.setInt(instr.a, @intCast(string.String.fromHeader(v.asHeap()).cpLen()));
+                if (!(v.isHeap() and v.heapType() == .string))
+                    return @call(.always_tail, opLenSlow(mode), .{ st, pc, instr, vm, tags, payloads });
+                regs.setInt(instr.a, @intCast(string.String.fromHeader(v.asHeap()).cpLen()));
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// `opLen` for anything but a string. A table with no metatable cannot
+    /// have `__len`, so its border comes straight from `Table.length` (an
+    /// `i64` in a register); everything else takes `lenValue`'s `__len`
+    /// probe.
+    fn opLenSlow(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const v = regs.get(instr.b);
+                if (v.isHeap() and v.heapType() == .table and table.Table.fromHeader(v.asHeap()).metatable == null) {
+                    regs.setInt(instr.a, table.Table.fromHeader(v.asHeap()).length());
                 } else {
                     regs.set(instr.a, vm.lenValue(v) catch |e| return parkErr(st, e));
                 }

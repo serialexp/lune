@@ -616,20 +616,45 @@ pub const Table = struct {
 
     /// A *border* `n` such that `t[n] ~= nil` and `t[n+1] == nil` (or `0`). Like
     /// Lua, with holes any valid border may be returned; this is `#t`.
-    pub fn length(self: *const Table) i64 {
+    /// `#t`. The common case is inline: no grid, an empty hash part, and a
+    /// present last array slot (or no candidate at all), where the border is
+    /// the array part's last key. That is `alen`'s exact fast case (trace_ir).
+    /// Everything else is `lengthSearch`.
+    pub inline fn length(self: *const Table) i64 {
+        const ap = &self.array;
+        if (!ap.isGrid() and self.hash.count() == 0) {
+            if (ap.asize <= 1) return 0;
+            const n = ap.asize - 1;
+            if (!ap.get(n).isNil()) return @intCast(n);
+        }
+        return self.lengthSearch();
+    }
+
+    fn lengthSearch(self: *const Table) i64 {
         // Every grid row `1..rows` is a present `row_view` (a table is never nil)
         // and a grid carries no hash-part border, so `#t` is exactly the row
         // count. (Phase 3, doc 14.)
         if (self.array.isGrid()) return @intCast(self.array.gridRows());
         // Doc 18: the extent covers keys 0..asize-1, but `#t` stays a 1-based
         // border — the maximum candidate is key `asize - 1`, and key 0 never
-        // participates (the trim loop stops at n == 0 exactly as before).
-        var n: usize = if (self.array.asize == 0) 0 else self.array.asize - 1;
-        const max_key = n;
-        // Trim trailing nils: if the array part ends in a nil, the border is the
-        // last non-nil prefix and cannot extend past it.
-        while (n > 0 and self.array.get(n).isNil()) n -= 1;
-        if (n < max_key) return @intCast(n);
+        // participates (the search below treats slot 0 as present).
+        const n: usize = if (self.array.asize == 0) 0 else self.array.asize - 1;
+        // The array part ends in a nil: binary-search a non-nil → nil
+        // transition inside it, as `lj_tab_len` does. `lo` is present (or 0)
+        // and `hi` is nil throughout, so `lo` is a border. A linear trim of
+        // the trailing nils made every `#t` of a stack being popped cost its
+        // emptied capacity, quadratic over the pops. On an array with holes
+        // the border found can sit below the highest present index; any
+        // border is a valid `#t`, and it is a pure function of the table.
+        if (n > 0 and self.array.get(n).isNil()) {
+            var lo: usize = 0;
+            var hi: usize = n;
+            while (hi - lo > 1) {
+                const mid = lo + (hi - lo) / 2;
+                if (self.array.get(mid).isNil()) hi = mid else lo = mid;
+            }
+            return @intCast(lo);
+        }
 
         // Array part is non-nil through its end; the border may continue into the
         // hash part. Unbound-then-binary search, as luaH_getn does.
@@ -760,6 +785,56 @@ test "length border and deletion" {
     try t.set(gpa, Value.int(5), Value.nil());
     try testing.expectEqual(@as(i64, 4), t.length());
     try testing.expect(t.get(Value.int(5)).isNil());
+}
+
+test "length: a popped stack's border follows every pop" {
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    const gpa = testing.allocator;
+
+    // `t[#t + 1] = v` pushes, `t[#t] = nil` pops: the capacity left behind is
+    // trailing nils that `#t` must see past.
+    const N: i64 = 1000;
+    var i: i64 = 1;
+    while (i <= N) : (i += 1) try t.set(gpa, Value.int(t.length() + 1), Value.int(i));
+    try testing.expectEqual(N, t.length());
+    i = N;
+    while (i >= 1) : (i -= 1) {
+        try testing.expectEqual(i, t.length());
+        try testing.expectEqual(i, t.get(Value.int(t.length())).asInt());
+        try t.set(gpa, Value.int(t.length()), Value.nil());
+    }
+    try testing.expectEqual(@as(i64, 0), t.length());
+}
+
+test "length: the result is a border for every hole pattern" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xB0DE5);
+    const rnd = prng.random();
+
+    var round: usize = 0;
+    while (round < 200) : (round += 1) {
+        const t = try Table.create(gpa);
+        defer t.destroy(gpa);
+        // A dense run grows the array part; then holes are punched at random,
+        // and some rounds add keys past the array part (the hash continuation).
+        const n = rnd.intRangeAtMost(i64, 0, 300);
+        var k: i64 = 1;
+        while (k <= n) : (k += 1) try t.set(gpa, Value.int(k), Value.int(k));
+        const holes = rnd.intRangeAtMost(i64, 0, 40);
+        var h: i64 = 0;
+        while (h < holes and n > 0) : (h += 1)
+            try t.set(gpa, Value.int(rnd.intRangeAtMost(i64, 1, n)), Value.nil());
+        if (rnd.boolean()) {
+            const extra = rnd.intRangeAtMost(i64, 1, 8);
+            var e: i64 = 1;
+            while (e <= extra) : (e += 1) try t.set(gpa, Value.int(n + e), Value.int(e));
+        }
+        const b = t.length();
+        // `#t == b` holds iff (b == 0 or t[b] ~= nil) and t[b + 1] == nil.
+        if (b > 0) try testing.expect(!t.get(Value.int(b)).isNil());
+        try testing.expect(t.get(Value.int(b + 1)).isNil());
+    }
 }
 
 test "nil and NaN keys are rejected; missing keys read nil" {
@@ -1052,7 +1127,7 @@ test "lane: the nsieve bool pattern packs into a boolean lane (hole at 1)" {
         try testing.expect(v.isBool());
         try testing.expectEqual(true, v.asBool());
     }
-    // `#t` is unchanged by the packing: the trailing-nil trim lands on the last
+    // `#t` is unchanged by the packing: the border search lands on the last
     // contiguous non-nil slot, so the border is K regardless of the hole at 1.
     try testing.expectEqual(K, t.length());
 }

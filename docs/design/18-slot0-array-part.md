@@ -2,7 +2,7 @@
 
 Status: complete — Phases 0–4 landed (`823f7ed` design, `81b73c2` Phase 1, `838fd75` Phase 2 THE flip, `0829bb7` Phase 3 doc sweep, Phase 4 measurement recorded in §P below); only the deliberately-deferred hash-part integer-key recording arc remains open
 Owner: Bart / Claude
-Last updated: 2026-08-14
+Last updated: 2026-10-23
 
 ## Implementation status
 
@@ -142,6 +142,14 @@ grid row-count meaning (D1's conditional contract). Each consumer:
    guard (§R1 finding: `asize - 1` underflows at 0 before the existing
    `n > 0` loop can help). Then the existing trailing-nil trim + border
    search runs from that `n`, never visiting key 0.
+   *Follow-up (2026-10-23):* the linear trailing-nil trim is gone. Popping
+   a stack through `t[#t] = nil` made it quadratic (80k pops cost 57.7G
+   instructions). When the last array slot is nil, `Table.length` now
+   binary-searches a non-nil → nil transition, as LuaJIT's `lj_tab_len`
+   does, with slot 0 standing in as present, so key 0 still never counts.
+   On an array with holes the border found can sit below the highest
+   present index. It is still a valid border and a pure function of the
+   table. `bench/stdlib/tbl_stack.lua` covers this case.
 3. **Append-successor identity**: "append" = writing key `k == asize`
    (the next physical slot), growing `asize` by one. Sites:
    `table.zig:228/295`, `trace.zig:11404`, `irinterp.zig:771`,
