@@ -788,15 +788,20 @@ const Compiler = struct {
     /// `target = value` without the temporary the general path stores from,
     /// when that is equivalent; returns false (nothing emitted) otherwise.
     /// A local target takes the value directly when `value` writes its
-    /// destination only last (`x = x + 1` is one `add`). A field or index
-    /// target stores a local value from its own register when evaluating the
-    /// target's prefix can't write that local (`t.x = v` needs no `move`).
+    /// destination only last (`x = x + 1` is one `add`). An upvalue or global
+    /// target, which has no prefix to evaluate, and a field or index target
+    /// whose prefix can't write the local, store a local value from its own
+    /// register (`u = v`, `t.x = v` need no `move`).
     fn compileSingleAssign(self: *Compiler, tgt: *const ast.Expr, val: *const ast.Expr) Error!bool {
         switch (tgt.data) {
             .name => |nm| {
-                const r = self.resolveLocal(nm) orelse return false;
-                if (!writesDestLast(val)) return false;
-                try self.compileExprTo(val, r);
+                if (self.resolveLocal(nm)) |r| {
+                    if (!writesDestLast(val)) return false;
+                    try self.compileExprTo(val, r);
+                    return true;
+                }
+                const src = self.localRegOf(val) orelse return false;
+                try self.storeName(nm, src, tgt.span);
                 return true;
             },
             .field => |f| {
@@ -2166,6 +2171,25 @@ test "locals are read in place: no operand or result moves" {
         if (ins.op == .add and ins.a == 0 and ins.b == 0 and ins.c == 1) in_place += 1;
     }
     try testing.expectEqual(@as(usize, 2), in_place);
+}
+
+test "doc 71 P0: an upvalue or global stores a local from its own register" {
+    var r = try run(
+        \\local u = 0
+        \\local function f(v) u = v; g = (v) end
+        \\f(4)
+        \\return u * 10 + g
+    );
+    defer r.deinit();
+    try testing.expectEqual(@as(i64, 44), r.value.asInt());
+    const code = r.chunk.proto.protos[0].code;
+    var stores: usize = 0;
+    for (code) |ins| {
+        try testing.expect(ins.op != .move);
+        // `v` is the parameter, r0.
+        if ((ins.op == .set_upval or ins.op == .set_global) and ins.a == 0) stores += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), stores);
 }
 
 test "doc 66 P3: a number literal operand compiles to a constant form" {
