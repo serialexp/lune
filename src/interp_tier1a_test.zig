@@ -1266,15 +1266,16 @@ test "doc 58 §4.5: a while root's zero-completion own-test exits are exempt onl
 test "doc 66 P2: an inlined callee's branch guard is never decoded against the anchor proto" {
     // A guard's source pc lives in the proto it was recorded in: the generic-for
     // iterator below is inlined into main's loop trace, so its wrap test's guard
-    // names pc 5 of the ITERATOR. main's own pc 5 is also a `jmp_if_false` (the
-    // three-local prefix puts it there), so decoding the callee's pc against the
+    // names a pc of the ITERATOR. main's own instruction at that pc is also a
+    // `jmp_if_false` (the two-local prefix puts it there; P3's `add_rk` moved
+    // the iterator's test up one), so decoding the callee's pc against the
     // anchor proto reads a real branch: the wrap exit was routed as a source
     // branch, raised a prime-side want, and unpatched the loop entry on every
     // wrap (array3d after the field forms shortened its iterator by one op).
     // `TraceCode.anchorSourcePc` answers null for any guard at inline depth > 0.
     const gpa = testing.allocator;
     const source =
-        \\local u1, u2, u3 = 1, 2, 3
+        \\local u1, u2 = 1, 2
         \\local n = 40
         \\local wrap = n and n > 0
         \\local function points(s)
@@ -1293,7 +1294,7 @@ test "doc 66 P2: an inlined callee's branch guard is never decoded against the a
         \\for x, y in points(s) do
         \\  s.sum = s.sum + x * y
         \\end
-        \\print(s.sum, wrap, u1 + u2 + u3)
+        \\print(s.sum, wrap, u1 + u2)
     ;
     inline for (.{ false, true }) |native| {
         var vm = try Vm.init(gpa);
@@ -1305,7 +1306,7 @@ test "doc 66 P2: an inlined callee's branch guard is never decoded against the a
         else
             try runExecForTrace(&vm, gpa, source, &out);
         defer chunk.deinit();
-        try testing.expectEqualStrings("608400\ttrue\t6\n", out.buffered());
+        try testing.expectEqualStrings("608400\ttrue\t3\n", out.buffered());
 
         // The coincidence this test exists for must still be present: some
         // inlined branch guard whose raw pc decodes to a conditional branch in

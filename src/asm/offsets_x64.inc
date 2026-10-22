@@ -81,6 +81,8 @@
 .set CF_CODE_CACHE_GEN_SIZE, 8
 .set CF_IN_FLIGHT, 78
 .set CF_IN_FLIGHT_SIZE, 1
+.set CF_CTL, 79
+.set CF_CTL_SIZE, 1
 
 // Closure, Proto, and the heap object header's type byte.
 .set CLOSURE_PROTO, 16

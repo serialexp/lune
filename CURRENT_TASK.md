@@ -18,8 +18,10 @@ MULTI-FILE VIZ + NESTED SUSPENSION (2026-10-22, coral-raven).
   (continuation frames à la LuaJIT FRAME_CONT; pcall as protected frames;
   resumable natives). Rev 2 folds in the codex + antigravity round-1 review
   (docs/reviews/doc68/). Waiting on Bart for Q2 (gsub buffer) and Q3
-  (embedder boundary: defer vs refuse; the reviewers split on both). Code
-  waits until coral-marten commits doc 66 P2 (also in interp.zig).
+  (embedder boundary: defer vs refuse; the reviewers split on both).
+  P0 (FrameCtl byte, no behaviour change) is coded but ungated: the tree
+  doesn't compile mid coral-marten's doc 66 P3 (`add_rk` etc.); they'll
+  bundle it or tell me when interp.zig is clean.
 - Added with it: wasm panics now carry their message to JS
   (`mahina_panic_message_*`, `MahinaTrapError`; the worker reloads the
   module after a trap).
@@ -168,7 +170,13 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     `set_field`) done with its numbers in doc 66's checklist. It also
     fixed a JIT classification bug P2 exposed: inlined-callee branch
     guards were decoded against the anchor proto (`TraceCode.anchorSourcePc`
-    and the `off_frame` memo). P3 (constant-operand arithmetic) next.
+    and the `off_frame` memo).
+  - P3 (constant-operand arithmetic, Q6: separate NV opcodes) done with
+    its numbers in doc 66's checklist, together with the float-text fix
+    it found (exponent form at the extremes, TODO.md's float-text entry).
+    The commit bundles coral-raven's doc 68 P0 hunks (FrameCtl byte) at
+    their request, since both touch interp.zig. P5 (`eq`/`ne` against a
+    constant) next.
   - The 5 failing viz "multi-file:" wasm tests are not P2's. They trap on
     `Vm.callValue`'s `suspend_ctl == null` assert via `require` under a
     suspendable run, which is doc 68's territory. Named wasm frames: bundle

@@ -138,6 +138,8 @@ const expected = [_]Entry{
     .{ .name = "CF_CODE_CACHE_GEN_SIZE", .value = width(CallFrame, "code_cache_gen") },
     .{ .name = "CF_IN_FLIGHT", .value = off(CallFrame, "in_flight") },
     .{ .name = "CF_IN_FLIGHT_SIZE", .value = width(CallFrame, "in_flight") },
+    .{ .name = "CF_CTL", .value = off(CallFrame, "ctl") },
+    .{ .name = "CF_CTL_SIZE", .value = width(CallFrame, "ctl") },
 
     // Closure, Proto, and the heap object header's type byte.
     .{ .name = "CLOSURE_PROTO", .value = off(Closure, "proto") },

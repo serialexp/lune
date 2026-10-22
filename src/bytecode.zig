@@ -237,7 +237,136 @@ pub const OpCode = enum(u8) {
     ///             `t.x = v`, `t["x"] = v`, `function t.f()` and a constructor's
     ///             named fields; the constant-key form of `set_index`.
     set_field,
+
+    // ---- constant-operand arithmetic (doc 66 P3, LuaJIT `ADDVN`/`ADDNV`) ----
+    // `K[c]` is a number constant. The `_rk` forms take it as the right
+    // operand, `R[a] = R[b] op K[c]`; the `_kr` forms as the left one,
+    // `R[a] = K[c] op R[b]`, so a metamethod still sees the operands in
+    // source order. Each is exactly its register form with the constant
+    // loaded first. `arithFormOf` decodes them.
+    /// `a, b, c`   R[a] = R[b] + K[c]
+    add_rk,
+    /// `a, b, c`   R[a] = R[b] - K[c]
+    sub_rk,
+    /// `a, b, c`   R[a] = R[b] * K[c]
+    mul_rk,
+    /// `a, b, c`   R[a] = R[b] / K[c]
+    div_rk,
+    /// `a, b, c`   R[a] = R[b] % K[c]
+    mod_rk,
+    /// `a, b, c`   R[a] = R[b] // K[c]
+    idiv_rk,
+    /// `a, b, c`   R[a] = R[b] ^ K[c]
+    pow_rk,
+    /// `a, b, c`   R[a] = K[c] + R[b]
+    add_kr,
+    /// `a, b, c`   R[a] = K[c] - R[b]
+    sub_kr,
+    /// `a, b, c`   R[a] = K[c] * R[b]
+    mul_kr,
+    /// `a, b, c`   R[a] = K[c] / R[b]
+    div_kr,
+    /// `a, b, c`   R[a] = K[c] % R[b]
+    mod_kr,
+    /// `a, b, c`   R[a] = K[c] // R[b]
+    idiv_kr,
+    /// `a, b, c`   R[a] = K[c] ^ R[b]
+    pow_kr,
+    /// `a, b, c`   R[a] = R[b] & K[c]
+    band_rk,
+    /// `a, b, c`   R[a] = R[b] | K[c]
+    bor_rk,
+    /// `a, b, c`   R[a] = R[b] ~ K[c]
+    bxor_rk,
+    /// `a, b, c`   R[a] = R[b] << K[c]
+    shl_rk,
+    /// `a, b, c`   R[a] = R[b] >> K[c]
+    shr_rk,
 };
+
+/// Doc 66 P3: where an arithmetic or bitwise instruction's operands come
+/// from.
+pub const ArithShape = enum {
+    /// `R[a] = R[b] op R[c]`: the register form.
+    rr,
+    /// `R[a] = R[b] op K[c]`: a constant right operand.
+    rk,
+    /// `R[a] = K[c] op R[b]`: a constant left operand.
+    kr,
+};
+
+/// Doc 66 P3: an arithmetic or bitwise instruction, decoded into its
+/// register-form operator and its operand shape. The interpreter, the
+/// recorder, liveness and fault rendering go through `arithFormOf` instead
+/// of naming the constant forms.
+pub const ArithForm = struct {
+    /// The register-form opcode: `add` for `add`, `add_rk` and `add_kr`.
+    base: OpCode,
+    shape: ArithShape,
+};
+
+/// The arithmetic or bitwise operator `op` performs, or null when it is not
+/// one. Usable at comptime.
+pub fn arithFormOf(op: OpCode) ?ArithForm {
+    const base: OpCode, const shape: ArithShape = switch (op) {
+        .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .sar => .{ op, .rr },
+        .add_rk => .{ .add, .rk },
+        .sub_rk => .{ .sub, .rk },
+        .mul_rk => .{ .mul, .rk },
+        .div_rk => .{ .div, .rk },
+        .mod_rk => .{ .mod, .rk },
+        .idiv_rk => .{ .idiv, .rk },
+        .pow_rk => .{ .pow, .rk },
+        .add_kr => .{ .add, .kr },
+        .sub_kr => .{ .sub, .kr },
+        .mul_kr => .{ .mul, .kr },
+        .div_kr => .{ .div, .kr },
+        .mod_kr => .{ .mod, .kr },
+        .idiv_kr => .{ .idiv, .kr },
+        .pow_kr => .{ .pow, .kr },
+        .band_rk => .{ .band, .rk },
+        .bor_rk => .{ .bor, .rk },
+        .bxor_rk => .{ .bxor, .rk },
+        .shl_rk => .{ .shl, .rk },
+        .shr_rk => .{ .shr, .rk },
+        else => return null,
+    };
+    return .{ .base = base, .shape = shape };
+}
+
+/// The constant form of register-form operator `base` with a constant on
+/// the side `shape` names, or null when there is none (the compiler then
+/// keeps the register form). The inverse of `arithFormOf`.
+pub fn constantFormOf(base: OpCode, shape: ArithShape) ?OpCode {
+    return switch (shape) {
+        .rr => null,
+        .rk => switch (base) {
+            .add => .add_rk,
+            .sub => .sub_rk,
+            .mul => .mul_rk,
+            .div => .div_rk,
+            .mod => .mod_rk,
+            .idiv => .idiv_rk,
+            .pow => .pow_rk,
+            .band => .band_rk,
+            .bor => .bor_rk,
+            .bxor => .bxor_rk,
+            .shl => .shl_rk,
+            .shr => .shr_rk,
+            else => null,
+        },
+        .kr => switch (base) {
+            .add => .add_kr,
+            .sub => .sub_kr,
+            .mul => .mul_kr,
+            .div => .div_kr,
+            .mod => .mod_kr,
+            .idiv => .idiv_kr,
+            .pow => .pow_kr,
+            else => null,
+        },
+    };
+}
 
 /// Doc 58: the kind of loop a `loop` marker belongs to, in its `.b` operand.
 pub const LoopKind = enum(u16) {
@@ -791,6 +920,28 @@ pub fn writeProto(w: *io.Writer, proto: *const Proto) io.Writer.Error!void {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "doc 66 P3: arithFormOf and constantFormOf are inverses" {
+    var forms: usize = 0;
+    for (std.enums.values(OpCode)) |op| {
+        const f = arithFormOf(op) orelse continue;
+        if (f.shape == .rr) {
+            try testing.expectEqual(op, f.base);
+            continue;
+        }
+        forms += 1;
+        try testing.expectEqual(@as(?OpCode, op), constantFormOf(f.base, f.shape));
+        try testing.expectEqual(ArithShape.rr, arithFormOf(f.base).?.shape);
+    }
+    try testing.expectEqual(@as(usize, 19), forms);
+    // Bitwise ops take a constant on the right only; `sar` and the
+    // non-arithmetic ops have no constant form.
+    try testing.expectEqual(@as(?OpCode, null), constantFormOf(.band, .kr));
+    try testing.expectEqual(@as(?OpCode, null), constantFormOf(.sar, .rk));
+    try testing.expectEqual(@as(?OpCode, null), constantFormOf(.concat, .rk));
+    try testing.expectEqual(@as(?OpCode, null), constantFormOf(.add, .rr));
+    try testing.expectEqual(@as(?ArithForm, null), arithFormOf(.concat));
+}
 
 test "Instr is a compact 12 bytes" {
     // Auto-layout struct (Zig may reorder fields to minimise padding); we only

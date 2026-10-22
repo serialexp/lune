@@ -9,7 +9,11 @@ instructions, against LuaJIT `-joff`. These are not `@bench` programs, so
 - `ops2.lua`: probes with mahina-only syntax (`//`). The LuaJIT column is
   skipped for it.
 - `ops3.lua`: doc 66's probes: constant loads, local-table fields,
-  compare-and-branch, `== nil`, and one `pairs` step.
+  compare-and-branch, `== nil`, one `pairs` step, arithmetic with a
+  constant operand on either side (`ksubr`, `ksubl`, `kmix`, `kfadd`,
+  `kpow`, `kshl`, `kband`) and the register-form float and int handlers
+  they share (`rfmul`, `rfsub`, `rfdiv`, `rimul`). The bitwise probes
+  compile through `load`, so the file still parses under LuaJIT.
 - `fields.lua`: field reads, writes and `__index` method lookup (item 2).
 
 Usage, from the repo root, with a ReleaseFast build (`just release`):

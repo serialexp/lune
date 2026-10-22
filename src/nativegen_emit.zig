@@ -1010,6 +1010,9 @@ pub fn emitInlineSelfPush(
     // Doc 61 §4.2: a pushed frame starts out of flight (the struct-literal
     // default); the slot may hold a retained faulting frame's set flag.
     try a.movByteMemImm(.rax, abi.frame_in_flight_off, 0);
+    // Doc 68: an ordinary Lua frame with no continuation; the slot may hold
+    // an old activation's.
+    try a.movByteMemImm(.rax, abi.frame_ctl_off, 0);
     // ctx.base refresh now, while rcx still holds callee_base (step 8's
     // base half, hoisted — nothing observes ctx mid-sequence).
     try a.movMemReg(.r9, @offsetOf(Ctx, "base"), .rcx);

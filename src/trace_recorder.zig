@@ -1568,19 +1568,13 @@ pub const RecordingSession = struct {
             .move => self.setReg(instr.a, try self.refOf(instr.b)),
 
             // arithmetic / bitwise / unary.
-            .add => try self.recArith(.add, instr, regs),
-            .sub => try self.recArith(.sub, instr, regs),
-            .mul => try self.recArith(.mul, instr, regs),
-            .div => try self.recArith(.div, instr, regs),
-            .idiv => try self.recArith(.idiv, instr, regs),
-            .mod => try self.recArith(.mod, instr, regs),
-            .pow => try self.recArith(.pow, instr, regs),
-            .band => try self.recBitwise(.band, instr, regs),
-            .bor => try self.recBitwise(.bor, instr, regs),
-            .bxor => try self.recBitwise(.bxor, instr, regs),
-            .shl => try self.recBitwise(.shl, instr, regs),
-            .shr => try self.recBitwise(.shr, instr, regs),
-            .sar => try self.recBitwise(.sar, instr, regs),
+            // Doc 66 P3: the constant forms are the register forms with the
+            // constant operand's `konst` in the register's place.
+            .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .sar,
+            .add_rk, .sub_rk, .mul_rk, .div_rk, .mod_rk, .idiv_rk, .pow_rk,
+            .add_kr, .sub_kr, .mul_kr, .div_kr, .mod_kr, .idiv_kr, .pow_kr,
+            .band_rk, .bor_rk, .bxor_rk, .shl_rk, .shr_rk,
+            => try self.recArithInstr(instr, regs, proto),
             .neg => try self.recNeg(instr, regs),
             .not => try self.recNot(instr, regs),
             .bnot => try self.recBnot(instr, regs),
@@ -2131,28 +2125,70 @@ pub const RecordingSession = struct {
         return iof;
     }
 
-    pub fn recArith(self: *RecordingSession, op: IrOp, instr: Instr, regs: RegWindow) !void {
-        const vb = regs.get(instr.b);
-        const vc = regs.get(instr.c);
-        if (!vb.isNumber() or !vc.isNumber()) return self.abort(.bad_type);
-        const rb = try self.refOf(instr.b);
-        const rc = try self.refOf(instr.c);
-        try self.guardNum(rb, vb, .operand_type, .b);
-        try self.guardNum(rc, vc, .operand_type, .c);
-        const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = arithResultType(op, vb, vc) });
-        self.setReg(instr.a, r);
+    /// Doc 66 P3: an arithmetic instruction's slot frame. `lhs` and `rhs`
+    /// are the operands in source order, each designated by the instruction
+    /// field it lives in (`.b` for the register of a constant form, `.c` for
+    /// its constant).
+    pub const ArithFrame = struct {
+        dst: u16,
+        lhs: Operand,
+        rhs: Operand,
+        lhs_od: OperandDesig,
+        rhs_od: OperandDesig,
+    };
+
+    pub fn arithFrameOf(instr: Instr, proto: *const Proto, shape: bytecode.ArithShape) ArithFrame {
+        return switch (shape) {
+            .rr => .{ .dst = instr.a, .lhs = .{ .reg = instr.b }, .rhs = .{ .reg = instr.c }, .lhs_od = .b, .rhs_od = .c },
+            .rk => .{ .dst = instr.a, .lhs = .{ .reg = instr.b }, .rhs = .{ .konst = proto.constants[instr.c] }, .lhs_od = .b, .rhs_od = .c },
+            .kr => .{ .dst = instr.a, .lhs = .{ .konst = proto.constants[instr.c] }, .rhs = .{ .reg = instr.b }, .lhs_od = .c, .rhs_od = .b },
+        };
     }
 
-    pub fn recBitwise(self: *RecordingSession, op: IrOp, instr: Instr, regs: RegWindow) !void {
-        const vb = regs.get(instr.b);
-        const vc = regs.get(instr.c);
+    /// Record an arithmetic or bitwise instruction, any shape.
+    fn recArithInstr(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto) !void {
+        const f = bytecode.arithFormOf(instr.op).?;
+        const fr = arithFrameOf(instr, proto, f.shape);
+        switch (f.base) {
+            .add => try self.recArith(.add, fr, regs),
+            .sub => try self.recArith(.sub, fr, regs),
+            .mul => try self.recArith(.mul, fr, regs),
+            .div => try self.recArith(.div, fr, regs),
+            .idiv => try self.recArith(.idiv, fr, regs),
+            .mod => try self.recArith(.mod, fr, regs),
+            .pow => try self.recArith(.pow, fr, regs),
+            .band => try self.recBitwise(.band, fr, regs),
+            .bor => try self.recBitwise(.bor, fr, regs),
+            .bxor => try self.recBitwise(.bxor, fr, regs),
+            .shl => try self.recBitwise(.shl, fr, regs),
+            .shr => try self.recBitwise(.shr, fr, regs),
+            .sar => try self.recBitwise(.sar, fr, regs),
+            else => unreachable,
+        }
+    }
+
+    pub fn recArith(self: *RecordingSession, op: IrOp, f: ArithFrame, regs: RegWindow) !void {
+        const vb = operandValue(regs, f.lhs);
+        const vc = operandValue(regs, f.rhs);
+        if (!vb.isNumber() or !vc.isNumber()) return self.abort(.bad_type);
+        const rb = try self.operandRef(f.lhs);
+        const rc = try self.operandRef(f.rhs);
+        try self.guardNum(rb, vb, .operand_type, f.lhs_od);
+        try self.guardNum(rc, vc, .operand_type, f.rhs_od);
+        const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = arithResultType(op, vb, vc) });
+        self.setReg(f.dst, r);
+    }
+
+    pub fn recBitwise(self: *RecordingSession, op: IrOp, f: ArithFrame, regs: RegWindow) !void {
+        const vb = operandValue(regs, f.lhs);
+        const vc = operandValue(regs, f.rhs);
         if (!vb.isInt() or !vc.isInt()) return self.abort(.bad_type);
-        const rb = try self.refOf(instr.b);
-        const rc = try self.refOf(instr.c);
-        try self.guardInt(rb, .operand_type, .b);
-        try self.guardInt(rc, .operand_type, .c);
+        const rb = try self.operandRef(f.lhs);
+        const rc = try self.operandRef(f.rhs);
+        try self.guardInt(rb, .operand_type, f.lhs_od);
+        try self.guardInt(rc, .operand_type, f.rhs_od);
         const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .int });
-        self.setReg(instr.a, r);
+        self.setReg(f.dst, r);
     }
 
     pub fn recNeg(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
@@ -2230,26 +2266,29 @@ pub const RecordingSession = struct {
     // operand is designated in exit provenance (`.b`/`.c` for the opcodes,
     // `.a1`/`.a2`/`.a3` — call args — for the builtins).
 
-    /// Doc 66 P2: where an access's key comes from.
-    pub const KeyOperand = union(enum) {
-        /// A guest register (`get_index`/`set_index`, `rawget`/`rawset`).
+    /// Doc 66: where an operand comes from: an access's key (P2) or an
+    /// arithmetic operand (P3).
+    pub const Operand = union(enum) {
+        /// A guest register (`get_index`/`set_index`, `rawget`/`rawset`, the
+        /// register forms of arithmetic).
         reg: u16,
-        /// A proto constant (`get_field`/`set_field`), always an interned
-        /// string, so the array shapes never see one.
+        /// A proto constant: an interned string for `get_field`/`set_field`
+        /// (so the array shapes never see one), a number for the constant
+        /// arithmetic forms.
         konst: Value,
     };
 
-    /// The key's observed value.
-    fn keyValue(regs: RegWindow, k: KeyOperand) Value {
+    /// The operand's observed value.
+    fn operandValue(regs: RegWindow, k: Operand) Value {
         return switch (k) {
             .reg => |r| regs.get(r),
             .konst => |v| v,
         };
     }
 
-    /// The key's SSA ref: the register's, or the interned `konst` that a
+    /// The operand's SSA ref: the register's, or the interned `konst` that a
     /// `load_const` of the same constant would have produced.
-    fn keyRef(self: *RecordingSession, k: KeyOperand) !Ref {
+    fn operandRef(self: *RecordingSession, k: Operand) !Ref {
         return switch (k) {
             .reg => |r| self.refOf(r),
             .konst => |v| self.konst(v),
@@ -2260,7 +2299,7 @@ pub const RecordingSession = struct {
     pub const GetFrame = struct {
         dst: u16,
         tab: u16,
-        key: KeyOperand,
+        key: Operand,
         tab_od: OperandDesig,
         key_od: OperandDesig,
     };
@@ -2268,7 +2307,7 @@ pub const RecordingSession = struct {
     /// Slot frame for the write shapes: `val` is the stored value's register.
     pub const SetFrame = struct {
         tab: u16,
-        key: KeyOperand,
+        key: Operand,
         val: u16,
         tab_od: OperandDesig,
         key_od: OperandDesig,
@@ -2305,7 +2344,7 @@ pub const RecordingSession = struct {
 
     pub fn arrayGetShape(self: *RecordingSession, regs: RegWindow, f: GetFrame) !void {
         const vtab = regs.get(f.tab);
-        const vkey = keyValue(regs, f.key);
+        const vkey = operandValue(regs, f.key);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         const idx = keyIndexOf(vkey) orelse {
             self.dbg("bad_type arrayGet key: isInt={} isFloat={} pc={d}", .{ vkey.isInt(), vkey.isFloat(), self.cur_pc });
@@ -2629,7 +2668,7 @@ pub const RecordingSession = struct {
         // because we cannot tell append-vs-in-bounds until we know `idx`/`len` below.
         // See `docs/design/08-multi-store-sinking.md`.
         const vtab = regs.get(f.tab);
-        const vkey = keyValue(regs, f.key);
+        const vkey = operandValue(regs, f.key);
         const vval = regs.get(f.val);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         if (self.globalsStoreBars(vtab)) return self.abort(.aliased_input); // doc 43 P0b
@@ -3083,12 +3122,12 @@ pub const RecordingSession = struct {
     /// General absent lookup. Keep the nil constant behind a runtime proof;
     /// never specialize an observed absence into an unconditional result.
     fn recordAbsentGet(self: *RecordingSession, regs: RegWindow, f: GetFrame) !void {
-        const key = keyValue(regs, f.key);
+        const key = operandValue(regs, f.key);
         const rtab = try self.refOf(f.tab);
         const rkey = if (key.isNumber())
             try self.keyRefNarrowed(f.key.reg, f.key_od, key)
         else
-            try self.keyRef(f.key);
+            try self.operandRef(f.key);
         if (!key.isNumber() and self.konstValueOf(rkey) == null) return self.abort(.bad_type);
         // Pending mutations are not yet in the executor heap. The existing
         // forwarding paths either resolve them or refuse ambiguous aliases.
@@ -3106,7 +3145,7 @@ pub const RecordingSession = struct {
 
     pub fn hashGetShape(self: *RecordingSession, regs: RegWindow, f: GetFrame) !void {
         const vtab = regs.get(f.tab);
-        const vkey = keyValue(regs, f.key);
+        const vkey = operandValue(regs, f.key);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
         if (tbl.metatable != null) return self.abort(.has_metatable);
@@ -3154,7 +3193,7 @@ pub const RecordingSession = struct {
         // `load_const`), so its ref is provably the constant — no runtime key-
         // identity guard is needed and the cell is pinnable. A computed key reaches
         // here as a `slot_load`/arith ref and aborts (v1 scope).
-        const rkey = try self.keyRef(f.key);
+        const rkey = try self.operandRef(f.key);
         if (self.instrs.items[@intCast(rkey)].op != .konst) return self.abort(.bad_type);
 
         const rtab = try self.refOf(f.tab);
@@ -3241,7 +3280,7 @@ pub const RecordingSession = struct {
 
     pub fn hashSetShape(self: *RecordingSession, regs: RegWindow, f: SetFrame) !void {
         const vtab = regs.get(f.tab);
-        const vkey = keyValue(regs, f.key);
+        const vkey = operandValue(regs, f.key);
         const vval = regs.get(f.val);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         if (self.globalsStoreBars(vtab)) return self.abort(.aliased_input);
@@ -3256,7 +3295,7 @@ pub const RecordingSession = struct {
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
         if (tbl.metatable != null) return self.abort(.has_metatable);
         _ = tbl.fieldPtr(vkey) orelse return self.abort(.bad_type); // absent = insert
-        const rkey = try self.keyRef(f.key);
+        const rkey = try self.operandRef(f.key);
         if (self.instrs.items[@intCast(rkey)].op != .konst) return self.abort(.bad_type);
 
         // C1 / store-sinking, identical to `recArraySet`: a write following any heap

@@ -1115,6 +1115,78 @@ test "doc 66 P2: the constant-key field forms match the register-key access" {
     );
 }
 
+test "doc 66 P3: every constant arithmetic form is its register form" {
+    // Each operator with a literal on either side (`x + (2)`, `(2) + x`)
+    // against the same operator with the constant in a register, over an
+    // operand matrix: ints at the edges, floats, -0.0, NaN, inf, a table with
+    // every metamethod (which sees the operands in source order), a string, a
+    // boolean and nil. The result's type and value, or the error message
+    // without its location, must match. The compiler emits a constant form
+    // wherever one exists (the compiler test pins which).
+    //
+    // The two sides share the handlers' number lanes (mixed int/float, pow,
+    // shifts, mod/idiv on floats), so the digest of every result pins those
+    // lanes as well: it was taken on e4ba1e2, before them, where every case
+    // ran through `arith`.
+    try expectProgram(
+        \\local M = {}
+        \\for _, op in ipairs({ "add", "sub", "mul", "div", "mod", "idiv", "pow", "band", "bor", "bxor", "shl", "shr" }) do
+        \\  M["__" .. op] = function(a, b)
+        \\    return (type(a) == "table" and "T" or type(a)) .. op .. (type(b) == "table" and "T" or type(b))
+        \\  end
+        \\end
+        \\local X = { 7, -7, 0, math.mininteger, math.maxinteger, 2.5, -0.0, 0 / 0, 1 / 0, setmetatable({}, M), "7", true }
+        \\local function render(ok, v)
+        \\  if not ok then return "E:" .. string.gsub(tostring(v), "^[^:]*:%d+: ", "") end
+        \\  if math.type(v) == "float" then return "f:" .. string.format("%.17g", v) end
+        \\  return (math.type(v) or type(v)) .. ":" .. tostring(v)
+        \\end
+        \\local bad, checks, h = 0, 0, 0
+        \\local function check(kexpr, rexpr, k)
+        \\  local kf = load("return function(x) return " .. kexpr .. " end")()
+        \\  local rf = load("return function(x, k) return " .. rexpr .. " end")()
+        \\  for i = 1, 13 do
+        \\    local got = render(pcall(kf, X[i]))
+        \\    if got ~= render(pcall(rf, X[i], k)) then bad = bad + 1 end
+        \\    for j = 1, #got do h = h * 31 + string.codepoint(got, j) end
+        \\    checks = checks + 1
+        \\  end
+        \\end
+        \\local K = { "2", "-3", "0", "-1", "0.5", "-0.0", "1e308", "9223372036854775807" }
+        \\for _, op in ipairs({ "+", "-", "*", "/", "%", "//", "^", "&", "|", "~", "<<", ">>" }) do
+        \\  for _, k in ipairs(K) do
+        \\    local kv = load("return " .. k)()
+        \\    check("x " .. op .. " (" .. k .. ")", "x " .. op .. " k", kv)
+        \\    check("(" .. k .. ") " .. op .. " x", "k " .. op .. " x", kv)
+        \\  end
+        \\end
+        \\print(bad, checks, h)
+        \\
+    , "0\t2496\t-2335769007170761397\n");
+}
+
+test "float text: print, tostring and .. agree, exponent form at the extremes" {
+    // One renderer (`io.formatFloat`) behind all three. Positional text at
+    // the extremes ran to 330 bytes and overran the fixed buffers `tostring`
+    // and `..` render into (a panic in Debug, UB in release); a loop over the
+    // conversions keeps the traced legs on the same renderer.
+    try expectProgram(
+        \\local xs = { 1e308 / 3, 5e-324, 1e21, 1e20, 1e-7, 1e-8, -1e300 / 7, 0.1, 2 ^ 63 }
+        \\local out = {}
+        \\for i = 1, #xs do
+        \\  local x = xs[i]
+        \\  local t = tostring(x)
+        \\  out[i] = (t == x .. "" and t == string.format("%s", x)) and t or "MISMATCH"
+        \\end
+        \\print(table.concat(out, " "))
+        \\print(1e308 / 3, -5e-324)
+        \\
+    ,
+        "3.333333333333333e+307 5e-324 1e+21 100000000000000000000 0.0000001 1e-8 -1.4285714285714286e+299 0.1 9223372036854776000\n" ++
+            "3.333333333333333e+307\t-5e-324\n",
+    );
+}
+
 test "compare fast paths: every operand mix matches the full op" {
     // `lt`/`le`/`gt`/`ge` decide two ints or two floats on the raw lanes; a
     // mixed pair, strings and `__lt`/`__le` leave for the full op. Each line

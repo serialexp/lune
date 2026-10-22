@@ -416,6 +416,33 @@ fn orBitsAt(bits: []u64, at: usize, row: []const u64, n: usize) void {
 /// resumed mid-execution** (the keyframe records `pc`/`base`/return-wiring per
 /// frame). Windows stack contiguously upward: `frames[i+1].base == frames[i].base
 /// + frames[i].closure.proto.num_registers`.
+/// Doc 68 §4.3: what a frame's return means for its parent. `.none` is the
+/// ordinary result wiring through `ret_dest`/`ret_count`; the others arrive
+/// with the continuation frames of doc 68 P1/P2.
+pub const Cont = enum(u2) {
+    none,
+    /// Finish the parent's in-flight instruction with this frame's results
+    /// (a metamethod's continuation, `luaV_finishOp`-style).
+    finish_op,
+    /// Step the parent native activation with this frame's results.
+    native_resume,
+};
+
+/// Doc 68 §4.1/§4.3: the activation's kind and its continuation, one byte so
+/// `CallFrame` keeps its stride. Every push writes the zero default: the Zig
+/// funnel through the struct literal, the inline native push and the `.S`
+/// host-call frame write with a byte store, so a reused slot never keeps an
+/// old continuation.
+pub const FrameCtl = packed struct(u8) {
+    /// A native activation (doc 68 §5) rather than a Lua frame. None exist yet.
+    native: bool = false,
+    cont: Cont = .none,
+    /// Which half of a fused `get_index2`/`set_index2` a `.finish_op`
+    /// continuation is finishing (doc 68 §6).
+    phase: u1 = 0,
+    _pad: u4 = 0,
+};
+
 pub const CallFrame = struct {
     /// The closure executing in this frame (its proto = code/constants/upvalues).
     closure: *const Closure,
@@ -480,6 +507,8 @@ pub const CallFrame = struct {
     /// not written by the producer and are masked out. Transient, like
     /// `in_flight`.
     multret_top: u16 = 0,
+    /// Doc 68: kind and continuation. Always the default until doc 68 P1.
+    ctl: FrameCtl = .{},
 };
 
 /// Doc 54 P0: `CallFrame.code_cache_gen`'s "no cached image" sentinel. All-ones
@@ -1113,6 +1142,7 @@ pub const Vm = struct {
             .frame_varargs_count_off = @offsetOf(CallFrame, "varargs_count"),
             .frame_code_cache_gen_off = @offsetOf(CallFrame, "code_cache_gen"),
             .frame_in_flight_off = @offsetOf(CallFrame, "in_flight"),
+            .frame_ctl_off = @offsetOf(CallFrame, "ctl"),
             .max_call_depth = max_call_depth,
         };
     };
@@ -2039,15 +2069,21 @@ pub const Vm = struct {
             Error.DivisionByZero => try arena.dupe(u8, "attempt to perform integer division or modulo by zero"),
             Error.MetatableChainLoop => try arena.dupe(u8, "'__index' chain too long; possible loop"),
             Error.ForStepZero => try arena.dupe(u8, "'for' step is zero"),
-            else => switch (instr.op) {
-                .add, .sub, .mul, .div, .idiv, .mod, .pow => try std.fmt.allocPrint(
-                    arena,
-                    "attempt to perform arithmetic on a {s} value",
-                    .{firstNonNumber(regs.get(instr.b), regs.get(instr.c)).typeName()},
-                ),
-                // Bitwise ops want an integer operand: a float (no integer form)
-                // and a non-number get distinct Lua-5.4-shaped messages.
-                .band, .bor, .bxor, .shl, .shr, .sar => try bitwiseFaultMessage(arena, firstNonInteger(regs.get(instr.b), regs.get(instr.c))),
+            // Doc 66 P3: the register and constant forms alike, over the
+            // operands in source order.
+            else => if (bytecode.arithFormOf(instr.op)) |f| blk: {
+                const o = arithOperandValues(proto, regs, instr, f.shape);
+                break :blk switch (f.base) {
+                    // Bitwise ops want an integer operand: a float (no integer
+                    // form) and a non-number get distinct Lua-5.4-shaped messages.
+                    .band, .bor, .bxor, .shl, .shr, .sar => try bitwiseFaultMessage(arena, firstNonInteger(o[0], o[1])),
+                    else => try std.fmt.allocPrint(
+                        arena,
+                        "attempt to perform arithmetic on a {s} value",
+                        .{firstNonNumber(o[0], o[1]).typeName()},
+                    ),
+                };
+            } else switch (instr.op) {
                 .neg => try std.fmt.allocPrint(arena, "attempt to perform arithmetic on a {s} value", .{regs.get(instr.b).typeName()}),
                 .bnot => try bitwiseFaultMessage(arena, regs.get(instr.b)),
                 .len => try std.fmt.allocPrint(arena, "attempt to get length of a {s} value", .{regs.get(instr.b).typeName()}),
@@ -3256,8 +3292,7 @@ pub const Vm = struct {
         t[@intFromEnum(bytecode.OpCode.set_index)] = opSetIndexSlow(mode);
         t[@intFromEnum(bytecode.OpCode.get_field)] = opGetFieldSlow(mode);
         t[@intFromEnum(bytecode.OpCode.set_field)] = opSetFieldSlow(mode);
-        t[@intFromEnum(bytecode.OpCode.idiv)] = opModIdivSlow(mode, .idiv);
-        t[@intFromEnum(bytecode.OpCode.mod)] = opModIdivSlow(mode, .mod);
+        inline for (.{ .idiv, .mod, .idiv_rk, .mod_rk, .idiv_kr, .mod_kr }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opModIdivSlow(mode, op);
         inline for (.{ .eq, .ne }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opEqNeSlow(mode, op);
         inline for (.{ .lt, .le, .gt, .ge }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opCompareSlow(mode, op);
         return t;
@@ -5875,11 +5910,11 @@ pub const Vm = struct {
     fn handlerFor(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
         return switch (op) {
             .load_nil, .load_bool, .load_int, .load_const, .move => opLoad(mode, op),
-            .add, .sub, .mul => opBinNum(mode, op),
-            .div => opDiv(mode),
-            .idiv, .mod => opModIdiv(mode, op),
-            .pow, .shl, .shr, .sar => opArithMeta(mode, op),
-            .band, .bor, .bxor => opBinBit(mode, op),
+            .add, .sub, .mul, .add_rk, .sub_rk, .mul_rk, .add_kr, .sub_kr, .mul_kr => opBinNum(mode, op),
+            .div, .div_rk, .div_kr => opDiv(mode, op),
+            .idiv, .mod, .idiv_rk, .mod_rk, .idiv_kr, .mod_kr => opModIdiv(mode, op),
+            .pow, .pow_rk, .pow_kr => opPow(mode, op),
+            .band, .bor, .bxor, .shl, .shr, .sar, .band_rk, .bor_rk, .bxor_rk, .shl_rk, .shr_rk => opBinBit(mode, op),
             .neg => opNeg(mode),
             .not => opNot(mode),
             .bnot => opBnot(mode),
@@ -5943,75 +5978,168 @@ pub const Vm = struct {
     // operand mix falls back to the exact `arith.*` + `arithMeta` path (mixed
     // promotion, `__add`/… metamethod, or a propagated error like
     // `DivisionByZero`). Numbers carry no metatable, so the common path never
-    // touches dispatch.
+    // touches dispatch. Doc 66 P3: each handler is built per opcode, register
+    // form and constant forms alike, and reads its operands through
+    // `arithOperands`; the lanes are the same for every shape.
+
+    /// Doc 66 P3: an arithmetic or bitwise instruction's operands in source
+    /// order, as raw lanes. The register form reads `R[b]` and `R[c]`; a
+    /// constant form reads `R[b]` and the number constant `K[c]` on the side
+    /// its shape names. The tags are read up front; the payloads stay behind
+    /// pointers so each lane loads only what it uses, straight into the
+    /// register it computes in (a float lane's load folds into `vdivsd`
+    /// instead of passing through a general register: 3 instructions on `/`).
+    /// Every lane reads its operands before it writes `R[a]`, which may be
+    /// either of them.
+    const ArithOperands = struct {
+        lt: value.Tag,
+        rt: value.Tag,
+        lp: *const u64,
+        rp: *const u64,
+
+        inline fn lb(self: ArithOperands) u64 {
+            return self.lp.*;
+        }
+
+        inline fn rb(self: ArithOperands) u64 {
+            return self.rp.*;
+        }
+
+        inline fn lhs(self: ArithOperands) Value {
+            return .{ .tag = self.lt, .payload = .{ .bits = self.lb() } };
+        }
+
+        inline fn rhs(self: ArithOperands) Value {
+            return .{ .tag = self.rt, .payload = .{ .bits = self.rb() } };
+        }
+
+        inline fn bothInt(self: ArithOperands) bool {
+            return self.lt == .int and self.rt == .int;
+        }
+
+        inline fn bothFloat(self: ArithOperands) bool {
+            return self.lt == .float and self.rt == .float;
+        }
+
+        inline fn bothNumber(self: ArithOperands) bool {
+            return (self.lt == .int or self.lt == .float) and (self.rt == .int or self.rt == .float);
+        }
+
+        /// A number operand as a float, as `Value.toFloat` converts it.
+        inline fn lhsFloat(self: ArithOperands) f64 {
+            return laneFloat(self.lt, self.lb());
+        }
+
+        inline fn rhsFloat(self: ArithOperands) f64 {
+            return laneFloat(self.rt, self.rb());
+        }
+    };
+
+    inline fn laneFloat(t: value.Tag, bits: u64) f64 {
+        return if (t == .int) @floatFromInt(@as(i64, @bitCast(bits))) else @bitCast(bits);
+    }
+
+    inline fn arithOperands(comptime shape: bytecode.ArithShape, st: *const ExecState, regs: RegWindow, instr: *const Instr) ArithOperands {
+        switch (shape) {
+            .rr => return .{ .lt = regs.tagAt(instr.b), .rt = regs.tagAt(instr.c), .lp = &regs.payloads[instr.b], .rp = &regs.payloads[instr.c] },
+            .rk => {
+                const k = &st.proto.constants[instr.c];
+                return .{ .lt = regs.tagAt(instr.b), .rt = k.tag, .lp = &regs.payloads[instr.b], .rp = &k.payload.bits };
+            },
+            .kr => {
+                const k = &st.proto.constants[instr.c];
+                return .{ .lt = k.tag, .rt = regs.tagAt(instr.b), .lp = &k.payload.bits, .rp = &regs.payloads[instr.b] };
+            },
+        }
+    }
+
+    /// `arith`'s operation for register-form operator `base`.
+    inline fn arithRaw(comptime base: bytecode.OpCode, lhs: Value, rhs: Value) arith.Error!Value {
+        return switch (base) {
+            .add => arith.add(lhs, rhs),
+            .sub => arith.sub(lhs, rhs),
+            .mul => arith.mul(lhs, rhs),
+            .div => arith.div(lhs, rhs),
+            .idiv => arith.floorDiv(lhs, rhs),
+            .mod => arith.mod(lhs, rhs),
+            .pow => arith.pow(lhs, rhs),
+            .band => arith.band(lhs, rhs),
+            .bor => arith.bor(lhs, rhs),
+            .bxor => arith.bxor(lhs, rhs),
+            .shl => arith.shl(lhs, rhs),
+            .shr => arith.shr(lhs, rhs),
+            .sar => arith.sar(lhs, rhs),
+            else => comptime unreachable,
+        };
+    }
+
+    /// `R[a] = lhs op rhs` through `arith` and the operator's metamethod:
+    /// every handler's last resort.
+    inline fn arithGeneric(self: *Vm, comptime base: bytecode.OpCode, regs: RegWindow, a: usize, o: ArithOperands) Error!void {
+        const lhs = o.lhs();
+        const rhs = o.rhs();
+        regs.set(a, try self.arithMeta(arithRaw(base, lhs, rhs), @field(self.mm, @tagName(base)), lhs, rhs));
+    }
+
+    /// `+`, `-`, `*`: both-int (wrapping) and both-float lanes, then the
+    /// mixed one (both as floats, as `arith.add` computes it), then `arith`.
     fn opBinNum(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        const f = comptime bytecode.arithFormOf(op).?;
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                const self = vm;
-                self.binNum(regs, instr.a, instr.b, instr.c, comptime switch (op) {
-                    .add => .add,
-                    .sub => .sub,
-                    .mul => .mul,
-                    else => unreachable,
-                }, switch (op) {
-                    .add => self.mm.add,
-                    .sub => self.mm.sub,
-                    .mul => self.mm.mul,
-                    else => unreachable,
-                }) catch |e| return parkErr(st, e);
+                vm.binNum(regs, instr.a, arithOperands(f.shape, st, regs, instr), f.base) catch |e| return parkErr(st, e);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
     }
 
-    fn opDiv(comptime mode: ExecMode) *const HandlerFn {
+    /// `/`: always a float, so any two numbers divide on the lanes.
+    fn opDiv(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        const f = comptime bytecode.arithFormOf(op).?;
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
-                const self = vm;
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                const tb = regs.tagAt(instr.b);
-                const tc = regs.tagAt(instr.c);
-                if (tb == .float and tc == .float) {
-                    @setFloatMode(.strict);
-                    regs.setFloat(instr.a, @as(f64, @bitCast(regs.bitsAt(instr.b))) / @as(f64, @bitCast(regs.bitsAt(instr.c))));
+                const o = arithOperands(f.shape, st, regs, instr);
+                @setFloatMode(.strict);
+                if (o.bothFloat()) {
+                    regs.setFloat(instr.a, @as(f64, @bitCast(o.lb())) / @as(f64, @bitCast(o.rb())));
+                } else if (o.bothNumber()) {
+                    regs.setFloat(instr.a, o.lhsFloat() / o.rhsFloat());
                 } else {
-                    const lhs = regs.get(instr.b);
-                    const rhs = regs.get(instr.c);
-                    regs.set(instr.a, self.arithMeta(arith.div(lhs, rhs), self.mm.div, lhs, rhs) catch |e| return parkErr(st, e));
+                    vm.arithGeneric(.div, regs, instr.a, o) catch |e| return parkErr(st, e);
                 }
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
     }
 
-    /// The `arith.* → arithMeta` fallback family (no raw-lane fast path).
-    fn opArithMeta(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+    /// `^`: always a float, through the one `fmath.powRuntime` kernel
+    /// `arith.pow` uses, so any two numbers take the lane.
+    fn opPow(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        const f = comptime bytecode.arithFormOf(op).?;
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
-                const self = vm;
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                const lhs = regs.get(instr.b);
-                const rhs = regs.get(instr.c);
-                const raw = switch (op) {
-                    .idiv => arith.floorDiv(lhs, rhs),
-                    .mod => arith.mod(lhs, rhs),
-                    .pow => arith.pow(lhs, rhs),
-                    .shl => arith.shl(lhs, rhs),
-                    .shr => arith.shr(lhs, rhs),
-                    .sar => arith.sar(lhs, rhs),
-                    else => unreachable,
-                };
-                const name = switch (op) {
-                    .idiv => self.mm.idiv,
-                    .mod => self.mm.mod,
-                    .pow => self.mm.pow,
-                    .shl => self.mm.shl,
-                    .shr => self.mm.shr,
-                    .sar => self.mm.sar,
-                    else => unreachable,
-                };
-                regs.set(instr.a, self.arithMeta(raw, name, lhs, rhs) catch |e| return parkErr(st, e));
+                const o = arithOperands(f.shape, st, regs, instr);
+                if (o.bothNumber()) {
+                    regs.setFloat(instr.a, fmath.powRuntime(o.lhsFloat(), o.rhsFloat()));
+                } else {
+                    vm.arithGeneric(.pow, regs, instr.a, o) catch |e| return parkErr(st, e);
+                }
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// The `arith.* → arithMeta` path on its own: `opModIdivSlow`'s last
+    /// resort.
+    fn opArithMeta(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        const f = comptime bytecode.arithFormOf(op).?;
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                vm.arithGeneric(f.base, regs, instr.a, arithOperands(f.shape, st, regs, instr)) catch |e| return parkErr(st, e);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -6024,17 +6152,19 @@ pub const Vm = struct {
     /// float lane lives there because its kernel call cost the int lane
     /// 8 instructions when it sat here.
     fn opModIdiv(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        const f = comptime bytecode.arithFormOf(op).?;
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                if (regs.tagAt(instr.b) == .int and regs.tagAt(instr.c) == .int) {
-                    const x: i64 = @bitCast(regs.bitsAt(instr.b));
-                    const y: i64 = @bitCast(regs.bitsAt(instr.c));
+                const o = arithOperands(f.shape, st, regs, instr);
+                if (o.bothInt()) {
+                    const x: i64 = @bitCast(o.lb());
+                    const y: i64 = @bitCast(o.rb());
                     if (y != 0) {
-                        regs.setInt(instr.a, switch (op) {
+                        regs.setInt(instr.a, switch (f.base) {
                             .mod => if (y == -1) 0 else @mod(x, y),
                             .idiv => if (y == -1) 0 -% x else @divFloor(x, y),
-                            else => unreachable,
+                            else => comptime unreachable,
                         });
                         return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
                     }
@@ -6044,21 +6174,23 @@ pub const Vm = struct {
         }.h;
     }
 
-    /// `opModIdiv`'s slow half: two floats through the same `fmath` kernels
-    /// `arith.mod`/`arith.floorDiv` use, everything else through
-    /// `opArithMeta` (mixed promotion, the zero-divisor error, `__mod`/
-    /// `__idiv`).
+    /// `opModIdiv`'s slow half: two numbers that are not both ints (so the
+    /// result is a float) through the same `fmath` kernels `arith.mod`/
+    /// `arith.floorDiv` use, everything else through `opArithMeta` (the
+    /// zero-divisor error, `__mod`/`__idiv`).
     fn opModIdivSlow(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        const f = comptime bytecode.arithFormOf(op).?;
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                if (regs.tagAt(instr.b) == .float and regs.tagAt(instr.c) == .float) {
-                    const x: f64 = @bitCast(regs.bitsAt(instr.b));
-                    const y: f64 = @bitCast(regs.bitsAt(instr.c));
-                    regs.setFloat(instr.a, switch (op) {
+                const o = arithOperands(f.shape, st, regs, instr);
+                if (o.bothNumber() and !o.bothInt()) {
+                    const x = o.lhsFloat();
+                    const y = o.rhsFloat();
+                    regs.setFloat(instr.a, switch (f.base) {
                         .mod => fmath.fmodRuntime(x, y),
                         .idiv => fmath.floordivRuntime(x, y),
-                        else => unreachable,
+                        else => comptime unreachable,
                     });
                     return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
                 }
@@ -6069,21 +6201,26 @@ pub const Vm = struct {
 
     // ---- bitwise ---- (both-int fast lane; else `arith.*` + meta)
     fn opBinBit(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        const f = comptime bytecode.arithFormOf(op).?;
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                const self = vm;
-                self.binBit(regs, instr.a, instr.b, instr.c, comptime switch (op) {
-                    .band => .band,
-                    .bor => .bor,
-                    .bxor => .bxor,
-                    else => unreachable,
-                }, switch (op) {
-                    .band => self.mm.band,
-                    .bor => self.mm.bor,
-                    .bxor => self.mm.bxor,
-                    else => unreachable,
-                }) catch |e| return parkErr(st, e);
+                const o = arithOperands(f.shape, st, regs, instr);
+                if (o.bothInt()) {
+                    const x: i64 = @bitCast(o.lb());
+                    const y: i64 = @bitCast(o.rb());
+                    regs.setInt(instr.a, switch (f.base) {
+                        .band => x & y,
+                        .bor => x | y,
+                        .bxor => x ^ y,
+                        .shl => arith.shiftLeft(x, y),
+                        .shr => arith.shiftRight(x, y),
+                        .sar => arith.shiftRightArith(x, y),
+                        else => comptime unreachable,
+                    });
+                } else {
+                    vm.arithGeneric(f.base, regs, instr.a, o) catch |e| return parkErr(st, e);
+                }
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -7552,6 +7689,9 @@ pub const Vm = struct {
                 // `print(g())`), take everything the callee produced and stamp
                 // `reg_top` so the parent's adjacent consumer instruction can
                 // expand them.
+                // Doc 68 P0: no frame carries a continuation yet; P1 routes
+                // the others to their finish before the ordinary wiring.
+                std.debug.assert(st.frame.ctl.cont == .none);
                 const parent = &self.frames[self.depth - 2];
                 const wants_all = st.frame.ret_count == bytecode.all_results;
                 const want: usize = if (wants_all) result.count else st.frame.ret_count;
@@ -8063,45 +8203,41 @@ pub const Vm = struct {
         return self.callMeta(handler, &.{ v, v });
     }
 
-    /// Wrap a raw binary arithmetic/bitwise result: on `TypeError` (an operand
-    /// the operator doesn't accept) fall back to the binary metamethod `name`;
-    /// any other arith error (e.g. `DivisionByZero`) propagates unchanged.
-    /// `R[a] = R[b] <op> R[c]` for add/sub/mul, computing the hot both-int and
-    /// both-float cases directly on the raw payload lanes (no `Value` built — the
-    /// SoA spill/scale win), and deferring every other operand mix to the exact
-    /// `arith.*` + `arithMeta` path. Byte-identical to the AoS arms: the int path
-    /// mirrors `Value.int(x +% y)`, the float path mirrors
-    /// `Value.float(x + y)` under `@setFloatMode(.strict)`.
-    inline fn binNum(self: *Vm, regs: RegWindow, a: usize, b: usize, c: usize, comptime op: enum { add, sub, mul }, name: Value) Error!void {
-        const tb = regs.tagAt(b);
-        const tc = regs.tagAt(c);
-        if (tb == .int and tc == .int) {
-            const x: i64 = @bitCast(regs.bitsAt(b));
-            const y: i64 = @bitCast(regs.bitsAt(c));
-            regs.setInt(a, switch (op) {
+    /// `R[a] = lhs <op> rhs` for add/sub/mul, computing the hot both-int,
+    /// both-float and mixed cases directly on the raw payload lanes (no `Value`
+    /// built — the SoA spill/scale win), and deferring every other operand mix
+    /// to the exact `arith.*` + `arithMeta` path. Byte-identical to `arith`:
+    /// the int path mirrors `Value.int(x +% y)`, the float and mixed paths
+    /// `Value.float(x.toFloat() + y.toFloat())` under `@setFloatMode(.strict)`.
+    inline fn binNum(self: *Vm, regs: RegWindow, a: usize, o: ArithOperands, comptime base: bytecode.OpCode) Error!void {
+        if (o.bothInt()) {
+            const x: i64 = @bitCast(o.lb());
+            const y: i64 = @bitCast(o.rb());
+            regs.setInt(a, switch (base) {
                 .add => x +% y,
                 .sub => x -% y,
                 .mul => x *% y,
+                else => comptime unreachable,
             });
-        } else if (tb == .float and tc == .float) {
+        } else if (o.bothFloat()) {
             @setFloatMode(.strict);
-            const x: f64 = @bitCast(regs.bitsAt(b));
-            const y: f64 = @bitCast(regs.bitsAt(c));
-            regs.setFloat(a, switch (op) {
-                .add => x + y,
-                .sub => x - y,
-                .mul => x * y,
-            });
+            regs.setFloat(a, floatBin(base, @bitCast(o.lb()), @bitCast(o.rb())));
+        } else if (o.bothNumber()) {
+            @setFloatMode(.strict);
+            regs.setFloat(a, floatBin(base, o.lhsFloat(), o.rhsFloat()));
         } else {
-            const lhs = regs.get(b);
-            const rhs = regs.get(c);
-            const raw = switch (op) {
-                .add => arith.add(lhs, rhs),
-                .sub => arith.sub(lhs, rhs),
-                .mul => arith.mul(lhs, rhs),
-            };
-            regs.set(a, try self.arithMeta(raw, name, lhs, rhs));
+            try self.arithGeneric(base, regs, a, o);
         }
+    }
+
+    inline fn floatBin(comptime base: bytecode.OpCode, x: f64, y: f64) f64 {
+        @setFloatMode(.strict);
+        return switch (base) {
+            .add => x + y,
+            .sub => x - y,
+            .mul => x * y,
+            else => comptime unreachable,
+        };
     }
 
     /// The numeric-`for` step shared by `for_loop` and `jfor_loop`, over
@@ -8159,31 +8295,9 @@ pub const Vm = struct {
         return arith.forWithin(regs.get(a), limit, regs.get(a + 2));
     }
 
-    /// `R[a] = R[b] <op> R[c]` for band/bor/bxor. Bitwise ops require integer
-    /// operands, so the only fast lane is both-int (computed directly); anything
-    /// else (a float, a non-number) routes through `arith.*` which raises
-    /// `TypeError` → `__band`/… metamethod, exactly as the AoS arm did.
-    inline fn binBit(self: *Vm, regs: RegWindow, a: usize, b: usize, c: usize, comptime op: enum { band, bor, bxor }, name: Value) Error!void {
-        if (regs.tagAt(b) == .int and regs.tagAt(c) == .int) {
-            const x: i64 = @bitCast(regs.bitsAt(b));
-            const y: i64 = @bitCast(regs.bitsAt(c));
-            regs.setInt(a, switch (op) {
-                .band => x & y,
-                .bor => x | y,
-                .bxor => x ^ y,
-            });
-        } else {
-            const lhs = regs.get(b);
-            const rhs = regs.get(c);
-            const raw = switch (op) {
-                .band => arith.band(lhs, rhs),
-                .bor => arith.bor(lhs, rhs),
-                .bxor => arith.bxor(lhs, rhs),
-            };
-            regs.set(a, try self.arithMeta(raw, name, lhs, rhs));
-        }
-    }
-
+    /// Wrap a raw binary arithmetic/bitwise result: on `TypeError` (an operand
+    /// the operator doesn't accept) fall back to the binary metamethod `name`;
+    /// any other arith error (e.g. `DivisionByZero`) propagates unchanged.
     fn arithMeta(self: *Vm, raw: arith.Error!Value, name: Value, a: Value, b: Value) Error!Value {
         return raw catch |e| switch (e) {
             error.TypeError => self.binMeta(name, a, b, Error.TypeError),
@@ -8741,6 +8855,16 @@ pub fn catchable(e: Error) bool {
     };
 }
 
+/// Doc 66 P3: an arithmetic or bitwise instruction's operands in source
+/// order, for fault rendering: a constant form's `K[c]` on its side.
+fn arithOperandValues(proto: *const bytecode.Proto, regs: RegWindow, instr: Instr, shape: bytecode.ArithShape) [2]Value {
+    return switch (shape) {
+        .rr => .{ regs.get(instr.b), regs.get(instr.c) },
+        .rk => .{ regs.get(instr.b), proto.constants[instr.c] },
+        .kr => .{ proto.constants[instr.c], regs.get(instr.b) },
+    };
+}
+
 /// For an arithmetic fault on `x op y`, the operand that wasn't a number (the
 /// one to blame). Falls back to `x` if both are numbers (shouldn't happen — the
 /// op only faults when one isn't).
@@ -9258,7 +9382,8 @@ fn nativeIoFlush(ctx: *anyopaque, args: []const Value) anyerror!Value {
 }
 
 /// Coerce a concat operand to bytes: a string's own bytes, or a number formatted
-/// into `buf`. Returns a slice valid until `buf` is reused.
+/// into `buf` (at least `io.float_text_max` bytes) as `tostring` renders it.
+/// Returns a slice valid until `buf` is reused.
 pub fn coerceConcat(v: Value, buf: []u8) Error![]const u8 {
     return switch (v.tag) {
         .heap_ref => if (v.heapType() == .string)
@@ -9266,7 +9391,7 @@ pub fn coerceConcat(v: Value, buf: []u8) Error![]const u8 {
         else
             Error.TypeError,
         .int => std.fmt.bufPrint(buf, "{d}", .{v.asInt()}) catch unreachable,
-        .float => std.fmt.bufPrint(buf, "{d}", .{v.asFloat()}) catch unreachable,
+        .float => io.formatFloat(buf, v.asFloat()),
         else => Error.TypeError,
     };
 }

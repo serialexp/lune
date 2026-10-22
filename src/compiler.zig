@@ -467,6 +467,39 @@ const Compiler = struct {
         });
     }
 
+    /// Doc 66 P3: the value of a number literal, through parentheses and a
+    /// unary minus, or null for any other expression. The minus folds exactly
+    /// as `neg` would compute it at run time (an int wraps, a float flips its
+    /// sign), so `x * -1` carries `-1`.
+    fn numberLiteral(e: *const ast.Expr) ?Value {
+        return switch (e.data) {
+            .int => |i| Value.int(i),
+            .float => |f| Value.float(f),
+            .paren => |inner| numberLiteral(inner),
+            .unary => |u| if (u.op != .neg) null else if (numberLiteral(u.operand)) |v|
+                (if (v.isInt()) Value.int(0 -% v.asInt()) else Value.float(-v.asFloat()))
+            else
+                null,
+            else => null,
+        };
+    }
+
+    /// Doc 66 P3: an arithmetic instruction with its constant operand.
+    const ConstantOperand = struct {
+        op: OpCode,
+        k: u16,
+    };
+
+    /// The constant form of register-form operator `base` with `e` as its
+    /// operand on the side `shape` names, when `e` is a number literal and
+    /// the operator has that form; null keeps the register form. A literal
+    /// reads no state, so taking it out of the evaluation order is exact.
+    fn constantOperand(self: *Compiler, base: OpCode, comptime shape: bytecode.ArithShape, e: *const ast.Expr) Error!?ConstantOperand {
+        const op = bytecode.constantFormOf(base, shape) orelse return null;
+        const v = numberLiteral(e) orelse return null;
+        return .{ .op = op, .k = try self.addConstant(v) };
+    }
+
     // ---- scopes & locals ----
 
     fn beginScope(self: *Compiler) void {
@@ -775,9 +808,14 @@ const Compiler = struct {
                     // unless `value` is inert.
                     const m = self.next_reg;
                     const lhs = try self.operandRegBefore(tgt, ca.value);
-                    const rhs = try self.operandReg(ca.value);
-                    self.cur_span = op_span;
-                    _ = try self.emit(Instr.opABC(binOpCode(ca.op), r, lhs, rhs));
+                    if (try self.constantOperand(binOpCode(ca.op), .rk, ca.value)) |ko| {
+                        self.cur_span = op_span;
+                        _ = try self.emit(Instr.opABC(ko.op, r, lhs, ko.k));
+                    } else {
+                        const rhs = try self.operandReg(ca.value);
+                        self.cur_span = op_span;
+                        _ = try self.emit(Instr.opABC(binOpCode(ca.op), r, lhs, rhs));
+                    }
                     self.freeTo(m);
                     return;
                 }
@@ -785,10 +823,7 @@ const Compiler = struct {
                 const m = self.next_reg;
                 const acc = try self.alloc1();
                 try self.loadName(nm, acc, tgt.span);
-                const rhs = try self.alloc1();
-                try self.compileExprTo(ca.value, rhs);
-                self.cur_span = op_span;
-                _ = try self.emit(Instr.opABC(binOpCode(ca.op), acc, acc, rhs));
+                try self.emitCompoundOp(ca.op, acc, ca.value, op_span);
                 try self.storeName(nm, acc, tgt.span);
                 self.freeTo(m);
             },
@@ -829,11 +864,25 @@ const Compiler = struct {
         const m = self.next_reg;
         const cur = try self.alloc1();
         try self.emitGetIndex(cur, obj, key);
+        try self.emitCompoundOp(op, cur, rhs_expr, op_span);
+        try self.emitSetIndex(obj, key, cur);
+        self.freeTo(m);
+    }
+
+    /// `R[acc] = R[acc] op rhs_expr` for a compound assignment through a
+    /// scratch accumulator: the right operand a constant when it is a number
+    /// literal (doc 66 P3), else evaluated into a fresh register.
+    fn emitCompoundOp(self: *Compiler, op: ast.BinaryOp, acc: u16, rhs_expr: *const ast.Expr, op_span: ast.Span) Error!void {
+        if (try self.constantOperand(binOpCode(op), .rk, rhs_expr)) |ko| {
+            self.cur_span = op_span;
+            _ = try self.emit(Instr.opABC(ko.op, acc, acc, ko.k));
+            return;
+        }
+        const m = self.next_reg;
         const rhs = try self.alloc1();
         try self.compileExprTo(rhs_expr, rhs);
         self.cur_span = op_span;
-        _ = try self.emit(Instr.opABC(binOpCode(op), cur, cur, rhs));
-        try self.emitSetIndex(obj, key, cur);
+        _ = try self.emit(Instr.opABC(binOpCode(op), acc, acc, rhs));
         self.freeTo(m);
     }
 
@@ -1350,13 +1399,26 @@ const Compiler = struct {
         }
 
         const m = self.next_reg;
-        const t1 = try self.operandRegBefore(lhs, rhs);
-        const t2 = try self.operandReg(rhs);
+        const base = binOpCode(op);
         // Compiling the operands reset `cur_span`; re-stamp the binop with the
         // whole `lhs op rhs` span so a runtime fault here underlines the
         // operation (which always contains the offending operand).
-        self.cur_span = .{ .start = lhs.span.start, .end = rhs.span.end };
-        _ = try self.emit(Instr.opABC(binOpCode(op), dest, t1, t2));
+        const op_span: ast.Span = .{ .start = lhs.span.start, .end = rhs.span.end };
+        // Doc 66 P3: a number literal operand rides in the instruction.
+        if (try self.constantOperand(base, .rk, rhs)) |ko| {
+            const t1 = try self.operandReg(lhs);
+            self.cur_span = op_span;
+            _ = try self.emit(Instr.opABC(ko.op, dest, t1, ko.k));
+        } else if (try self.constantOperand(base, .kr, lhs)) |ko| {
+            const t2 = try self.operandReg(rhs);
+            self.cur_span = op_span;
+            _ = try self.emit(Instr.opABC(ko.op, dest, t2, ko.k));
+        } else {
+            const t1 = try self.operandRegBefore(lhs, rhs);
+            const t2 = try self.operandReg(rhs);
+            self.cur_span = op_span;
+            _ = try self.emit(Instr.opABC(base, dest, t1, t2));
+        }
         self.freeTo(m);
     }
 
@@ -1950,6 +2012,52 @@ test "locals are read in place: no operand or result moves" {
         if (ins.op == .add and ins.a == 0 and ins.b == 0 and ins.c == 1) in_place += 1;
     }
     try testing.expectEqual(@as(usize, 2), in_place);
+}
+
+test "doc 66 P3: a number literal operand compiles to a constant form" {
+    var r = try run(
+        \\local x, f = 7, 2.5
+        \\local a = x + 1
+        \\local b = 10 - x
+        \\local c = f * -2
+        \\local d = 1 / (f)
+        \\local e = x & 3
+        \\local g = 3 & x
+        \\x += 2
+        \\local h = x ~>> 1
+        \\local i = 2 * 3
+        \\local j = x .. 1
+        \\return a + b + e + g + x + h + i
+    );
+    defer r.deinit();
+    try testing.expectEqual(@as(i64, 36), r.value.asInt());
+    const proto = r.chunk.proto;
+    var count = std.EnumArray(OpCode, usize).initFill(0);
+    for (proto.code) |ins| count.getPtr(ins.op).* += 1;
+    // `x + 1` and `x += 2` (in place, r0); `2 * 3` loads its left literal.
+    try testing.expectEqual(@as(usize, 2), count.get(.add_rk));
+    try testing.expectEqual(@as(usize, 1), count.get(.sub_kr));
+    try testing.expectEqual(@as(usize, 2), count.get(.mul_rk));
+    // Through the parentheses, constant on the left.
+    try testing.expectEqual(@as(usize, 1), count.get(.div_kr));
+    try testing.expectEqual(@as(usize, 1), count.get(.band_rk));
+    // A bitwise op has no constant-left form, `~>>` no constant form at all,
+    // and `..` is not arithmetic: all three keep their register form.
+    try testing.expectEqual(@as(usize, 1), count.get(.band));
+    try testing.expectEqual(@as(usize, 1), count.get(.sar));
+    try testing.expectEqual(@as(usize, 1), count.get(.concat));
+    for (proto.code) |ins| {
+        const f = bytecode.arithFormOf(ins.op) orelse continue;
+        if (f.shape == .rr) continue;
+        const k = proto.constants[ins.c];
+        try testing.expect(k.isNumber());
+        // `f * -2` carries the folded `-2`, an int.
+        if (ins.op == .mul_rk and ins.b == 1) try testing.expectEqual(@as(i64, -2), k.asInt());
+        if (ins.op == .add_rk and ins.a == 0) {
+            try testing.expectEqual(@as(u16, 0), ins.b);
+            try testing.expectEqual(@as(i64, 2), k.asInt());
+        }
+    }
 }
 
 test "an operand read before code that can write it keeps its value" {

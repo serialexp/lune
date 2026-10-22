@@ -230,6 +230,37 @@ pub fn hostEntropy(buf: []u8) void {
     std.Io.randomSecure(io, buf) catch std.Io.random(io, buf);
 }
 
+/// The longest text `formatFloat` produces, with room to spare: 21 integer
+/// digits or `0.0000001` plus 17 significant digits, and a sign.
+pub const float_text_max = 32;
+
+/// A float's text, the one form `print`, `tostring` and `..` share: the
+/// shortest digits that read back to the same value, positional for
+/// `1e-7 <= |x| < 1e21` (and for zero, the infinities and NaN), in exponent
+/// form outside it with the exponent's sign written (`3.333333333333333e+307`,
+/// `5e-324`). Bounded by `float_text_max`, so a number always fits the small
+/// fixed buffers its renderers use; positional text at the extremes ran to
+/// 330 bytes and overran them.
+pub fn formatFloat(buf: []u8, x: f64) []const u8 {
+    std.debug.assert(buf.len >= float_text_max);
+    const a = @abs(x);
+    if (a == 0 or !std.math.isFinite(x) or (a >= 1e-7 and a < 1e21)) {
+        return std.fmt.bufPrint(buf, "{d}", .{x}) catch unreachable;
+    }
+    var sci: [std.fmt.float.min_buffer_size]u8 = undefined;
+    const s = std.fmt.float.render(&sci, x, .{ .mode = .scientific }) catch unreachable;
+    const e = std.mem.indexOfScalar(u8, s, 'e').?;
+    const exp = s[e + 1 ..];
+    var n: usize = e + 1;
+    @memcpy(buf[0..n], s[0..n]);
+    if (exp[0] != '-') {
+        buf[n] = '+';
+        n += 1;
+    }
+    @memcpy(buf[n..][0..exp.len], exp);
+    return buf[0 .. n + exp.len];
+}
+
 /// Render a `Value` to `w` in a human-readable, debugger-friendly form. The
 /// canonical text form of a value lives here (one place), separate from the
 /// `Value` type itself so the type stays free of the churny writer dependency.
@@ -238,7 +269,10 @@ pub fn writeValue(w: *Writer, v: Value) Writer.Error!void {
         .nil => try w.writeAll("nil"),
         .boolean => try w.writeAll(if (v.asBool()) "true" else "false"),
         .int => try w.print("{d}", .{v.asInt()}),
-        .float => try w.print("{d}", .{v.asFloat()}),
+        .float => {
+            var buf: [float_text_max]u8 = undefined;
+            try w.writeAll(formatFloat(&buf, v.asFloat()));
+        },
         .heap_ref => switch (v.heapType()) {
             // Strings print as their raw bytes (Lua `print`/`tostring` style).
             .string => try w.writeAll(string.String.fromHeader(v.asHeap()).bytes()),
@@ -284,6 +318,29 @@ test "writeValue renders scalars" {
     try std.testing.expectEqualStrings("false", renderValue(&buf, Value.boolean(false)));
     try std.testing.expectEqualStrings("-42", renderValue(&buf, Value.int(-42)));
     try std.testing.expectEqualStrings("3.5", renderValue(&buf, Value.float(3.5)));
+}
+
+test "formatFloat: positional inside [1e-7, 1e21), exponent form outside, always bounded" {
+    var buf: [float_text_max]u8 = undefined;
+    const cases = [_]struct { f64, []const u8 }{
+        .{ 0.1, "0.1" },
+        .{ 1.0 / 3.0, "0.3333333333333333" },
+        .{ 1e20, "100000000000000000000" },
+        .{ 1e21, "1e+21" },
+        .{ -1e21, "-1e+21" },
+        .{ 1e-7, "0.0000001" },
+        .{ std.math.nextAfter(f64, 1e-7, 0), "9.999999999999998e-8" },
+        .{ 1e308 / 3.0, "3.333333333333333e+307" },
+        .{ -std.math.floatMax(f64), "-1.7976931348623157e+308" },
+        .{ 5e-324, "5e-324" },
+        .{ -2.2250738585072014e-308, "-2.2250738585072014e-308" },
+        .{ 0.0, "0" },
+        .{ std.math.inf(f64), "inf" },
+    };
+    for (cases) |c| try std.testing.expectEqualStrings(c[1], formatFloat(&buf, c[0]));
+    // The longest positional texts still fit.
+    try std.testing.expect(formatFloat(&buf, -1.2345678901234567e-7).len <= float_text_max);
+    try std.testing.expect(formatFloat(&buf, -123456789012345680000.0).len <= float_text_max);
 }
 
 test "writeValue prints a real string's bytes" {

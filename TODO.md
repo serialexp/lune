@@ -1430,6 +1430,16 @@ characters, and **no benchmark can `print` a bare float and claim
 "accumulate an *integer* checksum" — `bench/README.md` now states this as the
 reason rather than leaving it as folklore.
 
+**Follow-up (2026-10-22): exponent form at the extremes.** "Always positional"
+was unbounded: `tostring(1e308 / 3)` wrote 309 digits into a fixed buffer
+(a Debug panic, found by doc 66 P3's operand-matrix test). Bart chose to keep
+shortest round-trip and switch to exponent form outside `1e-7 <= |x| < 1e21`,
+with the exponent's sign written: `print(1e100)` is now `1e+100`,
+`print(5e-324)` is `5e-324`, and `5e-7`, `2^53` and the rest of the table
+above are unchanged. One renderer, `io.formatFloat`, serves `print`,
+`tostring` and `..`, bounded by `io.float_text_max`. JS switches at `1e-6`
+on the small side, not `1e-7`; the `1e-7` edge is the one Bart approved.
+
 ## Weak-but-nonzero bench output coverage (noted 2026-08-26)
 
 The empty-stdout hole is closed, but the *next* weakest link is worth naming.

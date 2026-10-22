@@ -740,7 +740,7 @@ test "doc 56 Phase 4: an adapter restores many carried values at once" {
         \\  if i % 3 == 0 then s = s + t[1] + a + n2 else s = s - 1 end
         \\end
         \\print(s, t[1], a, n2)
-    , "12661121433520190000000\t352480413526858700000\t45151\t-3210781427597235360\n", Places.check);
+    , "1.266112143352019e+22\t352480413526858700000\t45151\t-3210781427597235360\n", Places.check);
 }
 
 test "doc 56 Phase 4: an open-upvalue continuation runs behind a native adapter" {

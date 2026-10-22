@@ -194,7 +194,7 @@ pub fn bnot(a: Value) Error!Value {
 
 /// Logical left shift of the 64-bit pattern `x` by `n` bits, Lua-style: `n < 0`
 /// shifts right, `|n| >= 64` yields 0.
-fn shiftLeft(x: i64, n: i64) i64 {
+pub fn shiftLeft(x: i64, n: i64) i64 {
     if (n <= -64 or n >= 64) return 0;
     const ux: u64 = @bitCast(x);
     if (n >= 0) return @bitCast(ux << @intCast(n));
@@ -204,7 +204,7 @@ fn shiftLeft(x: i64, n: i64) i64 {
 /// Logical right shift of the 64-bit pattern `x` by `n` bits, Lua-style: `n < 0`
 /// shifts left, `|n| >= 64` yields 0. Written directly (not via `-n`) so a
 /// `minInt` count cannot overflow the negation.
-fn shiftRight(x: i64, n: i64) i64 {
+pub fn shiftRight(x: i64, n: i64) i64 {
     if (n <= -64 or n >= 64) return 0;
     const ux: u64 = @bitCast(x);
     if (n >= 0) return @bitCast(ux >> @intCast(n));
@@ -228,7 +228,7 @@ pub fn shr(a: Value, b: Value) Error!Value {
 /// (`-1` for negative `x`, `0` otherwise) rather than `0`. The positive leg
 /// uses Zig's signed `>>`, which is arithmetic. Written directly (not via `-n`)
 /// so a `minInt` count cannot overflow the negation.
-fn shiftRightArith(x: i64, n: i64) i64 {
+pub fn shiftRightArith(x: i64, n: i64) i64 {
     if (n >= 63) return x >> 63; // full sign fill (clamp the count to 63)
     if (n >= 0) return x >> @intCast(n);
     if (n <= -64) return 0;

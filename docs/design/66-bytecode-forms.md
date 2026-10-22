@@ -1,6 +1,6 @@
 # 66 — Bytecode forms: constant operands, field ops, compare-and-branch, ITERN
 
-Status: rev 2, partial. The `condBranchOf` refactor and P2 landed; P3,
+Status: rev 2, partial. The `condBranchOf` refactor, P2 and P3 landed;
 P5, P4 and P1 are outstanding, in that order. Round-1 review findings
 (codex and antigravity, §10) are folded in. Bart answered Q1–Q5 (§9) on
 2026-10-22.
@@ -47,6 +47,13 @@ land; move whole phases to Done once everything inside them is checked.
   the fast lane).
 - [x] **Q5 — phase order** (§7). Bart, 2026-10-22: `condBranchOf`
   refactor → P2 → P3 → P5 → P4 → P1.
+- [x] **Q6 — P3 constant-left encoding and op set** (§5.3). Bart,
+  2026-10-22: separate NV opcodes (LuaJIT `ADDVN`/`ADDNV`, no orientation
+  bit). K forms for add, sub, mul, div, mod, idiv and pow in both
+  orientations, and for band, bor, bxor, shl and shr with the constant on
+  the right only. A static count over the `@bench` sources before the
+  choice: 164 constant-operand sites, 43 of them constant-left (`*` 19,
+  `+` 9, `/` 7, `^` 4).
 - [x] **`condBranchOf` refactor** (2026-10-22, §5.4). `bytecode.condBranchOf`
   decodes a conditional branch (`CondTest`, polarity, target) and
   `falseBranchTargetOf` names the `while` test and `repeat` closer shape.
@@ -95,7 +102,65 @@ land; move whole phases to Done once everything inside them is checked.
   callee's branch guard is never decoded against the anchor proto"
   (tier-1a and native, mutation-checked).
 
+- [x] **P3 — constant-operand arithmetic** (2026-10-22, §5.3, Q6). 19
+  opcodes: `add_rk`/`add_kr` (`R[A] = R[B] op K[C]` / `K[C] op R[B]`, the
+  register always B and the constant always C) and the same for sub, mul,
+  div, mod, idiv and pow; `band_rk`, `bor_rk`, `bxor_rk`, `shl_rk` and
+  `shr_rk`. `bytecode.arithFormOf` decodes every arithmetic op to
+  (base operator, `rr`/`rk`/`kr`) and `constantFormOf` is its inverse;
+  `bc_liveness` and fault rendering (`describeFault`) follow. The
+  compiler emits a K form when either operand is a number literal (a
+  parenthesised or negated one too), constant-right first, through
+  `compileBinary` and every compound-assignment path (`emitCompoundOp`).
+  The handlers are built per opcode over one `ArithOperands` reader, so
+  metamethods see the operands in source order. The recorder takes the
+  constant as a `konst` (`Operand`, renamed from P2's `KeyOperand`), so
+  the IR is the IR `load_int` + op produced.
+- [x] **P3 extended: the arithmetic lanes** (beyond the plan, same change).
+  Every handler, register form included, now computes mixed int/float
+  `+ - * /` on the lanes (both as floats, as `arith` does), pow on any
+  two numbers through `fmath.powRuntime`, mod/idiv on any non-both-int
+  number pair in the slow half, and shifts in the both-int lane
+  (`arith.shiftLeft`/`shiftRight`/`shiftRightArith`, now `pub`). Before,
+  each of these went through `arith.*` + `arithMeta`. The operands' tags
+  are read up front and their payloads behind pointers, so a lane loads
+  only what it uses: the first cut loaded both payloads eagerly, which
+  cost the register-form float handlers 1–3 instructions (nbody +0.5%
+  tier-0) until the load could fold into the arithmetic again.
+- [x] **P3 measured** (`ops3.lua`, instructions per op, e4ba1e2 → P3,
+  LuaJIT `-joff` in brackets): `i - 7` 73 → 50 (15), `7 - i` 73 → 50
+  (15), `i * 0.5` 109 → 73 (15), `x + 2.5` 83 → 53 (15), `x ^ 2` 285 →
+  257 (163), `i << 3` 84 → 58, `i & 7` 75 → 52; the register forms
+  `x * x` 51 → 49, `x / x` 46 → 46, `i * i` 48 → 46, and the empty
+  loop's own `s = s + i` 128 → 126. `abench.sh` tier-0: pi_leibniz
+  −27.9%, euler14-bit −16.3%, nsieve-bit −10.7%, spectral-norm −10.1%,
+  while_shortcircuit_probe −7.9%, partialsums −7.4%, scimark-fft −6.8%,
+  scimark-sor −5.4%, recursive-fib −5.1%, repack −4.4%, array3d −3.9%,
+  nsieve-bit-fp −3.3%, lua54 −3.1%, io_print −2.9%, nbody −1.7%, the
+  rest −0.05 to −2.6%. The one rise, io_write +0.08% in both tiers
+  (+1 instruction per `io.write`), is doc 68 P0's `CF_CTL` store in
+  `mahina_hostcall_entry`, which was in the tree. JIT tier: euler14-bit
+  −5.1%, lua54 −3.1%, io_print −2.8%, while_shortcircuit_probe −1.9%,
+  tbl_ops −1.5%, str_format −1.1%, the rest 0 to −0.7%. `--dump-aborts`
+  NYI counts are unchanged on all 33 programs; hashgate: 99 digests match
+  on both legs. Test: "doc 66 P3: every constant arithmetic form is its
+  register form", 12 operators × 8 constants × both sides × 13 operands
+  against the register form, with a digest of every result taken on
+  e4ba1e2 (before the new lanes). Mutation-checked: the mixed lane, `kr`
+  operand order, the shift lane, mod's float lane, pow and div each
+  change it.
+- [x] **Float text at the extremes** (found by the P3 test, fixed in the
+  same change). `print`, `tostring` and `..` rendered a float
+  positionally at any magnitude, so `1e308 / 3` ran to 309 digits and
+  overran `tostring`'s fixed buffer (a Debug panic; undefined in
+  release). Bart chose exponent form at the extremes: `io.formatFloat`
+  keeps the shortest round-trip digits, positional for
+  `1e-7 <= |x| < 1e21` and `3.333333333333333e+307` / `5e-324` outside,
+  bounded by `io.float_text_max`. One renderer behind all three.
 ### Outstanding
+
+- [ ] **Defer: a `sar` constant form.** Q6's set leaves mahina's `~>>`
+  (`sar`, no Lua 5.4 spelling, 0 `@bench` sites) on the register form.
 
 - [ ] **P1 — `itern`** (§5.1): the generic-`for` step for the real `next`
   without a call.
@@ -103,7 +168,6 @@ land; move whole phases to Done once everything inside them is checked.
   to the fix above). Today they are simply not classified. An option is
   to carry the guard's proto in provenance, so a callee's own loop test
   can still be recognised. Not needed for correctness.
-- [ ] **P3 — constant-operand arithmetic** (§5.3).
 - [ ] **P4 — compare-and-branch** (§5.4).
 - [ ] **P5 — `eq`/`ne` against a constant** (§5.5).
 - [ ] **Each phase: recorder and JIT parity in the same change** (§6). A
