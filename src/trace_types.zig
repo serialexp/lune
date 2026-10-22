@@ -363,8 +363,16 @@ pub const AnchorKeyContext = struct {
 };
 
 /// An unmanaged hash map keyed by `AnchorKey` (see `AnchorKeyContext`).
+///
+/// Max load 50%, not std's 80%: most probes are misses (`hasTrace` on a
+/// tier-0 back-edge or return with no trace there), and a miss walks to the
+/// next free slot, past every live entry and tombstone (retired traces
+/// leave them) in its cluster. These maps hold tens of anchors, so the
+/// extra room costs little. At 80% the walk length swung with where the
+/// anchor pcs happened to hash: one bytecode layout change moved
+/// binary-trees' JIT count +0.46% through `hasTrace` probing alone.
 pub fn AnchorMap(comptime V: type) type {
-    return std.HashMapUnmanaged(AnchorKey, V, AnchorKeyContext, std.hash_map.default_max_load_percentage);
+    return std.HashMapUnmanaged(AnchorKey, V, AnchorKeyContext, 50);
 }
 
 /// The steps of a batch retirement (doc 61 §7.1 item 5, `removeTraces`).
