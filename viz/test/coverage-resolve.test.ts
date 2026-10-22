@@ -17,6 +17,7 @@ function anchor(o: Partial<CoverageAnchorOutput> & { proto_id: number; pc: numbe
     pc: o.pc,
     traced_iters: o.traced_iters ?? 0n,
     interp_iters: o.interp_iters ?? 0n,
+    fallback_iters: o.fallback_iters ?? 0n,
     traced_cycles: o.traced_cycles ?? 0n,
     interp_cycles: o.interp_cycles ?? 0n,
     has_trace: o.has_trace ?? 0,
@@ -46,17 +47,28 @@ test("resolves an anchor's (proto_id, pc) to its source line", () => {
 
 test("classes a traced-dominant line native", () => {
   const dis = disasmOf(0, [7]);
-  const m = resolveCoverageLines([anchor({ proto_id: 0, pc: 0, traced_iters: 90n, interp_iters: 10n, has_trace: 1 })], dis);
+  const m = resolveCoverageLines([anchor({ proto_id: 0, pc: 0, traced_iters: 90n, interp_iters: 10n, fallback_iters: 10n, has_trace: 1 })], dis);
   expect(m.get(7)!.cls).toBe("native");
+});
+
+test("warm-up before the trace doesn't outvote the native iterations", () => {
+  const dis = disasmOf(0, [7]);
+  // A short loop: 57 tier-0 iterations to get hot, then 43 native, no fallback.
+  const m = resolveCoverageLines([anchor({ proto_id: 0, pc: 0, traced_iters: 43n, interp_iters: 57n, fallback_iters: 0n, has_trace: 1 })], dis);
+  const e = m.get(7)!;
+  expect(e.cls).toBe("native");
+  expect(e.warmup).toBe(57);
+  expect(e.coveredInterp).toBe(0);
 });
 
 test("classes a has_trace line that ran mostly interpreted as covered-interpreted (the smell)", () => {
   const dis = disasmOf(0, [7]);
-  // Trace exists, but interpreted back-edges dominate → covered-interpreted.
-  const m = resolveCoverageLines([anchor({ proto_id: 0, pc: 0, traced_iters: 5n, interp_iters: 95n, has_trace: 1 })], dis);
+  // Trace exists, but interpreted back-edges after it dominate → covered-interpreted.
+  const m = resolveCoverageLines([anchor({ proto_id: 0, pc: 0, traced_iters: 5n, interp_iters: 95n, fallback_iters: 80n, has_trace: 1 })], dis);
   const e = m.get(7)!;
   expect(e.cls).toBe("covered-interpreted");
-  expect(e.coveredInterp).toBe(95);
+  expect(e.coveredInterp).toBe(80);
+  expect(e.warmup).toBe(15);
   expect(e.uncovered).toBe(0);
 });
 
@@ -74,7 +86,7 @@ test("sums multiple anchors that resolve to the same line", () => {
   const m = resolveCoverageLines(
     [
       anchor({ proto_id: 0, pc: 0, traced_iters: 3n, has_trace: 1 }),
-      anchor({ proto_id: 0, pc: 1, interp_iters: 2n, has_trace: 1 }),
+      anchor({ proto_id: 0, pc: 1, interp_iters: 2n, fallback_iters: 2n, has_trace: 1 }),
     ],
     dis,
   );
@@ -110,7 +122,7 @@ function covWith(
 ): CoverageFileOutput {
   const [ct, cc, cu, run] = cycles ?? [0n, 0n, 0n, 0n];
   return {
-    version: 1,
+    version: 2,
     iters_traced: traced,
     iters_tier0_covered: covered,
     iters_tier0_uncovered: uncovered,

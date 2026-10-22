@@ -338,12 +338,13 @@
     },
 
     "CoverageAnchor": {
-      "description": "Per-loop-header JIT execution coverage (AnchorCoverage, src/trace.zig), keyed by the anchor's stable proto id (never the *const Proto pointer) plus loop-header pc. `traced_iters`/`interp_iters` are back-edge counts (ran-as-trace vs fell-back-to-tier-0); `traced_cycles`/`interp_cycles` are the per-hop TSC attribution (0 on a target without rdtsc). `has_trace` = a compiled trace exists at this anchor — so an anchor with has_trace=1 and traced_iters=0 is the smell: it has a trace but ran fully interpreted.",
+      "description": "Per-loop-header JIT execution coverage (AnchorCoverage, src/trace.zig), keyed by the anchor's stable proto id (never the *const Proto pointer) plus loop-header pc. `traced_iters`/`interp_iters` are back-edge counts (ran-as-trace vs fell-back-to-tier-0); `traced_cycles`/`interp_cycles` are the per-hop TSC attribution (0 on a target without rdtsc). `fallback_iters` is the part of `interp_iters` taken after a trace existed here (the rest is warm-up before the trace was committed), so `fallback_iters` vs `traced_iters` says whether the loop ran native once it could. `has_trace` = a compiled trace exists at this anchor — so an anchor with has_trace=1 and traced_iters=0 is the smell: it has a trace but ran fully interpreted.",
       "sequence": [
         { "name": "proto_id",      "type": "uint32" },
         { "name": "pc",            "type": "uint32" },
         { "name": "traced_iters",  "type": "uint64" },
         { "name": "interp_iters",  "type": "uint64" },
+        { "name": "fallback_iters", "type": "uint64" },
         { "name": "traced_cycles", "type": "uint64" },
         { "name": "interp_cycles", "type": "uint64" },
         { "name": "has_trace",     "type": "uint8" }

@@ -1521,6 +1521,7 @@ pub const CoverageAnchor = struct {
     pc: u32,
     traced_iters: u64,
     interp_iters: u64,
+    fallback_iters: u64,
     traced_cycles: u64,
     interp_cycles: u64,
     has_trace: u8,
@@ -1540,6 +1541,7 @@ pub const CoverageAnchor = struct {
         try enc.writeUint32(self.pc, .little_endian);
         try enc.writeUint64(self.traced_iters, .little_endian);
         try enc.writeUint64(self.interp_iters, .little_endian);
+        try enc.writeUint64(self.fallback_iters, .little_endian);
         try enc.writeUint64(self.traced_cycles, .little_endian);
         try enc.writeUint64(self.interp_cycles, .little_endian);
         try enc.writeUint8(self.has_trace);
@@ -1558,6 +1560,7 @@ pub const CoverageAnchor = struct {
         result.pc = try dec.readUint32(.little_endian);
         result.traced_iters = try dec.readUint64(.little_endian);
         result.interp_iters = try dec.readUint64(.little_endian);
+        result.fallback_iters = try dec.readUint64(.little_endian);
         result.traced_cycles = try dec.readUint64(.little_endian);
         result.interp_cycles = try dec.readUint64(.little_endian);
         result.has_trace = try dec.readUint8();

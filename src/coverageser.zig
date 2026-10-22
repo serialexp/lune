@@ -28,8 +28,9 @@ pub const schema = @import("gen/trace_schema.zig");
 /// Coverage wire-format version, written into every `CoverageFile`. Independent of
 /// the trace/keyframe/effect/execlog versions — a distinct record family sharing
 /// only the binschema *encoding*. v1: the initial format (iteration + TSC split,
-/// event counters, per-anchor breakdown).
-pub const coverage_format_version: u32 = 1;
+/// event counters, per-anchor breakdown). v2: per-anchor `fallback_iters` (the
+/// interpreted iterations taken after the anchor had a trace).
+pub const coverage_format_version: u32 = 2;
 
 /// Errors from decoding a coverage artifact.
 pub const DecodeError = error{
@@ -78,6 +79,7 @@ pub fn encodeState(gpa: std.mem.Allocator, ts: *const trace.TraceState) ![]u8 {
             .pc = e.key_ptr.pc,
             .traced_iters = e.value_ptr.traced,
             .interp_iters = e.value_ptr.interp,
+            .fallback_iters = e.value_ptr.fallback,
             .traced_cycles = e.value_ptr.traced_cycles,
             .interp_cycles = e.value_ptr.interp_cycles,
             .has_trace = @intFromBool(e.value_ptr.has_trace),
@@ -152,10 +154,10 @@ fn seedState(ts: *trace.TraceState, gpa: std.mem.Allocator, pa: *const bytecode.
     ts.tier0_outer_body_entries = 9;
 
     try ts.coverage.put(gpa, .{ .proto = pb, .pc = 24, .proto_id = pb.id }, .{
-        .traced = 111, .interp = 0, .traced_cycles = 900, .interp_cycles = 10, .has_trace = true,
+        .traced = 111, .interp = 0, .fallback = 0, .traced_cycles = 900, .interp_cycles = 10, .has_trace = true,
     });
     try ts.coverage.put(gpa, .{ .proto = pa, .pc = 14, .proto_id = pa.id }, .{
-        .traced = 0, .interp = 222, .traced_cycles = 0, .interp_cycles = 5_000, .has_trace = true,
+        .traced = 0, .interp = 222, .fallback = 180, .traced_cycles = 0, .interp_cycles = 5_000, .has_trace = true,
     });
     try ts.coverage.put(gpa, .{ .proto = pa, .pc = 3, .proto_id = pa.id }, .{
         .traced = 5, .interp = 6, .traced_cycles = 7, .interp_cycles = 8, .has_trace = false,
@@ -203,6 +205,7 @@ test "coverage artifact round-trips struct-exact (aggregates, counters, per-anch
     // The smell anchor: has_trace but fully interpreted (a:14).
     try testing.expectEqual(@as(u64, 0), file.anchors[1].traced_iters);
     try testing.expectEqual(@as(u64, 222), file.anchors[1].interp_iters);
+    try testing.expectEqual(@as(u64, 180), file.anchors[1].fallback_iters);
     try testing.expectEqual(@as(u8, 1), file.anchors[1].has_trace);
     // The fully-traced anchor (b:24).
     try testing.expectEqual(@as(u64, 111), file.anchors[2].traced_iters);
@@ -239,7 +242,7 @@ test "a truncated anchor array is rejected without leaking the partial slice" {
 
     const bytes = try encodeState(gpa, &ts);
     defer gpa.free(bytes);
-    // Drop the last 5 bytes: enough to leave the final CoverageAnchor (41 bytes)
+    // Drop the last 5 bytes: enough to leave the final CoverageAnchor (49 bytes)
     // incomplete while keeping the length prefix and the first two anchors intact.
     try testing.expect(bytes.len > 5);
     const truncated = bytes[0 .. bytes.len - 5];

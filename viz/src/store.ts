@@ -143,19 +143,23 @@ export interface LineCoverage {
   cls: CoverageClass;
   /** Iterations that ran as native compiled code. */
   native: number;
-  /** Interpreted iterations at an anchor that HAS a trace (the smell bucket). */
+  /** Interpreted iterations at a traced anchor before its trace existed. They
+   *  are shown but never decide the class: every loop that tiers up has some. */
+  warmup: number;
+  /** Interpreted iterations at an anchor once it HAD a trace (the smell bucket). */
   coveredInterp: number;
   /** Interpreted iterations at an anchor with no trace at all. */
   uncovered: number;
 }
 
-/** Pick the dominant bucket. Ties resolve toward the more interesting signal:
- *  native > covered-interpreted (smell) > uncovered. */
+/** Pick the dominant bucket, ignoring warm-up. Ties resolve toward the more
+ *  interesting signal: native > covered-interpreted (smell) > uncovered. */
 function classifyLine(c: LineCoverage): CoverageClass {
   if (c.native >= c.coveredInterp && c.native >= c.uncovered && c.native > 0) return "native";
   if (c.coveredInterp >= c.uncovered && c.coveredInterp > 0) return "covered-interpreted";
   if (c.uncovered > 0) return "uncovered";
-  // All-zero anchor (has_trace set but never iterated): treat as the smell.
+  // Traced but never iterated after the trace committed (or not at all): the
+  // trace didn't run, so treat it as the smell.
   return "covered-interpreted";
 }
 
@@ -168,13 +172,12 @@ export const COVERAGE_LABEL: Record<CoverageClass, string> = {
 };
 
 /** The hover text for a coverage stripe: the line's class and the iteration
- *  counts behind it. "Interpreted" on a traced line includes the warm-up
- *  iterations before the trace existed — the per-anchor counts don't separate
- *  them (only the run's aggregate does). Pure. */
+ *  counts behind it. Pure. */
 export function coverageLineTitle(c: LineCoverage): string {
   const n = (x: number) => x.toLocaleString("en-US");
   const parts = [`${n(c.native)} native`];
-  if (c.coveredInterp > 0) parts.push(`${n(c.coveredInterp)} interpreted (warm-up included)`);
+  if (c.coveredInterp > 0) parts.push(`${n(c.coveredInterp)} interpreted after tracing`);
+  if (c.warmup > 0) parts.push(`${n(c.warmup)} warm-up before the trace`);
   if (c.uncovered > 0) parts.push(`${n(c.uncovered)} interpreted, no trace`);
   return `${COVERAGE_LABEL[c.cls]} — loop iterations: ${parts.join(" · ")}`;
 }
@@ -740,14 +743,17 @@ export function resolveCoverageLines(
     if (line <= 0) continue;
     let e = map.get(line);
     if (e === undefined) {
-      e = { cls: "uncovered", native: 0, coveredInterp: 0, uncovered: 0 };
+      e = { cls: "uncovered", native: 0, warmup: 0, coveredInterp: 0, uncovered: 0 };
       map.set(line, e);
     }
     // Iteration counts are exact small integers here (back-edge tallies); Number
     // is lossless well past any realistic loop-trip count.
     e.native += Number(a.traced_iters);
-    if (a.has_trace !== 0) e.coveredInterp += Number(a.interp_iters);
-    else e.uncovered += Number(a.interp_iters);
+    if (a.has_trace !== 0) {
+      const fallback = Number(a.fallback_iters);
+      e.coveredInterp += fallback;
+      e.warmup += Number(a.interp_iters) - fallback;
+    } else e.uncovered += Number(a.interp_iters);
   }
   for (const e of map.values()) e.cls = classifyLine(e);
   return map;

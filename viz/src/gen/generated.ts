@@ -5115,7 +5115,7 @@ export class JitCountersDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * Per-loop-header JIT execution coverage (AnchorCoverage, src/trace.zig), keyed by the anchor's stable proto id (never the *const Proto pointer) plus loop-header pc. `traced_iters`/`interp_iters` are back-edge counts (ran-as-trace vs fell-back-to-tier-0); `traced_cycles`/`interp_cycles` are the per-hop TSC attribution (0 on a target without rdtsc). `has_trace` = a compiled trace exists at this anchor — so an anchor with has_trace=1 and traced_iters=0 is the smell: it has a trace but ran fully interpreted.
+ * Per-loop-header JIT execution coverage (AnchorCoverage, src/trace.zig), keyed by the anchor's stable proto id (never the *const Proto pointer) plus loop-header pc. `traced_iters`/`interp_iters` are back-edge counts (ran-as-trace vs fell-back-to-tier-0); `traced_cycles`/`interp_cycles` are the per-hop TSC attribution (0 on a target without rdtsc). `fallback_iters` is the part of `interp_iters` taken after a trace existed here (the rest is warm-up before the trace was committed), so `fallback_iters` vs `traced_iters` says whether the loop ran native once it could. `has_trace` = a compiled trace exists at this anchor — so an anchor with has_trace=1 and traced_iters=0 is the smell: it has a trace but ran fully interpreted.
  */
 export interface CoverageAnchorInput {
   /**
@@ -5142,6 +5142,11 @@ export interface CoverageAnchorInput {
    * 64-bit Unsigned Integer
    * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
    */
+  fallback_iters: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
   traced_cycles: bigint;
   /**
    * 64-bit Unsigned Integer
@@ -5156,7 +5161,7 @@ export interface CoverageAnchorInput {
 }
 
 /**
- * Per-loop-header JIT execution coverage (AnchorCoverage, src/trace.zig), keyed by the anchor's stable proto id (never the *const Proto pointer) plus loop-header pc. `traced_iters`/`interp_iters` are back-edge counts (ran-as-trace vs fell-back-to-tier-0); `traced_cycles`/`interp_cycles` are the per-hop TSC attribution (0 on a target without rdtsc). `has_trace` = a compiled trace exists at this anchor — so an anchor with has_trace=1 and traced_iters=0 is the smell: it has a trace but ran fully interpreted.
+ * Per-loop-header JIT execution coverage (AnchorCoverage, src/trace.zig), keyed by the anchor's stable proto id (never the *const Proto pointer) plus loop-header pc. `traced_iters`/`interp_iters` are back-edge counts (ran-as-trace vs fell-back-to-tier-0); `traced_cycles`/`interp_cycles` are the per-hop TSC attribution (0 on a target without rdtsc). `fallback_iters` is the part of `interp_iters` taken after a trace existed here (the rest is warm-up before the trace was committed), so `fallback_iters` vs `traced_iters` says whether the loop ran native once it could. `has_trace` = a compiled trace exists at this anchor — so an anchor with has_trace=1 and traced_iters=0 is the smell: it has a trace but ran fully interpreted.
  */
 export interface CoverageAnchorOutput {
   /**
@@ -5179,6 +5184,11 @@ export interface CoverageAnchorOutput {
    * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
    */
   interp_iters: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  fallback_iters: bigint;
   /**
    * 64-bit Unsigned Integer
    * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
@@ -5213,6 +5223,7 @@ export class CoverageAnchorEncoder extends BitStreamEncoder {
     this.writeUint32(value.pc, "little_endian");
     this.writeUint64(value.traced_iters, "little_endian");
     this.writeUint64(value.interp_iters, "little_endian");
+    this.writeUint64(value.fallback_iters, "little_endian");
     this.writeUint64(value.traced_cycles, "little_endian");
     this.writeUint64(value.interp_cycles, "little_endian");
     this.writeUint8(value.has_trace);
@@ -5224,7 +5235,7 @@ export class CoverageAnchorEncoder extends BitStreamEncoder {
    * Used for from_after_field computed lengths and buffer pre-allocation.
    */
   calculateSize(value: CoverageAnchor): number {
-    return 41; // proto_id + pc + traced_iters + interp_iters + traced_cycles + interp_cycles + has_trace
+    return 49; // proto_id + pc + traced_iters + interp_iters + fallback_iters + traced_cycles + interp_cycles + has_trace
   }
 }
 
@@ -5241,6 +5252,7 @@ export class CoverageAnchorDecoder extends SeekableBitStreamDecoder {
     value.pc = this.readUint32("little_endian");
     value.traced_iters = this.readUint64("little_endian");
     value.interp_iters = this.readUint64("little_endian");
+    value.fallback_iters = this.readUint64("little_endian");
     value.traced_cycles = this.readUint64("little_endian");
     value.interp_cycles = this.readUint64("little_endian");
     value.has_trace = this.readUint8();
@@ -5479,6 +5491,7 @@ export class CoverageFileDecoder extends SeekableBitStreamDecoder {
       anchors__iter.pc = this.readUint32("little_endian");
       anchors__iter.traced_iters = this.readUint64("little_endian");
       anchors__iter.interp_iters = this.readUint64("little_endian");
+      anchors__iter.fallback_iters = this.readUint64("little_endian");
       anchors__iter.traced_cycles = this.readUint64("little_endian");
       anchors__iter.interp_cycles = this.readUint64("little_endian");
       anchors__iter.has_trace = this.readUint8();

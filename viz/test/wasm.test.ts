@@ -145,7 +145,7 @@ test("records a decodable JIT coverage artifact for a hot loop", () => {
 
   expect(result.coverage.length).toBeGreaterThan(0);
   const cov = new CoverageFileDecoder(result.coverage).decode();
-  expect(cov.version).toBe(1);
+  expect(cov.version).toBe(2);
   // The loop tiered up: the vast majority of back-edges ran as a trace.
   expect(Number(cov.iters_traced)).toBeGreaterThan(0);
   expect(Number(cov.iters_traced)).toBeGreaterThan(Number(cov.iters_tier0_uncovered));
@@ -157,13 +157,19 @@ test("records a decodable JIT coverage artifact for a hot loop", () => {
   const hot = cov.anchors.find((a) => Number(a.traced_iters) > 0);
   expect(hot).toBeDefined();
   expect(hot!.has_trace).toBe(1);
+  // Its interpreted back-edges split into warm-up and fallback, and the
+  // per-anchor fallback agrees with the run's covered-interpreted total.
+  expect(Number(hot!.fallback_iters)).toBeLessThanOrEqual(Number(hot!.interp_iters));
+  expect(Number(hot!.interp_iters)).toBeGreaterThan(Number(hot!.fallback_iters));
+  const fallback = cov.anchors.reduce((sum, a) => sum + Number(a.fallback_iters), 0);
+  expect(fallback).toBe(Number(cov.iters_tier0_covered));
 });
 
 test("a non-looping program's coverage artifact has no traced iterations", () => {
   const result = mod.runSource("print(1 + 2)\n");
   expect(result.status).toBe(0);
   const cov = new CoverageFileDecoder(result.coverage).decode();
-  expect(cov.version).toBe(1);
+  expect(cov.version).toBe(2);
   expect(Number(cov.iters_traced)).toBe(0);
   expect(cov.anchors.length).toBe(0);
 });

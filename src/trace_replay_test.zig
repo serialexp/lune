@@ -886,6 +886,32 @@ test "driveSeedLedger: a deep hop-0 ledger [C.link, I.done, C.deopt] charges eac
     try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2, .proto_id = proto.id }));
 }
 
+test "jit coverage: interpreted back-edges before the first trace are warm-up, after it fallback" {
+    // A loop that tiers up runs some tier-0 iterations before its trace commits.
+    // Those are warm-up; only interpreted iterations once the anchor has a trace
+    // count as `fallback`, so a consumer can tell "ran native once it could" from
+    // "kept falling back" without the warm-up diluting the split.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    state.config.coverage = true;
+
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 1 };
+    const anchor: trace.AnchorKey = .{ .proto = &proto, .pc = 7, .proto_id = proto.id };
+
+    for (0..3) |_| state.noteInterpIter(&proto, 7, 0);
+    state.noteTraceIters(anchor, 40);
+    for (0..2) |_| state.noteInterpIter(&proto, 7, 0);
+
+    const cov = state.coverage.get(anchor).?;
+    try testing.expectEqual(@as(u64, 5), cov.interp);
+    try testing.expectEqual(@as(u64, 2), cov.fallback);
+    try testing.expectEqual(@as(u64, 40), cov.traced);
+    // The aggregates split the same way.
+    try testing.expectEqual(@as(u64, 3), state.iters_tier0_uncovered);
+    try testing.expectEqual(@as(u64, 2), state.iters_tier0_covered);
+}
+
 test "jit coverage: per-hop cycles bill each hop's own anchor, never the entry anchor" {
     // The load-bearing anti-misattribution guarantee. A chain runs several hops
     // through `onSideExit`, each with its OWN anchor. Before the per-hop fix the

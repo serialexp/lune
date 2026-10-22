@@ -822,7 +822,10 @@ const SilentProvenanceEvidence = struct {
 
 /// Per-anchor JIT execution-coverage tally (`TraceState.coverage` value). `traced`
 /// = loop iterations committed by trace runs (tier-1b native, or tier-1a IR-interp)
-/// anchored here; `interp` = interpreted (tier-0) back-edges taken at this anchor.
+/// anchored here; `interp` = interpreted (tier-0) back-edges taken at this anchor;
+/// `fallback` = the part of `interp` taken once `has_trace` was set (the rest is
+/// warm-up before the first trace committed), so `traced` vs `fallback` says
+/// whether the loop ran as a trace once it could — warm-up no longer dilutes it.
 /// `has_trace` flips true once a trace is committed at this anchor (at commit, and
 /// defensively on any trace run), so `noteInterpIter` can classify each interpreted
 /// back-edge covered-vs-uncovered in O(1) — a single map probe it already does —
@@ -848,6 +851,7 @@ const SilentProvenanceEvidence = struct {
 pub const AnchorCoverage = struct {
     traced: u64 = 0,
     interp: u64 = 0,
+    fallback: u64 = 0,
     traced_cycles: u64 = 0,
     interp_cycles: u64 = 0,
     has_trace: bool = false,
@@ -2281,6 +2285,7 @@ pub const TraceState = struct {
         gop.value_ptr.interp +|= 1;
         gop.value_ptr.interp_cycles +|= cycles;
         if (gop.value_ptr.has_trace) {
+            gop.value_ptr.fallback +|= 1;
             self.iters_tier0_covered +|= 1;
             self.cycles_tier0_covered +|= cycles;
         } else {

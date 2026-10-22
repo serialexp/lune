@@ -57,10 +57,10 @@ test("a loaded trace drops the last run's execution logs", () => {
 });
 
 test("a coverage stripe's tooltip gives the class and the counts behind it", () => {
-  expect(coverageLineTitle({ cls: "native", native: 43, coveredInterp: 57, uncovered: 0 })).toBe(
-    "ran native — loop iterations: 43 native · 57 interpreted (warm-up included)",
+  expect(coverageLineTitle({ cls: "native", native: 43, warmup: 57, coveredInterp: 2, uncovered: 0 })).toBe(
+    "ran native — loop iterations: 43 native · 2 interpreted after tracing · 57 warm-up before the trace",
   );
-  expect(coverageLineTitle({ cls: "uncovered", native: 0, coveredInterp: 0, uncovered: 12000 })).toBe(
+  expect(coverageLineTitle({ cls: "uncovered", native: 0, warmup: 0, coveredInterp: 0, uncovered: 12000 })).toBe(
     "no trace, ran tier-0 — loop iterations: 0 native · 12,000 interpreted, no trace",
   );
 });

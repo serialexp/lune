@@ -172,11 +172,10 @@ effect log so runs stay replayable (doc 02).
       replay transport keys; GLOBALS no longer wraps and hides builtins
       behind a toggle.
   - [ ] Panes are still fixed (no resize).
-- [~] Editor stripes now have a legend and per-line tooltips. Still open:
-      they classify by majority, so a loop that went native shows amber
-      when warm-up iterations outnumber native ones (`classifyLine`,
-      `viz/src/store.ts`). A correct split needs a per-anchor post-trace
-      tier-0 counter from `src/trace.zig` in the coverage artifact.
+- [x] Editor stripes have a legend and per-line tooltips, and warm-up no
+      longer outvotes native: the coverage artifact (v2) carries a
+      per-anchor `fallback_iters` (tier-0 iterations once the anchor had a
+      trace), and `classifyLine` ignores the warm-up before it.
 - [x] `viz/README.md` rewritten for the current features.
 
 ## 7. Embedding (C API + Rust crates)
