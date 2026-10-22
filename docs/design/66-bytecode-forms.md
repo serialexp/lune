@@ -1,10 +1,10 @@
 # 66 — Bytecode forms: constant operands, field ops, compare-and-branch, ITERN
 
-Status: draft rev 2, not yet implemented. Round-1 review findings
-(codex and antigravity, §10) are folded in. Decisions Q1–Q5 (§9) are open
-for Bart.
+Status: rev 2, decided, not yet implemented. Round-1 review findings
+(codex and antigravity, §10) are folded in. Bart answered Q1–Q5 (§9) on
+2026-10-22; implementation starts with the `condBranchOf` refactor.
 Owner: claude (coral-marten)
-Last updated: 2026-10-21
+Last updated: 2026-10-22
 
 ## Implementation status
 
@@ -35,14 +35,21 @@ land; move whole phases to Done once everything inside them is checked.
   with `measure.sh` (per-op marginal cost against LuaJIT `-joff`) and
   `abench.sh` (every `@bench` program, both tiers). They are not
   `@bench` programs, so `run.py` and hashgate skip them.
-
-- [ ] **Q1 — strategy for the fused forms** (§4): new canonical opcodes,
-  handler-level fusion over unchanged bytecode, or a mix per form.
-- [ ] **Q2 — constant-operand arithmetic shape** (§5.3): immediate ints in
-  `aux`, or a K index, and whether constant-on-the-left forms are included.
-- [ ] **Q3 — which compare-and-branch forms** (§5.4).
-- [ ] **Q4 — the `pairs` fast path's shape** (§5.1).
-- [ ] **Q5 — phase order** (§7).
+- [x] **Q1 — strategy for the fused forms** (§4). Bart, 2026-10-22:
+  strategy A (new canonical opcodes) for every form, with the §5.4
+  `condBranchOf` predicate refactor landed first as its own commit.
+- [x] **Q2 — constant-operand arithmetic shape** (§5.3). Bart,
+  2026-10-22: a K index (any number), keeping the constant-on-the-left
+  forms. Int immediates only if a probe later shows the K load matters.
+- [x] **Q3 — which compare-and-branch forms** (§5.4). Bart, 2026-10-22:
+  register-register, equality against a constant, and ordered compares
+  against a constant (`jltk` and kin).
+- [x] **Q4 — the `pairs` fast path's shape** (§5.1). Bart, 2026-10-22:
+  (b2), declining while the hash view needs a build (no allocation in
+  the fast lane).
+- [x] **Q5 — phase order** (§7). Bart, 2026-10-22: `condBranchOf`
+  refactor → P2 → P3 → P5 → P4 → P1.
+- [ ] **`condBranchOf` refactor** (§5.4), its own commit, before P2.
 - [ ] **P1 — `itern`** (§5.1): the generic-`for` step for the real `next`
   without a call.
 - [ ] **P2 — `get_field` / `set_field`** (§5.2): a constant string key in
