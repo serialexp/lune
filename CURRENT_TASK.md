@@ -241,6 +241,34 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     the probe for node (`bun build /tmp/mfprobe/probe.ts --target=node`),
     because bun's JSC drops the wasm name section from stacks.
   - Then item 5 (call/return) and item 6 (dispatch prologue, doc 42 §4.2).
+- 2026-10-23, items 5 and 6:
+  - **0312c9e** has two parts.
+    - The slot-ordered open-upvalue list (item 5, step one): a return
+      closes its suffix, and a call 514 → 381 instructions.
+    - Doc 69 P0, `Heap.gc_headroom`, the GC countdown gate (item 6): −0.6
+      to −11.7% tier-0 by itself. Write `gc_stress`/`next_gc` only through
+      `setGcStress`/`setNextGc`.
+  - **fa38c80**: the gmatch-under-GC-stress no-trace (the generic-`for` ctrl
+    pin read a dead, scrubbed register).
+  - **9440ba1**: doc 69 (`docs/design/69-dispatch-prologue.md`).
+    - Upper bounds: the GC+region tests 6.6–23.5%, the pc store 0.1–5.5%,
+      the frame pointer 1–5.3%.
+    - Q1 (merged gate owner), Q2 (lazy pc; §5 has the read-only reader
+      audit) and Q3 (omit_frame_pointer) wait on Bart. He hasn't answered
+      yet, so none is started.
+  - Next: item 5's structural part, doc 69 P3, the call/return transitions.
+    Callgrind on the uv build:
+    - opCall ~190 and opRet ~140 instructions;
+    - `reloadTopFrame`+`cachedCodeFor` ~70;
+    - `onCallEntry` ~32;
+    - `setRegionContext` twice per call, and a ~96-byte frame write.
+
+    Coordinate interp.zig with coral-raven, whose doc 68 P2/P3 slices
+    touch the same push path.
+  - Scratch shadows are under /tmp/p1:
+    - `ab2.sh BASE NEW`: instructions:u A/B over every @bench program, both
+      tiers;
+    - ubA/ubB/ggR/ggF: the upper-bound builds.
 - Bart (2026-10-21): wraparound should stop, a zero step should raise,
   `next`'s zero results are fine, and continuations shouldn't re-check
   the step sign every run.
