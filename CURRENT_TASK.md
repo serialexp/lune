@@ -235,7 +235,10 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
   - The dry run's finding (doc 67 §11): the static tables prove 0/53
     `link_terminal` and 0/20 `loop_done_linked` arms. Most misses are
     pass-through slots (the parent never touches them) or seeded
-    children. Waiting on Bart's Q5–Q7 (doc 67 §11.3) before P1.
+    children. Codex and antigravity both recommended parking P1–P3
+    (doc 67 §11.4); Bart agreed 2026-10-22. Doc 67 is parked; P0 stays.
+    Next: the tier-0 plan's remaining levers; doc 66 Q1–Q5 still wait
+    on Bart.
 
 LINE LOOKUP FIX (2026-10-11, coral-marten): LANDED in `49fd572`, bundled with amber-badger's doc 61 Phase K.
 - Bug from TODO.md "Every located runtime error rescans the source for

@@ -115,7 +115,10 @@ earlier in `/tmp/t0micro/`).
       design doc. (c) Lua 5.4's iteration count, which removes both guards
       everywhere but adds a carried count to every root loop.
       Bart picked (b) on 2026-10-21. The design is doc 67
-      (`docs/design/67-proven-link-entry.md`); its Q1–Q4 are open.
+      (`docs/design/67-proven-link-entry.md`). Its P0 dry run proved
+      none of the hot `.link` and loop-done arms. Parked 2026-10-22
+      after P0, on both reviewers' advice; doc 67 §11.4 has the
+      bounded follow-up if it is ever reopened.
 - [x] **A zero `for` step looped forever instead of raising** (noted
       2026-10-21). `for i = 1, 3, 0` and `for i = 1, 3, 0.0` never ended;
       Lua 5.4's `forprep` raises `'for' step is zero`. Fixed 2026-10-21:

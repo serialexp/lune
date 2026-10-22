@@ -1,11 +1,12 @@
 # 67 — Proven-fact link entry: a linked child skips the checks its parent proved
 
-Status: rev 2; P0 (facts and a dry run) landed 2026-10-21. Its dry run
+Status: parked. P0 (facts and a dry run) landed 2026-10-21. Its dry run
 found that the static tables prove none of the hot `.link` and loop-done
-arms (§11). P1 waits on Bart's answer to Q5–Q7 (§11.3). Codex and
-antigravity both recommend parking P1–P3 (§11.4).
+arms (§11). Codex and antigravity both recommended parking P1–P3 (§11.4),
+and Bart agreed on 2026-10-22. P0's refactor, tables and `--jit-stats`
+counters stay in the tree.
 Owner: claude (coral-marten)
-Last updated: 2026-10-21
+Last updated: 2026-10-22
 
 ## Implementation status
 
@@ -71,28 +72,32 @@ land; move whole phases to Done once everything inside them is checked.
     recorder cap (§11.2).
   - Adding the counters moved the `Vm` layout, so
     `src/asm/offsets_x64.inc` was updated with the corrected lines.
+- [x] **Q5–Q7 — the dry run's questions** (§11.3, §11.4). Bart,
+  2026-10-22: Q5 (d), stop after P0 and park P1–P3, as both reviewers
+  recommended. Q6 and Q7 are moot while the lever is parked. If it is
+  ever picked up again, start from §11.4: Codex's bounded combination is
+  (b), plus a seed-first proven entry and guard-derived facts on `.link`
+  only, estimated below 1% of instructions.
 
 ### Outstanding
 
 Rev 2 replanned the phases. The fact builders P0 needs are the final
 ones, so P0 builds them for real, not as scaffolding (Rule Z-7).
 
-- [ ] **Q5 — facts about slots the parent never touches** (§11.3). Most
-  misses are of this kind. Blocks P1.
-- [ ] **Q6 — seeded children** (§11.3). The v1 exclusion covers 31 of the
-  66 misses.
-- [ ] **Q7 — facts from the parent's own guards** (§11.3). They would turn
-  20 misses into proofs.
-- [ ] **P1 — child side, proven targeting disabled** (§4). The hoisted
+- [ ] **Defer — fix the `proven-miss:` untouched classification** (codex,
+  §11.4). It calls a slot untouched when the parent's fact list doesn't
+  mention it, not when the parent's IR never reads or writes it. Only
+  matters if the lever is picked up again.
+- [ ] **Defer — P1 — child side, proven targeting disabled** (§4). The hoisted
   checks in the prologue, the body suppression and `opMayExitInBody`, the
   `proven` label and the proven stubs. No arm targets a proven entry yet.
   The hoisting already changes behaviour (exit identity and coverage when a
   step check fails), so P1 gets its own board run. P2 cannot land before
   P1: until then a hoisted guard's fact is a body check, not a prologue one.
-- [ ] **P2 — arm funnel** (§6). `arm` picks the proven stub when the parent
+- [ ] **Defer — P2 — arm funnel** (§6). `arm` picks the proven stub when the parent
   exit proves the child's facts. Every consumer listed in §6 agrees with
   that choice. Counters in `--jit-stats`.
-- [ ] **P3 — measurement** (§8). The board, against the §1 bounds.
+- [ ] **Defer — P3 — measurement** (§8). The board, against the §1 bounds.
 
 ## 1. Why this exists
 
