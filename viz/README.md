@@ -11,6 +11,15 @@ What it does:
   wasm VM and shows its output; a runtime error is squiggled at its source
   location with a traceback. Stop ends a runaway program. Script arguments go
   in the args box (`arg[1..]`).
+- **Several files.** A program is a set of files in tabs, paths relative to
+  the program's directory: the entry (▶) is what Run executes, and the rest
+  are what its `require`/`loadfile`/`dofile` read (`require('lib.util')` reads
+  `lib/util.mah`). + adds a file, double-click renames, × closes, "Run this
+  file" makes the shown tab the entry. Opening files adds them as tabs (the
+  first replaces the untouched starter program). Every location the UI shows
+  — a runtime error, a traceback frame, a replay step, a trace row, a coverage
+  stripe — names its file, and showing it switches to that tab; a string
+  `load` compiled appears as a read-only tab of its own.
 - **Step replay.** Replay re-runs the recorded effect log to any instruction
   (or line) of the last run, deterministically: the current line, the
   bytecode with the pending pc, output so far, the call chain, locals (dead
@@ -59,9 +68,14 @@ pnpm smoke:browser <mahina>   # drive `mahina viz` in headless Chrome (e2e/)
 `smoke:browser` needs a CLI with the UI embedded (`just cli`) and a system
 Chrome; CI runs it on every CLI build.
 
-`mahina viz [trace.mahinatrace]` serves a built copy of this app from the CLI
-itself, `POST /run` included (`just cli` builds CLIs with it embedded; see
-`src/viz_server.zig`).
+`mahina viz [script] [trace.mahinatrace]` serves a built copy of this app from
+the CLI itself, `POST /run` included (`just cli` builds CLIs with it embedded;
+see `src/viz_server.zig`). Given a script, it opens that program: the script as
+the entry, plus the source files (`.mah`/`.mahina`/`.lua`) under its directory
+as tabs (`GET /project`; hidden directories, `node_modules`, `zig-cache` and
+`zig-out` are skipped, and the listing stops at 256 files / 8 MiB). `POST /run`
+takes the whole program (`{files, entry, args}`) and runs the native binary on
+it in a scratch directory.
 
 Load a trace via the “Open .mahinatrace…” button, drag-and-drop, or a `?src=<url>`
 deep link (e.g. `…/?src=/my-trace.mahinatrace`) that auto-loads on open. Generate
@@ -93,7 +107,10 @@ zig build
   comparison, the keyframe → globals/locals view, the trace-animation stream.
 - `src/editor/` — the CodeMirror editor, mahina language mode and linter.
 - `src/components/` — `TraceList`/`TraceView` (the trace panes),
-  `ReplayPanel`, `CoveragePanel`.
+  `ReplayPanel`, `CoveragePanel`, `FileTabs` (the program's files).
+- `src/paths.ts` — program-relative path normalization, mirroring
+  `../src/relpath.zig` so the UI, the wasm VM and `mahina viz` agree on which
+  file `./lib/util.mah` is.
 - `fixtures/` — `counting-loop.lua` + the committed `counting-loop.mahinatrace`
   cross-language fixture.
 - `test/` — `bun test` specs.

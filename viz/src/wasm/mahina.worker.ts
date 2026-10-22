@@ -9,14 +9,14 @@
 // cleanly: `readBuf` (`mahina.ts`) copies every blob out of linear memory, and the
 // result structs are plain data (strings, numbers, typed arrays, plain objects).
 
-import { loadMahina, type MahinaModule, type MahinaRunResult, type MahinaReplayResult } from "./mahina";
+import { loadMahina, MahinaTrapError, type MahinaModule, type MahinaRunResult, type MahinaReplayResult, type SourceFile } from "./mahina";
 
 /** Request from the client. `init` must arrive (once) before any call; it carries
  *  the wasm URL to instantiate from. Each call carries a unique `id` the client
  *  matches the response to. */
 type Req =
   | { id: number; method: "init"; url: string }
-  | { id: number; method: "run"; src: string; argv: string[] }
+  | { id: number; method: "run"; src: string; argv: string[]; files: SourceFile[] }
   | { id: number; method: "check"; src: string }
   | { id: number; method: "replay"; src: string; effects: Uint8Array; stopAfter: number };
 
@@ -27,8 +27,10 @@ type Res =
 // The single module instance, lazily created by the first `init`. Subsequent
 // `init`s are idempotent (the client only sends one, but be defensive).
 let modPromise: Promise<MahinaModule> | null = null;
+let modUrl = "";
 
 function ensureModule(url: string): Promise<MahinaModule> {
+  modUrl = url;
   if (modPromise === null) modPromise = loadMahina(url);
   return modPromise;
 }
@@ -42,6 +44,7 @@ function runTransferables(r: MahinaRunResult): Transferable[] {
     r.effects.buffer,
     r.trace.buffer,
     r.safepointLines.buffer,
+    r.safepointProtos.buffer,
     r.executionLog.buffer,
     r.coverage.buffer,
   ] as Transferable[];
@@ -63,7 +66,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
     const mod = await modPromise;
     switch (req.method) {
       case "run": {
-        const result = mod.runSource(req.src, req.argv);
+        const result = mod.runSource(req.src, req.argv, req.files);
         post({ id: req.id, ok: true, result }, runTransferables(result));
         return;
       }
@@ -79,6 +82,9 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       }
     }
   } catch (e) {
+    // A VM panic leaves the instance's memory mid-operation: the next request
+    // gets a fresh one.
+    if (e instanceof MahinaTrapError && modUrl !== "") modPromise = loadMahina(modUrl);
     post({ id: req.id, ok: false, error: e instanceof Error ? e.message : String(e) });
   }
 };

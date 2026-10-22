@@ -1,10 +1,11 @@
 import { defineConfig, type Plugin } from "vite";
 import solid from "vite-plugin-solid";
-import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { normalizePath } from "./src/paths";
 
 // The in-browser VM artifact, built by `zig build wasm` at the repo root. It
 // lives outside viz/ (it is not a source asset), so this plugin bridges it into
@@ -29,10 +30,40 @@ function readBody(req: import("node:http").IncomingMessage): Promise<string> {
   });
 }
 
-// Run `source` through the native binary with all three emit flags and collect
-// the artifact bytes (base64) + the program's stdout. Mirrors the flag set the
-// wasm entry uses internally, so the two are comparable.
-function runNative(source: string, args: string[]): {
+/** The program a `/run` request carries: its files (paths relative to the
+ *  program's directory) and which of them to run. */
+interface RunProgram {
+  files: { path: string; text: string }[];
+  entry: string;
+  args: string[];
+}
+
+/** Decode and check a `/run` body: JSON `{ files, entry, args }`. Every path
+ *  must normalize (relative, inside the program's directory) and the entry
+ *  must be one of the files — the server writes them all under a fresh temp
+ *  directory, so a path climbing out of it is refused, never written. */
+function parseRunBody(body: string): RunProgram {
+  const parsed = JSON.parse(body) as { files?: unknown; entry?: unknown; args?: unknown };
+  if (!Array.isArray(parsed.files) || typeof parsed.entry !== "string") throw new Error("/run wants JSON { files, entry, args }");
+  const files: { path: string; text: string }[] = [];
+  for (const f of parsed.files as { path?: unknown; text?: unknown }[]) {
+    if (typeof f?.path !== "string" || typeof f?.text !== "string") throw new Error("/run: each file is { path, text }");
+    const path = normalizePath(f.path);
+    if (path === null) throw new Error(`/run: ${f.path} is not a path inside the program's directory`);
+    files.push({ path, text: f.text });
+  }
+  const entry = normalizePath(parsed.entry);
+  if (entry === null || !files.some((f) => f.path === entry)) throw new Error(`/run: entry ${parsed.entry} is not among the files`);
+  const args = Array.isArray(parsed.args) ? parsed.args.map(String) : [];
+  return { files, entry, args };
+}
+
+// Run the program through the native binary with all three emit flags and
+// collect the artifact bytes (base64) + the program's stdout. Mirrors the flag
+// set the wasm entry uses internally, so the two are comparable. The files are
+// written under a temp directory the binary runs in, so `require`/`loadfile`/
+// `dofile` resolve their relative paths there, as the wasm run's file set does.
+function runNative(program: RunProgram): {
   status: number;
   stdout: string;
   diagnostics: string;
@@ -42,13 +73,22 @@ function runNative(source: string, args: string[]): {
   coverage: string;
 } {
   const dir = mkdtempSync(join(tmpdir(), "mahina-diff-"));
+  const { files, entry, args } = program;
   try {
-    const src = join(dir, "prog.mahina");
+    // The program in its own directory, the artifacts beside it.
+    const prog = join(dir, "prog");
     const kf = join(dir, "k.mahinasnap");
     const ef = join(dir, "e.mahinaeff");
     const tr = join(dir, "t.mahinatrace");
     const cov = join(dir, "c.mahinacov");
-    writeFileSync(src, source);
+    for (const f of files) {
+      const path = join(prog, f.path);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, f.text);
+    }
+    // The entry by its relative path: that is the native run's `arg[0]`, as
+    // the wasm run's is the entry's path.
+    const src = entry;
     const b64 = (p: string): string => {
       try {
         return readFileSync(p).toString("base64");
@@ -64,7 +104,7 @@ function runNative(source: string, args: string[]): {
     const r = spawnSync(
       nativeBin,
       ["--emit-traces", tr, "--emit-keyframe", kf, "--emit-effects", ef, src, ...args],
-      { encoding: "buffer", timeout: 15_000 },
+      { encoding: "buffer", timeout: 15_000, cwd: prog },
     );
     // A SECOND, separate run purely to capture the honest native coverage split
     // (real TSC cycles): `--jit-native` so traces run as native machine code (the
@@ -76,7 +116,7 @@ function runNative(source: string, args: string[]): {
     spawnSync(
       nativeBin,
       ["--jit-native", "--emit-coverage", cov, src, ...args],
-      { encoding: "buffer", timeout: 15_000 },
+      { encoding: "buffer", timeout: 15_000, cwd: prog },
     );
     return {
       status: r.status === 0 ? 0 : 1,
@@ -108,28 +148,14 @@ function mahinaWasm(): Plugin {
         }
       });
 
-      // Dev: the differential validator's native side. POST the source; get back
-      // the native binary's artifacts (base64) + stdout for byte-comparison
-      // against the wasm run. Dev/CI only.
+      // Dev: the differential validator's native side. POST the program; get
+      // back the native binary's artifacts (base64) + stdout for
+      // byte-comparison against the wasm run. Dev/CI only.
       server.middlewares.use("/run", (req, res, next) => {
         if (req.method !== "POST") return next();
         void (async () => {
           try {
-            const body = await readBody(req);
-            // Body is JSON `{ source, args }`. Tolerate a bare string body (older
-            // clients / manual POSTs) as source with no args.
-            let source = body;
-            let args: string[] = [];
-            try {
-              const parsed = JSON.parse(body) as { source?: string; args?: string[] };
-              if (parsed && typeof parsed === "object" && typeof parsed.source === "string") {
-                source = parsed.source;
-                args = Array.isArray(parsed.args) ? parsed.args.map(String) : [];
-              }
-            } catch {
-              // not JSON — treat the whole body as source
-            }
-            const result = runNative(source, args);
+            const result = runNative(parseRunBody(await readBody(req)));
             res.setHeader("Content-Type", "application/json");
             res.end(JSON.stringify(result));
           } catch (e) {

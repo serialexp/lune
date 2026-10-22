@@ -19,12 +19,15 @@
 //!   import  env.host_now_ns() i64          — monotonic-ish ns from the host (JS)
 //!   export  mahina_alloc(len) -> ptr         — allocate `len` bytes in linear mem
 //!   export  mahina_free(ptr, len)            — free a prior `mahina_alloc`
-//!   export  mahina_run(src_ptr, src_len) -> *Result
+//!   export  mahina_run(src_ptr, src_len, args_ptr, args_len, files_ptr, files_len) -> *Result
 //!   export  mahina_free_result(*Result)      — free a Result and all its buffers
 //!   export  mahina_check(src_ptr, src_len) -> *CheckResult
 //!   export  mahina_free_check_result(*CheckResult)
 //!   export  mahina_replay(src_ptr, src_len, eff_ptr, eff_len, stop_after) -> *ReplayResult
 //!   export  mahina_free_replay_result(*ReplayResult)
+//!   export  mahina_panic_message_ptr() -> ptr, mahina_panic_message_len() -> len
+//!                                            — the last panic's message (a trap
+//!                                            reaches JS without one)
 //!
 //! Result layout (extern struct, read by JS via DataView):
 //!   u32 status        0 = ok, 1 = error (see `diag` for the message)
@@ -39,11 +42,19 @@
 //!   {u32 ptr,u32 len} backtrace  structured call chain blob (see encodeBacktrace;
 //!                                empty when there's no located runtime error):
 //!                                u32 frame_count, then per frame deepest-first
-//!                                { u32 line, start, end, name_len, [name_len]u8 }
+//!                                { u32 proto_id, line, start, end, name_len, [name_len]u8 }
 //!   (further fields are appended after `backtrace` — exec timing, the step-replay
-//!    index `safepoint_*`/`safepoint_lines`, and the bytecode-view `disasm` blob;
-//!    each is documented at its field in the `Result` struct below. New fields are
+//!    index `safepoint_*`/`safepoint_lines`, the bytecode-view `disasm` blob, and
+//!    the `chunks` table that names the file every `proto_id` is in; each is
+//!    documented at its field in the `Result` struct below. New fields are
 //!    always appended last so existing JS DataView offsets stay stable.)
+//!
+//! Files: a program's other files (what `require`/`loadfile`/`dofile` read) come
+//! in as the `files` blob of `mahina_run`: u32 count, then per file
+//! { u32 path_len, [path_len]u8 path, u32 text_len, [text_len]u8 text }. Paths are
+//! relative to the program's directory and matched after `relpath.normalize`, so
+//! `./mod.mah` and `mod.mah` name the same file. Replay needs no files: the
+//! reads are `file_read` effects in the log.
 //!
 //! CheckResult layout (compile-only validation; for the in-browser editor's live
 //! linter — parse + compile WITHOUT running the program, so there are no side
@@ -91,6 +102,30 @@ fn wasmRandomSeed(_: *anyopaque) u64 {
 
 /// `RandomSeedSource.ctx` is unused (the import needs no state) — point it anywhere.
 var rng_ctx: u8 = 0;
+
+/// The last panic's message. A freestanding panic can only trap, and the trap
+/// reaches JS as a bare "unreachable"; the host reads this to say what failed.
+/// Longer messages are cut at the buffer's end.
+var panic_buf: [1024]u8 = undefined;
+var panic_len: u32 = 0;
+
+fn wasmPanic(msg: []const u8, _: ?usize) noreturn {
+    @branchHint(.cold);
+    const n = @min(msg.len, panic_buf.len);
+    @memcpy(panic_buf[0..n], msg[0..n]);
+    panic_len = @intCast(n);
+    @trap();
+}
+
+pub const panic = std.debug.FullPanic(wasmPanic);
+
+export fn mahina_panic_message_ptr() u32 {
+    return @intFromPtr(&panic_buf);
+}
+
+export fn mahina_panic_message_len() u32 {
+    return panic_len;
+}
 
 /// A null env/args source for the browser playground: there is no process
 /// environment or command line, so `getenv` always returns nil, `argc` is 0, and
@@ -153,8 +188,10 @@ const Result = extern struct {
     /// silent); 0 otherwise.
     safepoint_capped: u32 = 0,
     /// Line-per-safepoint index for line-grain stepping: a blob of `safepoint_count`
-    /// little-endian `u32`s, where entry k is the 1-based source line of the
-    /// instruction pending at safepoint k+1. Empty when `safepoint_count == 0`.
+    /// little-endian `{u32 proto_id, u32 line}` pairs, where entry k is the
+    /// instruction pending at safepoint k+1 (its 1-based source line, and the
+    /// proto that names the file the line is in — see `chunks`). Empty when
+    /// `safepoint_count == 0`.
     safepoint_lines: Buf = .{},
     /// Static disassembly of every proto in this program (the bytecode view the
     /// step-replay panel renders, indexed by the replay cursor's `proto_id`). A
@@ -174,6 +211,15 @@ const Result = extern struct {
     /// successful run with at least one back-edge. Appended last so prior JS field
     /// offsets stay stable.
     coverage: Buf = .{},
+    /// Every chunk the run compiled, so a `proto_id` anywhere in this Result or
+    /// its artifacts can be named a file (see `buildChunks` for the layout).
+    /// Entry 0 is the program itself; the rest are the chunks `require`/
+    /// `loadfile`/`dofile`/`load` compiled, in load order. Set on success and
+    /// on a runtime error.
+    chunks: Buf = .{},
+    /// The `proto_id` the runtime error's `error_line` is in (0 with no
+    /// located error). Appended last so prior JS field offsets stay stable.
+    error_proto_id: u32 = 0,
 };
 
 /// One compile diagnostic, flattened for JS (24 bytes; see file header). `start`/
@@ -279,7 +325,7 @@ export fn mahina_free(ptr: u32, len: u32) void {
 /// catastrophic allocation failure before a Result exists). The source bytes at
 /// `[src_ptr, src_ptr+src_len)` are read but not freed — JS still owns that
 /// buffer and frees it with `mahina_free`.
-export fn mahina_run(src_ptr: u32, src_len: u32, args_ptr: u32, args_len: u32) ?*Result {
+export fn mahina_run(src_ptr: u32, src_len: u32, args_ptr: u32, args_len: u32, files_ptr: u32, files_len: u32) ?*Result {
     const res = gpa.create(Result) catch return null;
     res.* = .{};
 
@@ -298,8 +344,14 @@ export fn mahina_run(src_ptr: u32, src_len: u32, args_ptr: u32, args_len: u32) ?
         const p: [*]const u8 = @ptrFromInt(@as(usize, args_ptr));
         break :blk p[0..@as(usize, args_len)];
     };
+    // The program's other files (borrowed like the argv blob; see the header).
+    const files_blob: []const u8 = blk: {
+        if (files_len == 0) break :blk &[_]u8{};
+        const p: [*]const u8 = @ptrFromInt(@as(usize, files_ptr));
+        break :blk p[0..@as(usize, files_len)];
+    };
 
-    run(res, src, args_blob) catch |err| {
+    run(res, src, args_blob, files_blob) catch |err| {
         // Best-effort: surface the error name as diagnostics text. If even that
         // allocation fails, leave diag null; status still flags the failure.
         res.status = 1;
@@ -325,6 +377,7 @@ export fn mahina_free_result(res: ?*Result) void {
     freeBuf(r.disasm);
     freeBuf(r.exec_log);
     freeBuf(r.coverage);
+    freeBuf(r.chunks);
     gpa.destroy(r);
 }
 
@@ -470,6 +523,7 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
         res.status = 1;
         const fault = try vm.describeFault(err, gpa);
         res.diag = bufFromSlice(@constCast(fault.message));
+        res.proto_id = fault.proto_id;
         res.current_line = fault.line;
         res.current_start = fault.start;
         res.current_end = fault.end;
@@ -541,7 +595,74 @@ fn parseArgv(blob: []const u8) ![]const []const u8 {
     return argv;
 }
 
-fn run(res: *Result, source: []const u8, args_blob: []const u8) !void {
+/// The program's other files, as `mahina_run` received them: the `FsSource`
+/// the VM reads `require`/`loadfile`/`dofile` through. Paths are stored
+/// normalized; `text` borrows the caller's blob.
+const FileSet = struct {
+    files: []const File,
+    /// Scratch for normalizing a looked-up path (a longer path is not found).
+    scratch: [mahina.relpath.max_len]u8 = undefined,
+
+    const File = struct { path: []const u8, text: []const u8 };
+
+    fn read(ctx: *anyopaque, path: []const u8) ?[]const u8 {
+        const self: *FileSet = @ptrCast(@alignCast(ctx));
+        const want = mahina.relpath.normalize(&self.scratch, path) orelse return null;
+        for (self.files) |f| if (std.mem.eql(u8, f.path, want)) return f.text;
+        return null;
+    }
+
+    fn source(self: *FileSet) mahina.interp.FsSource {
+        return .{ .ctx = self, .read = &FileSet.read };
+    }
+};
+
+/// Decode the `files` blob (see the file header) into `FileSet.File`s whose
+/// paths are normalized into `paths` (owned by the caller, like the returned
+/// slice) and whose texts borrow `blob`. A path that doesn't normalize
+/// (absolute, escapes the root, or too long) is dropped: nothing could read
+/// it. Any length that overruns the blob is `Malformed`.
+fn parseFiles(blob: []const u8, paths: *std.ArrayList(u8)) ![]FileSet.File {
+    if (blob.len == 0) return &[_]FileSet.File{};
+    if (blob.len < 4) return error.Malformed;
+    const count = std.mem.readInt(u32, blob[0..4], .little);
+    var files: std.ArrayList(FileSet.File) = .empty;
+    errdefer files.deinit(gpa);
+    // Path bytes go into `paths` first and are sliced once it stops growing,
+    // so a regrow can't leave a stale slice behind.
+    var ends: std.ArrayList(usize) = .empty;
+    defer ends.deinit(gpa);
+    var off: usize = 4;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const path = try takeField(blob, &off);
+        const text = try takeField(blob, &off);
+        var scratch: [mahina.relpath.max_len]u8 = undefined;
+        const norm = mahina.relpath.normalize(&scratch, path) orelse continue;
+        try paths.appendSlice(gpa, norm);
+        try ends.append(gpa, paths.items.len);
+        try files.append(gpa, .{ .path = &.{}, .text = text });
+    }
+    var start: usize = 0;
+    for (files.items, ends.items) |*f, end| {
+        f.path = paths.items[start..end];
+        start = end;
+    }
+    return files.toOwnedSlice(gpa);
+}
+
+/// Read one `{ u32 len, [len]u8 }` field of a blob at `off.*`, advancing it.
+fn takeField(blob: []const u8, off: *usize) ![]const u8 {
+    if (off.* + 4 > blob.len) return error.Malformed;
+    const len = std.mem.readInt(u32, blob[off.*..][0..4], .little);
+    off.* += 4;
+    if (len > blob.len - off.*) return error.Malformed;
+    const field = blob[off.* .. off.* + len];
+    off.* += len;
+    return field;
+}
+
+fn run(res: *Result, source: []const u8, args_blob: []const u8, files_blob: []const u8) !void {
     // The lexer wants a NUL-terminated `[:0]const u8`. Copy the borrowed source
     // into an owned, sentinel-terminated buffer.
     const src0 = try gpa.allocSentinel(u8, source.len, 0);
@@ -595,6 +716,14 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8) !void {
     // The browser has no process env/args — inject a null source so getenv→nil,
     // argc→0, argv→nil (available, not EnvUnavailable).
     vm.host_env = nullHostEnv();
+    // The program's other files: `require`/`loadfile`/`dofile` read them as
+    // `file_read` effects, exactly as the CLI reads the disk.
+    var file_paths: std.ArrayList(u8) = .empty;
+    defer file_paths.deinit(gpa);
+    const files = try parseFiles(files_blob, &file_paths);
+    defer gpa.free(files);
+    var file_set = FileSet{ .files = files };
+    vm.fs_source = file_set.source();
 
     // --- compile --- (pass builtin globals so the unknown-global lint doesn't
     // flag `print`/`clock`).
@@ -637,6 +766,7 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8) !void {
         // ownership straight to the Result (freed by `mahina_free_result`).
         const fault = try vm.describeFault(err, gpa);
         res.diag = bufFromSlice(@constCast(fault.message));
+        res.error_proto_id = fault.proto_id;
         res.error_line = fault.line;
         res.error_start = fault.start;
         res.error_end = fault.end;
@@ -647,6 +777,8 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8) !void {
         gpa.free(fault.frames);
         // Still hand back whatever was printed before the fault.
         res.stdout = bufFromSlice(try gpa.dupe(u8, sink.buffered()));
+        // The error may be in a loaded file: name every chunk's file.
+        buildChunks(res, chunk.proto, &vm);
         return;
     };
 
@@ -672,7 +804,48 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8) !void {
     // tree is static and its ids are stable across compiles (deterministic
     // `assignProtoIds`), so the disassembly the record run emits here aligns with
     // the cursor (`proto_id`/`pc`) a replay step reports. Best-effort.
-    buildDisasm(res, chunk.proto);
+    buildDisasm(res, chunk.proto, &vm);
+    buildChunks(res, chunk.proto, &vm);
+}
+
+/// Populate `res.chunks`: which file every proto id is in. Best-effort — on
+/// failure the UI can't name loaded files, and treats every location as the
+/// program's own. Layout (little-endian):
+///   u32 chunk_count
+///   per chunk:
+///     u32 first_proto_id, u32 proto_count   the ids `[first, first+count)`
+///     u32 name_len, [name_len]u8 name        the chunk name: the path
+///                                            `require`/`loadfile`/`dofile`
+///                                            read, else `load`'s chunkname
+///                                            (empty for entry 0)
+///     u32 source_len, [source_len]u8 source  the text it was compiled from
+///                                            (empty for entry 0: the caller
+///                                            has the program's own source)
+fn buildChunks(res: *Result, root: *const mahina.bytecode.Proto, vm: *const mahina.interp.Vm) void {
+    res.chunks = bufFromSlice(buildChunksBlob(root, vm) catch return);
+}
+
+fn buildChunksBlob(root: *const mahina.bytecode.Proto, vm: *const mahina.interp.Vm) ![]u8 {
+    var protos: std.ArrayList(*const mahina.bytecode.Proto) = .empty;
+    defer protos.deinit(gpa);
+    try collectProtos(&protos, root);
+
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try appendU32(&buf, @intCast(1 + vm.loaded_chunks.items.len));
+    try appendU32(&buf, root.id);
+    try appendU32(&buf, @intCast(protos.items.len));
+    try appendU32(&buf, 0);
+    try appendU32(&buf, 0);
+    for (vm.loaded_chunks.items) |lc| {
+        try appendU32(&buf, lc.chunk.proto.id);
+        try appendU32(&buf, lc.chunk.proto_count);
+        try appendU32(&buf, @intCast(lc.chunk.proto.name.len));
+        try buf.appendSlice(gpa, lc.chunk.proto.name);
+        try appendU32(&buf, @intCast(lc.source.len));
+        try buf.appendSlice(gpa, lc.source);
+    }
+    return buf.toOwnedSlice(gpa);
 }
 
 /// The maximum number of safepoints the replay index records (and the ceiling
@@ -711,23 +884,28 @@ fn buildReplayIndexInner(res: *Result, proto: *const mahina.bytecode.Proto, effe
     const outcome = try vm.start(proto);
     res.safepoint_capped = if (outcome == .suspended) 1 else 0;
     res.safepoint_count = @intCast(vm.safepoint_lines.items.len);
-    res.safepoint_lines = bufFromSlice(try encodeU32Array(vm.safepoint_lines.items));
+    res.safepoint_lines = bufFromSlice(try encodeSafepointLines(vm.safepoint_lines.items));
 }
 
-/// Serialize the safepoint index's lines as a flat little-endian `u32` blob (4 bytes each). Empty → empty.
-fn encodeU32Array(points: []const mahina.interp.Vm.SafepointLine) ![]u8 {
+/// Serialize the safepoint line index as flat little-endian `{u32 proto_id,
+/// u32 line}` pairs. Empty → empty.
+fn encodeSafepointLines(points: []const mahina.interp.Vm.SafepointLine) ![]u8 {
     if (points.len == 0) return &[_]u8{};
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(gpa);
-    for (points) |p| try appendU32(&buf, p.line);
-    return buf.toOwnedSlice(gpa);
+    const bytes = try gpa.alloc(u8, points.len * 8);
+    for (points, 0..) |sp, i| {
+        std.mem.writeInt(u32, bytes[i * 8 ..][0..4], sp.proto_id, .little);
+        std.mem.writeInt(u32, bytes[i * 8 + 4 ..][0..4], sp.line, .little);
+    }
+    return bytes;
 }
 
-/// Populate `res.disasm` with a static disassembly of the whole proto tree (the
-/// bytecode the step-replay panel renders). Best-effort — swallows errors (the
-/// bytecode view is simply absent on failure; the run already succeeded).
-fn buildDisasm(res: *Result, root: *const mahina.bytecode.Proto) void {
-    res.disasm = bufFromSlice(buildDisasmBlob(root) catch return);
+/// Populate `res.disasm` with a static disassembly of every proto the run
+/// compiled: the program's tree, then each loaded chunk's (the bytecode the
+/// step-replay panel renders, and how the UI maps a `(proto_id, pc)` to a
+/// line). Best-effort — swallows errors (the bytecode view is simply absent on
+/// failure; the run already succeeded).
+fn buildDisasm(res: *Result, root: *const mahina.bytecode.Proto, vm: *const mahina.interp.Vm) void {
+    res.disasm = bufFromSlice(buildDisasmBlob(root, vm) catch return);
 }
 
 /// Encode the proto tree as a self-describing little-endian blob:
@@ -740,12 +918,14 @@ fn buildDisasm(res: *Result, root: *const mahina.bytecode.Proto) void {
 ///     per instruction:
 ///       u32 line          1-based source line (0 if no span)
 ///       u32 text_len, [text_len]u8 text   (rendered via bytecode.writeInstr)
-/// Protos are emitted in pre-order (root first, then children), matching the id
-/// assignment order — but consumers index by `id`, not position.
-fn buildDisasmBlob(root: *const mahina.bytecode.Proto) ![]u8 {
+/// Protos are emitted in pre-order (root first, then children) per chunk, the
+/// program's chunk first — matching the id assignment order — but consumers
+/// index by `id`, not position.
+fn buildDisasmBlob(root: *const mahina.bytecode.Proto, vm: *const mahina.interp.Vm) ![]u8 {
     var protos: std.ArrayList(*const mahina.bytecode.Proto) = .empty;
     defer protos.deinit(gpa);
     try collectProtos(&protos, root);
+    for (vm.loaded_chunks.items) |lc| try collectProtos(&protos, lc.chunk.proto);
 
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
@@ -868,7 +1048,8 @@ fn renderDiagnostics(diags: *const Diagnostics) ![]u8 {
 
 /// Serialize a runtime-error backtrace into a self-describing little-endian blob
 /// for JS: `u32 frame_count`, then per frame (deepest-first)
-/// `{ u32 line, u32 start, u32 end, u32 name_len, [name_len]u8 name }`. Empty
+/// `{ u32 proto_id, u32 line, u32 start, u32 end, u32 name_len, [name_len]u8 name }`
+/// (`proto_id` names the frame's file, see `Result.chunks`). Empty
 /// chain → empty slice (a null `Buf`).
 fn encodeBacktrace(frames: []const mahina.interp.FaultFrame) ![]u8 {
     if (frames.len == 0) return &[_]u8{};
@@ -876,6 +1057,7 @@ fn encodeBacktrace(frames: []const mahina.interp.FaultFrame) ![]u8 {
     errdefer buf.deinit(gpa);
     try appendU32(&buf, @intCast(frames.len));
     for (frames) |f| {
+        try appendU32(&buf, f.proto_id);
         try appendU32(&buf, f.line);
         try appendU32(&buf, f.start);
         try appendU32(&buf, f.end);

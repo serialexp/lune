@@ -9,12 +9,17 @@ import {
   openReplay,
   loadSourceBytes,
   loadDroppedFile,
+  loadProjectFromUrl,
   setScriptArgs,
   stopRun,
   coverageStripesShown,
+  locLabel,
+  frameLabel,
+  revealLoc,
   COVERAGE_LABEL,
 } from "./store";
 import MahinaEditor from "./editor/MahinaEditor";
+import FileTabs from "./components/FileTabs";
 import TraceList from "./components/TraceList";
 import TraceView from "./components/TraceView";
 import ReplayPanel from "./components/ReplayPanel";
@@ -46,10 +51,14 @@ export default function App() {
   let inputRef: HTMLInputElement | undefined;
   let sourceInputRef: HTMLInputElement | undefined;
 
-  // Deep link: `?src=<url>` auto-loads a trace on open (no file picker needed).
+  // Deep links: `?src=<url>` auto-loads a trace on open (no file picker
+  // needed); `?project=<url>` opens a program (`mahina viz <file>`).
   onMount(() => {
-    const src = new URLSearchParams(window.location.search).get("src");
+    const params = new URLSearchParams(window.location.search);
+    const src = params.get("src");
     if (src) void loadFromUrl(src);
+    const project = params.get("project");
+    if (project) void loadProjectFromUrl(project);
   });
 
   // Ctrl/⌘+Enter runs (Ctrl/⌘+Shift+Enter: Run both) from anywhere, the editor
@@ -71,8 +80,7 @@ export default function App() {
 
   const onDrop = (e: DragEvent) => {
     e.preventDefault();
-    const file = e.dataTransfer?.files?.[0];
-    if (file) void ingest(file);
+    for (const file of Array.from(e.dataTransfer?.files ?? [])) void ingest(file);
   };
 
   return (
@@ -110,7 +118,7 @@ export default function App() {
           below exactly as a loaded .mahinatrace would. */}
       <section class="editor">
         <div class="editor-head">
-          <span class="muted">Author &amp; run in-browser (wasm) <span class="editor-file">· {state.scriptName}</span></span>
+          <span class="muted">Author &amp; run in-browser (wasm) <span class="editor-file">· {state.entryPath}</span></span>
           <Show when={state.sourceError}>
             <span class="source-error" role="alert">{state.sourceError}</span>
           </Show>
@@ -118,7 +126,7 @@ export default function App() {
             <button
               type="button"
               class="secondary"
-              title="Load a local .mah/.lua source file into the editor (e.g. a benchmark like nsieve)"
+              title="Load local .mah/.lua source files (e.g. a benchmark like nsieve). The first replaces the untouched starter program and becomes the entry; otherwise they join the program as tabs."
               onClick={() => sourceInputRef?.click()}
             >
               Open source…
@@ -126,11 +134,11 @@ export default function App() {
             <input
               ref={sourceInputRef}
               type="file"
-              accept=".mah,.lua,.luau,.txt,text/plain"
+              multiple
+              accept=".mah,.mahina,.lua,.luau,.txt,text/plain"
               style={{ display: "none" }}
               onChange={(e) => {
-                const file = e.currentTarget.files?.[0];
-                if (file) void ingestSource(file);
+                for (const file of Array.from(e.currentTarget.files ?? [])) void ingestSource(file);
                 e.currentTarget.value = ""; // allow re-picking the same file
               }}
             />
@@ -171,6 +179,7 @@ export default function App() {
             </button>
           </div>
         </div>
+        <FileTabs />
         <MahinaEditor />
         <Show when={coverageStripesShown()}>
           <div class="cov-legend muted">
@@ -201,10 +210,24 @@ export default function App() {
             </Show>
             <Show when={state.runError}>
               <pre class="run-error">
-                {state.runErrorSpan ? `line ${state.runErrorSpan.line}: ${state.runError}` : state.runError}
+                <Show when={state.runErrorSpan} fallback={state.runError}>
+                  {(span) => (
+                    <>
+                      <button
+                        type="button"
+                        class="loc-link"
+                        title="Show this line in the editor"
+                        onClick={() => revealLoc({ path: span().path, line: span().line })}
+                      >
+                        {locLabel({ path: span().path, line: span().line })}
+                      </button>
+                      : {state.runError}
+                    </>
+                  )}
+                </Show>
                 <Show when={state.runBacktrace && state.runBacktrace.length > 1}>
                   {"\n"}<span class="run-traceback">
-                    {state.runBacktrace!.map((f) => `${f.name}:${f.line}`).join(" → ")}
+                    {state.runBacktrace!.map(frameLabel).join(" → ")}
                   </span>
                 </Show>
               </pre>

@@ -6,7 +6,8 @@ import { createStore } from "solid-js/store";
 import { decodeTraceFile, decodeExecLogFile, decodeCoverageFile, type TraceExecLogOutput, type CoverageFileOutput, type CoverageAnchorOutput } from "./decode";
 import { viewsOf, type TraceView, type SourcePoint } from "./disasm";
 import { flattenExec, type ExecStep } from "./exec";
-import { type MahinaRunResult, type MahinaReplayResult, type MahinaDiagnostic, type BacktraceFrame, type ProtoDisasm } from "./wasm/mahina";
+import { type MahinaRunResult, type MahinaReplayResult, type MahinaDiagnostic, type BacktraceFrame, type ProtoDisasm, type RunChunk, type SourceFile } from "./wasm/mahina";
+import { normalizePath } from "./paths";
 import { mahinaWorker, StoppedError } from "./wasm/mahina-client";
 import { runNative } from "./native";
 import { diffRuns, type DiffReport } from "./diff";
@@ -23,12 +24,14 @@ interface VizState {
   error: string | null;
 
   // --- authoring + in-browser execution (Phase 7 v3) ---
-  /** The editable source for the in-browser VM. */
-  source: string;
-  /** The script name used as `arg[0]` and shown as the loaded-file label. Set
-   *  when a local source file is opened; a plain default otherwise. `arg[0]` is
-   *  cancelled by the differential validator, so its exact value is cosmetic. */
-  scriptName: string;
+  /** The program's files, in tab order: what the editor edits and what a run
+   *  can `require`/`loadfile`/`dofile`. Paths are normalized (`normalizePath`). */
+  files: SourceFile[];
+  /** The file a run executes (its path is `arg[0]`). Always one of `files`. */
+  entryPath: string;
+  /** The tab the editor shows: one of `files`, or one of the last run's
+   *  read-only `runFiles` that isn't a workspace file. */
+  activePath: string;
   /** Why the last picked/dropped source file wasn't loaded (not text), or null.
    *  Shown beside the editor; cleared by the next load. */
   sourceError: string | null;
@@ -42,9 +45,9 @@ interface VizState {
   /** Diagnostics / runtime-error text from the last wasm run, if it failed. */
   runError: string | null;
   /** Located runtime error from the last wasm run (for the editor squiggle):
-   *  1-based `line` + UTF-8 byte span `[start,end)`. Null unless the last run
-   *  faulted with a locatable instruction. */
-  runErrorSpan: { line: number; start: number; end: number } | null;
+   *  the file, 1-based `line` + UTF-8 byte span `[start,end)` in it. Null
+   *  unless the last run faulted with a locatable instruction. */
+  runErrorSpan: { path: string; line: number; start: number; end: number } | null;
   /** The last runtime error's call chain, deepest-first. Null on a clean run or
    *  an error with no locatable frame. The UI flattens it to a one-line
    *  traceback; the editor squiggle still uses `runErrorSpan` (the leaf only). */
@@ -63,11 +66,15 @@ interface VizState {
   /** True while the replay panel is open. Opened only after a successful run
    *  that produced a non-empty safepoint index. */
   replayActive: boolean;
-  /** The recorded effect log + the exact source that produced it, frozen when
-   *  replay opened. Replay re-runs this pair to any step k; editing the editor
-   *  afterwards doesn't disturb an open replay (it replays the captured source). */
+  /** The recorded effect log + the exact entry source that produced it, frozen
+   *  when replay opened. Replay re-runs this pair to any step k (the other
+   *  files' reads are effects in the log); editing the editor afterwards doesn't
+   *  disturb an open replay (it replays the captured source). */
   replayEffects: Uint8Array | null;
   replaySource: string;
+  /** The files the last run compiled, one per chunk (index = chunk index; 0 is
+   *  the entry). Names the file of every proto id; see `runFileOf`. */
+  runFiles: RunFile[];
   /** Total instruction-boundary safepoints in the captured run (step count). */
   safepointCount: number;
   /** True if the record run hit the safepoint cap (stepping is bounded; surfaced
@@ -76,6 +83,8 @@ interface VizState {
   /** Per-safepoint source line (`safepointLines[k-1]` = line pending at step k).
    *  Drives line-grain navigation without extra wasm round-trips. */
   safepointLines: Uint32Array;
+  /** Parallel to `safepointLines`: the proto each line is in (names its file). */
+  safepointProtos: Uint32Array;
   /** Step grain: `instr` = one stop per safepoint; `line` = one stop per source
    *  line change. */
   grain: "instr" | "line";
@@ -135,16 +144,38 @@ interface VizState {
    *  compile's, and mapping them through this run's disasm would point at the
    *  wrong lines. */
   tracesFromRun: boolean;
-  /** The source line of the IR row under the pointer (0 = none). */
-  irHoverLine: number;
-  /** The source line of the last clicked IR row (0 = none). */
-  irPinnedLine: number;
-  /** Bumped on every IR row click, so clicking the same row again still
-   *  scrolls the editor back to its line. */
-  irRevealSeq: number;
-  /** The editor cursor's line once the user has put the cursor somewhere
-   *  (0 = not yet). IR rows recorded from that line are marked. */
-  editorCursorLine: number;
+  /** Where the IR row under the pointer was recorded (null = none). */
+  irHoverLoc: Loc | null;
+  /** Where the last clicked IR row was recorded (null = none). */
+  irPinnedLoc: Loc | null;
+  /** Where the editor last scrolled to on request (`revealLoc`). */
+  revealTarget: Loc | null;
+  /** Bumped by every `revealLoc`, so revealing the same place again still
+   *  scrolls the editor back to it. */
+  revealSeq: number;
+  /** The editor cursor's place once the user has put the cursor somewhere
+   *  (null = not yet). IR rows recorded from that line are marked. */
+  editorCursor: Loc | null;
+}
+
+/** A place in the program: a file (a `files` or `runFiles` path) and a 1-based
+ *  line in it. */
+export interface Loc {
+  path: string;
+  line: number;
+}
+
+/** One chunk of the last run, resolved to a file. */
+export interface RunFile {
+  /** The workspace file it was read from (normalized), or, for a chunk no
+   *  workspace file holds (a `load`ed string), a read-only virtual path. */
+  path: string;
+  /** The text the chunk was compiled from. */
+  text: string;
+  firstProtoId: number;
+  protoCount: number;
+  /** True for a chunk no workspace file holds; shown as a read-only tab. */
+  virtual: boolean;
 }
 
 /** The coverage class of a source line, from the last run's per-anchor data.
@@ -203,18 +234,29 @@ export function coverageLineTitle(c: LineCoverage): string {
  *  safepoint 1..count; `line` is just the steps where the source line changes.
  *  Both append `count+1` — the terminal "finished" state (replay past the last
  *  safepoint reproduces the uninterrupted run). */
-function buildStops(grain: "instr" | "line", count: number, lines: Uint32Array): number[] {
+function buildStops(
+  grain: "instr" | "line",
+  count: number,
+  lines: Uint32Array,
+  fileKeyOf: (protoId: number) => number,
+  protos: Uint32Array,
+): number[] {
   if (count <= 0) return [];
   const stops: number[] = [];
   if (grain === "instr") {
     for (let k = 1; k <= count; k++) stops.push(k);
   } else {
-    let prev = -1;
+    // A line change is a change of file or of line: line 3 of another file
+    // is a new line.
+    let prevLine = -1;
+    let prevFile = -1;
     for (let k = 1; k <= count; k++) {
       const ln = lines[k - 1] ?? 0;
-      if (ln !== prev) {
+      const file = fileKeyOf(protos[k - 1] ?? 0);
+      if (ln !== prevLine || file !== prevFile) {
         stops.push(k);
-        prev = ln;
+        prevLine = ln;
+        prevFile = file;
       }
     }
   }
@@ -222,7 +264,8 @@ function buildStops(grain: "instr" | "line", count: number, lines: Uint32Array):
   return stops;
 }
 
-const DEFAULT_SOURCE = `-- Edit and run in-browser (wasm). A hot loop records a trace.
+export const DEFAULT_PATH = "main.mah";
+export const DEFAULT_SOURCE = `-- Edit and run in-browser (wasm). A hot loop records a trace.
 local sum = 0
 for i = 1, 100 do
   sum = sum + i
@@ -236,8 +279,9 @@ const [state, setState] = createStore<VizState>({
   traces: [],
   selected: -1,
   error: null,
-  source: DEFAULT_SOURCE,
-  scriptName: "playground.mahina",
+  files: [{ path: DEFAULT_PATH, text: DEFAULT_SOURCE }],
+  entryPath: DEFAULT_PATH,
+  activePath: DEFAULT_PATH,
   sourceError: null,
   scriptArgs: "",
   running: false,
@@ -251,9 +295,11 @@ const [state, setState] = createStore<VizState>({
   replayActive: false,
   replayEffects: null,
   replaySource: "",
+  runFiles: [],
   safepointCount: 0,
   safepointCapped: false,
   safepointLines: new Uint32Array(0),
+  safepointProtos: new Uint32Array(0),
   grain: "instr",
   replayStops: [],
   replayPos: 0,
@@ -268,28 +314,137 @@ const [state, setState] = createStore<VizState>({
   coverage: null,
   nativeCoverage: null,
   tracesFromRun: false,
-  irHoverLine: 0,
-  irPinnedLine: 0,
-  irRevealSeq: 0,
-  editorCursorLine: 0,
+  irHoverLoc: null,
+  irPinnedLoc: null,
+  revealTarget: null,
+  revealSeq: 0,
+  editorCursor: null,
 });
 
 export { state };
 
-/** Update the editable source (does not run). */
-export function setSource(src: string): void {
-  setState("source", src);
+/** The workspace file at `path`, or undefined. */
+function workspaceFile(path: string): SourceFile | undefined {
+  return state.files.find((f) => f.path === path);
 }
 
-/** Load a local source file's text into the editor (does not run). Sets the
- *  script name (used as `arg[0]` and the loaded-file label). Distinct from
- *  `loadBytes`, which decodes a binary `.mahinatrace` artifact into the trace view. */
-export function loadSourceText(name: string, text: string): void {
-  // A different program: an open replay (of the last run's source) no longer
-  // describes what the editor shows, so close it.
+/** The text of the tab at `path`: a workspace file's, else a read-only run
+ *  file's; undefined when there is no such tab. */
+export function fileText(path: string): string | undefined {
+  return workspaceFile(path)?.text ?? state.runFiles.find((f) => f.virtual && f.path === path)?.text;
+}
+
+/** One editor tab. `virtual` tabs are the last run's read-only chunks. */
+export interface Tab {
+  path: string;
+  entry: boolean;
+  virtual: boolean;
+}
+
+/** The editor's tabs: the workspace files, then the last run's read-only
+ *  chunks (each path once). */
+export function tabs(): Tab[] {
+  const out: Tab[] = state.files.map((f) => ({ path: f.path, entry: f.path === state.entryPath, virtual: false }));
+  for (const rf of state.runFiles) {
+    if (rf.virtual && !out.some((t) => t.path === rf.path)) out.push({ path: rf.path, entry: false, virtual: true });
+  }
+  return out;
+}
+
+/** Whether the active tab is read-only (one of the last run's chunks). */
+export function activeReadOnly(): boolean {
+  return workspaceFile(state.activePath) === undefined;
+}
+
+/** Update a workspace file's text (does not run). */
+export function setFileText(path: string, text: string): void {
+  const i = state.files.findIndex((f) => f.path === path);
+  if (i >= 0 && state.files[i].text !== text) setState("files", i, "text", text);
+}
+
+/** Show the tab at `path` in the editor. */
+export function setActivePath(path: string): void {
+  if (fileText(path) !== undefined && state.activePath !== path) setState("activePath", path);
+}
+
+/** Make the workspace file at `path` the one a run executes. */
+export function setEntryPath(path: string): void {
+  if (workspaceFile(path) !== undefined) setState("entryPath", path);
+}
+
+/** Why `path` can't name a new or renamed file (null when it can). The name is
+ *  checked as written: callers pass it through `normalizePath` first. */
+export function filePathProblem(path: string | null, except?: string): string | null {
+  if (path === null) return "a file name is relative, inside the program's directory (no leading / or ..)";
+  if (path !== except && workspaceFile(path) !== undefined) return `${path} already exists`;
+  return null;
+}
+
+/** Add an empty file with a fresh `untitledN.mah` name and show it. */
+export function newFile(): string {
+  let n = 1;
+  while (workspaceFile(n === 1 ? "untitled.mah" : `untitled${n}.mah`) !== undefined) n++;
+  const path = n === 1 ? "untitled.mah" : `untitled${n}.mah`;
+  setState({ files: [...state.files, { path, text: "" }], activePath: path });
+  return path;
+}
+
+/** Rename a workspace file. Returns why not (and changes nothing), or null. */
+export function renameFile(from: string, to: string): string | null {
+  const norm = normalizePath(to.trim());
+  const problem = filePathProblem(norm, from);
+  if (problem !== null || norm === null) return problem;
+  if (norm === from) return null;
   setState({
-    source: text,
-    scriptName: name,
+    files: state.files.map((f) => (f.path === from ? { path: norm, text: f.text } : f)),
+    entryPath: state.entryPath === from ? norm : state.entryPath,
+    activePath: state.activePath === from ? norm : state.activePath,
+  });
+  return null;
+}
+
+/** Remove a workspace file. The last file stays (a program needs an entry); a
+ *  removed entry passes to the first remaining file. */
+export function closeFile(path: string): void {
+  if (state.files.length <= 1 || workspaceFile(path) === undefined) return;
+  const files = state.files.filter((f) => f.path !== path);
+  setState({
+    files,
+    entryPath: state.entryPath === path ? files[0].path : state.entryPath,
+    activePath: state.activePath === path ? files[0].path : state.activePath,
+  });
+}
+
+/** Whether the workspace is still the untouched default program, which a
+ *  loaded file replaces instead of joining. */
+function pristineWorkspace(): boolean {
+  return state.files.length === 1 && state.files[0].path === DEFAULT_PATH && state.files[0].text === DEFAULT_SOURCE;
+}
+
+/** Load a local source file's text into the editor (does not run). It replaces
+ *  the untouched default program (and becomes the entry, its name `arg[0]`);
+ *  otherwise it joins the program as a new tab, or replaces the file of the
+ *  same name. Distinct from `loadBytes`, which decodes a binary `.mahinatrace`
+ *  artifact into the trace view. */
+export function loadSourceText(name: string, text: string): void {
+  const path = normalizePath(name) ?? DEFAULT_PATH;
+  if (pristineWorkspace()) {
+    replaceWorkspace([{ path, text }], path);
+    return;
+  }
+  const files = workspaceFile(path) !== undefined
+    ? state.files.map((f) => (f.path === path ? { path, text } : f))
+    : [...state.files, { path, text }];
+  setState({ files, activePath: path, sourceError: null });
+}
+
+/** Replace the whole program (a project `mahina viz` serves, or the first file
+ *  opened). An open replay describes the old program, so it closes. */
+export function replaceWorkspace(files: SourceFile[], entry: string): void {
+  setState({
+    files,
+    entryPath: entry,
+    activePath: entry,
     sourceError: null,
     replayActive: false,
     replayState: null,
@@ -359,7 +514,30 @@ export function parseArgsString(s: string): string[] {
  *  (`runNative`) — it supplies `arg[0]` = the temp source path itself. */
 function wasmArgv(): string[] {
   const userArgs = parseArgsString(state.scriptArgs);
-  return userArgs.length > 0 ? [state.scriptName, ...userArgs] : [];
+  return userArgs.length > 0 ? [state.entryPath, ...userArgs] : [];
+}
+
+/** The entry file's current text. */
+function entrySource(): string {
+  return workspaceFile(state.entryPath)?.text ?? "";
+}
+
+/** Resolve a run's chunks to files. Chunk 0 is the entry; a loaded chunk is
+ *  the workspace file it was read from when its name normalizes to one whose
+ *  text (as the run saw it, `ranFiles`) is the chunk's; anything else — a
+ *  `load`ed string, a chunk under a made-up name — is a read-only virtual file
+ *  named after its chunk. Pure. */
+export function resolveRunFiles(chunks: RunChunk[], entry: string, entryText: string, ranFiles: SourceFile[]): RunFile[] {
+  return chunks.map((c, i) => {
+    if (i === 0) return { path: entry, text: entryText, firstProtoId: c.firstProtoId, protoCount: c.protoCount, virtual: false };
+    const norm = normalizePath(c.name);
+    const ws = norm === null ? undefined : ranFiles.find((f) => f.path === norm);
+    if (ws !== undefined && ws.text === c.source) {
+      return { path: ws.path, text: c.source, firstProtoId: c.firstProtoId, protoCount: c.protoCount, virtual: false };
+    }
+    const label = c.name.length > 0 ? c.name : "(load)";
+    return { path: `${label} #${i}`, text: c.source, firstProtoId: c.firstProtoId, protoCount: c.protoCount, virtual: true };
+  });
 }
 
 /**
@@ -379,7 +557,7 @@ export async function checkSource(src: string): Promise<MahinaDiagnostic[]> {
 
 /** Decode a wasm run's recorded trace and push it + stdout into the store. The
  *  trace flows into the existing views exactly as a loaded .mahinatrace would. */
-function applyWasmResult(result: MahinaRunResult, fileName: string, source: string): void {
+function applyWasmResult(result: MahinaRunResult, fileName: string, ran: RunInput): void {
   let traces: TraceView[] = [];
   let version: number | null = null;
   if (result.trace.length > 0) {
@@ -409,6 +587,8 @@ function applyWasmResult(result: MahinaRunResult, fileName: string, source: stri
       coverage = null;
     }
   }
+  const runFiles = resolveRunFiles(result.chunks, ran.entry, ran.source, ran.files);
+  const errorFile = runFileIn(runFiles, result.errorProtoId);
   setState({
     fileName,
     version,
@@ -420,7 +600,7 @@ function applyWasmResult(result: MahinaRunResult, fileName: string, source: stri
     // A located runtime error (errorLine > 0) drives the editor squiggle. Parse/
     // compile errors carry no run-time span here (errorLine stays 0).
     runErrorSpan: result.status !== 0 && result.errorLine > 0
-      ? { line: result.errorLine, start: result.errorStart, end: result.errorEnd }
+      ? { path: errorFile?.path ?? ran.entry, line: result.errorLine, start: result.errorStart, end: result.errorEnd }
       : null,
     // The full call chain (deepest-first) for the traceback line; null on a
     // clean run or an unlocatable fault.
@@ -431,10 +611,16 @@ function applyWasmResult(result: MahinaRunResult, fileName: string, source: stri
     // source + safepoint index so replay can re-run them to any step.
     replayActive: false,
     replayEffects: result.effects,
-    replaySource: source,
+    replaySource: ran.source,
+    runFiles,
+    // A read-only tab of the previous run may be gone now.
+    activePath: state.files.some((f) => f.path === state.activePath) || runFiles.some((f) => f.path === state.activePath)
+      ? state.activePath
+      : state.entryPath,
     safepointCount: result.safepointCount,
     safepointCapped: result.safepointCapped,
     safepointLines: result.safepointLines,
+    safepointProtos: result.safepointProtos,
     replayStops: [],
     replayPos: 0,
     replayState: null,
@@ -446,9 +632,71 @@ function applyWasmResult(result: MahinaRunResult, fileName: string, source: stri
     traceExecPos: 0,
     coverage,
     tracesFromRun: true,
-    irHoverLine: 0,
-    irPinnedLine: 0,
+    irHoverLoc: null,
+    irPinnedLoc: null,
   });
+}
+
+/** What a run was given: the entry's path and text, and every file. */
+interface RunInput {
+  entry: string;
+  source: string;
+  files: SourceFile[];
+}
+
+/** Snapshot the program for a run. */
+function runInput(): RunInput {
+  return { entry: state.entryPath, source: entrySource(), files: state.files.map((f) => ({ path: f.path, text: f.text })) };
+}
+
+/** The run file chunk `protoId` belongs to in `runFiles`, or null. Pure. */
+function runFileIn(runFiles: readonly RunFile[], protoId: number): RunFile | null {
+  for (const f of runFiles) {
+    if (protoId >= f.firstProtoId && protoId - f.firstProtoId < f.protoCount) return f;
+  }
+  return null;
+}
+
+/** The last run's file that proto `protoId` was compiled from, or null. */
+export function runFileOf(protoId: number): RunFile | null {
+  return runFileIn(state.runFiles, protoId);
+}
+
+/** Whether lines of the last run still name lines of tab `path`: it's one of
+ *  the run's read-only chunks, or a workspace file whose text is unchanged
+ *  since the run. */
+export function fileMapped(path: string): boolean {
+  const rf = state.runFiles.find((f) => f.path === path);
+  if (rf === undefined) return false;
+  return rf.virtual || workspaceFile(path)?.text === rf.text;
+}
+
+/** Where `line` of proto `protoId` is, if the last run's lines still apply
+ *  to that file (`fileMapped`); null otherwise or for line 0. */
+export function locOf(protoId: number, line: number): Loc | null {
+  if (line <= 0) return null;
+  const rf = runFileOf(protoId);
+  if (rf === null || !fileMapped(rf.path)) return null;
+  return { path: rf.path, line };
+}
+
+/** A place as the UI writes it: `line N` in the entry file, else
+ *  `path:N`. */
+export function locLabel(loc: Loc): string {
+  return loc.path === state.entryPath ? `line ${loc.line}` : `${loc.path}:${loc.line}`;
+}
+
+/** Show `loc`'s file in the editor and scroll it to the line. */
+export function revealLoc(loc: Loc): void {
+  setActivePath(loc.path);
+  setState({ revealTarget: loc, revealSeq: state.revealSeq + 1 });
+}
+
+/** A stable small number per file of the last run (its first chunk's index),
+ *  for telling files apart in the safepoint index. */
+function fileKeyOf(protoId: number): number {
+  const rf = runFileOf(protoId);
+  return rf === null ? -1 : state.runFiles.findIndex((f) => f.path === rf.path);
 }
 
 /** True when the last run produced a replayable step index (a successful run
@@ -461,7 +709,7 @@ export function canReplay(): boolean {
  *  land on the first step. No-op if there's nothing replayable. */
 export function openReplay(): void {
   if (!canReplay()) return;
-  const stops = buildStops(state.grain, state.safepointCount, state.safepointLines);
+  const stops = buildStops(state.grain, state.safepointCount, state.safepointLines, memoFileKey(), state.safepointProtos);
   setState({ replayActive: true, replayStops: stops, replayPos: 0 });
   setReplayPos(0);
 }
@@ -475,7 +723,7 @@ export function closeReplay(): void {
  *  point: snap to the last stop at or before the current safepoint. */
 export function setGrain(grain: "instr" | "line"): void {
   const curK = state.replayStops[state.replayPos] ?? 1;
-  const stops = buildStops(grain, state.safepointCount, state.safepointLines);
+  const stops = buildStops(grain, state.safepointCount, state.safepointLines, memoFileKey(), state.safepointProtos);
   let pos = 0;
   for (let i = 0; i < stops.length; i++) {
     if (stops[i] <= curK) pos = i;
@@ -483,6 +731,28 @@ export function setGrain(grain: "instr" | "line"): void {
   }
   setState({ grain, replayStops: stops });
   setReplayPos(pos);
+}
+
+/** `fileKeyOf`, memoized per proto: the index has a row per step, the program
+ *  only a few protos. */
+function memoFileKey(): (protoId: number) => number {
+  const memo = new Map<number, number>();
+  return (id) => {
+    let k = memo.get(id);
+    if (k === undefined) {
+      k = fileKeyOf(id);
+      memo.set(id, k);
+    }
+    return k;
+  };
+}
+
+/** Where the replay is paused: the file and line of the pending instruction,
+ *  or null when finished, unavailable, or the file was edited since the run. */
+export function replayLoc(): Loc | null {
+  const rs = state.replayState;
+  if (!state.replayActive || rs === null || rs.finished) return null;
+  return locOf(rs.protoId, rs.currentLine);
 }
 
 /** Move the slider to position `pos` (an index into `replayStops`) and fetch the
@@ -505,6 +775,9 @@ export function setReplayPos(pos: number): void {
       if (req !== replayRequest) return;
       const view = decodeSnapshot(rs.keyframe);
       setState({ replayState: rs, replayView: view });
+      // Follow the step into whichever file it is in, like a debugger.
+      const loc = replayLoc();
+      if (loc !== null && loc.path !== state.activePath) setActivePath(loc.path);
       // Step 1 is before the program's first line: its globals are the builtins.
       if (k === 1 && state.replayBaseGlobals === null && view !== null) {
         setState("replayBaseGlobals", view.globals.map(globalKey));
@@ -563,9 +836,9 @@ export async function runWasm(): Promise<void> {
   setState({ running: true, runError: null, runErrorSpan: null, runBacktrace: null, diff: null });
   runAbort = new AbortController();
   try {
-    const src = state.source;
-    const result = await mahinaWorker().runSource(src, wasmArgv());
-    applyWasmResult(result, "(wasm run)", src);
+    const ran = runInput();
+    const result = await mahinaWorker().runSource(ran.source, wasmArgv(), ran.files);
+    applyWasmResult(result, "(wasm run)", ran);
     // A wasm-only run has no cycle counter — drop any prior native time split so
     // the panel's time column reverts to "run native".
     setState({ running: false, nativeCoverage: null });
@@ -608,16 +881,16 @@ export async function runBoth(): Promise<void> {
   runAbort = new AbortController();
   const signal = runAbort.signal;
   try {
-    const src = state.source;
-    // wasm gets `[scriptName, ...userArgs]`; native gets the raw userArgs and
+    const ran = runInput();
+    // wasm gets `[entryPath, ...userArgs]`; native gets the raw userArgs and
     // prepends the temp source path as its own arg[0]. Both see the same
     // arg[1..], which is what the keyframe compare requires (arg[0] is cancelled).
     const userArgs = parseArgsString(state.scriptArgs);
     const [wasm, native] = await Promise.all([
-      mahinaWorker().runSource(src, wasmArgv()),
-      runNative(src, userArgs, signal),
+      mahinaWorker().runSource(ran.source, wasmArgv(), ran.files),
+      runNative(ran.files, ran.entry, userArgs, signal),
     ]);
-    applyWasmResult(wasm, "(wasm + native diff)", src);
+    applyWasmResult(wasm, "(wasm + native diff)", ran);
     // The native run carries the honest time-weighted coverage (real TSC cycles).
     // Decode best-effort — a failure just leaves the time column grayed.
     let nativeCoverage: CoverageFileOutput | null = null;
@@ -659,8 +932,8 @@ export function loadBytes(name: string, bytes: Uint8Array): void {
       execLogsRecorded: false,
       traceExecPos: 0,
       tracesFromRun: false,
-      irHoverLine: 0,
-      irPinnedLine: 0,
+      irHoverLoc: null,
+      irPinnedLoc: null,
     });
   } catch (e) {
     setState({
@@ -695,9 +968,54 @@ export async function loadFromUrl(url: string): Promise<void> {
   }
 }
 
+/** A program as `mahina viz <file>` serves it at `GET /project`: the entry's
+ *  path and every file of its directory tree it found (paths relative to that
+ *  directory), plus why the list is incomplete, if it is. */
+export interface ProjectPayload {
+  entry: string;
+  files: SourceFile[];
+  truncated?: string;
+}
+
+/** Decode a `/project` payload into the program it holds: paths normalized,
+ *  files that don't normalize dropped. Throws when the entry isn't among the
+ *  files. Pure. */
+export function projectWorkspace(p: ProjectPayload): { files: SourceFile[]; entry: string } {
+  const files: SourceFile[] = [];
+  for (const f of p.files) {
+    const path = normalizePath(f.path);
+    if (path !== null && !files.some((g) => g.path === path)) files.push({ path, text: f.text });
+  }
+  const entry = normalizePath(p.entry);
+  if (entry === null || !files.some((f) => f.path === entry)) throw new Error(`project entry ${p.entry} is not among its files`);
+  return { files, entry };
+}
+
+/** Fetch a program from `url` (`mahina viz <file>` serves `/project`) and open
+ *  it in the editor, replacing the current one. Doesn't run it. */
+export async function loadProjectFromUrl(url: string): Promise<void> {
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`fetch ${url}: ${resp.status} ${resp.statusText}`);
+    const payload = (await resp.json()) as ProjectPayload;
+    const { files, entry } = projectWorkspace(payload);
+    replaceWorkspace(files, entry);
+    if (payload.truncated) setState("sourceError", payload.truncated);
+  } catch (e) {
+    setState("sourceError", e instanceof Error ? e.message : String(e));
+  }
+}
+
+/** A backtrace frame as the UI writes it: `name:line` in the entry file, else
+ *  `name (path:line)`. */
+export function frameLabel(f: BacktraceFrame): string {
+  const path = runFileOf(f.protoId)?.path ?? state.entryPath;
+  return path === state.entryPath ? `${f.name}:${f.line}` : `${f.name} (${path}:${f.line})`;
+}
+
 export function selectTrace(index: number): void {
   // A new selection resets the animation to the start of that trace's stream.
-  setState({ selected: index, traceExecPos: 0, irHoverLine: 0, irPinnedLine: 0 });
+  setState({ selected: index, traceExecPos: 0, irHoverLoc: null, irPinnedLoc: null });
 }
 
 /** The source line of bytecode `sp`, via the disassembly of the same compile
@@ -708,32 +1026,35 @@ export function sourceLineOf(disasm: ProtoDisasm[], sp: SourcePoint | null): num
   return proto?.instrs[sp.pc]?.line ?? 0;
 }
 
-/** Whether trace instructions can be mapped to editor lines: the traces came
- *  from the last run and the editor still holds that run's source. */
-export function traceSourceMapped(): boolean {
-  return state.tracesFromRun && state.source === state.replaySource && state.disasm.length > 0;
+/** Where a trace instruction (or anchor) was recorded from, or null when it
+ *  has no place, the traces aren't the last run's (a loaded `.mahinatrace`'s
+ *  protos are another compile's), or its file changed since the run. */
+export function traceLoc(sp: SourcePoint | null): Loc | null {
+  if (!state.tracesFromRun || sp === null) return null;
+  return locOf(sp.protoId, sourceLineOf(state.disasm, sp));
 }
 
-/** The editor line a trace instruction (or anchor) was recorded from, or 0
- *  when it has none or the mapping doesn't apply (see `traceSourceMapped`). */
-export function traceLine(sp: SourcePoint | null): number {
-  return traceSourceMapped() ? sourceLineOf(state.disasm, sp) : 0;
+/** Two places are the same line of the same file. */
+export function sameLoc(a: Loc | null, b: Loc | null): boolean {
+  return a !== null && b !== null && a.path === b.path && a.line === b.line;
 }
 
-/** The IR row under the pointer is from `line` (0 clears). */
-export function hoverIrLine(line: number): void {
-  setState("irHoverLine", line);
+/** The IR row under the pointer is from `loc` (null clears). */
+export function hoverIrLoc(loc: Loc | null): void {
+  setState("irHoverLoc", loc);
 }
 
-/** An IR row from `line` was clicked: keep its line marked in the editor and
- *  scroll the editor to it. */
-export function pinIrLine(line: number): void {
-  setState({ irPinnedLine: line, irRevealSeq: state.irRevealSeq + 1 });
+/** An IR row from `loc` was clicked: keep its line marked in the editor, and
+ *  show and scroll to it. */
+export function pinIrLoc(loc: Loc): void {
+  setState("irPinnedLoc", loc);
+  revealLoc(loc);
 }
 
-/** The editor cursor moved to `line` (by the user). */
+/** The editor cursor moved to `line` of the active tab (by the user). */
 export function setEditorCursorLine(line: number): void {
-  if (state.editorCursorLine !== line) setState("editorCursorLine", line);
+  const loc = { path: state.activePath, line };
+  if (!sameLoc(state.editorCursor, loc)) setState("editorCursor", loc);
 }
 
 /** The currently-selected trace view, or null. */
@@ -910,19 +1231,21 @@ export function nativeTimeSplit(): CoverageTimeSplit | null {
   return state.nativeCoverage ? timeSplitOf(state.nativeCoverage) : null;
 }
 
-/** Resolve the last run's per-anchor coverage to source lines (store wrapper over
- *  {@link resolveCoverageLines}). Empty when there's no coverage. */
-export function coverageByLine(): Map<number, LineCoverage> {
+/** Resolve the last run's per-anchor coverage to the lines of file `path`
+ *  (store wrapper over {@link resolveCoverageLines}). Empty when there's no
+ *  coverage or the file changed since the run. */
+export function coverageLinesOf(path: string): Map<number, LineCoverage> {
   const cov = state.coverage;
-  if (cov === null) return new Map();
-  return resolveCoverageLines(cov.anchors, state.disasm);
+  if (cov === null || !fileMapped(path)) return new Map();
+  const anchors = cov.anchors.filter((a) => runFileOf(a.proto_id)?.path === path);
+  return resolveCoverageLines(anchors, state.disasm);
 }
 
 /** Whether the editor is showing coverage stripes: the last run produced
- *  per-line coverage and the editor still holds that run's source (an edit
- *  clears the stripes). Gates the stripe legend. */
+ *  per-line coverage for the active tab and it is unchanged since the run (an
+ *  edit clears the stripes). Gates the stripe legend. */
 export function coverageStripesShown(): boolean {
-  return state.coverage !== null && state.source === state.replaySource && coverageByLine().size > 0;
+  return coverageLinesOf(state.activePath).size > 0;
 }
 
 /** The last run's aggregate coverage split (store wrapper over

@@ -6,6 +6,7 @@
 // no `/run`.
 
 import type { RunArtifacts } from "./diff";
+import type { SourceFile } from "./wasm/mahina";
 
 interface NativeRunResponse {
   status: number;
@@ -26,19 +27,23 @@ function fromBase64(b64: string): Uint8Array {
   return out;
 }
 
-/** Run `source` (with optional script `args` → `arg[1..]`) through the native
- *  binary via `vite dev` or `mahina viz`. Throws if the endpoint is unavailable
- *  (a static host of `dist/`). `signal` abandons the request (Stop); the
- *  server's own per-run timeout ends the native process. */
+/** Run the program — `files`, of which `entry` is executed (with optional
+ *  script `args` → `arg[1..]`) — through the native binary via `vite dev` or
+ *  `mahina viz`. The server writes the files into a fresh directory and runs
+ *  there, so `require`/`loadfile`/`dofile` read them as the wasm run does.
+ *  Throws if the endpoint is unavailable (a static host of `dist/`). `signal`
+ *  abandons the request (Stop); the server's own per-run timeout ends the
+ *  native process. */
 export async function runNative(
-  source: string,
+  files: SourceFile[],
+  entry: string,
   args: string[] = [],
   signal?: AbortSignal,
 ): Promise<RunArtifacts & { diagnostics: string; coverage: Uint8Array }> {
   const resp = await fetch("/run", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ source, args }),
+    body: JSON.stringify({ files, entry, args }),
     signal,
   });
   if (!resp.ok) {

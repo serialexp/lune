@@ -487,6 +487,85 @@ button.secondary {
   background: transparent;
 }
 
+/* The program's file tabs above the editor: the entry is marked ▶; a run's
+   read-only `load` chunks are italic. */
+.file-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.25rem 0;
+}
+.file-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px 4px 0 0;
+  cursor: pointer;
+  user-select: none;
+}
+.file-tab:hover {
+  color: var(--fg);
+}
+.file-tab.active {
+  color: var(--fg);
+  background: var(--panel2);
+  border-bottom-color: var(--accent);
+}
+.file-tab.virtual {
+  font-style: italic;
+}
+.entry-mark {
+  color: var(--accent);
+  font-size: 0.65rem;
+}
+.tab-close {
+  padding: 0 0.25rem;
+  line-height: 1;
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+.tab-close:hover {
+  color: #f7768e;
+  border-color: transparent;
+}
+.tab-add {
+  padding: 0.1rem 0.45rem;
+}
+.tab-rename {
+  width: 12rem;
+  padding: 0.2rem 0.4rem;
+  font: inherit;
+  font-size: 0.8rem;
+  color: var(--fg);
+  background: var(--panel2);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+}
+.tab-entry {
+  font-size: 0.8rem;
+  padding: 0.15rem 0.5rem;
+}
+
+/* A `file:line` in the run error that shows that line in the editor. */
+.loc-link {
+  padding: 0;
+  font-size: inherit;
+  color: inherit;
+  text-decoration: underline dotted;
+  background: transparent;
+  border: none;
+}
+.loc-link:hover {
+  color: var(--fg);
+}
+
 .diff {
   border: 1px solid var(--border);
   border-radius: 4px;

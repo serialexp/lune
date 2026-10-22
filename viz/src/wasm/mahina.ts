@@ -12,13 +12,25 @@ interface MahinaExports {
   memory: WebAssembly.Memory;
   mahina_alloc(len: number): number;
   mahina_free(ptr: number, len: number): void;
-  mahina_run(srcPtr: number, srcLen: number, argsPtr: number, argsLen: number): number;
+  mahina_run(srcPtr: number, srcLen: number, argsPtr: number, argsLen: number, filesPtr: number, filesLen: number): number;
   mahina_free_result(resPtr: number): void;
   mahina_check(srcPtr: number, srcLen: number): number;
   mahina_free_check_result(resPtr: number): void;
   mahina_replay(srcPtr: number, srcLen: number, effPtr: number, effLen: number, stopAfter: number): number;
   mahina_free_replay_result(resPtr: number): void;
   mahina_dispatch_smoke(iterations: number): number;
+  mahina_panic_message_ptr(): number;
+  mahina_panic_message_len(): number;
+}
+
+/** The VM panicked (a bug in mahina, not in the program): wasm trapped, with
+ *  the panic's message. The instance's memory is left mid-operation, so every
+ *  later call on it throws this too; load a fresh module. */
+export class MahinaTrapError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "MahinaTrapError";
+  }
 }
 
 /** The artifacts of one in-browser run. Byte buffers are copies out of linear
@@ -40,6 +52,8 @@ export interface MahinaRunResult {
    *  Set only on a run failure with a faulting frame; parse/compile errors
    *  leave it 0 (their spans come through `check`). */
   errorLine: number;
+  /** The proto `errorLine` is in, which names its file (see `chunks`). */
+  errorProtoId: number;
   /** UTF-8 byte offsets [start,end) of the faulting span, for an editor
    *  squiggle. Both 0 when there's no located runtime error. */
   errorStart: number;
@@ -65,6 +79,13 @@ export interface MahinaRunResult {
    *  instruction pending at safepoint k+1. Length == `safepointCount`. Drives
    *  line-grain stepping (slider over the indices where the line changes). */
   safepointLines: Uint32Array;
+  /** Parallel to `safepointLines`: the proto each line is in, which names its
+   *  file (see `chunks`). */
+  safepointProtos: Uint32Array;
+  /** Every chunk the run compiled: entry 0 is the program, the rest what
+   *  `require`/`loadfile`/`dofile`/`load` compiled, in load order. Names the
+   *  file of any proto id. Empty when the run never got to execute. */
+  chunks: RunChunk[];
   /** Static disassembly of every proto in the program, indexed by `id` (use the
    *  replay cursor's `protoId`). Empty when the disassembly couldn't be built.
    *  Drives the step-replay panel's bytecode view. */
@@ -79,6 +100,26 @@ export interface MahinaRunResult {
    *  populated. Empty only on a run that never reached a back-edge. Drives the
    *  coverage view. */
   coverage: Uint8Array;
+}
+
+/** One compiled chunk of a run: the proto ids `[firstProtoId, firstProtoId +
+ *  protoCount)` are its functions. */
+export interface RunChunk {
+  firstProtoId: number;
+  protoCount: number;
+  /** The chunk name: the path `require`/`loadfile`/`dofile` read (as the
+   *  program spelled it, e.g. `./mod.mah`), else `load`'s chunkname. Empty
+   *  for entry 0, the program itself. */
+  name: string;
+  /** The text it was compiled from. Empty for entry 0 (the caller has it). */
+  source: string;
+}
+
+/** A file the program can `require`/`loadfile`/`dofile`, by its path relative
+ *  to the program's directory. */
+export interface SourceFile {
+  path: string;
+  text: string;
 }
 
 /** The disassembly of one function prototype (a node in the proto tree). */
@@ -136,6 +177,8 @@ export interface MahinaReplayResult {
 export interface BacktraceFrame {
   /** Function name (`"main"` for the top-level chunk). */
   name: string;
+  /** The frame's proto, which names its file (see `MahinaRunResult.chunks`). */
+  protoId: number;
   /** 1-based source line of this frame's active instruction. */
   line: number;
   start: number;
@@ -161,8 +204,9 @@ export interface MahinaModule {
   /** Parse, compile, and run a source chunk; returns its artifacts. `argv`, when
    *  given, fills the global `arg` table (`argv[0]` = script name, `argv[1..]` =
    *  user args) exactly as the CLI does — so a script reading `arg[1]` (e.g.
-   *  nsieve's workload size) sees it. Omitted/empty ⇒ `arg` stays an empty table. */
-  runSource(src: string, argv?: string[]): MahinaRunResult;
+   *  nsieve's workload size) sees it. Omitted/empty ⇒ `arg` stays an empty table.
+   *  `files` are what `require`/`loadfile`/`dofile` can read. */
+  runSource(src: string, argv?: string[], files?: SourceFile[]): MahinaRunResult;
   /** Parse + compile a source chunk and return its diagnostics WITHOUT running
    *  it — the editor's live linter. An empty array means a clean compile. */
   check(src: string): MahinaDiagnostic[];
@@ -185,8 +229,10 @@ export interface MahinaModule {
 //   then { u32 ptr; u32 len } safepoint_lines (line-per-safepoint blob, @80);
 //   then { u32 ptr; u32 len } disasm (static bytecode blob, @88);
 //   then { u32 ptr; u32 len } exec_log (trace execution-log blob, @96);
-//   then { u32 ptr; u32 len } coverage (JIT coverage blob, @104). Total 112 bytes.
-const RESULT_BYTES = 4 + 5 * 8 + 3 * 4 + 8 + 8 + 4 + 4 + 8 + 8 + 8 + 8;
+//   then { u32 ptr; u32 len } coverage (JIT coverage blob, @104);
+//   then { u32 ptr; u32 len } chunks (the chunk table, @112);
+//   then u32 error_proto_id (@120). 124 bytes read (128 with the u64's padding).
+const RESULT_BYTES = 4 + 5 * 8 + 3 * 4 + 8 + 8 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 4;
 
 // ReplayResult struct layout (extern struct), little-endian:
 //   u32 status; { u32 ptr; u32 len } stdout/keyframe/diag; u32 current_line (@28),
@@ -208,12 +254,24 @@ const decoder = new TextDecoder();
  *  Empty argv → empty blob (the caller then passes len 0 and the VM leaves `arg`
  *  an empty table). */
 function encodeArgv(argv: string[]): Uint8Array {
-  if (argv.length === 0) return new Uint8Array(0);
-  const parts = argv.map((a) => encoder.encode(a));
+  return encodeRecords(argv.length, argv);
+}
+
+/** Pack the program's files into the blob `mahina_run` decodes (see
+ *  `parseFiles` in wasm_entry.zig): `u32 count`, then per file `{ u32 len;
+ *  utf8 path }{ u32 len; utf8 text }`. No files → empty blob. */
+function encodeFiles(files: SourceFile[]): Uint8Array {
+  return encodeRecords(files.length, files.flatMap((f) => [f.path, f.text]));
+}
+
+/** `u32 count`, then each field as `{ u32 len; utf8 }`. Count 0 → empty. */
+function encodeRecords(count: number, fields: string[]): Uint8Array {
+  if (count === 0) return new Uint8Array(0);
+  const parts = fields.map((a) => encoder.encode(a));
   const total = 4 + parts.reduce((n, p) => n + 4 + p.length, 0);
   const buf = new Uint8Array(total);
   const dv = new DataView(buf.buffer);
-  dv.setUint32(0, argv.length, true);
+  dv.setUint32(0, count, true);
   let off = 4;
   for (const p of parts) {
     dv.setUint32(off, p.length, true);
@@ -260,9 +318,50 @@ function readU32Array(blob: Uint8Array): Uint32Array {
   return new Uint32Array(blob.buffer, blob.byteOffset, blob.length >>> 2);
 }
 
+/** Split the safepoint index blob (little-endian `{u32 proto_id, u32 line}`
+ *  pairs, see `encodeSafepointLines` in wasm_entry.zig) into its two columns. */
+function decodeSafepoints(blob: Uint8Array): { lines: Uint32Array; protos: Uint32Array } {
+  const pairs = readU32Array(blob);
+  const n = pairs.length >>> 1;
+  const lines = new Uint32Array(n);
+  const protos = new Uint32Array(n);
+  for (let i = 0; i < n; i++) {
+    protos[i] = pairs[2 * i];
+    lines[i] = pairs[2 * i + 1];
+  }
+  return { lines, protos };
+}
+
+/** Decode the chunk table (see `buildChunksBlob` in wasm_entry.zig): `u32
+ *  count`, then per chunk `{ u32 first_proto_id, u32 proto_count, u32
+ *  name_len, name, u32 source_len, source }`. Empty → []. */
+function decodeChunks(blob: Uint8Array): RunChunk[] {
+  if (blob.length < 4) return [];
+  const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  const count = dv.getUint32(0, true);
+  const chunks: RunChunk[] = [];
+  let off = 4;
+  const str = (): string => {
+    const len = dv.getUint32(off, true);
+    off += 4;
+    const s = decoder.decode(blob.subarray(off, off + len));
+    off += len;
+    return s;
+  };
+  for (let i = 0; i < count; i++) {
+    const firstProtoId = dv.getUint32(off, true);
+    const protoCount = dv.getUint32(off + 4, true);
+    off += 8;
+    const name = str();
+    const source = str();
+    chunks.push({ firstProtoId, protoCount, name, source });
+  }
+  return chunks;
+}
+
 /** Decode the structured backtrace blob (see `encodeBacktrace` in
  *  wasm_entry.zig): `u32 frame_count`, then per frame (deepest-first)
- *  `{ u32 line, start, end, name_len, [name_len]u8 name }`. Empty → []. */
+ *  `{ u32 proto_id, line, start, end, name_len, [name_len]u8 name }`. Empty → []. */
 function decodeBacktrace(blob: Uint8Array): BacktraceFrame[] {
   if (blob.length < 4) return [];
   const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
@@ -270,14 +369,15 @@ function decodeBacktrace(blob: Uint8Array): BacktraceFrame[] {
   const frames: BacktraceFrame[] = [];
   let off = 4;
   for (let i = 0; i < count; i++) {
-    const line = dv.getUint32(off, true);
-    const start = dv.getUint32(off + 4, true);
-    const end = dv.getUint32(off + 8, true);
-    const nameLen = dv.getUint32(off + 12, true);
-    off += 16;
+    const protoId = dv.getUint32(off, true);
+    const line = dv.getUint32(off + 4, true);
+    const start = dv.getUint32(off + 8, true);
+    const end = dv.getUint32(off + 12, true);
+    const nameLen = dv.getUint32(off + 16, true);
+    off += 20;
     const name = decoder.decode(blob.subarray(off, off + nameLen));
     off += nameLen;
-    frames.push({ name, line, start, end });
+    frames.push({ name, protoId, line, start, end });
   }
   return frames;
 }
@@ -317,7 +417,22 @@ function decodeDisasm(blob: Uint8Array): ProtoDisasm[] {
 }
 
 function wrap(exports: MahinaExports): MahinaModule {
-  const runSource = (src: string, argv: string[] = []): MahinaRunResult => {
+  // Set by the first trap; the instance is unusable from then on.
+  let trapped: string | null = null;
+  const guarded = <A extends unknown[], R>(name: string, fn: (...args: A) => R) => (...args: A): R => {
+    if (trapped !== null) throw new MahinaTrapError(`the in-browser VM crashed earlier (${trapped}); reload it`);
+    try {
+      return fn(...args);
+    } catch (e) {
+      if (!(e instanceof WebAssembly.RuntimeError)) throw e;
+      const len = exports.mahina_panic_message_len();
+      const msg = len === 0 ? e.message : decoder.decode(new Uint8Array(exports.memory.buffer, exports.mahina_panic_message_ptr(), len));
+      trapped = msg;
+      throw new MahinaTrapError(`mahina ${name} panicked: ${msg}`, { cause: e });
+    }
+  };
+
+  const runSource = (src: string, argv: string[] = [], files: SourceFile[] = []): MahinaRunResult => {
     const bytes = encoder.encode(src);
     const srcPtr = bytes.length === 0 ? 0 : exports.mahina_alloc(bytes.length);
     if (bytes.length !== 0) {
@@ -331,14 +446,20 @@ function wrap(exports: MahinaExports): MahinaModule {
     if (argsBlob.length !== 0) {
       new Uint8Array(exports.memory.buffer, argsPtr, argsBlob.length).set(argsBlob);
     }
+    const filesBlob = encodeFiles(files);
+    const filesPtr = filesBlob.length === 0 ? 0 : exports.mahina_alloc(filesBlob.length);
+    if (filesBlob.length !== 0) {
+      new Uint8Array(exports.memory.buffer, filesPtr, filesBlob.length).set(filesBlob);
+    }
 
     // Total wall-clock brackets the whole wasm call (parse + compile + execute +
     // artifact serialization). The execute-only subset comes back as `exec_ns`.
     const t0 = performance.now();
-    const resPtr = exports.mahina_run(srcPtr, bytes.length, argsPtr, argsBlob.length);
+    const resPtr = exports.mahina_run(srcPtr, bytes.length, argsPtr, argsBlob.length, filesPtr, filesBlob.length);
     const totalMs = performance.now() - t0;
     if (srcPtr !== 0) exports.mahina_free(srcPtr, bytes.length);
     if (argsPtr !== 0) exports.mahina_free(argsPtr, argsBlob.length);
+    if (filesPtr !== 0) exports.mahina_free(filesPtr, filesBlob.length);
     if (resPtr === 0) {
       throw new Error("mahina_run returned null (wasm allocation failure)");
     }
@@ -358,10 +479,12 @@ function wrap(exports: MahinaExports): MahinaModule {
     const execMs = Number(dv.getBigUint64(64, true)) / 1e6;
     const safepointCount = dv.getUint32(72, true);
     const safepointCapped = dv.getUint32(76, true) !== 0;
-    const safepointLines = readU32Array(readBuf(exports.memory, dv, 80));
+    const safepoints = decodeSafepoints(readBuf(exports.memory, dv, 80));
     const disasm = decodeDisasm(readBuf(exports.memory, dv, 88));
     const executionLog = readBuf(exports.memory, dv, 96);
     const coverage = readBuf(exports.memory, dv, 104);
+    const chunks = decodeChunks(readBuf(exports.memory, dv, 112));
+    const errorProtoId = dv.getUint32(120, true);
 
     exports.mahina_free_result(resPtr);
 
@@ -373,6 +496,7 @@ function wrap(exports: MahinaExports): MahinaModule {
       effects,
       trace,
       errorLine,
+      errorProtoId,
       errorStart,
       errorEnd,
       backtrace,
@@ -380,7 +504,9 @@ function wrap(exports: MahinaExports): MahinaModule {
       totalMs,
       safepointCount,
       safepointCapped,
-      safepointLines,
+      safepointLines: safepoints.lines,
+      safepointProtos: safepoints.protos,
+      chunks,
       disasm,
       executionLog,
       coverage,
@@ -480,10 +606,10 @@ function wrap(exports: MahinaExports): MahinaModule {
   };
 
   return {
-    runSource,
-    check,
-    replay,
-    dispatchSmoke: (iterations: number) => exports.mahina_dispatch_smoke(iterations),
+    runSource: guarded("run", runSource),
+    check: guarded("check", check),
+    replay: guarded("replay", replay),
+    dispatchSmoke: guarded("dispatch smoke", (iterations: number) => exports.mahina_dispatch_smoke(iterations)),
   };
 }
 

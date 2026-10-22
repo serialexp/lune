@@ -29,6 +29,9 @@ pub const mem = @import("mem.zig");
 /// API and `Value` text rendering.
 pub const io = @import("io.zig");
 
+/// Program-relative file paths (the visualiser's files, `mahina viz`).
+pub const relpath = @import("relpath.zig");
+
 /// Phase 2 — front end: lexer, AST, parser.
 pub const diag = @import("diag.zig");
 pub const token = @import("token.zig");
@@ -140,6 +143,7 @@ test {
     _ = arith;
     _ = mem;
     _ = io;
+    _ = relpath;
     _ = diag;
     _ = token;
     _ = lexer;

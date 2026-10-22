@@ -394,3 +394,91 @@ test("env/args reads diff as expected nondeterministic divergence, not a real mi
   // Whatever differs is excused: no unexplained artifact mismatch survives.
   expect(report.ok).toBe(true);
 });
+
+// Multi-file: `require` reads the files passed with the run (normalized,
+// relative to the program), and every location the run reports — the fault,
+// the backtrace, the step index, coverage — names its chunk through a proto id
+// that `chunks` maps to a file.
+//
+// `test.todo` until doc 68 (docs/design/68-nested-suspension.md) lands: a
+// wasm run builds its replay index with a suspension armed, and `require`
+// re-enters the VM through `callValue`, which asserts that no suspension is
+// armed. The Debug wasm traps on it (the bug predates multi-file; any pcall
+// traps the same way). Doc 68 P4 turns these back into `test`.
+const MULTI_MAIN = "local m = require('lib.mod')\nlocal f = load('return 7', '=snippet')\nprint(m.sum(300) + f())\nif arg[1] == 'boom' then print(m.boom()) end\n";
+const MULTI_MOD = "local M = {}\nfunction M.sum(n)\n  local s = 0\n  for i = 1, n do s = s + i end\n  return s\nend\nfunction M.boom()\n  return 1 + nope\nend\nreturn M\n";
+const MULTI_FILES = [
+  { path: "main.mah", text: MULTI_MAIN },
+  { path: "lib/mod.mah", text: MULTI_MOD },
+];
+
+function chunkOf(result: { chunks: { firstProtoId: number; protoCount: number }[] }, protoId: number): number {
+  return result.chunks.findIndex((c) => protoId >= c.firstProtoId && protoId < c.firstProtoId + c.protoCount);
+}
+
+test.todo("multi-file: require runs a passed file, and chunks name every compiled file", () => {
+  const result = mod.runSource(MULTI_MAIN, ["main.mah"], MULTI_FILES);
+  expect(result.status).toBe(0);
+  expect(result.stdout).toBe("45157\n");
+  expect(result.chunks.length).toBe(3);
+  expect(result.chunks[0]).toMatchObject({ firstProtoId: 0, name: "", source: "" });
+  expect(result.chunks[1].name).toBe("./lib/mod.mah");
+  expect(result.chunks[1].source).toBe(MULTI_MOD);
+  expect(result.chunks[2]).toMatchObject({ name: "=snippet", source: "return 7" });
+  // The chunks' proto ranges are disjoint and consecutive.
+  for (let i = 1; i < result.chunks.length; i++) {
+    const prev = result.chunks[i - 1];
+    expect(result.chunks[i].firstProtoId).toBe(prev.firstProtoId + prev.protoCount);
+  }
+  // The disassembly covers the loaded chunks' protos too.
+  const last = result.chunks[result.chunks.length - 1];
+  expect(result.disasm.some((p) => p.id === last.firstProtoId)).toBe(true);
+});
+
+test.todo("multi-file: a fault in a required file names that file's proto", () => {
+  const result = mod.runSource(MULTI_MAIN, ["main.mah", "boom"], MULTI_FILES);
+  expect(result.status).toBe(1);
+  expect(result.errorLine).toBe(8);
+  expect(chunkOf(result, result.errorProtoId)).toBe(1);
+  expect(MULTI_MOD.slice(result.errorStart, result.errorEnd)).toBe("1 + nope");
+  // Leaf in the module, caller in the program.
+  expect(result.backtrace.map((f) => [chunkOf(result, f.protoId), f.line])).toEqual([
+    [1, 8],
+    [0, 4],
+  ]);
+});
+
+test.todo("multi-file: the step index and coverage say which file each line is in", () => {
+  const result = mod.runSource(MULTI_MAIN, ["main.mah"], MULTI_FILES);
+  expect(result.safepointProtos.length).toBe(result.safepointLines.length);
+  const files = new Set(Array.from(result.safepointProtos, (id) => chunkOf(result, id)));
+  expect(files.has(0)).toBe(true);
+  expect(files.has(1)).toBe(true);
+  expect(files.has(-1)).toBe(false);
+  // The module's loop line (4) is stepped through, as a line of the module.
+  const modLines = Array.from(result.safepointLines).filter((_, k) => chunkOf(result, result.safepointProtos[k]) === 1);
+  expect(modLines).toContain(4);
+  // Coverage anchors the loop's back-edge in the module.
+  const cov = new CoverageFileDecoder(result.coverage).decode();
+  expect(cov.anchors.length).toBeGreaterThan(0);
+  expect(cov.anchors.every((a) => chunkOf(result, a.proto_id) === 1)).toBe(true);
+});
+
+test.todo("multi-file: a required file that isn't there is an error, not a host read", () => {
+  const result = mod.runSource("require('missing')\n", ["main.mah"], []);
+  expect(result.status).toBe(1);
+  expect(result.diagnostics).toContain("missing");
+});
+
+test.todo("multi-file: replay re-reads the required file from the recorded effects", () => {
+  const run = mod.runSource(MULTI_MAIN, ["main.mah"], MULTI_FILES);
+  // No files are passed to replay: the reads come back out of the effect log.
+  const whole = mod.replay(MULTI_MAIN, run.effects, run.safepointCount + 1);
+  expect(whole.stdout).toBe("45157\n");
+  // A step inside the module reports a proto of the module.
+  const k = Array.from(run.safepointProtos).findIndex((id) => chunkOf(run, id) === 1);
+  expect(k).toBeGreaterThanOrEqual(0);
+  const step = mod.replay(MULTI_MAIN, run.effects, k + 1);
+  expect(chunkOf(run, step.protoId)).toBe(1);
+  expect(step.currentLine).toBe(run.safepointLines[k]);
+});

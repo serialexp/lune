@@ -20,7 +20,17 @@ import {
   setScriptArgs,
   execLogFor,
   sourceLineOf,
-  traceSourceMapped,
+  traceLoc,
+  fileText,
+  replaceWorkspace,
+  newFile,
+  renameFile,
+  closeFile,
+  filePathProblem,
+  resolveRunFiles,
+  projectWorkspace,
+  DEFAULT_PATH,
+  DEFAULT_SOURCE,
 } from "../src/store";
 import type { TraceExecLogOutput } from "../src/gen/generated";
 
@@ -45,7 +55,7 @@ test("a loaded trace is never mapped through the last run's disassembly", () => 
   // Its proto ids belong to whatever compile produced the file, not this run.
   loadBytes("counting-loop.mahinatrace", bytes);
   expect(state.tracesFromRun).toBe(false);
-  expect(traceSourceMapped()).toBe(false);
+  expect(traceLoc({ protoId: 0, pc: 5 })).toBeNull();
 });
 
 test("sourceLineOf resolves a bytecode position through the disassembly", () => {
@@ -108,30 +118,108 @@ test("decodeSourceText accepts UTF-8 text and refuses binary", () => {
 });
 
 test("a binary source file is reported, and the editor keeps its text", () => {
-  loadSourceText("keep.mahina", "print(1)\n");
+  replaceWorkspace([{ path: "keep.mahina", text: "print(1)\n" }], "keep.mahina");
   loadSourceBytes("photo.png", new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]));
-  expect(state.source).toBe("print(1)\n");
-  expect(state.scriptName).toBe("keep.mahina");
+  expect(state.files).toEqual([{ path: "keep.mahina", text: "print(1)\n" }]);
+  expect(state.entryPath).toBe("keep.mahina");
   expect(state.sourceError).toContain("photo.png is not a text file");
   loadSourceBytes("next.mahina", new TextEncoder().encode("print(2)\n"));
-  expect(state.source).toBe("print(2)\n");
+  expect(fileText("next.mahina")).toBe("print(2)\n");
+  expect(state.activePath).toBe("next.mahina");
   expect(state.sourceError).toBeNull();
 });
 
 test("a dropped file loads by what it is, not only by its name", () => {
+  replaceWorkspace([{ path: "main.mah", text: "print(0)\n" }], "main.mah");
   // Text under any name → the editor.
   loadDroppedFile("prog.txt", new TextEncoder().encode("print(3)\n"));
-  expect(state.source).toBe("print(3)\n");
+  expect(fileText("prog.txt")).toBe("print(3)\n");
   // A trace saved under another name → the trace view.
   loadDroppedFile("saved.bin", bytes);
   expect(state.fileName).toBe("saved.bin");
   expect(state.traces.length).toBe(1);
-  expect(state.source).toBe("print(3)\n");
+  expect(fileText("prog.txt")).toBe("print(3)\n");
   // Neither → reported; nothing replaced.
   loadDroppedFile("blob.dat", new Uint8Array([1, 0, 2, 0, 3]));
   expect(state.sourceError).toContain("neither source text nor a .mahinatrace");
-  expect(state.source).toBe("print(3)\n");
+  expect(state.files.map((f) => f.path)).toEqual(["main.mah", "prog.txt"]);
   expect(state.traces.length).toBe(1);
+});
+
+test("a loaded file joins the program as a tab, or replaces the file of its name", () => {
+  replaceWorkspace([{ path: "main.mah", text: "require('lib')\n" }], "main.mah");
+  loadSourceText("./lib.mah", "return 1\n");
+  expect(state.files.map((f) => f.path)).toEqual(["main.mah", "lib.mah"]);
+  expect(state.entryPath).toBe("main.mah");
+  expect(state.activePath).toBe("lib.mah");
+  loadSourceText("lib.mah", "return 2\n");
+  expect(state.files.length).toBe(2);
+  expect(fileText("lib.mah")).toBe("return 2\n");
+});
+
+test("files are added, renamed and closed; the entry follows its file", () => {
+  replaceWorkspace([{ path: "main.mah", text: "" }], "main.mah");
+  const a = newFile();
+  expect(a).toBe("untitled.mah");
+  expect(newFile()).toBe("untitled2.mah");
+  expect(renameFile(a, "lib/util.mah")).toBeNull();
+  expect(fileText("lib/util.mah")).toBe("");
+  // Refused, nothing changed: an existing name, an escaping or absolute path.
+  expect(renameFile("lib/util.mah", "untitled2.mah")).toContain("already exists");
+  expect(renameFile("lib/util.mah", "../x.mah")).toContain("relative");
+  expect(renameFile("lib/util.mah", "/x.mah")).toContain("relative");
+  expect(filePathProblem("main.mah")).toContain("already exists");
+  expect(filePathProblem("main.mah", "main.mah")).toBeNull();
+  // Renaming the entry moves it.
+  expect(renameFile("main.mah", "app.mah")).toBeNull();
+  expect(state.entryPath).toBe("app.mah");
+  // Closing the entry passes it to the first remaining file; the last file stays.
+  closeFile("app.mah");
+  expect(state.entryPath).toBe("lib/util.mah");
+  closeFile("untitled2.mah");
+  closeFile("lib/util.mah");
+  expect(state.files.map((f) => f.path)).toEqual(["lib/util.mah"]);
+});
+
+test("resolveRunFiles maps each chunk to the workspace file it ran, else a read-only text", () => {
+  const ran = [
+    { path: "main.mah", text: "local m = require('mod')\n" },
+    { path: "mod.mah", text: "return {}\n" },
+  ];
+  const chunks = [
+    { firstProtoId: 0, protoCount: 2, name: "", source: "" },
+    { firstProtoId: 2, protoCount: 1, name: "./mod.mah", source: "return {}\n" },
+    { firstProtoId: 3, protoCount: 1, name: "=(load)", source: "return 1" },
+    // A file whose text differs from the workspace's isn't that file.
+    { firstProtoId: 4, protoCount: 1, name: "mod.mah", source: "return 2\n" },
+  ];
+  const files = resolveRunFiles(chunks, "main.mah", ran[0].text, ran);
+  expect(files.map((f) => [f.path, f.virtual])).toEqual([
+    ["main.mah", false],
+    ["mod.mah", false],
+    ["=(load) #2", true],
+    ["mod.mah #3", true],
+  ]);
+  expect(files[0].text).toBe(ran[0].text);
+  expect(files[2].text).toBe("return 1");
+});
+
+test("projectWorkspace normalizes paths and requires the entry among the files", () => {
+  const ws = projectWorkspace({
+    entry: "./prog.lua",
+    files: [
+      { path: "./prog.lua", text: "a" },
+      { path: "lib/x.mah", text: "b" },
+      { path: "lib/./x.mah", text: "dup" },
+      { path: "../escape.mah", text: "c" },
+    ],
+  });
+  expect(ws.entry).toBe("prog.lua");
+  expect(ws.files).toEqual([
+    { path: "prog.lua", text: "a" },
+    { path: "lib/x.mah", text: "b" },
+  ]);
+  expect(() => projectWorkspace({ entry: "gone.lua", files: [{ path: "a.lua", text: "" }] })).toThrow("not among its files");
 });
 
 test("exec logs join to traces by stable id, not by list position", () => {
@@ -160,10 +248,11 @@ test("parseArgsString splits on whitespace and drops empties", () => {
   expect(parseArgsString("   ")).toEqual([]);
 });
 
-test("loadSourceText loads text into the editor and sets the script name", () => {
+test("loadSourceText replaces the untouched default program and becomes the entry", () => {
+  replaceWorkspace([{ path: DEFAULT_PATH, text: DEFAULT_SOURCE }], DEFAULT_PATH);
   loadSourceText("nsieve.mahina", "print(arg[1])\n");
-  expect(state.source).toBe("print(arg[1])\n");
-  expect(state.scriptName).toBe("nsieve.mahina");
+  expect(state.files).toEqual([{ path: "nsieve.mahina", text: "print(arg[1])\n" }]);
+  expect(state.entryPath).toBe("nsieve.mahina");
 });
 
 test("setScriptArgs updates the raw args string", () => {

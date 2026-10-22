@@ -4,12 +4,18 @@ MULTI-FILE VIZ + NESTED SUSPENSION (2026-10-22, coral-raven).
   `SafepointLine{proto_id,line}`, `Fault.proto_id`), tabs + in-memory files
   in the wasm playground (`mahina_run` files blob, `src/relpath.zig` /
   `viz/src/paths.ts`, `FileTabs.tsx`), and `mahina viz prog.lua`
-  (`GET /project`, `/run` takes `{files, entry, args}`). Uncommitted.
+  (`GET /project`, `/run` takes `{files, entry, args}`). Committed
+  (feat(viz): multi-file programs), with the five doc-68-blocked wasm
+  tests as `test.todo`. Bart asked me to break the open ties: doc 68 Q2 =
+  byte buffer, Q3 = defer, commit now, and Lua-style `file:line:` error
+  prefixes (TODO_USABILITY §4, queued behind doc 66 P5).
   Green: just test, jit-debug test, lib ReleaseFast, wasm, tsc, viz tests
-  except four multi-file wasm tests (see next item). Not yet run: browser
-  smoke (updated for tabs), hashgate, cli-smoke, a manual `mahina viz
-  prog.lua` look.
-- Those four fail on a PRE-EXISTING bug: the replay index / `mahina_replay`
+  (96 pass) except five multi-file wasm tests (see next item), the browser
+  smoke on a locally embedded CLI (all 8 steps), and a manual `mahina viz
+  main.mah` (`GET /project` lists the dir; multi-file `/run` runs a
+  require; `../`, absolute, and `a/../../` paths are refused). Not yet run:
+  hashgate, the six-platform cli-smoke.
+- Those five fail on a PRE-EXISTING bug: the replay index / `mahina_replay`
   arm `suspend_ctl`, and every host re-entry (`callValue`/`runPushedFrame`)
   asserts it isn't. Any pcall, sort comparator, gsub function, function
   metamethod or require traps the Debug wasm on Run; ReleaseFast (the
@@ -19,14 +25,18 @@ MULTI-FILE VIZ + NESTED SUSPENSION (2026-10-22, coral-raven).
   resumable natives). Rev 2 folds in the codex + antigravity round-1 review
   (docs/reviews/doc68/). Waiting on Bart for Q2 (gsub buffer) and Q3
   (embedder boundary: defer vs refuse; the reviewers split on both).
-  P0 (FrameCtl byte, no behaviour change) is coded but ungated: the tree
-  doesn't compile mid coral-marten's doc 66 P3 (`add_rk` etc.); they'll
-  bundle it or tell me when interp.zig is clean.
+  P0 (FrameCtl byte, no behaviour change) landed in d0b815e (bundled by
+  coral-marten). Its follow-up, one 16-bit store clearing in_flight+ctl
+  (x64.movWordMemImm, nativegen_emit, hostcall_x64.S, trace_code, a
+  comptime adjacency assert in interp.zig), is gated and in the tree;
+  coral-marten has been asked to bundle it into doc 66 P5 because
+  interp.zig holds their P5 hunks. P1 waits on Bart's Q3.
 - Added with it: wasm panics now carry their message to JS
   (`mahina_panic_message_*`, `MahinaTrapError`; the worker reloads the
   module after a trap).
-- coral-marten's bytecode/trace changes are committed (3b84fc8); the
-  uncommitted interp.zig changes are all mine.
+- My interp.zig multi-file hunks went in with e4ba1e2. The uncommitted
+  interp.zig hunks now are coral-marten's doc 66 P5, plus my two P0
+  follow-up hunks.
 
 WORST BOARD ROW (2026-10-19, amber-badger): nsieve-bit-fp.
 - Board on 1b60a01 (gothab run e3763f2b): nsieve-bit-fp 18.6× LuaJIT, its
@@ -175,8 +185,11 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     its numbers in doc 66's checklist, together with the float-text fix
     it found (exponent form at the extremes, TODO.md's float-text entry).
     The commit bundles coral-raven's doc 68 P0 hunks (FrameCtl byte) at
-    their request, since both touch interp.zig. P5 (`eq`/`ne` against a
-    constant) next.
+    their request, since both touch interp.zig.
+  - P5 (equality against a constant) done with its numbers in doc 66.
+    Bart didn't answer the encoding question (Q7), so it took the LuaJIT
+    P/S/N split by default; doc 66 records the alternatives in case he
+    wants another. P4 (compare-and-branch) next, then P1 (`itern`).
   - The 5 failing viz "multi-file:" wasm tests are not P2's. They trap on
     `Vm.callValue`'s `suspend_ctl == null` assert via `require` under a
     suspendable run, which is doc 68's territory. Named wasm frames: bundle

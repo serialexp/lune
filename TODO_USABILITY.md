@@ -99,9 +99,22 @@ effect log so runs stay replayable (doc 02).
 
 - [ ] No variable names: `attempt to index a nil value` where Lua says
       `(local 't')` / `(field 'x')` / `(global 'f')` / `(method 'm')`.
-- [ ] Locations name the function, not the file: `anonymous:11:`,
-      `main:10:`, `f:1:`; tracebacks have no file names. Errors inside a
-      `require`d module are blamed on the caller's file.
+- [~] Locations name the function, not the file: `anonymous:11:`,
+      `main:10:`, `f:1:`; tracebacks have no file names. **Partly done
+      (multi-file viz, 2026-10-22):** a type fault inside a `require`d /
+      `dofile`d / `load`ed chunk is now blamed on that chunk's file in the
+      CLI's ` at file:line` suffix (`Fault.proto_id`), and the visualiser
+      names the file of every location. Still open: an `error()` message's
+      prefix and the CLI traceback rows keep the function name
+      (`boom:3`), where Lua writes `lib/mod.mah:3:`. **Decided
+      2026-10-22** (Bart asked coral-raven to break the tie): switch to
+      Lua-style `chunk:line:`. The chunk is the file path for a loaded file,
+      the script path for the entry, and the `load` chunkname otherwise.
+      This needs a per-proto chunk name from the compiler, and touches
+      `raiseLocatedError`, `raiseBadArg`/`nativeSite`, `synthErrorValue`,
+      `capi.zig:424`, `stdlib/load.zig:174`, main.zig's traceback and about
+      48 test expectations (`anonymous:N`/`main:N`). Queued behind
+      coral-marten's doc 66 P5, which holds interp.zig.
 - [ ] Uncaught errors put the location last (`… at file.lua:33`), caught
       ones first.
 - [ ] Bare native errors: `bad argument to 'insert'/'sort'/'concat'/

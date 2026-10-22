@@ -127,10 +127,11 @@ try {
     await page.locator(".replay").waitFor({ timeout });
   });
 
-  // A replay paused late in a long program, then a shorter file loaded: the
-  // replay closes and the next Run is clean (it used to throw CodeMirror's
-  // "Position … is out of range" from a stale replay-line decoration).
-  await step("loading a source file mid-replay closes the replay", async () => {
+  // A replay paused late in a long program, then a shorter file opened: it
+  // joins the program as a tab with no replay line on it (a stale replay-line
+  // decoration used to throw CodeMirror's "Position … is out of range"), and
+  // once it is the entry, Run runs it.
+  await step("a file opened mid-replay joins as a tab, and runs as the entry", async () => {
     const lines = Array.from({ length: 30 }, (_, i) => `local v${i} = ${i}`).join("\n");
     await page.locator(".cm-content").click();
     await page.keyboard.press("ControlOrMeta+A");
@@ -144,7 +145,10 @@ try {
     await page.locator(".cm-replay-line").waitFor({ timeout });
     writeFileSync(join(work, "short.mahina"), "print('short')\n");
     await page.locator("section.editor input[type=file]").setInputFiles(join(work, "short.mahina"));
-    await page.locator(".replay").waitFor({ state: "detached", timeout });
+    await page.locator(".file-tab.active").filter({ hasText: "short.mahina" }).waitFor({ timeout });
+    if ((await page.locator(".cm-replay-line").count()) !== 0) throw new Error("the new tab shows the replay's line");
+    await page.getByRole("button", { name: "Run this file" }).click();
+    await page.locator(".file-tab.entry").filter({ hasText: "short.mahina" }).waitFor({ timeout });
     await page.getByRole("button", { name: "Run (wasm)" }).click();
     await page.locator(".run-stdout").filter({ hasText: "short" }).waitFor({ timeout });
   });

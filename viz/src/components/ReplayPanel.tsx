@@ -16,6 +16,9 @@ import {
   replayDisasm,
   visibleGlobals,
   setShowBuiltinGlobals,
+  replayLoc,
+  locLabel,
+  frameLabel,
 } from "../store";
 
 /** Milliseconds between auto-advance steps while playing. */
@@ -159,7 +162,9 @@ export default function ReplayPanel() {
           fallback={<span class="replay-done">finished — {state.safepointCount} safepoints</span>}
         >
           <span>
-            line <span class="accent">{state.replayState?.currentLine ?? "–"}</span>
+            <Show when={replayLoc()} fallback={<>line <span class="accent">{state.replayState?.currentLine ?? "–"}</span></>}>
+              {(loc) => <span class="accent">{locLabel(loc())}</span>}
+            </Show>
             <span class="muted"> · depth {state.replayState?.depth ?? 0}</span>
           </span>
         </Show>
@@ -173,7 +178,7 @@ export default function ReplayPanel() {
       {/* Call chain at this step (deepest-first), flattened like the error traceback. */}
       <Show when={(state.replayState?.backtrace.length ?? 0) > 0}>
         <div class="replay-frames">
-          {state.replayState!.backtrace.map((f) => `${f.name}:${f.line}`).join(" → ")}
+          {state.replayState!.backtrace.map(frameLabel).join(" → ")}
         </div>
       </Show>
 

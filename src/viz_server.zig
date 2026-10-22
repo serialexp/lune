@@ -2,16 +2,21 @@
 //!
 //! The UI is a static SolidJS app with the VM compiled to wasm, so almost all
 //! of this is a file server for the assets `build.zig` embedded
-//! (`-Dviz-dist`, the `viz_assets` module). Two dynamic routes:
+//! (`-Dviz-dist`, the `viz_assets` module). Three dynamic routes:
 //!
 //!   GET  /trace/<name>  the `.mahinatrace` given on the command line, re-read
 //!                       per request (re-run the emit, then reload the page);
 //!                       the page opens on `/?src=trace/<name>`.
+//!   GET  /project       the program given on the command line: its file and
+//!                       the source files of its directory tree (what it can
+//!                       `require`), re-read per request; the page opens on
+//!                       `/?project=project`. Bounded (`project_*_limit`).
 //!   POST /run           the differential validator's native side, the same
 //!                       contract as the vite dev middleware
-//!                       (viz/vite.config.ts): `{source, args}` in, this
+//!                       (viz/vite.config.ts): `{files, entry, args}` in, this
 //!                       binary's artifacts + stdout out (base64), so the
-//!                       validator works outside `vite dev` too.
+//!                       validator works outside `vite dev` too. The files are
+//!                       written into a fresh directory the run starts in.
 //!
 //! `/run` executes arbitrary code, so the server binds 127.0.0.1 only and
 //! answers nothing whose `Host` isn't this listener (DNS rebinding) or whose
@@ -24,6 +29,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const mahina = @import("mahina");
+const relpath = mahina.relpath;
 const Io = std.Io;
 const http = std.http;
 const Allocator = std.mem.Allocator;
@@ -37,6 +44,9 @@ pub const Options = struct {
     open_browser: bool = true,
     /// A `.mahinatrace` to serve at `/trace/<basename>` and open on start.
     trace_path: ?[]const u8 = null,
+    /// A program to serve at `/project` (with its directory's other source
+    /// files) and open on start.
+    program_path: ?[]const u8 = null,
 };
 
 /// Per-run limits for `/run`, which spawns this binary twice per request.
@@ -45,6 +55,14 @@ const run_output_limit = 16 * 1024 * 1024;
 const run_body_limit = 4 * 1024 * 1024;
 /// The largest artifact `/run` reads back (keyframes of big heaps).
 const artifact_limit = 256 * 1024 * 1024;
+/// `/project` bounds, so `mahina viz` on a script in a big tree (a home
+/// directory) answers quickly with what it found and says the list is cut:
+/// source files sent, their total bytes, directory entries looked at, and how
+/// deep it descends.
+const project_file_limit = 256;
+const project_bytes_limit = 8 * 1024 * 1024;
+const project_entry_limit = 20_000;
+const project_depth_limit = 8;
 
 pub const Server = struct {
     gpa: Allocator,
@@ -53,6 +71,8 @@ pub const Server = struct {
     trace_path: ?[]const u8,
     /// `/trace/<percent-encoded basename>`, when `trace_path` is set.
     trace_url: ?[]const u8,
+    /// The program `/project` serves, when one was given.
+    program_path: ?[]const u8 = null,
     /// This binary, which `/run` spawns.
     exe_path: []const u8,
     /// Where `/run` makes its per-request directory.
@@ -136,6 +156,7 @@ pub const Server = struct {
             return respondText(request, .method_not_allowed, "GET only\n");
         }
         if (s.trace_url) |url| if (std.mem.eql(u8, path, url)) return s.serveTrace(request);
+        if (s.program_path != null and std.mem.eql(u8, path, "/project")) return s.serveProject(request);
 
         const asset_path = if (std.mem.eql(u8, path, "/")) "/index.html" else path;
         const file = findFile(s.files, asset_path) orelse {
@@ -160,10 +181,147 @@ pub const Server = struct {
         } });
     }
 
+    fn serveProject(s: *Server, request: *http.Server.Request) !void {
+        const reply = s.projectJson() catch |err| {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "cannot read {s}: {s}", .{ s.program_path.?, @errorName(err) }) catch "cannot read the program";
+            return respondJsonError(s.gpa, request, .not_found, msg);
+        };
+        defer s.gpa.free(reply);
+        try request.respond(reply, .{ .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "cache-control", .value = "no-cache" },
+        } });
+    }
+
+    /// The `/project` reply: `{"entry": path, "files": [{"path", "text"}],
+    /// "truncated"?: why}`. The entry first, then every source file of its
+    /// directory tree by path (relative to the entry's directory, `/`
+    /// separated). Hidden entries, build/dependency directories, symlinks and
+    /// non-UTF-8 files are skipped; past a `project_*_limit` the walk stops and
+    /// `truncated` says which.
+    fn projectJson(s: *Server) ![]u8 {
+        const gpa = s.gpa;
+        const io = s.io;
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const program = s.program_path.?;
+        const entry = std.fs.path.basename(program);
+        var dir = try Io.Dir.cwd().openDir(io, std.fs.path.dirname(program) orelse ".", .{ .iterate = true });
+        defer dir.close(io);
+
+        const ProjectFile = struct { path: []const u8, text: []const u8 };
+        var files: std.ArrayList(ProjectFile) = .empty;
+        const entry_text = try dir.readFileAlloc(io, entry, arena, .limited(project_bytes_limit));
+        var total: usize = entry_text.len;
+        var truncated: ?[]const u8 = null;
+
+        var walker = try dir.walkSelectively(arena);
+        defer walker.deinit();
+        var seen: usize = 0;
+        walk: while (try walker.next(io)) |e| {
+            seen += 1;
+            if (seen > project_entry_limit) {
+                truncated = "mahina viz: stopped looking for the program's files after 20000 directory entries";
+                break;
+            }
+            if (e.basename.len == 0 or e.basename[0] == '.') continue;
+            switch (e.kind) {
+                .directory => {
+                    if (skippedDir(e.basename)) continue;
+                    if (walker.stack.items.len > project_depth_limit) continue;
+                    try walker.enter(io, e);
+                },
+                .file => {
+                    if (!isSourceName(e.basename)) continue;
+                    const path = try projectPath(arena, e.path);
+                    if (std.mem.eql(u8, path, entry)) continue;
+                    if (files.items.len + 1 >= project_file_limit) {
+                        truncated = "mahina viz: the program's directory has more than 256 source files; only some are open";
+                        break :walk;
+                    }
+                    const text = e.dir.readFileAlloc(io, e.basename, arena, .limited(project_bytes_limit - total)) catch |err| switch (err) {
+                        error.StreamTooLong => {
+                            truncated = "mahina viz: the program's source files pass 8 MiB; only some are open";
+                            break :walk;
+                        },
+                        else => continue,
+                    };
+                    if (!std.unicode.utf8ValidateSlice(text)) continue;
+                    total += text.len;
+                    try files.append(arena, .{ .path = path, .text = text });
+                },
+                else => {},
+            }
+        }
+        std.mem.sort(ProjectFile, files.items, {}, struct {
+            fn lt(_: void, a: ProjectFile, b: ProjectFile) bool {
+                return std.mem.lessThan(u8, a.path, b.path);
+            }
+        }.lt);
+
+        var out: Io.Writer.Allocating = .init(gpa);
+        errdefer out.deinit();
+        const w = &out.writer;
+        try w.writeAll("{\"entry\":");
+        try writeJsonString(w, entry);
+        try w.writeAll(",\"files\":[{\"path\":");
+        try writeJsonString(w, entry);
+        try w.writeAll(",\"text\":");
+        try writeJsonString(w, entry_text);
+        try w.writeByte('}');
+        for (files.items) |f| {
+            try w.writeAll(",{\"path\":");
+            try writeJsonString(w, f.path);
+            try w.writeAll(",\"text\":");
+            try writeJsonString(w, f.text);
+            try w.writeByte('}');
+        }
+        try w.writeByte(']');
+        if (truncated) |t| {
+            try w.writeAll(",\"truncated\":");
+            try writeJsonString(w, t);
+        }
+        try w.writeByte('}');
+        return out.toOwnedSlice();
+    }
+
+    const RunFile = struct {
+        path: []const u8,
+        text: []const u8,
+    };
+
     const RunRequest = struct {
-        source: []const u8,
+        files: []const RunFile,
+        entry: []const u8,
         args: []const []const u8 = &.{},
     };
+
+    /// A `RunRequest` whose paths are normalized and checked: each inside the
+    /// program's directory (a path that climbs out of the run's temp
+    /// directory is refused, never written) and the entry among them.
+    const RunProgram = struct {
+        files: []const RunFile,
+        entry: []const u8,
+        args: []const []const u8,
+    };
+
+    fn checkRunRequest(arena: Allocator, req: RunRequest) error{ BadPath, NoEntry, OutOfMemory }!RunProgram {
+        const files = try arena.alloc(RunFile, req.files.len);
+        for (req.files, files) |f, *out| {
+            var buf: [relpath.max_len]u8 = undefined;
+            const norm = relpath.normalize(&buf, f.path) orelse return error.BadPath;
+            out.* = .{ .path = try arena.dupe(u8, norm), .text = f.text };
+        }
+        var buf: [relpath.max_len]u8 = undefined;
+        const entry = relpath.normalize(&buf, req.entry) orelse return error.NoEntry;
+        for (files) |f| {
+            if (std.mem.eql(u8, f.path, entry)) return .{ .files = files, .entry = f.path, .args = req.args };
+        }
+        return error.NoEntry;
+    }
 
     fn serveRun(s: *Server, request: *http.Server.Request) !void {
         if (!isJson(request.head.content_type)) {
@@ -182,11 +340,18 @@ pub const Server = struct {
         defer s.gpa.free(body);
 
         const parsed = std.json.parseFromSlice(RunRequest, s.gpa, body, .{ .ignore_unknown_fields = true }) catch {
-            return respondJsonError(s.gpa, request, .bad_request, "expected {\"source\": string, \"args\": [string]}");
+            return respondJsonError(s.gpa, request, .bad_request, "expected {\"files\": [{\"path\": string, \"text\": string}], \"entry\": string, \"args\": [string]}");
         };
         defer parsed.deinit();
+        var check_arena: std.heap.ArenaAllocator = .init(s.gpa);
+        defer check_arena.deinit();
+        const program = checkRunRequest(check_arena.allocator(), parsed.value) catch |err| switch (err) {
+            error.BadPath => return respondJsonError(s.gpa, request, .bad_request, "a file path is not inside the program's directory"),
+            error.NoEntry => return respondJsonError(s.gpa, request, .bad_request, "the entry is not among the files"),
+            error.OutOfMemory => return err,
+        };
 
-        const reply = s.runNative(parsed.value) catch |err| {
+        const reply = s.runNative(program) catch |err| {
             return respondJsonError(s.gpa, request, .internal_server_error, @errorName(err));
         };
         defer s.gpa.free(reply);
@@ -195,11 +360,14 @@ pub const Server = struct {
         } });
     }
 
-    /// Run `req.source` through this binary the way the vite middleware runs
+    /// Run the program through this binary the way the vite middleware runs
     /// the native CLI: once with the three emit flags (the determinism
     /// compare), once more with `--jit-native --emit-coverage` (the coverage
-    /// panel's native split; best-effort). Returns the JSON reply.
-    fn runNative(s: *Server, req: RunRequest) ![]u8 {
+    /// panel's native split; best-effort). The files go under `prog/` of a
+    /// fresh directory, which both runs start in, so `require`/`loadfile`/
+    /// `dofile` read them by the same relative paths as the wasm run. Returns
+    /// the JSON reply.
+    fn runNative(s: *Server, req: RunProgram) ![]u8 {
         const gpa = s.gpa;
         const io = s.io;
 
@@ -220,12 +388,20 @@ pub const Server = struct {
                 return std.fs.path.join(a, &.{ root, sub, file });
             }
         }.of;
-        const src = try path(arena, s.tmp_root, dir_name, "prog.mahina");
+        const prog = try path(arena, s.tmp_root, dir_name, "prog");
         const kf = try path(arena, s.tmp_root, dir_name, "k.mahinasnap");
         const ef = try path(arena, s.tmp_root, dir_name, "e.mahinaeff");
         const tr = try path(arena, s.tmp_root, dir_name, "t.mahinatrace");
         const cov = try path(arena, s.tmp_root, dir_name, "c.mahinacov");
-        try dir.writeFile(io, .{ .sub_path = "prog.mahina", .data = req.source });
+        var prog_dir = try dir.createDirPathOpen(io, "prog", .{});
+        defer prog_dir.close(io);
+        for (req.files) |f| {
+            if (std.fs.path.dirnamePosix(f.path)) |sub| try prog_dir.createDirPath(io, sub);
+            try prog_dir.writeFile(io, .{ .sub_path = f.path, .data = f.text });
+        }
+        // The entry by its relative path, from inside the program's directory:
+        // that is the native run's `arg[0]`, as the wasm run's is the entry's.
+        const src = req.entry;
 
         // Script args go after the source path: the CLI fills arg[1..] from them.
         var diff_argv: std.ArrayList([]const u8) = .empty;
@@ -235,8 +411,8 @@ pub const Server = struct {
         try cov_argv.appendSlice(arena, &.{ s.exe_path, "--jit-native", "--emit-coverage", cov, src });
         try cov_argv.appendSlice(arena, req.args);
 
-        const diff = try s.runChild(arena, diff_argv.items);
-        if (s.runChild(arena, cov_argv.items)) |_| {} else |_| {}
+        const diff = try s.runChild(arena, diff_argv.items, prog);
+        if (s.runChild(arena, cov_argv.items, prog)) |_| {} else |_| {}
 
         const read = struct {
             fn file(d: Io.Dir, i: Io, a: Allocator, name: []const u8) []const u8 {
@@ -268,10 +444,11 @@ pub const Server = struct {
 
     const ChildResult = struct { ok: bool, stdout: []const u8, stderr: []const u8 };
 
-    fn runChild(s: *Server, arena: Allocator, argv: []const []const u8) !ChildResult {
+    fn runChild(s: *Server, arena: Allocator, argv: []const []const u8, cwd: []const u8) !ChildResult {
         const deadline: Io.Timeout = .{ .duration = .{ .raw = .fromNanoseconds(run_timeout_ns), .clock = .awake } };
         const result = std.process.run(arena, s.io, .{
             .argv = argv,
+            .cwd = .{ .path = cwd },
             .stdout_limit = .limited(run_output_limit),
             .stderr_limit = .limited(run_output_limit),
             .timeout = deadline.toDeadline(s.io),
@@ -291,10 +468,13 @@ pub fn serve(gpa: Allocator, io: Io, files: []const File, environ: *const std.pr
     defer gpa.free(exe_path);
     var s = try Server.init(gpa, io, files, opts.trace_path, exe_path, tmpRoot(environ), opts.port);
     defer s.deinit();
+    s.program_path = opts.program_path;
 
     var url_buf: [512]u8 = undefined;
     const url = if (s.trace_url) |t|
         try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/?src={s}", .{ s.port, t[1..] })
+    else if (s.program_path != null)
+        try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/?project=project", .{s.port})
     else
         try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{s.port});
     var line_buf: [600]u8 = undefined;
@@ -344,6 +524,26 @@ fn openBrowserTask(io: Io, url: []const u8) void {
         .stderr = .ignore,
     }) catch return;
     _ = child.wait(io) catch {};
+}
+
+/// Directories `/project` never descends into: dependency and build trees.
+fn skippedDir(name: []const u8) bool {
+    const skipped = [_][]const u8{ "node_modules", "zig-cache", "zig-out" };
+    for (skipped) |n| if (std.mem.eql(u8, name, n)) return true;
+    return false;
+}
+
+/// A file `require`/`loadfile`/`dofile` would read: `.mah`, `.mahina`, `.lua`.
+fn isSourceName(name: []const u8) bool {
+    const ext = std.fs.path.extension(name);
+    return std.mem.eql(u8, ext, ".mah") or std.mem.eql(u8, ext, ".mahina") or std.mem.eql(u8, ext, ".lua");
+}
+
+/// A walker path as the UI names files: `/`-separated (Windows walks `\`).
+fn projectPath(arena: Allocator, walked: []const u8) ![]const u8 {
+    const path = try arena.dupe(u8, walked);
+    if (std.fs.path.sep != '/') std.mem.replaceScalar(u8, path, std.fs.path.sep, '/');
+    return path;
 }
 
 /// The target without its query string or fragment.
@@ -613,4 +813,65 @@ test "viz_server: serves embedded files and refuses foreign origins over loopbac
         defer testing.allocator.free(resp);
         try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 403 Forbidden\r\n"));
     }
+}
+test "viz_server: a /run program's paths are normalized and must stay inside its directory" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const files = [_]Server.RunFile{
+        .{ .path = "./main.mah", .text = "require('lib.util')" },
+        .{ .path = "lib//util.mah", .text = "return 1" },
+    };
+    const ok = try Server.checkRunRequest(arena, .{ .files = &files, .entry = "main.mah" });
+    try testing.expectEqualStrings("main.mah", ok.entry);
+    try testing.expectEqualStrings("main.mah", ok.files[0].path);
+    try testing.expectEqualStrings("lib/util.mah", ok.files[1].path);
+
+    const escaping = [_]Server.RunFile{.{ .path = "../outside.mah", .text = "" }};
+    try testing.expectError(error.BadPath, Server.checkRunRequest(arena, .{ .files = &escaping, .entry = "../outside.mah" }));
+    const absolute = [_]Server.RunFile{.{ .path = "/etc/x.mah", .text = "" }};
+    try testing.expectError(error.BadPath, Server.checkRunRequest(arena, .{ .files = &absolute, .entry = "x.mah" }));
+    try testing.expectError(error.NoEntry, Server.checkRunRequest(arena, .{ .files = &files, .entry = "other.mah" }));
+}
+
+test "viz_server: /project lists the program and the source files of its tree" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.mah", .data = "local u = require('lib.util')\n" });
+    try tmp.dir.createDirPath(io, "lib");
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/util.mah", .data = "return {}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "old.lua", .data = "print(1)\n" });
+    // Not sources, hidden, a dependency tree, not UTF-8: all left out.
+    try tmp.dir.writeFile(io, .{ .sub_path = "notes.txt", .data = "hi" });
+    try tmp.dir.createDirPath(io, ".git");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git/x.lua", .data = "" });
+    try tmp.dir.createDirPath(io, "node_modules");
+    try tmp.dir.writeFile(io, .{ .sub_path = "node_modules/y.lua", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "bin.lua", .data = "\xff\xfe" });
+
+    var program_buf: [128]u8 = undefined;
+    const program = try std.fmt.bufPrint(&program_buf, ".zig-cache/tmp/{s}/main.mah", .{tmp.sub_path});
+    var server = try Server.init(testing.allocator, io, &.{}, null, "/nonexistent", "/tmp", 0);
+    defer server.deinit();
+    server.program_path = program;
+
+    const json = try server.projectJson();
+    defer testing.allocator.free(json);
+    const Payload = struct {
+        entry: []const u8,
+        files: []const struct { path: []const u8, text: []const u8 },
+        truncated: ?[]const u8 = null,
+    };
+    const parsed = try std.json.parseFromSlice(Payload, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const p = parsed.value;
+    try testing.expectEqualStrings("main.mah", p.entry);
+    try testing.expectEqual(@as(usize, 3), p.files.len);
+    // The entry first, then the rest by path.
+    try testing.expectEqualStrings("main.mah", p.files[0].path);
+    try testing.expectEqualStrings("local u = require('lib.util')\n", p.files[0].text);
+    try testing.expectEqualStrings("lib/util.mah", p.files[1].path);
+    try testing.expectEqualStrings("old.lua", p.files[2].path);
+    try testing.expectEqual(@as(?[]const u8, null), p.truncated);
 }

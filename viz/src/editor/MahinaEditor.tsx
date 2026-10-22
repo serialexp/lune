@@ -1,7 +1,9 @@
 // SolidJS <-> CodeMirror 6 bridge for the in-browser mahina editor. Highlights via
 // the mahina mode (mahinaLanguage) and validates live against the real compiler
-// (mahinaLinter -> store.checkSource -> wasm `check`). Two-way bound to the store's
-// `source` with a guard so the view<->store sync never loops.
+// (mahinaLinter -> store.checkSource -> wasm `check`). Shows the store's active
+// tab (`activePath`), two-way bound to that file's text with a guard so the
+// view<->store sync never loops. Each tab keeps its own EditorState (undo
+// history, selection) while the program is open.
 
 import { onMount, onCleanup, createEffect, on } from "solid-js";
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection, Decoration, type DecorationSet } from "@codemirror/view";
@@ -11,11 +13,15 @@ import { indentOnInput, bracketMatching } from "@codemirror/language";
 import { lintGutter, lintKeymap } from "@codemirror/lint";
 import {
   state,
-  setSource,
+  setFileText,
+  fileText,
+  activeReadOnly,
   checkSource,
-  coverageByLine,
+  coverageLinesOf,
   coverageLineTitle,
-  traceSourceMapped,
+  fileMapped,
+  replayLoc,
+  tabs,
   setEditorCursorLine,
   type CoverageClass,
 } from "../store";
@@ -158,63 +164,92 @@ const mahinaTheme = EditorView.theme(
 export default function MahinaEditor() {
   let host!: HTMLDivElement;
   let view: EditorView | undefined;
+  /** The tab `view` shows, and each other tab's state while it's hidden. */
+  let shownPath = state.activePath;
+  const saved = new Map<string, EditorState>();
+
+  const makeState = (doc: string, readOnly: boolean): EditorState =>
+    EditorState.create({
+      doc,
+      extensions: [
+        lineNumbers(),
+        highlightActiveLineGutter(),
+        highlightActiveLine(),
+        history(),
+        drawSelection(),
+        indentOnInput(),
+        bracketMatching(),
+        keymap.of([...defaultKeymap, ...historyKeymap, ...lintKeymap, indentWithTab]),
+        mahinaLanguage(),
+        mahinaHighlighting,
+        mahinaLinter(checkSource),
+        runtimeErrorField,
+        replayLineField,
+        traceLineField,
+        coverageField,
+        lintGutter(),
+        mahinaTheme,
+        EditorState.readOnly.of(readOnly),
+        EditorView.updateListener.of((u) => {
+          // The cursor line marks the IR rows recorded from it — only once
+          // the user has put the cursor somewhere (not the initial line 1).
+          if (u.selectionSet && u.view.hasFocus) {
+            setEditorCursorLine(u.state.doc.lineAt(u.state.selection.main.head).number);
+          }
+          if (!u.docChanged) return;
+          const text = u.state.doc.toString();
+          if (text !== fileText(shownPath)) setFileText(shownPath, text);
+        }),
+      ],
+    });
 
   onMount(() => {
-    view = new EditorView({
-      parent: host,
-      state: EditorState.create({
-        doc: state.source,
-        extensions: [
-          lineNumbers(),
-          highlightActiveLineGutter(),
-          highlightActiveLine(),
-          history(),
-          drawSelection(),
-          indentOnInput(),
-          bracketMatching(),
-          keymap.of([...defaultKeymap, ...historyKeymap, ...lintKeymap, indentWithTab]),
-          mahinaLanguage(),
-          mahinaHighlighting,
-          mahinaLinter(checkSource),
-          runtimeErrorField,
-          replayLineField,
-          traceLineField,
-          coverageField,
-          lintGutter(),
-          mahinaTheme,
-          EditorView.updateListener.of((u) => {
-            // The cursor line marks the IR rows recorded from it — only once
-            // the user has put the cursor somewhere (not the initial line 1).
-            if (u.selectionSet && u.view.hasFocus) {
-              setEditorCursorLine(u.state.doc.lineAt(u.state.selection.main.head).number);
-            }
-            if (!u.docChanged) return;
-            const text = u.state.doc.toString();
-            if (text !== state.source) setSource(text);
-          }),
-        ],
-      }),
-    });
+    view = new EditorView({ parent: host, state: makeState(fileText(shownPath) ?? "", activeReadOnly()) });
   });
 
-  // Reconcile external `source` changes (e.g. loading a sample) into the view,
-  // but only when they actually differ — edits originating in the view already
-  // updated the store, so this skips them and avoids a feedback loop.
+  // Switch tabs: park the shown tab's state and show the active one's — its
+  // saved state when that still holds the file's text, else a fresh one.
+  // Created before the decoration effects, so on a switch they re-apply to the
+  // tab being shown.
   createEffect(() => {
-    const src = state.source;
-    if (view && src !== view.state.doc.toString()) {
-      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: src } });
+    const path = state.activePath;
+    if (!view || path === shownPath) return;
+    saved.set(shownPath, view.state);
+    const text = fileText(path) ?? "";
+    const parked = saved.get(path);
+    view.setState(parked !== undefined && parked.doc.toString() === text ? parked : makeState(text, activeReadOnly()));
+    saved.delete(path);
+    shownPath = path;
+  });
+
+  // Forget the parked states of tabs that are gone (closed, renamed, or a
+  // previous run's read-only chunks).
+  createEffect(() => {
+    const live = new Set(tabs().map((t) => t.path));
+    for (const path of saved.keys()) if (!live.has(path)) saved.delete(path);
+  });
+
+  // Reconcile external text changes of the shown tab (e.g. loading a file)
+  // into the view, but only when they actually differ — edits originating in
+  // the view already updated the store, so this skips them and avoids a
+  // feedback loop.
+  createEffect(() => {
+    const text = fileText(state.activePath);
+    if (view && state.activePath === shownPath && text !== undefined && text !== view.state.doc.toString()) {
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text } });
     }
   });
 
-  // Mirror the last run's located runtime error into the editor as a squiggle.
-  // Reactive on both `runErrorSpan` (the byte span) and `runError` (the message
-  // shown in the tooltip). mahina spans are UTF-8 byte offsets → map to UTF-16.
+  // Mirror the last run's located runtime error into the editor as a squiggle,
+  // when it's in the shown tab. Reactive on both `runErrorSpan` (the byte span)
+  // and `runError` (the message shown in the tooltip). mahina spans are UTF-8
+  // byte offsets → map to UTF-16.
   createEffect(() => {
     const span = state.runErrorSpan;
     const message = state.runError ?? "runtime error";
+    const path = state.activePath;
     if (!view) return;
-    if (!span) {
+    if (!span || span.path !== path || !fileMapped(path)) {
       view.dispatch({ effects: setRuntimeError.of(null) });
       return;
     }
@@ -229,52 +264,49 @@ export default function MahinaEditor() {
     view.dispatch({ effects: setRuntimeError.of({ from, to, message }) });
   });
 
-  // Mirror the step-replay current line into the editor. Only highlights while
-  // replay is open, paused on a suspended (not finished) step, and the editor
-  // still holds the replayed source — after an edit the line numbers are the
-  // old text's. `currentLine` is already 1-based, the unit CodeMirror lines use.
+  // Mirror the step-replay current line into the editor: while replay is
+  // open, paused on a suspended (not finished) step in the shown tab, and that
+  // file is unchanged since the run (`replayLoc` checks both).
   createEffect(() => {
     if (!view) return;
-    const active = state.replayActive && state.source === state.replaySource;
-    const rs = state.replayState;
-    const line = active && rs && !rs.finished && rs.currentLine > 0 ? rs.currentLine : null;
-    view.dispatch({ effects: setReplayLine.of(line) });
+    const loc = replayLoc();
+    view.dispatch({ effects: setReplayLine.of(loc !== null && loc.path === state.activePath ? loc.line : null) });
   });
 
   // Mirror the trace IR's hovered (else pinned) row into the editor as its
-  // source line. Only while the traces map onto this source (a loaded
-  // .mahinatrace's protos are another compile's; an edit shifts the lines).
+  // source line, when it's in the shown tab and that file is unchanged since
+  // the run.
   createEffect(() => {
     if (!view) return;
-    const line = traceSourceMapped() ? state.irHoverLine || state.irPinnedLine : 0;
-    view.dispatch({ effects: setTraceLine.of(line > 0 ? line : null) });
+    const loc = state.irHoverLoc ?? state.irPinnedLoc;
+    const show = loc !== null && loc.path === state.activePath && fileMapped(loc.path);
+    view.dispatch({ effects: setTraceLine.of(show ? loc.line : null) });
   });
 
-  // Clicking an IR row scrolls the editor to the row's line (every click, via
-  // the reveal counter — not just when the pinned line changes).
-  // Tracks the counter alone; the reads inside are untracked, so typing never
-  // re-scrolls.
+  // `revealLoc` (an IR row click, an error link) scrolls the editor to its
+  // line — every time, via the reveal counter, not just when the target
+  // changes. Tracks the counter alone; the reads inside are untracked, so
+  // typing never re-scrolls. `revealLoc` shows the target's tab first.
   createEffect(
     on(
-      () => state.irRevealSeq,
+      () => state.revealSeq,
       () => {
-        if (!view) return;
-        const line = state.irPinnedLine;
-        if (!traceSourceMapped() || line < 1 || line > view.state.doc.lines) return;
-        view.dispatch({ effects: EditorView.scrollIntoView(view.state.doc.line(line).from, { y: "center" }) });
+        const loc = state.revealTarget;
+        if (!view || loc === null || loc.path !== shownPath) return;
+        if (loc.line < 1 || loc.line > view.state.doc.lines) return;
+        view.dispatch({ effects: EditorView.scrollIntoView(view.state.doc.line(loc.line).from, { y: "center" }) });
       },
       { defer: true },
     ),
   );
 
-  // Mirror the last run's JIT coverage into the editor as per-line shading.
-  // Reactive on `coverageByLine()` (which reads `state.coverage` + `state.disasm`).
-  // The editor source may have been edited since the run; the coverage refers to
-  // the run's line numbers, so the field clears itself on any docChange — here we
-  // only (re)apply when a fresh map arrives. Empty map → clear.
+  // Mirror the last run's JIT coverage of the shown tab into the editor as
+  // per-line shading. `coverageLinesOf` is empty once the file is edited
+  // (the field also clears itself on any docChange); here we only (re)apply
+  // when a fresh map arrives. Empty map → clear.
   createEffect(() => {
     if (!view) return;
-    const byLine = coverageByLine();
+    const byLine = coverageLinesOf(state.activePath);
     const entries = Array.from(byLine, ([line, c]) => ({ line, cls: c.cls, title: coverageLineTitle(c) }));
     view.dispatch({ effects: setCoverage.of(entries.length > 0 ? entries : null) });
   });

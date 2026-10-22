@@ -408,13 +408,15 @@ fn printVersion() void {
 }
 
 const viz_usage =
-    \\usage: mahina viz [options] [trace.mahinatrace]
+    \\usage: mahina viz [options] [script] [trace.mahinatrace]
     \\
     \\Serve the trace visualiser on http://127.0.0.1 and open it in a browser.
     \\The visualiser runs programs in-browser (wasm); its differential validator
-    \\also runs them through this binary. With a .mahinatrace (from
-    \\`mahina --emit-traces <file> <script>`), the page opens on it; it is
-    \\re-read on every page load.
+    \\also runs them through this binary. With a script, the editor opens on it
+    \\and on the other source files (.mah, .mahina, .lua) of its directory tree,
+    \\which it can require; they are re-read on every page load. With a
+    \\.mahinatrace (from `mahina --emit-traces <file> <script>`), the page opens
+    \\on it, also re-read on every page load.
     \\
     \\options:
     \\  --port <N>   listen on port N (default: any free port)
@@ -444,11 +446,17 @@ fn vizMain(init: std.process.Init, it: *std.process.Args.Iterator) u8 {
         } else if (std.mem.startsWith(u8, arg, "-")) {
             mahina.io.eprint("mahina viz: error: unknown option '{s}'\n{s}", .{ arg, viz_usage });
             return 2;
-        } else if (opts.trace_path != null) {
-            mahina.io.eprint("mahina viz: error: one trace file at most\n{s}", .{viz_usage});
+        } else if (std.mem.endsWith(u8, arg, ".mahinatrace")) {
+            if (opts.trace_path != null) {
+                mahina.io.eprint("mahina viz: error: one trace file at most\n{s}", .{viz_usage});
+                return 2;
+            }
+            opts.trace_path = arg;
+        } else if (opts.program_path != null) {
+            mahina.io.eprint("mahina viz: error: one script at most\n{s}", .{viz_usage});
             return 2;
         } else {
-            opts.trace_path = arg;
+            opts.program_path = arg;
         }
     }
     if (!viz_assets.embedded) {
@@ -579,10 +587,17 @@ fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source:
             // A self-located message (a raised Lua value) already carries its
             // `chunk:line:` prefix — print it verbatim, Lua-style. The type-name
             // faults are not self-located and get the " at chunk:line" suffix.
+            // The suffix names the chunk the faulting instruction is in: the
+            // script for its own code, the loaded file's path for a fault inside
+            // a `require`d / `dofile`d / `load`ed chunk.
+            const fault_chunk = if (vm.loadedChunkIndexOf(fault.proto_id)) |i|
+                vm.loaded_chunks.items[i].chunk.proto.name
+            else
+                name;
             if (fault.self_located)
                 mahina.io.eprint("mahina: runtime error: {s}\n", .{fault.message})
             else
-                mahina.io.eprint("mahina: runtime error: {s} at {s}:{d}\n", .{ fault.message, name, fault.line });
+                mahina.io.eprint("mahina: runtime error: {s} at {s}:{d}\n", .{ fault.message, fault_chunk, fault.line });
             // A traceback only adds signal when control crossed a call boundary.
             if (fault.frames.len > 1) {
                 mahina.io.eprint("stack traceback:\n", .{});

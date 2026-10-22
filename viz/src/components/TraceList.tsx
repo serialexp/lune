@@ -1,5 +1,5 @@
 import { For, Show } from "solid-js";
-import { state, selectTrace, traceLine } from "../store";
+import { state, selectTrace, traceLoc, locLabel } from "../store";
 
 /** Left pane: one row per trace, showing the source line its anchor (the loop
  *  header, the body's first bytecode) sits on — else its proto:pc — and its
@@ -17,8 +17,8 @@ export default function TraceList() {
             onClick={() => selectTrace(i())}
           >
             <span class="anchor" title={`anchor: proto ${t.anchorProtoId}, pc ${t.anchorPc}`}>
-              <Show when={traceLine({ protoId: t.anchorProtoId, pc: t.anchorPc })} fallback={`proto ${t.anchorProtoId}:${t.anchorPc}`}>
-                {(line) => `from line ${line()}`}
+              <Show when={traceLoc({ protoId: t.anchorProtoId, pc: t.anchorPc })} fallback={`proto ${t.anchorProtoId}:${t.anchorPc}`}>
+                {(loc) => `from ${locLabel(loc())}`}
               </Show>
             </span>
             <span class="count">{t.instrs.length} ir</span>

@@ -13,15 +13,26 @@ import {
   traceExecSteps,
   setTraceExecPos,
   stepTraceExec,
-  traceLine,
-  hoverIrLine,
-  pinIrLine,
+  traceLoc,
+  hoverIrLoc,
+  pinIrLoc,
+  sameLoc,
+  locLabel,
 } from "../store";
+import type { Loc } from "../store";
+import { baseName } from "../paths";
 import { ExecEventKind, formatExecValue, exitKindLabel } from "../exec";
 import { operandTokens } from "../disasm";
 
 /** Milliseconds between auto-advance steps while playing (matches ReplayPanel). */
 const PLAY_INTERVAL_MS = 220;
+
+/** The IR table's line cell: the line number in the entry file, else
+ *  `file:line` (the file's last path segment; the cell's title has the path). */
+function srcLineCell(loc: Loc | null): string {
+  if (loc === null) return "";
+  return loc.path === state.entryPath ? `${loc.line}` : `${baseName(loc.path)}:${loc.line}`;
+}
 
 export default function TraceView() {
   const trace = selectedTrace;
@@ -136,8 +147,8 @@ export default function TraceView() {
           <header class="trace-header">
             <h2>
               JIT trace IR <span class="accent">{t().anchorProtoId}:{t().anchorPc}</span>
-              <Show when={traceLine({ protoId: t().anchorProtoId, pc: t().anchorPc })}>
-                {(line) => <span class="muted"> · starts at line {line()}</span>}
+              <Show when={traceLoc({ protoId: t().anchorProtoId, pc: t().anchorPc })}>
+                {(loc) => <span class="muted"> · starts at {locLabel(loc())}</span>}
               </Show>
             </h2>
             <p class="trace-note muted">
@@ -229,7 +240,7 @@ export default function TraceView() {
               <For each={t().instrs}>
                 {(ins, i) => {
                   const isCurrent = () => hasAnim() && i() === curRef();
-                  const line = () => traceLine(ins.src);
+                  const loc = () => traceLoc(ins.src);
                   return (
                     <tr
                       id={`ir-${i()}`}
@@ -239,21 +250,26 @@ export default function TraceView() {
                         "ir-exit": isCurrent() && isExit(),
                         // A row's position is its SSA number (`ins.index` is the padded text).
                         "ir-ref-target": hoverRef() === i() || flashRef() === i(),
-                        "ir-has-line": line() > 0,
+                        "ir-has-line": loc() !== null,
                         // Recorded from the line the editor cursor is on.
-                        "ir-cursor-line": line() > 0 && line() === state.editorCursorLine,
-                        "ir-pinned-line": line() > 0 && line() === state.irPinnedLine,
+                        "ir-cursor-line": sameLoc(loc(), state.editorCursor),
+                        "ir-pinned-line": sameLoc(loc(), state.irPinnedLoc),
                       }}
                       ref={(el) => {
                         if (isCurrent()) currentRow = el;
                         rowEls[i()] = el;
                       }}
-                      onMouseEnter={() => hoverIrLine(line())}
-                      onMouseLeave={() => hoverIrLine(0)}
-                      onClick={() => { if (line() > 0) pinIrLine(line()); }}
+                      onMouseEnter={() => hoverIrLoc(loc())}
+                      onMouseLeave={() => hoverIrLoc(null)}
+                      onClick={() => {
+                        const l = loc();
+                        if (l !== null) pinIrLoc(l);
+                      }}
                     >
                       <td class="idx">%{ins.index}</td>
-                      <td class="src-line">{line() > 0 ? line() : ""}</td>
+                      <td class="src-line" title={loc() !== null ? `${loc()!.path}, line ${loc()!.line}` : undefined}>
+                        {srcLineCell(loc())}
+                      </td>
                       <td class="op">{ins.op}</td>
                       <td class="operands">
                         <For each={operandTokens(ins.operands)}>

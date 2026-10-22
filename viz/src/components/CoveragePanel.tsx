@@ -64,7 +64,7 @@ export default function CoveragePanel() {
           <div class="coverage-head">
             <span class="coverage-title">JIT coverage</span>
             <span class="muted">
-              {state.scriptName} · {fmt(a.total)} loop iteration(s)
+              {state.entryPath} · {fmt(a.total)} loop iteration(s)
             </span>
           </div>
 
