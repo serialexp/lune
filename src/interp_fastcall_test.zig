@@ -85,7 +85,8 @@ test "fast functions: every fast body agrees with its native, bit for bit" {
         Value.float(9223372036854775808.0),  Value.float(-9223372036854775808.0), Value.float(2.0),
         try vm.heap.internValue("#"),        try vm.heap.internValue(""),       try vm.heap.internValue("héllo"),
         try vm.heap.internValue("10"),       Value.heap(&arr_t.header),         Value.heap(&hash_t.header),
-        Value.heap(&empty_t.header),         print_fn,
+        Value.heap(&empty_t.header),         print_fn,                          try vm.heap.internValue(" 0x1F "),
+        try vm.heap.internValue("1.5e3"),    try vm.heap.internValue("z"),      Value.int(36),
     };
 
     var checked: usize = 0;
@@ -94,7 +95,7 @@ test "fast functions: every fast body agrees with its native, bit for bit" {
             checked += 1;
             var taken: usize = 0;
             const max_arity: usize = switch (fast) {
-                .min, .max, .select => 3,
+                .min, .max, .select, .tonumber => 3,
                 else => 2,
             };
             for (0..max_arity + 1) |arity| taken += try diffArity(&vm, bn, fast, &pool, arity);

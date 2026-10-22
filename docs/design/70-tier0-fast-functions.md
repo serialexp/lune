@@ -1,6 +1,6 @@
 # 70 — Tier-0 fast functions
 
-Status: partial. P0–P2 landed (12 builtins, the call-protocol byte);
+Status: partial. P0–P2 landed (13 builtins, the call-protocol byte);
 P3's allocating half and Q1–Q3's confirmation by Bart are outstanding.
 Owner: claude (coral-marten)
 Last updated: 2026-10-23
@@ -23,6 +23,11 @@ land; move whole phases to Done once everything inside them is checked.
 - [x] **P2 — base**: `type`, `select('#', …)`, `rawequal`, `rawget` (not on
   a grid), `rawlen`.
 - [x] **P3, non-allocating half**: `string.len` of a string.
+- [x] **`tonumber`**, every shape (2026-10-23): `arith.toNumber` parses
+  without allocating. Called out of line (`.never_inline`): inlined, the
+  parser's register pressure cost every other fast body 2–8 instructions.
+  `tonumber("123")` 327 → 274 (LuaJIT 264); scalar −1.33%,
+  str_find_match −0.81%.
 - [x] **Q1–Q3 defaults** (2026-10-23, Bart away; §7 records them): a
   separate `FastBuiltin`, non-allocating bodies only, the generic ABI later.
 
@@ -32,7 +37,6 @@ land; move whole phases to Done once everything inside them is checked.
 - [ ] **`math.type`**: needs its two names cached like `type`'s.
 - [ ] **Allocating bodies** (Q2): `string.sub`, `tostring` of a number,
   `rawset`.
-- [ ] **`tonumber` of a number**: returns its argument; one more arm.
 - [ ] **The generic native ABI** (Q3): register-lane arguments, results in
   registers.
 

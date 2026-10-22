@@ -9738,8 +9738,10 @@ fn writeSingleResult(regs: RegWindow, a: usize, nwanted: usize, result: Value) v
 /// raises or re-enters the VM.
 pub inline fn fastResult(vm: *const Vm, fast: function.FastBuiltin, regs: RegWindow, first: usize, nargs: usize) ?Value {
     if (nargs == 0) return switch (fast) {
-        // `rawequal()` compares two nils; everything else wants an argument.
+        // `rawequal()` compares two nils, `tonumber()` is nil; everything
+        // else wants an argument.
         .rawequal => Value.boolean(true),
+        .tonumber => Value.nil(),
         else => null,
     };
     const x = regs.get(first);
@@ -9785,6 +9787,9 @@ pub inline fn fastResult(vm: *const Vm, fast: function.FastBuiltin, regs: RegWin
             if (!x.isHeap() or x.heapType() != .string) return null;
             return Value.int(@intCast(string.String.fromHeader(x.asHeap()).cpLen()));
         },
+        // Out of line: inlined, the parser's register pressure lands on
+        // every other body's path through `opCallFast`.
+        .tonumber => return @call(.never_inline, arith.toNumber, .{ x, if (nargs >= 2) regs.get(first + 1) else null }),
     }
 }
 

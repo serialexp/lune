@@ -267,8 +267,9 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     scalar −7.1%. The 7 interned strings move later object ids by 7
     (field_hash −3.2%, array3d +0.47% are that id lottery).
   - Doc 70, tier-0 fast functions (`docs/design/70-tier0-fast-functions.md`):
-    12 pure builtins skip the generic native call (`Native.protocol` byte,
-    `opCallFast`, `fastResult`), scalar −12.7%, nsieve-bit-fp −9.9%;
+    13 pure builtins skip the generic native call (`Native.protocol` byte,
+    `opCallFast`, `fastResult`), scalar −12.7%, nsieve-bit-fp −9.9%
+    (7138437; `tonumber` after it, scalar another −1.3%);
     `itern`'s call fallback moved to `opIternCall` (`coldTail`). Q1–Q3
     unanswered, defaults recorded in doc 70 §7. The one row above the bar
     is while_shortcircuit_probe +0.10% (≈650 instructions of install).

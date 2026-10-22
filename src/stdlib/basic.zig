@@ -287,7 +287,7 @@ pub const natives = [_]function.BaseNative{
     // observed-shape abort matrix for that builtin.
     .{ .name = "type", .func = &bType, .recorded = .type, .fast = .type },
     .{ .name = "tostring", .func = &bToString, .recorded = .tostring },
-    .{ .name = "tonumber", .func = &bToNumber, .recorded = .tonumber },
+    .{ .name = "tonumber", .func = &bToNumber, .recorded = .tonumber, .fast = .tonumber },
     .{ .name = "select", .func = &bSelect1, .multi = &bSelectN, .recorded = .select, .fast = .select },
     .{ .name = "rawequal", .func = &bRawEqual, .recorded = .rawequal, .fast = .rawequal },
     .{ .name = "rawget", .func = &bRawGet, .recorded = .rawget, .fast = .rawget },

@@ -320,6 +320,8 @@ pub const FastBuiltin = enum(u8) {
     /// `string.len` of a string; a number argument (coerced, allocating)
     /// falls back.
     len,
+    /// Every shape: `arith.toNumber` parses without allocating.
+    tonumber,
 };
 
 /// Which **nondeterministic input** a native represents, if any. A native with a
