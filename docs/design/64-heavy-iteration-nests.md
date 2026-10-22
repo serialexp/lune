@@ -1077,6 +1077,13 @@ hops 3.06M → 3.39M) into a continuation that runs a few steps to the
 `for k` loop-done. Before, those firings ran in tier-0 after the give-up.
 That per-hop seam is step 6's re-profile.
 
+Board (5f5834d vs 483235d, pinned pool, jit ms). The commit also carries
+doc 65 Phase 0 and coral-marten's `for` fixes (zero step, integer-edge
+overflow guard), so these deltas are not 1d's alone: nsieve-bit-fp
+224.5 → 217.1 (−3.3%, 10.2× LuaJIT), grid_matmul_f64 −6.1%, nsieve-bit
++3.4%, nsieve +1.2%. str_find_match +4.1% is the same noise row as the
+step-4 board's −4.2%. Every other row is within ±2.6%.
+
 The first build cost +0.8% on benches with no region teardown at all
 (binary-trees, euler14-bit, spectral-norm). Callgrind (x86_64_v3 build)
 put it in `drainBarrier`, which runs after every ledger. The new sweep
