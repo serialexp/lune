@@ -1,3 +1,29 @@
+MULTI-FILE VIZ + NESTED SUSPENSION (2026-10-22, coral-raven).
+- Multi-file programs in the visualiser, all three parts Bart asked for:
+  file identity for every location (proto id → chunk, `Vm.loadedChunkIndexOf`,
+  `SafepointLine{proto_id,line}`, `Fault.proto_id`), tabs + in-memory files
+  in the wasm playground (`mahina_run` files blob, `src/relpath.zig` /
+  `viz/src/paths.ts`, `FileTabs.tsx`), and `mahina viz prog.lua`
+  (`GET /project`, `/run` takes `{files, entry, args}`). Uncommitted.
+  Green: just test, jit-debug test, lib ReleaseFast, wasm, tsc, viz tests
+  except four multi-file wasm tests (see next item). Not yet run: browser
+  smoke (updated for tabs), hashgate, cli-smoke, a manual `mahina viz
+  prog.lua` look.
+- Those four fail on a PRE-EXISTING bug: the replay index / `mahina_replay`
+  arm `suspend_ctl`, and every host re-entry (`callValue`/`runPushedFrame`)
+  asserts it isn't. Any pcall, sort comparator, gsub function, function
+  metamethod or require traps the Debug wasm on Run; ReleaseFast (the
+  CLI-embedded UI) hits `.suspended => unreachable` = UB. Bart chose "real
+  nested suspension": design in `docs/design/68-nested-suspension.md`
+  (continuation frames à la LuaJIT FRAME_CONT; pcall as protected frames;
+  resumable natives). Waiting on Q1–Q3 there before P0.
+- Added with it: wasm panics now carry their message to JS
+  (`mahina_panic_message_*`, `MahinaTrapError`; the worker reloads the
+  module after a trap).
+- Commit caveat: src/interp.zig also holds another agent's uncommitted
+  changes (as do bytecode.zig and trace*.zig) — Rule #13, ask before
+  committing interp.zig.
+
 WORST BOARD ROW (2026-10-19, amber-badger): nsieve-bit-fp.
 - Board on 1b60a01 (gothab run e3763f2b): nsieve-bit-fp 18.6× LuaJIT, its
   JIT run slower than tier-0. Next worst: fft 12.1×, recursive-fib 10.4×,
@@ -131,7 +157,13 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
   - Rev 2 withdrew `itern` shape (b) for (b2) and corrected Strategy B's
     GC and region-gate argument (B is off in any program with a region
     profit map).
-  - Waiting on Bart's Q1–Q5. The reviewer split is in doc 66 §10.
+  - Bart answered Q1–Q5 on 2026-10-22: A everywhere, `condBranchOf`
+    first; K-index constant operands with constant-left forms; reg-reg,
+    constant equality and ordered constant compares; `itern` (b2)
+    declining on a hash-view build; order `condBranchOf` → P2 → P3 → P5
+    → P4 → P1.
+  - `condBranchOf` refactor landed (doc 66 checklist). P2
+    (`get_field`/`set_field`) next.
   - Then item 5 (call/return) and item 6 (dispatch prologue, doc 42 §4.2).
 - Bart (2026-10-21): wraparound should stop, a zero step should raise,
   `next`'s zero results are fine, and continuations shouldn't re-check

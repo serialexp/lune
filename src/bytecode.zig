@@ -258,6 +258,62 @@ pub fn loopHeaderOf(ins: Instr, pc: usize) ?u32 {
     return @intCast(t);
 }
 
+/// Doc 66 §5.4: what a conditional branch tests.
+pub const CondTest = enum {
+    /// The Lua truthiness of one register (`jmp_if_true`/`jmp_if_false`).
+    truthy,
+    /// One register is not nil (`jmp_if_not_nil`, the `??` operator).
+    not_nil,
+
+    /// Whether the test is a Lua condition, the kind `if`, `while`,
+    /// `repeat`, `and` and `or` compile to. `??`'s nil test is not one.
+    pub fn isCondition(self: CondTest) bool {
+        return switch (self) {
+            .truthy => true,
+            .not_nil => false,
+        };
+    }
+};
+
+/// Doc 66 §5.4: a conditional branch, decoded. Every matcher that asks "is
+/// this the branch" goes through `condBranchOf` instead of naming opcodes,
+/// so a new branching op (the fused compare-and-branch forms) only has to
+/// be taught here. The predicate decodes; each caller keeps its own
+/// restrictions on the test and polarity.
+pub const CondBranch = struct {
+    cond: CondTest,
+    /// The branch jumps when the test holds (true) or when it fails (false).
+    on_true: bool,
+    /// `pc + 1 + aux`, unchecked: callers compare it against a known pc.
+    target: i64,
+
+    /// Whether the recorded path took the jump, given the test's observed
+    /// outcome.
+    pub fn jumpsOn(self: CondBranch, holds: bool) bool {
+        return self.on_true == holds;
+    }
+};
+
+/// The conditional branch at `pc`, or null when `ins` is not one.
+pub fn condBranchOf(ins: Instr, pc: usize) ?CondBranch {
+    const cond: CondTest, const on_true: bool = switch (ins.op) {
+        .jmp_if_true => .{ .truthy, true },
+        .jmp_if_false => .{ .truthy, false },
+        .jmp_if_not_nil => .{ .not_nil, true },
+        else => return null,
+    };
+    return .{ .cond = cond, .on_true = on_true, .target = jumpTargetOf(ins, pc) };
+}
+
+/// The target of a branch that jumps when its Lua condition is false, the
+/// shape a `while` test and a `repeat` closer compile to; null for any
+/// other instruction.
+pub fn falseBranchTargetOf(ins: Instr, pc: usize) ?i64 {
+    const cb = condBranchOf(ins, pc) orelse return null;
+    if (!cb.cond.isCondition() or cb.on_true) return null;
+    return cb.target;
+}
+
 /// Doc 58: the static extent of one loop — every instruction from `start` to
 /// `end` inclusive runs inside it — plus its back-edge instruction.
 pub const LoopExtent = struct {
@@ -340,9 +396,8 @@ pub fn loopExtentFor(proto: *const Proto, header: u32) ?LoopExtent {
                 // closer at `E − 1` jumps back to `C`.
                 .while_loop => blk: {
                     if (i == 0) return null;
-                    const branch = code[i - 1];
-                    if (branch.op != .jmp_if_false) return null;
-                    if (jumpTargetOf(branch, i - 1) != @as(i64, exit)) return null;
+                    const branch_target = falseBranchTargetOf(code[i - 1], i - 1) orelse return null;
+                    if (branch_target != @as(i64, exit)) return null;
                     if (closer.op != .jmp) return null;
                     const c = jumpTargetOf(closer, end);
                     if (c < 0 or c > @as(i64, i - 1)) return null;
@@ -351,8 +406,8 @@ pub fn loopExtentFor(proto: *const Proto, header: u32) ?LoopExtent {
                 // `loop; body; cond; jmp_if_false → loop`: the closer at `E − 1`
                 // jumps back to the marker, which opens the loop.
                 .repeat_loop => blk: {
-                    if (closer.op != .jmp_if_false) return null;
-                    if (jumpTargetOf(closer, end) != @as(i64, i)) return null;
+                    const closer_target = falseBranchTargetOf(closer, end) orelse return null;
+                    if (closer_target != @as(i64, i)) return null;
                     break :blk i;
                 },
             };
@@ -394,36 +449,33 @@ fn jumpTargetOf(ins: Instr, pc: usize) i64 {
 pub fn assertLoopClosersWellFormed(code: []const Instr) void {
     if (!std.debug.runtime_safety) return;
     for (code, 0..) |ins, pc| {
-        const t: i64 = switch (ins.op) {
-            .jmp, .jmp_if_true, .jmp_if_false, .jmp_if_not_nil => @as(i64, @intCast(pc)) + 1 + ins.aux,
-            else => continue,
-        };
+        const t: i64 = if (ins.op == .jmp)
+            jumpTargetOf(ins, pc)
+        else if (condBranchOf(ins, pc)) |cb| cb.target else continue;
         if (t > @as(i64, @intCast(pc))) continue; // forward: not a closer
         const target: usize = @intCast(t);
-        switch (ins.op) {
+        if (ins.op == .jmp) {
             // `while`: a backward `jmp` at `E − 1` targets the condition `C`,
             // and the loop's marker `m` sits between them with `code[m − 1]`
             // the condition's branch: `C ≤ m − 1 < m < E`. The marker is
             // identified by its extent ENDING at this closer (`E == pc + 1`),
             // not by being the nearest one — an inner loop's marker also lies
             // in `(C, pc)`.
-            .jmp => {
-                var m: usize = target + 1;
-                const found = while (m <= pc) : (m += 1) {
-                    if (code[m].op == .loop and loopMarkerExit(code[m], m) == pc + 1) break true;
-                } else false;
-                std.debug.assert(found);
-                std.debug.assert(@as(LoopKind, @enumFromInt(code[m].b)) == .while_loop);
-                std.debug.assert(m > target); // `C ≤ m − 1`
-                std.debug.assert(code[m - 1].op == .jmp_if_false);
-            },
-            // `repeat`: a backward `jmp_if_false` targets its `loop` marker.
-            .jmp_if_false => {
-                std.debug.assert(code[target].op == .loop);
-                std.debug.assert(@as(LoopKind, @enumFromInt(code[target].b)) == .repeat_loop);
-                std.debug.assert(loopMarkerExit(code[target], target) == pc + 1);
-            },
-            else => unreachable, // no other backward jump shape exists
+            var m: usize = target + 1;
+            const found = while (m <= pc) : (m += 1) {
+                if (code[m].op == .loop and loopMarkerExit(code[m], m) == pc + 1) break true;
+            } else false;
+            std.debug.assert(found);
+            std.debug.assert(@as(LoopKind, @enumFromInt(code[m].b)) == .while_loop);
+            std.debug.assert(m > target); // `C ≤ m − 1`
+            std.debug.assert(falseBranchTargetOf(code[m - 1], m - 1) != null);
+        } else {
+            // `repeat`: a backward branch on a false condition targets its
+            // `loop` marker. No other backward jump shape exists.
+            std.debug.assert(falseBranchTargetOf(ins, pc) != null);
+            std.debug.assert(code[target].op == .loop);
+            std.debug.assert(@as(LoopKind, @enumFromInt(code[target].b)) == .repeat_loop);
+            std.debug.assert(loopMarkerExit(code[target], target) == pc + 1);
         }
     }
 }
@@ -748,6 +800,36 @@ test "instruction constructors set the right operands" {
     const li = Instr.opAx(.load_int, 5, 1000);
     try testing.expectEqual(@as(u16, 5), li.a);
     try testing.expectEqual(@as(i32, 1000), li.aux);
+}
+
+test "doc 66 §5.4: condBranchOf decodes exactly the conditional branches" {
+    for (std.enums.values(OpCode)) |op| {
+        const ins: Instr = .{ .op = op, .a = 3, .aux = -4 };
+        const cb = condBranchOf(ins, 10);
+        const false_target = falseBranchTargetOf(ins, 10);
+        switch (op) {
+            .jmp_if_true, .jmp_if_false, .jmp_if_not_nil => {
+                const got = cb.?;
+                try testing.expectEqual(@as(i64, 7), got.target);
+                try testing.expectEqual(op != .jmp_if_false, got.on_true);
+                try testing.expectEqual(op != .jmp_if_not_nil, got.cond.isCondition());
+                // Only a branch on a false condition is a loop test or closer.
+                if (op == .jmp_if_false)
+                    try testing.expectEqual(@as(?i64, 7), false_target)
+                else
+                    try testing.expectEqual(@as(?i64, null), false_target);
+            },
+            else => {
+                try testing.expectEqual(@as(?CondBranch, null), cb);
+                try testing.expectEqual(@as(?i64, null), false_target);
+            },
+        }
+    }
+    // The recorded path jumped iff the test's outcome is the jumping one.
+    const t = condBranchOf(Instr.opAx(.jmp_if_true, 0, 1), 0).?;
+    const f = condBranchOf(Instr.opAx(.jmp_if_false, 0, 1), 0).?;
+    try testing.expect(t.jumpsOn(true) and !t.jumpsOn(false));
+    try testing.expect(f.jumpsOn(false) and !f.jumpsOn(true));
 }
 
 test "disassembly renders a small program" {

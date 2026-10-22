@@ -3355,6 +3355,9 @@ pub const RecordingSession = struct {
     /// register. Which path the trace records is whatever tier-0 took; the guard
     /// is what keeps the straight-line trace valid.
     pub fn recBranch(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32) !void {
+        // `pc` is the post-increment cursor, as in applyJump.
+        const cb = bytecode.condBranchOf(instr, pc - 1).?;
+        std.debug.assert(cb.cond == .truthy);
         const truthy_early = regs.get(instr.a).isTruthy();
         // Doc 38 LLEAVE (LuaJIT `rec_loop_interp`): a ROOT trace anchored at a
         // loop header "must loop back to form a root trace". If this branch is
@@ -3368,8 +3371,8 @@ pub const RecordingSession = struct {
         if (self.kind == .root and self.inline_depth == 0 and
             self.anchor.proto == proto)
         {
-            const jumped = (instr.op == .jmp_if_true) == truthy_early;
-            const target_i: i64 = @as(i64, pc) + instr.aux; // `pc` = post-increment cursor, as in applyJump
+            const jumped = cb.jumpsOn(truthy_early);
+            const target_i = cb.target;
             if (target_i >= 0 and target_i < @as(i64, @intCast(proto.code.len))) {
                 const target: u32 = @intCast(target_i);
                 // Doc 58 §4.3: the own-loop test is structural and LOCAL now —
@@ -3388,11 +3391,11 @@ pub const RecordingSession = struct {
                     {
                         return self.abort(.loop_leave);
                     }
-                } else if (instr.op == .jmp_if_false and !jumped and
+                } else if (!cb.on_true and !jumped and
                     bytecode.loopHeaderOf(proto.code[target], target) == self.anchor.pc)
                 {
-                    // `repeat`: the backward `jmp_if_false` targets our marker,
-                    // and falling through leaves the loop.
+                    // `repeat`: the backward branch on a false condition
+                    // targets our marker, and falling through leaves the loop.
                     return self.abort(.loop_leave);
                 }
             }
@@ -3427,8 +3430,8 @@ pub const RecordingSession = struct {
         // Polarity names which guest CFG edge the RECORDED path took, keyed on the
         // branch's *jump-taken* edge (opcode-relative), NOT raw truthiness: a
         // `jmp_if_false` jumps when the value is falsy, a `jmp_if_true` when truthy.
-        // So the recorded path took the branch iff `(op == jmp_if_true) == truthy`.
-        const jumped = (instr.op == .jmp_if_true) == truthy;
+        // So the recorded path took the branch iff `cb.on_true == truthy`.
+        const jumped = cb.jumpsOn(truthy);
         // Doc 58: a `while`'s own condition guard keeps role `.branch_cond` —
         // the role describes the guard's SHAPE, and `resumeOf` needs it for the
         // branch fix-up that sends the exit to the post-loop pc. Which guards

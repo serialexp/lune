@@ -443,10 +443,7 @@ pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: u
     const branch = self.isSourceBranchGuardExit(t, exit_instr, proto) and blk: {
         const src_pc = guardSourcePc(t.code.instrs[exit_instr]) orelse break :blk false;
         if (src_pc >= proto.code.len) break :blk false;
-        break :blk switch (proto.code[src_pc].op) {
-            .jmp_if_false, .jmp_if_true, .jmp_if_not_nil => true,
-            else => false,
-        };
+        break :blk bytecode.condBranchOf(proto.code[src_pc], src_pc) != null;
     };
     if (branch) {
         if (self.wants_prime_side != null) return;

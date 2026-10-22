@@ -2,7 +2,7 @@
 
 Status: rev 2, decided, not yet implemented. Round-1 review findings
 (codex and antigravity, §10) are folded in. Bart answered Q1–Q5 (§9) on
-2026-10-22; implementation starts with the `condBranchOf` refactor.
+2026-10-22. The `condBranchOf` refactor landed; P2 is next.
 Owner: claude (coral-marten)
 Last updated: 2026-10-22
 
@@ -49,7 +49,20 @@ land; move whole phases to Done once everything inside them is checked.
   the fast lane).
 - [x] **Q5 — phase order** (§7). Bart, 2026-10-22: `condBranchOf`
   refactor → P2 → P3 → P5 → P4 → P1.
-- [ ] **`condBranchOf` refactor** (§5.4), its own commit, before P2.
+- [x] **`condBranchOf` refactor** (2026-10-22, §5.4). `bytecode.condBranchOf`
+  decodes a conditional branch (`CondTest`, polarity, target) and
+  `falseBranchTargetOf` names the `while` test and `repeat` closer shape.
+  Every §4.1 shape matcher calls them instead of naming `jmp_if_*`:
+  `loopExtentFor`, `assertLoopClosersWellFormed`, `computeOwnLoopTest`,
+  `classifyBridgeCandidate`, `CompositeWalk.init`, `resumeOf`,
+  `continuationReachesEnclosingBackEdge`, the prime-side and sibling
+  branch checks, and `recBranch` (polarity and LLEAVE). Each keeps its own
+  admission: `jmp_if_not_nil` is still accepted only where it was.
+  Op-semantic switches (`handlerFor`/`opJump`, `effectOf`, the
+  disassembler, `recordOne`'s dispatch) still name the opcodes. No
+  behaviour change: `--dump-native` and `--jit-stats` counts are
+  identical to HEAD on all 33 `@bench` programs with helper addresses
+  masked.
 - [ ] **P1 — `itern`** (§5.1): the generic-`for` step for the real `next`
   without a call.
 - [ ] **P2 — `get_field` / `set_field`** (§5.2): a constant string key in

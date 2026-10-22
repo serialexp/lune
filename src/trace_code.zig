@@ -759,10 +759,11 @@ pub const TraceCode = struct {
     /// needs no role and matches every unrolled copy of the test (a copy has the
     /// same source instruction). One classifier for all three loop shapes:
     ///  - a `for_loop`/`tfor_loop` whose header is the anchor;
-    ///  - a `jmp_if_false` immediately followed by a `loop` marker whose header
-    ///    is the anchor (`while`);
-    ///  - a backward `jmp_if_false` targeting a `loop` marker whose header is
-    ///    the anchor (`repeat`).
+    ///  - a branch on a false condition (`bytecode.falseBranchTargetOf`)
+    ///    immediately followed by a `loop` marker whose header is the anchor
+    ///    (`while`);
+    ///  - a backward branch on a false condition targeting a `loop` marker
+    ///    whose header is the anchor (`repeat`).
     ///
     /// A loop's own test is not a branch alternation: it must not raise
     /// `wants_prime_side` (which would unpatch the entry and chain same-anchor
@@ -792,12 +793,11 @@ pub const TraceCode = struct {
         const src = proto.code[src_pc];
         // `for_loop` / `tfor_loop`: the back-edge itself is the test.
         if (bytecode.loopHeaderOf(src, src_pc) == self.anchor.pc) return true;
-        if (src.op != .jmp_if_false) return false;
+        const t = bytecode.falseBranchTargetOf(src, src_pc) orelse return false;
         // `while`: the branch sits right above the marker.
         if (src_pc + 1 < proto.code.len and
             bytecode.loopHeaderOf(proto.code[src_pc + 1], src_pc + 1) == self.anchor.pc) return true;
         // `repeat`: the branch is the backward closer onto the marker.
-        const t: i64 = @as(i64, src_pc) + 1 + src.aux;
         if (t < 0 or t >= @as(i64, @intCast(proto.code.len))) return false;
         const target: usize = @intCast(t);
         return target <= src_pc and bytecode.loopHeaderOf(proto.code[target], target) == self.anchor.pc;
@@ -837,10 +837,8 @@ pub const TraceCode = struct {
             .link_terminal => return false,
         };
         if (gp.role != .branch_cond or gp.source_proto_id != self.anchor.proto.id or gp.source_pc != source_pc) return false;
-        switch (self.anchor.proto.code[source_pc].op) {
-            .jmp_if_true, .jmp_if_false => {},
-            else => return false,
-        }
+        const cb = bytecode.condBranchOf(self.anchor.proto.code[source_pc], source_pc) orelse return false;
+        if (!cb.cond.isCondition()) return false;
         // Doc 43 P0c (fail-closed): an ARMED composite bridge hands off directly to
         // the successor (`nativegen` edge-4 stub: snapshot φ slots, then `jmpMem`
         // to `exit_target` — NO tier-0 replay) and its snapshot
@@ -996,13 +994,10 @@ pub const CompositeWalk = struct {
     /// jump or the guard carries no direction.
     pub fn init(code: []const bytecode.Instr, source_pc: u32, polarity: trace_types.Polarity) ?CompositeWalk {
         if (polarity == .neutral or source_pc >= code.len) return null;
-        const bop = code[source_pc];
-        switch (bop.op) {
-            .jmp_if_true, .jmp_if_false => {},
-            else => return null,
-        }
+        const cb = bytecode.condBranchOf(code[source_pc], source_pc) orelse return null;
+        if (!cb.cond.isCondition()) return null;
         const fallthrough: i64 = @as(i64, source_pc) + 1;
-        return .{ .code = code, .pc_i = if (polarity == .fallthrough) fallthrough + bop.aux else fallthrough };
+        return .{ .code = code, .pc_i = if (polarity == .fallthrough) cb.target else fallthrough };
     }
 
     /// The pc the walk stands on, or null once it has left the code or run

@@ -1858,10 +1858,7 @@ pub const TraceState = struct {
         if (!self.isSourceBranchGuardExit(t, exit_instr, t.code.anchor.proto)) return false;
         const src_pc = guardSourcePc(t.code.instrs[exit_instr]) orelse return false;
         if (src_pc >= t.code.anchor.proto.code.len) return false;
-        switch (t.code.anchor.proto.code[src_pc].op) {
-            .jmp_if_false, .jmp_if_true, .jmp_if_not_nil => {},
-            else => return false,
-        }
+        if (bytecode.condBranchOf(t.code.anchor.proto.code[src_pc], src_pc) == null) return false;
         // Doc 44 D10 (round 4) / D12b: one-shot parents (head + cont) demand
         // the POSITIVE provenance proof, not just the source-opcode shape
         // above. A one-shot trace inlines callees freely, and an inlined

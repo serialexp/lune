@@ -924,8 +924,10 @@ test "recArraySet sinks a read-steered const store (control channel) instead of 
     state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(state.isRecording());
     // Branch on the read (a guard), then store a *constant* false (r3). The store
-    // sinks below the branch guard — still recording, store deferred.
-    state.recordInstr(Instr.opABC(.jmp_if_true, 0, 0, 0), winRO(&regs), &proto, 0, Value.nil());
+    // sinks below the branch guard — still recording, store deferred. The
+    // recorder's `pc` is the cursor past the instruction, so a branch's is at
+    // least 1.
+    state.recordInstr(Instr.opABC(.jmp_if_true, 0, 0, 0), winRO(&regs), &proto, 1, Value.nil());
     state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(state.isRecording());
     try testing.expectEqual(@as(usize, 1), state.rec.pending_stores.items.len);

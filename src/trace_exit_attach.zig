@@ -377,11 +377,8 @@ pub fn resumeOf(code: *const TraceCode, idx: usize) Resolved {
     if (code.exit_snapshots[si - 1].resume_pc != b) return .{ .refused = .resume_mismatch };
     if (gp.role != .branch_cond) return .{ .pc = b };
 
-    const jumps_if_truthy = switch (proto.code[b].op) {
-        .jmp_if_true => true,
-        .jmp_if_false => false,
-        else => return .{ .refused = .branch_shape },
-    };
+    const cb = bytecode.condBranchOf(proto.code[b], b) orelse return .{ .refused = .branch_shape };
+    if (!cb.cond.isCondition()) return .{ .refused = .branch_shape };
     const recorded_truthy = switch (g.op) {
         .guard_true => true,
         .guard_false => false,
@@ -389,11 +386,11 @@ pub fn resumeOf(code: *const TraceCode, idx: usize) Resolved {
     };
     // The recorded path jumped iff the op jumps on the truthiness it saw;
     // the exit fires on the other truthiness, so it takes the other edge.
-    const jumped = jumps_if_truthy == recorded_truthy;
+    const jumped = cb.jumpsOn(recorded_truthy);
     const want: trace_types.Polarity = if (jumped) .taken else .fallthrough;
     if (gp.polarity != want) return .{ .refused = .branch_shape };
     const fall: i64 = @as(i64, b) + 1;
-    const p: i64 = if (jumped) fall else fall + proto.code[b].aux;
+    const p: i64 = if (jumped) fall else cb.target;
     if (p < 0 or p >= @as(i64, @intCast(proto.code.len))) return .{ .refused = .branch_shape };
     return .{ .pc = @intCast(p) };
 }
@@ -505,12 +502,14 @@ pub fn continuationReachesEnclosingBackEdge(proto: *const Proto, start_pc: u32, 
             // The scan starts past the inner anchor, so a target at or before
             // it is necessarily backward and enclosing (rule Z-6: while-in-
             // while nests arm continuations like for-in-for ones).
-            .jmp, .jmp_if_false => {
+            .jmp => {
                 const target = @as(i64, @intCast(pc)) + 1 + ins.aux;
                 if (target >= 0 and target <= @as(i64, @intCast(inner_anchor))) return true;
             },
             .ret, .halt => return false,
-            else => {},
+            else => if (bytecode.falseBranchTargetOf(ins, pc)) |target| {
+                if (target >= 0 and target <= @as(i64, @intCast(inner_anchor))) return true;
+            },
         }
     }
     return false;
