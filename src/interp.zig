@@ -803,20 +803,21 @@ pub const Vm = struct {
     /// mid-unwind could not resume). Runtime faults (`TypeError`, …) leave this
     /// null and are turned into a value lazily at the catch via `synthErrorValue`.
     pending_error: ?Value = null,
-    /// Open upvalues, keyed by absolute stack index. Searched on capture (to
-    /// share a cell) and on scope/frame exit (to close cells over dying slots).
-    /// Doc 54 P1: mutated ONLY through the centralized methods that own
-    /// `open_upvalue_ceiling` (`appendOpenUpvalue`, `closeUpvaluesFrom`,
-    /// `clearOpenUpvalues`) — direct list writes would let the ceiling go
+    /// Open upvalues, keyed by absolute stack index and kept in ascending
+    /// slot order, one cell per slot. Searched from the end on capture (to
+    /// share a cell), and popped from the end on scope/frame exit (to close
+    /// cells over dying slots). Doc 54 P1: mutated ONLY through the
+    /// centralized methods that own the order and `open_upvalue_ceiling`
+    /// (`appendOpenUpvalue`, `closeUpvaluesFrom`, `clearOpenUpvalues`) —
+    /// direct list writes would break the order, or let the ceiling go
     /// stale-LOW, the one unsound direction.
     open_upvalues: std.ArrayList(OpenUpvalue) = .empty,
-    /// Doc 54 P1: upper bound on `index + 1` over `open_upvalues` — the
-    /// inline native pop's one-load check (`ceiling <= popped frame.base` ⇒
-    /// no open cell at or above the popped window, replacing the helper's
-    /// full-list scan). Raised via `@max` on open, recomputed exactly in
-    /// `closeUpvaluesFrom` (which already walks the list), reset on clear;
-    /// the keyframe restorer republishes it through `appendOpenUpvalue`.
-    /// Stale-HIGH only declines a pop spuriously — fail closed.
+    /// Doc 54 P1: `index + 1` of the last (highest) cell in `open_upvalues`,
+    /// 0 when none is open. It is the one-load check of the inline native pop
+    /// and of `closeUpvaluesFrom` (`ceiling <= from` ⇒ no open cell at or
+    /// above `from`). Kept exact by every mutation; the keyframe restorer
+    /// republishes it through `appendOpenUpvalue`. A stale-HIGH value would
+    /// only decline a pop spuriously (fail closed); stale-LOW is unsound.
     open_upvalue_ceiling: usize = 0,
     /// Where the `print` host-effect writes. `null` means the process's buffered
     /// stdout (`io.zig`); a test (or a future effect recorder) can point this at
@@ -3688,7 +3689,12 @@ pub const Vm = struct {
         // INTO; each does its call and re-enters the remaining prologue, so
         // the §4.2 step order is preserved exactly and the hot handlers stay
         // frameless.
-        if (!self.reg_top_pending and self.heap.shouldCollect())
+        //
+        // The hot test is the heap's `gc_headroom` countdown alone; the
+        // pending-multret conjunct is the rare case, so it is checked in the
+        // trampoline, which then skips the collection — the same verdict at
+        // every boundary as testing both here.
+        if (self.heap.shouldCollect())
             return @call(.always_tail, gcTrampoline(mode), .{ st, pc, iptr, vm, tags, payloads });
         return dispatchPostGc(mode, st, pc, iptr, vm, tags, payloads);
     }
@@ -3710,8 +3716,10 @@ pub const Vm = struct {
                 // Doc 61 §4.1: publish the innermost frame's true next pc
                 // before collecting (step 6 would store the same value just
                 // after), so the collector reads `frame.pc` for every frame.
-                st.frame.pc = pc;
-                vm.collect();
+                if (!vm.reg_top_pending) {
+                    st.frame.pc = pc;
+                    vm.collect();
+                }
                 return dispatchPostGc(mode, st, pc, instr, vm, tags, payloads);
             }
         }.h;
@@ -3739,7 +3747,12 @@ pub const Vm = struct {
                     .proto_id = proto.id,
                     .line = sp_line,
                     .stoppable = self.canSuspendHere(),
-                }) catch |e| return parkErr(st, e);
+                }) catch |e| {
+                    // Park at the instruction about to run, as step (4)
+                    // does: step (6) has not stored it yet.
+                    st.frame.pc = pc;
+                    return parkErr(st, e);
+                };
             }
         }
 
@@ -9423,23 +9436,34 @@ pub const Vm = struct {
 
     /// Find-or-create the open upvalue for stack slot `index`. Two closures
     /// capturing the same live variable thereby share one cell (so a write
-    /// through one is seen through the other).
+    /// through one is seen through the other). A capture is a slot of the
+    /// running frame, the top of the stack, so the slot-ordered list is
+    /// searched from its end and only that frame's cells are visited
+    /// (LuaJIT's `lj_func_finduv`).
     fn captureUpvalue(self: *Vm, index: usize) Error!*function.Upvalue {
-        for (self.open_upvalues.items) |ou| {
-            if (ou.index == index) return ou.cell;
+        const items = self.open_upvalues.items;
+        var k = items.len;
+        while (k > 0 and items[k - 1].index >= index) : (k -= 1) {
+            if (items[k - 1].index == index) return items[k - 1].cell;
         }
         const cell = try self.heap.newUpvalue(index);
         try self.appendOpenUpvalue(index, cell);
         return cell;
     }
 
-    /// Doc 54 P1: the ONLY append into `open_upvalues` — owns the ceiling
-    /// raise (`@max`, so the watermark can never go stale-LOW on an open).
-    /// Pub for the keyframe restorer's list rebuild and for tests; interp-
-    /// internal opens (`captureUpvalue`) route through here too.
+    /// Doc 54 P1: the ONLY insertion into `open_upvalues`, which owns its
+    /// order and the ceiling. The list is kept ascending by slot, so the cell
+    /// goes in after every lower slot. A capture lands at or near the end,
+    /// past the running frame's higher slots only; the keyframe restorer
+    /// inserts in any order. Pub for that restorer and for tests;
+    /// `captureUpvalue` routes through here too. One cell per slot.
     pub fn appendOpenUpvalue(self: *Vm, index: usize, cell: *function.Upvalue) std.mem.Allocator.Error!void {
-        try self.open_upvalues.append(self.gpa, .{ .index = index, .cell = cell });
-        self.open_upvalue_ceiling = @max(self.open_upvalue_ceiling, index + 1);
+        const items = self.open_upvalues.items;
+        var at = items.len;
+        while (at > 0 and items[at - 1].index > index) at -= 1;
+        std.debug.assert(at == 0 or items[at - 1].index != index);
+        try self.open_upvalues.insert(self.gpa, at, .{ .index = index, .cell = cell });
+        self.open_upvalue_ceiling = self.open_upvalues.getLast().index + 1;
     }
 
     /// Doc 54 P1: the ONLY wholesale clear of `open_upvalues` (tests) — the
@@ -9474,23 +9498,21 @@ pub const Vm = struct {
     /// faulting frames' registers and so must close their upvalues (otherwise an
     /// escaped closure's cell stays open over a slot above the restored
     /// `stack_top`, which the GC root scan no longer covers — a dangling value).
+    /// The list is slot-ordered, so those cells are its suffix: the cost is
+    /// the cells closed, and one compare when there are none (every return
+    /// from a frame without captured locals), not the open cells of the whole
+    /// stack (LuaJIT's `lj_func_closeuv`).
     pub fn closeUpvaluesFrom(self: *Vm, from: usize) void {
-        var i = self.open_upvalues.items.len;
-        while (i > 0) {
-            i -= 1;
-            const ou = self.open_upvalues.items[i];
-            if (ou.index >= from) {
-                // Snapshot the live slot value into the cell (the VM owns the stack).
-                ou.cell.closeWith(self.regGet(ou.index));
-                _ = self.open_upvalues.swapRemove(i);
-            }
+        if (self.open_upvalue_ceiling <= from) return;
+        const list = &self.open_upvalues;
+        while (list.items.len > 0 and list.items[list.items.len - 1].index >= from) {
+            const ou = list.pop().?;
+            // Snapshot the live slot value into the cell (the VM owns the stack).
+            ou.cell.closeWith(self.regGet(ou.index));
         }
-        // Doc 54 P1: exact ceiling recompute — this call already visits the
-        // whole list, so the survivor pass keeps the watermark tight (and 0
-        // on empty) with no separate maintenance site to forget.
-        var ceiling: usize = 0;
-        for (self.open_upvalues.items) |ou| ceiling = @max(ceiling, ou.index + 1);
-        self.open_upvalue_ceiling = ceiling;
+        // Doc 54 P1: the ceiling stays exact, the last cell's slot plus one
+        // (0 when none is open).
+        self.open_upvalue_ceiling = if (list.items.len > 0) list.getLast().index + 1 else 0;
     }
 
     /// Place a single native result at `regs[a]` (absolute `stack[base + a]`) and

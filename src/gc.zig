@@ -133,8 +133,20 @@ pub const Heap = struct {
     /// not yet scanned). Pre-sized before each cycle so marking cannot allocate.
     /// Capacity is retained across cycles.
     gray: std.ArrayListUnmanaged(*GcHeader) = .empty,
-    /// Live-count threshold at which the next collection triggers.
+    /// Live-count threshold at which the next collection triggers. Write it
+    /// through `setNextGc`, which keeps `gc_headroom` exact.
     next_gc: usize = initial_gc_threshold,
+    /// The dispatch prologue's GC gate, a countdown: a collection is due
+    /// exactly when it is `<= 0`, which holds iff `gc_stress or object_count
+    /// >= next_gc`. It is `next_gc - object_count` (`0` under stress),
+    /// re-derived at every write of `next_gc`/`gc_stress` (`setNextGc`,
+    /// `setGcStress`, the sweep) and decremented in step with `object_count`
+    /// in `link`, so the per-instruction safepoint test is one compare
+    /// instead of the three-field predicate, and an allocation pays one
+    /// decrement. Signed so a due-but-deferred heap (a pending multret, a
+    /// skipped cycle) keeps counting down below zero; 2^63 allocations
+    /// cannot wrap it. Debug builds re-derive the verdict in `shouldCollect`.
+    gc_headroom: i64 = initial_gc_threshold,
     /// Doc 63 §5.6: moves whenever something a trace may rely on can have
     /// changed across a host call: guest execution, a collection, a host's
     /// structural change, or any C API entry not on the §5.6 exemption
@@ -145,6 +157,7 @@ pub const Heap = struct {
     /// Test/diagnostic knob: when set, `shouldCollect` is always true, so the
     /// collector runs at *every* safepoint. Surfaces use-after-free and missing
     /// roots immediately (a wrongly-freed live object breaks the very next op).
+    /// Write it through `setGcStress`, which keeps `gc_headroom` exact.
     gc_stress: bool = false,
     /// Doc 30: the pattern-match callout scratch (see `MatchScratch`). Plain
     /// memory — the collector, the serializer, and the snapshot machinery all
@@ -194,6 +207,7 @@ pub const Heap = struct {
         h.next = self.objects;
         self.objects = h;
         self.object_count += 1;
+        self.gc_headroom -= 1;
     }
 
     /// Advance the monotonic id counter to at least `next`, so allocations after a
@@ -579,8 +593,36 @@ pub const Heap = struct {
     }
 
     /// Whether a collection should run at the next safepoint.
-    pub fn shouldCollect(self: *const Heap) bool {
+    pub inline fn shouldCollect(self: *const Heap) bool {
+        const due = self.gc_headroom <= 0;
+        std.debug.assert(due == self.dueFromInputs());
+        return due;
+    }
+
+    fn dueFromInputs(self: *const Heap) bool {
         return self.gc_stress or self.object_count >= self.next_gc;
+    }
+
+    pub fn setGcStress(self: *Heap, on: bool) void {
+        self.gc_stress = on;
+        self.refreshHeadroom();
+    }
+
+    pub fn setNextGc(self: *Heap, threshold: usize) void {
+        self.next_gc = threshold;
+        self.refreshHeadroom();
+    }
+
+    fn refreshHeadroom(self: *Heap) void {
+        const max: u64 = std.math.maxInt(i64);
+        const count: u64 = self.object_count;
+        const next: u64 = self.next_gc;
+        self.gc_headroom = if (self.gc_stress)
+            0
+        else if (count >= next)
+            -@as(i64, @intCast(@min(count - next, max)))
+        else
+            @intCast(@min(next - count, max));
     }
 
     /// Begin a cycle: reserve worklist capacity for the worst case (every object
@@ -734,7 +776,7 @@ pub const Heap = struct {
         // the pre-sweep figure.
         self.strtab_count = live_str;
         self.object_count = live;
-        self.next_gc = @max(initial_gc_threshold, live * heap_growth);
+        self.setNextGc(@max(initial_gc_threshold, live * heap_growth));
         self.strtabMaybeShrink();
     }
 
@@ -1128,12 +1170,51 @@ test "shouldCollect honours the stress knob and the threshold" {
     defer heap.deinit();
 
     try testing.expect(!heap.shouldCollect()); // empty, below threshold
-    heap.gc_stress = true;
+    heap.setGcStress(true);
     try testing.expect(heap.shouldCollect());
-    heap.gc_stress = false;
-    heap.next_gc = 1;
+    heap.setGcStress(false);
+    heap.setNextGc(1);
     _ = try heap.intern("x");
     try testing.expect(heap.shouldCollect()); // count (1) >= next_gc (1)
+}
+
+test "the countdown gate tracks the trigger through allocation, deferral, stress and sweep" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    heap.setNextGc(heap.object_count + 2);
+    _ = try heap.intern("a");
+    try testing.expect(!heap.shouldCollect());
+    _ = try heap.intern("b");
+    try testing.expect(heap.shouldCollect()); // count reached next_gc
+    // A deferred collection (pending multret, skipped cycle) keeps counting
+    // below zero and stays due.
+    _ = try heap.intern("c");
+    try testing.expectEqual(@as(i64, -1), heap.gc_headroom);
+    try testing.expect(heap.shouldCollect());
+    // Clearing stress re-derives from the counters, so it stays due.
+    heap.setGcStress(true);
+    heap.setGcStress(false);
+    try testing.expect(heap.shouldCollect());
+    // Nothing is rooted: the sweep frees everything and re-arms the
+    // countdown at the floor threshold.
+    try heap.beginCollect();
+    heap.traceAll();
+    heap.sweep();
+    try testing.expectEqual(@as(usize, 0), heap.object_count);
+    try testing.expectEqual(@as(i64, initial_gc_threshold), heap.gc_headroom);
+    try testing.expect(!heap.shouldCollect());
+    // Stress forces it due with headroom to spare, and allocating under
+    // stress never brings it back.
+    heap.setGcStress(true);
+    _ = try heap.intern("d");
+    try testing.expect(heap.shouldCollect());
+    heap.setGcStress(false);
+    try testing.expect(!heap.shouldCollect());
+    // A restored threshold past i64 saturates instead of wrapping.
+    heap.setNextGc(std.math.maxInt(usize));
+    try testing.expectEqual(@as(i64, std.math.maxInt(i64)), heap.gc_headroom);
+    try testing.expect(!heap.shouldCollect());
 }
 
 test "inflateToGrid: strict homogeneous int rows flatten; round-trip via deflate is logically identical" {

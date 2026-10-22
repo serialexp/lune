@@ -1347,6 +1347,61 @@ test "doc 66 P4: a compare-and-branch fault names its operands in source order" 
     );
 }
 
+test "open upvalues: captures out of slot order, shared cells, block and frame closes" {
+    // The open-upvalue list is slot-ordered (`Vm.appendOpenUpvalue`), so a
+    // close pops its suffix. This pins what that must preserve: captures
+    // made in descending slot order, a cell shared by closures made at
+    // different times, a block exit closing only its own local under a
+    // still-open frame, one cell per recursion level, closed in turn as
+    // each level returns (after it last wrote the local), a fresh cell per
+    // loop iteration, and a nested function's cell next to its caller's.
+    // The output was taken on d21a333, before the list was ordered.
+    try expectProgram(
+        \\local function mk()
+        \\  local a, b, c = 1, 2, 3
+        \\  local fc = function() c = c + 10; return c end
+        \\  local fa = function() a = a + 1; return a end
+        \\  local fb
+        \\  do
+        \\    local d = 100
+        \\    fb = function() d = d + b; return d end
+        \\  end
+        \\  local fc2 = function() return c end
+        \\  b = 5
+        \\  return fa, fb, fc, fc2
+        \\end
+        \\local fa, fb, fc, fc2 = mk()
+        \\print(fa(), fb(), fc(), fc2(), fa(), fb())
+        \\local function rec(n, acc)
+        \\  if n == 0 then return acc end
+        \\  local v = n
+        \\  acc[#acc + 1] = function() v = v * 2; return v end
+        \\  local r = rec(n - 1, acc)
+        \\  v = v + 1000
+        \\  return r
+        \\end
+        \\local fs = rec(5, {})
+        \\local out = {}
+        \\for i = 1, #fs do out[i] = fs[i]() end
+        \\print(table.concat(out, " "))
+        \\local gs = {}
+        \\for i = 1, 4 do local j = i * i; gs[i] = function() j = j + 1; return j end end
+        \\print(gs[1](), gs[4](), gs[1]())
+        \\local function outer()
+        \\  local x = 0
+        \\  local function inc() x = x + 1 end
+        \\  for _ = 1, 3 do
+        \\    local y = x
+        \\    local function both() x = x + y; return x end
+        \\    inc(); both()
+        \\  end
+        \\  return x
+        \\end
+        \\print(outer(), outer())
+        \\
+    , "2\t105\t13\t13\t3\t110\n2010 2008 2006 2004 2002\n2\t17\t3\n7\t7\n");
+}
+
 test "doc 66 P1: `itern` steps a table exactly as the `next` native does" {
     // The array part (holes, key 0), the hash part, both and neither; a
     // second traversal reusing the hash view, and one after an insertion
@@ -1498,9 +1553,9 @@ test "doc 66 P1: one generic `for` traced with `gmatch` keeps its trace across `
             for (vm.trace.abort_log.items) |r| {
                 if (r.op == .itern) try testing.expectEqual(trace.AbortReason.itern_next, r.reason);
             }
-            // Under GC stress this loop keeps no trace, on 98aef7f as well
-            // (TODO.md); the assertion is about the iterator, not that.
-            if (mode != .record_execute_native or vm.heap.gc_stress) return;
+            // The GC-stress leg too: the ctrl pin reads the register where
+            // `itern` reads it, before a collection can scrub it as dead.
+            if (mode != .record_execute_native) return;
             var compiled = false;
             for (vm.trace.registry.cache.items) |t| {
                 if (!std.mem.eql(u8, t.code.anchor.proto.name, "walk")) continue;
@@ -2921,7 +2976,7 @@ test "doc 61 Phase 0: a collection between instructions sees the innermost frame
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    vm.heap.gc_stress = true;
+    vm.heap.setGcStress(true);
     InnermostProbe.n = 0;
     interp.Vm.test_collect_probe = &InnermostProbe.probe;
     defer interp.Vm.test_collect_probe = null;

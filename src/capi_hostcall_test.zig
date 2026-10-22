@@ -487,7 +487,7 @@ const Pair = struct {
     }
 
     fn setGcStress(self: *Pair, on: bool) void {
-        for (self.box) |b| b.vm.heap.gc_stress = on;
+        for (self.box) |b| b.vm.heap.setGcStress(on);
     }
 
     /// Fail the next allocation (and resize) on both legs, or with `null`

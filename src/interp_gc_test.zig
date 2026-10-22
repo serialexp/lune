@@ -94,7 +94,7 @@ test "gc: per-iteration garbage is reclaimed (heap stays bounded)" {
     // against this keeps the bound robust as the stdlib grows instead of baking a
     // magic total that breaks each time a library lands.
     const base_objects = vm.heap.object_count;
-    vm.heap.gc_stress = true;
+    vm.heap.setGcStress(true);
 
     var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();

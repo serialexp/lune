@@ -692,7 +692,7 @@ pub fn restoreSnapshot(
     // object restored, `object_count` matches the source's too, so the next
     // collection fires at the same allocation. (On a 32-bit host a threshold
     // past usize can never be reached either way.)
-    vm.heap.next_gc = std.math.cast(usize, kf.next_gc) orelse std.math.maxInt(usize);
+    vm.heap.setNextGc(std.math.cast(usize, kf.next_gc) orelse std.math.maxInt(usize));
 
     // --- Pass 1a: create every object shell EXCEPT closures, stamped with its
     // original id. Strings are interned first so the recompile below reuses them

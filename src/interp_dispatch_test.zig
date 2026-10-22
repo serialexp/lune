@@ -321,3 +321,44 @@ test "T-5: reentrant callValue via __index preserves outer execution state" {
     try testutil.runCapturedTuned(gpa, src, &sink2, false, .off, .{ .inspect = Hook.grab });
     try testing.expectEqual(first, Hook.seq);
 }
+
+// The prologue's replay-line append (step 3) can fail. Its park must locate
+// the fault at the instruction about to run, as every other prologue park
+// does, not at the previous one (step 6 has not stored the pc yet).
+test "a replay-line OOM is located at the instruction about to run" {
+    const gpa = testing.allocator;
+    const source: [:0]const u8 =
+        \\local a = 1
+        \\local b = a + 2
+        \\local c = b * 3
+        \\local d = c - 4
+        \\return d
+        \\
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var failing = std.testing.FailingAllocator.init(gpa, .{});
+    const fa = failing.allocator();
+    var vm = try Vm.init(fa);
+    defer vm.deinit();
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    vm.setSuspendCtl(.{ .after_safepoints = 2 });
+    try testing.expect(try vm.start(chunk.proto) == .suspended);
+    const at = vm.frames[vm.depth - 1].pc;
+    vm.setSuspendCtl(null);
+    vm.setRecordSafepointLines(true);
+    // Room for exactly one more line: the first resumed instruction
+    // records, the second one's append is the failing allocation.
+    try vm.safepoint_lines.ensureTotalCapacityPrecise(fa, vm.safepoint_lines.items.len + 1);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try testing.expectError(error.OutOfMemory, vm.exec());
+    try testing.expectEqual(at + 1, vm.frames[vm.depth - 1].pc);
+}

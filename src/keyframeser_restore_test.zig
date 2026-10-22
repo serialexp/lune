@@ -528,7 +528,7 @@ test "H-2: next_obj_id survives pre-cut garbage (restored verbatim, not reconstr
 
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    vm.heap.gc_stress = true; // collect at every safepoint → the junk is really swept
+    vm.heap.setGcStress(true); // collect at every safepoint → the junk is really swept
     var sink_buf: [256]u8 = undefined;
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
@@ -695,7 +695,7 @@ test "H-2/G-2: snapshot bytes are identical whether or not the JIT recorded (tra
             defer tree.deinit();
             var vm = try Vm.init(a);
             defer vm.deinit();
-            vm.heap.gc_stress = stress;
+            vm.heap.setGcStress(stress);
             vm.trace.config.enabled = jit;
             vm.trace.config.execute = jit;
             vm.trace.config.optimize = jit;

@@ -143,7 +143,7 @@ test "H-2 part 3: a trace const does not survive a top-level epoch boundary (cro
 
             var vm = try Vm.init(a);
             defer vm.deinit();
-            vm.heap.gc_stress = stress;
+            vm.heap.setGcStress(stress);
             configTraceMode(&vm, mode);
 
             // Epoch 1 — records the t.foo trace.
@@ -491,7 +491,7 @@ test "doc 24 c4: gc_stress forces allocating traces back to tier-0 with identica
 
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    vm.heap.gc_stress = true;
+    vm.heap.setGcStress(true);
     vm.trace.config.enabled = true;
     vm.trace.config.execute = true;
     vm.trace.config.optimize = true;
@@ -1868,7 +1868,7 @@ test "chunk rooting: a host-compiled retained chunk survives GC before it runs" 
 
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    vm.heap.gc_stress = true; // sweep at every safepoint during A's run
+    vm.heap.setGcStress(true); // sweep at every safepoint during A's run
 
     // Compile B first (interns "compdeferlit"), then A. Neither is run yet.
     var tb = try parser.parse(gpa, src_b, &diags);
@@ -1911,7 +1911,7 @@ test "chunk rooting: releaseChunk unroots a retained chunk's constants" {
 
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    vm.heap.gc_stress = true;
+    vm.heap.setGcStress(true);
     var sink: [16]u8 = undefined;
     var w = io.Writer.fixed(&sink);
     vm.out = &w;
@@ -1954,7 +1954,7 @@ test "chunk rooting: appendLoadedChunk pins constants (survive GC without per-cy
 
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    vm.heap.gc_stress = true;
+    vm.heap.setGcStress(true);
     var sink: [16]u8 = undefined;
     var w = io.Writer.fixed(&sink);
     vm.out = &w;
@@ -2063,7 +2063,7 @@ test "chunk rooting: retained-chunk output is byte-identical across all 10 modes
             defer diags.deinit();
             var vm = try Vm.init(a);
             defer vm.deinit();
-            vm.heap.gc_stress = stress;
+            vm.heap.setGcStress(stress);
             configTraceMode(&vm, mode);
 
             var tbb = try parser.parse(a, sb, &diags);
@@ -5797,12 +5797,15 @@ test "descent gate publication (doc 54 P0): prepareNativeEpisode computes descen
     try testing.expectEqual(@as(u8, 1), ctx.descent_ok);
 }
 
-test "open-upvalue ceiling (doc 54 P1): centralized maintenance keeps the watermark exact-or-high" {
-    // The inline native pop replaces the helper's full open-list scan with
-    // one `ceiling <= popped base` compare, so the ceiling must never go
-    // stale-LOW (unsound: a pop would free a window with a live open cell
-    // above it). Pin every maintenance site: append raises via @max,
-    // closeUpvaluesFrom recomputes exactly (0 on empty), clear resets.
+test "open-upvalue ceiling (doc 54 P1): centralized maintenance keeps the list slot-ordered and the watermark exact" {
+    // The inline native pop and `closeUpvaluesFrom` decide "no open cell at
+    // or above `from`" with one `ceiling <= from` compare, so the ceiling
+    // must never go stale-LOW (unsound: a pop would free a window with a
+    // live open cell above it). The list is slot-ordered, so a close pops a
+    // suffix. Pin every maintenance site: an insert keeps the order (in any
+    // insertion order), a close takes exactly the cells at or above `from`
+    // and snapshots their slots, the ceiling is the last slot + 1 (0 on
+    // empty), and clear resets.
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
@@ -5817,12 +5820,25 @@ test "open-upvalue ceiling (doc 54 P1): centralized maintenance keeps the waterm
     try testing.expectEqual(@as(usize, 4), vm.open_upvalue_ceiling);
     try vm.appendOpenUpvalue(7, try vm.heap.newUpvalue(7));
     try testing.expectEqual(@as(usize, 8), vm.open_upvalue_ceiling);
-    // A lower open never lowers the watermark.
-    try vm.appendOpenUpvalue(1, try vm.heap.newUpvalue(1));
+    // A lower open never lowers the watermark, and goes in slot order.
+    const one = try vm.heap.newUpvalue(1);
+    try vm.appendOpenUpvalue(1, one);
     try testing.expectEqual(@as(usize, 8), vm.open_upvalue_ceiling);
-    // Partial close: the exact recompute drops to the surviving max.
+    try vm.appendOpenUpvalue(5, try vm.heap.newUpvalue(5));
+    var slots: [4]usize = undefined;
+    for (vm.open_upvalues.items, 0..) |ou, k| slots[k] = ou.index;
+    try testing.expectEqualSlices(usize, &.{ 1, 3, 5, 7 }, slots[0..vm.open_upvalues.items.len]);
+    // Nothing at or above 8: one compare, nothing closed.
+    vm.closeUpvaluesFrom(8);
+    try testing.expectEqual(@as(usize, 4), vm.open_upvalues.items.len);
+    // Partial close: the suffix at or above 4 closes over its slots' values,
+    // and the ceiling drops to the surviving last slot.
+    const seven = vm.open_upvalues.items[3].cell;
     vm.closeUpvaluesFrom(4);
     try testing.expectEqual(@as(usize, 4), vm.open_upvalue_ceiling);
+    try testing.expectEqual(@as(usize, 2), vm.open_upvalues.items.len);
+    try testing.expect(seven.loc == .closed and seven.loc.closed.asInt() == 17);
+    try testing.expect(one.loc == .open);
     // Close-all: empty list ⇒ zero.
     vm.closeUpvaluesFrom(0);
     try testing.expectEqual(@as(usize, 0), vm.open_upvalue_ceiling);
@@ -6621,7 +6637,7 @@ test "executor (tnew OOM, doc 45 D5): a one-shot allocation failure exits precis
     defer gpa.free(entry);
     const values = try gpa.alloc(Value, t.instrs.len);
     defer gpa.free(values);
-    vm.heap.next_gc = 1_000_000; // keep guard_gc out of the way
+    vm.heap.setNextGc(1_000_000); // keep guard_gc out of the way
 
     // One-shot failing allocator over the heap's real gpa: the FIRST heap
     // allocation attempt (this iteration's `tnew`) fails.

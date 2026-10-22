@@ -1384,7 +1384,7 @@ test "doc 24 c2: guard_gc declines at the header — budget exceeded, gc_stress,
     {
         var heap = gc.Heap.init(gpa);
         defer heap.deinit();
-        heap.next_gc = heap.object_count; // saturate the budget
+        heap.setNextGc(heap.object_count); // saturate the budget
         const objs_before = heap.object_count;
         const strs_before = heap.strtab_count;
 
@@ -1414,7 +1414,7 @@ test "doc 24 c2: guard_gc declines at the header — budget exceeded, gc_stress,
     {
         var heap = gc.Heap.init(gpa);
         defer heap.deinit();
-        heap.gc_stress = true;
+        heap.setGcStress(true);
         const objs_before = heap.object_count;
 
         var iregs = regs_init;
@@ -1808,7 +1808,7 @@ test "doc 24 c4: two allocs per iteration — the bound declines entry even when
     {
         var iheap = gc.Heap.init(gpa);
         defer iheap.deinit();
-        iheap.next_gc = iheap.object_count + 2;
+        iheap.setNextGc(iheap.object_count + 2);
         const iobjs = iheap.object_count;
         var iregs = regs_init;
         const values = try gpa.alloc(Value, t.instrs.len);
@@ -1821,7 +1821,7 @@ test "doc 24 c4: two allocs per iteration — the bound declines entry even when
 
         var nheap = gc.Heap.init(gpa);
         defer nheap.deinit();
-        nheap.next_gc = nheap.object_count + 2;
+        nheap.setNextGc(nheap.object_count + 2);
         const nobjs = nheap.object_count;
         var ct = nativegen.compileWithHeap(gpa, &t, 0, &nheap) orelse return error.NativeBailedUnexpectedly;
         defer ct.deinit();
@@ -1842,7 +1842,7 @@ test "doc 24 c4: two allocs per iteration — the bound declines entry even when
     {
         var iheap = gc.Heap.init(gpa);
         defer iheap.deinit();
-        iheap.next_gc = iheap.object_count + 9;
+        iheap.setNextGc(iheap.object_count + 9);
         const iobjs = iheap.object_count;
         var iregs = regs_init;
         const values = try gpa.alloc(Value, t.instrs.len);
@@ -1854,7 +1854,7 @@ test "doc 24 c4: two allocs per iteration — the bound declines entry even when
 
         var nheap = gc.Heap.init(gpa);
         defer nheap.deinit();
-        nheap.next_gc = nheap.object_count + 9;
+        nheap.setNextGc(nheap.object_count + 9);
         const nobjs = nheap.object_count;
         var ct = nativegen.compileWithHeap(gpa, &t, 0, &nheap) orelse return error.NativeBailedUnexpectedly;
         defer ct.deinit();
@@ -1887,7 +1887,7 @@ test "doc 24 c4: an intern-hit loop parked just below next_gc completes natively
     // Parked run: every allocation is now an intern HIT (zero links), so
     // `object_count` never moves and the guard passes forever at a fixed
     // one-object headroom — the loop must complete natively, never bouncing.
-    heap.next_gc = heap.object_count + 3; // A=2 → headroom of exactly one
+    heap.setNextGc(heap.object_count + 3); // A=2 → headroom of exactly one
     const objs_before = heap.object_count;
     var pregs = regs_init;
     const presult = try util.runNative(ct, &pregs);

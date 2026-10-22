@@ -1,7 +1,6 @@
 # 69 — Tier-0 dispatch prologue: one gate, lazy pc, frame pointer
 
-Status: draft. P0 (the GC countdown gate) is built and gated in a shadow,
-waiting to commit behind doc 68 P1 slice 2's `interp.zig`. P1–P3 wait on
+Status: partial. P0 (the GC countdown gate) is on master; P1–P3 wait on
 Bart's answers to §7.
 Owner: claude (coral-marten)
 Last updated: 2026-10-23
@@ -16,18 +15,18 @@ land; move whole phases to Done once everything inside them is checked.
 - [x] **Diagnosis** (2026-10-23, §2). The hot prologue costs ~17 of a simple
   handler's 22 instructions, against LuaJIT's ~5. Deliberately unsound
   upper-bound builds measured what each piece is worth (§2.2).
-- [x] **P0 — the GC countdown gate** (§3), built in a shadow. `Heap.gc_headroom`
+- [x] **P0 — the GC countdown gate** (§3), landed 2026-10-23 together with
+  the slot-ordered open-upvalue list (TODO.md "Lua call + return"). `Heap.gc_headroom`
   replaces the three-field `gc_stress or object_count >= next_gc` test,
   and the `reg_top_pending` conjunct moves into `gcTrampoline`. Every
   @bench row is −0.6 to −11.7% instructions at tier 0 and −0.0 to −5.4%
   with the JIT; the worst row is scalar JIT at +0.05% (one extra
-  decrement per allocation). Outputs are byte-identical. `just test`,
-  the jit-debug tests, wasm, lib and hashgate all pass in the shadow.
+  decrement per allocation). Outputs are byte-identical.
+- [x] **A replay-line OOM was described at the previous instruction**, found
+  by the §5 audit. Step 3's park ran before step 6's pc store; it now stores
+  the pc itself. Landed with P0, with a test in `interp_dispatch_test.zig`.
 
 ### Outstanding
-
-- [ ] **Commit P0** onto the tree after doc 68 P1 slice 2 lands, re-gated on
-  the exact commit content.
 - [ ] **Q1 — the merged slow-path gate** (§4). Fold the regions-live test
   into P0's gate so the prologue has one compare. Upper bound −0.3 to −5.3%
   at tier 0 on top of P0. Needs a decision on who owns the gate (§7 Q1).

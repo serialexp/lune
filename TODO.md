@@ -259,12 +259,23 @@ earlier in `/tmp/t0micro/`).
       register pushes from handler register pressure.
 - [ ] **Lua call + return.** 0-arg call 461/63, 1-arg 611/74. The callee
       window is filled by a generic per-register loop, then
-      `pushFrameVararg`, `reloadTopFrame` and `onCallEntry`.
+      `pushFrameVararg`, `reloadTopFrame` and `onCallEntry`. Step one
+      landed 2026-10-23: the open-upvalue list is slot-ordered (LuaJIT's
+      `lj_func_finduv`/`lj_func_closeuv`), so a return closes only its
+      suffix and a capture searches only the running frame. Before, every
+      tier-0 return walked every open upvalue on the stack. 0-arg call
+      514 → 381, 1-arg 664 → 531. A return at stack depth 48/96/192 costs
+      1.77M/3.35M/6.73M (was 2.16M/4.86M/12.65M), linear now. What remains
+      (callgrind): opCall ~190, opRet ~140, `reloadTopFrame` +
+      `cachedCodeFor` ~70, `onCallEntry` ~32, the ~96-byte frame write,
+      and `setRegionContext` twice per call. Doc 69 P3 takes it.
 - [ ] **Dispatch prologue, ~18 instructions per op** (doc 42 §4.2): GC
       check (two dependent loads), `safepoint_seq` bump, region count
       test, `frame.pc` store, fetch, jump. LuaJIT's is ~5. Each step is
       part of the determinism contract, so changing one needs a design
-      argument.
+      argument. Doc 69 is that argument. Its P0 (the GC countdown gate)
+      landed 2026-10-23 at −0.6 to −11.7% tier-0 instructions. The merged
+      gate, lazy pc and the frame pointer wait on Bart (doc 69 §7).
 - [ ] **`#t` on a table is ~177 instructions** (string `#` ~48): the
       `__len` metatable probe plus `Table.length`'s border scan.
 
@@ -309,9 +320,8 @@ cost. Repro files: pad `bench/repack_adversarial.lua` after
       Test: "generic for: the ctrl pin survives a collection inside the
       recorded iteration" (`interp_trace_test.zig`, mutation-checked). The
       `@bench` instruction counts are unchanged.
-- [ ] Drop the stress-leg skip in the doc 66 P1 test (`interp_semantics_test.zig`
-      "… keeps its trace across `pairs`"). It waits on that file being free:
-      doc 68 work is uncommitted in it.
+- [x] Drop the stress-leg skip in the doc 66 P1 test (`interp_semantics_test.zig`
+      "… keeps its trace across `pairs`"). Done 2026-10-23, with doc 69 P0.
 - [x] **Find out why.** Doc 66 P1's test "one generic `for` traced with
       `gmatch` keeps its trace across `pairs`" (`interp_semantics_test.zig`)
       leaves a compiled trace anchored in `walk` on the normal native leg,
@@ -323,14 +333,14 @@ cost. Repro files: pad `bench/repack_adversarial.lua` after
 
 ## A replay-line OOM is described at the previous instruction (noted 2026-10-23)
 
-- [ ] Prologue step 3 (the `.full` replay-line append in `dispatchPostGc`)
+- [x] Prologue step 3 (the `.full` replay-line append in `dispatchPostGc`)
       parks `OutOfMemory` with `parkErr` before step 6 stores `frame.pc =
       cur`. So `describeFault`/`backtraceFrames` locate the fault at the
       previous instruction. The fix is to store `st.frame.pc = pc` before
       that `parkErr` (`pc` is in scope there). Found by doc 69's lazy-pc
-      audit. The fix and its test ("a replay-line OOM is located at the
-      instruction about to run", `interp_dispatch_test.zig`, mutation-checked)
-      are ready in a shadow and land with doc 69 P0, once interp.zig is free.
+      audit. Fixed 2026-10-23 with doc 69 P0; test "a replay-line OOM is
+      located at the instruction about to run" (`interp_dispatch_test.zig`,
+      mutation-checked).
 
 ## `pcall(next, 5)` blames `pcall` for `next`'s bad argument (noted 2026-10-22)
 
