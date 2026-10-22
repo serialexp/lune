@@ -25,15 +25,14 @@ MULTI-FILE VIZ + NESTED SUSPENSION (2026-10-22, coral-raven).
   resumable natives). Rev 2 folds in the codex + antigravity round-1 review
   (docs/reviews/doc68/). Waiting on Bart for Q2 (gsub buffer) and Q3
   (embedder boundary: defer vs refuse; the reviewers split on both).
-  P1 slice 1, the boundary guard, is in the tree, uncommitted
-  (2026-10-22). A suspend due inside a Zig re-entry is deferred, so the
+  P1 slice 1, the boundary guard, landed in 98aef7f (bundled by
+  coral-marten, 2026-10-22). A suspend due inside a Zig re-entry is deferred, so the
   trap and UB are fixed. The step index marks steps as stoppable, the
   slider skips the others, and the index is limited at the cap through
-  `SuspendCtl.index_limit` (a new Vm field reshuffles the asm offsets).
+  `SuspendCtl.index_limit`, which sits in existing padding (a new Vm field
+  had reshuffled the asm-visible offsets, so it was moved there).
   Also fixed: the wasm index pass used the run VM's effect values. Details
   are in doc 68's status. Next: resumable natives, with pcall/xpcall first.
-  interp.zig also holds coral-marten's uncommitted doc 66 P4, so the commit
-  needs coordinating.
   P0 (FrameCtl byte, no behaviour change) landed in d0b815e (bundled by
   coral-marten). Its follow-up, one 16-bit store clearing in_flight+ctl
   (x64.movWordMemImm, nativegen_emit, hostcall_x64.S, trace_code, a
@@ -207,7 +206,19 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     `hasTrace` probing moved by the pc layout). The P4 commit bundles
     coral-raven's doc 68 P1 slice 1 at their request. Follow-ups in doc
     66: short-circuit `and`/`or` conditions, `not` on a truthiness test.
-    Next: P1 (`itern`).
+  - P1 (`itern`, shape (b2)) done with its numbers in doc 66: a hash
+    `pairs` step 455 → 256 instructions, an array one 394 → 60;
+    pairs_hash −30.6% tier-0. Two codegen traps were caught by the A/B
+    before commit:
+    - a by-value operand struct into `callTail` cost `.call` 2
+      instructions a call;
+    - an inline `.itern` arm made `bc_liveness.effectOf` spill. Out of
+      line, `effectOf` is half its size and compile_multret_chain −4.1%;
+      TODO.md has the why.
+    It also fixed a pre-existing GC bug: the register root walk didn't
+    root a `row_view`'s parent grid. Follow-ups in doc 66: the hash-part
+    step on the call-free lane, and `ipairs` through `itern`. Doc 66's
+    five phases are all landed.
   - The 5 failing viz "multi-file:" wasm tests are not P2's. They trap on
     `Vm.callValue`'s `suspend_ctl == null` assert via `require` under a
     suspendable run, which is doc 68's territory. Named wasm frames: bundle

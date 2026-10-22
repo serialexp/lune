@@ -284,6 +284,39 @@ cost. Repro files: pad `bench/repack_adversarial.lua` after
       A per-proto bit per pc (set on attach, cleared on detach) would
       answer without touching the map at all. Not measured.
 
+## `bc_liveness.effectOf`'s codegen swings with its switch arms (noted 2026-10-23)
+
+- [ ] **Find out why, and make the good shape deliberate.** Doc 66 P1 added
+      an `.itern` arm. Written inline like its neighbours, it made
+      `effectOf` spill more on every instruction (`compile_multret_chain`
+      +0.26% instructions). Moved out of line (`iternEffect`, `return
+      @call(.never_inline, …)`), it made `effectOf` 231 disassembly lines
+      instead of 537, and that bench 4.3% *faster* than before P1. One
+      arm's shape decides how LLVM lowers the whole by-value `Effect` result,
+      and nothing pins that. Find what changed (result location? the
+      zero-init of `e`?), write `effectOf` so it holds by construction, and
+      check `bc_dom`'s `successors`, which calls it per edge too.
+
+## A `gmatch` loop keeps no trace under GC stress (noted 2026-10-22)
+
+- [ ] **Find out why.** Doc 66 P1's test "one generic `for` traced with
+      `gmatch` keeps its trace across `pairs`" (`interp_semantics_test.zig`)
+      leaves a compiled trace anchored in `walk` on the normal native leg,
+      but none at all on the `gc_stress` native leg, and no abort is logged
+      there either. 98aef7f (before `itern`) behaves the same in the same
+      harness, so this is pre-existing. The test skips the stress leg for
+      now. Suspects: a collection cancelling the recording (`const_swept`)
+      or retiring the trace over its pattern constant.
+
+## `pcall(next, 5)` blames `pcall` for `next`'s bad argument (noted 2026-10-22)
+
+- [ ] On 98aef7f, `print(pcall(next, 5))` prints `bad argument #1 to
+      'pcall' (table expected, got number)`; Lua says `'next'`. `nativeSite`
+      names the native at the frame's call site, which is the `pcall` call.
+      A native called by another native needs its own name. Doc 68's
+      resumable `pcall` (coral-raven, in flight) changes this path, so check
+      again once that lands.
+
 ## nsieve-bit-fp, the board's worst row (noted 2026-10-19)
 
 18.6× LuaJIT on the 1b60a01 board, and JIT (394 ms) slower than tier-0

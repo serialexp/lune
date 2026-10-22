@@ -1356,12 +1356,13 @@ const Compiler = struct {
 
     /// `for v1..vn in explist do body end`. Layout mirrors `compileNumericFor`:
     /// control registers [f(iterator), s(state), ctrl(control)] at `base..base+2`,
-    /// the loop variables `v1..vn` at `base+3..`. Each iteration calls
-    /// `f(s, ctrl)` (a real `.call`, so the iterator may be a native like `next`
-    /// *or* a user closure) wanting `n` results into the variable slots; the new
-    /// `tfor_loop` continues iff the first result is non-nil, publishing it as the
-    /// next `ctrl`. The iterator call window is `base+3,4,5`, so even for `n < 3`
-    /// we reserve `3 + max(n,3)` registers.
+    /// the loop variables `v1..vn` at `base+3..`. Each iteration's `itern`
+    /// calls `f(s, ctrl)` (the iterator may be a native like `next` *or* a
+    /// user closure) wanting `n` results into the variable slots; the
+    /// `tfor_loop` continues iff the first result is non-nil, publishing it as
+    /// the next `ctrl`. The iterator call window is `base+3,4,5` (doc 66 P1:
+    /// `itern` is that call's shorthand), so even for `n < 3` we reserve
+    /// `3 + max(n,3)` registers.
     fn compileGenericFor(self: *Compiler, gf: anytype) Error!void {
         const base = self.next_reg;
         const n: u16 = @intCast(gf.names.len);
@@ -1390,14 +1391,11 @@ const Compiler = struct {
         try self.endScope();
 
         // Test block (the forward-jmp target and the `tfor_loop` back-edge anchor;
-        // the body falls through into it). Copy f,s,ctrl up into the call window —
-        // f(base+0)/s(base+1) are never clobbered by the call, so they persist
-        // across iterations — then call f(s, ctrl) for n results, then test.
+        // the body falls through into it): the step f(s, ctrl) for n results —
+        // f(base+0)/s(base+1) are never clobbered by it, so they persist across
+        // iterations — then the test.
         self.patchToHere(prep);
-        _ = try self.emit(Instr.opAB(.move, base + 3, base + 0));
-        _ = try self.emit(Instr.opAB(.move, base + 4, base + 1));
-        _ = try self.emit(Instr.opAB(.move, base + 5, base + 2));
-        _ = try self.emit(Instr.opABC(.call, base + 3, 2, n));
+        _ = try self.emit(Instr.opABC(.itern, base, 0, n));
         try self.emitJumpTo(.tfor_loop, base, body_start);
 
         self.patchBreaks(loop_idx);
@@ -2312,6 +2310,41 @@ test "doc 66 P4: a comparison test compiles to one compare-and-branch" {
         }
     }
     try testing.expectEqual(@as(usize, 1), mirrored);
+}
+
+test "doc 66 P1: a generic `for` steps with one `itern`" {
+    var r = try run(
+        \\local n = 0
+        \\for k, v in pairs({ 1, 2, x = 3 }) do n = n + v end
+        \\for k in next, { 4 } do n = n + k end
+        \\for a, b, c, d in pairs({ 5 }) do n = n + b end
+        \\return n
+    );
+    defer r.deinit();
+    try testing.expectEqual(@as(i64, 12), r.value.asInt());
+    const proto = r.chunk.proto;
+    var count = std.EnumArray(OpCode, usize).initFill(0);
+    for (proto.code) |ins| count.getPtr(ins.op).* += 1;
+    try testing.expectEqual(@as(usize, 3), count.get(.itern));
+    try testing.expectEqual(@as(usize, 3), count.get(.tfor_loop));
+    // Each test block is the step and the test: the only calls left are
+    // the two `pairs(...)`.
+    try testing.expectEqual(@as(usize, 2), count.get(.call));
+    for (proto.code, 0..) |ins, pc| {
+        if (ins.op != .itern) continue;
+        const loop = proto.code[pc + 1];
+        try testing.expectEqual(OpCode.tfor_loop, loop.op);
+        try testing.expectEqual(loop.a, ins.a);
+        // It is the call it replaced, with the window's own wanted count.
+        const call = bytecode.callOperandsOf(ins).?;
+        try testing.expectEqual(ins.a + 3, call.a);
+        try testing.expectEqual(@as(u16, 2), call.b);
+        try testing.expect(ins.c == 1 or ins.c == 2 or ins.c == 4);
+        const header: u32 = @intCast(bytecode.loopHeaderOf(loop, pc + 1).?);
+        try testing.expectEqual(@as(u32, @intCast(pc + 1)), bytecode.loopGateOf(proto, header).?);
+    }
+    // A caller suspended in the iterator call is masked like one at a `call`.
+    try testing.expect(proto.maskable);
 }
 
 test "an operand read before code that can write it keeps its value" {

@@ -52,4 +52,20 @@ P.pairs = function(n)
   for r = 1, math.floor(n / 100) do for k, v in pairs(t) do s = s + v end end
   return s
 end
+-- The same over an array part (doc 66 P1's call-free lane).
+P.apairs = function(n)
+  local t = {}
+  for i = 1, 100 do t[i] = i end
+  local s = 0
+  for r = 1, math.floor(n / 100) do for k, v in pairs(t) do s = s + v end end
+  return s
+end
+-- And `ipairs`, which `itern` runs as the call it replaced.
+P.ipairs = function(n)
+  local t = {}
+  for i = 1, 100 do t[i] = i end
+  local s = 0
+  for r = 1, math.floor(n / 100) do for k, v in ipairs(t) do s = s + v end end
+  return s
+end
 print(P[which](n))

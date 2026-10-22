@@ -10,6 +10,7 @@ const function = @import("function.zig");
 const string_mod = @import("string.zig");
 const pattern_mod = @import("stdlib/pattern.zig");
 const string_stdlib = @import("stdlib/string.zig");
+const stdbase = @import("stdlib/base.zig");
 const table_mod = @import("table.zig");
 const arith = @import("arith.zig");
 const gc = @import("gc.zig");
@@ -185,6 +186,11 @@ pub const AbortReason = enum {
     /// recording is cancelled (`RecordingSession.cancel`, never `abort`'s
     /// peel rewind) before the sweep frees it. Ordinary strike semantics.
     const_swept,
+    /// Doc 66 P1: an `itern` whose iterator is the `next` builtin, which
+    /// tier-0 steps inline. Recording the step is LuaJIT's `rec_itern`, not
+    /// built yet; until doc 66 P1 the same loop aborted at the `next` call
+    /// (`.host_barrier`), so coverage is unchanged.
+    itern_next,
 };
 const ExitProvenance = @import("trace_types.zig").ExitProvenance;
 const ProgramPoint = @import("trace_types.zig").ProgramPoint;
@@ -1621,6 +1627,7 @@ pub const RecordingSession = struct {
             // windows resolve against the one-instruction `multret` shadow
             // (doc 27) instead of aborting.
             .call => try self.recCall(instr, regs, proto, multret),
+            .itern => try self.recItern(instr, regs, proto, multret),
             .ret => if (self.inline_depth == 0)
                 // Depth-0 return. A one-shot recording (`.head`/`.cont`,
                 // doc 44) CLOSES here — the one-shot terminal, set before
@@ -4397,6 +4404,33 @@ pub const RecordingSession = struct {
         };
         self.inline_depth += 1;
         self.base_off = callee_base_off;
+    }
+
+    /// Doc 66 P1: `itern a, c`, the generic-`for` step. With the `next`
+    /// builtin tier-0 steps inline, which aborts `.itern_next`. Anything else
+    /// is tier-0's fallback, `move a+3,a; move a+4,a+1; move a+5,a+2` then
+    /// `call a+3, 2, c`, recorded exactly as that sequence was. The recorder
+    /// observes an instruction before tier-0 runs it, so `recCall` reads the
+    /// window as the moves leave it: a scratch copy of the frame's registers
+    /// with R[a+3..a+5] = R[a..a+2]. Recording-time only, one frame's worth.
+    fn recItern(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto, multret: ?u32) !void {
+        const a = instr.a;
+        const f = regs.get(a);
+        if (f.isHeap() and f.heapType() == .native and stdbase.isNext(function.Native.fromHeader(f.asHeap())))
+            return self.abort(.itern_next);
+        var k: u16 = 0;
+        while (k < 3) : (k += 1) self.setReg(a + 3 + k, try self.refOf(a + k));
+        const tags = try self.gpa.alloc(u8, regs.n);
+        defer self.gpa.free(tags);
+        const payloads = try self.gpa.alloc(u64, regs.n);
+        defer self.gpa.free(payloads);
+        @memcpy(tags, regs.tags[0..regs.n]);
+        @memcpy(payloads, regs.payloads[0..regs.n]);
+        const moved = RegWindow.of(tags, payloads);
+        k = 0;
+        while (k < 3) : (k += 1) moved.set(a + 3 + k, regs.get(a + k));
+        const call = bytecode.callOperandsOf(instr).?;
+        try self.recCall(Instr.opABC(.call, call.a, call.b, call.c), moved, proto, multret);
     }
 
     /// Dispatch a `.call` whose callee is a `RecordedBuiltin`-tagged native to

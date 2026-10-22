@@ -1,11 +1,12 @@
 # 66 — Bytecode forms: constant operands, field ops, compare-and-branch, ITERN
 
-Status: rev 2, partial. The `condBranchOf` refactor, P2, P3, P5 and P4
-landed; P1 is outstanding. Round-1 review findings
+Status: rev 2, all five phases landed. The `condBranchOf` refactor, P2, P3,
+P5, P4 and P1 are on master; follow-ups and deferrals remain (Outstanding).
+Round-1 review findings
 (codex and antigravity, §10) are folded in. Bart answered Q1–Q5 (§9) on
 2026-10-22.
 Owner: claude (coral-marten)
-Last updated: 2026-10-22
+Last updated: 2026-10-23
 
 ## Implementation status
 
@@ -257,13 +258,81 @@ land; move whole phases to Done once everything inside them is checked.
   keeps the shortest round-trip digits, positional for
   `1e-7 <= |x| < 1e21` and `3.333333333333333e+307` / `5e-324` outside,
   bounded by `io.float_text_max`. One renderer behind all three.
+- [x] **P1 — `itern`** (2026-10-23, §5.1, Q4 shape (b2)). The generic-`for`
+  test block is `itern a, c; tfor_loop`, where `itern` stands for `move
+  a+3,a; move a+4,a+1; move a+5,a+2; call a+3, 2, c`.
+  `bytecode.callOperandsOf` decodes the call either one makes for every
+  call-site consumer: `nativeSite`, `frameShape`, `frameMask`,
+  `describeFault` and the liveness call-layout check. `loopExtentFor`
+  accepts only that test block.
+  - Lanes: `opItern` steps `next` over a non-grid table's array part
+    call-free, and ends the traversal at an empty hash part. `opIternSlow`
+    takes the hash part, once its view is built, and a `row_view` through
+    `stdbase.iternStep` (`nextStep(.no_alloc)`, which declines with
+    `error.WouldAllocate` while `live != 0 and !iter_valid`). Anything else
+    runs the moves, then `callTail`, `.call`'s body shared through
+    `inline`.
+  - The recorder aborts on the `next` lane (`.itern_next`). Otherwise it
+    records the three moves and `recCall` over the synthesized call.
+  - As built, against the plan in §5.1: the liveness kill set is
+    `a+3 .. a+3+c` (below), and the recorder runs `recCall` on a scratch
+    copy of the register window (below).
+  - Per op (`ops3.lua`, 98aef7f → P1, LuaJIT `-joff` in brackets): hash
+    `pairs` step 454.6 → 256.4 (16.7), array `pairs` step 393.7 → 59.8
+    (10.3), `ipairs` step 353.7 → 306.2 (61.9).
+  - `abench.sh`-style instruction A/B against 98aef7f, both tiers:
+    pairs_hash −30.6% / −29.2%, str_gmatch −3.7% / −1.2%, array3d −0.55% /
+    −0.12%, while_shortcircuit_probe −1.1% / −0.8%, compile_multret_chain
+    −4.1% / −4.1%; every other row within ±0.02%, and outputs are
+    identical. The compile_multret_chain change is the `effectOf`
+    codegen swing below, not `itern`.
+  - Two codegen traps, found by that A/B before commit:
+    - `callTail` first took the operands as a by-value struct. LLVM then
+      held them in registers across `.call`'s whole body: recursive-fib
+      +0.28%, scalar +1.2% tier-0. `callA`/`callB` re-read `instr` at each
+      use, as `.call` always did, and the call rows are back to ±0.00%.
+    - An inline `.itern` arm in `bc_liveness.effectOf` made it spill on
+      every instruction (compile_multret_chain +0.26%). Out of line
+      (`iternEffect`), `effectOf` compiles to under half its size (TODO.md).
+  - **A pre-existing GC bug, found by the `row_view` test and fixed in the
+    same change.** `forEachKeptRegister`, the doc 61 register root walk,
+    rooted only `heap_ref`-tagged registers. So a register holding a
+    `row_view` did not keep its parent grid alive, unlike
+    `Heap.markValue`. A row whose grid was otherwise dead was swept under
+    it, and the next `next` read freed cells: a Debug panic, undefined in
+    release. On 98aef7f the `row_view` test's GC-stress legs crash through
+    the `next` native. The walk now roots the parent of a `row_view` too.
+  - `--dump-aborts` NYI counts are unchanged on all 33 programs.
+    pairs_hash's `host_barrier` at the `next` call is now `itern_next` at
+    the `itern`, and str_gmatch's trace exit snapshots shrank from 40 slots
+    to 28.
+  - Tests:
+    - "doc 66 P1: a generic `for` steps with one `itern`" (compiler);
+    - `loopExtentFor` over the new block (bytecode);
+    - in the semantics matrix: "`itern` steps a table exactly as the
+      `next` native does", whose digest was taken on 98aef7f, covering
+      array, hash, holes, mutation, absent keys, grids and every `c`;
+    - "`itern` steps a host's `row_view` as `next` does". A program sees
+      a `row_view` only from a host, because indexing a grid and `ipairs`
+      deflate it, so a test native hands one over;
+    - "any other iterator is the call `itern` replaced", covering
+      closures, gmatch, `__call`, bad arguments and non-callables, with
+      the 98aef7f messages;
+    - "one generic `for` traced with `gmatch` keeps its trace across
+      `pairs`", the §5.1 soundness test.
 ### Outstanding
 
 - [ ] **Defer: a `sar` constant form.** Q6's set leaves mahina's `~>>`
   (`sar`, no Lua 5.4 spelling, 0 `@bench` sites) on the register form.
 
-- [ ] **P1 — `itern`** (§5.1): the generic-`for` step for the real `next`
-  without a call.
+- [ ] **The hash-part step on the call-free lane** (follow-up to P1). A
+  hash `pairs` step is still 256 instructions against LuaJIT's 17. It
+  leaves `opItern` for the slow table, `opIternSlow`, and
+  `stdbase.iternStep`'s generic walk. Fold the built-view step into
+  `opItern` the way the array part is.
+- [ ] **`ipairs` through `itern`** (follow-up to P1, §5.1's last
+  paragraph). A second builtin identity with an array-only step. `ipairs`
+  is 306 instructions a step against LuaJIT's 62.
 - [ ] **Decode inlined branch guards against their own proto** (follow-up
   to the fix above). Today they are simply not classified. An option is
   to carry the guard's proto in provenance, so a callee's own loop test
@@ -281,7 +350,8 @@ land; move whole phases to Done once everything inside them is checked.
 - [ ] **Each phase: measured** (§8). Per-op probe, `abench.sh` over every
   `@bench` program in both tiers, and hashgate.
 - [ ] **Defer: JIT recording of `itern`** (§5.1). Today a `pairs` loop
-  aborts recording at the `next` call (`.host_barrier`). Recording the
+  aborts recording at its `itern` (`.itern_next`; `.host_barrier` at the
+  `next` call before P1). Recording the
   step natively is a separate design: an IR op for the step, as LuaJIT's
   `rec_itern` does.
 
@@ -656,6 +726,21 @@ What (b2) must keep (most also apply to (a) and (c)):
 
 `ipairs` can join later through the same op (a second builtin identity,
 an array-only step).
+
+**As built (P1, 2026-10-23).** Two points differ from the plan above:
+
+- **Liveness kills `a+3 .. a+3+c`, not `.. a+3+max(c, 3)`.** The fast lane
+  writes only the `c` loop variables. When `c < 3`, R[a+3+c .. a+6) keep
+  whatever they held, so they are not a must-write and cannot be a kill.
+  Nothing reads them: they sit above the loop variables, the body's
+  registers start past them, and collection and keyframe capture both
+  treat dead slots as dead (scrubbed; tombstoned).
+- **The recorder runs `recCall` on a scratch register window.** The
+  recorder observes before tier-0 executes the instruction, so at an
+  `itern` R[a+3..a+5] still hold the previous step's values, not f, s and
+  ctrl. `recItern` copies the window, sets those three slots to R[a..a+2],
+  and runs `recCall` over the synthesized `call a+3, 2, c` against the
+  copy. The copy is per recorded `itern`, during recording only.
 
 ### 5.2 `get_field` / `set_field` — constant string keys (P2)
 

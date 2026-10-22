@@ -334,6 +334,17 @@ pub const OpCode = enum(u8) {
     jeq_s,
     /// `a, b, c, aux`  R[b] == K[c]   (K[c] a number)
     jeq_n,
+
+    // ---- the generic-`for` step (doc 66 P1, LuaJIT `ITERN`) ----
+    /// `a, c`      the step of `for v1..vc in f, s, ctrl`, with the control
+    ///             registers at R[a..a+2]: one call `f(s, ctrl)` wanting `c`
+    ///             results in R[a+3..a+3+c). It replaces the test block's
+    ///             `move a+3,a; move a+4,a+1; move a+5,a+2; call a+3, 2, c`,
+    ///             and its one successor is the `tfor_loop` at `pc + 1`. When
+    ///             R[a] is the `next` builtin over a table or a `row_view`,
+    ///             the step runs inline without a call; anything else is
+    ///             exactly that sequence (`callOperandsOf`).
+    itern,
 };
 
 /// Doc 66 P5: the immediate operand of `eq_p`/`ne_p`.
@@ -703,9 +714,9 @@ pub const LoopExtent = struct {
 /// back-edge from the instruction right above its header:
 ///  - numeric `for`: `for_prep` at `header − 1` names its `for_loop` in `aux`;
 ///    the `for_loop`'s taken edge returns to `header` (`compileNumericFor`);
-///  - generic `for`: a forward `jmp` at `header − 1` enters the test block
-///    (`move`s and the iterator `call`) that ends in the `tfor_loop` returning
-///    to `header` (`compileGenericFor`);
+///  - generic `for`: a forward `jmp` at `header − 1` enters the test block,
+///    an `itern` followed by the `tfor_loop` returning to `header`
+///    (`compileGenericFor`);
 ///  - `while`/`repeat`: the `loop` marker at `header − 1` (below).
 /// Each link is checked, so anything else is null. That one back-edge per
 /// header is unique is a property of compiler output (each loop owns its
@@ -746,12 +757,11 @@ pub fn loopExtentFor(proto: *const Proto, header: u32) ?LoopExtent {
         .jmp => {
             const t = jumpTargetOf(entry, i);
             if (t <= i or t >= @as(i64, @intCast(code.len))) return null;
-            var back: usize = @intCast(t);
-            while (back < code.len) : (back += 1) switch (code[back].op) {
-                .move, .call => {},
-                else => break,
-            };
-            if (back >= code.len or code[back].op != .tfor_loop or loopHeaderOf(code[back], back) != header) return null;
+            // Doc 66 P1: the test block is exactly `itern; tfor_loop`.
+            const step: usize = @intCast(t);
+            const back = step + 1;
+            if (code[step].op != .itern or back >= code.len) return null;
+            if (code[back].op != .tfor_loop or loopHeaderOf(code[back], back) != header) return null;
             return .{ .start = header, .end = @intCast(back), .back_edge_pc = @intCast(back), .back_edge_op = .tfor_loop };
         },
         .loop => {
@@ -899,6 +909,25 @@ comptime {
 /// Sentinel for `call`'s `c` operand meaning "want every result the callee
 /// produces" (multi-value tail position). A real result count is `< this`.
 pub const all_results: u16 = std.math.maxInt(u16);
+
+/// The operands of the call an instruction makes, in `call`'s terms: the
+/// callee in R[a], `b` arguments after it (or `all_results`), `c` results
+/// written back from R[a] (or `all_results`).
+pub const CallOperands = struct { a: u16, b: u16, c: u16 };
+
+/// The call `ins` makes, or null when it makes none. Doc 66 P1: `itern a, c`
+/// calls `f(s, ctrl)` exactly as the `call a+3, 2, c` it replaced, after
+/// copying R[a..a+2] up to R[a+3..a+5]; its fast lane makes no call but
+/// runs no other code either. Every reader of a call site (the native's
+/// error location, a suspended caller's frame shape, the multret span)
+/// decodes through this, so the two ops cannot drift apart.
+pub fn callOperandsOf(ins: Instr) ?CallOperands {
+    return switch (ins.op) {
+        .call => .{ .a = ins.a, .b = ins.b, .c = ins.c },
+        .itern => .{ .a = ins.a + 3, .b = 2, .c = ins.c },
+        else => null,
+    };
+}
 
 /// One decoded instruction. 12 bytes: op (1) + three u16 operands (6) + a signed
 /// 32-bit immediate (4), with one byte of natural padding. Roomy on purpose —
@@ -1126,6 +1155,8 @@ pub fn writeInstr(w: *io.Writer, instr: Instr) io.Writer.Error!void {
         .vararg_get,
         => try w.print(" r{d}  {d}", .{ instr.a, instr.b }),
         .eq_p, .ne_p => try w.print(" r{d}  {d}  {s}", .{ instr.a, instr.b, @tagName(@as(Prim, @enumFromInt(instr.c))) }),
+        // Doc 66 P1: the control base and the wanted result count.
+        .itern => try w.print(" r{d}  {d}", .{ instr.a, instr.c }),
         // Doc 66 P4: the polarity, the operands, then the offset.
         .jlt, .jle, .jgt, .jge, .jeq, .jlt_k, .jle_k, .jgt_k, .jge_k, .jeq_p, .jeq_s, .jeq_n => {
             try w.print(" {s} r{d}  ", .{ if (instr.a & cmp_on_true != 0) "T" else "F", instr.b });
@@ -1336,16 +1367,22 @@ test "doc 58 §4.8: loopExtentFor and loopGateOf on every compiler loop shape" {
     const fp = Proto{ .code = &for_code };
     try testing.expectEqual(LoopExtent{ .start = 1, .end = 2, .back_edge_pc = 2, .back_edge_op = .for_loop }, loopExtentFor(&fp, 1).?);
     try testing.expectEqual(@as(?u32, 0), loopGateOf(&fp, 1));
-    // Generic `for`: jmp → test block; body (header 1); move×3; call; tfor_loop → header.
+    // Generic `for`: jmp → test block; body (header 1); itern; tfor_loop → header.
     const gen_code = [_]Instr{
-        Instr.opAx(.jmp, 0, 1),      Instr.opAx(.load_int, 6, 0),
-        Instr.opAB(.move, 3, 0),     Instr.opAB(.move, 4, 1),
-        Instr.opAB(.move, 5, 2),     Instr.opABC(.call, 3, 2, 1),
-        Instr.opAx(.tfor_loop, 0, -6), Instr.op0(.ret),
+        Instr.opAx(.jmp, 0, 1),         Instr.opAx(.load_int, 6, 0),
+        Instr.opABC(.itern, 0, 0, 1),   Instr.opAx(.tfor_loop, 0, -3),
+        Instr.op0(.ret),
     };
     const gp = Proto{ .code = &gen_code };
-    try testing.expectEqual(LoopExtent{ .start = 1, .end = 6, .back_edge_pc = 6, .back_edge_op = .tfor_loop }, loopExtentFor(&gp, 1).?);
-    try testing.expectEqual(@as(?u32, 6), loopGateOf(&gp, 1));
+    try testing.expectEqual(LoopExtent{ .start = 1, .end = 3, .back_edge_pc = 3, .back_edge_op = .tfor_loop }, loopExtentFor(&gp, 1).?);
+    try testing.expectEqual(@as(?u32, 3), loopGateOf(&gp, 1));
+    // Anything else in the test block is not a generic `for`.
+    const odd_code = [_]Instr{
+        Instr.opAx(.jmp, 0, 1),         Instr.opAx(.load_int, 6, 0),
+        Instr.opABC(.call, 3, 2, 1),    Instr.opAx(.tfor_loop, 0, -3),
+        Instr.op0(.ret),
+    };
+    try testing.expectEqual(@as(?LoopExtent, null), loopExtentFor(&Proto{ .code = &odd_code }, 1));
     // A pc that is not a header (inside a body, past the end) has no loop.
     try testing.expectEqual(@as(?LoopExtent, null), loopExtentFor(&wp, 4));
     try testing.expectEqual(@as(?LoopExtent, null), loopExtentFor(&fp, 3));

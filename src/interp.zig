@@ -1945,9 +1945,8 @@ pub const Vm = struct {
     fn nativeSite(self: *Vm) ?NativeSite {
         const cs = self.callSiteAt(1) orelse return null;
         if (cs.pc >= cs.proto.code.len) return null;
-        const instr = cs.proto.code[cs.pc];
-        if (instr.op != .call) return null;
-        const callee = self.regGet(cs.base + instr.a);
+        const call = bytecode.callOperandsOf(cs.proto.code[cs.pc]) orelse return null;
+        const callee = self.regGet(cs.base + call.a);
         if (!(callee.isHeap() and callee.heapType() == .native)) return null;
         return .{
             .fname = nativeDisplayName(function.Native.fromHeader(callee.asHeap())),
@@ -2134,7 +2133,8 @@ pub const Vm = struct {
                 // forms' key is a constant, which the message never reads.
                 .get_index, .get_field => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs.get(instr.b).typeName()}),
                 .set_index, .set_field => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs.get(instr.a).typeName()}),
-                .call => blk: {
+                // Doc 66 P1: an `itern` faults only in the call it makes.
+                .call, .itern => blk: {
                     // A native runs inline (no child frame), so when one returns a
                     // bare fault the leaf instruction is the `.call` to it — the
                     // callee is perfectly callable. Name it generically instead of
@@ -2142,7 +2142,7 @@ pub const Vm = struct {
                     // messages come from `Vm.badArg` (which raises `LuaError`, so it
                     // never reaches this non-LuaError arm). A genuine non-callable
                     // (nil/number/…) keeps the real "attempt to call a X value".
-                    const callee = regs.get(instr.a);
+                    const callee = regs.get(bytecode.callOperandsOf(instr).?.a);
                     if (callee.isHeap() and callee.heapType() == .native and err == Error.TypeError)
                         break :blk try std.fmt.allocPrint(arena, "bad argument to '{s}'", .{nativeDisplayName(function.Native.fromHeader(callee.asHeap()))});
                     if (callee.isHeap() and (callee.heapType() == .native or callee.heapType() == .function))
@@ -2722,8 +2722,7 @@ pub const Vm = struct {
         const code = f.closure.proto.code;
         // `pc == 0` would read before the code; no `.call` can precede it.
         if (f.pc == 0 or f.pc > code.len) return .{ .kind = .unknown, .pc = f.pc };
-        const call = code[f.pc - 1];
-        if (call.op != .call) return .{ .kind = .unknown, .pc = f.pc };
+        const call = bytecode.callOperandsOf(code[f.pc - 1]) orelse return .{ .kind = .unknown, .pc = f.pc };
         return .{ .kind = .suspended_call, .pc = f.pc, .call_a = call.a };
     }
 
@@ -2774,8 +2773,8 @@ pub const Vm = struct {
             // consumer (`reg_top_pending`), so `pc` never names one that has
             // not started.
             .in_flight => blk: {
-                const ins = proto.code[shape.pc];
-                break :blk if (ins.op == .call and ins.b == bytecode.all_results) f.multret_top else nreg;
+                const call = bytecode.callOperandsOf(proto.code[shape.pc]);
+                break :blk if (call != null and call.?.b == bytecode.all_results) f.multret_top else nreg;
             },
             .innermost, .unknown => nreg,
         };
@@ -2862,13 +2861,19 @@ pub const Vm = struct {
         return @bitCast(block == @as(@Vector(64, u8), @splat(@intFromEnum(tag))));
     }
 
-    /// `cb` on every kept register holding a heap value, in stack order.
+    /// `cb` on every kept register holding a heap value, in stack order. A
+    /// `row_view` (doc 14) is not a heap value but borrows its parent grid
+    /// table's cells, so it roots that table, as `Heap.markValue` has it.
     fn forEachKeptRegister(self: *Vm, ctx: anytype, comptime cb: fn (@TypeOf(ctx), *object.GcHeader) void) void {
         const top = self.stack_top;
         for (self.gc_keep[0 .. (top + 63) / 64], 0..) |word, wi| {
             const at = wi * 64;
-            var w = word & lowBits(top - at) & self.tagMask(at, .heap_ref);
-            while (w != 0) : (w &= w - 1) cb(ctx, self.regGet(at + @ctz(w)).asHeap());
+            const refs = self.tagMask(at, .heap_ref) | self.tagMask(at, .row_view);
+            var w = word & lowBits(top - at) & refs;
+            while (w != 0) : (w &= w - 1) {
+                const v = self.regGet(at + @ctz(w));
+                cb(ctx, if (v.isRowView()) v.rowViewParent() else v.asHeap());
+            }
         }
     }
 
@@ -3338,6 +3343,7 @@ pub const Vm = struct {
         inline for (.{ .lt, .le, .gt, .ge }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opCompareSlow(mode, op);
         inline for (.{ .jlt, .jle, .jgt, .jge, .jlt_k, .jle_k, .jgt_k, .jge_k }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opJOrderSlow(mode, op);
         inline for (.{ .jeq, .jeq_n }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opJEqSlow(mode, op);
+        t[@intFromEnum(bytecode.OpCode.itern)] = opIternSlow(mode);
         return t;
     }
 
@@ -5990,6 +5996,7 @@ pub const Vm = struct {
             .jfunc_head => opJFuncHead(mode),
             .jcont => opJCont(mode),
             .tfor_loop => opTForLoop(mode),
+            .itern => opItern(mode),
             .new_table => opNewTable(mode),
             .get_index => opGetIndex(mode),
             .set_index => opSetIndex(mode),
@@ -7266,6 +7273,97 @@ pub const Vm = struct {
         }.h;
     }
 
+    /// Is `f` the `next` builtin? `itern`'s fast-lane test (doc 66 P1).
+    inline fn isNextNative(f: Value) bool {
+        return f.isHeap() and f.heapType() == .native and stdbase.isNext(function.Native.fromHeader(f.asHeap()));
+    }
+
+    /// One `next` step's results as the `call a+3, 2, want` it stands for
+    /// leaves them: the key, the value when two or more are wanted, then nil
+    /// (`key` nil at the end of the traversal, when `next` returns none).
+    inline fn writeIternStep(regs: RegWindow, a: usize, want: u16, key: Value, val: Value) void {
+        regs.set(a + 3, key);
+        if (want >= 2) regs.set(a + 4, val);
+        var k: usize = 2;
+        while (k < want) : (k += 1) regs.set(a + 3 + k, Value.nil());
+    }
+
+    /// Doc 66 P1: the generic-`for` step, `itern a, c`. Its fast lane is
+    /// `next`'s array part over a plain table, inline and call-free: the
+    /// `nextStep` scan from the control key. The hash part, a `row_view`, a
+    /// grid, a float-spelled control and every other iterator leave for
+    /// `opIternSlow`.
+    fn opItern(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const a: usize = instr.a;
+                const s = regs.get(a + 1);
+                if (isNextNative(regs.get(a)) and s.isHeap() and s.heapType() == .table) {
+                    const t = table.Table.fromHeader(s.asHeap());
+                    const ctrl = regs.get(a + 2);
+                    // Where `nextStep` resumes in the array part: at its
+                    // start, or after an integer key inside it.
+                    const resume_at: ?i64 = if (ctrl.isNil())
+                        0
+                    else if (ctrl.isInt() and array.ArrayPart.inArray(ctrl.asInt(), t.array.asize))
+                        ctrl.asInt() + 1
+                    else
+                        null;
+                    if (resume_at) |first| if (!t.array.isGrid()) {
+                        const n: i64 = @intCast(t.array.asize);
+                        var i = first;
+                        while (i < n) : (i += 1) {
+                            const v = t.array.get(@intCast(i));
+                            if (!v.isNil()) {
+                                writeIternStep(regs, a, instr.c, Value.int(i), v);
+                                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+                            }
+                        }
+                        // Past the array part, an empty hash part ends the
+                        // traversal, unless `nextLive` has a view to free.
+                        if (t.hash.live == 0 and t.hash.iter_keys == null) {
+                            writeIternStep(regs, a, instr.c, Value.nil(), Value.nil());
+                            return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+                        }
+                    };
+                }
+                return slowTail(mode, st, pc, instr, vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// `itern` off its call-free lane. With the `next` builtin, the step
+    /// `stdbase.iternStep` takes without allocating: the hash part once its
+    /// view is built, or a `row_view`. Anything else is exactly the sequence
+    /// `itern` replaced, `move a+3,a; move a+4,a+1; move a+5,a+2` then the
+    /// `call a+3, 2, c` (`callTail`): another iterator, a grid to deflate, a
+    /// view to build, a bad argument to raise.
+    fn opIternSlow(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const a: usize = instr.a;
+                const f = regs.get(a);
+                const s = regs.get(a + 1);
+                const ctrl = regs.get(a + 2);
+                if (isNextNative(f)) {
+                    if (stdbase.iternStep(vm.gpa, s, ctrl)) |step| {
+                        if (step.found)
+                            writeIternStep(regs, a, instr.c, step.key, step.val)
+                        else
+                            writeIternStep(regs, a, instr.c, Value.nil(), Value.nil());
+                        return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+                    }
+                }
+                regs.set(a + 3, f);
+                regs.set(a + 4, s);
+                regs.set(a + 5, ctrl);
+                return callTail(mode, .itern, st, pc, instr, vm, tags, payloads);
+            }
+        }.h;
+    }
+
     // ---- tables ----
     fn opNewTable(comptime mode: ExecMode) *const HandlerFn {
         return struct {
@@ -7660,255 +7758,276 @@ pub const Vm = struct {
     fn opCall(comptime mode: ExecMode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
-                const self = vm;
-                const a: usize = instr.a;
-                const base = st.base;
-                // Resolve the argument count first: nothing before it may
-                // fail. `all_results` (the consumer half of dynamic multret,
-                // e.g. the outer `print` in `print(unpack(t))`) takes every
-                // value the immediately-preceding producer left, from the
-                // first argument slot up to `reg_top`. Taking it clears
-                // `reg_top_pending`, which must not outlive a fault here.
-                // Doc 61 §5 (B): the frame keeps the span's end, so a
-                // collection while it is in flight here (a native or
-                // `__call` callee, or a fault under `xpcall`) masks the
-                // unwritten window above it.
-                const nargs: usize = if (instr.b == bytecode.all_results) blk: {
-                    self.reg_top_pending = false;
-                    st.frame.multret_top = @intCast(@min(self.reg_top - base, st.proto.num_registers));
-                    break :blk self.reg_top - (base + a + 1);
-                } else instr.b;
-                const callee = st.regs.get(a);
-                if (!callee.isHeap()) return parkErr(st, Error.TypeError);
-                switch (callee.heapType()) {
-                    .function => {
-                        const cl = Closure.fromHeader(callee.asHeap());
-                        const cp = cl.proto;
-                        // The callee window sits above the caller's window AND
-                        // above the argument span (doc 61 P1, LuaJIT's vararg
-                        // frame layout). A dynamic (`all_results`) span can end
-                        // past the caller window; laying the callee at the
-                        // window end would overwrite the surplus varargs it
-                        // then reads, and make the param copy below overlap.
-                        // A fixed span always fits, so this is the window end.
-                        const callee_base = @max(base + st.proto.num_registers, base + a + 1 + nargs);
-                        if (self.depth >= max_call_depth) return parkErr(st, Error.StackOverflow);
-                        if (callee_base + cp.num_registers > self.regCapacity()) return parkErr(st, Error.StackOverflow);
-                        // Lay out the callee window: bind fixed params
-                        // (nil-fill any not supplied), nil the rest.
-                        // Straight-line and allocation-free — these slots sit
-                        // above the current `stack_top` until `pushFrame`
-                        // raises it, so no safepoint may intervene here (none
-                        // does).
-                        var i: usize = 0;
-                        while (i < cp.num_registers) : (i += 1) {
-                            self.regSet(callee_base + i, if (i < cp.num_params and i < nargs)
-                                self.regGet(base + a + 1 + i)
-                            else
-                                Value.nil());
-                        }
-                        // Varargs cursor: a vararg callee handed more args
-                        // than it has fixed params keeps the surplus where
-                        // they already sit — below `callee_base`, in the
-                        // caller's window or in the span above it. They stay valid (the stack slab never
-                        // moves) and GC-rooted (`forEachRootHeader` scans the
-                        // whole live prefix) for the callee's lifetime.
-                        // Recorded per-callee so a non-vararg or no-surplus
-                        // callee gets a zero cursor (never inherits one).
-                        const va_count: usize = if (cp.is_vararg and nargs > cp.num_params) nargs - cp.num_params else 0;
-                        const va_base: usize = if (va_count > 0) base + a + 1 + cp.num_params else 0;
-                        // Freeze the caller's resume cursor (already one past
-                        // this call), push the callee, and reload onto it.
-                        // Doc 61 §4.3: a caller suspended at a Lua call is
-                        // out of flight with `pc` one past a `.call`.
-                        std.debug.assert(!st.frame.in_flight);
-                        st.frame.pc = pc;
-                        self.pushFrameVararg(cl, callee_base, instr.a, instr.c, va_base, va_count) catch |e| {
-                            // Doc 61 §4.4 fault-pc invariant: a frame left
-                            // faulting names its faulting instruction, the
-                            // `.call` (as the early checks above leave it).
-                            st.frame.pc = pc - 1;
-                            return parkErr(st, e);
-                        };
-                        reloadTopFrame(st);
-                        // Doc 44: count this SUCCESSFUL Lua-callee entry
-                        // toward the callee's function-head anchor (after the
-                        // push — failed calls never count). A hot verdict
-                        // sets `pending_call_anchor`; the very next prologue
-                        // (the dispatchTail below lands on callee pc 0) arms
-                        // it under `.full` — never here (T-2/T-3 discipline).
-                        // `st.code` is the callee's image, just reloaded above
-                        // — passing it makes the patched steady state hash-free
-                        // (doc 44 D9 S1).
-                        self.trace.onCallEntry(cp, st.base, st.frame.call_seq, st.code);
-                        // A hot verdict under `.fast` needs the `.full`
-                        // prologue's consumer (step 10b) at callee pc 0 —
-                        // park and flip, exactly the back-edge arming
-                        // discipline (`runFastPath` holds `.full` while the
-                        // pending exists; it is consumed on the very next
-                        // prologue, so the stint is one instruction on a
-                        // mismatch).
-                        if (mode == .fast and self.trace.pending_call_anchor != null)
-                            return .switch_mode;
-                        // Reloaded onto the callee frame; tail-dispatch its
-                        // first instruction with a full prologue
-                        // (GC/seq/suspend/recording) — exactly one prologue at
-                        // the call boundary (T-2).
-                        return dispatchTail(mode, st, st.frame.pc, vm);
-                    },
-                    .native => {
-                        const nat = function.Native.fromHeader(callee.asHeap());
-                        const nwanted: usize = instr.c;
-                        // Doc 61 P2: a dynamic argument span can end past the
-                        // window, above `stack_top`. Cover it for the call:
-                        // the GC roots it, and a re-entry lays its window (and
-                        // gathers its natives' scratch) above it. Restored on
-                        // success; an error leaves it raised for the catcher,
-                        // which resets `stack_top` when it discards frames.
-                        const entry_top = self.stack_top;
-                        const args_end = base + a + 1 + nargs;
-                        if (args_end > entry_top) self.stack_top = args_end;
-                        // Doc 61 §4.2: the frame is in flight at this `.call`
-                        // for the native's whole duration, so every frame a
-                        // callback or a host entry pushes above it finds its
-                        // caller marked. Cleared on success; an error leaves it
-                        // set for the catcher, like `stack_top`.
-                        std.debug.assert(!st.frame.in_flight);
-                        st.frame.in_flight = true;
-                        // Materialize the args into the absolute-indexed
-                        // boundary scratch so the native ABI keeps speaking
-                        // `[]Value` after the register file split (SoA). The
-                        // scratch is laid out at the same absolute slot
-                        // indices as the registers, so the `out`-aliases-`args`
-                        // overlap multi natives rely on is preserved exactly;
-                        // nesting is safe because a deeper call parks its own
-                        // args at higher absolute indices.
-                        const args = self.gatherScratch(base + a + 1, base + a + 1 + nargs);
-                        // `all` = the caller wants *every* result (dynamic
-                        // count, the producer half of `print(unpack(t))` /
-                        // `return f()`): results land starting at `regs[a]`
-                        // and `reg_top` records their end for the adjacent
-                        // consumer. Otherwise a concrete `nwanted` is written
-                        // and the tail nil-padded.
-                        //
-                        // Three native shapes, in priority order:
-                        //  1. effect native (clock/getenv/…): one result
-                        //     through the record/replay boundary — effects are
-                        //     inherently single.
-                        //  2. multi-result native: write straight into the
-                        //     destination slots. `out` aliases `args` (see
-                        //     NativeMultiFn), which is why the native reads
-                        //     its args first. For `all`, `out` spans to the
-                        //     end of the register stack (bounded → no OOB; the
-                        //     native caps at `out.len`).
-                        //  3. otherwise (pure single, or a multi native with
-                        //     0/1 wanted): call `func` (the primary-value
-                        //     projection) and write one.
-                        // A native call is a trace barrier (recording aborts
-                        // at it), so none of this touches the JIT.
-                        const all = nwanted == bytecode.all_results;
-                        if (nat.host != null) {
-                            // Embedder host fn (doc 59 §3.5): the results land
-                            // in the destination slots from `regs[a]`. The
-                            // host wrote them to a private buffer
-                            // (`callHostNative`), so they never aliased
-                            // `args` or anything a nested call wrote.
-                            const out_lo = base + a;
-                            const want: usize = if (all) self.regCapacity() -| out_lo else nwanted;
-                            if (out_lo + want > self.regCapacity()) return parkErr(st, Error.StackOverflow);
-                            const res = self.callHostNative(nat, args, want) catch |e| return parkErr(st, e);
-                            const produced = res.len;
-                            // Straight-line from here to the register writes —
-                            // no allocation, so the results (rooted only via
-                            // the host's park/refs) can't be swept mid-copy.
-                            var k: usize = 0;
-                            while (k < produced) : (k += 1) self.regSet(out_lo + k, res[k]);
-                            if (all) {
-                                std.debug.assert(!self.reg_top_pending);
-                                self.reg_top = base + a + produced;
-                                self.reg_top_pending = true;
-                            } else {
-                                while (k < nwanted) : (k += 1) self.regSet(base + a + k, Value.nil());
-                            }
-                        } else if (nat.effect) |kind| {
-                            const result = performEffect(self, kind, nat, args) catch |e| return parkErr(st, e);
-                            if (all) self.stampSingleResult(base, a, result) else writeSingleResult(st.regs, a, nwanted, result);
-                        } else if (nat.multi != null and (all or nwanted >= 2)) {
-                            // `out` aliases `args` in scratch (same overlap as
-                            // the old stack slices); the native writes results
-                            // into scratch, then we scatter them back into the
-                            // registers.
-                            const out = if (all) self.scratchOut(base + a, self.regCapacity()) else self.scratchOut(base + a, base + a + nwanted);
-                            const produced = nat.multi.?(@ptrCast(self), args, out) catch |e| return parkErr(st, narrowError(e));
-                            if (all) {
-                                std.debug.assert(!self.reg_top_pending);
-                                self.scatterScratch(base + a, base + a + produced);
-                                self.reg_top = base + a + produced;
-                                self.reg_top_pending = true;
-                            } else {
-                                var k: usize = produced;
-                                while (k < nwanted) : (k += 1) out[k] = Value.nil();
-                                self.scatterScratch(base + a, base + a + nwanted);
-                            }
-                        } else {
-                            const result = nat.func(@ptrCast(self), args) catch |e| return parkErr(st, narrowError(e));
-                            if (all) self.stampSingleResult(base, a, result) else writeSingleResult(st.regs, a, nwanted, result);
-                        }
-                        st.frame.in_flight = false;
-                        self.stack_top = entry_top;
-                    },
-                    // `__call`: a non-callable heap value (typically a table)
-                    // with a `__call` metamethod is invoked as
-                    // `handler(value, args...)`. The arguments already sit
-                    // contiguously as `[callee, args...]` at `stack[base+a..]`
-                    // — exactly the handler's argument list, so no copy is
-                    // needed; `callValue` reads it before writing results.
-                    // Results honour `nwanted`/`all_results` like the native
-                    // arm. A nil/non-heap callee, or a callee whose `__call`
-                    // chain bottoms out in a non-callable, stays the located
-                    // "attempt to call a <type> value" fault. A `__call` whose
-                    // handler is itself a `__call` table chains through
-                    // `callValue` (bounded by `native_reentry_depth`; a cycle
-                    // surfaces as a catchable StackOverflow, never a hang).
-                    else => {
-                        const handler = self.metamethod(callee, self.mm.call);
-                        if (handler.isNil()) return parkErr(st, Error.TypeError);
-                        const nwanted: usize = instr.c;
-                        // Doc 61 P2, as in the native arm: cover a dynamic
-                        // argument span past the window while the handler runs.
-                        const entry_top = self.stack_top;
-                        const args_end = base + a + 1 + nargs;
-                        if (args_end > entry_top) self.stack_top = args_end;
-                        // `[callee, args...]` is exactly the handler's
-                        // argument list — gather it into the absolute-indexed
-                        // scratch (the result `out` aliases it, same overlap
-                        // as the old stack slices; `callValue` reads its args
-                        // before writing out).
-                        const call_args = self.gatherScratch(base + a, base + a + 1 + nargs);
-                        if (nwanted == bytecode.all_results) {
-                            const n = self.callValue(handler, call_args, self.scratchOut(base + a, self.regCapacity())) catch |e| return parkErr(st, e);
-                            std.debug.assert(!self.reg_top_pending);
-                            self.scatterScratch(base + a, base + a + n);
-                            self.reg_top = base + a + n;
-                            self.reg_top_pending = true;
-                        } else {
-                            const out = self.scratchOut(base + a, base + a + nwanted);
-                            const n = self.callValue(handler, call_args, out) catch |e| return parkErr(st, e);
-                            var k: usize = n;
-                            while (k < nwanted) : (k += 1) out[k] = Value.nil();
-                            self.scatterScratch(base + a, base + a + nwanted);
-                        }
-                        self.stack_top = entry_top;
-                    },
-                }
-                // The native and `__call` arms run inline (no frame push) and
-                // leave `pc` one past the call, exactly like a straight-line
-                // op, so they thread to the next instruction. (The `.function`
-                // arm never reaches here — it tail-dispatches after reloading
-                // onto the callee frame.)
-                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+                return callTail(mode, .call, st, pc, instr, vm, tags, payloads);
             }
         }.h;
+    }
+
+    /// The callee slot of the call `instr` (a `.call` or an `itern`, `of`)
+    /// makes, as `bytecode.callOperandsOf` has it. Read from `instr` at each
+    /// use, like `.call`'s handler always did: holding the operands from the
+    /// top of `callTail` costs `.call` registers across its whole body.
+    inline fn callA(comptime of: bytecode.OpCode, instr: *const Instr) u16 {
+        return if (of == .itern) instr.a + 3 else instr.a;
+    }
+
+    /// The argument count operand of `callA`'s call.
+    inline fn callB(comptime of: bytecode.OpCode, instr: *const Instr) u16 {
+        return if (of == .itern) 2 else instr.b;
+    }
+
+    /// `.call`'s body, shared with `itern`'s fallback (doc 66 P1): `of` names
+    /// the opcode `instr` is, and the operands are the call it makes
+    /// (`callA`/`callB`; `c` is the same field for both).
+    inline fn callTail(comptime mode: ExecMode, comptime of: bytecode.OpCode, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+        comptime std.debug.assert(of == .call or of == .itern);
+        const self = vm;
+        const a: usize = callA(of, instr);
+        const base = st.base;
+        // Resolve the argument count first: nothing before it may
+        // fail. `all_results` (the consumer half of dynamic multret,
+        // e.g. the outer `print` in `print(unpack(t))`) takes every
+        // value the immediately-preceding producer left, from the
+        // first argument slot up to `reg_top`. Taking it clears
+        // `reg_top_pending`, which must not outlive a fault here.
+        // Doc 61 §5 (B): the frame keeps the span's end, so a
+        // collection while it is in flight here (a native or
+        // `__call` callee, or a fault under `xpcall`) masks the
+        // unwritten window above it.
+        const nargs: usize = if (callB(of, instr) == bytecode.all_results) blk: {
+            self.reg_top_pending = false;
+            st.frame.multret_top = @intCast(@min(self.reg_top - base, st.proto.num_registers));
+            break :blk self.reg_top - (base + a + 1);
+        } else callB(of, instr);
+        const callee = st.regs.get(a);
+        if (!callee.isHeap()) return parkErr(st, Error.TypeError);
+        switch (callee.heapType()) {
+            .function => {
+                const cl = Closure.fromHeader(callee.asHeap());
+                const cp = cl.proto;
+                // The callee window sits above the caller's window AND
+                // above the argument span (doc 61 P1, LuaJIT's vararg
+                // frame layout). A dynamic (`all_results`) span can end
+                // past the caller window; laying the callee at the
+                // window end would overwrite the surplus varargs it
+                // then reads, and make the param copy below overlap.
+                // A fixed span always fits, so this is the window end.
+                const callee_base = @max(base + st.proto.num_registers, base + a + 1 + nargs);
+                if (self.depth >= max_call_depth) return parkErr(st, Error.StackOverflow);
+                if (callee_base + cp.num_registers > self.regCapacity()) return parkErr(st, Error.StackOverflow);
+                // Lay out the callee window: bind fixed params
+                // (nil-fill any not supplied), nil the rest.
+                // Straight-line and allocation-free — these slots sit
+                // above the current `stack_top` until `pushFrame`
+                // raises it, so no safepoint may intervene here (none
+                // does).
+                var i: usize = 0;
+                while (i < cp.num_registers) : (i += 1) {
+                    self.regSet(callee_base + i, if (i < cp.num_params and i < nargs)
+                        self.regGet(base + a + 1 + i)
+                    else
+                        Value.nil());
+                }
+                // Varargs cursor: a vararg callee handed more args
+                // than it has fixed params keeps the surplus where
+                // they already sit — below `callee_base`, in the
+                // caller's window or in the span above it. They stay valid (the stack slab never
+                // moves) and GC-rooted (`forEachRootHeader` scans the
+                // whole live prefix) for the callee's lifetime.
+                // Recorded per-callee so a non-vararg or no-surplus
+                // callee gets a zero cursor (never inherits one).
+                const va_count: usize = if (cp.is_vararg and nargs > cp.num_params) nargs - cp.num_params else 0;
+                const va_base: usize = if (va_count > 0) base + a + 1 + cp.num_params else 0;
+                // Freeze the caller's resume cursor (already one past
+                // this call), push the callee, and reload onto it.
+                // Doc 61 §4.3: a caller suspended at a Lua call is
+                // out of flight with `pc` one past a `.call`.
+                std.debug.assert(!st.frame.in_flight);
+                st.frame.pc = pc;
+                self.pushFrameVararg(cl, callee_base, callA(of, instr), instr.c, va_base, va_count) catch |e| {
+                    // Doc 61 §4.4 fault-pc invariant: a frame left
+                    // faulting names its faulting instruction, the
+                    // `.call` (as the early checks above leave it).
+                    st.frame.pc = pc - 1;
+                    return parkErr(st, e);
+                };
+                reloadTopFrame(st);
+                // Doc 44: count this SUCCESSFUL Lua-callee entry
+                // toward the callee's function-head anchor (after the
+                // push — failed calls never count). A hot verdict
+                // sets `pending_call_anchor`; the very next prologue
+                // (the dispatchTail below lands on callee pc 0) arms
+                // it under `.full` — never here (T-2/T-3 discipline).
+                // `st.code` is the callee's image, just reloaded above
+                // — passing it makes the patched steady state hash-free
+                // (doc 44 D9 S1).
+                self.trace.onCallEntry(cp, st.base, st.frame.call_seq, st.code);
+                // A hot verdict under `.fast` needs the `.full`
+                // prologue's consumer (step 10b) at callee pc 0 —
+                // park and flip, exactly the back-edge arming
+                // discipline (`runFastPath` holds `.full` while the
+                // pending exists; it is consumed on the very next
+                // prologue, so the stint is one instruction on a
+                // mismatch).
+                if (mode == .fast and self.trace.pending_call_anchor != null)
+                    return .switch_mode;
+                // Reloaded onto the callee frame; tail-dispatch its
+                // first instruction with a full prologue
+                // (GC/seq/suspend/recording) — exactly one prologue at
+                // the call boundary (T-2).
+                return dispatchTail(mode, st, st.frame.pc, vm);
+            },
+            .native => {
+                const nat = function.Native.fromHeader(callee.asHeap());
+                const nwanted: usize = instr.c;
+                // Doc 61 P2: a dynamic argument span can end past the
+                // window, above `stack_top`. Cover it for the call:
+                // the GC roots it, and a re-entry lays its window (and
+                // gathers its natives' scratch) above it. Restored on
+                // success; an error leaves it raised for the catcher,
+                // which resets `stack_top` when it discards frames.
+                const entry_top = self.stack_top;
+                const args_end = base + a + 1 + nargs;
+                if (args_end > entry_top) self.stack_top = args_end;
+                // Doc 61 §4.2: the frame is in flight at this `.call`
+                // for the native's whole duration, so every frame a
+                // callback or a host entry pushes above it finds its
+                // caller marked. Cleared on success; an error leaves it
+                // set for the catcher, like `stack_top`.
+                std.debug.assert(!st.frame.in_flight);
+                st.frame.in_flight = true;
+                // Materialize the args into the absolute-indexed
+                // boundary scratch so the native ABI keeps speaking
+                // `[]Value` after the register file split (SoA). The
+                // scratch is laid out at the same absolute slot
+                // indices as the registers, so the `out`-aliases-`args`
+                // overlap multi natives rely on is preserved exactly;
+                // nesting is safe because a deeper call parks its own
+                // args at higher absolute indices.
+                const args = self.gatherScratch(base + a + 1, base + a + 1 + nargs);
+                // `all` = the caller wants *every* result (dynamic
+                // count, the producer half of `print(unpack(t))` /
+                // `return f()`): results land starting at `regs[a]`
+                // and `reg_top` records their end for the adjacent
+                // consumer. Otherwise a concrete `nwanted` is written
+                // and the tail nil-padded.
+                //
+                // Three native shapes, in priority order:
+                //  1. effect native (clock/getenv/…): one result
+                //     through the record/replay boundary — effects are
+                //     inherently single.
+                //  2. multi-result native: write straight into the
+                //     destination slots. `out` aliases `args` (see
+                //     NativeMultiFn), which is why the native reads
+                //     its args first. For `all`, `out` spans to the
+                //     end of the register stack (bounded → no OOB; the
+                //     native caps at `out.len`).
+                //  3. otherwise (pure single, or a multi native with
+                //     0/1 wanted): call `func` (the primary-value
+                //     projection) and write one.
+                // A native call is a trace barrier (recording aborts
+                // at it), so none of this touches the JIT.
+                const all = nwanted == bytecode.all_results;
+                if (nat.host != null) {
+                    // Embedder host fn (doc 59 §3.5): the results land
+                    // in the destination slots from `regs[a]`. The
+                    // host wrote them to a private buffer
+                    // (`callHostNative`), so they never aliased
+                    // `args` or anything a nested call wrote.
+                    const out_lo = base + a;
+                    const want: usize = if (all) self.regCapacity() -| out_lo else nwanted;
+                    if (out_lo + want > self.regCapacity()) return parkErr(st, Error.StackOverflow);
+                    const res = self.callHostNative(nat, args, want) catch |e| return parkErr(st, e);
+                    const produced = res.len;
+                    // Straight-line from here to the register writes —
+                    // no allocation, so the results (rooted only via
+                    // the host's park/refs) can't be swept mid-copy.
+                    var k: usize = 0;
+                    while (k < produced) : (k += 1) self.regSet(out_lo + k, res[k]);
+                    if (all) {
+                        std.debug.assert(!self.reg_top_pending);
+                        self.reg_top = base + a + produced;
+                        self.reg_top_pending = true;
+                    } else {
+                        while (k < nwanted) : (k += 1) self.regSet(base + a + k, Value.nil());
+                    }
+                } else if (nat.effect) |kind| {
+                    const result = performEffect(self, kind, nat, args) catch |e| return parkErr(st, e);
+                    if (all) self.stampSingleResult(base, a, result) else writeSingleResult(st.regs, a, nwanted, result);
+                } else if (nat.multi != null and (all or nwanted >= 2)) {
+                    // `out` aliases `args` in scratch (same overlap as
+                    // the old stack slices); the native writes results
+                    // into scratch, then we scatter them back into the
+                    // registers.
+                    const out = if (all) self.scratchOut(base + a, self.regCapacity()) else self.scratchOut(base + a, base + a + nwanted);
+                    const produced = nat.multi.?(@ptrCast(self), args, out) catch |e| return parkErr(st, narrowError(e));
+                    if (all) {
+                        std.debug.assert(!self.reg_top_pending);
+                        self.scatterScratch(base + a, base + a + produced);
+                        self.reg_top = base + a + produced;
+                        self.reg_top_pending = true;
+                    } else {
+                        var k: usize = produced;
+                        while (k < nwanted) : (k += 1) out[k] = Value.nil();
+                        self.scatterScratch(base + a, base + a + nwanted);
+                    }
+                } else {
+                    const result = nat.func(@ptrCast(self), args) catch |e| return parkErr(st, narrowError(e));
+                    if (all) self.stampSingleResult(base, a, result) else writeSingleResult(st.regs, a, nwanted, result);
+                }
+                st.frame.in_flight = false;
+                self.stack_top = entry_top;
+            },
+            // `__call`: a non-callable heap value (typically a table)
+            // with a `__call` metamethod is invoked as
+            // `handler(value, args...)`. The arguments already sit
+            // contiguously as `[callee, args...]` at `stack[base+a..]`
+            // — exactly the handler's argument list, so no copy is
+            // needed; `callValue` reads it before writing results.
+            // Results honour `nwanted`/`all_results` like the native
+            // arm. A nil/non-heap callee, or a callee whose `__call`
+            // chain bottoms out in a non-callable, stays the located
+            // "attempt to call a <type> value" fault. A `__call` whose
+            // handler is itself a `__call` table chains through
+            // `callValue` (bounded by `native_reentry_depth`; a cycle
+            // surfaces as a catchable StackOverflow, never a hang).
+            else => {
+                const handler = self.metamethod(callee, self.mm.call);
+                if (handler.isNil()) return parkErr(st, Error.TypeError);
+                const nwanted: usize = instr.c;
+                // Doc 61 P2, as in the native arm: cover a dynamic
+                // argument span past the window while the handler runs.
+                const entry_top = self.stack_top;
+                const args_end = base + a + 1 + nargs;
+                if (args_end > entry_top) self.stack_top = args_end;
+                // `[callee, args...]` is exactly the handler's
+                // argument list — gather it into the absolute-indexed
+                // scratch (the result `out` aliases it, same overlap
+                // as the old stack slices; `callValue` reads its args
+                // before writing out).
+                const call_args = self.gatherScratch(base + a, base + a + 1 + nargs);
+                if (nwanted == bytecode.all_results) {
+                    const n = self.callValue(handler, call_args, self.scratchOut(base + a, self.regCapacity())) catch |e| return parkErr(st, e);
+                    std.debug.assert(!self.reg_top_pending);
+                    self.scatterScratch(base + a, base + a + n);
+                    self.reg_top = base + a + n;
+                    self.reg_top_pending = true;
+                } else {
+                    const out = self.scratchOut(base + a, base + a + nwanted);
+                    const n = self.callValue(handler, call_args, out) catch |e| return parkErr(st, e);
+                    var k: usize = n;
+                    while (k < nwanted) : (k += 1) out[k] = Value.nil();
+                    self.scatterScratch(base + a, base + a + nwanted);
+                }
+                self.stack_top = entry_top;
+            },
+        }
+        // The native and `__call` arms run inline (no frame push) and
+        // leave `pc` one past the call, exactly like a straight-line
+        // op, so they thread to the next instruction. (The `.function`
+        // arm never reaches here — it tail-dispatches after reloading
+        // onto the callee frame.)
+        return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
     }
 
     // ---- returns ---- pop this frame; copy results into the parent's window

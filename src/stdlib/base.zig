@@ -93,20 +93,28 @@ fn globalNative(vm: *Vm, name: []const u8) anyerror!Value {
 // ---------------------------------------------------------------------------
 
 /// A located key/value pair, or `found == false` at the end of traversal.
-const Step = struct { found: bool, key: Value = undefined, val: Value = undefined };
+pub const Step = struct { found: bool, key: Value = undefined, val: Value = undefined };
+
+/// Who is stepping: the `next` native, or doc 66 P1's `itern` fast lane,
+/// which must not allocate and so declines (`error.WouldAllocate`) where
+/// `next` would build the hash part's sorted view.
+const Stepper = enum { native, no_alloc };
 
 /// The hash key/value after `ctrl` in canonical order (the first one when
 /// `ctrl` is null). Strictly greater, not "find ctrl, then +1", so it stays
 /// correct when the current key was just deleted (Lua permits that during a
 /// traversal). `HashPart.nextLive` keeps the sorted view across the steps.
-fn hashStep(gpa: std.mem.Allocator, t: *Table, ctrl: ?Value) !Step {
+fn hashStep(comptime by: Stepper, gpa: std.mem.Allocator, t: *Table, ctrl: ?Value) !Step {
+    // `nextLive` allocates only to (re)build the view, and only frees it
+    // when the hash part is empty.
+    if (by == .no_alloc and t.hash.live != 0 and !t.hash.iter_valid) return error.WouldAllocate;
     const e = try t.hash.nextLive(gpa, ctrl) orelse return .{ .found = false };
     return .{ .found = true, .key = e.key, .val = e.value_ptr.* };
 }
 
 /// The core of `next(t, ctrl)`: array part (ascending index, skipping nil holes)
 /// then hash part (canonical order).
-fn nextStep(gpa: std.mem.Allocator, t: *Table, ctrl: Value) !Step {
+fn nextStep(comptime by: Stepper, gpa: std.mem.Allocator, t: *Table, ctrl: Value) !Step {
     const n: i64 = @intCast(t.array.asize);
 
     // Table keys are identity-normalized (float-spelled integers and -0.0 fold
@@ -134,9 +142,9 @@ fn nextStep(gpa: std.mem.Allocator, t: *Table, ctrl: Value) !Step {
             if (!v.isNil()) return .{ .found = true, .key = Value.int(i), .val = v };
         }
         // Array part exhausted → first hash key.
-        return hashStep(gpa, t, null);
+        return hashStep(by, gpa, t, null);
     }
-    return hashStep(gpa, t, nctrl);
+    return hashStep(by, gpa, t, nctrl);
 }
 
 /// `next` over a `row_view` (doc 14): ascending columns `1..stride`, skipping
@@ -162,7 +170,30 @@ fn rowViewNextStep(rv: Value, ctrl: Value) Step {
 /// `next(t [, ctrl])` over a table or a `row_view`, dispatching on the container.
 fn nextStepAny(gpa: std.mem.Allocator, container: Value, ctrl: Value) !Step {
     if (container.isRowView()) return rowViewNextStep(container, ctrl);
-    return nextStep(gpa, Table.fromHeader(container.asHeap()), ctrl);
+    return nextStep(.native, gpa, Table.fromHeader(container.asHeap()), ctrl);
+}
+
+/// Doc 66 P1: is `nat` the `next` builtin? By function identity, which the
+/// keyframe restorer preserves (it rebinds natives from the registry).
+pub fn isNext(nat: *const function.Native) bool {
+    return nat.func == &nNext1;
+}
+
+/// Doc 66 P1: `next(container, ctrl)` for `itern`'s fast lane, or null where
+/// the `next` native would do more than step: a non-table argument (which
+/// raises), a grid (which `iterableArg` deflates) or a hash view to build.
+/// The same core as `next` otherwise, so the step is exactly the native's.
+pub fn iternStep(gpa: std.mem.Allocator, container: Value, ctrl: Value) ?Step {
+    if (container.isRowView()) return rowViewNextStep(container, ctrl);
+    if (!container.isHeap() or container.heapType() != .table) return null;
+    const t = Table.fromHeader(container.asHeap());
+    if (t.array.isGrid()) return null;
+    return nextStep(.no_alloc, gpa, t, ctrl) catch |e| switch (e) {
+        error.WouldAllocate => null,
+        // Unreachable: the no-allocation lane declines before `nextLive`
+        // could build anything.
+        error.OutOfMemory => unreachable,
+    };
 }
 
 /// `next(t [, ctrl])` primary projection — the next key only (drives `for k in

@@ -1346,6 +1346,188 @@ test "doc 66 P4: a compare-and-branch fault names its operands in source order" 
     );
 }
 
+test "doc 66 P1: `itern` steps a table exactly as the `next` native does" {
+    // The array part (holes, key 0), the hash part, both and neither; a
+    // second traversal reusing the hash view, and one after an insertion
+    // dropped it; one to five loop variables; deleting the current key and
+    // overwriting another mid-traversal; inserting mid-traversal; `next`
+    // with an integer, a float-spelled and a hash-key control; a grid
+    // (deflated by the fallback's real `next`); nested traversals of one
+    // table; a long mixed traversal allocating per step. The output was
+    // taken on 98aef7f, where every step was the `move`s and a `call next`.
+    try expectProgram(
+        \\local function keys(t)
+        \\  local out = {}
+        \\  for k, v in pairs(t) do out[#out + 1] = tostring(k) .. "=" .. tostring(v) end
+        \\  return table.concat(out, " ")
+        \\end
+        \\local z = { 1, nil, 3, nil, nil, 6 }; z[0] = "z"
+        \\print(keys(z), keys({}))
+        \\print(keys({ x = 1, [true] = "t", [2.5] = "f", 10, [100] = "far" }))
+        \\local h = { a = 1, b = 2 }
+        \\print(keys(h), keys(h))
+        \\h.c = 3
+        \\print(keys(h))
+        \\for k in pairs({ 7 }) do io.write(k, " ") end
+        \\for a, b, c, d, e in pairs({ 7, x = 8 }) do io.write(a, b, tostring(c), tostring(e), " ") end
+        \\print()
+        \\local d = { a = 1, b = 2, c = 3, 5, 6 }
+        \\local seen = 0
+        \\for k in pairs(d) do seen = seen + 1; d[k] = nil; if d.c then d.c = "c" end end
+        \\local g, log = { a = 1 }, {}
+        \\for k in pairs(g) do log[#log + 1] = k; if k == "a" then g.z = 26; g.b = 2 end end
+        \\print(seen, next(d), table.concat(log))
+        \\for k, v in next, { 1, 2, 3 }, 1 do io.write(k, v, " ") end
+        \\for k, v in next, { 1, 2, 3 }, 2.0 do io.write(k, v, " ") end
+        \\local m = { 1, p = "P", q = "Q" }
+        \\for k, v in next, m, next(m, 1) do io.write(k, v, " ") end
+        \\local grid = { { 1, 2 }, { 3, 4 } }
+        \\grid[1][1] = 10
+        \\local rows = 0
+        \\for _, row in pairs(grid) do rows = rows + row[1] end
+        \\local nest, n2 = { a = 1, b = 2 }, 0
+        \\for _ in pairs(nest) do for _ in pairs(nest) do n2 = n2 + 1 end end
+        \\print(rows, n2)
+        \\local big = {}
+        \\for i = 1, 300 do big["k" .. i] = i; big[i] = -i end
+        \\local s1, s2 = 0, 0
+        \\for k, v in pairs(big) do
+        \\  if type(k) == "string" then s1 = s1 + v else s2 = s2 + v end
+        \\  local garbage = { k, v }
+        \\end
+        \\print(s1, s2)
+        \\
+    ,
+        "0=z 1=1 3=3 6=6\t\n" ++
+            "1=10 true=t 100=far 2.5=f x=1\n" ++
+            "a=1 b=2\ta=1 b=2\n" ++
+            "a=1 b=2 c=3\n" ++
+            "1 17nilnil x8nilnil \n" ++
+            "5\tnil\tab\n" ++
+            "22 33 33 qQ 13\t4\n" ++
+            "45150\t-45150\n",
+    );
+}
+
+test "doc 66 P1: `itern` steps a host's `row_view` as `next` does" {
+    // A grid row reaches a program only from a host: `Table.getInt` mints
+    // a `row_view`, but source-level indexing and `ipairs` deflate the grid
+    // first. `rowof` stands in for that host. `opIternSlow` steps the row
+    // through `stdbase.iternStep`. The output was taken on 98aef7f, whose
+    // GC-stress legs crashed here: the register root walk skipped a
+    // `row_view`, so `rowof(g, 1)`'s grid, dead after the call, was swept
+    // under the loop stepping its row (`forEachKeptRegister`).
+    const Host = struct {
+        fn rowOf(_: *anyopaque, args: []const Value) anyerror!Value {
+            const t = table.Table.fromHeader(args[0].asHeap());
+            if (!t.array.isGrid()) return Value.nil();
+            return t.getInt(args[1].asInt());
+        }
+        fn install(vm: *interp.Vm) anyerror!void {
+            const native = try vm.heap.newNative(&rowOf, "rowof");
+            try vm.globals.set(vm.heap.gpa, try vm.heap.internValue("rowof"), Value.heap(&native.header));
+        }
+    };
+    try util.expectProgramTuned(
+        \\local g = { { 1, 2, 3 }, { 4, 5, 6 } }
+        \\local i, j = 2, 2
+        \\g[i][j] = 50
+        \\local r = rowof(g, 2)
+        \\local out = {}
+        \\for k, v in pairs(r) do out[#out + 1] = k .. "=" .. v end
+        \\for k, v, x in next, r, 1 do out[#out + 1] = k .. v .. tostring(x) end
+        \\for k in next, r, 3 do out[#out + 1] = "after3" end
+        \\for k in pairs(rowof(g, 1)) do out[#out + 1] = k end
+        \\print(r ~= nil, table.concat(out, " "))
+        \\local h, a = { { 7, 8 } }, 1
+        \\h[a][a] = 70
+        \\local hr = rowof(h, 1)
+        \\h = nil
+        \\local junk = { {}, {} }
+        \\print(next(hr, 1))
+        \\
+    , "true\t1=4 2=50 3=6 250nil 36nil 1 2 3\n2\t8\n", .{ .setup = Host.install });
+}
+
+test "doc 66 P1: any other iterator is the call `itern` replaced" {
+    // `ipairs`, `gmatch`, a closure, a `__call` table, a local shadowing
+    // `next`, `next` over a table with `__index` (raw, as before), and the
+    // faults: each message and line as the `call` gave them (98aef7f).
+    try expectProgram(
+        \\for i, v in ipairs({ "a", "b", nil, "d" }) do io.write(i, v, " ") end
+        \\for w, n in string.gmatch("a1 b22", "(%a)(%d+)") do io.write(w, n, " ") end
+        \\local function range(s, c) if c < s then return c + 1 end end
+        \\for i in range, 3, 0 do io.write(i, " ") end
+        \\local callable = setmetatable({}, { __call = function(_, s, c) if c < s then return c + 1, "c" end end })
+        \\for i, v in callable, 2, 0 do io.write(i, v, " ") end
+        \\print()
+        \\do
+        \\  local next = function(t, k) if k == nil then return "only", t end end
+        \\  for k, v in next, {} do io.write(k, type(v), " ") end
+        \\end
+        \\local count = 0
+        \\for _ in next, setmetatable({ 1, 2 }, { __index = function() return "x" end }) do count = count + 1 end
+        \\print(count)
+        \\local function err(f) print(select(2, pcall(f))) end
+        \\err(function() for k in next, 5 do end end)
+        \\err(function() for k in nil do end end)
+        \\err(function() for k in 42, 1 do end end)
+        \\print(pcall(function() for k in next, {}, "absent" do end end))
+        \\
+    ,
+        "1a 2b a1 b22 1 2 3 1c 2c \n" ++
+            "onlytable 2\n" ++
+            "anonymous:16: bad argument #1 to 'next' (table expected, got number)\n" ++
+            "anonymous:17: attempt to call a nil value\n" ++
+            "anonymous:18: attempt to call a number value\n" ++
+            "true\n",
+    );
+}
+
+test "doc 66 P1: one generic `for` traced with `gmatch` keeps its trace across `pairs`" {
+    // One compiled loop driven by `gmatch`, then by `pairs` and `next`,
+    // then by `gmatch` with another pattern and the first one again. The
+    // `gmatch` step records (the fallback is the `call` it replaced, and its
+    // builtin guard pins the callee), so a `next` in the same slot exits; a
+    // `next` step aborts its own recording as `.itern_next`, never as an
+    // unknown opcode.
+    const Inspect = struct {
+        fn run(vm: *interp.Vm, mode: util.TraceMode) anyerror!void {
+            if (mode == .off) return;
+            for (vm.trace.abort_log.items) |r| {
+                if (r.op == .itern) try testing.expectEqual(trace.AbortReason.itern_next, r.reason);
+            }
+            // Under GC stress this loop keeps no trace, on 98aef7f as well
+            // (TODO.md); the assertion is about the iterator, not that.
+            if (mode != .record_execute_native or vm.heap.gc_stress) return;
+            var compiled = false;
+            for (vm.trace.registry.cache.items) |t| {
+                if (!std.mem.eql(u8, t.code.anchor.proto.name, "walk")) continue;
+                if (t.native == .compiled) compiled = true;
+            }
+            try testing.expect(compiled);
+        }
+    };
+    try util.expectProgramTuned(
+        \\local function walk(f, s, c)
+        \\  local n, acc = 0, 0
+        \\  for k, v in f, s, c do
+        \\    n = n + 1
+        \\    acc = acc + #k
+        \\  end
+        \\  return n, acc
+        \\end
+        \\local text = string.rep("ab cde ", 150)
+        \\local t = { alpha = 1, beta = 2, gamma = 3, delta = 4, eps = 5, zeta = 6, eta = 7, theta = 8, iota = 9, kappa = 10 }
+        \\print(walk(string.gmatch(text, "%a+")))
+        \\print(walk(pairs(t)))
+        \\print(walk(next, t))
+        \\print(walk(string.gmatch(text, "(%a)%a*")))
+        \\print(walk(string.gmatch(text, "%a+")))
+        \\
+    , "300\t750\n10\t43\n10\t43\n300\t300\n300\t750\n", .{ .record_aborts = true, .inspect = Inspect.run });
+}
+
 test "float text: print, tostring and .. agree, exponent form at the extremes" {
     // One renderer (`io.formatFloat`) behind all three. Positional text at
     // the extremes ran to 330 bytes and overran the fixed buffers `tostring`

@@ -115,6 +115,21 @@ pub fn successors(ins: Instr, pc: u32, code_len: usize) [2]?u32 {
     return effectOf(ins, pc, code_len).succ;
 }
 
+/// Doc 66 P1: `itern` reads f, s and ctrl. Both lanes write the `c` loop
+/// variables; only the fallback's copies write R[a+3+c..a+6) when `c < 3`,
+/// so those are not a kill (nothing ever reads them). Out of line: as an
+/// inline arm it cost `effectOf` spills on every instruction
+/// (`compile_multret_chain` +0.26%), and this way `effectOf` compiles to
+/// under half its former size (-4.3% there). Why is TODO.md's.
+fn iternEffect(ins: Instr, next: ?u32) Effect {
+    var e: Effect = .{};
+    const a: u32 = ins.a;
+    e.useRange(a, a + 3);
+    e.kill(a + 3, a + 3 + @as(u32, ins.c));
+    e.succ[0] = next;
+    return e;
+}
+
 fn effectOf(ins: Instr, pc: u32, code_len: usize) Effect {
     var e: Effect = .{};
     const next: ?u32 = if (pc + 1 < code_len) pc + 1 else null;
@@ -235,6 +250,7 @@ fn effectOf(ins: Instr, pc: u32, code_len: usize) Effect {
             if (ins.c != bytecode.all_results) e.kill(a, a + @as(u32, ins.c));
             e.succ[0] = next;
         },
+        .itern => return @call(.never_inline, iternEffect, .{ ins, next }),
         .ret => {
             e.useRange(a, if (ins.b == bytecode.all_results) to_top else a + @as(u32, ins.b));
             // No successor: the frame is gone.
@@ -435,6 +451,7 @@ fn visit(
 ///  * the **call-layout check**: after every `.call (a, b, c)`, a register
 ///    at or above `a` that is live and not captured is one of the call's
 ///    result slots (`a ≤ r < a + c`; every `r ≥ a` for `c = all_results`).
+///    An `itern` is checked as the call it makes (`callOperandsOf`).
 /// The second is what lets the collector mask a caller suspended at a call
 /// with `live_in[p] ∩ [0, a)` (§4.3), and a frame in flight at a multret
 /// consumer with `live_in[p] ∩ [0, top)` (§5 (B), see the loop). The compiler allocates a call at the
@@ -460,8 +477,8 @@ pub fn maskable(
             if (uv.in_stack and uv.index < num_registers) setBit(captured, uv.index);
         }
     }
-    for (code, 0..) |ins, pc| {
-        if (ins.op != .call) continue;
+    for (code, 0..) |code_ins, pc| {
+        const ins = bytecode.callOperandsOf(code_ins) orelse continue;
         if (ins.c == bytecode.all_results) {
             // §5 (B): a frame in flight at a multret consumer is masked to
             // its dynamic span, so nothing at or above the consumer's base
