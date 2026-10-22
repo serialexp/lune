@@ -300,10 +300,51 @@ pub fn emitShift(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: P
     if (dst == .mem) try a.movMemReg(.rsp, dst.mem, W);
 }
 
-/// Lower a comparison `dst = pa <cc> pb` reading operands in place. Needs a register
-/// on the left of `cmp`; stages `a` through rax only when it is spilled. The Bool
-/// result lands in `dst` via setcc+movzx.
-pub fn emitCompare(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Place) !void {
+/// The condition the flags satisfy after `emitCompareFlags` exactly when
+/// compare `op` holds, for operands of kind `kind` (the compare's `a`). A
+/// float `==`/`~=` has none (its NaN rule reads ZF and PF), so it is never
+/// lowered to flags alone (`ngalloc.isFlagsCompare`).
+pub fn compareCond(op: trace.IrOp, kind: Kind) x64.Cond {
+    if (kind == .float) return switch (op) {
+        // `ucomisd rhs, lhs`: CF==0 && ZF==0 is rhs > lhs; a NaN sets CF.
+        .lt => .a,
+        .le => .ae,
+        else => unreachable,
+    };
+    return switch (op) {
+        .eq => .e,
+        .ne => .ne,
+        .lt => .l,
+        .le => .le,
+        else => unreachable,
+    };
+}
+
+/// The condition that holds exactly when `cc` does not.
+pub fn invertCond(cc: x64.Cond) x64.Cond {
+    // x86 pairs every condition with its negation in the low bit.
+    return @enumFromInt(@intFromEnum(cc) ^ 1);
+}
+
+/// Set the flags for compare `op` over operands of kind `kind` without
+/// materializing the bool; `compareCond(op, kind)` reads them. The guard
+/// after a flags compare (`Loc.flags`) branches on them directly.
+pub fn emitCompareFlags(a: *x64.Assembler, op: trace.IrOp, kind: Kind, pa: Place, pb: Place) !void {
+    switch (kind) {
+        .float => {
+            std.debug.assert(op == .lt or op == .le);
+            try floatOperandToXmm(a, XMM_SCRATCH0, pa, .float); // lhs
+            try floatOperandToXmm(a, XMM_SCRATCH1, pb, .float); // rhs
+            try a.ucomisdRegReg(XMM_SCRATCH1, XMM_SCRATCH0);
+        },
+        .ptr, .heap => try heapCompareFlags(a, pa, pb),
+        else => try intCompareFlags(a, pa, pb),
+    }
+}
+
+/// `cmp pa, pb` over two int-like operands read in place. Needs a register on
+/// the left of `cmp`; stages `a` through rax only when it is spilled.
+fn intCompareFlags(a: *x64.Assembler, pa: Place, pb: Place) !void {
     const lhs: Reg = switch (pa) {
         .reg => |r| r,
         .mem => |d| blk: {
@@ -317,13 +358,10 @@ pub fn emitCompare(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb:
         .mem => |d| try a.cmpRegMem(lhs, .rsp, d),
         .xmm => unreachable, // F1 admits only int compare operands (float compare is F2)
     }
-    const cc: x64.Cond = switch (op) {
-        .eq => .e,
-        .ne => .ne,
-        .lt => .l,
-        .le => .le,
-        else => unreachable,
-    };
+}
+
+/// Materialize condition `cc` as a 0/1 bool in `dst` (setcc+movzx).
+fn condToPlace(a: *x64.Assembler, cc: x64.Cond, dst: Place) !void {
     switch (dst) {
         .reg => |R| {
             try a.setcc(cc, R);
@@ -338,30 +376,29 @@ pub fn emitCompare(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb:
     }
 }
 
+/// Lower a comparison `dst = pa <cc> pb` reading operands in place. The Bool
+/// result lands in `dst` via setcc+movzx.
+pub fn emitCompare(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Place) !void {
+    try intCompareFlags(a, pa, pb);
+    try condToPlace(a, compareCond(op, .int), dst);
+}
+
 /// Lower heap-reference equality by stable `GcHeader.id`. Process-address
 /// equality is not mahina identity: keyframe restore deliberately rebuilds the
 /// graph at new addresses while preserving IDs. Both operand kinds (`.ptr` and
 /// `.heap`) hold a non-null raw `*GcHeader` in a GP home.
 pub fn emitHeapCompare(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Place) !void {
     std.debug.assert(op == .eq or op == .ne);
+    try heapCompareFlags(a, pa, pb);
+    try condToPlace(a, compareCond(op, .heap), dst);
+}
+
+fn heapCompareFlags(a: *x64.Assembler, pa: Place, pb: Place) !void {
     try placeToReg(a, .rax, pa);
     try a.movRegMem32(.rax, .rax, layout.GCHEADER_ID_OFF);
     try placeToReg(a, .rcx, pb);
     try a.movRegMem32(.rcx, .rcx, layout.GCHEADER_ID_OFF);
     try a.cmpRegReg(.rax, .rcx);
-    const cc: x64.Cond = if (op == .eq) .e else .ne;
-    switch (dst) {
-        .reg => |R| {
-            try a.setcc(cc, R);
-            try a.movzxRegReg8(R, R);
-        },
-        .mem => |D| {
-            try a.setcc(cc, .rax);
-            try a.movzxRegReg8(.rax, .rax);
-            try a.movMemReg(.rsp, D, .rax);
-        },
-        .xmm => unreachable,
-    }
 }
 
 /// Lower a float comparison `dst = pa <cc> pb` (both operands proven `.float`; mixed

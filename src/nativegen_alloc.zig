@@ -43,6 +43,10 @@ pub const Loc = union(enum) {
     reg: Reg, // a general-purpose register (int/bool/ptr/aref)
     xmm: Reg, // an XMM register (float) — same 0..15 index space, disjoint pool
     spill: u32, // frame slot index; byte displacement = index * 8 (kind-agnostic 8-B cell)
+    /// A compare that lives only in the CPU flags, from its `cmp` to the
+    /// `guard_true`/`guard_false` right after it, which branches on them
+    /// (`isFlagsCompare`). It has no home, so nothing but that guard reads it.
+    flags,
 };
 
 /// How a slot participates in the loop, deciding its prologue/back-edge/EXIT handling.
@@ -284,6 +288,8 @@ pub fn isCommutative(op: trace_ir.IrOp) bool {
 
 /// Whether two `Loc`s name the same physical home (register or spill slot).
 pub fn locEql(x: Loc, y: Loc) bool {
+    // A flags compare has no home, so it shares one with nothing.
+    if (x == .flags or y == .flags) return false;
     return Place.eql(locToPlace(x), locToPlace(y));
 }
 
@@ -1222,6 +1228,13 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     var active_len: usize = 0;
     var active_xmm: [XMM_ALLOC_ORDER.len]struct { reg: Reg, last: u32 } = undefined;
     var active_xmm_len: usize = 0;
+    // The refs some snapshot captures, for `isFlagsCompare`: an exit that
+    // materializes a value needs it in a home.
+    const named = try gpa.alloc(bool, n);
+    defer gpa.free(named);
+    @memset(named, false);
+    for (t.snapshot_slots) |ss| named[ss.ref] = true;
+    for (t.exit_snapshot_slots) |ss| named[ss.ref] = true;
     for (t.instrs, 0..) |ins, i| {
         if (!isTransient(ins.op)) continue;
         // A `.none` value (a konst only an href key or an exit snapshot
@@ -1257,6 +1270,10 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         // A run-once preheader value already has a computed home (pinned above, its
         // register reserved out of the pool) — never reallocate or expire it.
         if (is_computed[i]) continue;
+        if (isFlagsCompare(t, kinds, last_use, named, i)) {
+            loc[i] = .flags;
+            continue;
+        }
 
         // [Phase D] A float transient draws from the XMM pool. Operand coalescing
         // (win 1) is disabled for floats (the value always lands in a scratch XMM
@@ -1337,6 +1354,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                     seen_xmm |= b;
                 },
                 .spill => {},
+                .flags => unreachable, // a slot home is a register or a cell
             }
         }
         // Computed homes (preheader values + internal φs) are also register-disjoint
@@ -1355,6 +1373,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                     seen_xmm |= b;
                 },
                 .spill => {},
+                .flags => unreachable, // a computed home is a register or a cell
             }
         }
         // [Phase 2] Invariant array-base homes are register-disjoint from slot homes,
@@ -1378,7 +1397,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             switch (loc[i]) {
                 .reg => |r| std.debug.assert(home_reg_mask & regBit(r) == 0),
                 .xmm => |r| std.debug.assert(home_xmm_mask & regBit(r) == 0),
-                .spill => {},
+                .spill, .flags => {},
             }
         }
         // every slot-bound φ's back-edge update ref has a concrete location (always does)
@@ -1517,7 +1536,33 @@ pub fn locToPlace(l: Loc) Place {
         .reg => |r| .{ .reg = r },
         .xmm => |r| .{ .xmm = r },
         .spill => |idx| .{ .mem = @as(i32, @intCast(idx)) * 8 },
+        // Only its guard reads a flags compare, and that guard branches on
+        // the flags without asking for a place.
+        .flags => unreachable,
     };
+}
+
+/// True iff compare `i` can live in the flags (`Loc.flags`): its one reader is
+/// the `guard_true`/`guard_false` right after it, and no snapshot names it, so
+/// the guard lowers to one `jcc` and the bool never needs a register,
+/// `setcc`/`movzx` or a re-test. LuaJIT's comparisons are guards outright
+/// (`lj_asm_x86.h` `asm_comp`); this is the same lowering for a compare the
+/// recorder emitted next to its guard. Not a float `==`/`~=`: its NaN rule
+/// reads two flags (ZF and PF), which no single `jcc` tests. `last_use`
+/// must be final (every reader and liveness extension applied); `named`
+/// marks the refs a snapshot captures.
+fn isFlagsCompare(t: *const Trace, kinds: []const Kind, last_use: []const u32, named: []const bool, i: usize) bool {
+    const ins = t.instrs[i];
+    switch (ins.op) {
+        .eq, .ne, .lt, .le => {},
+        else => return false,
+    }
+    if (kinds[i] != .bool) return false;
+    if ((ins.op == .eq or ins.op == .ne) and kinds[ins.a] == .float) return false;
+    if (i + 1 >= t.instrs.len) return false;
+    const g = t.instrs[i + 1];
+    if ((g.op != .guard_true and g.op != .guard_false) or g.a != i) return false;
+    return last_use[i] == i + 1 and !named[i];
 }
 
 /// Doc 57: true iff some instruction reads `ref` other than a value pin on it

@@ -270,3 +270,122 @@ test "doc 57 native: malformed pins and unstable carried bools bail" {
         try expectBail(&t);
     }
 }
+
+// A compare whose one reader is the guard right after it lowers to `cmp` +
+// one `jcc` (`Loc.flags`, `ngalloc.isFlagsCompare`). `c = (i + 1) OP k` (or
+// `k OP (i + 1)` when `swap`), guarded by `pol`, inside `for i..limit`.
+fn flagsLoop(op: trace.IrOp, pol: trace.IrOp, swap: bool) [13]I {
+    const l: u16 = if (swap) 6 else 5;
+    const r: u16 = if (swap) 5 else 6;
+    return .{
+        .{ .op = .slot_load, .aux = 1 }, // 0: i
+        .{ .op = .slot_load, .aux = 2 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .konst, .aux = 0 }, // 4: 1
+        .{ .op = .add, .a = 0, .b = 4 }, // 5: i + 1
+        .{ .op = .konst, .aux = 1 }, // 6: k
+        .{ .op = op, .a = l, .b = r }, // 7: the compare
+        .{ .op = pol, .a = 7 }, // 8
+        .{ .op = .le, .a = 5, .b = 1 }, // 9
+        .{ .op = .guard_true, .a = 9 }, // 10
+        .{ .op = .phi, .b = 5, .aux = 1 }, // 11
+        .{ .op = .loop }, // 12
+    };
+}
+
+test "native: a compare read only by the next guard lives in the flags" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const nil = Value.nil();
+    for ([_]trace.IrOp{ .eq, .ne, .lt, .le }) |op| {
+        for ([_]trace.IrOp{ .guard_true, .guard_false }) |pol| {
+            for ([_]bool{ false, true }) |swap| {
+                var instrs = flagsLoop(op, pol, swap);
+                var consts = [_]Value{ Value.int(1), Value.int(7) };
+                var es = [_]u16{};
+                const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+                var kinds: [instrs.len]Kind = undefined;
+                var slot_of: [instrs.len]i32 = undefined;
+                var al = try analyzed(&t, &kinds, &slot_of);
+                defer al.deinit(testing.allocator);
+                try testing.expect(al.loc[7] == .flags);
+                // The loop's own `le` (9) is fused as well.
+                try testing.expect(al.loc[9] == .flags);
+
+                // Starting points on both sides of k and at it, so each
+                // guard passes for a while, fails at once, or never fails.
+                for ([_]i64{ -3, 5, 6, 7, 30 }) |start| {
+                    try expectMatch(&t, &.{ nil, Value.int(start), Value.int(12) });
+                }
+            }
+        }
+    }
+}
+
+test "native: a float order compare lives in the flags and keeps NaN false" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const nil = Value.nil();
+    for ([_]trace.IrOp{ .lt, .le, .eq }) |op| {
+        for ([_]trace.IrOp{ .guard_true, .guard_false }) |pol| {
+            // r3 OP r4 over two invariant floats, guarded, inside `for i..limit`.
+            var instrs = [_]I{
+                .{ .op = .slot_load, .aux = 1 }, // 0: i
+                .{ .op = .slot_load, .aux = 2 }, // 1: limit
+                .{ .op = .guard_int, .a = 0 }, // 2
+                .{ .op = .guard_int, .a = 1 }, // 3
+                .{ .op = .slot_load, .aux = 3 }, // 4: x
+                .{ .op = .slot_load, .aux = 4 }, // 5: y
+                .{ .op = .guard_float, .a = 4 }, // 6
+                .{ .op = .guard_float, .a = 5 }, // 7
+                .{ .op = op, .a = 4, .b = 5 }, // 8
+                .{ .op = pol, .a = 8 }, // 9
+                .{ .op = .konst, .aux = 0 }, // 10: 1
+                .{ .op = .add, .a = 0, .b = 10 }, // 11: i + 1
+                .{ .op = .le, .a = 11, .b = 1 }, // 12
+                .{ .op = .guard_true, .a = 12 }, // 13
+                .{ .op = .phi, .b = 11, .aux = 1 }, // 14
+                .{ .op = .loop }, // 15
+            };
+            var consts = [_]Value{Value.int(1)};
+            var es = [_]u16{};
+            const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+            var kinds: [instrs.len]Kind = undefined;
+            var slot_of: [instrs.len]i32 = undefined;
+            var al = try analyzed(&t, &kinds, &slot_of);
+            defer al.deinit(testing.allocator);
+            // A float `==` needs ZF and PF, so it keeps its bool.
+            try testing.expectEqual(op != .eq, al.loc[8] == .flags);
+
+            const nan = std.math.nan(f64);
+            const pairs = [_][2]f64{ .{ 1.5, 2.5 }, .{ 2.5, 2.5 }, .{ 3.5, 2.5 }, .{ nan, 2.5 }, .{ 2.5, nan }, .{ -0.0, 0.0 } };
+            for (pairs) |xy| {
+                try expectMatch(&t, &.{ nil, Value.int(0), Value.int(5), Value.float(xy[0]), Value.float(xy[1]) });
+            }
+        }
+    }
+}
+
+test "native: a compare with another reader keeps its bool" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const nil = Value.nil();
+    // `flagsLoop`, with the compare also written back to r3 by a φ.
+    var base = flagsLoop(.lt, .guard_true, false);
+    var instrs: [14]I = undefined;
+    @memcpy(instrs[0..12], base[0..12]);
+    instrs[12] = .{ .op = .phi, .b = 7, .aux = 3 };
+    instrs[13] = .{ .op = .loop };
+    var consts = [_]Value{ Value.int(1), Value.int(7) };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    var kinds: [instrs.len]Kind = undefined;
+    var slot_of: [instrs.len]i32 = undefined;
+    var al = try analyzed(&t, &kinds, &slot_of);
+    defer al.deinit(testing.allocator);
+    try testing.expect(al.loc[7] != .flags);
+    for ([_]i64{ 0, 6, 30 }) |start| {
+        try expectMatch(&t, &.{ nil, Value.int(start), Value.int(12), nil });
+    }
+}

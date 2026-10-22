@@ -41,6 +41,8 @@ fn expectPlace(row: nativegen.ExitLoc, loc: ngalloc.Loc) !void {
             try testing.expectEqual(nativegen.ExitLoc.Tag.spill, row.tag);
             try testing.expectEqual(idx * 8, row.payload);
         },
+        // No exit materializes a flags compare (`isFlagsCompare`).
+        .flags => return error.FlagsCompareAtExit,
     }
 }
 

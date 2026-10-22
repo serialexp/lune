@@ -636,6 +636,9 @@ const emitShift = emit.emitShift;
 const emitCompare = emit.emitCompare;
 const emitHeapCompare = emit.emitHeapCompare;
 const emitFloatCompare = emit.emitFloatCompare;
+const emitCompareFlags = emit.emitCompareFlags;
+const compareCond = emit.compareCond;
+const invertCond = emit.invertCond;
 const floatOperandToXmm = emit.floatOperandToXmm;
 const emitFloatBinOp = emit.emitFloatBinOp;
 const boxedTagSpill = emit.boxedTagSpill;
@@ -1276,7 +1279,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 // proveKinds pins the pair to both-numeric or, for eq/ne, two
                 // heap-reference kinds. Heap identity is stable GcHeader.id, not
                 // process address (keyframe restore preserves the former only).
-                if (kinds[ins.a] == .float) {
+                if (alloc.loc[i] == .flags) {
+                    // Only the guard right after reads it (`isFlagsCompare`):
+                    // set the flags and let it branch on them.
+                    try emitCompareFlags(a, ins.op, kinds[ins.a], placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
+                } else if (kinds[ins.a] == .float) {
                     try emitFloatCompare(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
                 } else if (kinds[ins.a] == .ptr or kinds[ins.a] == .heap) {
                     try emitHeapCompare(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
@@ -2104,7 +2111,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 // Every non-bool proven value is statically truthy (only
                 // nil/false are falsy in Lua) → guard always passes (no-op).
                 .int, .float, .ptr, .func, .native, .heap => {},
-                .bool => {
+                .bool => if (alloc.loc[ins.a] == .flags) {
+                    const c = t.instrs[ins.a];
+                    try jccNativeExit(a, exit_labels, i, invertCond(compareCond(c.op, kinds[c.a]))); // false → side-exit
+                } else {
                     switch (placeOfRef(alloc, ins.a)) {
                         .reg => |r| try a.cmpRegImm32(r, 0),
                         .mem => |d| try a.cmpQwordMemImm8(.rsp, d, 0),
@@ -2118,7 +2128,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 .nil => {},
                 // A non-bool proven value is never falsy → always side-exit.
                 .int, .float, .ptr, .func, .native, .heap => try jmpNativeExit(a, exit_labels, i),
-                .bool => {
+                .bool => if (alloc.loc[ins.a] == .flags) {
+                    const c = t.instrs[ins.a];
+                    try jccNativeExit(a, exit_labels, i, compareCond(c.op, kinds[c.a])); // true → side-exit
+                } else {
                     switch (placeOfRef(alloc, ins.a)) {
                         .reg => |r| try a.cmpRegImm32(r, 0),
                         .mem => |d| try a.cmpQwordMemImm8(.rsp, d, 0),
