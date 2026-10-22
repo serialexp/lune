@@ -19,6 +19,8 @@ import {
   visibleGlobals,
   setScriptArgs,
   execLogFor,
+  sourceLineOf,
+  traceSourceMapped,
 } from "../src/store";
 import type { TraceExecLogOutput } from "../src/gen/generated";
 
@@ -29,14 +31,33 @@ test("loadBytes populates the store and auto-selects the first trace", () => {
   loadBytes("counting-loop.mahinatrace", bytes);
   expect(state.error).toBeNull();
   expect(state.fileName).toBe("counting-loop.mahinatrace");
-  expect(state.version).toBe(5); // v5: traces carry their stable Trace.id
+  expect(state.version).toBe(6); // v6: instructions map back to their bytecode
   expect(state.traces.length).toBe(1);
   expect(state.selected).toBe(0);
 
   const t = selectedTrace();
   expect(t).not.toBeNull();
   expect(t!.anchorPc).toBe(5);
-  expect(t!.instrs.length).toBe(21);
+  expect(t!.instrs.length).toBe(24);
+});
+
+test("a loaded trace is never mapped through the last run's disassembly", () => {
+  // Its proto ids belong to whatever compile produced the file, not this run.
+  loadBytes("counting-loop.mahinatrace", bytes);
+  expect(state.tracesFromRun).toBe(false);
+  expect(traceSourceMapped()).toBe(false);
+});
+
+test("sourceLineOf resolves a bytecode position through the disassembly", () => {
+  const disasm = [
+    { id: 0, name: "main", numParams: 0, numRegisters: 1, instrs: [{ line: 1, text: "" }, { line: 4, text: "" }] },
+    { id: 3, name: "f", numParams: 0, numRegisters: 1, instrs: [{ line: 9, text: "" }] },
+  ];
+  expect(sourceLineOf(disasm, { protoId: 0, pc: 1 })).toBe(4);
+  expect(sourceLineOf(disasm, { protoId: 3, pc: 0 })).toBe(9);
+  expect(sourceLineOf(disasm, { protoId: 7, pc: 0 })).toBe(0); // no such proto
+  expect(sourceLineOf(disasm, { protoId: 0, pc: 5 })).toBe(0); // pc out of range
+  expect(sourceLineOf(disasm, null)).toBe(0);
 });
 
 test("loadBytes on garbage records an error, not a crash", () => {

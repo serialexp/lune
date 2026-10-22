@@ -105,6 +105,15 @@ try {
     await page.locator(".run-stdout").filter({ hasText: "sum\t1001000" }).waitFor({ timeout });
   });
 
+  await step("a trace's IR rows map back to source lines", async () => {
+    // The loop is all on line 2: the trace list says so, and hovering the
+    // body's `mul` marks line 2 in the editor.
+    await page.locator(".trace-row .anchor").filter({ hasText: "from line 2" }).waitFor({ timeout });
+    await page.locator("table.ir tbody tr", { has: page.locator("td.op", { hasText: /^mul$/ }) }).first().hover();
+    const marked = (await page.locator(".cm-trace-line").innerText()).trim();
+    if (!marked.startsWith("for i = 1, 1000")) throw new Error(`marked editor line is "${marked}"`);
+  });
+
   await step("Run both + diff finds wasm and native agree", async () => {
     await page.getByRole("button", { name: "Run both + diff" }).click();
     const verdict = page.locator(".diff-verdict");

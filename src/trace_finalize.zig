@@ -253,6 +253,15 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
         &.{};
     errdefer if (rec_path_owned.len != 0) gpa.free(rec_path_owned);
 
+    // The ordinal → source map for the visualiser. Fail-soft and diagnostic:
+    // an overflowed ordinal space would map late instructions to the wrong
+    // bytecode, so it (like an OOM) commits no map at all.
+    const src_by_ord_owned: []ProgramPoint = if (rec.src_by_ord_ok and !rec.exit_ord_overflow and rec.src_by_ord.items.len != 0)
+        (gpa.dupe(ProgramPoint, rec.src_by_ord.items) catch &.{})
+    else
+        &.{};
+    errdefer if (src_by_ord_owned.len != 0) gpa.free(src_by_ord_owned);
+
     assertWellFormed(fields.instrs, fields.consts.len, rec.anchor_num_registers, @as(usize, rec.anchor_num_registers) + rec.input_seeds.items.len, rec.precise);
 
     var entry_guards: std.ArrayListUnmanaged(EntryGuard) = .empty;
@@ -428,6 +437,7 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
         .exit_prov_complete = exit_prov_complete,
         .rec_path = rec_path_owned,
         .rec_path_complete = rec_path_complete,
+        .src_by_ord = src_by_ord_owned,
         .alloc_bound = rec.alloc_count,
         .requires_unicode_pin = requires_unicode_pin,
         .unrolled_while = rec.unrolled_while,

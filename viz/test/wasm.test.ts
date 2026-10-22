@@ -17,6 +17,7 @@ import { instantiateMahinaFromBytes, type MahinaModule } from "../src/wasm/mahin
 import { decodeTraceFile, decodeExecLogFile } from "../src/decode";
 import { ExecEventKind } from "../src/exec";
 import { viewsOf } from "../src/disasm";
+import { sourceLineOf } from "../src/store";
 import { decodeSnapshot } from "../src/snapshot";
 import { diffRuns } from "../src/diff";
 import { CoverageFileDecoder } from "../src/gen/generated";
@@ -95,6 +96,25 @@ test("records a decodable trace for a hot loop", () => {
   const file = decodeTraceFile(result.trace);
   const views = viewsOf(file);
   expect(views.length).toBeGreaterThan(0);
+});
+
+test("a run's trace maps its instructions and loop back to source lines", () => {
+  const result = mod.runSource("local s = 0\nfor i = 1, 300 do\n  s = s + i * 3\nend\nprint(s)\n");
+  expect(result.status).toBe(0);
+  const views = viewsOf(decodeTraceFile(result.trace));
+  expect(views.length).toBeGreaterThan(0);
+  const t = views[0];
+  // The anchor is the loop header — the first body bytecode, on line 3 — and
+  // the body's `mul` is `i * 3`, also line 3.
+  expect(sourceLineOf(result.disasm, { protoId: t.anchorProtoId, pc: t.anchorPc })).toBe(3);
+  const mul = t.instrs.find((ins) => ins.op === "mul");
+  expect(mul).toBeDefined();
+  expect(sourceLineOf(result.disasm, mul!.src)).toBe(3);
+  // Every mapped instruction lands on a line of the loop (2–3).
+  for (const ins of t.instrs) {
+    const line = sourceLineOf(result.disasm, ins.src);
+    if (ins.src !== null) expect([2, 3]).toContain(line);
+  }
 });
 
 test("records a decodable execution log (the JIT-trace animation feed)", () => {

@@ -503,7 +503,7 @@ export class ConstValueDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * One SSA instruction: op, two operand refs, aux immediate, observed type, snapshot index.
+ * One SSA instruction: op, two operand refs, aux immediate, observed type, snapshot index, and `ord` (wire v6): the ordinal of the guest bytecode whose recording emitted it, an index into the trace's `src_by_ord` (0 = none — the entry prologue, the φ block and terminal, or a trace without the map).
  */
 export interface IrInstrInput {
   /**
@@ -536,10 +536,15 @@ export interface IrInstrInput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   snap: number;
+  /**
+   * 16-bit Unsigned Integer
+   * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
+   */
+  ord: number;
 }
 
 /**
- * One SSA instruction: op, two operand refs, aux immediate, observed type, snapshot index.
+ * One SSA instruction: op, two operand refs, aux immediate, observed type, snapshot index, and `ord` (wire v6): the ordinal of the guest bytecode whose recording emitted it, an index into the trace's `src_by_ord` (0 = none — the entry prologue, the φ block and terminal, or a trace without the map).
  */
 export interface IrInstrOutput {
   /**
@@ -572,6 +577,11 @@ export interface IrInstrOutput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   snap: number;
+  /**
+   * 16-bit Unsigned Integer
+   * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
+   */
+  ord: number;
 }
 
 export type IrInstr = IrInstrOutput;
@@ -593,6 +603,7 @@ export class IrInstrEncoder extends BitStreamEncoder {
     this.writeInt32(value.aux, "little_endian");
     this.writeUint8(value.ty);
     this.writeUint32(value.snap, "little_endian");
+    this.writeUint16(value.ord, "little_endian");
     return this.finish();
   }
 
@@ -601,7 +612,7 @@ export class IrInstrEncoder extends BitStreamEncoder {
    * Used for from_after_field computed lengths and buffer pre-allocation.
    */
   calculateSize(value: IrInstr): number {
-    return 14; // op + a + b + aux + ty + snap
+    return 16; // op + a + b + aux + ty + snap + ord
   }
 }
 
@@ -620,12 +631,87 @@ export class IrInstrDecoder extends SeekableBitStreamDecoder {
     value.aux = this.readInt32("little_endian");
     value.ty = this.readUint8();
     value.snap = this.readUint32("little_endian");
+    value.ord = this.readUint16("little_endian");
     return value;
   }
 }
 
 /**
- * A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized. `peeled` (doc 39, wire v3): 1 when the trace was committed from a type-stabilizing peel — its preheader run-once region is a REAL tier-0 iteration, so the first back-edge completes two iterations and a zero-completion deopt replays from the entry state. Semantic, not inferable from the marker (an LICM preheader completes zero iterations). `id` (doc 61 §7.1, wire v5): the trace's stable `Trace.id`, never reused; execution logs join to their trace by it.
+ * A guest bytecode position: the proto's stable id and the bytecode index within it. The visualiser resolves it to a source line through the program's disassembly.
+ */
+export interface SourcePointInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  proto_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  pc: number;
+}
+
+/**
+ * A guest bytecode position: the proto's stable id and the bytecode index within it. The visualiser resolves it to a source line through the program's disassembly.
+ */
+export interface SourcePointOutput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  proto_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  pc: number;
+}
+
+export type SourcePoint = SourcePointOutput;
+
+export class SourcePointEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: SourcePointInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.proto_id, "little_endian");
+    this.writeUint32(value.pc, "little_endian");
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a SourcePoint value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: SourcePoint): number {
+    return 8; // proto_id + pc
+  }
+}
+
+export class SourcePointDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): SourcePointOutput {
+    const value: any = {};
+
+    value.proto_id = this.readUint32("little_endian");
+    value.pc = this.readUint32("little_endian");
+    return value;
+  }
+}
+
+/**
+ * A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized. `peeled` (doc 39, wire v3): 1 when the trace was committed from a type-stabilizing peel — its preheader run-once region is a REAL tier-0 iteration, so the first back-edge completes two iterations and a zero-completion deopt replays from the entry state. Semantic, not inferable from the marker (an LICM preheader completes zero iterations). `id` (doc 61 §7.1, wire v5): the trace's stable `Trace.id`, never reused; execution logs join to their trace by it. `src_by_ord` (wire v6): ordinal → the bytecode it stands for (entry 0 unused), so `instrs[i].ord` maps an instruction to its source; empty when the recording kept no map.
  */
 export interface TraceInput {
   /**
@@ -678,10 +764,20 @@ export interface TraceInput {
    * Length prefix type: uint16
    */
   entry_slots: number[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  src_by_ord: SourcePointInput[];
 }
 
 /**
- * A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized. `peeled` (doc 39, wire v3): 1 when the trace was committed from a type-stabilizing peel — its preheader run-once region is a REAL tier-0 iteration, so the first back-edge completes two iterations and a zero-completion deopt replays from the entry state. Semantic, not inferable from the marker (an LICM preheader completes zero iterations). `id` (doc 61 §7.1, wire v5): the trace's stable `Trace.id`, never reused; execution logs join to their trace by it.
+ * A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized. `peeled` (doc 39, wire v3): 1 when the trace was committed from a type-stabilizing peel — its preheader run-once region is a REAL tier-0 iteration, so the first back-edge completes two iterations and a zero-completion deopt replays from the entry state. Semantic, not inferable from the marker (an LICM preheader completes zero iterations). `id` (doc 61 §7.1, wire v5): the trace's stable `Trace.id`, never reused; execution logs join to their trace by it. `src_by_ord` (wire v6): ordinal → the bytecode it stands for (entry 0 unused), so `instrs[i].ord` maps an instruction to its source; empty when the recording kept no map.
  */
 export interface TraceOutput {
   /**
@@ -734,6 +830,16 @@ export interface TraceOutput {
    * Length prefix type: uint16
    */
   entry_slots: number[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  src_by_ord: SourcePointOutput[];
 }
 
 export type Trace = TraceOutput;
@@ -776,6 +882,15 @@ export class TraceEncoder extends BitStreamEncoder {
       const value_entry_slots__iter = value.entry_slots[value_entry_slots__iter_index];
       this.writeUint16(value_entry_slots__iter, "little_endian");
     }
+    this.writeUint32(value.src_by_ord.length, "little_endian");
+    for (let value_src_by_ord__iter_index = 0; value_src_by_ord__iter_index < value.src_by_ord.length; value_src_by_ord__iter_index++) {
+      const value_src_by_ord__iter = value.src_by_ord[value_src_by_ord__iter_index];
+      const encoder_value_src_by_ord__iter = new SourcePointEncoder();
+      const encoded_value_src_by_ord__iter = encoder_value_src_by_ord__iter.encode(value_src_by_ord__iter);
+      for (const byte of encoded_value_src_by_ord__iter) {
+        this.writeUint8(byte);
+      }
+    }
     return this.finish();
   }
 
@@ -803,6 +918,12 @@ export class TraceEncoder extends BitStreamEncoder {
       size += 2;
     }
     size += 2; // length prefix (uint16)
+    // src_by_ord: array (kind: length_prefixed)
+    for (const item of value.src_by_ord) {
+      const src_by_ord_itemEncoder = new SourcePointEncoder();
+      size += src_by_ord_itemEncoder.calculateSize(item);
+    }
+    size += 4; // length prefix (uint32)
     return size;
   }
 }
@@ -831,6 +952,7 @@ export class TraceDecoder extends SeekableBitStreamDecoder {
       instrs__iter.aux = this.readInt32("little_endian");
       instrs__iter.ty = this.readUint8();
       instrs__iter.snap = this.readUint32("little_endian");
+      instrs__iter.ord = this.readUint16("little_endian");
       value.instrs.push(instrs__iter);
     }
     value.consts = [];
@@ -879,6 +1001,15 @@ export class TraceDecoder extends SeekableBitStreamDecoder {
       let entry_slots__iter: any;
       entry_slots__iter = this.readUint16("little_endian");
       value.entry_slots.push(entry_slots__iter);
+    }
+    value.src_by_ord = [];
+    const src_by_ord_length = this.readUint32("little_endian");
+    for (let i = 0; i < src_by_ord_length; i++) {
+      let src_by_ord__iter: any;
+      src_by_ord__iter = {};
+      src_by_ord__iter.proto_id = this.readUint32("little_endian");
+      src_by_ord__iter.pc = this.readUint32("little_endian");
+      value.src_by_ord.push(src_by_ord__iter);
     }
     return value;
   }
@@ -999,6 +1130,7 @@ export class TraceFileDecoder extends SeekableBitStreamDecoder {
         traces__iter_instrs__iter.aux = this.readInt32("little_endian");
         traces__iter_instrs__iter.ty = this.readUint8();
         traces__iter_instrs__iter.snap = this.readUint32("little_endian");
+        traces__iter_instrs__iter.ord = this.readUint16("little_endian");
         traces__iter.instrs.push(traces__iter_instrs__iter);
       }
       traces__iter.consts = [];
@@ -1047,6 +1179,15 @@ export class TraceFileDecoder extends SeekableBitStreamDecoder {
         let traces__iter_entry_slots__iter: any;
         traces__iter_entry_slots__iter = this.readUint16("little_endian");
         traces__iter.entry_slots.push(traces__iter_entry_slots__iter);
+      }
+      traces__iter.src_by_ord = [];
+      const traces__iter_src_by_ord_length = this.readUint32("little_endian");
+      for (let i = 0; i < traces__iter_src_by_ord_length; i++) {
+        let traces__iter_src_by_ord__iter: any;
+        traces__iter_src_by_ord__iter = {};
+        traces__iter_src_by_ord__iter.proto_id = this.readUint32("little_endian");
+        traces__iter_src_by_ord__iter.pc = this.readUint32("little_endian");
+        traces__iter.src_by_ord.push(traces__iter_src_by_ord__iter);
       }
       value.traces.push(traces__iter);
     }

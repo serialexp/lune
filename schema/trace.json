@@ -35,19 +35,28 @@
     },
 
     "IrInstr": {
-      "description": "One SSA instruction: op, two operand refs, aux immediate, observed type, snapshot index.",
+      "description": "One SSA instruction: op, two operand refs, aux immediate, observed type, snapshot index, and `ord` (wire v6): the ordinal of the guest bytecode whose recording emitted it, an index into the trace's `src_by_ord` (0 = none — the entry prologue, the φ block and terminal, or a trace without the map).",
       "sequence": [
         { "name": "op",   "type": "uint8" },
         { "name": "a",    "type": "uint16" },
         { "name": "b",    "type": "uint16" },
         { "name": "aux",  "type": "int32" },
         { "name": "ty",   "type": "uint8" },
-        { "name": "snap", "type": "uint32" }
+        { "name": "snap", "type": "uint32" },
+        { "name": "ord",  "type": "uint16" }
+      ]
+    },
+
+    "SourcePoint": {
+      "description": "A guest bytecode position: the proto's stable id and the bytecode index within it. The visualiser resolves it to a source line through the program's disassembly.",
+      "sequence": [
+        { "name": "proto_id", "type": "uint32" },
+        { "name": "pc",       "type": "uint32" }
       ]
     },
 
     "Trace": {
-      "description": "A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized. `peeled` (doc 39, wire v3): 1 when the trace was committed from a type-stabilizing peel — its preheader run-once region is a REAL tier-0 iteration, so the first back-edge completes two iterations and a zero-completion deopt replays from the entry state. Semantic, not inferable from the marker (an LICM preheader completes zero iterations). `id` (doc 61 §7.1, wire v5): the trace's stable `Trace.id`, never reused; execution logs join to their trace by it.",
+      "description": "A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized. `peeled` (doc 39, wire v3): 1 when the trace was committed from a type-stabilizing peel — its preheader run-once region is a REAL tier-0 iteration, so the first back-edge completes two iterations and a zero-completion deopt replays from the entry state. Semantic, not inferable from the marker (an LICM preheader completes zero iterations). `id` (doc 61 §7.1, wire v5): the trace's stable `Trace.id`, never reused; execution logs join to their trace by it. `src_by_ord` (wire v6): ordinal → the bytecode it stands for (entry 0 unused), so `instrs[i].ord` maps an instruction to its source; empty when the recording kept no map.",
       "sequence": [
         { "name": "id",              "type": "uint32" },
         { "name": "anchor_proto_id", "type": "uint32" },
@@ -55,7 +64,8 @@
         { "name": "peeled",          "type": "uint8" },
         { "name": "instrs",      "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "IrInstr" } },
         { "name": "consts",      "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "ConstValue" } },
-        { "name": "entry_slots", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "uint16" } }
+        { "name": "entry_slots", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "uint16" } },
+        { "name": "src_by_ord",  "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "SourcePoint" } }
       ]
     },
 

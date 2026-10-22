@@ -89,8 +89,29 @@ test "real recorded numeric loop round-trips struct-exact (incl. proto id)" {
                 try testing.expectEqual(o.aux, d.aux);
                 try testing.expectEqual(@intFromEnum(o.ty), d.ty);
                 try testing.expectEqual(o.snap, d.snap);
+                try testing.expectEqual(o.ord, d.ord);
             }
             for (orig.entry_slots, dec.entry_slots) |o, d| try testing.expectEqual(o, d);
+
+            // Wire v6 source mapping: every ordinal resolves to a bytecode in
+            // the anchor proto, and the trace's `mul` maps back to line 3
+            // (`n = n + i * 2`).
+            try testing.expectEqual(orig.src_by_ord.len, dec.src_by_ord.len);
+            try testing.expect(dec.src_by_ord.len > 1);
+            const proto = orig.anchor.proto;
+            var saw_mul = false;
+            for (dec.instrs) |d| {
+                if (d.ord == 0) continue;
+                try testing.expect(d.ord < dec.src_by_ord.len);
+                const sp = dec.src_by_ord[d.ord];
+                try testing.expectEqual(proto.id, sp.proto_id);
+                try testing.expect(sp.pc < proto.code.len);
+                if (d.op == @intFromEnum(trace_ir.IrOp.mul)) {
+                    try testing.expectEqual(@as(u32, 3), proto.spans[sp.pc].line);
+                    saw_mul = true;
+                }
+            }
+            try testing.expect(saw_mul);
         }
     };
     try withRecordedVm(
@@ -156,12 +177,12 @@ test "hand-built schema edge corpus round-trips byte-exact" {
                 .anchor_pc = 0,
                 .peeled = 1, // doc 39 wire v3: the semantic peel byte
                 .instrs = &.{
-                    .{ .op = 0, .a = 0, .b = 0, .aux = std.math.minInt(i32), .ty = 0, .snap = 0 },
-                    .{ .op = 1, .a = 65535, .b = 65535, .aux = std.math.maxInt(i32), .ty = 5, .snap = 4294967295 },
-                    .{ .op = 250, .a = 1, .b = 2, .aux = -1, .ty = 3, .snap = 7 },
+                    .{ .op = 0, .a = 0, .b = 0, .aux = std.math.minInt(i32), .ty = 0, .snap = 0, .ord = 0 },
+                    .{ .op = 1, .a = 65535, .b = 65535, .aux = std.math.maxInt(i32), .ty = 5, .snap = 4294967295, .ord = 65535 },
+                    .{ .op = 250, .a = 1, .b = 2, .aux = -1, .ty = 3, .snap = 7, .ord = 3 },
                     // a slot-bound φ (op 35) — the loop-carried writeback now rides the
                     // instr stream instead of a separate exit_stores array.
-                    .{ .op = 35, .a = 0, .b = 1, .aux = 3, .ty = 1, .snap = 0 },
+                    .{ .op = 35, .a = 0, .b = 1, .aux = 3, .ty = 1, .snap = 0, .ord = 0 },
                 },
                 .consts = &.{
                     .{ .tag = 0, .body = .{ .ConstNil = .{ .pad = 0 } } },
@@ -175,15 +196,22 @@ test "hand-built schema edge corpus round-trips byte-exact" {
                     .{ .tag = 4, .body = .{ .ConstString = .{ .v = "" } } },
                 },
                 .entry_slots = &.{ 0, 1, 2, 3 },
+                .src_by_ord = &.{
+                    .{ .proto_id = 0, .pc = 0 },
+                    .{ .proto_id = 0xDEAD_BEEF, .pc = std.math.maxInt(u32) },
+                    .{ .proto_id = 2, .pc = 9 },
+                    .{ .proto_id = 2, .pc = 10 },
+                },
             },
             .{
                 .id = 7,
                 .anchor_proto_id = 1,
                 .anchor_pc = 12345,
                 .peeled = 0,
-                .instrs = &.{.{ .op = 99, .a = 0, .b = 0, .aux = 0, .ty = 0, .snap = 0 }},
+                .instrs = &.{.{ .op = 99, .a = 0, .b = 0, .aux = 0, .ty = 0, .snap = 0, .ord = 0 }},
                 .consts = &.{},
                 .entry_slots = &.{},
+                .src_by_ord = &.{},
             },
         },
     };

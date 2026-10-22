@@ -29,7 +29,7 @@ export type DecodedConst = TraceOutput["consts"][number];
 /** The `.mahinatrace` wire version this viewer reads (`traceser.format_version`).
  *  The fixture tests decode a CLI-produced trace, so a bump on the Zig side
  *  that isn't mirrored here fails them. */
-export const TRACE_FORMAT_VERSION = 5;
+export const TRACE_FORMAT_VERSION = 6;
 
 /** Decode a `.mahinatrace` byte buffer into its structural form. Strict, so a
  *  file that isn't one fails with a reason instead of decoding into garbage:

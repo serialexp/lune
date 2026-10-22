@@ -1032,6 +1032,15 @@ pub const RecordingSession = struct {
     /// inlined frame, or hit the snapshot budget). Index 0 is the "no
     /// ordinal" entry and is always 0.
     exit_snap_by_ord: std.ArrayListUnmanaged(trace_ir.SnapIdx) = .empty,
+    /// ordinal → the guest bytecode `{proto_id, source_pc}` that opened it, in
+    /// lockstep with `exit_snap_by_ord` (index 0 is the "no ordinal" entry).
+    /// Every IR instruction's `ord` resolves through it to a source position
+    /// for the visualiser. Unlike `rec_path` it is rewound with the ordinals,
+    /// so an ordinal always names the bytecode it was stamped for. Fail-soft
+    /// like `rec_path`: an OOM clears `src_by_ord_ok` and the trace commits
+    /// without the map — it must never abort the recording.
+    src_by_ord: std.ArrayListUnmanaged(ProgramPoint) = .empty,
+    src_by_ord_ok: bool = true,
 
     /// A jitdbg probe line, behind both gates: compiled in only with
     /// `-Djit-debug`, printed only when this VM set `Config.debug_log`.
@@ -1089,6 +1098,7 @@ pub const RecordingSession = struct {
         // the mark was taken.
         if (self.snap_builder_init) self.snap_builder.truncate(plc.saved_snap_mark);
         self.exit_snap_by_ord.items.len = plc.saved_by_ord_len;
+        if (self.src_by_ord_ok) self.src_by_ord.items.len = plc.saved_by_ord_len;
         self.cur_ord = plc.saved_ord;
         self.exit_ord_overflow = plc.saved_ord_overflow;
         // The restored `reg_map` may have un-defined slots the peel defined.
@@ -1359,6 +1369,15 @@ pub const RecordingSession = struct {
         }
     }
 
+    /// Append the source point of the ordinal just opened (`src_by_ord`).
+    /// Fail-soft: an OOM drops the map for this recording, never the trace.
+    fn noteOrdSource(self: *RecordingSession, point: ProgramPoint) void {
+        if (!self.src_by_ord_ok) return;
+        self.src_by_ord.append(self.gpa, point) catch {
+            self.src_by_ord_ok = false;
+        };
+    }
+
     /// Doc 56 §4.2: open an ORDINARY recording's guest-bytecode boundary —
     /// bump the ordinal and, when the boundary is eligible, mark its
     /// snapshot pending. O(1): nothing is copied here. The snapshot is built
@@ -1379,9 +1398,11 @@ pub const RecordingSession = struct {
             try self.prepareSnapBuilder();
             try self.prepareExitCapture();
             try self.exit_snap_by_ord.append(self.gpa, 0); // ordinal 0: "none"
+            self.noteOrdSource(.{ .proto_id = 0, .source_pc = 0 });
         }
         self.cur_ord += 1;
         try self.exit_snap_by_ord.append(self.gpa, 0);
+        self.noteOrdSource(.{ .proto_id = proto.id, .source_pc = pc -| 1 });
         if (self.inline_depth != 0 or self.exit_snap_exhausted) return;
         // `pc` is post-increment; 0 names no bytecode (synthetic recorder
         // drives in unit tests), so there is no resume point to snapshot —
@@ -6090,6 +6111,7 @@ pub const RecordingSession = struct {
         if (self.snap_builder_init) self.snap_builder.deinit();
         self.host_sites.deinit(gpa);
         self.exit_snap_by_ord.deinit(gpa);
+        self.src_by_ord.deinit(gpa);
         if (self.exit_undo_prev.len != 0) gpa.free(self.exit_undo_prev);
         if (self.exit_undo_stamp.len != 0) gpa.free(self.exit_undo_stamp);
         if (self.exit_def_bits.len != 0) gpa.free(self.exit_def_bits);
@@ -6154,6 +6176,8 @@ pub const RecordingSession = struct {
         self.exit_snap_exhausted = false;
         self.exit_snap_pending = false;
         self.exit_snap_by_ord.clearRetainingCapacity();
+        self.src_by_ord.clearRetainingCapacity();
+        self.src_by_ord_ok = true;
         self.pending_stores.clearRetainingCapacity();
         self.alloc_count = 0;
         self.guard_gc_ref = null;

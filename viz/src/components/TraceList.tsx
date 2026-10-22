@@ -1,7 +1,9 @@
-import { For } from "solid-js";
-import { state, selectTrace } from "../store";
+import { For, Show } from "solid-js";
+import { state, selectTrace, traceLine } from "../store";
 
-/** Left pane: one row per trace, showing its anchor and instruction count. */
+/** Left pane: one row per trace, showing the source line its anchor (the loop
+ *  header, the body's first bytecode) sits on — else its proto:pc — and its
+ *  instruction count. */
 export default function TraceList() {
   return (
     <nav class="trace-list">
@@ -14,8 +16,10 @@ export default function TraceList() {
             classList={{ selected: i() === state.selected }}
             onClick={() => selectTrace(i())}
           >
-            <span class="anchor">
-              proto {t.anchorProtoId}:{t.anchorPc}
+            <span class="anchor" title={`anchor: proto ${t.anchorProtoId}, pc ${t.anchorPc}`}>
+              <Show when={traceLine({ protoId: t.anchorProtoId, pc: t.anchorPc })} fallback={`proto ${t.anchorProtoId}:${t.anchorPc}`}>
+                {(line) => `from line ${line()}`}
+              </Show>
             </span>
             <span class="count">{t.instrs.length} ir</span>
           </button>

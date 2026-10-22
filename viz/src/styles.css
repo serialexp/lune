@@ -288,6 +288,31 @@ table.ir tr.ir-ref-target td {
   background: #e0af6826;
 }
 
+/* Source mapping: each row's recording line, the rows from the editor cursor's
+   (or the last clicked row's) line, and the editor's matching line highlight —
+   all in the same violet, apart from the replay blue and the guard amber. */
+table.ir th.src-line,
+table.ir td.src-line {
+  width: 1%;
+  color: var(--muted);
+  text-align: right;
+}
+table.ir tr.ir-has-line {
+  cursor: pointer;
+}
+table.ir tr.ir-has-line:hover td {
+  background: #bb9af714;
+}
+table.ir tr.ir-cursor-line td,
+table.ir tr.ir-pinned-line td {
+  background: #bb9af71f;
+}
+table.ir tr.ir-cursor-line td.src-line,
+table.ir tr.ir-pinned-line td.src-line {
+  color: #bb9af7;
+  box-shadow: inset 2px 0 0 #bb9af7;
+}
+
 /* The side-exit ("exit ramp") — the dramatic deopt back to tier-0, in the
    guard amber/red register. */
 table.ir tr.ir-exit td {
@@ -746,6 +771,11 @@ table.replay-vars td.replay-var-name {
 .cm-replay-line {
   background: #7aa2f72a;
   box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.cm-trace-line {
+  background: #bb9af726;
+  box-shadow: inset 2px 0 0 #bb9af7;
 }
 
 /* --- JIT-coverage line shading (Phase 3) --- */

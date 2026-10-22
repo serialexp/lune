@@ -19,7 +19,7 @@ const bytes = new Uint8Array(readFileSync(fixturePath));
 
 test("decodes the fixture header + trace count", () => {
   const file = decodeTraceFile(bytes);
-  expect(file.version).toBe(5); // v5: traces carry their stable Trace.id (exec logs join on it)
+  expect(file.version).toBe(6); // v6: instructions map back to their bytecode (ord → src_by_ord)
   expect(file.traces.length).toBe(1);
   expect(file.traces[0].id).toBe(0); // the first trace minted in the run
 });
@@ -46,15 +46,15 @@ test("a file that isn't a .mahinatrace fails with a reason", () => {
   };
   expect(() => decodeTraceFile(new Uint8Array([5, 0, 0]))).toThrow("only 3 byte(s)");
   // A keyframe (snapshot v10) or any other version word.
-  expect(() => decodeTraceFile(withVersion(10, [0, 0, 0, 0]))).toThrow("version word 10, expected 5");
+  expect(() => decodeTraceFile(withVersion(10, [0, 0, 0, 0]))).toThrow("version word 10, expected 6");
   // The right version word, then a trace count the bytes can't hold.
-  expect(() => decodeTraceFile(withVersion(5, [9, 0, 0, 0]))).toThrow("not a .mahinatrace");
+  expect(() => decodeTraceFile(withVersion(6, [9, 0, 0, 0]))).toThrow("not a .mahinatrace");
   // A whole trace file with something after it.
   const padded = new Uint8Array(bytes.length + 3);
   padded.set(bytes);
   expect(() => decodeTraceFile(padded)).toThrow("3 byte(s) left over");
   // An empty cache is a valid file.
-  expect(decodeTraceFile(withVersion(5, [0, 0, 0, 0])).traces).toEqual([]);
+  expect(decodeTraceFile(withVersion(6, [0, 0, 0, 0])).traces).toEqual([]);
 });
 
 test("trace anchor + array shapes match the recorded counting loop", () => {
@@ -69,8 +69,8 @@ test("trace anchor + array shapes match the recorded counting loop", () => {
   // v2: loop-carried writebacks ride the instr stream as slot-bound φ nodes
   // (the separate `exit_stores` list is gone), so the body is longer and the
   // `loop` terminator sits past the φ rows.
-  expect(t.instrs.length).toBe(21);
-  expect(t.entry_slots).toEqual([0, 4, 1, 2, 3]);
+  expect(t.instrs.length).toBe(24);
+  expect(t.entry_slots).toEqual([2, 3, 0, 4, 1]);
 
   // The straight-line body terminates in a single `loop` back-edge.
   expect(irOpName(t.instrs[t.instrs.length - 1].op)).toBe("loop");
@@ -95,16 +95,16 @@ test("disasm view-model renders operands like writeIrInstr", () => {
   const file = decodeTraceFile(bytes);
   const view = traceToView(file.traces[0]);
 
-  expect(view.instrs[0]).toMatchObject({ index: "000", op: "slot_load", operands: "r0" });
-  expect(view.instrs[2]).toMatchObject({ op: "konst", operands: "k0" });
-  // mul %1 %2  (two operands)
-  expect(view.instrs[4]).toMatchObject({ op: "mul", operands: "%1  %2" });
+  expect(view.instrs[0]).toMatchObject({ index: "000", op: "slot_load", operands: "r2" });
+  expect(view.instrs[6]).toMatchObject({ op: "konst", operands: "k0" });
+  // mul %7 %6  (two operands)
+  expect(view.instrs[9]).toMatchObject({ op: "mul", operands: "%7  %6" });
   // a guard renders a single operand
-  expect(view.instrs[3]).toMatchObject({ op: "guard_int", operands: "%1" });
+  expect(view.instrs[8]).toMatchObject({ op: "guard_int", operands: "%7" });
   // a slot-bound φ renders its back-edge update and target register
-  expect(view.instrs[17]).toMatchObject({ op: "phi", operands: "update=%7 -> r0" });
+  expect(view.instrs[20]).toMatchObject({ op: "phi", operands: "update=%12 -> r0" });
   // loop terminator has no operands (now past the φ rows)
-  expect(view.instrs[20]).toMatchObject({ op: "loop", operands: "" });
+  expect(view.instrs[23]).toMatchObject({ op: "loop", operands: "" });
 
   expect(view.consts[0]).toEqual({ slot: "k0", kind: "int", text: "2" });
 });
@@ -114,11 +114,23 @@ test("traceToText reproduces the dump body (header uses proto id)", () => {
   const text = traceToText(file.traces[0]);
   // Header + first/last instruction lines, byte-for-byte vs --dump-traces
   // (the artifact carries the proto id, so the header shows `0:5` not `main:5`).
-  expect(text.startsWith("trace 0:5  entry=[r0 r4 r1 r2 r3]\n")).toBe(true);
-  expect(text).toContain("\n  %000  slot_load    r0\n");
-  expect(text).toContain("\n  %004  mul          %1  %2\n");
+  expect(text.startsWith("trace 0:5  entry=[r2 r3 r0 r4 r1]\n")).toBe(true);
+  expect(text).toContain("\n  %000  slot_load    r2\n");
+  expect(text).toContain("\n  %009  mul          %7  %6\n");
   // v2: loop-carry rides the instr stream as slot-bound φ rows; the `exit:`
   // footer is gone and the `loop` terminator sits past the φ block.
-  expect(text).toContain("\n  %017  phi          update=%7 -> r0\n");
-  expect(text).toContain("\n  %020  loop         \n");
+  expect(text).toContain("\n  %020  phi          update=%12 -> r0\n");
+  expect(text).toContain("\n  %023  loop         \n");
+});
+
+test("instructions carry the bytecode that emitted them (wire v6 source map)", () => {
+  const view = traceToView(decodeTraceFile(bytes).traces[0]);
+  // The loop body's `mul` came from a bytecode in the root proto.
+  const mul = view.instrs[9];
+  expect(mul.src).not.toBeNull();
+  expect(mul.src!.protoId).toBe(0);
+  // The entry prologue, the φ block and the terminal belong to no bytecode.
+  expect(view.instrs[0].src).toBeNull();
+  expect(view.instrs[20].src).toBeNull();
+  expect(view.instrs[23].src).toBeNull();
 });

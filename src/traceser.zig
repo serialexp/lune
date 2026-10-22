@@ -48,7 +48,11 @@ pub const schema = @import("gen/trace_schema.zig");
 /// v5 (doc 61 §7.1): each Trace record leads with its stable `id`, the key
 /// execution logs join on (they no longer key on the cache index, which
 /// retirement compacts).
-pub const format_version: u32 = 5;
+///
+/// v6: source mapping for the visualiser. Each instruction carries its
+/// bytecode ordinal `ord`, and each Trace record ends with `src_by_ord`, the
+/// ordinal → `{proto_id, pc}` table (`TraceCode.src_by_ord`).
+pub const format_version: u32 = 6;
 
 /// Map one trace constant. A `heap_ref` const is always a string — the only
 /// heap value a trace constant can be (tables/closures are never compile-time
@@ -103,7 +107,11 @@ pub fn toSchemaTrace(a: std.mem.Allocator, wt: WireTrace) !schema.Trace {
         .aux = ins.aux,
         .ty = @intFromEnum(ins.ty),
         .snap = ins.snap,
+        .ord = ins.ord,
     };
+
+    const src_by_ord = try a.alloc(schema.SourcePoint, t.src_by_ord.len);
+    for (t.src_by_ord, 0..) |pp, i| src_by_ord[i] = .{ .proto_id = pp.proto_id, .pc = pp.source_pc };
 
     const consts = try a.alloc(schema.ConstValue, t.consts.len);
     for (t.consts, 0..) |c, i| consts[i] = try toSchemaConst(c);
@@ -117,6 +125,7 @@ pub fn toSchemaTrace(a: std.mem.Allocator, wt: WireTrace) !schema.Trace {
         .consts = consts,
         // `[]u16` coerces directly to the schema's `[]const u16` — no remap.
         .entry_slots = t.entry_slots,
+        .src_by_ord = src_by_ord,
     };
 }
 

@@ -143,9 +143,18 @@ effect log so runs stay replayable (doc 02).
       `viz/e2e/browser-smoke.ts` drives `mahina viz` in headless Chrome
       (trace load, Run, Run both + diff, Replay); the `viz-browser-smoke`
       job in `bundle.yml` runs it and gates releases.
-- [ ] No source mapping: traces are `proto 0:6` (bytecode pcs); the trace
-      format (`schema/trace.json`) has no line info. Clicking a trace or IR
-      row highlights nothing.
+- [x] No source mapping: traces were `proto 0:6` (bytecode pcs) with no
+      line info. The trace format (v6) now carries each instruction's
+      bytecode ordinal and the ordinal → `{proto_id, pc}` table; the viz
+      shows each IR row's line, marks it in the editor on hover/click, and
+      marks the rows from the editor cursor's line.
+  - [ ] A loaded `.mahinatrace` isn't mapped: its proto ids are another
+        compile's. Needs the source paired with it (compile it to get the
+        disasm), i.e. the `mahina viz prog.lua` item below.
+  - [ ] `for_loop` carries the span of the body's last statement (the
+        compiler never resets `cur_span` before the back-edge), so the loop
+        test/increment rows map to the body's last line, not the `for`
+        line. Fixing it also changes line-grain replay stepping.
 - [ ] No IR vocabulary: no op tooltips/legend (`slot_load`, `phi`, `snap`,
       `entry`); registers never show variable names (IR or replay LOCALS).
       (Op tooltips wait on the in-flight `viz/src/enums.ts` edit landing.)

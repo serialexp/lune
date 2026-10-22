@@ -466,6 +466,13 @@ pub const TraceCode = struct {
     /// regions containing incomplete members must fail closed.
     rec_path: []ProgramPoint = &.{},
     rec_path_complete: bool = true,
+    /// Owned ordinal → guest bytecode map: `instrs[i].ord` names the bytecode
+    /// whose recording emitted it, `src_by_ord[ord]` is that bytecode's
+    /// `{proto_id, source_pc}` (index 0 = no ordinal). Diagnostic only — read by
+    /// the trace serializer for the visualiser's source mapping, never by
+    /// tiering or codegen. Empty when the recording had no ordinals (precise),
+    /// overflowed them, or hit an OOM.
+    src_by_ord: []ProgramPoint = &.{},
     /// Owned LSB-first pure-classifier memo, built once before publication.
     /// OOM leaves it unbuilt and isBridgeCandidate uses the identical oracle.
     bridge_cand: []const u8 = &.{},
@@ -528,6 +535,7 @@ pub const TraceCode = struct {
         if (self.inputs.len != 0) gpa.free(self.inputs);
         if (self.exit_prov.len != 0) gpa.free(self.exit_prov);
         if (self.rec_path.len != 0) gpa.free(self.rec_path);
+        if (self.src_by_ord.len != 0) gpa.free(self.src_by_ord);
         if (self.bridge_cand.len != 0) gpa.free(self.bridge_cand);
         if (self.snapshots.len != 0) gpa.free(self.snapshots);
         if (self.snapshot_slots.len != 0) gpa.free(self.snapshot_slots);

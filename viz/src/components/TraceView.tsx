@@ -13,6 +13,9 @@ import {
   traceExecSteps,
   setTraceExecPos,
   stepTraceExec,
+  traceLine,
+  hoverIrLine,
+  pinIrLine,
 } from "../store";
 import { ExecEventKind, formatExecValue, exitKindLabel } from "../exec";
 import { operandTokens } from "../disasm";
@@ -133,6 +136,9 @@ export default function TraceView() {
           <header class="trace-header">
             <h2>
               JIT trace IR <span class="accent">{t().anchorProtoId}:{t().anchorPc}</span>
+              <Show when={traceLine({ protoId: t().anchorProtoId, pc: t().anchorPc })}>
+                {(line) => <span class="muted"> · starts at line {line()}</span>}
+              </Show>
             </h2>
             <p class="trace-note muted">
               Optimized SSA recorded for this hot loop — not the tier-0 bytecode
@@ -212,6 +218,7 @@ export default function TraceView() {
             <thead>
               <tr>
                 <th>#</th>
+                <th class="src-line" title="The source line whose bytecode recorded this instruction. Hover a row to see it in the editor; click to jump there.">line</th>
                 <th>op</th>
                 <th>operands</th>
                 <th>ty</th>
@@ -222,6 +229,7 @@ export default function TraceView() {
               <For each={t().instrs}>
                 {(ins, i) => {
                   const isCurrent = () => hasAnim() && i() === curRef();
+                  const line = () => traceLine(ins.src);
                   return (
                     <tr
                       id={`ir-${i()}`}
@@ -231,13 +239,21 @@ export default function TraceView() {
                         "ir-exit": isCurrent() && isExit(),
                         // A row's position is its SSA number (`ins.index` is the padded text).
                         "ir-ref-target": hoverRef() === i() || flashRef() === i(),
+                        "ir-has-line": line() > 0,
+                        // Recorded from the line the editor cursor is on.
+                        "ir-cursor-line": line() > 0 && line() === state.editorCursorLine,
+                        "ir-pinned-line": line() > 0 && line() === state.irPinnedLine,
                       }}
                       ref={(el) => {
                         if (isCurrent()) currentRow = el;
                         rowEls[i()] = el;
                       }}
+                      onMouseEnter={() => hoverIrLine(line())}
+                      onMouseLeave={() => hoverIrLine(0)}
+                      onClick={() => { if (line() > 0) pinIrLine(line()); }}
                     >
                       <td class="idx">%{ins.index}</td>
+                      <td class="src-line">{line() > 0 ? line() : ""}</td>
                       <td class="op">{ins.op}</td>
                       <td class="operands">
                         <For each={operandTokens(ins.operands)}>

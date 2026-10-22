@@ -3,13 +3,22 @@
 // (mahinaLinter -> store.checkSource -> wasm `check`). Two-way bound to the store's
 // `source` with a guard so the view<->store sync never loops.
 
-import { onMount, onCleanup, createEffect } from "solid-js";
+import { onMount, onCleanup, createEffect, on } from "solid-js";
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection, Decoration, type DecorationSet } from "@codemirror/view";
 import { EditorState, StateField, StateEffect } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { indentOnInput, bracketMatching } from "@codemirror/language";
 import { lintGutter, lintKeymap } from "@codemirror/lint";
-import { state, setSource, checkSource, coverageByLine, coverageLineTitle, type CoverageClass } from "../store";
+import {
+  state,
+  setSource,
+  checkSource,
+  coverageByLine,
+  coverageLineTitle,
+  traceSourceMapped,
+  setEditorCursorLine,
+  type CoverageClass,
+} from "../store";
 import { mahinaLanguage, mahinaHighlighting } from "./mahinaLanguage";
 import { mahinaLinter, byteToUtf16 } from "./mahinaLinter";
 
@@ -62,6 +71,27 @@ const replayLineField = StateField.define<DecorationSet>({
     // any edit, like the other run-derived fields. (Keeping it unmapped left a
     // decoration past the end of a shorter document: CodeMirror's "Position …
     // is out of range" crash after loading a new file mid-replay.)
+    if (tr.docChanged) return Decoration.none;
+    return deco;
+  },
+  provide: (f) => EditorView.decorations.from(f),
+});
+
+// Trace-IR source line — the line the hovered (else last clicked) IR row was
+// recorded from. Its own channel, like the replay line, and cleared on any edit
+// for the same reason: the line number is the traced source's.
+const setTraceLine = StateEffect.define<number | null>();
+
+const traceLineField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(deco, tr) {
+    for (const e of tr.effects) {
+      if (e.is(setTraceLine)) {
+        const lineNo = e.value;
+        if (lineNo === null || lineNo < 1 || lineNo > tr.state.doc.lines) return Decoration.none;
+        return Decoration.set([Decoration.line({ class: "cm-trace-line" }).range(tr.state.doc.line(lineNo).from)]);
+      }
+    }
     if (tr.docChanged) return Decoration.none;
     return deco;
   },
@@ -148,10 +178,16 @@ export default function MahinaEditor() {
           mahinaLinter(checkSource),
           runtimeErrorField,
           replayLineField,
+          traceLineField,
           coverageField,
           lintGutter(),
           mahinaTheme,
           EditorView.updateListener.of((u) => {
+            // The cursor line marks the IR rows recorded from it — only once
+            // the user has put the cursor somewhere (not the initial line 1).
+            if (u.selectionSet && u.view.hasFocus) {
+              setEditorCursorLine(u.state.doc.lineAt(u.state.selection.main.head).number);
+            }
             if (!u.docChanged) return;
             const text = u.state.doc.toString();
             if (text !== state.source) setSource(text);
@@ -204,6 +240,32 @@ export default function MahinaEditor() {
     const line = active && rs && !rs.finished && rs.currentLine > 0 ? rs.currentLine : null;
     view.dispatch({ effects: setReplayLine.of(line) });
   });
+
+  // Mirror the trace IR's hovered (else pinned) row into the editor as its
+  // source line. Only while the traces map onto this source (a loaded
+  // .mahinatrace's protos are another compile's; an edit shifts the lines).
+  createEffect(() => {
+    if (!view) return;
+    const line = traceSourceMapped() ? state.irHoverLine || state.irPinnedLine : 0;
+    view.dispatch({ effects: setTraceLine.of(line > 0 ? line : null) });
+  });
+
+  // Clicking an IR row scrolls the editor to the row's line (every click, via
+  // the reveal counter — not just when the pinned line changes).
+  // Tracks the counter alone; the reads inside are untracked, so typing never
+  // re-scrolls.
+  createEffect(
+    on(
+      () => state.irRevealSeq,
+      () => {
+        if (!view) return;
+        const line = state.irPinnedLine;
+        if (!traceSourceMapped() || line < 1 || line > view.state.doc.lines) return;
+        view.dispatch({ effects: EditorView.scrollIntoView(view.state.doc.line(line).from, { y: "center" }) });
+      },
+      { defer: true },
+    ),
+  );
 
   // Mirror the last run's JIT coverage into the editor as per-line shading.
   // Reactive on `coverageByLine()` (which reads `state.coverage` + `state.disasm`).

@@ -27,6 +27,16 @@ export interface InstrRow {
   ty: string;
   /** Deopt snapshot index — only meaningful for guards. */
   snap: number;
+  /** The guest bytecode whose recording emitted this instruction (wire v6
+   *  `ord` → `src_by_ord`), or null for the entry prologue, the φ block and
+   *  terminal, and traces recorded without the map. */
+  src: SourcePoint | null;
+}
+
+/** A guest bytecode position: a proto's stable id and an index into its code. */
+export interface SourcePoint {
+  protoId: number;
+  pc: number;
 }
 
 export interface ConstRow {
@@ -141,12 +151,14 @@ export function traceToView(t: TraceOutput): TraceView {
   const instrs: InstrRow[] = t.instrs.map((ins, i) => {
     const op = irOpName(ins.op);
     const tyName = obsTypeName(ins.ty);
+    const sp = ins.ord > 0 ? t.src_by_ord[ins.ord] : undefined;
     return {
       index: i.toString().padStart(3, "0"),
       op,
       operands: operandsOf(op, ins.a, ins.b, ins.aux),
       ty: tyName === "unknown" ? "" : tyName,
       snap: ins.snap,
+      src: sp ? { protoId: sp.proto_id, pc: sp.pc } : null,
     };
   });
 

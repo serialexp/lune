@@ -4,7 +4,7 @@
 
 import { createStore } from "solid-js/store";
 import { decodeTraceFile, decodeExecLogFile, decodeCoverageFile, type TraceExecLogOutput, type CoverageFileOutput, type CoverageAnchorOutput } from "./decode";
-import { viewsOf, type TraceView } from "./disasm";
+import { viewsOf, type TraceView, type SourcePoint } from "./disasm";
 import { flattenExec, type ExecStep } from "./exec";
 import { type MahinaRunResult, type MahinaReplayResult, type MahinaDiagnostic, type BacktraceFrame, type ProtoDisasm } from "./wasm/mahina";
 import { mahinaWorker, StoppedError } from "./wasm/mahina-client";
@@ -128,6 +128,23 @@ interface VizState {
    *  run is `--jit-native`, so `cycles_traced` is genuine native-machine-code time
    *  — the number the wasm iteration split can't show. */
   nativeCoverage: CoverageFileOutput | null;
+
+  // --- trace ↔ source mapping ---
+  /** Whether `traces` came from the last wasm run, so their proto ids match
+   *  `disasm`. False for a loaded `.mahinatrace`: its protos are some other
+   *  compile's, and mapping them through this run's disasm would point at the
+   *  wrong lines. */
+  tracesFromRun: boolean;
+  /** The source line of the IR row under the pointer (0 = none). */
+  irHoverLine: number;
+  /** The source line of the last clicked IR row (0 = none). */
+  irPinnedLine: number;
+  /** Bumped on every IR row click, so clicking the same row again still
+   *  scrolls the editor back to its line. */
+  irRevealSeq: number;
+  /** The editor cursor's line once the user has put the cursor somewhere
+   *  (0 = not yet). IR rows recorded from that line are marked. */
+  editorCursorLine: number;
 }
 
 /** The coverage class of a source line, from the last run's per-anchor data.
@@ -250,6 +267,11 @@ const [state, setState] = createStore<VizState>({
   traceExecPos: 0,
   coverage: null,
   nativeCoverage: null,
+  tracesFromRun: false,
+  irHoverLine: 0,
+  irPinnedLine: 0,
+  irRevealSeq: 0,
+  editorCursorLine: 0,
 });
 
 export { state };
@@ -423,6 +445,9 @@ function applyWasmResult(result: MahinaRunResult, fileName: string, source: stri
     execLogsRecorded: true,
     traceExecPos: 0,
     coverage,
+    tracesFromRun: true,
+    irHoverLine: 0,
+    irPinnedLine: 0,
   });
 }
 
@@ -633,6 +658,9 @@ export function loadBytes(name: string, bytes: Uint8Array): void {
       execLogs: [],
       execLogsRecorded: false,
       traceExecPos: 0,
+      tracesFromRun: false,
+      irHoverLine: 0,
+      irPinnedLine: 0,
     });
   } catch (e) {
     setState({
@@ -669,7 +697,43 @@ export async function loadFromUrl(url: string): Promise<void> {
 
 export function selectTrace(index: number): void {
   // A new selection resets the animation to the start of that trace's stream.
-  setState({ selected: index, traceExecPos: 0 });
+  setState({ selected: index, traceExecPos: 0, irHoverLine: 0, irPinnedLine: 0 });
+}
+
+/** The source line of bytecode `sp`, via the disassembly of the same compile
+ *  (`disasm[proto].instrs[pc].line`); 0 when unknown. Pure. */
+export function sourceLineOf(disasm: ProtoDisasm[], sp: SourcePoint | null): number {
+  if (sp === null) return 0;
+  const proto = disasm.find((p) => p.id === sp.protoId);
+  return proto?.instrs[sp.pc]?.line ?? 0;
+}
+
+/** Whether trace instructions can be mapped to editor lines: the traces came
+ *  from the last run and the editor still holds that run's source. */
+export function traceSourceMapped(): boolean {
+  return state.tracesFromRun && state.source === state.replaySource && state.disasm.length > 0;
+}
+
+/** The editor line a trace instruction (or anchor) was recorded from, or 0
+ *  when it has none or the mapping doesn't apply (see `traceSourceMapped`). */
+export function traceLine(sp: SourcePoint | null): number {
+  return traceSourceMapped() ? sourceLineOf(state.disasm, sp) : 0;
+}
+
+/** The IR row under the pointer is from `line` (0 clears). */
+export function hoverIrLine(line: number): void {
+  setState("irHoverLine", line);
+}
+
+/** An IR row from `line` was clicked: keep its line marked in the editor and
+ *  scroll the editor to it. */
+export function pinIrLine(line: number): void {
+  setState({ irPinnedLine: line, irRevealSeq: state.irRevealSeq + 1 });
+}
+
+/** The editor cursor moved to `line` (by the user). */
+export function setEditorCursorLine(line: number): void {
+  if (state.editorCursorLine !== line) setState("editorCursorLine", line);
 }
 
 /** The currently-selected trace view, or null. */

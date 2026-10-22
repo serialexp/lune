@@ -18,7 +18,11 @@ What it does:
 - **Trace IR.** Every trace the run recorded: anchor, entry slots and the
   optimised SSA body (as `mahina --dump-traces` prints it), with an animation
   of each executed trace's per-iteration events (values, guards, commits,
-  exits).
+  exits). Each instruction shows the source line it was recorded from
+  (inlined callees included): hover a row to mark that line in the editor,
+  click to jump there; putting the editor cursor on a line marks its rows.
+  This needs the traces of a run of the editor's current source — a loaded
+  `.mahinatrace` isn't mapped.
 - **JIT coverage.** How the run's loop iterations split between native code,
   traced-but-interpreted, and no trace; the editor stripes each loop line the
   same way (hover for its counts).

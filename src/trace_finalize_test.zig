@@ -45,9 +45,11 @@ const Scratch = struct {
     cur_ord: u16 = 0,
     exit_ord_overflow: bool = false,
     exit_snap_by_ord: std.ArrayListUnmanaged(ir.SnapIdx) = .empty,
+    src_by_ord: std.ArrayListUnmanaged(types.ProgramPoint) = .empty,
+    src_by_ord_ok: bool = true,
 
     fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
-        inline for (.{ "instrs", "consts", "entry_slots", "input_seeds", "exit_prov", "rec_path", "pending_stores", "lane_pins", "exit_snap_by_ord", "host_sites" }) |field|
+        inline for (.{ "instrs", "consts", "entry_slots", "input_seeds", "exit_prov", "rec_path", "pending_stores", "lane_pins", "exit_snap_by_ord", "src_by_ord", "host_sites" }) |field|
             @field(self, field).deinit(gpa);
     }
 };
