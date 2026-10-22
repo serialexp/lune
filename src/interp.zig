@@ -1713,8 +1713,14 @@ pub const Vm = struct {
     /// Gather registers `[lo, hi)` into `boundary_scratch` and return that slice
     /// as a contiguous `[]Value` (read-only operand view for a native).
     inline fn gatherScratch(self: *Vm, lo: usize, hi: usize) []Value {
+        // The lanes and the scratch are read into locals once: the stores
+        // below may alias `self` as far as the compiler knows, which made it
+        // reload all three pointers on every element.
+        const tags = self.tags.ptr;
+        const payloads = self.payloads.ptr;
+        const scratch = self.boundary_scratch.ptr;
         var i = lo;
-        while (i < hi) : (i += 1) self.boundary_scratch[i] = self.regGet(i);
+        while (i < hi) : (i += 1) scratch[i] = .{ .tag = @enumFromInt(tags[i]), .payload = .{ .bits = payloads[i] } };
         return self.boundary_scratch[lo..hi];
     }
 
@@ -1727,8 +1733,15 @@ pub const Vm = struct {
     /// Scatter `boundary_scratch[lo, hi)` back into the register file after a
     /// native wrote its results there.
     inline fn scatterScratch(self: *Vm, lo: usize, hi: usize) void {
+        // Pointers in locals, as in `gatherScratch`.
+        const tags = self.tags.ptr;
+        const payloads = self.payloads.ptr;
+        const scratch = self.boundary_scratch.ptr;
         var i = lo;
-        while (i < hi) : (i += 1) self.regSet(i, self.boundary_scratch[i]);
+        while (i < hi) : (i += 1) {
+            tags[i] = @intFromEnum(scratch[i].tag);
+            payloads[i] = scratch[i].payload.bits;
+        }
     }
 
     /// Install the built-in globals (the host-effect boundary) from the single
@@ -2293,11 +2306,18 @@ pub const Vm = struct {
     /// neither check nor the context store is repeated here. Cold callers
     /// (`run`, keyframe restore) go through the checked `pushFrameVararg`
     /// above, which also publishes the region context. The `.call` opcode
-    /// arm deliberately does NOT use this: inlining the push there grew the
-    /// hottest handler and cost scalar ~4% wall from pure code placement
-    /// (fewer instructions, more cycles — measured 2026-10-01), so it keeps
-    /// the outlined checked call.
+    /// arm (`enterCallee`) pushes through `pushFrameImage`, which this
+    /// wraps. On 2026-10-01 inlining the push into `.call` cost scalar ~4%
+    /// wall from code placement alone. Doc 69 P3 (2026-10-23) re-measured it
+    /// with the rest of P3: scalar ~−3% cycles, recursive-fib −24%.
     pub inline fn pushFrameTrusted(self: *Vm, closure: *const Closure, nreg: usize, base: usize, ret_dest: u16, ret_count: u16, varargs_base: usize, varargs_count: usize) void {
+        self.pushFrameImage(closure, nreg, base, ret_dest, ret_count, varargs_base, varargs_count, &.{}, CODE_CACHE_GEN_INVALID);
+    }
+
+    /// `pushFrameTrusted` with the frame's doc-20 code cache filled: `code`
+    /// is `closure`'s image at generation `code_gen` (the sentinel generation
+    /// stores as an invalid cache, as `cachedCodeFor` would leave it).
+    inline fn pushFrameImage(self: *Vm, closure: *const Closure, nreg: usize, base: usize, ret_dest: u16, ret_count: u16, varargs_base: usize, varargs_count: usize, code: []const Instr, code_gen: u64) void {
         std.debug.assert(self.final_cut == null);
         std.debug.assert(self.depth < max_call_depth);
         std.debug.assert(base + nreg <= self.regCapacity());
@@ -2313,6 +2333,8 @@ pub const Vm = struct {
             .ret_count = ret_count,
             .varargs_base = varargs_base,
             .varargs_count = varargs_count,
+            .code_cache = code,
+            .code_cache_gen = code_gen,
         };
         self.depth += 1;
         self.stack_top = base + nreg;
@@ -3562,14 +3584,30 @@ pub const Vm = struct {
 
     inline fn reloadTopFrame(st: *ExecState) void {
         const vm = st.vm;
-        st.frame = &vm.frames[vm.depth - 1];
-        st.closure = st.frame.closure;
-        st.proto = st.closure.proto;
-        st.code = vm.cachedCodeFor(st.frame, st.proto); // doc 20 image
+        const frame = &vm.frames[vm.depth - 1];
+        const cl = frame.closure;
+        _ = loadFrame(st, vm, vm.depth, frame, cl, frame.base, vm.cachedCodeFor(frame, cl.proto));
+    }
+
+    /// Point `st` at `frame`, the top frame at `depth`, whose closure and
+    /// base the caller passes from registers: a push (`enterCallee`) or a pop
+    /// (`opRet`) has them already, and reading them back through
+    /// `vm.frames`, behind the stores to `st`, cost each crossing a reload
+    /// chain (doc 69 P3). `code` is the closure's doc-20 image at the
+    /// current generation. Returns the frame's register window, which the
+    /// caller dispatches on (`dispatchTailFrom`) rather than reading it back.
+    inline fn loadFrame(st: *ExecState, vm: *Vm, depth: u32, frame: *CallFrame, cl: *const Closure, base: usize, code: []const Instr) RegWindow {
+        const proto = cl.proto;
+        st.frame = frame;
+        st.closure = cl;
+        st.proto = proto;
+        st.code = code;
         st.code_gen = vm.trace.registry.entry_registry.image_gen;
-        st.base = st.frame.base;
-        st.regs = vm.frameWindow(st.base, st.proto.num_registers);
-        vm.trace.setRegionContext(vm.depth, st.frame.call_seq);
+        st.base = base;
+        const regs = vm.frameWindow(base, proto.num_registers);
+        st.regs = regs;
+        vm.trace.setRegionContext(depth, frame.call_seq);
+        return regs;
     }
 
     /// The per-mode handler tables, comptime-built from `handlerFor`. Two
@@ -8090,7 +8128,8 @@ pub const Vm = struct {
         // then reads, and make the param copy below overlap.
         // A fixed span always fits, so this is the window end.
         const callee_base = @max(base + st.proto.num_registers, base + a + 1 + nargs);
-        if (self.depth >= max_call_depth) return parkErr(st, Error.StackOverflow);
+        const depth = self.depth;
+        if (depth >= max_call_depth) return parkErr(st, Error.StackOverflow);
         if (callee_base + cp.num_registers > self.regCapacity()) return parkErr(st, Error.StackOverflow);
         // Lay out the callee window: bind fixed params
         // (nil-fill any not supplied), nil the rest.
@@ -8098,12 +8137,20 @@ pub const Vm = struct {
         // above the current `stack_top` until `pushFrame`
         // raises it, so no safepoint may intervene here (none
         // does).
+        // The lane pointers live in locals: a `u8` tag store may alias
+        // `self` as far as the compiler knows, which made it reload both
+        // on every register. The argument span ends at or below
+        // `callee_base`, so the forward copy never overlaps.
+        const tags = self.tags.ptr;
+        const payloads = self.payloads.ptr;
+        const src = base + a + 1;
+        const nfix = @min(cp.num_params, nargs);
+        const nil = Value.nil();
         var i: usize = 0;
         while (i < cp.num_registers) : (i += 1) {
-            self.regSet(callee_base + i, if (i < cp.num_params and i < nargs)
-                self.regGet(base + a + 1 + i)
-            else
-                Value.nil());
+            const fixed = i < nfix;
+            tags[callee_base + i] = if (fixed) tags[src + i] else @intFromEnum(nil.tag);
+            payloads[callee_base + i] = if (fixed) payloads[src + i] else nil.payload.bits;
         }
         // Varargs cursor: a vararg callee handed more args
         // than it has fixed params keeps the surplus where
@@ -8123,14 +8170,14 @@ pub const Vm = struct {
         st.frame.pc = pc;
         const ret_dest: u16 = callA(of, instr) + @min(shift, 1);
         const ret_count: u16 = if (shift == 0 or instr.c == bytecode.all_results) instr.c else instr.c -| 1;
-        self.pushFrameVararg(cl, callee_base, ret_dest, ret_count, va_base, va_count) catch |e| {
-            // Doc 61 §4.4 fault-pc invariant: a frame left
-            // faulting names its faulting instruction, the
-            // `.call` (as the early checks above leave it).
-            st.frame.pc = pc - 1;
-            return parkErr(st, e);
-        };
-        reloadTopFrame(st);
+        // The depth and capacity checks above are the push's own, so the
+        // trusted push cannot fail, and `loadPushedFrame` publishes the
+        // region context `pushFrameVararg` would have stored twice.
+        // The callee's image goes into its frame's cache at the push, the
+        // fill `cachedCodeFor` would make on the fresh frame's miss.
+        const code = self.trace.codeFor(cp);
+        self.pushFrameImage(cl, cp.num_registers, callee_base, ret_dest, ret_count, va_base, va_count, code, self.trace.registry.entry_registry.image_gen);
+        const regs = loadFrame(st, vm, depth + 1, &self.frames[depth], cl, callee_base, code);
         if (shift == 0) {
             // Doc 44: count this SUCCESSFUL Lua-callee entry
             // toward the callee's function-head anchor (after the
@@ -8168,7 +8215,7 @@ pub const Vm = struct {
         // first instruction with a full prologue
         // (GC/seq/suspend/recording) — exactly one prologue at
         // the call boundary (T-2).
-        return dispatchTail(mode, st, st.frame.pc, vm);
+        return dispatchTailFrom(mode, st, 0, &code[0], vm, regs.tags, regs.payloads);
     }
 
     /// A native callee's error edge in `callTail`. `pcall`/`xpcall` of a
@@ -8457,11 +8504,16 @@ pub const Vm = struct {
                 // Doc 68 P0: no frame carries a continuation yet; P1 routes
                 // the others to their finish before the ordinary wiring.
                 std.debug.assert(st.frame.ctl.cont == .none);
-                const parent = &self.frames[self.depth - 2];
+                const depth = self.depth;
+                const parent = &self.frames[depth - 2];
                 const wants_all = st.frame.ret_count == bytecode.all_results;
                 const want: usize = if (wants_all) result.count else st.frame.ret_count;
                 const dst = parent.base + st.frame.ret_dest;
                 const src = base + result.reg;
+                // Lane pointers in locals (`enterCallee`'s window fill has
+                // the why). `dst` sits below `src` (the parent's window is
+                // under this one), so the forward copy reads each source
+                // before any store reaches it.
                 var k: usize = 0;
                 while (k < want) : (k += 1) {
                     self.regSet(dst + k, if (k < result.count)
@@ -8478,10 +8530,18 @@ pub const Vm = struct {
                 // past the call), shrinking `stack_top` to the parent's
                 // window. Then tail-dispatch the parent's next instruction
                 // with exactly one full prologue (T-3).
-                self.trace.dropRegionActivation(st.frame.call_seq);
-                self.depth -= 1;
-                reloadTopFrame(st);
-                self.stack_top = st.base + st.proto.num_registers;
+                // With no profit windows open, dropping the activation only
+                // invalidates a matching region context, and `loadFrame`
+                // republishes the context for the parent right after: skip
+                // the dead store (doc 69 P3).
+                if (self.trace.regionProfitCount() != 0)
+                    self.trace.dropRegionActivation(st.frame.call_seq);
+                self.depth = depth - 1;
+                const parent_cl = parent.closure;
+                const parent_base = parent.base;
+                const code = self.cachedCodeFor(parent, parent_cl.proto);
+                const regs = loadFrame(st, vm, depth - 1, parent, parent_cl, parent_base, code);
+                self.stack_top = parent_base + regs.n;
                 // Doc 44 D12b: count this return toward the CALLER's
                 // continuation anchor at the frozen cursor (`st` is the
                 // caller now; `st.code` its freshly-reloaded image). The
@@ -8497,11 +8557,12 @@ pub const Vm = struct {
                 // its tag here, not before the pop, keeps nothing live
                 // across the calls above (a spill cost every return ~4
                 // instructions).
-                if (self.trace.config.enabled and self.frames[self.depth].ctl.protect == .none)
+                if (self.trace.config.enabled and self.frames[depth - 1].ctl.protect == .none)
                     self.trace.onRetResume(st.proto, @intCast(st.frame.pc), st.base, st.frame.call_seq, st.code);
                 if (mode == .fast and self.trace.pending_ret_anchor != null)
                     return .switch_mode;
-                return dispatchTail(mode, st, st.frame.pc, vm);
+                const resume_pc = parent.pc;
+                return dispatchTailFrom(mode, st, resume_pc, &code[resume_pc], vm, regs.tags, regs.payloads);
             }
         }.h;
     }

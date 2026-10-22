@@ -1,7 +1,7 @@
 # 69 — Tier-0 dispatch prologue: one gate, lazy pc, frame pointer
 
-Status: partial. P0 (the GC countdown gate) is on master; P1–P3 wait on
-Bart's answers to §7.
+Status: partial. P0 (the GC countdown gate) and P3 (call/return
+transitions) are on master; P1 and P2 wait on Bart's answers to §7.
 Owner: claude (coral-marten)
 Last updated: 2026-10-23
 
@@ -25,6 +25,11 @@ land; move whole phases to Done once everything inside them is checked.
 - [x] **A replay-line OOM was described at the previous instruction**, found
   by the §5 audit. Step 3's park ran before step 6's pc store; it now stores
   the pc itself. Landed with P0, with a test in `interp_dispatch_test.zig`.
+- [x] **P3 — call/return transitions** (§3b; TODO.md "Lua call + return"),
+  landed 2026-10-23 after doc 68 P1. A 0-arg Lua call is 355 → 293
+  instructions and a 1-arg one 490 → 417 (LuaJIT `-joff` 63/74). Tier-0
+  recursive-fib −16.1%, spectral-norm −10.2%, binary-trees −8.0%,
+  array3d −5.1%. No row moves up, and outputs are byte-identical.
 
 ### Outstanding
 - [ ] **Q1 — the merged slow-path gate** (§4). Fold the regions-live test
@@ -38,9 +43,10 @@ land; move whole phases to Done once everything inside them is checked.
 - [ ] **Q3 — `omit_frame_pointer` on the mahina module** (§6; doc 42 §9.4,
   "Bart's call"). Measured on top of P0: −1.0 to −5.3% at tier 0 and
   −0.0 to −5.3% with the JIT.
-- [ ] **P3 — call/return transitions** (TODO.md "Lua call + return"; §2.3).
-  It waits on doc 68's activation frames settling. It gets its own
-  section here once doc 68 P1 has landed.
+- [ ] **Native-call arm** (§3b, "What is left"). A native call costs ~125
+  instructions in opCall, most of it spills around the indirect call and
+  the by-value error-union result. That is the native ABI, not this doc's
+  prologue; TODO.md tracks it.
 
 ## 1. Why this exists
 
@@ -105,6 +111,7 @@ The ExecState reload re-reads 7 fields on every transition.
 `setRegionContext` runs twice per call. The ~96-byte `CallFrame` is written
 whole on every push. These are the P3 levers. They wait because doc 68 P1
 slice 2 is reshaping the same push path (activation frames).
+(Doc 68 P1 landed first; P3 is §3b.)
 
 ## 3. P0 — the GC countdown gate
 
@@ -142,6 +149,90 @@ The countdown costs one decrement (+0.05%).
 The native code's `guard_gc` still reads `gc_stress`, `object_count` and
 `next_gc` through baked addresses. Those fields keep their meaning, so the
 JIT is untouched.
+
+## 3b. P3 — call and return transitions
+
+Landed 2026-10-23, on top of doc 68 P1 (protected calls as tagged frames). The
+contract is the same as P0's: every step at every boundary keeps its verdict.
+Only the way the new top frame's state is computed changes.
+
+### What changed
+
+- **`onCallEntry` is an inline gate.** The counter tick and the
+  `config.enabled` test are inline at the call site; the traced body is
+  `onCallEntryTraced`. With tracing off, a call no longer makes a call.
+- **The push is trusted, and the reload is derived.** `enterCallee` has
+  already proven the depth and register-capacity checks, so it pushes
+  through `pushFrameImage` (the core of `pushFrameTrusted`) instead of
+  `pushFrameVararg`. That drops the re-checks and the first of two
+  `setRegionContext` stores. `loadFrame` then points `ExecState` at the new
+  frame from the closure, base and depth the caller holds in registers. It
+  replaces `reloadTopFrame`'s reads back through `vm.frames`, which came
+  after the stores to `st` and so had to be reloaded.
+- **The callee's code cache is filled at the push.** A fresh frame always
+  missed in `cachedCodeFor`. Now the image is resolved once and written
+  into the frame literal with its generation. The sentinel generation
+  stores as an invalid cache, exactly as `cachedCodeFor` leaves it.
+- **Dispatch comes from registers.** The call and the return both dispatch
+  through `dispatchTailFrom` with the code and window `loadFrame` just
+  built, not `dispatchTail`'s re-read of `st`.
+- **The return skips a dead store.** With no region profit windows open,
+  `dropRegionActivation` only invalidates a matching context, and
+  `loadFrame` republishes the parent's context right after. The boundary
+  (`stop_depth`) return still drops, since nothing republishes there.
+- **Lane pointers in locals.** A `u8` tag store may alias the `Vm` as far
+  as LLVM knows, so the callee-window fill and `gatherScratch` /
+  `scatterScratch` reloaded `tags.ptr` / `payloads.ptr` (and the scratch)
+  on every element. They now read them once.
+
+### Numbers
+
+`bench/opprobe` (`measure.sh ops.lua`, instructions per op; LuaJIT `-joff`
+second):
+
+| probe | HEAD c7540e7 | P3 | LuaJIT |
+|---|---|---|---|
+| `f0()` | 355 | 293 | 63 |
+| `local b = f1(i)` | 490 | 417 | 74 |
+| `math.abs(i)` | 227 | 227 | 59 |
+
+Over every @bench program (`/tmp/p1/ab2.sh`), tier 0: recursive-fib
+−16.07%, spectral-norm −10.24%, binary-trees −8.04%, array3d −5.10%,
+nbody −0.78%, scalar −0.75%. JIT: spectral-norm −1.38%, binary-trees
+−1.12%. The worst row is ±0.00%, and outputs are byte-identical. Wall
+cycles (interleaved, five runs each): recursive-fib −24%, scalar ~−3%. The
+old note on `pushFrameTrusted`, that inlining the push into `.call` cost
+scalar 4% wall (2026-10-01), no longer holds.
+
+### What was tried and dropped
+
+opCall's Lua and native arms share one LLVM function, so a change to one
+moves the other's register allocation. The first cut of the derived reload
+cost every native call one instruction (scalar +0.16%), all of it spill
+shuffling. Three shapes were measured and dropped:
+
+- tail-calling the Lua arm into its own handler: native calls +2;
+- the push and load out of line (`noinline`): calls +10;
+- the lane-pointer hoist in opRet's result copy: a 1-arg call +9.
+
+The code-cache prefill happened to bring the native arm back to parity.
+Nothing pins that.
+
+### What is left
+
+Callgrind, a 0-arg call: opCall ~148 and opRet ~104.
+
+- `ExecState` lives in memory. Every transition stores ten fields and the
+  next handler loads the ones it needs.
+- The ~96-byte frame is written whole.
+- `setRegionContext` is a three-field store per transition. Native code
+  mirrors `region_context`, so making it lazy needs its own argument.
+- Each argument and result still costs a `move` (~51 instructions in
+  call1). That is bytecode shape (doc 66), not the transition.
+- The native arm, ~125 instructions in opCall per native call, is
+  dominated by values spilled across the indirect call and the
+  error-union result returned in memory. Fixing it means changing the
+  native ABI (TODO.md).
 
 ## 4. Q1 — merging regions-live into the gate
 

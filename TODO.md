@@ -257,7 +257,7 @@ earlier in `/tmp/t0micro/`).
       after the in-place-operand compiler change. The rest of `t.x` is the
       `load_const` of the key (constant-operand forms, below) and five
       register pushes from handler register pressure.
-- [ ] **Lua call + return.** 0-arg call 461/63, 1-arg 611/74. The callee
+- [x] **Lua call + return.** 0-arg call 461/63, 1-arg 611/74. The callee
       window is filled by a generic per-register loop, then
       `pushFrameVararg`, `reloadTopFrame` and `onCallEntry`. Step one
       landed 2026-10-23: the open-upvalue list is slot-ordered (LuaJIT's
@@ -268,7 +268,20 @@ earlier in `/tmp/t0micro/`).
       1.77M/3.35M/6.73M (was 2.16M/4.86M/12.65M), linear now. What remains
       (callgrind): opCall ~190, opRet ~140, `reloadTopFrame` +
       `cachedCodeFor` ~70, `onCallEntry` ~32, the ~96-byte frame write,
-      and `setRegionContext` twice per call. Doc 69 P3 takes it.
+      and `setRegionContext` twice per call. Doc 69 P3 takes it. **P3
+      landed 2026-10-23** (doc 69 §3b): 0-arg 355 → 293, 1-arg 490 → 417;
+      tier-0 recursive-fib −16.1%, spectral-norm −10.2%, binary-trees
+      −8.0%. What is left: `ExecState` stored and reloaded per transition,
+      the whole-frame write, `setRegionContext`, and a `move` per argument.
+- [ ] **A native call is ~125 instructions in opCall** (LuaJIT `-joff`
+      `math.abs(i)` 227/59 total). Most of it is values spilled across the
+      indirect call (`nat.func` / `nat.multi`) and the `anyerror!Value`
+      result returned through memory, plus the SoA → AoS `gatherScratch`
+      copy the `[]Value` native ABI needs. opCall's native and Lua arms
+      share one LLVM function, so each arm's register allocation moves
+      with any change to the other (doc 69 §3b: three shapes, ±1–2 per
+      native call). The lever is the native ABI: results in registers, or
+      natives reading the register lanes directly.
 - [ ] **Dispatch prologue, ~18 instructions per op** (doc 42 §4.2): GC
       check (two dependent loads), `safepoint_seq` bump, region count
       test, `frame.pc` store, fetch, jump. LuaJIT's is ~5. Each step is

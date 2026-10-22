@@ -3620,9 +3620,17 @@ pub const TraceState = struct {
     /// whose recording aborts must still see cooldowns elapse). Vararg protos
     /// are refused here — head arming bypasses `recCall`'s vararg rejection,
     /// so the bar must sit at the counting site (doc 44 D2).
-    pub fn onCallEntry(self: *TraceState, proto: *const Proto, base: usize, call_seq: u64, img: []const Instr) void {
+    ///
+    /// Inline down to the `enabled` test: with tracing off a call pays the
+    /// tick and one compare, not an out-of-line call (~30 instructions a
+    /// Lua call, callgrind).
+    pub inline fn onCallEntry(self: *TraceState, proto: *const Proto, base: usize, call_seq: u64, img: []const Instr) void {
         self.tickCallEntry();
         if (!self.config.enabled) return;
+        self.onCallEntryTraced(proto, base, call_seq, img);
+    }
+
+    fn onCallEntryTraced(self: *TraceState, proto: *const Proto, base: usize, call_seq: u64, img: []const Instr) void {
         // A recording owns the stream; don't compete. Suspended (doc 63
         // §5.9): no repatch (it drains) and no pending call anchor. Both
         // conditions are `fast_block` bits: one load and test.
