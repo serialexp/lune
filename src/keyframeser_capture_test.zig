@@ -95,8 +95,8 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
             },
             .stack = &.{ util.reg(sRef(2)), util.reg(sInt(-1)), util.regDead },
             .frames = &.{
-                .{ .closure_id = 3, .pc = 7, .base = 0, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 },
-                .{ .closure_id = 6, .pc = 2, .base = 5, .ret_dest = 1, .ret_count = 1, .varargs_base = 0, .varargs_count = 0 },
+                .{ .closure_id = 3, .pc = 7, .base = 0, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0, .ctl = 0 },
+                .{ .closure_id = 6, .pc = 2, .base = 5, .ret_dest = 1, .ret_count = 1, .varargs_base = 0, .varargs_count = 0, .ctl = 0 },
             },
             .open_upvalues = &.{.{ .stack_index = 0, .upvalue_id = 5 }},
             .loaded_chunks = &.{},

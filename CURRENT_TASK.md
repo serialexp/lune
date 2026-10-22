@@ -1,3 +1,19 @@
+DOC 68 P1 SLICE 2: PCALL/XPCALL AS FRAME TAGS (2026-10-23, coral-raven).
+- A `pcall`/`xpcall` body is an ordinary frame tagged `ctl.protect`
+  (LuaJIT FRAME_PCALL), entered by `opProtectedEntry`/`enterCallee` on the
+  native's `ActivatePcall` signal and caught by `Vm.catchProtected`. Other
+  targets use `Vm.protectedCallSync`. Keyframe v11 carries `ctl`. Doc 68
+  §7.1 rev 3 and §12 hold the design and the numbers.
+- The trampoline prototype (+57% t0) was dropped for this. Found on the way
+  and fixed: the `NativeResult` memcpy per trace entry; doc 61's GC mask
+  dropping `pcall`'s `true`/`xpcall`'s handler under GC stress (new test);
+  three codegen regressions on every Lua call/return (callgrind-diagnosed,
+  comments at `enterCallee` and in `opRet`). Tier-0 returns no longer call
+  `onRetResume` with tracing off (recursive-fib t0 −1.6%).
+- Open (TODO.md): head-trace entry cost (B), record through pcall (C), the
+  ~5% dearer catch. P2 (metamethods), P3 (natives), `host_boundary_depth`
+  are next in doc 68.
+
 MULTI-FILE VIZ + NESTED SUSPENSION (2026-10-22, coral-raven).
 - Multi-file programs in the visualiser, all three parts Bart asked for:
   file identity for every location (proto id → chunk, `Vm.loadedChunkIndexOf`,

@@ -1,12 +1,13 @@
 # 68 — Nested suspension: re-entry as continuation frames, so the VM can stop anywhere
 
-Status: draft rev 2, not yet implemented. Bart chose this direction on
-2026-10-22 over "stop in place, then abort" and "step over nested code" (§2).
+Status: rev 3, P0 and part of P1 landed (`pcall`/`xpcall` as frame tags,
+§7.1). Bart chose this direction on 2026-10-22 over "stop in place, then
+abort" and "step over nested code" (§2).
 Round-1 review by codex and antigravity is folded in (§11). Q2 and Q3 are
 decided: the reviewers split on both, and Bart asked the author to break the
 tie (2026-10-22).
 Owner: claude (coral-raven)
-Last updated: 2026-10-22
+Last updated: 2026-10-23
 
 ## Implementation status
 
@@ -55,7 +56,7 @@ land; move whole phases to Done once everything inside them is checked.
   `FrameRef` fields and format bump, `host_boundary_depth`, the
   `onRetResume` gating and the walkers' kind branches (§4, §9).
 - [~] **P1 — the boundary guard and native activations.**
-  - [x] **The boundary guard** (2026-10-22). A due suspend waits while
+  - [x] **The boundary guard** (98aef7f, 2026-10-22). A due suspend waits while
     `native_reentry_depth > 0` (`Vm.canSuspendHere`, which also holds the
     existing `reg_top_pending` gate), so the three asserts are gone and the
     nested `.suspended` arms are unreachable by construction: the trap and
@@ -78,9 +79,28 @@ land; move whole phases to Done once everything inside them is checked.
     the next stoppable step, can be captured as a keyframe, and resumes to
     the full run's output; the index limit), plus the viz wasm and store
     tests. The five `multi-file:` wasm tests pass again.
-  - [ ] The resumable-native protocol, with `pcall`/`xpcall` as its first
-    users (§5, §7.1). This is where `host_boundary_depth` and the keyframe
-    fields of §4.5 land.
+  - [x] **`pcall`/`xpcall` bodies are stoppable** (2026-10-23). Not as
+    §5's resumable native but as LuaJIT's `FRAME_PCALL`: a tag on the
+    body's own frame (rev 3, §7.1). `pcall(f, …)` with a Lua function
+    pushes `f`'s frame in place of the native call, tagged
+    `ctl.protect`, so the body runs in the caller's dispatch with
+    `native_reentry_depth` unchanged and a due suspend lands inside it. A
+    catch is a frame-stack search (`Vm.catchProtected`). Natives, callable
+    tables and non-callables stay on the synchronous path
+    (`Vm.protectedCallSync`), and so does the `xpcall` handler, which
+    still runs nested (P3 territory). The keyframe `FrameRef` gained
+    `ctl` (format v11). Restore validates its raw bits: only protect
+    bits, a known kind, never on the bottom frame. Doc 61's GC mask keeps
+    the parent's `pcall` slot and `xpcall`'s handler, which sit above the
+    call base. Tests: `interp_replay_test` "doc 68 §5" (a stop inside a
+    body, its frame tagged), `keyframeser_resume_test` (every cut through
+    pcall/xpcall bodies, caught errors included, resumes after restore),
+    `interp_semantics_test` "a collection inside a protected body keeps
+    the call's own slots". Numbers are in §12.
+  - [ ] **`host_boundary_depth`.** Not needed yet: no re-entry has
+    become non-recursive except the `pcall` body, which never raises
+    `native_reentry_depth`. It lands with the first converted native
+    that runs inside a host function's dispatch.
 - [ ] **P2 — metamethods.** The shared callable driver; every metamethod
   site in §3, fused reads and stores included, runs as a continuation frame;
   `__call` chains stay bounded (§6).
@@ -349,6 +369,49 @@ resumable native's and suspends like any other (§7.5). `mh_table_get`/
 
 ### 7.1 `pcall` and `xpcall` (P1)
 
+**Rev 3 (2026-10-23, as built).** No activation: the body's frame is the
+protection. The resumable-native version cost +57% tier-0 and 2.45× JIT on a
+`pcall` microbench, measured as a trampoline prototype. It paid for an extra
+vararg Lua call and return per `pcall`, plus a head trace on every body. So
+`pcall` and `xpcall` adopt LuaJIT's frame tag instead:
+
+- **Entry.** `pcall`'s native checks its arguments and, for a Lua function,
+  returns the signal `error.ActivatePcall` (`ActivateXpcall`). The `.call`
+  handler's error edge tail-calls `opProtectedEntry`, which pushes the
+  function's frame with `ret_dest = a + 1` and the call's wanted count less
+  one (`enterCallee`, the same push a closure callee gets). It writes `true`
+  into `pcall`'s own slot and, for `xpcall`, moves the handler into the
+  first result slot. It tags the frame `ctl.protect`. The body runs in the
+  caller's dispatch, and its ordinary return delivers `true, results…`.
+  Doc 61's GC mask stops at the parent's call base, so `fillKeep` keeps
+  those slots for a tagged frame.
+- **Catch.** `catchProtected` finds the nearest tagged frame above the
+  dispatch's `stop_depth`. It runs the handler (xpcall) on top of the
+  faulting frames, as before. Then it unwinds to that frame and writes
+  `false` and the values where the return would have put them. The parent's
+  `pc` is already past its call. A catchable handler error is "error in
+  error handling"; no frame is ever in a "handling" phase.
+- **Synchronous fallback.** A native, a callable table or a non-callable as
+  the target, and any protected call made through `callValue`, go through
+  `Vm.protectedCallSync`, the old Zig `protectedCall`. Those targets have no
+  Lua frame to tag, and none can be stepped into anyway.
+- **Error levels.** `pcall` has no frame, so `callSiteAt` counts a virtual
+  C level above each tagged frame, as Lua counts `pcall`'s. While a native
+  called by a native runs (`callNativeUnparked`), its caller level is C as
+  well. So `pcall(error, "x")` gives `"x"` and `pcall(string.rep)` names
+  `'rep'`. Both now match Lua 5.4, and `pcall(next, 5)` names `'next'`.
+- **Tiering parity.** A tagged entry is not counted toward the body's head
+  anchor, and its return doesn't arm `onRetResume`, so the parent's
+  continuation after `pcall` isn't armed either. That is what a `callValue`
+  body got before. Loops inside a body still trace. Counting the return
+  made the JIT leg of a `pcall` loop 8.5% slower: a trace entered from
+  tier-0 costs more than a small body saves (TODO.md, with the two general
+  fixes). `opRet` reads the popped frame's tag only with tracing on, and a
+  tier-0 return no longer calls `onRetResume` at all.
+
+The rest of this section is rev 2's design, kept for P3, where `table.sort`,
+`gsub` and `require` do need resumable activations.
+
 `pcall` and `xpcall` are the protocol's first resumable natives, because a
 protected call needs an activation that exists before its callee does:
 `pcall(nil)`, `pcall(error, "x")`, `pcall(pcall, f)` and `pcall(t)` with a
@@ -522,7 +585,45 @@ Split, for Bart: Q2 (codex a byte buffer, antigravity a table) and Q3
 
 ## 12. Measurements
 
-_(filled in as phases land)_
+**P1, `pcall`/`xpcall` frame tags** (2026-10-23, native ReleaseFast,
+user-mode instructions against d21a333; `/tmp/pcall-bench`, not
+committed):
+
+| Program | Tier-0 | `--trace --jit-native` |
+|---|---|---|
+| `pcall(f, i)`, f returns `x + 1`, 3·10⁷ calls | −5.7% | −4.8% |
+| `xpcall(f, h, i)`, 2·10⁷ calls | −3.5% | −2.7% |
+| `pcall(error, i)`, 3·10⁶ catches | +5.9% | +5.7% |
+| `xpcall(error, h, i)`, 3·10⁶ catches | +5.4% | +5.3% |
+| `pcall(f, i)`, f raises, 10⁷ catches | +4.8% | +4.7% |
+
+The success paths are cheaper: the body is an ordinary frame push, not a
+`callValue` with its nested dispatch setup. A catch is ~5% dearer.
+Callgrind (100 k catches):
+
+- A Lua body's catch (1140 → 1196 instructions) leaves the dispatch loop
+  and re-enters it in the parent (~60 in `execWith`/`execImpl` setup).
+  `protectedCall`'s Zig `catch` returned straight to the native's call
+  site. `catchProtected` itself is at par (126 vs 116), and so is
+  `dropRegionActivationsFromDepth` (68).
+- A native target (`pcall(error, i)`, 821 → 869) still takes the
+  synchronous path. It pays for the unparked-native level marker (~8),
+  the `protectSignal` checks (~8), the error-value branch (~10) and
+  `pcallEnter`'s argument checks (~8).
+
+Both levers are in TODO.md. Over the `@bench` corpus (both legs), the call
+handlers first lost 2–4 instructions per Lua call and return to register
+allocation. Callgrind on recursive-fib found three causes (comments at
+`enterCallee`, `nativeFailed` and `opRet`). With them fixed, tier-0 call
+rows are faster than before: recursive-fib −1.5%, spectral-norm −0.8%,
+binary-trees −0.7%, array3d −0.3%, because a tier-0 return no longer
+calls `onRetResume`. What's left is about one instruction per native
+call on the error edge's signal test: stdlib tier-0 rows +0.07% to +0.18%
+(str_manip, scalar, io_print, lua54). The JIT rows move by under 0.1%,
+inside the pc-layout spread TODO.md records.
+
+The first trial design, a trampoline closure per call, was +57% tier-0
+and 2.45× JIT on the first row. It is why §7.1 is frame tags.
 
 ## 13. References
 

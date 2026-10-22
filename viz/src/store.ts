@@ -86,8 +86,8 @@ interface VizState {
   /** Parallel to `safepointLines`: the proto each line is in (names its file). */
   safepointProtos: Uint32Array;
   /** Parallel to `safepointLines`: 1 where a replay can stop. 0 inside code a
-   *  native runs that can't suspend yet (a `pcall` body, a `require`d module, a
-   *  metamethod); the slider skips those steps. */
+   *  native runs that can't suspend yet (an `xpcall` handler, a `require`d
+   *  module, a metamethod); the slider skips those steps. */
   safepointStoppable: Uint8Array;
   /** How many of the steps are not stoppable (0s in `safepointStoppable`). */
   safepointNested: number;

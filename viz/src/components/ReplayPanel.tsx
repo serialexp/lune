@@ -176,7 +176,7 @@ export default function ReplayPanel() {
         <Show when={state.safepointNested > 0}>
           <span
             class="replay-nested muted"
-            title="Code that pcall, xpcall, require, dofile, table.sort, gsub, tostring or a metamethod runs can't be paused yet, so stepping skips over it."
+            title="Code that an xpcall message handler, require, dofile, table.sort, gsub, tostring or a metamethod runs can't be paused yet, so stepping skips over it."
           >
             {state.safepointNested.toLocaleString("en-US")} steps inside nested calls skipped
           </span>

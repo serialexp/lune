@@ -23,9 +23,10 @@ What it does:
 - **Step replay.** Replay re-runs the recorded effect log to any instruction
   (or line) of the last run, deterministically: the current line, the
   bytecode with the pending pc, output so far, the call chain, locals (dead
-  registers marked) and the globals the program set. Code that a native runs
-  (a `pcall` body, a `require`d module's top level, a sort comparator, a
-  metamethod) can't be paused yet: stepping skips it, and the panel says how
+  registers marked) and the globals the program set. A `pcall` body steps
+  like any other code. Code that a native runs (an `xpcall` message handler, a
+  `require`d module's top level, a sort comparator, a metamethod) can't be
+  paused yet: stepping skips it, and the panel says how
   many steps that was (`../docs/design/68-nested-suspension.md`).
 - **Trace IR.** Every trace the run recorded: anchor, entry slots and the
   optimised SSA body (as `mahina --dump-traces` prints it), with an animation

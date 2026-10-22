@@ -440,8 +440,37 @@ pub const FrameCtl = packed struct(u8) {
     /// Which half of a fused `get_index2`/`set_index2` a `.finish_op`
     /// continuation is finishing (doc 68 §6).
     phase: u1 = 0,
-    _pad: u4 = 0,
+    protect: Protect = .none,
+    _pad: u2 = 0,
 };
+
+/// Doc 68 §5: the frame is the function a `pcall`/`xpcall` protects,
+/// LuaJIT's `FRAME_PCALL`. `pcall` itself has no frame: it pre-wrote `true`
+/// into its callee slot and wired the frame's results to land just above
+/// it (`ret_dest` = that slot + 1), so a return is an ordinary one. Only an
+/// error looks at the tag (`Vm.catchProtected`), which writes `false` there
+/// instead; `xpcall`'s handler waits in the result slot at `ret_dest`.
+pub const Protect = enum(u2) {
+    none,
+    pcall,
+    xpcall,
+
+    /// How far the protected function's slot sits above `pcall`'s callee
+    /// slot: past `f` for `pcall`, past `f, handler` for `xpcall`.
+    pub fn shift(self: Protect) usize {
+        return @intFromEnum(self);
+    }
+};
+
+/// The signal `pcall`/`xpcall` return for a Lua function, after checking
+/// their arguments: the caller pushes the protected frame in their place.
+pub fn protectSignal(e: anyerror) ?Protect {
+    if (e == error.ActivatePcall) return .pcall;
+    if (e == error.ActivateXpcall) return .xpcall;
+    return null;
+}
+
+
 
 comptime {
     // Doc 68: the inline native push and the `.S` host-call frame write clear
@@ -758,6 +787,14 @@ pub const Vm = struct {
     /// `max_native_reentry` to keep a `pcall`/comparator chain from overflowing the
     /// Zig host stack. Incremented around each nested `execWith`, restored after.
     native_reentry_depth: u16 = 0,
+    /// The native `callValue` is running (`callNativeUnparked`), and the
+    /// depth it runs at. A native called by a native has no Lua call site:
+    /// while no frame has been pushed above it, error levels and
+    /// bad-argument messages see a C caller there, as in Lua (`pcall(error,
+    /// "x")` raises a bare `x`). Saved and restored around each call; two
+    /// scalars rather than an optional struct, so that is four moves.
+    unparked_native: ?*const function.Native = null,
+    unparked_depth: u32 = 0,
     /// The in-flight Lua error value, set by `error`/`assert` (and read by
     /// `pcall`/`xpcall`). Non-null only between a raise and the nearest protected
     /// boundary that catches it — every `pcall` clears it. A **GC root while set**
@@ -1896,8 +1933,35 @@ pub const Vm = struct {
     /// `null` for `level == 0`, `level > depth` (past the stack — Lua suppresses
     /// the location prefix in that case), or an empty stack.
     pub fn callSiteAt(self: *Vm, level: usize) ?CallSite {
-        if (self.depth == 0 or level == 0 or level > self.depth) return null;
-        const idx = self.depth - level;
+        if (self.depth == 0 or level == 0) return null;
+        // Lua counts C functions as levels, with no location. Two live here:
+        // the native that called the running native (`callValue`), and the
+        // `pcall`/`xpcall` beneath each protected frame (doc 68 §5).
+        var lvl = level;
+        if (self.unparkedNative() != null) {
+            if (lvl == 1) return null;
+            lvl -= 1;
+        }
+        var idx = self.depth;
+        while (idx > 0) {
+            idx -= 1;
+            if (lvl == 1) return self.siteOf(idx);
+            lvl -= 1;
+            if (self.frames[idx].ctl.protect != .none) {
+                if (lvl == 1) return null;
+                lvl -= 1;
+            }
+        }
+        return null;
+    }
+
+    /// The running native, when `callValue` called it and no frame has been
+    /// pushed since (`unparked_native`).
+    fn unparkedNative(self: *const Vm) ?*const function.Native {
+        return if (self.unparked_depth == self.depth) self.unparked_native else null;
+    }
+
+    fn siteOf(self: *Vm, idx: usize) CallSite {
         const f = &self.frames[idx];
         const proto = f.closure.proto;
         const is_top = idx == self.depth - 1;
@@ -1941,8 +2005,11 @@ pub const Vm = struct {
     /// native), plus its caller's chunk name and the call line — everything a
     /// "bad argument" message needs, all recovered from live state so the caller
     /// passes none of it. `null` only if there is no resolvable native call site.
-    const NativeSite = struct { fname: []const u8, chunk: []const u8, line: u32 };
+    const NativeSite = struct { fname: []const u8, chunk: []const u8, line: u32, located: bool };
     fn nativeSite(self: *Vm) ?NativeSite {
+        // A native called by a native: named, with no location (Lua's
+        // `bad argument #1 to 'rep'` under `pcall(string.rep)`).
+        if (self.unparkedNative()) |nat| return .{ .fname = nativeDisplayName(nat), .chunk = "", .line = 0, .located = false };
         const cs = self.callSiteAt(1) orelse return null;
         if (cs.pc >= cs.proto.code.len) return null;
         const call = bytecode.callOperandsOf(cs.proto.code[cs.pc]) orelse return null;
@@ -1952,6 +2019,7 @@ pub const Vm = struct {
             .fname = nativeDisplayName(function.Native.fromHeader(callee.asHeap())),
             .chunk = cs.proto.name,
             .line = cs.line,
+            .located = true,
         };
     }
 
@@ -1964,8 +2032,8 @@ pub const Vm = struct {
         var arena_inst = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_inst.deinit();
         const a = arena_inst.allocator();
-        const full = if (site) |s|
-            try std.fmt.allocPrint(a, "{s}:{d}: {s}", .{ s.chunk, s.line, body })
+        const full = if (site != null and site.?.located)
+            try std.fmt.allocPrint(a, "{s}:{d}: {s}", .{ site.?.chunk, site.?.line, body })
         else
             body;
         self.pending_error = try self.heap.internValue(full);
@@ -2451,6 +2519,14 @@ pub const Vm = struct {
             for (res, 0..) |v, k| Value.storeWords(&results_out[k], v);
             return res.len;
         }
+        const saved_native = self.unparked_native;
+        const saved_depth = self.unparked_depth;
+        self.unparked_native = nat;
+        self.unparked_depth = self.depth;
+        defer {
+            self.unparked_native = saved_native;
+            self.unparked_depth = saved_depth;
+        }
         if (nat.effect) |kind| {
             const r = try performEffect(self, kind, nat, args);
             if (results_out.len == 0) return 0;
@@ -2462,10 +2538,10 @@ pub const Vm = struct {
             // is the parked window at/above `pbase` while `results_out` is
             // the original caller's buffer below it. Either way a
             // strictly-safer case of the NativeMultiFn alias contract.
-            const produced = nat.multi.?(@ptrCast(self), args, results_out) catch |e| return narrowError(e);
+            const produced = nat.multi.?(@ptrCast(self), args, results_out) catch |e| return self.nativeUnparkedFailed(e, args, results_out);
             return @min(produced, results_out.len);
         } else {
-            const r = nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
+            const r = nat.func(@ptrCast(self), args) catch |e| return self.nativeUnparkedFailed(e, args, results_out);
             if (results_out.len == 0) return 0;
             results_out[0] = r;
             return 1;
@@ -2595,6 +2671,90 @@ pub const Vm = struct {
                 return n;
             },
         }
+    }
+
+    /// `callNativeUnparked`'s error edge. `pcall`/`xpcall` of a Lua
+    /// function ask for a protected frame (doc 68 §5), which only an
+    /// instruction can give; under `callValue` there is a Zig frame anyway,
+    /// so the call is protected in Zig.
+    inline fn nativeUnparkedFailed(self: *Vm, e: anyerror, args: []const Value, results_out: []Value) Error!usize {
+        const kind = protectSignal(e) orelse return narrowError(e);
+        return self.protectedCallSync(kind, args, results_out);
+    }
+
+    /// `pcall(f, ...)`/`xpcall(f, h, ...)` (`args` as the natives get them)
+    /// protected in Zig: `f` runs through `callValue`, so nothing it runs can
+    /// be suspended. For a callee without a frame to tag (a native, a callable
+    /// table, a non-callable value) and for a protected call made by
+    /// `callValue`; `pcall(f)` from an instruction runs as a protected frame
+    /// instead (`catchProtected`). Writes `out[0] = ok` and the results or the
+    /// error after it; returns how many values it wrote.
+    ///
+    /// On a **catchable** fault the error value is `pending_error`, or for a
+    /// bare runtime fault (`nil + 1`) synthesized from the still-live faulting
+    /// frames before they are discarded. Non-catchable faults (OOM,
+    /// effect-log integrity) propagate unchanged, so a program can never
+    /// observe heap pressure or mask a replay divergence. `xpcall`'s handler
+    /// runs before the unwind, on top of the faulting frames (Lua semantics),
+    /// so `debug.traceback` in it sees where the error happened; a catchable
+    /// fault in the handler gives `"error in error handling"` (it never runs
+    /// twice), a non-catchable one propagates.
+    pub fn protectedCallSync(self: *Vm, kind: Protect, args: []const Value, out: []Value) Error!usize {
+        std.debug.assert(kind != .none and args.len >= kind.shift() and out.len >= 1);
+        const f = args[0];
+        const handler: ?Value = if (kind == .xpcall) args[1] else null;
+        const call_args = args[kind.shift()..];
+        const entry_depth = self.depth;
+        const entry_top = self.stack_top;
+        // Doc 61 §4.2: the surviving frame's in-flight flag, captured before
+        // any re-entry; an error leaves it set, and each discard restores it.
+        const entry_in_flight = entry_depth > 0 and self.frames[entry_depth - 1].in_flight;
+        const results = out[1..];
+        const produced = self.callValue(f, call_args, results) catch |err| {
+            if (!catchable(err)) return err;
+            // Still at the faulting depth (`callValue` does not unwind): the
+            // value comes from the live frames, before the boundary returns.
+            // A value that can't be called raised before any frame, so the
+            // live frames would describe the `pcall` call: name it here.
+            var msg_buf: [64]u8 = undefined;
+            const errval = if (self.pending_error) |pe| pe else if (!self.isCallable(f))
+                try self.heap.internValue(std.fmt.bufPrint(&msg_buf, "attempt to call a {s} value", .{f.typeName()}) catch unreachable)
+            else
+                try self.synthErrorValue(err);
+            self.pending_error = null;
+            out[0] = Value.boolean(false);
+            var n: usize = 1;
+            if (handler) |h| {
+                // `callValue` lays the handler's window above the faulting
+                // registers and marks the top faulting frame in flight for
+                // its run (doc 61 §4.4).
+                n = self.callValue(h, &.{errval}, results) catch |herr| blk: {
+                    if (!catchable(herr)) return herr;
+                    self.pending_error = null;
+                    if (results.len > 0) results[0] = try self.heap.internValue("error in error handling");
+                    break :blk 1;
+                };
+            } else if (results.len > 0) results[0] = errval;
+            // Discard the faulting (and handler) frames, closing their open
+            // upvalues first so an escaped closure keeps its value once
+            // `stack_top` drops below their slots.
+            self.closeUpvaluesFrom(entry_top);
+            self.dropRegionActivationsFromDepth(entry_depth);
+            self.depth = entry_depth;
+            self.stack_top = entry_top;
+            if (entry_depth > 0) self.frames[entry_depth - 1].in_flight = entry_in_flight;
+            self.retireFinalCut(); // doc 21: the unwind reuses the stack
+            return @min(out.len, 1 + n);
+        };
+        std.debug.assert(self.pending_error == null);
+        out[0] = Value.boolean(true);
+        return @min(out.len, 1 + produced);
+    }
+
+    /// May `v` be called: a function, or a value with `__call`.
+    fn isCallable(self: *Vm, v: Value) bool {
+        if (v.isHeap() and (v.heapType() == .function or v.heapType() == .native)) return true;
+        return !self.metamethod(v, self.mm.call).isNil();
     }
 
     /// Turn a runtime fault (a non-`LuaError` Error raised with no `pending_error`)
@@ -2846,6 +3006,15 @@ pub const Vm = struct {
             }
             if (f.varargs_count > 0 and f.varargs_base < top)
                 setBitRange(keep, f.varargs_base, @min(f.varargs_base + f.varargs_count, top));
+            // Doc 68 §5: a protected frame's parent is suspended at the
+            // `pcall`, and its mask stops at the call base. The call's own
+            // slots there hold `true` (in the `pcall` slot), `xpcall`'s
+            // handler and the callee. The return keeps `true` and a catch
+            // reads the handler, so they stay whole.
+            if (f.ctl.protect != .none) {
+                const lo = self.frames[i - 1].base + f.ret_dest - 1;
+                if (lo < top) setBitRange(keep, lo, @min(lo + 1 + f.ctl.protect.shift(), top));
+            }
         }
         for (self.open_upvalues.items) |ou| {
             if (ou.index < top) keep[ou.index / 64] |= @as(u64, 1) << @intCast(ou.index % 64);
@@ -3071,7 +3240,9 @@ pub const Vm = struct {
                     return .suspended;
                 },
                 .switch_mode => {}, // mode flip parked `frame.pc`; general loop resumes
-                .err => return st.err.?,
+                // Doc 68 §5: a caught error resumes in the protected
+                // call's caller, in the general loop.
+                .err => if (!try self.catchProtected(st.err.?, stop_depth)) return st.err.?,
             }
         }
         // The nested errdefers in `execWith` re-run ours on an error edge;
@@ -3089,10 +3260,16 @@ pub const Vm = struct {
         // untouched.
         errdefer self.trace.abortRaised();
         while (true) {
-            const step = if (self.runFastPath())
-                try self.execImpl(.fast, stop_depth)
+            const attempt = if (self.runFastPath())
+                self.execImpl(.fast, stop_depth)
             else
-                try self.execImpl(.full, stop_depth);
+                self.execImpl(.full, stop_depth);
+            const step = attempt catch |e| {
+                // Doc 68 §5: caught by a protected frame of this
+                // dispatch; its caller resumes after the call.
+                if (try self.catchProtected(e, stop_depth)) continue;
+                return e;
+            };
             switch (step) {
                 .finished => |fr| {
                     self.trace.clearPendingExitAnchor();
@@ -3105,6 +3282,97 @@ pub const Vm = struct {
                 .switch_mode => continue,
             }
         }
+    }
+
+    /// Doc 68 §5/§7.1: catch error `e`, unwinding out of a dispatch bounded
+    /// by `stop_depth`, at the nearest protected frame (`ctl.protect`) this
+    /// dispatch pushed: above its boundary frame `frames[stop_depth - 1]`,
+    /// which `callValue` pushes untagged. Returns false, touching nothing,
+    /// when there is none or `e` is not catchable (OOM, effect-log integrity:
+    /// those always propagate, with the frames retained).
+    ///
+    /// On a catch it does what `execWith`'s errdefers and `protectedCallSync`
+    /// do: the error value comes from the still-live faulting frames
+    /// (`pending_error`, or `synthErrorValue`); `xpcall`'s handler runs on top
+    /// of them, before the unwind, through `callValue` (so a suspend due
+    /// inside a handler is still deferred). Then the protected frame and
+    /// everything above it are discarded (upvalues closed, region activations
+    /// dropped), the JIT forgets the raise (`abortRaised`,
+    /// `clearPendingExitAnchor`), and `false, err` (or `false` and the
+    /// handler's results) land where the call's `true, results…` would have,
+    /// wired by the frame's `ret_dest`/`ret_count`. The parent's `pc` is
+    /// already past its call, so the caller resumes dispatch there. An error
+    /// from the handler run itself propagates out of here.
+    noinline fn catchProtected(self: *Vm, e: Error, stop_depth: u32) Error!bool {
+        @branchHint(.cold);
+        if (!catchable(e) or stop_depth == 0 or self.depth <= stop_depth) return false;
+        const p: u32 = blk: {
+            var i = self.depth;
+            while (i > stop_depth) {
+                i -= 1;
+                if (self.frames[i].ctl.protect != .none) break :blk i;
+            }
+            return false;
+        };
+        const f = &self.frames[p];
+        const kind = f.ctl.protect;
+        const parent = &self.frames[p - 1];
+        // `pcall`'s callee slot (now `true`) is `dst - 1`; the values start
+        // at `dst`, where `xpcall`'s handler waits.
+        const dst = parent.base + f.ret_dest;
+        const want = f.ret_count;
+        const fbase = f.base;
+        const errval = self.pending_error orelse try self.synthErrorValue(e);
+        self.pending_error = null;
+        // A fault never leaves a multret pending (its consumer clears the
+        // flag before anything can fail), but the frames it belonged to are
+        // about to go.
+        self.reg_top_pending = false;
+        // The values go through the scratch at `dst`: the handler runs above
+        // the faulting frames, and the registers at `dst` are only written
+        // once they are gone.
+        const out = self.scratchOut(dst, self.regCapacity());
+        var n: usize = 1;
+        if (kind == .xpcall) {
+            // Lua runs the message handler before the stack unwinds, as a
+            // call on top of the faulting frames, so `debug.traceback` in it
+            // sees where the error happened. `callValue` marks the faulting
+            // top frame in flight for the run (doc 61 §4.4) and lays the
+            // handler's window above them.
+            n = self.callValue(self.regGet(dst), &.{errval}, out) catch |herr| blk: {
+                // A non-catchable handler fault propagates unchanged, with
+                // the frames still live; a catchable one becomes the fixed
+                // message (the handler never runs twice).
+                if (!catchable(herr)) return herr;
+                self.pending_error = null;
+                out[0] = try self.heap.internValue("error in error handling");
+                break :blk 1;
+            };
+        } else out[0] = errval;
+        // Discard the protected frame and the frames above it. Each sits
+        // at or above the end of its window, so that is where their open
+        // upvalues start; the parent (suspended at its `.call`) survives.
+        self.closeUpvaluesFrom(fbase);
+        self.dropRegionActivationsFromDepth(p);
+        self.depth = p;
+        self.stack_top = parent.base + parent.closure.proto.num_registers;
+        self.retireFinalCut(); // doc 21: the unwind reuses the stack
+        // What `execWith`'s errdefers do on an error edge: a recording
+        // never sees the raise, so it must not splice the catch onto a
+        // partial iteration.
+        self.trace.abortRaised();
+        self.trace.clearPendingExitAnchor();
+        self.regSet(dst - 1, Value.boolean(false));
+        if (want == bytecode.all_results) {
+            self.scatterScratch(dst, dst + n);
+            self.reg_top = dst + n;
+            self.reg_top_pending = true;
+        } else {
+            const shown = @min(n, want);
+            self.scatterScratch(dst, dst + shown);
+            if (want > shown) self.fillNil(dst + shown, want - shown);
+        }
+        return true;
     }
 
     /// May the dispatch loop run with the off-by-default prologue hooks compiled
@@ -3227,6 +3495,12 @@ pub const Vm = struct {
         /// `execWith`'s errdefers and every enclosing pcall byte-identical.
         /// Initialized `null` on EVERY entry.
         err: ?Error,
+        /// Doc 68 §5: which protected call `opProtectedEntry` makes, set by
+        /// `nativeFailed` just before it tail-calls it. One entry handler
+        /// with the kind here, rather than one per kind, keeps the native
+        /// call's error edge to a single tail call (two cost every native
+        /// call ~4 instructions in its register allocation).
+        entry_protect: Protect = undefined,
     };
 
     /// Doc 42 §4.1: register-sized handler return. A handler that continues
@@ -7776,6 +8050,162 @@ pub const Vm = struct {
         return if (of == .itern) 2 else instr.b;
     }
 
+    /// Enter closure `cl` for the call `instr` (a `callTail` opcode) makes,
+    /// with the callee `shift` registers past the call's base and `nargs`
+    /// arguments after it: lay out its window, freeze the caller's resume
+    /// cursor, push the frame, reload `st` onto it and dispatch its first
+    /// instruction. `shift` 0 is a closure callee, whose results land at
+    /// the call's base. 1 and 2 are a protected call (doc 68 §5): the
+    /// function sits after `pcall` (`xpcall`, and its handler), and the
+    /// results land one past the base, one fewer of them. A failed push
+    /// parks its error, leaving the caller faulting at the call.
+    ///
+    /// `base` and `call_a` are the caller's own `st.base` and `callA`: read
+    /// again here, behind the caller's stores, they cost every Lua call ~3
+    /// instructions (callgrind, recursive-fib). The return wiring is read
+    /// from `instr` at the push, as the closure arm always did.
+    inline fn enterCallee(comptime mode: ExecMode, comptime of: bytecode.OpCode, comptime shift: usize, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, base: usize, call_a: usize, cl: *const Closure, nargs: usize) HandlerResult {
+        comptime std.debug.assert(shift <= 2);
+        const self = vm;
+        const cp = cl.proto;
+        const a: usize = call_a + shift;
+        // The callee window sits above the caller's window AND
+        // above the argument span (doc 61 P1, LuaJIT's vararg
+        // frame layout). A dynamic (`all_results`) span can end
+        // past the caller window; laying the callee at the
+        // window end would overwrite the surplus varargs it
+        // then reads, and make the param copy below overlap.
+        // A fixed span always fits, so this is the window end.
+        const callee_base = @max(base + st.proto.num_registers, base + a + 1 + nargs);
+        if (self.depth >= max_call_depth) return parkErr(st, Error.StackOverflow);
+        if (callee_base + cp.num_registers > self.regCapacity()) return parkErr(st, Error.StackOverflow);
+        // Lay out the callee window: bind fixed params
+        // (nil-fill any not supplied), nil the rest.
+        // Straight-line and allocation-free — these slots sit
+        // above the current `stack_top` until `pushFrame`
+        // raises it, so no safepoint may intervene here (none
+        // does).
+        var i: usize = 0;
+        while (i < cp.num_registers) : (i += 1) {
+            self.regSet(callee_base + i, if (i < cp.num_params and i < nargs)
+                self.regGet(base + a + 1 + i)
+            else
+                Value.nil());
+        }
+        // Varargs cursor: a vararg callee handed more args
+        // than it has fixed params keeps the surplus where
+        // they already sit — below `callee_base`, in the
+        // caller's window or in the span above it. They stay valid (the stack slab never
+        // moves) and GC-rooted (`forEachRootHeader` scans the
+        // whole live prefix) for the callee's lifetime.
+        // Recorded per-callee so a non-vararg or no-surplus
+        // callee gets a zero cursor (never inherits one).
+        const va_count: usize = if (cp.is_vararg and nargs > cp.num_params) nargs - cp.num_params else 0;
+        const va_base: usize = if (va_count > 0) base + a + 1 + cp.num_params else 0;
+        // Freeze the caller's resume cursor (already one past
+        // this call), push the callee, and reload onto it.
+        // Doc 61 §4.3: a caller suspended at a Lua call is
+        // out of flight with `pc` one past a `.call`.
+        std.debug.assert(!st.frame.in_flight);
+        st.frame.pc = pc;
+        const ret_dest: u16 = callA(of, instr) + @min(shift, 1);
+        const ret_count: u16 = if (shift == 0 or instr.c == bytecode.all_results) instr.c else instr.c -| 1;
+        self.pushFrameVararg(cl, callee_base, ret_dest, ret_count, va_base, va_count) catch |e| {
+            // Doc 61 §4.4 fault-pc invariant: a frame left
+            // faulting names its faulting instruction, the
+            // `.call` (as the early checks above leave it).
+            st.frame.pc = pc - 1;
+            return parkErr(st, e);
+        };
+        reloadTopFrame(st);
+        if (shift == 0) {
+            // Doc 44: count this SUCCESSFUL Lua-callee entry
+            // toward the callee's function-head anchor (after the
+            // push — failed calls never count). A hot verdict
+            // sets `pending_call_anchor`; the very next prologue
+            // (the dispatchTail below lands on callee pc 0) arms
+            // it under `.full` — never here (T-2/T-3 discipline).
+            // `st.code` is the callee's image, just reloaded above
+            // — passing it makes the patched steady state hash-free
+            // (doc 44 D9 S1).
+            self.trace.onCallEntry(cp, st.base, st.frame.call_seq, st.code);
+            // A hot verdict under `.fast` needs the `.full`
+            // prologue's consumer (step 10b) at callee pc 0 —
+            // park and flip, exactly the back-edge arming
+            // discipline (`runFastPath` holds `.full` while the
+            // pending exists; it is consumed on the very next
+            // prologue, so the stint is one instruction on a
+            // mismatch).
+            if (mode == .fast and self.trace.pending_call_anchor != null)
+                return .switch_mode;
+        } else {
+            // Below the new window: the caller's slots, rewired now
+            // that the push can no longer fail.
+            const pa = base + call_a;
+            self.regSet(pa, Value.boolean(true));
+            if (shift == 2) self.regSet(pa + 1, self.regGet(pa + 2));
+            st.frame.ctl.protect = if (shift == 2) .xpcall else .pcall;
+            // Not counted toward the function's head anchor
+            // (`onCallEntry`), as a `callValue` entry never was: a head
+            // trace entered from tier-0 costs more than a small body
+            // saves (TODO.md), and this keeps a protected call's
+            // tiering what it was. Loops inside it still trace.
+        }
+        // Reloaded onto the callee frame; tail-dispatch its
+        // first instruction with a full prologue
+        // (GC/seq/suspend/recording) — exactly one prologue at
+        // the call boundary (T-2).
+        return dispatchTail(mode, st, st.frame.pc, vm);
+    }
+
+    /// A native callee's error edge in `callTail`. `pcall`/`xpcall` of a
+    /// Lua function checked their arguments and signal (`protectSignal`):
+    /// the call becomes a protected entry (`opProtectedEntry`). Any other
+    /// error parks as before.
+    inline fn nativeFailed(comptime mode: ExecMode, comptime of: bytecode.OpCode, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64, e: anyerror, entry_top: usize) HandlerResult {
+        const kind = protectSignal(e) orelse return parkErr(st, narrowError(e));
+        // The native returned without running anything: undo its call's
+        // bookkeeping.
+        st.frame.in_flight = false;
+        vm.stack_top = entry_top;
+        st.entry_protect = kind;
+        return @call(.always_tail, opProtectedEntry(mode, of), .{ st, pc, instr, vm, tags, payloads });
+    }
+
+    /// Doc 68 §5, LuaJIT's `FRAME_PCALL`: `pcall`/`xpcall` call `instr`
+    /// (a `callTail` opcode) made becomes a call of the Lua function after
+    /// it, in a frame tagged `ctl.protect`, and `pcall` gets no frame. The
+    /// arguments already sit after the function, so nothing moves. The
+    /// call's first result, `true`, goes into `pcall`'s own (dead) slot, and
+    /// the frame's results land just above it through the ordinary return
+    /// wiring. `xpcall`'s handler moves into that first result slot, where
+    /// a catch reads it. Out of line, so the call handlers carry only the
+    /// signal test.
+    fn opProtectedEntry(comptime mode: ExecMode, comptime of: bytecode.OpCode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                _ = tags;
+                _ = payloads;
+                if (st.entry_protect == .xpcall) return enter(.xpcall, st, pc, instr, vm);
+                return enter(.pcall, st, pc, instr, vm);
+            }
+
+            inline fn enter(comptime kind: Protect, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm) HandlerResult {
+                const a: usize = callA(of, instr);
+                const base = st.base;
+                // `callTail`'s argument count again: only the native's
+                // argument check ran since, which moves no `reg_top`.
+                const nargs: usize = if (callB(of, instr) == bytecode.all_results)
+                    vm.reg_top - (base + a + 1)
+                else
+                    callB(of, instr);
+                const shift = comptime kind.shift();
+                const cl = Closure.fromHeader(vm.regGet(base + a + 1).asHeap());
+                return enterCallee(mode, of, shift, st, pc, instr, vm, base, a, cl, nargs - shift);
+            }
+        }.h;
+    }
+
     /// `.call`'s body, shared with `itern`'s fallback (doc 66 P1): `of` names
     /// the opcode `instr` is, and the operands are the call it makes
     /// (`callA`/`callB`; `c` is the same field for both).
@@ -7804,78 +8234,9 @@ pub const Vm = struct {
         switch (callee.heapType()) {
             .function => {
                 const cl = Closure.fromHeader(callee.asHeap());
-                const cp = cl.proto;
-                // The callee window sits above the caller's window AND
-                // above the argument span (doc 61 P1, LuaJIT's vararg
-                // frame layout). A dynamic (`all_results`) span can end
-                // past the caller window; laying the callee at the
-                // window end would overwrite the surplus varargs it
-                // then reads, and make the param copy below overlap.
-                // A fixed span always fits, so this is the window end.
-                const callee_base = @max(base + st.proto.num_registers, base + a + 1 + nargs);
-                if (self.depth >= max_call_depth) return parkErr(st, Error.StackOverflow);
-                if (callee_base + cp.num_registers > self.regCapacity()) return parkErr(st, Error.StackOverflow);
-                // Lay out the callee window: bind fixed params
-                // (nil-fill any not supplied), nil the rest.
-                // Straight-line and allocation-free — these slots sit
-                // above the current `stack_top` until `pushFrame`
-                // raises it, so no safepoint may intervene here (none
-                // does).
-                var i: usize = 0;
-                while (i < cp.num_registers) : (i += 1) {
-                    self.regSet(callee_base + i, if (i < cp.num_params and i < nargs)
-                        self.regGet(base + a + 1 + i)
-                    else
-                        Value.nil());
-                }
-                // Varargs cursor: a vararg callee handed more args
-                // than it has fixed params keeps the surplus where
-                // they already sit — below `callee_base`, in the
-                // caller's window or in the span above it. They stay valid (the stack slab never
-                // moves) and GC-rooted (`forEachRootHeader` scans the
-                // whole live prefix) for the callee's lifetime.
-                // Recorded per-callee so a non-vararg or no-surplus
-                // callee gets a zero cursor (never inherits one).
-                const va_count: usize = if (cp.is_vararg and nargs > cp.num_params) nargs - cp.num_params else 0;
-                const va_base: usize = if (va_count > 0) base + a + 1 + cp.num_params else 0;
-                // Freeze the caller's resume cursor (already one past
-                // this call), push the callee, and reload onto it.
-                // Doc 61 §4.3: a caller suspended at a Lua call is
-                // out of flight with `pc` one past a `.call`.
-                std.debug.assert(!st.frame.in_flight);
-                st.frame.pc = pc;
-                self.pushFrameVararg(cl, callee_base, callA(of, instr), instr.c, va_base, va_count) catch |e| {
-                    // Doc 61 §4.4 fault-pc invariant: a frame left
-                    // faulting names its faulting instruction, the
-                    // `.call` (as the early checks above leave it).
-                    st.frame.pc = pc - 1;
-                    return parkErr(st, e);
-                };
-                reloadTopFrame(st);
-                // Doc 44: count this SUCCESSFUL Lua-callee entry
-                // toward the callee's function-head anchor (after the
-                // push — failed calls never count). A hot verdict
-                // sets `pending_call_anchor`; the very next prologue
-                // (the dispatchTail below lands on callee pc 0) arms
-                // it under `.full` — never here (T-2/T-3 discipline).
-                // `st.code` is the callee's image, just reloaded above
-                // — passing it makes the patched steady state hash-free
-                // (doc 44 D9 S1).
-                self.trace.onCallEntry(cp, st.base, st.frame.call_seq, st.code);
-                // A hot verdict under `.fast` needs the `.full`
-                // prologue's consumer (step 10b) at callee pc 0 —
-                // park and flip, exactly the back-edge arming
-                // discipline (`runFastPath` holds `.full` while the
-                // pending exists; it is consumed on the very next
-                // prologue, so the stint is one instruction on a
-                // mismatch).
-                if (mode == .fast and self.trace.pending_call_anchor != null)
-                    return .switch_mode;
-                // Reloaded onto the callee frame; tail-dispatch its
-                // first instruction with a full prologue
-                // (GC/seq/suspend/recording) — exactly one prologue at
-                // the call boundary (T-2).
-                return dispatchTail(mode, st, st.frame.pc, vm);
+                // The proto is read before the push, so `cl` need not
+                // live across it (`onCallEntry` below).
+                return enterCallee(mode, of, 0, st, pc, instr, vm, base, a, cl, nargs);
             },
             .native => {
                 const nat = function.Native.fromHeader(callee.asHeap());
@@ -7960,7 +8321,7 @@ pub const Vm = struct {
                     // into scratch, then we scatter them back into the
                     // registers.
                     const out = if (all) self.scratchOut(base + a, self.regCapacity()) else self.scratchOut(base + a, base + a + nwanted);
-                    const produced = nat.multi.?(@ptrCast(self), args, out) catch |e| return parkErr(st, narrowError(e));
+                    const produced = nat.multi.?(@ptrCast(self), args, out) catch |e| return nativeFailed(mode, of, st, pc, instr, vm, tags, payloads, e, entry_top);
                     if (all) {
                         std.debug.assert(!self.reg_top_pending);
                         self.scatterScratch(base + a, base + a + produced);
@@ -7972,7 +8333,7 @@ pub const Vm = struct {
                         self.scatterScratch(base + a, base + a + nwanted);
                     }
                 } else {
-                    const result = nat.func(@ptrCast(self), args) catch |e| return parkErr(st, narrowError(e));
+                    const result = nat.func(@ptrCast(self), args) catch |e| return nativeFailed(mode, of, st, pc, instr, vm, tags, payloads, e, entry_top);
                     if (all) self.stampSingleResult(base, a, result) else writeSingleResult(st.regs, a, nwanted, result);
                 }
                 st.frame.in_flight = false;
@@ -8116,7 +8477,15 @@ pub const Vm = struct {
                 // `pending_ret_anchor`; the very next prologue (the
                 // dispatchTail below lands on the resume pc) arms it under
                 // `.full` — park and flip in `.fast`, the opCall discipline.
-                self.trace.onRetResume(st.proto, @intCast(st.frame.pc), st.base, st.frame.call_seq, st.code);
+                // Only with tracing on, so a tier-0 return makes no call. A
+                // protected frame's return is `pcall`'s (doc 68 §5), which
+                // never counted (`enterCallee`'s head-anchor note). The
+                // popped frame is still intact at `frames[depth]`; reading
+                // its tag here, not before the pop, keeps nothing live
+                // across the calls above (a spill cost every return ~4
+                // instructions).
+                if (self.trace.config.enabled and self.frames[self.depth].ctl.protect == .none)
+                    self.trace.onRetResume(st.proto, @intCast(st.frame.pc), st.base, st.frame.call_seq, st.code);
                 if (mode == .fast and self.trace.pending_ret_anchor != null)
                     return .switch_mode;
                 return dispatchTail(mode, st, st.frame.pc, vm);

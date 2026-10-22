@@ -612,8 +612,8 @@ fn expectTwoFrameWindowError(second_base: u32, stack: []const schema.StackValue)
             },
             .stack = stack,
             .frames = &.{
-                .{ .closure_id = 0, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 },
-                .{ .closure_id = 1, .pc = 0, .base = second_base, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 },
+                .{ .closure_id = 0, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0, .ctl = 0 },
+                .{ .closure_id = 1, .pc = 0, .base = second_base, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0, .ctl = 0 },
             },
             .open_upvalues = &.{},
             .loaded_chunks = &.{},
@@ -693,8 +693,8 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
             },
             .stack = &.{ nil_reg, nil_reg, nil_reg },
             .frames = &.{
-                .{ .closure_id = 0, .pc = 0, .base = 1, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 }, // must be 0
-                .{ .closure_id = 1, .pc = 0, .base = 2, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 },
+                .{ .closure_id = 0, .pc = 0, .base = 1, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0, .ctl = 0 }, // must be 0
+                .{ .closure_id = 1, .pc = 0, .base = 2, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0, .ctl = 0 },
             },
             .open_upvalues = &.{},
             .loaded_chunks = &.{},
@@ -1092,6 +1092,35 @@ test "doc 21 §T-A.6: pcall/xpcall unwind then finish — the cut reflects the f
     try testing.expectEqual(@as(u32, @intCast(vm.stack_top)), fc.stack_top);
     const snap = try encodeSnapshot(gpa, &vm);
     gpa.free(snap);
+}
+
+test "doc 68 §5: every cut through pcall/xpcall bodies resumes after restore, caught errors included" {
+    // A protected body runs as a Lua callee of a VM-owned trampoline frame,
+    // so a cut inside it is an ordinary one: the keyframe names the
+    // trampoline frame by its reserved id and restore rebinds it. A cut due
+    // inside an `xpcall` handler (still a Zig re-entry) defers to the next
+    // stoppable step, so every cut below still suspends.
+    const gpa = testing.allocator;
+    const source =
+        \\local function body(n)
+        \\  local s = 0
+        \\  for i = 1, n do s = s + i end
+        \\  if n > 3 then error("big " .. n) end
+        \\  return s, n
+        \\end
+        \\for n = 1, 5 do print(pcall(body, n)) end
+        \\print(xpcall(body, function(e) return "h:" .. e end, 2))
+        \\print(xpcall(body, function(e) return "h:" .. e end, 4))
+        \\print(pcall(pcall, body, 5))
+        \\print(select("#", pcall(body, 1)))
+        \\print("done")
+    ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+    var cut: u64 = 1;
+    while (cut < ref.total_safepoints) : (cut += 1) {
+        gpa.free(try expectResume(gpa, source, .{ .after_safepoints = cut }, ref));
+    }
 }
 
 test "keyframe cut before a sweep: a re-interned unreachable string keeps its id across restore" {

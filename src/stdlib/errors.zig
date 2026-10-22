@@ -1,19 +1,23 @@
 //! mahina stdlib — protected calls and error raising: `pcall`, `xpcall`, `error`,
 //! `assert`. Top-level globals (Lua's "basic" library, not a namespace).
 //!
-//! These are the first consumers of the reentrancy + error-value machinery in
-//! `interp.zig`:
-//!
 //!   * `error(v)` / `assert(false, v)` stash `v` in `Vm.pending_error` and return
 //!     the Zig signal `error.LuaError`, which unwinds the dispatch loop (a native
 //!     is a trace barrier, so this never touches the JIT).
-//!   * `pcall`/`xpcall` drive the protected function through `Vm.callValue` (the
-//!     bounded nested dispatch) and catch the unwinding error. On a **catchable**
-//!     fault (`interp.catchable`) they read the value from `pending_error`, or —
-//!     for a bare runtime fault like `nil + 1` — synthesize it from the still-live
-//!     faulting frames via `Vm.synthErrorValue` **before** restoring the boundary.
-//!     Non-catchable faults (OOM, effect-log integrity) re-raise unchanged so a
-//!     program can never observe heap pressure or mask a replay divergence.
+//!   * `pcall`/`xpcall` (doc 68 §5) check their arguments. For a Lua function
+//!     they return the signal `error.ActivatePcall`/`error.ActivateXpcall`,
+//!     and the `.call` instruction runs the function in a frame tagged
+//!     `ctl.protect` in their place (`interp.Protect`): no Zig frame stays on
+//!     the stack for it, so a suspend inside the protected call is an
+//!     ordinary one, and the catch is `Vm.catchProtected`. Anything else (a
+//!     native, a callable table, a non-callable value) has no frame to tag
+//!     and is protected in Zig (`Vm.protectedCallSync`), as is a protected
+//!     call `callValue` makes. On a **catchable** fault (`interp.catchable`)
+//!     both read the value from `pending_error`, or — for a bare runtime
+//!     fault like `nil + 1` — synthesize it from the still-live faulting
+//!     frames via `Vm.synthErrorValue` before discarding them. Non-catchable
+//!     faults (OOM, effect-log integrity) propagate unchanged so a program
+//!     can never observe heap pressure or mask a replay divergence.
 //!
 //! Determinism: the whole error path reads only deterministic state (argument
 //! values, opcodes, operand types, source spans) and interns id-stable strings,
@@ -21,13 +25,12 @@
 //!
 //! `error(msg, level)` prepends a `chunk:line:` location to **string** messages
 //! per Lua's `level` rule (via `Vm.raiseLocatedError` + the shared `callSiteAt`
-//! locator); non-string messages pass through verbatim.
+//! locator); non-string messages pass through verbatim. `pcall` counts as a
+//! level with no location, as Lua's C `pcall` does.
 //!
 //! `xpcall`'s message handler runs **before** the stack unwinds (Lua semantics):
 //! it executes as a frame on top of the still-live faulting frames, so a handler
 //! of `debug.traceback` produces a real backtrace of where the error happened.
-//! The boundary (`vm.depth`/`vm.stack_top`) is restored only after the handler
-//! returns.
 
 const std = @import("std");
 const value = @import("../value.zig");
@@ -42,136 +45,47 @@ inline fn vmOf(ctx: *anyopaque) *Vm {
 }
 
 // ---------------------------------------------------------------------------
-// pcall / xpcall — the protected-call core
+// pcall / xpcall — argument checks, then a protected frame or a Zig catch
 // ---------------------------------------------------------------------------
 
-/// Run `f(call_args...)` protected, writing `out[0] = ok` and (on success)
-/// `out[1..] = results`. Returns the number of values written into `out`.
-///
-/// `handler` non-null ⇒ `xpcall`: on a caught error the message handler is invoked
-/// with the error value **while the faulting frames are still live** (before the
-/// boundary is restored, so `debug.traceback` inside it sees the error site), and
-/// its results replace the error value in `out[1..]`. A handler that raises a
-/// *catchable* error yields the fixed string `"error in error handling"` (never
-/// recurses); a *non-catchable* handler fault (OOM, effect-log integrity, replay
-/// divergence) re-raises unchanged, exactly like the primary protected call — it
-/// must never be masked.
-///
-/// MUST be called from a native (it reenters the VM). The boundary it restores is
-/// `(vm.depth, vm.stack_top)` captured at entry — `callValue` leaves the faulting
-/// frames live on error so `synthErrorValue` can read them here first.
-/// Doc 61 §4.2: a catcher discarding retained frames restores the one
-/// surviving frame's in-flight flag to its value at the catcher's entry.
-fn restoreInFlight(vm: *Vm, entry_depth: u32, entry_in_flight: bool) void {
-    if (entry_depth > 0) vm.frames[entry_depth - 1].in_flight = entry_in_flight;
+fn isClosure(v: Value) bool {
+    return v.isHeap() and v.heapType() == .function;
 }
 
-fn protectedCall(vm: *Vm, f: Value, call_args: []const Value, out: []Value, handler: ?Value) anyerror!usize {
-    std.debug.assert(out.len >= 1);
-    const entry_depth = vm.depth;
-    const entry_top = vm.stack_top;
-    // Doc 61 §4.2: the surviving frame's in-flight flag, captured before any
-    // re-entry; an error leaves it set, and each discard below restores it.
-    const entry_in_flight = entry_depth > 0 and vm.frames[entry_depth - 1].in_flight;
-    const results = if (out.len > 1) out[1..] else out[0..0];
+/// Lua's `luaL_checkany(L, 1)`.
+fn pcallEnter(vm: *Vm, args: []const Value, out: []Value) anyerror!usize {
+    if (args.len < 1) return vm.badArgReason(1, "value expected");
+    if (isClosure(args[0])) return error.ActivatePcall;
+    return vm.protectedCallSync(.pcall, args, out);
+}
 
-    const produced = vm.callValue(f, call_args, results) catch |err| {
-        // Determinism/replay-integrity faults are not catchable — re-raise so the
-        // program cannot observe heap pressure or swallow a replay divergence.
-        if (!interp.catchable(err)) return err;
-        // Still at the faulting depth here (callValue did not unwind): build the
-        // error value from the live frames BEFORE restoring the boundary.
-        const errval = vm.pending_error orelse try vm.synthErrorValue(err);
-        vm.pending_error = null;
-        out[0] = Value.boolean(false);
-
-        if (handler) |h| {
-            // Lua runs the message handler **before** the stack unwinds — a new
-            // frame on top of the still-live faulting frames — so the handler can
-            // inspect where the error happened (e.g. `debug.traceback`). We keep
-            // `vm.depth`/`vm.stack_top` raised here: `callValue` lays the handler's
-            // window at the raised `stack_top` (above the faulting registers) and
-            // runs it bounded at the faulting depth, so the faulting frames stay
-            // intact underneath for the handler to walk. The boundary is restored
-            // only AFTER the handler returns.
-            //
-            // Doc 61 §4.4: the topmost faulting frame, if the fault left one,
-            // must be in flight at its faulting instruction while the handler
-            // runs (`describeFault` and a fatal report read its operands).
-            // `callValue` marks exactly that frame, `frames[depth - 1]`, for
-            // the handler's whole run and leaves it set on a fatal fault; it
-            // is discarded below on every other outcome.
-            const hn = vm.callValue(h, &.{errval}, results) catch |herr| {
-                // A non-catchable handler fault (OOM, effect-log integrity, a
-                // replay divergence) must propagate unchanged — swallowing it as
-                // "error in error handling" would let a program mask heap pressure
-                // or a determinism break. Re-raise with the frames still live.
-                if (!interp.catchable(herr)) return herr;
-                // A catchable handler fault: restore the boundary and report a
-                // fixed message. Do not recurse into the handler.
-                vm.pending_error = null;
-                // Discarding the faulting (and handler) frames: close their open
-                // upvalues so an escaped closure keeps a valid value (their slots
-                // fall above the restored `stack_top`, off the GC root scan).
-                vm.closeUpvaluesFrom(entry_top);
-                vm.dropRegionActivationsFromDepth(entry_depth);
-                vm.depth = entry_depth;
-                vm.stack_top = entry_top;
-                restoreInFlight(vm, entry_depth, entry_in_flight);
-                vm.retireFinalCut(); // doc 21: manual unwind reuses the stack
-                if (out.len > 1) out[1] = try vm.heap.internValue("error in error handling");
-                return @min(out.len, @as(usize, 2));
-            };
-            // Handler returned — now unwind to the protected-call boundary,
-            // closing the faulting frames' open upvalues first (see below).
-            vm.closeUpvaluesFrom(entry_top);
-            vm.dropRegionActivationsFromDepth(entry_depth);
-            vm.depth = entry_depth;
-            vm.stack_top = entry_top;
-            restoreInFlight(vm, entry_depth, entry_in_flight);
-            vm.retireFinalCut(); // doc 21: manual unwind reuses the stack
-            return @min(out.len, 1 + hn);
-        }
-        // `pcall` (no handler): nothing observes the live stack, so unwind now and
-        // return `false, errval`. Close the faulting frames' open upvalues first so
-        // an escaped closure keeps a valid value once `stack_top` drops below their
-        // slots (off the GC root scan).
-        vm.closeUpvaluesFrom(entry_top);
-        vm.dropRegionActivationsFromDepth(entry_depth);
-        vm.depth = entry_depth;
-        vm.stack_top = entry_top;
-        restoreInFlight(vm, entry_depth, entry_in_flight);
-        vm.retireFinalCut(); // doc 21: manual unwind reuses the stack
-        if (out.len > 1) out[1] = errval;
-        return @min(out.len, @as(usize, 2));
-    };
-    // Success: no error value should be parked.
-    std.debug.assert(vm.pending_error == null);
-    out[0] = Value.boolean(true);
-    return @min(out.len, 1 + produced);
+/// Lua's `luaL_checktype(L, 2, LUA_TFUNCTION)`: the handler must be a
+/// function (a closure or a native), not merely callable.
+fn xpcallEnter(vm: *Vm, args: []const Value, out: []Value) anyerror!usize {
+    const h: ?Value = if (args.len >= 2) args[1] else null;
+    const is_fn = if (h) |v| v.isHeap() and (v.heapType() == .function or v.heapType() == .native) else false;
+    if (!is_fn) return vm.badArg(2, "function", h);
+    if (isClosure(args[0])) return error.ActivateXpcall;
+    return vm.protectedCallSync(.xpcall, args, out);
 }
 
 fn nPcallN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
-    if (args.len < 1) return error.TypeError;
-    return protectedCall(vmOf(ctx), args[0], args[1..], out, null);
+    return pcallEnter(vmOf(ctx), args, out);
 }
 
 fn nPcall1(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    if (args.len < 1) return error.TypeError;
     var b: [1]Value = undefined;
-    _ = try protectedCall(vmOf(ctx), args[0], args[1..], b[0..1], null);
+    _ = try pcallEnter(vmOf(ctx), args, &b);
     return b[0];
 }
 
 fn nXpcallN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
-    if (args.len < 2) return error.TypeError;
-    return protectedCall(vmOf(ctx), args[0], args[2..], out, args[1]);
+    return xpcallEnter(vmOf(ctx), args, out);
 }
 
 fn nXpcall1(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    if (args.len < 2) return error.TypeError;
     var b: [1]Value = undefined;
-    _ = try protectedCall(vmOf(ctx), args[0], args[2..], b[0..1], args[1]);
+    _ = try xpcallEnter(vmOf(ctx), args, &b);
     return b[0];
 }
 
@@ -264,9 +178,10 @@ test "A-iv pcall unwind drops region_profit for the destroyed activation" {
     try testing.expect(!diags.hasErrors());
     const failing = try vm.run(chunk.proto);
 
-    // The next physical push is the protected closure. Seed a nonzero remainder
-    // under that exact activation id; the only path that can remove it is the
-    // pcall catch's depth-restore cleanup hook.
+    // The next physical push is the protected closure (`callValue` protects
+    // it in Zig). Seed a nonzero remainder under its exact activation id;
+    // the only path that can remove it is the pcall catch's depth-restore
+    // cleanup hook.
     const activation = vm.next_call_seq;
     try vm.trace.region_policy.region_profit.put(testing.allocator, .{
         .region_id = @as(trace.RegionId, @enumFromInt(123)),
@@ -277,8 +192,9 @@ test "A-iv pcall unwind drops region_profit for the destroyed activation" {
         .root_call_seq = activation,
     });
     const baseline = vm.trace.regionProfitCount() - 1;
+    const pcall = vm.globals.get(try vm.heap.internValue("pcall"));
     var out: [2]Value = undefined;
-    const n = try protectedCall(&vm, failing, &.{}, &out, null);
+    const n = try vm.callValue(pcall, &.{failing}, &out);
     try testing.expectEqual(@as(usize, 2), n);
     try testing.expect(!out[0].asBool());
     try testing.expectEqual(baseline, vm.trace.regionProfitCount());

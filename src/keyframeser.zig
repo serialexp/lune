@@ -93,7 +93,13 @@ pub const schema = @import("gen/trace_schema.zig");
 /// `HeapTable` carries its array part physically — `lane`, `flags` (frozen,
 /// no_grid) and a live grid as `grid` — so capture no longer deflates grids and
 /// restore reproduces the representation that decides later inflation.
-pub const snapshot_format_version: u32 = 10;
+///
+/// v11 (doc 68 §5): `FrameRef` gained `ctl`, the frame's `FrameCtl` byte. A
+/// `pcall`/`xpcall` of a Lua function runs it in a frame tagged
+/// `ctl.protect`, and without the tag a restored VM would not catch the
+/// errors raised under it. Only `protect` may be set yet, and never on the
+/// bottom frame.
+pub const snapshot_format_version: u32 = 11;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -370,6 +376,7 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
         .ret_count = f.ret_count,
         .varargs_base = @intCast(f.varargs_base),
         .varargs_count = @intCast(f.varargs_count),
+        .ctl = @bitCast(f.ctl),
     };
 
     const open = try a.alloc(schema.OpenUpvalueRef, vm.open_upvalues.items.len);
@@ -452,6 +459,7 @@ pub const RestoreError = error{
     FrameNotAClosure, // a frame's closure_id resolves to a non-closure
     FrameWindowMismatch, // a frame's base != the running sum of prior register windows
     InvalidFrameVarargs, // a frame's vararg cursor is non-canonical or outside its live prefix
+    InvalidFrameCtl, // a frame's control byte sets more than a known `protect` tag, or tags the bottom frame
     UpvalueNotAnUpvalue, // a closure/open-upvalue id resolves to a non-upvalue
     StackTooLarge, // the snapshot stack exceeds the VM's register window
     TooManyFrames, // the snapshot frame count exceeds max_call_depth
@@ -876,6 +884,15 @@ pub fn restoreSnapshot(
         const fh = idmap.get(fr.closure_id) orelse return error.UnresolvedHeapRef;
         if (fh.type != .function) return error.FrameNotAClosure;
         const cl = function.Closure.fromHeader(fh);
+        // Doc 68 §5: only a protected call's tag may be set, and the bottom
+        // frame has no caller to protect.
+        // Checked on the raw bits: an out-of-range tag is no `Protect` value.
+        const protect_off = @bitOffsetOf(interp.FrameCtl, "protect");
+        const protect_bits = (fr.ctl >> protect_off) & 0b11;
+        if (fr.ctl & ~(@as(u8, 0b11) << protect_off) != 0 or
+            protect_bits > @intFromEnum(interp.Protect.xpcall) or
+            (i == 0 and protect_bits != 0)) return error.InvalidFrameCtl;
+        const ctl: interp.FrameCtl = .{ .protect = @enumFromInt(protect_bits) };
         // Frame windows are ordered, non-overlapping and in bounds, starting
         // at 0. Usually they are contiguous, but a callee whose dynamic
         // argument span ran past its caller's window sits above that span
@@ -907,6 +924,7 @@ pub fn restoreSnapshot(
             fr.varargs_count,
         ) catch return error.TooManyFrames;
         vm.frames[i].pc = fr.pc;
+        vm.frames[i].ctl = ctl;
         expected_base = @as(usize, fr.base) + cl.proto.num_registers;
     }
     // `pushFrameVararg` raises this to each physical window end. The serialized

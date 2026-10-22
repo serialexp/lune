@@ -3688,8 +3688,9 @@ pub const TraceState = struct {
     ///   bypasses `recCall`'s vararg rejection, so the bar sits here).
     /// - the boundary return never reaches this funnel (`opRet`'s
     ///   `stop_depth` path exits `execImpl` before it).
+    /// `opRet` calls it only with tracing enabled.
     pub fn onRetResume(self: *TraceState, proto: *const Proto, resume_pc: u32, base: usize, call_seq: u64, img: []const Instr) void {
-        if (!self.config.enabled) return;
+        std.debug.assert(self.config.enabled);
         // A recording owns the stream; don't compete. Suspended (doc 63
         // §5.9): as `onCallEntry`, one `fast_block` test for both.
         if ((self.fast_block & (FastBit.recording | FastBit.jit_suspended)) != 0) return;

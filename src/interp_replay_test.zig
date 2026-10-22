@@ -379,7 +379,8 @@ test "doc 68 defer: the safepoint index stops growing at its limit" {
     const parser = @import("parser.zig");
     const diag = @import("diag.zig");
     const source: [:0]const u8 =
-        \\pcall(function() local s = 0 for i = 1, 200 do s = s + i end end)
+        \\local t = {3, 1, 2}
+        \\table.sort(t, function(a, b) local s = 0 for i = 1, 100 do s = s + i end return a < b end)
         \\print("done")
     ;
     var diags = diag.Diagnostics.init(gpa);
@@ -392,13 +393,68 @@ test "doc 68 defer: the safepoint index stops growing at its limit" {
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
     vm.setRecordSafepointLines(true);
-    // The replay driver's cap: due inside the pcall body, so deferred past it.
-    vm.setSuspendCtl(.{ .after_safepoints = 10, .index_limit = 10 });
+    // The replay driver's cap: due inside the sort comparator (main's own
+    // steps up to the `sort` call are fewer than 30), so deferred past it.
+    vm.setSuspendCtl(.{ .after_safepoints = 30, .index_limit = 30 });
     var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect((try vm.start(chunk.proto)) == .suspended);
     try testing.expect(vm.safepoint_seq > 200);
-    try testing.expectEqual(@as(usize, 10), vm.safepoint_lines.items.len);
+    try testing.expectEqual(@as(usize, 30), vm.safepoint_lines.items.len);
+}
+
+test "doc 68 §5: a pcall body is stoppable, in a frame of its own tagged protected" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source: [:0]const u8 =
+        \\local function body(x)
+        \\  local y = x * 2
+        \\  return y + 1
+        \\end
+        \\print(pcall(body, 20))
+    ;
+    // The index: every step in `body` (lines 2-3) is stoppable.
+    const index = try recordSafepointIndex(gpa, source);
+    defer gpa.free(index);
+    var in_body: usize = 0;
+    for (index) |sp| {
+        if (sp.line == 2 or sp.line == 3) {
+            try testing.expect(sp.stoppable);
+            in_body += 1;
+        }
+    }
+    try testing.expect(in_body > 0);
+
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    // main → body: `pcall` itself has no frame.
+    vm.setSuspendCtl(.{ .min_depth = 2, .after_safepoints = 0 });
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect((try vm.start(chunk.proto)) == .suspended);
+    try testing.expectEqual(@as(u32, 2), vm.depth);
+    try testing.expectEqual(@as(u16, 0), vm.native_reentry_depth);
+    try testing.expectEqual(interp.Protect.pcall, vm.frames[1].ctl.protect);
+    try testing.expectEqual(interp.Protect.none, vm.frames[0].ctl.protect);
+
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const frames = try vm.backtraceFrames(arena_inst.allocator());
+    try testing.expectEqual(@as(usize, 2), frames.len);
+    try testing.expectEqualStrings("body", frames[0].name);
+    try testing.expectEqualStrings("main", frames[1].name);
+
+    vm.setSuspendCtl(null);
+    try testing.expect((try vm.exec()) == .finished);
+    try testing.expectEqualStrings("true\t41\n", sink.buffered());
 }
 
 test "top-level re-entry on a suspended (dirty) VM fails closed (doc 17 H-3 / 9-A(ii))" {

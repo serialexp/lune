@@ -596,7 +596,7 @@ test "errmsg: error() with invalid level type or non-integral float raises bad a
 
 test "errmsg: error() with level past depth suppresses location" {
     try expectProgram(
-        \\local function f() error("deep", 4) end
+        \\local function f() error("deep", 5) end
         \\print(pcall(function() f() end))
         \\
     ,
@@ -971,7 +971,8 @@ test "metatable: getmetatable and __metatable protection" {
         \\print(pcall(setmetatable, t, {}))
         \\
     ,
-        "locked\nfalse\tmain:4: cannot change a protected metatable\n",
+        // Lua 5.4: raised at level 1, which is `pcall` here: no location.
+        "locked\nfalse\tcannot change a protected metatable\n",
     );
 }
 
@@ -2814,8 +2815,10 @@ test "doc 61 Phase 0: a native stays in flight between and after its re-entries"
     , "F:call\nF:call\n");
 }
 
-test "doc 61 Phase 0: pcall, table.sort and a require loader keep their caller in flight across every re-entry" {
+test "doc 61 Phase 0: table.sort and a require loader keep their caller in flight across every re-entry; pcall suspends it" {
     // The comparator runs once per comparison: each sees the same shapes.
+    // A Lua function under `pcall` runs in a protected frame (doc 68 §5),
+    // with its caller suspended at the `.call`.
     try expectShapes(
         \\local seen = {}
         \\local t = {5, 3, 8, 1, 9, 2}
@@ -2827,12 +2830,13 @@ test "doc 61 Phase 0: pcall, table.sort and a require loader keep their caller i
         \\print(require('m'))
         \\print(shapes())
         \\
-    , "F:call F:call\nF:call F:call\nF:call F:call\nF:call\n");
+    , "F:call F:call\nS F:call\nF:call F:call\nF:call\n");
 }
 
 test "doc 61 Phase 0: an xpcall handler sees the faulting frame in flight at its fault" {
     // Faults at pc 0, and right after a `.call` (where the call-suspended
-    // classification would wrongly apply).
+    // classification would wrongly apply). Below the faulting protected
+    // frame (doc 68 §5), main is suspended at its `.call`.
     try expectShapes(
         \\local function g() return 1 end
         \\local function h(e) return shapes() end
@@ -2846,13 +2850,14 @@ test "doc 61 Phase 0: an xpcall handler sees the faulting frame in flight at its
         \\print(a)
         \\print(b)
         \\
-    , "F:call F:get_field F:call\nF:call F:add F:call\n");
+    , "S F:get_field F:call\nS F:add F:call\n");
 }
 
 test "doc 61 Phase 0: a retained in-flight parent stays in flight under its faulting metamethod" {
     // protected fn → `.add` → Lua `__add` faults → the handler runs over
     // both: the parent is in flight at `.add`, the metamethod at its fault.
-    // The `g()` before the `.add` puts a `.call` at `pc − 1`.
+    // The `g()` before the `.add` puts a `.call` at `pc − 1`. Main, below
+    // the protected frame, is suspended at its `.call`.
     try expectShapes(
         \\local function g() return 1 end
         \\local mt = {__add = function(x, y) return y.z end}
@@ -2862,7 +2867,7 @@ test "doc 61 Phase 0: a retained in-flight parent stays in flight under its faul
         \\for i = 1, 10 do r = select(2, xpcall(f, function(e) return shapes() end)) end
         \\print(r)
         \\
-    , "F:call F:add F:get_field F:call\n");
+    , "S F:add F:get_field F:call\n");
 }
 
 test "doc 61 Phase 0: nested xpcall marks each level's own faulting frame" {
@@ -2875,7 +2880,7 @@ test "doc 61 Phase 0: nested xpcall marks each level's own faulting frame" {
         \\print(r)
         \\print(shapes())
         \\
-    , "F:call F:get_field F:call F:get_field F:call\nF:call\n");
+    , "S F:get_field S F:get_field F:call\nF:call\n");
 }
 
 test "doc 61 Phase 0: a rejected push leaves the faulting frame's pc at its .call" {
@@ -3368,5 +3373,25 @@ test "doc 61 P1: a hot vararg call with a surplus span past the window" {
         \\
     ,
         "6300\n",
+    );
+}
+
+// Doc 68 §5: a protected frame's parent is suspended at the `pcall`, whose
+// slots (`true`, `xpcall`'s handler) lie at and above the call base, outside
+// the parent's mask. The stress legs collect inside each body (the concat), so
+// a scrub there would print `nil` for `true` or run a nil handler.
+test "doc 68 §5: a collection inside a protected body keeps the call's own slots" {
+    try expectProgram(
+        \\local e = 'x'
+        \\print(pcall(function() return 'H:' .. e end))
+        \\local function g() local ok, m = pcall(function() return 'H:' .. e end) return ok, m end
+        \\print(g())
+        \\local t = setmetatable({}, {__index = function() return (g()) end})
+        \\print(t.x)
+        \\print(xpcall(function() error('o') end, function(m) return 'h:' .. m end))
+        \\print(xpcall(function() error('o') end, function() return g() end))
+        \\
+    ,
+        "true\tH:x\ntrue\tH:x\ntrue\nfalse\th:anonymous:7: o\nfalse\ttrue\tH:x\n",
     );
 }

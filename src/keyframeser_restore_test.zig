@@ -1125,8 +1125,8 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
             // Both stub protos have num_registers == 0, so contiguity wants base 0
             // for both frames (this corpus exercises structural restore, not resume).
             .frames = &.{
-                .{ .closure_id = 3, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 },
-                .{ .closure_id = 6, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 },
+                .{ .closure_id = 3, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0, .ctl = 0 },
+                .{ .closure_id = 6, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0, .ctl = 0 },
             },
             .open_upvalues = &.{.{ .stack_index = 0, .upvalue_id = 5 }},
             .loaded_chunks = &.{},
