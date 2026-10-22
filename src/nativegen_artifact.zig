@@ -757,48 +757,45 @@ pub const CompiledTrace = struct {
     /// forcing only the inner fn would just move the call boundary to the
     /// ~1KB public wrappers.
     inline fn runWithLinkedLoopDone(self: CompiledTrace, regs: RegWindow, linked_loop_done: bool, ledger_out: ?[]trace_exec.LedgerEntry, silent: SilentStaging, exit_side_ok: bool) trace_exec.ExecResult {
-        var result = NativeResult{
-            .completed = 0,
-            .exit_instr = std.math.maxInt(u32),
-            .linked_loop_done = if (linked_loop_done) 1 else 0,
-            .final_trace_id = trace_exec.NO_TRACE_ID,
-            .entry_rbx = 0,
-            .exit_reason = @intFromEnum(trace_exec.ExitReason.normal),
-            .exit_target = 0,
-            // 2.3c-2a: fresh span → zero recorded transitions. Arrays stay `undefined`;
-            // only `[0..ledger_len]` is ever read, and every appended slot is fully
-            // written by `emitLedgerAppend` before `ledger_len` counts it.
-            .ledger_len = 0,
-            .ledger_cum = undefined,
-            .ledger_id = undefined,
-            .ledger_exit = undefined,
-            .ledger_reason = undefined,
-            .ledger_kind = undefined,
-            .ledger_outcome = undefined,
-            .silent_active = 0,
-            .silent_transitions = 0,
-            .silent_budget = silent.silent_budget,
-            .barren_budget = silent.barren_budget,
-            .silent_cell = 0,
-            .cur_zero_run = silent.cur_zero_run,
-            .silent_cum = 0,
-            .silent_last_cell = 0,
-            .pushed_frames = 0,
-            .popped_frames = 0,
-            .snapshot_id = 0,
-            .runtime_error = 0,
-            .activation_base = 0,
-            .activation_depth = 0,
-            // Doc 54 P2: fresh transition budget + motion flag per episode.
-            // The wrapper is the replay-stable init point — every episode
-            // re-entry after a yield/bounce gets a full budget by
-            // construction.
-            .descent_budget = trace_exec.DESCENT_BUDGET,
-            .frame_motion_taken = 0,
-            // Doc 54 P2 amendment: fresh sibling-hop allowance per episode.
-            .sibling_hop_taken = 0,
-            .exit_side_ok = if (exit_side_ok) 1 else 0,
-        };
+        // Field by field, never a struct literal: a literal with `undefined`
+        // ledger arrays still lowers to a copy of the whole ~1 KiB struct
+        // from a constant template, on every entry — a quarter of a
+        // short-trip entry's cost (a head trace of a tiny callee).
+        var result: NativeResult = undefined;
+        result.completed = 0;
+        result.exit_instr = std.math.maxInt(u32);
+        result.linked_loop_done = if (linked_loop_done) 1 else 0;
+        result.final_trace_id = trace_exec.NO_TRACE_ID;
+        result.entry_rbx = 0;
+        result.exit_reason = @intFromEnum(trace_exec.ExitReason.normal);
+        result.exit_target = 0;
+        // 2.3c-2a: fresh span → zero recorded transitions. Arrays stay `undefined`;
+        // only `[0..ledger_len]` is ever read, and every appended slot is fully
+        // written by `emitLedgerAppend` before `ledger_len` counts it.
+        result.ledger_len = 0;
+        result.silent_active = 0;
+        result.silent_transitions = 0;
+        result.silent_budget = silent.silent_budget;
+        result.barren_budget = silent.barren_budget;
+        result.silent_cell = 0;
+        result.cur_zero_run = silent.cur_zero_run;
+        result.silent_cum = 0;
+        result.silent_last_cell = 0;
+        result.pushed_frames = 0;
+        result.popped_frames = 0;
+        result.snapshot_id = 0;
+        result.runtime_error = 0;
+        result.activation_base = 0;
+        result.activation_depth = 0;
+        // Doc 54 P2: fresh transition budget + motion flag per episode.
+        // The wrapper is the replay-stable init point — every episode
+        // re-entry after a yield/bounce gets a full budget by
+        // construction.
+        result.descent_budget = trace_exec.DESCENT_BUDGET;
+        result.frame_motion_taken = 0;
+        // Doc 54 P2 amendment: fresh sibling-hop allowance per episode.
+        result.sibling_hop_taken = 0;
+        result.exit_side_ok = if (exit_side_ok) 1 else 0;
         if (self.trampoline_entry) |tramp| {
             const f: *const TrampolineFn = @ptrFromInt(tramp);
             f(regs.tags, regs.payloads, &result, self.page.code.ptr);
