@@ -297,6 +297,31 @@ pub const RecordedBuiltin = enum(u8) {
     assert = 25,
 };
 
+/// A builtin with a **tier-0 fast path** (doc 70): `callTail`'s native arm
+/// hands the call to `opCallFast`, which computes the common argument shapes
+/// straight from the register lanes — no scratch gather, no indirect call, no
+/// `in_flight`/`stack_top` cover — and falls back to the native itself for
+/// every other shape, so errors and edge cases stay the native's. Independent
+/// of `RecordedBuiltin` (that one tracks recorder arms); never serialized, set
+/// from the registry at install and at restore.
+pub const FastBuiltin = enum(u8) {
+    type,
+    floor,
+    ceil,
+    sqrt,
+    abs,
+    min,
+    max,
+    /// `select('#', ...)` only; any other selector falls back.
+    select,
+    rawequal,
+    rawget,
+    rawlen,
+    /// `string.len` of a string; a number argument (coerced, allocating)
+    /// falls back.
+    len,
+};
+
 /// Which **nondeterministic input** a native represents, if any. A native with a
 /// non-null `EffectKind` is a record/replay boundary: in `record` mode its result
 /// is logged, in `replay` mode it is *not called* and the logged result is fed
@@ -374,6 +399,48 @@ pub const Native = struct {
     /// changes which tier runs a call, never its result. 0 for non-host
     /// natives.
     disturbs: u8 = 0,
+    /// How a tier-0 `.call` invokes this native (doc 70): the call arm
+    /// switches on it, instead of testing `host`, `effect` and `multi` in
+    /// turn. Set with `protocolOf` wherever those fields are set (the
+    /// registry rows' values are precomputed, `interp.base_protocols`); the
+    /// call arm asserts that it agrees with the fields.
+    protocol: CallProtocol = .plain,
+
+    pub const CallProtocol = union(enum(u8)) {
+        /// `func`, one result.
+        plain,
+        /// `multi` when two or more results are wanted, else `func`.
+        multi,
+        /// Through the record/replay boundary (`effect`).
+        effect,
+        /// An embedder host function (`host`).
+        host,
+        /// A builtin with a tier-0 fast path (`FastBuiltin`): the fast
+        /// body first, then `multi`/`func` for the shapes it doesn't take.
+        fast: FastBuiltin,
+    };
+
+    /// The protocol of a native with these fields. A host function owns
+    /// its whole protocol and an effect is single-result, so neither has a
+    /// fast path.
+    pub fn protocolOf(host: bool, effect: bool, fast: ?FastBuiltin, multi: bool) CallProtocol {
+        std.debug.assert(fast == null or !(host or effect));
+        if (host) return .host;
+        if (effect) return .effect;
+        if (fast) |which| return .{ .fast = which };
+        if (multi) return .multi;
+        return .plain;
+    }
+
+    /// Whether `protocol` agrees with `host`, `effect` and `multi` (which
+    /// fast path, if any, is the registry's to say).
+    pub fn protocolConsistent(self: *const Native) bool {
+        const fast: ?FastBuiltin = switch (self.protocol) {
+            .fast => |which| which,
+            else => null,
+        };
+        return std.meta.eql(self.protocol, protocolOf(self.host != null, self.effect != null, fast, self.multi != null));
+    }
 
     pub fn create(
         gpa: std.mem.Allocator,
@@ -429,6 +496,8 @@ pub const BaseNative = struct {
     multi: ?NativeMultiFn = null,
     /// Non-null ⇒ a deterministic builtin the recorder can record (see `RecordedBuiltin`).
     recorded: ?RecordedBuiltin = null,
+    /// Non-null ⇒ a builtin with a tier-0 fast path (see `FastBuiltin`).
+    fast: ?FastBuiltin = null,
     /// If set, install into this module table (a global table) rather than as a
     /// top-level global. The unknown-global lint then knows `module` (not `name`).
     module: ?[]const u8 = null,

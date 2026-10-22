@@ -283,9 +283,12 @@ earlier in `/tmp/t0micro/`).
       native call). The lever is the native ABI: results in registers, or
       natives reading the register lanes directly. LuaJIT's 59 for
       `math.abs` is its assembler fast functions (`ffid` dispatch in
-      `BC_CALL`). The tier-0 equivalent would switch on
-      `Native.recorded` before the generic path and fall back to the
-      native for every other shape. It needs a design doc (doc 70).
+      `BC_CALL`). The tier-0 equivalent is doc 70, landed 2026-10-23 for
+      12 pure builtins (`math.abs` 227 → 151, scalar −12.7%), and its
+      call-protocol byte made every generic native call cheaper too
+      (io_print −0.67%). What's left for the generic path is the ABI
+      (doc 70 Q3), and doc 70's outstanding list (allocating bodies,
+      `math.type`).
       Found along the way: `type` interned its result on every call (5% of
       scalar). Fixed 2026-10-23 with `Vm.type_names`, interned and rooted
       next to the metamethod names: scalar −7.1% tier-0. The 7 strings

@@ -60,13 +60,12 @@ fn floatToIntValue(f: f64) error{TypeError}!Value {
 }
 
 // ---------------------------------------------------------------------------
-// Natives
+// Number cores — the natives' bodies over an already-checked number argument,
+// shared with the interpreter's tier-0 fast paths (doc 70) so the two can
+// never disagree.
 // ---------------------------------------------------------------------------
 
-/// `math.abs(x)` — absolute value, preserving subtype. Integer `abs(mininteger)`
-/// wraps to `mininteger` (Lua uses wrapping integer negation).
-fn mAbs(_: *anyopaque, args: []const Value) anyerror!Value {
-    const x = try numArg(args, 0);
+pub inline fn absOf(x: Value) Value {
     if (x.isInt()) {
         const i = x.asInt();
         return Value.int(if (i < 0) 0 -% i else i);
@@ -74,23 +73,50 @@ fn mAbs(_: *anyopaque, args: []const Value) anyerror!Value {
     return Value.float(@abs(x.asFloat()));
 }
 
-/// `math.ceil(x)` — smallest integer >= x, returned as an integer.
-fn mCeil(_: *anyopaque, args: []const Value) anyerror!Value {
-    const x = try numArg(args, 0);
+pub inline fn ceilOf(x: Value) error{TypeError}!Value {
     if (x.isInt()) return x;
     return floatToIntValue(@ceil(x.asFloat()));
 }
 
-/// `math.floor(x)` — largest integer <= x, returned as an integer.
-fn mFloor(_: *anyopaque, args: []const Value) anyerror!Value {
-    const x = try numArg(args, 0);
+pub inline fn floorOf(x: Value) error{TypeError}!Value {
     if (x.isInt()) return x;
     return floatToIntValue(@floor(x.asFloat()));
 }
 
+pub inline fn sqrtOf(x: Value) Value {
+    return Value.float(@sqrt(x.toFloat()));
+}
+
+/// One step of `math.max`/`math.min`'s scan: `v` replaces `best` only when it
+/// is strictly beyond it, so ties keep the earlier argument (and its subtype).
+pub inline fn pickExtremum(comptime max: bool, best: Value, v: Value) Value {
+    const beyond = if (max) v.toFloat() > best.toFloat() else v.toFloat() < best.toFloat();
+    return if (beyond) v else best;
+}
+
+// ---------------------------------------------------------------------------
+// Natives
+// ---------------------------------------------------------------------------
+
+/// `math.abs(x)` — absolute value, preserving subtype. Integer `abs(mininteger)`
+/// wraps to `mininteger` (Lua uses wrapping integer negation).
+fn mAbs(_: *anyopaque, args: []const Value) anyerror!Value {
+    return absOf(try numArg(args, 0));
+}
+
+/// `math.ceil(x)` — smallest integer >= x, returned as an integer.
+fn mCeil(_: *anyopaque, args: []const Value) anyerror!Value {
+    return ceilOf(try numArg(args, 0));
+}
+
+/// `math.floor(x)` — largest integer <= x, returned as an integer.
+fn mFloor(_: *anyopaque, args: []const Value) anyerror!Value {
+    return floorOf(try numArg(args, 0));
+}
+
 /// `math.sqrt(x)` — square root (always float).
 fn mSqrt(_: *anyopaque, args: []const Value) anyerror!Value {
-    return Value.float(@sqrt((try numArg(args, 0)).toFloat()));
+    return sqrtOf(try numArg(args, 0));
 }
 
 /// `math.exp(x)` — e^x (always float).
@@ -178,10 +204,7 @@ fn mFmod(_: *anyopaque, args: []const Value) anyerror!Value {
 fn mMax(_: *anyopaque, args: []const Value) anyerror!Value {
     var best = try numArg(args, 0);
     var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const v = try numArg(args, i);
-        if (v.toFloat() > best.toFloat()) best = v;
-    }
+    while (i < args.len) : (i += 1) best = pickExtremum(true, best, try numArg(args, i));
     return best;
 }
 
@@ -190,10 +213,7 @@ fn mMax(_: *anyopaque, args: []const Value) anyerror!Value {
 fn mMin(_: *anyopaque, args: []const Value) anyerror!Value {
     var best = try numArg(args, 0);
     var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const v = try numArg(args, i);
-        if (v.toFloat() < best.toFloat()) best = v;
-    }
+    while (i < args.len) : (i += 1) best = pickExtremum(false, best, try numArg(args, i));
     return best;
 }
 
@@ -259,10 +279,10 @@ fn mModfN(_: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 /// appends this slice; install and keyframe-restore both read it by qualified
 /// `name`, so the names here are the serialized identities and must stay unique.
 pub const natives = [_]function.BaseNative{
-    .{ .name = "math.abs", .func = &mAbs, .module = "math", .field = "abs" },
-    .{ .name = "math.ceil", .func = &mCeil, .module = "math", .field = "ceil", .recorded = .ceil },
-    .{ .name = "math.floor", .func = &mFloor, .module = "math", .field = "floor", .recorded = .floor },
-    .{ .name = "math.sqrt", .func = &mSqrt, .module = "math", .field = "sqrt", .recorded = .sqrt },
+    .{ .name = "math.abs", .func = &mAbs, .module = "math", .field = "abs", .fast = .abs },
+    .{ .name = "math.ceil", .func = &mCeil, .module = "math", .field = "ceil", .recorded = .ceil, .fast = .ceil },
+    .{ .name = "math.floor", .func = &mFloor, .module = "math", .field = "floor", .recorded = .floor, .fast = .floor },
+    .{ .name = "math.sqrt", .func = &mSqrt, .module = "math", .field = "sqrt", .recorded = .sqrt, .fast = .sqrt },
     .{ .name = "math.exp", .func = &mExp, .module = "math", .field = "exp" },
     .{ .name = "math.log", .func = &mLog, .module = "math", .field = "log" },
     .{ .name = "math.sin", .func = &mSin, .module = "math", .field = "sin", .recorded = .sin },
@@ -275,8 +295,8 @@ pub const natives = [_]function.BaseNative{
     .{ .name = "math.rad", .func = &mRad, .module = "math", .field = "rad" },
     .{ .name = "math.fmod", .func = &mFmod, .module = "math", .field = "fmod" },
     .{ .name = "math.modf", .func = &mModf1, .multi = &mModfN, .module = "math", .field = "modf" },
-    .{ .name = "math.max", .func = &mMax, .module = "math", .field = "max" },
-    .{ .name = "math.min", .func = &mMin, .module = "math", .field = "min" },
+    .{ .name = "math.max", .func = &mMax, .module = "math", .field = "max", .fast = .max },
+    .{ .name = "math.min", .func = &mMin, .module = "math", .field = "min", .fast = .min },
     .{ .name = "math.tointeger", .func = &mToInteger, .module = "math", .field = "tointeger" },
     .{ .name = "math.ult", .func = &mUlt, .module = "math", .field = "ult" },
 };

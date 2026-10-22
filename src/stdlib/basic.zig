@@ -119,7 +119,7 @@ fn selectStart(vm: *Vm, args: []const Value) anyerror!usize {
 
 /// `select("#", ...)` returns the count of extra args; this is the primary
 /// projection helper distinguishing the `"#"` form from the numeric form.
-fn isHashSelector(v: Value) bool {
+pub fn isHashSelector(v: Value) bool {
     if (interp.strBytes(v)) |s| return s.len == 1 and s[0] == '#';
     return false;
 }
@@ -285,14 +285,14 @@ pub const natives = [_]function.BaseNative{
     // `.recorded` tags land together with their recorder arms (doc 23 D1):
     // a tag makes `recCall` dispatch to `trace.recBuiltin`, whose arm owns the
     // observed-shape abort matrix for that builtin.
-    .{ .name = "type", .func = &bType, .recorded = .type },
+    .{ .name = "type", .func = &bType, .recorded = .type, .fast = .type },
     .{ .name = "tostring", .func = &bToString, .recorded = .tostring },
     .{ .name = "tonumber", .func = &bToNumber, .recorded = .tonumber },
-    .{ .name = "select", .func = &bSelect1, .multi = &bSelectN, .recorded = .select },
-    .{ .name = "rawequal", .func = &bRawEqual, .recorded = .rawequal },
-    .{ .name = "rawget", .func = &bRawGet, .recorded = .rawget },
+    .{ .name = "select", .func = &bSelect1, .multi = &bSelectN, .recorded = .select, .fast = .select },
+    .{ .name = "rawequal", .func = &bRawEqual, .recorded = .rawequal, .fast = .rawequal },
+    .{ .name = "rawget", .func = &bRawGet, .recorded = .rawget, .fast = .rawget },
     .{ .name = "rawset", .func = &bRawSet, .recorded = .rawset },
-    .{ .name = "rawlen", .func = &bRawLen, .recorded = .rawlen },
+    .{ .name = "rawlen", .func = &bRawLen, .recorded = .rawlen, .fast = .rawlen },
     .{ .name = "setmetatable", .func = &bSetMetatable },
     .{ .name = "getmetatable", .func = &bGetMetatable },
     .{ .name = "math.type", .func = &mType, .module = "math", .field = "type", .recorded = .mtype },

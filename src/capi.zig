@@ -1257,6 +1257,7 @@ pub export fn mh_register_fn(vm: ?*VmBox, name: mh_str, cfn: ?mh_host_fn, userda
         return oom(box);
     };
     native.host = binding;
+    native.protocol = .host;
 
     if (std.mem.indexOfScalar(u8, n, '.')) |dot| {
         const mod = n[0..dot];

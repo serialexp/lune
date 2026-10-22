@@ -3395,6 +3395,7 @@ test "doc 61 P3: a native callee reached through a metamethod stays rooted while
     binding.* = .{ .call = &SelfDrop.call, .destroy = &SelfDrop.destroy, .name = try gpa.dupe(u8, "selfdrop") };
     const native = try vm.heap.newNative(&SelfDrop.call_stub, binding.name);
     native.host = binding;
+    native.protocol = .host;
     try vm.globals.set(gpa, try vm.heap.internValue("selfdrop"), Value.heap(&native.header));
 
     // `make` builds the metatable in its own frame, so no stale register of

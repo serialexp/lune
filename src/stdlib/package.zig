@@ -451,6 +451,7 @@ pub fn installPackageRuntime(vm: *Vm) interp.Error!void {
     for (searcher_natives, 0..) |bn, idx| {
         const nat = try vm.heap.newNative(bn.func, bn.name);
         nat.multi = bn.multi; // searchers return (loader, data) → keep the 2-result projection
+        nat.protocol = function.Native.protocolOf(false, false, null, bn.multi != null);
         try searchers.set(vm.gpa, Value.int(@as(i64, @intCast(idx)) + 1), Value.heap(&nat.header));
     }
 }

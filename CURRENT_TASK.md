@@ -256,15 +256,23 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     - Q1 (merged gate owner), Q2 (lazy pc; §5 has the read-only reader
       audit) and Q3 (omit_frame_pointer) wait on Bart. He hasn't answered
       yet, so none is started.
-  - Next: item 5's structural part, doc 69 P3, the call/return transitions.
-    Callgrind on the uv build:
-    - opCall ~190 and opRet ~140 instructions;
-    - `reloadTopFrame`+`cachedCodeFor` ~70;
-    - `onCallEntry` ~32;
-    - `setRegionContext` twice per call, and a ~96-byte frame write.
-
-    Coordinate interp.zig with coral-raven, whose doc 68 P2/P3 slices
-    touch the same push path.
+  - **11c6287**: doc 69 P3, the call/return transitions (call0 355 → 293,
+    call1 490 → 417; recursive-fib −16% tier-0). Doc 69 §3b has the
+    register-allocation lessons.
+  - **02892e7**: `#t` binary-searches its border (LuaJIT's `lj_tab_len`),
+    plus an opLen table fast path; new bench `tbl_stack`. Bart didn't
+    answer the border-semantics question, so it took LuaJIT's default;
+    doc 18 records the alternatives.
+  - **3dfb1de**: `type` returns cached interned names (`Vm.type_names`),
+    scalar −7.1%. The 7 interned strings move later object ids by 7
+    (field_hash −3.2%, array3d +0.47% are that id lottery).
+  - Doc 70, tier-0 fast functions (`docs/design/70-tier0-fast-functions.md`):
+    12 pure builtins skip the generic native call (`Native.protocol` byte,
+    `opCallFast`, `fastResult`), scalar −12.7%, nsieve-bit-fp −9.9%;
+    `itern`'s call fallback moved to `opIternCall` (`coldTail`). Q1–Q3
+    unanswered, defaults recorded in doc 70 §7. The one row above the bar
+    is while_shortcircuit_probe +0.10% (≈650 instructions of install).
+    Outstanding there: `math.type`, allocating bodies, the generic ABI.
   - Scratch shadows are under /tmp/p1:
     - `ab2.sh BASE NEW`: instructions:u A/B over every @bench program, both
       tiers;

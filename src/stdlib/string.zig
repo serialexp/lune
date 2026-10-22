@@ -1640,7 +1640,7 @@ fn sDecode(ctx: *anyopaque, args: []const Value) anyerror!Value {
 // ---------------------------------------------------------------------------
 
 pub const natives = [_]function.BaseNative{
-    .{ .name = "string.len", .func = &sLen, .module = "string", .field = "len", .recorded = .len },
+    .{ .name = "string.len", .func = &sLen, .module = "string", .field = "len", .recorded = .len, .fast = .len },
     .{ .name = "string.sub", .func = &sSub, .module = "string", .field = "sub", .recorded = .sub },
     .{ .name = "string.reverse", .func = &sReverse, .module = "string", .field = "reverse", .recorded = .reverse },
     .{ .name = "string.upper", .func = &sUpper, .module = "string", .field = "upper", .recorded = .upper },

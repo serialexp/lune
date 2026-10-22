@@ -20,6 +20,10 @@ instructions, against LuaJIT `-joff`. These are not `@bench` programs, so
   registers (`ifeq`). The bitwise
   probes compile through `load`, so the file still parses under LuaJIT.
 - `fields.lua`: field reads, writes and `__index` method lookup (item 2).
+- `builtins.lua`: doc 70's probes, one call per iteration of a builtin
+  held in a local: `type`, `floor`, `abs`, `sqrt`, `max`, `rawget`,
+  `rawequal`, `slen` (`string.len`) and `selectn` (`select('#', ...)`
+  in a vararg function). LuaJIT-compatible.
 
 Usage, from the repo root, with a ReleaseFast build (`just release`):
 
