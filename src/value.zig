@@ -221,20 +221,28 @@ pub const Value = extern struct {
     /// "attempt to perform arithmetic on a nil value"). Both closures and native
     /// functions report as "function"; tables and typed arrays as "table".
     pub fn typeName(self: Value) []const u8 {
+        return @tagName(self.typeNameId());
+    }
+
+    /// The `type(v)` names, one tag per distinct string; `typeName` is the
+    /// tag's name. `Vm.type_names` caches each as an interned string.
+    pub const TypeName = enum(u8) { nil, boolean, number, string, table, function, upvalue, userdata, value };
+
+    pub fn typeNameId(self: Value) TypeName {
         return switch (self.tag) {
-            .nil => "nil",
-            .boolean => "boolean",
-            .int, .float => "number",
+            .nil => .nil,
+            .boolean => .boolean,
+            .int, .float => .number,
             .heap_ref => switch (self.heapType()) {
-                .string => "string",
-                .table, .typed_array => "table",
-                .function, .native => "function",
-                .upvalue => "upvalue",
-                .host => "userdata",
-                _ => "value",
+                .string => .string,
+                .table, .typed_array => .table,
+                .function, .native => .function,
+                .upvalue => .upvalue,
+                .host => .userdata,
+                _ => .value,
             },
             // A grid row is observationally a table.
-            .row_view => "table",
+            .row_view => .table,
         };
     }
 

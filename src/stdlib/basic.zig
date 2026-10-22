@@ -53,7 +53,7 @@ inline fn vmOf(ctx: *anyopaque) *Vm {
 fn bType(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     if (args.len == 0) return error.TypeError; // Lua: "bad argument #1 to 'type' (value expected)"
-    return vm.heap.internValue(args[0].typeName());
+    return vm.typeNameValue(args[0]);
 }
 
 /// `tostring(v)` — render `v` to a string. A `__tostring` metamethod wins first
@@ -322,6 +322,41 @@ test "type / math.type name the subtype" {
     try testing.expectEqualStrings("integer", bytesOf(try mType(@ptrCast(&vm), &.{Value.int(1)})));
     try testing.expectEqualStrings("float", bytesOf(try mType(@ptrCast(&vm), &.{Value.float(1.5)})));
     try testing.expect((try mType(@ptrCast(&vm), &.{try vm.heap.internValue("x")})).isNil());
+}
+
+test "type hands back one cached string per name, across a collection" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    const ctx: *anyopaque = @ptrCast(&vm);
+    const tbl = try vm.heap.newTable();
+    const cases = [_]struct { v: Value, name: []const u8 }{
+        .{ .v = Value.int(1), .name = "number" },
+        .{ .v = Value.nil(), .name = "nil" },
+        .{ .v = Value.boolean(false), .name = "boolean" },
+        .{ .v = try vm.heap.internValue("s"), .name = "string" },
+        .{ .v = Value.heap(&tbl.header), .name = "table" },
+    };
+    var first: [cases.len]Value = undefined;
+    for (cases, 0..) |c, i| {
+        first[i] = try bType(ctx, &.{c.v});
+        try testing.expectEqualStrings(c.name, bytesOf(first[i]));
+    }
+    // The cache is a GC root: after a collection each name is still the
+    // object the intern table holds (a swept entry would be gone from it), and
+    // `type` still returns it. Only the scalar inputs are asked again; the
+    // table and string above are unrooted and the collection frees them.
+    vm.collect();
+    for (cases[0..3], 0..) |c, i| {
+        const live = vm.heap.internedLookup(c.name) orelse return error.TestExpectedEqual;
+        try testing.expectEqual(first[i].asHeap(), &live.header);
+        try testing.expectEqual(first[i].asHeap(), (try bType(ctx, &.{c.v})).asHeap());
+    }
+}
+
+test "type in a bare VM interns its result" {
+    var vm = try Vm.initBare(testing.allocator);
+    defer vm.deinit();
+    try testing.expectEqualStrings("number", bytesOf(try bType(@ptrCast(&vm), &.{Value.int(1)})));
 }
 
 test "tostring renders scalars; passes strings through" {

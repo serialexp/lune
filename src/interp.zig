@@ -918,6 +918,10 @@ pub const Vm = struct {
     /// keyframe restorer rebuilds them after seeding the heap. GC-rooted via
     /// `forEachRootHeader`.
     mm: MetamethodNames = .{},
+    /// The interned `type(v)` result strings, indexed by `Value.TypeName`, so
+    /// `type` never re-interns (it hashed its result on every call). Interned
+    /// and rooted with `mm`; all `nil` in a bare VM.
+    type_names: [@typeInfo(Value.TypeName).@"enum".field_names.len]Value = @splat(Value.nil()),
     /// The shared built-in **string metatable** (chunk 2a / M3): a table whose
     /// `__index` is the `string` module table, so indexing a string with an
     /// absent raw key flows through to the string library and `("x"):upper()`
@@ -1121,6 +1125,19 @@ pub const Vm = struct {
         inline for (@typeInfo(MetamethodNames).@"struct".field_names) |name| {
             @field(self.mm, name) = try self.heap.internValue("__" ++ name);
         }
+        // The `type` result names ride along: the same idempotent interning,
+        // so the keyframe restorer re-derives them too.
+        inline for (@typeInfo(Value.TypeName).@"enum".field_names, 0..) |name, i| {
+            self.type_names[i] = try self.heap.internValue(name);
+        }
+    }
+
+    /// `type(v)`'s result: the cached interned name, or a fresh intern in a
+    /// bare VM (no cache).
+    pub fn typeNameValue(self: *Vm, v: Value) std.mem.Allocator.Error!Value {
+        const cached = self.type_names[@intFromEnum(v.typeNameId())];
+        if (!cached.isNil()) return cached;
+        return self.heap.internValue(v.typeName());
     }
 
     fn initMetatableSupport(self: *Vm) Error!void {
@@ -3154,6 +3171,7 @@ pub const Vm = struct {
             const v = @field(self.mm, name);
             if (v.isHeap()) cb(ctx, v.asHeap());
         }
+        for (self.type_names) |v| if (v.isHeap()) cb(ctx, v.asHeap());
         if (self.string_metatable) |smt| cb(ctx, &smt.header);
     }
 

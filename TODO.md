@@ -281,7 +281,18 @@ earlier in `/tmp/t0micro/`).
       share one LLVM function, so each arm's register allocation moves
       with any change to the other (doc 69 §3b: three shapes, ±1–2 per
       native call). The lever is the native ABI: results in registers, or
-      natives reading the register lanes directly.
+      natives reading the register lanes directly. LuaJIT's 59 for
+      `math.abs` is its assembler fast functions (`ffid` dispatch in
+      `BC_CALL`). The tier-0 equivalent would switch on
+      `Native.recorded` before the generic path and fall back to the
+      native for every other shape. It needs a design doc (doc 70).
+      Found along the way: `type` interned its result on every call (5% of
+      scalar). Fixed 2026-10-23 with `Vm.type_names`, interned and rooted
+      next to the metamethod names: scalar −7.1% tier-0. The 7 strings
+      interned at init move every later object id by 7, so id-hashed
+      tables' probe chains reshuffle: field_hash −3.2%, array3d +0.47%,
+      str_gsub +0.09%, the same numbers with the interning alone and no
+      cache. Eight GC tests that pin `table: 0x…` ids moved by +7.
 - [ ] **Dispatch prologue, ~18 instructions per op** (doc 42 §4.2): GC
       check (two dependent loads), `safepoint_seq` bump, region count
       test, `frame.pc` store, fetch, jump. LuaJIT's is ~5. Each step is
