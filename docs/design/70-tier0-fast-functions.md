@@ -136,6 +136,13 @@ asserts in safety builds that the byte agrees with `host`, `effect` and
 `multi` (`protocolConsistent`). A ReleaseFast `assert` would be an
 assumption, and LLVM tested the fields again.
 
+Follow-up (2026-10-23, doc 66's `ipairs` lane). Doc 66 added a second
+registry byte, `Native.itern`, and storing it cost another ~320
+instructions per start. Registry rows are now whole comptime `Native`
+templates (`interp.base_templates`), protocol included, and
+`Heap.newNativeFrom` copies one. A VM start is 2k instructions under
+the protocol-byte cost, and while_shortcircuit_probe −0.27% tier-0.
+
 **`itern`'s fallback in its own handler.** `opIternSlow` inlined
 `callTail` for the call it falls back to, so the larger native arm moved
 its `next` step (+3 instructions per hash step). The call is now

@@ -281,6 +281,10 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     −2.1%, recursive-fib −1.5% on both tiers.
   - Doc 66 follow-up: `opItern` takes the hash part's usual step from a
     built view, a hash `pairs` step 247 → 64; pairs_hash −42.5% tier-0.
+  - Doc 66 follow-up: `ipairs` through `itern` on a per-native lane byte
+    (`IternLane`), 270 → 93 a step. Registry natives install from comptime
+    templates. It also fixed the `ipairs` native's overflow at
+    maxinteger.
   - Scratch shadows are under /tmp/p1:
     - `ab2.sh BASE NEW`: instructions:u A/B over every @bench program, both
       tiers;

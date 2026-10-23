@@ -223,8 +223,6 @@ fn nNextN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 // ipairs iterator — numeric, stops at the first nil
 // ---------------------------------------------------------------------------
 
-/// `@ipairs_iter(t, i)` primary projection — the next index `i+1`, or nil when
-/// `t[i+1]` is nil (stops the loop).
 /// `container[j]` for an integer key over a table or `row_view` — the `ipairs`
 /// iterator's per-step read.
 fn iterableGetInt(container: Value, j: i64) Value {
@@ -232,11 +230,14 @@ fn iterableGetInt(container: Value, j: i64) Value {
     return Table.fromHeader(container.asHeap()).getInt(j);
 }
 
+/// `@ipairs_iter(t, i)` primary projection — the next index `i+1`, or nil when
+/// `t[i+1]` is nil (stops the loop). `i+1` wraps as Lua's does, so a
+/// `math.maxinteger` control reads `t[math.mininteger]`.
 fn nInext1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const container = try iterableArg(vm, args, 0);
     const i = if (args.len >= 2 and args[1].isInt()) args[1].asInt() else 0;
-    const j = i + 1;
+    const j = i +% 1;
     return if (iterableGetInt(container, j).isNil()) Value.nil() else Value.int(j);
 }
 
@@ -246,7 +247,7 @@ fn nInextN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
     const container = try iterableArg(vm, args, 0);
     const i = if (args.len >= 2 and args[1].isInt()) args[1].asInt() else 0;
-    const j = i + 1;
+    const j = i +% 1;
     const v = iterableGetInt(container, j);
     if (v.isNil()) return 0;
     if (out.len >= 1) out[0] = Value.int(j);
@@ -301,7 +302,7 @@ pub const natives = [_]function.BaseNative{
     .{ .name = "next", .func = &nNext1, .multi = &nNextN },
     .{ .name = "pairs", .func = &nPairs1, .multi = &nPairsN },
     .{ .name = "ipairs", .func = &nIpairs1, .multi = &nIpairsN },
-    .{ .name = ipairs_iter_name, .func = &nInext1, .multi = &nInextN },
+    .{ .name = ipairs_iter_name, .func = &nInext1, .multi = &nInextN, .itern = .inext },
 };
 
 test "next keeps its sorted view across traversals, and a collection mid-walk drops it" {

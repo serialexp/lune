@@ -273,13 +273,23 @@ comptime {
     }
 }
 
-/// Each `base_natives` row's `Native.protocol`, derived at compile time so
-/// installing a native stores one byte (doc 70). A registry row is never a
+/// Each `base_natives` row's `Native`, built at compile time with every
+/// registry-derived field (its call protocol included, doc 70), so
+/// installing a native copies one template. A registry row is never a
 /// host function.
-const base_protocols = blk: {
-    var p: [base_natives.len]function.Native.CallProtocol = undefined;
-    for (base_natives, &p) |bn, *proto| proto.* = function.Native.protocolOf(false, bn.effect != null, bn.fast, bn.multi != null);
-    break :blk p;
+const base_templates = blk: {
+    var t: [base_natives.len]function.Native = undefined;
+    for (base_natives, &t) |bn, *n| n.* = .{
+        .header = object.GcHeader.init(.native),
+        .func = bn.func,
+        .name = bn.name,
+        .effect = bn.effect,
+        .multi = bn.multi,
+        .recorded = bn.recorded,
+        .protocol = function.Native.protocolOf(false, bn.effect != null, bn.fast, bn.multi != null),
+        .itern = bn.itern,
+    };
+    break :blk t;
 };
 
 /// The interpreter's own natives. `print` is pure output; `clock` is the first
@@ -1777,7 +1787,7 @@ pub const Vm = struct {
     /// `base_natives` registry — the same table the keyframe restorer reads to
     /// rebind a serialized native by name, so install and restore can never drift.
     fn installBaseLib(self: *Vm) Error!void {
-        for (base_natives, base_protocols) |bn, protocol| try self.defineNative(bn, protocol);
+        for (base_natives, &base_templates) |bn, *template| try self.defineNative(bn, template);
         for (base_constants) |c| try self.defineConstant(c);
         // `arg` is a real (initially empty) table so the lint, tests, the wasm
         // host, and keyframe restore all see a table; `arg[i]` is nil until the
@@ -1804,16 +1814,12 @@ pub const Vm = struct {
         try stdpackage.installPackageRuntime(self);
     }
 
-    fn defineNative(self: *Vm, bn: BaseNative, protocol: function.Native.CallProtocol) Error!void {
+    fn defineNative(self: *Vm, bn: BaseNative, template: *const function.Native) Error!void {
         // `manual` natives have no install slot — they exist in `base_natives` only
         // so the keyframe restorer can rebind them by name (e.g. the default
         // `package.searchers`, which `installPackageRuntime` places into an array).
         if (bn.manual) return;
-        const native = try self.heap.newNative(bn.func, bn.name);
-        native.effect = bn.effect; // null for pure host calls (e.g. print)
-        native.multi = bn.multi; // null unless the native can return ≥2 results
-        native.recorded = bn.recorded; // null unless a JIT-inlinable pure builtin (e.g. sqrt)
-        native.protocol = protocol; // `bn`'s, precomputed (doc 70)
+        const native = try self.heap.newNativeFrom(template);
         if (bn.module) |mod| {
             const tbl = try self.getOrCreateModuleTable(mod);
             const fkey = try self.heap.internValue(bn.field.?);
@@ -3708,6 +3714,22 @@ pub const Vm = struct {
     inline fn coldTail(comptime mode: ExecMode, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
         const table_ = if (mode == .fast) &cold_table_fast else &cold_table_full;
         return @call(.always_tail, table_[@intFromEnum(instr.op)], .{ st, pc, instr, vm, tags, payloads });
+    }
+
+    /// `itern`'s lanes for a native iterator other than `next`, indexed by
+    /// its `IternLane` byte. That load replaces `coldTail`'s opcode load, so
+    /// a lane costs other iterators nothing, and the runtime index keeps
+    /// LLVM from inlining a lane into `opItern`.
+    const itern_lanes_fast = buildIternLanes(.fast);
+    const itern_lanes_full = buildIternLanes(.full);
+
+    fn buildIternLanes(comptime mode: ExecMode) [@typeInfo(function.IternLane).@"enum".field_names.len]*const HandlerFn {
+        return .{ opIternCall(mode), opIternInext(mode) };
+    }
+
+    inline fn iternLaneTail(comptime mode: ExecMode, lane: function.IternLane, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+        const table_ = if (mode == .fast) &itern_lanes_fast else &itern_lanes_full;
+        return @call(.always_tail, table_[@intFromEnum(lane)], .{ st, pc, instr, vm, tags, payloads });
     }
 
     fn noSlowPath(_: *ExecState, _: usize, instr: *const Instr, _: *Vm, _: [*]u8, _: [*]u64) HandlerResult {
@@ -7693,8 +7715,13 @@ pub const Vm = struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
                 const a: usize = instr.a;
-                // Another iterator is just the call `itern` replaced.
-                if (!isNextNative(regs.get(a))) return coldTail(mode, st, pc, instr, vm, tags, payloads);
+                const f = regs.get(a);
+                if (!(f.isHeap() and f.heapType() == .native))
+                    return coldTail(mode, st, pc, instr, vm, tags, payloads);
+                const nat = function.Native.fromHeader(f.asHeap());
+                // Another native iterator takes its own lane (`IternLane`),
+                // `opIternCall` for most: the call `itern` replaced.
+                if (!stdbase.isNext(nat)) return iternLaneTail(mode, nat.itern, st, pc, instr, vm, tags, payloads);
                 const s = regs.get(a + 1);
                 if (s.isHeap() and s.heapType() == .table) {
                     const t = table.Table.fromHeader(s.asHeap());
@@ -7761,6 +7788,34 @@ pub const Vm = struct {
                 }
                 // Its own handler (`coldTail`), so the call's register
                 // pressure stays off the `next` step above.
+                return coldTail(mode, st, pc, instr, vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// `ipairs`'s step over a plain table, call-free: `nInextN`'s
+    /// `(i+1, t[i+1])`, or none at the first nil, `i+1` wrapping as the
+    /// native's does. A grid (which the native deflates), a `row_view`, or a
+    /// control that is not an integer is the call `itern` replaced.
+    fn opIternInext(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const a: usize = instr.a;
+                const s = regs.get(a + 1);
+                const ctrl = regs.get(a + 2);
+                if (s.isHeap() and s.heapType() == .table and ctrl.isInt()) {
+                    const t = table.Table.fromHeader(s.asHeap());
+                    if (!t.array.isGrid()) {
+                        const j = ctrl.asInt() +% 1;
+                        const v = t.getInt(j);
+                        if (v.isNil())
+                            writeIternStep(regs, a, instr.c, Value.nil(), Value.nil())
+                        else
+                            writeIternStep(regs, a, instr.c, Value.int(j), v);
+                        return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+                    }
+                }
                 return coldTail(mode, st, pc, instr, vm, tags, payloads);
             }
         }.h;

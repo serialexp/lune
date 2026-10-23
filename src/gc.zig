@@ -557,6 +557,15 @@ pub const Heap = struct {
         return n;
     }
 
+    /// Allocate a copy of `template` (an unlinked native, e.g. a registry
+    /// row's `interp.base_templates` entry) and register it with the heap.
+    pub fn newNativeFrom(self: *Heap, template: *const Native) std.mem.Allocator.Error!*Native {
+        const n = try self.gpa.create(Native);
+        n.* = template.*;
+        self.link(&n.header);
+        return n;
+    }
+
     /// Allocate an *open* upvalue over live stack slot `index`, whose lanes
     /// are `tag` and `payload`, and register it with the heap. Closing is the
     /// interpreter's job.

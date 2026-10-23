@@ -745,6 +745,7 @@ pub fn restoreSnapshot(
                 n.multi = entry.multi; // …and keeps its multi-result projection
                 n.recorded = entry.recorded; // …and its JIT-inlinable pure-builtin tag
                 n.protocol = function.Native.protocolOf(false, entry.effect != null, entry.fast, entry.multi != null); // …and its call protocol (doc 70)
+                n.itern = entry.itern; // …and its `itern` lane (doc 66)
                 // `pure ⇒ !effect` (doc 17, H-4 / 9-A(i)). The static `base_natives`
                 // registry is comptime-proven in `interp.zig`; this guards a
                 // caller-supplied `NativeRegistry` on the restore path.

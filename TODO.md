@@ -26,8 +26,8 @@ earlier in `/tmp/t0micro/`).
       `ISNEXT` checks the iterator is the real `next`) and no call. Fixed
       2026-10-23 by doc 66 P1 (`itern`, d21a333): a hash step 455 → 256,
       an array step 394 → 60 (LuaJIT `-joff` 17 and 10). The hash step
-      went 247 → 64 on 2026-10-23 (doc 66, pairs_hash −42.5%); the
-      `ipairs` follow-up is in doc 66's Outstanding list.
+      went 247 → 64 on 2026-10-23 (doc 66, pairs_hash −42.5%), and an
+      `ipairs` step 270 → 93 (doc 66's `IternLane`).
 - [x] **`for_loop` has no integer fast path.** An empty `for` loop costs
       206 instructions per iteration (LuaJIT 18). Every iteration calls
       `arith.add`, `arith.lt(step, 0)` and `arith.le` out of line, with

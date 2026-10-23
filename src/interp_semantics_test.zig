@@ -1540,6 +1540,54 @@ test "doc 66 P1: any other iterator is the call `itern` replaced" {
     );
 }
 
+test "doc 66: `itern` steps `ipairs` exactly as its native does" {
+    // The `inext` lane: holes, a hash-only array, a `[0]` key, an array
+    // grown and shrunk mid-walk, a float, string or maxinteger control (all
+    // three the native's call; maxinteger wraps to `t[mininteger]`, as Lua's
+    // `ipairs` does), more loop variables than it returns, nested walks, and
+    // the faults with the native's message (as before the lane).
+    try expectProgram(
+        \\local function walk(t)
+        \\  local out = {}
+        \\  for i, v in ipairs(t) do out[#out + 1] = i .. "=" .. tostring(v) end
+        \\  return table.concat(out, " ")
+        \\end
+        \\local h = {}; h[1] = "a"; h[2] = "b"; h[4] = "d"
+        \\print(walk({ 1, 2, 3, nil, 5 }), walk({}), walk(h), walk({ [0] = 0, 1 }))
+        \\local grow, n = { 1 }, 0
+        \\for i, v in ipairs(grow) do n = n + v; if i < 5 then grow[i + 1] = i + 1 end end
+        \\local shrink, m = { 1, 2, 3, 4 }, 0
+        \\for i in ipairs(shrink) do m = m + i; shrink[3] = nil end
+        \\print(n, m)
+        \\local f, s = ipairs({ 10, 20, 30 })
+        \\for i, v in f, s, 1 do io.write(i, v, " ") end
+        \\for i, v in f, s, 1.0 do io.write(i, v, " ") end
+        \\for i, v in f, s, "x" do io.write(i, v, " ") end
+        \\for i, v in f, { 1, [math.mininteger] = "w" }, math.maxinteger do io.write(i, v, " ") end
+        \\for i in ipairs({ 7, 8 }) do io.write(i, " ") end
+        \\for i, v, w in ipairs({ 7 }) do io.write(i, v, tostring(w), " ") end
+        \\print()
+        \\local g = 0
+        \\for _, row in ipairs({ { 10, 2 }, { 3, 4 } }) do for _, x in ipairs(row) do g = g + x end end
+        \\print(g)
+        \\
+    ,
+        "1=1 2=2 3=3\t\t1=a 2=b\t1=1\n" ++
+            "15\t3\n" ++
+            "220 330 110 220 330 110 220 330 -9223372036854775808w 1 2 17nil \n" ++
+            "19\n",
+    );
+    try expectProgram(
+        \\local f = ipairs({})
+        \\print(pcall(function() for i, v in f, 5, 0 do end end))
+        \\print(pcall(function() for i, v in f, "ab", 0 do end end))
+        \\
+    ,
+        "false\tanonymous:2: bad argument #1 to '@ipairs_iter' (table expected, got number)\n" ++
+            "false\tanonymous:3: bad argument #1 to '@ipairs_iter' (table expected, got string)\n",
+    );
+}
+
 test "doc 66 P1: one generic `for` traced with `gmatch` keeps its trace across `pairs`" {
     // One compiled loop driven by `gmatch`, then by `pairs` and `next`,
     // then by `gmatch` with another pattern and the first one again. The

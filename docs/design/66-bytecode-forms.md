@@ -330,15 +330,34 @@ land; move whole phases to Done once everything inside them is checked.
   tier-0, −39.6% `--jit-native`, no other row moved. Inside `opItern`
   but shaped as a check on the control, the array lane stayed at 54
   instructions; a fuller `nextLiveBuilt(?Value)` there cost it +8.
+- [x] **`ipairs` through `itern`** (follow-up to P1, §5.1's last
+  paragraph, 2026-10-23). `ipairs` was 270 instructions a step against
+  LuaJIT's 62; it is now 92.6. A per-step identity check for a second
+  builtin in `opItern` cost str_gmatch's iterator 0.15–0.46%, so the
+  identity is a byte instead. `Native.itern` (`function.IternLane`) is
+  set from the registry row, and `opItern`, after testing for `next`,
+  leaves through a table indexed by it (`iternLaneTail`): `.call` to
+  `opIternCall`, `.inext` to `opIternInext`. That load replaces
+  `coldTail`'s opcode load, so the other iterators pay nothing.
+  `opIternInext` steps a non-grid table with an integer control; a grid
+  (the native deflates it), a `row_view` or another control takes the
+  call. The extra byte at install cost about 320 instructions per VM
+  start, so registry natives are now one comptime `Native` template
+  each (`interp.base_templates`, `Heap.newNativeFrom`). Install is a
+  struct copy, and a VM start is 2k instructions cheaper than before
+  (doc 70's while_shortcircuit cost, −0.27%). No other `@bench` row
+  moved. The test found a bug that predates this change: the `ipairs`
+  native's `i + 1` overflowed at `math.maxinteger` (a Debug panic,
+  wrapped by accident in release). It now wraps as Lua's does, to
+  `t[math.mininteger]`. Test: "`itern` steps `ipairs` exactly as its
+  native does".
 
 ### Outstanding
 
 - [ ] **Defer: a `sar` constant form.** Q6's set leaves mahina's `~>>`
   (`sar`, no Lua 5.4 spelling, 0 `@bench` sites) on the register form.
 
-- [ ] **`ipairs` through `itern`** (follow-up to P1, §5.1's last
-  paragraph). A second builtin identity with an array-only step. `ipairs`
-  is 306 instructions a step against LuaJIT's 62.
+
 - [ ] **Decode inlined branch guards against their own proto** (follow-up
   to the fix above). Today they are simply not classified. An option is
   to carry the guard's proto in provenance, so a callee's own loop test

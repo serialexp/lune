@@ -60,7 +60,7 @@ P.apairs = function(n)
   for r = 1, math.floor(n / 100) do for k, v in pairs(t) do s = s + v end end
   return s
 end
--- And `ipairs`, which `itern` runs as the call it replaced.
+-- And `ipairs`, on `itern`'s `inext` lane (doc 66).
 P.ipairs = function(n)
   local t = {}
   for i = 1, 100 do t[i] = i end

@@ -442,9 +442,12 @@ pub const Native = struct {
     /// How a tier-0 `.call` invokes this native (doc 70): the call arm
     /// switches on it, instead of testing `host`, `effect` and `multi` in
     /// turn. Set with `protocolOf` wherever those fields are set (the
-    /// registry rows' values are precomputed, `interp.base_protocols`); the
+    /// registry rows' values are precomputed, `interp.base_templates`); the
     /// call arm asserts that it agrees with the fields.
     protocol: CallProtocol = .plain,
+    /// How `itern` steps a generic `for` with this native as its iterator
+    /// (doc 66). Set from the registry like `protocol`.
+    itern: IternLane = .call,
 
     pub const CallProtocol = union(enum(u8)) {
         /// `func`, one result.
@@ -512,6 +515,18 @@ pub const Native = struct {
     }
 };
 
+/// How `itern` steps a generic `for` whose iterator is a native (doc 66):
+/// the call it stands for, or a call-free step of the iterator's own.
+/// `opItern` tests for `next` itself and leaves for any other iterator
+/// through a table indexed by this byte, so a lane costs the other
+/// iterators nothing.
+pub const IternLane = enum(u8) {
+    /// The call `itern a, c` replaced (`opIternCall`).
+    call,
+    /// `ipairs`'s iterator, `@ipairs_iter` (`opIternInext`).
+    inext,
+};
+
 /// One built-in native, as a *registry descriptor* (distinct from the heap
 /// `Native` object above). `name` is the native's **serialized identity** — the
 /// key the keyframe restorer (`keyframeser.zig`) looks up to rebind it — so it
@@ -538,6 +553,8 @@ pub const BaseNative = struct {
     recorded: ?RecordedBuiltin = null,
     /// Non-null ⇒ a builtin with a tier-0 fast path (see `FastBuiltin`).
     fast: ?FastBuiltin = null,
+    /// `itern`'s lane for this native as a generic-`for` iterator.
+    itern: IternLane = .call,
     /// If set, install into this module table (a global table) rather than as a
     /// top-level global. The unknown-global lint then knows `module` (not `name`).
     module: ?[]const u8 = null,
