@@ -2,7 +2,7 @@
 
 Status: complete — P1–P5 landed and green (P1–P4: nbody 23.3× → 13.4× LJ; P5: 13.9× → 11.6×, resolveHashCell callouts eliminated from nbody); defers recorded below
 Owner: mahina JIT campaign (nbody arc, task #32; P5: task #41)
-Last updated: 2026-09-18
+Last updated: 2026-10-23
 
 ## Implementation status
 
@@ -90,6 +90,9 @@ inside them is checked.
   loops), **nbody 62.8 → 54.0–54.5 ms (−13%, 13.9× → 11.6× LJ)**,
   binary-trees −3.4%, sparse −3%, rest of the board in band, all
   cross-tier ok.
+- [x] **Follow-up (2026-10-23) — a heap key hashes with one multiply.**
+  Extended beyond the original plan; see "Hashing, probing, growth" →
+  follow-up. Tier-0 field_hash −13.6%, nbody −7.7%, str_gsub −2.9%.
 
 ### Outstanding
 - [ ] **Defer — guard_hash subsumption.** With mask + key + live-cell
@@ -291,6 +294,27 @@ soundly proves every hash lookup yields nil even when `used > 0`.
   `keyframeser.sortedHashEntries` impose the canonical `key_order`
   sort (doc 02), so probe layout never leaks into observable guest
   order.
+
+Follow-up (2026-10-23): the splitmix avalanche cost every string-key
+lookup about 16 instructions, a fifth of a tier-0 `t.x`. A heap key's
+payload is its u32 id, so `heapHash` multiplies by the 64-bit golden
+ratio and rotates the high half down: every id bit reaches the slot
+bits, and the high bits still vary for a fingerprinting map. Scalar
+keys keep `mixHash`. Each caller already branched on `heap_ref` to pick
+the payload, and picks the hash at that branch. Strided id runs spread
+about as well as a random hash would (pinned by the `heapHash` test in
+`hash_part.zig`). Probe layout stays a pure function of ids and history,
+so replay is unaffected; only which keys share a chain changes. Three
+same-arc fixes kept every @bench row flat or down:
+- `Table.getInt` past the array part uses `liveIntNode`;
+- `Table.getHeap` serves `metamethod`, which stays `noinline` (inlined,
+  it sat in `opCall`'s frame);
+- `seedGlobal`/`seedHashCell` keep the seed loops' heavy arms out of
+  line.
+`liveSlotOf` is `inline` again; the hash branch had pushed it out of
+line in `get`/`contains`/`remove`.
+Per-op (`ops3.lua`/`fields.lua`, tier-0): `t.x` 84 → 74, `t.x = v`
+82 → 72, a method lookup 192 → 150.
 
 Rule #20 analysis: one allocation per map, no per-entry allocations;
 get/put O(1) amortised with linear-probe clustering bounded by the

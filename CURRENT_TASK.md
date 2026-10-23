@@ -279,8 +279,9 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     nsieve-bit −19.5%, euler14-bit −20.6%, scimark ≈ −7%. The handlers
     still carrying a five-register frame with no call are
     `get/set_index`, `get/set_field` and `itern`: pure register
-    pressure. `t.x` is 84 instructions per get (LuaJIT `-joff` 29), and
-    7.2M of 36.7M in the lfget profile is `hash_part`.
+    pressure. `t.x` was 84 instructions per get (LuaJIT `-joff` 29), and
+    `mixHash` was ~16 of them: a heap key now hashes with one multiply
+    (doc 49 follow-up), `t.x` 74, field_hash −13.6%, nbody −7.7%.
     Outstanding there: `math.type`, allocating bodies, the generic ABI.
   - Doc 71, tier-0 upvalue access (`docs/design/71-tier0-upvalue-access.md`):
     a cell carries pointers to its value's two lanes (LuaJIT's `uv->v`),

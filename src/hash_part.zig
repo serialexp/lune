@@ -40,10 +40,12 @@ const value = @import("value.zig");
 const Value = value.Value;
 
 /// Deterministic key hash — moved here from `table.ValueContext` (doc 49);
-/// `ValueContext.hash` now delegates to this. A fixed-width splitmix64-style
-/// avalanche over `(tag, payload-or-heap-id)`: the key is always 1 tag byte +
-/// 8 payload bytes, so there is nothing to *stream* (the old per-lookup
-/// `Wyhash.final` was ~45–57% of table-heavy benchmark runtime).
+/// `ValueContext.hash` now delegates to this. A heap key hashes its id with
+/// one multiply (`heapHash`), any other key gets a fixed-width
+/// splitmix64-style avalanche over `(tag, payload)` (`mixHash`): the key is
+/// always 1 tag byte + 8 payload bytes, so there is nothing to *stream* (the
+/// old per-lookup `Wyhash.final` was ~45–57% of table-heavy benchmark
+/// runtime).
 ///
 /// Determinism: a pure function of `(tag, payload)`, identical in all 8 modes
 /// and on replay. Heap keys hash by their stable, deterministic object `id`,
@@ -52,10 +54,18 @@ const Value = value.Value;
 /// Distribution quality is a performance concern only, never correctness
 /// (the probe still compares the full identity: `Ident.matches`).
 pub fn keyHash(v: Value) u64 {
-    const payload: u64 = if (v.isHeap()) v.asHeap().id else v.payload.bits;
-    return mixHash(v.tag, payload);
+    return if (v.isHeap()) heapHash(v.asHeap().id) else mixHash(v.tag, v.payload.bits);
 }
 
+/// A heap key's hash. The id is a u32, so one multiply carries every id bit
+/// into the product's high half, and rotating that half down makes it the
+/// slot bits. A field lookup pays this for every string key; the avalanche
+/// `mixHash` does cost it 10 more instructions.
+inline fn heapHash(id: u64) u64 {
+    return std.math.rotr(u64, id *% 0x9E3779B97F4A7C15, 32);
+}
+
+/// A scalar (non-heap) key's hash.
 fn mixHash(tag: value.Tag, payload: u64) u64 {
     var x = payload ^ (@as(u64, @intFromEnum(tag)) *% 0x9E3779B97F4A7C15);
     x = (x ^ (x >> 30)) *% 0xBF58476D1CE4E5B9;
@@ -102,8 +112,7 @@ pub const Node = extern struct {
     /// The `keyHash` of this node's key, from the stored identity (no header
     /// load).
     fn hash(n: *const Node) u64 {
-        const payload: u64 = if (n.key_tag == .heap_ref) n.key_id else n.key_payload.bits;
-        return mixHash(n.key_tag, payload);
+        return if (n.key_tag == .heap_ref) heapHash(n.key_id) else mixHash(n.key_tag, n.key_payload.bits);
     }
 };
 
@@ -141,7 +150,7 @@ const Ident = struct {
     }
 
     fn hash(self: Ident) u64 {
-        return mixHash(self.tag, if (self.tag == .heap_ref) self.id else self.bits);
+        return if (self.tag == .heap_ref) heapHash(self.id) else mixHash(self.tag, self.bits);
     }
 };
 
@@ -307,7 +316,8 @@ pub const HashPart = extern struct {
     inline fn liveNodeInline(self: *const HashPart, comptime tag: value.Tag, payload: u64) ?*Node {
         const nodes = self.nodes orelse return null;
         const mask = self.mask;
-        var idx: u32 = @truncate(mixHash(tag, payload) & mask);
+        const h = if (tag == .heap_ref) heapHash(payload) else mixHash(tag, payload);
+        var idx: u32 = @truncate(h & mask);
         var limit: u64 = @as(u64, mask) + 1;
         while (limit != 0) : (limit -= 1) {
             const n = &nodes[idx];
@@ -579,11 +589,11 @@ pub const HashPart = extern struct {
     /// match proves logical absence and stops the probe: a key occupies at
     /// most one node, live or dead). This is the recorder's `hashSlotOf`
     /// backing: hrefk pins live slots only.
-    pub fn liveSlotOf(self: *const HashPart, key: Value) ?u32 {
+    pub inline fn liveSlotOf(self: *const HashPart, key: Value) ?u32 {
         return self.liveSlotOfIdent(Ident.of(key), key);
     }
 
-    fn liveSlotOfIdent(self: *const HashPart, ident: Ident, key: Value) ?u32 {
+    inline fn liveSlotOfIdent(self: *const HashPart, ident: Ident, key: Value) ?u32 {
         const nodes = self.nodes orelse return null;
         const mask = self.mask;
         var idx: u32 = @truncate(ident.hash() & mask);
@@ -1324,4 +1334,28 @@ test "nextLive under allocator failure leaves the map unchanged and retryable" {
     try testing.expectEqual(@as(u32, 2), m.count());
     try testing.expect(!m.iter_valid);
     try testing.expectEqual(@as(i64, 1), (try m.nextLive(testing.allocator, null)).?.key.asInt());
+}
+
+test "heapHash spreads strided runs of heap ids over the slots" {
+    // Interning allocates heap ids in runs, often a fixed number of objects
+    // apart (a name and its function, a key and its value table). Each run of
+    // 64 ids, at every stride, must spread over a 128-slot table about as
+    // well as a random hash would (≈ 50 distinct slots), and the high bits a
+    // fingerprinting map reads must vary too.
+    for ([_]u64{ 1, 2, 3, 4, 5, 8, 16, 64, 1024 }) |stride| {
+        var homes: [128]bool = @splat(false);
+        var tops: [128]bool = @splat(false);
+        var distinct: usize = 0;
+        var distinct_top: usize = 0;
+        var k: u64 = 0;
+        while (k < 64) : (k += 1) {
+            const h = heapHash(1000 + k * stride);
+            if (!homes[h & 127]) distinct += 1;
+            homes[h & 127] = true;
+            if (!tops[h >> 57]) distinct_top += 1;
+            tops[h >> 57] = true;
+        }
+        try std.testing.expect(distinct >= 44);
+        try std.testing.expect(distinct_top >= 44);
+    }
 }

@@ -1425,7 +1425,7 @@ pub const Vm = struct {
             const v = switch (seed.kind) {
                 .upvalue_cell, .upvalue_slot_alias => unreachable, // handled above
                 .upvalue => closure.upvalues[seed.source].get(),
-                .global => self.globals.get(proto.constants[seed.source]),
+                .global => self.seedGlobal(proto.constants[seed.source]),
                 .hash_cell => blk: {
                     // Resolve the loop-invariant value-cell pointer and stash it raw
                     // for the native prologue (`[rsi + slot*8]`). Validate exactly the
@@ -1434,17 +1434,7 @@ pub const Vm = struct {
                     // cell pointer is never null — so native declines and tier-1a owns
                     // this entry. The slot is tagged `.int` so the raw pointer is never
                     // mistaken for a `GcHeader` by a GC scan of this dead scratch.
-                    const vtab = self.regGet(base + seed.table_reg);
-                    var cell_bits: u64 = 0;
-                    if (vtab.isHeap() and vtab.heapType() == .table) {
-                        const tbl = table.Table.fromHeader(vtab.asHeap());
-                        if (tbl.metatable == null) {
-                            if (tbl.fieldPtr(ct.consts[seed.source])) |cell| {
-                                if (tbl.hash.count() == seed.expected_count)
-                                    cell_bits = @intFromPtr(cell);
-                            }
-                        }
-                    }
+                    const cell_bits = seedHashCell(self.regGet(base + seed.table_reg), ct.consts[seed.source], seed.expected_count);
                     if (cell_bits == 0) native_eligible.* = false;
                     break :blk Value{ .tag = .int, .payload = .{ .bits = cell_bits } };
                 },
@@ -1463,7 +1453,7 @@ pub const Vm = struct {
                 // Doc 43 P4: a global read inside an inlined callee — the name
                 // was copied into the TRACE's const pool at record time (the
                 // hash_cell precedent), so resolution is proto-free.
-                .callee_global => self.globals.get(ct.consts[seed.source]),
+                .callee_global => self.seedGlobal(ct.consts[seed.source]),
             };
             self.regSet(base + seed.slot, v);
         }
@@ -1589,19 +1579,9 @@ pub const Vm = struct {
             const v = switch (seed.kind) {
                 .upvalue_cell, .upvalue_slot_alias => unreachable, // handled above
                 .upvalue => closure.upvalues[seed.source].get(),
-                .global => self.globals.get(proto.constants[seed.source]),
+                .global => self.seedGlobal(proto.constants[seed.source]),
                 .hash_cell => blk: {
-                    const vtab = self.regGet(ctx.base + seed.table_reg);
-                    var cell_bits: u64 = 0;
-                    if (vtab.isHeap() and vtab.heapType() == .table) {
-                        const tbl = table.Table.fromHeader(vtab.asHeap());
-                        if (tbl.metatable == null) {
-                            if (tbl.fieldPtr(ct.consts[seed.source])) |cell| {
-                                if (tbl.hash.count() == seed.expected_count)
-                                    cell_bits = @intFromPtr(cell);
-                            }
-                        }
-                    }
+                    const cell_bits = seedHashCell(self.regGet(ctx.base + seed.table_reg), ct.consts[seed.source], seed.expected_count);
                     if (cell_bits == 0) ok = false;
                     break :blk Value{ .tag = .int, .payload = .{ .bits = cell_bits } };
                 },
@@ -1616,11 +1596,30 @@ pub const Vm = struct {
                 },
                 // Doc 43 P4: same as seedTraceInputs's callee_global arm — the
                 // name lives in the trace const pool, resolution is proto-free.
-                .callee_global => self.globals.get(ct.consts[seed.source]),
+                .callee_global => self.seedGlobal(ct.consts[seed.source]),
             };
             self.regSet(ctx.base + seed.slot, v);
         }
         return if (ok) trace.NativeSeedCtx.SEED_OK else trace.NativeSeedCtx.SEED_HASH_DECLINE;
+    }
+
+    /// A global seed's value, out of line so the probe stays out of the
+    /// per-entry seed loops (`seedTraceInputs`, `nativeSeedFn`), which most
+    /// traces run without a global seed.
+    noinline fn seedGlobal(self: *Vm, name: Value) Value {
+        return self.globals.getHeap(name);
+    }
+
+    /// A `hash_cell` seed's value-cell pointer, or 0 when `vtab` is not a
+    /// metatable-free table holding `key` at population `expected_count`
+    /// (a real cell pointer is never null). Out of line, as `seedGlobal`.
+    noinline fn seedHashCell(vtab: Value, key: Value, expected_count: u32) u64 {
+        if (!(vtab.isHeap() and vtab.heapType() == .table)) return 0;
+        const tbl = table.Table.fromHeader(vtab.asHeap());
+        if (tbl.metatable != null) return 0;
+        const cell = tbl.fieldPtr(key) orelse return 0;
+        if (tbl.hash.count() != expected_count) return 0;
+        return @intFromPtr(cell);
     }
 
     /// Doc 22 §B.3: the tier-1a seeding twin, installed into
@@ -9255,9 +9254,10 @@ pub const Vm = struct {
     /// metatable, or `nil` if `v` has no metatable or the field is absent. Pure
     /// (no dispatch) — the caller decides whether the result is a handler to call,
     /// a table to chain through, or a sentinel.
-    fn metamethod(self: *Vm, v: Value, name: Value) Value {
+    /// Out of line: inlined, it sits in `opCall`'s frame for `__call`.
+    noinline fn metamethod(self: *Vm, v: Value, name: Value) Value {
         const mt = self.metatableOf(v) orelse return Value.nil();
-        return mt.get(name);
+        return mt.getHeap(name); // a metamethod name is an interned string
     }
 
     // ---- chunk 2b: operator metamethod dispatch -----------------------------

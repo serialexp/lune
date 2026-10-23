@@ -134,6 +134,14 @@ pub const Table = struct {
         return self.hash.get(nk) orelse Value.nil();
     }
 
+    /// `get` for a heap key (an interned string, typically), through the
+    /// probe specialised to one: a heap key is never normalized and only
+    /// ever lives in the hash part, so this is `get`'s answer.
+    pub inline fn getHeap(self: *const Table, key: Value) Value {
+        const n = self.hash.liveHeapNode(key) orelse return Value.nil();
+        return n.value;
+    }
+
     /// The inline, call-free hit of `getHinted` for a heap key
     /// (`HashPart.heapHintHit`): the value, or null for "take `getHinted`".
     /// A heap key is never normalized and only ever lives in the hash part.
@@ -183,11 +191,10 @@ pub const Table = struct {
         } else if (arr.ArrayPart.inArray(i, self.array.asize)) {
             return self.array.get(@intCast(i));
         }
-        // Out of array range: only the hash part can hold this key. Skip the
-        // (non-inlined) hashmap call when there is no hash part — the common case
-        // on an array being built/read by contiguous integer keys.
-        if (self.hash.count() == 0) return Value.nil();
-        return self.hash.get(Value.int(i)) orelse Value.nil();
+        // Out of array range: only the hash part can hold this key, through
+        // the probe specialised to an int key.
+        const n = self.hash.liveIntNode(i) orelse return Value.nil();
+        return n.value;
     }
 
     /// Doc 30 B03: `t[k]` iff it is an existing **in-lane `.value` array cell
