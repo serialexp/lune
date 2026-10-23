@@ -274,6 +274,9 @@ earlier in `/tmp/t0micro/`).
       tier-0 recursive-fib −16.1%, spectral-norm −10.2%, binary-trees
       −8.0%. What is left: `ExecState` stored and reloaded per transition,
       the whole-frame write, `setRegionContext`, and a `move` per argument.
+      The result's `move` and `return x`'s landed 2026-10-23 (doc 66: a
+      call lays its frame out at its fresh destination): 1-arg 408 → 355,
+      tier-0 recursive-fib −6.0%.
 - [ ] **A native call is ~125 instructions in opCall** (LuaJIT `-joff`
       `math.abs(i)` 227/59 total). Most of it is values spilled across the
       indirect call (`nat.func` / `nat.multi`) and the `anyerror!Value`

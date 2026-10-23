@@ -228,7 +228,10 @@ Callgrind, a 0-arg call: opCall ~148 and opRet ~104.
 - `setRegionContext` is a three-field store per transition. Native code
   mirrors `region_context`, so making it lazy needs its own argument.
 - Each argument and result still costs a `move` (~51 instructions in
-  call1). That is bytecode shape (doc 66), not the transition.
+  call1). That is bytecode shape (doc 66), not the transition. The
+  result's `move`, and `return x`'s, are gone (doc 66, 2026-10-23: a
+  call lays its frame out at its fresh destination): call1 408 → 355.
+  Each argument still costs one.
 - The native arm, ~125 instructions in opCall per native call, is
   dominated by values spilled across the indirect call and the
   error-union result returned in memory. Fixing it means changing the

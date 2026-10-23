@@ -394,6 +394,31 @@ land; move whole phases to Done once everything inside them is checked.
     in the semantics matrix "an `and`/`or`/`not` test runs its links in
     order, each once" and "loops leave through any link of their test",
     whose outputs were taken on 8b98d64.
+- [x] **A call lays its frame out at its destination; `return x` returns
+  in place** (2026-10-23, beyond the original plan; doc 69 §3b's "a
+  `move` per result"). Lua's `exp2reg` on a fresh slot:
+  - `compileCall`/`compileMethodCall` put the function slot at `dest`
+    itself when `dest` is the top register and holds no local
+    (`isFreshTop`), so `local b = f(i)` is `call r_b` with no result
+    `move`. A store into an existing local (`x = f(x)`) keeps its move:
+    the call reads the local while it runs.
+  - `return e` of one value returns from `operandReg(e)`, so `return x`
+    of a local is `ret r_x 1` with no `move`.
+  - Probes: call1 408 → 355, `math.abs(i)` 151 → 129, call0 unchanged
+    at 284. A/B: no row up in either tier; tier-0 recursive-fib −6.0%,
+    scalar −4.7%, str_manip −3.8%, nsieve-bit-fp −3.0%, lua54 −2.5%
+    (jit −2.5%), partialsums −2.2%, binary-trees −2.0%, spectral-norm
+    −2.0%. `--dump-aborts` sites are unchanged on every program.
+  - The new shape put a `ret` right after a recursive call (`local s =
+    f(n - 1) return s`), which exposed an existing hang that `f() end`
+    already had: doc 44's `.self_terminal` fix, committed first.
+  - Four doc 61 register probes read the new layout; their expectations
+    follow it, and the dead-φ probe declares `w` first so `peek` still
+    reads `s`.
+  - Tests: "a call lays its frame out at a fresh destination; `return x`
+    returns in place" (compiler); "a call laid out at its destination,
+    and `return x` in place, keep every value" (semantics matrix, output
+    taken on 2a20e98).
 
 ### Outstanding
 

@@ -408,6 +408,18 @@ const Compiler = struct {
         self.next_reg = mark;
     }
 
+    /// Whether `dest` is the topmost allocated register and holds no local,
+    /// so nothing can read it before an expression compiled into it is
+    /// done: a call may then lay its frame out at `dest` and leave its
+    /// result there, with no result `move` (Lua's `exp2reg` on a fresh
+    /// `VNONRELOC` slot). Locals are allocated stack-wise, so the last one
+    /// declared has the highest register.
+    fn isFreshTop(self: *const Compiler, dest: u16) bool {
+        if (dest + 1 != self.next_reg) return false;
+        const locals = self.locals.items;
+        return locals.len == 0 or locals[locals.len - 1].reg < dest;
+    }
+
     // ---- constants ----
 
     /// Append a constant (deduplicated by *exact* identity — not `Value.eql`,
@@ -1101,6 +1113,11 @@ const Compiler = struct {
             }
             try self.compileSpreadInPlace();
             _ = try self.emit(Instr.opAB(.ret, base, bytecode.all_results));
+        } else if (n == 1) {
+            // One value: a local returns from its own register, with no
+            // `move` into a temporary.
+            const r = try self.operandReg(exprs[0]);
+            _ = try self.emit(Instr.opAB(.ret, r, 1));
         } else {
             for (exprs) |e| {
                 const r = try self.alloc1();
@@ -1737,7 +1754,9 @@ const Compiler = struct {
     /// out in a fresh contiguous temp window: `[fn, arg0, arg1, …]`.
     fn compileCall(self: *Compiler, callee: *const ast.Expr, args: []const *ast.Expr, dest: u16, nwanted: u16) Error!void {
         const mark = self.next_reg;
-        const base = try self.alloc1(); // function slot; results land here
+        // The function slot, where the results land: `dest` itself when it
+        // is a fresh top register, else a new temporary.
+        const base = if (nwanted >= 1 and self.isFreshTop(dest)) dest else try self.alloc1();
         try self.compileExprTo(callee, base);
         try self.compileArgList(args, base, callee.span, nwanted);
         if (nwanted >= 1 and dest != base) _ = try self.emit(Instr.opAB(.move, dest, base));
@@ -1782,7 +1801,8 @@ const Compiler = struct {
     /// evaluated once and passed as the implicit first argument (`self`).
     fn compileMethodCall(self: *Compiler, obj: *const ast.Expr, name: []const u8, args: []const *ast.Expr, dest: u16, nwanted: u16) Error!void {
         const mark = self.next_reg;
-        const base = try self.alloc1(); // function slot
+        // The function slot, as in `compileCall`.
+        const base = if (nwanted >= 1 and self.isFreshTop(dest)) dest else try self.alloc1();
         const self_reg = try self.alloc1(); // base+1 = self (first argument)
         try self.compileExprTo(obj, self_reg);
 
@@ -2229,6 +2249,48 @@ test "doc 71 P0: an upvalue or global stores a local from its own register" {
         if ((ins.op == .set_upval or ins.op == .set_global) and ins.a == 0) stores += 1;
     }
     try testing.expectEqual(@as(usize, 2), stores);
+}
+
+test "a call lays its frame out at a fresh destination; `return x` returns in place" {
+    var r = try run(
+        \\local function f1(x) return x end
+        \\local function m(t, v) return t.k + v end
+        \\local o = { k = 1, m = m }
+        \\local a = 0
+        \\local b = f1(2)
+        \\local c = o:m(b)
+        \\a = f1(a + b)
+        \\c = f1(c + 1)
+        \\return a * 100 + b * 10 + c
+    );
+    defer r.deinit();
+    try testing.expectEqual(@as(i64, 224), r.value.asInt());
+    const proto = r.chunk.proto;
+    // f1 r0, m r1, o r2, a r3, b r4, c r5.
+    var moves: usize = 0;
+    var at_b: usize = 0;
+    var at_c: usize = 0;
+    for (proto.code, 0..) |ins, pc| {
+        if (ins.op != .call) continue;
+        if (ins.a == 4) at_b += 1;
+        if (ins.a == 5) at_c += 1;
+        const next = proto.code[pc + 1];
+        if (next.op == .move and next.b == ins.a) {
+            moves += 1;
+            // Only the stores into the locals `a` and `c` move a result:
+            // the call reads `a` and `c` as it runs, so it cannot sit there.
+            try testing.expect(next.a == 3 or next.a == 5);
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), moves);
+    try testing.expectEqual(@as(usize, 1), at_b);
+    try testing.expectEqual(@as(usize, 1), at_c);
+    // f1 returns its parameter from r0.
+    const f1 = proto.protos[0].code;
+    for (f1) |ins| try testing.expect(ins.op != .move);
+    try testing.expectEqual(OpCode.ret, f1[0].op);
+    try testing.expectEqual(@as(u16, 0), f1[0].a);
+    try testing.expectEqual(@as(u16, 1), f1[0].b);
 }
 
 test "doc 66 P3: a number literal operand compiles to a constant form" {

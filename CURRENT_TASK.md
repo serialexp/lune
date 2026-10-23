@@ -297,6 +297,10 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     closed at its own entry pc and its terminal resumed at the patched
     pc. Refused at the `hotcall` threshold, with a `.self_terminal`
     recorder abort as the backstop. Board unchanged.
+  - Doc 66 follow-up: a call lays its frame out at a fresh destination
+    (`isFreshTop`) and `return x` returns in place: call1 408 → 355,
+    tier-0 recursive-fib −6.0%, no row up. The new shape is what exposed
+    the hang above.
   - Scratch shadows are under /tmp/p1:
     - `ab2.sh BASE NEW`: instructions:u A/B over every @bench program, both
       tiers;

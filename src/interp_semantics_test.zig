@@ -3148,6 +3148,34 @@ test "doc 44: a function that is only its `ret`, and a call followed by `ret`, r
     , "300\n");
 }
 
+test "a call laid out at its destination, and `return x` in place, keep every value" {
+    // Output taken on 2a20e98, before calls sat at a fresh destination.
+    // `a = f1(a + b)` and `x = bump()` store into locals, which keep their
+    // result move; `bump` writes `x` through its upvalue while it runs.
+    // `rec2` returns the local its call landed in, the call's own register.
+    try expectProgram(
+        \\local function f1(x) return x end
+        \\local function rec(n) if n == 0 then return 0 end local s = rec(n - 1) return s + 1 end
+        \\local function rec2(n) if n == 0 then return 0 end local s = rec2(n - 1) return s end
+        \\local o = { k = 5 }
+        \\function o:m(v) return self.k + v end
+        \\local x = 1
+        \\local function bump() x = x + 10 return x end
+        \\local a = f1(3)
+        \\local b = o:m(a)
+        \\a = f1(a + b)
+        \\x = bump()
+        \\local y = bump()
+        \\local z = f1(f1(2) + f1(3))
+        \\local t = { f1(4), f1(5) }
+        \\local ok, e = pcall(function() local q = f1(nil) + 1 return q end)
+        \\local r = 0
+        \\for i = 1, 300 do r = r + rec(4) + rec2(4) end
+        \\print(a, b, x, y, z, t[1] + t[2], ok, r)
+        \\
+    , "11\t8\t21\t21\t5\t9\tfalse\t1200\n");
+}
+
 test "doc 61 Phase 0: a backtrace names an in-flight parent's own instruction line" {
     // `f` is in flight at the `.add`, whose span starts on line 3; the
     // instruction before it, the call to its right operand, is on line 4.
@@ -3241,8 +3269,9 @@ fn expectRegs(source: [:0]const u8, expected: []const u8) !void {
 
 test "doc 61 Phase 1: a dead register of the in-flight frame is scrubbed; live ones survive" {
     // At the `.call` of `regs`, `t` (r0) is dead: `#t` was its last read.
-    // `n` and `u` are read after the call, and r4 holds the callee. The
-    // suspended main chunk keeps `print` below its call; `f` itself is dead.
+    // `n` and `u` are read after the call, and r3, the register `s` takes,
+    // holds the callee. The suspended main chunk keeps `print` below its
+    // call; `f` itself is dead.
     try expectRegs(
         \\local function f()
         \\  local t = {}
@@ -3253,7 +3282,7 @@ test "doc 61 Phase 1: a dead register of the in-flight frame is scrubbed; live o
         \\end
         \\print(f())
         \\
-    , ".f.|.#t.f..\t0\t0\n");
+    , ".f.|.#tf...\t0\t0\n");
 }
 
 test "doc 61 Phase 1: a suspended caller keeps only the registers below its call" {
@@ -3274,10 +3303,11 @@ test "doc 61 Phase 1: a suspended caller keeps only the registers below its call
 }
 
 test "doc 61 Phase 1: a frame in flight at a multret consumer keeps its dynamic span only" {
-    // `regs` sits at r1 and `h()` leaves its two results at r2, r3, so the
-    // consumer's top is r4. The dead table `a5` left in r4 lies above it:
-    // masked to the span it is scrubbed, though the consumer's row covers
-    // every register from its base up.
+    // `regs` sits at r0, the register `s` takes, and `h()` leaves its two
+    // results at r1, r2, so the consumer's top is r3. The dead tables `a4`
+    // and `a5` left in r3, r4 lie above it: masked to the span they are
+    // scrubbed, though the consumer's row covers every register from its
+    // base up.
     try expectRegs(
         \\local function h() return {}, {} end
         \\local function f()
@@ -3287,7 +3317,7 @@ test "doc 61 Phase 1: a frame in flight at a multret consumer keeps its dynamic 
         \\end
         \\print(f())
         \\
-    , "f.f.|.ftt.\n");
+    , "f.f.|ftt..\n");
 }
 
 test "doc 61 Phase 1: a frame of a non-maskable proto is kept whole" {
@@ -3304,7 +3334,7 @@ test "doc 61 Phase 1: a frame of a non-maskable proto is kept whole" {
         \\unmask(f)
         \\print(f())
         \\
-    , ".f.|t#t.f..\t0\t0\n");
+    , ".f.|t#tf...\t0\t0\n");
 }
 
 /// The traced legs materialised exits at their resume pcs (doc 56): the
@@ -3394,9 +3424,9 @@ test "doc 61 §2 site 3: an attached exit over a non-maskable proto materialises
 /// over a maskable `f` the loop-close φ set leaves it out and its slab copy
 /// stays stale. On every 50th trip `hit` sends tier-0 back to the header
 /// with the committed registers (the `if hit` guard fails), and `peek`
-/// collects and reads `s`'s register before this trip writes it. The `if`
-/// holds its condition in the register `x` takes, the call's base is `y`'s
-/// and `s` is the one above it. A maskable `f` has `s` scrubbed in every
+/// collects and reads `s`'s register before this trip writes it. `w` takes
+/// the register `x` takes, so the call, which lands in `v`, has its base at
+/// `y`'s and `s` is the one above it. A maskable `f` has `s` scrubbed in every
 /// tier; a non-maskable one keeps the φ, so every tier holds the previous
 /// trip's value. `s` is a number, which keeps the trace non-allocating; an
 /// allocating one filters the same way (doc 61 §9b). `PRE` runs before `f`.
@@ -3406,7 +3436,7 @@ fn deadPhiProbeSource(comptime pre: []const u8) [:0]const u8 {
     \\  local c, same, nils, hit = 0, 0, 0, false
     \\  for i = 1, n do
     \\    if hit then
-    \\      local v = peek()
+    \\      local w, v = 0, peek()
     \\      if v == (i - 1) * 3 then same = same + 1 elseif v == nil then nils = nils + 1 end
     \\    end
     \\    local x, y = 0, 0
