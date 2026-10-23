@@ -351,24 +351,72 @@ land; move whole phases to Done once everything inside them is checked.
   wrapped by accident in release). It now wraps as Lua's does, to
   `t[math.mininteger]`. Test: "`itern` steps `ipairs` exactly as its
   native does".
+- [x] **Short-circuit conditions and `not` on a truthiness test**
+  (follow-ups to P4, 2026-10-23). An `if` or `while` test is now a chain
+  of branches (`Compiler.condJumps`, LuaJIT's `bcemit_branch_t/f`):
+  `not` flips a link's polarity, `and`/`or` chain their links, and each
+  link is a compare-and-branch or a `jmp_if_*` on the operand, so no
+  link writes the condition's value. Per test, against the value form:
+  `a < b and c > d` 124 → 74 instructions (LuaJIT 44), short-circuited
+  on its first link 92 → 38 (23), `a > b or c < d` 144 → 80 (53),
+  `not x` 55 → 27 (13), `x and a > b` 110 → 63 (34). Literals are not
+  folded, so `while true` keeps its branch above the marker.
+  - What a loop test is had to change with it. A `while` chain's last
+    link sits right above the marker, but it may be a `jmp_if_true`
+    (`while not done`), and an earlier `and` link also leaves the loop.
+    `CondBranch.onFalseCondition` is gone, and `falseBranchTargetOf` is
+    `loopTestTargetOf`: a condition branch in either polarity, since only
+    its position says which way leaves the loop. The new
+    `bytecode.whileTestMarkerOf` names the loop a leaving link belongs
+    to. `TraceCode.computeOwnLoopTest` and the recorder's LLEAVE check
+    (`leavesAnchorLoop`) ask it, where they used to ask "is the next
+    instruction the marker".
+  - A/B: tier-0 while_shortcircuit_probe −4.0%; no other row moved, in
+    either tier, because no other `@bench` program has a compound test
+    in a hot loop. `--dump-aborts` counts are unchanged on every program.
+    The probe's `--jit-native` row is +1.9% at its n = 120 (+20k
+    instructions, one time), −0.2% at 1200 and −6.2% at 12000. Its loop
+    leaves through its first link, which the value form hid behind an
+    ordinary branch. As the loop's own test, the exit now takes exactly
+    the plain `while i < X` path (event logs identical bar snapshot
+    ordinals): its fallback region mints dormant (doc 47 Increment B),
+    and the short run ends before admission and silent promotion pay
+    back. A first cut that classified only the last link left the first
+    link a bridge candidate: 10 failed bridge pipelines, +2.3%.
+  - Two tests changed to keep their intent:
+    - doc 57's bool-lane test takes `not t[i]` as a value, since as a
+      test it is now the load's branch flipped;
+    - doc 58 B2's hazard test wraps its `and` in `== true`, which keeps
+      the condition temp the hazard needs.
+  - Tests: "an `and`/`or`/`not` test compiles to a chain of branches",
+    "a `while` test may end on a `jmp_if_true`" (compiler); "every link
+    of a `while` test that leaves the loop names its marker" (bytecode);
+    in the semantics matrix "an `and`/`or`/`not` test runs its links in
+    order, each once" and "loops leave through any link of their test",
+    whose outputs were taken on 8b98d64.
 
 ### Outstanding
 
 - [ ] **Defer: a `sar` constant form.** Q6's set leaves mahina's `~>>`
   (`sar`, no Lua 5.4 spelling, 0 `@bench` sites) on the register form.
-
-
 - [ ] **Decode inlined branch guards against their own proto** (follow-up
   to the fix above). Today they are simply not classified. An option is
   to carry the guard's proto in provenance, so a callee's own loop test
   can still be recognised. Not needed for correctness.
-- [ ] **Short-circuit conditions** (follow-up to P4). `if a < b and c < d`
-  still compiles each comparison to a temporary and a `jmp_if_*`: fusing
-  each link needs the compiler to emit `and`/`or` as jump lists, as
-  LuaJIT's `bcemit_branch_t`/`bcemit_branch_f` do.
-- [ ] **`not` on a truthiness test** (follow-up to P4). P4 folds `not` into
-  a comparison's polarity only; `if not x` stays `not` + `jmp_if_false`
-  where `jmp_if_true` alone would do.
+- [ ] **Bart to confirm the short-circuit change's one probe row**
+  (2026-10-23, asked while he was away, default taken). See the Done
+  bullet: while_shortcircuit_probe `--jit-native` +1.9% at the bench's
+  n = 120, a one-time warm-up the plain `while` already pays.
+- [ ] **`and`/`or` as values** (follow-up to the chains). `local b = i > n
+  and 1 or 2` still materialises `i > n` and tests the temporary: 110
+  instructions against LuaJIT's 32. LuaJIT compiles an expression with
+  pending jump lists (`expr_toreg` with `t`/`f` lists), so a comparison
+  feeding `and`/`or` never becomes a value.
+- [ ] **`repeat … until` with an `and`/`or` test** (follow-up to the
+  chains). It keeps the value form: its closer must be the one backward
+  branch onto the marker (`assertLoopClosersWellFormed`), and the body's
+  `close_upvalues` must run before it, so a chain's earlier links have
+  nowhere to jump.
 - [ ] **Each phase: recorder and JIT parity in the same change** (§6). A
   new op that the recorder aborts on regresses every traced loop that uses
   it.

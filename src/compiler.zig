@@ -1138,17 +1138,48 @@ const Compiler = struct {
         };
     }
 
-    /// Emit the branch an `if` or `while` test compiles to, jumping when
-    /// `cond` is false, and return its index for patching: one
-    /// compare-and-branch for a comparison, else a `jmp_if_false` on the
-    /// condition's value.
-    fn emitFalseBranch(self: *Compiler, cond: *const ast.Expr) Error!usize {
+    /// Branches still to be patched to one target.
+    const JumpList = std.ArrayList(usize);
+
+    /// Doc 66 (short-circuit conditions): emit `cond` as branches that jump
+    /// when its truth is `jump_when`, appending each to `out`, and fall
+    /// through otherwise (LuaJIT's `bcemit_branch_t`/`bcemit_branch_f`).
+    /// `not` flips `jump_when`; `and`/`or` become one chain of links, each
+    /// a compare-and-branch for a comparison or a `jmp_if_*` on the link's
+    /// value, so no link materialises the condition's value. A literal is
+    /// not folded: a `while true` keeps its branch above the loop marker.
+    fn condJumps(self: *Compiler, cond: *const ast.Expr, jump_when: bool, out: *JumpList) Error!void {
+        switch (cond.data) {
+            .paren => |inner| return self.condJumps(inner, jump_when, out),
+            .unary => |u| if (u.op == .not) return self.condJumps(u.operand, !jump_when, out),
+            .binary => |b| if (b.op == .and_ or b.op == .or_) {
+                // `a or b` holds when either link does, so when it jumps on
+                // true both links jump to `out`; `a and b` alike on false.
+                // Otherwise `a` decides only when it skips `b`, falling to
+                // whatever follows the chain.
+                if ((b.op == .or_) == jump_when) {
+                    try self.condJumps(b.lhs, jump_when, out);
+                } else {
+                    var skip: JumpList = .empty;
+                    defer skip.deinit(self.scratch);
+                    try self.condJumps(b.lhs, !jump_when, &skip);
+                    try self.condJumps(b.rhs, jump_when, out);
+                    for (skip.items) |j| self.patchToHere(j);
+                    return;
+                }
+                return self.condJumps(b.rhs, jump_when, out);
+            },
+            else => {},
+        }
         const mark = self.next_reg;
-        defer self.freeTo(mark); // condition temps are dead after the test
-        if (try self.compareBranch(cond, false)) |ins| return self.emit(ins);
-        const cr = try self.operandReg(cond);
-        return self.emitJump(.jmp_if_false, cr);
+        defer self.freeTo(mark); // a link's temps are dead after its branch
+        const at = if (try self.compareBranch(cond, jump_when)) |ins|
+            try self.emit(ins)
+        else
+            try self.emitJump(if (jump_when) .jmp_if_true else .jmp_if_false, try self.operandReg(cond));
+        try out.append(self.scratch, at);
     }
+
 
     /// Doc 66 P4: evaluate a comparison condition's operands, and return the
     /// compare-and-branch that jumps when the condition's truth is
@@ -1220,15 +1251,18 @@ const Compiler = struct {
         var end_jumps: std.ArrayList(usize) = .empty;
         defer end_jumps.deinit(self.scratch);
 
+        var skips: JumpList = .empty;
+        defer skips.deinit(self.scratch);
         for (f.branches) |br| {
-            const skip = try self.emitFalseBranch(br.cond);
+            skips.clearRetainingCapacity();
+            try self.condJumps(br.cond, false, &skips);
 
             self.beginScope();
             try self.compileBlock(br.body);
             try self.endScope();
 
             try end_jumps.append(self.scratch, try self.emitJump(.jmp, 0));
-            self.patchToHere(skip); // false → fall to the next branch / else
+            for (skips.items) |j| self.patchToHere(j); // false → fall to the next branch / else
         }
 
         if (f.else_body) |eb| {
@@ -1243,7 +1277,12 @@ const Compiler = struct {
     fn compileWhile(self: *Compiler, w: anytype) Error!void {
         const loop_top = self.code.items.len;
 
-        const exit = try self.emitFalseBranch(w.cond);
+        // Each link that fails the test leaves the loop, the last one right
+        // above the marker (`bytecode.loopExtentFor`); a link that skips the
+        // rest of the chain lands on the marker, which runs every iteration.
+        var exits: JumpList = .empty;
+        defer exits.deinit(self.scratch);
+        try self.condJumps(w.cond, false, &exits);
         // Doc 58: the loop marker (LuaJIT `BC_LOOP`) sits right after the
         // condition, so the body starts at `marker + 1`.
         const marker = try self.emit(.{ .op = .loop, .b = @intFromEnum(bytecode.LoopKind.while_loop) });
@@ -1257,7 +1296,7 @@ const Compiler = struct {
 
         try self.emitJumpTo(.jmp, 0, loop_top);
 
-        self.patchToHere(exit);
+        for (exits.items) |j| self.patchToHere(j);
         self.patchToHere(marker); // the marker's exit offset
         self.patchBreaks(loop_idx);
     }
@@ -2304,7 +2343,8 @@ test "doc 66 P4: a comparison test compiles to one compare-and-branch" {
     const proto = r.chunk.proto;
     var count = std.EnumArray(OpCode, usize).initFill(0);
     for (proto.code) |ins| count.getPtr(ins.op).* += 1;
-    try testing.expectEqual(@as(usize, 1), count.get(.jlt));
+    // `x < y`, and both links of the `and`.
+    try testing.expectEqual(@as(usize, 3), count.get(.jlt));
     try testing.expectEqual(@as(usize, 1), count.get(.jle));
     // `x > 2`, and `2 < x` mirrored with its constant on the right.
     try testing.expectEqual(@as(usize, 2), count.get(.jgt_k));
@@ -2314,13 +2354,12 @@ test "doc 66 P4: a comparison test compiles to one compare-and-branch" {
     try testing.expectEqual(@as(usize, 1), count.get(.jeq));
     try testing.expectEqual(@as(usize, 1), count.get(.jge));
     try testing.expectEqual(@as(usize, 1), count.get(.jle_k));
-    // Only the value-producing `and` operands keep a compare into a
-    // register; no compare feeds a test.
-    try testing.expectEqual(@as(usize, 2), count.get(.lt));
-    try testing.expectEqual(@as(usize, 0), count.get(.le) + count.get(.gt) + count.get(.ge) + count.get(.eq) + count.get(.ne));
-    // `if x`, `if not x` (a `not` into a register), and the `and`: its
-    // short circuit and the test of its value.
-    try testing.expectEqual(@as(usize, 4), count.get(.jmp_if_false));
+    // No compare feeds a test, the `and`'s links included.
+    try testing.expectEqual(@as(usize, 0), count.get(.lt) + count.get(.le) + count.get(.gt) + count.get(.ge) + count.get(.eq) + count.get(.ne));
+    // `if x`, and `if not x` as a `jmp_if_true` with no `not`.
+    try testing.expectEqual(@as(usize, 1), count.get(.jmp_if_false));
+    try testing.expectEqual(@as(usize, 1), count.get(.jmp_if_true));
+    try testing.expectEqual(@as(usize, 0), count.get(.not));
     var mirrored: usize = 0;
     for (proto.code) |ins| {
         const f = bytecode.cmpBranchOf(ins.op) orelse continue;
@@ -2334,6 +2373,61 @@ test "doc 66 P4: a comparison test compiles to one compare-and-branch" {
         }
     }
     try testing.expectEqual(@as(usize, 1), mirrored);
+}
+
+test "doc 66: an `and`/`or`/`not` test compiles to a chain of branches" {
+    var r = try run(
+        \\local x, y, f, n = 3, 4, false, 0
+        \\if x < y and y < 9 then n = n + 1 end
+        \\if x > y or f then n = n + 10 end
+        \\if not (x < y or f) then n = n + 100 end
+        \\while x < y and not f do x = x + 1 end
+        \\while x > 9 or y > 9 do x = x - 1 end
+        \\return n
+    );
+    defer r.deinit();
+    try testing.expectEqual(@as(i64, 1), r.value.asInt());
+    const code = r.chunk.proto.code;
+    // No link materialises a value: no compare into a register, no `not`,
+    // and every truthiness link tests `f`'s own register.
+    var f_reg: ?u16 = null;
+    for (code) |ins| switch (ins.op) {
+        .lt, .le, .gt, .ge, .eq, .ne, .not => return error.TestUnexpectedResult,
+        .jmp_if_true, .jmp_if_false => {
+            if (f_reg) |reg| try testing.expectEqual(reg, ins.a) else f_reg = ins.a;
+        },
+        else => {},
+    };
+    try testing.expect(f_reg != null);
+    // Each `while` keeps a false branch to its exit right above its marker.
+    var markers: usize = 0;
+    for (code, 0..) |ins, m| {
+        if (ins.op != .loop) continue;
+        markers += 1;
+        const e = bytecode.loopMarkerExit(ins, m);
+        try testing.expectEqual(@as(?i64, @intCast(e)), bytecode.loopTestTargetOf(code[m - 1], m - 1));
+        try testing.expect(bytecode.loopExtentFor(r.chunk.proto, @intCast(m + 1)) != null);
+    }
+    try testing.expectEqual(@as(usize, 2), markers);
+}
+
+test "doc 66: a `while` test may end on a `jmp_if_true`" {
+    // `not x` is `x`'s branch with the polarity flipped, so this chain's
+    // last link jumps to the exit when `x` holds. It is still the loop's
+    // test: the position, right above the marker, says so.
+    var r = try run(
+        \\local i, x = 0, true
+        \\while not (i >= 3 and x) do i = i + 1 end
+        \\return i
+    );
+    defer r.deinit();
+    try testing.expectEqual(@as(i64, 3), r.value.asInt());
+    const code = r.chunk.proto.code;
+    const m = try onlyLoopMarker(code);
+    try testing.expectEqual(OpCode.jmp_if_true, code[m - 1].op);
+    const e = bytecode.loopMarkerExit(code[m], m);
+    try testing.expectEqual(@as(?i64, @intCast(e)), bytecode.loopTestTargetOf(code[m - 1], m - 1));
+    try testing.expect(bytecode.loopExtentFor(r.chunk.proto, @intCast(m + 1)) != null);
 }
 
 test "doc 66 P1: a generic `for` steps with one `itern`" {
@@ -2440,7 +2534,7 @@ test "doc 58: a while loop emits a loop marker right after its condition branch"
     try testing.expectEqual(OpCode.jle_k, code[m - 1].op);
     try testing.expectEqual(@as(u16, 0), code[m - 1].a & bytecode.cmp_on_true);
     const e = bytecode.loopMarkerExit(code[m], m);
-    try testing.expectEqual(@as(?i64, @intCast(e)), bytecode.falseBranchTargetOf(code[m - 1], m - 1));
+    try testing.expectEqual(@as(?i64, @intCast(e)), bytecode.loopTestTargetOf(code[m - 1], m - 1));
     try testing.expectEqual(OpCode.jmp, code[e - 1].op);
     const back: i64 = @as(i64, @intCast(e)) + code[e - 1].aux;
     try testing.expect(back < m - 1 or back == m - 1);
@@ -2484,7 +2578,7 @@ test "doc 58: a repeat loop emits a loop marker at its top" {
     // `until i >= 5` is one compare-and-branch (doc 66 P4).
     const e = bytecode.loopMarkerExit(code[m], m);
     try testing.expectEqual(OpCode.jge_k, code[e - 1].op);
-    try testing.expectEqual(@as(?i64, @intCast(m)), bytecode.falseBranchTargetOf(code[e - 1], e - 1));
+    try testing.expectEqual(@as(?i64, @intCast(m)), bytecode.loopTestTargetOf(code[e - 1], e - 1));
     try testing.expectEqual(@as(?u32, null), bytecode.loopHeaderOf(code[e - 1], e - 1));
     try testing.expectEqual(@as(?u32, @intCast(m + 1)), bytecode.loopHeaderOf(code[m], m));
     // A `repeat` is not a `while` header (the peel's scope is unchanged).

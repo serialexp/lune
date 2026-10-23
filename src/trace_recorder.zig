@@ -3529,18 +3529,17 @@ pub const RecordingSession = struct {
                 // retry lands on a condition-true pass and records the body
                 // root first.
                 if (target > pc) {
-                    // `while`: the branch is at `b`, `code[b + 1]` is the
-                    // marker, and taking the branch leaves the loop.
-                    if (jumped and pc < proto.code.len and
-                        bytecode.loopHeaderOf(proto.code[pc], pc) == self.anchor.pc)
-                    {
-                        return true;
-                    }
-                } else if (cb.onFalseCondition() and !jumped and
+                    // `while`: the branch is a link of the test that
+                    // leaves the loop (any `and` link, or the last one
+                    // right above the marker), and it was taken.
+                    if (jumped) if (bytecode.whileTestMarkerOf(proto.code, pc - 1)) |m| {
+                        if (m + 1 == self.anchor.pc) return true;
+                    };
+                } else if (cb.cond.isCondition() and !jumped and
                     bytecode.loopHeaderOf(proto.code[target], target) == self.anchor.pc)
                 {
-                    // `repeat`: the backward branch on a false condition
-                    // targets our marker, and falling through leaves the loop.
+                    // `repeat`: the backward condition branch targets our
+                    // marker, and falling through leaves the loop.
                     return true;
                 }
             }

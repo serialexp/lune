@@ -552,7 +552,8 @@ test "doc 57: bool-lane loads compare and negate as dynamic booleans (shapes D, 
         fn run(vm: *Vm, mode: TraceMode) !void {
             if (!executes(mode)) return;
             // `t[i] == true` records an `eq` over the bool-lane load (it used
-            // to abort `bad_type`), and `not t[i]` a dynamic `not`.
+            // to abort `bad_type`), and `not t[i]` as a value a dynamic
+            // `not` (as a test it is the load's branch flipped, doc 66).
             var eq_on_load: usize = 0;
             var not_on_load: usize = 0;
             for (vm.trace.registry.cache.items) |t| {
@@ -578,7 +579,7 @@ test "doc 57: bool-lane loads compare and negate as dynamic booleans (shapes D, 
         \\for i = 1, 300 do t[i] = (i % 2 == 0) end
         \\local d, e, f = 0, 0, 0
         \\for i = 1, 300 do if t[i] == true then d = d + 1 end end
-        \\for i = 1, 300 do if not t[i] then e = e + 1 end end
+        \\for i = 1, 300 do local n = not t[i] if n then e = e + 1 end end
         \\for i = 1, 300 do if t[i] ~= false then f = f + 1 end end
         \\print(d, e, f)
     , "150\t150\t150\n", .{ .inspect = Inspect.run });

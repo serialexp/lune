@@ -1082,7 +1082,7 @@ test "doc 58: a repeat loop anchors at its marker's header and keeps cross-tier 
         try testing.expectEqual(@as(?u32, @intCast(pc + 1)), bc.loopHeaderOf(ins, pc));
         // The closer sits at `E − 1` and jumps back to the marker.
         const closer_pc = bc.loopMarkerExit(ins, pc) - 1;
-        try testing.expectEqual(@as(?i64, @intCast(pc)), bc.falseBranchTargetOf(code[closer_pc], closer_pc));
+        try testing.expectEqual(@as(?i64, @intCast(pc)), bc.loopTestTargetOf(code[closer_pc], closer_pc));
     }
     try testing.expectEqual(@as(usize, 1), markers);
 

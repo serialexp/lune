@@ -217,7 +217,8 @@ fn exitSideServes(self: *const TraceState, t: *const Trace, exit_instr: u32) boo
 
 /// Doc 58: is `exit_instr` the own test of a `while`/`repeat` loop — a marker
 /// loop, whose header has its `loop` marker right above it? (`isOwnLoopTest`
-/// answers for `for` loops too; those keep their own policy.)
+/// answers for `for` loops too; those keep their own policy. A `while`'s
+/// test may be any leaving link of its chain, doc 66.)
 fn isMarkerLoopTest(t: *const Trace, exit_instr: u32) bool {
     if (!isOwnLoopTestIndex(t, exit_instr)) return false;
     const code = t.code.anchor.proto.code;

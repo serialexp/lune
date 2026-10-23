@@ -1588,12 +1588,16 @@ test "doc 56 §4.8.3 R1: a live ordinary arm wins over a published exit adapter"
 /// the top of the trace. A composite bridge that flushed that φ committed
 /// `cr = true` where the guest had `cr = false`, and the `while` ran one
 /// trip past its bound (215 instead of 76).
+///
+/// Since doc 66's short-circuit tests a bare `and` is a chain of branches
+/// that writes no condition temp, so `== true` keeps the `and` a value:
+/// the temp, and the hazard, are back.
 const while_shortcircuit_src =
     \\local s = 0
     \\for r = 1, 120 do
     \\  local b = false
     \\  local i = 0
-    \\  while i < (r % 9 + 3) and true do
+    \\  while (i < (r % 9 + 3) and true) == true do
     \\    b = not b
     \\    i = i + 1
     \\    if b then s = s + i else s = s - i end

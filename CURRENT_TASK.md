@@ -285,6 +285,13 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     (`IternLane`), 270 → 93 a step. Registry natives install from comptime
     templates. It also fixed the `ipairs` native's overflow at
     maxinteger.
+  - Doc 66 follow-up: `if`/`while` tests compile `and`/`or`/`not` to
+    chains of branches (`condJumps`): `a and b` 124 → 74, `not x` 55 → 27.
+    `falseBranchTargetOf` is now `loopTestTargetOf`, and
+    `whileTestMarkerOf` recognises every leaving link as the loop's test.
+    while_shortcircuit_probe's JIT row is +1.9% at n = 120, a warm-up
+    cost (TODO "A nested `while` goes silent late"). I asked Bart, got
+    no answer, and took the default: commit and record.
   - Scratch shadows are under /tmp/p1:
     - `ab2.sh BASE NEW`: instructions:u A/B over every @bench program, both
       tiers;

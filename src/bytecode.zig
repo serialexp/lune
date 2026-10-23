@@ -656,20 +656,6 @@ pub const CondBranch = struct {
     pub fn jumpsOn(self: CondBranch, holds: bool) bool {
         return self.on_true == holds;
     }
-
-    /// Whether the branch jumps when the Lua condition it was compiled
-    /// from is false: the shape of every `if`, `while` and `repeat` test.
-    /// A truthiness branch does so only as `jmp_if_false`. A
-    /// compare-and-branch always does, in either polarity: the compiler
-    /// emits one only for those tests, folding a `not` into the polarity
-    /// (`while not (i < n)` jumps when `i < n` holds).
-    pub fn onFalseCondition(self: CondBranch) bool {
-        return switch (self.cond) {
-            .truthy => !self.on_true,
-            .compare => true,
-            .not_nil => false,
-        };
-    }
 };
 
 /// The conditional branch at `pc`, or null when `ins` is not one.
@@ -686,13 +672,48 @@ pub fn condBranchOf(ins: Instr, pc: usize) ?CondBranch {
     return .{ .cond = cond, .on_true = on_true, .target = jumpTargetOf(ins, pc) };
 }
 
-/// The target of a branch that jumps when its Lua condition is false, the
-/// shape a `while` test and a `repeat` closer compile to; null for any
-/// other instruction.
-pub fn falseBranchTargetOf(ins: Instr, pc: usize) ?i64 {
+/// The target of a branch with the shape of a `while` test or a `repeat`
+/// closer, a Lua condition's branch in either polarity; null for any other
+/// instruction, `??`'s `jmp_if_not_nil` included. A `not` folds into a
+/// branch's polarity (`while not (i < n)` jumps when `i < n` holds, and
+/// `while not done` is a `jmp_if_true`), and an `and`/`or` test is a chain
+/// of such branches (doc 66), so the instruction alone cannot say which
+/// way leaves the loop. Its position does, and every caller pins it: a
+/// `while` test sits right above its marker and jumps to the loop's exit,
+/// a `repeat` closer jumps back to its marker.
+pub fn loopTestTargetOf(ins: Instr, pc: usize) ?i64 {
     const cb = condBranchOf(ins, pc) orelse return null;
-    if (!cb.onFalseCondition()) return null;
+    if (!cb.cond.isCondition()) return null;
     return cb.target;
+}
+
+/// Doc 66: the `loop` marker of the `while` loop whose test the branch at
+/// `pc` is a link of and leaves, or null. A `while` test is a chain of
+/// condition branches from the loop's start `C` to its marker `m`
+/// (`C … ; loop; body; jmp → C`, exit `E`): each link either jumps to `E`
+/// or skips ahead within the chain, and the last one sits right above
+/// `m`. A link that jumps to `E` is the loop's test as much as the last
+/// one. The chain is expression code, which emits no `loop`, so `m` is
+/// the first marker after `pc`. O(1) unless the branch's target is a
+/// `while` exit whose start precedes it; then O(the test's length).
+pub fn whileTestMarkerOf(code: []const Instr, pc: usize) ?usize {
+    const t = loopTestTargetOf(code[pc], pc) orelse return null;
+    if (t <= @as(i64, @intCast(pc)) or t > @as(i64, @intCast(code.len))) return null;
+    const exit: usize = @intCast(t);
+    // The closer at `E − 1` jumps back to the loop's start, at or before
+    // the link.
+    const closer = code[exit - 1];
+    if (closer.op != .jmp) return null;
+    const start = jumpTargetOf(closer, exit - 1);
+    if (start < 0 or start > @as(i64, @intCast(pc))) return null;
+    var m = pc + 1;
+    while (m < exit - 1) : (m += 1) {
+        if (code[m].op != .loop) continue;
+        if (std.enums.fromInt(LoopKind, code[m].b) != .while_loop) return null;
+        const e = loopMarkerExitChecked(code[m], m, code.len) orelse return null;
+        return if (e == exit) m else null;
+    }
+    return null;
 }
 
 /// Doc 58: the static extent of one loop — every instruction from `start` to
@@ -776,7 +797,7 @@ pub fn loopExtentFor(proto: *const Proto, header: u32) ?LoopExtent {
                 // closer at `E − 1` jumps back to `C`.
                 .while_loop => blk: {
                     if (i == 0) return null;
-                    const branch_target = falseBranchTargetOf(code[i - 1], i - 1) orelse return null;
+                    const branch_target = loopTestTargetOf(code[i - 1], i - 1) orelse return null;
                     if (branch_target != @as(i64, exit)) return null;
                     if (closer.op != .jmp) return null;
                     const c = jumpTargetOf(closer, end);
@@ -786,7 +807,7 @@ pub fn loopExtentFor(proto: *const Proto, header: u32) ?LoopExtent {
                 // `loop; body; cond; jmp_if_false → loop`: the closer at `E − 1`
                 // jumps back to the marker, which opens the loop.
                 .repeat_loop => blk: {
-                    const closer_target = falseBranchTargetOf(closer, end) orelse return null;
+                    const closer_target = loopTestTargetOf(closer, end) orelse return null;
                     if (closer_target != @as(i64, i)) return null;
                     break :blk i;
                 },
@@ -848,11 +869,11 @@ pub fn assertLoopClosersWellFormed(code: []const Instr) void {
             std.debug.assert(found);
             std.debug.assert(@as(LoopKind, @enumFromInt(code[m].b)) == .while_loop);
             std.debug.assert(m > target); // `C ≤ m − 1`
-            std.debug.assert(falseBranchTargetOf(code[m - 1], m - 1) != null);
+            std.debug.assert(loopTestTargetOf(code[m - 1], m - 1) != null);
         } else {
-            // `repeat`: a backward branch on a false condition targets its
-            // `loop` marker. No other backward jump shape exists.
-            std.debug.assert(falseBranchTargetOf(ins, pc) != null);
+            // `repeat`: a backward condition branch targets its `loop`
+            // marker. No other backward jump shape exists.
+            std.debug.assert(loopTestTargetOf(ins, pc) != null);
             std.debug.assert(code[target].op == .loop);
             std.debug.assert(@as(LoopKind, @enumFromInt(code[target].b)) == .repeat_loop);
             std.debug.assert(loopMarkerExit(code[target], target) == pc + 1);
@@ -1279,34 +1300,35 @@ test "doc 66 §5.4: condBranchOf decodes exactly the conditional branches" {
     for (std.enums.values(OpCode)) |op| {
         const ins: Instr = .{ .op = op, .a = 3, .aux = -4 };
         const cb = condBranchOf(ins, 10);
-        const false_target = falseBranchTargetOf(ins, 10);
+        const loop_target = loopTestTargetOf(ins, 10);
         switch (op) {
             .jmp_if_true, .jmp_if_false, .jmp_if_not_nil => {
                 const got = cb.?;
                 try testing.expectEqual(@as(i64, 7), got.target);
                 try testing.expectEqual(op != .jmp_if_false, got.on_true);
                 try testing.expectEqual(op != .jmp_if_not_nil, got.cond.isCondition());
-                // Only a branch on a false condition is a loop test or closer.
-                if (op == .jmp_if_false)
-                    try testing.expectEqual(@as(?i64, 7), false_target)
+                // A condition's branch in either polarity can test a loop;
+                // `??`'s cannot.
+                if (op == .jmp_if_not_nil)
+                    try testing.expectEqual(@as(?i64, null), loop_target)
                 else
-                    try testing.expectEqual(@as(?i64, null), false_target);
+                    try testing.expectEqual(@as(?i64, 7), loop_target);
             },
-            // Doc 66 P4: polarity from bit 0 of `a`, and either polarity is
-            // the false branch of the condition it was compiled from.
+            // Doc 66 P4: polarity from bit 0 of `a`, and either polarity can
+            // test a loop.
             .jlt, .jle, .jgt, .jge, .jeq, .jlt_k, .jle_k, .jgt_k, .jge_k, .jeq_p, .jeq_s, .jeq_n => {
                 const got = cb.?;
                 try testing.expectEqual(CondTest.compare, got.cond);
                 try testing.expectEqual(@as(i64, 7), got.target);
                 try testing.expect(got.on_true); // a = 3: on_true | k_left
-                try testing.expectEqual(@as(?i64, 7), false_target);
+                try testing.expectEqual(@as(?i64, 7), loop_target);
                 const off = condBranchOf(.{ .op = op, .a = cmp_k_left, .aux = -4 }, 10).?;
                 try testing.expect(!off.on_true);
-                try testing.expect(off.onFalseCondition());
+                try testing.expectEqual(@as(?i64, 7), loopTestTargetOf(.{ .op = op, .a = cmp_k_left, .aux = -4 }, 10));
             },
             else => {
                 try testing.expectEqual(@as(?CondBranch, null), cb);
-                try testing.expectEqual(@as(?i64, null), false_target);
+                try testing.expectEqual(@as(?i64, null), loop_target);
             },
         }
     }
@@ -1315,6 +1337,37 @@ test "doc 66 §5.4: condBranchOf decodes exactly the conditional branches" {
     const f = condBranchOf(Instr.opAx(.jmp_if_false, 0, 1), 0).?;
     try testing.expect(t.jumpsOn(true) and !t.jumpsOn(false));
     try testing.expect(f.jumpsOn(false) and !f.jumpsOn(true));
+}
+
+test "doc 66: every link of a `while` test that leaves the loop names its marker" {
+    // `while a < b and c do … end`, then an `if` after the loop:
+    //   0 jlt a b → 5   (on false: leaves)
+    //   1 jmp_if_false c → 5
+    //   2 loop (exit 5)
+    //   3 add
+    //   4 jmp → 0       (the closer)
+    //   5 jmp_if_false → 6, the `if` after the loop
+    const code = [_]Instr{
+        .{ .op = .jlt, .a = 0, .b = 0, .c = 1, .aux = 4 },
+        Instr.opAx(.jmp_if_false, 2, 3),
+        .{ .op = .loop, .b = @intFromEnum(LoopKind.while_loop), .aux = 2 },
+        Instr.opABC(.add, 3, 3, 3),
+        Instr.opAx(.jmp, 0, -5),
+        Instr.opAx(.jmp_if_false, 2, 0),
+    };
+    try testing.expectEqual(@as(?usize, 2), whileTestMarkerOf(&code, 0));
+    try testing.expectEqual(@as(?usize, 2), whileTestMarkerOf(&code, 1));
+    // Not a branch; a branch after the loop.
+    try testing.expectEqual(@as(?usize, null), whileTestMarkerOf(&code, 3));
+    try testing.expectEqual(@as(?usize, null), whileTestMarkerOf(&code, 5));
+    // An `or` link skipping to the marker does not leave the loop.
+    var skip = code;
+    skip[0] = .{ .op = .jlt, .a = cmp_on_true, .b = 0, .c = 1, .aux = 1 };
+    try testing.expectEqual(@as(?usize, null), whileTestMarkerOf(&skip, 0));
+    // A `repeat` marker is no `while`'s.
+    var rep = code;
+    rep[2].b = @intFromEnum(LoopKind.repeat_loop);
+    try testing.expectEqual(@as(?usize, null), whileTestMarkerOf(&rep, 0));
 }
 
 test "disassembly renders a small program" {

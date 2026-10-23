@@ -507,7 +507,7 @@ pub fn continuationReachesEnclosingBackEdge(proto: *const Proto, start_pc: u32, 
                 if (target >= 0 and target <= @as(i64, @intCast(inner_anchor))) return true;
             },
             .ret, .halt => return false,
-            else => if (bytecode.falseBranchTargetOf(ins, pc)) |target| {
+            else => if (bytecode.loopTestTargetOf(ins, pc)) |target| {
                 if (target >= 0 and target <= @as(i64, @intCast(inner_anchor))) return true;
             },
         }

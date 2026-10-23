@@ -427,6 +427,27 @@ doesn't count it (§7.1, "Tiering parity"). The fixes are general:
       ~1 KB `memcpy` on every trace entry** (its arrays were `undefined`).
       Assigned field by field (2026-10-23, `nativegen_artifact.zig`).
 
+## A nested `while` goes silent late on a short run (noted 2026-10-23)
+
+Found by doc 66's short-circuit tests. `bench/while_shortcircuit_probe.lua`
+(a `while` with a varying trip count inside a `for`) now leaves its loop
+through its own test, as a plain `while i < X` does. Its exit is armed
+exit-side, but the cycle's fallback region mints dormant (doc 47 Increment
+B). Admission waits for a full-cap ledger, and promotion for the next
+activation after that, so ledger rows are written until then: at the
+bench's n = 120 the `--jit-native` run is +20k instructions (+1.9%) over the
+old shape, which hid the exit behind an ordinary branch and went silent at
+once through a sibling handoff. At n = 12000 the new shape is −6.2%.
+
+- [ ] **Bart: accept the +1.9% probe row** (doc 66 Outstanding), or ask for
+      the fix below first.
+- [ ] **Shorten dormant admission → silent promotion for an own-loop-test
+      cycle.** Rule Z-8 layer 2: armed, `armable=true`, but "silent-consider:
+      no active region" right after "dormant admission", because the
+      activation opens only on later receipts. Any change trades against the
+      dormant-mint motive (spectral-norm +16% wall before admission gating).
+      The probe with `and true` deleted shows the same path on 8b98d64.
+
 ## A caught error costs ~5% more since `pcall` frame tags (noted 2026-10-23)
 
 Doc 68 §12: success paths got ~5% cheaper, catches ~5% dearer (callgrind,

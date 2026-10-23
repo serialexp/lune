@@ -1347,6 +1347,68 @@ test "doc 66 P4: a compare-and-branch fault names its operands in source order" 
     );
 }
 
+test "doc 66: an `and`/`or`/`not` test runs its links in order, each once" {
+    // A chain of branches must evaluate exactly the operands the value
+    // form did, in its order: a link skipped by a short circuit runs no
+    // call, no metamethod and no fault. The outputs were taken on 8b98d64,
+    // before the chains.
+    try expectProgram(
+        \\local log = ""
+        \\local function v(name, x) log = log .. name return x end
+        \\local function r(c) local s = (c and "T" or "F") .. log .. " " log = "" return s end
+        \\local o = ""
+        \\if v("a", 1) < v("b", 2) and v("c", 3) > v("d", 4) then o = o .. r(true) else o = o .. r(false) end
+        \\if v("a", nil) or v("b", false) then o = o .. r(true) else o = o .. r(false) end
+        \\if not (v("a", 1) == v("b", 1) or v("c", 0)) then o = o .. r(true) else o = o .. r(false) end
+        \\if v("a", false) and v("b", error("never")) then end log = ""
+        \\if v("a", 0) and v("b", "") and not v("c", nil) then o = o .. r(true) else o = o .. r(false) end
+        \\if (v("a", 1) > 2 or v("b", 2) > 1) and (v("c", nil) or v("d", 5) == 5) then o = o .. r(true) else o = o .. r(false) end
+        \\local mt = { __lt = function(a, b) log = log .. "<" return a.v < b.v end, __eq = function(a, b) log = log .. "=" return a.v == b.v end }
+        \\local A, B = setmetatable({ v = 1 }, mt), setmetatable({ v = 2 }, mt)
+        \\if A < B and not (A == B) then o = o .. r(true) else o = o .. r(false) end
+        \\if B < A or A == B then o = o .. r(true) else o = o .. r(false) end
+        \\print(o)
+        \\local function cls(x) if x < 0 and x > -10 then return "s" elseif x >= 10 or x ~= x then return "b" elseif not (x == 0) then return "p" else return "z" end end
+        \\print(cls(-5), cls(-50), cls(0/0), cls(10), cls(3), cls(0))
+        \\print(pcall(function() local x if x or 1 < "a" then end end))
+        \\
+    ,
+        "Fabcd Fab Fab Tabc Tabcd T<= F<= \n" ++
+            "s\tp\tb\tb\tp\tz\n" ++
+            "false\tanonymous:18: attempt to compare number with string\n",
+    );
+}
+
+test "doc 66: loops leave through any link of their test" {
+    // `while` chains exiting through their first link and their last, a
+    // `not` folded into the links, an `or` link landing on the marker, the
+    // value-tested fallback, and a `repeat` (still value-tested), each hot
+    // enough to trace.
+    try expectProgram(
+        \\local s, i = 0, 0
+        \\while i < 300 and s >= 0 do i = i + 1 if i % 3 == 0 or i % 5 == 0 then s = s + i end end
+        \\local j, k = 0, 0
+        \\while j < 200 or k < 100 do j = j + 1 if not (j % 2 == 0) and j > 50 then k = k + 1 end end
+        \\local found = 0
+        \\for r = 1, 200 do
+        \\  local t = { 5, 6, 7, r % 4 }
+        \\  local p = 1
+        \\  while p <= #t and t[p] ~= 7 + (r % 2) do p = p + 1 end
+        \\  found = found + p
+        \\end
+        \\local q, f = 0, false
+        \\while not f and not (q >= 250) do q = q + 1 f = q % 97 == 0 end
+        \\local u = 0
+        \\repeat u = u + 1 until u >= 10 and u % 7 == 0
+        \\local w, x = 0, true
+        \\while not (w >= 300 and x) do w = w + 1 end
+        \\print(s, i, j, k, found, q, u, w)
+        \\
+    ,
+        "21150\t300\t249\t100\t800\t97\t14\t300\n",
+    );
+}
+
 test "open upvalues: captures out of slot order, shared cells, block and frame closes" {
     // The open-upvalue list is slot-ordered (`Vm.appendOpenUpvalue`), so a
     // close pops its suffix. This pins what that must preserve: captures
