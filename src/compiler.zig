@@ -1158,6 +1158,30 @@ const Compiler = struct {
     /// Branches still to be patched to one target.
     const JumpList = std.ArrayList(usize);
 
+    const AndOperands = struct { lhs: *const ast.Expr, rhs: *const ast.Expr };
+
+    /// The operands of `e` when it is an `and`, under any parentheses.
+    fn andOperands(e: *const ast.Expr) ?AndOperands {
+        var cur = e;
+        while (cur.data == .paren) cur = cur.data.paren;
+        return switch (cur.data) {
+            .binary => |b| if (b.op == .and_) .{ .lhs = b.lhs, .rhs = b.rhs } else null,
+            else => null,
+        };
+    }
+
+    /// Whether `e`'s value is true whatever runs: a literal other than
+    /// `nil` and `false`, a table constructor or a function. (Every number
+    /// and string is true in Lua.)
+    fn isAlwaysTrue(e: *const ast.Expr) bool {
+        return switch (e.data) {
+            .bool => |b| b,
+            .int, .float, .string_raw, .table, .function => true,
+            .paren => |inner| isAlwaysTrue(inner),
+            else => false,
+        };
+    }
+
     /// Doc 66 (short-circuit conditions): emit `cond` as branches that jump
     /// when its truth is `jump_when`, appending each to `out`, and fall
     /// through otherwise (LuaJIT's `bcemit_branch_t`/`bcemit_branch_f`).
@@ -1581,6 +1605,25 @@ const Compiler = struct {
                 return;
             },
             .or_ => {
+                // Doc 66: `A and B or C`, the ternary idiom. A falsy `A` is
+                // never the value, since the `or` discards it, so `A`
+                // compiles to branches straight to `C` (`condJumps`) and
+                // never becomes a value. Only `B` is tested, unless it is a
+                // literal that is always true.
+                if (andOperands(lhs)) |ab| {
+                    var to_c: JumpList = .empty;
+                    defer to_c.deinit(self.scratch);
+                    try self.condJumps(ab.lhs, false, &to_c);
+                    try self.compileExprTo(ab.rhs, dest);
+                    const done = if (isAlwaysTrue(ab.rhs))
+                        try self.emitJump(.jmp, 0)
+                    else
+                        try self.emitJump(.jmp_if_true, dest);
+                    for (to_c.items) |j| self.patchToHere(j);
+                    try self.compileExprTo(rhs, dest);
+                    self.patchToHere(done);
+                    return;
+                }
                 try self.compileExprTo(lhs, dest);
                 const skip = try self.emitJump(.jmp_if_true, dest); // true → keep lhs
                 try self.compileExprTo(rhs, dest);
@@ -2471,6 +2514,33 @@ test "doc 66: an `and`/`or`/`not` test compiles to a chain of branches" {
         try testing.expect(bytecode.loopExtentFor(r.chunk.proto, @intCast(m + 1)) != null);
     }
     try testing.expectEqual(@as(usize, 2), markers);
+}
+
+test "doc 66: `A and B or C` compiles `A` to branches straight to `C`" {
+    var r = try run(
+        \\local i, n, x, y = 3, 5, 1, false
+        \\local a = i > n and 1 or 2
+        \\local b = x and y or 7
+        \\local c = (i < n and not y) and "s" or "t"
+        \\return a * 100 + b * 10 + (c == "s" and 1 or 0)
+    );
+    defer r.deinit();
+    try testing.expectEqual(@as(i64, 271), r.value.asInt());
+    const code = r.chunk.proto.code;
+    var count = std.EnumArray(OpCode, usize).initFill(0);
+    for (code) |ins| count.getPtr(ins.op).* += 1;
+    // No `A` is a value: no compare into a register, no `not`, and `x`'s
+    // and `y`'s tests read their own registers (r2, r3).
+    try testing.expectEqual(@as(usize, 0), count.get(.lt) + count.get(.le) + count.get(.gt) + count.get(.ge) + count.get(.not));
+    for (code) |ins| switch (ins.op) {
+        .jmp_if_false => try testing.expectEqual(@as(u16, 2), ins.a),
+        .jmp_if_true => try testing.expect(ins.a == 3 or ins.a > 4),
+        else => {},
+    };
+    // `b`'s `B` is a local that may be false, so it is tested once; the
+    // literal `B`s jump over `C` unconditionally.
+    try testing.expectEqual(@as(usize, 1), count.get(.jmp_if_false));
+    try testing.expectEqual(@as(usize, 2), count.get(.jmp_if_true));
 }
 
 test "doc 66: a `while` test may end on a `jmp_if_true`" {

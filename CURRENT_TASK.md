@@ -301,6 +301,8 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     (`isFreshTop`) and `return x` returns in place: call1 408 → 355,
     tier-0 recursive-fib −6.0%, no row up. The new shape is what exposed
     the hang above.
+  - Doc 66 follow-up: `A and B or C` compiles `A` to branches straight to
+    `C`: `tern` 110 → 58, lua54 −0.7%.
   - Scratch shadows are under /tmp/p1:
     - `ab2.sh BASE NEW`: instructions:u A/B over every @bench program, both
       tiers;

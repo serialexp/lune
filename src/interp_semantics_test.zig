@@ -3176,6 +3176,37 @@ test "a call laid out at its destination, and `return x` in place, keep every va
     , "11\t8\t21\t21\t5\t9\tfalse\t1200\n");
 }
 
+test "doc 66: `A and B or C` runs each operand once, in order, with Lua's values" {
+    // Output taken on 2a20e98, where every `and`/`or` value was a tested
+    // register, and checked against LuaJIT. A falsy `B` falls to `C`; a
+    // falsy `A` never becomes the value.
+    try expectProgram(
+        \\local log = ""
+        \\local function v(x, s) log = log .. s return x end
+        \\local n, f, z = 5, false, nil
+        \\local r = {}
+        \\for i = 3, 7 do r[#r + 1] = i > n and 1 or 2 end
+        \\print(table.concat(r, " "))
+        \\print(n > 1 and false or 3, n > 1 and nil or 4, n < 1 and 9 or nil, f and 1 or 2, z and 1 or f)
+        \\print(v(1, "a") and v(false, "b") or v(7, "c"), log)
+        \\log = ""
+        \\print(v(nil, "a") and v(1, "b") or v(8, "c"), log)
+        \\log = ""
+        \\print((v(1, "a") and v(2, "b")) or v(9, "c"), log)
+        \\log = ""
+        \\print(n > 1 and n < 9 and "in" or "out", not (n > 1) and "x" or "y", (n == 5 or f) and {} ~= nil or 0)
+        \\local nan = 0 / 0
+        \\print(nan < 1 and "lt" or "nlt", nan ~= nan and "ne" or "eq")
+        \\print(pcall(function() return n < "x" and 1 or 2 end))
+        \\local t = {}
+        \\local c = n > 3 and t or {}
+        \\print(c == t, (n > 9 and t or c) == t, 1 and 2 and 3 or 4, nil and 1 or false and 2 or 5)
+        \\
+    ,
+        "2 2 2 1 1\n3\t4\tnil\t2\tfalse\n7\tabc\n8\tac\n2\tab\nin\ty\ttrue\nnlt\tne\n" ++
+            "false\tanonymous:17: attempt to compare number with string\ntrue\ttrue\t3\t5\n");
+}
+
 test "doc 61 Phase 0: a backtrace names an in-flight parent's own instruction line" {
     // `f` is in flight at the `.add`, whose span starts on line 3; the
     // instruction before it, the call to its right operand, is on line 4.

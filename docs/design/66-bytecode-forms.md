@@ -419,6 +419,30 @@ land; move whole phases to Done once everything inside them is checked.
     returns in place" (compiler); "a call laid out at its destination,
     and `return x` in place, keep every value" (semantics matrix, output
     taken on 2a20e98).
+- [x] **`and`/`or` as values: `A and B or C`** (2026-10-23, the follow-up
+  to the chains). `local b = i > n and 1 or 2` materialised `i > n` and
+  tested the temporary: 110 instructions against LuaJIT's 32. LuaJIT
+  compiles it with pending jump lists (`expr_toreg` with `t`/`f` lists).
+  Here the idiom gets the same code without them: a falsy `A` is never
+  the value of `A and B or C`, because the `or` discards it, so `A`
+  compiles to branches straight to `C` (`condJumps`, any `A`). `B` lands
+  in the destination and is tested with one `jmp_if_true`, or jumped over
+  unconditionally when it is a literal that is always true
+  (`isAlwaysTrue`).
+  - Alone, `A and B` and `A or B` with a comparison `A` keep the value
+    form: branching on `A` would load the `false`/`true` it short-
+    circuits to, so neither path gets shorter.
+  - Probe: `tern` 110 → 58 instructions at tier 0 (LuaJIT 32); with
+    `--jit-native` 16 → 12 an iteration.
+  - A/B: lua54 −0.70% on both tiers; no other row moves at tier 0. The
+    one JIT row up is scimark-lu +0.04%, inside the bar: every
+    `--jit-stats` counter is identical, and the only difference is that
+    `lu_factor`'s anchors sit one pc lower (its `m < n and m or n` is one
+    instruction shorter), the `AnchorMap` probing lottery 4f08b76 names.
+  - Tests: "`A and B or C` compiles `A` to branches straight to `C`"
+    (compiler); "`A and B or C` runs each operand once, in order, with
+    Lua's values" (semantics matrix, output taken on 2a20e98 and checked
+    against LuaJIT).
 
 ### Outstanding
 
@@ -432,11 +456,6 @@ land; move whole phases to Done once everything inside them is checked.
   (2026-10-23, asked while he was away, default taken). See the Done
   bullet: while_shortcircuit_probe `--jit-native` +1.9% at the bench's
   n = 120, a one-time warm-up the plain `while` already pays.
-- [ ] **`and`/`or` as values** (follow-up to the chains). `local b = i > n
-  and 1 or 2` still materialises `i > n` and tests the temporary: 110
-  instructions against LuaJIT's 32. LuaJIT compiles an expression with
-  pending jump lists (`expr_toreg` with `t`/`f` lists), so a comparison
-  feeding `and`/`or` never becomes a value.
 - [ ] **`repeat … until` with an `and`/`or` test** (follow-up to the
   chains). It keeps the value form: its closer must be the one backward
   branch onto the marker (`assertLoopClosersWellFormed`), and the body's
