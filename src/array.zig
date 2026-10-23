@@ -239,10 +239,12 @@ pub const ArrayPart = extern struct {
     /// lane can reinterpret it as `[*]Value` and `.i64`/`.f64` stay aligned.
     /// `null` iff `cap == 0`.
     data: ?[*]align(@alignOf(Value)) u8 = null,
-    /// Presence bitmap, 1 bit/slot (`null` for the `.value` lane, which encodes
-    /// holes in-band). Bit `i` set ⇒ slot `i` holds a value; clear ⇒ hole/`nil`.
-    /// For a grid, this is the per-*cell* bitmap over `cap*stride` cells (bit
-    /// `row*stride + col`).
+    /// Presence bitmap, 1 bit/slot (`null` for the `.value` and `.boolean`
+    /// lanes, which encode holes in-band). Bit `i` set ⇒ slot `i` holds a
+    /// value; clear ⇒ hole/`nil`. For a grid, this is the per-*cell* bitmap
+    /// over `cap*stride` cells (bit `row*stride + col`). It lives in `data`'s
+    /// block, after the lane data (`allocStorage`), so it is never freed on
+    /// its own.
     present: ?[*]u8 = null,
     /// **Grid stride** (doc 14): meaningful only when `lane == .grid` — the number
     /// of cells per row, so cell `(row, col)` lives at flat index `row*stride+col`.
@@ -274,15 +276,12 @@ pub const ArrayPart = extern struct {
             // Grid buffers are sized by the flattened cell count (`cap*stride`),
             // not the scalar `cap`, and carry the extra `row_len` vector — free
             // them on their own terms.
-            const cells = gridCells(self.cap, self.stride);
-            if (self.data) |d| gpa.free(d[0..dataBytes(self.grid_elem, cells)]);
-            if (self.present) |p| gpa.free(p[0..presenceBytes(cells)]);
+            freeStorage(gpa, self.data, self.grid_elem, gridCells(self.cap, self.stride));
             if (self.row_len) |r| gpa.free(r[0..self.cap]);
             self.* = .empty;
             return;
         }
-        if (self.data) |d| gpa.free(d[0..dataBytes(self.lane, self.cap)]);
-        if (self.present) |p| gpa.free(p[0..presenceBytes(self.cap)]);
+        freeStorage(gpa, self.data, self.lane, self.cap);
         self.* = .empty;
     }
 
@@ -455,7 +454,7 @@ pub const ArrayPart = extern struct {
         if (n > self.asize) {
             // New slots are holes. The int/float lanes lean on the presence
             // bitmap (zeroed by the growth path); the boolean lane leans on its
-            // in-band data bytes (zeroed by `allocData`, and re-zeroed on shrink
+            // in-band data bytes (zeroed by `allocStorage`, and re-zeroed on shrink
             // below) — both already read `[len, n)` as absent. Only `.value`, with
             // no out-of-band hole marker, must write explicit `nil`s.
             if (self.lane == .value) {
@@ -619,7 +618,7 @@ pub const ArrayPart = extern struct {
         // (in-bounds astore and grow astore_append) would trip on small arrays. Sizing
         // to `ceil(slots/64)*8` bytes makes every in-range `bts` land inside the
         // buffer. Tier-0's byte-granular `setBit`/`isPresent` are unaffected; the extra
-        // trailing bytes are zeroed (allocPresence) and never read as presence for
+        // trailing bytes are zeroed (allocStorage) and never read as presence for
         // slots >= cap.
         return ((slots + 63) / 64) * 8;
     }
@@ -774,28 +773,55 @@ pub const ArrayPart = extern struct {
 
     // ---- allocation / growth / lane conversion ----
 
-    fn allocData(gpa: std.mem.Allocator, lane: Lane, cap: usize) std.mem.Allocator.Error!?[*]align(@alignOf(Value)) u8 {
-        const nbytes = dataBytes(lane, cap);
-        if (nbytes == 0) return null;
-        const slice = try gpa.alignedAlloc(u8, std.mem.Alignment.of(Value), nbytes);
-        // The boolean lane encodes absence in-band (byte 0), so freshly allocated
-        // slots must read as holes — zero them, mirroring how `allocPresence`
-        // zeroes the bitmap that the int/float lanes lean on. Other lanes write
-        // every live slot before reading it, so they need no zeroing.
-        if (lane == .boolean) @memset(slice, 0);
-        return slice.ptr;
+    /// An array part's storage: `cells` slots of `lane` data, then, for a
+    /// bitmap lane, the presence bitmap. One allocation for both, so a narrow
+    /// array costs one alloc and one free rather than two of each.
+    const Storage = struct {
+        data: ?[*]align(@alignOf(Value)) u8 = null,
+        present: ?[*]u8 = null,
+    };
+
+    /// Where the presence bitmap starts in a storage block: after the lane
+    /// data, on a word boundary for the native path's 8-byte `bt`/`bts`.
+    fn presenceOffset(lane: Lane, cells: usize) usize {
+        return std.mem.alignForward(usize, dataBytes(lane, cells), 8);
     }
 
-    fn allocPresence(gpa: std.mem.Allocator, cap: usize) std.mem.Allocator.Error!?[*]u8 {
-        const nbytes = presenceBytes(cap);
-        if (nbytes == 0) return null;
-        const slice = try gpa.alloc(u8, nbytes);
-        @memset(slice, 0); // all slots absent until written
-        return slice.ptr;
+    /// The size of a storage block for `cells` slots of `lane`.
+    fn storageBytes(lane: Lane, cells: usize) usize {
+        if (!lane.usesPresenceBitmap()) return dataBytes(lane, cells);
+        return presenceOffset(lane, cells) + presenceBytes(cells);
     }
 
-    /// Ensure `cap >= needed`, reallocating `data` (and the presence bitmap for a
-    /// narrow lane) and preserving existing contents. New capacity grows
+    /// Allocate a storage block (`Storage`) for `cells` slots of `lane` (a
+    /// scalar lane, or a grid's `grid_elem`); empty when `cells == 0`. Every
+    /// slot starts absent. `inline`: `ensureCapacity` is every array's growth.
+    inline fn allocStorage(gpa: std.mem.Allocator, lane: Lane, cells: usize) std.mem.Allocator.Error!Storage {
+        const nbytes = dataBytes(lane, cells);
+        if (nbytes == 0) return .{};
+        if (!lane.usesPresenceBitmap()) {
+            const block = try gpa.alignedAlloc(u8, std.mem.Alignment.of(Value), nbytes);
+            // The boolean lane encodes absence in-band (byte 0), so freshly
+            // allocated slots must read as holes — zero them, as the bitmap the
+            // int/float lanes lean on is zeroed. Other lanes write every live
+            // slot before reading it, so they need no zeroing.
+            if (lane == .boolean) @memset(block, 0);
+            return .{ .data = block.ptr };
+        }
+        const at = std.mem.alignForward(usize, nbytes, 8);
+        const block = try gpa.alignedAlloc(u8, std.mem.Alignment.of(Value), at + presenceBytes(cells));
+        const bitmap = block[at..];
+        @memset(bitmap, 0); // all slots absent until written
+        return .{ .data = block.ptr, .present = bitmap.ptr };
+    }
+
+    /// Free the storage block `data` heads, allocated for `cells` slots of `lane`.
+    fn freeStorage(gpa: std.mem.Allocator, data: ?[*]align(@alignOf(Value)) u8, lane: Lane, cells: usize) void {
+        if (data) |d| gpa.free(d[0..storageBytes(lane, cells)]);
+    }
+
+    /// Ensure `cap >= needed`, reallocating the storage block and preserving
+    /// existing contents. New capacity grows
     /// geometrically. New slots are left absent (presence zeroed); `.value`
     /// new slots are written by the caller (`append`/`resize`) before being read.
     fn ensureCapacity(self: *ArrayPart, gpa: std.mem.Allocator, needed: usize) std.mem.Allocator.Error!void {
@@ -808,47 +834,38 @@ pub const ArrayPart = extern struct {
         var new_cap = if (self.cap == 0) @as(usize, 8) else self.cap;
         while (new_cap < needed) new_cap = @min(new_cap *| 2, max_cap);
 
-        // Allocate *both* new buffers before freeing or mutating anything: an OOM on
-        // the presence alloc must not leave `self` half-rewritten (old data freed,
-        // `cap` stale) — that would later free the wrong slice length and corrupt.
-        const new_data = try allocData(gpa, self.lane, new_cap);
-        errdefer if (new_data) |nd| gpa.free(nd[0..dataBytes(self.lane, new_cap)]);
+        // Allocate the new block before freeing or mutating anything, so an OOM
+        // leaves `self` as it was.
+        const new = try allocStorage(gpa, self.lane, new_cap);
 
-        var new_present: ?[*]u8 = null;
-        if (self.lane.usesPresenceBitmap()) new_present = try allocPresence(gpa, new_cap);
-
-        // Both allocations succeeded — now it is safe to copy, free, and commit.
         if (self.data) |old| {
             // Copy the live payload. For bit-packed lanes the live byte count is
             // ceil(len/8); for byte lanes it's len*width. Copying `dataBytes(len)`
             // covers exactly the occupied prefix.
             const live = dataBytes(self.lane, self.asize);
-            if (live > 0) @memcpy(new_data.?[0..live], old[0..live]);
-            gpa.free(old[0..dataBytes(self.lane, self.cap)]);
+            if (live > 0) @memcpy(new.data.?[0..live], old[0..live]);
         }
-        if (new_present) |np| {
+        if (new.present) |np| {
             if (self.present) |old| {
                 const live = presenceBytes(self.asize);
                 if (live > 0) @memcpy(np[0..live], old[0..live]);
-                gpa.free(old[0..presenceBytes(self.cap)]);
             }
         }
-        self.data = new_data;
-        self.present = new_present;
+        freeStorage(gpa, self.data, self.lane, self.cap);
+        self.data = new.data;
+        self.present = new.present;
         self.cap = new_cap;
     }
 
     /// Convert the array part to `target` by re-encoding every live slot through
     /// a logical `Value`. Allocates fresh storage sized to the current `cap`,
-    /// copies, then frees the old buffers.
+    /// copies, then frees the old block.
     fn convert(self: *ArrayPart, gpa: std.mem.Allocator, target: Lane) std.mem.Allocator.Error!void {
         std.debug.assert(self.lane != .grid and target != .grid); // grid migration is a reshape, not a lane convert
         std.debug.assert(target != self.lane);
         const cap = self.cap;
 
-        const new_data = try allocData(gpa, target, cap);
-        errdefer if (new_data) |nd| gpa.free(nd[0..dataBytes(target, cap)]);
-        const new_present: ?[*]u8 = if (target.usesPresenceBitmap()) try allocPresence(gpa, cap) else null;
+        const new = try allocStorage(gpa, target, cap);
 
         // Build a temporary view of the destination to encode into, then commit.
         // `frozen` carries through unchanged: a monotonic widen on the store path
@@ -858,15 +875,14 @@ pub const ArrayPart = extern struct {
             .frozen = self.frozen,
             .asize = self.asize,
             .cap = cap,
-            .data = new_data,
-            .present = new_present,
+            .data = new.data,
+            .present = new.present,
         };
         var i: usize = 0;
         while (i < self.asize) : (i += 1) dst.encode(i, self.decode(i));
 
-        // Free the old buffers and adopt the converted storage.
-        if (self.data) |old| gpa.free(old[0..dataBytes(self.lane, self.cap)]);
-        if (self.present) |old| gpa.free(old[0..presenceBytes(self.cap)]);
+        // Free the old block and adopt the converted storage.
+        freeStorage(gpa, self.data, self.lane, self.cap);
         self.* = dst;
     }
 
@@ -953,12 +969,11 @@ pub const ArrayPart = extern struct {
         const cells = gridCells(rows, stride);
         if (cells > max_cells) return error.OutOfMemory;
 
-        // Allocate all three buffers before committing; an OOM on a later alloc
-        // frees the earlier ones via the errdefers and leaves nothing behind.
-        const data = try allocData(gpa, grid_elem, cells);
-        errdefer if (data) |d| gpa.free(d[0..dataBytes(grid_elem, cells)]);
-        const present = try allocPresence(gpa, cells); // grid_elem always uses a bitmap
-        errdefer if (present) |p| gpa.free(p[0..presenceBytes(cells)]);
+        // Allocate both buffers (cells with their bitmap, then `row_len`) before
+        // committing; an OOM on the second frees the first via the errdefer and
+        // leaves nothing behind.
+        const storage = try allocStorage(gpa, grid_elem, cells); // grid_elem always uses a bitmap
+        errdefer freeStorage(gpa, storage.data, grid_elem, cells);
 
         var row_len: ?[*]u32 = null;
         if (rows != 0) {
@@ -977,8 +992,8 @@ pub const ArrayPart = extern struct {
             .asize = rows,
             .cap = rows,
             .stride = stride,
-            .data = data,
-            .present = present,
+            .data = storage.data,
+            .present = storage.present,
             .row_len = row_len,
         };
     }
@@ -1051,9 +1066,9 @@ pub const ArrayPart = extern struct {
         const new_cells = gridCells(rows, new_stride);
         if (new_cells > max_cells) return error.OutOfMemory;
 
-        const new_data = try allocData(gpa, self.grid_elem, new_cells);
-        errdefer if (new_data) |nd| gpa.free(nd[0..dataBytes(self.grid_elem, new_cells)]);
-        const new_present = try allocPresence(gpa, new_cells);
+        const new = try allocStorage(gpa, self.grid_elem, new_cells);
+        const new_data = new.data;
+        const new_present = new.present;
 
         // Re-lay each row from `old_stride` to `new_stride`: bulk-copy its data bytes
         // (grid cells are whole-byte fixed-width lanes — `cell_bytes >= 1`), then move
@@ -1079,10 +1094,8 @@ pub const ArrayPart = extern struct {
             }
         }
 
-        // Free old buffers, commit the wider stride.
-        const old_cells = gridCells(self.cap, old_stride);
-        if (self.data) |d| gpa.free(d[0..dataBytes(self.grid_elem, old_cells)]);
-        if (self.present) |p| gpa.free(p[0..presenceBytes(old_cells)]);
+        // Free the old block, commit the wider stride.
+        freeStorage(gpa, self.data, self.grid_elem, gridCells(self.cap, old_stride));
         self.data = new_data;
         self.present = new_present;
         self.stride = new_stride;
@@ -1099,23 +1112,24 @@ pub const ArrayPart = extern struct {
         std.debug.assert(target.usesPresenceBitmap() and target != self.grid_elem);
         const cells = gridCells(self.cap, self.stride);
 
-        const new_data = try allocData(gpa, target, cells);
-        errdefer if (new_data) |nd| gpa.free(nd[0..dataBytes(target, cells)]);
+        const new = try allocStorage(gpa, target, cells);
 
-        // Re-encode present cells; the shared presence bitmap is reused as-is (cell
+        // Re-encode present cells; the presence bitmap is copied as it is (cell
         // positions don't move), so absent cells stay holes.
         if (self.data) |old_data| {
             const present = self.present.?;
+            @memcpy(new.present.?[0..presenceBytes(cells)], present[0..presenceBytes(cells)]);
             var idx: usize = 0;
             while (idx < cells) : (idx += 1) {
                 if (getBit(present, idx)) {
                     const v = decodeGridCell(self.grid_elem, old_data, present, idx);
-                    encodeGridCell(target, new_data.?, present, idx, v);
+                    encodeGridCell(target, new.data.?, new.present.?, idx, v);
                 }
             }
-            gpa.free(old_data[0..dataBytes(self.grid_elem, cells)]);
+            freeStorage(gpa, old_data, self.grid_elem, cells);
         }
-        self.data = new_data;
+        self.data = new.data;
+        self.present = new.present;
         self.grid_elem = target;
     }
 
@@ -1200,6 +1214,40 @@ test "value lane: round-trips every value kind incl. nil holes" {
     try testing.expect(a.get(1).isNil());
     try testing.expectEqual(@as(f64, 2.5), a.get(2).asFloat());
     try testing.expectEqual(true, a.get(3).asBool());
+}
+
+test "a narrow lane's presence bitmap shares its data block" {
+    var tracking = @import("mem.zig").TrackingAllocator.init(testing.allocator);
+    const gpa = tracking.allocator();
+    var a: ArrayPart = .empty;
+    errdefer a.deinit(gpa);
+
+    // The first int commits a byte lane: one block, the bitmap word-aligned
+    // after the slots.
+    try a.append(gpa, Value.int(3));
+    try testing.expectEqual(Lane.u8, a.lane);
+    try testing.expectEqual(@as(usize, 1), tracking.stats.alloc_count);
+    try testing.expectEqual(@intFromPtr(a.data.?) + std.mem.alignForward(usize, a.cap, 8), @intFromPtr(a.present.?));
+
+    // Growth moves both in one block, holes and values intact.
+    try a.resize(gpa, 5);
+    var i: usize = 5;
+    while (i < 20) : (i += 1) try a.append(gpa, Value.int(@intCast(i)));
+    try testing.expectEqual(@as(usize, 1), tracking.stats.live_allocations);
+    try testing.expectEqual(@as(i64, 3), a.get(0).asInt());
+    try testing.expect(a.get(1).isNil());
+    try testing.expect(a.get(4).isNil());
+    try testing.expectEqual(@as(i64, 19), a.get(19).asInt());
+
+    // A widen to `.value` drops the bitmap.
+    try a.append(gpa, Value.boolean(true));
+    try testing.expectEqual(Lane.value, a.lane);
+    try testing.expect(a.present == null);
+    try testing.expectEqual(@as(usize, 1), tracking.stats.live_allocations);
+    try testing.expect(a.get(1).isNil());
+
+    a.deinit(gpa);
+    tracking.assertNoLeaks();
 }
 
 test "boolean lane: repack packs true/false/hole at one byte/slot, presence in-band" {

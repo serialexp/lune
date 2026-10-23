@@ -289,9 +289,14 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     nsieve −5.6% tier-0. A full array's growth skips the lane (JIT mode
     sees only those). Constructors, measured by `bench/opprobe/ctors.lua`
     against LuaJIT `-joff`: `{i}` 908 vs 502, `{i,i,i}` 1338 vs 571,
-    `{x=i,y=i}` 943 vs 832. What's left in a positional constructor is the
-    first store (`seedAt` plus two allocations, data and presence bitmap)
-    and the int→value convert in `{i, t, t}`.
+    `{x=i,y=i}` 943 vs 832.
+  - A narrow array part's presence bitmap lives in its data block
+    (`ArrayPart.allocStorage`), one allocation instead of two; `present`
+    still points at it, so native code is unchanged. `{i}` 908 → 809,
+    binary-trees −3.9% tier-0 / −1.9% JIT, lua54 −2.7%, tbl_ops −1.4%.
+    What's left in a positional constructor is the first store's path
+    (`indexSet` → `Table.set` → `seedAt` → `commitFreshLane` →
+    `ensureCapacity`) and the int→value convert in `{i, t, t}`.
   - Doc 71, tier-0 upvalue access (`docs/design/71-tier0-upvalue-access.md`):
     a cell carries pointers to its value's two lanes (LuaJIT's `uv->v`),
     the cell pointers live inline in the closure, and `u = v` stores from
