@@ -3707,10 +3707,11 @@ pub const Vm = struct {
         return t;
     }
 
-    /// A slow handler's cold continuation: a second per-op table, read with
-    /// the instruction's runtime opcode (like `slowTail`), so LLVM can't
-    /// inline the continuation back into the handler that leaves for it,
-    /// where its register pressure would land on that handler's hot path.
+    /// A slow handler's cold continuation, or a fast handler's second exit
+    /// (`set_index`'s append lane): a second per-op table, read with the
+    /// instruction's runtime opcode (like `slowTail`), so LLVM can't inline
+    /// the continuation back into the handler that leaves for it, where its
+    /// register pressure would land on that handler's hot path.
     const cold_table_fast = buildColdTable(.fast);
     const cold_table_full = buildColdTable(.full);
 
@@ -3718,6 +3719,7 @@ pub const Vm = struct {
         var t: [op_count]*const HandlerFn = undefined;
         for (&t) |*h| h.* = noSlowPath;
         t[@intFromEnum(bytecode.OpCode.itern)] = opIternCall(mode);
+        t[@intFromEnum(bytecode.OpCode.set_index)] = opSetIndexAppend(mode);
         return t;
     }
 
@@ -8022,6 +8024,7 @@ pub const Vm = struct {
                                 break :fast;
                             }
                         }
+                        if (i == @as(i64, @intCast(tbl.array.asize)) and tbl.array.asize < tbl.array.cap) return coldTail(mode, st, pc, instr, vm, tags, payloads);
                     }
                     // Heap-key mirror (`t.name = v`): a key live in the hash
                     // part takes a non-nil value in place, which is what
@@ -8053,6 +8056,25 @@ pub const Vm = struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
                 vm.indexSet(regs.get(instr.a), regs.get(instr.b), regs.get(instr.c)) catch |e| return parkErr(st, e);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// `set_index`'s append lane (`opSetIndex` leaves for it when the int key
+    /// is `#t`'s successor and the array has room; a full array's growth is
+    /// `opSetIndexSlow`'s): an append into allocated capacity (`t[#t+1] = v`,
+    /// a constructor's next positional) is a store and nothing else, which
+    /// `indexSet` → `Table.set` would reach through four calls. Anything else
+    /// takes `opSetIndexSlow`.
+    fn opSetIndexAppend(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const t = table.Table.fromHeader(regs.get(instr.a).asHeap());
+                const val = regs.get(instr.c);
+                if (!t.appendInCap(regs.get(instr.b).asInt(), val)) return slowTail(mode, st, pc, instr, vm, tags, payloads);
+                vm.heap.writeBarrier(&t.header, val); // no-op until Phase 4
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;

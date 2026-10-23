@@ -316,6 +316,21 @@ pub const Table = struct {
         return .{ .slot = idx, .mask = self.hash.mask };
     }
 
+    /// `t[i] = val` when it is an append into allocated capacity, else `false`
+    /// with nothing done. That is `set`'s append branch with only the store left
+    /// to do: the lane is committed (`asize != 0`), the slot exists, the value
+    /// fits, and an empty hash part has no stale copy to drop or successor to
+    /// migrate. No metatable, so no `__newindex` for the absent key. The raw
+    /// store for a caller that has not yet dispatched metamethods.
+    pub inline fn appendInCap(self: *Table, i: i64, val: Value) bool {
+        const asize = self.array.asize;
+        if (i != @as(i64, @intCast(asize)) or asize == 0 or asize >= self.array.cap) return false;
+        if (self.metatable != null or self.hash.count() != 0 or val.isNil()) return false;
+        if (self.array.isGrid() or !self.array.fits(val)) return false;
+        self.array.appendInCap(val);
+        return true;
+    }
+
     /// `t[key] = val`. A `nil`/`NaN` key errors; storing `nil` deletes.
     pub fn set(self: *Table, gpa: std.mem.Allocator, key: Value, val: Value) Error!void {
         // A grid table never takes a raw store: outer row (re)assignment and row

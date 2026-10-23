@@ -3757,3 +3757,30 @@ test "arithmetic, unary and length fall back to their metamethods" {
         "add\tsub\tmul\tdiv\tband\tshl\tunm\tbnot\tlen\nfalse\tanonymous:7: attempt to perform arithmetic on a string value\n3\t3\n2\t-6\t-2.5\t1.5\nfalse\tanonymous:12: attempt to perform arithmetic on a table value\n",
     );
 }
+
+test "an append stores, and leaves the rest to the full store" {
+    // `set_index`'s append lane takes only a plain store into allocated
+    // capacity: a `__newindex` on the successor key, a successor already in
+    // the hash part, a value that widens the lane and a full array take the
+    // full store.
+    try expectProgram(
+        \\local t = { 1, 2 }
+        \\for i = 3, 20 do t[i] = i end
+        \\print(#t, t[20])
+        \\local log = {}
+        \\local m = setmetatable({ 1 }, { __newindex = function(_, k, v) log[#log + 1] = k .. "=" .. v end })
+        \\m[2] = 5
+        \\print(rawget(m, 2), log[1])
+        \\local h = { 1 }
+        \\h[3] = 30
+        \\h[2] = 20
+        \\print(#h, h[3])
+        \\local w = { 1, 2 }
+        \\w[3] = "x"
+        \\w[4] = 1.5
+        \\print(#w, w[3], w[4])
+        \\
+    ,
+        "20\t20\nnil\t2=5\n3\t30\n4\tx\t1.5\n",
+    );
+}

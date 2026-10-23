@@ -283,6 +283,15 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     `mixHash` was ~16 of them: a heap key now hashes with one multiply
     (doc 49 follow-up), `t.x` 74, field_hash −13.6%, nbody −7.7%.
     Outstanding there: `math.type`, allocating bodies, the generic ABI.
+  - `set_index` appends into allocated capacity on a cold lane
+    (`opSetIndexAppend` via `coldTail`, `Table.appendInCap`) instead of
+    `indexSet` → `Table.set` → `append`: repack −21%, sieve_int −9.8%,
+    nsieve −5.6% tier-0. A full array's growth skips the lane (JIT mode
+    sees only those). Constructors, measured by `bench/opprobe/ctors.lua`
+    against LuaJIT `-joff`: `{i}` 908 vs 502, `{i,i,i}` 1338 vs 571,
+    `{x=i,y=i}` 943 vs 832. What's left in a positional constructor is the
+    first store (`seedAt` plus two allocations, data and presence bitmap)
+    and the int→value convert in `{i, t, t}`.
   - Doc 71, tier-0 upvalue access (`docs/design/71-tier0-upvalue-access.md`):
     a cell carries pointers to its value's two lanes (LuaJIT's `uv->v`),
     the cell pointers live inline in the closure, and `u = v` stores from
