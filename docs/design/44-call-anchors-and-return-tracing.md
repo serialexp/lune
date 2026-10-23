@@ -12,7 +12,7 @@ Remaining P1/P2/P4 work below is not claimed complete.
 Codex-reviewed ×6 (gpt-5.6-sol, all sound-with-changes, every required change
 folded; ledger at bottom)
 Owner: Bart
-Last updated: 2026-09-08
+Last updated: 2026-10-23
 
 Prerequisite reading: doc 10 (cross-frame tracing, inline frames, `guard_func`),
 doc 16 (coherent state chaining — the seam-cost lesson that shapes this arc's
@@ -275,6 +275,16 @@ to Done once everything inside a phase is checked.
       snapshots, and immutable entry homes for terminal one-shot roots independent
       of outgoing register kinds. Plain/jit-debug tests, hashgate84×2, wasm/viz69
       and full28-program board pass. Board:20260909-155852-06bab1b.tsv.
+
+- [x] **Fix: a one-shot anchor at its own `ret` hung (found 2026-10-23).**
+      A head whose pc 0 is its `ret` (an empty function) or a continuation
+      whose resume pc is the caller's `ret` (`f() end`) recorded a trace that
+      closes at its own entry pc. Its terminal resumed tier-0 at the patched
+      pc, which re-entered the trace forever: any such hot function hung
+      `--trace` and `--jit-native`. `onCallEntry`/`onRetResume` refuse the
+      anchor once the counter crosses `hotcall` (no test on the per-call
+      path), and the recorder aborts `.self_terminal` as the backstop for
+      every other arming path. Board unchanged.
 
 ### Outstanding
 - [ ] **Phase 1a follow-ups.** Remaining review-round-2 matrix tests

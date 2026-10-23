@@ -3132,6 +3132,22 @@ test "doc 61 Phase 0: a reused frame slot starts out of flight" {
     , "S S S S S S S F:call\n", .{ .setup = &ShapeProbe.install, .inspect = &check.pushed });
 }
 
+test "doc 44: a function that is only its `ret`, and a call followed by `ret`, run to completion" {
+    // A one-shot trace at either pc closed at its own entry and resumed at
+    // its patched pc, re-entering itself forever (`.self_terminal`). The
+    // `setmetatable` call keeps the driver loop off trace, so the heads and
+    // continuations go hot on their own.
+    try expectProgram(
+        \\local mt = {}
+        \\local function e() end
+        \\local function v(n) if n == 0 then return end v(n - 1) end
+        \\local c = 0
+        \\for i = 1, 300 do local t = setmetatable({}, mt) e() v(2) c = c + 1 end
+        \\print(c)
+        \\
+    , "300\n");
+}
+
 test "doc 61 Phase 0: a backtrace names an in-flight parent's own instruction line" {
     // `f` is in flight at the `.add`, whose span starts on line 3; the
     // instruction before it, the call to its right operand, is on line 4.

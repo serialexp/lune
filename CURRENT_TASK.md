@@ -292,6 +292,11 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     while_shortcircuit_probe's JIT row is +1.9% at n = 120, a warm-up
     cost (TODO "A nested `while` goes silent late"). I asked Bart, got
     no answer, and took the default: commit and record.
+  - Fix (doc 44): a hot function that is only its `ret`, or a call
+    followed by `ret` (`f() end`), hung `--trace`: the one-shot trace
+    closed at its own entry pc and its terminal resumed at the patched
+    pc. Refused at the `hotcall` threshold, with a `.self_terminal`
+    recorder abort as the backstop. Board unchanged.
   - Scratch shadows are under /tmp/p1:
     - `ab2.sh BASE NEW`: instructions:u A/B over every @bench program, both
       tiers;

@@ -5241,6 +5241,71 @@ test "cont collision refusal (doc 44 D12b): a resume pc holding a patchable-op s
         try testing.expect(trace.anchorKind(t.code.anchor.pc) != .cont);
 }
 
+test "self-terminal refusal (doc 44): a head or resume pc holding its `ret` forms no anchor" {
+    // `e`'s pc 0 is its `ret`, and `v`'s recursive call is followed by its
+    // `ret`. A one-shot trace at either pc closes at its own entry and
+    // resumes tier-0 at its patched pc, which re-entered the trace forever
+    // (the program hung once `e` went hot). Executing traces here proves
+    // the run completes. Such a pc counts like any other, but its anchor
+    // is refused at the threshold: it never arms, strikes or commits.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local function e() end
+        \\local function v(n) if n == 0 then return end v(n - 1) end
+        \\local c = 0
+        \\for i = 1, 40 do e() v(3) c = c + 1 end
+        \\print(c)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.hotloop = 1 << 24; // the driver loop never arms
+    vm.trace.config.hotcall = 4;
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings("40\n", sink.buffered());
+
+    // The shape premise: `e` is only its `ret`, and `v`'s call is followed
+    // by one.
+    const e = chunk.proto.protos[0].code;
+    try testing.expectEqual(bytecode.OpCode.ret, e[0].op);
+    const v = chunk.proto.protos[1].code;
+    var call_then_ret = false;
+    for (v[0 .. v.len - 1], 0..) |ins, i| {
+        if (ins.op == .call and v[i + 1].op == .ret) call_then_ret = true;
+    }
+    try testing.expect(call_then_ret);
+    // Both pcs went hot, yet nothing gates or commits at a pc holding a
+    // `ret`.
+    const atRet = struct {
+        fn f(key: trace.AnchorKey) bool {
+            if (trace.anchorKind(key.pc) == .loop) return false;
+            return key.proto.code[trace.entryPc(key.pc)].op == .ret;
+        }
+    }.f;
+    var hot: usize = 0;
+    var cit = vm.trace.counters.iterator();
+    while (cit.next()) |entry| {
+        if (atRet(entry.key_ptr.*)) hot += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), hot);
+    var git = vm.trace.record_gate.iterator();
+    while (git.next()) |entry| try testing.expect(!atRet(entry.key_ptr.*));
+    for (vm.trace.registry.cache.items) |t| try testing.expect(!atRet(t.code.anchor));
+}
+
 test "recorder (head, doc 44 P0): a vararg callee never counts and never arms" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);

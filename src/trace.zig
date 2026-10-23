@@ -3664,6 +3664,10 @@ pub const TraceState = struct {
         gop.value_ptr.* +|= 1;
         if (gop.value_ptr.* < self.config.hotcall) return;
         gop.value_ptr.* = 0; // reset so a declined/aborted arm re-warms, the loop discipline
+        // A body that is only its `ret` has nothing to trace, and the head's
+        // terminal would resume at the patched pc 0 (`.self_terminal`).
+        // Refused here, at the threshold, so no other call pays the test.
+        if (proto.code[0].op == .ret) return;
         self.setPendingCallAnchor(.{ .proto = proto, .base = base, .call_seq = call_seq });
     }
 
@@ -3724,6 +3728,11 @@ pub const TraceState = struct {
         gop.value_ptr.* +|= 1;
         if (gop.value_ptr.* < self.config.hotcall) return;
         gop.value_ptr.* = 0; // reset so a declined/aborted arm re-warms
+        // A resume pc that is the caller's own `ret` (`f() end`, or `local
+        // s = f() return s`) has nothing to trace, and the continuation's
+        // terminal would resume at its own patched pc (`.self_terminal`).
+        // Refused at the threshold, so no other return pays the test.
+        if (proto.code[resume_pc].op == .ret) return;
         self.setPendingRetAnchor(.{ .proto = proto, .resume_pc = resume_pc, .base = base, .call_seq = call_seq });
     }
 

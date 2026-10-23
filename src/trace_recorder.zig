@@ -173,6 +173,13 @@ pub const AbortReason = enum {
     /// `maxrecord`. Ordinary strike semantics: the shape is honestly
     /// uncompilable under the budget, no partial candidate publishes.
     snapshot_limit,
+    /// Doc 44: a one-shot (`.head`/`.cont`) recording reached its terminal
+    /// at its own entry pc: the entry instruction is the `ret` itself. The
+    /// terminal resumes tier-0 at that pc, which is the patched entry, so
+    /// the trace would re-enter itself forever without running a bytecode.
+    /// The anchor counters refuse such pcs up front (`onCallEntry`,
+    /// `onRetResume`); this is the backstop for every other arming path.
+    self_terminal,
     /// Doc 56 G6-Q1(d), LuaJIT `LJ_TRERR_LUNROLL` (`rec_loop_interp`): a
     /// side or continuation recording went round a loop it could not link
     /// to (no root at its header, a peeled root, an entry-contract mismatch)
@@ -5469,6 +5476,7 @@ pub const RecordingSession = struct {
     /// exactly once — is `cur_pc - 1`.
     fn closeHeadTerminal(self: *RecordingSession, kind: trace_ir.TerminalKind) void {
         std.debug.assert(isOneShotKind(self.kind) and self.inline_depth == 0);
+        if (self.cur_pc - 1 == trace_code.entryPc(self.anchor.pc)) return self.abort(.self_terminal);
         self.terminal_close = .{ .kind = kind, .resume_pc = self.cur_pc - 1 };
         self.close_requested = true;
     }
