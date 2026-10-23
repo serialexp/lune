@@ -4,6 +4,7 @@ local which, n = arg[1], tonumber(arg[2])
 local P = {}
 P.base = function(n) local s = 0 for i = 1, n do s = s + i end return s end
 P.type = function(n) local f = type local s = 0 for i = 1, n do local b = f(i) s = s + i end return s end
+P.mtype = function(n) local f = math.type local s = 0 for i = 1, n do local b = f(i) s = s + i end return s end
 P.floor = function(n) local f = math.floor local s = 0 for i = 1, n do local b = f(i * 0.5) s = s + i end return s end
 P.abs = function(n) local f = math.abs local s = 0 for i = 1, n do local b = f(i) s = s + i end return s end
 P.sqrt = function(n) local f = math.sqrt local s = 0 for i = 1, n do local b = f(i) s = s + i end return s end

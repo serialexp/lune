@@ -1,6 +1,6 @@
 # 70 — Tier-0 fast functions
 
-Status: partial. P0–P2 landed (13 builtins, the call-protocol byte);
+Status: partial. P0–P2 landed (14 builtins, the call-protocol byte);
 P3's allocating half and Q1–Q3's confirmation by Bart are outstanding.
 Owner: claude (coral-marten)
 Last updated: 2026-10-23
@@ -28,13 +28,37 @@ land; move whole phases to Done once everything inside them is checked.
   parser's register pressure cost every other fast body 2–8 instructions.
   `tonumber("123")` 327 → 274 (LuaJIT 264); scalar −1.33%,
   str_find_match −0.81%.
+- [x] **`math.type`** (2026-10-23). `Vm.subtype_names` caches "integer"
+  and "float" beside `type_names`: interned in `internMetamethodNames`
+  (so the keyframe restorer re-derives them), rooted with them. The
+  native reads the same cache. Probe `mtype` 328 → 133 instructions;
+  lua54 −10.9% on both tiers (its subtype loop calls `math.type`
+  three times an iteration), str_gsub −0.76%, array3d −0.96%.
+  - The enum member and switch arm sit last: placed after `type`, they
+    renumbered the jump table and `floor` paid one instruction (nsieve-
+    bit-fp +0.14%); last, every other probe and row is unchanged.
+  - The two interned names shift every later heap id by 2. Hash parts
+    hash heap keys by id, so placements move: field_hash +3.28% at tier
+    0, pairs_hash +0.09%. Both are that lottery, not cost: the base
+    binary with one or two string constants prepended to the bench runs
+    the new count exactly (field_hash 7320M → 7560M), and the new binary
+    with one prepended runs the old (TODO.md "field_hash's hash part
+    pays 3% for id parity").
+  - Caching lazily, on the first slow call, would leave ids alone for
+    programs that never call `math.type`, but it breaks replay: a
+    restored heap can hold an "integer" the original run never cached,
+    so the restorer cannot tell whether to root it. It would need the
+    cache state in the snapshot schema.
+  - Tests: the differential test covers it (it walks every
+    `FastBuiltin`); "math.type names the subtype, and its error shape
+    falls back" pins the wiring. Eight GC and phase-Q tests that print a
+    fresh table's id now print it 2 higher.
 - [x] **Q1–Q3 defaults** (2026-10-23, Bart away; §7 records them): a
   separate `FastBuiltin`, non-allocating bodies only, the generic ABI later.
 
 ### Outstanding
 
 - [ ] **Q1–Q3 confirmation by Bart** (§7).
-- [ ] **`math.type`**: needs its two names cached like `type`'s.
 - [ ] **Allocating bodies** (Q2): `string.sub`, `tostring` of a number,
   `rawset`.
 - [ ] **The generic native ABI** (Q3): register-lane arguments, results in

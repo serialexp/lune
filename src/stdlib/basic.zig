@@ -259,9 +259,11 @@ fn mType(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     if (args.len == 0) return error.TypeError;
     const v = args[0];
-    if (v.isInt()) return vm.heap.internValue("integer");
-    if (v.isFloat()) return vm.heap.internValue("float");
-    return Value.nil();
+    if (!v.isNumber()) return Value.nil();
+    // The cached names; nil only in a bare VM, which interns.
+    const cached = vm.subtype_names[@intFromBool(v.isFloat())];
+    if (!cached.isNil()) return cached;
+    return vm.heap.internValue(if (v.isFloat()) "float" else "integer");
 }
 
 // ---------------------------------------------------------------------------
@@ -295,7 +297,7 @@ pub const natives = [_]function.BaseNative{
     .{ .name = "rawlen", .func = &bRawLen, .recorded = .rawlen, .fast = .rawlen },
     .{ .name = "setmetatable", .func = &bSetMetatable },
     .{ .name = "getmetatable", .func = &bGetMetatable },
-    .{ .name = "math.type", .func = &mType, .module = "math", .field = "type", .recorded = .mtype },
+    .{ .name = "math.type", .func = &mType, .module = "math", .field = "type", .recorded = .mtype, .fast = .math_type },
     .{ .name = "os.difftime", .func = &osDiffTime, .module = "os", .field = "difftime" },
 };
 

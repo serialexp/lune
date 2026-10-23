@@ -360,6 +360,8 @@ pub const FastBuiltin = enum(u8) {
     len,
     /// Every shape: `arith.toNumber` parses without allocating.
     tonumber,
+    /// `math.type`: the cached "integer"/"float", or nil.
+    math_type,
 };
 
 /// Which **nondeterministic input** a native represents, if any. A native with a

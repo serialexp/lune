@@ -18,9 +18,10 @@
 //! (`function.NativeMultiFn`): its primary projection is the integral part, and
 //! the multi path additionally yields the fractional part.
 //!
+//! `math.type` returns a *string*, which needs the `*Vm`'s interned names, so
+//! it lives in `stdlib/basic.zig`.
+//!
 //! Deferred (need calling-convention or heap support not yet available):
-//!   - `math.type`            — returns a *string* ("integer"/"float"/nil), which
-//!                              needs heap interning (a `*Vm`).
 //!   - `math.frexp`           — returns *two* values (mantissa, exponent); lands
 //!                              with the rest of the C99 float helpers.
 //!

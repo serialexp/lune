@@ -155,3 +155,14 @@ test "fast functions: argument and result counts around the fast path" {
             "b\t0\n",
     );
 }
+
+test "fast functions: math.type names the subtype, and its error shape falls back" {
+    try testutil.expectProgram(
+        \\print(math.type(1), math.type(-0.0), math.type("1"), math.type(nil))
+        \\print(pcall(function() return math.type() end))
+        \\
+    ,
+        "integer\tfloat\tnil\tnil\n" ++
+            "false\tanonymous:2: bad argument to 'type'\n",
+    );
+}

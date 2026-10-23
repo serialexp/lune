@@ -366,6 +366,21 @@ cost. Repro files: pad `bench/repack_adversarial.lua` after
       A per-proto bit per pc (set on attach, cleared on detach) would
       answer without touching the map at all. Not measured.
 
+## field_hash's hash part pays 3% for id parity (noted 2026-10-23)
+
+Found while landing doc 70's `math.type` (which interns two names at
+init and so shifts every later heap id by 2). `bench/field_hash.lua`
+runs 7320M instructions at tier 0 or 7560M (+3.3%) depending only on
+how many strings were interned before its keys: prepend one or two
+string constants and the count flips, deterministically. Hash parts
+hash heap keys by id (`hash_part.keyHash`), so the likely cause is two
+of its field keys sharing a main position in a small hash part, and a
+collision costs ~4 instructions on every `t.x`/`t.y`. That is a real
+cost any program can draw, not just this bench. Worth checking: which
+keys collide (`hashSlotOf`), whether the mix spreads consecutive ids
+well enough across small masks, and what a collision costs in
+`opGetField`'s probe. pairs_hash moves +0.09% the same way.
+
 ## A `gmatch` loop keeps no trace under GC stress (noted 2026-10-22)
 
 - [x] **Fixed 2026-10-23.** The recorder pinned a generic `for`'s ctrl

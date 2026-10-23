@@ -944,6 +944,10 @@ pub const Vm = struct {
     /// `type` never re-interns (it hashed its result on every call). Interned
     /// and rooted with `mm`; all `nil` in a bare VM.
     type_names: [@typeInfo(Value.TypeName).@"enum".field_names.len]Value = @splat(Value.nil()),
+    /// `math.type(v)`'s two result strings, "integer" then "float", cached
+    /// beside `type_names` for the same reason. Interned and rooted with `mm`;
+    /// both `nil` in a bare VM.
+    subtype_names: [2]Value = @splat(Value.nil()),
     /// The shared built-in **string metatable** (chunk 2a / M3): a table whose
     /// `__index` is the `string` module table, so indexing a string with an
     /// absent raw key flows through to the string library and `("x"):upper()`
@@ -1152,6 +1156,7 @@ pub const Vm = struct {
         inline for (@typeInfo(Value.TypeName).@"enum".field_names, 0..) |name, i| {
             self.type_names[i] = try self.heap.internValue(name);
         }
+        self.subtype_names = .{ try self.heap.internValue("integer"), try self.heap.internValue("float") };
     }
 
     /// `type(v)`'s result: the cached interned name, or a fresh intern in a
@@ -3191,6 +3196,7 @@ pub const Vm = struct {
             if (v.isHeap()) cb(ctx, v.asHeap());
         }
         for (self.type_names) |v| if (v.isHeap()) cb(ctx, v.asHeap());
+        for (self.subtype_names) |v| if (v.isHeap()) cb(ctx, v.asHeap());
         if (self.string_metatable) |smt| cb(ctx, &smt.header);
     }
 
@@ -9840,6 +9846,12 @@ pub inline fn fastResult(vm: *const Vm, fast: function.FastBuiltin, regs: RegWin
         // Out of line: inlined, the parser's register pressure lands on
         // every other body's path through `opCallFast`.
         .tonumber => return @call(.never_inline, arith.toNumber, .{ x, if (nargs >= 2) regs.get(first + 1) else null }),
+        .math_type => {
+            if (!x.isNumber()) return Value.nil();
+            // Nil only in a bare VM, which interns on the slow path.
+            const tv = vm.subtype_names[@intFromBool(x.isFloat())];
+            return if (tv.isNil()) null else tv;
+        },
     }
 }
 
