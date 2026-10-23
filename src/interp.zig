@@ -7683,10 +7683,11 @@ pub const Vm = struct {
     }
 
     /// Doc 66 P1: the generic-`for` step, `itern a, c`. Its fast lane is
-    /// `next`'s array part over a plain table, inline and call-free: the
-    /// `nextStep` scan from the control key. The hash part, a `row_view`, a
-    /// grid and a float-spelled control leave for `opIternSlow`; every other
-    /// iterator for `opIternCall`.
+    /// `next` over a plain table, inline and call-free: the `nextStep` scan
+    /// of the array part from the control key, and the hash part's usual
+    /// step once its view is built (`HashPart.isLastReturned`). The first
+    /// hash key, a `row_view`, a grid and a float-spelled control leave for
+    /// `opIternSlow`; every other iterator for `opIternCall`.
     fn opItern(comptime mode: ExecMode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
@@ -7723,6 +7724,16 @@ pub const Vm = struct {
                             return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
                         }
                     };
+                    // `nextStep`'s hash arm, for a control outside the array
+                    // part. A float key is never integral, so `normalizeKey`
+                    // leaves a matching one as it is.
+                    if (resume_at == null and !t.array.isGrid() and t.hash.isLastReturned(ctrl)) {
+                        if (t.hash.liveFrom(t.hash.iter_pos + 1)) |entry|
+                            writeIternStep(regs, a, instr.c, entry.key, entry.value_ptr.*)
+                        else
+                            writeIternStep(regs, a, instr.c, Value.nil(), Value.nil());
+                        return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+                    }
                 }
                 return slowTail(mode, st, pc, instr, vm, tags, payloads);
             }
@@ -7730,9 +7741,10 @@ pub const Vm = struct {
     }
 
     /// `next`'s step off the call-free lane: the one `stdbase.iternStep`
-    /// takes without allocating, the hash part once its view is built, or a
-    /// `row_view`. A grid to deflate, a view to build or a bad argument
-    /// leaves for `opIternCall`.
+    /// takes without allocating, from a built hash view (its first key, or
+    /// after a key other than the one returned last), or a `row_view`. A
+    /// grid to deflate, a view to build or a bad argument leaves for
+    /// `opIternCall`.
     fn opIternSlow(comptime mode: ExecMode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {

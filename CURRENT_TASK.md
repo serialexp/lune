@@ -279,6 +279,8 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     the cell pointers live inline in the closure, and `u = v` stores from
     `v`'s register. Read 33 → 26, write 52 → 28 instructions; scalar
     −2.1%, recursive-fib −1.5% on both tiers.
+  - Doc 66 follow-up: `opItern` takes the hash part's usual step from a
+    built view, a hash `pairs` step 247 → 64; pairs_hash −42.5% tier-0.
   - Scratch shadows are under /tmp/p1:
     - `ab2.sh BASE NEW`: instructions:u A/B over every @bench program, both
       tiers;

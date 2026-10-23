@@ -320,16 +320,22 @@ land; move whole phases to Done once everything inside them is checked.
       the 98aef7f messages;
     - "one generic `for` traced with `gmatch` keeps its trace across
       `pairs`", the §5.1 soundness test.
+- [x] **The hash-part step on the call-free lane** (follow-up to P1,
+  2026-10-23). A hash `pairs` step was 247 instructions against
+  LuaJIT's 17: it left `opItern` for `opIternSlow` and
+  `stdbase.iternStep`'s generic walk. `opItern` now takes `nextLive`'s
+  usual step itself when the view is built and the control is the key
+  it returned last (`HashPart.isLastReturned`, `liveFrom`): 64. The
+  first hash key and every other control still leave. pairs_hash −42.5%
+  tier-0, −39.6% `--jit-native`, no other row moved. Inside `opItern`
+  but shaped as a check on the control, the array lane stayed at 54
+  instructions; a fuller `nextLiveBuilt(?Value)` there cost it +8.
+
 ### Outstanding
 
 - [ ] **Defer: a `sar` constant form.** Q6's set leaves mahina's `~>>`
   (`sar`, no Lua 5.4 spelling, 0 `@bench` sites) on the register form.
 
-- [ ] **The hash-part step on the call-free lane** (follow-up to P1). A
-  hash `pairs` step is still 256 instructions against LuaJIT's 17. It
-  leaves `opItern` for the slow table, `opIternSlow`, and
-  `stdbase.iternStep`'s generic walk. Fold the built-view step into
-  `opItern` the way the array part is.
 - [ ] **`ipairs` through `itern`** (follow-up to P1, §5.1's last
   paragraph). A second builtin identity with an array-only step. `ipairs`
   is 306 instructions a step against LuaJIT's 62.

@@ -478,7 +478,6 @@ pub const HashPart = extern struct {
         }
         if (!self.iter_valid) try self.buildIterCache(gpa);
         const keys = self.iter_keys.?[0..self.iter_len];
-        const nodes = self.nodes.?;
         var lo: usize = 0;
         if (ctrl) |c| {
             if (self.iter_pos < keys.len and self.isKeyAt(keys[self.iter_pos], c)) {
@@ -493,6 +492,23 @@ pub const HashPart = extern struct {
                 }
             }
         }
+        return self.liveFrom(lo);
+    }
+
+    /// Is `nextLive`'s step after `c` its usual one, from a built view and
+    /// with `c` the live key it returned last, matched by raw bits? Then
+    /// `liveFrom(iter_pos + 1)` is that step (`itern`'s call-free lane).
+    pub inline fn isLastReturned(self: *const HashPart, c: Value) bool {
+        if (!self.iter_valid or self.iter_pos >= self.iter_len) return false;
+        const n = &self.nodes.?[self.iter_keys.?[self.iter_pos].slot];
+        return n.key_tag == c.tag and n.key_payload.bits == c.payload.bits and !n.value.isNil();
+    }
+
+    /// The first live entry of the built view at or after position `first`.
+    pub inline fn liveFrom(self: *HashPart, first: usize) ?Entry {
+        const keys = self.iter_keys.?[0..self.iter_len];
+        const nodes = self.nodes.?;
+        var lo = first;
         while (lo < keys.len) : (lo += 1) {
             const n = &nodes[keys[lo].slot];
             std.debug.assert(keys[lo].names(n));
@@ -1235,6 +1251,44 @@ test "nextLive: a new key landing in a dead slot mid-walk is visited" {
     defer gpa.free(all);
     try testing.expect(all[0].eql(first));
     try expectSameKeys(all[1..], got.items);
+}
+
+test "isLastReturned + liveFrom step exactly as nextLive, and only from the key returned last" {
+    // `itern`'s hash lane: after the key `nextLive` returned last, step
+    // with `liveFrom(iter_pos + 1)`; anything else goes through `nextLive`.
+    const gpa = testing.allocator;
+    var m: HashPart = .empty;
+    defer m.deinit(gpa);
+    var hs: [12]GcHeader = undefined;
+    try putMixed(gpa, &m, &hs);
+    try testing.expect(!m.isLastReturned(Value.int(5))); // no view yet
+
+    const want = try canonicalKeys(gpa, &m);
+    defer gpa.free(want);
+    var got: std.ArrayList(Value) = .empty;
+    defer got.deinit(gpa);
+    var fast_steps: usize = 0;
+    var e = try m.nextLive(gpa, null);
+    while (e) |cur| {
+        try got.append(gpa, cur.key);
+        try testing.expect(m.isLastReturned(cur.key));
+        e = m.liveFrom(m.iter_pos + 1);
+        fast_steps += 1;
+    }
+    try expectSameKeys(want, got.items);
+    try testing.expectEqual(want.len, fast_steps);
+
+    // Another key, a removed one, or any key once an insertion dropped the
+    // view, is not the usual step.
+    const a = (try m.nextLive(gpa, null)).?;
+    const b = (try m.nextLive(gpa, a.key)).?;
+    try testing.expect(!m.isLastReturned(a.key));
+    _ = m.remove(b.key);
+    try testing.expect(!m.isLastReturned(b.key));
+    const c = (try m.nextLive(gpa, b.key)).?;
+    try testing.expect(m.isLastReturned(c.key));
+    try m.put(gpa, Value.int(77), Value.int(7));
+    try testing.expect(!m.isLastReturned(c.key));
 }
 
 test "nextLive: a control that is not a key resumes at the next greater key" {
