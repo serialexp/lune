@@ -1382,8 +1382,7 @@ test "doc 66: an `and`/`or`/`not` test runs its links in order, each once" {
 test "doc 66: loops leave through any link of their test" {
     // `while` chains exiting through their first link and their last, a
     // `not` folded into the links, an `or` link landing on the marker, the
-    // value-tested fallback, and a `repeat` (still value-tested), each hot
-    // enough to trace.
+    // value-tested fallback, and a `repeat` chain, each hot enough to trace.
     try expectProgram(
         \\local s, i = 0, 0
         \\while i < 300 and s >= 0 do i = i + 1 if i % 3 == 0 or i % 5 == 0 then s = s + i end end
@@ -1407,6 +1406,82 @@ test "doc 66: loops leave through any link of their test" {
     ,
         "21150\t300\t249\t100\t800\t97\t14\t300\n",
     );
+}
+
+test "doc 66: a `repeat` test runs each link once, in order, with Lua's values" {
+    // `and`/`or`/`not` links logging their order; a captured body local and
+    // a closure in the test (both keep the value form); `break`; a body
+    // local holding a table in the test; a hot chain; an error from the
+    // last link. Checked against LuaJIT.
+    try expectProgram(
+        \\local log = {}
+        \\local function p(tag, v) log[#log + 1] = tag return v end
+        \\local i = 0
+        \\repeat i = i + 1 until p("a", i >= 2) and p("b", i % 3 == 0)
+        \\print(i, table.concat(log))
+        \\log = {}
+        \\local j = 0
+        \\repeat j = j + 1 until p("c", j > 5) or not p("d", j < 3)
+        \\print(j, table.concat(log))
+        \\local fs, k = {}, 0
+        \\repeat local v = k fs[#fs + 1] = function() return v end k = k + 1 until k >= 2 and fs[1]
+        \\print(k, fs[1](), fs[2]())
+        \\local m = 0
+        \\repeat local w = m * 2 m = m + 1 until (function() return w end)() >= 4 and m > 1
+        \\print(m)
+        \\local q = 0
+        \\repeat q = q + 1 if q == 4 then break end until q > 10 and q < 0
+        \\print(q)
+        \\local r = 0
+        \\repeat r = r + 1 local t = r > 2 and { done = true } or nil until t and t.done
+        \\print(r)
+        \\local h, acc = 0, 0
+        \\repeat h = h + 1 acc = acc + (h % 3) until h >= 300 and acc > 0
+        \\print(h, acc)
+        \\print(pcall(function() local z = 0 repeat z = z + 1 until z > 1 and z < "x" end))
+        \\
+    ,
+        "3\taabab\n3\tcdcdcd\n2\t0\t1\n3\n4\n3\n300\t300\n" ++
+            "false\tanonymous:25: attempt to compare number with string\n",
+    );
+}
+
+test "doc 66: a `repeat` root records through a link that falls to the next" {
+    // `n > 3` holds on almost every iteration while `n >= 2000` fails, so
+    // the first link falls through to the second, which loops back. Only
+    // the closer's fall-through leaves the loop: a recording that took the
+    // first link's fall-through for the loop's exit would abort LLEAVE on
+    // every iteration and never commit. The `or` loop leaves through its
+    // first link's jump.
+    const Inspect = struct {
+        fn run(vm: *interp.Vm, mode: util.TraceMode) anyerror!void {
+            if (mode == .off) return;
+            for (vm.trace.abort_log.items) |r| try testing.expect(r.reason != .loop_leave);
+            var repeat_roots: usize = 0;
+            for (vm.trace.registry.cache.items) |t| {
+                const pc = t.code.anchor.pc;
+                const code = t.code.anchor.proto.code;
+                if (pc == 0 or pc >= code.len or code[pc - 1].op != .loop) continue;
+                if (code[pc - 1].b != @intFromEnum(bytecode.LoopKind.repeat_loop)) continue;
+                repeat_roots += 1;
+                // The own test is a leaving link, never the first `and` link.
+                for (t.code.instrs, 0..) |_, idx| {
+                    if (!t.code.isOwnLoopTest(idx)) continue;
+                    const src = t.code.anchorSourcePc(idx).?;
+                    try testing.expectEqual(@as(?usize, pc - 1), bytecode.repeatTestMarkerOf(code, src));
+                }
+            }
+            try testing.expectEqual(@as(usize, 2), repeat_roots);
+        }
+    };
+    try util.expectProgramTuned(
+        \\local n, c = 0, 0
+        \\repeat n = n + 1 if n % 2 == 0 then c = c + 1 end until n > 3 and n >= 2000
+        \\local m, d = 0, 0
+        \\repeat m = m + 1 d = d + m % 3 until m >= 2000 or d < 0
+        \\print(n, c, m, d)
+        \\
+    , "2000\t1000\t2000\t2001\n", .{ .record_aborts = true, .inspect = Inspect.run });
 }
 
 test "open upvalues: captures out of slot order, shared cells, block and frame closes" {

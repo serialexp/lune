@@ -134,7 +134,8 @@ pub fn compileWithOptions(
     // don't warn.
     if (!diags.hasErrors()) try c.warnUnknownGlobals();
 
-    // Doc 58 §4.2: the two loop closers are the only backward jumps.
+    // Doc 58 §4.2: the two loop closers, and the earlier links of a
+    // `repeat` test (doc 66), are the only backward jumps.
     bytecode.assertLoopClosersWellFormed(c.code.items);
     const proto = try c.arena.create(Proto);
     proto.* = .{
@@ -540,6 +541,17 @@ const Compiler = struct {
 
     fn beginScope(self: *Compiler) void {
         self.scope_depth += 1;
+    }
+
+    /// Whether a local of the innermost open scope is captured, so that
+    /// `endScope` would close it.
+    fn scopeHasCaptured(self: *const Compiler) bool {
+        var n = self.locals.items.len;
+        while (n > 0 and self.locals.items[n - 1].depth >= self.scope_depth) {
+            n -= 1;
+            if (self.locals.items[n].captured) return true;
+        }
+        return false;
     }
 
     fn endScope(self: *Compiler) Error!void {
@@ -1170,6 +1182,35 @@ const Compiler = struct {
         };
     }
 
+    /// Whether evaluating `e` can create a closure: a function literal
+    /// anywhere in it. (A closure can capture a local the evaluation is in
+    /// the scope of.)
+    fn hasFunction(e: *const ast.Expr) bool {
+        return switch (e.data) {
+            .nil, .bool, .int, .float, .string_raw, .name, .vararg => false,
+            .function => true,
+            .paren => |inner| hasFunction(inner),
+            .unary => |u| hasFunction(u.operand),
+            .binary => |b| hasFunction(b.lhs) or hasFunction(b.rhs),
+            .field => |f| hasFunction(f.obj),
+            .index => |x| hasFunction(x.obj) or hasFunction(x.key),
+            .call => |c| hasFunction(c.callee) or anyHasFunction(c.args),
+            .method_call => |m| hasFunction(m.obj) or anyHasFunction(m.args),
+            .table => |fields| for (fields) |f| {
+                if (switch (f) {
+                    .positional => |v| hasFunction(v),
+                    .named => |nv| hasFunction(nv.value),
+                    .keyed => |kv| hasFunction(kv.key) or hasFunction(kv.value),
+                }) break true;
+            } else false,
+        };
+    }
+
+    fn anyHasFunction(es: []const *ast.Expr) bool {
+        for (es) |e| if (hasFunction(e)) return true;
+        return false;
+    }
+
     /// Whether `e`'s value is true whatever runs: a literal other than
     /// `nil` and `false`, a table constructor or a function. (Every number
     /// and string is true in Lua.)
@@ -1345,12 +1386,9 @@ const Compiler = struct {
     /// `repeat body until cond`. Runs the body, then loops back while `cond` is
     /// false (exits when true) — the post-test mirror of `while`. The twist Lua
     /// requires: `cond` is evaluated in the *body's* scope, so locals declared in
-    /// the body are visible to `until`. We reserve the condition register at `base`
-    /// (below the body scope) and keep it live across the whole iteration, so the
-    /// body's locals sit above it and `endScope` closes their upvalues normally
+    /// the body are visible to `until`, and `endScope` closes their upvalues
     /// before the back-edge — each iteration gets fresh captured cells.
     fn compileRepeat(self: *Compiler, r: anytype) Error!void {
-        const base = self.next_reg;
         // Doc 58: the loop marker (LuaJIT `BC_LOOP`) opens the loop, and the
         // closer targets IT, not the body — so the marker runs once per
         // iteration and is the loop's only back-edge (LuaJIT `parse_repeat`).
@@ -1358,43 +1396,42 @@ const Compiler = struct {
         const marker = try self.emit(.{ .op = .loop, .b = @intFromEnum(bytecode.LoopKind.repeat_loop) });
         const loop_top = marker;
 
-        // Doc 66 P4: a comparison needs no condition slot; any other
-        // condition is written to one reserved below the body.
-        const fused = comparisonOf(r.cond) != null;
-        const cr: u16 = if (fused) 0 else try self.alloc1();
-
-        // Body locals begin above the slot; `break` closes upvalues from there.
         try self.loops.append(self.scratch, .{ .scope_base = self.next_reg });
         const loop_idx = self.loops.items.len - 1;
 
         self.beginScope();
         try self.compileBlock(r.body);
-        if (fused) {
-            // The operands are evaluated in the body's scope. `endScope` then
-            // emits at most a `close_upvalues`, which moves captured values
-            // to their cells without changing a register, so the branch
-            // after it still reads them. Comparing after the close is not
-            // observable: a value written before it is copied, one written
-            // after goes to the cell.
-            const mark = self.next_reg;
-            const ins = (try self.compareBranch(r.cond, false)).?;
+        const mark = self.next_reg;
+        if (!self.scopeHasCaptured() and !hasFunction(r.cond)) {
+            // Doc 66: nothing in the scope needs closing, so `cond` compiles
+            // to a chain of branches straight back to the marker when it is
+            // false (LuaJIT `parse_repeat`), falling through to the exit. Its
+            // last link closes the loop.
+            var back: JumpList = .empty;
+            defer back.deinit(self.scratch);
+            try self.condJumps(r.cond, false, &back);
+            self.freeTo(mark);
+            try self.endScope(); // emits nothing: no local is captured
+            for (back.items) |j| self.patchJumpTo(j, loop_top);
+        } else {
+            // A captured local must be closed on both edges, after every
+            // operand has run, so the test is one branch after the close.
+            // `endScope` emits at most a `close_upvalues`, which moves
+            // captured values to their cells without changing a register,
+            // so the branch after it still reads the operands. Testing after
+            // the close is not observable: a value written before it is
+            // copied, one written after goes to the cell.
+            const ins = if (try self.compareBranch(r.cond, false)) |cmp|
+                cmp
+            else
+                Instr{ .op = .jmp_if_false, .a = try self.operandReg(r.cond), .aux = 0 };
             self.freeTo(mark);
             try self.endScope();
             const at = try self.emit(ins);
             self.patchJumpTo(at, loop_top);
-        } else {
-            // `cond` sees the body's locals (still in scope); write it into
-            // `cr`, which lives below them and so survives `endScope`'s
-            // register pop.
-            try self.compileExprTo(r.cond, cr);
-            try self.endScope(); // pops body locals + closes their upvalues if captured
-
-            // Loop back while the condition is false; fall through (exit) when true.
-            try self.emitJumpTo(.jmp_if_false, cr, loop_top);
         }
 
         self.patchToHere(marker); // the marker's exit offset
-        self.freeTo(base); // release the condition slot
         self.patchBreaks(loop_idx);
     }
 
@@ -1744,7 +1781,8 @@ const Compiler = struct {
         // Implicit `return` (no values) if control reaches the end.
         _ = try child.emit(Instr.opAB(.ret, 0, 0));
 
-        // Doc 58 §4.2: the two loop closers are the only backward jumps.
+        // Doc 58 §4.2: the two loop closers, and the earlier links of a
+        // `repeat` test (doc 66), are the only backward jumps.
         bytecode.assertLoopClosersWellFormed(child.code.items);
         const proto = try self.arena.create(Proto);
         proto.* = .{
@@ -2719,6 +2757,54 @@ test "doc 58: a repeat loop emits a loop marker at its top" {
     const ext = bytecode.loopExtentFor(r.chunk.proto, @intCast(m + 1)).?;
     try testing.expectEqual(@as(u32, @intCast(m)), ext.start);
     try testing.expectEqual(@as(u32, @intCast(e - 1)), ext.end);
+}
+
+test "doc 66: an `and`/`or` repeat test branches straight back to its marker" {
+    var r = try run(
+        \\local i, s, n = 0, 0, 0
+        \\repeat i = i + 1 s = s + i until i >= 5 and s > 0
+        \\repeat i = i - 1 until i <= 0 or s < 0
+        \\local fs = {}
+        \\repeat
+        \\  local k = i
+        \\  fs[#fs + 1] = function() return k end
+        \\  i = i + 1
+        \\until i >= 3 and #fs >= 3
+        \\return fs[1]() + fs[3]() + s
+    );
+    defer r.deinit();
+    try testing.expectEqual(@as(i64, 17), r.value.asInt());
+    const code = r.chunk.proto.code;
+    var markers: [3]usize = undefined;
+    var n: usize = 0;
+    for (code, 0..) |ins, m| {
+        if (ins.op != .loop) continue;
+        markers[n] = m;
+        n += 1;
+        // The closer at `E − 1` targets the marker; the extent holds.
+        const e = bytecode.loopMarkerExit(ins, m);
+        try testing.expectEqual(@as(?i64, @intCast(m)), bytecode.loopTestTargetOf(code[e - 1], e - 1));
+        try testing.expect(bytecode.loopExtentFor(r.chunk.proto, @intCast(m + 1)) != null);
+    }
+    try testing.expectEqual(@as(usize, 3), n);
+    // No link of the first two tests materialises a value.
+    for (code[markers[0]..markers[2]]) |ins| switch (ins.op) {
+        .lt, .le, .gt, .ge, .eq, .ne, .not => return error.TestUnexpectedResult,
+        else => {},
+    };
+    // `and`: both links branch back to the marker.
+    const e0 = bytecode.loopMarkerExit(code[markers[0]], markers[0]);
+    try testing.expectEqual(@as(?i64, @intCast(markers[0])), bytecode.loopTestTargetOf(code[e0 - 2], e0 - 2));
+    try testing.expectEqual(@as(?usize, null), bytecode.repeatTestMarkerOf(code, e0 - 2));
+    try testing.expectEqual(@as(?usize, markers[0]), bytecode.repeatTestMarkerOf(code, e0 - 1));
+    // `or`: the first link leaves for the exit.
+    const e1 = bytecode.loopMarkerExit(code[markers[1]], markers[1]);
+    try testing.expectEqual(@as(?i64, @intCast(e1)), bytecode.loopTestTargetOf(code[e1 - 2], e1 - 2));
+    try testing.expectEqual(@as(?usize, markers[1]), bytecode.repeatTestMarkerOf(code, e1 - 2));
+    // A captured body local: the value form, one branch after the close.
+    const e2 = bytecode.loopMarkerExit(code[markers[2]], markers[2]);
+    try testing.expectEqual(OpCode.jmp_if_false, code[e2 - 1].op);
+    try testing.expectEqual(OpCode.close_upvalues, code[e2 - 2].op);
 }
 
 test "repeat/until runs the body before testing and loops while false" {

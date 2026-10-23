@@ -68,4 +68,9 @@ P.ipairs = function(n)
   for r = 1, math.floor(n / 100) do for k, v in ipairs(t) do s = s + v end end
   return s
 end
+-- Doc 66: a `repeat` test, one comparison and as `and`/`or`/`not` chains.
+P.rone = function(n) local s, i = 0, 0 repeat i = i + 1 s = s + i until i >= n return s end
+P.rand = function(n) local s, i = 0, 0 repeat i = i + 1 s = s + i until i >= n and s > 0 return s end
+P.ror = function(n) local s, i = 0, 0 repeat i = i + 1 s = s + i until i >= n or s < 0 return s end
+P.rnot = function(n) local s, i, done = 0, 0, false repeat i = i + 1 s = s + i done = i >= n until not (not done) return s end
 print(P[which](n))

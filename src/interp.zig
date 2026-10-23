@@ -7140,9 +7140,10 @@ pub const Vm = struct {
                 }
                 // Doc 58 §4.2: no jump is a back-edge any more. The only
                 // backward jumps the compiler emits are the two loop closers
-                // (`while`'s `jmp` to its condition, `repeat`'s `jmp_if_false`
-                // to its marker), and the marker is the back-edge that counts
-                // the iteration. `for_loop`/`tfor_loop` keep their own.
+                // (`while`'s `jmp` to its condition, `repeat`'s condition
+                // branch to its marker) and the earlier links of a `repeat`
+                // test onto the same marker (doc 66), and the marker is the
+                // back-edge that counts the iteration. `for_loop`/`tfor_loop` keep their own.
                 return dispatchTail(mode, st, npc, vm);
             }
         }.h;

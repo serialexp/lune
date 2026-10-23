@@ -303,6 +303,8 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     the hang above.
   - Doc 66 follow-up: `A and B or C` compiles `A` to branches straight to
     `C`: `tern` 110 → 58, lua54 −0.7%.
+  - Doc 66 follow-up: a `repeat` test chains straight back to its marker
+    (`repeatTestMarkerOf` classifies its leaving links): `rand` 80 → 26.
   - Doc 70: `math.type` is a fast builtin (cached names): `mtype` 328 →
     133, lua54 −10.9%. field_hash +3.28% is the heap-id lottery (doc 70
     Done bullet has the proof; TODO.md entry).

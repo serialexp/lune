@@ -716,6 +716,40 @@ pub fn whileTestMarkerOf(code: []const Instr, pc: usize) ?usize {
     return null;
 }
 
+/// Doc 66: the `loop` marker of the `repeat` loop whose test the branch at
+/// `pc` is a link of and LEAVES, or null. A `repeat` test is a chain of
+/// condition branches ending at the closer, `E − 1` (`loop; body; links;
+/// closer → loop`, exit `E`): a link either jumps back to the marker when
+/// the test fails, or (an `or` link) jumps to `E` when it holds, or skips
+/// ahead within the chain. Two links leave the loop: the closer, by
+/// falling through, and a link that jumps to `E`, by jumping. A backward
+/// link above the closer leaves in neither direction (it falls through to
+/// the next link). Which way leaves follows from the direction: backward
+/// leaves on fall-through, forward on the jump. O(1).
+pub fn repeatTestMarkerOf(code: []const Instr, pc: usize) ?usize {
+    const t = loopTestTargetOf(code[pc], pc) orelse return null;
+    if (t < 0 or t > @as(i64, @intCast(code.len))) return null;
+    const target: usize = @intCast(t);
+    if (target <= pc) {
+        // The closer: a backward branch onto a `repeat` marker that ends it.
+        if (code[target].op != .loop) return null;
+        if (std.enums.fromInt(LoopKind, code[target].b) != .repeat_loop) return null;
+        const e = loopMarkerExitChecked(code[target], target, code.len) orelse return null;
+        return if (e == pc + 1) target else null;
+    }
+    // A forward link to `E`: the closer at `E − 1` names the marker, and
+    // the link sits between the marker and the closer.
+    if (target == 0 or target - 1 <= pc) return null;
+    const closer = target - 1;
+    const m_t = loopTestTargetOf(code[closer], closer) orelse return null;
+    if (m_t < 0 or m_t >= @as(i64, @intCast(pc))) return null;
+    const m: usize = @intCast(m_t);
+    if (code[m].op != .loop) return null;
+    if (std.enums.fromInt(LoopKind, code[m].b) != .repeat_loop) return null;
+    const e = loopMarkerExitChecked(code[m], m, code.len) orelse return null;
+    return if (e == target) m else null;
+}
+
 /// Doc 58: the static extent of one loop — every instruction from `start` to
 /// `end` inclusive runs inside it — plus its back-edge instruction.
 pub const LoopExtent = struct {
@@ -843,7 +877,9 @@ fn jumpTargetOf(ins: Instr, pc: usize) i64 {
 }
 
 /// Doc 58 §4.2: the compiler's own check that the only backward jumps it emits
-/// are the two loop closers, each in its pinned shape. Every other backward
+/// are the two loop closers, each in its pinned shape, and (doc 66) the
+/// earlier links of a `repeat` test, onto the marker its closer targets.
+/// Every other backward
 /// jump would be an untracked back-edge now that `loopHeaderOf` recognises
 /// only the three loop ops. Debug/safe builds only; called once per finished
 /// proto.
@@ -872,11 +908,15 @@ pub fn assertLoopClosersWellFormed(code: []const Instr) void {
             std.debug.assert(loopTestTargetOf(code[m - 1], m - 1) != null);
         } else {
             // `repeat`: a backward condition branch targets its `loop`
-            // marker. No other backward jump shape exists.
+            // marker: the closer at `E − 1`, or (doc 66) an earlier link of
+            // the same test, above a closer onto the same marker. No other
+            // backward jump shape exists.
             std.debug.assert(loopTestTargetOf(ins, pc) != null);
             std.debug.assert(code[target].op == .loop);
             std.debug.assert(@as(LoopKind, @enumFromInt(code[target].b)) == .repeat_loop);
-            std.debug.assert(loopMarkerExit(code[target], target) == pc + 1);
+            const e = loopMarkerExit(code[target], target);
+            std.debug.assert(e > pc);
+            std.debug.assert(loopTestTargetOf(code[e - 1], e - 1) == @as(i64, @intCast(target)));
         }
     }
 }
@@ -1368,6 +1408,43 @@ test "doc 66: every link of a `while` test that leaves the loop names its marker
     var rep = code;
     rep[2].b = @intFromEnum(LoopKind.repeat_loop);
     try testing.expectEqual(@as(?usize, null), whileTestMarkerOf(&rep, 0));
+}
+
+test "doc 66: the links of a `repeat` test that leave the loop name its marker" {
+    // `repeat add until a and b`, then a branch after the loop:
+    //   0 loop (repeat, exit 4)
+    //   1 add
+    //   2 jmp_if_false a → 0   (falls through to the next link)
+    //   3 jmp_if_false b → 0   (the closer: falling through leaves)
+    //   4 jmp_if_false → 5, after the loop
+    const code = [_]Instr{
+        .{ .op = .loop, .b = @intFromEnum(LoopKind.repeat_loop), .aux = 3 },
+        Instr.opABC(.add, 3, 3, 3),
+        Instr.opAx(.jmp_if_false, 2, -3),
+        Instr.opAx(.jmp_if_false, 3, -4),
+        Instr.opAx(.jmp_if_false, 2, 0),
+    };
+    assertLoopClosersWellFormed(&code);
+    try testing.expectEqual(@as(?usize, null), repeatTestMarkerOf(&code, 2));
+    try testing.expectEqual(@as(?usize, 0), repeatTestMarkerOf(&code, 3));
+    try testing.expectEqual(@as(?usize, null), repeatTestMarkerOf(&code, 1));
+    try testing.expectEqual(@as(?usize, null), repeatTestMarkerOf(&code, 4));
+    try testing.expectEqual(LoopExtent{ .start = 0, .end = 3, .back_edge_pc = 0, .back_edge_op = .loop }, loopExtentFor(&Proto{ .code = &code }, 1).?);
+    // `until a < b or c`: the `or` link jumps to the exit when it holds.
+    var alt = code;
+    alt[2] = .{ .op = .jlt, .a = cmp_on_true, .b = 0, .c = 1, .aux = 1 };
+    assertLoopClosersWellFormed(&alt);
+    try testing.expectEqual(@as(?usize, 0), repeatTestMarkerOf(&alt, 2));
+    try testing.expectEqual(@as(?usize, 0), repeatTestMarkerOf(&alt, 3));
+    // A link skipping within the chain does not leave the loop.
+    var skip = alt;
+    skip[2].aux = 0;
+    try testing.expectEqual(@as(?usize, null), repeatTestMarkerOf(&skip, 2));
+    // A `while` marker is no `repeat`'s.
+    var whl = code;
+    whl[0].b = @intFromEnum(LoopKind.while_loop);
+    try testing.expectEqual(@as(?usize, null), repeatTestMarkerOf(&whl, 3));
+    try testing.expectEqual(@as(?usize, null), repeatTestMarkerOf(&alt, 4));
 }
 
 test "disassembly renders a small program" {

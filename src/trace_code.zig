@@ -841,8 +841,9 @@ pub const TraceCode = struct {
     ///  - a link of the test of the `while` whose header is the anchor that
     ///    leaves the loop (`bytecode.whileTestMarkerOf`): the last one,
     ///    right above the marker, or an earlier `and` link;
-    ///  - a backward condition branch targeting a `loop` marker whose
-    ///    header is the anchor (`repeat`).
+    ///  - a link of the test of the `repeat` whose header is the anchor
+    ///    that leaves the loop (`bytecode.repeatTestMarkerOf`): the closer
+    ///    onto the marker, or an `or` link jumping to the exit.
     ///
     /// A loop's own test is not a branch alternation: it must not raise
     /// `wants_prime_side` (which would unpatch the entry and chain same-anchor
@@ -869,15 +870,13 @@ pub const TraceCode = struct {
         const src = proto.code[src_pc];
         // `for_loop` / `tfor_loop`: the back-edge itself is the test.
         if (bytecode.loopHeaderOf(src, src_pc) == self.anchor.pc) return true;
-        const t = bytecode.loopTestTargetOf(src, src_pc) orelse return false;
         // `while`: a link of the test that leaves the loop.
         if (bytecode.whileTestMarkerOf(proto.code, src_pc)) |m| {
             if (m + 1 == self.anchor.pc) return true;
         }
-        // `repeat`: the branch is the backward closer onto the marker.
-        if (t < 0 or t >= @as(i64, @intCast(proto.code.len))) return false;
-        const target: usize = @intCast(t);
-        return target <= src_pc and bytecode.loopHeaderOf(proto.code[target], target) == self.anchor.pc;
+        // `repeat`: likewise.
+        const m = bytecode.repeatTestMarkerOf(proto.code, src_pc) orelse return false;
+        return m + 1 == self.anchor.pc;
     }
 
     /// Doc 39: is exit `idx` in a PEELED trace's steady region — past the

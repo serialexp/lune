@@ -443,6 +443,41 @@ land; move whole phases to Done once everything inside them is checked.
     (compiler); "`A and B or C` runs each operand once, in order, with
     Lua's values" (semantics matrix, output taken on 2a20e98 and checked
     against LuaJIT).
+- [x] **`repeat … until` with an `and`/`or` test** (2026-10-23, the
+  follow-up to the chains). `until i >= n and s > 0` materialised its
+  value into a slot reserved below the body and tested it: 80
+  instructions against LuaJIT's 26. Now the test compiles to branches
+  straight back to the marker when false (`condJumps`, LuaJIT
+  `parse_repeat`), falling through to the exit; its last link is the
+  closer at `E − 1`.
+  - The two obstacles the Outstanding item named. A chain has several
+    backward branches onto the marker, so `assertLoopClosersWellFormed`
+    now accepts an earlier link when the closer at `E − 1` targets the
+    same marker; `loopExtentFor` is unchanged (doc 58 §4.2 follow-up).
+    And a captured body local must be closed on both edges after every
+    operand, which a chain cannot do in one place: when a body local is
+    captured, or the test holds a function literal (`hasFunction`), the
+    test keeps one branch after the `close_upvalues`. No slot is
+    reserved for it any more: the close leaves registers alone, so the
+    branch reads the operand's temporary, as the comparison form did.
+  - Classification. An earlier `and` link onto the marker falls through
+    to the next link, so a backward branch is no longer the loop's test
+    by being backward. `bytecode.repeatTestMarkerOf` names the two links
+    that leave: the closer (falling through) and an `or` link jumping
+    to `E`. `isOwnLoopTest` and the recorder's LLEAVE check use it. On
+    the old check, `until n > 3 and n >= 2000` aborted `loop_leave` on
+    every recording and never traced.
+  - Probes (`ops3.lua`): `rand` 80 → 26 at tier 0 (LuaJIT 26), `ror`
+    132 → 68 (56), `rnot` 109 → 51 (67); `--jit-native` 13 → 10,
+    19 → 13, 19 → 13 an iteration.
+  - A/B: no `@bench` program has such a test, and every row is flat
+    (inside ±0.03%); abort sites identical on all 34.
+  - Tests: "the links of a `repeat` test that leave the loop name its
+    marker" (bytecode); "an `and`/`or` repeat test branches straight
+    back to its marker" (compiler); "a `repeat` test runs each link
+    once, in order, with Lua's values" (semantics, checked against
+    LuaJIT) and "a `repeat` root records through a link that falls to
+    the next" (no `loop_leave`; every own-test guard is a leaving link).
 
 ### Outstanding
 
@@ -456,11 +491,6 @@ land; move whole phases to Done once everything inside them is checked.
   (2026-10-23, asked while he was away, default taken). See the Done
   bullet: while_shortcircuit_probe `--jit-native` +1.9% at the bench's
   n = 120, a one-time warm-up the plain `while` already pays.
-- [ ] **`repeat … until` with an `and`/`or` test** (follow-up to the
-  chains). It keeps the value form: its closer must be the one backward
-  branch onto the marker (`assertLoopClosersWellFormed`), and the body's
-  `close_upvalues` must run before it, so a chain's earlier links have
-  nowhere to jump.
 - [ ] **Each phase: recorder and JIT parity in the same change** (§6). A
   new op that the recorder aborts on regresses every traced loop that uses
   it.

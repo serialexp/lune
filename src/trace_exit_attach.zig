@@ -497,8 +497,9 @@ pub fn continuationReachesEnclosingBackEdge(proto: *const Proto, start_pc: u32, 
             // backward closer, which is what this forward scan meets — the
             // `loop` marker itself sits at the top, behind the scan. A `while`
             // closes with a `jmp` back to its condition; a `repeat` with a
-            // `jmp_if_false` back to its marker (doc 58 review r3 finding 4 —
-            // a loop inside a `repeat` could never arm a continuation before).
+            // condition branch back to its marker (doc 58 review r3 finding 4 —
+            // a loop inside a `repeat` could never arm a continuation before),
+            // as do the earlier links of a chained `repeat` test (doc 66).
             // The scan starts past the inner anchor, so a target at or before
             // it is necessarily backward and enclosing (rule Z-6: while-in-
             // while nests arm continuations like for-in-for ones).

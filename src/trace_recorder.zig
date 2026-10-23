@@ -3538,16 +3538,23 @@ pub const RecordingSession = struct {
                 if (target > pc) {
                     // `while`: the branch is a link of the test that
                     // leaves the loop (any `and` link, or the last one
-                    // right above the marker), and it was taken.
-                    if (jumped) if (bytecode.whileTestMarkerOf(proto.code, pc - 1)) |m| {
+                    // right above the marker), and it was taken; `repeat`:
+                    // an `or` link to the exit, taken.
+                    if (jumped) {
+                        if (bytecode.whileTestMarkerOf(proto.code, pc - 1)) |m| {
+                            if (m + 1 == self.anchor.pc) return true;
+                        }
+                        if (bytecode.repeatTestMarkerOf(proto.code, pc - 1)) |m| {
+                            if (m + 1 == self.anchor.pc) return true;
+                        }
+                    }
+                } else if (!jumped) {
+                    // `repeat`: the branch is the closer onto our marker,
+                    // and falling through leaves the loop. (An earlier link
+                    // onto the marker falls through to the next link.)
+                    if (bytecode.repeatTestMarkerOf(proto.code, pc - 1)) |m| {
                         if (m + 1 == self.anchor.pc) return true;
-                    };
-                } else if (cb.cond.isCondition() and !jumped and
-                    bytecode.loopHeaderOf(proto.code[target], target) == self.anchor.pc)
-                {
-                    // `repeat`: the backward condition branch targets our
-                    // marker, and falling through leaves the loop.
-                    return true;
+                    }
                 }
             }
         }

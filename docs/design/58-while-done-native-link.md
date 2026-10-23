@@ -20,7 +20,7 @@ leaves scimark-fft +19% from duplicate root traces at the bit-reverse
 G6 re-run follow. Rev 2's Option A design and its review are kept as
 Appendix R2.
 **Owner:** claude
-**Last updated:** 2026-10-01
+**Last updated:** 2026-10-23
 
 ## Implementation status
 
@@ -296,6 +296,18 @@ change, grouped:
     `C ≤ m − 1 < m < E`.
   - `repeat`: a backward `jmp_if_false` targets a `loop` op of kind
     `repeat`.
+
+  Follow-up (doc 66, 2026-10-23): a `repeat` test that is an
+  `and`/`or`/`not` chain compiles to branches straight back to the
+  marker, so a `repeat` can have several backward branches onto it: its
+  closer at `E − 1` (any condition branch, not only `jmp_if_false`) and
+  the chain's earlier links. The closer is still the instruction at
+  `E − 1`, so `loopExtentFor` is unchanged, and the marker is still the
+  one back-edge. The check accepts an earlier link when the closer at
+  `E − 1` targets the same marker. Which links leave the loop is
+  `bytecode.repeatTestMarkerOf` (the closer by falling through, an `or`
+  link by jumping to `E`); an earlier backward link leaves in neither
+  direction.
 - **Patching** (doc 20 Phase 3): `patchedEntryOp` maps `.loop → .jloop`,
   `.tfor_loop → .jloop`, `.for_loop → .jfor_loop`. `.jmp` and
   `.jmp_if_false` are never patched. `resolvePatchPc` keeps its rule
