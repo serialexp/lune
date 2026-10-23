@@ -273,6 +273,14 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     `itern`'s call fallback moved to `opIternCall` (`coldTail`). Q1–Q3
     unanswered, defaults recorded in doc 70 §7. The one row above the bar
     is while_shortcircuit_probe +0.10% (≈650 instructions of install).
+  - Frame-free hot handlers (doc 42 §9.5): `+ - * / & | ~ -x ~x #`
+    and `for_loop` leave through `slowTail` for their non-number shapes,
+    so a hit pushes no callee-saved registers. Every @bench row is down:
+    nsieve-bit −19.5%, euler14-bit −20.6%, scimark ≈ −7%. The handlers
+    still carrying a five-register frame with no call are
+    `get/set_index`, `get/set_field` and `itern`: pure register
+    pressure. `t.x` is 84 instructions per get (LuaJIT `-joff` 29), and
+    7.2M of 36.7M in the lfget profile is `hash_part`.
     Outstanding there: `math.type`, allocating bodies, the generic ABI.
   - Doc 71, tier-0 upvalue access (`docs/design/71-tier0-upvalue-access.md`):
     a cell carries pointers to its value's two lanes (LuaJIT's `uv->v`),

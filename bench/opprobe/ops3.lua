@@ -24,6 +24,8 @@ P.kpow = function(n) local s, x = 0, 1.5 for i = 1, n do local b = x ^ 2 s = s +
 -- parses there.
 P.kshl = function(n) return load("local n = ... local s = 0 for i = 1, n do local b = i << 3 s = s + i end return s")(n) end
 P.kband = function(n) return load("local n = ... local s = 0 for i = 1, n do local b = i & 7 s = s + i end return s")(n) end
+P.rbnot = function(n) return load("local n = ... local s = 0 for i = 1, n do local b = ~i s = s + i end return s")(n) end
+P.rneg = function(n) local s = 0 for i = 1, n do local b = -i s = s + i end return s end
 -- The register forms on floats, which share the constant forms' handlers.
 P.rfmul = function(n) local s, x = 0, 1.5 for i = 1, n do local b = x * x s = s + i end return s end
 P.rfsub = function(n) local s, x = 0, 1.5 for i = 1, n do local b = x - x s = s + i end return s end

@@ -621,16 +621,22 @@ pub const Table = struct {
     /// the array part's last key. That is `alen`'s exact fast case (trace_ir).
     /// Everything else is `lengthSearch`.
     pub inline fn length(self: *const Table) i64 {
+        return self.lengthFast() orelse self.lengthSearch();
+    }
+
+    /// `length`'s inline fast case, or null where it takes `lengthSearch`.
+    pub inline fn lengthFast(self: *const Table) ?i64 {
         const ap = &self.array;
         if (!ap.isGrid() and self.hash.count() == 0) {
             if (ap.asize <= 1) return 0;
             const n = ap.asize - 1;
             if (!ap.get(n).isNil()) return @intCast(n);
         }
-        return self.lengthSearch();
+        return null;
     }
 
-    fn lengthSearch(self: *const Table) i64 {
+    /// `length` past its fast case, though correct on every table.
+    pub fn lengthSearch(self: *const Table) i64 {
         // Every grid row `1..rows` is a present `row_view` (a table is never nil)
         // and a grid carries no hash-part border, so `#t` is exactly the row
         // count. (Phase 3, doc 14.)

@@ -407,3 +407,25 @@ conversion (in the megafunction both inlined into `execImpl`'s arms).
 (pi_leibniz 195.9ms vs 202.9ms same-shape A/B). Cost: fp-based `perf
 record -g` call graphs degrade (flat profiles and `--call-graph dwarf`
 unaffected). Left out of the conversion commit deliberately.
+
+### 9.5 Follow-up (2026-10-23): the handlers' own slow halves
+
+§9.2's rule holds for a handler's own body as much as for the prologue,
+and the busiest handlers still broke it: `opBinNum` (`+ - *`), `opDiv`,
+`opBinBit`, `opNeg` and `opBnot` called `arithGeneric`/`unArithMeta` on
+their non-number lane, `opForLoop` called `forLoopStepMixed`, and `opLen`
+musttail'd `opLenSlow` directly, which LLVM inlined back with its calls.
+Each pushed five callee-saved registers on every hit. They now leave
+through `slowTail` (doc 62 §4.3's per-op slow table, whose runtime index
+LLVM cannot fold into an inlinable call): `opArithMeta` for the binary
+ops, `opUnArithSlow` for `-`/`~`, `opForLoopSlow` for a float index with
+an int step, and `opLenSlow`, which searches with `Table.lengthSearch`
+directly once `opLen` has tried `Table.lengthFast` inline. `for_loop`
+keeps the int-index/float-limit case inline, tested after the all-one-type
+lanes so the int path keeps its frame (nsieve's limit is a float).
+
+Receipts (tier-0 instructions vs f03cee8; `ops.lua` base `s = s + i` 116 → 91;
+`-i` 37 → 25, `~i` 41 → 24, `i & 7` 47 → 31, `x / x` 41 → 34, `#t` 100 → 81):
+nsieve-bit −19.5%, euler14-bit −20.6% (JIT −5.5%), sieve_int −9.2%,
+pi_leibniz −8.9%, scimark −7.2…−7.7%, nsieve −7.5%, field_hash −6.6%; every
+@bench row down on both tiers, no aborts changed.

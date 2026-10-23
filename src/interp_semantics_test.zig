@@ -3713,3 +3713,47 @@ test "doc 68 §5: a collection inside a protected body keeps the call's own slot
         "true\tH:x\ntrue\tH:x\ntrue\nfalse\th:anonymous:7: o\nfalse\ttrue\tH:x\n",
     );
 }
+
+test "a numeric for steps every limit, step and index shape" {
+    // `opForLoop` steps an all-int or all-float triple and an int loop with a
+    // float limit inline; everything else (a float index with an int step)
+    // is `opForLoopSlow`'s.
+    try expectProgram(
+        \\local s = 0
+        \\for i = 1, 3.5 do s = s + i end
+        \\for i = 3, 0.5, -1 do s = s + i end
+        \\for i = 1, 0 / 0 do s = s + 100 end
+        \\for i = 1.0, 2.0 do s = s + i end
+        \\for i = 1.0, 2 do s = s + i end
+        \\for i = 1, 2, 0.5 do s = s + i end
+        \\for i = math.maxinteger - 1, math.maxinteger do s = s + 1 end
+        \\for i = math.mininteger + 1, math.mininteger, -1 do s = s + 1 end
+        \\print(s, math.type(s))
+        \\print(pcall(function() for i = 1, "x" do end end))
+        \\
+    ,
+        "26.5\tfloat\nfalse\tanonymous:11: 'for' limit must be a number\n",
+    );
+}
+
+test "arithmetic, unary and length fall back to their metamethods" {
+    // The raw lanes live in the hot handlers; metamethods and errors are the
+    // slow halves'.
+    try expectProgram(
+        \\local mt = {}
+        \\for _, k in ipairs({ "add", "sub", "mul", "div", "band", "shl", "unm", "bnot", "len" }) do
+        \\  mt["__" .. k] = function() return k end
+        \\end
+        \\local o = setmetatable({}, mt)
+        \\print(o + 1, 1 - o, o * 2, 1 / o, o & 1, 1 << o, -o, ~o, #o)
+        \\print(pcall(function() return "10" + 1 end))
+        \\print(7 // 2, #"abc")
+        \\local t = { 1, 2, 3 }
+        \\t[3] = nil
+        \\print(#t, ~5, -2.5, 6 / 4)
+        \\print(pcall(function() return {} + 1 end))
+        \\
+    ,
+        "add\tsub\tmul\tdiv\tband\tshl\tunm\tbnot\tlen\nfalse\tanonymous:7: attempt to perform arithmetic on a string value\n3\t3\n2\t-6\t-2.5\t1.5\nfalse\tanonymous:12: attempt to perform arithmetic on a table value\n",
+    );
+}

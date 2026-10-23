@@ -3700,6 +3700,11 @@ pub const Vm = struct {
         inline for (.{ .jlt, .jle, .jgt, .jge, .jlt_k, .jle_k, .jgt_k, .jge_k }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opJOrderSlow(mode, op);
         inline for (.{ .jeq, .jeq_n }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opJEqSlow(mode, op);
         t[@intFromEnum(bytecode.OpCode.itern)] = opIternSlow(mode);
+        inline for (.{ .add, .sub, .mul, .div, .add_rk, .sub_rk, .mul_rk, .div_rk, .add_kr, .sub_kr, .mul_kr, .div_kr }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opArithMeta(mode, op);
+        t[@intFromEnum(bytecode.OpCode.for_loop)] = opForLoopSlow(mode);
+        inline for (.{ .band, .bor, .bxor, .shl, .shr, .sar, .band_rk, .bor_rk, .bxor_rk, .shl_rk, .shr_rk }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opArithMeta(mode, op);
+        inline for (.{ .neg, .bnot }) |op| t[@intFromEnum(@as(bytecode.OpCode, op))] = opUnArithSlow(mode, op);
+        t[@intFromEnum(bytecode.OpCode.len)] = opLenSlow(mode);
         return t;
     }
 
@@ -6563,13 +6568,16 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                vm.binNum(regs, instr.a, arithOperands(f.shape, st, regs, instr), f.base) catch |e| return parkErr(st, e);
-                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+                if (binNum(regs, instr.a, arithOperands(f.shape, st, regs, instr), f.base))
+                    return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+                // A non-number operand: `opArithMeta`, through `slowTail`.
+                return slowTail(mode, st, pc, instr, vm, tags, payloads);
             }
         }.h;
     }
 
-    /// `/`: always a float, so any two numbers divide on the lanes.
+    /// `/`: always a float, so any two numbers divide on the lanes; anything
+    /// else is `opArithMeta`, through `slowTail`.
     fn opDiv(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
         const f = comptime bytecode.arithFormOf(op).?;
         return struct {
@@ -6582,7 +6590,7 @@ pub const Vm = struct {
                 } else if (o.bothNumber()) {
                     regs.setFloat(instr.a, o.lhsFloat() / o.rhsFloat());
                 } else {
-                    vm.arithGeneric(.div, regs, instr.a, o) catch |e| return parkErr(st, e);
+                    return slowTail(mode, st, pc, instr, vm, tags, payloads);
                 }
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
@@ -6674,7 +6682,7 @@ pub const Vm = struct {
         }.h;
     }
 
-    // ---- bitwise ---- (both-int fast lane; else `arith.*` + meta)
+    // ---- bitwise ---- (both-int fast lane; else `opArithMeta`)
     fn opBinBit(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
         const f = comptime bytecode.arithFormOf(op).?;
         return struct {
@@ -6694,7 +6702,7 @@ pub const Vm = struct {
                         else => comptime unreachable,
                     });
                 } else {
-                    vm.arithGeneric(f.base, regs, instr.a, o) catch |e| return parkErr(st, e);
+                    return slowTail(mode, st, pc, instr, vm, tags, payloads);
                 }
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
@@ -6705,7 +6713,6 @@ pub const Vm = struct {
     fn opNeg(comptime mode: ExecMode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
-                const self = vm;
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
                 const a: usize = instr.a;
                 switch (regs.tagAt(instr.b)) {
@@ -6714,11 +6721,26 @@ pub const Vm = struct {
                         @setFloatMode(.strict);
                         regs.setFloat(a, -@as(f64, @bitCast(regs.bitsAt(instr.b))));
                     },
-                    else => {
-                        const v = regs.get(instr.b);
-                        regs.set(a, self.unArithMeta(arith.neg(v), self.mm.unm, v) catch |e| return parkErr(st, e));
-                    },
+                    else => return slowTail(mode, st, pc, instr, vm, tags, payloads),
                 }
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// `opNeg`'s and `opBnot`'s slow half: `arith` with the unary
+    /// metamethod.
+    fn opUnArithSlow(comptime mode: ExecMode, comptime op: bytecode.OpCode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const v = regs.get(instr.b);
+                const r = switch (op) {
+                    .neg => vm.unArithMeta(arith.neg(v), vm.mm.unm, v),
+                    .bnot => vm.unArithMeta(arith.bnot(v), vm.mm.bnot, v),
+                    else => comptime unreachable,
+                };
+                regs.set(instr.a, r catch |e| return parkErr(st, e));
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -6738,9 +6760,8 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                const self = vm;
-                const v = regs.get(instr.b);
-                regs.set(instr.a, self.unArithMeta(arith.bnot(v), self.mm.bnot, v) catch |e| return parkErr(st, e));
+                if (regs.tagAt(instr.b) != .int) return slowTail(mode, st, pc, instr, vm, tags, payloads);
+                regs.setInt(instr.a, ~@as(i64, @bitCast(regs.bitsAt(instr.b))));
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -6758,28 +6779,37 @@ pub const Vm = struct {
                 // (str_gmatch profile, 2026-08-29: 20% of the bench) — is pure
                 // overhead here. Tables (metamethod dispatch), row views, and
                 // error cases keep the slow path.
-                // Everything else is `opLenSlow`, a handler of its own, so
-                // this one makes no call at all.
+                // A table with no metatable whose border is `Table.length`'s
+                // inline fast case is read here too. Everything else is
+                // `opLenSlow`, through `slowTail`, so this one makes no call
+                // at all.
                 const v = regs.get(instr.b);
-                if (!(v.isHeap() and v.heapType() == .string))
-                    return @call(.always_tail, opLenSlow(mode), .{ st, pc, instr, vm, tags, payloads });
-                regs.setInt(instr.a, @intCast(string.String.fromHeader(v.asHeap()).cpLen()));
+                if (!v.isHeap()) return slowTail(mode, st, pc, instr, vm, tags, payloads);
+                switch (v.heapType()) {
+                    .string => regs.setInt(instr.a, @intCast(string.String.fromHeader(v.asHeap()).cpLen())),
+                    .table => {
+                        const t = table.Table.fromHeader(v.asHeap());
+                        if (t.metatable != null) return slowTail(mode, st, pc, instr, vm, tags, payloads);
+                        regs.setInt(instr.a, t.lengthFast() orelse return slowTail(mode, st, pc, instr, vm, tags, payloads));
+                    },
+                    else => return slowTail(mode, st, pc, instr, vm, tags, payloads),
+                }
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
     }
 
-    /// `opLen` for anything but a string. A table with no metatable cannot
-    /// have `__len`, so its border comes straight from `Table.length` (an
-    /// `i64` in a register); everything else takes `lenValue`'s `__len`
-    /// probe.
+    /// `opLen` past its fast cases. A table with no metatable cannot have
+    /// `__len`, and `opLen` has already tried `Table.length`'s fast case, so
+    /// its border comes straight from `lengthSearch` (an `i64` in a
+    /// register); everything else takes `lenValue`'s `__len` probe.
     fn opLenSlow(comptime mode: ExecMode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
                 const v = regs.get(instr.b);
                 if (v.isHeap() and v.heapType() == .table and table.Table.fromHeader(v.asHeap()).metatable == null) {
-                    regs.setInt(instr.a, table.Table.fromHeader(v.asHeap()).length());
+                    regs.setInt(instr.a, table.Table.fromHeader(v.asHeap()).lengthSearch());
                 } else {
                     regs.set(instr.a, vm.lenValue(v) catch |e| return parkErr(st, e));
                 }
@@ -7193,24 +7223,45 @@ pub const Vm = struct {
 
     // idx += step; if still within limit (direction by step sign) and the int
     // add didn't overflow, publish idx to the loop var R[a+3] and take the
-    // back-edge.
+    // back-edge. An all-int or all-float (index, limit, step) steps here, on
+    // the raw lanes; every other shape is `opForLoopSlow`, through
+    // `slowTail`.
     fn opForLoop(comptime mode: ExecMode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                const a: usize = instr.a;
-                const within = forLoopStep(regs, a) catch |e| return parkErr(st, e);
-                const cur_pc = pc - 1;
-                var npc = pc;
-                if (within) {
-                    regs.copy(a + 3, a);
-                    npc = applyJump(pc, instr.aux);
-                }
-                if (vm.trace.config.enabled and npc <= cur_pc)
-                    return @call(.always_tail, gatedBackEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
-                return dispatchTail(mode, st, npc, vm);
+                const within = forLoopLanes(regs, instr.a) orelse
+                    return slowTail(mode, st, pc, instr, vm, tags, payloads);
+                return forLoopNext(mode, st, pc, instr, vm, tags, payloads, within);
             }
         }.h;
+    }
+
+    /// `opForLoop`'s other shapes, through the whole `forLoopStep`.
+    fn opForLoopSlow(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const within = forLoopStep(regs, instr.a) catch |e| return parkErr(st, e);
+                return forLoopNext(mode, st, pc, instr, vm, tags, payloads, within);
+            }
+        }.h;
+    }
+
+    /// The rest of a `for_loop` once the step has run: publish the index and
+    /// take the back-edge if still `within`, else fall out of the loop.
+    inline fn forLoopNext(comptime mode: ExecMode, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64, within: bool) HandlerResult {
+        const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+        const a: usize = instr.a;
+        const cur_pc = pc - 1;
+        var npc = pc;
+        if (within) {
+            regs.copy(a + 3, a);
+            npc = applyJump(pc, instr.aux);
+        }
+        if (vm.trace.config.enabled and npc <= cur_pc)
+            return @call(.always_tail, gatedBackEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
+        return dispatchTail(mode, st, npc, vm);
     }
 
     // Doc 20 Phase 1 (patched trace entry, the BC_JFORL analogue): only ever
@@ -9252,7 +9303,9 @@ pub const Vm = struct {
     /// to the exact `arith.*` + `arithMeta` path. Byte-identical to `arith`:
     /// the int path mirrors `Value.int(x +% y)`, the float and mixed paths
     /// `Value.float(x.toFloat() + y.toFloat())` under `@setFloatMode(.strict)`.
-    inline fn binNum(self: *Vm, regs: RegWindow, a: usize, o: ArithOperands, comptime base: bytecode.OpCode) Error!void {
+    /// `+ - *` on two numbers, on the raw lanes. False (nothing written) for
+    /// any other operand, which is `arithGeneric`'s.
+    inline fn binNum(regs: RegWindow, a: usize, o: ArithOperands, comptime base: bytecode.OpCode) bool {
         if (o.bothInt()) {
             const x: i64 = @bitCast(o.lb());
             const y: i64 = @bitCast(o.rb());
@@ -9269,8 +9322,9 @@ pub const Vm = struct {
             @setFloatMode(.strict);
             regs.setFloat(a, floatBin(base, o.lhsFloat(), o.rhsFloat()));
         } else {
-            try self.arithGeneric(base, regs, a, o);
+            return false;
         }
+        return true;
     }
 
     inline fn floatBin(comptime base: bytecode.OpCode, x: f64, y: f64) f64 {
@@ -9294,6 +9348,46 @@ pub const Vm = struct {
     /// the true sum is past every int, so past an int limit and past the int
     /// Lua 5.4 clips a float limit to (the wrapped sum is written back,
     /// unread). Any other mix takes `arith`.
+    /// `forLoopStep` for an int index and step (with either limit) or an
+    /// all-float (index, limit, step): whether the loop goes on, or null with
+    /// nothing written for any other shape.
+    inline fn forLoopLanes(regs: RegWindow, a: usize) ?bool {
+        const ti = regs.tagAt(a);
+        const tl = regs.tagAt(a + 1);
+        if (ti != regs.tagAt(a + 2)) return null;
+        if (ti == tl) {
+            if (ti == .int) {
+                const step: i64 = @bitCast(regs.bitsAt(a + 2));
+                const sum = @addWithOverflow(@as(i64, @bitCast(regs.bitsAt(a))), step);
+                const idx: i64 = sum[0];
+                regs.setInt(a, idx);
+                if (sum[1] != 0) return false;
+                const limit: i64 = @bitCast(regs.bitsAt(a + 1));
+                return if (step > 0) idx <= limit else limit <= idx;
+            }
+            if (ti == .float) {
+                @setFloatMode(.strict);
+                const step: f64 = @bitCast(regs.bitsAt(a + 2));
+                const idx: f64 = @as(f64, @bitCast(regs.bitsAt(a))) + step;
+                regs.setFloat(a, idx);
+                const limit: f64 = @bitCast(regs.bitsAt(a + 1));
+                return if (step > 0) idx <= limit else limit <= idx;
+            }
+            return null;
+        }
+        if (ti == .int and tl == .float) {
+            // `for i = 1, n / 2`: an int loop with a float limit.
+            const step: i64 = @bitCast(regs.bitsAt(a + 2));
+            const sum = @addWithOverflow(@as(i64, @bitCast(regs.bitsAt(a))), step);
+            const idx: i64 = sum[0];
+            regs.setInt(a, idx);
+            if (sum[1] != 0) return false;
+            const o = value.compareNumeric(Value.int(idx), Value.float(@bitCast(regs.bitsAt(a + 1))));
+            return if (step > 0) o == .lt or o == .eq else o == .gt or o == .eq;
+        }
+        return null;
+    }
+
     inline fn forLoopStep(regs: RegWindow, a: usize) Error!bool {
         const ti = regs.tagAt(a);
         const tl = regs.tagAt(a + 1);
