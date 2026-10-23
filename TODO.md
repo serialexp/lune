@@ -1089,13 +1089,18 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
 
 ## `{f()}` keeps only the first result (noted 2026-10-09)
 
-- [ ] **A call as the last item of a table constructor is truncated to
+- [x] **A call as the last item of a table constructor is truncated to
       one value.** `local function f() return 1,2,3 end print(#{f()})`
       prints 1 (Lua: 3). Doc 27 §7 says the compiler has no
       `all_results` bytecode shape for constructors. Decide whether this
       is intended for mahina or a gap. If it's a gap, add the shape
       (Lua: `SETLIST` with `C=0` after a multret call; `{...}` is the
       same case) along with the recorder/JIT side.
+      **Done (2026-10-23, doc 72 P2):** a gap (Bart: expand, as Lua and
+      LuaJIT do). A constructor's trailing call or `...` is a `set_list`
+      with `b = all_results`, the multret consumer of its values. The
+      recorder aborts `set_list` (`nyi_opcode`), as it aborted the
+      per-field stores before; the JIT side is doc 45's `tset`.
 
 ## Precise traces retry a failed string-helper allocation (noted 2026-10-10)
 
@@ -2424,8 +2429,8 @@ run verbatim: they all need `tonumber`, `io.write`, `string.format`, `unpack`,
 generic-`for`/`pairs`, `repeat/until`, `math.*`. mahina now has most of these
 (`math.*`, `table.*` incl. `unpack`, `tonumber`/`string.format`/`io.write`,
 generic-`for` + `pairs`/`ipairs`/`next`, `repeat/until`, and bare varargs `...` —
-see below). Remaining vararg work: named `...rest` (`#rest`/`rest[i]`), keyframe
-persistence, and `{...}`/`{f()}` table-spread.
+see below). Remaining vararg work: named `...rest` (`#rest`/`rest[i]`) and keyframe
+persistence (`{...}`/`{f()}` table-spread landed with doc 72 P2).
 
 ### ~~Generic-`for` + `pairs`/`ipairs`/`next` (deterministic iteration)~~ — DONE
 `for v1..vn in explist` now compiles (`compiler.compileGenericFor` → one new
@@ -2470,8 +2475,8 @@ function is a clean compile error. Trace recorder aborts (`nyi_opcode`) on the f
 opcodes, so vararg functions never form a trace. Covered by V1 VM unit tests,
 compiler diagnostics, three all-modes e2e programs, and a determinism-corpus entry.
 **Remaining:** V3 named `...rest` (`#rest`/`rest[i]` + capture diagnostic), V4
-keyframe persistence (frame schema + version bump + suspend-in-vararg F2c), and the
-`{...}`/`{f()}` table-spread follow-up (also fixes the latent `{f()}` bug).
+keyframe persistence (frame schema + version bump + suspend-in-vararg F2c). (The
+`{...}`/`{f()}` table-spread follow-up landed with doc 72 P2.)
 
 **Recommended target: `nsieve.lua`** — integer + boolean + tables, numeric-`for` hot
 loops; closest to mahina's int/bool tier-1b strength and drives the natural next

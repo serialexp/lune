@@ -232,6 +232,9 @@ pub const HashPart = extern struct {
 
     pub const empty: HashPart = .{};
     pub const min_capacity: u32 = 4;
+    /// The keys the first insertion's allocation holds: `reserve` for no
+    /// more than this buys nothing.
+    pub const first_alloc_keys: u32 = @intCast(loadLimit(min_capacity));
 
     pub const Entry = struct { key: Value, value_ptr: *Value };
 
@@ -645,6 +648,19 @@ pub const HashPart = extern struct {
         return cap * 3 / 4;
     }
 
+    /// Allocate an empty map at the capacity `n` insertions of new keys grow
+    /// it to — the smallest one `n` fits under the load limit — so they
+    /// insert without a rehash. A table constructor's hash fields (doc 72
+    /// P0). Layout stays a pure function of the guest's history: the
+    /// constructor's field count is part of it.
+    pub fn reserve(self: *HashPart, gpa: std.mem.Allocator, n: u32) std.mem.Allocator.Error!void {
+        std.debug.assert(self.nodes == null);
+        if (n == 0) return;
+        var cap: u64 = min_capacity;
+        while (n > loadLimit(cap)) cap <<= 1;
+        try self.rehashTo(gpa, @intCast(cap));
+    }
+
     /// Grow (or shrink, after heavy deletion) to the smallest power-of-2
     /// capacity that fits `live + 1` under the load limit. Overflow-safe: the
     /// arithmetic is u64 and `live` is bounded by addressable memory / 32.
@@ -685,6 +701,26 @@ pub const HashPart = extern struct {
 // ----------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "reserve allocates the capacity the insertions would grow to" {
+    const gpa = testing.allocator;
+    for ([_]u32{ 1, 2, 3, 4, 6, 7, 12, 13, 100 }) |n| {
+        var grown: HashPart = .empty;
+        defer grown.deinit(gpa);
+        var sized: HashPart = .empty;
+        defer sized.deinit(gpa);
+        try sized.reserve(gpa, n);
+        const cap = sized.capacity();
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            try grown.put(gpa, Value.int(i), Value.int(i));
+            try sized.put(gpa, Value.int(i), Value.int(i));
+        }
+        try testing.expectEqual(grown.capacity(), cap);
+        try testing.expectEqual(cap, sized.capacity()); // no rehash
+        try testing.expectEqual(n, sized.count());
+    }
+}
 
 test "basic put/get/overwrite/contains round-trip" {
     const gpa = testing.allocator;

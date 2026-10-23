@@ -33,6 +33,7 @@ const gc = @import("gc.zig");
 const diag = @import("diag.zig");
 const bc_liveness = @import("bc_liveness.zig");
 const bc_dom = @import("bc_dom.zig");
+const HashPart = @import("hash_part.zig").HashPart;
 
 const Instr = bytecode.Instr;
 const OpCode = bytecode.OpCode;
@@ -1717,36 +1718,89 @@ const Compiler = struct {
         self.freeTo(m);
     }
 
+    /// A table constructor (doc 72). `new_table` allocates the hash part for
+    /// the named and keyed fields, when there are more of them than the
+    /// first insertion's allocation holds anyway. A run of positional values compiles into
+    /// consecutive registers, stored by one `set_list` per `set_list_batch`;
+    /// a named or keyed field ends the run and stores after it, so every
+    /// store happens in source order. A trailing call or `...` expands to all
+    /// its values (`set_list` with `b = all_results`), as in Lua.
     fn compileTable(self: *Compiler, fields: []const ast.TableField, dest: u16) Error!void {
-        _ = try self.emit(Instr.opA(.new_table, dest));
-        var array_index: i32 = 1;
-        for (fields) |field| {
-            const m = self.next_reg;
-            // A named field and a literal string key ride in the store as a
-            // constant (doc 66 P2); every other key takes a register first.
-            const key: IndexKey = switch (field) {
-                .positional => blk: {
-                    const r = try self.alloc1();
-                    _ = try self.emit(Instr.opAx(.load_int, r, array_index));
-                    array_index += 1;
-                    break :blk .{ .reg = r };
+        var nhash: usize = 0;
+        for (fields) |field| switch (field) {
+            .positional => {},
+            .named => nhash += 1,
+            // A number key is most likely the array part's.
+            .keyed => |kv| nhash += @intFromBool(numberLiteral(kv.key) == null),
+        };
+        if (nhash <= HashPart.first_alloc_keys) nhash = 0;
+        _ = try self.emit(Instr.opABC(.new_table, dest, 0, @intCast(@min(nhash, std.math.maxInt(u16)))));
+        var pending: PositionalRun = .{ .table = dest, .first_reg = self.next_reg };
+        for (fields, 0..) |field, i| {
+            switch (field) {
+                .positional => |e| {
+                    if (pending.len == 0) pending.first_reg = self.next_reg;
+                    if (i + 1 == fields.len and (e.isCall() or e.data == .vararg)) {
+                        if (e.isCall()) {
+                            try self.compileCallInPlace(e, bytecode.all_results);
+                        } else {
+                            try self.requireVararg(e.span);
+                            try self.compileSpreadInPlace();
+                        }
+                        _ = try self.emit(.{ .op = .set_list, .a = pending.first_reg, .b = bytecode.all_results, .c = dest, .aux = pending.next_key - pending.len });
+                        self.freeTo(pending.first_reg);
+                        return;
+                    }
+                    try self.compileExprTo(e, try self.alloc1());
+                    pending.len += 1;
+                    pending.next_key += 1;
+                    if (pending.len == bytecode.set_list_batch) try self.flushRun(&pending);
                 },
-                .named => |nv| .{ .konst = try self.stringConstant(nv.name) },
-                .keyed => |kv| try self.literalKey(kv.key) orelse blk: {
-                    const r = try self.alloc1();
-                    try self.compileExprTo(kv.key, r);
-                    break :blk .{ .reg = r };
+                .named, .keyed => {
+                    try self.flushRun(&pending);
+                    const m = self.next_reg;
+                    // A named field and a literal string key ride in the store
+                    // as a constant (doc 66 P2); any other key takes a register.
+                    const key: IndexKey = switch (field) {
+                        .positional => unreachable,
+                        .named => |nv| .{ .konst = try self.stringConstant(nv.name) },
+                        .keyed => |kv| try self.literalKey(kv.key) orelse blk: {
+                            const r = try self.alloc1();
+                            try self.compileExprTo(kv.key, r);
+                            break :blk .{ .reg = r };
+                        },
+                    };
+                    const val = try self.alloc1();
+                    try self.compileExprTo(switch (field) {
+                        .positional => unreachable,
+                        .named => |nv| nv.value,
+                        .keyed => |kv| kv.value,
+                    }, val);
+                    try self.emitSetIndex(dest, key, val);
+                    self.freeTo(m);
                 },
-            };
-            const val = try self.alloc1();
-            try self.compileExprTo(switch (field) {
-                .positional => |val_expr| val_expr,
-                .named => |nv| nv.value,
-                .keyed => |kv| kv.value,
-            }, val);
-            try self.emitSetIndex(dest, key, val);
-            self.freeTo(m);
+            }
         }
+        try self.flushRun(&pending);
+    }
+
+    /// The positional values a constructor has evaluated and not yet stored.
+    const PositionalRun = struct {
+        table: u16,
+        /// The register of the first value; the rest follow it.
+        first_reg: u16,
+        len: u16 = 0,
+        /// The key of the next positional value.
+        next_key: i32 = 1,
+    };
+
+    /// Store the pending run, if any, with one `set_list`, and free its
+    /// registers.
+    fn flushRun(self: *Compiler, pending: *PositionalRun) Error!void {
+        if (pending.len == 0) return;
+        _ = try self.emit(.{ .op = .set_list, .a = pending.first_reg, .b = pending.len, .c = pending.table, .aux = pending.next_key - pending.len });
+        self.freeTo(pending.first_reg);
+        pending.len = 0;
     }
 
     // ---- functions & calls ----
@@ -2220,7 +2274,7 @@ test "doc 61: every compiled proto passes the call-layout check" {
         \\  fs[i] = function() return x + i end
         \\  obj:inc(sum(i, x, fs[i]())):inc(1)
         \\end
-        \\local t = {sum(1, 2, 3), math.max(sum(4, 5)), tostring(sum(6))}
+        \\local t = {sum(1, 2, 3), math.max(sum(4, 5)), math.abs(sum(6))}
         \\local ok, a, b = pcall(sum, table.unpack(t))
         \\local s = tostring(ok) .. a .. b .. obj.n .. #t .. string.format("%d", sum(7, 8))
         \\return sum(sum(1), sum(2, 3)), s

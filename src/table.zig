@@ -108,6 +108,17 @@ pub const Table = struct {
         return self;
     }
 
+    /// `create`, with the hash part allocated for `nhash` new keys
+    /// (`HashPart.reserve`): a table constructor's hash fields (doc 72 P0).
+    pub fn createSized(gpa: std.mem.Allocator, nhash: u32) std.mem.Allocator.Error!*Table {
+        const self = try create(gpa);
+        self.hash.reserve(gpa, nhash) catch |e| {
+            gpa.destroy(self);
+            return e;
+        };
+        return self;
+    }
+
     pub fn destroy(self: *Table, gpa: std.mem.Allocator) void {
         self.array.deinit(gpa);
         self.hash.deinit(gpa);
@@ -345,6 +356,36 @@ pub const Table = struct {
         if (self.array.lane != .value or self.array.frozen) return false;
         try self.array.seedFresh(gpa, i, val);
         return true;
+    }
+
+    /// A table constructor's positional run (`set_list`, doc 72): store the
+    /// leading non-nil values of `vals.get(0) .. vals.get(n - 1)` at keys
+    /// `k0 ..` in one step when `set` would append every one of them to the
+    /// array part, and return how many it stored, 0 when it would not. The
+    /// caller stores the rest one at a time. They are appends when the array
+    /// part has never had storage and `k0` is 0 or 1 (`set`'s seed), or `k0`
+    /// is its extent; when no metatable can intercept; and when the hash part
+    /// holds none of the keys `set` would absorb or drop on the way: the
+    /// run's own, its successor (`migrateFromHash`), and for a seed key 0.
+    /// `vals` is anything with `get(i: usize) Value`.
+    pub fn storeRun(self: *Table, gpa: std.mem.Allocator, k0: i64, vals: anytype, n: usize) Error!usize {
+        if (self.metatable != null or self.array.isGrid()) return 0;
+        var m: usize = 0;
+        while (m < n and !vals.get(m).isNil()) m += 1;
+        if (m == 0) return 0;
+        const fresh = self.array.cap == 0;
+        if (fresh) {
+            if (self.array.lane != .value or self.array.frozen or @as(u64, @bitCast(k0)) > 1) return 0;
+        } else if (self.array.asize == 0 or k0 != @as(i64, @intCast(self.array.asize))) return 0;
+        if (self.hash.count() != 0) {
+            var k: i64 = if (fresh) 0 else k0;
+            const last = k0 + @as(i64, @intCast(m));
+            while (k <= last) : (k += 1) {
+                if (self.hash.liveIntNode(k) != null) return 0;
+            }
+        }
+        try self.array.storeRun(gpa, @intCast(k0), vals, m);
+        return m;
     }
 
     /// `t[key] = val`. A `nil`/`NaN` key errors; storing `nil` deletes.
@@ -1033,6 +1074,78 @@ test "computeArraySize: chosen power-of-two extent always contains the counted k
         var nums: [Table.NBUCKETS]u32 = @splat(0);
         try testing.expect(!Table.countKey(-1, &nums));
         try testing.expect(!Table.countKey(std.math.minInt(i64), &nums));
+    }
+}
+
+test "storeRun and the stores after it leave what the sequential stores leave" {
+    const gpa = testing.allocator;
+    const Run = struct {
+        s: []const Value,
+        pub fn get(self: @This(), i: usize) Value {
+            return self.s[i];
+        }
+    };
+    const I = Value.int;
+    const nil = Value.nil();
+    const Case = struct {
+        /// Stored first, one at a time, into both tables.
+        before: []const [2]Value = &.{},
+        /// Then put straight into both hash parts (`restoreEntry`): a split
+        /// only a restore makes, which `set` must still honour.
+        hashed: []const [2]Value = &.{},
+        k0: i64 = 1,
+        run: []const Value,
+        /// How many values `storeRun` takes.
+        stored: usize,
+    };
+    const cases = [_]Case{
+        .{ .run = &.{ I(1), I(2), I(3) }, .stored = 3 },
+        .{ .run = &.{ I(1), I(300), Value.float(0.5) }, .stored = 3 },
+        .{ .before = &.{.{ Value.float(2.5), I(9) }}, .run = &.{ I(1), I(2) }, .stored = 2 },
+        .{ .run = &.{ I(1), nil, I(3) }, .stored = 1 },
+        .{ .run = &.{ nil, I(2) }, .stored = 0 },
+        // A seed absorbs key 0 from the hash and drops its own key; an
+        // append migrates the run's successor.
+        .{ .hashed = &.{.{ I(0), I(9) }}, .run = &.{ I(1), I(2) }, .stored = 0 },
+        .{ .hashed = &.{.{ I(2), I(9) }}, .run = &.{ I(1), I(2) }, .stored = 0 },
+        .{ .hashed = &.{.{ I(3), I(9) }}, .run = &.{ I(1), I(2) }, .stored = 0 },
+        .{ .hashed = &.{.{ I(4), I(9) }}, .run = &.{ I(1), I(2) }, .stored = 2 },
+        // Key 0 stored first is the array part's: the run appends.
+        .{ .before = &.{.{ I(0), I(9) }}, .run = &.{ I(1), I(2) }, .stored = 2 },
+        // An append run onto a committed part, and one not at its extent.
+        .{ .before = &.{.{ I(1), I(5) }}, .k0 = 2, .run = &.{ I(2), I(-3) }, .stored = 2 },
+        .{ .before = &.{.{ I(1), I(5) }}, .k0 = 4, .run = &.{ I(2), I(3) }, .stored = 0 },
+    };
+    for (cases) |c| {
+        const seq = try Table.create(gpa);
+        defer seq.destroy(gpa);
+        const run = try Table.create(gpa);
+        defer run.destroy(gpa);
+        for (c.before) |kv| {
+            try seq.set(gpa, kv[0], kv[1]);
+            try run.set(gpa, kv[0], kv[1]);
+        }
+        for (c.hashed) |kv| {
+            try seq.restoreEntry(gpa, kv[0], kv[1]);
+            try run.restoreEntry(gpa, kv[0], kv[1]);
+        }
+        for (c.run, 0..) |v, i| try seq.set(gpa, I(c.k0 + @as(i64, @intCast(i))), v);
+        const m = try run.storeRun(gpa, c.k0, Run{ .s = c.run }, c.run.len);
+        try testing.expectEqual(c.stored, m);
+        for (c.run[m..], m..) |v, i| try run.set(gpa, I(c.k0 + @as(i64, @intCast(i))), v);
+
+        try testing.expectEqual(seq.array.lane, run.array.lane);
+        try testing.expectEqual(seq.array.frozen, run.array.frozen);
+        try testing.expectEqual(seq.array.asize, run.array.asize);
+        try testing.expectEqual(seq.hash.count(), run.hash.count());
+        var k: i64 = 0;
+        while (k < 8) : (k += 1) {
+            const a = seq.get(I(k));
+            const b = run.get(I(k));
+            try testing.expectEqual(a.tag, b.tag);
+            try testing.expectEqual(a.payload.bits, b.payload.bits);
+            try testing.expectEqual(arr.ArrayPart.inArray(k, seq.array.asize), arr.ArrayPart.inArray(k, run.array.asize));
+        }
     }
 }
 

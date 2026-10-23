@@ -3708,7 +3708,7 @@ pub const Vm = struct {
     }
 
     /// A slow handler's cold continuation, or a fast handler's second exit
-    /// (`set_index`'s append lane): a second per-op table, read with the
+    /// (`set_index`'s append lane, `new_table`'s sized one): a second per-op table, read with the
     /// instruction's runtime opcode (like `slowTail`), so LLVM can't inline
     /// the continuation back into the handler that leaves for it, where its
     /// register pressure would land on that handler's hot path.
@@ -3720,6 +3720,7 @@ pub const Vm = struct {
         for (&t) |*h| h.* = noSlowPath;
         t[@intFromEnum(bytecode.OpCode.itern)] = opIternCall(mode);
         t[@intFromEnum(bytecode.OpCode.set_index)] = opSetIndexAppend(mode);
+        t[@intFromEnum(bytecode.OpCode.new_table)] = opNewTableSized(mode);
         return t;
     }
 
@@ -6426,6 +6427,7 @@ pub const Vm = struct {
             .set_field => opSetField(mode),
             .get_index2 => opGetIndex2(mode),
             .set_index2 => opSetIndex2(mode),
+            .set_list => opSetList(mode),
             .get_global => opGetGlobal(mode),
             .set_global => opSetGlobal(mode),
             .closure => opClosure(mode),
@@ -7914,7 +7916,21 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                if (instr.c != 0) return coldTail(mode, st, pc, instr, vm, tags, payloads);
                 const t = vm.heap.newTable() catch |e| return parkErr(st, e);
+                regs.set(instr.a, Value.heap(&t.header));
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// `new_table` with a hash part for `c` keys (doc 72 P0): a cold lane,
+    /// so the second allocation path stays out of every `{}`.
+    fn opNewTableSized(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const t = vm.heap.newTableSized(instr.c) catch |e| return parkErr(st, e);
                 regs.set(instr.a, Value.heap(&t.header));
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
@@ -8110,6 +8126,43 @@ pub const Vm = struct {
                 const seeded = t.seedFresh(vm.gpa, regs.get(instr.b).asInt(), val) catch |e| return parkErr(st, e);
                 if (!seeded) return slowTail(mode, st, pc, instr, vm, tags, payloads);
                 vm.heap.writeBarrier(&t.header, val); // no-op until Phase 4
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// Doc 72 P1: `set_list a, b, c, aux` stores a constructor's run of
+    /// positional values, `R[a .. a + b)` or, after a trailing call or `...`,
+    /// up to `reg_top`, into `R[c]` at keys `aux ..`. `Table.storeRun` takes its leading
+    /// appends in one step; the rest are stored one at a time, the
+    /// `set_index`es a constructor used to compile to. Values above the
+    /// window are read off the whole stack, as a multret `call` reads them.
+    fn opSetList(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            /// The run's values, from the register file.
+            const Run = struct {
+                vm: *Vm,
+                first: usize,
+                pub fn get(self: Run, i: usize) Value {
+                    return self.vm.regGet(self.first + i);
+                }
+            };
+
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const vals: Run = .{ .vm = vm, .first = st.base + instr.a };
+                const n: usize = if (instr.b == bytecode.all_results) blk: {
+                    vm.reg_top_pending = false;
+                    break :blk vm.reg_top - vals.first;
+                } else instr.b;
+                const tv = vm.regGet(st.base + instr.c);
+                const t = table.Table.fromHeader(tv.asHeap());
+                const k0: i64 = instr.aux;
+                const stored = t.storeRun(vm.gpa, k0, vals, n) catch |e| return parkErr(st, e);
+                var i: usize = 0;
+                while (i < stored) : (i += 1) vm.heap.writeBarrier(&t.header, vals.get(i)); // no-op until Phase 4
+                while (i < n) : (i += 1) {
+                    vm.indexSet(tv, Value.int(k0 + @as(i64, @intCast(i))), vals.get(i)) catch |e| return parkErr(st, e);
+                }
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;

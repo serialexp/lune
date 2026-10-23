@@ -224,6 +224,14 @@ pub const Heap = struct {
         return t;
     }
 
+    /// `newTable` with the hash part allocated for `nhash` keys: a table
+    /// constructor's (doc 72 P0).
+    pub fn newTableSized(self: *Heap, nhash: u32) std.mem.Allocator.Error!*Table {
+        const t = try Table.createSized(self.gpa, nhash);
+        self.link(&t.header);
+        return t;
+    }
+
     /// Attempt to flatten a `.value` array-of-rows table into a flat grid
     /// (doc 14, Phase 4). **STRICT homogeneous-numeric** precondition — inflate
     /// only when:

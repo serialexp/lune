@@ -467,6 +467,56 @@ pub const ArrayPart = extern struct {
         self.encode(@intCast(k), val);
     }
 
+    /// Store a run of `n` non-nil values, `vals.get(0) .. vals.get(n - 1)`, at
+    /// keys `k0 .. k0 + n - 1`, every one an append: on a part that has never
+    /// had storage (`cap == 0`, `k0` 0 or 1) the end state of `seedAt(k0, v0)`
+    /// followed by `append`s of the rest, on a part with `k0 == asize > 0`
+    /// that of `n` `append`s. The lane is the one those stores end on — the
+    /// commitment `commitFreshLane` makes for the first value, widened as
+    /// `widenFor` widens for each later value that does not fit — so it stays
+    /// a pure function of the write sequence (doc 18 D2a). The difference is
+    /// the work: the lane is folded before anything is stored, so the part is
+    /// allocated or converted once. A fresh part is allocated to exactly its
+    /// extent (doc 72 Q2); a growing one takes `ensureCapacity`'s growth. A
+    /// table constructor's positional run (`set_list`) stores through this.
+    /// `vals` is anything with `get(i: usize) Value`. OOM leaves the part
+    /// untouched.
+    pub fn storeRun(self: *ArrayPart, gpa: std.mem.Allocator, k0: usize, vals: anytype, n: usize) std.mem.Allocator.Error!void {
+        std.debug.assert(self.lane != .grid);
+        std.debug.assert(n != 0);
+        const fresh = self.cap == 0;
+        if (fresh) {
+            std.debug.assert(self.asize == 0 and self.lane == .value and !self.frozen and k0 <= 1);
+        } else {
+            std.debug.assert(k0 == self.asize and k0 != 0);
+        }
+        const commit = if (fresh) laneForValue(vals.get(0)) else self.lane;
+        var lane = commit;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const v = vals.get(i);
+            std.debug.assert(!v.isNil());
+            if (!laneFits(lane, v)) lane = widenTarget(lane, v);
+        }
+        const end = k0 + n;
+        if (fresh) {
+            const storage = try allocStorage(gpa, lane, end);
+            self.lane = lane;
+            self.frozen = commit.isNarrow();
+            self.cap = end;
+            self.data = storage.data;
+            self.present = storage.present;
+            if (k0 == 1) self.encode(0, Value.nil()); // slot-0 hole
+        } else if (lane != self.lane) {
+            try self.convertInto(gpa, lane, if (end > self.cap) try self.grownCap(end) else self.cap);
+        } else {
+            try self.ensureCapacity(gpa, end);
+        }
+        i = 0;
+        while (i < n) : (i += 1) self.encode(k0 + i, vals.get(i));
+        self.asize = end;
+    }
+
     /// Resize the array part to exactly `n` slots. Growing fills the new slots
     /// with `nil` (holes); shrinking simply drops the tail. Lane is preserved.
     pub fn resize(self: *ArrayPart, gpa: std.mem.Allocator, n: usize) std.mem.Allocator.Error!void {
@@ -850,13 +900,7 @@ pub const ArrayPart = extern struct {
     /// new slots are written by the caller (`append`/`resize`) before being read.
     fn ensureCapacity(self: *ArrayPart, gpa: std.mem.Allocator, needed: usize) std.mem.Allocator.Error!void {
         if (needed <= self.cap) return;
-        // Cap growth so the widest-lane byte math (`cap * @sizeOf(Value)`) can never
-        // overflow `usize` — critical on wasm32 where `usize` is 32-bit, since a
-        // wrapped (tiny) allocation behind a huge `cap` would be a heap overflow.
-        const max_cap = std.math.maxInt(usize) / @sizeOf(Value);
-        if (needed > max_cap) return error.OutOfMemory;
-        var new_cap = if (self.cap == 0) first_cap else self.cap;
-        while (new_cap < needed) new_cap = @min(new_cap *| 2, max_cap);
+        const new_cap = try self.grownCap(needed);
 
         // Allocate the new block before freeing or mutating anything, so an OOM
         // leaves `self` as it was.
@@ -881,13 +925,32 @@ pub const ArrayPart = extern struct {
         self.cap = new_cap;
     }
 
+    /// The capacity growth to at least `needed` slots (`needed > cap`)
+    /// allocates: `first_cap`, doubling.
+    fn grownCap(self: *const ArrayPart, needed: usize) std.mem.Allocator.Error!usize {
+        std.debug.assert(needed > self.cap);
+        // Cap growth so the widest-lane byte math (`cap * @sizeOf(Value)`) can never
+        // overflow `usize` — critical on wasm32 where `usize` is 32-bit, since a
+        // wrapped (tiny) allocation behind a huge `cap` would be a heap overflow.
+        const max_cap = std.math.maxInt(usize) / @sizeOf(Value);
+        if (needed > max_cap) return error.OutOfMemory;
+        var new_cap = if (self.cap == 0) first_cap else self.cap;
+        while (new_cap < needed) new_cap = @min(new_cap *| 2, max_cap);
+        return new_cap;
+    }
+
     /// Convert the array part to `target` by re-encoding every live slot through
     /// a logical `Value`. Allocates fresh storage sized to the current `cap`,
     /// copies, then frees the old block.
     fn convert(self: *ArrayPart, gpa: std.mem.Allocator, target: Lane) std.mem.Allocator.Error!void {
+        return self.convertInto(gpa, target, self.cap);
+    }
+
+    /// `convert` into storage of `cap` slots (`>= asize`).
+    fn convertInto(self: *ArrayPart, gpa: std.mem.Allocator, target: Lane, cap: usize) std.mem.Allocator.Error!void {
         std.debug.assert(self.lane != .grid and target != .grid); // grid migration is a reshape, not a lane convert
         std.debug.assert(target != self.lane);
-        const cap = self.cap;
+        std.debug.assert(cap >= self.asize);
 
         const new = try allocStorage(gpa, target, cap);
 
@@ -910,17 +973,10 @@ pub const ArrayPart = extern struct {
         self.* = dst;
     }
 
-    /// Monotonic widen: climb the lane lattice just enough to hold `val`, which
-    /// the caller has determined does **not** fit the current (narrow) lane. An
-    /// int that outgrows its lane steps up to the next int lane (i8→i16→i32→i64);
-    /// any type-incompatible value (a float into an int lane, a bool into an int
-    /// lane, a heap value, …) falls straight to `.value`. The lane never narrows
-    /// again, so over an array's lifetime it crosses at most a handful of
-    /// boundaries — total widening work is amortised O(1) per slot, and the
-    /// repeated-repack attack (re-narrowing at every rehash) is structurally gone.
-    fn widenFor(self: *ArrayPart, gpa: std.mem.Allocator, val: Value) std.mem.Allocator.Error!void {
-        std.debug.assert(self.lane.isNarrow()); // `.value` fits everything; caller short-circuits
-        const target: Lane = switch (self.lane) {
+    /// The lane `widenFor` climbs to for `val`, which does not fit the narrow
+    /// `lane`. Also `storeRun`'s fold, so the two cannot drift.
+    fn widenTarget(lane: Lane, val: Value) Lane {
+        return switch (lane) {
             .value => unreachable,
             // A non-fitting int needs a strictly wider int lane (`intLaneFor`
             // returns the narrowest covering it, which is necessarily > current,
@@ -940,6 +996,19 @@ pub const ArrayPart = extern struct {
             // gridSet); `setInPlace`/`append` assert `lane != .grid` upstream.
             .grid => unreachable,
         };
+    }
+
+    /// Monotonic widen: climb the lane lattice just enough to hold `val`, which
+    /// the caller has determined does **not** fit the current (narrow) lane. An
+    /// int that outgrows its lane steps up to the next int lane (i8→i16→i32→i64);
+    /// any type-incompatible value (a float into an int lane, a bool into an int
+    /// lane, a heap value, …) falls straight to `.value`. The lane never narrows
+    /// again, so over an array's lifetime it crosses at most a handful of
+    /// boundaries — total widening work is amortised O(1) per slot, and the
+    /// repeated-repack attack (re-narrowing at every rehash) is structurally gone.
+    fn widenFor(self: *ArrayPart, gpa: std.mem.Allocator, val: Value) std.mem.Allocator.Error!void {
+        std.debug.assert(self.lane.isNarrow()); // `.value` fits everything; caller short-circuits
+        const target = widenTarget(self.lane, val);
         std.debug.assert(target != self.lane);
         try self.convert(gpa, target);
     }
@@ -1298,6 +1367,101 @@ test "seedFresh leaves a fresh part exactly as seedAt does" {
             }
         }
     }
+}
+
+test "storeRun ends where the sequential stores end" {
+    const gpa = testing.allocator;
+    var hdr = object.GcHeader.init(.table); // tag-only; never dereferenced
+    const Run = struct {
+        s: []const Value,
+        pub fn get(self: @This(), i: usize) Value {
+            return self.s[i];
+        }
+    };
+    const I = Value.int;
+    const runs = [_][]const Value{
+        &.{I(7)},
+        &.{ I(1), I(2), I(3) },
+        &.{ I(1), I(300), I(-2) }, // u8 -> i16
+        &.{ I(-1), I(200), I(1 << 20) }, // i8 -> i16 -> i32
+        &.{ I(1), I(1 << 40) }, // u8 -> i64
+        &.{ I(5), Value.heap(&hdr), I(6) }, // u8 -> value: the binary-trees node
+        &.{ Value.heap(&hdr), I(1), I(2) }, // value, never frozen
+        &.{ Value.boolean(true), Value.boolean(false) },
+        &.{ Value.boolean(true), I(1) }, // boolean -> value
+        &.{ Value.float(1.5), Value.float(-2.0) },
+        &.{ Value.float(1.5), I(2) }, // f64 -> value
+        &.{ I(2), Value.float(0.5) }, // u8 -> value
+    };
+    for (runs) |run| {
+        // A fresh part, seeded at key 0 or 1; then an append run onto a part
+        // already holding a prefix of it.
+        for ([_]usize{ 0, 1 }) |k0| {
+            var a: ArrayPart = .empty;
+            defer a.deinit(gpa);
+            var b: ArrayPart = .empty;
+            defer b.deinit(gpa);
+            try a.seedAt(gpa, @intCast(k0), run[0]);
+            for (run[1..]) |v| try a.append(gpa, v);
+            try b.storeRun(gpa, k0, Run{ .s = run }, run.len);
+            try testing.expectEqual(k0 + run.len, b.cap); // exact (doc 72 Q2)
+            try expectSameArray(&a, &b);
+        }
+        for (1..run.len) |split| {
+            var a: ArrayPart = .empty;
+            defer a.deinit(gpa);
+            var b: ArrayPart = .empty;
+            defer b.deinit(gpa);
+            try a.seedAt(gpa, 1, run[0]);
+            try b.seedAt(gpa, 1, run[0]);
+            for (run[1..split]) |v| {
+                try a.append(gpa, v);
+                try b.append(gpa, v);
+            }
+            for (run[split..]) |v| try a.append(gpa, v);
+            try b.storeRun(gpa, b.asize, Run{ .s = run[split..] }, run.len - split);
+            try expectSameArray(&a, &b);
+        }
+    }
+}
+
+/// The lane, frozen bit, extent and every slot's logical value agree.
+fn expectSameArray(a: *const ArrayPart, b: *const ArrayPart) !void {
+    try testing.expectEqual(a.lane, b.lane);
+    try testing.expectEqual(a.frozen, b.frozen);
+    try testing.expectEqual(a.asize, b.asize);
+    try testing.expectEqual(a.present == null, b.present == null);
+    var i: usize = 0;
+    while (i < a.asize) : (i += 1) {
+        try testing.expectEqual(a.get(i).tag, b.get(i).tag);
+        try testing.expectEqual(a.get(i).payload.bits, b.get(i).payload.bits);
+    }
+}
+
+test "storeRun leaves the part untouched when it runs out of memory" {
+    const Run = struct {
+        s: []const Value,
+        pub fn get(self: @This(), i: usize) Value {
+            return self.s[i];
+        }
+    };
+    const run = [_]Value{ Value.int(1), Value.float(2.5), Value.int(3) };
+    var fail = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var a: ArrayPart = .empty;
+    try testing.expectError(error.OutOfMemory, a.storeRun(fail.allocator(), 1, Run{ .s = &run }, run.len));
+    try testing.expectEqual(@as(usize, 0), a.cap);
+    try testing.expectEqual(Lane.value, a.lane);
+    try testing.expect(!a.frozen);
+
+    // An append run that must widen: the conversion fails, the prefix stays.
+    var b: ArrayPart = .empty;
+    defer b.deinit(testing.allocator);
+    try b.seedAt(testing.allocator, 1, Value.int(1));
+    var fail2 = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, b.storeRun(fail2.allocator(), 2, Run{ .s = run[1..] }, 2));
+    try testing.expectEqual(Lane.u8, b.lane);
+    try testing.expectEqual(@as(usize, 2), b.asize);
+    try testing.expectEqual(@as(i64, 1), b.get(1).asInt());
 }
 
 test "boolean lane: repack packs true/false/hole at one byte/slot, presence in-band" {

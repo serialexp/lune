@@ -3797,3 +3797,74 @@ test "an append stores, and leaves the rest to the full store" {
         "20\t20\nnil\t2=5\n3\t30\n4\tx\t1.5\n5\t6\t1\ntrue\tfalse\t1.5\t2\ta\tnil\tc\n2\t1\t1\nnil\t1=7\n",
     );
 }
+
+test "a constructor's positional runs end as the sequential stores would" {
+    // Doc 72: a run of positional values is one `set_list`; a lane change,
+    // a hole, a keyed field before or inside the constructor, a named field
+    // between runs, a run longer than one batch and an erroring field all
+    // end where the old per-field stores did (LuaJIT's results).
+    try expectProgram(
+        \\local t = { 5, 300, -2 }
+        \\print(#t, t[1], t[2], t[3])
+        \\t = { 1, {}, 2 }
+        \\print(#t, type(t[2]), t[3])
+        \\t = { 1, nil, 3 }
+        \\print(#t, t[3])
+        \\t = { "b", [1] = "a", "c" }
+        \\print(t[1], t[2])
+        \\t = { 1, 2, [3] = 9, 4 }
+        \\print(#t, t[3], t[4])
+        \\t = { [2] = 9, 1 }
+        \\print(#t, t[2])
+        \\t = { x = 1, 10, y = 2, 20 }
+        \\print(#t, t[1], t[2], t.x, t.y)
+        \\t = { { 1, 2 }, { 3, { 4 } } }
+        \\print(t[2][2][1])
+        \\t = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70 }
+        \\print(#t, t[64], t[65], t[70])
+        \\print(pcall(function() return { 1, 2, error("boom", 0), 4 } end))
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  local p = { i, i + 1, true }
+        \\  s = s + #p + p[2]
+        \\end
+        \\print(s)
+        \\
+    ,
+        "3\t5\t300\t-2\n3\ttable\t2\n1\t3\na\tc\n3\t4\tnil\n2\t9\n2\t10\t20\t1\t2\n4\n70\t64\t65\t70\nfalse\tboom\n46350\n",
+    );
+}
+
+test "a constructor's trailing call or `...` expands to all its values" {
+    // Doc 72 Q1: as in Lua and LuaJIT; a call that is not last, or is
+    // parenthesised, is one value.
+    try expectProgram(
+        \\local function f() return 1, 2, 3 end
+        \\local function none() end
+        \\local function pack(...) return { ... } end
+        \\local function pack0(...) return { 0, ... } end
+        \\local t = { f() }
+        \\print(#t, t[3])
+        \\t = { 0, f() }
+        \\print(#t, t[4])
+        \\t = { f(), 0 }
+        \\print(#t, t[2])
+        \\t = { (f()) }
+        \\print(#t)
+        \\t = { none() }
+        \\print(#t)
+        \\t = { f(), x = 1 }
+        \\print(#t, t.x)
+        \\print(#pack(), #pack(4, 5, 6), pack(4, 5, 6)[3], #pack0(7, 8), pack0(7, 8)[3])
+        \\t = { 1, 2, f() }
+        \\print(#t, t[5])
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  s = s + #pack(i, i, i) + #{ f() }
+        \\end
+        \\print(s)
+        \\
+    ,
+        "3\t3\n4\t3\n2\t0\n1\n0\n1\t1\n0\t3\t6\t3\t8\n5\t3\n1800\n",
+    );
+}

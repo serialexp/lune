@@ -1,3 +1,18 @@
+DOC 72 P0–P2: TABLE CONSTRUCTORS (2026-10-23, coral-marten).
+- `new_table a, c` pre-sizes the hash part for more than three named/keyed
+  fields (`opNewTableSized`, a cold lane). A run of positional values
+  compiles into consecutive registers and stores with one `set_list a, b,
+  c` + aux (values `R[a..a+b)`, table `R[c]`, first key aux), up to 64 per
+  instruction; `Table.storeRun` takes the leading appends in one allocation
+  in the lane the sequential stores end on, the rest go through `indexSet`.
+  A trailing call or `...` expands (`b = all_results`, a multret consumer).
+- binary-trees −13.8% t0 / −6.6% JIT; `{i,t,t}` 1356 → 702 instructions.
+  Liveness decodes dynamic producers once into a bitset
+  (`compile_multret_chain` −0.9%); the operand layout is why (doc 72 §4.2,
+  §4.6). Board otherwise ±0.02%, outputs identical, binary-trees' two
+  constructor abort rows move `bad_type` → `nyi_opcode` (same sites).
+- Open: P3 (record `set_list` once doc 45's `tset` lands); TDUP deferred.
+
 DOC 68 P1 SLICE 2: PCALL/XPCALL AS FRAME TAGS (2026-10-23, coral-raven).
 - A `pcall`/`xpcall` body is an ordinary frame tagged `ctl.protect`
   (LuaJIT FRAME_PCALL), entered by `opProtectedEntry`/`enterCallee` on the

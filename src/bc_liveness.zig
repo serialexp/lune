@@ -251,6 +251,16 @@ fn effectOf(ins: Instr, pc: u32, code_len: usize) Effect {
             e.succ[0] = next;
         },
         .itern => return @call(.never_inline, iternEffect, .{ ins, next }),
+        // Doc 72: the run of values, fixed or up to the top (a trailing
+        // call's or `...`'s), and the table. Nothing is written. Its
+        // operands sit where `ret`'s do: with the run anywhere but `a`, the
+        // arm costs `effectOf` a callee-saved register on every
+        // instruction (`compile_multret_chain` +0.08% to +0.25%).
+        .set_list => {
+            e.useRange(a, if (ins.b == bytecode.all_results) to_top else a + @as(u32, ins.b));
+            e.use(ins.c);
+            e.succ[0] = next;
+        },
         .ret => {
             e.useRange(a, if (ins.b == bytecode.all_results) to_top else a + @as(u32, ins.b));
             // No successor: the frame is gone.
@@ -336,6 +346,15 @@ pub fn compute(
         }
     }
 
+    // The dynamic producers, decoded once: the worklist asks after them
+    // and their neighbours on every visit.
+    const producers = try scratch.alloc(u64, (n + 63) / 64);
+    defer scratch.free(producers);
+    @memset(producers, 0);
+    for (0..n) |i| {
+        if (dynamicProducerBase(code, i) != null) setBit(producers, @intCast(i));
+    }
+
     // Worklist as a bitset, drained in rounds of DESCENDING pc (the natural
     // order for a backward problem on the compiler's forward-laid-out code).
     // Round 1 visits every pc once — an ordinary backward sweep. After that
@@ -360,7 +379,7 @@ pub fn compute(
                 const b: u6 = @intCast(63 - @clz(queued[w]));
                 queued[w] &= ~(@as(u64, 1) << b);
                 const i: usize = w * 64 + b;
-                if (visit(i, code, bits, words, row, &keep, valid, captured, num_registers)) {
+                if (visit(i, code, producers, bits, words, row, &keep, valid, captured, num_registers)) {
                     for (preds[pred_off[i]..pred_off[i + 1]]) |p| {
                         queued[p / 64] |= @as(u64, 1) << @intCast(p % 64);
                         // A higher pc in an already-drained word waits for
@@ -370,7 +389,7 @@ pub fn compute(
                     // A dynamic producer also reads the row just past its
                     // consumer (`producerSurvivors`), which is not a CFG
                     // edge.
-                    if (i >= 2 and dynamicProducerBase(code, i - 2) != null)
+                    if (i >= 2 and testBit(producers, i - 2))
                         queued[(i - 2) / 64] |= @as(u64, 1) << @intCast((i - 2) % 64);
                 }
                 // A producer's survivors extend those of the producer it
@@ -378,7 +397,7 @@ pub fn compute(
                 // row or not (the shared row hides survivor changes).
                 // Lower pcs: this round still drains them, top-down, so the
                 // cache in `producerSurvivors` hits.
-                if (i >= 1 and dynamicProducerBase(code, i - 1) != null and dynamicProducerBase(code, i) != null)
+                if (i >= 1 and testBit(producers, i - 1) and testBit(producers, i))
                     queued[(i - 1) / 64] |= @as(u64, 1) << @intCast((i - 1) % 64);
             }
         }
@@ -390,6 +409,7 @@ pub fn compute(
 fn visit(
     i: usize,
     code: []const Instr,
+    producers: []const u64,
     bits: []u64,
     words: usize,
     row: []u64,
@@ -427,8 +447,9 @@ fn visit(
         // read keeps `R[p..)` live back through the code, and a caller
         // suspended at any earlier call would look as if it held values
         // above its call base (doc 61 §5).
-        if (dynamicProducerBase(code, i)) |p| {
-            producerSurvivors(code, bits, words, i, keep);
+        if (testBit(producers, i)) {
+            const p: u32 = code[i].a;
+            producerSurvivors(code, producers, bits, words, i, keep);
             for (row, keep.row, 0..) |*d, kp, wi| d.* &= belowMask(p, wi) | kp;
         }
         for (e.uses[0..e.n_uses]) |u| {
@@ -487,12 +508,11 @@ pub fn maskable(
             // itself a producer passes on what survives the next consumer,
             // so that one must sit adjacent at the same or a lower base:
             // then the chain inherits the property down to a fixed-`c`
-            // call or a `ret`.
+            // call, a `ret` or a `set_list`.
             if (ins.b == bytecode.all_results) {
                 if (pc + 1 >= code.len) return false;
                 const next = code[pc + 1];
-                const consumes = (next.op == .call or next.op == .ret) and next.b == bytecode.all_results;
-                if (!consumes or next.a > ins.a) return false;
+                if (!bytecode.isMultretConsumer(next) or next.a > ins.a) return false;
             }
             continue;
         }
@@ -512,8 +532,8 @@ pub fn maskable(
 
 /// The base `p` of a dynamic producer at `i` (`call` with `c = all_results`,
 /// or `vararg_spread`) whose next instruction is the multret consumer of its
-/// results (`call`/`ret` with `b = all_results`). Null for anything else,
-/// which keeps the conservative "kills nothing".
+/// results (`bytecode.isMultretConsumer`). Null for anything else, which
+/// keeps the conservative "kills nothing".
 fn dynamicProducerBase(code: []const Instr, i: usize) ?u32 {
     if (i + 1 >= code.len) return null;
     const ins = code[i];
@@ -523,9 +543,7 @@ fn dynamicProducerBase(code: []const Instr, i: usize) ?u32 {
         else => false,
     };
     if (!produces) return null;
-    const next = code[i + 1];
-    const consumes = (next.op == .call or next.op == .ret) and next.b == bytecode.all_results;
-    return if (consumes) ins.a else null;
+    return if (bytecode.isMultretConsumer(code[i + 1])) ins.a else null;
 }
 
 /// The last survivor set `producerSurvivors` computed, and the producer pc
@@ -542,35 +560,37 @@ const KeepCache = struct {
 /// The worklist drains a chain top-down, so the cache nearly always hits,
 /// and a chain of length L costs O(L · words), not O(L² · words). The
 /// fallback walks the chain.
-fn producerSurvivors(code: []const Instr, bits: []const u64, words: usize, i: usize, cache: *KeepCache) void {
+fn producerSurvivors(code: []const Instr, producers: []const u64, bits: []const u64, words: usize, i: usize, cache: *KeepCache) void {
     const j = i + 1;
     hit: {
-        if (cache.pc != j) break :hit;
-        const a = dynamicProducerBase(code, j) orelse break :hit;
+        if (cache.pc != j or !testBit(producers, j)) break :hit;
+        const a: u32 = code[j].a;
         const after = bits[(j + 1) * words ..][0..words];
         for (cache.row, after, 0..) |*d, v, wi| d.* |= v & belowMask(a, wi);
         cache.pc = i;
         return;
     }
-    survivorsOfConsumer(code, bits, words, j, cache.row);
+    survivorsOfConsumer(code, producers, bits, words, j, cache.row);
     cache.pc = i;
 }
 
 /// Into `out`: the registers live after the multret consumer at `j` and not
 /// written by it — `live_out[j] − kill[j]`, read from the rows already in
 /// `bits`. A `ret` leaves nothing live. A fixed-`c` call writes exactly
-/// `R[a..a+c)`. A consumer that is itself a dynamic producer (`f(g(h()))`)
+/// `R[a..a+c)`; a `set_list` writes no register. A consumer that is itself
+/// a dynamic producer (`f(g(h()))`)
 /// writes nothing below its own base and, above it, passes on what survives
 /// ITS consumer — so the walk follows the chain. Only the bits the caller
 /// tests (`≥` the producer's base) need be exact; the rest are harmless.
-fn survivorsOfConsumer(code: []const Instr, bits: []const u64, words: usize, consumer: usize, out: []u64) void {
+fn survivorsOfConsumer(code: []const Instr, producers: []const u64, bits: []const u64, words: usize, consumer: usize, out: []u64) void {
     @memset(out, 0);
     var j = consumer;
     while (true) {
         const ins = code[j];
         if (ins.op == .ret or j + 1 >= code.len) return;
         const after = bits[(j + 1) * words ..][0..words];
-        if (dynamicProducerBase(code, j)) |a| {
+        if (testBit(producers, j)) {
+            const a: u32 = ins.a;
             // Survives below `a` (untouched); above, whatever survives
             // the next consumer — the next iteration ORs that in.
             for (out, after, 0..) |*d, v, wi| d.* |= v & belowMask(a, wi);
@@ -578,7 +598,7 @@ fn survivorsOfConsumer(code: []const Instr, bits: []const u64, words: usize, con
             continue;
         }
         for (out, after) |*d, v| d.* |= v;
-        if (ins.c != bytecode.all_results) {
+        if (ins.op == .call and ins.c != bytecode.all_results) {
             var k: u32 = ins.a;
             while (k < @as(u32, ins.a) + ins.c and k / 64 < words) : (k += 1) clearBit(out, k);
         }
@@ -600,6 +620,10 @@ fn setBit(ws: []u64, r: u32) void {
 
 fn clearBit(ws: []u64, r: u32) void {
     ws[r / 64] &= ~(@as(u64, 1) << @intCast(r % 64));
+}
+
+fn testBit(ws: []const u64, r: usize) bool {
+    return ws[r / 64] & (@as(u64, 1) << @intCast(r % 64)) != 0;
 }
 
 // ---------------------------------------------------------------------------

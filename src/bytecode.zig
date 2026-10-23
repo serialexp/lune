@@ -131,7 +131,11 @@ pub const OpCode = enum(u8) {
     tfor_loop,
 
     // ---- tables   (Increment B/E) ----
-    /// `a`         R[a] = {}   (new empty table)
+    /// `a, c`      R[a] = {}   (new empty table), its hash part allocated for
+    ///             `c` keys: a constructor's named and keyed fields (doc 72
+    ///             P0). `c = 0` allocates none, and is what the compiler
+    ///             emits for no more keys than the first insertion's
+    ///             allocation holds.
     new_table,
     /// `a, b, c`   R[a] = R[b][R[c]]
     get_index,
@@ -345,7 +349,32 @@ pub const OpCode = enum(u8) {
     ///             the step runs inline without a call; anything else is
     ///             exactly that sequence (`callOperandsOf`).
     itern,
+
+    // ---- table constructor (doc 72 P1, Lua's `SETLIST`, LuaJIT `TSETM`) ----
+    /// `a, b, c, aux`  R[c][aux + i] = R[a + i] for i in 0..b: a constructor's
+    ///             run of positional values, stored in order. `b =
+    ///             all_results` is the consumer of a trailing call's or
+    ///             `...`'s values (the count is `reg_top` minus `a`), with
+    ///             the operands where a multret `call`'s and `ret`'s are:
+    ///             the run's base in `a`, its count in `b`. A run ends at a
+    ///             named or keyed field, which stores after it, so the
+    ///             stores are the sequential ones in source order;
+    ///             `Table.storeRun` takes the run in one step when they are
+    ///             appends.
+    set_list,
 };
+
+/// The most values one `set_list` stores from fixed registers (a longer
+/// constructor takes several; Lua flushes at 50).
+pub const set_list_batch: u16 = 64;
+
+/// Whether `ins` is the consumer of a dynamic multret producer (`call` with
+/// `c = all_results`, `vararg_spread`), which reads its count from the
+/// transient `Vm.reg_top`: a `call`, `ret` or `set_list` with `b =
+/// all_results`. Each reads `R[a ..)` up to the top.
+pub inline fn isMultretConsumer(ins: Instr) bool {
+    return (ins.op == .call or ins.op == .ret or ins.op == .set_list) and ins.b == all_results;
+}
 
 /// Doc 66 P5: the immediate operand of `eq_p`/`ne_p`.
 pub const Prim = enum(u16) {
@@ -1192,7 +1221,12 @@ pub fn writeInstr(w: *io.Writer, instr: Instr) io.Writer.Error!void {
     switch (instr.op) {
         .halt => {},
         .jmp => try w.print(" {d:>4}", .{instr.aux}),
-        .load_nil, .new_table, .close_upvalues, .vararg_first, .vararg_len, .vararg_spread => try w.print(" r{d}", .{instr.a}),
+        .load_nil, .close_upvalues, .vararg_first, .vararg_len, .vararg_spread => try w.print(" r{d}", .{instr.a}),
+        .new_table => try w.print(" r{d}  {d}", .{ instr.a, instr.c }),
+        .set_list => if (instr.b == all_results)
+            try w.print(" r{d}  *  r{d}  {d}", .{ instr.a, instr.c, instr.aux })
+        else
+            try w.print(" r{d}  {d}  r{d}  {d}", .{ instr.a, instr.b, instr.c, instr.aux }),
         .load_int => try w.print(" r{d}  {d}", .{ instr.a, instr.aux }),
         .jmp_if_false, .jmp_if_true, .jmp_if_not_nil, .for_prep, .for_loop => try w.print(" r{d}  {d:>4}", .{ instr.a, instr.aux }),
         // Doc 58: the loop kind and the exit offset (a fall-through op).

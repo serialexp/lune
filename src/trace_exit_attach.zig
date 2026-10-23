@@ -36,9 +36,10 @@
 //!   8. `P` is not a loop header, and a continuation started at `P`
 //!      reaches an enclosing back-edge (`continuationReachesEnclosingBackEdge`,
 //!      the loop-done continuation's own gate);
-//!   9. `P` is not the CONSUMER half of a multret pair (a `call`/`ret` whose
-//!      `b` is `all_results`): tier-0 reads its count from the transient
-//!      `Vm.reg_top` its producer stamped, which no snapshot carries.
+//!   9. `P` is not the CONSUMER half of a multret pair
+//!      (`bytecode.isMultretConsumer`): tier-0 reads its count from the
+//!      transient `Vm.reg_top` its producer stamped, which no snapshot
+//!      carries.
 
 const std = @import("std");
 const bytecode = @import("bytecode.zig");
@@ -461,15 +462,9 @@ fn operandReady(code: *const TraceCode, r: Ref, gi: usize) bool {
 }
 
 /// Rule 9: `ins` reads `Vm.reg_top`, which only the instruction right
-/// before it (its multret producer) sets — `interp.zig`'s `call` argument
-/// count and `ret` result count under `all_results` are the only readers.
-/// Resuming there after a materialize would read a stale or garbage top.
-fn isMultretConsumer(ins: Instr) bool {
-    return switch (ins.op) {
-        .call, .ret => ins.b == bytecode.all_results,
-        else => false,
-    };
-}
+/// before it (its multret producer) sets. Resuming there after a
+/// materialize would read a stale or garbage top.
+const isMultretConsumer = bytecode.isMultretConsumer;
 
 fn isLoopHeader(proto: *const Proto, p: u32, headers: ?[]const u8) bool {
     if (headers) |h| return (h[p >> 3] >> @intCast(p & 7)) & 1 != 0;
