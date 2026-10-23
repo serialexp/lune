@@ -3760,9 +3760,10 @@ test "arithmetic, unary and length fall back to their metamethods" {
 
 test "an append stores, and leaves the rest to the full store" {
     // `set_index`'s append lane takes only a plain store into allocated
-    // capacity: a `__newindex` on the successor key, a successor already in
-    // the hash part, a value that widens the lane and a full array take the
-    // full store.
+    // capacity, or a fresh table's first store at key 0 or 1: a `__newindex`
+    // on the key, a successor already in the hash part, a fresh table with a
+    // hash part, a value that widens the lane and a full array take the full
+    // store.
     try expectProgram(
         \\local t = { 1, 2 }
         \\for i = 3, 20 do t[i] = i end
@@ -3779,8 +3780,20 @@ test "an append stores, and leaves the rest to the full store" {
         \\w[3] = "x"
         \\w[4] = 1.5
         \\print(#w, w[3], w[4])
+        \\local z = {}
+        \\z[0] = 5
+        \\z[1] = 6
+        \\print(z[0], z[1], #z)
+        \\local b, f, s = { true, false }, { 1.5, 2 }, { "a", nil, "c" }
+        \\print(b[1], b[2], f[1], f[2], s[1], s[2], s[3])
+        \\local q = { x = 1 }
+        \\q[1] = 2
+        \\print(q[1], q.x, #q)
+        \\local n = setmetatable({}, { __newindex = function(_, k, v) log[#log + 1] = k .. "=" .. v end })
+        \\n[1] = 7
+        \\print(rawget(n, 1), log[2])
         \\
     ,
-        "20\t20\nnil\t2=5\n3\t30\n4\tx\t1.5\n",
+        "20\t20\nnil\t2=5\n3\t30\n4\tx\t1.5\n5\t6\t1\ntrue\tfalse\t1.5\t2\ta\tnil\tc\n2\t1\t1\nnil\t1=7\n",
     );
 }

@@ -3744,6 +3744,19 @@ pub const Vm = struct {
         return @call(.always_tail, table_[@intFromEnum(lane)], .{ st, pc, instr, vm, tags, payloads });
     }
 
+    /// Where `set_index`'s append lane sends a store that is not an append:
+    /// the seed lane when the table has no array storage yet, else the slow
+    /// handler. The runtime index keeps LLVM from inlining the seed, whose
+    /// allocator call would make every append save registers, as `itern`'s
+    /// lane byte does.
+    const set_index_seed_fast = [2]*const HandlerFn{ opSetIndexSlow(.fast), opSetIndexSeed(.fast) };
+    const set_index_seed_full = [2]*const HandlerFn{ opSetIndexSlow(.full), opSetIndexSeed(.full) };
+
+    inline fn setIndexSeedTail(comptime mode: ExecMode, fresh: bool, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+        const table_ = if (mode == .fast) &set_index_seed_fast else &set_index_seed_full;
+        return @call(.always_tail, table_[@intFromBool(fresh)], .{ st, pc, instr, vm, tags, payloads });
+    }
+
     fn noSlowPath(_: *ExecState, _: usize, instr: *const Instr, _: *Vm, _: [*]u8, _: [*]u64) HandlerResult {
         std.debug.panic("no slow handler for {s}", .{@tagName(instr.op)});
     }
@@ -8024,7 +8037,9 @@ pub const Vm = struct {
                                 break :fast;
                             }
                         }
-                        if (i == @as(i64, @intCast(tbl.array.asize)) and tbl.array.asize < tbl.array.cap) return coldTail(mode, st, pc, instr, vm, tags, payloads);
+                        const asize: i64 = @intCast(tbl.array.asize);
+                        if ((i == asize and asize < tbl.array.cap) or (tbl.array.cap == 0 and @as(u64, @bitCast(i)) <= 1))
+                            return coldTail(mode, st, pc, instr, vm, tags, payloads);
                     }
                     // Heap-key mirror (`t.name = v`): a key live in the hash
                     // part takes a non-nil value in place, which is what
@@ -8062,18 +8077,38 @@ pub const Vm = struct {
     }
 
     /// `set_index`'s append lane (`opSetIndex` leaves for it when the int key
-    /// is `#t`'s successor and the array has room; a full array's growth is
+    /// is `#t`'s successor and the array has room, or the table has no array
+    /// storage yet and the key is 0 or 1; a full array's growth is
     /// `opSetIndexSlow`'s): an append into allocated capacity (`t[#t+1] = v`,
     /// a constructor's next positional) is a store and nothing else, which
-    /// `indexSet` → `Table.set` would reach through four calls. Anything else
-    /// takes `opSetIndexSlow`.
+    /// `indexSet` → `Table.set` would reach through four calls. A fresh
+    /// table goes on to `opSetIndexSeed`, anything else to `opSetIndexSlow`.
     fn opSetIndexAppend(comptime mode: ExecMode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
                 const t = table.Table.fromHeader(regs.get(instr.a).asHeap());
                 const val = regs.get(instr.c);
-                if (!t.appendInCap(regs.get(instr.b).asInt(), val)) return slowTail(mode, st, pc, instr, vm, tags, payloads);
+                if (!t.appendInCap(regs.get(instr.b).asInt(), val))
+                    return setIndexSeedTail(mode, t.array.cap == 0, st, pc, instr, vm, tags, payloads);
+                vm.heap.writeBarrier(&t.header, val); // no-op until Phase 4
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// `set_index`'s seed lane: a fresh table's first store at key 0 or 1,
+    /// one allocation rather than `indexSet` → `Table.set` → `seedAt`. Its
+    /// own handler, so the allocator call stays out of `opSetIndexAppend` and
+    /// an append saves no registers. Anything else takes `opSetIndexSlow`.
+    fn opSetIndexSeed(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const t = table.Table.fromHeader(regs.get(instr.a).asHeap());
+                const val = regs.get(instr.c);
+                const seeded = t.seedFresh(vm.gpa, regs.get(instr.b).asInt(), val) catch |e| return parkErr(st, e);
+                if (!seeded) return slowTail(mode, st, pc, instr, vm, tags, payloads);
                 vm.heap.writeBarrier(&t.header, val); // no-op until Phase 4
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }

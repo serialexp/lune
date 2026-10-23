@@ -446,6 +446,27 @@ pub const ArrayPart = extern struct {
         self.encode(1, val);
     }
 
+    /// `seedAt` for a part that has never had storage (`cap == 0`, so `.value`
+    /// and unfrozen): the same end state — the lane `commitFreshLane` commits,
+    /// frozen when narrow, the first growth's capacity — from one allocation
+    /// and none of the capacity checks. Every table's first array store takes
+    /// it, through `set_index`'s cold lane. OOM leaves the part untouched.
+    pub fn seedFresh(self: *ArrayPart, gpa: std.mem.Allocator, k: i64, val: Value) std.mem.Allocator.Error!void {
+        std.debug.assert(self.cap == 0 and self.asize == 0 and self.lane == .value and !self.frozen);
+        std.debug.assert(!val.isNil());
+        std.debug.assert(k == 0 or k == 1);
+        const lane = laneForValue(val);
+        const storage = try allocStorage(gpa, lane, first_cap);
+        self.lane = lane;
+        self.frozen = lane.isNarrow();
+        self.cap = first_cap;
+        self.data = storage.data;
+        self.present = storage.present;
+        self.asize = @intCast(k + 1);
+        if (k == 1) self.encode(0, Value.nil()); // slot-0 hole
+        self.encode(@intCast(k), val);
+    }
+
     /// Resize the array part to exactly `n` slots. Growing fills the new slots
     /// with `nil` (holes); shrinking simply drops the tail. Lane is preserved.
     pub fn resize(self: *ArrayPart, gpa: std.mem.Allocator, n: usize) std.mem.Allocator.Error!void {
@@ -820,6 +841,9 @@ pub const ArrayPart = extern struct {
         if (data) |d| gpa.free(d[0..storageBytes(lane, cells)]);
     }
 
+    /// The capacity an array part's first growth allocates.
+    const first_cap: usize = 8;
+
     /// Ensure `cap >= needed`, reallocating the storage block and preserving
     /// existing contents. New capacity grows
     /// geometrically. New slots are left absent (presence zeroed); `.value`
@@ -831,7 +855,7 @@ pub const ArrayPart = extern struct {
         // wrapped (tiny) allocation behind a huge `cap` would be a heap overflow.
         const max_cap = std.math.maxInt(usize) / @sizeOf(Value);
         if (needed > max_cap) return error.OutOfMemory;
-        var new_cap = if (self.cap == 0) @as(usize, 8) else self.cap;
+        var new_cap = if (self.cap == 0) first_cap else self.cap;
         while (new_cap < needed) new_cap = @min(new_cap *| 2, max_cap);
 
         // Allocate the new block before freeing or mutating anything, so an OOM
@@ -1248,6 +1272,32 @@ test "a narrow lane's presence bitmap shares its data block" {
 
     a.deinit(gpa);
     tracking.assertNoLeaks();
+}
+
+test "seedFresh leaves a fresh part exactly as seedAt does" {
+    const gpa = testing.allocator;
+    var hdr = object.GcHeader.init(.table); // tag-only; never dereferenced
+    const vals = [_]Value{ Value.int(3), Value.int(-5), Value.int(1000), Value.int(1 << 40), Value.boolean(false), Value.float(2.5), Value.heap(&hdr) };
+    for (vals) |v| {
+        for ([_]i64{ 0, 1 }) |k| {
+            var a: ArrayPart = .empty;
+            defer a.deinit(gpa);
+            var b: ArrayPart = .empty;
+            defer b.deinit(gpa);
+            try a.seedAt(gpa, k, v);
+            try b.seedFresh(gpa, k, v);
+            try testing.expectEqual(a.lane, b.lane);
+            try testing.expectEqual(a.frozen, b.frozen);
+            try testing.expectEqual(a.asize, b.asize);
+            try testing.expectEqual(a.cap, b.cap);
+            try testing.expectEqual(a.present == null, b.present == null);
+            var i: usize = 0;
+            while (i < a.asize) : (i += 1) {
+                try testing.expectEqual(a.get(i).tag, b.get(i).tag);
+                try testing.expectEqual(a.get(i).payload.bits, b.get(i).payload.bits);
+            }
+        }
+    }
 }
 
 test "boolean lane: repack packs true/false/hole at one byte/slot, presence in-band" {

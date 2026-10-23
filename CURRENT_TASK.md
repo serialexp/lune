@@ -294,9 +294,16 @@ TIER-0 SPEEDUPS (2026-10-20, coral-marten): Bart: "take them in order of payoff 
     (`ArrayPart.allocStorage`), one allocation instead of two; `present`
     still points at it, so native code is unchanged. `{i}` 908 → 809,
     binary-trees −3.9% tier-0 / −1.9% JIT, lua54 −2.7%, tbl_ops −1.4%.
-    What's left in a positional constructor is the first store's path
-    (`indexSet` → `Table.set` → `seedAt` → `commitFreshLane` →
-    `ensureCapacity`) and the int→value convert in `{i, t, t}`.
+  - A fresh table's first store at key 0 or 1 takes `opSetIndexSeed`
+    (`ArrayPart.seedFresh`: `seedAt`'s end state from one allocation),
+    reached from the append lane through a two-entry runtime-indexed
+    table so the allocator call stays out of it. The append lane itself
+    had been calling `fits`/`appendInCap` out of line with a five-register
+    frame; `Table.appendInCap` now forces both inline. `{i}` 809 → 643,
+    `{i,i,i}` 1239 → 949 (LuaJIT `-joff` 502 / 571). What's left in a
+    positional constructor: the int→value convert in `{i, t, t}` (1356),
+    and the per-element `load_int` + `set_index` dispatch that a sized
+    `new_table` + batch store (Lua's SETLIST) would remove.
   - Doc 71, tier-0 upvalue access (`docs/design/71-tier0-upvalue-access.md`):
     a cell carries pointers to its value's two lanes (LuaJIT's `uv->v`),
     the cell pointers live inline in the closure, and `u = v` stores from

@@ -326,8 +326,24 @@ pub const Table = struct {
         const asize = self.array.asize;
         if (i != @as(i64, @intCast(asize)) or asize == 0 or asize >= self.array.cap) return false;
         if (self.metatable != null or self.hash.count() != 0 or val.isNil()) return false;
-        if (self.array.isGrid() or !self.array.fits(val)) return false;
-        self.array.appendInCap(val);
+        // Inlined here, so `set_index`'s append lane makes no call and saves
+        // no registers.
+        if (self.array.isGrid() or !@call(.always_inline, arr.ArrayPart.laneFits, .{ self.array.lane, val })) return false;
+        @call(.always_inline, arr.ArrayPart.appendInCap, .{ &self.array, val });
+        return true;
+    }
+
+    /// `t[i] = val` when it is the first store into a table that has never had
+    /// array storage, at one of the keys (0, 1) `set`'s fresh-part branches
+    /// seed, else `false` with nothing done. An empty hash part has nothing to
+    /// absorb or migrate, and with no metatable there is no `__newindex`.
+    pub inline fn seedFresh(self: *Table, gpa: std.mem.Allocator, i: i64, val: Value) Error!bool {
+        if (self.array.cap != 0 or @as(u64, @bitCast(i)) > 1) return false;
+        if (self.metatable != null or self.hash.count() != 0 or val.isNil()) return false;
+        // A never-allocated part is `.value` and unfrozen unless it is a
+        // zero-row grid or was restored with its lane committed.
+        if (self.array.lane != .value or self.array.frozen) return false;
+        try self.array.seedFresh(gpa, i, val);
         return true;
     }
 
