@@ -37,6 +37,7 @@ const irinterp = @import("irinterp.zig");
 const execlog = @import("execlog.zig");
 const compiler = @import("compiler.zig");
 const io = @import("io.zig");
+const system = @import("system.zig");
 const stdmath = @import("stdlib/math.zig");
 const stdtable = @import("stdlib/table.zig");
 const stdbase = @import("stdlib/base.zig");
@@ -86,20 +87,6 @@ pub const Error = error{
     /// its own — the host that constructs the VM must supply one (`main.zig` on
     /// native, the JS host on wasm, a fake in tests). Replay needs none.
     ClockUnavailable,
-    /// `random()` needed its seed (in `off`/`record` mode) but no
-    /// `random_seed_source` was injected. Mirrors `ClockUnavailable`: the VM holds
-    /// no entropy source of its own. Replay needs none (the seed is in the log).
-    RandomUnavailable,
-    /// A `getenv`/`argc`/`argv` effect ran (in `off`/`record` mode) but no
-    /// `host_env` source was injected. Mirrors `ClockUnavailable`: the VM holds no
-    /// platform environment/args of its own. Replay needs none (the results are in
-    /// the log). One error covers all three — they share the single `HostEnv` seam.
-    EnvUnavailable,
-    /// A `file_read` effect ran (in `off`/`record` mode) but no `fs_source` was
-    /// injected. Mirrors `EnvUnavailable`: the VM holds no filesystem of its own —
-    /// `loadfile`/`dofile` read through the embedder's `FsSource`. Replay needs none
-    /// (the file content is in the log).
-    FsUnavailable,
     /// Allocation failure (register stack, future heap).
     OutOfMemory,
     /// A mahina program raised a VALUE via `error(obj)`/`assert` (or a runtime fault
@@ -186,45 +173,19 @@ pub const ClockSource = struct {
 /// one (`main.zig` reads OS entropy, the wasm host imports `crypto.getRandomValues`,
 /// tests supply a fixed seed). Consulted once per run — lazily, on the first
 /// `random()` call — in `off`/`record`; `replay` reads the seed from the log.
+/// With none injected `random()` starts from `default_random_seed` (doc 65 Q4).
 pub const RandomSeedSource = struct {
     ctx: *anyopaque,
     seed: *const fn (ctx: *anyopaque) u64,
 };
 
-/// An embedder-supplied window onto the process environment and command-line
-/// args, backing the `getenv`/`argc`/`argv` effects. One combined source (not
-/// three) because they are the same host facility — the VM holds no platform
-/// access of its own (so it still compiles to `wasm32-freestanding`, where the
-/// browser host injects a null source). Consulted in `off`/`record`; `replay`
-/// reads results from the log. With no source set, those effects fail with
-/// `EnvUnavailable`. Returned byte slices are **borrowed** — valid only for the
-/// duration of the call — so the native interns them into the heap immediately.
-pub const HostEnv = struct {
-    ctx: *anyopaque,
-    /// Look up an environment variable by name. Null ⇒ unset (distinct from a
-    /// set-but-empty `""`, which returns a zero-length slice).
-    getenv: *const fn (ctx: *anyopaque, name: []const u8) ?[]const u8,
-    /// The number of command-line arguments visible to the program.
-    argCount: *const fn (ctx: *anyopaque) i64,
-    /// The i-th command-line argument. Null ⇒ index out of range (the source owns
-    /// the bounds check, so any out-of-range `i` — including negative — is null).
-    arg: *const fn (ctx: *anyopaque, i: i64) ?[]const u8,
-};
+/// The seed `math.random` starts from when the host supplies no entropy (doc 65
+/// Q4): an embedded VM is deterministic unless the host opts in.
+pub const default_random_seed: u64 = 0x6d61_6869_6e61_0001;
 
-/// An embedder-supplied filesystem read seam, backing the `file_read` effect
-/// (`loadfile`/`dofile`). The VM holds no filesystem of its own — so it still
-/// compiles to `wasm32-freestanding`, where the host injects a null source (or an
-/// in-memory one). Consulted in `off`/`record`; `replay` reads the file content
-/// from the log and never touches disk. With no source set, `loadfile`/`dofile`
-/// fail with `FsUnavailable`. The returned bytes are **borrowed** (valid only for
-/// the call) — the native interns them into the heap immediately, exactly like
-/// `HostEnv.getenv`. `null` ⇒ the file could not be opened (any reason); the
-/// caller turns that into Lua's `(nil, "cannot open <path>")`. The path is plain
-/// program data, so the source need not record it — only the content is the input.
-pub const FsSource = struct {
-    ctx: *anyopaque,
-    read: *const fn (ctx: *anyopaque, path: []const u8) ?[]const u8,
-};
+/// The host system seam (doc 65 §5): files, stdin, the environment and the
+/// wall clock. Defined in `system.zig`; re-exported because hosts name it here.
+pub const HostSystem = system.HostSystem;
 
 /// The built-in-native registry descriptor and the module-constant descriptor now
 /// live in `function.zig` (the dependency-light home alongside `NativeFn`/
@@ -304,8 +265,8 @@ const core_natives = [_]BaseNative{
     // serialized keyframe identity; `.module`/`.field` only drive table install,
     // exactly as `math.random` did. This drops the flat `clock` global and makes
     // `os` a known builtin via `builtin_global_names` (`bn.module orelse bn.name`).
-    .{ .name = "clock", .func = &nativeClock, .effect = .clock, .module = "os", .field = "clock" },
-    .{ .name = "nsclock", .func = &nativeNsClock, .effect = .clock, .module = "os", .field = "nsclock" },
+    .{ .name = "clock", .func = &nativeClock, .effect = .clock, .module = "os", .field = "clock", .group = .clock },
+    .{ .name = "nsclock", .func = &nativeNsClock, .effect = .clock, .module = "os", .field = "nsclock", .group = .clock },
     // `random`/`randomseed` carry no `effect`: the call itself isn't the boundary —
     // the *seed* is (acquired once, inside the native, as `.random_seed`). So the
     // dispatch calls them directly; the seed goes through record/replay internally.
@@ -315,11 +276,10 @@ const core_natives = [_]BaseNative{
     // pure `stdlib/math.zig`.
     .{ .name = "random", .func = &nativeRandom, .module = "math", .field = "random" },
     .{ .name = "randomseed", .func = &nativeRandomseed, .module = "math", .field = "randomseed" },
-    // env/args inputs — `clock`-style (the call site is the boundary). `getenv`
-    // and `argv` return heap strings, so the effect log carries inline bytes.
-    .{ .name = "getenv", .func = &nativeGetenv, .effect = .getenv },
-    .{ .name = "argc", .func = &nativeArgc, .effect = .argc },
-    .{ .name = "argv", .func = &nativeArgv, .effect = .argv },
+    // `os.getenv` — `clock`-style (the call site is the boundary); the result is
+    // a heap string or nil, so the effect log carries inline bytes. The program's
+    // arguments are the load-time `arg` table (doc 65 Q3: no `argc`/`argv`).
+    .{ .name = "getenv", .func = &nativeGetenv, .effect = .getenv, .module = "os", .field = "getenv", .group = .env },
     // `io.write` is a host-output call (no effect), installed into the `io` module
     // table. (`tonumber` and `string.format` moved to `stdlib/basic.zig` and
     // `stdlib/string.zig` respectively, keeping their serialized names.)
@@ -908,18 +868,16 @@ pub const Vm = struct {
     clock_source: ?ClockSource = null,
     /// Embedder-supplied entropy for `random()`'s seed (null = none injected).
     /// Read once, lazily, on the first `random()` in `off`/`record`; `replay`
-    /// reads the seed from the log instead. No source set ⇒ `RandomUnavailable`.
+    /// reads the seed from the log instead. No source set ⇒ the fixed
+    /// `default_random_seed` (still logged, so replay needs no source either).
     random_seed_source: ?RandomSeedSource = null,
-    /// Embedder-supplied env/args window for `getenv`/`argc`/`argv` (null = none).
-    /// Read in `off`/`record` (`main.zig` native = real process env + argv, the
-    /// wasm host = a null source); `replay` feeds results from the log. No source
-    /// set ⇒ `EnvUnavailable`.
-    host_env: ?HostEnv = null,
-    /// Embedder-supplied filesystem read seam for `loadfile`/`dofile` (null = none).
-    /// Read in `off`/`record` (`main.zig` native = real disk, the wasm host = a
-    /// null/in-memory source); `replay` feeds file content from the log. No source
-    /// set ⇒ `FsUnavailable`.
-    fs_source: ?FsSource = null,
+    /// The host system (doc 65 §5; null = none). Read in `off`/`record`;
+    /// `replay` feeds every result from the log and never calls it. With none,
+    /// `require`/`loadfile`/`dofile` find no files and a group's natives that
+    /// were installed anyway (a replay VM) report the `other` error class.
+    system: ?HostSystem = null,
+    /// The interface groups whose natives are installed (`enableSystem`).
+    system_groups: system.Groups = .none,
     /// The VM's PRNG, seeded lazily from the first `random()` call's seed (an
     /// effect). `std.Random.Xoshiro256` is pinned *by name* (not `DefaultPrng`) so
     /// the draw stream is a stable part of the language: a given seed reproduces
@@ -1791,7 +1749,10 @@ pub const Vm = struct {
     /// `base_natives` registry — the same table the keyframe restorer reads to
     /// rebind a serialized native by name, so install and restore can never drift.
     fn installBaseLib(self: *Vm) Error!void {
-        for (base_natives, &base_templates) |bn, *template| try self.defineNative(bn, template);
+        // A system group's natives wait for `enableSystem` (doc 65 Q5).
+        for (base_natives, &base_templates) |bn, *template| {
+            if (bn.group == null) try self.defineNative(bn, template);
+        }
         for (base_constants) |c| try self.defineConstant(c);
         // `arg` is a real (initially empty) table so the lint, tests, the wasm
         // host, and keyframe restore all see a table; `arg[i]` is nil until the
@@ -1818,6 +1779,19 @@ pub const Vm = struct {
         try stdpackage.installPackageRuntime(self);
     }
 
+    /// Install the natives of `groups` (doc 65 §5.2): the host's switch for
+    /// system access. Idempotent per group; a group is never uninstalled. The
+    /// host sets `system` (and the clock and seed sources) itself — a replay VM
+    /// enables the recording's groups with no host behind them.
+    pub fn enableSystem(self: *Vm, groups: system.Groups) Error!void {
+        for (base_natives, &base_templates) |bn, *template| {
+            const g = bn.group orelse continue;
+            if (groups.has(g) and !self.system_groups.has(g)) try self.defineNative(bn, template);
+        }
+        const before: u8 = @bitCast(self.system_groups);
+        self.system_groups = @bitCast(before | @as(u8, @bitCast(groups)));
+    }
+
     fn defineNative(self: *Vm, bn: BaseNative, template: *const function.Native) Error!void {
         // `manual` natives have no install slot — they exist in `base_natives` only
         // so the keyframe restorer can rebind them by name (e.g. the default
@@ -1839,8 +1813,8 @@ pub const Vm = struct {
     /// This is a **load-time host input**, set once at the host boundary
     /// (`main.zig`), so the interpreter exec core never reads argv mid-run and
     /// stays deterministic. The table is a normal heap table → serializes through
-    /// the keyframe path. (The dynamic `argv()`/`argc()` effect natives are
-    /// unaffected — they remain the per-call nondeterministic-input boundary.)
+    /// the keyframe path. It is the only way a program sees its arguments
+    /// (doc 65 Q3).
     pub fn populateArgs(self: *Vm, argv: []const []const u8) Error!void {
         const v = self.globals.get(try self.heap.internValue("arg"));
         if (!(v.isHeap() and v.heapType() == .table)) return; // installBaseLib guarantees a table
@@ -10107,16 +10081,6 @@ fn narrowError(e: anyerror) Error {
         error.StackOverflow => Error.StackOverflow,
         error.Unimplemented => Error.Unimplemented,
         error.ClockUnavailable => Error.ClockUnavailable,
-        // `random()` reaches the effect machinery from *inside* its native (the
-        // seed, not the call, is the boundary), so these surface through here —
-        // unlike `clock`, which goes via `performEffect` and never narrows.
-        error.RandomUnavailable => Error.RandomUnavailable,
-        // `getenv`/`argc`/`argv` go through `performEffect`, which narrows their
-        // native errors — so the missing-source signal must survive the round-trip.
-        error.EnvUnavailable => Error.EnvUnavailable,
-        // `loadfile`/`dofile` drive the `file_read` effect from inside their
-        // native (via `obtainFileRead`), so the missing-source signal narrows here.
-        error.FsUnavailable => Error.FsUnavailable,
         error.EffectLogExhausted => Error.EffectLogExhausted,
         error.EffectKindMismatch => Error.EffectKindMismatch,
         // `upper`/`lower` pin the `unicode_version` effect from inside their
@@ -10150,9 +10114,6 @@ pub fn catchable(e: Error) bool {
         Error.EffectLogExhausted,
         Error.EffectKindMismatch,
         Error.ClockUnavailable,
-        Error.RandomUnavailable,
-        Error.EnvUnavailable,
-        Error.FsUnavailable,
         Error.UnicodeVersionMismatch,
         // A top-level `run`/`start` contract violation — it can never surface inside
         // a `pcall`/`xpcall` (those don't re-enter top-level), so it is unreachable
@@ -10282,15 +10243,16 @@ fn peekLoggedEffect(self: *Vm, kind: EffectKind) Error!Value {
 }
 
 /// Obtain `random()`'s one seed through the record/replay boundary. In
-/// `off`/`record` it reads the injected entropy source (else `RandomUnavailable`)
-/// and, in `record`, logs it once as `.random_seed` (a non-heap int — no schema
-/// change). In `replay` it reads the seed back from the log. Called lazily by
-/// `nativeRandom` the first time `random()` runs; subsequent draws need no effect.
+/// `off`/`record` it reads the injected entropy source (else the fixed
+/// `default_random_seed`, doc 65 Q4) and, in `record`, logs it once as
+/// `.random_seed` (a non-heap int) — the default seed too, so a replay never
+/// needs to know whether the recording had a source. In `replay` it reads the
+/// seed back from the log. Called lazily by `nativeRandom` the first time
+/// `random()` runs; subsequent draws need no effect.
 fn obtainRandomSeed(self: *Vm) Error!u64 {
     const seed = switch (self.effect_mode) {
         .off, .record => blk: {
-            const src = self.random_seed_source orelse return Error.RandomUnavailable;
-            const seed = src.seed(src.ctx);
+            const seed = if (self.random_seed_source) |src| src.seed(src.ctx) else default_random_seed;
             if (self.effect_mode == .record) try logEffect(self, .random_seed, Value.int(@bitCast(seed)));
             break :blk seed;
         },
@@ -10365,8 +10327,9 @@ pub fn noteUnicodeVersion(self: *Vm) Error!void {
 }
 
 /// Read a file's content through the `file_read` record/replay boundary, for
-/// `loadfile`/`dofile`. In `off`/`record` it reads the injected `fs_source` (else
-/// `FsUnavailable`) and, in `record`, logs the result once as `.file_read`. In
+/// `loadfile`/`dofile`/`require`. In `off`/`record` it reads the host system's
+/// `readFile` (no host, or no `readFile`: the file can't be opened, doc 65 §5.3)
+/// and, in `record`, logs the result once as `.file_read`. In
 /// `replay` it reads the content back from the log and never touches disk. The
 /// result is an interned heap **string** of the file bytes, or `nil` if the file
 /// could not be opened (the caller turns that into Lua's `cannot open` message).
@@ -10375,13 +10338,13 @@ pub fn noteUnicodeVersion(self: *Vm) Error!void {
 pub fn obtainFileRead(self: *Vm, path: []const u8) Error!Value {
     const result = switch (self.effect_mode) {
         .off, .record => blk: {
-            const src = self.fs_source orelse return Error.FsUnavailable;
-            const r = if (src.read(src.ctx, path)) |bytes|
+            const sys = self.system orelse break :blk try logFileRead(self, Value.nil());
+            const read = sys.vtable.readFile orelse break :blk try logFileRead(self, Value.nil());
+            const r = if (read(sys.ctx, path)) |bytes|
                 try self.heap.internValue(bytes)
             else
                 Value.nil();
-            if (self.effect_mode == .record) try logEffect(self, .file_read, r);
-            break :blk r;
+            break :blk try logFileRead(self, r);
         },
         .replay => try nextLoggedEffect(self, .file_read),
     };
@@ -10391,6 +10354,12 @@ pub fn obtainFileRead(self: *Vm, path: []const u8) Error!Value {
     try self.validateHostText(result);
     onEffectCommitted(self);
     return result;
+}
+
+/// Log a `file_read` result in `record` mode; returns it.
+fn logFileRead(self: *Vm, r: Value) Error!Value {
+    if (self.effect_mode == .record) try logEffect(self, .file_read, r);
+    return r;
 }
 
 /// `os.clock()` — the canonical first nondeterministic *input* (doc 02). Returns
@@ -10516,8 +10485,8 @@ fn nativeRandom(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// in `replay` re-seeds identically without consuming the log). With no argument it
 /// draws one fresh seed from the host entropy source through the `.random_seed`
 /// record/replay boundary (`obtainRandomSeed`) — exactly like `random()`'s lazy
-/// seed, so the entropy form is recorded and replayed for free, and is
-/// `RandomUnavailable` when no source is injected. mahina's Xoshiro256 takes a single
+/// seed, so the entropy form is recorded and replayed for free, and is the fixed
+/// default seed when no source is injected. mahina's Xoshiro256 takes a single
 /// `u64` seed (not PUC's two words), so this returns the one seed actually used.
 fn nativeRandomseed(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm: *Vm = @ptrCast(@alignCast(ctx));
@@ -10529,45 +10498,20 @@ fn nativeRandomseed(ctx: *anyopaque, args: []const Value) anyerror!Value {
     return Value.int(@bitCast(seed));
 }
 
-/// `getenv(name)` — read an environment variable. A nondeterministic input (the
-/// `.getenv` effect): the host environment differs between machines/runs, so it
-/// is recorded and replayed. Reads through the embedder-injected `Vm.host_env`
-/// (the VM holds no platform env of its own). Returns the value as an interned
-/// heap string, or `nil` if unset — note a *set-but-empty* var returns an empty
-/// string, distinct from `nil`. The `replay` path never reaches here (the logged
-/// result is fed back in `performEffect`).
+/// `os.getenv(name)` — read an environment variable. A nondeterministic input
+/// (the `.getenv` effect): the host environment differs between machines/runs,
+/// so it is recorded and replayed. Reads through the host system's `getenv`.
+/// Returns the value as an interned heap string, or `nil` if unset — a
+/// *set-but-empty* var returns an empty string, distinct from `nil`. The
+/// `replay` path never reaches here (the logged result is fed back in
+/// `performEffect`).
 fn nativeGetenv(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm: *Vm = @ptrCast(@alignCast(ctx));
-    if (args.len < 1 or !args[0].isHeap() or args[0].heapType() != .string)
-        return Error.TypeError;
-    const name = string.String.fromHeader(args[0].asHeap()).bytes();
-    const env = vm.host_env orelse return Error.EnvUnavailable;
-    if (env.getenv(env.ctx, name)) |val| {
-        return vm.heap.internValue(val);
-    }
-    return Value.nil();
-}
-
-/// `argc()` — the number of command-line arguments. A nondeterministic input
-/// (the `.argc` effect). Ignores its arguments; reads through `Vm.host_env`.
-fn nativeArgc(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    _ = args;
-    const vm: *Vm = @ptrCast(@alignCast(ctx));
-    const env = vm.host_env orelse return Error.EnvUnavailable;
-    return Value.int(env.argCount(env.ctx));
-}
-
-/// `argv(i)` — the i-th command-line argument as an interned heap string, or
-/// `nil` if the index is out of range (the host source owns the bounds check, so
-/// negative and oversized indices both yield `nil`). A nondeterministic input
-/// (the `.argv` effect); reads through `Vm.host_env`.
-fn nativeArgv(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    const vm: *Vm = @ptrCast(@alignCast(ctx));
-    if (args.len < 1 or args[0].tag != .int) return Error.TypeError;
-    const env = vm.host_env orelse return Error.EnvUnavailable;
-    if (env.arg(env.ctx, args[0].asInt())) |s| {
-        return vm.heap.internValue(s);
-    }
+    const name = (if (args.len >= 1) strBytes(args[0]) else null) orelse
+        return vm.badArg(1, "string", if (args.len >= 1) args[0] else null);
+    const sys = vm.system orelse return Value.nil();
+    const getenv = sys.vtable.getenv orelse return Value.nil();
+    if (getenv(sys.ctx, name)) |val| return vm.heap.internValue(val);
     return Value.nil();
 }
 

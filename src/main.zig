@@ -124,6 +124,10 @@ const usage =
     \\                       the coverage artifact (native-vs-tier-0 split by
     \\                       iterations + time, event counters, per-anchor) to
     \\                       <file> (binschema wire format) after the run.
+    \\  --system <groups>    the system interfaces the program gets (doc 65 §5.2):
+    \\                       `all` (the default), `none`, or a comma-separated
+    \\                       list of files, stdio, env, time, clock, random. A
+    \\                       group that is off is absent: `io.open` is nil.
     \\  --mem-stats          wrap the process allocator in mem.TrackingAllocator and
     \\                       print byte-level accounting (peak/live/total bytes,
     \\                       alloc/free counts) to stderr after the run. Small
@@ -202,6 +206,9 @@ const TraceOpts = struct {
     /// + coverage split + per-anchor table) to stderr. Implies `--trace` +
     /// `coverage`; combine with `--jit-native` to measure the native path.
     jit_stats: bool = false,
+    /// `--system <groups>`: the interface groups `enableSystem` installs, and
+    /// whether the clock and seed sources are wired (doc 65 §5.2).
+    system: mahina.system.Groups = .all,
 };
 
 pub fn main(init: std.process.Init) u8 {
@@ -338,6 +345,15 @@ pub fn main(init: std.process.Init) u8 {
                 mahina.io.eprint("mahina: error: --emit-coverage requires a <file> argument\n", .{});
                 return 2;
             };
+        } else if (std.mem.eql(u8, arg, "--system")) {
+            const val = it.next() orelse {
+                mahina.io.eprint("mahina: error: --system requires a <groups> argument\n", .{});
+                return 2;
+            };
+            topts.system = mahina.system.Groups.parse(val) orelse {
+                mahina.io.eprint("mahina: error: --system: expected all, none, or a comma-separated list of files,stdio,env,time,clock,random; got '{s}'\n", .{val});
+                return 2;
+            };
         } else if (std.mem.eql(u8, arg, "--mem-stats")) {
             mem_stats = true;
         } else if (std.mem.eql(u8, arg, "--time")) {
@@ -365,7 +381,7 @@ pub fn main(init: std.process.Init) u8 {
             mahina.io.eprint("mahina: error: -e requires a chunk argument\n", .{});
             return 2;
         };
-        // Program argv for `-e`: argv(0) = "-e", then any trailing user args.
+        // Program argv for `-e`: arg[0] = "-e", then any trailing user args.
         var prog_argv: std.ArrayList([]const u8) = .empty;
         defer prog_argv.deinit(gpa);
         prog_argv.append(gpa, "-e") catch return 1;
@@ -379,7 +395,7 @@ pub fn main(init: std.process.Init) u8 {
         return 1;
     };
     defer gpa.free(source);
-    // Program argv for a script: argv(0) = the script path, then trailing user args.
+    // Program argv for a script: arg[0] = the script path, then trailing user args.
     var prog_argv: std.ArrayList([]const u8) = .empty;
     defer prog_argv.deinit(gpa);
     prog_argv.append(gpa, first) catch return 1;
@@ -512,23 +528,22 @@ fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source:
     // Inject the native clock. The interpreter holds no platform clock of its own
     // (so the VM core stays portable, incl. wasm); the host that builds the VM —
     // here, the CLI — supplies one. This is the single place the OS clock syscall
-    // lives now. `clock()` is `ClockUnavailable` without it.
-    vm.clock_source = .{ .ctx = &clock_ctx, .nowNs = &nativeClockNs };
+    // lives now.
+    if (topts.system.clock) vm.clock_source = .{ .ctx = &clock_ctx, .nowNs = &nativeClockNs };
     // Inject the native seed source for `random()`. The VM owns the PRNG; the host
-    // supplies only the one nondeterministic seed (OS entropy here). `random()` is
-    // `RandomUnavailable` without it.
-    vm.random_seed_source = .{ .ctx = &rng_ctx, .seed = &nativeRandomSeed };
-    // Inject the native env/args window for `getenv`/`argc`/`argv`. `env_ctx` is a
-    // stack local that outlives `vm.run` below; the env is read from the OS, argv
-    // is the program's command line. `getenv`/`argv` are `EnvUnavailable` without it.
-    var env_ctx = EnvCtx{ .env = env_map, .argv = argv };
-    vm.host_env = .{ .ctx = &env_ctx, .getenv = &hostGetenv, .argCount = &hostArgCount, .arg = &hostArg };
-    // Inject the native filesystem read seam for `loadfile`/`dofile`. `fs_ctx` is a
-    // stack local that outlives `vm.run` below; it owns the most-recent file buffer
-    // (freed at scope exit). `loadfile`/`dofile` are `FsUnavailable` without it.
-    var fs_ctx = FsCtx{ .gpa = gpa, .io = io };
-    defer fs_ctx.deinit();
-    vm.fs_source = .{ .ctx = &fs_ctx, .read = &FsCtx.read };
+    // supplies only the one nondeterministic seed (OS entropy here).
+    if (topts.system.random) vm.random_seed_source = .{ .ctx = &rng_ctx, .seed = &nativeRandomSeed };
+    // The real OS behind `io`/`os` and `require`/`loadfile`/`dofile` (doc 65
+    // §5): every group unless `--system` says otherwise. Module loading is
+    // not a group, so the system is wired whatever the groups. `real_sys`
+    // outlives `vm.run` below.
+    var real_sys = mahina.host_system.RealSystem.init(gpa, io, env_map);
+    defer real_sys.deinit();
+    vm.system = real_sys.system();
+    vm.enableSystem(topts.system) catch |err| {
+        mahina.io.eprint("mahina: error: vm init failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
     // Fill the global `arg` table from the program's command line (load-time host
     // input; keeps the exec core deterministic). `arg[0]` = script path.
     vm.populateArgs(argv) catch |err| {
@@ -712,63 +727,6 @@ fn nativeRandomSeed(_: *anyopaque) u64 {
     mahina.io.hostEntropy(&bytes);
     return std.mem.readInt(u64, &bytes, .little);
 }
-
-/// Backing state for the native `getenv`/`argc`/`argv` effects: the process
-/// environment map and the program's command-line argv (both owned by the
-/// process `Init`, valid for the whole run). Injected as `Vm.host_env`.
-const EnvCtx = struct {
-    env: *std.process.Environ.Map,
-    argv: []const []const u8,
-};
-
-fn hostGetenv(ctx: *anyopaque, name: []const u8) ?[]const u8 {
-    const self: *EnvCtx = @ptrCast(@alignCast(ctx));
-    return self.env.get(name);
-}
-
-fn hostArgCount(ctx: *anyopaque) i64 {
-    const self: *EnvCtx = @ptrCast(@alignCast(ctx));
-    return @intCast(self.argv.len);
-}
-
-fn hostArg(ctx: *anyopaque, i: i64) ?[]const u8 {
-    const self: *EnvCtx = @ptrCast(@alignCast(ctx));
-    if (i < 0 or i >= self.argv.len) return null;
-    return self.argv[@intCast(i)];
-}
-
-/// Backing state for the native `file_read` effect (`loadfile`/`dofile`): the real
-/// filesystem, read through the project's `std.Io` wrapper. Injected as
-/// `Vm.fs_source`. The `FsSource` contract returns bytes valid only for the call
-/// (the native interns them immediately), so we hold the most-recent read in `last`
-/// and free it on the next read and at teardown (`deinit`) — a single reusable
-/// owner, never two live buffers.
-const FsCtx = struct {
-    gpa: std.mem.Allocator,
-    io: mahina.io.Io,
-    last: ?[]u8 = null,
-
-    fn read(ctx: *anyopaque, path: []const u8) ?[]const u8 {
-        const self: *FsCtx = @ptrCast(@alignCast(ctx));
-        if (self.last) |b| {
-            self.gpa.free(b);
-            self.last = null;
-        }
-        const bytes = std.Io.Dir.cwd().readFileAlloc(
-            self.io,
-            path,
-            self.gpa,
-            mahina.io.Io.Limit.limited(mahina.io.max_source_bytes),
-        ) catch return null; // missing/unreadable/too-large → Lua's `cannot open`
-        self.last = bytes;
-        return bytes;
-    }
-
-    fn deinit(self: *FsCtx) void {
-        if (self.last) |b| self.gpa.free(b);
-        self.last = null;
-    }
-};
 
 /// Serialize a whole-VM keyframe snapshot to `path` (binschema wire format).
 fn emitKeyframe(gpa: std.mem.Allocator, io: mahina.io.Io, path: []const u8, vm: *mahina.interp.Vm) !void {

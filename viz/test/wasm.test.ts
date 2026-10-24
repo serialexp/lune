@@ -353,36 +353,34 @@ test("keyframe + effects are produced for a deterministic program", () => {
   expect(result.keyframe.length).toBeGreaterThan(0); // reachable heap graph
 });
 
-test("env/args builtins read the wasm null host: getenv→nil, argc→0, argv→nil", () => {
-  // The browser has no process environment or command-line args, so the wasm
-  // host injects a *null* HostEnv: every getenv misses (nil), argc is 0, and any
-  // argv index is out of range (nil). These are still recorded effects — the call
-  // site is a nondeterministic-input boundary — but their values are fixed here.
-  const result = mod.runSource(
-    'print(getenv("HOME"))\nprint(argc())\nprint(argv(0))\n',
-  );
+test("the playground has no environment: os.getenv and the old argc/argv globals are absent", () => {
+  // The browser has no process environment, so the wasm VM installs only the
+  // clock and random groups (doc 65 §5.2): `os.getenv` is nil, like a Lua state
+  // that never opened the library, and nothing is logged. The program's
+  // arguments are the `arg` table (doc 65 Q3).
+  const result = mod.runSource("print(os.getenv, getenv, argc, argv)\n");
   expect(result.status).toBe(0);
-  expect(result.stdout).toBe("nil\n0\nnil\n");
-  // Three effect natives fired (getenv, argc, argv) → three logged effects, read
-  // from the EffectFile length prefix the diff view uses (decode-free).
+  expect(result.stdout).toBe("nil\tnil\tnil\tnil\n");
+  // No effect fired → an empty log, read from the EffectFile length prefix the
+  // diff view uses (decode-free).
   const dv = new DataView(
     result.effects.buffer,
     result.effects.byteOffset,
     result.effects.byteLength,
   );
-  expect(dv.getUint32(4, true)).toBe(3);
+  expect(dv.getUint32(4, true)).toBe(0);
 });
 
-test("env/args reads diff as expected nondeterministic divergence, not a real mismatch", () => {
-  // A program that reads env/args records effects, so it is NOT in the strong
+test("a recorded input diffs as expected nondeterministic divergence, not a real mismatch", () => {
+  // A program that reads the clock records an effect, so it is NOT in the strong
   // (zero-effect) determinism regime. diffRuns must treat an effects/keyframe/
-  // stdout divergence as *expected* (like clock()/random()), the same way the
-  // EffectFile length prefix the diff reads is unchanged by the v2 result format.
-  const reader = mod.runSource('print(getenv("PATH"))\n');
+  // stdout divergence as *expected*, the same way the EffectFile length prefix
+  // the diff reads is unchanged by the result format.
+  const reader = mod.runSource("print(os.clock() >= 0)\n");
   expect(reader.status).toBe(0);
   // Fabricate a second engine's artifacts that differ only in the recorded input
-  // (one effect each, distinct bytes) — the env-reading program is nondeterministic.
-  const other = mod.runSource('print(getenv("PATH"))\n');
+  // (one effect each, distinct values) — the clock-reading program is nondeterministic.
+  const other = mod.runSource("print(os.clock() >= 0)\n");
   const report = diffRuns(
     { keyframe: reader.keyframe, effects: reader.effects, trace: reader.trace, stdout: reader.stdout, status: reader.status },
     { keyframe: other.keyframe, effects: other.effects, trace: other.trace, stdout: other.stdout, status: other.status },

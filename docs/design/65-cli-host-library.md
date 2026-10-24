@@ -1,10 +1,10 @@
 # 65 — The `io` and `os` host library — Design
 
-Status: Phase 0 implemented; Phases 1–6 not started. Ground rules D1–D4
-(2026-10-20) and all ten design questions Q1–Q10 (2026-10-21) decided by
-Bart; the design below reflects the answers.
+Status: Phases 0 and 1 implemented; Phases 2–6 not started. Ground rules
+D1–D4 (2026-10-20) and all ten design questions Q1–Q10 (2026-10-21)
+decided by Bart; the design below reflects the answers.
 Owner: Bart
-Last updated: 2026-10-21
+Last updated: 2026-10-24
 
 ## Implementation status
 
@@ -44,21 +44,33 @@ checked. Every phase lands behind `just test`, `just hashgate` and
   - [x] Benchmarks `bench/stdlib/io_print.lua` and `io_write.lua` (§9).
   - [x] Inventory rows for `io.write` and `io.flush` (`base-host`,
     `partial`: both act on stdout only until Phase 3 adds handles).
+- [x] **Phase 1 — one host seam and the system switch.** 2026-10-24.
+  - [x] `HostSystem` (§5, `src/system.zig`) replaces `FsSource` and
+    `HostEnv`. Its vtable already names the file, stdio, wall-time and
+    local-zone operations; the real implementation fills in whole-file
+    reads and `getenv` so far, the rest arrive with Phases 3 and 4.
+  - [x] The real-OS implementation moved out of `src/main.zig` into
+    `src/host_system.zig` (`RealSystem`), used by the CLI and
+    `src/capi.zig`.
+  - [x] `mh_config.system` (C, `MH_SYSTEM_*`) and `Config.system`
+    (Rust, `System::ALL` etc.); zero by default (D4), the clock and
+    random seed included (Q4).
+  - [x] A deterministic default seed for `math.random` when no seed
+    source is enabled (`interp.default_random_seed`, Q4); it is logged
+    like a host seed.
+  - [x] Without an interface group, its functions are not installed
+    (Q5, §5.3; `Vm.enableSystem`). The non-catchable `FsUnavailable`,
+    `EnvUnavailable` and `RandomUnavailable` errors are gone: without a
+    system, `loadfile`/`dofile`/`require` report "cannot open".
+  - [x] The bare `getenv`/`argc`/`argv` globals removed (Q3, listed
+    under Phase 4 before); `os.getenv` is in the env group.
+  - [x] Extended beyond the plan: the CLI's `--system <groups>` flag
+    (default `all`). The visualiser's native diff and coverage runs pass
+    the playground's groups (`clock,random`), so both engines see the
+    same globals.
 
 ### Outstanding
 
-- [ ] **Phase 1 — one host seam and the system switch.**
-  - [ ] `HostSystem` (§5) replaces `FsSource` and `HostEnv` and adds
-    files, stdio, wall time and the local time zone.
-  - [ ] Move the real-OS implementation out of `src/main.zig` into
-    `src/host_system.zig`, used by the CLI and `src/capi.zig`.
-  - [ ] `mh_config.system` (C) and a builder switch (Rust); off by
-    default (D4), the clock and random seed included (Q4).
-  - [ ] A deterministic default seed for `math.random` when no seed
-    source is enabled (Q4).
-  - [ ] Without an interface group, its functions are not installed
-    (Q5, §5.3). This removes the non-catchable `FsUnavailable` /
-    `EnvUnavailable` errors that poison an embedded VM today.
 - [ ] **Phase 2 — the effect-log format for host operations.**
   - [ ] Error results and the new effect kinds (§4.2); binary results
     as inline bytes (§4.2, Q1).
@@ -82,9 +94,10 @@ checked. Every phase lands behind `just test`, `just hashgate` and
   - [ ] Record/replay tests for every effect kind, including a replay
     with the host system detached.
 - [ ] **Phase 4 — the `os` library.**
-  - [ ] `os.exit` (§7, Q6), `os.getenv`, `os.time`, `os.date` (§8),
+  - [ ] `os.exit` (§7, Q6), `os.time`, `os.date` (§8), `os.difftime`,
     `os.remove`, `os.rename`, `os.tmpname`.
-  - [ ] Remove the bare `getenv`/`argc`/`argv` globals (Q3).
+  - [ ] Windows `getenv` in libmahina (no libc environ there yet; the
+    CLI reads its environment map and is unaffected).
 - [ ] **Phase 5 — the visualiser.** "Run both + diff" refuses programs
   whose native run used a system interface, with a message saying why
   (Q10).

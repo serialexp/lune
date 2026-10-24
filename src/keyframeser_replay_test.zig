@@ -92,6 +92,7 @@ test "F2d: restore a mid-run keyframe + replay its effect log → identical forw
     const ref = blk: {
         var vm = try Vm.init(gpa);
         defer vm.deinit();
+        try vm.enableSystem(.{ .clock = true });
         var buf: [512]u8 = undefined;
         var sink = io.Writer.fixed(&buf);
         vm.out = &sink;
@@ -124,6 +125,7 @@ test "F2d: restore a mid-run keyframe + replay its effect log → identical forw
     // the restored VM that borrows `chunk.proto`.
     var vm2 = try Vm.init(gpa);
     defer vm2.deinit();
+    try vm2.enableSystem(.{ .clock = true });
     var buf2: [512]u8 = undefined;
     var sink2 = io.Writer.fixed(&buf2);
     vm2.out = &sink2;
@@ -201,6 +203,7 @@ fn captureNativeF2cCut(gpa: std.mem.Allocator, source: [:0]const u8, native: boo
 
     var vm = try Vm.init(gpa);
     defer vm.deinit();
+    try vm.enableSystem(.{ .clock = true });
     var out_buf: [512]u8 = undefined;
     var sink = io.Writer.fixed(&out_buf);
     vm.out = &sink;
@@ -334,6 +337,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
     defer tree.deinit();
     var cut_vm = try Vm.init(gpa);
     defer cut_vm.deinit();
+    try cut_vm.enableSystem(.{ .clock = true });
     var cut_out_buf: [512]u8 = undefined;
     var cut_sink = io.Writer.fixed(&cut_out_buf);
     cut_vm.out = &cut_sink;
@@ -384,6 +388,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
     // Uninterrupted tier-0 reference with the same deterministic clock.
     var ref_vm = try Vm.init(gpa);
     defer ref_vm.deinit();
+    try ref_vm.enableSystem(.{ .clock = true });
     var ref_out_buf: [512]u8 = undefined;
     var ref_sink = io.Writer.fixed(&ref_out_buf);
     ref_vm.out = &ref_sink;

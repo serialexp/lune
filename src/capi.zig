@@ -54,6 +54,8 @@ const diag = mahina.diag;
 const table = mahina.table;
 const mem = mahina.mem;
 const io = mahina.io;
+const system = mahina.system;
+const host_system = mahina.host_system;
 const key_order = mahina.key_order;
 
 const Value = mahina.Value;
@@ -196,6 +198,8 @@ comptime {
 /// distinguishable (doc 59 §3.7).
 pub const mh_config = extern struct {
     jit: c_int = 0,
+    /// `MH_SYSTEM_*` groups (`system.Groups` bit order); 0 = none.
+    system: c_uint = 0,
 };
 
 pub const mh_mem_stats = extern struct {
@@ -249,6 +253,8 @@ pub const VmBox = struct {
     /// A non-catchable fault (OOM, replay integrity) poisoned the VM: no more
     /// guest-running entries (doc 59 §3.6).
     fatal: bool = false,
+    /// The real OS behind the enabled `mh_config.system` groups (doc 65 §5.2).
+    real_sys: host_system.RealSystem = undefined,
 };
 
 /// The `mh_script` handle: a VM-owned program image (see file header). The
@@ -515,11 +521,16 @@ pub fn createVm(backing: std.mem.Allocator, config: mh_config) !*VmBox {
     box.err_sink = io.Writer.Allocating.init(box.tracking.allocator());
     box.vm.out = &box.out_sink.writer;
     box.vm.err = &box.err_sink.writer;
-    box.vm.clock_source = .{ .ctx = &host_src_ctx, .nowNs = &hostClockNs };
-    box.vm.random_seed_source = .{ .ctx = &host_src_ctx, .seed = &hostRandomSeed };
-    // Effects stay `.off` (doc 59 §3.7): plain embedding, no replay. Env/fs
-    // sources stay absent — an embedded guest sees the host's environment
-    // only if the host grants it (future setters).
+    // Effects stay `.off` (doc 59 §3.7): plain embedding, no replay. The guest
+    // sees the host only through the groups `config.system` enables (doc 65
+    // §5.2); with none, it is deterministic: no clock, a fixed random seed.
+    const groups = system.Groups.fromMask(config.system);
+    box.real_sys = host_system.RealSystem.init(box.tracking.allocator(), io.hostIo(), null);
+    errdefer box.real_sys.deinit();
+    if (@as(u8, @bitCast(groups)) != 0) box.vm.system = box.real_sys.system();
+    if (groups.clock) box.vm.clock_source = .{ .ctx = &host_src_ctx, .nowNs = &hostClockNs };
+    if (groups.random) box.vm.random_seed_source = .{ .ctx = &host_src_ctx, .seed = &hostRandomSeed };
+    try box.vm.enableSystem(groups);
     if (config.jit != 2) {
         // Default/on: the CLI's production shape (--trace --jit-native).
         box.vm.trace.config.enabled = true;
@@ -533,6 +544,7 @@ pub fn createVm(backing: std.mem.Allocator, config: mh_config) !*VmBox {
 pub fn destroyVm(box: *VmBox) void {
     const backing = box.backing;
     box.vm.deinit();
+    box.real_sys.deinit();
     box.out_sink.deinit();
     box.err_sink.deinit();
     box.last_error.deinit(backing);

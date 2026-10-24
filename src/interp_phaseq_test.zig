@@ -45,7 +45,7 @@ test "phase Q: a runtime-built find pattern only a trace pins is swept as in tie
         \\for k = 1, 5000 do local junk = {} end
         \\local again = "%d" .. "+"
         \\print({})
-    , "2000\ntable: 0x147c\n");
+    , "2000\ntable: 0x1472\n");
 }
 
 test "phase Q: a runtime-built gmatch pattern only a trace pins is swept as in tier-0" {
@@ -63,7 +63,7 @@ test "phase Q: a runtime-built gmatch pattern only a trace pins is swept as in t
         \\for k = 1, 5000 do local junk = {} end
         \\local again = "%d" .. "+"
         \\print({})
-    , "1800\ntable: 0x15ab\n");
+    , "1800\ntable: 0x15a1\n");
 }
 
 const installCollect = util.installCollect;
@@ -93,7 +93,7 @@ test "phase Q: a collection from a host call retires a patched trace and re-entr
         \\pcall(function() collect() end)
         \\print(f("%d" .. "+"))
         \\print({})
-    , "2000\n2000\n2000\ntable: 0xf9\n", .{ .setup = installCollect, .inspect = expectRetiredInJitLegs });
+    , "2000\n2000\n2000\ntable: 0xef\n", .{ .setup = installCollect, .inspect = expectRetiredInJitLegs });
 }
 
 /// How many armed links the checking collector has seen survive a teardown,

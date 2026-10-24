@@ -1,3 +1,18 @@
+DOC 65 PHASE 1: ONE HOST SEAM + THE SYSTEM SWITCH (2026-10-24, coral-marten).
+- `src/system.zig` (`HostSystem` vtable, `Groups`, `ErrorClass`, file-op
+  types) replaces `FsSource`/`HostEnv`; `src/host_system.zig`
+  (`RealSystem`) is the real OS for the CLI and libmahina (readFile and
+  getenv so far). `Vm.enableSystem(groups)` installs only the enabled
+  groups' natives (Q5); `mh_config.system` / Rust `Config.system` default
+  to none (D4/Q4); `math.random` falls back to `default_random_seed`. Bare
+  `getenv`/`argc`/`argv` removed (Q3), `os.getenv` in the env group.
+- CLI `--system <groups|all|none>`; the viz native diff/coverage runs pass
+  `clock,random` (the playground's groups) so both engines see the same
+  globals. Init allocates 10 fewer objects, so the GC/phaseq tests' table
+  ids moved by −0xa.
+- Next: Phase 2 (effect-log format: fail/bytes results, new kinds, the
+  1 MiB cap, the pinned io error mode, version 6), then Phases 3–6.
+
 DOC 72 P0–P2: TABLE CONSTRUCTORS (2026-10-23, coral-marten).
 - `new_table a, c` pre-sizes the hash part for more than three named/keyed
   fields (`opNewTableSized`, a cold lane). A run of positional values

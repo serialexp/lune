@@ -28,6 +28,10 @@ pub const mem = @import("mem.zig");
 /// Diagnostic / CLI I/O — the single wrapper around the churny `std.Io` writer
 /// API and `Value` text rendering.
 pub const io = @import("io.zig");
+/// The host system seam (doc 65 §5) and its real-OS implementation (not
+/// referenced by the wasm build).
+pub const system = @import("system.zig");
+pub const host_system = @import("host_system.zig");
 
 /// Program-relative file paths (the visualiser's files, `mahina viz`).
 pub const relpath = @import("relpath.zig");

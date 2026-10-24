@@ -97,7 +97,7 @@ os,os.clock,base-host,implemented,"Monotonic time in seconds as a float (nativeC
 os,os.time,cli-binding,not-started,"Current time as a numeric timestamp, or the time encoded by a date table. Nondeterministic input; log-outputs effect."
 os,os.date,cli-binding,not-started,"Formatted date/time string or table of components for a given time. Time input is an effect; formatting is pure."
 os,os.difftime,core,implemented,"Returns t2 - t1 in seconds. Pure arithmetic over timestamps; no host call."
-os,os.getenv,cli-binding,not-started,"Returns the value of an environment variable, or nil. Nondeterministic input; log-outputs effect."
+os,os.getenv,cli-binding,implemented,"Returns the value of an environment variable, or nil. Nondeterministic input; log-outputs effect. Env group (doc 65)."
 os,os.exit,cli-binding,not-started,"Terminates the program with a code/boolean, optionally closing state. CLI lifecycle concern."
 os,os.remove,cli-binding,not-started,"Deletes a file or empty directory. Filesystem mutation; CLI-only."
 os,os.rename,cli-binding,not-started,"Renames a file or directory. Filesystem mutation; CLI-only."

@@ -127,30 +127,6 @@ export fn mahina_panic_message_len() u32 {
     return panic_len;
 }
 
-/// A null env/args source for the browser playground: there is no process
-/// environment or command line, so `getenv` always returns nil, `argc` is 0, and
-/// `argv` is always nil. Injected (in `record`) so `getenv`/`argc`/`argv` are
-/// *available* (they cleanly return empty) rather than `EnvUnavailable`. A
-/// JS-supplied env/argv map could replace this later; for now the playground has
-/// none. `ctx` is unused — point it at the shared throwaway byte.
-fn nullEnvGetenv(_: *anyopaque, _: []const u8) ?[]const u8 {
-    return null;
-}
-fn nullEnvArgCount(_: *anyopaque) i64 {
-    return 0;
-}
-fn nullEnvArg(_: *anyopaque, _: i64) ?[]const u8 {
-    return null;
-}
-fn nullHostEnv() mahina.interp.HostEnv {
-    return .{
-        .ctx = &clock_ctx,
-        .getenv = &nullEnvGetenv,
-        .argCount = &nullEnvArgCount,
-        .arg = &nullEnvArg,
-    };
-}
-
 /// A (pointer, length) pair into linear memory, as two u32s for JS DataView.
 const Buf = extern struct {
     ptr: u32 = 0,
@@ -491,6 +467,8 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
 
     var vm = try mahina.interp.Vm.init(gpa);
     defer vm.deinit();
+    // The recording's natives, installed in the recording's order (object ids).
+    try vm.enableSystem(playground_groups);
 
     var out_buf: [64 * 1024]u8 = undefined;
     var sink = mahina.io.Writer.fixed(&out_buf);
@@ -603,9 +581,14 @@ fn parseArgv(blob: []const u8) ![]const []const u8 {
     return argv;
 }
 
-/// The program's other files, as `mahina_run` received them: the `FsSource`
-/// the VM reads `require`/`loadfile`/`dofile` through. Paths are stored
-/// normalized; `text` borrows the caller's blob.
+/// The browser has a clock and entropy but no files, stdin, environment or wall
+/// clock (doc 65 §3): only those two groups' natives exist. A replay VM enables
+/// the same groups, in the same place, so its object ids match the recording's.
+const playground_groups: mahina.system.Groups = .{ .clock = true, .random = true };
+
+/// The program's other files, as `mahina_run` received them: the host system
+/// (only `readFile`, doc 65 §5.2) the VM reads `require`/`loadfile`/`dofile`
+/// through. Paths are stored normalized; `text` borrows the caller's blob.
 const FileSet = struct {
     files: []const File,
     /// Scratch for normalizing a looked-up path (a longer path is not found).
@@ -620,8 +603,10 @@ const FileSet = struct {
         return null;
     }
 
-    fn source(self: *FileSet) mahina.interp.FsSource {
-        return .{ .ctx = self, .read = &FileSet.read };
+    const vtable: mahina.system.HostSystem.VTable = .{ .readFile = &FileSet.read };
+
+    fn system(self: *FileSet) mahina.system.HostSystem {
+        return .{ .ctx = self, .vtable = &vtable };
     }
 };
 
@@ -721,9 +706,7 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8, files_blob: []co
     vm.effect_mode = .record;
     vm.clock_source = .{ .ctx = &clock_ctx, .nowNs = &wasmClockNs };
     vm.random_seed_source = .{ .ctx = &rng_ctx, .seed = &wasmRandomSeed };
-    // The browser has no process env/args — inject a null source so getenv→nil,
-    // argc→0, argv→nil (available, not EnvUnavailable).
-    vm.host_env = nullHostEnv();
+    try vm.enableSystem(playground_groups);
     // The program's other files: `require`/`loadfile`/`dofile` read them as
     // `file_read` effects, exactly as the CLI reads the disk.
     var file_paths: std.ArrayList(u8) = .empty;
@@ -731,7 +714,7 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8, files_blob: []co
     const files = try parseFiles(files_blob, &file_paths);
     defer gpa.free(files);
     var file_set = FileSet{ .files = files };
-    vm.fs_source = file_set.source();
+    vm.system = file_set.system();
 
     // --- compile --- (pass builtin globals so the unknown-global lint doesn't
     // flag `print`/`clock`).
@@ -753,9 +736,7 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8, files_blob: []co
     // like the CLI at main.zig:350 — the exec core never reads it mid-run, so
     // determinism holds). `argv[0]` is the script name, `argv[1..]` the user args;
     // a program reads its workload from `arg[1]` etc. Empty blob → arg stays the
-    // empty table `installBaseLib` created (unchanged playground default). The
-    // `argc()`/`argv()` *effect* natives remain null here (host_env is null) — this
-    // only populates the deterministic `arg` table, which is what scripts use.
+    // empty table `installBaseLib` created (unchanged playground default).
     const argv = try parseArgv(args_blob);
     defer gpa.free(argv);
     if (argv.len > 0) try vm.populateArgs(argv);
@@ -878,6 +859,7 @@ fn buildReplayIndex(res: *Result, proto: *const mahina.bytecode.Proto, eff_bytes
 fn buildReplayIndexInner(res: *Result, proto: *const mahina.bytecode.Proto, eff_bytes: []const u8) !void {
     var vm = try mahina.interp.Vm.init(gpa);
     defer vm.deinit();
+    try vm.enableSystem(playground_groups);
 
     // stdout is irrelevant to the index; a throwaway sink (same size as the run
     // sink, so an over-printing program fails here identically rather than diverging).

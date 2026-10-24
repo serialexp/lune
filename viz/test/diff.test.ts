@@ -34,7 +34,7 @@ function runNative(source: string): RunArtifacts {
     const ef = join(dir, "e");
     const tr = join(dir, "t");
     writeFileSync(src, source);
-    const r = Bun.spawnSync([nativePath, "--emit-traces", tr, "--emit-keyframe", kf, "--emit-effects", ef, src]);
+    const r = Bun.spawnSync([nativePath, "--system", "clock,random", "--emit-traces", tr, "--emit-keyframe", kf, "--emit-effects", ef, src]);
     const read = (p: string): Uint8Array => {
       try {
         return new Uint8Array(readFileSync(p));

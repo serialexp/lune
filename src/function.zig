@@ -32,6 +32,7 @@ const std = @import("std");
 const object = @import("object.zig");
 const value = @import("value.zig");
 const bytecode = @import("bytecode.zig");
+const system = @import("system.zig");
 const GcHeader = object.GcHeader;
 const Value = value.Value;
 const Proto = bytecode.Proto;
@@ -379,16 +380,12 @@ pub const EffectKind = enum(u8) {
     /// first `random()` call and recorded once; the VM's PRNG reproduces the whole
     /// draw stream from it on replay (so `random()` itself logs nothing per call).
     random_seed = 1,
-    /// `getenv(name)` — an environment-variable read. `clock`-style (the call
+    /// `os.getenv(name)` — an environment-variable read. `clock`-style (the call
     /// site is the boundary): its result is logged per call. The result is a
     /// **heap string** (or nil if unset), so the effect log carries inline string
     /// bytes for this kind (see `effectser.EffectResult`).
     getenv = 2,
-    /// `argc()` — the command-line argument count. `clock`-style; int result.
-    argc = 3,
-    /// `argv(i)` — the i-th command-line argument (heap string, or nil if the
-    /// index is out of range). `clock`-style; carries inline string bytes.
-    argv = 4,
+    // 3 and 4 were the bare `argc()`/`argv()` (removed, doc 65 Q3).
     /// `loadfile`/`dofile` file content — a file read is a nondeterministic input
     /// (the filesystem differs between machines/runs). `clock`-style (the read is
     /// the boundary): the result is the file's **bytes as a heap string**, or `nil`
@@ -570,6 +567,10 @@ pub const BaseNative = struct {
     /// default `package.searchers` array. Without this seam such a native would be
     /// unrestorable (`UnknownNative`) since the restorer resolves only by registry name.
     manual: bool = false,
+    /// The host-system group this native belongs to (doc 65 §5.2), or null for
+    /// one every VM has. A grouped native is installed by `Vm.enableSystem`,
+    /// not `installBaseLib`.
+    group: ?system.Group = null,
 };
 
 /// A built-in **constant** installed as a field of a module table — e.g.

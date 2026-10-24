@@ -55,6 +55,10 @@ const run_output_limit = 16 * 1024 * 1024;
 const run_body_limit = 4 * 1024 * 1024;
 /// The largest artifact `/run` reads back (keyframes of big heaps).
 const artifact_limit = 256 * 1024 * 1024;
+/// The browser playground's interface groups (`wasm_entry.playground_groups`),
+/// as the CLI's `--system` value: the native diff and coverage runs must see
+/// the globals the wasm run sees.
+const playground_system = "clock,random";
 /// `/project` bounds, so `mahina viz` on a script in a big tree (a home
 /// directory) answers quickly with what it found and says the list is cut:
 /// source files sent, their total bytes, directory entries looked at, and how
@@ -404,11 +408,13 @@ pub const Server = struct {
         const src = req.entry;
 
         // Script args go after the source path: the CLI fills arg[1..] from them.
+        // `--system` gives the native run the playground's groups, so both
+        // runs see the same globals (doc 65 §5.2).
         var diff_argv: std.ArrayList([]const u8) = .empty;
-        try diff_argv.appendSlice(arena, &.{ s.exe_path, "--emit-traces", tr, "--emit-keyframe", kf, "--emit-effects", ef, src });
+        try diff_argv.appendSlice(arena, &.{ s.exe_path, "--system", playground_system, "--emit-traces", tr, "--emit-keyframe", kf, "--emit-effects", ef, src });
         try diff_argv.appendSlice(arena, req.args);
         var cov_argv: std.ArrayList([]const u8) = .empty;
-        try cov_argv.appendSlice(arena, &.{ s.exe_path, "--jit-native", "--emit-coverage", cov, src });
+        try cov_argv.appendSlice(arena, &.{ s.exe_path, "--system", playground_system, "--jit-native", "--emit-coverage", cov, src });
         try cov_argv.appendSlice(arena, req.args);
 
         const diff = try s.runChild(arena, diff_argv.items, prog);

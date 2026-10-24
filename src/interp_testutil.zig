@@ -36,7 +36,7 @@ const Closure = function.Closure;
 const RegWindow = regwindow.RegWindow;
 const testing = std.testing;
 
-const FsSource = interp.FsSource;
+const HostSystem = interp.HostSystem;
 const Vm = interp.Vm;
 
 /// Run `source` (tier-0, no GC stress) and return the captured output bytes in
@@ -228,7 +228,7 @@ pub fn compileRun(gpa: std.mem.Allocator, vm: *Vm, source: [:0]const u8) !void {
 }
 /// A deterministic in-memory filesystem for the `file_read` effect: a fixed map of
 /// path → content. Any unknown path reads as `null` (couldn't open). Injected as a
-/// `FsSource` so tests never touch the real disk.
+/// host system with only `readFile`, so tests never touch the real disk.
 pub const FakeFs = struct {
     entries: []const struct { path: []const u8, content: []const u8 },
     pub fn readFn(ctx: *anyopaque, path: []const u8) ?[]const u8 {
@@ -236,8 +236,9 @@ pub const FakeFs = struct {
         for (self.entries) |e| if (std.mem.eql(u8, e.path, path)) return e.content;
         return null;
     }
-    pub fn source(self: *FakeFs) FsSource {
-        return .{ .ctx = self, .read = &FakeFs.readFn };
+    const vtable: HostSystem.VTable = .{ .readFile = &FakeFs.readFn };
+    pub fn system(self: *FakeFs) HostSystem {
+        return .{ .ctx = self, .vtable = &vtable };
     }
 };
 /// Like `runForTrace` but with tier-1a execution ON, capturing `print` output

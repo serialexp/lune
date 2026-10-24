@@ -101,10 +101,25 @@ typedef struct mh_table_iter mh_table_iter;
 /* A GC root handle (generational — a freed ref is detected, never dangling). */
 typedef uint64_t mh_ref;
 
+/* System interface groups (doc 65 §5.2), for mh_config.system. A group that
+ * is off installs none of its functions (`io.open` is nil). */
+#define MH_SYSTEM_FILES  (1u << 0) /* io.open/lines/input/output/close/tmpfile,
+                                       os.remove/rename/tmpname, require and
+                                       loadfile/dofile reading the disk */
+#define MH_SYSTEM_STDIO  (1u << 1) /* io.stdin, io.read */
+#define MH_SYSTEM_ENV    (1u << 2) /* os.getenv, os.exit */
+#define MH_SYSTEM_TIME   (1u << 3) /* os.time, os.date */
+#define MH_SYSTEM_CLOCK  (1u << 4) /* os.clock, os.nsclock */
+#define MH_SYSTEM_RANDOM (1u << 5) /* an OS seed for math.random (off: fixed seed) */
+#define MH_SYSTEM_ALL    0x3Fu
+
 /* VM creation options. Zero-initialize (or pass NULL) for defaults.
- * jit: 0 = default (on), 1 = on, 2 = off. */
+ * jit: 0 = default (on), 1 = on, 2 = off.
+ * system: MH_SYSTEM_* groups; 0 = none, so a VM is deterministic and sees
+ * nothing of the host unless asked (doc 65 D4, Q4). */
 typedef struct mh_config {
     int jit;
+    unsigned system;
 } mh_config;
 
 typedef struct mh_mem_stats {

@@ -71,12 +71,7 @@ fn detGetenv(_: *anyopaque, name: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, name, "V")) return name[1..];
     return null;
 }
-fn detArgCount(_: *anyopaque) i64 {
-    return 0;
-}
-fn detArg(_: *anyopaque, _: i64) ?[]const u8 {
-    return null;
-}
+const det_vtable: mahina.system.HostSystem.VTable = .{ .getenv = &detGetenv };
 
 /// The effect-log mode of both legs (doc 60 §6.1's record and replay legs).
 /// The embedding's public API keeps effects `.off` (doc 59 §3.7), so the
@@ -461,12 +456,14 @@ const Pair = struct {
         self.prev_results = @splat(@splat(.{}));
         for (0..2) |leg| {
             self.fa[leg] = .init(testing.allocator, .{});
-            const box = try capi.createVm(self.fa[leg].allocator(), .{ .jit = if (tier == .off) 2 else 0 });
+            // Every group installed (MH_SYSTEM_ALL), then the real OS swapped
+            // for the deterministic sources.
+            const box = try capi.createVm(self.fa[leg].allocator(), .{ .jit = if (tier == .off) 2 else 0, .system = 0x3F });
             self.box[leg] = box;
             const vm = &box.vm;
             vm.clock_source = .{ .ctx = &det_ctx, .nowNs = &detClock };
             vm.random_seed_source = .{ .ctx = &det_ctx, .seed = &detSeed };
-            vm.host_env = .{ .ctx = &det_ctx, .getenv = &detGetenv, .argCount = &detArgCount, .arg = &detArg };
+            vm.system = .{ .ctx = &det_ctx, .vtable = &det_vtable };
             vm.effect_mode = mode;
             if (log) |bytes| {
                 const effects = try mahina.effectser.decodeFile(vm.gpa, vm.heap, bytes);
@@ -1374,15 +1371,15 @@ test "hostcall diff: register capacity, at the outer entry and at a nested host 
 }
 
 const effects_src =
-    \\function eff(a) return os.clock(), getenv("HOME"), math.random(1, 1000), a end
-    \\function effn(n) return #getenv("V" .. n) end
-    \\function effnest(n) local h = getenv("HOME") return reenter(effn, n) end
-    \\function effboom(x) local t = os.nsclock() error("after " .. getenv("HOME") .. x) end
+    \\function eff(a) return os.clock(), os.getenv("HOME"), math.random(1, 1000), a end
+    \\function effn(n) return #os.getenv("V" .. n) end
+    \\function effnest(n) local h = os.getenv("HOME") return reenter(effn, n) end
+    \\function effboom(x) local t = os.nsclock() error("after " .. os.getenv("HOME") .. x) end
     \\function effmany()
-    \\  return getenv("Va"), getenv("Vb"), getenv("Vc"), getenv("Vd"),
-    \\         getenv("Ve"), getenv("Vf"), getenv("Vg"), getenv("Vh")
+    \\  return os.getenv("Va"), os.getenv("Vb"), os.getenv("Vc"), os.getenv("Vd"),
+    \\         os.getenv("Ve"), os.getenv("Vf"), os.getenv("Vg"), os.getenv("Vh")
     \\end
-    \\function effva(a, ...) return getenv("V" .. a), ... end
+    \\function effva(a, ...) return os.getenv("V" .. a), ... end
     \\function effloop(n)
     \\  local acc = os.nsclock()
     \\  for i = 1, n do acc = acc + i end

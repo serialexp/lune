@@ -80,8 +80,8 @@ pub const DecodeError = error{
 /// newly added kind forces a deliberate classification here.
 fn resultShapeOf(kind: EffectKind) enum { scalar, string_or_nil } {
     return switch (kind) {
-        .clock, .random_seed, .argc, .unicode_version => .scalar,
-        .getenv, .argv, .file_read => .string_or_nil,
+        .clock, .random_seed, .unicode_version => .scalar,
+        .getenv, .file_read => .string_or_nil,
     };
 }
 
@@ -211,11 +211,10 @@ test "effect log round-trips byte/struct-exact (empty, single, multi; int + floa
         .{ .kind = .random_seed, .result = Value.int(@bitCast(@as(u64, 0xC0FFEE))) },
         .{ .kind = .random_seed, .result = Value.int(@bitCast(@as(u64, 0xFFFF_FFFF_FFFF_FFFF))) },
     });
-    // argc is an int result like clock; nil is a valid result (getenv/argv miss).
+    // nil is a valid result (a getenv/file_read miss).
     try expectLogRoundTrips(&.{
-        .{ .kind = .argc, .result = Value.int(3) },
         .{ .kind = .getenv, .result = Value.nil() },
-        .{ .kind = .argv, .result = Value.nil() },
+        .{ .kind = .file_read, .result = Value.nil() },
     });
 }
 
@@ -228,7 +227,7 @@ test "a string effect result round-trips as inline bytes (getenv/argv)" {
     // holds — and an empty string is distinct from a nil result.
     const log = [_]Effect{
         .{ .kind = .getenv, .result = try heap.internValue("/home/bart") },
-        .{ .kind = .argv, .result = try heap.internValue("alpha") },
+        .{ .kind = .file_read, .result = try heap.internValue("alpha") },
         .{ .kind = .getenv, .result = try heap.internValue("") }, // set-but-empty
         .{ .kind = .getenv, .result = Value.nil() }, // unset
     };

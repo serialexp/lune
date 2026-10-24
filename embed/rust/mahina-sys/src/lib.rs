@@ -9,7 +9,7 @@
 
 #![allow(non_camel_case_types)]
 
-use std::os::raw::{c_int, c_void};
+use std::os::raw::{c_int, c_uint, c_void};
 
 // ---- status / type constants (mirror mh_status / mh_type) -----------------
 
@@ -79,7 +79,17 @@ impl mh_value {
 pub struct mh_config {
     /// 0 = default (JIT on), 1 = on, 2 = off.
     pub jit: c_int,
+    /// `MH_SYSTEM_*` groups; 0 = none (doc 65 §5.2).
+    pub system: c_uint,
 }
+
+pub const MH_SYSTEM_FILES: c_uint = 1 << 0;
+pub const MH_SYSTEM_STDIO: c_uint = 1 << 1;
+pub const MH_SYSTEM_ENV: c_uint = 1 << 2;
+pub const MH_SYSTEM_TIME: c_uint = 1 << 3;
+pub const MH_SYSTEM_CLOCK: c_uint = 1 << 4;
+pub const MH_SYSTEM_RANDOM: c_uint = 1 << 5;
+pub const MH_SYSTEM_ALL: c_uint = 0x3F;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]

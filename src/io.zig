@@ -210,7 +210,7 @@ pub fn writeFile(io: Io, path: []const u8, data: []const u8) !void {
 /// matters in libmahina, where the process belongs to the host. Its clock is
 /// stateless and its entropy calls lock internally, so any thread may call
 /// these.
-fn hostIo() Io {
+pub fn hostIo() Io {
     if (is_freestanding) @compileError("no host clock or entropy on freestanding");
     return std.Io.Threaded.global_single_threaded.io();
 }

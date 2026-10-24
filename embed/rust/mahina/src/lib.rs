@@ -152,6 +152,44 @@ impl Drop for VmInner {
 pub struct Config {
     /// `None` = default (JIT on).
     pub jit: Option<bool>,
+    /// The system interfaces the guest may use (doc 65 §5.2). The default is
+    /// none: the VM is deterministic and sees nothing of the host.
+    pub system: System,
+}
+
+/// A set of system interface groups for [`Config::system`]. A group that is
+/// off installs none of its functions (`io.open` is `nil`). Combine with `|`.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct System(u32);
+
+impl System {
+    pub const NONE: System = System(0);
+    /// `io.open`/`lines`/`input`/`output`/`close`/`tmpfile`,
+    /// `os.remove`/`rename`/`tmpname`, and `require`/`loadfile`/`dofile`
+    /// reading the disk.
+    pub const FILES: System = System(sys::MH_SYSTEM_FILES);
+    /// `io.stdin`, `io.read`.
+    pub const STDIO: System = System(sys::MH_SYSTEM_STDIO);
+    /// `os.getenv`, `os.exit`.
+    pub const ENV: System = System(sys::MH_SYSTEM_ENV);
+    /// `os.time`, `os.date`.
+    pub const TIME: System = System(sys::MH_SYSTEM_TIME);
+    /// `os.clock`, `os.nsclock`.
+    pub const CLOCK: System = System(sys::MH_SYSTEM_CLOCK);
+    /// An OS seed for `math.random` (off: a fixed seed).
+    pub const RANDOM: System = System(sys::MH_SYSTEM_RANDOM);
+    pub const ALL: System = System(sys::MH_SYSTEM_ALL);
+
+    pub fn contains(self, other: System) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl std::ops::BitOr for System {
+    type Output = System;
+    fn bitor(self, rhs: System) -> System {
+        System(self.0 | rhs.0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -896,6 +934,7 @@ impl Vm {
                 Some(true) => 1,
                 Some(false) => 2,
             },
+            system: config.system.0,
         };
         let mut raw: *mut sys::mh_vm = std::ptr::null_mut();
         let st = unsafe { sys::mh_vm_new(&cfg, &mut raw) };

@@ -46,7 +46,7 @@ const compileRun = util.compileRun;
 
 // ---------------------------------------------------------------------------
 // P3 — `require` / `package`. The module system is built on the existing
-// `fs_source` + `file_read` effect (no new seam, no new effect kind): module
+// host system's `readFile` + `file_read` effect (no new seam, no new effect kind): module
 // content is the only nondeterministic input, so `require` programs record/replay
 // byte-identically and snapshot like any other heap state. These tests inject an
 // in-memory `FakeFs` (the default `package.path` resolves to `./?.mah`, `./?.lua`
@@ -61,7 +61,7 @@ const compileRun = util.compileRun;
 fn requireRun(gpa: std.mem.Allocator, vm: *Vm, ffs: *FakeFs, sink: *io.Writer, source: [:0]const u8) !void {
     vm.out = sink;
     vm.effect_mode = .record;
-    vm.fs_source = ffs.source();
+    vm.system = ffs.system();
     try compileRun(gpa, vm, source);
 }
 
@@ -294,7 +294,7 @@ test "P3: record→serialize→replay reproduces a require program with the FS d
         const log = try effectser.decodeFile(gpa, vm.heap, log_bytes);
         defer gpa.free(log);
         try vm.effect_log.appendSlice(gpa, log);
-        vm.effect_mode = .replay; // NO fs_source — content must come from the log
+        vm.effect_mode = .replay; // NO host system — content must come from the log
         try compileRun(gpa, &vm, driver);
         try testing.expectEqualStrings("hi mahina\n", sink.buffered());
     }
