@@ -43,7 +43,11 @@ What it does:
   binary (`POST /run`, answered by `mahina viz` or the dev server) and
   compares every artifact byte for byte — two engines agreeing is the
   determinism check (`../docs/design/02-determinism.md`). It also gives the
-  native run's time split, which wasm (no cycle counter) can't.
+  native run's time split, which wasm (no cycle counter) can't. Both engines
+  get the browser's system interfaces only (the clock and the random seed),
+  so a program that stops on a missing one (`io.open`, `os.time`, …) is not
+  compared: the panel says which interface it needed
+  (`../docs/design/65-cli-host-library.md` Q10).
 - **Open a `.mahinatrace`** from `mahina --emit-traces` to inspect its traces
   (structure only: the file holds no execution log).
 

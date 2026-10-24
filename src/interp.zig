@@ -40,6 +40,7 @@ const io = @import("io.zig");
 const system = @import("system.zig");
 const effectlog = @import("effectlog.zig");
 const effectser = @import("effectser.zig");
+const bc_names = @import("bc_names.zig");
 const stdmath = @import("stdlib/math.zig");
 const stdtable = @import("stdlib/table.zig");
 const stdbase = @import("stdlib/base.zig");
@@ -2323,6 +2324,8 @@ pub const Vm = struct {
         const regs = self.frameWindow(frame.base, proto.num_registers);
         const span: bytecode.Span = if (pc < proto.spans.len) proto.spans[pc] else .{};
         const line = span.line;
+        // `faultVarInfo`'s suffix, when it fits.
+        var info_buf: [256]u8 = undefined;
 
         const message: []const u8 = switch (err) {
             Error.StackOverflow => try arena.dupe(u8, "stack overflow"),
@@ -2366,8 +2369,8 @@ pub const Vm = struct {
                     "'for' step must be a number"),
                 // The container is a register in all four forms; the field
                 // forms' key is a constant, which the message never reads.
-                .get_index, .get_field => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs.get(instr.b).typeName()}),
-                .set_index, .set_field => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs.get(instr.a).typeName()}),
+                .get_index, .get_field => try std.fmt.allocPrint(arena, "attempt to index a {s} value{s}", .{ regs.get(instr.b).typeName(), try self.faultVarInfo(arena, &info_buf, proto, pc, instr.b, regs.get(instr.b)) }),
+                .set_index, .set_field => try std.fmt.allocPrint(arena, "attempt to index a {s} value{s}", .{ regs.get(instr.a).typeName(), try self.faultVarInfo(arena, &info_buf, proto, pc, instr.a, regs.get(instr.a)) }),
                 // Doc 66 P1: an `itern` faults only in the call it makes.
                 .call, .itern => blk: {
                     // A native runs inline (no child frame), so when one returns a
@@ -2377,12 +2380,16 @@ pub const Vm = struct {
                     // messages come from `Vm.badArg` (which raises `LuaError`, so it
                     // never reaches this non-LuaError arm). A genuine non-callable
                     // (nil/number/…) keeps the real "attempt to call a X value".
-                    const callee = regs.get(bytecode.callOperandsOf(instr).?.a);
+                    const callee_reg = bytecode.callOperandsOf(instr).?.a;
+                    const callee = regs.get(callee_reg);
                     if (callee.isHeap() and callee.heapType() == .native and err == Error.TypeError)
                         break :blk try std.fmt.allocPrint(arena, "bad argument to '{s}'", .{nativeDisplayName(function.Native.fromHeader(callee.asHeap()))});
                     if (callee.isHeap() and (callee.heapType() == .native or callee.heapType() == .function))
                         break :blk try arena.dupe(u8, @errorName(err));
-                    break :blk try std.fmt.allocPrint(arena, "attempt to call a {s} value", .{callee.typeName()});
+                    // An `itern`'s callee is the generic `for`'s iterator,
+                    // which Lua does not name either.
+                    const info = if (instr.op == .call) try self.faultVarInfo(arena, &info_buf, proto, pc, callee_reg, callee) else "";
+                    break :blk try std.fmt.allocPrint(arena, "attempt to call a {s} value{s}", .{ callee.typeName(), info });
                 },
                 else => try arena.dupe(u8, @errorName(err)),
             },
@@ -2390,6 +2397,92 @@ pub const Vm = struct {
 
         const frames = try self.backtraceFrames(arena);
         return .{ .message = message, .proto_id = proto.id, .line = line, .start = span.start, .end = span.end, .frames = frames };
+    }
+
+    /// The suffix naming the faulting value, as Lua 5.4's `varinfo` does
+    /// (" (global 'foo')", " (field 'open')", " (method 'read')"), or "".
+    /// A nil that a system group would have installed says so (doc 65 Q10):
+    /// " (field 'open'; io.open needs the 'files' system interface, which
+    /// this VM does not have)". Formatted into `buf` (a caught fault in a
+    /// loop pays for this every time), or into `arena` when it does not fit.
+    fn faultVarInfo(self: *Vm, arena: std.mem.Allocator, buf: []u8, proto: *const bytecode.Proto, pc: usize, reg: u16, v: Value) std.mem.Allocator.Error![]const u8 {
+        const o = bc_names.originOf(proto, @intCast(pc), reg) orelse return "";
+        const kind = @tagName(o.kind);
+        if (v.isNil()) if (self.absentSystemMember(o)) |groups| {
+            // At most two groups install any one name.
+            var names: [2][]const u8 = .{ "", "" };
+            var n: usize = 0;
+            for (std.enums.values(system.Group)) |g| {
+                if (!groups.has(g)) continue;
+                std.debug.assert(n < names.len);
+                names[n] = @tagName(g);
+                n += 1;
+            }
+            const sep = if (o.table_global != null) "." else "";
+            return concatInto(arena, buf, &.{
+                " (",                        kind,     " '",                                 o.name,         "'; ",
+                o.table_global orelse "",    sep,      o.name,                               " needs the '", names[0],
+                if (n > 1) "' or '" else "", names[1], "' " ++ missing_system_phrase ++ ")",
+            });
+        };
+        return concatInto(arena, buf, &.{ " (", kind, " '", o.name, "')" });
+    }
+
+    /// `parts` joined, in `buf` when they fit, else in `arena`.
+    fn concatInto(arena: std.mem.Allocator, buf: []u8, parts: []const []const u8) std.mem.Allocator.Error![]const u8 {
+        var len: usize = 0;
+        for (parts) |p| len += p.len;
+        const out = if (len <= buf.len) buf[0..len] else try arena.alloc(u8, len);
+        var k: usize = 0;
+        for (parts) |p| {
+            @memcpy(out[k..][0..p.len], p);
+            k += p.len;
+        }
+        return out;
+    }
+
+    /// The tail of the message `faultVarInfo` gives a member of a system
+    /// group this VM lacks. The visualiser keys its "can't compare" verdict
+    /// on it (doc 65 Q10, `viz/src/diff.ts`), so keep the two in step.
+    pub const missing_system_phrase = "system interface, which this VM does not have";
+
+    /// What a system group installs, by name: its natives (from
+    /// `base_natives`) and the values that are not natives. `module` is null
+    /// for a global.
+    const SystemMember = struct { module: ?[]const u8, name: []const u8, groups: system.Groups };
+    const system_members = blk: {
+        var n: usize = 0;
+        for (base_natives) |bn| n += @intFromBool(bn.groups != system.Groups.none);
+        const values = [_]SystemMember{
+            .{ .module = "io", .name = "stdin", .groups = .{ .stdio = true } },
+        };
+        var t: [n + values.len]SystemMember = undefined;
+        var k: usize = 0;
+        for (base_natives) |bn| {
+            if (bn.groups == system.Groups.none) continue;
+            t[k] = .{ .module = bn.module, .name = if (bn.module != null) bn.field.? else bn.name, .groups = bn.groups };
+            k += 1;
+        }
+        for (values) |v| {
+            t[k] = v;
+            k += 1;
+        }
+        break :blk t;
+    };
+
+    /// The groups that would install what `o` names, when none of them is
+    /// enabled in this VM; null for a name no group installs, or one whose
+    /// group is on (the program removed it itself).
+    fn absentSystemMember(self: *const Vm, o: bc_names.Origin) ?system.Groups {
+        // A field of a table that is not a global (`t.open`) is no member.
+        const module: ?[]const u8 = if (o.kind == .global) null else o.table_global orelse return null;
+        for (system_members) |sm| {
+            if ((sm.module == null) != (module == null)) continue;
+            if (module) |m| if (!std.mem.eql(u8, sm.module.?, m)) continue;
+            if (!std.mem.eql(u8, sm.name, o.name)) continue;
+            return if (sm.groups.overlaps(self.system_groups)) null else sm.groups;
+        }
+        return null;
     }
 
     /// Walk the live call stack into `FaultFrame` rows, **deepest-first** (leaf at

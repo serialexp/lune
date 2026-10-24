@@ -1,3 +1,23 @@
+DOC 65 PHASE 5: THE VISUALISER REFUSAL + LUA-STYLE FAULT NAMES (2026-10-24, coral-marten).
+- Bart chose "explain the missing global": Phase 1's playground groups
+  made Q10's effect-log mechanism moot (both engines fail identically).
+- `src/bc_names.zig`: Lua 5.4 varinfo ("global 'x'", "field 'x'",
+  "method 'x'") from bytecode. Candidate = nearest may-writer before pc
+  (`bc_liveness.mayWrite`, new); proven when no jump from outside [d,pc)
+  lands in (d,pc]. Comptime tables (succ shapes, fixed kills) are derived
+  from effectOf/successors and tested against them. No local/upvalue
+  names (TODO.md).
+- `Vm.faultVarInfo` + `absentSystemMember`: a nil from a group the VM
+  lacks adds "; io.open needs the 'files' system interface, which this VM
+  does not have". `Vm.missing_system_phrase` is matched by
+  `viz/src/diff.ts` `missingSystemInterface`; the diff panel shows
+  "⊘ not compared".
+- Cost: per caught fault +0.12 µs (0.17→0.29 s per 1M; lua5.4 0.37).
+  Bench `bench/stdlib/pcall_faults.lua`.
+- `zig fmt` on 0.17 migrates deprecated builtins file-wide. I ran it once
+  by mistake and rebuilt interp.zig from HEAD + my hunks. Don't run it.
+- Next: Phase 6 (docs + inventory + doc 02 taxonomy).
+
 DOC 65 PHASE 4: THE `os` LIBRARY (2026-10-24, coral-marten).
 - `src/stdlib/os.zig`: os.time/date/remove/rename/tmpname/exit.
   `src/datetime.zig` (civil calendar, C-locale strftime, Lua checkoption)

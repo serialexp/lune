@@ -280,6 +280,49 @@ test "os: os.exit from a hot loop ends the run in every trace mode" {
     }
 }
 
+test "os: calling a member of a group that is off says which interface it needs" {
+    const r = try run(testing.allocator, .{ .groups = .{ .clock = true } },
+        \\print(pcall(function() io.open("x") end))
+        \\print(pcall(function() return os.date() end))
+        \\print(pcall(function() return io.stdin:read() end))
+        \\print(pcall(function() return io.read() end))
+        \\print(pcall(function() os.exit(1) end))
+        \\print(pcall(function() return io.nope() end))
+    );
+    defer r.deinit(testing.allocator);
+    const tail = ", which this VM does not have)\n";
+    try testing.expectEqualStrings(
+        "false\tanonymous:1: attempt to call a nil value (field 'open'; io.open needs the 'files' system interface" ++ tail ++
+            "false\tanonymous:2: attempt to call a nil value (field 'date'; os.date needs the 'time' system interface" ++ tail ++
+            "false\tanonymous:3: attempt to index a nil value (field 'stdin'; io.stdin needs the 'stdio' system interface" ++ tail ++
+            "false\tanonymous:4: attempt to call a nil value (field 'read'; io.read needs the 'files' or 'stdio' system interface" ++ tail ++
+            "false\tanonymous:5: attempt to call a nil value (field 'exit'; os.exit needs the 'env' system interface" ++ tail ++
+            "false\tanonymous:6: attempt to call a nil value (field 'nope')\n",
+        r.out,
+    );
+    // With the group on, a member the program removed is just missing.
+    const removed = try run(testing.allocator, .{}, "io.open = nil print(pcall(function() io.open('x') end))");
+    defer removed.deinit(testing.allocator);
+    try testing.expectEqualStrings("false\tanonymous:1: attempt to call a nil value (field 'open')\n", removed.out);
+}
+
+test "os: the interface hint is the same from a hot loop in every trace mode" {
+    const source =
+        \\local function f(i) if i == 300 then return os.time() end return i end
+        \\local s = 0
+        \\print(pcall(function() for i = 1, 1000 do s = s + f(i) end end))
+    ;
+    for (std.enums.values(util.TraceMode)) |mode| {
+        var buf: [512]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        try util.runCapturedTuned(testing.allocator, source, &sink, false, mode, .{});
+        try testing.expectEqualStrings(
+            "false\tf:1: attempt to call a nil value (field 'time'; os.time needs the 'time' system interface, which this VM does not have)\n",
+            sink.buffered(),
+        );
+    }
+}
+
 test "os: a group that is off installs none of its functions" {
     const r = try run(testing.allocator, .{ .groups = .{ .clock = true } },
         \\print(os.time, os.date, os.remove, os.rename, os.tmpname, os.exit, os.difftime ~= nil)

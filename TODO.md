@@ -2,6 +2,22 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Noted 2026-10-24 (doc 65 Phase 5, fault naming)
+
+- [ ] **JIT mode is slower than tier-0 on caught faults.**
+      `bench/stdlib/pcall_faults.lua`: t0 ~0.07 s, `--trace --jit-native`
+      ~0.09 s at bcdde11 (before fault naming), residency 13%. Run
+      `--jit-stats` first (doc 31 D3 rule).
+- [ ] **Name the operands of arithmetic, concatenation and comparison
+      faults** too, as Lua 5.4 does ("attempt to perform arithmetic on a
+      nil value (field 'z')"). `src/bc_names.zig` answers it; the
+      describers in `Vm.describeFault` need the operand register, not just
+      the value.
+- [ ] **Local and upvalue names in errors** ("local 'f'", "upvalue 'f'")
+      need debug info the compiler doesn't keep (locals' registers and pc
+      ranges, upvalue names). The fault-naming search also skips the
+      generic `for` iterator ("for iterator 'for iterator'").
+
 ## Tier-0 interpreter cost survey (noted 2026-10-20)
 
 Measured at HEAD 1806b9b, ReleaseFast, `perf stat -e instructions:u`,

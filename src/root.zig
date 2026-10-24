@@ -146,6 +146,7 @@ pub const Value = value.Value;
 pub const GcHeader = object.GcHeader;
 
 test {
+    _ = @import("bc_names.zig");
     // Pull in tests from referenced files.
     _ = dispatch;
     _ = object;

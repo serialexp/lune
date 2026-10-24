@@ -20,6 +20,12 @@
 //     from them) differ BY DESIGN. That is expected, labelled, and does not fail
 //     the verdict. Such a program's determinism is verified by *replay*, not by
 //     this cross-engine record-vs-record comparison.
+//   - A program that needs a system interface the browser lacks (files, stdin,
+//     the environment, the wall clock — docs/design/65-cli-host-library.md Q10)
+//     is not compared at all. Both engines run with the playground's groups, so
+//     such a program stops at the same missing function in both; the VM's
+//     error says which interface it needed, and the report is a refusal that
+//     names it rather than a vacuous match.
 //
 // Effect counts are read decode-free (a plain u32 prefix). The keyframe, however,
 // is normalized through the snapshot decoder before comparison to neutralize the
@@ -216,10 +222,27 @@ export function keyframeSansArg(bytes: Uint8Array): string {
   return JSON.stringify({ roots, objects, loaded_chunks }, jsonReplacer);
 }
 
+/** The tail of the VM's error for a member of a system group the VM lacks
+ *  (`Vm.missing_system_phrase`, src/interp.zig). Keep the two in step. */
+export const MISSING_SYSTEM_PHRASE = "system interface, which this VM does not have";
+
+/** Doc 65 Q10: the clause naming the system interface a run stopped for
+ *  ("io.open needs the 'files' system interface"), or null when it did not.
+ *  Only an uncaught error counts: a program that handles the miss itself
+ *  (`pcall`) ran the same in both engines and is compared as usual. */
+export function missingSystemInterface(diagnostics: string): string | null {
+  const at = diagnostics.indexOf(MISSING_SYSTEM_PHRASE);
+  if (at < 0) return null;
+  const start = diagnostics.lastIndexOf("; ", at);
+  return diagnostics.slice(start < 0 ? 0 : start + 2, at + "system interface".length);
+}
+
 /** One engine's run output (wasm or native), artifacts as raw bytes. */
 export interface RunArtifacts {
   status: number;
   stdout: string;
+  /** The run's error text (empty when it finished). */
+  diagnostics: string;
   keyframe: Uint8Array;
   effects: Uint8Array;
   trace: Uint8Array;
@@ -240,8 +263,12 @@ export interface ArtifactDiff {
 
 export interface DiffReport {
   /** True iff every artifact matches OR every mismatch is an explained, expected
-   *  divergence — i.e. there is no UNEXPLAINED mismatch. */
+   *  divergence — i.e. there is no UNEXPLAINED mismatch. False when refused. */
   ok: boolean;
+  /** Set when the program needs a system interface the browser lacks (doc 65
+   *  Q10): why it was not compared. Nothing else in the report is then
+   *  meaningful (`artifacts` is empty). */
+  refused: string | null;
   /** Whether both engines saw zero recorded effects (the strong-claim regime). */
   deterministic: boolean;
   /** Recorded-effect counts (wasm, native) read from each log's u32 prefix. */
@@ -280,6 +307,11 @@ export function diffRuns(wasm: RunArtifacts, native: RunArtifacts): DiffReport {
   const wasmEffects = effectCount(wasm.effects);
   const nativeEffects = effectCount(native.effects);
   const deterministic = wasmEffects === 0 && nativeEffects === 0;
+
+  const refused = missingSystemInterface(native.diagnostics) ?? missingSystemInterface(wasm.diagnostics);
+  if (refused !== null) {
+    return { ok: false, refused, deterministic, wasmEffects, nativeEffects, stdoutMatch: wasm.stdout === native.stdout, stdoutNote: null, artifacts: [] };
+  }
 
   const order: ArtifactName[] = ["keyframe", "effects", "trace"];
   const artifacts: ArtifactDiff[] = order.map((name) => {
@@ -324,5 +356,5 @@ export function diffRuns(wasm: RunArtifacts, native: RunArtifacts): DiffReport {
   const statusMatch = wasm.status === native.status;
   const ok = !unexplainedArtifact && !unexplainedStdout && statusMatch;
 
-  return { ok, deterministic, wasmEffects, nativeEffects, stdoutMatch, stdoutNote, artifacts };
+  return { ok, refused: null, deterministic, wasmEffects, nativeEffects, stdoutMatch, stdoutNote, artifacts };
 }

@@ -382,8 +382,8 @@ test("a recorded input diffs as expected nondeterministic divergence, not a real
   // (one effect each, distinct values) — the clock-reading program is nondeterministic.
   const other = mod.runSource("print(os.clock() >= 0)\n");
   const report = diffRuns(
-    { keyframe: reader.keyframe, effects: reader.effects, trace: reader.trace, stdout: reader.stdout, status: reader.status },
-    { keyframe: other.keyframe, effects: other.effects, trace: other.trace, stdout: other.stdout, status: other.status },
+    { keyframe: reader.keyframe, effects: reader.effects, trace: reader.trace, stdout: reader.stdout, diagnostics: reader.diagnostics, status: reader.status },
+    { keyframe: other.keyframe, effects: other.effects, trace: other.trace, stdout: other.stdout, diagnostics: other.diagnostics, status: other.status },
   );
   // One effect recorded on each side → not the strong-claim regime.
   expect(report.deterministic).toBe(false);

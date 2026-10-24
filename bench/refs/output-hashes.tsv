@@ -1,5 +1,5 @@
 # mahina frozen benchmark output digests — see tools/hashgate.py
-# generated from zig-out/bin/mahina at rev 6e00190
+# generated from zig-out/bin/mahina at rev bcdde11
 # name	mode	argv	rc	sha256(stdout)
 array3d	jit	80	0	48752ee828b38c1ad373f80e83f62bc9394a1f02665eccff98db8159e39e4d54
 array3d	t0	80	0	48752ee828b38c1ad373f80e83f62bc9394a1f02665eccff98db8159e39e4d54
@@ -61,6 +61,9 @@ pairs_hash	trace	200	0	f717a14cdcc02f2551eb9cc58343312796f8d5be05303ad7b3d0d6e9d
 partialsums	jit	1000000	0	c21bad99f03cb8f45f8db5107e46ed2286cc9addd80b2574b2ae57c92fbac1d0
 partialsums	t0	1000000	0	c21bad99f03cb8f45f8db5107e46ed2286cc9addd80b2574b2ae57c92fbac1d0
 partialsums	trace	1000000	0	c21bad99f03cb8f45f8db5107e46ed2286cc9addd80b2574b2ae57c92fbac1d0
+pcall_faults	jit	300000	0	2d5c043a952d70ef9564858b25a01a30613abfb3d1562f67ef8d089646bbf786
+pcall_faults	t0	300000	0	2d5c043a952d70ef9564858b25a01a30613abfb3d1562f67ef8d089646bbf786
+pcall_faults	trace	300000	0	2d5c043a952d70ef9564858b25a01a30613abfb3d1562f67ef8d089646bbf786
 pi_leibniz	jit	5000000	0	6d2c6267459bf99b7bda15185eb58eee858b8c8ce71328aefe21f9d00fb9ed8d
 pi_leibniz	t0	5000000	0	6d2c6267459bf99b7bda15185eb58eee858b8c8ce71328aefe21f9d00fb9ed8d
 pi_leibniz	trace	5000000	0	6d2c6267459bf99b7bda15185eb58eee858b8c8ce71328aefe21f9d00fb9ed8d

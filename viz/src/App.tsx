@@ -244,7 +244,19 @@ export default function App() {
 
         <Show when={state.diff} keyed>
           {(diff) => (
-            <div class="diff" classList={{ "diff-ok": diff.ok, "diff-bad": !diff.ok }}>
+            <div class="diff" classList={{ "diff-ok": diff.ok, "diff-bad": !diff.ok && diff.refused === null, "diff-refused": diff.refused !== null }}>
+              <Show
+                when={diff.refused === null}
+                fallback={
+                  <div class="diff-head">
+                    <span class="diff-verdict">⊘ not compared</span>
+                    <span class="muted">
+                      {diff.refused}; the browser has no system interfaces beyond the clock and the random seed, so the
+                      two engines can't be compared on this program.
+                    </span>
+                  </div>
+                }
+              >
               <div class="diff-head">
                 <span class="diff-verdict">
                   {diff.ok ? "✓ wasm ≡ native" : "✗ unexplained divergence"}
@@ -286,6 +298,7 @@ export default function App() {
                   </span>
                 </li>
               </ul>
+              </Show>
             </div>
           )}
         </Show>

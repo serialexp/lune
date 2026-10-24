@@ -600,6 +600,14 @@ button.secondary {
   color: #f7768e;
 }
 
+.diff-refused {
+  border-color: #6b5a3a;
+}
+
+.diff-refused .diff-verdict {
+  color: #e0af68;
+}
+
 .diff-list {
   list-style: none;
   margin: 0;

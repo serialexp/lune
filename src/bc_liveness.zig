@@ -115,6 +115,56 @@ pub fn successors(ins: Instr, pc: u32, code_len: usize) [2]?u32 {
     return effectOf(ins, pc, code_len).succ;
 }
 
+/// Whether `ins` at `pc` may write register `reg` on any edge: the superset
+/// of the kills (`effectOf`'s writes are exact or conservative-to-none, the
+/// wrong direction for this question). Every write whose extent is dynamic
+/// or conditional counts here — a call or `vararg_spread` writes from its
+/// base up, a numeric `for` its index and loop variable, `itern` its
+/// fallback's copies — and so does any patched-image opcode. For the
+/// variable naming of runtime errors (`bc_names`), where a missed write
+/// would name the wrong value.
+pub fn mayWrite(ins: Instr, pc: u32, code_len: usize, reg: u16) bool {
+    const a: u32 = ins.a;
+    const r: u32 = reg;
+    switch (ins.op) {
+        .call, .vararg_spread => return r >= a,
+        // The whole control block: a numeric `for` may normalize its
+        // limit and step as well as stepping the index.
+        .for_prep, .for_loop => return r >= a and r < a + 4,
+        .tfor_loop => return r >= a,
+        .itern => return r >= a + 3 and r < a + 6,
+        .jfor_loop, .jloop, .jfunc_head, .jcont => return true,
+        else => {
+            if (fixed_kills.get(ins.op)) |k| return r >= a + k.lo and r < a + k.hi;
+            const e = effectOf(ins, pc, code_len);
+            return reg >= e.kill_lo and reg < e.kill_hi;
+        },
+    }
+}
+
+/// Per opcode, the registers `effectOf` kills as offsets from `a`, when they
+/// depend on nothing else; null when they do (or the op is `mayWrite`'s own
+/// case). Derived from `effectOf` at compile time, so `mayWrite` asks it
+/// without building an `Effect` for the common ops and the two cannot
+/// disagree.
+const fixed_kills = blk: {
+    @setEvalBranchQuota(200_000);
+    const Span = struct { lo: u32, hi: u32 };
+    var t = std.enums.EnumArray(bytecode.OpCode, ?Span).initFill(null);
+    for (std.enums.values(bytecode.OpCode)) |op| {
+        if (op == .itern) continue; // out of line; `mayWrite` handles it
+        const x = effectOf(.{ .op = op, .a = 20, .b = 3, .c = 4, .aux = 2 }, 10, 100);
+        const y = effectOf(.{ .op = op, .a = 20, .b = 9, .c = 11, .aux = -3 }, 10, 100);
+        if (x.kill_lo != y.kill_lo or x.kill_hi != y.kill_hi) continue;
+        if (x.kill_hi == x.kill_lo) {
+            t.set(op, .{ .lo = 0, .hi = 0 });
+        } else if (x.kill_lo >= 20) {
+            t.set(op, .{ .lo = x.kill_lo - 20, .hi = x.kill_hi - 20 });
+        }
+    }
+    break :blk t;
+};
+
 /// Doc 66 P1: `itern` reads f, s and ctrl. Both lanes write the `c` loop
 /// variables; only the fallback's copies write R[a+3+c..a+6) when `c < 3`,
 /// so those are not a kill (nothing ever reads them). Out of line: as an
@@ -647,6 +697,25 @@ fn computeT(code: []const Instr, n: u16, children: []const *const Proto) !RegLiv
 
 fn freeT(l: RegLiveness) void {
     if (l.bits.len != 0) testing.allocator.free(l.bits);
+}
+
+test "mayWrite's comptime kill table agrees with effectOf, and covers every kill" {
+    for (std.enums.values(bytecode.OpCode)) |op| {
+        if (op == .itern) continue;
+        for ([_][3]u16{ .{ 0, 0, 0 }, .{ 7, 2, 9 }, .{ 30, 31, 1 } }) |abc| for ([_]i32{ -2, 0, 3 }) |aux| {
+            const ins: Instr = .{ .op = op, .a = abc[0], .b = abc[1], .c = abc[2], .aux = aux };
+            const e = effectOf(ins, 10, 100);
+            for (0..64) |r| {
+                const reg: u16 = @intCast(r);
+                // A kill is a write: `mayWrite` may say more, never less.
+                if (reg >= e.kill_lo and reg < e.kill_hi) try testing.expect(mayWrite(ins, 10, 100, reg));
+                if (fixed_kills.get(op)) |k| {
+                    const in_table = reg >= abc[0] + k.lo and reg < abc[0] + k.hi;
+                    try testing.expectEqual(reg >= e.kill_lo and reg < e.kill_hi, in_table);
+                }
+            }
+        };
+    }
 }
 
 test "straight line: a value is live from its def to its last use, a dead def never" {

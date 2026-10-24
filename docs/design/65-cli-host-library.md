@@ -1,6 +1,6 @@
 # 65 — The `io` and `os` host library — Design
 
-Status: Phases 0–4 implemented; Phases 5–6 not started. Ground rules
+Status: Phases 0–5 implemented; Phase 6 not started. Ground rules
 D1–D4 (2026-10-20) and all ten design questions Q1–Q10 (2026-10-21)
 decided by Bart; the design below reflects the answers.
 Owner: Bart
@@ -155,6 +155,23 @@ checked. Every phase lands behind `just test`, `just hashgate` and
     tests, and the real-OS tests in `src/host_system.zig`.
   - [x] Benchmark `bench/stdlib/os_date.lua` (§9).
   - [x] Inventory rows for the six functions.
+- [x] **Phase 5 — the visualiser.** 2026-10-24.
+  - [x] Changed from the plan (Bart, 2026-10-24): the refusal keys on the
+    run's error, not on the effect log (§10 Q10, *As built*).
+  - [x] Runtime errors name the value as Lua 5.4 does ("attempt to call a
+    nil value (field 'open')", "(global 'foo')", "(method 'read')"),
+    derived from the bytecode (`src/bc_names.zig`). A nil that a system
+    group this VM lacks would have installed says so: "(field 'open';
+    io.open needs the 'files' system interface, which this VM does not
+    have)". Every embedding gets it; it is not a visualiser feature.
+  - [x] "Run both + diff" reports "not compared" with that clause when
+    either run stopped on it (`viz/src/diff.ts`); a program that handles
+    the miss with `pcall` is compared as usual.
+  - [x] Tests: `src/bc_names.zig` (names, the no-name cases, hand-built
+    branch and loop CFGs, the comptime tables against `bc_liveness`),
+    the messages in `interp_semantics_test.zig` and `interp_os_test.zig`
+    (every trace mode), and the viz diff tests on both engines.
+  - [x] Benchmark `bench/stdlib/pcall_faults.lua` (§9).
 
 ### Outstanding
 
@@ -174,9 +191,6 @@ checked. Every phase lands behind `just test`, `just hashgate` and
   replay without a host (§8 *As built*). The alternative is offset only,
   with `%Z` printing the numeric offset; Bart has not confirmed the
   choice.
-- [ ] **Phase 5 — the visualiser.** "Run both + diff" refuses programs
-  whose native run used a system interface, with a message saying why
-  (Q10).
 - [ ] **Phase 6 — docs and inventory.** Flip the 27 `cli-binding` rows;
   update doc 02's taxonomy table; document the user-facing differences
   (raising errors and the compatibility mode, code-point `read(n)`,
@@ -615,6 +629,13 @@ The zone file is read once per VM and each lookup is a binary search
 over its transitions. Record mode logs one 14-byte `local_zone` entry
 per lookup, three per iteration here (0.34 s, 13 MB for 900 k entries).
 
+**Phase 5 measurements** (2026-10-24; Linux x86-64, ReleaseFast): naming
+the value costs every caught fault a backward scan and a walk over the
+function's jumps. A `pcall` loop of a million nil calls from a
+30-instruction function: 0.17 s before, 0.29 s after, `lua5.4` 0.37 s.
+`bench/stdlib/pcall_faults.lua` (300 k mixed faults): mahina 0.10 s,
+LuaJIT 0.31 s.
+
 ## 10. Design questions (all decided 2026-10-21)
 
 Kept with their options, so the reasoning stays visible.
@@ -666,6 +687,17 @@ Kept with their options, so the reasoning stays visible.
   that the script cannot be compared and refuse to compare it. The
   native run's effect log says whether a system interface was used; the
   visualiser refuses the comparison when it was.
+
+  *As built (Phase 5, Bart's choice 2026-10-24):* Phase 1 gave the
+  visualiser's native runs the playground's groups (`clock,random`), so
+  both engines see the same globals, and a program that calls `io.open`
+  fails the same way in both; the effect log can never show the
+  interface. So the VM's error says it: an "attempt to call a nil value"
+  (or to index one) whose value would have come from a group the VM
+  lacks names the member and the group, and the visualiser refuses the
+  comparison when either run stopped on that error. The phrase is
+  `Vm.missing_system_phrase`, matched by `missingSystemInterface` in
+  `viz/src/diff.ts`.
 
 ## 11. References
 

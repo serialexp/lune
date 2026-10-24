@@ -488,6 +488,39 @@ test "a multret consumer that faults on a non-callable value consumes its produc
     );
 }
 
+test "a call or index fault names the value as Lua 5.4 does" {
+    // Globals, fields and methods are named; mahina keeps no local or
+    // upvalue names, so those stay bare. A tail call and a call under
+    // `return` fault the same way.
+    // (Two programs: the harness's output buffer is 256 bytes.)
+    try expectProgram(
+        \\local t = {}
+        \\print(pcall(function() nope() end))
+        \\print(pcall(function() t.a.b = 1 end))
+        \\print(pcall(function() return t.missing(1) end))
+        \\print(pcall(function() t:method() end))
+        \\
+    ,
+        "false\tanonymous:2: attempt to call a nil value (global 'nope')\n" ++
+            "false\tanonymous:3: attempt to index a nil value (field 'a')\n" ++
+            "false\tanonymous:4: attempt to call a nil value (field 'missing')\n" ++
+            "false\tanonymous:5: attempt to call a nil value (method 'method')\n",
+    );
+    try expectProgram(
+        \\local f
+        \\print(pcall(function() return string.nope("x") end))
+        \\print(pcall(function() f() end))
+        \\print(pcall(function() for _ in nil do end end))
+        \\print(pcall(function() return undefined.x end))
+        \\
+    ,
+        "false\tanonymous:2: attempt to call a nil value (field 'nope')\n" ++
+            "false\tanonymous:3: attempt to call a nil value\n" ++
+            "false\tanonymous:4: attempt to call a nil value\n" ++
+            "false\tanonymous:5: attempt to index a nil value (global 'undefined')\n",
+    );
+}
+
 test "pcall unwind closes the faulting frame's escaped upvalue" {
     // A closure captures a local inside the protected function and escapes (stored
     // in an outer variable) before the call errors. On unwind the faulting frame's

@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { instantiateMahinaFromBytes, type MahinaModule } from "../src/wasm/mahina";
-import { diffRuns, type RunArtifacts } from "../src/diff";
+import { diffRuns, missingSystemInterface, type RunArtifacts } from "../src/diff";
 
 const repoBin = (name: string) => fileURLToPath(new URL(`../../zig-out/bin/${name}`, import.meta.url));
 const wasmPath = repoBin("mahina.wasm");
@@ -45,6 +45,7 @@ function runNative(source: string): RunArtifacts {
     return {
       status: r.exitCode === 0 ? 0 : 1,
       stdout: r.stdout.toString(),
+      diagnostics: r.stderr.toString(),
       keyframe: read(kf),
       effects: read(ef),
       trace: read(tr),
@@ -56,7 +57,7 @@ function runNative(source: string): RunArtifacts {
 
 function runWasm(source: string): RunArtifacts {
   const r = mod.runSource(source);
-  return { status: r.status, stdout: r.stdout, keyframe: r.keyframe, effects: r.effects, trace: r.trace };
+  return { status: r.status, stdout: r.stdout, diagnostics: r.diagnostics, keyframe: r.keyframe, effects: r.effects, trace: r.trace };
 }
 
 // Integer/deterministic corpus: no clock(), no floats ⇒ the strong byte-identity
@@ -119,4 +120,38 @@ test("basic float ops are bit-identical across wasm and native", () => {
   expect(report.stdoutMatch).toBe(true);
   for (const a of report.artifacts) expect(a.match).toBe(true);
   expect(report.ok).toBe(true);
+});
+
+test("a program that needs a system interface the browser lacks is refused, naming it (doc 65 Q10)", () => {
+  const src = 'print("before")\nlocal f = io.open("data.txt")\nprint(f:read("a"))\n';
+  const wasm = runWasm(src);
+  const native = runNative(src);
+  const report = diffRuns(wasm, native);
+
+  expect(wasm.diagnostics).toContain("io.open needs the 'files' system interface");
+  expect(native.diagnostics).toContain("io.open needs the 'files' system interface");
+  expect(report.refused).toBe("io.open needs the 'files' system interface");
+  expect(report.ok).toBe(false);
+  expect(report.artifacts).toEqual([]);
+});
+
+test("a miss the program handles itself is compared as usual", () => {
+  const src = "print(pcall(os.time))\nprint(pcall(function() return os.time() end))\n";
+  const wasm = runWasm(src);
+  const native = runNative(src);
+  const report = diffRuns(wasm, native);
+
+  expect(report.refused).toBeNull();
+  expect(report.stdoutMatch).toBe(true);
+  expect(report.ok).toBe(true);
+});
+
+test("missingSystemInterface picks out the clause, and only from that message", () => {
+  expect(
+    missingSystemInterface(
+      "p.mahina:2: attempt to index a nil value (field 'stdin'; io.stdin needs the 'stdio' system interface, which this VM does not have)",
+    ),
+  ).toBe("io.stdin needs the 'stdio' system interface");
+  expect(missingSystemInterface("p.mahina:1: attempt to call a nil value (global 'foo')")).toBeNull();
+  expect(missingSystemInterface("")).toBeNull();
 });
