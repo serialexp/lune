@@ -18,6 +18,7 @@ const function = @import("function.zig");
 const trace = @import("trace.zig");
 const irinterp = @import("irinterp.zig");
 const execlog = @import("execlog.zig");
+const effectser = @import("effectser.zig");
 const compiler = @import("compiler.zig");
 const io = @import("io.zig");
 const stdmath = @import("stdlib/math.zig");
@@ -149,7 +150,7 @@ fn effectRun(gpa: std.mem.Allocator, source: [:0]const u8, mode: EffectMode, pre
     try vm.enableSystem(.{ .clock = true });
     if (clock) |c| vm.clock_source = c.source();
     if (seed) |s| vm.random_seed_source = s.source();
-    if (preload.len > 0) try vm.effect_log.appendSlice(gpa, preload);
+    if (preload.len > 0) try vm.effect_log.entries.appendSlice(gpa, preload);
 
     var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
@@ -158,7 +159,7 @@ fn effectRun(gpa: std.mem.Allocator, source: [:0]const u8, mode: EffectMode, pre
     _ = try vm.run(chunk.proto);
     return .{
         .out = try gpa.dupe(u8, sink.buffered()),
-        .log = try gpa.dupe(Effect, vm.effect_log.items),
+        .log = try gpa.dupe(Effect, vm.effect_log.entries.items),
     };
 }
 
@@ -201,7 +202,7 @@ test "F2d: replay with a too-short log reports EffectLogExhausted (no silent div
     ;
     // A one-entry log for a program that asks for two effects. Replay feeds the
     // log back (no clock needed) and runs out on the second call.
-    const short = [_]Effect{.{ .kind = .clock, .result = Value.int(123) }};
+    const short = [_]Effect{Effect.of(.clock, Value.int(123))};
     try testing.expectError(error.EffectLogExhausted, effectRun(gpa, source, .replay, &short, null, null));
 }
 
@@ -401,7 +402,7 @@ test "doc 65 Q4: math.random() with no injected source starts from the fixed def
     try testing.expectEqualStrings(a.out, b.out);
     try testing.expectEqual(@as(usize, 1), a.log.len);
     try testing.expectEqual(EffectKind.random_seed, a.log[0].kind);
-    try testing.expectEqual(@as(i64, @bitCast(interp.default_random_seed)), a.log[0].result.asInt());
+    try testing.expectEqual(@as(i64, @bitCast(interp.default_random_seed)), a.log[0].result.value.asInt());
     const rep = try effectRun(gpa, "print(math.random(1, 1000000))", .replay, a.log, null, null);
     defer rep.deinit(gpa);
     try testing.expectEqualStrings(a.out, rep.out);
@@ -499,7 +500,7 @@ test "F2e: an invalid math.random call raises before touching the seed/effect bo
     vm.effect_mode = .record;
     vm.random_seed_source = sd.source();
     try testing.expectError(error.LuaError, compileRun(gpa, &vm, "math.random(5, 2)"));
-    try testing.expectEqual(@as(usize, 0), vm.effect_log.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.effect_log.entries.items.len);
 }
 
 test "F2e: math.randomseed(x) re-seeds deterministically (same seed → same stream)" {
@@ -550,7 +551,7 @@ test "doc 65 Q4: math.randomseed() with no injected source uses the default seed
     const r = try effectRun(gpa, "print(math.randomseed())", .record, &.{}, null, null);
     defer r.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), r.log.len);
-    try testing.expectEqual(@as(i64, @bitCast(interp.default_random_seed)), r.log[0].result.asInt());
+    try testing.expectEqual(@as(i64, @bitCast(interp.default_random_seed)), r.log[0].result.value.asInt());
 }
 
 // ---------------------------------------------------------------------------
@@ -586,8 +587,8 @@ test "env: os.getenv reads set/unset/empty (record)" {
         sink.buffered(),
     );
     // One effect logged per successful call.
-    try testing.expectEqual(@as(usize, 3), vm.effect_log.items.len);
-    for (vm.effect_log.items) |it| try testing.expectEqual(EffectKind.getenv, it.kind);
+    try testing.expectEqual(@as(usize, 3), vm.effect_log.entries.items.len);
+    for (vm.effect_log.entries.items) |it| try testing.expectEqual(EffectKind.getenv, it.kind);
 }
 
 test "doc 65 Q5: without the env group, os.getenv is absent and nothing is unavailable" {
@@ -622,12 +623,12 @@ test "env: a recorded string result survives a GC collection while parked in the
     // Read HOME but discard the result — nothing references the string except the
     // effect log. A collection would de-intern + free it without the new root.
     try compileRun(gpa, &vm, "os.getenv(\"HOME\")");
-    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.entries.items.len);
 
     vm.collect(); // force a stop-the-world sweep
 
     // The logged result must still be a live string reading "/home/bart".
-    const res = vm.effect_log.items[0].result;
+    const res = vm.effect_log.entries.items[0].result.value;
     try testing.expect(res.isHeap() and res.heapType() == .string);
     try testing.expectEqualStrings("/home/bart", string.String.fromHeader(res.asHeap()).bytes());
 }
@@ -644,7 +645,7 @@ test "env: replay feeds back a logged string result without calling the native" 
     // host system: getenv is not called — the logged string is fed back.
     try vm.enableSystem(.{ .env = true });
     const logged = try vm.heap.internValue("REPLAYED");
-    try vm.effect_log.append(gpa, .{ .kind = .getenv, .result = logged });
+    try vm.effect_log.append(gpa, Effect.of(.getenv, logged));
     vm.effect_mode = .replay;
 
     try compileRun(gpa, &vm, "print(os.getenv(\"IGNORED\"))");
@@ -691,8 +692,8 @@ test "S-B: a recorded non-UTF-8 getenv replays byte-identically (validate-after-
     const recorded = rec_sink.buffered();
     try testing.expectEqualStrings("false\tstring\n", recorded);
     // Exactly one getenv effect logged, holding the raw invalid bytes.
-    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
-    try testing.expectEqual(EffectKind.getenv, vm.effect_log.items[0].kind);
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.entries.items.len);
+    try testing.expectEqual(EffectKind.getenv, vm.effect_log.entries.items[0].kind);
 
     // Replay the same VM's log (string result lives in this heap) with no host
     // system: the native is not called, the logged bytes are re-validated → same
@@ -752,8 +753,8 @@ test "S-B: a recorded non-UTF-8 loadfile replays byte-identically (validate-afte
     const recorded = rec_sink.buffered();
     try testing.expectEqualStrings("false\tstring\n", recorded);
     // Exactly one file_read effect logged, holding the raw invalid bytes.
-    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
-    try testing.expectEqual(EffectKind.file_read, vm.effect_log.items[0].kind);
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.entries.items.len);
+    try testing.expectEqual(EffectKind.file_read, vm.effect_log.entries.items[0].kind);
 
     // Replay the same VM's log with no fs_source:
     // the logged bytes are re-validated -> same raise, same caught error, byte-identical output.
@@ -825,8 +826,8 @@ test "S-C: case ops pin the unicode_version exactly once; replay is byte-identic
     const recorded = rec_sink.buffered();
     try testing.expectEqualStrings("CAFÉ\nαβγ\n", recorded);
     // Two case operations, but the version is pinned only ONCE.
-    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
-    try testing.expectEqual(EffectKind.unicode_version, vm.effect_log.items[0].kind);
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.entries.items.len);
+    try testing.expectEqual(EffectKind.unicode_version, vm.effect_log.entries.items[0].kind);
 
     // Replay the same log → byte-identical (the recorded version equals this
     // binary's compiled version, so the re-pin passes and the tables match).
@@ -849,7 +850,7 @@ test "S-C: a replay log with a wrong unicode_version is a fatal, uncatchable err
     vm.out = &sink;
     vm.effect_mode = .replay;
     // A log claiming a Unicode version this binary's table was NOT built against.
-    try vm.effect_log.append(gpa, .{ .kind = .unicode_version, .result = Value.int(0xDEAD) });
+    try vm.effect_log.append(gpa, Effect.of(.unicode_version, Value.int(0xDEAD)));
     // Even wrapped in pcall, the mismatch is a determinism fault: NOT catchable.
     try testing.expectError(error.UnicodeVersionMismatch, compileRun(gpa, &vm,
         \\print(pcall(string.upper, "x"))
@@ -857,7 +858,7 @@ test "S-C: a replay log with a wrong unicode_version is a fatal, uncatchable err
 }
 
 test "S-C: a unicode_version log entry with a non-int (float) result is rejected, not asserted" {
-    // The shared scalar shape-gate accepts int OR float, so a corrupt log could
+    // The decoder accepts only an int here, but an in-memory log can still
     // park a float-tagged result on a .unicode_version entry. noteUnicodeVersion
     // must turn that into a clean UnicodeVersionMismatch rather than asserting in
     // asInt() on hostile bytes.
@@ -868,7 +869,7 @@ test "S-C: a unicode_version log entry with a non-int (float) result is rejected
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
     vm.effect_mode = .replay;
-    try vm.effect_log.append(gpa, .{ .kind = .unicode_version, .result = Value.float(16.0) });
+    try vm.effect_log.append(gpa, Effect.of(.unicode_version, Value.float(16.0)));
     try testing.expectError(error.UnicodeVersionMismatch, compileRun(gpa, &vm,
         \\print(pcall(string.lower, "X"))
     ));
@@ -894,7 +895,7 @@ test "S-C: a wrong-version pin is not self-erasing — the rejected entry stays 
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
     vm.effect_mode = .replay;
-    try vm.effect_log.append(gpa, .{ .kind = .unicode_version, .result = Value.int(0xDEAD) });
+    try vm.effect_log.append(gpa, Effect.of(.unicode_version, Value.int(0xDEAD)));
     const src =
         \\print(pcall(string.upper, "x"))
     ;
@@ -927,7 +928,7 @@ test "replay: a kind-diverged log entry is not consumed — the cursor stays put
     vm.out = &sink;
     vm.effect_mode = .replay;
     try vm.enableSystem(.{ .clock = true });
-    try vm.effect_log.append(gpa, .{ .kind = .unicode_version, .result = Value.int(1) });
+    try vm.effect_log.append(gpa, Effect.of(.unicode_version, Value.int(1)));
     try testing.expectError(error.EffectKindMismatch, compileRun(gpa, &vm,
         \\print(os.clock())
     ));
@@ -974,7 +975,6 @@ test "S-D: pattern matching over multibyte text is byte-identical across all mod
 
 test "A-vi: committed effect sequence is mode-independent across all four commit families" {
     const gpa = testing.allocator;
-    const effectser = @import("effectser.zig");
     const source: [:0]const u8 =
         \\local c = os.clock()
         \\local r = math.random()
@@ -1002,7 +1002,7 @@ test "A-vi: committed effect sequence is mode-independent across all four commit
         vm.system = ffs.system();
         try compileRun(gpa, &vm, source);
         try testing.expectEqual(@as(u64, 4), vm.committed_effect_seq);
-        try testing.expectEqual(@as(usize, 0), vm.effect_log.items.len);
+        try testing.expectEqual(@as(usize, 0), vm.effect_log.entries.items.len);
     }
 
     // Record produces clock, random_seed, unicode_version, file_read in order.
@@ -1022,12 +1022,12 @@ test "A-vi: committed effect sequence is mode-independent across all four commit
         vm.system = ffs.system();
         try compileRun(gpa, &vm, source);
         try testing.expectEqual(@as(u64, 4), vm.committed_effect_seq);
-        try testing.expectEqual(@as(usize, 4), vm.effect_log.items.len);
-        try testing.expectEqual(EffectKind.clock, vm.effect_log.items[0].kind);
-        try testing.expectEqual(EffectKind.random_seed, vm.effect_log.items[1].kind);
-        try testing.expectEqual(EffectKind.unicode_version, vm.effect_log.items[2].kind);
-        try testing.expectEqual(EffectKind.file_read, vm.effect_log.items[3].kind);
-        log_bytes = try effectser.encodeFile(gpa, vm.effect_log.items);
+        try testing.expectEqual(@as(usize, 4), vm.effect_log.entries.items.len);
+        try testing.expectEqual(EffectKind.clock, vm.effect_log.entries.items[0].kind);
+        try testing.expectEqual(EffectKind.random_seed, vm.effect_log.entries.items[1].kind);
+        try testing.expectEqual(EffectKind.unicode_version, vm.effect_log.entries.items[2].kind);
+        try testing.expectEqual(EffectKind.file_read, vm.effect_log.entries.items[3].kind);
+        log_bytes = try effectser.encodeFile(gpa, &vm.effect_log);
     }
     defer gpa.free(log_bytes);
 
@@ -1041,17 +1041,15 @@ test "A-vi: committed effect sequence is mode-independent across all four commit
         var out_buf: [256]u8 = undefined;
         var sink = io.Writer.fixed(&out_buf);
         vm.out = &sink;
-        const log = try effectser.decodeFile(gpa, vm.heap, log_bytes);
-        defer gpa.free(log);
-        try vm.effect_log.appendSlice(gpa, log);
+        try effectser.decodeInto(&vm.effect_log, gpa, vm.heap, log_bytes);
         vm.effect_mode = .replay;
         try compileRun(gpa, &vm, source);
         try testing.expectEqual(@as(u64, 4), vm.committed_effect_seq);
-        try testing.expectEqual(vm.effect_log.items.len, vm.effect_cursor);
+        try testing.expectEqual(vm.effect_log.entries.items.len, vm.effect_cursor);
         vm.unicode_version_pinned = false;
         try noteUnicodeVersion(&vm);
         try testing.expectEqual(@as(u64, 4), vm.committed_effect_seq);
-        try testing.expectEqual(vm.effect_log.items.len, vm.effect_cursor);
+        try testing.expectEqual(vm.effect_log.entries.items.len, vm.effect_cursor);
     }
 
     // A host failure occurs before commitment and leaves the counter untouched.
@@ -1085,8 +1083,8 @@ test "L-3: loadfile reads + compiles a file via the file_read effect (record)" {
     );
     try testing.expectEqualStrings("42\n", sink.buffered());
     // Exactly one file_read effect logged (the single loadfile read).
-    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
-    try testing.expectEqual(EffectKind.file_read, vm.effect_log.items[0].kind);
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.entries.items.len);
+    try testing.expectEqual(EffectKind.file_read, vm.effect_log.entries.items[0].kind);
 }
 
 test "L-3: dofile runs the file and returns its results (record)" {
@@ -1111,7 +1109,6 @@ test "L-3: dofile runs the file and returns its results (record)" {
 
 test "L-3: record→serialize→replay reproduces output with the FS detached" {
     const gpa = testing.allocator;
-    const effectser = @import("effectser.zig");
     // `add.lua` is a vararg chunk loaded by `loadfile` and then called with args;
     // `const.lua` is run directly by `dofile`. Two distinct file_read effects.
     var ffs = FakeFs{ .entries = &.{
@@ -1135,10 +1132,10 @@ test "L-3: record→serialize→replay reproduces output with the FS detached" {
         vm.system = ffs.system();
         try compileRun(gpa, &vm, driver);
         // Two file reads (loadfile + dofile), both file_read effects.
-        try testing.expectEqual(@as(usize, 2), vm.effect_log.items.len);
-        try testing.expectEqual(EffectKind.file_read, vm.effect_log.items[0].kind);
-        try testing.expectEqual(EffectKind.file_read, vm.effect_log.items[1].kind);
-        log_bytes = try effectser.encodeFile(gpa, vm.effect_log.items);
+        try testing.expectEqual(@as(usize, 2), vm.effect_log.entries.items.len);
+        try testing.expectEqual(EffectKind.file_read, vm.effect_log.entries.items[0].kind);
+        try testing.expectEqual(EffectKind.file_read, vm.effect_log.entries.items[1].kind);
+        log_bytes = try effectser.encodeFile(gpa, &vm.effect_log);
     }
     defer gpa.free(log_bytes);
 
@@ -1151,9 +1148,7 @@ test "L-3: record→serialize→replay reproduces output with the FS detached" {
         defer vm.deinit();
         var sink = io.Writer.fixed(&rep_out_buf);
         vm.out = &sink;
-        const log = try effectser.decodeFile(gpa, vm.heap, log_bytes);
-        defer gpa.free(log);
-        try vm.effect_log.appendSlice(gpa, log);
+        try effectser.decodeInto(&vm.effect_log, gpa, vm.heap, log_bytes);
         vm.effect_mode = .replay;
         // No fs_source set on purpose.
         try compileRun(gpa, &vm, driver);
@@ -1253,4 +1248,168 @@ test "multi-file: fault, frames and safepoint lines name the chunk their line is
         } else saw_static = true;
     }
     try testing.expect(saw_static and saw_mod_line3);
+}
+
+// ---------------------------------------------------------------------------
+// Doc 65 Phase 2 — the effect log for host operations: the recording cap, the
+// pinned io error mode, and fail/bytes results through record and replay.
+
+test "doc 65 §4.5: a recording past the effect-log limit is fatal, uncatchable, and names the limit" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    var env: FakeEnv = .{};
+    try env.install(&vm);
+    vm.effect_mode = .record;
+    // A nil getenv result encodes as 3 bytes (kind, tag, pad): room for three.
+    const limit = effectser.file_header_size + 3 * 3;
+    vm.effect_log_limit = limit;
+    const err = compileRun(gpa, &vm,
+        \\for i = 1, 10 do print(pcall(os.getenv, "UNSET")) end
+    );
+    try testing.expectError(error.EffectLogLimit, err);
+    try testing.expect(!interp.catchable(error.EffectLogLimit));
+    // The entries before the cap are all there, none dropped, none past it.
+    try testing.expectEqual(@as(usize, 3), vm.effect_log.len());
+    try testing.expectEqual(limit, vm.effect_log_encoded);
+    try testing.expectEqualStrings("true\tnil\ntrue\tnil\ntrue\tnil\n", sink.buffered());
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const fault = try vm.describeFault(error.EffectLogLimit, arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, fault.message, "limit of 17 bytes") != null);
+    try testing.expect(std.mem.indexOf(u8, fault.message, "--effect-log-limit") != null);
+}
+
+test "doc 65 §4.5: the cap counts what encodeFile writes, and 0 or off mode means none" {
+    const gpa = testing.allocator;
+    const src =
+        \\for i = 1, 50 do os.getenv("HOME") end
+    ;
+    // Record with no cap: the counter equals the encoded file's size.
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var env: FakeEnv = .{};
+        try env.install(&vm);
+        vm.effect_mode = .record;
+        vm.effect_log_limit = 0;
+        try compileRun(gpa, &vm, src);
+        try testing.expectEqual(@as(usize, 50), vm.effect_log.len());
+        const bytes = try effectser.encodeFile(gpa, &vm.effect_log);
+        defer gpa.free(bytes);
+        try testing.expectEqual(bytes.len, vm.effect_log_encoded);
+    }
+    // Off mode logs nothing, so a tiny cap never trips.
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var env: FakeEnv = .{};
+        try env.install(&vm);
+        vm.effect_log_limit = 1;
+        try compileRun(gpa, &vm, src);
+        try testing.expectEqual(@as(usize, 0), vm.effect_log.len());
+    }
+}
+
+test "doc 65 §4.4: the io error mode is pinned once per session in record" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.effect_mode = .record;
+    vm.io_errors = .lua;
+    try interp.noteIoErrorMode(&vm);
+    try interp.noteIoErrorMode(&vm);
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.len());
+    const e = vm.effect_log.entries.items[0];
+    try testing.expectEqual(EffectKind.io_error_mode, e.kind);
+    try testing.expectEqual(@as(i64, 1), e.result.value.asInt());
+    try testing.expectEqual(@as(u64, 1), vm.committed_effect_seq);
+}
+
+test "doc 65 §4.4: a replay under the other io error mode refuses, and the entry stays at the cursor" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.effect_mode = .replay;
+    vm.io_errors = .raise;
+    try vm.effect_log.append(gpa, Effect.of(.io_error_mode, Value.int(1)));
+    try testing.expectError(error.IoErrorModeMismatch, interp.noteIoErrorMode(&vm));
+    try testing.expectError(error.IoErrorModeMismatch, interp.noteIoErrorMode(&vm));
+    try testing.expectEqual(@as(usize, 0), vm.effect_cursor);
+    try testing.expect(!vm.io_errors_pinned);
+    try testing.expect(!interp.catchable(error.IoErrorModeMismatch));
+    // Under the recorded mode it is consumed once.
+    vm.io_errors = .lua;
+    try interp.noteIoErrorMode(&vm);
+    try interp.noteIoErrorMode(&vm);
+    try testing.expectEqual(@as(usize, 1), vm.effect_cursor);
+    try testing.expect(vm.io_errors_pinned);
+}
+
+test "doc 65 §4.4: a resumed replay does not consume a second io error mode pin" {
+    // The keyframe carries no pinned flag: after a restore the pin before the
+    // cut is found behind the cursor, as for `unicode_version`.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.effect_mode = .replay;
+    try vm.effect_log.append(gpa, Effect.of(.io_error_mode, Value.int(0)));
+    try vm.effect_log.append(gpa, Effect.of(.file_seek, Value.int(9)));
+    vm.effect_cursor = 1;
+    try interp.noteIoErrorMode(&vm);
+    try testing.expectEqual(@as(usize, 1), vm.effect_cursor);
+    try testing.expectEqual(@as(i64, 9), (try interp.replayHost(&vm, .file_seek)).value.asInt());
+}
+
+test "doc 65 §4.2: host results — values, failures and bytes — record, encode and replay" {
+    const gpa = testing.allocator;
+    var log_bytes: []u8 = undefined;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        vm.effect_mode = .record;
+        try interp.noteIoErrorMode(&vm);
+        try interp.recordHost(&vm, .file_open, .{ .value = Value.int(3) });
+        try interp.recordHost(&vm, .file_open, .{ .fail = .not_found });
+        var buf = [_]u8{ 0xff, 0x00, 0x80 };
+        try interp.recordHostBytes(&vm, .file_read_op, &buf);
+        buf[0] = 0; // the log holds its own copy
+        try interp.recordHost(&vm, .file_read_op, .{ .value = try vm.heap.internValue("línea") });
+        try interp.recordHost(&vm, .file_write, .{ .value = Value.nil() });
+        try testing.expectEqual(@as(u64, 6), vm.committed_effect_seq);
+        log_bytes = try effectser.encodeFile(gpa, &vm.effect_log);
+        try testing.expectEqual(log_bytes.len, vm.effect_log_encoded);
+    }
+    defer gpa.free(log_bytes);
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    try effectser.decodeInto(&vm.effect_log, gpa, vm.heap, log_bytes);
+    vm.effect_mode = .replay;
+    try interp.noteIoErrorMode(&vm);
+    try testing.expectEqual(@as(i64, 3), (try interp.replayHost(&vm, .file_open)).value.asInt());
+    try testing.expectEqual(@import("system.zig").ErrorClass.not_found, (try interp.replayHost(&vm, .file_open)).fail);
+    const raw = try interp.replayHost(&vm, .file_read_op);
+    try testing.expectEqualSlices(u8, &.{ 0xff, 0x00, 0x80 }, vm.effect_log.bytesOf(raw.bytes));
+    const line = (try interp.replayHost(&vm, .file_read_op)).value;
+    try testing.expectEqualStrings("línea", string.String.fromHeader(line.asHeap()).bytes());
+    // A kind the program did not ask for is refused and left at the cursor.
+    try testing.expectError(error.EffectKindMismatch, interp.replayHost(&vm, .file_seek));
+    try testing.expect((try interp.replayHost(&vm, .file_write)).value.tag == .nil);
+    try testing.expectError(error.EffectLogExhausted, interp.replayHost(&vm, .file_write));
+}
+
+test "doc 65 §4.5: a bytes result past the cap is refused and leaves the log as it was" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.effect_mode = .record;
+    vm.effect_log_limit = effectser.file_header_size + 2 + 4 + 15;
+    try testing.expectError(error.EffectLogLimit, interp.recordHostBytes(&vm, .file_read_op, "sixteen bytes!!!"));
+    try testing.expectEqual(@as(usize, 0), vm.effect_log.len());
+    try testing.expectEqual(@as(usize, 0), vm.effect_log.bytes.items.len);
+    try interp.recordHostBytes(&vm, .file_read_op, "fifteen bytes!!");
+    try testing.expectEqual(vm.effect_log_limit, vm.effect_log_encoded);
 }

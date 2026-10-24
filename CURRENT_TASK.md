@@ -10,8 +10,17 @@ DOC 65 PHASE 1: ONE HOST SEAM + THE SYSTEM SWITCH (2026-10-24, coral-marten).
   `clock,random` (the playground's groups) so both engines see the same
   globals. Init allocates 10 fewer objects, so the GC/phaseq tests' table
   ids moved by −0xa.
-- Next: Phase 2 (effect-log format: fail/bytes results, new kinds, the
-  1 MiB cap, the pinned io error mode, version 6), then Phases 3–6.
+- Phase 2 (same day): `src/effectlog.zig` — `Effect.Result` is a value,
+  bytes (in the log's own buffer) or a failure class; `Vm.effect_log` is an
+  `EffectLog`. Kinds 7–16 (file/fs/wall-clock/local-offset/io_error_mode),
+  wire tags 5 (`EffectBytes`) and 6 (`HostFail`), effect format v6.
+  `effectser.decodeInto`/`encodeFile(&log)`/`encodePrefix`; the decoder
+  checks each result against its kind. The 1 MiB cap
+  (`--effect-log-limit`, fatal `EffectLogLimit`) counts the exact encoded
+  size. `noteIoErrorMode` pins the error mode (`pinSessionConstant`, shared
+  with the Unicode pin). `recordHost`/`recordHostBytes`/`replayHost` are
+  the entry points for the Phase 3/4 natives.
+- Next: Phase 3 (the `file` heap object + `io` library), then 4–6.
 
 DOC 72 P0–P2: TABLE CONSTRUCTORS (2026-10-23, coral-marten).
 - `new_table a, c` pre-sizes the hash part for more than three named/keyed

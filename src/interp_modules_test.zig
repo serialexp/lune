@@ -88,8 +88,8 @@ test "P3: require loads, caches, and reads the file exactly once" {
     // from `package.loaded` and re-searches nothing. A caching regression would
     // double this count rather than change it by one, which is why the number is
     // still a sharp test of the property the name claims.
-    try testing.expectEqual(@as(usize, 3), vm.effect_log.items.len);
-    for (vm.effect_log.items) |e| try testing.expectEqual(EffectKind.file_read, e.kind);
+    try testing.expectEqual(@as(usize, 3), vm.effect_log.entries.items.len);
+    for (vm.effect_log.entries.items) |e| try testing.expectEqual(EffectKind.file_read, e.kind);
 }
 
 test "P3: package.preload beats the path searcher and seeds package.loaded" {
@@ -108,7 +108,7 @@ test "P3: package.preload beats the path searcher and seeds package.loaded" {
     );
     try testing.expectEqualStrings("preload:m\npreload:m\n", sink.buffered());
     // Preload won before the path searcher ran → no file was ever read.
-    try testing.expectEqual(@as(usize, 0), vm.effect_log.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.effect_log.entries.items.len);
 }
 
 test "P3: a dotted module name maps dots to the path separator" {
@@ -159,7 +159,7 @@ test "P3: `.mah` wins over `.lua` when a module exists as both" {
     );
     try testing.expectEqualStrings("from-mah\n", sink.buffered());
     // The `.lua` candidate is never even read: the search stops at the first hit.
-    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.entries.items.len);
 }
 
 test "P3: a `.lua` module still resolves when no `.mah` shadows it" {
@@ -280,8 +280,8 @@ test "P3: record→serialize→replay reproduces a require program with the FS d
         // module costs two recorded misses (`./greeter.mah`, `./greeter/init.mah`)
         // before the hit on `./greeter.lua`. The misses are part of the recording
         // and must replay identically, which is what this test then proves.
-        try testing.expectEqual(@as(usize, 3), vm.effect_log.items.len);
-        log_bytes = try effectser.encodeFile(gpa, vm.effect_log.items);
+        try testing.expectEqual(@as(usize, 3), vm.effect_log.entries.items.len);
+        log_bytes = try effectser.encodeFile(gpa, &vm.effect_log);
     }
     defer gpa.free(log_bytes);
 
@@ -291,9 +291,7 @@ test "P3: record→serialize→replay reproduces a require program with the FS d
         defer vm.deinit();
         var sink = io.Writer.fixed(&rep_out_buf);
         vm.out = &sink;
-        const log = try effectser.decodeFile(gpa, vm.heap, log_bytes);
-        defer gpa.free(log);
-        try vm.effect_log.appendSlice(gpa, log);
+        try effectser.decodeInto(&vm.effect_log, gpa, vm.heap, log_bytes);
         vm.effect_mode = .replay; // NO host system — content must come from the log
         try compileRun(gpa, &vm, driver);
         try testing.expectEqualStrings("hi mahina\n", sink.buffered());

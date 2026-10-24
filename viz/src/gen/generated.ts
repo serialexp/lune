@@ -3969,7 +3969,7 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/argv) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. tag: nil=0, bool=1, int=2, float=3, string=4.
+ * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/file_read) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. Doc 65 adds the bytes of a `b`-mode read (EffectBytes, rebuilt into a fresh byte array on replay) and a failed host call (HostFail, its error class). Trace execution events (ExecEvent) carry only tags 0-4. tag: nil=0, bool=1, int=2, float=3, string=4, bytes=5, fail=6.
  */
 export interface EffectResultInput {
   /**
@@ -3984,18 +3984,20 @@ export interface EffectResultInput {
    * @remarks
    *
    * Discriminator: field 'tag'
-   * Variants: 5
+   * Variants: 7
    * - ConstNil (when value === 0)
    * - ConstBool (when value === 1)
    * - ConstInt (when value === 2)
    * - ConstFloat (when value === 3)
    * - ConstString (when value === 4)
+   * - EffectBytes (when value === 5)
+   * - HostFail (when value === 6)
    */
-  body: { type: 'ConstNil'; value: ConstNilInput } | { type: 'ConstBool'; value: ConstBoolInput } | { type: 'ConstInt'; value: ConstIntInput } | { type: 'ConstFloat'; value: ConstFloatInput } | { type: 'ConstString'; value: ConstStringInput };
+  body: { type: 'ConstNil'; value: ConstNilInput } | { type: 'ConstBool'; value: ConstBoolInput } | { type: 'ConstInt'; value: ConstIntInput } | { type: 'ConstFloat'; value: ConstFloatInput } | { type: 'ConstString'; value: ConstStringInput } | { type: 'EffectBytes'; value: EffectBytesInput } | { type: 'HostFail'; value: HostFailInput };
 }
 
 /**
- * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/argv) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. tag: nil=0, bool=1, int=2, float=3, string=4.
+ * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/file_read) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. Doc 65 adds the bytes of a `b`-mode read (EffectBytes, rebuilt into a fresh byte array on replay) and a failed host call (HostFail, its error class). Trace execution events (ExecEvent) carry only tags 0-4. tag: nil=0, bool=1, int=2, float=3, string=4, bytes=5, fail=6.
  */
 export interface EffectResultOutput {
   /**
@@ -4010,14 +4012,16 @@ export interface EffectResultOutput {
    * @remarks
    *
    * Discriminator: field 'tag'
-   * Variants: 5
+   * Variants: 7
    * - ConstNil (when value === 0)
    * - ConstBool (when value === 1)
    * - ConstInt (when value === 2)
    * - ConstFloat (when value === 3)
    * - ConstString (when value === 4)
+   * - EffectBytes (when value === 5)
+   * - HostFail (when value === 6)
    */
-  body: { type: 'ConstNil'; value: ConstNilOutput } | { type: 'ConstBool'; value: ConstBoolOutput } | { type: 'ConstInt'; value: ConstIntOutput } | { type: 'ConstFloat'; value: ConstFloatOutput } | { type: 'ConstString'; value: ConstStringOutput };
+  body: { type: 'ConstNil'; value: ConstNilOutput } | { type: 'ConstBool'; value: ConstBoolOutput } | { type: 'ConstInt'; value: ConstIntOutput } | { type: 'ConstFloat'; value: ConstFloatOutput } | { type: 'ConstString'; value: ConstStringOutput } | { type: 'EffectBytes'; value: EffectBytesOutput } | { type: 'HostFail'; value: HostFailOutput };
 }
 
 export type EffectResult = EffectResultOutput;
@@ -4031,6 +4035,8 @@ export const enum EffectResultBodyVariant {
   ConstInt = 'ConstInt',
   ConstFloat = 'ConstFloat',
   ConstString = 'ConstString',
+  EffectBytes = 'EffectBytes',
+  HostFail = 'HostFail',
 }
 
 export class EffectResultEncoder extends BitStreamEncoder {
@@ -4079,6 +4085,20 @@ export class EffectResultEncoder extends BitStreamEncoder {
       for (const byte of encoded_value) {
         this.writeUint8(byte);
       }
+    }
+    else if (value.body.type === 'EffectBytes') {
+      const encoder_value = new EffectBytesEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'HostFail') {
+      const encoder_value = new HostFailEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
     } else {
       throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type: ${(value.body as any).type}`);
     }
@@ -4110,6 +4130,14 @@ export class EffectResultEncoder extends BitStreamEncoder {
     }
     else if (value.body.type === 'ConstString') {
       const _enc = new ConstStringEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'EffectBytes') {
+      const _enc = new EffectBytesEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'HostFail') {
+      const _enc = new HostFailEncoder();
       size += _enc.calculateSize(value.body.value);
     }
     else {
@@ -4158,6 +4186,18 @@ export class EffectResultDecoder extends SeekableBitStreamDecoder {
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.body = { type: 'ConstString', value: payload };
+    }
+    else if (value.tag === 5) {
+      const decoder = new EffectBytesDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'EffectBytes', value: payload };
+    }
+    else if (value.tag === 6) {
+      const decoder = new HostFailDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'HostFail', value: payload };
     } else {
       throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.tag}`);
     }
@@ -4166,7 +4206,145 @@ export class EffectResultDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * One recorded nondeterministic INPUT: the host effect that produced it and the Value it returned. `kind` mirrors mahina's interp.EffectKind enum (clock=0, random_seed=1, getenv=2, argc=3, argv=4). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars (clock/argc/random_seed) plus inline string bytes (getenv/argv), never a heap_ref.
+ * The bytes of a `b`-mode read (doc 65 Q1), inline. Not a string: mahina strings are code points, and these need not be UTF-8.
+ */
+export interface EffectBytesInput {
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  v: number[];
+}
+
+/**
+ * The bytes of a `b`-mode read (doc 65 Q1), inline. Not a string: mahina strings are code points, and these need not be UTF-8.
+ */
+export interface EffectBytesOutput {
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  v: number[];
+}
+
+export type EffectBytes = EffectBytesOutput;
+
+export class EffectBytesEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: EffectBytesInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.v.length, "little_endian");
+    for (let value_v__iter_index = 0; value_v__iter_index < value.v.length; value_v__iter_index++) {
+      const value_v__iter = value.v[value_v__iter_index];
+      this.writeUint8(value_v__iter);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a EffectBytes value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: EffectBytes): number {
+    let size = 0;
+    // v: bytes (kind: length_prefixed)
+    size += value.v.length;
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class EffectBytesDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): EffectBytesOutput {
+    const value: any = {};
+
+    value.v = [];
+    const v_length = this.readUint32("little_endian");
+    for (let i = 0; i < v_length; i++) {
+      let v__iter: any;
+      v__iter = this.readUint8();
+      value.v.push(v__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * A failed host call (doc 65 §4.2): its error class (mahina's system.ErrorClass: not_found=1, permission_denied=2, exists=3, is_a_directory=4, not_utf8=5, other=6). The message is rebuilt from the class and the program's own arguments, so it replays identically on any machine.
+ */
+export interface HostFailInput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  class: number;
+}
+
+/**
+ * A failed host call (doc 65 §4.2): its error class (mahina's system.ErrorClass: not_found=1, permission_denied=2, exists=3, is_a_directory=4, not_utf8=5, other=6). The message is rebuilt from the class and the program's own arguments, so it replays identically on any machine.
+ */
+export interface HostFailOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  class: number;
+}
+
+export type HostFail = HostFailOutput;
+
+export class HostFailEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: HostFailInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(value.class);
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a HostFail value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: HostFail): number {
+    return 1; // class
+  }
+}
+
+export class HostFailDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): HostFailOutput {
+    const value: any = {};
+
+    value.class = this.readUint8();
+    return value;
+  }
+}
+
+/**
+ * One recorded nondeterministic INPUT: the host effect that produced it and what it returned. `kind` mirrors mahina's function.EffectKind enum (clock=0, random_seed=1, getenv=2, file_read=5, unicode_version=6, file_open=7, file_read_op=8, file_write=9, file_seek=10, file_control=11, fs_mutate=12, fs_tmpname=13, wall_clock=14, local_offset=15, io_error_mode=16; 3 and 4 are retired). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars, inline string bytes, inline byte-array bytes, or a host failure class, never a heap_ref.
  */
 export interface EffectInput {
   /**
@@ -4175,13 +4353,13 @@ export interface EffectInput {
    */
   kind: number;
   /**
-   * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/argv) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. tag: nil=0, bool=1, int=2, float=3, string=4.
+   * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/file_read) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. Doc 65 adds the bytes of a `b`-mode read (EffectBytes, rebuilt into a fresh byte array on replay) and a failed host call (HostFail, its error class). Trace execution events (ExecEvent) carry only tags 0-4. tag: nil=0, bool=1, int=2, float=3, string=4, bytes=5, fail=6.
    */
   result: EffectResultInput;
 }
 
 /**
- * One recorded nondeterministic INPUT: the host effect that produced it and the Value it returned. `kind` mirrors mahina's interp.EffectKind enum (clock=0, random_seed=1, getenv=2, argc=3, argv=4). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars (clock/argc/random_seed) plus inline string bytes (getenv/argv), never a heap_ref.
+ * One recorded nondeterministic INPUT: the host effect that produced it and what it returned. `kind` mirrors mahina's function.EffectKind enum (clock=0, random_seed=1, getenv=2, file_read=5, unicode_version=6, file_open=7, file_read_op=8, file_write=9, file_seek=10, file_control=11, fs_mutate=12, fs_tmpname=13, wall_clock=14, local_offset=15, io_error_mode=16; 3 and 4 are retired). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars, inline string bytes, inline byte-array bytes, or a host failure class, never a heap_ref.
  */
 export interface EffectOutput {
   /**
@@ -4190,7 +4368,7 @@ export interface EffectOutput {
    */
   kind: number;
   /**
-   * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/argv) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. tag: nil=0, bool=1, int=2, float=3, string=4.
+   * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/file_read) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. Doc 65 adds the bytes of a `b`-mode read (EffectBytes, rebuilt into a fresh byte array on replay) and a failed host call (HostFail, its error class). Trace execution events (ExecEvent) carry only tags 0-4. tag: nil=0, bool=1, int=2, float=3, string=4, bytes=5, fail=6.
    */
   result: EffectResultOutput;
 }
@@ -4272,6 +4450,18 @@ export class EffectDecoder extends SeekableBitStreamDecoder {
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.result.body = { type: 'ConstString', value: payload };
+    }
+    else if (value.result.tag === 5) {
+      const decoder = new EffectBytesDecoder(this.bytes.slice(this.byteOffset), value.result);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.result.body = { type: 'EffectBytes', value: payload };
+    }
+    else if (value.result.tag === 6) {
+      const decoder = new HostFailDecoder(this.bytes.slice(this.byteOffset), value.result);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.result.body = { type: 'HostFail', value: payload };
     } else {
       throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.result.tag}`);
     }
@@ -4411,6 +4601,18 @@ export class EffectFileDecoder extends SeekableBitStreamDecoder {
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         effects__iter.result.body = { type: 'ConstString', value: payload };
+      }
+      else if (effects__iter.result.tag === 5) {
+        const decoder = new EffectBytesDecoder(this.bytes.slice(this.byteOffset), effects__iter.result);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        effects__iter.result.body = { type: 'EffectBytes', value: payload };
+      }
+      else if (effects__iter.result.tag === 6) {
+        const decoder = new HostFailDecoder(this.bytes.slice(this.byteOffset), effects__iter.result);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        effects__iter.result.body = { type: 'HostFail', value: payload };
       } else {
         throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${effects__iter.result.tag}`);
       }
@@ -4435,7 +4637,7 @@ export interface ExecEventInput {
    */
   ref: number;
   /**
-   * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/argv) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. tag: nil=0, bool=1, int=2, float=3, string=4.
+   * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/file_read) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. Doc 65 adds the bytes of a `b`-mode read (EffectBytes, rebuilt into a fresh byte array on replay) and a failed host call (HostFail, its error class). Trace execution events (ExecEvent) carry only tags 0-4. tag: nil=0, bool=1, int=2, float=3, string=4, bytes=5, fail=6.
    */
   value: EffectResultInput;
 }
@@ -4455,7 +4657,7 @@ export interface ExecEventOutput {
    */
   ref: number;
   /**
-   * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/argv) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. tag: nil=0, bool=1, int=2, float=3, string=4.
+   * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/file_read) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. Doc 65 adds the bytes of a `b`-mode read (EffectBytes, rebuilt into a fresh byte array on replay) and a failed host call (HostFail, its error class). Trace execution events (ExecEvent) carry only tags 0-4. tag: nil=0, bool=1, int=2, float=3, string=4, bytes=5, fail=6.
    */
   value: EffectResultOutput;
 }
@@ -4539,6 +4741,18 @@ export class ExecEventDecoder extends SeekableBitStreamDecoder {
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.value.body = { type: 'ConstString', value: payload };
+    }
+    else if (value.value.tag === 5) {
+      const decoder = new EffectBytesDecoder(this.bytes.slice(this.byteOffset), value.value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value.body = { type: 'EffectBytes', value: payload };
+    }
+    else if (value.value.tag === 6) {
+      const decoder = new HostFailDecoder(this.bytes.slice(this.byteOffset), value.value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value.body = { type: 'HostFail', value: payload };
     } else {
       throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.value.tag}`);
     }
@@ -4715,6 +4929,18 @@ export class TraceEntryDecoder extends SeekableBitStreamDecoder {
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         events__iter.value.body = { type: 'ConstString', value: payload };
+      }
+      else if (events__iter.value.tag === 5) {
+        const decoder = new EffectBytesDecoder(this.bytes.slice(this.byteOffset), events__iter.value);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        events__iter.value.body = { type: 'EffectBytes', value: payload };
+      }
+      else if (events__iter.value.tag === 6) {
+        const decoder = new HostFailDecoder(this.bytes.slice(this.byteOffset), events__iter.value);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        events__iter.value.body = { type: 'HostFail', value: payload };
       } else {
         throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${events__iter.value.tag}`);
       }
@@ -4878,6 +5104,18 @@ export class TraceExecLogDecoder extends SeekableBitStreamDecoder {
           const payload = decoder.decode();
           this.byteOffset += decoder.byteOffset;
           entries__iter_events__iter.value.body = { type: 'ConstString', value: payload };
+        }
+        else if (entries__iter_events__iter.value.tag === 5) {
+          const decoder = new EffectBytesDecoder(this.bytes.slice(this.byteOffset), entries__iter_events__iter.value);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          entries__iter_events__iter.value.body = { type: 'EffectBytes', value: payload };
+        }
+        else if (entries__iter_events__iter.value.tag === 6) {
+          const decoder = new HostFailDecoder(this.bytes.slice(this.byteOffset), entries__iter_events__iter.value);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          entries__iter_events__iter.value.body = { type: 'HostFail', value: payload };
         } else {
           throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${entries__iter_events__iter.value.tag}`);
         }
@@ -5038,6 +5276,18 @@ export class ExecLogFileDecoder extends SeekableBitStreamDecoder {
             const payload = decoder.decode();
             this.byteOffset += decoder.byteOffset;
             logs__iter_entries__iter_events__iter.value.body = { type: 'ConstString', value: payload };
+          }
+          else if (logs__iter_entries__iter_events__iter.value.tag === 5) {
+            const decoder = new EffectBytesDecoder(this.bytes.slice(this.byteOffset), logs__iter_entries__iter_events__iter.value);
+            const payload = decoder.decode();
+            this.byteOffset += decoder.byteOffset;
+            logs__iter_entries__iter_events__iter.value.body = { type: 'EffectBytes', value: payload };
+          }
+          else if (logs__iter_entries__iter_events__iter.value.tag === 6) {
+            const decoder = new HostFailDecoder(this.bytes.slice(this.byteOffset), logs__iter_entries__iter_events__iter.value);
+            const payload = decoder.decode();
+            this.byteOffset += decoder.byteOffset;
+            logs__iter_entries__iter_events__iter.value.body = { type: 'HostFail', value: payload };
           } else {
             throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${logs__iter_entries__iter_events__iter.value.tag}`);
           }

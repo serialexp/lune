@@ -43,6 +43,11 @@ export function formatExecValue(v: ExecEventOutput["value"]): string {
       return floatToDisplay(v.body.value.v);
     case "ConstString":
       return `"${bytesToDisplay(v.body.value.v)}"`;
+    // The effect log's own variants (doc 65); a trace event never carries them.
+    case "EffectBytes":
+      return `bytes[${v.body.value.v.length}]`;
+    case "HostFail":
+      return `fail(${v.body.value.class})`;
   }
 }
 

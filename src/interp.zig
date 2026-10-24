@@ -38,6 +38,8 @@ const execlog = @import("execlog.zig");
 const compiler = @import("compiler.zig");
 const io = @import("io.zig");
 const system = @import("system.zig");
+const effectlog = @import("effectlog.zig");
+const effectser = @import("effectser.zig");
 const stdmath = @import("stdlib/math.zig");
 const stdtable = @import("stdlib/table.zig");
 const stdbase = @import("stdlib/base.zig");
@@ -108,6 +110,14 @@ pub const Error = error{
     /// the run refuses rather than silently diverging. Fatal like
     /// `EffectKindMismatch` — NOT a catchable `LuaError`.
     UnicodeVersionMismatch,
+    /// Doc 65 §4.5: a `record`-mode effect log would grow past
+    /// `Vm.effect_log_limit`. Fatal: a recording never drops an input, and
+    /// letting a program catch this would make it observe the cap.
+    EffectLogLimit,
+    /// Doc 65 §4.4: the recording was made under the other `io` error mode,
+    /// so the same logged results would be observed differently. Fatal like
+    /// `UnicodeVersionMismatch`.
+    IoErrorModeMismatch,
 };
 
 /// Fixed VM register/call stack: every frame's register window is a slice of
@@ -144,12 +154,14 @@ const host_out_slots: usize = (@as(usize, max_native_reentry) + 1) * max_host_re
 /// it cycle-free; re-exported here because effects are an interpreter concept.
 pub const EffectKind = function.EffectKind;
 
-/// One recorded nondeterministic input: the effect that produced it and the
-/// `Value` it returned. The `effect_log` is an **ordered** list consumed in call
-/// order on replay (the kind + result fully describe it). `result` may be a heap
-/// **string** (`getenv`/`argv`); such results are GC roots while parked in the log
-/// (see `forEachRootHeader`) and serialize as inline bytes (`effectser`).
-pub const Effect = struct { kind: EffectKind, result: Value };
+/// One recorded nondeterministic input and the ordered log of them
+/// (`effectlog.zig`). The log is consumed in call order on replay (the kind +
+/// result fully describe each entry).
+pub const Effect = effectlog.Effect;
+pub const EffectLog = effectlog.EffectLog;
+
+/// Doc 65 §4.5: the default cap on a recording's encoded effect log.
+pub const default_effect_log_limit: usize = 1 << 20;
 
 /// Record / replay / off — the effect-log mode. `off` (default) is the
 /// pre-F2d behaviour: every native runs normally and nothing is logged.
@@ -845,9 +857,24 @@ pub const Vm = struct {
     effect_mode: EffectMode = .off,
     /// The ordered nondeterministic-input log. In `record` it grows; in `replay`
     /// it is consumed front-to-back via `effect_cursor`. Owned by the VM.
-    effect_log: std.ArrayList(Effect) = .empty,
+    effect_log: EffectLog = .{},
     /// Replay read position into `effect_log` (next effect to feed back).
     effect_cursor: usize = 0,
+    /// Doc 65 §4.5: the cap on the encoded effect log in `record`, in bytes
+    /// (0: none). A recording that would grow past it fails with the
+    /// non-catchable `EffectLogLimit`; entries are never dropped.
+    effect_log_limit: usize = default_effect_log_limit,
+    /// The encoded size of the log so far (`effectser.encodedEntrySize` of
+    /// every entry logged in `record`, plus the file header).
+    effect_log_encoded: usize = effectser.file_header_size,
+    /// Doc 65 §4.4: whether a failed `io`/`os` call raises or returns Lua's
+    /// `nil, msg, code`. Pinned into the log at the first host operation
+    /// that can fail (`noteIoErrorMode`), so a replay under the other mode
+    /// refuses.
+    io_errors: system.IoErrors = .raise,
+    /// Whether this session has pinned `io_errors` (like
+    /// `unicode_version_pinned`; in-memory only).
+    io_errors_pinned: bool = false,
     /// Mode-independent logical count of successfully committed host effects.
     /// Unlike `effect_cursor` (replay-only), this advances once in off, record,
     /// and replay through `onEffectCommitted`. It is replay-driver state rather
@@ -2127,10 +2154,10 @@ pub const Vm = struct {
     }
 
     /// S-B (design doc 06): every program-visible string is valid UTF-8. Host
-    /// inputs (`getenv`/`argv`/`file_read`/the `arg[]` table) can supply arbitrary
+    /// inputs (`getenv`/`file_read`/the `arg[]` table) can supply arbitrary
     /// bytes, so the host-input boundary validates here and raises a *catchable*
     /// error on malformed input — mirroring `string.decode`. Determinism: a pure
-    /// function of the bytes, and (for the recorded `getenv`/`argv` effects) called
+    /// function of the bytes, and (for the recorded `getenv`/`file_read` effects) called
     /// on the *logged* result, so `record` (fresh intern) and `replay` (re-intern
     /// from the log) validate the identical bytes and raise identically. The error
     /// message embeds no raw bytes (which would itself be a malformed string).
@@ -2151,6 +2178,20 @@ pub const Vm = struct {
     /// registers, so nothing must have executed since. `arena` owns the returned
     /// message.
     pub fn describeFault(self: *Vm, err: Error, arena: std.mem.Allocator) std.mem.Allocator.Error!Fault {
+        // Doc 65 §4.5, §4.4: recording-level faults, not a place in the
+        // program; the message is the whole report (`self_located`).
+        if (err == Error.EffectLogLimit) return .{
+            .message = try std.fmt.allocPrint(
+                arena,
+                "the effect log reached its limit of {d} bytes; raise the limit (--effect-log-limit <bytes>, 0 for none)",
+                .{self.effect_log_limit},
+            ),
+            .self_located = true,
+        };
+        if (err == Error.IoErrorModeMismatch) return .{
+            .message = try arena.dupe(u8, "the recording was made under the other io error mode (--lua-io-errors); replay it under the same mode"),
+            .self_located = true,
+        };
         // No frame (e.g. main chunk too big for the stack) → just the error name.
         if (self.depth == 0) return .{ .message = try arena.dupe(u8, @errorName(err)) };
 
@@ -3124,7 +3165,7 @@ pub const Vm = struct {
     ///      constant the sweep will free (`invalidateDeadTraceConsts`), so
     ///      liveness is identical in every tier and no trace keeps a dangling
     ///      constant.
-    ///   6. effect-log heap results — a string-valued effect (`getenv`/`argv`)
+    ///   6. effect-log heap results — a string-valued effect (`getenv`/`file_read`)
     ///      parked in `effect_log` must outlive collection until it is serialized
     ///      (record) or fed back to the program (replay). Without this root, the
     ///      sweep would de-intern and free an otherwise-unreferenced result string.
@@ -3155,7 +3196,10 @@ pub const Vm = struct {
         for (self.host_refs.items) |slot| if (slot.value.isHeap()) cb(ctx, slot.value.asHeap());
         for (self.parked_inline[0..self.parked_inline_len]) |v| if (v.isHeap()) cb(ctx, v.asHeap());
         for (self.parked_results.items) |v| if (v.isHeap()) cb(ctx, v.asHeap());
-        for (self.effect_log.items) |e| if (e.result.isHeap()) cb(ctx, e.result.asHeap());
+        for (self.effect_log.entries.items) |e| switch (e.result) {
+            .value => |v| if (v.isHeap()) cb(ctx, v.asHeap()),
+            .bytes, .fail => {},
+        };
         // 7. the in-flight Lua error value — rooted while parked between a raise and
         //    its catch. Load-bearing for the `xpcall` handler path, which allocates
         //    (and so may collect) while the error value waits to be handed over.
@@ -10087,6 +10131,8 @@ fn narrowError(e: anyerror) Error {
         // native, so a replay version mismatch narrows here — and must stay fatal
         // (not fall through to the catchable `HostError`).
         error.UnicodeVersionMismatch => Error.UnicodeVersionMismatch,
+        error.EffectLogLimit => Error.EffectLogLimit,
+        error.IoErrorModeMismatch => Error.IoErrorModeMismatch,
         else => Error.HostError,
     };
 }
@@ -10115,6 +10161,8 @@ pub fn catchable(e: Error) bool {
         Error.EffectKindMismatch,
         Error.ClockUnavailable,
         Error.UnicodeVersionMismatch,
+        Error.EffectLogLimit,
+        Error.IoErrorModeMismatch,
         // A top-level `run`/`start` contract violation — it can never surface inside
         // a `pcall`/`xpcall` (those don't re-enter top-level), so it is unreachable
         // here; classified not-catchable for completeness (doc 17, H-3 / 9-A(ii)).
@@ -10184,7 +10232,7 @@ fn performEffect(self: *Vm, kind: EffectKind, nat: *const function.Native, args:
         .off => nat.func(@ptrCast(self), args) catch |e| return narrowError(e),
         .record => blk: {
             const r = nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
-            try logEffect(self, kind, r);
+            try logEffect(self, Effect.of(kind, r));
             break :blk r;
         },
         .replay => try nextLoggedEffect(self, kind),
@@ -10206,10 +10254,26 @@ fn onEffectCommitted(self: *Vm) void {
     self.committed_effect_seq += 1;
 }
 
-/// Append one effect result to the ordered log (record mode). Shared by
-/// `performEffect` (native-backed effects like `clock`) and the seed path.
-fn logEffect(self: *Vm, kind: EffectKind, result: Value) Error!void {
-    try self.effect_log.append(self.gpa, .{ .kind = kind, .result = result });
+/// Append one effect to the ordered log (record mode), charging its encoded
+/// size against `effect_log_limit` first (doc 65 §4.5). Shared by every
+/// effect family. A `bytes` result goes through `logEffectBytes` instead.
+fn logEffect(self: *Vm, e: Effect) Error!void {
+    std.debug.assert(e.result != .bytes);
+    try chargeEffectLog(self, effectser.encodedEntrySize(e.result));
+    try self.effect_log.append(self.gpa, e);
+}
+
+/// `logEffect` for a `bytes` result: the content is copied into the log.
+fn logEffectBytes(self: *Vm, kind: EffectKind, content: []const u8) Error!void {
+    try chargeEffectLog(self, effectser.encodedEntrySize(.{ .bytes = .{ .start = 0, .len = content.len } }));
+    try self.effect_log.appendBytes(self.gpa, kind, content);
+}
+
+/// Count `size` encoded bytes against the cap, refusing past it.
+fn chargeEffectLog(self: *Vm, size: usize) Error!void {
+    const total = self.effect_log_encoded + size;
+    if (self.effect_log_limit != 0 and total > self.effect_log_limit) return Error.EffectLogLimit;
+    self.effect_log_encoded = total;
 }
 
 /// Consume the next logged effect in call order (replay mode), checking the run
@@ -10226,18 +10290,22 @@ fn logEffect(self: *Vm, kind: EffectKind, result: Value) Error!void {
 /// version check) must follow the same rule: peek via `peekLoggedEffect`,
 /// validate, and only then advance.
 fn nextLoggedEffect(self: *Vm, kind: EffectKind) Error!Value {
-    const v = try peekLoggedEffect(self, kind);
+    const r = try peekLoggedEffect(self, kind);
+    // The decoder checks every entry's result against its kind
+    // (`effectser.checkResultShape`), and the kinds read here only ever log
+    // a `value`; anything else is a log this binary did not write.
+    if (r != .value) return Error.EffectKindMismatch;
     self.effect_cursor += 1;
-    return v;
+    return r.value;
 }
 
 /// The non-consuming half of `nextLoggedEffect`: bounds- and kind-check the
 /// entry at the cursor and return its result WITHOUT advancing. For consumers
 /// that must validate the value itself before committing the consume
-/// (`noteUnicodeVersion`) — see the cursor-truthfulness contract above.
-fn peekLoggedEffect(self: *Vm, kind: EffectKind) Error!Value {
-    if (self.effect_cursor >= self.effect_log.items.len) return Error.EffectLogExhausted;
-    const e = self.effect_log.items[self.effect_cursor];
+/// (`pinSessionConstant`) — see the cursor-truthfulness contract above.
+fn peekLoggedEffect(self: *Vm, kind: EffectKind) Error!Effect.Result {
+    if (self.effect_cursor >= self.effect_log.len()) return Error.EffectLogExhausted;
+    const e = self.effect_log.entries.items[self.effect_cursor];
     if (e.kind != kind) return Error.EffectKindMismatch;
     return e.result;
 }
@@ -10253,7 +10321,7 @@ fn obtainRandomSeed(self: *Vm) Error!u64 {
     const seed = switch (self.effect_mode) {
         .off, .record => blk: {
             const seed = if (self.random_seed_source) |src| src.seed(src.ctx) else default_random_seed;
-            if (self.effect_mode == .record) try logEffect(self, .random_seed, Value.int(@bitCast(seed)));
+            if (self.effect_mode == .record) try logEffect(self, Effect.of(.random_seed, Value.int(@bitCast(seed))));
             break :blk seed;
         },
         .replay => blk: {
@@ -10265,14 +10333,53 @@ fn obtainRandomSeed(self: *Vm) Error!u64 {
     return seed;
 }
 
-/// Has a `.unicode_version` effect already been consumed earlier this session?
-/// Used only on a snapshot-resume: the keyframe carries no "already pinned" flag,
-/// so the first `upper`/`lower` after a restore derives it from the re-attached
-/// log + cursor instead of re-consuming an effect that was pinned before the cut.
-fn versionAlreadyConsumed(self: *Vm) bool {
-    const upto = @min(self.effect_cursor, self.effect_log.items.len);
-    for (self.effect_log.items[0..upto]) |e| if (e.kind == .unicode_version) return true;
+/// Has an effect of `kind` already been consumed earlier this session? Used
+/// only on a snapshot-resume: the keyframe carries no "already pinned" flag,
+/// so the first pin after a restore derives it from the re-attached log +
+/// cursor instead of re-consuming an effect that was pinned before the cut.
+fn alreadyConsumed(self: *Vm, kind: EffectKind) bool {
+    const upto = @min(self.effect_cursor, self.effect_log.len());
+    for (self.effect_log.entries.items[0..upto]) |e| if (e.kind == kind) return true;
     return false;
+}
+
+/// Pin a once-per-session constant through the record/replay boundary: the
+/// shared mechanism behind `noteUnicodeVersion` and `noteIoErrorMode`. In
+/// `off` it only marks `pinned`; in `record` it logs `want` as `kind`; in
+/// `replay` it consumes that effect and refuses with `mismatch` if the
+/// recording pinned a different value. Idempotent once `pinned` is set.
+fn pinSessionConstant(self: *Vm, kind: EffectKind, want: i64, pinned: *bool, mismatch: Error) Error!void {
+    if (pinned.*) return;
+    var committed = true;
+    switch (self.effect_mode) {
+        .off => {},
+        .record => try logEffect(self, Effect.of(kind, Value.int(want))),
+        .replay => {
+            // On a snapshot-resume the constant may have been pinned before the
+            // cut; its effect then sits behind the cursor — don't consume a
+            // second one.
+            if (alreadyConsumed(self, kind)) {
+                committed = false;
+            } else {
+                // Peek, validate, THEN consume (the cursor-truthfulness contract
+                // on `nextLoggedEffect`): on a mismatch the wrong entry must stay
+                // IN FRONT of the cursor, so any later retry — a host re-running
+                // this faulted-but-live VM, or a resumed session — re-validates
+                // and re-raises instead of finding the entry behind the cursor
+                // via `alreadyConsumed` and silently pinning the wrong value.
+                const r = try peekLoggedEffect(self, kind);
+                // The decoder (effectser.checkResultShape) admits only an int
+                // here, but a log built in memory need not have been decoded;
+                // `asInt()` asserts int. A value we cannot read is, for our
+                // purposes, the wrong value — refuse rather than assert on
+                // hostile bytes.
+                if (r != .value or r.value.tag != .int or r.value.asInt() != want) return mismatch;
+                self.effect_cursor += 1; // accepted — consume
+            }
+        },
+    }
+    pinned.* = true;
+    if (committed) onEffectCommitted(self);
 }
 
 /// Pin the active Unicode version through the record/replay boundary (S-C). The
@@ -10292,38 +10399,47 @@ fn versionAlreadyConsumed(self: *Vm) bool {
 /// the documented out-of-scope follow-up in TODO.md (it needs the keyframe to carry
 /// `effect_log`/`effect_cursor`), not a partial fix here.
 pub fn noteUnicodeVersion(self: *Vm) Error!void {
-    if (self.unicode_version_pinned) return;
-    var committed = true;
-    switch (self.effect_mode) {
-        .off => {},
-        .record => try logEffect(self, .unicode_version, Value.int(unicode_case.unicode_version_packed)),
-        .replay => {
-            // On a snapshot-resume the version may have been pinned before the cut;
-            // its effect then sits behind the cursor — don't consume a second one.
-            if (versionAlreadyConsumed(self)) {
-                committed = false;
-            } else {
-                // Peek, validate, THEN consume (the cursor-truthfulness contract
-                // on `nextLoggedEffect`): on a mismatch the wrong-version entry
-                // must stay IN FRONT of the cursor, so any later retry — a host
-                // re-running this faulted-but-live VM, or a resumed session —
-                // re-validates and re-raises instead of finding the entry behind
-                // the cursor via `versionAlreadyConsumed` and silently pinning
-                // the MISMATCHED table.
-                const v = try peekLoggedEffect(self, .unicode_version);
-                // The shared scalar shape-gate (effectser.checkResultShape) accepts
-                // *either* int or float, so a corrupt log could park a float here;
-                // `asInt()` asserts int. Treat a non-int version as a mismatch (a log
-                // we cannot read the version from is, for our purposes, the wrong
-                // version) rather than asserting on hostile bytes.
-                if (v.tag != .int or v.asInt() != @as(i64, unicode_case.unicode_version_packed))
-                    return Error.UnicodeVersionMismatch;
-                self.effect_cursor += 1; // accepted — consume
-            }
-        },
-    }
-    self.unicode_version_pinned = true;
-    if (committed) onEffectCommitted(self);
+    return pinSessionConstant(self, .unicode_version, unicode_case.unicode_version_packed, &self.unicode_version_pinned, Error.UnicodeVersionMismatch);
+}
+
+/// Pin the `io` error mode (doc 65 §4.4) through the record/replay boundary,
+/// once per session, at the first host operation that can fail: the same
+/// logged failure raises in one mode and returns `nil, msg, code` in the
+/// other, so a replay under the other mode refuses (`IoErrorModeMismatch`).
+/// Called by the `io`/`os` natives before their own effect.
+pub fn noteIoErrorMode(self: *Vm) Error!void {
+    return pinSessionConstant(self, .io_error_mode, @intFromEnum(self.io_errors), &self.io_errors_pinned, Error.IoErrorModeMismatch);
+}
+
+/// Log one `io`/`os` host operation's outcome (doc 65 §4.2) and commit it.
+/// The native has already called the host (in `off`/`record`) and validated
+/// what came back — a text read that is not UTF-8 is a `not_utf8` failure
+/// here, never a string — so this only logs, in `record`. A `bytes` result
+/// goes through `recordHostBytes`. In `replay` the native calls `replayHost`
+/// instead.
+pub fn recordHost(self: *Vm, kind: EffectKind, result: Effect.Result) Error!void {
+    std.debug.assert(self.effect_mode != .replay);
+    if (self.effect_mode == .record) try logEffect(self, .{ .kind = kind, .result = result });
+    onEffectCommitted(self);
+}
+
+/// `recordHost` for a `b`-mode read's bytes, copied into the log.
+pub fn recordHostBytes(self: *Vm, kind: EffectKind, content: []const u8) Error!void {
+    std.debug.assert(self.effect_mode != .replay);
+    if (self.effect_mode == .record) try logEffectBytes(self, kind, content);
+    onEffectCommitted(self);
+}
+
+/// Replay one `io`/`os` host operation: consume the next logged outcome of
+/// `kind`, which the decoder has already checked against the kind. A `bytes`
+/// result's content is `effect_log.bytesOf(span)`; the native builds a fresh
+/// byte array from it.
+pub fn replayHost(self: *Vm, kind: EffectKind) Error!Effect.Result {
+    std.debug.assert(self.effect_mode == .replay);
+    const r = try peekLoggedEffect(self, kind);
+    self.effect_cursor += 1;
+    onEffectCommitted(self);
+    return r;
 }
 
 /// Read a file's content through the `file_read` record/replay boundary, for
@@ -10358,7 +10474,7 @@ pub fn obtainFileRead(self: *Vm, path: []const u8) Error!Value {
 
 /// Log a `file_read` result in `record` mode; returns it.
 fn logFileRead(self: *Vm, r: Value) Error!Value {
-    if (self.effect_mode == .record) try logEffect(self, .file_read, r);
+    if (self.effect_mode == .record) try logEffect(self, Effect.of(.file_read, r));
     return r;
 }
 

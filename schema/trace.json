@@ -257,7 +257,7 @@
     },
 
     "EffectResult": {
-      "description": "An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/argv) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. tag: nil=0, bool=1, int=2, float=3, string=4.",
+      "description": "An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/file_read) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. Doc 65 adds the bytes of a `b`-mode read (EffectBytes, rebuilt into a fresh byte array on replay) and a failed host call (HostFail, its error class). Trace execution events (ExecEvent) carry only tags 0-4. tag: nil=0, bool=1, int=2, float=3, string=4, bytes=5, fail=6.",
       "sequence": [
         { "name": "tag", "type": "uint8" },
         {
@@ -269,14 +269,26 @@
             { "type": "ConstBool",   "when": "value === 1" },
             { "type": "ConstInt",    "when": "value === 2" },
             { "type": "ConstFloat",  "when": "value === 3" },
-            { "type": "ConstString", "when": "value === 4" }
+            { "type": "ConstString", "when": "value === 4" },
+            { "type": "EffectBytes", "when": "value === 5" },
+            { "type": "HostFail",    "when": "value === 6" }
           ]
         }
       ]
     },
 
+    "EffectBytes": {
+      "description": "The bytes of a `b`-mode read (doc 65 Q1), inline. Not a string: mahina strings are code points, and these need not be UTF-8.",
+      "sequence": [ { "name": "v", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" } ]
+    },
+
+    "HostFail": {
+      "description": "A failed host call (doc 65 §4.2): its error class (mahina's system.ErrorClass: not_found=1, permission_denied=2, exists=3, is_a_directory=4, not_utf8=5, other=6). The message is rebuilt from the class and the program's own arguments, so it replays identically on any machine.",
+      "sequence": [ { "name": "class", "type": "uint8" } ]
+    },
+
     "Effect": {
-      "description": "One recorded nondeterministic INPUT: the host effect that produced it and the Value it returned. `kind` mirrors mahina's interp.EffectKind enum (clock=0, random_seed=1, getenv=2, argc=3, argv=4). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars (clock/argc/random_seed) plus inline string bytes (getenv/argv), never a heap_ref.",
+      "description": "One recorded nondeterministic INPUT: the host effect that produced it and what it returned. `kind` mirrors mahina's function.EffectKind enum (clock=0, random_seed=1, getenv=2, file_read=5, unicode_version=6, file_open=7, file_read_op=8, file_write=9, file_seek=10, file_control=11, fs_mutate=12, fs_tmpname=13, wall_clock=14, local_offset=15, io_error_mode=16; 3 and 4 are retired). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars, inline string bytes, inline byte-array bytes, or a host failure class, never a heap_ref.",
       "sequence": [
         { "name": "kind",   "type": "uint8" },
         { "name": "result", "type": "EffectResult" }

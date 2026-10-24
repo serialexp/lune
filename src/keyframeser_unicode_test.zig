@@ -81,7 +81,7 @@ test "S-C: unicode_version survives a snapshot cut with no double-consume" {
         _ = try vm.run(chunk.proto);
         break :blk .{
             .out = try gpa.dupe(u8, sink.buffered()),
-            .log = try gpa.dupe(interp.Effect, vm.effect_log.items),
+            .log = try gpa.dupe(interp.Effect, vm.effect_log.entries.items),
             .safepoints = vm.safepoint_seq,
         };
     };
@@ -102,7 +102,7 @@ test "S-C: unicode_version survives a snapshot cut with no double-consume" {
     try testing.expect(!diags.hasErrors());
 
     vm2.effect_mode = .replay;
-    try vm2.effect_log.appendSlice(gpa, ref.log);
+    try vm2.effect_log.entries.appendSlice(gpa, ref.log);
     vm2.setSuspendCtl(.{ .min_depth = 2, .after_safepoints = ref.safepoints / 2 });
     try testing.expect((try vm2.start(chunk2.proto)) == .suspended);
 
@@ -129,7 +129,7 @@ test "S-C: unicode_version survives a snapshot cut with no double-consume" {
     var sink_r = io.Writer.fixed(&buf_r);
     vm_r.out = &sink_r;
     vm_r.effect_mode = .replay;
-    try vm_r.effect_log.appendSlice(gpa, ref.log);
+    try vm_r.effect_log.entries.appendSlice(gpa, ref.log);
     vm_r.effect_cursor = cursor_at_cut;
     vm_r.setSuspendCtl(null);
     // If the derivation were wrong, the post-cut upper() would try to consume a

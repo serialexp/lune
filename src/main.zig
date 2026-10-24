@@ -119,6 +119,10 @@ const usage =
     \\                       record the run's nondeterministic-input effect log
     \\                       (e.g. clock() results) and serialize it to <file>
     \\                       (binschema wire format) after the run.
+    \\  --effect-log-limit <bytes>
+    \\                       the cap on the --emit-effects log (doc 65 §4.5;
+    \\                       default 1048576, 0 for none). A recording that
+    \\                       would grow past it stops with an error.
     \\  --emit-coverage <file>
     \\                       imply --trace + JIT coverage accounting and serialize
     \\                       the coverage artifact (native-vs-tier-0 split by
@@ -164,6 +168,8 @@ const TraceOpts = struct {
     /// `--emit-effects <file>`: record the nondeterministic-input effect log and
     /// serialize it here after the run (puts the VM in effect `record` mode).
     effects_path: ?[]const u8 = null,
+    /// `--effect-log-limit <bytes>`: `Vm.effect_log_limit` (0: none).
+    effect_log_limit: usize = mahina.interp.default_effect_log_limit,
     /// `--emit-coverage <file>`: serialize the JIT execution-coverage artifact here
     /// after the run. Implies `--trace` + `coverage` (the accounting must be on).
     coverage_path: ?[]const u8 = null,
@@ -343,6 +349,15 @@ pub fn main(init: std.process.Init) u8 {
             topts.coverage = true;
             topts.coverage_path = it.next() orelse {
                 mahina.io.eprint("mahina: error: --emit-coverage requires a <file> argument\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, arg, "--effect-log-limit")) {
+            const val = it.next() orelse {
+                mahina.io.eprint("mahina: error: --effect-log-limit requires a <bytes> argument\n", .{});
+                return 2;
+            };
+            topts.effect_log_limit = std.fmt.parseUnsigned(usize, val, 10) catch {
+                mahina.io.eprint("mahina: error: --effect-log-limit expects a byte count, got '{s}'\n", .{val});
                 return 2;
             };
         } else if (std.mem.eql(u8, arg, "--system")) {
@@ -562,6 +577,7 @@ fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source:
     };
     // `--emit-effects` records the nondeterministic-input log during the run.
     if (topts.effects_path != null) vm.effect_mode = .record;
+    vm.effect_log_limit = topts.effect_log_limit;
 
     // --- compile --- (pass the builtin globals so the unknown-global lint
     // doesn't flag `print`/`clock`).
@@ -739,10 +755,10 @@ fn emitKeyframe(gpa: std.mem.Allocator, io: mahina.io.Io, path: []const u8, vm: 
 /// Serialize the recorded nondeterministic-input effect log to `path` (binschema
 /// wire format). Mirrors `emitKeyframe`; the VM must have run in `record` mode.
 fn emitEffects(gpa: std.mem.Allocator, io: mahina.io.Io, path: []const u8, vm: *mahina.interp.Vm) !void {
-    const bytes = try mahina.effectser.encodeFile(gpa, vm.effect_log.items);
+    const bytes = try mahina.effectser.encodeFile(gpa, &vm.effect_log);
     defer gpa.free(bytes);
     try mahina.io.writeFile(io, path, bytes);
-    mahina.io.eprint("mahina: wrote effect log, {d} effect(s), {d} bytes → {s}\n", .{ vm.effect_log.items.len, bytes.len, path });
+    mahina.io.eprint("mahina: wrote effect log, {d} effect(s), {d} bytes → {s}\n", .{ vm.effect_log.len(), bytes.len, path });
 }
 
 /// Serialize the JIT execution-coverage artifact to `path` (binschema wire format).

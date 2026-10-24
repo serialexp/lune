@@ -3223,7 +3223,7 @@ pub const RecordingSession = struct {
         // bool→heap never flows on-trace. (The old "the scalar exec-log encoder
         // can't take it" half of the objection was already dead — doc 32: the log
         // silently drops unencodables, is viz-only, mutually exclusive with
-        // native, and `effectser.toEffectResult` encodes bools anyway.)
+        // native, and `execlogser.toWire` encodes bools anyway.)
         // A FUNCTION field (doc 43 P2 — `local m = self.method` / `obj:method()`
         // dispatch) records as `hload ty=.heap` + an immediate `guard_func`
         // pinning the closure's `Proto.id` (doc 02: a stable id, never a pointer

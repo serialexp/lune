@@ -859,8 +859,8 @@ test "doc 26: upper/lower/codepoint loop runs NATIVELY end-to-end — pin invari
     // commit pinned the version — ONCE, for 400 case calls + all trace
     // entries (recording shadows execution; executors never re-pin).
     try testing.expect(vm.unicode_version_pinned);
-    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
-    try testing.expectEqual(interp.EffectKind.unicode_version, vm.effect_log.items[0].kind);
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.entries.items.len);
+    try testing.expectEqual(interp.EffectKind.unicode_version, vm.effect_log.entries.items[0].kind);
 
     // The committed trace: all three ops present, `requires_unicode_pin`
     // stamped (M3), and the guard_gc bound counts EXACTLY the two case
@@ -902,7 +902,7 @@ test "doc 26: upper/lower/codepoint loop runs NATIVELY end-to-end — pin invari
     vm.out = &rep_sink;
     _ = try vm.run(chunk.proto);
     try testing.expectEqualStrings(t0_out[0..t0_len], rep_sink.buffered());
-    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.entries.items.len);
     try testing.expectEqual(@as(usize, 1), vm.effect_cursor);
     try testing.expect(vm.unicode_version_pinned);
 }
@@ -1423,8 +1423,8 @@ test "doc 27: nested lower(upper(s)) records, runs NATIVELY, chains provenance, 
     if (@import("nativegen.zig").is_x64_linux)
         try testing.expect(vm.trace.native_entries > 0);
     try testing.expect(vm.unicode_version_pinned);
-    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
-    try testing.expectEqual(interp.EffectKind.unicode_version, vm.effect_log.items[0].kind);
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.entries.items.len);
+    try testing.expectEqual(interp.EffectKind.unicode_version, vm.effect_log.entries.items[0].kind);
 
     // Committed-trace shape: `slower` consumes `supper`'s ref directly, and no
     // `guard_string` re-checks the proven producer result in between.
@@ -4559,7 +4559,7 @@ test "doc 30 c5: the pattern/str2num loop runs NATIVELY end-to-end — find/matc
     if (@import("nativegen.zig").is_x64_linux)
         try testing.expect(vm.trace.native_entries > 0);
     // Pattern callouts are PURE: nothing may enter the effect log.
-    try testing.expectEqual(@as(usize, 0), vm.effect_log.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.effect_log.entries.items.len);
 
     // Structural: one committed trace carries the numeric-for body's ops —
     // sfindp (plain find, konst-folded end index), TWO smatch (interleaved
@@ -4600,7 +4600,7 @@ test "doc 30 c5: the pattern/str2num loop runs NATIVELY end-to-end — find/matc
     vm.out = &rep_sink;
     _ = try vm.run(chunk.proto);
     try testing.expectEqualStrings(t0_out[0..t0_len], rep_sink.buffered());
-    try testing.expectEqual(@as(usize, 0), vm.effect_log.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.effect_log.entries.items.len);
 }
 
 test "doc 30 c5: guard_sid identity pin — a pattern rebound between loop runs side-exits and re-records with the new census" {

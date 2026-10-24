@@ -122,6 +122,9 @@ pub const keyframeser = @import("keyframeser.zig");
 /// nondeterministic inputs (`interp.Effect`) to/from their on-disk form (shares
 /// the generated binschema codec with `traceser`/`keyframeser`).
 pub const effectser = @import("effectser.zig");
+/// The in-memory effect log (`Vm.effect_log`): entries, and the bytes of
+/// `b`-mode read results (doc 65 §4.2).
+pub const effectlog = @import("effectlog.zig");
 
 /// Phase 7 (trace-iteration animation) — execution-log serialization: maps the
 /// IR-interpreter's per-trace execution logs (`execlog.TraceExecLog`) to/from their
@@ -177,6 +180,7 @@ test {
     _ = traceser;
     _ = keyframeser;
     _ = effectser;
+    _ = effectlog;
     _ = execlogser;
     _ = coverageser;
 }

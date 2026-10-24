@@ -103,6 +103,15 @@ test "Groups.parse" {
     try std.testing.expect(Groups.parse("") == null);
 }
 
+/// What a failed `io`/`os` call does (doc 65 §4.4). The ordinal is the
+/// `io_error_mode` effect's logged value, so it is part of the wire format.
+pub const IoErrors = enum(u8) {
+    /// Raise a catchable error (the default).
+    raise = 0,
+    /// Return Lua's `nil, msg, code` (`--lua-io-errors`).
+    lua = 1,
+};
+
 /// Why a host operation failed (doc 65 §4.2). The message a script sees is
 /// mahina's own text for the class plus the path or handle, never the OS's
 /// `strerror`, so a recording replays with the same text on any machine. The

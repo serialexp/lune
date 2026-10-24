@@ -402,6 +402,33 @@ pub const EffectKind = enum(u8) {
     /// packed `major<<16|minor<<8|patch` version. On replay it is read back and
     /// asserted equal to the compiled version (else a fatal `UnicodeVersionMismatch`).
     unicode_version = 6,
+    // Doc 65 §4.2: the `io`/`os` host operations. Each logs only its result
+    // (the arguments are program data); a failure logs its error class.
+    /// `io.open`, `io.tmpfile`: the handle id (an int), or a failure.
+    file_open = 7,
+    /// One `read` format, or one `lines` step: a string, a number, `nil` at
+    /// EOF, the bytes of a `b`-mode read, or a failure.
+    file_read_op = 8,
+    /// `write`: `nil` on success, or a failure.
+    file_write = 9,
+    /// `seek`: the new position (an int), or a failure.
+    file_seek = 10,
+    /// `flush`, `setvbuf`, `close`: `nil` on success, or a failure.
+    file_control = 11,
+    /// `os.remove`, `os.rename`: `nil` on success, or a failure.
+    fs_mutate = 12,
+    /// `os.tmpname`: the name (a string), or a failure.
+    fs_tmpname = 13,
+    /// `os.time()`: the wall clock, integer seconds since the epoch.
+    wall_clock = 14,
+    /// The local zone's offset from UTC in seconds at one instant, for
+    /// `os.date`/`os.time(t)` in local time.
+    local_offset = 15,
+    /// The `io` error mode (doc 65 §4.4: 0 = raise, 1 = Lua's returns). Not a
+    /// host input, but it changes what a program observes for the same logged
+    /// results, so it is pinned once per session like `unicode_version` and a
+    /// replay under the other mode refuses (`IoErrorModeMismatch`).
+    io_error_mode = 16,
 };
 
 pub const Native = struct {

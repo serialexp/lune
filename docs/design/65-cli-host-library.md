@@ -1,6 +1,6 @@
 # 65 — The `io` and `os` host library — Design
 
-Status: Phases 0 and 1 implemented; Phases 2–6 not started. Ground rules
+Status: Phases 0–2 implemented; Phases 3–6 not started. Ground rules
 D1–D4 (2026-10-20) and all ten design questions Q1–Q10 (2026-10-21)
 decided by Bart; the design below reflects the answers.
 Owner: Bart
@@ -68,18 +68,35 @@ checked. Every phase lands behind `just test`, `just hashgate` and
     (default `all`). The visualiser's native diff and coverage runs pass
     the playground's groups (`clock,random`), so both engines see the
     same globals.
+- [x] **Phase 2 — the effect-log format for host operations.** 2026-10-24.
+  - [x] Error results and the new effect kinds (§4.2): `file_open`,
+    `file_read_op`, `file_write`, `file_seek`, `file_control`,
+    `fs_mutate`, `fs_tmpname`, `wall_clock`, `local_offset`. A result is
+    a value, the bytes of a `b`-mode read, or a failure class
+    (`effectlog.Effect.Result`); bytes live in the log's own buffer and
+    ride the wire inline (`EffectBytes`, tag 5), failures as their class
+    (`HostFail`, tag 6). The decoder checks every result against its
+    kind. `recordHost`/`recordHostBytes`/`replayHost` are the entry
+    points the Phase 3 and 4 natives call.
+  - [x] The error mode (§4.4) pinned into the log once per session as
+    the `io_error_mode` kind (`noteIoErrorMode`, sharing
+    `pinSessionConstant` with the Unicode version pin); a replay under
+    the other mode fails with the non-catchable `IoErrorModeMismatch`.
+    The mode itself (`Vm.io_errors`) gets its CLI flag in Phase 3.
+  - [x] The recording size cap (§4.5, Q8): `Vm.effect_log_limit`,
+    1 MiB by default, `--effect-log-limit <bytes>` on the CLI, 0 for
+    none. It counts the encoded log exactly (`effectser.encodedEntrySize`,
+    pinned against `encodeFile` by a test) and stops the run with the
+    non-catchable `EffectLogLimit`, whose message names the limit and
+    the flag.
+  - [x] `effect_format_version` 6; `schema/trace.json` and the
+    regenerated Zig and TS codecs.
 
 ### Outstanding
 
-- [ ] **Phase 2 — the effect-log format for host operations.**
-  - [ ] Error results and the new effect kinds (§4.2); binary results
-    as inline bytes (§4.2, Q1).
-  - [ ] The error mode (§4.4) recorded with the log, so a replay cannot
-    run under the other mode.
-  - [ ] The recording size cap, 1 MiB by default, configurable (§4.5,
-    Q8).
-  - [ ] `effect_format_version` bump; `schema/trace.json` and the
-    regenerated Zig and TS codecs (`tools/regen-trace-schema.sh`).
+- [ ] **Defer — the cap's embedding config field.** The C API has no
+  record mode yet, so there is nothing for an `mh_config` field to cap;
+  it arrives with recording in the C API.
 - [ ] **Phase 3 — file handles and the `io` library.**
   - [ ] The `file` heap object (§4.1), its methods table, and keyframe
     serialization, including the reopen fingerprint (Q7).

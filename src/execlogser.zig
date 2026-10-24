@@ -93,14 +93,16 @@ fn toWire(v: LogValue) schema.EffectResult {
 }
 
 /// Inverse of `toWire`; a string's bytes are copied out of the (arena-backed)
-/// decoded wire struct into `gpa`, owned by the returned value.
-fn fromWire(gpa: std.mem.Allocator, er: schema.EffectResult) error{OutOfMemory}!LogValue {
+/// decoded wire struct into `gpa`, owned by the returned value. The effect
+/// log's byte and host-failure results are never trace values.
+fn fromWire(gpa: std.mem.Allocator, er: schema.EffectResult) DecodeError!LogValue {
     return switch (er.body) {
         .ConstNil => .nil,
         .ConstBool => |b| .{ .boolean = b.v != 0 },
         .ConstInt => |x| .{ .int = x.v },
         .ConstFloat => |x| .{ .float = x.v },
         .ConstString => |s| .{ .string = try gpa.dupe(u8, s.v) },
+        .EffectBytes, .HostFail => error.Malformed,
     };
 }
 
