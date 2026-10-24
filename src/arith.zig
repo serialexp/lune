@@ -337,7 +337,13 @@ pub fn toNumber(v: Value, base_arg: ?Value) Value {
         .int, .float => return v,
         else => {},
     }
-    const s = strBytes(v) orelse return Value.nil();
+    return strToNumber(strBytes(v) orelse return Value.nil());
+}
+
+/// `tonumber`'s conversion of a string's bytes (the 1-argument form): the
+/// number, or `nil`. Shared with `file:read("n")` (doc 65 Phase 3), which
+/// collects a numeral the way Lua's `read_number` does and converts it here.
+pub fn strToNumber(s: []const u8) Value {
     const t = std.mem.trim(u8, s, tonumber_trim);
     if (t.len == 0) return Value.nil();
     if (fastDecInt(t)) |iv| return Value.int(iv); // doc 29 B(a): the common shape

@@ -1,6 +1,6 @@
 # 65 — The `io` and `os` host library — Design
 
-Status: Phases 0–2 implemented; Phases 3–6 not started. Ground rules
+Status: Phases 0–3 implemented; Phases 4–6 not started. Ground rules
 D1–D4 (2026-10-20) and all ten design questions Q1–Q10 (2026-10-21)
 decided by Bart; the design below reflects the answers.
 Owner: Bart
@@ -91,8 +91,53 @@ checked. Every phase lands behind `just test`, `just hashgate` and
     the flag.
   - [x] `effect_format_version` 6; `schema/trace.json` and the
     regenerated Zig and TS codecs.
+- [x] **Phase 3 — file handles and the `io` library.** 2026-10-24.
+  - [x] The `file` heap object (§4.1, `src/file.zig`), its methods
+    table (`@file`, `__name = "FILE*"`) and keyframe serialization
+    (`HeapFile`, keyframe v12: the file metatable, the default input and
+    output and `next_file_id` are roots). The reopen fingerprint (size,
+    modification time, position) is host metadata: a keyframe captured
+    live takes it from the host, one captured in replay carries the
+    stored one, and the viz keyframe comparison leaves it out.
+  - [x] `io.open/close/read/write/lines/input/output/flush/type/tmpfile`,
+    `io.stdin/stdout/stderr`, `file:read/write/lines/seek/flush/setvbuf/close`
+    (`src/stdlib/io.zig`), text and `b` modes (Q1, Q2). The real host
+    (`src/host_system.zig`) buffers reads (64 KiB) and writes (8 KiB) per
+    handle. `io.tmpfile` opens in text mode (`w+`), since `b` would mean
+    byte arrays. Byte arrays cannot be written to stdout/stderr, which
+    are text streams.
+  - [x] The raising error mode and the Lua-compatibility mode (§4.4):
+    `--lua-io-errors`, `mh_config.lua_io_errors`, Rust
+    `Config::lua_io_errors`. The mode is pinned in the log by the first
+    host operation (`io_error_mode`), so a replay in the other mode is
+    refused. Three new error classes for failures the VM decides without
+    the host, never logged: `not_readable`, `not_writable`,
+    `not_seekable`.
+  - [x] Live resume of a restored keyframe: a restored `file`/`tmpfile`
+    handle is detached and every operation raises "file handle was not
+    reopened after restore"; `Vm.reopenFiles` reopens the ones whose
+    fingerprint still matches, at the recorded position (§4.1, Q7).
+  - [x] Record/replay tests for every effect kind, including a replay
+    with no host at all (`src/interp_io_test.zig`, on the in-memory
+    `FakeHost` in `src/interp_testutil.zig`, which fills 3 bytes at a
+    time so every read crosses host buffers).
+  - [x] Benchmarks `bench/stdlib/io_lines.lua`, `io_read_all.lua`,
+    `io_read_all_bin.lua` (§9), all inside budget. Text `read("a")` was
+    1.6× `lua5.4` until `String.countCodepoints` (every string's
+    construction scan) was vectorised.
+  - [x] Inventory rows for the 20 `io` functions; `io.type`,
+    `io.stdout`/`io.stderr` and the `file:` methods moved to
+    `base-host`, since every VM has them.
 
 ### Outstanding
+
+- [ ] **Defer — `--reopen-files` and its embedding config field.**
+  Neither the CLI nor the C API can resume from a keyframe yet, so the
+  flag has nothing to apply to; `Vm.reopenFiles` is the mechanism they
+  will call.
+- [ ] **Defer — `__close`.** mahina has no to-be-closed variables, so
+  the file metatable has no `__close` and `io.lines` returns no
+  closing value for one.
 
 - [ ] **Defer — the cap's embedding config field.** The C API has no
   record mode yet, so there is nothing for an `mh_config` field to cap;
@@ -227,6 +272,13 @@ the extra fields. Restore followed by *live* execution:
   fingerprint no longer matches stays closed and raises like the
   default case. This is for restarting a session straight after a
   crash, when nothing has touched the files since.
+
+*As built (Phase 3):* the reopen is a call, `Vm.reopenFiles`, made after
+restore once the host is set; the CLI flag and the config field wait for
+a resume entry point (status section). The metatable has no
+`__tostring` (`tostring` renders a handle natively, as "file (0x…)")
+and no `__close` (no to-be-closed variables). A temporary file is
+detached on restore like any other, and never reopened: it has no path.
 
 ### 4.2 Effects
 
@@ -456,6 +508,28 @@ Both are inside the 1.5× budget. A million `print`s went from 1 M
 copy each 4 KiB `io.write` into the buffer instead of passing it
 straight to the kernel, so 100 MB to a pipe took 9–13 ms instead of
 7 ms. We use 4 KiB.
+
+**Phase 3 measurements** (2026-10-24; best of 7, Linux x86-64,
+ReleaseFast, tier-0; a 100 MB file of 1 M 100-byte ASCII lines, warm in
+the page cache):
+
+| Benchmark | mahina | `lua5.4` | LuaJIT | vs `lua5.4` |
+|---|---|---|---|---|
+| `io_lines` 1 M lines | 0.106 s | 0.096 s | 0.112 s | 1.11× |
+| `io_read_all` text, 100 MB | 0.074 s | 0.065 s | 0.057 s | 1.14× |
+| `io_read_all_bin` `rb`, 100 MB | 0.063 s | 0.064 s | 0.061 s | 0.98× |
+
+Text `read("a")` first measured 0.100 s (1.6×): 69% of it was
+`String.countCodepoints`, the scan every new string pays for its
+code-point count and ASCII bit, running a byte at a time. Vectorised,
+it no longer shows. The `--jit-native` times are the same: the loops
+are host calls.
+
+Record mode, `io_lines` with `--effect-log-limit 0`: the log is 1.05×
+the bytes read (105 MB for 100 MB), and the time per line is flat,
+462, 429 and 415 ns at 100 k, 300 k and 1 M lines (0.42 s at 1 M
+against 0.11 s off), so it grows linearly. Peak memory at 1 M lines is
+437 MB: the log keeps every line string alive until it is written.
 
 ## 10. Design questions (all decided 2026-10-21)
 

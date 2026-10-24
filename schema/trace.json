@@ -183,8 +183,29 @@
       "sequence": [ { "name": "name", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" } ]
     },
 
+    "FileFingerprint": {
+      "description": "A file as the host saw it when the keyframe was captured (doc 65 Q7): its size and modification time (nanoseconds since the epoch), and the handle's byte position. A live resume reopens the file only if size and mtime still match, then seeks to the position.",
+      "sequence": [
+        { "name": "size",     "type": "uint64" },
+        { "name": "mtime_ns", "type": "int64" },
+        { "name": "position", "type": "uint64" }
+      ]
+    },
+
+    "HeapFile": {
+      "description": "A file handle (doc 65 §4.1). `file_id` is the VM-assigned handle number the host keys its OS file by (0-2 are the standard streams); `kind` is file.File.Kind (stdin=0, stdout=1, stderr=2, file=3, tmpfile=4); `mode` the packed open mode (file.packMode: kind in bits 0-1 — read=0, write=1, append=2 — update in bit 2, binary in bit 3); `closed` 0/1; `path` the name it was opened with (empty for a standard stream or temporary file). `fingerprint` has one entry for an open file captured live (host metadata, not program state: a replay needs none, and a capture made in replay carries only what a restore gave it), none otherwise.",
+      "sequence": [
+        { "name": "file_id",     "type": "uint32" },
+        { "name": "kind",        "type": "uint8" },
+        { "name": "mode",        "type": "uint8" },
+        { "name": "closed",      "type": "uint8" },
+        { "name": "path",        "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" },
+        { "name": "fingerprint", "type": "array", "kind": "length_prefixed", "length_type": "uint8", "items": { "type": "FileFingerprint" } }
+      ]
+    },
+
     "HeapObject": {
-      "description": "One heap object in a snapshot, tagged by `obj_type` (mirrors object.ObjectType: string=0, table=1, function=2, native=3, upvalue=4). `id` is the object's stable GcHeader.id and the key every HeapRef points at. typed_array(5)/host(6) have no variant yet — emitting one is a serializer bug (UnsupportedObject), not a silent drop.",
+      "description": "One heap object in a snapshot, tagged by `obj_type` (mirrors object.ObjectType: string=0, table=1, function=2, native=3, upvalue=4, file=7). `id` is the object's stable GcHeader.id and the key every HeapRef points at. typed_array(5)/host(6) have no variant yet — emitting one is a serializer bug (UnsupportedObject), not a silent drop.",
       "sequence": [
         { "name": "id",       "type": "uint32" },
         { "name": "obj_type", "type": "uint8" },
@@ -197,7 +218,8 @@
             { "type": "HeapTable",   "when": "value === 1" },
             { "type": "HeapClosure", "when": "value === 2" },
             { "type": "HeapNative",  "when": "value === 3" },
-            { "type": "HeapUpvalue", "when": "value === 4" }
+            { "type": "HeapUpvalue", "when": "value === 4" },
+            { "type": "HeapFile",    "when": "value === 7" }
           ]
         }
       ]
@@ -234,10 +256,14 @@
     },
 
     "Keyframe": {
-      "description": "A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.",
+      "description": "A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.",
       "sequence": [
         { "name": "globals_id",    "type": "uint32" },
         { "name": "string_metatable_id", "type": "uint32" },
+        { "name": "file_metatable_id", "type": "uint32" },
+        { "name": "io_input_id",   "type": "uint32" },
+        { "name": "io_output_id",  "type": "uint32" },
+        { "name": "next_file_id",  "type": "uint32" },
         { "name": "next_obj_id",   "type": "uint32" },
         { "name": "next_gc",       "type": "uint64" },
         { "name": "objects",       "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "HeapObject" } },

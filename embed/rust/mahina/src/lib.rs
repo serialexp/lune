@@ -155,6 +155,9 @@ pub struct Config {
     /// The system interfaces the guest may use (doc 65 §5.2). The default is
     /// none: the VM is deterministic and sees nothing of the host.
     pub system: System,
+    /// A failed `io`/`os` call returns Lua's `nil, msg, code` instead of
+    /// raising an error (doc 65 §4.4). Off by default.
+    pub lua_io_errors: bool,
 }
 
 /// A set of system interface groups for [`Config::system`]. A group that is
@@ -935,6 +938,7 @@ impl Vm {
                 Some(false) => 2,
             },
             system: config.system.0,
+            lua_io_errors: config.lua_io_errors as std::os::raw::c_int,
         };
         let mut raw: *mut sys::mh_vm = std::ptr::null_mut();
         let st = unsafe { sys::mh_vm_new(&cfg, &mut raw) };

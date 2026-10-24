@@ -38,6 +38,8 @@ const arr = @import("array.zig");
 const value = @import("value.zig");
 const function = @import("function.zig");
 const bytecode = @import("bytecode.zig");
+const system = @import("system.zig");
+const File = @import("file.zig").File;
 const GcHeader = object.GcHeader;
 const GcColor = object.GcColor;
 const String = string.String;
@@ -574,6 +576,13 @@ pub const Heap = struct {
         return n;
     }
 
+    /// Allocate a file handle (doc 65 §4.1) and register it with the heap.
+    pub fn newFile(self: *Heap, id: system.FileId, kind: File.Kind, mode: system.OpenMode, path: []const u8) std.mem.Allocator.Error!*File {
+        const f = try File.create(self.gpa, id, kind, mode, path);
+        self.link(&f.header);
+        return f;
+    }
+
     /// Allocate an *open* upvalue over live stack slot `index`, whose lanes
     /// are `tag` and `payload`, and register it with the heap. Closing is the
     /// interpreter's job.
@@ -696,8 +705,8 @@ pub const Heap = struct {
     fn blacken(self: *Heap, h: *GcHeader) void {
         switch (h.type) {
             // Leaves: no heap children. A `Native`'s name is a borrowed/static
-            // slice, not a heap String.
-            .string, .native => {},
+            // slice, not a heap String; a `File`'s path is owned bytes.
+            .string, .native, .file => {},
             .table => {
                 const t = Table.fromHeader(h);
                 // Narrow lanes (bool/int/float) hold no heap pointers — the array
@@ -822,6 +831,7 @@ fn destroyObject(gpa: std.mem.Allocator, h: *GcHeader) void {
         .function => Closure.fromHeader(h).destroy(gpa),
         .native => Native.fromHeader(h).destroy(gpa),
         .upvalue => Upvalue.fromHeader(h).destroy(gpa),
+        .file => File.fromHeader(h).destroy(gpa),
         // typed_array (Phase 9b) and host (embedding) are not heap-allocated
         // here yet.
         else => @panic("gc: unknown object type during sweep"),

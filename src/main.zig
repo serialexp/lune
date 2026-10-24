@@ -123,6 +123,8 @@ const usage =
     \\                       the cap on the --emit-effects log (doc 65 §4.5;
     \\                       default 1048576, 0 for none). A recording that
     \\                       would grow past it stops with an error.
+    \\  --lua-io-errors      a failed io/os call returns Lua's nil, message,
+    \\                       code instead of raising an error (doc 65 §4.4).
     \\  --emit-coverage <file>
     \\                       imply --trace + JIT coverage accounting and serialize
     \\                       the coverage artifact (native-vs-tier-0 split by
@@ -170,6 +172,8 @@ const TraceOpts = struct {
     effects_path: ?[]const u8 = null,
     /// `--effect-log-limit <bytes>`: `Vm.effect_log_limit` (0: none).
     effect_log_limit: usize = mahina.interp.default_effect_log_limit,
+    /// `--lua-io-errors`: `Vm.io_errors = .lua`.
+    lua_io_errors: bool = false,
     /// `--emit-coverage <file>`: serialize the JIT execution-coverage artifact here
     /// after the run. Implies `--trace` + `coverage` (the accounting must be on).
     coverage_path: ?[]const u8 = null,
@@ -351,6 +355,8 @@ pub fn main(init: std.process.Init) u8 {
                 mahina.io.eprint("mahina: error: --emit-coverage requires a <file> argument\n", .{});
                 return 2;
             };
+        } else if (std.mem.eql(u8, arg, "--lua-io-errors")) {
+            topts.lua_io_errors = true;
         } else if (std.mem.eql(u8, arg, "--effect-log-limit")) {
             const val = it.next() orelse {
                 mahina.io.eprint("mahina: error: --effect-log-limit requires a <bytes> argument\n", .{});
@@ -578,6 +584,7 @@ fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source:
     // `--emit-effects` records the nondeterministic-input log during the run.
     if (topts.effects_path != null) vm.effect_mode = .record;
     vm.effect_log_limit = topts.effect_log_limit;
+    vm.io_errors = if (topts.lua_io_errors) .lua else .raise;
 
     // --- compile --- (pass the builtin globals so the unknown-global lint
     // doesn't flag `print`/`clock`).

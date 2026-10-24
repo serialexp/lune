@@ -2815,7 +2815,263 @@ export class HeapNativeDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * One heap object in a snapshot, tagged by `obj_type` (mirrors object.ObjectType: string=0, table=1, function=2, native=3, upvalue=4). `id` is the object's stable GcHeader.id and the key every HeapRef points at. typed_array(5)/host(6) have no variant yet — emitting one is a serializer bug (UnsupportedObject), not a silent drop.
+ * A file as the host saw it when the keyframe was captured (doc 65 Q7): its size and modification time (nanoseconds since the epoch), and the handle's byte position. A live resume reopens the file only if size and mtime still match, then seeks to the position.
+ */
+export interface FileFingerprintInput {
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  size: bigint;
+  /**
+   * 64-bit Signed Integer
+   * Fixed-width 64-bit signed integer (-9223372036854775808 to 9223372036854775807). Respects endianness configuration.
+   */
+  mtime_ns: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  position: bigint;
+}
+
+/**
+ * A file as the host saw it when the keyframe was captured (doc 65 Q7): its size and modification time (nanoseconds since the epoch), and the handle's byte position. A live resume reopens the file only if size and mtime still match, then seeks to the position.
+ */
+export interface FileFingerprintOutput {
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  size: bigint;
+  /**
+   * 64-bit Signed Integer
+   * Fixed-width 64-bit signed integer (-9223372036854775808 to 9223372036854775807). Respects endianness configuration.
+   */
+  mtime_ns: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  position: bigint;
+}
+
+export type FileFingerprint = FileFingerprintOutput;
+
+export class FileFingerprintEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: FileFingerprintInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint64(value.size, "little_endian");
+    this.writeInt64(value.mtime_ns, "little_endian");
+    this.writeUint64(value.position, "little_endian");
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a FileFingerprint value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: FileFingerprint): number {
+    return 24; // size + mtime_ns + position
+  }
+}
+
+export class FileFingerprintDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): FileFingerprintOutput {
+    const value: any = {};
+
+    value.size = this.readUint64("little_endian");
+    value.mtime_ns = this.readInt64("little_endian");
+    value.position = this.readUint64("little_endian");
+    return value;
+  }
+}
+
+/**
+ * A file handle (doc 65 §4.1). `file_id` is the VM-assigned handle number the host keys its OS file by (0-2 are the standard streams); `kind` is file.File.Kind (stdin=0, stdout=1, stderr=2, file=3, tmpfile=4); `mode` the packed open mode (file.packMode: kind in bits 0-1 — read=0, write=1, append=2 — update in bit 2, binary in bit 3); `closed` 0/1; `path` the name it was opened with (empty for a standard stream or temporary file). `fingerprint` has one entry for an open file captured live (host metadata, not program state: a replay needs none, and a capture made in replay carries only what a restore gave it), none otherwise.
+ */
+export interface HeapFileInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  file_id: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  kind: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  mode: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  closed: number;
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  path: number[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint8
+   */
+  fingerprint: FileFingerprintInput[];
+}
+
+/**
+ * A file handle (doc 65 §4.1). `file_id` is the VM-assigned handle number the host keys its OS file by (0-2 are the standard streams); `kind` is file.File.Kind (stdin=0, stdout=1, stderr=2, file=3, tmpfile=4); `mode` the packed open mode (file.packMode: kind in bits 0-1 — read=0, write=1, append=2 — update in bit 2, binary in bit 3); `closed` 0/1; `path` the name it was opened with (empty for a standard stream or temporary file). `fingerprint` has one entry for an open file captured live (host metadata, not program state: a replay needs none, and a capture made in replay carries only what a restore gave it), none otherwise.
+ */
+export interface HeapFileOutput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  file_id: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  kind: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  mode: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  closed: number;
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  path: number[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint8
+   */
+  fingerprint: FileFingerprintOutput[];
+}
+
+export type HeapFile = HeapFileOutput;
+
+export class HeapFileEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: HeapFileInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.file_id, "little_endian");
+    this.writeUint8(value.kind);
+    this.writeUint8(value.mode);
+    this.writeUint8(value.closed);
+    this.writeUint32(value.path.length, "little_endian");
+    for (let value_path__iter_index = 0; value_path__iter_index < value.path.length; value_path__iter_index++) {
+      const value_path__iter = value.path[value_path__iter_index];
+      this.writeUint8(value_path__iter);
+    }
+    this.writeUint8(value.fingerprint.length);
+    for (let value_fingerprint__iter_index = 0; value_fingerprint__iter_index < value.fingerprint.length; value_fingerprint__iter_index++) {
+      const value_fingerprint__iter = value.fingerprint[value_fingerprint__iter_index];
+      const encoder_value_fingerprint__iter = new FileFingerprintEncoder();
+      const encoded_value_fingerprint__iter = encoder_value_fingerprint__iter.encode(value_fingerprint__iter);
+      for (const byte of encoded_value_fingerprint__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a HeapFile value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: HeapFile): number {
+    let size = 0;
+    size += 7; // file_id + kind + mode + closed
+    // path: bytes (kind: length_prefixed)
+    size += value.path.length;
+    size += 4; // length prefix (uint32)
+    // fingerprint: array (kind: length_prefixed)
+    for (const item of value.fingerprint) {
+      const fingerprint_itemEncoder = new FileFingerprintEncoder();
+      size += fingerprint_itemEncoder.calculateSize(item);
+    }
+    size += 1; // length prefix (uint8)
+    return size;
+  }
+}
+
+export class HeapFileDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): HeapFileOutput {
+    const value: any = {};
+
+    value.file_id = this.readUint32("little_endian");
+    value.kind = this.readUint8();
+    value.mode = this.readUint8();
+    value.closed = this.readUint8();
+    value.path = [];
+    const path_length = this.readUint32("little_endian");
+    for (let i = 0; i < path_length; i++) {
+      let path__iter: any;
+      path__iter = this.readUint8();
+      value.path.push(path__iter);
+    }
+    value.fingerprint = [];
+    const fingerprint_length = this.readUint8();
+    for (let i = 0; i < fingerprint_length; i++) {
+      let fingerprint__iter: any;
+      fingerprint__iter = {};
+      fingerprint__iter.size = this.readUint64("little_endian");
+      fingerprint__iter.mtime_ns = this.readInt64("little_endian");
+      fingerprint__iter.position = this.readUint64("little_endian");
+      value.fingerprint.push(fingerprint__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * One heap object in a snapshot, tagged by `obj_type` (mirrors object.ObjectType: string=0, table=1, function=2, native=3, upvalue=4, file=7). `id` is the object's stable GcHeader.id and the key every HeapRef points at. typed_array(5)/host(6) have no variant yet — emitting one is a serializer bug (UnsupportedObject), not a silent drop.
  */
 export interface HeapObjectInput {
   /**
@@ -2835,18 +3091,19 @@ export interface HeapObjectInput {
    * @remarks
    *
    * Discriminator: field 'obj_type'
-   * Variants: 5
+   * Variants: 6
    * - HeapString (when value === 0)
    * - HeapTable (when value === 1)
    * - HeapClosure (when value === 2)
    * - HeapNative (when value === 3)
    * - HeapUpvalue (when value === 4)
+   * - HeapFile (when value === 7)
    */
-  body: { type: 'HeapString'; value: HeapStringInput } | { type: 'HeapTable'; value: HeapTableInput } | { type: 'HeapClosure'; value: HeapClosureInput } | { type: 'HeapNative'; value: HeapNativeInput } | { type: 'HeapUpvalue'; value: HeapUpvalueInput };
+  body: { type: 'HeapString'; value: HeapStringInput } | { type: 'HeapTable'; value: HeapTableInput } | { type: 'HeapClosure'; value: HeapClosureInput } | { type: 'HeapNative'; value: HeapNativeInput } | { type: 'HeapUpvalue'; value: HeapUpvalueInput } | { type: 'HeapFile'; value: HeapFileInput };
 }
 
 /**
- * One heap object in a snapshot, tagged by `obj_type` (mirrors object.ObjectType: string=0, table=1, function=2, native=3, upvalue=4). `id` is the object's stable GcHeader.id and the key every HeapRef points at. typed_array(5)/host(6) have no variant yet — emitting one is a serializer bug (UnsupportedObject), not a silent drop.
+ * One heap object in a snapshot, tagged by `obj_type` (mirrors object.ObjectType: string=0, table=1, function=2, native=3, upvalue=4, file=7). `id` is the object's stable GcHeader.id and the key every HeapRef points at. typed_array(5)/host(6) have no variant yet — emitting one is a serializer bug (UnsupportedObject), not a silent drop.
  */
 export interface HeapObjectOutput {
   /**
@@ -2866,14 +3123,15 @@ export interface HeapObjectOutput {
    * @remarks
    *
    * Discriminator: field 'obj_type'
-   * Variants: 5
+   * Variants: 6
    * - HeapString (when value === 0)
    * - HeapTable (when value === 1)
    * - HeapClosure (when value === 2)
    * - HeapNative (when value === 3)
    * - HeapUpvalue (when value === 4)
+   * - HeapFile (when value === 7)
    */
-  body: { type: 'HeapString'; value: HeapStringOutput } | { type: 'HeapTable'; value: HeapTableOutput } | { type: 'HeapClosure'; value: HeapClosureOutput } | { type: 'HeapNative'; value: HeapNativeOutput } | { type: 'HeapUpvalue'; value: HeapUpvalueOutput };
+  body: { type: 'HeapString'; value: HeapStringOutput } | { type: 'HeapTable'; value: HeapTableOutput } | { type: 'HeapClosure'; value: HeapClosureOutput } | { type: 'HeapNative'; value: HeapNativeOutput } | { type: 'HeapUpvalue'; value: HeapUpvalueOutput } | { type: 'HeapFile'; value: HeapFileOutput };
 }
 
 export type HeapObject = HeapObjectOutput;
@@ -2887,6 +3145,7 @@ export const enum HeapObjectBodyVariant {
   HeapClosure = 'HeapClosure',
   HeapNative = 'HeapNative',
   HeapUpvalue = 'HeapUpvalue',
+  HeapFile = 'HeapFile',
 }
 
 export class HeapObjectEncoder extends BitStreamEncoder {
@@ -2936,6 +3195,13 @@ export class HeapObjectEncoder extends BitStreamEncoder {
       for (const byte of encoded_value) {
         this.writeUint8(byte);
       }
+    }
+    else if (value.body.type === 'HeapFile') {
+      const encoder_value = new HeapFileEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
     } else {
       throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type: ${(value.body as any).type}`);
     }
@@ -2967,6 +3233,10 @@ export class HeapObjectEncoder extends BitStreamEncoder {
     }
     else if (value.body.type === 'HeapUpvalue') {
       const _enc = new HeapUpvalueEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'HeapFile') {
+      const _enc = new HeapFileEncoder();
       size += _enc.calculateSize(value.body.value);
     }
     else {
@@ -3016,6 +3286,12 @@ export class HeapObjectDecoder extends SeekableBitStreamDecoder {
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.body = { type: 'HeapUpvalue', value: payload };
+    }
+    else if (value.obj_type === 7) {
+      const decoder = new HeapFileDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'HeapFile', value: payload };
     } else {
       throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.obj_type}`);
     }
@@ -3345,7 +3621,7 @@ export class LoadedChunkDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
  */
 export interface KeyframeInput {
   /**
@@ -3358,6 +3634,26 @@ export interface KeyframeInput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   string_metatable_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  file_metatable_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  io_input_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  io_output_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  next_file_id: number;
   /**
    * 32-bit Unsigned Integer
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
@@ -3421,7 +3717,7 @@ export interface KeyframeInput {
 }
 
 /**
- * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
  */
 export interface KeyframeOutput {
   /**
@@ -3434,6 +3730,26 @@ export interface KeyframeOutput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   string_metatable_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  file_metatable_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  io_input_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  io_output_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  next_file_id: number;
   /**
    * 32-bit Unsigned Integer
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
@@ -3511,6 +3827,10 @@ export class KeyframeEncoder extends BitStreamEncoder {
 
     this.writeUint32(value.globals_id, "little_endian");
     this.writeUint32(value.string_metatable_id, "little_endian");
+    this.writeUint32(value.file_metatable_id, "little_endian");
+    this.writeUint32(value.io_input_id, "little_endian");
+    this.writeUint32(value.io_output_id, "little_endian");
+    this.writeUint32(value.next_file_id, "little_endian");
     this.writeUint32(value.next_obj_id, "little_endian");
     this.writeUint64(value.next_gc, "little_endian");
     this.writeUint32(value.objects.length, "little_endian");
@@ -3567,7 +3887,7 @@ export class KeyframeEncoder extends BitStreamEncoder {
    */
   calculateSize(value: Keyframe): number {
     let size = 0;
-    size += 20; // globals_id + string_metatable_id + next_obj_id + next_gc
+    size += 36; // globals_id + string_metatable_id + file_metatable_id + io_input_id + io_output_id + next_file_id + next_obj_id + next_gc
     // objects: array (kind: length_prefixed)
     for (const item of value.objects) {
       const objects_itemEncoder = new HeapObjectEncoder();
@@ -3613,6 +3933,10 @@ export class KeyframeDecoder extends SeekableBitStreamDecoder {
 
     value.globals_id = this.readUint32("little_endian");
     value.string_metatable_id = this.readUint32("little_endian");
+    value.file_metatable_id = this.readUint32("little_endian");
+    value.io_input_id = this.readUint32("little_endian");
+    value.io_output_id = this.readUint32("little_endian");
+    value.next_file_id = this.readUint32("little_endian");
     value.next_obj_id = this.readUint32("little_endian");
     value.next_gc = this.readUint64("little_endian");
     value.objects = [];
@@ -3651,6 +3975,12 @@ export class KeyframeDecoder extends SeekableBitStreamDecoder {
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         objects__iter.body = { type: 'HeapUpvalue', value: payload };
+      }
+      else if (objects__iter.obj_type === 7) {
+        const decoder = new HeapFileDecoder(this.bytes.slice(this.byteOffset), objects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        objects__iter.body = { type: 'HeapFile', value: payload };
       } else {
         throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${objects__iter.obj_type}`);
       }
@@ -3761,7 +4091,7 @@ export interface SnapshotFileInput {
    */
   version: number;
   /**
-   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
    */
   keyframe: KeyframeInput;
 }
@@ -3776,7 +4106,7 @@ export interface SnapshotFileOutput {
    */
   version: number;
   /**
-   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
    */
   keyframe: KeyframeOutput;
 }
@@ -3830,6 +4160,10 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
     value.keyframe = {};
     value.keyframe.globals_id = this.readUint32("little_endian");
     value.keyframe.string_metatable_id = this.readUint32("little_endian");
+    value.keyframe.file_metatable_id = this.readUint32("little_endian");
+    value.keyframe.io_input_id = this.readUint32("little_endian");
+    value.keyframe.io_output_id = this.readUint32("little_endian");
+    value.keyframe.next_file_id = this.readUint32("little_endian");
     value.keyframe.next_obj_id = this.readUint32("little_endian");
     value.keyframe.next_gc = this.readUint64("little_endian");
     value.keyframe.objects = [];
@@ -3868,6 +4202,12 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         keyframe_objects__iter.body = { type: 'HeapUpvalue', value: payload };
+      }
+      else if (keyframe_objects__iter.obj_type === 7) {
+        const decoder = new HeapFileDecoder(this.bytes.slice(this.byteOffset), keyframe_objects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        keyframe_objects__iter.body = { type: 'HeapFile', value: payload };
       } else {
         throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${keyframe_objects__iter.obj_type}`);
       }

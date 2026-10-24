@@ -63,6 +63,15 @@ pub const Groups = packed struct(u8) {
         };
     }
 
+    /// Whether the two sets share a group.
+    pub fn overlaps(self: Groups, other: Groups) bool {
+        return @as(u8, @bitCast(self)) & @as(u8, @bitCast(other)) != 0;
+    }
+
+    pub fn unite(self: Groups, other: Groups) Groups {
+        return @bitCast(@as(u8, @bitCast(self)) | @as(u8, @bitCast(other)));
+    }
+
     /// From the C mask; bits above `MH_SYSTEM_ALL` are ignored.
     pub fn fromMask(mask: u32) Groups {
         var g: Groups = @bitCast(@as(u8, @truncate(mask)));
@@ -126,6 +135,15 @@ pub const ErrorClass = enum(u8) {
     /// A text-mode read that is not valid UTF-8 (raised by the VM, not the host).
     not_utf8 = 5,
     other = 6,
+    /// A read from a handle opened only for writing. Decided by the VM from
+    /// the handle's mode, so never logged; the ordinal is still the `code`.
+    not_readable = 7,
+    /// A write to a handle opened only for reading (VM-decided, like
+    /// `not_readable`).
+    not_writable = 8,
+    /// A seek on a stream that has no position: a pipe or terminal (from the
+    /// host), or the VM's stdout/stderr seam (VM-decided).
+    not_seekable = 9,
 
     pub fn text(self: ErrorClass) []const u8 {
         return switch (self) {
@@ -135,6 +153,9 @@ pub const ErrorClass = enum(u8) {
             .is_a_directory => "is a directory",
             .not_utf8 => "not valid UTF-8",
             .other => "input/output error",
+            .not_readable => "not open for reading",
+            .not_writable => "not open for writing",
+            .not_seekable => "not seekable",
         };
     }
 };
@@ -193,7 +214,8 @@ pub const HostSystem = struct {
         // ---- files and stdin (doc 65 §5.1) ----
         /// Open `path` as file `id`.
         open: ?*const fn (ctx: *anyopaque, id: FileId, path: []const u8, mode: OpenMode) ?ErrorClass = null,
-        /// Open an anonymous temporary file (`w+b`) as file `id`.
+        /// Open an anonymous read-write temporary file as file `id`, removed
+        /// when it is closed (or at exit).
         tmpfile: ?*const fn (ctx: *anyopaque, id: FileId) ?ErrorClass = null,
         /// The bytes buffered at the read position, refilling when empty. An
         /// empty slice is end of file. Reading does not advance until `consume`.

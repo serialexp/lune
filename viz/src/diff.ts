@@ -144,6 +144,12 @@ export function keyframeSansArg(bytes: Uint8Array): string {
   const roots = {
     globals: visit(Number(kf.globals_id)),
     string_metatable: Number(kf.string_metatable_id) > 0 ? visit(Number(kf.string_metatable_id) - 1) : -1,
+    // The io library's roots (doc 65): the file metatable, the default files
+    // and the handle-id counter, all deterministic.
+    file_metatable: Number(kf.file_metatable_id) > 0 ? visit(Number(kf.file_metatable_id) - 1) : -1,
+    io_input: Number(kf.io_input_id) > 0 ? visit(Number(kf.io_input_id) - 1) : -1,
+    io_output: Number(kf.io_output_id) > 0 ? visit(Number(kf.io_output_id) - 1) : -1,
+    next_file_id: kf.next_file_id,
     stack: kf.stack.map(canonSv),
     frames: kf.frames.map((fr: any) => ({ closure: visit(Number(fr.closure_id)), pc: fr.pc, base: fr.base, ret_dest: fr.ret_dest, ret_count: fr.ret_count })),
     open_upvalues: kf.open_upvalues.map((uv: any) => ({ stack_index: uv.stack_index, upvalue: visit(Number(uv.upvalue_id)) })),
@@ -188,6 +194,11 @@ export function keyframeSansArg(bytes: Uint8Array): string {
       case 4: // upvalue
         body = { closed: o.body.value.closed, value: canonSv(o.body.value.value) };
         break;
+      case 7: { // file handle; the fingerprint is host metadata, not program state
+        const f = o.body.value;
+        body = { file_id: f.file_id, kind: f.kind, mode: f.mode, closed: f.closed, path: Array.from(new Uint8Array(f.path)) };
+        break;
+      }
       default:
         body = { unknown: o.obj_type };
     }

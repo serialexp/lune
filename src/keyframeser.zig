@@ -35,6 +35,9 @@ const parser = @import("parser.zig");
 const compiler = @import("compiler.zig");
 const diag = @import("diag.zig");
 const trace = @import("trace.zig");
+const system = @import("system.zig");
+const filemod = @import("file.zig");
+const File = filemod.File;
 
 const Value = value.Value;
 const GcHeader = object.GcHeader;
@@ -99,7 +102,13 @@ pub const schema = @import("gen/trace_schema.zig");
 /// `ctl.protect`, and without the tag a restored VM would not catch the
 /// errors raised under it. Only `protect` may be set yet, and never on the
 /// bottom frame.
-pub const snapshot_format_version: u32 = 11;
+///
+/// v12 (doc 65 §4.1): file handles. `HeapObject` gained `HeapFile` (obj_type
+/// 7: the handle id, kind, packed mode, closed flag, path, and the host's
+/// fingerprint of an open file captured live), and `Keyframe` the file
+/// metatable, the default input and output handles (1-based optional ids)
+/// and `next_file_id`.
+pub const snapshot_format_version: u32 = 12;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -206,8 +215,12 @@ fn sortedHashEntries(a: std.mem.Allocator, t: *const table.Table) ![]HashKV {
 ///
 /// `typed_array`/`host` have no wire variant in F2a — a reachable one is a
 /// serializer bug surfaced as `UnsupportedObject`, not a silent drop.
-pub fn toSchemaHeapObject(a: std.mem.Allocator, h: *GcHeader) !schema.HeapObject {
-    const Body = schema.BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue;
+///
+/// `live` is the host system when the capture is live (`off`/`record`): an
+/// open file's fingerprint is then the host's view of it now (doc 65 Q7).
+/// Otherwise a file carries the fingerprint it was restored with, if any.
+pub fn toSchemaHeapObject(a: std.mem.Allocator, h: *GcHeader, live: ?system.HostSystem) !schema.HeapObject {
+    const Body = schema.BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue_HeapFile;
     const body: Body = switch (h.type) {
         .string => .{ .HeapString = .{ .bytes = string.String.fromHeader(h).bytes() } },
         .table => blk: {
@@ -265,6 +278,28 @@ pub fn toSchemaHeapObject(a: std.mem.Allocator, h: *GcHeader) !schema.HeapObject
             break :blk .{ .HeapUpvalue = .{ .closed = @intFromBool(is_closed), .value = toSchemaValue(u.get()) } };
         },
         .native => .{ .HeapNative = .{ .name = function.Native.fromHeader(h).name } },
+        .file => blk: {
+            const f = File.fromHeader(h);
+            var fp = f.fingerprint;
+            if (live) |sys| {
+                if (f.kind == .file and !f.closed and !f.detached) {
+                    if (sys.vtable.fingerprint) |get| fp = get(sys.ctx, f.id);
+                }
+            }
+            const fps: []schema.FileFingerprint = if (fp) |x| blk2: {
+                const one = try a.alloc(schema.FileFingerprint, 1);
+                one[0] = .{ .size = x.size, .mtime_ns = x.mtime_ns, .position = x.position };
+                break :blk2 one;
+            } else &.{};
+            break :blk .{ .HeapFile = .{
+                .file_id = f.id,
+                .kind = @intFromEnum(f.kind),
+                .mode = filemod.packMode(f.mode),
+                .closed = @intFromBool(f.closed),
+                .path = f.path,
+                .fingerprint = fps,
+            } };
+        },
         else => return error.UnsupportedObject, // typed_array / host: no F2a variant
     };
     return .{ .id = h.id, .obj_type = @intFromEnum(h.type), .body = body };
@@ -346,7 +381,8 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
     //    (with `next_gc`) as the uninterrupted run.
     const all = try heapObjectsById(a, vm.heap);
     const objects = try a.alloc(schema.HeapObject, all.len);
-    for (all, 0..) |h, idx| objects[idx] = try toSchemaHeapObject(a, h);
+    const live: ?system.HostSystem = if (vm.effect_mode == .replay) null else vm.system;
+    for (all, 0..) |h, idx| objects[idx] = try toSchemaHeapObject(a, h, live);
 
     // 2. The registers capture keeps (doc 61 Phase K); every other slot is a
     //    tombstone. Dead slots are where a JIT run can differ from tier-0
@@ -407,6 +443,12 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
             // (a bare VM that never built metatable support — only hand-built test
             // snapshots) — id 0 is a real object, so it cannot be the sentinel.
             .string_metatable_id = if (vm.string_metatable) |s| s.header.id + 1 else 0,
+            // Doc 65: the file metatable and the default input/output, VM-level
+            // roots like the string metatable (1-based optional ids).
+            .file_metatable_id = if (vm.file_metatable) |t| t.header.id + 1 else 0,
+            .io_input_id = if (vm.io_input) |f| f.header.id + 1 else 0,
+            .io_output_id = if (vm.io_output) |f| f.header.id + 1 else 0,
+            .next_file_id = vm.next_file_id,
             // The heap's monotonic allocation counter (H-2, v5): the NEXT id to
             // hand out. Serialized verbatim so restore reproduces the id timeline
             // exactly — a pre-cut allocation that was GC'd before the cut bumped
@@ -467,6 +509,9 @@ pub const RestoreError = error{
     InvalidTombstones, // a tombstone in a slot the restored keep set requires, or a depth-0 stack whose kept registers are not one contiguous result span
     InvalidTableLane, // a table's lane/grid does not describe its values (unknown lane, a value that does not fit, a malformed grid)
     InvalidRehashThreshold, // a table's rehash trigger is below 4 or past usize
+    InvalidFile, // a file handle's kind or mode byte is not one the encoder writes, or it has more than one fingerprint
+    FileRootNotAFile, // io_input_id / io_output_id resolves to a non-file object
+    NextFileIdBelowFiles, // next_file_id is at or below a restored file's id, or below the standard streams' 3
 } || std.mem.Allocator.Error || SchemaDecodeError // + the codec's own decode errors
 || table.Table.Error; // a corrupt snapshot could carry a nil/NaN table key
 
@@ -619,6 +664,14 @@ fn recompileLoadedChunks(vm: *Vm, root: *const Proto, loaded: []const schema.Loa
     }
 }
 
+/// A 1-based optional file root id (`io_input_id`/`io_output_id`).
+fn fileRoot(idmap: *const IdMap, id1: u32) RestoreError!?*File {
+    if (id1 == 0) return null;
+    const h = idmap.get(id1 - 1) orelse return error.UnresolvedHeapRef;
+    if (h.type != .file) return error.FileRootNotAFile;
+    return File.fromHeader(h);
+}
+
 /// Decode `bytes` and restore them into a fresh VM (see `restoreSnapshot`).
 pub fn restore(
     gpa: std.mem.Allocator,
@@ -737,6 +790,24 @@ pub fn restoreSnapshot(
                 vm.heap.linkRestored(&u.header, o.id);
                 break :blk &u.header;
             },
+            .HeapFile => |hf| blk: {
+                const kind = std.enums.fromInt(File.Kind, hf.kind) orelse return error.InvalidFile;
+                const mode = filemod.unpackMode(hf.mode) orelse return error.InvalidFile;
+                if (hf.closed > 1 or hf.fingerprint.len > 1) return error.InvalidFile;
+                if (hf.file_id >= kf.next_file_id) return error.NextFileIdBelowFiles;
+                const f = try File.create(gpa, hf.file_id, kind, mode, hf.path);
+                f.closed = hf.closed == 1;
+                // Q7: an open file restored into a live VM has nothing behind
+                // it on the host until `Vm.reopenFiles` reopens it. The
+                // standard streams are the process's own and stay usable.
+                f.detached = !f.closed and (kind == .file or kind == .tmpfile);
+                if (hf.fingerprint.len == 1) {
+                    const x = hf.fingerprint[0];
+                    f.fingerprint = .{ .size = x.size, .mtime_ns = x.mtime_ns, .position = x.position };
+                }
+                vm.heap.linkRestored(&f.header, o.id);
+                break :blk &f.header;
+            },
             .HeapNative => |hn| blk: {
                 const entry = natives.lookup(hn.name) orelse return error.UnknownNative;
                 // Use the registry's static name (outlives the decode arena).
@@ -790,7 +861,7 @@ pub fn restoreSnapshot(
     for (kf.objects) |o| {
         const h = idmap.get(o.id).?;
         switch (o.body) {
-            .HeapString, .HeapNative => {},
+            .HeapString, .HeapNative, .HeapFile => {},
             .HeapTable => |ht| {
                 const t = table.Table.fromHeader(h);
                 // Array part: append in order — v7 is positional 0-based (doc 18
@@ -977,6 +1048,18 @@ pub fn restoreSnapshot(
         vm.string_metatable = table.Table.fromHeader(sh);
         try vm.internMetamethodNames();
     }
+
+    // Doc 65: the file metatable, the default input/output, and the handle
+    // counter (above every restored handle and the standard streams).
+    if (kf.next_file_id < 3) return error.NextFileIdBelowFiles;
+    vm.next_file_id = kf.next_file_id;
+    if (kf.file_metatable_id != 0) {
+        const mh = idmap.get(kf.file_metatable_id - 1) orelse return error.UnresolvedHeapRef;
+        if (mh.type != .table) return error.MetatableNotATable;
+        vm.file_metatable = table.Table.fromHeader(mh);
+    }
+    vm.io_input = try fileRoot(&idmap, kf.io_input_id);
+    vm.io_output = try fileRoot(&idmap, kf.io_output_id);
 
     return vm;
 }

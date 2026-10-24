@@ -116,10 +116,13 @@ typedef uint64_t mh_ref;
 /* VM creation options. Zero-initialize (or pass NULL) for defaults.
  * jit: 0 = default (on), 1 = on, 2 = off.
  * system: MH_SYSTEM_* groups; 0 = none, so a VM is deterministic and sees
- * nothing of the host unless asked (doc 65 D4, Q4). */
+ * nothing of the host unless asked (doc 65 D4, Q4).
+ * lua_io_errors: 0 = a failed io/os call raises an error (the default);
+ * nonzero = it returns Lua's nil, message, code instead (doc 65 §4.4). */
 typedef struct mh_config {
     int jit;
     unsigned system;
+    int lua_io_errors;
 } mh_config;
 
 typedef struct mh_mem_stats {

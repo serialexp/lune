@@ -5,7 +5,7 @@ const binschema = @import("binschema");
 pub const BsUnion_ConstNil_ConstBool_ConstInt_ConstFloat_ConstString = union(enum) { ConstNil: ConstNil, ConstBool: ConstBool, ConstInt: ConstInt, ConstFloat: ConstFloat, ConstString: ConstString };
 pub const BsUnion_ConstNil_ConstBool_ConstInt_ConstFloat_HeapRef = union(enum) { ConstNil: ConstNil, ConstBool: ConstBool, ConstInt: ConstInt, ConstFloat: ConstFloat, HeapRef: HeapRef };
 pub const BsUnion_ConstNil_ConstBool_ConstInt_ConstFloat_HeapRef_DeadSlot = union(enum) { ConstNil: ConstNil, ConstBool: ConstBool, ConstInt: ConstInt, ConstFloat: ConstFloat, HeapRef: HeapRef, DeadSlot: DeadSlot };
-pub const BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue = union(enum) { HeapString: HeapString, HeapTable: HeapTable, HeapClosure: HeapClosure, HeapNative: HeapNative, HeapUpvalue: HeapUpvalue };
+pub const BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue_HeapFile = union(enum) { HeapString: HeapString, HeapTable: HeapTable, HeapClosure: HeapClosure, HeapNative: HeapNative, HeapUpvalue: HeapUpvalue, HeapFile: HeapFile };
 pub const BsUnion_ConstNil_ConstBool_ConstInt_ConstFloat_ConstString_EffectBytes_HostFail = union(enum) { ConstNil: ConstNil, ConstBool: ConstBool, ConstInt: ConstInt, ConstFloat: ConstFloat, ConstString: ConstString, EffectBytes: EffectBytes, HostFail: HostFail };
 
 pub const ConstInt = struct {
@@ -899,10 +899,101 @@ pub const HeapNative = struct {
     }
 };
 
+pub const FileFingerprint = struct {
+    size: u64,
+    mtime_ns: i64,
+    position: u64,
+
+    pub fn encode(self: FileFingerprint, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: FileFingerprint, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        _ = ctx;
+        try enc.writeUint64(self.size, .little_endian);
+        try enc.writeInt64(self.mtime_ns, .little_endian);
+        try enc.writeUint64(self.position, .little_endian);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!FileFingerprint {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!FileFingerprint {
+        _ = allocator;
+        _ = root;
+        var result: FileFingerprint = undefined;
+        result.size = try dec.readUint64(.little_endian);
+        result.mtime_ns = try dec.readInt64(.little_endian);
+        result.position = try dec.readUint64(.little_endian);
+        return result;
+    }
+};
+
+pub const HeapFile = struct {
+    file_id: u32,
+    kind: u8,
+    mode: u8,
+    closed: u8,
+    path: []const u8,
+    fingerprint: []const FileFingerprint,
+
+    pub fn encode(self: HeapFile, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: HeapFile, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint32(self.file_id, .little_endian);
+        try enc.writeUint8(self.kind);
+        try enc.writeUint8(self.mode);
+        try enc.writeUint8(self.closed);
+        try enc.writeUint32(@intCast(self.path.len), .little_endian);
+        try enc.writeBytes(self.path);
+        try enc.writeUint8(@intCast(self.fingerprint.len));
+        for (self.fingerprint) |_item_0| {
+            try _item_0.encodeInto(enc, ctx);
+        }
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!HeapFile {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!HeapFile {
+        var result: HeapFile = undefined;
+        result.file_id = try dec.readUint32(.little_endian);
+        result.kind = try dec.readUint8();
+        result.mode = try dec.readUint8();
+        result.closed = try dec.readUint8();
+        const _len_1 = try dec.readUint32(.little_endian);
+        result.path = try dec.readBytesSlice(_len_1);
+        const _len_5 = try dec.readUint8();
+        const _buf_6 = try allocator.alloc(FileFingerprint, @as(usize, _len_5));
+        errdefer allocator.free(_buf_6);
+        for (0.._buf_6.len) |_i_3| {
+            _buf_6[_i_3] = try FileFingerprint.decodeWith(allocator, dec, root);
+        }
+        result.fingerprint = _buf_6;
+        return result;
+    }
+};
+
 pub const HeapObject = struct {
     id: u32,
     obj_type: u8,
-    body: BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue,
+    body: BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue_HeapFile,
 
     pub fn encode(self: HeapObject, allocator: std.mem.Allocator) binschema.Error![]u8 {
         var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
@@ -922,6 +1013,7 @@ pub const HeapObject = struct {
             .HeapClosure => |_uv_2| try _uv_2.encodeInto(enc, ctx),
             .HeapNative => |_uv_3| try _uv_3.encodeInto(enc, ctx),
             .HeapUpvalue => |_uv_4| try _uv_4.encodeInto(enc, ctx),
+            .HeapFile => |_uv_5| try _uv_5.encodeInto(enc, ctx),
         }
     }
 
@@ -948,6 +1040,9 @@ pub const HeapObject = struct {
         }
         else if (result.obj_type == 4) {
             result.body = .{ .HeapUpvalue = try HeapUpvalue.decodeWith(allocator, dec, root) };
+        }
+        else if (result.obj_type == 7) {
+            result.body = .{ .HeapFile = try HeapFile.decodeWith(allocator, dec, root) };
         }
         else {
             return error.InvalidVariant;
@@ -1083,6 +1178,10 @@ pub const LoadedChunk = struct {
 pub const Keyframe = struct {
     globals_id: u32,
     string_metatable_id: u32,
+    file_metatable_id: u32,
+    io_input_id: u32,
+    io_output_id: u32,
+    next_file_id: u32,
     next_obj_id: u32,
     next_gc: u64,
     objects: []const HeapObject,
@@ -1103,6 +1202,10 @@ pub const Keyframe = struct {
     pub fn encodeInto(self: Keyframe, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
         try enc.writeUint32(self.globals_id, .little_endian);
         try enc.writeUint32(self.string_metatable_id, .little_endian);
+        try enc.writeUint32(self.file_metatable_id, .little_endian);
+        try enc.writeUint32(self.io_input_id, .little_endian);
+        try enc.writeUint32(self.io_output_id, .little_endian);
+        try enc.writeUint32(self.next_file_id, .little_endian);
         try enc.writeUint32(self.next_obj_id, .little_endian);
         try enc.writeUint64(self.next_gc, .little_endian);
         try enc.writeUint32(@intCast(self.objects.len), .little_endian);
@@ -1136,6 +1239,10 @@ pub const Keyframe = struct {
         var result: Keyframe = undefined;
         result.globals_id = try dec.readUint32(.little_endian);
         result.string_metatable_id = try dec.readUint32(.little_endian);
+        result.file_metatable_id = try dec.readUint32(.little_endian);
+        result.io_input_id = try dec.readUint32(.little_endian);
+        result.io_output_id = try dec.readUint32(.little_endian);
+        result.next_file_id = try dec.readUint32(.little_endian);
         result.next_obj_id = try dec.readUint32(.little_endian);
         result.next_gc = try dec.readUint64(.little_endian);
         const _len_8 = try dec.readUint32(.little_endian);

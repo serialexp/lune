@@ -238,7 +238,7 @@ pub const Value = extern struct {
                 .table, .typed_array => .table,
                 .function, .native => .function,
                 .upvalue => .upvalue,
-                .host => .userdata,
+                .host, .file => .userdata,
                 _ => .value,
             },
             // A grid row is observationally a table.

@@ -90,14 +90,58 @@ pub const String = extern struct {
     /// `std.unicode.utf8CountCodepoints` for valid UTF-8, merely defined for
     /// stray non-UTF-8 bytes) AND the exact all-ASCII bit.
     const Counted = struct { cp_len: usize, ascii: bool };
+    /// Every string's construction scan, so it runs at memory speed: a
+    /// code point is a byte that is not a continuation byte (`10xxxxxx`), and
+    /// the string is ASCII if no byte has its high bit set. Vector lanes count
+    /// in `u8`s, summed before they can wrap (255 chunks).
     fn countCodepoints(content: []const u8) Counted {
         var n: usize = 0;
-        var ascii = true;
-        for (content) |b| {
-            if (b & 0xC0 != 0x80) n += 1;
-            if (b >= 0x80) ascii = false;
+        var high: u8 = 0;
+        var rest = content;
+        if (comptime std.simd.suggestVectorLength(u8)) |L| {
+            const V = @Vector(L, u8);
+            const zero: V = @splat(0);
+            var high_v = zero;
+            while (rest.len >= L) {
+                const chunks: usize = @min(rest.len / L, 255);
+                var leads = zero;
+                for (0..chunks) |c| {
+                    const v: V = rest[c * L ..][0..L].*;
+                    leads += @select(u8, v & @as(V, @splat(0xC0)) != @as(V, @splat(0x80)), @as(V, @splat(1)), zero);
+                    high_v |= v;
+                }
+                n += @reduce(.Add, @as(@Vector(L, u16), leads));
+                rest = rest[chunks * L ..];
+            }
+            high = @reduce(.Or, high_v);
         }
-        return .{ .cp_len = n, .ascii = ascii };
+        for (rest) |b| {
+            if (b & 0xC0 != 0x80) n += 1;
+            high |= b;
+        }
+        return .{ .cp_len = n, .ascii = high < 0x80 };
+    }
+
+    test "countCodepoints matches the byte-at-a-time definition at every length" {
+        var buf: [9000]u8 = undefined;
+        var xs: [9000]u8 = undefined;
+        @memset(&xs, 'x');
+        // A mix of ASCII, 2-, 3- and 4-byte sequences; the counter only
+        // classifies bytes, so the cut points need not be on characters.
+        const pattern = "aé€𝄞z";
+        for (&buf, 0..) |*b, i| b.* = pattern[i % pattern.len];
+        var len: usize = 0;
+        while (len <= buf.len) : (len += if (len < 300) 1 else 97) {
+            const s = buf[0..len];
+            var n: usize = 0;
+            var ascii = true;
+            for (s) |b| {
+                if (b & 0xC0 != 0x80) n += 1;
+                if (b >= 0x80) ascii = false;
+            }
+            try std.testing.expectEqual(Counted{ .cp_len = n, .ascii = ascii }, countCodepoints(s));
+            try std.testing.expectEqual(Counted{ .cp_len = len, .ascii = true }, countCodepoints(xs[0..len]));
+        }
     }
 
     /// Allocate a `String` owning a copy of `content`. This is the raw allocation

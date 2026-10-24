@@ -603,6 +603,10 @@ fn expectTwoFrameWindowError(second_base: u32, stack: []const schema.StackValue)
         .keyframe = .{
             .globals_id = 9,
             .string_metatable_id = 0,
+            .file_metatable_id = 0,
+            .io_input_id = 0,
+            .io_output_id = 0,
+            .next_file_id = 3,
             .next_obj_id = 10,
             .next_gc = 1024,
             .objects = &.{
@@ -684,6 +688,10 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
         .keyframe = .{
             .globals_id = 9,
             .string_metatable_id = 0,
+            .file_metatable_id = 0,
+            .io_input_id = 0,
+            .io_output_id = 0,
+            .next_file_id = 3,
             .next_obj_id = 10,
             .next_gc = 1024,
             .objects = &.{

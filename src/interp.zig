@@ -49,6 +49,8 @@ const stderrors = @import("stdlib/errors.zig");
 const stddebug = @import("stdlib/debug.zig");
 const stdload = @import("stdlib/load.zig");
 const stdpackage = @import("stdlib/package.zig");
+const stdio = @import("stdlib/io.zig");
+const File = @import("file.zig").File;
 const unicode_case = @import("gen/unicode_case.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
@@ -227,7 +229,7 @@ pub const mahina_version = "mahina 0.0.0";
 
 pub const base_natives = core_natives ++ stdmath.natives ++ stdtable.natives ++
     stdbase.natives ++ stdbasic.natives ++ stdstring.natives ++ stderrors.natives ++
-    stddebug.natives ++ stdload.natives ++ stdpackage.natives;
+    stddebug.natives ++ stdload.natives ++ stdpackage.natives ++ stdio.natives;
 
 comptime {
     // `pure ⇒ !effect` (doc 17, H-4 / 9-A(i)). `pure` and `effect` are independent
@@ -277,8 +279,8 @@ const core_natives = [_]BaseNative{
     // serialized keyframe identity; `.module`/`.field` only drive table install,
     // exactly as `math.random` did. This drops the flat `clock` global and makes
     // `os` a known builtin via `builtin_global_names` (`bn.module orelse bn.name`).
-    .{ .name = "clock", .func = &nativeClock, .effect = .clock, .module = "os", .field = "clock", .group = .clock },
-    .{ .name = "nsclock", .func = &nativeNsClock, .effect = .clock, .module = "os", .field = "nsclock", .group = .clock },
+    .{ .name = "clock", .func = &nativeClock, .effect = .clock, .module = "os", .field = "clock", .groups = .{ .clock = true } },
+    .{ .name = "nsclock", .func = &nativeNsClock, .effect = .clock, .module = "os", .field = "nsclock", .groups = .{ .clock = true } },
     // `random`/`randomseed` carry no `effect`: the call itself isn't the boundary —
     // the *seed* is (acquired once, inside the native, as `.random_seed`). So the
     // dispatch calls them directly; the seed goes through record/replay internally.
@@ -291,12 +293,10 @@ const core_natives = [_]BaseNative{
     // `os.getenv` — `clock`-style (the call site is the boundary); the result is
     // a heap string or nil, so the effect log carries inline bytes. The program's
     // arguments are the load-time `arg` table (doc 65 Q3: no `argc`/`argv`).
-    .{ .name = "getenv", .func = &nativeGetenv, .effect = .getenv, .module = "os", .field = "getenv", .group = .env },
-    // `io.write` is a host-output call (no effect), installed into the `io` module
-    // table. (`tonumber` and `string.format` moved to `stdlib/basic.zig` and
-    // `stdlib/string.zig` respectively, keeping their serialized names.)
-    .{ .name = "io.write", .func = &nativeIoWrite, .module = "io", .field = "write" },
-    .{ .name = "io.flush", .func = &nativeIoFlush, .module = "io", .field = "flush" },
+    .{ .name = "getenv", .func = &nativeGetenv, .effect = .getenv, .module = "os", .field = "getenv", .groups = .{ .env = true } },
+    // (`io.write`/`io.flush` moved to `stdlib/io.zig` with the rest of `io`,
+    // keeping their serialized names; `tonumber` and `string.format` to
+    // `stdlib/basic.zig` and `stdlib/string.zig`.)
 };
 
 /// Built-in module constants (non-heap `Value` fields like `math.pi`). Like
@@ -940,6 +940,21 @@ pub const Vm = struct {
     /// restorer rebinds it. Referenced from the VM (not `globals`), so it is
     /// GC-rooted explicitly via `forEachRootHeader`.
     string_metatable: ?*table.Table = null,
+    /// The shared metatable of every file handle (doc 65 §4.1): `__index` is
+    /// the hidden `@file` methods table, `__name` is `"FILE*"`. Built by
+    /// `initIoStreams`; a VM-level root like `string_metatable`.
+    file_metatable: ?*table.Table = null,
+    /// `io.input()` / `io.output()`: the handles `io.read`/`io.lines` and
+    /// `io.write` act on. Output starts as stdout; input as stdin when the
+    /// `stdio` group is on, else none. VM-level roots.
+    io_input: ?*File = null,
+    io_output: ?*File = null,
+    /// The next file handle id (doc 65 §4.1): a deterministic counter, so a
+    /// replay assigns the ids the recording did. 0–2 are the standard streams.
+    next_file_id: system.FileId = 3,
+    /// Scratch for assembling a read that spans host buffers (`stdlib/io.zig`),
+    /// reused across reads so a line loop does not allocate per line.
+    io_scratch: std.ArrayList(u8) = .empty,
     /// Chunks compiled at runtime by `load`/`loadfile`/`dofile`. A `load` closure
     /// can outlive the call that created it, so the VM owns each compiled `Chunk`
     /// (its arena holds the proto tree) plus a NUL-terminated copy of the source
@@ -1118,7 +1133,32 @@ pub const Vm = struct {
         vm.trace.rec_globals_header = &vm.globals.header;
         try vm.installBaseLib();
         try vm.initMetatableSupport();
+        try vm.initIoStreams();
         return vm;
+    }
+
+    /// The file metatable and the output streams every VM has (doc 65 §4.1):
+    /// `io.stdout`, `io.stderr`, and stdout as the default output. Their
+    /// writes go to the VM's output seam (`out`/`err`), never the host, so
+    /// they need no system group. stdin arrives with the `stdio` group
+    /// (`enableSystem`).
+    fn initIoStreams(self: *Vm) Error!void {
+        const methods = try self.getOrCreateModuleTable(stdio.methods_module);
+        const fmt = try self.heap.newTable();
+        try fmt.set(self.gpa, self.mm.index, Value.heap(&methods.header));
+        try fmt.set(self.gpa, try self.heap.internValue("__name"), try self.heap.internValue("FILE*"));
+        self.file_metatable = fmt;
+        const out = try self.newStdStream(system.stdout_id, .stdout, .write, "stdout");
+        _ = try self.newStdStream(system.stderr_id, .stderr, .write, "stderr");
+        self.io_output = out;
+    }
+
+    /// A standard stream's handle, set as `io.<field>`.
+    fn newStdStream(self: *Vm, id: system.FileId, kind: File.Kind, mode: @FieldType(system.OpenMode, "kind"), field: []const u8) Error!*File {
+        const f = try self.heap.newFile(id, kind, .{ .kind = mode }, "");
+        const io_mod = try self.getOrCreateModuleTable("io");
+        try io_mod.set(self.gpa, try self.heap.internValue(field), Value.heap(&f.header));
+        return f;
     }
 
     /// Build the metamethod-name string cache and the shared string metatable.
@@ -1289,6 +1329,7 @@ pub const Vm = struct {
         self.trace.deinit();
         self.open_upvalues.deinit(self.gpa);
         self.effect_log.deinit(self.gpa);
+        self.io_scratch.deinit(self.gpa);
         self.safepoint_lines.deinit(self.gpa);
         for (self.loaded_chunks.items) |*lc| {
             lc.chunk.deinit();
@@ -1778,7 +1819,7 @@ pub const Vm = struct {
     fn installBaseLib(self: *Vm) Error!void {
         // A system group's natives wait for `enableSystem` (doc 65 Q5).
         for (base_natives, &base_templates) |bn, *template| {
-            if (bn.group == null) try self.defineNative(bn, template);
+            if (bn.groups == system.Groups.none) try self.defineNative(bn, template);
         }
         for (base_constants) |c| try self.defineConstant(c);
         // `arg` is a real (initially empty) table so the lint, tests, the wasm
@@ -1812,11 +1853,46 @@ pub const Vm = struct {
     /// enables the recording's groups with no host behind them.
     pub fn enableSystem(self: *Vm, groups: system.Groups) Error!void {
         for (base_natives, &base_templates) |bn, *template| {
-            const g = bn.group orelse continue;
-            if (groups.has(g) and !self.system_groups.has(g)) try self.defineNative(bn, template);
+            if (bn.groups == system.Groups.none) continue;
+            // Installed by this call when one of its groups is new and none
+            // was on before.
+            if (bn.groups.overlaps(groups) and !bn.groups.overlaps(self.system_groups)) try self.defineNative(bn, template);
         }
-        const before: u8 = @bitCast(self.system_groups);
-        self.system_groups = @bitCast(before | @as(u8, @bitCast(groups)));
+        // `io.stdin`, and stdin as the default input (doc 65 §5.2).
+        if (groups.stdio and !self.system_groups.stdio) {
+            self.io_input = try self.newStdStream(system.stdin_id, .stdin, .read, "stdin");
+        }
+        self.system_groups = self.system_groups.unite(groups);
+    }
+
+    /// Reopen the files a keyframe restore left detached (doc 65 §4.1, Q7),
+    /// for a VM that resumes live straight after the session it was captured
+    /// from — a restart after a crash. Each file is reopened by path only if
+    /// the host still sees it as the keyframe recorded it (size and
+    /// modification time), and at the recorded position. A file that cannot
+    /// be — changed since, gone, a temporary file, captured in a replay and so
+    /// with no fingerprint — stays detached, and every operation on it raises.
+    /// Opt-in: without this call, every restored handle refuses. Returns how
+    /// many stayed detached. Call after setting `system`; a replay needs none
+    /// of it (it never asks the host).
+    pub fn reopenFiles(self: *Vm) usize {
+        var detached: usize = 0;
+        var it = self.heap.objects;
+        while (it) |h| : (it = h.next) {
+            if (h.type != .file) continue;
+            const f = File.fromHeader(h);
+            if (!f.detached) continue;
+            if (self.reopenFile(f)) f.detached = false else detached += 1;
+        }
+        return detached;
+    }
+
+    fn reopenFile(self: *Vm, f: *File) bool {
+        if (f.kind != .file) return false;
+        const fp = f.fingerprint orelse return false;
+        const sys = self.system orelse return false;
+        const reopen = sys.vtable.reopen orelse return false;
+        return reopen(sys.ctx, f.id, f.path, f.mode, fp) == null;
     }
 
     fn defineNative(self: *Vm, bn: BaseNative, template: *const function.Native) Error!void {
@@ -3215,6 +3291,10 @@ pub const Vm = struct {
         for (self.type_names) |v| if (v.isHeap()) cb(ctx, v.asHeap());
         for (self.subtype_names) |v| if (v.isHeap()) cb(ctx, v.asHeap());
         if (self.string_metatable) |smt| cb(ctx, &smt.header);
+        // 9. the file metatable and the default input/output handles (doc 65).
+        if (self.file_metatable) |fmt| cb(ctx, &fmt.header);
+        if (self.io_input) |f| cb(ctx, &f.header);
+        if (self.io_output) |f| cb(ctx, &f.header);
     }
 
     /// The tier-0 dispatch loop over the **explicit** call stack. Runs the top
@@ -9374,6 +9454,7 @@ pub const Vm = struct {
         return switch (v.heapType()) {
             .table => table.Table.fromHeader(v.asHeap()).metatable,
             .string => self.string_metatable,
+            .file => self.file_metatable,
             else => null,
         };
     }
@@ -10717,37 +10798,6 @@ pub fn strBytes(v: Value) ?[]const u8 {
     return null;
 }
 
-/// `io.write(...)`: write each argument's bytes to the VM's output with no
-/// separators and no trailing newline (contrast `print`). Strings write their
-/// bytes; numbers format like concat (`coerceConcat`). Non-string/number → error.
-fn nativeIoWrite(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    const vm: *Vm = @ptrCast(@alignCast(ctx));
-    const to_stdout = vm.out == null;
-    const w = vm.out orelse io.stdout();
-    var buf: [64]u8 = undefined;
-    var newline = false;
-    for (args) |a| {
-        const bytes = try coerceConcat(a, &buf);
-        try w.writeAll(bytes);
-        if (to_stdout and !newline) newline = std.mem.indexOfScalar(u8, bytes, '\n') != null;
-    }
-    if (to_stdout) io.stdoutWrote(newline);
-    return Value.nil();
-}
-
-/// `io.flush()`: push buffered output out now. stdout is fully buffered when
-/// it is not a terminal (doc 65 §6), so a script that wants a progress line
-/// seen before a long computation flushes it. Flushes the VM's output seam
-/// (`Vm.out`) when one is set, else the process stdout. Returns `true`, as
-/// Lua's does; a failed flush raises (doc 65 §4.4).
-fn nativeIoFlush(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    _ = args;
-    const vm: *Vm = @ptrCast(@alignCast(ctx));
-    const w = vm.out orelse io.stdout();
-    try w.flush();
-    return Value.boolean(true);
-}
-
 /// Coerce a concat operand to bytes: a string's own bytes, or a number formatted
 /// into `buf` (at least `io.float_text_max` bytes) as `tostring` renders it.
 /// Returns a slice valid until `buf` is reused.
@@ -10807,6 +10857,7 @@ test {
     _ = @import("interp_semantics_test.zig");
     _ = @import("interp_determinism_test.zig");
     _ = @import("interp_effects_test.zig");
+    _ = @import("interp_io_test.zig");
     _ = @import("interp_modules_test.zig");
     _ = @import("interp_replay_test.zig");
     _ = @import("interp_dispatch_test.zig");

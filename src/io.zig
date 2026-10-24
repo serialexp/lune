@@ -15,6 +15,7 @@
 const std = @import("std");
 const value = @import("value.zig");
 const string = @import("string.zig");
+const File = @import("file.zig").File;
 const Value = value.Value;
 
 /// Generic byte-sink writer type. Re-exported so callers never name `std.Io`
@@ -150,6 +151,17 @@ pub fn stdoutWrote(newline: bool) void {
     }
 }
 
+/// `io.stdout:setvbuf(mode)` (doc 65 §6): override the buffering policy for
+/// the process stdout. The size argument Lua takes is accepted and ignored —
+/// the buffer stays `buffer_len`. Flushes first, so switching to `none` or
+/// `line` never strands output written under `full`.
+pub fn setStdoutBuffering(mode: Buffering) void {
+    if (is_freestanding) return;
+    ensureInit();
+    flush();
+    stdout_buffering = mode;
+}
+
 /// printf-style line to stdout, flushed immediately. Swallows I/O errors —
 /// failing to print a banner is not the VM's problem. For explicit error
 /// handling, use `stdout()` directly.
@@ -276,6 +288,12 @@ pub fn writeValue(w: *Writer, v: Value) Writer.Error!void {
         .heap_ref => switch (v.heapType()) {
             // Strings print as their raw bytes (Lua `print`/`tostring` style).
             .string => try w.writeAll(string.String.fromHeader(v.asHeap()).bytes()),
+            // A file handle, Lua-style ("file (0x…)" / "file (closed)"), with
+            // the same stable id as any other object.
+            .file => if (File.fromHeader(v.asHeap()).closed)
+                try w.writeAll("file (closed)")
+            else
+                try w.print("file (0x{x})", .{v.asHeap().id}),
             // Other objects: kind + identity (e.g. "table: 0x3"). The identity is
             // the object's stable, heap-assigned `id` — NOT its address — so the
             // output is deterministic and reproducible run-to-run, never leaking

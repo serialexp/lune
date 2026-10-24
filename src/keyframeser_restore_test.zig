@@ -1092,6 +1092,10 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
         .keyframe = .{
             .globals_id = 2,
             .string_metatable_id = 0,
+            .file_metatable_id = 0,
+            .io_input_id = 0,
+            .io_output_id = 0,
+            .next_file_id = 3,
             .next_obj_id = 8,
             .next_gc = 1024,
             .objects = &.{
@@ -1185,6 +1189,10 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
+        .file_metatable_id = 0,
+        .io_input_id = 0,
+        .io_output_id = 0,
+        .next_file_id = 3,
         .next_obj_id = 1,
         .next_gc = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
@@ -1206,6 +1214,10 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
+        .file_metatable_id = 0,
+        .io_input_id = 0,
+        .io_output_id = 0,
+        .next_file_id = 3,
         .next_obj_id = 1,
         .next_gc = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
@@ -1229,6 +1241,10 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
         const vm = try restoreSnapshot(gpa, .{ .version = snapshot_format_version, .keyframe = .{
             .globals_id = 0,
             .string_metatable_id = 0,
+            .file_metatable_id = 0,
+            .io_input_id = 0,
+            .io_output_id = 0,
+            .next_file_id = 3,
             .next_obj_id = 1,
             .next_gc = 1024,
             .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
@@ -1262,6 +1278,10 @@ fn oneTableFile(obj: *[1]schema.HeapObject, ht: schema.HeapTable) schema.Snapsho
     return .{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
+        .file_metatable_id = 0,
+        .io_input_id = 0,
+        .io_output_id = 0,
+        .next_file_id = 3,
         .next_obj_id = 1,
         .next_gc = 1024,
         .objects = obj,
@@ -1286,6 +1306,10 @@ fn tableInGlobalsFile(obj: *[2]schema.HeapObject, ht: schema.HeapTable) schema.S
     return .{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
+        .file_metatable_id = 0,
+        .io_input_id = 0,
+        .io_output_id = 0,
+        .next_file_id = 3,
         .next_obj_id = 2,
         .next_gc = 1024,
         .objects = obj,
@@ -1429,6 +1453,10 @@ test "restore surfaces specific errors for malformed snapshots" {
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
+        .file_metatable_id = 0,
+        .io_input_id = 0,
+        .io_output_id = 0,
+        .next_file_id = 3,
         .next_obj_id = 1,
         .next_gc = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
@@ -1450,6 +1478,10 @@ test "restore surfaces specific errors for malformed snapshots" {
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
+        .file_metatable_id = 0,
+        .io_input_id = 0,
+        .io_output_id = 0,
+        .next_file_id = 3,
         .next_obj_id = 1,
         .next_gc = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = 99, .upvalue_ids = &.{} } } }},
@@ -1463,6 +1495,10 @@ test "restore surfaces specific errors for malformed snapshots" {
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
+        .file_metatable_id = 0,
+        .io_input_id = 0,
+        .io_output_id = 0,
+        .next_file_id = 3,
         .next_obj_id = 1,
         .next_gc = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 3, .body = .{ .HeapNative = .{ .name = "nope" } } }},
@@ -1476,6 +1512,10 @@ test "restore surfaces specific errors for malformed snapshots" {
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
+        .file_metatable_id = 0,
+        .io_input_id = 0,
+        .io_output_id = 0,
+        .next_file_id = 3,
         .next_obj_id = 1,
         .next_gc = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "x" } } }},
@@ -1489,6 +1529,10 @@ test "restore surfaces specific errors for malformed snapshots" {
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 5,
         .string_metatable_id = 0,
+        .file_metatable_id = 0,
+        .io_input_id = 0,
+        .io_output_id = 0,
+        .next_file_id = 3,
         .next_obj_id = 6,
         .next_gc = 1024,
         .objects = &.{
@@ -1505,6 +1549,10 @@ test "restore surfaces specific errors for malformed snapshots" {
     try expectRestoreError(.{ .version = snapshot_format_version + 1, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
+        .file_metatable_id = 0,
+        .io_input_id = 0,
+        .io_output_id = 0,
+        .next_file_id = 3,
         .next_obj_id = 1,
         .next_gc = 1024,
         .objects = &.{},
@@ -1520,6 +1568,10 @@ test "restore surfaces specific errors for malformed snapshots" {
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
+        .file_metatable_id = 0,
+        .io_input_id = 0,
+        .io_output_id = 0,
+        .next_file_id = 3,
         .next_obj_id = 2,
         .next_gc = 1024,
         .objects = &.{
@@ -1539,6 +1591,10 @@ test "restore surfaces specific errors for malformed snapshots" {
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = std.math.maxInt(u32),
         .string_metatable_id = 0,
+        .file_metatable_id = 0,
+        .io_input_id = 0,
+        .io_output_id = 0,
+        .next_file_id = 3,
         .next_obj_id = std.math.maxInt(u32),
         .next_gc = 1024,
         .objects = &.{.{ .id = std.math.maxInt(u32), .obj_type = 1, .body = .{ .HeapTable = .{
@@ -1563,6 +1619,10 @@ test "restore surfaces specific errors for malformed snapshots" {
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 5,
         .string_metatable_id = 0,
+        .file_metatable_id = 0,
+        .io_input_id = 0,
+        .io_output_id = 0,
+        .next_file_id = 3,
         .next_obj_id = 3,
         .next_gc = 1024,
         .objects = &.{.{ .id = 5, .obj_type = 1, .body = .{ .HeapTable = .{

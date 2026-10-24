@@ -594,10 +594,11 @@ pub const BaseNative = struct {
     /// default `package.searchers` array. Without this seam such a native would be
     /// unrestorable (`UnknownNative`) since the restorer resolves only by registry name.
     manual: bool = false,
-    /// The host-system group this native belongs to (doc 65 §5.2), or null for
+    /// The host-system groups this native belongs to (doc 65 §5.2); empty for
     /// one every VM has. A grouped native is installed by `Vm.enableSystem`,
-    /// not `installBaseLib`.
-    group: ?system.Group = null,
+    /// not `installBaseLib`, once any one of its groups is on — `io.read`
+    /// serves stdin (`stdio`) and files (`files`) alike.
+    groups: system.Groups = .none,
 };
 
 /// A built-in **constant** installed as a field of a module table — e.g.

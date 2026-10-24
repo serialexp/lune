@@ -388,6 +388,23 @@ pub const Table = struct {
         return m;
     }
 
+    /// A fresh table as a byte array (`ArrayPart.initBytes`): `t[1 .. #bytes]`
+    /// are the bytes, in the `u8` lane.
+    pub fn initBytes(self: *Table, gpa: std.mem.Allocator, bytes: []const u8) Error!void {
+        std.debug.assert(self.metatable == null and self.hash.count() == 0);
+        try self.array.initBytes(gpa, bytes);
+    }
+
+    /// The bytes of a byte array `t[1 .. #t]`, borrowed, when the sequence is a
+    /// gap-free `u8` run that is exactly `#t` long; null otherwise, and the
+    /// caller reads it element by element.
+    pub fn byteRun(self: *Table) ?[]const u8 {
+        if (self.array.isGrid()) return null;
+        const run = self.array.byteRun() orelse return null;
+        if (self.length() != @as(i64, @intCast(run.len))) return null;
+        return run;
+    }
+
     /// `t[key] = val`. A `nil`/`NaN` key errors; storing `nil` deletes.
     pub fn set(self: *Table, gpa: std.mem.Allocator, key: Value, val: Value) Error!void {
         // A grid table never takes a raw store: outer row (re)assignment and row

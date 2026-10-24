@@ -71,6 +71,9 @@ function heapRefDisplay(id: number, obj: HeapObjectOutput | undefined): string {
       return `native#${id}`;
     case "HeapUpvalue":
       return `upvalue#${id}`;
+    case "HeapFile":
+      // As `tostring` renders a handle (src/io.zig).
+      return obj.body.value.closed !== 0 ? "file (closed)" : `file (0x${id.toString(16)})`;
     default:
       return `#${id}`;
   }

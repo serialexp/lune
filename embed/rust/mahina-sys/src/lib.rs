@@ -81,6 +81,9 @@ pub struct mh_config {
     pub jit: c_int,
     /// `MH_SYSTEM_*` groups; 0 = none (doc 65 §5.2).
     pub system: c_uint,
+    /// Nonzero: failed `io`/`os` calls return `nil, msg, code` instead of
+    /// raising (doc 65 §4.4).
+    pub lua_io_errors: c_int,
 }
 
 pub const MH_SYSTEM_FILES: c_uint = 1 << 0;

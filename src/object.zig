@@ -25,6 +25,8 @@ pub const ObjectType = enum(u8) {
     typed_array,
     /// Opaque host-owned object exposed through the embedding API.
     host,
+    /// A Lua file handle (`file.zig`, doc 65 §4.1).
+    file,
     _,
 };
 

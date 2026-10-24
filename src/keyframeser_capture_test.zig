@@ -63,6 +63,10 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
         .keyframe = .{
             .globals_id = 2,
             .string_metatable_id = 0,
+            .file_metatable_id = 0,
+            .io_input_id = 0,
+            .io_output_id = 0,
+            .next_file_id = 3,
             .next_obj_id = 8,
             .next_gc = 1024,
             .objects = &.{
@@ -209,7 +213,7 @@ test "VM-driven snapshot captures a complete, non-dangling heap graph" {
             // to a present object — no dangling reference.
             var refs: std.ArrayList(u32) = .empty;
             for (kf.objects) |o| switch (o.body) {
-                .HeapString, .HeapNative => {},
+                .HeapString, .HeapNative, .HeapFile => {},
                 .HeapTable => |t| {
                     for (t.array) |v| if (refId(v)) |id| try refs.append(a, id);
                     for (t.entries) |e| {
@@ -239,6 +243,7 @@ test "VM-driven snapshot captures a complete, non-dangling heap graph" {
                 .HeapUpvalue => n_upvalue += 1,
                 .HeapNative => n_native += 1,
                 .HeapString => n_string += 1,
+                .HeapFile => {}, // io.stdout / io.stderr
             };
             try testing.expect(n_table >= 2); // globals + g
             try testing.expect(n_closure >= 1); // g.add

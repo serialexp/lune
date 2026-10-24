@@ -1,3 +1,26 @@
+DOC 65 PHASE 3: FILE HANDLES + THE `io` LIBRARY (2026-10-24, coral-marten).
+- `src/file.zig` (the `file` heap object: VM id, kind, mode, closed,
+  detached, path, fingerprint) and `src/stdlib/io.zig` (the whole `io`
+  library and the `@file` methods). Each host op records/replays one
+  effect (file_open/read_op/write/seek/control); stdout/stderr go to
+  `vm.out`/`vm.err` and are never effects. VM-decided failures (closed,
+  not_readable/not_writable/not_seekable) are not logged. `RealSystem`
+  holds a per-id `Handle` with 64 KiB read / 8 KiB write buffers.
+- Keyframe v12: `HeapFile` + roots (file metatable, io_input/output,
+  next_file_id). A restored file handle is `detached`; `Vm.reopenFiles`
+  reopens by path when size+mtime still match. No CLI/C resume entry
+  point yet, so no `--reopen-files` (doc 65 Outstanding).
+- `--lua-io-errors` / `mh_config.lua_io_errors` / Rust
+  `Config::lua_io_errors`. Init allocates more objects again, so the
+  GC/phaseq table ids moved +0x18; offsets_x64.inc updated (both blocks).
+- Tests: `src/interp_io_test.zig` on `FakeHost` (testutil; 3-byte fills,
+  call counting proves a replay never reaches the host).
+- `String.countCodepoints` vectorised (it was 69% of a 100 MB text
+  `read("a")`); benches io_lines/io_read_all/io_read_all_bin all inside
+  1.5× lua5.4 (doc 65 §9 table).
+- Next: Phase 4 (`os.exit/time/date/remove/rename/tmpname`, TZif parsed
+  ourselves per Bart, Windows TZ API), then 5 (viz refusal) and 6 (docs).
+
 DOC 65 PHASE 1: ONE HOST SEAM + THE SYSTEM SWITCH (2026-10-24, coral-marten).
 - `src/system.zig` (`HostSystem` vtable, `Groups`, `ErrorClass`, file-op
   types) replaces `FsSource`/`HostEnv`; `src/host_system.zig`

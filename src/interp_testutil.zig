@@ -36,6 +36,7 @@ const Closure = function.Closure;
 const RegWindow = regwindow.RegWindow;
 const testing = std.testing;
 
+const seam = @import("system.zig");
 const HostSystem = interp.HostSystem;
 const Vm = interp.Vm;
 
@@ -241,6 +242,219 @@ pub const FakeFs = struct {
         return .{ .ctx = self, .vtable = &vtable };
     }
 };
+/// An in-memory host system for the `io` library (doc 65 Phase 3): files by
+/// path, stdin, and handles by the VM's id — the `HostSystem` surface the
+/// real OS implements (`host_system.zig`), so tests never touch the disk. A
+/// `fill` returns at most `chunk` bytes, so reads cross host buffers. `calls`
+/// counts every vtable call, so a test can prove a replay made none.
+pub const FakeHost = struct {
+    gpa: std.mem.Allocator,
+    files: std.StringArrayHashMapUnmanaged(FakeFile) = .empty,
+    handles: std.AutoHashMapUnmanaged(seam.FileId, FakeHandle) = .empty,
+    /// Paths `open` refuses with `permission_denied`.
+    denied: []const []const u8 = &.{},
+    stdin: []const u8 = "",
+    stdin_pos: usize = 0,
+    chunk: usize = 3,
+    calls: usize = 0,
+    /// The modification clock: every write ticks it.
+    clock: i64 = 0,
+
+    pub const FakeFile = struct {
+        content: std.ArrayList(u8) = .empty,
+        mtime: i64 = 0,
+    };
+    const FakeHandle = struct {
+        /// The key in `files` (owned by the map).
+        path: []const u8,
+        pos: usize = 0,
+        append: bool = false,
+        /// A `tmpfile`: its file goes when it is closed.
+        tmp: bool = false,
+    };
+
+    pub fn init(gpa: std.mem.Allocator) FakeHost {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(self: *FakeHost) void {
+        var it = self.files.iterator();
+        while (it.next()) |e| {
+            e.value_ptr.content.deinit(self.gpa);
+            self.gpa.free(e.key_ptr.*);
+        }
+        self.files.deinit(self.gpa);
+        self.handles.deinit(self.gpa);
+    }
+
+    /// Create or replace a file.
+    pub fn put(self: *FakeHost, path: []const u8, bytes: []const u8) !void {
+        const f = try self.fileFor(path);
+        f.content.clearRetainingCapacity();
+        try f.content.appendSlice(self.gpa, bytes);
+        self.clock += 1;
+        f.mtime = self.clock;
+    }
+
+    /// A file's content, or null if there is none.
+    pub fn contentOf(self: *FakeHost, path: []const u8) ?[]const u8 {
+        const f = self.files.getPtr(path) orelse return null;
+        return f.content.items;
+    }
+
+    fn fileFor(self: *FakeHost, path: []const u8) !*FakeFile {
+        const gop = try self.files.getOrPut(self.gpa, path);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.gpa.dupe(u8, path) catch |e| {
+                self.files.swapRemoveAt(gop.index);
+                return e;
+            };
+            gop.value_ptr.* = .{};
+        }
+        return gop.value_ptr;
+    }
+
+    fn of(ctx: *anyopaque) *FakeHost {
+        const self: *FakeHost = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        return self;
+    }
+
+    fn openFn(ctx: *anyopaque, id: seam.FileId, path: []const u8, mode: seam.OpenMode) ?seam.ErrorClass {
+        const self = of(ctx);
+        for (self.denied) |d| if (std.mem.eql(u8, d, path)) return .permission_denied;
+        if (mode.kind == .read and !self.files.contains(path)) return .not_found;
+        const f = self.fileFor(path) catch return .other;
+        if (mode.kind == .write) {
+            f.content.clearRetainingCapacity();
+            self.clock += 1;
+            f.mtime = self.clock;
+        }
+        const key = self.files.getKey(path).?;
+        self.handles.put(self.gpa, id, .{ .path = key, .append = mode.kind == .append }) catch return .other;
+        return null;
+    }
+
+    fn tmpfileFn(ctx: *anyopaque, id: seam.FileId) ?seam.ErrorClass {
+        const self = of(ctx);
+        var name_buf: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "<tmp {d}>", .{id}) catch return .other;
+        _ = self.fileFor(name) catch return .other;
+        self.handles.put(self.gpa, id, .{ .path = self.files.getKey(name).?, .tmp = true }) catch return .other;
+        return null;
+    }
+
+    fn fillFn(ctx: *anyopaque, id: seam.FileId) seam.Result([]const u8) {
+        const self = of(ctx);
+        if (id == seam.stdin_id) {
+            const rest = self.stdin[self.stdin_pos..];
+            return .{ .ok = rest[0..@min(rest.len, self.chunk)] };
+        }
+        const h = self.handles.getPtr(id) orelse return .{ .fail = .other };
+        const bytes = self.files.getPtr(h.path).?.content.items;
+        if (h.pos >= bytes.len) return .{ .ok = "" };
+        const rest = bytes[h.pos..];
+        return .{ .ok = rest[0..@min(rest.len, self.chunk)] };
+    }
+
+    fn consumeFn(ctx: *anyopaque, id: seam.FileId, n: usize) void {
+        const self = of(ctx);
+        if (id == seam.stdin_id) {
+            self.stdin_pos += n;
+        } else if (self.handles.getPtr(id)) |h| h.pos += n;
+    }
+
+    fn writeFn(ctx: *anyopaque, id: seam.FileId, bytes: []const u8) ?seam.ErrorClass {
+        const self = of(ctx);
+        const h = self.handles.getPtr(id) orelse return .other;
+        const f = self.files.getPtr(h.path).?;
+        if (h.append) h.pos = f.content.items.len;
+        const end = h.pos + bytes.len;
+        if (end > f.content.items.len) {
+            const old = f.content.items.len;
+            f.content.resize(self.gpa, end) catch return .other;
+            if (h.pos > old) @memset(f.content.items[old..h.pos], 0);
+        }
+        @memcpy(f.content.items[h.pos..end], bytes);
+        h.pos = end;
+        self.clock += 1;
+        f.mtime = self.clock;
+        return null;
+    }
+
+    fn seekFn(ctx: *anyopaque, id: seam.FileId, whence: seam.Whence, offset: i64) seam.Result(u64) {
+        const self = of(ctx);
+        if (id == seam.stdin_id) return .{ .fail = .not_seekable };
+        const h = self.handles.getPtr(id) orelse return .{ .fail = .other };
+        const base: i64 = switch (whence) {
+            .set => 0,
+            .cur => @intCast(h.pos),
+            .end => @intCast(self.files.getPtr(h.path).?.content.items.len),
+        };
+        const to = base + offset;
+        if (to < 0) return .{ .fail = .other };
+        h.pos = @intCast(to);
+        return .{ .ok = h.pos };
+    }
+
+    fn okFn(ctx: *anyopaque, id: seam.FileId) ?seam.ErrorClass {
+        const self = of(ctx);
+        return if (self.handles.contains(id)) null else .other;
+    }
+
+    fn setvbufFn(ctx: *anyopaque, id: seam.FileId, mode: seam.BufferMode, size: usize) ?seam.ErrorClass {
+        _ = mode;
+        _ = size;
+        return okFn(ctx, id);
+    }
+
+    fn closeFn(ctx: *anyopaque, id: seam.FileId) ?seam.ErrorClass {
+        const self = of(ctx);
+        const kv = self.handles.fetchRemove(id) orelse return .other;
+        if (kv.value.tmp) {
+            const i = self.files.getIndex(kv.value.path).?;
+            const key = self.files.keys()[i];
+            self.files.values()[i].content.deinit(self.gpa);
+            self.files.swapRemoveAt(i);
+            self.gpa.free(key);
+        }
+        return null;
+    }
+
+    fn fingerprintFn(ctx: *anyopaque, id: seam.FileId) ?seam.Fingerprint {
+        const self = of(ctx);
+        const h = self.handles.getPtr(id) orelse return null;
+        const f = self.files.getPtr(h.path).?;
+        return .{ .size = f.content.items.len, .mtime_ns = f.mtime, .position = h.pos };
+    }
+
+    fn reopenFn(ctx: *anyopaque, id: seam.FileId, path: []const u8, mode: seam.OpenMode, fp: seam.Fingerprint) ?seam.ErrorClass {
+        const self = of(ctx);
+        const f = self.files.getPtr(path) orelse return .not_found;
+        if (f.content.items.len != fp.size or f.mtime != fp.mtime_ns) return .other;
+        self.handles.put(self.gpa, id, .{ .path = self.files.getKey(path).?, .pos = @intCast(fp.position), .append = mode.kind == .append }) catch return .other;
+        return null;
+    }
+
+    const vtable: HostSystem.VTable = .{
+        .open = &openFn,
+        .tmpfile = &tmpfileFn,
+        .fill = &fillFn,
+        .consume = &consumeFn,
+        .write = &writeFn,
+        .seek = &seekFn,
+        .flush = &okFn,
+        .setvbuf = &setvbufFn,
+        .close = &closeFn,
+        .fingerprint = &fingerprintFn,
+        .reopen = &reopenFn,
+    };
+
+    pub fn system(self: *FakeHost) HostSystem {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+};
+
 /// Like `runForTrace` but with tier-1a execution ON, capturing `print` output
 /// into `sink`. Leaves `vm` inspectable (cache / penalty / blacklist / back-edge
 /// counters). The caller must `deinit` the returned chunk only *after* inspecting

@@ -517,6 +517,46 @@ pub const ArrayPart = extern struct {
         self.asize = end;
     }
 
+    /// A fresh part (`cap == 0`) as a byte array: keys `1 .. bytes.len` hold
+    /// `bytes` in the `u8` lane. The end state of `storeRun(1, …)` with the
+    /// same bytes as ints — a byte always commits `u8` and every later byte
+    /// fits it — built with one copy instead of a store per byte. The `b`-mode
+    /// file reads (doc 65 Phase 3) build their byte arrays here. Empty `bytes`
+    /// leaves the part untouched, as an empty run would.
+    pub fn initBytes(self: *ArrayPart, gpa: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!void {
+        std.debug.assert(self.cap == 0 and self.asize == 0 and self.lane == .value and !self.frozen);
+        if (bytes.len == 0) return;
+        const end = bytes.len + 1;
+        const storage = try allocStorage(gpa, .u8, end);
+        self.lane = .u8;
+        self.frozen = true;
+        self.cap = end;
+        self.data = storage.data;
+        self.present = storage.present;
+        @memcpy(self.data.?[1..end], bytes);
+        // Presence: slot 0 is the hole, slots 1 .. end-1 are set.
+        const p = self.present.?;
+        @memset(p[0 .. end >> 3], 0xFF);
+        if (end & 7 != 0) p[end >> 3] = (@as(u8, 1) << @intCast(end & 7)) - 1;
+        p[0] &= 0xFE;
+        self.asize = end;
+    }
+
+    /// The bytes of slots `1 .. asize-1` when the part is a gap-free `u8`
+    /// run, borrowed; null otherwise. The inverse of `initBytes`: a byte
+    /// array written to a `b`-mode file is passed through without a copy.
+    pub fn byteRun(self: *const ArrayPart) ?[]const u8 {
+        if (self.lane != .u8 or self.asize < 2) return null;
+        const p = self.present.?;
+        // Every bit in 1 .. asize-1: whole bytes, then the partial ends.
+        const end = self.asize;
+        var i: usize = 1;
+        while (i < end and i & 7 != 0) : (i += 1) if (!getBit(p, i)) return null;
+        while (i + 8 <= end) : (i += 8) if (p[i >> 3] != 0xFF) return null;
+        while (i < end) : (i += 1) if (!getBit(p, i)) return null;
+        return self.data.?[1..end];
+    }
+
     /// Resize the array part to exactly `n` slots. Growing fills the new slots
     /// with `nil` (holes); shrinking simply drops the tail. Lane is preserved.
     pub fn resize(self: *ArrayPart, gpa: std.mem.Allocator, n: usize) std.mem.Allocator.Error!void {

@@ -200,6 +200,9 @@ pub const mh_config = extern struct {
     jit: c_int = 0,
     /// `MH_SYSTEM_*` groups (`system.Groups` bit order); 0 = none.
     system: c_uint = 0,
+    /// Nonzero: failed `io`/`os` calls return `nil, msg, code` instead of
+    /// raising (doc 65 §4.4, `Vm.io_errors`).
+    lua_io_errors: c_int = 0,
 };
 
 pub const mh_mem_stats = extern struct {
@@ -531,6 +534,7 @@ pub fn createVm(backing: std.mem.Allocator, config: mh_config) !*VmBox {
     if (groups.clock) box.vm.clock_source = .{ .ctx = &host_src_ctx, .nowNs = &hostClockNs };
     if (groups.random) box.vm.random_seed_source = .{ .ctx = &host_src_ctx, .seed = &hostRandomSeed };
     try box.vm.enableSystem(groups);
+    box.vm.io_errors = if (config.lua_io_errors != 0) .lua else .raise;
     if (config.jit != 2) {
         // Default/on: the CLI's production shape (--trace --jit-native).
         box.vm.trace.config.enabled = true;
