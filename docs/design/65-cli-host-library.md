@@ -1,6 +1,6 @@
 # 65 — The `io` and `os` host library — Design
 
-Status: Phases 0–3 implemented; Phases 4–6 not started. Ground rules
+Status: Phases 0–4 implemented; Phases 5–6 not started. Ground rules
 D1–D4 (2026-10-20) and all ten design questions Q1–Q10 (2026-10-21)
 decided by Bart; the design below reflects the answers.
 Owner: Bart
@@ -128,6 +128,33 @@ checked. Every phase lands behind `just test`, `just hashgate` and
   - [x] Inventory rows for the 20 `io` functions; `io.type`,
     `io.stdout`/`io.stderr` and the `file:` methods moved to
     `base-host`, since every VM has them.
+- [x] **Phase 4 — the `os` library.** 2026-10-24.
+  - [x] `os.time`, `os.date` (§8), `os.remove`, `os.rename`,
+    `os.tmpname` (`src/stdlib/os.zig`); `os.difftime` was already there.
+    Calendar arithmetic and `strftime` in the C locale are
+    `src/datetime.zig`; every C99 conversion, Lua's `checkoption`, and
+    Lua 5.4's date-table errors and in-place normalization.
+  - [x] The local zone, parsed by mahina rather than libc (Bart,
+    2026-10-24): TZif files v1–v4 with their POSIX footer, and POSIX `TZ`
+    rules (`src/tzif.zig`). The real host reads `$TZ` (a zoneinfo name
+    under `$TZDIR`, an absolute file, or a rule; empty means UTC) or
+    `/etc/localtime`; Windows asks `GetTimeZoneInformation`.
+  - [x] Changed from the plan: the zone effect is `local_zone`, not
+    `local_offset` (§4.2, §8 *As built*), carrying the offset, the
+    daylight-saving flag and the abbreviation. Effect format version 7.
+  - [x] `os.exit` (§7, Q6): the non-catchable `Error.Exit` with
+    `Vm.exit_status`. The CLI exits with it after its usual reports and
+    artifacts; the C API returns `MH_EXIT` (`mh_exit_status`), the Rust
+    crate `Error::Exit`.
+  - [x] Windows `getenv` in libmahina: the process environment block,
+    tested under wine with the Windows paths and zone
+    (`src/host_system.zig` tests).
+  - [x] Tests: `src/interp_os_test.zig` (live results against
+    `lua5.4`'s under the same `TZ`, both error modes, record/replay with
+    no host, `os.exit` in every trace mode), the C API and Rust exit
+    tests, and the real-OS tests in `src/host_system.zig`.
+  - [x] Benchmark `bench/stdlib/os_date.lua` (§9).
+  - [x] Inventory rows for the six functions.
 
 ### Outstanding
 
@@ -142,24 +169,11 @@ checked. Every phase lands behind `just test`, `just hashgate` and
 - [ ] **Defer — the cap's embedding config field.** The C API has no
   record mode yet, so there is nothing for an `mh_config` field to cap;
   it arrives with recording in the C API.
-- [ ] **Phase 3 — file handles and the `io` library.**
-  - [ ] The `file` heap object (§4.1), its methods table, and keyframe
-    serialization, including the reopen fingerprint (Q7).
-  - [ ] `io.open/close/read/write/lines/input/output/flush/type/tmpfile`,
-    `io.stdin/stdout/stderr`, `file:read/write/lines/seek/flush/setvbuf/close`;
-    text and `b` modes (Q1, Q2).
-  - [ ] The raising error mode and the Lua-compatibility mode (§4.4),
-    with the CLI flag and the embedding config field.
-  - [ ] Live resume of a restored keyframe: handles refuse operations,
-    or reopen under the opt-in flag when the file is unchanged (§4.1,
-    Q7).
-  - [ ] Record/replay tests for every effect kind, including a replay
-    with the host system detached.
-- [ ] **Phase 4 — the `os` library.**
-  - [ ] `os.exit` (§7, Q6), `os.time`, `os.date` (§8), `os.difftime`,
-    `os.remove`, `os.rename`, `os.tmpname`.
-  - [ ] Windows `getenv` in libmahina (no libc environ there yet; the
-    CLI reads its environment map and is unaffected).
+- [ ] **Decide — what the zone record carries.** Implemented as
+  offset + daylight-saving flag + abbreviation, so `%Z` and `isdst`
+  replay without a host (§8 *As built*). The alternative is offset only,
+  with `%Z` printing the numeric offset; Bart has not confirmed the
+  choice.
 - [ ] **Phase 5 — the visualiser.** "Run both + diff" refuses programs
   whose native run used a system interface, with a message saying why
   (Q10).
@@ -295,7 +309,7 @@ is what the script sees, or the error it raises.
 | `os.remove`, `os.rename` | `fs_mutate` | success, or an error |
 | `os.tmpname` | `fs_tmpname` | the name |
 | `os.time()` | `wall_clock` | integer seconds |
-| `os.date` / `os.time(t)` in local time | `local_offset` | the zone offset in seconds |
+| `os.date` / `os.time(t)` in local time | `local_offset` | the zone offset in seconds (built as `local_zone`, below) |
 | `os.getenv` | `getenv` (exists) | string or `nil` |
 
 Each kind logs the result only, as today: the arguments are a
@@ -456,6 +470,19 @@ not catch it). Then:
   in the environment group (§5.2), so a VM without that group has no
   `os.exit` at all.
 
+*As built (Phase 4):* `os.exit` sets `Vm.exit_status` (C's `int`) and
+returns `Error.Exit`, which `catchable` excludes. `Vm.run` unwinds the
+stack before returning it, as a finished run leaves it, so the CLI still
+prints its reports and writes its artifacts (`--emit-effects`,
+`--emit-keyframe`, …) and then exits with the low 8 bits, as C's `exit`
+does. stdout is flushed and open files are flushed and closed at
+teardown either way, so `close` has nothing to do. In the C API the
+boundary is restored as for a catchable fault and the call returns
+`MH_EXIT`; `mh_exit_status` gives the status. A nested `mh_call` inside a
+host callback that returns `MH_EXIT` leaves the exit pending: whatever
+the callback then returns, the exit continues outward to the outermost
+entry (`cHostCall`). The Rust crate maps it to `Error::Exit(status)`.
+
 ## 8. Time and dates
 
 - `os.time()` reads the host wall clock: the `wall_clock` effect,
@@ -471,6 +498,50 @@ not catch it). Then:
 - `os.clock` stays the monotonic clock in seconds (the absolute value
   differs from Lua's CPU time since start; deltas match). `os.difftime`
   exists.
+
+*As built (Phase 4):* the offset alone could not replay `%Z` or a date
+table's `isdst`, so the zone effect is `local_zone` (kind 15), a byte
+record: the offset east of UTC (`i32`, little-endian), a daylight-saving
+byte, and the abbreviation (at most 64 bytes, cut to valid UTF-8 before
+it is logged). The host owns the abbreviation's text: the tz database's
+names on Linux and macOS, the full zone names on Windows, as the C
+runtime's `%Z` gives them. A host with no `localZone` is in UTC, and so
+is `os.date` with a `!` prefix, which logs nothing.
+
+`os.date` asks for the zone once. `os.time(t)` reads the table's wall
+time as C's `mktime` does: the offset at the wall time taken as UTC is a
+guess, the offset at the instant that guess gives is the answer (exact
+away from a change; at a gap or an overlap it picks one side, as glibc
+does from a fresh process), and the zone at the result fills in the
+normalized table, usually with no third lookup. These differ from
+glibc's `mktime`, by choice:
+
+- `isdst` that disagrees with the zone (say `isdst=true` in January):
+  glibc steps a week at a time, up to about 7 years either way, for the
+  nearest instant with the requested state and uses its offset; failing
+  that it assumes daylight saving is one hour. Every step would be a
+  logged effect here (up to ~760), so mahina probes every half year out
+  to 7 years, nearest first, then makes the same one-hour assumption: at
+  most 28 lookups, and the same answer in every case compared below.
+- At an overlap, glibc's choice depends on the offset its previous
+  `mktime` call found (a static cache), so the same table can give
+  either answer within one process. mahina's depends only on the
+  table.
+- glibc applies a POSIX `TZ` rule only from 1970 (before that, every
+  year uses 1970's transition instants); mahina applies it to every
+  year, as tzcode does.
+- The date table's fields are read raw, without `__index`.
+- On Windows the zone is always the system's; `TZ` is not read.
+
+Compared by hand (2026-10-24) with `lua5.4` on glibc: 420 `os.time`
+round trips per zone (years 1950–2040, hours around the changes,
+`isdst` true/false/absent), under 14 zoneinfo zones (Amsterdam, São
+Paulo, UTC, Lord Howe, New York, London, Kolkata, Chatham, Santiago,
+Dublin, Casablanca, Tehran, St John's, Moscow). The output is identical
+except New York's 1996 overlap (glibc's cache, above). A POSIX
+`CET-1CEST,…` rule also differs only in its 1950 rows (glibc's
+1970-only rules, above). The unit tests in `src/interp_os_test.zig` pin
+a subset of these results.
 
 ## 9. Performance
 
@@ -530,6 +601,19 @@ the bytes read (105 MB for 100 MB), and the time per line is flat,
 462, 429 and 415 ns at 100 k, 300 k and 1 M lines (0.42 s at 1 M
 against 0.11 s off), so it grows linearly. Peak memory at 1 M lines is
 437 MB: the log keeps every line string alive until it is written.
+
+**Phase 4 measurements** (2026-10-24; best of 7, Linux x86-64,
+ReleaseFast): `bench/stdlib/os_date.lua`, 300 k iterations of one
+`os.date` with eleven conversions and an `os.date("*t", os.time(t))`
+round trip, `TZ=Europe/Amsterdam` (a TZif file):
+
+| Benchmark | mahina | `lua5.4` | LuaJIT | vs `lua5.4` |
+|---|---|---|---|---|
+| `os_date` 300 k | 0.21 s | 0.51 s | 0.37 s | 0.41× |
+
+The zone file is read once per VM and each lookup is a binary search
+over its transitions. Record mode logs one 14-byte `local_zone` entry
+per lookup, three per iteration here (0.34 s, 13 MB for 900 k entries).
 
 ## 10. Design questions (all decided 2026-10-21)
 

@@ -76,7 +76,7 @@ fn strArg(vm: *Vm, args: []const Value, i: usize) anyerror![]const u8 {
 /// `default` when absent; raises the located Lua bad-argument error for a present
 /// non-number, and the "number has no integer representation" reason for a
 /// non-integral float.
-fn optIntArg(vm: *Vm, args: []const Value, i: usize, default: i64) anyerror!i64 {
+pub fn optIntArg(vm: *Vm, args: []const Value, i: usize, default: i64) anyerror!i64 {
     if (i >= args.len or args[i].isNil()) return default;
     const v = args[i];
     if (v.isInt()) return v.asInt();

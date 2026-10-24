@@ -17,6 +17,7 @@
 //! native registry, and the VM core imports this file on every target.
 
 const std = @import("std");
+const datetime = @import("datetime.zig");
 
 /// One interface group (doc 65 §5.2). A native tagged with a group is
 /// installed only when the host enables that group.
@@ -144,6 +145,8 @@ pub const ErrorClass = enum(u8) {
     /// A seek on a stream that has no position: a pipe or terminal (from the
     /// host), or the VM's stdout/stderr seam (VM-decided).
     not_seekable = 9,
+    /// Removing a directory that still has entries.
+    not_empty = 10,
 
     pub fn text(self: ErrorClass) []const u8 {
         return switch (self) {
@@ -156,6 +159,7 @@ pub const ErrorClass = enum(u8) {
             .not_readable => "not open for reading",
             .not_writable => "not open for writing",
             .not_seekable => "not seekable",
+            .not_empty => "directory not empty",
         };
     }
 };
@@ -245,8 +249,36 @@ pub const HostSystem = struct {
         // ---- time ----
         /// Wall-clock seconds since the Unix epoch.
         wallSeconds: ?*const fn (ctx: *anyopaque) i64 = null,
-        /// The local zone's offset from UTC, in seconds, at `utc` (seconds since
-        /// the epoch). Varies with daylight saving.
-        localOffset: ?*const fn (ctx: *anyopaque, utc: i64) i32 = null,
+        /// The local zone at `utc` (seconds since the epoch): it varies with
+        /// daylight saving. A host without this function is in UTC.
+        localZone: ?*const fn (ctx: *anyopaque, utc: i64) LocalZone = null,
     };
 };
+
+/// The local zone at one instant (doc 65 §8): what `os.date` needs beyond
+/// the instant itself. The abbreviation borrows host memory like the other
+/// borrowed results (valid until the next call), and is at most
+/// `max_abbr_len` bytes of UTF-8; a host truncates a longer one.
+pub const LocalZone = datetime.Zone;
+
+/// The `local_zone` effect's byte record: the offset (`i32`, little-endian),
+/// daylight saving (one byte), then the abbreviation.
+pub const local_zone_fixed_len = 5;
+pub const max_abbr_len = 64;
+pub const max_local_zone_len = local_zone_fixed_len + max_abbr_len;
+
+/// Encode `zone` into `buf` as the `local_zone` record (the abbreviation cut
+/// to `max_abbr_len`).
+pub fn encodeLocalZone(zone: LocalZone, buf: *[max_local_zone_len]u8) []const u8 {
+    std.mem.writeInt(i32, buf[0..4], zone.offset, .little);
+    buf[4] = @intFromBool(zone.dst);
+    const n = @min(zone.abbr.len, max_abbr_len);
+    @memcpy(buf[local_zone_fixed_len..][0..n], zone.abbr[0..n]);
+    return buf[0 .. local_zone_fixed_len + n];
+}
+
+/// Decode a `local_zone` record; the abbreviation borrows `rec`. The effect
+/// decoder has checked it is at least `local_zone_fixed_len` bytes.
+pub fn decodeLocalZone(rec: []const u8) LocalZone {
+    return .{ .offset = std.mem.readInt(i32, rec[0..4], .little), .dst = rec[4] != 0, .abbr = rec[local_zone_fixed_len..] };
+}

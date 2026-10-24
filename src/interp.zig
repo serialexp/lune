@@ -50,6 +50,7 @@ const stddebug = @import("stdlib/debug.zig");
 const stdload = @import("stdlib/load.zig");
 const stdpackage = @import("stdlib/package.zig");
 const stdio = @import("stdlib/io.zig");
+const stdos = @import("stdlib/os.zig");
 const File = @import("file.zig").File;
 const unicode_case = @import("gen/unicode_case.zig");
 const Value = value.Value;
@@ -120,6 +121,11 @@ pub const Error = error{
     /// so the same logged results would be observed differently. Fatal like
     /// `UnicodeVersionMismatch`.
     IoErrorModeMismatch,
+    /// Doc 65 §7: `os.exit` ended the program, with `Vm.exit_status`. Not
+    /// an error but an unwind no `pcall` may stop; the host that ran the
+    /// program turns it into its own ending (the CLI's process status, the
+    /// C API's `MH_EXIT`).
+    Exit,
 };
 
 /// Fixed VM register/call stack: every frame's register window is a slice of
@@ -229,7 +235,7 @@ pub const mahina_version = "mahina 0.0.0";
 
 pub const base_natives = core_natives ++ stdmath.natives ++ stdtable.natives ++
     stdbase.natives ++ stdbasic.natives ++ stdstring.natives ++ stderrors.natives ++
-    stddebug.natives ++ stdload.natives ++ stdpackage.natives ++ stdio.natives;
+    stddebug.natives ++ stdload.natives ++ stdpackage.natives ++ stdio.natives ++ stdos.natives;
 
 comptime {
     // `pure ⇒ !effect` (doc 17, H-4 / 9-A(i)). `pure` and `effect` are independent
@@ -875,6 +881,9 @@ pub const Vm = struct {
     /// Whether this session has pinned `io_errors` (like
     /// `unicode_version_pinned`; in-memory only).
     io_errors_pinned: bool = false,
+    /// Doc 65 §7: the status `os.exit` ended the program with, read by the
+    /// host when a run returns `Error.Exit`. C's `exit` takes an `int`.
+    exit_status: i32 = 0,
     /// Mode-independent logical count of successfully committed host effects.
     /// Unlike `effect_cursor` (replay-only), this advances once in off, record,
     /// and replay through `onEffectCommitted`. It is replay-driver state rather
@@ -2033,7 +2042,14 @@ pub const Vm = struct {
         const top = try self.heap.newClosure(proto, 0);
         try self.pushFrame(top, 0, 0, 0);
         // `run` never arms `suspend_ctl`, so `exec` always finishes here.
-        switch (try self.exec()) {
+        const outcome = self.exec() catch |err| {
+            // Doc 65 §7: `os.exit` ends the run, not the VM. Unwind every
+            // frame, as a finished run leaves the stack, so the host can
+            // still snapshot and reuse the VM.
+            if (err == Error.Exit) self.unwindTo(0, 0);
+            return err;
+        };
+        switch (outcome) {
             .finished => |fr| return if (fr.count >= 1) self.regGet(fr.reg) else Value.nil(),
             .suspended => unreachable,
         }
@@ -2266,6 +2282,12 @@ pub const Vm = struct {
         };
         if (err == Error.IoErrorModeMismatch) return .{
             .message = try arena.dupe(u8, "the recording was made under the other io error mode (--lua-io-errors); replay it under the same mode"),
+            .self_located = true,
+        };
+        // Doc 65 §7: not a fault; a host that reports it anyway says what
+        // happened.
+        if (err == Error.Exit) return .{
+            .message = try std.fmt.allocPrint(arena, "the program called os.exit({d})", .{self.exit_status}),
             .self_located = true,
         };
         // No frame (e.g. main chunk too big for the stack) → just the error name.
@@ -3115,6 +3137,17 @@ pub const Vm = struct {
     /// gone, `fillKeep` keeps the old prefix whole and roots the stale values
     /// the restored VM never had (Codex review of doc 61 Phase K). O(stack_top)
     /// once per finished run; later clears find no cut.
+    /// Drop every frame above `entry_depth`, and the stack above `entry_top`,
+    /// after an unwinding error: close their open upvalues first, so an
+    /// escaped closure keeps its value once the slots are reused.
+    pub fn unwindTo(self: *Vm, entry_depth: u32, entry_top: usize) void {
+        self.closeUpvaluesFrom(entry_top);
+        self.dropRegionActivationsFromDepth(entry_depth);
+        self.depth = entry_depth;
+        self.stack_top = entry_top;
+        self.retireFinalCut(); // doc 21: the unwind reuses the stack
+    }
+
     pub fn retireFinalCut(self: *Vm) void {
         if (self.validFinalCut()) |fc| {
             const end = @as(usize, fc.result_base) + fc.result_count;
@@ -10214,6 +10247,7 @@ fn narrowError(e: anyerror) Error {
         error.UnicodeVersionMismatch => Error.UnicodeVersionMismatch,
         error.EffectLogLimit => Error.EffectLogLimit,
         error.IoErrorModeMismatch => Error.IoErrorModeMismatch,
+        error.Exit => Error.Exit,
         else => Error.HostError,
     };
 }
@@ -10244,6 +10278,7 @@ pub fn catchable(e: Error) bool {
         Error.UnicodeVersionMismatch,
         Error.EffectLogLimit,
         Error.IoErrorModeMismatch,
+        Error.Exit,
         // A top-level `run`/`start` contract violation — it can never surface inside
         // a `pcall`/`xpcall` (those don't re-enter top-level), so it is unreachable
         // here; classified not-catchable for completeness (doc 17, H-3 / 9-A(ii)).
@@ -10858,6 +10893,7 @@ test {
     _ = @import("interp_determinism_test.zig");
     _ = @import("interp_effects_test.zig");
     _ = @import("interp_io_test.zig");
+    _ = @import("interp_os_test.zig");
     _ = @import("interp_modules_test.zig");
     _ = @import("interp_replay_test.zig");
     _ = @import("interp_dispatch_test.zig");

@@ -1,7 +1,7 @@
 //! Integration tests for the safe `mahina` crate (doc 59 E4). These also
 //! exercise `mahina-sys`'s build.rs (`zig build lib`) end to end.
 
-use mahina::{shared, Error, Value, Vm};
+use mahina::{shared, Config, Error, System, Value, Vm};
 
 #[test]
 fn eval_scalars() {
@@ -414,4 +414,14 @@ fn truthiness_and_type_errors() {
         Err(Error::Type { expected: "int", got: "string" }) => {}
         other => panic!("expected type error, got {other:?}"),
     }
+}
+
+#[test]
+fn os_exit_is_an_error_with_the_status_and_the_vm_stays_usable() {
+    let vm = Vm::with_config(Config { system: System::ENV, ..Config::default() }).unwrap();
+    assert_eq!(vm.eval("pcall(os.exit, 42) return 1", "t"), Err(Error::Exit(42)));
+    assert_eq!(vm.eval("return 2", "t").unwrap()[0], Value::Int(2));
+    // Without the environment group there is no os.exit.
+    let plain = Vm::new().unwrap();
+    assert_eq!(plain.eval("return os.exit == nil", "t").unwrap()[0], Value::Bool(true));
 }

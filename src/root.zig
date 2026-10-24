@@ -32,6 +32,10 @@ pub const io = @import("io.zig");
 /// referenced by the wasm build).
 pub const system = @import("system.zig");
 pub const host_system = @import("host_system.zig");
+/// Calendar arithmetic and `strftime` (`os.date`/`os.time`), and the local
+/// zone from TZif / POSIX `TZ` (the host's `localZone`).
+pub const datetime = @import("datetime.zig");
+pub const tzif = @import("tzif.zig");
 
 /// Program-relative file paths (the visualiser's files, `mahina viz`).
 pub const relpath = @import("relpath.zig");
@@ -150,6 +154,11 @@ test {
     _ = arith;
     _ = mem;
     _ = io;
+    _ = system;
+    _ = host_system;
+    _ = @import("file.zig");
+    _ = datetime;
+    _ = tzif;
     _ = relpath;
     _ = diag;
     _ = token;

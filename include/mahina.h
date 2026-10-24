@@ -34,7 +34,12 @@
  *
  * ERRORS: failing calls return an mh_status and store a rendered message
  * retrievable with mh_last_error (borrowed until the next failing call).
- * After MH_ERR_RUNTIME the VM is fully restored and reusable. A rare
+ * After MH_ERR_RUNTIME the VM is fully restored and reusable. MH_EXIT is
+ * not a fault: the guest called os.exit (MH_SYSTEM_ENV), the call unwound
+ * like an error, the VM is restored and reusable, and mh_exit_status gives
+ * the status. Inside a host callback, a nested call that returns MH_EXIT
+ * ends the callback's own caller too: once the callback returns, whatever
+ * it returns, the exit continues outward to the outermost entry. A rare
  * non-catchable fault (out of memory inside the VM) poisons the VM: every
  * later guest-running call returns MH_ERR_API; free it.
  *
@@ -59,7 +64,8 @@ typedef enum mh_status {
     MH_ERR_COMPILE = 1, /* parse/compile diagnostics in mh_last_error      */
     MH_ERR_RUNTIME = 2, /* guest fault; located message in mh_last_error   */
     MH_ERR_OOM = 3,     /* allocation failure                              */
-    MH_ERR_API = 4      /* misuse: bad value/ref/handle, collision, fatal  */
+    MH_ERR_API = 4,     /* misuse: bad value/ref/handle, collision, fatal  */
+    MH_EXIT = 5         /* the guest called os.exit; see mh_exit_status    */
 } mh_status;
 
 /* The public value type. Stable; deliberately decoupled from the VM's
@@ -139,6 +145,11 @@ mh_status mh_vm_new(const mh_config *config, mh_vm **out);
 mh_status mh_vm_free(mh_vm *vm);
 
 mh_str mh_last_error(mh_vm *vm);
+
+/* The status of the guest's last os.exit (true is 0, false 1, an integer
+ * as given, truncated to an int as C's exit takes it); 0 if it never
+ * called it. Meaningful after a call returned MH_EXIT. */
+int mh_exit_status(mh_vm *vm);
 
 /* print/io.write output and warn() output are captured per-VM. */
 mh_str mh_output(mh_vm *vm);

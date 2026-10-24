@@ -314,7 +314,7 @@
     },
 
     "Effect": {
-      "description": "One recorded nondeterministic INPUT: the host effect that produced it and what it returned. `kind` mirrors mahina's function.EffectKind enum (clock=0, random_seed=1, getenv=2, file_read=5, unicode_version=6, file_open=7, file_read_op=8, file_write=9, file_seek=10, file_control=11, fs_mutate=12, fs_tmpname=13, wall_clock=14, local_offset=15, io_error_mode=16; 3 and 4 are retired). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars, inline string bytes, inline byte-array bytes, or a host failure class, never a heap_ref.",
+      "description": "One recorded nondeterministic INPUT: the host effect that produced it and what it returned. `kind` mirrors mahina's function.EffectKind enum (clock=0, random_seed=1, getenv=2, file_read=5, unicode_version=6, file_open=7, file_read_op=8, file_write=9, file_seek=10, file_control=11, fs_mutate=12, fs_tmpname=13, wall_clock=14, local_zone=15, io_error_mode=16; 3 and 4 are retired). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars, inline string bytes, inline byte-array bytes, or a host failure class, never a heap_ref.",
       "sequence": [
         { "name": "kind",   "type": "uint8" },
         { "name": "result", "type": "EffectResult" }

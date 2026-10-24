@@ -1,5 +1,5 @@
 # mahina frozen benchmark output digests — see tools/hashgate.py
-# generated from zig-out/bin/mahina at rev 6958e4c
+# generated from zig-out/bin/mahina at rev 6e00190
 # name	mode	argv	rc	sha256(stdout)
 array3d	jit	80	0	48752ee828b38c1ad373f80e83f62bc9394a1f02665eccff98db8159e39e4d54
 array3d	t0	80	0	48752ee828b38c1ad373f80e83f62bc9394a1f02665eccff98db8159e39e4d54
@@ -52,6 +52,9 @@ nsieve-bit	trace	6	0	49601107e4d950351260d76ccdfc2506ca84646061d68fda23b451b2c3f
 nsieve-bit-fp	jit	6	0	49601107e4d950351260d76ccdfc2506ca84646061d68fda23b451b2c3f52bf6
 nsieve-bit-fp	t0	6	0	49601107e4d950351260d76ccdfc2506ca84646061d68fda23b451b2c3f52bf6
 nsieve-bit-fp	trace	6	0	49601107e4d950351260d76ccdfc2506ca84646061d68fda23b451b2c3f52bf6
+os_date	jit	300000	0	bbaa9d30a14efc3bdd492c3c5806c25d5d4c8a80020a279604cea2cbe8816672
+os_date	t0	300000	0	bbaa9d30a14efc3bdd492c3c5806c25d5d4c8a80020a279604cea2cbe8816672
+os_date	trace	300000	0	bbaa9d30a14efc3bdd492c3c5806c25d5d4c8a80020a279604cea2cbe8816672
 pairs_hash	jit	200	0	f717a14cdcc02f2551eb9cc58343312796f8d5be05303ad7b3d0d6e9dcb53068
 pairs_hash	t0	200	0	f717a14cdcc02f2551eb9cc58343312796f8d5be05303ad7b3d0d6e9dcb53068
 pairs_hash	trace	200	0	f717a14cdcc02f2551eb9cc58343312796f8d5be05303ad7b3d0d6e9dcb53068

@@ -71,6 +71,9 @@ pub enum Error {
     Compile(String),
     /// A guest fault (located message). The VM is restored and reusable.
     Runtime(String),
+    /// The guest called `os.exit` with this status (needs `System::ENV`).
+    /// Not a fault: the VM is restored and reusable.
+    Exit(i32),
     /// Allocation failure.
     Oom,
     /// API misuse (stale ref, wrong type, name collision, fatal VM, …).
@@ -86,6 +89,7 @@ impl fmt::Display for Error {
         match self {
             Error::Compile(m) => write!(f, "compile error: {m}"),
             Error::Runtime(m) => write!(f, "runtime error: {m}"),
+            Error::Exit(code) => write!(f, "the program called os.exit({code})"),
             Error::Oom => write!(f, "out of memory"),
             Error::Api(m) => write!(f, "API error: {m}"),
             Error::ForeignVm => write!(f, "value belongs to a different VM"),
@@ -132,6 +136,7 @@ impl VmInner {
             sys::MH_ERR_COMPILE => Error::Compile(self.last_error()),
             sys::MH_ERR_RUNTIME => Error::Runtime(self.last_error()),
             sys::MH_ERR_OOM => Error::Oom,
+            sys::MH_EXIT => Error::Exit(unsafe { sys::mh_exit_status(self.raw) }),
             _ => Error::Api(self.last_error()),
         }
     }

@@ -50,7 +50,9 @@ pub const schema = @import("gen/trace_schema.zig");
 /// v6 (doc 65): the `io`/`os` kinds (ordinals 7–16) and two result variants,
 /// `EffectBytes` (tag 5, a `b`-mode read) and `HostFail` (tag 6, an error
 /// class); `argc`/`argv` (3, 4) are retired.
-pub const effect_format_version: u32 = 6;
+/// v7 (doc 65 Phase 4): kind 15 is `local_zone`, a byte record (offset,
+/// daylight saving, abbreviation) where v6's `local_offset` was an int.
+pub const effect_format_version: u32 = 7;
 
 /// The encoded size of an `EffectFile` with no entries: the `version` word and
 /// the entry count.
@@ -83,7 +85,7 @@ pub const DecodeError = error{
 /// log whose result contradicts its kind. Exhaustive over `EffectKind` so a
 /// newly added kind forces a deliberate classification here.
 const Shape = enum {
-    /// An int: a seed, a packed version, seconds, a zone offset, a mode.
+    /// An int: a seed, a packed version, seconds, a mode.
     int,
     /// A number: `os.clock`'s float seconds or `os.nsclock`'s int nanoseconds.
     number,
@@ -100,11 +102,15 @@ const Shape = enum {
     /// What one `read` format returns: a string, a number, `nil` at EOF, the
     /// bytes of a `b`-mode read, or a failure.
     read_value,
+    /// A local-zone record: bytes, at least the fixed part
+    /// (`system.LocalZone.fixed_len`).
+    zone,
 };
 
 fn resultShapeOf(kind: EffectKind) Shape {
     return switch (kind) {
-        .random_seed, .unicode_version, .wall_clock, .local_offset, .io_error_mode => .int,
+        .random_seed, .unicode_version, .wall_clock, .io_error_mode => .int,
+        .local_zone => .zone,
         .clock => .number,
         .getenv, .file_read => .string_or_nil,
         .file_open, .file_seek => .int_or_fail,
@@ -121,9 +127,9 @@ fn checkResultShape(kind: EffectKind, result: Effect.Result) DecodeError!void {
     const ok = switch (result) {
         .fail => switch (shape) {
             .int_or_fail, .ok_or_fail, .string_or_fail, .read_value => true,
-            .int, .number, .string_or_nil => false,
+            .int, .number, .string_or_nil, .zone => false,
         },
-        .bytes => shape == .read_value,
+        .bytes => |span| shape == .read_value or (shape == .zone and span.len >= system.local_zone_fixed_len),
         .value => |v| switch (shape) {
             .int, .int_or_fail => v.tag == .int,
             .number => v.tag == .int or v.tag == .float,
@@ -131,6 +137,7 @@ fn checkResultShape(kind: EffectKind, result: Effect.Result) DecodeError!void {
             .ok_or_fail => v.tag == .nil,
             .string_or_fail => isString(v),
             .read_value => v.tag == .nil or v.tag == .int or v.tag == .float or isString(v),
+            .zone => false,
         },
     };
     if (!ok) return error.MismatchedEffectResult;
@@ -323,8 +330,36 @@ test "doc 65 host-operation results round-trip, failures as their class" {
         .{ .kind = .fs_mutate, .result = .{ .fail = .permission_denied } },
         .{ .kind = .fs_tmpname, .result = .{ .fail = .exists } },
         Effect.of(.wall_clock, Value.int(1_790_000_000)),
-        Effect.of(.local_offset, Value.int(-7 * 3600)),
     });
+}
+
+test "a local-zone record round-trips; a short one is refused" {
+    const gpa = testing.allocator;
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    var rec: [system.max_local_zone_len]u8 = undefined;
+    const zone: system.LocalZone = .{ .offset = -7 * 3600, .dst = true, .abbr = "PDT" };
+    var log: EffectLog = .{};
+    defer log.deinit(gpa);
+    try log.appendBytes(gpa, .local_zone, system.encodeLocalZone(zone, &rec));
+    const bytes = try encodeFile(gpa, &log);
+    defer gpa.free(bytes);
+    var back: EffectLog = .{};
+    defer back.deinit(gpa);
+    try decodeInto(&back, gpa, &heap, bytes);
+    const got = system.decodeLocalZone(back.bytesOf(back.entries.items[0].result.bytes));
+    try testing.expectEqual(zone.offset, got.offset);
+    try testing.expectEqual(zone.dst, got.dst);
+    try testing.expectEqualStrings(zone.abbr, got.abbr);
+
+    var short: EffectLog = .{};
+    defer short.deinit(gpa);
+    try short.appendBytes(gpa, .local_zone, "abc");
+    const short_bytes = try encodeFile(gpa, &short);
+    defer gpa.free(short_bytes);
+    var refused: EffectLog = .{};
+    defer refused.deinit(gpa);
+    try testing.expectError(error.MismatchedEffectResult, decodeInto(&refused, gpa, &heap, short_bytes));
 }
 
 test "a bytes result round-trips into the decoding log's own buffer" {

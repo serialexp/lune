@@ -9,6 +9,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const seam = @import("system.zig");
 const mio = @import("io.zig");
+const datetime = @import("datetime.zig");
+const tzif = @import("tzif.zig");
 
 const Io = std.Io;
 const HostSystem = seam.HostSystem;
@@ -26,6 +28,8 @@ pub const RealSystem = struct {
     /// added on its first use. Files the program never closed are flushed
     /// and closed by `deinit`.
     handles: std.AutoHashMapUnmanaged(seam.FileId, *Handle) = .empty,
+    /// The local time zone, loaded on the first `localZone` (doc 65 §8).
+    zone: ?ZoneSource = null,
 
     /// For the CLI, with the process environment from `Init`.
     pub fn init(gpa: std.mem.Allocator, io: Io, env_map: ?*std.process.Environ.Map) RealSystem {
@@ -34,6 +38,7 @@ pub const RealSystem = struct {
 
     pub fn deinit(self: *RealSystem) void {
         self.dropLast();
+        if (self.zone) |*z| z.deinit(self.gpa);
         var it = self.handles.valueIterator();
         while (it.next()) |h| {
             _ = h.*.flushWrites(self.io);
@@ -60,6 +65,11 @@ pub const RealSystem = struct {
         .close = &close,
         .fingerprint = &fingerprint,
         .reopen = &reopen,
+        .remove = &remove,
+        .rename = &rename,
+        .tmpname = &tmpname,
+        .wallSeconds = &wallSeconds,
+        .localZone = &localZone,
     };
 
     fn of(ctx: *anyopaque) *RealSystem {
@@ -150,6 +160,7 @@ pub const RealSystem = struct {
             error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => .permission_denied,
             error.PathAlreadyExists => .exists,
             error.IsDir => .is_a_directory,
+            error.DirNotEmpty => .not_empty,
             error.Unseekable => .not_seekable,
             error.NotOpenForReading => .not_readable,
             error.NotOpenForWriting => .not_writable,
@@ -377,9 +388,196 @@ pub const RealSystem = struct {
         return null;
     }
 
+    // ---- paths (doc 65 §5.1) ----
+
+    /// C's `remove`: a file, or an empty directory.
+    fn remove(ctx: *anyopaque, path: []const u8) ?seam.ErrorClass {
+        const self = of(ctx);
+        Io.Dir.cwd().deleteFile(self.io, path) catch |e| switch (e) {
+            error.IsDir => Io.Dir.cwd().deleteDir(self.io, path) catch |d| return classOf(d),
+            else => return classOf(e),
+        };
+        return null;
+    }
+
+    fn rename(ctx: *anyopaque, from: []const u8, to: []const u8) ?seam.ErrorClass {
+        const self = of(ctx);
+        Io.Dir.rename(Io.Dir.cwd(), from, Io.Dir.cwd(), to, self.io) catch |e| return classOf(e);
+        return null;
+    }
+
+    /// A fresh name in the temporary directory, created empty so no other
+    /// process takes it (Lua's `mkstemp` template, `lua_XXXXXX`).
+    fn tmpname(ctx: *anyopaque) seam.Result([]const u8) {
+        const self = of(ctx);
+        const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        var attempt: usize = 0;
+        while (attempt < 100) : (attempt += 1) {
+            var rand: [6]u8 = undefined;
+            mio.hostEntropy(&rand);
+            var suffix: [6]u8 = undefined;
+            for (&suffix, rand) |*c, r| c.* = alphabet[r % alphabet.len];
+            const dir = self.tempDir();
+            const path = std.fmt.allocPrint(self.gpa, "{s}{c}lua_{s}", .{ dir, std.fs.path.sep, &suffix }) catch return .{ .fail = .other };
+            const file = Io.Dir.cwd().createFile(self.io, path, .{ .exclusive = true }) catch |e| {
+                self.gpa.free(path);
+                if (e == error.PathAlreadyExists) continue;
+                return .{ .fail = classOf(e) };
+            };
+            file.close(self.io);
+            self.dropLast();
+            self.last = path;
+            return .{ .ok = path };
+        }
+        return .{ .fail = .exists };
+    }
+
+    // ---- time (doc 65 §8) ----
+
+    fn wallSeconds(ctx: *anyopaque) i64 {
+        const self = of(ctx);
+        return @intCast(@divFloor(Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
+    }
+
+    /// Where the local zone comes from: a TZif file, a POSIX `TZ` string, the
+    /// Windows zone API, or nothing (UTC).
+    const ZoneSource = union(enum) {
+        tzif: tzif.TzInfo,
+        /// The `TZ` value (owned) and its parse, which borrows it.
+        posix: struct { text: []u8, tz: tzif.Posix },
+        windows: WindowsZone,
+        utc,
+
+        fn deinit(z: *ZoneSource, gpa: std.mem.Allocator) void {
+            switch (z.*) {
+                .tzif => |*t| t.deinit(gpa),
+                .posix => |p| gpa.free(p.text),
+                .windows => |*w| w.deinit(gpa),
+                .utc => {},
+            }
+        }
+    };
+
+    const utc_zone: seam.LocalZone = .{ .offset = 0, .dst = false, .abbr = "UTC" };
+
+    fn localZone(ctx: *anyopaque, utc: i64) seam.LocalZone {
+        const self = of(ctx);
+        if (self.zone == null) self.zone = self.loadZone();
+        return switch (self.zone.?) {
+            .tzif => |*t| t.lookup(utc),
+            .posix => |p| p.tz.lookup(utc),
+            .windows => |*w| w.lookup(self.gpa, utc),
+            .utc => utc_zone,
+        };
+    }
+
+    /// The zone as C's `tzset` finds it: `$TZ` names a zoneinfo file (under
+    /// `$TZDIR`, or absolute) or is a POSIX rule; unset, `/etc/localtime`;
+    /// empty or unusable, UTC. Windows asks the system.
+    fn loadZone(self: *RealSystem) ZoneSource {
+        if (builtin.os.tag == .windows) return .{ .windows = .{} };
+        const tz_env = getenv(self, "TZ") orelse return self.loadTzif("/etc/localtime") orelse .utc;
+        var name = tz_env;
+        if (name.len > 0 and name[0] == ':') name = name[1..];
+        if (name.len == 0) return .utc;
+        // `getenv`'s result is borrowed: copy what outlives the next call.
+        const owned = self.gpa.dupe(u8, name) catch return .utc;
+        defer self.gpa.free(owned);
+        if (owned[0] == '/') return self.loadTzif(owned) orelse .utc;
+        const dir = if (getenv(self, "TZDIR")) |d| (if (d.len > 0) d else "/usr/share/zoneinfo") else "/usr/share/zoneinfo";
+        const path = std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ dir, owned }) catch return .utc;
+        defer self.gpa.free(path);
+        if (self.loadTzif(path)) |z| return z;
+        const text = self.gpa.dupe(u8, owned) catch return .utc;
+        const tz = tzif.Posix.parse(text) orelse {
+            self.gpa.free(text);
+            return .utc;
+        };
+        return .{ .posix = .{ .text = text, .tz = tz } };
+    }
+
+    fn loadTzif(self: *RealSystem, path: []const u8) ?ZoneSource {
+        const bytes = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, Io.Limit.limited(1 << 20)) catch return null;
+        defer self.gpa.free(bytes);
+        return .{ .tzif = tzif.TzInfo.parse(self.gpa, bytes) catch return null };
+    }
+
+    /// The Windows zone API: the system's current zone, its rules applied to
+    /// any instant by `SystemTimeToTzSpecificLocalTime`, its names (UTF-16)
+    /// as the abbreviations, as the C runtime's `%Z` gives them.
+    const WindowsZone = struct {
+        /// The UTF-8 name last returned (borrowed by the caller).
+        name: ?[]u8 = null,
+
+        fn deinit(w: *WindowsZone, gpa: std.mem.Allocator) void {
+            if (w.name) |n| gpa.free(n);
+        }
+
+        fn lookup(w: *WindowsZone, gpa: std.mem.Allocator, utc: i64) seam.LocalZone {
+            if (builtin.os.tag != .windows) unreachable;
+            var tzi: win.TIME_ZONE_INFORMATION = undefined;
+            if (win.GetTimeZoneInformation(&tzi) == win.TIME_ZONE_ID_INVALID) return utc_zone;
+            const standard = -(tzi.Bias + tzi.StandardBias) * 60;
+            const tm = datetime.breakDown(utc);
+            // SYSTEMTIME covers 1601..30827; outside it, standard time.
+            var offset = standard;
+            if (tm.year >= 1601 and tm.year <= 30827) {
+                const st: win.SYSTEMTIME = .{ .wYear = @intCast(tm.year), .wMonth = tm.month, .wDayOfWeek = tm.wday, .wDay = tm.day, .wHour = tm.hour, .wMinute = tm.min, .wSecond = tm.sec, .wMilliseconds = 0 };
+                var local: win.SYSTEMTIME = undefined;
+                if (win.SystemTimeToTzSpecificLocalTime(null, &st, &local) != 0) {
+                    const l = datetime.secondsOf(.{ .year = local.wYear, .month = local.wMonth, .day = local.wDay, .hour = local.wHour, .min = local.wMinute, .sec = local.wSecond });
+                    offset = @intCast(l - utc);
+                }
+            }
+            const dst = offset != standard;
+            const wide = if (dst) &tzi.DaylightName else &tzi.StandardName;
+            if (w.name) |n| gpa.free(n);
+            w.name = std.unicode.wtf16LeToWtf8Alloc(gpa, std.mem.sliceTo(wide, 0)) catch null;
+            const name = w.name orelse "";
+            return .{ .offset = offset, .dst = dst, .abbr = name[0..@min(name.len, seam.max_abbr_len)] };
+        }
+    };
+
+    const win = struct {
+        const SYSTEMTIME = extern struct {
+            wYear: u16,
+            wMonth: u16,
+            wDayOfWeek: u16,
+            wDay: u16,
+            wHour: u16,
+            wMinute: u16,
+            wSecond: u16,
+            wMilliseconds: u16,
+        };
+        const TIME_ZONE_INFORMATION = extern struct {
+            Bias: i32,
+            StandardName: [32]u16,
+            StandardDate: SYSTEMTIME,
+            StandardBias: i32,
+            DaylightName: [32]u16,
+            DaylightDate: SYSTEMTIME,
+            DaylightBias: i32,
+        };
+        const TIME_ZONE_ID_INVALID: u32 = 0xFFFF_FFFF;
+        extern "kernel32" fn GetTimeZoneInformation(tzi: *TIME_ZONE_INFORMATION) callconv(.winapi) u32;
+        extern "kernel32" fn SystemTimeToTzSpecificLocalTime(tzi: ?*const TIME_ZONE_INFORMATION, utc: *const SYSTEMTIME, local: *SYSTEMTIME) callconv(.winapi) i32;
+    };
+
     fn getenv(ctx: *anyopaque, name: []const u8) ?[]const u8 {
         const self = of(ctx);
         if (self.env_map) |m| return m.get(name);
+        if (builtin.os.tag == .windows) {
+            // libmahina on Windows: the process environment block, which has
+            // no libc `getenv` behind it.
+            const key = std.unicode.wtf8ToWtf16LeAllocZ(self.gpa, name) catch return null;
+            defer self.gpa.free(key);
+            const env: std.process.Environ = .{ .block = .global };
+            const wide = env.getWindows(key) orelse return null;
+            const val = std.unicode.wtf16LeToWtf8Alloc(self.gpa, wide) catch return null;
+            self.dropLast();
+            self.last = val;
+            return val;
+        }
         if (comptime builtin.link_libc and builtin.os.tag != .windows) {
             // libc wants a NUL-terminated name; an over-long or NUL-bearing
             // name can't name a variable.
@@ -393,3 +591,125 @@ pub const RealSystem = struct {
         return null;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Tests: the real OS, in a scratch directory under `.zig-cache/tmp`.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// A path inside the test's scratch directory, relative to the cwd (the
+/// host's path operations take paths as a program would give them).
+fn scratchPath(buf: []u8, tmp: *const testing.TmpDir, name: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, ".zig-cache{c}tmp{c}{s}{c}{s}", .{ std.fs.path.sep, std.fs.path.sep, &tmp.sub_path, std.fs.path.sep, name }) catch unreachable;
+}
+
+test "remove, rename and tmpname on the real file system" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
+    defer sys.deinit();
+    const ctx: *anyopaque = &sys;
+    var a_buf: [256]u8 = undefined;
+    var b_buf: [256]u8 = undefined;
+    var d_buf: [256]u8 = undefined;
+    const a = scratchPath(&a_buf, &tmp, "a.txt");
+    const b = scratchPath(&b_buf, &tmp, "b.txt");
+    const d = scratchPath(&d_buf, &tmp, "d");
+    try tmp.dir.writeFile(mio.hostIo(), .{ .sub_path = "a.txt", .data = "A" });
+    try testing.expectEqual(@as(?seam.ErrorClass, null), RealSystem.rename(ctx, a, b));
+    try testing.expectEqual(@as(?seam.ErrorClass, .not_found), RealSystem.rename(ctx, a, b));
+    try testing.expectEqual(@as(?seam.ErrorClass, null), RealSystem.remove(ctx, b));
+    try testing.expectEqual(@as(?seam.ErrorClass, .not_found), RealSystem.remove(ctx, b));
+    // A directory goes when it is empty, as C's `remove` does.
+    try tmp.dir.createDir(mio.hostIo(), "d", .default_dir);
+    try tmp.dir.writeFile(mio.hostIo(), .{ .sub_path = "d" ++ std.fs.path.sep_str ++ "x", .data = "" });
+    try testing.expectEqual(@as(?seam.ErrorClass, .not_empty), RealSystem.remove(ctx, d));
+    try tmp.dir.deleteFile(mio.hostIo(), "d" ++ std.fs.path.sep_str ++ "x");
+    try testing.expectEqual(@as(?seam.ErrorClass, null), RealSystem.remove(ctx, d));
+    // A temporary name is a new, empty file.
+    const name = switch (RealSystem.tmpname(ctx)) {
+        .ok => |n| try testing.allocator.dupe(u8, n),
+        .fail => |c| return std.debug.panic("tmpname failed: {s}", .{c.text()}),
+    };
+    defer testing.allocator.free(name);
+    try testing.expect(std.mem.indexOf(u8, name, "lua_") != null);
+    try testing.expectEqual(@as(?seam.ErrorClass, null), RealSystem.remove(ctx, name));
+}
+
+/// The zone a fresh system finds under `TZ=tz` (null: unset).
+fn zoneUnder(env: *std.process.Environ.Map, utc: i64, abbr_buf: []u8) !seam.LocalZone {
+    var sys = RealSystem.init(testing.allocator, mio.hostIo(), env);
+    defer sys.deinit();
+    var z = RealSystem.localZone(&sys, utc);
+    @memcpy(abbr_buf[0..z.abbr.len], z.abbr);
+    z.abbr = abbr_buf[0..z.abbr.len];
+    return z;
+}
+
+test "the local zone follows TZ: a POSIX rule, a zoneinfo name, empty for UTC" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // the system zone
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    var buf: [64]u8 = undefined;
+    const summer: i64 = 1_690_000_000; // 2023-07-22
+    const winter: i64 = 1_700_000_000; // 2023-11-14
+
+    try env.put("TZ", "CET-1CEST,M3.5.0,M10.5.0/3");
+    var z = try zoneUnder(&env, summer, &buf);
+    try testing.expectEqual(@as(i32, 7200), z.offset);
+    try testing.expect(z.dst);
+    try testing.expectEqualStrings("CEST", z.abbr);
+    z = try zoneUnder(&env, winter, &buf);
+    try testing.expectEqual(@as(i32, 3600), z.offset);
+    try testing.expectEqualStrings("CET", z.abbr);
+
+    // A name that is no file under `TZDIR` falls back to a POSIX parse.
+    try env.put("TZDIR", ".zig-cache/no-such-zoneinfo");
+    try env.put("TZ", "<+0530>-5:30");
+    z = try zoneUnder(&env, summer, &buf);
+    try testing.expectEqual(@as(i32, 19800), z.offset);
+    try testing.expectEqualStrings("+0530", z.abbr);
+
+    try env.put("TZ", "");
+    z = try zoneUnder(&env, summer, &buf);
+    try testing.expectEqual(@as(i32, 0), z.offset);
+    try testing.expectEqualStrings("UTC", z.abbr);
+
+    // A zoneinfo name, where the system has the database.
+    try env.put("TZDIR", "/usr/share/zoneinfo");
+    Io.Dir.cwd().access(mio.hostIo(), "/usr/share/zoneinfo/Europe/Amsterdam", .{}) catch return;
+    try env.put("TZ", ":Europe/Amsterdam");
+    z = try zoneUnder(&env, summer, &buf);
+    try testing.expectEqual(@as(i32, 7200), z.offset);
+    try testing.expectEqualStrings("CEST", z.abbr);
+    z = try zoneUnder(&env, -1_520_000_000, &buf); // 1921-11-01: Amsterdam mean time
+    try testing.expectEqual(@as(i32, 1172), z.offset);
+    try testing.expectEqualStrings("AMT", z.abbr);
+}
+
+test "on Windows the zone is the system's, named as the C runtime names it" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
+    defer sys.deinit();
+    for ([_]i64{ 1_690_000_000, 1_700_000_000 }) |t| {
+        const z = RealSystem.localZone(&sys, t);
+        try testing.expect(@abs(z.offset) <= 14 * 3600);
+        try testing.expect(z.abbr.len > 0);
+        try testing.expect(std.unicode.utf8ValidateSlice(z.abbr));
+    }
+}
+
+test "without an environment map, getenv reads the process environment" {
+    if (builtin.os.tag != .windows and !builtin.link_libc) return error.SkipZigTest;
+    var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
+    defer sys.deinit();
+    try testing.expect(RealSystem.getenv(&sys, "PATH") != null);
+    try testing.expect(RealSystem.getenv(&sys, "MAHINA_SURELY_UNSET_VARIABLE") == null);
+}
+
+test "the wall clock is past 2020" {
+    var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
+    defer sys.deinit();
+    try testing.expect(RealSystem.wallSeconds(&sys) > 1_577_836_800);
+}

@@ -636,3 +636,44 @@ test "mem stats reflect VM allocation" {
     try testing.expect(stats.live_bytes > 0);
     try testing.expect(stats.live_allocations > 0);
 }
+
+/// Calls the guest function it is handed, which exits, and returns `ok`
+/// regardless: the exit must still end the call that called it.
+fn hostCallExiting(vm: ?*capi.VmBox, userdata: ?*anyopaque, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: *usize) callconv(.c) capi.mh_status {
+    _ = results;
+    _ = max_results;
+    const inner_status: *capi.mh_status = @ptrCast(@alignCast(userdata.?));
+    if (nargs < 1) return .err_api;
+    var n: usize = 0;
+    inner_status.* = capi.mh_call(vm, args.?[0], null, 0, null, 0, &n);
+    nresults.* = 0;
+    return .ok;
+}
+
+test "os.exit: MH_EXIT with the status, the VM restored and reusable, and an exit inside a callback ends its caller" {
+    const env: c_uint = @as(u8, @bitCast(mahina.system.Groups{ .env = true }));
+    const box = try capi.createVm(testing.allocator, .{ .system = env });
+    defer freeVm(box);
+    var results: [1]mh_value = undefined;
+    var n: usize = 0;
+    try testing.expectEqual(capi.mh_status.exit, capi.mh_eval(box, s("local t = {} pcall(os.exit, 5) return 1"), s("x"), &results, 1, &n));
+    try testing.expectEqual(@as(c_int, 5), capi.mh_exit_status(box));
+    try expectInt(try evalOne(box, "return 7"), 7);
+
+    var inner: capi.mh_status = .ok;
+    try testing.expectEqual(capi.mh_status.ok, capi.mh_register_fn(box, s("callit"), &hostCallExiting, &inner, null));
+    try testing.expectEqual(capi.mh_status.exit, capi.mh_eval(box, s(
+        \\print(pcall(callit, function() os.exit(false) end))
+        \\print("not reached")
+    ), s("y"), &results, 1, &n));
+    try testing.expectEqual(capi.mh_status.exit, inner);
+    try testing.expectEqual(@as(c_int, 1), capi.mh_exit_status(box));
+    const out = capi.mh_output(box);
+    try testing.expectEqual(@as(usize, 0), out.len);
+    try expectInt(try evalOne(box, "return 8"), 8);
+
+    // Without the environment group there is no `os.exit` at all.
+    const plain = try newVm();
+    defer freeVm(plain);
+    try expectInt(try evalOne(plain, "return os.exit == nil and 1 or 0"), 1);
+}

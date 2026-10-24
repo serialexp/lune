@@ -617,7 +617,13 @@ fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source:
     // negligible against a whole-program run. Harmless when coverage is off (the field
     // is only emitted with the artifact, which needs `--emit-coverage`).
     vm.trace.run_nanos = exec_ns;
-    _ = run_outcome catch |err| {
+    // Doc 65 §7: `os.exit` ends the program, not with a fault: the reports
+    // and artifacts below still go out (`run` has unwound the stack), and the
+    // status becomes the process's. C's `exit` keeps the low 8 bits.
+    var status: u8 = 0;
+    if (run_outcome) |_| {} else |err| if (err == error.Exit) {
+        status = @truncate(@as(u32, @bitCast(vm.exit_status)));
+    } else {
         // Located, Lua-style message + call chain from the un-popped frame stack.
         var fault_arena = std.heap.ArenaAllocator.init(gpa);
         defer fault_arena.deinit();
@@ -647,7 +653,7 @@ fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source:
             mahina.io.eprint("mahina: runtime error: {s}\n", .{@errorName(err)});
         }
         return 1;
-    };
+    }
 
     // --- execute-only timing (--time) --- to stderr, never interleaving stdout.
     // Deliberately free of coverage accounting so the number is a clean measure of
@@ -727,7 +733,7 @@ fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source:
             return 1;
         };
     }
-    return 0;
+    return status;
 }
 
 /// The native monotonic clock backing `clock()`, injected as `Vm.clock_source`.

@@ -1,3 +1,27 @@
+DOC 65 PHASE 4: THE `os` LIBRARY (2026-10-24, coral-marten).
+- `src/stdlib/os.zig`: os.time/date/remove/rename/tmpname/exit.
+  `src/datetime.zig` (civil calendar, C-locale strftime, Lua checkoption)
+  and `src/tzif.zig` (TZif v1–v4 + POSIX TZ rules; Bart: parse it
+  ourselves). RealSystem reads $TZ/$TZDIR or /etc/localtime; on Windows it
+  uses GetTimeZoneInformation, and getenv reads the environment block
+  (tested under wine).
+- Zone effect `local_zone` (kind 15: i32 offset, dst byte, abbreviation)
+  instead of the planned `local_offset`. It is my call, still open for
+  Bart (doc 65 Outstanding). Effect format v7.
+- os.time(t) emulates glibc mktime. Deviations are listed in doc 65 §8
+  "As built". Compared by hand with lua5.4 in 14 zones: identical apart
+  from the documented overlap case and pre-1970 POSIX rules.
+- os.exit: non-catchable `Error.Exit` + `Vm.exit_status`. `Vm.unwindTo`
+  is shared with capi. CLI exit code is the low 8 bits; C `MH_EXIT` +
+  `mh_exit_status`, with nested exits kept pending through cHostCall;
+  Rust `Error::Exit`. The Vm layout moved, so both offsets_x64.inc blocks
+  were updated.
+- Tests: src/interp_os_test.zig, capi + Rust exit tests, real-OS tests in
+  host_system.zig (now part of the test root). Bench
+  bench/stdlib/os_date.lua: 0.21 s vs lua5.4 0.51 s / LuaJIT 0.37 s.
+- Next: Phase 5 (viz "Run both + diff" refuses programs that used a
+  system interface, Q10), then Phase 6 (docs, doc 02 taxonomy).
+
 DOC 65 PHASE 3: FILE HANDLES + THE `io` LIBRARY (2026-10-24, coral-marten).
 - `src/file.zig` (the `file` heap object: VM id, kind, mode, closed,
   detached, path, fingerprint) and `src/stdlib/io.zig` (the whole `io`

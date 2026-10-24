@@ -155,6 +155,8 @@ pub const mh_status = enum(c_int) {
     err_runtime = 2,
     err_oom = 3,
     err_api = 4,
+    /// Doc 65 §7 (Q6): the guest called `os.exit`; not a fault.
+    exit = 5,
 };
 
 /// The public value *type* — a stable wire enum, deliberately decoupled from
@@ -256,6 +258,9 @@ pub const VmBox = struct {
     /// A non-catchable fault (OOM, replay integrity) poisoned the VM: no more
     /// guest-running entries (doc 59 §3.6).
     fatal: bool = false,
+    /// Doc 65 §7: a nested entry (inside a host callback) returned `MH_EXIT`;
+    /// when the callback returns, the exit continues outward (`cHostCall`).
+    exit_pending: bool = false,
     /// The real OS behind the enabled `mh_config.system` groups (doc 65 §5.2).
     real_sys: host_system.RealSystem = undefined,
 };
@@ -400,21 +405,28 @@ fn oom(box: *VmBox) mh_status {
 /// the `pcall` recipe, doc 59 §3.6) or mark the VM fatal (non-catchable).
 fn guestFault(box: *VmBox, entry_depth: u32, entry_top: usize, err: interp.Error) mh_status {
     const vm = &box.vm;
+    if (err == error.Exit) {
+        // Doc 65 §7 (Q6): `os.exit` ends the program, never the host. The
+        // boundary is restored as for a catchable fault, so the VM stays
+        // usable; a nested entry leaves the exit pending for its callback's
+        // caller.
+        setLastErrorFmt(box, "the program called os.exit({d})", .{vm.exit_status});
+        vm.pending_error = null;
+        vm.unwindTo(entry_depth, entry_top);
+        box.exit_pending = entry_depth > 0;
+        return .exit;
+    }
     renderFault(box, err);
     if (!interp.catchable(err)) {
         box.fatal = true;
         return if (err == error.OutOfMemory) .err_oom else .err_runtime;
     }
     vm.pending_error = null;
-    vm.closeUpvaluesFrom(entry_top);
-    vm.dropRegionActivationsFromDepth(entry_depth);
-    vm.depth = entry_depth;
-    vm.stack_top = entry_top;
     // Doc 61 §4.2: nothing to restore. A capi entry at depth > 0 runs inside
     // a host fn, so the surviving frame was in flight at entry, and an error
     // only ever leaves flags set.
     std.debug.assert(entry_depth == 0 or vm.frames[entry_depth - 1].in_flight);
-    vm.retireFinalCut();
+    vm.unwindTo(entry_depth, entry_top);
     return .err_runtime;
 }
 
@@ -589,6 +601,12 @@ pub export fn mh_vm_free(vm: ?*VmBox) mh_status {
 pub export fn mh_last_error(vm: ?*VmBox) mh_str {
     const box = vm orelse return .{};
     return asStr(box.last_error.items);
+}
+
+/// Exempt as well: reads one plain `Vm` field, no heap.
+pub export fn mh_exit_status(vm: ?*VmBox) c_int {
+    const box = vm orelse return 0;
+    return box.vm.exit_status;
 }
 
 pub export fn mh_output(vm: ?*VmBox) mh_str {
@@ -1181,6 +1199,10 @@ fn cHostCall(ctx: ?*anyopaque, vm_opaque: *anyopaque, args: []const Value, out: 
         out.len,
         &nres,
     );
+    // Doc 65 §7: a nested entry hit `os.exit`; it ends this call's caller too,
+    // whatever the callback returned. Not catchable, so it unwinds to the
+    // outermost entry, which clears it.
+    if (h.box.exit_pending) return error.Exit;
     if (st != .ok) {
         const msg: []const u8 = if (h.box.host_error.items.len > 0) h.box.host_error.items else "host function error";
         const e = vm.raiseLocatedError(msg, 1);

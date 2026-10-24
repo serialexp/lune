@@ -37,6 +37,7 @@ const RegWindow = regwindow.RegWindow;
 const testing = std.testing;
 
 const seam = @import("system.zig");
+const tzif = @import("tzif.zig");
 const HostSystem = interp.HostSystem;
 const Vm = interp.Vm;
 
@@ -259,6 +260,15 @@ pub const FakeHost = struct {
     calls: usize = 0,
     /// The modification clock: every write ticks it.
     clock: i64 = 0,
+    /// The wall clock `os.time()` reads.
+    now: i64 = 0,
+    /// The local zone, a POSIX `TZ` rule; null is UTC.
+    tz: ?tzif.Posix = null,
+    /// Paths `remove`/`rename` refuse with `permission_denied`.
+    locked: []const []const u8 = &.{},
+    /// How many names `tmpname` has handed out.
+    tmp_count: usize = 0,
+    tmp_name: [32]u8 = undefined,
 
     pub const FakeFile = struct {
         content: std.ArrayList(u8) = .empty,
@@ -421,6 +431,51 @@ pub const FakeHost = struct {
         return null;
     }
 
+    fn dropFile(self: *FakeHost, path: []const u8) void {
+        const i = self.files.getIndex(path).?;
+        const key = self.files.keys()[i];
+        self.files.values()[i].content.deinit(self.gpa);
+        self.files.orderedRemoveAt(i);
+        self.gpa.free(key);
+    }
+
+    fn removeFn(ctx: *anyopaque, path: []const u8) ?seam.ErrorClass {
+        const self = of(ctx);
+        for (self.locked) |d| if (std.mem.eql(u8, d, path)) return .permission_denied;
+        if (!self.files.contains(path)) return .not_found;
+        self.dropFile(path);
+        return null;
+    }
+
+    fn renameFn(ctx: *anyopaque, from: []const u8, to: []const u8) ?seam.ErrorClass {
+        const self = of(ctx);
+        for (self.locked) |d| if (std.mem.eql(u8, d, from) or std.mem.eql(u8, d, to)) return .permission_denied;
+        const content = (self.files.getPtr(from) orelse return .not_found).content.items;
+        if (std.mem.eql(u8, from, to)) return null;
+        const copy = self.gpa.dupe(u8, content) catch return .other;
+        defer self.gpa.free(copy);
+        self.put(to, copy) catch return .other;
+        self.dropFile(from);
+        return null;
+    }
+
+    fn tmpnameFn(ctx: *anyopaque) seam.Result([]const u8) {
+        const self = of(ctx);
+        self.tmp_count += 1;
+        const name = std.fmt.bufPrint(&self.tmp_name, "/tmp/lua_{d}", .{self.tmp_count}) catch return .{ .fail = .other };
+        self.put(name, "") catch return .{ .fail = .other };
+        return .{ .ok = name };
+    }
+
+    fn wallSecondsFn(ctx: *anyopaque) i64 {
+        return of(ctx).now;
+    }
+
+    fn localZoneFn(ctx: *anyopaque, utc: i64) seam.LocalZone {
+        const self = of(ctx);
+        return if (self.tz) |tz| tz.lookup(utc) else seam.LocalZone.utc;
+    }
+
     fn fingerprintFn(ctx: *anyopaque, id: seam.FileId) ?seam.Fingerprint {
         const self = of(ctx);
         const h = self.handles.getPtr(id) orelse return null;
@@ -448,6 +503,11 @@ pub const FakeHost = struct {
         .close = &closeFn,
         .fingerprint = &fingerprintFn,
         .reopen = &reopenFn,
+        .remove = &removeFn,
+        .rename = &renameFn,
+        .tmpname = &tmpnameFn,
+        .wallSeconds = &wallSecondsFn,
+        .localZone = &localZoneFn,
     };
 
     pub fn system(self: *FakeHost) HostSystem {

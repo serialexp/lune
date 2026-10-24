@@ -421,9 +421,10 @@ pub const EffectKind = enum(u8) {
     fs_tmpname = 13,
     /// `os.time()`: the wall clock, integer seconds since the epoch.
     wall_clock = 14,
-    /// The local zone's offset from UTC in seconds at one instant, for
-    /// `os.date`/`os.time(t)` in local time.
-    local_offset = 15,
+    /// The local zone at one instant, for `os.date`/`os.time(t)` in local
+    /// time: a byte record (`system.LocalZone.encode`) of the offset east of
+    /// UTC, whether daylight saving is in effect, and the abbreviation.
+    local_zone = 15,
     /// The `io` error mode (doc 65 §4.4: 0 = raise, 1 = Lua's returns). Not a
     /// host input, but it changes what a program observes for the same logged
     /// results, so it is pinned once per session like `unicode_version` and a

@@ -19,6 +19,7 @@ pub const MH_ERR_COMPILE: mh_status = 1;
 pub const MH_ERR_RUNTIME: mh_status = 2;
 pub const MH_ERR_OOM: mh_status = 3;
 pub const MH_ERR_API: mh_status = 4;
+pub const MH_EXIT: mh_status = 5;
 
 pub type mh_type = c_int;
 pub const MH_NIL: mh_type = 0;
@@ -138,6 +139,7 @@ extern "C" {
     pub fn mh_vm_free(vm: *mut mh_vm) -> mh_status;
 
     pub fn mh_last_error(vm: *mut mh_vm) -> mh_str;
+    pub fn mh_exit_status(vm: *mut mh_vm) -> c_int;
     pub fn mh_output(vm: *mut mh_vm) -> mh_str;
     pub fn mh_output_clear(vm: *mut mh_vm);
     pub fn mh_warnings(vm: *mut mh_vm) -> mh_str;

@@ -60,14 +60,14 @@ inline fn vmOf(ctx: *anyopaque) *Vm {
 }
 
 /// Copy `vals` into `out` (as many as fit) and return how many were written.
-fn putResults(out: []Value, vals: []const Value) usize {
+pub fn putResults(out: []Value, vals: []const Value) usize {
     const n = @min(out.len, vals.len);
     @memcpy(out[0..n], vals[0..n]);
     return n;
 }
 
 /// The 0/1-result projection of a multi-result core, as the registry wants it.
-fn single(comptime core: function.NativeMultiFn) function.NativeFn {
+pub fn single(comptime core: function.NativeMultiFn) function.NativeFn {
     return &struct {
         fn f(ctx: *anyopaque, args: []const Value) anyerror!Value {
             var buf: [1]Value = .{Value.nil()};
@@ -107,7 +107,7 @@ fn fileArg(vm: *Vm, args: []const Value, i: usize) anyerror!*File {
 /// message is mahina's own text — the verb, the handle or path, the class —
 /// so a recording replays with the same text anywhere (§4.2). `always_raise`
 /// is for the calls Lua raises from too (`io.lines`, `io.input(name)`).
-fn failWith(vm: *Vm, out: []Value, verb: []const u8, name: Name, class: ErrorClass, always_raise: bool) anyerror!usize {
+pub fn failWith(vm: *Vm, out: []Value, verb: []const u8, name: Name, class: ErrorClass, always_raise: bool) anyerror!usize {
     const msg = switch (name) {
         .path => |p| try std.fmt.allocPrint(vm.gpa, "cannot {s} '{s}': {s}", .{ verb, p, class.text() }),
         .stream => |s| try std.fmt.allocPrint(vm.gpa, "cannot {s} {s}: {s}", .{ verb, s, class.text() }),
@@ -118,7 +118,7 @@ fn failWith(vm: *Vm, out: []Value, verb: []const u8, name: Name, class: ErrorCla
 }
 
 /// How a message names what failed: a quoted path, or a stream's name.
-const Name = union(enum) {
+pub const Name = union(enum) {
     path: []const u8,
     stream: []const u8,
 
@@ -153,7 +153,7 @@ fn replayOutcome(vm: *Vm, kind: function.EffectKind) anyerror!?ErrorClass {
 
 /// Run an `ok_or_fail` host operation through the record/replay boundary:
 /// `live` is called only in `off`/`record`.
-fn control(vm: *Vm, kind: function.EffectKind, live: anytype) anyerror!?ErrorClass {
+pub fn control(vm: *Vm, kind: function.EffectKind, live: anytype) anyerror!?ErrorClass {
     if (vm.effect_mode == .replay) return replayOutcome(vm, kind);
     const err = try live.run(vm);
     try recordOutcome(vm, kind, err);
@@ -161,7 +161,7 @@ fn control(vm: *Vm, kind: function.EffectKind, live: anytype) anyerror!?ErrorCla
 }
 
 /// Flush stdout before a stdin read (§6), so a prompt is visible.
-fn flushStdout(vm: *Vm) void {
+pub fn flushStdout(vm: *Vm) void {
     if (vm.out) |w| w.flush() catch {} else mio.flush();
 }
 
