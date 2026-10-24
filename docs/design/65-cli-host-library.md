@@ -1,6 +1,7 @@
 # 65 — The `io` and `os` host library — Design
 
-Status: Phases 0–5 implemented; Phase 6 not started. Ground rules
+Status: Phases 0–6 implemented; open: the zone-record decision and the
+deferred items below. Ground rules
 D1–D4 (2026-10-20) and all ten design questions Q1–Q10 (2026-10-21)
 decided by Bart; the design below reflects the answers.
 Owner: Bart
@@ -172,6 +173,19 @@ checked. Every phase lands behind `just test`, `just hashgate` and
     the messages in `interp_semantics_test.zig` and `interp_os_test.zig`
     (every trace mode), and the viz diff tests on both engines.
   - [x] Benchmark `bench/stdlib/pcall_faults.lua` (§9).
+- [x] **Phase 6 — docs and inventory.** 2026-10-24.
+  - [x] Inventory checked: every `io` and `os` row is `implemented` or
+    `excluded`; the rows flipped with Phases 0, 3 and 4 (Rule Z-5). The
+    "27 `cli-binding` rows" figure was from before several moved to
+    `base-host`; 15 `cli-binding` rows remain, all implemented.
+  - [x] Doc 02's effect taxonomy: the time, file and environment rows
+    name their effect kinds; new rows for process spawning (forbidden),
+    the io error mode (pinned), program output and `os.exit` (not
+    inputs).
+  - [x] `docs/differences-from-lua.md`, linked from the README: strings
+    are text, error messages, the system interfaces, raising errors and
+    `--lua-io-errors`, text and `b` modes, file handles, stdout
+    buffering, `os.exit`, dates and times, and the recording cap.
 
 ### Outstanding
 
@@ -182,7 +196,6 @@ checked. Every phase lands behind `just test`, `just hashgate` and
 - [ ] **Defer — `__close`.** mahina has no to-be-closed variables, so
   the file metatable has no `__close` and `io.lines` returns no
   closing value for one.
-
 - [ ] **Defer — the cap's embedding config field.** The C API has no
   record mode yet, so there is nothing for an `mh_config` field to cap;
   it arrives with recording in the C API.
@@ -191,10 +204,6 @@ checked. Every phase lands behind `just test`, `just hashgate` and
   replay without a host (§8 *As built*). The alternative is offset only,
   with `%Z` printing the numeric offset; Bart has not confirmed the
   choice.
-- [ ] **Phase 6 — docs and inventory.** Flip the 27 `cli-binding` rows;
-  update doc 02's taxonomy table; document the user-facing differences
-  (raising errors and the compatibility mode, code-point `read(n)`,
-  byte arrays in `b` mode, the size cap).
 - [ ] **Defer — `collectgarbage`.** It is `core`, not `cli-binding`, and
   `"count"` is a determinism question of its own (heap sizes differ
   between wasm32 and x86-64). Tracked in `TODO_USABILITY.md` §1.

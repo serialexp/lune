@@ -1,8 +1,8 @@
 # mahina — Determinism & the Host-Effect Boundary
 
-Status: partial — host-effect boundary + record/replay (clock F2d, random F2e) + keyframe capture/restore/resume landed; record-once/replay-to-k driver now in the browser (Phase 7 v8); cross-platform-FP guarantee + guard-snapshots outstanding
+Status: partial — host-effect boundary + record/replay (clock F2d, random F2e, the `io`/`os` host inputs doc 65) + keyframe capture/restore/resume landed; record-once/replay-to-k driver now in the browser (Phase 7 v8); cross-platform-FP guarantee + guard-snapshots outstanding
 Owner: Bart
-Last updated: 2026-06-15
+Last updated: 2026-10-24
 
 Prerequisite for **Phase 3** (the host-effect boundary must exist in the calling
 convention) and **Phase 5** (replay) in `00-architecture.md`. Deterministic
@@ -93,7 +93,9 @@ that for a time-travel debugger it *is* the architecture.
       inputs/outputs*. **The first input now exists** (F2d): `clock()` — the host
       monotonic clock — is the canonical *log-outputs* effect, carried as a stable
       wire enum `interp.EffectKind` (clock=0). The table below is the full plan;
-      `clock` is the first row made real.
+      `clock` is the first row made real. **2026-10-24:** every host input of the
+      Lua `io`/`os` library is a row now (doc 65); what remains open is the
+      non-host rows (hash seed, FP mode, GC timing).
 - [~] **Host-effect *recording*** — the seam exists (Phase 3, above). **F2d makes
       it real for the first input.** A native may now carry an `effect: ?EffectKind`
       (null = pure host call like `print`; non-null = a nondeterministic input). The
@@ -382,15 +384,19 @@ accounting that makes "deterministic" true rather than aspirational.
   `00-architecture.md`).
 - General coroutines (replaced by host-mediated suspension; see below).
 
-## Effect taxonomy (to be completed)
+## Effect taxonomy
 
 | Source | Policy (forbid / virtualise / log) | Notes |
 |---|---|---|
 | Host function calls | log inputs+outputs | the primary boundary |
-| Time / clock | log | **landed (F2d)**: `clock()` host effect, `EffectKind.clock`=0 |
+| Time / clock | log | **landed (F2d)**: `clock()` host effect, `EffectKind.clock`=0 (now `os.clock`). **Doc 65 Phase 4:** `os.time()` logs `wall_clock`=14; `os.date`/`os.time(t)` in local time log the zone at each instant they ask about, `local_zone`=15 (offset, DST flag, abbreviation) |
 | Randomness | seed | **landed (F2e)**: `random()` draws from a VM-owned PRNG; the one recorded effect is the seed, `EffectKind.random_seed`=1 |
-| File / network / stdin | log results | **file landed (L-3)**: `loadfile`/`dofile` read content through `EffectKind.file_read`=5; the path is plain program data, only the content is the input. Network/stdin still host effects |
-| Environment / args | log at startup | snapshot in header |
+| File / network / stdin | log results | **file landed (L-3)**: `loadfile`/`dofile` read content through `EffectKind.file_read`=5; the path is plain program data, only the content is the input. **Doc 65 Phases 2–4:** the `io` library and file side of `os`, one effect per host call, result only: `file_open`=7, `file_read_op`=8 (stdin too), `file_write`=9, `file_seek`=10, `file_control`=11, `fs_mutate`=12 (`os.remove`/`os.rename`), `fs_tmpname`=13. A failure is logged as its class, so replay raises the same message anywhere. Network: none (excluded) |
+| Process spawning | forbid | `io.popen`, `os.execute`: excluded, unrecordable (doc 65 non-goals) |
+| Environment / args | log | `os.getenv` logs each read, `EffectKind.getenv`=2 (the bare `getenv`/`argc`/`argv`, kinds 3–4, are gone: doc 65 Q3). `arg` is VM state before the run, so the keyframe carries it |
+| `io` error mode | pin per recording | `io_error_mode`=16, recorded once; a replay under the other mode refuses (doc 65 §4.4) |
+| Program output (stdout, stderr, `print`) | not an input | written to the VM's output seam (`Vm.out`/`Vm.err`) in every mode, never logged (doc 65 §4.3, §6) |
+| `os.exit` | not an input | logs nothing; a replay reaches the same call and ends there (doc 65 §7) |
 | Unicode case table | pin version per recording | **landed (S-C)**: `string.upper`/`lower` use a compiled-in simple-case table; its version is recorded once as `EffectKind.unicode_version`=6 and re-asserted on replay (fatal mismatch) |
 | Hash seed | fix per recording | header |
 | Table iteration order | design out | address-independent |

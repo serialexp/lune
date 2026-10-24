@@ -126,6 +126,9 @@ no UI embedded; `zig build -Dviz-dist=<built viz/dist>` adds one.
 - `docs/design/05+` — one doc per JIT mechanism (native codegen, store
   sinking, cross-frame tracing, nested-loop linking, exit-branch patching,
   …).
+- `docs/differences-from-lua.md` — what a Lua programmer will notice:
+  text strings and byte arrays, the `io`/`os` library and its system
+  interfaces, errors, dates.
 - `docs/lua-stdlib-inventory.csv` — per-function map of the Lua 5.4 stdlib
   surface: what's in scope, what's implemented, what's deliberately excluded.
 

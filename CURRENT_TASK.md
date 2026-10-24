@@ -1,3 +1,14 @@
+DOC 65 PHASE 6: DOCS AND INVENTORY (2026-10-24, coral-marten).
+- `docs/differences-from-lua.md` (new, linked from README): every claim
+  checked against the binary.
+- Doc 02 taxonomy rows for time/file/env name their effect kinds; new
+  rows for process spawning, io error mode, program output, os.exit.
+- Inventory: all io/os rows already implemented/excluded; no change.
+- Doc 65 is Phases 0–6 done. Open: Bart's call on the `local_zone`
+  record (offset+dst+abbrev vs offset only), and the Defer items.
+- Still open elsewhere: `os.clock()` is absolute host time, not CPU time
+  since start (TODO_USABILITY §1).
+
 DOC 65 PHASE 5: THE VISUALISER REFUSAL + LUA-STYLE FAULT NAMES (2026-10-24, coral-marten).
 - Bart chose "explain the missing global": Phase 1's playground groups
   made Q10's effect-log mechanism moot (both engines fail identically).

@@ -16,11 +16,13 @@ All 27 `cli-binding` rows in `docs/lua-stdlib-inventory.csv` are
 with a status, or read the environment or the time. Route them through the
 effect log so runs stay replayable (doc 02).
 
-- [ ] `io.read`, `io.lines`, `io.open`, `io.close`, `io.input`,
+- [x] `io.read`, `io.lines`, `io.open`, `io.close`, `io.input`,
       `io.output`, `io.flush`, `io.type`, `io.tmpfile`; `io.stdin`,
       `io.stdout`, `io.stderr`; `file:read/write/lines/seek/flush/setvbuf/close`.
-- [ ] `os.exit`, `os.getenv`, `os.time`, `os.date`, `os.remove`,
-      `os.rename`, `os.tmpname`.
+      Doc 65 Phase 3.
+- [x] `os.exit`, `os.getenv`, `os.time`, `os.date`, `os.remove`,
+      `os.rename`, `os.tmpname`. Doc 65 Phases 1 and 4; differences from
+      Lua in `docs/differences-from-lua.md`.
 - [x] The inventory says `io.write` is `not-started`, but it works: fix the
       row (Rule Z-5). Doc 65 Phase 0; `io.flush` added too.
 - [ ] `collectgarbage` is `core` + `not-started` (not excluded); at least
