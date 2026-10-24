@@ -111,6 +111,7 @@ smoke() {
             ;;
     esac
     cd "$dir"
+    [[ -f $dir/mahina-$platform/LICENSE ]] || fail "mahina-$platform has no LICENSE"
 
     # --version names the commit the archive was built from, and the UI.
     local version

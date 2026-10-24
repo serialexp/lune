@@ -233,8 +233,10 @@ effect log so runs stay replayable (doc 02).
 
 ## 8. Docs, licensing, ecosystem
 
-- [ ] No LICENSE in the repo or any release archive (`gh repo view` →
-      `licenseInfo: null`).
+- [x] No LICENSE in the repo or any release archive (`gh repo view` →
+      `licenseInfo: null`). MIT, 2026-10-24: `LICENSE`, both crates'
+      `license`, viz `package.json`, the CLI archives (cli-smoke checks)
+      and the vendor bundle.
 - [ ] No user-facing docs: all of `docs/design/` is internal. Proposed
       site: Why mahina → Install → Hello world → Coming from Lua
       (generated from the inventory CSV) → Language reference → Stdlib

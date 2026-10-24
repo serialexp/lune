@@ -3,6 +3,7 @@ name = "mahina"
 version = "0.1.2"
 edition = "2021"
 description = "Safe Rust embedding API for the mahina VM (doc 59)"
+license = "MIT"
 
 [dependencies]
 mahina-sys = { path = "../mahina-sys" }

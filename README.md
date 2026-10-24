@@ -128,3 +128,8 @@ no UI embedded; `zig build -Dviz-dist=<built viz/dist>` adds one.
   …).
 - `docs/lua-stdlib-inventory.csv` — per-function map of the Lua 5.4 stdlib
   surface: what's in scope, what's implemented, what's deliberately excluded.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE). `vendor/ucd/` holds Unicode Character
+Database files under the Unicode License.

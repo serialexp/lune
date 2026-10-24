@@ -8,8 +8,8 @@
 #   <out>/
 #     LUNE_COMMIT                       full sha of HEAD, "-dirty" if the tree wasn't clean
 #     ZIG_VERSION                       the pinned toolchain the binaries were built with
-#     mahina-<platform>.tar.gz          mahina-<platform>/mahina (Linux, macOS)
-#     mahina-<platform>.zip             mahina-<platform>/mahina.exe (Windows)
+#     mahina-<platform>.tar.gz          mahina-<platform>/{mahina,LICENSE} (Linux, macOS)
+#     mahina-<platform>.zip             mahina-<platform>/{mahina.exe,LICENSE} (Windows)
 #     SHA256SUMS                        one line per archive
 #
 # The web UI is built once: the wasm VM (ReleaseFast, stripped), then
@@ -81,13 +81,13 @@ for entry in "${TARGETS[@]}"; do
     mkdir -p "$pkg"
     case $platform in
         *-windows)
-            cp "$work/build/$platform/bin/mahina.exe" "$pkg/"
+            cp "$work/build/$platform/bin/mahina.exe" "$root/LICENSE" "$pkg/"
             # zip stores local times: pin both the timestamp and the zone.
-            TZ=UTC touch -t 198001010000 "$pkg" "$pkg/mahina.exe"
+            TZ=UTC touch -t 198001010000 "$pkg" "$pkg/mahina.exe" "$pkg/LICENSE"
             (cd "$work/pkg" && TZ=UTC zip -X -q -r "$stage/mahina-$platform.zip" "mahina-$platform")
             ;;
         *)
-            cp "$work/build/$platform/bin/mahina" "$pkg/"
+            cp "$work/build/$platform/bin/mahina" "$root/LICENSE" "$pkg/"
             chmod 755 "$pkg/mahina"
             (cd "$work/pkg" && tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
                 --mode='u+rwX,go+rX,go-w' --format=gnu -cf - "mahina-$platform" |

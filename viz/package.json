@@ -2,6 +2,7 @@
   "name": "@aeolun/mahina-viz",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "packageManager": "pnpm@11.28.6",
   "description": "mahina trace inspector — a SolidJS app that reads .mahinatrace artifacts (Phase 7 v1).",

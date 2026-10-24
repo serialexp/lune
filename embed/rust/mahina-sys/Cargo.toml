@@ -5,6 +5,7 @@ edition = "2021"
 links = "mahina"
 build = "build.rs"
 description = "Raw FFI bindings to libmahina (the mahina VM C embedding API, doc 59)"
+license = "MIT"
 
 [lib]
 # The bindings mirror include/mahina.h by hand (no bindgen — the surface is

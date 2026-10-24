@@ -7,6 +7,7 @@
 #   <out>/
 #     LUNE_COMMIT          full sha of HEAD, "-dirty" if the tree wasn't clean
 #     ZIG_VERSION          the pinned toolchain the archives were built with
+#     LICENSE
 #     include/mahina.h
 #     rust/mahina/         the binding crates, as in embed/rust/
 #     rust/mahina-sys/
@@ -106,6 +107,7 @@ for entry in "${TARGETS[@]}"; do
 done
 
 cp "$root/include/mahina.h" "$stage/include/"
+cp "$root/LICENSE" "$stage/"
 # The crates' sources: tracked files plus untracked-but-not-ignored ones, so
 # a dirty bundle carries exactly the tree LUNE_COMMIT says it does.
 for crate in mahina mahina-sys; do
