@@ -117,6 +117,7 @@ pub fn compileToClosure(vm: *Vm, src_bytes: []const u8, chunk_name: []const u8, 
         // constants are rooted VM-lifetime via `loaded_chunks` in both root
         // walks, so the old H-2 "never JIT loaded code" gate is gone.)
         .vararg_root = true,
+        .chunk_name = chunk_name,
     }) catch {
         return loadError(vm, owned, chunk_name, &diags, out);
     };
@@ -125,8 +126,9 @@ pub fn compileToClosure(vm: *Vm, src_bytes: []const u8, chunk_name: []const u8, 
         return loadError(vm, owned, chunk_name, &diags, out);
     }
 
-    // Name the top-level proto after the chunk so a runtime fault in loaded code
-    // reports e.g. `(load):2:`, not the static chunk's `main:2:`. Dup into the
+    // Name the top-level proto after the chunk, which is how a snapshot and the
+    // visualiser name a loaded chunk (every proto's `chunk` already holds it, for
+    // error locations). Dup into the
     // chunk's own arena (VM-owned for the proto's lifetime); `chunk_name` may
     // borrow a GC-managed heap string, so we must not keep that borrow. Only the
     // top-level proto is renamed — nested protos keep their function names. An OOM

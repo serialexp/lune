@@ -466,7 +466,7 @@ test "leveled long comment is ignored between statements" {
 test "foundations: pcall catches a bare runtime fault (synthesized message)" {
     try expectProgram(
         "print(pcall(function() return nil + 1 end))\n",
-        "false\tanonymous:1: attempt to perform arithmetic on a nil value\n",
+        "false\tmain:1: attempt to perform arithmetic on a nil value\n",
     );
 }
 
@@ -484,7 +484,7 @@ test "a multret consumer that faults on a non-callable value consumes its produc
         \\print("after")
         \\
     ,
-        "false\tanonymous:3: attempt to call a nil value\nfalse\tanonymous:4: attempt to call a nil value\nafter\n",
+        "false\tmain:3: attempt to call a nil value\nfalse\tmain:4: attempt to call a nil value\nafter\n",
     );
 }
 
@@ -501,10 +501,10 @@ test "a call or index fault names the value as Lua 5.4 does" {
         \\print(pcall(function() t:method() end))
         \\
     ,
-        "false\tanonymous:2: attempt to call a nil value (global 'nope')\n" ++
-            "false\tanonymous:3: attempt to index a nil value (field 'a')\n" ++
-            "false\tanonymous:4: attempt to call a nil value (field 'missing')\n" ++
-            "false\tanonymous:5: attempt to call a nil value (method 'method')\n",
+        "false\tmain:2: attempt to call a nil value (global 'nope')\n" ++
+            "false\tmain:3: attempt to index a nil value (field 'a')\n" ++
+            "false\tmain:4: attempt to call a nil value (field 'missing')\n" ++
+            "false\tmain:5: attempt to call a nil value (method 'method')\n",
     );
     try expectProgram(
         \\local f
@@ -514,10 +514,10 @@ test "a call or index fault names the value as Lua 5.4 does" {
         \\print(pcall(function() return undefined.x end))
         \\
     ,
-        "false\tanonymous:2: attempt to call a nil value (field 'nope')\n" ++
-            "false\tanonymous:3: attempt to call a nil value\n" ++
-            "false\tanonymous:4: attempt to call a nil value\n" ++
-            "false\tanonymous:5: attempt to index a nil value (global 'undefined')\n",
+        "false\tmain:2: attempt to call a nil value (field 'nope')\n" ++
+            "false\tmain:3: attempt to call a nil value\n" ++
+            "false\tmain:4: attempt to call a nil value\n" ++
+            "false\tmain:5: attempt to index a nil value (global 'undefined')\n",
     );
 }
 
@@ -571,7 +571,7 @@ test "xpcall unwind closes the faulting frame's escaped upvalue (after handler)"
 test "errmsg: error(msg) renders located through the pcall path" {
     try expectProgram(
         "print(pcall(function() error(\"boom\") end))\n",
-        "false\tanonymous:1: boom\n",
+        "false\tmain:1: boom\n",
     );
 }
 
@@ -588,7 +588,7 @@ test "errmsg: error(msg, 2) points at the caller's caller" {
         \\print(pcall(function() f() end))
         \\
     ,
-        "false\tanonymous:2: deep\n",
+        "false\tmain:2: deep\n",
     );
 }
 
@@ -605,25 +605,25 @@ test "errmsg: a non-string error object passes through unprefixed and keeps its 
 test "errmsg: a converted native gives the detailed located bad-argument message" {
     try expectProgram(
         "print(pcall(function() return string.sub(nil, 1) end))\n",
-        "false\tanonymous:1: bad argument #1 to 'sub' (string expected, got nil)\n",
+        "false\tmain:1: bad argument #1 to 'sub' (string expected, got nil)\n",
     );
 }
 
 test "errmsg: a non-integral float arg reports the integer-representation reason" {
     try expectProgram(
         "print(pcall(function() return string.sub(\"abc\", 1.5) end))\n",
-        "false\tanonymous:1: bad argument #2 to 'sub' (number has no integer representation)\n",
+        "false\tmain:1: bad argument #2 to 'sub' (number has no integer representation)\n",
     );
 }
 
 test "errmsg: error() with invalid level type or non-integral float raises bad argument" {
     try expectProgram(
         "print(pcall(function() error(\"boom\", \"invalid\") end))\n",
-        "false\tanonymous:1: bad argument #2 to 'error' (number expected, got string)\n",
+        "false\tmain:1: bad argument #2 to 'error' (number expected, got string)\n",
     );
     try expectProgram(
         "print(pcall(function() error(\"boom\", 2.5) end))\n",
-        "false\tanonymous:1: bad argument #2 to 'error' (number has no integer representation)\n",
+        "false\tmain:1: bad argument #2 to 'error' (number has no integer representation)\n",
     );
 }
 
@@ -644,14 +644,14 @@ test "errmsg: select() with float arguments handles conversion and bounds checks
     );
     try expectProgram(
         "print(pcall(function() select(1e20, 'a') end))\n",
-        "false\tanonymous:1: bad argument #1 to 'select' (number has no integer representation)\n",
+        "false\tmain:1: bad argument #1 to 'select' (number has no integer representation)\n",
     );
 }
 
 test "errmsg: a math native names the function and the argument, located" {
     try expectProgram(
         "print(pcall(function() return math.floor(\"x\") end))\n",
-        "false\tanonymous:1: bad argument #1 to 'floor' (number expected, got string)\n",
+        "false\tmain:1: bad argument #1 to 'floor' (number expected, got string)\n",
     );
 }
 
@@ -909,7 +909,7 @@ test "load: a single-result call yields only the closure (primary projection)" {
 test "load: passing a non-string chunk raises a bad-argument error" {
     try expectProgram(
         "print(pcall(function() return load(42) end))\n",
-        "false\tanonymous:1: bad argument #1 to 'load' (string expected, got number)\n",
+        "false\tmain:1: bad argument #1 to 'load' (string expected, got number)\n",
     );
 }
 
@@ -1053,7 +1053,7 @@ test "metatable: a self-referential __index chain raises rather than hanging" {
         \\print(pcall(function() return loop.nope end))
         \\
     ,
-        "false\tanonymous:3: '__index' chain too long; possible loop\n",
+        "false\tmain:3: '__index' chain too long; possible loop\n",
     );
 }
 
@@ -1141,9 +1141,9 @@ test "doc 66 P2: the constant-key field forms match the register-key access" {
             "3\t7\t5\t1\n" ++
             "deep\ttrue\tdeep\n" ++
             "HELLO\txxx\n" ++
-            "false\tidx:25: attempt to index a nil value\n" ++
-            "false\tput:26: attempt to index a number value\n" ++
-            "false\tanonymous:29: attempt to index a nil value\n" ++
+            "false\tmain:25: attempt to index a nil value\n" ++
+            "false\tmain:26: attempt to index a number value\n" ++
+            "false\tmain:29: attempt to index a nil value\n" ++
             "1\t3\tX\tY\t3\n" ++
             "42\tnil\n",
     );
@@ -1410,7 +1410,7 @@ test "doc 66: an `and`/`or`/`not` test runs its links in order, each once" {
     ,
         "Fabcd Fab Fab Tabc Tabcd T<= F<= \n" ++
             "s\tp\tb\tb\tp\tz\n" ++
-            "false\tanonymous:18: attempt to compare number with string\n",
+            "false\tmain:18: attempt to compare number with string\n",
     );
 }
 
@@ -1477,7 +1477,7 @@ test "doc 66: a `repeat` test runs each link once, in order, with Lua's values" 
         \\
     ,
         "3\taabab\n3\tcdcdcd\n2\t0\t1\n3\n4\n3\n300\t300\n" ++
-            "false\tanonymous:25: attempt to compare number with string\n",
+            "false\tmain:25: attempt to compare number with string\n",
     );
 }
 
@@ -1705,9 +1705,9 @@ test "doc 66 P1: any other iterator is the call `itern` replaced" {
     ,
         "1a 2b a1 b22 1 2 3 1c 2c \n" ++
             "onlytable 2\n" ++
-            "anonymous:16: bad argument #1 to 'next' (table expected, got number)\n" ++
-            "anonymous:17: attempt to call a nil value\n" ++
-            "anonymous:18: attempt to call a number value\n" ++
+            "main:16: bad argument #1 to 'next' (table expected, got number)\n" ++
+            "main:17: attempt to call a nil value\n" ++
+            "main:18: attempt to call a number value\n" ++
             "true\n",
     );
 }
@@ -1755,8 +1755,8 @@ test "doc 66: `itern` steps `ipairs` exactly as its native does" {
         \\print(pcall(function() for i, v in f, "ab", 0 do end end))
         \\
     ,
-        "false\tanonymous:2: bad argument #1 to '@ipairs_iter' (table expected, got number)\n" ++
-            "false\tanonymous:3: bad argument #1 to '@ipairs_iter' (table expected, got string)\n",
+        "false\tmain:2: bad argument #1 to '@ipairs_iter' (table expected, got number)\n" ++
+            "false\tmain:3: bad argument #1 to '@ipairs_iter' (table expected, got string)\n",
     );
 }
 
@@ -1936,7 +1936,7 @@ test "numeric for: a trace recorded on one step sign never runs the other" {
         \\print(run(200.5, 1.5, -1.0), run(1.5, 3.5, 1.0), run(0.5, 2.5, 0 / 0), select(2, pcall(run, 2.5, 0.5, -0.0)))
         \\
     ,
-        "20100\t6\t20100\n20200\t7.5\t0\trun:3: 'for' step is zero\n",
+        "20100\t6\t20100\n20200\t7.5\t0\tmain:3: 'for' step is zero\n",
     );
 }
 
@@ -1980,7 +1980,7 @@ test "metatable: setmetatable rejects a non-table/non-nil metatable argument" {
         \\print(pcall(function() return setmetatable({}, 5) end))
         \\
     ,
-        "false\tanonymous:1: bad argument #2 to 'setmetatable' (nil or table expected, got number)\n",
+        "false\tmain:1: bad argument #2 to 'setmetatable' (nil or table expected, got number)\n",
     );
 }
 
@@ -2352,7 +2352,7 @@ test "metatable: a __call cycle is caught as a stack overflow, not a hang" {
         \\print(pcall(function() return loop() end))
         \\
     ,
-        "false\tanonymous:3: stack overflow\n",
+        "false\tmain:3: stack overflow\n",
     );
 }
 
@@ -2376,9 +2376,9 @@ test "metatable: arithmetic on a table without the metamethod still raises locat
         \\print(pcall(function() return -({}) end))
         \\
     ,
-        "false\tanonymous:1: attempt to perform arithmetic on a table value\n" ++
-            "false\tanonymous:2: attempt to concatenate a table value\n" ++
-            "false\tanonymous:3: attempt to perform arithmetic on a table value\n",
+        "false\tmain:1: attempt to perform arithmetic on a table value\n" ++
+            "false\tmain:2: attempt to concatenate a table value\n" ++
+            "false\tmain:3: attempt to perform arithmetic on a table value\n",
     );
 }
 
@@ -2392,9 +2392,9 @@ test "bitwise faults report integer-representation / bitwise-operation messages"
         \\print(pcall(function() return 1 << 2.0 end))
         \\print(pcall(function() return 1 | {} end))
     ,
-        "false\tanonymous:1: number has no integer representation\n" ++
-            "false\tanonymous:2: number has no integer representation\n" ++
-            "false\tanonymous:3: attempt to perform bitwise operation on a table value\n",
+        "false\tmain:1: number has no integer representation\n" ++
+            "false\tmain:2: number has no integer representation\n" ++
+            "false\tmain:3: attempt to perform bitwise operation on a table value\n",
     );
 }
 
@@ -2403,7 +2403,7 @@ test "metatable: calling a table with no __call raises a located TypeError" {
         \\print(pcall(function() local t = {}; return t() end))
         \\
     ,
-        "false\tanonymous:1: attempt to call a table value\n",
+        "false\tmain:1: attempt to call a table value\n",
     );
 }
 
@@ -2415,7 +2415,7 @@ test "metatable: __tostring returning a non-string, non-number is rejected" {
         \\print(pcall(function() return tostring(bad) end))
         \\
     ,
-        "true\t42\nfalse\tanonymous:4: '__tostring' must return a string\n",
+        "true\t42\nfalse\tmain:4: '__tostring' must return a string\n",
     );
 }
 
@@ -2452,7 +2452,7 @@ test "_G: globals and _G are the same table in both directions" {
 test "xpcall: message handler transforms the error value" {
     try expectProgram(
         "print(xpcall(function() error(\"boom\") end, function(e) return \"H:\" .. e end))\n",
-        "false\tH:anonymous:1: boom\n",
+        "false\tH:main:1: boom\n",
     );
 }
 
@@ -2466,7 +2466,7 @@ test "xpcall: a handler that itself errors yields the fixed message" {
 test "xpcall: pcall behaviour is unchanged (false + located value)" {
     try expectProgram(
         "print(pcall(function() error(\"boom\") end))\n",
-        "false\tanonymous:1: boom\n",
+        "false\tmain:1: boom\n",
     );
 }
 
@@ -2549,7 +2549,7 @@ test "metatable: hot loop accumulating through __add is deterministic across mod
 test "errmsg: a converted table native reports the located bad-argument message" {
     try expectProgram(
         "print(pcall(function() return table.insert(nil, 1) end))\n",
-        "false\tanonymous:1: bad argument #1 to 'insert' (table expected, got nil)\n",
+        "false\tmain:1: bad argument #1 to 'insert' (table expected, got nil)\n",
     );
 }
 
@@ -2566,7 +2566,7 @@ test "foundations: error raises an arbitrary value caught by pcall" {
 test "foundations: recursive pcall — inner result flows out of the outer" {
     try expectProgram(
         "print(pcall(function() return pcall(function() error(\"x\") end) end))\n",
-        "true\tfalse\tanonymous:1: x\n",
+        "true\tfalse\tmain:1: x\n",
     );
 }
 
@@ -2595,7 +2595,7 @@ test "foundations: table.sort with a custom comparator (descending)" {
 test "foundations: a sort comparator that errors propagates to an enclosing pcall" {
     try expectProgram(
         "print(pcall(function() table.sort({1, 2}, function() error(\"cmp\") end) end))\n",
-        "false\tanonymous:1: cmp\n",
+        "false\tmain:1: cmp\n",
     );
 }
 
@@ -2623,7 +2623,7 @@ test "foundations: assert passes its arguments through when truthy" {
 test "foundations: assert raises its message when falsy, caught by pcall" {
     try expectProgram(
         "print(pcall(function() assert(false, \"boom\") end))\n",
-        "false\tanonymous:1: boom\n",
+        "false\tmain:1: boom\n",
     );
 }
 
@@ -2633,7 +2633,7 @@ test "foundations: xpcall runs the message handler on the error value" {
         \\print(ok, r)
         \\
     ,
-        "false\thandled:anonymous:1: orig\n",
+        "false\thandled:main:1: orig\n",
     );
 }
 
@@ -2666,7 +2666,7 @@ test "strings: table.sort orders a string list with the default comparator" {
 test "strings: comparing a string with a number is a catchable type error" {
     try expectProgram(
         "print(pcall(function() return \"a\" < 1 end))\n",
-        "false\tanonymous:1: attempt to compare string with number\n",
+        "false\tmain:1: attempt to compare string with number\n",
     );
 }
 
@@ -2682,9 +2682,9 @@ test "for: a zero step raises before the loop runs, as Lua 5.4 does" {
         \\print(n)
         \\
     ,
-        "false\tanonymous:2: 'for' step is zero\n" ++
-            "false\tanonymous:3: 'for' step is zero\n" ++
-            "false\tanonymous:4: 'for' step is zero\n" ++
+        "false\tmain:2: 'for' step is zero\n" ++
+            "false\tmain:3: 'for' step is zero\n" ++
+            "false\tmain:4: 'for' step is zero\n" ++
             "0\n",
     );
 }
@@ -2703,7 +2703,7 @@ test "for: a hot loop whose inner step turns zero raises on that run" {
         \\print(ok, e, s)
         \\
     ,
-        "false\tanonymous:5: 'for' step is zero\t174\n",
+        "false\tmain:5: 'for' step is zero\t174\n",
     );
 }
 
@@ -2714,9 +2714,9 @@ test "for: a non-number control value names which one, as Lua 5.4 does" {
         \\print(pcall(function() for i = 1, 2, nil do end end))
         \\
     ,
-        "false\tanonymous:1: 'for' initial value must be a number\n" ++
-            "false\tanonymous:2: 'for' limit must be a number\n" ++
-            "false\tanonymous:3: 'for' step must be a number\n",
+        "false\tmain:1: 'for' initial value must be a number\n" ++
+            "false\tmain:2: 'for' limit must be a number\n" ++
+            "false\tmain:3: 'for' step must be a number\n",
     );
 }
 
@@ -2890,9 +2890,9 @@ test "doc 61 P2: an error inside a native with a raised span unwinds to the prot
         \\
     ,
         // `print` streams: "T1\t" is out before argument 2's `__tostring` raises.
-        "T1\tfalse\tanonymous:2: bad 2\n" ++
-            "T1\tfalse\tanonymous:2: bad 2\n" ++
-            "T1\tfalse\tanonymous:2: bad 2\n",
+        "T1\tfalse\tmain:2: bad 2\n" ++
+            "T1\tfalse\tmain:2: bad 2\n" ++
+            "T1\tfalse\tmain:2: bad 2\n",
     );
 }
 
@@ -2958,9 +2958,9 @@ test "doc 61 P3: an error inside a parked native call unwinds to the protected b
         \\end
         \\
     ,
-        "false\tanonymous:7: stop\n" ++
-            "false\tanonymous:7: stop\n" ++
-            "false\tanonymous:7: stop\n",
+        "false\tmain:7: stop\n" ++
+            "false\tmain:7: stop\n" ++
+            "false\tmain:7: stop\n",
     );
 }
 
@@ -3316,7 +3316,7 @@ test "doc 66: `A and B or C` runs each operand once, in order, with Lua's values
         \\
     ,
         "2 2 2 1 1\n3\t4\tnil\t2\tfalse\n7\tabc\n8\tac\n2\tab\nin\ty\ttrue\nnlt\tne\n" ++
-            "false\tanonymous:17: attempt to compare number with string\ntrue\ttrue\t3\t5\n");
+            "false\tmain:17: attempt to compare number with string\ntrue\ttrue\t3\t5\n");
 }
 
 test "doc 61 Phase 0: a backtrace names an in-flight parent's own instruction line" {
@@ -3333,11 +3333,11 @@ test "doc 61 Phase 0: a backtrace names an in-flight parent's own instruction li
         \\  return s
         \\end
         \\local ok, tb = xpcall(f, debug.traceback, setmetatable({}, mt), 1)
-        \\print(string.find(tb, "f:3:", 1, true) ~= nil, string.find(tb, "f:4:", 1, true) ~= nil)
+        \\print(string.find(tb, "main:3: in function 'f'", 1, true) ~= nil, string.find(tb, "main:4: in function 'f'", 1, true) ~= nil)
         \\local ok2, msg = pcall(f, setmetatable({}, mt), 2)
         \\print(msg)
         \\
-    , "true\tfalse\nf:3: boom\n");
+    , "true\tfalse\nmain:3: boom\n");
 }
 
 /// Doc 61 Phase 1 probe. `regs()` collects, then reports every frame's
@@ -3747,7 +3747,7 @@ test "doc 68 §5: a collection inside a protected body keeps the call's own slot
         \\print(xpcall(function() error('o') end, function() return g() end))
         \\
     ,
-        "true\tH:x\ntrue\tH:x\ntrue\nfalse\th:anonymous:7: o\nfalse\ttrue\tH:x\n",
+        "true\tH:x\ntrue\tH:x\ntrue\nfalse\th:main:7: o\nfalse\ttrue\tH:x\n",
     );
 }
 
@@ -3769,7 +3769,7 @@ test "a numeric for steps every limit, step and index shape" {
         \\print(pcall(function() for i = 1, "x" do end end))
         \\
     ,
-        "26.5\tfloat\nfalse\tanonymous:11: 'for' limit must be a number\n",
+        "26.5\tfloat\nfalse\tmain:11: 'for' limit must be a number\n",
     );
 }
 
@@ -3791,7 +3791,7 @@ test "arithmetic, unary and length fall back to their metamethods" {
         \\print(pcall(function() return {} + 1 end))
         \\
     ,
-        "add\tsub\tmul\tdiv\tband\tshl\tunm\tbnot\tlen\nfalse\tanonymous:7: attempt to perform arithmetic on a string value\n3\t3\n2\t-6\t-2.5\t1.5\nfalse\tanonymous:12: attempt to perform arithmetic on a table value\n",
+        "add\tsub\tmul\tdiv\tband\tshl\tunm\tbnot\tlen\nfalse\tmain:7: attempt to perform arithmetic on a string value\n3\t3\n2\t-6\t-2.5\t1.5\nfalse\tmain:12: attempt to perform arithmetic on a table value\n",
     );
 }
 

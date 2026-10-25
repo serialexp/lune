@@ -590,6 +590,7 @@ fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source:
     // doesn't flag `print`/`clock`).
     var chunk = mahina.compiler.compileWithOptions(gpa, vm.heap, source, tree.root, &diags, .{
         .known_globals = &mahina.interp.builtin_global_names,
+        .chunk_name = name,
     }) catch |err| {
         reportDiagnostics(name, &diags);
         mahina.io.eprint("mahina: error: compile failed: {s}\n", .{@errorName(err)});
@@ -634,19 +635,19 @@ fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source:
             // The suffix names the chunk the faulting instruction is in: the
             // script for its own code, the loaded file's path for a fault inside
             // a `require`d / `dofile`d / `load`ed chunk.
-            const fault_chunk = if (vm.loadedChunkIndexOf(fault.proto_id)) |i|
-                vm.loaded_chunks.items[i].chunk.proto.name
-            else
-                name;
             if (fault.self_located)
                 mahina.io.eprint("mahina: runtime error: {s}\n", .{fault.message})
             else
-                mahina.io.eprint("mahina: runtime error: {s} at {s}:{d}\n", .{ fault.message, fault_chunk, fault.line });
+                mahina.io.eprint("mahina: runtime error: {s} at {s}:{d}\n", .{ fault.message, fault.chunk, fault.line });
             // A traceback only adds signal when control crossed a call boundary.
+            // Rows read as Lua's: `chunk:line: in function 'f'`.
             if (fault.frames.len > 1) {
                 mahina.io.eprint("stack traceback:\n", .{});
                 for (fault.frames) |f| {
-                    mahina.io.eprint("    {s}:{d}\n", .{ f.name, f.line });
+                    if (f.main_chunk)
+                        mahina.io.eprint("    {s}:{d}: in main chunk\n", .{ f.chunk, f.line })
+                    else
+                        mahina.io.eprint("    {s}:{d}: in function '{s}'\n", .{ f.chunk, f.line, f.name });
                 }
             }
         } else |_| {

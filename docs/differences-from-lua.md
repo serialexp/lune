@@ -194,10 +194,6 @@ name where Lua would say `(local 'f')` or `(upvalue 'f')`.
 
 Other differences:
 
-- **Not yet supported:** the position prefix names the function, not the
-  file: `f:2: oops` where Lua says `script.lua:2: oops` (the main chunk is
-  `main`, an anonymous function `anonymous`). A required file's top level
-  does get its path.
 - `load`'s chunk name is used as given (`=name` keeps its `=`), and the
   default is `(load)`, not `[string "..."]`.
 - Some wording differs: arithmetic on a string says "attempt to perform

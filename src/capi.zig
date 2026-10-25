@@ -430,7 +430,7 @@ fn guestFault(box: *VmBox, entry_depth: u32, entry_top: usize, err: interp.Error
     return .err_runtime;
 }
 
-/// Render a runtime fault into `last_error`, Lua-style (`name:line: msg`)
+/// Render a runtime fault into `last_error`, Lua-style (`chunk:line: msg`)
 /// when a location is known. Reads the still-live faulting frames; a failure
 /// to allocate the pretty message degrades to the bare error name.
 fn renderFault(box: *VmBox, err: interp.Error) void {
@@ -442,7 +442,7 @@ fn renderFault(box: *VmBox, err: interp.Error) void {
         return;
     };
     if (!fault.self_located and fault.line > 0 and fault.frames.len > 0) {
-        setLastErrorFmt(box, "{s}:{d}: {s}", .{ fault.frames[0].name, fault.line, fault.message });
+        setLastErrorFmt(box, "{s}:{d}: {s}", .{ fault.chunk, fault.line, fault.message });
     } else {
         setLastError(box, fault.message);
     }
@@ -683,6 +683,7 @@ fn compileImage(box: *VmBox, src: []const u8, name: []const u8) error{ Compile, 
         .id_base = vm.next_proto_id,
         // Embedder chunks are vararg like `load()`ed ones (top-level `...`).
         .vararg_root = true,
+        .chunk_name = name,
     }) catch {
         setErrorFromDiags(box, &diags);
         vm.gpa.free(owned);
@@ -695,7 +696,7 @@ fn compileImage(box: *VmBox, src: []const u8, name: []const u8) error{ Compile, 
         return error.Compile;
     }
 
-    // Name the top-level proto so faults report `name:line:`. Arena-owned,
+    // Name the top-level proto after the chunk, as `load()` does. Arena-owned,
     // same as `load()`.
     chunk.proto.name = chunk.arena.allocator().dupe(u8, name) catch {
         chunk.deinit();

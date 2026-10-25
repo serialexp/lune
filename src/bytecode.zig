@@ -1199,6 +1199,14 @@ pub const Proto = struct {
     dom: DomTree = .{},
     /// Debug name for disassembly / diagnostics (not semantically meaningful).
     name: []const u8 = "?",
+    /// The chunk this proto was compiled in (the script path, a `load`
+    /// chunkname, an embedder's chunk name): the `chunk` of a runtime error's
+    /// `chunk:line:`, as Lua's `short_src`. Every proto of one compile shares
+    /// it (`compiler.Options.chunk_name`).
+    chunk: []const u8 = "?",
+    /// True for a chunk's top-level proto (Lua's `what == "main"`): a
+    /// traceback calls its frame "main chunk".
+    main_chunk: bool = false,
     /// Stable, unique id assigned at compile time (pre-order over the proto
     /// tree, root = 0). This — not the in-memory `*const Proto` address — is how
     /// a serialized trace names its anchor (`src/traceser.zig`): a pointer is

@@ -86,10 +86,10 @@ class MahinaWorkerClient {
     return this.#call<MahinaDiagnostic[]>({ method: "check", src });
   }
 
-  replay(src: string, effects: Uint8Array, stopAfter: number): Promise<MahinaReplayResult> {
+  replay(src: string, effects: Uint8Array, stopAfter: number, argv: string[] = []): Promise<MahinaReplayResult> {
     // The effects blob is owned by the store (frozen for the whole replay
     // session), so DON'T transfer it — the worker gets a structured-clone copy.
-    return this.#call<MahinaReplayResult>({ method: "replay", src, effects, stopAfter });
+    return this.#call<MahinaReplayResult>({ method: "replay", src, effects, stopAfter, argv });
   }
 
   /** Stop whatever the worker is doing (a runaway `while true do end`): the VM

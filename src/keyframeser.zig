@@ -639,6 +639,7 @@ fn recompileLoadedChunks(vm: *Vm, root: *const Proto, loaded: []const schema.Loa
             .known_globals = &interp.builtin_global_names,
             .id_base = vm.next_proto_id,
             .vararg_root = true,
+            .chunk_name = lc.name,
         }) catch {
             vm.gpa.free(owned);
             return error.LoadedChunkRecompileFailed;

@@ -149,9 +149,9 @@ test "fast functions: argument and result counts around the fast path" {
             "7.5\t2\t2\n" ++
             "function\tnil\t2\t6\t5\n" ++
             "false\ttrue\t5\tnil\n" ++
-            "false\tanonymous:10: bad argument #1 to 'floor' (number expected, got string)\n" ++
+            "false\tmain:10: bad argument #1 to 'floor' (number expected, got string)\n" ++
             "true\tinf\n" ++
-            "false\tanonymous:12: bad argument #1 to 'rawlen' (table or string expected, got number)\n" ++
+            "false\tmain:12: bad argument #1 to 'rawlen' (table or string expected, got number)\n" ++
             "b\t0\n",
     );
 }
@@ -163,6 +163,6 @@ test "fast functions: math.type names the subtype, and its error shape falls bac
         \\
     ,
         "integer\tfloat\tnil\tnil\n" ++
-            "false\tanonymous:2: bad argument #1 to 'type' (value expected)\n",
+            "false\tmain:2: bad argument #1 to 'type' (value expected)\n",
     );
 }

@@ -44,9 +44,9 @@ inline fn vmOf(ctx: *anyopaque) *Vm {
 ///     (leaf) frame — `level == 1` is the function that called `traceback`. A
 ///     non-integer-representable float `level` is a bad argument, never a trap.
 ///
-/// Each line follows mahina's existing `chunk:line:` error convention, using a
-/// frame's `proto.name` as its chunk: `<name>:<line>: in main chunk` for the top
-/// chunk (`proto.name == "main"`), else `<name>:<line>: in function '<name>'`.
+/// Each line follows Lua's `chunk:line:` convention: `<chunk>:<line>: in main
+/// chunk` for a chunk's top level (`Proto.main_chunk`), else
+/// `<chunk>:<line>: in function '<name>'`.
 fn nTraceback(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
 
@@ -93,10 +93,10 @@ fn nTraceback(ctx: *anyopaque, args: []const Value) anyerror!Value {
         var nbuf: [16]u8 = undefined;
         const line_digits = std.fmt.bufPrint(&nbuf, "{d}", .{fr.line}) catch unreachable;
         try buf.appendSlice(vm.gpa, "\n\t");
-        try buf.appendSlice(vm.gpa, fr.name);
+        try buf.appendSlice(vm.gpa, fr.chunk);
         try buf.append(vm.gpa, ':');
         try buf.appendSlice(vm.gpa, line_digits);
-        if (std.mem.eql(u8, fr.name, "main")) {
+        if (fr.main_chunk) {
             try buf.appendSlice(vm.gpa, ": in main chunk");
         } else {
             try buf.appendSlice(vm.gpa, ": in function '");

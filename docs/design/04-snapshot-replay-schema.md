@@ -251,7 +251,8 @@ schema follows; this is that schema's home.
       (`safepoint_lines[k-1]` = the source line of the instruction pending at
       safepoint *k*), recorded only under a gated `Vm.record_safepoint_lines`
       flag so tier-0 pays nothing by default. To show step *k*, the wasm export
-      `mahina_replay(src, effects, k)` re-compiles, sets `effect_mode = .replay`
+      `mahina_replay(src, effects, argv, k)` re-compiles (with the run's argv,
+      which fills `arg` and names the chunk), sets `effect_mode = .replay`
       with the decoded effect blob, runs a **pure tier-0** pass (trace disabled,
       so each loop iteration is its own safepoint) with
       `suspend_ctl.after_safepoints = k`, and on suspend returns the keyframe

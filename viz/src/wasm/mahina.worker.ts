@@ -18,7 +18,7 @@ type Req =
   | { id: number; method: "init"; url: string }
   | { id: number; method: "run"; src: string; argv: string[]; files: SourceFile[] }
   | { id: number; method: "check"; src: string }
-  | { id: number; method: "replay"; src: string; effects: Uint8Array; stopAfter: number };
+  | { id: number; method: "replay"; src: string; effects: Uint8Array; stopAfter: number; argv: string[] };
 
 type Res =
   | { id: number; ok: true; result: unknown }
@@ -77,7 +77,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         return;
       }
       case "replay": {
-        const result = mod.replay(req.src, req.effects, req.stopAfter);
+        const result = mod.replay(req.src, req.effects, req.stopAfter, req.argv);
         post({ id: req.id, ok: true, result }, replayTransferables(result));
         return;
       }

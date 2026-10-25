@@ -80,6 +80,10 @@ pub const Options = struct {
     /// The runtime `load` path sets this true to match Lua, where a loaded chunk
     /// is vararg and `load("return ...")(1, 2)` yields its arguments.
     vararg_root: bool = false,
+    /// The chunk's name, stamped on every proto as `Proto.chunk`: what a
+    /// runtime error's `chunk:line:` names. The CLI passes the script path,
+    /// `load` its chunkname. Copied, so it may borrow a transient string.
+    chunk_name: []const u8 = "main",
 };
 
 /// Compile a parsed chunk. String literals/names are interned into `heap`.
@@ -147,6 +151,7 @@ pub fn compileWithOptions(
         .protos = c.protos.items,
         .global_slot_hints = try zeroedHints(c.arena, c.constants.items.len),
         .name = "main",
+        .main_chunk = true,
         .is_vararg = c.is_vararg,
         // Doc 56 §4.2: per-pc register liveness, from the finished code.
         .reg_live = try bc_liveness.compute(c.arena, c.scratch, c.code.items, c.max_reg, c.protos.items),
@@ -165,7 +170,7 @@ pub fn compileWithOptions(
     // within-a-compile matter. (Source lines need no pass: every span already
     // carries its line in this chunk.)
     var next_id: u32 = opts.id_base;
-    assignProtoIds(proto, &next_id);
+    assignProtoIds(proto, &next_id, try c.arena.dupe(u8, opts.chunk_name));
 
     // Moving `arena` is safe: code/constants/proto live in arena *heap* buffers,
     // not in the struct, so the pointers stay valid; only the `c.arena` handle
@@ -221,10 +226,11 @@ const LineTable = struct {
 /// children were created as mutable `*Proto` in the compile arena (see
 /// `compileFunction`); the `[]const *const Proto` field type is only a
 /// downstream immutability contract, not the original allocation's constness.
-fn assignProtoIds(proto: *Proto, next: *u32) void {
+fn assignProtoIds(proto: *Proto, next: *u32, chunk: []const u8) void {
     proto.id = next.*;
+    proto.chunk = chunk;
     next.* += 1;
-    for (proto.protos) |child| assignProtoIds(@constCast(child), next);
+    for (proto.protos) |child| assignProtoIds(@constCast(child), next, chunk);
 }
 
 /// One `get_global` site recorded during compilation, for the unknown-global

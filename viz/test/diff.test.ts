@@ -29,12 +29,14 @@ beforeAll(async () => {
 function runNative(source: string): RunArtifacts {
   const dir = mkdtempSync(join(tmpdir(), "mahina-difftest-"));
   try {
-    const src = join(dir, "p.mahina");
     const kf = join(dir, "k");
     const ef = join(dir, "e");
     const tr = join(dir, "t");
-    writeFileSync(src, source);
-    const r = Bun.spawnSync([nativePath, "--system", "clock,random", "--emit-traces", tr, "--emit-keyframe", kf, "--emit-effects", ef, src]);
+    writeFileSync(join(dir, "p.mahina"), source);
+    // From inside the program's directory, by its relative name, as the viz
+    // server runs it: the name is the chunk's in error messages, which the
+    // wasm run gets as its `argv[0]` (`runWasm`).
+    const r = Bun.spawnSync([nativePath, "--system", "clock,random", "--emit-traces", tr, "--emit-keyframe", kf, "--emit-effects", ef, "p.mahina"], { cwd: dir });
     const read = (p: string): Uint8Array => {
       try {
         return new Uint8Array(readFileSync(p));
@@ -56,7 +58,7 @@ function runNative(source: string): RunArtifacts {
 }
 
 function runWasm(source: string): RunArtifacts {
-  const r = mod.runSource(source);
+  const r = mod.runSource(source, ["p.mahina"]);
   return { status: r.status, stdout: r.stdout, diagnostics: r.diagnostics, keyframe: r.keyframe, effects: r.effects, trace: r.trace };
 }
 

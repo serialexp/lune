@@ -166,16 +166,16 @@ test "os: date tables and formats are checked as Lua checks them" {
         \\print(pcall(function() return os.date("*t", 1.5) end))
         \\print(pcall(function() return os.date("!%c", 2^60) end))
         \\print(os.time({year=2000, month=1, day=1, hour=0.0}))
-    , "false\tanonymous:1: field 'year' missing in date table\n" ++
-        "false\tanonymous:2: field 'day' is not an integer\n" ++
-        "false\tanonymous:3: field 'day' is out-of-bound\n" ++
-        "false\tanonymous:4: field 'month' is not an integer\n" ++
-        "false\tanonymous:5: time result cannot be represented in this installation\n" ++
-        "false\tanonymous:6: bad argument #1 to 'time' (table expected, got number)\n" ++
-        "false\tanonymous:7: bad argument #1 to 'date' (invalid conversion specifier '%Q')\n" ++
-        "false\tanonymous:8: bad argument #1 to 'date' (invalid conversion specifier '%E')\n" ++
-        "false\tanonymous:9: bad argument #2 to 'date' (number has no integer representation)\n" ++
-        "false\tanonymous:10: date result cannot be represented in this installation\n" ++
+    , "false\tmain:1: field 'year' missing in date table\n" ++
+        "false\tmain:2: field 'day' is not an integer\n" ++
+        "false\tmain:3: field 'day' is out-of-bound\n" ++
+        "false\tmain:4: field 'month' is not an integer\n" ++
+        "false\tmain:5: time result cannot be represented in this installation\n" ++
+        "false\tmain:6: bad argument #1 to 'time' (table expected, got number)\n" ++
+        "false\tmain:7: bad argument #1 to 'date' (invalid conversion specifier '%Q')\n" ++
+        "false\tmain:8: bad argument #1 to 'date' (invalid conversion specifier '%E')\n" ++
+        "false\tmain:9: bad argument #2 to 'date' (number has no integer representation)\n" ++
+        "false\tmain:10: date result cannot be represented in this installation\n" ++
         "946684800\n");
 }
 
@@ -292,18 +292,18 @@ test "os: calling a member of a group that is off says which interface it needs"
     defer r.deinit(testing.allocator);
     const tail = ", which this VM does not have)\n";
     try testing.expectEqualStrings(
-        "false\tanonymous:1: attempt to call a nil value (field 'open'; io.open needs the 'files' system interface" ++ tail ++
-            "false\tanonymous:2: attempt to call a nil value (field 'date'; os.date needs the 'time' system interface" ++ tail ++
-            "false\tanonymous:3: attempt to index a nil value (field 'stdin'; io.stdin needs the 'stdio' system interface" ++ tail ++
-            "false\tanonymous:4: attempt to call a nil value (field 'read'; io.read needs the 'files' or 'stdio' system interface" ++ tail ++
-            "false\tanonymous:5: attempt to call a nil value (field 'exit'; os.exit needs the 'env' system interface" ++ tail ++
-            "false\tanonymous:6: attempt to call a nil value (field 'nope')\n",
+        "false\tmain:1: attempt to call a nil value (field 'open'; io.open needs the 'files' system interface" ++ tail ++
+            "false\tmain:2: attempt to call a nil value (field 'date'; os.date needs the 'time' system interface" ++ tail ++
+            "false\tmain:3: attempt to index a nil value (field 'stdin'; io.stdin needs the 'stdio' system interface" ++ tail ++
+            "false\tmain:4: attempt to call a nil value (field 'read'; io.read needs the 'files' or 'stdio' system interface" ++ tail ++
+            "false\tmain:5: attempt to call a nil value (field 'exit'; os.exit needs the 'env' system interface" ++ tail ++
+            "false\tmain:6: attempt to call a nil value (field 'nope')\n",
         r.out,
     );
     // With the group on, a member the program removed is just missing.
     const removed = try run(testing.allocator, .{}, "io.open = nil print(pcall(function() io.open('x') end))");
     defer removed.deinit(testing.allocator);
-    try testing.expectEqualStrings("false\tanonymous:1: attempt to call a nil value (field 'open')\n", removed.out);
+    try testing.expectEqualStrings("false\tmain:1: attempt to call a nil value (field 'open')\n", removed.out);
 }
 
 test "os: the interface hint is the same from a hot loop in every trace mode" {
@@ -317,7 +317,7 @@ test "os: the interface hint is the same from a hot loop in every trace mode" {
         var sink = io.Writer.fixed(&buf);
         try util.runCapturedTuned(testing.allocator, source, &sink, false, mode, .{});
         try testing.expectEqualStrings(
-            "false\tf:1: attempt to call a nil value (field 'time'; os.time needs the 'time' system interface, which this VM does not have)\n",
+            "false\tmain:1: attempt to call a nil value (field 'time'; os.time needs the 'time' system interface, which this VM does not have)\n",
             sink.buffered(),
         );
     }

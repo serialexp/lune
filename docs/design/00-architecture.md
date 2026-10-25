@@ -344,7 +344,7 @@ _(nothing yet — design only)_
       VM-execute-only). (2) A user-facing step debugger built on a **stateless
       "replay to k"** model: the initial run records the effect log once and
       reports a total safepoint count plus a per-safepoint source-line index; to
-      show the program at step *k* the viz calls `mahina_replay(src, effects, k)`,
+      show the program at step *k* the viz calls `mahina_replay(src, effects, argv, k)`,
       which re-compiles, replays the recorded effects with
       `suspend_ctl.after_safepoints = k` (a separate *pure tier-0* pass so every
       loop iteration is its own step), and snapshots the keyframe + stdout-so-far

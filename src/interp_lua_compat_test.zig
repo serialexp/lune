@@ -166,7 +166,7 @@ test "assert raises its message with the caller's position" {
         \\print(pcall(function() assert(false, "boom") end))
         \\print(pcall(function() assert(nil) end))
         \\print(pcall(function() assert(false, 42) end))
-    , "false\tanonymous:1: boom\nfalse\tanonymous:2: assertion failed!\nfalse\t42\n");
+    , "false\tmain:1: boom\nfalse\tmain:2: assertion failed!\nfalse\t42\n");
 }
 
 

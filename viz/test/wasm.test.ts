@@ -465,16 +465,24 @@ test("multi-file: a required file that isn't there is an error, not a host read"
 test("multi-file: replay re-reads the required file from the recorded effects", () => {
   const run = mod.runSource(MULTI_MAIN, ["main.mah"], MULTI_FILES);
   // No files are passed to replay: the reads come back out of the effect log.
-  const whole = mod.replay(MULTI_MAIN, run.effects, run.safepointCount + 1);
+  const whole = mod.replay(MULTI_MAIN, run.effects, run.safepointCount + 1, ["main.mah"]);
   expect(whole.stdout).toBe("45157\n");
   // A stoppable step inside the module (in `M.sum`, which main calls)
   // reports a proto of the module.
   const k = Array.from(run.safepointProtos).findIndex((id, i) => chunkOf(run, id) === 1 && run.safepointStoppable[i] === 1);
   expect(k).toBeGreaterThanOrEqual(0);
-  const step = mod.replay(MULTI_MAIN, run.effects, k + 1);
+  const step = mod.replay(MULTI_MAIN, run.effects, k + 1, ["main.mah"]);
   expect(step.stoppedAt).toBe(k + 1);
   expect(chunkOf(run, step.protoId)).toBe(1);
   expect(step.currentLine).toBe(run.safepointLines[k]);
+});
+
+test("errors name the entry's chunk, and a replay given the run's argv names it the same", () => {
+  const src = "print(pcall(function() return nil + 1 end))\nprint(arg[0], arg[1])\n";
+  const run = mod.runSource(src, ["main.mah", "x"]);
+  expect(run.stdout).toBe("false\tmain.mah:1: attempt to perform arithmetic on a nil value\nmain.mah\tx\n");
+  const whole = mod.replay(src, run.effects, run.safepointCount + 1, ["main.mah", "x"]);
+  expect(whole.stdout).toBe(run.stdout);
 });
 
 // Doc 68 §8 (defer): the module's top level runs inside `require`, which
@@ -487,7 +495,7 @@ test("multi-file: a stop inside require's run of the module is deferred to the n
   expect(k).toBeGreaterThanOrEqual(0);
   const next = stoppable.findIndex((f, i) => i > k && f === 1);
   expect(next).toBeGreaterThan(k);
-  const step = mod.replay(MULTI_MAIN, run.effects, k + 1);
+  const step = mod.replay(MULTI_MAIN, run.effects, k + 1, ["main.mah"]);
   expect(step.status).toBe(0);
   expect(step.finished).toBe(false);
   expect(step.stoppedAt).toBe(next + 1);

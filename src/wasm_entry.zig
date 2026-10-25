@@ -409,7 +409,7 @@ export fn mahina_free_check_result(res: ?*CheckResult) void {
 ///
 /// Returns 0 only on a catastrophic allocation failure before a ReplayResult
 /// exists. The source/effect bytes are read but not freed (JS still owns them).
-export fn mahina_replay(src_ptr: u32, src_len: u32, eff_ptr: u32, eff_len: u32, stop_after: u32) ?*ReplayResult {
+export fn mahina_replay(src_ptr: u32, src_len: u32, eff_ptr: u32, eff_len: u32, args_ptr: u32, args_len: u32, stop_after: u32) ?*ReplayResult {
     const res = gpa.create(ReplayResult) catch return null;
     res.* = .{};
 
@@ -423,8 +423,15 @@ export fn mahina_replay(src_ptr: u32, src_len: u32, eff_ptr: u32, eff_len: u32, 
         const p: [*]const u8 = @ptrFromInt(@as(usize, eff_ptr));
         break :blk p[0..@as(usize, eff_len)];
     };
+    // The recorded run's argv blob (see `mahina_run`): `arg` and the chunk
+    // name must be what that run saw.
+    const args_blob: []const u8 = blk: {
+        if (args_len == 0) break :blk &[_]u8{};
+        const p: [*]const u8 = @ptrFromInt(@as(usize, args_ptr));
+        break :blk p[0..@as(usize, args_len)];
+    };
 
-    replayRun(res, src, eff, stop_after) catch |err| {
+    replayRun(res, src, eff, args_blob, stop_after) catch |err| {
         res.status = 1;
         if (res.diag.len == 0) {
             if (gpa.dupe(u8, @errorName(err))) |name| {
@@ -445,7 +452,7 @@ export fn mahina_free_replay_result(res: ?*ReplayResult) void {
     gpa.destroy(r);
 }
 
-fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop_after: u32) !void {
+fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, args_blob: []const u8, stop_after: u32) !void {
     const src0 = try gpa.allocSentinel(u8, source.len, 0);
     defer gpa.free(src0);
     @memcpy(src0, source);
@@ -486,8 +493,11 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
     // instruction is one safepoint — matching `Result.safepoint_count`.
     vm.setSuspendCtl(.{ .after_safepoints = @min(@as(u64, stop_after), safepoint_cap) });
 
+    const argv = try parseArgv(args_blob);
+    defer gpa.free(argv);
     var chunk = mahina.compiler.compileWithOptions(gpa, vm.heap, src0, tree.root, &diags, .{
         .known_globals = &mahina.interp.builtin_global_names,
+        .chunk_name = chunkName(argv),
     }) catch {
         res.status = 1;
         res.diag = bufFromSlice(try renderDiagnostics(&diags));
@@ -499,6 +509,8 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
         res.diag = bufFromSlice(try renderDiagnostics(&diags));
         return;
     }
+    // As the recorded run did, after its compile.
+    if (argv.len > 0) try vm.populateArgs(argv);
 
     const outcome = vm.start(chunk.proto) catch |err| {
         // A runtime fault during replay: surface it the same way the live run does
@@ -553,6 +565,13 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
 }
 
 // --- the run path (mirrors main.zig runSource, host-free) ------------------
+
+/// The main chunk's name: the script name, `argv[0]`, as the CLI names it
+/// after the script path, so a run's error locations match the native run's.
+/// `main` when the host passes no argv.
+fn chunkName(argv: []const []const u8) []const u8 {
+    return if (argv.len > 0) argv[0] else "main";
+}
 
 /// Decode the packed argv blob the JS host builds (see `runSource` in
 /// `viz/src/wasm/mahina.ts`): a little-endian `u32 count`, then `count` records of
@@ -714,10 +733,14 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8, files_blob: []co
     var file_set = FileSet{ .files = files };
     vm.system = file_set.system();
 
+    const argv = try parseArgv(args_blob);
+    defer gpa.free(argv);
+
     // --- compile --- (pass builtin globals so the unknown-global lint doesn't
     // flag `print`/`clock`).
     var chunk = mahina.compiler.compileWithOptions(gpa, vm.heap, src0, tree.root, &diags, .{
         .known_globals = &mahina.interp.builtin_global_names,
+        .chunk_name = chunkName(argv),
     }) catch {
         res.status = 1;
         res.diag = bufFromSlice(try renderDiagnostics(&diags));
@@ -734,9 +757,7 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8, files_blob: []co
     // like the CLI at main.zig:350 — the exec core never reads it mid-run, so
     // determinism holds). `argv[0]` is the script name, `argv[1..]` the user args;
     // a program reads its workload from `arg[1]` etc. Empty blob → arg stays the
-    // empty table `installBaseLib` created (unchanged playground default).
-    const argv = try parseArgv(args_blob);
-    defer gpa.free(argv);
+    // empty table `installBaseLib` created.
     if (argv.len > 0) try vm.populateArgs(argv);
 
     // --- run --- (bracket the VM execution alone with the host clock for an

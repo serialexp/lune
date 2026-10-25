@@ -66,12 +66,13 @@ interface VizState {
   /** True while the replay panel is open. Opened only after a successful run
    *  that produced a non-empty safepoint index. */
   replayActive: boolean;
-  /** The recorded effect log + the exact entry source that produced it, frozen
-   *  when replay opened. Replay re-runs this pair to any step k (the other
-   *  files' reads are effects in the log); editing the editor afterwards doesn't
-   *  disturb an open replay (it replays the captured source). */
+  /** The recorded effect log + the exact entry source and argv that produced
+   *  it, frozen when replay opened. Replay re-runs these to any step k (the
+   *  other files' reads are effects in the log); editing the editor afterwards
+   *  doesn't disturb an open replay (it replays the captured source). */
   replayEffects: Uint8Array | null;
   replaySource: string;
+  replayArgv: string[];
   /** The files the last run compiled, one per chunk (index = chunk index; 0 is
    *  the entry). Names the file of every proto id; see `runFileOf`. */
   runFiles: RunFile[];
@@ -329,6 +330,7 @@ const [state, setState] = createStore<VizState>({
   replayActive: false,
   replayEffects: null,
   replaySource: "",
+  replayArgv: [],
   runFiles: [],
   safepointCount: 0,
   safepointCapped: false,
@@ -544,13 +546,12 @@ export function parseArgsString(s: string): string[] {
   return s.split(/\s+/).filter((w) => w.length > 0);
 }
 
-/** The argv handed to the wasm VM for the current source + args: `[scriptName,
- *  ...userArgs]` when there are user args, else `[]` (leaving `arg` an empty
- *  table, the historical default). The native side receives only `userArgs`
- *  (`runNative`) — it supplies `arg[0]` = the temp source path itself. */
+/** The argv handed to the wasm VM for the current source + args: `[entryPath,
+ *  ...userArgs]`. The native side receives only `userArgs` (`runNative`) and
+ *  supplies `arg[0]` = the entry path itself, so both name the main chunk
+ *  after the entry in their error messages. */
 function wasmArgv(): string[] {
-  const userArgs = parseArgsString(state.scriptArgs);
-  return userArgs.length > 0 ? [state.entryPath, ...userArgs] : [];
+  return [state.entryPath, ...parseArgsString(state.scriptArgs)];
 }
 
 /** The entry file's current text. */
@@ -648,6 +649,7 @@ function applyWasmResult(result: MahinaRunResult, fileName: string, ran: RunInpu
     replayActive: false,
     replayEffects: result.effects,
     replaySource: ran.source,
+    replayArgv: ran.argv,
     runFiles,
     // A read-only tab of the previous run may be gone now.
     activePath: state.files.some((f) => f.path === state.activePath) || runFiles.some((f) => f.path === state.activePath)
@@ -680,11 +682,18 @@ interface RunInput {
   entry: string;
   source: string;
   files: SourceFile[];
+  /** The wasm run's argv (`wasmArgv`), kept for its replay. */
+  argv: string[];
 }
 
 /** Snapshot the program for a run. */
 function runInput(): RunInput {
-  return { entry: state.entryPath, source: entrySource(), files: state.files.map((f) => ({ path: f.path, text: f.text })) };
+  return {
+    entry: state.entryPath,
+    source: entrySource(),
+    files: state.files.map((f) => ({ path: f.path, text: f.text })),
+    argv: wasmArgv(),
+  };
 }
 
 /** The run file chunk `protoId` belongs to in `runFiles`, or null. Pure. */
@@ -809,7 +818,7 @@ export function setReplayPos(pos: number): void {
   const req = ++replayRequest;
   void (async () => {
     try {
-      const rs = await mahinaWorker().replay(state.replaySource, state.replayEffects!, k);
+      const rs = await mahinaWorker().replay(state.replaySource, state.replayEffects!, k, state.replayArgv);
       if (req !== replayRequest) return;
       const view = decodeSnapshot(rs.keyframe);
       setState({ replayState: rs, replayView: view });
@@ -875,7 +884,7 @@ export async function runWasm(): Promise<void> {
   runAbort = new AbortController();
   try {
     const ran = runInput();
-    const result = await mahinaWorker().runSource(ran.source, wasmArgv(), ran.files);
+    const result = await mahinaWorker().runSource(ran.source, ran.argv, ran.files);
     applyWasmResult(result, "(wasm run)", ran);
     // A wasm-only run has no cycle counter — drop any prior native time split so
     // the panel's time column reverts to "run native".
@@ -925,7 +934,7 @@ export async function runBoth(): Promise<void> {
     // arg[1..], which is what the keyframe compare requires (arg[0] is cancelled).
     const userArgs = parseArgsString(state.scriptArgs);
     const [wasm, native] = await Promise.all([
-      mahinaWorker().runSource(ran.source, wasmArgv(), ran.files),
+      mahinaWorker().runSource(ran.source, ran.argv, ran.files),
       runNative(ran.files, ran.entry, userArgs, signal),
     ]);
     applyWasmResult(wasm, "(wasm + native diff)", ran);

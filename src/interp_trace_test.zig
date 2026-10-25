@@ -4009,7 +4009,7 @@ test "assert P4 end-to-end: mid-loop falsy drift side-exits and raises identical
         \\end
         \\local ok, err = pcall(body)
         \\print(ok, err, s)
-    , "false\tbody:6: flipped\t49\n");
+    , "false\tmain:6: flipped\t49\n");
 }
 
 test "doc 43 end-to-end: mini-array3d — iterator closure + method with assert + fields + append fill; all ten legs" {
@@ -5589,7 +5589,7 @@ test "head e2e (doc 44 D11): StackOverflow through a native descent — message 
         \\local ok2, err2 = pcall(down, 1)
         \\print(ok1, err1)
         \\print(ok2, err2)
-    , "false\tdown:3: stack overflow\nfalse\tdown:3: stack overflow\n");
+    , "false\tmain:3: stack overflow\nfalse\tmain:3: stack overflow\n");
 }
 
 test "head e2e (doc 44 D11): argument type change at depth deopts mid-descent, all ten legs" {

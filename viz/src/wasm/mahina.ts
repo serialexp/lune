@@ -16,7 +16,7 @@ interface MahinaExports {
   mahina_free_result(resPtr: number): void;
   mahina_check(srcPtr: number, srcLen: number): number;
   mahina_free_check_result(resPtr: number): void;
-  mahina_replay(srcPtr: number, srcLen: number, effPtr: number, effLen: number, stopAfter: number): number;
+  mahina_replay(srcPtr: number, srcLen: number, effPtr: number, effLen: number, argsPtr: number, argsLen: number, stopAfter: number): number;
   mahina_free_replay_result(resPtr: number): void;
   mahina_dispatch_smoke(iterations: number): number;
   mahina_panic_message_ptr(): number;
@@ -221,8 +221,9 @@ export interface MahinaModule {
   /** Replay `src` forward to instruction-boundary safepoint `stopAfter`, feeding
    *  the recorded `effects` blob (from a prior `runSource`) back deterministically,
    *  and return the VM state there. Re-running to the same `stopAfter` yields
-   *  identical state every time (the deterministic-replay payoff). */
-  replay(src: string, effects: Uint8Array, stopAfter: number): MahinaReplayResult;
+   *  identical state every time (the deterministic-replay payoff). `argv` must be
+   *  the recorded run's: it fills `arg` and names the chunk in error messages. */
+  replay(src: string, effects: Uint8Array, stopAfter: number, argv?: string[]): MahinaReplayResult;
   /** The guaranteed-tail-call capability gate: run `iterations` `.always_tail`
    *  hops and return the accumulator (== `iterations` iff frames were reused). */
   dispatchSmoke(iterations: number): number;
@@ -525,7 +526,7 @@ function wrap(exports: MahinaExports): MahinaModule {
     };
   };
 
-  const replay = (src: string, effects: Uint8Array, stopAfter: number): MahinaReplayResult => {
+  const replay = (src: string, effects: Uint8Array, stopAfter: number, argv: string[] = []): MahinaReplayResult => {
     const srcBytes = encoder.encode(src);
     const srcPtr = srcBytes.length === 0 ? 0 : exports.mahina_alloc(srcBytes.length);
     if (srcBytes.length !== 0) {
@@ -537,10 +538,16 @@ function wrap(exports: MahinaExports): MahinaModule {
     if (effects.length !== 0) {
       new Uint8Array(exports.memory.buffer, effPtr, effects.length).set(effects);
     }
+    const argsBlob = encodeArgv(argv);
+    const argsPtr = argsBlob.length === 0 ? 0 : exports.mahina_alloc(argsBlob.length);
+    if (argsBlob.length !== 0) {
+      new Uint8Array(exports.memory.buffer, argsPtr, argsBlob.length).set(argsBlob);
+    }
 
-    const resPtr = exports.mahina_replay(srcPtr, srcBytes.length, effPtr, effects.length, stopAfter);
+    const resPtr = exports.mahina_replay(srcPtr, srcBytes.length, effPtr, effects.length, argsPtr, argsBlob.length, stopAfter);
     if (srcPtr !== 0) exports.mahina_free(srcPtr, srcBytes.length);
     if (effPtr !== 0) exports.mahina_free(effPtr, effects.length);
+    if (argsPtr !== 0) exports.mahina_free(argsPtr, argsBlob.length);
     if (resPtr === 0) {
       throw new Error("mahina_replay returned null (wasm allocation failure)");
     }

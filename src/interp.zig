@@ -587,11 +587,41 @@ const ExecMode = enum { fast, full };
 /// `exec` wrapper consumes `switch_mode`; it never escapes to a real caller.
 const ExecStep = union(enum) { finished: FrameResult, suspended, switch_mode };
 
+/// Scratch for building one error message on the fault path: a bump allocator
+/// over a stack buffer, falling back to an arena over `gpa` past it (a deep
+/// backtrace). A caught fault in a loop pays this per fault. An arena alone is
+/// std's atomic, thread-safe one, and went back to `gpa` whenever a message
+/// outgrew its first node: a 16-byte chunk name cost ~1100 instructions per
+/// fault (`bench/stdlib/pcall_faults.lua`, 2026-10-26). Initialised in place,
+/// since `first` points at `arena`.
+const MsgScratch = struct {
+    buf: [2048]u8,
+    arena: std.heap.ArenaAllocator,
+    first: std.heap.BufferFirstAllocator,
+
+    fn init(self: *MsgScratch, gpa: std.mem.Allocator) void {
+        self.arena = .init(gpa);
+        self.first = .init(&self.buf, self.arena.allocator());
+    }
+
+    fn deinit(self: *MsgScratch) void {
+        self.arena.deinit();
+    }
+
+    fn allocator(self: *MsgScratch) std.mem.Allocator {
+        return self.first.allocator();
+    }
+};
+
 /// One row of a runtime-error backtrace: a function name plus the source span of
 /// the active instruction in that frame (the faulting instruction for the leaf;
 /// the outgoing call site for every parent). `line` is 1-based.
 pub const FaultFrame = struct {
     name: []const u8,
+    /// The chunk `line` is in (`Proto.chunk`).
+    chunk: []const u8 = "?",
+    /// The frame runs a chunk's top level (`Proto.main_chunk`).
+    main_chunk: bool = false,
     /// The frame's `Proto.id`: names the chunk (and so the file) `line` is in,
     /// via `Vm.loadedChunkIndexOf`.
     proto_id: u32 = 0,
@@ -607,6 +637,8 @@ pub const FaultFrame = struct {
 /// top-level `message`/`line`/`start`/`end` describe that leaf frame.
 pub const Fault = struct {
     message: []const u8,
+    /// The chunk the location (`line`/`start`/`end`) is in (`Proto.chunk`).
+    chunk: []const u8 = "?",
     /// The `Proto.id` the location (`line`/`start`/`end`) is in, which names
     /// its chunk and so its file (`Vm.loadedChunkIndexOf`).
     proto_id: u32 = 0,
@@ -2213,7 +2245,7 @@ pub const Vm = struct {
         const origin = bc_names.originOf(cs.proto, @intCast(cs.pc), call.a);
         return .{
             .fname = nativeDisplayName(function.Native.fromHeader(callee.asHeap())),
-            .chunk = cs.proto.name,
+            .chunk = cs.proto.chunk,
             .line = cs.line,
             .located = true,
             .method = origin != null and origin.?.kind == .method,
@@ -2231,9 +2263,10 @@ pub const Vm = struct {
         const site = self.nativeSite();
         const fname = if (site) |s| s.fname else "?";
         const method = site != null and site.?.method;
-        var arena_inst = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_inst.deinit();
-        const a = arena_inst.allocator();
+        var scratch: MsgScratch = undefined;
+        scratch.init(self.gpa);
+        defer scratch.deinit();
+        const a = scratch.allocator();
         const body = if (method and n == 1)
             try std.fmt.allocPrint(a, "calling '{s}' on bad self ({s})", .{ fname, reason })
         else
@@ -2253,9 +2286,10 @@ pub const Vm = struct {
     /// supplies only the 1-based index, the expected type, and the offending value.
     pub fn badArg(self: *Vm, n: usize, expected: []const u8, got: ?Value) Error {
         const got_name = if (got) |g| g.typeName() else "no value";
-        var arena_inst = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_inst.deinit();
-        const reason = try std.fmt.allocPrint(arena_inst.allocator(), "{s} expected, got {s}", .{ expected, got_name });
+        var scratch: MsgScratch = undefined;
+        scratch.init(self.gpa);
+        defer scratch.deinit();
+        const reason = try std.fmt.allocPrint(scratch.allocator(), "{s} expected, got {s}", .{ expected, got_name });
         return self.raiseBadArg(n, reason);
     }
 
@@ -2299,12 +2333,13 @@ pub const Vm = struct {
     pub fn raiseLocatedError(self: *Vm, bytes: []const u8, level: usize) Error {
         const cs = if (level == 0) null else self.callSiteAt(level);
         if (cs) |site| {
-            var arena_inst = std.heap.ArenaAllocator.init(self.gpa);
-            defer arena_inst.deinit();
+            var scratch: MsgScratch = undefined;
+            scratch.init(self.gpa);
+            defer scratch.deinit();
             const full = try std.fmt.allocPrint(
-                arena_inst.allocator(),
+                scratch.allocator(),
                 "{s}:{d}: {s}",
-                .{ site.proto.name, site.line, bytes },
+                .{ site.proto.chunk, site.line, bytes },
             );
             self.pending_error = try self.heap.internValue(full);
         } else {
@@ -2373,6 +2408,7 @@ pub const Vm = struct {
             const cs = self.callSiteAt(1);
             return .{
                 .message = message,
+                .chunk = if (cs) |c| c.proto.chunk else "?",
                 .proto_id = if (cs) |c| c.proto.id else 0,
                 .line = if (cs) |c| c.line else 0,
                 .start = if (cs) |c| c.span.start else 0,
@@ -2463,7 +2499,7 @@ pub const Vm = struct {
         };
 
         const frames = try self.backtraceFrames(arena);
-        return .{ .message = message, .proto_id = proto.id, .line = line, .start = span.start, .end = span.end, .frames = frames };
+        return .{ .message = message, .chunk = proto.chunk, .proto_id = proto.id, .line = line, .start = span.start, .end = span.end, .frames = frames };
     }
 
     /// The suffix naming the faulting value, as Lua 5.4's `varinfo` does
@@ -2573,6 +2609,8 @@ pub const Vm = struct {
             const fspan: bytecode.Span = if (fpc < fp.spans.len) fp.spans[fpc] else .{};
             frames[self.depth - 1 - i] = .{
                 .name = fp.name,
+                .chunk = fp.chunk,
+                .main_chunk = fp.main_chunk,
                 .proto_id = fp.id,
                 .line = fspan.line,
                 .start = fspan.start,
@@ -3122,20 +3160,20 @@ pub const Vm = struct {
     /// only deterministic state (opcodes, operand types, source spans), so the same
     /// fault yields the same value bytes across all tiers and record/replay.
     pub fn synthErrorValue(self: *Vm, e: Error) Error!Value {
-        var arena_inst = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_inst.deinit();
-        const a = arena_inst.allocator();
+        var scratch: MsgScratch = undefined;
+        scratch.init(self.gpa);
+        defer scratch.deinit();
+        const a = scratch.allocator();
         const fault = try self.describeFault(e, a);
         // A raised value (`error`/`assert`/`badArg`) already carries its own
         // `chunk:line:`; intern it verbatim. A bare runtime fault (`nil + 1`,
         // indexing nil, a native's generic bad-argument) is reported by Lua with a
-        // `chunk:line:` prefix on the *caught* value too — prepend it from the leaf
-        // frame's chunk (its proto name) and the fault line. Deterministic: proto
-        // name is static and the line derives from a source offset.
+        // `chunk:line:` prefix on the *caught* value too — prepend it from the
+        // fault's chunk and line. Deterministic: the chunk name is static and
+        // the line derives from a source offset.
         if (fault.self_located or fault.line == 0 or self.depth == 0)
             return self.heap.internValue(fault.message);
-        const chunk = self.frames[self.depth - 1].closure.proto.name;
-        const full = try std.fmt.allocPrint(a, "{s}:{d}: {s}", .{ chunk, fault.line, fault.message });
+        const full = try std.fmt.allocPrint(a, "{s}:{d}: {s}", .{ fault.chunk, fault.line, fault.message });
         return self.heap.internValue(full);
     }
 

@@ -103,8 +103,14 @@ effect log so runs stay replayable (doc 02).
 
 - [ ] No variable names: `attempt to index a nil value` where Lua says
       `(local 't')` / `(field 'x')` / `(global 'f')` / `(method 'm')`.
-- [~] Locations name the function, not the file: `anonymous:11:`,
-      `main:10:`, `f:1:`; tracebacks have no file names. **Partly done
+- [x] Locations name the function, not the file: `anonymous:11:`,
+      `main:10:`, `f:1:`; tracebacks have no file names. **Done
+      2026-10-26:** every proto carries its chunk (`Proto.chunk`, from
+      `compiler.Options.chunk_name`), and error prefixes, the CLI's
+      ` at chunk:line` suffix, `debug.traceback` and the CLI traceback rows
+      (`chunk:line: in function 'f'` / `in main chunk`) all name it. The
+      wasm run and its replay name the entry (`argv[0]`), as the native run
+      does. **Partly done
       (multi-file viz, 2026-10-22):** a type fault inside a `require`d /
       `dofile`d / `load`ed chunk is now blamed on that chunk's file in the
       CLI's ` at file:line` suffix (`Fault.proto_id`), and the visualiser
