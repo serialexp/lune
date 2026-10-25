@@ -800,14 +800,95 @@ const Compiler = struct {
         if (a.targets.len == 1 and a.values.len == 1) {
             if (try self.compileSingleAssign(a.targets[0], a.values[0])) return;
         }
+        // Lua's order: every target's table and key are evaluated, left to
+        // right, before any value, so `i, a[i] = i+1, 20` stores into the old
+        // `a[i]`; then the values; then the stores, right to left (as
+        // `lparser.c restassign` does).
         const mark = self.next_reg;
+        const prepared = try self.scratch.alloc(PreparedTarget, a.targets.len);
+        defer self.scratch.free(prepared);
+        for (a.targets, prepared, 0..) |tgt, *p, k| {
+            p.* = try self.prepareTarget(tgt, a.targets[k + 1 ..]);
+        }
         const val_base = self.next_reg;
         const n_targets: u16 = @intCast(a.targets.len);
         try self.compileValuesInto(a.values, val_base, n_targets);
-        for (a.targets, 0..) |tgt, j| {
-            try self.compileStore(tgt, @intCast(val_base + j));
+        var j = prepared.len;
+        while (j > 0) {
+            j -= 1;
+            try self.storePrepared(prepared[j], @intCast(val_base + j));
         }
         self.freeTo(mark);
+    }
+
+    /// One target of a multiple assignment with its table and key already
+    /// evaluated, and the span its store reports a fault at.
+    const PreparedTarget = struct {
+        place: union(enum) {
+            name: []const u8,
+            index: struct { obj: u16, key: IndexKey },
+            /// `obj[i][j]`, stored by one fused `set_index2` (see
+            /// `compileStore`); the row `obj[i]` is looked up at the store.
+            index2: struct { obj: u16, key1: u16, key2: u16 },
+        },
+        span: ast.Span,
+    };
+
+    /// Evaluate `tgt`'s table and key into registers. A local is used in
+    /// place, as Lua does, unless one of the `later` targets assigns it: the
+    /// stores run right to left, so that store would happen first and this
+    /// one would see the new value (Lua's `check_conflict` copies it too).
+    fn prepareTarget(self: *Compiler, tgt: *const ast.Expr, later: []const *ast.Expr) Error!PreparedTarget {
+        switch (tgt.data) {
+            .name => |nm| return .{ .place = .{ .name = nm }, .span = tgt.span },
+            .field => |f| {
+                const obj = try self.prepareOperand(f.obj, later);
+                return .{
+                    .place = .{ .index = .{ .obj = obj, .key = .{ .konst = try self.stringConstant(f.name) } } },
+                    .span = self.cur_span,
+                };
+            },
+            .index => |ix| {
+                if (ix.obj.data == .index) {
+                    const inner = ix.obj.data.index;
+                    const obj = try self.prepareOperand(inner.obj, later);
+                    const key1 = try self.prepareOperand(inner.key, later);
+                    const key2 = try self.prepareOperand(ix.key, later);
+                    return .{ .place = .{ .index2 = .{ .obj = obj, .key1 = key1, .key2 = key2 } }, .span = self.cur_span };
+                }
+                const obj = try self.prepareOperand(ix.obj, later);
+                const key: IndexKey = if (try self.literalKey(ix.key)) |k| blk: {
+                    self.cur_span = ix.key.span;
+                    break :blk k;
+                } else .{ .reg = try self.prepareOperand(ix.key, later) };
+                return .{ .place = .{ .index = .{ .obj = obj, .key = key } }, .span = self.cur_span };
+            },
+            else => unreachable, // parser guarantees targets are assignable
+        }
+    }
+
+    /// `operandReg`, but copied into a temporary when one of the `later`
+    /// targets is the local `e` reads.
+    fn prepareOperand(self: *Compiler, e: *const ast.Expr, later: []const *ast.Expr) Error!u16 {
+        if (self.localRegOf(e)) |r| {
+            for (later) |t| {
+                if (t.data == .name and self.resolveLocal(t.data.name) == r) {
+                    const copy = try self.alloc1();
+                    try self.compileExprTo(e, copy);
+                    return copy;
+                }
+            }
+        }
+        return self.operandReg(e);
+    }
+
+    fn storePrepared(self: *Compiler, p: PreparedTarget, src: u16) Error!void {
+        self.cur_span = p.span;
+        switch (p.place) {
+            .name => |nm| try self.storeName(nm, src, p.span),
+            .index => |ix| try self.emitSetIndex(ix.obj, ix.key, src),
+            .index2 => |ix| _ = try self.emit(.{ .op = .set_index2, .a = ix.obj, .b = ix.key1, .c = ix.key2, .aux = @intCast(src) }),
+        }
     }
 
     /// `target = value` without the temporary the general path stores from,
@@ -2701,11 +2782,12 @@ test "an operand read before code that can write it keeps its value" {
     try testing.expectEqual(@as(i64, 10), (try runScalar(prelude ++ "return bump() + a")).asInt());
     try testing.expectEqual(@as(i64, 1), (try runScalar(prelude ++ "a = a + bump() return a")).asInt());
     try testing.expectEqual(@as(i64, 1), (try runScalar(prelude ++ "a += bump() return a")).asInt());
-    // The value is evaluated before the target's key, so the key is `a`
-    // after the call.
+    // The target's key is the local `a` read in place, as in Lua, so the
+    // store sees `a` after the call.
     try testing.expectEqual(@as(i64, 0), (try runScalar(prelude ++ "local t = {} t[a] = bump() return t[10]")).asInt());
-    // A store's value is copied before a target prefix that runs code.
-    try testing.expectEqual(@as(i64, 2), (try runScalar(
+    // A target prefix runs before the value, as in Lua: `get()` sets `v`
+    // first.
+    try testing.expectEqual(@as(i64, 99), (try runScalar(
         \\local t = {}
         \\local v = 2
         \\local function get() v = 99 return t end

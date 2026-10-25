@@ -1341,9 +1341,10 @@ test "fused index: __index / __newindex on the inner level still dispatch" {
     );
 }
 
-test "fused index: evaluation order matches the unfused RHS-first convention" {
-    // Single-level store is RHS-first (`g[k(1)]=k(2)` ⇒ 2 then 1); the fused
-    // two-level store must keep the same order: value, then the two keys L→R.
+test "fused index: evaluation order is Lua's, target keys before the value" {
+    // Lua evaluates a store's prefix and keys before its value
+    // (`g[k(1)]=k(2)` ⇒ 1 then 2); the fused two-level store keeps that
+    // order: the two keys left to right, then the value.
     try expectProgram(
         \\local order = {}
         \\local function k(n) order[#order+1] = n; return n end
@@ -1357,7 +1358,7 @@ test "fused index: evaluation order matches the unfused RHS-first convention" {
         \\print(rd[1], rd[2])
         \\
     ,
-        "3\t1\t2\n1\t2\n",
+        "1\t2\t3\n1\t2\n",
     );
 }
 

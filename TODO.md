@@ -23,7 +23,7 @@ catch them):
 
 Wrong results:
 
-- [ ] **Multiple assignment evaluates its targets after the values.**
+- [x] **Multiple assignment evaluates its targets after the values.**
       `i = 3; i, a[i] = i+1, 20` sets `a[4]` (the manual's own example
       says `a[3]`); `t[k(1)], t[k(2)] = k(3), k(4)` calls `k` in the order
       3 4 1 2 (Lua 1 2 3 4).

@@ -29,3 +29,25 @@ test "results and sizes past the limits raise Lua's errors instead of overflowin
         \\print(select('#', table.unpack({}, 1, 60000)), #("ab"):rep(3, ","))
     , "false\ttrue\nfalse\ttrue\nfalse\ttrue\nfalse\ttrue\nfalse\ttrue\nfalse\ttrue\n60000\t8\n");
 }
+
+test "multiple assignment evaluates targets, then values, then stores right to left" {
+    try expectProgram(
+        \\local a, i = {}, 3
+        \\i, a[i] = i + 1, 20
+        \\print(a[3], a[4], i)
+        \\local t, seen = {}, {}
+        \\local function k(n) seen[#seen + 1] = n return n end
+        \\t[k(1)], t[k(2)] = k(3), k(4)
+        \\print(table.concat(seen, " "))
+        \\local b = {}
+        \\b[1], b[1] = "first", "second"
+        \\local x, j = {}, 1
+        \\x[j], j = "a", 2
+        \\print(b[1], x[1], x[2], j)
+        \\local g = {{}}
+        \\g[k(1)][k(2)], g[1][3] = 5, 6
+        \\local s = {3, 1}
+        \\s[1], s[2] = s[2], s[1]
+        \\print(g[1][2], g[1][3], s[1], s[2])
+    , "20\tnil\t4\n1 2 3 4\nfirst\ta\tnil\t2\n5\t6\t1\t3\n");
+}
