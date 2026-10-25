@@ -33,6 +33,7 @@ const fmath = @import("fmath.zig");
 const value = @import("value.zig");
 const string = @import("string.zig");
 const numeral = @import("numeral.zig");
+const bytes = @import("bytes.zig");
 const Value = value.Value;
 
 /// The UTF-8 byte slice of a string `Value`, or `null` if it isn't a string.
@@ -281,11 +282,11 @@ pub fn forWithin(idx: Value, limit: Value, step: Value) bool {
 // ---- comparisons ----
 
 /// `a < b`. Numbers compare by value (a `NaN` operand makes this false); two
-/// strings compare lexicographically by byte (`std.mem.order`). A mixed
+/// strings compare lexicographically by byte (`bytes.order`). A mixed
 /// string/number pair errors, exactly as Lua does ("attempt to compare").
 pub fn lt(a: Value, b: Value) Error!bool {
     if (a.isNumber() and b.isNumber()) return value.compareNumeric(a, b) == .lt;
-    if (strBytes(a)) |sa| if (strBytes(b)) |sb| return std.mem.order(u8, sa, sb) == .lt;
+    if (strBytes(a)) |sa| if (strBytes(b)) |sb| return bytes.order(sa, sb) == .lt;
     return Error.TypeError;
 }
 
@@ -296,7 +297,7 @@ pub fn le(a: Value, b: Value) Error!bool {
         const o = value.compareNumeric(a, b);
         return o == .lt or o == .eq;
     }
-    if (strBytes(a)) |sa| if (strBytes(b)) |sb| return std.mem.order(u8, sa, sb) != .gt;
+    if (strBytes(a)) |sa| if (strBytes(b)) |sb| return bytes.order(sa, sb) != .gt;
     return Error.TypeError;
 }
 

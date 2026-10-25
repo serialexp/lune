@@ -31,6 +31,7 @@ const table_mod = @import("../table.zig");
 const pattern = @import("pattern.zig");
 const decimal = @import("decimal.zig");
 const io = @import("../io.zig");
+const byte_ops = @import("../bytes.zig");
 const gc = @import("../gc.zig");
 const unicode_case = @import("../gen/unicode_case.zig");
 
@@ -1354,7 +1355,7 @@ fn findCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
         }
         if (st <= s.len) {
             // A plain substring of valid UTF-8 lands on a code-point boundary.
-            if (std.mem.indexOfPos(u8, s, st, pat)) |q| {
+            if (byte_ops.find(s, st, pat)) |q| {
                 buf[0] = Value.int(@intCast(byteToCharS(sobj, q)));
                 buf[1] = Value.int(@intCast(cpCountPrefixS(sobj, q + pat.len)));
                 return 2;
@@ -1609,7 +1610,7 @@ pub fn sfindPlainCore(sobj: *const String, init_raw: i64, pat: []const u8) i64 {
     if (pat.len == 0) return @intCast(byteToCharS(sobj, st));
     if (st <= s.len) {
         // A plain substring of valid UTF-8 lands on a code-point boundary.
-        if (std.mem.indexOfPos(u8, s, st, pat)) |q| return @intCast(byteToCharS(sobj, q));
+        if (byte_ops.find(s, st, pat)) |q| return @intCast(byteToCharS(sobj, q));
     }
     return MatchStatus.no_match;
 }

@@ -152,14 +152,20 @@ Wrong results:
 intern lookup and pattern back-references. Two neighbours measured the same
 day (ReleaseFast, native CPU, per call):
 
-- [ ] `std.mem.order` is a byte loop, ~10 instructions per byte (610 at 60
+- [x] `std.mem.order` is a byte loop, ~10 instructions per byte (610 at 60
       bytes, 1010 at 100). String `<`/`<=` (`arith.zig:288`) and
       `table.sort` on strings pay it; a word- or vector-at-a-time compare
       to the first difference would be a few per 8-32 bytes.
-- [ ] `std.mem.indexOfPos` with a long needle grows faster than the needle:
+      → `bytes.order`: first byte inline, then word/vector compare to the
+      first difference. `bench/stdlib/str_sort.lua` −55% instructions,
+      −50% cycles.
+- [x] `std.mem.indexOfPos` with a long needle grows faster than the needle:
       555 instructions for a 60-byte needle in 120 bytes, 1241 for 100 in
       200, likely through the same `eql`. Plain `string.find` and
       `gsub` with a plain pattern (`string.zig:1357`, `:1612`) use it.
+      → `bytes.find`: first/last-byte vector filter, then `eql` on the
+      middle (101 and 143 instructions for those two cases).
+      `str_find_match` −13%/−16% instructions (t0/jit).
 
 ## Noted 2026-10-24 (doc 65 Phase 5, fault naming)
 
