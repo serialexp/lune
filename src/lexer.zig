@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const token = @import("token.zig");
+const numeral = @import("numeral.zig");
 const Token = token.Token;
 const Diagnostics = @import("diag.zig").Diagnostics;
 
@@ -178,43 +179,31 @@ pub const Lexer = struct {
         return self.make(token.identifierTag(text), start, line);
     }
 
+    /// Lua's `read_numeral`: from a digit (or `.digit`), take hex digits, `.`
+    /// and an exponent mark (`e`/`E`, or `p`/`P` after `0x`) with an optional
+    /// sign, then one touching letter, so `3x` is one bad numeral rather than
+    /// `3` and `x`. The span must read as a numeral (`numeral.parse`), which
+    /// also decides int against float. One difference from Lua: a `..` ends
+    /// the numeral, so `1..2` is `1 .. 2` (Lua: "malformed number").
     fn number(self: *Lexer, start: u32, line: u32) Token {
-        // Hex integer: 0x / 0X followed by hex digits.
-        if (self.peek() == '0' and (self.peekNext() == 'x' or self.peekNext() == 'X')) {
-            self.index += 2;
-            const digits_start = self.index;
-            while (isHexDigit(self.peek())) self.index += 1;
-            if (self.index == digits_start) {
-                self.diags.err("invalid hexadecimal number", start, self.index, line);
-                return self.make(.invalid, start, line);
-            }
-            return self.make(.int_literal, start, line);
+        const hex = self.peek() == '0' and (self.peekNext() == 'x' or self.peekNext() == 'X');
+        if (hex) self.index += 2;
+        const exp_mark: u8 = if (hex) 'p' else 'e';
+        while (true) {
+            const c = self.peek();
+            if (c == exp_mark or c == std.ascii.toUpper(exp_mark)) {
+                self.index += 1;
+                if (self.peek() == '+' or self.peek() == '-') self.index += 1;
+            } else if (isHexDigit(c) or (c == '.' and self.peekNext() != '.')) {
+                self.index += 1;
+            } else break;
         }
-
-        var is_float = false;
-        while (isDigit(self.peek())) self.index += 1;
-
-        // Fractional part — but not if the dot is actually a `..` operator.
-        if (self.peek() == '.' and self.peekNext() != '.') {
-            is_float = true;
-            self.index += 1;
-            while (isDigit(self.peek())) self.index += 1;
-        }
-
-        // Exponent.
-        if (self.peek() == 'e' or self.peek() == 'E') {
-            is_float = true;
-            self.index += 1;
-            if (self.peek() == '+' or self.peek() == '-') self.index += 1;
-            const exp_start = self.index;
-            while (isDigit(self.peek())) self.index += 1;
-            if (self.index == exp_start) {
-                self.diags.err("malformed number exponent", start, self.index, line);
-                return self.make(.invalid, start, line);
-            }
-        }
-
-        return self.make(if (is_float) .float_literal else .int_literal, start, line);
+        if (isAlpha(self.peek())) self.index += 1;
+        const n = numeral.parse(self.source[start..self.index]) orelse {
+            self.diags.err("malformed number", start, self.index, line);
+            return self.make(.invalid, start, line);
+        };
+        return self.make(if (n == .int) .int_literal else .float_literal, start, line);
     }
 
     fn string(self: *Lexer, start: u32, line: u32) Token {
@@ -442,6 +431,24 @@ test "int vs float literals" {
     try expectTags("1 2.0 3e2 0x1F 4.5e-3 .5", &.{
         .int_literal, .float_literal, .float_literal, .int_literal, .float_literal, .float_literal,
     });
+}
+
+test "hex floats and Lua's numeral span" {
+    try expectTags("0x1.8p+1 0x.8 0xA 0x1P-3 1e+5", &.{
+        .float_literal, .float_literal, .int_literal, .float_literal, .float_literal,
+    });
+}
+
+test "a letter touching a numeral makes one malformed number, as in Lua" {
+    for ([_][:0]const u8{ "3x", "0xfg", "1e", "0x", "1e+" }) |src| {
+        var diags = Diagnostics.init(testing.allocator);
+        defer diags.deinit();
+        const toks = try tokenize(testing.allocator, src, &diags);
+        defer testing.allocator.free(toks);
+        try testing.expect(diags.hasErrors());
+        try testing.expectEqual(@as(usize, 2), toks.len); // one invalid token + eof
+        try testing.expectEqual(Token.Tag.invalid, toks[0].tag);
+    }
 }
 
 test "number followed by concat is not a float" {

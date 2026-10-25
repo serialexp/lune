@@ -32,6 +32,7 @@ const std = @import("std");
 const fmath = @import("fmath.zig");
 const value = @import("value.zig");
 const string = @import("string.zig");
+const numeral = @import("numeral.zig");
 const Value = value.Value;
 
 /// The UTF-8 byte slice of a string `Value`, or `null` if it isn't a string.
@@ -307,32 +308,17 @@ pub fn eq(a: Value, b: Value) bool {
 
 /// The `tonumber(v[, base])` conversion core — the ONE implementation shared by
 /// the stdlib native (`stdlib/basic.zig` `bToNumber`) and the trace recorder's
-/// konst fold (doc 23 D2), so the two can never disagree. Pure and total: any
-/// unconvertible input yields `nil`, never an error, and nothing is allocated
-/// (results are ints/floats/nil; a string input is only *read*). `base_arg`
-/// mirrors the native's argument handling exactly: `null` means the 1-arg form;
-/// a non-number base falls through to the 1-arg auto path (matching the
-/// native's `args[1].isNumber()` gate); a numeric base outside 2..36 → nil.
-/// The whitespace set `tonumber` trims before parsing: C `isspace`, which is
-/// what both Lua 5.4 (`l_str2int`/`l_str2d` skip `lisspace`) and LuaJIT
-/// (`lj_strscan` skips `LJ_CHAR_SPACE`) use. Verified empirically 2026-08-29:
-/// with only " \t\n\r" mahina rejected "\x0B10"/"\x0C10" that both engines
-/// accept — the one acceptance gap on the 77-case three-engine probe matrix.
-const tonumber_trim = " \t\n\r\x0B\x0C"; // space \t \n \r \v \f
-
-pub fn toNumber(v: Value, base_arg: ?Value) Value {
-    // Explicit base form: string interpreted as an integer in that base.
-    if (base_arg) |bv| if (bv.isNumber()) {
-        const base_i = bv.toFloat();
-        if (base_i < 2 or base_i > 36) return Value.nil();
-        const base: u8 = @intFromFloat(base_i);
-        const s = strBytes(v) orelse return Value.nil();
-        const t = std.mem.trim(u8, s, tonumber_trim);
-        if (t.len == 0) return Value.nil();
-        const parsed = std.fmt.parseInt(i64, t, base) catch return Value.nil();
-        return Value.int(parsed);
-    };
-
+/// konst fold (doc 23 D2), so the two can never disagree. Pure and total, and
+/// nothing is allocated (a string input is only *read*). `base` is a base
+/// `tonumberBase` accepted (the native raises on the rest, and the recorder
+/// does not fold them): the string read in that base (Lua's `b_str2int`), or
+/// nil. With no base, a number is itself and a string is read as a numeral;
+/// anything else is nil.
+pub fn toNumber(v: Value, base: ?u8) Value {
+    if (base) |b| {
+        const iv = numeral.parseBase(strBytes(v).?, b) orelse return Value.nil();
+        return Value.int(iv);
+    }
     switch (v.tag) {
         .int, .float => return v,
         else => {},
@@ -340,63 +326,31 @@ pub fn toNumber(v: Value, base_arg: ?Value) Value {
     return strToNumber(strBytes(v) orelse return Value.nil());
 }
 
+/// The base of a `tonumber(v, base)` call that converts rather than raises:
+/// `v` is a string and `base` an integer (or an integral float) in 2..36.
+/// Null when `bToNumber` raises instead (checked there in Lua's order).
+pub fn tonumberBase(v: Value, base: Value) ?u8 {
+    if (strBytes(v) == null) return null;
+    const b: i64 = switch (base.tag) {
+        .int => base.asInt(),
+        .float => value.floatAsExactInt(base.asFloat()) orelse return null,
+        else => return null,
+    };
+    if (b < 2 or b > 36) return null;
+    return @intCast(b);
+}
+
 /// `tonumber`'s conversion of a string's bytes (the 1-argument form): the
 /// number, or `nil`. Shared with `file:read("n")` (doc 65 Phase 3), which
 /// collects a numeral the way Lua's `read_number` does and converts it here.
+/// Surrounding C-`isspace` is trimmed, as Lua 5.4 and LuaJIT do.
 pub fn strToNumber(s: []const u8) Value {
-    const t = std.mem.trim(u8, s, tonumber_trim);
-    if (t.len == 0) return Value.nil();
-    if (fastDecInt(t)) |iv| return Value.int(iv); // doc 29 B(a): the common shape
-    if (std.fmt.parseInt(i64, t, 0)) |iv| {
-        return Value.int(iv);
-    } else |_| {}
-    if (std.fmt.parseFloat(f64, t)) |fv| {
-        return Value.float(fv);
-    } else |_| {}
+    const t = std.mem.trim(u8, s, numeral.space);
+    // `numeral.parse`, split so the common integer case stays inline and
+    // only a float reaches the (large) float reader.
+    if (numeral.parseInt(t)) |i| return Value.int(i);
+    if (numeral.parseFloat(t)) |f| return Value.float(f);
     return Value.nil();
-}
-
-/// Doc 29 B, grammar option (a): the plain-decimal-integer fast path.
-///
-/// Claims ONLY strings where `std.fmt.parseInt(i64, t, 0)` succeeds with the
-/// same value — optional single sign then 1..19 pure ASCII digits in i64
-/// range — and returns null for everything else (underscores, prefixes,
-/// decimal points, exponents, ≥20 digit runs incl. leading-zero shapes,
-/// out-of-range values), which then takes the untouched std.fmt pipeline.
-/// Routing and int/float tags are therefore preserved BY CONSTRUCTION (codex
-/// review Blocker #1 of doc 29): the fast path is a strict subset of the
-/// integer lane, never a re-implementation of its grammar.
-fn fastDecInt(t: []const u8) ?i64 {
-    var i: usize = 0;
-    var negative = false;
-    switch (t[0]) { // caller guarantees t.len > 0
-        '+' => i = 1,
-        '-' => {
-            negative = true;
-            i = 1;
-        },
-        else => {},
-    }
-    if (i >= t.len) return null; // bare sign
-    var x: u64 = 0;
-    var digits: usize = 0;
-    while (i < t.len) : (i += 1) {
-        const c = t[i];
-        if (c < '0' or c > '9') return null; // any non-digit → slow path
-        digits += 1;
-        // ≥20 digits could overflow u64 accumulation AND covers the
-        // leading-zeros-still-int shapes ("00…01") — let parseInt decide.
-        if (digits > 19) return null;
-        x = x * 10 + (c - '0');
-    }
-    const min_mag: u64 = 1 << 63; // |i64 min|
-    if (negative) {
-        if (x > min_mag) return null; // parseInt overflows → parseFloat lane
-        if (x == min_mag) return std.math.minInt(i64);
-        return -@as(i64, @intCast(x));
-    }
-    if (x > std.math.maxInt(i64)) return null;
-    return @intCast(x);
 }
 
 // ---------------------------------------------------------------------------
@@ -556,122 +510,33 @@ test "comparisons: large integers beyond f64 precision are exact" {
     try expect(!eq(Value.int(big), Value.float(two53)));
 }
 
-/// Doc 29 B(a): the fast path must be a STRICT SUBSET of the parseInt lane —
-/// whenever it claims a (pre-trimmed) string, parseInt(i64, t, 0) succeeds
-/// with the identical value. Routing/tag preservation follows: the composed
-/// pipeline (fast → parseInt → parseFloat) is then extensionally equal to
-/// the old one (parseInt → parseFloat).
-fn checkFastSubset(t: []const u8) !void {
-    if (t.len == 0) return; // toNumber nil-checks before the fast path
-    if (fastDecInt(t)) |got| {
-        const want = std.fmt.parseInt(i64, t, 0) catch {
-            std.debug.print("fastDecInt claimed \"{s}\" but parseInt rejects it\n", .{t});
-            return error.TestUnexpectedResult;
-        };
-        try expectEqual(want, got);
-    }
-}
-
-test "doc 29 B(a): fastDecInt is a subset of parseInt — directed families" {
-    // Every doc-29 B edge family, incl. the codex Blocker #1 shapes.
-    const cases = [_][]const u8{
-        "0",                       "1",                    "42",                   "00420",
-        "9223372036854775807",     "-9223372036854775808", "9223372036854775808", // +max overflows → must NOT be claimed
-        "-9223372036854775809", // < min → parseInt overflow → float lane
-        "18446744073709551616", // > u64
-        "0000000000000000000001", // 22 digits, leading zeros: int 1 via slow path
-        "1_000",                   "1__0",                 "_10_",                 "10_",
-        "0x10",                    "0X10",                 "0b101",                "0o17",
-        "0x_10",                   "1e5",                  "1.0",                  "1.",
-        ".5",                      "-0",                   "+0",                   "-0.0",
-        "-0e0",                    "inf",                  "-inf",                 "infinity",
-        "nan",                     "+",                    "-",                    "",
-        "0x",                      "0b",                   "1e999",                "abc",
-        "12a",                     "a12",                  "1 2",                  "٤٢", // non-ASCII digits
-    };
-    for (cases) |t| try checkFastSubset(t);
-    // Claim-coverage pins: the shapes the fast path exists for ARE claimed.
-    try expectEqual(@as(?i64, 420), fastDecInt("00420"));
-    try expectEqual(@as(?i64, -7), fastDecInt("-7"));
-    try expectEqual(@as(?i64, 7), fastDecInt("+7"));
-    try expectEqual(@as(?i64, std.math.maxInt(i64)), fastDecInt("9223372036854775807"));
-    try expectEqual(@as(?i64, std.math.minInt(i64)), fastDecInt("-9223372036854775808"));
-    try expectEqual(@as(?i64, null), fastDecInt("9223372036854775808"));
-    try expectEqual(@as(?i64, null), fastDecInt("1_0"));
-    try expectEqual(@as(?i64, null), fastDecInt("0x10"));
-}
-
-test "doc 29 B(a): fastDecInt subset — pseudo-exhaustive short strings" {
-    // Every string of length 1..4 over an adversarial alphabet: signs,
-    // digits, separators, prefixes, float markers. 13^4 ≈ 28.6k checks.
-    const alpha = "0189+-_.exX bo";
-    var buf: [4]u8 = undefined;
-    for (alpha) |a| {
-        buf[0] = a;
-        try checkFastSubset(buf[0..1]);
-        for (alpha) |b| {
-            buf[1] = b;
-            try checkFastSubset(buf[0..2]);
-            for (alpha) |c| {
-                buf[2] = c;
-                try checkFastSubset(buf[0..3]);
-                for (alpha) |d| {
-                    buf[3] = d;
-                    try checkFastSubset(buf[0..4]);
-                }
-            }
-        }
-    }
-}
-
-test "doc 29 B(a): toNumber end-to-end routing unchanged on the matrix" {
-    // The composed pipeline through the public entry: tags and values.
+test "strToNumber: Lua's numerals, trimmed by C isspace" {
     const h = std.math.inf(f64);
     const Exp = union(enum) { int: i64, float: f64, nil };
     const cases = [_]struct { s: []const u8, want: Exp }{
         .{ .s = "42", .want = .{ .int = 42 } },
-        .{ .s = " 42 ", .want = .{ .int = 42 } }, // trim (via caller) — tested below raw
+        .{ .s = " 42 ", .want = .{ .int = 42 } },
         // C-isspace trim parity with Lua 5.4 + LuaJIT (2026-08-29 probe):
         // \v and \f trim like space/tab; both engines accept all four shapes.
         .{ .s = "\x0B10", .want = .{ .int = 10 } },
         .{ .s = "\x0C10", .want = .{ .int = 10 } },
         .{ .s = "10\x0B", .want = .{ .int = 10 } },
         .{ .s = " \x0B\x0C 10 \x0C\x0B ", .want = .{ .int = 10 } },
-        .{ .s = "00420", .want = .{ .int = 420 } },
-        .{ .s = "1_000", .want = .{ .int = 1000 } }, // std.fmt artifact, grammar (a) freezes it
-        .{ .s = "0o17", .want = .{ .int = 15 } },
-        .{ .s = "0b101", .want = .{ .int = 5 } },
-        .{ .s = "0x10", .want = .{ .int = 16 } },
-        .{ .s = "1e5", .want = .{ .float = 1e5 } },
-        .{ .s = "1.0", .want = .{ .float = 1.0 } },
-        .{ .s = "-0", .want = .{ .int = 0 } },
-        .{ .s = "-0.0", .want = .{ .float = -0.0 } },
-        .{ .s = "9223372036854775808", .want = .{ .float = 9223372036854775808.0 } },
-        .{ .s = "0000000000000000000001", .want = .{ .int = 1 } },
-        .{ .s = "inf", .want = .{ .float = h } },
+        .{ .s = " 0x1p4\t", .want = .{ .float = 16.0 } },
         .{ .s = "1e999", .want = .{ .float = h } },
+        .{ .s = "1_000", .want = .nil },
+        .{ .s = "0b101", .want = .nil },
+        .{ .s = "inf", .want = .nil },
         .{ .s = "zz", .want = .nil },
+        .{ .s = "   ", .want = .nil },
         .{ .s = "", .want = .nil },
     };
     for (cases) |tc| {
-        // Reproduce toNumber's string arm on raw bytes (strBytes needs a heap
-        // Value; the arm's logic below the strBytes call is what we pin).
-        const t = std.mem.trim(u8, tc.s, tonumber_trim);
-        const got: Exp = blk: {
-            if (t.len == 0) break :blk .nil;
-            if (fastDecInt(t)) |iv| break :blk .{ .int = iv };
-            if (std.fmt.parseInt(i64, t, 0)) |iv| break :blk .{ .int = iv } else |_| {}
-            if (std.fmt.parseFloat(f64, t)) |fv| break :blk .{ .float = fv } else |_| {}
-            break :blk .nil;
-        };
+        const got = strToNumber(tc.s);
         switch (tc.want) {
-            .int => |w| try expectEqual(w, got.int),
-            .nil => try expect(got == .nil),
-            .float => |w| {
-                try expect(got == .float);
-                // bit-exact incl. -0.0
-                try expectEqual(@as(u64, @bitCast(w)), @as(u64, @bitCast(got.float)));
-            },
+            .int => |w| try expectEqual(w, got.asInt()),
+            .nil => try expect(got.isNil()),
+            .float => |w| try expectEqual(@as(u64, @bitCast(w)), @as(u64, @bitCast(got.asFloat()))),
         }
     }
 }

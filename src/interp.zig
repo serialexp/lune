@@ -10366,8 +10366,12 @@ pub inline fn fastResult(vm: *const Vm, fast: function.FastBuiltin, regs: RegWin
             return Value.int(@intCast(string.String.fromHeader(x.asHeap()).cpLen()));
         },
         // Out of line: inlined, the parser's register pressure lands on
-        // every other body's path through `opCallFast`.
-        .tonumber => return @call(.never_inline, arith.toNumber, .{ x, if (nargs >= 2) regs.get(first + 1) else null }),
+        // every other body's path through `opCallFast`. A base call is the
+        // native's, which checks its arguments.
+        .tonumber => {
+            if (nargs >= 2 and !regs.get(first + 1).isNil()) return null;
+            return @call(.never_inline, arith.toNumber, .{ x, null });
+        },
         .math_type => {
             if (!x.isNumber()) return Value.nil();
             // Nil only in a bare VM, which interns on the slow path.

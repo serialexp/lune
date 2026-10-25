@@ -13,6 +13,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const token = @import("token.zig");
 const lexer = @import("lexer.zig");
+const numeral = @import("numeral.zig");
 const Token = token.Token;
 const Tag = Token.Tag;
 const Diagnostics = @import("diag.zig").Diagnostics;
@@ -668,16 +669,9 @@ const Parser = struct {
                 _ = self.advance();
                 return self.newExpr(.{ .start = t.start, .end = t.end }, .{ .bool = false });
             },
-            .int_literal => {
+            .int_literal, .float_literal => {
                 _ = self.advance();
                 return self.newExpr(.{ .start = t.start, .end = t.end }, try self.parseNumber(t));
-            },
-            .float_literal => {
-                _ = self.advance();
-                const f = std.fmt.parseFloat(f64, t.lexeme(self.source)) catch {
-                    return self.failAtToken(t, "invalid float literal");
-                };
-                return self.newExpr(.{ .start = t.start, .end = t.end }, .{ .float = f });
             },
             .string_literal => {
                 _ = self.advance();
@@ -712,28 +706,14 @@ const Parser = struct {
         return Error.ParseError;
     }
 
-    /// Parse an integer literal's value. Hex that overflows `i64` wraps (Phase 1
-    /// semantics); a decimal that overflows `i64` promotes to a float.
+    /// A numeric literal's value, read as Lua reads it (`numeral.parse`, the
+    /// lexer's classifier): hex integers wrap, a decimal integer too big for
+    /// `i64` is a float, and floats may be hex (`0x1.8p+1`).
     fn parseNumber(self: *Parser, t: Token) Error!Expr.Data {
-        const text = t.lexeme(self.source);
-        if (std.fmt.parseInt(i64, text, 0)) |v| {
-            return .{ .int = v };
-        } else |e| switch (e) {
-            error.Overflow => {
-                const is_hex = text.len >= 2 and text[0] == '0' and (text[1] == 'x' or text[1] == 'X');
-                if (is_hex) {
-                    const u = std.fmt.parseInt(u64, text, 0) catch {
-                        return self.failAtToken(t, "invalid integer literal");
-                    };
-                    return .{ .int = @bitCast(u) };
-                }
-                const f = std.fmt.parseFloat(f64, text) catch {
-                    return self.failAtToken(t, "invalid integer literal");
-                };
-                return .{ .float = f };
-            },
-            error.InvalidCharacter => return self.failAtToken(t, "invalid integer literal"),
-        }
+        return switch (numeral.parse(t.lexeme(self.source)) orelse return self.failAtToken(t, "malformed number")) {
+            .int => |i| .{ .int = i },
+            .float => |f| .{ .float = f },
+        };
     }
 
     fn parseTable(self: *Parser) Error!*Expr {

@@ -5108,7 +5108,9 @@ pub const RecordingSession = struct {
     /// `tonumber(v[, base])` — konst arguments fold at record time through
     /// `arith.toNumber`, the ONE conversion core shared with tier-0's
     /// `bToNumber` (so the fold and the builtin can never disagree); the result
-    /// is an int/float/nil konst, never an interned string. A non-konst
+    /// is an int/float/nil konst, never an interned string. A konst base call
+    /// folds only when it converts (`arith.tonumberBase`); one that raises is
+    /// tier-0's. A non-konst
     /// observed-*number* 1-arg call is the identity: pin with `guardNum` and
     /// pass the ref through. Everything else (non-konst strings — a guarded
     /// runtime parse — and dynamic bases) aborts; tier-0 owns it.
@@ -5121,8 +5123,9 @@ pub const RecordingSession = struct {
             const base_ref = try self.refOf(@intCast(@as(usize, instr.a) + 2));
             const kb = self.konstValueOf(base_ref) orelse return self.abort(.bad_type);
             const ka = kv orelse return self.abort(.bad_type);
+            const base: ?u8 = if (kb.isNil()) null else arith.tonumberBase(ka, kb) orelse return self.abort(.bad_type);
             try self.guardBuiltinCallee(instr.a, .tonumber);
-            self.setReg(instr.a, try self.konst(arith.toNumber(ka, kb)));
+            self.setReg(instr.a, try self.konst(arith.toNumber(ka, base)));
             return;
         }
         if (kv) |ka| {

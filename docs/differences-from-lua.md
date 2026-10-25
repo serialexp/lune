@@ -24,14 +24,16 @@ is `nil`), `!=`, `!`, `&&`, `||`, and optional type annotations
 (`local x: number = 3`) (`docs/design/13-luajit-syntax-parity.md`). One
 catch: as a statement, `x ~= 1` is xor-assignment, not a comparison.
 
+**Numerals** read as in Lua, hex floats (`0x1.8p+1`) and wrapping hex
+integers included, with one exception: `..` ends a numeral, so `1..2` is
+`1 .. 2` where Lua reports a malformed number.
+
 **Not yet supported:**
 
 - `goto` and labels.
 - The `<const>` and `<close>` attributes.
 - Calls without parentheses: `f"str"`, `f[[str]]`, `f{...}`, so
   `require"mod"` must be `require("mod")`.
-- Hexadecimal floats (`0x1p4`, `0x.8`). A hex integer wider than 64 bits
-  is an error; Lua wraps it.
 - The `\z` escape.
 - A `#!` first line.
 - `...` in the main chunk. Script arguments are only in `arg`.
@@ -152,9 +154,8 @@ What follows from that:
 
 ## The rest of the standard library
 
-- **`string.format`.** **Not yet supported:** `%a`, `%q` of anything but a
-  string, and `%s` of a table with `__tostring`. `%q` writes a newline
-  as `\n` where Lua writes a backslash-newline.
+- **`string.format`.** `%p` writes the object's stable id (`0x11b`, the
+  one `tostring` shows), not its address.
 - **`string.gmatch`** ignores the `init` argument (**not yet
   supported**), and its iterator only works inside a generic `for`.
 - **`string.pack`, `packsize`, `unpack`**: **not yet supported**.

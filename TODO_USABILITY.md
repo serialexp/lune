@@ -87,14 +87,15 @@ effect log so runs stay replayable (doc 02).
       (`math.floor(1e100)` now returns the float, as in Lua.)
 - [ ] `table.sort` without a comparator rejects elements that only have
       `__lt`.
-- [ ] `string.format`: `%s` of a table (even with `__tostring`) or function
+- [x] `string.format`: `%s` of a table (even with `__tostring`) or function
       errors; `%q` of numbers and `%a` fail; `%d` of 3.5 gives 3 (Lua
       errors). `%q` of `"a\nb"` writes `\n` where Lua writes `\` + newline.
+      Fixed 2026-10-26.
 - [ ] Hangs instead of errors: `for i=1,10,0` loops forever (Lua: `'for'
       step is zero`); `for i=maxint-2,maxint` wraps forever;
       `string.rep("x",1e10)` allocates until killed.
-- [ ] Small: `next({})` returns nothing (Lua `nil`); `tonumber("inf")` →
-      inf; `tonumber()`/base 99 return nil instead of erroring;
+- [ ] Small: `next({})` returns nothing (Lua `nil`); ~~`tonumber("inf")` →
+      inf; `tonumber()`/base 99 return nil instead of erroring~~ (fixed);
       `math.tointeger("8")` → nil; `__name` ignored; internal names leak
       into `_G` (`@ipairs_iter`, `@gmatch_iter`, `@codes_iter`).
 
@@ -120,10 +121,10 @@ effect log so runs stay replayable (doc 02).
       coral-marten's doc 66 P5, which holds interp.zig.
 - [ ] Uncaught errors put the location last (`… at file.lua:33`), caught
       ones first.
-- [ ] Bare native errors: `bad argument to 'concat'/'format'` with no
+- [ ] Bare native errors: `bad argument to 'concat'` with no
       argument number or type; `t[nil]=1` → `attempt to index a table
-      value` (Lua: "table index is nil"). (`insert`, `sort`, the math
-      library and bad patterns now give Lua's messages.)
+      value` (Lua: "table index is nil"). (`insert`, `sort`, `format`, the
+      math library and bad patterns now give Lua's messages.)
 - [ ] Excluded functions fail as `attempt to call a nil value`
       (`("x"):byte()`): say "string.byte is not available in mahina; use
       string.codepoint".

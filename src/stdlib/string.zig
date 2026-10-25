@@ -30,6 +30,7 @@ const string_mod = @import("../string.zig");
 const table_mod = @import("../table.zig");
 const pattern = @import("pattern.zig");
 const decimal = @import("decimal.zig");
+const io = @import("../io.zig");
 const gc = @import("../gc.zig");
 const unicode_case = @import("../gen/unicode_case.zig");
 
@@ -662,7 +663,8 @@ fn sCodesAuxN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize
 // format — relocated from interp.zig (name kept: "string.format")
 // ---------------------------------------------------------------------------
 
-/// A parsed `%`-conversion specifier: `%[-+ 0#][width][.prec]<conv>`.
+/// A conversion specifier `%[flags][width][.prec]<conv>` that `parseSpec` has
+/// checked against its conversion's rules (Lua's `checkformat`).
 const FormatSpec = struct {
     minus: bool = false, // '-' left-justify
     zero: bool = false, // '0' zero-pad
@@ -714,22 +716,6 @@ fn emitNumeric(
         try out.appendSlice(gpa, prefix);
         try appendN(out, gpa, '0', zext);
         try out.appendSlice(gpa, digits);
-    }
-}
-
-/// Coerce a `string.format` numeric argument to a signed integer, truncating a
-/// float toward zero. Errors on a non-number or an out-of-range / non-finite float.
-fn argToInt(v: Value) error{TypeError}!i64 {
-    switch (v.tag) {
-        .int => return v.asInt(),
-        .float => {
-            const f = v.asFloat();
-            if (!std.math.isFinite(f) or f >= 9.223372036854776e18 or f < -9.223372036854776e18) {
-                return error.TypeError;
-            }
-            return @intFromFloat(@trunc(f));
-        },
-        else => return error.TypeError,
     }
 }
 
@@ -791,14 +777,250 @@ fn renderG(dst: []u8, mag: f64, p: usize, exp_char: u8, hash: bool) ![]const u8 
     return stripZeros(dst, body);
 }
 
-/// `string.format(fmt, ...)` — a focused C-`printf` supporting Lua's conversions:
-/// `d i u o x X c` (integers), `f F e E g G` (floats), `s` (strings, precision =
-/// max length), `q` (Lua-quoted), and `%%`. Honors the `- + space 0 #` flags,
-/// width, and precision.
+/// Flag bits, and Lua's flag sets per conversion (`lstrlib.c` `L_FMTFLAGS*`).
+const f_minus: u8 = 1;
+const f_zero: u8 = 2;
+const f_plus: u8 = 4;
+const f_space: u8 = 8;
+const f_hash: u8 = 16;
+const flags_float = f_minus | f_plus | f_hash | f_zero | f_space; // a A e E f g G
+const flags_hex = f_minus | f_hash | f_zero; // o x X
+const flags_int = f_minus | f_plus | f_zero | f_space; // d i
+const flags_uint = f_minus | f_zero; // u
+const flags_char = f_minus; // c p s
+
+/// A flag byte's bit, 0 for any other byte.
+const flag_bit = blk: {
+    var t: [256]u8 = @splat(0);
+    t['-'] = f_minus;
+    t['0'] = f_zero;
+    t['+'] = f_plus;
+    t[' '] = f_space;
+    t['#'] = f_hash;
+    break :blk t;
+};
+
+/// The bytes Lua's `getformat` spans before the conversion: flags, digits, `.`.
+const spec_byte = blk: {
+    var t: [256]bool = @splat(false);
+    for ("-+#0 123456789.") |c| t[c] = true;
+    break :blk t;
+};
+
+/// Lua's `MAX_FORMAT - 10`: a spec whose flags, width, precision and
+/// conversion run this long is "invalid format (too long)".
+const max_spec_len = 22;
+
+/// A spec as `sFormat` reads it, before its conversion is known: the
+/// flags as bits, the width and precision, and whether its shape is one
+/// `checkformat` can accept (each number at most two digits, nothing after).
+const SpecRead = struct {
+    flags: u8 = 0,
+    width: usize = 0,
+    precision: ?usize = null,
+    well_formed: bool = true,
+};
+
+/// Lua's `checkformat` on a read spec: every flag in `allowed`, a
+/// precision only where `precision_ok`. Reading every flag first and then
+/// checking the set accepts exactly what Lua's `strspn` over the allowed
+/// flags does: a disallowed flag fails either way.
+inline fn checkSpec(vm: *Vm, sr: SpecRead, allowed: u8, precision_ok: bool, span: []const u8, conv: u8) anyerror!FormatSpec {
+    if (!sr.well_formed or sr.flags & ~allowed != 0 or (sr.precision != null and !precision_ok))
+        return specError(vm, .specification, span, conv);
+    return .{
+        .minus = sr.flags & f_minus != 0,
+        .zero = sr.flags & f_zero != 0,
+        .plus = sr.flags & f_plus != 0,
+        .space = sr.flags & f_space != 0,
+        .hash = sr.flags & f_hash != 0,
+        .width = sr.width,
+        .precision = sr.precision,
+    };
+}
+
+/// Read up to two digits at `fmt[i.*]` (Lua's `get2digits`); a third makes
+/// the spec malformed.
+inline fn specNumber(fmt: []const u8, i: *usize, well_formed: *bool) usize {
+    var n: usize = 0;
+    var nd: usize = 0;
+    while (i.* < fmt.len and fmt[i.*] >= '0' and fmt[i.*] <= '9') : (i.* += 1) {
+        if (nd < 2) n = n * 10 + (fmt[i.*] - '0');
+        nd += 1;
+    }
+    if (nd > 2) well_formed.* = false;
+    return n;
+}
+
+/// Raise one of Lua's two spec errors, naming the spec as written
+/// (`'%' ++ span ++ conv`; a format that ends inside a spec has no `conv`).
+fn specError(vm: *Vm, comptime kind: enum { specification, conversion }, span: []const u8, conv: u8) anyerror {
+    var buf: [96]u8 = undefined;
+    const conv_s: []const u8 = if (conv == 0) "" else &.{conv};
+    const msg = switch (kind) {
+        .specification => std.fmt.bufPrint(&buf, "invalid conversion specification: '%{s}{s}'", .{ span, conv_s }),
+        .conversion => std.fmt.bufPrint(&buf, "invalid conversion '%{s}{s}' to 'format'", .{ span, conv_s }),
+    } catch unreachable; // span < max_spec_len
+    return vm.raiseLocatedError(msg, 1);
+}
+
+/// `luaL_checknumber` for `format`'s float conversions (`arg` is present).
+fn formatNumArg(vm: *Vm, arg: Value, argn: usize) anyerror!f64 {
+    if (!arg.isNumber()) return vm.badArg(argn, "number", arg);
+    return arg.toFloat();
+}
+
+/// C's `#` flag on `%f`/`%e`/`%g`: the body always has a decimal point, put
+/// before the exponent when there is one.
+fn forcePoint(dst: []u8, body: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, body, '.') != null) return body;
+    const ei = std.mem.indexOfAny(u8, body, "eE") orelse body.len;
+    @memcpy(dst[0..ei], body[0..ei]);
+    dst[ei] = '.';
+    @memcpy(dst[ei + 1 ..][0 .. body.len - ei], body[ei..]);
+    return dst[0 .. body.len + 1];
+}
+
+/// C's `%a` magnitude body after the `0x`: a finite non-negative `mag` as
+/// `h.hhhp±d`, the form glibc's `printf` writes. A normal number leads with
+/// `1`, a subnormal with `0` and exponent -1022. With no `precision` the
+/// 13 fraction digits lose their trailing zeros; with one (at most 13 here,
+/// `hexFloatInto` pads past that) they round to nearest-even, and a carry
+/// can raise the leading digit to `2`. `hash` keeps the point even with no
+/// fraction digits.
+fn hexFloatBody(dst: *[32]u8, mag: f64, precision: ?usize, upper: bool, hash: bool) []const u8 {
+    std.debug.assert(precision == null or precision.? <= 13);
+    const bits: u64 = @bitCast(mag);
+    const exp_bits: u64 = (bits >> 52) & 0x7ff;
+    var frac: u64 = bits & ((@as(u64, 1) << 52) - 1);
+    var lead: u8 = if (exp_bits == 0) 0 else 1;
+    const e: i64 = if (exp_bits == 0) (if (frac == 0) 0 else -1022) else @as(i64, @intCast(exp_bits)) - 1023;
+
+    var ndigits: usize = 13;
+    if (precision) |pr| {
+        if (pr < 13) {
+            const shift: u6 = @intCast((13 - pr) * 4);
+            const rem = frac & ((@as(u64, 1) << shift) - 1);
+            const half = @as(u64, 1) << (shift - 1);
+            frac >>= shift;
+            // Ties go to even; with no fraction digits the last kept
+            // digit is the leading one.
+            const odd = if (pr == 0) lead & 1 == 1 else frac & 1 == 1;
+            if (rem > half or (rem == half and odd)) frac += 1;
+            if (frac >> @intCast(pr * 4) != 0) {
+                frac &= (@as(u64, 1) << @intCast(pr * 4)) - 1;
+                lead += 1;
+            }
+            ndigits = pr;
+        }
+    } else {
+        while (ndigits > 0 and frac & 0xf == 0) : (ndigits -= 1) frac >>= 4;
+    }
+
+    const hex = if (upper) "0123456789ABCDEF" else "0123456789abcdef";
+    var w: usize = 0;
+    dst[w] = '0' + lead;
+    w += 1;
+    if (ndigits > 0 or hash) {
+        dst[w] = '.';
+        w += 1;
+    }
+    var d = ndigits;
+    while (d > 0) : (d -= 1) {
+        dst[w] = hex[@intCast((frac >> @intCast((d - 1) * 4)) & 0xf)];
+        w += 1;
+    }
+    const tail = std.fmt.bufPrint(dst[w..], "{c}{s}{d}", .{ @as(u8, if (upper) 'P' else 'p'), if (e < 0) "-" else "+", @abs(e) }) catch unreachable;
+    return dst[0 .. w + tail.len];
+}
+
+/// `hexFloatBody` into `buf`, for any precision: past 13 digits the 13
+/// exact ones are followed by zeros (up to 99 of them).
+fn hexFloatInto(buf: []u8, mag: f64, precision: ?usize, upper: bool, hash: bool) []const u8 {
+    var small: [32]u8 = undefined;
+    const pr = precision orelse return copyInto(buf, hexFloatBody(&small, mag, null, upper, hash));
+    if (pr <= 13) return copyInto(buf, hexFloatBody(&small, mag, pr, upper, hash));
+    const body = hexFloatBody(&small, mag, 13, upper, hash);
+    const p_at = std.mem.indexOfAny(u8, body, "pP").?;
+    var w: usize = 0;
+    @memcpy(buf[w..][0..p_at], body[0..p_at]);
+    w += p_at;
+    @memset(buf[w..][0 .. pr - 13], '0');
+    w += pr - 13;
+    @memcpy(buf[w..][0 .. body.len - p_at], body[p_at..]);
+    return buf[0 .. w + body.len - p_at];
+}
+
+fn copyInto(buf: []u8, s: []const u8) []const u8 {
+    @memcpy(buf[0..s.len], s);
+    return buf[0..s.len];
+}
+
+/// Lua's `addquoted`: `"`, `\` and newline are backslash-escaped (a newline
+/// as `\` plus a real newline), every other control byte as `\ddd`, padded
+/// to three digits when a digit follows so it reads back the same.
+fn addQuoted(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {
+    try out.append(gpa, '"');
+    for (s, 0..) |c, k| {
+        if (c == '"' or c == '\\' or c == '\n') {
+            try out.append(gpa, '\\');
+            try out.append(gpa, c);
+        } else if (c < 0x20 or c == 0x7f) {
+            var ebuf: [8]u8 = undefined;
+            const digit_next = k + 1 < s.len and std.ascii.isDigit(s[k + 1]);
+            const esc = if (digit_next)
+                std.fmt.bufPrint(&ebuf, "\\{d:0>3}", .{c}) catch unreachable
+            else
+                std.fmt.bufPrint(&ebuf, "\\{d}", .{c}) catch unreachable;
+            try out.appendSlice(gpa, esc);
+        } else try out.append(gpa, c);
+    }
+    try out.append(gpa, '"');
+}
+
+/// Lua's `addliteral` (`%q`): a string quoted, an integer in decimal (the
+/// minimum integer in hex, since `-9223372036854775808` reads back as a
+/// float), a float in hex so it reads back exactly (inf as `1e9999`, NaN
+/// as `(0/0)`), nil and booleans as their names. Nothing else has a literal.
+fn addLiteral(vm: *Vm, out: *std.ArrayList(u8), arg: Value, argn: usize) anyerror!void {
+    const gpa = vm.gpa;
+    if (interp.strBytes(arg)) |s| return addQuoted(out, gpa, s);
+    var buf: [48]u8 = undefined;
+    switch (arg.tag) {
+        .int => {
+            const n = arg.asInt();
+            const text = if (n == std.math.minInt(i64))
+                "0x8000000000000000"
+            else
+                std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable;
+            try out.appendSlice(gpa, text);
+        },
+        .float => {
+            const f = arg.asFloat();
+            if (std.math.isNan(f)) return out.appendSlice(gpa, "(0/0)");
+            if (std.math.isInf(f)) return out.appendSlice(gpa, if (f > 0) "1e9999" else "-1e9999");
+            if (std.math.signbit(f)) try out.append(gpa, '-');
+            try out.appendSlice(gpa, "0x");
+            try out.appendSlice(gpa, hexFloatInto(&buf, @abs(f), null, false, false));
+        },
+        .nil => try out.appendSlice(gpa, "nil"),
+        .boolean => try out.appendSlice(gpa, if (arg.asBool()) "true" else "false"),
+        else => return vm.badArgReason(argn, "value has no literal form"),
+    }
+}
+
+/// `string.format(fmt, ...)`, Lua 5.4's `str_format`: the conversions
+/// `d i u c o x X a A f e E g G p q s` and `%%`. Each spec is checked against
+/// its conversion's flags, with a width and precision of at most two digits
+/// (`invalid conversion specification`); an unknown conversion is `invalid
+/// conversion '%…' to 'format'`. Integer conversions take
+/// `luaL_checkinteger` (an integral float is fine, 3.5 is not), `%s` takes
+/// any value through `__tostring` as `tostring` does, and `%c` writes a code
+/// point as UTF-8 (mahina's strings are UTF-8), padding by characters.
 fn sFormat(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    if (args.len < 1) return error.TypeError;
-    const fmt = interp.strBytes(args[0]) orelse return error.TypeError;
+    if (args.len < 1) return vm.badArg(1, "string", null);
+    const fmt = interp.strBytes(args[0]) orelse return vm.badArg(1, "string", args[0]);
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(vm.gpa);
@@ -814,55 +1036,41 @@ fn sFormat(ctx: *anyopaque, args: []const Value) anyerror!Value {
             continue;
         }
         i += 1; // consume '%'
-        if (i >= fmt.len) return error.TypeError;
-        if (fmt[i] == '%') {
+        if (i < fmt.len and fmt[i] == '%') {
             try out.append(gpa, '%');
             i += 1;
             continue;
         }
 
-        var spec: FormatSpec = .{};
-        // flags
-        flags: while (i < fmt.len) : (i += 1) {
-            switch (fmt[i]) {
-                '-' => spec.minus = true,
-                '0' => spec.zero = true,
-                '+' => spec.plus = true,
-                ' ' => spec.space = true,
-                '#' => spec.hash = true,
-                else => break :flags,
-            }
-        }
-        // width (checked accumulate, doc 28 c2: an absurd digit run must reject
-        // as a bad format — the old `w * 10 + d` overflowed usize, a safe-build
-        // panic / ReleaseFast silent wrap on `%99999...9d`)
-        while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {
-            const w10 = std.math.mul(usize, spec.width, 10) catch return error.TypeError;
-            spec.width = std.math.add(usize, w10, fmt[i] - '0') catch return error.TypeError;
-        }
-        // precision (same checked accumulate)
-        if (i < fmt.len and fmt[i] == '.') {
-            i += 1;
-            var p: usize = 0;
-            while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {
-                const p10 = std.math.mul(usize, p, 10) catch return error.TypeError;
-                p = std.math.add(usize, p10, fmt[i] - '0') catch return error.TypeError;
-            }
-            spec.precision = p;
-        }
-        if (i >= fmt.len) return error.TypeError;
-        spec.conv = fmt[i];
-        i += 1;
-
-        // `%%` already handled; every remaining conversion consumes one argument.
-        if (argi >= args.len) return error.TypeError;
+        // As in Lua, the argument is checked before the spec is read.
+        if (argi >= args.len) return vm.badArgReason(argi + 1, "no value");
         const arg = args[argi];
+        const argn = argi + 1;
         argi += 1;
 
+        // Lua's `getformat`: the spec spans flag, digit and '.' bytes; the
+        // byte after it is the conversion (none if the format ends there).
+        // Read flags, width and precision in the same pass; whatever else
+        // the span holds (`%5-d`, `%1.2.3f`) makes it malformed.
+        const span_start = i;
+        var sr: SpecRead = .{};
+        while (i < fmt.len and flag_bit[fmt[i]] != 0) : (i += 1) sr.flags |= flag_bit[fmt[i]];
+        sr.width = specNumber(fmt, &i, &sr.well_formed);
+        if (i < fmt.len and fmt[i] == '.') {
+            i += 1;
+            sr.precision = specNumber(fmt, &i, &sr.well_formed);
+        }
+        while (i < fmt.len and spec_byte[fmt[i]]) : (i += 1) sr.well_formed = false;
+        const span = fmt[span_start..i];
+        if (span.len + 1 >= max_spec_len) return vm.raiseLocatedError("invalid format (too long)", 1);
+        const conv: u8 = if (i < fmt.len) fmt[i] else 0;
+        i += 1;
+
         var nbuf: [512]u8 = undefined;
-        switch (spec.conv) {
+        switch (conv) {
             'd', 'i' => {
-                const n = try argToInt(arg);
+                const n = try vm.intArg(args, argn - 1);
+                const spec = try checkSpec(vm, sr, flags_int, true, span, conv);
                 const neg = n < 0;
                 const un: u64 = @bitCast(n);
                 const mag: u64 = if (neg) (~un +% 1) else un; // |n| in two's complement (safe at minInt)
@@ -870,46 +1078,74 @@ fn sFormat(ctx: *anyopaque, args: []const Value) anyerror!Value {
                 try emitNumeric(&out, gpa, signPrefix(neg, spec), digits, spec);
             },
             'u' => {
-                const n = try argToInt(arg);
+                const n = try vm.intArg(args, argn - 1);
+                const spec = try checkSpec(vm, sr, flags_uint, true, span, conv);
                 const digits = std.fmt.bufPrint(&nbuf, "{d}", .{@as(u64, @bitCast(n))}) catch unreachable;
                 try emitNumeric(&out, gpa, "", digits, spec);
             },
             'o' => {
-                const n = try argToInt(arg);
+                const n = try vm.intArg(args, argn - 1);
+                const spec = try checkSpec(vm, sr, flags_hex, true, span, conv);
                 const digits = std.fmt.bufPrint(&nbuf, "{o}", .{@as(u64, @bitCast(n))}) catch unreachable;
                 const prefix: []const u8 = if (spec.hash and !(digits.len == 1 and digits[0] == '0')) "0" else "";
                 try emitNumeric(&out, gpa, prefix, digits, spec);
             },
             'x', 'X' => {
-                const n = try argToInt(arg);
+                const n = try vm.intArg(args, argn - 1);
+                const spec = try checkSpec(vm, sr, flags_hex, true, span, conv);
                 const u: u64 = @bitCast(n);
-                const digits = if (spec.conv == 'x')
+                const digits = if (conv == 'x')
                     std.fmt.bufPrint(&nbuf, "{x}", .{u}) catch unreachable
                 else
                     std.fmt.bufPrint(&nbuf, "{X}", .{u}) catch unreachable;
                 const prefix: []const u8 = if (spec.hash and u != 0)
-                    (if (spec.conv == 'x') "0x" else "0X")
+                    (if (conv == 'x') "0x" else "0X")
                 else
                     "";
                 try emitNumeric(&out, gpa, prefix, digits, spec);
             },
             'c' => {
+                const spec = try checkSpec(vm, sr, flags_char, false, span, conv);
                 // S-B: `%c` emits the one-code-point string for this scalar value
-                // (UTF-8), not a single truncated byte. Range/surrogate-checked.
-                const n = try argToInt(arg);
-                if (n < 0 or n > 0x10FFFF) return error.TypeError;
+                // (UTF-8), not a single truncated byte.
+                const n = try vm.intArg(args, argn - 1);
+                if (n < 0 or n > 0x10FFFF) return vm.badArgReason(argn, "value out of range");
                 var tmp: [4]u8 = undefined;
-                const ln = std.unicode.utf8Encode(@intCast(n), &tmp) catch return error.TypeError;
+                const ln = std.unicode.utf8Encode(@intCast(n), &tmp) catch return vm.badArgReason(argn, "value out of range");
                 // Route through emitString so the width pads by one **character**
                 // (code point), not by the UTF-8 byte length of the encoding.
                 try emitString(&out, gpa, tmp[0..ln], 1, .{ .minus = spec.minus, .width = spec.width });
             },
-            'f', 'F', 'e', 'E', 'g', 'G' => {
-                if (!arg.isNumber()) return error.TypeError;
-                const f = arg.toFloat();
+            'a', 'A' => {
+                const spec = try checkSpec(vm, sr, flags_float, true, span, conv);
+                const f = try formatNumArg(vm, arg, argn);
+                const upper = conv == 'A';
+                const neg = std.math.signbit(f) and !std.math.isNan(f);
+                const mag = @abs(f);
+                var fspec = spec;
+                fspec.precision = null;
+                var pbuf: [3]u8 = undefined;
+                var plen: usize = 0;
+                const sign = signPrefix(neg, spec);
+                @memcpy(pbuf[0..sign.len], sign);
+                plen = sign.len;
+                const body = if (std.math.isNan(mag) or std.math.isInf(mag)) blk: {
+                    fspec.zero = false;
+                    break :blk if (std.math.isNan(mag)) (if (upper) "NAN" else "nan") else (if (upper) "INF" else "inf");
+                } else blk: {
+                    pbuf[plen] = '0';
+                    pbuf[plen + 1] = if (upper) 'X' else 'x';
+                    plen += 2;
+                    break :blk hexFloatInto(&nbuf, mag, spec.precision, upper, spec.hash);
+                };
+                try emitNumeric(&out, gpa, pbuf[0..plen], body, fspec);
+            },
+            'f', 'e', 'E', 'g', 'G' => {
+                const f = try formatNumArg(vm, arg, argn);
+                const spec = try checkSpec(vm, sr, flags_float, true, span, conv);
                 const neg = std.math.signbit(f) and !std.math.isNan(f);
                 const mag = if (neg) -f else f;
-                const upper = spec.conv == 'F' or spec.conv == 'E' or spec.conv == 'G';
+                const upper = conv == 'E' or conv == 'G';
                 var rbuf: [float_body_max]u8 = undefined;
                 var body: []const u8 = undefined;
                 // C renders inf/nan as letters (no digits); the `0` flag is
@@ -922,64 +1158,85 @@ fn sFormat(ctx: *anyopaque, args: []const Value) anyerror!Value {
                 } else if (std.math.isInf(mag)) {
                     body = if (upper) "INF" else "inf";
                     fspec.zero = false;
-                } else switch (spec.conv) {
-                    'f', 'F' => body = decimal.fixed(&rbuf, mag, spec.precision orelse 6) catch
-                        return error.TypeError,
-                    'e', 'E' => body = decimal.scientific(&rbuf, mag, spec.precision orelse 6, if (upper) 'E' else 'e') catch
-                        return error.TypeError,
-                    else => { // 'g'/'G': C significant-digit form, default precision 6, min 1
-                        const p = blk: {
-                            const pp = spec.precision orelse 6;
-                            break :blk if (pp == 0) 1 else pp;
-                        };
-                        body = try renderG(&rbuf, mag, p, if (upper) 'E' else 'e', spec.hash);
-                    },
+                } else {
+                    switch (conv) {
+                        'f' => body = decimal.fixed(&rbuf, mag, spec.precision orelse 6) catch
+                            return error.TypeError,
+                        'e', 'E' => body = decimal.scientific(&rbuf, mag, spec.precision orelse 6, if (upper) 'E' else 'e') catch
+                            return error.TypeError,
+                        else => { // 'g'/'G': C significant-digit form, default precision 6, min 1
+                            const pr = blk: {
+                                const pp = spec.precision orelse 6;
+                                break :blk if (pp == 0) 1 else pp;
+                            };
+                            body = try renderG(&rbuf, mag, pr, if (upper) 'E' else 'e', spec.hash);
+                        },
+                    }
+                    if (spec.hash) body = forcePoint(&nbuf, body);
                 }
                 try emitNumeric(&out, gpa, signPrefix(neg, spec), body, fspec);
             },
-            's' => {
-                // S-B: `%.Ns` precision counts **code points**, not bytes.
-                // doc 28 c2: the string arg is taken as its OBJECT — the kept
-                // character count is known from the cached `cp_len` (clamped
-                // precision via `charPrefixEndS`, which also kills the old
-                // `p + 1` overflow on a huge precision), so emitString never
-                // rescans. A coerced number is ASCII by construction (digits,
-                // sign, '.', 'e', inf/nan) — chars ARE bytes there.
-                if (strObjOf(arg)) |sobj| {
-                    const full = sobj.bytes();
-                    if (spec.precision) |p| {
-                        const kept = @min(p, sobj.cpLen());
-                        try emitString(&out, gpa, full[0..charPrefixEndS(sobj, p)], kept, spec);
-                    } else {
-                        try emitString(&out, gpa, full, sobj.cpLen(), spec);
-                    }
-                } else if (arg.isNumber()) {
-                    var sbuf: [64]u8 = undefined;
-                    const full = try interp.coerceConcat(arg, &sbuf);
-                    const body = if (spec.precision) |p| full[0..@min(p, full.len)] else full;
-                    try emitString(&out, gpa, body, body.len, spec);
-                } else {
-                    try formatNonStr(&out, gpa, arg, spec);
-                }
+            'p' => {
+                const spec = try checkSpec(vm, sr, flags_char, false, span, conv);
+                // Lua prints the object's address; mahina its stable id, the
+                // same one `tostring` shows. A value with no identity (a
+                // number, boolean or nil) is "(null)", as in Lua.
+                const text = switch (arg.tag) {
+                    .heap_ref => std.fmt.bufPrint(&nbuf, "0x{x}", .{arg.asHeap().id}) catch unreachable,
+                    .row_view => std.fmt.bufPrint(&nbuf, "0x{x}#{d}", .{ arg.rowViewParent().id, arg.rowViewRow() }) catch unreachable,
+                    else => "(null)",
+                };
+                try emitString(&out, gpa, text, text.len, spec);
             },
             'q' => {
-                const s = interp.strBytes(arg) orelse return error.TypeError;
-                try out.append(gpa, '"');
-                for (s) |qc| switch (qc) {
-                    '"' => try out.appendSlice(gpa, "\\\""),
-                    '\\' => try out.appendSlice(gpa, "\\\\"),
-                    '\n' => try out.appendSlice(gpa, "\\n"),
-                    '\r' => try out.appendSlice(gpa, "\\r"),
-                    0 => try out.appendSlice(gpa, "\\0"),
-                    else => try out.append(gpa, qc),
-                };
-                try out.append(gpa, '"');
+                if (span.len != 0) return vm.raiseLocatedError("specifier '%q' cannot have modifiers", 1);
+                try addLiteral(vm, &out, arg, argn);
             },
-            else => return error.TypeError, // unknown conversion
+            's' => {
+                // `luaL_tolstring`: `__tostring` first, then the value's own text.
+                const sobj: ?*const String = if (try vm.metaToString(arg)) |ts| strObjOf(ts) else strObjOf(arg);
+                var tbuf: [128]u8 = undefined;
+                const full = if (sobj) |so| so.bytes() else plainText(&tbuf, arg);
+                if (span.len == 0) {
+                    try out.appendSlice(gpa, full);
+                    continue;
+                }
+                if (std.mem.indexOfScalar(u8, full, 0) != null) return vm.badArgReason(argn, "string contains zeros");
+                const spec = try checkSpec(vm, sr, flags_char, true, span, conv);
+                if (spec.precision == null and full.len >= 100) {
+                    // As in Lua: too long to pad, so it is kept whole.
+                    try out.appendSlice(gpa, full);
+                    continue;
+                }
+                // S-B: `%.Ns` precision counts **code points**, not bytes.
+                // doc 28 c2: a string's character count is its cached
+                // `cp_len` (clamped precision via `charPrefixEndS`), so
+                // emitString never rescans. The rendering of a value with no
+                // string (a number, `table: 0x…`) is ASCII: chars ARE bytes.
+                if (sobj) |so| {
+                    if (spec.precision) |pr| {
+                        try emitString(&out, gpa, full[0..charPrefixEndS(so, pr)], @min(pr, so.cpLen()), spec);
+                    } else {
+                        try emitString(&out, gpa, full, so.cpLen(), spec);
+                    }
+                } else {
+                    const body = if (spec.precision) |pr| full[0..@min(pr, full.len)] else full;
+                    try emitString(&out, gpa, body, body.len, spec);
+                }
+            },
+            else => return specError(vm, .conversion, span, conv),
         }
     }
 
     return vm.heap.internValue(out.items);
+}
+
+/// `tostring`'s text for a value with no `__tostring` and no string of its
+/// own: a number, nil, a boolean, or the `kind: 0x<id>` of an object.
+fn plainText(buf: *[128]u8, v: Value) []const u8 {
+    var w = io.Writer.fixed(buf);
+    io.writeValue(&w, v) catch unreachable; // bounded: scalars and identity forms
+    return w.buffered();
 }
 
 /// Emit a string field with width + `-` justification (the `0` flag is ignored
@@ -1000,17 +1257,6 @@ fn emitString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, body: []const u8,
         try appendN(out, gpa, ' ', pad);
         try out.appendSlice(gpa, body);
     }
-}
-
-/// `%s` fallback for nil/boolean (Lua applies `tostring`).
-fn formatNonStr(out: *std.ArrayList(u8), gpa: std.mem.Allocator, v: Value, spec: FormatSpec) !void {
-    const body: []const u8 = switch (v.tag) {
-        .nil => "nil",
-        .boolean => if (v.asBool()) "true" else "false",
-        else => return error.TypeError,
-    };
-    const trimmed = if (spec.precision) |p| body[0..@min(p, body.len)] else body;
-    try emitString(out, gpa, trimmed, trimmed.len, spec); // ASCII bodies: chars == bytes
 }
 
 // ---------------------------------------------------------------------------
@@ -1932,7 +2178,7 @@ test "string.format: integer/float/string/quote specs" {
     const r = try sFormat(@ptrCast(&vm), &.{ f, Value.int(42), Value.int(42), Value.float(3.14159), Value.int(255), try sv(&vm, "hi"), try sv(&vm, "a\"b") });
     try testing.expectEqualStrings("[   42][42   ][03.14][ff][hi][\"a\\\"b\"]", bytesOf(r));
     // Unknown conversion errors.
-    try testing.expectError(error.TypeError, sFormat(@ptrCast(&vm), &.{ try sv(&vm, "%y"), Value.int(1) }));
+    try testing.expectError(error.LuaError, sFormat(@ptrCast(&vm), &.{ try sv(&vm, "%y"), Value.int(1) }));
 }
 
 test "string.format: %s and %c field width pad by code points (S-B)" {

@@ -74,19 +74,23 @@ Wrong results:
 - [x] Malformed patterns (`[a`, a trailing `%`, unbalanced `(`/`)`, `%1`
       with no capture, `%b`, `%f` without `[`, >32 captures) raise the
       literal string `"HostError"`. Each now raises Lua's message.
-- [ ] `%q` round trip: `("\0" .. "1")` is written `"\01"`, which reads back
-      as `"\1"`. Lua pads to `\0001`.
-- [ ] `string.format("%d", 3.5)` and `%x` of 1.5 truncate silently (Lua:
+- [x] `%q` round trip: `("\0" .. "1")` is written `"\01"`, which reads back
+      as `"\1"`. Lua pads to `\0001`. `string.format` now follows
+      `str_format` (spec checks, `%a`, `%p`, `%q` of numbers, `%s` via
+      `__tostring`); hex output matches glibc on ~48k cases.
+- [x] `string.format("%d", 3.5)` and `%x` of 1.5 truncate silently (Lua:
       "number has no integer representation"); `%100d` is accepted;
       the `#` flag is ignored for floats.
-- [ ] `tonumber` uses Zig's parsers: it accepts `"1_000"`, `"0b101"`,
+- [x] `tonumber` uses Zig's parsers: it accepts `"1_000"`, `"0b101"`,
       `"0o17"`, `"inf"`, `"nan"` (Lua: nil). `"0xffffffffffffffff"` gives a
       float (Lua wraps to -1); `tonumber("ffffffffffffffff", 16)` is nil
       (Lua -1); `tonumber(10, 16)` and base 1 or 37 return nil (Lua
-      raises).
+      raises). `src/numeral.zig` is now the one grammar for literals,
+      `tonumber` and `read("n")`; hex float literals lex.
 - [ ] Lexer: unknown escapes (`"\q"`) are accepted (Lua: "invalid escape
-      sequence"); `3..2` parses as `3 .. 2`; `"a\` + CRLF + `b"` is
-      "unterminated string".
+      sequence"); `"a\` + CRLF + `b"` is "unterminated string". (`3..2`
+      as `3 .. 2` is pinned by a lexer test, so kept and documented as a
+      difference; Bart to decide whether to match Lua's error.)
 - [x] Missing-argument checks: `tostring()`, `tonumber()`,
       `getmetatable()`, `rawequal(1)`, `setmetatable({})`,
       `math.tointeger()` return instead of raising "value expected".
@@ -1536,6 +1540,17 @@ work, not implemented by that first arc:
 - [ ] Stable runtime scratch/context ownership distinct from collector mechanism.
 - [ ] Visualizer session/artifact ownership, injected execution clients, and stale async result tests (retain Solid stores).
 - [ ] Native registry uniqueness and restore identity validation, without assuming backwards compatibility.
+
+## Metamethod absence cache (noted 2026-10-26)
+
+Every metamethod probe is a hash `get` on the metatable (`Vm.metamethod`),
+including the common "not there" answer. `string.format("%s", s)` now
+probes the string metatable for `__tostring` per argument (Lua's
+`luaL_tolstring` does the same), worth ~1.5% of `str_format`. Lua keeps a
+per-table `flags` byte of known-absent metamethods, cleared on any store
+into the table (`ltm.c` `luaT_gettm`, `invalidateTMcache`). The same here
+would make every negative probe (`__index`, `__newindex`, `__eq`,
+`__tostring`, ...) one bit test. General, not format-specific.
 
 ## `require` returns 1 value, Lua 5.4 returns 2
 

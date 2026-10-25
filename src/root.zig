@@ -21,6 +21,8 @@ pub const object = @import("object.zig");
 pub const value = @import("value.zig");
 pub const regwindow = @import("regwindow.zig");
 pub const arith = @import("arith.zig");
+/// Lua's numeral grammar — literals, `tonumber`, `file:read("n")`.
+pub const numeral = @import("numeral.zig");
 
 /// Memory accounting — the `TrackingAllocator` wrapper + allocation discipline.
 pub const mem = @import("mem.zig");
@@ -153,6 +155,7 @@ test {
     _ = value;
     _ = regwindow;
     _ = arith;
+    _ = numeral;
     _ = mem;
     _ = io;
     _ = system;

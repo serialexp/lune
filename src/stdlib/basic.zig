@@ -83,14 +83,20 @@ fn bToString(ctx: *anyopaque, args: []const Value) anyerror!Value {
 // tonumber — relocated from interp.zig's bench stdlib (name kept: "tonumber")
 // ---------------------------------------------------------------------------
 
-/// `tonumber(v [, base])`. Numbers pass through. A string is trimmed and parsed:
-/// with an explicit `base` as an integer in that base; otherwise auto (int first —
-/// honoring a `0x` prefix — then float). Anything unparseable / non-numeric → nil.
-/// The conversion itself lives in `arith.toNumber` — the ONE core shared with the
-/// trace recorder's konst fold (doc 23 D2), so the two can never disagree.
+/// `tonumber(v [, base])`, Lua's `luaB_tonumber`. Without a base (or a nil
+/// one) a number passes through and a string is read as a Lua numeral;
+/// anything else is nil. With a base, `v` must be a string and the base an
+/// integer in 2..36 (checked in Lua's order: the base, then `v`, then the
+/// range), and the string is read as an integer in that base. The
+/// conversion itself lives in `arith.toNumber` — the ONE core shared with
+/// the trace recorder's konst fold (doc 23 D2), so the two can never disagree.
 fn bToNumber(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    const v = try anyArg(vmOf(ctx), args, 0);
-    return arith.toNumber(v, if (args.len >= 2) args[1] else null);
+    const vm = vmOf(ctx);
+    if (args.len < 2 or args[1].isNil()) return arith.toNumber(try anyArg(vm, args, 0), null);
+    const base = try vm.intArg(args, 1);
+    if (interp.strBytes(args[0]) == null) return vm.badArg(1, "string", args[0]);
+    if (base < 2 or base > 36) return vm.badArgReason(2, "base out of range");
+    return arith.toNumber(args[0], @intCast(base));
 }
 
 // ---------------------------------------------------------------------------

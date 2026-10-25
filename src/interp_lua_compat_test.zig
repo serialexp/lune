@@ -189,3 +189,73 @@ test "__tostring may return a number but not a table" {
         \\print(pcall(tostring, setmetatable({}, {__tostring = function() return {} end})))
     , "42\nfalse\t'__tostring' must return a string\n");
 }
+
+test "string.format checks its specs as Lua does" {
+    try expectProgram(
+        \\local function e(...) print(select(2, pcall(string.format, ...))) end
+        \\e("%d", 3.5)
+        \\e("%100d", 1)
+        \\e("%#d", 1)
+        \\e("%05s", "a")
+    , "bad argument #2 to 'format' (number has no integer representation)\n" ++
+        "invalid conversion specification: '%100d'\n" ++
+        "invalid conversion specification: '%#d'\n" ++
+        "invalid conversion specification: '%05s'\n");
+    try expectProgram(
+        \\local function e(...) print(select(2, pcall(string.format, ...))) end
+        \\e("%F", 1)
+        \\e("abc%")
+        \\e("%5q", "x")
+    , "invalid conversion '%F' to 'format'\n" ++
+        "bad argument #2 to 'format' (no value)\n" ++
+        "specifier '%q' cannot have modifiers\n");
+}
+
+test "string.format: %a, the # flag, and %s through __tostring" {
+    try expectProgram(
+        \\print(string.format("%a %A %.0a %.3a %a", 1.5, 0.1, 1.5, 1, 2^-1074))
+        \\print(string.format("%#.0f %#.0e %#.0g %d", 3, 3, 3, 3.0))
+        \\local t = setmetatable({}, {__tostring = function() return "TS" end})
+        \\print(string.format("[%s][%4s][%-4s]", t, t, t))
+        \\print(select(2, pcall(string.format, "%5s", "a\0b")))
+    , "0x1.8p+0 0X1.999999999999AP-4 0x2p+0 0x1.000p+0 0x0.0000000000001p-1022\n" ++
+        "3. 3.e+00 3. 3\n[TS][  TS][TS  ]\n" ++
+        "bad argument #2 to 'format' (string contains zeros)\n");
+}
+
+test "string.format %q writes literals that read back exactly" {
+    try expectProgram(
+        \\print(string.format("%q %q %q", "\0" .. "1", "a\r\t", 1.5))
+        \\print(string.format("%q %q %q %q", 1/0, -1/0, 0/0, math.mininteger))
+        \\print(select(2, pcall(string.format, "%q", {})))
+        \\local v = 1/3
+        \\print(load(string.format("return %q", v))() == v)
+    , "\"\\0001\" \"a\\13\\9\" 0x1.8p+0\n1e9999 -1e9999 (0/0) 0x8000000000000000\n" ++
+        "bad argument #2 to 'format' (value has no literal form)\ntrue\n");
+}
+
+test "tonumber reads Lua's numerals" {
+    try expectProgram(
+        \\print(tonumber("1_000"), tonumber("0b101"), tonumber("0o17"), tonumber("inf"), tonumber("nan"))
+        \\print(tonumber("0xffffffffffffffff"), tonumber(" 0x1p4 "), tonumber("0x.8"), tonumber("1e"))
+        \\print(tonumber("ffffffffffffffff", 16), tonumber("z", 36), tonumber("2", 2), tonumber("10", nil))
+        \\print(select(2, pcall(tonumber, 10, 16)))
+        \\print(select(2, pcall(tonumber, "10", 37)))
+        \\print(select(2, pcall(tonumber, "10", 2.5)))
+    , "nil\tnil\tnil\tnil\tnil\n-1\t16\t0.5\tnil\n-1\t35\tnil\t10\n" ++
+        "bad argument #1 to 'tonumber' (string expected, got number)\n" ++
+        "bad argument #2 to 'tonumber' (base out of range)\n" ++
+        "bad argument #2 to 'tonumber' (number has no integer representation)\n");
+}
+
+test "numeric literals: hex floats, wrapping hex, malformed numerals" {
+    try expectProgram(
+        \\print(0x1.8p+1, 0x.8, 0xA.8P0, 0x1p-3, 0xffffffffffffffff, 9223372036854775808)
+        \\print(load("return 3x"))
+        \\print(load("return 0x"))
+        \\print(load("return 1e+"))
+    , "3\t0.5\t10.5\t0.125\t-1\t9223372036854776000\n" ++
+        "nil\t(load):1: malformed number\n" ++
+        "nil\t(load):1: malformed number\n" ++
+        "nil\t(load):1: malformed number\n");
+}
