@@ -51,3 +51,13 @@ test "multiple assignment evaluates targets, then values, then stores right to l
         \\print(g[1][2], g[1][3], s[1], s[2])
     , "20\tnil\t4\n1 2 3 4\nfirst\ta\tnil\t2\n5\t6\t1\t3\n");
 }
+
+test "an iterator that is done returns one nil" {
+    try expectProgram(
+        \\print(select('#', next({})), next({}))
+        \\local f, s = ipairs({})
+        \\print(select('#', f(s, 0)), f(s, 0))
+        \\for k, v in pairs({1, x = 2}) do io.write(tostring(k), "=", v, " ") end
+        \\print()
+    , "1\tnil\n1\tnil\n1=1 x=2 \n");
+}

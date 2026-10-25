@@ -87,6 +87,10 @@ division or modulo by zero".
   in the order they were first inserted. Lua's order depends on hashing;
   mahina's is the same on every run and every platform
   (`docs/design/02-determinism.md`).
+- `next(t, k)` with a `k` that is not in `t` returns the key after it
+  rather than raising "invalid key to 'next'": a traversal may delete
+  the current key, and mahina does not keep deleted keys around to tell
+  the two apart.
 - `#t` on a table with holes may pick a different border than Lua does
   (both are valid): `#{1, 2, nil, 4}` is 2, where Lua gives 4.
 - `tostring({})` is `table: 0x11b`: a small object number, not an

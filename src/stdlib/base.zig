@@ -206,17 +206,23 @@ fn nNext1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     return if (step.found) step.key else Value.nil();
 }
 
-/// `next(t [, ctrl])` multi path — `(key, value)`, or 0 results at the end (the
-/// VM nil-pads, so the generic-for sees a nil first var and stops).
+/// `next(t [, ctrl])` multi path — `(key, value)`, or one `nil` at the end, as
+/// in Lua (`select('#', next({}))` is 1).
 fn nNextN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
     const container = try iterableArg(vm, args, 0);
     const ctrl = if (args.len >= 2) args[1] else Value.nil();
     const step = try nextStepAny(vm.gpa, container, ctrl);
-    if (!step.found) return 0;
+    if (!step.found) return endOfTraversal(out);
     if (out.len >= 1) out[0] = step.key;
     if (out.len >= 2) out[1] = step.val;
     return @min(@as(usize, 2), out.len);
+}
+
+/// The one `nil` an iterator returns when it is done.
+fn endOfTraversal(out: []Value) usize {
+    if (out.len >= 1) out[0] = Value.nil();
+    return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -241,15 +247,15 @@ fn nInext1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     return if (iterableGetInt(container, j).isNil()) Value.nil() else Value.int(j);
 }
 
-/// `@ipairs_iter(t, i)` multi path — `(i+1, t[i+1])`, or 0 results at the first
-/// nil.
+/// `@ipairs_iter(t, i)` multi path — `(i+1, t[i+1])`, or one `nil` at the
+/// first nil, as Lua's `ipairsaux` returns.
 fn nInextN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
     const container = try iterableArg(vm, args, 0);
     const i = if (args.len >= 2 and args[1].isInt()) args[1].asInt() else 0;
     const j = i +% 1;
     const v = iterableGetInt(container, j);
-    if (v.isNil()) return 0;
+    if (v.isNil()) return endOfTraversal(out);
     if (out.len >= 1) out[0] = Value.int(j);
     if (out.len >= 2) out[1] = v;
     return @min(@as(usize, 2), out.len);
@@ -384,7 +390,8 @@ test "next/ipairs traverse a grid row_view as a length-#row array" {
     try testing.expectEqual(@as(i64, 3), out[1].asInt());
 
     n = try nNextN(ctx, &.{ rv, Value.int(3) }, &out);
-    try testing.expectEqual(@as(usize, 0), n); // past the last non-nil cell → done
+    try testing.expectEqual(@as(usize, 1), n); // past the last non-nil cell → done: one nil
+    try testing.expect(out[0].isNil());
 
     // `pairs(rv)` hands back (next, rv, nil) — the row_view rides as the state.
     var trip: [3]Value = undefined;
@@ -399,5 +406,6 @@ test "next/ipairs traverse a grid row_view as a length-#row array" {
     try testing.expectEqual(@as(i64, 1), out[0].asInt());
     try testing.expectEqual(@as(i64, 1), out[1].asInt());
     n = try nInextN(ctx, &.{ rv, Value.int(1) }, &out);
-    try testing.expectEqual(@as(usize, 0), n); // t[2] is a hole → ipairs halts
+    try testing.expectEqual(@as(usize, 1), n); // t[2] is a hole → ipairs halts: one nil
+    try testing.expect(out[0].isNil());
 }

@@ -27,10 +27,15 @@ Wrong results:
       `i = 3; i, a[i] = i+1, 20` sets `a[4]` (the manual's own example
       says `a[3]`); `t[k(1)], t[k(2)] = k(3), k(4)` calls `k` in the order
       3 4 1 2 (Lua 1 2 3 4).
-- [ ] `next({})` returns no values (Lua one `nil`), so
-      `select('#', next({}))` is 0; `next({}, "nokey")` returns nothing
-      (Lua: "invalid key to 'next'"). `print()` and `warn()` return one
-      `nil` (Lua none).
+- [x] `next({})` returns no values (Lua one `nil`), so
+      `select('#', next({}))` is 0. The `ipairs` iterator too. Not a bug:
+      `next({}, "nokey")` returns `nil` where Lua raises "invalid key to
+      'next'"; the traversal steps past a key deleted mid-loop by design,
+      and can't tell it from one never present (documented).
+- [ ] Natives that return nothing in Lua return one `nil` in mahina:
+      `select('#', print())`, `table.insert`, `table.sort`, `warn` are 1
+      (Lua 0). Needs a general "no results" native shape, not per-native
+      multi functions.
 - [ ] Float `%` with an infinite divisor: `5 % math.huge` and
       `-5 % math.huge` are `-nan` (Lua `5.0`, `inf`); `1e300 % 7` is `0`
       (Lua `1.0`). `arith.mod` uses `a - floor(a/b)*b`, not `fmod` with
