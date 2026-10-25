@@ -152,10 +152,14 @@ pub noinline fn schar1Runtime(heap: *gc.Heap, code: i64) callconv(.c) StrResult 
     return .ok(&r.header);
 }
 
-/// `srep2` body: 2-argument `string.rep(s, n)`.
+/// `srep2` body: 2-argument `string.rep(s, n)`. A result past the largest
+/// string → decline (tier-0 replays and raises "resulting string too large").
 pub noinline fn srep2Runtime(heap: *gc.Heap, s: *object.GcHeader, n: i64) callconv(.c) StrResult {
     const str = string_mod.String.fromHeader(s);
-    const r = string_std.rep2Core(heap, str, n) catch return .oom;
+    const r = string_std.rep2Core(heap, str, n) catch |e| return switch (e) {
+        error.TooLarge => .decline,
+        error.OutOfMemory => .oom,
+    };
     return .ok(&r.header);
 }
 

@@ -97,7 +97,8 @@ pub fn optIntArg(vm: *Vm, args: []const Value, i: usize, default: i64) anyerror!
 fn posRelat(pos: i64, len: usize) i64 {
     if (pos >= 0) return pos;
     const l: i64 = @intCast(len);
-    if (-pos > l) return 0;
+    // `pos < -l`, not `-pos > l`: negating minInt overflows.
+    if (pos < -l) return 0;
     return l + pos + 1;
 }
 
@@ -327,17 +328,31 @@ pub fn char1Core(heap: *gc.Heap, code: i64) (error{OutOfRange} || std.mem.Alloca
 /// Takes the `*String` (doc 28 §6): repetition multiplies the character count
 /// exactly and preserves the ASCII bit — both are per-byte properties, so this
 /// holds for ANY bytes, not just valid UTF-8.
-pub fn rep2Core(heap: *gc.Heap, str: *const String, n: i64) std.mem.Allocator.Error!*String {
+pub fn rep2Core(heap: *gc.Heap, str: *const String, n: i64) (error{TooLarge} || std.mem.Allocator.Error)!*String {
     if (n <= 0) return heap.internKnown("", .{ .cp_len = 0, .ascii = true });
     const bytes = str.bytes();
-    var buf: std.ArrayList(u8) = .empty;
+    const total = repBytes(bytes.len, n, 0) orelse return error.TooLarge;
+    var buf: std.ArrayList(u8) = try .initCapacity(heap.gpa, total);
     defer buf.deinit(heap.gpa);
     const count: usize = @intCast(n);
     var k: usize = 0;
-    while (k < count) : (k += 1) try buf.appendSlice(heap.gpa, bytes);
+    while (k < count) : (k += 1) buf.appendSliceAssumeCapacity(bytes);
     // Checked multiply: overflow → null (recount), NEVER a wrapped claim.
     const known_cp: ?usize = std.math.mul(usize, str.cpLen(), count) catch null;
     return heap.internKnown(buf.items, .{ .cp_len = known_cp, .ascii = str.isAscii() });
+}
+
+/// The byte length of `n > 0` copies of a `len`-byte string joined by a
+/// `sep_len`-byte separator, or null when it is past the largest string
+/// (Lua's "resulting string too large"). The bound is the same on every
+/// target, `maxInt(i64)`, then capped to the address space.
+fn repBytes(len: usize, n: i64, sep_len: usize) ?usize {
+    const count: u64 = @intCast(n);
+    const body = std.math.mul(u64, len, count) catch return null;
+    const seps = std.math.mul(u64, sep_len, count - 1) catch return null;
+    const total = std.math.add(u64, body, seps) catch return null;
+    if (total > std.math.maxInt(i64) or total > std.math.maxInt(usize)) return null;
+    return @intCast(total);
 }
 
 // ---------------------------------------------------------------------------
@@ -477,18 +492,22 @@ fn sRep(ctx: *anyopaque, args: []const Value) anyerror!Value {
     else
         "";
     if (sep.len == 0) { // the recordable 2-arg shape shares the ONE core
-        const r = try rep2Core(vm.heap, sobj, n);
+        const r = rep2Core(vm.heap, sobj, n) catch |e| return switch (e) {
+            error.TooLarge => vm.raiseLocatedError("resulting string too large", 1),
+            error.OutOfMemory => e,
+        };
         return Value.heap(&r.header);
     }
     if (n <= 0) return vm.heap.internValue("");
 
-    var buf: std.ArrayList(u8) = .empty;
+    const total = repBytes(s.len, n, sep.len) orelse return vm.raiseLocatedError("resulting string too large", 1);
+    var buf: std.ArrayList(u8) = try .initCapacity(vm.gpa, total);
     defer buf.deinit(vm.gpa);
     const count: usize = @intCast(n);
     var k: usize = 0;
     while (k < count) : (k += 1) {
-        if (k != 0) try buf.appendSlice(vm.gpa, sep);
-        try buf.appendSlice(vm.gpa, s);
+        if (k != 0) buf.appendSliceAssumeCapacity(sep);
+        buf.appendSliceAssumeCapacity(s);
     }
     return vm.heap.internValue(buf.items);
 }
@@ -572,20 +591,23 @@ fn sCodepointN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usiz
     if (r.lo > r.hi) return 0;
     const bytes = s.bytes();
     const count = r.hi - r.lo + 1;
+    // More results than the whole stack holds: Lua's checkstack message.
+    // Fewer, but more than `out` holds, is the VM's call (`NativeMultiFn`).
+    if (count > vm.regCapacity()) return vm.raiseLocatedError("stack overflow (string slice too long)", 1);
     var k: usize = 0;
     if (isAscii(s)) {
         // doc 28 L1: bytes are the code points; no decode loop.
-        while (k < count and k < out.len and r.lo - 1 + k < bytes.len) : (k += 1)
+        while (k < count and k < out.len) : (k += 1)
             out[k] = Value.int(bytes[r.lo - 1 + k]);
-        return k;
+        return count;
     }
     var off = charByteOffset(bytes, r.lo);
-    while (k < count and k < out.len and off < bytes.len) : (k += 1) {
+    while (k < count and k < out.len) : (k += 1) {
         const d = decodeAt(bytes, off);
         out[k] = Value.int(@intCast(d.cp));
         off += d.len;
     }
-    return k;
+    return count;
 }
 
 /// The hidden iterator `s:codes()` hands back, mirroring `@gmatch_iter`: a

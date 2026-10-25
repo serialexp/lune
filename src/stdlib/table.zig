@@ -190,6 +190,8 @@ fn tMove(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const a2 = if (given(args, 4)) try tableArg(vm, args, 4) else a1;
 
     if (e >= f) {
+        if (!(f > 0 or e < std.math.maxInt(i64) + f)) return vm.badArgReason(3, "too many elements to move");
+        if (tpos > std.math.maxInt(i64) - (e - f)) return vm.badArgReason(4, "destination wrap around");
         // Forward when ranges don't overlap-up (or different tables); else
         // backward to preserve overlapping source bytes.
         if (tpos > e or tpos <= f or a1 != a2) {
@@ -221,30 +223,46 @@ fn tPack(ctx: *anyopaque, args: []const Value) anyerror!Value {
 }
 
 /// `table.unpack(t, [i, [j]])` primary projection — `t[i]` (default `i=1`).
+/// A range the stack could never hold raises even here, as in Lua, whose
+/// check does not depend on how many results the caller keeps.
 fn tUnpack1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const t = try tableArg(vm, args, 0);
     const i: i64 = if (given(args, 1)) try intArg(vm, args, 1) else 1;
+    const j: i64 = if (given(args, 2)) try intArg(vm, args, 2) else t.length();
+    if (j < i) return Value.nil();
+    try checkUnpackSpan(vm, i, j);
     return t.getInt(i);
 }
 
+/// Lua's "too many results to unpack": `j - i` (in u64, which cannot
+/// overflow for `j >= i`) past what the whole stack could hold.
+fn checkUnpackSpan(vm: *Vm, i: i64, j: i64) anyerror!void {
+    const span = @as(u64, @bitCast(j)) -% @as(u64, @bitCast(i));
+    if (span >= vm.regCapacity()) return vm.raiseLocatedError("too many results to unpack", 1);
+}
+
 /// `table.unpack(t, [i, [j]])` multi path — write `t[i..j]` (default `i=1`,
-/// `j=#t`) into `out`, returning the count actually written (`min(j-i+1,
-/// out.len)`). All table reads (the `*Table` pointer and `i`/`j`) happen before
-/// any `out` write, honouring the alias contract (`out` overlaps `args`).
+/// `j=#t`) into `out` and return the count `j-i+1`, which may exceed
+/// `out.len` (the VM decides whether that is a truncation or an overflow,
+/// `NativeMultiFn`). More than the whole stack could hold is Lua's "too many
+/// results to unpack". All table reads (the `*Table` pointer and `i`/`j`)
+/// happen before any `out` write, honouring the alias contract (`out`
+/// overlaps `args`).
 fn tUnpackN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
     const t = try tableArg(vm, args, 0);
     const i: i64 = if (given(args, 1)) try intArg(vm, args, 1) else 1;
     const j: i64 = if (given(args, 2)) try intArg(vm, args, 2) else t.length();
     if (j < i) return 0;
-    const count: usize = @intCast(j - i + 1);
+    try checkUnpackSpan(vm, i, j);
+    const count: usize = @intCast(@as(u64, @bitCast(j)) -% @as(u64, @bitCast(i)) + 1);
     const write = @min(count, out.len);
     var k: usize = 0;
     while (k < write) : (k += 1) {
         out[k] = t.getInt(i + @as(i64, @intCast(k)));
     }
-    return write;
+    return count;
 }
 
 // ---------------------------------------------------------------------------
@@ -348,10 +366,11 @@ test "table.unpack multi fn writes t[i..j], honouring out.len and range" {
     try testing.expectEqual(@as(i64, 10), out[0].asInt());
     try testing.expectEqual(@as(i64, 30), out[2].asInt());
 
-    // out.len caps the count (fixed-count caller: local a,b = unpack(t)).
+    // out.len caps the writes but not the count (fixed-count caller: local
+    // a,b = unpack(t)); the VM truncates or overflows (`NativeMultiFn`).
     var two: [2]Value = undefined;
     n = try tUnpackN(@ptrCast(&vm), &.{seq}, &two);
-    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(usize, 3), n);
     try testing.expectEqual(@as(i64, 20), two[1].asInt());
 
     // Explicit i,j sub-range.

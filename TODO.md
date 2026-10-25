@@ -11,13 +11,13 @@ features are in `docs/differences-from-lua.md`; these are wrong results.
 Crashes (a Debug panic, unchecked overflow in release; `pcall` can't
 catch them):
 
-- [ ] `("hello"):sub(math.mininteger, math.maxinteger)`: integer overflow
+- [x] `("hello"):sub(math.mininteger, math.maxinteger)`: integer overflow
       in `posRelat` (`stdlib/string.zig:100`).
-- [ ] `table.unpack({}, math.mininteger, math.maxinteger)`: overflow
+- [x] `table.unpack({}, math.mininteger, math.maxinteger)`: overflow
       (`stdlib/table.zig:241`); Lua says "too many results to unpack".
-- [ ] `table.move({}, 1, math.maxinteger, 2)`: overflow
+- [x] `table.move({}, 1, math.maxinteger, 2)`: overflow
       (`stdlib/table.zig:203`); Lua says "destination wrap around".
-- [ ] `("ab"):rep(math.maxinteger)` has no size check: it grows to the
+- [x] `("ab"):rep(math.maxinteger)` has no size check: it grows to the
       machine's memory, then an uncatchable OutOfMemory. Lua raises
       "resulting string too large".
 
@@ -35,8 +35,12 @@ Wrong results:
       `-5 % math.huge` are `-nan` (Lua `5.0`, `inf`); `1e300 % 7` is `0`
       (Lua `1.0`). `arith.mod` uses `a - floor(a/b)*b`, not `fmod` with
       Lua's sign fix.
-- [ ] `table.unpack({}, 1, 1e8)` silently returns ~65k values instead of
-      raising "too many results to unpack".
+- [x] `table.unpack({}, 1, 1e8)` silently returns ~65k values instead of
+      raising "too many results to unpack". Fixed for every multi-result
+      native: one may now return more results than `out` holds, and the VM
+      raises "stack overflow" when the caller wanted them all
+      (`NativeMultiFn`). Still lenient: a single-result
+      `string.codepoint` over a slice longer than the stack doesn't raise.
 - [ ] `local it = s:gmatch(p); it()` fails (`bad argument #1 to
       '@gmatch_iter'`): `gmatch` returns `(iter, state)`, so only a generic
       `for` works. `string.codes` likewise. The internal `@…_iter` names

@@ -8928,6 +8928,7 @@ pub const Vm = struct {
                 const out = if (all) self.scratchOut(base + a, self.regCapacity()) else self.scratchOut(base + a, base + a + nwanted);
                 const produced = nat.multi.?(@ptrCast(self), args, out) catch |e| return nativeFailed(mode, of, st, pc, instr, vm, tags, payloads, e, entry_top);
                 if (all) {
+                    if (produced > out.len) return nativeFailed(mode, of, st, pc, instr, vm, tags, payloads, Error.StackOverflow, entry_top);
                     std.debug.assert(!self.reg_top_pending);
                     self.scatterScratch(base + a, base + a + produced);
                     self.reg_top = base + a + produced;
@@ -11010,6 +11011,7 @@ test {
     _ = @import("interp_effects_test.zig");
     _ = @import("interp_io_test.zig");
     _ = @import("interp_os_test.zig");
+    _ = @import("interp_lua_compat_test.zig");
     _ = @import("interp_modules_test.zig");
     _ = @import("interp_replay_test.zig");
     _ = @import("interp_dispatch_test.zig");

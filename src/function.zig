@@ -181,8 +181,11 @@ pub const Closure = struct {
 pub const NativeFn = *const fn (ctx: *anyopaque, args: []const Value) anyerror!Value;
 
 /// A **multi-result** native. Writes up to `out.len` results into `out` (in
-/// order) and returns the count actually produced (`<= out.len`); the VM nil-pads
-/// `out[count..]`. The VM only takes this path when the caller wants ≥2 results —
+/// order) and returns how many results it has; the VM nil-pads `out[count..]`.
+/// A native whose result count depends on its data (`table.unpack`,
+/// `string.codepoint`) may return more than `out.len`, having written only
+/// `out.len`: when the caller wants every result, `out` is the rest of the
+/// stack, and the VM raises "stack overflow" rather than drop the excess. The VM only takes this path when the caller wants ≥2 results —
 /// for 0 or 1 wanted results a multi native is called through its single-result
 /// `NativeFn` projection (the *primary* value), so this fn never has to special-
 /// case the truncating cases.
