@@ -43,6 +43,13 @@ inline fn vmOf(ctx: *anyopaque) *Vm {
     return @ptrCast(@alignCast(ctx));
 }
 
+/// Argument `i`, which may be nil but must be present (`luaL_checkany`):
+/// "bad argument #n to 'f' (value expected)" when the call passed fewer.
+fn anyArg(vm: *Vm, args: []const Value, i: usize) anyerror!Value {
+    if (i < args.len) return args[i];
+    return vm.badArgReason(i + 1, "value expected");
+}
+
 // ---------------------------------------------------------------------------
 // type / tostring
 // ---------------------------------------------------------------------------
@@ -52,8 +59,7 @@ inline fn vmOf(ctx: *anyopaque) *Vm {
 /// closures and natives → "function", tables/typed-arrays → "table".
 fn bType(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    if (args.len == 0) return error.TypeError; // Lua: "bad argument #1 to 'type' (value expected)"
-    return vm.typeNameValue(args[0]);
+    return vm.typeNameValue(try anyArg(vm, args, 0));
 }
 
 /// `tostring(v)` — render `v` to a string. A `__tostring` metamethod wins first
@@ -62,7 +68,7 @@ fn bType(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// so the two never disagree) into a bounded stack buffer, then interned.
 fn bToString(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    const v = if (args.len == 0) Value.nil() else args[0];
+    const v = try anyArg(vm, args, 0);
     if (try vm.metaToString(v)) |s| return s; // `__tostring` handler
     if (v.isHeap() and v.heapType() == .string) return v; // already a string
     // Non-string renderings are bounded: scalars (<~32 bytes) and the
@@ -82,9 +88,9 @@ fn bToString(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// honoring a `0x` prefix — then float). Anything unparseable / non-numeric → nil.
 /// The conversion itself lives in `arith.toNumber` — the ONE core shared with the
 /// trace recorder's konst fold (doc 23 D2), so the two can never disagree.
-fn bToNumber(_: *anyopaque, args: []const Value) anyerror!Value {
-    if (args.len == 0) return Value.nil();
-    return arith.toNumber(args[0], if (args.len >= 2) args[1] else null);
+fn bToNumber(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const v = try anyArg(vmOf(ctx), args, 0);
+    return arith.toNumber(v, if (args.len >= 2) args[1] else null);
 }
 
 // ---------------------------------------------------------------------------
@@ -95,23 +101,11 @@ fn bToNumber(_: *anyopaque, args: []const Value) anyerror!Value {
 /// (`args[1..]`). `"#"` is handled by callers before this. A negative `n` counts
 /// from the end (`-1` = the last argument). Returns the 0-based index *into
 /// `args`* of the first selected value, clamped so an out-of-range positive `n`
-/// yields an empty selection (Lua errors on `n == 0` or `|n|` past the end; we
-/// surface those as `TypeError`).
+/// yields an empty selection. `n == 0`, or a negative `n` past the start, is
+/// "index out of range", as in Lua.
 fn selectStart(vm: *Vm, args: []const Value) anyerror!usize {
-    if (args.len == 0) return vm.badArg(1, "number", null);
-    if (!args[0].isNumber()) return vm.badArg(1, "number", args[0]);
+    var n = try vm.intArg(args, 0);
     const nargs: i64 = @intCast(args.len - 1); // count of values after the selector
-    var n: i64 = undefined;
-    if (args[0].isInt()) {
-        n = args[0].asInt();
-    } else {
-        const f = args[0].asFloat();
-        const two_pow_63 = 9223372036854775808.0;
-        if (!std.math.isFinite(f) or @trunc(f) != f or f < -two_pow_63 or f >= two_pow_63) {
-            return vm.badArgReason(1, "number has no integer representation");
-        }
-        n = @intFromFloat(f);
-    }
     // -1 → last; past the end selects nothing, as in Lua.
     if (n < 0) n += nargs + 1 else if (n > nargs + 1) n = nargs + 1;
     if (n < 1) return vm.badArgReason(1, "index out of range");
@@ -167,17 +161,16 @@ fn tableArg(vm: *Vm, args: []const Value, i: usize) anyerror!*Table {
 /// `rawequal(a, b)` — primitive equality, bypassing any `__eq`. With no
 /// metatables this is exactly `Value.eql` (numbers compare across the int/float
 /// boundary, heap objects by stable id).
-fn bRawEqual(_: *anyopaque, args: []const Value) anyerror!Value {
-    const a = if (args.len >= 1) args[0] else Value.nil();
-    const b = if (args.len >= 2) args[1] else Value.nil();
+fn bRawEqual(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const a = try anyArg(vmOf(ctx), args, 0);
+    const b = try anyArg(vmOf(ctx), args, 1);
     return Value.boolean(a.eql(b));
 }
 
 /// `rawget(t, k)` — `t[k]` without `__index`.
 fn bRawGet(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const t = try tableArg(vmOf(ctx), args, 0);
-    const k = if (args.len >= 2) args[1] else Value.nil();
-    return t.get(k);
+    return t.get(try anyArg(vmOf(ctx), args, 1));
 }
 
 /// `rawset(t, k, v)` — `t[k] = v` without `__newindex`; returns `t`. A nil key is
@@ -186,17 +179,18 @@ fn bRawGet(ctx: *anyopaque, args: []const Value) anyerror!Value {
 fn bRawSet(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const t = try tableArg(vm, args, 0);
-    const k = if (args.len >= 2) args[1] else Value.nil();
-    const v = if (args.len >= 3) args[2] else Value.nil();
-    if (k.isNil()) return error.TypeError;
-    if (k.isFloat() and std.math.isNan(k.asFloat())) return error.TypeError;
+    const k = try anyArg(vm, args, 1);
+    const v = try anyArg(vm, args, 2);
+    // Unlocated, as Lua's: the key check fails inside the native.
+    if (k.isNil()) return vm.raiseLocatedError("table index is nil", 0);
+    if (k.isFloat() and std.math.isNan(k.asFloat())) return vm.raiseLocatedError("table index is NaN", 0);
     try t.set(vm.gpa, k, v);
     return args[0];
 }
 
 /// `rawlen(v)` — length of a string (bytes) or table (a border), without `__len`.
-fn bRawLen(_: *anyopaque, args: []const Value) anyerror!Value {
-    if (args.len == 0) return error.TypeError;
+fn bRawLen(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    if (args.len == 0) return vmOf(ctx).badArg(1, "table or string", null);
     const v = args[0];
     if (v.isHeap()) {
         switch (v.heapType()) {
@@ -205,7 +199,7 @@ fn bRawLen(_: *anyopaque, args: []const Value) anyerror!Value {
             else => {},
         }
     }
-    return error.TypeError; // Lua: "table or string expected"
+    return vmOf(ctx).badArg(1, "table or string", v);
 }
 
 // ---------------------------------------------------------------------------
@@ -221,7 +215,8 @@ fn bRawLen(_: *anyopaque, args: []const Value) anyerror!Value {
 fn bSetMetatable(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const t = try tableArg(vm, args, 0);
-    const mt_arg = if (args.len >= 2) args[1] else Value.nil();
+    if (args.len < 2) return vm.badArg(2, "nil or table", null);
+    const mt_arg = args[1];
     const new_mt: ?*Table = if (mt_arg.isNil())
         null
     else if (mt_arg.isHeap() and mt_arg.heapType() == .table)
@@ -244,8 +239,7 @@ fn bSetMetatable(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// string metatable, so `getmetatable("")` is non-nil.
 fn bGetMetatable(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    const v = if (args.len >= 1) args[0] else Value.nil();
-    const mt = vm.metatableOf(v) orelse return Value.nil();
+    const mt = vm.metatableOf(try anyArg(vm, args, 0)) orelse return Value.nil();
     const prot = mt.get(vm.mm.metatable);
     if (!prot.isNil()) return prot;
     return Value.heap(&mt.header);
@@ -258,8 +252,7 @@ fn bGetMetatable(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// `math.type(x)` — "integer" / "float" / nil. Pure subtype query.
 fn mType(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    if (args.len == 0) return error.TypeError;
-    const v = args[0];
+    const v = try anyArg(vm, args, 0);
     if (!v.isNumber()) return Value.nil();
     // The cached names; nil only in a bare VM, which interns.
     const cached = vm.subtype_names[@intFromBool(v.isFloat())];
@@ -273,11 +266,12 @@ fn mType(ctx: *anyopaque, args: []const Value) anyerror!Value {
 
 /// `os.difftime(t2, t1)` — `t2 - t1` in seconds, as a float. Pure: it never
 /// reads a clock, so it carries no effect and stays in the deterministic core.
-fn osDiffTime(_: *anyopaque, args: []const Value) anyerror!Value {
-    if (args.len < 1 or !args[0].isNumber()) return error.TypeError;
-    const t2 = args[0].toFloat();
-    const t1 = if (args.len >= 2 and args[1].isNumber()) args[1].toFloat() else 0;
-    return Value.float(t2 - t1);
+/// Both are integer timestamps and both are required, as in Lua 5.4.
+fn osDiffTime(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm = vmOf(ctx);
+    const t2 = try vm.intArg(args, 0);
+    const t1 = try vm.intArg(args, 1);
+    return Value.float(@as(f64, @floatFromInt(t2)) - @as(f64, @floatFromInt(t1)));
 }
 
 // ---------------------------------------------------------------------------
@@ -429,14 +423,16 @@ test "rawequal / rawget / rawset / rawlen" {
     try testing.expectEqual(@as(i64, 30), t.getInt(3).asInt());
 
     // nil key errors; non-table rawget/rawlen errors.
-    try testing.expectError(error.TypeError, bRawSet(@ptrCast(&vm), &.{ tv, Value.nil(), Value.int(1) }));
+    try testing.expectError(error.LuaError, bRawSet(@ptrCast(&vm), &.{ tv, Value.nil(), Value.int(1) }));
     try testing.expectError(error.LuaError, bRawGet(@ptrCast(&vm), &.{ Value.int(1), Value.int(1) }));
-    try testing.expectError(error.TypeError, bRawLen(@ptrCast(&vm), &.{Value.int(1)}));
+    try testing.expectError(error.LuaError, bRawLen(@ptrCast(&vm), &.{Value.int(1)}));
 }
 
 test "os.difftime is pure subtraction" {
     var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
     try testing.expectEqual(@as(f64, 5.0), (try osDiffTime(@ptrCast(&vm), &.{ Value.int(15), Value.int(10) })).asFloat());
-    try testing.expectEqual(@as(f64, 15.0), (try osDiffTime(@ptrCast(&vm), &.{Value.int(15)})).asFloat());
+    try testing.expectEqual(@as(f64, 15.0), (try osDiffTime(@ptrCast(&vm), &.{ Value.float(15.0), Value.int(0) })).asFloat());
+    // Both arguments are required, as in Lua 5.4.
+    try testing.expectError(error.LuaError, osDiffTime(@ptrCast(&vm), &.{Value.int(15)}));
 }

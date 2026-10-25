@@ -162,8 +162,8 @@ fn getField(vm: *Vm, t: *Table, comptime key: []const u8, default: ?i64, delta: 
     const v = t.get(try vm.heap.internValue(key));
     const n: i64 = if (v.isInt())
         v.asInt()
-    else if (v.isFloat() and intOfFloat(v.asFloat()) != null)
-        intOfFloat(v.asFloat()).?
+    else if (v.isFloat() and value.floatAsExactInt(v.asFloat()) != null)
+        value.floatAsExactInt(v.asFloat()).?
     else if (v.isNil())
         return default orelse vm.raiseLocatedError("field '" ++ key ++ "' missing in date table", 1)
     else
@@ -171,13 +171,6 @@ fn getField(vm: *Vm, t: *Table, comptime key: []const u8, default: ?i64, delta: 
     const in_range = if (n >= 0) n - delta <= std.math.maxInt(i32) else std.math.minInt(i32) + delta <= n;
     if (!in_range) return vm.raiseLocatedError("field '" ++ key ++ "' is out-of-bound", 1);
     return n;
-}
-
-/// An integral float's integer, or null.
-fn intOfFloat(f: f64) ?i64 {
-    const two_pow_63 = 9223372036854775808.0;
-    if (!std.math.isFinite(f) or @trunc(f) != f or f < -two_pow_63 or f >= two_pow_63) return null;
-    return @intFromFloat(f);
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +217,7 @@ fn osDateN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
     var fmt: []const u8 = if (args.len >= 1 and !args[0].isNil()) try strArg(vm, args, 0) else "%c";
     const t: i64 = if (args.len >= 2 and !args[1].isNil())
-        try string.optIntArg(vm, args, 1, 0)
+        try vm.optIntArg(args, 1, 0)
     else
         try wallSeconds(vm);
     // The year must fit a C `tm_year` in UTC before the host is asked for a
@@ -354,7 +347,7 @@ fn osExitN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const code: i64 = if (args.len >= 1 and args[0].isBool())
         @intFromBool(!args[0].asBool())
     else
-        try string.optIntArg(vm, args, 0, 0);
+        try vm.optIntArg(args, 0, 0);
     // C's `exit` takes an `int`.
     vm.exit_status = @truncate(code);
     return error.Exit;

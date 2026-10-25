@@ -136,7 +136,7 @@ test "fast functions: argument and result counts around the fast path" {
         \\math.sqrt(4)
         \\print(math.max(3, 7.5, 7), math.min(2, 2.0), math.max(2.0, 2))
         \\print(type(print), type(nil), rawlen({1, 2}), rawlen("héllo"), string.len("héllo"))
-        \\print(rawequal(), rawequal(1, 1.0), rawget({5}, 1), rawget({}, "x"))
+        \\print(pcall(rawequal), rawequal(1, 1.0), rawget({5}, 1), rawget({}, "x"))
         \\print(pcall(function() return math.floor("x") end))
         \\print(pcall(function() return math.floor(1 / 0) end))
         \\print(pcall(function() return rawlen(5) end))
@@ -148,10 +148,10 @@ test "fast functions: argument and result counts around the fast path" {
             "2\tnil\tnil\n" ++
             "7.5\t2\t2\n" ++
             "function\tnil\t2\t6\t5\n" ++
-            "true\ttrue\t5\tnil\n" ++
+            "false\ttrue\t5\tnil\n" ++
             "false\tanonymous:10: bad argument #1 to 'floor' (number expected, got string)\n" ++
             "true\tinf\n" ++
-            "false\tanonymous:12: bad argument to 'rawlen'\n" ++
+            "false\tanonymous:12: bad argument #1 to 'rawlen' (table or string expected, got number)\n" ++
             "b\t0\n",
     );
 }
@@ -163,6 +163,6 @@ test "fast functions: math.type names the subtype, and its error shape falls bac
         \\
     ,
         "integer\tfloat\tnil\tnil\n" ++
-            "false\tanonymous:2: bad argument to 'type'\n",
+            "false\tanonymous:2: bad argument #1 to 'type' (value expected)\n",
     );
 }

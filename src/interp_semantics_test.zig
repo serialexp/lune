@@ -2621,7 +2621,7 @@ test "foundations: assert passes its arguments through when truthy" {
 test "foundations: assert raises its message when falsy, caught by pcall" {
     try expectProgram(
         "print(pcall(function() assert(false, \"boom\") end))\n",
-        "false\tboom\n",
+        "false\tanonymous:1: boom\n",
     );
 }
 

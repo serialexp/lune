@@ -135,3 +135,37 @@ test "math.random checks its argument count and blames #1 for an empty interval"
     , "wrong number of arguments\nbad argument #1 to 'random' (interval is empty)\n" ++
         "true\tbad argument #1 to 'sqrt' (number expected, got no value)\n");
 }
+
+test "a missing argument is 'value expected', as in Lua" {
+    try expectProgram(
+        \\for _, f in ipairs({ tostring, tonumber, getmetatable, type, assert, rawequal }) do
+        \\  print((select(2, pcall(f)):gsub("^[^']*", "")))
+        \\end
+    , "'tostring' (value expected)\n'tonumber' (value expected)\n" ++
+        "'getmetatable' (value expected)\n'type' (value expected)\n" ++
+        "'assert' (value expected)\n'rawequal' (value expected)\n");
+    try expectProgram(
+        \\print(select(2, pcall(rawequal, 1)), select(2, pcall(rawget, {})))
+    , "bad argument #2 to 'rawequal' (value expected)\t" ++
+        "bad argument #2 to 'rawget' (value expected)\n");
+}
+
+test "rawset, rawlen and setmetatable check their arguments as Lua does" {
+    try expectProgram(
+        \\print(select(2, pcall(rawset, {}, 1)))
+        \\print(select(2, pcall(rawset, {}, nil, 1)), select(2, pcall(rawset, {}, 0/0, 1)))
+        \\print(select(2, pcall(rawlen, 5)))
+        \\print(select(2, pcall(setmetatable, {})))
+    , "bad argument #3 to 'rawset' (value expected)\ntable index is nil\ttable index is NaN\n" ++
+        "bad argument #1 to 'rawlen' (table or string expected, got number)\n" ++
+        "bad argument #2 to 'setmetatable' (nil or table expected, got no value)\n");
+}
+
+test "assert raises its message with the caller's position" {
+    try expectProgram(
+        \\print(pcall(function() assert(false, "boom") end))
+        \\print(pcall(function() assert(nil) end))
+        \\print(pcall(function() assert(false, 42) end))
+    , "false\tanonymous:1: boom\nfalse\tanonymous:2: assertion failed!\nfalse\t42\n");
+}
+

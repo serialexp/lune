@@ -65,32 +65,6 @@ fn tableArg(vm: *Vm, args: []const Value, i: usize) anyerror!*Table {
     return t;
 }
 
-/// Convert a number `Value` to an `i64` with an exact integer representation
-/// (Lua: "number has no integer representation" otherwise). Used for positions
-/// and ranges, which Lua requires to be integers. Pure converter — callers map
-/// the `error.TypeError` to a located bad-argument message via `intArg`.
-fn toInt(v: Value) error{TypeError}!i64 {
-    if (v.isInt()) return v.asInt();
-    if (v.isFloat()) {
-        const f = v.asFloat();
-        const two_pow_63 = 9223372036854775808.0; // 2^63, exact in f64
-        if (std.math.isFinite(f) and f == @trunc(f) and f >= -two_pow_63 and f < two_pow_63) {
-            return @intFromFloat(f);
-        }
-    }
-    return error.TypeError;
-}
-
-/// Fetch argument `i` (0-based) as an integer, raising the located Lua
-/// bad-argument error: `(number expected, got <type|no value>)` when missing or
-/// non-numeric, `(number has no integer representation)` for a non-integral float.
-fn intArg(vm: *Vm, args: []const Value, i: usize) anyerror!i64 {
-    if (i >= args.len) return vm.badArg(i + 1, "number", null);
-    const v = args[i];
-    if (!v.isNumber()) return vm.badArg(i + 1, "number", v);
-    return toInt(v) catch vm.badArgReason(i + 1, "number has no integer representation");
-}
-
 /// True when arg `i` is present and not nil (an *omitted* optional).
 inline fn given(args: []const Value, i: usize) bool {
     return i < args.len and !args[i].isNil();
@@ -111,7 +85,7 @@ fn tInsert(ctx: *anyopaque, args: []const Value) anyerror!Value {
     switch (args.len) {
         2 => try t.set(vm.gpa, Value.int(n + 1), args[1]),
         3 => {
-            const pos = try intArg(vm, args, 1);
+            const pos = try vm.intArg(args, 1);
             // Lua: 1 <= pos <= #t+1 ("position out of bounds").
             if (pos < 1 or pos > n + 1) return error.TypeError;
             var i = n;
@@ -134,7 +108,7 @@ fn tRemove(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const t = try tableArg(vm, args, 0);
     const size = t.length();
     var pos: i64 = size;
-    if (given(args, 1)) pos = try intArg(vm, args, 1);
+    if (given(args, 1)) pos = try vm.intArg(args, 1);
     if (pos != size) {
         if (pos < 1 or pos > size + 1) return error.TypeError;
     }
@@ -162,8 +136,8 @@ fn tConcat(ctx: *anyopaque, args: []const Value) anyerror!Value {
     else
         "";
 
-    const lo: i64 = if (given(args, 2)) try intArg(vm, args, 2) else 1;
-    const hi: i64 = if (given(args, 3)) try intArg(vm, args, 3) else t.length();
+    const lo: i64 = try vm.optIntArg(args, 2, 1);
+    const hi: i64 = if (given(args, 3)) try vm.intArg(args, 3) else t.length();
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(vm.gpa);
@@ -184,9 +158,9 @@ fn tConcat(ctx: *anyopaque, args: []const Value) anyerror!Value {
 fn tMove(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const a1 = try tableArg(vm, args, 0);
-    const f = try intArg(vm, args, 1);
-    const e = try intArg(vm, args, 2);
-    const tpos = try intArg(vm, args, 3);
+    const f = try vm.intArg(args, 1);
+    const e = try vm.intArg(args, 2);
+    const tpos = try vm.intArg(args, 3);
     const a2 = if (given(args, 4)) try tableArg(vm, args, 4) else a1;
 
     if (e >= f) {
@@ -228,8 +202,8 @@ fn tPack(ctx: *anyopaque, args: []const Value) anyerror!Value {
 fn tUnpack1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const t = try tableArg(vm, args, 0);
-    const i: i64 = if (given(args, 1)) try intArg(vm, args, 1) else 1;
-    const j: i64 = if (given(args, 2)) try intArg(vm, args, 2) else t.length();
+    const i: i64 = try vm.optIntArg(args, 1, 1);
+    const j: i64 = if (given(args, 2)) try vm.intArg(args, 2) else t.length();
     if (j < i) return Value.nil();
     try checkUnpackSpan(vm, i, j);
     return t.getInt(i);
@@ -252,8 +226,8 @@ fn checkUnpackSpan(vm: *Vm, i: i64, j: i64) anyerror!void {
 fn tUnpackN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
     const t = try tableArg(vm, args, 0);
-    const i: i64 = if (given(args, 1)) try intArg(vm, args, 1) else 1;
-    const j: i64 = if (given(args, 2)) try intArg(vm, args, 2) else t.length();
+    const i: i64 = try vm.optIntArg(args, 1, 1);
+    const j: i64 = if (given(args, 2)) try vm.intArg(args, 2) else t.length();
     if (j < i) return 0;
     try checkUnpackSpan(vm, i, j);
     const count: usize = @intCast(@as(u64, @bitCast(j)) -% @as(u64, @bitCast(i)) + 1);

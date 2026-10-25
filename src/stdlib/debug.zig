@@ -65,19 +65,7 @@ fn nTraceback(ctx: *anyopaque, args: []const Value) anyerror!Value {
 
     // `level` (default 1): parsed like `error`'s level — an out-of-range or
     // non-integral float is a located bad argument, NOT a `@intFromFloat` trap.
-    var level: i64 = 1;
-    if (args.len >= 2 and !args[1].isNil()) {
-        const lv = args[1];
-        if (lv.isInt()) {
-            level = lv.asInt();
-        } else if (lv.isFloat()) {
-            const f = lv.asFloat();
-            const two_pow_63 = 9223372036854775808.0;
-            if (!std.math.isFinite(f) or @trunc(f) != f or f < -two_pow_63 or f >= two_pow_63)
-                return vm.badArgReason(2, "number has no integer representation");
-            level = @intFromFloat(f);
-        } else return vm.badArg(2, "number", lv);
-    }
+    const level = try vm.optIntArg(args, 1, 1);
 
     // backtraceFrames allocates the frame slice; an arena keeps it scratch.
     var arena_inst = std.heap.ArenaAllocator.init(vm.gpa);

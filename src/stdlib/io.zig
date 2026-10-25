@@ -854,16 +854,7 @@ fn fileSeekN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize 
         const s = interp.strBytes(args[1]) orelse return vm.badArg(2, "string", args[1]);
         whence = std.meta.stringToEnum(system.Whence, s) orelse return vm.badArgReason(2, "invalid option");
     }
-    var offset: i64 = 0;
-    if (args.len >= 3 and !args[2].isNil()) {
-        if (!args[2].isNumber()) return vm.badArg(3, "number", args[2]);
-        offset = if (args[2].isInt()) args[2].asInt() else blk: {
-            const x = args[2].asFloat();
-            if (!std.math.isFinite(x) or @trunc(x) != x or x < -9.2233720368547758e18 or x >= 9.2233720368547758e18)
-                return vm.badArgReason(3, "number has no integer representation");
-            break :blk @intFromFloat(x);
-        };
-    }
+    const offset = try vm.optIntArg(args, 2, 0);
     try interp.noteIoErrorMode(vm);
     // stdout/stderr write to the VM's seam, which has no position.
     if (f.kind == .stdout or f.kind == .stderr) return fail(vm, out, "seek", f, .not_seekable);

@@ -2,6 +2,27 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## opCallFast is inlined into opCall (noted 2026-10-26)
+
+- [ ] Doc 70 put the fast bodies in their own handler "so its bodies stay
+      out of this arm's register allocation", but LLVM inlines the
+      `@call(.always_tail, opCallFast(...))` into `opCall`: the release
+      binary has no `opCallFast` symbol. So any edit to `fastResult` moves
+      `opCall`'s register allocation on the closure path. Making
+      `fastResult` return null for a call with no arguments cost
+      `recursive-fib` +1.9% instructions at t0 (cycles within noise), with
+      `opRet` byte-identical and `opCall` 304 bytes smaller (also
+      binary-trees +0.9%, spectral-norm +0.9%, scalar +0.7%). The cause is
+      shrink-wrapping: the new `opCall` pushes callee-saved registers at
+      entry (`push %r13` is hot) where the old one kept them off the
+      closure path. Every correct form of the check tried costs the same.
+      `noinline` can't be used: it changes the fn type, and handler tail
+      calls need matching types. Routing `.call`'s fast callee through the
+      cold table (runtime-opcode index, like `coldTail`) keeps it out of
+      line but costs scalar +6.4% and still leaves fib +1.5%. Needs a
+      structural answer for the call handler: e.g. a quickened opcode for
+      fast callees, or splitting the closure path from the native arm.
+
 ## Lua 5.4 divergence audit: bugs (noted 2026-10-25)
 
 Found by probing mahina against `lua5.4` (probes in `/tmp/langaudit/`,
@@ -66,11 +87,14 @@ Wrong results:
 - [ ] Lexer: unknown escapes (`"\q"`) are accepted (Lua: "invalid escape
       sequence"); `3..2` parses as `3 .. 2`; `"a\` + CRLF + `b"` is
       "unterminated string".
-- [ ] Missing-argument checks: `tostring()`, `tonumber()`,
+- [x] Missing-argument checks: `tostring()`, `tonumber()`,
       `getmetatable()`, `rawequal(1)`, `setmetatable({})`,
       `math.tointeger()` return instead of raising "value expected".
+      Also `rawget`/`rawset`/`rawlen`, `string.sub`/`rep` without their
+      count, and `os.difftime` with one argument. The integer-argument
+      checks share `Vm.intArg`/`optIntArg` now.
 - [x] `select(5, 1, 2)` raises "index out of range" (Lua returns nothing).
-- [ ] `assert(false, "boom")` adds no position (Lua 5.4.6:
+- [x] `assert(false, "boom")` adds no position (Lua 5.4.6:
       `chunk:N: boom`).
 - [x] `math.floor`/`ceil` of a float outside the integer range (`2^63`,
       `1e100`, `inf`, `nan`) raise; Lua returns the float.

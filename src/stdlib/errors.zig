@@ -101,22 +101,7 @@ fn nXpcall1(ctx: *anyopaque, args: []const Value) anyerror!Value {
 fn nError(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const msg = if (args.len >= 1) args[0] else Value.nil();
-    var level: i64 = 1;
-    if (args.len >= 2 and !args[1].isNil()) {
-        const lv = args[1];
-        if (lv.isInt()) {
-            level = lv.asInt();
-        } else if (lv.isFloat()) {
-            const f = lv.asFloat();
-            const two_pow_63 = 9223372036854775808.0;
-            if (!std.math.isFinite(f) or @trunc(f) != f or f < -two_pow_63 or f >= two_pow_63) {
-                return vm.badArgReason(2, "number has no integer representation");
-            }
-            level = @intFromFloat(f);
-        } else {
-            return vm.badArg(2, "number", lv);
-        }
-    }
+    const level = try vm.optIntArg(args, 1, 1);
     if (level >= 1) {
         if (interp.strBytes(msg)) |bytes| return vm.raiseLocatedError(bytes, @intCast(level));
     }
@@ -126,8 +111,13 @@ fn nError(ctx: *anyopaque, args: []const Value) anyerror!Value {
 
 /// `assert(v[, message, ...])` — if `v` is truthy, return all arguments unchanged;
 /// otherwise raise `message` (any type) or the default `"assertion failed!"`.
+/// Like Lua's, the raise is `error(message, 1)`: a string message gets the
+/// caller's position.
 fn assertRaise(vm: *Vm, args: []const Value) anyerror {
-    vm.pending_error = if (args.len >= 2) args[1] else try vm.heap.internValue("assertion failed!");
+    if (args.len == 0) return vm.badArgReason(1, "value expected");
+    if (args.len < 2) return vm.raiseLocatedError("assertion failed!", 1);
+    if (interp.strBytes(args[1])) |bytes| return vm.raiseLocatedError(bytes, 1);
+    vm.pending_error = args[1];
     return error.LuaError;
 }
 

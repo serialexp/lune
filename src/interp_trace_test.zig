@@ -4009,7 +4009,7 @@ test "assert P4 end-to-end: mid-loop falsy drift side-exits and raises identical
         \\end
         \\local ok, err = pcall(body)
         \\print(ok, err, s)
-    , "false\tflipped\t49\n");
+    , "false\tbody:6: flipped\t49\n");
 }
 
 test "doc 43 end-to-end: mini-array3d — iterator closure + method with assert + fields + append fill; all ten legs" {

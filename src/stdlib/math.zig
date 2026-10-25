@@ -61,15 +61,7 @@ fn optFloatArg(ctx: *anyopaque, args: []const Value, i: usize, default: f64) int
     return (try numArg(ctx, args, i)).toFloat();
 }
 
-/// Argument `i` as an integer. An integral float converts, as
-/// `luaL_checkinteger` does.
-fn intArg(ctx: *anyopaque, args: []const Value, i: usize) interp.Error!i64 {
-    const x = try numArg(ctx, args, i);
-    if (x.isInt()) return x.asInt();
-    const f = x.asFloat();
-    if (f == @trunc(f)) if (floatToIntValue(f)) |v| return v.asInt() else |_| {};
-    return vmOf(ctx).badArgReason(i + 1, "number has no integer representation");
-}
+
 
 /// Convert a finite, in-range float to an integer `Value`; `TypeError` if the
 /// value has no exact `i64` representation (Lua: "number has no integer
@@ -267,8 +259,8 @@ fn mToInteger(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// `math.ult(m, n)` — whether m < n when both integers are read as *unsigned*.
 /// Both arguments must be integers (Lua errors otherwise).
 fn mUlt(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    const a: u64 = @bitCast(try intArg(ctx, args, 0));
-    const b: u64 = @bitCast(try intArg(ctx, args, 1));
+    const a: u64 = @bitCast(try vmOf(ctx).intArg(args, 0));
+    const b: u64 = @bitCast(try vmOf(ctx).intArg(args, 1));
     return Value.boolean(a < b);
 }
 

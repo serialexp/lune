@@ -72,25 +72,6 @@ fn strArg(vm: *Vm, args: []const Value, i: usize) anyerror![]const u8 {
     return interp.strBytes(args[i]) orelse vm.badArg(i + 1, "string", args[i]);
 }
 
-/// Fetch an optional integer argument (truncating an integral float). Returns
-/// `default` when absent; raises the located Lua bad-argument error for a present
-/// non-number, and the "number has no integer representation" reason for a
-/// non-integral float.
-pub fn optIntArg(vm: *Vm, args: []const Value, i: usize, default: i64) anyerror!i64 {
-    if (i >= args.len or args[i].isNil()) return default;
-    const v = args[i];
-    if (v.isInt()) return v.asInt();
-    if (v.isFloat()) {
-        const f = v.asFloat();
-        const two_pow_63 = 9223372036854775808.0;
-        if (!std.math.isFinite(f) or @trunc(f) != f or f < -two_pow_63 or f >= two_pow_63) {
-            return vm.badArgReason(i + 1, "number has no integer representation");
-        }
-        return @intFromFloat(f);
-    }
-    return vm.badArg(i + 1, "number", v);
-}
-
 /// Lua's `posrelat`: map a possibly-negative 1-based position to an absolute
 /// 1-based position against a string of length `len`. A negative `pos` counts
 /// from the end (`-1` = last); the result is *not* yet clamped to `[1, len]`.
@@ -373,8 +354,8 @@ fn sLen(ctx: *anyopaque, args: []const Value) anyerror!Value {
 fn sSub(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const s = try strObjArg(vm, args, 0);
-    const i = try optIntArg(vm, args, 1, 1);
-    const j = try optIntArg(vm, args, 2, -1);
+    const i = try vm.intArg(args, 1);
+    const j = try vm.optIntArg(args, 2, -1);
     const r = try subCore(vm.heap, s, i, j);
     return Value.heap(&r.header);
 }
@@ -486,7 +467,7 @@ fn sRep(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const sobj = try strObjArg(vm, args, 0);
     const s = sobj.bytes();
-    const n = try optIntArg(vm, args, 1, 0);
+    const n = try vm.intArg(args, 1);
     const sep: []const u8 = if (args.len >= 3 and !args[2].isNil())
         (interp.strBytes(args[2]) orelse return vm.badArg(3, "string", args[2]))
     else
@@ -524,12 +505,10 @@ fn sChar(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(vm.gpa);
-    for (args, 0..) |arg, idx| {
-        // `string.char` arguments are mandatory code points: an explicit nil is a
-        // bad argument, not a default-to-zero (which would silently emit NUL).
-        if (arg.isNil()) return vm.badArg(idx + 1, "number", arg);
-        const code = try optIntArg(vm, args, idx, 0); // arg is non-nil → default unused
-        try appendCodepoint(vm, idx + 1, code, &buf);
+    for (0..args.len) |idx| {
+        // Mandatory code points: an explicit nil is a bad argument, not a
+        // default-to-zero (which would silently emit NUL).
+        try appendCodepoint(vm, idx + 1, try vm.intArg(args, idx), &buf);
     }
     return vm.heap.internValue(buf.items);
 }
@@ -538,8 +517,8 @@ fn sChar(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// points, with Lua's negative-index + clamping. `i` defaults to 1, `j` to `i`.
 /// An empty range is reported as `lo > hi`.
 fn charRange(vm: *Vm, args: []const Value, clen: usize) anyerror!struct { lo: usize, hi: usize } {
-    const i_raw = try optIntArg(vm, args, 1, 1);
-    const j_raw = try optIntArg(vm, args, 2, i_raw);
+    const i_raw = try vm.optIntArg(args, 1, 1);
+    const j_raw = try vm.optIntArg(args, 2, i_raw);
     var i = posRelat(i_raw, clen);
     var j = posRelat(j_raw, clen);
     if (i < 1) i = 1;
@@ -578,8 +557,8 @@ pub fn codepointCore(s: *const String, i_arg: i64, j_arg: i64) ?i64 {
 fn sCodepoint1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const s = try strObjArg(vm, args, 0);
-    const i_raw = try optIntArg(vm, args, 1, 1);
-    const j_raw = try optIntArg(vm, args, 2, i_raw);
+    const i_raw = try vm.optIntArg(args, 1, 1);
+    const j_raw = try vm.optIntArg(args, 2, i_raw);
     const cp = codepointCore(s, i_raw, j_raw) orelse return Value.nil();
     return Value.int(cp);
 }
@@ -1113,7 +1092,7 @@ fn findCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
     const sobj = try strObjArg(vm, args, 0);
     const s = sobj.bytes();
     const pat = try strArg(vm, args, 1);
-    const st = resolveInit(try optIntArg(vm, args, 2, 1), sobj) orelse {
+    const st = resolveInit(try vm.optIntArg(args, 2, 1), sobj) orelse {
         buf[0] = Value.nil();
         return 1;
     };
@@ -1172,7 +1151,7 @@ fn matchCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
     const sobj = try strObjArg(vm, args, 0);
     const s = sobj.bytes();
     const pat = try strArg(vm, args, 1);
-    const st = resolveInit(try optIntArg(vm, args, 2, 1), sobj) orelse {
+    const st = resolveInit(try vm.optIntArg(args, 2, 1), sobj) orelse {
         buf[0] = Value.nil();
         return 1;
     };
@@ -1547,7 +1526,7 @@ fn gsubCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
         null;
 
     const max_n: i64 = if (args.len >= 4 and !args[3].isNil())
-        try optIntArg(vm, args, 3, 0)
+        try vm.optIntArg(args, 3, 0)
     else
         @as(i64, @intCast(s.len + 1));
 

@@ -2228,6 +2228,30 @@ pub const Vm = struct {
         return self.raiseBadArg(site, body);
     }
 
+    /// Argument `i` (0-based) as an integer, read as `luaL_checkinteger` reads
+    /// it: an integral float converts, a missing argument or a non-number is
+    /// "number expected, got …", and any other float is "number has no integer
+    /// representation". The integer case is inline; the rest is out of line.
+    pub inline fn intArg(self: *Vm, args: []const Value, i: usize) Error!i64 {
+        if (i < args.len and args[i].isInt()) return args[i].asInt();
+        if (i >= args.len) return self.badArg(i + 1, "number", null);
+        return self.intOfArg(args[i], i + 1);
+    }
+
+    /// Optional integer argument `i` (`luaL_optinteger`): absent or nil gives
+    /// `default`; anything else is read as `intArg` reads it.
+    pub inline fn optIntArg(self: *Vm, args: []const Value, i: usize, default: i64) Error!i64 {
+        if (i >= args.len or args[i].isNil()) return default;
+        if (args[i].isInt()) return args[i].asInt();
+        return self.intOfArg(args[i], i + 1);
+    }
+
+    /// A non-integer argument `n` (1-based) as an integer, or its error.
+    fn intOfArg(self: *Vm, v: Value, n: usize) Error!i64 {
+        if (!v.isFloat()) return self.badArg(n, "number", v);
+        return value.floatAsExactInt(v.asFloat()) orelse self.badArgReason(n, "number has no integer representation");
+    }
+
     /// Like `badArg`, but with a free-text reason inside the parentheses (e.g.
     /// "number has no integer representation", "index out of range", "value
     /// expected") instead of the "X expected, got Y" form.
@@ -10245,13 +10269,8 @@ fn writeSingleResult(regs: RegWindow, a: usize, nwanted: usize, result: Value) v
 /// their natives (`stdmath.floorOf`, `Table.get`, …), and none allocates,
 /// raises or re-enters the VM.
 pub inline fn fastResult(vm: *const Vm, fast: function.FastBuiltin, regs: RegWindow, first: usize, nargs: usize) ?Value {
-    if (nargs == 0) return switch (fast) {
-        // `rawequal()` compares two nils, `tonumber()` is nil; everything
-        // else wants an argument.
-        .rawequal => Value.boolean(true),
-        .tonumber => Value.nil(),
-        else => null,
-    };
+    // Every fast function wants an argument; the native raises its absence.
+    if (nargs == 0) return null;
     const x = regs.get(first);
     switch (fast) {
         .type => {
@@ -10275,13 +10294,13 @@ pub inline fn fastResult(vm: *const Vm, fast: function.FastBuiltin, regs: RegWin
             return best;
         },
         .select => return if (stdbasic.isHashSelector(x)) Value.int(@intCast(nargs - 1)) else null,
-        .rawequal => return Value.boolean(x.eql(if (nargs >= 2) regs.get(first + 1) else Value.nil())),
+        .rawequal => return if (nargs >= 2) Value.boolean(x.eql(regs.get(first + 1))) else null,
         .rawget => {
             if (!x.isHeap() or x.heapType() != .table) return null;
             const t = table.Table.fromHeader(x.asHeap());
             // A grid deflates first (doc 14), which allocates: the native's.
-            if (t.array.isGrid()) return null;
-            return t.get(if (nargs >= 2) regs.get(first + 1) else Value.nil());
+            if (t.array.isGrid() or nargs < 2) return null;
+            return t.get(regs.get(first + 1));
         },
         .rawlen => {
             if (!x.isHeap()) return null;
@@ -10761,22 +10780,6 @@ fn projectU64(rng: *std.Random.Xoshiro256, span: u64) u64 {
     return r;
 }
 
-/// Fetch `random`/`randomseed` argument `i` (0-based) as an integer, raising the
-/// located Lua bad-argument error: `(number expected, got <type|no value>)` when
-/// missing or non-numeric, `(number has no integer representation)` for a
-/// non-integral float. Mirrors `stdlib/table.zig`'s `intArg`.
-fn randIntArg(vm: *Vm, args: []const Value, i: usize) Error!i64 {
-    if (i >= args.len) return vm.badArg(i + 1, "number", null);
-    const v = args[i];
-    if (!v.isNumber()) return vm.badArg(i + 1, "number", v);
-    if (v.isInt()) return v.asInt();
-    const f = v.asFloat();
-    const two_pow_63 = 9223372036854775808.0; // 2^63, exact in f64
-    if (std.math.isFinite(f) and f == @trunc(f) and f >= -two_pow_63 and f < two_pow_63)
-        return @intFromFloat(f);
-    return vm.badArgReason(i + 1, "number has no integer representation");
-}
-
 /// `math.random([m [, n]])` — drawn from the VM's own PRNG. The nondeterministic
 /// *input* is a single seed (the `.random_seed` effect), obtained lazily on the
 /// first call (or set explicitly by `math.randomseed`) and recorded once; every
@@ -10806,11 +10809,11 @@ fn nativeRandom(ctx: *anyopaque, args: []const Value) anyerror!Value {
     if (args.len > 2) return vm.raiseLocatedError("wrong number of arguments", 1);
     if (args.len >= 1) {
         if (args.len == 1) {
-            up = try randIntArg(vm, args, 0);
+            up = try vm.intArg(args, 0);
             if (up == 0) full_width = true;
         } else {
-            low = try randIntArg(vm, args, 0);
-            up = try randIntArg(vm, args, 1);
+            low = try vm.intArg(args, 0);
+            up = try vm.intArg(args, 1);
         }
         // Lua blames #1 for both forms.
         if (!full_width and low > up) return vm.badArgReason(1, "interval is empty");
@@ -10843,7 +10846,7 @@ fn nativeRandomseed(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const seed: u64 = if (args.len == 0 or args[0].isNil())
         try obtainRandomSeed(vm)
     else
-        @bitCast(try randIntArg(vm, args, 0));
+        @bitCast(try vm.intArg(args, 0));
     vm.rng = std.Random.Xoshiro256.init(seed);
     return Value.int(@bitCast(seed));
 }
