@@ -736,6 +736,31 @@ const Compiler = struct {
         }
     }
 
+    /// A store into `_G.name` or `_G["name"]`, with `_G` the global, defines
+    /// the global `name` as `name = …` does, for `warnUnknownGlobals`.
+    fn noteGlobalTableWrite(self: *Compiler, tgt: *const ast.Expr) Error!void {
+        const obj, const name = switch (tgt.data) {
+            .field => |f| .{ f.obj, f.name },
+            .index => |ix| switch (ix.key.data) {
+                .string_raw => |raw| .{ ix.obj, try self.decodeString(raw, ix.key.span) },
+                else => return,
+            },
+            else => return,
+        };
+        if (obj.data != .name or !std.mem.eql(u8, obj.data.name, "_G") or !self.isGlobal("_G")) return;
+        try self.globals_usage.writes.put(name, {});
+    }
+
+    /// Whether `name` here is a global: no local of this function or of an
+    /// enclosing one is in scope. Unlike `resolveUpvalue`, captures nothing.
+    fn isGlobal(self: *Compiler, name: []const u8) bool {
+        var c: ?*Compiler = self;
+        while (c) |cc| : (c = cc.parent) {
+            if (cc.resolveLocalSlot(name) != null) return false;
+        }
+        return true;
+    }
+
     /// Emit a warning for every global *read* of a name that is never assigned
     /// anywhere in the chunk and isn't a host builtin. In mahina (Lua/Luau
     /// semantics) such a name is a `nil`-valued global, so it compiles fine and
@@ -803,6 +828,7 @@ const Compiler = struct {
     }
 
     fn compileAssign(self: *Compiler, a: anytype) Error!void {
+        for (a.targets) |tgt| try self.noteGlobalTableWrite(tgt);
         if (a.targets.len == 1 and a.values.len == 1) {
             if (try self.compileSingleAssign(a.targets[0], a.values[0])) return;
         }
@@ -940,6 +966,7 @@ const Compiler = struct {
     /// (the parser never produces a short-circuit op here), so `binOpCode` is safe.
     fn compileCompoundAssign(self: *Compiler, ca: anytype) Error!void {
         const tgt = ca.target;
+        try self.noteGlobalTableWrite(tgt);
         const op_span = ast.Span{ .start = tgt.span.start, .end = ca.value.span.end };
         switch (tgt.data) {
             .name => |nm| {
@@ -3477,6 +3504,36 @@ test "unknown global: a global assigned elsewhere does NOT warn" {
         \\print_unused = g
         \\
     , &.{}, Probe.check);
+}
+
+test "unknown global: a store through _G defines the global" {
+    const Probe = struct {
+        fn check(diags: *const Diagnostics) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), diags.count());
+        }
+    };
+    try checkGlobals(
+        \\local function show() return a, b, c end
+        \\_G.a = 1
+        \\_G["b"] = 2
+        \\_G.c += 1
+        \\
+    , &.{"_G"}, Probe.check);
+}
+
+test "unknown global: a store through a local named _G defines nothing" {
+    const Probe = struct {
+        fn check(diags: *const Diagnostics) anyerror!void {
+            try testing.expectEqual(@as(usize, 1), diags.count());
+            try testing.expect(std.mem.indexOf(u8, diags.list.items[0].message, "'a'") != null);
+        }
+    };
+    try checkGlobals(
+        \\local _G = {}
+        \\local function f() _G.a = 1 end
+        \\return a
+        \\
+    , &.{"_G"}, Probe.check);
 }
 
 test "unknown global: a forward reference to a later global function does NOT warn" {

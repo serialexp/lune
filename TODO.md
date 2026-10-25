@@ -140,8 +140,9 @@ Wrong results:
       replacement values returned a bare `TypeError`, described as "bad
       argument to 'insert'" (or to `pcall`, when it called them directly).
       Each raises Lua's message now.
-- [ ] The undefined-global lint fires for globals created via
-      `_G.name = …`.
+- [x] The undefined-global lint fires for globals created via
+      `_G.name = …`. A store to `_G.name` or `_G["name"]` (with `_G` not
+      a local) now counts as an assignment.
 
 ## std's string primitives on the hot path (noted 2026-10-26)
 
