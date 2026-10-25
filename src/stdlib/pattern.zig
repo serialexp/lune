@@ -20,6 +20,7 @@
 //! is dropped per Lua 5.4 (so `%z` is a literal `z`).
 
 const std = @import("std");
+const bytes = @import("../bytes.zig");
 
 /// `LUA_MAXCAPTURES` — the capture-array bound.
 pub const max_captures = 32;
@@ -353,7 +354,7 @@ pub const MatchState = struct {
         const cap = self.captures[idx];
         const len: usize = @intCast(cap.len);
         if (self.src.len - s >= len and
-            std.mem.eql(u8, self.src[cap.init .. cap.init + len], self.src[s .. s + len]))
+            bytes.eql(self.src[cap.init .. cap.init + len], self.src[s .. s + len]))
             return s + len;
         return null;
     }

@@ -70,7 +70,11 @@ Wrong results:
 - [ ] `local it = s:gmatch(p); it()` fails (`bad argument #1 to
       '@gmatch_iter'`): `gmatch` returns `(iter, state)`, so only a generic
       `for` works. `string.codes` likewise. The internal `@…_iter` names
-      also show in `pairs(_G)` and in error text.
+      also show in `pairs(_G)` and in error text. **Needs a decision
+      (2026-10-26):** a `Native` carries no state, so a lone callable needs
+      a stateful native closure (serializable, GC-traced; the same
+      primitive `coroutine.wrap` needs, doc 73), a Lua closure wrapping the
+      iterator, or a callable state table (`__call`).
 - [x] Malformed patterns (`[a`, a trailing `%`, unbalanced `(`/`)`, `%1`
       with no capture, `%b`, `%f` without `[`, >32 captures) raise the
       literal string `"HostError"`. Each now raises Lua's message.
@@ -129,6 +133,22 @@ Wrong results:
       use of '%' in replacement string"). `%z` is unsupported. Both fixed.
 - [ ] The undefined-global lint fires for globals created via
       `_G.name = …`.
+
+## std's string primitives on the hot path (noted 2026-10-26)
+
+`std.mem.eql` past 64 bytes cost ~1093 instructions on this AVX-512 host
+(LLVM builds each 64-byte chunk lane by lane); `src/bytes.zig` now does the
+intern lookup and pattern back-references. Two neighbours measured the same
+day (ReleaseFast, native CPU, per call):
+
+- [ ] `std.mem.order` is a byte loop, ~10 instructions per byte (610 at 60
+      bytes, 1010 at 100). String `<`/`<=` (`arith.zig:288`) and
+      `table.sort` on strings pay it; a word- or vector-at-a-time compare
+      to the first difference would be a few per 8-32 bytes.
+- [ ] `std.mem.indexOfPos` with a long needle grows faster than the needle:
+      555 instructions for a 60-byte needle in 120 bytes, 1241 for 100 in
+      200, likely through the same `eql`. Plain `string.find` and
+      `gsub` with a plain pattern (`string.zig:1357`, `:1612`) use it.
 
 ## Noted 2026-10-24 (doc 65 Phase 5, fault naming)
 

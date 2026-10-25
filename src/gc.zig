@@ -32,6 +32,7 @@
 
 const std = @import("std");
 const object = @import("object.zig");
+const bytes = @import("bytes.zig");
 const string = @import("string.zig");
 const table = @import("table.zig");
 const arr = @import("array.zig");
@@ -421,7 +422,7 @@ pub const Heap = struct {
         if (self.strtab.len == 0) return null;
         var s = self.strtab[@as(usize, @truncate(hash)) & (self.strtab.len - 1)];
         while (s) |cur| : (s = cur.next_intern) {
-            if (cur.hash == hash and cur.len == content.len and std.mem.eql(u8, cur.bytes(), content))
+            if (cur.hash == hash and cur.len == content.len and bytes.eql(cur.bytes(), content))
                 return cur;
         }
         return null;

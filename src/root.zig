@@ -27,6 +27,9 @@ pub const numeral = @import("numeral.zig");
 /// Memory accounting — the `TrackingAllocator` wrapper + allocation discipline.
 pub const mem = @import("mem.zig");
 
+/// Byte-slice equality without std's slow long-slice codegen.
+pub const bytes = @import("bytes.zig");
+
 /// Diagnostic / CLI I/O — the single wrapper around the churny `std.Io` writer
 /// API and `Value` text rendering.
 pub const io = @import("io.zig");
