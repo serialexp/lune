@@ -196,6 +196,27 @@ test "an __index or __newindex that is not a function is indexed in turn" {
         "false\tmain:3: attempt to index a number value\nx1\tnil\n");
 }
 
+test "table.insert, remove, concat and gsub raise Lua's messages" {
+    try expectProgram(
+        \\print(pcall(function() table.insert({1}, 5, 2) end))
+        \\print(pcall(function() table.insert({1}, 1, 2, 3) end))
+        \\print(pcall(function() table.remove({1, 2}, 7) end))
+        \\print(pcall(function() return table.concat({1, {}, 3}) end))
+    , "false\tmain:1: bad argument #2 to 'insert' (position out of bounds)\n" ++
+        "false\tmain:2: wrong number of arguments to 'insert'\n" ++
+        "false\tmain:3: bad argument #2 to 'remove' (position out of bounds)\n" ++
+        "false\tmain:4: invalid value (table) at index 2 in table for 'concat'\n");
+    try expectProgram(
+        \\print(pcall(function() return table.concat({1, 2}, {}) end))
+        \\print(pcall(function() return table.concat({1, 2}, ",", 1, 3) end))
+        \\print(pcall(function() return ("abc"):gsub("b", {b = {}}) end))
+        \\print(pcall(function() return ("abc"):gsub("b", function() return true end) end))
+    , "false\tmain:1: bad argument #2 to 'concat' (string expected, got table)\n" ++
+        "false\tmain:2: invalid value (nil) at index 3 in table for 'concat'\n" ++
+        "false\tmain:3: invalid replacement value (a table)\n" ++
+        "false\tmain:4: invalid replacement value (a boolean)\n");
+}
+
 test "assert raises its message with the caller's position" {
     try expectProgram(
         \\print(pcall(function() assert(false, "boom") end))

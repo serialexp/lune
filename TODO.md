@@ -135,6 +135,11 @@ Wrong results:
       (Lua: "table index is nil"/"NaN"); `t[i][j]` faults said "TypeError".
       An `__index`/`__newindex` that is neither a table nor a function was
       called; Lua indexes it in turn (`__index = "abc"` reaches `string`).
+- [x] `table.insert`/`remove` bounds, `insert`'s argument count,
+      `table.concat`'s values and separator, and `gsub`'s invalid
+      replacement values returned a bare `TypeError`, described as "bad
+      argument to 'insert'" (or to `pcall`, when it called them directly).
+      Each raises Lua's message now.
 - [ ] The undefined-global lint fires for globals created via
       `_G.name = …`.
 

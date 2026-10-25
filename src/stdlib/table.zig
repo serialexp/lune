@@ -87,14 +87,14 @@ fn tInsert(ctx: *anyopaque, args: []const Value) anyerror!Value {
         3 => {
             const pos = try vm.intArg(args, 1);
             // Lua: 1 <= pos <= #t+1 ("position out of bounds").
-            if (pos < 1 or pos > n + 1) return error.TypeError;
+            if (pos < 1 or pos > n + 1) return vm.badArgReason(2, "position out of bounds");
             var i = n;
             while (i >= pos) : (i -= 1) {
                 try t.set(vm.gpa, Value.int(i + 1), t.getInt(i));
             }
             try t.set(vm.gpa, Value.int(pos), args[2]);
         },
-        else => return error.TypeError,
+        else => return vm.raiseLocatedError("wrong number of arguments to 'insert'", 1),
     }
     return Value.nil();
 }
@@ -110,7 +110,7 @@ fn tRemove(ctx: *anyopaque, args: []const Value) anyerror!Value {
     var pos: i64 = size;
     if (given(args, 1)) pos = try vm.intArg(args, 1);
     if (pos != size) {
-        if (pos < 1 or pos > size + 1) return error.TypeError;
+        if (pos < 1 or pos > size + 1) return vm.badArgReason(2, "position out of bounds");
     }
     const removed = t.getInt(pos);
     var i = pos;
@@ -132,7 +132,7 @@ fn tConcat(ctx: *anyopaque, args: []const Value) anyerror!Value {
 
     var sep_buf: [64]u8 = undefined;
     const sep: []const u8 = if (given(args, 1))
-        (interp.coerceConcat(args[1], &sep_buf) catch return error.TypeError)
+        (interp.coerceConcat(args[1], &sep_buf) catch return vm.badArg(2, "string", args[1]))
     else
         "";
 
@@ -145,7 +145,12 @@ fn tConcat(ctx: *anyopaque, args: []const Value) anyerror!Value {
     var k = lo;
     while (k <= hi) : (k += 1) {
         var buf: [64]u8 = undefined;
-        const s = interp.coerceConcat(t.getInt(k), &buf) catch return error.TypeError;
+        const v = t.getInt(k);
+        const s = interp.coerceConcat(v, &buf) catch {
+            var msg_buf: [96]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "invalid value ({s}) at index {d} in table for 'concat'", .{ v.typeName(), k }) catch unreachable;
+            return vm.raiseLocatedError(msg, 1);
+        };
         try out.appendSlice(vm.gpa, s);
         if (k < hi) try out.appendSlice(vm.gpa, sep);
     }
@@ -414,11 +419,11 @@ test "table.concat joins with separator and range; rejects non string/number" {
     const ranged = try tConcat(@ptrCast(&vm), &.{ seq, try vm.heap.internValue("-"), Value.int(2), Value.int(3) });
     try testing.expectEqualStrings("8-7", strOf(ranged));
 
-    // A table element is neither string nor number → TypeError.
+    // A table element is neither string nor number: Lua's "invalid value".
     const t = Table.fromHeader(seq.asHeap());
     const inner = try vm.heap.newTable();
     try t.set(vm.gpa, Value.int(2), Value.heap(&inner.header));
-    try testing.expectError(error.TypeError, tConcat(@ptrCast(&vm), &.{ seq, sep }));
+    try testing.expectError(error.LuaError, tConcat(@ptrCast(&vm), &.{ seq, sep }));
 }
 
 test "table natives reject a non-table first argument" {

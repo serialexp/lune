@@ -197,8 +197,10 @@ Other differences:
 - `load`'s chunk name is used as given (`=name` keeps its `=`), and the
   default is `(load)`, not `[string "..."]`.
 - Some wording differs: arithmetic on a string says "attempt to perform
-  arithmetic on a string value", and many library functions say only
-  `bad argument to 'insert'` without the argument number and reason.
+  arithmetic on a string value"; `ipairs` takes only a table ("table
+  expected"), where Lua takes any value; a library function called
+  straight from `pcall` is named `'insert'`, where Lua says
+  `'table.insert'`.
 - An uncaught error prints `mahina: runtime error: message at file:line`
   and an indented traceback without `[C]` frames. An error object's
   `__tostring` gives the message, as in Lua; if that `__tostring` itself

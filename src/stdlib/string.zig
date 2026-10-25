@@ -1716,13 +1716,13 @@ fn addReplTable(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState,
         try appendValueText(vm, out, v);
         return;
     }
-    return error.TypeError; // invalid replacement value
+    return invalidReplacement(vm, v.typeNameId());
 }
 
 /// `add_value` for a function replacement: call `repl(captures…)` (the explicit
 /// captures, or the whole match when the pattern has none) via `Vm.callValue`. A
 /// nil/false result keeps the original text; a string/number substitutes; any
-/// other type is an invalid replacement (`TypeError`).
+/// other type is an invalid replacement.
 ///
 /// GC: `captureValue` interns the capture strings with no intervening safepoint,
 /// and `callValue` copies them into the rooted VM stack before running `repl`, so
@@ -1745,7 +1745,19 @@ fn addReplFunction(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchSta
         try appendValueText(vm, out, rv);
         return;
     }
-    return error.TypeError; // invalid replacement value
+    return invalidReplacement(vm, rv.typeNameId());
+}
+
+/// Lua's `add_value` error for a table or function replacement's truthy
+/// value that is neither a string nor a number. Takes the type, not the
+/// value: passing the `Value` made `gsubCore` copy each looked-up value
+/// through a stack slot, a store-forwarding stall that cost a table
+/// replacement ~9% in cycles.
+noinline fn invalidReplacement(vm: *Vm, type_name: Value.TypeName) anyerror {
+    @branchHint(.cold);
+    var buf: [48]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "invalid replacement value (a {s})", .{@tagName(type_name)}) catch unreachable;
+    return vm.raiseLocatedError(msg, 1);
 }
 
 /// Core of `string.gsub(s, pat, repl [, n])` → `(result, count)`. `repl` may be a
@@ -1834,6 +1846,8 @@ fn sGsubN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const n = try gsubCore(vmOf(ctx), args, &buf);
     return copyOut(buf[0..n], out);
 }
+
+
 
 /// Copy `src` results into `out` (capped at `out.len`), returning the count
 /// written. The VM nil-pads `out[count..]`.
