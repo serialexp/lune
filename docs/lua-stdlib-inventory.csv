@@ -128,7 +128,7 @@ io,file:close,base-host,implemented,"Method: closes the file handle (standard st
 package,require,base-host,implemented,"Loads a module by name via the searchers, running it once and caching in package.loaded. Built on the injectable fs_source + file_read effect, so a game/embedding host gets it for free and it record/replays deterministically."
 package,package.loaded,base-host,implemented,"Table of already-loaded modules keyed by name; require consults and populates it. Pre-seeded with the built-in module tables (_G, package, string, table, math, os, io)."
 package,package.preload,base-host,implemented,"Table of loader functions tried by the first built-in searcher before the path searcher."
-package,package.path,base-host,implemented,"Search-path template for module source (default ./?.lua;./?/init.lua); the path searcher walks it via the file_read effect."
+package,package.path,base-host,implemented,"Search-path template for module source (default ./?.mah;./?/init.mah;./?.lua;./?/init.lua); the path searcher walks it via the file_read effect."
 package,package.cpath,base-host,partial,"Inert empty field kept only for script compatibility — mahina has no native (C) module loading under determinism, so there is no cpath searcher."
 package,package.config,base-host,implemented,"Constant string describing path-handling configuration (separators and marks)."
 package,package.searchers,base-host,implemented,"Ordered array of searcher functions require tries: built-in preload + path searchers (manual natives, rebound by name on snapshot restore); a host may prepend/replace its own."

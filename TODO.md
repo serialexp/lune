@@ -2,6 +2,88 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Lua 5.4 divergence audit: bugs (noted 2026-10-25)
+
+Found by probing mahina against `lua5.4` (probes in `/tmp/langaudit/`,
+`/tmp/libaudit/`). The deliberate differences and the not-yet-built
+features are in `docs/differences-from-lua.md`; these are wrong results.
+
+Crashes (a Debug panic, unchecked overflow in release; `pcall` can't
+catch them):
+
+- [ ] `("hello"):sub(math.mininteger, math.maxinteger)`: integer overflow
+      in `posRelat` (`stdlib/string.zig:100`).
+- [ ] `table.unpack({}, math.mininteger, math.maxinteger)`: overflow
+      (`stdlib/table.zig:241`); Lua says "too many results to unpack".
+- [ ] `table.move({}, 1, math.maxinteger, 2)`: overflow
+      (`stdlib/table.zig:203`); Lua says "destination wrap around".
+- [ ] `("ab"):rep(math.maxinteger)` has no size check: it grows to the
+      machine's memory, then an uncatchable OutOfMemory. Lua raises
+      "resulting string too large".
+
+Wrong results:
+
+- [ ] **Multiple assignment evaluates its targets after the values.**
+      `i = 3; i, a[i] = i+1, 20` sets `a[4]` (the manual's own example
+      says `a[3]`); `t[k(1)], t[k(2)] = k(3), k(4)` calls `k` in the order
+      3 4 1 2 (Lua 1 2 3 4).
+- [ ] `next({})` returns no values (Lua one `nil`), so
+      `select('#', next({}))` is 0; `next({}, "nokey")` returns nothing
+      (Lua: "invalid key to 'next'"). `print()` and `warn()` return one
+      `nil` (Lua none).
+- [ ] Float `%` with an infinite divisor: `5 % math.huge` and
+      `-5 % math.huge` are `-nan` (Lua `5.0`, `inf`); `1e300 % 7` is `0`
+      (Lua `1.0`). `arith.mod` uses `a - floor(a/b)*b`, not `fmod` with
+      Lua's sign fix.
+- [ ] `table.unpack({}, 1, 1e8)` silently returns ~65k values instead of
+      raising "too many results to unpack".
+- [ ] `local it = s:gmatch(p); it()` fails (`bad argument #1 to
+      '@gmatch_iter'`): `gmatch` returns `(iter, state)`, so only a generic
+      `for` works. `string.codes` likewise. The internal `@…_iter` names
+      also show in `pairs(_G)` and in error text.
+- [ ] Malformed patterns (`[a`, a trailing `%`, unbalanced `(`/`)`, `%1`
+      with no capture, `%b`, `%f` without `[`, >32 captures) raise the
+      literal string `"HostError"`.
+- [ ] `%q` round trip: `("\0" .. "1")` is written `"\01"`, which reads back
+      as `"\1"`. Lua pads to `\0001`.
+- [ ] `string.format("%d", 3.5)` and `%x` of 1.5 truncate silently (Lua:
+      "number has no integer representation"); `%100d` is accepted;
+      the `#` flag is ignored for floats.
+- [ ] `tonumber` uses Zig's parsers: it accepts `"1_000"`, `"0b101"`,
+      `"0o17"`, `"inf"`, `"nan"` (Lua: nil). `"0xffffffffffffffff"` gives a
+      float (Lua wraps to -1); `tonumber("ffffffffffffffff", 16)` is nil
+      (Lua -1); `tonumber(10, 16)` and base 1 or 37 return nil (Lua
+      raises).
+- [ ] Lexer: unknown escapes (`"\q"`) are accepted (Lua: "invalid escape
+      sequence"); `3..2` parses as `3 .. 2`; `"a\` + CRLF + `b"` is
+      "unterminated string".
+- [ ] Missing-argument checks: `tostring()`, `tonumber()`,
+      `getmetatable()`, `rawequal(1)`, `setmetatable({})`,
+      `math.tointeger()` return instead of raising "value expected".
+- [ ] `select(5, 1, 2)` raises "index out of range" (Lua returns nothing).
+- [ ] `assert(false, "boom")` adds no position (Lua 5.4.6:
+      `chunk:N: boom`).
+- [ ] `math.floor`/`ceil` of a float outside the integer range (`2^63`,
+      `1e100`, `inf`, `nan`) raise; Lua returns the float.
+- [ ] `math.random(1, 2, 3)` is accepted (Lua: "wrong number of
+      arguments"); `random(2, 1)` blames `#2` (Lua `#1`); `fmod(1, 0)`
+      says "integer division or modulo by zero" (Lua: "bad argument #2 to
+      'fmod' (zero)").
+- [ ] `table.sort({3, nil, 1})` sorts the border-1 prefix silently (Lua:
+      "attempt to compare nil with number").
+- [ ] `package.loaded.x = false` makes `require("x")` return `false`; Lua
+      treats `false` as not loaded.
+- [ ] A `__tostring` returning a number is rejected; one returning a table
+      blames `print`/`pcall` (Lua: "'__tostring' must return a string").
+- [ ] An uncaught error object with `__tostring` prints "(error object is
+      a table value)"; Lua prints its text.
+- [ ] Method calls don't adjust argument numbers: `("a"):rep(2.5)` says
+      `#2` (Lua `#1`).
+- [ ] `gsub` with `"%x"` in the replacement yields `"x"` (Lua: "invalid
+      use of '%' in replacement string"). `%z` is unsupported.
+- [ ] The undefined-global lint fires for globals created via
+      `_G.name = …`.
+
 ## Noted 2026-10-24 (doc 65 Phase 5, fault naming)
 
 - [ ] **JIT mode is slower than tier-0 on caught faults.**

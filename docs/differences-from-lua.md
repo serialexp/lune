@@ -1,9 +1,117 @@
 # mahina for Lua programmers: the differences
 
-mahina follows Lua 5.4 closely, and most Lua programs run unchanged. Where
+mahina is shaped like Lua 5.4 but is not a drop-in replacement. Where
 compatibility would cost determinism or a sound design, mahina differs on
-purpose. This page lists those differences as a program sees them. The
-reasoning behind each is in the design doc it names.
+purpose; elsewhere a Lua feature is simply not built yet. This page lists
+both as a program sees them, marked **not yet supported** where the
+difference is a gap rather than a decision. The reasoning behind a
+deliberate difference is in the design doc it names.
+
+The differences most likely to stop an existing Lua program:
+
+- Strings never turn into numbers in arithmetic: `"10" + 1` is an error
+  (§Numbers).
+- No coroutines, `goto`, `<const>`/`<close>`, or `f"str"`/`f{...}` call
+  syntax (§Syntax, §Missing libraries and functions).
+- Calls nest at most 200 deep, and tail calls are not eliminated
+  (§Calls).
+
+## Syntax
+
+**Added.** Compound assignment (`+=`, `-=`, `*=`, `/=`, `//=`, `%=`,
+`..=`, `&=`, `|=`, `<<=`, `>>=`, `~=`), `??` (the right side when the left
+is `nil`), `!=`, `!`, `&&`, `||`, and optional type annotations
+(`local x: number = 3`) (`docs/design/13-luajit-syntax-parity.md`). One
+catch: as a statement, `x ~= 1` is xor-assignment, not a comparison.
+
+**Not yet supported:**
+
+- `goto` and labels.
+- The `<const>` and `<close>` attributes.
+- Calls without parentheses: `f"str"`, `f[[str]]`, `f{...}`, so
+  `require"mod"` must be `require("mod")`.
+- Hexadecimal floats (`0x1p4`, `0x.8`). A hex integer wider than 64 bits
+  is an error; Lua wraps it.
+- The `\z` escape.
+- A `#!` first line.
+- `...` in the main chunk. Script arguments are only in `arg`.
+- A carriage return inside a long string is kept; Lua turns `\r\n` into
+  `\n`.
+
+A compile error reads `file:line: error: message`, without Lua's
+`near 'token'`, and one compile may report several.
+
+A read of a global that is never assigned anywhere prints a warning on
+stderr when the file compiles (`warning: undefined global 'x'`). It also
+fires for globals created through `_G.name = …`.
+
+## Numbers
+
+Integers and floats are separate subtypes as in Lua 5.4, integer
+arithmetic wraps, and `/` and `^` always give floats.
+
+**Strings are not numbers.** Lua converts a numeric string wherever a
+number is wanted; mahina never does. `"10" + 1`, `-"2"`, `for i = "1", 2`,
+`math.floor("3.7")` and `string.format("%d", "10")` are all errors. Use
+`tonumber`. The other direction still works for `..`: `1 .. ""` is `"1"`,
+but string functions don't accept numbers (`string.len(123)` is an
+error).
+
+**Bitwise operators take integers only**, not floats with an integral
+value: `3.0 | 0` raises "number has no integer representation", where Lua
+gives `3`. Use `math.tointeger`.
+
+**Floats print as the shortest text that reads back to the same value**,
+positionally between `1e-7` and `1e21`, and an integral float prints
+without `.0`:
+
+| Value | Lua 5.4 | mahina |
+|---|---|---|
+| `3.0`, `4 / 2` | `3.0`, `2.0` | `3`, `2` |
+| `0.1 + 0.2` | `0.3` | `0.30000000000000004` |
+| `math.pi` | `3.1415926535898` | `3.141592653589793` |
+| `1e15` | `1e+15` | `1000000000000000` |
+| `2^63` | `9.2233720368548e+18` | `9223372036854776000` |
+| `-0.0` | `-0.0` | `-0` |
+
+`print`, `tostring`, `..`, `%s` and `table.concat` all use this text, so
+text alone no longer tells an integer from a float; `math.type` does.
+`string.format("%g", x)` and friends format as in C.
+
+`n // 0` and `n % 0` on integers raise "attempt to perform integer
+division or modulo by zero".
+
+## Tables
+
+- `pairs` and `next` visit the array part in order, then the other keys
+  in the order they were first inserted. Lua's order depends on hashing;
+  mahina's is the same on every run and every platform
+  (`docs/design/02-determinism.md`).
+- `#t` on a table with holes may pick a different border than Lua does
+  (both are valid): `#{1, 2, nil, 4}` is 2, where Lua gives 4.
+- `tostring({})` is `table: 0x11b`: a small object number, not an
+  address, so it is the same on every run. Built-in functions print as
+  `native: 0x…` (`type` still says `"function"`).
+- **Not yet supported:** `__pairs`; `ipairs` and the `table` library
+  ignore `__index`, `__newindex` and `__len`; `table.sort` ignores `__lt`.
+- `table.sort` is a heapsort: equal elements may end up in a different
+  order than Lua's, and a comparator that is not a valid order does not
+  raise "invalid order function".
+
+## Calls
+
+The call stack holds 200 frames, and a tail call takes a frame like any
+other call. A recursion deeper than that, tail-recursive or not, raises
+"stack overflow"; Lua allows hundreds of thousands. **Not yet
+supported:** proper tail calls and a deeper stack.
+
+## Globals and environments
+
+**Not yet supported:** `_ENV`, and `load`'s `env` and `mode` arguments
+(both are ignored), a reader function as `load`'s chunk, and metatables
+on `_G` (an `__index` or `__newindex` there has no effect).
+
+`_VERSION` is `"mahina 0.0.0"`.
 
 ## Strings are text
 
@@ -16,12 +124,81 @@ Binary data is a **byte array**: a table of integers `0..255` at keys
 `string.decode(bytes)` turns valid UTF-8 bytes back into a string
 (`docs/design/06-strings-and-bytes.md`).
 
+What follows from that:
+
+- `#s`, `string.sub`, `string.find` positions, `string.reverse`, and the
+  width and precision of `%5s`/`%.1s` all count code points:
+  `#"héllo"` is 5, `("日本語"):sub(2, 2)` is `"本"`.
+- `string.byte` is gone; `string.codepoint(s, i, j)` returns code points.
+  `string.char` takes code points (`string.char(256)` is `"Ā"`), and
+  `%c` writes one. There is no `utf8` library: `string.char`,
+  `string.codepoint`, `string.codes` and `#` cover it.
+- `string.upper` and `lower` use Unicode simple case mapping:
+  `("é"):upper()` is `"É"`.
+- In patterns, `.` matches one code point, but the classes `%a`, `%w`,
+  `%s`, `%p`, `%d` are ASCII only, and a set such as `[а-я]` or `[é]`
+  does not match characters outside ASCII yet.
+- A `\xNN` or `\ddd` escape must be below 128, and `\u{...}` must be a
+  valid code point; Lua accepts any byte.
+
+## The rest of the standard library
+
+- **`string.format`.** **Not yet supported:** `%a`, `%q` of anything but a
+  string, and `%s` of a table with `__tostring`. `%q` writes a newline
+  as `\n` where Lua writes a backslash-newline.
+- **`string.gmatch`** ignores the `init` argument (**not yet
+  supported**), and its iterator only works inside a generic `for`.
+- **`string.pack`, `packsize`, `unpack`**: **not yet supported**.
+- **`math.random`** uses xoshiro256 like Lua 5.4, but draws a different
+  sequence for the same seed, and `math.randomseed` returns one value.
+  Without the `random` system interface every run uses the same seed.
+- **`math`** has no `pow`, `ldexp`, `frexp`, `log10`, `cosh`, `sinh`,
+  `tanh` (none is in Lua 5.4 proper, only in compatibility builds).
+- **`collectgarbage`**: **not yet supported**. There are no finalizers or
+  weak tables, so `__gc` and `__mode` do nothing.
+- **`tostring`** ignores `__name` (**not yet supported**).
+- **`warn`** is on from the start and prints `mahina warning: …`; the Lua
+  interpreter starts with warnings off.
+- **`require`** searches `package.path`, which starts with
+  `./?.mah;./?/init.mah;./?.lua;./?/init.lua`. There are two searchers
+  (`package.preload` and the path); C modules are not supported, so
+  `package.cpath` is empty and `package.loadlib` is absent. `require`
+  returns one value; Lua also returns where it found the module.
+- **`debug`** has only `traceback`.
+
+## Missing libraries and functions
+
+| Missing | Why | Instead |
+|---|---|---|
+| `coroutine` | not built yet (`docs/design/73-coroutines.md`) | — |
+| `debug.*` except `traceback` | reflection breaks the language's guarantees; the trace visualiser takes its place | `mahina viz` |
+| `string.byte`, `utf8` | strings are code points | `string.codepoint`, `string.char`, `string.codes` |
+| `string.dump` | bytecode is internal and not portable between versions | — |
+| `package.loadlib`, C modules | native code can't be sandboxed or replayed | the embedding API |
+| `io.popen`, `os.execute` | a spawned process can't be recorded and replayed | — |
+| `os.setlocale` | formatting always uses the C locale | — |
+| `loadstring`, `unpack`, `setfenv` | removed from Lua itself before 5.4 | `load`, `table.unpack` |
+
 ## Error messages
 
 Runtime errors name the value the way Lua 5.4 does: `attempt to call a
 nil value (global 'foo')`, `(field 'open')`, `(method 'read')`. mahina
 keeps no names for locals and upvalues, so a value read from one gets no
 name where Lua would say `(local 'f')` or `(upvalue 'f')`.
+
+Other differences:
+
+- **Not yet supported:** the position prefix names the function, not the
+  file: `f:2: oops` where Lua says `script.lua:2: oops` (the main chunk is
+  `main`, an anonymous function `anonymous`). A required file's top level
+  does get its path.
+- `load`'s chunk name is used as given (`=name` keeps its `=`), and the
+  default is `(load)`, not `[string "..."]`.
+- Some wording differs: arithmetic on a string says "attempt to perform
+  arithmetic on a string value", and many library functions say only
+  `bad argument to 'insert'` without the argument number and reason.
+- An uncaught error prints `mahina: runtime error: message at file:line`
+  and an indented traceback without `[C]` frames.
 
 ## Files and the operating system: `io` and `os`
 
@@ -51,9 +228,8 @@ only `clock` and `random`. Calling a missing function says why:
 attempt to call a nil value (field 'open'; io.open needs the 'files' system interface, which this VM does not have)
 ```
 
-`io.popen`, `os.execute` and `os.setlocale` do not exist anywhere: a
-spawned process can't be recorded and replayed, and formatting always
-uses the C locale.
+`io.popen`, `os.execute` and `os.setlocale` do not exist anywhere (see
+§Missing libraries and functions).
 
 ### Failures raise
 
