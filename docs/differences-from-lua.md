@@ -139,9 +139,10 @@ of the next year) and its errors. The differences:
   1970.
 - The date table's fields are read directly, without `__index`.
 
-`os.clock` measures elapsed time from a monotonic clock, not CPU time.
-Differences between two calls behave as in Lua; the absolute value
-differs.
+`os.clock` counts seconds since the VM started, as Lua's starts near 0,
+but it measures elapsed time from a monotonic clock, not CPU time: time
+spent waiting on input or a file counts. Each VM in an embedding has its
+own zero; Lua's is the process's.
 
 ### Recording and replay
 

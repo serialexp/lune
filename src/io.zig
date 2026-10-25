@@ -229,7 +229,7 @@ pub fn hostIo() Io {
 
 /// The host's monotonic clock in nanoseconds from an unspecified start
 /// (`CLOCK_MONOTONIC` on Linux, `CLOCK_UPTIME_RAW` on macOS, QPC on Windows):
-/// what the CLI and libmahina inject as `Vm.clock_source`.
+/// what the CLI and libmahina hand `Vm.setClockSource`.
 pub fn monotonicNs() i64 {
     return @intCast(std.Io.Clock.awake.now(hostIo()).nanoseconds);
 }

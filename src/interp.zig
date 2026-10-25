@@ -88,7 +88,7 @@ pub const Error = error{
     /// Replay's next logged effect is a different kind than the program just
     /// requested — the recording doesn't match this program/run.
     EffectKindMismatch,
-    /// A `clock`-kind effect ran (in `off`/`record` mode) but no `clock_source`
+    /// A `clock`-kind effect ran (in `off`/`record` mode) but no `Vm.clock`
     /// was injected by the embedder. The interpreter holds no platform clock of
     /// its own — the host that constructs the VM must supply one (`main.zig` on
     /// native, the JS host on wasm, a fake in tests). Replay needs none.
@@ -182,11 +182,25 @@ pub const EffectMode = enum { off, record, replay };
 /// `wasm32-freestanding`, where there is no clock syscall). The host that
 /// constructs the VM injects one: `main.zig` supplies the Linux monotonic clock,
 /// the wasm host imports `performance.now()`, tests supply a deterministic
-/// counter. `record`/`off` call `nowNs`; `replay` never does (it feeds the log
-/// back). `ctx` is an opaque pointer to whatever state the source needs.
+/// counter. `Vm.setClockSource` reads it once to fix the VM's zero; after that
+/// `record`/`off` call `nowNs` and `replay` never does (it feeds the log back).
+/// `ctx` is an opaque pointer to whatever state the source needs.
 pub const ClockSource = struct {
     ctx: *anyopaque,
     nowNs: *const fn (ctx: *anyopaque) i64,
+};
+
+/// A VM's clock: the source, and its reading when the VM got it. `os.clock`
+/// counts from that reading, so a program sees time since its VM started
+/// (near 0 at first, as in Lua) rather than the host clock's own start, which
+/// is boot time on Linux.
+pub const Clock = struct {
+    source: ClockSource,
+    epoch_ns: i64,
+
+    fn sinceEpochNs(self: Clock) i64 {
+        return self.source.nowNs(self.source.ctx) -% self.epoch_ns;
+    }
 };
 
 /// An embedder-supplied source of one nondeterministic seed for `random()`.
@@ -897,12 +911,13 @@ pub const Vm = struct {
     /// (scanning for an already-consumed `.unicode_version`), exactly as the PRNG
     /// is not persisted either. See `noteUnicodeVersion`.
     unicode_version_pinned: bool = false,
-    /// Embedder-supplied clock for `clock()` (null = none injected). The
-    /// interpreter holds no platform clock; the host that builds the VM sets this
-    /// (`main.zig` native, the JS host on wasm, a fake in tests). A `clock()` in
-    /// `off`/`record` mode with no source set fails with `ClockUnavailable`;
-    /// `replay` never reads it.
-    clock_source: ?ClockSource = null,
+    /// Embedder-supplied clock for `os.clock`/`os.nsclock` and the reading it
+    /// counts from (null = none injected). Set through `setClockSource`, never
+    /// directly. The interpreter holds no platform clock; the host that builds
+    /// the VM sets this (`main.zig` native, the JS host on wasm, a fake in
+    /// tests). A clock read in `off`/`record` mode with none set fails with
+    /// `ClockUnavailable`; `replay` never reads it.
+    clock: ?Clock = null,
     /// Embedder-supplied entropy for `random()`'s seed (null = none injected).
     /// Read once, lazily, on the first `random()` in `off`/`record`; `replay`
     /// reads the seed from the log instead. No source set ⇒ the fixed
@@ -1855,6 +1870,12 @@ pub const Vm = struct {
         // global. Pure heap tables/strings/natives off `globals` → captured/restored
         // by the keyframe path; the searcher natives rebind by name (manual entries).
         try stdpackage.installPackageRuntime(self);
+    }
+
+    /// Give the VM its clock. The reading taken here is the zero `os.clock`
+    /// and `os.nsclock` count from, so install it when the VM starts.
+    pub fn setClockSource(self: *Vm, source: ClockSource) void {
+        self.clock = .{ .source = source, .epoch_ns = source.nowNs(source.ctx) };
     }
 
     /// Install the natives of `groups` (doc 65 §5.2): the host's switch for
@@ -10688,25 +10709,27 @@ fn logFileRead(self: *Vm, r: Value) Error!Value {
 }
 
 /// `os.clock()` — the canonical first nondeterministic *input* (doc 02). Returns
-/// the host monotonic clock as **seconds, a float** (Lua-faithful; `os.nsclock`
-/// exposes the raw integer nanoseconds). Pure-nondeterministic: two calls differ,
+/// the time since the VM got its clock (`Vm.setClockSource`) as **seconds, a
+/// float** (Lua-faithful; `os.nsclock` exposes the integer nanoseconds). Lua's
+/// is CPU time since the process started; this is elapsed time, so time spent
+/// waiting counts. Pure-nondeterministic: two calls differ,
 /// which is exactly why it must be recorded to replay deterministically. The
 /// recorded `.clock` effect carries this float value (the `EffectResult` codec
 /// round-trips float scalars; `replay` returns it verbatim without re-dividing).
 /// Ignores its arguments. Reads the value through the embedder-injected
-/// `Vm.clock_source` — the interpreter holds no platform clock of its own, so the
+/// `Vm.clock` — the interpreter holds no platform clock of its own, so the
 /// VM core compiles to any target (including `wasm32-freestanding`, which has no
 /// clock syscall). With no source injected this is `ClockUnavailable`; the
 /// `replay` path never reaches here (it feeds the log back in `performEffect`).
 fn nativeClock(ctx: *anyopaque, args: []const Value) anyerror!Value {
     _ = args;
     const vm: *Vm = @ptrCast(@alignCast(ctx));
-    const src = vm.clock_source orelse return Error.ClockUnavailable;
-    return Value.float(@as(f64, @floatFromInt(src.nowNs(src.ctx))) / 1e9);
+    const clock = vm.clock orelse return Error.ClockUnavailable;
+    return Value.float(@as(f64, @floatFromInt(clock.sinceEpochNs())) / 1e9);
 }
 
-/// `os.nsclock()` — a mahina extension (no Lua equivalent): the same host monotonic
-/// clock as `os.clock`, but returned as **integer nanoseconds** for high-resolution
+/// `os.nsclock()` — a mahina extension (no Lua equivalent): the same clock and
+/// zero as `os.clock`, but returned as **integer nanoseconds** for high-resolution
 /// timing. Shares `EffectKind.clock`; the recorded result is the int ns. Mixing
 /// `os.clock` (float) and `os.nsclock` (int) in one run interleaves float/int
 /// `.clock` entries in the log, consumed by call order on replay (the scalar shape
@@ -10714,8 +10737,8 @@ fn nativeClock(ctx: *anyopaque, args: []const Value) anyerror!Value {
 fn nativeNsClock(ctx: *anyopaque, args: []const Value) anyerror!Value {
     _ = args;
     const vm: *Vm = @ptrCast(@alignCast(ctx));
-    const src = vm.clock_source orelse return Error.ClockUnavailable;
-    return Value.int(src.nowNs(src.ctx));
+    const clock = vm.clock orelse return Error.ClockUnavailable;
+    return Value.int(clock.sinceEpochNs());
 }
 
 /// Uniform `u64` in `[0, span]` inclusive, drawn from `rng`. Mirrors PUC Lua's

@@ -56,7 +56,8 @@ fn s(bytes: []const u8) mh_str {
     return .{ .ptr = if (bytes.len == 0) null else bytes.ptr, .len = bytes.len };
 }
 
-// Deterministic host sources: both legs must see the same clock and seed.
+// Deterministic host sources: both legs must see the same clock and seed. The
+// clock never advances, so `os.clock` (time since the VM got it) reads 0.
 var det_ctx: u8 = 0;
 fn detClock(_: *anyopaque) i64 {
     return 1_000_000;
@@ -461,7 +462,7 @@ const Pair = struct {
             const box = try capi.createVm(self.fa[leg].allocator(), .{ .jit = if (tier == .off) 2 else 0, .system = 0x3F });
             self.box[leg] = box;
             const vm = &box.vm;
-            vm.clock_source = .{ .ctx = &det_ctx, .nowNs = &detClock };
+            vm.setClockSource(.{ .ctx = &det_ctx, .nowNs = &detClock });
             vm.random_seed_source = .{ .ctx = &det_ctx, .seed = &detSeed };
             vm.system = .{ .ctx = &det_ctx, .vtable = &det_vtable };
             vm.effect_mode = mode;
@@ -1414,7 +1415,7 @@ test "hostcall diff: effects through every path of the entry, recorded and repla
                 try testing.expectEqual(@as(usize, 4), pr.last_nres);
                 var clock: f64 = 0;
                 try testing.expectEqual(Status.ok, capi.mh_value_float(pr.last_results[0], &clock));
-                try testing.expectEqual(@as(f64, 0.001), clock);
+                try testing.expectEqual(@as(f64, 0), clock);
                 try testing.expectEqualStrings("/det/home", try lastStr(pr, 1));
             }
             try pr.callGlobal("effnest", &.{.{ .int = 5 }});

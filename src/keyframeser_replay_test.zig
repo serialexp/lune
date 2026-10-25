@@ -103,7 +103,7 @@ test "F2d: restore a mid-run keyframe + replay its effect log → identical forw
         // Inject a deterministic clock so the recorded log is reproducible (the
         // record VM is the only one that calls clock(); the replay VMs feed L back).
         var clk = TestClock{ .next = 1000 };
-        vm.clock_source = clk.source();
+        vm.setClockSource(clk.source());
         vm.effect_mode = .record;
         _ = try vm.run(chunk.proto);
 
@@ -209,7 +209,7 @@ fn captureNativeF2cCut(gpa: std.mem.Allocator, source: [:0]const u8, native: boo
     vm.out = &sink;
     vm.effect_mode = .record;
     var clock = TestClock{ .next = 1000 };
-    vm.clock_source = clock.source();
+    vm.setClockSource(clock.source());
     vm.trace.config.enabled = native;
     vm.trace.config.execute = native;
     vm.trace.config.optimize = native;
@@ -343,7 +343,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
     cut_vm.out = &cut_sink;
     cut_vm.effect_mode = .record;
     var cut_clock = TestClock{ .next = 1000 };
-    cut_vm.clock_source = cut_clock.source();
+    cut_vm.setClockSource(cut_clock.source());
     cut_vm.trace.config.enabled = true;
     cut_vm.trace.config.execute = true;
     cut_vm.trace.config.optimize = true;
@@ -392,7 +392,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
     ref_vm.out = &ref_sink;
     ref_vm.effect_mode = .record;
     var ref_clock = TestClock{ .next = 1000 };
-    ref_vm.clock_source = ref_clock.source();
+    ref_vm.setClockSource(ref_clock.source());
     var ref_chunk = try mahina_compiler.compile(gpa, ref_vm.heap, source, tree.root, &diags);
     defer ref_chunk.deinit();
     try testing.expect(!diags.hasErrors());

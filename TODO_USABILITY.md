@@ -30,8 +30,9 @@ effect log so runs stay replayable (doc 02).
 - [x] `prog > log 2>&1` mangles stdout: stderr overwrites the start of the
       shared file. Positional writes; doc 65 Phase 0 made stdout/stderr
       streaming writers, with C-stdio buffering.
-- [ ] `os.clock()` returns an absolute value (~4.5e6); Lua's is CPU time
-      since start. Deltas work.
+- [x] `os.clock()` returns an absolute value (~4.5e6); Lua's is CPU time
+      since start. Deltas work. Now counts from when the VM got its clock
+      (Bart, 2026-10-25: VM start, elapsed time rather than CPU time).
 
 ## 2. CLI entry points
 

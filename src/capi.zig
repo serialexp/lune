@@ -543,7 +543,7 @@ pub fn createVm(backing: std.mem.Allocator, config: mh_config) !*VmBox {
     box.real_sys = host_system.RealSystem.init(box.tracking.allocator(), io.hostIo(), null);
     errdefer box.real_sys.deinit();
     if (@as(u8, @bitCast(groups)) != 0) box.vm.system = box.real_sys.system();
-    if (groups.clock) box.vm.clock_source = .{ .ctx = &host_src_ctx, .nowNs = &hostClockNs };
+    if (groups.clock) box.vm.setClockSource(.{ .ctx = &host_src_ctx, .nowNs = &hostClockNs });
     if (groups.random) box.vm.random_seed_source = .{ .ctx = &host_src_ctx, .seed = &hostRandomSeed };
     try box.vm.enableSystem(groups);
     box.vm.io_errors = if (config.lua_io_errors != 0) .lua else .raise;

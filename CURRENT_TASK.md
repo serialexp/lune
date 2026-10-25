@@ -1,3 +1,11 @@
+OS.CLOCK COUNTS FROM VM START (2026-10-25, coral-marten).
+- Bart chose VM start (over process start) as the zero. `Vm.clock` is now
+  `?Clock` {source, epoch_ns}, set only via `Vm.setClockSource`, which
+  takes the epoch reading; os.clock/os.nsclock return now - epoch. The
+  log carries the relative values, so replay is unchanged.
+- Vm layout moved: both offsets_x64.inc blocks updated.
+- Still elapsed time, not CPU time (documented in differences-from-lua).
+
 DOC 65 PHASE 6: DOCS AND INVENTORY (2026-10-24, coral-marten).
 - `docs/differences-from-lua.md` (new, linked from README): every claim
   checked against the binary.

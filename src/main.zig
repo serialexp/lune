@@ -550,7 +550,7 @@ fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source:
     // (so the VM core stays portable, incl. wasm); the host that builds the VM —
     // here, the CLI — supplies one. This is the single place the OS clock syscall
     // lives now.
-    if (topts.system.clock) vm.clock_source = .{ .ctx = &clock_ctx, .nowNs = &nativeClockNs };
+    if (topts.system.clock) vm.setClockSource(.{ .ctx = &clock_ctx, .nowNs = &nativeClockNs });
     // Inject the native seed source for `random()`. The VM owns the PRNG; the host
     // supplies only the one nondeterministic seed (OS entropy here).
     if (topts.system.random) vm.random_seed_source = .{ .ctx = &rng_ctx, .seed = &nativeRandomSeed };
@@ -736,7 +736,7 @@ fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source:
     return status;
 }
 
-/// The native monotonic clock backing `clock()`, injected as `Vm.clock_source`.
+/// The native monotonic clock backing `clock()`, injected with `Vm.setClockSource`.
 /// The VM core stays platform-agnostic (it only sees the function pointer).
 /// `ctx` is unused — the OS clock needs no state — so it points at a throwaway byte.
 var clock_ctx: u8 = 0;

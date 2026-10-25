@@ -32,7 +32,7 @@ pub const Group = enum(u3) {
     env,
     /// `os.time`, `os.date` (they read the wall clock and the local zone).
     time,
-    /// `os.clock`, `os.nsclock` (the monotonic clock, `Vm.clock_source`).
+    /// `os.clock`, `os.nsclock` (the monotonic clock, `Vm.clock`).
     clock,
     /// A host entropy seed for `math.random` (`Vm.random_seed_source`). Off,
     /// `math.random` starts from a fixed seed, so a VM is deterministic.

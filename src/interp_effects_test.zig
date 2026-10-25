@@ -148,7 +148,7 @@ fn effectRun(gpa: std.mem.Allocator, source: [:0]const u8, mode: EffectMode, pre
     // Every program here may read the clock; the group is installed even when
     // no source is (a replay, or the `ClockUnavailable` test).
     try vm.enableSystem(.{ .clock = true });
-    if (clock) |c| vm.clock_source = c.source();
+    if (clock) |c| vm.setClockSource(c.source());
     if (seed) |s| vm.random_seed_source = s.source();
     if (preload.len > 0) try vm.effect_log.entries.appendSlice(gpa, preload);
 
@@ -185,11 +185,13 @@ test "F2d: replaying a recorded effect log reproduces the recorded output" {
     // Replay re-emits the same effects into its own log (every clock() consumed one).
     try testing.expectEqual(rec.log.len, rep.log.len);
 
-    // A second record against a DIFFERENT clock sequence (9000, 9001, …) genuinely
-    // differs — modelling the nondeterminism a real clock has between runs, which is
-    // exactly what the log captures. (With injection the clock is deterministic, so
-    // we vary it explicitly rather than leaning on wall-clock advance.)
-    var clk2 = CounterClock{ .next = 9000 };
+    // A second record against a clock that ADVANCES differently (steps of 7 ns)
+    // genuinely differs — modelling the nondeterminism a real clock has between
+    // runs, which is exactly what the log captures. (With injection the clock is
+    // deterministic, so we vary it explicitly rather than leaning on wall-clock
+    // advance. Only the rate shows: `os.clock` counts from the VM's first
+    // reading, so a different starting value alone would print the same.)
+    var clk2 = CounterClock{ .next = 9000, .step = 7 };
     const rec2 = try effectRun(gpa, source, .record, &.{}, &clk2, null);
     defer rec2.deinit(gpa);
     try testing.expect(!std.mem.eql(u8, rec.out, rec2.out));
@@ -223,14 +225,16 @@ test "F2d: clock() with no injected source is ClockUnavailable" {
     try testing.expectError(error.ClockUnavailable, effectRun(gpa, "print(os.clock())", .record, &.{}, null, null));
 }
 
-test "F2d: os.clock is float seconds, os.nsclock is int nanoseconds (same source)" {
+test "F2d: os.clock is float seconds, os.nsclock is int nanoseconds, both from the VM's zero" {
     const gpa = testing.allocator;
-    // Pin the clock so both reads see the same instant (2.5e9 ns = 2.5 s). os.clock
-    // divides to a float; os.nsclock hands back the raw integer nanoseconds.
-    var clk = CounterClock{ .next = 2_500_000_000, .step = 0 };
+    // The clock starts at 7 s and advances 2.5 s per read. Installing it takes the
+    // first reading as the VM's zero, so the program's reads are 2.5 s and 5 s
+    // after it, not the source's absolute 9.5 s and 12 s. os.clock divides to a
+    // float; os.nsclock hands back the integer nanoseconds.
+    var clk = CounterClock{ .next = 7_000_000_000, .step = 2_500_000_000 };
     const run = try effectRun(gpa,
         \\print(os.clock() == 2.5)
-        \\print(os.nsclock() == 2500000000)
+        \\print(os.nsclock() == 5000000000)
         \\print(math.type(os.clock()), math.type(os.nsclock()))
     , .off, &.{}, &clk, null);
     defer run.deinit(gpa);
@@ -997,7 +1001,7 @@ test "A-vi: committed effect sequence is mode-independent across all four commit
         var out_buf: [256]u8 = undefined;
         var sink = io.Writer.fixed(&out_buf);
         vm.out = &sink;
-        vm.clock_source = clock.source();
+        vm.setClockSource(clock.source());
         vm.random_seed_source = seed.source();
         vm.system = ffs.system();
         try compileRun(gpa, &vm, source);
@@ -1017,7 +1021,7 @@ test "A-vi: committed effect sequence is mode-independent across all four commit
         var sink = io.Writer.fixed(&out_buf);
         vm.out = &sink;
         vm.effect_mode = .record;
-        vm.clock_source = clock.source();
+        vm.setClockSource(clock.source());
         vm.random_seed_source = seed.source();
         vm.system = ffs.system();
         try compileRun(gpa, &vm, source);

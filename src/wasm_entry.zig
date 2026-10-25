@@ -702,7 +702,7 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8, files_blob: []co
     // carries iteration counts only.
     vm.trace.config.coverage = true;
     vm.effect_mode = .record;
-    vm.clock_source = .{ .ctx = &clock_ctx, .nowNs = &wasmClockNs };
+    vm.setClockSource(.{ .ctx = &clock_ctx, .nowNs = &wasmClockNs });
     vm.random_seed_source = .{ .ctx = &rng_ctx, .seed = &wasmRandomSeed };
     try vm.enableSystem(playground_groups);
     // The program's other files: `require`/`loadfile`/`dofile` read them as

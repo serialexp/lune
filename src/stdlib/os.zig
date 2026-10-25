@@ -46,7 +46,7 @@ fn strArg(vm: *Vm, args: []const Value, i: usize) anyerror![]const u8 {
 
 /// The wall clock, in whole seconds since the epoch: the `wall_clock` effect.
 /// A host that enabled the time group without a clock behind it is an
-/// embedding error, like a missing `clock_source`.
+/// embedding error, like a missing `Vm.clock`.
 fn wallSeconds(vm: *Vm) anyerror!i64 {
     if (vm.effect_mode == .replay) return switch (try interp.replayHost(vm, .wall_clock)) {
         .value => |v| if (v.isInt()) v.asInt() else error.EffectKindMismatch,
