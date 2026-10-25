@@ -53,10 +53,10 @@ Wrong results:
       `next({}, "nokey")` returns `nil` where Lua raises "invalid key to
       'next'"; the traversal steps past a key deleted mid-loop by design,
       and can't tell it from one never present (documented).
-- [ ] Natives that return nothing in Lua return one `nil` in mahina:
+- [x] Natives that return nothing in Lua return one `nil` in mahina:
       `select('#', print())`, `table.insert`, `table.sort`, `warn` are 1
-      (Lua 0). Needs a general "no results" native shape, not per-native
-      multi functions.
+      (Lua 0). `function.noResults(func)` is their `multi` projection now
+      (a registry row's one field, no hand-written multi body).
 - [x] Float `%` with an infinite divisor: `5 % math.huge` and
       `-5 % math.huge` are `-nan` (Lua `5.0`, `inf`); `1e300 % 7` is `0`
       (Lua `1.0`). `arith.mod` uses `a - floor(a/b)*b`, not `fmod` with

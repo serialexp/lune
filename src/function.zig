@@ -198,6 +198,21 @@ pub const NativeFn = *const fn (ctx: *anyopaque, args: []const Value) anyerror!V
 /// mirroring Lua's stack), so it must not be made to copy.
 pub const NativeMultiFn = *const fn (ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize;
 
+/// The `multi` projection of a native that, as in Lua, returns nothing
+/// (`print`, `table.insert`): `select('#', print())` is 0. Its `func`
+/// returns `nil`, which is what one wanted result reads anyway; this
+/// projection, taken when the caller wants every result or two or more,
+/// runs `func` and produces none.
+pub fn noResults(comptime func: NativeFn) NativeMultiFn {
+    return &struct {
+        fn multi(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+            _ = out;
+            _ = try func(ctx, args);
+            return 0;
+        }
+    }.multi;
+}
+
 /// Embedding (doc 59 §3.5): an embedder-registered host function. Generic Zig —
 /// no C types here (the C adaptation lives entirely in `capi.zig`, per the
 /// wrapper-boundary rule). `ctx` is the binding's own userdata (NOT the VM; the

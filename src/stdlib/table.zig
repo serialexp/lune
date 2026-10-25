@@ -308,13 +308,13 @@ fn tSort(ctx: *anyopaque, args: []const Value) anyerror!Value {
 }
 
 pub const natives = [_]function.BaseNative{
-    .{ .name = "table.insert", .func = &tInsert, .module = "table", .field = "insert" },
+    .{ .name = "table.insert", .func = &tInsert, .multi = function.noResults(&tInsert), .module = "table", .field = "insert" },
     .{ .name = "table.remove", .func = &tRemove, .module = "table", .field = "remove" },
     .{ .name = "table.concat", .func = &tConcat, .module = "table", .field = "concat" },
     .{ .name = "table.move", .func = &tMove, .module = "table", .field = "move" },
     .{ .name = "table.pack", .func = &tPack, .module = "table", .field = "pack" },
     .{ .name = "table.unpack", .func = &tUnpack1, .multi = &tUnpackN, .module = "table", .field = "unpack" },
-    .{ .name = "table.sort", .func = &tSort, .module = "table", .field = "sort" },
+    .{ .name = "table.sort", .func = &tSort, .multi = function.noResults(&tSort), .module = "table", .field = "sort" },
 };
 
 // ---------------------------------------------------------------------------

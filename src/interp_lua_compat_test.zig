@@ -217,6 +217,17 @@ test "table.insert, remove, concat and gsub raise Lua's messages" {
         "false\tmain:4: invalid replacement value (a boolean)\n");
 }
 
+test "print, warn, table.insert and table.sort return nothing" {
+    try expectProgram(
+        \\print(select("#", print()), select("#", warn("@off")))
+        \\print(select("#", table.insert({}, 1)), select("#", table.sort({2, 1})))
+        \\print(select("#", pcall(print)), select("#", pcall(table.insert, {}, 1)))
+        \\local function f() return table.insert({}, 1, 2) end
+        \\local a, b = f()
+        \\print(select("#", f()), a, b)
+    , "\n0\t0\n0\t0\n\n1\t1\n0\tnil\tnil\n");
+}
+
 test "assert raises its message with the caller's position" {
     try expectProgram(
         \\print(pcall(function() assert(false, "boom") end))

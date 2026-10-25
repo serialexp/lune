@@ -291,10 +291,10 @@ const base_templates = blk: {
 /// The interpreter's own natives. `print` is pure output; `clock` is the first
 /// nondeterministic input.
 const core_natives = [_]BaseNative{
-    .{ .name = "print", .func = &nativePrint },
+    .{ .name = "print", .func = &nativePrint, .multi = function.noResults(&nativePrint) },
     // `warn` is a pure host output to stderr (no effect, like `print`); the `@on`/
     // `@off` control state lives in `Vm.warn_enabled`.
-    .{ .name = "warn", .func = &nativeWarn },
+    .{ .name = "warn", .func = &nativeWarn, .multi = function.noResults(&nativeWarn) },
     // `os.clock` (float seconds) + `os.nsclock` (int nanoseconds, a mahina extension)
     // share the `.clock` effect. `.name` stays bare (`clock`/`nsclock`) — the
     // serialized keyframe identity; `.module`/`.field` only drive table install,
