@@ -34,11 +34,8 @@ integers included, with one exception: `..` ends a numeral, so `1..2` is
 - The `<const>` and `<close>` attributes.
 - Calls without parentheses: `f"str"`, `f[[str]]`, `f{...}`, so
   `require"mod"` must be `require("mod")`.
-- The `\z` escape.
 - A `#!` first line.
 - `...` in the main chunk. Script arguments are only in `arg`.
-- A carriage return inside a long string is kept; Lua turns `\r\n` into
-  `\n`.
 
 A compile error reads `file:line: error: message`, without Lua's
 `near 'token'`, and one compile may report several.

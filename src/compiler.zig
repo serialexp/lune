@@ -2146,7 +2146,15 @@ const Compiler = struct {
                 '\\' => try buf.append(self.arena, '\\'),
                 '"' => try buf.append(self.arena, '"'),
                 '\'' => try buf.append(self.arena, '\''),
-                '\n' => try buf.append(self.arena, '\n'),
+                // A backslash before a newline (LF, CR, CRLF or LFCR) is one `\n`.
+                '\n', '\r' => {
+                    if (i < inner.len and (inner[i] == '\n' or inner[i] == '\r') and inner[i] != esc) i += 1;
+                    try buf.append(self.arena, '\n');
+                },
+                // `\z` skips the whitespace after it, newlines included.
+                'z' => while (i < inner.len and std.mem.indexOfScalar(u8, " \t\n\r\x0B\x0C", inner[i]) != null) {
+                    i += 1;
+                },
                 'x' => {
                     var val: u16 = 0;
                     var digits: usize = 0;
@@ -2187,7 +2195,7 @@ const Compiler = struct {
                         return self.fail(span, "\\u{...} is not a valid code point (surrogate or out of range)");
                     try buf.appendSlice(self.arena, tmp[0..n]);
                 },
-                else => try buf.append(self.arena, esc), // unknown escape → literal
+                else => return self.fail(span, "invalid escape sequence"),
             }
         }
         if (!std.unicode.utf8ValidateSlice(buf.items)) return self.fail(span, "string literal is not valid UTF-8");
@@ -2197,9 +2205,11 @@ const Compiler = struct {
     /// Decode a long-bracket string literal `raw` = `[` `=`{n} `[` body `]` `=`{n} `]`.
     /// The content is verbatim (no escape interpretation); if the body begins with
     /// a newline it is dropped (Lua 5.4 §3.1: a `\r\n`/`\n\r`/`\r`/`\n` immediately
-    /// after the opening bracket is not part of the string). The returned slice
+    /// after the opening bracket is not part of the string), and every other
+    /// newline sequence reads as one `\n`, as in Lua. A body without a `\r`
     /// borrows `self.source`, which is fine — `stringConstant` interns (copies) it
-    /// immediately. UTF-8 validated like every mahina string literal.
+    /// immediately; one with a `\r` is rebuilt in the arena. UTF-8 validated like
+    /// every mahina string literal.
     fn decodeLongString(self: *Compiler, raw: []const u8, span: ast.Span) Error![]const u8 {
         std.debug.assert(raw[0] == '[');
         var level: usize = 0;
@@ -2216,7 +2226,20 @@ const Compiler = struct {
             }
         }
         if (!std.unicode.utf8ValidateSlice(inner)) return self.fail(span, "string literal is not valid UTF-8");
-        return inner;
+        if (std.mem.indexOfScalar(u8, inner, '\r') == null) return inner;
+        var buf: std.ArrayList(u8) = .empty;
+        try buf.ensureTotalCapacity(self.arena, inner.len);
+        var i: usize = 0;
+        while (i < inner.len) : (i += 1) {
+            const ch = inner[i];
+            if (ch != '\n' and ch != '\r') {
+                buf.appendAssumeCapacity(ch);
+                continue;
+            }
+            if (i + 1 < inner.len and (inner[i + 1] == '\n' or inner[i + 1] == '\r') and inner[i + 1] != ch) i += 1;
+            buf.appendAssumeCapacity('\n');
+        }
+        return buf.items;
     }
 
     fn lineOf(self: *const Compiler, offset: u32) u32 {
@@ -3079,6 +3102,22 @@ test "string literals, escapes, and concatenation" {
     defer r.deinit();
     try testing.expect(r.value.isHeap());
     try testing.expectEqualStrings("hello, world\n", string.String.fromHeader(r.value.asHeap()).bytes());
+}
+
+test "string escapes: newlines, \\z, and unknown escapes" {
+    // A backslash before any newline sequence is one `\n`; `\z` skips the
+    // whitespace after it, newlines included.
+    var r = try run("return \"a\\\r\nb\\\n\rc\\\rd\" .. \"e\\z \r\n\t f\"");
+    defer r.deinit();
+    try testing.expectEqualStrings("a\nb\nc\ndef", string.String.fromHeader(r.value.asHeap()).bytes());
+    try expectCompileError("return \"\\q\"");
+    try expectCompileError("return \"\\Z\"");
+}
+
+test "long strings read every newline sequence as \\n" {
+    var r = try run("return [[\r\na\r\nb\n\rc\rd]]");
+    defer r.deinit();
+    try testing.expectEqualStrings("a\nb\nc\nd", string.String.fromHeader(r.value.asHeap()).bytes());
 }
 
 test "string length via #" {

@@ -87,10 +87,14 @@ Wrong results:
       (Lua -1); `tonumber(10, 16)` and base 1 or 37 return nil (Lua
       raises). `src/numeral.zig` is now the one grammar for literals,
       `tonumber` and `read("n")`; hex float literals lex.
-- [ ] Lexer: unknown escapes (`"\q"`) are accepted (Lua: "invalid escape
-      sequence"); `"a\` + CRLF + `b"` is "unterminated string". (`3..2`
-      as `3 .. 2` is pinned by a lexer test, so kept and documented as a
+- [x] Lexer: unknown escapes (`"\q"`) raise "invalid escape sequence";
+      a backslash takes a whole CR/CRLF/LFCR newline; `\z` is supported;
+      long strings read every newline sequence as `\n`. (`3..2` as
+      `3 .. 2` is pinned by a lexer test, so kept and documented as a
       difference; Bart to decide whether to match Lua's error.)
+- [ ] Line numbers count only `\n`: a file with CR-only line endings is
+      all line 1 (Lua's `inclinenumber` counts a lone `\r` too). The
+      lexer and `LineTable` (compiler.zig) must change together.
 - [x] Missing-argument checks: `tostring()`, `tonumber()`,
       `getmetatable()`, `rawequal(1)`, `setmetatable({})`,
       `math.tointeger()` return instead of raising "value expected".

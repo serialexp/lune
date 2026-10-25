@@ -206,23 +206,49 @@ pub const Lexer = struct {
         return self.make(if (n == .int) .int_literal else .float_literal, start, line);
     }
 
+    /// Step over one newline inside a string, as Lua's `inclinenumber`: `\n`,
+    /// `\r`, or either pair (`\r\n`, `\n\r`) is one newline. It counts a line
+    /// only if it holds a `\n`, the one line break `LineTable` knows, so the
+    /// two never disagree on a span's line.
+    fn newline(self: *Lexer) void {
+        const first = self.peek();
+        self.index += 1;
+        const second = self.peek();
+        const pair = (second == '\n' or second == '\r') and second != first;
+        if (pair) self.index += 1;
+        if (first == '\n' or pair) self.line += 1;
+    }
+
     fn string(self: *Lexer, start: u32, line: u32) Token {
         const quote = self.peek();
         self.index += 1; // opening quote
         while (true) {
             const c = self.peek();
             switch (c) {
-                0, '\n' => {
+                0, '\n', '\r' => {
                     self.diags.err("unterminated string", start, self.index, line);
                     return self.make(.invalid, start, line);
                 },
                 '\\' => {
                     // Consume the backslash and the escaped character verbatim;
-                    // escape *interpretation* happens when the parser builds the
-                    // string value. A backslash-newline counts a line.
+                    // escape *interpretation* happens when the compiler builds
+                    // the string value. Two escapes span more: a backslash before
+                    // a newline (LF, CR, CRLF or LFCR) takes the whole newline,
+                    // and `\z` the whitespace after it; both count lines.
                     self.index += 1;
-                    if (self.peek() == '\n') self.line += 1;
-                    if (self.peek() != 0) self.index += 1;
+                    switch (self.peek()) {
+                        0 => {}, // reported as unterminated next round
+                        '\n', '\r' => self.newline(),
+                        'z' => {
+                            self.index += 1;
+                            while (true) switch (self.peek()) {
+                                ' ', '\t', 0x0B, 0x0C => self.index += 1,
+                                '\n', '\r' => self.newline(),
+                                else => break,
+                            };
+                        },
+                        else => self.index += 1,
+                    }
                 },
                 else => {
                     if (c == quote) {
@@ -502,6 +528,26 @@ test "strings with escapes and both quote styles" {
     try expectTags(
         \\"hello" 'it\'s' "tab\there"
     , &.{ .string_literal, .string_literal, .string_literal });
+}
+
+test "a backslash takes a whole CRLF, and \\z the whitespace after it" {
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    const toks = try tokenize(testing.allocator, "\"a\\\r\nb\" \"c\\z \r\n\t d\" x", &diags);
+    defer testing.allocator.free(toks);
+    try testing.expect(!diags.hasErrors());
+    try testing.expectEqual(Token.Tag.string_literal, toks[0].tag);
+    try testing.expectEqual(Token.Tag.string_literal, toks[1].tag);
+    try testing.expectEqual(@as(u32, 3), toks[2].line); // `x`, after two newlines
+}
+
+test "a raw carriage return ends a string as unterminated" {
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    const toks = try tokenize(testing.allocator, "\"a\rb\"", &diags);
+    defer testing.allocator.free(toks);
+    try testing.expect(diags.hasErrors());
+    try testing.expectEqual(Token.Tag.invalid, toks[0].tag);
 }
 
 test "line and block comments are skipped, lines tracked" {
