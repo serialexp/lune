@@ -190,23 +190,42 @@ fn zeroedHints(arena: std.mem.Allocator, n: usize) std.mem.Allocator.Error![]u32
 /// per compile so a span's line is a binary search, never a rescan from byte 0.
 /// The compiler stamps every `Span.line` and every diagnostic's line from it.
 const LineTable = struct {
-    /// `starts[0] == 0`; `starts[k]` is one past the k-th `'\n'`.
+    /// `starts[0] == 0`; `starts[k]` is one past the k-th line break. A line
+    /// break is Lua's (`inclinenumber`, and the lexer's `newline`): `\n`,
+    /// `\r`, `\r\n` or `\n\r`.
     starts: []u32,
+    /// The allocation `starts` is the front of.
+    buf: []u32,
 
     fn build(gpa: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error!LineTable {
-        const starts = try gpa.alloc(u32, std.mem.count(u8, source, "\n") + 1);
+        const lfs = std.mem.count(u8, source, "\n");
+        const crs = std.mem.count(u8, source, "\r");
+        // An upper bound: a pair is one break, but two bytes.
+        const cap = lfs + crs + 1;
+        const starts = try gpa.alloc(u32, cap);
         starts[0] = 0;
         var n: usize = 1;
-        for (source, 0..) |ch, i| {
-            if (ch != '\n') continue;
+        var i: usize = 0;
+        if (crs == 0) {
+            // The usual source: every break is a `\n`, found a vector at a time.
+            while (std.mem.findScalarPos(u8, source, i, '\n')) |at| : (n += 1) {
+                i = at + 1;
+                starts[n] = @intCast(i);
+            }
+            return .{ .starts = starts, .buf = starts };
+        }
+        while (i < source.len) : (i += 1) {
+            const ch = source[i];
+            if (ch != '\n' and ch != '\r') continue;
+            if (i + 1 < source.len and (source[i + 1] == '\n' or source[i + 1] == '\r') and source[i + 1] != ch) i += 1;
             starts[n] = @intCast(i + 1);
             n += 1;
         }
-        return .{ .starts = starts };
+        return .{ .starts = starts[0..n], .buf = starts };
     }
 
     fn deinit(self: LineTable, gpa: std.mem.Allocator) void {
-        gpa.free(self.starts);
+        gpa.free(self.buf);
     }
 
     /// 1-based line containing byte `offset`: the number of line starts at or
@@ -3425,6 +3444,14 @@ test "LineTable: line of an offset, newline by newline" {
     try testing.expectEqual(@as(u32, 3), t.lineOf(5)); // the empty line
     try testing.expectEqual(@as(u32, 4), t.lineOf(6));
     try testing.expectEqual(@as(u32, 4), t.lineOf(1000)); // past the end
+}
+
+test "LineTable: CR, CRLF and LFCR are one line break each, as Lua's" {
+    const t = try LineTable.build(testing.allocator, "a\rb\r\nc\n\rd\n\ne\r\rf");
+    defer t.deinit(testing.allocator);
+    const want = [_]u32{ 1, 2, 3, 4, 5, 6, 7 };
+    const at = [_]u32{ 0, 2, 5, 8, 10, 11, 13 };
+    for (at, want) |off, line| try testing.expectEqual(line, t.lineOf(off));
 }
 
 test "LineTable: empty source and a trailing newline" {

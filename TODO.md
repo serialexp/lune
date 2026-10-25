@@ -96,9 +96,10 @@ Wrong results:
       long strings read every newline sequence as `\n`. (`3..2` as
       `3 .. 2` is pinned by a lexer test, so kept and documented as a
       difference; Bart to decide whether to match Lua's error.)
-- [ ] Line numbers count only `\n`: a file with CR-only line endings is
+- [x] Line numbers count only `\n`: a file with CR-only line endings is
       all line 1 (Lua's `inclinenumber` counts a lone `\r` too). The
-      lexer and `LineTable` (compiler.zig) must change together.
+      lexer's `newline` and `LineTable` now both take `\n`, `\r`, `\r\n`
+      and `\n\r` as one break.
 - [x] Missing-argument checks: `tostring()`, `tonumber()`,
       `getmetatable()`, `rawequal(1)`, `setmetatable({})`,
       `math.tointeger()` return instead of raising "value expected".

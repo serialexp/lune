@@ -83,11 +83,8 @@ pub const Lexer = struct {
     fn skipTrivia(self: *Lexer) void {
         while (true) {
             switch (self.peek()) {
-                ' ', '\t', '\r' => self.index += 1,
-                '\n' => {
-                    self.index += 1;
-                    self.line += 1;
-                },
+                ' ', '\t' => self.index += 1,
+                '\n', '\r' => self.newline(),
                 '-' => {
                     if (self.peekNext() != '-') return;
                     self.index += 2; // consume "--"
@@ -117,13 +114,12 @@ pub const Lexer = struct {
                             return;
                         }
                     }
-                    if (c == '\n') self.line += 1;
-                    self.index += 1;
+                    if (c == '\n' or c == '\r') self.newline() else self.index += 1;
                 }
             }
         }
-        // Line comment: to end of line (the '\n' is left for skipTrivia).
-        while (self.peek() != '\n' and self.peek() != 0) self.index += 1;
+        // Line comment: to end of line (the newline is left for skipTrivia).
+        while (self.peek() != '\n' and self.peek() != '\r' and self.peek() != 0) self.index += 1;
     }
 
     /// At a `[`, detect a long-bracket opener `[` `=`* `[` and return its level
@@ -166,8 +162,7 @@ pub const Lexer = struct {
                     return self.make(.string_literal, start, line);
                 }
             }
-            if (c == '\n') self.line += 1;
-            self.index += 1;
+            if (c == '\n' or c == '\r') self.newline() else self.index += 1;
         }
     }
 
@@ -206,17 +201,15 @@ pub const Lexer = struct {
         return self.make(if (n == .int) .int_literal else .float_literal, start, line);
     }
 
-    /// Step over one newline inside a string, as Lua's `inclinenumber`: `\n`,
-    /// `\r`, or either pair (`\r\n`, `\n\r`) is one newline. It counts a line
-    /// only if it holds a `\n`, the one line break `LineTable` knows, so the
-    /// two never disagree on a span's line.
+    /// Step over one newline, as Lua's `inclinenumber`: `\n`, `\r`, or either
+    /// pair (`\r\n`, `\n\r`) is one line break, the same ones
+    /// `compiler.LineTable` counts, so the two never disagree on a line.
     fn newline(self: *Lexer) void {
         const first = self.peek();
         self.index += 1;
         const second = self.peek();
-        const pair = (second == '\n' or second == '\r') and second != first;
-        if (pair) self.index += 1;
-        if (first == '\n' or pair) self.line += 1;
+        if ((second == '\n' or second == '\r') and second != first) self.index += 1;
+        self.line += 1;
     }
 
     fn string(self: *Lexer, start: u32, line: u32) Token {
@@ -634,6 +627,17 @@ test "unexpected character is diagnosed" {
     try testing.expect(diags.hasErrors());
     try testing.expectEqual(Token.Tag.identifier, toks[0].tag);
     try testing.expectEqual(Token.Tag.invalid, toks[1].tag);
+}
+
+test "CR, CRLF and LFCR each end one line, in code, comments and long strings" {
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    const src: [:0]const u8 = "a\rb\r\nc\n\rd -- x\re --[[\r\n]] f [[\r]] g";
+    const toks = try tokenize(testing.allocator, src, &diags);
+    defer testing.allocator.free(toks);
+    try testing.expect(!diags.hasErrors());
+    const want = [_]u32{ 1, 2, 3, 4, 5, 6, 6, 7 };
+    for (want, toks[0..want.len]) |line, t| try testing.expectEqual(line, t.line);
 }
 
 test "lexeme slices map back to source" {

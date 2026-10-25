@@ -217,6 +217,12 @@ test "table.insert, remove, concat and gsub raise Lua's messages" {
         "false\tmain:4: invalid replacement value (a boolean)\n");
 }
 
+test "a carriage return ends a line, alone or paired" {
+    try expectProgram("local x = 1\rprint(pcall(error, 'a', 1))\r\nprint(pcall(function() error('b') end))\n\r" ++
+        "print(pcall(function() error('c') end))\n\nprint(pcall(function() error('d') end))",
+        "false\ta\nfalse\tmain:3: b\nfalse\tmain:4: c\nfalse\tmain:6: d\n");
+}
+
 test "print, warn, table.insert and table.sort return nothing" {
     try expectProgram(
         \\print(select("#", print()), select("#", warn("@off")))
