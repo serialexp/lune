@@ -1,9 +1,9 @@
 # 73 — Coroutines, and async on top of them — Design
 
-Status: draft, not yet implemented. Direction (§4) and the open questions
-(§8) are for Bart.
+Status: draft, not yet implemented. Q2–Q4 decided (2026-10-26); Q1 (the
+direction) is open after research round 1 (§4.1).
 Owner: claude (coral-marten)
-Last updated: 2026-10-25
+Last updated: 2026-10-26
 
 ## Implementation status
 
@@ -12,16 +12,23 @@ land; move whole phases to Done once everything inside them is checked.
 
 ### Done
 
-_(nothing yet)_
+- [x] **Q2 — the stack model** (§5): decided 2026-10-26 — option 5.3, a
+  stack per coroutine in reserved address space.
+- [x] **Q3 — yielding across an embedder host function** (§6.3): decided
+  2026-10-26 — raise Lua's "attempt to yield across a C-call boundary"
+  first; a continuation form of the C API maybe later.
+- [x] **Q4 — the async surface** (§7): decided 2026-10-26 — async with
+  syntactic sugar (`async function` / `await`).
+- [x] **Q1 research round 1** (§4.1): Codex and Antigravity surveyed
+  single-model designs; reports in `docs/reviews/doc73/`.
 
 ### Outstanding
 
-- [ ] **Q1 — direction** (§4): Lua 5.4 coroutines, stackless generators, or
-  coroutines with an async layer built from the same primitive.
-- [ ] **Q2 — the stack model** (§5): a stack per coroutine, or one VM stack
-  with suspended coroutines copied out to the heap.
-- [ ] **Q3 — yielding across an embedder host function** (§6.3).
-- [ ] **Q4 — the async surface** (§7), if Q1 includes it.
+- [ ] **Q1 — direction** (§4, §4.1): Bart leans to a single model (option
+  4.4) with Lua's coroutines derived from it; the two reports differ on
+  where its delimiters live (§4.1).
+- [ ] **Q2 on wasm32** (§5): the in-browser VM (`zig build wasm`) has no
+  reserve-then-commit; every reserved byte is real linear memory.
 - [ ] **P0 — the thread object and stack switch** (§5), `coroutine.create`,
   `resume`, `yield`, `status`, `running`, `isyieldable`, `wrap`, `close`.
 - [ ] **P1 — GC, keyframes and replay** (§6.1, §6.2): suspended stacks are
@@ -99,6 +106,52 @@ What does remain hard is real engineering, not a wall: the stack model
 3. **Lua 5.4 coroutines plus an async layer** (§7). The coroutine is the
    primitive; `async`/`await` and host-owned tasks are a library (or thin
    syntax) over it, with the host's scheduling choices logged as effects.
+4. **A single model: one-shot effect handlers or tagged delimited
+   suspension** (added 2026-10-26). A function performs a named operation;
+   the nearest enclosing delimiter for that tag receives it with a
+   continuation it may resume once. Lua's `coroutine` library, generators,
+   `async`/`await` and host waits are all surfaces over it. OCaml 5 is the
+   reference example, not a limit (§4.1).
+
+### 4.1 Research round 1 (2026-10-26)
+
+Bart leaned to option 4 and asked Codex and Antigravity for a survey
+(`docs/reviews/doc73/codex-research-r1.md`,
+`docs/reviews/doc73/antigravity-research-r1.md`). Where they agree:
+
+- Multi-shot continuations and stackless state machines are out: the first
+  duplicates resources and breaks replay bookkeeping, the second can't
+  yield through ordinary Lua calls.
+- Asymmetric coroutines and one-shot delimited continuations are equally
+  expressive (Moura & Ierusalimschy, "Revisiting Coroutines", 2009); the
+  choice is about targeting, composition and cost.
+- Tagged delimiters solve the case plain coroutines get wrong: an `await`
+  inside a coroutine (or an iterator built on one) must reach the task's
+  scheduler, not come out of the inner `coroutine.resume` as an ordinary
+  yield.
+- Switches are trace barriers; loops inside a body trace as today.
+- The debugger stop shares the saved state but stays a privileged VM event
+  that guest handlers can't intercept.
+
+Where they differ:
+
+- **Codex** recommends tagged one-shot delimited suspension as the core,
+  with each handler body on its own reserved stack segment, so capture
+  never copies or moves registers. Its cost is more segments than
+  coroutines when handlers nest.
+- **Antigravity** recommends asymmetric fibers with tagged yields as the
+  core, prompt tags kept as an internal hook, and rejects general effect
+  handlers: a handler either needs its own fiber (nested handlers use up
+  stacks) or forces frames to be copied, against Q2.
+
+The two agree on the mechanism: a delimiter per reserved stack, with a
+tagged suspend that finds the nearest matching ancestor. They differ on
+whether to expose it as general handlers. Codex adds points neither draft
+had: `coroutine.close` must close open upvalues into the coroutine (not
+just mark it dead); a closure can hold an open upvalue into a suspended
+coroutine whose handle is unreachable, so the stack must stay alive or be
+closed first; and GC and keyframes belong in the first slice, not a later
+phase.
 
 ## 5. The stack model (Q2)
 
@@ -124,6 +177,18 @@ entry argument rather than baking its address (no `tags.ptr` immediates in
    generators; the call path is untouched and windows stay stable while
    running. Open upvalues pointing into the copied range must be rebased or
    closed into the heap object.
+3. **A stack per coroutine in reserved address space** (added 2026-10-26).
+   Each coroutine reserves the full stack size as virtual memory, and pages
+   commit when touched; freed stacks are pooled. Addresses never move, so
+   there is no relocation pass, and a switch stays a pointer swap. Costs: a
+   reservation per new stack (mmap, or VirtualAlloc behind one wrapper, Rule
+   Z-2), address space per live coroutine, and the same extra `Vm.frames`
+   load on calls as 5.1.
+
+**Decided (Bart, 2026-10-26): option 3.** Open: wasm32 has no
+reserve-then-commit, so the browser VM needs its own stack backend behind
+the same contract (smaller fixed stacks, growth with relocation there, or a
+cap on live coroutines).
 
 ## 6. What every option must handle
 
@@ -145,6 +210,8 @@ A yield with an embedder host function between the yield and its `resume`:
 raise Lua's "attempt to yield across a C-call boundary", or add a
 continuation form to the C API (Lua's `lua_yieldk`/`lua_callk`). Lua's error
 is the smaller first step.
+
+**Decided (Bart, 2026-10-26):** the error first.
 
 ### 6.4 The JIT
 
@@ -169,6 +236,10 @@ Built on the coroutine primitive, not beside it:
 - Surface options: library only (`task.spawn(f)`, `task.await(x)`), or
   `async function` / `await` syntax compiling to the same calls. Syntax is
   a divergence from Lua that code would have to opt into.
+
+**Decided (Bart, 2026-10-26):** syntax, compiling to the library calls.
+Still open: whether an async call starts its task at once or when first
+awaited.
 
 ## 8. Open questions for review
 
