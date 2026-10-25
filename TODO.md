@@ -36,7 +36,7 @@ Wrong results:
       `select('#', print())`, `table.insert`, `table.sort`, `warn` are 1
       (Lua 0). Needs a general "no results" native shape, not per-native
       multi functions.
-- [ ] Float `%` with an infinite divisor: `5 % math.huge` and
+- [x] Float `%` with an infinite divisor: `5 % math.huge` and
       `-5 % math.huge` are `-nan` (Lua `5.0`, `inf`); `1e300 % 7` is `0`
       (Lua `1.0`). `arith.mod` uses `a - floor(a/b)*b`, not `fmod` with
       Lua's sign fix.

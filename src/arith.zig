@@ -137,8 +137,8 @@ pub fn mod(a: Value, b: Value) Error!Value {
         if (y == -1) return Value.int(0);
         return Value.int(@mod(a.asInt(), y));
     }
-    // Lua float modulo, `a - floor(a/b)*b` — through the ONE noinline kernel
-    // so all three tiers share a single compiled body (doc 25 D2).
+    // Lua float modulo (`luai_nummod`) — through the ONE noinline kernel so
+    // all three tiers share a single compiled body (doc 25 D2).
     return Value.float(fmath.fmodRuntime(a.toFloat(), b.toFloat()));
 }
 

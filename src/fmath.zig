@@ -26,14 +26,20 @@ pub noinline fn powRuntime(x: f64, y: f64) callconv(.c) f64 {
     return std.math.pow(f64, x, y);
 }
 
-/// Float `%` kernel (doc 25 D2) — Lua's floored float modulo,
-/// `x - floor(x/y) * y`, the single body all tiers execute (tier-0 and
+/// Float `%` kernel (doc 25 D2) — Lua 5.4's floored float modulo
+/// (`luai_nummod`): the C `fmod` remainder, moved into the divisor's sign
+/// when the two differ. The single body all tiers execute (tier-0 and
 /// tier-1a reach it through `arith.mod`'s float path; the native JIT calls it
-/// directly as a two-arg body callout). Total: `y == 0` yields NaN through
-/// IEEE — no error, no side-exit.
+/// directly as a two-arg body callout). `x - floor(x/y) * y` is not the
+/// same: it is NaN for an infinite `y` (`5 % math.huge` is `5.0`) and loses
+/// the remainder of a large `x` (`1e300 % 7` is `1.0`). Total: `y == 0`
+/// yields NaN through IEEE — no error, no side-exit. `@rem` is compiler-rt's
+/// software `fmod`, exact and the same on every target.
 pub noinline fn fmodRuntime(x: f64, y: f64) callconv(.c) f64 {
     @setFloatMode(.strict);
-    return x - @floor(x / y) * y;
+    var m = @rem(x, y);
+    if (if (m > 0) y < 0 else (m < 0 and y > 0)) m += y;
+    return m;
 }
 
 /// Float `//` kernel (doc 25 D2) — `floor(x / y)`, the single body all tiers

@@ -61,3 +61,13 @@ test "an iterator that is done returns one nil" {
         \\print()
     , "1\tnil\n1\tnil\n1=1 x=2 \n");
 }
+
+test "float modulo is fmod with Lua's sign correction" {
+    try expectProgram(
+        \\print(5 % math.huge, -5 % math.huge, 3 % -math.huge, -3 % -math.huge)
+        \\print(1e300 % 7, -5.5 % 2, 5.5 % -2, -5.5 % -2, -6.0 % 3)
+        \\local s = 0.0
+        \\for i = 1, 300 do s = s + (i * 1.5) % 7 + (-i * 0.5) % 4 end
+        \\print(s)
+    , "5\tinf\t-inf\t-3\n1\t0.5\t-0.5\t-1.5\t-0\n1502\n");
+}

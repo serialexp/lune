@@ -1196,7 +1196,9 @@ test "doc 66 P3: every constant arithmetic form is its register form" {
         \\end
         \\print(bad, checks, h)
         \\
-    , "0\t2496\t-2335769007170761397\n");
+        // The digest moved on 2026-10-25 when float `%` became Lua's fmod with
+        // the sign correction (`fmath.fmodRuntime`); `bad` stayed 0.
+    , "0\t2496\t-8023700992279324750\n");
 }
 
 test "doc 66 P5: equality against a constant is `Value.eql` against it" {
