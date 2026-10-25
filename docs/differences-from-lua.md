@@ -92,7 +92,11 @@ division or modulo by zero".
   the current key, and mahina does not keep deleted keys around to tell
   the two apart.
 - `#t` on a table with holes may pick a different border than Lua does
-  (both are valid): `#{1, 2, nil, 4}` is 2, where Lua gives 4.
+  (both are valid): `#{1, 2, nil, 4}` is 2, where Lua gives 4. Everything
+  that uses `#t` follows it: `table.sort({3, nil, 1})` sorts only the
+  one-element prefix (Lua reaches the nil and raises "attempt to compare
+  nil with number"), and `table.unpack`, `table.concat` and `table.insert`
+  work on the same shorter prefix.
 - `tostring({})` is `table: 0x11b`: a small object number, not an
   address, so it is the same on every run. Built-in functions print as
   `native: 0x…` (`type` still says `"function"`).
@@ -167,8 +171,7 @@ What follows from that:
 - **`require`** searches `package.path`, which starts with
   `./?.mah;./?/init.mah;./?.lua;./?/init.lua`. There are two searchers
   (`package.preload` and the path); C modules are not supported, so
-  `package.cpath` is empty and `package.loadlib` is absent. `require`
-  returns one value; Lua also returns where it found the module.
+  `package.cpath` is empty and `package.loadlib` is absent.
 - **`debug`** has only `traceback`.
 
 ## Missing libraries and functions
@@ -203,7 +206,10 @@ Other differences:
   arithmetic on a string value", and many library functions say only
   `bad argument to 'insert'` without the argument number and reason.
 - An uncaught error prints `mahina: runtime error: message at file:line`
-  and an indented traceback without `[C]` frames.
+  and an indented traceback without `[C]` frames. An error object's
+  `__tostring` gives the message, as in Lua; if that `__tostring` itself
+  fails, mahina prints `(error object is a table value)` where Lua reports
+  the handler's error.
 
 ## Files and the operating system: `io` and `os`
 

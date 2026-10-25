@@ -2407,13 +2407,15 @@ test "metatable: calling a table with no __call raises a located TypeError" {
     );
 }
 
-test "metatable: __tostring returning a non-string is rejected" {
+test "metatable: __tostring returning a non-string, non-number is rejected" {
     try expectProgram(
-        \\local bad = setmetatable({}, { __tostring = function() return 42 end })
+        \\local num = setmetatable({}, { __tostring = function() return 42 end })
+        \\local bad = setmetatable({}, { __tostring = function() return {} end })
+        \\print(pcall(function() return tostring(num) end))
         \\print(pcall(function() return tostring(bad) end))
         \\
     ,
-        "false\tanonymous:2: bad argument to 'tostring'\n",
+        "true\t42\nfalse\tanonymous:4: '__tostring' must return a string\n",
     );
 }
 
@@ -3105,7 +3107,7 @@ test "doc 61 Phase 0: table.sort and a require loader keep their caller in fligh
         \\print(require('m'))
         \\print(shapes())
         \\
-    , "F:call F:call\nS F:call\nF:call F:call\nF:call\n");
+    , "F:call F:call\nS F:call\nF:call F:call\t:preload:\nF:call\n");
 }
 
 test "doc 61 Phase 0: an xpcall handler sees the faulting frame in flight at its fault" {

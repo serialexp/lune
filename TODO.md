@@ -103,14 +103,17 @@ Wrong results:
       says "integer division or modulo by zero" (Lua: "bad argument #2 to
       'fmod' (zero)"). Every math argument error now names the argument
       (it was "bad argument to 'floor'"), and `ult` takes integral floats.
-- [ ] `table.sort({3, nil, 1})` sorts the border-1 prefix silently (Lua:
-      "attempt to compare nil with number").
-- [ ] `package.loaded.x = false` makes `require("x")` return `false`; Lua
+- [x] `table.sort({3, nil, 1})` sorts the border-1 prefix silently (Lua:
+      "attempt to compare nil with number"). Not a sort bug: `#` picks
+      border 1 there, a valid border. Documented under `#` in
+      differences-from-lua.md.
+- [x] `package.loaded.x = false` makes `require("x")` return `false`; Lua
       treats `false` as not loaded.
-- [ ] A `__tostring` returning a number is rejected; one returning a table
+- [x] A `__tostring` returning a number is rejected; one returning a table
       blames `print`/`pcall` (Lua: "'__tostring' must return a string").
-- [ ] An uncaught error object with `__tostring` prints "(error object is
-      a table value)"; Lua prints its text.
+- [x] An uncaught error object with `__tostring` prints "(error object is
+      a table value)"; Lua prints its text. (A handler that itself errors
+      falls back to the generic text; Lua reports the handler's error.)
 - [ ] Method calls don't adjust argument numbers: `("a"):rep(2.5)` says
       `#2` (Lua `#1`).
 - [x] `gsub` with `"%x"` in the replacement yields `"x"` (Lua: "invalid
@@ -1548,6 +1551,10 @@ returns the path as `out[1]`, so the value exists — it is `require` that drops
 it. Under the extension contract just adopted (`.lua` = a Lua program, must run
 under stock Lua too) this is a real 5.4 incompatibility, not a nicety. Not fixed
 here to stay focused; it needs a check of whether anything depends on the arity.
+
+**FIXED 2026-10-26:** `require` returns `(module, loader data)` on a fresh
+load and the one cached value on a hit, as `ll_require` does. Only tests
+printing `require(...)` depended on the arity.
 
 ## Doc 30 arc observations (noted 2026-08-29, c5)
 

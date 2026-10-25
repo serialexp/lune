@@ -294,13 +294,16 @@ fn searchPathN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usiz
 /// otherwise iterates `package.searchers` in order. The first searcher returning a
 /// callable loader wins: the loader is called as `loader(name, data)` and its
 /// result (or `true` if it returned nothing) is cached in `package.loaded[name]`
-/// and returned. Searchers returning a string contribute to the not-found message;
+/// and returned, followed by the loader data (Lua 5.4's second result: the file
+/// path, or `":preload:"`). A cache hit returns the one value. A falsy
+/// `package.loaded[name]` counts as not loaded, as `lua_toboolean` does. Searchers returning a string contribute to the not-found message;
 /// no loader → a raised `module '<name>' not found:…` error.
 ///
 /// Reentrant: a loader may `require` further modules (rides `native_reentry_depth`
 /// through `callValue`). A `require` cycle currently bottoms out in `StackOverflow`
 /// rather than a dedicated "loop" message (see TODO).
-fn requireCore(vm: *Vm, args: []const Value) anyerror!Value {
+fn requireCore(vm: *Vm, args: []const Value, out: []Value) anyerror!usize {
+    std.debug.assert(out.len >= 1);
     // `name_val` is an argument → it lives in the caller's register window, which
     // stays GC-rooted for the whole native call (every nested `callValue` raises
     // `stack_top` above it). So the `Value` (and the string bytes it points at) are
@@ -314,7 +317,10 @@ fn requireCore(vm: *Vm, args: []const Value) anyerror!Value {
     {
         const loaded = try requirePackageSubTable(vm, "loaded", "package.loaded");
         const cached = loaded.get(name_val);
-        if (!cached.isNil()) return cached;
+        if (cached.isTruthy()) {
+            out[0] = cached;
+            return 1;
+        }
     }
 
     // Accumulate the not-found message from string-returning searchers.
@@ -351,9 +357,13 @@ fn requireCore(vm: *Vm, args: []const Value) anyerror!Value {
         return vm.raiseLocatedError(emsg, 0);
     }
 
-    // Run the loader: `loader(name, data)` → one result.
+    // Run the loader: `loader(name, data)` → one result. `loader_data` is
+    // returned after it, but the loader's window need not keep it (a loader
+    // that takes no parameters leaves it dead), so park it for the call.
     var lr: [1]Value = .{Value.nil()};
+    const data_slot = try vm.parkTemp(loader_data);
     _ = try vm.callValue(loader, &.{ name_val, loader_data }, lr[0..1]);
+    loader_data = vm.unparkTemp(data_slot);
     const result = lr[0];
 
     // Cache per Lua's rule: a non-nil loader result is the module; otherwise, if the
@@ -370,11 +380,19 @@ fn requireCore(vm: *Vm, args: []const Value) anyerror!Value {
         try loaded.set(vm.gpa, name_val, Value.boolean(true));
         cur = Value.boolean(true);
     }
-    return cur;
+    out[0] = cur;
+    if (out.len < 2) return 1;
+    out[1] = loader_data;
+    return 2;
 }
 
 fn require1(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    return requireCore(vmOf(ctx), args);
+    var b: [2]Value = .{ Value.nil(), Value.nil() };
+    _ = try requireCore(vmOf(ctx), args, b[0..2]);
+    return b[0];
+}
+fn requireN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    return requireCore(vmOf(ctx), args, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +430,7 @@ pub const searcher_natives = [_]function.BaseNative{
 /// Library natives concatenated into `interp.base_natives`. `require` is a bare
 /// global; `searchpath` namespaces under `package`; the two searchers are manual.
 pub const natives = [_]function.BaseNative{
-    .{ .name = "require", .func = &require1 },
+    .{ .name = "require", .func = &require1, .multi = &requireN },
     .{ .name = "searchpath", .func = &searchpath1, .multi = &searchpathN, .module = "package", .field = "searchpath" },
 } ++ searcher_natives;
 

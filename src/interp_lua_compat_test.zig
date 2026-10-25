@@ -169,3 +169,23 @@ test "assert raises its message with the caller's position" {
     , "false\tanonymous:1: boom\nfalse\tanonymous:2: assertion failed!\nfalse\t42\n");
 }
 
+
+test "require returns the loader data and treats a false cache entry as unloaded" {
+    try expectProgram(
+        \\package.preload.m = function(n, d) return {n = n, d = d} end
+        \\local a, b = require("m")
+        \\print(a.n, a.d, b, select("#", require("m")))
+        \\package.loaded.x = false
+        \\package.preload.x = function() return 7 end
+        \\print(require("x"))
+        \\package.preload.y = function() end
+        \\print(require("y"), package.loaded.y)
+    , "m\t:preload:\t:preload:\t1\n7\t:preload:\ntrue\ttrue\n");
+}
+
+test "__tostring may return a number but not a table" {
+    try expectProgram(
+        \\print(tostring(setmetatable({}, {__tostring = function() return 42 end})))
+        \\print(pcall(tostring, setmetatable({}, {__tostring = function() return {} end})))
+    , "42\nfalse\t'__tostring' must return a string\n");
+}

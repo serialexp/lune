@@ -2170,6 +2170,30 @@ pub const Vm = struct {
         }
     }
 
+    /// `renderErrorValue` for an error nothing caught: like Lua's standalone
+    /// interpreter, an error object with a `__tostring` metamethod reports
+    /// that text. A handler that fails, or returns a non-string, falls back
+    /// to the plain rendering.
+    fn renderUncaughtError(self: *Vm, ev: Value, arena: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
+        if (strBytes(ev) == null and !ev.isNumber()) {
+            const saved = self.pending_error;
+            defer self.pending_error = saved;
+            // The faulting frames are still live (the report reads them), so
+            // the handler runs above them; a failing one is unwound back to
+            // here, as `protectedCallSync` does, so the report is unchanged.
+            const entry_depth = self.depth;
+            const entry_top = self.stack_top;
+            const entry_in_flight = entry_depth > 0 and self.frames[entry_depth - 1].in_flight;
+            if (self.metaToString(ev)) |s| {
+                if (s) |text| return arena.dupe(u8, strBytes(text).?);
+            } else |_| {
+                self.unwindTo(entry_depth, entry_top);
+                if (entry_depth > 0) self.frames[entry_depth - 1].in_flight = entry_in_flight;
+            }
+        }
+        return renderErrorValue(ev, arena);
+    }
+
     /// The native at the current call site (the `.call` that invoked the running
     /// native), plus its caller's chunk name and the call line — everything a
     /// "bad argument" message needs, all recovered from live state so the caller
@@ -2345,7 +2369,7 @@ pub const Vm = struct {
         // its line for the traceback header.
         if (err == Error.LuaError) {
             const message = if (self.pending_error) |ev|
-                try renderErrorValue(ev, arena)
+                try self.renderUncaughtError(ev, arena)
             else
                 try arena.dupe(u8, "error");
             const cs = self.callSiteAt(1);
@@ -2860,6 +2884,28 @@ pub const Vm = struct {
             results_out[0] = r;
             return 1;
         }
+    }
+
+    /// Root `v`, a value a native holds only in a Zig local, across the
+    /// re-entrant `callValue`s it is about to make: park it at `stack_top`
+    /// and raise `stack_top` over it, as `callValue` parks a native callee's
+    /// arguments (`fillKeep` keeps the gaps between windows whole). Pass
+    /// the returned slot to `unparkTemp`. An error between the two leaves
+    /// `stack_top` raised for the catcher, which restores it.
+    pub fn parkTemp(self: *Vm, v: Value) Error!usize {
+        const slot = self.stack_top;
+        if (slot + 1 > self.regCapacity()) return Error.StackOverflow;
+        self.regSet(slot, v);
+        self.stack_top = slot + 1;
+        return slot;
+    }
+
+    /// Read back the value `parkTemp` rooted at `slot` and lower `stack_top`
+    /// to it.
+    pub fn unparkTemp(self: *Vm, slot: usize) Value {
+        std.debug.assert(self.stack_top == slot + 1);
+        self.stack_top = slot;
+        return self.regGet(slot);
     }
 
     pub fn callValue(self: *Vm, callee: Value, args: []const Value, results_out: []Value) Error!usize {
@@ -9891,8 +9937,13 @@ pub const Vm = struct {
         const handler = self.metamethod(v, self.mm.tostring);
         if (handler.isNil()) return null;
         const r = try self.callMeta(handler, &.{v});
-        if (!(r.isHeap() and r.heapType() == .string)) return Error.TypeError;
-        return r;
+        if (r.isHeap() and r.heapType() == .string) return r;
+        // A number is accepted and converted, as `luaL_tolstring` does.
+        if (r.isNumber()) {
+            var buf: [64]u8 = undefined;
+            return try self.heap.internValue(coerceConcat(r, &buf) catch unreachable);
+        }
+        return self.raiseLocatedError("'__tostring' must return a string", 1);
     }
 
     /// Upper bound on `__index`/`__newindex` table-chain hops before we declare a

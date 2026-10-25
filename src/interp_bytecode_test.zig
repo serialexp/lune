@@ -99,6 +99,33 @@ test "describeFault: arithmetic on a nil value names the op, type, line, and spa
     try testing.expectEqualStrings("s + d", src[fault.start..fault.end]);
 }
 
+test "describeFault: an uncaught error object renders through __tostring" {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const cases = [_]struct { src: [:0]const u8, want: []const u8 }{
+        .{ .src = "error(setmetatable({}, {__tostring = function() return 'custom!' end}))", .want = "custom!" },
+        .{ .src = "error(setmetatable({}, {__tostring = function() error('inner') end}))", .want = "(error object is a table value)" },
+        .{ .src = "error({})", .want = "(error object is a table value)" },
+    };
+    for (cases) |c| {
+        var diags = diag.Diagnostics.init(testing.allocator);
+        defer diags.deinit();
+        var tree = try parser.parse(testing.allocator, c.src, &diags);
+        defer tree.deinit();
+        var vm = try Vm.init(testing.allocator);
+        defer vm.deinit();
+        var chunk = try compiler.compile(testing.allocator, vm.heap, c.src, tree.root, &diags);
+        defer chunk.deinit();
+
+        try testing.expectError(Error.LuaError, vm.run(chunk.proto));
+
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const fault = try vm.describeFault(Error.LuaError, arena.allocator());
+        try testing.expectEqualStrings(c.want, fault.message);
+    }
+}
+
 test "describeFault: calling a nil value names the call and the type" {
     const parser = @import("parser.zig");
     const diag = @import("diag.zig");

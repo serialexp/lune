@@ -127,8 +127,8 @@ effect log so runs stay replayable (doc 02).
 - [ ] Excluded functions fail as `attempt to call a nil value`
       (`("x"):byte()`): say "string.byte is not available in mahina; use
       string.codepoint".
-- [ ] An uncaught error object with `__tostring` prints `(error object is a
-      table value)`.
+- [x] An uncaught error object with `__tostring` prints `(error object is a
+      table value)`. Fixed 2026-10-26.
 
 ## 5. Deliberate divergences that bite (decide / document)
 

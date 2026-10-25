@@ -106,7 +106,7 @@ test "P3: package.preload beats the path searcher and seeds package.loaded" {
         \\print(require("m"))
         \\print(package.loaded.m)
     );
-    try testing.expectEqualStrings("preload:m\npreload:m\n", sink.buffered());
+    try testing.expectEqualStrings("preload:m\t:preload:\npreload:m\n", sink.buffered());
     // Preload won before the path searcher ran → no file was ever read.
     try testing.expectEqual(@as(usize, 0), vm.effect_log.entries.items.len);
 }
@@ -123,7 +123,7 @@ test "P3: a dotted module name maps dots to the path separator" {
     try requireRun(gpa, &vm, &ffs, &sink,
         \\print(require("a.b"))
     );
-    try testing.expectEqualStrings("nested\n", sink.buffered());
+    try testing.expectEqualStrings("nested\t./a/b.lua\n", sink.buffered());
 }
 
 test "P3: require resolves a `.mah` module" {
@@ -138,7 +138,7 @@ test "P3: require resolves a `.mah` module" {
     try requireRun(gpa, &vm, &ffs, &sink,
         \\print(require("m"))
     );
-    try testing.expectEqualStrings("from-mah\n", sink.buffered());
+    try testing.expectEqualStrings("from-mah\t./m.mah\n", sink.buffered());
 }
 
 test "P3: `.mah` wins over `.lua` when a module exists as both" {
@@ -157,7 +157,7 @@ test "P3: `.mah` wins over `.lua` when a module exists as both" {
     try requireRun(gpa, &vm, &ffs, &sink,
         \\print(require("m"))
     );
-    try testing.expectEqualStrings("from-mah\n", sink.buffered());
+    try testing.expectEqualStrings("from-mah\t./m.mah\n", sink.buffered());
     // The `.lua` candidate is never even read: the search stops at the first hit.
     try testing.expectEqual(@as(usize, 1), vm.effect_log.entries.items.len);
 }
@@ -174,7 +174,7 @@ test "P3: a `.lua` module still resolves when no `.mah` shadows it" {
     try requireRun(gpa, &vm, &ffs, &sink,
         \\print(require("m"))
     );
-    try testing.expectEqualStrings("from-lua\n", sink.buffered());
+    try testing.expectEqualStrings("from-lua\t./m.lua\n", sink.buffered());
 }
 
 test "P3: `.mah` and `.lua` init forms both resolve for a dotted name" {
@@ -191,7 +191,7 @@ test "P3: `.mah` and `.lua` init forms both resolve for a dotted name" {
         \\print(require("pkg"))
         \\print(require("other"))
     );
-    try testing.expectEqualStrings("mah-init\nlua-init\n", sink.buffered());
+    try testing.expectEqualStrings("mah-init\t./pkg/init.mah\nlua-init\t./other/init.lua\n", sink.buffered());
 }
 
 test "P3: require of a missing module raises the accumulated not-found message" {
@@ -236,7 +236,7 @@ test "P3: a module that returns nothing caches as true" {
         \\print(require("m"))
         \\print(package.loaded.m)
     );
-    try testing.expectEqualStrings("true\ntrue\n", sink.buffered());
+    try testing.expectEqualStrings("true\t./m.lua\ntrue\n", sink.buffered());
 }
 
 test "P3: transitive require (a loader requires another module)" {
@@ -252,7 +252,7 @@ test "P3: transitive require (a loader requires another module)" {
     try requireRun(gpa, &vm, &ffs, &sink,
         \\print(require("top"))
     );
-    try testing.expectEqualStrings("42\n", sink.buffered());
+    try testing.expectEqualStrings("42\t./top.lua\n", sink.buffered());
 }
 
 test "P3: record→serialize→replay reproduces a require program with the FS detached" {
@@ -313,5 +313,5 @@ test "P3: a user-replaced searcher (a Lua closure) is honoured" {
         \\end
         \\print(require("anything"))
     );
-    try testing.expectEqualStrings("custom:anything\n", sink.buffered());
+    try testing.expectEqualStrings("custom:anything\tnil\n", sink.buffered());
 }
