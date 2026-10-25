@@ -2197,8 +2197,10 @@ pub const Vm = struct {
     /// The native at the current call site (the `.call` that invoked the running
     /// native), plus its caller's chunk name and the call line — everything a
     /// "bad argument" message needs, all recovered from live state so the caller
-    /// passes none of it. `null` only if there is no resolvable native call site.
-    const NativeSite = struct { fname: []const u8, chunk: []const u8, line: u32, located: bool };
+    /// passes none of it. `method` is set when the call site is a method call
+    /// (`s:rep(…)`), whose arguments Lua numbers from the one after `self`.
+    /// `null` only if there is no resolvable native call site.
+    const NativeSite = struct { fname: []const u8, chunk: []const u8, line: u32, located: bool, method: bool = false };
     fn nativeSite(self: *Vm) ?NativeSite {
         // A native called by a native: named, with no location (Lua's
         // `bad argument #1 to 'rep'` under `pcall(string.rep)`).
@@ -2208,23 +2210,34 @@ pub const Vm = struct {
         const call = bytecode.callOperandsOf(cs.proto.code[cs.pc]) orelse return null;
         const callee = self.regGet(cs.base + call.a);
         if (!(callee.isHeap() and callee.heapType() == .native)) return null;
+        const origin = bc_names.originOf(cs.proto, @intCast(cs.pc), call.a);
         return .{
             .fname = nativeDisplayName(function.Native.fromHeader(callee.asHeap())),
             .chunk = cs.proto.name,
             .line = cs.line,
             .located = true,
+            .method = origin != null and origin.?.kind == .method,
         };
     }
 
-    /// Intern `body` (already a complete "bad argument …" clause) as the in-flight
-    /// error value, prefixed with the `chunk:line:` of the call site when one is
-    /// resolvable, and return the unwinding signal. Shared tail of `badArg`/
-    /// `badArgReason` so their location handling can't drift. Deterministic: reads
-    /// only the call site and interns an id-stable string.
-    fn raiseBadArg(self: *Vm, site: ?NativeSite, body: []const u8) Error {
+    /// Raise Lua's `luaL_argerror` for argument `n` (1-based) with `reason` in
+    /// the parentheses: "bad argument #n to 'f' (reason)", prefixed with the
+    /// `chunk:line:` of the call site when one is resolvable. At a method call
+    /// the number counts from the argument after `self`, and a bad `self` is
+    /// "calling 'f' on bad self (reason)". Shared tail of `badArg`/
+    /// `badArgReason` so their numbering and location can't drift.
+    /// Deterministic: reads only the call site and interns an id-stable string.
+    fn raiseBadArg(self: *Vm, n: usize, reason: []const u8) Error {
+        const site = self.nativeSite();
+        const fname = if (site) |s| s.fname else "?";
+        const method = site != null and site.?.method;
         var arena_inst = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_inst.deinit();
         const a = arena_inst.allocator();
+        const body = if (method and n == 1)
+            try std.fmt.allocPrint(a, "calling '{s}' on bad self ({s})", .{ fname, reason })
+        else
+            try std.fmt.allocPrint(a, "bad argument #{d} to '{s}' ({s})", .{ if (method) n - 1 else n, fname, reason });
         const full = if (site != null and site.?.located)
             try std.fmt.allocPrint(a, "{s}:{d}: {s}", .{ site.?.chunk, site.?.line, body })
         else
@@ -2239,17 +2252,11 @@ pub const Vm = struct {
     /// Name + location come from the live call site (`nativeSite`); the caller
     /// supplies only the 1-based index, the expected type, and the offending value.
     pub fn badArg(self: *Vm, n: usize, expected: []const u8, got: ?Value) Error {
-        const site = self.nativeSite();
-        const fname = if (site) |s| s.fname else "?";
         const got_name = if (got) |g| g.typeName() else "no value";
         var arena_inst = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_inst.deinit();
-        const body = try std.fmt.allocPrint(
-            arena_inst.allocator(),
-            "bad argument #{d} to '{s}' ({s} expected, got {s})",
-            .{ n, fname, expected, got_name },
-        );
-        return self.raiseBadArg(site, body);
+        const reason = try std.fmt.allocPrint(arena_inst.allocator(), "{s} expected, got {s}", .{ expected, got_name });
+        return self.raiseBadArg(n, reason);
     }
 
     /// Argument `i` (0-based) as an integer, read as `luaL_checkinteger` reads
@@ -2280,16 +2287,7 @@ pub const Vm = struct {
     /// "number has no integer representation", "index out of range", "value
     /// expected") instead of the "X expected, got Y" form.
     pub fn badArgReason(self: *Vm, n: usize, reason: []const u8) Error {
-        const site = self.nativeSite();
-        const fname = if (site) |s| s.fname else "?";
-        var arena_inst = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_inst.deinit();
-        const body = try std.fmt.allocPrint(
-            arena_inst.allocator(),
-            "bad argument #{d} to '{s}' ({s})",
-            .{ n, fname, reason },
-        );
-        return self.raiseBadArg(site, body);
+        return self.raiseBadArg(n, reason);
     }
 
     /// Raise `bytes` as the in-flight error value, prepending the `chunk:line:`

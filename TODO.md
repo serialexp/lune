@@ -122,8 +122,9 @@ Wrong results:
 - [x] An uncaught error object with `__tostring` prints "(error object is
       a table value)"; Lua prints its text. (A handler that itself errors
       falls back to the generic text; Lua reports the handler's error.)
-- [ ] Method calls don't adjust argument numbers: `("a"):rep(2.5)` says
-      `#2` (Lua `#1`).
+- [x] Method calls don't adjust argument numbers: `("a"):rep(2.5)` says
+      `#2` (Lua `#1`). `nativeSite` asks `bc_names` whether the callee was
+      a method lookup; a bad `self` is "calling 'f' on bad self".
 - [x] `gsub` with `"%x"` in the replacement yields `"x"` (Lua: "invalid
       use of '%' in replacement string"). `%z` is unsupported. Both fixed.
 - [ ] The undefined-global lint fires for globals created via

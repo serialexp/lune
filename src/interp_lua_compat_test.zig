@@ -259,3 +259,16 @@ test "numeric literals: hex floats, wrapping hex, malformed numerals" {
         "nil\t(load):1: malformed number\n" ++
         "nil\t(load):1: malformed number\n");
 }
+
+test "method calls number arguments from the one after self" {
+    try expectProgram(
+        \\local function e(f) print((select(2, pcall(f)):gsub("^[^:]*:%d+: ", ""))) end
+        \\e(function() return ("a"):rep(2.5) end)
+        \\e(function() return string.rep("a", 2.5) end)
+        \\e(function() local t = setmetatable({}, {__index = string}) return t:upper() end)
+        \\print(select(2, pcall(string.rep)))
+    , "bad argument #1 to 'rep' (number has no integer representation)\n" ++
+        "bad argument #2 to 'rep' (number has no integer representation)\n" ++
+        "calling 'upper' on bad self (string expected, got table)\n" ++
+        "bad argument #1 to 'rep' (string expected, got no value)\n");
+}
